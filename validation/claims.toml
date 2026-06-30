@@ -1,6 +1,368 @@
 registry_version = 1
 generated_doc_path = "docs/CLAIM_REGISTRY.md"
 
+[[product_admission_gates]]
+id = "local-pool-device-lifecycle"
+status = "blocked"
+scope = "local pool/device lifecycle, import/export, device topology, and owner-authority behavior before local successor wording"
+claim_ids = [
+  "storage.intent.layout_allocator_honesty.v1",
+  "storage.local.successor_comparator.v1",
+  "storage.intent.successor_comparator.v1",
+]
+required_evidence_classes = [
+  "storage-intent-layout-policy-evidence",
+  "storage-intent-lifecycle-capacity-evidence",
+  "storage-intent-layout-action-execution",
+  "local-storage-successor-claim-boundary-review",
+  "storage-intent-successor-claim-boundary-review",
+  "claims-gate-review",
+]
+authority_paths = [
+  "docs/POOL_IMPORT_EXPORT_DEVICE_TOPOLOGY_DESIGN.md",
+  "docs/STORAGE_INTENT_POLICY_AUTHORITY.md",
+  "docs/REVIEW_TODO_REGISTER.md",
+  "validation/claims.toml",
+]
+admission_rule = "Pool/device lifecycle wording may strengthen only after the layout/lifecycle, local successor boundary, umbrella successor boundary, and claims-gate evidence classes validate for the exact local scope."
+blockers = [
+  "The layout/lifecycle claim is blocked on policy, capacity, recovery, action-execution, fault, and result/refusal evidence.",
+  "The local and umbrella successor claims remain blocked and must not inherit authority from pool/device design prose.",
+]
+
+[[product_admission_gates]]
+id = "mounted-posix-operator-runtime"
+status = "blocked"
+scope = "mounted POSIX path, FUSE adapter lifecycle, namespace behavior, and operator-visible local filesystem behavior"
+claim_ids = [
+  "fuse.adapter.lifecycle_translation.model.v1",
+  "namespace.rename.atomicity.v1",
+  "local.vfs.rename_atomic_crash.v1",
+  "storage.local.successor_comparator.v1",
+]
+required_evidence_classes = [
+  "fuse-adapter-lifecycle-model",
+  "model-crash-matrix",
+  "runtime-namespace-crash-artifact",
+  "no-hidden-queue-gate",
+  "local-storage-successor-claim-boundary-review",
+  "claims-gate-review",
+]
+authority_paths = [
+  "docs/FUSE_ADAPTER_CONTRACT_ASSUMPTIONS.md",
+  "docs/OPERATOR_UAPI_AUTHORITY.md",
+  "docs/CLAIMS_GATE_POLICY.md",
+  "validation/claims.toml",
+]
+admission_rule = "Mounted POSIX or operator-facing filesystem wording may strengthen only when FUSE lifecycle, namespace crash/runtime, local successor boundary, and claims-gate evidence all validate for the mounted local scope."
+blockers = [
+  "FUSE lifecycle evidence is model-only and does not validate mounted runtime behavior.",
+  "Namespace and local VFS rename claims remain blocked on active runtime/no-hidden-queue admission proof.",
+]
+
+[[product_admission_gates]]
+id = "transaction-replay-crash-recovery"
+status = "blocked"
+scope = "transaction, replay, fsync, rename, and crash-recovery behavior across local storage and storage-intent receipts"
+claim_ids = [
+  "storage.write_fsync.crash_safety.v1",
+  "namespace.rename.atomicity.v1",
+  "local.vfs.write_fsync_crash.v1",
+  "local.vfs.rename_atomic_crash.v1",
+  "storage.intent.ack_receipt_honesty.v1",
+]
+required_evidence_classes = [
+  "model-crash-matrix",
+  "runtime-crash-oracle",
+  "runtime-namespace-crash-artifact",
+  "storage-intent-ack-fault-matrix",
+  "claims-gate-review",
+]
+authority_paths = [
+  "docs/REVIEW_TODO_REGISTER.md",
+  "docs/STORAGE_INTENT_POLICY_AUTHORITY.md",
+  "docs/RELEASE_READINESS_VERDICT_CONTRACT.md",
+  "validation/claims.toml",
+]
+admission_rule = "Crash/replay wording may strengthen only when the model, runtime crash oracle, namespace runtime, storage-intent fault, and claims-gate evidence validate without widening beyond their declared scope."
+blockers = [
+  "Broad write/fsync and namespace atomicity claims remain planned or blocked outside the bounded local VFS artifacts.",
+  "Storage-intent acknowledgment honesty remains blocked on earned receipt, membership, ordering, media, fault, recovery, and result/refusal evidence.",
+]
+
+[[product_admission_gates]]
+id = "integrity-scrub-repair-rebuild"
+status = "blocked"
+scope = "checksums, data-shape integrity, scrub, repair, rebuild, foreground read protection, and distributed safety model boundaries"
+claim_ids = [
+  "scrub.foreground_read.protected.v1",
+  "perf.local.foreground_read_not_blocked_by_scrub.v1",
+  "storage.intent.data_shape_honesty.v1",
+  "distributed.combined_safety.model.v1",
+  "storage.distributed.successor_comparator.v1",
+]
+required_evidence_classes = [
+  "scrub-read-isolation-model",
+  "runtime-scrub-read-artifact",
+  "storage-intent-data-shape-policy-evidence",
+  "storage-intent-data-shape-performance-fault-rows",
+  "distributed-combined-safety-model",
+  "distributed-storage-successor-claim-boundary-review",
+  "claims-gate-review",
+]
+authority_paths = [
+  "docs/SCRUB_IDENTITY_AUTHORITY.md",
+  "docs/STORAGE_INTENT_POLICY_AUTHORITY.md",
+  "docs/LOCAL_DISTRIBUTED_RECEIPT_AUTHORITY.md",
+  "validation/claims.toml",
+]
+admission_rule = "Integrity, scrub, repair, or rebuild wording may strengthen only after scrub/runtime, data-shape, distributed model, distributed successor boundary, and claims-gate evidence validate for the declared local or distributed envelope."
+blockers = [
+  "Scrub/read claims lack mounted runtime evidence.",
+  "Data-shape and distributed successor claims remain blocked on policy, execution, performance/fault, transport, recovery, and operator explanation evidence.",
+]
+
+[[product_admission_gates]]
+id = "snapshot-clone-send-receive-reclaim"
+status = "blocked"
+scope = "snapshot, clone, send, receive, deadlist, reclaim, and source-retirement behavior"
+claim_ids = [
+  "storage.intent.layout_allocator_honesty.v1",
+  "storage.local.successor_comparator.v1",
+  "storage.distributed.successor_comparator.v1",
+]
+required_evidence_classes = [
+  "storage-intent-lifecycle-capacity-evidence",
+  "storage-intent-layout-action-execution",
+  "local-storage-successor-claim-boundary-review",
+  "distributed-storage-successor-claim-boundary-review",
+  "claims-gate-review",
+]
+authority_paths = [
+  "docs/SNAPSHOT_CLONE_DEADLIST_AUTHORITY.md",
+  "docs/STORAGE_INTENT_POLICY_AUTHORITY.md",
+  "docs/REVIEW_TODO_REGISTER.md",
+  "validation/claims.toml",
+]
+admission_rule = "Snapshot, clone, send/receive, deadlist, reclaim, or source-retirement wording may strengthen only when lifecycle/capacity, action-execution, local/distributed successor boundary, and claims-gate evidence validate for the exact mode."
+blockers = [
+  "Snapshot/clone/deadlist authority remains implementation-gated and does not by itself validate product behavior.",
+  "Local and distributed successor boundaries remain blocked and must not inherit authority from snapshot design docs or row labels.",
+]
+
+[[product_admission_gates]]
+id = "capacity-quota-reserve-accounting"
+status = "blocked"
+scope = "capacity, quota, reserve, allocator accounting, dirty-debt budgets, and scheduler admission behavior"
+claim_ids = [
+  "storage.intent.layout_allocator_honesty.v1",
+  "scheduler.dirty_debt.no_hidden.v1",
+  "perf.local.no_unbounded_dirty_debt.v1",
+  "storage.intent.sync_latency_envelope.v1",
+]
+required_evidence_classes = [
+  "storage-intent-layout-policy-evidence",
+  "storage-intent-lifecycle-capacity-evidence",
+  "admission-budget-model",
+  "queue-depth-runtime-artifact",
+  "storage-intent-scheduler-admission-row",
+  "claims-gate-review",
+]
+authority_paths = [
+  "docs/CAPACITY_ACCOUNTING_AUTHORITY.md",
+  "docs/STORAGE_INTENT_POLICY_AUTHORITY.md",
+  "docs/REVIEW_TODO_REGISTER.md",
+  "validation/claims.toml",
+]
+admission_rule = "Capacity/accounting wording may strengthen only after layout/capacity, dirty-debt, queue-depth, scheduler admission, and claims-gate evidence validate for the declared workload and scope."
+blockers = [
+  "Capacity and allocator evidence remains blocked on lifecycle, recovery, ENOSPC, action-execution, and result/refusal rows.",
+  "A bounded local no-unbounded-dirty-debt claim does not validate scheduler-wide dirty-debt or successor performance claims.",
+]
+
+[[product_admission_gates]]
+id = "page-cache-writeback-fsync"
+status = "blocked"
+scope = "page cache, writeback, fsync, mmap coherency, and local durability wording"
+claim_ids = [
+  "local.vfs.page_cache_writeback_authority.v1",
+  "storage.write_fsync.crash_safety.v1",
+  "local.vfs.write_fsync_crash.v1",
+  "scheduler.dirty_debt.no_hidden.v1",
+  "perf.local.no_unbounded_dirty_debt.v1",
+]
+required_evidence_classes = [
+  "claims-gate-review",
+  "model-crash-matrix",
+  "runtime-crash-oracle",
+  "admission-budget-model",
+  "queue-depth-runtime-artifact",
+]
+authority_paths = [
+  "docs/PAGE_CACHE_WRITEBACK_AUTHORITY.md",
+  "docs/FUSE_ADAPTER_CONTRACT_ASSUMPTIONS.md",
+  "docs/REVIEW_TODO_REGISTER.md",
+  "validation/claims.toml",
+]
+admission_rule = "Page-cache/writeback/fsync wording may strengthen only when page-cache authority, crash evidence, dirty-debt evidence, runtime queue-depth evidence, and claims-gate review validate together for the same mounted scope."
+blockers = [
+  "Page-cache writeback authority remains blocked on mounted writeback, mmap coherency, no-hidden-queue, and broader durability evidence.",
+  "Validated local VFS fsync evidence is bounded and must not become broad mounted writeback or production crash-safety wording.",
+]
+
+[[product_admission_gates]]
+id = "block-device-product-boundary"
+status = "blocked"
+scope = "block/device path where ublk export, request completion, and started-export service behavior are product rather than harness claims"
+claim_ids = [
+  "ublk.qid_tag.exactly_once_completion.v1",
+  "ublk.started_export.live_service_loop.v1",
+  "storage.local.successor_comparator.v1",
+]
+required_evidence_classes = [
+  "qid-tag-state-model",
+  "runtime-ublk-completion-artifact",
+  "started-export-service-loop-model",
+  "runtime-ublk-started-export-admission-artifact",
+  "local-storage-successor-claim-boundary-review",
+  "claims-gate-review",
+]
+authority_paths = [
+  "docs/BLOCK_VOLUME_UBLK_STARTED_EXPORT_ADMISSION_BOUNDARY_ISSUE_341.md",
+  "docs/REQUEST_CONTRACT.md",
+  "docs/CLAIMS_GATE_POLICY.md",
+  "validation/claims.toml",
+]
+admission_rule = "Block-device wording may strengthen only when qid/tag completion, started-export admission, service-loop, local successor boundary, and claims-gate evidence validate without implying broader fio, filesystem, resize, crash, or production block readiness."
+blockers = [
+  "uBLK completion remains planned and started-export evidence is bounded to live service-loop/admission.",
+  "The local successor boundary remains blocked and must not consume harness-only block evidence as product proof.",
+]
+
+[[product_admission_gates]]
+id = "kernel-residency-boundary"
+status = "blocked"
+scope = "kernel residency, no-daemon boundary, teardown, mounted-kernel behavior, and product-mode kernel wording"
+claim_ids = [
+  "kernel.teardown.no_work_after.v1",
+  "storage.local.successor_comparator.v1",
+  "storage.intent.successor_comparator.v1",
+]
+required_evidence_classes = [
+  "kernel-context-token-model",
+  "teardown-race-proof-artifact",
+  "local-storage-successor-claim-boundary-review",
+  "storage-intent-successor-claim-boundary-review",
+  "claims-gate-review",
+]
+authority_paths = [
+  "docs/KERNEL_RESIDENCY_AUTHORITY.md",
+  "docs/KERNEL_RESIDENT_POOL_ENGINE_ARCHITECTURE.md",
+  "docs/GITHUB_CI.md",
+  "validation/claims.toml",
+]
+admission_rule = "Kernel-residency wording may strengthen only when teardown/no-work-after, mounted-kernel or no-daemon runtime evidence, local and umbrella successor boundaries, and claims-gate review validate for the exact kernel tier."
+blockers = [
+  "Kernel teardown remains blocked without accepted T6 full-kernel/no-daemon runtime evidence.",
+  "Local and umbrella successor claims remain blocked and must not inherit authority from target architecture docs or T5-only evidence.",
+]
+
+[[product_admission_gates]]
+id = "distributed-product-mode"
+status = "blocked"
+scope = "distributed transport, membership, placement, geo/RPO, repair, recovery, and degraded-visible behavior before distributed product wording"
+claim_ids = [
+  "distributed.combined_safety.model.v1",
+  "storage.distributed.successor_comparator.v1",
+  "storage.intent.geo_async_rpo.v1",
+  "storage.intent.ack_receipt_honesty.v1",
+  "storage.intent.placement_satisfaction.v1",
+]
+required_evidence_classes = [
+  "distributed-combined-safety-model",
+  "distributed-storage-comparator-equivalence-evidence",
+  "distributed-storage-successor-performance-fault-set",
+  "storage-intent-geo-policy-transport-evidence",
+  "storage-intent-placement-decision-frontier",
+  "storage-intent-ack-receipt-runtime",
+  "claims-gate-review",
+]
+authority_paths = [
+  "docs/LOCAL_DISTRIBUTED_RECEIPT_AUTHORITY.md",
+  "docs/STORAGE_INTENT_POLICY_AUTHORITY.md",
+  "docs/REVIEW_TODO_REGISTER.md",
+  "validation/claims.toml",
+]
+admission_rule = "Distributed wording may strengthen only when transport, membership, placement, geo/RPO, ack receipt, performance/fault, recovery, operator explanation, and distributed successor boundary evidence validate for the declared topology."
+blockers = [
+  "Distributed evidence is currently split across model, transport, placement, receipt, geo/RPO, and successor claims, all blocked or planned for product wording.",
+  "Source-model or prototype cluster evidence must not become Ceph-class, clustered-storage, or distributed product-mode admission.",
+]
+
+[[product_admission_gates]]
+id = "operator-uapi-release-verdict"
+status = "blocked"
+scope = "operator UAPI truth, release-readiness verdict ownership, and externally readable product wording"
+claim_ids = [
+  "storage.local.successor_comparator.v1",
+  "storage.distributed.successor_comparator.v1",
+  "storage.intent.successor_comparator.v1",
+]
+required_evidence_classes = [
+  "local-storage-operator-explanation-evidence",
+  "distributed-storage-operator-explanation-evidence",
+  "storage-intent-operator-explanation-evidence",
+  "claims-gate-review",
+]
+authority_paths = [
+  "docs/OPERATOR_UAPI_AUTHORITY.md",
+  "docs/PREVIEW_UAPI_ABI_BOUNDARY_OW202.md",
+  "docs/RELEASE_READINESS_VERDICT_CONTRACT.md",
+  "docs/CLAIMS_GATE_POLICY.md",
+  "validation/claims.toml",
+]
+admission_rule = "Operator or release-facing wording may strengthen only when local, distributed, and umbrella successor claims validate and the release-readiness verdict owner records a current verdict that consumes the claim evidence without widening it."
+blockers = [
+  "No release-readiness verdict exists, and claims-gate status alone is not a whole-product admission decision.",
+  "The split local, distributed, and umbrella successor claims all remain blocked.",
+]
+
+[[product_admission_gates]]
+id = "evidence-proof-train-packet"
+status = "blocked"
+scope = "aggregate proof packet shape: model, mounted runtime, crash/powerfail, xfstests, QEMU/device lifecycle, fault injection, long soak, and performance/SLO evidence"
+claim_ids = [
+  "storage.write_fsync.crash_safety.v1",
+  "local.vfs.write_fsync_crash.v1",
+  "ublk.qid_tag.exactly_once_completion.v1",
+  "kernel.teardown.no_work_after.v1",
+  "distributed.combined_safety.model.v1",
+  "storage.local.successor_comparator.v1",
+  "storage.distributed.successor_comparator.v1",
+  "storage.intent.successor_comparator.v1",
+]
+required_evidence_classes = [
+  "model-crash-matrix",
+  "runtime-crash-oracle",
+  "runtime-ublk-completion-artifact",
+  "teardown-race-proof-artifact",
+  "distributed-combined-safety-model",
+  "local-storage-successor-performance-fault-set",
+  "distributed-storage-successor-performance-fault-set",
+  "claims-gate-review",
+]
+authority_paths = [
+  "docs/RELEASE_CANDIDATE_EVIDENCE_CONTRACT.md",
+  "docs/RELEASE_READINESS_VERDICT_CONTRACT.md",
+  "docs/GITHUB_CI.md",
+  "validation/claims.toml",
+]
+admission_rule = "A proof packet may support product wording only when every consumed claim validates, the evidence manifests are current, the verdict boundary records open gaps/non-claims, and no gate-local receipt is treated as whole-product admission."
+blockers = [
+  "The evidence packet is an admission map, not a release-readiness verdict.",
+  "Several referenced claims remain planned or blocked, and no current release-readiness verdict consumes the full product-spine evidence set.",
+]
+
 [[claims]]
 id = "storage.write_fsync.crash_safety.v1"
 status = "planned"

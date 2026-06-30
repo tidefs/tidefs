@@ -199,7 +199,21 @@ struct CommandSurfaceFact {
 struct ClaimRegistry {
     registry_version: u32,
     generated_doc_path: String,
+    #[serde(default)]
+    product_admission_gates: Vec<ProductAdmissionGate>,
     claims: Vec<ClaimRecord>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct ProductAdmissionGate {
+    id: String,
+    status: ClaimStatus,
+    scope: String,
+    claim_ids: Vec<String>,
+    required_evidence_classes: Vec<String>,
+    authority_paths: Vec<String>,
+    admission_rule: String,
+    blockers: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1802,11 +1816,170 @@ fn validate_claim_registry(registry: &ClaimRegistry) -> Vec<String> {
         validate_crash_claim_requirements(claim, &mut failures);
     }
 
+    let claims_by_id = registry
+        .claims
+        .iter()
+        .map(|claim| (claim.id.as_str(), claim))
+        .collect::<BTreeMap<_, _>>();
+    failures.extend(validate_product_admission_gates(registry, &claims_by_id));
+
     for required_id in REQUIRED_INITIAL_CLAIMS {
         if !ids.contains(*required_id) {
             failures.push(format!(
                 "`{CLAIM_REGISTRY_PATH}` is missing required initial claim `{required_id}`"
             ));
+        }
+    }
+
+    failures
+}
+
+fn validate_product_admission_gates(
+    registry: &ClaimRegistry,
+    claims_by_id: &BTreeMap<&str, &ClaimRecord>,
+) -> Vec<String> {
+    let mut failures = Vec::new();
+    if registry.product_admission_gates.is_empty() {
+        failures.push(format!(
+            "`{CLAIM_REGISTRY_PATH}` does not register any product_admission_gates"
+        ));
+    }
+
+    let mut gate_ids = BTreeSet::new();
+    for gate in &registry.product_admission_gates {
+        if gate.id.trim().is_empty() {
+            failures.push("product admission gate has an empty id".to_string());
+            continue;
+        }
+        if !gate_ids.insert(gate.id.as_str()) {
+            failures.push(format!("duplicate product admission gate `{}`", gate.id));
+        }
+        if gate.scope.trim().is_empty() {
+            failures.push(format!(
+                "product admission gate `{}` has an empty scope",
+                gate.id
+            ));
+        }
+        if gate.admission_rule.trim().is_empty() {
+            failures.push(format!(
+                "product admission gate `{}` has an empty admission_rule",
+                gate.id
+            ));
+        }
+        if gate.claim_ids.is_empty() {
+            failures.push(format!(
+                "product admission gate `{}` references no claim_ids",
+                gate.id
+            ));
+        }
+        if gate.required_evidence_classes.is_empty() {
+            failures.push(format!(
+                "product admission gate `{}` has no required_evidence_classes",
+                gate.id
+            ));
+        }
+        if gate.authority_paths.is_empty() {
+            failures.push(format!(
+                "product admission gate `{}` has no authority_paths",
+                gate.id
+            ));
+        }
+        if !gate.status.is_validated() && gate.blockers.is_empty() {
+            failures.push(format!(
+                "product admission gate `{}` is {} but records no blockers",
+                gate.id,
+                gate.status.as_str()
+            ));
+        }
+        if gate.status.is_validated() && !gate.blockers.is_empty() {
+            failures.push(format!(
+                "product admission gate `{}` is validated but still records blockers",
+                gate.id
+            ));
+        }
+
+        let mut referenced_classes = BTreeSet::new();
+        let mut referenced_claim_ids = BTreeSet::new();
+        for claim_id in &gate.claim_ids {
+            if claim_id.trim().is_empty() {
+                failures.push(format!(
+                    "product admission gate `{}` has an empty claim id",
+                    gate.id
+                ));
+                continue;
+            }
+            if !referenced_claim_ids.insert(claim_id.as_str()) {
+                failures.push(format!(
+                    "product admission gate `{}` repeats claim id `{claim_id}`",
+                    gate.id
+                ));
+            }
+            let Some(claim) = claims_by_id.get(claim_id.as_str()) else {
+                failures.push(format!(
+                    "product admission gate `{}` references unknown claim `{claim_id}`",
+                    gate.id
+                ));
+                continue;
+            };
+            if gate.status.is_validated() && !claim.status.is_validated() {
+                failures.push(format!(
+                    "product admission gate `{}` is validated but claim `{claim_id}` is {}",
+                    gate.id,
+                    claim.status.as_str()
+                ));
+            }
+            referenced_classes.extend(claim.required_evidence_classes.iter().map(String::as_str));
+        }
+
+        let mut evidence_classes = BTreeSet::new();
+        for class in &gate.required_evidence_classes {
+            if class.trim().is_empty() {
+                failures.push(format!(
+                    "product admission gate `{}` has an empty required evidence class",
+                    gate.id
+                ));
+                continue;
+            }
+            if !evidence_classes.insert(class.as_str()) {
+                failures.push(format!(
+                    "product admission gate `{}` repeats evidence class `{class}`",
+                    gate.id
+                ));
+            }
+            if !referenced_classes.contains(class.as_str()) {
+                failures.push(format!(
+                    "product admission gate `{}` requires evidence class `{class}` that no referenced claim requires",
+                    gate.id
+                ));
+            }
+        }
+
+        let mut authority_paths = BTreeSet::new();
+        for authority_path in &gate.authority_paths {
+            if authority_path.trim().is_empty() {
+                failures.push(format!(
+                    "product admission gate `{}` has an empty authority path",
+                    gate.id
+                ));
+                continue;
+            }
+            if !authority_paths.insert(authority_path.as_str()) {
+                failures.push(format!(
+                    "product admission gate `{}` repeats authority path `{authority_path}`",
+                    gate.id
+                ));
+            }
+            let rel = Path::new(authority_path);
+            if rel.is_absolute()
+                || rel
+                    .components()
+                    .any(|component| matches!(component, std::path::Component::ParentDir))
+            {
+                failures.push(format!(
+                    "product admission gate `{}` authority path `{authority_path}` must be workspace-relative",
+                    gate.id
+                ));
+            }
         }
     }
 
@@ -2741,6 +2914,35 @@ fn render_claim_registry_doc(registry: &ClaimRegistry) -> String {
     out.push_str("Maturity: generated claim registry.\n\n");
     out.push_str("This file is generated from `validation/claims.toml` by `cargo run -p tidefs-xtask -- check-claims-gate`. Edit the registry, not this document.\n\n");
     out.push_str("`validate-claim <id>` prints PASS, BLOCKED, or FAIL. PASS is limited to validated claims with fresh evidence artifacts; BLOCKED exits successfully for focused validation while remaining a non-product claim, and FAIL exits nonzero.\n\n");
+
+    if !registry.product_admission_gates.is_empty() {
+        out.push_str("## Product Admission Gates\n\n");
+        out.push_str("These generated gates are the product-spine admission map. A gate is not product-ready unless its status is validated and every referenced claim validates with current evidence. Blocked gates preserve the non-claim boundary for successor, comparator, release-readiness, production, and whole-product wording.\n\n");
+        out.push_str("| Gate id | Status | Scope | Claim ids | Required evidence | Authority paths | Admission rule | Blockers |\n");
+        out.push_str("|---|---|---|---|---|---|---|---|\n");
+        for gate in &registry.product_admission_gates {
+            out.push_str("| `");
+            out.push_str(&markdown_cell(&gate.id));
+            out.push_str("` | `");
+            out.push_str(gate.status.as_str());
+            out.push_str("` | ");
+            out.push_str(&markdown_cell(&gate.scope));
+            out.push_str(" | ");
+            out.push_str(&markdown_code_list_cell(&gate.claim_ids));
+            out.push_str(" | ");
+            out.push_str(&markdown_list_cell(&gate.required_evidence_classes));
+            out.push_str(" | ");
+            out.push_str(&markdown_code_list_cell(&gate.authority_paths));
+            out.push_str(" | ");
+            out.push_str(&markdown_cell(&gate.admission_rule));
+            out.push_str(" | ");
+            out.push_str(&markdown_list_cell(&gate.blockers));
+            out.push_str(" |\n");
+        }
+        out.push('\n');
+    }
+
+    out.push_str("## Claims\n\n");
     out.push_str("| Claim id | Status | Scope | Required evidence | Blockers | Generated text |\n");
     out.push_str("|---|---|---|---|---|---|\n");
     for claim in &registry.claims {
@@ -2759,6 +2961,18 @@ fn render_claim_registry_doc(registry: &ClaimRegistry) -> String {
         out.push_str(" |\n");
     }
     out
+}
+
+fn markdown_code_list_cell(values: &[String]) -> String {
+    if values.is_empty() {
+        "-".to_string()
+    } else {
+        values
+            .iter()
+            .map(|value| format!("`{}`", markdown_cell(value)))
+            .collect::<Vec<_>>()
+            .join("<br>")
+    }
 }
 
 fn markdown_list_cell(values: &[String]) -> String {
@@ -3226,6 +3440,14 @@ mod tests {
             .claims
             .iter()
             .any(|claim| claim.status == ClaimStatus::Blocked));
+        assert!(registry
+            .product_admission_gates
+            .iter()
+            .any(|gate| gate.id == "distributed-product-mode"));
+        assert!(registry
+            .product_admission_gates
+            .iter()
+            .all(|gate| !gate.claim_ids.is_empty()));
         assert_eq!(ClaimStatus::Planned.as_str(), "planned");
         assert_eq!(ClaimStatus::Blocked.as_str(), "blocked");
         assert_eq!(ClaimStatus::Validated.as_str(), "validated");
@@ -3239,6 +3461,8 @@ mod tests {
         let generated = render_claim_registry_doc(&registry);
         assert_eq!(generated, include_str!("../../../docs/CLAIM_REGISTRY.md"));
         assert!(generated.contains("offload.ready.non_authoritative.v1"));
+        assert!(generated.contains("## Product Admission Gates"));
+        assert!(generated.contains("operator-uapi-release-verdict"));
         assert!(generated.contains("BLOCKED exits successfully for focused validation"));
     }
 
