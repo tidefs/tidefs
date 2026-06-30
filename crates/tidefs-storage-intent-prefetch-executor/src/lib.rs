@@ -344,6 +344,35 @@ impl_u8_canonical!(PrefetchExecutorAdmissionOutcome, {
     Unavailable = 7 => "unavailable",
 });
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum PrefetchExecutorRecoveryEscalationClass {
+    #[default]
+    None = 0,
+    DegradedRiskReduction = 1,
+    RepairEscalation = 2,
+    EvacuationEscalation = 3,
+    GeoCatchupEscalation = 4,
+    ReplacementReceiptRisk = 5,
+}
+
+impl_u8_canonical!(PrefetchExecutorRecoveryEscalationClass, {
+    None = 0 => "none",
+    DegradedRiskReduction = 1 => "degraded-risk-reduction",
+    RepairEscalation = 2 => "repair-escalation",
+    EvacuationEscalation = 3 => "evacuation-escalation",
+    GeoCatchupEscalation = 4 => "geo-catchup-escalation",
+    ReplacementReceiptRisk = 5 => "replacement-receipt-risk",
+});
+
+impl PrefetchExecutorRecoveryEscalationClass {
+    #[must_use]
+    pub const fn requires_recovery_degradation_evidence(self) -> bool {
+        !matches!(self, Self::None)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub struct PrefetchExecutorPressureMask(pub u64);
@@ -819,6 +848,7 @@ pub struct PrefetchExecutorAdmissionRecord {
     pub droppable: bool,
     pub throttleable: bool,
     pub expirable: bool,
+    pub recovery_escalation: PrefetchExecutorRecoveryEscalationClass,
     pub reserve_protected: bool,
     pub budget_owner: StorageIntentDomainId,
     pub requested_bytes: u64,
@@ -826,6 +856,7 @@ pub struct PrefetchExecutorAdmissionRecord {
     pub queue_time_us: u64,
     pub refusal: StorageIntentRefusalReason,
     pub scheduler_admission_ref: StorageIntentEvidenceRef,
+    pub recovery_degradation_ref: StorageIntentEvidenceRef,
 }
 
 impl Default for PrefetchExecutorAdmissionRecord {
@@ -837,6 +868,7 @@ impl Default for PrefetchExecutorAdmissionRecord {
             droppable: false,
             throttleable: false,
             expirable: false,
+            recovery_escalation: PrefetchExecutorRecoveryEscalationClass::None,
             reserve_protected: false,
             budget_owner: StorageIntentDomainId::ZERO,
             requested_bytes: 0,
@@ -844,6 +876,7 @@ impl Default for PrefetchExecutorAdmissionRecord {
             queue_time_us: 0,
             refusal: StorageIntentRefusalReason::None,
             scheduler_admission_ref: EMPTY_EVIDENCE_REF,
+            recovery_degradation_ref: EMPTY_EVIDENCE_REF,
         }
     }
 }
@@ -862,6 +895,7 @@ impl PrefetchExecutorAdmissionRecord {
             droppable: false,
             throttleable: true,
             expirable: false,
+            recovery_escalation: PrefetchExecutorRecoveryEscalationClass::None,
             reserve_protected: false,
             budget_owner,
             requested_bytes: 0,
@@ -869,6 +903,7 @@ impl PrefetchExecutorAdmissionRecord {
             queue_time_us: 0,
             refusal: StorageIntentRefusalReason::None,
             scheduler_admission_ref: evidence_ref,
+            recovery_degradation_ref: EMPTY_EVIDENCE_REF,
         }
     }
 
@@ -893,6 +928,17 @@ impl PrefetchExecutorAdmissionRecord {
         self.droppable = droppable;
         self.throttleable = throttleable;
         self.expirable = expirable;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_recovery_escalation(
+        mut self,
+        escalation: PrefetchExecutorRecoveryEscalationClass,
+        recovery_degradation_ref: StorageIntentEvidenceRef,
+    ) -> Self {
+        self.recovery_escalation = escalation;
+        self.recovery_degradation_ref = recovery_degradation_ref;
         self
     }
 }
@@ -1049,6 +1095,7 @@ pub struct PrefetchExecutorEvidenceRefs {
     pub tenant_isolation_ref: StorageIntentEvidenceRef,
     pub transport_budget_ref: StorageIntentEvidenceRef,
     pub trust_domain_ref: StorageIntentEvidenceRef,
+    pub recovery_degradation_ref: StorageIntentEvidenceRef,
     pub retention_ref: StorageIntentEvidenceRef,
     pub attribution_ref: StorageIntentEvidenceRef,
     pub validation_ref: StorageIntentEvidenceRef,
@@ -1732,14 +1779,14 @@ pub fn evaluate_prefetch_execution(input: PrefetchExecutorInput) -> PrefetchExec
                     PrefetchExecutorByteState::Blocked,
                     runtime_dispatch_evidence_refusal(input, family),
                 )
-            } else if admitted_speculative_pressure_refusal(input.admission) as u16
+            } else if admitted_speculative_pressure_refusal(input) as u16
                 != StorageIntentRefusalReason::None as u16
             {
                 terminal(
                     record,
                     PrefetchExecutorOutcome::Refused,
                     PrefetchExecutorByteState::Refused,
-                    admitted_speculative_pressure_refusal(input.admission),
+                    admitted_speculative_pressure_refusal(input),
                 )
             } else if !input.runtime_support.supports_family(family) {
                 terminal(
@@ -1965,6 +2012,7 @@ fn base_record(input: PrefetchExecutorInput) -> PrefetchExecutorRecord {
                 input.media_path.trust_domain_ref,
                 input.decision.evidence_refs.trust_domain_ref,
             ),
+            recovery_degradation_ref: input.admission.recovery_degradation_ref,
             retention_ref: input.result_detail.retention_ref,
             attribution_ref: input.result_detail.attribution_ref,
             validation_ref: input.result_detail.validation_ref,
@@ -2241,6 +2289,17 @@ fn terminal_update_lacks_started_dispatch_evidence(
         return true;
     }
 
+    if record_uses_recovery_escalation(record)
+        && !terminal_ref_in_cut(
+            record,
+            cut,
+            record.evidence_refs.recovery_degradation_ref,
+            StorageIntentEvidenceKind::RecoveryDegradationEvidence,
+        )
+    {
+        return true;
+    }
+
     false
 }
 
@@ -2248,6 +2307,13 @@ fn record_runtime_dispatch_needs_transport_or_trust(record: PrefetchExecutorReco
     record.action_family.needs_remote_path_evidence()
         || media_needs_transport_or_trust(record.source_media)
         || media_needs_transport_or_trust(record.target_media)
+}
+
+fn record_uses_recovery_escalation(record: PrefetchExecutorRecord) -> bool {
+    record
+        .admission
+        .recovery_escalation
+        .requires_recovery_degradation_evidence()
 }
 
 fn terminal_result_detail_lacks_charge_evidence(
@@ -2855,17 +2921,33 @@ const fn media_needs_transport_or_trust(media: StorageMediaClass) -> bool {
 }
 
 fn admitted_speculative_pressure_refusal(
-    admission: PrefetchExecutorAdmissionRecord,
+    input: PrefetchExecutorInput,
 ) -> StorageIntentRefusalReason {
+    let admission = input.admission;
     if !matches!(
         admission.lane,
         PrefetchExecutorSchedulerLane::Speculative | PrefetchExecutorSchedulerLane::Background
     ) || admission.pressure.is_empty()
-        || admission.droppable
-        || admission.throttleable
-        || admission.expirable
     {
         return StorageIntentRefusalReason::None;
+    }
+
+    if admission.droppable || admission.throttleable || admission.expirable {
+        return StorageIntentRefusalReason::None;
+    }
+
+    if admission
+        .recovery_escalation
+        .requires_recovery_degradation_evidence()
+    {
+        if snapshot_contains_fresh_ref(
+            input,
+            StorageIntentEvidenceKind::RecoveryDegradationEvidence,
+            admission.recovery_degradation_ref,
+        ) {
+            return StorageIntentRefusalReason::None;
+        }
+        return StorageIntentRefusalReason::EvidenceNotUsable;
     }
 
     pressure_refusal(admission.pressure)
@@ -3083,6 +3165,7 @@ mod tests {
     const INTERRUPTION: StorageIntentEvidenceId = StorageIntentEvidenceId([23; 32]);
     const RUNTIME_SUPPORT: StorageIntentEvidenceId = StorageIntentEvidenceId([24; 32]);
     const RELOCATION: StorageIntentEvidenceId = StorageIntentEvidenceId([25; 32]);
+    const RECOVERY: StorageIntentEvidenceId = StorageIntentEvidenceId([26; 32]);
 
     fn evidence(
         kind: StorageIntentEvidenceKind,
@@ -3440,6 +3523,9 @@ mod tests {
             push_terminal_ref(refs, record.evidence_refs.transport_budget_ref);
             push_terminal_ref(refs, record.evidence_refs.trust_domain_ref);
         }
+        if record_uses_recovery_escalation(record) {
+            push_terminal_ref(refs, record.evidence_refs.recovery_degradation_ref);
+        }
     }
 
     fn push_terminal_start_refs_except(
@@ -3469,6 +3555,13 @@ mod tests {
                 omitted,
             );
             push_terminal_start_ref_unless(refs, record.evidence_refs.trust_domain_ref, omitted);
+        }
+        if record_uses_recovery_escalation(record) {
+            push_terminal_start_ref_unless(
+                refs,
+                record.evidence_refs.recovery_degradation_ref,
+                omitted,
+            );
         }
     }
 
@@ -3814,6 +3907,76 @@ mod tests {
         );
         assert!(degraded_record.is_non_authority_population());
         assert_record_has_no_authority_claims(degraded_record);
+    }
+
+    #[test]
+    fn pressured_speculative_dispatch_requires_controls_or_recovery_escalation() {
+        let mut unprotected = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        unprotected.admission.pressure = PrefetchExecutorPressureMask::P99_LATENCY;
+        unprotected.admission = unprotected
+            .admission
+            .with_speculative_controls(false, false, false);
+        let unprotected_record = evaluate_prefetch_execution(unprotected);
+        assert_eq!(unprotected_record.outcome, PrefetchExecutorOutcome::Refused);
+        assert_eq!(
+            unprotected_record.refusal,
+            StorageIntentRefusalReason::NoisyNeighborPressure
+        );
+        assert_record_has_no_authority_claims(unprotected_record);
+
+        let mut missing_ref = unprotected;
+        missing_ref.admission = missing_ref.admission.with_recovery_escalation(
+            PrefetchExecutorRecoveryEscalationClass::DegradedRiskReduction,
+            EMPTY_EVIDENCE_REF,
+        );
+        let missing_ref_record = evaluate_prefetch_execution(missing_ref);
+        assert_eq!(missing_ref_record.outcome, PrefetchExecutorOutcome::Refused);
+        assert_eq!(
+            missing_ref_record.refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+        assert_record_has_no_authority_claims(missing_ref_record);
+
+        let wrong_kind_ref = evidence(StorageIntentEvidenceKind::ActionExecutionEvidence, RECOVERY);
+        let mut wrong_kind = unprotected;
+        wrong_kind.admission = wrong_kind.admission.with_recovery_escalation(
+            PrefetchExecutorRecoveryEscalationClass::RepairEscalation,
+            wrong_kind_ref,
+        );
+        wrong_kind
+            .evidence_query_snapshot
+            .included_refs
+            .push(wrong_kind_ref)
+            .unwrap();
+        let wrong_kind_record = evaluate_prefetch_execution(wrong_kind);
+        assert_eq!(wrong_kind_record.outcome, PrefetchExecutorOutcome::Refused);
+        assert_eq!(
+            wrong_kind_record.refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+        assert_record_has_no_authority_claims(wrong_kind_record);
+
+        let recovery_ref = evidence(
+            StorageIntentEvidenceKind::RecoveryDegradationEvidence,
+            RECOVERY,
+        );
+        let mut escalated = unprotected;
+        add_fresh(
+            &mut escalated.evidence_query_snapshot,
+            StorageIntentEvidenceKind::RecoveryDegradationEvidence,
+            RECOVERY,
+        );
+        escalated.admission = escalated.admission.with_recovery_escalation(
+            PrefetchExecutorRecoveryEscalationClass::DegradedRiskReduction,
+            recovery_ref,
+        );
+        let escalated_record = evaluate_prefetch_execution(escalated);
+        assert_eq!(escalated_record.outcome, PrefetchExecutorOutcome::Started);
+        assert_eq!(
+            escalated_record.evidence_refs.recovery_degradation_ref,
+            recovery_ref
+        );
+        assert_record_has_no_authority_claims(escalated_record);
     }
 
     #[test]
@@ -5048,6 +5211,73 @@ mod tests {
                 evidence_cut: PrefetchExecutorTerminalEvidenceCut {
                     evidence_query_snapshot_ref: started.evidence_refs.evidence_query_snapshot_ref,
                     included_refs: missing_trust_refs,
+                },
+                ..PrefetchExecutorTerminalUpdate::default()
+            },
+        );
+        assert_eq!(
+            rejected.outcome,
+            PrefetchExecutorOutcome::VerificationFailed
+        );
+        assert_eq!(
+            rejected.refusal,
+            StorageIntentRefusalReason::ValidationGateFailed
+        );
+        assert_record_has_no_authority_claims(rejected);
+
+        let completed = finalize_prefetch_execution(
+            started,
+            PrefetchExecutorTerminalUpdate {
+                outcome: PrefetchExecutorOutcome::Completed,
+                evidence_cut: terminal_evidence_cut(
+                    started,
+                    PrefetchExecutorResultDetail::default(),
+                    EMPTY_EVIDENCE_REF,
+                ),
+                ..PrefetchExecutorTerminalUpdate::default()
+            },
+        );
+        assert_eq!(completed.outcome, PrefetchExecutorOutcome::Completed);
+        assert_record_has_no_authority_claims(completed);
+    }
+
+    #[test]
+    fn terminal_update_requires_recovery_escalation_ref_inside_terminal_cut() {
+        let recovery_ref = evidence(
+            StorageIntentEvidenceKind::RecoveryDegradationEvidence,
+            RECOVERY,
+        );
+        let mut input = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        input.admission.pressure = PrefetchExecutorPressureMask::REPAIR;
+        input.admission = input
+            .admission
+            .with_speculative_controls(false, false, false)
+            .with_recovery_escalation(
+                PrefetchExecutorRecoveryEscalationClass::RepairEscalation,
+                recovery_ref,
+            );
+        add_fresh(
+            &mut input.evidence_query_snapshot,
+            StorageIntentEvidenceKind::RecoveryDegradationEvidence,
+            RECOVERY,
+        );
+        let started = evaluate_prefetch_execution(input);
+        assert_eq!(started.outcome, PrefetchExecutorOutcome::Started);
+        assert!(record_uses_recovery_escalation(started));
+
+        let mut missing_recovery_refs = StorageIntentEvidenceRefs::EMPTY;
+        push_terminal_start_refs_except(
+            &mut missing_recovery_refs,
+            started,
+            started.evidence_refs.recovery_degradation_ref,
+        );
+        let rejected = finalize_prefetch_execution(
+            started,
+            PrefetchExecutorTerminalUpdate {
+                outcome: PrefetchExecutorOutcome::Completed,
+                evidence_cut: PrefetchExecutorTerminalEvidenceCut {
+                    evidence_query_snapshot_ref: started.evidence_refs.evidence_query_snapshot_ref,
+                    included_refs: missing_recovery_refs,
                 },
                 ..PrefetchExecutorTerminalUpdate::default()
             },
