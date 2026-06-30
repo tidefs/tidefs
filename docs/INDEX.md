@@ -12,14 +12,15 @@ Start here:
 8. `docs/REVIEW_TODO_REGISTER.md`
 9. `docs/WHOLE_REPO_REVIEW.md`
 10. `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`
-11. `docs/KERNEL_RESIDENCY_AUTHORITY.md`
-12. `docs/MOUNTED_TRANSFORM_AUTHORITY_RAW_STORE_INVENTORY.md`
-13. `docs/TIMESTAMP_GENERATION_AUTHORITY.md`
-14. `docs/INODE_NAMESPACE_AUTHORITY.md`
-15. `docs/PAGE_CACHE_WRITEBACK_AUTHORITY.md`
-16. `docs/RAM_AUTHORITY_DESIGN.md`
-17. `docs/STORAGE_INTENT_SERVICE_OBJECTIVE_DESIGN.md`
-18. `docs/STORAGE_INTENT_RESULT_REFUSAL_EVIDENCE_DESIGN.md`
+11. `docs/SUCCESSOR_LOCKDOWN_AND_DOC_CONSOLIDATION.md`
+12. `docs/KERNEL_RESIDENCY_AUTHORITY.md`
+13. `docs/MOUNTED_TRANSFORM_AUTHORITY_RAW_STORE_INVENTORY.md`
+14. `docs/TIMESTAMP_GENERATION_AUTHORITY.md`
+15. `docs/INODE_NAMESPACE_AUTHORITY.md`
+16. `docs/PAGE_CACHE_WRITEBACK_AUTHORITY.md`
+17. `docs/RAM_AUTHORITY_DESIGN.md`
+18. `docs/STORAGE_INTENT_SERVICE_OBJECTIVE_DESIGN.md`
+19. `docs/STORAGE_INTENT_RESULT_REFUSAL_EVIDENCE_DESIGN.md`
 
 Book:
 
@@ -41,6 +42,9 @@ Release readiness boundary and evidence inputs:
 - `docs/PRODUCT_ADMISSION_PROOF_TRAINS.md` maps product-admission proof trains
   as a planning and review overlay, not as a release-readiness verdict or
   product-admission claim.
+- `docs/SUCCESSOR_LOCKDOWN_AND_DOC_CONSOLIDATION.md` binds successor and
+  comparator wording to the claim registry and routes documentation cleanup
+  through TFR-019 authority classification.
 - `docs/PERFORMANCE_BUDGETS_SLO_REGRESSION_GATES_P10-03.md` defines the
   performance-budget gate and gate-local receipts.
 - `docs/GITHUB_CI.md` describes standing CI and release-candidate workflow
@@ -75,6 +79,7 @@ Key design, policy, and reference areas:
 - `docs/INODE_NAMESPACE_AUTHORITY.md`
 - `docs/LOCAL_DISTRIBUTED_RECEIPT_AUTHORITY.md`
 - `docs/STORAGE_INTENT_POLICY_AUTHORITY.md`
+- `docs/SUCCESSOR_LOCKDOWN_AND_DOC_CONSOLIDATION.md`
 - `docs/STORAGE_INTENT_SERVICE_OBJECTIVE_DESIGN.md`
 - `docs/STORAGE_INTENT_RESULT_REFUSAL_EVIDENCE_DESIGN.md`
 - `docs/TRANSPORT_CLUSTER_AUTHORITY.md`
