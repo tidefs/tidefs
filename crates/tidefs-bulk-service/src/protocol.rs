@@ -23,6 +23,7 @@ const CREDIT_GRANT_TCP_BODY_LEN: usize = 17;
 const CREDIT_GRANT_RDMA_BODY_LEN: usize = 29;
 const DONE_BODY_LEN: usize = 48;
 const ABORT_BODY_LEN: usize = 37;
+const TCP_CHUNK_HEADER_LEN: usize = 24;
 
 /// Magic prefix for BULK-owned VFS_RPC metadata carried in OFFER.
 pub const VFS_RPC_BULK_METADATA_MAGIC: [u8; 4] = *b"VFSR";
@@ -212,6 +213,74 @@ pub struct BulkAbortFrame {
     pub reason: BulkAbortReason,
 }
 
+/// A raw TCP_STREAM data chunk for a granted BULK credit.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BulkTcpChunkFrame {
+    pub stream_id: StreamId,
+    pub chunk_seq: u32,
+    pub offset: u64,
+    pub payload: Vec<u8>,
+    pub checksum32: u32,
+}
+
+impl BulkTcpChunkFrame {
+    pub fn new(
+        stream_id: StreamId,
+        chunk_seq: u32,
+        offset: u64,
+        payload: Vec<u8>,
+    ) -> Result<Self, BulkProtocolError> {
+        ensure_tcp_chunk_len(payload.len())?;
+        let checksum32 = crc32c::crc32c(&payload);
+        Ok(Self {
+            stream_id,
+            chunk_seq,
+            offset,
+            payload,
+            checksum32,
+        })
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>, BulkProtocolError> {
+        ensure_tcp_chunk_len(self.payload.len())?;
+        let mut out = Vec::with_capacity(TCP_CHUNK_HEADER_LEN + self.payload.len());
+        out.extend_from_slice(&self.stream_id.to_le_bytes());
+        out.extend_from_slice(&self.chunk_seq.to_le_bytes());
+        out.extend_from_slice(&self.offset.to_le_bytes());
+        out.extend_from_slice(&(self.payload.len() as u32).to_le_bytes());
+        out.extend_from_slice(&self.checksum32.to_le_bytes());
+        out.extend_from_slice(&self.payload);
+        Ok(out)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, BulkProtocolError> {
+        require_min_len("TCP chunk", bytes, TCP_CHUNK_HEADER_LEN)?;
+        let payload_len = u32::from_le_bytes(bytes[16..20].try_into().unwrap()) as usize;
+        let expected = TCP_CHUNK_HEADER_LEN
+            .checked_add(payload_len)
+            .ok_or(BulkProtocolError::BodyLengthOverflow { frame: "TCP chunk" })?;
+        require_exact_len("TCP chunk", bytes, expected)?;
+
+        let payload = bytes[TCP_CHUNK_HEADER_LEN..].to_vec();
+        let checksum32 = u32::from_le_bytes(bytes[20..24].try_into().unwrap());
+        let actual = crc32c::crc32c(&payload);
+        if checksum32 != actual {
+            return Err(BulkProtocolError::TcpChunkChecksumMismatch {
+                expected: checksum32,
+                actual,
+            });
+        }
+
+        Ok(Self {
+            stream_id: u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
+            chunk_seq: u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+            offset: u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
+            payload,
+            checksum32,
+        })
+    }
+}
+
 /// A typed BULK service frame.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BulkFrame {
@@ -345,6 +414,13 @@ pub enum BulkProtocolError {
     UnknownAbortReason(u8),
     UnknownVfsRpcMethod(u8),
     UnknownVfsRpcDirection(u8),
+    TcpChunkTooLarge {
+        len: usize,
+    },
+    TcpChunkChecksumMismatch {
+        expected: u32,
+        actual: u32,
+    },
 }
 
 impl fmt::Display for BulkProtocolError {
@@ -389,6 +465,13 @@ impl fmt::Display for BulkProtocolError {
             Self::UnknownVfsRpcDirection(value) => {
                 write!(f, "unknown VFS_RPC BULK direction {value}")
             }
+            Self::TcpChunkTooLarge { len } => {
+                write!(f, "BULK TCP chunk payload length {len} exceeds u32::MAX")
+            }
+            Self::TcpChunkChecksumMismatch { expected, actual } => write!(
+                f,
+                "BULK TCP chunk CRC32C {actual:#010x} does not match expected {expected:#010x}"
+            ),
         }
     }
 }
@@ -680,6 +763,13 @@ fn require_exact_len(
     Ok(())
 }
 
+fn ensure_tcp_chunk_len(len: usize) -> Result<(), BulkProtocolError> {
+    if len > u32::MAX as usize {
+        return Err(BulkProtocolError::TcpChunkTooLarge { len });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -753,6 +843,26 @@ mod tests {
             let decoded = BulkFrame::decode_from_transport(&wire).expect("decode");
             assert_eq!(decoded, frame);
         }
+    }
+
+    #[test]
+    fn tcp_chunk_frame_roundtrips_and_checksums_payload() {
+        let chunk = BulkTcpChunkFrame::new(11, 2, 8192, b"chunk payload".to_vec()).expect("chunk");
+        let wire = chunk.encode().expect("wire");
+        let decoded = BulkTcpChunkFrame::decode(&wire).expect("decode");
+
+        assert_eq!(decoded, chunk);
+
+        let mut corrupted = wire;
+        *corrupted.last_mut().unwrap() ^= 0xff;
+        let actual = crc32c::crc32c(&corrupted[TCP_CHUNK_HEADER_LEN..]);
+        assert_eq!(
+            BulkTcpChunkFrame::decode(&corrupted),
+            Err(BulkProtocolError::TcpChunkChecksumMismatch {
+                expected: chunk.checksum32,
+                actual,
+            })
+        );
     }
 
     #[test]

@@ -16,8 +16,8 @@ use tidefs_transport::{
 use crate::{
     AbortedBulkTransfer, BulkAbortFrame, BulkAcceptFrame, BulkCreditGrantFrame,
     BulkCreditRequestFrame, BulkCreditResult, BulkDoneFrame, BulkError, BulkFrame,
-    BulkProtocolError, BulkService, BulkToken, CompletedBulkTransfer, ConnectionId, StreamId,
-    BULK_SERVICE_ID,
+    BulkProtocolError, BulkService, BulkTcpChunkFrame, BulkToken, CompletedBulkTransfer,
+    ConnectionId, StreamId, BULK_SERVICE_ID,
 };
 
 /// BULK service-id handler suitable for registration in `DataServiceDispatch`.
@@ -52,6 +52,21 @@ impl BulkDataServiceHandler {
             chunk_seq,
             offset,
             payload,
+        )
+    }
+
+    /// Write a decoded TCP_STREAM chunk into BULK reassembly state.
+    pub fn handle_tcp_chunk(
+        &self,
+        connection_id: ConnectionId,
+        chunk: BulkTcpChunkFrame,
+    ) -> Result<(), BulkError> {
+        self.service.lock().unwrap().write_tcp_chunk_for_stream(
+            connection_id,
+            chunk.stream_id,
+            chunk.chunk_seq,
+            chunk.offset,
+            &chunk.payload,
         )
     }
 
@@ -301,8 +316,12 @@ mod tests {
 
         assert_eq!(handler.active_transfer_count(session_id.0), 1);
         assert_eq!(handler.pinned_bytes(session_id.0), 5);
+        let chunk = BulkTcpChunkFrame::new(11, grant.chunk_seq, grant.offset, b"hello".to_vec())
+            .expect("chunk");
+        let chunk =
+            BulkTcpChunkFrame::decode(&chunk.encode().expect("chunk wire")).expect("chunk decode");
         handler
-            .write_tcp_chunk(session_id.0, token, grant.chunk_seq, grant.offset, b"hello")
+            .handle_tcp_chunk(session_id.0, chunk)
             .expect("chunk");
 
         let done = BulkFrame::Done(BulkDoneFrame {
