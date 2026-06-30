@@ -21,6 +21,7 @@ tidefs-binary_schema-core = { workspace = true }
 tidefs-local-object-store = { workspace = true }
 tokio = { workspace = true, optional = true, features = ["rt"] }
 tidefs-transport = { workspace = true, optional = true }
+tidefs-types-transport-session = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
@@ -30,4 +31,4 @@ path = "src/lib.rs"
 
 [features]
 default = []
-transport = ["tidefs-transport", "tokio"]
+transport = ["tidefs-transport", "tidefs-types-transport-session", "tokio"]

@@ -36,6 +36,8 @@ pub mod object_chunk_framer;
 pub mod send_queue;
 pub mod send_stream_writer;
 pub mod send_transport_bridge;
+pub mod sender_session;
+pub mod source_admission;
 pub mod transport;
 
 pub use object_chunk_framer::{ChunkPacket, FrameError, ObjectChunkFramer};
@@ -43,6 +45,18 @@ pub use send_queue::SendQueue;
 #[cfg(feature = "transport")]
 pub use send_transport_bridge::ConnectionTransport;
 pub use send_transport_bridge::{SendTransport, SendTransportBridge, SendTransportError};
+pub use sender_session::{
+    CheckpointStoreError, InMemorySendCheckpointStore, SendCheckpointStore, SendResumePlan,
+    SendSessionCheckpoint, SenderSessionController, SenderSessionError,
+    ValidatedFeatureNegotiation,
+};
+pub use source_admission::{
+    ActiveShipment, AdmissionLimitScope, AdmissionToken, EvidenceStatus, ReceiverBaseRootStatus,
+    ResumeCheckpointStatus, RetryBackoffPolicy, SendAdmissionDecision, SendDeferReason,
+    SendFailureClass, SendRetryState, ShipmentCandidate, ShipmentKey, ShipmentMode,
+    SourceAdmissionController, SourceAdmissionEvidence, SourceAdmissionLimits, SourceSnapshotState,
+    TransportPathEvidence,
+};
 #[cfg(feature = "transport")]
 pub mod send_stream_adapter;
 #[cfg(feature = "transport")]
@@ -1778,6 +1792,12 @@ impl SendBuilder {
     #[must_use]
     pub fn records(&self) -> &[SendRecord] {
         &self.records
+    }
+
+    /// Return the stream header used for this planned send.
+    #[must_use]
+    pub const fn header(&self) -> &SendStreamHeader {
+        &self.header
     }
 
     /// Return send statistics for the planned stream.

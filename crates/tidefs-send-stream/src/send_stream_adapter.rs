@@ -68,6 +68,7 @@ use std::sync::mpsc;
 
 use tidefs_transport::envelope::MessageFamily;
 use tidefs_transport::outbound_send::SendPipelineHandle;
+use tidefs_types_transport_session::SessionClass;
 // SendPriority used via full path tidefs_transport::send_scheduler::SendPriority
 // Data-plane bulk priority: SendPriority::Bulk maps from SessionClass::TransferBulk
 
@@ -148,6 +149,7 @@ impl SendStreamTransportWriter {
     /// `buffer_depth` controls how many chunks can be queued before
     /// `send_chunk` blocks (backpressure).
     pub fn new(handle: SendPipelineHandle, config: SendStreamSessionConfig) -> Self {
+        let handle = handle.with_session_class(SessionClass::TransferBulk);
         let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(config.buffer_depth);
 
         let max_chunk_size = config.max_chunk_size;

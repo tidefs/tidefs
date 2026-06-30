@@ -126,6 +126,26 @@ impl<W: TransportWriter> SendTransport<W> {
         }
     }
 
+    /// Create a send transport that starts at an already-committed stream byte
+    /// offset. This is the source-side replay primitive for checkpoint resume:
+    /// bytes before `stream_offset` are not sent again.
+    pub fn resume_from_offset(
+        encoded: Vec<u8>,
+        writer: W,
+        chunk_size: u32,
+        stream_offset: usize,
+    ) -> Result<Self, SendStreamError> {
+        if stream_offset > encoded.len() {
+            return Err(SendStreamError::CursorOutOfRange {
+                index: stream_offset as u64,
+                records: encoded.len() as u64,
+            });
+        }
+        let mut transport = Self::new(encoded, writer, chunk_size);
+        transport.pos = stream_offset;
+        Ok(transport)
+    }
+
     /// Send all remaining chunks.
     pub fn send_all(&mut self) -> Result<(), W::Error> {
         self.start = Some(Instant::now());
@@ -157,6 +177,12 @@ impl<W: TransportWriter> SendTransport<W> {
     #[must_use]
     pub fn remaining(&self) -> usize {
         self.encoded.len() - self.pos
+    }
+
+    /// Current byte position in the encoded stream.
+    #[must_use]
+    pub fn position(&self) -> usize {
+        self.pos
     }
 
     /// Returns the underlying writer, consuming the transport.
@@ -478,6 +504,26 @@ mod tests {
             received.objects.get(&object_id(11)).unwrap().payload,
             b"goodbye"
         );
+    }
+
+    #[test]
+    fn resume_from_offset_sends_only_remaining_bytes() {
+        let pair = LoopbackPair::new(512);
+        let (writer, mut reader) = pair.split();
+        let mut send =
+            SendTransport::resume_from_offset(b"0123456789".to_vec(), writer, 4, 4).unwrap();
+
+        assert_eq!(send.position(), 4);
+        send.send_all().unwrap();
+        let stats = send.stats();
+        drop(send);
+
+        let mut received = Vec::new();
+        while let Some(chunk) = reader.wait_for_chunk().unwrap() {
+            received.extend_from_slice(&chunk);
+        }
+        assert_eq!(received, b"456789");
+        assert_eq!(stats.bytes_sent, 6);
     }
 
     #[test]
