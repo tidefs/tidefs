@@ -345,10 +345,6 @@ pub enum BulkProtocolError {
     UnknownAbortReason(u8),
     UnknownVfsRpcMethod(u8),
     UnknownVfsRpcDirection(u8),
-    ReservedNonZero {
-        frame: &'static str,
-        value: u8,
-    },
 }
 
 impl fmt::Display for BulkProtocolError {
@@ -392,9 +388,6 @@ impl fmt::Display for BulkProtocolError {
             Self::UnknownVfsRpcMethod(value) => write!(f, "unknown VFS_RPC BULK method {value}"),
             Self::UnknownVfsRpcDirection(value) => {
                 write!(f, "unknown VFS_RPC BULK direction {value}")
-            }
-            Self::ReservedNonZero { frame, value } => {
-                write!(f, "BULK {frame} reserved field is non-zero: {value}")
             }
         }
     }
@@ -602,12 +595,6 @@ fn decode_metadata(bytes: &[u8]) -> Result<BulkMetadata, BulkProtocolError> {
     require_exact_len("VFS_RPC metadata", bytes, VFS_RPC_BULK_METADATA_LEN)?;
     if bytes[4] != VFS_RPC_BULK_METADATA_VERSION {
         return Err(BulkProtocolError::UnsupportedMetadataVersion(bytes[4]));
-    }
-    if bytes[7] != 0 {
-        return Err(BulkProtocolError::ReservedNonZero {
-            frame: "VFS_RPC metadata",
-            value: bytes[7],
-        });
     }
     Ok(BulkMetadata::VfsRpc {
         method: decode_vfs_rpc_method(bytes[5])?,
@@ -825,5 +812,14 @@ mod tests {
             decode_metadata(&body).unwrap_err(),
             BulkProtocolError::UnsupportedMetadataVersion(2)
         );
+    }
+
+    #[test]
+    fn vfs_rpc_metadata_ignores_reserved_extension_byte() {
+        let metadata = BulkMetadata::vfs_rpc_write_upload(123);
+        let mut encoded = encode_metadata(&metadata);
+        encoded[7] = 0x7f;
+
+        assert_eq!(decode_metadata(&encoded).expect("decode"), metadata);
     }
 }

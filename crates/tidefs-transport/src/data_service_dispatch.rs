@@ -68,10 +68,6 @@ impl DataServiceFrame {
 
         let service_id = bytes[0];
         let message_type = bytes[1];
-        let reserved = u16::from_le_bytes([bytes[2], bytes[3]]);
-        if reserved != 0 {
-            return Err(DataServiceDispatchError::ReservedNonZero(reserved));
-        }
 
         let body_len = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as usize;
         let expected = DATA_SERVICE_FRAME_HEADER_LEN
@@ -161,7 +157,6 @@ impl DataServiceDispatch {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataServiceDispatchError {
     FrameTooShort { got: usize },
-    ReservedNonZero(u16),
     FrameLengthOverflow,
     FrameLengthMismatch { expected: usize, actual: usize },
     BodyTooLarge { len: usize },
@@ -174,9 +169,6 @@ impl fmt::Display for DataServiceDispatchError {
         match self {
             Self::FrameTooShort { got } => {
                 write!(f, "data service frame too short: {got} bytes")
-            }
-            Self::ReservedNonZero(value) => {
-                write!(f, "data service reserved field is non-zero: {value}")
             }
             Self::FrameLengthOverflow => f.write_str("data service frame length overflow"),
             Self::FrameLengthMismatch { expected, actual } => write!(
@@ -237,6 +229,17 @@ mod tests {
                 actual: DATA_SERVICE_FRAME_HEADER_LEN + 3,
             }
         );
+    }
+
+    #[test]
+    fn data_service_frame_ignores_reserved_header_bytes() {
+        let frame = DataServiceFrame::new(0x07, 0x02, b"bulk-body".to_vec());
+        let mut encoded = frame.encode().expect("encode");
+        encoded[2] = 0xaa;
+        encoded[3] = 0x55;
+
+        let decoded = DataServiceFrame::decode(&encoded).expect("decode");
+        assert_eq!(decoded, frame);
     }
 
     #[derive(Default)]
