@@ -715,7 +715,7 @@ comparisons remain gated by #875 and #928/#930 evidence.
 | `docs/POOL_IMPORT_EXPORT_DEVICE_TOPOLOGY_DESIGN.md` | Pool label and system area layout |
 | `docs/design/cross-dataset-reflink-and-copy-offload.md` | Pool-wide extent sharing |
 | `docs/design/rename-atomicity-spec-renameat2-flags-5-step-algorithm.md` | Intra-dataset rename spec |
-| `docs/ZFS_CEPH_DESIGN_MISTAKE_COVERAGE_MATRIX.md` | ZFS mistake #19 tracked |
+| Deleted ZFS/Ceph mistake lineage | Historical mistake #19 input retained in git history |
 
 ## 15. Gate
 

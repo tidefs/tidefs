@@ -822,7 +822,7 @@ operational safety versus ZFS/CephFS.
 - [#1252] Intent log and LOG_DEVICE design
 - [#1209] MEMBERSHIP service design (`docs/MEMBERSHIP_SERVICE_DESIGN.md`)
 - [#1251] Send/receive changed-record stream
-- [#1210] Transport boundedness design (`docs/CLUSTER_TRANSPORT_BOUNDEDNESS_DESIGN.md`)
+- [#1210] Transport boundedness lineage (deleted historical design in git history)
 - [#1228] Cluster security and identity model
 - [#1283] Cluster membership consensus
 - [#1285] Extent maps and locator tables

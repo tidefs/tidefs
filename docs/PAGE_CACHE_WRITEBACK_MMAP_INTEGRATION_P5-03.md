@@ -21,7 +21,8 @@ See also:
 - `docs/BLOCK_VOLUME_PROJECTION_CHARTER_BLOCK_VOLUME_ADAPTER.md`
 - `docs/END_TO_END_PRODUCTION_BLUEPRINT.md`
 - `docs/AUTHORITATIVE_DATA_STRUCTURES_ALGORITHMS.md`
-- `docs/CLUSTER_TRANSPORT_BOUNDEDNESS_DESIGN.md` (historical cluster BULK-plane foundation for Forgejo #1259 remote page faulting)
+- Deleted historical cluster transport lineage from Forgejo #1210/#1259
+  remains available in git history for remote page faulting background.
 
 ## Historical OW-204 implemented-source binding
 

@@ -865,7 +865,8 @@ This design does not cover:
 - `crates/tidefs_background_scheduler/src/lib.rs` — Background scheduler with 5-stage priority ordering
 - `crates/tidefs_dir_index/src/lib.rs` — Runtime polymorphic directory index (micro-list / B+tree)
 - `docs/design/cache-lattice-views.md` — Cache-lattice views design (#1176)
-- `docs/design/prefetch-readahead-budgeted-speculative-io.md` — Prefetch/readahead architecture (#1247)
+- Deleted prefetch/readahead lineage (#1247) — historical architecture input
+  retained in git history
 - `docs/DOCUMENTATION_AUTHORITY_REGISTER.md` — Current document authority classification register; this design remains historical input unless classified there
 - GitHub issues and pull requests — Current implementation coordination and status surface
 - Issue #1173 — Directory change streams (authoritative feed for incremental refresh)

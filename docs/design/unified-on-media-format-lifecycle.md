@@ -29,7 +29,7 @@ docs; it defines the rules that connect them.
 |---|---|---|
 | `docs/design/on-media-format-strategy.md` (#1220) | Record family catalogue, TLV rules, encoding | 1, 3 |
 | `docs/DATASET_FEATURE_FLAGS_DESIGN.md` (#1223) | Feature class model, mount gating | 2 |
-| `docs/V1_EXTENT_MAP_TRISTATE_MODEL_DESIGN.md` (#1225) | Example record family through full lifecycle | 1–5 |
+| Deleted tristate extent lineage (#1225) | Historical example record-family input retained in git history | 1–5 |
 | (pending) trace oracle spec (#1235) | Cross-implementation semantic equivalence | 5 |
 | (pending) RFP-Core methodology (#1236) | Python oracle mirror rule | cross-cutting |
 
@@ -919,7 +919,7 @@ path. All lifecycle costs are paid at:
 ## References
 
 - `docs/design/on-media-format-strategy.md` — V1 record family catalogue
-- `docs/V1_EXTENT_MAP_TRISTATE_MODEL_DESIGN.md` — Extent map tristate model
+- Deleted tristate extent lineage (#1225) — historical input in git history
 - `docs/DATASET_FEATURE_FLAGS_DESIGN.md` — Feature flag design
 - `docs/design/deterministic-crash-injection-harness.md` — Crash injection harness
 - `crates/tidefs-types-dataset-feature-flags-core/src/lib.rs` — Feature flag type authority

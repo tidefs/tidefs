@@ -83,7 +83,8 @@ authority docs and deleted it as a separate policy surface. Successor and
 comparator wording now lives in `docs/CLAIMS_GATE_POLICY.md`; the storage-intent
 receipt and non-claim spine lives in `docs/STORAGE_INTENT_POLICY_AUTHORITY.md`;
 TFR-019 classification and deletion process stays in this register. This did
-not validate
+not validate `storage.local.successor_comparator.v1`,
+`storage.distributed.successor_comparator.v1`, or the umbrella
 `storage.intent.successor_comparator.v1`, declare release or production
 readiness, classify every imported document, or close TFR-019.
 
@@ -176,6 +177,37 @@ The surviving source-backed surfaces are:
 This register intentionally does not keep a live row for every deleted
 duplicate. Git history and GitHub issue/PR history retain the path lineage.
 
+### Second-Wave Historical Design Deletions (TFR-019 / #1595)
+
+Issue #1595 deleted a second wave of historical design inputs whose live-looking
+status, phase-complete, canonical, sealed, or implementation-plan wording could
+be mistaken for current authority. The deleted set covered duplicate or stale
+cluster transport, trace-oracle, extent/locator, generation-staleness,
+semantic-op, cursor, metadata-parallelism, membership, directory-stream,
+prefetch/readahead, locator, and record-shaping designs, plus the old
+ZFS/Ceph mistake coverage matrix. Their useful current boundaries are either
+already represented by surviving source-backed authority docs, issue state,
+validation policy, or the split successor/comparator claim ids in
+`validation/claims.toml`.
+
+This register intentionally records the deletion as a family-level authority
+cleanup instead of keeping live rows for every removed path. Git history, issue
+#1595, and its pull request retain the deleted-path lineage.
+
+### Live-Looking Authority Marker Classifications (TFR-019 / #1595)
+
+Issue #1595 also hardened the doc-authority drift guard for unclassified
+Markdown files that declare themselves current, re-evaluated, canonical, or
+single-source authority. The following surviving docs keep narrow current-spec
+classification because source references or implementation-gate coordination
+still consume their exact boundaries. This does not promote broader runtime,
+release, successor, comparator, production, or parity claims.
+
+| Path | State | Classification note |
+|---|---|---|
+| `docs/cache-authority-model.md` | Current spec | Binding only for the cache authority class vocabulary and cache-layer ownership table consumed by current cache, local-filesystem, and FUSE adapter source comments. It is not an end-to-end page-cache/writeback/mmap durability proof, kernel page-cache completion claim, performance claim, or production readiness evidence. |
+| `docs/SNAPSHOT_NAMESPACE_BROWSING.md` | Current spec | Binding only as the issue #768 snapshot browsing namespace decision and follow-up map: transparent read-only browsing is the chosen design target and mutation/refusal boundary. It is not runtime validation, ZFS parity evidence, snapshot lifecycle proof, or release-readiness evidence. |
+
 ### Stale Marker Classifications (TFR-019 / #1590)
 
 Issue #1590 also classified surviving Markdown files that still carried
@@ -187,7 +219,6 @@ narrow source-backed scope.
 |---|---|---|
 | `docs/THREE_CONTRACT_ARCHITECTURE.md` | Historical input | Imported three-contract meta-architecture/design-law text. It is not current on-media, VFS, trace, JSONL, multi-implementation, or release authority. |
 | `docs/TORN_COMMIT_RECOVERY_CONTRACT.md` | Historical input | Imported torn-commit recovery design-spec text. It is not current recovery implementation evidence, crash-safety proof, or release-readiness authority. |
-| `docs/ZFS_CEPH_DESIGN_MISTAKE_COVERAGE_MATRIX.md` | Historical input | Imported ZFS/Ceph design-lesson matrix. It is not current successor, comparator, performance, reliability, cost, wear, or product evidence. |
 | `docs/adr/0001-checksum-architecture-g3-pillar.md` | Historical input | Historical ADR for checksum target architecture. It is not current checksum implementation evidence or OpenZFS/Ceph-class integrity proof. |
 | `docs/adr/0002-persistent-orphan-index.md` | Historical input | Historical ADR for persistent orphan-index target architecture. It is not current reclaim, crash-recovery, or space-accounting proof. |
 | `docs/adr/0004-txg-commit-ordering-state-machine.md` | Historical input | Historical ADR for commit-group ordering target architecture. It is not current pool-layer implementation or crash-consistency evidence. |
@@ -316,14 +347,11 @@ surface beyond adding `docs/CLAIMS_GATE_POLICY.md`, which was already scanned.
 | `docs/SPACE_ACCOUNTING_MODEL_DESIGN.md` | Historical input | Imported design-spec for logical vs physical space accounting. References Forgejo issue #1215. Claims registry has no validated space-accounting claim. |
 | `docs/POOL_IMPORT_EXPORT_DEVICE_TOPOLOGY_DESIGN.md` | Current spec | Scoped source-backed summary for the current pool-label, pool-scan/import, local import/export, and device-manager code paths. It is not product-readiness evidence for hot spares, evacuation, cluster ownership, online topology conversion, hardware-failure survival, availability, operational safety, or incumbent-comparison claims. |
 | `docs/DEVICE_LAYOUT_POLICIES_DESIGN.md` | Historical input | Imported design-spec that self-declares it has been superseded by `docs/design/device-layout-policies-adaptive-segment-sizing.md`. References Forgejo issue #1193. |
-| `docs/DEFERRED_CLEANUP_WORK_QUEUES_DESIGN.md` | Historical input | Imported design-spec for bounded-memory deferred cleanup work queues. References Forgejo issue #1212. |
-| `docs/DETERMINISTIC_TRACE_ORACLE_DESIGN.md` | Historical input | Imported design-spec for deterministic trace oracle. References Forgejo issue #1174. |
-| `docs/CLUSTER_TRANSPORT_BOUNDEDNESS_DESIGN.md` | Historical input | Imported design-spec for bounded cluster transport. References Forgejo issue #1210. Claims registry has no validated distributed-transport claim. |
 | `docs/INTENT_LOG_SYNC_WRITE_LATENCY_PC008.md` | Historical input | Imported implemented-source specification for intent-log sync write latency (PC-008). Binds PC-008 closeout to source without claiming production persistent WAL or measured SLO pass. |
 | `docs/TRANSACTION_COMMIT_GROUPS_PC007.md` | Historical input | Imported implemented-source specification for transaction commit groups (PC-007). Binds existing Local Filesystem transaction-root implementation and FUSE fsync boundary. |
 | `docs/MEMBERSHIP_SERVICE_DESIGN.md` | Historical input | Imported design-spec for cluster membership service. References Forgejo issue #1209. ZFS/Ceph comparison text is design input only and is not a cluster-membership, distributed-availability, scale, performance, or successor claim. Claims registry has no validated cluster-membership claim. |
 | `docs/ERASURE_CODING_PLACEMENT_DESIGN.md` | Historical input | Imported design-spec superseded by the G4 pillar at `docs/design/production-erasure-coding-crush-placement-g4-pillar.md`. References Forgejo issue #1249. |
-| `docs/design/openzfs-ceph-successor-claim.md` | Historical input | Imported sealed design-spec for the OpenZFS/Ceph successor claim with 8-dimension quantitative comparison. The seal is historical, not current claim authority. Claims gate currently blocks publishing an OpenZFS/Ceph successor claim; any future retained product-facing statement needs a #875 claim id and #928/#930 comparator evidence. |
+| `docs/design/openzfs-ceph-successor-claim.md` | Historical input | Imported sealed design-spec for the OpenZFS/Ceph successor claim with 8-dimension quantitative comparison. The seal is historical, not current claim authority. Claims gate currently blocks publishing OpenZFS/Ceph successor claims; any future retained product-facing statement must route through `storage.local.successor_comparator.v1` or `storage.distributed.successor_comparator.v1` plus their comparator evidence. |
 | `docs/design/production-erasure-coding-crush-placement-g4-pillar.md` | Historical input | Imported G4 pillar design-spec for TideCRUSH deterministic placement. References Forgejo issue #1779. Supersedes earlier erasure-coding placement designs. |
 | `docs/design/compression-design-strategy.md` | Historical input | Imported design-spec for compression format extension model. References Forgejo issue #1245. Transform authority blocks mounted compression claims. |
 
@@ -419,16 +447,18 @@ sections as historical design lessons or fail-closed review blockers, not
 current TideFS product evidence. None of these documents may be cited for a
 current OpenZFS, ZFS, Ceph, DRBD, ext4/XFS, performance-superiority,
 cost-effectiveness, flash-wear, RAM, WAN, durability, or successor claim
-unless the cited statement is re-expressed through a #875 claim id and the
-comparator evidence required by #928/#930:
+unless the cited statement is re-expressed through
+`storage.local.successor_comparator.v1` or
+`storage.distributed.successor_comparator.v1` and the comparator evidence
+required by those registry entries:
 
 - `docs/PERSISTENT_ORPHAN_INDEX_DESIGN.md`: ZFS/ext4/CephFS orphan-index
   table and former "key advantages" list are non-claim design lessons.
 - `docs/POLYMORPHIC_DIRECTORY_INDEX_DESIGN.md`: ZFS ZAP comparison and former
   "improvements over ZFS" list are non-claim design lessons.
-- `docs/POLYMORPHIC_EXTENT_MAPS_DESIGN.md`: ZFS/Ceph extent-layout tables,
-  random-read cost hypothesis, and design-mistake coverage are non-claim
-  design lessons.
+- Deleted polymorphic extent-map design lineage: ZFS/Ceph extent-layout tables,
+  random-read cost hypotheses, and design-mistake coverage remain non-claim
+  historical lessons in git history only.
 - `docs/MEMBERSHIP_SERVICE_DESIGN.md`: ZFS/Ceph cluster-membership comparison
   is design input only; no cluster-membership claim is validated.
 - The deleted shard/rebake design-family comparison text about ZFS/Ceph
@@ -447,7 +477,8 @@ Non-overlapping child slices completed the cluster-by-cluster audit and added
 Incumbent Comparison Boundary sections to the following file groups. Each
 grouped file is classified as historical/design input only for its comparison
 text; no product-facing successor, superiority, or parity wording exists in
-any of these files without a #875 claim id and #928/#930 comparator evidence.
+any of these files without the matching split successor/comparator claim id and
+its comparator evidence.
 
 Child slices (all merged):
 - #933 / PR #955: background jobs, deferred cleanup, reclaim, orphan-index,
@@ -466,12 +497,13 @@ Consolidation closure (this commit):
   close" comparison sections are historical design input, not current capability
   or successor claims. A Incumbent Comparison Boundary section now gates both
   comparison blocks, and the former "CephFS successor claims" product-surface
-  line is rewritten as a non-claim scope note citing #875/#928/#930.
+  line is rewritten as a non-claim scope note citing the split
+  successor/comparator claim boundary.
 
 This consolidation closes the #931 audit. No live doc contains un-gated
 incumbent-comparison, successor, or product-superiority wording. Any future
-product-facing comparison must route through #875 claim ids and #928/#930
-comparator evidence.
+product-facing comparison must route through the matching split
+successor/comparator claim id and comparator evidence.
 
 ## Initial Open Queue Resolution (#689)
 
@@ -485,27 +517,12 @@ larger than this documentation-authority cleanup.
 
 | Path | State | Classification note |
 |---|---|---|
-| `docs/EXTENT_MAPS_LOCATOR_TABLES_DESIGN.md` | Historical input | Imported Forgejo #1285 design with on-media extent/locator authority wording. Live source has extent-map and locator-table crates, but this slice did not reconcile the full V2 media model, migration text, and claims-gate surface, so it is design input only. |
-| `docs/GENERATION_STALENESS_DISCIPLINE_DESIGN.md` | Historical input | Imported Forgejo #1242 stale-generation/fence model that spans caches, commit groups, metadata, replication, and jobs. It needs a dedicated source and claims review before it can govern current staleness behavior. |
 | `docs/POLYMORPHIC_XATTR_STORAGE_DESIGN.md` | Historical input | Imported Forgejo #1290 xattr storage design with proposed on-media records and ACL integration. Current xattr/ACL behavior and claims coverage were not audited here, so the document remains review material. |
 | `docs/POSIX_ACL_XATTR_CODEC_DESIGN.md` | Historical input | Imported ACL codec design that marks itself superseded and names a replacement issue lineage. It must not be cited as current POSIX ACL authority without a fresh ACL/xattr source review. |
 | `docs/REFCOUNT_DELTA_CLEANUP_QUEUES_DESIGN.md` | Historical input | Imported Forgejo #1180 refcount-delta reclamation design. Current reclaim/deadlist work is active elsewhere, but the complete queue data model and runtime evidence were not validated in this slice. |
-| `docs/SEMANTIC_OP_CANONICAL_NAME_REGISTRY_DESIGN.md` | Historical input | Imported Forgejo #1200 semantic-op registry proposal. It describes a central naming authority broader than the current claims reviewed here and remains implementation-planning input. |
 | `docs/SNAPSHOT_DEADLIST_PINNING_DESIGN.md` | Historical input | Imported snapshot deadlist/pinning design that reaches into reclamation, references, and snapshot lifecycle. It needs a dedicated snapshot/deadlist source and claims-gate review before promotion. |
 | `docs/UNIFIED_RESOURCE_GOVERNOR_DESIGN.md` | Historical input | Imported resource-governor design with broad scheduling and budget claims. Open resource-governor implementation work is separate; this document is not current runtime authority. |
-| `docs/UNIVERSAL_INCREMENTAL_CURSOR_FRAMEWORK_DESIGN.md` | Historical input | Imported universal cursor framework design across scrub, send/receive, rebake, resilver, and cleanup jobs. Promotion would require cross-crate source and evidence review beyond this slice. |
-| `docs/V1_EXTENT_MAP_TRISTATE_MODEL_DESIGN.md` | Historical input | Imported design-sealed tristate extent model that claims implemented source coverage. Although bounded search found current extent-map crates, the old authority and phase wording exceed the reviewed claims surface. |
-| `docs/design/METADATA_ENGINE_PARALLELISM_DESIGN.md` | Historical input | Imported metadata-engine parallelism design with broad scheduling and correctness implications. It needs dedicated engine/source review before any current-spec promotion. |
-| `docs/design/bounded-cluster-membership-state.md` | Historical input | Imported bounded-membership state design. Current distributed membership authority is only whatever later scoped rows classify; this file is not current cluster-service evidence. |
-| `docs/design/deterministic-trace-oracle-system.md` | Historical input | Imported deterministic trace-oracle design. It may inform future validation tooling, but this slice did not promote any trace-oracle claim or scanned claims-gate surface. |
 | `docs/design/device-layout-policies-adaptive-segment-sizing.md` | Historical input | Imported adaptive segment-sizing/device-layout policy design. It needs storage allocator/device-layout source and evidence review before it can constrain current behavior. |
-| `docs/design/directory-change-streams-namespace-event-protocol.md` | Historical input | Imported directory change-stream protocol design. Current namespace event behavior and claims coverage were not audited here, so it remains design input. |
-| `docs/design/polymorphic-extent-maps-design.md` | Historical input | Imported lowercase polymorphic-extent-map design duplicate/variant. It remains lineage material alongside the already historical extent-map comparison docs. |
-| `docs/design/prefetch-readahead-budgeted-speculative-io.md` | Historical input | Imported prefetch/readahead design with performance and scheduling implications. No current performance or runtime evidence was promoted in this slice. |
-| `docs/design/refcount-delta-based-incremental-data-cleanup-queues.md` | Historical input | Imported lowercase refcount-delta cleanup design duplicate/variant. It is review material until reclamation source and claims evidence are reconciled. |
-| `docs/design/v1-extent-map-tristate-model.md` | Historical input | Imported sealed architecture/design note for the V1 tristate extent model. It references current extent-map crates, but source/claims reconciliation for the full sparse-file, FIEMAP, fallocate, and stat-block contract remains out of scope here. |
-| `docs/design/v1-locator-table-inline-hash.md` | Historical input | Imported V1 locator-table inline-hash design that names `crates/tidefs-locator-table`. Promotion would require a focused locator-table source, validation, and claims-gate review. |
-| `docs/design/workload-adaptive-recordsize-and-extent-shaping.md` | Historical input | Imported workload-adaptive recordsize/extent-shaping design. It contains policy and performance implications that need storage allocator, extent, and claims evidence before becoming current authority. |
 
 ### Background Service Framework Scheduler Authority (TFR-019 / #1537)
 

@@ -180,8 +180,8 @@ for equivalent inputs, they are semantically equivalent.
 
 | Document | Role |
 |---|---|
-| `docs/DETERMINISTIC_TRACE_ORACLE_DESIGN.md` (#1174) | Trace oracle system design |
-| `docs/SEMANTIC_OP_CANONICAL_NAME_REGISTRY_DESIGN.md` (#1200) | Canonical op name registry |
+| Deleted trace-oracle lineage (#1174) | Historical trace oracle design input retained in git history |
+| Deleted semantic-op registry lineage (#1200) | Historical canonical op-name registry input retained in git history |
 | `docs/RFP_CORE.md` (#1236) | Python → Rust translation methodology |
 
 ### 4.4 Key invariants

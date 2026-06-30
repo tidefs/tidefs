@@ -30,7 +30,7 @@ owner and maps follow-up implementation issues with expected write sets.
   identity spec
 - `docs/MEMBERSHIP_PLACEMENT_FAILURE_DOMAIN_MODEL_P8-02.md` — membership,
   placement, and failure-domain law
-- `docs/CLUSTER_TRANSPORT_BOUNDEDNESS_DESIGN.md` — transport boundedness
+- Deleted transport boundedness lineage — historical input in git history
 - `docs/TRANSPORT_CLUSTER_AUTHORITY.md` and #672 (closed) — transport/cluster
   authority boundary decision
 - `docs/REVIEW_TODO_REGISTER.md` TFR-017 and TFR-019 entries
