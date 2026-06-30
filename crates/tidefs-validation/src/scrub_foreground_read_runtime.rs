@@ -379,7 +379,7 @@ fn base_evidence(
         claim_status_change: false,
         product_wording_change: false,
         run_id,
-        source_ref,
+        source_ref: source_ref.clone(),
         generated_at,
         environment: environment.clone(),
         runtime_source: RuntimeArtifactSource {
