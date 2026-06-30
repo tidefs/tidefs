@@ -526,7 +526,8 @@ tidefs-locator-table/                  # ExtentLocatorTable (page storage)
 - `docs/EXTENT_MAPS_LOCATOR_TABLES_DESIGN.md` — Extent map and locator table core design
 - `docs/V1_EXTENT_MAP_TRISTATE_MODEL_DESIGN.md` — V1 tristate model design spec
 - `docs/REFCOUNT_DELTA_CLEANUP_QUEUES_DESIGN.md` — Refcount cleanup design
-- `docs/SHARD_GROUPS_REPLICAS_REBAKE_DESIGN.md` — Shard groups and rebake
+- Deleted shard/rebake historical lineage; use
+  `docs/LOCAL_DISTRIBUTED_RECEIPT_AUTHORITY.md` for current receipt authority.
 - `docs/BACKGROUND_SERVICE_FRAMEWORK_DESIGN.md` — Background service framework
 - `crates/tidefs-extent-map/src/polymorphic.rs` — PolymorphicExtentMap implementation
 - `crates/tidefs-types-extent-map-core/src/lib.rs` — Types, constants, and traits

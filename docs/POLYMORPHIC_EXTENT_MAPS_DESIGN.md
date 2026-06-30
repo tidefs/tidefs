@@ -583,8 +583,13 @@ pub enum PolymorphicExtentMapError {
 - [#1285] Extent Maps and Locator Tables Design (`docs/EXTENT_MAPS_LOCATOR_TABLES_DESIGN.md`)
 - [#1305] V1 Locator Table (`crates/tidefs-locator-table/`)
 - [#1180] Refcount Delta-Based Incremental Data Cleanup Queues (`docs/REFCOUNT_DELTA_CLEANUP_QUEUES_DESIGN.md`)
-- [#1286] Shard Groups, Replicas, and Rebake Pathway (`docs/SHARD_GROUPS_REPLICAS_REBAKE_DESIGN.md`)
-- [#1288] Scrub, Deep Scrub, Repair, and Resilver Orchestration (`docs/SCRUB_REPAIR_RESILVER_DESIGN.md`)
+- [#1286] Shard Groups, Replicas, and Rebake Pathway (deleted historical
+  lineage; use `docs/LOCAL_DISTRIBUTED_RECEIPT_AUTHORITY.md` and
+  `docs/POOL_WIDE_REDUNDANCY_PLACEMENT_CONTRACT.md` for current
+  receipt/placement authority)
+- [#1288] Scrub, Deep Scrub, Repair, and Resilver Orchestration (deleted
+  historical lineage; use `docs/SCRUB_IDENTITY_AUTHORITY.md` for current local
+  scrub identity authority)
 - [#1223] Dataset Feature Flags Architecture (`docs/DATASET_FEATURE_FLAGS_DESIGN.md`)
 - [#1179] Background Service Framework (`docs/BACKGROUND_SERVICE_FRAMEWORK_DESIGN.md`)
 - [#1265] Online Defrag of Base Shards (future)

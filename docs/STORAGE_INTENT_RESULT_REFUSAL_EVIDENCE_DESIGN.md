@@ -59,13 +59,12 @@ infrastructure.
   `docs/TRANSPORT_CLUSTER_AUTHORITY.md`, `docs/CAPACITY_ACCOUNTING_AUTHORITY.md`,
   and `docs/PAGE_CACHE_WRITEBACK_AUTHORITY.md` for neighbor laws that must
   reach callers through #920 instead of local status strings.
-- `~/ai/docs/projects/tidefs/SCOPE_REFOCUS_2026-05-11.md`,
-  `~/ai/docs/projects/tidefs/automation/WORKER_BRIEF.md`, and current TideFS
-  workflow docs, which forbid new duplicated control-plane or
-  response-registry scaffolding without a direct running-product need.
+- Current TideFS workflow and authority docs, which forbid new duplicated
+  control-plane or response-registry scaffolding without a direct
+  running-product need.
 
-The required `~/ai/docs` searches found response-registry refocus material but
-no separate active #920 process document beyond the TideFS/Nexus workflow
+The required process-doc searches found response-registry refocus background
+but no separate active #920 process document beyond the TideFS/Nexus workflow
 rules.
 
 ## Decision

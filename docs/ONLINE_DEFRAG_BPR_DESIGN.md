@@ -295,5 +295,6 @@ surfaces a soft error. No data loss — existing shards remain valid.
 - #845 — workload prediction, payback, and anti-thrash evidence
 - #904/#960/#961/#962 — media capability predicates, producers, and freshness
 - #875/#928/#931 — claim and incumbent-comparison gates
-- `docs/SHARD_GROUPS_REPLICAS_REBAKE_DESIGN.md` — rebake design
+- Deleted shard/rebake historical lineage; use
+  `docs/LOCAL_DISTRIBUTED_RECEIPT_AUTHORITY.md` for current receipt authority.
 - Issue #1262 — merged duplicate with extended rationale

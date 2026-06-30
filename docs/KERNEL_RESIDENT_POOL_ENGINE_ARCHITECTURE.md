@@ -9,15 +9,18 @@ block-volume export, xfstests coverage, or production readiness exists today.
 Use `docs/KERNEL_RESIDENCY_AUTHORITY.md` for the TFR-009 authority boundary,
 explicit non-claims, tier upgrade gates, and follow-up implementation map.
 
-It consumes:
+Current authority and implementation inputs:
+
+- `docs/KERNEL_RESIDENCY_AUTHORITY.md`
+- `docs/KERNEL_MODULE_DEVELOPMENT_WORKFLOW_P7-05.md`
+- `crates/tidefs-kmod-posix-vfs/README.md`
+- `crates/tidefs-block-kmod/README.md`
+
+Historical design inputs:
 
 - `docs/KERNEL_MODULE_FAMILY_MATRIX_ROLLOUT_ORDER_P7-01.md`
 - `docs/RUST_FOR_LINUX_CRATE_TRAIT_BOUNDARIES_P7-02.md`
 - `docs/KERNEL_LOCKING_RCU_PINNING_WORKQUEUE_MODEL_P7-03.md`
-- `docs/VFS_BLOCK_INTEGRATION_KERNEL_UAPI_LAW_P7-04.md`
-- `docs/KERNEL_MODULE_DEVELOPMENT_WORKFLOW_P7-05.md`
-- `crates/tidefs-kmod-posix-vfs/README.md`
-- `crates/tidefs-block-kmod/README.md`
 
 ## Current Release Interpretation
 

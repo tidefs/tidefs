@@ -1,22 +1,37 @@
-# Background Service Framework Design (redirect)
+# Background Service Framework
 
-> **Historical design redirect.** TFR-019 / GitHub issue #1537 keeps this
-> background-service framework lineage as historical input in
-> `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`.
+This file is the single surviving documentation surface for the background
+service scheduler after the TFR-019 / GitHub issue #1590 duplicate-family
+collapse. The deleted background-service design variants were Forgejo-era
+lineage and phase-tracking material; git history and issue history preserve
+that record.
 
-The imported background service framework design lineage is now collected at:
+## Current Source Boundary
 
-**[`docs/design/background-service-framework-design.md`](design/background-service-framework-design.md)**
-(Forgejo issues #1592, #1673, #1674, #1877, #1859)
+The current source-backed scheduler boundary is:
 
-The original imported design lineage (issue #1179) described an initial
-specification and Phase 1-4 implementation. Later imported lineage records
-#1592 (enhanced pool properties, testing strategy), #1673 (tick-driven
-scheduler semantics), #1674 (consolidation), and #1877 (background service
-framework design audit and consolidation).
+- `crates/tidefs-background-scheduler/src/lib.rs`: `BackgroundService`,
+  `BackgroundScheduler`, `ServicePriority`, `ServiceBudget`, and
+  `IncrementalJobAdapter`.
+- `crates/tidefs-incremental-job-core/src/lib.rs`: object-safe
+  `IncrementalJob` trait and checkpoint codec boundary.
+- `crates/tidefs-types-incremental-job-core/src/lib.rs`: `WorkBudget`,
+  `JobKind`, `JobId`, `Checkpoint`, `StepResult`, and progress/error types.
+- `xtask/tidefs-xtask/src/bg_framework.rs`: focused source-marker validation
+  for the background-service framework.
 
-The live source-matched scheduler contract is limited to
-`crates/tidefs-background-scheduler/` source and the #1537 register entry. Do not
-use this redirect or the target design lineage as current product/runtime proof,
-phase-completion evidence, FUSE integration evidence, no-hidden-queue closure,
-release readiness, or product-comparison authority.
+This document does not supersede source. If source and this summary disagree,
+source plus the focused xtask check wins and this file must be corrected.
+
+## Authority Limits
+
+This file is not release-readiness evidence and does not prove every background
+maintenance subsystem is wired into mounted runtime behavior. It also does not
+prove scrub, resilver, rebake, compaction, reclamation, snapshot, distributed
+repair, or product-comparison claims. Those behaviors require their own current
+source evidence, validation, and claim IDs where they become publishing-facing
+claims.
+
+The current guarantee is narrow: TideFS has a shared scheduler/job contract in
+the crates named above, and that contract is validated by the focused
+background-framework xtask check.

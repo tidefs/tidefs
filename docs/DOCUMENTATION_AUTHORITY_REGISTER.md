@@ -2,16 +2,16 @@
 
 Date: 2026-06-30
 
-This register is the TFR-019 queue for imported documents that still need
-authority classification. It is deliberately narrow: it does not make the
-listed documents current policy, and it does not close any storage behavior
-claim.
+This register is the TFR-019 queue for documents that still need authority
+classification. It is deliberately narrow: it does not make the listed
+documents current policy, and it does not close any storage behavior claim.
 
 ## Authority Rule
 
 The active entry points are `README.md`, `AGENTS.md`, `docs/INDEX.md`,
-`docs/LICENSING.md`, `docs/REVIEW_TODO_REGISTER.md`,
-`docs/WHOLE_REPO_REVIEW.md`, `docs/CLAIMS_GATE_POLICY.md`, and this file.
+`docs/LICENSING.md`, `docs/REVIEW_TODO_POLICY.md`,
+`docs/REVIEW_TODO_REGISTER.md`, `docs/WHOLE_REPO_REVIEW.md`,
+`docs/CLAIMS_GATE_POLICY.md`, and this file.
 
 The active TideFS Book authoring decision is `docs/book/README.adoc`. The
 assembled book source starts at `docs/book/tidefs-book.adoc`; book chapters are
@@ -19,7 +19,19 @@ current only for the narrow subject they state and must not promote imported
 historical design material without this register classifying it.
 
 All other imported documents are review inputs until classified here or in a
-small follow-up commit tied to TFR-019.
+small follow-up commit tied to TFR-019. Documents under `docs/design/`, root
+documents ending in `_DESIGN.md`, issue-era implementation plans, old status
+matrices, coordination packets, closeout snapshots, and Forgejo-era milestone
+updates are historical input by default even when their text says
+`Maturity:`, `Status: sealed`, `canonical`, `single authoritative`, phase
+complete, implemented, or current. That wording is imported context, not
+current authority.
+
+A document becomes current policy or current spec only through source-backed
+classification that names the narrow scope being promoted. Product-facing,
+successor, comparator, release-readiness, durability, safety, performance,
+availability, or production wording still requires the claims gate and current
+validation evidence for that exact scope.
 
 ## Classification States
 
@@ -59,9 +71,10 @@ new status files. Keep generated outputs generated, especially
 `docs/CLAIM_REGISTRY.md` from `validation/claims.toml`. Treat broad design docs,
 old status matrices, coordination packets, closeout snapshots, and issue-era
 implementation plans as historical input or delete candidates until a focused
-issue classifies their exact scope. Delete only after useful content has moved
-or the file is obsolete scaffold/closeout material; keep path lineage in git,
-issues, and PRs instead of preserving a live row for every deleted file.
+issue classifies their exact scope. Delete after useful current content has
+moved or the file is obsolete scaffold/closeout material; keep deleted-path
+lineage in git, issues, and PRs instead of preserving a live register row for
+every deleted file.
 
 ## Folded Claim And Consolidation Bridge (#1588)
 
@@ -113,8 +126,9 @@ stay out of this coordination slice:
   `docs/design/persistent-orphan-index-consolidated-design.md`.
 - #1024 owns deleted status/matrix delivery outputs in
   `docs/design/node-lifecycle-management.md`.
-- #1025 owns deleted status/matrix update targets in
-  `docs/design/deferred-cleanup-background-service-scheduling.md`.
+- #1590 deleted the
+  `docs/design/deferred-cleanup-background-service-scheduling.md` historical
+  status/update target along with the background-service duplicate family.
 
 Bounded source/doc inspection for this coordination slice also found older
 status/matrix references outside the #1015-#1025 child map. Issue #1586 later
@@ -138,6 +152,48 @@ classification evidence remains in git history and the closed issues; this
 register intentionally does not keep live per-file rows for deleted documents.
 Current coordination authority remains GitHub issue and pull-request state plus
 the active repo documentation entry points.
+
+### Duplicate Design Family Deletions (TFR-019 / #1590)
+
+Issue #1590 deleted the obvious stale worklog/status documents and duplicate
+Forgejo-era design-family files for background service scheduling,
+scrub/repair/resilver, shard/rebake, pool import/export, and incremental-job
+wire-up. The deleted files were historical lineage, phase-tracking, or
+sealed/canonical-design variants whose useful current content either moved into
+existing source-backed authority paths or remains available in git history.
+
+The surviving source-backed surfaces are:
+
+- `docs/BACKGROUND_SERVICE_FRAMEWORK_DESIGN.md` for the current scheduler/job
+  contract summary.
+- `docs/POOL_IMPORT_EXPORT_DEVICE_TOPOLOGY_DESIGN.md` for the current
+  pool-label, scan/import, local import/export, and device-manager summary.
+- `docs/SCRUB_IDENTITY_AUTHORITY.md`,
+  `docs/LOCAL_DISTRIBUTED_RECEIPT_AUTHORITY.md`, and
+  `docs/POOL_WIDE_REDUNDANCY_PLACEMENT_CONTRACT.md` for narrow current
+  scrub/receipt/placement authority.
+
+This register intentionally does not keep a live row for every deleted
+duplicate. Git history and GitHub issue/PR history retain the path lineage.
+
+### Stale Marker Classifications (TFR-019 / #1590)
+
+Issue #1590 also classified surviving Markdown files that still carried
+Forgejo-era URLs or live-looking imported status markers. These files remain in
+the tree only as historical input unless a future focused issue promotes a
+narrow source-backed scope.
+
+| Path | State | Classification note |
+|---|---|---|
+| `docs/THREE_CONTRACT_ARCHITECTURE.md` | Historical input | Imported three-contract meta-architecture/design-law text. It is not current on-media, VFS, trace, JSONL, multi-implementation, or release authority. |
+| `docs/TORN_COMMIT_RECOVERY_CONTRACT.md` | Historical input | Imported torn-commit recovery design-spec text. It is not current recovery implementation evidence, crash-safety proof, or release-readiness authority. |
+| `docs/ZFS_CEPH_DESIGN_MISTAKE_COVERAGE_MATRIX.md` | Historical input | Imported ZFS/Ceph design-lesson matrix. It is not current successor, comparator, performance, reliability, cost, wear, or product evidence. |
+| `docs/adr/0001-checksum-architecture-g3-pillar.md` | Historical input | Historical ADR for checksum target architecture. It is not current checksum implementation evidence or OpenZFS/Ceph-class integrity proof. |
+| `docs/adr/0002-persistent-orphan-index.md` | Historical input | Historical ADR for persistent orphan-index target architecture. It is not current reclaim, crash-recovery, or space-accounting proof. |
+| `docs/adr/0004-txg-commit-ordering-state-machine.md` | Historical input | Historical ADR for commit-group ordering target architecture. It is not current pool-layer implementation or crash-consistency evidence. |
+| `docs/crates/types-core-consolidation-plan.md` | Historical input | Historical consolidation plan for deleted type-core scaffold roots. Current package authority is `docs/workspace-package-classification.md`. |
+| `docs/k7-kbuild-toolchain.md` | Historical input | Historical Kbuild toolchain preparation note. Current kernel workflow authority is `docs/KERNEL_MODULE_DEVELOPMENT_WORKFLOW_P7-05.md`. |
+| `docs/security/security-audit-2026-04-30.md` | Historical input | Chronological pre-release security audit snapshot. It is not current unsafe-code, security, release-readiness, or product-hardening authority. |
 
 ### Request Contract Authority (TFR-019 / #1136)
 
@@ -188,8 +244,8 @@ this set.
 | `docs/UAPI_ABI_BOUNDARY_OW202.md` | Historical input | Tracker-era duplicate with the retired `tidefs-schema-codec-vfs-boundary` crate path and old mirror-layout table. It may inform preview layout review, but it is not current UAPI/ABI authority and must not be cited as a production Linux ioctl/statx/ublk or kernel module ABI freeze. |
 | `docs/KERNEL_RESIDENT_POOL_ENGINE_ARCHITECTURE.md` | Current spec | Target architecture and evidence-tier map for kernel-resident pool-engine work. Current implementation evidence is the narrow Linux 7.0 QEMU configured-pool smoke described in `docs/GITHUB_CI.md`; full-kernel, daemonless storage parity, xfstests, crash/replay, object/extent engine, block-volume export, and production-readiness claims remain outside this status. |
 | `docs/KERNEL_MODULE_DEVELOPMENT_WORKFLOW_P7-05.md` | Current policy | Binding only as the Linux 7.0 kernel development workflow: external-module or Linux-branch ownership, out-of-repo build output, disposable QEMU guests, and Nix/QEMU acceptance gates. It is not runtime maturity evidence and does not require broad kernel validation for documentation-only slices. |
-| `docs/KERNEL_MODULE_FAMILY_MATRIX_ROLLOUT_ORDER_P7-01.md` | Current spec | Binding only for kernel-family rollout order, first-seam scope, and anti-regression constraints. It does not prove current full-kernel residency, no-daemon parity, block-volume behavior, xfstests coverage, crash recovery, distributed behavior, or production readiness. |
-| `docs/KERNEL_LOCKING_RCU_PINNING_WORKQUEUE_MODEL_P7-03.md` | Current spec | Binding only for the source-level locking, RCU, pin, workqueue, and acceptance-row model that later kernel work must consume. It is not a kernel implementation gate and not runtime proof until issue-scoped Kbuild/QEMU/fault evidence maps to the rows. |
+| `docs/KERNEL_MODULE_FAMILY_MATRIX_ROLLOUT_ORDER_P7-01.md` | Historical input | Broad P7 rollout-law import with missing blueprint-era dependencies. Current kernel authority is `docs/KERNEL_RESIDENCY_AUTHORITY.md`, `docs/KERNEL_RESIDENT_POOL_ENGINE_ARCHITECTURE.md`, the scoped Linux workflow row, kmod READMEs, source, and issue-scoped QEMU/Kbuild evidence. |
+| `docs/KERNEL_LOCKING_RCU_PINNING_WORKQUEUE_MODEL_P7-03.md` | Historical input | Broad P7 concurrency-law import with missing blueprint-era dependencies. It may inform future kernel work, but it is not current evidence, a kernel implementation gate, or a live cross-doc authority surface. |
 
 ### Operator UAPI Authority Decision
 
@@ -238,7 +294,7 @@ surface beyond adding `docs/CLAIMS_GATE_POLICY.md`, which was already scanned.
 | `docs/ON_DISK_FORMAT_VERSIONING_AND_COMPATIBILITY_POLICY.md` | Historical input | Imported release-policy with well-articulated format versioning discipline, but references a stale Forgejo issue (#6518) and non-existent sub-documents (FORMAT_IDENTITY_UPGRADE_REPLAY_CONTINUITY_LAW_P2-04.md, TRANSPORT_SESSION_COHORT_GRAPH_P8-01.md, ZERO_COPY_DMA_PINNING_PAGE_LOAN_LAW_P4-04.md). The pre-release note correctly states no public release has shipped. |
 | `docs/RDMA_TRANSPORT_POSITION.md` | Historical input | Imported transport-position document referencing non-existent sub-documents and stating "TideFS does not have a product RDMA data path yet." Useful for future RDMA design reference. |
 | `docs/DISTRIBUTED_OPERATOR_PRODUCT_SURFACE_BLOCKER_MAP_OW307D.md` | Historical input | Imported OW-307D blocker map. Records typed truth rows and deterministic demo rows present in source, but the parent OW-307 gate remains open and a runtime-fed operator product surface is not yet present. |
-| `docs/OPERATOR_PRODUCT_SURFACE_DECISION.md` | Current policy | Design decision #1267 recording the current runtime-fed operator product-surface boundary after the OW-307D blocker map. States that no runtime-fed operator product surface exists, the P10-04 truth-surface law is missing from the repository, and no product carrier class is selectable until prerequisite gates (TFR-011, TFR-017) close. Includes follow-up issue map for P10-04 disposition, TFR-011/TFR-017 closeout, and documentation cleanup. |
+| `docs/OPERATOR_PRODUCT_SURFACE_DECISION.md` | Current policy | Design decision #1267 recording the current runtime-fed operator product-surface boundary after the OW-307D blocker map. States that no runtime-fed operator product surface exists, the P10-04 truth-surface law is missing from the repository, and no product carrier class is selectable until transport/cluster authority and the P10-04 gap close. The operator/UAPI command boundary is closed for the current pre-alpha command surface, but that closeout is not a runtime-fed product carrier. |
 | `docs/DASHBOARDS_TRACES_OPERATOR_TRUTH_SURFACES_P10-04.md` | Missing | Truth-surface law reference absent from the repository. Issue #1270 records the gap: the law expected to define mandatory surface classes, provenance/exactness/freshness rendering, carrier verification, and the `truth_view` concept does not exist, so citations to this path are not current authority. |
 | `docs/PREVIEW_USER_MANUAL.md` | Historical input | Imported preview manual that correctly disclaims production readiness and references the claims gate and transform authority. Preview commands are useful orientation but the document is preview-scoped, not binding policy. |
 | `docs/troubleshooting-build.md` | Historical input | Imported developer guide for build failure diagnosis covering Nix shell and Cargo issues. Useful reference but specific tool versions and paths may have drifted since import. |
@@ -258,7 +314,7 @@ surface beyond adding `docs/CLAIMS_GATE_POLICY.md`, which was already scanned.
 | `docs/TXG_STATE_MACHINE_DESIGN.md` | Historical input | Imported spec-draft for canonical commit ordering and multi-phase commit_group state machine. References Forgejo issue #1267. |
 | `docs/SPACEMAP_ALLOCATOR_DESIGN.md` | Historical input | Imported design-spec for spacemap and segment allocator. Explicitly states no runtime allocator or persistent spacemap exists in current source. References Forgejo issue #1189. |
 | `docs/SPACE_ACCOUNTING_MODEL_DESIGN.md` | Historical input | Imported design-spec for logical vs physical space accounting. References Forgejo issue #1215. Claims registry has no validated space-accounting claim. |
-| `docs/POOL_IMPORT_EXPORT_DEVICE_TOPOLOGY_DESIGN.md` | Historical input | Imported design-spec for pool labels, import/export, and device topology. References Forgejo issue #1254. |
+| `docs/POOL_IMPORT_EXPORT_DEVICE_TOPOLOGY_DESIGN.md` | Current spec | Scoped source-backed summary for the current pool-label, pool-scan/import, local import/export, and device-manager code paths. It is not product-readiness evidence for hot spares, evacuation, cluster ownership, online topology conversion, hardware-failure survival, availability, operational safety, or incumbent-comparison claims. |
 | `docs/DEVICE_LAYOUT_POLICIES_DESIGN.md` | Historical input | Imported design-spec that self-declares it has been superseded by `docs/design/device-layout-policies-adaptive-segment-sizing.md`. References Forgejo issue #1193. |
 | `docs/DEFERRED_CLEANUP_WORK_QUEUES_DESIGN.md` | Historical input | Imported design-spec for bounded-memory deferred cleanup work queues. References Forgejo issue #1212. |
 | `docs/DETERMINISTIC_TRACE_ORACLE_DESIGN.md` | Historical input | Imported design-spec for deterministic trace oracle. References Forgejo issue #1174. |
@@ -266,13 +322,10 @@ surface beyond adding `docs/CLAIMS_GATE_POLICY.md`, which was already scanned.
 | `docs/INTENT_LOG_SYNC_WRITE_LATENCY_PC008.md` | Historical input | Imported implemented-source specification for intent-log sync write latency (PC-008). Binds PC-008 closeout to source without claiming production persistent WAL or measured SLO pass. |
 | `docs/TRANSACTION_COMMIT_GROUPS_PC007.md` | Historical input | Imported implemented-source specification for transaction commit groups (PC-007). Binds existing Local Filesystem transaction-root implementation and FUSE fsync boundary. |
 | `docs/MEMBERSHIP_SERVICE_DESIGN.md` | Historical input | Imported design-spec for cluster membership service. References Forgejo issue #1209. ZFS/Ceph comparison text is design input only and is not a cluster-membership, distributed-availability, scale, performance, or successor claim. Claims registry has no validated cluster-membership claim. |
-| `docs/SHARD_GROUPS_REPLICAS_REBAKE_DESIGN.md` | Historical input | Imported design-spec for distributed extent redundancy with ShardGroupV1 encoding. References Forgejo issue #1286. ZFS/Ceph comparison text is design input only and is not a write-latency, write-amplification, durability, cost, or successor claim. |
-| `docs/SCRUB_REPAIR_RESILVER_DESIGN.md` | Historical input | Imported design-spec for background integrity services. References Forgejo issue #1288. Claims registry has only planned/blocked scrub claims. |
 | `docs/ERASURE_CODING_PLACEMENT_DESIGN.md` | Historical input | Imported design-spec superseded by the G4 pillar at `docs/design/production-erasure-coding-crush-placement-g4-pillar.md`. References Forgejo issue #1249. |
 | `docs/design/openzfs-ceph-successor-claim.md` | Historical input | Imported sealed design-spec for the OpenZFS/Ceph successor claim with 8-dimension quantitative comparison. The seal is historical, not current claim authority. Claims gate currently blocks publishing an OpenZFS/Ceph successor claim; any future retained product-facing statement needs a #875 claim id and #928/#930 comparator evidence. |
 | `docs/design/production-erasure-coding-crush-placement-g4-pillar.md` | Historical input | Imported G4 pillar design-spec for TideCRUSH deterministic placement. References Forgejo issue #1779. Supersedes earlier erasure-coding placement designs. |
 | `docs/design/compression-design-strategy.md` | Historical input | Imported design-spec for compression format extension model. References Forgejo issue #1245. Transform authority blocks mounted compression claims. |
-| `docs/design/2159-milestone-targets-velocity-update.md` | Historical input | Imported milestone-target architecture with May 2026 velocity assessment. Supersedes prior milestone targets. Useful coordination reference. |
 
 ### Remaining Imported Design Surface (TFR-019 / #512)
 
@@ -378,8 +431,8 @@ comparator evidence required by #928/#930:
   design lessons.
 - `docs/MEMBERSHIP_SERVICE_DESIGN.md`: ZFS/Ceph cluster-membership comparison
   is design input only; no cluster-membership claim is validated.
-- `docs/SHARD_GROUPS_REPLICAS_REBAKE_DESIGN.md`: ZFS/Ceph deferred-redundancy
-  and write-amplification comparison is design input only.
+- The deleted shard/rebake design-family comparison text about ZFS/Ceph
+  deferred redundancy and write amplification is design input only.
 - `docs/ONLINE_DEFRAG_BPR_DESIGN.md`: ZFS/Ceph defrag and BPR comparison text
   is target mechanism input, not evidence of implemented online defrag; its
   BPR mechanism is subordinate to #848 storage-intent relocation gates, #844/#856
@@ -442,33 +495,14 @@ larger than this documentation-authority cleanup.
 | `docs/UNIFIED_RESOURCE_GOVERNOR_DESIGN.md` | Historical input | Imported resource-governor design with broad scheduling and budget claims. Open resource-governor implementation work is separate; this document is not current runtime authority. |
 | `docs/UNIVERSAL_INCREMENTAL_CURSOR_FRAMEWORK_DESIGN.md` | Historical input | Imported universal cursor framework design across scrub, send/receive, rebake, resilver, and cleanup jobs. Promotion would require cross-crate source and evidence review beyond this slice. |
 | `docs/V1_EXTENT_MAP_TRISTATE_MODEL_DESIGN.md` | Historical input | Imported design-sealed tristate extent model that claims implemented source coverage. Although bounded search found current extent-map crates, the old authority and phase wording exceed the reviewed claims surface. |
-| `docs/design/1781-shard-groups-replicas-rebake-design-spec.md` | Historical input | Imported shard-group/rebake design iteration. It is useful lineage for distributed layout planning, not current redundancy, rebake, or recovery evidence. |
-| `docs/design/1782-shard-groups-replicas-rebake-design-spec.md` | Historical input | Imported shard-group/rebake design iteration with old issue lineage. It remains historical comparison input until a distributed placement/rebake source audit promotes a narrower contract. |
-| `docs/design/1806-shard-groups-replicas-rebake-design-spec.md` | Historical input | Imported shard-group/rebake design iteration. It must not be cited as current distributed-storage behavior or runtime validation. |
-| `docs/design/2068-shard-groups-replicas-rebake-pathway-design.md` | Historical input | Imported rebake-pathway refinement whose production-depth flow claims exceed the current validation register. It remains design input for future rebake authority work. |
 | `docs/design/METADATA_ENGINE_PARALLELISM_DESIGN.md` | Historical input | Imported metadata-engine parallelism design with broad scheduling and correctness implications. It needs dedicated engine/source review before any current-spec promotion. |
-| `docs/design/background-service-framework-canonical-consolidation.md` | Historical input | Imported background-service consolidation note in a larger duplicate lineage. Current `tidefs-background-scheduler` source exists, but this closeout/consolidation document was not reconciled with live scheduler authority. |
-| `docs/design/background-service-framework-design-1803.md` | Historical input | Imported background-service design iteration. It remains lineage material for scheduler review and is not current service-contract authority. |
-| `docs/design/background-service-framework-design-enhanced.md` | Historical input | Imported enhanced background-service design. Current scheduler behavior and claims evidence were not audited against the enhancement set in this slice. |
-| `docs/design/background-service-framework-design-spec.md` | Historical input | Imported background-service design-spec variant. It is not authoritative over the current scheduler without a focused `tidefs-background-scheduler` source and claims review. |
-| `docs/design/background-service-framework-design.md` | Historical input | Imported background-service framework design referenced by multiple old distributed-service docs. It remains useful design context, not current runtime authority. |
-| `docs/design/background-service-framework-multithread-design.md` | Historical input | Imported multithreaded background-service design. It must be reconciled with current scheduler source and validation before being used as a current concurrency contract. |
-| `docs/design/background-service-framework-phases-5-10-wire-up-tracking.md` | Historical input | Imported phase-tracking note for background-service wire-up. It remains historical input until live source and validation are checked against the phase claims. |
 | `docs/design/bounded-cluster-membership-state.md` | Historical input | Imported bounded-membership state design. Current distributed membership authority is only whatever later scoped rows classify; this file is not current cluster-service evidence. |
 | `docs/design/deterministic-trace-oracle-system.md` | Historical input | Imported deterministic trace-oracle design. It may inform future validation tooling, but this slice did not promote any trace-oracle claim or scanned claims-gate surface. |
 | `docs/design/device-layout-policies-adaptive-segment-sizing.md` | Historical input | Imported adaptive segment-sizing/device-layout policy design. It needs storage allocator/device-layout source and evidence review before it can constrain current behavior. |
 | `docs/design/directory-change-streams-namespace-event-protocol.md` | Historical input | Imported directory change-stream protocol design. Current namespace event behavior and claims coverage were not audited here, so it remains design input. |
-| `docs/design/incremental-job-core-trait-checkpoint-codec-design.md` | Historical input | Imported incremental-job trait/checkpoint design. Live incremental-job crates exist, but this broad codec and job-contract document needs focused source review before promotion. |
 | `docs/design/polymorphic-extent-maps-design.md` | Historical input | Imported lowercase polymorphic-extent-map design duplicate/variant. It remains lineage material alongside the already historical extent-map comparison docs. |
 | `docs/design/prefetch-readahead-budgeted-speculative-io.md` | Historical input | Imported prefetch/readahead design with performance and scheduling implications. No current performance or runtime evidence was promoted in this slice. |
-| `docs/design/rebake-architecture-ingest-journal-to-base-shard-conversion.md` | Historical input | Imported rebake architecture document for ingest-journal to base-shard conversion. It is future distributed-layout input, not current rebake authority. |
 | `docs/design/refcount-delta-based-incremental-data-cleanup-queues.md` | Historical input | Imported lowercase refcount-delta cleanup design duplicate/variant. It is review material until reclamation source and claims evidence are reconciled. |
-| `docs/design/scrub-deep-scrub-repair-resilver-orchestration-design-1952.md` | Historical input | Imported scrub/repair/resilver orchestration iteration. `validation/claims.toml` still blocks scrub/read isolation and scrub runtime queues, so this cannot be current integrity-service authority. |
-| `docs/design/scrub-deep-scrub-repair-resilver-orchestration-design-1965.md` | Historical input | Imported scrub/repair/resilver orchestration iteration. Its distributed repair and resilver claims exceed current claim-registry evidence. |
-| `docs/design/scrub-deep-scrub-repair-resilver-orchestration-design.md` | Historical input | Imported broad integrity-service orchestration design. It remains historical input until scrub, deep-scrub, repair, and resilver source behavior and runtime evidence are reviewed together. |
-| `docs/design/scrub-deep-scrub-repair-resilver-orchestration-placement-ae-auditor.md` | Historical input | Imported placement/anti-entropy auditor refinement for scrub and repair. It is not current placement or anti-entropy authority without a dedicated implementation/evidence review. |
-| `docs/design/shard-groups-replicas-rebake-design-1963.md` | Historical input | Imported shard-group/rebake design iteration. It remains distributed-storage lineage material and not current runtime behavior. |
-| `docs/design/shard-groups-replicas-rebake-design-spec.md` | Historical input | Imported sealed shard-group/rebake design-spec with multiple prior-iteration links. It must not be used as current distributed redundancy or rebake evidence. |
 | `docs/design/v1-extent-map-tristate-model.md` | Historical input | Imported sealed architecture/design note for the V1 tristate extent model. It references current extent-map crates, but source/claims reconciliation for the full sparse-file, FIEMAP, fallocate, and stat-block contract remains out of scope here. |
 | `docs/design/v1-locator-table-inline-hash.md` | Historical input | Imported V1 locator-table inline-hash design that names `crates/tidefs-locator-table`. Promotion would require a focused locator-table source, validation, and claims-gate review. |
 | `docs/design/workload-adaptive-recordsize-and-extent-shaping.md` | Historical input | Imported workload-adaptive recordsize/extent-shaping design. It contains policy and performance implications that need storage allocator, extent, and claims evidence before becoming current authority. |
@@ -478,8 +512,8 @@ larger than this documentation-authority cleanup.
 Classified for TFR-019 / GitHub issue #1537 on 2026-06-29 after reviewing this
 register's authority rule and review method, the TFR-019 notes in
 `docs/REVIEW_TODO_REGISTER.md`, `docs/WHOLE_REPO_REVIEW.md`, the root
-background-service redirect, every tracked
-`docs/design/background-service-framework-*.md` file, live scheduler source in
+background-service redirect, the tracked deleted background-service design
+family, live scheduler source in
 `crates/tidefs-background-scheduler/src/lib.rs`,
 `crates/tidefs-background-scheduler/src/scheduler.rs`,
 `crates/tidefs-background-scheduler/src/scheduling.rs`, and
@@ -520,15 +554,7 @@ claim/comparator evidence path.
 
 | Path | State | Classification note |
 |---|---|---|
-| `docs/BACKGROUND_SERVICE_FRAMEWORK_DESIGN.md` | Historical input | Redirect into the imported background-service design lineage. It now points readers at this register boundary; it is not current scheduler/runtime authority, phase-completion evidence, FUSE-loop proof, no-hidden-queue proof, release readiness, or product-comparison permission. |
-| `docs/design/background-service-framework-canonical-consolidation.md` | Historical input | Imported Forgejo-era consolidation note. It remains lineage for background-service review, but its design-spec and consolidation-status wording does not override the live `tidefs-background-scheduler` source contract or current claims gate. |
-| `docs/design/background-service-framework-design-1803.md` | Historical input | Imported background-service design iteration. It is useful design context for the scheduler trait/priority/budget review but is not current service-contract authority. |
-| `docs/design/background-service-framework-design-1962.md` | Historical input | Imported self-contained background-service design summary that points at the old Forgejo consolidation lineage. It was not previously classified in the #689 table; this slice preserves it as historical input, not current architecture, runtime, or product-status authority. |
-| `docs/design/background-service-framework-design-enhanced.md` | Historical input | Imported enhanced design variant. Source review in this slice does not validate its lifecycle, starvation, backpressure, observability, or implementation-status claims, so it remains review material. |
-| `docs/design/background-service-framework-design-spec.md` | Historical input | Imported design-spec/roadmap variant. The live scheduler source supports only the narrow API behavior named above; the broader roadmap, phase, runtime, and claims wording remains unpromoted. |
-| `docs/design/background-service-framework-design.md` | Historical input | Focused imported design entry point. It now carries an authority note; its scheduler API examples may inform source navigation, but its canonical-design, Maturity, phase-completion, FUSE integration, performance, crash-recovery, observability, and incumbent-comparison wording is not current product proof. |
-| `docs/design/background-service-framework-multithread-design.md` | Historical input | Imported multi-threaded design. `multi_threaded.rs` exposes feature-gated scheduler types, but this slice did not validate production multi-core runtime behavior, work stealing, cross-partition delivery, or operator-visible concurrency claims. |
-| `docs/design/background-service-framework-phases-5-10-wire-up-tracking.md` | Historical input | Imported phase-tracking specification for phases 5-10. It remains useful follow-up planning input, but FUSE integration, derived catalog, data cleaner, segment cleaner, compaction, and runtime validation claims require separate source/validation slices. |
+| `docs/BACKGROUND_SERVICE_FRAMEWORK_DESIGN.md` | Current spec | Scoped source-backed summary for the current background scheduler and incremental-job contract in `crates/tidefs-background-scheduler`, `crates/tidefs-incremental-job-core`, and `crates/tidefs-types-incremental-job-core`. It is not release-readiness evidence or proof that every maintenance subsystem is wired into mounted runtime behavior. |
 
 ### Derived-Views Architectural Pillar (TFR-019 / #1240)
 
@@ -563,25 +589,6 @@ product source, or unrelated docs.
 |---|---|---|
 | `docs/design/unified-on-media-format-lifecycle.md` | Historical input | Imported Forgejo-era unified five-phase lifecycle design with old issue #1238 metadata (Forgejo on `172.16.106.12`), design-spec status, P1 priority, docs lane, and cross-references to old Forgejo-era issue numbers (#1220, #1223, #1225, #1222, #1224, #1185, #1235, #1236) whose current TideFS GitHub issue mapping is undefined under TFR-019. The file defines a meta-framework for on-media record format phases (record families, feature flags, TLV extensions, rebake, golden vectors, trace oracle, torn-commit recovery) that has no current live-source implementation evidence, no claim-registry coverage, and no current format-lifecycle policy authority in the active GitHub issue and PR coordination surface. The individual format docs referenced remain canonical for their own domains under separate register rows; this lifecycle file is preserved as design lineage material and must not be cited as current TideFS implementation status, release-readiness evidence, or format-lifecycle authority. |
 
-### IncrementalJob Core Wire-Up Deferred Design (TFR-019 / #1244)
-
-Classified for TFR-019 / GitHub issue #1244 on 2026-06-24 after reviewing this
-register's authority rule and review method, the TFR-019 notes in
-`docs/REVIEW_TODO_REGISTER.md`, the imported incremental-job wire-up deferred
-design document, `docs/INDEX.md`, `docs/GITHUB_PR_DEVELOPMENT.md`,
-`docs/design/incremental-job-core-types-crate-design.md`,
-`docs/design/incremental-job-core-types-crate-design-sealed.md`, and bounded
-source/doc searches for IncrementalJob, tidefs-types-incremental-job-core,
-tidefs-incremental-job-core, Forgejo-era issue references, STATUS.md,
-FEATURE_MATRIX.md, lane, priority, design-sealed, deferred-wire-up, and
-subsystem-wire-up wording in the current source tree. This slice does not edit
-product source, Cargo manifests, the sealed types/trait design docs, other
-#952 leftover files, or unrelated documentation-authority files.
-
-| Path | State | Classification note |
-|---|---|---|
-| `docs/design/incremental-job-core-wire-up-deferred-design.md` | Historical input | Imported Forgejo-era wire-up deferred design (old issue #2047, coordination seal #1930) with design-sealed status, design-spec maturity, storage-core lane, Forgejo-era URLs (`172.16.106.12/forgejo/forgeadmin`), and deferred wire-up claims for 14 background maintenance subsystems. The pre-existing "imported/historical design input" header annotation is consistent with this register's Historical input state: the annotation explicitly denies current policy, current spec, implementation-status evidence, release-readiness evidence, and worker scheduling authority. Live source has `tidefs-types-incremental-job-core` and `tidefs-incremental-job-core` crates implementing the sealed `IncrementalJob` trait contract, but the 14-subsystem wire-up deferral architecture, per-subsystem cursor schemas, schedule-priority table, observability contract, and subsystem-migration phases described in the document have no current live-source implementation evidence, no claim-registry coverage, and no current background-scheduler runtime authority in the active GitHub issue and PR coordination surface. The sibling sealed-types docs (`docs/design/incremental-job-core-types-crate-design.md`, `docs/design/incremental-job-core-types-crate-design-sealed.md`) remain under their own register rows. This file is preserved as lineage material for future incremental-job wire-up review and must not be cited as current TideFS implementation status, release-readiness evidence, or worker scheduling authority. |
-
 ### Release Readiness Verdict Contract (#1279)
 
 Classified for GitHub issue #1279 on 2026-06-24 after reviewing this register's
@@ -598,7 +605,7 @@ cross-reference additions recorded in #1279.
 
 | Path | State | Classification note |
 |---|---|---|
-| `docs/RELEASE_READINESS_VERDICT_CONTRACT.md` | Current policy | Design decision #1279 defining the release-readiness verdict boundary. Names the verdict owner, required evidence families, explicit non-claims, and the distinction between gate-local readiness receipts (such as P10-03 `GateReceipt.release_ready`, claims-gate claim status, and release-candidate evidence index) and whole-product admission. States that no release-readiness verdict exists as of 2026-06-24, that TideFS is not release-ready, and that no automated gate, CI workflow, or generated artifact may render an unqualified release-readiness claim without the verdict owner's recorded decision. Maps follow-up issues #1283 and #1284 for the remaining scoped P10-03 receipt rename/rendering work and release-facing documentation register classifications. The contract is a design/decision artifact; it does not implement a product surface, widen publishing claims, or change `validation/claims.toml`. |
+| `docs/RELEASE_READINESS_VERDICT_CONTRACT.md` | Current policy | Design decision #1279 defining the release-readiness verdict boundary. Names the verdict owner, required evidence families, explicit non-claims, and the distinction between gate-local readiness receipts (such as performance-gate `GateReceipt.release_ready`, claims-gate claim status, and release-candidate evidence index) and whole-product admission. States that no release-readiness verdict exists as of 2026-06-24, that TideFS is not release-ready, and that no automated gate, CI workflow, or generated artifact may render an unqualified release-readiness claim without the verdict owner's recorded decision. Maps follow-up issues #1283 and #1284 for the remaining scoped performance-gate receipt rename/rendering work and release-facing documentation register classifications. The contract is a design/decision artifact; it does not implement a product surface, widen publishing claims, or change `validation/claims.toml`. |
 
 ### Release-Facing Evidence Inputs (#1284)
 
@@ -620,29 +627,8 @@ documents.
 |---|---|---|
 | `docs/RELEASE_CANDIDATE_EVIDENCE_CONTRACT.md` | Current spec | Documents how the Release Candidate workflow (`release-candidate.yml`) produces and indexes evidence across `smoke` and `full` profiles. Records lane job attributes (rust-smoke, nix, qemu, xfstests, rdma), artifact upload details, evidence index shape, profile selection logic, concurrency rules, and retention policies. Explicitly states the release-candidate evidence index is a **gate input, not a gate verdict**. Live-source inspection of `.github/workflows/release-candidate.yml` and the referenced lane workflows confirms the documented attributes match current workflow YAML. The contract does not make a product-readiness claim; it describes how evidence is collected so gate auditors can interpret index artifacts without tracing through YAML. The four lane-local manifest owner issues (643-646) are recorded without checking current issue state; gate auditors should verify at decision time. |
 | `docs/UNRELEASED_AUTHORITY_POLICY.md` | Current policy | Binding guardrail that forbids adding or preserving legacy, backward-compatibility, migration, downgrade, or fallback behavior for unreleased TideFS data by default. Requires released external boundaries (Linux, POSIX, kernel, third-party), shipped wire/format/operator surfaces, or a temporary bridge explicitly tracked by a GitHub issue before compatibility work is permitted. Names pre-release code paths explicitly (current authority, retired pre-release path, historical input, receiptless path) instead of using "legacy." Includes a review checklist for compatibility additions. Classified as current policy consistent with its own "current policy guardrail" maturity label and live enforcement through PR review conventions. |
-| `docs/PERFORMANCE_BUDGETS_SLO_REGRESSION_GATES_P10-03.md` | Current spec | Source-of-truth for the production-depth performance-budget, SLO, and regression-gate law. Defines the typed gate language (`family.performance_budget.performance_budget_0`) replacing benchmark folklore with first-class workload envelopes, environment profiles, KPI families, numeric budget thresholds, regression locks, and gate receipts. Section 12 documents live-source implementation evidence in `crates/tidefs-validation/src/performance_gate/`. The `GateReceipt.release_ready` field (section 12.12.5) is a **performance-gate-local** receipt requiring subject completeness, zero artifact gap, and zero budget gap; it is not a whole-product release-readiness verdict. Many categories (workload-envelope classes, environment profiles, noise policies, baseline policy families) remain at 0 implemented; the document records these gaps explicitly. The verdict contract (#1279) identifies P10-03 as a required evidence-family input and maps #1283 for the `release_ready` field rename and scope-qualified rendering. |
+| `docs/PERFORMANCE_BUDGETS_SLO_REGRESSION_GATES_P10-03.md` | Historical input | Broad P10 performance-law import with missing blueprint-era dependencies and source-of-truth wording that is wider than current implementation. Current performance-gate authority is the source under `crates/tidefs-validation/src/performance_gate/`, `xtask` command behavior, release-candidate evidence, and the release-readiness verdict contract. The old document remains useful background only until a focused source-backed performance-gate spec replaces it. |
 | `docs/GITHUB_CI.md` | Current policy | Documents the live GitHub Actions CI surface: secret boundary (GitHub is not a TideFS secret store), self-hosted runner contract, workflow shape (`Rust Fast`, `Clippy`, `Focused Rust`, `Focused Claim Validation`, `Secret Policy`, `QEMU Smoke`, `xfstests`, `RDMA`, `Release Candidate`), path-filtered PR validation, draft-PR CI skip rules, and `TIDEFS_SELF_HOSTED_READY` gating. Live-source inspection of the named workflow YAML files confirms the documented attributes match current behavior. The Release Candidate workflow is a manual-only self-hosted composition that uploads a `release-candidate-evidence-index` artifact without making a product-readiness claim. This document is a binding CI reference that complements the workflow YAML; it is not a product admission or release-readiness verdict. |
-
-### Pool Import/Export Device Topology Design (TFR-019 / #1137)
-
-Classified for TFR-019 / GitHub issue #1137 on 2026-06-26 after reviewing this
-register's authority rule and review method, the TFR-019 notes in
-`docs/REVIEW_TODO_REGISTER.md`, the imported 1813 pool import/export design
-document, the already-classified
-`docs/POOL_IMPORT_EXPORT_DEVICE_TOPOLOGY_DESIGN.md` register row, live source in
-`crates/tidefs-types-pool-label-core/`,
-`crates/tidefs-local-object-store/src/pool_importer.rs`,
-`crates/tidefs-local-object-store/src/pool_exporter.rs`,
-`crates/tidefs-local-object-store/src/device_manager.rs`, and
-`crates/tidefs-local-object-store/src/device_health.rs`,
-`validation/claims.toml` (no pool import/export claims), closed #931/#934
-incumbent-comparison audit evidence, and the #952 leftover list in this
-register. This slice does not edit product source, Cargo manifests,
-CI workflows, validation artifacts, or `validation/claims.toml`.
-
-| Path | State | Classification note |
-|---|---|---|
-| `docs/design/1813-pool-import-export-device-topology-management-design.md` | Historical input | Imported Forgejo-era #1813 design iteration for pool import/export and online device topology management. It preserves the PoolLabelV1 data structure design, import/export protocol algorithms, device failure state machine, and 7-phase implementation plan as historical design lineage. Its "design-sealed" and "frozen" language, Forgejo issue references, and phase-status claims (Phases 2–5 and 7 marked "deferred to wire-up") are stale: live source in `tidefs-local-object-store/src/pool_importer.rs`, `pool_exporter.rs`, and `device_manager.rs` implements pool import/export and device topology management referencing `docs/POOL_IMPORT_EXPORT_DEVICE_TOPOLOGY_DESIGN.md` as its design authority. The PoolLabelV1 on-device label format is implemented in `tidefs-types-pool-label-core/lib.rs`. The ZFS/Ceph prior-art comparison table in §10 is incumbent-comparison context preserved as historical design input under the #931/#934 cluster boundary; it is not a current capability, availability, durability, or product claim. No `validation/claims.toml` entries exist for pool import/export, device topology, hot-spare, evacuation, or cluster-aware pool ownership. The file is not current policy, current spec, implementation status, or product authority. |
 
 ### Retired Cluster Services Closeout Deletions (TFR-019 / #1586)
 
@@ -652,25 +638,3 @@ boundary findings remain unchanged: TFR-017 still blocks broad multi-node or
 production cluster claims, and the deleted closeout notes are not current
 policy, current spec, implementation status, release-readiness evidence, or
 product authority.
-
-### Pool Import/Export 7-Phase Implementation Plan (TFR-019 / #1152)
-
-Classified for TFR-019 / GitHub issue #1152 on 2026-06-26 after reviewing this
-register's authority rule and review method, the TFR-019 notes in
-`docs/REVIEW_TODO_REGISTER.md`, the imported Forgejo #1971 phase-plan document,
-closed #931/#934 incumbent-comparison evidence, the sibling #1137 classification
-for the imported 1813 pool import/export design, bounded source/doc searches,
-live source in `crates/tidefs-types-pool-label-core/`,
-`crates/tidefs-local-object-store/src/pool_importer.rs`,
-`crates/tidefs-local-object-store/src/pool_exporter.rs`,
-`crates/tidefs-local-object-store/src/device_manager.rs`, and
-`crates/tidefs-local-object-store/src/device_health.rs`, plus
-`validation/claims.toml` and `docs/CLAIM_REGISTRY.md` (no pool import/export,
-device topology, hot-spare, evacuation, or cluster-aware pool ownership claim
-entries). This slice does not edit product source, Cargo manifests, CI
-workflows, validation artifacts, generated claim registries, or
-`validation/claims.toml`.
-
-| Path | State | Classification note |
-|---|---|---|
-| `docs/design/1971-pool-import-export-7-phase-implementation-plan.md` | Historical input | Imported Forgejo-era #1971 companion implementation plan for the pool import/export and device-topology design lineage. It preserves per-phase data-structure sketches, pseudocode, tradeoff notes, and dependency mapping as historical design input. Its `design-spec` status, sealed-canonical-design wording, "DONE" and "NOT YET IMPLEMENTED" phase labels, "new" source-file notes, Forgejo issue links, and phase-completion criteria are not current implementation status, product readiness, or current authority. Live source now contains pool import/export and device-manager code paths in `tidefs-local-object-store/src/pool_importer.rs`, `pool_exporter.rs`, `device_manager.rs`, and `device_health.rs`, and PoolLabelV1 lives in `tidefs-types-pool-label-core/`; current behavior must be checked against source and current claim evidence rather than this phase plan. The ZFS prior-art, hot-spare, evacuation, online topology, cluster-lease, and public-capability wording is retained only as non-claim historical input under the #931/#934 comparator boundary. No `validation/claims.toml` or generated claim-registry entries exist for broad pool import/export, hot-spare, evacuation, device topology, or cluster-aware ownership claims. The file is not current policy, current spec, implementation status, release-readiness evidence, or product authority. |

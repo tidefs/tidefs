@@ -48,15 +48,16 @@ surface, widen publishing claims, or preselect a runtime carrier.
   non-claims preserve that the decision is not a production ioctl/statx/
   ublk/FUSE ABI freeze, not kernelspace readiness evidence, not distributed
   operator maturity evidence, and does not wire runtime-fed remote policy
-  authority. TFR-011 remains open.
+  authority. Issue #1278 later closed the current pre-alpha command-boundary
+  follow-up map without selecting a runtime-fed product carrier.
 - `docs/USER_MANUAL.md`: Describes the pre-alpha userspace filesystem.
   Lists known limitations including no mmap, no online device replacement,
   no network transport for send/receive, no automated self-healing. No
   operator dashboard or product surface described.
-- `docs/REVIEW_TODO_REGISTER.md`: TFR-011 (Operator CLI/UAPI) and TFR-017
-  (Transport/cluster authority) remain open. TFR-011 notes confirm the
-  operator/UAPI authority is not yet one boundary and maps follow-ups
-  #657-#662.
+- `docs/REVIEW_TODO_REGISTER.md`: the operator/UAPI closeout notes are closed
+  for the current pre-alpha command boundary. TFR-017 (Transport/cluster
+  authority) remains open and still blocks runtime-fed distributed product
+  surfaces.
 - `docs/WHOLE_REPO_REVIEW.md`: Reports that the OW-307D blocker map says
   deterministic demo rows do not prove a production operator surface.
 - Bounded `rg` inspection for `DASHBOARDS_TRACES_OPERATOR_TRUTH_SURFACES`,
@@ -69,9 +70,8 @@ surface, widen publishing claims, or preselect a runtime carrier.
   `docs/RUST_FOR_LINUX_CRATE_TRAIT_BOUNDARIES_P7-02.md`,
   `docs/UPGRADE_FAILOVER_CUTOVER_OPERATOR_RUNBOOKS_P9-03.md`,
   `docs/WORKSPACE_FAMILY_LAYOUT_CRATE_SERVICE_BOUNDARIES_P1-01.md`,
-  `docs/OPERATOR_MANUAL_DYNAMIC_TUNING_AND_REALTIME_OBSERVABILITY.md`,
-  `docs/design/scrub-deep-scrub-repair-resilver-orchestration-design.md`,
-  and `docs/design/scrub-deep-scrub-repair-resilver-orchestration-placement-ae-auditor.md`.
+  `docs/OPERATOR_MANUAL_DYNAMIC_TUNING_AND_REALTIME_OBSERVABILITY.md`, and
+  deleted scrub/repair/resilver historical lineage docs.
   All references treat it as an existing law document; none of them
   reproduce its content. The `truth_view` glyph appears as the OW-307
   identifier across these documents.
@@ -113,8 +113,8 @@ reclassified by this decision.
 
 The evidence confirms the surface is premature for any product carrier
 implementation. No live distributed storage runtime feeds operator rows.
-No runtime mirrors or receipt-backed source classes exist. TFR-011 and
-TFR-017 remain open. However, recording the decision boundary and
+No runtime mirrors or receipt-backed source classes exist. TFR-017 remains
+open. However, recording the decision boundary and
 follow-up map is useful even without implementation: it prevents future
 work from treating deterministic demo output as a production operator
 product and defines the prerequisites that must close before any carrier
@@ -136,11 +136,11 @@ The runtime-fed operator product surface boundary is:
    exist in the repository. Until this gap is resolved, no carrier can
    claim to render truth-surface-compliant operator data.
 
-3. **No product carrier class is selectable now.** The prerequisite gates
-   are open: TFR-011 (Operator CLI/UAPI boundary), TFR-017
-   (Transport/cluster authority), and the missing P10-04 truth grammar
-   must close before any carrier (CLI, API, dashboard, archive-reader)
-   can be selected or implemented.
+3. **No product carrier class is selectable now.** The current pre-alpha
+   operator/UAPI command boundary is closed, but it is not a product carrier.
+   TFR-017 transport/cluster authority and the missing P10-04 truth grammar
+   must close before any carrier (CLI, API, dashboard, archive-reader) can be
+   selected or implemented.
 
 4. **OW-307D remains Historical input.** Its classification in
    `docs/DOCUMENTATION_AUTHORITY_REGISTER.md` is preserved. The OW-307
@@ -159,7 +159,7 @@ The runtime-fed operator product surface boundary is:
 
 | Carrier class | Plausible next? | Prerequisites |
 | --- | --- | --- |
-| CLI/status | Plausible after prerequisite closure | TFR-011 close, TFR-017 decision, P10-04 disposition, live-owner routing audit |
+| CLI/status | Plausible after prerequisite closure | TFR-017 decision, P10-04 disposition, live-owner routing audit, and proof that the command boundary has a runtime-fed carrier |
 | API | Not plausible | Requires live runtime mirrors, receipt-backed source classes, and transport authority that do not exist |
 | Dashboard | Not plausible | Requires API carrier or equivalent backend, render pipeline, and refusal behavior paths |
 | Archive-reader | Not plausible | Requires runtime-fed receipts, render bundles, and archive format authority |
@@ -175,8 +175,7 @@ The runtime-fed operator product surface boundary is:
 - This decision does not implement a dashboard server, long-running
   operator CLI, API product surface, runtime placement/health/rebuild/risk
   mirrors, or any distributed storage behavior.
-- This decision does not close TFR-011, TFR-017, TFR-019, or parent
-  OW-307.
+- This decision does not close TFR-017, TFR-019, or parent OW-307.
 - This decision does not reclassify OW-307D or any other historical-input
   document as current policy or current spec.
 - This decision is not a publishing-facing capability claim and does not
@@ -191,9 +190,8 @@ the issue body is updated before work starts.
 | Topic | Expected write set | Scope |
 | --- | --- | --- |
 | P10-04 disposition: classify the missing truth-surface law reference and update cross-referencing documents | `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`, cross-reference notes in the ten documents that reference P10-04, `docs/REVIEW_TODO_REGISTER.md` | Record that `docs/DASHBOARDS_TRACES_OPERATOR_TRUTH_SURFACES_P10-04.md` is missing; either create a placeholder recording its absence or add a register row explaining the gap. Update cross-references so future readers are not misled into treating a missing document as existing authority. |
-| TFR-011 closeout: operator CLI/UAPI one-boundary decision | `docs/OPERATOR_UAPI_AUTHORITY.md`, `docs/REVIEW_TODO_REGISTER.md`, follow-up issues #657-#662 | Close the remaining TFR-011 mapped follow-ups or update the decision to record which remain deferred and why. |
 | TFR-017 transport/cluster authority decision | `docs/TRANSPORT_CLUSTER_AUTHORITY.md` or successor, `docs/REVIEW_TODO_REGISTER.md` | Define transport authority, cross-replica comparison, dispatch, and backpressure semantics before any carrier can consume runtime cluster data. |
-| Documentation authority register: classify this decision | `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`, `docs/REVIEW_TODO_REGISTER.md` | Add a row classifying `docs/OPERATOR_PRODUCT_SURFACE_DECISION.md` as current policy and updating TFR-011/TFR-019 notes. |
+| Documentation authority register: classify this decision | `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`, `docs/REVIEW_TODO_REGISTER.md` | Add a row classifying `docs/OPERATOR_PRODUCT_SURFACE_DECISION.md` as current policy and updating operator/UAPI and TFR-019 notes. |
 | INDEX.md: add this decision | `docs/INDEX.md` | Add this decision document to the documentation index. |
 
 ## Implementation Boundary

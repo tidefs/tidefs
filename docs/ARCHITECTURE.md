@@ -323,9 +323,8 @@ included deleted scaffold roots and are no longer package authority.
 
 This section was previously written as the controlling workspace authority for
 TideFS package families. It now remains review input only. The current package
-authority records that the prior control-plane, publication-pipeline, and
-response-registry type roots were deleted rather than reclassified, and that
-the live record definitions are present in `tidefs-types-vfs-core`.
+authority is `docs/workspace-package-classification.md`; deleted scaffold type
+roots and their old dependency chains are intentionally not repeated here.
 
 ### Historical Package Family Classification
 
@@ -338,74 +337,16 @@ The table below is a historical family taxonomy, not a current package list:
 | Operator/query utility (`tidefsctl`, CLI surfaces) | Product-critical | In workspace |
 | Bounded mirror (`apps/` demo, harness, and tool binaries) | Product-critical | In workspace |
 | Kernel bridge (`tidefs-kmod-*`, `tidefs-block-kmod`, `tidefs-kernel-cutover-runtime`) | Product-critical | In workspace |
-| Historical scaffold (`tidefs-control-plane-*`, `tidefs-policy-authority-*`, `tidefs-observe-core-*`, `tidefs-response-registry-*`, deleted `tidefs-types-*` scaffold roots) | Deleted or stale review input | Not current package authority |
-| Retired scaffold type roots (`tidefs-types-control-plane-core`, `tidefs-types-publication-pipeline-core`, `tidefs-types-response-registry-core`) | Deleted historical review input; current records live in `tidefs-types-vfs-core` | Deleted roots; see `docs/workspace-package-classification.md` |
+| Historical scaffold families | Deleted or stale review input | Not current package authority; see `docs/workspace-package-classification.md` |
 | Kernel implementation (`kmod/`) | Product-critical (separate Kbuild tree) | In workspace as path member only; compiled via out-of-tree Kbuild |
 
 ### Scaffold Crate Disposition
 
 The following lists are retained as historical review input. Current package
 membership is not governed here; use `docs/workspace-package-classification.md`
-and Cargo metadata. Some older scaffold roots were removed from normal
-workspace compilation, and the retired type roots named below are deleted from
-the current checkout rather than active package authority.
-
-**Removed from workspace members:**
-
-- `crates/tidefs-schema-codec-control-plane` — fixed-width codecs for control-plane request/receipt envelopes; depended on by non-workspace `tidefs-control-plane-runtime` only
-- `crates/tidefs-policy-authority` — bundled policy-authority core/runtime/client; depended on by non-workspace `apps/tidefs-policy-authority-daemon` and `apps/tidefs-control-plane-daemon` only
-- `crates/tidefs-kmod-policy-authority` — kernel policy-authority module; fully removed from disk
-
-**Deleted historical scaffold roots:**
-
-- `crates/tidefs-types-policy-authority-core`
-- `crates/tidefs-types-control-plane-core`
-- `crates/tidefs-types-publication-pipeline-core`
-- `crates/tidefs-types-response-registry-core`
-- `crates/tidefs-types-truth-view-core`
-- `crates/tidefs-types-shadow-pilot`
-- `crates/tidefs-types-archive-control-core`
-- `crates/tidefs-types-observe-core`
-
-**Never in workspace (historical docs only; not present on disk in the fresh
-TideFS checkout unless restored intentionally):**
-
-- `crates/tidefs-schema-codec-outcome`
-- `crates/tidefs-control-plane-api`
-- `crates/tidefs-control-plane-runtime`
-- `crates/tidefs-observe-core-truth-view-render`
-- `crates/tidefs-response-registry-query`
-- `crates/tidefs-response-registry-runtime`
-- `apps/tidefs-policy-authority-daemon`
-- `apps/tidefs-control-plane-daemon`
-
-
-### Retired Scaffold Type Evidence
-
-Earlier versions of this section described the following scaffold type roots as
-product-transitional workspace members. Current repo evidence no longer supports
-that wording: the roots are absent from the current checkout and are not Cargo
-package roots. The current authority records the surviving control-plane,
-publication-pipeline, and response-registry record definitions in
-`tidefs-types-vfs-core`.
-
-| Retired root | Current authority |
-|---|---|
-| `tidefs-types-control-plane-core` | Deleted historical root; current control-plane records live in `tidefs-types-vfs-core`. |
-| `tidefs-types-publication-pipeline-core` | Deleted historical root; current publication-pipeline records live in `tidefs-types-vfs-core`. |
-| `tidefs-types-response-registry-core` | Deleted historical root; current response-registry records live in `tidefs-types-vfs-core`. |
-
-### Retired Scaffold Dependency Evidence
-
-The historical dependency chain below is not a current path-dependency claim.
-It records the scaffold-internal edges that made the old roots review targets
-after live consumers were removed. Use current Cargo metadata and
-`docs/workspace-package-classification.md` for active dependencies.
-
-Historical scaffold-internal edges:
-
-- `tidefs-types-publication-pipeline-core` -> `tidefs-types-control-plane-core`
-- `tidefs-types-response-registry-core` -> `tidefs-types-control-plane-core`
+and Cargo metadata. The deleted-root list and dependency evidence now live in
+git history, the review register, and the package-classification table rather
+than in this current architecture overview.
 
 ### Anti-Regression Rule
 

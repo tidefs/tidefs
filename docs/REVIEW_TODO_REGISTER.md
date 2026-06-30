@@ -1308,12 +1308,11 @@ Important 2026-06-01 findings:
   scheduling language is retired context, not current TideFS authority. Current
   coordination remains GitHub issues and pull requests plus active repo docs.
 
-- `TFR-019`: GitHub issue #1152 classifies
-  `docs/design/1971-pool-import-export-7-phase-implementation-plan.md` as
-  historical input after reviewing the documentation authority register, this
-  TFR-019 note set, the imported Forgejo #1971 phase plan, closed #931/#934
-  incumbent-comparison evidence, sibling #1137 context, bounded source/doc
-  searches, `crates/tidefs-types-pool-label-core/`,
+- `TFR-019`: GitHub issue #1152 classified the deleted pool import/export
+  7-phase implementation-plan lineage after reviewing the documentation
+  authority register, this TFR-019 note set, the imported Forgejo #1971 phase
+  plan, closed #931/#934 incumbent-comparison evidence, sibling #1137 context,
+  bounded source/doc searches, `crates/tidefs-types-pool-label-core/`,
   `crates/tidefs-local-object-store/src/pool_importer.rs`,
   `crates/tidefs-local-object-store/src/pool_exporter.rs`,
   `crates/tidefs-local-object-store/src/device_manager.rs`,

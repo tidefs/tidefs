@@ -273,6 +273,6 @@ RDMA and broad release-candidate runs are further milestone gates (see issue
 - Issue #676: rebake/reclaim policy-satisfying receipt gate
 - Issue #17: pool-wide redundancy placement
 - Issue #16: media substrate
-- `docs/SHARD_GROUPS_REPLICAS_REBAKE_DESIGN.md`
+- Deleted shard/rebake historical lineage
 - `docs/REPLICATION_REBUILD_RELOCATION_DATA_FLOWS_P8-03.md`
 - `docs/RECEIPT_RESPONSE_RUNTIME_EMISSION_PATH_P3-03.md`

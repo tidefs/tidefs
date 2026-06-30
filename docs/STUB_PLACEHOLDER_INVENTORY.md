@@ -248,7 +248,7 @@ Follow-up scope: #789 tracks the 22 planned-authority surfaces and has split the
 
 ### 7.2 Forgejo references in unclassified docs
 
-- **Surface**: Multiple docs under `docs/` and `docs/design/` still reference Forgejo issue numbers and URLs (e.g., `http://172.16.106.12/forgejo/forgeadmin/tidefs/issues/...`).
+- **Surface**: Multiple docs under `docs/` and `docs/design/` still reference Forgejo issue numbers and old local Forgejo URLs.
   - This is tracked by TFR-019 and the `docs/DOCUMENTATION_AUTHORITY_REGISTER.md` initial open queue.
 - Classification: **Implement** — already queued under TFR-019 documentation authority classification.
 - Follow-up issue: #689 tracks the `docs/DOCUMENTATION_AUTHORITY_REGISTER.md` initial open queue (87 unclassified docs).

@@ -467,7 +467,8 @@ per-tick budget enforcement, with product comparisons left to #875 and
 ## 8. References
 
 - Canonical design spec: [`docs/design/deferred-cleanup-work-queues.md`](deferred-cleanup-work-queues.md)
-- Background service scheduling: [`docs/design/deferred-cleanup-background-service-scheduling.md`](deferred-cleanup-background-service-scheduling.md)
+- Background service scheduling:
+  [`docs/BACKGROUND_SERVICE_FRAMEWORK_DESIGN.md`](../BACKGROUND_SERVICE_FRAMEWORK_DESIGN.md)
 - Incremental job framework: #1239
 - Refcount delta queues: #1180
 - Background service framework: #1179

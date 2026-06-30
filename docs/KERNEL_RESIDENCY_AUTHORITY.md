@@ -72,8 +72,8 @@ This decision reviewed the evidence named by issue #1288:
 - `docs/KERNEL_TEARDOWN_RUNTIME_EVIDENCE_DECISION.md`, whose T5/T6 model is
   still the teardown tiering vocabulary even though #1186 / PR #1463 has since
   accepted the T5 mounted-kernel cutover/teardown artifact.
-- `docs/KERNEL_MODULE_FAMILY_MATRIX_ROLLOUT_ORDER_P7-01.md`, especially the
-  full-kernel residency invariant and rollout-order constraints.
+- `docs/KERNEL_MODULE_FAMILY_MATRIX_ROLLOUT_ORDER_P7-01.md` as historical
+  design input for rollout-order constraints; it is not current evidence.
 - `docs/PAGE_CACHE_WRITEBACK_AUTHORITY.md` and
   `docs/PAGE_CACHE_INVALIDATION_AUTHORITY.md`, which own TFR-008 dirty data,
   writeback, mmap, and invalidation boundaries that kernel residency must

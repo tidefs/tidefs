@@ -17,8 +17,8 @@ reclaim, checksum-tree, extent-map, or object-store runtime behavior.
 - `crates/tidefs-data-cleaner/`: model reclaim-queue draining surface that is
   not mounted-runtime wiring.
 - `crates/tidefs-background-scheduler/` and
-  `docs/design/background-service-framework-design.md`: unified tick-driven
-  scheduler and priority/budget model.
+  `docs/BACKGROUND_SERVICE_FRAMEWORK_DESIGN.md`: unified tick-driven scheduler
+  and priority/budget model.
 - `crates/tidefs-reclaim/` and `crates/tidefs-reclaim-queue-core/`: reclaim
   queue, liveness accounting, dead-object handoff, and existing reclaim policy
   surfaces.

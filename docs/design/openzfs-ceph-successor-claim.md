@@ -595,10 +595,10 @@ topology from on-device labels alone.
 | TideCRUSH placement engine | `docs/ERASURE_CODING_PLACEMENT_DESIGN.md` | #1249 |
 | Recovery loop orchestrator | `docs/ERASURE_CODING_PLACEMENT_DESIGN.md` S5 | #1249 |
 | Erasure family catalog | `docs/ERASURE_CODING_PLACEMENT_DESIGN.md` S4 | #1249 |
-| Shard groups + rebake | `docs/SHARD_GROUPS_REPLICAS_REBAKE_DESIGN.md` | #1286 |
+| Shard groups + rebake | deleted historical lineage; current receipt authority is `docs/LOCAL_DISTRIBUTED_RECEIPT_AUTHORITY.md` | #1286 |
 | End-to-end checksum architecture | `docs/CHECKSUM_ARCHITECTURE_DESIGN.md` + `docs/design/end-to-end-checksum-architecture-g3-pillar.md` | #1287, #1559 |
-| Pool import/export + device topology | `docs/design/pool-import-export-device-topology-management.md` | #2084, #2078 |
-| Scrub/repair/resilver | `docs/SCRUB_REPAIR_RESILVER_DESIGN.md` | #1221 |
+| Pool import/export + device topology | `docs/POOL_IMPORT_EXPORT_DEVICE_TOPOLOGY_DESIGN.md` | #2084, #2078 |
+| Scrub/repair/resilver | deleted historical lineage; current local scrub identity is `docs/SCRUB_IDENTITY_AUTHORITY.md` | #1221 |
 
 ### 6.3 Production Runtime Gaps
 
@@ -664,8 +664,8 @@ when the four pillars (placement, redundancy, integrity, dynamics) are
 - [#1252](http://172.16.106.12/forgejo/forgeadmin/tidefs/issues/1252) — Intent log + write-intent bitmap
 - `docs/ZFS_CEPH_DESIGN_MISTAKE_COVERAGE_MATRIX.md`
 - `docs/ERASURE_CODING_PLACEMENT_DESIGN.md`
-- `docs/SHARD_GROUPS_REPLICAS_REBAKE_DESIGN.md`
+- deleted shard/rebake historical lineage
 - `docs/CHECKSUM_ARCHITECTURE_DESIGN.md`
 - `docs/REDUNDANCY_PLACEMENT_RECOVERY_BLOCKER_MAP_PC010A.md`
-- `docs/design/pool-import-export-device-topology-management.md`
+- `docs/POOL_IMPORT_EXPORT_DEVICE_TOPOLOGY_DESIGN.md`
 - `docs/FEATURE_MATRIX.md`

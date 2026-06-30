@@ -6,9 +6,8 @@
 //! with per-tick budget enforcement, 5-stage priority ordering, round-robin
 //! fairness, and budget cascading.
 //!
-//! Implements the canonical design spec at
-//! [`docs/design/background-service-framework-design.md`]
-//! (issues #1592, #1673, #1674, #1780). Wire-up tracking: #1877.
+//! Implements the current source-backed scheduler boundary summarized by
+//! [`docs/BACKGROUND_SERVICE_FRAMEWORK_DESIGN.md`].
 //! Pairs the [`BackgroundService`] trait with an
 //! [`IncrementalJobAdapter`] that wraps any [`IncrementalJob`] implementor,
 //! enabling the same job implementations to be driven in priority order
@@ -41,8 +40,8 @@
 //!   round-robin fairness, and budget cascading from higher to lower
 //!   priorities.
 //!
-//! [`docs/design/background-service-framework-design.md`]:
-//!     https://forgejo/forgeadmin/tidefs/docs/design/background-service-framework-design.md
+//! [`docs/BACKGROUND_SERVICE_FRAMEWORK_DESIGN.md`]:
+//!     docs/BACKGROUND_SERVICE_FRAMEWORK_DESIGN.md
 //! [`BackgroundService`]: trait.BackgroundService.html
 //! [`IncrementalJobAdapter`]: struct.IncrementalJobAdapter.html
 //! [`ServicePriority`]: enum.ServicePriority.html

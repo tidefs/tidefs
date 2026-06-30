@@ -4,10 +4,9 @@
 
 //! Authority type definitions for the universal incremental cursor framework.
 //!
-//! Implements Phase 1 of the background service framework.
-//! Canonical design spec:
-//! [`docs/design/background-service-framework-design.md`]
-//! (issues #1592, #1673, #1674, #1780). Wire-up tracking: #1877.
+//! Implements the job data-plane type boundary used by the current
+//! source-backed background scheduler. See
+//! [`docs/BACKGROUND_SERVICE_FRAMEWORK_DESIGN.md`].
 //! with seven core types:
 //!
 //! - [`WorkBudget`] — three-dimensional resource bound (items, bytes, time)
@@ -53,8 +52,8 @@
 //!
 //! [`IncrementalJob`]:
 //!     ../../tidefs-incremental-job-core/trait.IncrementalJob.html
-//! [`docs/design/background-service-framework-design.md`]:
-//!     docs/design/background-service-framework-design.md
+//! [`docs/BACKGROUND_SERVICE_FRAMEWORK_DESIGN.md`]:
+//!     docs/BACKGROUND_SERVICE_FRAMEWORK_DESIGN.md
 
 use core::fmt;
 

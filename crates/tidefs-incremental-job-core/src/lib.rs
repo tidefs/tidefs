@@ -5,10 +5,9 @@
 //! Control-plane [`IncrementalJob`] trait and checkpoint serialization
 //! contract for the universal incremental cursor framework.
 //!
-//! Implements Phase 2 of the background service framework.
-//! Canonical design spec:
-//! [`docs/design/background-service-framework-design.md`]
-//! (issues #1592, #1673, #1674, #1780). Wire-up tracking: #1877.
+//! Implements the object-safe job trait boundary used by the current
+//! source-backed background scheduler. See
+//! [`docs/BACKGROUND_SERVICE_FRAMEWORK_DESIGN.md`].
 //! Phase 1 (data-plane types: [`WorkBudget`], [`Checkpoint`], [`StepResult`],
 //! [`JobId`], [`JobKind`], [`JobProgress`], [`JobError`]) lives in
 //! [`tidefs_types_incremental_job_core`].
@@ -74,8 +73,8 @@
 //! [`JobKind`]: tidefs_types_incremental_job_core::JobKind
 //! [`JobProgress`]: tidefs_types_incremental_job_core::JobProgress
 //! [`JobError`]: tidefs_types_incremental_job_core::JobError
-//! [`docs/design/background-service-framework-design.md`]:
-//!     docs/design/background-service-framework-design.md
+//! [`docs/BACKGROUND_SERVICE_FRAMEWORK_DESIGN.md`]:
+//!     docs/BACKGROUND_SERVICE_FRAMEWORK_DESIGN.md
 
 #[cfg(feature = "alloc")]
 extern crate alloc;
