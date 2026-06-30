@@ -35,8 +35,8 @@ pub use sender::{
     BulkSenderResponse,
 };
 pub use vfs_rpc_handoff::{
-    VfsRpcBulkAbort, VfsRpcBulkCompletion, VfsRpcBulkDescriptor, VfsRpcBulkHandoff,
-    VfsRpcBulkHandoffError,
+    VfsRpcBulkAbort, VfsRpcBulkAdmission, VfsRpcBulkCompletion, VfsRpcBulkDescriptor,
+    VfsRpcBulkHandoff, VfsRpcBulkHandoffError,
 };
 
 /// Stable transport service id for the BULK plane.
