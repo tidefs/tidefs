@@ -88,7 +88,10 @@ use tidefs_types_pool_label_core::PoolRedundancyPolicy as LabelPoolRedundancyPol
 
 use crate::authority_spine::RuntimeAuthority;
 use crate::protocol::{self, Frame};
-use crate::snapshot_barrier::{SnapshotBarrierConfig, SnapshotCoordinator};
+use crate::snapshot_barrier::{
+    allocate_barrier_id, snapshot_barrier_send_report, SnapshotBarrierConfig,
+    SnapshotBarrierSendError, SnapshotBarrierSendReport, SnapshotCoordinator,
+};
 
 /// Magic prefix for cluster pool protocol messages (CP01 = Cluster Pool v1).
 const CLUSTER_POOL_MESSAGE_MAGIC: &[u8; 4] = b"CP01";
@@ -767,6 +770,108 @@ fn build_bridged_vfssend2_send_payload(
 ) -> Result<Vec<u8>, String> {
     let stream = build_vfssend2_send_stream(fs, fs_root, auth_key, config, key)?;
     bridge_vfssend2_send_stream(stream).map_err(|e| format!("VFSSEND2 transport bridge: {e}"))
+}
+
+fn snapshot_barrier_send_label(barrier_id: u64, key: &[u8]) -> String {
+    let class = if key.is_empty() { "full" } else { "incremental" };
+    format!("vfssend2-{class}-send-{barrier_id}")
+}
+
+fn run_snapshot_barrier_before_send(
+    session_id: tidefs_transport::SessionId,
+    ctx: &SessionContext,
+    key: &[u8],
+) -> Result<SnapshotBarrierSendReport, SnapshotBarrierSendError> {
+    let barrier_id = allocate_barrier_id();
+    let snapshot_name = snapshot_barrier_send_label(barrier_id, key);
+    let mut transport = ctx.transport.lock().unwrap();
+    let mut peer_sessions = BTreeMap::new();
+    for sid in transport.all_stats().sessions.keys() {
+        if *sid == session_id {
+            continue;
+        }
+        if let Some(peer_id) = transport.peer_node(*sid) {
+            peer_sessions.entry(peer_id).or_insert(*sid);
+        }
+    }
+
+    let peer_ids = peer_sessions.keys().copied().collect::<Vec<_>>();
+    let coordinator = SnapshotCoordinator::new(
+        barrier_id,
+        snapshot_name,
+        peer_ids,
+        SnapshotBarrierConfig::default(),
+    );
+
+    let request_bytes = coordinator.request_bytes();
+    {
+        let mut active = ctx.active_barrier.lock().unwrap();
+        if active.is_some() {
+            return Err(SnapshotBarrierSendError::AlreadyActive {
+                barrier_id,
+            });
+        }
+        if peer_sessions.is_empty() {
+            return snapshot_barrier_send_report(
+                barrier_id,
+                coordinator
+                    .outcome()
+                    .expect("empty snapshot barrier completes immediately"),
+            );
+        }
+        *active = Some(coordinator);
+    }
+
+    for (&peer_id, &peer_session) in &peer_sessions {
+        if let Err(err) = transport.send_message(peer_session, &request_bytes) {
+            *ctx.active_barrier.lock().unwrap() = None;
+            return Err(SnapshotBarrierSendError::SendFailed {
+                barrier_id,
+                peer_id,
+                reason: err.to_string(),
+            });
+        }
+    }
+    drop(transport);
+
+    loop {
+        let outcome = {
+            let active = ctx.active_barrier.lock().unwrap();
+            active.as_ref().and_then(SnapshotCoordinator::outcome)
+        };
+        if let Some(outcome) = outcome {
+            *ctx.active_barrier.lock().unwrap() = None;
+            return snapshot_barrier_send_report(barrier_id, outcome);
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+fn require_snapshot_barrier_before_send(
+    session_id: tidefs_transport::SessionId,
+    ctx: &SessionContext,
+    key: &[u8],
+) -> Result<(), String> {
+    match run_snapshot_barrier_before_send(session_id, ctx, key) {
+        Ok(report) => {
+            eprintln!(
+                "[storage-node] session {session_id}: snapshot barrier {} passed before VFSSEND2 send peers={} txg_range={}..{} objects={}",
+                report.barrier_id,
+                report.peer_count,
+                report.min_txg,
+                report.max_txg,
+                report.total_objects,
+            );
+            Ok(())
+        }
+        Err(err) => {
+            let message = err.to_string();
+            eprintln!(
+                "[storage-node] session {session_id}: snapshot barrier before VFSSEND2 send failed: {message}"
+            );
+            Err(format!("snapshot barrier before VFSSEND2 send: {message}"))
+        }
+    }
 }
 
 fn advance_tracker_after_peer_replica_read_map(
@@ -5345,6 +5450,9 @@ fn handle_frame_ctx(
         Frame::Send { key } => {
             let fs_root = ctx.config.fs_root.as_ref()?;
             let auth_key = ctx.config.root_auth_key?;
+            if let Err(message) = require_snapshot_barrier_before_send(session_id, ctx, key) {
+                return Some(Frame::Error { message });
+            }
             let mut fs = match vfs::LocalFileSystem::open_with_root_authentication_key(
                 fs_root,
                 StoreOptions::default(),
@@ -5588,6 +5696,9 @@ fn handle_frame_ctx(
         Frame::SendChunked { key } => {
             let fs_root = ctx.config.fs_root.as_ref()?;
             let auth_key = ctx.config.root_auth_key?;
+            if let Err(message) = require_snapshot_barrier_before_send(session_id, ctx, key) {
+                return Some(Frame::Error { message });
+            }
             let mut fs = match vfs::LocalFileSystem::open_with_root_authentication_key(
                 fs_root,
                 StoreOptions::default(),
@@ -6255,6 +6366,52 @@ mod cluster_pool_handler_tests {
                 );
             }
             other => panic!("expected VFSSEND1 receive rejection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn snapshot_barrier_before_send_allows_zero_peer_gate() {
+        let (_dir, store) = frame_local_store();
+        let ctx = frame_test_context(Arc::clone(&store));
+
+        let report =
+            run_snapshot_barrier_before_send(tidefs_transport::SessionId::new(1), &ctx, &[])
+                .expect("zero-peer barrier completes");
+
+        assert_eq!(report.peer_count, 0);
+        assert_eq!(report.min_txg, 0);
+        assert_eq!(report.max_txg, 0);
+        assert!(ctx.active_barrier.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn frame_send_aborts_when_snapshot_barrier_is_active() {
+        let (_dir, store) = frame_local_store();
+        let mut ctx = frame_test_context(Arc::clone(&store));
+        let fs_dir = tempfile::tempdir().unwrap();
+        ctx.config.fs_root = Some(fs_dir.path().join("fs"));
+        ctx.config.root_auth_key = Some(RootAuthenticationKey::demo_key());
+        *ctx.active_barrier.lock().unwrap() = Some(SnapshotCoordinator::new(
+            99,
+            "active".into(),
+            Vec::new(),
+            SnapshotBarrierConfig::default(),
+        ));
+
+        let response = handle_frame_ctx(
+            tidefs_transport::SessionId::new(1),
+            &Frame::Send { key: Vec::new() },
+            &store,
+            &ctx,
+        )
+        .expect("send returns barrier error");
+
+        match response {
+            Frame::Error { message } => {
+                assert!(message.contains("snapshot barrier before VFSSEND2 send"));
+                assert!(message.contains("already active"));
+            }
+            other => panic!("expected barrier error, got {other:?}"),
         }
     }
 
