@@ -656,34 +656,13 @@ impl BaseRootPinLookup for LocalReceiveBaseRootPinLookup<'_> {
 }
 
 fn receive_contract_error(error: ReceivePersistenceError) -> FileSystemError {
-    match error {
-        ReceivePersistenceError::BaseRootNotPinned { .. } => FileSystemError::Unsupported {
-            operation: "incremental receive",
-            reason: "receive contract base root is not pinned",
-        },
-        ReceivePersistenceError::DatasetLineageUnavailable { .. } => FileSystemError::Unsupported {
-            operation: "incremental receive",
-            reason: "receive contract dataset lineage is unavailable",
-        },
-        ReceivePersistenceError::DatasetLineageMismatch { .. } => FileSystemError::Unsupported {
-            operation: "incremental receive",
-            reason: "receive contract dataset lineage does not match local authority",
-        },
-        ReceivePersistenceError::ReceiveGenerationReplayed { .. } => FileSystemError::Unsupported {
-            operation: "incremental receive",
-            reason: "receive contract generation was already completed",
-        },
-        ReceivePersistenceError::ContractRequired => FileSystemError::Unsupported {
-            operation: "incremental receive",
-            reason: "receive contract is required",
-        },
-        ReceivePersistenceError::ContractNotValidated => FileSystemError::Unsupported {
-            operation: "incremental receive",
-            reason: "receive contract was not validated",
-        },
-        ReceivePersistenceError::Store(_) => FileSystemError::CorruptState {
+    if matches!(error, ReceivePersistenceError::Store(_)) {
+        return FileSystemError::CorruptState {
             reason: "receive contract validation unexpectedly reached object-store persistence",
-        },
+        };
+    }
+    FileSystemError::ReceiveStreamRefused {
+        reason: error.receiver_refusal_reason(),
     }
 }
 
