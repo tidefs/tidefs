@@ -281,10 +281,12 @@ pub enum IntentLogEntryKind {
     CrashReplayReconcile,
 }
 impl IntentLogEntryKind {
-    /// Whether this entry kind carries data intents that reference `inode_id`.
+    /// Whether this entry kind carries replayable data bytes for `inode_id`.
     ///
-    /// Covers SyncWriteRange, OdsyncDataRange, SharedMmapMsync, and
-    /// FsyncDirtyDrain (which drains accumulated intents for listed inodes).
+    /// Covers SyncWriteRange, OdsyncDataRange, and SharedMmapMsync only.
+    /// FsyncDirtyDrain is barrier evidence, and NamespaceSyncIntent is
+    /// metadata/namespace evidence; neither may satisfy a file-data barrier
+    /// without a separate replayable byte entry or committed content object.
     /// NamespaceCreateIntent is metadata-only: directory fsync tracks it
     /// through is_namespace_sync_for_dir(), but file fsync/fdatasync must not
     /// treat it as durable data authority for the created inode.
@@ -293,14 +295,11 @@ impl IntentLogEntryKind {
             IntentLogEntryKind::SyncWriteRange { inode_id: id, .. }
             | IntentLogEntryKind::OdsyncDataRange { inode_id: id, .. }
             | IntentLogEntryKind::SharedMmapMsync { inode_id: id, .. } => *id == inode_id,
-            IntentLogEntryKind::FsyncDirtyDrain { inode_ids } => inode_ids.contains(&inode_id),
-            IntentLogEntryKind::NamespaceSyncIntent {
-                affected_inode_ids, ..
-            } => affected_inode_ids.contains(&inode_id),
-            IntentLogEntryKind::NamespaceCreateIntent(_) => false,
-            IntentLogEntryKind::PressureFallback | IntentLogEntryKind::CrashReplayReconcile => {
-                false
-            }
+            IntentLogEntryKind::FsyncDirtyDrain { .. }
+            | IntentLogEntryKind::NamespaceSyncIntent { .. }
+            | IntentLogEntryKind::NamespaceCreateIntent(_)
+            | IntentLogEntryKind::PressureFallback
+            | IntentLogEntryKind::CrashReplayReconcile => false,
         }
     }
 
@@ -1163,7 +1162,7 @@ impl IntentLog {
     /// whether flushing the intent log is sufficient instead of a full
     /// commit_group commit.
     pub fn has_pending_data_for_inode(&self, inode_id: InodeId) -> bool {
-        self.entries
+        self.unflushed_entries()
             .iter()
             .any(|e| e.entry_kind.references_data_inode(inode_id))
     }
@@ -1172,9 +1171,13 @@ impl IntentLog {
     /// `NamespaceSyncIntent` for the given directory inode.
     /// Used by the fsync_directory fast path.
     pub fn has_pending_namespace_for_dir(&self, parent_inode_id: InodeId) -> bool {
-        self.entries
+        self.unflushed_entries()
             .iter()
             .any(|e| e.entry_kind.is_namespace_sync_for_dir(parent_inode_id))
+    }
+
+    fn unflushed_entries(&self) -> &[IntentLogEntry] {
+        self.entries.get(self.flushed_entry_count..).unwrap_or(&[])
     }
 
     /// Whether the adaptive flush interval has elapsed since the last flush.
@@ -2148,6 +2151,110 @@ mod tests {
             }
             _ => panic!("wrong kind"),
         }
+    }
+
+    #[test]
+    fn replayable_data_reference_excludes_barrier_and_namespace_markers() {
+        let inode_id = InodeId::new(77);
+
+        let data_entries = [
+            IntentLogEntryKind::SyncWriteRange {
+                inode_id,
+                offset: 0,
+                length: 4,
+                payload_digest: IntegrityDigest64(0xAA),
+                data_version: 1,
+            },
+            IntentLogEntryKind::OdsyncDataRange {
+                inode_id,
+                offset: 0,
+                length: 4,
+                payload_digest: IntegrityDigest64(0xBB),
+                has_size_delta: false,
+                data_version: 1,
+            },
+            IntentLogEntryKind::SharedMmapMsync {
+                inode_id,
+                offset: 0,
+                length: 4,
+                payload_digest: IntegrityDigest64(0xCC),
+                data_version: 1,
+            },
+        ];
+        for entry_kind in data_entries {
+            assert!(entry_kind.references_data_inode(inode_id));
+        }
+
+        let marker_entries = [
+            IntentLogEntryKind::FsyncDirtyDrain {
+                inode_ids: vec![inode_id],
+            },
+            IntentLogEntryKind::NamespaceSyncIntent {
+                parent_inode_id: ROOT_INODE_ID,
+                affected_inode_ids: vec![inode_id],
+                link_count_deltas: vec![(inode_id, 1)],
+            },
+            IntentLogEntryKind::PressureFallback,
+            IntentLogEntryKind::CrashReplayReconcile,
+        ];
+        for entry_kind in marker_entries {
+            assert!(!entry_kind.references_data_inode(inode_id));
+        }
+    }
+
+    #[test]
+    fn pending_data_for_inode_requires_unflushed_replayable_data() {
+        let inode_id = InodeId::new(88);
+        let mut log = IntentLog::new();
+        log.entries.push(IntentLogEntry {
+            entry_id: 0,
+            entry_kind: IntentLogEntryKind::SyncWriteRange {
+                inode_id,
+                offset: 0,
+                length: 4,
+                payload_digest: IntegrityDigest64(0xAA),
+                data_version: 1,
+            },
+            root_anchor: test_root_anchor(),
+            timestamp_ns: test_timestamp(),
+        });
+        log.flushed_entry_count = 1;
+        assert!(!log.has_pending_data_for_inode(inode_id));
+
+        log.entries.push(IntentLogEntry {
+            entry_id: 1,
+            entry_kind: IntentLogEntryKind::FsyncDirtyDrain {
+                inode_ids: vec![inode_id],
+            },
+            root_anchor: test_root_anchor(),
+            timestamp_ns: test_timestamp(),
+        });
+        log.entries.push(IntentLogEntry {
+            entry_id: 2,
+            entry_kind: IntentLogEntryKind::NamespaceSyncIntent {
+                parent_inode_id: ROOT_INODE_ID,
+                affected_inode_ids: vec![inode_id],
+                link_count_deltas: vec![(inode_id, 1)],
+            },
+            root_anchor: test_root_anchor(),
+            timestamp_ns: test_timestamp(),
+        });
+        assert!(!log.has_pending_data_for_inode(inode_id));
+
+        log.entries.push(IntentLogEntry {
+            entry_id: 3,
+            entry_kind: IntentLogEntryKind::OdsyncDataRange {
+                inode_id,
+                offset: 4,
+                length: 4,
+                payload_digest: IntegrityDigest64(0xBB),
+                has_size_delta: false,
+                data_version: 2,
+            },
+            root_anchor: test_root_anchor(),
+            timestamp_ns: test_timestamp(),
+        });
+        assert!(log.has_pending_data_for_inode(inode_id));
     }
 
     #[test]
