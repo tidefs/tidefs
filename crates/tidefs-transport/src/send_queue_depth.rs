@@ -320,9 +320,9 @@ impl fmt::Display for SendQueueDepthEvidenceError {
 ///
 /// # Thread safety
 ///
-/// `try_reserve` and `release` use `AtomicUsize` fetch_add/sub with
-/// `Ordering::Acquire`/`Release` semantics, so they are safe to call
-/// from any thread concurrently.
+/// `try_reserve` and `release` use `AtomicUsize` read-modify-write operations
+/// with acquire/release ordering, so they are safe to call from any thread
+/// concurrently.
 #[derive(Debug)]
 pub struct SendQueueDepth {
     config: SendQueueDepthConfig,
@@ -473,10 +473,21 @@ impl SendQueueDepth {
         if self.config.max_depth(lane) == 0 {
             return;
         }
-        let prev = self.depth[lane.as_usize()].fetch_sub(1, Ordering::Release);
-        // Underflow guard: if we released more than reserved, clamp.
-        if prev == 0 {
-            self.depth[lane.as_usize()].store(0, Ordering::Release);
+        let depth = &self.depth[lane.as_usize()];
+        let mut current = depth.load(Ordering::Acquire);
+        loop {
+            if current == 0 {
+                return;
+            }
+            match depth.compare_exchange_weak(
+                current,
+                current - 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(observed) => current = observed,
+            }
         }
     }
 
@@ -651,6 +662,34 @@ mod tests {
         // Release without reserve: should stay at 0.
         gov.release(LaneClass::Speculative);
         assert_eq!(gov.depth(LaneClass::Speculative), 0);
+    }
+
+    #[test]
+    fn concurrent_empty_releases_do_not_wrap_depth() {
+        let cfg = SendQueueDepthConfig::new([10; LaneClass::COUNT]).unwrap();
+        let gov = Arc::new(SendQueueDepth::new(cfg));
+        let lane = LaneClass::Demand;
+
+        for _ in 0..64 {
+            let barrier = Arc::new(Barrier::new(8));
+            let threads: Vec<_> = (0..8)
+                .map(|_| {
+                    let gov = Arc::clone(&gov);
+                    let barrier = Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        gov.release(lane);
+                    })
+                })
+                .collect();
+
+            for thread in threads {
+                thread.join().unwrap();
+            }
+
+            let depth = gov.depth(lane);
+            assert!(depth <= 10, "depth {depth} exceeded max 10");
+        }
     }
 
     #[test]
