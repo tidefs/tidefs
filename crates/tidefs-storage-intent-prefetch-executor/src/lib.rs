@@ -1843,20 +1843,6 @@ pub fn evaluate_prefetch_execution(input: PrefetchExecutorInput) -> PrefetchExec
                     PrefetchExecutorByteState::Refused,
                     admitted_speculative_pressure_refusal(input),
                 )
-            } else if !input.runtime_support.supports_family(family) {
-                terminal(
-                    record,
-                    PrefetchExecutorOutcome::Unavailable,
-                    PrefetchExecutorByteState::Unavailable,
-                    input.runtime_support.refusal_reason(),
-                )
-            } else if !snapshot_contains_ref(input, input.runtime_support.support_ref) {
-                terminal(
-                    record,
-                    PrefetchExecutorOutcome::Blocked,
-                    PrefetchExecutorByteState::Blocked,
-                    StorageIntentRefusalReason::EvidenceNotUsable,
-                )
             } else {
                 let dispatch_plan_refusal = dispatch_plan_refusal(input, family);
                 if dispatch_plan_refusal as u16 != StorageIntentRefusalReason::None as u16 {
@@ -1872,6 +1858,20 @@ pub fn evaluate_prefetch_execution(input: PrefetchExecutorInput) -> PrefetchExec
                         outcome,
                         PrefetchExecutorByteState::Blocked,
                         dispatch_plan_refusal,
+                    )
+                } else if !input.runtime_support.supports_family(family) {
+                    terminal(
+                        record,
+                        PrefetchExecutorOutcome::Unavailable,
+                        PrefetchExecutorByteState::Unavailable,
+                        input.runtime_support.refusal_reason(),
+                    )
+                } else if !snapshot_contains_ref(input, input.runtime_support.support_ref) {
+                    terminal(
+                        record,
+                        PrefetchExecutorOutcome::Blocked,
+                        PrefetchExecutorByteState::Blocked,
+                        StorageIntentRefusalReason::EvidenceNotUsable,
                     )
                 } else {
                     record.executor_byte_state = byte_state_for_decision(input.decision, family);
@@ -4400,6 +4400,52 @@ mod tests {
             record.refusal,
             StorageIntentRefusalReason::EvidenceNotUsable
         );
+    }
+
+    #[test]
+    fn missing_runtime_support_does_not_mask_missing_dispatch_plan() {
+        let mut input = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        input.runtime_support = PrefetchExecutorRuntimeSupport::default();
+        input.dispatch_plan = PrefetchExecutorDispatchPlan::default();
+
+        let record = evaluate_prefetch_execution(input);
+
+        assert_eq!(record.outcome, PrefetchExecutorOutcome::Blocked);
+        assert_eq!(
+            record.executor_byte_state,
+            PrefetchExecutorByteState::Blocked
+        );
+        assert_eq!(
+            record.refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+        assert_record_has_no_authority_claims(record);
+    }
+
+    #[test]
+    fn wrong_runtime_support_does_not_mask_out_of_cut_dispatch_plan() {
+        let mut input = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        input.runtime_support = PrefetchExecutorRuntimeSupport::supported(
+            PrefetchExecutorRuntimeSupportMask::STRIDED_VECTOR_RANGE_PREFETCH,
+            evidence(StorageIntentEvidenceKind::ActionExecutionEvidence, ACTION),
+        );
+        input.dispatch_plan.plan_ref = evidence(
+            StorageIntentEvidenceKind::ActionExecutionEvidence,
+            OUTSIDE_CUT,
+        );
+
+        let record = evaluate_prefetch_execution(input);
+
+        assert_eq!(record.outcome, PrefetchExecutorOutcome::Blocked);
+        assert_eq!(
+            record.executor_byte_state,
+            PrefetchExecutorByteState::Blocked
+        );
+        assert_eq!(
+            record.refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+        assert_record_has_no_authority_claims(record);
     }
 
     #[test]
