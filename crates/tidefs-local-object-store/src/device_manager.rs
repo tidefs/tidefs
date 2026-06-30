@@ -2,7 +2,8 @@
 //! Online device topology management: add, remove, and replace devices while
 //! the pool is live.
 //!
-//! Implements Phase 5-8 of `docs/POOL_IMPORT_EXPORT_DEVICE_TOPOLOGY_DESIGN.md`.
+//! Implements online device topology operations summarized by
+//! `docs/POOL_IMPORT_EXPORT_DEVICE_TOPOLOGY_DESIGN.md`.
 //!
 //! The `DeviceManager` coordinates label updates on device topology changes:
 //! - Adding a device: writes label to new device, updates all existing device

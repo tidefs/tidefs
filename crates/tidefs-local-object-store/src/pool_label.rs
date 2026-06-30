@@ -3,9 +3,7 @@
 //! `tidefs-types-pool-label-core`.
 //!
 //! This module exists so that `PoolImporter`, `PoolExporter`, and
-//! `DeviceManager` (deferred to wire-up issues per the sealed design
-//! spec in `docs/design/pool-import-export-device-topology-management.md`)
-//! can import label types from a single crate.
+//! `DeviceManager` can import label types from a single crate.
 //!
 //! The PoolLabelV1 on-device label format, PoolState/DeviceClass enums,
 //! and BLAKE3-256 encode/decode/checksum routines are implemented in

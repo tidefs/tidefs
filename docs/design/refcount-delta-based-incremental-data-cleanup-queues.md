@@ -67,13 +67,12 @@ The current Rust codebase has:
   monitors space pressure, tracks compaction state, and coordinates batch
   segment rotation via `LocalObjectStore::rotate_segment()`.
 
-The **scrub / deep-scrub / repair / resilver orchestration design**
-(`docs/design/scrub-deep-scrub-repair-resilver-orchestration-design.md`) specifies
-how scrub findings, deep-scrub shard divergence, repair strategy resolution, and
-resilver topology-aware placement integrate with the reclaim pipeline. When reclaim
-discovers refcount underflows or stale deltas, findings are emitted through the
-unified `IntegrityEventBus` (orchestration design §8). The repair service drains
-the `SuspectLog` (orchestration design §3.6) and delegates rebuild execution to the
+The deleted scrub / deep-scrub / repair / resilver historical lineage described
+how scrub findings, deep-scrub shard divergence, repair strategy resolution,
+and resilver topology-aware placement might integrate with the reclaim
+pipeline. When reclaim discovers refcount underflows or stale deltas, findings
+are emitted through the unified `IntegrityEventBus`. The repair service drains
+the `SuspectLog` and delegates rebuild execution to the
 P8-03 distributed infrastructure. Rust implementation of the four integrity
 services is deferred to wire-up issues U1–U10.
 
@@ -477,7 +476,7 @@ reclamation is performed by the segment cleaner (#1215).
 | `recovery.rs` | Crash recovery audit. Reclaim queue replay is mount recovery. |
 | `tidefs-locator-table` | Extent reclaim interacts with `ExtentLocatorValueV1.refcount`. |
 | `tidefs-space-accounting` | Reclaim updates physical counters on deadlist handoff. |
-| `docs/design/scrub-deep-scrub-repair-resilver-orchestration-design.md` | Orchestration design (#2128) for scrub, deep-scrub, repair, and resilver as `BackgroundService` implementations. Reclaim queue integrity errors (refcount underflows, stale delta resurrections) emit `IntegrityEvent` on the unified event bus (orchestration design §8). Repair drains the `SuspectLog` (orchestration design §3.6) and delegates rebuild to P8-03 infrastructure. Rust implementation deferred to wire-up issues U1–U10. |
+| Deleted scrub/repair/resilver historical lineage | Former orchestration design (#2128) for scrub, deep-scrub, repair, and resilver as `BackgroundService` implementations. Current local scrub identity authority lives in `docs/SCRUB_IDENTITY_AUTHORITY.md`; broader repair/rebuild behavior requires current source and validation evidence. |
 
 
 ## 10. Implementation Plan
@@ -581,7 +580,7 @@ and crash-safe resume — all standard across all background jobs.
   - [#1689](http://172.16.106.12/forgejo/forgeadmin/tidefs/issues/1689) — this design (current revision, canonical)
 - **Foundation dependencies**:
   - [#1285](http://172.16.106.12/forgejo/forgeadmin/tidefs/issues/1285) — locator table lifecycle
-  - [#1179](http://172.16.106.12/forgejo/forgeadmin/tidefs/issues/1179) — background service framework (`docs/design/background-service-framework-design.md`)
+  - [#1179](http://172.16.106.12/forgejo/forgeadmin/tidefs/issues/1179) — background service framework (`docs/BACKGROUND_SERVICE_FRAMEWORK_DESIGN.md`)
   - [#1239](http://172.16.106.12/forgejo/forgeadmin/tidefs/issues/1239) — incremental cursor framework / `IncrementalJob` trait
   - [#1267](http://172.16.106.12/forgejo/forgeadmin/tidefs/issues/1267) — commit_group state machine
 - **Implemented integration**:
@@ -594,7 +593,7 @@ and crash-safe resume — all standard across all background jobs.
   - [#1215](http://172.16.106.12/forgejo/forgeadmin/tidefs/issues/1215) — space accounting / segment cleaner
   - [#1249](http://172.16.106.12/forgejo/forgeadmin/tidefs/issues/1249) — erasure coding
 - **Orchestration integration**:
-  - [#2128](http://172.16.106.12/forgejo/forgeadmin/tidefs/issues/2128) — scrub, deep scrub, repair, and resilver orchestration integration (`docs/design/scrub-deep-scrub-repair-resilver-orchestration-design.md`)
+  - [#2128](http://172.16.106.12/forgejo/forgeadmin/tidefs/issues/2128) — deleted scrub, deep scrub, repair, and resilver orchestration lineage
 - **External references**:
   - ZFS: `bpobj` subsystem, `dsl_scan`/`dsl_destroy` pipeline
   - Ceph: PG log recovery, OSD snap trimming

@@ -46,7 +46,7 @@ No host-global Rust or cargo installation is needed.
 Clone the repository and build:
 
 ```sh
-git clone http://172.16.106.12/forgejo/tidefs/tidefs.git
+git clone https://github.com/tidefs/tidefs.git
 cd tidefs
 nix build .#packages.x86_64-linux.default
 ```

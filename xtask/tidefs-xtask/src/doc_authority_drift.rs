@@ -15,6 +15,38 @@ const AUTHORITY_EVIDENCE_DOCS: &[&str] = &[
     "docs/WHOLE_REPO_REVIEW.md",
 ];
 
+const ACTIVE_ENTRYPOINT_DOCS: &[&str] = &[
+    "docs/INDEX.md",
+    "docs/LICENSING.md",
+    "docs/REVIEW_TODO_POLICY.md",
+    "docs/TEST_SIGNAL_POLICY.md",
+];
+
+const STALE_AUTHORITY_MARKER_ALLOWED_DOCS: &[&str] = &[
+    // Current policy for TideFS kernel development names the local Linux mirror.
+    "docs/KERNEL_MODULE_DEVELOPMENT_WORKFLOW_P7-05.md",
+];
+
+const STALE_AUTHORITY_MARKERS: &[&str] = &[
+    "http://172.16.106.12/forgejo",
+    "https://172.16.106.12/forgejo",
+    "http://forgejo/forgeadmin",
+    "https://forgejo/forgeadmin",
+    "Current branch:",
+    "Current worktree:",
+    "Maturity: **design-spec**",
+    "Maturity: design-spec",
+    "Maturity: **design-sealed**",
+    "Maturity: design-sealed",
+    "Status: sealed",
+    "Status: Sealed",
+    "**Status: Sealed**",
+    "This document closes Forgejo issue",
+    "closes Forgejo issue",
+    "single authoritative reference",
+    "single consolidated canonical design specification",
+];
+
 #[derive(Debug)]
 pub struct DocAuthorityDriftError {
     violations: Vec<String>,
@@ -48,14 +80,16 @@ fn check_workspace_root(root: &Path) -> Result<(), DocAuthorityDriftError> {
     let mut violations = BTreeSet::new();
     let mut scanned_docs = 0_usize;
     for rel_path in docs {
-        if !should_scan_doc(&rel_path, &authority_states) {
+        let Some(scan_mode) = scan_mode_for_doc(&rel_path, &authority_states) else {
             continue;
-        }
+        };
         scanned_docs += 1;
         scan_doc(
             root,
             &rel_path,
+            scan_mode,
             &retired_crates,
+            &authority_states,
             &valid_register_ids,
             &mut violations,
         );
@@ -81,20 +115,74 @@ fn single_violation(message: String) -> DocAuthorityDriftError {
     }
 }
 
-fn should_scan_doc(rel_path: &str, authority_states: &BTreeMap<String, AuthorityState>) -> bool {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScanMode {
+    StrictReferencesAndMarkers,
+    AuthorityMarkersOnly,
+}
+
+fn scan_mode_for_doc(
+    rel_path: &str,
+    authority_states: &BTreeMap<String, AuthorityState>,
+) -> Option<ScanMode> {
     if AUTHORITY_EVIDENCE_DOCS.contains(&rel_path) {
-        return false;
+        return None;
     }
-    !matches!(
-        authority_states.get(rel_path),
-        Some(AuthorityState::HistoricalInput | AuthorityState::DeleteCandidate)
-    )
+
+    let authority_state = effective_authority_state(rel_path, authority_states);
+    if matches!(
+        authority_state,
+        Some(
+            AuthorityState::HistoricalInput
+                | AuthorityState::Missing
+                | AuthorityState::DeleteCandidate
+        )
+    ) {
+        return None;
+    }
+
+    if ACTIVE_ENTRYPOINT_DOCS.contains(&rel_path)
+        || matches!(
+            authority_state,
+            Some(AuthorityState::CurrentPolicy | AuthorityState::CurrentSpec)
+        )
+    {
+        Some(ScanMode::StrictReferencesAndMarkers)
+    } else {
+        Some(ScanMode::AuthorityMarkersOnly)
+    }
+}
+
+fn effective_authority_state(
+    rel_path: &str,
+    authority_states: &BTreeMap<String, AuthorityState>,
+) -> Option<AuthorityState> {
+    authority_states
+        .get(rel_path)
+        .copied()
+        .or_else(|| default_historical_state(rel_path))
+}
+
+fn default_historical_state(rel_path: &str) -> Option<AuthorityState> {
+    if rel_path.starts_with("docs/design/")
+        || rel_path.ends_with("_DESIGN.md")
+        || rel_path.ends_with("_PLAN.md")
+        || rel_path.contains("-implementation-plan")
+        || rel_path.contains("-milestone-")
+        || rel_path.contains("-velocity-")
+    {
+        Some(AuthorityState::HistoricalInput)
+    } else {
+        None
+    }
 }
 
 fn scan_doc(
     root: &Path,
     rel_path: &str,
+    scan_mode: ScanMode,
     retired_crates: &BTreeSet<String>,
+    authority_states: &BTreeMap<String, AuthorityState>,
     valid_register_ids: &BTreeSet<String>,
     violations: &mut BTreeSet<String>,
 ) {
@@ -110,28 +198,45 @@ fn scan_doc(
     for (line_index, line) in text.lines().enumerate() {
         let line_number = line_index + 1;
 
-        for crate_name in extract_tidefs_crate_names(line) {
-            if retired_crates.contains(&crate_name) {
-                violations.insert(format!(
-                    "{rel_path}:{line_number}: retired crate reference `{crate_name}`; expected a current crate from {PACKAGE_CLASSIFICATION_DOC} or a historical-input classification in {DOCUMENTATION_AUTHORITY_REGISTER}"
-                ));
+        if scan_mode == ScanMode::StrictReferencesAndMarkers {
+            for crate_name in extract_tidefs_crate_names(line) {
+                if retired_crates.contains(&crate_name) {
+                    violations.insert(format!(
+                        "{rel_path}:{line_number}: retired crate reference `{crate_name}`; expected a current crate from {PACKAGE_CLASSIFICATION_DOC} or a historical-input classification in {DOCUMENTATION_AUTHORITY_REGISTER}"
+                    ));
+                }
+            }
+
+            for doc_ref in extract_doc_references(line, rel_path) {
+                if !root.join(&doc_ref.rel_target).exists()
+                    && !matches!(
+                        authority_states.get(&doc_ref.rel_target),
+                        Some(AuthorityState::Missing)
+                    )
+                {
+                    violations.insert(format!(
+                        "{rel_path}:{line_number}: missing doc path `{}`; expected retargeting to an existing path, restoring the path, or classifying this document as historical input in {DOCUMENTATION_AUTHORITY_REGISTER}",
+                        doc_ref.raw
+                    ));
+                }
+            }
+
+            for register_id in extract_register_ids(line) {
+                if !valid_register_ids.contains(&register_id) {
+                    violations.insert(format!(
+                        "{rel_path}:{line_number}: stale register id `{register_id}`; expected a live row in {REVIEW_TODO_REGISTER} or an updated reference"
+                    ));
+                }
             }
         }
 
-        for doc_ref in extract_doc_references(line, rel_path) {
-            if !root.join(&doc_ref.rel_target).exists() {
-                violations.insert(format!(
-                    "{rel_path}:{line_number}: missing doc path `{}`; expected retargeting to an existing path, restoring the path, or classifying this document as historical input in {DOCUMENTATION_AUTHORITY_REGISTER}",
-                    doc_ref.raw
-                ));
-            }
-        }
-
-        for register_id in extract_register_ids(line) {
-            if !valid_register_ids.contains(&register_id) {
-                violations.insert(format!(
-                    "{rel_path}:{line_number}: stale register id `{register_id}`; expected a live row in {REVIEW_TODO_REGISTER} or an updated reference"
-                ));
+        if !STALE_AUTHORITY_MARKER_ALLOWED_DOCS.contains(&rel_path) {
+            for marker in STALE_AUTHORITY_MARKERS {
+                if line.contains(marker) {
+                    violations.insert(format!(
+                        "{rel_path}:{line_number}: stale authority marker `{marker}` in live Markdown doc; classify the file as historical input in {DOCUMENTATION_AUTHORITY_REGISTER}, delete/fold it, or replace the marker with current source-backed authority wording"
+                    ));
+                }
             }
         }
     }
@@ -318,6 +423,7 @@ enum AuthorityState {
     CurrentPolicy,
     CurrentSpec,
     HistoricalInput,
+    Missing,
     DeleteCandidate,
 }
 
@@ -328,6 +434,7 @@ impl AuthorityState {
             "Current policy" => Some(Self::CurrentPolicy),
             "Current spec" => Some(Self::CurrentSpec),
             "Historical input" => Some(Self::HistoricalInput),
+            "Missing" => Some(Self::Missing),
             "Delete candidate" => Some(Self::DeleteCandidate),
             _ => None,
         }
@@ -396,6 +503,9 @@ fn collect_inline_doc_tokens(line: &str, source_rel_path: &str, refs: &mut BTree
 
 fn add_doc_reference(raw: &str, source_rel_path: &str, refs: &mut BTreeSet<DocReference>) {
     let cleaned = clean_reference(raw);
+    if is_glob_reference(&cleaned) {
+        return;
+    }
     if let Some(rel_target) = resolve_doc_reference(&cleaned, source_rel_path) {
         refs.insert(DocReference {
             raw: cleaned,
@@ -450,6 +560,8 @@ fn resolve_doc_reference(raw: &str, source_rel_path: &str) -> Option<String> {
         PathBuf::from(raw.trim_start_matches('/'))
     } else if raw.starts_with("docs/") {
         PathBuf::from(raw)
+    } else if is_repo_root_markdown_reference(raw) {
+        PathBuf::from(raw)
     } else if raw.starts_with("./") || raw.starts_with("../") || has_doc_extension(raw) {
         let source_dir = Path::new(source_rel_path)
             .parent()
@@ -460,11 +572,31 @@ fn resolve_doc_reference(raw: &str, source_rel_path: &str) -> Option<String> {
     };
 
     let normalized = normalize_rel_path(&path)?;
-    if normalized.starts_with("docs/") {
+    if is_checked_doc_reference(&normalized) {
         Some(normalized)
     } else {
         None
     }
+}
+
+fn is_glob_reference(value: &str) -> bool {
+    value.contains('*')
+}
+
+fn is_repo_root_markdown_reference(value: &str) -> bool {
+    matches!(
+        value,
+        "README.md" | "AGENTS.md" | "CONTRIBUTING.md" | "SECURITY.md"
+    ) || value.starts_with("apps/")
+        || value.starts_with("crates/")
+        || value.starts_with("kmod/")
+        || value.starts_with("xtask/")
+        || value.starts_with(".github/")
+        || value.starts_with("validation/")
+}
+
+fn is_checked_doc_reference(value: &str) -> bool {
+    value.starts_with("docs/") || is_repo_root_markdown_reference(value)
 }
 
 fn has_doc_extension(value: &str) -> bool {
@@ -613,7 +745,7 @@ mod tests {
         fs::write(path, text).expect("write file");
     }
 
-    fn write_minimal_authority(root: &Path, extra_register_rows: &str) {
+    fn write_minimal_authority(root: &Path, extra_authority_rows: &str) {
         write_file(root, "Cargo.toml", "[workspace]\nmembers = []\n");
         write_file(
             root,
@@ -636,27 +768,27 @@ Retired scaffold roots include `tidefs-old-core`.
         write_file(
             root,
             DOCUMENTATION_AUTHORITY_REGISTER,
-            "\
+            &format!(
+                "\
 # Documentation Authority Register
 
 | Path | State | Classification note |
 |---|---|---|
 | `docs/historical.md` | Historical input | fixture. |
-",
+{extra_authority_rows}
+"
+            ),
         );
         write_file(
             root,
             REVIEW_TODO_REGISTER,
-            &format!(
-                "\
+            "\
 # TideFS Review Todo Register
 
 | Id | Area | Finding | Required Direction |
 | --- | --- | --- | --- |
 | TFR-002 | Workspace authority | fixture. | fixture. |
-{extra_register_rows}
-"
-            ),
+",
         );
     }
 
@@ -667,7 +799,7 @@ Retired scaffold roots include `tidefs-old-core`.
         write_file(temp.path(), "docs/existing.md", "# Existing\n");
         write_file(
             temp.path(),
-            "docs/live.md",
+            "docs/INDEX.md",
             "See `docs/existing.md`, `tidefs-current-core`, and TFR-002.\n",
         );
 
@@ -678,11 +810,11 @@ Retired scaffold roots include `tidefs-old-core`.
     fn retired_crate_reference_is_reported() {
         let temp = tempfile::tempdir().expect("tempdir");
         write_minimal_authority(temp.path(), "");
-        write_file(temp.path(), "docs/live.md", "Uses `tidefs-old-core`.\n");
+        write_file(temp.path(), "docs/INDEX.md", "Uses `tidefs-old-core`.\n");
 
         let err = check_workspace_root(temp.path()).expect_err("retired crate drift");
         let rendered = err.to_string();
-        assert!(rendered.contains("docs/live.md:1"));
+        assert!(rendered.contains("docs/INDEX.md:1"));
         assert!(rendered.contains("retired crate reference `tidefs-old-core`"));
     }
 
@@ -690,23 +822,75 @@ Retired scaffold roots include `tidefs-old-core`.
     fn missing_doc_reference_is_reported() {
         let temp = tempfile::tempdir().expect("tempdir");
         write_minimal_authority(temp.path(), "");
-        write_file(temp.path(), "docs/live.md", "See `docs/missing.md`.\n");
+        write_file(temp.path(), "docs/INDEX.md", "See `docs/missing.md`.\n");
 
         let err = check_workspace_root(temp.path()).expect_err("missing doc drift");
         let rendered = err.to_string();
-        assert!(rendered.contains("docs/live.md:1"));
+        assert!(rendered.contains("docs/INDEX.md:1"));
         assert!(rendered.contains("missing doc path `docs/missing.md`"));
+    }
+
+    #[test]
+    fn registered_missing_doc_reference_is_allowed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_minimal_authority(
+            temp.path(),
+            "\
+| `docs/missing.md` | Missing | known absent fixture. |
+",
+        );
+        write_file(
+            temp.path(),
+            "docs/INDEX.md",
+            "Known gap: `docs/missing.md`.\n",
+        );
+
+        check_workspace_root(temp.path()).expect("registered missing doc is a known gap");
+    }
+
+    #[test]
+    fn repo_root_markdown_references_are_checked() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_minimal_authority(temp.path(), "");
+        write_file(temp.path(), "README.md", "# Root\n");
+        write_file(temp.path(), "AGENTS.md", "# Agents\n");
+        write_file(temp.path(), "apps/README.md", "# Apps\n");
+        write_file(
+            temp.path(),
+            "crates/tidefs-current-core/README.md",
+            "# Crate\n",
+        );
+        write_file(
+            temp.path(),
+            "docs/INDEX.md",
+            "See `README.md`, `AGENTS.md`, `apps/README.md`, and `crates/tidefs-current-core/README.md`.\n",
+        );
+
+        check_workspace_root(temp.path()).expect("repo-root references exist");
+    }
+
+    #[test]
+    fn glob_doc_references_are_ignored() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_minimal_authority(temp.path(), "");
+        write_file(
+            temp.path(),
+            "docs/INDEX.md",
+            "Examples include `docs/**`, `docs/design/*pool*`, and `**`docs/example.md`.\n",
+        );
+
+        check_workspace_root(temp.path()).expect("glob examples are not doc refs");
     }
 
     #[test]
     fn stale_register_id_is_reported() {
         let temp = tempfile::tempdir().expect("tempdir");
         write_minimal_authority(temp.path(), "");
-        write_file(temp.path(), "docs/live.md", "Review debt TFR-999.\n");
+        write_file(temp.path(), "docs/INDEX.md", "Review debt TFR-999.\n");
 
         let err = check_workspace_root(temp.path()).expect_err("stale register id");
         let rendered = err.to_string();
-        assert!(rendered.contains("docs/live.md:1"));
+        assert!(rendered.contains("docs/INDEX.md:1"));
         assert!(rendered.contains("stale register id `TFR-999`"));
     }
 
@@ -721,5 +905,104 @@ Retired scaffold roots include `tidefs-old-core`.
         );
 
         check_workspace_root(temp.path()).expect("historical fixture is skipped");
+    }
+
+    #[test]
+    fn current_specs_report_gap_references() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_minimal_authority(
+            temp.path(),
+            "| `docs/live.md` | Current spec | fixture. |\n",
+        );
+        write_file(
+            temp.path(),
+            "docs/live.md",
+            "Gap refs: `tidefs-old-core`, `docs/missing.md`, and TFR-999.\n",
+        );
+
+        let err = check_workspace_root(temp.path()).expect_err("current fixture is strict");
+        let rendered = err.to_string();
+        assert!(rendered.contains("retired crate reference `tidefs-old-core`"));
+        assert!(rendered.contains("missing doc path `docs/missing.md`"));
+        assert!(rendered.contains("stale register id `TFR-999`"));
+    }
+
+    #[test]
+    fn imported_design_docs_are_historical_by_default() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_minimal_authority(temp.path(), "");
+        write_file(
+            temp.path(),
+            "docs/design/old-design.md",
+            "Maturity: **design-spec**\nOld `tidefs-old-core`, `docs/missing.md`, and TFR-999.\n",
+        );
+
+        check_workspace_root(temp.path()).expect("design fixture is skipped by default");
+    }
+
+    #[test]
+    fn root_design_docs_are_historical_by_default() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_minimal_authority(temp.path(), "");
+        write_file(
+            temp.path(),
+            "docs/OLD_SUBSYSTEM_DESIGN.md",
+            "Status: Sealed\nOld `tidefs-old-core`, `docs/missing.md`, and TFR-999.\n",
+        );
+
+        check_workspace_root(temp.path()).expect("root design fixture is skipped by default");
+    }
+
+    #[test]
+    fn stale_authority_marker_in_live_doc_is_reported() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_minimal_authority(
+            temp.path(),
+            "| `docs/live.md` | Current spec | fixture. |\n",
+        );
+        write_file(
+            temp.path(),
+            "docs/live.md",
+            "Maturity: **design-spec**\nThis document closes Forgejo issue #1234.\n",
+        );
+
+        let err = check_workspace_root(temp.path()).expect_err("stale marker drift");
+        let rendered = err.to_string();
+        assert!(rendered.contains("docs/live.md:1"));
+        assert!(rendered.contains("stale authority marker `Maturity: **design-spec**`"));
+        assert!(rendered.contains("docs/live.md:2"));
+        assert!(rendered.contains("stale authority marker `This document closes Forgejo issue`"));
+    }
+
+    #[test]
+    fn unclassified_root_doc_stale_authority_marker_is_reported() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_minimal_authority(temp.path(), "");
+        write_file(
+            temp.path(),
+            "docs/new-surface.md",
+            "Current branch: old-branch\n",
+        );
+
+        let err = check_workspace_root(temp.path()).expect_err("unclassified stale marker");
+        let rendered = err.to_string();
+        assert!(rendered.contains("docs/new-surface.md:1"));
+        assert!(rendered.contains("stale authority marker `Current branch:`"));
+    }
+
+    #[test]
+    fn active_entrypoint_stale_authority_marker_is_reported() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_minimal_authority(temp.path(), "");
+        write_file(
+            temp.path(),
+            "docs/INDEX.md",
+            "Current worktree: /tmp/tidefs\n",
+        );
+
+        let err = check_workspace_root(temp.path()).expect_err("entrypoint stale marker");
+        let rendered = err.to_string();
+        assert!(rendered.contains("docs/INDEX.md:1"));
+        assert!(rendered.contains("stale authority marker `Current worktree:`"));
     }
 }

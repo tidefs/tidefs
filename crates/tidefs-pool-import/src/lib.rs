@@ -2,10 +2,9 @@
 //! Pool import: device activation, superblock verification, intent log
 //! replay, dataset mount readiness, and pool activation.
 //!
-//! Phase 3 of the pool import/export pipeline (#1971).  Builds on the
-//! device scan and pool assembly phases (#3319, #3360) implemented in
-//! `tidefs-pool-scan`.  Uses the design-sealed spec in
-//! [`docs/design/pool-import-export-device-topology-management.md`].
+//! Builds on the device scan and pool assembly code in `tidefs-pool-scan`.
+//! Pool import/export behavior is summarized by
+//! [`docs/POOL_IMPORT_EXPORT_DEVICE_TOPOLOGY_DESIGN.md`].
 
 #![forbid(unsafe_code)]
 

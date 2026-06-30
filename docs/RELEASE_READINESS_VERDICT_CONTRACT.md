@@ -51,11 +51,10 @@ contract:
   and does not make a product-readiness claim.
 - `docs/OPERATOR_PRODUCT_SURFACE_DECISION.md` (#1267): Records that no runtime-fed
   operator product surface exists, the P10-04 truth-surface law is missing, and no
-  product carrier class is selectable until TFR-011 and TFR-017 close.
+  product carrier class is selectable until transport/cluster authority and the
+  P10-04 gap close.
 - `docs/DOCUMENTATION_AUTHORITY_REGISTER.md` (TFR-019): Classifies existing
-  release-facing documents. RELEASE_CANDIDATE_EVIDENCE_CONTRACT.md, P10-03,
-  UNRELEASED_AUTHORITY_POLICY.md, CLAIMS_GATE_POLICY.md, and GITHUB_CI.md are not
-  yet classified with rows in the register table.
+  release-facing documents and records the P10-04 missing-doc gap.
 - `docs/DISTRIBUTED_OPERATOR_PRODUCT_SURFACE_BLOCKER_MAP_OW307D.md`: Records six
   required product properties (runtime source data, source/cut headers,
   provenance/exactness/freshness, product carrier, render proof, refusal behavior)
@@ -136,10 +135,10 @@ as open gaps in the verdict artifact.
 |---|---|---|
 | Release-candidate evidence index | `docs/RELEASE_CANDIDATE_EVIDENCE_CONTRACT.md`, `release-candidate-evidence-index` artifact | Defined; smoke and full profiles exist; lane-local manifests (issues 643-646) are still absent |
 | Claims gate | `docs/CLAIMS_GATE_POLICY.md`, `validation/claims.toml`, `xtask check-claims-gate` | Enforced; individual claims validated; no product-admission claim exists |
-| Performance budget gate | `docs/PERFORMANCE_BUDGETS_SLO_REGRESSION_GATES_P10-03.md`, `GateReceipt` | Gate-local `release_ready` implemented; minimum suite families not yet complete (see P10-03 section 12.13) |
+| Performance budget gate | `crates/tidefs-validation/src/performance_gate/`, `GateReceipt`; historical design input in `docs/PERFORMANCE_BUDGETS_SLO_REGRESSION_GATES_P10-03.md` | Gate-local `release_ready` implemented; minimum suite families remain incomplete |
 | Standing CI gate | `docs/GITHUB_CI.md`, Rust Fast, Nix Checks, Clippy, Secret Policy | Active on self-hosted runners; path-filtered for docs-only PRs |
 | Operator truth surfaces | `docs/DASHBOARDS_TRACES_OPERATOR_TRUTH_SURFACES_P10-04.md` (missing), `docs/DISTRIBUTED_OPERATOR_PRODUCT_SURFACE_BLOCKER_MAP_OW307D.md` (historical input) | P10-04 document does not exist; OW-307D blocker map records six unsatisfied properties |
-| Operator UAPI authority | `docs/OPERATOR_UAPI_AUTHORITY.md`, TFR-011 | Pre-alpha boundary; TFR-011 remains open |
+| Operator UAPI authority | `docs/OPERATOR_UAPI_AUTHORITY.md` | Pre-alpha command boundary is closed, but it does not create a runtime-fed product carrier |
 | Transport/cluster authority | TFR-017 | Open; no current transport authority document |
 | Unreleased authority | `docs/UNRELEASED_AUTHORITY_POLICY.md` | Current policy; enforced in review |
 | Kernel residency evidence | `docs/KERNEL_RESIDENT_POOL_ENGINE_ARCHITECTURE.md`, QEMU smoke, kernel teardown | Narrow QEMU smoke exists; full-kernel, daemonless, crash/replay not yet covered |
@@ -189,8 +188,8 @@ This contract records that as of 2026-06-24:
 - The missing P10-04 truth-surface law means the production truth grammar is
   undefined (see #1270 for P10-04 disposition).
 - No runtime-fed operator product surface exists (see #1267).
-- TFR-011 (operator CLI/UAPI) and TFR-017 (transport/cluster authority) remain
-  open.
+- TFR-017 (transport/cluster authority) remains open, and the closed pre-alpha
+  operator/UAPI command boundary does not create a runtime-fed product carrier.
 
 ## Follow-Up Issue Map
 

@@ -91,7 +91,8 @@ branch can pass the guard.
 
 ## Scrub/Repair Identity Boundary
 
-Issue #637 reviewed this inventory, `docs/SCRUB_REPAIR_RESILVER_DESIGN.md`,
+Issue #637 reviewed this inventory, the deleted scrub/repair/resilver
+historical lineage,
 `crates/tidefs-local-filesystem/src/scrub.rs`,
 `crates/tidefs-local-filesystem/src/repair.rs`, active stale-generation repair
 issue #591, and placement/rebuild issue #18.

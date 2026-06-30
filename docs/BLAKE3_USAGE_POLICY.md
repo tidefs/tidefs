@@ -20,9 +20,8 @@ historical G3 checksum architecture docs.
 ## 1. Design Principle
 
 BLAKE3-256 is TideFS's canonical content-addressable hash and durable-integrity
-digest. It is **not** the project's general-purpose hash function. The existing
-checksum law (`docs/CANONICAL_BINARY_ENCODE_DECODE_ENDIAN_CHECKSUM_LAW_P2-03.md`)
-already defines two integrity classes:
+digest. It is **not** the project's general-purpose hash function. This policy
+keeps two integrity classes:
 
 - **CRC32C** — fast corruption detection for record framing, self-consistency
 - **BLAKE3-256** — strong identity / transfer digest for content addressing and

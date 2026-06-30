@@ -3,9 +3,8 @@
 //! directory B-tree, populates a ViewCache of directory entries, evicts cold
 //! entries, and serves cached lookups.
 //!
-//! Implements Phase 5 of the background service framework (#3321).
-//! Canonical design spec:
-//! [`docs/design/background-service-framework-phases-5-10-wire-up-tracking.md`].
+//! Implements a derived-catalog background job using the current scheduler
+//! boundary summarized by [`docs/BACKGROUND_SERVICE_FRAMEWORK_DESIGN.md`].
 //!
 //! # Architecture
 //!

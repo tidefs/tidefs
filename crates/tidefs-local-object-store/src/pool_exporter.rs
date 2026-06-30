@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Pool export: atomic label state transition from ACTIVE to EXPORTED.
 //!
-//! Implements Phase 4 of `docs/POOL_IMPORT_EXPORT_DEVICE_TOPOLOGY_DESIGN.md`.
+//! Implements the pool export transition summarized by
+//! `docs/POOL_IMPORT_EXPORT_DEVICE_TOPOLOGY_DESIGN.md`.
 //!
 //! The exporter guarantees all-or-nothing atomicity: either all device labels
 //! are transitioned to EXPORTED or none are. No partial/split state is possible.

@@ -632,4 +632,6 @@ implementation successors. Step 10 is deferred.
 - #1254: Pool Import/Export and Online Device Topology (`docs/POOL_IMPORT_EXPORT_DEVICE_TOPOLOGY_DESIGN.md`)
 - #1220: On-Media Format Strategy (`docs/design/on-media-format-strategy.md`)
 - #1265: Online Defrag/BPR Design (`docs/ONLINE_DEFRAG_BPR_DESIGN.md`)
-- #1222: Shard Groups, Replicas, Rebake Design (`docs/SHARD_GROUPS_REPLICAS_REBAKE_DESIGN.md`)
+- #1222: Shard Groups, Replicas, Rebake Design (deleted historical lineage;
+  use `docs/LOCAL_DISTRIBUTED_RECEIPT_AUTHORITY.md` for current receipt
+  authority)

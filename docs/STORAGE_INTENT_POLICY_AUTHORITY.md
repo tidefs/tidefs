@@ -4145,7 +4145,7 @@ This document composes existing authority surfaces:
   locator authority and must drive reads, rebuild, and reclaim.
 - `docs/POOL_WIDE_REDUNDANCY_PLACEMENT_CONTRACT.md`: pool-wide placement and
   failure-domain policy are receipt-backed.
-- `docs/SCRUB_REPAIR_RESILVER_DESIGN.md`,
+- Deleted scrub/repair/resilver historical lineage,
   `docs/REPLICATION_REBUILD_RELOCATION_DATA_FLOWS_P8-03.md`, and
   `docs/CROSS_REPLICA_SCRUB_COMPARISON_DESIGN.md`: scrub, repair, resilver,
   rebuild, anti-entropy, and movement material inform #900, but storage intent
@@ -4357,8 +4357,8 @@ This document composes existing authority surfaces:
 - `docs/design/unified-scheduling-classes-lane-priority-model.md`: storage
   intent maps onto the shared lane vocabulary for admission, dispatch,
   starvation prevention, and pressure throttling.
-- `docs/design/background-service-framework-design.md`: relocation, repair,
-  rebuild, scrub, compaction, and geo catch-up run as budgeted resumable work
+- `docs/BACKGROUND_SERVICE_FRAMEWORK_DESIGN.md`: relocation, repair, rebuild,
+  scrub, compaction, and geo catch-up use the shared job/scheduler vocabulary
   when they are not serving a foreground or critical policy risk.
 - `docs/POLICY_AUTHORITY_RUNTIME_SURFACE_P3-01.md`,
   `docs/PREVIEW_UAPI_ABI_BOUNDARY_OW202.md`, and

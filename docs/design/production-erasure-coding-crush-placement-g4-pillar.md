@@ -751,8 +751,10 @@ TideCRUSH provides the following guarantees:
 - [#1249] Earlier erasure-coding placement design (superseded by this document)
 - Erasure-coded layout model OW-306 — single-parity XOR stripe model
 - Straw2 algorithm: Sage Weil. "Straw2: Improving Data Distribution in CRUSH." 2014.
-- `docs/design/shard-groups-replicas-rebake-pathway.md`
-- `docs/design/rebake-architecture-ingest-journal-to-base-shard-conversion.md`
+- Deleted shard/rebake historical lineage; use
+  `docs/LOCAL_DISTRIBUTED_RECEIPT_AUTHORITY.md` and
+  `docs/POOL_WIDE_REDUNDANCY_PLACEMENT_CONTRACT.md` for current
+  receipt/placement authority.
 - `crates/tidefs-erasure-coding/` — GF(2^8) Reed-Solomon engine
 - `crates/tidefs-erasure-coded-store/` — Object-level EC store
 - `crates/tidefs-placement-planner/` — Replica target computation

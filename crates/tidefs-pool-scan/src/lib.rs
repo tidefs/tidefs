@@ -12,14 +12,8 @@
 //!   health reporting via [`scanner::PoolScanReport`].
 //! - Device removal planning with evacuation and redundancy checks
 //!
-//! Phase 1 + 2 of the pool import/export pipeline (#1971, #3360).  Uses the
-//! design-sealed spec in
-//! [`docs/design/pool-import-export-device-topology-management.md`].
-//! classification, pool label reading, and topology report generation.
-//!
-//! Phase 1 + 2 of the pool import/export pipeline (#1971, #3360).  Uses the
-//! design-sealed spec in
-//! [`docs/design/pool-import-export-device-topology-management.md`].
+//! Pool import/export behavior is summarized by
+//! [`docs/POOL_IMPORT_EXPORT_DEVICE_TOPOLOGY_DESIGN.md`].
 
 #![deny(unsafe_code)]
 

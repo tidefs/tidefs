@@ -5,10 +5,8 @@
 //! PoolLabelV1 on-device label type, PoolState/DeviceClass enums, and
 //! BLAKE3-256 encode/decode with checksum verification.
 //!
-//! Implements the label format described in
-//! [`docs/design/pool-import-export-device-topology-management.md`],
-//! which is the canonical design-spec for pool import/export and online
-//! device topology management.
+//! Implements the label format summarized by
+//! [`docs/POOL_IMPORT_EXPORT_DEVICE_TOPOLOGY_DESIGN.md`].
 //!
 //! # Label layout
 //!

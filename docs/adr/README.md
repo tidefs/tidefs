@@ -11,7 +11,7 @@ are marked with `Status: Superseded by ADR-NNNN`.
 |-----|-------|--------|------|
 | 0001 | End-to-end checksum architecture (G3 pillar) | Accepted | 2026-05-05 |
 | 0002 | Persistent orphan index | Accepted | 2026-05-05 |
-| 0003 | Shard groups, replicas, and rebake pathway | Accepted | 2026-05-05 |
+| 0003 | Shard groups, replicas, and rebake pathway | Historical input | 2026-05-05 |
 | 0004 | CommitGroup commit ordering state machine | Accepted | 2026-05-05 |
 | 0005 | Crate dependency graph and ownership boundaries | Accepted | 2026-05-05 |
 | 0006 | License compliance with cargo-deny | Accepted | 2026-05-05 |

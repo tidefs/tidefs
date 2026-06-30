@@ -2,8 +2,8 @@
 //! Pool import: device scan, pool_guid grouping, topology_generation
 //! validation, recovery commit_group selection, and cross-system portability.
 //!
-//! Implements the pool import protocol from
-//! `docs/POOL_IMPORT_EXPORT_DEVICE_TOPOLOGY_DESIGN.md` (Phases 2-3).
+//! Implements the pool import protocol summarized by
+//! `docs/POOL_IMPORT_EXPORT_DEVICE_TOPOLOGY_DESIGN.md`.
 //!
 //! The `PoolImporter` is responsible for discovering pools by scanning
 //! candidate devices, grouping them by pool_guid, validating topology
