@@ -12624,24 +12624,21 @@ impl LocalFileSystem {
 
     // ── Space accounting ────────────────────────────────────────────
 
-    /// Derive PoolPhysicalCountersV1 from the single capacity authority.
+    /// Derive the mounted-authority physical pool projection.
     ///
-    /// Both `phys_total_bytes` and `phys_free_bytes`
-    /// derive from [`CapacityAuthority`] — the single source of truth for
-    /// used/free/reserved byte counters.
+    /// The mounted consumer admits only total capacity from the lower
+    /// physical-pool boundary. Free/reclaimable/watermark fields are producer
+    /// observations, so this projection derives the mounted-capacity side from
+    /// committed [`SpaceAccounting`] consumption instead of exporting a raw
+    /// pool-free mirror.
     fn derive_pool_physical_counters(&self) -> PoolPhysicalCountersV1 {
         let total_bytes = self.capacity_authority.total_bytes();
-        let free_bytes = self.capacity_authority.free_bytes();
-        let total_segments = total_bytes / content_chunk_size() as u64;
-        let free_segments = free_bytes / content_chunk_size() as u64;
-        PoolPhysicalCountersV1 {
-            phys_free_segments: free_segments,
-            phys_free_bytes: free_bytes,
-            phys_reclaimable_bytes: 0,
-            phys_tail_reserved_segments: 0,
-            phys_total_segments: total_segments,
-            phys_total_bytes: total_bytes,
-        }
+        let consumed_bytes = self.state.space_accounting.counters().total_consumed_bytes();
+        PoolPhysicalCountersV1::mounted_authority_from_capacity(
+            total_bytes,
+            consumed_bytes,
+            StatfsResult::DEFAULT_BLOCK_SIZE,
+        )
     }
 
     /// Apply and persist the accumulated space delta.

@@ -189,6 +189,72 @@ fn open_with_capacity_sizes_hidden_regular_file_dev_backing() {
 }
 
 #[test]
+fn mounted_capacity_projection_consumes_committed_accounting_not_pool_free_claims() {
+    let root = temp_root("mounted-capacity-projection");
+    let chunk = content_chunk_size() as u64;
+    let capacity = chunk * 8;
+    let payload = vec![0x5a; (chunk * 2) as usize];
+    let mut fs = LocalFileSystem::open_with_capacity(&root, StoreOptions::test_fast(), capacity)
+        .expect("open capacity-limited filesystem");
+
+    fs.create_file("/data.bin", DEFAULT_FILE_PERMISSIONS)
+        .expect("create data file");
+    fs.write_file("/data.bin", 0, &payload)
+        .expect("write data file");
+    fs.sync_all().expect("commit data file");
+
+    let consumed = fs.state.space_accounting.counters().total_consumed_bytes();
+    assert!(
+        consumed > 0,
+        "test setup must commit consumed bytes through SpaceAccounting"
+    );
+    let authority_free = fs.capacity_authority().free_bytes();
+    let projection = fs.derive_pool_physical_counters();
+
+    assert_eq!(projection.phys_total_bytes, capacity);
+    assert_eq!(
+        projection.phys_free_bytes, capacity,
+        "physical input uses the admitted capacity ceiling, not a free-space mirror"
+    );
+    assert_ne!(
+        projection.phys_free_bytes, authority_free,
+        "non-empty committed consumption must keep phys_free_bytes from mirroring mounted free"
+    );
+    assert_eq!(
+        projection.phys_free_segments,
+        capacity.saturating_sub(consumed) / StatfsResult::DEFAULT_BLOCK_SIZE
+    );
+    assert_eq!(projection.phys_reclaimable_bytes, 0);
+    assert_eq!(projection.phys_tail_reserved_segments, 0);
+
+    let mounted_before = fs.statfs().expect("mounted statfs before poisoning");
+    fs.store
+        .update_space_book_pool_counters(PoolPhysicalCountersV1 {
+            phys_free_segments: u64::MAX,
+            phys_free_bytes: u64::MAX,
+            phys_reclaimable_bytes: u64::MAX,
+            phys_tail_reserved_segments: u64::MAX,
+            phys_total_segments: 1,
+            phys_total_bytes: capacity * 4,
+        });
+    let mounted_after = fs.statfs().expect("mounted statfs after poisoning");
+
+    assert_eq!(mounted_after.blocks, mounted_before.blocks);
+    assert_eq!(mounted_after.bfree, mounted_before.bfree);
+    assert_eq!(mounted_after.bavail, mounted_before.bavail);
+
+    let store_projection = fs
+        .store
+        .statfs_for_dataset(ROOT_DATASET_ID)
+        .expect("committed root dataset projection");
+    assert_eq!(store_projection.blocks, mounted_after.blocks);
+    assert_eq!(store_projection.blocks_free, mounted_after.bfree);
+    assert_eq!(store_projection.blocks_avail, mounted_after.bavail);
+
+    cleanup(&root);
+}
+
+#[test]
 fn local_filesystem_round_trips_on_explicit_regular_file_dev() {
     let root = temp_root("explicit-regular-file-dev");
     fs::create_dir_all(&root).unwrap();
