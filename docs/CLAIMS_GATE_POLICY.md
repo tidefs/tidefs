@@ -57,6 +57,10 @@ The publishing-facing successor and comparator boundary is split in
 - `storage.intent.successor_comparator.v1` is the blocked umbrella boundary
   tying storage-intent wording back to those split claim ids.
 
+The OpenZFS/Ceph successor claim remains a blocked publishing boundary unless
+the exact local, distributed, and umbrella claim ids validate with current
+evidence.
+
 Until the matching split claim id and the umbrella boundary validate with
 current evidence manifests, TideFS docs, release notes, generated claim text,
 operator output, issue closeouts, and PR summaries must not say or imply that
