@@ -1940,20 +1940,6 @@ pub fn finalize_prefetch_execution(
     }
 
     let mut record = record;
-    record.result_detail = update.result_detail;
-    record.evidence_refs.attribution_ref = update.result_detail.attribution_ref;
-    record.evidence_refs.retention_ref = update.result_detail.retention_ref;
-    record.evidence_refs.validation_ref = update.result_detail.validation_ref;
-    if update.result_refusal_ref.is_bound() {
-        record.evidence_refs.result_refusal_ref = update.result_refusal_ref;
-    }
-    if update.degraded_visibility_ref.is_bound() {
-        record.evidence_refs.degraded_visibility_ref = update.degraded_visibility_ref;
-    }
-    record.interruption = update.interruption;
-    if update.interruption_ref.is_bound() {
-        record.evidence_refs.interruption_ref = update.interruption_ref;
-    }
 
     if terminal_result_detail_is_inconsistent(update.result_detail) {
         return terminal(
@@ -2004,10 +1990,31 @@ pub fn finalize_prefetch_execution(
         record.handoff_target = update.handoff_target;
     }
 
+    apply_terminal_update_metadata(&mut record, update);
     record.executor_byte_state = terminal_update_byte_state(record.executor_byte_state, update);
     record.outcome = update.outcome;
     record.refusal = terminal_update_refusal(update);
     record
+}
+
+fn apply_terminal_update_metadata(
+    record: &mut PrefetchExecutorRecord,
+    update: PrefetchExecutorTerminalUpdate,
+) {
+    record.result_detail = update.result_detail;
+    record.evidence_refs.attribution_ref = update.result_detail.attribution_ref;
+    record.evidence_refs.retention_ref = update.result_detail.retention_ref;
+    record.evidence_refs.validation_ref = update.result_detail.validation_ref;
+    if update.result_refusal_ref.is_bound() {
+        record.evidence_refs.result_refusal_ref = update.result_refusal_ref;
+    }
+    if update.degraded_visibility_ref.is_bound() {
+        record.evidence_refs.degraded_visibility_ref = update.degraded_visibility_ref;
+    }
+    record.interruption = update.interruption;
+    if update.interruption_ref.is_bound() {
+        record.evidence_refs.interruption_ref = update.interruption_ref;
+    }
 }
 
 fn base_record(input: PrefetchExecutorInput) -> PrefetchExecutorRecord {
@@ -5781,6 +5788,75 @@ mod tests {
         assert_eq!(
             rejected.executor_byte_state,
             PrefetchExecutorByteState::Refused
+        );
+        assert_record_has_no_authority_claims(rejected);
+    }
+
+    #[test]
+    fn rejected_terminal_update_does_not_publish_unvalidated_metadata() {
+        let started = evaluate_prefetch_execution(admitted_input(
+            PrefetchResidencyCandidateClass::BoundedReadahead,
+        ));
+        let detail = terminal_detail();
+        let result_ref = evidence(
+            StorageIntentEvidenceKind::ResultRefusalEvidence,
+            RESULT_REFUSAL,
+        );
+        let degraded_ref = evidence(
+            StorageIntentEvidenceKind::RecoveryDegradationEvidence,
+            RECOVERY,
+        );
+        let interruption_ref = evidence(
+            StorageIntentEvidenceKind::ActionExecutionEvidence,
+            INTERRUPTION,
+        );
+
+        let rejected = finalize_prefetch_execution(
+            started,
+            PrefetchExecutorTerminalUpdate {
+                outcome: PrefetchExecutorOutcome::Completed,
+                result_detail: detail,
+                result_refusal_ref: result_ref,
+                degraded_visibility_ref: degraded_ref,
+                interruption: PrefetchExecutorInterruptionClass::CrashRestartReplay,
+                interruption_ref,
+                evidence_cut: PrefetchExecutorTerminalEvidenceCut {
+                    evidence_query_snapshot_ref: started.evidence_refs.evidence_query_snapshot_ref,
+                    included_refs: StorageIntentEvidenceRefs::EMPTY,
+                },
+                ..PrefetchExecutorTerminalUpdate::default()
+            },
+        );
+
+        assert_eq!(
+            rejected.outcome,
+            PrefetchExecutorOutcome::VerificationFailed
+        );
+        assert_eq!(rejected.result_detail, started.result_detail);
+        assert_eq!(
+            rejected.evidence_refs.attribution_ref,
+            started.evidence_refs.attribution_ref
+        );
+        assert_eq!(
+            rejected.evidence_refs.retention_ref,
+            started.evidence_refs.retention_ref
+        );
+        assert_eq!(
+            rejected.evidence_refs.validation_ref,
+            started.evidence_refs.validation_ref
+        );
+        assert_eq!(
+            rejected.evidence_refs.result_refusal_ref,
+            started.evidence_refs.result_refusal_ref
+        );
+        assert_eq!(
+            rejected.evidence_refs.degraded_visibility_ref,
+            started.evidence_refs.degraded_visibility_ref
+        );
+        assert_eq!(rejected.interruption, started.interruption);
+        assert_eq!(
+            rejected.evidence_refs.interruption_ref,
+            started.evidence_refs.interruption_ref
         );
         assert_record_has_no_authority_claims(rejected);
     }
