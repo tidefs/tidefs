@@ -1659,6 +1659,15 @@ pub fn evaluate_prefetch_execution(input: PrefetchExecutorInput) -> PrefetchExec
     }
 
     if authority_handoff_required(input.decision, family) {
+        let handoff_boundary_refusal = authority_handoff_boundary_refusal(input);
+        if handoff_boundary_refusal as u16 != StorageIntentRefusalReason::None as u16 {
+            return terminal(
+                record,
+                PrefetchExecutorOutcome::Blocked,
+                PrefetchExecutorByteState::Blocked,
+                handoff_boundary_refusal,
+            );
+        }
         record.handoff_target = handoff_target(input.decision);
         return terminal(
             record,
@@ -3168,6 +3177,18 @@ fn authority_handoff_required(
         PrefetchResidencyDecisionOutcome::PromotionCandidate
             | PrefetchResidencyDecisionOutcome::DemotionCandidate
     )
+}
+
+fn authority_handoff_boundary_refusal(input: PrefetchExecutorInput) -> StorageIntentRefusalReason {
+    if snapshot_contains_typed_ref(
+        input,
+        input.decision.evidence_refs.relocation_boundary_ref,
+        StorageIntentEvidenceKind::RelocationReceipt,
+    ) {
+        StorageIntentRefusalReason::None
+    } else {
+        StorageIntentRefusalReason::EvidenceNotUsable
+    }
 }
 
 fn handoff_target(decision: PrefetchResidencyDecisionRecord) -> PrefetchExecutorHandoffTarget {
@@ -5309,6 +5330,52 @@ mod tests {
             admitted_input(PrefetchResidencyCandidateClass::AuthorityPromotionCandidate);
         input.decision.outcome = PrefetchResidencyDecisionOutcome::PromotionCandidate;
         input.decision.selected_residency = PrefetchResidencyStateClass::PmemDurable;
+
+        let missing_boundary = evaluate_prefetch_execution(input);
+        assert_eq!(missing_boundary.outcome, PrefetchExecutorOutcome::Blocked);
+        assert_eq!(
+            missing_boundary.refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+        assert_record_has_no_authority_claims(missing_boundary);
+
+        let wrong_kind_ref = evidence(
+            StorageIntentEvidenceKind::ActionExecutionEvidence,
+            RELOCATION,
+        );
+        let mut wrong_kind = input;
+        wrong_kind.decision.evidence_refs.relocation_boundary_ref = wrong_kind_ref;
+        wrong_kind
+            .evidence_query_snapshot
+            .included_refs
+            .push(wrong_kind_ref)
+            .unwrap();
+        let wrong_kind_record = evaluate_prefetch_execution(wrong_kind);
+        assert_eq!(wrong_kind_record.outcome, PrefetchExecutorOutcome::Blocked);
+        assert_eq!(
+            wrong_kind_record.refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+        assert_record_has_no_authority_claims(wrong_kind_record);
+
+        let outside_cut_ref = evidence(StorageIntentEvidenceKind::RelocationReceipt, OUTSIDE_CUT);
+        let mut outside_cut = input;
+        outside_cut.decision.evidence_refs.relocation_boundary_ref = outside_cut_ref;
+        let outside_cut_record = evaluate_prefetch_execution(outside_cut);
+        assert_eq!(outside_cut_record.outcome, PrefetchExecutorOutcome::Blocked);
+        assert_eq!(
+            outside_cut_record.refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+        assert_record_has_no_authority_claims(outside_cut_record);
+
+        let relocation_ref = evidence(StorageIntentEvidenceKind::RelocationReceipt, RELOCATION);
+        input.decision.evidence_refs.relocation_boundary_ref = relocation_ref;
+        input
+            .evidence_query_snapshot
+            .included_refs
+            .push(relocation_ref)
+            .unwrap();
         let record = evaluate_prefetch_execution(input);
         assert_eq!(record.outcome, PrefetchExecutorOutcome::HandoffRequired);
         assert_eq!(
@@ -5319,6 +5386,7 @@ mod tests {
             record.handoff_target,
             PrefetchExecutorHandoffTarget::DurableResidencyChange
         );
+        assert_eq!(record.evidence_refs.relocation_boundary_ref, relocation_ref);
         assert_record_has_no_authority_claims(record);
     }
 
