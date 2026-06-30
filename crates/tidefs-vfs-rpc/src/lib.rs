@@ -19,6 +19,7 @@ use tidefs_types_vfs_core::{
 };
 
 pub mod transport_adapter;
+pub mod vfs_engine_bridge;
 
 /// Stable VFS_RPC service id in the cluster service registry.
 pub const VFS_RPC_SERVICE_ID: u8 = 0x06;

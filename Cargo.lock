@@ -3947,6 +3947,7 @@ version = "0.421.0"
 dependencies = [
  "tidefs-transport",
  "tidefs-types-vfs-core",
+ "tidefs-vfs-engine",
 ]
 
 [[package]]

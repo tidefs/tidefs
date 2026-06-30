@@ -15,6 +15,7 @@ description = "VFS_RPC wire protocol and request/response multiplexer for forwar
 [dependencies]
 tidefs-transport = { workspace = true }
 tidefs-types-vfs-core = { workspace = true, features = ["alloc"] }
+tidefs-vfs-engine = { workspace = true }
 
 [lib]
 path = "src/lib.rs"
