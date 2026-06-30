@@ -50,11 +50,25 @@ use tidefs_send_stream::{
     SenderAuthority, SnapshotDelta,
 };
 
+use tidefs_local_object_store::IntegrityDigest64;
+
 use crate::error::FileSystemError;
 use crate::types::{
     ChangedObjectRecord, ChangedRecordExport, ChangedRecordObjectRole, ChangedRecordRoot,
     CommittedRootSummary,
 };
+
+const CHANGED_RECORD_METADATA_MAGIC: [u8; 8] = *b"VFS1META";
+const CHANGED_RECORD_METADATA_VERSION: u16 = 1;
+const CHANGED_RECORD_METADATA_HAS_FROM_ROOT: u16 = 1 << 0;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ChangedRecordObjectMetadata {
+    role: ChangedRecordObjectRole,
+    checksum: IntegrityDigest64,
+    source_root: CommittedRootSummary,
+    from_root: Option<CommittedRootSummary>,
+}
 
 /// Convert a VFSSEND1 [`ChangedRecordExport`] into a VFSSEND2-encoded stream.
 ///
@@ -201,13 +215,16 @@ fn build_header_and_snapshots(
     }
     let mut snapshots: Vec<SnapshotDelta> = Vec::with_capacity(export.roots.len());
     for root in &export.roots {
-        let delta = changed_record_root_to_snapshot_delta(root)?;
+        let delta = changed_record_root_to_snapshot_delta(root, export.from_root.as_ref())?;
         snapshots.push(delta);
     }
     Ok((header, snapshots))
 }
 
-fn changed_record_root_to_snapshot_delta(root: &ChangedRecordRoot) -> crate::Result<SnapshotDelta> {
+fn changed_record_root_to_snapshot_delta(
+    root: &ChangedRecordRoot,
+    from_root: Option<&CommittedRootSummary>,
+) -> crate::Result<SnapshotDelta> {
     let summary = &root.source_root;
     let snapshot_id = make_snapshot_id(summary.transaction_id, summary.generation);
     let snapshot_name = format!("tx-{}", summary.transaction_id);
@@ -215,7 +232,7 @@ fn changed_record_root_to_snapshot_delta(root: &ChangedRecordRoot) -> crate::Res
     let mut delta = SnapshotDelta::new(snapshot_id, snapshot_name, summary.generation);
 
     for record in &root.records {
-        let delta_obj = changed_record_to_delta_object(record, summary.generation)?;
+        let delta_obj = changed_record_to_delta_object(record, summary, from_root)?;
         delta.objects.push(delta_obj);
     }
 
@@ -226,15 +243,88 @@ fn changed_record_root_to_snapshot_delta(root: &ChangedRecordRoot) -> crate::Res
 
 fn changed_record_to_delta_object(
     record: &ChangedObjectRecord,
-    birth_commit_group: u64,
+    source_root: &CommittedRootSummary,
+    from_root: Option<&CommittedRootSummary>,
 ) -> crate::Result<DeltaObject> {
     let object_id: Bytes32 = *record.object_key.as_bytes();
     let kind = role_to_object_kind(record.role);
 
     let mut obj = DeltaObject::new(object_id, kind, record.payload.clone());
-    obj.birth_commit_group = birth_commit_group;
+    obj.metadata = encode_changed_record_metadata(source_root, from_root, record);
+    obj.birth_commit_group = source_root.generation;
 
     Ok(obj)
+}
+
+fn encode_changed_record_metadata(
+    source_root: &CommittedRootSummary,
+    from_root: Option<&CommittedRootSummary>,
+    record: &ChangedObjectRecord,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&CHANGED_RECORD_METADATA_MAGIC);
+    crate::encoding::push_u16(&mut out, CHANGED_RECORD_METADATA_VERSION);
+    let flags = if from_root.is_some() {
+        CHANGED_RECORD_METADATA_HAS_FROM_ROOT
+    } else {
+        0
+    };
+    crate::encoding::push_u16(&mut out, flags);
+    crate::encoding::push_u16(&mut out, record.role.as_u16());
+    crate::encoding::push_u16(&mut out, 0);
+    crate::encoding::push_u64(&mut out, record.checksum.get());
+    crate::encoding::encode_committed_root_summary(&mut out, source_root);
+    if let Some(from_root) = from_root {
+        crate::encoding::encode_committed_root_summary(&mut out, from_root);
+    }
+    out
+}
+
+fn decode_changed_record_metadata(bytes: &[u8]) -> crate::Result<ChangedRecordObjectMetadata> {
+    let mut decoder = crate::encoding::Decoder::new("VFSSEND2 changed-record metadata", bytes);
+    decoder.expect_magic(CHANGED_RECORD_METADATA_MAGIC)?;
+    let version = decoder.read_u16()?;
+    if version != CHANGED_RECORD_METADATA_VERSION {
+        return Err(FileSystemError::Decode {
+            object: "VFSSEND2 changed-record metadata",
+            reason: "unsupported metadata version",
+        });
+    }
+    let flags = decoder.read_u16()?;
+    if flags & !CHANGED_RECORD_METADATA_HAS_FROM_ROOT != 0 {
+        return Err(FileSystemError::Decode {
+            object: "VFSSEND2 changed-record metadata",
+            reason: "reserved metadata flags are set",
+        });
+    }
+    let role = ChangedRecordObjectRole::try_from(decoder.read_u16()?).map_err(|_| {
+        FileSystemError::Decode {
+            object: "VFSSEND2 changed-record metadata",
+            reason: "unknown changed-record role",
+        }
+    })?;
+    if decoder.read_u16()? != 0 {
+        return Err(FileSystemError::Decode {
+            object: "VFSSEND2 changed-record metadata",
+            reason: "reserved metadata field is non-zero",
+        });
+    }
+    let checksum = IntegrityDigest64(decoder.read_u64()?);
+    let source_root = crate::encoding::decode_committed_root_summary(&mut decoder)?;
+    let from_root = if flags & CHANGED_RECORD_METADATA_HAS_FROM_ROOT != 0 {
+        Some(crate::encoding::decode_committed_root_summary(
+            &mut decoder,
+        )?)
+    } else {
+        None
+    };
+    decoder.finish()?;
+    Ok(ChangedRecordObjectMetadata {
+        role,
+        checksum,
+        source_root,
+        from_root,
+    })
 }
 
 fn role_to_object_kind(role: ChangedRecordObjectRole) -> ObjectKind {
@@ -279,7 +369,10 @@ fn changed_record_root_digest(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{ChangedRecordExport, ChangedRecordRoot, CommittedRootSummary};
+    use crate::types::{
+        ChangedRecordExport, ChangedRecordRoot, CommittedRootSummary, RootAuthenticationCode,
+        RootAuthenticationDigest,
+    };
     use tidefs_local_object_store::{IntegrityDigest64, ObjectKey};
 
     fn make_test_root_summary(tx: u64, gen: u64) -> CommittedRootSummary {
@@ -299,6 +392,21 @@ mod tests {
             superblock_digest: None,
             manifest_digest: None,
             root_authentication_code: None,
+        }
+    }
+
+    fn make_authenticated_root_summary(tx: u64, gen: u64) -> CommittedRootSummary {
+        CommittedRootSummary {
+            has_transaction_manifest: true,
+            manifest_checksum: IntegrityDigest64(tx + gen + 10),
+            manifest_entry_count: 3,
+            has_root_authentication: true,
+            root_authentication_policy_epoch: Some(1),
+            root_authentication_algorithm_suite_id: Some(1),
+            superblock_digest: Some(RootAuthenticationDigest::from_bytes32([0x11; 32])),
+            manifest_digest: Some(RootAuthenticationDigest::from_bytes32([0x22; 32])),
+            root_authentication_code: Some(RootAuthenticationCode::from_bytes32([0x33; 32])),
+            ..make_test_root_summary(tx, gen)
         }
     }
 
@@ -452,6 +560,84 @@ mod tests {
     }
 
     #[test]
+    fn receive_bridge_preserves_changed_record_metadata() {
+        let summary = make_authenticated_root_summary(7, 700);
+        let object_key = ObjectKey::from_bytes32([9u8; 32]);
+        let record = ChangedObjectRecord {
+            role: ChangedRecordObjectRole::TransactionSuperblock,
+            object_key,
+            checksum: IntegrityDigest64(0x1234),
+            payload: vec![1, 2, 3, 4, 5],
+        };
+        let root = ChangedRecordRoot {
+            source_root: summary.clone(),
+            records: vec![record.clone()],
+        };
+        let export = ChangedRecordExport {
+            spec: "test",
+            stream_version: 1,
+            current_root: summary.clone(),
+            roots: vec![root],
+            total_records: 1,
+            payload_bytes: 5,
+            production_fsck_required: false,
+            from_root: None,
+            incremental: false,
+            placement_epoch: None,
+        };
+        let encoded = export_vfssend2_from_changed_records(&export, [1u8; 16], [2u8; 16]).unwrap();
+
+        let decoded = receive_vfssend2_to_changed_records(&encoded).expect("decode");
+
+        assert!(!decoded.incremental);
+        assert_eq!(decoded.from_root, None);
+        assert_eq!(decoded.current_root, summary);
+        assert_eq!(decoded.roots.len(), 1);
+        assert_eq!(decoded.roots[0].source_root, summary);
+        assert_eq!(decoded.roots[0].records, vec![record]);
+    }
+
+    #[test]
+    fn receive_bridge_preserves_incremental_base_metadata() {
+        let from_summary = make_authenticated_root_summary(7, 700);
+        let to_summary = make_authenticated_root_summary(8, 800);
+        let object_key = ObjectKey::from_bytes32([10u8; 32]);
+        let record = ChangedObjectRecord {
+            role: ChangedRecordObjectRole::TransactionInode,
+            object_key,
+            checksum: IntegrityDigest64(0x5678),
+            payload: vec![6, 7, 8],
+        };
+        let root = ChangedRecordRoot {
+            source_root: to_summary.clone(),
+            records: vec![record.clone()],
+        };
+        let export = ChangedRecordExport {
+            spec: "test",
+            stream_version: 2,
+            current_root: to_summary.clone(),
+            roots: vec![root],
+            total_records: 1,
+            payload_bytes: 3,
+            production_fsck_required: false,
+            from_root: Some(from_summary.clone()),
+            incremental: true,
+            placement_epoch: None,
+        };
+        let encoded =
+            export_incremental_vfssend2_from_changed_records(&export, [1u8; 16], [2u8; 16])
+                .unwrap();
+
+        let decoded = receive_vfssend2_to_changed_records(&encoded).expect("decode");
+
+        assert!(decoded.incremental);
+        assert_eq!(decoded.from_root, Some(from_summary));
+        assert_eq!(decoded.current_root, to_summary);
+        assert_eq!(decoded.roots.len(), 1);
+        assert_eq!(decoded.roots[0].records, vec![record]);
+    }
+
+    #[test]
     fn role_to_kind_maps_all_variants() {
         use ChangedRecordObjectRole::*;
         // Every role must map without panic
@@ -588,33 +774,6 @@ mod tests {
 // VFSSEND2 receive bridge: convert VFSSEND2 stream -> ChangedRecordExport
 // ---------------------------------------------------------------------------
 
-/// Map a VFSSEND2 [`ObjectKind`] to a VFSSEND1 [`ChangedRecordObjectRole`].
-///
-/// The reverse of the export mapping defined at the top of this module.
-/// Multiple VFSSEND2 kinds map to `DatasetProperty`; callers that need
-/// finer disambiguation should inspect the object payload or metadata.
-fn vfssend2_kind_to_role(
-    kind: tidefs_send_stream::ObjectKind,
-) -> crate::types::ChangedRecordObjectRole {
-    match kind {
-        tidefs_send_stream::ObjectKind::Inode => {
-            crate::types::ChangedRecordObjectRole::TransactionInode
-        }
-        tidefs_send_stream::ObjectKind::Directory => {
-            crate::types::ChangedRecordObjectRole::TransactionDirectory
-        }
-        tidefs_send_stream::ObjectKind::Extent => {
-            crate::types::ChangedRecordObjectRole::TransactionExtentMap
-        }
-        tidefs_send_stream::ObjectKind::SnapshotCatalog => {
-            crate::types::ChangedRecordObjectRole::TransactionSnapshotCatalogEntry
-        }
-        tidefs_send_stream::ObjectKind::DatasetProperty | tidefs_send_stream::ObjectKind::Xattr => {
-            crate::types::ChangedRecordObjectRole::TransactionManifest
-        }
-    }
-}
-
 /// Receive a VFSSEND2-encoded byte stream and convert it into a
 /// VFSSEND1 [`ChangedRecordExport`] suitable for the existing
 /// `receive_changed_records_into_empty_root` pipeline.
@@ -626,6 +785,169 @@ fn vfssend2_kind_to_role(
 pub fn receive_vfssend2_to_changed_records(
     stream_bytes: &[u8],
 ) -> crate::Result<crate::types::ChangedRecordExport> {
+    let (header, dataset) = receive_vfssend2_dataset(stream_bytes)?;
+    let incremental = header
+        .flags
+        .contains(tidefs_send_stream::StreamFlags::INCREMENTAL);
+    let mut snapshots: Vec<_> = dataset.snapshots.values().collect();
+    snapshots.sort_by_key(|snapshot| snapshot.commit_group);
+    let mut roots = Vec::with_capacity(snapshots.len());
+    let mut total_records = 0_u64;
+    let mut payload_bytes = 0_u64;
+    let mut from_root: Option<CommittedRootSummary> = None;
+    let mut referenced_objects = BTreeSet::new();
+
+    for snapshot in snapshots {
+        let mut source_root: Option<CommittedRootSummary> = None;
+        let mut records: Vec<crate::types::ChangedObjectRecord> =
+            Vec::with_capacity(snapshot.object_ids.len());
+
+        for object_id in &snapshot.object_ids {
+            let object = dataset.objects.get(object_id).ok_or_else(|| {
+                crate::FileSystemError::LifecycleError {
+                    reason: "VFSSEND2 snapshot references a missing object".into(),
+                }
+            })?;
+            referenced_objects.insert(*object_id);
+
+            let metadata = decode_changed_record_metadata(&object.metadata)?;
+            if role_to_object_kind(metadata.role) != object.kind {
+                return Err(crate::FileSystemError::Decode {
+                    object: "VFSSEND2 changed-record metadata",
+                    reason: "changed-record role does not match VFSSEND2 object kind",
+                });
+            }
+            if make_snapshot_id(
+                metadata.source_root.transaction_id,
+                metadata.source_root.generation,
+            ) != snapshot.snapshot_id
+                || metadata.source_root.generation != snapshot.commit_group
+            {
+                return Err(crate::FileSystemError::Decode {
+                    object: "VFSSEND2 changed-record metadata",
+                    reason: "committed root summary does not match snapshot boundary",
+                });
+            }
+            match &source_root {
+                Some(existing) if existing != &metadata.source_root => {
+                    return Err(crate::FileSystemError::Decode {
+                        object: "VFSSEND2 changed-record metadata",
+                        reason: "snapshot objects carry inconsistent committed roots",
+                    });
+                }
+                Some(_) => {}
+                None => source_root = Some(metadata.source_root.clone()),
+            }
+            match (&from_root, &metadata.from_root) {
+                (Some(existing), Some(candidate)) if existing != candidate => {
+                    return Err(crate::FileSystemError::Decode {
+                        object: "VFSSEND2 changed-record metadata",
+                        reason: "snapshot objects carry inconsistent incremental base roots",
+                    });
+                }
+                (None, Some(candidate)) => from_root = Some(candidate.clone()),
+                (Some(_), None) if incremental => {
+                    return Err(crate::FileSystemError::Decode {
+                        object: "VFSSEND2 changed-record metadata",
+                        reason: "incremental object is missing base-root metadata",
+                    });
+                }
+                _ => {}
+            }
+
+            payload_bytes = payload_bytes
+                .checked_add(object.payload.len() as u64)
+                .ok_or(FileSystemError::SizeOverflow {
+                    requested: u64::MAX,
+                })?;
+            total_records = total_records
+                .checked_add(1)
+                .ok_or(FileSystemError::SizeOverflow {
+                    requested: u64::MAX,
+                })?;
+            records.push(crate::types::ChangedObjectRecord {
+                role: metadata.role,
+                object_key: tidefs_local_object_store::ObjectKey::from_bytes(object.object_id),
+                checksum: metadata.checksum,
+                payload: object.payload.clone(),
+            });
+        }
+
+        let source_root = source_root.ok_or_else(|| crate::FileSystemError::LifecycleError {
+            reason: "VFSSEND2 snapshot contained no changed-record objects".into(),
+        })?;
+        roots.push(crate::types::ChangedRecordRoot {
+            source_root,
+            records,
+        });
+    }
+
+    if roots.is_empty() {
+        return Err(crate::FileSystemError::LifecycleError {
+            reason: "VFSSEND2 stream contained no changed-record roots".into(),
+        });
+    }
+    if dataset
+        .objects
+        .keys()
+        .any(|object_id| !referenced_objects.contains(object_id))
+    {
+        return Err(crate::FileSystemError::Decode {
+            object: "VFSSEND2 changed-record metadata",
+            reason: "stream contains objects outside snapshot boundaries",
+        });
+    }
+
+    let from_root = if incremental {
+        let from_root = from_root.ok_or(crate::FileSystemError::Decode {
+            object: "VFSSEND2 changed-record metadata",
+            reason: "incremental stream is missing base-root metadata",
+        })?;
+        if make_snapshot_id(from_root.transaction_id, from_root.generation)
+            != header.from_snapshot_id
+        {
+            return Err(crate::FileSystemError::Decode {
+                object: "VFSSEND2 changed-record metadata",
+                reason: "base-root metadata does not match VFSSEND2 header",
+            });
+        }
+        Some(from_root)
+    } else {
+        if from_root.is_some() {
+            return Err(crate::FileSystemError::Decode {
+                object: "VFSSEND2 changed-record metadata",
+                reason: "full stream carries incremental base-root metadata",
+            });
+        }
+        None
+    };
+
+    let current_root = roots
+        .last()
+        .expect("roots checked non-empty")
+        .source_root
+        .clone();
+
+    Ok(crate::types::ChangedRecordExport {
+        spec: crate::constants::SEND_RECEIVE_CHANGED_RECORD_SPEC,
+        stream_version: crate::constants::SEND_RECEIVE_STREAM_VERSION,
+        current_root,
+        roots,
+        total_records,
+        payload_bytes,
+        production_fsck_required: false,
+        from_root,
+        placement_epoch: None,
+        incremental,
+    })
+}
+
+fn receive_vfssend2_dataset(
+    stream_bytes: &[u8],
+) -> crate::Result<(
+    tidefs_send_stream::SendStreamHeader,
+    tidefs_send_stream::ReceivedDataset,
+)> {
     use tidefs_send_stream::{ReceiveBuilder, ReceiveProgress, SendStreamHeader};
 
     let (header, _tail) = SendStreamHeader::decode(stream_bytes).map_err(|e| {
@@ -641,7 +963,6 @@ pub fn receive_vfssend2_to_changed_records(
     }
 
     let dataset_id = header.source_dataset_id;
-
     let mut builder = ReceiveBuilder::new(dataset_id, stream_bytes).map_err(|e| {
         crate::FileSystemError::LifecycleError {
             reason: format!("VFSSEND2 ReceiveBuilder: {e}"),
@@ -667,74 +988,7 @@ pub fn receive_vfssend2_to_changed_records(
         }
     }
 
-    let dataset = builder.staged_dataset();
-    let mut records: Vec<crate::types::ChangedObjectRecord> = Vec::new();
-
-    for object in dataset.objects.values() {
-        let role = vfssend2_kind_to_role(object.kind);
-        records.push(crate::types::ChangedObjectRecord {
-            role,
-            object_key: tidefs_local_object_store::ObjectKey::from_bytes(object.object_id),
-            checksum: tidefs_local_object_store::IntegrityDigest64(object.birth_commit_group),
-            payload: object.payload.clone(),
-        });
-    }
-
-    if records.is_empty() {
-        return Err(crate::FileSystemError::LifecycleError {
-            reason: "VFSSEND2 stream contained no objects".into(),
-        });
-    }
-
-    let total_records = records.len() as u64;
-    let payload_bytes: u64 = records.iter().map(|r| r.payload.len() as u64).sum();
-
-    // Derive commit group from max object birth_commit_group.
-    let max_cg = dataset
-        .objects
-        .values()
-        .map(|o| o.birth_commit_group)
-        .max()
-        .unwrap_or(1);
-
-    // Build a synthetic root for the export.
-    let current_root = crate::types::CommittedRootSummary {
-        slot: 0,
-        transaction_id: max_cg,
-        generation: max_cg,
-        next_inode_id: 1,
-        inode_count: records.len() as u64,
-        superblock_checksum: tidefs_local_object_store::IntegrityDigest64(0),
-        has_transaction_manifest: true,
-        manifest_checksum: tidefs_local_object_store::IntegrityDigest64(0),
-        manifest_entry_count: 0,
-        has_root_authentication: false,
-        root_authentication_policy_epoch: None,
-        root_authentication_algorithm_suite_id: None,
-        superblock_digest: None,
-        manifest_digest: None,
-        root_authentication_code: None,
-    };
-
-    let changed_root = crate::types::ChangedRecordRoot {
-        source_root: current_root.clone(),
-        records,
-    };
-
-    Ok(crate::types::ChangedRecordExport {
-        spec: crate::constants::SEND_RECEIVE_CHANGED_RECORD_SPEC,
-        stream_version: crate::constants::SEND_RECEIVE_STREAM_VERSION,
-        current_root,
-        roots: vec![changed_root],
-        total_records,
-        payload_bytes,
-        production_fsck_required: false,
-        from_root: None,
-        placement_epoch: None,
-        incremental: header
-            .flags
-            .contains(tidefs_send_stream::StreamFlags::INCREMENTAL),
-    })
+    Ok((header, builder.staged_dataset().clone()))
 }
 
 /// Auto-detect stream format and convert to [`ChangedRecordExport`].
