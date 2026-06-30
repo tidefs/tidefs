@@ -1160,6 +1160,7 @@ pub struct PrefetchExecutorResultDetail {
     pub ram_pressure_bytes: u64,
     pub cache_index_write_bytes: u64,
     pub predictor_metadata_write_bytes: u64,
+    pub retained_evidence_bytes: u64,
     pub wan_bytes: u64,
     pub egress_cost_microunits: u64,
     pub restore_cost_microunits: u64,
@@ -1191,6 +1192,7 @@ impl Default for PrefetchExecutorResultDetail {
             ram_pressure_bytes: 0,
             cache_index_write_bytes: 0,
             predictor_metadata_write_bytes: 0,
+            retained_evidence_bytes: 0,
             wan_bytes: 0,
             egress_cost_microunits: 0,
             restore_cost_microunits: 0,
@@ -1232,6 +1234,7 @@ impl PrefetchExecutorResultDetail {
             || self.ram_pressure_bytes != 0
             || self.cache_index_write_bytes != 0
             || self.predictor_metadata_write_bytes != 0
+            || self.retained_evidence_bytes != 0
             || self.wan_bytes != 0
             || self.egress_cost_microunits != 0
             || self.restore_cost_microunits != 0
@@ -1263,6 +1266,9 @@ impl PrefetchExecutorResultDetail {
         }
         if self.predictor_metadata_write_bytes != 0 {
             required = required.union(PrefetchExecutorCostRequirementMask::PREDICTOR_CHECKPOINTS);
+        }
+        if self.retained_evidence_bytes != 0 {
+            required = required.union(PrefetchExecutorCostRequirementMask::RETAINED_EVIDENCE);
         }
         if self.wan_bytes != 0 {
             required = required.union(PrefetchExecutorCostRequirementMask::WAN_BANDWIDTH);
@@ -4142,6 +4148,7 @@ mod tests {
             ram_pressure_bytes: 64 * 1024,
             cache_index_write_bytes: 128,
             predictor_metadata_write_bytes: 64,
+            retained_evidence_bytes: 256,
             wan_bytes: 32,
             egress_cost_microunits: 7,
             restore_cost_microunits: 11,
@@ -5536,6 +5543,7 @@ mod tests {
             ram_pressure_bytes: 1,
             cache_index_write_bytes: 1,
             predictor_metadata_write_bytes: 1,
+            retained_evidence_bytes: 1,
             wan_bytes: 1,
             egress_cost_microunits: 1,
             restore_cost_microunits: 1,
@@ -5553,6 +5561,7 @@ mod tests {
         assert!(required.contains(PrefetchExecutorCostRequirementMask::RAM_PMEM_CAPACITY));
         assert!(required.contains(PrefetchExecutorCostRequirementMask::CACHE_DEVICE_INDEXES));
         assert!(required.contains(PrefetchExecutorCostRequirementMask::PREDICTOR_CHECKPOINTS));
+        assert!(required.contains(PrefetchExecutorCostRequirementMask::RETAINED_EVIDENCE));
         assert!(required.contains(PrefetchExecutorCostRequirementMask::WAN_BANDWIDTH));
         assert!(required.contains(PrefetchExecutorCostRequirementMask::EGRESS));
         assert!(
@@ -5637,6 +5646,62 @@ mod tests {
             PrefetchExecutorByteState::Refused
         );
         assert_record_has_no_authority_claims(rejected);
+    }
+
+    #[test]
+    fn terminal_retained_evidence_measurement_uses_retention_charge() {
+        let detail = PrefetchExecutorResultDetail {
+            retained_evidence_bytes: 4096,
+            attribution_ref: evidence(
+                StorageIntentEvidenceKind::MeasurementAttributionEvidence,
+                ATTRIBUTION,
+            ),
+            retention_ref: evidence(
+                StorageIntentEvidenceKind::EvidenceRetentionEvidence,
+                RETENTION,
+            ),
+            validation_ref: evidence(StorageIntentEvidenceKind::ValidationArtifact, VALIDATION),
+            ..PrefetchExecutorResultDetail::default()
+        };
+        assert!(detail
+            .charge_requirements()
+            .contains(PrefetchExecutorCostRequirementMask::RETAINED_EVIDENCE));
+
+        let mut missing_retention =
+            admitted_charged_input(PrefetchResidencyCandidateClass::BoundedReadahead, detail);
+        missing_retention.cost_state.snapshot.evidence_state =
+            StorageIntentCostEvidenceState::FRESH
+                .with_missing(StorageIntentCostClass::ColdRetention);
+        let rejected = evaluate_prefetch_execution(missing_retention);
+        assert_eq!(rejected.outcome, PrefetchExecutorOutcome::Refused);
+        assert_eq!(
+            rejected.refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+        assert_record_has_no_authority_claims(rejected);
+
+        let started = evaluate_prefetch_execution(admitted_charged_input(
+            PrefetchResidencyCandidateClass::BoundedReadahead,
+            detail,
+        ));
+        assert_eq!(started.outcome, PrefetchExecutorOutcome::Started);
+
+        let completed = finalize_prefetch_execution(
+            started,
+            PrefetchExecutorTerminalUpdate {
+                outcome: PrefetchExecutorOutcome::Completed,
+                result_detail: detail,
+                evidence_cut: terminal_evidence_cut(started, detail, EMPTY_EVIDENCE_REF),
+                ..PrefetchExecutorTerminalUpdate::default()
+            },
+        );
+
+        assert_eq!(completed.outcome, PrefetchExecutorOutcome::Completed);
+        assert_eq!(
+            completed.result_detail.retained_evidence_bytes,
+            detail.retained_evidence_bytes
+        );
+        assert_record_has_no_authority_claims(completed);
     }
 
     #[test]
