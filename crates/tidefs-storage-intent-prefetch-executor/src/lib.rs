@@ -1868,6 +1868,10 @@ pub fn evaluate_prefetch_execution(input: PrefetchExecutorInput) -> PrefetchExec
                         PrefetchExecutorByteState::Blocked,
                         dispatch_plan_refusal,
                     )
+                } else if let Some((outcome, byte_state, refusal)) =
+                    dispatch_plan_expiration_terminal(input, family)
+                {
+                    terminal(record, outcome, byte_state, refusal)
                 } else if !input.runtime_support.supports_family(family) {
                     terminal(
                         record,
@@ -2804,6 +2808,43 @@ fn dispatch_plan_refusal(
     StorageIntentRefusalReason::None
 }
 
+fn dispatch_plan_expiration_terminal(
+    input: PrefetchExecutorInput,
+    family: PrefetchExecutorActionFamily,
+) -> Option<(
+    PrefetchExecutorOutcome,
+    PrefetchExecutorByteState,
+    StorageIntentRefusalReason,
+)> {
+    if !family.can_start_runtime_dispatch() || !input.admission.expirable {
+        return None;
+    }
+    if input.dispatch_plan.expires_after_ms == 0 {
+        return Some((
+            PrefetchExecutorOutcome::Blocked,
+            PrefetchExecutorByteState::Blocked,
+            StorageIntentRefusalReason::EvidenceNotUsable,
+        ));
+    }
+
+    let Some(expires_after_us) = input.dispatch_plan.expires_after_ms.checked_mul(1000) else {
+        return Some((
+            PrefetchExecutorOutcome::Blocked,
+            PrefetchExecutorByteState::Blocked,
+            StorageIntentRefusalReason::EvidenceNotUsable,
+        ));
+    };
+    if input.admission.queue_time_us >= expires_after_us {
+        return Some((
+            PrefetchExecutorOutcome::TimedOut,
+            PrefetchExecutorByteState::Unavailable,
+            StorageIntentRefusalReason::EvidenceNotUsable,
+        ));
+    }
+
+    None
+}
+
 fn dispatch_plan_has_shape_bounds(plan: PrefetchExecutorDispatchPlan) -> bool {
     match plan.shape {
         PrefetchExecutorDispatchShape::BoundedRange
@@ -3507,7 +3548,7 @@ mod tests {
         let shape = PrefetchExecutorDispatchShape::for_action_family(family);
         let plan_ref = evidence(StorageIntentEvidenceKind::ActionExecutionEvidence, ACTION);
 
-        match shape {
+        let plan = match shape {
             PrefetchExecutorDispatchShape::Unknown => PrefetchExecutorDispatchPlan::default(),
             PrefetchExecutorDispatchShape::StridedVectorRanges => {
                 PrefetchExecutorDispatchPlan::bounded_range(4096, 4096, plan_ref)
@@ -3533,6 +3574,11 @@ mod tests {
             | PrefetchExecutorDispatchShape::ObjectArchiveRestoreRange => {
                 PrefetchExecutorDispatchPlan::bounded_range(4096, 4096, plan_ref).with_shape(shape)
             }
+        };
+        if matches!(shape, PrefetchExecutorDispatchShape::Unknown) {
+            plan
+        } else {
+            plan.with_expires_after_ms(250)
         }
     }
 
@@ -4454,6 +4500,69 @@ mod tests {
             record.refusal,
             StorageIntentRefusalReason::EvidenceNotUsable
         );
+    }
+
+    #[test]
+    fn expirable_runtime_dispatch_requires_expiry_horizon() {
+        let mut input = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        input.admission = input
+            .admission
+            .with_speculative_controls(false, false, true);
+        input.dispatch_plan.expires_after_ms = 0;
+
+        let record = evaluate_prefetch_execution(input);
+
+        assert_eq!(record.outcome, PrefetchExecutorOutcome::Blocked);
+        assert_eq!(
+            record.executor_byte_state,
+            PrefetchExecutorByteState::Blocked
+        );
+        assert_eq!(
+            record.refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+        assert_record_has_no_authority_claims(record);
+    }
+
+    #[test]
+    fn expirable_runtime_dispatch_times_out_after_queue_deadline() {
+        let mut input = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        input.admission = input
+            .admission
+            .with_speculative_controls(false, false, true);
+        input.dispatch_plan = input.dispatch_plan.with_expires_after_ms(10);
+        input.admission.queue_time_us = 10_000;
+
+        let record = evaluate_prefetch_execution(input);
+
+        assert_eq!(record.outcome, PrefetchExecutorOutcome::TimedOut);
+        assert_eq!(
+            record.executor_byte_state,
+            PrefetchExecutorByteState::Unavailable
+        );
+        assert_eq!(
+            record.refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+        assert_record_has_no_authority_claims(record);
+    }
+
+    #[test]
+    fn droppable_runtime_dispatch_does_not_require_expiry_horizon() {
+        let mut input = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        input.admission = input
+            .admission
+            .with_speculative_controls(true, false, false);
+        input.dispatch_plan.expires_after_ms = 0;
+
+        let record = evaluate_prefetch_execution(input);
+
+        assert_eq!(record.outcome, PrefetchExecutorOutcome::Started);
+        assert_eq!(
+            record.executor_byte_state,
+            PrefetchExecutorByteState::CacheOnly
+        );
+        assert_record_has_no_authority_claims(record);
     }
 
     #[test]
