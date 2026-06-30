@@ -455,6 +455,11 @@ impl PrefetchExecutorCostRequirementMask {
     pub const fn contains(self, other: Self) -> bool {
         (self.0 & other.0) == other.0
     }
+
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
@@ -1073,6 +1078,52 @@ impl PrefetchExecutorResultDetail {
         self.has_usage_measurement()
             || self.has_latency_measurement()
             || self.has_cost_or_pressure_measurement()
+    }
+
+    #[must_use]
+    pub fn charge_requirements(self) -> PrefetchExecutorCostRequirementMask {
+        let mut required = PrefetchExecutorCostRequirementMask::EMPTY;
+
+        if self.flash_write_bytes != 0 || self.waf_micros != 0 {
+            required = required.union(PrefetchExecutorCostRequirementMask::FLASH_WRITES);
+        }
+        if self.pmem_write_bytes != 0 || self.ram_pressure_bytes != 0 {
+            required = required.union(PrefetchExecutorCostRequirementMask::RAM_PMEM_CAPACITY);
+        }
+        if self.cache_index_write_bytes != 0 {
+            required = required.union(PrefetchExecutorCostRequirementMask::CACHE_DEVICE_INDEXES);
+        }
+        if self.predictor_metadata_write_bytes != 0 {
+            required = required.union(PrefetchExecutorCostRequirementMask::PREDICTOR_CHECKPOINTS);
+        }
+        if self.wan_bytes != 0 {
+            required = required.union(PrefetchExecutorCostRequirementMask::WAN_BANDWIDTH);
+        }
+        if self.egress_cost_microunits != 0 {
+            required = required.union(PrefetchExecutorCostRequirementMask::EGRESS);
+        }
+        if self.restore_cost_microunits != 0 {
+            required =
+                required.union(PrefetchExecutorCostRequirementMask::OBJECT_ARCHIVE_RESTORE_CALLS);
+        }
+        if self.staging_capacity_bytes != 0 {
+            required = required.union(PrefetchExecutorCostRequirementMask::STAGING_CAPACITY);
+        }
+        if self.cpu_us != 0 {
+            required = required.union(PrefetchExecutorCostRequirementMask::CPU);
+        }
+        if self.memory_bytes != 0 {
+            required = required.union(PrefetchExecutorCostRequirementMask::MEMORY);
+        }
+        if self.foreground_p50_disruption_us != 0
+            || self.foreground_p95_disruption_us != 0
+            || self.foreground_p99_disruption_us != 0
+            || self.protected_reserve_pressure
+        {
+            required = required.union(PrefetchExecutorCostRequirementMask::FOREGROUND_DISRUPTION);
+        }
+
+        required
     }
 
     #[must_use]
@@ -1725,6 +1776,7 @@ pub fn finalize_prefetch_execution(
     if terminal_update_refs_outside_evidence_cut(record, update)
         || terminal_result_detail_lacks_feedback_evidence(record, update)
         || terminal_update_lacks_result_refusal_evidence(record, update)
+        || terminal_result_detail_lacks_charge_evidence(record, update)
     {
         return terminal(
             record,
@@ -1921,6 +1973,92 @@ fn terminal_update_lacks_result_refusal_evidence(
             update.result_refusal_ref,
             StorageIntentEvidenceKind::ResultRefusalEvidence,
         )
+}
+
+fn terminal_result_detail_lacks_charge_evidence(
+    record: PrefetchExecutorRecord,
+    update: PrefetchExecutorTerminalUpdate,
+) -> bool {
+    let required = update.result_detail.charge_requirements();
+    if required.is_empty() {
+        return false;
+    }
+
+    if record.budget_owner.is_zero()
+        || !record.cost_state.required.contains(required)
+        || record.cost_state.missing_isolation_evidence
+    {
+        return true;
+    }
+
+    let terminal_cost_state = PrefetchExecutorCostState {
+        required,
+        ..record.cost_state
+    };
+    if terminal_cost_state.missing_required_cost() {
+        return true;
+    }
+
+    if terminal_charge_requires_flash_waf(required) && record.cost_state.unknown_waf {
+        return true;
+    }
+    if terminal_charge_requires_egress_restore(required)
+        && record.cost_state.unknown_egress_or_restore_cost
+    {
+        return true;
+    }
+
+    if !terminal_ref_in_cut(
+        record,
+        update.evidence_cut,
+        record.evidence_refs.cost_wear_ref,
+        StorageIntentEvidenceKind::MediaCostWearLedger,
+    ) || !terminal_ref_in_cut(
+        record,
+        update.evidence_cut,
+        record.evidence_refs.tenant_isolation_ref,
+        StorageIntentEvidenceKind::TenantIsolationEvidence,
+    ) {
+        return true;
+    }
+
+    if terminal_charge_requires_egress_restore(required)
+        && !terminal_ref_in_cut(
+            record,
+            update.evidence_cut,
+            record.evidence_refs.egress_restore_cost_ref,
+            StorageIntentEvidenceKind::MediaCostWearLedger,
+        )
+    {
+        return true;
+    }
+
+    if terminal_charge_requires_transport(required)
+        && !terminal_ref_in_cut(
+            record,
+            update.evidence_cut,
+            record.evidence_refs.transport_budget_ref,
+            StorageIntentEvidenceKind::TransportPathEvidence,
+        )
+    {
+        return true;
+    }
+
+    false
+}
+
+fn terminal_charge_requires_flash_waf(required: PrefetchExecutorCostRequirementMask) -> bool {
+    required.contains(PrefetchExecutorCostRequirementMask::FLASH_WRITES)
+}
+
+fn terminal_charge_requires_egress_restore(required: PrefetchExecutorCostRequirementMask) -> bool {
+    required.contains(PrefetchExecutorCostRequirementMask::EGRESS)
+        || required.contains(PrefetchExecutorCostRequirementMask::OBJECT_ARCHIVE_RESTORE_CALLS)
+}
+
+fn terminal_charge_requires_transport(required: PrefetchExecutorCostRequirementMask) -> bool {
+    required.contains(PrefetchExecutorCostRequirementMask::WAN_BANDWIDTH)
+        || terminal_charge_requires_egress_restore(required)
 }
 
 fn initial_result_detail_lacks_feedback_evidence(input: PrefetchExecutorInput) -> bool {
@@ -2995,9 +3133,18 @@ mod tests {
         refs: &mut StorageIntentEvidenceRefs,
         evidence_ref: StorageIntentEvidenceRef,
     ) {
-        if evidence_ref.is_bound() {
+        if evidence_ref.is_bound() && !refs.contains_ref(evidence_ref) {
             refs.push(evidence_ref).unwrap();
         }
+    }
+
+    fn admitted_charged_input(
+        candidate: PrefetchResidencyCandidateClass,
+        detail: PrefetchExecutorResultDetail,
+    ) -> PrefetchExecutorInput {
+        let mut input = admitted_input(candidate);
+        input.cost_state.required = detail.charge_requirements();
+        input
     }
 
     fn terminal_evidence_cut(
@@ -3010,6 +3157,26 @@ mod tests {
         push_terminal_ref(&mut included_refs, detail.retention_ref);
         push_terminal_ref(&mut included_refs, detail.validation_ref);
         push_terminal_ref(&mut included_refs, result_refusal_ref);
+        let required = detail.charge_requirements();
+        if !required.is_empty() {
+            push_terminal_ref(&mut included_refs, record.evidence_refs.cost_wear_ref);
+            push_terminal_ref(
+                &mut included_refs,
+                record.evidence_refs.tenant_isolation_ref,
+            );
+            if terminal_charge_requires_egress_restore(required) {
+                push_terminal_ref(
+                    &mut included_refs,
+                    record.evidence_refs.egress_restore_cost_ref,
+                );
+            }
+            if terminal_charge_requires_transport(required) {
+                push_terminal_ref(
+                    &mut included_refs,
+                    record.evidence_refs.transport_budget_ref,
+                );
+            }
+        }
 
         PrefetchExecutorTerminalEvidenceCut {
             evidence_query_snapshot_ref: record.evidence_refs.evidence_query_snapshot_ref,
@@ -4301,12 +4468,13 @@ mod tests {
 
     #[test]
     fn terminal_update_completes_started_record_without_authority() {
-        let started = evaluate_prefetch_execution(admitted_input(
+        let detail = terminal_detail();
+        let started = evaluate_prefetch_execution(admitted_charged_input(
             PrefetchResidencyCandidateClass::BoundedReadahead,
+            detail,
         ));
         assert_eq!(started.outcome, PrefetchExecutorOutcome::Started);
 
-        let detail = terminal_detail();
         let result_ref = evidence(
             StorageIntentEvidenceKind::ResultRefusalEvidence,
             RESULT_REFUSAL,
@@ -4340,6 +4508,118 @@ mod tests {
         assert!(completed.result_detail.has_feedback_evidence_roots());
         assert!(completed.is_non_authority_population());
         assert_record_has_no_authority_claims(completed);
+    }
+
+    #[test]
+    fn terminal_detail_derives_charge_requirements_from_measurements() {
+        let detail = PrefetchExecutorResultDetail {
+            flash_write_bytes: 1,
+            waf_micros: 1,
+            pmem_write_bytes: 1,
+            ram_pressure_bytes: 1,
+            cache_index_write_bytes: 1,
+            predictor_metadata_write_bytes: 1,
+            wan_bytes: 1,
+            egress_cost_microunits: 1,
+            restore_cost_microunits: 1,
+            staging_capacity_bytes: 1,
+            cpu_us: 1,
+            memory_bytes: 1,
+            foreground_p95_disruption_us: 1,
+            protected_reserve_pressure: true,
+            ..PrefetchExecutorResultDetail::default()
+        };
+
+        let required = detail.charge_requirements();
+
+        assert!(required.contains(PrefetchExecutorCostRequirementMask::FLASH_WRITES));
+        assert!(required.contains(PrefetchExecutorCostRequirementMask::RAM_PMEM_CAPACITY));
+        assert!(required.contains(PrefetchExecutorCostRequirementMask::CACHE_DEVICE_INDEXES));
+        assert!(required.contains(PrefetchExecutorCostRequirementMask::PREDICTOR_CHECKPOINTS));
+        assert!(required.contains(PrefetchExecutorCostRequirementMask::WAN_BANDWIDTH));
+        assert!(required.contains(PrefetchExecutorCostRequirementMask::EGRESS));
+        assert!(
+            required.contains(PrefetchExecutorCostRequirementMask::OBJECT_ARCHIVE_RESTORE_CALLS)
+        );
+        assert!(required.contains(PrefetchExecutorCostRequirementMask::STAGING_CAPACITY));
+        assert!(required.contains(PrefetchExecutorCostRequirementMask::CPU));
+        assert!(required.contains(PrefetchExecutorCostRequirementMask::MEMORY));
+        assert!(required.contains(PrefetchExecutorCostRequirementMask::FOREGROUND_DISRUPTION));
+    }
+
+    #[test]
+    fn terminal_update_rejects_uncharged_result_measurements() {
+        let started = evaluate_prefetch_execution(admitted_input(
+            PrefetchResidencyCandidateClass::BoundedReadahead,
+        ));
+        assert_eq!(started.outcome, PrefetchExecutorOutcome::Started);
+
+        let detail = terminal_detail();
+        let rejected = finalize_prefetch_execution(
+            started,
+            PrefetchExecutorTerminalUpdate {
+                outcome: PrefetchExecutorOutcome::Completed,
+                result_detail: detail,
+                evidence_cut: terminal_evidence_cut(started, detail, EMPTY_EVIDENCE_REF),
+                ..PrefetchExecutorTerminalUpdate::default()
+            },
+        );
+
+        assert_eq!(
+            rejected.outcome,
+            PrefetchExecutorOutcome::VerificationFailed
+        );
+        assert_eq!(
+            rejected.refusal,
+            StorageIntentRefusalReason::ValidationGateFailed
+        );
+        assert_eq!(
+            rejected.executor_byte_state,
+            PrefetchExecutorByteState::Refused
+        );
+        assert_record_has_no_authority_claims(rejected);
+    }
+
+    #[test]
+    fn terminal_update_requires_charge_refs_inside_terminal_cut() {
+        let detail = terminal_detail();
+        let started = evaluate_prefetch_execution(admitted_charged_input(
+            PrefetchResidencyCandidateClass::BoundedReadahead,
+            detail,
+        ));
+        assert_eq!(started.outcome, PrefetchExecutorOutcome::Started);
+
+        let mut feedback_only_refs = StorageIntentEvidenceRefs::EMPTY;
+        push_terminal_ref(&mut feedback_only_refs, detail.attribution_ref);
+        push_terminal_ref(&mut feedback_only_refs, detail.retention_ref);
+        push_terminal_ref(&mut feedback_only_refs, detail.validation_ref);
+
+        let rejected = finalize_prefetch_execution(
+            started,
+            PrefetchExecutorTerminalUpdate {
+                outcome: PrefetchExecutorOutcome::Completed,
+                result_detail: detail,
+                evidence_cut: PrefetchExecutorTerminalEvidenceCut {
+                    evidence_query_snapshot_ref: started.evidence_refs.evidence_query_snapshot_ref,
+                    included_refs: feedback_only_refs,
+                },
+                ..PrefetchExecutorTerminalUpdate::default()
+            },
+        );
+
+        assert_eq!(
+            rejected.outcome,
+            PrefetchExecutorOutcome::VerificationFailed
+        );
+        assert_eq!(
+            rejected.refusal,
+            StorageIntentRefusalReason::ValidationGateFailed
+        );
+        assert_eq!(
+            rejected.executor_byte_state,
+            PrefetchExecutorByteState::Refused
+        );
+        assert_record_has_no_authority_claims(rejected);
     }
 
     #[test]
@@ -4704,11 +4984,13 @@ mod tests {
 
     #[test]
     fn terminal_update_projects_failure_and_handoff_without_receipt_power() {
-        let started = evaluate_prefetch_execution(admitted_input(
-            PrefetchResidencyCandidateClass::BoundedReadahead,
-        ));
-
         let failed_detail = terminal_detail();
+        let started = evaluate_prefetch_execution(admitted_charged_input(
+            PrefetchResidencyCandidateClass::BoundedReadahead,
+            failed_detail,
+        ));
+        assert_eq!(started.outcome, PrefetchExecutorOutcome::Started);
+
         let failed_result_ref = evidence(
             StorageIntentEvidenceKind::ResultRefusalEvidence,
             RESULT_REFUSAL,
