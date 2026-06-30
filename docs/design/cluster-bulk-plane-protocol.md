@@ -687,13 +687,19 @@ Current source status for the #1523 evidence pass:
   TCP_STREAM credit/data/DONE/ABORT state machine, CRC32C DONE verification,
   failed-transfer discard behavior, and a BULK-side VFS_RPC handoff helper that
   binds WRITE/READ metadata, `op_id`, `BulkToken`, and descriptor length before
-  completed bytes may be consumed. The crate is a service surface for a future
-  transport dispatcher; it is not a multi-node product-readiness claim.
+  completed bytes may be consumed. It also exposes a typed BULK wire codec for
+  OFFER/ACCEPT/CREDIT/DONE/ABORT frames carried as `service_id = 0x07` DATA
+  service frames. The crate is a service surface for transport integration; it
+  is not a multi-node product-readiness claim.
 - `apps/tidefs-storage-node/src/protocol.rs` is still an object-store tag
   protocol, not a cluster service_id `0x07` BULK dispatcher.
 - `crates/tidefs-transport/src/boundedness.rs` exposes generic bulk-token
   limits and a default bulk deadline for transport boundedness, and the BULK
   service consumes those bounds for TCP_STREAM transfer admission.
+- `crates/tidefs-transport/src/data_service_dispatch.rs` provides the generic
+  DATA-endpoint service-id frame wrapper and registry for
+  `EndpointFamily::Data`, `MessageFamily::StateTransfer`, and the Demand lane.
+  It does not register BULK into a live receive loop by itself.
 
 Until transport dispatch and the VFS_RPC transport adapter wire this BULK-side
 helper into service_id `0x06` request/response handling, VFS_RPC endpoints may
@@ -708,17 +714,16 @@ connection that carries the VFS_RPC frame, and report timeout or ABORT
 completion to the waiting VFS_RPC operation before any VFS Engine call observes
 failed-transfer bytes.
 
-Post-#1558 source-edit gate, inspected at `origin/master` `31cac908` on
-2026-06-30:
+Post-codec source status, inspected on 2026-06-30:
 
 - The live BULK crate exports the TCP_STREAM state machine and VFS_RPC handoff
-  helper, but it still does not expose a transport frame codec or dispatcher.
-- `crates/tidefs-transport/src/control_service_dispatch.rs` provides
-  service-id dispatch only for the control-lane `ControlServiceFrame`
-  (`MessageFamily::LeaseFenceDeadline`). The transport data endpoint admits the
-  `StateTransfer` and `ReplicaTransferVerify` message families, but current
-  source has no service-id registry that can honestly carry `service_id = 0x07`
-  BULK bytes on that data path.
+  helper plus `src/protocol.rs`, which encodes/decodes `service_id = 0x07`
+  DATA service frames without binding a live runtime dispatcher.
+- `crates/tidefs-transport/src/control_service_dispatch.rs` remains the
+  control-lane service-id path. `crates/tidefs-transport/src/data_service_dispatch.rs`
+  is the DATA-endpoint service-id wrapper/registry and must be bound to an
+  authenticated `TransferBulk` data session before it counts as live transport
+  dispatch.
 - `crates/tidefs-vfs-rpc/src/transport_adapter.rs` still rejects
   `REQ_FLAG_BULK_PENDING`, `RESP_FLAG_BULK`, and `InlineOrBulk::Bulk` with
   `BulkUnsupported`. Removing that rejection requires a VFS_RPC transport
@@ -726,10 +731,9 @@ Post-#1558 source-edit gate, inspected at `origin/master` `31cac908` on
 
 The next implementation must not put BULK data on the control-service path and
 must not reuse the storage-node object-store tag protocol as a BULK success.
-Split the remaining work into a data-endpoint BULK transport binding/codec
-owned by `tidefs-bulk-service` and `tidefs-transport`, followed by VFS_RPC
-descriptor acceptance that binds peer, session, `op_id`, timeout, and ABORT
-state to that data binding before VFS Engine dispatch.
+The remaining work is VFS_RPC descriptor acceptance that binds peer, session,
+`op_id`, timeout, and ABORT state to the DATA service binding before VFS Engine
+dispatch.
 
 #### 12.1.1 WRITE with BULK
 
@@ -813,19 +817,19 @@ The ublk block device adapter uses BULK for READ_AT/WRITE_AT payloads:
 
 ### 13.1 Crate layout
 
-The BULK service should live in a new crate:
+The live BULK service crate layout is:
 
 ```text
 crates/tidefs-bulk-service/
   src/
     lib.rs           -- public API: BulkService, BulkToken, BulkOffer
+    protocol.rs      -- service_id 0x07 DATA frame codec (OfferV1, AcceptV1, etc.)
     vfs_rpc_handoff.rs -- VFS_RPC READ/WRITE BulkToken handoff helper
-    protocol.rs      -- wire message types (OfferV1, AcceptV1, etc.)
-    state_machine.rs -- per-transfer state machine
-    pinned_pool.rs   -- PinnedPool for RDMA/TCP buffer management
-    scheduler.rs     -- credit scheduling and fairness
-    tcp_stream.rs    -- TCP_STREAM mode implementation
 ```
+
+The state machine, credit scheduling, pinned/TCP buffer accounting, and
+TCP_STREAM reassembly currently live in `lib.rs`; they can be split into
+dedicated modules when the implementation outgrows the current crate shape.
 
 ### 13.2 Dependencies
 
