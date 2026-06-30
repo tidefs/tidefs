@@ -736,8 +736,8 @@ tidefsctl dataset set-strategy (live mutation)
 
 - `docs/DATASET_FEATURE_FLAGS_DESIGN.md` — Feature flag architecture (#1223)
 - `docs/design/on-media-format-strategy.md` — V1 record family catalog (#1220)
-- `docs/V1_EXTENT_MAP_TRISTATE_MODEL_DESIGN.md` — Tristate extent model (#1225)
-- `docs/EXTENT_MAPS_LOCATOR_TABLES_DESIGN.md` — Extent maps and locator tables (#1285)
+- Deleted tristate extent lineage (#1225) — historical input in git history
+- Deleted extent/locator lineage (#1285) — historical input in git history
 - `docs/SPACE_ACCOUNTING_MODEL_DESIGN.md` — Space accounting model (#1215)
 - `docs/design/weighted-arc-cache-per-entry-weight-tracking.md` — Weighted ARC cache (#1192)
 - `crates/tidefs-frame/src/lib.rs` — Compression frame format (5-byte header)

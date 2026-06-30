@@ -626,7 +626,8 @@ implementation successors. Step 10 is deferred.
 
 - ZFS ashift documentation: `zpoolprops(7)` — "ashift" property
 - Ceph BlueStore min_alloc_size: `ceph-osd(8)` — `bluestore_min_alloc_size`
-- #1285: Extent Maps and Locator Tables Design (`docs/EXTENT_MAPS_LOCATOR_TABLES_DESIGN.md`)
+- #1285: Extent maps and locator tables lineage; deleted historical design in
+  git history
 - #1193: Device Layout Policies Design (`docs/DEVICE_LAYOUT_POLICIES_DESIGN.md`)
 - #1275: Online Pool Geometry Conversion (`docs/design/online-pool-geometry-conversion.md`)
 - #1254: Pool Import/Export and Online Device Topology (`docs/POOL_IMPORT_EXPORT_DEVICE_TOPOLOGY_DESIGN.md`)

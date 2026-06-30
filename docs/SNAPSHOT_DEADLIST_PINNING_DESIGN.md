@@ -58,9 +58,10 @@ death_commit_group: u64   // commit_group when refcount became 0 for the active 
                  // 0 = still referenced by active dataset
 ```
 
-These fields already exist in `ExtentLocatorValueV1` as defined in #1285
-(`docs/EXTENT_MAPS_LOCATOR_TABLES_DESIGN.md` section 5.1). The snapshot pinning
-algorithm interprets them as the pinning interval `[birth_commit_group, death_commit_group)`.
+These fields already exist in `ExtentLocatorValueV1` from the #1285
+extent/locator lineage. The deleted historical design remains available in git
+history; the snapshot pinning algorithm interprets the fields as the pinning
+interval `[birth_commit_group, death_commit_group)`.
 
 ### 2.2 Per-snapshot metadata
 
@@ -413,7 +414,8 @@ the freeze go to the next newer snapshot.
 ## 11. References
 
 - v0.262 Python reference: `tidefs_v0.262/docs/notes/2026-02-06-fuse-userspace-api-and-mmap.15c-space-accounting-and-cleaning.md` section 15.8.7
-- Extent maps and locator tables design: `docs/EXTENT_MAPS_LOCATOR_TABLES_DESIGN.md` (#1285)
+- Extent maps and locator tables lineage: #1285, deleted historical design in
+  git history
 - CommitGroup commit ordering design: `docs/design/canonical-commit-ordering-commit_group-state-machine.md` (#1267)
 - Dataset lifecycle states: Forgejo issue #1219
 - Dataset feature flags: Forgejo issue #1223

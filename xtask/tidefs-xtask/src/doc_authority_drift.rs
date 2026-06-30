@@ -47,6 +47,16 @@ const STALE_AUTHORITY_MARKERS: &[&str] = &[
     "single consolidated canonical design specification",
 ];
 
+const LIVE_LOOKING_AUTHORITY_MARKERS: &[&str] = &[
+    "Maturity: current policy",
+    "Maturity: current spec",
+    "Status: current design authority",
+    "Status: re-evaluated",
+    "single repo-tracked authority table",
+    "single authoritative specification",
+    "This document is the canonical authority model",
+];
+
 #[derive(Debug)]
 pub struct DocAuthorityDriftError {
     violations: Vec<String>,
@@ -235,6 +245,16 @@ fn scan_doc(
                 if line.contains(marker) {
                     violations.insert(format!(
                         "{rel_path}:{line_number}: stale authority marker `{marker}` in live Markdown doc; classify the file as historical input in {DOCUMENTATION_AUTHORITY_REGISTER}, delete/fold it, or replace the marker with current source-backed authority wording"
+                    ));
+                }
+            }
+        }
+
+        if scan_mode == ScanMode::AuthorityMarkersOnly {
+            for marker in LIVE_LOOKING_AUTHORITY_MARKERS {
+                if line.contains(marker) {
+                    violations.insert(format!(
+                        "{rel_path}:{line_number}: live-looking authority marker `{marker}` in unclassified Markdown doc; classify the file as current policy/spec, historical input, or delete/fold it in {DOCUMENTATION_AUTHORITY_REGISTER}"
                     ));
                 }
             }
@@ -988,6 +1008,34 @@ Retired scaffold roots include `tidefs-old-core`.
         let rendered = err.to_string();
         assert!(rendered.contains("docs/new-surface.md:1"));
         assert!(rendered.contains("stale authority marker `Current branch:`"));
+    }
+
+    #[test]
+    fn unclassified_root_doc_live_looking_authority_marker_is_reported() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_minimal_authority(temp.path(), "");
+        write_file(
+            temp.path(),
+            "docs/new-surface.md",
+            "Maturity: current policy\n",
+        );
+
+        let err = check_workspace_root(temp.path()).expect_err("unclassified live marker");
+        let rendered = err.to_string();
+        assert!(rendered.contains("docs/new-surface.md:1"));
+        assert!(rendered.contains("live-looking authority marker `Maturity: current policy`"));
+    }
+
+    #[test]
+    fn registered_current_doc_live_looking_authority_marker_is_allowed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_minimal_authority(
+            temp.path(),
+            "| `docs/live.md` | Current policy | fixture. |\n",
+        );
+        write_file(temp.path(), "docs/live.md", "Maturity: current policy\n");
+
+        check_workspace_root(temp.path()).expect("registered current marker is allowed");
     }
 
     #[test]

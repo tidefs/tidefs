@@ -190,8 +190,8 @@ Run the trace oracle gate:
     cargo run -p tidefs-xtask -- check-trace-oracle
 
 The oracle compares Rust semantics against golden traces under
-`traces/golden/`. See `docs/DETERMINISTIC_TRACE_ORACLE_DESIGN.md` for the
-trace format and schema.
+`traces/golden/`. The deleted trace-oracle design from #1174 remains in git
+history as historical input.
 
 ## 8. Deterministic distributed test harness
 
@@ -403,7 +403,7 @@ call-graphs resolve correctly.
 
 ## 17. Where to go next
 
-- `docs/DETERMINISTIC_TRACE_ORACLE_DESIGN.md` -- trace oracle design
+- Deleted trace-oracle lineage (#1174) -- historical design input in git history
 - `docs/NO_PRODUCTION_FSCK_FAILURE_MODEL.md` -- crash recovery model
 - `docs/CONTROL_PLANE_SERVICE_API_CLI_TOPOLOGY_P9-01.md` -- control-plane route topology
 - `docs/THREE_CONTRACT_ARCHITECTURE.md` -- three-contract architecture

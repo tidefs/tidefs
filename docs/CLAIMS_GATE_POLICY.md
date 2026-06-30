@@ -47,13 +47,22 @@ as claim-status authority.
 
 ## Successor And Comparator Wording
 
-The publishing-facing successor and comparator boundary is
-`storage.intent.successor_comparator.v1` in `validation/claims.toml`. Until
-that claim validates with current evidence manifests, TideFS docs, release
-notes, generated claim text, operator output, issue closeouts, and PR summaries
-must not say or imply that TideFS is a successor, replacement, superior
-alternative, or comparator-performance winner against OpenZFS, Ceph, DRBD, or
-local filesystems.
+The publishing-facing successor and comparator boundary is split in
+`validation/claims.toml`:
+
+- `storage.local.successor_comparator.v1` covers local-storage comparisons
+  against OpenZFS, DRBD, ext4/XFS, and local filesystems.
+- `storage.distributed.successor_comparator.v1` covers distributed-storage
+  comparisons against OpenZFS, Ceph, DRBD, and clustered storage systems.
+- `storage.intent.successor_comparator.v1` is the blocked umbrella boundary
+  tying storage-intent wording back to those split claim ids.
+
+Until the matching split claim id and the umbrella boundary validate with
+current evidence manifests, TideFS docs, release notes, generated claim text,
+operator output, issue closeouts, and PR summaries must not say or imply that
+TideFS is a successor, replacement, superior alternative, or
+comparator-performance winner against OpenZFS, Ceph, DRBD, local filesystems,
+or clustered storage systems.
 
 Allowed wording may describe ambition and target class, blocked claim ids and
 missing evidence, historical design inputs from incumbent systems, or bounded
@@ -68,11 +77,13 @@ Disallowed wording includes:
   statements without a verdict artifact owned by
   `docs/RELEASE_READINESS_VERDICT_CONTRACT.md`.
 
-The successor comparator claim remains blocked until the registry-required
+The successor comparator claims remain blocked until their registry-required
 evidence classes are present and current, including:
 
-- `storage-intent-comparator-equivalence-evidence`;
-- `storage-intent-successor-performance-fault-set`;
+- `local-storage-comparator-equivalence-evidence`;
+- `local-storage-successor-performance-fault-set`;
+- `distributed-storage-comparator-equivalence-evidence`;
+- `distributed-storage-successor-performance-fault-set`;
 - `storage-intent-successor-claim-boundary-review`;
 - `storage-intent-operator-explanation-evidence`;
 - `claims-gate-review`.
@@ -142,7 +153,7 @@ wording until the required runtime class and claims-gate review both exist.
 Current capability wording is blocked for these claim families unless the same
 line clearly frames the capability as absent today, future work, or a goal:
 
-- must not publish an OpenZFS/Ceph successor claim;
+- must not publish local or distributed OpenZFS/Ceph/DRBD successor claims;
 - must not claim production-ready status;
 - must not claim POSIX-complete behavior;
 - must not claim distributed storage capability;

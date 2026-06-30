@@ -4,8 +4,10 @@
 not a current TideFS capability, performance-superiority, cost-effectiveness,
 flash-wear, RAM, WAN, durability, or OpenZFS/Ceph successor claim. The claims
 gate currently blocks publishing an OpenZFS/Ceph successor claim. Any future
-retained product-facing comparison must be expressed through a #875 claim id
-and the comparator evidence required by #928/#930.
+retained product-facing comparison must be expressed through
+`storage.local.successor_comparator.v1` or
+`storage.distributed.successor_comparator.v1` and the comparator evidence
+required by that split claim id.
 
 Historical status: sealed design-spec for the TideFS successor claim to
 OpenZFS and Ceph, with an 8-dimension quantitative comparison covering
@@ -26,8 +28,8 @@ and codebase efficiency.
 This section records the historical imported seal. It is not current TideFS
 claim authority. The 8-dimension comparison, quantified improvements, and
 architectural analysis described here may be used as design input only until a
-future claim is explicitly registered through #875 and backed by #928/#930
-comparator evidence.
+future claim validates under the split local or distributed successor/comparator
+claim id and its comparator evidence.
 
 **Rust implementation is deferred to wire-up issues.** Each dependency
 (TideCRUSH placement, recovery orchestrator, rebake service, checksum
@@ -56,7 +58,8 @@ both OpenZFS and Ceph. It recorded 60 alleged design mistakes from those
 systems (38 ZFS, 22 Ceph) and a target redundancy model: **per-stripe
 erasure-coded placement with deferred redundancy via budgeted rebake**. This
 document does not establish a current quantitative claim. It preserves the
-historical 8-dimension framing as input for future #875/#928-gated evidence.
+historical 8-dimension framing as input for future split successor/comparator
+evidence.
 
 The historical claim framing rests on four pillars:
 
@@ -615,12 +618,12 @@ These gaps are tracked in the PC-010 blocker map
 
 ## 7. Relationship to 60-Mistake Coverage Matrix
 
-The [ZFS and Ceph Design Mistake Coverage Matrix](../ZFS_CEPH_DESIGN_MISTAKE_COVERAGE_MATRIX.md)
-enumerates 60 design mistakes (38 ZFS, 22 Ceph), all COVERED by TideFS
-design issues. In current authority, that coverage is historical input only:
-it does not prove an implemented-source, runtime, measured, or successor
-claim. Each positive statement below needs current issue/spec adoption plus
-#875/#928 evidence before it can become product-facing.
+The deleted ZFS/Ceph design mistake coverage matrix historically enumerated 60
+design mistakes (38 ZFS, 22 Ceph) as covered by TideFS design issues. In
+current authority, that coverage is historical input only: it does not prove an
+implemented-source, runtime, measured, or successor claim. Each positive
+statement below needs current issue/spec adoption plus the matching split
+successor/comparator claim evidence before it can become product-facing.
 
 | Mistake category | Count | Representative TideFS solution |
 |---|---|---|
@@ -662,7 +665,7 @@ when the four pillars (placement, redundancy, integrity, dynamics) are
 - [#1283](http://172.16.106.12/forgejo/forgeadmin/tidefs/issues/1283) — Bounded cluster membership
 - [#1237](http://172.16.106.12/forgejo/forgeadmin/tidefs/issues/1237) — Unified resource governor
 - [#1252](http://172.16.106.12/forgejo/forgeadmin/tidefs/issues/1252) — Intent log + write-intent bitmap
-- `docs/ZFS_CEPH_DESIGN_MISTAKE_COVERAGE_MATRIX.md`
+- Deleted ZFS/Ceph design mistake lineage
 - `docs/ERASURE_CODING_PLACEMENT_DESIGN.md`
 - deleted shard/rebake historical lineage
 - `docs/CHECKSUM_ARCHITECTURE_DESIGN.md`

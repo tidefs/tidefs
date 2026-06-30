@@ -1006,5 +1006,6 @@ this pool".
 - [#1286] Shard groups, replicas, and rebake pathway
 - [#1270] Observability surface (prometheus metrics)
 - [#1238] Unified on-media format lifecycle
-- `docs/ZFS_CEPH_DESIGN_MISTAKE_COVERAGE_MATRIX.md` — mistake #30
+- Deleted ZFS/Ceph mistake lineage — historical mistake #30 input in git
+  history
 - ZFS special device documentation: `zpoolconcepts(7)` — "Special Allocation Class"
