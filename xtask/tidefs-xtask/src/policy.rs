@@ -2249,6 +2249,7 @@ fn classify_library_family(name: &str) -> Family {
         || name.starts_with("tidefs-anti-entropy-")
         || name == "tidefs-auth"
         || name == "tidefs-btree"
+        || name == "tidefs-bulk-service"
         || name.starts_with("tidefs-chunk-shipper")
         || name.starts_with("tidefs-cleanup-")
         || name == "tidefs-clock-timing"
@@ -2913,6 +2914,14 @@ mod tests {
         assert_eq!(kind, NodeKind::Library);
         assert_eq!(family, Family::Storage);
         assert_eq!(class, CrateClass::Storage);
+
+        let (kind, family, class) = classify_member(
+            Path::new("crates/tidefs-bulk-service/Cargo.toml"),
+            "tidefs-bulk-service",
+        );
+        assert_eq!(kind, NodeKind::Library);
+        assert_eq!(family, Family::Storage);
+        assert_eq!(class, CrateClass::Core);
 
         let (kind, family, class) = classify_member(
             Path::new("crates/tidefs-local-filesystem/Cargo.toml"),
