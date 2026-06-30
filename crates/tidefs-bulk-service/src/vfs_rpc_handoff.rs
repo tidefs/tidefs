@@ -112,6 +112,15 @@ pub struct VfsRpcBulkAbort {
     pub reason: BulkAbortReason,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct VfsRpcBulkDoneCheck {
+    op_id: OpId,
+    handoff: VfsRpcBulkHandoff,
+    expected_len: u64,
+    total_transferred: u64,
+    checksum32: u32,
+}
+
 /// Errors emitted by the VFS_RPC/BULK handoff adapter.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum VfsRpcBulkHandoffError {
@@ -159,7 +168,10 @@ impl fmt::Display for VfsRpcBulkHandoffError {
                 write!(f, "BULK op_id {actual} does not match expected {expected}")
             }
             Self::LengthMismatch { expected, actual } => {
-                write!(f, "BULK length {actual} does not match VFS_RPC descriptor {expected}")
+                write!(
+                    f,
+                    "BULK length {actual} does not match VFS_RPC descriptor {expected}"
+                )
             }
         }
     }
@@ -223,11 +235,13 @@ impl BulkService {
         self.finish_vfs_rpc_handoff(
             connection_id,
             token,
-            op_id,
-            VfsRpcBulkHandoff::WriteUpload,
-            expected_len,
-            total_transferred,
-            checksum32,
+            VfsRpcBulkDoneCheck {
+                op_id,
+                handoff: VfsRpcBulkHandoff::WriteUpload,
+                expected_len,
+                total_transferred,
+                checksum32,
+            },
         )
     }
 
@@ -244,11 +258,13 @@ impl BulkService {
         self.finish_vfs_rpc_handoff(
             connection_id,
             token,
-            op_id,
-            VfsRpcBulkHandoff::ReadDownload,
-            expected_len,
-            total_transferred,
-            checksum32,
+            VfsRpcBulkDoneCheck {
+                op_id,
+                handoff: VfsRpcBulkHandoff::ReadDownload,
+                expected_len,
+                total_transferred,
+                checksum32,
+            },
         )
     }
 
@@ -269,29 +285,27 @@ impl BulkService {
         &mut self,
         connection_id: ConnectionId,
         token: BulkToken,
-        op_id: OpId,
-        handoff: VfsRpcBulkHandoff,
-        expected_len: u64,
-        total_transferred: u64,
-        checksum32: u32,
+        check: VfsRpcBulkDoneCheck,
     ) -> Result<VfsRpcBulkCompletion, VfsRpcBulkHandoffError> {
-        let completed = self.done(connection_id, token, total_transferred, checksum32)?;
-        validate_vfs_rpc_completion(completed, handoff, op_id, expected_len)
+        let completed = self.done(
+            connection_id,
+            token,
+            check.total_transferred,
+            check.checksum32,
+        )?;
+        validate_vfs_rpc_completion(completed, check)
     }
 }
 
 fn validate_vfs_rpc_completion(
     completed: CompletedBulkTransfer,
-    expected_handoff: VfsRpcBulkHandoff,
-    expected_op_id: OpId,
-    expected_len: u64,
+    check: VfsRpcBulkDoneCheck,
 ) -> Result<VfsRpcBulkCompletion, VfsRpcBulkHandoffError> {
-    let (handoff, op_id) =
-        validate_metadata(completed.metadata, expected_handoff, expected_op_id)?;
+    let (handoff, op_id) = validate_metadata(completed.metadata, check.handoff, check.op_id)?;
     let actual_len = completed.bytes.len() as u64;
-    if actual_len != expected_len {
+    if actual_len != check.expected_len {
         return Err(VfsRpcBulkHandoffError::LengthMismatch {
-            expected: expected_len,
+            expected: check.expected_len,
             actual: actual_len,
         });
     }
@@ -312,8 +326,7 @@ fn validate_vfs_rpc_abort(
     expected_handoff: VfsRpcBulkHandoff,
     expected_op_id: OpId,
 ) -> Result<VfsRpcBulkAbort, VfsRpcBulkHandoffError> {
-    let (handoff, op_id) =
-        validate_metadata(aborted.metadata, expected_handoff, expected_op_id)?;
+    let (handoff, op_id) = validate_metadata(aborted.metadata, expected_handoff, expected_op_id)?;
     Ok(VfsRpcBulkAbort {
         connection_id: aborted.connection_id,
         stream_id: aborted.stream_id,
@@ -373,15 +386,19 @@ mod tests {
     fn complete_chunks(service: &mut BulkService, token: BulkToken, bytes: &[u8]) {
         let mut offset = 0;
         for (chunk_seq, chunk) in bytes.chunks(8).enumerate() {
-            let grant = service
-                .credit(7, token, chunk_seq as u32, chunk.len() as u32)
-                .unwrap();
+            let chunk_seq = u32::try_from(chunk_seq).unwrap();
+            let chunk_len = u32::try_from(chunk.len()).unwrap();
+            let grant = service.credit(7, token, chunk_seq, chunk_len).unwrap();
             assert_eq!(grant.offset, offset);
             service
-                .write_tcp_chunk(7, token, chunk_seq as u32, grant.offset, chunk)
+                .write_tcp_chunk(7, token, chunk_seq, grant.offset, chunk)
                 .unwrap();
-            offset += chunk.len() as u64;
+            offset += u64::try_from(chunk.len()).unwrap();
         }
+    }
+
+    fn payload_len(bytes: &[u8]) -> u64 {
+        u64::try_from(bytes.len()).unwrap()
     }
 
     #[test]
@@ -389,15 +406,9 @@ mod tests {
         let mut service = service();
         let op_id = 99;
         let bytes = b"hello world";
-        let accept = service.accept_vfs_rpc_write_upload(
-            7,
-            11,
-            op_id,
-            bytes.len() as u64,
-            BulkPriority::Bulk,
-        );
-        let descriptor =
-            VfsRpcBulkDescriptor::from_accept(&accept, bytes.len() as u64).unwrap();
+        let len = payload_len(bytes);
+        let accept = service.accept_vfs_rpc_write_upload(7, 11, op_id, len, BulkPriority::Bulk);
+        let descriptor = VfsRpcBulkDescriptor::from_accept(&accept, len).unwrap();
 
         complete_chunks(&mut service, descriptor.token, bytes);
         let completed = service
@@ -406,7 +417,7 @@ mod tests {
                 descriptor.token,
                 op_id,
                 descriptor.len,
-                bytes.len() as u64,
+                len,
                 crc32c::crc32c(bytes),
             )
             .unwrap();
@@ -421,15 +432,9 @@ mod tests {
     fn read_download_handoff_rejects_wrong_op_id_after_discard() {
         let mut service = service();
         let bytes = b"read bytes";
-        let accept = service.accept_vfs_rpc_read_download(
-            7,
-            12,
-            55,
-            bytes.len() as u64,
-            BulkPriority::Bulk,
-        );
-        let descriptor =
-            VfsRpcBulkDescriptor::from_accept(&accept, bytes.len() as u64).unwrap();
+        let len = payload_len(bytes);
+        let accept = service.accept_vfs_rpc_read_download(7, 12, 55, len, BulkPriority::Bulk);
+        let descriptor = VfsRpcBulkDescriptor::from_accept(&accept, len).unwrap();
 
         complete_chunks(&mut service, descriptor.token, bytes);
         assert_eq!(
@@ -438,7 +443,7 @@ mod tests {
                 descriptor.token,
                 56,
                 descriptor.len,
-                bytes.len() as u64,
+                len,
                 crc32c::crc32c(bytes),
             ),
             Err(VfsRpcBulkHandoffError::OpIdMismatch {
@@ -453,27 +458,16 @@ mod tests {
     fn failed_done_discards_bytes_before_vfs_rpc_completion() {
         let mut service = service();
         let bytes = b"bad";
-        let accept = service.accept_vfs_rpc_write_upload(
-            7,
-            13,
-            77,
-            bytes.len() as u64,
-            BulkPriority::Bulk,
-        );
-        let descriptor =
-            VfsRpcBulkDescriptor::from_accept(&accept, bytes.len() as u64).unwrap();
+        let len = payload_len(bytes);
+        let accept = service.accept_vfs_rpc_write_upload(7, 13, 77, len, BulkPriority::Bulk);
+        let descriptor = VfsRpcBulkDescriptor::from_accept(&accept, len).unwrap();
 
         complete_chunks(&mut service, descriptor.token, bytes);
         assert!(matches!(
-            service.finish_vfs_rpc_write_upload(
-                7,
-                descriptor.token,
-                77,
-                descriptor.len,
-                3,
-                0,
-            ),
-            Err(VfsRpcBulkHandoffError::Bulk(BulkError::ChecksumMismatch { .. }))
+            service.finish_vfs_rpc_write_upload(7, descriptor.token, 77, descriptor.len, 3, 0,),
+            Err(VfsRpcBulkHandoffError::Bulk(
+                BulkError::ChecksumMismatch { .. }
+            ))
         ));
         assert_eq!(service.active_transfer_count(7), 0);
     }
