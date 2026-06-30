@@ -485,8 +485,9 @@ pub use cross_session_scheduler::{
     CrossSessionScheduler, CrossSessionSchedulerConfig, SessionSendEntry,
 };
 pub use data_service_dispatch::{
-    DataServiceDispatch, DataServiceDispatchError, DataServiceDispatchOutcome, DataServiceFrame,
-    DataServiceHandler, DATA_SERVICE_ENDPOINT_FAMILY, DATA_SERVICE_FRAME_HEADER_LEN,
+    register_data_service_dispatch, DataServiceDispatch, DataServiceDispatchError,
+    DataServiceDispatchOutcome, DataServiceFrame, DataServiceHandler, DataServiceMessageHandler,
+    DataServiceReplySink, DATA_SERVICE_ENDPOINT_FAMILY, DATA_SERVICE_FRAME_HEADER_LEN,
     DATA_SERVICE_LANE, DATA_SERVICE_MESSAGE_FAMILY,
 };
 pub use dedup_filter::{DedupFilter, DedupFilterConfig, DedupFilterStats, DeliveryVerdict};

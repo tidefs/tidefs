@@ -41,6 +41,7 @@ use std::sync::RwLock;
 
 use crate::channel::ChannelId;
 use crate::envelope::MessageFamily;
+use crate::types::SessionId;
 use crate::write_gate::WriteGate;
 use tidefs_cluster::write_fence::{StaleFence, WriteFence};
 
@@ -52,6 +53,8 @@ use tidefs_cluster::write_fence::{StaleFence, WriteFence};
 /// [`MessageFamily`] discriminant and the raw payload bytes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DecodedMessage {
+    /// Authenticated transport session that received this message, when known.
+    pub session_id: Option<SessionId>,
     /// The multiplex channel ID, if this message was received on a specific channel.
     pub channel_id: Option<ChannelId>,
     /// The message family that classifies this message.
@@ -65,6 +68,7 @@ impl DecodedMessage {
     #[must_use]
     pub fn new(family: MessageFamily, payload: Vec<u8>) -> Self {
         Self {
+            session_id: None,
             family,
             payload,
             channel_id: None,
@@ -75,10 +79,18 @@ impl DecodedMessage {
     #[must_use]
     pub fn with_channel_id(family: MessageFamily, payload: Vec<u8>, channel_id: ChannelId) -> Self {
         Self {
+            session_id: None,
             family,
             payload,
             channel_id: Some(channel_id),
         }
+    }
+
+    /// Attach the authenticated transport session that carried this message.
+    #[must_use]
+    pub fn with_session_id(mut self, session_id: SessionId) -> Self {
+        self.session_id = Some(session_id);
+        self
     }
 }
 

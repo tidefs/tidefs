@@ -82,6 +82,9 @@ use tokio::net::TcpStream;
 
 use crate::channel::{ChannelId, SharedChannelTable};
 use crate::connection::ConnectionHandle;
+use crate::data_service_dispatch::{
+    register_data_service_dispatch, DataServiceDispatch, DataServiceReplySink,
+};
 use crate::dispatch::{DecodedMessage, MessageDispatch};
 use crate::envelope::MessageFamily;
 use crate::epoch_gate::EpochGate;
@@ -91,6 +94,7 @@ use crate::receive_flow::{
     ReceiveCredit, ReceiveFlowController, SenderCreditTracker, RECEIVE_CREDIT_FRAME_SIZE,
 };
 use crate::recv_batch::RecvBatchDecoder;
+use crate::types::SessionId;
 use tokio::task::JoinHandle;
 
 // ---------------------------------------------------------------------------
@@ -165,6 +169,7 @@ pub struct ConnectionReceiver {
     decoder: FramingDecoder,
     dispatch: Arc<MessageDispatch>,
     config: ReceiveLoopConfig,
+    session_id: Option<SessionId>,
     channel_table: Option<SharedChannelTable>,
     idle_tracker: Option<IdleTracker>,
     /// Telemetry accumulator for per-connection receive metrics.
@@ -207,6 +212,7 @@ impl ConnectionReceiver {
             decoder,
             dispatch,
             config,
+            session_id: None,
             channel_table: None,
             idle_tracker: None,
             telemetry: None,
@@ -223,6 +229,30 @@ impl ConnectionReceiver {
     #[must_use]
     pub fn with_idle_tracker(mut self, tracker: IdleTracker) -> Self {
         self.idle_tracker = Some(tracker);
+        self
+    }
+
+    /// Attach the authenticated transport session id for downstream handlers.
+    #[must_use]
+    pub fn with_session_id(mut self, session_id: SessionId) -> Self {
+        self.session_id = Some(session_id);
+        self
+    }
+
+    /// Bind DATA service-id dispatch to this receive loop's StateTransfer path.
+    ///
+    /// The caller supplies the already-authenticated session id from connection
+    /// establishment. Reply frames are emitted through `reply_sink`; the receive
+    /// loop itself does not choose an outbound transport.
+    #[must_use]
+    pub fn with_data_service_dispatch(
+        mut self,
+        session_id: SessionId,
+        dispatch: DataServiceDispatch,
+        reply_sink: Arc<dyn DataServiceReplySink>,
+    ) -> Self {
+        self.session_id = Some(session_id);
+        register_data_service_dispatch(&self.dispatch, dispatch, reply_sink);
         self
     }
 
@@ -510,6 +540,11 @@ impl ConnectionReceiver {
             } else {
                 DecodedMessage::new(family, body)
             };
+            let msg = if let Some(session_id) = self.session_id {
+                msg.with_session_id(session_id)
+            } else {
+                msg
+            };
 
             // Record received bytes on the channel table for per-channel accounting.
             if let (Some(ref table), Some(ch)) = (&self.channel_table, channel_id) {
@@ -620,6 +655,11 @@ impl ConnectionReceiver {
         let msg_count = batch.len();
         for (family, payload) in batch {
             let msg = DecodedMessage::new(family, payload);
+            let msg = if let Some(session_id) = self.session_id {
+                msg.with_session_id(session_id)
+            } else {
+                msg
+            };
 
             // Per-channel accounting is not available for batch-decoded
             // messages (no channel ID in the codec format).
