@@ -708,6 +708,29 @@ connection that carries the VFS_RPC frame, and report timeout or ABORT
 completion to the waiting VFS_RPC operation before any VFS Engine call observes
 failed-transfer bytes.
 
+Post-#1558 source-edit gate, inspected at `origin/master` `31cac908` on
+2026-06-30:
+
+- The live BULK crate exports the TCP_STREAM state machine and VFS_RPC handoff
+  helper, but it still does not expose a transport frame codec or dispatcher.
+- `crates/tidefs-transport/src/control_service_dispatch.rs` provides
+  service-id dispatch only for the control-lane `ControlServiceFrame`
+  (`MessageFamily::LeaseFenceDeadline`). The transport data endpoint admits the
+  `StateTransfer` and `ReplicaTransferVerify` message families, but current
+  source has no service-id registry that can honestly carry `service_id = 0x07`
+  BULK bytes on that data path.
+- `crates/tidefs-vfs-rpc/src/transport_adapter.rs` still rejects
+  `REQ_FLAG_BULK_PENDING`, `RESP_FLAG_BULK`, and `InlineOrBulk::Bulk` with
+  `BulkUnsupported`. Removing that rejection requires a VFS_RPC transport
+  integration slice after the data-endpoint BULK dispatch contract exists.
+
+The next implementation must not put BULK data on the control-service path and
+must not reuse the storage-node object-store tag protocol as a BULK success.
+Split the remaining work into a data-endpoint BULK transport binding/codec
+owned by `tidefs-bulk-service` and `tidefs-transport`, followed by VFS_RPC
+descriptor acceptance that binds peer, session, `op_id`, timeout, and ABORT
+state to that data binding before VFS Engine dispatch.
+
 #### 12.1.1 WRITE with BULK
 
 The minimal live WRITE handoff is:
