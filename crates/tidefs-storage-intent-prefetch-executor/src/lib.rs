@@ -1870,6 +1870,7 @@ pub fn finalize_prefetch_execution(
         || terminal_update_lacks_result_refusal_evidence(record, update)
         || terminal_update_lacks_interruption_evidence(record, update)
         || terminal_update_has_inconsistent_interruption(update)
+        || terminal_update_lacks_handoff_boundary_evidence(record, update)
         || terminal_update_lacks_started_dispatch_evidence(record, update)
         || terminal_result_detail_lacks_charge_evidence(record, update)
     {
@@ -2092,6 +2093,20 @@ fn terminal_update_has_inconsistent_interruption(update: PrefetchExecutorTermina
     !update
         .interruption
         .is_compatible_with_outcome(update.outcome)
+}
+
+fn terminal_update_lacks_handoff_boundary_evidence(
+    record: PrefetchExecutorRecord,
+    update: PrefetchExecutorTerminalUpdate,
+) -> bool {
+    update.outcome == PrefetchExecutorOutcome::HandoffRequired
+        && update.handoff_target != PrefetchExecutorHandoffTarget::None
+        && !terminal_ref_in_cut(
+            record,
+            update.evidence_cut,
+            record.evidence_refs.relocation_boundary_ref,
+            StorageIntentEvidenceKind::RelocationReceipt,
+        )
 }
 
 fn terminal_update_lacks_started_dispatch_evidence(
@@ -3053,6 +3068,7 @@ mod tests {
     const RESULT_REFUSAL: StorageIntentEvidenceId = StorageIntentEvidenceId([22; 32]);
     const INTERRUPTION: StorageIntentEvidenceId = StorageIntentEvidenceId([23; 32]);
     const RUNTIME_SUPPORT: StorageIntentEvidenceId = StorageIntentEvidenceId([24; 32]);
+    const RELOCATION: StorageIntentEvidenceId = StorageIntentEvidenceId([25; 32]);
 
     fn evidence(
         kind: StorageIntentEvidenceKind,
@@ -5725,13 +5741,99 @@ mod tests {
         );
 
         let handoff_detail = terminal_detail();
-        let handoff = finalize_prefetch_execution(
+        let handoff_without_boundary = finalize_prefetch_execution(
             started,
             PrefetchExecutorTerminalUpdate {
                 outcome: PrefetchExecutorOutcome::HandoffRequired,
                 result_detail: handoff_detail,
                 handoff_target: PrefetchExecutorHandoffTarget::Promotion,
                 evidence_cut: terminal_evidence_cut(started, handoff_detail, EMPTY_EVIDENCE_REF),
+                ..PrefetchExecutorTerminalUpdate::default()
+            },
+        );
+        assert_eq!(
+            handoff_without_boundary.outcome,
+            PrefetchExecutorOutcome::VerificationFailed
+        );
+        assert_eq!(
+            handoff_without_boundary.executor_byte_state,
+            PrefetchExecutorByteState::Refused
+        );
+        assert_record_has_no_authority_claims(handoff_without_boundary);
+
+        let mut wrong_kind_input = admitted_charged_input(
+            PrefetchResidencyCandidateClass::BoundedReadahead,
+            handoff_detail,
+        );
+        let wrong_kind_relocation_ref = evidence(
+            StorageIntentEvidenceKind::ActionExecutionEvidence,
+            RELOCATION,
+        );
+        wrong_kind_input
+            .decision
+            .evidence_refs
+            .relocation_boundary_ref = wrong_kind_relocation_ref;
+        wrong_kind_input
+            .evidence_query_snapshot
+            .included_refs
+            .push(wrong_kind_relocation_ref)
+            .unwrap();
+        let wrong_kind_started = evaluate_prefetch_execution(wrong_kind_input);
+        assert_eq!(wrong_kind_started.outcome, PrefetchExecutorOutcome::Started);
+
+        let mut wrong_kind_cut =
+            terminal_evidence_cut(wrong_kind_started, handoff_detail, EMPTY_EVIDENCE_REF);
+        wrong_kind_cut
+            .included_refs
+            .push(wrong_kind_started.evidence_refs.relocation_boundary_ref)
+            .unwrap();
+        let handoff_wrong_kind = finalize_prefetch_execution(
+            wrong_kind_started,
+            PrefetchExecutorTerminalUpdate {
+                outcome: PrefetchExecutorOutcome::HandoffRequired,
+                result_detail: handoff_detail,
+                handoff_target: PrefetchExecutorHandoffTarget::Promotion,
+                evidence_cut: wrong_kind_cut,
+                ..PrefetchExecutorTerminalUpdate::default()
+            },
+        );
+        assert_eq!(
+            handoff_wrong_kind.outcome,
+            PrefetchExecutorOutcome::VerificationFailed
+        );
+        assert_eq!(
+            handoff_wrong_kind.executor_byte_state,
+            PrefetchExecutorByteState::Refused
+        );
+        assert_record_has_no_authority_claims(handoff_wrong_kind);
+
+        let mut handoff_input = admitted_charged_input(
+            PrefetchResidencyCandidateClass::BoundedReadahead,
+            handoff_detail,
+        );
+        let relocation_ref = evidence(StorageIntentEvidenceKind::RelocationReceipt, RELOCATION);
+        handoff_input.decision.evidence_refs.relocation_boundary_ref = relocation_ref;
+        handoff_input
+            .evidence_query_snapshot
+            .included_refs
+            .push(relocation_ref)
+            .unwrap();
+        let handoff_started = evaluate_prefetch_execution(handoff_input);
+        assert_eq!(handoff_started.outcome, PrefetchExecutorOutcome::Started);
+
+        let mut handoff_cut =
+            terminal_evidence_cut(handoff_started, handoff_detail, EMPTY_EVIDENCE_REF);
+        handoff_cut
+            .included_refs
+            .push(handoff_started.evidence_refs.relocation_boundary_ref)
+            .unwrap();
+        let handoff = finalize_prefetch_execution(
+            handoff_started,
+            PrefetchExecutorTerminalUpdate {
+                outcome: PrefetchExecutorOutcome::HandoffRequired,
+                result_detail: handoff_detail,
+                handoff_target: PrefetchExecutorHandoffTarget::Promotion,
+                evidence_cut: handoff_cut,
                 ..PrefetchExecutorTerminalUpdate::default()
             },
         );
