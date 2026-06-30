@@ -1157,11 +1157,24 @@ impl IntentLog {
         self.entries.len().saturating_sub(self.flushed_entry_count)
     }
 
-    /// Whether any pending (unflushed) intent log entry carries data
-    /// intents for `inode_id`. Used by the fsync fast path to decide
-    /// whether flushing the intent log is sufficient instead of a full
-    /// commit_group commit.
+    /// Whether any uncleared intent-log entry carries replayable data bytes
+    /// for `inode_id`.
+    ///
+    /// Entries flushed by `sync_write_intent()` are still recovery authority
+    /// until a full commit publishes the state and clears the log.
     pub fn has_pending_data_for_inode(&self, inode_id: InodeId) -> bool {
+        self.has_unflushed_data_for_inode(inode_id)
+            || self
+                .entries
+                .get(..self.flushed_entry_count)
+                .unwrap_or(&[])
+                .iter()
+                .any(|e| e.entry_kind.references_data_inode(inode_id))
+    }
+
+    /// Whether any unflushed intent-log entry carries replayable data bytes
+    /// for `inode_id`.
+    pub fn has_unflushed_data_for_inode(&self, inode_id: InodeId) -> bool {
         self.unflushed_entries()
             .iter()
             .any(|e| e.entry_kind.references_data_inode(inode_id))
@@ -2203,7 +2216,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_data_for_inode_requires_unflushed_replayable_data() {
+    fn pending_data_for_inode_keeps_flushed_replayable_data_until_commit() {
         let inode_id = InodeId::new(88);
         let mut log = IntentLog::new();
         log.entries.push(IntentLogEntry {
@@ -2219,7 +2232,8 @@ mod tests {
             timestamp_ns: test_timestamp(),
         });
         log.flushed_entry_count = 1;
-        assert!(!log.has_pending_data_for_inode(inode_id));
+        assert!(log.has_pending_data_for_inode(inode_id));
+        assert!(!log.has_unflushed_data_for_inode(inode_id));
 
         log.entries.push(IntentLogEntry {
             entry_id: 1,
@@ -2239,7 +2253,8 @@ mod tests {
             root_anchor: test_root_anchor(),
             timestamp_ns: test_timestamp(),
         });
-        assert!(!log.has_pending_data_for_inode(inode_id));
+        assert!(log.has_pending_data_for_inode(inode_id));
+        assert!(!log.has_unflushed_data_for_inode(inode_id));
 
         log.entries.push(IntentLogEntry {
             entry_id: 3,
@@ -2255,6 +2270,7 @@ mod tests {
             timestamp_ns: test_timestamp(),
         });
         assert!(log.has_pending_data_for_inode(inode_id));
+        assert!(log.has_unflushed_data_for_inode(inode_id));
     }
 
     #[test]
