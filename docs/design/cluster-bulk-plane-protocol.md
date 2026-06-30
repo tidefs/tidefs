@@ -685,24 +685,28 @@ Current source status for the #1523 evidence pass:
 - `crates/tidefs-bulk-service/` provides the BULK-owned `service_id = 0x07`
   `BulkService`/`BulkToken`/`BulkOffer` API, connection-scoped transfer table,
   TCP_STREAM credit/data/DONE/ABORT state machine, CRC32C DONE verification,
-  and failed-transfer discard behavior. The crate is a service surface for a
-  future transport dispatcher; it is not a multi-node product-readiness claim.
+  failed-transfer discard behavior, and a BULK-side VFS_RPC handoff helper that
+  binds WRITE/READ metadata, `op_id`, `BulkToken`, and descriptor length before
+  completed bytes may be consumed. The crate is a service surface for a future
+  transport dispatcher; it is not a multi-node product-readiness claim.
 - `apps/tidefs-storage-node/src/protocol.rs` is still an object-store tag
   protocol, not a cluster service_id `0x07` BULK dispatcher.
 - `crates/tidefs-transport/src/boundedness.rs` exposes generic bulk-token
   limits and a default bulk deadline for transport boundedness, and the BULK
   service consumes those bounds for TCP_STREAM transfer admission.
 
-Until transport dispatch and the VFS_RPC handoff adapter consume that service
-surface, VFS_RPC endpoints may reject BULK descriptors as unsupported. They
-must not silently downgrade RDMA-capable BULK offers to TCP, claim RDMA
-readiness, or treat moved bytes as storage semantics authority.
+Until transport dispatch and the VFS_RPC transport adapter wire this BULK-side
+helper into service_id `0x06` request/response handling, VFS_RPC endpoints may
+reject BULK descriptors as unsupported. They must not silently downgrade
+RDMA-capable BULK offers to TCP, claim RDMA readiness, or treat moved bytes as
+storage semantics authority.
 
-The remaining implementation blocker is therefore transport/VFS_RPC integration
-that can dispatch service_id `0x07` frames to the BULK service, bind the
-transport-authenticated peer identity to the same connection that carries the
-VFS_RPC frame, and report timeout or ABORT completion to the waiting VFS_RPC
-operation before any VFS Engine call observes failed-transfer bytes.
+The remaining implementation blocker outside the BULK service is therefore
+transport/VFS_RPC integration that can dispatch service_id `0x07` frames to the
+BULK service, bind the transport-authenticated peer identity to the same
+connection that carries the VFS_RPC frame, and report timeout or ABORT
+completion to the waiting VFS_RPC operation before any VFS Engine call observes
+failed-transfer bytes.
 
 #### 12.1.1 WRITE with BULK
 
@@ -792,6 +796,7 @@ The BULK service should live in a new crate:
 crates/tidefs-bulk-service/
   src/
     lib.rs           -- public API: BulkService, BulkToken, BulkOffer
+    vfs_rpc_handoff.rs -- VFS_RPC READ/WRITE BulkToken handoff helper
     protocol.rs      -- wire message types (OfferV1, AcceptV1, etc.)
     state_machine.rs -- per-transfer state machine
     pinned_pool.rs   -- PinnedPool for RDMA/TCP buffer management
