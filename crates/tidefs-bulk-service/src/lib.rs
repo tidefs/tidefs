@@ -18,8 +18,14 @@ use std::time::Duration;
 
 use tidefs_transport::{bulk_deadline_default, BULK_CHUNK_SIZE_DEFAULT, MAX_INFLIGHT_BULK_TOKENS};
 
+pub mod protocol;
 pub mod vfs_rpc_handoff;
 
+pub use protocol::{
+    BulkAbortFrame, BulkAcceptFrame, BulkCreditGrantFrame, BulkCreditRequestFrame,
+    BulkCreditResult, BulkDoneFrame, BulkFrame, BulkFrameKind, BulkMethod, BulkOfferFrame,
+    BulkProtocolError, BulkRdmaCredit, VFS_RPC_BULK_METADATA_MAGIC, VFS_RPC_BULK_METADATA_VERSION,
+};
 pub use vfs_rpc_handoff::{
     VfsRpcBulkAbort, VfsRpcBulkCompletion, VfsRpcBulkDescriptor, VfsRpcBulkHandoff,
     VfsRpcBulkHandoffError,

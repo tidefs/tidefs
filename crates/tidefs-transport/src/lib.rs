@@ -252,6 +252,7 @@ pub mod connection_telemetry;
 pub mod control_service_dispatch;
 pub mod correlation_frame;
 pub mod cross_session_scheduler;
+pub mod data_service_dispatch;
 pub mod dedup_filter;
 pub mod delivery_confirmation;
 pub mod dispatch;
@@ -482,6 +483,11 @@ pub use correlation_frame::{
 };
 pub use cross_session_scheduler::{
     CrossSessionScheduler, CrossSessionSchedulerConfig, SessionSendEntry,
+};
+pub use data_service_dispatch::{
+    DataServiceDispatch, DataServiceDispatchError, DataServiceDispatchOutcome, DataServiceFrame,
+    DataServiceHandler, DATA_SERVICE_ENDPOINT_FAMILY, DATA_SERVICE_FRAME_HEADER_LEN,
+    DATA_SERVICE_LANE, DATA_SERVICE_MESSAGE_FAMILY,
 };
 pub use dedup_filter::{DedupFilter, DedupFilterConfig, DedupFilterStats, DeliveryVerdict};
 pub use delivery_confirmation::{
