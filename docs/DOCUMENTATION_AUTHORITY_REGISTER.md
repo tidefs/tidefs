@@ -1,6 +1,6 @@
 # Documentation Authority Register
 
-Date: 2026-06-21
+Date: 2026-06-30
 
 This register is the TFR-019 queue for imported documents that still need
 authority classification. It is deliberately narrow: it does not make the
@@ -9,9 +9,9 @@ claim.
 
 ## Authority Rule
 
-The active entry points are `README.md`, `AGENTS.md`, `docs/LICENSING.md`,
-`docs/REVIEW_TODO_REGISTER.md`, `docs/WHOLE_REPO_REVIEW.md`,
-`docs/SUCCESSOR_LOCKDOWN_AND_DOC_CONSOLIDATION.md`, and this file.
+The active entry points are `README.md`, `AGENTS.md`, `docs/INDEX.md`,
+`docs/LICENSING.md`, `docs/REVIEW_TODO_REGISTER.md`,
+`docs/WHOLE_REPO_REVIEW.md`, `docs/CLAIMS_GATE_POLICY.md`, and this file.
 
 The active TideFS Book authoring decision is `docs/book/README.adoc`. The
 assembled book source starts at `docs/book/tidefs-book.adoc`; book chapters are
@@ -54,19 +54,25 @@ too large for the current slice, leave the document as historical input and
 record the blocker in `docs/REVIEW_TODO_REGISTER.md` or
 `docs/WHOLE_REPO_REVIEW.md`.
 
-## Successor Lockdown And Documentation Consolidation (#1580)
+Consolidation work must collapse duplicate truth surfaces instead of creating
+new status files. Keep generated outputs generated, especially
+`docs/CLAIM_REGISTRY.md` from `validation/claims.toml`. Treat broad design docs,
+old status matrices, coordination packets, closeout snapshots, and issue-era
+implementation plans as historical input or delete candidates until a focused
+issue classifies their exact scope. Delete only after useful content has moved
+or the file is obsolete scaffold/closeout material; keep path lineage in git,
+issues, and PRs instead of preserving a live row for every deleted file.
 
-Classified for TFR-019 / GitHub issue #1580 on 2026-06-30 after reviewing the
-current claim registry, `validation/claims.toml`, the storage-intent policy
-authority, the release-readiness verdict contract, the product-admission proof
-train map, this register, `docs/INDEX.md`, `docs/WHOLE_REPO_REVIEW.md`, and live
-GitHub issue/PR state. This slice adds a current policy guardrail and does not
-classify every imported document, validate any successor claim, or close
-TFR-019.
+## Folded Claim And Consolidation Bridge (#1588)
 
-| Path | State | Classification note |
-|---|---|---|
-| `docs/SUCCESSOR_LOCKDOWN_AND_DOC_CONSOLIDATION.md` | Current policy | Binding guardrail that routes OpenZFS, Ceph, DRBD, local-filesystem successor/comparator wording through `storage.intent.successor_comparator.v1`, separates normal issue/PR validation from product-gate evidence, and makes documentation consolidation a TFR-019 authority-classification workstream. It does not validate the successor comparator claim, declare release or production readiness, classify every imported document, or promote broad historical design material. |
+Issue #1588 folded the temporary claim/consolidation bridge into existing
+authority docs and deleted it as a separate policy surface. Successor and
+comparator wording now lives in `docs/CLAIMS_GATE_POLICY.md`; the storage-intent
+receipt and non-claim spine lives in `docs/STORAGE_INTENT_POLICY_AUTHORITY.md`;
+TFR-019 classification and deletion process stays in this register. This did
+not validate
+`storage.intent.successor_comparator.v1`, declare release or production
+readiness, classify every imported document, or close TFR-019.
 
 ## Doc-Authority Drift Cleanup Coordination (#952)
 
