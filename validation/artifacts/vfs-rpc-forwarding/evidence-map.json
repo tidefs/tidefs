@@ -1,0 +1,255 @@
+{
+  "report_version": 1,
+  "artifact_id": "vfs-rpc-forwarding-evidence-map-v1",
+  "generated_by": "issue-1524-source-inspection",
+  "generated_at": "2026-06-30T03:52:06Z",
+  "source_branch": "gpt2/issue-1524-vfs-rpc-forwarding-validation",
+  "base_ref": {
+    "name": "origin/master",
+    "sha": "b828e7a8175f9c9c6d6a7f016239db96d17e2877"
+  },
+  "coordination": {
+    "issue": "https://github.com/tidefs/tidefs/issues/1524",
+    "parent_decision_issue": "https://github.com/tidefs/tidefs/issues/1518",
+    "parent_decision_state": "closed",
+    "merged_bulk_service_pr": "https://github.com/tidefs/tidefs/pull/1550",
+    "bulk_handoff_issue_state": "open"
+  },
+  "claim_boundary": {
+    "supported_by_this_artifact": "TideFS has a source-reviewed, issue-gated validation matrix for VFS_RPC forwarding evidence, including the smallest focused workflow and artifact surface for each forwarding claim row.",
+    "not_supported_by_this_artifact": [
+      "VFS_RPC inline forwarding is not runtime-validated by this artifact.",
+      "BULK-bound VFS_RPC data movement is not validated while #1523 remains open; #1550 landed the BULK service surface but not the VFS_RPC handoff binding.",
+      "RDMA readiness is not claimed; RDMA remains behind BULK, transport peer security, pinned-memory accounting, rkey/addr lifecycle, abort cleanup, and hardware/runtime evidence gates.",
+      "Multi-node product readiness is not claimed.",
+      "Release-candidate readiness is not claimed.",
+      "Storage semantics or durability authority is not claimed."
+    ]
+  },
+  "live_prerequisites": [
+    {
+      "issue": 1518,
+      "state": "closed",
+      "role": "selected the VFS_RPC control/inline forwarding boundary with BULK-plane data movement and explicit non-claims"
+    },
+    {
+      "issue": 1521,
+      "state": "closed",
+      "role": "transport adapter/control dispatch prerequisite",
+      "current_source_evidence": [
+        "crates/tidefs-vfs-rpc/src/lib.rs exports transport_adapter",
+        "crates/tidefs-vfs-rpc/src/transport_adapter.rs binds service 0x06 to the CONTROL path",
+        "transport adapter tests cover frame limits, peer/session errors, retry/timeout surfaces, peer mismatch, and BULK-not-bound rejection"
+      ]
+    },
+    {
+      "issue": 1522,
+      "state": "open",
+      "role": "VFS Engine bridge prerequisite for inline forwarding, stale term/epoch rejection, dedup replay, credential mismatch, and transferable handle rejection rows",
+      "current_gate": "Issue #1522 records a source-edit gate for bridge module/dependency wiring before bridge behavior can land."
+    },
+    {
+      "issue": 1523,
+      "state": "open",
+      "merged_pr": 1550,
+      "role": "BULK service and InlineOrBulk/BulkToken handoff prerequisite",
+      "current_gate": "PR #1550 is merged for the TCP token handoff service surface. Issue #1523 remains open for transport/VFS_RPC integration: service_id 0x07 frame dispatch, same-authenticated-connection peer binding, and VFS_RPC timeout/ABORT notification. This branch treats BULK-bound forwarding rows as gated until that integration lands and is validated."
+    }
+  ],
+  "minimum_validation_matrix": [
+    {
+      "row_id": "transport-framing",
+      "claim": "VFS_RPC request and response frames for service id 0x06 are wrapped and unwrapped through the transport CONTROL envelope without changing the VFS_RPC wire protocol.",
+      "current_status": "dispatchable-on-current-source",
+      "blocking_issues": [],
+      "smallest_workflows": [
+        {
+          "workflow": "Focused Rust",
+          "ref": "feature branch under test",
+          "inputs": {
+            "crates": "tidefs-vfs-rpc,tidefs-transport",
+            "cargo_test_args": "transport_adapter"
+          },
+          "expected_artifact": "focused-rust-summary",
+          "artifact_claim": "cargo-unit evidence for transport framing, service id, CONTROL lane selection, frame-size rejection, and response correlation only"
+        },
+        {
+          "workflow": "Focused Claim Validation",
+          "ref": "feature branch carrying the evidence map",
+          "inputs": {
+            "mode": "validate-evidence-manifest",
+            "artifact_path": "validation/artifacts/vfs-rpc-forwarding/evidence-map.manifest.json"
+          },
+          "expected_artifact": "workflow summary",
+          "artifact_claim": "schema evidence that the source-controlled VFS_RPC forwarding evidence map is a bounded claim-boundary artifact"
+        }
+      ]
+    },
+    {
+      "row_id": "inline-forwarding",
+      "claim": "Validated inline VFS_RPC operations are forwarded to writer-side VFS Engine dispatch and return typed VFS_RPC responses without changing storage semantics.",
+      "current_status": "gated",
+      "blocking_issues": [
+        1522
+      ],
+      "smallest_workflows": [
+        {
+          "workflow": "Focused Rust",
+          "ref": "#1522 implementation branch after the bridge prerequisite lands",
+          "inputs": {
+            "crates": "tidefs-vfs-rpc,tidefs-vfs-engine",
+            "cargo_test_args": "vfs_engine_bridge"
+          },
+          "expected_artifact": "focused-rust-summary",
+          "artifact_claim": "cargo-unit evidence for inline bridge dispatch and typed response encoding only"
+        }
+      ]
+    },
+    {
+      "row_id": "stale-term-epoch-rejection",
+      "claim": "Forwarded operations reject stale writer, term, or epoch input with ESTALE or a documented retry signal before side effects.",
+      "current_status": "gated",
+      "blocking_issues": [
+        1522
+      ],
+      "smallest_workflows": [
+        {
+          "workflow": "Focused Rust",
+          "ref": "#1522 implementation branch after writer lease validation exists",
+          "inputs": {
+            "crates": "tidefs-vfs-rpc,tidefs-vfs-engine",
+            "cargo_test_args": "stale"
+          },
+          "expected_artifact": "focused-rust-summary",
+          "artifact_claim": "cargo-unit evidence for bridge-side stale writer, term, and epoch refusal only"
+        }
+      ]
+    },
+    {
+      "row_id": "dedup-replay-eviction",
+      "claim": "Per-peer op_id dedup replays completed mutation responses, evicts by the bounded window, and honors REQ_FLAG_NO_DEDUP for one-shot paths.",
+      "current_status": "partially-source-present-bridge-gated",
+      "blocking_issues": [
+        1522
+      ],
+      "smallest_workflows": [
+        {
+          "workflow": "Focused Rust",
+          "ref": "#1522 implementation branch after bridge dispatch can consume the existing VFS_RPC dedup window",
+          "inputs": {
+            "crates": "tidefs-vfs-rpc,tidefs-vfs-engine",
+            "cargo_test_args": "dedup"
+          },
+          "expected_artifact": "focused-rust-summary",
+          "artifact_claim": "cargo-unit evidence for completed-response replay, window eviction, and NO_DEDUP bypass at the bridge boundary only"
+        }
+      ]
+    },
+    {
+      "row_id": "credential-mismatch",
+      "claim": "The transport-authenticated peer identity is checked against VfsRpcCredentials before handles or operations are accepted; mismatch returns EACCES.",
+      "current_status": "gated",
+      "blocking_issues": [
+        1522
+      ],
+      "smallest_workflows": [
+        {
+          "workflow": "Focused Rust",
+          "ref": "#1522 implementation branch after bridge credential admission exists",
+          "inputs": {
+            "crates": "tidefs-vfs-rpc,tidefs-vfs-engine",
+            "cargo_test_args": "credential"
+          },
+          "expected_artifact": "focused-rust-summary",
+          "artifact_claim": "cargo-unit evidence for peer credential mismatch refusal only"
+        }
+      ]
+    },
+    {
+      "row_id": "transferable-handle-rejection",
+      "claim": "Transferable file and directory handles are rejected for wrong writer, dataset, inode generation, missing cookie, released handle, or peer mismatch.",
+      "current_status": "gated",
+      "blocking_issues": [
+        1522
+      ],
+      "smallest_workflows": [
+        {
+          "workflow": "Focused Rust",
+          "ref": "#1522 implementation branch after handle resolution exists",
+          "inputs": {
+            "crates": "tidefs-vfs-rpc,tidefs-vfs-engine",
+            "cargo_test_args": "handle"
+          },
+          "expected_artifact": "focused-rust-summary",
+          "artifact_claim": "cargo-unit evidence for scoped transferable-handle rejection only"
+        }
+      ]
+    },
+    {
+      "row_id": "bulk-not-bound",
+      "claim": "Before VFS_RPC binds a live BULK handoff, it rejects or defers REQ_FLAG_BULK_PENDING, RESP_FLAG_BULK, and InlineOrBulk::Bulk descriptors instead of truncating, inlining, or claiming success.",
+      "current_status": "dispatchable-on-current-source",
+      "blocking_issues": [],
+      "smallest_workflows": [
+        {
+          "workflow": "Focused Rust",
+          "ref": "feature branch under test before the #1523 VFS_RPC/BULK integration lands",
+          "inputs": {
+            "crates": "tidefs-vfs-rpc,tidefs-transport",
+            "cargo_test_args": "bulk"
+          },
+          "expected_artifact": "focused-rust-summary",
+          "artifact_claim": "cargo-unit evidence that BULK-not-bound descriptors fail closed at the transport adapter boundary only"
+        }
+      ]
+    },
+    {
+      "row_id": "bulk-bound-tcp",
+      "claim": "After VFS_RPC binds the live TCP_STREAM BULK handoff, VFS_RPC WRITE waits for same-connection BULK DONE before engine dispatch and READ publishes a same-connection BulkToken without treating RDMA or moved bytes as storage semantics proof.",
+      "current_status": "gated",
+      "blocking_issues": [
+        1522,
+        1523
+      ],
+      "smallest_workflows": [
+        {
+          "workflow": "Focused Rust",
+          "ref": "branch that contains the #1522 bridge and #1523 VFS_RPC/BULK integration on top of the merged BULK service surface",
+          "inputs": {
+            "crates": "tidefs-vfs-rpc,tidefs-vfs-engine,tidefs-bulk-service",
+            "cargo_test_args": "bulk"
+          },
+          "expected_artifact": "focused-rust-summary",
+          "artifact_claim": "cargo-unit evidence for TCP_STREAM BulkToken handoff, failed-transfer discard, and retry/op_id interaction only"
+        },
+        {
+          "workflow": "Focused Claim Validation",
+          "ref": "branch carrying the post-BULK evidence manifest",
+          "inputs": {
+            "mode": "validate-evidence-manifest",
+            "artifact_path": "validation/artifacts/vfs-rpc-forwarding/<bulk-bound-artifact>.manifest.json"
+          },
+          "expected_artifact": "workflow summary",
+          "artifact_claim": "schema evidence for a future BULK-bound forwarding artifact; not RDMA, multi-node, release-candidate, or storage semantics authority"
+        }
+      ]
+    }
+  ],
+  "publication_requirements": {
+    "run_url_surface": "PR body or issue comment for #1524",
+    "required_for_each_run": [
+      "workflow run URL",
+      "branch or PR ref under test",
+      "uploaded artifact name or explicit no-upload summary",
+      "exact claim supported by that artifact",
+      "residual non-claims"
+    ],
+    "forbidden_validation_from_this_issue": [
+      "broad QEMU",
+      "xfstests",
+      "RDMA",
+      "kernel",
+      "release-candidate"
+    ]
+  }
+}
