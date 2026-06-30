@@ -515,10 +515,10 @@ mod tests {
         let mut snapshot = SnapshotDelta::new(id(3), b"snap".to_vec(), 1);
         snapshot
             .objects
-            .push(DeltaObject::new([9; 32], ObjectKind::File, vec![1; 16]));
+            .push(DeltaObject::new([9; 32], ObjectKind::Extent, vec![1; 16]));
         snapshot
             .objects
-            .push(DeltaObject::new([8; 32], ObjectKind::File, vec![2; 16]));
+            .push(DeltaObject::new([8; 32], ObjectKind::Extent, vec![2; 16]));
         let builder = SendBuilder::full(header, vec![snapshot]).unwrap();
         let cursor = builder
             .records()
@@ -576,8 +576,8 @@ mod tests {
 
     #[test]
     fn negotiation_reply_must_cover_required_features() {
-        let required = SendFeatureSet::from_names(["org.tidefs.required"]).unwrap();
-        let optional = SendFeatureSet::from_names(["org.tidefs.optional"]).unwrap();
+        let required = SendFeatureSet::from_names(["org.tidefs:required"]).unwrap();
+        let optional = SendFeatureSet::from_names(["org.tidefs:optional"]).unwrap();
         let request =
             FeatureNegotiationRequest::new(required.clone(), optional, SendCompatibility::CURRENT);
         let target = FeatureSupport::new(required, SendCompatibility::CURRENT);
