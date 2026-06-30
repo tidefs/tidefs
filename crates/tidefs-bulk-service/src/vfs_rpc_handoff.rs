@@ -89,6 +89,17 @@ impl VfsRpcBulkDescriptor {
     }
 }
 
+/// Active VFS_RPC descriptor admitted against the same BULK connection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VfsRpcBulkAdmission {
+    pub connection_id: ConnectionId,
+    pub stream_id: StreamId,
+    pub token: BulkToken,
+    pub op_id: OpId,
+    pub handoff: VfsRpcBulkHandoff,
+    pub len: u64,
+}
+
 /// DONE-verified VFS_RPC transfer bytes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VfsRpcBulkCompletion {
@@ -129,6 +140,10 @@ pub enum VfsRpcBulkHandoffError {
         result: BulkAcceptResult,
     },
     MissingAcceptedToken,
+    InactiveDescriptor {
+        connection_id: ConnectionId,
+        token: BulkToken,
+    },
     NonVfsRpcMetadata {
         metadata: BulkMetadata,
     },
@@ -155,6 +170,10 @@ impl fmt::Display for VfsRpcBulkHandoffError {
                 write!(f, "BULK ACCEPT rejected VFS_RPC handoff with {result:?}")
             }
             Self::MissingAcceptedToken => write!(f, "accepted BULK handoff has no BulkToken"),
+            Self::InactiveDescriptor { connection_id, .. } => write!(
+                f,
+                "VFS_RPC BULK descriptor is not active on connection {connection_id}"
+            ),
             Self::NonVfsRpcMetadata { .. } => write!(f, "BULK transfer is not VFS_RPC metadata"),
             Self::UnexpectedVfsRpcMetadata {
                 expected,
@@ -186,6 +205,42 @@ impl From<BulkError> for VfsRpcBulkHandoffError {
 }
 
 impl BulkService {
+    /// Admit a VFS_RPC WRITE descriptor before waiting for DONE or engine dispatch.
+    ///
+    /// This is a read-only same-connection check for the VFS_RPC transport
+    /// adapter: the token must still be active on `connection_id`, carry WRITE
+    /// metadata for `op_id`, and match the descriptor length. Completed or
+    /// aborted transfers are no longer admissible and must be retried with a
+    /// fresh BULK offer/token at the VFS_RPC layer.
+    pub fn admit_vfs_rpc_write_upload(
+        &self,
+        connection_id: ConnectionId,
+        descriptor: VfsRpcBulkDescriptor,
+        op_id: OpId,
+    ) -> Result<VfsRpcBulkAdmission, VfsRpcBulkHandoffError> {
+        self.admit_vfs_rpc_handoff(
+            connection_id,
+            descriptor,
+            op_id,
+            VfsRpcBulkHandoff::WriteUpload,
+        )
+    }
+
+    /// Admit a VFS_RPC READ descriptor before waiting for client-side DONE.
+    pub fn admit_vfs_rpc_read_download(
+        &self,
+        connection_id: ConnectionId,
+        descriptor: VfsRpcBulkDescriptor,
+        op_id: OpId,
+    ) -> Result<VfsRpcBulkAdmission, VfsRpcBulkHandoffError> {
+        self.admit_vfs_rpc_handoff(
+            connection_id,
+            descriptor,
+            op_id,
+            VfsRpcBulkHandoff::ReadDownload,
+        )
+    }
+
     /// Accept a VFS_RPC WRITE upload OFFER on the receiver/writer side.
     pub fn accept_vfs_rpc_write_upload(
         &mut self,
@@ -295,6 +350,58 @@ impl BulkService {
         )?;
         validate_vfs_rpc_completion(completed, check)
     }
+
+    fn admit_vfs_rpc_handoff(
+        &self,
+        connection_id: ConnectionId,
+        descriptor: VfsRpcBulkDescriptor,
+        op_id: OpId,
+        expected_handoff: VfsRpcBulkHandoff,
+    ) -> Result<VfsRpcBulkAdmission, VfsRpcBulkHandoffError> {
+        let (stream_id, metadata, total_len) =
+            active_transfer_for_descriptor(self, connection_id, descriptor)?;
+        let (handoff, op_id) = validate_metadata(metadata, expected_handoff, op_id)?;
+        if descriptor.len != total_len {
+            return Err(VfsRpcBulkHandoffError::LengthMismatch {
+                expected: total_len,
+                actual: descriptor.len,
+            });
+        }
+
+        Ok(VfsRpcBulkAdmission {
+            connection_id,
+            stream_id,
+            token: descriptor.token,
+            op_id,
+            handoff,
+            len: total_len,
+        })
+    }
+}
+
+fn active_transfer_for_descriptor(
+    service: &BulkService,
+    connection_id: ConnectionId,
+    descriptor: VfsRpcBulkDescriptor,
+) -> Result<(StreamId, BulkMetadata, u64), VfsRpcBulkHandoffError> {
+    let inactive = || VfsRpcBulkHandoffError::InactiveDescriptor {
+        connection_id,
+        token: descriptor.token,
+    };
+    let connection = service
+        .connections
+        .get(&connection_id)
+        .ok_or_else(inactive)?;
+    let stream_id = *connection
+        .token_index
+        .get(&descriptor.token)
+        .ok_or_else(inactive)?;
+    let transfer = connection.transfers.get(&stream_id).ok_or_else(inactive)?;
+    Ok((
+        stream_id,
+        transfer.offer.metadata.clone(),
+        transfer.offer.total_len,
+    ))
 }
 
 fn validate_vfs_rpc_completion(
@@ -409,6 +516,21 @@ mod tests {
         let len = payload_len(bytes);
         let accept = service.accept_vfs_rpc_write_upload(7, 11, op_id, len, BulkPriority::Bulk);
         let descriptor = VfsRpcBulkDescriptor::from_accept(&accept, len).unwrap();
+        let admitted = service
+            .admit_vfs_rpc_write_upload(7, descriptor, op_id)
+            .unwrap();
+
+        assert_eq!(
+            admitted,
+            VfsRpcBulkAdmission {
+                connection_id: 7,
+                stream_id: 11,
+                token: descriptor.token,
+                op_id,
+                handoff: VfsRpcBulkHandoff::WriteUpload,
+                len,
+            }
+        );
 
         complete_chunks(&mut service, descriptor.token, bytes);
         let completed = service
@@ -426,6 +548,13 @@ mod tests {
         assert_eq!(completed.handoff, VfsRpcBulkHandoff::WriteUpload);
         assert_eq!(completed.bytes.as_slice(), bytes);
         assert_eq!(service.active_transfer_count(7), 0);
+        assert_eq!(
+            service.admit_vfs_rpc_write_upload(7, descriptor, op_id),
+            Err(VfsRpcBulkHandoffError::InactiveDescriptor {
+                connection_id: 7,
+                token: descriptor.token,
+            })
+        );
     }
 
     #[test]
@@ -452,6 +581,50 @@ mod tests {
             })
         );
         assert_eq!(service.active_transfer_count(7), 0);
+    }
+
+    #[test]
+    fn descriptor_admission_rejects_foreign_connection_op_direction_and_length() {
+        let mut service = service();
+        let accept = service.accept_vfs_rpc_write_upload(7, 16, 88, 3, BulkPriority::Bulk);
+        let descriptor = VfsRpcBulkDescriptor::from_accept(&accept, 3).unwrap();
+
+        assert_eq!(
+            service.admit_vfs_rpc_write_upload(8, descriptor, 88),
+            Err(VfsRpcBulkHandoffError::InactiveDescriptor {
+                connection_id: 8,
+                token: descriptor.token,
+            })
+        );
+        assert_eq!(
+            service.admit_vfs_rpc_write_upload(7, descriptor, 89),
+            Err(VfsRpcBulkHandoffError::OpIdMismatch {
+                expected: 89,
+                actual: 88,
+            })
+        );
+        assert_eq!(
+            service.admit_vfs_rpc_read_download(7, descriptor, 88),
+            Err(VfsRpcBulkHandoffError::UnexpectedVfsRpcMetadata {
+                expected: VfsRpcBulkHandoff::ReadDownload,
+                method: VfsRpcBulkMethod::Write,
+                direction: BulkTransferDirection::WriteUpload,
+            })
+        );
+        assert_eq!(
+            service.admit_vfs_rpc_write_upload(
+                7,
+                VfsRpcBulkDescriptor {
+                    token: descriptor.token,
+                    len: 4,
+                },
+                88,
+            ),
+            Err(VfsRpcBulkHandoffError::LengthMismatch {
+                expected: 3,
+                actual: 4,
+            })
+        );
     }
 
     #[test]
@@ -491,6 +664,13 @@ mod tests {
         assert_eq!(aborted.op_id, 88);
         assert_eq!(aborted.reason, BulkAbortReason::Timeout);
         assert_eq!(service.active_transfer_count(7), 0);
+        assert_eq!(
+            service.admit_vfs_rpc_write_upload(7, descriptor, 88),
+            Err(VfsRpcBulkHandoffError::InactiveDescriptor {
+                connection_id: 7,
+                token: descriptor.token,
+            })
+        );
     }
 
     #[test]

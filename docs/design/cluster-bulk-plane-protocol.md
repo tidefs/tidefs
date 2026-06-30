@@ -686,12 +686,13 @@ Current source status for the #1523 evidence pass:
   `BulkService`/`BulkToken`/`BulkOffer` API, connection-scoped transfer table,
   TCP_STREAM credit/data/DONE/ABORT state machine, CRC32C DONE verification,
   failed-transfer discard behavior, and a BULK-side VFS_RPC handoff helper that
-  binds WRITE/READ metadata, `op_id`, `BulkToken`, and descriptor length before
-  completed bytes may be consumed. It also exposes a typed BULK wire codec for
-  OFFER/ACCEPT/CREDIT/DONE/ABORT frames carried as `service_id = 0x07` DATA
-  service frames, plus a `BulkDataServiceHandler` that maps receiver-side
-  OFFER/CREDIT/DONE/ABORT frames onto the state machine under the
-  authenticated transport session id. The crate is a service surface for
+  admits an active same-connection descriptor before VFS_RPC waits or dispatches
+  and then binds WRITE/READ metadata, `op_id`, `BulkToken`, and descriptor
+  length again before completed bytes may be consumed. It also exposes a typed
+  BULK wire codec for OFFER/ACCEPT/CREDIT/DONE/ABORT frames carried as
+  `service_id = 0x07` DATA service frames, plus a `BulkDataServiceHandler` that
+  maps receiver-side OFFER/CREDIT/DONE/ABORT frames onto the state machine under
+  the authenticated transport session id. The crate is a service surface for
   transport integration; it is not a multi-node product-readiness claim.
 - `apps/tidefs-storage-node/src/protocol.rs` is still an object-store tag
   protocol, not a cluster service_id `0x07` BULK dispatcher.
@@ -706,11 +707,11 @@ Current source status for the #1523 evidence pass:
   an explicit reply sink before DATA service replies can leave the receive
   path.
 
-Until transport dispatch and the VFS_RPC transport adapter wire this BULK-side
-helper into service_id `0x06` request/response handling, VFS_RPC endpoints may
-reject BULK descriptors as unsupported. They must not silently downgrade
-RDMA-capable BULK offers to TCP, claim RDMA readiness, or treat moved bytes as
-storage semantics authority.
+Until transport dispatch and the VFS_RPC transport adapter call this BULK-side
+descriptor-admission and completion helper from service_id `0x06`
+request/response handling, VFS_RPC endpoints may reject BULK descriptors as
+unsupported. They must not silently downgrade RDMA-capable BULK offers to TCP,
+claim RDMA readiness, or treat moved bytes as storage semantics authority.
 
 The remaining implementation blocker outside the BULK service is therefore
 transport/VFS_RPC integration that can dispatch service_id `0x07` frames to the
@@ -736,6 +737,10 @@ Post-codec source status, inspected on 2026-06-30:
   authenticated `TransferBulk` data session, a reply sink, the BULK handler
   instance, the sender coordinator, and the raw TCP chunk I/O for the
   connection before VFS_RPC can rely on service_id `0x07` progress.
+- `crates/tidefs-bulk-service/src/vfs_rpc_handoff.rs` now provides read-only
+  descriptor admission for active WRITE upload and READ download tokens before
+  DONE, and still requires DONE-time metadata, length, and CRC32C verification
+  before bytes can reach a VFS Engine consumer.
 - `crates/tidefs-vfs-rpc/src/transport_adapter.rs` still rejects
   `REQ_FLAG_BULK_PENDING`, `RESP_FLAG_BULK`, and `InlineOrBulk::Bulk` with
   `BulkUnsupported`. Removing that rejection requires a VFS_RPC transport
