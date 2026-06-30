@@ -10,7 +10,8 @@ claim.
 ## Authority Rule
 
 The active entry points are `README.md`, `AGENTS.md`, `docs/LICENSING.md`,
-`docs/REVIEW_TODO_REGISTER.md`, `docs/WHOLE_REPO_REVIEW.md`, and this file.
+`docs/REVIEW_TODO_REGISTER.md`, `docs/WHOLE_REPO_REVIEW.md`,
+`docs/SUCCESSOR_LOCKDOWN_AND_DOC_CONSOLIDATION.md`, and this file.
 
 The active TideFS Book authoring decision is `docs/book/README.adoc`. The
 assembled book source starts at `docs/book/tidefs-book.adoc`; book chapters are
@@ -34,6 +35,13 @@ Use exactly one state when auditing a document:
 - Delete candidate: stale duplicate, obsolete closeout note, or scaffold text
   whose useful content has already moved elsewhere.
 
+Classification notes may also record a document handling role. Evidence-only
+documents record authority evidence, old paths, retired crates, issue
+closeouts, or generated-state inputs without becoming current status surfaces.
+Generated or derived documents are produced from registry/source data and must
+not become hand-authored independent policy. These handling roles do not add
+extra authority states: each document still uses exactly one state above.
+
 ## Review Method
 
 Classify documents in focused commits. Do not mix doc classification with
@@ -45,6 +53,20 @@ source behavior, `validation/claims.toml`, and the claims gate. If that review i
 too large for the current slice, leave the document as historical input and
 record the blocker in `docs/REVIEW_TODO_REGISTER.md` or
 `docs/WHOLE_REPO_REVIEW.md`.
+
+## Successor Lockdown And Documentation Consolidation (#1580)
+
+Classified for TFR-019 / GitHub issue #1580 on 2026-06-30 after reviewing the
+current claim registry, `validation/claims.toml`, the storage-intent policy
+authority, the release-readiness verdict contract, the product-admission proof
+train map, this register, `docs/INDEX.md`, `docs/WHOLE_REPO_REVIEW.md`, and live
+GitHub issue/PR state. This slice adds a current policy guardrail and does not
+classify every imported document, validate any successor claim, or close
+TFR-019.
+
+| Path | State | Classification note |
+|---|---|---|
+| `docs/SUCCESSOR_LOCKDOWN_AND_DOC_CONSOLIDATION.md` | Current policy | Binding guardrail that routes OpenZFS, Ceph, DRBD, local-filesystem successor/comparator wording through `storage.intent.successor_comparator.v1`, separates normal issue/PR validation from product-gate evidence, and makes documentation consolidation a TFR-019 authority-classification workstream. It does not validate the successor comparator claim, declare release or production readiness, classify every imported document, or promote broad historical design material. |
 
 ## Doc-Authority Drift Cleanup Coordination (#952)
 
