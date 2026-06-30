@@ -724,16 +724,18 @@ Post-codec source status, inspected on 2026-06-30:
 - The live BULK crate exports the TCP_STREAM state machine and VFS_RPC handoff
   helper plus `src/protocol.rs`, which encodes/decodes `service_id = 0x07`
   DATA service frames. `src/data_service.rs` provides the receiver-side DATA
-  service handler for OFFER, CREDIT, DONE, and ABORT. Sender-side
-  ACCEPT/CREDIT_GRANT coordination and the raw TCP_STREAM byte handoff remain
-  outside this receiver-side handler.
+  service handler for OFFER, CREDIT, DONE, and ABORT. `src/protocol.rs` also
+  encodes/decodes the raw TCP_STREAM chunk header, and `src/sender.rs`
+  provides the BULK-owned sender-side coordinator that consumes ACCEPT and
+  CREDIT_GRANT responses, emits CREDIT/DONE/ABORT frames, and hands granted
+  TCP chunks to the transport binding.
 - `crates/tidefs-transport/src/control_service_dispatch.rs` remains the
   control-lane service-id path. `crates/tidefs-transport/src/data_service_dispatch.rs`
   is the DATA-endpoint service-id wrapper/registry with a receive-loop
   registration hook. Production callers must still bind that hook to an
-  authenticated `TransferBulk` data session, a reply sink, and the BULK
-  handler instance for the connection before VFS_RPC can rely on service_id
-  `0x07` progress.
+  authenticated `TransferBulk` data session, a reply sink, the BULK handler
+  instance, the sender coordinator, and the raw TCP chunk I/O for the
+  connection before VFS_RPC can rely on service_id `0x07` progress.
 - `crates/tidefs-vfs-rpc/src/transport_adapter.rs` still rejects
   `REQ_FLAG_BULK_PENDING`, `RESP_FLAG_BULK`, and `InlineOrBulk::Bulk` with
   `BulkUnsupported`. Removing that rejection requires a VFS_RPC transport
@@ -832,8 +834,10 @@ The live BULK service crate layout is:
 ```text
 crates/tidefs-bulk-service/
   src/
+    data_service.rs  -- receiver-side DATA service handler and TCP chunk entry point
     lib.rs           -- public API: BulkService, BulkToken, BulkOffer
     protocol.rs      -- service_id 0x07 DATA frame codec (OfferV1, AcceptV1, etc.)
+    sender.rs        -- sender-side ACCEPT/CREDIT_GRANT coordinator
     vfs_rpc_handoff.rs -- VFS_RPC READ/WRITE BulkToken handoff helper
 ```
 

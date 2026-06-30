@@ -20,13 +20,19 @@ use tidefs_transport::{bulk_deadline_default, BULK_CHUNK_SIZE_DEFAULT, MAX_INFLI
 
 pub mod data_service;
 pub mod protocol;
+pub mod sender;
 pub mod vfs_rpc_handoff;
 
 pub use data_service::BulkDataServiceHandler;
 pub use protocol::{
     BulkAbortFrame, BulkAcceptFrame, BulkCreditGrantFrame, BulkCreditRequestFrame,
     BulkCreditResult, BulkDoneFrame, BulkFrame, BulkFrameKind, BulkMethod, BulkOfferFrame,
-    BulkProtocolError, BulkRdmaCredit, VFS_RPC_BULK_METADATA_MAGIC, VFS_RPC_BULK_METADATA_VERSION,
+    BulkProtocolError, BulkRdmaCredit, BulkTcpChunkFrame, VFS_RPC_BULK_METADATA_MAGIC,
+    VFS_RPC_BULK_METADATA_VERSION,
+};
+pub use sender::{
+    BulkSenderAccepted, BulkSenderCoordinator, BulkSenderCreditOutcome, BulkSenderError,
+    BulkSenderResponse,
 };
 pub use vfs_rpc_handoff::{
     VfsRpcBulkAbort, VfsRpcBulkCompletion, VfsRpcBulkDescriptor, VfsRpcBulkHandoff,
@@ -421,6 +427,26 @@ impl BulkService {
             .get_mut(&stream_id)
             .ok_or(BulkError::UnknownToken)?;
         transfer.write_tcp_chunk(token, chunk_seq, offset, payload)
+    }
+
+    /// Write a granted TCP_STREAM chunk identified by its stream header.
+    pub fn write_tcp_chunk_for_stream(
+        &mut self,
+        connection_id: ConnectionId,
+        stream_id: StreamId,
+        chunk_seq: u32,
+        offset: u64,
+        payload: &[u8],
+    ) -> Result<(), BulkError> {
+        let connection = self
+            .connections
+            .get_mut(&connection_id)
+            .ok_or(BulkError::UnknownToken)?;
+        let transfer = connection
+            .transfers
+            .get_mut(&stream_id)
+            .ok_or(BulkError::UnknownToken)?;
+        transfer.write_tcp_chunk(transfer.token, chunk_seq, offset, payload)
     }
 
     /// Verify DONE and retire the token. Failed transfers are discarded.
