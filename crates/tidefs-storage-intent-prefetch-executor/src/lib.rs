@@ -1134,6 +1134,7 @@ pub struct PrefetchExecutorEvidenceRefs {
     pub transport_budget_ref: StorageIntentEvidenceRef,
     pub trust_domain_ref: StorageIntentEvidenceRef,
     pub recovery_degradation_ref: StorageIntentEvidenceRef,
+    pub degraded_visibility_ref: StorageIntentEvidenceRef,
     pub retention_ref: StorageIntentEvidenceRef,
     pub attribution_ref: StorageIntentEvidenceRef,
     pub validation_ref: StorageIntentEvidenceRef,
@@ -1333,6 +1334,7 @@ pub struct PrefetchExecutorTerminalUpdate {
     pub interruption: PrefetchExecutorInterruptionClass,
     pub interruption_ref: StorageIntentEvidenceRef,
     pub result_refusal_ref: StorageIntentEvidenceRef,
+    pub degraded_visibility_ref: StorageIntentEvidenceRef,
     pub evidence_cut: PrefetchExecutorTerminalEvidenceCut,
 }
 
@@ -1346,6 +1348,7 @@ impl Default for PrefetchExecutorTerminalUpdate {
             interruption: PrefetchExecutorInterruptionClass::None,
             interruption_ref: EMPTY_EVIDENCE_REF,
             result_refusal_ref: EMPTY_EVIDENCE_REF,
+            degraded_visibility_ref: EMPTY_EVIDENCE_REF,
             evidence_cut: PrefetchExecutorTerminalEvidenceCut::default(),
         }
     }
@@ -1944,6 +1947,9 @@ pub fn finalize_prefetch_execution(
     if update.result_refusal_ref.is_bound() {
         record.evidence_refs.result_refusal_ref = update.result_refusal_ref;
     }
+    if update.degraded_visibility_ref.is_bound() {
+        record.evidence_refs.degraded_visibility_ref = update.degraded_visibility_ref;
+    }
     record.interruption = update.interruption;
     if update.interruption_ref.is_bound() {
         record.evidence_refs.interruption_ref = update.interruption_ref;
@@ -1971,6 +1977,7 @@ pub fn finalize_prefetch_execution(
         || terminal_result_detail_lacks_feedback_evidence(record, update)
         || terminal_update_lacks_result_refusal_evidence(record, update)
         || terminal_update_lacks_verification_evidence(record, update)
+        || terminal_update_lacks_degraded_visibility_evidence(record, update)
         || terminal_update_lacks_interruption_evidence(record, update)
         || terminal_update_has_inconsistent_interruption(update)
         || terminal_update_lacks_handoff_boundary_evidence(record, update)
@@ -2068,6 +2075,7 @@ fn base_record(input: PrefetchExecutorInput) -> PrefetchExecutorRecord {
                 input.decision.evidence_refs.trust_domain_ref,
             ),
             recovery_degradation_ref: input.admission.recovery_degradation_ref,
+            degraded_visibility_ref: EMPTY_EVIDENCE_REF,
             retention_ref: input.result_detail.retention_ref,
             attribution_ref: input.result_detail.attribution_ref,
             validation_ref: input.result_detail.validation_ref,
@@ -2188,6 +2196,22 @@ fn terminal_update_lacks_verification_evidence(
             update.result_detail.validation_ref,
             StorageIntentEvidenceKind::ValidationArtifact,
         )
+}
+
+fn terminal_update_lacks_degraded_visibility_evidence(
+    record: PrefetchExecutorRecord,
+    update: PrefetchExecutorTerminalUpdate,
+) -> bool {
+    if update.outcome != PrefetchExecutorOutcome::DegradedVisible {
+        return update.degraded_visibility_ref.is_bound();
+    }
+
+    !terminal_ref_in_cut(
+        record,
+        update.evidence_cut,
+        update.degraded_visibility_ref,
+        StorageIntentEvidenceKind::RecoveryDegradationEvidence,
+    )
 }
 
 fn terminal_update_lacks_interruption_evidence(
@@ -2524,6 +2548,11 @@ fn terminal_update_refs_outside_evidence_cut(
         update.evidence_cut,
         update.result_refusal_ref,
         StorageIntentEvidenceKind::ResultRefusalEvidence,
+    ) || terminal_bound_ref_outside_cut(
+        record,
+        update.evidence_cut,
+        update.degraded_visibility_ref,
+        StorageIntentEvidenceKind::RecoveryDegradationEvidence,
     ) || terminal_bound_ref_outside_cut(
         record,
         update.evidence_cut,
@@ -3759,6 +3788,17 @@ mod tests {
             evidence_query_snapshot_ref: record.evidence_refs.evidence_query_snapshot_ref,
             included_refs,
         }
+    }
+
+    fn terminal_evidence_cut_with_degraded_visibility(
+        record: PrefetchExecutorRecord,
+        detail: PrefetchExecutorResultDetail,
+        result_refusal_ref: StorageIntentEvidenceRef,
+        degraded_visibility_ref: StorageIntentEvidenceRef,
+    ) -> PrefetchExecutorTerminalEvidenceCut {
+        let mut cut = terminal_evidence_cut(record, detail, result_refusal_ref);
+        push_terminal_ref(&mut cut.included_refs, degraded_visibility_ref);
+        cut
     }
 
     fn add_initial_feedback_roots(
@@ -6047,6 +6087,109 @@ mod tests {
             );
             assert_record_has_no_authority_claims(rejected);
         }
+    }
+
+    #[test]
+    fn terminal_update_requires_degraded_visibility_root_for_degraded_outcome() {
+        let started = evaluate_prefetch_execution(admitted_input(
+            PrefetchResidencyCandidateClass::BoundedReadahead,
+        ));
+        assert_eq!(started.outcome, PrefetchExecutorOutcome::Started);
+        let degraded_ref = evidence(
+            StorageIntentEvidenceKind::RecoveryDegradationEvidence,
+            RECOVERY,
+        );
+
+        let missing = finalize_prefetch_execution(
+            started,
+            PrefetchExecutorTerminalUpdate {
+                outcome: PrefetchExecutorOutcome::DegradedVisible,
+                evidence_cut: terminal_evidence_cut(
+                    started,
+                    PrefetchExecutorResultDetail::default(),
+                    EMPTY_EVIDENCE_REF,
+                ),
+                ..PrefetchExecutorTerminalUpdate::default()
+            },
+        );
+        assert_eq!(missing.outcome, PrefetchExecutorOutcome::VerificationFailed);
+        assert_eq!(
+            missing.refusal,
+            StorageIntentRefusalReason::ValidationGateFailed
+        );
+        assert_record_has_no_authority_claims(missing);
+
+        let wrong_kind_ref = evidence(StorageIntentEvidenceKind::ActionExecutionEvidence, RECOVERY);
+        let wrong_kind = finalize_prefetch_execution(
+            started,
+            PrefetchExecutorTerminalUpdate {
+                outcome: PrefetchExecutorOutcome::DegradedVisible,
+                degraded_visibility_ref: wrong_kind_ref,
+                evidence_cut: terminal_evidence_cut_with_degraded_visibility(
+                    started,
+                    PrefetchExecutorResultDetail::default(),
+                    EMPTY_EVIDENCE_REF,
+                    wrong_kind_ref,
+                ),
+                ..PrefetchExecutorTerminalUpdate::default()
+            },
+        );
+        assert_eq!(
+            wrong_kind.outcome,
+            PrefetchExecutorOutcome::VerificationFailed
+        );
+        assert_eq!(
+            wrong_kind.refusal,
+            StorageIntentRefusalReason::ValidationGateFailed
+        );
+        assert_record_has_no_authority_claims(wrong_kind);
+
+        let completed_with_degraded_ref = finalize_prefetch_execution(
+            started,
+            PrefetchExecutorTerminalUpdate {
+                outcome: PrefetchExecutorOutcome::Completed,
+                degraded_visibility_ref: degraded_ref,
+                evidence_cut: terminal_evidence_cut_with_degraded_visibility(
+                    started,
+                    PrefetchExecutorResultDetail::default(),
+                    EMPTY_EVIDENCE_REF,
+                    degraded_ref,
+                ),
+                ..PrefetchExecutorTerminalUpdate::default()
+            },
+        );
+        assert_eq!(
+            completed_with_degraded_ref.outcome,
+            PrefetchExecutorOutcome::VerificationFailed
+        );
+        assert_eq!(
+            completed_with_degraded_ref.refusal,
+            StorageIntentRefusalReason::ValidationGateFailed
+        );
+        assert_record_has_no_authority_claims(completed_with_degraded_ref);
+
+        let degraded = finalize_prefetch_execution(
+            started,
+            PrefetchExecutorTerminalUpdate {
+                outcome: PrefetchExecutorOutcome::DegradedVisible,
+                degraded_visibility_ref: degraded_ref,
+                evidence_cut: terminal_evidence_cut_with_degraded_visibility(
+                    started,
+                    PrefetchExecutorResultDetail::default(),
+                    EMPTY_EVIDENCE_REF,
+                    degraded_ref,
+                ),
+                ..PrefetchExecutorTerminalUpdate::default()
+            },
+        );
+        assert_eq!(degraded.outcome, PrefetchExecutorOutcome::DegradedVisible);
+        assert_eq!(
+            degraded.executor_byte_state,
+            PrefetchExecutorByteState::DegradedVisible
+        );
+        assert_eq!(degraded.refusal, StorageIntentRefusalReason::None);
+        assert_eq!(degraded.evidence_refs.degraded_visibility_ref, degraded_ref);
+        assert_record_has_no_authority_claims(degraded);
     }
 
     #[test]
