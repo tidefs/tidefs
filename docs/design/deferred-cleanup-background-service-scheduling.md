@@ -632,7 +632,7 @@ repo authority registers.
 ## 10. References
 
 - [#1929] Canonical deferred‑cleanup design spec — `docs/design/deferred-cleanup-work-queues.md`
-- [#1992] Background service framework coordination seal — `docs/design/background-service-framework-coordination-confirmed.md`
+- [#1992] Retired background-service coordination seal, removed by #1586
 - [#1673] 16‑phase background service roadmap — `docs/design/background-service-framework-design-spec.md`
 - [#1592] Canonical background service design — `docs/design/background-service-framework-design.md`
 - [#1180] Refcount delta cleanup queues — `docs/REFCOUNT_DELTA_CLEANUP_QUEUES_DESIGN.md`

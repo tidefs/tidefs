@@ -1300,98 +1300,13 @@ Important 2026-06-01 findings:
   close runtime adapter rewiring, FUSE, ublk, kernel VFS, RPC, storage,
   placement, rebuild, reclaim, offload, mounted-runtime validation,
   release-readiness, claims-gate closure, or broad TFR-019 debt.
-- `TFR-019`: GitHub issue #1164 classifies
-  `docs/design/coordination-pipeline-health-advancement-strategy.md` as
-  historical input after reviewing the documentation authority register,
-  `docs/INDEX.md`, `docs/GITHUB_PR_DEVELOPMENT.md`, and the file itself. The
-  retained Forgejo labels, lane/blocking claims, deleted `docs/STATUS.md` and
-  `docs/FEATURE_MATRIX.md` references, and health-score/dashboard machinery are
-  archival context only. They are not current TideFS automation policy,
-  implementation status, release-readiness evidence, or worker scheduling
-  authority. TFR-019 remains open for the other unclassified #952
-  status/matrix leftovers and any separate source/evidence review needed before
-  promoting a document to current policy or current spec.
-- `TFR-019`: GitHub issue #1165 classifies
-  `docs/design/coordination-pipeline-status-update.md` as historical input after
-  reviewing the authority register, this TFR-019 note set, the imported #1833
-  design, `docs/INDEX.md`, `docs/GITHUB_PR_DEVELOPMENT.md`, and bounded lineage
-  from the numbered status-update snapshots. The file's `STATUS.md`,
-  `FEATURE_MATRIX.md`, lane-summary, health-score, and Forgejo label machinery
-  are retired design input only; current TideFS coordination remains GitHub
-  issues and pull requests plus the repo documentation entry points. This
-  reduces status/matrix drift but does not classify the numbered status-update
-  snapshots or promote a current automation, implementation-status,
-  release-readiness, or worker-scheduling claim.
-- `TFR-019`: GitHub issue #1174 classifies
-  `docs/design/coordination-pipeline-status-update-1767.md` as historical input
-  after reviewing the authority register, this TFR-019 note set, the imported
-  #1767 status-update snapshot, `docs/INDEX.md`,
-  `docs/GITHUB_PR_DEVELOPMENT.md`, closed lineage issues #952/#1165, and
-  bounded chronology from the main `coordination-pipeline-status-update.md`
-  architecture document and neighboring numbered snapshots. The file's
-  design-spec metadata, `STATUS.md`, `FEATURE_MATRIX.md`,
-  lane-health/status-record machinery, cluster-service implementation-status
-  statements, deferred-wire-up, active-lane gate language, and Forgejo
-  issue/scheduling concepts are retired Forgejo-era snapshot artifacts only;
-  current TideFS coordination remains GitHub issues and pull requests plus the
-  repo documentation entry points. This reduces status/matrix drift but does
-  not newly classify or alter the sibling -1839, -1915, -1954, or -2054
-  snapshots or promote a current automation, implementation-status,
-  release-readiness, worker-scheduling, `STATUS.md`, `FEATURE_MATRIX.md`,
-  lane-health, or product claim.
-- `TFR-019`: GitHub issue #1232 classifies
-  `docs/design/coordination-pipeline-status-update-1839.md` as historical input
-  after reviewing the authority register, this TFR-019 note set, the imported
-  #1839 status-update snapshot, `docs/INDEX.md`,
-  `docs/GITHUB_PR_DEVELOPMENT.md`, closed lineage issues #952/#1164/#1165, the
-  already-classified #1174/#1234/#1236 status-update snapshot rows, bounded
-  chronology from the main `coordination-pipeline-status-update.md` architecture
-  document, and live issue #1233 for the separate 1915 slice. The file's
-  design-spec metadata, `STATUS.md`, `FEATURE_MATRIX.md`,
-  lane-health/status-record machinery, cluster-service implementation-status
-  statements, deferred-wire-up, active-lane gate language, and Forgejo
-  issue/scheduling concepts are retired Forgejo-era snapshot artifacts only;
-  current TideFS coordination remains GitHub issues and pull requests plus the
-  repo documentation entry points. This reduces status/matrix drift but does not
-  classify or alter the -1915, -1767, -1954, or -2054 snapshots, the #1164
-  health-strategy classification, or the #1165 status-update-architecture
-  classification, and it does not promote a current automation,
-  implementation-status, release-readiness, worker-scheduling, `STATUS.md`,
-  `FEATURE_MATRIX.md`, lane-health, or product claim.
-- `TFR-019`: GitHub issue #1233 classifies
-  `docs/design/coordination-pipeline-status-update-1915.md` as historical input
-  after reviewing the authority register, this TFR-019 note set, the imported
-  #1915 status-update snapshot, `docs/INDEX.md`,
-  `docs/GITHUB_PR_DEVELOPMENT.md`, closed lineage issues #952/#1164/#1165, the
-  already-classified #1174/#1232/#1234/#1236 status-update snapshot rows, and
-  bounded chronology from the main `coordination-pipeline-status-update.md`
-  architecture document and neighboring numbered snapshots. The file's
-  design-spec metadata, `STATUS.md`, `FEATURE_MATRIX.md`, lane-health,
-  velocity-assessment, coordinator-proliferation,
-  cluster-service implementation-status, deferred-wire-up, and Forgejo
-  issue/scheduling concepts are retired Forgejo-era snapshot artifacts only;
-  current TideFS coordination remains GitHub issues and pull requests plus the
-  repo documentation entry points. This reduces status/matrix drift but does not
-  classify or alter the -1767, -1839, -1954, or -2054 snapshots, the #1164
-  health-strategy classification, or the #1165 status-update-architecture
-  classification, and it does not promote a current automation,
-  implementation-status, release-readiness, worker-scheduling, `STATUS.md`,
-  `FEATURE_MATRIX.md`, lane-health, or product claim.
-- `TFR-019`: GitHub issue #1234 classifies
-  `docs/design/coordination-pipeline-status-update-1954.md` as historical input
-  after reviewing the authority register, this TFR-019 note set, the imported
-  #1954 status-update snapshot, `docs/INDEX.md`,
-  `docs/GITHUB_PR_DEVELOPMENT.md`, the already-classified #1164 health-strategy
-  and #1165 status-update-architecture rows, and bounded lineage from the main
-  `coordination-pipeline-status-update.md` architecture document. The file's
-  `STATUS.md`, `FEATURE_MATRIX.md`, lane-health, coordinator-proliferation,
-  cluster-service implementation-status, deferred-wire-up, and Forgejo API/label
-  machinery are retired Forgejo-era snapshot artifacts only; current TideFS
-  coordination remains GitHub issues and pull requests plus the repo
-  documentation entry points. This reduces status/matrix drift but does not
-  classify the -1767, -1839, -1915, or -2054 snapshots or promote a current
-  automation, implementation-status, release-readiness, or worker-scheduling
-  claim.
+- `TFR-019`: GitHub issue #1586 deletes the already-classified Forgejo-era
+  coordination health, status-update, and roadmap snapshot files previously
+  covered by #1164, #1165, #1174, #1232, #1233, #1234, #1236, and #1238.
+  Those files were historical input only: their STATUS/FEATURE_MATRIX, lane
+  health, Forgejo issue, implementation-status, release-readiness, and worker
+  scheduling language is retired context, not current TideFS authority. Current
+  coordination remains GitHub issues and pull requests plus active repo docs.
 
 - `TFR-019`: GitHub issue #1152 classifies
   `docs/design/1971-pool-import-export-7-phase-implementation-plan.md` as
@@ -1411,26 +1326,11 @@ Important 2026-06-01 findings:
   current pool import/export spec, product readiness, or broad pool lifecycle
   claim.
 
-- `TFR-019`/`TFR-017`: GitHub issue #1153 classifies
-  `docs/design/coordination-pipeline-cluster-services-design-seal.md` as
-  historical input after reviewing the documentation authority register, this
-  TFR-019/TFR-017 note set, the imported Forgejo #1738 seal, the sibling #1754
-  completion document, closed #931/#875/#928 and PR #930 claim-boundary
-  evidence, bounded source/doc searches, `crates/tidefs-membership-live/`,
-  `crates/tidefs-membership-epoch/`, `crates/tidefs-node-drain/`,
-  `validation/claims.toml`, and `docs/CLAIM_REGISTRY.md`. Live source contains
-  membership, epoch, and drain surfaces, but TFR-017 remains open before
-  multi-node or production cluster claims. The checked claim evidence keeps
-  `distributed.combined_safety.model.v1` planned for bounded source-model
-  invariants and `storage.intent.successor_comparator.v1` blocked for
-  comparator/product wording; it does not validate broad cluster-service,
-  distributed-membership, production distributed-runtime, multi-node, or
-  product-scale capability. The retained "sealed", "design-sealed",
-  "implemented-source", deleted `docs/STATUS.md`/`docs/FEATURE_MATRIX.md`, and
-  3-node cluster wording is historical design-lineage context only. A stronger
-  current-spec treatment would need a separate issue-scoped source and
-  claims-boundary review; the sibling completion document is not classified by
-  this slice.
+- `TFR-019`/`TFR-017`: GitHub issue #1586 also deletes the Forgejo-era
+  cluster-services seal/completion closeout notes previously classified by
+  #1153 and #1293. This does not promote any multi-node, distributed-membership,
+  production distributed-runtime, product-scale, release-readiness, or successor
+  claim; TFR-017 and the claim registry remain the current gate.
 
 - `TFR-019`/`TFR-018`: the current xfstests harness authority slice repairs
   `xfstests-runner` as a diagnostic scoreboard wrapper, and sends output under

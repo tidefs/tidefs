@@ -32,12 +32,10 @@ The review covered the required sources:
 - `docs/design/metadata-engine-parallelism-multi-core-metadata-path.md`
   defines local-node concurrency with in-process directory and extent locks,
   while cluster-wide lock integration is a later lease-aware wrapper.
-- `docs/design/cluster-wide-distributed-lock-service-design.md`,
-  `docs/MEMBERSHIP_SERVICE_DESIGN.md`, and
-  `docs/design/coordination-pipeline-cluster-services-design-seal.md`
-  establish cluster membership, lease, and LOCK services as clustered
-  coordination services, not proof that every local mount operation should
-  call a network-capable service.
+- `docs/design/cluster-wide-distributed-lock-service-design.md` and
+  `docs/MEMBERSHIP_SERVICE_DESIGN.md` establish cluster membership, lease, and
+  LOCK services as clustered coordination services, not proof that every local
+  mount operation should call a network-capable service.
 
 Current source behavior also points to a mode split:
 

@@ -14,7 +14,6 @@ TideFS unified background service framework. It supersedes the following documen
 | `docs/design/background-service-framework-design-enhanced.md` | #1624 | Lifecycle, starvation, backpressure |
 | `docs/design/background-service-framework-multithread-design.md` | #1625 | Multi-threaded work-stealing |
 | `docs/design/background-service-framework-phases-5-10-wire-up-tracking.md` | #1946 | Phases 5–10 per-phase details |
-| `docs/design/background-service-framework-coordination-confirmed.md` | #1992 | Coordination seal |
 
 **Source context:** lane `storage-core`, kind `design`.
 
@@ -807,8 +806,7 @@ For release-candidate or shared-surface changes:
 - [#1858][#1859][#1877][#1980] Coordination seal & status tracking
 - [#1946] Phases 5–10 wire-up tracking →
   `docs/design/background-service-framework-phases-5-10-wire-up-tracking.md`
-- [#1992] Coordination confirmed →
-  `docs/design/background-service-framework-coordination-confirmed.md`
+- [#1992] Retired coordination confirmation, removed by #1586
 - [#1983] This document — canonical consolidation
 - `crates/tidefs-background-scheduler/src/lib.rs` — scheduler implementation (phases 1–4)
 - `crates/tidefs-types-incremental-job-core/src/lib.rs` — `IncrementalJob` trait and types
