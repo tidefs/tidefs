@@ -137,11 +137,11 @@ local and clustered paths only when the local path remains in-process and
 validated as non-regressing for local latency, throughput, and POSIX/block
 semantics.
 
-The clustered POSIX LOCK forwarding boundary is specified in
-`docs/design/clustered-posix-lock-forwarding-boundary.md`. It names the mounted
-clustered owner that supplies committed dataset mount identity, membership
-epoch, term, and LOCK transport while keeping the existing local FUSE/VFS lock
-dispatch in-process.
+The clustered POSIX LOCK forwarding boundary remains future clustered-product
+work. The historical design-lineage file was deleted by #1595; current
+clustered locking work must name the live GitHub issue, source, and validation
+evidence that owns the mounted clustered owner, membership epoch, term, and LOCK
+transport boundary.
 
 ## Data Flow
 

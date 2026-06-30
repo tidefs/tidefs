@@ -15,8 +15,8 @@ whole-product admission.
 TideFS has guardrails around release and product claims (`docs/CLAIMS_GATE_POLICY.md`,
 `docs/UNRELEASED_AUTHORITY_POLICY.md`), a release-candidate evidence index
 (`docs/RELEASE_CANDIDATE_EVIDENCE_CONTRACT.md`), and a performance-gate receipt
-with a `release_ready` field (`docs/PERFORMANCE_BUDGETS_SLO_REGRESSION_GATES_P10-03.md`).
-None of these documents is a whole-product release-readiness verdict. This
+with a gate-local `release_ready` field in `crates/tidefs-validation/src/performance_gate/`.
+None of these surfaces is a whole-product release-readiness verdict. This
 contract:
 
 - names the verdict owner (who decides that TideFS is ready for a release),
@@ -40,11 +40,13 @@ contract:
   not present future capability as current product fact. Scans specific surfaces through
   `xtask check-claims-gate`. Claims are individually validated; no single claim or
   summary row acts as a product admission verdict.
-- `docs/PERFORMANCE_BUDGETS_SLO_REGRESSION_GATES_P10-03.md` (2026-06-24 snapshot):
-  Section 12.12.5 defines `GateReceipt.release_ready` as a gate-local receipt: it
-  requires subject completeness, zero artifact gap, and zero budget gap for the
-  `performance_budget_0` matrix rows. It is a performance-gate admission signal,
-  not a whole-product release-readiness verdict.
+- Deleted P10-03 performance-budget historical design lineage (2026-06-24
+  snapshot): Section 12.12.5 defined `GateReceipt.release_ready` as a
+  gate-local receipt requiring subject completeness, zero artifact gap, and
+  zero budget gap for the `performance_budget_0` matrix rows. The current
+  authority is the performance-gate implementation under
+  `crates/tidefs-validation/src/performance_gate/`; it is a performance-gate
+  admission signal, not a whole-product release-readiness verdict.
 - `docs/GITHUB_CI.md` (current): Describes the Release Candidate workflow as a
   manual-only self-hosted composition of Rust, Nix, QEMU smoke, xfstests, and RDMA
   lanes. The workflow uploads a `release-candidate-evidence-index` JSON artifact
@@ -55,10 +57,11 @@ contract:
   P10-04 gap close.
 - `docs/DOCUMENTATION_AUTHORITY_REGISTER.md` (TFR-019): Classifies existing
   release-facing documents and records the P10-04 missing-doc gap.
-- `docs/DISTRIBUTED_OPERATOR_PRODUCT_SURFACE_BLOCKER_MAP_OW307D.md`: Records six
-  required product properties (runtime source data, source/cut headers,
-  provenance/exactness/freshness, product carrier, render proof, refusal behavior)
-  and states none are satisfied. Classified as Historical input.
+- Deleted OW-307D distributed operator product-surface historical lineage:
+  recorded six required product properties (runtime source data, source/cut
+  headers, provenance/exactness/freshness, product carrier, render proof, and
+  refusal behavior) and stated none were satisfied. Current operator-surface
+  authority is the #1267 decision below plus the open P10-04 truth-surface gap.
 - `README.md` and `AGENTS.md`: TideFS is pre-alpha. Claims must stay behind
   implementation reality. OpenZFS/Ceph-class target is aspirational.
 - Bounded inspection of `crates/tidefs-validation/src/performance_gate/runner.rs`:
@@ -135,9 +138,9 @@ as open gaps in the verdict artifact.
 |---|---|---|
 | Release-candidate evidence index | `docs/RELEASE_CANDIDATE_EVIDENCE_CONTRACT.md`, `release-candidate-evidence-index` artifact | Defined; smoke and full profiles exist; lane-local manifests (issues 643-646) are still absent |
 | Claims gate | `docs/CLAIMS_GATE_POLICY.md`, `validation/claims.toml`, `xtask check-claims-gate` | Enforced; individual claims validated; no product-admission claim exists |
-| Performance budget gate | `crates/tidefs-validation/src/performance_gate/`, `GateReceipt`; historical design input in `docs/PERFORMANCE_BUDGETS_SLO_REGRESSION_GATES_P10-03.md` | Gate-local `release_ready` implemented; minimum suite families remain incomplete |
+| Performance budget gate | `crates/tidefs-validation/src/performance_gate/`, `GateReceipt`; deleted P10-03 historical design lineage | Gate-local `release_ready` implemented; minimum suite families remain incomplete |
 | Standing CI gate | `docs/GITHUB_CI.md`, Rust Fast, Nix Checks, Clippy, Secret Policy | Active on self-hosted runners; path-filtered for docs-only PRs |
-| Operator truth surfaces | `docs/DASHBOARDS_TRACES_OPERATOR_TRUTH_SURFACES_P10-04.md` (missing), `docs/DISTRIBUTED_OPERATOR_PRODUCT_SURFACE_BLOCKER_MAP_OW307D.md` (historical input) | P10-04 document does not exist; OW-307D blocker map records six unsatisfied properties |
+| Operator truth surfaces | `docs/DASHBOARDS_TRACES_OPERATOR_TRUTH_SURFACES_P10-04.md` (missing), deleted OW-307D historical blocker-map lineage, `docs/OPERATOR_PRODUCT_SURFACE_DECISION.md` | P10-04 document does not exist; #1267 records that no runtime-fed operator product surface exists |
 | Operator UAPI authority | `docs/OPERATOR_UAPI_AUTHORITY.md` | Pre-alpha command boundary is closed, but it does not create a runtime-fed product carrier |
 | Transport/cluster authority | TFR-017 | Open; no current transport authority document |
 | Unreleased authority | `docs/UNRELEASED_AUTHORITY_POLICY.md` | Current policy; enforced in review |
@@ -201,7 +204,7 @@ by #1279 and are not listed as future follow-ups.
 
 | Issue | Expected write set | Scope |
 |---|---|---|
-| #1283 | `crates/tidefs-validation/src/performance_gate/runner.rs`, `crates/tidefs-validation/src/performance_gate/consolidation.rs`, `xtask/tidefs-xtask/src/main.rs`, `docs/PERFORMANCE_BUDGETS_SLO_REGRESSION_GATES_P10-03.md` | Rename P10-03 `release_ready` to `perf_gate_ready` or equivalent and update `GateReceipt::render_markdown()` so the field name and rendered label are both gate-local. Update P10-03 prose and any inline comments. |
+| #1283 | `crates/tidefs-validation/src/performance_gate/runner.rs`, `crates/tidefs-validation/src/performance_gate/consolidation.rs`, `xtask/tidefs-xtask/src/main.rs`, performance-gate generated/inline documentation | Rename performance-gate `release_ready` to `perf_gate_ready` or equivalent and update `GateReceipt::render_markdown()` so the field name and rendered label are both gate-local. Update any inline comments and generated-facing prose owned by that implementation slice. |
 | #1284 | `docs/DOCUMENTATION_AUTHORITY_REGISTER.md` | Add rows for the release-facing evidence-input documents named by this contract. This slice adds the contract row only; the remaining classification rows are deferred to this focused follow-up. |
 
 ## Non-Overlap with #1270

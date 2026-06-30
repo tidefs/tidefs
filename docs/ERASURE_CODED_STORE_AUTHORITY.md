@@ -29,15 +29,16 @@ This authority covers:
 This authority does not cover EC encode/decode mathematics, the GF(2^8)
 Reed-Solomon engine in `tidefs-erasure-coding`, the XOR single-parity model in
 `tidefs-replication-model`, or the TideCRUSH placement algorithm specified in
-`docs/ERASURE_CODING_PLACEMENT_DESIGN.md`. Those are upstream contracts that
-the EC store consumes; this document only decides the store-level authority
-boundaries.
+deleted erasure-coding placement historical design lineage. Those are upstream
+contracts that the EC store consumes; this document only decides the
+store-level authority boundaries.
 
 ## Evidence Reviewed
 
 - `docs/ERASURE_CODED_LAYOUT_OW306.md` — current single-parity XOR model spec
-- `docs/ERASURE_CODING_PLACEMENT_DESIGN.md` — TideCRUSH placement, erasure
-  family catalog, recovery loop orchestration, and integration contracts
+- Deleted erasure-coding placement historical design lineage: TideCRUSH
+  placement, erasure family catalog, recovery loop orchestration, and
+  integration contracts.
 - `docs/LOCAL_DISTRIBUTED_RECEIPT_AUTHORITY.md` — placement receipt model,
   write/repair/read/reclaim flows, receipt format with erasure policy support
 - `crates/tidefs-erasure-coded-store/` — current local EC store runtime:
@@ -89,10 +90,10 @@ placement-planner and receipt authority that replicated paths use.
 
 Rationale:
 
-- The existing placement design (`ERASURE_CODING_PLACEMENT_DESIGN.md`)
-  specifies TideCRUSH as the deterministic placement function for all
-  redundancy policies, including erasure coding. Having the EC store own a
-  parallel placement truth would fork the placement authority.
+- Deleted erasure-coding placement historical design lineage specified
+  TideCRUSH as the deterministic placement function for all redundancy
+  policies, including erasure coding. Having the EC store own a parallel
+  placement truth would fork the placement authority.
 - The `PlacementReceipt` format already encodes erasure policy targets
   (`data_shards + parity_shards`), and the receipt read path already describes
   erasure reads with shard-digest verification and reconstruction. This is
@@ -161,8 +162,8 @@ Rationale:
 - Broader repair orchestration (a node failure affects many stripes across
   many objects) must consume the placement planner to select new targets and
   the receipt system to publish replacement receipts. This exceeds the EC
-  store's local scope and belongs to the recovery loop orchestrator described
-  in `ERASURE_CODING_PLACEMENT_DESIGN.md` section 5.
+  store's local scope and belongs to the recovery loop orchestrator lineage
+  described by the deleted erasure-coding placement design.
 - The EC store provides the per-stripe rebuild primitive; the orchestrator
   schedules, dispatches, and throttles.
 
@@ -256,9 +257,9 @@ worked sequentially or by non-overlapping owners.
    primitive. Expected write set: `crates/tidefs-pool/`,
    `crates/tidefs-erasure-coded-store/`.
 
-4. **Recovery loop orchestrator**: Implement the recovery loop described in
-   `ERASURE_CODING_PLACEMENT_DESIGN.md` section 5: member-failure stripe
-   enumeration, TideCRUSH re-placement, repair job dispatch, and throttling.
+4. **Recovery loop orchestrator**: Implement the deleted erasure-coding
+   placement design lineage for member-failure stripe enumeration, TideCRUSH
+   re-placement, repair job dispatch, and throttling.
    Expected write set: new crate or
    `crates/tidefs-recovery-orchestrator/`, `crates/tidefs-erasure-coded-store/`
    (repair primitive).
@@ -269,9 +270,9 @@ worked sequentially or by non-overlapping owners.
    `crates/tidefs-replication-model/` (profile records),
    `crates/tidefs-erasure-coded-store/` (profile consumption).
 
-6. **Background scrub for EC**: Implement the periodic scrub cycle described
-   in `ERASURE_CODING_PLACEMENT_DESIGN.md` section 5.1 trigger 2: enumerate
-   stripes, verify shard checksums, enqueue repair. Expected write set:
+6. **Background scrub for EC**: Implement the deleted erasure-coding placement
+   design lineage for periodic EC scrub: enumerate stripes, verify shard
+   checksums, and enqueue repair. Expected write set:
    `crates/tidefs-erasure-coded-store/` (scrub entry point), new or existing
    background task infrastructure.
 
@@ -290,7 +291,7 @@ before implementation depends on them:
 - Whether to add an async encode queue (deferred pending throughput
   benchmarks).
 - Whether TideCRUSH placement should be cached or computed per-read (open
-  question 1 in `ERASURE_CODING_PLACEMENT_DESIGN.md`).
+  question 1 in deleted erasure-coding placement historical design lineage).
 - Whether the recovery loop uses cooperative or preemptive scheduling (open
   question 3).
 - Whether the erasure profile catalog should be compile-time or runtime
@@ -301,7 +302,8 @@ before implementation depends on them:
 ## References
 
 - `docs/ERASURE_CODED_LAYOUT_OW306.md` — XOR single-parity layout model
-- `docs/ERASURE_CODING_PLACEMENT_DESIGN.md` — TideCRUSH and recovery loop design
+- Deleted erasure-coding placement historical design lineage: TideCRUSH and
+  recovery loop design
 - `docs/LOCAL_DISTRIBUTED_RECEIPT_AUTHORITY.md` — receipt authority model
 - `docs/workspace-package-classification.md` — crate classification
 - `crates/tidefs-erasure-coded-store/` — current EC store runtime

@@ -47,13 +47,25 @@ as claim-status authority.
 
 ## Successor And Comparator Wording
 
-The publishing-facing successor and comparator boundary is
-`storage.intent.successor_comparator.v1` in `validation/claims.toml`. Until
-that claim validates with current evidence manifests, TideFS docs, release
-notes, generated claim text, operator output, issue closeouts, and PR summaries
-must not say or imply that TideFS is a successor, replacement, superior
-alternative, or comparator-performance winner against OpenZFS, Ceph, DRBD, or
-local filesystems.
+The publishing-facing successor and comparator boundary is split across three
+blocked claim ids in `validation/claims.toml`:
+
+- `storage.intent.successor_comparator.v1` is the umbrella boundary for broad
+  successor, superiority, DRBD/local-filesystem, or comparator-performance
+  wording.
+- `storage.local.openzfs_class_successor_comparator.v1` is the local
+  OpenZFS-class boundary for pool, filesystem, snapshot, device lifecycle,
+  integrity, crash-recovery, and local-performance wording.
+- `storage.distributed.ceph_class_successor_comparator.v1` is the distributed
+  Ceph-class boundary for multi-node placement, membership, transport,
+  recovery, object/block behavior, geo/WAN behavior, and distributed
+  performance.
+
+Until the relevant exact claim validates with current evidence manifests,
+TideFS docs, release notes, generated claim text, operator output, issue
+closeouts, and PR summaries must not say or imply that TideFS is a successor,
+replacement, superior alternative, or comparator-performance winner against
+OpenZFS, Ceph, DRBD, or local filesystems.
 
 Allowed wording may describe ambition and target class, blocked claim ids and
 missing evidence, historical design inputs from incumbent systems, or bounded
@@ -68,14 +80,19 @@ Disallowed wording includes:
   statements without a verdict artifact owned by
   `docs/RELEASE_READINESS_VERDICT_CONTRACT.md`.
 
-The successor comparator claim remains blocked until the registry-required
-evidence classes are present and current, including:
+The umbrella successor comparator claim remains blocked until both split claim
+ids validate and the registry-required umbrella evidence classes are present
+and current, including:
 
-- `storage-intent-comparator-equivalence-evidence`;
-- `storage-intent-successor-performance-fault-set`;
+- `local-openzfs-class-successor-claim-validation`;
+- `distributed-ceph-class-successor-claim-validation`;
 - `storage-intent-successor-claim-boundary-review`;
-- `storage-intent-operator-explanation-evidence`;
 - `claims-gate-review`.
+
+The local and distributed split claims each have their own comparator,
+proof-train, performance/fault, operator-explanation, and claims-gate evidence
+classes. Evidence for one split claim must not be reused as permission for the
+other without an explicit matching manifest and claim validation.
 
 Normal implementation PRs need the focused validation named by their GitHub
 issue; they do not prove the whole successor claim. Product-facing comparator

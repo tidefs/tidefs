@@ -565,26 +565,84 @@ evidence_artifacts = []
 [[claims]]
 id = "storage.intent.successor_comparator.v1"
 status = "blocked"
-scope = "explicit OpenZFS, Ceph, DRBD, local-filesystem successor or comparator-performance wording for storage-intent behavior"
+scope = "umbrella boundary for explicit OpenZFS-class, Ceph-class, DRBD, local-filesystem successor, superiority, or comparator-performance wording"
 required_evidence_classes = [
-  "storage-intent-comparator-equivalence-evidence",
-  "storage-intent-successor-performance-fault-set",
+  "local-openzfs-class-successor-claim-validation",
+  "distributed-ceph-class-successor-claim-validation",
   "storage-intent-successor-claim-boundary-review",
-  "storage-intent-operator-explanation-evidence",
   "claims-gate-review",
 ]
 evidence_requirements = [
-  { class = "storage-intent-comparator-equivalence-evidence", path = "validation/artifacts/storage-intent/successor-comparator-equivalence.json", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/successor-comparator-equivalence.manifest.json", blocking_issues = ["#850", "#912", "#913", "#915", "#928"] },
-  { class = "storage-intent-successor-performance-fault-set", path = "validation/artifacts/storage-intent/successor-performance-fault-set.json", validation_tier = "multi-process-distributed", manifest_path = "validation/artifacts/storage-intent/successor-performance-fault-set.manifest.json", blocking_issues = ["#846", "#850", "#863", "#900", "#904"] },
-  { class = "storage-intent-successor-claim-boundary-review", path = "validation/artifacts/storage-intent/successor-claim-boundary-review.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/successor-claim-boundary-review.manifest.json", blocking_issues = ["#841", "#843", "#844", "#845", "#848", "#855", "#856", "#862", "#874", "#878", "#880", "#905", "#920", "#926"] },
-  { class = "storage-intent-operator-explanation-evidence", path = "validation/artifacts/storage-intent/successor-operator-explanation.json", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/successor-operator-explanation.manifest.json", blocking_issues = ["#849", "#901", "#902", "#903", "#913", "#920"] },
-  { class = "claims-gate-review", path = "validation/artifacts/storage-intent/successor-comparator-claims-gate-review.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/successor-comparator-claims-gate-review.manifest.json", blocking_issues = ["#875"] },
+  { class = "local-openzfs-class-successor-claim-validation", path = "validation/artifacts/successor/local-openzfs-class-successor-claim-validation.json", validation_tier = "source-model", manifest_path = "validation/artifacts/successor/local-openzfs-class-successor-claim-validation.manifest.json", blocking_issues = ["#1594"] },
+  { class = "distributed-ceph-class-successor-claim-validation", path = "validation/artifacts/successor/distributed-ceph-class-successor-claim-validation.json", validation_tier = "source-model", manifest_path = "validation/artifacts/successor/distributed-ceph-class-successor-claim-validation.manifest.json", blocking_issues = ["#1594"] },
+  { class = "storage-intent-successor-claim-boundary-review", path = "validation/artifacts/storage-intent/successor-claim-boundary-review.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/successor-claim-boundary-review.manifest.json", blocking_issues = ["#841", "#843", "#844", "#845", "#848", "#855", "#856", "#862", "#874", "#878", "#880", "#905", "#920", "#926", "#1594"] },
+  { class = "claims-gate-review", path = "validation/artifacts/storage-intent/successor-comparator-claims-gate-review.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/successor-comparator-claims-gate-review.manifest.json", blocking_issues = ["#875", "#1594"] },
 ]
 blockers = [
-  "Comparator equivalence #928, performance #850, fault #863, attribution #912, evidence-query #913, service-objective #915, transport #846, media capability #904, and recovery/degradation #900 evidence must match the exact workload, media, topology, failure, and cost envelope.",
-  "Policy receipts #841, placement #843, media/wear #844, prediction #845, relocation #848, policy config #855, cost #856, scheduler #862, satisfaction #874, data-shape #878, layout #880, decision frontier #905, result/refusal #920, and preflight #926 boundaries must be claim-ready before successor wording can consume them.",
-  "Operator explanation #849, rollout #901, tenant isolation #902, temporal #903, evidence-query #913, and result/refusal #920 evidence must expose residual limitations, refusals, degraded-visible states, and non-comparable envelopes.",
-  "Non-claim boundary: naming OpenZFS, Ceph, DRBD, local filesystems, an average throughput win, a benchmark class, or a row label is not product-language permission without a validated claim for the exact scope.",
+  "Umbrella successor wording must not validate until `storage.local.openzfs_class_successor_comparator.v1` and `storage.distributed.ceph_class_successor_comparator.v1` are independently validated for their exact scopes.",
+  "Product-spine issue #1594 must define the admission map tying local OpenZFS-class evidence, distributed Ceph-class evidence, DRBD/local-filesystem comparator wording, and storage-intent claim boundaries to source-backed gates.",
+  "Policy receipts #841, placement #843, media/wear #844, prediction #845, relocation #848, policy config #855, cost #856, scheduler #862, satisfaction #874, data-shape #878, layout #880, decision frontier #905, result/refusal #920, and preflight #926 boundaries must be claim-ready before umbrella successor wording can consume them.",
+  "Non-claim boundary: naming OpenZFS, Ceph, DRBD, local filesystems, an average throughput win, a benchmark class, or a row label is not product-language permission without a validated split claim for the exact scope.",
 ]
-generated_doc = "Blocked storage-intent successor/comparator claim. Future wording must prove comparator equivalence, matched performance and fault evidence, attribution, operator explanation, and every consumed storage-intent claim boundary before TideFS may use explicit OpenZFS, Ceph, DRBD, local-filesystem successor, superiority, or comparator-performance wording."
+generated_doc = "Blocked umbrella storage successor/comparator claim. Future wording must validate both the local OpenZFS-class and distributed Ceph-class successor/comparator claims, plus every consumed storage-intent boundary, before TideFS may use broad OpenZFS, Ceph, DRBD, local-filesystem successor, superiority, or comparator-performance wording."
+evidence_artifacts = []
+
+[[claims]]
+id = "storage.local.openzfs_class_successor_comparator.v1"
+status = "blocked"
+scope = "local OpenZFS-class successor or comparator wording for pool, filesystem, snapshot, device lifecycle, integrity, crash recovery, and local performance behavior"
+required_evidence_classes = [
+  "local-openzfs-comparator-equivalence-evidence",
+  "local-storage-durability-recovery-proof-train",
+  "local-storage-capacity-snapshot-device-proof-train",
+  "local-storage-performance-fault-set",
+  "local-operator-explanation-evidence",
+  "claims-gate-review",
+]
+evidence_requirements = [
+  { class = "local-openzfs-comparator-equivalence-evidence", path = "validation/artifacts/successor/local-openzfs-comparator-equivalence.json", validation_tier = "source-model", manifest_path = "validation/artifacts/successor/local-openzfs-comparator-equivalence.manifest.json", blocking_issues = ["#850", "#912", "#913", "#915", "#928", "#1594"] },
+  { class = "local-storage-durability-recovery-proof-train", path = "validation/artifacts/successor/local-storage-durability-recovery-proof-train.json", validation_tier = "qemu-guest", manifest_path = "validation/artifacts/successor/local-storage-durability-recovery-proof-train.manifest.json", blocking_issues = ["#841", "#842", "#894", "#900", "#920", "#1594"] },
+  { class = "local-storage-capacity-snapshot-device-proof-train", path = "validation/artifacts/successor/local-storage-capacity-snapshot-device-proof-train.json", validation_tier = "qemu-guest", manifest_path = "validation/artifacts/successor/local-storage-capacity-snapshot-device-proof-train.manifest.json", blocking_issues = ["#843", "#844", "#848", "#855", "#856", "#878", "#880", "#881", "#898", "#1594"] },
+  { class = "local-storage-performance-fault-set", path = "validation/artifacts/successor/local-storage-performance-fault-set.json", validation_tier = "qemu-guest", manifest_path = "validation/artifacts/successor/local-storage-performance-fault-set.manifest.json", blocking_issues = ["#850", "#863", "#904", "#912", "#913", "#915", "#1594"] },
+  { class = "local-operator-explanation-evidence", path = "validation/artifacts/successor/local-operator-explanation-evidence.json", validation_tier = "source-model", manifest_path = "validation/artifacts/successor/local-operator-explanation-evidence.manifest.json", blocking_issues = ["#849", "#901", "#902", "#903", "#913", "#920", "#1594"] },
+  { class = "claims-gate-review", path = "validation/artifacts/successor/local-openzfs-class-claims-gate-review.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/successor/local-openzfs-class-claims-gate-review.manifest.json", blocking_issues = ["#875", "#1594"] },
+]
+blockers = [
+  "Local OpenZFS-class wording needs comparator equivalence #928, performance #850, attribution #912, evidence-query #913, and service-objective #915 evidence for the exact local media, topology, workload, feature set, and failure envelope.",
+  "Durability, ordering, recovery, and result/refusal evidence from #841, #842, #894, #900, and #920 must prove local crash/replay behavior before local successor wording can consume storage-intent receipts.",
+  "Capacity, snapshot, device lifecycle, data-shape, layout, and media evidence from #843, #844, #848, #855, #856, #878, #880, #881, #898, and #904 must be current and tied to local proof trains rather than imported design prose.",
+  "Operator explanation #849, rollout #901, tenant isolation #902, temporal #903, evidence-query #913, and result/refusal #920 evidence must expose residual limitations and refusals for the local claim scope.",
+  "Non-claim boundary: a local benchmark win, pool-placement test, snapshot demo, checksum design, or device-lifecycle row does not prove OpenZFS-class local successor status.",
+]
+generated_doc = "Blocked local OpenZFS-class successor/comparator claim. Future wording must prove local comparator equivalence, durability and recovery, capacity/snapshot/device lifecycle, performance and fault behavior, and operator explanation evidence before TideFS may claim local OpenZFS-class successor, superiority, or comparator-performance status."
+evidence_artifacts = []
+
+[[claims]]
+id = "storage.distributed.ceph_class_successor_comparator.v1"
+status = "blocked"
+scope = "distributed Ceph-class successor or comparator wording for multi-node placement, membership, transport, recovery, object/block behavior, geo/WAN behavior, and distributed performance"
+required_evidence_classes = [
+  "distributed-ceph-comparator-equivalence-evidence",
+  "distributed-storage-membership-transport-proof-train",
+  "distributed-storage-placement-recovery-proof-train",
+  "distributed-storage-performance-fault-set",
+  "distributed-operator-explanation-evidence",
+  "claims-gate-review",
+]
+evidence_requirements = [
+  { class = "distributed-ceph-comparator-equivalence-evidence", path = "validation/artifacts/successor/distributed-ceph-comparator-equivalence.json", validation_tier = "source-model", manifest_path = "validation/artifacts/successor/distributed-ceph-comparator-equivalence.manifest.json", blocking_issues = ["#750", "#846", "#850", "#912", "#913", "#915", "#928", "#1594"] },
+  { class = "distributed-storage-membership-transport-proof-train", path = "validation/artifacts/successor/distributed-storage-membership-transport-proof-train.json", validation_tier = "multi-process-distributed", manifest_path = "validation/artifacts/successor/distributed-storage-membership-transport-proof-train.manifest.json", blocking_issues = ["#750", "#846", "#855", "#903", "#904", "#1594"] },
+  { class = "distributed-storage-placement-recovery-proof-train", path = "validation/artifacts/successor/distributed-storage-placement-recovery-proof-train.json", validation_tier = "multi-process-distributed", manifest_path = "validation/artifacts/successor/distributed-storage-placement-recovery-proof-train.manifest.json", blocking_issues = ["#843", "#848", "#874", "#878", "#880", "#900", "#901", "#902", "#920", "#1594"] },
+  { class = "distributed-storage-performance-fault-set", path = "validation/artifacts/successor/distributed-storage-performance-fault-set.json", validation_tier = "multi-process-distributed", manifest_path = "validation/artifacts/successor/distributed-storage-performance-fault-set.manifest.json", blocking_issues = ["#850", "#863", "#900", "#912", "#913", "#915", "#1594"] },
+  { class = "distributed-operator-explanation-evidence", path = "validation/artifacts/successor/distributed-operator-explanation-evidence.json", validation_tier = "source-model", manifest_path = "validation/artifacts/successor/distributed-operator-explanation-evidence.manifest.json", blocking_issues = ["#849", "#901", "#902", "#903", "#913", "#920", "#1594"] },
+  { class = "claims-gate-review", path = "validation/artifacts/successor/distributed-ceph-class-claims-gate-review.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/successor/distributed-ceph-class-claims-gate-review.manifest.json", blocking_issues = ["#875", "#1594"] },
+]
+blockers = [
+  "Distributed Ceph-class wording needs comparator equivalence #928, performance #850, attribution #912, evidence-query #913, service-objective #915, membership #750, and transport #846 evidence for the exact cluster, media, workload, topology, and failure envelope.",
+  "Membership, transport, policy, temporal, and media evidence from #750, #846, #855, #903, and #904 must prove the distributed control plane before distributed successor wording can consume storage-intent receipts.",
+  "Placement, relocation, satisfaction, data-shape, layout, recovery/degradation, rollout, tenant isolation, and result/refusal evidence from #843, #848, #874, #878, #880, #900, #901, #902, and #920 must cover partitions, stale replicas, degraded reads, repair, rebalance, and refusal behavior.",
+  "Performance #850 and fault #863 rows must cover multi-node and WAN/geo envelopes without using RDMA-only, no-fault, cache-hit, or local-only rows as distributed product permission.",
+  "Non-claim boundary: a protocol design, transport probe, simnet row, object/block adapter demo, or Ceph-named comparison label does not prove Ceph-class distributed successor status.",
+]
+generated_doc = "Blocked distributed Ceph-class successor/comparator claim. Future wording must prove distributed comparator equivalence, membership and transport, placement and recovery, multi-node performance and fault behavior, and operator explanation evidence before TideFS may claim distributed Ceph-class successor, superiority, or comparator-performance status."
 evidence_artifacts = []

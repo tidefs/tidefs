@@ -54,8 +54,9 @@ focused validation, and claim evidence.
   authority.
 - `docs/TRANSPORT_CLUSTER_AUTHORITY.md`, because WAN and replicated objectives
   must consume path, epoch, and fencing evidence instead of assuming RDMA.
-- `docs/UNIFIED_RESOURCE_GOVERNOR_DESIGN.md`, because queue, memory, CPU, and
-  background-work budgets must be visible service-objective inputs.
+- Deleted unified-resource-governor historical lineage, because queue, memory,
+  CPU, and background-work budgets must still be visible service-objective
+  inputs backed by live source or validation evidence.
 
 The required `~/ai/docs` searches found no additional service-objective
 process document beyond the general TideFS and Nexus workflow rules.

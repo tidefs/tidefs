@@ -76,6 +76,38 @@ moved or the file is obsolete scaffold/closeout material; keep deleted-path
 lineage in git, issues, and PRs instead of preserving a live register row for
 every deleted file.
 
+## Second-Wave Deletion Coordination (#1595)
+
+Issue #1595 is the second consolidation wave for live-looking Markdown sprawl.
+It deletes stale root design/status/plan documents, stale ADR snapshots, old
+troubleshooting/security notes, and most `docs/design/**` imported design
+material whose current value is already represented by source, validation
+artifacts, claim registry entries, this authority register, or live GitHub
+issues and pull requests.
+
+Deleted files from this wave must not be restored only to preserve provenance.
+Their lineage is git history, issue #1595, and the owning PR. Current docs that
+still need the deleted material should cite the surviving source-backed
+authority, generated registry, live issue, or evidence artifact instead of a
+deleted Markdown path. Gate-owned historical docs and files owned by active
+non-overlapping PRs remain live until a focused issue retargets their checks or
+the owning PR lands.
+
+The same wave tightens `check-doc-authority-drift` so unclassified Markdown
+that self-describes as current, implemented, design-law, design-policy, or
+current authority fails closed. The following existing docs are classified
+only for the narrow live scope reviewed here:
+
+| Path | State | Classification note |
+|---|---|---|
+| `docs/CAPACITY_ACCOUNTING_AUTHORITY.md` | Current spec | Scoped TFR-007 boundary decision for mounted capacity/accounting ownership: local-filesystem `CapacityAuthority`, `tidefs-space-accounting`, and type-core counters own mounted admission/statfs/accounting semantics while lower allocators, object-store counters, cleanup, dedup, inode, adapter, and operator surfaces are inputs or projections. It does not implement runtime behavior, close TFR-007, prove quota/reclaim completeness, or validate product capacity claims. |
+| `docs/ERASURE_CODED_STORE_AUTHORITY.md` | Current spec | Scoped GitHub issue #748 authority decision for `crates/tidefs-erasure-coded-store` placement, read-path, rebuild, and write-path boundaries relative to pool placement, receipts, and recovery orchestration. The named authority path is not a validated product claim; EC placement/rebuild/runtime proof remains blocked by the implementation and validation evidence named in that document. |
+| `docs/KERNEL_MODULE_BUILD_REQUIREMENTS.md` | Current policy | Binding only as the out-of-tree TideFS kernel-module build policy for the supported Linux 7.0 baseline, required kernel config, Rust/LLVM toolchain, warning flags, Kbuild invocation, and local/QEMU validation commands. It is not kernel-resident storage authority, module runtime proof, ABI freeze, or product-readiness evidence. |
+| `docs/KERNEL_RESIDENCY_AUTHORITY.md` | Current spec | Scoped TFR-009 / #1288 authority decision for the current tiered kernel-residency boundary and follow-up map. It records bounded evidence-scoped kernel residency and explicit non-claims; it does not replace `docs/KERNEL_RESIDENT_POOL_ENGINE_ARCHITECTURE.md`, validate full-kernel/no-daemon storage parity, close `kernel.teardown.no_work_after.v1`, or prove production kernel-resident storage. |
+| `docs/NEXTGEN_VERIFICATION_EVIDENCE_CHAIN_AUTHORITY.md` | Current policy | Binding TFR-021 / #751 evidence-chain owner decision: `validation/claims.toml` remains the editable claim registry, `xtask validate-claim <id>` remains claim-status authority, `docs/CLAIM_REGISTRY.md` remains generated output, and evidence producers must feed common manifests rather than parallel registries. It does not validate new claims or close crash, performance, adapter, kernel, distributed, RDMA, or offload evidence gaps. |
+| `docs/PAGE_CACHE_WRITEBACK_AUTHORITY.md` | Current spec | Scoped TFR-008 / #511 / #1065 authority boundary for page-cache dirty state, writeback, fsync/syncfs/msync barriers, invalidation interaction, and crash recovery ordering. It keeps `local.vfs.page_cache_writeback_authority.v1` blocked until mounted writeback, mmap coherency, no-hidden-queue, and broader durability evidence exist. |
+| `docs/security/pool-encryption-secret-handle-boundary.md` | Current spec | Scoped implemented-source record for the `tidefs-encryption::secret_handle` committed mount-token and key-lease boundary with unit evidence. It is not mounted local-filesystem encryption, transform authority closure, production security hardening, or end-to-end mounted encryption proof. |
+
 ## Folded Claim And Consolidation Bridge (#1588)
 
 Issue #1588 folded the temporary claim/consolidation bridge into existing

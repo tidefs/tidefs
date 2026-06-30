@@ -187,7 +187,8 @@ warning or a Kbuild failure blocks the PR.
 
 ## References
 
-- [k7-kbuild-toolchain.md](k7-kbuild-toolchain.md): toolchain preparation
-- [KERNEL_MODULE_DEVELOPMENT_WORKFLOW_P7-05.md](KERNEL_MODULE_DEVELOPMENT_WORKFLOW_P7-05.md): kernel-source development loop
+- Deleted k7-kbuild-toolchain historical note: toolchain preparation lineage
+- `docs/KERNEL_MODULE_DEVELOPMENT_WORKFLOW_P7-05.md`: kernel-source
+  development loop
 - [crates/tidefs-kmod-posix-vfs/Kbuild](../crates/tidefs-kmod-posix-vfs/Kbuild)
 - [crates/tidefs-block-kmod/Kbuild](../crates/tidefs-block-kmod/Kbuild)

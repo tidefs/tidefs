@@ -17,12 +17,11 @@ It answers one concrete question:
 Nix into the per-edit full-kernel rebuild loop, while still keeping Nix and
 QEMU as the reproducible acceptance authority?**
 
-See also:
-
-- `docs/KERNEL_MODULE_FAMILY_MATRIX_ROLLOUT_ORDER_P7-01.md`
-- `docs/RUST_FOR_LINUX_CRATE_TRAIT_BOUNDARIES_P7-02.md`
-- `docs/KERNEL_LOCKING_RCU_PINNING_WORKQUEUE_MODEL_P7-03.md`
-- `docs/LINUX_7_0_BASELINE_CONTRACT_SUPPORTED_SUBSYSTEMS_P0-01.md`
+See also `docs/KERNEL_RESIDENCY_AUTHORITY.md`,
+`docs/KERNEL_RESIDENT_POOL_ENGINE_ARCHITECTURE.md`, `docs/GITHUB_CI.md`, and
+the relevant `kmod/` and kernel-crate READMEs. The old P7 rollout, Rust for
+Linux trait-boundary, locking/RCU/workqueue, and Linux-baseline lineage files
+were historical inputs and were deleted by #1595.
 
 ## 1. Decision
 

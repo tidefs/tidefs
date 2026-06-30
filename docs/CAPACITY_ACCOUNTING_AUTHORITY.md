@@ -41,10 +41,10 @@ mirrors.
 - `docs/REVIEW_TODO_REGISTER.md`: TFR-007 records the live split across
   allocation, quotas, `statfs`, reserves, logical/physical counters, reclaim,
   obligation ledgers, and store-layer persistence.
-- `docs/SPACE_ACCOUNTING_MODEL_DESIGN.md`: separates logical admission from
-  physical allocator pressure, defines `DatasetSpaceCountersV1`, `SpaceDelta`,
-  `PoolPhysicalCountersV1`, space domains, and POSIX `statfs` rules.
-- `docs/SNAPSHOT_DEADLIST_PINNING_DESIGN.md` and
+- Deleted space-accounting historical design lineage: separated logical
+  admission from physical allocator pressure, defined dataset/pool counter and
+  delta vocabulary, space domains, and POSIX `statfs` rules.
+- Deleted snapshot-deadlist historical design lineage and
   `docs/LOCAL_SNAPSHOTS_OW108.md`: snapshot-pinned bytes are separately
   observable and must not be double-counted in POSIX `statfs`; snapshot
   reclaim remains tied to lifecycle pins, deadlists, and placement/rebuild
@@ -206,7 +206,7 @@ recorded as non-claims.
 
 | Slice | Issue | Expected write set | Sequencing and acceptance |
 |---|---|---|---|
-| Scope overclaim cleanup | #857 | `crates/tidefs-block-allocator/README.md`, `crates/tidefs-block-allocator/src/lib.rs` docs/comments only | Narrow allocator wording to physical placement, transactional reservation/fencing, and lower free-space input. |
+| Scope overclaim cleanup | #857 | `crates/tidefs-block-allocator/README.md`, `crates/tidefs-block-allocator/src/lib.rs` documentation comments only | Narrow allocator wording to physical placement, transactional reservation/fencing, and lower free-space input. |
 | Adapter facade retirement | #858 | `apps/tidefs-posix-filesystem-adapter-daemon/src/capacity/` and adapter tests that import it | Delete or further quarantine the test-only `CapacityFacade`, admission lifecycle, and tracker so release code cannot consume an adapter-local capacity API. |
 | Operator capacity projection | #859 | `apps/tidefsctl/src/commands/dataset.rs` and focused CLI tests/docs only | Make `dataset list` report authority-derived used/available fields instead of mixing `statfs` availability with unset `used`. |
 | Dataset quota input bridge | #860 | `crates/tidefs-dataset-properties/` plus focused property-resolution tests | Expose resolved `space.quota` as a typed authority input. Runtime enforcement in local filesystem/space-accounting is a separate gated row. |

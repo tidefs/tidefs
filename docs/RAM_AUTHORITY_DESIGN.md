@@ -64,9 +64,10 @@ canonical storage-intent authority on the default branch.
 - `docs/TRANSPORT_CLUSTER_AUTHORITY.md`: transport owns session-local mechanics
   and evidence, while membership/runtime own roster, epoch, and fencing
   decisions.
-- `docs/UNIFIED_RESOURCE_GOVERNOR_DESIGN.md`: daemon memory must be admitted
-  and explained through one budget authority rather than hidden per-subsystem
-  buffers.
+- Deleted unified-resource-governor historical lineage: daemon memory must
+  still be admitted and explained through visible budget evidence rather than
+  hidden per-subsystem buffers, but future work must cite live source,
+  validation artifacts, or GitHub issues for the concrete governor authority.
 
 The required `~/ai/docs` searches found no additional RAM-authority-specific
 process document beyond the general TideFS and Nexus workflow rules.

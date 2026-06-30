@@ -21,20 +21,14 @@ surface, widen publishing claims, or preselect a runtime carrier.
   Registered claims are filesystem-scoped (crash safety, rename atomicity,
   page-cache writeback, kernel teardown, distributed combined safety
   model). The combined safety claim is bounded model-check evidence only.
-- `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`:
-  `docs/DISTRIBUTED_OPERATOR_PRODUCT_SURFACE_BLOCKER_MAP_OW307D.md` is
-  classified as Historical input. The register states the parent OW-307
-  gate remains open and a runtime-fed operator product surface is not yet
-  present.
-- `docs/DISTRIBUTED_OPERATOR_PRODUCT_SURFACE_BLOCKER_MAP_OW307D.md`:
-  Records typed distributed operator truth rows (OW-307A), deterministic
-  demo rows (OW-307B), summary rows (OW-307C), and source/cut/provenance/
-  exactness/freshness headers (OW-307E) as implementation-tracked
-  non-release building blocks. Explicitly states that deterministic demo
-  output is not a production operator product. Lists six required product
-  properties (runtime source data, source/cut headers,
-  provenance/exactness/freshness, product carrier, render proof, refusal
-  behavior) and records that none are satisfied.
+- `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`: the old OW-307D distributed
+  operator product-surface blocker map was classified as Historical input and
+  deleted by #1595. Its useful current conclusion survives here: no
+  runtime-fed operator product surface is present yet, deterministic demo
+  output is not a production operator product, and future work must prove
+  runtime source data, source/cut headers, provenance/exactness/freshness,
+  product carrier, render proof, and refusal behavior before claiming such a
+  surface.
 - `docs/DASHBOARDS_TRACES_OPERATOR_TRUTH_SURFACES_P10-04.md`: **Does not
   exist in the repository.** Referenced by OW-307D as the production truth
   grammar and by at least ten other documents as the truth-surface law
@@ -62,16 +56,10 @@ surface, widen publishing claims, or preselect a runtime carrier.
   deterministic demo rows do not prove a production operator surface.
 - Bounded `rg` inspection for `DASHBOARDS_TRACES_OPERATOR_TRUTH_SURFACES`,
   `truth_view`, runtime-fed operator surfaces, render receipts, and
-  product carriers: The P10-04 document is referenced by
-  `docs/RECEIPT_RESPONSE_RUNTIME_EMISSION_PATH_P3-03.md`,
-  `docs/MEMBERSHIP_PLACEMENT_FAILURE_DOMAIN_MODEL_P8-02.md`,
-  `docs/PERFORMANCE_BUDGETS_SLO_REGRESSION_GATES_P10-03.md`,
-  `docs/FAULT_INJECTION_CHAOS_CORRUPTION_CAMPAIGNS_P10-02.md`,
-  `docs/RUST_FOR_LINUX_CRATE_TRAIT_BOUNDARIES_P7-02.md`,
-  `docs/UPGRADE_FAILOVER_CUTOVER_OPERATOR_RUNBOOKS_P9-03.md`,
-  `docs/WORKSPACE_FAMILY_LAYOUT_CRATE_SERVICE_BOUNDARIES_P1-01.md`,
-  `docs/OPERATOR_MANUAL_DYNAMIC_TUNING_AND_REALTIME_OBSERVABILITY.md`, and
-  deleted scrub/repair/resilver historical lineage docs.
+  product carriers: the missing P10-04 document was referenced by deleted
+  receipt-response, membership, performance, Rust-for-Linux, operator manual,
+  and scrub/repair/resilver historical lineage plus surviving P10-02,
+  P9-03, and P1-01 material.
   All references treat it as an existing law document; none of them
   reproduce its content. The `truth_view` glyph appears as the OW-307
   identifier across these documents.

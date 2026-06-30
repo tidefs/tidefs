@@ -19,10 +19,13 @@ The core rule is:
 
 Successor and comparator claims may consume storage-intent work only after the
 consumed surface records its own boundary, non-claims, evidence, and refusal
-behavior. Media names, cache tiers, RAM-fast paths, remote placement, prefetch
-success, RDMA availability, latency rows, and background reclaim state do not
-upgrade an operation into a durability, availability, freshness, or successor
-claim.
+behavior. The umbrella claim `storage.intent.successor_comparator.v1` remains
+blocked behind the split local
+`storage.local.openzfs_class_successor_comparator.v1` and distributed
+`storage.distributed.ceph_class_successor_comparator.v1` claim ids. Media
+names, cache tiers, RAM-fast paths, remote placement, prefetch success, RDMA
+availability, latency rows, and background reclaim state do not upgrade an
+operation into a durability, availability, freshness, or successor claim.
 
 Data shape belongs in that same contract. Record size, compression, checksum
 suite, dedup scope, encryption boundary, erasure shape, coalescing, and rebake
@@ -1034,11 +1037,11 @@ visible until converged or retired.
 ## Result, Refusal, And Caller Projection
 
 #920 owns the storage-intent result/refusal evidence projection. It does not
-promote `docs/RECEIPT_RESPONSE_RUNTIME_EMISSION_PATH_P3-03.md` beyond its
-historical-input classification or replace any current response/refusal runtime
-successor. Instead, it is the storage-intent outcome record that the response
-or refusal runtime consumes when a write, read, fsync, FUA, placement decision,
-relocation action, operator request, or retry becomes caller-visible.
+promote the deleted P3-03 receipt-response runtime-emission historical lineage
+or replace any current response/refusal runtime successor. Instead, it is the
+storage-intent outcome record that the response or refusal runtime consumes
+when a write, read, fsync, FUA, placement decision, relocation action, operator
+request, or retry becomes caller-visible.
 
 `docs/STORAGE_INTENT_RESULT_REFUSAL_EVIDENCE_DESIGN.md` is the focused #920
 model record for this boundary.
@@ -3897,6 +3900,12 @@ Hard laws:
   attribution, #915 service objectives, #849 explanations, #863 fault rows, or
   #875 claim ids may support OpenZFS/Ceph/DRBD successor or
   performance-superiority wording.
+- Local OpenZFS-class wording must validate
+  `storage.local.openzfs_class_successor_comparator.v1`; distributed
+  Ceph-class wording must validate
+  `storage.distributed.ceph_class_successor_comparator.v1`. The umbrella
+  `storage.intent.successor_comparator.v1` claim is not a shortcut around
+  either split proof train.
 - A faster result against a weaker incumbent mode, disabled safety feature,
   different failure domain, warmer cache, lower fill/fragmentation state, lower
   durability, weaker ordering, absent fsyncdir coverage, easier recovery state,
@@ -4139,8 +4148,9 @@ This document composes existing authority surfaces:
 - `docs/PAGE_CACHE_WRITEBACK_AUTHORITY.md`: page cache is not durable truth;
   fsync may be satisfied only by committed storage, durable replayable intent,
   or a future equivalent receipt authority.
-- `docs/INTENT_LOG_SYNC_WRITE_LATENCY_PC008.md`: bounded sync replies require
-  durable replayable intent or full commit.
+- Deleted intent-log sync-write latency historical lineage: bounded sync
+  replies require durable replayable intent or full commit, backed by live
+  source and validation evidence.
 - `docs/LOCAL_DISTRIBUTED_RECEIPT_AUTHORITY.md`: placement receipts are durable
   locator authority and must drive reads, rebuild, and reclaim.
 - `docs/POOL_WIDE_REDUNDANCY_PLACEMENT_CONTRACT.md`: pool-wide placement and
@@ -4163,24 +4173,20 @@ This document composes existing authority surfaces:
   local snapshot and send/receive authority inform #881, including their
   still-open placement, reclaim, deadlist, distributed replication, and
   incremental-resume gaps.
-- `docs/SNAPSHOT_DEADLIST_PINNING_DESIGN.md`,
-  `docs/RECEIVE_STREAM_MERGE_POLICY.md`, and
-  `docs/DATASET_LIFECYCLE_DESIGN.md`: deadlist, receive-base, and dataset
-  lifecycle material inform #881, but historical or issue-scoped wording is not
-  broad storage-intent lifecycle authority until live source, issue, and claim
-  authority say so.
-- `docs/SPACEMAP_ALLOCATOR_DESIGN.md`,
-  `docs/SPACE_ACCOUNTING_MODEL_DESIGN.md`,
-  `docs/LOCAL_STORAGE_ALLOCATOR_OW102.md`,
+- Deleted snapshot-deadlist, receive-merge, and dataset-lifecycle historical
+  lineage informs #881 only through git history and issue closeouts; broad
+  storage-intent lifecycle authority still requires live source, issue, and
+  claim authority.
+- `docs/LOCAL_STORAGE_ALLOCATOR_OW102.md`,
   `docs/ALLOCATOR_RECLAIM_FREE_SPACE_SCHEMA_FAMILY_P2-02.md`, and
-  `docs/LOCAL_OBJECT_STORE_ON_DISK_FORMAT.md`: allocator, space accounting,
-  segment, reclaim, and object-store material inform #880, but historical or
-  unclassified design wording is not current storage-intent evidence until live
-  source, issue, and claim authority say so.
-- `docs/DEVICE_LAYOUT_POLICIES_DESIGN.md` and
-  `docs/design/device-layout-policies-adaptive-segment-sizing.md`: media class
-  and device segment sizing are placement inputs; storage intent owns the
-  workload-facing record/extent/stripe shape policy that uses those inputs.
+  `docs/LOCAL_OBJECT_STORE_ON_DISK_FORMAT.md`, plus deleted spacemap and
+  space-accounting historical lineage: allocator, space accounting, segment,
+  reclaim, and object-store material inform #880, but historical or
+  unclassified design wording is not current storage-intent evidence until
+  live source, issue, and claim authority say so.
+- Deleted device-layout historical lineage: media class and device segment
+  sizing are placement inputs; storage intent owns the workload-facing
+  record/extent/stripe shape policy that uses those inputs.
 - Dataset property and mount-profile authorities are policy sources. Storage
   intent owns the compiled cross-source policy snapshot consumed by ack,
   placement, relocation, and explanation paths; it does not replace the
@@ -4193,10 +4199,11 @@ This document composes existing authority surfaces:
   operation scope, VFS/namespace authority refs, namespace intent, fsyncdir,
   metadata locality, directory/xattr/ACL locality, small-object shape, metadata
   write amplification, and typed metadata refusal. It composes
-  `docs/VFS_ENGINE_API_CONTRACT.md`, `docs/INODE_NAMESPACE_AUTHORITY.md`,
-  #688 namespace revision work, #894 ordering, #842 ack receipts, #878 data
-  shape, #920 result/refusal, and cost/wear evidence without replacing VFS
-  semantics, inode identity authority, adapter caches, or response grammar.
+  deleted VFS-engine API-contract historical lineage,
+  `docs/INODE_NAMESPACE_AUTHORITY.md`, #688 namespace revision work, #894
+  ordering, #842 ack receipts, #878 data shape, #920 result/refusal, and
+  cost/wear evidence without replacing VFS semantics, inode identity
+  authority, adapter caches, or response grammar.
 - #750 owns the membership authority decision for epoch identity, quorum-write
   dispatch, witness-set role, join/drain lifecycle, and epoch/fence enforcement;
   storage intent consumes those evidence refs and must not originate a parallel
@@ -4329,9 +4336,9 @@ This document composes existing authority surfaces:
 - `docs/MEMBERSHIP_CONFIG_QUORUM_SET_IDENTITY_OW302B.md`: scoped current spec
   for deterministic quorum-set identity; it is input to #750 and storage-intent
   membership evidence, not a full membership service claim.
-- `docs/MEMBERSHIP_SERVICE_DESIGN.md` and
-  `docs/MEMBERSHIP_PLACEMENT_FAILURE_DOMAIN_MODEL_P8-02.md`: historical input
-  for #750; useful for semantics, but not broad current authority by themselves.
+- `docs/MEMBERSHIP_PLACEMENT_FAILURE_DOMAIN_MODEL_P8-02.md` and deleted
+  membership-service historical lineage are inputs for #750; useful for
+  semantics, but not broad current authority by themselves.
 - `docs/POOL_WIDE_REDUNDANCY_PLACEMENT_CONTRACT.md` and
   `docs/LOCAL_DISTRIBUTED_RECEIPT_AUTHORITY.md`: scoped current specs for
   receipt-backed placement. Storage intent may consume their receipt refs but
@@ -4343,32 +4350,35 @@ This document composes existing authority surfaces:
   while membership/runtime own epoch, fencing, and roster decisions.
 - `docs/CACHE_TAXONOMY_INVARIANTS_P4-02.md`: caches are not authority; RAM
   authority must be modeled explicitly.
-- `docs/UNIFIED_RESOURCE_GOVERNOR_DESIGN.md`: admission, dirty debt, transport
-  queues, and memory budgets are hard gates for any optimizer.
-- #893 and `docs/UNIFIED_RESOURCE_GOVERNOR_DESIGN.md`: per-dataset memory
-  partitioning and governor pressure are source evidence for #902 isolation, but
-  storage intent owns the cross-resource policy question of whether an admitted
-  action is fair, borrowed, throttled, or refused for the current receipt.
-- `docs/SPACE_ACCOUNTING_MODEL_DESIGN.md`, `docs/SPACEMAP_ALLOCATOR_DESIGN.md`,
-  `docs/LOCAL_STORAGE_ALLOCATOR_OW102.md`, and the claim/reserve ledger crates:
-  quota, statfs, allocator, pending-free, allocation-ticket, claim, and reserve
-  evidence inform #898, but storage intent consumes typed refs instead of
-  originating a parallel capacity authority.
-- `docs/design/unified-scheduling-classes-lane-priority-model.md`: storage
-  intent maps onto the shared lane vocabulary for admission, dispatch,
-  starvation prevention, and pressure throttling.
+- Deleted unified-resource-governor historical lineage: admission, dirty debt,
+  transport queues, and memory budgets remain hard gates for any optimizer, but
+  current authority must come from live source, validation, and issue state.
+- #893 and deleted unified-resource-governor historical lineage: per-dataset
+  memory partitioning and governor pressure are source evidence for #902
+  isolation, but storage intent owns the cross-resource policy question of
+  whether an admitted action is fair, borrowed, throttled, or refused for the
+  current receipt.
+- `docs/LOCAL_STORAGE_ALLOCATOR_OW102.md` and the claim/reserve ledger crates,
+  plus deleted space-accounting and spacemap historical lineage: quota, statfs,
+  allocator, pending-free, allocation-ticket, claim, and reserve evidence inform
+  #898, but storage intent consumes typed refs instead of originating a
+  parallel capacity authority.
+- Deleted unified-scheduling-class historical lineage: storage intent maps onto
+  shared lane vocabulary for admission, dispatch, starvation prevention, and
+  pressure throttling only when live scheduler/admission source and validation
+  evidence provide that vocabulary.
 - `docs/BACKGROUND_SERVICE_FRAMEWORK_DESIGN.md`: relocation, repair, rebuild,
   scrub, compaction, and geo catch-up use the shared job/scheduler vocabulary
   when they are not serving a foreground or critical policy risk.
-- `docs/POLICY_AUTHORITY_RUNTIME_SURFACE_P3-01.md`,
+- Deleted policy-authority runtime-surface historical lineage,
   `docs/PREVIEW_UAPI_ABI_BOUNDARY_OW202.md`, and
   `docs/UPGRADE_FAILOVER_CUTOVER_OPERATOR_RUNBOOKS_P9-03.md`: policy publish,
   dataset/property mutation visibility, dry-run, stage, commit, verify, and
   rollback grammar are inputs to #855/#901/#926; storage intent consumes their
   refs instead of inventing a second operator runbook engine.
-- `docs/PERFORMANCE_BUDGETS_SLO_REGRESSION_GATES_P10-03.md`: performance
-  truth requires workload envelopes, service-objective contracts, KPIs, budgets,
-  and receipts.
+- Deleted performance-budget historical lineage: performance truth requires
+  workload envelopes, service-objective contracts, KPIs, budgets, and receipts
+  backed by current performance-gate source and validation artifacts.
 - `docs/FAULT_INJECTION_CHAOS_CORRUPTION_CAMPAIGNS_P10-02.md` (including
   section 13, storage-intent fault validation matrix per #863): fault,
   corruption, partition, and recovery campaigns must name fault classes,
@@ -4628,7 +4638,7 @@ this document except to update the issue map after live tickets exist.
 | Relocation governor | #848 | new relocation/optimizer crate or existing background-service integration | Unify defrag, compaction, rebake, metadata repack, directory-index compaction, rebuild, evacuation, geo catch-up, wear movement, #915 service objectives, #913 query snapshots, media-capability gates, metadata/namespace gates, decision-frontier, action-execution, result/refusal, measurement-attribution, and evidence-retention evidence, reserve admission, recovery/degradation predicates, shadow evaluation, payback, and cooldown. |
 | Result/refusal caller evidence | #920 | storage-intent core/result model, response-registry integration docs or code, adapter/result tests | Bind typed storage-intent outcomes to policy/query/decision/receipt refs, degraded-visible state, response-registry projection, errno/block/API/trace compression, retryability, delivery/index refs, and retention/audit proof. |
 | Operator explanation UAPI | #849 | `apps/tidefsctl/`, operator docs | Explain policy, rollout stage, preflight simulation, receipts, service objective, result/refusal projection, evidence-query snapshot, lag/timebase, media capability, metadata/namespace state, decision frontier, action execution, measurement attribution, comparator evidence and refusal, evidence retention, volatility, placement, trust/domain state, capacity/reserve state, recovery/degradation state, isolation/throttle state, prediction outcome, and wear to operators. |
-| Performance intent gates | #850 | `docs/PERFORMANCE_BUDGETS_SLO_REGRESSION_GATES_P10-03.md`, `crates/tidefs-performance-contract/`, validation matrix | Add rows for ack latency, metadata storm, fsyncdir, lookup/readdir, small-object shape, throughput, tail, service-objective envelope consistency, result/refusal projection, evidence-query consistency, media-capability role legality, decision-frontier preservation, preflight-simulation fidelity, action-execution safety, measurement-attribution safety, comparator-equivalence safety, evidence-retention safety, trust/domain changes, temporal freshness/lag, capacity admission, recovery/degradation, policy rollout, tenant isolation, prediction accuracy, signal-materialization overhead, wear, cost, RPO, and relocation. |
+| Performance intent gates | #850 | current performance-gate source, validation matrix, and deleted performance-budget historical lineage | Add rows for ack latency, metadata storm, fsyncdir, lookup/readdir, small-object shape, throughput, tail, service-objective envelope consistency, result/refusal projection, evidence-query consistency, media-capability role legality, decision-frontier preservation, preflight-simulation fidelity, action-execution safety, measurement-attribution safety, comparator-equivalence safety, evidence-retention safety, trust/domain changes, temporal freshness/lag, capacity admission, recovery/degradation, policy rollout, tenant isolation, prediction accuracy, signal-materialization overhead, wear, cost, RPO, and relocation. |
 | Storage intent fault validation | #863 | `docs/FAULT_INJECTION_CHAOS_CORRUPTION_CAMPAIGNS_P10-02.md` section 13, storage-intent validation matrix/config docs | Prove ack, placement, metadata/namespace, service-objective consistency, result/refusal preservation, evidence-query consistency, media capability, decision-frontier, preflight-simulation non-authority, action-execution, measurement-attribution, comparator-equivalence refusal, evidence-retention, trust/domain, temporal freshness/lag, capacity/reserve, recovery/degradation, policy rollout, tenant isolation, prediction accountability, signal-materialization safety, relocation, RAM, scheduler, and WAN promises under typed faults and forbidden-outcome checks. See P10-02 section 13 for the full row-family catalog, fault-class inventory, and forbidden-outcome checklist. |
 | Storage intent claims gate | #875 | `validation/claims.toml`, generated `docs/CLAIM_REGISTRY.md`, focused claims-gate tests if needed | Register planned/blocked claim ids and evidence boundaries for storage-intent successor, performance, durability, metadata/namespace, service-objective envelope consistency, result/refusal preservation, evidence-query consistency, media-capability role eligibility, decision-frontier accountability, preflight-simulation non-claim proof, action-execution safety, measurement-attribution safety, comparator-equivalence safety, evidence-retention safety, temporal lag/freshness, recovery/degradation, policy rollout, tenant isolation, adaptive prediction, RAM, WAN, and wear promises. |
 

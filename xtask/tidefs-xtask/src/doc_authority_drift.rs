@@ -47,6 +47,26 @@ const STALE_AUTHORITY_MARKERS: &[&str] = &[
     "single consolidated canonical design specification",
 ];
 
+const UNCLASSIFIED_LIVE_AUTHORITY_MARKERS: &[&str] = &[
+    "Maturity: **implemented-source**",
+    "Maturity: implemented-source",
+    "Maturity: **implemented**",
+    "Maturity: implemented",
+    "Maturity: **design-law**",
+    "Maturity: design-law",
+    "Maturity: **design-policy**",
+    "Maturity: design-policy",
+    "Maturity: **current policy**",
+    "Maturity: current policy",
+    "Maturity: current authority",
+    "Status: current design authority",
+    "Status: design authority",
+    "Status: design decision",
+    "Status: implemented",
+    "current authority document",
+    "current design authority",
+];
+
 #[derive(Debug)]
 pub struct DocAuthorityDriftError {
     violations: Vec<String>,
@@ -235,6 +255,16 @@ fn scan_doc(
                 if line.contains(marker) {
                     violations.insert(format!(
                         "{rel_path}:{line_number}: stale authority marker `{marker}` in live Markdown doc; classify the file as historical input in {DOCUMENTATION_AUTHORITY_REGISTER}, delete/fold it, or replace the marker with current source-backed authority wording"
+                    ));
+                }
+            }
+        }
+
+        if scan_mode == ScanMode::AuthorityMarkersOnly {
+            for marker in UNCLASSIFIED_LIVE_AUTHORITY_MARKERS {
+                if line.contains(marker) {
+                    violations.insert(format!(
+                        "{rel_path}:{line_number}: unclassified live-authority marker `{marker}` in Markdown doc; classify the file in {DOCUMENTATION_AUTHORITY_REGISTER}, delete/fold it, or replace the marker with historical/non-claim wording"
                     ));
                 }
             }
@@ -972,6 +1002,39 @@ Retired scaffold roots include `tidefs-old-core`.
         assert!(rendered.contains("stale authority marker `Maturity: **design-spec**`"));
         assert!(rendered.contains("docs/live.md:2"));
         assert!(rendered.contains("stale authority marker `This document closes Forgejo issue`"));
+    }
+
+    #[test]
+    fn unclassified_live_authority_marker_is_reported() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_minimal_authority(temp.path(), "");
+        write_file(
+            temp.path(),
+            "docs/new-operator-surface.md",
+            "Maturity: **implemented-source** developer guide.\n",
+        );
+
+        let err = check_workspace_root(temp.path()).expect_err("unclassified live marker");
+        let rendered = err.to_string();
+        assert!(rendered.contains("docs/new-operator-surface.md:1"));
+        assert!(rendered
+            .contains("unclassified live-authority marker `Maturity: **implemented-source**`"));
+    }
+
+    #[test]
+    fn classified_current_spec_may_use_scoped_live_authority_marker() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_minimal_authority(
+            temp.path(),
+            "| `docs/live.md` | Current spec | fixture. |\n",
+        );
+        write_file(
+            temp.path(),
+            "docs/live.md",
+            "Maturity: **implemented** with scoped source evidence.\n",
+        );
+
+        check_workspace_root(temp.path()).expect("classified current spec marker is scoped");
     }
 
     #[test]

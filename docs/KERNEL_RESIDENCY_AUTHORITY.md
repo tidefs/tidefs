@@ -65,20 +65,21 @@ For present authority, the boundary is narrower:
 
 This decision reviewed the evidence named by issue #1288:
 
-- `docs/REVIEW_TODO_REGISTER.md` TFR-008, TFR-009, TFR-010, TFR-011,
-  TFR-017, TFR-018, and TFR-019 notes.
+- `docs/REVIEW_TODO_REGISTER.md` TFR-008, TFR-009, TFR-010, TFR-017, and
+  TFR-019 notes, plus current operator-UAPI and transform/security authority
+  docs that supersede retired review-register lineage labels.
 - `docs/KERNEL_RESIDENT_POOL_ENGINE_ARCHITECTURE.md`, which remains the target
   architecture and evidence-tier map.
 - `docs/KERNEL_TEARDOWN_RUNTIME_EVIDENCE_DECISION.md`, whose T5/T6 model is
   still the teardown tiering vocabulary even though #1186 / PR #1463 has since
   accepted the T5 mounted-kernel cutover/teardown artifact.
-- `docs/KERNEL_MODULE_FAMILY_MATRIX_ROLLOUT_ORDER_P7-01.md` as historical
-  design input for rollout-order constraints; it is not current evidence.
+- Deleted kernel-module family rollout-order historical design lineage as
+  input for rollout-order constraints; it is not current evidence.
 - `docs/PAGE_CACHE_WRITEBACK_AUTHORITY.md` and
   `docs/PAGE_CACHE_INVALIDATION_AUTHORITY.md`, which own TFR-008 dirty data,
   writeback, mmap, and invalidation boundaries that kernel residency must
   consume rather than redefine.
-- `docs/STD_NO_STD_KERNEL_USERSPACE_BOUNDARY_RULES_P1-02.md`, as historical
+- Deleted std/no_std kernel-userspace boundary historical design lineage, as
   input for environment-boundary rules; current authority classification stays
   with `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`.
 - `crates/tidefs-kmod-posix-vfs/README.md` and
@@ -94,9 +95,10 @@ This decision reviewed the evidence named by issue #1288:
 - Live issue #825 and PR #1189, which closed on 2026-06-23 by establishing
   `tidefs-kernel-cutover-runtime` as current source/model authority and
   leaving mounted runtime evidence to #1186.
-- `docs/VFS_BLOCK_INTEGRATION_KERNEL_UAPI_LAW_P7-04.md` was referenced by the
-  kernel architecture and rollout docs but is absent in this checkout. This
-  decision therefore does not derive a new VFS/block UAPI law from that file.
+- The absent VFS/block integration kernel-UAPI law was referenced by the kernel
+  architecture and rollout docs but is not present in this checkout. This
+  decision therefore does not derive a new VFS/block UAPI law from that
+  historical path.
 
 ## Alternatives Considered
 
@@ -147,8 +149,8 @@ direct-I/O reconciliation are projections of the dirty-data authority in
 `docs/PAGE_CACHE_WRITEBACK_AUTHORITY.md` and the stale-generation authority in
 `docs/PAGE_CACHE_INVALIDATION_AUTHORITY.md`.
 
-TFR-011 operator UAPI composes beside kernel residency. Operator commands and
-future kernel UAPI clients may select, configure, inspect, and collect
+Operator UAPI authority composes beside kernel residency. Operator commands
+and future kernel UAPI clients may select, configure, inspect, and collect
 evidence, but they are not storage authorities and cannot replace mounted
 kernel runtime evidence.
 

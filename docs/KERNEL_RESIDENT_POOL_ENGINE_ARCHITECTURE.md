@@ -18,9 +18,10 @@ Current authority and implementation inputs:
 
 Historical design inputs:
 
-- `docs/KERNEL_MODULE_FAMILY_MATRIX_ROLLOUT_ORDER_P7-01.md`
-- `docs/RUST_FOR_LINUX_CRATE_TRAIT_BOUNDARIES_P7-02.md`
-- `docs/KERNEL_LOCKING_RCU_PINNING_WORKQUEUE_MODEL_P7-03.md`
+- The old P7 rollout, Rust for Linux trait-boundary, and kernel
+  locking/RCU/workqueue lineage files were historical inputs and were deleted
+  by #1595. Use git history for archaeology; do not cite those files as live
+  kernel authority.
 
 ## Current Release Interpretation
 
