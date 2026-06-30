@@ -318,6 +318,44 @@ impl_u8_canonical!(PrefetchExecutorSchedulerLane, {
     Background = 5 => "background",
 });
 
+impl PrefetchExecutorSchedulerLane {
+    #[must_use]
+    pub const fn for_action_family(family: PrefetchExecutorActionFamily) -> Self {
+        match family.action_class() {
+            StorageIntentActionClass::ReadTriggeredRepair
+            | StorageIntentActionClass::DegradedReadReconstruction => Self::Metadata,
+            StorageIntentActionClass::NewWriteShaping
+            | StorageIntentActionClass::AuthorityPromotion
+            | StorageIntentActionClass::DurablePlacementMovement
+            | StorageIntentActionClass::ReadSourceRefresh => Self::Demand,
+            StorageIntentActionClass::QueuePrefetchTuning
+            | StorageIntentActionClass::CacheOnlyServingTrial
+            | StorageIntentActionClass::FlashServingPromotion => Self::Speculative,
+            StorageIntentActionClass::DefragRepack
+            | StorageIntentActionClass::ReclaimRelocation
+            | StorageIntentActionClass::GeoCatchup
+            | StorageIntentActionClass::ArchiveMigration => Self::Background,
+        }
+    }
+
+    #[must_use]
+    pub const fn priority_rank(self) -> u8 {
+        match self {
+            Self::Control => 0,
+            Self::Metadata => 1,
+            Self::Demand => 2,
+            Self::Speculative => 3,
+            Self::Background => 4,
+            Self::Unknown => 5,
+        }
+    }
+
+    #[must_use]
+    pub const fn is_stricter_than(self, other: Self) -> bool {
+        self.priority_rank() < other.priority_rank()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 #[repr(u8)]
@@ -1770,6 +1808,23 @@ pub fn evaluate_prefetch_execution(input: PrefetchExecutorInput) -> PrefetchExec
                     PrefetchExecutorByteState::Blocked,
                     StorageIntentRefusalReason::EvidenceNotUsable,
                 )
+            } else if admitted_scheduler_lane_refusal(input, family) as u16
+                != StorageIntentRefusalReason::None as u16
+            {
+                let refusal = admitted_scheduler_lane_refusal(input, family);
+                let (outcome, byte_state) =
+                    if refusal as u16 == StorageIntentRefusalReason::EvidenceNotUsable as u16 {
+                        (
+                            PrefetchExecutorOutcome::Blocked,
+                            PrefetchExecutorByteState::Blocked,
+                        )
+                    } else {
+                        (
+                            PrefetchExecutorOutcome::Refused,
+                            PrefetchExecutorByteState::Refused,
+                        )
+                    };
+                terminal(record, outcome, byte_state, refusal)
             } else if runtime_dispatch_evidence_refusal(input, family) as u16
                 != StorageIntentRefusalReason::None as u16
             {
@@ -2920,6 +2975,40 @@ const fn media_needs_transport_or_trust(media: StorageMediaClass) -> bool {
     )
 }
 
+fn admitted_scheduler_lane_refusal(
+    input: PrefetchExecutorInput,
+    family: PrefetchExecutorActionFamily,
+) -> StorageIntentRefusalReason {
+    if !family.can_start_runtime_dispatch() {
+        return StorageIntentRefusalReason::None;
+    }
+
+    let admission = input.admission;
+    let expected = PrefetchExecutorSchedulerLane::for_action_family(family);
+    if admission.lane == expected {
+        return StorageIntentRefusalReason::None;
+    }
+    if matches!(admission.lane, PrefetchExecutorSchedulerLane::Unknown) {
+        return StorageIntentRefusalReason::EvidenceNotUsable;
+    }
+    if admission.lane.is_stricter_than(expected)
+        && admission
+            .recovery_escalation
+            .requires_recovery_degradation_evidence()
+    {
+        if snapshot_contains_fresh_ref(
+            input,
+            StorageIntentEvidenceKind::RecoveryDegradationEvidence,
+            admission.recovery_degradation_ref,
+        ) {
+            return StorageIntentRefusalReason::None;
+        }
+        return StorageIntentRefusalReason::EvidenceNotUsable;
+    }
+
+    StorageIntentRefusalReason::PolicyConflict
+}
+
 fn admitted_speculative_pressure_refusal(
     input: PrefetchExecutorInput,
 ) -> StorageIntentRefusalReason {
@@ -3407,10 +3496,11 @@ mod tests {
 
     fn admitted_input(candidate: PrefetchResidencyCandidateClass) -> PrefetchExecutorInput {
         let decision = decision(candidate);
+        let family = PrefetchExecutorActionFamily::from_candidate(candidate);
         PrefetchExecutorInput {
             evidence_query_snapshot: snapshot(None),
             admission: PrefetchExecutorAdmissionRecord::admitted(
-                PrefetchExecutorSchedulerLane::Speculative,
+                PrefetchExecutorSchedulerLane::for_action_family(family),
                 BUDGET,
                 evidence(StorageIntentEvidenceKind::SchedulerAdmissionRecord, SCHED),
             )
@@ -4135,7 +4225,7 @@ mod tests {
     }
 
     #[test]
-    fn demand_admission_pressure_is_not_treated_as_droppable_speculation() {
+    fn scheduler_lane_mismatch_refuses_speculative_priority_bypass() {
         let mut input = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
         input.admission.lane = PrefetchExecutorSchedulerLane::Demand;
         input.admission = input
@@ -4144,11 +4234,47 @@ mod tests {
         input.admission.pressure = PrefetchExecutorPressureMask::P99_LATENCY;
 
         let record = evaluate_prefetch_execution(input);
+        assert_eq!(record.outcome, PrefetchExecutorOutcome::Refused);
+        assert_eq!(
+            record.executor_byte_state,
+            PrefetchExecutorByteState::Refused
+        );
+        assert_eq!(record.refusal, StorageIntentRefusalReason::PolicyConflict);
+        assert_record_has_no_authority_claims(record);
+    }
+
+    #[test]
+    fn scheduler_lane_recovery_escalation_allows_stricter_lane_with_evidence() {
+        let mut input = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        add_fresh(
+            &mut input.evidence_query_snapshot,
+            StorageIntentEvidenceKind::RecoveryDegradationEvidence,
+            RECOVERY,
+        );
+        input.admission.lane = PrefetchExecutorSchedulerLane::Demand;
+        input.admission = input
+            .admission
+            .with_speculative_controls(false, false, false)
+            .with_recovery_escalation(
+                PrefetchExecutorRecoveryEscalationClass::DegradedRiskReduction,
+                evidence(
+                    StorageIntentEvidenceKind::RecoveryDegradationEvidence,
+                    RECOVERY,
+                ),
+            );
+        input.admission.pressure = PrefetchExecutorPressureMask::P99_LATENCY;
+
+        let record = evaluate_prefetch_execution(input);
         assert_eq!(record.outcome, PrefetchExecutorOutcome::Started);
         assert_eq!(
             record.executor_byte_state,
             PrefetchExecutorByteState::CacheOnly
         );
+        assert_eq!(
+            record.evidence_refs.recovery_degradation_ref,
+            input.admission.recovery_degradation_ref
+        );
+        assert_record_has_no_authority_claims(record);
     }
 
     #[test]
