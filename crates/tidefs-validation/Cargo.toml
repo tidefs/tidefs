@@ -21,6 +21,10 @@ name = "receipt-bound-reclaim-validation"
 path = "src/bin/receipt_bound_reclaim_validation.rs"
 required-features = ["receipt-bound-physical-reclaim"]
 
+[[bin]]
+name = "scrub_foreground_read_validation"
+path = "src/bin/scrub_foreground_read_validation.rs"
+
 [features]
 default = []
 

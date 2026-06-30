@@ -38,6 +38,7 @@ pub mod qemu_pin_manifest;
 #[cfg(feature = "receipt-bound-physical-reclaim")]
 pub mod receipt_bound_reclaim_runtime;
 pub mod runtime_artifact_source;
+pub mod scrub_foreground_read_runtime;
 pub mod smoke;
 pub mod support_bundle;
 pub mod trace;
