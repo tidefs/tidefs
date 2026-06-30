@@ -1,0 +1,16 @@
+{
+  "manifest_version": 2,
+  "claim_id": "vfs.rpc.forwarding.evidence_map.v1",
+  "evidence_class": "vfs-rpc-forwarding-evidence-map",
+  "validation_tier": "source-model",
+  "scope": "source-reviewed validation matrix for VFS_RPC forwarding evidence; not inline runtime, BULK-bound, RDMA, multi-node product, release-candidate, or storage semantics proof",
+  "artifact_path": "validation/artifacts/vfs-rpc-forwarding/evidence-map.json",
+  "content_digest": "blake3:54f57fa5329d608b5fd3f69317ce556a4a8619dc7e22d9eab92c9b6df76f07dc",
+  "run_id": "deterministic-fixture:issue-1524-vfs-rpc-forwarding-evidence-map-v1",
+  "source_ref": "refs/heads/gpt2/issue-1524-vfs-rpc-forwarding-validation",
+  "outcome": "pass",
+  "residual_risk": "This artifact records the minimum evidence map and publication boundary only. It does not validate VFS Engine forwarding behavior, BULK-bound transfer behavior while #1523 remains open for VFS_RPC/BULK integration, RDMA readiness, multi-node product readiness, release-candidate status, or storage semantics authority.",
+  "source": "issue-1524-source-inspection",
+  "generated_at": "2026-06-30T03:52:06Z",
+  "blocking_issues": []
+}
