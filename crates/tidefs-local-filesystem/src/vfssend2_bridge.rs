@@ -351,23 +351,6 @@ fn make_snapshot_id(transaction_id: u64, generation: u64) -> Id128 {
     id
 }
 
-fn changed_record_root_digest(
-    dataset_id: Id128,
-    snapshot_id: Id128,
-    root: &CommittedRootSummary,
-) -> Bytes32 {
-    let mut hasher = blake3::Hasher::new_derive_key("TideFS VFSSEND2 local root summary digest v1");
-    hasher.update(&dataset_id);
-    hasher.update(&snapshot_id);
-    hasher.update(&root.slot.to_le_bytes());
-    hasher.update(&root.transaction_id.to_le_bytes());
-    hasher.update(&root.generation.to_le_bytes());
-    hasher.update(&root.superblock_checksum.0.to_le_bytes());
-    hasher.update(&root.manifest_checksum.0.to_le_bytes());
-    hasher.update(&root.manifest_entry_count.to_le_bytes());
-    *hasher.finalize().as_bytes()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
