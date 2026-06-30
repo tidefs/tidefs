@@ -45,6 +45,50 @@ non-pass, or blocked manifests fail closed; receipt integrity may support
 evidence integrity, but it does not replace the registry or `validate-claim`
 as claim-status authority.
 
+## Successor And Comparator Wording
+
+The publishing-facing successor and comparator boundary is
+`storage.intent.successor_comparator.v1` in `validation/claims.toml`. Until
+that claim validates with current evidence manifests, TideFS docs, release
+notes, generated claim text, operator output, issue closeouts, and PR summaries
+must not say or imply that TideFS is a successor, replacement, superior
+alternative, or comparator-performance winner against OpenZFS, Ceph, DRBD, or
+local filesystems.
+
+Allowed wording may describe ambition and target class, blocked claim ids and
+missing evidence, historical design inputs from incumbent systems, or bounded
+local claims that already validate under their own claim ids.
+
+Disallowed wording includes:
+
+- unqualified OpenZFS/Ceph-class fulfillment;
+- average benchmark wins used as superiority permission;
+- storage-intent row labels treated as product admission;
+- blocked release-ready, production-ready, GA-ready, or stable-release
+  statements without a verdict artifact owned by
+  `docs/RELEASE_READINESS_VERDICT_CONTRACT.md`.
+
+The successor comparator claim remains blocked until the registry-required
+evidence classes are present and current, including:
+
+- `storage-intent-comparator-equivalence-evidence`;
+- `storage-intent-successor-performance-fault-set`;
+- `storage-intent-successor-claim-boundary-review`;
+- `storage-intent-operator-explanation-evidence`;
+- `claims-gate-review`.
+
+Normal implementation PRs need the focused validation named by their GitHub
+issue; they do not prove the whole successor claim. Product-facing comparator
+evidence is collected only at named product gates such as `validate-claim`,
+proof-train packets, release-readiness verdict review, explicit
+performance/fault/attribution/evidence-query/service-objective matrices, or
+claim-boundary manifests under `validation/artifacts/`.
+
+If a PR touches product claims, successor wording, comparator baselines,
+release-readiness wording, or evidence manifests, it must run the relevant
+claim gate and preserve blocked status unless the same issue adds matching
+evidence for the exact claimed scope.
+
 ## Validation Tier Evidence Map
 
 The nextgen program authority is

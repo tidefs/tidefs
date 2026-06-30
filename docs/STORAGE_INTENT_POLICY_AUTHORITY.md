@@ -1,7 +1,7 @@
 # Storage Intent Policy Authority
 
-Issue: #839, #957, #968, #973, #975
-Date: 2026-06-21
+Issue: #839, #957, #968, #973, #975, #1588
+Date: 2026-06-30
 Status: design authority and media-native convergence gate for follow-up
 implementation slices
 
@@ -16,6 +16,13 @@ The core rule is:
 > TideFS must not choose between fast and honest. Every successful
 > acknowledgment must carry a named guarantee receipt, and the system must
 > optimize the path that earns that receipt.
+
+Successor and comparator claims may consume storage-intent work only after the
+consumed surface records its own boundary, non-claims, evidence, and refusal
+behavior. Media names, cache tiers, RAM-fast paths, remote placement, prefetch
+success, RDMA availability, latency rows, and background reclaim state do not
+upgrade an operation into a durability, availability, freshness, or successor
+claim.
 
 Data shape belongs in that same contract. Record size, compression, checksum
 suite, dedup scope, encryption boundary, erasure shape, coalescing, and rebake
