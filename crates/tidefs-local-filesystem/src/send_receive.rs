@@ -1529,6 +1529,58 @@ fn incremental_receive_placement_verified_stable(
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ReceivedSnapshotDeletionDeadlistTriggerOutcome {
+    Triggered,
+    SkippedNonRetainingRecord,
+    Failed { reason: String },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ReceivedSnapshotDeletionDeadlistTriggerReport {
+    pub snapshot_name: String,
+    pub source_transaction_id: u64,
+    pub source_generation: u64,
+    pub outcome: ReceivedSnapshotDeletionDeadlistTriggerOutcome,
+}
+
+fn received_snapshot_deletion_deadlist_trigger_with(
+    deleted_record: &SnapshotRecord,
+    trigger_derivation: impl FnOnce(&SnapshotRecord) -> Result<()>,
+) -> ReceivedSnapshotDeletionDeadlistTriggerReport {
+    let mut report = ReceivedSnapshotDeletionDeadlistTriggerReport {
+        snapshot_name: crate::snapshot::snapshot_record_display_name(deleted_record),
+        source_transaction_id: deleted_record.root.transaction_id,
+        source_generation: deleted_record.root.generation,
+        outcome: ReceivedSnapshotDeletionDeadlistTriggerOutcome::Triggered,
+    };
+
+    if !crate::snapshot::snapshot_record_retains_data(deleted_record) {
+        report.outcome = ReceivedSnapshotDeletionDeadlistTriggerOutcome::SkippedNonRetainingRecord;
+        return report;
+    }
+
+    if let Err(err) = trigger_derivation(deleted_record) {
+        report.outcome = ReceivedSnapshotDeletionDeadlistTriggerOutcome::Failed {
+            reason: err.to_string(),
+        };
+    }
+
+    report
+}
+
+impl LocalFileSystem {
+    #[allow(dead_code)]
+    pub(crate) fn trigger_deadlist_after_received_snapshot_deletion(
+        &mut self,
+        deleted_record: &SnapshotRecord,
+    ) -> ReceivedSnapshotDeletionDeadlistTriggerReport {
+        received_snapshot_deletion_deadlist_trigger_with(deleted_record, |record| {
+            self.enqueue_released_snapshot_deadlist(record)
+        })
+    }
+}
+
 pub(crate) fn receive_changed_records_into_empty_root(
     root: &Path,
     options: StoreOptions,
@@ -2321,7 +2373,104 @@ fn compute_export_identity_from_prepared(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::records::SnapshotKind;
     use std::collections::BTreeSet;
+
+    fn trigger_test_root_summary(transaction_id: u64, generation: u64) -> CommittedRootSummary {
+        CommittedRootSummary {
+            slot: 0,
+            transaction_id,
+            generation,
+            next_inode_id: 2,
+            inode_count: 1,
+            superblock_checksum: IntegrityDigest64(0xABCD),
+            has_transaction_manifest: true,
+            manifest_checksum: IntegrityDigest64(0x1234),
+            manifest_entry_count: 2,
+            has_root_authentication: true,
+            root_authentication_policy_epoch: Some(1),
+            root_authentication_algorithm_suite_id: Some(1),
+            superblock_digest: None,
+            manifest_digest: None,
+            root_authentication_code: None,
+        }
+    }
+
+    fn trigger_test_snapshot_record(kind: SnapshotKind) -> SnapshotRecord {
+        SnapshotRecord {
+            name: b"received-delete".to_vec(),
+            root: trigger_test_root_summary(41, 7),
+            created_at_generation: 7,
+            kind,
+            origin: None,
+            hold_count: 0,
+            hold_tag: None,
+        }
+    }
+
+    #[test]
+    fn received_snapshot_delete_deadlist_trigger_calls_stub_for_retained_root() {
+        let record = trigger_test_snapshot_record(SnapshotKind::Snapshot);
+        let mut called = false;
+
+        let report = received_snapshot_deletion_deadlist_trigger_with(&record, |deleted| {
+            called = true;
+            assert_eq!(deleted.name, record.name);
+            Ok(())
+        });
+
+        assert!(called, "retained snapshot roots must trigger derivation");
+        assert_eq!(
+            report,
+            ReceivedSnapshotDeletionDeadlistTriggerReport {
+                snapshot_name: "received-delete".to_string(),
+                source_transaction_id: 41,
+                source_generation: 7,
+                outcome: ReceivedSnapshotDeletionDeadlistTriggerOutcome::Triggered,
+            }
+        );
+    }
+
+    #[test]
+    fn received_snapshot_delete_deadlist_trigger_skips_bookmark() {
+        let record = trigger_test_snapshot_record(SnapshotKind::Bookmark);
+        let mut called = false;
+
+        let report = received_snapshot_deletion_deadlist_trigger_with(&record, |_deleted| {
+            called = true;
+            Ok(())
+        });
+
+        assert!(
+            !called,
+            "bookmark deletion does not release a retained traversal root"
+        );
+        assert_eq!(
+            report.outcome,
+            ReceivedSnapshotDeletionDeadlistTriggerOutcome::SkippedNonRetainingRecord
+        );
+    }
+
+    #[test]
+    fn received_snapshot_delete_deadlist_trigger_records_failure() {
+        let record = trigger_test_snapshot_record(SnapshotKind::Clone);
+
+        let report = received_snapshot_deletion_deadlist_trigger_with(&record, |_deleted| {
+            Err(FileSystemError::LifecycleError {
+                reason: "stub derivation failed".into(),
+            })
+        });
+
+        match report.outcome {
+            ReceivedSnapshotDeletionDeadlistTriggerOutcome::Failed { reason } => {
+                assert!(
+                    reason.contains("stub derivation failed"),
+                    "failure report must keep derivation error text, got {reason}"
+                );
+            }
+            other => panic!("derivation failure must be recorded, got {other:?}"),
+        }
+    }
 
     /// Round-trip encode/decode of an empty ReceiveCheckpoint.
     #[test]
