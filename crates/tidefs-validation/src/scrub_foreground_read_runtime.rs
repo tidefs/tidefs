@@ -657,20 +657,17 @@ impl ForegroundReadEvidence {
 fn wait_for_fuse_mount(harness: &MountHarness) -> Result<libc::c_long, String> {
     let started = Instant::now();
     let timeout = Duration::from_secs(MOUNT_READY_TIMEOUT_SECS);
-    let mut last_status: String;
     loop {
-        match harness.statfs() {
+        let last_status = match harness.statfs() {
             Ok(stats) => {
                 let f_type = stats.f_type;
                 if f_type == FUSE_SUPER_MAGIC {
                     return Ok(f_type);
                 }
-                last_status = format!("statfs_type=0x{f_type:x}");
+                format!("statfs_type=0x{f_type:x}")
             }
-            Err(error) => {
-                last_status = format!("statfs failed: {error}");
-            }
-        }
+            Err(error) => format!("statfs failed: {error}"),
+        };
 
         if started.elapsed() >= timeout {
             return Err(format!(
