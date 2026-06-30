@@ -319,6 +319,19 @@ claims-gate coverage change for this decision artifact.
 |---|---|---|
 | `docs/OPERATOR_UAPI_AUTHORITY.md` | Current spec | Binding only as the current pre-alpha operator UAPI boundary decision: `COMMAND_SURFACES` remains the `tidefsctl` command-surface authority, `command_admission` remains the privileged-admission authority, diagnostics/prototypes must keep weaker class and routing claims, and imported documents still require this register for authority. It is not a production Linux ioctl/statx/ublk/FUSE/kernel ABI freeze, kernelspace readiness evidence, distributed operator maturity evidence, runtime-fed remote policy authority, or release-readiness claim. |
 
+### Control Format And JSON Policy
+
+Classified on 2026-06-30 after checking the current README/AGENTS pre-alpha
+policy, unreleased-surface guardrail, on-disk format policy, operator UAPI
+decision, operator product-surface decision, and bounded source inspection of
+current live-owner, local-filesystem live-admin, device-removal, rebuild, and
+VFS control hooks. This slice records a policy guardrail only; it does not
+change source behavior or close any release-readiness claim.
+
+| Path | State | Classification note |
+|---|---|---|
+| `docs/CONTROL_FORMAT_AND_JSON_POLICY.md` | Current policy | Binding only as the JSON/control-format review guardrail: JSON is allowed for explicit evidence, diagnostics, support bundles, traces, and expert/machine export, but not as ordinary operator UX, a hot-path protocol, a final wire/control carrier, or durable product format. Existing JSON live-admin and local record uses are pre-alpha transitional debt until a source issue replaces or graduates them. This policy is not implementation evidence, production ABI authority, on-disk compatibility authority, or a release-readiness claim. |
+
 ### Initial Classification Slice (TFR-019 / #497)
 
 Classified for TFR-019 / GitHub issue #497 on 2026-06-17. Documents were

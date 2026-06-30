@@ -49,6 +49,9 @@ Release readiness boundary and evidence inputs:
   individual claim validation.
 - `docs/UNRELEASED_AUTHORITY_POLICY.md` defines the unreleased-surface
   authority and compatibility guardrail.
+- `docs/CONTROL_FORMAT_AND_JSON_POLICY.md` defines the JSON and control-format
+  guardrail for operator surfaces, wire/control paths, durable records, and
+  evidence artifacts.
 
 The evidence inputs, proof-train map, gate-local receipts, CI artifacts, and
 claims-gate results listed here do not combine into a product-admission
@@ -79,6 +82,7 @@ Key design, policy, and reference areas:
 - `docs/FUSE_ADAPTER_CONTRACT_ASSUMPTIONS.md`
 - `docs/OPERATOR_UAPI_AUTHORITY.md`
 - `docs/OPERATOR_PRODUCT_SURFACE_DECISION.md`
+- `docs/CONTROL_FORMAT_AND_JSON_POLICY.md`
 - `docs/NEXTGEN_VERIFICATION_EVIDENCE_CHAIN_AUTHORITY.md`
 - `docs/NEXTGEN_VERIFICATION_CONTRACT_ROADMAP.md`
 - `docs/NEXTGEN_VERIFICATION_PERFORMANCE_OFFLOAD_PLAN.md`
