@@ -1042,6 +1042,7 @@ pub struct PrefetchExecutorEvidenceRefs {
     pub source_path_ref: StorageIntentEvidenceRef,
     pub target_destination_ref: StorageIntentEvidenceRef,
     pub dispatch_plan_ref: StorageIntentEvidenceRef,
+    pub runtime_support_ref: StorageIntentEvidenceRef,
     pub read_serving_boundary_ref: StorageIntentEvidenceRef,
     pub relocation_boundary_ref: StorageIntentEvidenceRef,
     pub result_refusal_ref: StorageIntentEvidenceRef,
@@ -1869,6 +1870,7 @@ pub fn finalize_prefetch_execution(
         || terminal_update_lacks_result_refusal_evidence(record, update)
         || terminal_update_lacks_interruption_evidence(record, update)
         || terminal_update_has_inconsistent_interruption(update)
+        || terminal_update_lacks_started_dispatch_evidence(record, update)
         || terminal_result_detail_lacks_charge_evidence(record, update)
     {
         return terminal(
@@ -1945,6 +1947,7 @@ fn base_record(input: PrefetchExecutorInput) -> PrefetchExecutorRecord {
             source_path_ref: input.media_path.source_path_ref,
             target_destination_ref: input.media_path.target_destination_ref,
             dispatch_plan_ref: input.dispatch_plan.plan_ref,
+            runtime_support_ref: input.runtime_support.support_ref,
             read_serving_boundary_ref: input.decision.evidence_refs.read_serving_boundary_ref,
             relocation_boundary_ref: input.decision.evidence_refs.relocation_boundary_ref,
             result_refusal_ref: input.decision.evidence_refs.result_refusal_ref,
@@ -2089,6 +2092,133 @@ fn terminal_update_has_inconsistent_interruption(update: PrefetchExecutorTermina
     !update
         .interruption
         .is_compatible_with_outcome(update.outcome)
+}
+
+fn terminal_update_lacks_started_dispatch_evidence(
+    record: PrefetchExecutorRecord,
+    update: PrefetchExecutorTerminalUpdate,
+) -> bool {
+    if !record.action_family.can_start_runtime_dispatch() {
+        return false;
+    }
+
+    let cut = update.evidence_cut;
+    if !terminal_ref_in_cut(
+        record,
+        cut,
+        record.evidence_refs.prefetch_decision_ref,
+        StorageIntentEvidenceKind::DecisionFrontierEvidence,
+    ) || !terminal_ref_in_cut(
+        record,
+        cut,
+        record.evidence_refs.scheduler_admission_ref,
+        StorageIntentEvidenceKind::SchedulerAdmissionRecord,
+    ) || !terminal_ref_in_cut(
+        record,
+        cut,
+        record.evidence_refs.dispatch_plan_ref,
+        StorageIntentEvidenceKind::ActionExecutionEvidence,
+    ) || !terminal_ref_in_cut(
+        record,
+        cut,
+        record.evidence_refs.runtime_support_ref,
+        StorageIntentEvidenceKind::ActionExecutionEvidence,
+    ) || !terminal_ref_in_cut(
+        record,
+        cut,
+        record.evidence_refs.read_serving_boundary_ref,
+        StorageIntentEvidenceKind::ReadFreshnessEvidence,
+    ) || !terminal_ref_in_cut(
+        record,
+        cut,
+        record.evidence_refs.source_media_ref,
+        StorageIntentEvidenceKind::MediaCapabilityEvidence,
+    ) || !terminal_ref_in_cut(
+        record,
+        cut,
+        record.evidence_refs.target_media_ref,
+        StorageIntentEvidenceKind::MediaCapabilityEvidence,
+    ) || !terminal_ref_in_cut(
+        record,
+        cut,
+        record.evidence_refs.media_capability_ref,
+        StorageIntentEvidenceKind::MediaCapabilityEvidence,
+    ) || !terminal_ref_in_cut(
+        record,
+        cut,
+        record.evidence_refs.source_path_ref,
+        StorageIntentEvidenceKind::ReadFreshnessEvidence,
+    ) || !terminal_ref_in_cut(
+        record,
+        cut,
+        record.evidence_refs.target_destination_ref,
+        StorageIntentEvidenceKind::ActionExecutionEvidence,
+    ) {
+        return true;
+    }
+
+    let required = record.cost_state.required;
+    if !required.is_empty() {
+        if !terminal_ref_in_cut(
+            record,
+            cut,
+            record.evidence_refs.cost_wear_ref,
+            StorageIntentEvidenceKind::MediaCostWearLedger,
+        ) || !terminal_ref_in_cut(
+            record,
+            cut,
+            record.evidence_refs.tenant_isolation_ref,
+            StorageIntentEvidenceKind::TenantIsolationEvidence,
+        ) {
+            return true;
+        }
+
+        if terminal_charge_requires_egress_restore(required)
+            && !terminal_ref_in_cut(
+                record,
+                cut,
+                record.evidence_refs.egress_restore_cost_ref,
+                StorageIntentEvidenceKind::MediaCostWearLedger,
+            )
+        {
+            return true;
+        }
+
+        if terminal_charge_requires_transport(required)
+            && !terminal_ref_in_cut(
+                record,
+                cut,
+                record.evidence_refs.transport_budget_ref,
+                StorageIntentEvidenceKind::TransportPathEvidence,
+            )
+        {
+            return true;
+        }
+    }
+
+    if record_runtime_dispatch_needs_transport_or_trust(record)
+        && (!terminal_ref_in_cut(
+            record,
+            cut,
+            record.evidence_refs.transport_budget_ref,
+            StorageIntentEvidenceKind::TransportPathEvidence,
+        ) || !terminal_ref_in_cut(
+            record,
+            cut,
+            record.evidence_refs.trust_domain_ref,
+            StorageIntentEvidenceKind::TrustDomainEvidence,
+        ))
+    {
+        return true;
+    }
+
+    false
+}
+
+fn record_runtime_dispatch_needs_transport_or_trust(record: PrefetchExecutorRecord) -> bool {
+    record.action_family.needs_remote_path_evidence()
+        || media_needs_transport_or_trust(record.source_media)
+        || media_needs_transport_or_trust(record.target_media)
 }
 
 fn terminal_result_detail_lacks_charge_evidence(
@@ -2922,6 +3052,7 @@ mod tests {
     const OUTSIDE_CUT: StorageIntentEvidenceId = StorageIntentEvidenceId([21; 32]);
     const RESULT_REFUSAL: StorageIntentEvidenceId = StorageIntentEvidenceId([22; 32]);
     const INTERRUPTION: StorageIntentEvidenceId = StorageIntentEvidenceId([23; 32]);
+    const RUNTIME_SUPPORT: StorageIntentEvidenceId = StorageIntentEvidenceId([24; 32]);
 
     fn evidence(
         kind: StorageIntentEvidenceKind,
@@ -3260,6 +3391,114 @@ mod tests {
         }
     }
 
+    fn push_terminal_start_refs(
+        refs: &mut StorageIntentEvidenceRefs,
+        record: PrefetchExecutorRecord,
+    ) {
+        push_terminal_ref(refs, record.evidence_refs.prefetch_decision_ref);
+        push_terminal_ref(refs, record.evidence_refs.scheduler_admission_ref);
+        push_terminal_ref(refs, record.evidence_refs.dispatch_plan_ref);
+        push_terminal_ref(refs, record.evidence_refs.runtime_support_ref);
+        push_terminal_ref(refs, record.evidence_refs.read_serving_boundary_ref);
+        push_terminal_ref(refs, record.evidence_refs.source_media_ref);
+        push_terminal_ref(refs, record.evidence_refs.target_media_ref);
+        push_terminal_ref(refs, record.evidence_refs.media_capability_ref);
+        push_terminal_ref(refs, record.evidence_refs.source_path_ref);
+        push_terminal_ref(refs, record.evidence_refs.target_destination_ref);
+        push_terminal_start_charge_refs(refs, record, record.cost_state.required);
+        if record_runtime_dispatch_needs_transport_or_trust(record) {
+            push_terminal_ref(refs, record.evidence_refs.transport_budget_ref);
+            push_terminal_ref(refs, record.evidence_refs.trust_domain_ref);
+        }
+    }
+
+    fn push_terminal_start_refs_except(
+        refs: &mut StorageIntentEvidenceRefs,
+        record: PrefetchExecutorRecord,
+        omitted: StorageIntentEvidenceRef,
+    ) {
+        push_terminal_start_ref_unless(refs, record.evidence_refs.prefetch_decision_ref, omitted);
+        push_terminal_start_ref_unless(refs, record.evidence_refs.scheduler_admission_ref, omitted);
+        push_terminal_start_ref_unless(refs, record.evidence_refs.dispatch_plan_ref, omitted);
+        push_terminal_start_ref_unless(refs, record.evidence_refs.runtime_support_ref, omitted);
+        push_terminal_start_ref_unless(
+            refs,
+            record.evidence_refs.read_serving_boundary_ref,
+            omitted,
+        );
+        push_terminal_start_ref_unless(refs, record.evidence_refs.source_media_ref, omitted);
+        push_terminal_start_ref_unless(refs, record.evidence_refs.target_media_ref, omitted);
+        push_terminal_start_ref_unless(refs, record.evidence_refs.media_capability_ref, omitted);
+        push_terminal_start_ref_unless(refs, record.evidence_refs.source_path_ref, omitted);
+        push_terminal_start_ref_unless(refs, record.evidence_refs.target_destination_ref, omitted);
+        push_terminal_start_charge_refs_except(refs, record, record.cost_state.required, omitted);
+        if record_runtime_dispatch_needs_transport_or_trust(record) {
+            push_terminal_start_ref_unless(
+                refs,
+                record.evidence_refs.transport_budget_ref,
+                omitted,
+            );
+            push_terminal_start_ref_unless(refs, record.evidence_refs.trust_domain_ref, omitted);
+        }
+    }
+
+    fn push_terminal_start_ref_unless(
+        refs: &mut StorageIntentEvidenceRefs,
+        evidence_ref: StorageIntentEvidenceRef,
+        omitted: StorageIntentEvidenceRef,
+    ) {
+        if evidence_ref != omitted {
+            push_terminal_ref(refs, evidence_ref);
+        }
+    }
+
+    fn push_terminal_start_charge_refs(
+        refs: &mut StorageIntentEvidenceRefs,
+        record: PrefetchExecutorRecord,
+        required: PrefetchExecutorCostRequirementMask,
+    ) {
+        if required.is_empty() {
+            return;
+        }
+
+        push_terminal_ref(refs, record.evidence_refs.cost_wear_ref);
+        push_terminal_ref(refs, record.evidence_refs.tenant_isolation_ref);
+        if terminal_charge_requires_egress_restore(required) {
+            push_terminal_ref(refs, record.evidence_refs.egress_restore_cost_ref);
+        }
+        if terminal_charge_requires_transport(required) {
+            push_terminal_ref(refs, record.evidence_refs.transport_budget_ref);
+        }
+    }
+
+    fn push_terminal_start_charge_refs_except(
+        refs: &mut StorageIntentEvidenceRefs,
+        record: PrefetchExecutorRecord,
+        required: PrefetchExecutorCostRequirementMask,
+        omitted: StorageIntentEvidenceRef,
+    ) {
+        if required.is_empty() {
+            return;
+        }
+
+        push_terminal_start_ref_unless(refs, record.evidence_refs.cost_wear_ref, omitted);
+        push_terminal_start_ref_unless(refs, record.evidence_refs.tenant_isolation_ref, omitted);
+        if terminal_charge_requires_egress_restore(required) {
+            push_terminal_start_ref_unless(
+                refs,
+                record.evidence_refs.egress_restore_cost_ref,
+                omitted,
+            );
+        }
+        if terminal_charge_requires_transport(required) {
+            push_terminal_start_ref_unless(
+                refs,
+                record.evidence_refs.transport_budget_ref,
+                omitted,
+            );
+        }
+    }
+
     fn admitted_charged_input(
         candidate: PrefetchResidencyCandidateClass,
         detail: PrefetchExecutorResultDetail,
@@ -3289,30 +3528,18 @@ mod tests {
         interruption_ref: StorageIntentEvidenceRef,
     ) -> PrefetchExecutorTerminalEvidenceCut {
         let mut included_refs = StorageIntentEvidenceRefs::EMPTY;
+        push_terminal_start_refs(&mut included_refs, record);
         push_terminal_ref(&mut included_refs, detail.attribution_ref);
         push_terminal_ref(&mut included_refs, detail.retention_ref);
         push_terminal_ref(&mut included_refs, detail.validation_ref);
         push_terminal_ref(&mut included_refs, result_refusal_ref);
         push_terminal_ref(&mut included_refs, interruption_ref);
-        let required = detail.charge_requirements();
+        let required = record
+            .cost_state
+            .required
+            .union(detail.charge_requirements());
         if !required.is_empty() {
-            push_terminal_ref(&mut included_refs, record.evidence_refs.cost_wear_ref);
-            push_terminal_ref(
-                &mut included_refs,
-                record.evidence_refs.tenant_isolation_ref,
-            );
-            if terminal_charge_requires_egress_restore(required) {
-                push_terminal_ref(
-                    &mut included_refs,
-                    record.evidence_refs.egress_restore_cost_ref,
-                );
-            }
-            if terminal_charge_requires_transport(required) {
-                push_terminal_ref(
-                    &mut included_refs,
-                    record.evidence_refs.transport_budget_ref,
-                );
-            }
+            push_terminal_start_charge_refs(&mut included_refs, record, required);
         }
 
         PrefetchExecutorTerminalEvidenceCut {
@@ -4644,6 +4871,180 @@ mod tests {
         assert!(completed.has_feedback_payback_inputs());
         assert!(completed.result_detail.has_feedback_evidence_roots());
         assert!(completed.is_non_authority_population());
+        assert_record_has_no_authority_claims(completed);
+    }
+
+    #[test]
+    fn terminal_update_requires_started_dispatch_refs_inside_terminal_cut() {
+        let detail = terminal_detail();
+        let started = evaluate_prefetch_execution(admitted_charged_input(
+            PrefetchResidencyCandidateClass::BoundedReadahead,
+            detail,
+        ));
+        assert_eq!(started.outcome, PrefetchExecutorOutcome::Started);
+
+        let mut feedback_and_charge_refs = StorageIntentEvidenceRefs::EMPTY;
+        push_terminal_ref(&mut feedback_and_charge_refs, detail.attribution_ref);
+        push_terminal_ref(&mut feedback_and_charge_refs, detail.retention_ref);
+        push_terminal_ref(&mut feedback_and_charge_refs, detail.validation_ref);
+        push_terminal_start_charge_refs(
+            &mut feedback_and_charge_refs,
+            started,
+            detail.charge_requirements(),
+        );
+
+        let rejected = finalize_prefetch_execution(
+            started,
+            PrefetchExecutorTerminalUpdate {
+                outcome: PrefetchExecutorOutcome::Completed,
+                result_detail: detail,
+                evidence_cut: PrefetchExecutorTerminalEvidenceCut {
+                    evidence_query_snapshot_ref: started.evidence_refs.evidence_query_snapshot_ref,
+                    included_refs: feedback_and_charge_refs,
+                },
+                ..PrefetchExecutorTerminalUpdate::default()
+            },
+        );
+
+        assert_eq!(
+            rejected.outcome,
+            PrefetchExecutorOutcome::VerificationFailed
+        );
+        assert_eq!(
+            rejected.refusal,
+            StorageIntentRefusalReason::ValidationGateFailed
+        );
+        assert_eq!(
+            rejected.executor_byte_state,
+            PrefetchExecutorByteState::Refused
+        );
+        assert_record_has_no_authority_claims(rejected);
+    }
+
+    #[test]
+    fn terminal_update_requires_runtime_support_ref_inside_terminal_cut() {
+        let mut input = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        let runtime_support_ref = evidence(
+            StorageIntentEvidenceKind::ActionExecutionEvidence,
+            RUNTIME_SUPPORT,
+        );
+        input
+            .evidence_query_snapshot
+            .included_refs
+            .push(runtime_support_ref)
+            .unwrap();
+        input.runtime_support = PrefetchExecutorRuntimeSupport::supported(
+            PrefetchExecutorRuntimeSupportMask::BOUNDED_SEQUENTIAL_READAHEAD,
+            runtime_support_ref,
+        );
+        let started = evaluate_prefetch_execution(input);
+        assert_eq!(started.outcome, PrefetchExecutorOutcome::Started);
+        assert_eq!(
+            started.evidence_refs.runtime_support_ref,
+            runtime_support_ref
+        );
+        assert_ne!(
+            started.evidence_refs.runtime_support_ref,
+            started.evidence_refs.dispatch_plan_ref
+        );
+
+        let mut missing_runtime_refs = StorageIntentEvidenceRefs::EMPTY;
+        push_terminal_start_refs_except(
+            &mut missing_runtime_refs,
+            started,
+            started.evidence_refs.runtime_support_ref,
+        );
+        let rejected = finalize_prefetch_execution(
+            started,
+            PrefetchExecutorTerminalUpdate {
+                outcome: PrefetchExecutorOutcome::Completed,
+                evidence_cut: PrefetchExecutorTerminalEvidenceCut {
+                    evidence_query_snapshot_ref: started.evidence_refs.evidence_query_snapshot_ref,
+                    included_refs: missing_runtime_refs,
+                },
+                ..PrefetchExecutorTerminalUpdate::default()
+            },
+        );
+        assert_eq!(
+            rejected.outcome,
+            PrefetchExecutorOutcome::VerificationFailed
+        );
+        assert_eq!(
+            rejected.refusal,
+            StorageIntentRefusalReason::ValidationGateFailed
+        );
+        assert_record_has_no_authority_claims(rejected);
+
+        let completed = finalize_prefetch_execution(
+            started,
+            PrefetchExecutorTerminalUpdate {
+                outcome: PrefetchExecutorOutcome::Completed,
+                evidence_cut: terminal_evidence_cut(
+                    started,
+                    PrefetchExecutorResultDetail::default(),
+                    EMPTY_EVIDENCE_REF,
+                ),
+                ..PrefetchExecutorTerminalUpdate::default()
+            },
+        );
+        assert_eq!(completed.outcome, PrefetchExecutorOutcome::Completed);
+        assert_record_has_no_authority_claims(completed);
+    }
+
+    #[test]
+    fn terminal_update_requires_remote_transport_and_trust_start_refs() {
+        let mut input = admitted_input(PrefetchResidencyCandidateClass::WanGeoDeltaPrefetch);
+        input.evidence_query_snapshot =
+            snapshot(Some(StorageIntentEvidenceKind::TransportPathEvidence));
+        add_fresh(
+            &mut input.evidence_query_snapshot,
+            StorageIntentEvidenceKind::TrustDomainEvidence,
+            TRUST,
+        );
+        let started = evaluate_prefetch_execution(input);
+        assert_eq!(started.outcome, PrefetchExecutorOutcome::Started);
+        assert!(record_runtime_dispatch_needs_transport_or_trust(started));
+
+        let mut missing_trust_refs = StorageIntentEvidenceRefs::EMPTY;
+        push_terminal_start_refs_except(
+            &mut missing_trust_refs,
+            started,
+            started.evidence_refs.trust_domain_ref,
+        );
+        let rejected = finalize_prefetch_execution(
+            started,
+            PrefetchExecutorTerminalUpdate {
+                outcome: PrefetchExecutorOutcome::Completed,
+                evidence_cut: PrefetchExecutorTerminalEvidenceCut {
+                    evidence_query_snapshot_ref: started.evidence_refs.evidence_query_snapshot_ref,
+                    included_refs: missing_trust_refs,
+                },
+                ..PrefetchExecutorTerminalUpdate::default()
+            },
+        );
+        assert_eq!(
+            rejected.outcome,
+            PrefetchExecutorOutcome::VerificationFailed
+        );
+        assert_eq!(
+            rejected.refusal,
+            StorageIntentRefusalReason::ValidationGateFailed
+        );
+        assert_record_has_no_authority_claims(rejected);
+
+        let completed = finalize_prefetch_execution(
+            started,
+            PrefetchExecutorTerminalUpdate {
+                outcome: PrefetchExecutorOutcome::Completed,
+                evidence_cut: terminal_evidence_cut(
+                    started,
+                    PrefetchExecutorResultDetail::default(),
+                    EMPTY_EVIDENCE_REF,
+                ),
+                ..PrefetchExecutorTerminalUpdate::default()
+            },
+        );
+        assert_eq!(completed.outcome, PrefetchExecutorOutcome::Completed);
         assert_record_has_no_authority_claims(completed);
     }
 
