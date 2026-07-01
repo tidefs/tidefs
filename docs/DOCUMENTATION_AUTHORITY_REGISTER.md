@@ -601,6 +601,16 @@ OpenZFS/Ceph successor status.
 | `docs/RAM_AUTHORITY_DESIGN.md` | Current spec | Scoped current spec for the issue #847 RAM authority boundary: `ram-volatile-local`, `ram-volatile-replicated`, `ram-intent-backed`, and `pmem-durable` semantics, receipts, failure behavior, policy-transition rules, resource-governor boundaries, and operator explanation requirements. It is not runtime implementation, PMem platform validation, distributed quorum proof, or POSIX durability evidence. |
 | `docs/REPLICATION_REBUILD_RELOCATION_DATA_FLOWS_P8-03.md` | Historical input | Imported production-depth replication, rebuild, and relocation flow design. It is not current runtime proof for anti-entropy, repair rebuild, relocation, failover, or cutover drains. |
 
+Issue #1715 deleted the imported authn/authz/override/audit and
+upgrade/failover/cutover operator-runbook production-depth roots instead of
+preserving them as live historical surfaces. Current operator security
+authority remains with source-owned `crates/tidefs-auth/`,
+`docs/security/operator-authz-boundary.md`, `docs/OPERATOR_UAPI_AUTHORITY.md`,
+and `docs/OPERATOR_PRODUCT_SURFACE_DECISION.md`. This deletion does not
+implement production remote operator authorization, a production runbook engine,
+release readiness, OpenZFS/Ceph parity, distributed failover readiness, kernel
+residency, or successor/comparator wording.
+
 ## Incumbent Comparison Audit Slice (#931)
 
 This initial #931 slice classifies the following legacy incumbent-comparison

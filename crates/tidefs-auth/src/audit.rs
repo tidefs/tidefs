@@ -216,7 +216,7 @@ impl AuditLog {
 }
 
 // ---------------------------------------------------------------------------
-// Chain sealing — P9-02 §7.3
+// Chain sealing.
 // ---------------------------------------------------------------------------
 
 impl AuditLog {
@@ -324,7 +324,7 @@ impl Default for AuditLog {
 }
 
 // ---------------------------------------------------------------------------
-// Algorithm: append_audit_event_and_seal_chain_if_needed — P9-02 §7.3
+// Algorithm: append_audit_event_and_seal_chain_if_needed.
 // ---------------------------------------------------------------------------
 
 /// Append an audit event for a decision, and automatically seal the chain

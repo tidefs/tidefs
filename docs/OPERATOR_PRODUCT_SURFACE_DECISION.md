@@ -67,7 +67,7 @@ surface, widen publishing claims, or preselect a runtime carrier.
   `docs/MEMBERSHIP_PLACEMENT_FAILURE_DOMAIN_MODEL_P8-02.md`,
   deleted performance/fault production-depth lineage,
   deleted kernel-boundary production-depth lineage,
-  `docs/UPGRADE_FAILOVER_CUTOVER_OPERATOR_RUNBOOKS_P9-03.md`,
+  deleted operator-runbook production-depth lineage,
   `docs/WORKSPACE_FAMILY_LAYOUT_CRATE_SERVICE_BOUNDARIES_P1-01.md`, deleted
   operator-manual lineage docs, and deleted scrub/repair/resilver historical
   lineage docs.

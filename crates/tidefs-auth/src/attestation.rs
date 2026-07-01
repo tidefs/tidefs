@@ -385,7 +385,7 @@ pub fn verify_mutual_attestation(
 }
 
 // ---------------------------------------------------------------------------
-// Algorithm: mint_session_grant_for_authenticated_subject — P9-02 §4.2
+// Algorithm: mint_session_grant_for_authenticated_subject.
 // ---------------------------------------------------------------------------
 
 use crate::principal::{Principal, ScopeSelector};
@@ -394,7 +394,7 @@ use crate::records::{AssuranceClass, SessionGrantId, SessionGrantRecord};
 /// Mint a session grant for an authenticated principal after successful
 /// attestation handshake.
 ///
-/// P9-02 §4.2 — produces a `SessionGrantRecord` with audience, assurance
+/// Produces a `SessionGrantRecord` with audience, assurance
 /// class, scope ceiling, and revocation epoch.
 #[allow(clippy::too_many_arguments)]
 pub fn mint_session_grant_for_authenticated_subject(

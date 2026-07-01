@@ -6,7 +6,7 @@ use crate::authorization::{ActionClass, AuthorizationDecision};
 use crate::principal::{PrincipalId, ScopeSelector};
 
 // ---------------------------------------------------------------------------
-// CredentialBindingRecord — P9-02 §4.1
+// CredentialBindingRecord.
 // Resolves a presented credential to exactly one named principal.
 // ---------------------------------------------------------------------------
 
@@ -102,7 +102,7 @@ impl CredentialBindingRecord {
 }
 
 // ---------------------------------------------------------------------------
-// SessionGrantRecord — P9-02 §4.2
+// SessionGrantRecord.
 // ---------------------------------------------------------------------------
 
 #[derive(
@@ -217,7 +217,7 @@ impl SessionGrantRecord {
 }
 
 // ---------------------------------------------------------------------------
-// OverrideConstraintProfileRecord — P9-02 §6.2
+// OverrideConstraintProfileRecord.
 // ---------------------------------------------------------------------------
 
 #[derive(
@@ -269,7 +269,7 @@ impl OverrideConstraintProfileRecord {
 }
 
 // ---------------------------------------------------------------------------
-// OverrideConsumptionRecord — P9-02 §6.3
+// OverrideConsumptionRecord.
 // ---------------------------------------------------------------------------
 
 #[derive(
@@ -314,7 +314,7 @@ impl OverrideConsumptionRecord {
 }
 
 // ---------------------------------------------------------------------------
-// AuditChainAnchorRecord — P9-02 §7.3
+// AuditChainAnchorRecord.
 // ---------------------------------------------------------------------------
 
 #[derive(

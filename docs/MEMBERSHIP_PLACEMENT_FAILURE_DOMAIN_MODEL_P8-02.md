@@ -14,7 +14,7 @@ See also:
 - `docs/TRANSPORT_SESSION_COHORT_GRAPH_P8-01.md`
 - `docs/REPLICATION_REBUILD_RELOCATION_DATA_FLOWS_P8-03.md`
 - `docs/CLOCKS_TIMING_FENCES_DRIFT_ASSUMPTIONS_P8-04.md`
-- `docs/UPGRADE_FAILOVER_CUTOVER_OPERATOR_RUNBOOKS_P9-03.md`
+- `docs/OPERATOR_PRODUCT_SURFACE_DECISION.md`
 - `docs/CONTROL_PLANE_SERVICE_API_CLI_TOPOLOGY_P9-01.md`
 - `docs/DASHBOARDS_TRACES_OPERATOR_TRUTH_SURFACES_P10-04.md` (missing from the repository; see #1270)
 - `docs/AUTHORITATIVE_DATA_STRUCTURES_ALGORITHMS.md`
@@ -299,7 +299,7 @@ This design introduces **10 new algorithm / protocol families**.
 - cohort population is derived from epoch + member class, never hidden local lists,
 - placement checks run against declared failure-domain vectors and separation policy,
 - insufficient spread yields `v1`, `v2`, `v3`, `v5`, or `v6`, never silent acceptance,
-- and only after a committed verdict may `W5-06`, `P8-03`, `control_plane`, or `operator_runbook_0` advance a live move.
+- and only after a committed verdict may `W5-06`, `P8-03`, `control_plane`, or operator execution surfaces advance a live move.
 
 ## 10. Whole-system operational paths now fixed
 
@@ -314,5 +314,5 @@ With this law settled:
 - `P8-02` becomes detailed enough for later implementation planning,
 - the full `P8` distributed-runtime / coordination workstream is now at `L3`,
 - the repo now has one explicit answer to who may vote, learn, witness, host authority, store replicas, shadow-compare, or remain quarantined,
-- `transport_session_0`, `W5-06`, `P8-03`, `control_plane`, `operator_runbook_0`, `truth_view`, and `shadow_pilot_0` now share one epoch/placement/separation grammar,
+- `transport_session_0`, `W5-06`, `P8-03`, `control_plane`, operator execution surfaces, `truth_view`, and `shadow_pilot_0` now share one epoch/placement/separation grammar,
 - and the full production design ledger is now at `L3`, so later work is user-directed refinement or implementation discipline rather than missing seam/deletion law.

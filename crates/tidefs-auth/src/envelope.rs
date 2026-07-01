@@ -6,7 +6,7 @@ use crate::capability::{CapabilityGrantDenial, CapabilityGrantDenialReason, Capa
 use crate::principal::PrincipalId;
 
 // ---------------------------------------------------------------------------
-// Security response envelope classes — P9-02 §8
+// Security response envelope classes.
 // ---------------------------------------------------------------------------
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]

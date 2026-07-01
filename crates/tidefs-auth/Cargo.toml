@@ -10,7 +10,7 @@ homepage.workspace = true
 documentation.workspace = true
 authors.workspace = true
 
-description = "P9-02 authentication/authorization/audit model: Ed25519 node identity, mutual attestation, principal model, session grants, authorization pipeline, override machinery, audit chain seals"
+description = "Authentication/authorization/audit model: Ed25519 node identity, mutual attestation, principal model, session grants, authorization pipeline, override machinery, audit chain seals"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

@@ -240,7 +240,7 @@ pub fn current_time_utils() -> u64 {
 }
 
 // ---------------------------------------------------------------------------
-// Algorithm: resolve_principal_from_presented_credential_chain — P9-02 §4
+// Algorithm: resolve_principal_from_presented_credential_chain.
 // ---------------------------------------------------------------------------
 
 use crate::principal::Principal;
@@ -277,7 +277,7 @@ pub fn resolve_principal_from_presented_credential_chain(
 }
 
 // ---------------------------------------------------------------------------
-// Algorithm: validate_credential_binding_and_time_health — P9-02 §4.2-4.3
+// Algorithm: validate_credential_binding_and_time_health.
 // ---------------------------------------------------------------------------
 
 /// Validate credential binding is healthy and within time bounds.
