@@ -19,7 +19,7 @@ use tidefs_storage_intent_core::{
     StorageIntentDomainId, StorageIntentEvidenceId, StorageIntentEvidenceKind,
     StorageIntentEvidenceQuerySnapshot, StorageIntentEvidenceRef, StorageIntentEvidenceRefs,
     StorageIntentObjectScope, StorageIntentPolicyId, StorageIntentPolicyRevision,
-    StorageIntentRefusalReason, StorageMediaClass,
+    StorageIntentRefusalReason, StorageMediaClass, StorageMediaRole,
 };
 use tidefs_storage_intent_cost::{
     StorageIntentCostClass, StorageIntentCostEvidenceState, StorageIntentCostSnapshot,
@@ -1093,6 +1093,8 @@ impl PrefetchExecutorInterruptionClass {
 pub struct PrefetchExecutorMediaPath {
     pub source_media: StorageMediaClass,
     pub target_media: StorageMediaClass,
+    pub source_role: StorageMediaRole,
+    pub target_role: StorageMediaRole,
     pub source_path_ref: StorageIntentEvidenceRef,
     pub target_destination_ref: StorageIntentEvidenceRef,
     pub media_capability_ref: StorageIntentEvidenceRef,
@@ -1106,6 +1108,8 @@ impl Default for PrefetchExecutorMediaPath {
         Self {
             source_media: StorageMediaClass::SystemRam,
             target_media: StorageMediaClass::SystemRam,
+            source_role: StorageMediaRole::ServingDataHot,
+            target_role: StorageMediaRole::ReadCache,
             source_path_ref: EMPTY_EVIDENCE_REF,
             target_destination_ref: EMPTY_EVIDENCE_REF,
             media_capability_ref: EMPTY_EVIDENCE_REF,
@@ -1426,6 +1430,8 @@ pub struct PrefetchExecutorRecord {
     pub executor_byte_state: PrefetchExecutorByteState,
     pub source_media: StorageMediaClass,
     pub target_media: StorageMediaClass,
+    pub source_media_role: StorageMediaRole,
+    pub target_media_role: StorageMediaRole,
     pub source_path_ref: StorageIntentEvidenceRef,
     pub target_destination_ref: StorageIntentEvidenceRef,
     pub dispatch_plan: PrefetchExecutorDispatchPlan,
@@ -1462,6 +1468,8 @@ impl Default for PrefetchExecutorRecord {
             executor_byte_state: PrefetchExecutorByteState::Unknown,
             source_media: StorageMediaClass::SystemRam,
             target_media: StorageMediaClass::SystemRam,
+            source_media_role: StorageMediaRole::ServingDataHot,
+            target_media_role: StorageMediaRole::ReadCache,
             source_path_ref: EMPTY_EVIDENCE_REF,
             target_destination_ref: EMPTY_EVIDENCE_REF,
             dispatch_plan: PrefetchExecutorDispatchPlan::default(),
@@ -2101,6 +2109,8 @@ fn base_record(input: PrefetchExecutorInput) -> PrefetchExecutorRecord {
         decision_outcome: input.decision.outcome,
         source_media: input.decision.source_media,
         target_media: input.decision.target_media,
+        source_media_role: input.media_path.source_role,
+        target_media_role: input.media_path.target_role,
         source_path_ref: input.media_path.source_path_ref,
         target_destination_ref: input.media_path.target_destination_ref,
         dispatch_plan: input.dispatch_plan,
@@ -2930,6 +2940,11 @@ fn runtime_dispatch_evidence_refusal(
         return StorageIntentRefusalReason::PolicyConflict;
     }
 
+    let media_role_refusal = runtime_dispatch_media_role_refusal(input, family);
+    if media_role_refusal as u16 != StorageIntentRefusalReason::None as u16 {
+        return media_role_refusal;
+    }
+
     if !snapshot_contains_fresh_ref(
         input,
         StorageIntentEvidenceKind::ReadFreshnessEvidence,
@@ -3261,6 +3276,60 @@ fn runtime_dispatch_needs_transport_or_trust(
         || media_needs_transport_or_trust(input.decision.target_media)
         || media_needs_transport_or_trust(input.media_path.source_media)
         || media_needs_transport_or_trust(input.media_path.target_media)
+}
+
+fn runtime_dispatch_media_role_refusal(
+    input: PrefetchExecutorInput,
+    family: PrefetchExecutorActionFamily,
+) -> StorageIntentRefusalReason {
+    if !family.can_start_runtime_dispatch() {
+        return StorageIntentRefusalReason::None;
+    }
+
+    if !source_media_role_can_feed_executor(input.media_path.source_role, family)
+        || !target_media_role_can_receive_executor(input.media_path.target_role)
+    {
+        StorageIntentRefusalReason::MediaRoleNotAllowed
+    } else {
+        StorageIntentRefusalReason::None
+    }
+}
+
+const fn source_media_role_can_feed_executor(
+    role: StorageMediaRole,
+    family: PrefetchExecutorActionFamily,
+) -> bool {
+    match role {
+        StorageMediaRole::ScratchVolatile | StorageMediaRole::OptimizerTemp => false,
+        StorageMediaRole::RepairTemp => {
+            matches!(
+                family,
+                PrefetchExecutorActionFamily::DegradedReadReconstruction
+            )
+        }
+        StorageMediaRole::SyncIntent
+        | StorageMediaRole::MetadataHot
+        | StorageMediaRole::ServingDataHot
+        | StorageMediaRole::BulkDataCold
+        | StorageMediaRole::ReadCache
+        | StorageMediaRole::RamCache
+        | StorageMediaRole::RamVolatileAuthority
+        | StorageMediaRole::RamIntentBackedAuthority
+        | StorageMediaRole::PlacementAuthority
+        | StorageMediaRole::GeoAsyncReplica
+        | StorageMediaRole::ArchiveEc => true,
+    }
+}
+
+const fn target_media_role_can_receive_executor(role: StorageMediaRole) -> bool {
+    matches!(
+        role,
+        StorageMediaRole::ScratchVolatile
+            | StorageMediaRole::RepairTemp
+            | StorageMediaRole::ReadCache
+            | StorageMediaRole::RamCache
+            | StorageMediaRole::OptimizerTemp
+    )
 }
 
 const fn media_needs_transport_or_trust(media: StorageMediaClass) -> bool {
@@ -5462,6 +5531,131 @@ mod tests {
         );
         assert_eq!(target_conflict_record.target_media, expected_target);
         assert_record_has_no_authority_claims(target_conflict_record);
+    }
+
+    #[test]
+    fn runtime_dispatch_records_media_roles_and_refuses_authority_targets() {
+        let mut cache_target = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        cache_target.media_path.source_role = StorageMediaRole::BulkDataCold;
+        cache_target.media_path.target_role = StorageMediaRole::ReadCache;
+        let cache_record = evaluate_prefetch_execution(cache_target);
+        assert_eq!(cache_record.outcome, PrefetchExecutorOutcome::Started);
+        assert_eq!(
+            cache_record.source_media_role,
+            StorageMediaRole::BulkDataCold
+        );
+        assert_eq!(cache_record.target_media_role, StorageMediaRole::ReadCache);
+        assert_record_has_no_authority_claims(cache_record);
+
+        let mut placement_target =
+            admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        placement_target.media_path.target_role = StorageMediaRole::PlacementAuthority;
+        let placement_record = evaluate_prefetch_execution(placement_target);
+        assert_eq!(placement_record.outcome, PrefetchExecutorOutcome::Blocked);
+        assert_eq!(
+            placement_record.executor_byte_state,
+            PrefetchExecutorByteState::Blocked
+        );
+        assert_eq!(
+            placement_record.refusal,
+            StorageIntentRefusalReason::MediaRoleNotAllowed
+        );
+        assert_eq!(
+            placement_record.target_media_role,
+            StorageMediaRole::PlacementAuthority
+        );
+        assert_record_has_no_authority_claims(placement_record);
+
+        let mut ram_authority_target =
+            admitted_input(PrefetchResidencyCandidateClass::SmallRandomHotsetTrial);
+        ram_authority_target.media_path.target_role = StorageMediaRole::RamVolatileAuthority;
+        let ram_authority_record = evaluate_prefetch_execution(ram_authority_target);
+        assert_eq!(
+            ram_authority_record.outcome,
+            PrefetchExecutorOutcome::Blocked
+        );
+        assert_eq!(
+            ram_authority_record.refusal,
+            StorageIntentRefusalReason::MediaRoleNotAllowed
+        );
+        assert_record_has_no_authority_claims(ram_authority_record);
+    }
+
+    #[test]
+    fn runtime_dispatch_allows_only_staging_roles_for_remote_targets() {
+        let mut staged = admitted_input(PrefetchResidencyCandidateClass::WanGeoDeltaPrefetch);
+        staged.media_path.source_role = StorageMediaRole::GeoAsyncReplica;
+        staged.media_path.target_role = StorageMediaRole::OptimizerTemp;
+        staged.evidence_query_snapshot =
+            snapshot(Some(StorageIntentEvidenceKind::TransportPathEvidence));
+        add_fresh(
+            &mut staged.evidence_query_snapshot,
+            StorageIntentEvidenceKind::TrustDomainEvidence,
+            TRUST,
+        );
+        let staged_record = evaluate_prefetch_execution(staged);
+        assert_eq!(staged_record.outcome, PrefetchExecutorOutcome::Started);
+        assert_eq!(
+            staged_record.executor_byte_state,
+            PrefetchExecutorByteState::Staged
+        );
+        assert_eq!(
+            staged_record.target_media_role,
+            StorageMediaRole::OptimizerTemp
+        );
+        assert_record_has_no_authority_claims(staged_record);
+
+        let mut geo_authority_target =
+            admitted_input(PrefetchResidencyCandidateClass::WanGeoDeltaPrefetch);
+        geo_authority_target.media_path.source_role = StorageMediaRole::GeoAsyncReplica;
+        geo_authority_target.media_path.target_role = StorageMediaRole::GeoAsyncReplica;
+        geo_authority_target.evidence_query_snapshot =
+            snapshot(Some(StorageIntentEvidenceKind::TransportPathEvidence));
+        add_fresh(
+            &mut geo_authority_target.evidence_query_snapshot,
+            StorageIntentEvidenceKind::TrustDomainEvidence,
+            TRUST,
+        );
+        let geo_authority_record = evaluate_prefetch_execution(geo_authority_target);
+        assert_eq!(
+            geo_authority_record.outcome,
+            PrefetchExecutorOutcome::Blocked
+        );
+        assert_eq!(
+            geo_authority_record.refusal,
+            StorageIntentRefusalReason::MediaRoleNotAllowed
+        );
+        assert_record_has_no_authority_claims(geo_authority_record);
+    }
+
+    #[test]
+    fn runtime_dispatch_refuses_temporary_sources_except_degraded_reconstruction() {
+        let mut scratch_source = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        scratch_source.media_path.source_role = StorageMediaRole::ScratchVolatile;
+        let scratch_record = evaluate_prefetch_execution(scratch_source);
+        assert_eq!(scratch_record.outcome, PrefetchExecutorOutcome::Blocked);
+        assert_eq!(
+            scratch_record.refusal,
+            StorageIntentRefusalReason::MediaRoleNotAllowed
+        );
+        assert_record_has_no_authority_claims(scratch_record);
+
+        let mut repair_source =
+            admitted_input(PrefetchResidencyCandidateClass::DegradedReadPrefetch);
+        repair_source.media_path.source_role = StorageMediaRole::RepairTemp;
+        repair_source.media_path.target_role = StorageMediaRole::RepairTemp;
+        add_recovery_degradation_evidence(&mut repair_source);
+        let repair_record = evaluate_prefetch_execution(repair_source);
+        assert_eq!(repair_record.outcome, PrefetchExecutorOutcome::Started);
+        assert_eq!(
+            repair_record.source_media_role,
+            StorageMediaRole::RepairTemp
+        );
+        assert_eq!(
+            repair_record.target_media_role,
+            StorageMediaRole::RepairTemp
+        );
+        assert_record_has_no_authority_claims(repair_record);
     }
 
     #[test]
