@@ -589,7 +589,7 @@ pub(crate) fn encode_changed_record_export(export: &ChangedRecordExport) -> Vec<
     let stream_version =
         changed_record_stream_version(export.from_root.is_some(), export.placement_epoch.is_some());
     push_u16(&mut out, stream_version);
-    push_u16(&mut out, 0); // reserved
+    push_u16(&mut out, CHANGED_RECORD_STREAM_HAS_TRANSFORM_CONTRACT);
     encode_committed_root_summary(&mut out, &export.current_root);
     // For incremental streams (version >= 2), encode the baseline root.
     if let Some(ref from_root) = export.from_root {
@@ -599,6 +599,8 @@ pub(crate) fn encode_changed_record_export(export: &ChangedRecordExport) -> Vec<
     if let Some(epoch) = export.placement_epoch {
         push_u64(&mut out, epoch);
     }
+    push_u16(&mut out, export.transform_contract.as_u16());
+    push_u16(&mut out, 0); // reserved transform-contract field
     push_u64(&mut out, export.roots.len() as u64);
     for root in &export.roots {
         encode_committed_root_summary(&mut out, &root.source_root);
@@ -620,10 +622,11 @@ pub(crate) fn decode_changed_record_export(bytes: &[u8]) -> Result<ChangedRecord
     decoder.expect_magic(SEND_RECEIVE_STREAM_MAGIC_BYTES)?;
     let stream_version = decoder.read_u16()?;
     let envelope = decode_changed_record_stream_version(stream_version)?;
-    if decoder.read_u16()? != 0 {
+    let flags = decoder.read_u16()?;
+    if flags & !CHANGED_RECORD_STREAM_HAS_TRANSFORM_CONTRACT != 0 {
         return Err(FileSystemError::Decode {
             object: "local filesystem send/receive stream",
-            reason: "reserved field is non-zero",
+            reason: "reserved stream flags are set",
         });
     }
     let current_root = decode_committed_root_summary(&mut decoder)?;
@@ -637,6 +640,19 @@ pub(crate) fn decode_changed_record_export(bytes: &[u8]) -> Result<ChangedRecord
     } else {
         None
     };
+    if flags & CHANGED_RECORD_STREAM_HAS_TRANSFORM_CONTRACT == 0 {
+        return Err(FileSystemError::Decode {
+            object: "local filesystem send/receive stream",
+            reason: "stream is missing transform contract",
+        });
+    }
+    let transform_contract = ChangedRecordTransformContract::try_from(decoder.read_u16()?)?;
+    if decoder.read_u16()? != 0 {
+        return Err(FileSystemError::Decode {
+            object: "local filesystem send/receive stream",
+            reason: "reserved transform-contract field is non-zero",
+        });
+    }
     let root_count = decoder.read_count()?;
     let mut roots = Vec::with_capacity(root_count);
     let mut total_records = 0_u64;
@@ -695,6 +711,7 @@ pub(crate) fn decode_changed_record_export(bytes: &[u8]) -> Result<ChangedRecord
         production_fsck_required: false,
         incremental,
         placement_epoch,
+        transform_contract,
     })
 }
 
@@ -712,6 +729,8 @@ fn changed_record_stream_version(incremental: bool, has_placement_epoch: bool) -
         (true, true) => 4,
     }
 }
+
+const CHANGED_RECORD_STREAM_HAS_TRANSFORM_CONTRACT: u16 = 0x0001;
 
 fn decode_changed_record_stream_version(
     stream_version: u16,
@@ -1873,6 +1892,7 @@ mod tests {
             from_root,
             incremental,
             placement_epoch,
+            transform_contract: ChangedRecordTransformContract::StoredFrameNoDeviceTransforms,
         }
     }
 
@@ -1902,7 +1922,28 @@ mod tests {
             assert_eq!(decoded.incremental, from_root.is_some());
             assert_eq!(decoded.from_root, from_root);
             assert_eq!(decoded.placement_epoch, placement_epoch);
+            assert_eq!(
+                decoded.transform_contract,
+                ChangedRecordTransformContract::StoredFrameNoDeviceTransforms
+            );
         }
+    }
+
+    #[test]
+    fn changed_record_version_authority_rejects_missing_transform_contract() {
+        let export = changed_record_export(None, None, Vec::new());
+        let mut encoded = encode_changed_record_export(&export);
+        let flags_offset = SEND_RECEIVE_STREAM_MAGIC_BYTES.len() + 2;
+        encoded[flags_offset..flags_offset + 2].copy_from_slice(&0_u16.to_le_bytes());
+
+        let err = decode_changed_record_export(&encoded).expect_err("missing transform contract");
+        assert!(matches!(
+            err,
+            FileSystemError::Decode {
+                object: "local filesystem send/receive stream",
+                reason: "stream is missing transform contract",
+            }
+        ));
     }
 
     #[test]

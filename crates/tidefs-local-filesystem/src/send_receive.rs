@@ -57,6 +57,7 @@ pub(crate) struct PreparedChangedRecordExport {
     stream_version: u16,
     /// Placement epoch from the decoded export; None when sender did not track it.
     placement_epoch: Option<u64>,
+    transform_contract: ChangedRecordTransformContract,
 }
 
 pub(crate) fn export_changed_records_from_root(
@@ -107,6 +108,7 @@ pub(crate) fn export_changed_records_from_root(
         from_root: None,
         incremental: false,
         placement_epoch,
+        transform_contract: ChangedRecordTransformContract::StoredFrameNoDeviceTransforms,
     })
 }
 
@@ -235,6 +237,7 @@ pub(crate) fn export_incremental_changed_records(
         production_fsck_required: false,
         incremental: true,
         placement_epoch,
+        transform_contract: ChangedRecordTransformContract::StoredFrameNoDeviceTransforms,
     })
 }
 
@@ -384,6 +387,18 @@ pub(crate) fn validate_sender_authority_for_receive(
     }
 }
 
+pub(crate) fn validate_changed_record_transform_contract(
+    contract: ChangedRecordTransformContract,
+) -> Result<()> {
+    if contract.requires_typed_metadata() {
+        return Err(FileSystemError::Unsupported {
+            operation: "send/receive transform contract",
+            reason: "mounted device transforms require typed transform metadata before changed-record streams can be imported",
+        });
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_changed_record_export(
     export: &ChangedRecordExport,
     is_incremental: bool,
@@ -401,6 +416,7 @@ pub(crate) fn validate_changed_record_export(
             reason: "unsupported stream version",
         });
     }
+    validate_changed_record_transform_contract(export.transform_contract)?;
     if export.roots.is_empty() {
         return Err(FileSystemError::Decode {
             object: "local filesystem send/receive stream",
@@ -522,6 +538,7 @@ pub(crate) fn validate_changed_record_export(
         payload_bytes,
         stream_version: export.stream_version,
         placement_epoch: export.placement_epoch,
+        transform_contract: export.transform_contract,
     })
 }
 
@@ -1976,6 +1993,7 @@ pub(crate) fn compute_export_identity(export: &ChangedRecordExport) -> Integrity
     let mut hasher = blake3::Hasher::new();
     hasher.update(export.spec.as_bytes());
     hasher.update(&export.stream_version.to_le_bytes());
+    hasher.update(&export.transform_contract.as_u16().to_le_bytes());
     // Hash the sorted root identities so order does not matter.
     let mut root_ids: Vec<RootIdentity> = export
         .roots
@@ -2304,6 +2322,7 @@ fn compute_export_identity_from_prepared(
     let mut hasher = blake3::Hasher::new();
     hasher.update(SEND_RECEIVE_CHANGED_RECORD_SPEC.as_bytes());
     hasher.update(&prepared.stream_version.to_le_bytes());
+    hasher.update(&prepared.transform_contract.as_u16().to_le_bytes());
     let mut root_ids: Vec<RootIdentity> = prepared
         .roots
         .iter()
@@ -2457,10 +2476,67 @@ mod tests {
             from_root: None,
             incremental: false,
             placement_epoch: None,
+            transform_contract: ChangedRecordTransformContract::StoredFrameNoDeviceTransforms,
         };
         let id1 = compute_export_identity(&export);
         let id2 = compute_export_identity(&export);
         assert_eq!(id1, id2, "same export must produce same identity");
+
+        let mut transform_required = export.clone();
+        transform_required.transform_contract =
+            ChangedRecordTransformContract::MountedDeviceTransformsRequireTypedMetadata;
+        assert_ne!(
+            compute_export_identity(&export),
+            compute_export_identity(&transform_required),
+            "receive checkpoint identity must include the transform contract"
+        );
+    }
+
+    #[test]
+    fn transform_required_changed_record_streams_fail_closed() {
+        use crate::types::CommittedRootSummary;
+
+        let summary = CommittedRootSummary {
+            slot: 0,
+            transaction_id: 1,
+            generation: 1,
+            next_inode_id: 2,
+            inode_count: 1,
+            superblock_checksum: IntegrityDigest64(0xABCD),
+            has_transaction_manifest: true,
+            manifest_checksum: IntegrityDigest64(0x1234),
+            manifest_entry_count: 0,
+            has_root_authentication: true,
+            root_authentication_policy_epoch: Some(1),
+            root_authentication_algorithm_suite_id: Some(1),
+            superblock_digest: None,
+            manifest_digest: None,
+            root_authentication_code: None,
+        };
+        let export = ChangedRecordExport {
+            spec: SEND_RECEIVE_CHANGED_RECORD_SPEC,
+            stream_version: SEND_RECEIVE_STREAM_VERSION,
+            current_root: summary,
+            roots: Vec::new(),
+            total_records: 0,
+            payload_bytes: 0,
+            production_fsck_required: false,
+            from_root: None,
+            incremental: false,
+            placement_epoch: None,
+            transform_contract:
+                ChangedRecordTransformContract::MountedDeviceTransformsRequireTypedMetadata,
+        };
+
+        let err = validate_changed_record_export(&export, false)
+            .expect_err("transform-required stream must fail before import");
+        assert!(matches!(
+            err,
+            FileSystemError::Unsupported {
+                operation: "send/receive transform contract",
+                reason: "mounted device transforms require typed transform metadata before changed-record streams can be imported",
+            }
+        ));
     }
 
     /// compute_export_identity differs for different exports.
@@ -2520,6 +2596,7 @@ mod tests {
             from_root: None,
             incremental: false,
             placement_epoch: None,
+            transform_contract: ChangedRecordTransformContract::StoredFrameNoDeviceTransforms,
         };
         let export2 = ChangedRecordExport {
             spec: SEND_RECEIVE_CHANGED_RECORD_SPEC,
@@ -2532,6 +2609,7 @@ mod tests {
             from_root: None,
             incremental: false,
             placement_epoch: None,
+            transform_contract: ChangedRecordTransformContract::StoredFrameNoDeviceTransforms,
         };
         assert_ne!(
             compute_export_identity(&export1),
@@ -2994,6 +3072,8 @@ mod tests {
             from_root: None,
             incremental: false,
             placement_epoch: Some(7),
+            transform_contract:
+                crate::ChangedRecordTransformContract::StoredFrameNoDeviceTransforms,
         };
 
         let encoded = encode_changed_record_export(&export);
@@ -3007,7 +3087,7 @@ mod tests {
     }
 
     #[test]
-    fn placement_epoch_none_is_backward_compatible() {
+    fn placement_epoch_none_keeps_base_stream_version() {
         use crate::encoding::{decode_changed_record_export, encode_changed_record_export};
 
         fn make_summary(txid: u64) -> crate::types::CommittedRootSummary {
@@ -3045,6 +3125,8 @@ mod tests {
             from_root: None,
             incremental: false,
             placement_epoch: None,
+            transform_contract:
+                crate::ChangedRecordTransformContract::StoredFrameNoDeviceTransforms,
         };
 
         let encoded = encode_changed_record_export(&export);
@@ -3096,6 +3178,8 @@ mod tests {
             from_root: Some(base),
             incremental: true,
             placement_epoch: Some(42),
+            transform_contract:
+                crate::ChangedRecordTransformContract::StoredFrameNoDeviceTransforms,
         };
 
         let encoded = encode_changed_record_export(&export);
@@ -3146,6 +3230,8 @@ mod tests {
             from_root: None,
             incremental: false,
             placement_epoch: Some(100),
+            transform_contract:
+                crate::ChangedRecordTransformContract::StoredFrameNoDeviceTransforms,
         };
 
         let encoded = encode_changed_record_export(&export);

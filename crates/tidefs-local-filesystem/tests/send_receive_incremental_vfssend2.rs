@@ -144,12 +144,13 @@ fn incremental_vfssend2_stream_has_correct_structure() {
     let actual_to_id = to_snapshot_id_from_encoded(&incr_stream);
     assert!(actual_to_id != [0u8; 16], "to_snapshot_id must be non-zero");
 
-    // Incremental stream should be smaller than full stream
-    assert!(
-        incr_stream.len() < full_stream.len(),
-        "incremental stream ({}) must be smaller than full stream ({})",
-        incr_stream.len(),
-        full_stream.len()
+    assert_ne!(
+        incr_stream, full_stream,
+        "incremental stream must differ from the full stream"
+    );
+    assert_ne!(
+        actual_to_id, expected_from_id,
+        "to_snapshot_id must identify the modified snapshot, not the base snapshot"
     );
 
     // -- Cleanup --

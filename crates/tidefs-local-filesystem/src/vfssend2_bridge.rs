@@ -55,7 +55,7 @@ use tidefs_local_object_store::IntegrityDigest64;
 use crate::error::FileSystemError;
 use crate::types::{
     ChangedObjectRecord, ChangedRecordExport, ChangedRecordObjectRole, ChangedRecordRoot,
-    CommittedRootSummary,
+    ChangedRecordTransformContract, CommittedRootSummary,
 };
 
 const CHANGED_RECORD_METADATA_MAGIC: [u8; 8] = *b"VFS1META";
@@ -432,6 +432,7 @@ mod tests {
             from_root: None,
             incremental: false,
             placement_epoch: None,
+            transform_contract: ChangedRecordTransformContract::StoredFrameNoDeviceTransforms,
         };
         let pool_id = [1u8; 16];
         let dataset_id = [2u8; 16];
@@ -464,6 +465,7 @@ mod tests {
             from_root: None,
             incremental: false,
             placement_epoch: None,
+            transform_contract: ChangedRecordTransformContract::StoredFrameNoDeviceTransforms,
         };
         let pool_id = [1u8; 16];
         let dataset_id = [2u8; 16];
@@ -501,6 +503,7 @@ mod tests {
             from_root: None,
             incremental: false,
             placement_epoch: None,
+            transform_contract: ChangedRecordTransformContract::StoredFrameNoDeviceTransforms,
         };
         assert!(export.sender_authority().is_absent_local_only());
 
@@ -547,6 +550,7 @@ mod tests {
             from_root: None,
             incremental: false,
             placement_epoch: None,
+            transform_contract: ChangedRecordTransformContract::StoredFrameNoDeviceTransforms,
         };
         let pool_id = [1u8; 16];
         let dataset_id = [2u8; 16];
@@ -592,6 +596,7 @@ mod tests {
             from_root: None,
             incremental: false,
             placement_epoch: None,
+            transform_contract: ChangedRecordTransformContract::StoredFrameNoDeviceTransforms,
         };
         let encoded = export_vfssend2_from_changed_records(&export, [1u8; 16], [2u8; 16]).unwrap();
 
@@ -631,6 +636,7 @@ mod tests {
             from_root: Some(from_summary.clone()),
             incremental: true,
             placement_epoch: None,
+            transform_contract: ChangedRecordTransformContract::StoredFrameNoDeviceTransforms,
         };
         let encoded =
             export_incremental_vfssend2_from_changed_records(&export, [1u8; 16], [2u8; 16])
@@ -722,6 +728,7 @@ mod tests {
             from_root: Some(from_summary.clone()),
             incremental: true,
             placement_epoch: None,
+            transform_contract: ChangedRecordTransformContract::StoredFrameNoDeviceTransforms,
         };
         let pool_id = [11u8; 16];
         let dataset_id = [22u8; 16];
@@ -768,6 +775,7 @@ mod tests {
             from_root: None,
             incremental: false,
             placement_epoch: None,
+            transform_contract: ChangedRecordTransformContract::StoredFrameNoDeviceTransforms,
         };
         let pool_id = [1u8; 16];
         let dataset_id = [2u8; 16];
@@ -799,6 +807,7 @@ mod tests {
             production_fsck_required: false,
             from_root: None,
             placement_epoch: None,
+            transform_contract: ChangedRecordTransformContract::StoredFrameNoDeviceTransforms,
             incremental: true, // flagged incremental but missing from_root
         };
         let pool_id = [1u8; 16];
@@ -980,6 +989,7 @@ pub fn receive_vfssend2_to_changed_records(
         from_root,
         placement_epoch: None,
         incremental,
+        transform_contract: ChangedRecordTransformContract::StoredFrameNoDeviceTransforms,
     })
 }
 
