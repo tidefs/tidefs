@@ -94,7 +94,7 @@ pub fn check_membership_epoch_model_current_workspace() -> Result<(), ClusterChe
     );
     if missing.is_empty() {
         println!(
-            "OW-302 membership epoch model ok: epochs, failure-domain placement, split-brain refusal, cohort exclusion, and learner rejoin gates are implementation-tracked non-release"
+            "membership epoch model ok: epochs, failure-domain placement, split-brain refusal, cohort exclusion, and learner rejoin gates are implementation-tracked non-release"
         );
         Ok(())
     } else {
@@ -121,7 +121,6 @@ pub fn check_failure_domain_placement_current_workspace() -> Result<(), ClusterC
         &root,
         "crates/tidefs-membership-epoch/src/lib.rs",
         &[
-            "FAILURE_DOMAIN_PLACEMENT_GATE_OW_303",
             "AntiAffinityClass",
             "FailureDomainPlacementPolicy",
             "FailureDomainPlacementPlan",
@@ -145,7 +144,7 @@ pub fn check_failure_domain_placement_current_workspace() -> Result<(), ClusterC
     );
     if missing.is_empty() {
         println!(
-            "OW-303 failure-domain placement ok: deterministic target choice, strict anti-affinity, degraded duplicate-domain visibility, and ineligible-member exclusion are implementation-tracked non-release"
+            "failure-domain placement ok: deterministic target choice, strict anti-affinity, degraded duplicate-domain visibility, and ineligible-member exclusion are implementation-tracked non-release"
         );
         Ok(())
     } else {
@@ -181,7 +180,6 @@ pub fn check_replicated_storage_model_current_workspace() -> Result<(), ClusterC
         &root,
         "crates/tidefs-replication-model/src/lib.rs",
         &[
-            "REPLICATED_OBJECT_ROOT_STORAGE_GATE_OW_304",
             "ReplicatedObjectRootRecord",
             "ReplicaCopyRecord",
             "ReplicatedWritePlan",
@@ -209,7 +207,7 @@ pub fn check_replicated_storage_model_current_workspace() -> Result<(), ClusterC
     );
     if missing.is_empty() {
         println!(
-            "OW-304 replicated object/root storage ok: degraded write, degraded read, no-quorum refusal, and rebuild restoration tests are implementation-tracked non-release"
+            "replicated object/root storage ok: degraded write, degraded read, no-quorum refusal, and rebuild restoration tests are implementation-tracked non-release"
         );
         Ok(())
     } else {
@@ -236,7 +234,6 @@ pub fn check_rebuild_backfill_rebalance_current_workspace() -> Result<(), Cluste
         &root,
         "crates/tidefs-replication-model/src/lib.rs",
         &[
-            "REBUILD_BACKFILL_REBALANCE_GATE_OW_305",
             "ReplicaMovementIntentRecord",
             "ReplicaCapacityRecord",
             "ReplicaMovementPlan",
@@ -264,7 +261,7 @@ pub fn check_rebuild_backfill_rebalance_current_workspace() -> Result<(), Cluste
     );
     if missing.is_empty() {
         println!(
-            "OW-305 rebuild/backfill/rebalance ok: faulted-copy rebuild, lagged-copy backfill, capacity rebalance, and reserve-floor blockage are implementation-tracked non-release"
+            "rebuild/backfill/rebalance ok: faulted-copy rebuild, lagged-copy backfill, capacity rebalance, and reserve-floor blockage are implementation-tracked non-release"
         );
         Ok(())
     } else {
@@ -290,7 +287,6 @@ pub fn check_erasure_coded_layout_current_workspace() -> Result<(), ClusterCheck
         &root,
         "crates/tidefs-replication-model/src/lib.rs",
         &[
-            "ERASURE_CODED_LAYOUT_GATE_OW_306",
             "ErasureLayoutPolicy",
             "ErasureShardRecord",
             "ErasureStripeRecord",
@@ -309,7 +305,6 @@ pub fn check_erasure_coded_layout_current_workspace() -> Result<(), ClusterCheck
         &root,
         "docs/ERASURE_CODED_LAYOUT_OW306.md",
         &[
-            "OW-306 executable erasure-coded layout slice",
             "`encode_single_parity_erasure_stripe()`",
             "`decode_single_parity_erasure_stripe()`",
             "single missing data shard",
@@ -320,7 +315,7 @@ pub fn check_erasure_coded_layout_current_workspace() -> Result<(), ClusterCheck
     );
     if missing.is_empty() {
         println!(
-            "OW-306 erasure-coded layout ok: single-parity decode, data-shard rebuild, parity rebuild, and too-many-missing refusal are implementation-tracked non-release"
+            "erasure-coded layout ok: single-parity decode, data-shard rebuild, parity rebuild, and too-many-missing refusal are implementation-tracked non-release"
         );
         Ok(())
     } else {

@@ -45,7 +45,6 @@ pub fn check_block_volume_adapter_core_current_workspace() -> Result<(), BlockCh
         &root,
         "crates/tidefs-block-volume-adapter-core/src/lib.rs",
         &[
-            "BLOCK_VOLUME_ADAPTER_CORE_GATE_OW_301A",
             "BlockVolumeGeometryRecord",
             "BlockVolumeDirtyRangeEpochRecord",
             "BlockVolumeFlushBarrierRecord",
@@ -82,7 +81,7 @@ pub fn check_block_volume_adapter_core_current_workspace() -> Result<(), BlockCh
 
     if missing.is_empty() {
         println!(
-            "OW-301A block-volume adapter core ok: read/write exactness, flush barriers, discard intents, bounds refusal, and alignment refusal are implementation-tracked non-release"
+            "block-volume adapter core ok: read/write exactness, flush barriers, discard intents, bounds refusal, and alignment refusal are implementation-tracked non-release"
         );
         Ok(())
     } else {
@@ -107,7 +106,6 @@ pub fn check_block_volume_queue_admission_current_workspace() -> Result<(), Bloc
         &root,
         "crates/tidefs-block-volume-adapter-core/src/lib.rs",
         &[
-            "BLOCK_VOLUME_QUEUE_ADMISSION_GATE_OW_301B",
             "BlockVolumeQueueRuntime",
             "BlockVolumeQueueClassRecord",
             "BlockVolumeQueueSetRecord",
@@ -132,7 +130,7 @@ pub fn check_block_volume_queue_admission_current_workspace() -> Result<(), Bloc
     );
     if missing.is_empty() {
         println!(
-            "OW-301B block-volume queue admission ok: queue classification, shard binding, backpressure refusal, export-fence refusal, flush epochs, and completion commits are implementation-tracked non-release"
+            "block-volume queue admission ok: queue classification, shard binding, backpressure refusal, export-fence refusal, flush epochs, and completion commits are implementation-tracked non-release"
         );
         Ok(())
     } else {
@@ -157,7 +155,6 @@ pub fn check_block_volume_dispatch_execution_current_workspace() -> Result<(), B
         &root,
         "crates/tidefs-block-volume-adapter-core/src/lib.rs",
         &[
-            "BLOCK_VOLUME_DISPATCH_EXECUTION_GATE_OW_301C",
             "BlockVolumeDispatchClass",
             "BlockVolumeDispatchExecutionRecord",
             "dispatch_submission_context",
@@ -172,7 +169,7 @@ pub fn check_block_volume_dispatch_execution_current_workspace() -> Result<(), B
     );
     if missing.is_empty() {
         println!(
-            "OW-301C block-volume dispatch execution ok: admitted read/write/flush/discard/write-zeroes dispatch, unadmitted refusal, payload-mismatch refusal, and completion release are implementation-tracked non-release"
+            "block-volume dispatch execution ok: admitted read/write/flush/discard/write-zeroes dispatch, unadmitted refusal, payload-mismatch refusal, and completion release are implementation-tracked non-release"
         );
         Ok(())
     } else {
@@ -197,7 +194,6 @@ pub fn check_block_volume_export_lifecycle_current_workspace() -> Result<(), Blo
         &root,
         "crates/tidefs-block-volume-adapter-core/src/lib.rs",
         &[
-            "BLOCK_VOLUME_EXPORT_LIFECYCLE_GATE_OW_301D",
             "BlockVolumeExportPhaseClass",
             "BlockVolumeExportRuntimeRecord",
             "BlockVolumeExportLifecycleRuntime",
@@ -216,7 +212,7 @@ pub fn check_block_volume_export_lifecycle_current_workspace() -> Result<(), Blo
     );
     if missing.is_empty() {
         println!(
-            "OW-301D block-volume export lifecycle ok: bootstrap, queue-live admission, quiesce classification, drain-before-fence, resume, and stop gates are implementation-tracked non-release"
+            "block-volume export lifecycle ok: bootstrap, queue-live admission, quiesce classification, drain-before-fence, resume, and stop gates are implementation-tracked non-release"
         );
         Ok(())
     } else {
@@ -241,7 +237,6 @@ pub fn check_block_volume_cache_coherency_current_workspace() -> Result<(), Bloc
         &root,
         "crates/tidefs-block-volume-adapter-core/src/lib.rs",
         &[
-            "BLOCK_VOLUME_CACHE_COHERENCY_GATE_OW_301E",
             "BlockVolumeCacheCoherencyRuntime",
             "BlockVolumeReadCacheWindowRecord",
             "BlockVolumeCacheDirtyEpochRecord",
@@ -265,7 +260,7 @@ pub fn check_block_volume_cache_coherency_current_workspace() -> Result<(), Bloc
     );
     if missing.is_empty() {
         println!(
-            "OW-301E block-volume cache coherency ok: clean cache windows, dirty epochs, flush/FUA barriers, discard/write-zeroes invalidation, direct-overlap guards, and non-authoritative cache loss are implementation-tracked non-release"
+            "block-volume cache coherency ok: clean cache windows, dirty epochs, flush/FUA barriers, discard/write-zeroes invalidation, direct-overlap guards, and non-authoritative cache loss are implementation-tracked non-release"
         );
         Ok(())
     } else {
@@ -290,7 +285,6 @@ pub fn check_block_volume_resize_fence_current_workspace() -> Result<(), BlockCh
         &root,
         "crates/tidefs-block-volume-adapter-core/src/lib.rs",
         &[
-            "BLOCK_VOLUME_RESIZE_FENCE_GATE_OW_301F",
             "BlockVolumeResizeFenceRuntime",
             "BlockVolumeResizeTransitionRecord",
             "BlockVolumeResizeTransitionOutcomeClass",
@@ -309,7 +303,7 @@ pub fn check_block_volume_resize_fence_current_workspace() -> Result<(), BlockCh
     );
     if missing.is_empty() {
         println!(
-            "OW-301F block-volume resize/fence ok: capacity targets, affected tail ranges, grow zero visibility, shrink drain refusal, no-authority refusal, and post-resize geometry publication are implementation-tracked non-release"
+            "block-volume resize/fence ok: capacity targets, affected tail ranges, grow zero visibility, shrink drain refusal, no-authority refusal, and post-resize geometry publication are implementation-tracked non-release"
         );
         Ok(())
     } else {
@@ -352,7 +346,6 @@ pub fn check_block_volume_host_preflight_current_workspace() -> Result<(), Block
         &root,
         "apps/tidefs-block-volume-adapter-daemon/src/main.rs",
         &[
-            "BLOCK_VOLUME_HOST_PREFLIGHT_GATE_OW_301H",
             "preflight-host",
             "run_host_preflight",
             "evaluate_host_preflight",
@@ -387,7 +380,7 @@ pub fn check_block_volume_host_preflight_current_workspace() -> Result<(), Block
     );
     if missing.is_empty() {
         println!(
-            "OW-301H block-volume host preflight ok: Linux host probe, ublk control-device readiness, explicit attach refusal, non-mutation, and proof hooks are implementation-tracked non-release"
+            "block-volume host preflight ok: Linux host probe, ublk control-device readiness, explicit attach refusal, non-mutation, and proof hooks are implementation-tracked non-release"
         );
         Ok(())
     } else {
@@ -423,7 +416,6 @@ pub fn check_block_volume_ublk_abi_current_workspace() -> Result<(), BlockCheckE
         &root,
         "crates/tidefs-ublk-abi/src/lib.rs",
         &[
-            "UBLK_ABI_GATE_OW_301I",
             "UBLK_CMD_GET_FEATURES",
             "UBLK_CMD_ADD_DEV",
             "UBLK_CMD_SET_PARAMS",
@@ -457,7 +449,6 @@ pub fn check_block_volume_ublk_abi_current_workspace() -> Result<(), BlockCheckE
         &root,
         "apps/tidefs-block-volume-adapter-daemon/src/main.rs",
         &[
-            "BLOCK_VOLUME_UBLK_ABI_PLAN_GATE_OW_301I",
             "ublk-abi-plan",
             "build_ublk_abi_plan_report",
             "features.required_mask",
@@ -470,7 +461,7 @@ pub fn check_block_volume_ublk_abi_current_workspace() -> Result<(), BlockCheckE
     );
     if missing.is_empty() {
         println!(
-            "OW-301I block-volume ublk ABI ok: Linux command numbers, ioctl encoding, record layouts, feature flags, dry-run control plan, and non-mutation claims are implementation-tracked non-release"
+            "block-volume ublk ABI ok: Linux command numbers, ioctl encoding, record layouts, feature flags, dry-run control plan, and non-mutation claims are implementation-tracked non-release"
         );
         Ok(())
     } else {
@@ -497,7 +488,6 @@ pub fn check_block_volume_file_backing_current_workspace() -> Result<(), BlockCh
         &root,
         "crates/tidefs-block-volume-adapter-core/src/lib.rs",
         &[
-            "BLOCK_VOLUME_FILE_IMAGE_BACKING_GATE_OW_301N",
             "BlockVolumeFileImage",
             "BlockVolumeFileImageError",
             "create_zeroed",
@@ -516,7 +506,6 @@ pub fn check_block_volume_file_backing_current_workspace() -> Result<(), BlockCh
         &root,
         "apps/tidefs-block-volume-adapter-daemon/src/main.rs",
         &[
-            "BLOCK_VOLUME_FILE_IMAGE_BACKING_GATE_OW_301N",
             "backing-file-smoke",
             "run_backing_file_smoke",
             "command.backing_file_smoke=backing-file-smoke",
@@ -538,7 +527,7 @@ pub fn check_block_volume_file_backing_current_workspace() -> Result<(), BlockCh
 
     if missing.is_empty() {
         println!(
-            "OW-301N block-volume file backing ok: real userspace backing files preserve read/write/flush/discard semantics with explicit no-ublk nonclaims"
+            "block-volume file backing ok: real userspace backing files preserve read/write/flush/discard semantics with explicit no-ublk nonclaims"
         );
         Ok(())
     } else {
@@ -567,7 +556,6 @@ pub fn check_block_volume_ublk_control_open_current_workspace() -> Result<(), Bl
         "apps/tidefs-block-volume-adapter-daemon/src/main.rs",
         &[
             "mod ublk_control_open",
-            "BLOCK_VOLUME_UBLK_CONTROL_OPEN_GATE_OW_301O",
             "ublk-control-open",
             "ublk-control-open-preflight",
             "command.ublk_control_open=ublk-control-open",
@@ -578,7 +566,6 @@ pub fn check_block_volume_ublk_control_open_current_workspace() -> Result<(), Bl
         &root,
         "apps/tidefs-block-volume-adapter-daemon/src/ublk_control_open/mod.rs",
         &[
-            "BLOCK_VOLUME_UBLK_CONTROL_OPEN_GATE_OW_301O",
             "OpenOptions::new()",
             ".read(true)",
             ".write(true)",
@@ -622,7 +609,7 @@ pub fn check_block_volume_ublk_control_open_current_workspace() -> Result<(), Bl
 
     if missing.is_empty() {
         println!(
-            "OW-301O block-volume ublk control open ok: real control-device admission opens only eligible hosts and records exact no-ioctl/no-block-device nonclaims"
+            "block-volume ublk control open ok: real control-device admission opens only eligible hosts and records exact no-ioctl/no-block-device nonclaims"
         );
         Ok(())
     } else {
@@ -666,7 +653,6 @@ pub fn check_block_volume_ublk_control_readonly_probe_current_workspace(
         &root,
         "crates/tidefs-block-volume-adapter-ublk-control-runtime/src/lib.rs",
         &[
-            "BLOCK_VOLUME_UBLK_CONTROL_READONLY_PROBE_GATE_OW_301P",
             "UblkControlReadonlyProbeCommand",
             "build_readonly_probe_spec",
             "UblkCtrlCommand::GetFeatures",
@@ -689,7 +675,6 @@ pub fn check_block_volume_ublk_control_readonly_probe_current_workspace(
         &root,
         "apps/tidefs-block-volume-adapter-daemon/src/main.rs",
         &[
-            "BLOCK_VOLUME_UBLK_CONTROL_READONLY_PROBE_GATE_OW_301P",
             "run_ublk_control_readonly_probe",
             "ublk-control-readonly-probe",
             "ublk-control-get-features",
@@ -731,7 +716,7 @@ pub fn check_block_volume_ublk_control_readonly_probe_current_workspace(
 
     if missing.is_empty() {
         println!(
-            "OW-301P block-volume ublk control read-only probe ok: admitted hosts can submit GET_FEATURES uring_cmd while mutating control commands and block-device creation remain explicitly absent"
+            "block-volume ublk control read-only probe ok: admitted hosts can submit GET_FEATURES uring_cmd while mutating control commands and block-device creation remain explicitly absent"
         );
         Ok(())
     } else {
@@ -759,7 +744,6 @@ pub fn check_block_volume_ublk_add_dev_boundary_current_workspace() -> Result<()
         &root,
         "crates/tidefs-block-volume-adapter-ublk-control-runtime/src/lib.rs",
         &[
-            "BLOCK_VOLUME_UBLK_CONTROL_ADD_DEV_GATE_OW_301Q",
             "UblkControlAddDevCommand",
             "UblkControlAddDevInput",
             "UblkControlAddDevSpec",
@@ -785,7 +769,6 @@ pub fn check_block_volume_ublk_add_dev_boundary_current_workspace() -> Result<()
         &root,
         "apps/tidefs-block-volume-adapter-daemon/src/main.rs",
         &[
-            "BLOCK_VOLUME_UBLK_CONTROL_ADD_DEV_GATE_OW_301Q",
             "run_ublk_control_add_dev_boundary",
             "ublk-control-add-dev",
             "ublk-add-dev-boundary",
@@ -832,7 +815,7 @@ pub fn check_block_volume_ublk_add_dev_boundary_current_workspace() -> Result<()
 
     if missing.is_empty() {
         println!(
-            "OW-301Q block-volume ublk ADD_DEV boundary ok: admitted hosts can reach the real ADD_DEV uring_cmd boundary while SET_PARAMS, START_DEV, data queues, and started block-device export remain absent"
+            "block-volume ublk ADD_DEV boundary ok: admitted hosts can reach the real ADD_DEV uring_cmd boundary while SET_PARAMS, START_DEV, data queues, and started block-device export remain absent"
         );
         Ok(())
     } else {
@@ -861,7 +844,6 @@ pub fn check_block_volume_ublk_del_dev_cleanup_boundary_current_workspace(
         &root,
         "crates/tidefs-block-volume-adapter-ublk-control-runtime/src/lib.rs",
         &[
-            "BLOCK_VOLUME_UBLK_CONTROL_DEL_DEV_GATE_OW_301R",
             "UblkControlDelDevCommand",
             "UblkControlDelDevInput",
             "UblkControlDelDevSpec",
@@ -886,7 +868,6 @@ pub fn check_block_volume_ublk_del_dev_cleanup_boundary_current_workspace(
         &root,
         "apps/tidefs-block-volume-adapter-daemon/src/main.rs",
         &[
-            "BLOCK_VOLUME_UBLK_CONTROL_DEL_DEV_GATE_OW_301R",
             "run_ublk_control_add_del_dev_boundary",
             "ublk-control-add-del-dev",
             "ublk-del-dev-cleanup-boundary",
@@ -932,7 +913,7 @@ pub fn check_block_volume_ublk_del_dev_cleanup_boundary_current_workspace(
 
     if missing.is_empty() {
         println!(
-            "OW-301R block-volume ublk DEL_DEV cleanup boundary ok: admitted hosts can clean up a successful ADD_DEV device pair while SET_PARAMS, START_DEV, data queues, and started block-device export remain absent"
+            "block-volume ublk DEL_DEV cleanup boundary ok: admitted hosts can clean up a successful ADD_DEV device pair while SET_PARAMS, START_DEV, data queues, and started block-device export remain absent"
         );
         Ok(())
     } else {
@@ -961,7 +942,6 @@ pub fn check_block_volume_ublk_set_params_boundary_current_workspace() -> Result
         &root,
         "crates/tidefs-block-volume-adapter-ublk-control-runtime/src/lib.rs",
         &[
-            "BLOCK_VOLUME_UBLK_CONTROL_SET_PARAMS_GATE_OW_301S",
             "UblkControlSetParamsCommand",
             "UblkControlSetParamsInput",
             "UblkControlSetParamsSpec",
@@ -987,7 +967,6 @@ pub fn check_block_volume_ublk_set_params_boundary_current_workspace() -> Result
         &root,
         "apps/tidefs-block-volume-adapter-daemon/src/main.rs",
         &[
-            "BLOCK_VOLUME_UBLK_CONTROL_SET_PARAMS_GATE_OW_301S",
             "run_ublk_control_set_params_boundary",
             "ublk-control-set-params",
             "ublk-set-params-boundary",
@@ -1032,7 +1011,7 @@ pub fn check_block_volume_ublk_set_params_boundary_current_workspace() -> Result
 
     if missing.is_empty() {
         println!(
-            "OW-301S block-volume ublk SET_PARAMS boundary ok: admitted hosts can project ublk_params into the real SET_PARAMS uring_cmd boundary with DEL_DEV cleanup while START_DEV, data queues, and started block-device export remain absent"
+            "block-volume ublk SET_PARAMS boundary ok: admitted hosts can project ublk_params into the real SET_PARAMS uring_cmd boundary with DEL_DEV cleanup while START_DEV, data queues, and started block-device export remain absent"
         );
         Ok(())
     } else {
@@ -1061,7 +1040,6 @@ pub fn check_block_volume_ublk_start_dev_boundary_current_workspace() -> Result<
         &root,
         "crates/tidefs-block-volume-adapter-ublk-control-runtime/src/lib.rs",
         &[
-            "BLOCK_VOLUME_UBLK_CONTROL_START_DEV_GATE_OW_301T",
             "UblkControlStartDevCommand",
             "UblkControlStartDevInput",
             "UblkControlStartDevSpec",
@@ -1086,7 +1064,6 @@ pub fn check_block_volume_ublk_start_dev_boundary_current_workspace() -> Result<
         &root,
         "apps/tidefs-block-volume-adapter-daemon/src/main.rs",
         &[
-            "BLOCK_VOLUME_UBLK_CONTROL_START_DEV_GATE_OW_301T",
             "run_ublk_control_start_dev_boundary",
             "ublk-control-start-dev",
             "ublk-start-dev-boundary",
@@ -1127,7 +1104,7 @@ pub fn check_block_volume_ublk_start_dev_boundary_current_workspace() -> Result<
 
     if missing.is_empty() {
         println!(
-            "OW-301T block-volume ublk START_DEV boundary ok: the real START_DEV command shape is implementation-tracked non-release and the daemon refuses START_DEV until data queue FETCH_REQ readiness exists, preserving DEL_DEV cleanup and avoiding unsafe control-only starts"
+            "block-volume ublk START_DEV boundary ok: the real START_DEV command shape is implementation-tracked non-release and the daemon refuses START_DEV until data queue FETCH_REQ readiness exists, preserving DEL_DEV cleanup and avoiding unsafe control-only starts"
         );
         Ok(())
     } else {
@@ -1156,7 +1133,6 @@ pub fn check_block_volume_ublk_fetch_req_readiness_boundary_current_workspace(
         &root,
         "crates/tidefs-block-volume-adapter-ublk-control-runtime/src/lib.rs",
         &[
-            "BLOCK_VOLUME_UBLK_DATA_QUEUE_FETCH_REQ_GATE_OW_301U",
             "UBLK_DATA_QUEUE_FETCH_REQ_RING_ENTRIES",
             "UblkDataQueueFetchReqCommand",
             "UblkDataQueueFetchReqInput",
@@ -1184,7 +1160,6 @@ pub fn check_block_volume_ublk_fetch_req_readiness_boundary_current_workspace(
         &root,
         "apps/tidefs-block-volume-adapter-daemon/src/main.rs",
         &[
-            "BLOCK_VOLUME_UBLK_DATA_QUEUE_FETCH_REQ_GATE_OW_301U",
             "run_ublk_data_queue_fetch_req_readiness_boundary",
             "ublk-data-queue-fetch-req",
             "ublk-fetch-req-readiness-boundary",
@@ -1220,7 +1195,7 @@ pub fn check_block_volume_ublk_fetch_req_readiness_boundary_current_workspace(
 
     if missing.is_empty() {
         println!(
-            "OW-301U block-volume ublk FETCH_REQ readiness boundary ok: the real data-queue FETCH_REQ command shape is implementation-tracked non-release, readiness requires live queue runtime ownership, and START_DEV remains guarded without unsafe data-queue submission"
+            "block-volume ublk FETCH_REQ readiness boundary ok: the real data-queue FETCH_REQ command shape is implementation-tracked non-release, readiness requires live queue runtime ownership, and START_DEV remains guarded without unsafe data-queue submission"
         );
         Ok(())
     } else {
@@ -1249,7 +1224,6 @@ pub fn check_block_volume_ublk_data_queue_open_boundary_current_workspace(
         &root,
         "crates/tidefs-block-volume-adapter-ublk-control-runtime/src/lib.rs",
         &[
-            "BLOCK_VOLUME_UBLK_DATA_QUEUE_OPEN_GATE_OW_301V",
             "UBLK_DATA_QUEUE_RUNTIME_RING_ENTRIES",
             "UBLK_DATA_QUEUE_PATH_TEMPLATE",
             "UblkDataQueueRuntimeOpenInput",
@@ -1269,7 +1243,6 @@ pub fn check_block_volume_ublk_data_queue_open_boundary_current_workspace(
         &root,
         "apps/tidefs-block-volume-adapter-daemon/src/main.rs",
         &[
-            "BLOCK_VOLUME_UBLK_DATA_QUEUE_OPEN_GATE_OW_301V",
             "run_ublk_data_queue_open_boundary",
             "ublk-data-queue-open",
             "command.ublk_data_queue_open=ublk-data-queue-open",
@@ -1304,7 +1277,7 @@ pub fn check_block_volume_ublk_data_queue_open_boundary_current_workspace(
 
     if missing.is_empty() {
         println!(
-            "OW-301V block-volume ublk data-queue open boundary ok: concrete ADD_DEV results bind /dev/ublkcN runtime-open admission and FETCH_REQ/START_DEV remain unsubmitted"
+            "block-volume ublk data-queue open boundary ok: concrete ADD_DEV results bind /dev/ublkcN runtime-open admission and FETCH_REQ/START_DEV remain unsubmitted"
         );
         Ok(())
     } else {
@@ -1333,7 +1306,6 @@ pub fn check_block_volume_ublk_fetch_req_submit_boundary_current_workspace(
         &root,
         "crates/tidefs-block-volume-adapter-ublk-control-runtime/src/lib.rs",
         &[
-            "BLOCK_VOLUME_UBLK_DATA_QUEUE_FETCH_REQ_SUBMIT_GATE_OW_301W",
             "UblkDataQueueFetchReqSubmissionSpec",
             "UblkDataQueueFetchReqSubmissionOutcome",
             "UblkDataQueueFetchReqSubmissionError",
@@ -1349,7 +1321,6 @@ pub fn check_block_volume_ublk_fetch_req_submit_boundary_current_workspace(
         &root,
         "apps/tidefs-block-volume-adapter-daemon/src/main.rs",
         &[
-            "BLOCK_VOLUME_UBLK_DATA_QUEUE_FETCH_REQ_SUBMIT_GATE_OW_301W",
             "run_ublk_data_queue_fetch_req_submission_boundary",
             "ublk-data-queue-fetch-req-submit",
             "command.ublk_data_queue_fetch_req_submit=ublk-data-queue-fetch-req-submit",
@@ -1385,7 +1356,7 @@ pub fn check_block_volume_ublk_fetch_req_submit_boundary_current_workspace(
 
     if missing.is_empty() {
         println!(
-            "OW-301W block-volume ublk FETCH_REQ submission boundary ok: live /dev/ublkcN runtime ownership gates FETCH_REQ submission and START_DEV remains unsubmitted"
+            "block-volume ublk FETCH_REQ submission boundary ok: live /dev/ublkcN runtime ownership gates FETCH_REQ submission and START_DEV remains unsubmitted"
         );
         Ok(())
     } else {
@@ -1414,7 +1385,6 @@ pub fn check_block_volume_ublk_commit_fetch_boundary_current_workspace(
         &root,
         "crates/tidefs-block-volume-adapter-ublk-control-runtime/src/lib.rs",
         &[
-            "BLOCK_VOLUME_UBLK_DATA_QUEUE_COMMIT_FETCH_GATE_OW_301X",
             "UblkDataQueueCommitAndFetchInput",
             "UblkDataQueueCommitAndFetchReadiness",
             "UblkDataQueueCommitAndFetchOutcome",
@@ -1429,7 +1399,6 @@ pub fn check_block_volume_ublk_commit_fetch_boundary_current_workspace(
         &root,
         "apps/tidefs-block-volume-adapter-daemon/src/main.rs",
         &[
-            "BLOCK_VOLUME_UBLK_DATA_QUEUE_COMMIT_FETCH_GATE_OW_301X",
             "run_ublk_data_queue_commit_and_fetch_boundary",
             "ublk-data-queue-commit-and-fetch",
             "ublk-commit-fetch-boundary",
@@ -1464,7 +1433,7 @@ pub fn check_block_volume_ublk_commit_fetch_boundary_current_workspace(
 
     if missing.is_empty() {
         println!(
-            "OW-301X block-volume ublk COMMIT_AND_FETCH_REQ boundary ok: live data-queue ownership and fetched request completion gate commit-and-fetch submission while START_DEV remains unsubmitted"
+            "block-volume ublk COMMIT_AND_FETCH_REQ boundary ok: live data-queue ownership and fetched request completion gate commit-and-fetch submission while START_DEV remains unsubmitted"
         );
         Ok(())
     } else {
@@ -1502,14 +1471,12 @@ pub fn check_block_volume_ublk_acceptance_harness_current_workspace() -> Result<
         &root,
         "apps/tidefs-block-volume-adapter-daemon/src/ublk_control_open/acceptance_harness.rs",
         &[
-            "BLOCK_VOLUME_UBLK_ACCEPTANCE_HARNESS_GATE_PC_012",
             "UblkAcceptanceStatus",
             "acceptance.status={}",
             "acceptance.is_evidence={}",
             "durability.block_reason={}",
             "classify_acceptance",
             "is_acceptance_evidence",
-            "PC-012 ublk acceptance harness passes fio verify and durability checks",
             "UblkAcceptanceFioPass",
             "fio_verify_passed",
             "first_verify.passed={}",
@@ -1536,7 +1503,7 @@ pub fn check_block_volume_ublk_acceptance_harness_current_workspace() -> Result<
 
     if missing.is_empty() {
         println!(
-            "PC-012 block-volume ublk acceptance harness ok: command wiring, fio verify fields, durability verify fields, acceptance status classification, and report markers are implementation-tracked non-release"
+            "block-volume ublk acceptance harness ok: command wiring, fio verify fields, durability verify fields, acceptance status classification, and report markers are implementation-tracked non-release"
         );
         Ok(())
     } else {
@@ -1645,7 +1612,7 @@ pub fn check_block_volume_ublk_surface_source_markers_current_workspace(
         check_required_file(&root, rel, &mut missing);
     }
 
-    // start_dev.rs markers (OW-301T gate)
+    // start_dev.rs markers (source boundary)
     check_source_markers(
         &root,
         "apps/tidefs-block-volume-adapter-daemon/src/ublk_control_open/start_dev.rs",
@@ -1659,7 +1626,7 @@ pub fn check_block_volume_ublk_surface_source_markers_current_workspace(
         &mut missing,
     );
 
-    // data_queue_io_loop.rs markers (OW-301V/W/X gate)
+    // data_queue_io_loop.rs markers (source boundary)
     check_source_markers(
         &root,
         "apps/tidefs-block-volume-adapter-daemon/src/ublk_control_open/data_queue_io_loop.rs",
@@ -1673,12 +1640,11 @@ pub fn check_block_volume_ublk_surface_source_markers_current_workspace(
         &mut missing,
     );
 
-    // block_device_validation.rs markers (OW-301Y gate)
+    // block_device_validation.rs markers (source boundary)
     check_source_markers(
         &root,
         "apps/tidefs-block-volume-adapter-daemon/src/block_device_validation.rs",
         &[
-            "BLOCK_VOLUME_UBLK_DEVICE_APPEARANCE_GATE_OW_301Y",
             "UblkDeviceAppearanceReport",
             "run_block_device_appearance_validation",
             "run_ublk_control_start_dev_boundary",

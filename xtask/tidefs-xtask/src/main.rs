@@ -1006,13 +1006,13 @@ fn main() {
                 }
             }
         }
-        Some("check-stale-claims" | "check-stale-forgejo-claims") => {
+        Some("check-stale-claims") => {
             if let Err(err) = forgejo_work::check_stale_claims_current_workspace() {
                 eprintln!("{err}");
                 process::exit(1);
             }
         }
-        Some("check-duplicate-claims" | "check-duplicate-forgejo-claims") => {
+        Some("check-duplicate-claims") => {
             if let Err(err) = forgejo_work::check_duplicate_claims_current_workspace() {
                 eprintln!("{err}");
                 process::exit(1);
@@ -1688,15 +1688,17 @@ fn run_all_checks() {
     // claims
     if let Err(e) = claims::check_current_workspace() {
         errors.push(format!("claims/check-claims-gate: {e}"));
-        // forgejo_work
+        // legacy claim tracker
         if let Err(e) = forgejo_work::check_claim_gate_current_workspace() {
-            errors.push(format!("forgejo_work/check-claim-gate: {e}"));
+            errors.push(format!("legacy-claim-tracker/check-claim-gate: {e}"));
         }
         if let Err(e) = forgejo_work::check_stale_claims_current_workspace() {
-            errors.push(format!("forgejo_work/check-stale-claims: {e}"));
+            errors.push(format!("legacy-claim-tracker/check-stale-claims: {e}"));
         }
         if let Err(e) = forgejo_work::check_abandoned_worktrees_current_workspace() {
-            errors.push(format!("forgejo_work/check-abandoned-worktrees: {e}"));
+            errors.push(format!(
+                "legacy-claim-tracker/check-abandoned-worktrees: {e}"
+            ));
         }
     }
     // kernel closure
@@ -2071,20 +2073,18 @@ fn print_help() {
         "  check-validation-packaging-host-probe validate current block-volume host preflight markers"
     );
     println!("  check-wave-zero-d alias for check-validation-packaging-host-probe");
-    println!("  check-membership-epoch-model validate OW-302 membership epoch model markers");
+    println!("  check-membership-epoch-model validate membership epoch model markers");
     println!("  check-cluster-membership alias for check-membership-epoch-model");
     println!(
         "  check-membership-types    validate MEMBERSHIP wire types with CRC32C encode/decode"
     );
-    println!("  check-failure-domain-placement validate OW-303 failure-domain placement markers");
+    println!("  check-failure-domain-placement validate failure-domain placement markers");
     println!("  check-replica-placement alias for check-failure-domain-placement");
-    println!("  check-replicated-storage-model validate OW-304 replicated storage markers");
+    println!("  check-replicated-storage-model validate replicated storage markers");
     println!("  check-replicated-storage alias for check-replicated-storage-model");
-    println!(
-        "  check-rebuild-backfill-rebalance validate OW-305 rebuild/backfill/rebalance markers"
-    );
+    println!("  check-rebuild-backfill-rebalance validate rebuild/backfill/rebalance markers");
     println!("  check-rebuild-rebalance alias for check-rebuild-backfill-rebalance");
-    println!("  check-erasure-coded-layout validate OW-306 erasure-coded layout markers");
+    println!("  check-erasure-coded-layout validate erasure-coded layout markers");
     println!("  check-erasure-layout alias for check-erasure-coded-layout");
     println!("  check-chunk-shipper      validate source-owned data_copy_6 chunk shipper markers");
     println!("  check-flow-commit-coordinator validate source-owned data_copy_7 flow commit coordinator markers");
@@ -2131,100 +2131,80 @@ fn print_help() {
     println!("  check-bg-framework     alias for check-background-service-framework");
     println!("  check-feature-flags      validate dataset feature flags type definitions and canonical registry");
     println!("  check-dataset-feature-flags alias for check-feature-flags");
-    println!(
-        "  check-block-volume-adapter-core validate OW-301A block-volume adapter core markers"
-    );
+    println!("  check-block-volume-adapter-core validate block-volume adapter core markers");
     println!("  check-block-volume-core alias for check-block-volume-adapter-core");
-    println!(
-        "  check-block-volume-queue-admission validate OW-301B block-volume queue admission markers"
-    );
+    println!("  check-block-volume-queue-admission validate block-volume queue admission markers");
     println!("  check-block-volume-queue alias for check-block-volume-queue-admission");
-    println!(
-        "  check-block-volume-dispatch-execution validate OW-301C block-volume dispatch markers"
-    );
+    println!("  check-block-volume-dispatch-execution validate block-volume dispatch markers");
     println!("  check-block-volume-dispatch alias for check-block-volume-dispatch-execution");
-    println!(
-        "  check-block-volume-export-lifecycle validate OW-301D block-volume lifecycle markers"
-    );
+    println!("  check-block-volume-export-lifecycle validate block-volume lifecycle markers");
     println!("  check-block-volume-lifecycle alias for check-block-volume-export-lifecycle");
-    println!(
-        "  check-block-volume-cache-coherency validate OW-301E block-volume cache coherency markers"
-    );
+    println!("  check-block-volume-cache-coherency validate block-volume cache coherency markers");
     println!("  check-block-volume-cache alias for check-block-volume-cache-coherency");
-    println!(
-        "  check-block-volume-resize-fence validate OW-301F block-volume resize/fence markers"
-    );
+    println!("  check-block-volume-resize-fence validate block-volume resize/fence markers");
     println!("  check-block-volume-resize alias for check-block-volume-resize-fence");
-    println!(
-        "  check-block-volume-host-preflight validate OW-301H block-volume host preflight markers"
-    );
+    println!("  check-block-volume-host-preflight validate block-volume host preflight markers");
     println!("  check-block-volume-host alias for check-block-volume-host-preflight");
-    println!("  check-block-volume-ublk-abi validate OW-301I block-volume ublk ABI markers");
+    println!("  check-block-volume-ublk-abi validate block-volume ublk ABI markers");
     println!("  check-ublk-abi alias for check-block-volume-ublk-abi");
-    println!(
-        "  check-block-volume-file-backing validate OW-301N block-volume file-backed image markers"
-    );
+    println!("  check-block-volume-file-backing validate block-volume file-backed image markers");
     println!("  check-block-volume-backing-file alias for check-block-volume-file-backing");
     println!(
-        "  check-block-volume-ublk-control-open validate OW-301O block-volume ublk control open markers"
+        "  check-block-volume-ublk-control-open validate block-volume ublk control open markers"
     );
     println!(
         "  check-block-volume-ublk-control-runtime alias for check-block-volume-ublk-control-open"
     );
     println!(
-        "  check-block-volume-ublk-control-readonly-probe validate OW-301P read-only GET_FEATURES markers"
+        "  check-block-volume-ublk-control-readonly-probe validate read-only GET_FEATURES markers"
     );
     println!(
         "  check-block-volume-ublk-control-get-features alias for check-block-volume-ublk-control-readonly-probe"
     );
-    println!("  check-block-volume-ublk-add-dev-boundary validate OW-301Q guarded ADD_DEV markers");
+    println!("  check-block-volume-ublk-add-dev-boundary validate guarded ADD_DEV markers");
     println!(
         "  check-block-volume-ublk-add-dev alias for check-block-volume-ublk-add-dev-boundary"
     );
     println!(
-        "  check-block-volume-ublk-del-dev-cleanup-boundary validate OW-301R guarded DEL_DEV cleanup markers"
+        "  check-block-volume-ublk-del-dev-cleanup-boundary validate guarded DEL_DEV cleanup markers"
     );
     println!(
         "  check-block-volume-ublk-del-dev alias for check-block-volume-ublk-del-dev-cleanup-boundary"
     );
-    println!(
-        "  check-block-volume-ublk-set-params-boundary validate OW-301S guarded SET_PARAMS markers"
-    );
+    println!("  check-block-volume-ublk-set-params-boundary validate guarded SET_PARAMS markers");
     println!(
         "  check-block-volume-ublk-set-params alias for check-block-volume-ublk-set-params-boundary"
     );
-    println!(
-        "  check-block-volume-ublk-start-dev-boundary validate OW-301T guarded START_DEV markers"
-    );
+    println!("  check-block-volume-ublk-start-dev-boundary validate guarded START_DEV markers");
     println!(
         "  check-block-volume-ublk-start-dev alias for check-block-volume-ublk-start-dev-boundary"
     );
     println!(
-        "  check-block-volume-ublk-fetch-req-readiness-boundary validate OW-301U guarded FETCH_REQ readiness markers"
+        "  check-block-volume-ublk-fetch-req-readiness-boundary validate guarded FETCH_REQ readiness markers"
     );
     println!(
         "  check-block-volume-ublk-fetch-req alias for check-block-volume-ublk-fetch-req-readiness-boundary"
     );
     println!(
-        "  check-block-volume-ublk-data-queue-open-boundary validate OW-301V guarded data-queue open markers"
+        "  check-block-volume-ublk-data-queue-open-boundary validate guarded data-queue open markers"
     );
     println!(
         "  check-block-volume-ublk-data-queue-open alias for check-block-volume-ublk-data-queue-open-boundary"
     );
     println!(
-        "  check-block-volume-ublk-fetch-req-submit-boundary validate OW-301W guarded FETCH_REQ submission markers"
+        "  check-block-volume-ublk-fetch-req-submit-boundary validate guarded FETCH_REQ submission markers"
     );
     println!(
         "  check-block-volume-ublk-fetch-req-submit alias for check-block-volume-ublk-fetch-req-submit-boundary"
     );
     println!(
-        "  check-block-volume-ublk-commit-fetch-boundary validate OW-301X guarded COMMIT_AND_FETCH_REQ markers"
+        "  check-block-volume-ublk-commit-fetch-boundary validate guarded COMMIT_AND_FETCH_REQ markers"
     );
     println!(
         "  check-block-volume-ublk-commit-fetch alias for check-block-volume-ublk-commit-fetch-boundary"
     );
     println!(
-        "  check-block-volume-ublk-acceptance-harness validate PC-012 ublk acceptance harness markers"
+        "  check-block-volume-ublk-acceptance-harness validate ublk acceptance harness markers"
     );
     println!(
         "  check-ublk-acceptance-harness alias for check-block-volume-ublk-acceptance-harness"
@@ -2236,21 +2216,21 @@ fn print_help() {
     println!("  check-object-store-format alias for check-local-store-format");
     println!("  check-production-integrity validate the production integrity policy spec");
     println!("  check-integrity-policy    alias for check-production-integrity");
-    println!("  check-production-integrity-v3 validate OW-014 v3 record integrity markers");
+    println!("  check-production-integrity-v3 validate v3 record integrity markers");
     println!("  check-v3-record-integrity alias for check-production-integrity-v3");
-    println!("  check-root-authentication validate OW-015 committed-root authentication markers");
+    println!("  check-root-authentication validate committed-root authentication markers");
     println!("  check-root-auth        alias for check-root-authentication");
     println!(
         "  check-mounted-transform-authority validate TFR-006 mounted raw-store inventory and transform claim guard"
     );
     println!("  check-transform-authority alias for check-mounted-transform-authority");
-    println!("  check-local-snapshots validate OW-108 snapshot and rollback markers");
+    println!("  check-local-snapshots validate snapshot and rollback markers");
     println!("  check-snapshot-rollback alias for check-local-snapshots");
-    println!("  check-send-receive validate OW-109 changed-record export/import markers");
+    println!("  check-send-receive validate changed-record export/import markers");
     println!("  check-changed-record-export-import alias for check-send-receive");
-    println!("  check-online-verifier validate OW-110 non-mutating online verifier markers");
+    println!("  check-online-verifier validate non-mutating online verifier markers");
     println!("  check-online-scrub alias for check-online-verifier");
-    println!("  check-hot-read-cache validate PC-003 hot read cache markers");
+    println!("  check-hot-read-cache validate hot read cache markers");
     println!("  check-read-cache alias for check-hot-read-cache");
     println!("  check-claims-gate       validate publish-facing capability claims");
     println!("  check-overclaims        alias for check-claims-gate");
@@ -2270,22 +2250,20 @@ fn print_help() {
     );
     println!("  check-claim-gate        validate current worktree has a valid issue owner");
     println!("  check-worktree-claim    alias for check-claim-gate");
-    println!("  check-stale-claims      scan Forgejo for stale codex:claimed issues");
-    println!("  check-stale-forgejo-claims alias for check-stale-claims");
-    println!("  check-duplicate-claims  scan Forgejo for duplicate codex:claimed work keys");
-    println!("  check-duplicate-forgejo-claims alias for check-duplicate-claims");
+    println!(
+        "  check-stale-claims      scan legacy claim tracker state for stale codex:claimed issues"
+    );
+    println!("  check-duplicate-claims  scan legacy claim tracker state for duplicate codex:claimed work keys");
     println!("  auto-release-stale-claims auto-release stale codex:claimed issues (set TIDEFS_AUTO_RELEASE_STALE=1 to enable)");
     println!(
-        "  coordination-health      print a coordination health report from Forgejo issue metrics"
+        "  coordination-health      print a coordination health report from legacy tracker issue metrics"
     );
     println!("  acquire-claim <N>     atomically claim issue N (adds codex:claimed label with optimistic locking)");
     println!("  check-abandoned-worktrees detect stale local worktree directories");
     println!("  check-stale-worktrees   alias for check-abandoned-worktrees");
     println!("  check-local-filesystem   validate the local filesystem MVP source slice");
-    println!("  check-chunked-file-layout validate OW-101 chunked content layout markers");
-    println!(
-        "  check-local-storage-allocator validate OW-102 allocator/free-space accounting markers"
-    );
+    println!("  check-chunked-file-layout validate chunked content layout markers");
+    println!("  check-local-storage-allocator validate allocator/free-space accounting markers");
     println!("  check-free-space-accounting alias for check-local-storage-allocator");
     println!("  check-no-fsck-recovery   validate automatic previous-or-new recovery design rule and source markers");
     println!("  check-no-fsck-failure-model validate formal failure model markers");
@@ -2306,15 +2284,15 @@ fn print_help() {
     println!("  check-posix-subset alias for check-preview-posix-subset");
     println!("  check-fuse-mount-path validate userspace FUSE mount-path source markers");
     println!("  check-userspace-fuse alias for check-fuse-mount-path");
-    println!("  check-posix-semantics validate OW-106 POSIX semantics source markers");
-    println!("  check-seek-hole-data validate PC-004B FUSE lseek preview surface markers");
+    println!("  check-posix-semantics validate POSIX semantics source markers");
+    println!("  check-seek-hole-data validate FUSE lseek preview surface markers");
     println!(
         "  check-xfstests-harness validate xfstests mount helper, runner, and exclude list markers"
     );
-    println!("  check-rename-exchange validate OW-108 RENAME_EXCHANGE atomic swap markers");
+    println!("  check-rename-exchange validate RENAME_EXCHANGE atomic swap markers");
     println!("  check-rename-noreplace validate #481 FUSE renameat2 RENAME_NOREPLACE flag markers");
     println!("  check-file-locking validate #491 FUSE advisory file locking getlk/setlk markers");
-    println!("  check-mmap-coherency validate OW-204 mmap coherency page-cache/writeback markers");
+    println!("  check-mmap-coherency validate mmap coherency page-cache/writeback markers");
     println!("  check-xattrs           validate #496 FUSE xattr operations (set/get/list/remove) markers");
     println!("  check-fallocate-mode0  validate #494 fallocate mode-0 allocator-admitted markers");
     println!("  check-fallocate-punch-hole validate #515 fallocate punch-hole/zero-range markers");
@@ -2325,11 +2303,11 @@ fn print_help() {
     println!("  check-orphan-index      validate #1397 orphan index B+tree runtime markers");
     println!("  check-spacemap-allocator validate spacemap allocator crate (SegmentFreeMap, bitmap encode/decode, generation counters)");
     println!("  check-space-accounting-watermarks validate cleaner watermarks, refresh_physical_counters, and threshold transitions");
-    println!("  check-transaction-model validate PC-007 transaction model markers");
+    println!("  check-transaction-model validate transaction model markers");
     println!("  check-integrity-pipeline validate integrity pipeline source markers");
-    println!("  check-posix-scoreboard validate OW-107 POSIX scoreboard source markers");
+    println!("  check-posix-scoreboard validate POSIX scoreboard source markers");
     println!("  check-root-retention   validate non-mutating committed-root retention markers");
-    println!("  check-safe-local-reclamation validate OW-103 mutating-safe local GC markers");
+    println!("  check-safe-local-reclamation validate mutating-safe local GC markers");
     println!("  check-safe-reclamation alias for check-safe-local-reclamation");
     println!("  check-safe-gc          alias for check-safe-local-reclamation");
     println!("  check-local-gc         alias for check-safe-local-reclamation");

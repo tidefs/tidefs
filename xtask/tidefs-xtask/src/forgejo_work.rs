@@ -5,9 +5,9 @@
 //   - Worktree ownership: the current directory is a valid tidefs worktree
 //     with a branch matching the current codexN/issue-N-* pattern or the
 //     legacy codex/issue-N-* pattern.
-//   - GitHub/Forgejo claim: the corresponding issue is live in the active
+//   - issue tracker claim: the corresponding issue is live in the active
 //     tracker for the branch family.
-//   - Stale legacy Forgejo claims: no codex:claimed issue has been untouched
+//   - Stale legacy tracker claims: no codex:claimed issue has been untouched
 //     for > timeout.
 //   - Abandoned worktrees: no stale worktree directories exist locally.
 //   - Auto-release: stale claims older than timeout can be automatically
@@ -160,7 +160,7 @@ pub struct ForgejoWorkError {
 
 impl fmt::Display for ForgejoWorkError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "forgejo work check failed:")?;
+        writeln!(f, "legacy claim tracker check failed:")?;
         for violation in &self.violations {
             writeln!(f, "- {violation}")?;
         }
@@ -183,7 +183,7 @@ pub struct DuplicatedClaimIssue {
 }
 
 // ---------------------------------------------------------------------------
-// check-claim-gate -- validates the current worktree has a valid Forgejo claim
+// check-claim-gate -- validates the current worktree has a valid issue claim
 // ---------------------------------------------------------------------------
 pub fn check_claim_gate_current_workspace() -> Result<(), ForgejoWorkError> {
     let cwd = std::env::current_dir().map_err(|err| ForgejoWorkError {
@@ -244,10 +244,10 @@ pub fn check_claim_gate_current_workspace() -> Result<(), ForgejoWorkError> {
         Some(WorktreeIssueAuthority::LegacyForgejo) => match check_forgejo_claim(issue_num) {
             Ok(true) => {}
             Ok(false) => violations.push(format!(
-                "issue #{issue_num} has no codex:claimed label on Forgejo"
+                "issue #{issue_num} has no codex:claimed label in the legacy claim tracker"
             )),
             Err(err) => violations.push(format!(
-                "could not verify Forgejo claim for issue #{issue_num}: {err}"
+                "could not verify legacy claim for issue #{issue_num}: {err}"
             )),
         },
         None => {}
@@ -286,12 +286,12 @@ fn check_foreground_main_claim(repo_root: &Path) -> Result<(), ForgejoWorkError>
             let active_claimed = active_claimed_issues(&issues);
             if active_claimed.is_empty() {
                 println!(
-                    "claim gate ok: foreground checkout '{}' has no active claimed Forgejo issue; open issue state remains available as work-selection input",
+                    "claim gate ok: foreground checkout '{}' has no active claimed legacy tracker issue; open issue state remains available as work-selection input",
                     repo_root.display(),
                 );
             } else {
                 println!(
-                    "claim gate ok: foreground checkout '{}' sees {} active Forgejo claim(s): {}",
+                    "claim gate ok: foreground checkout '{}' sees {} active legacy claim(s): {}",
                     repo_root.display(),
                     active_claimed.len(),
                     active_claimed
@@ -302,7 +302,7 @@ fn check_foreground_main_claim(repo_root: &Path) -> Result<(), ForgejoWorkError>
                 );
             }
         }
-        Err(err) => violations.push(format!("could not list Forgejo open issues: {err}")),
+        Err(err) => violations.push(format!("could not list legacy tracker open issues: {err}")),
     }
 
     if violations.is_empty() {
@@ -313,14 +313,16 @@ fn check_foreground_main_claim(repo_root: &Path) -> Result<(), ForgejoWorkError>
 }
 
 // ---------------------------------------------------------------------------
-// check-stale-claims -- scans Forgejo for claims older than the timeout
+// check-stale-claims -- scans legacy tracker claims older than the timeout
 // ---------------------------------------------------------------------------
 pub fn check_stale_claims_current_workspace() -> Result<(), ForgejoWorkError> {
     let timeout_hours = parse_stale_timeout().unwrap_or(DEFAULT_STALE_TIMEOUT_HOURS);
     let stale = find_stale_forgejo_claims(timeout_hours);
 
     if stale.is_empty() {
-        println!("stale claims ok: no claims older than {timeout_hours}h found on Forgejo");
+        println!(
+            "stale claims ok: no claims older than {timeout_hours}h found in the legacy claim tracker"
+        );
         return Ok(());
     }
 
@@ -429,10 +431,10 @@ pub fn check_abandoned_worktrees_current_workspace() -> Result<(), ForgejoWorkEr
             Some(WorktreeIssueAuthority::LegacyForgejo) => match check_forgejo_claim(issue_num) {
                 Ok(true) => {}
                 Ok(false) => violations.push(format!(
-                    "worktree '{dir_name}' exists but issue #{issue_num} is not claimed on Forgejo"
+                    "worktree '{dir_name}' exists but issue #{issue_num} is not claimed in the legacy claim tracker"
                 )),
                 Err(err) => violations.push(format!(
-                    "worktree '{dir_name}': could not verify Forgejo claim for issue #{issue_num}: {err}"
+                    "worktree '{dir_name}': could not verify legacy claim for issue #{issue_num}: {err}"
                 )),
             },
             None => {
@@ -479,7 +481,9 @@ pub fn auto_release_stale_claims() -> Result<(), ForgejoWorkError> {
     let stale = find_stale_forgejo_claims(timeout_hours);
 
     if stale.is_empty() {
-        println!("auto-release ok: no claims older than {timeout_hours}h found on Forgejo");
+        println!(
+            "auto-release ok: no claims older than {timeout_hours}h found in the legacy claim tracker"
+        );
         return Ok(());
     }
 
@@ -516,10 +520,10 @@ pub fn auto_release_stale_claims() -> Result<(), ForgejoWorkError> {
 
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
-// coordination-health -- prints a health report from Forgejo issue metrics
+// coordination-health -- prints a health report from legacy tracker issue metrics
 // ---------------------------------------------------------------------------
 
-/// Print a coordination health report derived from Forgejo issue labels.
+/// Print a coordination health report derived from legacy tracker issue labels.
 /// Fetches all open issues (and recently closed issues), groups them by
 /// lane, kind, priority, and codex workflow status, and prints a structured
 /// report with health flags for staleness, stalled pipelines, and blockers.
@@ -1404,7 +1408,7 @@ fn api_post_comment(issue_num: u64, body: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Check whether an issue on Forgejo currently has the codex:claimed label.
+/// Check whether a legacy-tracker issue currently has the codex:claimed label.
 /// Uses serde_json to parse the API response.
 fn check_forgejo_claim(issue_num: u64) -> Result<bool, String> {
     let path = format!("/issues/{issue_num}");
@@ -1441,7 +1445,7 @@ fn check_github_issue_open(issue_num: u64) -> Result<bool, String> {
     Ok(issue.state == "OPEN")
 }
 
-/// Find all open Forgejo issues that have the codex:claimed label and have
+/// Find all open legacy tracker issues that have the codex:claimed label and have
 /// been untouched for longer than timeout_hours.
 /// Uses serde_json for reliable JSON parsing (no manual string scanning).
 fn find_stale_forgejo_claims(timeout_hours: u64) -> Vec<(u64, u64, String)> {
