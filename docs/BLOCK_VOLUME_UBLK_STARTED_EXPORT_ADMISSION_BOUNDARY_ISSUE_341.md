@@ -2,6 +2,11 @@
 
 > TFR-019 authority classification: Current spec (scoped). See `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`.
 
+This is the surviving block-volume/uBLK current-spec surface for the bounded
+started-export admission artifact only. It is scoped to the daemon source and
+claim-gate boundary named below; it does not promote the deleted OW-301 receipt
+sequence into full block-device product readiness.
+
 ## Source Boundary
 
 Issue 341 binds the existing ublk control and data-queue pieces into one
@@ -42,15 +47,13 @@ Cleanup failures stay visible. If `DEL_DEV` was required but did not succeed,
 the artifact verifier records `claim_state=cleanup_failed` rather than hiding
 cleanup failure behind a successful runtime observation.
 
-## Relationship To Parent Gates
+## Folded Boundary Inputs
 
-This follows the source boundaries documented by:
-
-- `docs/BLOCK_VOLUME_UBLK_START_DEV_BOUNDARY_OW301T.md`
-- `docs/BLOCK_VOLUME_UBLK_FETCH_REQ_READINESS_BOUNDARY_OW301U.md`
-- `docs/BLOCK_VOLUME_UBLK_DATA_QUEUE_OPEN_BOUNDARY_OW301V.md`
-- `docs/BLOCK_VOLUME_UBLK_FETCH_REQ_SUBMISSION_BOUNDARY_OW301W.md`
-- `docs/BLOCK_VOLUME_UBLK_COMMIT_FETCH_BOUNDARY_OW301X.md`
+The deleted OW-301 control/data-queue receipt sequence is folded into this
+source-backed artifact boundary. The live source and verifier are the authority
+for START_DEV admission, data-queue runtime ownership, FETCH_REQ coverage, and
+COMMIT_AND_FETCH_REQ service observation; git history and issue #1637 retain
+the deleted receipt lineage.
 
 The focused QEMU runner remains the smallest supported runtime row for this
 artifact. It extracts both the qid/tag completion artifact and the

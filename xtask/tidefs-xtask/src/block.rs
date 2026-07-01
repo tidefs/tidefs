@@ -29,7 +29,6 @@ pub fn check_block_volume_adapter_core_current_workspace() -> Result<(), BlockCh
         "Cargo.lock",
         "crates/tidefs-block-volume-adapter-core/Cargo.toml",
         "crates/tidefs-block-volume-adapter-core/src/lib.rs",
-        "docs/BLOCK_VOLUME_ADAPTER_CORE_OW301A.md",
         "nix/tidefs-validation.sh",
         "xtask/tidefs-xtask/src/policy.rs",
     ] {
@@ -67,19 +66,6 @@ pub fn check_block_volume_adapter_core_current_workspace() -> Result<(), BlockCh
     );
     check_source_markers(
         &root,
-        "docs/BLOCK_VOLUME_ADAPTER_CORE_OW301A.md",
-        &[
-            "OW-301A executable block-volume adapter core slice",
-            "`tidefs-block-volume-adapter-core`",
-            "read/write exactness",
-            "flush barrier",
-            "discard intent",
-            "not a ublk daemon",
-        ],
-        &mut missing,
-    );
-    check_source_markers(
-        &root,
         "xtask/tidefs-xtask/src/policy.rs",
         &[
             "tidefs-ublk-abi",
@@ -112,8 +98,6 @@ pub fn check_block_volume_queue_admission_current_workspace() -> Result<(), Bloc
 
     for rel in [
         "crates/tidefs-block-volume-adapter-core/src/lib.rs",
-        "docs/BLOCK_VOLUME_QUEUE_ADMISSION_OW301B.md",
-        "docs/BLOCK_VOLUME_ADAPTER_CORE_OW301A.md",
         "nix/tidefs-validation.sh",
     ] {
         check_required_file(&root, rel, &mut missing);
@@ -146,26 +130,6 @@ pub fn check_block_volume_queue_admission_current_workspace() -> Result<(), Bloc
         ],
         &mut missing,
     );
-    check_source_markers(
-        &root,
-        "docs/BLOCK_VOLUME_QUEUE_ADMISSION_OW301B.md",
-        &[
-            "OW-301B executable block-volume queue admission slice",
-            "queue classes",
-            "queue shards",
-            "backpressure refusal",
-            "export fence refusal",
-            "flush epoch",
-            "not a ublk daemon",
-        ],
-        &mut missing,
-    );
-    check_source_markers(
-        &root,
-        "docs/BLOCK_VOLUME_ADAPTER_CORE_OW301A.md",
-        &["OW-301B extends this crate with a queue/admission model"],
-        &mut missing,
-    );
     if missing.is_empty() {
         println!(
             "OW-301B block-volume queue admission ok: queue classification, shard binding, backpressure refusal, export-fence refusal, flush epochs, and completion commits are implementation-tracked non-release"
@@ -184,8 +148,6 @@ pub fn check_block_volume_dispatch_execution_current_workspace() -> Result<(), B
 
     for rel in [
         "crates/tidefs-block-volume-adapter-core/src/lib.rs",
-        "docs/BLOCK_VOLUME_DISPATCH_EXECUTION_OW301C.md",
-        "docs/BLOCK_VOLUME_QUEUE_ADMISSION_OW301B.md",
         "nix/tidefs-validation.sh",
     ] {
         check_required_file(&root, rel, &mut missing);
@@ -208,27 +170,6 @@ pub fn check_block_volume_dispatch_execution_current_workspace() -> Result<(), B
         ],
         &mut missing,
     );
-    check_source_markers(
-        &root,
-        "docs/BLOCK_VOLUME_DISPATCH_EXECUTION_OW301C.md",
-        &[
-            "OW-301C executable block-volume dispatch execution slice",
-            "admitted submission contexts",
-            "read dispatch",
-            "write dispatch",
-            "flush dispatch",
-            "discard and write-zeroes dispatch",
-            "unadmitted context refusal",
-            "not a ublk daemon",
-        ],
-        &mut missing,
-    );
-    check_source_markers(
-        &root,
-        "docs/BLOCK_VOLUME_QUEUE_ADMISSION_OW301B.md",
-        &["OW-301C extends this queue/admission model with dispatch execution"],
-        &mut missing,
-    );
     if missing.is_empty() {
         println!(
             "OW-301C block-volume dispatch execution ok: admitted read/write/flush/discard/write-zeroes dispatch, unadmitted refusal, payload-mismatch refusal, and completion release are implementation-tracked non-release"
@@ -247,8 +188,6 @@ pub fn check_block_volume_export_lifecycle_current_workspace() -> Result<(), Blo
 
     for rel in [
         "crates/tidefs-block-volume-adapter-core/src/lib.rs",
-        "docs/BLOCK_VOLUME_EXPORT_LIFECYCLE_OW301D.md",
-        "docs/BLOCK_VOLUME_DISPATCH_EXECUTION_OW301C.md",
         "nix/tidefs-validation.sh",
     ] {
         check_required_file(&root, rel, &mut missing);
@@ -275,26 +214,6 @@ pub fn check_block_volume_export_lifecycle_current_workspace() -> Result<(), Blo
         ],
         &mut missing,
     );
-    check_source_markers(
-        &root,
-        "docs/BLOCK_VOLUME_EXPORT_LIFECYCLE_OW301D.md",
-        &[
-            "OW-301D executable block-volume export lifecycle slice",
-            "bootstrap",
-            "quiesce transition",
-            "commit-ok",
-            "replay-required",
-            "abort-required",
-            "not a ublk daemon",
-        ],
-        &mut missing,
-    );
-    check_source_markers(
-        &root,
-        "docs/BLOCK_VOLUME_DISPATCH_EXECUTION_OW301C.md",
-        &["OW-301D extends this dispatch model with export lifecycle and quiesce"],
-        &mut missing,
-    );
     if missing.is_empty() {
         println!(
             "OW-301D block-volume export lifecycle ok: bootstrap, queue-live admission, quiesce classification, drain-before-fence, resume, and stop gates are implementation-tracked non-release"
@@ -313,8 +232,6 @@ pub fn check_block_volume_cache_coherency_current_workspace() -> Result<(), Bloc
 
     for rel in [
         "crates/tidefs-block-volume-adapter-core/src/lib.rs",
-        "docs/BLOCK_VOLUME_CACHE_COHERENCY_OW301E.md",
-        "docs/BLOCK_VOLUME_EXPORT_LIFECYCLE_OW301D.md",
         "nix/tidefs-validation.sh",
     ] {
         check_required_file(&root, rel, &mut missing);
@@ -346,26 +263,6 @@ pub fn check_block_volume_cache_coherency_current_workspace() -> Result<(), Bloc
         ],
         &mut missing,
     );
-    check_source_markers(
-        &root,
-        "docs/BLOCK_VOLUME_CACHE_COHERENCY_OW301E.md",
-        &[
-            "OW-301E executable block-volume cache coherency slice",
-            "clean read-cache windows",
-            "dirty range epochs",
-            "flush/FUA barriers",
-            "discard/write-zeroes invalidation",
-            "direct-overlap guards",
-            "not a ublk daemon",
-        ],
-        &mut missing,
-    );
-    check_source_markers(
-        &root,
-        "docs/BLOCK_VOLUME_EXPORT_LIFECYCLE_OW301D.md",
-        &["OW-301E extends this lifecycle model with cache coherency and barrier records"],
-        &mut missing,
-    );
     if missing.is_empty() {
         println!(
             "OW-301E block-volume cache coherency ok: clean cache windows, dirty epochs, flush/FUA barriers, discard/write-zeroes invalidation, direct-overlap guards, and non-authoritative cache loss are implementation-tracked non-release"
@@ -384,9 +281,6 @@ pub fn check_block_volume_resize_fence_current_workspace() -> Result<(), BlockCh
 
     for rel in [
         "crates/tidefs-block-volume-adapter-core/src/lib.rs",
-        "docs/BLOCK_VOLUME_RESIZE_FENCE_OW301F.md",
-        "docs/BLOCK_VOLUME_EXPORT_LIFECYCLE_OW301D.md",
-        "docs/BLOCK_VOLUME_CACHE_COHERENCY_OW301E.md",
         "nix/tidefs-validation.sh",
     ] {
         check_required_file(&root, rel, &mut missing);
@@ -413,33 +307,6 @@ pub fn check_block_volume_resize_fence_current_workspace() -> Result<(), BlockCh
         ],
         &mut missing,
     );
-    check_source_markers(
-        &root,
-        "docs/BLOCK_VOLUME_RESIZE_FENCE_OW301F.md",
-        &[
-            "OW-301F executable block-volume resize/fence transition slice",
-            "capacity target publication",
-            "affected tail range",
-            "zero-visible grow range",
-            "drain-incomplete refusal",
-            "no-authority resize refusal",
-            "ordinary writes past current end stay refused",
-            "not a ublk daemon",
-        ],
-        &mut missing,
-    );
-    check_source_markers(
-        &root,
-        "docs/BLOCK_VOLUME_EXPORT_LIFECYCLE_OW301D.md",
-        &["OW-301F extends this lifecycle model with resize/fence capacity transitions"],
-        &mut missing,
-    );
-    check_source_markers(
-        &root,
-        "docs/BLOCK_VOLUME_CACHE_COHERENCY_OW301E.md",
-        &["OW-301F consumes these cache coherency records as resize drain blockers"],
-        &mut missing,
-    );
     if missing.is_empty() {
         println!(
             "OW-301F block-volume resize/fence ok: capacity targets, affected tail ranges, grow zero visibility, shrink drain refusal, no-authority refusal, and post-resize geometry publication are implementation-tracked non-release"
@@ -460,7 +327,6 @@ pub fn check_block_volume_host_preflight_current_workspace() -> Result<(), Block
         "apps/tidefs-block-volume-adapter-daemon/Cargo.toml",
         "apps/tidefs-block-volume-adapter-daemon/src/main.rs",
         "apps/tidefs-block-volume-adapter-daemon/src/kernel_check.rs",
-        "docs/BLOCK_VOLUME_ADAPTER_HOST_PREFLIGHT_OW301H.md",
         "docs/ARCHITECTURE.md",
         "docs/GITHUB_CI.md",
         "nix/tidefs-validation.sh",
@@ -506,19 +372,6 @@ pub fn check_block_volume_host_preflight_current_workspace() -> Result<(), Block
     );
     check_source_markers(
         &root,
-        "docs/BLOCK_VOLUME_ADAPTER_HOST_PREFLIGHT_OW301H.md",
-        &[
-            "OW-301H executable block-volume adapter host preflight surface",
-            "preflight-host",
-            "daemon-local host/kernel classification",
-            "/dev/ublk-control",
-            "does not load modules",
-            "not a ublk daemon",
-        ],
-        &mut missing,
-    );
-    check_source_markers(
-        &root,
         "docs/ARCHITECTURE.md",
         &[
             "tidefs-block-volume-adapter-daemon",
@@ -555,8 +408,6 @@ pub fn check_block_volume_ublk_abi_current_workspace() -> Result<(), BlockCheckE
         "crates/tidefs-ublk-abi/src/lib.rs",
         "apps/tidefs-block-volume-adapter-daemon/Cargo.toml",
         "apps/tidefs-block-volume-adapter-daemon/src/main.rs",
-        "docs/BLOCK_VOLUME_UBLK_ABI_CONTROL_PLAN_OW301I.md",
-        "docs/BLOCK_VOLUME_ADAPTER_HOST_PREFLIGHT_OW301H.md",
         "nix/tidefs-validation.sh",
     ] {
         check_required_file(&root, rel, &mut missing);
@@ -617,26 +468,6 @@ pub fn check_block_volume_ublk_abi_current_workspace() -> Result<(), BlockCheckE
         ],
         &mut missing,
     );
-    check_source_markers(
-        &root,
-        "docs/BLOCK_VOLUME_UBLK_ABI_CONTROL_PLAN_OW301I.md",
-        &[
-            "OW-301I executable block-volume ublk ABI control-plan surface",
-            "crates/tidefs-ublk-abi",
-            "tidefs-block-volume-adapter-daemon ublk-abi-plan",
-            "/usr/include/linux/ublk_cmd.h",
-            "GET_FEATURES -> ADD_DEV -> SET_PARAMS -> START_DEV -> GET_DEV_INFO2",
-            "does not open",
-            "`/dev/ublk-control`",
-        ],
-        &mut missing,
-    );
-    check_source_markers(
-        &root,
-        "docs/BLOCK_VOLUME_ADAPTER_HOST_PREFLIGHT_OW301H.md",
-        &["OW-301I follows this host preflight"],
-        &mut missing,
-    );
     if missing.is_empty() {
         println!(
             "OW-301I block-volume ublk ABI ok: Linux command numbers, ioctl encoding, record layouts, feature flags, dry-run control plan, and non-mutation claims are implementation-tracked non-release"
@@ -656,7 +487,6 @@ pub fn check_block_volume_file_backing_current_workspace() -> Result<(), BlockCh
     for rel in [
         "crates/tidefs-block-volume-adapter-core/src/lib.rs",
         "apps/tidefs-block-volume-adapter-daemon/src/main.rs",
-        "docs/BLOCK_VOLUME_FILE_BACKING_OW301N.md",
         "nix/tidefs-validation.sh",
         "xtask/tidefs-xtask/src/main.rs",
     ] {
@@ -698,19 +528,6 @@ pub fn check_block_volume_file_backing_current_workspace() -> Result<(), BlockCh
     );
     check_source_markers(
         &root,
-        "docs/BLOCK_VOLUME_FILE_BACKING_OW301N.md",
-        &[
-            "OW-301N executable block-volume file-backed image surface",
-            "tidefs-block-volume-adapter-daemon backing-file-smoke",
-            "std::fs::File",
-            "FileExt",
-            "sync_all",
-            "does not open `/dev/ublk-control`",
-        ],
-        &mut missing,
-    );
-    check_source_markers(
-        &root,
         "xtask/tidefs-xtask/src/main.rs",
         &[
             "check-block-volume-file-backing",
@@ -739,7 +556,6 @@ pub fn check_block_volume_ublk_control_open_current_workspace() -> Result<(), Bl
         "apps/tidefs-block-volume-adapter-daemon/src/main.rs",
         "apps/tidefs-block-volume-adapter-daemon/src/ublk_control_open/mod.rs",
         "crates/tidefs-ublk-abi/src/lib.rs",
-        "docs/BLOCK_VOLUME_UBLK_CONTROL_OPEN_OW301O.md",
         "nix/tidefs-validation.sh",
         "xtask/tidefs-xtask/src/main.rs",
     ] {
@@ -795,20 +611,6 @@ pub fn check_block_volume_ublk_control_open_current_workspace() -> Result<(), Bl
     );
     check_source_markers(
         &root,
-        "docs/BLOCK_VOLUME_UBLK_CONTROL_OPEN_OW301O.md",
-        &[
-            "OW-301O executable ublk control-device open boundary",
-            "tidefs-block-volume-adapter-daemon ublk-control-open",
-            "`/dev/ublk-control`",
-            "OpenOptions::new().read(true).write(true)",
-            "does not issue read-only probe ioctls",
-            "does not issue mutating ublk control ioctls",
-            "does not create `/dev/ublkbN`",
-        ],
-        &mut missing,
-    );
-    check_source_markers(
-        &root,
         "xtask/tidefs-xtask/src/main.rs",
         &[
             "check-block-volume-ublk-control-open",
@@ -842,7 +644,6 @@ pub fn check_block_volume_ublk_control_readonly_probe_current_workspace(
         "apps/tidefs-block-volume-adapter-daemon/src/ublk_control_open/mod.rs",
         "crates/tidefs-block-volume-adapter-ublk-control-runtime/Cargo.toml",
         "crates/tidefs-block-volume-adapter-ublk-control-runtime/src/lib.rs",
-        "docs/BLOCK_VOLUME_UBLK_CONTROL_READONLY_PROBE_OW301P.md",
         "nix/tidefs-validation.sh",
         "xtask/tidefs-xtask/src/main.rs",
     ] {
@@ -919,21 +720,6 @@ pub fn check_block_volume_ublk_control_readonly_probe_current_workspace(
     );
     check_source_markers(
         &root,
-        "docs/BLOCK_VOLUME_UBLK_CONTROL_READONLY_PROBE_OW301P.md",
-        &[
-            "OW-301P executable read-only ublk control uring_cmd probe boundary",
-            "tidefs-block-volume-adapter-ublk-control-runtime",
-            "UBLK_U_CMD_GET_FEATURES",
-            "IORING_OP_URING_CMD",
-            "cmd.addr",
-            "8-byte userspace feature buffer",
-            "does not issue mutating ublk control commands",
-            "does not create `/dev/ublkbN`",
-        ],
-        &mut missing,
-    );
-    check_source_markers(
-        &root,
         "xtask/tidefs-xtask/src/main.rs",
         &[
             "check-block-volume-ublk-control-readonly-probe",
@@ -963,7 +749,6 @@ pub fn check_block_volume_ublk_add_dev_boundary_current_workspace() -> Result<()
         "apps/tidefs-block-volume-adapter-daemon/src/main.rs",
         "apps/tidefs-block-volume-adapter-daemon/src/ublk_control_open/mod.rs",
         "crates/tidefs-block-volume-adapter-ublk-control-runtime/src/lib.rs",
-        "docs/BLOCK_VOLUME_UBLK_ADD_DEV_BOUNDARY_OW301Q.md",
         "nix/tidefs-validation.sh",
         "xtask/tidefs-xtask/src/main.rs",
     ] {
@@ -1036,22 +821,6 @@ pub fn check_block_volume_ublk_add_dev_boundary_current_workspace() -> Result<()
     );
     check_source_markers(
         &root,
-        "docs/BLOCK_VOLUME_UBLK_ADD_DEV_BOUNDARY_OW301Q.md",
-        &[
-            "OW-301Q executable ublk ADD_DEV control uring_cmd boundary",
-            "UBLK_U_CMD_ADD_DEV",
-            "IORING_OP_URING_CMD",
-            "cmd.addr",
-            "ublksrv_ctrl_dev_info",
-            "queue_id == u16::MAX",
-            "does not issue `UBLK_U_CMD_SET_PARAMS`",
-            "does not issue `UBLK_U_CMD_START_DEV`",
-            "does not start `/dev/ublkbN`",
-        ],
-        &mut missing,
-    );
-    check_source_markers(
-        &root,
         "xtask/tidefs-xtask/src/main.rs",
         &[
             "check-block-volume-ublk-add-dev-boundary",
@@ -1082,7 +851,6 @@ pub fn check_block_volume_ublk_del_dev_cleanup_boundary_current_workspace(
         "apps/tidefs-block-volume-adapter-daemon/src/main.rs",
         "apps/tidefs-block-volume-adapter-daemon/src/ublk_control_open/mod.rs",
         "crates/tidefs-block-volume-adapter-ublk-control-runtime/src/lib.rs",
-        "docs/BLOCK_VOLUME_UBLK_DEL_DEV_CLEANUP_BOUNDARY_OW301R.md",
         "nix/tidefs-validation.sh",
         "xtask/tidefs-xtask/src/main.rs",
     ] {
@@ -1153,22 +921,6 @@ pub fn check_block_volume_ublk_del_dev_cleanup_boundary_current_workspace(
     );
     check_source_markers(
         &root,
-        "docs/BLOCK_VOLUME_UBLK_DEL_DEV_CLEANUP_BOUNDARY_OW301R.md",
-        &[
-            "OW-301R executable ublk DEL_DEV cleanup uring_cmd boundary",
-            "UBLK_U_CMD_DEL_DEV",
-            "IORING_OP_URING_CMD",
-            "returned ADD_DEV device id",
-            "queue_id == u16::MAX",
-            "cmd.len == 0",
-            "cmd.addr == 0",
-            "does not issue `UBLK_U_CMD_SET_PARAMS`",
-            "does not issue `UBLK_U_CMD_START_DEV`",
-        ],
-        &mut missing,
-    );
-    check_source_markers(
-        &root,
         "xtask/tidefs-xtask/src/main.rs",
         &[
             "check-block-volume-ublk-del-dev-cleanup-boundary",
@@ -1199,7 +951,6 @@ pub fn check_block_volume_ublk_set_params_boundary_current_workspace() -> Result
         "apps/tidefs-block-volume-adapter-daemon/src/main.rs",
         "apps/tidefs-block-volume-adapter-daemon/src/ublk_control_open/mod.rs",
         "crates/tidefs-block-volume-adapter-ublk-control-runtime/src/lib.rs",
-        "docs/BLOCK_VOLUME_UBLK_SET_PARAMS_BOUNDARY_OW301S.md",
         "nix/tidefs-validation.sh",
         "xtask/tidefs-xtask/src/main.rs",
     ] {
@@ -1270,22 +1021,6 @@ pub fn check_block_volume_ublk_set_params_boundary_current_workspace() -> Result
     );
     check_source_markers(
         &root,
-        "docs/BLOCK_VOLUME_UBLK_SET_PARAMS_BOUNDARY_OW301S.md",
-        &[
-            "OW-301S executable ublk SET_PARAMS control uring_cmd boundary",
-            "UBLK_U_CMD_SET_PARAMS",
-            "IORING_OP_URING_CMD",
-            "cmd.addr",
-            "ublk_params",
-            "basic/discard/segment",
-            "DEL_DEV cleanup",
-            "does not issue `UBLK_U_CMD_START_DEV`",
-            "does not start `/dev/ublkbN`",
-        ],
-        &mut missing,
-    );
-    check_source_markers(
-        &root,
         "xtask/tidefs-xtask/src/main.rs",
         &[
             "check-block-volume-ublk-set-params-boundary",
@@ -1316,7 +1051,6 @@ pub fn check_block_volume_ublk_start_dev_boundary_current_workspace() -> Result<
         "apps/tidefs-block-volume-adapter-daemon/src/main.rs",
         "apps/tidefs-block-volume-adapter-daemon/src/ublk_control_open/mod.rs",
         "crates/tidefs-block-volume-adapter-ublk-control-runtime/src/lib.rs",
-        "docs/BLOCK_VOLUME_UBLK_START_DEV_BOUNDARY_OW301T.md",
         "nix/tidefs-validation.sh",
         "xtask/tidefs-xtask/src/main.rs",
     ] {
@@ -1382,7 +1116,6 @@ pub fn check_block_volume_ublk_start_dev_boundary_current_workspace() -> Result<
     );
     check_source_markers(
         &root,
-        "docs/BLOCK_VOLUME_UBLK_START_DEV_BOUNDARY_OW301T.md",
         &[
             "OW-301T guarded ublk START_DEV control boundary",
             "UBLK_U_CMD_START_DEV",
@@ -1426,7 +1159,6 @@ pub fn check_block_volume_ublk_fetch_req_readiness_boundary_current_workspace(
         "apps/tidefs-block-volume-adapter-daemon/src/main.rs",
         "apps/tidefs-block-volume-adapter-daemon/src/ublk_control_open/mod.rs",
         "crates/tidefs-block-volume-adapter-ublk-control-runtime/src/lib.rs",
-        "docs/BLOCK_VOLUME_UBLK_FETCH_REQ_READINESS_BOUNDARY_OW301U.md",
         "nix/tidefs-validation.sh",
         "xtask/tidefs-xtask/src/main.rs",
     ] {
@@ -1490,20 +1222,6 @@ pub fn check_block_volume_ublk_fetch_req_readiness_boundary_current_workspace(
     );
     check_source_markers(
         &root,
-        "docs/BLOCK_VOLUME_UBLK_FETCH_REQ_READINESS_BOUNDARY_OW301U.md",
-        &[
-            "OW-301U guarded ublk data-queue FETCH_REQ readiness boundary",
-            "UBLK_U_IO_FETCH_REQ",
-            "IORING_OP_URING_CMD",
-            "/dev/ublkcN",
-            "data_queue_runtime_live",
-            "must remain in flight",
-            "does not submit FETCH_REQ without a live data-queue runtime",
-        ],
-        &mut missing,
-    );
-    check_source_markers(
-        &root,
         "xtask/tidefs-xtask/src/main.rs",
         &[
             "check-block-volume-ublk-fetch-req-readiness-boundary",
@@ -1534,7 +1252,6 @@ pub fn check_block_volume_ublk_data_queue_open_boundary_current_workspace(
         "apps/tidefs-block-volume-adapter-daemon/src/main.rs",
         "apps/tidefs-block-volume-adapter-daemon/src/ublk_control_open/mod.rs",
         "crates/tidefs-block-volume-adapter-ublk-control-runtime/src/lib.rs",
-        "docs/BLOCK_VOLUME_UBLK_DATA_QUEUE_OPEN_BOUNDARY_OW301V.md",
         "nix/tidefs-validation.sh",
         "xtask/tidefs-xtask/src/main.rs",
     ] {
@@ -1589,17 +1306,6 @@ pub fn check_block_volume_ublk_data_queue_open_boundary_current_workspace(
     );
     check_source_markers(
         &root,
-        "docs/BLOCK_VOLUME_UBLK_DATA_QUEUE_OPEN_BOUNDARY_OW301V.md",
-        &[
-            "OW-301V guarded ublk data-queue runtime-open boundary",
-            "/dev/ublkcN",
-            "requires successful ADD_DEV",
-            "does not submit FETCH_REQ",
-        ],
-        &mut missing,
-    );
-    check_source_markers(
-        &root,
         "xtask/tidefs-xtask/src/main.rs",
         &[
             "check-block-volume-ublk-data-queue-open-boundary",
@@ -1630,7 +1336,6 @@ pub fn check_block_volume_ublk_fetch_req_submit_boundary_current_workspace(
         "apps/tidefs-block-volume-adapter-daemon/src/main.rs",
         "apps/tidefs-block-volume-adapter-daemon/src/ublk_control_open/mod.rs",
         "crates/tidefs-block-volume-adapter-ublk-control-runtime/src/lib.rs",
-        "docs/BLOCK_VOLUME_UBLK_FETCH_REQ_SUBMISSION_BOUNDARY_OW301W.md",
         "nix/tidefs-validation.sh",
         "xtask/tidefs-xtask/src/main.rs",
     ] {
@@ -1677,16 +1382,6 @@ pub fn check_block_volume_ublk_fetch_req_submit_boundary_current_workspace(
             "nonclaim.no_start_dev_uring_cmd_issued=true",
             "fetch_req_submission_boundary_records_all_tags_without_start_dev",
             "fetch_req_submission_boundary_records_partial_submit_error_and_cleanup",
-        ],
-        &mut missing,
-    );
-    check_source_markers(
-        &root,
-        "docs/BLOCK_VOLUME_UBLK_FETCH_REQ_SUBMISSION_BOUNDARY_OW301W.md",
-        &[
-            "OW-301W guarded ublk FETCH_REQ submission boundary",
-            "requires live data-queue runtime",
-            "does not submit START_DEV",
         ],
         &mut missing,
     );

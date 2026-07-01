@@ -423,7 +423,6 @@ surface beyond adding `docs/CLAIMS_GATE_POLICY.md`, which was already scanned.
 | `docs/VFS_ENGINE_API_CONTRACT.md` | Historical input | Imported implemented-source contract for the VFS Engine API. References stale Forgejo issues (#1887, #1213). The canonical types and operations are useful design reference, but full source-behavior alignment verification is too large for this slice. |
 | `docs/FUSE_BINDING_STRATEGY_AND_FEATURE_MATRIX_P1-05.md` | Historical input | Imported production-design FUSE binding strategy describing the `fuser`-based binding, capability negotiation, and feature matrix. Useful reference, but full per-capability source alignment verification is too large for this slice. |
 | `docs/DEBUGGING_WORKFLOWS.md` | Historical input | Imported developer guide covering debug builds, tracing, test isolation, and xtask checks. Generally applicable commands, but specific references may have drifted. |
-| `docs/BLOCK_VOLUME_PROJECTION_CHARTER_BLOCK_VOLUME_ADAPTER.md` | Historical input | Imported design charter for block volume projection. Detailed authoritative/projection noun mapping and durability classes. References Forgejo state and design-consolidation phase language. |
 | `docs/DATASET_FEATURE_FLAGS_DESIGN.md` | Historical input | Imported design-spec for per-dataset feature flags with three compatibility classes. References Forgejo issue #1223. |
 | `docs/DATASET_LIFECYCLE_DESIGN.md` | Historical input | Imported design-spec for dataset lifecycle state machine. References Forgejo issue #1219. Claims registry has no validated dataset-lifecycle claim. |
 | `docs/TXG_STATE_MACHINE_DESIGN.md` | Historical input | Imported spec-draft for canonical commit ordering and multi-phase commit_group state machine. References Forgejo issue #1267. |
@@ -461,27 +460,18 @@ xfstests coverage, distributed behavior, or runtime crash claims.
 
 **Block-volume adapter and ublk source-boundary docs**
 
+Issue #1637 deleted the OW-301 block-volume receipt/spec roots and the older
+projection charter as duplicate live Markdown authority surfaces. The useful
+current boundary is folded into the surviving started-export admission artifact
+doc below, source code, generated claim registry, validation artifacts, git
+history, and PR/issue lineage. This consolidation does not validate qid/tag
+completion as a product claim, unblock the block-device product boundary, or
+claim fio breadth, mkfs/mount acceptance, online resize, crash durability,
+kernel block readiness, release readiness, production readiness, or
+OpenZFS/Ceph successor status.
+
 | Path | State | Classification note |
 |---|---|---|
-| `docs/BLOCK_VOLUME_ADAPTER_CORE_OW301A.md` | Current spec | Scoped current spec for the executable block-volume core model in `tidefs-block-volume-adapter-core`: geometry bounds, exact read/write image behavior, dirty epochs, flush barriers, discard/zero behavior, and refusal records. It is not userspace daemon or Linux block-device readiness evidence. |
-| `docs/BLOCK_VOLUME_QUEUE_ADMISSION_OW301B.md` | Current spec | Scoped current spec for queue/admission records in `tidefs-block-volume-adapter-core`. It binds deterministic admission mirrors, not full ublk runtime or fio/blktests acceptance. |
-| `docs/BLOCK_VOLUME_DISPATCH_EXECUTION_OW301C.md` | Current spec | Scoped current spec for dispatch/completion execution over admitted block-volume submissions in `tidefs-block-volume-adapter-core`. It does not claim production export lifecycle coverage beyond the model. |
-| `docs/BLOCK_VOLUME_EXPORT_LIFECYCLE_OW301D.md` | Current spec | Scoped current spec for modeled export phases in the block-volume adapter core. It is not evidence of a live Linux block export. |
-| `docs/BLOCK_VOLUME_CACHE_COHERENCY_OW301E.md` | Current spec | Scoped current spec for clean-cache windows, dirty-range epochs, flush/FUA barriers, and cache-loss records in the block-volume model. Cached bytes remain non-authoritative. |
-| `docs/BLOCK_VOLUME_RESIZE_FENCE_OW301F.md` | Current spec | Scoped current spec for modeled resize target, tail-range, quiesce, and fence records. It does not prove live failover or kernel device resize behavior. |
-| `docs/BLOCK_VOLUME_ADAPTER_HOST_PREFLIGHT_OW301H.md` | Current spec | Scoped current spec for the daemon host preflight command and non-mutating Linux ublk readiness signals. It does not admit mutating ublk control operations by itself. |
-| `docs/BLOCK_VOLUME_UBLK_ABI_CONTROL_PLAN_OW301I.md` | Current spec | Scoped current spec for typed Linux ublk ABI command/record planning in `crates/tidefs-ublk-abi` and the daemon plan surface. It is not a live-device export claim. |
-| `docs/BLOCK_VOLUME_FILE_BACKING_OW301N.md` | Current spec | Scoped current spec for file-backed block image behavior exposed by `BlockVolumeFileImage` and the daemon backing-file smoke command. It does not claim kernel ublk device service. |
-| `docs/BLOCK_VOLUME_UBLK_CONTROL_OPEN_OW301O.md` | Current spec | Scoped current spec for real-host `/dev/ublk-control` open admission and refusal records. It is an admission boundary, not a full export guarantee. |
-| `docs/BLOCK_VOLUME_UBLK_CONTROL_READONLY_PROBE_OW301P.md` | Current spec | Scoped current spec for the read-only `UBLK_U_CMD_GET_FEATURES` uring command probe. It does not authorize mutating control commands. |
-| `docs/BLOCK_VOLUME_UBLK_ADD_DEV_BOUNDARY_OW301Q.md` | Current spec | Scoped current spec for guarded `UBLK_U_CMD_ADD_DEV` submission after host-open and read-only probe admission. It is not proof of sustained data-queue service. |
-| `docs/BLOCK_VOLUME_UBLK_DEL_DEV_CLEANUP_BOUNDARY_OW301R.md` | Current spec | Scoped current spec for guarded ADD_DEV then DEL_DEV cleanup behavior. It covers cleanup admission only, not production export lifecycle closure. |
-| `docs/BLOCK_VOLUME_UBLK_SET_PARAMS_BOUNDARY_OW301S.md` | Current spec | Scoped current spec for guarded `UBLK_U_CMD_SET_PARAMS` projection over the concrete device id returned by ADD_DEV. It does not prove guest-visible filesystem behavior. |
-| `docs/BLOCK_VOLUME_UBLK_START_DEV_BOUNDARY_OW301T.md` | Current spec | Scoped current spec for guarded `UBLK_U_CMD_START_DEV` command shape and concrete-device admission. It does not claim mounted block workload acceptance. |
-| `docs/BLOCK_VOLUME_UBLK_FETCH_REQ_READINESS_BOUNDARY_OW301U.md` | Current spec | Scoped current spec for data-queue `UBLK_U_IO_FETCH_REQ` command shape, queue id, and SQE128 readiness records. It is readiness authority, not live request throughput evidence. |
-| `docs/BLOCK_VOLUME_UBLK_DATA_QUEUE_OPEN_BOUNDARY_OW301V.md` | Current spec | Scoped current spec for guarded `/dev/ublkcN` data-queue runtime-open ownership after ADD_DEV. It does not prove request servicing. |
-| `docs/BLOCK_VOLUME_UBLK_FETCH_REQ_SUBMISSION_BOUNDARY_OW301W.md` | Current spec | Scoped current spec for first guarded `FETCH_REQ` submissions after control and data-queue admission. It does not claim full data-plane completion behavior. |
-| `docs/BLOCK_VOLUME_UBLK_COMMIT_FETCH_BOUNDARY_OW301X.md` | Current spec | Scoped current spec for guarded `COMMIT_AND_FETCH_REQ` submission after caller-completed fetched requests. It is not a broad block-volume crash-consistency claim. |
 | `docs/BLOCK_VOLUME_UBLK_STARTED_EXPORT_ADMISSION_BOUNDARY_ISSUE_341.md` | Current spec | Scoped current spec for the started-export admission artifact and fail-closed verification path. It does not close broader block-volume runtime validation. |
 
 **FUSE/POSIX adapter docs**

@@ -25,14 +25,13 @@ readiness, or discard/TRIM readiness.
   `crates/tidefs-encryption/`.
 - Current authority and non-claim docs:
   `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`,
-  `docs/BLOCK_VOLUME_ADAPTER_CORE_OW301A.md`,
-  `docs/BLOCK_VOLUME_FILE_BACKING_OW301N.md`,
   `docs/CAPACITY_ACCOUNTING_AUTHORITY.md`,
   `docs/MOUNTED_TRANSFORM_AUTHORITY_RAW_STORE_INVENTORY.md`,
   `docs/TRANSFORM_PIPELINE_AUTHORITY.md`, and
   `docs/POOL_IMPORT_EXPORT_DEVICE_TOPOLOGY_DESIGN.md`.
 - Issue #1536 reviewed the zero-visible/media-privacy evidence above plus the
-  current block-volume file-image zeroing docs and transform privacy guardrails
+  current block-volume file-image zeroing source, the deleted OW-301 lineage
+  retained by git history and issue #1637, and transform privacy guardrails
   before choosing a docs-only clarification for this slice.
 
 ## Current Surfaces

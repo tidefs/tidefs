@@ -1286,6 +1286,17 @@ Important 2026-06-01 findings:
   design-subdir documents as historical input. TFR-019 remains open for any
   per-document source audit needed before promoting additional docs to current
   spec or policy.
+- `TFR-019`: GitHub issue #1637 collapses the block-volume/uBLK OW-301
+  receipt/spec family by deleting the root-level OW-301 files and the older
+  block-volume projection charter as live Markdown authority surfaces. The
+  surviving current-spec block boundary is the scoped started-export admission
+  artifact doc, backed by daemon source, validation artifacts, the claim
+  registry, git history, and PR/issue lineage. This reduces the #512
+  block-volume documentation surface without validating the blocked
+  block-device product boundary, qid/tag completion product status, fio
+  breadth, mkfs/mount acceptance, online resize, crash durability, kernel block
+  readiness, release readiness, production readiness, or OpenZFS/Ceph successor
+  wording.
 - `TFR-019`: GitHub issue #1136 classifies `docs/REQUEST_CONTRACT.md` as
   current spec only for the TideFS-owned request/completion contract shape:
   portable `tidefs-types-vfs-core` records, the v1 `tidefs-schema-codec-vfs`
