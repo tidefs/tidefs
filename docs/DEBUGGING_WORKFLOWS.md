@@ -404,7 +404,10 @@ call-graphs resolve correctly.
 ## 17. Where to go next
 
 - Deleted trace-oracle lineage (#1174) -- historical design input in git history
-- `docs/TRANSACTION_COMMIT_GROUPS_PC007.md` -- local commit/recovery boundary
+- Local transaction/commit authority -- `crates/tidefs-local-filesystem/src/lib.rs`,
+  `crates/tidefs-local-filesystem/src/tests.rs`, and the FUSE
+  fsync/fdatasync dispatch in
+  `apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_flush_fsync.rs`
 - `docs/CONTROL_PLANE_SERVICE_API_CLI_TOPOLOGY_P9-01.md` -- control-plane route topology
 - `docs/THREE_CONTRACT_ARCHITECTURE.md` -- three-contract architecture
 - `docs/INDEX.md` -- full documentation index
