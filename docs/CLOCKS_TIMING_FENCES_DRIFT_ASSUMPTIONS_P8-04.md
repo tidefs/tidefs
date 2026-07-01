@@ -13,7 +13,6 @@ It is subordinate to design rule and the production blueprint, and it must not r
 
 See also:
 - `docs/END_TO_END_PRODUCTION_BLUEPRINT.md`
-- `docs/EXPORT_FENCING_RESIZE_FAILOVER_RUNTIME_P6-03.md`
 - `docs/REPLICATION_REBUILD_RELOCATION_DATA_FLOWS_P8-03.md`
 - `docs/CANONICAL_BINARY_ENCODE_DECODE_ENDIAN_CHECKSUM_LAW_P2-03.md`
 - `docs/AUTHORITATIVE_DATA_STRUCTURES_ALGORITHMS.md`

@@ -23,7 +23,7 @@ See also:
 - `docs/BUILD_PACKAGING_FEATURE_MATRIX_P1-04.md`
 - `docs/POLICY_AUTHORITY_RUNTIME_SURFACE_P3-01.md`
 - `docs/POSIX_FILESYSTEM_ADAPTER_DAEMON_TOPOLOGY_P5-01.md`
-- `docs/UBLK_DAEMON_QUEUE_TOPOLOGY_P6-01.md`
+- `docs/BLOCK_VOLUME_UBLK_STARTED_EXPORT_ADMISSION_BOUNDARY_ISSUE_341.md`
 - `docs/VFS_BLOCK_INTEGRATION_KERNEL_UAPI_LAW_P7-04.md`
 - `docs/RUST_FOR_LINUX_CRATE_TRAIT_BOUNDARIES_P7-02.md`
 - `docs/AUTHORITATIVE_DATA_STRUCTURES_ALGORITHMS.md`
@@ -137,7 +137,7 @@ prose:
   layout details, statx attributes, dirent typing, and utime markers are real
   boundary families that need named law.
 - `docs/VFS_BLOCK_INTEGRATION_KERNEL_UAPI_LAW_P7-04.md`,
-  `docs/UBLK_DAEMON_QUEUE_TOPOLOGY_P6-01.md`, and
+  `docs/BLOCK_VOLUME_UBLK_STARTED_EXPORT_ADMISSION_BOUNDARY_ISSUE_341.md`, and
   `docs/POSIX_CHARTER_TEST_XFSTESTS_MATRIX_P5-04.md` already assume that
   Linux-visible carrier structs are projection mirrors, not hidden authority.
 
