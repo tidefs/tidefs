@@ -358,10 +358,19 @@ narrow source-backed scope.
 |---|---|---|
 | `docs/THREE_CONTRACT_ARCHITECTURE.md` | Historical input | Imported three-contract meta-architecture/design-law text. It is not current on-media, VFS, trace, JSONL, multi-implementation, or release authority. |
 | `docs/TORN_COMMIT_RECOVERY_CONTRACT.md` | Historical input | Imported torn-commit recovery design-spec text. It is not current recovery implementation evidence, crash-safety proof, or release-readiness authority. |
-| `docs/adr/0001-checksum-architecture-g3-pillar.md` | Historical input | Historical ADR for checksum target architecture. It is not current checksum implementation evidence or OpenZFS/Ceph-class integrity proof. |
 | `docs/adr/0002-persistent-orphan-index.md` | Historical input | Historical ADR for persistent orphan-index target architecture. It is not current reclaim, crash-recovery, or space-accounting proof. |
-| `docs/adr/0004-txg-commit-ordering-state-machine.md` | Historical input | Historical ADR for commit-group ordering target architecture. It is not current pool-layer implementation or crash-consistency evidence. |
 | `docs/crates/types-core-consolidation-plan.md` | Historical input | Historical consolidation plan for deleted type-core scaffold roots. Current package authority is `docs/workspace-package-classification.md`. |
+
+### Historical ADR Root Deletion (TFR-019 / #1689)
+
+Issue #1689 deleted the stale checksum and commit-ordering ADR roots instead of
+keeping them as live historical Markdown. Current checksum and BLAKE3 authority
+remains with source-backed policy/spec inputs, `validation/claims.toml`, the
+generated claim registry, and the claims gate. Current transaction and commit
+behavior remains with source, tests, live issues, validation claims, and the
+claims gate. This deletion does not validate checksum architecture completion,
+commit-group crash consistency, pool-layer production readiness, release
+readiness, comparator parity, or OpenZFS/Ceph-successor claims.
 
 ### Historical Kbuild Toolchain Note Deletion (TFR-019 / #1685)
 
