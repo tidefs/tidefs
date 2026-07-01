@@ -826,5 +826,5 @@ pub enum TransitionFailureReason {
 - [#1248] Distributed lock service — writer lease integration
 - `crates/tidefs-membership-epoch/` — deterministic membership model (2895 lines)
 - `docs/BACKGROUND_SERVICE_FRAMEWORK_DESIGN.md`
-- `docs/ERASURE_CODING_PLACEMENT_DESIGN.md` — failure domain hierarchy reference
+- `docs/POOL_WIDE_REDUNDANCY_PLACEMENT_CONTRACT.md` — pool-wide placement and failure-domain reference
 - Python v0.262 reference: `cluster_membership.py` (421 lines)

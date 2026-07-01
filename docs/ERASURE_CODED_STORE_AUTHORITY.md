@@ -28,18 +28,22 @@ This authority covers:
 
 This authority does not cover EC encode/decode mathematics, the GF(2^8)
 Reed-Solomon engine in `tidefs-erasure-coding`, the XOR single-parity model in
-`tidefs-replication-model`, or the TideCRUSH placement algorithm specified in
-`docs/ERASURE_CODING_PLACEMENT_DESIGN.md`. Those are upstream contracts that
-the EC store consumes; this document only decides the store-level authority
-boundaries.
+`tidefs-replication-model`, or the pool-wide placement and receipt model in
+`docs/POOL_WIDE_REDUNDANCY_PLACEMENT_CONTRACT.md` and
+`docs/LOCAL_DISTRIBUTED_RECEIPT_AUTHORITY.md`. Those are upstream contracts
+that the EC store consumes; this document only decides the store-level
+authority boundaries.
 
 ## Evidence Reviewed
 
 - `docs/ERASURE_CODED_LAYOUT_OW306.md` — current single-parity XOR model spec
-- `docs/ERASURE_CODING_PLACEMENT_DESIGN.md` — TideCRUSH placement, erasure
-  family catalog, recovery loop orchestration, and integration contracts
+- `docs/POOL_WIDE_REDUNDANCY_PLACEMENT_CONTRACT.md` — current pool-wide
+  placement contract, erasure target width, receipt-backed reads, and
+  placement tests
 - `docs/LOCAL_DISTRIBUTED_RECEIPT_AUTHORITY.md` — placement receipt model,
   write/repair/read/reclaim flows, receipt format with erasure policy support
+- `crates/tidefs-placement-planner/` — current placement-planner source,
+  including `PlacementPlan`, `DeviceCandidate`, and failure-domain assignment
 - `crates/tidefs-erasure-coded-store/` — current local EC store runtime:
   inline encode, per-store read with reconstruction, `flush_repairs()`,
   `repair_store()`, `compute_shard_to_store()` consuming `PlacementPlan`
@@ -89,10 +93,9 @@ placement-planner and receipt authority that replicated paths use.
 
 Rationale:
 
-- The existing placement design (`ERASURE_CODING_PLACEMENT_DESIGN.md`)
-  specifies TideCRUSH as the deterministic placement function for all
-  redundancy policies, including erasure coding. Having the EC store own a
-  parallel placement truth would fork the placement authority.
+- The current pool-wide placement contract makes the pool the placement
+  authority for both replicated and erasure policies. Having the EC store own
+  a parallel placement truth would fork that authority.
 - The `PlacementReceipt` format already encodes erasure policy targets
   (`data_shards + parity_shards`), and the receipt read path already describes
   erasure reads with shard-digest verification and reconstruction. This is
@@ -150,7 +153,7 @@ Missing-shard rebuild has two tiers with different ownership:
 | Tier | Trigger | Owner | Scope |
 |------|---------|-------|-------|
 | Local per-stripe repair | Degraded read, `flush_repairs()` | EC store | Reconstruct one shard from k survivors and write it back to its assigned store |
-| Orchestrated repair | Member failure, background scrub | Recovery loop orchestrator (future) | Enumerate affected stripes, re-place via TideCRUSH, dispatch repair jobs, throttle |
+| Orchestrated repair | Member failure, background scrub | Recovery loop orchestrator (future) | Enumerate affected stripes, select replacement placement through current placement authority, dispatch repair jobs, throttle |
 
 Rationale:
 
@@ -161,8 +164,8 @@ Rationale:
 - Broader repair orchestration (a node failure affects many stripes across
   many objects) must consume the placement planner to select new targets and
   the receipt system to publish replacement receipts. This exceeds the EC
-  store's local scope and belongs to the recovery loop orchestrator described
-  in `ERASURE_CODING_PLACEMENT_DESIGN.md` section 5.
+  store's local scope and belongs to a recovery loop orchestrator that consumes
+  the current placement and receipt authority.
 - The EC store provides the per-stripe rebuild primitive; the orchestrator
   schedules, dispatches, and throttles.
 
@@ -172,9 +175,9 @@ Concrete contract:
   the primitive the EC store exposes to the recovery orchestrator.
 - `ErasureCodedStore::flush_repairs()` remains the local degraded-read repair
   path.
-- Stripe enumeration, TideCRUSH re-placement, and repair job scheduling live
-  in the recovery loop orchestrator, which consumes the EC store as a repair
-  worker.
+- Stripe enumeration, replacement placement decisions, and repair job
+  scheduling live in the recovery loop orchestrator, which consumes the EC
+  store as a repair worker.
 - `Pool::repair_with_receipt` is the pool-level repair entry point; for EC
   objects it delegates to the recovery orchestrator, which in turn drives the
   EC store's per-shard repair primitive.
@@ -221,7 +224,8 @@ implementation authority for:
 
 The EC store does not own:
 
-- device-level placement selection (placement planner / TideCRUSH);
+- device-level placement selection (pool-wide placement planner and receipt
+  authority);
 - receipt generation and publication (pool / receipt authority);
 - failure-domain topology (membership epoch);
 - recovery loop orchestration (recovery orchestrator, future);
@@ -256,10 +260,9 @@ worked sequentially or by non-overlapping owners.
    primitive. Expected write set: `crates/tidefs-pool/`,
    `crates/tidefs-erasure-coded-store/`.
 
-4. **Recovery loop orchestrator**: Implement the recovery loop described in
-   `ERASURE_CODING_PLACEMENT_DESIGN.md` section 5: member-failure stripe
-   enumeration, TideCRUSH re-placement, repair job dispatch, and throttling.
-   Expected write set: new crate or
+4. **Recovery loop orchestrator**: Implement member-failure stripe
+   enumeration, replacement placement through the current placement authority,
+   repair job dispatch, and throttling. Expected write set: new crate or
    `crates/tidefs-recovery-orchestrator/`, `crates/tidefs-erasure-coded-store/`
    (repair primitive).
 
@@ -269,9 +272,8 @@ worked sequentially or by non-overlapping owners.
    `crates/tidefs-replication-model/` (profile records),
    `crates/tidefs-erasure-coded-store/` (profile consumption).
 
-6. **Background scrub for EC**: Implement the periodic scrub cycle described
-   in `ERASURE_CODING_PLACEMENT_DESIGN.md` section 5.1 trigger 2: enumerate
-   stripes, verify shard checksums, enqueue repair. Expected write set:
+6. **Background scrub for EC**: Implement the periodic EC scrub cycle:
+   enumerate stripes, verify shard checksums, enqueue repair. Expected write set:
    `crates/tidefs-erasure-coded-store/` (scrub entry point), new or existing
    background task infrastructure.
 
@@ -289,21 +291,21 @@ before implementation depends on them:
 
 - Whether to add an async encode queue (deferred pending throughput
   benchmarks).
-- Whether TideCRUSH placement should be cached or computed per-read (open
-  question 1 in `ERASURE_CODING_PLACEMENT_DESIGN.md`).
-- Whether the recovery loop uses cooperative or preemptive scheduling (open
-  question 3).
-- Whether the erasure profile catalog should be compile-time or runtime
-  (open question 4).
-- Whether EC-2+1 should use the XOR optimization path (open question 2; the
-  GF(2^8) engine already dispatches to XOR for single parity).
+- Whether recovery orchestration should cache placement decisions, recompute
+  from receipt/planner inputs, or consume a separate placement-plan cache.
+- Whether the recovery loop uses cooperative or preemptive scheduling.
+- Whether the erasure profile catalog should be compile-time or runtime.
+- Whether EC-2+1 should use the XOR optimization path; the GF(2^8) engine
+  already dispatches to XOR for single parity.
 
 ## References
 
 - `docs/ERASURE_CODED_LAYOUT_OW306.md` — XOR single-parity layout model
-- `docs/ERASURE_CODING_PLACEMENT_DESIGN.md` — TideCRUSH and recovery loop design
+- `docs/POOL_WIDE_REDUNDANCY_PLACEMENT_CONTRACT.md` — current pool-wide
+  placement contract
 - `docs/LOCAL_DISTRIBUTED_RECEIPT_AUTHORITY.md` — receipt authority model
 - `docs/workspace-package-classification.md` — crate classification
+- `crates/tidefs-placement-planner/` — current placement planner
 - `crates/tidefs-erasure-coded-store/` — current EC store runtime
 - `crates/tidefs-erasure-coding/` — RS engine
 - `crates/tidefs-replication-model/` — EC profile, policy, and durability model
