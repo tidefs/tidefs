@@ -1990,6 +1990,7 @@ pub fn finalize_prefetch_execution(
     if terminal_update_refs_outside_evidence_cut(record, update)
         || terminal_result_detail_lacks_feedback_evidence(record, update)
         || terminal_result_detail_exceeds_started_action(record, update.result_detail)
+        || terminal_update_has_contradictory_refusal(update)
         || terminal_update_lacks_result_refusal_evidence(record, update)
         || terminal_update_lacks_verification_evidence(record, update)
         || terminal_update_lacks_degraded_visibility_evidence(record, update)
@@ -2247,6 +2248,16 @@ fn terminal_update_lacks_result_refusal_evidence(
             update.evidence_cut,
             update.result_refusal_ref,
             StorageIntentEvidenceKind::ResultRefusalEvidence,
+        )
+}
+
+fn terminal_update_has_contradictory_refusal(update: PrefetchExecutorTerminalUpdate) -> bool {
+    update.refusal != StorageIntentRefusalReason::None
+        && matches!(
+            update.outcome,
+            PrefetchExecutorOutcome::Completed
+                | PrefetchExecutorOutcome::DegradedVisible
+                | PrefetchExecutorOutcome::HandoffRequired
         )
 }
 
@@ -6481,6 +6492,75 @@ mod tests {
     }
 
     #[test]
+    fn terminal_update_rejects_success_outcomes_with_explicit_refusal() {
+        let started = evaluate_prefetch_execution(admitted_input(
+            PrefetchResidencyCandidateClass::BoundedReadahead,
+        ));
+        assert_eq!(started.outcome, PrefetchExecutorOutcome::Started);
+        let result_ref = evidence(
+            StorageIntentEvidenceKind::ResultRefusalEvidence,
+            RESULT_REFUSAL,
+        );
+        let completed = finalize_prefetch_execution(
+            started,
+            PrefetchExecutorTerminalUpdate {
+                outcome: PrefetchExecutorOutcome::Completed,
+                refusal: StorageIntentRefusalReason::OverBudget,
+                result_refusal_ref: result_ref,
+                evidence_cut: terminal_evidence_cut(
+                    started,
+                    PrefetchExecutorResultDetail::default(),
+                    result_ref,
+                ),
+                ..PrefetchExecutorTerminalUpdate::default()
+            },
+        );
+        assert_eq!(
+            completed.outcome,
+            PrefetchExecutorOutcome::VerificationFailed
+        );
+        assert_eq!(
+            completed.refusal,
+            StorageIntentRefusalReason::ValidationGateFailed
+        );
+        assert_eq!(
+            completed.executor_byte_state,
+            PrefetchExecutorByteState::Refused
+        );
+        assert_record_has_no_authority_claims(completed);
+
+        let degraded_ref = evidence(
+            StorageIntentEvidenceKind::RecoveryDegradationEvidence,
+            RECOVERY,
+        );
+        let degraded = finalize_prefetch_execution(
+            started,
+            PrefetchExecutorTerminalUpdate {
+                outcome: PrefetchExecutorOutcome::DegradedVisible,
+                refusal: StorageIntentRefusalReason::EvidenceNotUsable,
+                result_refusal_ref: result_ref,
+                degraded_visibility_ref: degraded_ref,
+                evidence_cut: terminal_evidence_cut_with_degraded_visibility(
+                    started,
+                    PrefetchExecutorResultDetail::default(),
+                    result_ref,
+                    degraded_ref,
+                ),
+                ..PrefetchExecutorTerminalUpdate::default()
+            },
+        );
+        assert_eq!(
+            degraded.outcome,
+            PrefetchExecutorOutcome::VerificationFailed
+        );
+        assert_eq!(
+            degraded.refusal,
+            StorageIntentRefusalReason::ValidationGateFailed
+        );
+        assert_record_has_no_authority_claims(degraded);
+    }
+
+    #[test]
     fn terminal_update_records_interruption_evidence_without_authority() {
         let detail = terminal_detail();
         let started = evaluate_prefetch_execution(admitted_charged_input(
@@ -6775,6 +6855,53 @@ mod tests {
         assert_eq!(degraded.refusal, StorageIntentRefusalReason::None);
         assert_eq!(degraded.evidence_refs.degraded_visibility_ref, degraded_ref);
         assert_record_has_no_authority_claims(degraded);
+    }
+
+    #[test]
+    fn terminal_update_rejects_handoff_required_with_explicit_refusal() {
+        let mut input = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        let relocation_ref = evidence(StorageIntentEvidenceKind::RelocationReceipt, RELOCATION);
+        input.decision.evidence_refs.relocation_boundary_ref = relocation_ref;
+        input
+            .evidence_query_snapshot
+            .included_refs
+            .push(relocation_ref)
+            .unwrap();
+        let started = evaluate_prefetch_execution(input);
+        assert_eq!(started.outcome, PrefetchExecutorOutcome::Started);
+
+        let result_ref = evidence(
+            StorageIntentEvidenceKind::ResultRefusalEvidence,
+            RESULT_REFUSAL,
+        );
+        let mut handoff_cut =
+            terminal_evidence_cut(started, PrefetchExecutorResultDetail::default(), result_ref);
+        handoff_cut
+            .included_refs
+            .push(started.evidence_refs.relocation_boundary_ref)
+            .unwrap();
+
+        let handoff = finalize_prefetch_execution(
+            started,
+            PrefetchExecutorTerminalUpdate {
+                outcome: PrefetchExecutorOutcome::HandoffRequired,
+                refusal: StorageIntentRefusalReason::EvidenceNotUsable,
+                handoff_target: PrefetchExecutorHandoffTarget::Promotion,
+                result_refusal_ref: result_ref,
+                evidence_cut: handoff_cut,
+                ..PrefetchExecutorTerminalUpdate::default()
+            },
+        );
+        assert_eq!(handoff.outcome, PrefetchExecutorOutcome::VerificationFailed);
+        assert_eq!(
+            handoff.refusal,
+            StorageIntentRefusalReason::ValidationGateFailed
+        );
+        assert_eq!(
+            handoff.executor_byte_state,
+            PrefetchExecutorByteState::Refused
+        );
+        assert_record_has_no_authority_claims(handoff);
     }
 
     #[test]
