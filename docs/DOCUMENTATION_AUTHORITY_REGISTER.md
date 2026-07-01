@@ -362,7 +362,16 @@ narrow source-backed scope.
 | `docs/adr/0002-persistent-orphan-index.md` | Historical input | Historical ADR for persistent orphan-index target architecture. It is not current reclaim, crash-recovery, or space-accounting proof. |
 | `docs/adr/0004-txg-commit-ordering-state-machine.md` | Historical input | Historical ADR for commit-group ordering target architecture. It is not current pool-layer implementation or crash-consistency evidence. |
 | `docs/crates/types-core-consolidation-plan.md` | Historical input | Historical consolidation plan for deleted type-core scaffold roots. Current package authority is `docs/workspace-package-classification.md`. |
-| `docs/k7-kbuild-toolchain.md` | Historical input | Historical Kbuild toolchain preparation note. Current kernel workflow authority is `docs/KERNEL_MODULE_DEVELOPMENT_WORKFLOW_P7-05.md`. |
+
+### Historical Kbuild Toolchain Note Deletion (TFR-019 / #1685)
+
+Issue #1685 deleted the standalone historical Linux 7.0 Kbuild toolchain
+preparation note. Current Kbuild toolchain behavior remains in
+`nix/vm/k7-kbuild-toolchain.nix`, `flake.nix`, and
+`scripts/k7-kbuild-toolchain-prepare.sh`; current workflow policy remains in
+`docs/KERNEL_MODULE_DEVELOPMENT_WORKFLOW_P7-05.md`. The deleted note is git,
+issue, and PR lineage only, not Kbuild, QEMU, kernel runtime, release, or
+OpenZFS/Ceph-successor evidence.
 
 ### Empty Module Owners Scaffold Retirement (TFR-019 / #1619)
 
