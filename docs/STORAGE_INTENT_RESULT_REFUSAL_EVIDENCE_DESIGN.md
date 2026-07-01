@@ -49,7 +49,7 @@ infrastructure.
   `StorageIntentRefusalReason`.
 - `crates/tidefs-storage-intent-satisfaction/src/lib.rs` for #874
   satisfaction states and axes, including the `ResultRefusal` axis.
-- `docs/RECEIPT_RESPONSE_RUNTIME_EMISSION_PATH_P3-03.md` and
+- deleted P3 receipt/response production-depth lineage and
   `crates/tidefs-types-vfs-core/src/lib.rs` for response-registry scope,
   truth-cut, render, refusal, retention, visible-answer, index, and recall
   vocabulary.

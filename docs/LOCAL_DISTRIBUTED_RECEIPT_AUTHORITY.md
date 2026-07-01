@@ -275,4 +275,4 @@ RDMA and broad release-candidate runs are further milestone gates (see issue
 - Issue #16: media substrate
 - Deleted shard/rebake historical lineage
 - `docs/REPLICATION_REBUILD_RELOCATION_DATA_FLOWS_P8-03.md`
-- `docs/RECEIPT_RESPONSE_RUNTIME_EMISSION_PATH_P3-03.md`
+- `docs/STORAGE_INTENT_RESULT_REFUSAL_EVIDENCE_DESIGN.md`

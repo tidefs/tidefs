@@ -14,12 +14,11 @@ See also:
 - `docs/END_TO_END_PRODUCTION_BLUEPRINT.md`
 - `docs/DOCTRINE_FAMILY_TO_RUST_TYPE_MAP_P2-01.md`
 - `docs/BUILD_PACKAGING_FEATURE_MATRIX_P1-04.md`
-- `docs/POLICY_AUTHORITY_RUNTIME_SURFACE_P3-01.md`
 - `docs/POSIX_FILESYSTEM_ADAPTER_DAEMON_TOPOLOGY_P5-01.md`
 - `docs/CONTROL_PLANE_SERVICE_API_CLI_TOPOLOGY_P9-01.md`
 - `docs/STORAGE_INTENT_POLICY_AUTHORITY.md`
 - `docs/LOCAL_DISTRIBUTED_RECEIPT_AUTHORITY.md`
-- `docs/RECEIPT_RESPONSE_RUNTIME_EMISSION_PATH_P3-03.md`
+- `docs/STORAGE_INTENT_RESULT_REFUSAL_EVIDENCE_DESIGN.md`
 - `docs/DASHBOARDS_TRACES_OPERATOR_TRUTH_SURFACES_P10-04.md` (missing from the repository; see #1270)
 - `docs/AUTHORITATIVE_DATA_STRUCTURES_ALGORITHMS.md`
 
@@ -86,17 +85,17 @@ in `docs/DOCTRINE_FAMILY_TO_RUST_TYPE_MAP_P2-01.md`.
 That boundary is deliberate.
 `P1-01` fixes **where Rust code is allowed to live and how crates may depend on
 one another**.
-It now also consumes the explicit `governance_surface_0` authority-service law in
-`docs/POLICY_AUTHORITY_RUNTIME_SURFACE_P3-01.md`, the explicit `posix_filesystem_adapter`
-daemon/process-topology law in `docs/POSIX_FILESYSTEM_ADAPTER_DAEMON_TOPOLOGY_P5-01.md`,
-current storage-intent and placement-receipt authority in
+It now also consumes the explicit `posix_filesystem_adapter`
+daemon/process-topology law in
+`docs/POSIX_FILESYSTEM_ADAPTER_DAEMON_TOPOLOGY_P5-01.md`, current
+storage-intent and placement-receipt authority in
 `docs/STORAGE_INTENT_POLICY_AUTHORITY.md` and
-`docs/LOCAL_DISTRIBUTED_RECEIPT_AUTHORITY.md`, the explicit
-`response_registry` receipt/response-emission law in
-`docs/RECEIPT_RESPONSE_RUNTIME_EMISSION_PATH_P3-03.md`, the explicit `package_profile_catalog`
-build/packaging law in `docs/BUILD_PACKAGING_FEATURE_MATRIX_P1-04.md`, the
-deleted kernel-boundary production-depth lineage, and the explicit `truth_view`
-operator-truth law in
+`docs/LOCAL_DISTRIBUTED_RECEIPT_AUTHORITY.md`, current result/refusal evidence
+authority in `docs/STORAGE_INTENT_RESULT_REFUSAL_EVIDENCE_DESIGN.md`, the
+explicit `package_profile_catalog` build/packaging law in
+`docs/BUILD_PACKAGING_FEATURE_MATRIX_P1-04.md`, the deleted P3
+policy/receipt production-depth lineage, deleted kernel-boundary
+production-depth lineage, and the explicit `truth_view` operator-truth law in
 `docs/DASHBOARDS_TRACES_OPERATOR_TRUTH_SURFACES_P10-04.md` (missing from the repository; see #1270), so service roots,
 client crates, observe crates, stage bindings, and the userspace-versus-kernel
 split are no longer allowed to drift into Cargo-local convenience.
@@ -361,7 +360,8 @@ With this law settled:
 - the repo now has one explicit answer to where Rust libraries, service roots,
   test harnesses, orchestration crates, and the sibling `kmod/` tree lawfully
   live,
-- `type_map`, `governance_surface_0`, `posix_filesystem_adapter`, `publication_pipeline`, `response_registry`, `package_profile_catalog`, `kernel_boundary`, and the future stage gates
+- `type_map`, `posix_filesystem_adapter`, `publication_pipeline`,
+  `response_registry`, `package_profile_catalog`, `kernel_boundary`, and the future stage gates
   now share one workspace-family and dependency grammar instead of Cargo-local
   convenience,
 - broad implementation already makes sense to start, because the remaining work

@@ -25,10 +25,9 @@ See also:
 - `docs/FUSE_REQUEST_WORKER_QUEUE_MODEL_P5-02.md`
 - `docs/PAGE_CACHE_WRITEBACK_MMAP_INTEGRATION_P5-03.md`
 - `docs/MEMORY_DOMAINS_ARENA_FAMILIES_OWNERSHIP_TOKEN_LAW_P4-01.md`
-- `docs/POLICY_AUTHORITY_RUNTIME_SURFACE_P3-01.md`
 - `docs/STORAGE_INTENT_POLICY_AUTHORITY.md`
 - `docs/LOCAL_DISTRIBUTED_RECEIPT_AUTHORITY.md`
-- `docs/RECEIPT_RESPONSE_RUNTIME_EMISSION_PATH_P3-03.md`
+- `docs/STORAGE_INTENT_RESULT_REFUSAL_EVIDENCE_DESIGN.md`
 - `docs/BUILD_PACKAGING_FEATURE_MATRIX_P1-04.md`
 - `docs/END_TO_END_PRODUCTION_BLUEPRINT.md`
 - `docs/AUTHORITATIVE_DATA_STRUCTURES_ALGORITHMS.md`
@@ -87,7 +86,19 @@ This document governs:
 - global versus per-session budgets, including thread, FD, reply-byte, pin/loan, and restart-storm accounting,
 - and crash, drain, restart, quarantine, and retirement behavior.
 
-This document now consumes the explicit `P5-02` worker/queue law in `docs/FUSE_REQUEST_WORKER_QUEUE_MODEL_P5-02.md`, the explicit `P5-03` page-cache / writeback / mmap law in `docs/PAGE_CACHE_WRITEBACK_MMAP_INTEGRATION_P5-03.md`, the explicit `memory_arena_0` memory-domain / arena / ownership-token law in `docs/MEMORY_DOMAINS_ARENA_FAMILIES_OWNERSHIP_TOKEN_LAW_P4-01.md`, the explicit `governance_surface_0` authority-service law in `docs/POLICY_AUTHORITY_RUNTIME_SURFACE_P3-01.md`, current storage-intent and placement-receipt authority in `docs/STORAGE_INTENT_POLICY_AUTHORITY.md` and `docs/LOCAL_DISTRIBUTED_RECEIPT_AUTHORITY.md`, the explicit `response_registry` receipt / response runtime emission law in `docs/RECEIPT_RESPONSE_RUNTIME_EMISSION_PATH_P3-03.md`, and the explicit `package_profile_catalog` build / packaging / activation law in `docs/BUILD_PACKAGING_FEATURE_MATRIX_P1-04.md`.
+This document now consumes the explicit `P5-02` worker/queue law in
+`docs/FUSE_REQUEST_WORKER_QUEUE_MODEL_P5-02.md`, the explicit `P5-03`
+page-cache / writeback / mmap law in
+`docs/PAGE_CACHE_WRITEBACK_MMAP_INTEGRATION_P5-03.md`, the explicit
+`memory_arena_0` memory-domain / arena / ownership-token law in
+`docs/MEMORY_DOMAINS_ARENA_FAMILIES_OWNERSHIP_TOKEN_LAW_P4-01.md`, current
+storage-intent and placement-receipt authority in
+`docs/STORAGE_INTENT_POLICY_AUTHORITY.md` and
+`docs/LOCAL_DISTRIBUTED_RECEIPT_AUTHORITY.md`, current result/refusal evidence
+authority in `docs/STORAGE_INTENT_RESULT_REFUSAL_EVIDENCE_DESIGN.md`, and the
+explicit `package_profile_catalog` build / packaging / activation law in
+`docs/BUILD_PACKAGING_FEATURE_MATRIX_P1-04.md`. Deleted P3 policy/receipt
+production-depth lineage is git and issue history only.
 
 That boundary is deliberate.
 `P5-01` closes the last remaining `L1` production-design blocker.
