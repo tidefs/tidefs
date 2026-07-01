@@ -461,7 +461,6 @@ surface beyond adding `docs/CLAIMS_GATE_POLICY.md`, which was already scanned.
 | `docs/OPERATOR_PRODUCT_SURFACE_DECISION.md` | Current policy | Design decision #1267 recording the current runtime-fed operator product-surface boundary after the OW-307D blocker map. States that no runtime-fed operator product surface exists, the P10-04 truth-surface law is missing from the repository, and no product carrier class is selectable until transport/cluster authority and the P10-04 gap close. The operator/UAPI command boundary is closed for the current pre-alpha command surface, but that closeout is not a runtime-fed product carrier. |
 | `docs/DASHBOARDS_TRACES_OPERATOR_TRUTH_SURFACES_P10-04.md` | Missing | Truth-surface law reference absent from the repository. Issue #1270 records the gap: the law expected to define mandatory surface classes, provenance/exactness/freshness rendering, carrier verification, and the `truth_view` concept does not exist, so citations to this path are not current authority. |
 | `docs/PREVIEW_USER_MANUAL.md` | Historical input | Imported preview manual that correctly disclaims production readiness and references the claims gate and transform authority. Preview commands are useful orientation but the document is preview-scoped, not binding policy. |
-| `docs/troubleshooting-build.md` | Historical input | Imported developer guide for build failure diagnosis covering Nix shell and Cargo issues. Useful reference but specific tool versions and paths may have drifted since import. |
 
 **Architecture, design, and feature docs**
 
@@ -681,22 +680,15 @@ claim/comparator evidence path.
 |---|---|---|
 | `docs/BACKGROUND_SERVICE_FRAMEWORK_DESIGN.md` | Current spec | Scoped source-backed summary for the current background scheduler and incremental-job contract in `crates/tidefs-background-scheduler`, `crates/tidefs-incremental-job-core`, and `crates/tidefs-types-incremental-job-core`. It is not release-readiness evidence or proof that every maintenance subsystem is wired into mounted runtime behavior. |
 
-### Derived-Views Architectural Pillar (TFR-019 / #1240)
+### Unreferenced Historical Input Deletions (TFR-019 / #1673)
 
-Classified for TFR-019 / GitHub issue #1240 on 2026-06-24 after reviewing this
-register's authority rule and review method, the TFR-019 notes in
-`docs/REVIEW_TODO_REGISTER.md`, the imported derived-views pillar document,
-`docs/INDEX.md`, `docs/GITHUB_PR_DEVELOPMENT.md`, and bounded source/doc
-searches for ValidityToken, derived-view, ViewClass, ViewBuildCost, WorkBudget,
-cache-lattice, cursor-framework, resource-governor, and Forgejo-era
-lane/priority/milestone wording in the current source tree. This slice does not
-implement derived views, does not recreate deleted cache-lattice or
-cursor-framework design docs, and does not convert historical architectural
-design into current product claims.
-
-| Path | State | Classification note |
-|---|---|---|
-| `docs/design/derived-views-first-class-architectural-pillar.md` | Historical input | Imported Forgejo-era derived-views architectural design with old issue #1240 metadata, P2 priority, DESIGN-M4 milestone, lane/blocking claims, `STATUS.md`/`FEATURE_MATRIX.md` references, DEPENDS-ON links to retired Forgejo issues #1173/#1176/#1237/#1239, and cache-lattice/cursor-framework/resource-governor design-spec wording. Live source has a simpler `ValidityToken` (32-byte BLAKE3 opaque token with `matches()`) in `tidefs-types-cache-lattice-core` and stub `ViewClass`/`ViewBuildCost` enums without derived-view implementations, but no multi-kind token dispatch, no six-view-type runtime, no incremental delta refresh, and no budget-governor wiring. The cache-lattice, cursor-framework, resource-governor, and WorkBudget architectural claims in the document exceed current live-source and claim-registry evidence. The file is preserved as lineage material for future review and must not be cited as current TideFS implementation status, release-readiness evidence, or product authority. |
+Issue #1673 deleted `docs/troubleshooting-build.md` and
+`docs/design/derived-views-first-class-architectural-pillar.md` after bounded
+search found no live source, validation, or current-authority references
+outside this register. Their lineage remains in git, issue #1673, and the pull
+request. This deletion does not create build/troubleshooting authority,
+derived-view implementation evidence, release-readiness evidence, or product
+claims.
 
 ### Unified On-Media Format Lifecycle (TFR-019 / #1242)
 
