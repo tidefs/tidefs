@@ -1425,7 +1425,12 @@ pub mod notification {
                 };
                 if self
                     .state
-                    .compare_exchange(current_raw, next.to_u8(), Ordering::AcqRel, Ordering::Acquire)
+                    .compare_exchange(
+                        current_raw,
+                        next.to_u8(),
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
                     .is_ok()
                 {
                     return next;
