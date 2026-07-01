@@ -686,7 +686,7 @@ cross-reference additions recorded in #1279.
 
 | Path | State | Classification note |
 |---|---|---|
-| `docs/RELEASE_READINESS_VERDICT_CONTRACT.md` | Current policy | Design decision #1279 defining the release-readiness verdict boundary. Names the verdict owner, required evidence families, explicit non-claims, and the distinction between gate-local readiness receipts (such as performance-gate `GateReceipt.release_ready`, claims-gate claim status, and release-candidate evidence index) and whole-product admission. States that no release-readiness verdict exists as of 2026-06-24, that TideFS is not release-ready, and that no automated gate, CI workflow, or generated artifact may render an unqualified release-readiness claim without the verdict owner's recorded decision. Maps follow-up issues #1283 and #1284 for the remaining scoped performance-gate receipt rename/rendering work and release-facing documentation register classifications. The contract is a design/decision artifact; it does not implement a product surface, widen publishing claims, or change `validation/claims.toml`. |
+| `docs/RELEASE_READINESS_VERDICT_CONTRACT.md` | Current policy | Design decision #1279 defining the release-readiness verdict boundary. Names the verdict owner, required evidence families, explicit non-claims, and the distinction between gate-local readiness receipts (such as performance-gate `GateReceipt.perf_gate_ready`, claims-gate claim status, and release-candidate evidence index) and whole-product admission. States that no release-readiness verdict exists as of 2026-06-24, that TideFS is not release-ready, and that no automated gate, CI workflow, or generated artifact may render an unqualified release-readiness claim without the verdict owner's recorded decision. Records closed follow-ups #1283 and #1284 for the scoped performance-gate receipt rename/rendering work and release-facing documentation register classifications. The contract is a design/decision artifact; it does not implement a product surface, widen publishing claims, or change `validation/claims.toml`. |
 
 ### Release-Facing Evidence Inputs (#1284)
 
@@ -698,9 +698,9 @@ and bounded source/doc inspection of `.github/workflows/release-candidate.yml`,
 `crates/tidefs-validation/src/performance_gate/runner.rs`, and the current
 open PR and issue validation conventions. This slice adds classification rows
 for the four release-facing evidence-input documents that the release-readiness
-verdict contract (#1279) identifies as required evidence families; the P10-03
-`GateReceipt.release_ready` field rename and rendering work is left to #1283.
-This slice does not edit runtime source, GitHub workflows,
+verdict contract (#1279) identifies as required evidence families. The P10-03
+`GateReceipt.perf_gate_ready` field rename and scoped rendering work was
+completed by #1283. This slice does not edit runtime source, GitHub workflows,
 `validation/claims.toml`, generated claim registry files, or unrelated
 documents.
 
