@@ -803,12 +803,36 @@ kernel-hosted policy authority service, runtime-fed operator product surface,
 response-registry runtime, receipt runtime closure, release readiness,
 OpenZFS/Ceph parity, or successor/comparator wording.
 
+### Performance And Fault Root Deletions (TFR-019 / #1712)
+
+Issue #1712 deleted the imported performance-budget/SLO/regression-gate
+and fault-injection/chaos/corruption production-depth roots instead of
+preserving them as live historical surfaces. The performance root was already
+classified as historical input, and the fault root still called itself
+source-of-truth even though current proof lives in source, validation
+artifacts, release evidence, and claims policy.
+
+Current performance-gate authority remains with
+`crates/tidefs-validation/src/performance_gate/`, `xtask` command behavior,
+`docs/RELEASE_CANDIDATE_EVIDENCE_CONTRACT.md`,
+`docs/RELEASE_READINESS_VERDICT_CONTRACT.md`, `docs/GITHUB_CI.md`,
+`docs/CLAIMS_GATE_POLICY.md`, `validation/claims.toml`, generated
+`docs/CLAIM_REGISTRY.md`, and live validation artifacts. Current typed
+fault-catalog and fault-scenario authority remains with
+`crates/tidefs-local-object-store/src/fault_catalog.rs`,
+`crates/tidefs-local-object-store/src/fault_injection.rs`,
+`crates/tidefs-validation/src/fault_injection_scenario_catalog.rs`, release
+evidence, claims policy, and live GitHub issues/PRs. This deletion does not
+validate release readiness, production fault campaigns, performance budget
+completeness, full POSIX/block/kernel readiness, OpenZFS/Ceph parity, or
+successor/comparator wording.
+
 ### Release Readiness Verdict Contract (#1279)
 
 Classified for GitHub issue #1279 on 2026-06-24 after reviewing this register's
 authority rule and review method, `docs/RELEASE_CANDIDATE_EVIDENCE_CONTRACT.md`,
 `docs/UNRELEASED_AUTHORITY_POLICY.md`, `docs/CLAIMS_GATE_POLICY.md`,
-`docs/PERFORMANCE_BUDGETS_SLO_REGRESSION_GATES_P10-03.md`, `docs/GITHUB_CI.md`,
+the source-backed performance gate, `docs/GITHUB_CI.md`,
 `docs/OPERATOR_PRODUCT_SURFACE_DECISION.md`, the current open PR and issue
 validation conventions, and bounded source inspection of
 `crates/tidefs-validation/src/performance_gate/runner.rs`. This slice classifies
@@ -825,15 +849,17 @@ cross-reference additions recorded in #1279.
 
 Classified for GitHub issue #1284 on 2026-06-24 after reviewing this register's
 authority rule and review method, `docs/RELEASE_READINESS_VERDICT_CONTRACT.md`
-(#1279), the four release-facing evidence-input documents named by the verdict
+(#1279), the release-facing evidence-input documents named by the verdict
 contract, `docs/CLAIMS_GATE_POLICY.md` (already classified as Current policy),
 and bounded source/doc inspection of `.github/workflows/release-candidate.yml`,
 `crates/tidefs-validation/src/performance_gate/runner.rs`, and the current
-open PR and issue validation conventions. This slice adds classification rows
-for the four release-facing evidence-input documents that the release-readiness
-verdict contract (#1279) identifies as required evidence families. The P10-03
-`GateReceipt.perf_gate_ready` field rename and scoped rendering work was
-completed by #1283. This slice does not edit runtime source, GitHub workflows,
+open PR and issue validation conventions. This slice added classification rows
+for the release-facing evidence-input documents that the release-readiness
+verdict contract (#1279) identified as required evidence families. The
+performance-gate-local `GateReceipt.perf_gate_ready` field rename and scoped
+rendering work was completed by #1283. Source-backed performance-gate authority
+remains with the validation crate, xtask behavior, release-candidate evidence,
+and the release-readiness verdict contract. This slice does not edit runtime source, GitHub workflows,
 `validation/claims.toml`, generated claim registry files, or unrelated
 documents.
 
@@ -841,7 +867,6 @@ documents.
 |---|---|---|
 | `docs/RELEASE_CANDIDATE_EVIDENCE_CONTRACT.md` | Current spec | Documents how the Release Candidate workflow (`release-candidate.yml`) produces and indexes evidence across `smoke` and `full` profiles. Records lane job attributes (rust-smoke, nix, qemu, xfstests, rdma), artifact upload details, evidence index shape, profile selection logic, concurrency rules, and retention policies. Explicitly states the release-candidate evidence index is a **gate input, not a gate verdict**. Live-source inspection of `.github/workflows/release-candidate.yml` and the referenced lane workflows confirms the documented attributes match current workflow YAML. The contract does not make a product-readiness claim; it describes how evidence is collected so gate auditors can interpret index artifacts without tracing through YAML. The four lane-local manifest owner issues (643-646) are recorded without checking current issue state; gate auditors should verify at decision time. |
 | `docs/UNRELEASED_AUTHORITY_POLICY.md` | Current policy | Binding guardrail that forbids adding or preserving legacy, backward-compatibility, migration, downgrade, or fallback behavior for unreleased TideFS data by default. Requires released external boundaries (Linux, POSIX, kernel, third-party), shipped wire/format/operator surfaces, or a temporary bridge explicitly tracked by a GitHub issue before compatibility work is permitted. Names pre-release code paths explicitly (current authority, retired pre-release path, historical input, receiptless path) instead of using "legacy." Includes a review checklist for compatibility additions. Classified as current policy consistent with its own "current policy guardrail" maturity label and live enforcement through PR review conventions. |
-| `docs/PERFORMANCE_BUDGETS_SLO_REGRESSION_GATES_P10-03.md` | Historical input | Broad P10 performance-law import with missing blueprint-era dependencies and source-of-truth wording that is wider than current implementation. Current performance-gate authority is the source under `crates/tidefs-validation/src/performance_gate/`, `xtask` command behavior, release-candidate evidence, and the release-readiness verdict contract. The old document remains useful background only until a focused source-backed performance-gate spec replaces it. |
 | `docs/GITHUB_CI.md` | Current policy | Documents the live GitHub Actions CI surface: secret boundary (GitHub is not a TideFS secret store), self-hosted runner contract, workflow shape (`Rust Fast`, `Clippy`, `Focused Rust`, `Focused Claim Validation`, `Secret Policy`, `QEMU Smoke`, `xfstests`, `RDMA`, `Release Candidate`), path-filtered PR validation, draft-PR CI skip rules, and `TIDEFS_SELF_HOSTED_READY` gating. Live-source inspection of the named workflow YAML files confirms the documented attributes match current behavior. The Release Candidate workflow is a manual-only self-hosted composition that uploads a `release-candidate-evidence-index` artifact without making a product-readiness claim. This document is a binding CI reference that complements the workflow YAML; it is not a product admission or release-readiness verdict. |
 
 ### Retired Cluster Services Closeout Deletions (TFR-019 / #1586)

@@ -8,7 +8,7 @@
 //!
 //! The probability-based parameters are a simplified interface; for typed,
 //! reproducible campaigns use [`FaultInjectionConfig::from_schedule`] with a
-//! `crate::FaultSchedule` from the typed fault catalog (P10-02).
+//! `crate::FaultSchedule` from the typed fault catalog.
 
 use rand::Rng;
 
@@ -259,7 +259,7 @@ pub struct FaultInjectionConfig {
     pub write_failure_probability: f64,
     pub byte_corruption_probability: f64,
     pub enospc_after_bytes: Option<u64>,
-    /// Typed fault campaign schedule (P10-02). When set, this drives
+    /// Typed fault campaign schedule. When set, this drives
     /// fault injection with a seed-reproducible, typed schedule.
     pub schedule: Option<FaultSchedule>,
     /// Crash injection configuration (#1230).
@@ -289,7 +289,7 @@ impl FaultInjectionConfig {
         }
     }
 
-    /// Create a config from a typed [`FaultSchedule`] (P10-02 campaign).
+    /// Create a config from a typed [`FaultSchedule`] campaign.
     #[must_use]
     pub fn from_schedule(schedule: FaultSchedule) -> Self {
         Self {

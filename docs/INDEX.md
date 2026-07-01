@@ -39,8 +39,7 @@ Release readiness boundary and evidence inputs:
   records the registry-backed product-admission gates and claim ids that bound
   successor/comparator wording.
 - The current performance-gate implementation lives under
-  `crates/tidefs-validation/src/performance_gate/`; the old P10-03 document is
-  historical input unless a focused source-backed spec replaces it.
+  `crates/tidefs-validation/src/performance_gate/`.
 - `docs/GITHUB_CI.md` describes standing CI and release-candidate workflow
   behavior.
 - `docs/CLAIMS_GATE_POLICY.md` defines publishing-facing claim guardrails,

@@ -65,8 +65,7 @@ surface, widen publishing claims, or preselect a runtime carrier.
   product carriers: The P10-04 document is referenced by
   deleted P3 receipt/response production-depth lineage,
   `docs/MEMBERSHIP_PLACEMENT_FAILURE_DOMAIN_MODEL_P8-02.md`,
-  `docs/PERFORMANCE_BUDGETS_SLO_REGRESSION_GATES_P10-03.md`,
-  `docs/FAULT_INJECTION_CHAOS_CORRUPTION_CAMPAIGNS_P10-02.md`,
+  deleted performance/fault production-depth lineage,
   deleted kernel-boundary production-depth lineage,
   `docs/UPGRADE_FAILOVER_CUTOVER_OPERATOR_RUNBOOKS_P9-03.md`,
   `docs/WORKSPACE_FAMILY_LAYOUT_CRATE_SERVICE_BOUNDARIES_P1-01.md`, deleted
@@ -84,8 +83,8 @@ The P10-04 document does not exist and its intended content is unknown
 beyond the OW-307D property table and cross-reference descriptions.
 Creating a substitute would invent product policy the repository has
 not previously defined. The document is referenced as law-level
-authority (P10-04 is in the P-series alongside P10-02 fault injection
-and P10-03 performance budgets, which do exist). Restoring it would
+authority by surviving historical P-series lineage and deleted
+fault/performance roots. Restoring it would
 require reconstructing the truth-surface grammar, mandatory surface
 classes, carrier verification rules, and `truth_view` rendering
 contract from secondary descriptions alone. This exceeds the scope of
