@@ -2876,10 +2876,13 @@ pub fn check_transaction_model_current_workspace() -> Result<(), StorageCheckErr
     })?;
     let mut missing = Vec::new();
     for rel in [
-        "docs/TRANSACTION_COMMIT_GROUPS_PC007.md",
+        "crates/tidefs-local-filesystem/src/commit_group.rs",
+        "crates/tidefs-local-filesystem/src/dirty_page_tracker.rs",
+        "crates/tidefs-local-filesystem/src/fuse_fsync.rs",
         "crates/tidefs-local-filesystem/src/lib.rs",
         "crates/tidefs-local-filesystem/src/tests.rs",
-        "apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_preview.rs",
+        "apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_flush_fsync.rs",
+        "apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_vfs_adapter.rs",
     ] {
         check_required_file(&root, rel, &mut missing);
     }
@@ -2887,50 +2890,63 @@ pub fn check_transaction_model_current_workspace() -> Result<(), StorageCheckErr
         &root,
         "crates/tidefs-local-filesystem",
         &[
-            "begin_transaction",
-            "commit_transaction",
-            "rollback_transaction",
+            "CommitGroupStateMachine",
+            "CommitGroupPhase",
+            "CommitClass",
+            "record_write",
+            "should_quiesce",
             "dirty_content",
             "dirty_inodes",
             "dirty_dirs",
-            "fsync_data_only",
-            "has_dirty_metadata",
+            "dirty_set",
             "do_commit",
-            "in_transaction",
+            "publish_root_commit",
+            "LocalObjectStore::sync_all",
+            "fsync_file",
+            "fsync_data_only_file",
+            "fsync_directory",
+            "DirtyPageTracker",
+            "clear_range",
+            "snapshot_ranges",
             "mark_metalogue_clean",
             "mark_all_state_dirty",
-            "begin_transaction_then_commit_persists_mutations",
-            "begin_transaction_then_rollback_discards_mutations",
-            "transaction_nesting_is_rejected",
-            "commit_without_transaction_is_rejected",
-            "rollback_without_transaction_is_rejected",
-            "fsync_data_only_persists_content_without_metadata",
-            "has_dirty_metadata_detects_dirty_inode",
+            "is_state_dirty",
+            "overlay_write_commits_when_padded_dirty_bytes_cross_target",
+            "metadata_mutations_count_once_toward_commit_group_target",
+            "fsync_file_falls_back_to_do_commit_when_no_intents_pending",
+            "txg_fsync_advances_durable_commit_group_in_live_fs",
         ],
         &mut missing,
     );
     check_source_markers(
         &root,
-        "apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_preview.rs",
-        &["sync_data_only", "fsync_data_only"],
+        "apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_flush_fsync.rs",
+        &[
+            "dispatch_fsync",
+            "dispatch_fsync_with_tracker",
+            "flush_dirty_range",
+            "engine.fsync()",
+            "datasync",
+            "DirtyPageTracker",
+            "take_boundary",
+            "clear_until_boundary",
+            "dispatch_fsync_datasync_true_passes_flag_to_engine",
+        ],
         &mut missing,
     );
     check_source_markers(
         &root,
-        "docs/TRANSACTION_COMMIT_GROUPS_PC007.md",
+        "apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_vfs_adapter.rs",
         &[
-            "commit groups",
-            "commit_group",
-            "dirty_buffer",
-            "transaction model",
-            "commit group",
-            "root_transaction",
-            "root_slot",
-            "O_DSYNC",
-            "fdatasync",
-            "fsync",
-            "staging data",
-            "publication boundary",
+            "dispatch_fsync_file",
+            "commit_current_txg_barrier",
+            "dispatch_fdatasync",
+            "dispatch_fsyncdir",
+            "pagecache_writeback_dispatch_write_dirty_then_fsync_clears",
+            "pagecache_writeback_dispatch_fdatasync_clears_dirty_pages",
+            "dispatch_fsync_drains_writeback_range_tracker",
+            "dispatch_fdatasync_drains_writeback_range_tracker",
+            "dispatch_fsyncdir_drains_writeback_range_tracker",
         ],
         &mut missing,
     );
@@ -2954,7 +2970,7 @@ pub fn check_transaction_model_current_workspace() -> Result<(), StorageCheckErr
         &mut missing,
     );
     if missing.is_empty() {
-        println!("transaction model ok: per-inode dirty tracking, begin/commit/rollback, fsync/O_DSYNC, and transaction lifecycle tests are implementation-tracked non-release");
+        println!("transaction model ok: source-backed commit-group state, dirty tracking, root publication, fsync/fdatasync dispatch, and drain tests are present");
         Ok(())
     } else {
         Err(StorageCheckError {
