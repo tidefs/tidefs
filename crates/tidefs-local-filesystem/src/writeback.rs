@@ -342,6 +342,8 @@ mod policy_tests {
             dirty_since: std::time::Instant::now()
                 .checked_sub(Duration::from_secs(age))
                 .unwrap(),
+            lifecycle: crate::dirty_page_tracker::DirtyLifecycleState::Dirty,
+            writeback_error: None,
         }
     }
     #[test]
