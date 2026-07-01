@@ -27,9 +27,9 @@
 //!   `// SAFETY:` comment.
 //!
 //! - **Lock discipline**: Lock acquisitions inside callbacks must declare a
-//!   `KernelLockClass` variant from the kmod-bridge and respect the
-//!   canonical P7-03 lockdep partial order.  Callbacks running in RCU
-//!   read-sections or under spinlocks must not sleep.
+//!   `KernelLockClass` variant from the kmod-bridge and respect the bridge
+//!   lockdep partial order. Callbacks running in RCU read-sections or under
+//!   spinlocks must not sleep.
 //!
 //! - **No hidden authority**: In full-kernel mode (no FUSE daemon, no ublk
 //!   control thread), these callbacks must not require a userspace process
@@ -47,7 +47,7 @@
 //!
 //! This crate implements the first legal kernel seam:
 //! `seam.kernel_module_0.posix_filesystem_adapter.namespace_cleanread.s0`
-//! (P7-01 §6).
+//! under the current kernel residency authority.
 //!
 //! It sits at stratum s3 / c7, consuming the kmod-bridge (s2 / c6) and
 //! delegating all operations to the canonical [`VfsEngine`] trait. The
