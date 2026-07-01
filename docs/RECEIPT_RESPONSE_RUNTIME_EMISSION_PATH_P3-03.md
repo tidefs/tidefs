@@ -16,7 +16,8 @@ invent its own “success/failure” story?**
 See also:
 - `docs/END_TO_END_PRODUCTION_BLUEPRINT.md`
 - `docs/CONTROL_PLANE_SERVICE_API_CLI_TOPOLOGY_P9-01.md`
-- `docs/PUBLICATION_PIPELINE_RUNTIME_DECOMPOSITION_P3-02.md`
+- `docs/STORAGE_INTENT_POLICY_AUTHORITY.md`
+- `docs/LOCAL_DISTRIBUTED_RECEIPT_AUTHORITY.md`
 - `docs/SHADOW_PILOT_RUNTIME_HOOKS_DIVERGENCE_SINKS_P3-04.md`
 - `docs/DASHBOARDS_TRACES_OPERATOR_TRUTH_SURFACES_P10-04.md` (missing from the repository; see #1270)
 - `docs/AUTHORITATIVE_DATA_STRUCTURES_ALGORITHMS.md`
@@ -88,8 +89,9 @@ This document now consumes the explicit `governance_surface_0` authority-service
 That boundary is deliberate.
 `P3-03` fixes **how committed or refused truth becomes a visible answer and a
 later recallable artifact**.
-It now consumes the explicit `memory_arena_0` memory-domain / arena / ownership-token law in `docs/MEMORY_DOMAINS_ARENA_FAMILIES_OWNERSHIP_TOKEN_LAW_P4-01.md`, the explicit `posix_filesystem_adapter` daemon / process topology law in `docs/POSIX_FILESYSTEM_ADAPTER_DAEMON_TOPOLOGY_P5-01.md`, the explicit `publication_pipeline` publication-runtime law in
-`docs/PUBLICATION_PIPELINE_RUNTIME_DECOMPOSITION_P3-02.md`, the explicit `control_plane`
+It now consumes the explicit `memory_arena_0` memory-domain / arena / ownership-token law in `docs/MEMORY_DOMAINS_ARENA_FAMILIES_OWNERSHIP_TOKEN_LAW_P4-01.md`, the explicit `posix_filesystem_adapter` daemon / process topology law in `docs/POSIX_FILESYSTEM_ADAPTER_DAEMON_TOPOLOGY_P5-01.md`, current storage-intent and placement-receipt authority in
+`docs/STORAGE_INTENT_POLICY_AUTHORITY.md` and
+`docs/LOCAL_DISTRIBUTED_RECEIPT_AUTHORITY.md`, the explicit `control_plane`
 route/carrier law in `docs/CONTROL_PLANE_SERVICE_API_CLI_TOPOLOGY_P9-01.md`, the
 explicit `shadow_pilot_0` shadow-runtime law in
 `docs/SHADOW_PILOT_RUNTIME_HOOKS_DIVERGENCE_SINKS_P3-04.md`, the explicit `truth_view`

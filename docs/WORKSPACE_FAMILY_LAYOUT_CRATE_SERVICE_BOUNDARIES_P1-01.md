@@ -18,7 +18,8 @@ See also:
 - `docs/POSIX_FILESYSTEM_ADAPTER_DAEMON_TOPOLOGY_P5-01.md`
 - `docs/RUST_FOR_LINUX_CRATE_TRAIT_BOUNDARIES_P7-02.md`
 - `docs/CONTROL_PLANE_SERVICE_API_CLI_TOPOLOGY_P9-01.md`
-- `docs/PUBLICATION_PIPELINE_RUNTIME_DECOMPOSITION_P3-02.md`
+- `docs/STORAGE_INTENT_POLICY_AUTHORITY.md`
+- `docs/LOCAL_DISTRIBUTED_RECEIPT_AUTHORITY.md`
 - `docs/RECEIPT_RESPONSE_RUNTIME_EMISSION_PATH_P3-03.md`
 - `docs/DASHBOARDS_TRACES_OPERATOR_TRUTH_SURFACES_P10-04.md` (missing from the repository; see #1270)
 - `docs/AUTHORITATIVE_DATA_STRUCTURES_ALGORITHMS.md`
@@ -89,9 +90,10 @@ one another**.
 It now also consumes the explicit `governance_surface_0` authority-service law in
 `docs/POLICY_AUTHORITY_RUNTIME_SURFACE_P3-01.md`, the explicit `posix_filesystem_adapter`
 daemon/process-topology law in `docs/POSIX_FILESYSTEM_ADAPTER_DAEMON_TOPOLOGY_P5-01.md`,
-the explicit `publication_pipeline` publication-pipeline law in
-`docs/PUBLICATION_PIPELINE_RUNTIME_DECOMPOSITION_P3-02.md`, the explicit `response_registry`
-receipt/response-emission law in
+current storage-intent and placement-receipt authority in
+`docs/STORAGE_INTENT_POLICY_AUTHORITY.md` and
+`docs/LOCAL_DISTRIBUTED_RECEIPT_AUTHORITY.md`, the explicit
+`response_registry` receipt/response-emission law in
 `docs/RECEIPT_RESPONSE_RUNTIME_EMISSION_PATH_P3-03.md`, the explicit `package_profile_catalog`
 build/packaging law in `docs/BUILD_PACKAGING_FEATURE_MATRIX_P1-04.md`, the
 explicit `kernel_boundary` kernel crate/trait boundary law in

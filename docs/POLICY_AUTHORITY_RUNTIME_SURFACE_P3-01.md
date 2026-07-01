@@ -21,7 +21,8 @@ hidden policy/budget/product authority?**
 
 See also:
 - `docs/CONTROL_PLANE_SERVICE_API_CLI_TOPOLOGY_P9-01.md`
-- `docs/PUBLICATION_PIPELINE_RUNTIME_DECOMPOSITION_P3-02.md`
+- `docs/STORAGE_INTENT_POLICY_AUTHORITY.md`
+- `docs/LOCAL_DISTRIBUTED_RECEIPT_AUTHORITY.md`
 - `docs/RECEIPT_RESPONSE_RUNTIME_EMISSION_PATH_P3-03.md`
 - `docs/SHADOW_PILOT_RUNTIME_HOOKS_DIVERGENCE_SINKS_P3-04.md`
 - `docs/AUTHN_AUTHZ_OVERRIDE_AUDIT_MODEL_P9-02.md`
@@ -137,14 +138,17 @@ This document governs:
 - request-capsule admission, idempotency, anchor freeze, and evaluation-plan
   shaping,
 - the service-local budget, stop, and quarantine grammar,
-- and the only legal bridge from `policy_authority` work into `publication_pipeline` publication, `schema_codec`
-  receipt emission, and `response_registry` visible-answer rendering.
+- and the only legal bridge from `policy_authority` work into source-backed
+  storage-intent/placement receipt authority, `schema_codec` receipt emission,
+  and `response_registry` visible-answer rendering.
 
 This document now consumes the explicit `control_plane` route/carrier law in
-`docs/CONTROL_PLANE_SERVICE_API_CLI_TOPOLOGY_P9-01.md`, the explicit `publication_pipeline`
-publication-runtime law in
-`docs/PUBLICATION_PIPELINE_RUNTIME_DECOMPOSITION_P3-02.md`, the explicit `response_registry`
-receipt/response law in `docs/RECEIPT_RESPONSE_RUNTIME_EMISSION_PATH_P3-03.md`,
+`docs/CONTROL_PLANE_SERVICE_API_CLI_TOPOLOGY_P9-01.md`, current
+storage-intent and placement-receipt authority in
+`docs/STORAGE_INTENT_POLICY_AUTHORITY.md` and
+`docs/LOCAL_DISTRIBUTED_RECEIPT_AUTHORITY.md`, the explicit
+`response_registry` receipt/response law in
+`docs/RECEIPT_RESPONSE_RUNTIME_EMISSION_PATH_P3-03.md`,
 the explicit `shadow_pilot_0` shadow-hook law in
 `docs/SHADOW_PILOT_RUNTIME_HOOKS_DIVERGENCE_SINKS_P3-04.md`, the explicit
 `identity_access_audit_0` principal/session/grant/override/audit law in
