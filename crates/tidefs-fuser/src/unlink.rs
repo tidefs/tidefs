@@ -81,8 +81,7 @@ pub enum UnlinkError {
     /// caller is neither the file owner, the directory owner, nor the
     /// superuser.  POSIX requires `EPERM` for this case.
     StickyPermissionDenied,
-    /// Caller lacks write permission on the parent directory (stub;
-    /// wired when `tidefs-permission` integration lands -- see #5378).
+    /// Caller lacks write and search permission on the parent directory.
     PermissionDenied,
     /// The filesystem is mounted read-only.
     ReadOnlyFilesystem,
@@ -212,12 +211,11 @@ pub fn check_unlink_sticky_bit(
 /// Returns `Ok(())` on success.
 /// On failure returns a [`UnlinkError`].
 ///
-/// # Stub permission check
+/// # Permission check
 ///
-/// Permission checking for parent-directory write access is deferred to
-/// `tidefs-permission` integration (see #5378).  When wired, this
-/// function will also return [`UnlinkError::PermissionDenied`] when the
-/// caller lacks write+search permission on the parent directory.
+/// Parent-directory write/search permission depends on caller credentials and
+/// mount identity. Use [`check_unlink_parent_permission`] before backend
+/// dispatch when that context is available.
 pub fn plan_unlink(
     name: &[u8],
     dir_has_sticky: bool,

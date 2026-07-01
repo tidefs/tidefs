@@ -347,7 +347,7 @@ fn readdir_vfs_readdirplus_inode_consistency_with_getattr() {
         let name = format!("file_{i}.txt");
         let path = dir.join(&name);
         File::create(&path).expect("create file");
-        file_inodes.push((name, 0)); // placeholder
+        file_inodes.push((name, 0));
     }
 
     // Now stat each file through the mount to get real inode numbers

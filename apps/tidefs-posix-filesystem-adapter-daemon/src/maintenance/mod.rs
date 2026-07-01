@@ -554,7 +554,7 @@ pub fn is_interrupt_canceled(token: &PosixFilesystemAdapterInterruptTokenRecord)
     token.cancel_requested
 }
 
-// ── Release finalizer placeholder ───────────────────────────────────────────
+// ── Release finalizer dispatch ──────────────────────────────────────────────
 
 /// Dispatch a release-finalize request through the maintenance drain.
 ///

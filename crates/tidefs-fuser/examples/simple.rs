@@ -479,8 +479,8 @@ impl SimpleFS {
     ///
     /// Walks the on-disk inode directory to count files/dirs/symlinks, sums
     /// actual content sizes, and queries the underlying filesystem for free
-    /// space so the FUSE mount reports honest capacity rather than a hardcoded
-    /// stub.
+    /// space so the FUSE mount reports honest capacity rather than hardcoded
+    /// constants.
     fn compute_statfs_fields(&self) -> fuser::statfs::StatfsFields {
         let inodes_dir = Path::new(&self.data_dir).join("inodes");
         let contents_dir = Path::new(&self.data_dir).join("contents");
@@ -872,6 +872,14 @@ impl Filesystem for SimpleFS {
             mode &= !(libc::S_ISUID | libc::S_ISGID) as u32;
         }
 
+        let kind = match as_file_kind(mode) {
+            Ok(kind) => kind,
+            Err(error_code) => {
+                reply.error(error_code);
+                return;
+            }
+        };
+
         let inode = self.allocate_next_inode();
         let attrs = InodeAttributes {
             inode,
@@ -880,7 +888,7 @@ impl Filesystem for SimpleFS {
             last_accessed: time_now(),
             last_modified: time_now(),
             last_metadata_changed: time_now(),
-            kind: as_file_kind(mode),
+            kind,
             mode: self.creation_mode(mode),
             hardlinks: 1,
             uid: req.uid(),
@@ -890,7 +898,7 @@ impl Filesystem for SimpleFS {
         self.write_inode(&attrs);
         File::create(self.content_path(inode)).unwrap();
 
-        if as_file_kind(mode) == FileKind::Directory {
+        if kind == FileKind::Directory {
             let mut entries = BTreeMap::new();
             entries.insert(b".".to_vec(), (inode, FileKind::Directory));
             entries.insert(b"..".to_vec(), (parent, FileKind::Directory));
@@ -1804,6 +1812,14 @@ impl Filesystem for SimpleFS {
             mode &= !(libc::S_ISUID | libc::S_ISGID) as u32;
         }
 
+        let kind = match as_file_kind(mode) {
+            Ok(kind) => kind,
+            Err(error_code) => {
+                reply.error(error_code);
+                return;
+            }
+        };
+
         let inode = self.allocate_next_inode();
         let attrs = InodeAttributes {
             inode,
@@ -1812,7 +1828,7 @@ impl Filesystem for SimpleFS {
             last_accessed: time_now(),
             last_modified: time_now(),
             last_metadata_changed: time_now(),
-            kind: as_file_kind(mode),
+            kind,
             mode: self.creation_mode(mode),
             hardlinks: 1,
             uid: req.uid(),
@@ -1822,7 +1838,7 @@ impl Filesystem for SimpleFS {
         self.write_inode(&attrs);
         File::create(self.content_path(inode)).unwrap();
 
-        if as_file_kind(mode) == FileKind::Directory {
+        if kind == FileKind::Directory {
             let mut entries = BTreeMap::new();
             entries.insert(b".".to_vec(), (inode, FileKind::Directory));
             entries.insert(b"..".to_vec(), (parent, FileKind::Directory));
@@ -1966,17 +1982,17 @@ pub fn check_access(
     return access_mask == 0;
 }
 
-fn as_file_kind(mut mode: u32) -> FileKind {
+fn as_file_kind(mut mode: u32) -> Result<FileKind, c_int> {
     mode &= libc::S_IFMT as u32;
 
     if mode == libc::S_IFREG as u32 {
-        return FileKind::File;
+        return Ok(FileKind::File);
     } else if mode == libc::S_IFLNK as u32 {
-        return FileKind::Symlink;
+        return Ok(FileKind::Symlink);
     } else if mode == libc::S_IFDIR as u32 {
-        return FileKind::Directory;
+        return Ok(FileKind::Directory);
     } else {
-        unimplemented!("{}", mode);
+        return Err(libc::ENOSYS);
     }
 }
 
