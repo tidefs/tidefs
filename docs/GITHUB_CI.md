@@ -32,7 +32,12 @@ may use non-secret repository variables for scheduling gates, such as
 - All TideFS development and release-candidate workflow jobs run on the
   self-hosted TideFS runner VMs. Do not add `ubuntu-latest`, other
   GitHub-hosted runner labels, or hosted-runner package-manager assumptions to
-  TideFS workflows.
+  TideFS workflows. The workflow YAML remains the exact trigger/input source;
+  this document is the discoverable CI authority entry point.
+- `Actionlint` runs `actionlint` against `.github/workflows/*.yml` with
+  `.github/actionlint.yaml` as the runner-label configuration source. It runs
+  on workflow/actionlint configuration changes and manual dispatch, records its
+  version and report in the step summary, and uploads no long-lived artifacts.
 - `Rust Fast` runs on the TideFS self-hosted runner VMs through the repo
   `.#ci` Nix development shell. It covers workspace metadata plus a focused
   Rust smoke set:
@@ -51,6 +56,10 @@ may use non-secret repository variables for scheduling gates, such as
   validation. Dispatch it against the feature branch with a comma-separated
   crate list and optional extra `cargo test` arguments when the acceptance
   criteria require touched-package Rust tests outside the standing smoke set.
+  The `crates` input must name workspace packages, not paths, and the workflow
+  rejects duplicate names, control characters, path-like entries, and shell
+  metacharacters before running Cargo. Optional `cargo_test_args` are bounded
+  to safe `cargo test` filters and flags.
   It uses the same repo `.#ci` Nix development shell, host-local Cargo scratch,
   JSON summary artifact, and per-run target cleanup as `Rust Fast`. Newer
   identical dispatches for the same ref, crate list, and extra cargo-test
@@ -67,22 +76,34 @@ may use non-secret repository variables for scheduling gates, such as
   shell and runs only the smallest relevant xtask subcommand:
   `validate-claim`, `check-claims-gate`, `check-no-hidden-queues`,
   `validate-evidence-manifest`, `validate-ublk-completion`, or
-  `validate-ublk-started-export`. Input validation rejects broad or
-  mismatched selections (for example, `claim_id` without
-  `validate-claim` mode). The workflow summary records the claim id,
+  `validate-ublk-started-export`. Input validation rejects broad, mismatched,
+  newline-bearing, or shell-like selections: `validate-claim` requires only
+  `claim_id`, the evidence and uBLK artifact validators require only
+  `artifact_path`, and the gate/no-hidden-queue modes accept neither. The
+  workflow summary records the claim id,
   artifact path, command executed, result, and any artifact upload
   path. It does not expose or configure TideFS secrets and does not
   trigger broad xfstests, RDMA, kernel, or release-candidate validation.
 - `Secret Policy` runs on the same self-hosted TideFS runner labels and keeps
   the GitHub secret boundary checked without spending hosted Actions minutes.
+  Its pull-request trigger is limited to workflow, policy, xtask, dependency,
+  build, and root configuration files; manual dispatch remains available for
+  focused checks of feature branches.
+- `Dependency Advisory` runs `cargo deny check advisories` against `deny.toml`
+  and `Cargo.lock` for dependency-policy and lockfile changes. It is
+  validation-only: the workflow reports RustSec/yanked dependency drift,
+  uploads `dependency-advisory-report`, and leaves remediation to a separate
+  issue/PR. Its job summary links `docs/DEPENDENCY_ADVISORY_CI.md`, which is
+  retained as the narrow remediation guide for this workflow.
 - Standing PR validation is path-filtered so docs-only design and authority
   PRs do not occupy scarce self-hosted runner slots when their issue validation
   tier is documentation/design/source inspection. `Rust Fast` and `Nix Checks`
   ignore pull requests that only touch `docs/**`, root Markdown policy text, or
-  `COPYING`; pushes to `master` and manual dispatches still run them.
-  `Secret Policy` pull-request runs are limited to the workflow/policy files it
-  scans plus the xtask and build inputs that can change the scanner itself. If
-  a documentation-only PR needs runtime or build validation, record that in the
+  `COPYING`. `Actionlint`, `Secret Policy`, dependency workflows, and the
+  `Focused Rust` self-test each use narrower pull-request path filters tied to
+  the files they validate. Pushes to `master` and manual dispatches still run
+  standing workflows according to their own trigger filters. If a
+  documentation-only PR needs runtime or build validation, record that in the
   issue validation tier and dispatch the focused workflow explicitly.
 - `Codex Nexus Relay` is a self-hosted event bridge for the local
   `tidefs-codex-nexus` dashboard. It does not run tests or checkout source; it
@@ -93,7 +114,9 @@ may use non-secret repository variables for scheduling gates, such as
   workflow-run events stay out of the relay to avoid recursive automation
   chatter; the Nexus safety poll still refreshes workflow state.
 - `Nix Checks` runs on self-hosted TideFS runners and builds pure check
-  derivations plus the core Nix packages.
+  derivations plus core Nix packages. It is a compile/build gate only: a green
+  run does not prove FUSE, uBLK, RDMA, mounted-kernel behavior, filesystem
+  correctness, crash consistency, performance, or release readiness.
 - `QEMU Smoke` runs outside-sandbox kernel runtime rows on self-hosted
   TideFS runners with KVM and FUSE access. Pushes to `master` run only the
   standing `kmod-xfstests-smoke` target: load `tidefs_posix_vfs.ko`, mount the
@@ -116,10 +139,19 @@ may use non-secret repository variables for scheduling gates, such as
   state-transfer scenario, and uploads `carrier-report.json`, `qemu.log`,
   `summary.json`, and environment metadata under
   `two-node-carrier-validation`.
+- `Kernel fsync/syncfs validation` is a narrow manual self-hosted workflow for
+  the fsync/fdatasync/syncfs durability row. It runs
+  `.#kernel-fsync-validation` against the selected branch with
+  `timeout_seconds` and `pool_size_mb` inputs, exercises a QEMU power-loss
+  cycle with persistent virtio-blk backing storage, and uploads phase logs,
+  `summary.env`, and `evidence-manifest.json` under
+  `kernel-fsync-validation`.
 - `Kernel mmap validation` is a narrow manual self-hosted workflow for the
   mounted mmap/writeback QEMU row. It runs `.#kernel-mmap-validation` against
-  the selected branch and uploads row artifacts under
-  `kernel-mmap-validation`.
+  the selected branch with a `timeout_seconds` input and uploads `summary.env`
+  and row artifacts under `kernel-mmap-validation`. This is mmap/page-cache row
+  evidence, not xfstests, RDMA, performance, release-candidate, or broad
+  crash-consistency evidence.
 - `Kernel teardown validation` is a manual self-hosted QEMU Smoke target
   for the T5 mounted-kernel-vfs cutover and teardown runtime evidence row. It runs
   `.#kernel-teardown-validation` against the selected branch, creates a
@@ -133,12 +165,23 @@ may use non-secret repository variables for scheduling gates, such as
   mounted-kernel cutover phase, fence, truth, trace, refusal, cleanup, source,
   or dmesg-danger fields are malformed or missing. It does not cover T6
   full-kernel/no-daemon rows and does not update claim registry status.
+- Kernel module CI builds use the Linux 7.0 Rust-for-Linux baseline, require
+  Rust-enabled prepared kernel trees, use LLVM tooling, and compile module C and
+  Rust paths with warnings treated as errors. Local build recipes are helper
+  workflows only; the validation tier for a change must still name the runtime,
+  kernel, xfstests, RDMA, or release-candidate lane that exercises the affected
+  behavior.
 - `xfstests` and `RDMA` are scheduled/manual lanes for longer filesystem and
   transport work. Manual `xfstests` dispatch accepts a `target` and an
   optional space-separated `tests` list. Use the smallest known failing row set
   such as `generic/003` while debugging an isolated failure; reserve broad
   target dispatches such as `target=fuse` or `target=all` for acceptance gates,
-  scheduled coverage, or when the failure set is not yet isolated.
+  scheduled coverage, or when the failure set is not yet isolated. `RDMA`
+  dispatch runs three matrix targets: `static-carrier-check` for source/harness
+  structure, `host-probe` for non-mutating runner capability inspection, and
+  `qemu-two-node` for multi-process distributed transport evidence. The first
+  two are harness/host evidence only; they do not prove live two-node transport
+  behavior.
 - `Release Candidate` is a manual-only self-hosted workflow. The `smoke`
   profile runs Rust, Nix, and QEMU smoke lanes; the `full` profile also runs
   xfstests and RDMA. Each run uploads a top-level
@@ -146,11 +189,11 @@ may use non-secret repository variables for scheduling gates, such as
   profile, source SHA, lane job results, expected lane artifact names and path
   patterns, and absent lane-local manifests without making a product-readiness
   claim. Newer dispatches for the same branch and profile cancel older queued
+  or running copies so superseded release-candidate runs do not leave stale
+  self-hosted index jobs in the runner queue.
   The evidence index is consumed by the release-readiness verdict contract
   (`docs/RELEASE_READINESS_VERDICT_CONTRACT.md`), which defines the boundary
   between gate-local readiness receipts and whole-product admission.
-  or running copies so superseded release-candidate runs do not leave stale
-  self-hosted index jobs in the runner queue.
 
 ## Runner Contract
 
@@ -163,6 +206,11 @@ self-hosted linux x64 tidefs nix kvm fuse ublk rdma kernel xfstests
 
 The runners need Nix, KVM, FUSE, ublk, loop devices, QEMU, RDMA userspace
 tools, and enough local scratch space for Nix builds and VM disks.
+Individual workflows select narrower subsets of that label set: Rust, Nix,
+Secret Policy, dependency, and actionlint lanes use the `nix` subset; QEMU and
+kernel validation lanes add `kvm`; xfstests adds `xfstests`; RDMA adds `rdma`;
+and Codex Nexus Relay intentionally uses only the minimal TideFS runner labels
+because it signs and forwards events rather than building or testing source.
 
 Push-triggered and scheduled self-hosted jobs stay skipped until the repository
 variable `TIDEFS_SELF_HOSTED_READY` is set to `1`. Manual dispatch ignores that

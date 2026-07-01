@@ -1,5 +1,7 @@
 # Dependency Advisory CI
 
+Maturity: current remediation guide for the `Dependency Advisory` workflow.
+
 The `Dependency Advisory` workflow ([.github/workflows/dependency-advisory.yml](../.github/workflows/dependency-advisory.yml))
 runs `cargo deny check advisories` against the RustSec advisory database to detect
 dependency security drift and yanked crate usage. It is a validation-only gate:
@@ -44,7 +46,7 @@ with:
 - Whether the finding is blocking (error) or a warning under the current
   `deny.toml` policy
 
-The uploaded 7-day artifact includes `advisories-report.json`, the canonical
+The uploaded 7-day artifact includes `advisories-report.json`, the normalized
 JSON report consumed by the summary formatter. Raw stdout and stderr captures
 (`advisories.json` and `advisories-stderr.txt`) are included as well because
 cargo-deny versions may write JSON diagnostics to either stream.
@@ -52,8 +54,8 @@ cargo-deny versions may write JSON diagnostics to either stream.
 ## Relationship to Other CI Lanes
 
 - **Dependency Advisory** (this lane): RustSec/yanked drift detection only.
-- **License gate** (future): `cargo deny check licenses` for allowlist
-  enforcement; does not exist yet.
+- **Dependency License**: `cargo deny check licenses` allowlist enforcement;
+  separate workflow and policy surface from advisory drift.
 - **Secret Policy**: Scans repository and workflow surfaces for secret leaks;
   unrelated to dependency metadata.
 - **Rust Fast / Focused Rust**: Build and test lanes; they use the existing
