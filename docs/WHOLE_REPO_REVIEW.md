@@ -535,16 +535,17 @@ replay, dataset-catalog side persistence, and the `tidefs-recovery-loop`
 namespace intent replay, with some failures logged while mount continues.
 Those are not yet one import-side durability state machine.
 
-The cache model also overstates closure. `docs/cache-authority-model.md` names
-`tidefs-cache-core::PageCache`, local `DirtyPageTracker`, and `DirtySet` as
-authoritative in different dimensions while also classifying the local-fs page
-cache as derived. Source comments in `dirty_page_tracker.rs` and
-`writeback.rs` both claim authority, and the daemon adds FUSE
-`writeback_page_cache`, `writeback_cache`, `dirty_state`, block-volume dirty
-ranges, and commit barriers. FUSE fsync dispatch drains daemon page-cache
+The cache authority table is now deliberately narrow:
+`docs/cache-authority-model.md` names cache classification vocabulary and
+layer ownership only. It does not close TFR-008. The unsettled part is still
+composition: `tidefs-cache-core::PageCache`, local `DirtyPageTracker`,
+`DirtySet`, daemon `writeback_page_cache`, `writeback_cache`, `dirty_state`,
+block-volume dirty ranges, and commit barriers all have to line up with one
+fsync/writeback product boundary. FUSE fsync dispatch drains daemon page-cache
 pages, marks daemon caches clean, flushes block-volume ranges, calls the
-engine fsync/fdatasync path, commits the adapter txg cycle, and then uses the
-ownership a product boundary, not a settled implementation detail.
+engine fsync/fdatasync path, and commits the adapter txg cycle, but that path
+remains evidence to prove against the TFR-008 contract rather than closure by
+documentation.
 
 Mmap and pre-full-kernel writeback remain especially risky, but the current
 mounted-kernel path is narrower and more concrete than the older source-model
