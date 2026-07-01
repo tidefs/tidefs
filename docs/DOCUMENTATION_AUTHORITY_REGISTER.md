@@ -324,7 +324,6 @@ narrow source-backed scope.
 | `docs/adr/0004-txg-commit-ordering-state-machine.md` | Historical input | Historical ADR for commit-group ordering target architecture. It is not current pool-layer implementation or crash-consistency evidence. |
 | `docs/crates/types-core-consolidation-plan.md` | Historical input | Historical consolidation plan for deleted type-core scaffold roots. Current package authority is `docs/workspace-package-classification.md`. |
 | `docs/k7-kbuild-toolchain.md` | Historical input | Historical Kbuild toolchain preparation note. Current kernel workflow authority is `docs/KERNEL_MODULE_DEVELOPMENT_WORKFLOW_P7-05.md`. |
-| `docs/security/security-audit-2026-04-30.md` | Historical input | Chronological pre-release security audit snapshot. It is not current unsafe-code, security, release-readiness, or product-hardening authority. |
 
 ### Empty Module Owners Scaffold Retirement (TFR-019 / #1619)
 

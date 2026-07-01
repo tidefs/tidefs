@@ -189,8 +189,7 @@ to any CLI/API privileged action paths. Wiring it requires:
 - `docs/OPERATOR_UAPI_AUTHORITY.md` — operator UAPI authority decision and
   preserved non-claims for preview ABI/UAPI scope
 - `docs/security/unified-storage-encryption-threat-model.md` — encryption claims
-- `docs/security/security-release-matrix.md` — signoff verdict and threat-claim
-  alignment
+- `docs/CLAIMS_GATE_POLICY.md` — claim wording and evidence-gate alignment
 - `docs/security/transport-security-boundary.md` — transport-level session
   security and ADMIN service gating
 - `docs/security/pool-encryption-secret-handle-boundary.md` — encryption secret
