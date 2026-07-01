@@ -198,6 +198,16 @@ Current reclaim/deadlist and compaction boundaries remain with source behavior,
 not validate runtime reclaim, deadlist, compaction, allocator, release,
 production, performance, availability, or successor/comparator claims.
 
+## Intent-Log Latency Historical Root Deletion (TFR-019 / #1679)
+
+Issue #1679 deleted the stale PC-008 intent-log sync-write latency historical
+root. The current boundary remains with source-backed local-filesystem
+constants/tests, `docs/STORAGE_INTENT_POLICY_AUTHORITY.md`,
+`validation/claims.toml`, and `docs/CLAIMS_GATE_POLICY.md`; this deletion does
+not validate persistent WAL, bounded-latency SLO, fsync, O_DSYNC, mmap
+durability, block/ublk, production, performance, availability, or
+successor/comparator claims.
+
 ## Doc-Authority Drift Cleanup Coordination (#952)
 
 Recorded on 2026-06-22 for the `check-doc-authority-drift` follow-up from PR
@@ -485,7 +495,6 @@ surface beyond adding `docs/CLAIMS_GATE_POLICY.md`, which was already scanned.
 | `docs/SPACE_ACCOUNTING_MODEL_DESIGN.md` | Historical input | Imported design-spec for logical vs physical space accounting. References Forgejo issue #1215. Claims registry has no validated space-accounting claim. |
 | `docs/POOL_IMPORT_EXPORT_DEVICE_TOPOLOGY_DESIGN.md` | Current spec | Scoped source-backed summary for the current pool-label, pool-scan/import, local import/export, and device-manager code paths. It is not product-readiness evidence for hot spares, evacuation, cluster ownership, online topology conversion, hardware-failure survival, availability, operational safety, or incumbent-comparison claims. |
 | `docs/DEVICE_LAYOUT_POLICIES_DESIGN.md` | Historical input | Imported design-spec that self-declares it has been superseded by `docs/design/device-layout-policies-adaptive-segment-sizing.md`. References Forgejo issue #1193. |
-| `docs/INTENT_LOG_SYNC_WRITE_LATENCY_PC008.md` | Historical input | Imported implemented-source specification for intent-log sync write latency (PC-008). Binds PC-008 closeout to source without claiming production persistent WAL or measured SLO pass. |
 | `docs/TRANSACTION_COMMIT_GROUPS_PC007.md` | Historical input | Imported implemented-source specification for transaction commit groups (PC-007). Binds existing Local Filesystem transaction-root implementation and FUSE fsync boundary. |
 | `docs/MEMBERSHIP_SERVICE_DESIGN.md` | Historical input | Imported design-spec for cluster membership service. References Forgejo issue #1209. ZFS/Ceph comparison text is design input only and is not a cluster-membership, distributed-availability, scale, performance, or successor claim. Claims registry has no validated cluster-membership claim. |
 | `docs/ERASURE_CODING_PLACEMENT_DESIGN.md` | Historical input | Imported design-spec superseded by the G4 pillar at `docs/design/production-erasure-coding-crush-placement-g4-pillar.md`. References Forgejo issue #1249. |

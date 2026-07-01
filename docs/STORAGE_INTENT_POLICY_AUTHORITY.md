@@ -4139,8 +4139,11 @@ This document composes existing authority surfaces:
 - `docs/PAGE_CACHE_WRITEBACK_AUTHORITY.md`: page cache is not durable truth;
   fsync may be satisfied only by committed storage, durable replayable intent,
   or a future equivalent receipt authority.
-- `docs/INTENT_LOG_SYNC_WRITE_LATENCY_PC008.md`: bounded sync replies require
-  durable replayable intent or full commit.
+- `crates/tidefs-local-filesystem/src/types.rs` and
+  `crates/tidefs-local-filesystem/src/tests.rs`: source-backed intent-log
+  sync-write latency constants and tests keep the non-release rule that bounded
+  sync replies require durable replayable intent or full commit, without
+  validating production WAL or a measured latency SLO.
 - `docs/LOCAL_DISTRIBUTED_RECEIPT_AUTHORITY.md`: placement receipts are durable
   locator authority and must drive reads, rebuild, and reclaim.
 - `docs/POOL_WIDE_REDUNDANCY_PLACEMENT_CONTRACT.md`: pool-wide placement and
