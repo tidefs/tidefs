@@ -9,7 +9,6 @@ It answers the question:
 See also:
 - `docs/AUTHN_AUTHZ_OVERRIDE_AUDIT_MODEL_P9-02.md`
 - `docs/FAULT_INJECTION_CHAOS_CORRUPTION_CAMPAIGNS_P10-02.md`
-- `docs/KERNEL_MODULE_FAMILY_MATRIX_ROLLOUT_ORDER_P7-01.md`
 - `docs/CHECKPOINT_SNAPSHOT_REPLAY_CURSOR_PERSISTENCE_LAW_P2-05.md`
 - `docs/FORMAT_IDENTITY_UPGRADE_REPLAY_CONTINUITY_LAW_P2-04.md`
 - `docs/REPLICATION_REBUILD_RELOCATION_DATA_FLOWS_P8-03.md`
@@ -76,7 +75,7 @@ The production system now requires at least these stable runbook classes:
    - `userspace` stage cutovers, especially narrow Rust authority, `posix_filesystem_adapter`/`explanation_query`/`block_volume_adapter` promotion, and final `control_plane` surface movement
 
 4. **`runbook.operator_runbook_0.cutover.kernel_family.r3`**
-   - future `P7-01` family promotions after `stage.userspace.mixed_soak_archive_ready.s7`
+   - future kernel-family promotions after `stage.userspace.mixed_soak_archive_ready.s7`
    - includes first `posix_filesystem_adapter` clean-read seam and later `block_volume_adapter` / optional `policy_authority` family moves
 
 5. **`runbook.operator_runbook_0.rollback.reentry.r4`**
@@ -216,7 +215,7 @@ The mapping is fixed:
   - `UserspaceAuthorityCutoverReceipt`
   - `UserspaceRollbackReentryReceipt` when needed
 
-- **kernel-family cutover runbooks** must commit through `P7-01` artifacts such as:
+- **kernel-family cutover runbooks** must commit through artifacts such as:
   - `KernelFamilyPromotionPlanRecord`
   - `KernelFamilyCutoverReceipt`
   - `KernelFamilyRollbackReceipt` when needed
@@ -301,7 +300,8 @@ They now have one declared runbook grammar.
 
 ### 6.4 Kernel-family cutover runbooks
 
-`runbook.operator_runbook_0.cutover.kernel_family.r3` is the operator form of `P7-01`.
+`runbook.operator_runbook_0.cutover.kernel_family.r3` is the operator form of
+future kernel-family promotion.
 It inherits the fixed family order and first-seam law.
 That means:
 - no kernel-family runbook may begin before `stage.userspace.mixed_soak_archive_ready.s7`,
@@ -353,13 +353,14 @@ But the grounding rule is now explicit:
 
 ## 9. Boundary with remaining unresolved production items
 
-The adjacent `P9-04` secret and policy-storage law is now explicit in `docs/SECRETS_POLICY_STORAGE_KEY_HANDLING_LAW_P9-04.md`, the shared numeric KPI/SLO law is now explicit in `docs/PERFORMANCE_BUDGETS_SLO_REGRESSION_GATES_P10-03.md`, the operator truth-surface law is now explicit in `docs/DASHBOARDS_TRACES_OPERATOR_TRUTH_SURFACES_P10-04.md` (missing from the repository; see #1270), and the kernel helper split is now explicit in `docs/RUST_FOR_LINUX_CRATE_TRAIT_BOUNDARIES_P7-02.md`.
+The adjacent `P9-04` secret and policy-storage law is now explicit in `docs/SECRETS_POLICY_STORAGE_KEY_HANDLING_LAW_P9-04.md`, the shared numeric KPI/SLO law is now explicit in `docs/PERFORMANCE_BUDGETS_SLO_REGRESSION_GATES_P10-03.md`, and the operator truth-surface law is now explicit in `docs/DASHBOARDS_TRACES_OPERATOR_TRUTH_SURFACES_P10-04.md` (missing from the repository; see #1270).
 The boundary is deliberate:
 - `P9-03` fixes how operators execute a move,
 - `P9-04` now fixes where long-lived secret material lives, how runtime leases work, and how secret material rotates or revokes,
 - `P10-03` now adds numeric floors to the same gates,
 - `P10-04` is now explicit in `docs/DASHBOARDS_TRACES_OPERATOR_TRUTH_SURFACES_P10-04.md` (missing from the repository; see #1270) and renders these results through shared `truth_view` truth surfaces and render receipts,
-- `P7-02` now fixes the `kernel_boundary` crate split that future kernel-side runbook helpers must obey,
+- future kernel-side runbook helpers must obey the current kernel residency and
+  preview UAPI boundaries,
 
 ## 10. Records required by this law
 

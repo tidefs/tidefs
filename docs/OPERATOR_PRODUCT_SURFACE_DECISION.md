@@ -67,7 +67,7 @@ surface, widen publishing claims, or preselect a runtime carrier.
   `docs/MEMBERSHIP_PLACEMENT_FAILURE_DOMAIN_MODEL_P8-02.md`,
   `docs/PERFORMANCE_BUDGETS_SLO_REGRESSION_GATES_P10-03.md`,
   `docs/FAULT_INJECTION_CHAOS_CORRUPTION_CAMPAIGNS_P10-02.md`,
-  `docs/RUST_FOR_LINUX_CRATE_TRAIT_BOUNDARIES_P7-02.md`,
+  deleted kernel-boundary production-depth lineage,
   `docs/UPGRADE_FAILOVER_CUTOVER_OPERATOR_RUNBOOKS_P9-03.md`,
   `docs/WORKSPACE_FAMILY_LAYOUT_CRATE_SERVICE_BOUNDARIES_P1-01.md`, deleted
   operator-manual lineage docs, and deleted scrub/repair/resilver historical

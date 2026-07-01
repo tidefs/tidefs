@@ -453,7 +453,8 @@ Temporary waivers still flow through `docs/AUTHN_AUTHZ_OVERRIDE_AUDIT_MODEL_P9-0
 
 - **`P10-03`** is now explicit in `docs/PERFORMANCE_BUDGETS_SLO_REGRESSION_GATES_P10-03.md`; it adds KPI and regression-threshold law to the same `cutover_control_0` runs instead of inventing a new performance-only chaos language.
 - **`P11-03`** must preserve hook-family semantics when the first Rust userspace staircase begins.
-- **`P7-01`** must require future kernel module families to inherit the same `cutover_control_0` row ids and bucket grammar.
+- Future kernel module families must inherit the same `cutover_control_0` row
+  ids and bucket grammar.
 - **`P2-05`** now supplies the shared checkpoint/snapshot/replay-cursor anchor law that these corruption rows must target; later variants may refine the rows, but they may not create a second persistence-fault grammar.
 - **`P9-03`** now does that in `docs/UPGRADE_FAILOVER_CUTOVER_OPERATOR_RUNBOOKS_P9-03.md`; later variants may refine rows, but they may not change the artifact or gate language.
 - **`P9-04`** now adds secret/key-specific handle, lease, and rotation law; any future secret-focused chaos rows must still stay inside this same campaign grammar.

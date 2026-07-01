@@ -9,7 +9,8 @@
 //!   authority and kernel mechanics.
 //! - **Opaque type facades** for Linux kernel objects (super_block, dentry,
 //!   inode, file, folio, bio, request_queue) that leaf modules bind to.
-//! - **Lock/pin/workqueue classifiers** from the canonical P7-03 model.
+//! - **Lock/pin/workqueue classifiers** for the bridge facade, bounded by
+//!   current kernel residency authority.
 //! - **Bridge error types** for all kernel-boundary failure modes.
 //!
 //! # What this crate does NOT own
@@ -45,8 +46,8 @@
 //!   kernel pointer, and the `// SAFETY:` comment must name the kernel
 //!   guarantee that keeps the pointer live for the callback duration.
 //! - Lock acquisitions inside callbacks must declare a `KernelLockClass`
-//!   variant and obey the canonical P7-03 lockdep partial order encoded in
-//!   the discriminants.
+//!   variant and obey the bridge lockdep partial order encoded in the
+//!   discriminants.
 //!
 //! # Safety: opaque-pointer lifetime contract
 //!

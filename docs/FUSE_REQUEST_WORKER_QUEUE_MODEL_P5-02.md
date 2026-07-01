@@ -316,4 +316,5 @@ The point is that ingress, scheduling, workers, reply commit, and maintenance ar
 Open work intentionally left to later items:
 - `P5-03` page-cache / writeback / mmap integration detail
 - `P4-04` zero-copy / DMA / page-loan law
-- `P7-03` kernel locking / RCU / pinning / workqueue mechanics
+- current kernel residency authority for locking / RCU / pinning / workqueue
+  mechanics

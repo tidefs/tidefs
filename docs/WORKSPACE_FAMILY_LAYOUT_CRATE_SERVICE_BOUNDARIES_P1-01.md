@@ -16,7 +16,6 @@ See also:
 - `docs/BUILD_PACKAGING_FEATURE_MATRIX_P1-04.md`
 - `docs/POLICY_AUTHORITY_RUNTIME_SURFACE_P3-01.md`
 - `docs/POSIX_FILESYSTEM_ADAPTER_DAEMON_TOPOLOGY_P5-01.md`
-- `docs/RUST_FOR_LINUX_CRATE_TRAIT_BOUNDARIES_P7-02.md`
 - `docs/CONTROL_PLANE_SERVICE_API_CLI_TOPOLOGY_P9-01.md`
 - `docs/STORAGE_INTENT_POLICY_AUTHORITY.md`
 - `docs/LOCAL_DISTRIBUTED_RECEIPT_AUTHORITY.md`
@@ -96,13 +95,17 @@ current storage-intent and placement-receipt authority in
 `response_registry` receipt/response-emission law in
 `docs/RECEIPT_RESPONSE_RUNTIME_EMISSION_PATH_P3-03.md`, the explicit `package_profile_catalog`
 build/packaging law in `docs/BUILD_PACKAGING_FEATURE_MATRIX_P1-04.md`, the
-explicit `kernel_boundary` kernel crate/trait boundary law in
-`docs/RUST_FOR_LINUX_CRATE_TRAIT_BOUNDARIES_P7-02.md`, and the explicit `truth_view`
+deleted kernel-boundary production-depth lineage, and the explicit `truth_view`
 operator-truth law in
 `docs/DASHBOARDS_TRACES_OPERATOR_TRUTH_SURFACES_P10-04.md` (missing from the repository; see #1270), so service roots,
 client crates, observe crates, stage bindings, and the userspace-versus-kernel
 split are no longer allowed to drift into Cargo-local convenience.
-It now also consumes the explicit `linux_baseline` Linux 7.0 baseline contract in `docs/LINUX_7_0_BASELINE_CONTRACT_SUPPORTED_SUBSYSTEMS_P0-01.md`, so admitted host assumptions, subsystem floors, and explicit non-baseline cuts are no longer allowed to drift from the declared package/stage bindings. It now also consumes the explicit `product_variant` product-variant matrix in `docs/PRODUCT_VARIANT_MATRIX_P0-02.md`, so declared bring-up-only, mixed-client-kernel, and kernel-self-sufficient authority rows are no longer allowed to drift from the declared host/package/stage bindings. It now also consumes the explicit `environment_boundary` std / `no_std` / userspace / kernel boundary law in `docs/STD_NO_STD_KERNEL_USERSPACE_BOUNDARY_RULES_P1-02.md`, so portable core, owned mirrors, userspace runtimes, Rust-for-Linux bridge crates, and leaf kernels are no longer allowed to drift from the declared environment split. It now also consumes the explicit `vfs_boundary_mirror` UAPI / FFI / canonical-schema boundary law in `docs/UAPI_FFI_CANONICAL_SCHEMA_BOUNDARY_RULES_P1-03.md`, so boundary mirrors, wire layouts, kernel-visible structs, `repr(C)` call frames, and conversion exactness are no longer allowed to drift from the declared design rule families. It now also consumes the explicit `seam_map` shared design rule-native seam-map law in `docs/SHARED_DOCTRINE_NATIVE_SEAM_MAP_P0-03.md`, so seam ownership, client/boundary bindings, kernel-promotion cuts, and anti-leak rules are no longer allowed to drift from the declared cross-system registry. It now also consumes the explicit `non_authority_deletion` non-authority / deletion law in `docs/NON_AUTHORITY_DELETION_LAW_P0-04.md`, so live archived residue, archive-only carriers, tombstone/delete bindings, and non-authority proof are no longer allowed to drift from the declared product boundary. They may **not** invent a second workspace graph, a second app-root grammar, or a second family/dependency law outside `workspace_layout`.
+It now also consumes historical production-law lineage for product variants,
+environment boundaries, UAPI mirrors, shared seams, and deletion rules. Current
+kernel and preview UAPI authority is kept in the focused kernel residency and
+preview UAPI docs; this historical document must not invent a second workspace
+graph, a second app-root grammar, or a second family/dependency law outside
+`workspace_layout`.
 
 ## 3. Repo anchor snapshot
 

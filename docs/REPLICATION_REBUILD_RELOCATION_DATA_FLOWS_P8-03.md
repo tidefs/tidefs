@@ -4,7 +4,9 @@
 
 This document is the source-of-truth for **P8-03** in the production design ledger.
 
-It answers the production question that remained deliberately open after `P2-02`, `P4-02`, `P4-03`, `P4-04`, `P5-02`, `P5-03`, `P6-01`, `P6-02`, and `P7-03`:
+It answers the production question that remained deliberately open after
+`P2-02`, `P4-02`, `P4-03`, `P4-04`, `P5-02`, `P5-03`, `P6-01`,
+`P6-02`, and the current kernel residency boundary:
 
 **How does tidefs move immutable payloads, restore lost placement, and relocate live extents across devices / nodes / failure domains without hidden authority leaks, fake durability, or folklore around rebuild and anti-entropy?**
 

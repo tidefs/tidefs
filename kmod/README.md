@@ -13,7 +13,8 @@ TideFS Rust-for-Linux kernel module root.
   and Linux kernel mechanics.
 - **Opaque kernel object facades** for super_block, dentry, inode, file, folio,
   page-window, bio, and request_queue.
-- **Lock/pin/workqueue classifiers** from the canonical P7-03 model.
+- **Lock/pin/workqueue classifiers** for the bridge facade, bounded by current
+  kernel residency authority.
 - **Bridge error types** for all kernel-boundary failure modes.
 - **Composite `KernelBridge` marker trait** as a compile-time gate for leaf modules.
 
@@ -53,16 +54,16 @@ pointer live for the operation duration.
 
 ### KernelLockClass canonical order
 
-[`KernelLockClass`](src/types.rs) discriminants encode the canonical P7-03
-lockdep partial order (PolicyRwsem → DomainMutex → RangeRwsem → PinMutex →
+[`KernelLockClass`](src/types.rs) discriminants encode the bridge lockdep
+partial order (PolicyRwsem → DomainMutex → RangeRwsem → PinMutex →
 ObjectSpin → SeqCountEpoch/RcuAnchor).  `derive(Ord)` enforces this order.
 Leaf modules must not introduce ad-hoc lock orders.
 
 ### WorkqueueFamily naming
 
-[`WorkqueueFamily`](src/types.rs) names match the 8 canonical P7-03 workqueue
-families: ControlSerial, NamespaceMut, PageWriteback, BlockSubmitComplete,
-PinDrain, ReclaimRelocate, ObserveExport, EmergencyRecovery.
+[`WorkqueueFamily`](src/types.rs) names match the 8 local bring-up families:
+ControlSerial, NamespaceMut, PageWriteback, BlockSubmitComplete, PinDrain,
+ReclaimRelocate, ObserveExport, EmergencyRecovery.
 
 ### Callback registration contract
 
@@ -72,11 +73,11 @@ must:
 - Match the kernel ABI exactly.
 - Construct opaque handles via `unsafe { ...::from_ptr(ptr) }` with a live
   kernel pointer guarantee.
-- Declare lock classes per the P7-03 hierarchy.
+- Declare lock classes per the bridge hierarchy.
 
 ### Deviations and blockers
 
-No upstream Rust-for-Linux deviations are recorded at this time.  Lock class
-discriminants and workqueue family names are source-level alignment with P7-03;
+No upstream Rust-for-Linux deviations are recorded at this time. Lock class
+discriminants and workqueue family names are source-level bridge labels;
 runtime lockdep integration requires a Rust-for-Linux `LockClassKey` binding
 that is not yet available (tracked in the kernel compile validation doc).

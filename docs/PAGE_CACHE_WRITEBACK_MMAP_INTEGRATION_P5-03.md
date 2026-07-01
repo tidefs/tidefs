@@ -369,7 +369,8 @@ Settled here:
 Still completed later, but now on explicit rails:
 - exact zero-copy / DMA / pin broker mechanics (`P4-04`)
 - exact block queue / ublk interaction details (`P6-01`, `P6-02`)
-- kernel locking / RCU / workqueue law (`P7-03`)
+- kernel locking / RCU / workqueue mechanics under the current kernel
+  residency authority
 - cluster mmap coherency design provenance recorded in Forgejo #1259; runtime implementation deferred to (`P6-03`, `P6-04`)
 
 ## 11. Production consequences
