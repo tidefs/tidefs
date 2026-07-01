@@ -905,7 +905,6 @@ total creates per second including commit_group sync time.
 - #1248: Cluster distributed lock service (sharded leases)
 - #1276: Cross-dataset reflink and copy offload
 - `docs/design/canonical-commit-ordering-commit_group-state-machine.md`
-- `docs/design/cluster-distributed-lock-service-sharded-leases.md`
 - `docs/design/cross-dataset-reflink-and-copy-offload.md`
 - `crates/tidefs-btree/src/lib.rs` — CoW B+tree implementation
 - `crates/tidefs-dir-index/src/lib.rs` — polymorphic directory index

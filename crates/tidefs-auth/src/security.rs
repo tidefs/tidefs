@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
-//! Cluster security and identity model — sealed implementation.
+//! Cluster security and identity helpers.
 //!
-//! This module implements the sealed design specification from
-//! `docs/design/cluster-security-identity-model.md` (§3–§11).
+//! This module owns source-level helpers for the current transport/session
+//! security boundary. Product authority remains with
+//! `docs/security/transport-security-boundary.md`,
+//! `docs/security/operator-authz-boundary.md`, and
+//! `docs/TRANSPORT_CLUSTER_AUTHORITY.md`.
 //!
 //! It provides:
 //! - Four security modes (`dev_insecure`, `tcp_mtls`, `psk_hmac`, `trusted_fabric`)
@@ -22,7 +25,7 @@ use crate::error::{AdminAccessDenied, RdmaBulkDenied, SecurityError};
 // 3.1 Mode Enumeration
 // ---------------------------------------------------------------------------
 
-/// Four security modes, per §3.1 of the sealed design.
+/// Four source-level security modes used by cluster/session helpers.
 ///
 /// Wire values:
 ///   `0x00 = dev_insecure`

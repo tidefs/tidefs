@@ -704,13 +704,12 @@ impl LaneConfig {
 }
 
 // ---------------------------------------------------------------------------
-// BulkPriority — 4-class priority model for BULK plane protocol (#1229, #1927)
+// BulkPriority — source-level 4-class transport priority model.
 // ---------------------------------------------------------------------------
 
 /// Priority class for BULK plane credit scheduling and OFFER ordering.
 ///
-/// Four canonical scheduling classes as defined in
-/// `docs/design/cluster-bulk-plane-protocol.md` §7.1. Priority ordering:
+/// Four scheduling classes are encoded in descending dispatch precedence:
 /// CONTROL > METADATA > BULK > BACKGROUND.
 ///
 /// This is the wire-level priority transmitted in `OfferV1::priority`.
