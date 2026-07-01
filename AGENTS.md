@@ -1,7 +1,10 @@
 # TideFS Agent Contract
 
-TideFS work is foreground Codex work unless the operator explicitly says
-otherwise. Do not start or depend on parked Nexus/Factory automation.
+TideFS work uses GitHub issues and pull requests. Foreground Codex owns work
+when no active operator-authorized automation is running. The current
+`tidefs-codex-nexus` controller and overseer may run managed Codex workers from
+live GitHub issue/PR state and repo docs when operator-authorized; do not start,
+depend on, or re-enable parked legacy Nexus/Factory automation.
 
 ## Development Rules
 

@@ -5,9 +5,11 @@ surface by themselves, and a larger test count is not evidence that the
 filesystem is healthier.
 
 This policy is current TideFS repo policy. It applies to foreground Codex work,
-review, and future cleanup. Do not encode these project-specific rules in Nexus
-or Factory automation; those systems are parked and, if reactivated, must stay
-mechanics-only.
+managed TideFS Codex Nexus work, review, and future cleanup. Do not encode
+these project-specific rules in Nexus or Factory automation. Current TideFS
+Codex Nexus work must stay mechanics-only and derive work selection from live
+GitHub issue/PR state plus repo docs; Factory and legacy automation remain
+parked unless separately reauthorized.
 
 ## Core Rule
 
