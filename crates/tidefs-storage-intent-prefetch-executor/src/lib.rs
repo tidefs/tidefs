@@ -3736,6 +3736,8 @@ fn admission_refusal(admission: PrefetchExecutorAdmissionRecord) -> StorageInten
 fn anti_waste_refusal(mask: PrefetchExecutorAntiWasteMask) -> StorageIntentRefusalReason {
     if mask.intersects(PrefetchExecutorAntiWasteMask::UNKNOWN_WAF) {
         StorageIntentRefusalReason::FlashWearBudgetExceeded
+    } else if mask.intersects(PrefetchExecutorAntiWasteMask::UNKNOWN_EGRESS_OR_RESTORE_COST) {
+        StorageIntentRefusalReason::OverBudget
     } else if mask.intersects(PrefetchExecutorAntiWasteMask::NOISY_NEIGHBOR_PRESSURE) {
         StorageIntentRefusalReason::NoisyNeighborPressure
     } else if mask.intersects(PrefetchExecutorAntiWasteMask::FAILED_PAYBACK)
@@ -6000,7 +6002,7 @@ mod tests {
         assert_eq!(egress_record.outcome, PrefetchExecutorOutcome::Dropped);
         assert_eq!(
             egress_record.refusal,
-            StorageIntentRefusalReason::EvidenceNotUsable
+            StorageIntentRefusalReason::OverBudget
         );
         assert!(!egress_record.can_publish_replacement_receipt());
     }
