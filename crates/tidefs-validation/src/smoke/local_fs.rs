@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
-//! Local-filesystem smoke: deterministic open/close and lifecycle operation
-//! recording against `LocalFileSystem`.
+//! Local-filesystem smoke: deterministic open/create/write/read/close checks
+//! against `LocalFileSystem`.
 //!
 //! Gated on `feature = "fuse"`.
 
@@ -26,22 +26,37 @@ pub fn run_local_fs_smoke() -> SmokeHarness {
         root_path: root_path.clone(),
     });
 
-    // Open the filesystem.
-    let _fs = LocalFileSystem::open(&root_path).expect("open LocalFileSystem");
-
-    // Record a placeholder lifecycle op.
+    // Open the filesystem and perform a small real readback operation.
+    let mut fs = LocalFileSystem::open(&root_path).expect("open LocalFileSystem");
+    let file_path = "/smoke-file";
+    let payload = b"local-fs smoke";
+    let file = fs
+        .create_file(file_path, 0o644)
+        .expect("create local-fs smoke file");
     h.record(TraceEvent::FsLifecycleOp {
-        inode_id: 1,
-        op_name: "mount".to_string(),
-        payload: b"".to_vec(),
+        inode_id: file.inode_id.get(),
+        op_name: "local_fs.write".to_string(),
+        payload: payload.to_vec(),
     });
+    fs.write_file(file_path, 0, payload)
+        .expect("write local-fs smoke file");
 
-    h.assert_ev("local-fs opened", true);
+    h.record(TraceEvent::FsLifecycleOp {
+        inode_id: file.inode_id.get(),
+        op_name: "local_fs.read".to_string(),
+        payload: Vec::new(),
+    });
+    let read_back = fs.read_file(file_path).expect("read local-fs smoke file");
+    h.assert_eq_ev(
+        "local-fs readback matches write",
+        read_back,
+        payload.to_vec(),
+    );
 
     // Close.
     h.record(TraceEvent::FsClose);
 
-    drop(_fs);
+    drop(fs);
     dir.close().ok();
 
     h.scenario_end("local-fs/smoke");

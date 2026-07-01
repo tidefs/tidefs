@@ -292,7 +292,7 @@ pub struct MeasuredKpi {
     pub percentile: Option<String>,
 }
 /// Distinguishes whether a row's KPI values came from actual measurement
-/// artifacts or placeholder entries that keep the matrix
+/// artifacts or schema-only entries that keep the matrix
 /// shape alive but do not constitute performance validation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

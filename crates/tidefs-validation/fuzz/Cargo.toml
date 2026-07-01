@@ -17,7 +17,7 @@ serde_json = "1"
 [workspace]
 
 [lib]
-path = "fake_lib.rs"
+path = "fixture_lib.rs"
 
 [[bin]]
 name = "json_parse"

@@ -197,8 +197,8 @@ impl KernelRowScoreboard {
     /// Clean pass requires: a non-empty command was issued, a kernel
     /// version is recorded, and zero product/harness failures and zero refusals.
     ///
-    /// Rows with empty command or missing kernel version are schema
-    /// placeholders, not runtime validation.
+    /// Rows with empty command or missing kernel version are schema-only rows,
+    /// not runtime validation.
     pub fn is_clean_pass(&self) -> bool {
         !self.command.is_empty()
             && self.kernel_version.is_some()
@@ -851,7 +851,7 @@ mod tests {
     #[test]
     fn guard_clean_pass_without_command_or_kernel_is_impossible() {
         // Empty command, zero failures/refusals => not clean pass
-        let placeholder = KernelRowScoreboard {
+        let schema_only = KernelRowScoreboard {
             row_id: "ph".into(),
             started_at: "t".into(),
             duration_secs: 0.0,
@@ -868,8 +868,8 @@ mod tests {
                 refusals: 0,
             },
         };
-        assert!(!placeholder.is_clean_pass());
-        assert!(!placeholder.is_genuine_runtime_pass());
+        assert!(!schema_only.is_clean_pass());
+        assert!(!schema_only.is_genuine_runtime_pass());
 
         // Clean pass without artifact => still not genuine runtime pass
         let clean_no_artifact = KernelRowScoreboard {

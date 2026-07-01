@@ -19,7 +19,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// All fields that might contain personally-identifiable or host-identifying
 /// information are redacted by default.  The `redacted` flag records whether
 /// redaction was applied. Each operator-evidence section names the source that
-/// produced it so unavailable placeholders cannot look like measured results.
+/// produced it so unavailable sections cannot look like measured results.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupportBundle {
     /// Bundle schema identifier.
@@ -30,7 +30,7 @@ pub struct SupportBundle {
     /// TideFS version (from the compiling binary).
     pub tidefs_version: String,
     /// Set to `true` when hostnames, IPs, and external paths have been
-    /// stripped or replaced with placeholders.
+    /// stripped or replaced with redacted values.
     pub redacted: bool,
     /// Collector/source summary for the bundle as a whole.
     pub report_source: DiagnosticReportSource,
@@ -70,7 +70,7 @@ pub enum EvidenceSource {
     OfflineDeviceScan,
     /// Reachable runtime owner endpoint.
     LiveOwner,
-    /// Static placeholder because no evidence source was consulted.
+    /// Explicit unavailable marker because no evidence source was consulted.
     Unavailable,
 }
 
