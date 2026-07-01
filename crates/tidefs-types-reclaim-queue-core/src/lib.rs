@@ -2,11 +2,9 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
-//! Authority type definitions for refcount delta-based incremental data
-//! cleanup queues.
+//! Portable type definitions for refcount delta-based reclaim queues.
 //!
-//! Implements Phase 1 of the reclaim queue design from
-//! [`docs/REFCOUNT_DELTA_CLEANUP_QUEUES_DESIGN.md`] with four core types:
+//! This crate owns the no_std type-level behavior for reclaim queue records:
 //!
 //! - [`QueueFamily`] — discriminant distinguishing the four queue families
 //!   (extent, locator, rebake, inode tombstone)
@@ -18,29 +16,18 @@
 //!   stale-delta resurrection, queue-family mismatches, and missing
 //!   keys detected during batch processing
 //!
-//! ## Comparison to ZFS / Ceph
+//! Runtime reclaim, deadlist handoff, compaction policy, allocator free-space
+//! publication, and product claims are outside this crate. Their current
+//! boundaries live in source behavior, `docs/COMPACTION_AUTHORITY.md`,
+//! `docs/SNAPSHOT_CLONE_DEADLIST_AUTHORITY.md`, `validation/claims.toml`, and
+//! `docs/CLAIMS_GATE_POLICY.md`.
 //!
-//! - **ZFS**: deferred frees use `bpobj` (block_ref object) — an opaque,
-//!   untyped deferred-free linked list processed in unpredictable order
-//!   during `dsl_scan`.  TideFS improves on this with a sorted, budgeted,
-//!   persistent B-tree queue that guarantees deterministic key-order
-//!   processing and explicit per-tick budget control.
-//! - **Ceph**: PG logs are append-only mutation journals used for
-//!   recovery, not space reclamation.  Ceph has no equivalent of the
-//!   reclaim delta queue; space reclamation is implicit via OSD-level
-//!   snap trimming which scans full object indexes.  TideFS decouples
-//!   delta recording (O(1) per mutation) from reclamation processing
-//!   (O(budget) per tick), avoiding full-dataset scans.
-//!
-//! [`docs/REFCOUNT_DELTA_CLEANUP_QUEUES_DESIGN.md`]:
-//!     https://forgejo/forgeadmin/tidefs/docs/REFCOUNT_DELTA_CLEANUP_QUEUES_DESIGN.md
-
 use core::fmt;
 
 // alloc is always available in tests; crate is no_std
 extern crate alloc;
 
-/// Design spec reference constant for runtime assertions.
+/// Stable diagnostic label for the reclaim queue v1 type family.
 pub const RECLAIM_QUEUE_SPEC: &str = "tidefs-reclaim-queue-v1-design-1180";
 
 // ---------------------------------------------------------------------------
@@ -51,7 +38,7 @@ pub const RECLAIM_QUEUE_SPEC: &str = "tidefs-reclaim-queue-v1-design-1180";
 ///
 /// Must be identical to the `ObjectKey` type used by the per-dataset
 /// extent refcount B-tree so that the same B-tree code can service
-/// both structures (design spec §2.1).
+/// both structures when runtime integration supplies conversions.
 ///
 /// This definition mirrors the `ObjectKey` in `tidefs-local-object-store`;
 /// when the runtime reclaim processor is built (Phase 2+), the integration
@@ -86,7 +73,7 @@ impl fmt::Display for ObjectKey {
 }
 
 // ---------------------------------------------------------------------------
-// QueueFamily — four queue families per design spec §3
+// QueueFamily — four queue families for reclaim queue records
 // ---------------------------------------------------------------------------
 
 /// Discriminant for the four reclaim queue families.
@@ -98,24 +85,24 @@ impl fmt::Display for ObjectKey {
 /// assignment.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd, Default)]
 pub enum QueueFamily {
-    /// Extent reclaim queue (§3.1): freed extent payloads.
+    /// Extent reclaim queue: freed extent payloads.
     /// Triggered by `locator.refcount` decremented to 0 on truncate,
     /// delete, or overwrite.
     #[default]
     Extent = 0,
 
-    /// Locator reclaim queue (§3.2): freed extent IDs.
+    /// Locator reclaim queue: freed extent IDs.
     /// Triggered after the locator table entry is deleted (extent fully
     /// dead).  Enqueues shard object keys into the rebake queue if
     /// erasure-coded parity shards exist.
     Locator = 1,
 
-    /// Rebake queue (§3.3): pending erasure-coding parity recomputation.
+    /// Rebake queue: pending erasure-coding parity recomputation.
     /// Triggered when a data shard is freed while parity shards remain
     /// alive in the stripe.
     Rebake = 2,
 
-    /// Inode tombstone queue (§3.4): deleted inodes awaiting compaction.
+    /// Inode tombstone queue: deleted inodes awaiting compaction.
     /// Triggered when inode `nlink` reaches 0 and all open handles are
     /// closed.
     InodeTombstone = 3,
@@ -186,7 +173,7 @@ impl fmt::Display for QueueFamily {
 
 /// A single entry in a dataset's persistent reclaim queue B-tree.
 ///
-/// Stored as a B-tree leaf value keyed by `ObjectKey` (design spec §2.1).
+/// Stored as a B-tree leaf value keyed by `ObjectKey`.
 /// Entries are appended atomically within the same commit_group as the refcount
 /// decrement that produced them.
 ///
@@ -317,7 +304,7 @@ impl fmt::Display for ReclaimQueueEntry {
 // ---------------------------------------------------------------------------
 
 /// Per-tick statistics returned by the reclaim processor after each
-/// budgeted batch (design spec §4.1).
+/// budgeted batch.
 ///
 /// These counters are reset per-tick and aggregated into higher-level
 /// observability metrics (prometheus counters, pool health reports).
@@ -580,7 +567,7 @@ impl fmt::Display for ReclaimIntegrityError {
 // QueueBudget — configuration for per-tick processing limits
 // ---------------------------------------------------------------------------
 
-/// Per-dataset reclaim processing budget (design spec §4.3).
+/// Per-dataset reclaim processing budget.
 ///
 /// Controls how many queue entries the reclaim processor consumes per
 /// tick, bounding mount-time stalls and providing predictable latency.
@@ -592,7 +579,7 @@ pub struct QueueBudget {
     /// Maximum entries to pull in a single batch (commit granularity).
     pub max_batch_size: usize,
 
-    /// Queue entry count threshold for pressure-driven ticks (§7.2).
+    /// Queue entry count threshold for pressure-driven ticks.
     /// When the queue exceeds this size, the next tick fires immediately
     /// with an increased budget.
     pub pressure_threshold: usize,

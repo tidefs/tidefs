@@ -189,6 +189,15 @@ not validate a full publication pipeline, response-emission runtime,
 distributed commit path, policy runtime service, production readiness, or
 OpenZFS/Ceph-class wording.
 
+## Refcount-Delta Historical Root Deletion (TFR-019 / #1677)
+
+Issue #1677 deleted the stale refcount-delta cleanup-queue historical root.
+Current reclaim/deadlist and compaction boundaries remain with source behavior,
+`docs/COMPACTION_AUTHORITY.md`, `docs/SNAPSHOT_CLONE_DEADLIST_AUTHORITY.md`,
+`validation/claims.toml`, and `docs/CLAIMS_GATE_POLICY.md`; this deletion does
+not validate runtime reclaim, deadlist, compaction, allocator, release,
+production, performance, availability, or successor/comparator claims.
+
 ## Doc-Authority Drift Cleanup Coordination (#952)
 
 Recorded on 2026-06-22 for the `check-doc-authority-drift` follow-up from PR
@@ -635,7 +644,6 @@ larger than this documentation-authority cleanup.
 | Path | State | Classification note |
 |---|---|---|
 | `docs/POLYMORPHIC_XATTR_STORAGE_DESIGN.md` | Historical input | Imported Forgejo #1290 xattr storage design with proposed on-media records and ACL integration. Current xattr/ACL behavior and claims coverage were not audited here, so the document remains review material. |
-| `docs/REFCOUNT_DELTA_CLEANUP_QUEUES_DESIGN.md` | Historical input | Imported Forgejo #1180 refcount-delta reclamation design. Current reclaim/deadlist work is active elsewhere, but the complete queue data model and runtime evidence were not validated in this slice. |
 | `docs/SNAPSHOT_DEADLIST_PINNING_DESIGN.md` | Historical input | Imported snapshot deadlist/pinning design that reaches into reclamation, references, and snapshot lifecycle. It needs a dedicated snapshot/deadlist source and claims-gate review before promotion. |
 | `docs/UNIFIED_RESOURCE_GOVERNOR_DESIGN.md` | Historical input | Imported resource-governor design with broad scheduling and budget claims. Open resource-governor implementation work is separate; this document is not current runtime authority. |
 | `docs/design/device-layout-policies-adaptive-segment-sizing.md` | Historical input | Imported adaptive segment-sizing/device-layout policy design. It needs storage allocator/device-layout source and evidence review before it can constrain current behavior. |
