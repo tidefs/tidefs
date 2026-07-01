@@ -356,10 +356,20 @@ narrow source-backed scope.
 
 | Path | State | Classification note |
 |---|---|---|
-| `docs/THREE_CONTRACT_ARCHITECTURE.md` | Historical input | Imported three-contract meta-architecture/design-law text. It is not current on-media, VFS, trace, JSONL, multi-implementation, or release authority. |
 | `docs/TORN_COMMIT_RECOVERY_CONTRACT.md` | Historical input | Imported torn-commit recovery design-spec text. It is not current recovery implementation evidence, crash-safety proof, or release-readiness authority. |
 | `docs/adr/0002-persistent-orphan-index.md` | Historical input | Historical ADR for persistent orphan-index target architecture. It is not current reclaim, crash-recovery, or space-accounting proof. |
 | `docs/crates/types-core-consolidation-plan.md` | Historical input | Historical consolidation plan for deleted type-core scaffold roots. Current package authority is `docs/workspace-package-classification.md`. |
+
+### Three-Contract Historical Root Deletion (TFR-019 / #1692)
+
+Issue #1692 deleted the stale three-contract architecture root instead of
+preserving it as another live historical Markdown authority surface. Current
+on-media, VFS, trace, claim, and product-shape authority remains with
+source-backed focused docs, `validation/claims.toml`, the generated claim
+registry, the claims gate, and live GitHub issues/PRs. This deletion does not
+validate multi-implementation equivalence, trace parity, format lifecycle
+completion, release readiness, comparator parity, or OpenZFS/Ceph-successor
+claims.
 
 ### Historical ADR Root Deletion (TFR-019 / #1689)
 

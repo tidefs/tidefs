@@ -42,7 +42,6 @@ The feature flag architecture is a foundational dependency for:
 | #1220 (on-media format strategy) | Record family gating | Feature flags are the mechanism by which V1 format evolves; new record families require a named feature flag |
 | #1254 (pool import/export) | Pool-level feature masks | `PoolLabelV1.features_incompat/ro_compat/compat` are pool-wide bitmasks; this design extends the same concept to per-dataset B-trees |
 | #1199 (POSIX ACL) | ACL support gating | `org.tidefs:posix_acl` is a canonical feature flag name; enabling it permits ACL on-disk storage |
-| #1250 (three-contract architecture) | Format contract evolution | Feature flags are the mechanism for evolving the on-media format contract without breaking the VFS semantic contract |
 | #1238 (format lifecycle meta) | Define→Gate phase | Feature flags implement the "Gate" phase of the unified format lifecycle |
 
 ## 3. Three Compatibility Classes

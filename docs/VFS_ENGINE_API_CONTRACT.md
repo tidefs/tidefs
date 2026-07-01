@@ -23,12 +23,13 @@ See also:
 - `docs/POSIX_FILESYSTEM_ADAPTER_DAEMON_TOPOLOGY_P5-01.md`
 - `docs/FUSE_REQUEST_WORKER_QUEUE_MODEL_P5-02.md`
 
-## Relationship to the three-contract architecture
+## VFS Boundary Role
 
-This document is the central embodiment of Contract 2 (VFS semantic contract)
-per the #1250 three-contract organizing principle. Contract 1 is the on-media
-defines what every operation **means** across all surfaces, independent of
-how it is encoded on the wire or written to disk.
+This document records the VFS operation boundary: what every operation
+**means** across frontend surfaces, independent of how it is encoded on the wire
+or written to disk. Current authority still depends on source-backed
+classification, live GitHub issue/PR state, and the claims gate rather than the
+deleted three-contract historical root.
 
 ## Metrics snapshot
 
@@ -790,7 +791,6 @@ encoded.
 
 | Issue | What | Status |
 |---|---|---|
-| #1250 | Three-contract architecture | Organizing meta; this is Contract 2 |
 | #1198 | POSIX semantics spec | Ownership/mode inheritance rules |
 
 ### 11.2 Issues blocked by this contract
