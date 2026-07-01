@@ -30,8 +30,9 @@ The document is anchored to the following design authorities:
 - `docs/security/transport-security-boundary.md` -- transport session boundary
 - `docs/security/pool-encryption-secret-handle-boundary.md` -- P9-04
   handle/lease implementation
-- `docs/security/security-release-matrix.md` -- consolidated release matrix
-- `docs/security/security-audit-2026-04-30.md` -- kernel unsafe audit
+- `docs/UNSAFE_AUDIT.md` -- current whole-tree unsafe inventory
+- `docs/security/kernel-unsafe-boundary-inventory.md` -- narrow unsafe-boundary
+  lineage for the earlier security crate set
 
 ## 2. Threat Model Framework
 
@@ -260,17 +261,17 @@ detection, with BLAKE3-256 for durable trails.
 | Code path | `crates/tidefs-local-object-store/` -- two-tier checksum model |
 | Policy | `CANONICAL_BINARY_ENCODE_DECODE_ENDIAN_CHECKSUM_LAW_P2-03.md` |
 
-### 3.15 Kernel Unsafe Boundary
+### 3.15 Unsafe-Code Boundary
 
-**Claim**: Kernel-mode code enforces `#![forbid(unsafe_code)]` on all
-production crates; kernel-facing unsafe blocks have explicit SAFETY
-invariants.
+**Claim boundary**: Unsafe-code assertions must come from the live unsafe
+inventory and source-backed follow-up issues, not from this threat model.
 
 | Element | Value |
 |---|---|
-| Code path | `crates/tidefs-block-kmod/`, `crates/tidefs-posix-vfs-kmod/` |
-| Audit | `docs/security/security-audit-2026-04-30.md` -- 41 of 42 production crates forbid unsafe; 1 exception with documented SAFETY invariants |
-| Owning gaps | Kernel unsafe boundary consolidated review; historical Forgejo #6492 |
+| Current inventory | `docs/UNSAFE_AUDIT.md` |
+| Narrow lineage | `docs/security/kernel-unsafe-boundary-inventory.md` for the earlier security/RDMA crate set |
+| Owning gaps | Follow-up issues named by the current unsafe inventory |
+| Non-claim | This threat model does not validate product-wide unsafe status, kernel safety, release readiness, or product hardening by itself. |
 
 ### 3.16 No Message-Local Crypto Proof Markers
 
@@ -438,7 +439,7 @@ A-register finding:
 | Local unprivileged process (cold storage) | At-rest encryption (3.1) | Source-level |
 | Local unprivileged process (running mount) | Not covered | Requires kernel page-cache isolation |
 | Compromised node (key extraction) | Secret handle/key lease (3.4), zeroization (3.6) | Type boundary; runtime pending |
-| Supply-chain adversary | Kernel unsafe audit (3.15), lockfile gate (#6493) | Partial |
+| Supply-chain adversary | Unsafe-code inventory, focused boundary docs, lockfile policy (#6493) | Partial |
 | Metadata tampering | BLAKE3 integrity (3.13), committed-root chains | T1 (cargo) |
 | Audit trail forgery | Not covered | #6490 (design-level) |
 
@@ -454,10 +455,10 @@ cargo test -p tidefs-auth --locked
 
 ## 9. References
 
-- `docs/security/security-release-matrix.md` -- consolidated release matrix
 - `docs/security/transport-security-boundary.md` -- transport session boundary
 - `docs/security/pool-encryption-secret-handle-boundary.md` -- P9-04 handle/lease
 - `docs/security/blake3-integrity-boundary.md` -- BLAKE3 integrity boundary
 - `docs/BLAKE3_USAGE_POLICY.md` -- BLAKE3 usage policy
-- `docs/security/security-audit-2026-04-30.md` -- kernel unsafe audit
-- `/root/ai/docs/projects/tidefs/state/full-review-attention-register.md` -- A4, A17, A37
+- `docs/UNSAFE_AUDIT.md` -- current whole-tree unsafe inventory
+- `docs/security/kernel-unsafe-boundary-inventory.md` -- narrow unsafe-boundary
+  lineage for the earlier security crate set

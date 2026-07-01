@@ -1,11 +1,14 @@
 # Kernel Unsafe Boundary Consolidated Inventory
 
 Historical issue: Forgejo #6492
-Current authority: this inventory plus
-`docs/security/security-audit-2026-04-30.md`.
 Review date: 2026-05-23
 Head (origin/master at review): `27403b998`
 Branch: `agent-s6` (Nexus worktree)
+
+This is a narrow historical inventory for the crate set listed below. The
+current whole-tree unsafe inventory lives in `docs/UNSAFE_AUDIT.md`; this file
+must not be cited as product-wide unsafe-code, release-readiness, security, or
+product-hardening authority.
 
 ## Summary
 
