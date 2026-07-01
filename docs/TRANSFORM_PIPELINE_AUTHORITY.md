@@ -36,12 +36,12 @@ authority boundary:
 | Surface | Evidence found | Authority role |
 |---|---|---|
 | `crates/tidefs-compression/src/lib.rs` | Describes itself as the compression helper/library tier. Mounted writes currently resolve `ContentCompressionPolicy` and call `encode_content_chunk()` in the local-filesystem content path. | Compression primitive and policy-report helper, not canonical transform dispatch. |
-| `docs/design/compression-design-strategy.md` | Historical input that already requires compression before encryption and keeps `tidefs-compression` as a helper/library surface. | Design input only; not proof that all runtime paths comply. |
+| `crates/tidefs-compression/src/lib.rs` | Source-owned compression helper/library tier. | Primitive and policy-report helper, not canonical transform dispatch. |
 | `crates/tidefs-encryption/src/lib.rs` and `crates/tidefs-encryption/src/secret_handle.rs` | Provide frame/key helpers and secret-handle helpers, while warning that lower object-store encryption is not an end-to-end mounted filesystem proof. | Encryption primitive and key-handle helper, not canonical dispatch. |
 | `docs/security/pool-encryption-secret-handle-boundary.md` | Defines the secret-handle/key-lease boundary for pool encryption access. | Key access policy boundary; not ciphertext ordering authority. |
 | `crates/tidefs-checksum-tree/src/lib.rs` | Provides BLAKE3 checksum trees, domain tags, `ChecksumTreeBuilder`, `ChecksumTreeVerifier`, and locator-bound verification helpers. | Checksum evidence primitive consumed by the pipeline. |
 | `crates/tidefs-verification-engine/src/lib.rs` and `crates/tidefs-verification-engine/src/object_verify.rs` | Provide `VerificationPlan`, object verification, batch verification, transfer receipts, and quorum/reporting helpers. | Verification consumer/projection of stored-frame evidence, not transform dispatch. |
-| `docs/CHECKSUM_ARCHITECTURE_DESIGN.md` | Historical target input names `data -> compress -> encrypt -> checksum -> write` and reverse read order. | Ordering evidence only until current runtime paths implement it. |
+| `docs/BLAKE3_USAGE_POLICY.md` | Current BLAKE3 placement and review policy. | Digest-placement policy only, not proof that all runtime paths comply. |
 | `crates/tidefs-local-object-store/src/pool/mod.rs` | `Pool`, `PoolStore`, and `PoolStoreMut` route normal pool I/O; `raw_primary_store()` and `raw_primary_store_mut()` are explicit raw-store escape hatches; encrypted pools fail closed when locked; `open_single_device()` currently wraps an encrypted inner device with an outer compressed device, so write flow compresses before encryption. | Chosen canonical dispatch boundary. |
 | `crates/tidefs-local-object-store/src/device.rs` | `DeviceConfig` accepts optional compression and encryption; `CompressedDevice` and `EncryptedDevice` are transparent wrappers; `Device::is_encrypted()` recurses through compression wrappers. | Lower wrapper implementation surface; cannot be the sole authority because wrapper nesting hides policy and raw-store visibility. |
 | `crates/tidefs-local-object-store/src/lib.rs` and `crates/tidefs-local-object-store/src/integrity.rs` | `LocalObjectStore` persists payload bytes with `IntegrityTrailerV2`; durable options can verify read checksums; `ChecksumProof` and `verify_object_read()` verify object data against checksum evidence. | Raw object persistence and stored-byte integrity surface. |
@@ -209,8 +209,8 @@ the authority:
 - `docs/ARCHITECTURE.md` lists `tidefs-compression`, `tidefs-encryption`, and
   `tidefs-dedup` as separate product-layer crates rather than one dispatch
   owner.
-- `docs/CHECKSUM_ARCHITECTURE_DESIGN.md` is historical input showing checksum
-  framing concerns are interdependent with transform framing.
+- `docs/BLAKE3_USAGE_POLICY.md` records the BLAKE3 placement and review
+  boundary consumed by transform framing.
 - `crates/tidefs-local-filesystem/src/content.rs` currently computes dedup
   fingerprints over plaintext chunks before `encode_content_chunk()`, then
   writes encoded chunk objects with `PoolStoreMut::put_with_receipt()`.

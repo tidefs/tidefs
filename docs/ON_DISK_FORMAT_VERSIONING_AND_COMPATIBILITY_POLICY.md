@@ -78,7 +78,8 @@ explicitly as capabilities are needed.
 
 ### 1.4 Committed Roots and Intent Log
 
-**Spec:** [TORN_COMMIT_RECOVERY_CONTRACT.md](TORN_COMMIT_RECOVERY_CONTRACT.md)
+**Authority:** source behavior plus the TFR-005/TFR-008 review-register
+boundaries.
 
 Committed-root entries and intent-log records carry their own version
 discriminants. The current documented format is V1. Replay accepts only
@@ -280,5 +281,5 @@ boundary in current policy.
 - `crates/tidefs-local-object-store/src/format_manifest.rs` -- local object store manifest and record-format version authority
 - [DATASET_FEATURE_FLAGS_DESIGN.md](DATASET_FEATURE_FLAGS_DESIGN.md) -- per-dataset feature flag architecture
 - [POOL_IMPORT_EXPORT_DEVICE_TOPOLOGY_DESIGN.md](POOL_IMPORT_EXPORT_DEVICE_TOPOLOGY_DESIGN.md) -- pool label format and import/export design
-- [TORN_COMMIT_RECOVERY_CONTRACT.md](TORN_COMMIT_RECOVERY_CONTRACT.md) -- committed-root and intent-log format contract
+- `docs/REVIEW_TODO_REGISTER.md` TFR-005/TFR-008 -- committed-root and intent-log format/recovery review boundary
 - [PRODUCTION_INTEGRITY_POLICY.md](PRODUCTION_INTEGRITY_POLICY.md) -- production integrity (digest, domain separation, trailer) policy

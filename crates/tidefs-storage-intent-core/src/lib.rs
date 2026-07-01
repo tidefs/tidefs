@@ -18807,7 +18807,7 @@ impl fmt::Display for MetadataSmallObjectShape {
 
 /// Inode-authority reference carried by metadata/namespace evidence.
 ///
-/// These refs cite `docs/VFS_ENGINE_API_CONTRACT.md` and
+/// These refs cite the source-owned VFS engine API and
 /// `docs/INODE_NAMESPACE_AUTHORITY.md` for inode identity, generation,
 /// parent/child relation, link-count, cookie, raw-name, and conflict-guard
 /// fields without replacing the VFS semantic contract.

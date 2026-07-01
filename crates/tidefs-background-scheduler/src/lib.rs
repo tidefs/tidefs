@@ -517,10 +517,9 @@ impl fmt::Display for SchedulerError {
 ///     ../../tidefs-types-incremental-job-core/trait.IncrementalJob.html
 /// [`TickReport`]: struct.TickReport.html
 ///
-/// Preserved as a trait per DESIGN_OVERFITTING_POLICY.md §5: this is
-/// legitimate open-set polymorphism. Multiple crates implement
-/// BackgroundService for different background work types (scrub,
-/// compaction, reclaim, dataset lifecycle, etc.).
+/// Preserved as a trait because this is legitimate open-set polymorphism.
+/// Multiple crates implement BackgroundService for different background work
+/// types (scrub, compaction, reclaim, dataset lifecycle, etc.).
 #[cfg(feature = "alloc")]
 pub trait BackgroundService: Send {
     /// Unique name for metrics, scheduling, and operator visibility.

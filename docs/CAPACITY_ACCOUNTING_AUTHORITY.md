@@ -41,9 +41,11 @@ mirrors.
 - `docs/REVIEW_TODO_REGISTER.md`: TFR-007 records the live split across
   allocation, quotas, `statfs`, reserves, logical/physical counters, reclaim,
   obligation ledgers, and store-layer persistence.
-- `docs/SPACE_ACCOUNTING_MODEL_DESIGN.md`: separates logical admission from
-  physical allocator pressure, defines `DatasetSpaceCountersV1`, `SpaceDelta`,
-  `PoolPhysicalCountersV1`, space domains, and POSIX `statfs` rules.
+- `crates/tidefs-space-accounting/` and
+  `crates/tidefs-types-space-accounting-core/`: define the current
+  source-owned logical admission, physical allocator pressure,
+  `DatasetSpaceCountersV1`, `SpaceDelta`, `PoolPhysicalCountersV1`, space
+  domains, and POSIX `statfs` projection inputs.
 - `docs/SNAPSHOT_DEADLIST_PINNING_DESIGN.md` and
   `docs/LOCAL_SNAPSHOTS_OW108.md`: snapshot-pinned bytes are separately
   observable and must not be double-counted in POSIX `statfs`; snapshot

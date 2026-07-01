@@ -133,8 +133,8 @@ impl std::fmt::Display for TransportBackendKind {
 ///
 /// Supports TCP (default), TLS, and RDMA (experimental, OW-308).
 ///
-/// Preserved as a trait per DESIGN_OVERFITTING_POLICY.md §5: this is
-/// legitimate open-set polymorphism with multiple production backends
+/// Preserved as a trait because this is legitimate open-set polymorphism with
+/// multiple production backends
 /// (TCP, TLS, RDMA, loopback).
 pub trait TransportBackend: Send + Sync {
     /// Bind to a local address and start listening.

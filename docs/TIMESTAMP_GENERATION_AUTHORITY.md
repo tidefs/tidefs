@@ -324,7 +324,7 @@ boundaries relevant to TFR-005.
 | Local object store records       | `record_format_version`      | 1-3     | `format_manifest.rs`; `ON_DISK_FORMAT_VERSIONING_AND_COMPATIBILITY_POLICY.md` |
 | Pool labels                      | `version`                    | 1       | `POOL_IMPORT_EXPORT_DEVICE_TOPOLOGY_DESIGN.md`   |
 | Dataset feature flags            | per-dataset B-trees          | N/A     | `DATASET_FEATURE_FLAGS_DESIGN.md`                |
-| Committed roots / intent log     | version discriminant         | V1      | `TORN_COMMIT_RECOVERY_CONTRACT.md`               |
+| Committed roots / intent log     | version discriminant         | V1      | Source behavior plus TFR-005/TFR-008 review register |
 | Content dedup redirects          | `CONTENT_DEDUP_REDIRECT_FORMAT_VERSION` | 1 | `encoding.rs` constants                        |
 
 ### 4.2 Version Bump Rules

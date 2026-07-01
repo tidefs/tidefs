@@ -21,7 +21,8 @@ rebake, reclaim, or send/receive behavior.
   by snapshot deadlists. The #638 statfs decision says those bytes are reported
   through dataset, snapshot, and operator views, not by reducing POSIX
   `statfs.f_bfree` or `statfs.f_bavail`.
-- `docs/SPACE_ACCOUNTING_MODEL_DESIGN.md`: `pinned_snapshot_bytes` is a
+- `crates/tidefs-space-accounting/` and
+  `crates/tidefs-types-space-accounting-core/`: `pinned_snapshot_bytes` is a
   classification of bytes already covered by `logical_used_bytes`, not an
   additional `logical_alloc_bytes` addend. `snapshot_reserve_bytes` is a policy
   reservation and pressure signal, not a second statfs subtraction.

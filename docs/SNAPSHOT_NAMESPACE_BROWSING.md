@@ -37,9 +37,10 @@ snapshot browsing support.
   operator UAPI.
 - `docs/FUSE_ADAPTER_CONTRACT_ASSUMPTIONS.md` — FUSE adapter as an environment
   boundary, not a filesystem-semantics authority.
-- `docs/VFS_ENGINE_API_CONTRACT.md` — inode-space operations, lookup(parent,
-  name) -> InodeAttr, generation tracking for ESTALE, and the contract that
-  InodeId, InodeAttr, and Generation are the canonical VFS vocabulary.
+- `crates/tidefs-vfs-engine/` and `tidefs-types-vfs-core` — inode-space
+  operations, lookup(parent, name) -> InodeAttr, generation tracking for
+  ESTALE, and the contract that InodeId, InodeAttr, and Generation are the
+  canonical VFS vocabulary.
 - `docs/design/posix-acl-xattr-codec-and-evaluation-design.md` — ACL evaluation
   against caller credentials,
   mode-ACL synchronisation, and default-ACL inheritance.

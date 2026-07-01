@@ -11,7 +11,8 @@
 //! obligation ledgers, reclaim, persistent store authority, and distributed
 //! capacity behavior still have separate closure work.
 //!
-//! Implements the runtime from [`docs/SPACE_ACCOUNTING_MODEL_DESIGN.md`].
+//! This crate is the source-owned runtime reduction for the current space
+//! accounting model.
 //!
 //! # Comparison to ZFS / Ceph
 //!
@@ -1441,8 +1442,8 @@ impl Default for CleanerWatermarks {
 /// else                               → NoChange
 /// ```
 ///
-/// This implements §8.2 "Trigger algorithm" from
-/// `docs/SPACE_ACCOUNTING_MODEL_DESIGN.md`.
+/// This is the crate-local cleaner trigger algorithm used by the current
+/// space-accounting runtime.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CleanerScheduler {
     watermarks: CleanerWatermarks,
@@ -1861,8 +1862,7 @@ impl SnapshotSpaceManager {
 ///
 /// Tracks aggregated [`SpaceDomainCounters`] per [`SpaceDomainId`], enabling
 /// domain-level `statfs` for clone families where multiple datasets share a
-/// single accounting domain.  Implements Phase 2 (domain-scoped accounting)
-/// of [`docs/SPACE_ACCOUNTING_MODEL_DESIGN.md`].
+/// single accounting domain.
 ///
 /// # Domain lifecycle
 ///

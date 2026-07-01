@@ -4,8 +4,8 @@
 
 //! Authority type definitions for the space accounting model.
 //!
-//! Implements the logical vs physical space accounting design from
-//! [`docs/SPACE_ACCOUNTING_MODEL_DESIGN.md`] with six core types:
+//! Implements the source-owned logical vs physical space accounting type model
+//! with six core types:
 //!
 //! - [`DatasetSpaceCountersV1`] — per-dataset logical space counters
 //! - [`SpaceDelta`] — per-operation delta accumulator, committed atomically
@@ -29,10 +29,6 @@
 //!   distinguish logical from physical space or track snapshot-pinned bytes
 //!   separately.  This design provides per-dataset granularity with
 //!   SpaceDomainId for correct clone-family statfs.
-//!
-//! [`docs/SPACE_ACCOUNTING_MODEL_DESIGN.md`]:
-//!     https://forgejo/forgeadmin/tidefs/docs/SPACE_ACCOUNTING_MODEL_DESIGN.md
-
 #[cfg(all(not(test), feature = "alloc"))]
 use alloc::vec::Vec;
 use core::fmt;

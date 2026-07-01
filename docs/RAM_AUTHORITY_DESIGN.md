@@ -64,8 +64,8 @@ canonical storage-intent authority on the default branch.
 - `docs/TRANSPORT_CLUSTER_AUTHORITY.md`: transport owns session-local mechanics
   and evidence, while membership/runtime own roster, epoch, and fencing
   decisions.
-- `docs/UNIFIED_RESOURCE_GOVERNOR_DESIGN.md`: daemon memory must be admitted
-  and explained through one budget authority rather than hidden per-subsystem
+- source-owned governor and admission paths: daemon memory must be admitted and
+  explained through one budget authority rather than hidden per-subsystem
   buffers.
 
 The required `~/ai/docs` searches found no additional RAM-authority-specific

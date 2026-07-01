@@ -8,7 +8,7 @@
 //! This is the first integration slice: admission/release with per-category
 //! watermarks, backpressure signals, and one wired cache admission path.
 //! Full 6-level migration and cluster backpressure are deferred to follow-up
-//! slices (see `docs/UNIFIED_RESOURCE_GOVERNOR_DESIGN.md`).
+//! slices owned by the storage-intent policy and review register.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -57,9 +57,9 @@ impl fmt::Display for BudgetCategory {
 
 /// Concrete cache level whose allocations must be charged to the governor.
 ///
-/// This is the centralized cache-level-to-budget-category mapping from
-/// `docs/UNIFIED_RESOURCE_GOVERNOR_DESIGN.md`.  Concrete cache callers use
-/// these variants instead of selecting budget categories from local strings.
+/// This is the centralized source-owned cache-level-to-budget-category mapping.
+/// Concrete cache callers use these variants instead of selecting budget
+/// categories from local strings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CacheBudgetLevel {
     /// L1 hot read cache: frequently-read payload bytes.

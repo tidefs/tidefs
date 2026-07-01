@@ -68,8 +68,8 @@ impl PageType {
 
 /// Concrete page metadata reader for compaction scanning.
 ///
-/// Formerly a trait; converted to a concrete struct per
-/// DESIGN_OVERFITTING_POLICY.md §5.
+/// Formerly a trait; converted to a concrete struct because this path only
+/// needs a local page-reader value.
 pub struct PageReader {
     /// Page type this reader handles.
     pub page_type: PageType,
@@ -113,8 +113,8 @@ impl PageReader {
 
 /// Concrete page merger for compaction.
 ///
-/// Formerly a trait; converted to a concrete struct per
-/// DESIGN_OVERFITTING_POLICY.md §5.
+/// Formerly a trait; converted to a concrete struct because this path only
+/// needs a local page-merger value.
 pub struct PageMerger {
     /// Page type this merger handles.
     pub page_type: PageType,
