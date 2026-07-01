@@ -2159,6 +2159,7 @@ pub fn finalize_prefetch_execution(
         || terminal_update_lacks_degraded_visibility_evidence(record, update)
         || terminal_update_lacks_interruption_evidence(record, update)
         || terminal_update_has_inconsistent_interruption(update)
+        || terminal_update_has_inconsistent_handoff_target(update)
         || terminal_update_lacks_handoff_boundary_evidence(record, update)
         || terminal_update_lacks_started_dispatch_evidence(record, update)
         || terminal_result_detail_lacks_charge_evidence(record, update)
@@ -2514,6 +2515,11 @@ fn terminal_update_lacks_handoff_boundary_evidence(
             record.evidence_refs.relocation_boundary_ref,
             StorageIntentEvidenceKind::RelocationReceipt,
         )
+}
+
+fn terminal_update_has_inconsistent_handoff_target(update: PrefetchExecutorTerminalUpdate) -> bool {
+    update.handoff_target != PrefetchExecutorHandoffTarget::None
+        && update.outcome != PrefetchExecutorOutcome::HandoffRequired
 }
 
 fn terminal_update_lacks_started_dispatch_evidence(
@@ -6982,6 +6988,42 @@ mod tests {
         assert!(completed.result_detail.has_feedback_evidence_roots());
         assert!(completed.is_non_authority_population());
         assert_record_has_no_authority_claims(completed);
+    }
+
+    #[test]
+    fn terminal_update_rejects_handoff_target_without_handoff_outcome() {
+        let detail = terminal_detail();
+        let started = evaluate_prefetch_execution(admitted_charged_input(
+            PrefetchResidencyCandidateClass::BoundedReadahead,
+            detail,
+        ));
+        assert_eq!(started.outcome, PrefetchExecutorOutcome::Started);
+
+        let rejected = finalize_prefetch_execution(
+            started,
+            PrefetchExecutorTerminalUpdate {
+                outcome: PrefetchExecutorOutcome::Completed,
+                result_detail: detail,
+                handoff_target: PrefetchExecutorHandoffTarget::Promotion,
+                evidence_cut: terminal_evidence_cut(started, detail, EMPTY_EVIDENCE_REF),
+                ..PrefetchExecutorTerminalUpdate::default()
+            },
+        );
+
+        assert_eq!(
+            rejected.outcome,
+            PrefetchExecutorOutcome::VerificationFailed
+        );
+        assert_eq!(
+            rejected.refusal,
+            StorageIntentRefusalReason::ValidationGateFailed
+        );
+        assert_eq!(
+            rejected.executor_byte_state,
+            PrefetchExecutorByteState::Refused
+        );
+        assert_eq!(rejected.handoff_target, PrefetchExecutorHandoffTarget::None);
+        assert_record_has_no_authority_claims(rejected);
     }
 
     #[test]
