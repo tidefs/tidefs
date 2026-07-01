@@ -306,7 +306,7 @@ The response-envelope family therefore needs stable security result classes such
 
 This document closes `P9-02`, but it does **not** close:
 - `P9-03` upgrade/failover/cutover operator runbooks,
-- or `P10-02` fault injection / chaos / corruption campaigns.
+- or typed fault-injection, chaos, and corruption validation.
 
 The adjacent `P9-04` secret and policy-storage law is now explicit in `docs/SECRETS_POLICY_STORAGE_KEY_HANDLING_LAW_P9-04.md`.
 The boundary is deliberate:

@@ -61,10 +61,10 @@ subsequent authority-register classification promotes that exact scope.
 Validation and evidence documents help reviewers interpret work, but they are
 not whole-product verdicts. `docs/GITHUB_CI.md` describes CI behavior.
 `docs/CLAIMS_GATE_POLICY.md` guards publishing-facing claim wording.
-`docs/RELEASE_CANDIDATE_EVIDENCE_CONTRACT.md` and
-`docs/PERFORMANCE_BUDGETS_SLO_REGRESSION_GATES_P10-03.md` describe evidence
-inputs and gate-local receipts. `docs/RELEASE_READINESS_VERDICT_CONTRACT.md`
-owns the whole-product verdict boundary.
+`docs/RELEASE_CANDIDATE_EVIDENCE_CONTRACT.md` describes evidence inputs.
+`crates/tidefs-validation/src/performance_gate/` owns performance-gate-local
+receipts. `docs/RELEASE_READINESS_VERDICT_CONTRACT.md` owns the whole-product
+verdict boundary.
 
 Until that verdict boundary records a decision, book text must keep the
 pre-alpha maturity boundary visible and treat CI artifacts, evidence indexes,

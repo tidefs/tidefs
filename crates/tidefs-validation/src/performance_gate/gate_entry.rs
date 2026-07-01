@@ -72,7 +72,7 @@ pub enum RowStatus {
     Pending,
 }
 /// Absolute numeric budget thresholds per row.
-/// Derived from P10-03 section 4.4 budget classes.
+/// Derived from the source-backed performance budget matrix classes.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NumericBudget {
     /// Minimum throughput floor in MiB/s. 0.0 means not enforced.

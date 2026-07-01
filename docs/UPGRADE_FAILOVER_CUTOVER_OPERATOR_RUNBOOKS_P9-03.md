@@ -8,7 +8,8 @@ It answers the question:
 
 See also:
 - `docs/AUTHN_AUTHZ_OVERRIDE_AUDIT_MODEL_P9-02.md`
-- `docs/FAULT_INJECTION_CHAOS_CORRUPTION_CAMPAIGNS_P10-02.md`
+- `crates/tidefs-local-object-store/src/fault_catalog.rs`
+- `crates/tidefs-validation/src/fault_injection_scenario_catalog.rs`
 - `docs/CHECKPOINT_SNAPSHOT_REPLAY_CURSOR_PERSISTENCE_LAW_P2-05.md`
 - `docs/FORMAT_IDENTITY_UPGRADE_REPLAY_CONTINUITY_LAW_P2-04.md`
 - `docs/REPLICATION_REBUILD_RELOCATION_DATA_FLOWS_P8-03.md`
@@ -353,11 +354,11 @@ But the grounding rule is now explicit:
 
 ## 9. Boundary with remaining unresolved production items
 
-The adjacent `P9-04` secret and policy-storage law is now explicit in `docs/SECRETS_POLICY_STORAGE_KEY_HANDLING_LAW_P9-04.md`, the shared numeric KPI/SLO law is now explicit in `docs/PERFORMANCE_BUDGETS_SLO_REGRESSION_GATES_P10-03.md`, and the operator truth-surface law is now explicit in `docs/DASHBOARDS_TRACES_OPERATOR_TRUTH_SURFACES_P10-04.md` (missing from the repository; see #1270).
+The adjacent `P9-04` secret and policy-storage law is now explicit in `docs/SECRETS_POLICY_STORAGE_KEY_HANDLING_LAW_P9-04.md`, source-backed performance-gate behavior lives under `crates/tidefs-validation/src/performance_gate/`, and the operator truth-surface law is now explicit in `docs/DASHBOARDS_TRACES_OPERATOR_TRUTH_SURFACES_P10-04.md` (missing from the repository; see #1270).
 The boundary is deliberate:
 - `P9-03` fixes how operators execute a move,
 - `P9-04` now fixes where long-lived secret material lives, how runtime leases work, and how secret material rotates or revokes,
-- `P10-03` now adds numeric floors to the same gates,
+- source-backed performance-gate rows add numeric floors to the same gates,
 - `P10-04` is now explicit in `docs/DASHBOARDS_TRACES_OPERATOR_TRUTH_SURFACES_P10-04.md` (missing from the repository; see #1270) and renders these results through shared `truth_view` truth surfaces and render receipts,
 - future kernel-side runbook helpers must obey the current kernel residency and
   preview UAPI boundaries,

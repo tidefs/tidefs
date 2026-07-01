@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
-//! Typed fault and corruption catalog (P10-02 Section 4).
+//! Typed fault and corruption catalog.
 //!
 //! This module defines the canonical set of fault classes, hook bindings,
 //! campaign schedule templates, and seed/replay manifests required by the
 //! production fault-injection law. It replaces ad hoc fault injection
 //! parameters with a typed, reproducible catalog.
 //!
-//! # Anti-regression rule (P10-02 Section 11)
+//! # Anti-regression rule
 //!
 //! No ad hoc chaos result without a typed fault catalog, hook binding, and
 //! seed/schedule manifest.
@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 // ---------------------------------------------------------------------------
-// Transport and link fault classes (P10-02 Section 4.1)
+// Transport and link fault classes.
 // ---------------------------------------------------------------------------
 
 /// Transport/link fault classes for distributed and shadow-pair rows.
@@ -56,7 +56,7 @@ impl fmt::Display for TransportFaultClass {
 }
 
 // ---------------------------------------------------------------------------
-// Process and runtime fault classes (P10-02 Section 4.2)
+// Process and runtime fault classes.
 // ---------------------------------------------------------------------------
 
 /// Process/runtime fault classes for nodes, authorities, and workers.
@@ -93,7 +93,7 @@ impl fmt::Display for ProcessFaultClass {
 }
 
 // ---------------------------------------------------------------------------
-// Storage media and corruption classes (P10-02 Section 4.3)
+// Storage media and corruption classes.
 // ---------------------------------------------------------------------------
 
 /// Storage-media and corruption fault classes.
@@ -139,7 +139,7 @@ impl fmt::Display for StorageFaultClass {
 }
 
 // ---------------------------------------------------------------------------
-// Time and clock fault classes (P10-02 Section 4.4)
+// Time and clock fault classes.
 // ---------------------------------------------------------------------------
 
 /// Time/clock fault classes for drift, heartbeat, and lease scenarios.
@@ -173,7 +173,7 @@ impl fmt::Display for TimeFaultClass {
 }
 
 // ---------------------------------------------------------------------------
-// Resource pressure fault classes (P10-02 Section 4.5)
+// Resource pressure fault classes.
 // ---------------------------------------------------------------------------
 
 /// Resource pressure fault classes.
@@ -207,7 +207,7 @@ impl fmt::Display for ResourceFaultClass {
 }
 
 // ---------------------------------------------------------------------------
-// Operator surface fault classes (P10-02 Section 5.1, hook 6)
+// Operator surface fault classes.
 // ---------------------------------------------------------------------------
 
 /// Operator surface interruption fault classes.
@@ -241,12 +241,12 @@ impl fmt::Display for OperatorFaultClass {
 }
 
 // ---------------------------------------------------------------------------
-// Combined fault class enum (P10-02 Section 4)
+// Combined fault class enum.
 // ---------------------------------------------------------------------------
 
 /// Canonical fault class — the union of all typed fault families.
 ///
-/// This enum carries the 22 fault classes required by P10-02:
+/// This enum carries the typed fault classes required for validation scenarios:
 /// 6 transport, 5 process, 8 storage, 4 time, 4 resource, 4 operator = 31 total.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum FaultClass {
@@ -308,7 +308,7 @@ impl fmt::Display for FaultClass {
 }
 
 // ---------------------------------------------------------------------------
-// Fault family (P10-02 Section 3.2, 4)
+// Fault family.
 // ---------------------------------------------------------------------------
 
 /// Top-level fault family grouping.
@@ -337,7 +337,7 @@ impl FaultFamily {
 }
 
 // ---------------------------------------------------------------------------
-// Campaign depth classes (P10-02 Section 6.1)
+// Campaign depth classes.
 // ---------------------------------------------------------------------------
 
 /// Campaign depth — controls how many concurrent faults may be active.
@@ -387,7 +387,7 @@ pub struct FaultScheduleEntry {
 }
 
 // ---------------------------------------------------------------------------
-// Fault schedule (P10-02 Section 6.2)
+// Fault schedule.
 // ---------------------------------------------------------------------------
 
 /// A fault campaign schedule — ordered list of fault injection steps.
@@ -437,7 +437,7 @@ pub enum ScheduleStopCondition {
 }
 
 // ---------------------------------------------------------------------------
-// Hook binding (P10-02 Section 5.2)
+// Hook binding.
 // ---------------------------------------------------------------------------
 
 /// A hook binding declares how a fault class is injected into a subject.
@@ -471,7 +471,7 @@ pub enum ReplayabilityClass {
 }
 
 // ---------------------------------------------------------------------------
-// Fault manifest (P10-02 Section 1, anti-regression rule)
+// Fault manifest.
 // ---------------------------------------------------------------------------
 
 /// A fault campaign manifest — the canonical record of a chaos run.
@@ -560,7 +560,7 @@ mod tests {
             + time.len()
             + resource.len()
             + operator.len();
-        // P10-02 requires 18+ fault classes
+        // Preserve enough typed classes to keep scenario rows meaningful.
         assert!(total >= 18, "fault catalog has {total} classes, need >= 18");
     }
 
@@ -647,7 +647,7 @@ mod tests {
 
         let manifest = FaultManifest {
             row_id: "test-row-001".into(),
-            fault_catalog_ref: "P10-02".into(),
+            fault_catalog_ref: "tidefs-local-object-store.fault_catalog.v1".into(),
             hook_binding_ref: "hook.cutover_control_0.runtime.subject_lifecycle".into(),
             schedule,
             expected_outcomes: vec!["restart_recovery".into()],

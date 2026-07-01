@@ -41,7 +41,7 @@ pub struct FaultInjectionScenario {
     pub description: String,
     /// TideFS subsystem(s) affected.
     pub subsystem: Vec<Subsystem>,
-    /// Fault class reference(s) from the P10-02 fault catalog (by label string).
+    /// Fault class reference(s) from the typed fault catalog (by label string).
     pub fault_classes: Vec<String>,
     /// Crash injection point(s) from CrashInjectionPoint (by label string).
     pub crash_injection_points: Vec<String>,
