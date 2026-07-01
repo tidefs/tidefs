@@ -41,6 +41,8 @@
 //! cross-node snapshot import validation.
 
 use std::collections::BTreeMap;
+use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::protocol::{encode, Frame};
@@ -51,6 +53,13 @@ use crate::protocol::{encode, Frame};
 
 /// Monotonic barrier identifier assigned by the coordinator.
 pub type BarrierId = u64;
+
+static NEXT_BARRIER_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Allocate a process-local monotonic barrier id for coordinator-initiated rounds.
+pub fn allocate_barrier_id() -> BarrierId {
+    NEXT_BARRIER_ID.fetch_add(1, Ordering::SeqCst)
+}
 
 // ---------------------------------------------------------------------------
 // SnapshotBarrierConfig
@@ -179,6 +188,109 @@ pub enum BarrierOutcome {
         max_txg: u64,
         responses: BTreeMap<u64, BarrierResponse>,
     },
+}
+
+/// Successful pre-send snapshot barrier summary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SnapshotBarrierSendReport {
+    pub barrier_id: BarrierId,
+    pub peer_count: usize,
+    pub min_txg: u64,
+    pub max_txg: u64,
+    pub total_objects: u64,
+}
+
+/// Pre-send barrier failure that must abort VFSSEND2 transfer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SnapshotBarrierSendError {
+    AlreadyActive {
+        barrier_id: BarrierId,
+    },
+    SendFailed {
+        barrier_id: BarrierId,
+        peer_id: u64,
+        reason: String,
+    },
+    Timeout {
+        barrier_id: BarrierId,
+        responded: Vec<u64>,
+        missing: Vec<u64>,
+    },
+    Inconsistent {
+        barrier_id: BarrierId,
+        min_txg: u64,
+        max_txg: u64,
+    },
+}
+
+impl fmt::Display for SnapshotBarrierSendError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AlreadyActive { barrier_id } => write!(
+                f,
+                "barrier {barrier_id} refused because another barrier is already active"
+            ),
+            Self::SendFailed {
+                barrier_id,
+                peer_id,
+                reason,
+            } => write!(
+                f,
+                "barrier {barrier_id} send to peer {peer_id} failed: {reason}"
+            ),
+            Self::Timeout {
+                barrier_id,
+                responded,
+                missing,
+            } => write!(
+                f,
+                "barrier {barrier_id} timed out; responded={responded:?} missing={missing:?}"
+            ),
+            Self::Inconsistent {
+                barrier_id,
+                min_txg,
+                max_txg,
+            } => write!(
+                f,
+                "barrier {barrier_id} inconsistent committed-root txg range {min_txg}..{max_txg}"
+            ),
+        }
+    }
+}
+
+/// Convert a completed barrier outcome into the mandatory pre-send gate result.
+pub fn snapshot_barrier_send_report(
+    barrier_id: BarrierId,
+    outcome: BarrierOutcome,
+) -> Result<SnapshotBarrierSendReport, SnapshotBarrierSendError> {
+    match outcome {
+        BarrierOutcome::Consistent {
+            min_txg,
+            max_txg,
+            total_objects,
+            responses,
+        } => Ok(SnapshotBarrierSendReport {
+            barrier_id,
+            peer_count: responses.len(),
+            min_txg,
+            max_txg,
+            total_objects,
+        }),
+        BarrierOutcome::Timeout { responded, missing } => {
+            Err(SnapshotBarrierSendError::Timeout {
+                barrier_id,
+                responded,
+                missing,
+            })
+        }
+        BarrierOutcome::Inconsistent {
+            min_txg, max_txg, ..
+        } => Err(SnapshotBarrierSendError::Inconsistent {
+            barrier_id,
+            min_txg,
+            max_txg,
+        }),
+    }
 }
 
 impl BarrierCollector {
@@ -484,8 +596,6 @@ pub trait BarrierStore {
 // ---------------------------------------------------------------------------
 // BarrierState — peer-side barrier round tracking
 // ---------------------------------------------------------------------------
-
-use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Per-server state for snapshot barrier rounds.
 ///
@@ -1064,5 +1174,72 @@ mod tests {
             }
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    #[test]
+    fn snapshot_barrier_send_report_accepts_consistent_outcome() {
+        let responses = BTreeMap::from([
+            (
+                2,
+                BarrierResponse {
+                    peer_id: 2,
+                    barrier_id: 7,
+                    committed_root_txg: 41,
+                    committed_root_generation: 5,
+                    object_count: 10,
+                    received_at: Instant::now(),
+                },
+            ),
+            (
+                3,
+                BarrierResponse {
+                    peer_id: 3,
+                    barrier_id: 7,
+                    committed_root_txg: 42,
+                    committed_root_generation: 6,
+                    object_count: 12,
+                    received_at: Instant::now(),
+                },
+            ),
+        ]);
+
+        let report = snapshot_barrier_send_report(
+            7,
+            BarrierOutcome::Consistent {
+                min_txg: 41,
+                max_txg: 42,
+                total_objects: 22,
+                responses,
+            },
+        )
+        .expect("consistent barrier admits send");
+
+        assert_eq!(report.barrier_id, 7);
+        assert_eq!(report.peer_count, 2);
+        assert_eq!(report.min_txg, 41);
+        assert_eq!(report.max_txg, 42);
+        assert_eq!(report.total_objects, 22);
+    }
+
+    #[test]
+    fn snapshot_barrier_send_report_rejects_timeout() {
+        let err = snapshot_barrier_send_report(
+            8,
+            BarrierOutcome::Timeout {
+                responded: vec![2],
+                missing: vec![3],
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            SnapshotBarrierSendError::Timeout {
+                barrier_id: 8,
+                responded: vec![2],
+                missing: vec![3],
+            }
+        );
+        assert!(err.to_string().contains("timed out"));
     }
 }
