@@ -5,11 +5,13 @@
 //! the transport peer against VFS_RPC credentials, checks the writer lease for
 //! operations that can mutate writer-local state, resolves transferable
 //! handles, dispatches inline operations through [`VfsDispatch`], and encodes a
-//! typed [`VfsRpcResponse`]. BULK descriptors remain explicitly unsupported
-//! until the BULK handoff lands.
+//! typed [`VfsRpcResponse`]. BULK WRITE bytes may only enter the engine through
+//! a DONE-verified BULK completion, and READ bulk responses only format a
+//! descriptor that the transport/BULK runtime has already admitted.
 
 use std::collections::BTreeMap;
 
+use tidefs_bulk_service::{VfsRpcBulkCompletion, VfsRpcBulkDescriptor, VfsRpcBulkHandoff};
 use tidefs_types_vfs_core::{
     EngineDirHandle, EngineFileHandle, Errno, Generation, InodeAttr, InodeId, LockSpec, RequestCtx,
     SetAttr, StatFs, FATTR_SIZE, F_RDLCK, F_WRLCK, SEEK_SET,
@@ -21,7 +23,7 @@ use crate::{
     DatasetId, InlineOrBulk, PeerId, VfsRpcCredentials, VfsRpcDedupWindow, VfsRpcError,
     VfsRpcHandle, VfsRpcHandleType, VfsRpcRequest, VfsRpcRequestPayload, VfsRpcResponse,
     VfsRpcResponsePayload, VfsRpcStats, DEFAULT_INLINE_THRESHOLD, REQ_FLAG_BULK_PENDING,
-    REQ_FLAG_NO_DEDUP,
+    REQ_FLAG_NO_DEDUP, RESP_FLAG_BULK,
 };
 
 /// Errno returned for VFS_RPC methods that are valid on the wire but not
@@ -160,6 +162,70 @@ impl VfsEngineBridge {
             self.dedup.insert(peer, response.clone());
         }
         Ok(response)
+    }
+
+    /// Forward a WRITE whose bytes were verified by BULK DONE.
+    ///
+    /// Failed, aborted, timed-out, or descriptor-only transfers must never call
+    /// this path; they continue to use the normal fail-closed response path and
+    /// are not inserted into the dedup cache as success.
+    pub fn dispatch_done_verified_write(
+        &mut self,
+        peer: PeerId,
+        request: &VfsRpcRequest,
+        completion: VfsRpcBulkCompletion,
+        target: &VfsEngineDispatchTarget,
+    ) -> Result<VfsRpcResponse, VfsRpcError> {
+        let (handle, offset, token, len) = match &request.payload {
+            VfsRpcRequestPayload::Write {
+                handle,
+                offset,
+                data: InlineOrBulk::Bulk { token, len },
+            } => (handle.clone(), *offset, *token, *len),
+            _ => return error_response(request, Errno::EPROTO),
+        };
+        if request.header.flags & REQ_FLAG_BULK_PENDING == 0
+            || completion.handoff != VfsRpcBulkHandoff::WriteUpload
+            || completion.op_id != request.header.op_id.0
+            || completion.token != token
+            || completion.len != len
+        {
+            return error_response(request, Errno::EPROTO);
+        }
+
+        let inline_request = VfsRpcRequest::new(
+            request.header.op_id,
+            request.header.term,
+            request.header.epoch,
+            request.header.flags & !REQ_FLAG_BULK_PENDING,
+            VfsRpcRequestPayload::Write {
+                handle,
+                offset,
+                data: InlineOrBulk::Inline(completion.bytes),
+            },
+            request.credentials.clone(),
+        )?;
+        self.dispatch(peer, &inline_request, target)
+    }
+
+    /// Format a READ response around a BULK descriptor already admitted on the
+    /// same transport session.
+    pub fn read_bulk_response(
+        request: &VfsRpcRequest,
+        descriptor: VfsRpcBulkDescriptor,
+    ) -> Result<VfsRpcResponse, VfsRpcError> {
+        if !matches!(request.payload, VfsRpcRequestPayload::Read { .. }) {
+            return error_response(request, Errno::EPROTO);
+        }
+        VfsRpcResponse::ok(
+            request.header.op_id,
+            request.header.method,
+            RESP_FLAG_BULK,
+            VfsRpcResponsePayload::Data(InlineOrBulk::Bulk {
+                token: descriptor.token,
+                len: descriptor.len,
+            }),
+        )
     }
 
     fn forward_payload(
@@ -1584,6 +1650,90 @@ mod tests {
 
         assert_eq!(response.header.errno, Errno::EOPNOTSUPP);
         assert!(target.writes.borrow().is_empty());
+    }
+
+    #[test]
+    fn done_verified_bulk_write_reaches_engine_once() {
+        let mut bridge = bridge();
+        let target = RecordingDispatch::new();
+        let handle = create_handle(&mut bridge, &target);
+        let token = [8; 32];
+        let bulk = request(
+            2,
+            REQ_FLAG_BULK_PENDING,
+            VfsRpcRequestPayload::Write {
+                handle,
+                offset: 7,
+                data: InlineOrBulk::Bulk { token, len: 3 },
+            },
+        );
+        let completion = VfsRpcBulkCompletion {
+            connection_id: 33,
+            stream_id: 11,
+            token,
+            op_id: 2,
+            handoff: VfsRpcBulkHandoff::WriteUpload,
+            len: 3,
+            bytes: b"abc".to_vec(),
+        };
+
+        let response = bridge
+            .dispatch_done_verified_write(PEER, &bulk, completion, &target)
+            .unwrap();
+        let replay = bridge
+            .dispatch_done_verified_write(
+                PEER,
+                &bulk,
+                VfsRpcBulkCompletion {
+                    connection_id: 33,
+                    stream_id: 11,
+                    token,
+                    op_id: 2,
+                    handoff: VfsRpcBulkHandoff::WriteUpload,
+                    len: 3,
+                    bytes: b"abc".to_vec(),
+                },
+                &target,
+            )
+            .unwrap();
+
+        assert_eq!(response.payload, VfsRpcResponsePayload::BytesWritten(3));
+        assert_eq!(
+            replay.header.flags & RESP_FLAG_DEDUP_REPLAY,
+            RESP_FLAG_DEDUP_REPLAY
+        );
+        assert_eq!(target.writes.borrow().as_slice(), &[b"abc".to_vec()]);
+    }
+
+    #[test]
+    fn read_bulk_response_formats_descriptor_and_flag() {
+        let mut bridge = bridge();
+        let target = RecordingDispatch::new();
+        let handle = create_handle(&mut bridge, &target);
+        let read = request(
+            3,
+            0,
+            VfsRpcRequestPayload::Read {
+                handle,
+                offset: 0,
+                length: 8192,
+            },
+        );
+        let descriptor = VfsRpcBulkDescriptor {
+            token: [9; 32],
+            len: 8192,
+        };
+
+        let response = VfsEngineBridge::read_bulk_response(&read, descriptor).unwrap();
+
+        assert_eq!(response.header.flags & RESP_FLAG_BULK, RESP_FLAG_BULK);
+        assert_eq!(
+            response.payload,
+            VfsRpcResponsePayload::Data(InlineOrBulk::Bulk {
+                token: descriptor.token,
+                len: descriptor.len,
+            })
+        );
     }
 
     #[test]

@@ -2,13 +2,19 @@
 //! VFS_RPC control/inline adapter for the TideFS transport envelope.
 //!
 //! This module binds the existing VFS_RPC service frame surface to the
-//! transport CONTROL path. It does not dispatch to a VFS engine and it rejects
-//! BULK descriptors until the dedicated BULK handoff lands.
+//! transport CONTROL path. It does not dispatch to a VFS engine; when callers
+//! supply the same-session BULK service state, it admits VFS_RPC BULK
+//! descriptors against active service `0x07` transfers and keeps them pending
+//! until DONE, ABORT, or timeout retirement.
 
 use std::collections::BTreeMap;
 use std::fmt;
 use std::time::{Duration, Instant};
 
+use tidefs_bulk_service::{
+    BulkService, BulkToken, ConnectionId, VfsRpcBulkAbort, VfsRpcBulkAdmission,
+    VfsRpcBulkCompletion, VfsRpcBulkDescriptor, VfsRpcBulkHandoff, VfsRpcBulkHandoffError,
+};
 use tidefs_transport::{
     ConnectionBounds, ControlServiceFrame, EndpointFamily, LaneClass, MessageFamily, SessionHealth,
     SessionId, TransportCohortId, TransportEnvelope, TransportError, TransportSessionSet,
@@ -112,6 +118,7 @@ pub struct VfsRpcTimeoutSignal {
     pub op_id: OpId,
     pub method: crate::VfsRpcMethod,
     pub timeout: Duration,
+    pub bulk: Option<VfsRpcBulkAdmissionRecord>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -130,12 +137,63 @@ struct PendingTransportKey {
     op_id: OpId,
 }
 
+/// Same-session BULK descriptor admitted by the VFS_RPC transport adapter.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VfsRpcBulkAdmissionRecord {
+    pub peer: PeerId,
+    pub session_id: SessionId,
+    pub connection_id: ConnectionId,
+    pub stream_id: tidefs_bulk_service::StreamId,
+    pub token: BulkToken,
+    pub op_id: OpId,
+    pub method: crate::VfsRpcMethod,
+    pub direction: VfsRpcFrameDirection,
+    pub handoff: VfsRpcBulkHandoff,
+    pub len: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct PendingBulkKey {
+    connection_id: ConnectionId,
+    token: BulkToken,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PendingBulkAdmission {
+    peer: PeerId,
+    session_id: SessionId,
+    op_id: OpId,
+    method: crate::VfsRpcMethod,
+    direction: VfsRpcFrameDirection,
+    handoff: VfsRpcBulkHandoff,
+    len: u64,
+    stream_id: tidefs_bulk_service::StreamId,
+}
+
+impl PendingBulkAdmission {
+    fn as_record(self, connection_id: ConnectionId, token: BulkToken) -> VfsRpcBulkAdmissionRecord {
+        VfsRpcBulkAdmissionRecord {
+            peer: self.peer,
+            session_id: self.session_id,
+            connection_id,
+            stream_id: self.stream_id,
+            token,
+            op_id: self.op_id,
+            method: self.method,
+            direction: self.direction,
+            handoff: self.handoff,
+            len: self.len,
+        }
+    }
+}
+
 /// VFS_RPC transport-envelope adapter.
 #[derive(Clone, Debug)]
 pub struct VfsRpcTransportAdapter {
     config: VfsRpcTransportAdapterConfig,
     sessions: TransportSessionSet,
     pending: BTreeMap<PendingTransportKey, PendingTransportRequest>,
+    pending_bulk: BTreeMap<PendingBulkKey, PendingBulkAdmission>,
 }
 
 impl VfsRpcTransportAdapter {
@@ -145,6 +203,7 @@ impl VfsRpcTransportAdapter {
             config,
             sessions,
             pending: BTreeMap::new(),
+            pending_bulk: BTreeMap::new(),
         }
     }
 
@@ -168,6 +227,11 @@ impl VfsRpcTransportAdapter {
         self.pending.len()
     }
 
+    #[must_use]
+    pub fn pending_bulk_len(&self) -> usize {
+        self.pending_bulk.len()
+    }
+
     /// Wrap an outbound request and record its `op_id` for response correlation.
     pub fn begin_request(
         &mut self,
@@ -179,6 +243,42 @@ impl VfsRpcTransportAdapter {
         reject_request_bulk(request)?;
         let session_id = self.healthy_session_for(peer)?;
         let outbound = self.wrap_request_for_session(peer, session_id, request, context)?;
+        let key = PendingTransportKey {
+            peer,
+            op_id: request.header.op_id,
+        };
+        self.pending.insert(
+            key,
+            PendingTransportRequest {
+                peer,
+                session_id,
+                method: request.header.method,
+                sent_at: now,
+                last_attempt_at: now,
+                retries: 0,
+            },
+        );
+        Ok(outbound)
+    }
+
+    /// Wrap an outbound request after admitting any BULK descriptor against
+    /// the same authenticated transport session.
+    pub fn begin_request_with_bulk(
+        &mut self,
+        peer: PeerId,
+        request: &VfsRpcRequest,
+        now: Instant,
+        context: VfsRpcEnvelopeContext,
+        bulk_service: &BulkService,
+    ) -> Result<VfsRpcOutboundFrame, VfsRpcTransportAdapterError> {
+        let session_id = self.healthy_session_for(peer)?;
+        let outbound = self.wrap_request_for_session_with_bulk(
+            peer,
+            session_id,
+            request,
+            context,
+            bulk_service,
+        )?;
         let key = PendingTransportKey {
             peer,
             op_id: request.header.op_id,
@@ -219,6 +319,30 @@ impl VfsRpcTransportAdapter {
         })
     }
 
+    /// Wrap an outbound request for a selected session and admit active BULK
+    /// descriptors against `bulk_service`.
+    pub fn wrap_request_for_session_with_bulk(
+        &mut self,
+        peer: PeerId,
+        session_id: SessionId,
+        request: &VfsRpcRequest,
+        context: VfsRpcEnvelopeContext,
+        bulk_service: &BulkService,
+    ) -> Result<VfsRpcOutboundFrame, VfsRpcTransportAdapterError> {
+        check_request_peer(peer, request)?;
+        self.admit_request_bulk(peer, session_id, request, bulk_service)?;
+        let frame = VfsRpcTransportFrame::from_request(request)?;
+        let payload = encode_control_service_frame(frame)?;
+        let envelope = self.envelope_for(session_id, context, payload.len())?;
+        Ok(VfsRpcOutboundFrame {
+            peer,
+            session_id,
+            op_id: request.header.op_id,
+            envelope,
+            payload,
+        })
+    }
+
     /// Wrap an outbound response for the control lane.
     pub fn wrap_response_for_session(
         &self,
@@ -228,6 +352,29 @@ impl VfsRpcTransportAdapter {
         context: VfsRpcEnvelopeContext,
     ) -> Result<VfsRpcOutboundFrame, VfsRpcTransportAdapterError> {
         reject_response_bulk(response)?;
+        let frame = VfsRpcTransportFrame::from_response(response)?;
+        let payload = encode_control_service_frame(frame)?;
+        let envelope = self.envelope_for(session_id, context, payload.len())?;
+        Ok(VfsRpcOutboundFrame {
+            peer,
+            session_id,
+            op_id: response.header.op_id,
+            envelope,
+            payload,
+        })
+    }
+
+    /// Wrap an outbound response and admit READ bulk descriptors against the
+    /// same session before exposing the descriptor to the peer.
+    pub fn wrap_response_for_session_with_bulk(
+        &mut self,
+        peer: PeerId,
+        session_id: SessionId,
+        response: &VfsRpcResponse,
+        context: VfsRpcEnvelopeContext,
+        bulk_service: &BulkService,
+    ) -> Result<VfsRpcOutboundFrame, VfsRpcTransportAdapterError> {
+        self.admit_response_bulk(peer, session_id, response, bulk_service, false)?;
         let frame = VfsRpcTransportFrame::from_response(response)?;
         let payload = encode_control_service_frame(frame)?;
         let envelope = self.envelope_for(session_id, context, payload.len())?;
@@ -281,10 +428,72 @@ impl VfsRpcTransportAdapter {
         }
     }
 
+    /// Decode an inbound frame and admit active BULK descriptors against the
+    /// same authenticated transport session.
+    pub fn unwrap_inbound_with_bulk(
+        &mut self,
+        now: Instant,
+        envelope: &TransportEnvelope,
+        payload: &[u8],
+        bulk_service: &BulkService,
+    ) -> Result<VfsRpcInboundFrame, VfsRpcTransportAdapterError> {
+        self.check_envelope(envelope, payload.len())?;
+        let peer = self.peer_for_session(envelope.session_id)?;
+        let service_frame = ControlServiceFrame::decode(payload)
+            .map_err(VfsRpcTransportAdapterError::ControlService)?;
+        let rpc_frame = VfsRpcTransportFrame {
+            service_id: service_frame.service_id,
+            message_type: service_frame.message_type,
+            body: service_frame.body,
+        };
+
+        match VfsRpcMessageKind::from_message_type(rpc_frame.message_type)? {
+            VfsRpcMessageKind::Request => {
+                let request = rpc_frame.decode_request()?;
+                check_request_peer(peer, &request)?;
+                self.admit_request_bulk(peer, envelope.session_id, &request, bulk_service)?;
+                Ok(VfsRpcInboundFrame::Request {
+                    peer,
+                    session_id: envelope.session_id,
+                    request,
+                })
+            }
+            VfsRpcMessageKind::Response => {
+                let response = rpc_frame.decode_response()?;
+                let has_bulk = self.admit_response_bulk(
+                    peer,
+                    envelope.session_id,
+                    &response,
+                    bulk_service,
+                    true,
+                )?;
+                if !has_bulk {
+                    self.complete_response(now, peer, envelope.session_id, &response)?;
+                }
+                Ok(VfsRpcInboundFrame::Response {
+                    peer,
+                    session_id: envelope.session_id,
+                    response,
+                })
+            }
+        }
+    }
+
     /// Mark retryable requests whose retry timer has elapsed.
     pub fn retry_due(&mut self, now: Instant) -> Vec<VfsRpcRetrySignal> {
+        let bulk_guarded: Vec<PendingTransportKey> = self
+            .pending
+            .iter()
+            .filter_map(|(key, pending)| {
+                self.bulk_admission_for_op(pending.peer, pending.session_id, key.op_id)
+                    .map(|_| *key)
+            })
+            .collect();
         let mut due = Vec::new();
         for (key, pending) in &mut self.pending {
+            if bulk_guarded.contains(key) {
+                continue;
+            }
             if now.saturating_duration_since(pending.last_attempt_at) >= self.config.retry_after {
                 pending.last_attempt_at = now;
                 pending.retries = pending.retries.saturating_add(1);
@@ -324,10 +533,58 @@ impl VfsRpcTransportAdapter {
                     op_id: key.op_id,
                     method: pending.method,
                     timeout: self.config.request_timeout,
+                    bulk: self.remove_bulk_admission_for_op(
+                        pending.peer,
+                        pending.session_id,
+                        key.op_id,
+                    ),
                 });
             }
         }
         signals
+    }
+
+    /// Retire a DONE-verified BULK handoff and, for READ bulk responses, only
+    /// then complete the original VFS_RPC response correlation.
+    pub fn complete_bulk_handoff(
+        &mut self,
+        completion: &VfsRpcBulkCompletion,
+    ) -> Result<VfsRpcBulkAdmissionRecord, VfsRpcTransportAdapterError> {
+        let record = self.remove_matching_bulk_admission(
+            completion.connection_id,
+            completion.token,
+            completion.op_id,
+            completion.handoff,
+            completion.len,
+        )?;
+        if record.direction == VfsRpcFrameDirection::Response {
+            self.pending.remove(&PendingTransportKey {
+                peer: record.peer,
+                op_id: record.op_id,
+            });
+        }
+        Ok(record)
+    }
+
+    /// Retire an ABORTed BULK handoff so retries must obtain a fresh token.
+    pub fn abort_bulk_handoff(
+        &mut self,
+        abort: &VfsRpcBulkAbort,
+    ) -> Result<VfsRpcBulkAdmissionRecord, VfsRpcTransportAdapterError> {
+        let record = self.remove_matching_bulk_admission(
+            abort.connection_id,
+            abort.token,
+            abort.op_id,
+            abort.handoff,
+            0,
+        )?;
+        if record.direction == VfsRpcFrameDirection::Response {
+            self.pending.remove(&PendingTransportKey {
+                peer: record.peer,
+                op_id: record.op_id,
+            });
+        }
+        Ok(record)
     }
 
     fn envelope_for(
@@ -441,7 +698,203 @@ impl VfsRpcTransportAdapter {
             ));
         }
         self.pending.remove(&key);
+        self.remove_bulk_admission_for_op(peer, session_id, response.header.op_id);
         Ok(())
+    }
+
+    fn admit_request_bulk(
+        &mut self,
+        peer: PeerId,
+        session_id: SessionId,
+        request: &VfsRpcRequest,
+        bulk_service: &BulkService,
+    ) -> Result<bool, VfsRpcTransportAdapterError> {
+        let descriptor = match request_bulk_descriptor(request)? {
+            Some(descriptor) => descriptor,
+            None => return Ok(false),
+        };
+        let connection_id = connection_id_for_session(session_id);
+        let admission = bulk_service
+            .admit_vfs_rpc_write_upload(connection_id, descriptor, request.header.op_id.0)
+            .map_err(|error| VfsRpcTransportAdapterError::BulkHandoff {
+                op_id: request.header.op_id,
+                method: request.header.method,
+                direction: VfsRpcFrameDirection::Request,
+                error,
+            })?;
+        self.record_bulk_admission(
+            peer,
+            session_id,
+            request.header.method,
+            VfsRpcFrameDirection::Request,
+            admission,
+        );
+        Ok(true)
+    }
+
+    fn admit_response_bulk(
+        &mut self,
+        peer: PeerId,
+        session_id: SessionId,
+        response: &VfsRpcResponse,
+        bulk_service: &BulkService,
+        check_pending: bool,
+    ) -> Result<bool, VfsRpcTransportAdapterError> {
+        let descriptor = match response_bulk_descriptor(response)? {
+            Some(descriptor) => descriptor,
+            None => return Ok(false),
+        };
+        if check_pending {
+            self.check_pending_response(peer, session_id, response)?;
+        }
+        let connection_id = connection_id_for_session(session_id);
+        let admission = bulk_service
+            .admit_vfs_rpc_read_download(connection_id, descriptor, response.header.op_id.0)
+            .map_err(|error| VfsRpcTransportAdapterError::BulkHandoff {
+                op_id: response.header.op_id,
+                method: response.method,
+                direction: VfsRpcFrameDirection::Response,
+                error,
+            })?;
+        self.record_bulk_admission(
+            peer,
+            session_id,
+            response.method,
+            VfsRpcFrameDirection::Response,
+            admission,
+        );
+        Ok(true)
+    }
+
+    fn check_pending_response(
+        &self,
+        peer: PeerId,
+        session_id: SessionId,
+        response: &VfsRpcResponse,
+    ) -> Result<(), VfsRpcTransportAdapterError> {
+        let key = PendingTransportKey {
+            peer,
+            op_id: response.header.op_id,
+        };
+        let pending =
+            *self
+                .pending
+                .get(&key)
+                .ok_or(VfsRpcTransportAdapterError::UnknownResponse {
+                    op_id: response.header.op_id,
+                })?;
+        if pending.peer != peer || pending.session_id != session_id {
+            return Err(VfsRpcTransportAdapterError::ResponsePeerMismatch {
+                op_id: response.header.op_id,
+                expected_peer: pending.peer,
+                found_peer: peer,
+                expected_session: pending.session_id,
+                found_session: session_id,
+            });
+        }
+        if pending.method != response.method {
+            return Err(VfsRpcTransportAdapterError::VfsRpc(
+                VfsRpcError::MethodMismatch {
+                    outer: pending.method,
+                    inner: response.method,
+                },
+            ));
+        }
+        Ok(())
+    }
+
+    fn record_bulk_admission(
+        &mut self,
+        peer: PeerId,
+        session_id: SessionId,
+        method: crate::VfsRpcMethod,
+        direction: VfsRpcFrameDirection,
+        admission: VfsRpcBulkAdmission,
+    ) {
+        let key = PendingBulkKey {
+            connection_id: admission.connection_id,
+            token: admission.token,
+        };
+        self.pending_bulk.insert(
+            key,
+            PendingBulkAdmission {
+                peer,
+                session_id,
+                op_id: OpId(admission.op_id),
+                method,
+                direction,
+                handoff: admission.handoff,
+                len: admission.len,
+                stream_id: admission.stream_id,
+            },
+        );
+    }
+
+    fn remove_matching_bulk_admission(
+        &mut self,
+        connection_id: ConnectionId,
+        token: BulkToken,
+        op_id: tidefs_bulk_service::OpId,
+        handoff: VfsRpcBulkHandoff,
+        len: u64,
+    ) -> Result<VfsRpcBulkAdmissionRecord, VfsRpcTransportAdapterError> {
+        let key = PendingBulkKey {
+            connection_id,
+            token,
+        };
+        let record = self.pending_bulk.remove(&key).ok_or(
+            VfsRpcTransportAdapterError::UnknownBulkCompletion {
+                connection_id,
+                token,
+                op_id: OpId(op_id),
+                handoff,
+            },
+        )?;
+        if record.op_id != OpId(op_id)
+            || record.handoff != handoff
+            || (len != 0 && record.len != len)
+        {
+            return Err(VfsRpcTransportAdapterError::BulkCompletionMismatch {
+                expected: record.as_record(connection_id, token),
+                op_id: OpId(op_id),
+                handoff,
+                len,
+            });
+        }
+        Ok(record.as_record(connection_id, token))
+    }
+
+    fn bulk_admission_for_op(
+        &self,
+        peer: PeerId,
+        session_id: SessionId,
+        op_id: OpId,
+    ) -> Option<VfsRpcBulkAdmissionRecord> {
+        self.pending_bulk.iter().find_map(|(key, record)| {
+            if record.peer == peer && record.session_id == session_id && record.op_id == op_id {
+                Some(record.as_record(key.connection_id, key.token))
+            } else {
+                None
+            }
+        })
+    }
+
+    fn remove_bulk_admission_for_op(
+        &mut self,
+        peer: PeerId,
+        session_id: SessionId,
+        op_id: OpId,
+    ) -> Option<VfsRpcBulkAdmissionRecord> {
+        let key = self.pending_bulk.iter().find_map(|(key, record)| {
+            if record.peer == peer && record.session_id == session_id && record.op_id == op_id {
+                Some(*key)
+            } else {
+                None
+            }
+        })?;
+        self.pending_bulk
+            .remove(&key)
+            .map(|record| record.as_record(key.connection_id, key.token))
     }
 }
 
@@ -475,6 +928,70 @@ fn reject_response_bulk(response: &VfsRpcResponse) -> Result<(), VfsRpcTransport
         });
     }
     Ok(())
+}
+
+fn request_bulk_descriptor(
+    request: &VfsRpcRequest,
+) -> Result<Option<VfsRpcBulkDescriptor>, VfsRpcTransportAdapterError> {
+    let flag = request.header.flags & REQ_FLAG_BULK_PENDING != 0;
+    match &request.payload {
+        VfsRpcRequestPayload::Write {
+            data: InlineOrBulk::Bulk { token, len },
+            ..
+        } if flag => Ok(Some(VfsRpcBulkDescriptor {
+            token: *token,
+            len: *len,
+        })),
+        VfsRpcRequestPayload::Write {
+            data: InlineOrBulk::Bulk { .. },
+            ..
+        } => Err(VfsRpcTransportAdapterError::BulkDescriptorInvalid {
+            op_id: request.header.op_id,
+            method: request.header.method,
+            direction: VfsRpcFrameDirection::Request,
+            reason: "WRITE bulk descriptor missing REQ_FLAG_BULK_PENDING",
+        }),
+        _ if flag => Err(VfsRpcTransportAdapterError::BulkDescriptorInvalid {
+            op_id: request.header.op_id,
+            method: request.header.method,
+            direction: VfsRpcFrameDirection::Request,
+            reason: "REQ_FLAG_BULK_PENDING without WRITE bulk descriptor",
+        }),
+        _ => Ok(None),
+    }
+}
+
+fn response_bulk_descriptor(
+    response: &VfsRpcResponse,
+) -> Result<Option<VfsRpcBulkDescriptor>, VfsRpcTransportAdapterError> {
+    let flag = response.header.flags & RESP_FLAG_BULK != 0;
+    match &response.payload {
+        VfsRpcResponsePayload::Data(InlineOrBulk::Bulk { token, len }) if flag => {
+            Ok(Some(VfsRpcBulkDescriptor {
+                token: *token,
+                len: *len,
+            }))
+        }
+        VfsRpcResponsePayload::Data(InlineOrBulk::Bulk { .. }) => {
+            Err(VfsRpcTransportAdapterError::BulkDescriptorInvalid {
+                op_id: response.header.op_id,
+                method: response.method,
+                direction: VfsRpcFrameDirection::Response,
+                reason: "READ bulk descriptor missing RESP_FLAG_BULK",
+            })
+        }
+        _ if flag => Err(VfsRpcTransportAdapterError::BulkDescriptorInvalid {
+            op_id: response.header.op_id,
+            method: response.method,
+            direction: VfsRpcFrameDirection::Response,
+            reason: "RESP_FLAG_BULK without READ bulk descriptor",
+        }),
+        _ => Ok(None),
+    }
+}
+
+fn connection_id_for_session(session_id: SessionId) -> ConnectionId {
+    session_id.0
 }
 
 fn request_payload_has_bulk(payload: &VfsRpcRequestPayload) -> bool {
@@ -616,6 +1133,30 @@ pub enum VfsRpcTransportAdapterError {
         method: crate::VfsRpcMethod,
         direction: VfsRpcFrameDirection,
     },
+    BulkDescriptorInvalid {
+        op_id: OpId,
+        method: crate::VfsRpcMethod,
+        direction: VfsRpcFrameDirection,
+        reason: &'static str,
+    },
+    BulkHandoff {
+        op_id: OpId,
+        method: crate::VfsRpcMethod,
+        direction: VfsRpcFrameDirection,
+        error: VfsRpcBulkHandoffError,
+    },
+    UnknownBulkCompletion {
+        connection_id: ConnectionId,
+        token: BulkToken,
+        op_id: OpId,
+        handoff: VfsRpcBulkHandoff,
+    },
+    BulkCompletionMismatch {
+        expected: VfsRpcBulkAdmissionRecord,
+        op_id: OpId,
+        handoff: VfsRpcBulkHandoff,
+        len: u64,
+    },
     UnknownResponse {
         op_id: OpId,
     },
@@ -642,6 +1183,10 @@ impl VfsRpcTransportAdapterError {
             Self::WrongLane { .. } => Errno::EINVAL,
             Self::FrameTooLarge { .. } => Errno::EMSGSIZE,
             Self::BulkUnsupported { .. } => Errno::EOPNOTSUPP,
+            Self::BulkDescriptorInvalid { .. }
+            | Self::BulkHandoff { .. }
+            | Self::UnknownBulkCompletion { .. }
+            | Self::BulkCompletionMismatch { .. } => Errno::EPROTO,
             Self::UnknownResponse { .. } | Self::ResponsePeerMismatch { .. } => Errno::EPROTO,
             Self::TransportFailure(failure) => failure.errno,
         }
@@ -717,6 +1262,46 @@ impl fmt::Display for VfsRpcTransportAdapterError {
                 "VFS_RPC {direction:?} {method:?}/{} requires BULK, but BULK is not bound",
                 op_id.0
             ),
+            Self::BulkDescriptorInvalid {
+                op_id,
+                method,
+                direction,
+                reason,
+            } => write!(
+                f,
+                "VFS_RPC {direction:?} {method:?}/{} has invalid BULK descriptor: {reason}",
+                op_id.0
+            ),
+            Self::BulkHandoff {
+                op_id,
+                method,
+                direction,
+                error,
+            } => write!(
+                f,
+                "VFS_RPC {direction:?} {method:?}/{} rejected by BULK handoff: {error}",
+                op_id.0
+            ),
+            Self::UnknownBulkCompletion {
+                connection_id,
+                op_id,
+                handoff,
+                ..
+            } => write!(
+                f,
+                "VFS_RPC BULK {handoff:?}/{} completed without admission on connection {connection_id}",
+                op_id.0
+            ),
+            Self::BulkCompletionMismatch {
+                expected,
+                op_id,
+                handoff,
+                len,
+            } => write!(
+                f,
+                "VFS_RPC BULK completion {handoff:?}/{} len {len} does not match admitted {:?}/{} len {}",
+                op_id.0, expected.handoff, expected.op_id.0, expected.len
+            ),
             Self::UnknownResponse { op_id } => {
                 write!(f, "unknown VFS_RPC transport response op_id {}", op_id.0)
             }
@@ -742,8 +1327,9 @@ impl std::error::Error for VfsRpcTransportAdapterError {}
 mod tests {
     use super::*;
     use crate::{DatasetId, VfsRpcCredentials, VfsRpcMethod, VFS_RPC_SERVICE_ID};
+    use tidefs_bulk_service::{BulkPriority, BulkService, BulkServiceConfig};
     use tidefs_transport::TransportError;
-    use tidefs_types_vfs_core::InodeId;
+    use tidefs_types_vfs_core::{Generation, InodeId};
 
     fn healthy_sessions(peer: PeerId, session_id: SessionId) -> TransportSessionSet {
         let mut sessions = TransportSessionSet::new();
@@ -765,6 +1351,42 @@ mod tests {
             Some(VfsRpcCredentials::root(PeerId(9))),
         )
         .expect("request")
+    }
+
+    fn sample_file_handle() -> crate::VfsRpcHandle {
+        crate::VfsRpcHandle {
+            handle_type: crate::VfsRpcHandleType::File,
+            flags: 0,
+            dataset_id: DatasetId(1),
+            inode: InodeId(2),
+            generation: Generation(3),
+            writer_node: 4,
+            handle_cookie: 5,
+        }
+    }
+
+    fn bulk_service() -> BulkService {
+        BulkService::new(BulkServiceConfig {
+            receiver_node_id: 42,
+            max_transfer_len: 64 * 1024,
+            ..BulkServiceConfig::default()
+        })
+    }
+
+    fn encode_response_payload(response: &VfsRpcResponse) -> (TransportEnvelope, Vec<u8>) {
+        let frame = VfsRpcTransportFrame::from_response(response).expect("rpc frame");
+        let payload = encode_control_service_frame(frame).expect("control frame");
+        let envelope = TransportEnvelope::new(
+            SessionId::new(33),
+            TransportCohortId::zero(),
+            VFS_RPC_CONTROL_LANE,
+            VFS_RPC_CONTROL_MESSAGE_FAMILY,
+            0,
+            0,
+            Vec::new(),
+            VisibilityClass::Internal,
+        );
+        (envelope, payload)
     }
 
     #[test]
@@ -1033,6 +1655,190 @@ mod tests {
                 .errno(),
             Errno::EOPNOTSUPP
         );
+    }
+
+    #[test]
+    fn bulk_write_request_is_admitted_only_on_same_session_service() {
+        let peer = PeerId(9);
+        let session_id = SessionId::new(33);
+        let mut adapter = VfsRpcTransportAdapter::new(
+            VfsRpcTransportAdapterConfig::default(),
+            healthy_sessions(peer, session_id),
+        );
+        let mut bulk = bulk_service();
+        let accept =
+            bulk.accept_vfs_rpc_write_upload(session_id.0, 11, 42, 4096, BulkPriority::Bulk);
+        let descriptor = VfsRpcBulkDescriptor::from_accept(&accept, 4096).expect("descriptor");
+        let request = VfsRpcRequest::new(
+            OpId(42),
+            2,
+            3,
+            REQ_FLAG_BULK_PENDING,
+            VfsRpcRequestPayload::Write {
+                handle: sample_file_handle(),
+                offset: 0,
+                data: InlineOrBulk::Bulk {
+                    token: descriptor.token,
+                    len: descriptor.len,
+                },
+            },
+            Some(VfsRpcCredentials::root(peer)),
+        )
+        .expect("request");
+
+        adapter
+            .begin_request_with_bulk(
+                peer,
+                &request,
+                Instant::now(),
+                VfsRpcEnvelopeContext::default(),
+                &bulk,
+            )
+            .expect("bulk admitted");
+
+        assert_eq!(adapter.pending_len(), 1);
+        assert_eq!(adapter.pending_bulk_len(), 1);
+
+        let other_session = SessionId::new(34);
+        let mut sessions = healthy_sessions(peer, other_session);
+        sessions.add_binding(99, session_id);
+        let mut wrong_session =
+            VfsRpcTransportAdapter::new(VfsRpcTransportAdapterConfig::default(), sessions);
+        let err = wrong_session
+            .wrap_request_for_session_with_bulk(
+                peer,
+                other_session,
+                &request,
+                VfsRpcEnvelopeContext::default(),
+                &bulk,
+            )
+            .expect_err("wrong connection rejected");
+        assert_eq!(err.errno(), Errno::EPROTO);
+        assert_eq!(wrong_session.pending_bulk_len(), 0);
+    }
+
+    #[test]
+    fn bulk_read_response_keeps_request_pending_until_done() {
+        let peer = PeerId(9);
+        let session_id = SessionId::new(33);
+        let now = Instant::now();
+        let mut adapter = VfsRpcTransportAdapter::new(
+            VfsRpcTransportAdapterConfig::default(),
+            healthy_sessions(peer, session_id),
+        );
+        let read = VfsRpcRequest::new(
+            OpId(55),
+            2,
+            3,
+            0,
+            VfsRpcRequestPayload::Read {
+                handle: sample_file_handle(),
+                offset: 0,
+                length: 8192,
+            },
+            Some(VfsRpcCredentials::root(peer)),
+        )
+        .expect("read request");
+        adapter
+            .begin_request(peer, &read, now, VfsRpcEnvelopeContext::default())
+            .expect("begin read");
+
+        let mut bulk = bulk_service();
+        let accept = bulk.accept_vfs_rpc_read_download(
+            session_id.0,
+            12,
+            read.header.op_id.0,
+            8192,
+            BulkPriority::Bulk,
+        );
+        let descriptor = VfsRpcBulkDescriptor::from_accept(&accept, 8192).expect("descriptor");
+        let response = VfsRpcResponse::ok(
+            read.header.op_id,
+            VfsRpcMethod::Read,
+            RESP_FLAG_BULK,
+            VfsRpcResponsePayload::Data(InlineOrBulk::Bulk {
+                token: descriptor.token,
+                len: descriptor.len,
+            }),
+        )
+        .expect("bulk response");
+        let (envelope, payload) = encode_response_payload(&response);
+
+        adapter
+            .unwrap_inbound_with_bulk(now, &envelope, &payload, &bulk)
+            .expect("bulk response admitted");
+        assert_eq!(adapter.pending_len(), 1);
+        assert_eq!(adapter.pending_bulk_len(), 1);
+        assert!(adapter.retry_due(now + Duration::from_secs(1)).is_empty());
+
+        let completion = VfsRpcBulkCompletion {
+            connection_id: session_id.0,
+            stream_id: 12,
+            token: descriptor.token,
+            op_id: read.header.op_id.0,
+            handoff: VfsRpcBulkHandoff::ReadDownload,
+            len: descriptor.len,
+            bytes: vec![0; descriptor.len as usize],
+        };
+        let retired = adapter
+            .complete_bulk_handoff(&completion)
+            .expect("complete bulk");
+
+        assert_eq!(retired.peer, peer);
+        assert_eq!(retired.session_id, session_id);
+        assert_eq!(adapter.pending_len(), 0);
+        assert_eq!(adapter.pending_bulk_len(), 0);
+    }
+
+    #[test]
+    fn bulk_timeout_retires_admission_for_abort_mapping() {
+        let peer = PeerId(9);
+        let session_id = SessionId::new(33);
+        let start = Instant::now();
+        let mut adapter = VfsRpcTransportAdapter::new(
+            VfsRpcTransportAdapterConfig {
+                request_timeout: Duration::from_millis(20),
+                ..VfsRpcTransportAdapterConfig::default()
+            },
+            healthy_sessions(peer, session_id),
+        );
+        let mut bulk = bulk_service();
+        let accept = bulk.accept_vfs_rpc_write_upload(session_id.0, 11, 90, 3, BulkPriority::Bulk);
+        let descriptor = VfsRpcBulkDescriptor::from_accept(&accept, 3).expect("descriptor");
+        let request = VfsRpcRequest::new(
+            OpId(90),
+            2,
+            3,
+            REQ_FLAG_BULK_PENDING,
+            VfsRpcRequestPayload::Write {
+                handle: sample_file_handle(),
+                offset: 0,
+                data: InlineOrBulk::Bulk {
+                    token: descriptor.token,
+                    len: descriptor.len,
+                },
+            },
+            Some(VfsRpcCredentials::root(peer)),
+        )
+        .expect("request");
+        adapter
+            .begin_request_with_bulk(
+                peer,
+                &request,
+                start,
+                VfsRpcEnvelopeContext::default(),
+                &bulk,
+            )
+            .expect("begin bulk");
+
+        let timeouts = adapter.expire_timed_out(start + Duration::from_millis(20));
+
+        assert_eq!(timeouts.len(), 1);
+        let bulk_record = timeouts[0].bulk.expect("bulk timeout record");
+        assert_eq!(bulk_record.token, descriptor.token);
+        assert_eq!(bulk_record.handoff, VfsRpcBulkHandoff::WriteUpload);
+        assert_eq!(adapter.pending_len(), 0);
+        assert_eq!(adapter.pending_bulk_len(), 0);
     }
 
     #[test]
