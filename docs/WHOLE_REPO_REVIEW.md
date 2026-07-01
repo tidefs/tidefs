@@ -1052,15 +1052,15 @@ exercise` as development diagnostics, but the commands still sit beside live
 cluster-pool dispatch and therefore remain part of the broader TFR-011/TFR-017
 operator-surface authority review.
 
-The docs already contain honest non-claims that must remain binding:
-`REPLICATION_REBUILD_RELOCATION_DATA_FLOWS_P8-03.md` says the replicated
-object/root slice is deterministic model work and that networked replication
-transport, streaming movement, relocation execution, and production runtime
-remain deferred. `ARCHITECTURE.md` says TideFS has multi-node foundations but
-is not production-scale against CephFS. The OW-307D blocker map says
-deterministic demo rows do not prove a production operator surface. The Tier 7
-multi-node/RDMA test is ignored by default and records that deterministic
-loopback readiness still requires live TCP or RDMA runtime closure.
+The docs already contain honest non-claims that must remain binding: the
+replication/rebuild source models remain bounded model work, not production
+runtime proof for networked replication transport, streaming movement,
+relocation execution, or full distributed operation. `ARCHITECTURE.md` says
+TideFS has multi-node foundations but is not production-scale against CephFS.
+The OW-307D blocker map says deterministic demo rows do not prove a production
+operator surface. The Tier 7 multi-node/RDMA test is ignored by default and
+records that deterministic loopback readiness still requires live TCP or RDMA
+runtime closure.
 
 The next transport implementation work should therefore start with a written
 authority contract, not another local patch. It needs to define the product

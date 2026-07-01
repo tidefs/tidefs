@@ -1014,7 +1014,7 @@ pub enum VerificationStatus {
     DegradedVerified,
 }
 
-/// Authoritative transfer admission ticket (P8-03 §5: `ReplicaTransferTicketRecord`).
+/// Authoritative transfer admission ticket (source-owned replication/rebuild model: `ReplicaTransferTicketRecord`).
 ///
 /// Issued when a movement intent is staged. Binds source anchors, target,
 /// pin budget, freshness fence, and expiry so transfer workers operate
@@ -1038,7 +1038,7 @@ pub struct ReplicaTransferTicketRecord {
     pub expiry: u64,
 }
 
-/// Canonical receipt of transfer completion (P8-03 §5: `ReplicaTransferReceipt`).
+/// Canonical receipt of transfer completion (source-owned replication/rebuild model: `ReplicaTransferReceipt`).
 ///
 /// Emitted after bytes have been successfully moved from source to target.
 /// Does not constitute legal placement — verification must follow.
@@ -1059,7 +1059,7 @@ pub struct ReplicaTransferReceipt {
     pub worker_refs: Vec<MemberId>,
 }
 
-/// Canonical verification truth (P8-03 §5: `ReplicaVerificationReceipt`).
+/// Canonical verification truth (source-owned replication/rebuild model: `ReplicaVerificationReceipt`).
 ///
 /// Emitted after digest comparison, witness attestation, and quorum
 /// validation. A `Verified` status makes replica placement legal.
@@ -1079,9 +1079,9 @@ pub struct ReplicaVerificationReceipt {
     pub status: VerificationStatus,
 }
 
-// ── P8-03 §5 canonical schema families ──
-// ReplicaFlowClass removed in favor of FlowCommitClass (6 canonical
-// data-flow classes per P8-03 §2).  See `FlowCommitClass` below.
+// ── source-owned replication/rebuild canonical schema families ──
+// ReplicaFlowClass was removed in favor of FlowCommitClass: the source-owned
+// replication/rebuild model has 6 canonical data-flow classes.
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReplicaChunkState {
@@ -1093,8 +1093,8 @@ pub enum ReplicaChunkState {
     Cancelled,
 }
 
-/// Advance a `ReplicaChunkState` through the canonical P8-03 §4 state
-/// machine.
+/// Advance a `ReplicaChunkState` through the canonical source-owned
+/// replication/rebuild state machine.
 ///
 /// Valid transitions:
 /// - `Pending` → `Transferring` (ticket issued)
@@ -1225,9 +1225,9 @@ pub enum RebuildDegradedClass {
     FullyUnavailable,
 }
 
-// ── P8-03 §5 canonical schema families: record types ──
+// ── source-owned replication/rebuild canonical schema families: record types ──
 
-/// Authoritative desired/actual replica group state (P8-03 §5: `ReplicaSetRecord`).
+/// Authoritative desired/actual replica group state (source-owned replication/rebuild model: `ReplicaSetRecord`).
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
 pub struct ReplicaSetRecord {
     pub replica_set_id: u64,
@@ -1238,7 +1238,7 @@ pub struct ReplicaSetRecord {
     pub current_placement_receipt_refs: Vec<ReplicatedReceiptId>,
 }
 
-/// Authoritative placement / movement intent (P8-03 §5: `ReplicaPlacementIntentRecord`).
+/// Authoritative placement / movement intent (source-owned replication/rebuild model: `ReplicaPlacementIntentRecord`).
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
 pub struct ReplicaPlacementIntentRecord {
     pub intent_id: ReplicatedReceiptId,
@@ -1253,7 +1253,7 @@ pub struct ReplicaPlacementIntentRecord {
     pub target_tier: Option<StorageTier>,
 }
 
-/// Authoritative per-chunk placement state (P8-03 §5: `ReplicaChunkStateRecord`).
+/// Authoritative per-chunk placement state (source-owned replication/rebuild model: `ReplicaChunkStateRecord`).
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
 pub struct ReplicaChunkStateRecord {
     pub chunk_id: u64,
@@ -1267,7 +1267,7 @@ pub struct ReplicaChunkStateRecord {
     pub verification_receipt_ref: ReplicatedReceiptId,
 }
 
-/// Authoritative rebuild lifecycle (P8-03 §5: `RebuildFlowRecord`).
+/// Authoritative rebuild lifecycle (source-owned replication/rebuild model: `RebuildFlowRecord`).
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
 pub struct RebuildFlowRecord {
     pub rebuild_flow_id: u64,
@@ -1280,7 +1280,7 @@ pub struct RebuildFlowRecord {
     pub degraded_class: RebuildDegradedClass,
 }
 
-/// Authoritative batch planning unit for rebuild (P8-03 §5: `RebuildBatchRecord`).
+/// Authoritative batch planning unit for rebuild (source-owned replication/rebuild model: `RebuildBatchRecord`).
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
 pub struct RebuildBatchRecord {
     pub batch_id: u64,
@@ -1291,7 +1291,7 @@ pub struct RebuildBatchRecord {
     pub verification_requirements: VerificationStatus,
 }
 
-/// Authoritative relocation lifecycle (P8-03 §5: `RelocationFlowRecord`).
+/// Authoritative relocation lifecycle (source-owned replication/rebuild model: `RelocationFlowRecord`).
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
 pub struct RelocationFlowRecord {
     pub relocation_flow_id: u64,
@@ -1303,7 +1303,7 @@ pub struct RelocationFlowRecord {
     pub reclaim_debt_ref: u64,
 }
 
-/// Authoritative relocation batch unit (P8-03 §5: `RelocationBatchRecord`).
+/// Authoritative relocation batch unit (source-owned replication/rebuild model: `RelocationBatchRecord`).
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
 pub struct RelocationBatchRecord {
     pub batch_id: u64,
@@ -1316,7 +1316,7 @@ pub struct RelocationBatchRecord {
     pub placement_receipt_refs: Vec<PlacementReceiptRef>,
 }
 
-/// Authoritative lag / degraded visibility state (P8-03 §5: `ReplicaLagStateRecord`).
+/// Authoritative lag / degraded visibility state (source-owned replication/rebuild model: `ReplicaLagStateRecord`).
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
 pub struct ReplicaLagStateRecord {
     pub subject_ref: ReplicatedSubjectId,
@@ -1328,7 +1328,7 @@ pub struct ReplicaLagStateRecord {
     pub degraded_visibility_class: DegradedVisibilityClass,
 }
 
-/// Canonical placement receipt (P8-03 §5: `ReplicaPlacementReceipt`).
+/// Canonical placement receipt (source-owned replication/rebuild model: `ReplicaPlacementReceipt`).
 ///
 /// Emitted after verification succeeds. This is the final receipt in the
 /// transfer→verify→place chain. Once emitted, replica placement is legal
@@ -1375,9 +1375,10 @@ pub enum FlowCommitClass {
 impl FlowCommitClass {
     /// Priority for flow class admission ordering (lower = higher urgency).
     ///
-    /// P8-03 §2: SteadyReplication(0) < CatchupReplication(1) < Rebuild(2)
-    /// < Relocation(3) < Failover(4) < Drain(5).  Rebuild may preempt
-    /// ordinary flows; Drain may override queue order for cutover/failover.
+    /// Source-owned replication/rebuild priority order:
+    /// SteadyReplication(0) < CatchupReplication(1) < Rebuild(2) <
+    /// Relocation(3) < Failover(4) < Drain(5). Rebuild may preempt ordinary
+    /// flows; Drain may override queue order for cutover/failover.
     #[must_use]
     pub const fn flow_class_priority(self) -> u8 {
         match self {
@@ -1392,8 +1393,9 @@ impl FlowCommitClass {
 
     /// Whether this flow class may preempt ordinary product work.
     ///
-    /// Per P8-03 §2: LossRebuild (Rebuild) is reserve-protected and may
-    /// preempt. CutoverFailoverDrain (Drain) may override queue order.
+    /// Per the source-owned replication/rebuild model, LossRebuild (Rebuild)
+    /// is reserve-protected and may preempt. CutoverFailoverDrain (Drain) may
+    /// override queue order.
     #[must_use]
     pub const fn may_preempt_product_work(self) -> bool {
         matches!(self, Self::Rebuild | Self::Drain)
@@ -1408,8 +1410,9 @@ impl FlowCommitClass {
 
 /// Canonical flow state machine position.
 ///
-/// Every P8-03 data flow progresses through these states. The flow commit
-/// coordinator advances the state as receipts are emitted.
+/// Every source-owned replication/rebuild data flow progresses through these
+/// states. The flow commit coordinator advances the state as receipts are
+/// emitted.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum FlowState {
     /// Flow has been planned but no work has started.
@@ -2022,7 +2025,7 @@ pub fn decode_single_parity_erasure_stripe(
 }
 
 /// Stage a transfer ticket from a movement intent, binding source anchors, target,
-/// pin budget, freshness fence, and expiry (P8-03 `stage_replica_transfer_ticket()`).
+/// pin budget, freshness fence, and expiry (source-owned `stage_replica_transfer_ticket()`).
 ///
 /// # Panics
 ///
@@ -2068,7 +2071,7 @@ pub fn stage_replica_transfer_ticket(
 }
 
 /// Emit a transfer receipt after bytes have been successfully moved from source
-/// to target under a ticket (P8-03 `commit_replica_transfer_and_placement_receipts()`
+/// to target under a ticket (source-owned `commit_replica_transfer_and_placement_receipts()`
 /// — transfer phase).
 ///
 /// After this receipt is emitted, verification must follow before placement is legal.
@@ -2099,7 +2102,7 @@ pub fn emit_replica_transfer_receipt(
 }
 
 /// Verify transferred chunks against expected digests, witness attestation, and quorum,
-/// then emit a verification receipt (P8-03 `verify_transferred_chunks_against_digest_and_witness()`).
+/// then emit a verification receipt (source-owned `verify_transferred_chunks_against_digest_and_witness()`).
 ///
 /// A `Verified` status makes replica placement legal. Any other status means placement
 /// cannot proceed without further action (re-transfer, witness recruitment, or degraded admission).
@@ -2154,7 +2157,7 @@ pub fn verify_transferred_chunks_and_emit_verification_receipt(
 /// Full receipt chain: stage ticket → emit transfer receipt → verify → mark replica copy
 /// as verified with the verification receipt reference.
 ///
-/// This is the core P8-03 law 3+7 implementation: "Copying bytes does not make placement legal.
+/// This is the core source-owned receipt law implementation: "Copying bytes does not make placement legal.
 /// Placement becomes legal only after verification and emission of matching receipts."
 ///
 /// Returns the updated `ReplicaCopyRecord` with `copy_class = Verified` and the verification
@@ -2189,8 +2192,9 @@ pub fn advance_replica_copy_through_receipt_chain(
     (copy, verification)
 }
 
-/// Emit a placement receipt after successful verification (P8-03
-/// `data_copy_7.flow_commit_coordinator` — placement phase).
+/// Emit a placement receipt after successful verification (source-owned
+/// replication/rebuild model: `data_copy_7.flow_commit_coordinator` placement
+/// phase).
 ///
 /// This is the final receipt in the transfer→verify→place chain. Once
 /// emitted, replica placement is legal and the copy transitions to live.
@@ -2230,8 +2234,9 @@ pub fn emit_replica_placement_receipt(
     }
 }
 
-/// Advance a flow through its canonical state machine (P8-03
-/// `data_copy_7.flow_commit_coordinator` — state advancement phase).
+/// Advance a flow through its canonical state machine (source-owned
+/// replication/rebuild model: `data_copy_7.flow_commit_coordinator` state
+/// advancement phase).
 ///
 /// The flow progresses through: Planned → Transferring → Transferred →
 /// Verifying → Verified → Complete. An `Aborted` state is terminal.
@@ -2264,7 +2269,7 @@ pub fn advance_flow_state(current: FlowState, event: FlowState) -> FlowState {
 }
 
 /// Full flow commit: verification → placement receipt → state advancement
-/// (P8-03 `data_copy_7.flow_commit_coordinator` end-to-end).
+/// (source-owned `data_copy_7.flow_commit_coordinator` end-to-end).
 ///
 /// This is the core commitment function. It takes a verified transfer and
 /// produces:
@@ -2323,7 +2328,7 @@ pub fn commit_transfer_flow(
         commit_epoch,
     }
 }
-// ── P8-03 §2: Transfer Orchestrator (data_copy_1) ──
+// ── source-owned replication/rebuild model: Transfer Orchestrator (data_copy_1) ──
 
 /// Lane class discriminants for transfer link assignments.
 ///
@@ -2423,7 +2428,7 @@ pub const fn movement_to_flow_class(class: ReplicaMovementClass) -> FlowCommitCl
 /// Decompose a `ReplicaMovementPlan` into scheduled transfer tickets with
 /// link assignments, respecting budget constraints and priority ordering.
 ///
-/// P8-03 §2: `data_copy_1.transfer_orchestrator` — "build chunk/extent transfer
+/// Source-owned replication/rebuild model: `data_copy_1.transfer_orchestrator` — "build chunk/extent transfer
 /// tickets and assign them to links/workers."
 ///
 /// The orchestrator:
@@ -4326,7 +4331,7 @@ mod tests {
         }
     }
 
-    // ── P8-03 §5 canonical schema family serde roundtrips ──
+    // ── source-owned replication/rebuild canonical schema family serde roundtrips ──
 
     #[test]
     fn serde_roundtrip_replica_set_record() {
@@ -4488,7 +4493,7 @@ mod tests {
 #[cfg(test)]
 mod orchestrator_tests {
     use super::*;
-    // ── Transfer Orchestrator tests (P8-03 §2: data_copy_1) ──
+    // ── Transfer Orchestrator tests (source-owned replication/rebuild model: data_copy_1) ──
 
     fn orchestrator_receipt_ref(
         subject: u64,

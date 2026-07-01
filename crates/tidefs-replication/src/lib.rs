@@ -154,7 +154,7 @@ impl ReplicationPolicySelector {
 // Transfer priority classes
 // ═══════════════════════════════════════════════════════════════════════
 
-/// Transfer priority classes for admission ordering per P8-03 data-flow mapping.
+/// Transfer priority classes for admission ordering per source-owned data-flow mapping.
 ///
 /// | Class            | Data flow | Priority | Description                     |
 /// |------------------|-----------|----------|---------------------------------|
@@ -202,7 +202,7 @@ impl TransferPriorityClass {
     }
 
     /// Admission priority: lower = lower urgency.
-    /// P8-03 data-flow ordering.
+    /// Source-owned data-flow ordering.
     #[must_use]
     pub const fn admission_priority(self) -> u8 {
         match self {
@@ -300,7 +300,7 @@ pub enum QuorumFailureReason {
 }
 
 /// A catchup repair ticket when a target is missing a chunk.
-/// Always uses `CatchupRepair` priority per P8-03 data-flow mapping.
+/// Always uses `CatchupRepair` priority per source-owned data-flow mapping.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CatchupRepairTicket {
     pub write_id: WriteId,
@@ -314,7 +314,7 @@ impl CatchupRepairTicket {
     }
 
     /// A `CatchupRepairTicket` always carries `CatchupRepair` priority
-    /// per P8-03 data-flow mapping.
+    /// per source-owned data-flow mapping.
     #[must_use]
     pub const fn priority_class() -> TransferPriorityClass {
         TransferPriorityClass::CatchupRepair
@@ -822,7 +822,7 @@ impl ReplicationProtocol {
     }
 
     /// Update  whenever a fence frontier or
-    /// placement receipt advances (P8-03 §10).
+    /// placement receipt advances (source-owned replication/rebuild model).
     ///
     /// Computes the lag class based on  total and
     /// records the oldest missing receipt ref.

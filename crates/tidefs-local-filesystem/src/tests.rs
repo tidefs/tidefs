@@ -8690,7 +8690,7 @@ fn get_dir_changes_non_directory_returns_none() {
 }
 
 // ── Quorum / distributed runtime integration tests ───────────────────
-// Issue #1579: 9/9 P8-03 canonical components have crate implementations.
+// Issue #1579: 9/9 source-owned replication/rebuild canonical components have crate implementations.
 // These tests exercise the local-filesystem ↔ quorum-write-runtime integration.
 
 fn quorum_options(replica_paths: Vec<PathBuf>) -> StoreOptions {

@@ -10,7 +10,7 @@ homepage.workspace = true
 documentation.workspace = true
 authors.workspace = true
 
-description = "P8-03 data_copy_7 flow commit coordinator: receipt emission and state advancement layer bridging verification, rebuild, relocation, and replication flows"
+description = "source-owned data_copy_7 flow commit coordinator: receipt emission and state advancement layer bridging verification, rebuild, relocation, and replication flows"
 
 [dependencies]
 tidefs-replication-model = { workspace = true }

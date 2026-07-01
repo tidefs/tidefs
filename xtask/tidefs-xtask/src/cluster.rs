@@ -28,7 +28,8 @@ pub fn check_membership_epoch_model_current_workspace() -> Result<(), ClusterChe
         "Cargo.toml",
         "crates/tidefs-membership-epoch/Cargo.toml",
         "crates/tidefs-membership-epoch/src/lib.rs",
-        "docs/MEMBERSHIP_PLACEMENT_FAILURE_DOMAIN_MODEL_P8-02.md",
+        "docs/MEMBERSHIP_AUTHORITY.md",
+        "docs/MEMBERSHIP_SERVICE_DESIGN.md",
         "nix/tidefs-validation.sh",
     ] {
         check_required_file(&root, rel, &mut missing);
@@ -44,7 +45,7 @@ pub fn check_membership_epoch_model_current_workspace() -> Result<(), ClusterChe
         &root,
         "crates/tidefs-membership-epoch/src/lib.rs",
         &[
-            "MEMBERSHIP_EPOCH_MODEL_P8_02",
+            "MEMBERSHIP_EPOCH_MODEL_FAMILY",
             "MEMBERSHIP_EPOCH_FAILURE_REJOIN_GATE",
             "ClusterMemberRecord",
             "MembershipConfigRecord",
@@ -73,13 +74,21 @@ pub fn check_membership_epoch_model_current_workspace() -> Result<(), ClusterChe
     );
     check_source_markers(
         &root,
-        "docs/MEMBERSHIP_PLACEMENT_FAILURE_DOMAIN_MODEL_P8-02.md",
+        "docs/MEMBERSHIP_AUTHORITY.md",
         &[
-            "OW-302 executable source slice",
+            "`tidefs-membership-epoch` is the single authority owner",
+            "source-owned membership, placement, and",
+            "failure-domain model",
+        ],
+        &mut missing,
+    );
+    check_source_markers(
+        &root,
+        "docs/MEMBERSHIP_SERVICE_DESIGN.md",
+        &[
             "`crates/tidefs-membership-epoch`",
-            "failure/rejoin tests",
-            "split-brain refusal",
-            "learner rejoin",
+            "failure-domain bindings",
+            "split-brain hazard laws",
         ],
         &mut missing,
     );
@@ -101,7 +110,8 @@ pub fn check_failure_domain_placement_current_workspace() -> Result<(), ClusterC
 
     for rel in [
         "crates/tidefs-membership-epoch/src/lib.rs",
-        "docs/MEMBERSHIP_PLACEMENT_FAILURE_DOMAIN_MODEL_P8-02.md",
+        "docs/MEMBERSHIP_AUTHORITY.md",
+        "docs/MEMBERSHIP_SERVICE_DESIGN.md",
         "nix/tidefs-validation.sh",
     ] {
         check_required_file(&root, rel, &mut missing);
@@ -125,12 +135,11 @@ pub fn check_failure_domain_placement_current_workspace() -> Result<(), ClusterC
     );
     check_source_markers(
         &root,
-        "docs/MEMBERSHIP_PLACEMENT_FAILURE_DOMAIN_MODEL_P8-02.md",
+        "docs/MEMBERSHIP_SERVICE_DESIGN.md",
         &[
-            "OW-303 executable failure-domain placement slice",
-            "`FailureDomainPlacementPolicy`",
-            "strict anti-affinity",
-            "degraded-visible duplicate-domain placement",
+            "failure-domain bindings",
+            "split-brain hazard laws",
+            "networked protocol",
         ],
         &mut missing,
     );
@@ -155,7 +164,8 @@ pub fn check_replicated_storage_model_current_workspace() -> Result<(), ClusterC
         "Cargo.lock",
         "crates/tidefs-replication-model/Cargo.toml",
         "crates/tidefs-replication-model/src/lib.rs",
-        "docs/REPLICATION_REBUILD_RELOCATION_DATA_FLOWS_P8-03.md",
+        "docs/LOCAL_DISTRIBUTED_RECEIPT_AUTHORITY.md",
+        "docs/DOCUMENTATION_AUTHORITY_REGISTER.md",
         "nix/tidefs-validation.sh",
     ] {
         check_required_file(&root, rel, &mut missing);
@@ -189,12 +199,11 @@ pub fn check_replicated_storage_model_current_workspace() -> Result<(), ClusterC
     );
     check_source_markers(
         &root,
-        "docs/REPLICATION_REBUILD_RELOCATION_DATA_FLOWS_P8-03.md",
+        "docs/LOCAL_DISTRIBUTED_RECEIPT_AUTHORITY.md",
         &[
-            "OW-304 executable replicated object/root storage slice",
-            "`crates/tidefs-replication-model`",
-            "degraded read/write",
-            "rebuild restoration",
+            "PlacementReceiptRef",
+            "rebuild, backfill,",
+            "transport models",
         ],
         &mut missing,
     );
@@ -216,7 +225,8 @@ pub fn check_rebuild_backfill_rebalance_current_workspace() -> Result<(), Cluste
 
     for rel in [
         "crates/tidefs-replication-model/src/lib.rs",
-        "docs/REPLICATION_REBUILD_RELOCATION_DATA_FLOWS_P8-03.md",
+        "docs/LOCAL_DISTRIBUTED_RECEIPT_AUTHORITY.md",
+        "docs/STORAGE_INTENT_POLICY_AUTHORITY.md",
         "nix/tidefs-validation.sh",
     ] {
         check_required_file(&root, rel, &mut missing);
@@ -243,14 +253,12 @@ pub fn check_rebuild_backfill_rebalance_current_workspace() -> Result<(), Cluste
     );
     check_source_markers(
         &root,
-        "docs/REPLICATION_REBUILD_RELOCATION_DATA_FLOWS_P8-03.md",
+        "docs/LOCAL_DISTRIBUTED_RECEIPT_AUTHORITY.md",
         &[
-            "OW-305 executable rebuild/backfill/rebalance slice",
-            "`open_rebuild_flow_from_loss_event()`",
-            "`schedule_backfill_batches_from_witness_sets()`",
-            "`plan_rebalance_for_capacity_movement()`",
-            "fault-injection",
-            "capacity-movement",
+            "PlacementReceiptRef",
+            "rebuild, backfill,",
+            "transport models",
+            "receipt reference",
         ],
         &mut missing,
     );
@@ -345,7 +353,7 @@ pub fn check_chunk_shipper_current_workspace() -> Result<(), ClusterCheckError> 
         "Cargo.toml",
         "crates/tidefs-chunk-shipper/Cargo.toml",
         "crates/tidefs-chunk-shipper/src/lib.rs",
-        "docs/REPLICATION_REBUILD_RELOCATION_DATA_FLOWS_P8-03.md",
+        "docs/LOCAL_DISTRIBUTED_RECEIPT_AUTHORITY.md",
     ] {
         check_required_file(&root, rel, &mut missing);
     }
@@ -354,7 +362,7 @@ pub fn check_chunk_shipper_current_workspace() -> Result<(), ClusterCheckError> 
         &root,
         "crates/tidefs-chunk-shipper/src/lib.rs",
         &[
-            "P8-03",
+            "CHUNK_SHIPPER_GATE_DATA_COPY_6",
             "data_copy_6",
             "ChunkStagingBuffer",
             "ChunkTransferProgress",
@@ -396,7 +404,6 @@ pub fn check_flow_commit_coordinator_current_workspace() -> Result<(), ClusterCh
         &root,
         "crates/tidefs-flow-commit-coordinator/src/lib.rs",
         &[
-            "P8-03",
             "data_copy_7",
             "FlowCommitCoordinator",
             "commit_transfer_receipt",
@@ -405,7 +412,7 @@ pub fn check_flow_commit_coordinator_current_workspace() -> Result<(), ClusterCh
             "seal_batch_and_emit_completion",
             "TrackedChunk",
             "TrackedBatch",
-            "FLOW_COMMIT_COORDINATOR_GATE_P8_03_DATA_COPY_7",
+            "FLOW_COMMIT_COORDINATOR_GATE_DATA_COPY_7",
         ],
         &mut missing,
     );
@@ -1016,47 +1023,38 @@ pub fn check_membership_types_current_workspace() -> Result<(), ClusterCheckErro
     }
 }
 
-pub fn check_p8_03_distributed_runtime_current_workspace() -> Result<(), ClusterCheckError> {
+pub fn check_distributed_replication_runtime_current_workspace() -> Result<(), ClusterCheckError> {
     let root = find_workspace_root().ok_or_else(|| ClusterCheckError {
         missing: vec!["could not locate workspace root Cargo.toml".to_string()],
     })?;
     let mut missing = Vec::new();
 
-    // Verify all 9 P8-03 canonical component crates exist
+    // Verify all 9 source-owned distributed replication component crates exist.
     let crate_specs: &[(&str, &str, &[&str])] = &[
         (
             "data_copy_0.placement_planner",
             "crates/tidefs-placement-planner/src/lib.rs",
-            &["compute_replica_target_set", "P8-03"],
+            &["data_copy_0", "compute_replica_target_set"],
         ),
         (
             "data_copy_1.transfer_orchestrator",
             "crates/tidefs-transport/src/lib.rs",
-            &["P8-03", "data_copy_1", "TransferOrchestrator"],
+            &["data_copy_1", "TransferOrchestrator"],
         ),
         (
             "data_copy_2.verification_engine",
             "crates/tidefs-verification-engine/src/lib.rs",
-            &[
-                "P8-03",
-                "data_copy_2",
-                "verify_digest_against_authoritative_source",
-            ],
+            &["data_copy_2", "verify_digest_against_authoritative_source"],
         ),
         (
             "data_copy_3.replica_health_tracker",
             "crates/tidefs-replica-health/src/lib.rs",
-            &[
-                "P8-03",
-                "data_copy_3",
-                "advance_replica_health_and_lag_frontiers",
-            ],
+            &["data_copy_3", "advance_replica_health_and_lag_frontiers"],
         ),
         (
             "data_copy_4.rebuild_planner",
             "crates/tidefs-rebuild-planner/src/lib.rs",
             &[
-                "P8-03",
                 "data_copy_4",
                 "RebuildPlanner",
                 "open_rebuild_flow_from_loss_event",
@@ -1065,27 +1063,22 @@ pub fn check_p8_03_distributed_runtime_current_workspace() -> Result<(), Cluster
         (
             "data_copy_5.relocation_planner",
             "crates/tidefs-relocation-planner/src/lib.rs",
-            &[
-                "P8-03",
-                "data_copy_5",
-                "RelocationPlanner",
-                "open_relocation_flow",
-            ],
+            &["data_copy_5", "RelocationPlanner", "open_relocation_flow"],
         ),
         (
             "data_copy_6.chunk_shipper",
             "crates/tidefs-chunk-shipper/src/lib.rs",
-            &["P8-03", "data_copy_6", "stage_replica_chunks_for_transport"],
+            &["data_copy_6", "stage_replica_chunks_for_transport"],
         ),
         (
             "data_copy_7.flow_commit_coordinator",
             "crates/tidefs-flow-commit-coordinator/src/lib.rs",
-            &["P8-03", "data_copy_7", "FlowCommitCoordinator"],
+            &["data_copy_7", "FlowCommitCoordinator"],
         ),
         (
             "data_copy_8.anti_entropy_auditor",
             "crates/tidefs-anti-entropy-auditor/src/lib.rs",
-            &["P8-03", "data_copy_8", "AntiEntropyAuditor"],
+            &["data_copy_8", "AntiEntropyAuditor"],
         ),
     ];
 
@@ -1109,14 +1102,16 @@ pub fn check_p8_03_distributed_runtime_current_workspace() -> Result<(), Cluster
         }
     }
 
-    // Also verify the design doc and feature matrix references
-    for rel in ["docs/REPLICATION_REBUILD_RELOCATION_DATA_FLOWS_P8-03.md"] {
+    for rel in [
+        "docs/LOCAL_DISTRIBUTED_RECEIPT_AUTHORITY.md",
+        "docs/DOCUMENTATION_AUTHORITY_REGISTER.md",
+    ] {
         check_required_file(&root, rel, &mut missing);
     }
 
     if missing.is_empty() {
         println!(
-            "P8-03 distributed runtime ok: all 9 canonical component crates are implementation-tracked non-release with implementations"
+            "source-owned distributed replication runtime ok: all 9 data_copy component crates are implementation-tracked non-release with implementations"
         );
         Ok(())
     } else {

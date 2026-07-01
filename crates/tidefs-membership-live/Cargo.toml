@@ -10,7 +10,7 @@ homepage.workspace = true
 documentation.workspace = true
 authors.workspace = true
 
-description = "P8-02 live membership runtime: SWIM failure detection, 3-phase epoch transitions, heartbeat protocol"
+description = "source-owned live membership runtime: SWIM failure detection, 3-phase epoch transitions, heartbeat protocol"
 
 [features]
 default = []

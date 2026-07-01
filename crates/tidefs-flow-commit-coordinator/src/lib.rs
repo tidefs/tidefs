@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
-//! P8-03 data_copy_7 flow commit coordinator.
+//! Source-owned data_copy_7 flow commit coordinator.
 //!
 //! The flow commit coordinator is the bridge between the verification pipeline
 //! (data_copy_2) and the state machines of rebuild (data_copy_4), relocation
@@ -41,9 +41,9 @@ use tidefs_replication_model::{
     VerificationStatus,
 };
 
-/// Gate constant for P8-03 data_copy_7 flow commit coordinator.
-pub const FLOW_COMMIT_COORDINATOR_GATE_P8_03_DATA_COPY_7: &str =
-    "P8-03 data_copy_7 flow commit coordinator covers transfer-receipt commit, verification-receipt commit, flow advancement, and batch sealing";
+/// Gate constant for the data_copy_7 flow commit coordinator.
+pub const FLOW_COMMIT_COORDINATOR_GATE_DATA_COPY_7: &str =
+    "data_copy_7 flow commit coordinator covers transfer-receipt commit, verification-receipt commit, flow advancement, and batch sealing";
 
 // ── Chunk state tracking ──────────────────────────────────────────────
 

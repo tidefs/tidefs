@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
-//! Timeout escalation (P8-04 Sections 4, 7.1 `classify_deadline_miss_and_escalate`).
+//! Timeout escalation (source-owned timing model: `classify_deadline_miss_and_escalate`).
 //!
 //! Converts deadline misses into hold/degrade/failover/stop actions under
 //! policy. Every escalation produces a receipt for auditability.
@@ -27,7 +27,7 @@ fn next_receipt_id() -> u64 {
 ///
 /// The escalator converts timing events into policy actions. It never creates
 /// authority truth — it only classifies health, issues deadlines, and emits
-/// receipts/findings (P8-04 Section 4).
+/// receipts/findings (source-owned timing model).
 #[derive(Debug, Clone)]
 pub struct TimeoutEscalator {
     /// Escalation receipts emitted by this escalator.

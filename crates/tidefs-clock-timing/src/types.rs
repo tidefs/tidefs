@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
-//! Canonical clock, drift, health, and deadline types (P8-04 Sections 2-6).
+//! Canonical clock, drift, health, and deadline types (source-owned timing model).
 //!
 //! Authority ordering is receipt/epoch/anchor-based; time only gates waiting,
 //! liveness, escalation, and narrative rendering.
@@ -10,7 +10,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 // ---------------------------------------------------------------------------
-// Clock classes (P8-04 Section 2)
+// Clock classes (source-owned timing model)
 // ---------------------------------------------------------------------------
 
 /// Seven canonical clock classes.
@@ -64,7 +64,7 @@ impl fmt::Display for ClockClass {
 }
 
 // ---------------------------------------------------------------------------
-// Drift and trust classes (P8-04 Section 3)
+// Drift and trust classes (source-owned timing model)
 // ---------------------------------------------------------------------------
 
 /// Five canonical drift / trust classes.
@@ -119,7 +119,7 @@ impl fmt::Display for DriftClass {
 }
 
 // ---------------------------------------------------------------------------
-// Clock source health (P8-04 Section 5.1)
+// Clock source health (source-owned timing model)
 // ---------------------------------------------------------------------------
 
 /// Five local time-health states.
@@ -145,7 +145,7 @@ impl TimeHealth {
 }
 
 // ---------------------------------------------------------------------------
-// HLC state (P8-04 Section 5.2)
+// HLC state (source-owned timing model)
 // ---------------------------------------------------------------------------
 
 /// HLC lifecycle states.
@@ -162,7 +162,7 @@ pub enum HlcState {
 }
 
 // ---------------------------------------------------------------------------
-// Lease deadline state (P8-04 Section 5.3)
+// Lease deadline state (source-owned timing model)
 // ---------------------------------------------------------------------------
 
 /// Six lease deadline lifecycle states.
@@ -196,7 +196,7 @@ impl LeaseDeadlineState {
 }
 
 // ---------------------------------------------------------------------------
-// Fence deadline state (P8-04 Section 5.4)
+// Fence deadline state (source-owned timing model)
 // ---------------------------------------------------------------------------
 
 /// Six fence deadline lifecycle states.
@@ -217,7 +217,7 @@ pub enum FenceDeadlineState {
 }
 
 // ---------------------------------------------------------------------------
-// Drift suspicion state (P8-04 Section 5.5)
+// Drift suspicion state (source-owned timing model)
 // ---------------------------------------------------------------------------
 
 /// Six drift suspicion lifecycle states.
@@ -236,7 +236,7 @@ pub enum DriftSuspicionState {
 }
 
 // ---------------------------------------------------------------------------
-// Escalation action class (P8-04 Section 4, time_manager_8)
+// Escalation action class (source-owned timing model, time_manager_8)
 // ---------------------------------------------------------------------------
 
 /// Actions a timeout escalator may choose when a deadline is missed.
@@ -272,7 +272,7 @@ pub enum FindingSeverity {
 }
 
 // ---------------------------------------------------------------------------
-// Record types (P8-04 Section 6)
+// Record types (source-owned timing model)
 // ---------------------------------------------------------------------------
 
 /// Snapshot of local clock source readings at a point in time.
@@ -1411,7 +1411,7 @@ mod tests {
 }
 
 // ---------------------------------------------------------------------------
-// Freshness fence types (P8-04 Section 4)
+// Freshness fence types (source-owned timing model)
 // ---------------------------------------------------------------------------
 
 /// Freshness fence classification.
@@ -1495,7 +1495,7 @@ pub struct FenceTiming {
     pub max_drift_window_ns: u64,
 }
 
-/// A freshness fence record (P8-04 Sections 4, 9.2).
+/// A freshness fence record (source-owned timing model).
 ///
 /// Freshness fences protect reads and writes from stale or lagged sources.
 /// Every fence has a declared frontier (the minimum acceptable source position),
@@ -1553,7 +1553,7 @@ impl FreshnessFenceRecord {
     }
 }
 
-/// An epoch timing attestation (P8-04 Section 5).
+/// An epoch timing attestation (source-owned timing model).
 ///
 /// Binds a membership config epoch transition to a timing attestation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1621,7 +1621,7 @@ impl SourceQuorum {
     }
 }
 
-/// A clock resynchronization receipt (P8-04 Section 7).
+/// A clock resynchronization receipt (source-owned timing model).
 ///
 /// Produced when drift recovers after a period of exceeded drift.
 /// Recovery requires a majority of clock sources to confirm health.

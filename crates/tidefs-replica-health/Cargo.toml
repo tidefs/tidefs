@@ -10,7 +10,7 @@ homepage.workspace = true
 documentation.workspace = true
 authors.workspace = true
 
-description = "Per-chunk replica health tracking with adaptive failure detection, lag computation, and flap suppression — P8-03 data_copy_3"
+description = "Per-chunk replica health tracking with adaptive failure detection, lag computation, and flap suppression — source-owned data_copy_3"
 
 [dependencies]
 tidefs-replication-model = { workspace = true }

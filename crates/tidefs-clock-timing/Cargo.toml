@@ -10,7 +10,7 @@ homepage.workspace = true
 documentation.workspace = true
 authors.workspace = true
 
-description = "HLC, clock health, drift estimation, lease/fence deadlines, and timeout escalation (P8-04)"
+description = "HLC, clock health, drift estimation, lease/fence deadlines, and timeout escalation (source-owned timing model)"
 
 [dependencies]
 serde = { version = "1", default-features = false, features = ["derive", "alloc"] }

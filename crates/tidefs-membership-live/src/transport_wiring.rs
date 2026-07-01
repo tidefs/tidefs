@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 #![forbid(unsafe_code)]
 
-//! Transport wiring for the P8-02 live membership runtime.
+//! Transport wiring for the source-owned live membership runtime.
 //!
 //! Connects `MembershipRuntime` (SWIM failure detection + 3-phase epoch
 //! transitions) to the `tidefs-transport` layer so that membership protocol
@@ -43,7 +43,7 @@ use crate::types::{
 ///
 /// Serialized with `bincode` and sent as opaque frames over the Transport
 /// layer (`send_message` / `recv_message`). Every variant maps 1:1 to a
-/// P8-02 membership protocol message type.
+/// membership protocol message type.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub enum MembershipWireMessage {
     /// SWIM direct ping.

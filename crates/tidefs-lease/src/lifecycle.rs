@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Lease lifecycle management: renewal scheduling, expiry tracking,
-//! fencing integration, and release coordination (P8-03 core law 5).
+//! fencing integration, and release coordination (source-owned replication/rebuild reserve law).
 //!
 //! Tracks active leases through their lifecycle, integrates with
 //! tidefs-clock-timing for deadline management.

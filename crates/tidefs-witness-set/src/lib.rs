@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
-// P8-03 witness set mechanism: quorum-based claim verification,
+// Source-owned witness set mechanism: quorum-based claim verification,
 // witness selection, and receipt integration.
 //
 // Design rule Rule 8: "Witnesses independently verify critical placements."
-// P8-03 core law 6: "Witnesses must observe and verify transfer completion
+// Source-owned witness completion law: "Witnesses must observe and verify transfer completion
 // before a replica is considered live."
 
 pub mod ack_tracker;

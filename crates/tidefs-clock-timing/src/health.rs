@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
-//! Clock source health monitoring (P8-04 Sections 4, 5.1, runtime components
-//! `clock_sampler`, `time_health_monitor`).
+//! Clock source health monitoring for source-owned timing runtime components
+//! (`clock_sampler`, `time_health_monitor`).
 //!
 //! The health monitor samples local clock sources and classifies their health
 //! state. It detects step regressions, suspend anomalies, and jitter so that

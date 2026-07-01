@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
-//! Freshness fence evaluation and epoch-timing attestation (P8-04 Sections 4-7).
+//! Freshness fence evaluation and epoch-timing attestation (source-owned timing model).
 //!
 //! Provides the canonical freshness evaluation algorithms:
 //! - `evaluate_freshness_against_fence`: determine if a source is fresh
@@ -16,7 +16,7 @@ use crate::types::{
 };
 
 // ---------------------------------------------------------------------------
-// evaluate_freshness_against_fence (P8-04 Section 7.1)
+// evaluate_freshness_against_fence (source-owned timing model)
 // ---------------------------------------------------------------------------
 
 /// Evaluate whether a source position is fresh under the given fence.
@@ -88,7 +88,7 @@ pub fn evaluate_freshness_against_fence(
 }
 
 // ---------------------------------------------------------------------------
-// evaluate_transfer_ticket_freshness (P8-04 Section 7.1, Section 6)
+// evaluate_transfer_ticket_freshness (source-owned timing model, section 6)
 // ---------------------------------------------------------------------------
 
 /// Evaluate whether a transfer ticket may proceed based on freshness.
@@ -128,12 +128,12 @@ pub fn evaluate_transfer_ticket_freshness(
 }
 
 // ---------------------------------------------------------------------------
-// attest_epoch_timing_and_bind_to_config_epoch (P8-04 Section 7.1, Section 5)
+// attest_epoch_timing_and_bind_to_config_epoch (source-owned timing model, section 5)
 // ---------------------------------------------------------------------------
 
 /// Produce a timing attestation for a membership config epoch transition.
 ///
-/// # Rules (P8-04 Section 5):
+/// # Rules (source-owned timing model):
 /// - No membership epoch transition may proceed without wall-clock and
 ///   logical-clock attestation.
 /// - A config epoch that started with `drift_class::exceeded` may only enter
@@ -180,7 +180,7 @@ pub fn attest_epoch_timing_and_bind_to_config_epoch(
 }
 
 // ---------------------------------------------------------------------------
-// detect_drift_exceeded_and_trigger_safety_actions (P8-04 Section 7.1, Section 7)
+// detect_drift_exceeded_and_trigger_safety_actions (source-owned timing model, section 7)
 // ---------------------------------------------------------------------------
 
 /// Result of drift safety evaluation.

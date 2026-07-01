@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
-//! Lease and fence deadline tracking (P8-04 Sections 5.3-5.4, 9.1-9.2).
+//! Lease and fence deadline tracking (source-owned timing model).
 //!
 //! Tracks lease expirations and fence ack deadlines. Deadlines are always
 //! derived from a base clock plus drift slack. Expiry alone does not move
@@ -15,7 +15,7 @@ use crate::types::{
 // LeaseDeadline
 // ---------------------------------------------------------------------------
 
-/// Tracks a lease deadline through its lifecycle (P8-04 Section 5.3).
+/// Tracks a lease deadline through its lifecycle (source-owned timing model).
 ///
 /// A lease is held by a node for a scarce authority object. The lease must be
 /// renewed before expiry. Expiry opens the path to failover staging but does
@@ -149,7 +149,7 @@ fn transition_lease(old: LeaseDeadlineState, new: LeaseDeadlineState) -> LeaseDe
 // FenceDeadline
 // ---------------------------------------------------------------------------
 
-/// Tracks a freshness fence deadline through its lifecycle (P8-04 Section 5.4).
+/// Tracks a freshness fence deadline through its lifecycle (source-owned timing model).
 ///
 /// A freshness fence is issued to a cohort when a frontier advances. Cohort
 /// members must acknowledge within the ack deadline. Late or missing acks

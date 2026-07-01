@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
-//! Anti-entropy auditor state machine — P8-03 data_copy_8.
+//! Anti-entropy auditor state machine — source-owned data_copy_8.
 //!
 //! The anti-entropy lifecycle has six states:
 //!   idle → enumerating → compare → divergence_found → ticketed → resolved

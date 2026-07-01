@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
-//! Hybrid Logical Clock (P8-04 Sections 5.2, 7.1, 8.3).
+//! Hybrid Logical Clock (source-owned timing model).
 //!
 //! HLC provides causal ordering across nodes without requiring synchronized
 //! physical clocks. Every local event advances the HLC; remote messages merge
@@ -16,7 +16,7 @@ use crate::types::{ClockClass, HlcState, HlcValue};
 /// HLC jumps forward. The logical counter breaks ties when physical components
 /// are equal.
 ///
-/// # Law (P8-04 Section 8.3)
+/// # Law (source-owned timing model)
 /// - HLC merges on message receive / receipt ingest / publication emit.
 /// - HLC does not replace epochs, receipts, or anchor references.
 /// - HLC values are for narrative ordering and tie-breaking, not sovereign truth.
@@ -64,7 +64,7 @@ impl HybridLogicalClock {
         self.receipt_count
     }
 
-    /// Advance the HLC for a local event (P8-04 Section 7.1:
+    /// Advance the HLC for a local event (source-owned timing model:
     /// `advance_hlc_on_send_merge_or_publish`).
     ///
     /// Uses the provided physical time (nanoseconds from a monotonic or
@@ -83,7 +83,7 @@ impl HybridLogicalClock {
         self.value
     }
 
-    /// Merge a remote HLC value from a received message (P8-04 Section 7.1:
+    /// Merge a remote HLC value from a received message (source-owned timing model:
     /// `advance_hlc_on_send_merge_or_publish`).
     ///
     /// After merge, the local HLC is guaranteed to be strictly greater than

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 #![forbid(unsafe_code)]
 
-//! P8-03 data_copy_6 chunk shipper — deterministic execution model.
+//! Source-owned data_copy_6 chunk shipper deterministic execution model.
 //!
 //!
 //! ## Chunk-Shipper Orchestration Engine
@@ -85,8 +85,8 @@ use tidefs_replication_model::{
 };
 
 /// Chunk shipper validation gate constant.
-pub const CHUNK_SHIPPER_GATE_P8_03_DATA_COPY_6: &str =
-    "P8-03 data_copy_6 chunk shipper: stage, stream, and receive replica chunks";
+pub const CHUNK_SHIPPER_GATE_DATA_COPY_6: &str =
+    "data_copy_6 chunk shipper: stage, stream, and receive replica chunks";
 
 // ── Transport path model ──
 
@@ -733,7 +733,7 @@ pub struct ChunkShippingReport {
 
 /// Stage chunks from the source object store into transport-ready buffers.
 ///
-/// P8-03 §6: `stage_replica_chunks_for_transport()`.
+/// Source-owned replication/rebuild model: `stage_replica_chunks_for_transport()`.
 ///
 /// Input: a transfer ticket, chunk payloads (mocked for deterministic model),
 /// and a selected transport path.
@@ -777,7 +777,7 @@ pub fn stage_replica_chunks_for_transport(
 
 /// Stream staged chunk buffers to the target under ticket constraints.
 ///
-/// P8-03 §6: `stream_replica_chunks_under_ticket()`.
+/// Source-owned replication/rebuild model: `stream_replica_chunks_under_ticket()`.
 ///
 /// Simulates the movement of chunk payloads from source to target.
 /// In a production system, this would use the selected transport path
@@ -822,7 +822,7 @@ pub fn stream_replica_chunks_under_ticket(
 
 /// Receive chunk payloads on the target side and stage them for verification.
 ///
-/// P8-03 §6: `receive_replica_chunks_and_stage_for_verification()`.
+/// Source-owned replication/rebuild model: `receive_replica_chunks_and_stage_for_verification()`.
 ///
 /// Reassembles received chunk payloads into a target-side staging area,
 /// computes receive-side digests, and categorizes each chunk as accepted
@@ -870,7 +870,7 @@ pub fn receive_replica_chunks_and_stage_for_verification(
 /// This is the primary entry point: it stages chunks, streams them, receives
 /// them on the target side, and produces a shipping report with transfer receipt.
 ///
-/// P8-03 `data_copy_6.chunk_shipper` — canonical execution.
+/// Source-owned `data_copy_6.chunk_shipper` — canonical execution.
 #[must_use]
 pub fn execute_chunk_shipping_pipeline(
     schedule: &TransferScheduleRecord,
@@ -965,7 +965,7 @@ pub fn execute_chunk_shipping_pipeline(
 /// After verification receipts are emitted by `data_copy_2.verification_engine`,
 /// advance chunk state records from Transferring/Verifying to Committed.
 ///
-/// P8-03 §6: advances chunks from in-flight or verifying to their final committed state.
+/// Source-owned replication/rebuild model: advances chunks from in-flight or verifying to their final committed state.
 /// Failed or cancelled chunks remain as-is.
 pub fn advance_chunks_after_verification(
     chunk_records: &[ReplicaChunkStateRecord],
@@ -994,7 +994,7 @@ pub fn advance_chunks_after_verification(
         .collect()
 }
 
-/// Reasons a chunk shipment can fail (P8-03 §data_copy_6).
+/// Reasons a chunk shipment can fail (source-owned data_copy_6).
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
 pub enum ChunkShipFailure {
     SourceUnreadable(String),

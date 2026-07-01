@@ -10,7 +10,7 @@ homepage.workspace = true
 documentation.workspace = true
 authors.workspace = true
 
-description = "P8-03 data_copy_0: replica target computation from placement policy, failure domains, and tier goals"
+description = "source-owned data_copy_0: replica target computation from placement policy, failure domains, and tier goals"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

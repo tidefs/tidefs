@@ -908,9 +908,8 @@ fn durability_sequence_clone_produces_independent_copy() {
 
 #[test]
 fn gate_constant_is_stable() {
-    use tidefs_flow_commit_coordinator::FLOW_COMMIT_COORDINATOR_GATE_P8_03_DATA_COPY_7;
-    assert!(FLOW_COMMIT_COORDINATOR_GATE_P8_03_DATA_COPY_7.contains("P8-03"));
-    assert!(FLOW_COMMIT_COORDINATOR_GATE_P8_03_DATA_COPY_7.contains("data_copy_7"));
+    use tidefs_flow_commit_coordinator::FLOW_COMMIT_COORDINATOR_GATE_DATA_COPY_7;
+    assert!(FLOW_COMMIT_COORDINATOR_GATE_DATA_COPY_7.contains("data_copy_7"));
 }
 
 // ── Property: commit idempotency under retry ──────────────────────────

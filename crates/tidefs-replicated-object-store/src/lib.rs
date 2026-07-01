@@ -2489,7 +2489,7 @@ impl TransportReplicatedStore {
         }
     }
 
-    // ── Plan-based API (P8-03 distributed runtime) ─────────────────
+    // ── Plan-based API (source-owned distributed replication runtime) ─────────────────
 
     /// Execute a model-generated write plan over the transport layer.
     ///

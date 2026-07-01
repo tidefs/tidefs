@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 #![forbid(unsafe_code)]
 
-//! Gossip message batching for the P8-02 membership runtime.
+//! Gossip message batching for the source-owned membership runtime.
 //!
 //! ## Architecture
 //!

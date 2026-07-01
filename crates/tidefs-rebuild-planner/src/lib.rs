@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
-//! Rebuild planner: loss/suspect event rebuild flow orchestration — P8-03 data_copy_4.
+//! Rebuild planner: loss/suspect event rebuild flow orchestration for data_copy_4.
 //!
 //! The rebuild planner is the recovery-side counterpart of the relocation
 //! planner. While relocation moves data for policy, tiering, or reclaim
@@ -15,7 +15,7 @@
 //! Exception paths: any state → BlockedNoSource, BlockedNoTarget,
 //! BlockedNoCapacity, Cancelled.
 //!
-//! Core algorithms (P8-03 §6):
+//! Core algorithms:
 //! - `open_rebuild_flow_from_loss_event()` — derive rebuild scope from
 //!   a loss/suspect event, freeze loss scope and degraded class
 //! - `schedule_rebuild_batches_from_witness_sets()` — choose source
@@ -51,9 +51,9 @@ use tidefs_transport::{self, ObjectPlacementEntry, PerNodeObjectDelta};
 pub mod plan;
 pub mod planner;
 
-/// Gate constant for P8-03 data_copy_4 rebuild planner.
-pub const REBUILD_PLANNER_GATE_P8_03_DATA_COPY_4: &str =
-    "P8-03 data_copy_4 rebuild planner covers loss-event flow open, witness-set batch scheduling, and state machine transitions";
+/// Gate constant for the data_copy_4 rebuild planner.
+pub const REBUILD_PLANNER_GATE_DATA_COPY_4: &str =
+    "data_copy_4 rebuild planner covers loss-event flow open, witness-set batch scheduling, and state machine transitions";
 
 /// Gate constant for OW-305 backfill/rebalance.
 pub const REBUILD_PLANNER_GATE_OW_305_BACKFILL_REBALANCE: &str =

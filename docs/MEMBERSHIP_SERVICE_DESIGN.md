@@ -37,7 +37,7 @@ tidefs needs a purpose-built MEMBERSHIP service that is:
 - Advisory for coherency decisions (writer lease remains the enforcement mechanism)
 - Lightweight (heartbeat + mount report, not full state replication)
 - Deterministic (joint consensus for membership changes, not gossip-based eventual consistency)
-- Topology-aware (failure-domain binding from `tidefs-membership-epoch` P8-02 model)
+- Topology-aware (failure-domain binding from `tidefs-membership-epoch`)
 
 ## 2. Design Overview
 
@@ -58,7 +58,7 @@ The service does **not**:
 
 ### 2.1 Relationship to tidefs-membership-epoch
 
-The `tidefs-membership-epoch` crate (P8-02 model) defines the deterministic
+The `tidefs-membership-epoch` crate defines the deterministic
 member classes, failure-domain bindings, config epochs, cohort populations,
 and split-brain hazard laws. The MEMBERSHIP service is the **networked protocol
 layer** that makes those types wire-addressable.
@@ -814,7 +814,8 @@ pub enum TransitionFailureReason {
 ## 13. References
 
 - [#1209] This design spec
-- [P8-02] `docs/MEMBERSHIP_PLACEMENT_FAILURE_DOMAIN_MODEL_P8-02.md` — deterministic membership/placement/failure-domain model
+- `docs/MEMBERSHIP_AUTHORITY.md` and `crates/tidefs-membership-epoch/` —
+  deterministic membership/placement/failure-domain authority
 - [OW-302B] `docs/MEMBERSHIP_CONFIG_QUORUM_SET_IDENTITY_OW302B.md` — config record hardening
 - [#1184] Named coherency profiles — `Auto` profile consumes CLUSTER_VIEW
 - [#1229] BULK protocol — transport integration for node-failure cleanup

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
-//! Digest comparison engine for anti-entropy auditing — P8-03 data_copy_8.
+//! Digest comparison engine for anti-entropy auditing — source-owned data_copy_8.
 //!
 //! Compares digests across replica targets for a given subject to detect
 //! divergence. Supports three comparison strategies:
