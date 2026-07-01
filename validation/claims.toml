@@ -373,9 +373,9 @@ required_evidence_classes = [
   "claims-gate-review",
 ]
 evidence_requirements = [
-  { class = "model-crash-matrix", path = "validation/artifacts/crash-oracle/model-crash-matrices.json", validation_tier = "source-model", manifest_path = "validation/artifacts/crash-oracle/model-crash-matrices.manifest.json", blocking_issues = ["#286"] },
-  { class = "runtime-crash-oracle", path = "validation/artifacts/crash-oracle/local-vfs-write-fsync-runtime-crash.json", validation_tier = "mounted-userspace", manifest_path = "validation/artifacts/crash-oracle/local-vfs-write-fsync-runtime-crash.manifest.json", blocking_issues = ["#493"] },
-  { class = "claims-gate-review", path = "validation/artifacts/crash-oracle/claims-gate-review.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/crash-oracle/claims-gate-review.manifest.json", blocking_issues = ["#329"] },
+  { class = "model-crash-matrix", path = "validation/artifacts/crash-oracle/model-crash-matrices.json", validation_tier = "source-model", manifest_path = "validation/artifacts/crash-oracle/model-crash-matrices.manifest.json", blocking_issues = [] },
+  { class = "runtime-crash-oracle", path = "validation/artifacts/crash-oracle/local-vfs-write-fsync-runtime-crash.json", validation_tier = "mounted-userspace", manifest_path = "validation/artifacts/crash-oracle/local-vfs-write-fsync-runtime-crash.manifest.json", blocking_issues = [] },
+  { class = "claims-gate-review", path = "validation/artifacts/crash-oracle/claims-gate-review.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/crash-oracle/claims-gate-review.manifest.json", blocking_issues = [] },
 ]
 blockers = [
   "GitHub issue #286 model-first evidence is bounded to the executable model, not local runtime crash injection.",
@@ -397,9 +397,9 @@ required_evidence_classes = [
   "claims-gate-review",
 ]
 evidence_requirements = [
-  { class = "model-crash-matrix", path = "validation/artifacts/crash-oracle/model-crash-matrices.json", validation_tier = "source-model", manifest_path = "validation/artifacts/crash-oracle/model-crash-matrices.namespace-rename.manifest.json", blocking_issues = ["#286"] },
+  { class = "model-crash-matrix", path = "validation/artifacts/crash-oracle/model-crash-matrices.json", validation_tier = "source-model", manifest_path = "validation/artifacts/crash-oracle/model-crash-matrices.namespace-rename.manifest.json", blocking_issues = [] },
   { class = "runtime-namespace-crash-artifact", path = "validation/artifacts/crash-oracle/local-vfs-rename-crash-runtime.json", validation_tier = "mounted-userspace", manifest_path = "validation/artifacts/crash-oracle/local-vfs-rename-crash-runtime.namespace-rename.manifest.json", blocking_issues = [] },
-  { class = "claims-gate-review", path = "validation/artifacts/crash-oracle/claims-gate-review.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/crash-oracle/claims-gate-review.namespace-rename.manifest.json", blocking_issues = ["#329"] },
+  { class = "claims-gate-review", path = "validation/artifacts/crash-oracle/claims-gate-review.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/crash-oracle/claims-gate-review.namespace-rename.manifest.json", blocking_issues = [] },
 ]
 blockers = [
   "GitHub issue #286 model-first evidence is bounded to the executable model, not local runtime crash injection.",
@@ -448,7 +448,7 @@ required_evidence_classes = [
 evidence_requirements = [
   { class = "model-crash-matrix", path = "validation/artifacts/crash-oracle/model-crash-matrices.json", validation_tier = "source-model", manifest_path = "validation/artifacts/crash-oracle/model-crash-matrices.local-vfs-rename.manifest.json", blocking_issues = [] },
   { class = "runtime-namespace-crash-artifact", path = "validation/artifacts/crash-oracle/local-vfs-rename-crash-runtime.json", validation_tier = "mounted-userspace", manifest_path = "validation/artifacts/crash-oracle/local-vfs-rename-crash-runtime.local-vfs-rename.manifest.json", blocking_issues = [] },
-  { class = "no-hidden-queue-gate", path = "validation/performance/no-hidden-queues.toml", validation_tier = "cargo-unit", blocking_issues = ["#720"] },
+  { class = "no-hidden-queue-gate", path = "validation/performance/no-hidden-queues.toml", validation_tier = "cargo-unit", blocking_issues = [] },
   { class = "claims-gate-review", path = "validation/artifacts/crash-oracle/claims-gate-review.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/crash-oracle/claims-gate-review.local-vfs-rename.manifest.json", blocking_issues = [] },
 ]
 blockers = [
@@ -471,9 +471,9 @@ required_evidence_classes = [
   "claims-gate-review",
 ]
 evidence_requirements = [
-  { class = "admission-budget-model", path = "validation/performance/no-hidden-queues.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/performance/scheduler-dirty-debt-admission-budget-model.manifest.json", blocking_issues = ["#287"] },
-  { class = "queue-depth-runtime-artifact", path = "validation/artifacts/performance/queue-depth-runtime.json", validation_tier = "mounted-userspace", manifest_path = "validation/artifacts/performance/scheduler-dirty-debt-queue-depth-runtime.manifest.json", blocking_issues = ["#498"] },
-  { class = "claims-gate-review", path = "validation/artifacts/performance/claims-gate-review.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/performance/scheduler-dirty-debt-claims-gate-review.manifest.json", blocking_issues = ["#287", "#498"] },
+  { class = "admission-budget-model", path = "validation/performance/no-hidden-queues.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/performance/scheduler-dirty-debt-admission-budget-model.manifest.json", blocking_issues = [] },
+  { class = "queue-depth-runtime-artifact", path = "validation/artifacts/performance/queue-depth-runtime.json", validation_tier = "mounted-userspace", manifest_path = "validation/artifacts/performance/scheduler-dirty-debt-queue-depth-runtime.manifest.json", blocking_issues = [] },
+  { class = "claims-gate-review", path = "validation/artifacts/performance/claims-gate-review.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/performance/scheduler-dirty-debt-claims-gate-review.manifest.json", blocking_issues = [] },
 ]
 blockers = [
   "GitHub issue #287 owns performance-contract work classes and no-hidden-queue gates.",
@@ -492,9 +492,9 @@ required_evidence_classes = [
   "claims-gate-review",
 ]
 evidence_requirements = [
-  { class = "scrub-read-isolation-model", path = "validation/artifacts/performance/scrub-read-isolation-model.toml", validation_tier = "source-model", blocking_issues = ["#287"] },
-  { class = "runtime-scrub-read-artifact", path = "validation/artifacts/performance/scrub-read-runtime.json", validation_tier = "mounted-userspace", blocking_issues = ["#287"] },
-  { class = "claims-gate-review", path = "validation/artifacts/performance/claims-gate-review.toml", validation_tier = "source-model", blocking_issues = ["#287"] },
+  { class = "scrub-read-isolation-model", path = "validation/artifacts/performance/scrub-read-isolation-model.toml", validation_tier = "source-model", blocking_issues = [] },
+  { class = "runtime-scrub-read-artifact", path = "validation/artifacts/performance/scrub-read-runtime.json", validation_tier = "mounted-userspace", blocking_issues = [] },
+  { class = "claims-gate-review", path = "validation/artifacts/performance/claims-gate-review.toml", validation_tier = "source-model", blocking_issues = [] },
 ]
 blockers = [
   "Scrub/read isolation authority is not proven by a focused runtime row.",
@@ -538,9 +538,9 @@ required_evidence_classes = [
   "claims-gate-review",
 ]
 evidence_requirements = [
-  { class = "scrub-read-isolation-model", path = "validation/artifacts/performance/scrub-read-isolation-model.toml", validation_tier = "source-model", blocking_issues = ["#287"] },
-  { class = "runtime-scrub-read-artifact", path = "validation/artifacts/performance/scrub-read-runtime.json", validation_tier = "mounted-userspace", blocking_issues = ["#287"] },
-  { class = "claims-gate-review", path = "validation/artifacts/performance/claims-gate-review.toml", validation_tier = "source-model", blocking_issues = ["#287"] },
+  { class = "scrub-read-isolation-model", path = "validation/artifacts/performance/scrub-read-isolation-model.toml", validation_tier = "source-model", blocking_issues = [] },
+  { class = "runtime-scrub-read-artifact", path = "validation/artifacts/performance/scrub-read-runtime.json", validation_tier = "mounted-userspace", blocking_issues = [] },
+  { class = "claims-gate-review", path = "validation/artifacts/performance/claims-gate-review.toml", validation_tier = "source-model", blocking_issues = [] },
 ]
 blockers = [
   "GitHub issue #287 first slice records a deterministic oracle, not a mounted scrub/read runtime artifact.",
@@ -602,9 +602,9 @@ required_evidence_classes = [
   "claims-gate-review",
 ]
 evidence_requirements = [
-  { class = "qid-tag-state-model", path = "validation/artifacts/ublk/qid-tag-state-model.json", validation_tier = "source-model", manifest_path = "validation/artifacts/ublk/qid-tag-state-model.manifest.json", blocking_issues = ["#289", "#312"] },
-  { class = "runtime-ublk-completion-artifact", path = "validation/artifacts/ublk/qid-tag-completion-runtime.json", validation_tier = "qemu-guest", blocking_issues = ["#312"] },
-  { class = "claims-gate-review", path = "validation/artifacts/ublk/claims-gate-review.toml", validation_tier = "source-model", blocking_issues = ["#312"] },
+  { class = "qid-tag-state-model", path = "validation/artifacts/ublk/qid-tag-state-model.json", validation_tier = "source-model", manifest_path = "validation/artifacts/ublk/qid-tag-state-model.manifest.json", blocking_issues = [] },
+  { class = "runtime-ublk-completion-artifact", path = "validation/artifacts/ublk/qid-tag-completion-runtime.json", validation_tier = "qemu-guest", blocking_issues = [] },
+  { class = "claims-gate-review", path = "validation/artifacts/ublk/claims-gate-review.toml", validation_tier = "source-model", blocking_issues = [] },
 ]
 blockers = [
   "The qid/tag state model is bounded pure-model evidence, not uBLK daemon or block-volume runtime evidence.",
@@ -670,9 +670,9 @@ required_evidence_classes = [
   "claims-gate-review",
 ]
 evidence_requirements = [
-  { class = "kernel-context-token-model", path = "validation/artifacts/kernel/teardown-race-proof-artifact.json", validation_tier = "source-model", blocking_issues = ["#291"] },
-  { class = "teardown-race-proof-artifact", path = "validation/artifacts/kernel/teardown-race-proof-artifact.json", validation_tier = "source-model", blocking_issues = ["#291"] },
-  { class = "claims-gate-review", path = "validation/artifacts/kernel/teardown-no-work-after-claims-gate-review.toml", validation_tier = "source-model", blocking_issues = ["#909"] },
+  { class = "kernel-context-token-model", path = "validation/artifacts/kernel/teardown-race-proof-artifact.json", validation_tier = "source-model", blocking_issues = [] },
+  { class = "teardown-race-proof-artifact", path = "validation/artifacts/kernel/teardown-race-proof-artifact.json", validation_tier = "source-model", blocking_issues = [] },
+  { class = "claims-gate-review", path = "validation/artifacts/kernel/teardown-no-work-after-claims-gate-review.toml", validation_tier = "source-model", blocking_issues = [] },
 ]
 blockers = [
   "The recorded teardown proof review is bounded source/model evidence; runtime acceptance is limited to the T5 mounted-kernel-vfs cutover and teardown artifact from #1186 / PR #1463.",
@@ -693,7 +693,7 @@ required_evidence_classes = [
   "claims-gate-review",
 ]
 evidence_requirements = [
-  { class = "claims-gate-review", path = "validation/artifacts/crash-oracle/claims-gate-review.toml", validation_tier = "source-model", blocking_issues = ["#329"] },
+  { class = "claims-gate-review", path = "validation/artifacts/crash-oracle/claims-gate-review.toml", validation_tier = "source-model", blocking_issues = [] },
 ]
 blockers = [
   "Page-cache writeback authority is a specification and vocabulary boundary, not a validated product claim.",
@@ -720,11 +720,11 @@ required_evidence_classes = [
   "claims-gate-review",
 ]
 evidence_requirements = [
-  { class = "storage-intent-policy-receipt-authority", path = "validation/artifacts/storage-intent/ack-receipt-policy-authority.json", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/ack-receipt-policy-authority.manifest.json", blocking_issues = ["#841", "#855", "#913", "#920"] },
-  { class = "storage-intent-ack-receipt-runtime", path = "validation/artifacts/storage-intent/ack-receipt-runtime.json", validation_tier = "mounted-userspace", manifest_path = "validation/artifacts/storage-intent/ack-receipt-runtime.manifest.json", blocking_issues = ["#842", "#862", "#874", "#920"] },
-  { class = "storage-intent-ordering-membership-media-gates", path = "validation/artifacts/storage-intent/ack-receipt-authority-gates.json", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/ack-receipt-authority-gates.manifest.json", blocking_issues = ["#750", "#894", "#904", "#913"] },
-  { class = "storage-intent-ack-fault-matrix", path = "validation/artifacts/storage-intent/ack-receipt-fault-matrix.json", validation_tier = "qemu-guest", manifest_path = "validation/artifacts/storage-intent/ack-receipt-fault-matrix.manifest.json", blocking_issues = ["#863", "#900"] },
-  { class = "claims-gate-review", path = "validation/artifacts/storage-intent/ack-receipt-claims-gate-review.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/ack-receipt-claims-gate-review.manifest.json", blocking_issues = ["#875"] },
+  { class = "storage-intent-policy-receipt-authority", path = "validation/artifacts/storage-intent/ack-receipt-policy-authority.json", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/ack-receipt-policy-authority.manifest.json", blocking_issues = [] },
+  { class = "storage-intent-ack-receipt-runtime", path = "validation/artifacts/storage-intent/ack-receipt-runtime.json", validation_tier = "mounted-userspace", manifest_path = "validation/artifacts/storage-intent/ack-receipt-runtime.manifest.json", blocking_issues = [] },
+  { class = "storage-intent-ordering-membership-media-gates", path = "validation/artifacts/storage-intent/ack-receipt-authority-gates.json", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/ack-receipt-authority-gates.manifest.json", blocking_issues = [] },
+  { class = "storage-intent-ack-fault-matrix", path = "validation/artifacts/storage-intent/ack-receipt-fault-matrix.json", validation_tier = "qemu-guest", manifest_path = "validation/artifacts/storage-intent/ack-receipt-fault-matrix.manifest.json", blocking_issues = [] },
+  { class = "claims-gate-review", path = "validation/artifacts/storage-intent/ack-receipt-claims-gate-review.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/ack-receipt-claims-gate-review.manifest.json", blocking_issues = [] },
 ]
 blockers = [
   "Earned acknowledgment receipts from #842, policy source records from #855, consistent evidence cuts from #913, and caller-visible result/refusal evidence from #920 are not registered as validated runtime evidence for this claim.",
@@ -747,11 +747,11 @@ required_evidence_classes = [
   "claims-gate-review",
 ]
 evidence_requirements = [
-  { class = "storage-intent-service-objective-envelope", path = "validation/artifacts/storage-intent/sync-latency-service-objective.json", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/sync-latency-service-objective.manifest.json", blocking_issues = ["#855", "#913", "#915"] },
-  { class = "storage-intent-sync-performance-row", path = "validation/artifacts/storage-intent/sync-latency-performance-row.json", validation_tier = "qemu-guest", manifest_path = "validation/artifacts/storage-intent/sync-latency-performance-row.manifest.json", blocking_issues = ["#846", "#850", "#912", "#928"] },
-  { class = "storage-intent-scheduler-admission-row", path = "validation/artifacts/storage-intent/sync-latency-scheduler-admission.json", validation_tier = "qemu-guest", manifest_path = "validation/artifacts/storage-intent/sync-latency-scheduler-admission.manifest.json", blocking_issues = ["#862", "#898", "#902", "#904"] },
-  { class = "storage-intent-sync-fault-row", path = "validation/artifacts/storage-intent/sync-latency-fault-row.json", validation_tier = "qemu-guest", manifest_path = "validation/artifacts/storage-intent/sync-latency-fault-row.manifest.json", blocking_issues = ["#863", "#900", "#920"] },
-  { class = "claims-gate-review", path = "validation/artifacts/storage-intent/sync-latency-claims-gate-review.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/sync-latency-claims-gate-review.manifest.json", blocking_issues = ["#875"] },
+  { class = "storage-intent-service-objective-envelope", path = "validation/artifacts/storage-intent/sync-latency-service-objective.json", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/sync-latency-service-objective.manifest.json", blocking_issues = [] },
+  { class = "storage-intent-sync-performance-row", path = "validation/artifacts/storage-intent/sync-latency-performance-row.json", validation_tier = "qemu-guest", manifest_path = "validation/artifacts/storage-intent/sync-latency-performance-row.manifest.json", blocking_issues = [] },
+  { class = "storage-intent-scheduler-admission-row", path = "validation/artifacts/storage-intent/sync-latency-scheduler-admission.json", validation_tier = "qemu-guest", manifest_path = "validation/artifacts/storage-intent/sync-latency-scheduler-admission.manifest.json", blocking_issues = [] },
+  { class = "storage-intent-sync-fault-row", path = "validation/artifacts/storage-intent/sync-latency-fault-row.json", validation_tier = "qemu-guest", manifest_path = "validation/artifacts/storage-intent/sync-latency-fault-row.manifest.json", blocking_issues = [] },
+  { class = "claims-gate-review", path = "validation/artifacts/storage-intent/sync-latency-claims-gate-review.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/sync-latency-claims-gate-review.manifest.json", blocking_issues = [] },
 ]
 blockers = [
   "Performance rows from #850 must bind the exact ack class, p50/p95/p99/tail envelope, media/topology profile, transport path #846, service objective #915, and comparator evidence #928 before any fast-sync claim can strengthen.",
@@ -774,11 +774,11 @@ required_evidence_classes = [
   "claims-gate-review",
 ]
 evidence_requirements = [
-  { class = "storage-intent-placement-decision-frontier", path = "validation/artifacts/storage-intent/placement-decision-frontier.json", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/placement-decision-frontier.manifest.json", blocking_issues = ["#843", "#845", "#904", "#905", "#913", "#926"] },
-  { class = "storage-intent-satisfaction-reconciler", path = "validation/artifacts/storage-intent/placement-satisfaction-reconciler.json", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/placement-satisfaction-reconciler.manifest.json", blocking_issues = ["#841", "#874", "#901", "#920"] },
-  { class = "storage-intent-relocation-action-execution", path = "validation/artifacts/storage-intent/placement-relocation-action-execution.json", validation_tier = "qemu-guest", manifest_path = "validation/artifacts/storage-intent/placement-relocation-action-execution.manifest.json", blocking_issues = ["#848", "#911", "#912", "#920"] },
-  { class = "storage-intent-placement-performance-fault-rows", path = "validation/artifacts/storage-intent/placement-performance-fault-rows.json", validation_tier = "qemu-guest", manifest_path = "validation/artifacts/storage-intent/placement-performance-fault-rows.manifest.json", blocking_issues = ["#850", "#863", "#898", "#900"] },
-  { class = "claims-gate-review", path = "validation/artifacts/storage-intent/placement-satisfaction-claims-gate-review.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/placement-satisfaction-claims-gate-review.manifest.json", blocking_issues = ["#875"] },
+  { class = "storage-intent-placement-decision-frontier", path = "validation/artifacts/storage-intent/placement-decision-frontier.json", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/placement-decision-frontier.manifest.json", blocking_issues = [] },
+  { class = "storage-intent-satisfaction-reconciler", path = "validation/artifacts/storage-intent/placement-satisfaction-reconciler.json", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/placement-satisfaction-reconciler.manifest.json", blocking_issues = [] },
+  { class = "storage-intent-relocation-action-execution", path = "validation/artifacts/storage-intent/placement-relocation-action-execution.json", validation_tier = "qemu-guest", manifest_path = "validation/artifacts/storage-intent/placement-relocation-action-execution.manifest.json", blocking_issues = [] },
+  { class = "storage-intent-placement-performance-fault-rows", path = "validation/artifacts/storage-intent/placement-performance-fault-rows.json", validation_tier = "qemu-guest", manifest_path = "validation/artifacts/storage-intent/placement-performance-fault-rows.manifest.json", blocking_issues = [] },
+  { class = "claims-gate-review", path = "validation/artifacts/storage-intent/placement-satisfaction-claims-gate-review.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/placement-satisfaction-claims-gate-review.manifest.json", blocking_issues = [] },
 ]
 blockers = [
   "Placement planning #843, predictor evidence #845, media capability #904, decision-frontier evidence #905, and preflight simulation #926 must distinguish candidate evaluation from authority-changing placement.",
@@ -801,11 +801,11 @@ required_evidence_classes = [
   "claims-gate-review",
 ]
 evidence_requirements = [
-  { class = "storage-intent-media-cost-wear-ledger", path = "validation/artifacts/storage-intent/flash-wear-cost-ledger.json", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/flash-wear-cost-ledger.manifest.json", blocking_issues = ["#844", "#856", "#898", "#904"] },
-  { class = "storage-intent-wear-decision-attribution", path = "validation/artifacts/storage-intent/flash-wear-decision-attribution.json", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/flash-wear-decision-attribution.manifest.json", blocking_issues = ["#845", "#905", "#912", "#913", "#915"] },
-  { class = "storage-intent-wear-performance-fault-rows", path = "validation/artifacts/storage-intent/flash-wear-performance-fault-rows.json", validation_tier = "qemu-guest", manifest_path = "validation/artifacts/storage-intent/flash-wear-performance-fault-rows.manifest.json", blocking_issues = ["#850", "#863", "#900"] },
-  { class = "storage-intent-prefetch-residency-execution", path = "validation/artifacts/storage-intent/flash-wear-prefetch-residency-execution.json", validation_tier = "qemu-guest", manifest_path = "validation/artifacts/storage-intent/flash-wear-prefetch-residency-execution.manifest.json", blocking_issues = ["#848", "#862", "#967", "#972"] },
-  { class = "claims-gate-review", path = "validation/artifacts/storage-intent/flash-wear-claims-gate-review.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/flash-wear-claims-gate-review.manifest.json", blocking_issues = ["#875"] },
+  { class = "storage-intent-media-cost-wear-ledger", path = "validation/artifacts/storage-intent/flash-wear-cost-ledger.json", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/flash-wear-cost-ledger.manifest.json", blocking_issues = [] },
+  { class = "storage-intent-wear-decision-attribution", path = "validation/artifacts/storage-intent/flash-wear-decision-attribution.json", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/flash-wear-decision-attribution.manifest.json", blocking_issues = [] },
+  { class = "storage-intent-wear-performance-fault-rows", path = "validation/artifacts/storage-intent/flash-wear-performance-fault-rows.json", validation_tier = "qemu-guest", manifest_path = "validation/artifacts/storage-intent/flash-wear-performance-fault-rows.manifest.json", blocking_issues = [] },
+  { class = "storage-intent-prefetch-residency-execution", path = "validation/artifacts/storage-intent/flash-wear-prefetch-residency-execution.json", validation_tier = "qemu-guest", manifest_path = "validation/artifacts/storage-intent/flash-wear-prefetch-residency-execution.manifest.json", blocking_issues = ["#972"] },
+  { class = "claims-gate-review", path = "validation/artifacts/storage-intent/flash-wear-claims-gate-review.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/flash-wear-claims-gate-review.manifest.json", blocking_issues = [] },
 ]
 blockers = [
   "Media cost and wear ledger evidence from #844/#856, capacity admission #898, and media capability #904 must prove unknown WAF, endurance reserve exhaustion, and stale device labels are fail-closed.",
@@ -828,11 +828,11 @@ required_evidence_classes = [
   "claims-gate-review",
 ]
 evidence_requirements = [
-  { class = "storage-intent-data-shape-policy-evidence", path = "validation/artifacts/storage-intent/data-shape-policy-evidence.json", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/data-shape-policy-evidence.manifest.json", blocking_issues = ["#855", "#878", "#904", "#913", "#915"] },
-  { class = "storage-intent-transform-execution-evidence", path = "validation/artifacts/storage-intent/data-shape-transform-execution.json", validation_tier = "qemu-guest", manifest_path = "validation/artifacts/storage-intent/data-shape-transform-execution.manifest.json", blocking_issues = ["#848", "#911", "#912", "#920"] },
-  { class = "storage-intent-data-shape-performance-fault-rows", path = "validation/artifacts/storage-intent/data-shape-performance-fault-rows.json", validation_tier = "qemu-guest", manifest_path = "validation/artifacts/storage-intent/data-shape-performance-fault-rows.manifest.json", blocking_issues = ["#850", "#863", "#898", "#900"] },
-  { class = "storage-intent-data-shape-result-boundary", path = "validation/artifacts/storage-intent/data-shape-result-boundary.json", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/data-shape-result-boundary.manifest.json", blocking_issues = ["#841", "#874", "#901", "#920"] },
-  { class = "claims-gate-review", path = "validation/artifacts/storage-intent/data-shape-claims-gate-review.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/data-shape-claims-gate-review.manifest.json", blocking_issues = ["#875"] },
+  { class = "storage-intent-data-shape-policy-evidence", path = "validation/artifacts/storage-intent/data-shape-policy-evidence.json", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/data-shape-policy-evidence.manifest.json", blocking_issues = [] },
+  { class = "storage-intent-transform-execution-evidence", path = "validation/artifacts/storage-intent/data-shape-transform-execution.json", validation_tier = "qemu-guest", manifest_path = "validation/artifacts/storage-intent/data-shape-transform-execution.manifest.json", blocking_issues = [] },
+  { class = "storage-intent-data-shape-performance-fault-rows", path = "validation/artifacts/storage-intent/data-shape-performance-fault-rows.json", validation_tier = "qemu-guest", manifest_path = "validation/artifacts/storage-intent/data-shape-performance-fault-rows.manifest.json", blocking_issues = [] },
+  { class = "storage-intent-data-shape-result-boundary", path = "validation/artifacts/storage-intent/data-shape-result-boundary.json", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/data-shape-result-boundary.manifest.json", blocking_issues = [] },
+  { class = "claims-gate-review", path = "validation/artifacts/storage-intent/data-shape-claims-gate-review.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/data-shape-claims-gate-review.manifest.json", blocking_issues = [] },
 ]
 blockers = [
   "Data-shape policy evidence #878, dataset policy source #855, media capability #904, evidence-query cuts #913, and service objectives #915 must bind record size, compression, digest, dedup, encryption, EC, archive, coalescing, and refusal state.",
@@ -855,11 +855,11 @@ required_evidence_classes = [
   "claims-gate-review",
 ]
 evidence_requirements = [
-  { class = "storage-intent-layout-policy-evidence", path = "validation/artifacts/storage-intent/layout-policy-evidence.json", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/layout-policy-evidence.manifest.json", blocking_issues = ["#855", "#880", "#904", "#905", "#913"] },
-  { class = "storage-intent-lifecycle-capacity-evidence", path = "validation/artifacts/storage-intent/layout-lifecycle-capacity-evidence.json", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/layout-lifecycle-capacity-evidence.manifest.json", blocking_issues = ["#881", "#898", "#900", "#903"] },
-  { class = "storage-intent-layout-action-execution", path = "validation/artifacts/storage-intent/layout-action-execution.json", validation_tier = "qemu-guest", manifest_path = "validation/artifacts/storage-intent/layout-action-execution.manifest.json", blocking_issues = ["#848", "#911", "#912", "#920"] },
-  { class = "storage-intent-layout-performance-fault-rows", path = "validation/artifacts/storage-intent/layout-performance-fault-rows.json", validation_tier = "qemu-guest", manifest_path = "validation/artifacts/storage-intent/layout-performance-fault-rows.manifest.json", blocking_issues = ["#850", "#863", "#862", "#902"] },
-  { class = "claims-gate-review", path = "validation/artifacts/storage-intent/layout-allocator-claims-gate-review.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/layout-allocator-claims-gate-review.manifest.json", blocking_issues = ["#875"] },
+  { class = "storage-intent-layout-policy-evidence", path = "validation/artifacts/storage-intent/layout-policy-evidence.json", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/layout-policy-evidence.manifest.json", blocking_issues = [] },
+  { class = "storage-intent-lifecycle-capacity-evidence", path = "validation/artifacts/storage-intent/layout-lifecycle-capacity-evidence.json", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/layout-lifecycle-capacity-evidence.manifest.json", blocking_issues = [] },
+  { class = "storage-intent-layout-action-execution", path = "validation/artifacts/storage-intent/layout-action-execution.json", validation_tier = "qemu-guest", manifest_path = "validation/artifacts/storage-intent/layout-action-execution.manifest.json", blocking_issues = [] },
+  { class = "storage-intent-layout-performance-fault-rows", path = "validation/artifacts/storage-intent/layout-performance-fault-rows.json", validation_tier = "qemu-guest", manifest_path = "validation/artifacts/storage-intent/layout-performance-fault-rows.manifest.json", blocking_issues = [] },
+  { class = "claims-gate-review", path = "validation/artifacts/storage-intent/layout-allocator-claims-gate-review.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/layout-allocator-claims-gate-review.manifest.json", blocking_issues = [] },
 ]
 blockers = [
   "Layout evidence #880, dataset policy #855, media capability #904, decision frontier #905, and evidence-query #913 must bind fragmentation, free-run pressure, locality, zone/write-pointer, alignment, pending-free, and reclaim debt before allocator claims can strengthen.",
@@ -882,11 +882,11 @@ required_evidence_classes = [
   "claims-gate-review",
 ]
 evidence_requirements = [
-  { class = "storage-intent-geo-policy-transport-evidence", path = "validation/artifacts/storage-intent/geo-policy-transport-evidence.json", validation_tier = "multi-process-distributed", manifest_path = "validation/artifacts/storage-intent/geo-policy-transport-evidence.manifest.json", blocking_issues = ["#750", "#846", "#855", "#904", "#913"] },
-  { class = "storage-intent-geo-temporal-recovery-evidence", path = "validation/artifacts/storage-intent/geo-temporal-recovery-evidence.json", validation_tier = "multi-process-distributed", manifest_path = "validation/artifacts/storage-intent/geo-temporal-recovery-evidence.manifest.json", blocking_issues = ["#881", "#900", "#901", "#903", "#920"] },
-  { class = "storage-intent-geo-performance-fault-rows", path = "validation/artifacts/storage-intent/geo-performance-fault-rows.json", validation_tier = "multi-process-distributed", manifest_path = "validation/artifacts/storage-intent/geo-performance-fault-rows.manifest.json", blocking_issues = ["#850", "#863", "#912", "#915"] },
-  { class = "storage-intent-geo-result-boundary", path = "validation/artifacts/storage-intent/geo-result-boundary.json", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/geo-result-boundary.manifest.json", blocking_issues = ["#842", "#874", "#898", "#902", "#920"] },
-  { class = "claims-gate-review", path = "validation/artifacts/storage-intent/geo-async-rpo-claims-gate-review.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/geo-async-rpo-claims-gate-review.manifest.json", blocking_issues = ["#875"] },
+  { class = "storage-intent-geo-policy-transport-evidence", path = "validation/artifacts/storage-intent/geo-policy-transport-evidence.json", validation_tier = "multi-process-distributed", manifest_path = "validation/artifacts/storage-intent/geo-policy-transport-evidence.manifest.json", blocking_issues = [] },
+  { class = "storage-intent-geo-temporal-recovery-evidence", path = "validation/artifacts/storage-intent/geo-temporal-recovery-evidence.json", validation_tier = "multi-process-distributed", manifest_path = "validation/artifacts/storage-intent/geo-temporal-recovery-evidence.manifest.json", blocking_issues = [] },
+  { class = "storage-intent-geo-performance-fault-rows", path = "validation/artifacts/storage-intent/geo-performance-fault-rows.json", validation_tier = "multi-process-distributed", manifest_path = "validation/artifacts/storage-intent/geo-performance-fault-rows.manifest.json", blocking_issues = [] },
+  { class = "storage-intent-geo-result-boundary", path = "validation/artifacts/storage-intent/geo-result-boundary.json", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/geo-result-boundary.manifest.json", blocking_issues = [] },
+  { class = "claims-gate-review", path = "validation/artifacts/storage-intent/geo-async-rpo-claims-gate-review.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/geo-async-rpo-claims-gate-review.manifest.json", blocking_issues = [] },
 ]
 blockers = [
   "Transport path #846, membership #750, policy source #855, media capability #904, evidence-query #913, and result/refusal #920 evidence must bind WAN/internet and RDMA-absent baselines before geo claims can strengthen.",
@@ -909,11 +909,11 @@ required_evidence_classes = [
   "claims-gate-review",
 ]
 evidence_requirements = [
-  { class = "storage-intent-ram-authority-policy", path = "validation/artifacts/storage-intent/ram-authority-policy.json", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/ram-authority-policy.manifest.json", blocking_issues = ["#847", "#855", "#913", "#915"] },
-  { class = "storage-intent-ram-media-receipt-gates", path = "validation/artifacts/storage-intent/ram-media-receipt-gates.json", validation_tier = "qemu-guest", manifest_path = "validation/artifacts/storage-intent/ram-media-receipt-gates.manifest.json", blocking_issues = ["#842", "#904", "#920", "#957"] },
-  { class = "storage-intent-ram-performance-fault-rows", path = "validation/artifacts/storage-intent/ram-performance-fault-rows.json", validation_tier = "qemu-guest", manifest_path = "validation/artifacts/storage-intent/ram-performance-fault-rows.manifest.json", blocking_issues = ["#850", "#863", "#900"] },
-  { class = "storage-intent-ram-result-boundary", path = "validation/artifacts/storage-intent/ram-result-boundary.json", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/ram-result-boundary.manifest.json", blocking_issues = ["#750", "#874", "#894", "#901", "#902"] },
-  { class = "claims-gate-review", path = "validation/artifacts/storage-intent/ram-authority-claims-gate-review.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/ram-authority-claims-gate-review.manifest.json", blocking_issues = ["#875"] },
+  { class = "storage-intent-ram-authority-policy", path = "validation/artifacts/storage-intent/ram-authority-policy.json", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/ram-authority-policy.manifest.json", blocking_issues = [] },
+  { class = "storage-intent-ram-media-receipt-gates", path = "validation/artifacts/storage-intent/ram-media-receipt-gates.json", validation_tier = "qemu-guest", manifest_path = "validation/artifacts/storage-intent/ram-media-receipt-gates.manifest.json", blocking_issues = [] },
+  { class = "storage-intent-ram-performance-fault-rows", path = "validation/artifacts/storage-intent/ram-performance-fault-rows.json", validation_tier = "qemu-guest", manifest_path = "validation/artifacts/storage-intent/ram-performance-fault-rows.manifest.json", blocking_issues = [] },
+  { class = "storage-intent-ram-result-boundary", path = "validation/artifacts/storage-intent/ram-result-boundary.json", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/ram-result-boundary.manifest.json", blocking_issues = [] },
+  { class = "claims-gate-review", path = "validation/artifacts/storage-intent/ram-authority-claims-gate-review.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/ram-authority-claims-gate-review.manifest.json", blocking_issues = [] },
 ]
 blockers = [
   "RAM authority #847, dataset policy #855, evidence-query #913, service-objective #915, media capability #904, and media-native convergence #957 must distinguish volatile RAM, replicated volatile RAM, PMem persistence domains, and intent-backed authority.",
@@ -936,11 +936,11 @@ required_evidence_classes = [
   "claims-gate-review",
 ]
 evidence_requirements = [
-  { class = "local-storage-comparator-equivalence-evidence", path = "validation/artifacts/successor/local-comparator-equivalence.json", validation_tier = "mounted-userspace", manifest_path = "validation/artifacts/successor/local-comparator-equivalence.manifest.json", blocking_issues = ["#850", "#912", "#915", "#928", "#930"] },
-  { class = "local-storage-successor-performance-fault-set", path = "validation/artifacts/successor/local-performance-fault-set.json", validation_tier = "mounted-userspace", manifest_path = "validation/artifacts/successor/local-performance-fault-set.manifest.json", blocking_issues = ["#850", "#863", "#900", "#928", "#930"] },
-  { class = "local-storage-successor-claim-boundary-review", path = "validation/artifacts/successor/local-claim-boundary-review.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/successor/local-claim-boundary-review.manifest.json", blocking_issues = ["#875", "#920", "#926"] },
-  { class = "local-storage-operator-explanation-evidence", path = "validation/artifacts/successor/local-operator-explanation.json", validation_tier = "source-model", manifest_path = "validation/artifacts/successor/local-operator-explanation.manifest.json", blocking_issues = ["#849", "#913", "#920"] },
-  { class = "claims-gate-review", path = "validation/artifacts/successor/local-successor-comparator-claims-gate-review.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/successor/local-successor-comparator-claims-gate-review.manifest.json", blocking_issues = ["#875"] },
+  { class = "local-storage-comparator-equivalence-evidence", path = "validation/artifacts/successor/local-comparator-equivalence.json", validation_tier = "mounted-userspace", manifest_path = "validation/artifacts/successor/local-comparator-equivalence.manifest.json", blocking_issues = [] },
+  { class = "local-storage-successor-performance-fault-set", path = "validation/artifacts/successor/local-performance-fault-set.json", validation_tier = "mounted-userspace", manifest_path = "validation/artifacts/successor/local-performance-fault-set.manifest.json", blocking_issues = [] },
+  { class = "local-storage-successor-claim-boundary-review", path = "validation/artifacts/successor/local-claim-boundary-review.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/successor/local-claim-boundary-review.manifest.json", blocking_issues = [] },
+  { class = "local-storage-operator-explanation-evidence", path = "validation/artifacts/successor/local-operator-explanation.json", validation_tier = "source-model", manifest_path = "validation/artifacts/successor/local-operator-explanation.manifest.json", blocking_issues = [] },
+  { class = "claims-gate-review", path = "validation/artifacts/successor/local-successor-comparator-claims-gate-review.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/successor/local-successor-comparator-claims-gate-review.manifest.json", blocking_issues = [] },
 ]
 blockers = [
   "Local comparator equivalence #928/#930, performance #850, attribution #912, service-objective #915, and fault #863 evidence must bind exact local filesystems, DRBD envelopes, media, mount mode, workload, and failure scope before local successor wording can strengthen.",
@@ -963,11 +963,11 @@ required_evidence_classes = [
   "claims-gate-review",
 ]
 evidence_requirements = [
-  { class = "distributed-storage-comparator-equivalence-evidence", path = "validation/artifacts/successor/distributed-comparator-equivalence.json", validation_tier = "multi-process-distributed", manifest_path = "validation/artifacts/successor/distributed-comparator-equivalence.manifest.json", blocking_issues = ["#846", "#850", "#912", "#913", "#915", "#928", "#930"] },
-  { class = "distributed-storage-successor-performance-fault-set", path = "validation/artifacts/successor/distributed-performance-fault-set.json", validation_tier = "multi-process-distributed", manifest_path = "validation/artifacts/successor/distributed-performance-fault-set.manifest.json", blocking_issues = ["#750", "#846", "#850", "#863", "#900", "#904"] },
-  { class = "distributed-storage-successor-claim-boundary-review", path = "validation/artifacts/successor/distributed-claim-boundary-review.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/successor/distributed-claim-boundary-review.manifest.json", blocking_issues = ["#875", "#920", "#926"] },
-  { class = "distributed-storage-operator-explanation-evidence", path = "validation/artifacts/successor/distributed-operator-explanation.json", validation_tier = "source-model", manifest_path = "validation/artifacts/successor/distributed-operator-explanation.manifest.json", blocking_issues = ["#849", "#901", "#902", "#913", "#920"] },
-  { class = "claims-gate-review", path = "validation/artifacts/successor/distributed-successor-comparator-claims-gate-review.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/successor/distributed-successor-comparator-claims-gate-review.manifest.json", blocking_issues = ["#875"] },
+  { class = "distributed-storage-comparator-equivalence-evidence", path = "validation/artifacts/successor/distributed-comparator-equivalence.json", validation_tier = "multi-process-distributed", manifest_path = "validation/artifacts/successor/distributed-comparator-equivalence.manifest.json", blocking_issues = [] },
+  { class = "distributed-storage-successor-performance-fault-set", path = "validation/artifacts/successor/distributed-performance-fault-set.json", validation_tier = "multi-process-distributed", manifest_path = "validation/artifacts/successor/distributed-performance-fault-set.manifest.json", blocking_issues = [] },
+  { class = "distributed-storage-successor-claim-boundary-review", path = "validation/artifacts/successor/distributed-claim-boundary-review.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/successor/distributed-claim-boundary-review.manifest.json", blocking_issues = [] },
+  { class = "distributed-storage-operator-explanation-evidence", path = "validation/artifacts/successor/distributed-operator-explanation.json", validation_tier = "source-model", manifest_path = "validation/artifacts/successor/distributed-operator-explanation.manifest.json", blocking_issues = [] },
+  { class = "claims-gate-review", path = "validation/artifacts/successor/distributed-successor-comparator-claims-gate-review.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/successor/distributed-successor-comparator-claims-gate-review.manifest.json", blocking_issues = [] },
 ]
 blockers = [
   "Distributed comparator equivalence #928/#930, transport #846, membership #750, service-objective #915, attribution #912, and evidence-query #913 must bind exact cluster topology, network, workload, media, cost, and failure envelopes before distributed successor wording can strengthen.",
@@ -990,11 +990,11 @@ required_evidence_classes = [
   "claims-gate-review",
 ]
 evidence_requirements = [
-  { class = "local-storage-successor-comparator-claim", path = "validation/artifacts/successor/local-successor-comparator-claim.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/successor/local-successor-comparator-claim.manifest.json", blocking_issues = ["#875", "#928", "#930"] },
-  { class = "distributed-storage-successor-comparator-claim", path = "validation/artifacts/successor/distributed-successor-comparator-claim.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/successor/distributed-successor-comparator-claim.manifest.json", blocking_issues = ["#875", "#928", "#930"] },
-  { class = "storage-intent-successor-claim-boundary-review", path = "validation/artifacts/storage-intent/successor-claim-boundary-review.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/successor-claim-boundary-review.manifest.json", blocking_issues = ["#841", "#843", "#844", "#845", "#848", "#855", "#856", "#862", "#874", "#878", "#880", "#905", "#920", "#926"] },
-  { class = "storage-intent-operator-explanation-evidence", path = "validation/artifacts/storage-intent/successor-operator-explanation.json", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/successor-operator-explanation.manifest.json", blocking_issues = ["#849", "#901", "#902", "#903", "#913", "#920"] },
-  { class = "claims-gate-review", path = "validation/artifacts/storage-intent/successor-comparator-claims-gate-review.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/successor-comparator-claims-gate-review.manifest.json", blocking_issues = ["#875"] },
+  { class = "local-storage-successor-comparator-claim", path = "validation/artifacts/successor/local-successor-comparator-claim.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/successor/local-successor-comparator-claim.manifest.json", blocking_issues = [] },
+  { class = "distributed-storage-successor-comparator-claim", path = "validation/artifacts/successor/distributed-successor-comparator-claim.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/successor/distributed-successor-comparator-claim.manifest.json", blocking_issues = [] },
+  { class = "storage-intent-successor-claim-boundary-review", path = "validation/artifacts/storage-intent/successor-claim-boundary-review.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/successor-claim-boundary-review.manifest.json", blocking_issues = [] },
+  { class = "storage-intent-operator-explanation-evidence", path = "validation/artifacts/storage-intent/successor-operator-explanation.json", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/successor-operator-explanation.manifest.json", blocking_issues = [] },
+  { class = "claims-gate-review", path = "validation/artifacts/storage-intent/successor-comparator-claims-gate-review.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/successor-comparator-claims-gate-review.manifest.json", blocking_issues = [] },
 ]
 blockers = [
   "Split claim ids `storage.local.successor_comparator.v1` and `storage.distributed.successor_comparator.v1` must validate independently before the umbrella boundary can support product-facing successor or comparator wording.",

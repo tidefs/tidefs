@@ -54,6 +54,12 @@ non-pass, or blocked manifests fail closed; receipt integrity may support
 evidence integrity, but it does not replace the registry or `validate-claim`
 as claim-status authority.
 
+The `blocking_issues` fields in registry evidence requirements and evidence
+manifests mean current unresolved GitHub blockers. Closed issues and merged
+pull requests must be removed from those fields; historical lineage or bounded
+evidence context belongs in claim blocker text, generated wording, or authority
+docs without keeping the evidence class blocked through `blocking_issues`.
+
 ## Successor And Comparator Wording
 
 The publishing-facing successor and comparator boundary is split in
