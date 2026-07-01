@@ -1276,7 +1276,7 @@ Concrete current drift:
   `docs/PRODUCTION_INTEGRITY_V3_RECORDS_OW014.md`,
   `docs/ROOT_AUTHENTICATION_OW015.md`,
   `docs/SAFE_LOCAL_RECLAMATION_OW103.md`,
-  `docs/SEND_RECEIVE_OW109.md`, and `docs/UAPI_ABI_BOUNDARY_OW202.md`.
+  and `docs/SEND_RECEIVE_OW109.md`.
   They are not current status authority; they are historical implementation
   notes until reconciled with current source and the review register.
 - A broader TFR-019 scan still finds 87 imported docs outside this review and

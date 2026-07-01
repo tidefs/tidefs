@@ -975,7 +975,7 @@ there is no fallback format to use.
 | Document | Relationship |
 |---|---|
 | `POLYMORPHIC_XATTR_STORAGE_DESIGN.md` | Defines the xattr storage layer that hosts ACL xattrs |
-| `POSIX_ACL_XATTR_CODEC_DESIGN.md` | Earlier (P2) version of this spec; superseded by this document |
+| Historical P2 ACL codec design | Earlier version of this spec; superseded by this document |
 | `CHECKSUM_ARCHITECTURE_DESIGN.md` | Checksum scheme used by xattr B+tree pages (not ACL-specific) |
 | `DATASET_FEATURE_FLAGS_DESIGN.md` | Defines `org.tidefs:posix_acl` feature flag |
 | `AUTHN_AUTHZ_OVERRIDE_AUDIT_MODEL_P9-02.md` | Security model; ACL evaluation fits into the access() check |

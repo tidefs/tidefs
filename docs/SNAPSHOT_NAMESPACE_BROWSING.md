@@ -40,8 +40,7 @@ snapshot browsing support.
 - `docs/VFS_ENGINE_API_CONTRACT.md` — inode-space operations, lookup(parent,
   name) -> InodeAttr, generation tracking for ESTALE, and the contract that
   InodeId, InodeAttr, and Generation are the canonical VFS vocabulary.
-- `docs/POSIX_ACL_XATTR_CODEC_DESIGN.md` and
-  `docs/design/posix-acl-xattr-codec-and-evaluation-design.md` — ACL evaluation
+- `docs/design/posix-acl-xattr-codec-and-evaluation-design.md` — ACL evaluation
   against caller credentials,
   mode-ACL synchronisation, and default-ACL inheritance.
 - Open issue #295 / PR #613 — active FUSE namespace stress work.

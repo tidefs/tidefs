@@ -295,7 +295,6 @@ this set.
 | Path | State | Classification note |
 |---|---|---|
 | `docs/PREVIEW_UAPI_ABI_BOUNDARY_OW202.md` | Current spec | Binding only for the checked tidefsctl command classification/admission table and the current non-release VFS fixed-width codec hook description. It is scanned by the claims gate and must keep explicit non-claim wording for production Linux ioctl/statx/ublk ABI freeze, kernel module ABI freeze, distributed operator UAPI finality, and kernelspace readiness. |
-| `docs/UAPI_ABI_BOUNDARY_OW202.md` | Historical input | Tracker-era duplicate with the retired `tidefs-schema-codec-vfs-boundary` crate path and old mirror-layout table. It may inform preview layout review, but it is not current UAPI/ABI authority and must not be cited as a production Linux ioctl/statx/ublk or kernel module ABI freeze. |
 | `docs/KERNEL_RESIDENT_POOL_ENGINE_ARCHITECTURE.md` | Current spec | Target architecture and evidence-tier map for kernel-resident pool-engine work. Current implementation evidence is the narrow Linux 7.0 QEMU configured-pool smoke described in `docs/GITHUB_CI.md`; full-kernel, daemonless storage parity, xfstests, crash/replay, object/extent engine, block-volume export, and production-readiness claims remain outside this status. |
 | `docs/KERNEL_MODULE_DEVELOPMENT_WORKFLOW_P7-05.md` | Current policy | Binding only as the Linux 7.0 kernel development workflow: external-module or Linux-branch ownership, out-of-repo build output, disposable QEMU guests, and Nix/QEMU acceptance gates. It is not runtime maturity evidence and does not require broad kernel validation for documentation-only slices. |
 | `docs/KERNEL_MODULE_FAMILY_MATRIX_ROLLOUT_ORDER_P7-01.md` | Historical input | Broad P7 rollout-law import with missing blueprint-era dependencies. Current kernel authority is `docs/KERNEL_RESIDENCY_AUTHORITY.md`, `docs/KERNEL_RESIDENT_POOL_ENGINE_ARCHITECTURE.md`, the scoped Linux workflow row, kmod READMEs, source, and issue-scoped QEMU/Kbuild evidence. |
@@ -399,7 +398,6 @@ xfstests coverage, distributed behavior, or runtime crash claims.
 | `docs/STD_NO_STD_KERNEL_USERSPACE_BOUNDARY_RULES_P1-02.md` | Historical input | Imported std/no_std boundary law for future kernel/userspace split. It remains design input until checked against the current workspace package graph and kernel-family source boundaries. |
 | `docs/RUST_FOR_LINUX_CRATE_TRAIT_BOUNDARIES_P7-02.md` | Historical input | Imported Rust-for-Linux crate-boundary target. Current scoped kernel rollout authority lives in the P7-01/P7-03/P7-05 rows above; this file does not prove implemented Rust-for-Linux leaf-module readiness. |
 | `docs/UAPI_FFI_CANONICAL_SCHEMA_BOUNDARY_RULES_P1-03.md` | Historical input | Imported UAPI/FFI schema law. The current preview UAPI authority is `docs/PREVIEW_UAPI_ABI_BOUNDARY_OW202.md`; this broader file is not current ABI/FFI freeze authority. |
-| `docs/LOCK_HIERARCHY_AND_CONCURRENCY_MODEL.md` | Historical input | Imported lock hierarchy target for storage, FUSE, ublk, and future cluster VFS RPC. It needs a source audit before it can supersede the scoped kernel locking row above. |
 
 **Block-volume adapter and ublk source-boundary docs**
 
@@ -538,7 +536,6 @@ larger than this documentation-authority cleanup.
 | Path | State | Classification note |
 |---|---|---|
 | `docs/POLYMORPHIC_XATTR_STORAGE_DESIGN.md` | Historical input | Imported Forgejo #1290 xattr storage design with proposed on-media records and ACL integration. Current xattr/ACL behavior and claims coverage were not audited here, so the document remains review material. |
-| `docs/POSIX_ACL_XATTR_CODEC_DESIGN.md` | Historical input | Imported ACL codec design that marks itself superseded and names a replacement issue lineage. It must not be cited as current POSIX ACL authority without a fresh ACL/xattr source review. |
 | `docs/REFCOUNT_DELTA_CLEANUP_QUEUES_DESIGN.md` | Historical input | Imported Forgejo #1180 refcount-delta reclamation design. Current reclaim/deadlist work is active elsewhere, but the complete queue data model and runtime evidence were not validated in this slice. |
 | `docs/SNAPSHOT_DEADLIST_PINNING_DESIGN.md` | Historical input | Imported snapshot deadlist/pinning design that reaches into reclamation, references, and snapshot lifecycle. It needs a dedicated snapshot/deadlist source and claims-gate review before promotion. |
 | `docs/UNIFIED_RESOURCE_GOVERNOR_DESIGN.md` | Historical input | Imported resource-governor design with broad scheduling and budget claims. Open resource-governor implementation work is separate; this document is not current runtime authority. |
