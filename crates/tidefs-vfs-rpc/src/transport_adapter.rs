@@ -842,7 +842,7 @@ impl VfsRpcTransportAdapter {
             connection_id,
             token,
         };
-        let record = self.pending_bulk.remove(&key).ok_or(
+        let record = *self.pending_bulk.get(&key).ok_or(
             VfsRpcTransportAdapterError::UnknownBulkCompletion {
                 connection_id,
                 token,
@@ -861,6 +861,10 @@ impl VfsRpcTransportAdapter {
                 len,
             });
         }
+        let record = self
+            .pending_bulk
+            .remove(&key)
+            .expect("matching bulk admission remains after validation");
         Ok(record.as_record(connection_id, token))
     }
 
@@ -1838,6 +1842,70 @@ mod tests {
         assert_eq!(bulk_record.token, descriptor.token);
         assert_eq!(bulk_record.handoff, VfsRpcBulkHandoff::WriteUpload);
         assert_eq!(adapter.pending_len(), 0);
+        assert_eq!(adapter.pending_bulk_len(), 0);
+    }
+
+    #[test]
+    fn bulk_completion_mismatch_does_not_retire_admission() {
+        let peer = PeerId(9);
+        let session_id = SessionId::new(33);
+        let mut adapter = VfsRpcTransportAdapter::new(
+            VfsRpcTransportAdapterConfig::default(),
+            healthy_sessions(peer, session_id),
+        );
+        let mut bulk = bulk_service();
+        let accept = bulk.accept_vfs_rpc_write_upload(session_id.0, 11, 90, 3, BulkPriority::Bulk);
+        let descriptor = VfsRpcBulkDescriptor::from_accept(&accept, 3).expect("descriptor");
+        let request = VfsRpcRequest::new(
+            OpId(90),
+            2,
+            3,
+            REQ_FLAG_BULK_PENDING,
+            VfsRpcRequestPayload::Write {
+                handle: sample_file_handle(),
+                offset: 0,
+                data: InlineOrBulk::Bulk {
+                    token: descriptor.token,
+                    len: descriptor.len,
+                },
+            },
+            Some(VfsRpcCredentials::root(peer)),
+        )
+        .expect("request");
+        adapter
+            .begin_request_with_bulk(
+                peer,
+                &request,
+                Instant::now(),
+                VfsRpcEnvelopeContext::default(),
+                &bulk,
+            )
+            .expect("begin bulk");
+
+        let wrong = VfsRpcBulkCompletion {
+            connection_id: session_id.0,
+            stream_id: 11,
+            token: descriptor.token,
+            op_id: request.header.op_id.0,
+            handoff: VfsRpcBulkHandoff::WriteUpload,
+            len: descriptor.len + 1,
+            bytes: b"abcd".to_vec(),
+        };
+        let err = adapter
+            .complete_bulk_handoff(&wrong)
+            .expect_err("mismatched completion rejected");
+
+        assert_eq!(err.errno(), Errno::EPROTO);
+        assert_eq!(adapter.pending_bulk_len(), 1);
+
+        let correct = VfsRpcBulkCompletion {
+            len: descriptor.len,
+            bytes: b"abc".to_vec(),
+            ..wrong
+        };
+        adapter
+            .complete_bulk_handoff(&correct)
+            .expect("matching completion still retires");
         assert_eq!(adapter.pending_bulk_len(), 0);
     }
 
