@@ -329,8 +329,8 @@ fn main() {
                 process::exit(1);
             }
         }
-        Some("check-p8-03-distributed-runtime") => {
-            if let Err(err) = cluster::check_p8_03_distributed_runtime_current_workspace() {
+        Some("check-distributed-replication-runtime" | "check-distributed-runtime") => {
+            if let Err(err) = cluster::check_distributed_replication_runtime_current_workspace() {
                 eprintln!("{err}");
                 process::exit(1);
             }
@@ -1386,7 +1386,7 @@ fn main() {
                     cluster::check_rebuild_backfill_rebalance_current_workspace(),
                     cluster::check_erasure_coded_layout_current_workspace(),
                     cluster::check_chunk_shipper_current_workspace(),
-                    cluster::check_p8_03_distributed_runtime_current_workspace(),
+                    cluster::check_distributed_replication_runtime_current_workspace(),
                 ),
                 "block" => run_checks!(
                     block::check_block_volume_adapter_core_current_workspace(),
@@ -1540,8 +1540,10 @@ fn run_all_checks() {
     if let Err(e) = cluster::check_checksum_architecture_current_workspace() {
         errors.push(format!("cluster/check-checksum-architecture: {e}"));
     }
-    if let Err(e) = cluster::check_p8_03_distributed_runtime_current_workspace() {
-        errors.push(format!("cluster/check-p8-03-distributed-runtime: {e}"));
+    if let Err(e) = cluster::check_distributed_replication_runtime_current_workspace() {
+        errors.push(format!(
+            "cluster/check-distributed-replication-runtime: {e}"
+        ));
     }
     // block
     if let Err(e) = block::check_block_volume_adapter_core_current_workspace() {
@@ -2084,8 +2086,11 @@ fn print_help() {
     println!("  check-rebuild-rebalance alias for check-rebuild-backfill-rebalance");
     println!("  check-erasure-coded-layout validate OW-306 erasure-coded layout markers");
     println!("  check-erasure-layout alias for check-erasure-coded-layout");
-    println!("  check-chunk-shipper      validate P8-03 data_copy_6 chunk shipper markers");
-    println!("  check-flow-commit-coordinator validate P8-03 data_copy_7 flow commit coordinator markers");
+    println!("  check-chunk-shipper      validate source-owned data_copy_6 chunk shipper markers");
+    println!("  check-flow-commit-coordinator validate source-owned data_copy_7 flow commit coordinator markers");
+    println!(
+        "  check-distributed-replication-runtime validate source-owned data_copy runtime markers"
+    );
     println!(
         "  check-extent-map         validate V1 inline-list extent map implementation markers"
     );
