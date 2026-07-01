@@ -2140,6 +2140,7 @@ pub fn finalize_prefetch_execution(
         || terminal_update_lacks_completion_result_evidence(update)
         || terminal_result_detail_exceeds_started_action(record, update.result_detail)
         || terminal_update_has_contradictory_refusal(update)
+        || terminal_update_lacks_protected_reserve_pressure_lowering(update)
         || terminal_update_lacks_result_refusal_evidence(record, update)
         || terminal_update_lacks_verification_evidence(record, update)
         || terminal_update_lacks_degraded_visibility_evidence(record, update)
@@ -2321,6 +2322,10 @@ fn terminal_update_refusal(update: PrefetchExecutorTerminalUpdate) -> StorageInt
         return update.refusal;
     }
 
+    if update.result_detail.protected_reserve_pressure {
+        return StorageIntentRefusalReason::ProtectedReserveWouldBeBreached;
+    }
+
     match update.outcome {
         PrefetchExecutorOutcome::Completed
         | PrefetchExecutorOutcome::DegradedVisible
@@ -2411,6 +2416,18 @@ fn terminal_update_lacks_result_refusal_evidence(
 
 fn terminal_update_has_contradictory_refusal(update: PrefetchExecutorTerminalUpdate) -> bool {
     update.refusal != StorageIntentRefusalReason::None
+        && matches!(
+            update.outcome,
+            PrefetchExecutorOutcome::Completed
+                | PrefetchExecutorOutcome::DegradedVisible
+                | PrefetchExecutorOutcome::HandoffRequired
+        )
+}
+
+fn terminal_update_lacks_protected_reserve_pressure_lowering(
+    update: PrefetchExecutorTerminalUpdate,
+) -> bool {
+    update.result_detail.protected_reserve_pressure
         && matches!(
             update.outcome,
             PrefetchExecutorOutcome::Completed
@@ -7450,6 +7467,89 @@ mod tests {
             PrefetchExecutorByteState::Refused
         );
         assert_record_has_no_authority_claims(rejected);
+    }
+
+    #[test]
+    fn terminal_update_rejects_completed_protected_reserve_pressure() {
+        let detail = PrefetchExecutorResultDetail {
+            protected_reserve_pressure: true,
+            ..terminal_detail()
+        };
+        let started = evaluate_prefetch_execution(admitted_charged_input(
+            PrefetchResidencyCandidateClass::BoundedReadahead,
+            detail,
+        ));
+        assert_eq!(started.outcome, PrefetchExecutorOutcome::Started);
+
+        let result_ref = evidence(
+            StorageIntentEvidenceKind::ResultRefusalEvidence,
+            RESULT_REFUSAL,
+        );
+        let rejected = finalize_prefetch_execution(
+            started,
+            PrefetchExecutorTerminalUpdate {
+                outcome: PrefetchExecutorOutcome::Completed,
+                result_detail: detail,
+                result_refusal_ref: result_ref,
+                evidence_cut: terminal_evidence_cut(started, detail, result_ref),
+                ..PrefetchExecutorTerminalUpdate::default()
+            },
+        );
+
+        assert_eq!(
+            rejected.outcome,
+            PrefetchExecutorOutcome::VerificationFailed
+        );
+        assert_eq!(
+            rejected.refusal,
+            StorageIntentRefusalReason::ValidationGateFailed
+        );
+        assert_eq!(
+            rejected.executor_byte_state,
+            PrefetchExecutorByteState::Refused
+        );
+        assert_record_has_no_authority_claims(rejected);
+    }
+
+    #[test]
+    fn terminal_update_records_protected_reserve_pressure_as_over_budget() {
+        let detail = PrefetchExecutorResultDetail {
+            protected_reserve_pressure: true,
+            ..terminal_detail()
+        };
+        let started = evaluate_prefetch_execution(admitted_charged_input(
+            PrefetchResidencyCandidateClass::BoundedReadahead,
+            detail,
+        ));
+        assert_eq!(started.outcome, PrefetchExecutorOutcome::Started);
+
+        let result_ref = evidence(
+            StorageIntentEvidenceKind::ResultRefusalEvidence,
+            RESULT_REFUSAL,
+        );
+        let over_budget = finalize_prefetch_execution(
+            started,
+            PrefetchExecutorTerminalUpdate {
+                outcome: PrefetchExecutorOutcome::OverBudget,
+                result_detail: detail,
+                result_refusal_ref: result_ref,
+                evidence_cut: terminal_evidence_cut(started, detail, result_ref),
+                ..PrefetchExecutorTerminalUpdate::default()
+            },
+        );
+
+        assert_eq!(over_budget.outcome, PrefetchExecutorOutcome::OverBudget);
+        assert_eq!(
+            over_budget.executor_byte_state,
+            PrefetchExecutorByteState::Blocked
+        );
+        assert_eq!(
+            over_budget.refusal,
+            StorageIntentRefusalReason::ProtectedReserveWouldBeBreached
+        );
+        assert!(over_budget.result_detail.protected_reserve_pressure);
+        assert_eq!(over_budget.evidence_refs.result_refusal_ref, result_ref);
+        assert_record_has_no_authority_claims(over_budget);
     }
 
     #[test]
