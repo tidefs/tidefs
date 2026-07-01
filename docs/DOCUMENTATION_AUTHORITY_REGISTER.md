@@ -88,6 +88,13 @@ not validate `storage.local.successor_comparator.v1`,
 `storage.intent.successor_comparator.v1`, declare release or production
 readiness, classify every imported document, or close TFR-019.
 
+Issue #1607 deleted `docs/design/openzfs-ceph-successor-claim.md` as a
+duplicate historical claim packet. Its lineage remains in git, the issue, and
+the PR only; current successor/comparator authority is limited to
+`validation/claims.toml`, generated `docs/CLAIM_REGISTRY.md`, and
+`docs/CLAIMS_GATE_POLICY.md`, with the split and umbrella claim ids still
+blocked until their exact evidence manifests validate.
+
 ## Product Admission Overlay Fold-Down (#1594)
 
 Issue #1594 moves the product-spine admission map into
@@ -367,7 +374,6 @@ surface beyond adding `docs/CLAIMS_GATE_POLICY.md`, which was already scanned.
 | `docs/TRANSACTION_COMMIT_GROUPS_PC007.md` | Historical input | Imported implemented-source specification for transaction commit groups (PC-007). Binds existing Local Filesystem transaction-root implementation and FUSE fsync boundary. |
 | `docs/MEMBERSHIP_SERVICE_DESIGN.md` | Historical input | Imported design-spec for cluster membership service. References Forgejo issue #1209. ZFS/Ceph comparison text is design input only and is not a cluster-membership, distributed-availability, scale, performance, or successor claim. Claims registry has no validated cluster-membership claim. |
 | `docs/ERASURE_CODING_PLACEMENT_DESIGN.md` | Historical input | Imported design-spec superseded by the G4 pillar at `docs/design/production-erasure-coding-crush-placement-g4-pillar.md`. References Forgejo issue #1249. |
-| `docs/design/openzfs-ceph-successor-claim.md` | Historical input | Imported sealed design-spec for the OpenZFS/Ceph successor claim with 8-dimension quantitative comparison. The seal is historical, not current claim authority. Claims gate currently blocks publishing OpenZFS/Ceph successor claims; any future retained product-facing statement must route through `storage.local.successor_comparator.v1` or `storage.distributed.successor_comparator.v1` plus their comparator evidence. |
 | `docs/design/production-erasure-coding-crush-placement-g4-pillar.md` | Historical input | Imported G4 pillar design-spec for TideCRUSH deterministic placement. References Forgejo issue #1779. Supersedes earlier erasure-coding placement designs. |
 | `docs/design/compression-design-strategy.md` | Historical input | Imported design-spec for compression format extension model. References Forgejo issue #1245. Transform authority blocks mounted compression claims. |
 
@@ -484,8 +490,6 @@ required by those registry entries:
   BPR mechanism is subordinate to #848 storage-intent relocation gates, #844/#856
   cost and wear evidence, #845 prediction/payback evidence, and #904 media
   capability evidence.
-- `docs/design/openzfs-ceph-successor-claim.md`: the sealed successor claim is
-  historical input, not current claim authority.
 - `docs/WHOLE_REPO_REVIEW.md`: incumbent references are fail-closed review
   blockers only.
 
