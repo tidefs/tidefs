@@ -287,15 +287,6 @@ Forgejo-era URLs or live-looking imported status markers. These files remain in
 the tree only as historical input unless a future focused issue promotes a
 narrow source-backed scope.
 
-### Empty Module Owners Scaffold Retirement (TFR-019 / #1619)
-
-Issue #1619 deleted the empty `MODULE_OWNERS_INVARIANTS_PC002` scaffold and
-retired its xtask aliases because the document had no owner-path rows to
-verify. Module ownership, subsystem invariants, release readiness, production
-readiness, and OpenZFS/Ceph-class wording remain blocked until a future
-source-backed issue introduces real owner-path data, validation evidence, and
-claim-gate coverage for an exact scope.
-
 | Path | State | Classification note |
 |---|---|---|
 | `docs/THREE_CONTRACT_ARCHITECTURE.md` | Historical input | Imported three-contract meta-architecture/design-law text. It is not current on-media, VFS, trace, JSONL, multi-implementation, or release authority. |
@@ -306,6 +297,15 @@ claim-gate coverage for an exact scope.
 | `docs/crates/types-core-consolidation-plan.md` | Historical input | Historical consolidation plan for deleted type-core scaffold roots. Current package authority is `docs/workspace-package-classification.md`. |
 | `docs/k7-kbuild-toolchain.md` | Historical input | Historical Kbuild toolchain preparation note. Current kernel workflow authority is `docs/KERNEL_MODULE_DEVELOPMENT_WORKFLOW_P7-05.md`. |
 | `docs/security/security-audit-2026-04-30.md` | Historical input | Chronological pre-release security audit snapshot. It is not current unsafe-code, security, release-readiness, or product-hardening authority. |
+
+### Empty Module Owners Scaffold Retirement (TFR-019 / #1619)
+
+Issue #1619 deleted the empty `MODULE_OWNERS_INVARIANTS_PC002` scaffold and
+retired its xtask aliases because the document had no owner-path rows to
+verify. Module ownership, subsystem invariants, release readiness, production
+readiness, and OpenZFS/Ceph-class wording remain blocked until a future
+source-backed issue introduces real owner-path data, validation evidence, and
+claim-gate coverage for an exact scope.
 
 ### Request Contract Authority (TFR-019 / #1136)
 
