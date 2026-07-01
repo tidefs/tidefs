@@ -1651,6 +1651,14 @@ pub fn evaluate_prefetch_execution(input: PrefetchExecutorInput) -> PrefetchExec
     }
 
     if family.is_negative_enforcement() || no_prefetch_decision(input.decision) {
+        if result_detail_has_execution_measurements(input.result_detail) {
+            return terminal(
+                record,
+                PrefetchExecutorOutcome::VerificationFailed,
+                PrefetchExecutorByteState::Refused,
+                StorageIntentRefusalReason::ValidationGateFailed,
+            );
+        }
         record.executor_byte_state = PrefetchExecutorByteState::NoPrefetchEnforced;
         record.outcome = PrefetchExecutorOutcome::Completed;
         return record;
@@ -1668,6 +1676,14 @@ pub fn evaluate_prefetch_execution(input: PrefetchExecutorInput) -> PrefetchExec
     }
 
     if authority_handoff_required(input.decision, family) {
+        if result_detail_has_execution_measurements(input.result_detail) {
+            return terminal(
+                record,
+                PrefetchExecutorOutcome::VerificationFailed,
+                PrefetchExecutorByteState::Refused,
+                StorageIntentRefusalReason::ValidationGateFailed,
+            );
+        }
         let handoff_boundary_refusal = authority_handoff_boundary_refusal(input);
         if handoff_boundary_refusal as u16 != StorageIntentRefusalReason::None as u16 {
             return terminal(
@@ -2604,6 +2620,23 @@ fn terminal_charge_requires_transport(required: PrefetchExecutorCostRequirementM
 fn initial_result_detail_lacks_feedback_evidence(input: PrefetchExecutorInput) -> bool {
     input.result_detail.has_feedback_payback_inputs()
         && !initial_result_detail_has_snapshot_feedback_roots(input)
+}
+
+fn result_detail_has_execution_measurements(detail: PrefetchExecutorResultDetail) -> bool {
+    detail.has_usage_measurement()
+        || detail.flash_write_bytes != 0
+        || detail.pmem_write_bytes != 0
+        || detail.waf_micros != 0
+        || detail.ram_pressure_bytes != 0
+        || detail.cache_index_write_bytes != 0
+        || detail.predictor_metadata_write_bytes != 0
+        || detail.retained_evidence_bytes != 0
+        || detail.wan_bytes != 0
+        || detail.egress_cost_microunits != 0
+        || detail.restore_cost_microunits != 0
+        || detail.staging_capacity_bytes != 0
+        || detail.cpu_us != 0
+        || detail.memory_bytes != 0
 }
 
 fn initial_result_detail_has_snapshot_feedback_roots(input: PrefetchExecutorInput) -> bool {
@@ -5576,6 +5609,36 @@ mod tests {
     }
 
     #[test]
+    fn authority_handoff_rejects_pre_dispatch_execution_measurements() {
+        let mut input =
+            admitted_input(PrefetchResidencyCandidateClass::AuthorityPromotionCandidate);
+        input.decision.outcome = PrefetchResidencyDecisionOutcome::PromotionCandidate;
+        input.decision.selected_residency = PrefetchResidencyStateClass::PmemDurable;
+        input.decision.evidence_refs.relocation_boundary_ref =
+            evidence(StorageIntentEvidenceKind::RelocationReceipt, RELOCATION);
+        input
+            .evidence_query_snapshot
+            .included_refs
+            .push(input.decision.evidence_refs.relocation_boundary_ref)
+            .unwrap();
+        input.result_detail = terminal_detail();
+        add_initial_feedback_roots(&mut input.evidence_query_snapshot, input.result_detail);
+
+        let record = evaluate_prefetch_execution(input);
+
+        assert_eq!(record.outcome, PrefetchExecutorOutcome::VerificationFailed);
+        assert_eq!(
+            record.executor_byte_state,
+            PrefetchExecutorByteState::Refused
+        );
+        assert_eq!(
+            record.refusal,
+            StorageIntentRefusalReason::ValidationGateFailed
+        );
+        assert_record_has_no_authority_claims(record);
+    }
+
+    #[test]
     fn explicit_no_prefetch_completes_without_dispatch_authority() {
         let mut input = admitted_input(PrefetchResidencyCandidateClass::NoPrefetch);
         input.decision.outcome = PrefetchResidencyDecisionOutcome::NoAction;
@@ -5587,6 +5650,28 @@ mod tests {
             PrefetchExecutorByteState::NoPrefetchEnforced
         );
         assert!(record.is_non_authority_population());
+        assert_record_has_no_authority_claims(record);
+    }
+
+    #[test]
+    fn no_prefetch_rejects_pre_dispatch_execution_measurements() {
+        let mut input = admitted_input(PrefetchResidencyCandidateClass::NoPrefetch);
+        input.decision.outcome = PrefetchResidencyDecisionOutcome::NoAction;
+        input.admission = PrefetchExecutorAdmissionRecord::default();
+        input.result_detail = terminal_detail();
+        add_initial_feedback_roots(&mut input.evidence_query_snapshot, input.result_detail);
+
+        let record = evaluate_prefetch_execution(input);
+
+        assert_eq!(record.outcome, PrefetchExecutorOutcome::VerificationFailed);
+        assert_eq!(
+            record.executor_byte_state,
+            PrefetchExecutorByteState::Refused
+        );
+        assert_eq!(
+            record.refusal,
+            StorageIntentRefusalReason::ValidationGateFailed
+        );
         assert_record_has_no_authority_claims(record);
     }
 
