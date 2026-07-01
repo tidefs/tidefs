@@ -257,8 +257,6 @@ stay out of this coordination slice:
 - #1019 owns historical/evidence treatment for retired type-root dependency
   tables in
   `docs/design/crate-dependency-graph-ownership-boundaries.md`.
-- #1020 owns retired type-root workspace prose in
-  `docs/crates/workspace-structure.md`.
 - #1021 owns the deleted `docs/FEATURE_MATRIX.md` reference in
   `docs/design/deterministic-cluster-simnet-protocol-correctness-testing.md`.
 - #1635 deleted the former #1022/#1023 design-subdir cleanup/orphan-index
