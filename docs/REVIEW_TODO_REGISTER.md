@@ -39,20 +39,16 @@ Important 2026-06-01 findings:
   surfaces; future cleanup should keep mounted/runtime/product and compact
   invariant tests, compress redundant branch tests, and remove or demote
   marker-only, stale-fixture, scaffold, and weakened-fixture claims.
-- `TFR-020`: issue #500 adds `docs/TEST_SIGNAL_AUDIT.md`, classifying the
-  scoped `crates/*/tests/`, inline `crates/*/src/`, and `apps/*/tests/`
-  roots by product/invariant, harness/scaffold, and marker/stale signal. The
-  audit records per-package counts, high-confidence marker/delete candidates,
-  and claim-registry cross-references; it does not delete or refactor tests.
-- `TFR-020`: issue #691 deletes the high-confidence comment-only and ignored
-  non-Linux no-op tests named by the issue #500 marker/delete-candidate audit.
-  The removed tests had no `validation/claims.toml` references; the surviving
-  Linux FUSE validation tests continue to exercise mount lifecycle and basic
-  I/O product paths. The same slice keeps daemon-, tool-, and
-  runner-environment-dependent validation tests from reporting missing
-  prerequisites or transient runner contention as product failures. Broader
-  low-value fixture cleanup remains itemized by `docs/TEST_SIGNAL_AUDIT.md`
-  and should stay issue-scoped to the owning code.
+- `TFR-020`: issues #500 and #691 are historical static-audit and cleanup
+  slices, not live test-count authority. The #500 review recorded that test
+  mass was large enough to require signal-quality review by product/invariant,
+  harness/scaffold, and low-value categories. Issue #691 removed the
+  high-confidence comment-only and ignored non-Linux no-op tests without
+  changing product behavior or claim status. Future cleanup must stay
+  issue-scoped to the owning code, apply `docs/TEST_SIGNAL_POLICY.md`, and cite
+  claim evidence through `validation/claims.toml`, generated
+  `docs/CLAIM_REGISTRY.md`, evidence artifacts, or PR/issue validation records
+  instead of preserving mutable audit snapshots.
 - `TFR-021`: issue #281 introduced the nextgen verification roadmap as staging
   lineage; issue #483 and issue #1066 folded that lane into
   `docs/NEXTGEN_VERIFICATION_PERFORMANCE_OFFLOAD_PLAN.md`, and issue #1656
