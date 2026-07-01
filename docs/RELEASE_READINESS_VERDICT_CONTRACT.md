@@ -2,7 +2,7 @@
 
 Issue: #1279
 Date: 2026-06-24
-Status: design decision; follow-up issue map recorded below
+Status: design decision; completed follow-up map recorded below
 
 This document defines the release-readiness verdict boundary for TideFS.
 It does not declare TideFS release-ready. It records where the verdict
@@ -15,7 +15,7 @@ whole-product admission.
 TideFS has guardrails around release and product claims (`docs/CLAIMS_GATE_POLICY.md`,
 `docs/UNRELEASED_AUTHORITY_POLICY.md`), a release-candidate evidence index
 (`docs/RELEASE_CANDIDATE_EVIDENCE_CONTRACT.md`), and a performance-gate receipt
-with a `release_ready` field (`docs/PERFORMANCE_BUDGETS_SLO_REGRESSION_GATES_P10-03.md`).
+with a `perf_gate_ready` field (`docs/PERFORMANCE_BUDGETS_SLO_REGRESSION_GATES_P10-03.md`).
 None of these documents is a whole-product release-readiness verdict. This
 contract:
 
@@ -41,10 +41,11 @@ contract:
   `xtask check-claims-gate`. Claims are individually validated; no single claim or
   summary row acts as a product admission verdict.
 - `docs/PERFORMANCE_BUDGETS_SLO_REGRESSION_GATES_P10-03.md` (2026-06-24 snapshot):
-  Section 12.12.5 defines `GateReceipt.release_ready` as a gate-local receipt: it
-  requires subject completeness, zero artifact gap, and zero budget gap for the
-  `performance_budget_0` matrix rows. It is a performance-gate admission signal,
-  not a whole-product release-readiness verdict.
+  Section 12.12.5 defines `GateReceipt.perf_gate_ready` as a gate-local
+  receipt: it requires subject completeness, at least one runtime validation
+  row, zero artifact gap, and zero budget gap for the `performance_budget_0`
+  matrix rows. It renders as `Performance gate: READY` or `Performance gate:
+  NOT READY`, not as a whole-product release-readiness verdict.
 - `docs/GITHUB_CI.md` (current): Describes the Release Candidate workflow as a
   manual-only self-hosted composition of Rust, Nix, QEMU smoke, xfstests, and RDMA
   lanes. The workflow uploads a `release-candidate-evidence-index` JSON artifact
@@ -62,10 +63,11 @@ contract:
 - `README.md` and `AGENTS.md`: TideFS is pre-alpha. Claims must stay behind
   implementation reality. OpenZFS/Ceph-class target is aspirational.
 - Bounded inspection of `crates/tidefs-validation/src/performance_gate/runner.rs`:
-  `GateReceipt.release_ready` is computed as
+  `GateReceipt.perf_gate_ready` is computed as
   `m.has_runtime_validation() && invariant_holds && artifact_gap == 0 && budget_gap == 0`.
-  The field is named without a `performance_` or `perf_gate_` prefix, which risks
-  a reader treating it as a whole-product signal.
+  The rendered report uses the scope-qualified `Performance gate:` label, so the
+  receipt remains an input to this verdict boundary rather than a product
+  admission signal.
 
 ## Compared Alternatives
 
@@ -91,7 +93,7 @@ admission.
 **Assessment: Selected.** This is the cleanest separation. Each document keeps
 one responsibility: the evidence contract describes the input, this verdict
 contract describes the decision boundary. Gate-local receipts (P10-03
-`release_ready`, claims-gate claim status, CI lane results) remain local
+`perf_gate_ready`, claims-gate claim status, CI lane results) remain local
 signals; the verdict contract is the only place that combines them into a
 product admission decision. The document can be updated as evidence families
 mature without rewiring the input documents.
@@ -102,11 +104,12 @@ Defer the verdict contract until more evidence families are implemented and the
 product is closer to a real release decision.
 
 **Assessment: Rejected.** Multiple documents already have readiness-adjacent
-concepts. The P10-03 `release_ready` field is in live source and rendered in
-markdown as "READY" or "NOT READY." The claims gate scans for publishing-facing
-capability statements. The release-candidate workflow produces an evidence index.
-Without a verdict contract, a reader could reasonably interpret any of these as
-a whole-product signal. Defining the boundary now costs little and prevents
+concepts. The P10-03 `perf_gate_ready` field is in live source and rendered in
+markdown with the scope-qualified `Performance gate: READY` or `Performance
+gate: NOT READY` label. The claims gate scans for publishing-facing capability
+statements. The release-candidate workflow produces an evidence index. Without
+a verdict contract, a reader could reasonably interpret any of these as a
+whole-product signal. Defining the boundary now costs little and prevents
 misinterpretation during the pre-release period when the most evidence gaps
 exist.
 
@@ -135,7 +138,7 @@ as open gaps in the verdict artifact.
 |---|---|---|
 | Release-candidate evidence index | `docs/RELEASE_CANDIDATE_EVIDENCE_CONTRACT.md`, `release-candidate-evidence-index` artifact | Defined; smoke and full profiles exist; lane-local manifests (issues 643-646) are still absent |
 | Claims gate | `docs/CLAIMS_GATE_POLICY.md`, `validation/claims.toml`, `xtask check-claims-gate` | Enforced; individual claims validated; no product-admission claim exists |
-| Performance budget gate | `crates/tidefs-validation/src/performance_gate/`, `GateReceipt`; historical design input in `docs/PERFORMANCE_BUDGETS_SLO_REGRESSION_GATES_P10-03.md` | Gate-local `release_ready` implemented; minimum suite families remain incomplete |
+| Performance budget gate | `crates/tidefs-validation/src/performance_gate/`, `GateReceipt`; historical design input in `docs/PERFORMANCE_BUDGETS_SLO_REGRESSION_GATES_P10-03.md` | Gate-local `perf_gate_ready` implemented; minimum suite families remain incomplete |
 | Standing CI gate | `docs/GITHUB_CI.md`, Rust Fast, Nix Checks, Clippy, Secret Policy | Active on self-hosted runners; path-filtered for docs-only PRs |
 | Operator truth surfaces | `docs/DASHBOARDS_TRACES_OPERATOR_TRUTH_SURFACES_P10-04.md` (missing), `docs/DISTRIBUTED_OPERATOR_PRODUCT_SURFACE_BLOCKER_MAP_OW307D.md` (historical input) | P10-04 document does not exist; OW-307D blocker map records six unsatisfied properties |
 | Operator UAPI authority | `docs/OPERATOR_UAPI_AUTHORITY.md` | Pre-alpha command boundary is closed, but it does not create a runtime-fed product carrier |
@@ -151,7 +154,7 @@ gaps explicitly.
 
 | Concept | Scope | Example |
 |---|---|---|
-| Gate-local receipt | One evidence family or matrix | P10-03 `GateReceipt.release_ready = true` means the performance budget rows pass; it does not mean TideFS is release-ready |
+| Gate-local receipt | One evidence family or matrix | P10-03 `GateReceipt.perf_gate_ready = true` means the performance budget rows pass; it does not mean TideFS is release-ready |
 | Gate-local receipt | One evidence family or matrix | `validate-claim <id>` passing means that claim's evidence artifacts are present and valid; it does not validate other claims |
 | Gate-local receipt | One evidence family or matrix | Release Candidate `smoke` profile passing means the narrow compose succeeded; it does not validate xfstests, RDMA, or distributed behavior |
 | Whole-product admission | All active families, with open gaps recorded | A verdict artifact (GitHub issue or equivalent) consuming all evidence families, naming consumed runs and artifacts, and recording explicit non-claims |
@@ -170,9 +173,9 @@ readiness unless accompanied by the verdict owner's recorded decision:
 - "GA-ready"
 - "stable release"
 
-Gate-local receipts that use `release_ready` as a field name must include
-a scope qualifier in their rendered output (e.g., "Performance gate: READY")
-and must not render an unqualified "READY" / "NOT READY" string that can be
+Gate-local receipts must use a scope-qualified field name or a scope-qualified
+rendered label, for example `perf_gate_ready` and `Performance gate: READY`.
+They must not render an unqualified "READY" / "NOT READY" string that can be
 misread as a whole-product verdict.
 
 ### What is explicitly not claimed
@@ -180,7 +183,7 @@ misread as a whole-product verdict.
 This contract records that as of 2026-06-24:
 
 - TideFS is **not** release-ready. No release-readiness verdict exists.
-- The P10-03 `GateReceipt.release_ready` field is a **performance-gate-local**
+- The P10-03 `GateReceipt.perf_gate_ready` field is a **performance-gate-local**
   receipt, not a whole-product admission claim.
 - The Release Candidate workflow produces an **evidence index**, not a verdict.
 - The claims gate validates individual claims; no claim or summary row acts as
@@ -191,18 +194,17 @@ This contract records that as of 2026-06-24:
 - TFR-017 (transport/cluster authority) remains open, and the closed pre-alpha
   operator/UAPI command boundary does not create a runtime-fed product carrier.
 
-## Follow-Up Issue Map
+## Completed Follow-Up Issue Map
 
-Each remaining follow-up issue is intentionally non-overlapping. Each should
-cite this contract and keep its expected write set within the listed paths
-unless updated before work starts. Cross-reference additions for the release
-candidate evidence contract, P10-03, GITHUB_CI.md, and INDEX.md are completed
-by #1279 and are not listed as future follow-ups.
+The original follow-up issues were intentionally non-overlapping. They are
+recorded here as closure evidence, not as remaining work. Cross-reference
+additions for the release candidate evidence contract, P10-03, GITHUB_CI.md,
+and INDEX.md were completed by #1279 and are not listed separately.
 
 | Issue | Expected write set | Scope |
 |---|---|---|
-| #1283 | `crates/tidefs-validation/src/performance_gate/runner.rs`, `crates/tidefs-validation/src/performance_gate/consolidation.rs`, `xtask/tidefs-xtask/src/main.rs`, `docs/PERFORMANCE_BUDGETS_SLO_REGRESSION_GATES_P10-03.md` | Rename P10-03 `release_ready` to `perf_gate_ready` or equivalent and update `GateReceipt::render_markdown()` so the field name and rendered label are both gate-local. Update P10-03 prose and any inline comments. |
-| #1284 | `docs/DOCUMENTATION_AUTHORITY_REGISTER.md` | Add rows for the release-facing evidence-input documents named by this contract. This slice adds the contract row only; the remaining classification rows are deferred to this focused follow-up. |
+| #1283 | `crates/tidefs-validation/src/performance_gate/runner.rs`, `crates/tidefs-validation/src/performance_gate/consolidation.rs`, `xtask/tidefs-xtask/src/main.rs`, `docs/PERFORMANCE_BUDGETS_SLO_REGRESSION_GATES_P10-03.md` | Completed the P10-03 rename from `release_ready` to `perf_gate_ready` and updated `GateReceipt::render_markdown()` so the rendered label is gate-local. Updated P10-03 prose and inline comments. |
+| #1284 | `docs/DOCUMENTATION_AUTHORITY_REGISTER.md` | Completed rows for the release-facing evidence-input documents named by this contract. |
 
 ## Non-Overlap with #1270
 
