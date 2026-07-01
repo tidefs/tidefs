@@ -725,3 +725,27 @@ boundary findings remain unchanged: TFR-017 still blocks broad multi-node or
 production cluster claims, and the deleted closeout notes are not current
 policy, current spec, implementation status, release-readiness evidence, or
 product authority.
+
+### Forgejo-Era Cluster Design Root Consolidation (TFR-019 / #1638)
+
+Issue #1638 removed the unreferenced imported cluster/admin, snapshot,
+mmap-coherency, and metadata-resilience roots:
+`docs/design/admin-service-wire-protocol.md`,
+`docs/design/cluster-admin-proxy-model.md`,
+`docs/design/cluster-wide-atomic-snapshot-coordination.md`,
+`docs/design/mmap-cluster-coherency.md`, and
+`docs/design/metadata-redundancy-fallback.md`. Their lineage remains in git,
+issue #1638, and its pull request only.
+
+The surviving source- or doc-referenced design roots below are retained as
+historical input because editing the references is outside the #1638 write
+boundary. They do not promote distributed mode, clustered POSIX, RDMA, mmap
+coherency, metadata redundancy, release readiness, production readiness,
+OpenZFS/Ceph parity, or successor/comparator wording.
+
+| Path | State | Classification note |
+|---|---|---|
+| `docs/design/cluster-bulk-plane-protocol.md` | Historical input | Retained for narrow `BulkPriority` priority-class lineage cited by source comments. Active transport authority remains `docs/TRANSPORT_CLUSTER_AUTHORITY.md`, membership authority, placement-receipt authority, source, validation claims, generated claim docs, and live GitHub issues/PRs. |
+| `docs/design/cluster-distributed-lock-service-sharded-leases.md` | Historical input | Retained for a remaining historical design cross-reference. It is not clustered POSIX, distributed lock, multi-writer, or mmap coherency authority. |
+| `docs/design/cluster-security-identity-model.md` | Historical input | Retained for narrow security-section lineage cited by source comments. Active trust, operator, transport, and membership boundaries remain source-backed authority surfaces and live GitHub issues/PRs. |
+| `docs/design/vfs-rpc-wire-protocol.md` | Historical input | Retained for service-id and method-id lineage cited by source comments and historical docs. It is not active clustered POSIX, VFS forwarding, or data-plane authority. |

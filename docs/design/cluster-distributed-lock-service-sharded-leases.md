@@ -1,37 +1,31 @@
-# Cluster-Wide Distributed Lock Service — Sharded Leases, Inode-Range Lock Forwarding, Multi-Writer Coherency
+# Cluster-Wide Distributed Lock Service - Historical Input
 
-**Issue**: [#1248](http://172.16.106.12/forgejo/forgeadmin/tidefs/issues/1248)
-**Status**: design-spec
-**Priority**: P2
-**Lane**: coordination (Layer 9: Coordination)
-**Milestone**: DESIGN-M4: Cluster Infrastructure (Layers 8-11)
-**Depends on**: #1228 (cluster security/identity model), #1210 (transport boundedness), #1209 (MEMBERSHIP service)
-**Blocks**: multi-writer dataset operations, FUSE lock forwarding, cluster mmap coherency
+TFR-019 / issue #1638 classification: historical input. This imported
+Forgejo-era lock-service sketch remains only because another historical design
+file still cites this path. Active transport, membership, storage-intent, and
+claim authority lives in the source-backed authority documents,
+`validation/claims.toml`, generated claim docs, and live GitHub issues/PRs.
+This file is not active distributed-lock, clustered POSIX, multi-writer, mmap
+coherency, or product-readiness authority.
 
-## Abstract
+## Historical Sketch
 
-This document defines the Cluster-Wide Distributed Lock Service for TideFS: a
-purpose-built LOCK service (service_id = `0x0A`) that replaces
-dataset-scoped exclusive writer leases with a three-tier sharded lease
-hierarchy: per-directory subtree leases, per-inode lease tokens, and per-inode
-byte-range record locks. The service provides acquire/renew/release/recall/break
-semantics, fault-tolerant lock state replication via an embedded Raft consensus
-group, FUSE lock operation forwarding (flock, fcntl setlk/getlck) from
-non-writer nodes, and lease-epoch fencing integrated with the membership layer.
+The imported text below sketched a LOCK service with sharded leases,
+record-lock forwarding, and membership fencing. Retaining it preserves lineage
+for a remaining historical cross-reference; it does not prove that the sketched
+service, forwarding path, consensus model, or multi-node coherency behavior
+exists as product behavior.
 
-This is the Phase 2+ scalability milestone from the v0.262 design book S17.5:
-without it, a single writer per dataset becomes the bottleneck. The design moves
-TideFS from coarse-grained dataset-scoped lease locking to fine-grained,
-concurrent, multi-writer operation.
+The old milestone text below is imported background only.
 
 ---
 
 ## 1. Problem Statement
 
-### 1.1 Current baseline (Phase 1)
+### 1.1 Historical baseline
 
-The current lease model (`tidefs-lease`) provides **dataset-scoped EXCLUSIVE
-writer leases**:
+The imported baseline text described `tidefs-lease` as providing
+**dataset-scoped EXCLUSIVE writer leases**:
 
 - One node holds the exclusive writer lease for a dataset
 - All other nodes serve reads only

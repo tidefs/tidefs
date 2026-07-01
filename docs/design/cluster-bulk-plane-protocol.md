@@ -1,24 +1,19 @@
-# Cluster BULK Plane Protocol — Design Specification
+# Cluster BULK Plane Protocol - Historical Input
 
-**Issue**: [#1666](http://172.16.106.12/forgejo/forgeadmin/tidefs/issues/1666)
-**Status**: design-spec
-**Priority**: P2
-**Lane**: transport
-**Depends on**: #1210 (transport boundedness), #1211 (daemon memory budget), #1227 (security model), #1666 (unified scheduling classes)
-**Related**: #1213 (VFS Engine/VFS_RPC), #1216 (ublk), #1228 (security model), #1241 (COMMIT_GROUP sync scheduling)
+TFR-019 / issue #1638 classification: historical input. This imported
+Forgejo-era protocol sketch remains only because source comments still cite
+its priority-class lineage. Active transport, membership, placement-receipt,
+operator, and claim authority lives in the source-backed authority documents,
+`validation/claims.toml`, generated claim docs, and live GitHub issues/PRs.
+This file is not active product authority, RDMA readiness evidence, or a
+distributed-mode validation claim.
 
-## Abstract
+## Historical Sketch
 
-This document defines the Cluster BULK Plane: a shared byte-transfer layer that
-provides bounded, credit-scheduled bulk data movement between cluster nodes. The
-protocol runs as service_id `0x07` on the tidefs cluster transport (#1210). The
-first live implementation target is TCP_STREAM under a unified
-OFFER/ACCEPT/CREDIT/DONE/ABORT state machine. RDMA direct-memory modes remain
-disabled design entries until the transport, security, memory-accounting,
-credit-lifecycle, abort-cleanup, and runtime-validation gates in §9.3 are all
-satisfied. Higher-level services (VFS_RPC, COMMIT_GROUP, BLOCK_EXPORT) never
-invent their own byte-mover; they speak only in terms of `BulkOffer` and
-`BulkToken`.
+The imported text below sketched a shared byte-transfer layer for cluster-node
+data movement. Retaining it preserves narrow lineage for the bulk scheduling
+class names; it does not prove that the sketched protocol, RDMA modes, cluster
+forwarding, or higher-level service integrations exist as product behavior.
 
 ---
 
