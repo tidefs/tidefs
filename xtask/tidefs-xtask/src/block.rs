@@ -1116,19 +1116,6 @@ pub fn check_block_volume_ublk_start_dev_boundary_current_workspace() -> Result<
     );
     check_source_markers(
         &root,
-        &[
-            "OW-301T guarded ublk START_DEV control boundary",
-            "UBLK_U_CMD_START_DEV",
-            "IORING_OP_URING_CMD",
-            "cmd.data[0]",
-            "data queue FETCH_REQ",
-            "data_queue_fetches_not_ready",
-            "does not submit START_DEV without ready data queues",
-        ],
-        &mut missing,
-    );
-    check_source_markers(
-        &root,
         "xtask/tidefs-xtask/src/main.rs",
         &[
             "check-block-volume-ublk-start-dev-boundary",
