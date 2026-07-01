@@ -667,4 +667,3 @@ pub struct ConversionRequest {
 - `crates/tidefs-background-scheduler/src/lib.rs` — 5-stage priority scheduler
 - `crates/tidefs-replication-model/src/lib.rs` — Replica placement and movement model
 - `docs/ONLINE_DEFRAG_BPR_DESIGN.md` — Defrag design (#1265)
-- `docs/design/unified-on-media-format-lifecycle.md` — Format lifecycle framework

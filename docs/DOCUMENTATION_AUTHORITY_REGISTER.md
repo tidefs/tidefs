@@ -758,21 +758,21 @@ request. This deletion does not create build/troubleshooting authority,
 derived-view implementation evidence, release-readiness evidence, or product
 claims.
 
-### Unified On-Media Format Lifecycle (TFR-019 / #1242)
+### Format Lifecycle Historical Root Deletions (TFR-019 / #1705)
 
-Classified for TFR-019 / GitHub issue #1242 on 2026-06-24 after reviewing this
-register's authority rule and review method, the TFR-019 notes in
-`docs/REVIEW_TODO_REGISTER.md`, the imported unified-on-media-format-lifecycle
-document, `docs/INDEX.md`, `docs/GITHUB_PR_DEVELOPMENT.md`,
-`docs/design/on-media-format-strategy.md`, and bounded source/doc searches for
-Forgejo-era issue references, design-spec, status, lane, maturity, and priority
-metadata in the current documentation surface. This slice does not edit
-`docs/design/on-media-format-strategy.md`, other sibling #952 leftover files,
-product source, or unrelated docs.
+Issue #1705 deleted the imported unified format-lifecycle and deterministic
+crash-injection design roots instead of preserving them as live historical
+surfaces. Their design-spec/status wording came from old Forgejo-era planning,
+depended on absent or undefined imported issue paths, and did not match a
+current source-backed product authority surface. Their lineage remains in git,
+issue #1705, and its pull request only.
 
-| Path | State | Classification note |
-|---|---|---|
-| `docs/design/unified-on-media-format-lifecycle.md` | Historical input | Imported Forgejo-era unified five-phase lifecycle design with old issue #1238 metadata (Forgejo on `172.16.106.12`), design-spec status, P1 priority, docs lane, and cross-references to old Forgejo-era issue numbers (#1220, #1223, #1225, #1222, #1224, #1185, #1235, #1236) whose current TideFS GitHub issue mapping is undefined under TFR-019. The file defines a meta-framework for on-media record format phases (record families, feature flags, TLV extensions, rebake, golden vectors, trace oracle, torn-commit recovery) that has no current live-source implementation evidence, no claim-registry coverage, and no current format-lifecycle policy authority in the active GitHub issue and PR coordination surface. The individual format docs referenced remain canonical for their own domains under separate register rows; this lifecycle file is preserved as design lineage material and must not be cited as current TideFS implementation status, release-readiness evidence, or format-lifecycle authority. |
+Current format and crash evidence remains with the relevant source crates,
+validation artifacts, claim registry, release-readiness contract, trace/crash
+oracle authority surfaces, and live GitHub issues/PRs. This deletion does not
+promote production format lifecycle, complete crash-injection coverage, runtime
+crash-safety claims, release readiness, OpenZFS/Ceph parity, or
+successor/comparator wording.
 
 ### Release Readiness Verdict Contract (#1279)
 
