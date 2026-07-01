@@ -26,7 +26,7 @@ and `validation/claims.toml`.
 
 | Cache Layer | Location | Data Scope | Dirty Ownership | Classification | Kernel Role |
 |---|---|---|---|---|---|
-| **PageCache** | `tidefs-cache-core` | Page-granularity read cache (4 KiB pages) with LRU eviction, dirty tracking, and writeback coordination | Authoritative for dirty pages in flight; writeback lifecycle gates durability | **Authoritative** | Mirrors kernel page cache in FUSE mode |
+| **PageCache** | `tidefs-cache-core` | Page-granularity read cache (4 KiB pages) with LRU eviction, dirty tracking, and writeback coordination | Authoritative for dirty pages in flight; writeback lifecycle gates this cache layer's dirty-page ownership handoff | **Authoritative** | Mirrors kernel page cache in FUSE mode |
 | **WeightedArc** | `tidefs-cache-core` | Generic ARC eviction policy (T1/T2/B1/B2) with byte-weight tracking for metadata entries | None (metadata-only, no dirty data) | **Authoritative** (for metadata placement) | ARC policy may inform kernel LRU |
 | **L2ARC** | `tidefs-cache-core` | Persistent second-level read cache on fast NVMe/SSD devices | None -- every entry has an authoritative copy on main pool devices | **Derived** | Kernel page cache is the final L1; L2ARC is a userspace flash tier |
 | **Prefetch** | `tidefs-cache-core` | Sequential-read detection and readahead planning | None (populates PageCache) | **Derived** | Kernel readahead is authoritative in kernel mode |
@@ -106,9 +106,9 @@ and `validation/claims.toml`.
 - **HotReadCache**: LRU eviction with byte-weight and entry-count caps.
 - **InodeCache**: LRU eviction with byte-weight caps via ARC p-adaptation.
 
-## Future Kernel Page-Cache Roles
+## Future Kernel Page-Cache Targets
 
-| Milestone | Cache Layer | Role |
+| Milestone | Cache Layer | Target role |
 |---|---|---|
 | kmod-posix-vfs baseline | Kernel page cache | Primary byte-residency plane for FUSE and kmod mounts |
 | VFS writeback expansion | Kernel dirty-folio tracking | Authoritative dirty tracking; replaces userspace DirtySet/WritebackDaemon |
