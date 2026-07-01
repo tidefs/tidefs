@@ -16,6 +16,18 @@ use crate::validation_status::ValidationStatus;
 
 pub const EVIDENCE_ARTIFACT_MANIFEST_VERSION: u32 = 2;
 pub const EVIDENCE_ARTIFACT_DIGEST_ALGORITHM: &str = "blake3";
+pub const MISSING_EVIDENCE_CONTENT_DIGEST: &str =
+    "blake3:0000000000000000000000000000000000000000000000000000000000000000";
+
+const BLOCKED_PASS_DIGEST_INPUTS: &[&[u8]] = &[
+    &[
+        115, 117, 109, 109, 97, 114, 121, 45, 110, 111, 116, 45, 97, 118, 97, 105, 108, 97, 98,
+        108, 101,
+    ],
+    &[112, 108, 97, 99, 101, 104, 111, 108, 100, 101, 114],
+    &[102, 97, 107, 101],
+    &[100, 117, 109, 109, 121],
+];
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -315,8 +327,8 @@ fn validate_outcome_tier_combination(
     if outcome == ValidationStatus::Pass && !blocking_issues.is_empty() {
         failures.push("outcome `pass` must not carry blocking_issues".to_string());
     }
-    if outcome == ValidationStatus::Pass && is_zero_content_digest(content_digest) {
-        failures.push("outcome `pass` requires a non-placeholder content_digest".to_string());
+    if outcome == ValidationStatus::Pass && is_unacceptable_pass_content_digest(content_digest) {
+        failures.push("outcome `pass` requires a real artifact content_digest".to_string());
     }
     if outcome == ValidationStatus::EnvironmentRefusal
         && matches!(
@@ -344,11 +356,12 @@ fn validate_content_digest(digest: &str, failures: &mut Vec<String>) {
     }
 }
 
-fn is_zero_content_digest(digest: &str) -> bool {
-    let Some(hex) = digest.strip_prefix(&format!("{EVIDENCE_ARTIFACT_DIGEST_ALGORITHM}:")) else {
-        return false;
-    };
-    hex.bytes().all(|b| b == b'0')
+fn is_unacceptable_pass_content_digest(digest: &str) -> bool {
+    let canonical = canonical_content_digest(digest);
+    canonical == MISSING_EVIDENCE_CONTENT_DIGEST
+        || BLOCKED_PASS_DIGEST_INPUTS
+            .iter()
+            .any(|bytes| canonical == content_digest_for_bytes(bytes))
 }
 
 fn is_windows_absolute_path(path: &str) -> bool {
@@ -468,18 +481,25 @@ mod tests {
     }
 
     #[test]
-    fn pass_outcome_requires_non_placeholder_digest() {
-        let mut manifest = valid_manifest();
-        manifest.content_digest =
-            "blake3:0000000000000000000000000000000000000000000000000000000000000000".to_string();
+    fn pass_outcome_rejects_missing_or_placeholder_digest() {
+        for digest in [
+            MISSING_EVIDENCE_CONTENT_DIGEST.to_string(),
+            content_digest_for_bytes(b"summary-not-available"),
+            content_digest_for_bytes(b"placeholder"),
+            content_digest_for_bytes(b"fake"),
+            content_digest_for_bytes(b"dummy"),
+        ] {
+            let mut manifest = valid_manifest();
+            manifest.content_digest = digest;
 
-        let err = manifest
-            .validate()
-            .expect_err("pass with placeholder digest fails");
-        assert!(err
-            .failures()
-            .iter()
-            .any(|failure| failure.contains("non-placeholder content_digest")));
+            let err = manifest
+                .validate()
+                .expect_err("pass with missing or placeholder digest fails");
+            assert!(err
+                .failures()
+                .iter()
+                .any(|failure| failure.contains("real artifact content_digest")));
+        }
     }
 
     #[test]

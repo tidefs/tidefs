@@ -5,7 +5,7 @@
 //!
 //! When a baseline package path is provided, the gate evaluates each
 //! subject row against the loaded KPIs and comparator data, producing a
-//! pass/fail receipt instead of the all-refused placeholder.
+//! pass/fail receipt instead of the all-refused schema-only receipt.
 
 use super::gate_entry::{BaselineKpi, ComparatorRef, EnvironmentManifest, MeasuredKpi, OpMix};
 use super::runner::{GateRunRecord, GateRunner, RunVerdict};
@@ -489,7 +489,7 @@ pub fn build_receipt_from_baseline(
 
 /// Extract KPI measurements from FUSE fio baseline.
 /// The FUSE fio baseline records pass/fail results without numeric KPIs,
-/// so we produce a synthetic "passed" KPI count rather than throughput/latency.
+/// so we produce a derived pass-rate KPI count rather than throughput/latency.
 fn extract_fuse_kpis(baseline: &FuseFioBaseline) -> Vec<MeasuredKpi> {
     let mut kpis = Vec::new();
     let total = baseline.results.len() as f64;

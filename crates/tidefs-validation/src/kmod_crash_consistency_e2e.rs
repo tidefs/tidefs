@@ -716,7 +716,7 @@ impl MockCrashConsistencyEngine {
                         continue;
                     }
                     let name = String::from_utf8_lossy(&entry[14..14 + name_len]).to_string();
-                    // Restore data from pre-crash state or create placeholder.
+                    // Restore data from pre-crash state or create an empty recovered entry.
                     if let Some(data) = pcf.get(&name) {
                         files.insert(name, data.clone());
                     } else {

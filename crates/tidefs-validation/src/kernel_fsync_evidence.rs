@@ -11,6 +11,7 @@
 
 use crate::evidence_artifact_manifest::{
     content_digest_for_bytes, EvidenceArtifactManifest, EVIDENCE_ARTIFACT_MANIFEST_VERSION,
+    MISSING_EVIDENCE_CONTENT_DIGEST,
 };
 use crate::validation_schema::ValidationTier;
 use crate::validation_status::ValidationStatus;
@@ -75,11 +76,9 @@ pub fn build_kernel_fsync_evidence_manifest(
             (summary_artifact_path.to_string(), digest, String::new())
         }
         None => {
-            let placeholder = "summary-not-available";
-            let digest = content_digest_for_bytes(placeholder.as_bytes());
             (
                 format!("{KERNEL_FSYNC_SUMMARY_FILENAME}.missing"),
-                digest,
+                MISSING_EVIDENCE_CONTENT_DIGEST.to_string(),
                 format!(
                     " (summary missing: run={workflow_run_id} source={source_ref} timeout={timeout_seconds}s pool={pool_size_mb}MB)"
                 ),
@@ -161,11 +160,10 @@ pub fn build_qemu_smoke_kernel_fsync_manifest(
             let digest = content_digest_for_bytes(bytes);
             (summary_artifact_path.to_string(), digest)
         }
-        None => {
-            let placeholder = "summary-not-available";
-            let digest = content_digest_for_bytes(placeholder.as_bytes());
-            (format!("{KERNEL_FSYNC_SUMMARY_FILENAME}.missing"), digest)
-        }
+        None => (
+            format!("{KERNEL_FSYNC_SUMMARY_FILENAME}.missing"),
+            MISSING_EVIDENCE_CONTENT_DIGEST.to_string(),
+        ),
     };
 
     let scope = format!(
@@ -350,6 +348,7 @@ mod tests {
         let parsed = parse_evidence_artifact_manifest_json(&json).expect("round-trip parse");
         assert!(parsed.scope.contains("no-summary"));
         assert!(parsed.artifact_path.contains(".missing"));
+        assert_eq!(parsed.content_digest, MISSING_EVIDENCE_CONTENT_DIGEST);
         assert_eq!(parsed.outcome, ValidationStatus::HarnessFail);
     }
 
@@ -399,6 +398,23 @@ mod tests {
         ));
         assert_eq!(parsed.source, "qemu-smoke-kernel-fsync-validation");
         assert_eq!(parsed.outcome, ValidationStatus::Pass);
+    }
+
+    #[test]
+    fn qemu_smoke_missing_summary_is_harness_failure() {
+        let manifest = build_qemu_smoke_kernel_fsync_manifest(
+            None,
+            "2026-06-21T00:00:00Z",
+            "12345",
+            "abc1234",
+            "summary.env",
+            "phase1.log,phase2.log",
+        );
+        let json = manifest.to_json_pretty().expect("serialize manifest");
+        let parsed = parse_evidence_artifact_manifest_json(&json).expect("round-trip parse");
+        assert!(parsed.artifact_path.contains(".missing"));
+        assert_eq!(parsed.content_digest, MISSING_EVIDENCE_CONTENT_DIGEST);
+        assert_eq!(parsed.outcome, ValidationStatus::HarnessFail);
     }
 
     #[test]

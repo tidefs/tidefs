@@ -347,9 +347,12 @@ mod tests {
     #[test]
     fn pinned_artifact_from_bytes() {
         let data = b"hello kernel 1234567890";
-        let artifact =
-            PinnedArtifact::from_bytes(Path::new("/fake/kernel"), data, Some("test-kernel".into()));
-        assert_eq!(artifact.path, Path::new("/fake/kernel"));
+        let artifact = PinnedArtifact::from_bytes(
+            Path::new("/fixture/kernel"),
+            data,
+            Some("test-kernel".into()),
+        );
+        assert_eq!(artifact.path, Path::new("/fixture/kernel"));
         assert_eq!(artifact.size_bytes, data.len() as u64);
         assert_eq!(artifact.label.as_deref(), Some("test-kernel"));
         assert!(!artifact.sha256.is_empty());
@@ -494,7 +497,7 @@ mod tests {
         let initrd = PinnedArtifact::from_file(&initrd_path, Some("initrd".into())).unwrap();
         let kernel = PinnedArtifact::from_bytes(
             Path::new("/nonexistent/kernel-file"),
-            b"fake kernel data",
+            b"fixture kernel data",
             Some("kernel".into()),
         );
 
