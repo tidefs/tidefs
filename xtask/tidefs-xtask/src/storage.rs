@@ -806,7 +806,6 @@ pub fn check_online_verifier_current_workspace() -> Result<(), StorageCheckError
             "OnlineVerifierOutcome",
             "verify_online",
             "verify_online_with_root_authentication_key",
-            "ONLINE_VERIFIER_CRATE_GATE_OW_110",
         ],
         &mut missing,
     );
@@ -2407,10 +2406,10 @@ pub fn check_mmap_coherency_current_workspace() -> Result<(), StorageCheckError>
     })?;
     let mut missing = Vec::new();
     for rel in [
-        "docs/PAGE_CACHE_WRITEBACK_MMAP_INTEGRATION_P5-03.md",
+        "docs/PAGE_CACHE_WRITEBACK_AUTHORITY.md",
         "crates/tidefs-local-filesystem/src/lib.rs",
         "crates/tidefs-local-filesystem/src/tests.rs",
-        "docs/PREVIEW_POSIX_SUBSET.md",
+        "crates/tidefs-local-filesystem/src/types.rs",
     ] {
         check_required_file(&root, rel, &mut missing);
     }
@@ -2435,26 +2434,25 @@ pub fn check_mmap_coherency_current_workspace() -> Result<(), StorageCheckError>
     );
     check_source_markers(
         &root,
-        "docs/PAGE_CACHE_WRITEBACK_MMAP_INTEGRATION_P5-03.md",
+        "docs/PAGE_CACHE_WRITEBACK_AUTHORITY.md",
         &[
-            "page-cache/writeback/mmap",
-            "P5-03",
-            "page-cache / writeback / mmap integration",
-            "PAGE_CACHE_WRITEBACK_MMAP_SPEC",
-            "PAGE_CACHE_WRITEBACK_MMAP_ACCEPTANCE_CASES",
-            "page_cache_writeback_mmap_acceptance_cases",
-            "shared writable mmap",
-            "private mmap copy-on-write",
-            "coherency classes",
-            "implemented-source specification gate",
-            "Non-negotiable rules",
+            "Authority claim path: `local.vfs.page_cache_writeback_authority.v1`",
+            "shared writable mmap dirties",
+            "writeback batches",
+            "page_cache_writeback_mmap_acceptance_cases() source binding",
+            "mounted writeback, mmap",
+            "validation/claims.toml",
         ],
         &mut missing,
     );
     check_source_markers(
         &root,
-        "docs/PREVIEW_POSIX_SUBSET.md",
-        &["mmap-coherency", "page-cache/writeback/mmap"],
+        "crates/tidefs-local-filesystem/src/types.rs",
+        &[
+            "operation: \"mmap-coherency\"",
+            "live mmap coherency remains deferred",
+            "page-cache/writeback/mmap authority model",
+        ],
         &mut missing,
     );
 

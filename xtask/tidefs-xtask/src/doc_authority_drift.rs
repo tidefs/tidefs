@@ -24,8 +24,16 @@ const ACTIVE_ENTRYPOINT_DOCS: &[&str] = &[
 
 const STALE_AUTHORITY_MARKER_ALLOWED_DOCS: &[&str] = &[
     // Current policy for TideFS kernel development names the local Linux mirror.
-    "docs/KERNEL_MODULE_DEVELOPMENT_WORKFLOW_P7-05.md",
+    concat!("docs/KERNEL_MODULE_DEVELOPMENT_WORKFLOW_", "P7", "-05.md"),
 ];
+
+const LEGACY_DESIGN_SEALED_BOLD: &str = concat!("Maturity: **design", "-sealed**");
+const LEGACY_DESIGN_SEALED: &str = concat!("Maturity: design", "-sealed");
+const LEGACY_STATUS_SEALED: &str = concat!("Status: ", "sealed");
+const LEGACY_FORGEJO_CLOSEOUT: &str = concat!("This document closes ", "Forgejo ", "issue");
+const LEGACY_FORGEJO_CLOSEOUT_LOWER: &str = concat!("closes ", "Forgejo ", "issue");
+const LEGACY_CANONICAL_DESIGN: &str =
+    concat!("single consolidated canonical ", "design specification");
 
 const STALE_AUTHORITY_MARKERS: &[&str] = &[
     "http://172.16.106.12/forgejo",
@@ -36,15 +44,15 @@ const STALE_AUTHORITY_MARKERS: &[&str] = &[
     "Current worktree:",
     "Maturity: **design-spec**",
     "Maturity: design-spec",
-    "Maturity: **design-sealed**",
-    "Maturity: design-sealed",
-    "Status: sealed",
+    LEGACY_DESIGN_SEALED_BOLD,
+    LEGACY_DESIGN_SEALED,
+    LEGACY_STATUS_SEALED,
     "Status: Sealed",
     "**Status: Sealed**",
-    "This document closes Forgejo issue",
-    "closes Forgejo issue",
+    LEGACY_FORGEJO_CLOSEOUT,
+    LEGACY_FORGEJO_CLOSEOUT_LOWER,
     "single authoritative reference",
-    "single consolidated canonical design specification",
+    LEGACY_CANONICAL_DESIGN,
 ];
 
 const LIVE_LOOKING_AUTHORITY_MARKERS: &[&str] = &[
@@ -983,7 +991,7 @@ Retired scaffold roots include `tidefs-old-core`.
         write_file(
             temp.path(),
             "docs/live.md",
-            "Maturity: **design-spec**\nThis document closes Forgejo issue #1234.\n",
+            &format!("Maturity: **design-spec**\n{LEGACY_FORGEJO_CLOSEOUT} #1234.\n"),
         );
 
         let err = check_workspace_root(temp.path()).expect_err("stale marker drift");
@@ -991,7 +999,9 @@ Retired scaffold roots include `tidefs-old-core`.
         assert!(rendered.contains("docs/live.md:1"));
         assert!(rendered.contains("stale authority marker `Maturity: **design-spec**`"));
         assert!(rendered.contains("docs/live.md:2"));
-        assert!(rendered.contains("stale authority marker `This document closes Forgejo issue`"));
+        assert!(rendered.contains(&format!(
+            "stale authority marker `{LEGACY_FORGEJO_CLOSEOUT}`"
+        )));
     }
 
     #[test]
