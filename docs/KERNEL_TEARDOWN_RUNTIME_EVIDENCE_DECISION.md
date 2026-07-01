@@ -50,8 +50,9 @@ matching runtime artifacts and a claims-gate review land in follow-up work.
 - `docs/CLAIMS_GATE_POLICY.md` defines `source-model`, `mounted-kernel-vfs`,
   and `full-kernel-no-daemon` as separate tiers. Lower-tier evidence can
   diagnose higher-tier claims, but cannot validate them.
-- `docs/TEST_SIGNAL_AUDIT.md` lists `kernel_env_model_*` tests as source-model
-  proof signal only.
+- `validation/claims.toml`, generated `docs/CLAIM_REGISTRY.md`, and the
+  teardown proof review receipt keep `kernel_env_model_*` evidence bounded to
+  source-model proof only.
 - `docs/NEXTGEN_VERIFICATION_PERFORMANCE_OFFLOAD_PLAN.md` says the kernel
   teardown model is bounded source-model evidence only and maps mounted kernel
   VFS to T5 and full-kernel no-daemon to T6.
