@@ -1989,6 +1989,7 @@ pub fn finalize_prefetch_execution(
 
     if terminal_update_refs_outside_evidence_cut(record, update)
         || terminal_result_detail_lacks_feedback_evidence(record, update)
+        || terminal_result_detail_exceeds_started_action(record, update.result_detail)
         || terminal_update_lacks_result_refusal_evidence(record, update)
         || terminal_update_lacks_verification_evidence(record, update)
         || terminal_update_lacks_degraded_visibility_evidence(record, update)
@@ -2207,6 +2208,35 @@ fn terminal_result_detail_lacks_feedback_evidence(
         && !terminal_result_detail_has_cut_feedback_roots(record, update)
 }
 
+fn terminal_result_detail_exceeds_started_action(
+    record: PrefetchExecutorRecord,
+    detail: PrefetchExecutorResultDetail,
+) -> bool {
+    if (detail.wan_bytes != 0 || detail.egress_cost_microunits != 0)
+        && !record_runtime_dispatch_needs_transport_or_trust(record)
+    {
+        return true;
+    }
+
+    if detail.restore_cost_microunits != 0 && !record_uses_object_or_archive_path(record) {
+        return true;
+    }
+
+    if detail.staging_capacity_bytes != 0 && !record_can_stage_bytes(record) {
+        return true;
+    }
+
+    if detail.pmem_write_bytes != 0 && !record_uses_pmem(record) {
+        return true;
+    }
+
+    if detail.ram_pressure_bytes != 0 && !record_uses_ram_or_pmem(record) {
+        return true;
+    }
+
+    false
+}
+
 fn terminal_update_lacks_result_refusal_evidence(
     record: PrefetchExecutorRecord,
     update: PrefetchExecutorTerminalUpdate,
@@ -2421,6 +2451,42 @@ fn record_runtime_dispatch_needs_transport_or_trust(record: PrefetchExecutorReco
     record.action_family.needs_remote_path_evidence()
         || media_needs_transport_or_trust(record.source_media)
         || media_needs_transport_or_trust(record.target_media)
+}
+
+fn record_uses_object_or_archive_path(record: PrefetchExecutorRecord) -> bool {
+    matches!(
+        record.action_family,
+        PrefetchExecutorActionFamily::ObjectArchiveRestoreStaging
+    ) || media_is_object_or_archive(record.source_media)
+        || media_is_object_or_archive(record.target_media)
+}
+
+fn record_can_stage_bytes(record: PrefetchExecutorRecord) -> bool {
+    matches!(
+        record.executor_byte_state,
+        PrefetchExecutorByteState::Staged
+    ) || record_uses_object_or_archive_path(record)
+}
+
+fn record_uses_pmem(record: PrefetchExecutorRecord) -> bool {
+    matches!(record.source_media, StorageMediaClass::PersistentMemory)
+        || matches!(record.target_media, StorageMediaClass::PersistentMemory)
+        || matches!(
+            record.selected_residency,
+            PrefetchResidencyStateClass::PmemDurable
+        )
+}
+
+fn record_uses_ram_or_pmem(record: PrefetchExecutorRecord) -> bool {
+    media_is_ram_or_pmem(record.source_media)
+        || media_is_ram_or_pmem(record.target_media)
+        || matches!(
+            record.selected_residency,
+            PrefetchResidencyStateClass::CacheOnlyRam
+                | PrefetchResidencyStateClass::VolatileRamServingTrial
+                | PrefetchResidencyStateClass::IntentBackedRam
+                | PrefetchResidencyStateClass::PmemDurable
+        )
 }
 
 fn record_uses_recovery_escalation(record: PrefetchExecutorRecord) -> bool {
@@ -3072,13 +3138,25 @@ fn runtime_dispatch_needs_transport_or_trust(
 }
 
 const fn media_needs_transport_or_trust(media: StorageMediaClass) -> bool {
+    matches!(media, StorageMediaClass::RemoteRam) || media_is_object_or_archive(media)
+}
+
+const fn media_is_object_or_archive(media: StorageMediaClass) -> bool {
     matches!(
         media,
-        StorageMediaClass::RemoteRam
-            | StorageMediaClass::ObjectAppliance
+        StorageMediaClass::ObjectAppliance
             | StorageMediaClass::CloudObject
             | StorageMediaClass::OpticalArchive
             | StorageMediaClass::TapeArchive
+    )
+}
+
+const fn media_is_ram_or_pmem(media: StorageMediaClass) -> bool {
+    matches!(
+        media,
+        StorageMediaClass::SystemRam
+            | StorageMediaClass::RemoteRam
+            | StorageMediaClass::PersistentMemory
     )
 }
 
@@ -5836,6 +5914,107 @@ mod tests {
         assert!(required.contains(PrefetchExecutorCostRequirementMask::CPU));
         assert!(required.contains(PrefetchExecutorCostRequirementMask::MEMORY));
         assert!(required.contains(PrefetchExecutorCostRequirementMask::FOREGROUND_DISRUPTION));
+    }
+
+    #[test]
+    fn terminal_update_rejects_result_shape_outside_started_action() {
+        let detail = PrefetchExecutorResultDetail {
+            wan_bytes: 8 * 1024,
+            egress_cost_microunits: 42,
+            attribution_ref: evidence(
+                StorageIntentEvidenceKind::MeasurementAttributionEvidence,
+                ATTRIBUTION,
+            ),
+            retention_ref: evidence(
+                StorageIntentEvidenceKind::EvidenceRetentionEvidence,
+                RETENTION,
+            ),
+            validation_ref: evidence(StorageIntentEvidenceKind::ValidationArtifact, VALIDATION),
+            ..PrefetchExecutorResultDetail::default()
+        };
+        let started = evaluate_prefetch_execution(admitted_charged_input(
+            PrefetchResidencyCandidateClass::BoundedReadahead,
+            detail,
+        ));
+        assert_eq!(started.outcome, PrefetchExecutorOutcome::Started);
+        assert!(!record_runtime_dispatch_needs_transport_or_trust(started));
+
+        let rejected = finalize_prefetch_execution(
+            started,
+            PrefetchExecutorTerminalUpdate {
+                outcome: PrefetchExecutorOutcome::Completed,
+                result_detail: detail,
+                evidence_cut: terminal_evidence_cut(started, detail, EMPTY_EVIDENCE_REF),
+                ..PrefetchExecutorTerminalUpdate::default()
+            },
+        );
+
+        assert_eq!(
+            rejected.outcome,
+            PrefetchExecutorOutcome::VerificationFailed
+        );
+        assert_eq!(
+            rejected.refusal,
+            StorageIntentRefusalReason::ValidationGateFailed
+        );
+        assert_eq!(
+            rejected.executor_byte_state,
+            PrefetchExecutorByteState::Refused
+        );
+        assert_record_has_no_authority_claims(rejected);
+    }
+
+    #[test]
+    fn terminal_update_accepts_result_shape_for_started_wan_action() {
+        let detail = PrefetchExecutorResultDetail {
+            wan_bytes: 8 * 1024,
+            egress_cost_microunits: 42,
+            staging_capacity_bytes: 8 * 1024,
+            attribution_ref: evidence(
+                StorageIntentEvidenceKind::MeasurementAttributionEvidence,
+                ATTRIBUTION,
+            ),
+            retention_ref: evidence(
+                StorageIntentEvidenceKind::EvidenceRetentionEvidence,
+                RETENTION,
+            ),
+            validation_ref: evidence(StorageIntentEvidenceKind::ValidationArtifact, VALIDATION),
+            ..PrefetchExecutorResultDetail::default()
+        };
+        let mut input =
+            admitted_charged_input(PrefetchResidencyCandidateClass::WanGeoDeltaPrefetch, detail);
+        input.evidence_query_snapshot =
+            snapshot(Some(StorageIntentEvidenceKind::TransportPathEvidence));
+        add_fresh(
+            &mut input.evidence_query_snapshot,
+            StorageIntentEvidenceKind::TrustDomainEvidence,
+            TRUST,
+        );
+        let started = evaluate_prefetch_execution(input);
+        assert_eq!(started.outcome, PrefetchExecutorOutcome::Started);
+        assert_eq!(
+            started.executor_byte_state,
+            PrefetchExecutorByteState::Staged
+        );
+        assert!(record_runtime_dispatch_needs_transport_or_trust(started));
+
+        let completed = finalize_prefetch_execution(
+            started,
+            PrefetchExecutorTerminalUpdate {
+                outcome: PrefetchExecutorOutcome::Completed,
+                result_detail: detail,
+                evidence_cut: terminal_evidence_cut(started, detail, EMPTY_EVIDENCE_REF),
+                ..PrefetchExecutorTerminalUpdate::default()
+            },
+        );
+
+        assert_eq!(completed.outcome, PrefetchExecutorOutcome::Completed);
+        assert_eq!(
+            completed.executor_byte_state,
+            PrefetchExecutorByteState::Staged
+        );
+        assert_eq!(completed.result_detail, detail);
+        assert_record_has_no_authority_claims(completed);
     }
 
     #[test]
