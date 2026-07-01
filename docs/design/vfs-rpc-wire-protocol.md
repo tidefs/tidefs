@@ -1,24 +1,22 @@
-# VFS_RPC Wire Protocol — Design Specification
+# VFS_RPC Wire Protocol - Historical Input
 
-**Issue**: [#1234](http://172.16.106.12/forgejo/forgeadmin/tidefs/issues/1234)
-**Status**: design-spec
-**Priority**: P1
-**Lane**: transport
-**Depends on**: #1213 (VFS Engine contract), #1210 (transport boundedness), #1228 (security model)
+TFR-019 / issue #1638 classification: historical input. This imported
+Forgejo-era wire-protocol sketch remains only because source and historical
+docs still cite its service-id and method-id lineage. Active transport,
+membership, operator, VFS, and claim authority lives in the source-backed
+authority documents, `validation/claims.toml`, generated claim docs, and live
+GitHub issues/PRs. This file is not active clustered POSIX, VFS forwarding,
+data-plane, or product-readiness authority.
 
-## Abstract
+## Historical Sketch
 
-This document defines the VFS_RPC wire protocol: the canonical encoding for
-forwarding VfsEngine operations (#1213) over the cluster transport. Every VFS
-operation receives a stable 6-bit method ID, a common request/response framing
-with term/epoch fencing, an idempotency contract via per-peer op_id dedup
-windows, a unified payload model (InlineOrBulkV1) that delegates large data to
-the BULK plane (#1229), and serializable handle encoding that makes in-process
-file/dir handles transferable across nodes.
+The imported text below sketched VFS operation forwarding over a cluster
+transport with service ids, method ids, request/response framing, deduplication,
+inline-or-bulk payload handling, and transferable handles. Retaining it
+preserves narrow source-comment lineage; it does not prove that the forwarding
+path or clustered POSIX behavior exists as product behavior.
 
-VFS_RPC is service_id `0x06` in the tidefs cluster service registry. It is the
-primary data-plane protocol: all POSIX filesystem operations that require
-cluster forwarding flow through this service.
+The old service-registry wording below is imported background only.
 
 ---
 

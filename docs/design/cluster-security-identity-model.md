@@ -1,29 +1,25 @@
-# Cluster Security and Identity Model — Sealed Design
+# Cluster Security and Identity Model - Historical Input
 
-**Issue**: [#1843](http://172.16.106.12/forgejo/forgeadmin/tidefs/issues/1843), [#1853](http://172.16.106.12/forgejo/forgeadmin/tidefs/issues/1853) (design formalization), [#1769](http://172.16.106.12/forgejo/forgeadmin/tidefs/issues/1769) (design re-seal)
-**Coord**: [#1919](http://172.16.106.12/forgejo/forgeadmin/tidefs/issues/1919)
-**This issue**: [#1775](http://172.16.106.12/forgejo/forgeadmin/tidefs/issues/1775) (coordination seal)
-**Prior**: [#2018](http://172.16.106.12/forgejo/forgeadmin/tidefs/issues/2018), [#2016](http://172.16.106.12/forgejo/forgeadmin/tidefs/issues/2016), [#1740](http://172.16.106.12/forgejo/forgeadmin/tidefs/issues/1740), [#1659](http://172.16.106.12/forgejo/forgeadmin/tidefs/issues/1659), [#1618](http://172.16.106.12/forgejo/forgeadmin/tidefs/issues/1618), [#1228](http://172.16.106.12/forgejo/forgeadmin/tidefs/issues/1228)
-**Status**: design-sealed
-**Kind**: design
-**Lane**: storage-core
+TFR-019 / issue #1638 classification: historical input. This imported
+Forgejo-era security sketch remains only because source comments still cite
+its section-number lineage for existing type names and checks. Active transport,
+membership, operator, storage-intent, and claim authority lives in the
+source-backed authority documents, `validation/claims.toml`, generated claim
+docs, and live GitHub issues/PRs. This file is not active cluster-security,
+authorization, RDMA, distributed-mode, or product-readiness authority.
 
-## Abstract
+## Historical Sketch
 
-This document seals the cluster security and identity model for TideFS: how
-nodes prove who they are, how the cluster establishes and maintains a trust
-fabric, how secured transport sessions bind identity to every frame, how key
-material is rotated and revoked, and how the system defends against the
-principal threats to a distributed storage cluster.
+The imported text below sketched node identity, attestation, session grants,
+authorization, and trust-domain handling for a distributed storage cluster.
+Retaining it preserves narrow lineage for source comments; it does not prove
+that the sketched model is complete or active as product behavior.
 
-It bridges the P8-01 transport session model, the P9-02 authentication and
-authorization law, the P9-04 secret-key policy law, the cluster transport
-boundedness design (#1210), and the MEMBERSHIP service (#1209) into one
-coherent cluster security architecture.
+The old seal and bridge wording below is imported background only.
 
-## 1. Core Result
+## 1. Historical Target
 
-The cluster security model rests on three pillars:
+The imported target model rested on three pillars:
 
 - **Node identity**: every cluster participant has a unique, self-signed
   Ed25519 identity bound to a `NodeIdentity` record. No node may participate
@@ -37,7 +33,7 @@ The cluster security model rests on three pillars:
   lane budget, and cohort membership. Authorization is per-frame, not
   per-connection.
 
-The anti-regression rule is explicit:
+The imported target text stated this anti-regression rule:
 
 **No cluster message may be delivered, no membership transition may be
 recorded, and no data-plane operation may be committed unless both endpoints
