@@ -3273,6 +3273,11 @@ fn dispatch_plan_refusal(
         return StorageIntentRefusalReason::OverBudget;
     }
 
+    let admission_byte_refusal = dispatch_plan_admission_byte_refusal(plan, input.admission);
+    if admission_byte_refusal as u16 != StorageIntentRefusalReason::None as u16 {
+        return admission_byte_refusal;
+    }
+
     StorageIntentRefusalReason::None
 }
 
@@ -3388,6 +3393,32 @@ fn dispatch_plan_within_executor_limits(
     };
 
     byte_limit == 0 || planned_bytes <= byte_limit
+}
+
+fn dispatch_plan_admission_byte_refusal(
+    plan: PrefetchExecutorDispatchPlan,
+    admission: PrefetchExecutorAdmissionRecord,
+) -> StorageIntentRefusalReason {
+    let Some(planned_bytes) = dispatch_plan_planned_bytes(plan) else {
+        return StorageIntentRefusalReason::EvidenceNotUsable;
+    };
+    if planned_bytes == 0 && admission.requested_bytes == 0 && admission.admitted_bytes == 0 {
+        return StorageIntentRefusalReason::None;
+    }
+    if admission.admitted_bytes != 0 && admission.requested_bytes == 0 {
+        return StorageIntentRefusalReason::EvidenceNotUsable;
+    }
+    if admission.requested_bytes != 0 && admission.admitted_bytes == 0 {
+        return StorageIntentRefusalReason::OverBudget;
+    }
+    if admission.requested_bytes != 0 && admission.admitted_bytes > admission.requested_bytes {
+        return StorageIntentRefusalReason::PolicyConflict;
+    }
+    if admission.admitted_bytes != 0 && planned_bytes > admission.admitted_bytes {
+        return StorageIntentRefusalReason::OverBudget;
+    }
+
+    StorageIntentRefusalReason::None
 }
 
 fn dispatch_plan_planned_bytes(plan: PrefetchExecutorDispatchPlan) -> Option<u64> {
@@ -5616,6 +5647,72 @@ mod tests {
             over_limit_record.refusal,
             StorageIntentRefusalReason::OverBudget
         );
+    }
+
+    #[test]
+    fn dispatch_plan_respects_scheduler_admitted_byte_grant() {
+        let mut valid = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        valid.admission.requested_bytes = 4096;
+        valid.admission.admitted_bytes = 4096;
+        let valid_record = evaluate_prefetch_execution(valid);
+        assert_eq!(valid_record.outcome, PrefetchExecutorOutcome::Started);
+        assert_eq!(valid_record.admission.requested_bytes, 4096);
+        assert_eq!(valid_record.admission.admitted_bytes, 4096);
+        assert_record_has_no_authority_claims(valid_record);
+
+        let mut over_admitted = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        over_admitted.admission.requested_bytes = 2048;
+        over_admitted.admission.admitted_bytes = 4096;
+        let over_admitted_record = evaluate_prefetch_execution(over_admitted);
+        assert_eq!(
+            over_admitted_record.outcome,
+            PrefetchExecutorOutcome::Blocked
+        );
+        assert_eq!(
+            over_admitted_record.refusal,
+            StorageIntentRefusalReason::PolicyConflict
+        );
+        assert_record_has_no_authority_claims(over_admitted_record);
+
+        let mut under_granted = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        under_granted.admission.requested_bytes = 4096;
+        under_granted.admission.admitted_bytes = 2048;
+        let under_granted_record = evaluate_prefetch_execution(under_granted);
+        assert_eq!(
+            under_granted_record.outcome,
+            PrefetchExecutorOutcome::OverBudget
+        );
+        assert_eq!(
+            under_granted_record.refusal,
+            StorageIntentRefusalReason::OverBudget
+        );
+        assert_record_has_no_authority_claims(under_granted_record);
+
+        let mut missing_request = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        missing_request.admission.admitted_bytes = 4096;
+        let missing_request_record = evaluate_prefetch_execution(missing_request);
+        assert_eq!(
+            missing_request_record.outcome,
+            PrefetchExecutorOutcome::Blocked
+        );
+        assert_eq!(
+            missing_request_record.refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+        assert_record_has_no_authority_claims(missing_request_record);
+    }
+
+    #[test]
+    fn strided_dispatch_counts_all_ranges_against_scheduler_grant() {
+        let mut input = admitted_input(PrefetchResidencyCandidateClass::StridedVectorPrefetch);
+        input.admission.requested_bytes = 8192;
+        input.admission.admitted_bytes = 4096;
+
+        let record = evaluate_prefetch_execution(input);
+
+        assert_eq!(record.outcome, PrefetchExecutorOutcome::OverBudget);
+        assert_eq!(record.refusal, StorageIntentRefusalReason::OverBudget);
+        assert_record_has_no_authority_claims(record);
     }
 
     #[test]
