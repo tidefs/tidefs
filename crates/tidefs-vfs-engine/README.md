@@ -112,9 +112,11 @@ All three txg lifecycle methods resolve within kernel authority through the
 engine. No userspace daemon is required for normal filesystem operation.
 This is a key enabler for full-kernel no-daemon crash consistency.
 
-## Design Doc
+## Authority
 
-`docs/VFS_ENGINE_API_CONTRACT.md` (#1213)
+The current VFS engine API authority is the `tidefs-vfs-engine` source crate
+and the portable records in `tidefs-types-vfs-core`. Request/completion codec
+shape is documented in `docs/REQUEST_CONTRACT.md`.
 
 ## KernelPoolCore (pool_core module)
 

@@ -4158,31 +4158,30 @@ This document composes existing authority surfaces:
   scrub, repair, recovery, and raw-store paths use one transform-aware authority.
 - `docs/BLAKE3_USAGE_POLICY.md`: BLAKE3 is the durable content-addressing and
   integrity digest, not a generic hot-path hash or duplicate transport checksum.
-- `docs/CHECKSUM_ARCHITECTURE_DESIGN.md`: checksum architecture remains
-  historical target input unless live source, validation, and claims evidence
-  prove a narrower current behavior.
+- `docs/BLAKE3_USAGE_POLICY.md`: checksum placement is a current policy
+  guardrail, while production repair, erasure, and committed-root integrity
+  claims still require live source, validation, and claims evidence.
 - `docs/LOCAL_SNAPSHOTS_OW108.md` and `docs/SEND_RECEIVE_OW109.md`: scoped
   local snapshot and send/receive authority inform #881, including their
   still-open placement, reclaim, deadlist, distributed replication, and
   incremental-resume gaps.
 - `docs/SNAPSHOT_DEADLIST_PINNING_DESIGN.md`,
-  `docs/RECEIVE_STREAM_MERGE_POLICY.md`, and
-  `docs/DATASET_LIFECYCLE_DESIGN.md`: deadlist, receive-base, and dataset
+  `docs/RECEIVE_STREAM_MERGE_POLICY.md`, and source-owned dataset lifecycle
+  evidence: deadlist, receive-base, and dataset
   lifecycle material inform #881, but historical or issue-scoped wording is not
   broad storage-intent lifecycle authority until live source, issue, and claim
   authority say so.
 - `docs/SPACEMAP_ALLOCATOR_DESIGN.md`,
-  `docs/SPACE_ACCOUNTING_MODEL_DESIGN.md`,
+  source-owned space-accounting crates,
   `docs/LOCAL_STORAGE_ALLOCATOR_OW102.md`,
   `docs/ALLOCATOR_RECLAIM_FREE_SPACE_SCHEMA_FAMILY_P2-02.md`, and the deleted
   local object-store format lineage from #1612: allocator, space accounting,
   segment, reclaim, and object-store material inform #880, but historical or
   unclassified design wording is not current storage-intent evidence until live
   source, issue, and claim authority say so.
-- `docs/design/device-layout-policies-adaptive-segment-sizing.md`: media
-  class and device segment sizing are placement inputs; storage intent owns
-  the workload-facing record/extent/stripe shape policy that uses those
-  inputs.
+- `crates/tidefs-local-object-store/src/device_layout.rs`: media class and
+  device segment sizing are placement inputs; storage intent owns the
+  workload-facing record/extent/stripe shape policy that uses those inputs.
 - Dataset property and mount-profile authorities are policy sources. Storage
   intent owns the compiled cross-source policy snapshot consumed by ack,
   placement, relocation, and explanation paths; it does not replace the
@@ -4195,7 +4194,7 @@ This document composes existing authority surfaces:
   operation scope, VFS/namespace authority refs, namespace intent, fsyncdir,
   metadata locality, directory/xattr/ACL locality, small-object shape, metadata
   write amplification, and typed metadata refusal. It composes
-  `docs/VFS_ENGINE_API_CONTRACT.md`, `docs/INODE_NAMESPACE_AUTHORITY.md`,
+  source-owned VFS engine API, `docs/INODE_NAMESPACE_AUTHORITY.md`,
   #688 namespace revision work, #894 ordering, #842 ack receipts, #878 data
   shape, #920 result/refusal, and cost/wear evidence without replacing VFS
   semantics, inode identity authority, adapter caches, or response grammar.
@@ -4344,13 +4343,13 @@ This document composes existing authority surfaces:
   while membership/runtime own epoch, fencing, and roster decisions.
 - `docs/CACHE_TAXONOMY_INVARIANTS_P4-02.md`: caches are not authority; RAM
   authority must be modeled explicitly.
-- `docs/UNIFIED_RESOURCE_GOVERNOR_DESIGN.md`: admission, dirty debt, transport
-  queues, and memory budgets are hard gates for any optimizer.
-- #893 and `docs/UNIFIED_RESOURCE_GOVERNOR_DESIGN.md`: per-dataset memory
-  partitioning and governor pressure are source evidence for #902 isolation, but
-  storage intent owns the cross-resource policy question of whether an admitted
-  action is fair, borrowed, throttled, or refused for the current receipt.
-- `docs/SPACE_ACCOUNTING_MODEL_DESIGN.md`, `docs/SPACEMAP_ALLOCATOR_DESIGN.md`,
+- source-owned resource-governor, admission, dirty debt, transport queue, and
+  memory-budget code paths are hard gates for any optimizer.
+- #893 and source-owned governor pressure evidence cover per-dataset memory
+  partitioning for #902 isolation, but storage intent owns the cross-resource
+  policy question of whether an admitted action is fair, borrowed, throttled,
+  or refused for the current receipt.
+- source-owned space-accounting crates, `docs/SPACEMAP_ALLOCATOR_DESIGN.md`,
   `docs/LOCAL_STORAGE_ALLOCATOR_OW102.md`, and the claim/reserve ledger crates:
   quota, statfs, allocator, pending-free, allocation-ticket, claim, and reserve
   evidence inform #898, but storage intent consumes typed refs instead of

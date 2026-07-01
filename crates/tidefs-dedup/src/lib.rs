@@ -619,7 +619,7 @@ impl DedupScannerStats {
 // Traits for testable I/O
 // ---------------------------------------------------------------------------
 
-// (traits removed per DESIGN_OVERFITTING_POLICY.md §5)
+// Traits were removed after source review; no external design root is required.
 
 // ---------------------------------------------------------------------------
 // Cursor helpers

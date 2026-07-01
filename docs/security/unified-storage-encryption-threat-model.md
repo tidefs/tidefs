@@ -26,7 +26,7 @@ stack:
 The document is anchored to the following design authorities:
 
 - `docs/BLAKE3_USAGE_POLICY.md` -- BLAKE3 usage boundary
-- `docs/security/blake3-integrity-boundary.md` -- integrity boundary closeout
+- `docs/BLAKE3_USAGE_POLICY.md` -- integrity digest placement and review policy
 - `docs/security/transport-security-boundary.md` -- transport session boundary
 - `docs/security/pool-encryption-secret-handle-boundary.md` -- P9-04
   handle/lease implementation
@@ -457,7 +457,6 @@ cargo test -p tidefs-auth --locked
 
 - `docs/security/transport-security-boundary.md` -- transport session boundary
 - `docs/security/pool-encryption-secret-handle-boundary.md` -- P9-04 handle/lease
-- `docs/security/blake3-integrity-boundary.md` -- BLAKE3 integrity boundary
 - `docs/BLAKE3_USAGE_POLICY.md` -- BLAKE3 usage policy
 - `docs/UNSAFE_AUDIT.md` -- current whole-tree unsafe inventory
 - `docs/security/kernel-unsafe-boundary-inventory.md` -- narrow unsafe-boundary

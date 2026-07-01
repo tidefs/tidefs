@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Device layout policies: adaptive segment sizing and device-class-aware write allocation.
 //!
-//! This module implements the device-class-aware policies described in
-//! `docs/design/device-layout-policies-adaptive-segment-sizing.md` (#1596).
+//! This module is the source authority for local device-class-aware write
+//! allocation. Workload-facing media and cost policy remains with
+//! `docs/STORAGE_INTENT_POLICY_AUTHORITY.md`.
 //!
 //! # Concepts
 //!

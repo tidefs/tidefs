@@ -2,8 +2,7 @@
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
 
-//! GC-safe pinned traversal root set for dataset destroy (§6 of
-//! [`docs/DATASET_LIFECYCLE_DESIGN.md`]).
+//! GC-safe pinned traversal root set for dataset destroy.
 //!
 //! Implements Phase 4 of the dataset lifecycle design: a const-generic
 //! bounded set of [`TraversalRoot`] records that act as GC barriers during
@@ -40,8 +39,6 @@
 //!   is a GC barrier; as the worker completes a root, it is unpinned,
 //!   and the GC naturally reclaims the now-unreachable blocks.
 //!
-//! [`docs/DATASET_LIFECYCLE_DESIGN.md`]:
-//!     https://forgejo/forgeadmin/tidefs/docs/DATASET_LIFECYCLE_DESIGN.md
 //! [`TraversalRoot`]: tidefs_types_dataset_lifecycle_core::TraversalRoot
 
 use core::fmt;

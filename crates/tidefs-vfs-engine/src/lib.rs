@@ -25,9 +25,10 @@
 //! - 2 memory-mapped I/O operations: `mmap` (policy), `fault` (page-fault resolver)
 //!
 //! - 3 advisory lock operations: `getlk`, `setlk`, `setlkw`
-//! # Design doc
 //!
-//! `docs/VFS_ENGINE_API_CONTRACT.md` (#1213)
+//! Current API authority is this source crate and the portable request records
+//! in `tidefs-types-vfs-core`; request/completion codec shape is documented in
+//! `docs/REQUEST_CONTRACT.md`.
 
 extern crate alloc;
 
@@ -547,14 +548,12 @@ pub trait VfsEngine {
     /// Returns the root inode of the filesystem.
     ///
     /// This is the adapter's entry point for mount and path resolution.
-    /// Corresponds to `get_root_inode` in `docs/VFS_ENGINE_API_CONTRACT.md` §5.1.
     fn get_root_inode(&self, ctx: &RequestCtx) -> Result<InodeId, Errno>;
 
     /// Look up `name` in directory `parent`.
     ///
     /// Returns the target inode's attributes.
     /// Errors: `ENOENT`, `ENOTDIR`, `EACCES`.
-    /// Corresponds to §5.2.
     fn lookup(&self, parent: InodeId, name: &[u8], ctx: &RequestCtx) -> Result<InodeAttr, Errno>;
 
     /// Get attributes for `inode`.
@@ -1825,8 +1824,8 @@ pub trait VfsEngine {}
 pub trait VfsEngineStatFs: VfsEngine {
     /// Return filesystem statistics (`statfs`/`statvfs`).
     ///
-    /// Corresponds to §9 auxiliary operations in
-    /// `docs/VFS_ENGINE_API_CONTRACT.md`.
+    /// This is an auxiliary VFS/statfs operation rather than a per-dataset
+    /// namespace mutation.
     fn statfs(&self, ctx: &RequestCtx) -> Result<StatFs, Errno>;
 
     /// Handle an imported-pool admin request owned by this live engine.

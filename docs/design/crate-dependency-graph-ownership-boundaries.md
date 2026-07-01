@@ -22,8 +22,9 @@
 > **Current authority**: [`docs/workspace-package-classification.md`](../workspace-package-classification.md)
 > for the active package-role table, [`docs/WHOLE_REPO_REVIEW.md`](../WHOLE_REPO_REVIEW.md)
 > for the current member set, and
-> [`docs/crates/types-core-consolidation-plan.md`](../crates/types-core-consolidation-plan.md)
-> for the consolidation rationale. Use `cargo metadata --no-deps` for live
+> for the deleted type-root consolidation lineage. Use
+> `docs/workspace-package-classification.md`, git history, and GitHub issue/PR
+> lineage for the current rationale; use `cargo metadata --no-deps` for live
 > dependency edges.
 >
 > TFR-002 / TFR-019 / issue #1019.
@@ -31,9 +32,10 @@
 ## Abstract
 
 This is a **historical design document** that recorded the crate-level
-dependency graph for a past TideFS Rust workspace snapshot. It is preserved as
-design input for the consolidation work tracked in
-[`docs/crates/types-core-consolidation-plan.md`](../crates/types-core-consolidation-plan.md).
+dependency graph for a past TideFS Rust workspace snapshot. The deleted
+type-root consolidation lineage now lives in git history and GitHub issue/PR
+state; use `docs/workspace-package-classification.md` for current package
+roles.
 Do not cite its tables or dependency edges as current workspace authority.
 
 The former 11-layer DESIGN issue matrix was deleted as stale Forgejo-era
@@ -498,8 +500,8 @@ current GitHub scheduling authority or current product architecture policy.
 - **Current authority for the workspace member set**:
   [`docs/WHOLE_REPO_REVIEW.md`](../WHOLE_REPO_REVIEW.md) and live
   `cargo metadata --no-deps`.
-- **Consolidation rationale**: [`docs/crates/types-core-consolidation-plan.md`](../crates/types-core-consolidation-plan.md)
-  documents which type-root crates were retired and why.
+- **Consolidation rationale**: deleted type-root lineage lives in git history,
+  GitHub issue/PR state, and the current package-role table.
 - The former 11-layer DESIGN issue matrix was deleted instead of kept as
   another stale status surface; use git history and GitHub issue/PR lineage for
   archaeological review.

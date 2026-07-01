@@ -4,8 +4,8 @@
 
 //! Authority type definitions for the persistent orphan index.
 //!
-//! Implements the narrow type vocabulary preserved by historical
-//! `docs/adr/0002-persistent-orphan-index.md` ADR lineage with six core types:
+//! Implements the narrow source-owned orphan-index type vocabulary with five
+//! core types:
 //!
 //! - [`OrphanKey`] — B-tree key: 8-byte big-endian inode ID
 //! - [`OrphanCursor`] — crash-recovery cursor for resumable batch processing

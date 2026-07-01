@@ -220,13 +220,41 @@ readiness, or successor/comparator claims.
 ## Device Layout Policy Historical Root Deletion (TFR-019 / #1684)
 
 Issue #1684 deleted the stale device-layout policy root that self-declared it
-was superseded by
-`docs/design/device-layout-policies-adaptive-segment-sizing.md`. Current
-authority remains with source-backed device-layout code, the refined design
-input, live issues, validation claims, and the claims gate; this deletion does
-not validate adaptive layout production readiness, import-performance
-scalability, allocator/device lifecycle completeness, availability, release
-readiness, or successor/comparator claims.
+was superseded by a later adaptive-segment-sizing design input that issue #1720
+also deleted. Current authority remains with source-backed device-layout code,
+live issues, validation claims, and the claims gate; these deletions do not
+validate adaptive layout production readiness, import-performance scalability,
+allocator/device lifecycle completeness, availability, release readiness, or
+successor/comparator claims.
+
+## Historical Input Fat Deletions (TFR-019 / #1720)
+
+Issue #1720 deleted stale historical roots whose remaining useful content was
+already covered by source, current authority docs, the review register, claims
+gate policy, git history, or GitHub issue/PR lineage. The deleted paths are:
+
+- `docs/TORN_COMMIT_RECOVERY_CONTRACT.md`
+- `docs/adr/0002-persistent-orphan-index.md`
+- `docs/crates/types-core-consolidation-plan.md`
+- `docs/security/blake3-integrity-boundary.md`
+- `docs/DESIGN_OVERFITTING_POLICY.md`
+- `docs/DATASET_LIFECYCLE_DESIGN.md`
+- `docs/SPACE_ACCOUNTING_MODEL_DESIGN.md`
+- `docs/UNIFIED_RESOURCE_GOVERNOR_DESIGN.md`
+- `docs/VFS_ENGINE_API_CONTRACT.md`
+- `docs/design/compression-design-strategy.md`
+- `docs/design/device-layout-policies-adaptive-segment-sizing.md`
+
+Current authority remains with source-owned crate comments and APIs,
+`docs/BLAKE3_USAGE_POLICY.md`, `docs/REQUEST_CONTRACT.md`,
+`docs/INODE_NAMESPACE_AUTHORITY.md`, `docs/CAPACITY_ACCOUNTING_AUTHORITY.md`,
+`docs/STORAGE_INTENT_POLICY_AUTHORITY.md`, `docs/TRANSFORM_PIPELINE_AUTHORITY.md`,
+`docs/workspace-package-classification.md`, `validation/claims.toml`, and
+`docs/CLAIMS_GATE_POLICY.md`. This deletion family does not validate VFS
+runtime completeness, dataset lifecycle closure, full space-accounting or
+resource-governor authority, mounted transform support, production checksum or
+recovery behavior, release readiness, performance, availability, or
+successor/comparator wording.
 
 ## Doc-Authority Drift Cleanup Coordination (#952)
 
@@ -252,8 +280,9 @@ stay out of this coordination slice:
 - #1016 owns deleted status/matrix links in `docs/USER_MANUAL.md`.
 - #1017 owns the visible historical-input treatment for retired crate paths in
   `docs/HUMAN_TERMINOLOGY.md`.
-- #1018 owns historical/evidence treatment for retired type-root consolidation
-  records in `docs/crates/types-core-consolidation-plan.md`.
+- #1018 owned historical/evidence treatment for retired type-root
+  consolidation records; #1720 deleted the remaining standalone plan root, so
+  git history and GitHub lineage retain that path.
 - #1019 owns historical/evidence treatment for retired type-root dependency
   tables in
   `docs/design/crate-dependency-graph-ownership-boundaries.md`.
@@ -348,15 +377,9 @@ release, successor, comparator, production, or parity claims.
 ### Stale Marker Classifications (TFR-019 / #1590)
 
 Issue #1590 also classified surviving Markdown files that still carried
-Forgejo-era URLs or live-looking imported status markers. These files remain in
-the tree only as historical input unless a future focused issue promotes a
-narrow source-backed scope.
-
-| Path | State | Classification note |
-|---|---|---|
-| `docs/TORN_COMMIT_RECOVERY_CONTRACT.md` | Historical input | Imported torn-commit recovery design-spec text. It is not current recovery implementation evidence, crash-safety proof, or release-readiness authority. |
-| `docs/adr/0002-persistent-orphan-index.md` | Historical input | Historical ADR for persistent orphan-index target architecture. It is not current reclaim, crash-recovery, or space-accounting proof. |
-| `docs/crates/types-core-consolidation-plan.md` | Historical input | Historical consolidation plan for deleted type-core scaffold roots. Current package authority is `docs/workspace-package-classification.md`. |
+Forgejo-era URLs or live-looking imported status markers. Issue #1720 later
+deleted the last standalone historical rows from this section; git history,
+issue #1590, and issue #1720 retain their lineage.
 
 ### Three-Contract Historical Root Deletion (TFR-019 / #1692)
 
@@ -448,8 +471,7 @@ source behavior, `validation/claims.toml`, and `xtask check-claims-gate`.
 | Path | State | Classification note |
 |---|---|---|
 | `docs/BLAKE3_USAGE_POLICY.md` | Current policy | Binding only as a BLAKE3 placement and review policy. It is not implementation-status evidence and does not validate production end-to-end checksum, scrub self-heal, erasure-coded integrity, or tamper-proof root claims. Because this is promoted to current policy, it is scanned by the claims gate. |
-| `docs/CHECKSUM_ARCHITECTURE_DESIGN.md` | Historical input | Imported G3 design target and old closeout text. Current source has object-store integrity pieces, but `validation/claims.toml` has no validated production checksum, repair, erasure, or committed-root tamper-detection claim covering the full architecture. |
-| `docs/security/blake3-integrity-boundary.md` | Historical input | Imported release-train closeout note. It may inform review of residual BLAKE3 overfit, but its conformant-crate and closeout language is not current release authority. |
+| `docs/CHECKSUM_ARCHITECTURE_DESIGN.md` | Historical input | Deferred in #1720 because active issue #1722 owns the remaining `xtask/tidefs-xtask/src/cluster.rs` citations. `docs/BLAKE3_USAGE_POLICY.md` is the current BLAKE3 placement policy; this imported G3 design target is not production checksum, repair, erasure, committed-root integrity, or release authority. |
 
 ### Storage Design Duplicate Root Deletions (TFR-019 / #1635)
 
@@ -517,29 +539,24 @@ surface beyond adding `docs/CLAIMS_GATE_POLICY.md`, which was already scanned.
 | Path | State | Classification note |
 |---|---|---|
 | `docs/CLAIMS_GATE_POLICY.md` | Current policy | Binding claims-gate guardrail enforced by `xtask check-claims-gate`. The scanner hard-codes a policy spec constant, verifies this file exists, and checks that the required gate text is present. Because this is promoted to current policy, it is scanned by the claims gate (it was already in the scanned-surface list). |
-| `docs/DESIGN_OVERFITTING_POLICY.md` | Historical input | Imported design-policy with a 2026-05-18 reconciliation note stating sections are superseded by P1-01 and workspace-package-classification. Binding rules (error variants, feature flags, dynamic dispatch, concurrency, unsafe) remain useful guidance, but the document references Forgejo state and partially-superseded crate-removal directives. |
 | `docs/ON_DISK_FORMAT_VERSIONING_AND_COMPATIBILITY_POLICY.md` | Historical input | Imported release-policy with well-articulated format versioning discipline, but references a stale Forgejo issue (#6518) and non-existent sub-documents (FORMAT_IDENTITY_UPGRADE_REPLAY_CONTINUITY_LAW_P2-04.md, TRANSPORT_SESSION_COHORT_GRAPH_P8-01.md, ZERO_COPY_DMA_PINNING_PAGE_LOAN_LAW_P4-04.md). The pre-release note correctly states no public release has shipped. |
 | `docs/RDMA_TRANSPORT_POSITION.md` | Historical input | Imported transport-position document referencing non-existent sub-documents and stating "TideFS does not have a product RDMA data path yet." Useful for future RDMA design reference. |
 | `docs/DISTRIBUTED_OPERATOR_PRODUCT_SURFACE_BLOCKER_MAP_OW307D.md` | Historical input | Imported OW-307D blocker map. Records typed truth rows and deterministic demo rows present in source, but the parent OW-307 gate remains open and a runtime-fed operator product surface is not yet present. |
 | `docs/OPERATOR_PRODUCT_SURFACE_DECISION.md` | Current policy | Design decision #1267 recording the current runtime-fed operator product-surface boundary after the OW-307D blocker map. States that no runtime-fed operator product surface exists, the P10-04 truth-surface law is missing from the repository, and no product carrier class is selectable until transport/cluster authority and the P10-04 gap close. The operator/UAPI command boundary is closed for the current pre-alpha command surface, but that closeout is not a runtime-fed product carrier. |
 | `docs/DASHBOARDS_TRACES_OPERATOR_TRUTH_SURFACES_P10-04.md` | Missing | Truth-surface law reference absent from the repository. Issue #1270 records the gap: the law expected to define mandatory surface classes, provenance/exactness/freshness rendering, carrier verification, and the `truth_view` concept does not exist, so citations to this path are not current authority. |
-| `docs/PREVIEW_USER_MANUAL.md` | Historical input | Imported preview manual that correctly disclaims production readiness and references the claims gate and transform authority. Preview commands are useful orientation but the document is preview-scoped, not binding policy. |
+| `docs/PREVIEW_USER_MANUAL.md` | Historical input | Deferred in #1720 because active issue #1722 owns the remaining `xtask` claims/storage citations. The file stays only as preview-scoped, claims-gated orientation; it is not binding operator policy, release authority, production readiness, or mounted transform evidence. |
 
 **Architecture, design, and feature docs**
 
 | Path | State | Classification note |
 |---|---|---|
-| `docs/HUMAN_TERMINOLOGY.md` | Historical input | Imported naming authority mapping human architecture names to Rust paths. Some listed crate paths (e.g. `tidefs-types-control-plane-core`) do not exist in the current workspace; several families are marked "Future". The naming pattern is useful reference but not current source authority. |
-| `docs/VFS_ENGINE_API_CONTRACT.md` | Historical input | Imported implemented-source contract for the VFS Engine API. References stale Forgejo issues (#1887, #1213). The canonical types and operations are useful design reference, but full source-behavior alignment verification is too large for this slice. |
+| `docs/HUMAN_TERMINOLOGY.md` | Historical input | Keep with current owner: `xtask/tidefs-xtask/src/terminology.rs` reads this file as the terminology-check map, and active issue #1722 owns adjacent xtask cleanup. Some listed crate paths are retired or future-only; the file is a checker input, not current source authority or product wording. |
 | `docs/FUSE_BINDING_STRATEGY_AND_FEATURE_MATRIX_P1-05.md` | Historical input | Imported production-design FUSE binding strategy describing the `fuser`-based binding, capability negotiation, and feature matrix. Useful reference, but full per-capability source alignment verification is too large for this slice. |
-| `docs/DEBUGGING_WORKFLOWS.md` | Historical input | Imported developer guide covering debug builds, tracing, test isolation, and xtask checks. Generally applicable commands, but specific references may have drifted. |
-| `docs/DATASET_FEATURE_FLAGS_DESIGN.md` | Historical input | Imported design-spec for per-dataset feature flags with three compatibility classes. References Forgejo issue #1223. |
-| `docs/DATASET_LIFECYCLE_DESIGN.md` | Historical input | Imported design-spec for dataset lifecycle state machine. References Forgejo issue #1219. Claims registry has no validated dataset-lifecycle claim. |
-| `docs/SPACEMAP_ALLOCATOR_DESIGN.md` | Historical input | Imported design-spec for spacemap and segment allocator. Explicitly states no runtime allocator or persistent spacemap exists in current source. References Forgejo issue #1189. |
-| `docs/SPACE_ACCOUNTING_MODEL_DESIGN.md` | Historical input | Imported design-spec for logical vs physical space accounting. References Forgejo issue #1215. Claims registry has no validated space-accounting claim. |
+| `docs/DEBUGGING_WORKFLOWS.md` | Historical input | Deferred in #1720 because active issue #1722 owns the remaining `xtask/tidefs-xtask/src/platform.rs` citations. This imported developer guide is not CI policy, workflow authority, or a guaranteed-current command reference. |
+| `docs/DATASET_FEATURE_FLAGS_DESIGN.md` | Historical input | Deferred in #1720 because active issue #1722 owns the remaining `xtask/tidefs-xtask/src/cluster.rs` citations and current source comments still consume the feature-flag type vocabulary. It is not a public compatibility promise or current mounted feature-negotiation claim. |
+| `docs/SPACEMAP_ALLOCATOR_DESIGN.md` | Historical input | Deferred in #1720 because active issue #1722 owns the remaining `xtask/tidefs-xtask/src/storage.rs` citation. Source allocator code and current capacity/storage-intent authority must be reviewed before deleting or promoting this root; it is not runtime allocator proof. |
 | `docs/POOL_IMPORT_EXPORT_DEVICE_TOPOLOGY_DESIGN.md` | Current spec | Scoped source-backed summary for the current pool-label, pool-scan/import, local import/export, and device-manager code paths. It is not product-readiness evidence for hot spares, evacuation, cluster ownership, online topology conversion, hardware-failure survival, availability, operational safety, or incumbent-comparison claims. |
 | `docs/MEMBERSHIP_SERVICE_DESIGN.md` | Historical input | Imported design-spec for cluster membership service. References Forgejo issue #1209. ZFS/Ceph comparison text is design input only and is not a cluster-membership, distributed-availability, scale, performance, or successor claim. Claims registry has no validated cluster-membership claim. |
-| `docs/design/compression-design-strategy.md` | Historical input | Imported design-spec for compression format extension model. References Forgejo issue #1245. Transform authority blocks mounted compression claims. |
 
 ### Remaining Imported Design Surface (TFR-019 / #512)
 
@@ -706,8 +723,6 @@ larger than this documentation-authority cleanup.
 |---|---|---|
 | `docs/POLYMORPHIC_XATTR_STORAGE_DESIGN.md` | Historical input | Imported Forgejo #1290 xattr storage design with proposed on-media records and ACL integration. Current xattr/ACL behavior and claims coverage were not audited here, so the document remains review material. |
 | `docs/SNAPSHOT_DEADLIST_PINNING_DESIGN.md` | Historical input | Imported snapshot deadlist/pinning design that reaches into reclamation, references, and snapshot lifecycle. It needs a dedicated snapshot/deadlist source and claims-gate review before promotion. |
-| `docs/UNIFIED_RESOURCE_GOVERNOR_DESIGN.md` | Historical input | Imported resource-governor design with broad scheduling and budget claims. Open resource-governor implementation work is separate; this document is not current runtime authority. |
-| `docs/design/device-layout-policies-adaptive-segment-sizing.md` | Historical input | Imported adaptive segment-sizing/device-layout policy design. It needs storage allocator/device-layout source and evidence review before it can constrain current behavior. |
 
 ### Background Service Framework Scheduler Authority (TFR-019 / #1537)
 
