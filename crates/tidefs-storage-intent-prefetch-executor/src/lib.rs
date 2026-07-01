@@ -792,6 +792,7 @@ pub struct PrefetchExecutorDispatchPlan {
     pub range_count: u32,
     pub fanout_limit: u32,
     pub namespace_depth_limit: u16,
+    pub projected_cost_requirements: PrefetchExecutorCostRequirementMask,
     pub expires_after_ms: u64,
     pub plan_ref: StorageIntentEvidenceRef,
 }
@@ -806,6 +807,7 @@ impl Default for PrefetchExecutorDispatchPlan {
             range_count: 0,
             fanout_limit: 0,
             namespace_depth_limit: 0,
+            projected_cost_requirements: PrefetchExecutorCostRequirementMask::EMPTY,
             expires_after_ms: 0,
             plan_ref: EMPTY_EVIDENCE_REF,
         }
@@ -827,6 +829,7 @@ impl PrefetchExecutorDispatchPlan {
             range_count: 1,
             fanout_limit: 0,
             namespace_depth_limit: 0,
+            projected_cost_requirements: PrefetchExecutorCostRequirementMask::EMPTY,
             expires_after_ms: 0,
             plan_ref,
         }
@@ -854,6 +857,15 @@ impl PrefetchExecutorDispatchPlan {
     #[must_use]
     pub const fn with_namespace_depth_limit(mut self, namespace_depth_limit: u16) -> Self {
         self.namespace_depth_limit = namespace_depth_limit;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_projected_cost_requirements(
+        mut self,
+        requirements: PrefetchExecutorCostRequirementMask,
+    ) -> Self {
+        self.projected_cost_requirements = requirements;
         self
     }
 
@@ -1657,7 +1669,8 @@ pub fn evaluate_prefetch_execution(input: PrefetchExecutorInput) -> PrefetchExec
             .union(PrefetchExecutorCostRequirementMask::for_media_destination(
                 input.media_path.target_media,
                 input.media_path.target_role,
-            )),
+            ))
+            .union(input.dispatch_plan.projected_cost_requirements),
     );
     record.cost_state = cost_state;
 
@@ -1865,23 +1878,13 @@ pub fn evaluate_prefetch_execution(input: PrefetchExecutorInput) -> PrefetchExec
         }
     }
 
-    if cost_state.required != PrefetchExecutorCostRequirementMask::EMPTY {
-        let cost_ref = first_bound(
-            cost_state.cost_ref,
-            input.decision.evidence_refs.cost_wear_ref,
+    if let Some(refusal) = dispatch_cost_evidence_refusal(input, cost_state) {
+        return terminal(
+            record,
+            PrefetchExecutorOutcome::Refused,
+            PrefetchExecutorByteState::Refused,
+            refusal,
         );
-        if !snapshot_contains_fresh_ref(
-            input,
-            StorageIntentEvidenceKind::MediaCostWearLedger,
-            cost_ref,
-        ) {
-            return terminal(
-                record,
-                PrefetchExecutorOutcome::Refused,
-                PrefetchExecutorByteState::Refused,
-                StorageIntentRefusalReason::EvidenceNotUsable,
-            );
-        }
     }
 
     if (input.require_known_waf
@@ -2791,6 +2794,53 @@ fn terminal_charge_requires_egress_restore(required: PrefetchExecutorCostRequire
 fn terminal_charge_requires_transport(required: PrefetchExecutorCostRequirementMask) -> bool {
     required.contains(PrefetchExecutorCostRequirementMask::WAN_BANDWIDTH)
         || terminal_charge_requires_egress_restore(required)
+}
+
+fn dispatch_cost_evidence_refusal(
+    input: PrefetchExecutorInput,
+    cost_state: PrefetchExecutorCostState,
+) -> Option<StorageIntentRefusalReason> {
+    if cost_state.required == PrefetchExecutorCostRequirementMask::EMPTY {
+        return None;
+    }
+
+    let cost_ref = first_bound(
+        cost_state.cost_ref,
+        input.decision.evidence_refs.cost_wear_ref,
+    );
+    if !snapshot_contains_fresh_ref(
+        input,
+        StorageIntentEvidenceKind::MediaCostWearLedger,
+        cost_ref,
+    ) {
+        return Some(StorageIntentRefusalReason::EvidenceNotUsable);
+    }
+
+    if terminal_charge_requires_egress_restore(cost_state.required)
+        && !snapshot_contains_fresh_ref(
+            input,
+            StorageIntentEvidenceKind::MediaCostWearLedger,
+            input.decision.evidence_refs.egress_restore_cost_ref,
+        )
+    {
+        return Some(StorageIntentRefusalReason::EvidenceNotUsable);
+    }
+
+    if terminal_charge_requires_transport(cost_state.required) {
+        let transport_ref = first_bound(
+            input.media_path.transport_path_ref,
+            input.decision.evidence_refs.transport_budget_ref,
+        );
+        if !snapshot_contains_fresh_ref(
+            input,
+            StorageIntentEvidenceKind::TransportPathEvidence,
+            transport_ref,
+        ) {
+            return Some(StorageIntentRefusalReason::EvidenceNotUsable);
+        }
+    }
+
+    None
 }
 
 fn initial_result_detail_lacks_feedback_evidence(input: PrefetchExecutorInput) -> bool {
@@ -6043,6 +6093,76 @@ mod tests {
             record.refusal,
             StorageIntentRefusalReason::EvidenceNotUsable
         );
+    }
+
+    #[test]
+    fn dispatch_plan_projected_costs_are_not_zero_cost() {
+        let projected = PrefetchExecutorCostRequirementMask::PREDICTOR_CHECKPOINTS
+            .union(PrefetchExecutorCostRequirementMask::CPU)
+            .union(PrefetchExecutorCostRequirementMask::MEMORY)
+            .union(PrefetchExecutorCostRequirementMask::FOREGROUND_DISRUPTION);
+        let mut input = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        input.dispatch_plan = input
+            .dispatch_plan
+            .with_projected_cost_requirements(projected);
+        input.cost_state.snapshot.evidence_state = StorageIntentCostEvidenceState::FRESH
+            .with_missing(StorageIntentCostClass::TransformProcessing);
+
+        let record = evaluate_prefetch_execution(input);
+
+        assert_eq!(record.outcome, PrefetchExecutorOutcome::Refused);
+        assert_eq!(
+            record.executor_byte_state,
+            PrefetchExecutorByteState::Refused
+        );
+        assert_eq!(
+            record.refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+        assert!(record.cost_state.required.contains(projected));
+        assert_record_has_no_authority_claims(record);
+    }
+
+    #[test]
+    fn projected_egress_restore_cost_ref_must_be_inside_evidence_cut() {
+        let projected = PrefetchExecutorCostRequirementMask::EGRESS
+            .union(PrefetchExecutorCostRequirementMask::OBJECT_ARCHIVE_RESTORE_CALLS);
+        let mut input = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        add_remote_path_evidence(&mut input);
+        input.dispatch_plan = input
+            .dispatch_plan
+            .with_projected_cost_requirements(projected);
+        input.decision.evidence_refs.egress_restore_cost_ref =
+            evidence(StorageIntentEvidenceKind::MediaCostWearLedger, OUTSIDE_CUT);
+
+        let record = evaluate_prefetch_execution(input);
+
+        assert_eq!(record.outcome, PrefetchExecutorOutcome::Refused);
+        assert_eq!(
+            record.refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+        assert!(record.cost_state.required.contains(projected));
+        assert_record_has_no_authority_claims(record);
+    }
+
+    #[test]
+    fn dispatch_plan_projected_costs_are_preserved_when_proven() {
+        let projected = PrefetchExecutorCostRequirementMask::PREDICTOR_CHECKPOINTS
+            .union(PrefetchExecutorCostRequirementMask::CPU)
+            .union(PrefetchExecutorCostRequirementMask::MEMORY)
+            .union(PrefetchExecutorCostRequirementMask::FOREGROUND_DISRUPTION);
+        let mut input = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        input.dispatch_plan = input
+            .dispatch_plan
+            .with_projected_cost_requirements(projected);
+
+        let record = evaluate_prefetch_execution(input);
+
+        assert_eq!(record.outcome, PrefetchExecutorOutcome::Started);
+        assert_eq!(record.dispatch_plan.projected_cost_requirements, projected);
+        assert!(record.cost_state.required.contains(projected));
+        assert_record_has_no_authority_claims(record);
     }
 
     #[test]
