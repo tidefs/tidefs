@@ -67,7 +67,8 @@ pub use inode::{InodeHandle, InodeState, InodeTable};
 pub use operation::{VfsOperation, VfsResponse};
 #[cfg(feature = "alloc")]
 pub use pool_core::{
-    KernelPoolConfig, KernelPoolCore, KernelPoolError, KernelPoolState, LowerDeviceDesc,
+    KernelPoolConfig, KernelPoolCore, KernelPoolError, KernelPoolImportedRoot,
+    KernelPoolReplayCursor, KernelPoolState, LowerDeviceDesc,
 };
 pub use txg::{CommittedRoot, TxgHandle, TxgId, TxgPrepareResult};
 

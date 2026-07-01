@@ -287,8 +287,30 @@ impl<E: VfsEngine + VfsEngineStatFs> KernelMountSequence<E> {
         // authority pointers.  The VRBT is at offset 3 * block_size within the
         // superblock region (after VCRL at offset 0, VCRP primary at offset
         // block_size, VCRP backup at offset 2*block_size).
-        let (inode_table_root, extent_map_root, intent_log_head, intent_log_tail) =
-            Self::try_decode_vrbt_from_region(superblock_region_buf, pool_ctx.superblock_size);
+        let vrbt = Self::try_decode_vrbt_from_region(
+            superblock_region_buf,
+            pool_ctx.superblock_size,
+        )?;
+        if root_anchor.root_ino.get() == 0 {
+            return Err(MountSequenceError::MissingComponent {
+                detail: String::from("committed-root ledger root inode"),
+            });
+        }
+        if vrbt.root_ino != root_anchor.root_ino.get() || vrbt.committed_txg != root_anchor.txg {
+            return Err(MountSequenceError::MissingComponent {
+                detail: String::from("committed-root VRBT matching selected ledger root"),
+            });
+        }
+        if vrbt.inode_table_root == 0 {
+            return Err(MountSequenceError::MissingComponent {
+                detail: String::from("committed-root inode table root"),
+            });
+        }
+        if vrbt.extent_map_root == 0 {
+            return Err(MountSequenceError::MissingComponent {
+                detail: String::from("committed-root extent map root"),
+            });
+        }
 
         // Phase 3: Build superblock metadata.
         // Derive a SuperblockInfo from the pool label context.
@@ -334,10 +356,10 @@ impl<E: VfsEngine + VfsEngineStatFs> KernelMountSequence<E> {
                 clean_export: pool_ctx.is_clean_export(),
                 cluster: pool_ctx.cluster.clone(),
                 transport_carrier: self.transport_carrier,
-                inode_table_root,
-                extent_map_root,
-                intent_log_head,
-                intent_log_tail,
+                inode_table_root: vrbt.inode_table_root,
+                extent_map_root: vrbt.extent_map_root,
+                intent_log_head: vrbt.intent_log_head,
+                intent_log_tail: vrbt.intent_log_tail,
             },
             engine,
         ))
@@ -347,12 +369,12 @@ impl<E: VfsEngine + VfsEngineStatFs> KernelMountSequence<E> {
     ///
     /// The VRBT sits at offset `3 * block_size` within the superblock region
     /// (VCRL at 0, VCRP at block_size, VCRP backup at 2*block_size).
-    /// Returns (inode_table_root, extent_map_root, intent_log_head, intent_log_tail).
-    /// Falls back to zeros when the VRBT is absent or the region is too small.
+    /// Returns the decoded VRBT root. Missing or malformed VRBT authority is a
+    /// fail-closed mount error for committed-root import mounts.
     fn try_decode_vrbt_from_region(
         superblock_region_buf: &[u8],
         superblock_size: u64,
-    ) -> (u64, u64, u64, u64) {
+    ) -> Result<crate::replay_integration::VrbtRoot, MountSequenceError> {
         use crate::replay_integration;
         // VRBT offset within superblock: the ledger (VCRL) is at offset 0,
         // VCRP records follow, VRBT is at 3 * block_size.  We try at a
@@ -365,15 +387,12 @@ impl<E: VfsEngine + VfsEngineStatFs> KernelMountSequence<E> {
             if let Ok(vrbt) =
                 replay_integration::decode_vrbt(&superblock_region_buf[vrbt_offset..vrbt_end])
             {
-                return (
-                    vrbt.inode_table_root,
-                    vrbt.extent_map_root,
-                    vrbt.intent_log_head,
-                    vrbt.intent_log_tail,
-                );
+                return Ok(vrbt);
             }
         }
-        (0, 0, 0, 0)
+        Err(MountSequenceError::MissingComponent {
+            detail: String::from("valid committed-root VRBT block"),
+        })
     }
 
     /// Return a reference to the underlying engine.
@@ -425,6 +444,38 @@ mod tests {
 
     fn make_ledger(anchors: &[CommittedRootAnchor]) -> Vec<u8> {
         MountRootSelector::encode_ledger(anchors)
+    }
+
+    fn make_vrbt(
+        committed_txg: u64,
+        root_ino: u64,
+        inode_table_root: u64,
+        extent_map_root: u64,
+        intent_log_head: u64,
+        intent_log_tail: u64,
+    ) -> Vec<u8> {
+        let mut block = vec![0u8; crate::replay_integration::VRBT_WIRE_SIZE];
+        block[0..4].copy_from_slice(b"VRBT");
+        block[4..8].copy_from_slice(&1u32.to_le_bytes());
+        block[8..16].copy_from_slice(&committed_txg.to_le_bytes());
+        block[16..24].copy_from_slice(&root_ino.to_le_bytes());
+        block[24..32].copy_from_slice(&inode_table_root.to_le_bytes());
+        block[32..40].copy_from_slice(&extent_map_root.to_le_bytes());
+        block[40..48].copy_from_slice(&intent_log_head.to_le_bytes());
+        block[48..56].copy_from_slice(&intent_log_tail.to_le_bytes());
+        let digest: [u8; 32] = blake3::hash(&block[..56]).into();
+        block[56..88].copy_from_slice(&digest);
+        block
+    }
+
+    fn make_superblock_region(anchor: &CommittedRootAnchor) -> Vec<u8> {
+        let ledger = make_ledger(core::slice::from_ref(anchor));
+        let vrbt = make_vrbt(anchor.txg, anchor.root_ino.get(), 4096, 8192, 0, 0);
+        let mut region = ledger;
+        region.resize(3 * 4096 + crate::replay_integration::VRBT_WIRE_SIZE, 0);
+        region[3 * 4096..3 * 4096 + crate::replay_integration::VRBT_WIRE_SIZE]
+            .copy_from_slice(&vrbt);
+        region
     }
 
     fn make_intent_create(parent: u64, name: &[u8], mode: u32, ino: u64) -> Vec<u8> {
@@ -500,7 +551,7 @@ mod tests {
             },
             7,
         );
-        let ledger_buf = make_ledger(&[anchor]);
+        let ledger_buf = make_superblock_region(&anchor);
         let intent = make_intent_create(1, b"file", 0o644, 42);
 
         let (result, _engine) = KernelMountSequence::new(engine, true)
@@ -512,9 +563,8 @@ mod tests {
         assert_eq!(result.replay_outcome.replayed, 1);
         assert_eq!(result.replay_outcome.skipped, 0);
         assert!(!result.clean_export);
-        // VRBT fields are zero when no VRBT is in the superblock region
-        assert_eq!(result.inode_table_root, 0);
-        assert_eq!(result.extent_map_root, 0);
+        assert_eq!(result.inode_table_root, 4096);
+        assert_eq!(result.extent_map_root, 8192);
     }
 
     #[test]
@@ -531,7 +581,7 @@ mod tests {
             },
             3,
         );
-        let ledger_buf = make_ledger(&[anchor]);
+        let ledger_buf = make_superblock_region(&anchor);
         let intent = make_intent_create(1, b"file", 0o644, 10);
 
         let (result, _engine) = KernelMountSequence::new(engine, false)
@@ -540,8 +590,71 @@ mod tests {
 
         assert_eq!(result.replay_outcome.replayed, 0);
         assert_eq!(result.replay_outcome.skipped, 0);
-        // VRBT fields are zero without a VRBT in the region
-        assert_eq!(result.inode_table_root, 0);
+        assert_eq!(result.inode_table_root, 4096);
+        assert_eq!(result.extent_map_root, 8192);
+    }
+
+    #[test]
+    fn mount_sequence_without_vrbt_fails_closed() {
+        let engine = build_engine();
+        let label_buf = make_label_buf(PoolState::Active, 3);
+
+        let anchor = CommittedRootAnchor::new(
+            InodeId::new(1),
+            {
+                let mut u = [0u8; 32];
+                u[0..16].copy_from_slice(&[0xAA; 16]);
+                u
+            },
+            3,
+        );
+        let ledger_buf = make_ledger(&[anchor]);
+
+        let result = KernelMountSequence::new(engine, false)
+            .mount(&label_buf, &ledger_buf, &[], &test_ctx())
+            .map(|(r, _e)| r);
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            MountSequenceError::MissingComponent { detail } => {
+                assert!(detail.contains("VRBT"));
+            }
+            other => panic!("expected MissingComponent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mount_sequence_with_mismatched_vrbt_fails_closed() {
+        let engine = build_engine();
+        let label_buf = make_label_buf(PoolState::Active, 3);
+
+        let anchor = CommittedRootAnchor::new(
+            InodeId::new(1),
+            {
+                let mut u = [0u8; 32];
+                u[0..16].copy_from_slice(&[0xAA; 16]);
+                u
+            },
+            3,
+        );
+        let ledger = make_ledger(core::slice::from_ref(&anchor));
+        let vrbt = make_vrbt(anchor.txg, 2, 4096, 8192, 0, 0);
+        let mut region = ledger;
+        region.resize(3 * 4096 + crate::replay_integration::VRBT_WIRE_SIZE, 0);
+        region[3 * 4096..3 * 4096 + crate::replay_integration::VRBT_WIRE_SIZE]
+            .copy_from_slice(&vrbt);
+
+        let result = KernelMountSequence::new(engine, false)
+            .mount(&label_buf, &region, &[], &test_ctx())
+            .map(|(r, _e)| r);
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            MountSequenceError::MissingComponent { detail } => {
+                assert!(detail.contains("matching selected ledger root"));
+            }
+            other => panic!("expected MissingComponent, got {other:?}"),
+        }
     }
 
     #[test]
