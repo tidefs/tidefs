@@ -1672,7 +1672,8 @@ pub fn evaluate_prefetch_execution(input: PrefetchExecutorInput) -> PrefetchExec
                 input.media_path.target_media,
                 input.media_path.target_role,
             ))
-            .union(input.dispatch_plan.projected_cost_requirements),
+            .union(input.dispatch_plan.projected_cost_requirements)
+            .union(input.result_detail.charge_requirements()),
     );
     record.cost_state = cost_state;
 
@@ -4993,6 +4994,7 @@ mod tests {
     #[test]
     fn feedback_result_detail_is_preserved_for_975() {
         let mut input = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        add_remote_path_evidence(&mut input);
         input.admission.requested_bytes = 16 * 1024;
         input.admission.admitted_bytes = 12 * 1024;
         input.admission.queue_time_us = 17;
@@ -5054,6 +5056,10 @@ mod tests {
             record.evidence_refs.validation_ref,
             input.result_detail.validation_ref
         );
+        assert!(record
+            .cost_state
+            .required
+            .contains(input.result_detail.charge_requirements()));
         assert_record_has_no_authority_claims(record);
     }
 
@@ -6241,6 +6247,85 @@ mod tests {
         assert_eq!(record.outcome, PrefetchExecutorOutcome::Started);
         assert_eq!(record.dispatch_plan.projected_cost_requirements, projected);
         assert!(record.cost_state.required.contains(projected));
+        assert_record_has_no_authority_claims(record);
+    }
+
+    #[test]
+    fn initial_feedback_cost_measurements_are_not_zero_cost() {
+        let mut input = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        input.result_detail = PrefetchExecutorResultDetail {
+            predictor_metadata_write_bytes: 64,
+            attribution_ref: evidence(
+                StorageIntentEvidenceKind::MeasurementAttributionEvidence,
+                ATTRIBUTION,
+            ),
+            retention_ref: evidence(
+                StorageIntentEvidenceKind::EvidenceRetentionEvidence,
+                RETENTION,
+            ),
+            validation_ref: evidence(StorageIntentEvidenceKind::ValidationArtifact, VALIDATION),
+            ..PrefetchExecutorResultDetail::default()
+        };
+        add_initial_feedback_roots(&mut input.evidence_query_snapshot, input.result_detail);
+        input.cost_state.snapshot.evidence_state = StorageIntentCostEvidenceState::FRESH
+            .with_missing(StorageIntentCostClass::TransformProcessing);
+
+        let record = evaluate_prefetch_execution(input);
+
+        assert_eq!(record.outcome, PrefetchExecutorOutcome::Refused);
+        assert_eq!(
+            record.executor_byte_state,
+            PrefetchExecutorByteState::Refused
+        );
+        assert_eq!(
+            record.refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+        assert!(record
+            .cost_state
+            .required
+            .contains(PrefetchExecutorCostRequirementMask::PREDICTOR_CHECKPOINTS));
+        assert_record_has_no_authority_claims(record);
+    }
+
+    #[test]
+    fn initial_feedback_remote_cost_refs_must_be_inside_evidence_cut() {
+        let mut input = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        input.result_detail = PrefetchExecutorResultDetail {
+            wan_bytes: 4096,
+            egress_cost_microunits: 7,
+            attribution_ref: evidence(
+                StorageIntentEvidenceKind::MeasurementAttributionEvidence,
+                ATTRIBUTION,
+            ),
+            retention_ref: evidence(
+                StorageIntentEvidenceKind::EvidenceRetentionEvidence,
+                RETENTION,
+            ),
+            validation_ref: evidence(StorageIntentEvidenceKind::ValidationArtifact, VALIDATION),
+            ..PrefetchExecutorResultDetail::default()
+        };
+        add_initial_feedback_roots(&mut input.evidence_query_snapshot, input.result_detail);
+
+        let record = evaluate_prefetch_execution(input);
+
+        assert_eq!(record.outcome, PrefetchExecutorOutcome::Refused);
+        assert_eq!(
+            record.executor_byte_state,
+            PrefetchExecutorByteState::Refused
+        );
+        assert_eq!(
+            record.refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+        assert!(record
+            .cost_state
+            .required
+            .contains(PrefetchExecutorCostRequirementMask::WAN_BANDWIDTH));
+        assert!(record
+            .cost_state
+            .required
+            .contains(PrefetchExecutorCostRequirementMask::EGRESS));
         assert_record_has_no_authority_claims(record);
     }
 
