@@ -63,7 +63,7 @@ surface, widen publishing claims, or preselect a runtime carrier.
 - Bounded `rg` inspection for `DASHBOARDS_TRACES_OPERATOR_TRUTH_SURFACES`,
   `truth_view`, runtime-fed operator surfaces, render receipts, and
   product carriers: The P10-04 document is referenced by
-  `docs/RECEIPT_RESPONSE_RUNTIME_EMISSION_PATH_P3-03.md`,
+  deleted P3 receipt/response production-depth lineage,
   `docs/MEMBERSHIP_PLACEMENT_FAILURE_DOMAIN_MODEL_P8-02.md`,
   `docs/PERFORMANCE_BUDGETS_SLO_REGRESSION_GATES_P10-03.md`,
   `docs/FAULT_INJECTION_CHAOS_CORRUPTION_CAMPAIGNS_P10-02.md`,

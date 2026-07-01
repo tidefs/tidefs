@@ -1034,11 +1034,11 @@ visible until converged or retired.
 ## Result, Refusal, And Caller Projection
 
 #920 owns the storage-intent result/refusal evidence projection. It does not
-promote `docs/RECEIPT_RESPONSE_RUNTIME_EMISSION_PATH_P3-03.md` beyond its
-historical-input classification or replace any current response/refusal runtime
-successor. Instead, it is the storage-intent outcome record that the response
-or refusal runtime consumes when a write, read, fsync, FUA, placement decision,
-relocation action, operator request, or retry becomes caller-visible.
+promote the deleted P3 receipt/response production-depth lineage into current
+authority or replace any current response/refusal runtime successor. Instead,
+it is the storage-intent outcome record that the response or refusal runtime
+consumes when a write, read, fsync, FUA, placement decision, relocation action,
+operator request, or retry becomes caller-visible.
 
 `docs/STORAGE_INTENT_RESULT_REFUSAL_EVIDENCE_DESIGN.md` is the focused #920
 model record for this boundary.
@@ -4363,8 +4363,9 @@ This document composes existing authority surfaces:
 - `docs/BACKGROUND_SERVICE_FRAMEWORK_DESIGN.md`: relocation, repair, rebuild,
   scrub, compaction, and geo catch-up use the shared job/scheduler vocabulary
   when they are not serving a foreground or critical policy risk.
-- `docs/POLICY_AUTHORITY_RUNTIME_SURFACE_P3-01.md`,
-  `docs/PREVIEW_UAPI_ABI_BOUNDARY_OW202.md`, and
+- `docs/OPERATOR_UAPI_AUTHORITY.md`,
+  `docs/PREVIEW_UAPI_ABI_BOUNDARY_OW202.md`,
+  `docs/OPERATOR_PRODUCT_SURFACE_DECISION.md`, and
   `docs/UPGRADE_FAILOVER_CUTOVER_OPERATOR_RUNBOOKS_P9-03.md`: policy publish,
   dataset/property mutation visibility, dry-run, stage, commit, verify, and
   rollback grammar are inputs to #855/#901/#926; storage intent consumes their

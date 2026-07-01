@@ -68,7 +68,11 @@ This document governs:
 - explicit hold/quarantine behavior when separation or quorum proof is insufficient,
 - and the grounding of those rules in the current deterministic cluster harness.
 
-This document now consumes the explicit `governance_surface_0` authority-service law in `docs/POLICY_AUTHORITY_RUNTIME_SURFACE_P3-01.md`.
+This historical input no longer cites the deleted P3 policy-authority root as
+live authority. Current policy and placement admission authority remains with
+`docs/STORAGE_INTENT_POLICY_AUTHORITY.md`,
+`docs/LOCAL_DISTRIBUTED_RECEIPT_AUTHORITY.md`, and source-backed membership and
+placement docs.
 
 That boundary is deliberate.
 `P8-02` fixes **who may belong where and how separation is proved**.

@@ -589,8 +589,6 @@ OpenZFS/Ceph successor status.
 
 | Path | State | Classification note |
 |---|---|---|
-| `docs/POLICY_AUTHORITY_RUNTIME_SURFACE_P3-01.md` | Historical input | Imported production-depth policy-authority runtime-surface design. It is not current authority for a complete kernel-hosted or runtime-fed policy authority service. |
-| `docs/RECEIPT_RESPONSE_RUNTIME_EMISSION_PATH_P3-03.md` | Historical input | Imported receipt/response runtime-emission design. It is not current closure for the local/distributed receipt authority or response-envelope runtime surface. |
 | `docs/STORAGE_INTENT_POLICY_AUTHORITY.md` | Current spec | Design authority for the native storage-intent policy surface introduced by GitHub issue #839: guarantee/ack classes, receipt-satisfaction predicates, satisfaction reconciliation, proximity domains, workload prediction, media roles, flash-wear cost, RAM authority classes, relocation/defrag policy, operator receipt explanation, and the need for the #863 storage-intent fault-validation matrix. It is not runtime implementation evidence, a POSIX sync validation claim, a distributed availability claim, a completed fault-validation claim, or a performance superiority claim. |
 | `docs/STORAGE_INTENT_SERVICE_OBJECTIVE_DESIGN.md` | Current spec | Scoped current spec for GitHub issue #915 service-objective evidence: objective identity, workload and operation scope, latency percentile/tail, throughput/burst/dwell, topology/media/proximity, RPO/RTO, isolation, capacity, cost, wear, decision/action, measurement, comparator, claim, and typed refusal requirements. It is not runtime implementation evidence, a performance-validation artifact, or a superiority claim over OpenZFS, Ceph, DRBD, or any other system. |
 | `docs/STORAGE_INTENT_RESULT_REFUSAL_EVIDENCE_DESIGN.md` | Current spec | Scoped current spec for GitHub issue #920 result/refusal evidence: caller-visible outcome identity, policy/query/decision/receipt refs, degraded-visible state, service-objective/admission/action blockers, response-registry projection, retryability, caller compression, and retention/audit requirements. It is not runtime implementation evidence, a response-registry runtime, a POSIX errno validation artifact, or a product-readiness claim. |
@@ -784,6 +782,26 @@ validation claims, claims-gate policy, and live GitHub issues/PRs. This
 deletion does not promote production kernel residency, full-kernel/no-daemon
 readiness, production UAPI/ABI freeze, kernel block or POSIX parity, release
 readiness, OpenZFS/Ceph parity, or successor/comparator wording.
+
+### P3 Policy And Receipt Root Deletions (TFR-019 / #1709)
+
+Issue #1709 deleted the imported policy-authority runtime-surface and
+receipt/response runtime-emission production-depth roots instead of preserving
+them as live historical surfaces. Those roots were already classified as
+historical input, used source-of-truth wording wider than current source-backed
+implementation, and competed with the scoped storage-intent, receipt,
+result/refusal, operator, and claims-gate authority surfaces.
+
+Current authority remains with `docs/STORAGE_INTENT_POLICY_AUTHORITY.md`,
+`docs/LOCAL_DISTRIBUTED_RECEIPT_AUTHORITY.md`,
+`docs/STORAGE_INTENT_RESULT_REFUSAL_EVIDENCE_DESIGN.md`,
+`docs/OPERATOR_PRODUCT_SURFACE_DECISION.md`,
+`docs/OPERATOR_UAPI_AUTHORITY.md`, `docs/CLAIMS_GATE_POLICY.md`,
+`validation/claims.toml`, generated `docs/CLAIM_REGISTRY.md`, source behavior,
+and live GitHub issues/PRs. This deletion does not promote a complete
+kernel-hosted policy authority service, runtime-fed operator product surface,
+response-registry runtime, receipt runtime closure, release readiness,
+OpenZFS/Ceph parity, or successor/comparator wording.
 
 ### Release Readiness Verdict Contract (#1279)
 
