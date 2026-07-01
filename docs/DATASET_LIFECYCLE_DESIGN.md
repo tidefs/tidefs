@@ -1,10 +1,17 @@
-# Dataset Lifecycle State Machine Design (P1 hard-gate)
+# Dataset Lifecycle State Machine Design (Historical Input)
 
-Maturity: **design-spec** for the per-dataset lifecycle state machine with
-ACTIVE/DESTROYING/TOMBSTONE states, mount safety gating, poison semantics for
-in-flight mounts, pinned traversal roots for GC safety, and tombstone reaper policy.
+Maturity: **historical input** - imported dataset-lifecycle target design, not
+current TideFS implementation status, product behavior proof, or claim-registry
+authority.
 
-This document closes Forgejo issue #1219.
+Authority classification: TFR-019 / `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`
+leaves this document as historical input. Use live source, current authority
+docs, and `validation/claims.toml` for current dataset-lifecycle status.
+
+Historical note: this imported document recorded a Forgejo issue #1219
+closeout. It does not close any current GitHub dataset-lifecycle,
+destroy-worker, cluster-consensus, release-readiness, or production-readiness
+item.
 
 ## 1. Motivation
 

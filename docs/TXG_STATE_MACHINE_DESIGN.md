@@ -1,6 +1,12 @@
-# Canonical commit ordering and multi-phase commit_group state machine (v1.0-draft)
+# Commit-group ordering target state machine (historical input)
 
-Maturity: **spec-draft** — formal design document per issue #1267.
+Maturity: **historical input** - imported commit-group ordering target design,
+not current TXG ordering behavior proof, crash-consistency proof, or
+claim-registry authority.
+
+Authority classification: TFR-019 / `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`
+leaves this document as historical input. Use live source, current authority
+docs, and `validation/claims.toml` for current commit-group/TXG behavior.
 
 ## Source
 
@@ -9,7 +15,7 @@ The v0.262 Python implementation (v0.135) implemented a detailed commit_group st
 machine with explicit ordering contract. This document formalizes that
 design for the Rust implementation.
 
-## Seven-step canonical commit ordering
+## Seven-step target commit ordering
 
 ```
 Step 1: APPEND data records (extent payloads / shards)

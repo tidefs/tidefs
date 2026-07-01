@@ -3,6 +3,12 @@
 Date: 2026-05-05
 Status: Accepted
 
+Current authority note: this ADR records the accepted historical design
+direction. It does not prove current persistent-orphan-index, reclaim,
+crash-recovery, space-accounting, release, production, or incumbent-comparison
+behavior. Product-facing comparison or successor wording still requires #875
+claim ids plus #928/#930 comparator evidence.
+
 ## Context
 
 TideFS is an authoritative graph of stable identities and immutable revisions.
@@ -55,9 +61,6 @@ Implement a **persistent orphan index** as a first-class on-media structure:
 - Coordination required with spacemap allocator to ensure freed blocks aren't
   double-allocated during crash recovery replay.
 
-Design specs:
-- `docs/design/persistent-orphan-index-consolidated-design.md`
-- `docs/design/persistent-orphan-index-design-2063.md`
-- `docs/design/persistent-orphan-index-wire-up-design-1961.md`
+Historical design input: `docs/PERSISTENT_ORPHAN_INDEX_DESIGN.md`
 Issues: [#2063](http://172.16.106.12/forgejo/forgeadmin/tidefs/issues/2063),
 [#2083](http://172.16.106.12/forgejo/forgeadmin/tidefs/issues/2083)

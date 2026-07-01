@@ -17,7 +17,7 @@ pointer and self-healing from redundant copies. Ceph offers optional per-object
 checksums but silent corruption can persist when they are disabled. These are
 design inputs, not current TideFS comparator evidence.
 
-TideFS needed a canonical checksum strategy that:
+TideFS needed a target checksum strategy that:
 - Is mandatory (never optional)
 - Covers every record payload
 - Domain-separates by record type to prevent cross-type confusion
@@ -29,7 +29,7 @@ TideFS needed a canonical checksum strategy that:
 
 Adopt a G3-pillar checksum architecture with these core elements:
 
-1. **BLAKE3-256** as the canonical cryptographic digest for all data payloads,
+1. **BLAKE3-256** as the target cryptographic digest for all data payloads,
    domain-separated by record type via `blake3_domain_digest()`.
 
    record kind, format version, payload length) — not end-to-end integrity.
@@ -62,5 +62,5 @@ Adopt a G3-pillar checksum architecture with these core elements:
 - Future-proofing: BLAKE3 domain separation ensures cryptographic agility if
   algorithm migration is ever needed.
 
-Design spec: `docs/design/1683-checksum-architecture-g3-pillar-design-spec.md`
+Historical design input: `docs/CHECKSUM_ARCHITECTURE_DESIGN.md`
 Issue: [#1683](http://172.16.106.12/forgejo/forgeadmin/tidefs/issues/1683)

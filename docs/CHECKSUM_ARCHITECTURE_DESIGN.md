@@ -52,7 +52,7 @@ Three axes define the architecture:
 | `PRODUCTION_INTEGRITY_TRAILER_LEN=80` (superseded by `IntegrityTrailerV2` 112-byte) | Replaced by `IntegrityTrailerV2` with shard fields | See SS3.1 |
 | Per-segment BLAKE3-256 in format strategy (#1220) | Refined: segment-level digest becomes `SegmentIntegrityFooter` | See SS3.4 |
 
-## 3. Canonical Checksum Types
+## 3. Target Checksum Types
 
 ### 3.1 Header Checksum: CRC32C (Per-Record Sanity)
 

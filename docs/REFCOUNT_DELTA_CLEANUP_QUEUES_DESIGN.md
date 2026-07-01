@@ -1,10 +1,16 @@
-# Refcount Delta-Based Incremental Data Cleanup Queues (P2 spec)
+# Refcount Delta-Based Incremental Data Cleanup Queues (Historical Input)
 
-Maturity: **design-spec** for the incremental data reclamation mechanism
-based on persistent refcount delta queues, batched processing, and
-integration with the locator table lifecycle.
+Maturity: **historical input** - imported refcount-delta cleanup-queue target
+design, not current deferred cleanup, reclaim, space-accounting, or
+claim-registry authority.
 
-This document closes Forgejo issue #1180.
+Authority classification: TFR-019 / `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`
+leaves this document as historical input. Use live source, current authority
+docs, and `validation/claims.toml` for current cleanup/reclaim status.
+
+Historical note: this imported document recorded a Forgejo issue #1180
+closeout. It does not close any current GitHub deferred cleanup, reclaim,
+release-readiness, or production-readiness item.
 
 ## 1. Motivation
 

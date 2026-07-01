@@ -3,6 +3,12 @@
 Date: 2026-05-05
 Status: Accepted
 
+Current authority note: this ADR records the accepted historical design
+direction. It does not prove current TXG/commit-group ordering behavior,
+crash consistency, release readiness, production readiness, or storage claim
+closure. Use live source, current authority docs, and `validation/claims.toml`
+for current behavior.
+
 ## Context
 
 Transaction groups (COMMIT_GROUPs) are the fundamental unit of atomic commitment in
@@ -56,6 +62,6 @@ design choices:
 - Future subsystems plug into the state machine by registering in the
   appropriate commit class.
 
-Design spec: `docs/design/canonical-commit-ordering-commit_group-state-machine.md`
+Historical design input: `docs/TXG_STATE_MACHINE_DESIGN.md`
 Issues: [#1654](http://172.16.106.12/forgejo/forgeadmin/tidefs/issues/1654),
 [#1743](http://172.16.106.12/forgejo/forgeadmin/tidefs/issues/1743)
