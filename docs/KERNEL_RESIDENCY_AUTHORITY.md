@@ -72,15 +72,12 @@ This decision reviewed the evidence named by issue #1288:
 - `docs/KERNEL_TEARDOWN_RUNTIME_EVIDENCE_DECISION.md`, whose T5/T6 model is
   still the teardown tiering vocabulary even though #1186 / PR #1463 has since
   accepted the T5 mounted-kernel cutover/teardown artifact.
-- `docs/KERNEL_MODULE_FAMILY_MATRIX_ROLLOUT_ORDER_P7-01.md` as historical
-  design input for rollout-order constraints; it is not current evidence.
+- Historical kernel production-depth lineage reviewed during #1288. That
+  lineage is now kept in git and issue #1707; it is not current evidence.
 - `docs/PAGE_CACHE_WRITEBACK_AUTHORITY.md` and
   `docs/PAGE_CACHE_INVALIDATION_AUTHORITY.md`, which own TFR-008 dirty data,
   writeback, mmap, and invalidation boundaries that kernel residency must
   consume rather than redefine.
-- `docs/STD_NO_STD_KERNEL_USERSPACE_BOUNDARY_RULES_P1-02.md`, as historical
-  input for environment-boundary rules; current authority classification stays
-  with `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`.
 - `crates/tidefs-kmod-posix-vfs/README.md` and
   `crates/tidefs-block-kmod/README.md`, including mount tiers, daemon
   independence, fixed-table bring-up, xfstests caveats, block-kmod QEMU

@@ -854,9 +854,9 @@ requires explicit `unsafe {}` blocks at every raw-pointer construction site.
 
 ### Lock class discipline
 
-`KernelLockClass` and `WorkqueueFamily` discriminants follow the P7-03
-canonical order.  No crate-local lock class or workqueue family may be
-introduced without updating P7-03 and the bridge definitions.
+`KernelLockClass` and `WorkqueueFamily` discriminants follow the bridge order.
+No crate-local lock class or workqueue family may be introduced without
+updating the current kernel residency authority and the bridge definitions.
 
 ### Deviations and blockers
 

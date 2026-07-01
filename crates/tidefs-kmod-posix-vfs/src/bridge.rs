@@ -48,9 +48,9 @@
 //!   `unsafe { Opaque*::from_ptr(ptr) }` in the bridge, with a `// SAFETY:`
 //!   comment naming the kernel guarantee that keeps the pointer live.
 //! - **Lock discipline**: Any lock acquired inside these callbacks must
-//!   declare a `KernelLockClass` variant per the canonical P7-03 lockdep
-//!   order, and may not sleep in non-sleepable callback contexts (e.g.,
-//!   RCU read sections, spinlock-held regions).
+//!   declare a `KernelLockClass` variant per the bridge lockdep order, and may
+//!   not sleep in non-sleepable callback contexts (e.g., RCU read sections,
+//!   spinlock-held regions).
 //! - **No userspace authority**: In full-kernel mode, these callbacks must
 //!   not require a userspace daemon, FUSE helper, or ublk control thread
 //!   for normal operation.  Callbacks that need policy authority must

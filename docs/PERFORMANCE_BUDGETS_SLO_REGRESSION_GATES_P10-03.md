@@ -20,7 +20,6 @@ See also:
 - `docs/DASHBOARDS_TRACES_OPERATOR_TRUTH_SURFACES_P10-04.md` (missing from the repository; see #1270)
 - `docs/WORKLOAD_SIGNATURE_MATERIALIZATION_PLANE_LAW.md`
 - `docs/FIRST_RUST_USERSPACE_IMPLEMENTATION_STAIRCASE_P11-03.md`
-- `docs/KERNEL_MODULE_FAMILY_MATRIX_ROLLOUT_ORDER_P7-01.md`
 - `docs/END_TO_END_PRODUCTION_BLUEPRINT.md`
 - `docs/AUTHORITATIVE_DATA_STRUCTURES_ALGORITHMS.md`
 
@@ -774,7 +773,7 @@ That means `secret_key_policy_0` is no longer allowed to be “secure but howeve
 `P10-03` now adds numeric floors to `gate.userspace.release_variant` and `gate.userspace.archive_ready` through shared `performance_budget_0` rows.
 The userspace move may not invent a migration-local performance pass.
 
-### 9.6 `P7-01` kernel rollout and `P11-04` later kernel progression
+### 9.6 Kernel Rollout And `P11-04` Later Kernel Progression
 
 `P11-04` is now explicit in `docs/KERNEL_PROGRESSION_STAIRCASE_AFTER_USERSPACE_SUCCESS_P11-04.md`. Future kernel-family admission must inherit the same `performance_budget_0` row ids, workload envelopes, comparator rules, and gate grammar across the fixed `kernel_gateway` stage ladder. Crossing into the kernel may change the measured numbers, but it may not change the proof language.
 

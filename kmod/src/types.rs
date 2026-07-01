@@ -22,10 +22,10 @@
 //!
 //! # Safety: lock-class and workqueue-family discriminants
 //!
-//! `KernelLockClass` discriminants encode the canonical P7-03 lockdep
-//! partial order.  `WorkqueueFamily` names match the P7-03 canonical
-//! workqueue families.  Leaf modules must not invent new lock classes or
-//! workqueue families without updating P7-03 and this bridge definition.
+//! `KernelLockClass` discriminants encode the bridge lockdep partial order.
+//! `WorkqueueFamily` names identify local bring-up families. Leaf modules must
+//! not invent new lock classes or workqueue families without updating the
+//! current kernel residency authority and this bridge definition.
 
 use core::fmt;
 
@@ -273,12 +273,12 @@ impl fmt::Debug for OpaqueRequestQueue {
 // Lock / synchronisation facades
 // ---------------------------------------------------------------------------
 
-/// Lock class identifier encoding the canonical P7-03 lockdep partial order.
+/// Lock class identifier encoding the bridge lockdep partial order.
 ///
 /// Discriminants form the global acquisition order: lower values are
 /// acquired first (outer locks), higher values are acquired later (inner
-/// locks).  This ordering is enforced by `derive(Ord)` and must match the
-/// canonical P7-03 §2.1 hierarchy:
+/// locks). This ordering is enforced by `derive(Ord)` and must match the
+/// bridge hierarchy:
 ///
 ///   `PolicyRwsem` → `DomainMutex` → `RangeRwsem` → `PinMutex`
 ///   → `ObjectSpin` → `SeqCountEpoch` / `RcuAnchor`
@@ -310,9 +310,9 @@ pub enum KernelLockClass {
 impl KernelLockClass {
     /// Whether code holding this lock may sleep.
     pub const fn is_sleepable(self) -> bool {
-        // Per P7-03 §2: PolicyRwsem, DomainMutex, RangeRwsem, PinMutex,
-        // and WorkGate are sleepable; SeqCountEpoch, RcuAnchor, ObjectSpin,
-        // and EmergencyRaw are not.
+        // PolicyRwsem, DomainMutex, RangeRwsem, PinMutex, and WorkGate are
+        // sleepable; SeqCountEpoch, RcuAnchor, ObjectSpin, and EmergencyRaw
+        // are not.
         !matches!(
             self,
             Self::SeqCountEpoch | Self::RcuAnchor | Self::ObjectSpin | Self::EmergencyRaw
@@ -331,7 +331,7 @@ pub struct PinEpoch {
     pub pin_class: PinClass,
 }
 
-/// Canonical pin classes from P4-04 and P7-03.
+/// Pin classes from P4-04 and the current kernel residency authority.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PinClass {
     /// Folio refs for page-cache residency.
@@ -352,10 +352,10 @@ pub enum PinClass {
 // Workqueue facades
 // ---------------------------------------------------------------------------
 
-/// Workqueue family identifier from P7-03 §5 (canonical workqueue families).
+/// Development workqueue family identifier for the kmod facade.
 ///
-/// Names and discriminants match the 8 canonical families defined in
-/// `docs/KERNEL_LOCKING_RCU_PINNING_WORKQUEUE_MODEL_P7-03.md`.
+/// Names and discriminants are local bring-up labels. Kernel residency
+/// authority owns whether these become product workqueue topology.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum WorkqueueFamily {
     /// Authority/cutover/fence staging hooks — ordered, low parallelism.

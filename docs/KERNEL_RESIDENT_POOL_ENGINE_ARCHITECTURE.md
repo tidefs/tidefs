@@ -16,11 +16,8 @@ Current authority and implementation inputs:
 - `crates/tidefs-kmod-posix-vfs/README.md`
 - `crates/tidefs-block-kmod/README.md`
 
-Historical design inputs:
-
-- `docs/KERNEL_MODULE_FAMILY_MATRIX_ROLLOUT_ORDER_P7-01.md`
-- `docs/RUST_FOR_LINUX_CRATE_TRAIT_BOUNDARIES_P7-02.md`
-- `docs/KERNEL_LOCKING_RCU_PINNING_WORKQUEUE_MODEL_P7-03.md`
+Historical kernel production-depth lineage reviewed during TFR-019 now lives
+in git and issue #1707. It is not current authority for this architecture.
 
 ## Current Release Interpretation
 
@@ -291,7 +288,7 @@ Consequences:
 
 No ad hoc kernel thread is allowed. Every execution context must be declared,
 owned by `KernelPoolCore` or the module global registry, stopped on teardown,
-and classified by P7-03.
+and classified by the current kernel residency authority.
 
 ### Synchronous Callback Contexts
 
@@ -309,7 +306,8 @@ I/O, txg sync, policy waits, or worker drain.
 
 ### Workqueue Families
 
-The canonical workqueue families from P7-03 are binding:
+The target workqueue families are architecture-local and stay bounded by the
+current kernel residency authority:
 
 | Family | Kernel Pool Use |
 |---|---|
@@ -358,7 +356,7 @@ Every service must have:
 
 ## Locking, Pins, And Reclaim
 
-The P7-03 lock order is binding:
+The target lock order for this architecture is:
 
 `PolicyRwsem -> DomainMutex -> RangeRwsem -> PinMutex -> ObjectSpin -> SeqCountEpoch/RcuAnchor`
 

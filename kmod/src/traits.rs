@@ -185,7 +185,8 @@ pub trait ValidationEmit {
 
 /// Shared pin, fence, and drain operations for kernel objects.
 ///
-/// Governed by P4-04 (zero-copy DMA pinning) and P7-03 (kernel locking model).
+/// Governed by P4-04 (zero-copy DMA pinning) and current kernel residency
+/// authority.
 /// Every mutable kernel object that holds pins must be drainable through this
 /// contract.
 pub trait PinDrain {

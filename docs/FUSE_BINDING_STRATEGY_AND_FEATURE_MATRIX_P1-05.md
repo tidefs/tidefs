@@ -26,9 +26,9 @@ See also:
 - `docs/SHARED_DOCTRINE_NATIVE_SEAM_MAP_P0-03.md` — seam ownership
 - `docs/FUSE_MOUNT.md` — current FUSE mount surface
 - `docs/FUSE_REQUEST_WORKER_QUEUE_MODEL_P5-02.md` — worker/queue topology
-- `docs/UAPI_FFI_CANONICAL_SCHEMA_BOUNDARY_RULES_P1-03.md` — boundary mirror law
+- `docs/PREVIEW_UAPI_ABI_BOUNDARY_OW202.md` — preview boundary mirror spec
 - `docs/CURRENT_VS_FUTURE_CAPABILITIES.md` — capability tracking
-- `docs/STD_NO_STD_KERNEL_USERSPACE_BOUNDARY_RULES_P1-02.md` — env boundary law
+- `docs/KERNEL_RESIDENCY_AUTHORITY.md` — current kernel residency boundary
 
 ---
 

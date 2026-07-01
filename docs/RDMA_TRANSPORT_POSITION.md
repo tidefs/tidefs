@@ -8,14 +8,9 @@ requirement.
 
 ## Current decision
 
-RDMA maps to the existing transport and pinning laws:
-
-- `docs/LINUX_7_0_BASELINE_CONTRACT_SUPPORTED_SUBSYSTEMS_P0-01.md` classifies
-  RDMA as `cut.linux_baseline.rdma_required_fastpath.x0`.
-- `docs/TRANSPORT_SESSION_COHORT_GRAPH_P8-01.md` owns endpoint, session,
-  cohort, lane, envelope, resume, and closure semantics.
-- `docs/ZERO_COPY_DMA_PINNING_PAGE_LOAN_LAW_P4-04.md` owns registered memory,
-  pin, loan, DMA, reserve, and fallback semantics.
+RDMA maps to current transport authority and future memory-registration
+evidence. The old production-law lineage is historical input only and is not a
+live correctness baseline.
 
 That means RDMA may improve `transfer_bulk`, `replica_transfer_verify`,
 `state_transfer`, and selected demand-fetch paths, but it may not redefine

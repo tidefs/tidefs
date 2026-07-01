@@ -176,14 +176,23 @@ boundary law in
 `docs/WORKSPACE_FAMILY_LAYOUT_CRATE_SERVICE_BOUNDARIES_P1-01.md`, so crate
 roots, service roots, dependency edges, and test/observe boundaries are no
 longer allowed to drift from the declared design rule and runtime laws. It now
-also consumes the explicit `linux_baseline` Linux 7.0 baseline contract in
-`docs/LINUX_7_0_BASELINE_CONTRACT_SUPPORTED_SUBSYSTEMS_P0-01.md`, so admitted
-host assumptions, subsystem floors, and explicit non-baseline cuts are no
-longer allowed to drift from the declared package/stage bindings. It now also consumes the explicit `product_variant` product-variant matrix in
+also consumes historical production-depth lineage for the Linux baseline.
+Current kernel authority is kept in the focused kernel residency docs. It now
+also consumes the explicit `product_variant` product-variant matrix in
 `docs/PRODUCT_VARIANT_MATRIX_P0-02.md`, so declared bring-up-only,
 mixed-client-kernel, and kernel-self-sufficient authority rows
 are no longer allowed to drift from the declared host/package/stage bindings.
-It now also consumes the explicit `vfs_boundary_mirror` UAPI / FFI / canonical-schema boundary law in `docs/UAPI_FFI_CANONICAL_SCHEMA_BOUNDARY_RULES_P1-03.md`, so boundary mirrors, wire layouts, kernel-visible structs, `repr(C)` call frames, and conversion exactness are no longer allowed to drift from the declared design rule families. It now also consumes the explicit `seam_map` shared design rule-native seam-map law in `docs/SHARED_DOCTRINE_NATIVE_SEAM_MAP_P0-03.md`, so seam ownership, client/boundary bindings, kernel-promotion cuts, and anti-leak rules are no longer allowed to drift from the declared cross-system registry. It now also consumes the explicit `non_authority_deletion` non-authority / deletion law in `docs/NON_AUTHORITY_DELETION_LAW_P0-04.md`, so live archived residue, archive-only carriers, tombstone/delete bindings, and non-authority proof are no longer allowed to drift from the declared product boundary. They may **not** invent a
+It now also consumes historical production-depth lineage for UAPI mirrors.
+Current preview UAPI authority is kept in the focused preview UAPI doc. It now
+also consumes the explicit `seam_map` shared design rule-native seam-map law in
+`docs/SHARED_DOCTRINE_NATIVE_SEAM_MAP_P0-03.md`, so seam ownership,
+client/boundary bindings, kernel-promotion cuts, and anti-leak rules are no
+longer allowed to drift from the declared cross-system registry. It now also
+consumes the explicit `non_authority_deletion` non-authority / deletion law in
+`docs/NON_AUTHORITY_DELETION_LAW_P0-04.md`, so live archived residue,
+archive-only carriers, tombstone/delete bindings, and non-authority proof are
+no longer allowed to drift from the declared product boundary. They may
+**not** invent a
 second authority service family, a second request family beyond `W8-01`/`request_queue_0`,
 a surface-local policy store, a queue-local publication dialect, or a
 render-local refusal dialect outside `governance_surface_0`.

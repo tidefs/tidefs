@@ -19,10 +19,9 @@ QEMU as the reproducible acceptance authority?**
 
 See also:
 
-- `docs/KERNEL_MODULE_FAMILY_MATRIX_ROLLOUT_ORDER_P7-01.md`
-- `docs/RUST_FOR_LINUX_CRATE_TRAIT_BOUNDARIES_P7-02.md`
-- `docs/KERNEL_LOCKING_RCU_PINNING_WORKQUEUE_MODEL_P7-03.md`
-- `docs/LINUX_7_0_BASELINE_CONTRACT_SUPPORTED_SUBSYSTEMS_P0-01.md`
+- `docs/KERNEL_RESIDENCY_AUTHORITY.md`
+- `docs/KERNEL_RESIDENT_POOL_ENGINE_ARCHITECTURE.md`
+- `docs/PREVIEW_UAPI_ABI_BOUNDARY_OW202.md`
 
 ## 1. Decision
 
@@ -46,6 +45,7 @@ The hot loop for kernel work is:
 1. use the Nexus Linux helper to prepare one shared Linux 7.0 source/build
    baseline under `/root/ai/state/tidefs/kernel-dev/shared/linux-7.0`;
 2. use per-slot `module-out` and `qemu-runs` directories for ordinary external
+   module build products and disposable guest artifacts;
 3. for external modules, build with
    `make -j8 -C <linux-src> LLVM=1 O=<linux-build> M=<tidefs-worktree>/<module-dir> MO=<module-out> RUSTC=$(cd <tidefs-worktree> && rustc --print sysroot)/bin/rustc RUSTC_BOOTSTRAP=1 modules`
    or a higher job count. Direct Kbuild commands must pass the absolute
@@ -62,15 +62,15 @@ The hot loop for kernel work is:
 
 The anti-regression rule is direct:
 
-loop.**
-
-but they are too expensive and too broad to be the inner loop for ordinary
-kernel edits.
+**Nix and QEMU are the reproducible admission gate, not the per-edit kernel
+loop.** Full acceptance targets remain mandatory when a kernel slice is ready
+for admission, but they are too expensive and too broad to be the inner loop
+for ordinary kernel edits.
 
 ## 2. Source ownership
 
-The TideFS repository owns the filesystem code, userspace control utilities,
-part of the product tree.
+The TideFS repository owns filesystem code, userspace control utilities, and
+TideFS-owned module/crate code that is part of the product tree.
 
 The `forgeadmin/linux` repository owns Linux source changes needed by TideFS.
 Use this branch shape for Linux work:
@@ -98,7 +98,7 @@ issue or acceptance note point at that branch.
 Nix owns:
 
 - the reproducible Linux 7.0 kernel acceptance build;
-  tool surface;
+- the reproducible kernel package and tool surface;
 - the Linux 7.0 QEMU acceptance target;
 
 Nix may build a full Linux 7.0 kernel when the acceptance target requires it.
@@ -182,7 +182,8 @@ parallelism.
 ## 4a. Disk and cache ownership
 
 The shared Linux baseline is the only normal full source/build copy. Per-slot
-the rare writable patch checkout created by `linux-prepare --mode patch`.
+state is limited to module outputs, QEMU run artifacts, and the rare writable
+patch checkout created by `linux-prepare --mode patch`.
 
 Nexus may prune stale inactive per-issue kernel-dev directories with:
 
@@ -202,6 +203,7 @@ Experimental TideFS kernel modules and patched TideFS kernels must not be
 loaded into the host kernel.
 
 The hot loop must use a disposable Linux 7.0 QEMU guest that can be destroyed
+after each run. Each smoke result must record:
 
 - the Linux kernel version and commit;
 - the module path and module metadata, or the patched kernel branch and commit;
@@ -275,7 +277,7 @@ The following shortcuts are forbidden:
 - relying on a non-exported kernel symbol without an explicit Linux branch and
   architecture decision;
 - using Linux patches as a hidden substitute for the documented VFS, block,
-  UAPI, authority, and rollback laws.
+  UAPI, authority, and rollback boundaries.
 
 If TideFS needs a Linux patch, a non-exported symbol, or a different kernel
 configuration to make forward progress, that is valid kernel-source work only
@@ -284,7 +286,7 @@ packet, and proven through QEMU and Nix acceptance.
 
 ## 8. Issue implications
 
-The K7 issue queue must interpret the build surfaces this way:
+Kernel issues must interpret the build surfaces this way:
 
 - `K7-02` owns reproducible Linux 7.0 Nix/QEMU acceptance, not the per-edit
   kernel loop.
@@ -293,7 +295,8 @@ The K7 issue queue must interpret the build surfaces this way:
   proof; it does not prohibit later in-tree Linux patch work.
 - `K7-05` and `K7-08` must use the hot loop for focused compile/load/smoke
   work and must run Nix acceptance only as a gate.
-  exist; it must not be used as the ordinary edit loop.
+- Nix acceptance must exist for admission; it must not be used as the ordinary
+  edit loop.
 - Any issue that discovers a real Linux source requirement must either push a
   Linux issue branch to `forgeadmin/linux` or split a child issue that owns
   that branch.
