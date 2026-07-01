@@ -76,6 +76,35 @@ moved or the file is obsolete scaffold/closeout material; keep deleted-path
 lineage in git, issues, and PRs instead of preserving a live register row for
 every deleted file.
 
+## CI And Validation Root Cleanup (TFR-019 / #1648)
+
+Issue #1648 folded the hidden CI and validation root-document family into
+`docs/GITHUB_CI.md` and deleted the unreferenced standalone roots instead of
+keeping a second CI-authority surface. `docs/DEPENDENCY_ADVISORY_CI.md` remains
+as the narrow remediation guide linked from the live `Dependency Advisory`
+workflow summary; it is now discoverable through `docs/GITHUB_CI.md`.
+
+Deleted paths from this cleanup keep lineage in git, issue #1648, and the pull
+request only:
+
+- `docs/ACTIONLINT_CI.md`
+- `docs/CARGO_METADATA_AUDIT.md`
+- `docs/CI_PATH_FILTER_CONTRACT.md`
+- `docs/FOCUSED_CLAIM_INPUT_CONTRACT.md`
+- `docs/FOCUSED_RUST_INPUT_CONTRACT.md`
+- `docs/KERNEL_FSYNC_VALIDATION_CONTRACT.md`
+- `docs/KERNEL_MMAP_VALIDATION_CONTRACT.md`
+- `docs/KERNEL_MODULE_BUILD_REQUIREMENTS.md`
+- `docs/NIX_CI_OUTPUT_CONTRACT.md`
+- `docs/RDMA_VALIDATION_CONTRACT.md`
+- `docs/SECRET_POLICY_CI_CONTRACT.md`
+- `docs/SELF_HOSTED_RUNNER_CONTRACT.md`
+
+This cleanup does not edit workflow behavior, add release or production
+readiness evidence, validate successor/comparator claims, or promote CI
+artifacts into product-proof authority beyond the exact validation lanes named
+in `docs/GITHUB_CI.md`.
+
 ## Folded Claim And Consolidation Bridge (#1588)
 
 Issue #1588 folded the temporary claim/consolidation bridge into existing
