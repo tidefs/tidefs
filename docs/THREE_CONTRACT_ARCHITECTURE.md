@@ -92,7 +92,6 @@ that mounts a TideFS dataset must obey this contract.
 | `docs/DATASET_FEATURE_FLAGS_DESIGN.md` (#1223) | Feature class model, mount gating, compatibility matrix |
 | `docs/CANONICAL_BINARY_ENCODE_DECODE_ENDIAN_CHECKSUM_LAW_P2-03.md` | Byte-order, envelope, and checksum law |
 | `docs/FORMAT_IDENTITY_UPGRADE_REPLAY_CONTINUITY_LAW_P2-04.md` | Identity tuple and upgrade/replay continuity |
-| `docs/LOCAL_OBJECT_STORE_ON_DISK_FORMAT.md` | Segment format, record versions, tombstones, trailers |
 
 ### 2.4 Key invariants
 
@@ -138,8 +137,7 @@ ordering guarantees, durability semantics, and the canonical operation catalog.
 | `docs/VFS_ENGINE_API_CONTRACT.md` (#1213) | Canonical VFS Engine API: types, ops, semantics |
 | `docs/design/vfs-rpc-wire-protocol.md` (#1234) | VFS_RPC wire protocol: method IDs, framing, dedup |
 | `docs/FUSE_BINDING_STRATEGY_AND_FEATURE_MATRIX_P1-05.md` | FUSE adapter binding strategy |
-| `docs/POSIX_SEMANTICS_OW106.md` | POSIX semantics coverage for the FUSE surface |
-| `docs/FUSE_OPERATION_COVERAGE_MATRIX.md` | Per-op FUSE coverage and gaps |
+| `docs/FUSE_ADAPTER_CONTRACT_ASSUMPTIONS.md` | Current FUSE adapter request-boundary guardrail |
 
 ### 3.4 Key invariants
 

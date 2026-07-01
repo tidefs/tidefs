@@ -528,8 +528,9 @@ reconstruction), the stripe is permanently lost. The system must:
 4. Log the event to the operator surface (`truth_view`, dashboard).
 5. Never silently return truncated or zero-filled data.
 
-This is consistent with the NO_PRODUCTION_FSCK_FAILURE_MODEL — unrecoverable
-stripes are explicit, observable, and do not produce silent corruption.
+This is consistent with the current fail-closed recovery boundary:
+unrecoverable stripes are explicit, observable, and do not produce silent
+corruption.
 
 ## 6. Integration Contracts
 

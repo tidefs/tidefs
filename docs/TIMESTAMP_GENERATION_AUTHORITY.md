@@ -320,8 +320,8 @@ boundaries relevant to TFR-005.
 | Format family                    | Version field                | Current | Governing doc                                    |
 |----------------------------------|------------------------------|---------|--------------------------------------------------|
 | Local filesystem records         | `FILESYSTEM_FORMAT_VERSION`  | 6       | This document; `encoding.rs` constants           |
-| Local object store manifest      | `manifest_version`           | 1       | `LOCAL_OBJECT_STORE_ON_DISK_FORMAT.md`           |
-| Local object store records       | `record_format_version`      | 1-3     | `LOCAL_OBJECT_STORE_ON_DISK_FORMAT.md`           |
+| Local object store manifest      | `manifest_version`           | 1       | `format_manifest.rs`; `ON_DISK_FORMAT_VERSIONING_AND_COMPATIBILITY_POLICY.md` |
+| Local object store records       | `record_format_version`      | 1-3     | `format_manifest.rs`; `ON_DISK_FORMAT_VERSIONING_AND_COMPATIBILITY_POLICY.md` |
 | Pool labels                      | `version`                    | 1       | `POOL_IMPORT_EXPORT_DEVICE_TOPOLOGY_DESIGN.md`   |
 | Dataset feature flags            | per-dataset B-trees          | N/A     | `DATASET_FEATURE_FLAGS_DESIGN.md`                |
 | Committed roots / intent log     | version discriminant         | V1      | `TORN_COMMIT_RECOVERY_CONTRACT.md`               |

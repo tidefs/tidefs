@@ -979,4 +979,4 @@ there is no fallback format to use.
 | `CHECKSUM_ARCHITECTURE_DESIGN.md` | Checksum scheme used by xattr B+tree pages (not ACL-specific) |
 | `DATASET_FEATURE_FLAGS_DESIGN.md` | Defines `org.tidefs:posix_acl` feature flag |
 | `AUTHN_AUTHZ_OVERRIDE_AUDIT_MODEL_P9-02.md` | Security model; ACL evaluation fits into the access() check |
-| `FUSE_OPERATION_COVERAGE_MATRIX.md` | Tracks which FUSE ops ACL touches (getxattr, setxattr, removexattr, listxattr, access, create, mkdir) |
+| `apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_vfs_adapter.rs` | Source-scoped FUSE dispatch evidence for getxattr, setxattr, removexattr, listxattr, access, create, and mkdir |

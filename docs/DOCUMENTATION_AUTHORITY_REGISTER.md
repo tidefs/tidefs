@@ -111,6 +111,24 @@ product proof, or close TFR-019. Product-facing wording must still route
 through the generated claim registry, `docs/CLAIMS_GATE_POLICY.md`, current
 evidence manifests, and `docs/RELEASE_READINESS_VERDICT_CONTRACT.md`.
 
+## Third-Wave Historical Input Deletions (TFR-019 / #1612)
+
+Issue #1612 deleted another small family of historical inputs whose live file
+presence kept competing with current authority for FUSE/POSIX, local recovery
+and object-store, and operator-product-surface wording:
+`docs/FUSE_OPERATION_COVERAGE_MATRIX.md`, `docs/POSIX_SUBSET.md`,
+`docs/POSIX_SEMANTICS_OW106.md`, `docs/LOCAL_OBJECT_STORE_ON_DISK_FORMAT.md`,
+`docs/NO_PRODUCTION_FSCK_FAILURE_MODEL.md`, and
+`docs/OPERATOR_MANUAL_DYNAMIC_TUNING_AND_REALTIME_OBSERVABILITY.md`.
+
+Their lineage now lives in git, issue #1612, and its pull request. Current
+claims and product-shape authority remains with source-backed focused docs,
+`validation/claims.toml`, generated `docs/CLAIM_REGISTRY.md`,
+`docs/CLAIMS_GATE_POLICY.md`, `docs/RELEASE_READINESS_VERDICT_CONTRACT.md`,
+and live GitHub issues/PRs. This deletion does not validate any
+successor/comparator, production, release-readiness, POSIX-completeness,
+crash-recovery, or operator-product claim.
+
 ## Doc-Authority Drift Cleanup Coordination (#952)
 
 Recorded on 2026-06-22 for the `check-doc-authority-drift` follow-up from PR
@@ -359,7 +377,6 @@ surface beyond adding `docs/CLAIMS_GATE_POLICY.md`, which was already scanned.
 | `docs/HUMAN_TERMINOLOGY.md` | Historical input | Imported naming authority mapping human architecture names to Rust paths. Some listed crate paths (e.g. `tidefs-types-control-plane-core`) do not exist in the current workspace; several families are marked "Future". The naming pattern is useful reference but not current source authority. |
 | `docs/VFS_ENGINE_API_CONTRACT.md` | Historical input | Imported implemented-source contract for the VFS Engine API. References stale Forgejo issues (#1887, #1213). The canonical types and operations are useful design reference, but full source-behavior alignment verification is too large for this slice. |
 | `docs/FUSE_BINDING_STRATEGY_AND_FEATURE_MATRIX_P1-05.md` | Historical input | Imported production-design FUSE binding strategy describing the `fuser`-based binding, capability negotiation, and feature matrix. Useful reference, but full per-capability source alignment verification is too large for this slice. |
-| `docs/FUSE_OPERATION_COVERAGE_MATRIX.md` | Historical input | Imported design-spec FUSE operation coverage matrix with op-by-op semantics, errno contracts, and coherency profiles. Useful implementation reference at design maturity. |
 | `docs/DEBUGGING_WORKFLOWS.md` | Historical input | Imported developer guide covering debug builds, tracing, test isolation, and xtask checks. Generally applicable commands, but specific references may have drifted. |
 | `docs/BLOCK_VOLUME_PROJECTION_CHARTER_BLOCK_VOLUME_ADAPTER.md` | Historical input | Imported design charter for block volume projection. Detailed authoritative/projection noun mapping and durability classes. References Forgejo state and design-consolidation phase language. |
 | `docs/DATASET_FEATURE_FLAGS_DESIGN.md` | Historical input | Imported design-spec for per-dataset feature flags with three compatibility classes. References Forgejo issue #1223. |
@@ -392,8 +409,6 @@ xfstests coverage, distributed behavior, or runtime crash claims.
 | Path | State | Classification note |
 |---|---|---|
 | `docs/ARCHITECTURE.md` | Current spec | Binding only as the high-level workspace layer map and harness/product separation reference. It is not evidence that every listed crate is complete, kernel-bound, production-ready, or validated by runtime CI. |
-| `docs/LOCAL_OBJECT_STORE_ON_DISK_FORMAT.md` | Historical input | Imported OW-005/OW-014 implementation note already marked as review material. Record-version and trailer details may inform source review, but the file is not current format authority until reconciled with live source and claims evidence. |
-| `docs/NO_PRODUCTION_FSCK_FAILURE_MODEL.md` | Historical input | Imported OW-004 recovery theorem and failure model. Useful target framing, but not a current production no-fsck guarantee or crash-recovery claim without matching runtime evidence. |
 | `docs/LINUX_7_0_BASELINE_CONTRACT_SUPPORTED_SUBSYSTEMS_P0-01.md` | Historical input | Broad production-depth baseline law with old blueprint-style cross-references. The scoped kernel workflow/spec rows above are the current authority for Linux 7.0 development and rollout behavior. |
 | `docs/STD_NO_STD_KERNEL_USERSPACE_BOUNDARY_RULES_P1-02.md` | Historical input | Imported std/no_std boundary law for future kernel/userspace split. It remains design input until checked against the current workspace package graph and kernel-family source boundaries. |
 | `docs/RUST_FOR_LINUX_CRATE_TRAIT_BOUNDARIES_P7-02.md` | Historical input | Imported Rust-for-Linux crate-boundary target. Current scoped kernel rollout authority lives in the P7-01/P7-03/P7-05 rows above; this file does not prove implemented Rust-for-Linux leaf-module readiness. |
@@ -437,14 +452,11 @@ xfstests coverage, distributed behavior, or runtime crash claims.
 | `docs/FUSE_REQUEST_WORKER_QUEUE_MODEL_P5-02.md` | Historical input | Imported production-depth FUSE worker/queue model. Useful design input, but it must not be cited as current runtime proof for queues, interrupts, forget handling, page runtime, or kernel parity. |
 | `docs/POSIX_FILESYSTEM_ADAPTER_DAEMON_TOPOLOGY_P5-01.md` | Historical input | Imported production-depth POSIX adapter topology. It contains useful residency and topology framing, but current FUSE runtime authority is issue-scoped evidence rather than this broad ledger. |
 | `docs/PAGE_CACHE_WRITEBACK_MMAP_INTEGRATION_P5-03.md` | Historical input | Imported page-cache, writeback, and mmap design target. It is not current proof of writeback, mmap coherency, direct-I/O, or no-daemon behavior. |
-| `docs/POSIX_SUBSET.md` | Historical input | Imported OW-104/OW-106/OW-107 implementation note already marked as TFR-019 review material. It can inform POSIX subset audits but is not current mounted-runtime authority. |
-| `docs/POSIX_SEMANTICS_OW106.md` | Historical input | Imported OW-106 userspace FUSE preview note. It documents historical semantic targets and must not be cited as current POSIX/FUSE runtime closure. |
 
 **Operator, placement, and distributed-runtime docs**
 
 | Path | State | Classification note |
 |---|---|---|
-| `docs/OPERATOR_MANUAL_DYNAMIC_TUNING_AND_REALTIME_OBSERVABILITY.md` | Historical input | Imported operator manual for dynamic tuning and observability. It remains useful target material, but a runtime-fed operator product surface is not established by this file. |
 | `docs/POLICY_AUTHORITY_RUNTIME_SURFACE_P3-01.md` | Historical input | Imported production-depth policy-authority runtime-surface design. It is not current authority for a complete kernel-hosted or runtime-fed policy authority service. |
 | `docs/PUBLICATION_PIPELINE_RUNTIME_DECOMPOSITION_P3-02.md` | Historical input | Imported publication-pipeline runtime decomposition. Useful queue/batch/commit vocabulary, but not current evidence of the full production publication pipeline. |
 | `docs/RECEIPT_RESPONSE_RUNTIME_EMISSION_PATH_P3-03.md` | Historical input | Imported receipt/response runtime-emission design. It is not current closure for the local/distributed receipt authority or response-envelope runtime surface. |

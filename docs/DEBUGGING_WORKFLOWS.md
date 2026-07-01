@@ -222,10 +222,10 @@ enabled by default. Use `RUST_LOG=debug` to see per-step events, and inspect
 
 ### Recovery model
 
-TideFS follows the no-production-fsck failure model (see
-`docs/NO_PRODUCTION_FSCK_FAILURE_MODEL.md`). On crash recovery, the system
-converges to one of: previous committed root, new committed root, or an
-explicit error. It never mounts partial truth.
+Ground local recovery debugging in the transaction commit-group review note
+and current local-filesystem recovery tests. On crash recovery, the intended
+boundary is convergence to one of: previous committed root, new committed root,
+or an explicit error. It must not mount partial truth.
 
 ### Inspecting recovery behavior
 
@@ -404,7 +404,7 @@ call-graphs resolve correctly.
 ## 17. Where to go next
 
 - Deleted trace-oracle lineage (#1174) -- historical design input in git history
-- `docs/NO_PRODUCTION_FSCK_FAILURE_MODEL.md` -- crash recovery model
+- `docs/TRANSACTION_COMMIT_GROUPS_PC007.md` -- local commit/recovery boundary
 - `docs/CONTROL_PLANE_SERVICE_API_CLI_TOPOLOGY_P9-01.md` -- control-plane route topology
 - `docs/THREE_CONTRACT_ARCHITECTURE.md` -- three-contract architecture
 - `docs/INDEX.md` -- full documentation index

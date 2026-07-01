@@ -19,7 +19,6 @@ Use this manual with:
   release-readiness and whole-product admission boundaries
 - `docs/OPERATOR_PRODUCT_SURFACE_DECISION.md` for the current operator
   product-surface boundary
-- `docs/POSIX_SUBSET.md` for historical first-FUSE subset context
 
 ## Current Capability Boundary
 

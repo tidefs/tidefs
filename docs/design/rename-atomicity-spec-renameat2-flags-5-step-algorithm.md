@@ -692,5 +692,5 @@ directory entries to check the flag, which is more error-prone.
 - **#1213** (`docs/VFS_ENGINE_API_CONTRACT.md`): The `VfsEngine::rename` trait definition that this algorithm implements.
 - **#1224**: Torn-commit recovery: after a crash during rename, the recovery contract replays the commit record.
 - **#1267** (`docs/design/canonical-commit-ordering-commit_group-state-machine.md`): The 7-step commit_group commit ordering that guarantees rename durability.
-- **#1292** (`docs/FUSE_OPERATION_COVERAGE_MATRIX.md`): The FUSE-level rename operation mapping.
+- **#1292**: Historical FUSE-level rename mapping lineage; current mapping evidence is source-scoped.
 - **#1233** (`docs/FUSE_BINDING_STRATEGY_AND_FEATURE_MATRIX_P1-05.md`): The FUSE adapter's rename method dispatch.

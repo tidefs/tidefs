@@ -69,9 +69,9 @@ surface, widen publishing claims, or preselect a runtime carrier.
   `docs/FAULT_INJECTION_CHAOS_CORRUPTION_CAMPAIGNS_P10-02.md`,
   `docs/RUST_FOR_LINUX_CRATE_TRAIT_BOUNDARIES_P7-02.md`,
   `docs/UPGRADE_FAILOVER_CUTOVER_OPERATOR_RUNBOOKS_P9-03.md`,
-  `docs/WORKSPACE_FAMILY_LAYOUT_CRATE_SERVICE_BOUNDARIES_P1-01.md`,
-  `docs/OPERATOR_MANUAL_DYNAMIC_TUNING_AND_REALTIME_OBSERVABILITY.md`, and
-  deleted scrub/repair/resilver historical lineage docs.
+  `docs/WORKSPACE_FAMILY_LAYOUT_CRATE_SERVICE_BOUNDARIES_P1-01.md`, deleted
+  operator-manual lineage docs, and deleted scrub/repair/resilver historical
+  lineage docs.
   All references treat it as an existing law document; none of them
   reproduce its content. The `truth_view` glyph appears as the OW-307
   identifier across these documents.

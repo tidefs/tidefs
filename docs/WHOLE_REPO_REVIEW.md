@@ -1267,10 +1267,7 @@ Concrete current drift:
   TFR-019 review material and removed their narrow `Maturity:`,
   framing:
   `docs/CHUNKED_FILE_LAYOUT_OW101.md`, `docs/HOT_READ_CACHE_PC003.md`,
-  `docs/LOCAL_OBJECT_STORE_ON_DISK_FORMAT.md`,
   `docs/LOCAL_SNAPSHOTS_OW108.md`, `docs/LOCAL_STORAGE_ALLOCATOR_OW102.md`,
-  `docs/NO_PRODUCTION_FSCK_FAILURE_MODEL.md`,
-  `docs/POSIX_SEMANTICS_OW106.md`, `docs/POSIX_SUBSET.md`,
   `docs/PREVIEW_UAPI_ABI_BOUNDARY_OW202.md`,
   `docs/PRODUCTION_INTEGRITY_POLICY.md`,
   `docs/PRODUCTION_INTEGRITY_V3_RECORDS_OW014.md`,
