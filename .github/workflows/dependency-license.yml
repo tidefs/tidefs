@@ -14,7 +14,7 @@ on:
       - 'flake.lock'
       - '.github/workflows/dependency-license.yml'
       - 'docs/adr/0006-license-compliance-cargo-deny.md'
-      - 'docs/DEPENDENCY_LICENSE_CI.md'
+      - 'docs/GITHUB_CI.md'
   workflow_dispatch:
 
 permissions:

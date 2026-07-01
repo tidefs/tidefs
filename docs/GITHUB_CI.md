@@ -45,6 +45,15 @@ may use non-secret repository variables for scheduling gates, such as
   `tidefs-schema-codec-posix-filesystem-adapter`, and
   `tidefs-secret-key-policy-runtime`, plus a targeted `tidefs-transport`
   session test.
+- `Rust Toolchain` (`.github/workflows/rust-toolchain.yml`) runs on the
+  TideFS self-hosted runner VMs through the repo `.#ci` Nix development shell
+  when `rust-toolchain.toml`, `flake.nix`, `flake.lock`, the workflow, or this
+  CI authority doc changes, and on manual dispatch. It verifies that the
+  `rust-toolchain.toml` channel matches `rustc -Vv`, records `cargo`,
+  `clippy`, `rustfmt`, and `rust-src` availability in the job summary, and
+  fails closed on missing components. It is a fast toolchain-coherence gate
+  only: toolchain version changes require their own issue and validation
+  through the build/test lanes that consume the updated pin.
 - `Clippy` runs on the TideFS self-hosted runner VMs through the same repo
   `.#ci` Nix development shell. On pull requests it selects changed workspace
   crates, compares their clippy warning counts against
@@ -52,6 +61,17 @@ may use non-secret repository variables for scheduling gates, such as
   above the recorded baseline. Manual dispatch can run either changed-crate or
   full-workspace clippy checks against a feature branch and uploads
   `clippy-baseline-summary`.
+- `Dependency License` (`.github/workflows/dependency-license.yml`) runs
+  `cargo deny check licenses` through the repo `.#ci` Nix development shell on
+  every `master` push, on pull requests that touch `Cargo.toml`, `Cargo.lock`,
+  `deny.toml`, `flake.nix`, `flake.lock`, the workflow, ADR-0006, or this CI
+  authority doc, and on manual dispatch. `deny.toml` remains the accepted
+  license allowlist and dependency rule source;
+  `docs/adr/0006-license-compliance-cargo-deny.md` records the architectural
+  decision to use `cargo-deny`. The workflow summary records the source ref,
+  SHA, command, and pass/fail outcome. License allowlist changes must edit
+  `deny.toml`, follow the ADR-0006 revision boundary, and pass this gate on
+  the update branch.
 - `Focused Rust` is a manual self-hosted workflow for issue-specific PR
   validation. Dispatch it against the feature branch with a comma-separated
   crate list and optional extra `cargo test` arguments when the acceptance
