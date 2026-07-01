@@ -409,5 +409,5 @@ call-graphs resolve correctly.
   fsync/fdatasync dispatch in
   `apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_flush_fsync.rs`
 - `docs/CONTROL_PLANE_SERVICE_API_CLI_TOPOLOGY_P9-01.md` -- control-plane route topology
-- `docs/THREE_CONTRACT_ARCHITECTURE.md` -- three-contract architecture
+- `docs/CLAIMS_GATE_POLICY.md` -- publishing claim boundary
 - `docs/INDEX.md` -- full documentation index

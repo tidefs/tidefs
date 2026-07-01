@@ -1,10 +1,9 @@
 # tidefs-vfs-engine
 
 VFS Engine trait: canonical operations defining the TideFS storage engine
-interface. This crate defines `VfsEngine`, the central embodiment of the
-VFS semantic contract per the three-contract architecture. Every frontend
-adapter (FUSE daemon, ublk surface, kernel module) implements this trait,
-unifying all surfaces behind a common engine abstraction.
+interface. This crate defines `VfsEngine`, the VFS semantic boundary for
+frontend adapters. FUSE, ublk, and kernel-module surfaces implement this trait
+to share one engine abstraction.
 
 ## Operations
 

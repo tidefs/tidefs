@@ -4,10 +4,9 @@
 
 //! VFS Engine trait: canonical operations defining the tidefs storage engine interface.
 //!
-//! This crate defines the [`VfsEngine`] trait — the central embodiment of Contract 2
-//! (VFS semantic contract) per the three-contract architecture. Every frontend adapter
-//! (FUSE daemon, ublk surface, admin proxy, VFS_RPC) implements this trait, unifying
-//! all surfaces behind a common engine abstraction.
+//! This crate defines the [`VfsEngine`] trait, the VFS semantic boundary for
+//! frontend adapters. FUSE, ublk, admin proxy, and VFS_RPC surfaces implement this
+//! trait to share one engine abstraction.
 //!
 //! The contract operates in **inode space**, not path space. Path resolution is the
 //! adapter's responsibility; the engine receives `InodeId` and raw name bytes.
