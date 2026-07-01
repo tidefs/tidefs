@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
-//! Per-chunk replica health state machine — P8-03 data_copy_3.
+//! Per-chunk replica health state machine — source-owned data_copy_3.
 //!
 //! Each chunk on each replica node has a health state. The state
 //! transitions through a lifecycle from Absent through Healthy

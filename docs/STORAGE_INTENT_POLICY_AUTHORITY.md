@@ -4148,8 +4148,7 @@ This document composes existing authority surfaces:
   locator authority and must drive reads, rebuild, and reclaim.
 - `docs/POOL_WIDE_REDUNDANCY_PLACEMENT_CONTRACT.md`: pool-wide placement and
   failure-domain policy are receipt-backed.
-- Deleted scrub/repair/resilver historical lineage,
-  `docs/REPLICATION_REBUILD_RELOCATION_DATA_FLOWS_P8-03.md`, and
+- Deleted scrub/repair/resilver historical lineage and
   `docs/CROSS_REPLICA_SCRUB_COMPARISON_DESIGN.md`: scrub, repair, resilver,
   rebuild, anti-entropy, and movement material inform #900, but storage intent
   consumes typed recovery/degradation refs instead of originating a parallel
@@ -4332,9 +4331,8 @@ This document composes existing authority surfaces:
 - `docs/MEMBERSHIP_CONFIG_QUORUM_SET_IDENTITY_OW302B.md`: scoped current spec
   for deterministic quorum-set identity; it is input to #750 and storage-intent
   membership evidence, not a full membership service claim.
-- `docs/MEMBERSHIP_SERVICE_DESIGN.md` and
-  `docs/MEMBERSHIP_PLACEMENT_FAILURE_DOMAIN_MODEL_P8-02.md`: historical input
-  for #750; useful for semantics, but not broad current authority by themselves.
+- `docs/MEMBERSHIP_SERVICE_DESIGN.md`: historical input for #750; useful for
+  semantics, but not broad current authority by itself.
 - `docs/POOL_WIDE_REDUNDANCY_PLACEMENT_CONTRACT.md` and
   `docs/LOCAL_DISTRIBUTED_RECEIPT_AUTHORITY.md`: scoped current specs for
   receipt-backed placement. Storage intent may consume their receipt refs but

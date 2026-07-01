@@ -405,4 +405,4 @@ It should also sharpen, but not yet fully close:
 - the explicit `memory_arena_0` memory-domain / arena / ownership-token law in `docs/MEMORY_DOMAINS_ARENA_FAMILIES_OWNERSHIP_TOKEN_LAW_P4-01.md`
 - `P4-03` pressure / reclaim / reserve interaction
 - `P6-02` block flush / discard / durability law
-- `P8-03` replication / relocation data flows
+- receipt-backed replication / relocation data-flow sources

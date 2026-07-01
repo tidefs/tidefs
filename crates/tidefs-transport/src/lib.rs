@@ -218,9 +218,9 @@
 //! - [TransportBackend]: abstraction over TCP (default) and RDMA (OW-308)
 //!
 //!
-//! ## P8-03 role: data_copy_1.transfer_orchestrator
+//! ## source-owned role: data_copy_1.transfer_orchestrator
 //!
-//! Serves as the `TransferOrchestrator` for P8-03 distributed runtime data
+//! Serves as the `TransferOrchestrator` for source-owned distributed replication runtime data
 //! movement, providing chunk shipping, session management, lane multiplexing,
 //! and transport backend abstraction for cross-node data copy coordination.
 //! This is the physical layer of the distributed system.

@@ -10,7 +10,7 @@ homepage.workspace = true
 documentation.workspace = true
 authors.workspace = true
 
-description = "P8-03 witness set mechanism: quorum-based claim verification, witness selection, and receipt integration"
+description = "source-owned witness set mechanism: quorum-based claim verification, witness selection, and receipt integration"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

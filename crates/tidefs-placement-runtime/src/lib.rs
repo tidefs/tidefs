@@ -45,4 +45,4 @@ pub use types::*;
 
 /// Gate constant for the placement runtime.
 pub const PLACEMENT_RUNTIME_GATE: &str =
-    "P8-03 placement runtime executes deterministic placement plans across nodes with 5-phase lifecycle, budget tracking, and plan conflict resolution";
+    "source-owned placement runtime executes deterministic placement plans across nodes with 5-phase lifecycle, budget tracking, and plan conflict resolution";

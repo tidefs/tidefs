@@ -122,7 +122,7 @@ impl MembershipCodec for Incarnation {
 /// Failure-domain vector: [device, node, chassis, rack, zone, region].
 ///
 /// Each entry is a domain id that locates the member in the failure-domain
-/// hierarchy defined by the P8-02 membership-epoch model.
+/// hierarchy defined by the source-owned membership-epoch model.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct FailureDomainVector {
     pub device: u64,

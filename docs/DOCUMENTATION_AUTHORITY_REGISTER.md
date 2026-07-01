@@ -592,14 +592,11 @@ OpenZFS/Ceph successor status.
 | `docs/STORAGE_INTENT_POLICY_AUTHORITY.md` | Current spec | Design authority for the native storage-intent policy surface introduced by GitHub issue #839: guarantee/ack classes, receipt-satisfaction predicates, satisfaction reconciliation, proximity domains, workload prediction, media roles, flash-wear cost, RAM authority classes, relocation/defrag policy, operator receipt explanation, and the need for the #863 storage-intent fault-validation matrix. It is not runtime implementation evidence, a POSIX sync validation claim, a distributed availability claim, a completed fault-validation claim, or a performance superiority claim. |
 | `docs/STORAGE_INTENT_SERVICE_OBJECTIVE_DESIGN.md` | Current spec | Scoped current spec for GitHub issue #915 service-objective evidence: objective identity, workload and operation scope, latency percentile/tail, throughput/burst/dwell, topology/media/proximity, RPO/RTO, isolation, capacity, cost, wear, decision/action, measurement, comparator, claim, and typed refusal requirements. It is not runtime implementation evidence, a performance-validation artifact, or a superiority claim over OpenZFS, Ceph, DRBD, or any other system. |
 | `docs/STORAGE_INTENT_RESULT_REFUSAL_EVIDENCE_DESIGN.md` | Current spec | Scoped current spec for GitHub issue #920 result/refusal evidence: caller-visible outcome identity, policy/query/decision/receipt refs, degraded-visible state, service-objective/admission/action blockers, response-registry projection, retryability, caller compression, and retention/audit requirements. It is not runtime implementation evidence, a response-registry runtime, a POSIX errno validation artifact, or a product-readiness claim. |
-| `docs/CLOCKS_TIMING_FENCES_DRIFT_ASSUMPTIONS_P8-04.md` | Historical input | Imported production-depth timing and drift law. It needs source and runtime-evidence reconciliation before it can govern distributed timing behavior. |
-| `docs/MEMBERSHIP_PLACEMENT_FAILURE_DOMAIN_MODEL_P8-02.md` | Historical input | Imported production-depth membership, placement, and failure-domain model. It remains design input until distributed membership and placement claims have runtime evidence. |
 | `docs/MEMBERSHIP_CONFIG_QUORUM_SET_IDENTITY_OW302B.md` | Current spec | Scoped current spec for deterministic joint quorum-set identity in `crates/tidefs-membership-epoch`. It does not validate a full cluster-membership service. |
 | `docs/ERASURE_CODED_LAYOUT_OW306.md` | Current spec | Scoped current spec for the deterministic single-parity erasure layout model in `crates/tidefs-replication-model`. It is not production erasure-coding placement or rebuild evidence. |
 | `docs/POOL_WIDE_REDUNDANCY_PLACEMENT_CONTRACT.md` | Current spec | Scoped current spec for pool-wide placement contract and property-tested local model behavior. It does not prove distributed availability, rebake, recovery, or operator lifecycle behavior. |
 | `docs/LOCAL_DISTRIBUTED_RECEIPT_AUTHORITY.md` | Current spec | Scoped current spec for the issue #18 placement receipt authority split, including the shared `PlacementReceiptRef` policy-satisfying gate and remaining follow-up issues #674, #675, and #676. It is not a closure claim for distributed availability, rebuild, rebake, reclaim, or runtime validation. |
 | `docs/RAM_AUTHORITY_DESIGN.md` | Current spec | Scoped current spec for the issue #847 RAM authority boundary: `ram-volatile-local`, `ram-volatile-replicated`, `ram-intent-backed`, and `pmem-durable` semantics, receipts, failure behavior, policy-transition rules, resource-governor boundaries, and operator explanation requirements. It is not runtime implementation, PMem platform validation, distributed quorum proof, or POSIX durability evidence. |
-| `docs/REPLICATION_REBUILD_RELOCATION_DATA_FLOWS_P8-03.md` | Historical input | Imported production-depth replication, rebuild, and relocation flow design. It is not current runtime proof for anti-entropy, repair rebuild, relocation, failover, or cutover drains. |
 
 Issue #1715 deleted the imported authn/authz/override/audit and
 upgrade/failover/cutover operator-runbook production-depth roots instead of
@@ -610,6 +607,17 @@ and `docs/OPERATOR_PRODUCT_SURFACE_DECISION.md`. This deletion does not
 implement production remote operator authorization, a production runbook engine,
 release readiness, OpenZFS/Ceph parity, distributed failover readiness, kernel
 residency, or successor/comparator wording.
+
+Issue #1717 deletes the imported membership/placement, replication/rebuild/
+relocation, and timing/drift production-depth roots instead of preserving them
+as live historical surfaces. Current authority remains with source-owned
+membership, receipt, replication, rebuild, relocation, and clock-timing crates,
+plus `docs/MEMBERSHIP_AUTHORITY.md`,
+`docs/LOCAL_DISTRIBUTED_RECEIPT_AUTHORITY.md`,
+`docs/OPERATOR_PRODUCT_SURFACE_DECISION.md`, `validation/claims.toml`, and the
+claims gate. This deletion does not implement distributed membership runtime
+closure, production replication or rebuild, clock-drift runtime validation,
+release readiness, OpenZFS/Ceph parity, or successor/comparator wording.
 
 ## Incumbent Comparison Audit Slice (#931)
 

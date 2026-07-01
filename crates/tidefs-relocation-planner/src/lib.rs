@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Relocation planner: reclaim/tiering/policy-change/drain relocation
-//! flow orchestration — P8-03 data_copy_5.
+//! flow orchestration — source-owned data_copy_5.
 //!
 //! The relocation planner is the decision layer of the data movement
 //! pipeline. It determines what data must move (and where) in response
@@ -107,7 +107,7 @@ impl RelocationPriority {
 
 /// A safety gate validated before relocation proceeds.
 ///
-/// P8-03 anti-regression rules require specific conditions to be met
+/// Source-owned relocation anti-regression rules require specific conditions to be met
 /// before relocation can advance through each state transition.
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
 pub enum RelocationGate {
@@ -301,7 +301,7 @@ impl RelocationPlanner {
     /// Open a relocation flow from a trigger.
     ///
     /// Implements `open_relocation_flow_from_policy_or_reclaim()` from
-    /// P8-03 §data_copy_5. Creates a `RelocationFlowRecord` in Open state,
+    /// Source-owned data_copy_5. Creates a `RelocationFlowRecord` in Open state,
     /// validates the trigger, and registers the flow.
     ///
     /// Returns the flow id, or None if the trigger is invalid.

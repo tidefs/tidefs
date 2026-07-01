@@ -11,11 +11,9 @@ Multiple membership and quorum crates exist (`tidefs-membership-epoch`,
 `tidefs-membership-live`, `tidefs-membership-types`, `tidefs-quorum-write`,
 `tidefs-quorum-write-runtime`, `tidefs-witness-set`) and design docs
 (`docs/MEMBERSHIP_SERVICE_DESIGN.md`,
-`docs/MEMBERSHIP_CONFIG_QUORUM_SET_IDENTITY_OW302B.md`,
-`docs/MEMBERSHIP_PLACEMENT_FAILURE_DOMAIN_MODEL_P8-02.md`), but no single
-document names the authority owner for membership epoch identity,
-quorum-write dispatch, witness-set evidence, and the cluster join/leave
-lifecycle.
+`docs/MEMBERSHIP_CONFIG_QUORUM_SET_IDENTITY_OW302B.md`), but no single document
+names the authority owner for membership epoch identity, quorum-write dispatch,
+witness-set evidence, and the cluster join/leave lifecycle.
 
 This record decides the single membership epoch authority owner, the
 quorum-write dispatch model, the node-join and node-drain lifecycle
@@ -28,8 +26,8 @@ owner and maps follow-up implementation issues with expected write sets.
 - `docs/MEMBERSHIP_SERVICE_DESIGN.md` — membership service design
 - `docs/MEMBERSHIP_CONFIG_QUORUM_SET_IDENTITY_OW302B.md` — quorum-set
   identity spec
-- `docs/MEMBERSHIP_PLACEMENT_FAILURE_DOMAIN_MODEL_P8-02.md` — membership,
-  placement, and failure-domain law
+- `crates/tidefs-membership-epoch/` — source-owned membership, placement, and
+  failure-domain model
 - Deleted transport boundedness lineage — historical input in git history
 - `docs/TRANSPORT_CLUSTER_AUTHORITY.md` and #672 (closed) — transport/cluster
   authority boundary decision
@@ -147,8 +145,8 @@ follows:
 - `NodeJoinState::Joining` proposes a membership epoch transition
   (`EpochStateMachine::join`) to include the new node as a learner
 - After catch-up, a second epoch transition promotes the learner to
-  voter through a joint-consensus config epoch (`c2.joint` in the P8-02
-  model)
+  voter through a joint-consensus config epoch (`c2.joint` in the
+  source-owned membership model)
 - The join lifecycle consumes epoch identity from
   `tidefs-membership-epoch`; it does not issue epochs
 
@@ -245,7 +243,7 @@ downstream records and predicates:
   roster that classifies voters, learners, witnesses, quarantined peers,
   draining peers, and fenced peers.
 - `failure_domain_binding`: the membership/failure-domain binding from the
-  committed epoch model and P8-02 placement law.
+  committed epoch and placement model.
 - `quorum_set_identity`: the old-voter/new-voter quorum sets in
   `MembershipConfigRecord`, reduced for a write to alive voters in the
   committed epoch.

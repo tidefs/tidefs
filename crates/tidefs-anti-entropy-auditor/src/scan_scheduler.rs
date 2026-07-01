@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
-//! Scan scheduler for anti-entropy auditing — P8-03 data_copy_8.
+//! Scan scheduler for anti-entropy auditing — source-owned data_copy_8.
 //!
 //! Controls when and how anti-entropy scans are performed:
 //! - Scan window policy: minimum interval, maximum interval, backoff after divergence

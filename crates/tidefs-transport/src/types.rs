@@ -103,7 +103,7 @@ mod hex {
 }
 
 // ---------------------------------------------------------------------------
-// HLC timestamp (P8-04 Section 7.1, backed by tidefs-clock-timing)
+// HLC timestamp (source-owned timing model, backed by tidefs-clock-timing)
 // ---------------------------------------------------------------------------
 
 /// Hybrid Logical Clock timestamp backed by a real HlcValue.

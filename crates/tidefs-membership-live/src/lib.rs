@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 #![forbid(unsafe_code)]
 
-//! P8-02 live membership runtime for TideFS.
+//! Source-owned live membership runtime for TideFS.
 //!
 //! Implements SWIM-based failure detection with the 3-phase epoch transition
 //! protocol. Provides the `MembershipRuntime` service that drives heartbeat,

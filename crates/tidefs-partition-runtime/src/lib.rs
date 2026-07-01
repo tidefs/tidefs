@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 #![forbid(unsafe_code)]
 
-//! P8-02 partition runtime for TideFS.
+//! Source-owned partition runtime for TideFS.
 //!
 //! Detects, prevents, and recovers from network partitions in the distributed
 //! cluster. Integrates SWIM-based failure detection with epoch fencing to

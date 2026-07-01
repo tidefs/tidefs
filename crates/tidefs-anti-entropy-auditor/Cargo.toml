@@ -10,7 +10,7 @@ homepage.workspace = true
 documentation.workspace = true
 authors.workspace = true
 
-description = "Anti-entropy auditor: periodic scan/compare/repair-candidate discovery bridge between replica health tracking and rebuild — P8-03 data_copy_8"
+description = "Anti-entropy auditor: periodic scan/compare/repair-candidate discovery bridge between replica health tracking and rebuild — source-owned data_copy_8"
 
 [dependencies]
 tidefs-replication-model = { workspace = true }

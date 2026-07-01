@@ -274,5 +274,5 @@ RDMA and broad release-candidate runs are further milestone gates (see issue
 - Issue #17: pool-wide redundancy placement
 - Issue #16: media substrate
 - Deleted shard/rebake historical lineage
-- `docs/REPLICATION_REBUILD_RELOCATION_DATA_FLOWS_P8-03.md`
+- source-owned replication, rebuild, and relocation model crates
 - `docs/STORAGE_INTENT_RESULT_REFUSAL_EVIDENCE_DESIGN.md`

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
-//! Drift estimation and classification (P8-04 Sections 3, 7.1).
+//! Drift estimation and classification (source-owned timing model).
 //!
 //! Estimates clock drift between nodes from observed remote/local clock
 //! validation and classifies the drift into canonical drift/trust classes.

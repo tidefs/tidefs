@@ -10,7 +10,7 @@ homepage.workspace = true
 documentation.workspace = true
 authors.workspace = true
 
-description = "Relocation planner: reclaim/tiering/policy-change/drain relocation flow orchestration — P8-03 data_copy_5"
+description = "Relocation planner: reclaim/tiering/policy-change/drain relocation flow orchestration — source-owned data_copy_5"
 
 [dependencies]
 tidefs-replication-model = { workspace = true }

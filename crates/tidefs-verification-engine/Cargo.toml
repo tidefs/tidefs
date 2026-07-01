@@ -10,7 +10,7 @@ homepage.workspace = true
 documentation.workspace = true
 authors.workspace = true
 
-description = "P8-03 data_copy_2 verification engine: digest/witness/range/quorum verification of replicated chunks with ReplicaVerificationReceipt emission, plus pool-level segment integrity verification"
+description = "source-owned data_copy_2 verification engine: digest/witness/range/quorum verification of replicated chunks with ReplicaVerificationReceipt emission, plus pool-level segment integrity verification"
 
 [dependencies]
 tidefs-replication-model = { workspace = true }

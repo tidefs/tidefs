@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
-//! TideFS verification engine: P8-03 `data_copy_2.verification_engine`,
+//! TideFS verification engine: source-owned `data_copy_2.verification_engine`,
 //! pool-level segment integrity verification, and per-object BLAKE3-256
 //! integrity checking.
 //!
@@ -17,7 +17,7 @@
 //! and the flow commit coordinator (data_copy_7). It validates transferred
 //! chunks through four verification classes before placement is legal.
 //!
-//! ## Verification classes (P8-03 anti-regression rule 1)
+//! ## Verification classes (source-owned relocation anti-regression rule 1)
 //!
 //! 1. **Digest verification** — compare chunk digest against authoritative source
 //! 2. **Extent/range verification** — confirm byte range matches transfer ticket
@@ -27,7 +27,7 @@
 //! ## Output
 //!
 //! The engine emits `ReplicaVerificationReceipt` records. A `Verified` status
-//! makes replica placement legal per P8-03 law 3+7.
+//! makes replica placement legal per source-owned receipt law.
 
 pub mod engine;
 pub mod health_report;

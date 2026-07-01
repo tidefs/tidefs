@@ -10,7 +10,7 @@ homepage.workspace = true
 documentation.workspace = true
 authors.workspace = true
 
-description = "P8-03 data_copy_6 chunk shipper: stage, stream, and receive replica chunks bridging transfer orchestrator tickets to transport-layer execution with verification handoff"
+description = "source-owned data_copy_6 chunk shipper: stage, stream, and receive replica chunks bridging transfer orchestrator tickets to transport-layer execution with verification handoff"
 
 [dependencies]
 tidefs-replication-model = { workspace = true }

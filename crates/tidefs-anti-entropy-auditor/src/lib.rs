@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Anti-entropy auditor: periodic scan/compare/repair-candidate discovery
-//! for P8-03 data_copy_8.
+//! for source-owned data_copy_8.
 //!
 //! The anti-entropy auditor is the bridge between replica health tracking
 //! (which detects lag/degradation via `tidefs-replica-health`) and the

@@ -6,7 +6,7 @@
 //! with quorum-backed issuance, automatic renewal, fencing, and receipt
 //! integration.
 //!
-//! # Design rule (P8-03 core law 5)
+//! # Design rule (source-owned replication/rebuild reserve law)
 //!
 //! "Scarce mutable authority is only issued through time-bounded, witness-
 //! attested leases. No node may mutate a shared domain without holding a

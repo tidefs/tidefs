@@ -3,7 +3,7 @@
 
 //! Replica health: per-chunk degradation tracking, BLAKE3-authenticated
 //! health probes, epoch-gated quorum aggregation, adaptive failure
-//! detection, and lag computation — P8-03 data_copy_3.
+//! detection, and lag computation — source-owned data_copy_3.
 //!
 //! # Design
 //!
@@ -1738,7 +1738,7 @@ mod read_selection_tests {
 }
 
 // ── Integration with tidefs-replication-model ──
-// P8-03 §5: ReplicaLagStateRecord schema family and
+// Source-owned replication/rebuild model: ReplicaLagStateRecord schema family and
 // advance_replica_health_and_lag_frontiers() algorithm
 
 use tidefs_replication_model::{
@@ -1746,7 +1746,7 @@ use tidefs_replication_model::{
     ReplicaVerificationReceipt, ReplicatedReceiptId, ReplicatedSubjectId, VerificationStatus,
 };
 
-/// Authoritative lag / degraded visibility state (P8-03 §5).
+/// Authoritative lag / degraded visibility state (source-owned replication/rebuild model).
 #[derive(Debug, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ReplicaLagStateRecord {
     pub subject_ref: ReplicatedSubjectId,
@@ -1789,7 +1789,7 @@ impl ReplicaLagStateRecord {
     }
 }
 
-/// Advance replica health and lag frontiers from receipts (P8-03 §6).
+/// Advance replica health and lag frontiers from receipts (source-owned replication/rebuild model).
 #[must_use]
 pub fn advance_replica_health_and_lag_frontiers(
     current_frontier: u64,

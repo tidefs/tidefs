@@ -18,9 +18,9 @@
 //! consumers.
 
 //! This crate is intentionally a small userspace model, not a networked
-//! consensus runtime. It binds the P8-02 membership, failure-domain, placement,
-//! split-brain, and rejoin laws to executable source and failure/rejoin tests.
-//! split-brain, and rejoin laws to executable source and failure/rejoin tests.
+//! consensus runtime. It binds the source-owned membership, failure-domain,
+//! placement, split-brain, and rejoin laws to executable source and
+//! failure/rejoin tests.
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -72,7 +72,7 @@ pub mod snapshot;
 pub mod transition_journal;
 pub mod unreachable_handler;
 
-pub const MEMBERSHIP_EPOCH_MODEL_P8_02: &str =
+pub const MEMBERSHIP_EPOCH_MODEL_FAMILY: &str =
     "family.membership_placement_failure_domain.membership_placement_0";
 pub const MEMBERSHIP_EPOCH_FAILURE_REJOIN_GATE: &str =
     "OW-302 failure/rejoin tests bind membership epochs, failure domains, split-brain refusal, and learner catch-up gates";

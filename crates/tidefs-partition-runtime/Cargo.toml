@@ -10,7 +10,7 @@ homepage.workspace = true
 documentation.workspace = true
 authors.workspace = true
 
-description = "P8-02 partition runtime: network partition detection, split-brain prevention, and partition healing for TideFS"
+description = "source-owned partition runtime: network partition detection, split-brain prevention, and partition healing for TideFS"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

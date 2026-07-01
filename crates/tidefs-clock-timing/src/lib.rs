@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 #![cfg_attr(not(test), no_std)]
 //! tidefs-clock-timing: HLC, clock health, drift estimation, lease/fence deadlines, freshness fences, epoch timing attestation, and timeout
-//! escalation (P8-04).
+//! escalation (source-owned timing model).
 //!
 //! # Design rule
 //!
 //! Authority ordering is receipt/epoch/anchor-based; time only gates waiting,
 //! liveness, escalation, and narrative rendering.
 //!
-//! # Clock classes (P8-04 Section 2)
+//! # Clock classes (source-owned timing model)
 //!
 //! Seven canonical clock classes are defined:
 //!
@@ -20,20 +20,20 @@
 //! - `FenceDeadline` (`time_clock_5`) — derived freshness-fence deadlines
 //! - `LeaseDeadline` (`time_clock_6`) — derived lease-expiry deadlines
 //!
-//! # Drift classes (P8-04 Section 3)
+//! # Drift classes (source-owned timing model)
 //!
 //! Five canonical drift/trust classes from `TrustedLocal` through `UntrustedTime`.
 //! Drift classes control deadline slack, admission of sensitive actions, and
 //! failover eligibility.
 //!
-//! # Freshness fences (P8-04 Section 4)
+//! # Freshness fences (source-owned timing model)
 //!
 //! `FreshnessFenceRecord` declares a freshness barrier: source data must be at
 //! or ahead of the fence frontier. Fence classes (`Strict`, `Bounded`, `Soft`)
 //! control what happens when a source is behind. Evaluation produces a
 //! `FreshnessVerdict`.
 //!
-//! # Runtime components (P8-04 Section 4)
+//! # Runtime components (source-owned timing model)
 //!
 //! - `ClockSampler` / `TimeHealthMonitor` — sample and classify local clock health
 //! - `HybridLogicalClock` — maintain HLC for causal cross-node ordering

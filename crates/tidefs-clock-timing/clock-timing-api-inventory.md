@@ -9,13 +9,13 @@
 | File | Lines | Purpose |
 |------|-------|---------|
 | `lib.rs` | 98 | Module declarations, re-exports, doc example |
-| `types.rs` | 839 | Canonical enums, structs, record types (P8-04 §§2-6) |
-| `hlc.rs` | 297 | HybridLogicalClock implementation (P8-04 §5.2) |
-| `health.rs` | 413 | ClockSampler + TimeHealthMonitor (P8-04 §§4-5.1) |
-| `drift.rs` | 359 | DriftEstimator + DriftSample (P8-04 §§3, 7.1) |
-| `deadline.rs` | 395 | LeaseDeadline + FenceDeadline trackers (P8-04 §§5.3-5.4) |
-| `escalation.rs` | 313 | TimeoutEscalator — miss→action policy (P8-04 §4) |
-| `fence.rs` | 534 | Freshness fence eval + epoch attestation + drift safety (P8-04 §§4-7) |
+| `types.rs` | 839 | Canonical enums, structs, record types (source-owned timing model) |
+| `hlc.rs` | 297 | HybridLogicalClock implementation (source-owned timing model) |
+| `health.rs` | 413 | ClockSampler + TimeHealthMonitor (source-owned timing model) |
+| `drift.rs` | 359 | DriftEstimator + DriftSample (source-owned timing model) |
+| `deadline.rs` | 395 | LeaseDeadline + FenceDeadline trackers (source-owned timing model) |
+| `escalation.rs` | 313 | TimeoutEscalator — miss→action policy (source-owned timing model) |
+| `fence.rs` | 534 | Freshness fence eval + epoch attestation + drift safety (source-owned timing model) |
 
 ## Public API Surface
 

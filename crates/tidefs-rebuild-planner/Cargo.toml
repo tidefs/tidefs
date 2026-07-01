@@ -10,7 +10,7 @@ homepage.workspace = true
 documentation.workspace = true
 authors.workspace = true
 
-description = "Rebuild planner: loss/suspect event rebuild flow orchestration — P8-03 data_copy_4"
+description = "Rebuild planner: loss/suspect event rebuild flow orchestration — source-owned data_copy_4"
 
 [dependencies]
 tidefs-replication-model = { workspace = true }

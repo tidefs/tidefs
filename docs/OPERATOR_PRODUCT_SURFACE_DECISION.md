@@ -64,7 +64,7 @@ surface, widen publishing claims, or preselect a runtime carrier.
   `truth_view`, runtime-fed operator surfaces, render receipts, and
   product carriers: The P10-04 document is referenced by
   deleted P3 receipt/response production-depth lineage,
-  `docs/MEMBERSHIP_PLACEMENT_FAILURE_DOMAIN_MODEL_P8-02.md`,
+  deleted membership/placement production-depth lineage,
   deleted performance/fault production-depth lineage,
   deleted kernel-boundary production-depth lineage,
   deleted operator-runbook production-depth lineage,

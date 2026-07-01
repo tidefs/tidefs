@@ -257,7 +257,7 @@ pub enum ReplicationMessage {
         generation: u64,
     },
 
-    // ── Plan-based replication protocol (P8-03 distributed runtime) ──
+    // ── Plan-based replication protocol (source-owned distributed replication runtime) ──
     /// Disseminate a serialized write plan to a replica (Control lane, e1).
     WritePlan { plan_bytes: Vec<u8> },
     /// Acknowledge or refuse a write plan (Control lane, e1).
