@@ -40,6 +40,12 @@ Each manifest records:
 - `generated_at`
 - `blocking_issues`
 
+`blocking_issues` lists only current unresolved GitHub blockers for the
+artifact or registry evidence requirement. Closed issues and merged pull
+requests are historical context, not active blockers, and must be recorded in
+claim blocker text or authority docs instead of this field when they still
+explain evidence lineage.
+
 The `artifact_path` must be relative to the repository or validation artifact
 root, and `content_digest` must match the bytes at that path. Use the
 manifest helpers in `tidefs-validation` to serialize, parse, and verify the

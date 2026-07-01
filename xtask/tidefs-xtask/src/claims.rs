@@ -3509,7 +3509,10 @@ mod tests {
             "validation/performance/no-hidden-queues.toml"
         );
         assert_eq!(no_hidden.validation_tier, "cargo-unit");
-        assert_eq!(no_hidden.blocking_issues, vec!["#720".to_string()]);
+        assert!(
+            no_hidden.blocking_issues.is_empty(),
+            "closed #720 must not remain an unresolved blocking issue"
+        );
         assert!(no_hidden.details.iter().any(|detail| detail
             .contains("no evidence_artifacts entry registers class `no-hidden-queue-gate`")));
 
@@ -3524,8 +3527,35 @@ mod tests {
         assert!(summary.contains("status: BLOCKED"));
         assert!(summary.contains("class: runtime-namespace-crash-artifact"));
         assert!(summary.contains("class: no-hidden-queue-gate"));
-        assert!(summary.contains("blocking_issues: #720"));
+        assert!(!summary.contains("blocking_issues: #720"));
         assert!(!summary.contains("blocking_issues: #596"));
+    }
+
+    #[test]
+    fn validate_claim_receipt_preserves_current_registry_blocker() {
+        let root = workspace_root();
+        let registry = parse_claim_registry(include_str!("../../../validation/claims.toml"))
+            .expect("claim registry parses");
+        let claim = registry
+            .claims
+            .iter()
+            .find(|claim| claim.id == "storage.intent.flash_wear_budget.v1")
+            .expect("flash wear budget claim registered");
+
+        let receipt = build_claim_validation_receipt(&root, SystemTime::UNIX_EPOCH, claim);
+        assert_eq!(receipt.status, ClaimReceiptStatus::Blocked);
+
+        let prefetch = receipt
+            .required_evidence
+            .iter()
+            .find(|evidence| evidence.class == "storage-intent-prefetch-residency-execution")
+            .expect("prefetch/residency execution evidence receipt");
+        assert_eq!(prefetch.status, EvidenceClassStatus::Missing);
+        assert_eq!(prefetch.blocking_issues, vec!["#972".to_string()]);
+
+        let summary = render_claim_validation_summary(&receipt);
+        assert!(summary.contains("class: storage-intent-prefetch-residency-execution"));
+        assert!(summary.contains("blocking_issues: #972"));
     }
 
     #[test]
