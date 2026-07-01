@@ -686,7 +686,9 @@ directory entries to check the flag, which is more error-prone.
 
 ## 12. Related Design Documents
 
-- **#1206** (`docs/LOCK_HIERARCHY_AND_CONCURRENCY_MODEL.md`): Canonical lock hierarchy used by the 5-step algorithm's lock set computation (section 5.2).
+- **#1206**: Historical lock-hierarchy lineage for the 5-step algorithm's lock
+  set computation (section 5.2). Current lock authority still requires a fresh
+  source audit before promotion.
 - **#1213** (`docs/VFS_ENGINE_API_CONTRACT.md`): The `VfsEngine::rename` trait definition that this algorithm implements.
 - **#1224**: Torn-commit recovery: after a crash during rename, the recovery contract replays the commit record.
 - **#1267** (`docs/design/canonical-commit-ordering-commit_group-state-machine.md`): The 7-step commit_group commit ordering that guarantees rename durability.
