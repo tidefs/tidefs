@@ -217,6 +217,17 @@ does not validate POSIX-complete durability, O_DSYNC/open-flag handling, block
 flush/FUA, distributed transactions, performance, availability, release
 readiness, or successor/comparator claims.
 
+## Device Layout Policy Historical Root Deletion (TFR-019 / #1684)
+
+Issue #1684 deleted the stale device-layout policy root that self-declared it
+was superseded by
+`docs/design/device-layout-policies-adaptive-segment-sizing.md`. Current
+authority remains with source-backed device-layout code, the refined design
+input, live issues, validation claims, and the claims gate; this deletion does
+not validate adaptive layout production readiness, import-performance
+scalability, allocator/device lifecycle completeness, availability, release
+readiness, or successor/comparator claims.
+
 ## Doc-Authority Drift Cleanup Coordination (#952)
 
 Recorded on 2026-06-22 for the `check-doc-authority-drift` follow-up from PR
@@ -503,7 +514,6 @@ surface beyond adding `docs/CLAIMS_GATE_POLICY.md`, which was already scanned.
 | `docs/SPACEMAP_ALLOCATOR_DESIGN.md` | Historical input | Imported design-spec for spacemap and segment allocator. Explicitly states no runtime allocator or persistent spacemap exists in current source. References Forgejo issue #1189. |
 | `docs/SPACE_ACCOUNTING_MODEL_DESIGN.md` | Historical input | Imported design-spec for logical vs physical space accounting. References Forgejo issue #1215. Claims registry has no validated space-accounting claim. |
 | `docs/POOL_IMPORT_EXPORT_DEVICE_TOPOLOGY_DESIGN.md` | Current spec | Scoped source-backed summary for the current pool-label, pool-scan/import, local import/export, and device-manager code paths. It is not product-readiness evidence for hot spares, evacuation, cluster ownership, online topology conversion, hardware-failure survival, availability, operational safety, or incumbent-comparison claims. |
-| `docs/DEVICE_LAYOUT_POLICIES_DESIGN.md` | Historical input | Imported design-spec that self-declares it has been superseded by `docs/design/device-layout-policies-adaptive-segment-sizing.md`. References Forgejo issue #1193. |
 | `docs/MEMBERSHIP_SERVICE_DESIGN.md` | Historical input | Imported design-spec for cluster membership service. References Forgejo issue #1209. ZFS/Ceph comparison text is design input only and is not a cluster-membership, distributed-availability, scale, performance, or successor claim. Claims registry has no validated cluster-membership claim. |
 | `docs/ERASURE_CODING_PLACEMENT_DESIGN.md` | Historical input | Imported design-spec superseded by the G4 pillar at `docs/design/production-erasure-coding-crush-placement-g4-pillar.md`. References Forgejo issue #1249. |
 | `docs/design/production-erasure-coding-crush-placement-g4-pillar.md` | Historical input | Imported G4 pillar design-spec for TideCRUSH deterministic placement. References Forgejo issue #1779. Supersedes earlier erasure-coding placement designs. |

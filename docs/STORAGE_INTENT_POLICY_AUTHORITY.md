@@ -4180,10 +4180,10 @@ This document composes existing authority surfaces:
   segment, reclaim, and object-store material inform #880, but historical or
   unclassified design wording is not current storage-intent evidence until live
   source, issue, and claim authority say so.
-- `docs/DEVICE_LAYOUT_POLICIES_DESIGN.md` and
-  `docs/design/device-layout-policies-adaptive-segment-sizing.md`: media class
-  and device segment sizing are placement inputs; storage intent owns the
-  workload-facing record/extent/stripe shape policy that uses those inputs.
+- `docs/design/device-layout-policies-adaptive-segment-sizing.md`: media
+  class and device segment sizing are placement inputs; storage intent owns
+  the workload-facing record/extent/stripe shape policy that uses those
+  inputs.
 - Dataset property and mount-profile authorities are policy sources. Storage
   intent owns the compiled cross-source policy snapshot consumed by ack,
   placement, relocation, and explanation paths; it does not replace the
