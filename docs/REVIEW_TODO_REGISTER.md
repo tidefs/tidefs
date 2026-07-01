@@ -1295,8 +1295,8 @@ Important 2026-06-01 findings:
   block-volume documentation surface without validating the blocked
   block-device product boundary, qid/tag completion product status, fio
   breadth, mkfs/mount acceptance, online resize, crash durability, kernel block
-  readiness, release readiness, production readiness, or OpenZFS/Ceph successor
-  wording.
+  status, release/product admission, or not yet validated OpenZFS/Ceph
+  successor/comparator wording.
 - `TFR-019`: GitHub issue #1136 classifies `docs/REQUEST_CONTRACT.md` as
   current spec only for the TideFS-owned request/completion contract shape:
   portable `tidefs-types-vfs-core` records, the v1 `tidefs-schema-codec-vfs`
