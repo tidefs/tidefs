@@ -287,6 +287,15 @@ Forgejo-era URLs or live-looking imported status markers. These files remain in
 the tree only as historical input unless a future focused issue promotes a
 narrow source-backed scope.
 
+### Empty Module Owners Scaffold Retirement (TFR-019 / #1619)
+
+Issue #1619 deleted the empty `MODULE_OWNERS_INVARIANTS_PC002` scaffold and
+retired its xtask aliases because the document had no owner-path rows to
+verify. Module ownership, subsystem invariants, release readiness, production
+readiness, and OpenZFS/Ceph-class wording remain blocked until a future
+source-backed issue introduces real owner-path data, validation evidence, and
+claim-gate coverage for an exact scope.
+
 | Path | State | Classification note |
 |---|---|---|
 | `docs/THREE_CONTRACT_ARCHITECTURE.md` | Historical input | Imported three-contract meta-architecture/design-law text. It is not current on-media, VFS, trace, JSONL, multi-implementation, or release authority. |
@@ -392,7 +401,6 @@ surface beyond adding `docs/CLAIMS_GATE_POLICY.md`, which was already scanned.
 |---|---|---|
 | `docs/CLAIMS_GATE_POLICY.md` | Current policy | Binding claims-gate guardrail enforced by `xtask check-claims-gate`. The scanner hard-codes a policy spec constant, verifies this file exists, and checks that the required gate text is present. Because this is promoted to current policy, it is scanned by the claims gate (it was already in the scanned-surface list). |
 | `docs/DESIGN_OVERFITTING_POLICY.md` | Historical input | Imported design-policy with a 2026-05-18 reconciliation note stating sections are superseded by P1-01 and workspace-package-classification. Binding rules (error variants, feature flags, dynamic dispatch, concurrency, unsafe) remain useful guidance, but the document references Forgejo state and partially-superseded crate-removal directives. |
-| `docs/MODULE_OWNERS_INVARIANTS_PC002.md` | Delete candidate | Scaffold document with an empty ownership table and no live owner-path bindings. The referenced `tidefs-xtask check-module-owners` gate has no data to verify. |
 | `docs/ON_DISK_FORMAT_VERSIONING_AND_COMPATIBILITY_POLICY.md` | Historical input | Imported release-policy with well-articulated format versioning discipline, but references a stale Forgejo issue (#6518) and non-existent sub-documents (FORMAT_IDENTITY_UPGRADE_REPLAY_CONTINUITY_LAW_P2-04.md, TRANSPORT_SESSION_COHORT_GRAPH_P8-01.md, ZERO_COPY_DMA_PINNING_PAGE_LOAN_LAW_P4-04.md). The pre-release note correctly states no public release has shipped. |
 | `docs/RDMA_TRANSPORT_POSITION.md` | Historical input | Imported transport-position document referencing non-existent sub-documents and stating "TideFS does not have a product RDMA data path yet." Useful for future RDMA design reference. |
 | `docs/DISTRIBUTED_OPERATOR_PRODUCT_SURFACE_BLOCKER_MAP_OW307D.md` | Historical input | Imported OW-307D blocker map. Records typed truth rows and deterministic demo rows present in source, but the parent OW-307 gate remains open and a runtime-fed operator product surface is not yet present. |
