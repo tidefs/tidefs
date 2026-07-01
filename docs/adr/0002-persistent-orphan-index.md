@@ -61,6 +61,7 @@ Implement a **persistent orphan index** as a first-class on-media structure:
 - Coordination required with spacemap allocator to ensure freed blocks aren't
   double-allocated during crash recovery replay.
 
-Historical design input: `docs/PERSISTENT_ORPHAN_INDEX_DESIGN.md`
+Historical design input: deleted by GitHub issue #1675; this ADR remains only
+target-history background, not current product evidence.
 Issues: [#2063](http://172.16.106.12/forgejo/forgeadmin/tidefs/issues/2063),
 [#2083](http://172.16.106.12/forgejo/forgeadmin/tidefs/issues/2083)

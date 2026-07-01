@@ -472,7 +472,6 @@ surface beyond adding `docs/CLAIMS_GATE_POLICY.md`, which was already scanned.
 | `docs/DEBUGGING_WORKFLOWS.md` | Historical input | Imported developer guide covering debug builds, tracing, test isolation, and xtask checks. Generally applicable commands, but specific references may have drifted. |
 | `docs/DATASET_FEATURE_FLAGS_DESIGN.md` | Historical input | Imported design-spec for per-dataset feature flags with three compatibility classes. References Forgejo issue #1223. |
 | `docs/DATASET_LIFECYCLE_DESIGN.md` | Historical input | Imported design-spec for dataset lifecycle state machine. References Forgejo issue #1219. Claims registry has no validated dataset-lifecycle claim. |
-| `docs/TXG_STATE_MACHINE_DESIGN.md` | Historical input | Imported spec-draft for canonical commit ordering and multi-phase commit_group state machine. References Forgejo issue #1267. |
 | `docs/SPACEMAP_ALLOCATOR_DESIGN.md` | Historical input | Imported design-spec for spacemap and segment allocator. Explicitly states no runtime allocator or persistent spacemap exists in current source. References Forgejo issue #1189. |
 | `docs/SPACE_ACCOUNTING_MODEL_DESIGN.md` | Historical input | Imported design-spec for logical vs physical space accounting. References Forgejo issue #1215. Claims registry has no validated space-accounting claim. |
 | `docs/POOL_IMPORT_EXPORT_DEVICE_TOPOLOGY_DESIGN.md` | Current spec | Scoped source-backed summary for the current pool-label, pool-scan/import, local import/export, and device-manager code paths. It is not product-readiness evidence for hot spares, evacuation, cluster ownership, online topology conversion, hardware-failure survival, availability, operational safety, or incumbent-comparison claims. |
@@ -562,8 +561,9 @@ unless the cited statement is re-expressed through
 `storage.distributed.successor_comparator.v1` and the comparator evidence
 required by those registry entries:
 
-- `docs/PERSISTENT_ORPHAN_INDEX_DESIGN.md`: ZFS/ext4/CephFS orphan-index
-  table and former "key advantages" list are non-claim design lessons.
+- Deleted orphan-index comparison lineage: ZFS/ext4/CephFS orphan-index table
+  and former "key advantages" list are non-claim design lessons in git history
+  only.
 - `docs/POLYMORPHIC_DIRECTORY_INDEX_DESIGN.md`: ZFS ZAP comparison and former
   "improvements over ZFS" list are non-claim design lessons.
 - Deleted polymorphic extent-map design lineage: ZFS/Ceph extent-layout tables,
@@ -580,6 +580,15 @@ required by those registry entries:
   capability evidence.
 - `docs/WHOLE_REPO_REVIEW.md`: incumbent references are fail-closed review
   blockers only.
+
+### ADR-Backed Historical Root Deletions (TFR-019 / #1675)
+
+Issue #1675 deleted the ADR-backed commit-group and orphan-index historical
+root docs whose useful target-history context was already preserved by ADRs and
+source code. The surviving ADRs remain historical input only; live behavior,
+current authority, and product claims still come from source-backed authority
+docs, `validation/claims.toml`, generated claim output, and GitHub issue/PR
+state.
 
 Non-overlapping child slices completed the cluster-by-cluster audit and added
 Incumbent Comparison Boundary sections to the following file groups. Each

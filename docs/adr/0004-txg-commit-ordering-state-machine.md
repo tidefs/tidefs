@@ -62,6 +62,7 @@ design choices:
 - Future subsystems plug into the state machine by registering in the
   appropriate commit class.
 
-Historical design input: `docs/TXG_STATE_MACHINE_DESIGN.md`
+Historical design input: deleted by GitHub issue #1675; this ADR remains only
+target-history background, not current product evidence.
 Issues: [#1654](http://172.16.106.12/forgejo/forgeadmin/tidefs/issues/1654),
 [#1743](http://172.16.106.12/forgejo/forgeadmin/tidefs/issues/1743)
