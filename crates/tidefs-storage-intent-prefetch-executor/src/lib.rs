@@ -2673,20 +2673,7 @@ fn initial_result_detail_lacks_feedback_evidence(input: PrefetchExecutorInput) -
 }
 
 fn result_detail_has_execution_measurements(detail: PrefetchExecutorResultDetail) -> bool {
-    detail.has_usage_measurement()
-        || detail.flash_write_bytes != 0
-        || detail.pmem_write_bytes != 0
-        || detail.waf_micros != 0
-        || detail.ram_pressure_bytes != 0
-        || detail.cache_index_write_bytes != 0
-        || detail.predictor_metadata_write_bytes != 0
-        || detail.retained_evidence_bytes != 0
-        || detail.wan_bytes != 0
-        || detail.egress_cost_microunits != 0
-        || detail.restore_cost_microunits != 0
-        || detail.staging_capacity_bytes != 0
-        || detail.cpu_us != 0
-        || detail.memory_bytes != 0
+    detail.has_feedback_payback_inputs()
 }
 
 fn initial_result_detail_has_snapshot_feedback_roots(input: PrefetchExecutorInput) -> bool {
@@ -6112,6 +6099,88 @@ mod tests {
         input.admission = PrefetchExecutorAdmissionRecord::default();
         input.result_detail = terminal_detail();
         add_initial_feedback_roots(&mut input.evidence_query_snapshot, input.result_detail);
+
+        let record = evaluate_prefetch_execution(input);
+
+        assert_eq!(record.outcome, PrefetchExecutorOutcome::VerificationFailed);
+        assert_eq!(
+            record.executor_byte_state,
+            PrefetchExecutorByteState::Refused
+        );
+        assert_eq!(
+            record.refusal,
+            StorageIntentRefusalReason::ValidationGateFailed
+        );
+        assert_record_has_no_authority_claims(record);
+    }
+
+    #[test]
+    fn no_prefetch_rejects_pre_dispatch_latency_measurements() {
+        let mut input = admitted_input(PrefetchResidencyCandidateClass::NoPrefetch);
+        input.decision.outcome = PrefetchResidencyDecisionOutcome::NoAction;
+        input.admission = PrefetchExecutorAdmissionRecord::default();
+        input.result_detail = PrefetchExecutorResultDetail {
+            latency_harm_us: 7,
+            attribution_ref: evidence(
+                StorageIntentEvidenceKind::MeasurementAttributionEvidence,
+                ATTRIBUTION,
+            ),
+            retention_ref: evidence(
+                StorageIntentEvidenceKind::EvidenceRetentionEvidence,
+                RETENTION,
+            ),
+            validation_ref: evidence(StorageIntentEvidenceKind::ValidationArtifact, VALIDATION),
+            ..PrefetchExecutorResultDetail::default()
+        };
+        add_initial_feedback_roots(&mut input.evidence_query_snapshot, input.result_detail);
+        assert!(result_detail_has_execution_measurements(
+            input.result_detail
+        ));
+
+        let record = evaluate_prefetch_execution(input);
+
+        assert_eq!(record.outcome, PrefetchExecutorOutcome::VerificationFailed);
+        assert_eq!(
+            record.executor_byte_state,
+            PrefetchExecutorByteState::Refused
+        );
+        assert_eq!(
+            record.refusal,
+            StorageIntentRefusalReason::ValidationGateFailed
+        );
+        assert_record_has_no_authority_claims(record);
+    }
+
+    #[test]
+    fn authority_handoff_rejects_pre_dispatch_protected_reserve_pressure() {
+        let mut input =
+            admitted_input(PrefetchResidencyCandidateClass::AuthorityPromotionCandidate);
+        input.decision.outcome = PrefetchResidencyDecisionOutcome::PromotionCandidate;
+        input.decision.selected_residency = PrefetchResidencyStateClass::PmemDurable;
+        input.decision.evidence_refs.relocation_boundary_ref =
+            evidence(StorageIntentEvidenceKind::RelocationReceipt, RELOCATION);
+        input
+            .evidence_query_snapshot
+            .included_refs
+            .push(input.decision.evidence_refs.relocation_boundary_ref)
+            .unwrap();
+        input.result_detail = PrefetchExecutorResultDetail {
+            protected_reserve_pressure: true,
+            attribution_ref: evidence(
+                StorageIntentEvidenceKind::MeasurementAttributionEvidence,
+                ATTRIBUTION,
+            ),
+            retention_ref: evidence(
+                StorageIntentEvidenceKind::EvidenceRetentionEvidence,
+                RETENTION,
+            ),
+            validation_ref: evidence(StorageIntentEvidenceKind::ValidationArtifact, VALIDATION),
+            ..PrefetchExecutorResultDetail::default()
+        };
+        add_initial_feedback_roots(&mut input.evidence_query_snapshot, input.result_detail);
+        assert!(result_detail_has_execution_measurements(
+            input.result_detail
+        ));
 
         let record = evaluate_prefetch_execution(input);
 
