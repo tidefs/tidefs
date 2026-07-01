@@ -3,11 +3,12 @@
 
 //! VFS_RPC wire protocol for forwarding VFS engine operations between nodes.
 //!
-//! This crate implements the stable service surface from
-//! `docs/design/vfs-rpc-wire-protocol.md`: service id `0x06`, the fixed
-//! request/response prefixes, stable method ids, inline-or-bulk payload
+//! This crate owns source-level VFS_RPC constants and encoders: service id
+//! `0x06`, fixed request/response prefixes, method ids, inline-or-bulk payload
 //! descriptors, transferable handle encoding, request id correlation, and a
 //! bounded per-peer deduplication window for retry-safe mutation replay.
+//! Current distributed-product authority remains with
+//! `docs/TRANSPORT_CLUSTER_AUTHORITY.md` and live implementation evidence.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;

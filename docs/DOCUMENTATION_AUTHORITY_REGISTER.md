@@ -837,15 +837,12 @@ mmap-coherency, and metadata-resilience roots:
 `docs/design/metadata-redundancy-fallback.md`. Their lineage remains in git,
 issue #1638, and its pull request only.
 
-The surviving source- or doc-referenced design roots below are retained as
-historical input because editing the references is outside the #1638 write
-boundary. They do not promote distributed mode, clustered POSIX, RDMA, mmap
-coherency, metadata redundancy, release readiness, production readiness,
-OpenZFS/Ceph parity, or successor/comparator wording.
-
-| Path | State | Classification note |
-|---|---|---|
-| `docs/design/cluster-bulk-plane-protocol.md` | Historical input | Retained for narrow `BulkPriority` priority-class lineage cited by source comments. Active transport authority remains `docs/TRANSPORT_CLUSTER_AUTHORITY.md`, membership authority, placement-receipt authority, source, validation claims, generated claim docs, and live GitHub issues/PRs. |
-| `docs/design/cluster-distributed-lock-service-sharded-leases.md` | Historical input | Retained for a remaining historical design cross-reference. It is not clustered POSIX, distributed lock, multi-writer, or mmap coherency authority. |
-| `docs/design/cluster-security-identity-model.md` | Historical input | Retained for narrow security-section lineage cited by source comments. Active trust, operator, transport, and membership boundaries remain source-backed authority surfaces and live GitHub issues/PRs. |
-| `docs/design/vfs-rpc-wire-protocol.md` | Historical input | Retained for service-id and method-id lineage cited by source comments and historical docs. It is not active clustered POSIX, VFS forwarding, or data-plane authority. |
+Issue #1699 later removed the remaining source- or doc-referenced
+Forgejo-era cluster design roots from this family after moving the narrow
+comment lineage into source-owned comments and current authority references.
+Their lineage remains in git, issue #1699, and the pull request only. Current
+transport, membership, operator-authz, clustered-lock boundary, source,
+validation-claim, generated-claim, and live GitHub issue/PR authority remains
+unchanged. This deletion does not promote distributed mode, clustered POSIX,
+RDMA, mmap coherency, metadata redundancy, release readiness, production
+readiness, OpenZFS/Ceph parity, or successor/comparator wording.
