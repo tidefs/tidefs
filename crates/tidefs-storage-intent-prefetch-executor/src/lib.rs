@@ -1878,15 +1878,6 @@ pub fn evaluate_prefetch_execution(input: PrefetchExecutorInput) -> PrefetchExec
         }
     }
 
-    if let Some(refusal) = dispatch_cost_evidence_refusal(input, cost_state) {
-        return terminal(
-            record,
-            PrefetchExecutorOutcome::Refused,
-            PrefetchExecutorByteState::Refused,
-            refusal,
-        );
-    }
-
     if (input.require_known_waf
         || cost_state
             .required
@@ -2000,6 +1991,13 @@ pub fn evaluate_prefetch_execution(input: PrefetchExecutorInput) -> PrefetchExec
                     PrefetchExecutorOutcome::Blocked,
                     PrefetchExecutorByteState::Blocked,
                     runtime_dispatch_evidence_refusal(input, family),
+                )
+            } else if let Some(refusal) = dispatch_cost_evidence_refusal(input, cost_state) {
+                terminal(
+                    record,
+                    PrefetchExecutorOutcome::Refused,
+                    PrefetchExecutorByteState::Refused,
+                    refusal,
                 )
             } else if admitted_speculative_pressure_refusal(input) as u16
                 != StorageIntentRefusalReason::None as u16
@@ -7429,10 +7427,10 @@ mod tests {
             validation_ref: evidence(StorageIntentEvidenceKind::ValidationArtifact, VALIDATION),
             ..PrefetchExecutorResultDetail::default()
         };
-        let started = evaluate_prefetch_execution(admitted_charged_input(
-            PrefetchResidencyCandidateClass::BoundedReadahead,
-            detail,
-        ));
+        let mut input =
+            admitted_charged_input(PrefetchResidencyCandidateClass::BoundedReadahead, detail);
+        add_remote_path_evidence(&mut input);
+        let started = evaluate_prefetch_execution(input);
         assert_eq!(started.outcome, PrefetchExecutorOutcome::Started);
         assert!(!record_runtime_dispatch_needs_transport_or_trust(started));
 
