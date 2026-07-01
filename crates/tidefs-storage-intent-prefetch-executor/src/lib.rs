@@ -1847,14 +1847,13 @@ pub fn evaluate_prefetch_execution(input: PrefetchExecutorInput) -> PrefetchExec
 
     match input.admission.outcome {
         PrefetchExecutorAdmissionOutcome::Admitted => {
-            if !input.admission.scheduler_admission_ref.is_bound()
-                || !snapshot_contains_ref(input, input.admission.scheduler_admission_ref)
-            {
+            let scheduler_refusal = scheduler_admission_refusal(input, family);
+            if scheduler_refusal as u16 != StorageIntentRefusalReason::None as u16 {
                 terminal(
                     record,
                     PrefetchExecutorOutcome::Blocked,
                     PrefetchExecutorByteState::Blocked,
-                    StorageIntentRefusalReason::EvidenceNotUsable,
+                    scheduler_refusal,
                 )
             } else if admitted_scheduler_lane_refusal(input, family) as u16
                 != StorageIntentRefusalReason::None as u16
@@ -1932,38 +1931,49 @@ pub fn evaluate_prefetch_execution(input: PrefetchExecutorInput) -> PrefetchExec
                 }
             }
         }
-        PrefetchExecutorAdmissionOutcome::Dropped => terminal(
+        PrefetchExecutorAdmissionOutcome::Dropped => scheduler_admission_terminal(
+            input,
             record,
             PrefetchExecutorOutcome::Dropped,
             PrefetchExecutorByteState::CacheOnly,
             admission_refusal(input.admission),
         ),
-        PrefetchExecutorAdmissionOutcome::Throttled => terminal(
+        PrefetchExecutorAdmissionOutcome::Throttled => scheduler_admission_terminal(
+            input,
             record,
             PrefetchExecutorOutcome::Throttled,
             PrefetchExecutorByteState::CacheOnly,
             admission_refusal(input.admission),
         ),
-        PrefetchExecutorAdmissionOutcome::Expired => terminal(
+        PrefetchExecutorAdmissionOutcome::Expired => scheduler_admission_terminal(
+            input,
             record,
             PrefetchExecutorOutcome::TimedOut,
             PrefetchExecutorByteState::Unavailable,
             admission_refusal(input.admission),
         ),
-        PrefetchExecutorAdmissionOutcome::Refused => terminal(
+        PrefetchExecutorAdmissionOutcome::Refused => scheduler_admission_terminal(
+            input,
             record,
             PrefetchExecutorOutcome::Refused,
             PrefetchExecutorByteState::Refused,
             admission_refusal(input.admission),
         ),
-        PrefetchExecutorAdmissionOutcome::Blocked => terminal(
+        PrefetchExecutorAdmissionOutcome::Blocked => scheduler_admission_terminal(
+            input,
             record,
             PrefetchExecutorOutcome::Blocked,
             PrefetchExecutorByteState::Blocked,
             admission_refusal(input.admission),
         ),
-        PrefetchExecutorAdmissionOutcome::Unavailable
-        | PrefetchExecutorAdmissionOutcome::Unknown => terminal(
+        PrefetchExecutorAdmissionOutcome::Unavailable => scheduler_admission_terminal(
+            input,
+            record,
+            PrefetchExecutorOutcome::Unavailable,
+            PrefetchExecutorByteState::Unavailable,
+            admission_refusal(input.admission),
+        ),
+        PrefetchExecutorAdmissionOutcome::Unknown => terminal(
             record,
             PrefetchExecutorOutcome::Unavailable,
             PrefetchExecutorByteState::Unavailable,
@@ -2792,6 +2802,26 @@ fn terminal(
     record
 }
 
+fn scheduler_admission_terminal(
+    input: PrefetchExecutorInput,
+    record: PrefetchExecutorRecord,
+    outcome: PrefetchExecutorOutcome,
+    byte_state: PrefetchExecutorByteState,
+    refusal: StorageIntentRefusalReason,
+) -> PrefetchExecutorRecord {
+    let scheduler_refusal = scheduler_admission_refusal(input, record.action_family);
+    if scheduler_refusal as u16 != StorageIntentRefusalReason::None as u16 {
+        terminal(
+            record,
+            PrefetchExecutorOutcome::Blocked,
+            PrefetchExecutorByteState::Blocked,
+            scheduler_refusal,
+        )
+    } else {
+        terminal(record, outcome, byte_state, refusal)
+    }
+}
+
 fn decision_identity_missing(decision: PrefetchResidencyDecisionRecord) -> bool {
     decision.policy_id.is_zero()
         || decision.policy_revision.0 == 0
@@ -3254,6 +3284,25 @@ const fn media_is_ram_or_pmem(media: StorageMediaClass) -> bool {
             | StorageMediaClass::RemoteRam
             | StorageMediaClass::PersistentMemory
     )
+}
+
+fn scheduler_admission_refusal(
+    input: PrefetchExecutorInput,
+    family: PrefetchExecutorActionFamily,
+) -> StorageIntentRefusalReason {
+    if !family.can_start_runtime_dispatch() {
+        return StorageIntentRefusalReason::None;
+    }
+
+    if snapshot_contains_fresh_ref(
+        input,
+        StorageIntentEvidenceKind::SchedulerAdmissionRecord,
+        input.admission.scheduler_admission_ref,
+    ) {
+        StorageIntentRefusalReason::None
+    } else {
+        StorageIntentRefusalReason::EvidenceNotUsable
+    }
 }
 
 fn admitted_scheduler_lane_refusal(
@@ -4660,6 +4709,72 @@ mod tests {
             record.refusal,
             StorageIntentRefusalReason::NoisyNeighborPressure
         );
+    }
+
+    #[test]
+    fn scheduler_terminal_outcomes_require_admission_ref_inside_evidence_cut() {
+        let mut missing_ref = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        missing_ref.admission = missing_ref.admission.with_outcome(
+            PrefetchExecutorAdmissionOutcome::Dropped,
+            StorageIntentRefusalReason::NoisyNeighborPressure,
+        );
+        missing_ref.admission.scheduler_admission_ref = EMPTY_EVIDENCE_REF;
+        let missing_ref_record = evaluate_prefetch_execution(missing_ref);
+        assert_eq!(missing_ref_record.outcome, PrefetchExecutorOutcome::Blocked);
+        assert_eq!(
+            missing_ref_record.executor_byte_state,
+            PrefetchExecutorByteState::Blocked
+        );
+        assert_eq!(
+            missing_ref_record.refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+        assert_record_has_no_authority_claims(missing_ref_record);
+
+        let mut outside_cut = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        outside_cut.admission = outside_cut.admission.with_outcome(
+            PrefetchExecutorAdmissionOutcome::Throttled,
+            StorageIntentRefusalReason::NoisyNeighborPressure,
+        );
+        outside_cut.admission.scheduler_admission_ref = evidence(
+            StorageIntentEvidenceKind::SchedulerAdmissionRecord,
+            OUTSIDE_CUT,
+        );
+        let outside_cut_record = evaluate_prefetch_execution(outside_cut);
+        assert_eq!(outside_cut_record.outcome, PrefetchExecutorOutcome::Blocked);
+        assert_eq!(
+            outside_cut_record.executor_byte_state,
+            PrefetchExecutorByteState::Blocked
+        );
+        assert_eq!(
+            outside_cut_record.refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+        assert_record_has_no_authority_claims(outside_cut_record);
+
+        let mut wrong_kind = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        wrong_kind.admission = wrong_kind.admission.with_outcome(
+            PrefetchExecutorAdmissionOutcome::Expired,
+            StorageIntentRefusalReason::EvidenceNotUsable,
+        );
+        wrong_kind.admission.scheduler_admission_ref =
+            evidence(StorageIntentEvidenceKind::ActionExecutionEvidence, SCHED);
+        wrong_kind
+            .evidence_query_snapshot
+            .included_refs
+            .push(wrong_kind.admission.scheduler_admission_ref)
+            .unwrap();
+        let wrong_kind_record = evaluate_prefetch_execution(wrong_kind);
+        assert_eq!(wrong_kind_record.outcome, PrefetchExecutorOutcome::Blocked);
+        assert_eq!(
+            wrong_kind_record.executor_byte_state,
+            PrefetchExecutorByteState::Blocked
+        );
+        assert_eq!(
+            wrong_kind_record.refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+        assert_record_has_no_authority_claims(wrong_kind_record);
     }
 
     #[test]
