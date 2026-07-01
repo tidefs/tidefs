@@ -532,6 +532,32 @@ impl PrefetchExecutorCostRequirementMask {
     pub const fn is_empty(self) -> bool {
         self.0 == 0
     }
+
+    #[must_use]
+    pub const fn for_action_family(family: PrefetchExecutorActionFamily) -> Self {
+        match family {
+            PrefetchExecutorActionFamily::WanGeoDeltaPrefetch => {
+                Self(Self::WAN_BANDWIDTH.0 | Self::EGRESS.0 | Self::STAGING_CAPACITY.0)
+            }
+            PrefetchExecutorActionFamily::ObjectArchiveRestoreStaging => Self(
+                Self::WAN_BANDWIDTH.0
+                    | Self::EGRESS.0
+                    | Self::OBJECT_ARCHIVE_RESTORE_CALLS.0
+                    | Self::STAGING_CAPACITY.0,
+            ),
+            PrefetchExecutorActionFamily::Unknown
+            | PrefetchExecutorActionFamily::BoundedSequentialReadahead
+            | PrefetchExecutorActionFamily::StridedVectorRangePrefetch
+            | PrefetchExecutorActionFamily::MetadataNamespaceWalkPrefetch
+            | PrefetchExecutorActionFamily::SmallRandomHotsetCacheTrial
+            | PrefetchExecutorActionFamily::ManifestIndexFanout
+            | PrefetchExecutorActionFamily::SnapshotCloneRepeatedRead
+            | PrefetchExecutorActionFamily::DegradedReadReconstruction
+            | PrefetchExecutorActionFamily::ExplicitNoPrefetch
+            | PrefetchExecutorActionFamily::AuthorityChangingHandoff
+            | PrefetchExecutorActionFamily::Unsupported => Self::EMPTY,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
@@ -831,6 +857,12 @@ impl Default for PrefetchExecutorCostState {
 }
 
 impl PrefetchExecutorCostState {
+    #[must_use]
+    pub const fn with_required(mut self, required: PrefetchExecutorCostRequirementMask) -> Self {
+        self.required = required;
+        self
+    }
+
     #[must_use]
     pub fn missing_required_cost(self) -> bool {
         self.missing_required_cost_class(
@@ -1565,6 +1597,12 @@ impl PrefetchExecutorRecord {
 pub fn evaluate_prefetch_execution(input: PrefetchExecutorInput) -> PrefetchExecutorRecord {
     let mut record = base_record(input);
     let family = record.action_family;
+    let cost_state = input
+        .cost_state
+        .with_required(input.cost_state.required.union(
+            PrefetchExecutorCostRequirementMask::for_action_family(family),
+        ));
+    record.cost_state = cost_state;
 
     if decision_identity_missing(input.decision) {
         return terminal(
@@ -1770,9 +1808,9 @@ pub fn evaluate_prefetch_execution(input: PrefetchExecutorInput) -> PrefetchExec
         }
     }
 
-    if input.cost_state.required != PrefetchExecutorCostRequirementMask::EMPTY {
+    if cost_state.required != PrefetchExecutorCostRequirementMask::EMPTY {
         let cost_ref = first_bound(
-            input.cost_state.cost_ref,
+            cost_state.cost_ref,
             input.decision.evidence_refs.cost_wear_ref,
         );
         if !snapshot_contains_fresh_ref(
@@ -1790,11 +1828,10 @@ pub fn evaluate_prefetch_execution(input: PrefetchExecutorInput) -> PrefetchExec
     }
 
     if (input.require_known_waf
-        || input
-            .cost_state
+        || cost_state
             .required
             .contains(PrefetchExecutorCostRequirementMask::FLASH_WRITES))
-        && input.cost_state.unknown_waf
+        && cost_state.unknown_waf
     {
         return terminal(
             record,
@@ -1805,15 +1842,13 @@ pub fn evaluate_prefetch_execution(input: PrefetchExecutorInput) -> PrefetchExec
     }
 
     if (input.require_known_egress_restore_cost
-        || input
-            .cost_state
+        || cost_state
             .required
             .contains(PrefetchExecutorCostRequirementMask::EGRESS)
-        || input
-            .cost_state
+        || cost_state
             .required
             .contains(PrefetchExecutorCostRequirementMask::OBJECT_ARCHIVE_RESTORE_CALLS))
-        && input.cost_state.unknown_egress_or_restore_cost
+        && cost_state.unknown_egress_or_restore_cost
     {
         return terminal(
             record,
@@ -1823,7 +1858,7 @@ pub fn evaluate_prefetch_execution(input: PrefetchExecutorInput) -> PrefetchExec
         );
     }
 
-    if input.cost_state.missing_required_cost() {
+    if cost_state.missing_required_cost() {
         return terminal(
             record,
             PrefetchExecutorOutcome::Refused,
@@ -1832,7 +1867,7 @@ pub fn evaluate_prefetch_execution(input: PrefetchExecutorInput) -> PrefetchExec
         );
     }
 
-    if input.cost_state.over_budget {
+    if cost_state.over_budget {
         return terminal(
             record,
             PrefetchExecutorOutcome::OverBudget,
@@ -3971,6 +4006,16 @@ mod tests {
         recovery_ref
     }
 
+    fn add_remote_path_evidence(input: &mut PrefetchExecutorInput) {
+        input.evidence_query_snapshot =
+            snapshot(Some(StorageIntentEvidenceKind::TransportPathEvidence));
+        add_fresh(
+            &mut input.evidence_query_snapshot,
+            StorageIntentEvidenceKind::TrustDomainEvidence,
+            TRUST,
+        );
+    }
+
     fn assert_record_has_no_authority_claims(record: PrefetchExecutorRecord) {
         assert!(!record.can_publish_replacement_receipt());
         assert!(!record.can_retire_source_receipt());
@@ -5963,15 +6008,126 @@ mod tests {
     }
 
     #[test]
+    fn remote_action_families_derive_required_costs_before_dispatch() {
+        let mut wan = admitted_input(PrefetchResidencyCandidateClass::WanGeoDeltaPrefetch);
+        add_remote_path_evidence(&mut wan);
+        let wan_record = evaluate_prefetch_execution(wan);
+        assert_eq!(wan_record.outcome, PrefetchExecutorOutcome::Started);
+        assert!(wan_record
+            .cost_state
+            .required
+            .contains(PrefetchExecutorCostRequirementMask::WAN_BANDWIDTH));
+        assert!(wan_record
+            .cost_state
+            .required
+            .contains(PrefetchExecutorCostRequirementMask::EGRESS));
+        assert!(wan_record
+            .cost_state
+            .required
+            .contains(PrefetchExecutorCostRequirementMask::STAGING_CAPACITY));
+        assert!(!wan_record
+            .cost_state
+            .required
+            .contains(PrefetchExecutorCostRequirementMask::OBJECT_ARCHIVE_RESTORE_CALLS));
+        assert_record_has_no_authority_claims(wan_record);
+
+        let mut archive =
+            admitted_input(PrefetchResidencyCandidateClass::ObjectArchiveRestoreStage);
+        add_remote_path_evidence(&mut archive);
+        let archive_record = evaluate_prefetch_execution(archive);
+        assert_eq!(archive_record.outcome, PrefetchExecutorOutcome::Started);
+        assert!(archive_record
+            .cost_state
+            .required
+            .contains(PrefetchExecutorCostRequirementMask::WAN_BANDWIDTH));
+        assert!(archive_record
+            .cost_state
+            .required
+            .contains(PrefetchExecutorCostRequirementMask::EGRESS));
+        assert!(archive_record
+            .cost_state
+            .required
+            .contains(PrefetchExecutorCostRequirementMask::OBJECT_ARCHIVE_RESTORE_CALLS));
+        assert!(archive_record
+            .cost_state
+            .required
+            .contains(PrefetchExecutorCostRequirementMask::STAGING_CAPACITY));
+        assert_record_has_no_authority_claims(archive_record);
+    }
+
+    #[test]
+    fn remote_action_families_refuse_missing_derived_cost_classes() {
+        let cases = [
+            (
+                PrefetchResidencyCandidateClass::WanGeoDeltaPrefetch,
+                StorageIntentCostClass::NetworkIngress,
+            ),
+            (
+                PrefetchResidencyCandidateClass::WanGeoDeltaPrefetch,
+                StorageIntentCostClass::NetworkEgress,
+            ),
+            (
+                PrefetchResidencyCandidateClass::WanGeoDeltaPrefetch,
+                StorageIntentCostClass::CapacityMediaClass,
+            ),
+            (
+                PrefetchResidencyCandidateClass::ObjectArchiveRestoreStage,
+                StorageIntentCostClass::RestoreTime,
+            ),
+        ];
+
+        for (candidate, cost_class) in cases {
+            let mut input = admitted_input(candidate);
+            add_remote_path_evidence(&mut input);
+            input.cost_state.required = PrefetchExecutorCostRequirementMask::EMPTY;
+            input.cost_state.snapshot.evidence_state =
+                StorageIntentCostEvidenceState::FRESH.with_missing(cost_class);
+
+            let record = evaluate_prefetch_execution(input);
+            assert_eq!(
+                record.outcome,
+                PrefetchExecutorOutcome::Refused,
+                "{candidate:?} did not refuse missing {cost_class:?}"
+            );
+            assert_eq!(
+                record.refusal,
+                StorageIntentRefusalReason::EvidenceNotUsable,
+                "{candidate:?} reported wrong refusal for missing {cost_class:?}"
+            );
+            assert_record_has_no_authority_claims(record);
+        }
+    }
+
+    #[test]
+    fn remote_action_families_refuse_unknown_egress_without_explicit_mask() {
+        let mut wan = admitted_input(PrefetchResidencyCandidateClass::WanGeoDeltaPrefetch);
+        add_remote_path_evidence(&mut wan);
+        wan.cost_state.unknown_egress_or_restore_cost = true;
+        let wan_record = evaluate_prefetch_execution(wan);
+        assert_eq!(wan_record.outcome, PrefetchExecutorOutcome::Refused);
+        assert_eq!(
+            wan_record.refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+        assert_record_has_no_authority_claims(wan_record);
+
+        let mut archive =
+            admitted_input(PrefetchResidencyCandidateClass::ObjectArchiveRestoreStage);
+        add_remote_path_evidence(&mut archive);
+        archive.cost_state.unknown_egress_or_restore_cost = true;
+        let archive_record = evaluate_prefetch_execution(archive);
+        assert_eq!(archive_record.outcome, PrefetchExecutorOutcome::Refused);
+        assert_eq!(
+            archive_record.refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+        assert_record_has_no_authority_claims(archive_record);
+    }
+
+    #[test]
     fn rdma_absence_is_not_a_correctness_failure() {
         let mut input = admitted_input(PrefetchResidencyCandidateClass::WanGeoDeltaPrefetch);
-        input.evidence_query_snapshot =
-            snapshot(Some(StorageIntentEvidenceKind::TransportPathEvidence));
-        add_fresh(
-            &mut input.evidence_query_snapshot,
-            StorageIntentEvidenceKind::TrustDomainEvidence,
-            TRUST,
-        );
+        add_remote_path_evidence(&mut input);
         input.media_path.rdma_available = false;
         let record = evaluate_prefetch_execution(input);
         assert_eq!(record.outcome, PrefetchExecutorOutcome::Started);
