@@ -449,7 +449,7 @@ impl<T: ShardTransport> ShardDispatcher<T> {
     /// # Arguments
     ///
     /// * `placement_key` — scopes all shards to a single placement operation.
-    /// * `plan` — the placement plan from TideCRUSH.
+    /// * `plan` — the current placement-planner assignment contract.
     /// * `candidates` — available device candidates.
     /// * `shard_data` — data for each shard slice, indexed by shard_index.
     ///

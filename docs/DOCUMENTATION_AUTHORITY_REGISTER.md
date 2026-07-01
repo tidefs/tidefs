@@ -541,8 +541,6 @@ surface beyond adding `docs/CLAIMS_GATE_POLICY.md`, which was already scanned.
 | `docs/SPACE_ACCOUNTING_MODEL_DESIGN.md` | Historical input | Imported design-spec for logical vs physical space accounting. References Forgejo issue #1215. Claims registry has no validated space-accounting claim. |
 | `docs/POOL_IMPORT_EXPORT_DEVICE_TOPOLOGY_DESIGN.md` | Current spec | Scoped source-backed summary for the current pool-label, pool-scan/import, local import/export, and device-manager code paths. It is not product-readiness evidence for hot spares, evacuation, cluster ownership, online topology conversion, hardware-failure survival, availability, operational safety, or incumbent-comparison claims. |
 | `docs/MEMBERSHIP_SERVICE_DESIGN.md` | Historical input | Imported design-spec for cluster membership service. References Forgejo issue #1209. ZFS/Ceph comparison text is design input only and is not a cluster-membership, distributed-availability, scale, performance, or successor claim. Claims registry has no validated cluster-membership claim. |
-| `docs/ERASURE_CODING_PLACEMENT_DESIGN.md` | Historical input | Imported design-spec superseded by the G4 pillar at `docs/design/production-erasure-coding-crush-placement-g4-pillar.md`. References Forgejo issue #1249. |
-| `docs/design/production-erasure-coding-crush-placement-g4-pillar.md` | Historical input | Imported G4 pillar design-spec for TideCRUSH deterministic placement. References Forgejo issue #1779. Supersedes earlier erasure-coding placement designs. |
 | `docs/design/compression-design-strategy.md` | Historical input | Imported design-spec for compression format extension model. References Forgejo issue #1245. Transform authority blocks mounted compression claims. |
 
 ### Remaining Imported Design Surface (TFR-019 / #512)
@@ -846,3 +844,17 @@ validation-claim, generated-claim, and live GitHub issue/PR authority remains
 unchanged. This deletion does not promote distributed mode, clustered POSIX,
 RDMA, mmap coherency, metadata redundancy, release readiness, production
 readiness, OpenZFS/Ceph parity, or successor/comparator wording.
+
+### Erasure Placement Historical Root Deletion (TFR-019 / #1702)
+
+Issue #1702 deleted the imported erasure-placement design roots after replacing
+the remaining live references with current pool-wide placement, placement
+receipt, and source-backed EC-store authority references. Their lineage remains
+in git, issue #1702, and its pull request only. Current authority remains with
+`docs/POOL_WIDE_REDUNDANCY_PLACEMENT_CONTRACT.md`,
+`docs/LOCAL_DISTRIBUTED_RECEIPT_AUTHORITY.md`,
+`docs/ERASURE_CODED_STORE_AUTHORITY.md`, source behavior, validation claims,
+and live GitHub issues/PRs. This deletion does not promote production
+erasure-coding placement, recovery-loop completion, rebalance performance,
+distributed availability, release readiness, OpenZFS/Ceph parity, or
+successor/comparator wording.
