@@ -15,8 +15,8 @@
 //! is remote, proxied, or cluster-routed.
 //!
 //! When TideFS gains full multi-node cluster operation with remote operator
-//! access, these operations will be gated through the P9-02 authorization
-//! pipeline ([`crate::authorization`]), requiring a validated
+//! access, these operations will be gated through the source-owned
+//! authorization pipeline ([`crate::authorization`]), requiring a validated
 //! [`crate::principal::Principal`], session grant, capability check, and
 //! audit record. Until that cluster-routing path is product-grade, the
 //! local-only guard prevents ambiguous operation in a

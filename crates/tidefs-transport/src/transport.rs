@@ -1235,7 +1235,7 @@ impl Transport {
         }
 
         // ------------------------------------------------------------------
-        // Mutual attestation handshake (P9-02)
+        // Mutual attestation handshake.
         // ------------------------------------------------------------------
         if requires_attestation {
             let attestation_key = self.attestation_key.as_ref().ok_or_else(|| {

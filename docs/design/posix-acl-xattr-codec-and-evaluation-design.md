@@ -978,5 +978,5 @@ there is no fallback format to use.
 | Historical P2 ACL codec design | Earlier version of this spec; superseded by this document |
 | `CHECKSUM_ARCHITECTURE_DESIGN.md` | Checksum scheme used by xattr B+tree pages (not ACL-specific) |
 | `DATASET_FEATURE_FLAGS_DESIGN.md` | Defines `org.tidefs:posix_acl` feature flag |
-| `AUTHN_AUTHZ_OVERRIDE_AUDIT_MODEL_P9-02.md` | Security model; ACL evaluation fits into the access() check |
+| `crates/tidefs-auth/` and `docs/security/operator-authz-boundary.md` | Source-owned security model and current local-only operator boundary; ACL evaluation fits into the access() check |
 | `apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_vfs_adapter.rs` | Source-scoped FUSE dispatch evidence for getxattr, setxattr, removexattr, listxattr, access, create, and mkdir |

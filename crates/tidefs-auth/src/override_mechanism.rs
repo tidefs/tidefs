@@ -12,7 +12,7 @@ use crate::records::{
 };
 
 // ---------------------------------------------------------------------------
-// OverrideClass — P9-02 §6.1
+// OverrideClass.
 // Six typed override classes.
 // ---------------------------------------------------------------------------
 
@@ -46,7 +46,7 @@ impl std::fmt::Display for OverrideClass {
 }
 
 // ---------------------------------------------------------------------------
-// OverrideTicket — P9-02 §6.1
+// OverrideTicket.
 // Typed override ticket supporting dual-control authorization.
 // ---------------------------------------------------------------------------
 
@@ -147,13 +147,13 @@ impl OverrideTicket {
 }
 
 // ---------------------------------------------------------------------------
-// Override algorithms — P9-02 §6
+// Override algorithms.
 // ---------------------------------------------------------------------------
 
 /// Determine whether an override is required for the given request,
 /// or whether the principal already has sufficient authority.
 ///
-/// P9-02 §6 — returns Ok(None) if no override is needed,
+/// Returns Ok(None) if no override is needed,
 /// Ok(Some(class)) if an override of the given class is required,
 /// or Err if the request is impossible even with override.
 pub fn determine_override_requirement_or_sufficiency(
@@ -206,7 +206,7 @@ pub fn determine_override_requirement_or_sufficiency(
 
 /// Issue a typed override ticket, optionally under dual control.
 ///
-/// P9-02 §6.3
+/// Override ticket issuance.
 #[allow(clippy::too_many_arguments)]
 pub fn issue_typed_override_ticket_under_dual_control(
     ticket_id: OverrideTicketId,
@@ -249,7 +249,7 @@ pub fn issue_typed_override_ticket_under_dual_control(
 
 /// Consume an override ticket and bind it to an action.
 ///
-/// P9-02 §6.3 — validates the ticket, records the use, and produces
+/// Validates the ticket, records the use, and produces
 /// a consumption record linked to the authorization decision and audit event.
 pub fn consume_override_ticket_and_bind_it_to_action(
     ticket: &mut OverrideTicket,

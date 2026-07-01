@@ -4366,10 +4366,11 @@ This document composes existing authority surfaces:
 - `docs/OPERATOR_UAPI_AUTHORITY.md`,
   `docs/PREVIEW_UAPI_ABI_BOUNDARY_OW202.md`,
   `docs/OPERATOR_PRODUCT_SURFACE_DECISION.md`, and
-  `docs/UPGRADE_FAILOVER_CUTOVER_OPERATOR_RUNBOOKS_P9-03.md`: policy publish,
-  dataset/property mutation visibility, dry-run, stage, commit, verify, and
-  rollback grammar are inputs to #855/#901/#926; storage intent consumes their
-  refs instead of inventing a second operator runbook engine.
+  `docs/security/operator-authz-boundary.md`: policy publish,
+  dataset/property mutation visibility, local-only admission, dry-run, stage,
+  commit, verify, and rollback boundaries are inputs to #855/#901/#926; storage
+  intent consumes their refs instead of inventing a second operator execution
+  engine.
 - `crates/tidefs-validation/src/performance_gate/`: performance truth requires
   workload envelopes, service-objective contracts, KPIs, budgets, and receipts.
 - `crates/tidefs-local-object-store/src/fault_catalog.rs` and

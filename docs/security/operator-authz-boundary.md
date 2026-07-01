@@ -17,7 +17,7 @@ pool lock directories, and encryption secret handles. These operations refuse
 to execute in a remote, proxied, or cluster-routed context.
 
 When TideFS gains full multi-node cluster operation with remote operator
-access, privileged actions will be gated through the P9-02 authorization
+access, privileged actions will be gated through the source-owned authorization
 pipeline (Principal, RoleBinding, AuthorizationRequest, AuthorizationDecision,
 AuditLog). Until that path is product-grade, the local-only guard prevents
 ambiguous operation.
@@ -131,7 +131,7 @@ reachable live-owner or validation artifact source is actually consulted.
 
 `mount` remains explicitly standalone/local: it constructs only standalone
 daemon mount authority and cannot assert cluster admission. `pool mount
---cluster` is separate from P9-02 remote operator authorization; it is admitted
+--cluster` is separate from remote operator authorization; it is admitted
 only after clustered pool labels are validated, the pool GUID is read from the
 labels, a non-empty `PoolLeaseToken` is acquired from the storage-node, and the
 daemon receives one typed cluster lease authority. The daemon rejects missing,
@@ -159,10 +159,10 @@ let _guard = LocalOnlyGuard::new("pool create")
 When either check fails, the guard returns `LocalOnlyError`, blocking the
 privileged operation.
 
-## P9-02 Authorization Pipeline (Future)
+## Source-Owned Authorization Pipeline (Future)
 
 When cluster-routed operator access is product-grade, the current
-`LocalOnlyGuard` will be replaced by the full P9-02 pipeline:
+`LocalOnlyGuard` will be replaced by the full `tidefs-auth` pipeline:
 
 1. **Principal resolution** — `resolve_principal_from_presented_credential_chain()`
    maps the caller's credentials to a `Principal` with class, roles, and
@@ -200,13 +200,13 @@ to any CLI/API privileged action paths. Wiring it requires:
 - **A17** (Security/Auth/Encryption Design): advanced — this document and
   `LocalOnlyGuard` wire the operator authz boundary to an explicit, checkable
   call-site token instead of leaving auth/authz claims as record types alone.
-  The remaining authz wiring (P9-02 pipeline to privileged handlers) is a
+  The remaining authz wiring (source-owned authorization pipeline to privileged handlers) is a
   deferred continuation gated on cluster operator path completion.
 - **A20** (tidefsctl Operator Surface): advanced — `tidefsctl` now has an
   explicit local-only admission table for privileged public operator
   mutations and data-movement paths. This does not claim remote cluster
   operator authorization; it keeps the current live-owner routing model in
-  place until the P9-02 path is product-grade.
+  place until the remote authorization path is product-grade.
 
 ## Implementation Status (2026-06-13)
 
@@ -246,6 +246,6 @@ to any CLI/API privileged action paths. Wiring it requires:
 - Keep new `tidefsctl` public operator commands wired through
   `apps/tidefsctl/src/commands/authz.rs` so every command has an explicit
   guarded or unguarded admission decision.
-- Replace the local-only guard with the full P9-02 authorization pipeline only
+- Replace the local-only guard with the full source-owned authorization pipeline only
   after the cluster operator path has product-grade principal, session,
   transport, admin peer, authorization, and audit behavior.

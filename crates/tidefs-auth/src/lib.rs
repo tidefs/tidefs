@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 #![forbid(unsafe_code)]
 
-//! P9-02 authentication/authorization/audit model for TideFS.
+//! Authentication/authorization/audit model for TideFS.
 //!
 //! This crate implements:
 //! - [NodeIdentity]: Ed25519-based node identity with self-signing and key rotation

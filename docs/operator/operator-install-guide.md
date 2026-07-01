@@ -651,4 +651,4 @@ state.
 - [FUSE Mount](../FUSE_MOUNT.md) — FUSE adapter details
 - [Review TODO Register](../REVIEW_TODO_REGISTER.md) — current capability blockers
 - [Cutover and Rollback Playbook](../release/cutover-fallback-rollback-playbook.md) — kernel-mode transitions
-- [Upgrade Failover Cutover Runbooks](../UPGRADE_FAILOVER_CUTOVER_OPERATOR_RUNBOOKS_P9-03.md) — design-level operator law
+- [Operator Authz Boundary](../security/operator-authz-boundary.md) — current local-only operator security boundary

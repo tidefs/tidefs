@@ -248,7 +248,7 @@ pub fn evaluate_authorization(
 
 // ---------------------------------------------------------------------------
 // Algorithm: evaluate_role_bindings_for_action_scope_and_visibility
-// P9-02 §5.3 step 2
+// Role-binding evaluation.
 // ---------------------------------------------------------------------------
 
 /// Evaluate whether the principal's role bindings cover the requested
@@ -295,7 +295,7 @@ pub fn scope_covers(parent: &ScopeSelector, target: &ScopeSelector) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Algorithm: derive_capability_grant_or_denial_from_policy — P9-02 §5.3 step 3
+// Algorithm: derive_capability_grant_or_denial_from_policy.
 // ---------------------------------------------------------------------------
 
 /// Derive a capability decision from policy.
@@ -317,7 +317,7 @@ pub fn derive_capability_grant_or_denial_from_policy(
 }
 
 // ---------------------------------------------------------------------------
-// Algorithm: derive_authorization_decision_for_request — P9-02 §5.3 step 5
+// Algorithm: derive_authorization_decision_for_request.
 // ---------------------------------------------------------------------------
 
 /// Full authorization decision pipeline.
