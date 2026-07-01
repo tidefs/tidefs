@@ -26,10 +26,10 @@ alloc = [
 poison-gating = ["alloc"]
 
 [dependencies]
-tidefs-types-dataset-lifecycle-core = { workspace = true, default-features = false }
-tidefs-gc-pin-set = { workspace = true, default-features = false }
-tidefs-incremental-job-core = { workspace = true, default-features = false }
-tidefs-types-incremental-job-core = { workspace = true, default-features = false }
+tidefs-types-dataset-lifecycle-core = { workspace = true }
+tidefs-gc-pin-set = { workspace = true }
+tidefs-incremental-job-core = { workspace = true }
+tidefs-types-incremental-job-core = { workspace = true }
 tidefs-types-reclaim-queue-core = { workspace = true }
 tidefs-dataset-catalog = { workspace = true }
 tidefs-derived-catalog = { workspace = true }

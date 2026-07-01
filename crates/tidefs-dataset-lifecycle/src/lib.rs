@@ -207,6 +207,41 @@ pub struct DatasetLifecycleStats {
     pub destroy_progress_ppm: u64,
 }
 
+/// Same-dataset lifecycle mutation that blocks scheduled snapshot pruning.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SnapshotPruneLifecycleMutationConflict {
+    /// A snapshot capture has frozen the dataset's mutation boundary.
+    FrozenSnapshotCapture,
+    /// A dataset destroy job is still in progress.
+    DestroyJob,
+}
+
+/// Lifecycle-side admission evidence for future scheduled snapshot pruning.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SnapshotPruneLifecycleAdmission {
+    /// Current lifecycle state.
+    pub state: DatasetStateV1,
+    /// Current poison state.
+    pub poison: PoisonState,
+    /// Whether the dataset was frozen at admission time.
+    pub frozen: bool,
+    /// Whether a destroy job was in progress at admission time.
+    pub destroy_job_in_progress: bool,
+}
+
+/// Fail-closed lifecycle refusal reason for snapshot-prune admission.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SnapshotPruneLifecycleRefusalReason {
+    /// The lifecycle state is not active.
+    LifecycleFenced { state: DatasetStateV1 },
+    /// The dataset is poisoned or mount-dead.
+    Poisoned { poison: PoisonState },
+    /// A same-dataset mutation is already in progress.
+    SameDatasetMutationConflict {
+        mutation: SnapshotPruneLifecycleMutationConflict,
+    },
+}
+
 // ---------------------------------------------------------------------------
 // PinnedRoot — handle returned by pin_root_for_service
 // ---------------------------------------------------------------------------
@@ -959,7 +994,7 @@ impl DatasetLifecycle {
     pub fn stats(&self) -> DatasetLifecycleStats {
         let mut per_root_pins = [0u32; 7];
         for root in self.gc_pin_set.pinned_roots() {
-            let idx = root.root_type.to_u8() as usize;
+            let idx = usize::from(root.root_type.to_u8());
             if idx < 7 {
                 per_root_pins[idx] = self.gc_pin_set.pin_count_by_type(root.root_type);
             }
@@ -973,6 +1008,49 @@ impl DatasetLifecycle {
             destroy_in_progress: self.state == DatasetStateV1::Destroying,
             destroy_progress_ppm: self.destroy_progress_ppm(),
         }
+    }
+
+    /// Admit lifecycle state for future scheduled snapshot pruning.
+    ///
+    /// This query only reports whether snapshot mutation is safe to consider
+    /// at the dataset lifecycle boundary. It does not schedule work or mutate
+    /// snapshot state.
+    pub fn snapshot_prune_lifecycle_admission(
+        &self,
+    ) -> Result<SnapshotPruneLifecycleAdmission, SnapshotPruneLifecycleRefusalReason> {
+        if self.state != DatasetStateV1::Active {
+            return Err(SnapshotPruneLifecycleRefusalReason::LifecycleFenced { state: self.state });
+        }
+        if !self.poison.is_healthy() {
+            return Err(SnapshotPruneLifecycleRefusalReason::Poisoned {
+                poison: self.poison,
+            });
+        }
+        if self.frozen {
+            return Err(
+                SnapshotPruneLifecycleRefusalReason::SameDatasetMutationConflict {
+                    mutation: SnapshotPruneLifecycleMutationConflict::FrozenSnapshotCapture,
+                },
+            );
+        }
+        let destroy_job_in_progress = self
+            .destroy_job
+            .as_ref()
+            .is_some_and(|job| !job.is_completed());
+        if destroy_job_in_progress {
+            return Err(
+                SnapshotPruneLifecycleRefusalReason::SameDatasetMutationConflict {
+                    mutation: SnapshotPruneLifecycleMutationConflict::DestroyJob,
+                },
+            );
+        }
+
+        Ok(SnapshotPruneLifecycleAdmission {
+            state: self.state,
+            poison: self.poison,
+            frozen: self.frozen,
+            destroy_job_in_progress,
+        })
     }
 
     /// Whether the dataset is mountable.
@@ -1306,7 +1384,7 @@ pub mod notification {
         #[must_use]
         pub fn new() -> Self {
             PoisonNotification {
-                state: Arc::new(AtomicU8::new(PoisonState::MountOk as u8)),
+                state: Arc::new(AtomicU8::new(PoisonState::MountOk.to_u8())),
                 reason: Arc::new(AtomicU8::new(0)), // PoisonReason::None
             }
         }
@@ -1314,7 +1392,7 @@ pub mod notification {
         #[must_use]
         pub fn with_state(initial: PoisonState) -> Self {
             PoisonNotification {
-                state: Arc::new(AtomicU8::new(initial as u8)),
+                state: Arc::new(AtomicU8::new(initial.to_u8())),
                 reason: Arc::new(AtomicU8::new(0)), // PoisonReason::None
             }
         }
@@ -1322,8 +1400,8 @@ pub mod notification {
         #[must_use]
         pub fn with_state_and_reason(initial: PoisonState, reason: PoisonReason) -> Self {
             PoisonNotification {
-                state: Arc::new(AtomicU8::new(initial as u8)),
-                reason: Arc::new(AtomicU8::new(reason as u8)),
+                state: Arc::new(AtomicU8::new(initial.to_u8())),
+                reason: Arc::new(AtomicU8::new(reason.to_u8())),
             }
         }
 
@@ -1346,7 +1424,12 @@ pub mod notification {
                 };
                 if self
                     .state
-                    .compare_exchange(current_raw, next as u8, Ordering::AcqRel, Ordering::Acquire)
+                    .compare_exchange(
+                        current_raw,
+                        next.to_u8(),
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
                     .is_ok()
                 {
                     return next;
@@ -1355,7 +1438,7 @@ pub mod notification {
         }
 
         pub fn set(&self, target: PoisonState) -> PoisonState {
-            let old_raw = self.state.swap(target as u8, Ordering::AcqRel);
+            let old_raw = self.state.swap(target.to_u8(), Ordering::AcqRel);
             PoisonState::from_u8(old_raw)
         }
 
@@ -1368,7 +1451,7 @@ pub mod notification {
 
         /// Set the poison reason. Returns the previous reason.
         pub fn set_reason(&self, target: PoisonReason) -> PoisonReason {
-            let old_raw = self.reason.swap(target as u8, Ordering::AcqRel);
+            let old_raw = self.reason.swap(target.to_u8(), Ordering::AcqRel);
             PoisonReason::from_u8(old_raw)
         }
 
@@ -2085,6 +2168,63 @@ mod tests {
         let lc = DatasetLifecycle::new();
         assert!(lc.is_mountable());
         assert!(lc.accepts_writes());
+    }
+
+    #[test]
+    fn snapshot_prune_lifecycle_admits_active_healthy_dataset() {
+        let lc = DatasetLifecycle::new();
+
+        let admitted = lc.snapshot_prune_lifecycle_admission().unwrap();
+
+        assert_eq!(admitted.state, DatasetStateV1::Active);
+        assert_eq!(admitted.poison, PoisonState::MountOk);
+        assert!(!admitted.frozen);
+        assert!(!admitted.destroy_job_in_progress);
+    }
+
+    #[test]
+    fn snapshot_prune_lifecycle_refuses_destroying_dataset() {
+        let mut lc = DatasetLifecycle::new();
+        lc.transition_to_destroying(DestroyFlags::NONE, &[])
+            .unwrap();
+
+        let err = lc.snapshot_prune_lifecycle_admission().unwrap_err();
+
+        assert_eq!(
+            err,
+            SnapshotPruneLifecycleRefusalReason::LifecycleFenced {
+                state: DatasetStateV1::Destroying
+            }
+        );
+    }
+
+    #[test]
+    fn snapshot_prune_lifecycle_refuses_poisoned_dataset() {
+        let lc = DatasetLifecycle::from_parts(DatasetStateV1::Active, PoisonState::PoisonActive);
+
+        let err = lc.snapshot_prune_lifecycle_admission().unwrap_err();
+
+        assert_eq!(
+            err,
+            SnapshotPruneLifecycleRefusalReason::Poisoned {
+                poison: PoisonState::PoisonActive
+            }
+        );
+    }
+
+    #[test]
+    fn snapshot_prune_lifecycle_refuses_frozen_mutation_conflict() {
+        let mut lc = DatasetLifecycle::new();
+        lc.freeze().unwrap();
+
+        let err = lc.snapshot_prune_lifecycle_admission().unwrap_err();
+
+        assert_eq!(
+            err,
+            SnapshotPruneLifecycleRefusalReason::SameDatasetMutationConflict {
+                mutation: SnapshotPruneLifecycleMutationConflict::FrozenSnapshotCapture
+            }
+        );
     }
 
     // ── validate_transition ───────────────────────────────────────
@@ -3039,7 +3179,7 @@ mod tests {
         assert_eq!(stats.active_pins, 1);
         assert_eq!(stats.distinct_pinned_roots, 1);
         assert_eq!(
-            stats.per_root_pins[TraversalRootType::InodeTable as u8 as usize],
+            stats.per_root_pins[usize::from(TraversalRootType::InodeTable.to_u8())],
             1
         );
         assert!(!stats.destroy_in_progress);
@@ -3065,11 +3205,11 @@ mod tests {
         assert_eq!(stats.active_pins, 3);
         assert_eq!(stats.distinct_pinned_roots, 2);
         assert_eq!(
-            stats.per_root_pins[TraversalRootType::InodeTable as u8 as usize],
+            stats.per_root_pins[usize::from(TraversalRootType::InodeTable.to_u8())],
             2
         );
         assert_eq!(
-            stats.per_root_pins[TraversalRootType::ExtentMap as u8 as usize],
+            stats.per_root_pins[usize::from(TraversalRootType::ExtentMap.to_u8())],
             1
         );
     }
@@ -3624,7 +3764,7 @@ mod tests {
         for i in 0..6u8 {
             let root = TraversalRoot::new(
                 TraversalRootType::from_u8(i + 1).unwrap(),
-                BlockPointer(i as u64 + 1),
+                BlockPointer(u64::from(i) + 1),
                 1,
             );
             let _ = lc.pin_root_for_service(root, BackgroundService::Scrub);
