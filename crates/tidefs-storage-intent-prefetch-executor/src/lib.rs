@@ -1989,6 +1989,7 @@ pub fn finalize_prefetch_execution(
 
     if terminal_update_refs_outside_evidence_cut(record, update)
         || terminal_result_detail_lacks_feedback_evidence(record, update)
+        || terminal_update_lacks_completion_result_evidence(update)
         || terminal_result_detail_exceeds_started_action(record, update.result_detail)
         || terminal_update_has_contradictory_refusal(update)
         || terminal_update_lacks_result_refusal_evidence(record, update)
@@ -2207,6 +2208,13 @@ fn terminal_result_detail_lacks_feedback_evidence(
 ) -> bool {
     update.result_detail.has_feedback_payback_inputs()
         && !terminal_result_detail_has_cut_feedback_roots(record, update)
+}
+
+fn terminal_update_lacks_completion_result_evidence(
+    update: PrefetchExecutorTerminalUpdate,
+) -> bool {
+    update.outcome == PrefetchExecutorOutcome::Completed
+        && !update.result_detail.has_feedback_payback_inputs()
 }
 
 fn terminal_result_detail_exceeds_started_action(
@@ -5648,6 +5656,39 @@ mod tests {
     }
 
     #[test]
+    fn terminal_update_rejects_unmeasured_completion() {
+        let started = evaluate_prefetch_execution(admitted_input(
+            PrefetchResidencyCandidateClass::BoundedReadahead,
+        ));
+        assert_eq!(started.outcome, PrefetchExecutorOutcome::Started);
+
+        let empty_detail = PrefetchExecutorResultDetail::default();
+        let rejected = finalize_prefetch_execution(
+            started,
+            PrefetchExecutorTerminalUpdate {
+                outcome: PrefetchExecutorOutcome::Completed,
+                result_detail: empty_detail,
+                evidence_cut: terminal_evidence_cut(started, empty_detail, EMPTY_EVIDENCE_REF),
+                ..PrefetchExecutorTerminalUpdate::default()
+            },
+        );
+
+        assert_eq!(
+            rejected.outcome,
+            PrefetchExecutorOutcome::VerificationFailed
+        );
+        assert_eq!(
+            rejected.refusal,
+            StorageIntentRefusalReason::ValidationGateFailed
+        );
+        assert_eq!(
+            rejected.executor_byte_state,
+            PrefetchExecutorByteState::Refused
+        );
+        assert_record_has_no_authority_claims(rejected);
+    }
+
+    #[test]
     fn terminal_update_requires_started_dispatch_refs_inside_terminal_cut() {
         let detail = terminal_detail();
         let started = evaluate_prefetch_execution(admitted_charged_input(
@@ -5696,7 +5737,9 @@ mod tests {
 
     #[test]
     fn terminal_update_requires_runtime_support_ref_inside_terminal_cut() {
-        let mut input = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        let detail = terminal_detail();
+        let mut input =
+            admitted_charged_input(PrefetchResidencyCandidateClass::BoundedReadahead, detail);
         let runtime_support_ref = evidence(
             StorageIntentEvidenceKind::ActionExecutionEvidence,
             RUNTIME_SUPPORT,
@@ -5727,10 +5770,14 @@ mod tests {
             started,
             started.evidence_refs.runtime_support_ref,
         );
+        push_terminal_ref(&mut missing_runtime_refs, detail.attribution_ref);
+        push_terminal_ref(&mut missing_runtime_refs, detail.retention_ref);
+        push_terminal_ref(&mut missing_runtime_refs, detail.validation_ref);
         let rejected = finalize_prefetch_execution(
             started,
             PrefetchExecutorTerminalUpdate {
                 outcome: PrefetchExecutorOutcome::Completed,
+                result_detail: detail,
                 evidence_cut: PrefetchExecutorTerminalEvidenceCut {
                     evidence_query_snapshot_ref: started.evidence_refs.evidence_query_snapshot_ref,
                     included_refs: missing_runtime_refs,
@@ -5752,11 +5799,8 @@ mod tests {
             started,
             PrefetchExecutorTerminalUpdate {
                 outcome: PrefetchExecutorOutcome::Completed,
-                evidence_cut: terminal_evidence_cut(
-                    started,
-                    PrefetchExecutorResultDetail::default(),
-                    EMPTY_EVIDENCE_REF,
-                ),
+                result_detail: detail,
+                evidence_cut: terminal_evidence_cut(started, detail, EMPTY_EVIDENCE_REF),
                 ..PrefetchExecutorTerminalUpdate::default()
             },
         );
@@ -5766,7 +5810,9 @@ mod tests {
 
     #[test]
     fn terminal_update_requires_remote_transport_and_trust_start_refs() {
-        let mut input = admitted_input(PrefetchResidencyCandidateClass::WanGeoDeltaPrefetch);
+        let detail = terminal_detail();
+        let mut input =
+            admitted_charged_input(PrefetchResidencyCandidateClass::WanGeoDeltaPrefetch, detail);
         input.evidence_query_snapshot =
             snapshot(Some(StorageIntentEvidenceKind::TransportPathEvidence));
         add_fresh(
@@ -5784,10 +5830,14 @@ mod tests {
             started,
             started.evidence_refs.trust_domain_ref,
         );
+        push_terminal_ref(&mut missing_trust_refs, detail.attribution_ref);
+        push_terminal_ref(&mut missing_trust_refs, detail.retention_ref);
+        push_terminal_ref(&mut missing_trust_refs, detail.validation_ref);
         let rejected = finalize_prefetch_execution(
             started,
             PrefetchExecutorTerminalUpdate {
                 outcome: PrefetchExecutorOutcome::Completed,
+                result_detail: detail,
                 evidence_cut: PrefetchExecutorTerminalEvidenceCut {
                     evidence_query_snapshot_ref: started.evidence_refs.evidence_query_snapshot_ref,
                     included_refs: missing_trust_refs,
@@ -5809,11 +5859,8 @@ mod tests {
             started,
             PrefetchExecutorTerminalUpdate {
                 outcome: PrefetchExecutorOutcome::Completed,
-                evidence_cut: terminal_evidence_cut(
-                    started,
-                    PrefetchExecutorResultDetail::default(),
-                    EMPTY_EVIDENCE_REF,
-                ),
+                result_detail: detail,
+                evidence_cut: terminal_evidence_cut(started, detail, EMPTY_EVIDENCE_REF),
                 ..PrefetchExecutorTerminalUpdate::default()
             },
         );
@@ -5823,11 +5870,13 @@ mod tests {
 
     #[test]
     fn terminal_update_requires_recovery_escalation_ref_inside_terminal_cut() {
+        let detail = terminal_detail();
         let recovery_ref = evidence(
             StorageIntentEvidenceKind::RecoveryDegradationEvidence,
             RECOVERY,
         );
-        let mut input = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        let mut input =
+            admitted_charged_input(PrefetchResidencyCandidateClass::BoundedReadahead, detail);
         input.admission.pressure = PrefetchExecutorPressureMask::REPAIR;
         input.admission = input
             .admission
@@ -5851,10 +5900,14 @@ mod tests {
             started,
             started.evidence_refs.recovery_degradation_ref,
         );
+        push_terminal_ref(&mut missing_recovery_refs, detail.attribution_ref);
+        push_terminal_ref(&mut missing_recovery_refs, detail.retention_ref);
+        push_terminal_ref(&mut missing_recovery_refs, detail.validation_ref);
         let rejected = finalize_prefetch_execution(
             started,
             PrefetchExecutorTerminalUpdate {
                 outcome: PrefetchExecutorOutcome::Completed,
+                result_detail: detail,
                 evidence_cut: PrefetchExecutorTerminalEvidenceCut {
                     evidence_query_snapshot_ref: started.evidence_refs.evidence_query_snapshot_ref,
                     included_refs: missing_recovery_refs,
@@ -5876,11 +5929,8 @@ mod tests {
             started,
             PrefetchExecutorTerminalUpdate {
                 outcome: PrefetchExecutorOutcome::Completed,
-                evidence_cut: terminal_evidence_cut(
-                    started,
-                    PrefetchExecutorResultDetail::default(),
-                    EMPTY_EVIDENCE_REF,
-                ),
+                result_detail: detail,
+                evidence_cut: terminal_evidence_cut(started, detail, EMPTY_EVIDENCE_REF),
                 ..PrefetchExecutorTerminalUpdate::default()
             },
         );
