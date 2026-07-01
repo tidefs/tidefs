@@ -22,8 +22,8 @@ reclaim, checksum-tree, extent-map, or object-store runtime behavior.
 - `crates/tidefs-reclaim/` and `crates/tidefs-reclaim-queue-core/`: reclaim
   queue, liveness accounting, dead-object handoff, and existing reclaim policy
   surfaces.
-- `docs/REFCOUNT_DELTA_CLEANUP_QUEUES_DESIGN.md`: reclaim queue and deadlist
-  handoff model.
+- `docs/SNAPSHOT_CLONE_DEADLIST_AUTHORITY.md`: implementation-gated
+  snapshot/clone/deadlist boundary.
 - `docs/SPACEMAP_ALLOCATOR_DESIGN.md`: allocator, space-pressure, and
   commit-group integration model.
 - `docs/workspace-package-classification.md`: `tidefs-compaction` and
