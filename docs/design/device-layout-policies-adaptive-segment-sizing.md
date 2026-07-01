@@ -535,7 +535,6 @@ evidence.
 - [#1238] Unified on-media format lifecycle (meta)
 - [#1220] On-media record format strategy
 - `docs/CANONICAL_BINARY_ENCODE_DECODE_ENDIAN_CHECKSUM_LAW_P2-03.md`
-- `docs/DEVICE_LAYOUT_POLICIES_DESIGN.md` (original #1193 design)
 - `crates/tidefs-local-object-store/src/constants.rs`
 - `crates/tidefs-local-object-store/src/store.rs` (segment rotation)
 - `crates/tidefs-local-object-store/src/device.rs` (DeviceImpl trait)

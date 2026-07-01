@@ -2,7 +2,6 @@
 //! Device layout policies: adaptive segment sizing and device-class-aware write allocation.
 //!
 //! This module implements the device-class-aware policies described in
-//! `docs/DEVICE_LAYOUT_POLICIES_DESIGN.md` (#1193) and its refined spec in
 //! `docs/design/device-layout-policies-adaptive-segment-sizing.md` (#1596).
 //!
 //! # Concepts
