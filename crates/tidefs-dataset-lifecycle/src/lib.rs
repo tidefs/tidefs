@@ -1015,7 +1015,6 @@ impl DatasetLifecycle {
     /// This query only reports whether snapshot mutation is safe to consider
     /// at the dataset lifecycle boundary. It does not schedule work or mutate
     /// snapshot state.
-    #[must_use]
     pub fn snapshot_prune_lifecycle_admission(
         &self,
     ) -> Result<SnapshotPruneLifecycleAdmission, SnapshotPruneLifecycleRefusalReason> {
