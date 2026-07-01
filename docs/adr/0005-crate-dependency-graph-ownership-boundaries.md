@@ -64,6 +64,8 @@ execution), or `daemon` (binary).
 
 Design spec: `docs/design/crate-dependency-graph-ownership-boundaries.md`
 Related:
-  `docs/design/11-layer-architecture-dependency-matrix.md`
-  (historical input only; not current scheduling or architecture authority)
   `crates/README.md`
+
+The former 11-layer DESIGN issue matrix was deleted as stale historical
+coordination material; git history and GitHub issue/PR lineage retain the
+path for archaeological review.

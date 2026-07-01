@@ -36,10 +36,11 @@ design input for the consolidation work tracked in
 [`docs/crates/types-core-consolidation-plan.md`](../crates/types-core-consolidation-plan.md).
 Do not cite its tables or dependency edges as current workspace authority.
 
-The companion document
-[`docs/design/11-layer-architecture-dependency-matrix.md`](11-layer-architecture-dependency-matrix.md)
-covers DESIGN-issue-level layering and milestone sequencing and shares the same
-historical-input status.
+The former 11-layer DESIGN issue matrix was deleted as stale Forgejo-era
+coordination material. Git history and the associated GitHub issue/PR lineage
+retain that path for archaeological review; live scheduling comes from GitHub
+issues and pull requests, and current workspace structure comes from the
+authority files above.
 
 ---
 
@@ -455,18 +456,17 @@ be preserved by all changes:
 
 ---
 
-## 7. Relationship to DESIGN Issue Matrix
+## 7. Relationship to Historical DESIGN Issue Matrix
 
 > **HISTORICAL**: The layer-to-crate mapping below is a past snapshot. Several
 > referenced crates (`tidefs-types-locator-table-core` and others) no longer
 > exist.
 
-In the same historical snapshot, the 11-layer DESIGN issue matrix
-(`docs/design/11-layer-architecture-dependency-matrix.md`) recorded
-issue-level sequencing for 71 DESIGN issues across 4 milestones. The crate
-graph documented here is the *historical implementation* artifact that realized
-those designs in Rust at the time of writing. Neither document is current
-GitHub scheduling authority or current product architecture policy.
+In the same historical snapshot, a now-deleted 11-layer DESIGN issue matrix
+recorded issue-level sequencing for 71 DESIGN issues across 4 milestones. The
+crate graph documented here is the *historical implementation* artifact that
+realized those designs in Rust at the time of writing. This section is not
+current GitHub scheduling authority or current product architecture policy.
 
 | DESIGN Layer | Primary Crates |
 |-------------|----------------|
@@ -487,7 +487,7 @@ GitHub scheduling authority or current product architecture policy.
 
 ## 8. State and Maintenance
 
-- **Current status**: historical-input (demoted 2026-06-22 per issue #1019).
+- **Current status**: historical-input (classified 2026-06-22 per issue #1019).
   This document is no longer regenerated and must not be cited as workspace
   authority.
 - The original Forgejo issue #2100 tracked the creation of this document in a
@@ -500,7 +500,8 @@ GitHub scheduling authority or current product architecture policy.
   `cargo metadata --no-deps`.
 - **Consolidation rationale**: [`docs/crates/types-core-consolidation-plan.md`](../crates/types-core-consolidation-plan.md)
   documents which type-root crates were retired and why.
-- The companion document `docs/design/11-layer-architecture-dependency-matrix.md`
-  shares the same historical-input status.
+- The former 11-layer DESIGN issue matrix was deleted instead of kept as
+  another stale status surface; use git history and GitHub issue/PR lineage for
+  archaeological review.
 - The `crates/README.md` provides a human-readable index of active crate groups;
   consult it for current structure.
