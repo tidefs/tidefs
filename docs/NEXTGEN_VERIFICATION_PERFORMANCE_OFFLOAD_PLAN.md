@@ -84,7 +84,7 @@ name or a narrower scope.
 | Program area | Current TideFS authority | Status and finishing direction |
 | --- | --- | --- |
 | Workspace inventory | `docs/workspace-package-classification.md`, root `Cargo.toml`, `crates/README.md`, `xtask check-workspace-policy` | Use this before creating or deleting packages. Package role classification is navigation and policy evidence, not product proof. |
-| Integrated roadmap | `docs/NEXTGEN_VERIFICATION_CONTRACT_ROADMAP.md` from PR #299 | Keep as staging history. This document is the integrated program authority for issue #483. |
+| Integrated program authority | `docs/NEXTGEN_VERIFICATION_PERFORMANCE_OFFLOAD_PLAN.md` | This document is the integrated program authority for issue #483 and issue #1066. The old issue #281 roadmap root was deleted by issue #1656; use git, issue, and PR history for staging lineage. |
 | Request contract | `docs/REQUEST_CONTRACT.md`, `crates/tidefs-types-vfs-core`, `crates/tidefs-schema-codec-vfs` from PRs #300 and #315 | Reuse these instead of adding `tidefs-contract-core` or `tidefs-contract-codec` unless a future issue proves the split is needed. |
 | Contract codecs | `xtask check-contract-codecs`, fixed v1 request/completion codec, golden vectors, reserved-field rejection | Good seed for contract-shape validation. This is codec/tooling evidence, not runtime adapter proof. |
 | Validation tiers | `crates/tidefs-validation/src/validation_schema.rs` | Canonical T0-T7 tier vocabulary. Do not invent another tier taxonomy. |

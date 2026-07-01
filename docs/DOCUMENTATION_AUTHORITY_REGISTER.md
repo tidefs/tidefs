@@ -335,13 +335,25 @@ readiness, and OpenZFS/Ceph-class wording remain blocked until a future
 source-backed issue introduces real owner-path data, validation evidence, and
 claim-gate coverage for an exact scope.
 
+### Nextgen Verification Roadmap Root Retirement (TFR-021 / #1656)
+
+Issue #1656 deleted the old issue #281 nextgen verification roadmap as a
+superseded live roadmap root. The current TFR-021 authority remains the
+integrated program document
+`docs/NEXTGEN_VERIFICATION_PERFORMANCE_OFFLOAD_PLAN.md`, together with
+`validation/claims.toml`, `docs/CLAIMS_GATE_POLICY.md`, and focused producer
+issues for evidence-manifest adoption. The deleted #281 roadmap remains
+lineage in git, issue, and PR history only; it is not a current planning
+authority surface and must not be cited as product-readiness, release,
+successor, crash-safety, performance-isolation, kernel, distributed, RDMA, or
+offload evidence.
+
 ### Request Contract Authority (TFR-019 / #1136)
 
 Classified for TFR-019 / GitHub issue #1136 on 2026-06-25 after reviewing this
 register's authority rule and review method, `docs/REQUEST_CONTRACT.md`,
 `docs/INDEX.md`, the verification/model references in
 `docs/NEXTGEN_VERIFICATION_EVIDENCE_CHAIN_AUTHORITY.md`,
-`docs/NEXTGEN_VERIFICATION_CONTRACT_ROADMAP.md`,
 `docs/NEXTGEN_VERIFICATION_PERFORMANCE_OFFLOAD_PLAN.md`, and
 `docs/TRACE_ORACLE_ARTIFACT_SCHEMA.md`, the claim registry and scanned
 claims-gate document list, the source anchors in `crates/tidefs-types-vfs-core/`
