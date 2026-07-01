@@ -20,7 +20,7 @@ See also:
 - `docs/DOCTRINE_FAMILY_TO_RUST_TYPE_MAP_P2-01.md`
 - `docs/POLICY_AUTHORITY_RUNTIME_SURFACE_P3-01.md`
 - `docs/POSIX_FILESYSTEM_ADAPTER_DAEMON_TOPOLOGY_P5-01.md`
-- `docs/UBLK_DAEMON_QUEUE_TOPOLOGY_P6-01.md`
+- `docs/BLOCK_VOLUME_UBLK_STARTED_EXPORT_ADMISSION_BOUNDARY_ISSUE_341.md`
 - `docs/KERNEL_MODULE_FAMILY_MATRIX_ROLLOUT_ORDER_P7-01.md`
 - `docs/RUST_FOR_LINUX_CRATE_TRAIT_BOUNDARIES_P7-02.md`
 - `docs/TRANSPORT_SESSION_COHORT_GRAPH_P8-01.md`
@@ -138,11 +138,10 @@ prose:
   repo depends on Linux mount-helper, `/dev/fuse`, signal, readiness-pipe, and
   mount-lifetime process semantics rather than a generic cross-platform file-
   serving abstraction.
-- `docs/UBLK_DAEMON_QUEUE_TOPOLOGY_P6-01.md`,
-  `docs/EXPORT_FENCING_RESIZE_FAILOVER_RUNTIME_P6-03.md`, and
-  already prove that the block-export plan is explicitly Linux `ublk` plus
-  `io_uring` based rather than “some future userspace block shim.”
-  userspace, not a hypothetical platform-neutral adapter abstraction.
+- The scoped OW-301 block-volume ublk docs and `validation/claims.toml`
+  record the current userspace `ublk`/`io_uring` block-export boundary. That
+  evidence is bounded and does not prove a kernel block path, fio breadth,
+  online resize, crash durability, or production block-device readiness.
 - `docs/TRANSPORT_SESSION_COHORT_GRAPH_P8-01.md` and
   `docs/MEMBERSHIP_PLACEMENT_FAILURE_DOMAIN_MODEL_P8-02.md` already prove that
   clustered runtime law needs one explicit answer for socket transport, timer /

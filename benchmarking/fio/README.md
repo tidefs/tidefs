@@ -113,10 +113,12 @@ reference templates for future profile development:
 When a new profile benefits from shared settings, include them in the
 job file with `include common/global.inc` (paths relative to the job file).
 
-## Relationship to acceptance profiles
+## Relationship to block claims
 
-The three benchmarking profiles map to the `block_volume_adapter` acceptance
-profile taxonomy defined in `docs/BLOCK_ACCEPTANCE_STRESS_HARNESS_MATRIX_P6-04.md`:
+The three benchmarking profiles are local fio presets for smoke and pressure
+experiments. They do not establish block-device product admission by
+themselves; publishing-facing block wording is gated by `validation/claims.toml`
+and generated `docs/CLAIM_REGISTRY.md`.
 
 | Benchmark profile | Acceptance profile | Purpose |
 |---|---|---|
@@ -124,9 +126,9 @@ profile taxonomy defined in `docs/BLOCK_ACCEPTANCE_STRESS_HARNESS_MATRIX_P6-04.m
 | `quick-required` | `profile.block_acceptance_profile_1.quick_required` | Pre-release charter validation |
 | `pressure` | `profile.block_acceptance_profile_2.quick_pressure` | Stress and degradation |
 
-The acceptance matrix also defines `profile.block_acceptance_profile_3.oracle`
-(differential) and `profile.block_acceptance_profile_4.soak` (sustained stress)
-which are out of scope for these fio profiles and belong to separate harnesses.
+The historical block-acceptance matrix lineage was deleted by #1614. Broader
+fio workload breadth, mkfs/mount acceptance, online resize, crash durability,
+and production block-device readiness remain outside these local presets.
 
 These benchmarking profiles are distinct from the ublk fio verification jobs in
 `validation/fio/`, which target correctness verification rather than

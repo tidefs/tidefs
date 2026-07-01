@@ -129,6 +129,21 @@ and live GitHub issues/PRs. This deletion does not validate any
 successor/comparator, production, release-readiness, POSIX-completeness,
 crash-recovery, or operator-product claim.
 
+## Block P6 Historical Input Deletions (TFR-019 / #1614)
+
+Issue #1614 deleted the stale block/ublk P6 historical inputs whose live files
+still read like production source-of-truth documents:
+`docs/UBLK_DAEMON_QUEUE_TOPOLOGY_P6-01.md`,
+`docs/EXPORT_FENCING_RESIZE_FAILOVER_RUNTIME_P6-03.md`, and
+`docs/BLOCK_ACCEPTANCE_STRESS_HARNESS_MATRIX_P6-04.md`.
+
+Their lineage now lives in git, issue #1614, and its pull request. Current
+block-device authority remains with the scoped OW-301 block-volume docs,
+`validation/claims.toml`, generated `docs/CLAIM_REGISTRY.md`, and
+`docs/CLAIMS_GATE_POLICY.md`. This deletion does not validate fio workload
+breadth, mkfs/mount acceptance, online resize, crash durability, production
+block-device readiness, kernel block readiness, or OpenZFS/Ceph-class wording.
+
 ## Doc-Authority Drift Cleanup Coordination (#952)
 
 Recorded on 2026-06-22 for the `check-doc-authority-drift` follow-up from PR
@@ -438,9 +453,6 @@ xfstests coverage, distributed behavior, or runtime crash claims.
 | `docs/BLOCK_VOLUME_UBLK_FETCH_REQ_SUBMISSION_BOUNDARY_OW301W.md` | Current spec | Scoped current spec for first guarded `FETCH_REQ` submissions after control and data-queue admission. It does not claim full data-plane completion behavior. |
 | `docs/BLOCK_VOLUME_UBLK_COMMIT_FETCH_BOUNDARY_OW301X.md` | Current spec | Scoped current spec for guarded `COMMIT_AND_FETCH_REQ` submission after caller-completed fetched requests. It is not a broad block-volume crash-consistency claim. |
 | `docs/BLOCK_VOLUME_UBLK_STARTED_EXPORT_ADMISSION_BOUNDARY_ISSUE_341.md` | Current spec | Scoped current spec for the started-export admission artifact and fail-closed verification path. It does not close broader block-volume runtime validation. |
-| `docs/UBLK_DAEMON_QUEUE_TOPOLOGY_P6-01.md` | Historical input | Imported production-depth ublk queue topology law. The scoped OW-301 rows above are the current authority for implemented slices; this broader topology remains design input. |
-| `docs/EXPORT_FENCING_RESIZE_FAILOVER_RUNTIME_P6-03.md` | Historical input | Imported production-depth export fencing, resize, and failover runtime target. The OW-301 lifecycle/cache/resize rows are scoped model authority only and do not validate this full runtime. |
-| `docs/BLOCK_ACCEPTANCE_STRESS_HARNESS_MATRIX_P6-04.md` | Historical input | Imported block acceptance and stress harness matrix. It is a validation target, not current evidence that fio, blktests, guest filesystems, or kernel block exports pass. |
 
 **FUSE/POSIX adapter docs**
 
