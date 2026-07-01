@@ -1,6 +1,6 @@
 # Workspace Package Classification
 
-Updated from current Cargo metadata and on-disk manifest discovery for issue #972 on 2026-06-25.
+Updated from current Cargo metadata, on-disk manifest discovery, and harness-consumer audit for issue #1723 on 2026-07-02.
 This document is the package-role authority for TideFS workspace selection and TFR-002/TFR-019 reduction.
 It is enforced by `cargo run -p tidefs-xtask -- check-workspace-policy`.
 
@@ -71,11 +71,11 @@ one-line justification. The table keeps the five machine-checked columns so
 | Package root | Package | Cargo status | Role | Disposition |
 | --- | --- | --- | --- | --- |
 | `apps/tidefs-block-volume-adapter-daemon` | `tidefs-block-volume-adapter-daemon` | `workspace-member` | `adapter-operator` | operator entrypoint for the ublk adapter; live runtime validation required before release claims. |
-| `apps/tidefs-filesystem-demo` | `tidefs-filesystem-demo` | `workspace-member` | `proof-harness` | demo entrypoint and proof harness; non-production Local Filesystem exercise only. |
+| `apps/tidefs-filesystem-demo` | `tidefs-filesystem-demo` | `workspace-member` | `proof-harness` | kept for `nix/tidefs-validation.sh` and the packaged workspace binary smoke path that exercises Local Filesystem write/read/replay/snapshot/send-receive output; harness signal only, not release proof. |
 | `apps/tidefs-posix-filesystem-adapter-daemon` | `tidefs-posix-filesystem-adapter-daemon` | `workspace-member` | `adapter-operator` | operator entrypoint and FUSE validation harness; preview mount surface only. |
 | `apps/tidefs-scrub` | `tidefs-scrub` | `workspace-member` | `adapter-operator` | operator entrypoint for scrub/repair plumbing; not release proof by itself. |
 | `apps/tidefs-storage-node` | `tidefs-storage-node` | `workspace-member` | `adapter-operator` | operator entrypoint for storage-node experiments; cluster authority remains TFR-017. |
-| `apps/tidefs-store-demo` | `tidefs-store-demo` | `workspace-member` | `proof-harness` | demo entrypoint and proof harness; non-production Local Object Store exercise only. |
+| `apps/tidefs-store-demo` | `tidefs-store-demo` | `workspace-member` | `proof-harness` | kept for `nix/tidefs-validation.sh`, packaged workspace binary checks, and the FUSE VM smoke path that runs object-store write/read/replay before mount validation; harness signal only, not release proof. |
 | `apps/tidefsctl` | `tidefsctl` | `workspace-member` | `adapter-operator` | operator entrypoint for CLI/UAPI work; TFR-011 and TFR-019 remain open. |
 | `crates/tidefs-anti-entropy-auditor` | `tidefs-anti-entropy-auditor` | `workspace-member` | `product-code` | live entrypoint for anti-entropy audit admission; issue #815 evidence covers Merkle proof validation, comparison-history accounting, repair-trigger receipts, SuspectLog feeding, and scrub admission while release claims remain limited by the review register. |
 | `crates/tidefs-auth` | `tidefs-auth` | `workspace-member` | `policy-tooling` | current policy/tooling surface; not a production-readiness claim. |
@@ -207,7 +207,7 @@ one-line justification. The table keeps the five machine-checked columns so
 | `crates/tidefs-storage-intent-scheduler` | `tidefs-storage-intent-scheduler` | `workspace-member` | `product-code` | planned authority surface for #862 intent-aware admission lanes, QoS budgets, backpressure, speculative-drop behavior, and read-only scheduling evidence; zero reverse dependencies reflect adapter-integration boundaries, not placeholder status; FUSE, block, transport, and mounted runtime wiring remain separately gated. |
 | `crates/tidefs-storage-intent-workload-signals` | `tidefs-storage-intent-workload-signals` | `workspace-member` | `product-code` | planned authority surface for #845 bounded local workload-signal records and conservative read-only snapshots; zero reverse dependencies reflect producer/consumer-boundary wiring, not placeholder status; scheduling, placement, and runtime evidence consumers remain separately gated. |
 | `crates/tidefs-tdma-scheduler` | `tidefs-tdma-scheduler` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
-| `crates/tidefs-trace-oracle` | `tidefs-trace-oracle` | `workspace-member` | `proof-harness` | current proof harness; test signal only and not a product capability claim. |
+| `crates/tidefs-trace-oracle` | `tidefs-trace-oracle` | `workspace-member` | `proof-harness` | current proof harness for JSONL trace replay and model/local-runtime comparison; `xtask check-trace-oracle` emits source-model or harness-only `TraceArtifactManifest` records, and runtime-tier trace claims remain separately gated. |
 | `crates/tidefs-transport` | `tidefs-transport` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-two-node-harness` | `tidefs-two-node-harness` | `workspace-member` | `proof-harness` | standalone-checkable proof-harness for deterministic two-node transport; 156 default tests cover BLAKE3 sessions, VFSSEND2 transfer, placement, peer-join, rebuild, receive-stream, membership lease, partition healing, degraded reads, and single-writer fencing; `qemu` adds live TCP carrier state-transfer validation with `tidefs-transport::Transport` for #1220 QEMU evidence. |
 | `crates/tidefs-types-cache-lattice-core` | `tidefs-types-cache-lattice-core` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
@@ -230,13 +230,13 @@ one-line justification. The table keeps the five machine-checked columns so
 | `crates/tidefs-types-vfs-core` | `tidefs-types-vfs-core` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-types-vfs-owned` | `tidefs-types-vfs-owned` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-ublk-abi` | `tidefs-ublk-abi` | `workspace-member` | `adapter-operator` | current adapter/operator surface; capability claims remain behind focused validation. |
-| `crates/tidefs-validation` | `tidefs-validation` | `workspace-member` | `proof-harness` | current proof harness; test signal only and not a product capability claim. |
+| `crates/tidefs-validation` | `tidefs-validation` | `workspace-member` | `proof-harness` | current runtime validation harness for QEMU Smoke, FUSE, ublk, xfstests, reclaim, scrub, and `EvidenceArtifactManifest` row artifacts; workflow and flake consumers collect evidence without making product-readiness claims. |
 | `crates/tidefs-validation/fuzz` | `tidefs-validation-fuzz` | `workspace-excluded` | `standalone-fuzz` | standalone-checkable fuzz package; keep mirrored in workspace.exclude until restored or made an issue-backed archive/delete candidate. |
 | `crates/tidefs-verification-engine` | `tidefs-verification-engine` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-vfs-engine` | `tidefs-vfs-engine` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-vfs-rpc` | `tidefs-vfs-rpc` | `workspace-member` | `product-code` | planned authority surface for VFS_RPC wire protocol; 14 unit tests cover all 36 method definitions, request/response encode/decode roundtrips, per-peer dedup window, flagged bypass paths, handle encoding, and client-side multiplexing; forbid(unsafe_code); zero reverse dependencies reflect service-surface boundaries, not placeholder status; #1518 selects the first live control/inline forwarding boundary while #1521-#1524 gate live transport, VFS Engine bridge, BULK/RDMA handoff, and validation claims. |
 | `crates/tidefs-witness-set` | `tidefs-witness-set` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
-| `crates/tidefs-workload` | `tidefs-workload` | `workspace-member` | `proof-harness` | current proof harness; test signal only and not a product capability claim. |
+| `crates/tidefs-workload` | `tidefs-workload` | `workspace-member` | `proof-harness` | current workload-signal harness consumed by the POSIX adapter workload observer; classification tests cover OLTP/OLAP/backup/VM signatures, and adaptive-runtime claims remain separately gated. |
 | `crates/tidefs-xattr-storage` | `tidefs-xattr-storage` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `fuzz` | `tidefs-fuzz` | `workspace-excluded` | `standalone-fuzz` | standalone-checkable fuzz package; keep mirrored in workspace.exclude until restored or made an issue-backed archive/delete candidate. |
 | `kmod` | `tidefs-kmod-bridge` | `workspace-member` | `adapter-operator` | current adapter/operator surface; capability claims remain behind focused validation. |
@@ -248,10 +248,10 @@ Zero reverse dependencies do not imply deletion. They mean the package is an ent
 
 | Package root | Package | Role | Disposition |
 | --- | --- | --- | --- |
-| `apps/tidefs-filesystem-demo` | `tidefs-filesystem-demo` | `proof-harness` | demo entrypoint and proof harness; non-production Local Filesystem exercise only. |
+| `apps/tidefs-filesystem-demo` | `tidefs-filesystem-demo` | `proof-harness` | kept for `nix/tidefs-validation.sh` and packaged workspace binary smoke coverage of Local Filesystem write/read/replay/snapshot/send-receive output; harness signal only. |
 | `apps/tidefs-scrub` | `tidefs-scrub` | `adapter-operator` | operator entrypoint for scrub/repair plumbing; not release proof by itself. |
 | `apps/tidefs-storage-node` | `tidefs-storage-node` | `adapter-operator` | operator entrypoint for storage-node experiments; cluster authority remains TFR-017. |
-| `apps/tidefs-store-demo` | `tidefs-store-demo` | `proof-harness` | demo entrypoint and proof harness; non-production Local Object Store exercise only. |
+| `apps/tidefs-store-demo` | `tidefs-store-demo` | `proof-harness` | kept for `nix/tidefs-validation.sh`, packaged workspace binary checks, and FUSE VM object-store write/read/replay smoke before mount validation; harness signal only. |
 | `apps/tidefsctl` | `tidefsctl` | `adapter-operator` | operator entrypoint for CLI/UAPI work; TFR-011 and TFR-019 remain open. |
 | `crates/tidefs-anti-entropy-auditor` | `tidefs-anti-entropy-auditor` | `product-code` | live entrypoint for anti-entropy audit admission; zero reverse dependencies reflect service-integration boundaries, not placeholder status; issue #815 records focused Merkle-to-repair validation evidence. |
 | `crates/tidefs-block-kmod` | `tidefs-block-kmod` | `adapter-operator` | operator entrypoint for the kernel block-volume adapter; PR #1093 records source/stub audit and unit validation while kernel-build release claims remain behind focused validation. |
