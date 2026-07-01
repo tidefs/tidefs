@@ -773,18 +773,9 @@ successor/comparator wording.
 Issue #1707 deleted the imported Linux-baseline, std/no_std environment,
 UAPI/FFI schema, Rust-for-Linux trait, kernel rollout, and kernel
 locking/RCU/workqueue production-depth roots instead of preserving them as
-live historical surfaces:
-
-- `docs/LINUX_7_0_BASELINE_CONTRACT_SUPPORTED_SUBSYSTEMS_P0-01.md`
-- `docs/STD_NO_STD_KERNEL_USERSPACE_BOUNDARY_RULES_P1-02.md`
-- `docs/UAPI_FFI_CANONICAL_SCHEMA_BOUNDARY_RULES_P1-03.md`
-- `docs/KERNEL_MODULE_FAMILY_MATRIX_ROLLOUT_ORDER_P7-01.md`
-- `docs/RUST_FOR_LINUX_CRATE_TRAIT_BOUNDARIES_P7-02.md`
-- `docs/KERNEL_LOCKING_RCU_PINNING_WORKQUEUE_MODEL_P7-03.md`
-
-Those roots were already classified as historical input, depended on deleted
-blueprint-era law documents, and competed with the current source-backed
-kernel and preview-UAPI authority surfaces.
+live historical surfaces. Those roots were already classified as historical
+input, depended on deleted blueprint-era law documents, and competed with the
+current source-backed kernel and preview-UAPI authority surfaces.
 
 Current kernel and preview-UAPI authority remains with the scoped kernel
 residency decision, kernel-resident pool-engine architecture, Linux workflow
