@@ -1496,6 +1496,52 @@ pub struct ChangedRecordRoot {
     pub records: Vec<ChangedObjectRecord>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChangedRecordTransformContract {
+    /// Content payloads are explicit stored frames for a mounted filesystem
+    /// whose device-level transforms are disabled. Checksums cover the stored
+    /// frame bytes carried by each changed record.
+    StoredFrameNoDeviceTransforms,
+    /// Mounted device transforms are required, but this changed-record stream
+    /// does not carry typed transform metadata for replay. Receivers must fail
+    /// closed until a typed metadata format exists.
+    MountedDeviceTransformsRequireTypedMetadata,
+}
+
+impl ChangedRecordTransformContract {
+    pub const fn as_u16(self) -> u16 {
+        match self {
+            Self::StoredFrameNoDeviceTransforms => 1,
+            Self::MountedDeviceTransformsRequireTypedMetadata => 2,
+        }
+    }
+
+    pub const fn requires_typed_metadata(self) -> bool {
+        matches!(self, Self::MountedDeviceTransformsRequireTypedMetadata)
+    }
+}
+
+impl TryFrom<u16> for ChangedRecordTransformContract {
+    type Error = FileSystemError;
+
+    fn try_from(value: u16) -> std::result::Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::StoredFrameNoDeviceTransforms),
+            2 => Ok(Self::MountedDeviceTransformsRequireTypedMetadata),
+            _ => Err(FileSystemError::Decode {
+                object: "local filesystem send/receive stream",
+                reason: "unsupported transform contract",
+            }),
+        }
+    }
+}
+
+impl Default for ChangedRecordTransformContract {
+    fn default() -> Self {
+        Self::StoredFrameNoDeviceTransforms
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ChangedRecordExport {
     pub spec: &'static str,
@@ -1512,6 +1558,7 @@ pub struct ChangedRecordExport {
     /// Placement epoch at export time; None when placement is not tracked
     /// (backward-compatible with existing callers).
     pub placement_epoch: Option<u64>,
+    pub transform_contract: ChangedRecordTransformContract,
 }
 
 impl ChangedRecordExport {

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 
-use tidefs_local_filesystem::{ChangedRecordExport, CommittedRootSummary};
+use tidefs_local_filesystem::{
+    ChangedRecordExport, ChangedRecordTransformContract, CommittedRootSummary,
+};
 use tidefs_local_object_store::IntegrityDigest64;
 
 fn root_summary(transaction_id: u64, generation: u64) -> CommittedRootSummary {
@@ -35,6 +37,7 @@ fn export(incremental: bool, placement_epoch: Option<u64>) -> ChangedRecordExpor
         from_root: incremental.then(|| root_summary(1, 10)),
         incremental,
         placement_epoch,
+        transform_contract: ChangedRecordTransformContract::StoredFrameNoDeviceTransforms,
     }
 }
 
