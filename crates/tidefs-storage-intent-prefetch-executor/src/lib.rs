@@ -2362,6 +2362,26 @@ fn terminal_update_lacks_started_dispatch_evidence(
     if !terminal_ref_in_cut(
         record,
         cut,
+        record.evidence_refs.evidence_query_snapshot_ref,
+        StorageIntentEvidenceKind::EvidenceQuerySnapshot,
+    ) {
+        return true;
+    }
+
+    if record.evidence_refs.compiled_policy_ref.is_bound()
+        && !terminal_ref_in_cut(
+            record,
+            cut,
+            record.evidence_refs.compiled_policy_ref,
+            StorageIntentEvidenceKind::PolicyRolloutEvidence,
+        )
+    {
+        return true;
+    }
+
+    if !terminal_ref_in_cut(
+        record,
+        cut,
         record.evidence_refs.prefetch_decision_ref,
         StorageIntentEvidenceKind::DecisionFrontierEvidence,
     ) || !terminal_ref_in_cut(
@@ -3504,6 +3524,7 @@ mod tests {
     const RUNTIME_SUPPORT: StorageIntentEvidenceId = StorageIntentEvidenceId([24; 32]);
     const RELOCATION: StorageIntentEvidenceId = StorageIntentEvidenceId([25; 32]);
     const RECOVERY: StorageIntentEvidenceId = StorageIntentEvidenceId([26; 32]);
+    const POLICY_ROLLOUT: StorageIntentEvidenceId = StorageIntentEvidenceId([27; 32]);
 
     fn evidence(
         kind: StorageIntentEvidenceKind,
@@ -3852,6 +3873,8 @@ mod tests {
         refs: &mut StorageIntentEvidenceRefs,
         record: PrefetchExecutorRecord,
     ) {
+        push_terminal_ref(refs, record.evidence_refs.evidence_query_snapshot_ref);
+        push_terminal_ref(refs, record.evidence_refs.compiled_policy_ref);
         push_terminal_ref(refs, record.evidence_refs.prefetch_decision_ref);
         push_terminal_ref(refs, record.evidence_refs.scheduler_admission_ref);
         push_terminal_ref(refs, record.evidence_refs.dispatch_plan_ref);
@@ -3877,6 +3900,12 @@ mod tests {
         record: PrefetchExecutorRecord,
         omitted: StorageIntentEvidenceRef,
     ) {
+        push_terminal_start_ref_unless(
+            refs,
+            record.evidence_refs.evidence_query_snapshot_ref,
+            omitted,
+        );
+        push_terminal_start_ref_unless(refs, record.evidence_refs.compiled_policy_ref, omitted);
         push_terminal_start_ref_unless(refs, record.evidence_refs.prefetch_decision_ref, omitted);
         push_terminal_start_ref_unless(refs, record.evidence_refs.scheduler_admission_ref, omitted);
         push_terminal_start_ref_unless(refs, record.evidence_refs.dispatch_plan_ref, omitted);
@@ -5818,6 +5847,122 @@ mod tests {
             PrefetchExecutorByteState::Refused
         );
         assert_record_has_no_authority_claims(rejected);
+    }
+
+    #[test]
+    fn terminal_update_requires_query_snapshot_ref_inside_terminal_cut() {
+        let detail = terminal_detail();
+        let started = evaluate_prefetch_execution(admitted_charged_input(
+            PrefetchResidencyCandidateClass::BoundedReadahead,
+            detail,
+        ));
+        assert_eq!(started.outcome, PrefetchExecutorOutcome::Started);
+
+        let mut missing_snapshot_refs = StorageIntentEvidenceRefs::EMPTY;
+        push_terminal_start_refs_except(
+            &mut missing_snapshot_refs,
+            started,
+            started.evidence_refs.evidence_query_snapshot_ref,
+        );
+        push_terminal_ref(&mut missing_snapshot_refs, detail.attribution_ref);
+        push_terminal_ref(&mut missing_snapshot_refs, detail.retention_ref);
+        push_terminal_ref(&mut missing_snapshot_refs, detail.validation_ref);
+
+        let rejected = finalize_prefetch_execution(
+            started,
+            PrefetchExecutorTerminalUpdate {
+                outcome: PrefetchExecutorOutcome::Completed,
+                result_detail: detail,
+                evidence_cut: PrefetchExecutorTerminalEvidenceCut {
+                    evidence_query_snapshot_ref: started.evidence_refs.evidence_query_snapshot_ref,
+                    included_refs: missing_snapshot_refs,
+                },
+                ..PrefetchExecutorTerminalUpdate::default()
+            },
+        );
+
+        assert_eq!(
+            rejected.outcome,
+            PrefetchExecutorOutcome::VerificationFailed
+        );
+        assert_eq!(
+            rejected.refusal,
+            StorageIntentRefusalReason::ValidationGateFailed
+        );
+        assert_record_has_no_authority_claims(rejected);
+    }
+
+    #[test]
+    fn terminal_update_requires_supplied_compiled_policy_ref_inside_terminal_cut() {
+        let detail = terminal_detail();
+        let mut input =
+            admitted_charged_input(PrefetchResidencyCandidateClass::BoundedReadahead, detail);
+        let compiled_policy_ref = evidence(
+            StorageIntentEvidenceKind::PolicyRolloutEvidence,
+            POLICY_ROLLOUT,
+        );
+        input.decision.evidence_refs.compiled_policy_ref = compiled_policy_ref;
+        input
+            .evidence_query_snapshot
+            .included_refs
+            .push(compiled_policy_ref)
+            .unwrap();
+
+        let started = evaluate_prefetch_execution(input);
+        assert_eq!(started.outcome, PrefetchExecutorOutcome::Started);
+        assert_eq!(
+            started.evidence_refs.compiled_policy_ref,
+            compiled_policy_ref
+        );
+
+        let mut missing_policy_refs = StorageIntentEvidenceRefs::EMPTY;
+        push_terminal_start_refs_except(
+            &mut missing_policy_refs,
+            started,
+            started.evidence_refs.compiled_policy_ref,
+        );
+        push_terminal_ref(&mut missing_policy_refs, detail.attribution_ref);
+        push_terminal_ref(&mut missing_policy_refs, detail.retention_ref);
+        push_terminal_ref(&mut missing_policy_refs, detail.validation_ref);
+
+        let rejected = finalize_prefetch_execution(
+            started,
+            PrefetchExecutorTerminalUpdate {
+                outcome: PrefetchExecutorOutcome::Completed,
+                result_detail: detail,
+                evidence_cut: PrefetchExecutorTerminalEvidenceCut {
+                    evidence_query_snapshot_ref: started.evidence_refs.evidence_query_snapshot_ref,
+                    included_refs: missing_policy_refs,
+                },
+                ..PrefetchExecutorTerminalUpdate::default()
+            },
+        );
+
+        assert_eq!(
+            rejected.outcome,
+            PrefetchExecutorOutcome::VerificationFailed
+        );
+        assert_eq!(
+            rejected.refusal,
+            StorageIntentRefusalReason::ValidationGateFailed
+        );
+        assert_record_has_no_authority_claims(rejected);
+
+        let completed = finalize_prefetch_execution(
+            started,
+            PrefetchExecutorTerminalUpdate {
+                outcome: PrefetchExecutorOutcome::Completed,
+                result_detail: detail,
+                evidence_cut: terminal_evidence_cut(started, detail, EMPTY_EVIDENCE_REF),
+                ..PrefetchExecutorTerminalUpdate::default()
+            },
+        );
+        assert_eq!(completed.outcome, PrefetchExecutorOutcome::Completed);
+        assert_eq!(
+            completed.evidence_refs.compiled_policy_ref,
+            compiled_policy_ref
+        );
+        assert_record_has_no_authority_claims(completed);
     }
 
     #[test]
