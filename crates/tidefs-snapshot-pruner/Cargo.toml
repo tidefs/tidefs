@@ -13,7 +13,9 @@ authors.workspace = true
 description = "Snapshot auto-pruner with per-dataset retention policies and age-based expiry"
 [dependencies]
 tidefs-gc-pin-set = { workspace = true }
+tidefs-incremental-job-core = { workspace = true }
 tidefs-local-object-store = { workspace = true }
+tidefs-types-incremental-job-core = { workspace = true }
 blake3 = "=1.5.5"
 
 [dev-dependencies]

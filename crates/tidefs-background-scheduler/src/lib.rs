@@ -83,7 +83,9 @@ use tidefs_types_incremental_job_core::{
     JobProgress, SchedulerEpoch, ServiceCheckpoint, ServiceState, StepResult, WorkBudget,
 };
 
-use tidefs_incremental_job_core::{DispatchStore, DispatchStoreError};
+use tidefs_incremental_job_core::{
+    DispatchStore, DispatchStoreError, IncrementalJob as FallibleIncrementalJob,
+};
 
 // ---------------------------------------------------------------------------
 // ServicePriority — 5-stage priority for scheduling and budget allocation
@@ -688,6 +690,164 @@ impl<J: IncrementalJob + fmt::Debug> fmt::Debug for IncrementalJobAdapter<J> {
 }
 
 // ---------------------------------------------------------------------------
+// FallibleIncrementalJobAdapter — wraps tidefs-incremental-job-core jobs
+// ---------------------------------------------------------------------------
+
+/// Adapter for newer fallible [`tidefs_incremental_job_core::IncrementalJob`]
+/// implementations.
+///
+/// This keeps the scheduler's existing infallible adapter intact while allowing
+/// jobs whose `step`, checkpoint persistence, and completion phases can fail to
+/// enter the same background-service and dispatch-record contract.
+#[cfg(feature = "alloc")]
+pub struct FallibleIncrementalJobAdapter<J: FallibleIncrementalJob> {
+    name: &'static str,
+    job: Option<J>,
+    priority: ServicePriority,
+    last_checkpoint: Option<Checkpoint>,
+    last_items_reported: u64,
+    last_bytes_reported: u64,
+}
+
+#[cfg(feature = "alloc")]
+impl<J: FallibleIncrementalJob> FallibleIncrementalJobAdapter<J> {
+    /// Create a new adapter for the given fallible job.
+    ///
+    /// Priority is derived from the job's [`JobKind`].
+    #[must_use]
+    pub fn new(name: &'static str, job: J) -> Self {
+        let priority = ServicePriority::from_job_kind(job.job_kind());
+        Self {
+            name,
+            job: Some(job),
+            priority,
+            last_checkpoint: None,
+            last_items_reported: 0,
+            last_bytes_reported: 0,
+        }
+    }
+
+    /// Create an adapter for a job resumed from a persisted checkpoint.
+    #[must_use]
+    pub fn resumed(name: &'static str, job: J, checkpoint: Option<Checkpoint>) -> Self {
+        let mut adapter = Self::new(name, job);
+        if let Some(checkpoint) = checkpoint {
+            adapter.last_items_reported = checkpoint.progress.items_processed;
+            adapter.last_bytes_reported = checkpoint.progress.bytes_processed;
+            adapter.last_checkpoint = Some(checkpoint);
+        }
+        adapter
+    }
+
+    /// Override the priority class.
+    #[must_use]
+    pub fn with_priority(mut self, priority: ServicePriority) -> Self {
+        self.priority = priority;
+        self
+    }
+
+    /// Return a reference to the inner job while it is still active.
+    #[must_use]
+    pub fn inner(&self) -> Option<&J> {
+        self.job.as_ref()
+    }
+
+    /// Return a mutable reference to the inner job while it is still active.
+    #[must_use]
+    pub fn inner_mut(&mut self) -> Option<&mut J> {
+        self.job.as_mut()
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl<J: FallibleIncrementalJob + Send> BackgroundService for FallibleIncrementalJobAdapter<J> {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn priority(&self) -> ServicePriority {
+        self.priority
+    }
+
+    fn tick(&mut self, budget: &ServiceBudget) -> Result<TickReport, ServiceError> {
+        let Some(job) = self.job.as_mut() else {
+            return Ok(TickReport {
+                has_more: false,
+                ..TickReport::default()
+            });
+        };
+
+        let step = job
+            .step(budget.to_work_budget())
+            .map_err(|error| ServiceError::JobError {
+                service: self.name,
+                error,
+            })?;
+
+        job.persist_checkpoint(&step.checkpoint)
+            .map_err(|error| ServiceError::JobError {
+                service: self.name,
+                error,
+            })?;
+
+        let cumulative_items = step.checkpoint.progress.items_processed;
+        let cumulative_bytes = step.checkpoint.progress.bytes_processed;
+        let items = cumulative_items.saturating_sub(self.last_items_reported);
+        let bytes = cumulative_bytes.saturating_sub(self.last_bytes_reported);
+
+        self.last_items_reported = cumulative_items;
+        self.last_bytes_reported = cumulative_bytes;
+        self.last_checkpoint = Some(step.checkpoint.clone());
+
+        if step.is_complete {
+            let job = self.job.take().ok_or(ServiceError::Internal {
+                service: self.name,
+                message: "completed job missing from adapter",
+            })?;
+            job.complete().map_err(|error| ServiceError::JobError {
+                service: self.name,
+                error,
+            })?;
+        }
+
+        Ok(TickReport {
+            processed: items,
+            skipped: 0,
+            errors: 0,
+            items_consumed: items,
+            bytes_consumed: bytes,
+            has_more: !step.is_complete,
+        })
+    }
+
+    fn has_work(&self) -> bool {
+        self.job.is_some()
+    }
+
+    fn dispatch_identity(&self) -> Option<(JobId, JobKind)> {
+        self.job.as_ref().map(|job| (job.job_id(), job.job_kind()))
+    }
+
+    fn dispatch_checkpoint(&self) -> Option<Checkpoint> {
+        self.last_checkpoint.clone()
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl<J: FallibleIncrementalJob + fmt::Debug> fmt::Debug for FallibleIncrementalJobAdapter<J> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FallibleIncrementalJobAdapter")
+            .field("name", &self.name)
+            .field("priority", &self.priority)
+            .field("job", &self.job)
+            .field("last_checkpoint", &self.last_checkpoint)
+            .field("last_items_reported", &self.last_items_reported)
+            .field("last_bytes_reported", &self.last_bytes_reported)
+            .finish()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // SchedulerStats — cumulative statistics across all scheduling cycles
 // ---------------------------------------------------------------------------
 
@@ -1194,6 +1354,25 @@ impl BackgroundScheduler {
         )
     }
 
+    /// Register a fallible [`tidefs_incremental_job_core::IncrementalJob`]
+    /// service and persist its dispatch record.
+    pub fn register_fallible_incremental_job<J>(
+        &mut self,
+        name: &'static str,
+        job: J,
+    ) -> Result<DispatchRecordId, DispatchStoreError>
+    where
+        J: FallibleIncrementalJob + Send + 'static,
+    {
+        let job_id = job.job_id();
+        let job_kind = job.job_kind();
+        self.register_dispatched(
+            Box::new(FallibleIncrementalJobAdapter::new(name, job)),
+            job_id,
+            job_kind,
+        )
+    }
+
     /// Register a reconstructed [`IncrementalJob`] against an existing
     /// resumable dispatch record.
     ///
@@ -1211,6 +1390,29 @@ impl BackgroundScheduler {
     {
         self.register_resumable_dispatch(
             Box::new(IncrementalJobAdapter::new(name, job)),
+            dispatch_id,
+        )
+    }
+
+    /// Register a reconstructed fallible
+    /// [`tidefs_incremental_job_core::IncrementalJob`] against an existing
+    /// resumable dispatch record.
+    pub fn register_resumable_fallible_incremental_job<J>(
+        &mut self,
+        name: &'static str,
+        job: J,
+        dispatch_id: DispatchRecordId,
+    ) -> Result<DispatchRecordId, DispatchStoreError>
+    where
+        J: FallibleIncrementalJob + Send + 'static,
+    {
+        let checkpoint = self
+            .load_dispatch_record(dispatch_id)?
+            .and_then(|record| record.last_checkpoint);
+        self.register_resumable_dispatch(
+            Box::new(FallibleIncrementalJobAdapter::resumed(
+                name, job, checkpoint,
+            )),
             dispatch_id,
         )
     }
@@ -1756,6 +1958,10 @@ pub mod scheduler;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tidefs_incremental_job_core::{
+        InMemoryDispatchStore, IncrementalJob as FallibleIncrementalJob,
+    };
+    use tidefs_types_incremental_job_core::DispatchState;
 
     // ── ServicePriority ───────────────────────────────────────────────
 
@@ -2079,6 +2285,164 @@ mod tests {
         fn job_kind(&self) -> JobKind {
             self.kind
         }
+    }
+
+    #[derive(Debug)]
+    struct FallibleMockJob {
+        id: JobId,
+        kind: JobKind,
+        total: u64,
+        processed: u64,
+    }
+
+    impl FallibleMockJob {
+        fn new(id: u64, kind: JobKind, total: u64) -> Self {
+            Self {
+                id: JobId(id),
+                kind,
+                total,
+                processed: 0,
+            }
+        }
+    }
+
+    impl FallibleIncrementalJob for FallibleMockJob {
+        fn resume(state: Option<Checkpoint>) -> Result<Self, JobError>
+        where
+            Self: Sized,
+        {
+            let checkpoint = state
+                .unwrap_or_else(|| Checkpoint::new_initial(JobId(99), JobKind::SnapshotPruner));
+            let processed = if checkpoint.cursor_state.is_empty() {
+                0
+            } else if checkpoint.cursor_state.len() == 8 {
+                let mut buf = [0u8; 8];
+                buf.copy_from_slice(checkpoint.cursor_state.as_bytes());
+                u64::from_le_bytes(buf)
+            } else {
+                return Err(JobError::CursorStateInvalid {
+                    job_id: checkpoint.job_id,
+                    reason: "cursor must be 8 bytes",
+                });
+            };
+            Ok(Self {
+                id: checkpoint.job_id,
+                kind: checkpoint.job_kind,
+                total: checkpoint.progress.items_total_estimate.max(processed),
+                processed,
+            })
+        }
+
+        fn step(&mut self, budget: WorkBudget) -> Result<StepResult, JobError> {
+            if self.processed >= self.total {
+                return Err(JobError::JobAlreadyComplete { job_id: self.id });
+            }
+            let remaining = self.total - self.processed;
+            let limit = if budget.max_items == 0 {
+                remaining
+            } else {
+                budget.max_items.min(remaining)
+            };
+            let batch = limit.min(1);
+            self.processed = self.processed.saturating_add(batch);
+            let checkpoint = Checkpoint {
+                job_id: self.id,
+                job_kind: self.kind,
+                epoch: 1,
+                cursor_state: tidefs_types_incremental_job_core::CursorState(
+                    self.processed.to_le_bytes().to_vec(),
+                ),
+                progress: JobProgress {
+                    items_processed: self.processed,
+                    items_total_estimate: self.total,
+                    bytes_processed: self.processed.saturating_mul(10),
+                    bytes_total_estimate: self.total.saturating_mul(10),
+                    elapsed_ms: 0,
+                },
+            };
+            if self.processed >= self.total {
+                Ok(StepResult::complete(checkpoint))
+            } else {
+                Ok(StepResult::in_progress(checkpoint))
+            }
+        }
+
+        fn persist_checkpoint(&self, _checkpoint: &Checkpoint) -> Result<(), JobError> {
+            Ok(())
+        }
+
+        fn complete(self) -> Result<(), JobError> {
+            Ok(())
+        }
+
+        fn job_id(&self) -> JobId {
+            self.id
+        }
+
+        fn job_kind(&self) -> JobKind {
+            self.kind
+        }
+    }
+
+    #[test]
+    fn fallible_snapshot_pruner_job_dispatch_checkpoints_and_resumes() {
+        let budget = ServiceBudget {
+            max_items: 1,
+            max_bytes: 0,
+            max_ms: 0,
+        };
+        let mut scheduler = BackgroundScheduler::with_dispatch_store(
+            budget,
+            Box::new(InMemoryDispatchStore::new()),
+        )
+        .unwrap();
+        let dispatch_id = scheduler
+            .register_fallible_incremental_job(
+                "snapshot-pruner",
+                FallibleMockJob::new(7, JobKind::SnapshotPruner, 2),
+            )
+            .unwrap();
+
+        let report = scheduler.run_cycle();
+        assert_eq!(report.total_processed, 1);
+        assert!(scheduler.any_work_pending());
+
+        let record = scheduler
+            .load_dispatch_record(dispatch_id)
+            .unwrap()
+            .expect("dispatch record must exist");
+        assert_eq!(record.state, DispatchState::InProgress);
+        let checkpoint = record
+            .last_checkpoint
+            .clone()
+            .expect("first tick must persist a checkpoint");
+        assert_eq!(checkpoint.job_kind, JobKind::SnapshotPruner);
+        assert_eq!(checkpoint.progress.items_processed, 1);
+
+        let _stopped_service = scheduler.take_last_service();
+        let resumable = scheduler.load_resumable_records().unwrap();
+        assert_eq!(resumable.len(), 1);
+        assert_eq!(resumable[0].dispatch_id, dispatch_id);
+
+        let resumed = FallibleMockJob::resume(resumable[0].last_checkpoint.clone()).unwrap();
+        let resumed_id = scheduler
+            .register_resumable_fallible_incremental_job("snapshot-pruner", resumed, dispatch_id)
+            .unwrap();
+        assert_eq!(resumed_id, dispatch_id);
+
+        let report = scheduler.run_cycle();
+        assert_eq!(report.total_processed, 1);
+        assert!(!scheduler.any_work_pending());
+
+        let completed = scheduler
+            .load_dispatch_record(dispatch_id)
+            .unwrap()
+            .expect("dispatch record must exist");
+        assert_eq!(completed.state, DispatchState::Completed);
+        let checkpoint = completed
+            .last_checkpoint
+            .expect("completed tick must persist a checkpoint");
+        assert_eq!(checkpoint.progress.items_processed, 2);
     }
 
     #[test]

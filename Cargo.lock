@@ -3478,7 +3478,9 @@ version = "0.421.0"
 dependencies = [
  "blake3",
  "tidefs-gc-pin-set",
+ "tidefs-incremental-job-core",
  "tidefs-local-object-store",
+ "tidefs-types-incremental-job-core",
  "tidefs-types-reclaim-queue-core",
 ]
 
