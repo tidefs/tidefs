@@ -2809,7 +2809,7 @@ fn scheduler_admission_terminal(
     byte_state: PrefetchExecutorByteState,
     refusal: StorageIntentRefusalReason,
 ) -> PrefetchExecutorRecord {
-    let scheduler_refusal = scheduler_admission_refusal(input, record.action_family);
+    let scheduler_refusal = scheduler_admission_ref_refusal(input);
     if scheduler_refusal as u16 != StorageIntentRefusalReason::None as u16 {
         terminal(
             record,
@@ -3294,6 +3294,10 @@ fn scheduler_admission_refusal(
         return StorageIntentRefusalReason::None;
     }
 
+    scheduler_admission_ref_refusal(input)
+}
+
+fn scheduler_admission_ref_refusal(input: PrefetchExecutorInput) -> StorageIntentRefusalReason {
     if snapshot_contains_fresh_ref(
         input,
         StorageIntentEvidenceKind::SchedulerAdmissionRecord,
@@ -4775,6 +4779,24 @@ mod tests {
             StorageIntentRefusalReason::EvidenceNotUsable
         );
         assert_record_has_no_authority_claims(wrong_kind_record);
+
+        let mut unsupported_terminal = admitted_input(PrefetchResidencyCandidateClass::Cooldown);
+        unsupported_terminal.admission = unsupported_terminal.admission.with_outcome(
+            PrefetchExecutorAdmissionOutcome::Unavailable,
+            StorageIntentRefusalReason::EvidenceNotUsable,
+        );
+        unsupported_terminal.admission.scheduler_admission_ref = EMPTY_EVIDENCE_REF;
+        let unsupported_record = evaluate_prefetch_execution(unsupported_terminal);
+        assert_eq!(unsupported_record.outcome, PrefetchExecutorOutcome::Blocked);
+        assert_eq!(
+            unsupported_record.executor_byte_state,
+            PrefetchExecutorByteState::Blocked
+        );
+        assert_eq!(
+            unsupported_record.refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+        assert_record_has_no_authority_claims(unsupported_record);
     }
 
     #[test]
