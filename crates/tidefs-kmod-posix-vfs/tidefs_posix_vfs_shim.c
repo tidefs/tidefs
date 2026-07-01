@@ -475,7 +475,13 @@ int tidefs_posix_vfs_engine_init_mounted(
 	unsigned int major,
 	unsigned int minor,
 	unsigned long long inode_table_root,
-	unsigned long long extent_map_root);
+	unsigned long long extent_map_root,
+	unsigned long long intent_log_head,
+	unsigned long long intent_log_tail,
+	unsigned long long replay_replayed,
+	unsigned long long replay_skipped,
+	unsigned long long replay_errored,
+	unsigned char clean_export);
 int tidefs_posix_vfs_engine_teardown_mounted(void);
 void tidefs_posix_vfs_engine_record_cluster_config(
 	const char *cluster_node_id,
@@ -637,11 +643,19 @@ struct tidefs_posix_vfs_kernel_pool_core {
 	u64 total_inodes;
 	u64 free_inodes;
 	u32 name_max;
+	u64 inode_table_root;
+	u64 extent_map_root;
+	u64 intent_log_head;
+	u64 intent_log_tail;
+	u64 replay_replayed;
+	u64 replay_skipped;
+	u64 replay_errored;
+	bool clean_export;
 	/*
-	 * Small kernel-resident namespace/data table for the first block-backed
-	 * mounted operations.  It is persisted in the pool data region so the
-	 * basic no-daemon QEMU gate can prove remount survival without a userspace
-	 * helper.  The full object/extent engine replaces this fixed table later.
+	 * Legacy kernel-resident namespace/data table retained for older fixed
+	 * table operations.  Engine-backed replay mounts do not load this table as
+	 * successful mount authority; they must import committed-root object,
+	 * extent, inode, and replay state before the root dentry is created.
 	 */
 	u64 next_ino;
 	u64 next_generation;
@@ -963,6 +977,14 @@ static struct tidefs_posix_vfs_mount *tidefs_posix_vfs_mount_new_engine_replay(
 	ctx->pool.total_inodes = ctx->total_inodes;
 	ctx->pool.free_inodes = ctx->free_inodes;
 	ctx->pool.name_max = ctx->name_max;
+	ctx->pool.inode_table_root = mo->inode_table_root;
+	ctx->pool.extent_map_root = mo->extent_map_root;
+	ctx->pool.intent_log_head = mo->intent_log_head;
+	ctx->pool.intent_log_tail = mo->intent_log_tail;
+	ctx->pool.replay_replayed = mo->replay_replayed;
+	ctx->pool.replay_skipped = mo->replay_skipped;
+	ctx->pool.replay_errored = mo->replay_errored;
+	ctx->pool.clean_export = mo->clean_export != 0;
 	ctx->pool.next_ino = mo->root_ino + 1;
 	ctx->pool.next_generation = 1;
 	ctx->pool.nr_inodes = 0;
@@ -1094,10 +1116,10 @@ static int tidefs_kernel_pool_publish_committed_root(
 
 	ret = tidefs_posix_vfs_engine_encode_committed_root_vrbt(
 		pool->committed_txg,
+		pool->root_ino,
 		tidefs_kernel_pool_state_base(pool),
 		tidefs_kernel_pool_state_base(pool),
-		0,
-		0,
+		pool->intent_log_tail,
 		pool->committed_txg,
 		root_sector,
 		vrbt,
@@ -1287,6 +1309,15 @@ static int tidefs_posix_vfs_activate_engine(struct tidefs_posix_vfs_mount *ctx)
 
 	if (!ctx || !ctx->engine_backed || !ctx->pool.imported)
 		return -ENODEV;
+	if (ctx->root_ino == 0 ||
+	    ctx->pool.inode_table_root == 0 ||
+	    ctx->pool.extent_map_root == 0) {
+		pr_err("tidefs_posix_vfs: engine activation refused missing committed-root import root=%llu inode_root=%llu extent_root=%llu\n",
+		       ctx->root_ino,
+		       ctx->pool.inode_table_root,
+		       ctx->pool.extent_map_root);
+		return -EINVAL;
+	}
 
 	mutex_lock(&tidefs_posix_vfs_engine_switch_lock);
 	if (g_active_engine_ctx == ctx && g_engine_pool == &ctx->pool) {
@@ -1331,8 +1362,14 @@ static int tidefs_posix_vfs_activate_engine(struct tidefs_posix_vfs_mount *ctx)
 		ctx->pool.pool_uuid,
 		major,
 		minor,
-		0ULL,
-		0ULL);
+		ctx->pool.inode_table_root,
+		ctx->pool.extent_map_root,
+		ctx->pool.intent_log_head,
+		ctx->pool.intent_log_tail,
+		ctx->pool.replay_replayed,
+		ctx->pool.replay_skipped,
+		ctx->pool.replay_errored,
+		ctx->pool.clean_export ? 1 : 0);
 	if (ret == 0) {
 		tidefs_posix_vfs_engine_record_cluster_config(
 			ctx->cluster_node_id,
@@ -1347,6 +1384,27 @@ static int tidefs_posix_vfs_activate_engine(struct tidefs_posix_vfs_mount *ctx)
 
 	mutex_unlock(&tidefs_posix_vfs_engine_switch_lock);
 	return ret;
+}
+
+static void tidefs_posix_vfs_abort_active_engine(
+	struct tidefs_posix_vfs_mount *ctx)
+{
+	int ret;
+
+	if (!ctx || !ctx->engine_activated)
+		return;
+
+	mutex_lock(&tidefs_posix_vfs_engine_switch_lock);
+	if (g_active_engine_ctx == ctx) {
+		ret = tidefs_posix_vfs_engine_teardown_mounted();
+		if (ret < 0)
+			pr_warn("tidefs_posix_vfs: mount-error engine teardown returned %d\n",
+				ret);
+		g_active_engine_ctx = NULL;
+		g_engine_pool = NULL;
+	}
+	ctx->engine_activated = false;
+	mutex_unlock(&tidefs_posix_vfs_engine_switch_lock);
 }
 
 static int tidefs_kernel_pool_persist_state(
@@ -1480,6 +1538,7 @@ out_free:
 	kfree(inos);
 }
 
+__attribute__((unused))
 static int tidefs_kernel_pool_load_state(
 	struct tidefs_posix_vfs_kernel_pool_core *pool)
 {
@@ -6703,6 +6762,7 @@ static int tidefs_posix_vfs_fill_super_bdev(struct super_block *sb,
 	void *label_buf = NULL;
 	void *ledger_buf = NULL;
 	struct inode *root;
+	struct tidefs_posix_vfs_engine_attr_out root_attr;
 	int ret;
 
 	if (!sb->s_bdev) {
@@ -6916,10 +6976,21 @@ static int tidefs_posix_vfs_fill_super_bdev(struct super_block *sb,
 			goto out_free;
 		}
 
-		pr_info("tidefs_posix_vfs: replay mount: root_ino=%llu txg=%llu replay=%llu/%llu/%llu clean=%u\n",
+		pr_info("tidefs_posix_vfs: replay mount: root_ino=%llu txg=%llu inode_root=%llu extent_root=%llu replay=%llu/%llu/%llu clean=%u\n",
 			replay_out.root_ino, replay_out.committed_txg,
+			replay_out.inode_table_root, replay_out.extent_map_root,
 			replay_out.replay_replayed, replay_out.replay_skipped,
 			replay_out.replay_errored, replay_out.clean_export);
+		if (replay_out.root_ino == 0 ||
+		    replay_out.inode_table_root == 0 ||
+		    replay_out.extent_map_root == 0) {
+			pr_err("tidefs_posix_vfs: replay mount refused missing committed-root import root=%llu inode_root=%llu extent_root=%llu\n",
+			       replay_out.root_ino,
+			       replay_out.inode_table_root,
+			       replay_out.extent_map_root);
+			ret = -ENODEV;
+			goto out_free;
+		}
 
 		/* ── Phase 5: Create root inode/dentry and store context ─────────── */
 		ctx = tidefs_posix_vfs_mount_new_engine_replay(sb, &label_out, &replay_out);
@@ -6950,27 +7021,21 @@ static int tidefs_posix_vfs_fill_super_bdev(struct super_block *sb,
 			if (ret < 0)
 				goto out_free;
 		}
-		/* Restore persisted kernel namespace state from the block
-		 * device so that inodes, directory entries, and names created
-		 * before the last crash survive remount. The Rust replay
-		 * adapter selects the committed root; the C pool inode table
-		 * carries the runtime namespace state between mounts. */
-		ret = tidefs_kernel_pool_load_state(&ctx->pool);
-		if (ret != 0) {
-			pr_err("tidefs_posix_vfs: failed to load pool namespace state (err=%d)\n", ret);
-			goto out_free;
-		}
 		ctx->committed_txg = ctx->pool.committed_txg;
-	}
+		pr_info("tidefs_posix_vfs: imported committed-root authority: inode_root=%llu extent_root=%llu intent=%llu..%llu replay=%llu/%llu/%llu\n",
+			ctx->pool.inode_table_root,
+			ctx->pool.extent_map_root,
+			ctx->pool.intent_log_head,
+			ctx->pool.intent_log_tail,
+			ctx->pool.replay_replayed,
+			ctx->pool.replay_skipped,
+			ctx->pool.replay_errored);
+		}
 
 	} /* ── end Phase 3.5 (intent-log read + replay mount) ──────────── */
 
 	sb->s_fs_info = ctx;
 	sb->s_magic = TIDEFS_POSIX_TFS_MAGIC;
-
-	/* Rust engine activation is tied to mounted VFS operations, not
-	 * fill_super.  Detached mounts that fail namespace attachment must not
-	 * replace the engine backing another mounted superblock. */
 
 	sb->s_maxbytes = MAX_LFS_FILESIZE;
 	sb->s_blocksize = ctx->block_size;
@@ -6983,17 +7048,32 @@ static int tidefs_posix_vfs_fill_super_bdev(struct super_block *sb,
 	sb->s_xattr = tidefs_posix_vfs_xattr_handlers;
 	sb->s_time_gran = 1;
 
+	ret = tidefs_posix_vfs_activate_engine(ctx);
+	if (ret < 0) {
+		pr_err("tidefs_posix_vfs: committed-root engine activation failed before root dentry (err=%d)\n",
+		       ret);
+		goto err_mount;
+	}
+
+	memset(&root_attr, 0, sizeof(root_attr));
+	ret = tidefs_posix_vfs_engine_getattr(ctx->root_ino, &root_attr);
+	if (ret < 0) {
+		pr_err("tidefs_posix_vfs: imported root getattr failed before root dentry (err=%d)\n",
+		       ret);
+		goto err_mount;
+	}
+	if (root_attr.ino != ctx->root_ino || !S_ISDIR(root_attr.mode)) {
+		pr_err("tidefs_posix_vfs: imported root refused ino=%llu expected=%llu mode=%o\n",
+		       root_attr.ino, ctx->root_ino, root_attr.mode);
+		ret = -EIO;
+		goto err_mount;
+	}
+
 	root = new_inode(sb);
 	if (!root)
 		goto err_nomem;
 
-	root->i_ino = ctx->root_ino;
-	root->i_generation = ctx->root_ino;
-	inode_init_owner(&nop_mnt_idmap, root, NULL, S_IFDIR | 0755);
-	root->i_op = &tidefs_posix_vfs_dir_inode_operations;
-	root->i_fop = &tidefs_posix_vfs_dir_file_operations;
-	set_nlink(root, 2);
-	simple_inode_init_ts(root);
+	tidefs_posix_vfs_apply_engine_attr(root, &root_attr);
 
 	sb->s_root = d_make_root(root);
 	if (!sb->s_root)
@@ -7008,10 +7088,13 @@ static int tidefs_posix_vfs_fill_super_bdev(struct super_block *sb,
 	return 0;
 
 err_nomem:
+	ret = -ENOMEM;
+err_mount:
 	sb->s_fs_info = NULL;
+	tidefs_posix_vfs_abort_active_engine(ctx);
+	tidefs_posix_vfs_pool_core_teardown(ctx);
 	tidefs_posix_vfs_mount_free(ctx);
 	ctx = NULL;
-	ret = -ENOMEM;
 
 out_free:
 	if (bh)

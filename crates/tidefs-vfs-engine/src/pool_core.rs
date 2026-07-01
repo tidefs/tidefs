@@ -5,14 +5,17 @@
 //! POSIX VFS kmod and block-kmod frontends. It carries pool identity,
 //! lower-device descriptors, and explicit lifecycle tracking (Configured ->
 //! Importing -> Mounted -> Teardown) with atomic refcounting and fail-closed
-//! state transitions.
+//! state transitions.  Imported committed-root state is stored only after the
+//! mount path proves the root inode, inode table, extent map, and replay cursor
+//! are present; incomplete import evidence fails closed before `Mounted`.
 //!
 //! # Safety and locking
 //!
 //! This module is safe `no_std` code under `#![forbid(unsafe_code)]`. State
-//! transitions use `AtomicU64` compare-and-swap loops. The committed root
-//! is NOT stored inside [`KernelPoolCore`] because an atomic state+root
-//! update requires a spinlock (see [Kernel Locking](#kernel-locking)).
+//! transitions use `AtomicU64` compare-and-swap loops. Imported committed-root
+//! state is immutable once recorded. Mutable committed-root publication still
+//! belongs to the kernel crate's lock-protected state (see
+//! [Kernel Locking](#kernel-locking)).
 //!
 //! # Kernel locking
 //!
@@ -21,10 +24,10 @@
 //! canonical integration point is:
 //!
 //! 1. Kernel crate acquires its spinlock.
-//! 2. Kernel crate calls [`KernelPoolCore::complete_import`] (CAS
-//!    Importing->Mounted).
-//! 3. Kernel crate stores the committed root in its own lock-protected
-//!    state while holding the spinlock.
+//! 2. Kernel crate records the immutable imported root and calls
+//!    [`KernelPoolCore::complete_import_with_root`] (CAS Importing->Mounted).
+//! 3. Later committed-root updates stay in its own lock-protected state while
+//!    holding the spinlock.
 //! 4. Kernel crate releases the spinlock.
 //!
 //! This two-phase protocol keeps `tidefs-vfs-engine` free of mutable
@@ -163,6 +166,86 @@ impl KernelPoolConfig {
     }
 }
 
+// ── Imported committed-root state ─────────────────────────────────────
+
+/// Replay cursor and refusal evidence captured during committed-root import.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KernelPoolReplayCursor {
+    /// Most recent intent-log record referenced by the committed-root block.
+    pub intent_log_head: u64,
+    /// Oldest replayable intent-log record frontier.
+    pub intent_log_tail: u64,
+    /// Number of intent-log records replayed during import.
+    pub replay_replayed: u64,
+    /// Number of intent-log records skipped during import.
+    pub replay_skipped: u64,
+    /// Number of intent-log records refused or errored during import.
+    pub replay_errored: u64,
+    /// Whether the imported pool was cleanly exported.
+    pub clean_export: bool,
+}
+
+impl KernelPoolReplayCursor {
+    #[must_use]
+    pub const fn new(
+        intent_log_head: u64,
+        intent_log_tail: u64,
+        replay_replayed: u64,
+        replay_skipped: u64,
+        replay_errored: u64,
+        clean_export: bool,
+    ) -> Self {
+        Self {
+            intent_log_head,
+            intent_log_tail,
+            replay_replayed,
+            replay_skipped,
+            replay_errored,
+            clean_export,
+        }
+    }
+}
+
+/// Immutable committed-root object/extent/inode import selected for a mount.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KernelPoolImportedRoot {
+    /// Pool UUID from the selected committed-root ledger anchor.
+    pub pool_uuid: [u8; 16],
+    /// Root inode selected from the committed-root ledger.
+    pub root_ino: u64,
+    /// Committed transaction group selected for import.
+    pub committed_txg: u64,
+    /// Inode table root locator decoded from the committed-root VRBT.
+    pub inode_table_root: u64,
+    /// Extent map root locator decoded from the committed-root VRBT.
+    pub extent_map_root: u64,
+    /// Replay cursor and refusal evidence associated with this import.
+    pub replay_cursor: KernelPoolReplayCursor,
+}
+
+impl KernelPoolImportedRoot {
+    pub fn new(
+        pool_uuid: [u8; 16],
+        root_ino: u64,
+        committed_txg: u64,
+        inode_table_root: u64,
+        extent_map_root: u64,
+        replay_cursor: KernelPoolReplayCursor,
+    ) -> Result<Self, KernelPoolError> {
+        if root_ino == 0 || inode_table_root == 0 || extent_map_root == 0 {
+            return Err(KernelPoolError::MissingImportedRoot);
+        }
+        Ok(Self {
+            pool_uuid,
+            root_ino,
+            committed_txg,
+            inode_table_root,
+            extent_map_root,
+            replay_cursor,
+        })
+    }
+}
+
 // ── Pool core errors ───────────────────────────────────────────────────
 
 /// Errors returned by [`KernelPoolCore`] operations.
@@ -178,6 +261,7 @@ pub enum KernelPoolError {
     TeardownInProgress,
     AlreadyMounted,
     RefcountNotZero,
+    MissingImportedRoot,
 }
 
 impl fmt::Display for KernelPoolError {
@@ -192,6 +276,12 @@ impl fmt::Display for KernelPoolError {
             Self::TeardownInProgress => write!(f, "pool teardown in progress"),
             Self::AlreadyMounted => write!(f, "pool is already mounted"),
             Self::RefcountNotZero => write!(f, "pool refcount is not zero"),
+            Self::MissingImportedRoot => {
+                write!(
+                    f,
+                    "pool import is missing committed-root object/extent/inode state"
+                )
+            }
         }
     }
 }
@@ -202,13 +292,14 @@ impl fmt::Display for KernelPoolError {
 ///
 /// Created in [`Configured`](KernelPoolState::Configured) state with an
 /// initial reference count of 1. State transitions use `AtomicU64`
-/// compare-and-swap loops. The committed root is tracked externally;
-/// see [module-level docs](crate::pool_core#kernel-locking) for
-/// the kernel integration protocol.
+/// compare-and-swap loops. The immutable imported committed root is stored
+/// after import validation; mutable committed-root publication is tracked
+/// externally by the kernel crate.
 pub struct KernelPoolCore {
     refcount: AtomicU64,
     state: AtomicU64,
     config: KernelPoolConfig,
+    imported_root: Option<KernelPoolImportedRoot>,
 }
 
 impl KernelPoolCore {
@@ -225,6 +316,7 @@ impl KernelPoolCore {
             refcount: AtomicU64::new(1),
             state: AtomicU64::new(KernelPoolState::Configured.to_u64()),
             config,
+            imported_root: None,
         })
     }
 
@@ -249,6 +341,27 @@ impl KernelPoolCore {
     #[inline]
     pub fn complete_import(&self) -> Result<(), KernelPoolError> {
         self.try_transition(KernelPoolState::Importing, KernelPoolState::Mounted)
+    }
+
+    /// Complete import with validated committed-root object/extent/inode state.
+    ///
+    /// This is the fail-closed mount path: the pool reaches `Mounted` only
+    /// when a nonzero root inode, inode-table root, extent-map root, and replay
+    /// cursor have already been captured.
+    #[inline]
+    pub fn complete_import_with_root(
+        &mut self,
+        imported_root: KernelPoolImportedRoot,
+    ) -> Result<(), KernelPoolError> {
+        if imported_root.root_ino == 0
+            || imported_root.inode_table_root == 0
+            || imported_root.extent_map_root == 0
+        {
+            return Err(KernelPoolError::MissingImportedRoot);
+        }
+        self.complete_import()?;
+        self.imported_root = Some(imported_root);
+        Ok(())
     }
 
     /// Begin tearing down the pool.
@@ -340,6 +453,13 @@ impl KernelPoolCore {
         &self.config
     }
 
+    /// Return the immutable imported committed-root state, if the pool was
+    /// mounted through the fail-closed committed-root import path.
+    #[inline]
+    pub fn imported_root(&self) -> Option<KernelPoolImportedRoot> {
+        self.imported_root
+    }
+
     // ── Internal helpers ──────────────────────────────────────────────
 
     /// CAS loop: atomically transition from `expected` to `target`.
@@ -393,6 +513,7 @@ impl fmt::Debug for KernelPoolCore {
             .field("state", &self.state())
             .field("refcount", &self.ref_count())
             .field("device_count", &self.config.device_count())
+            .field("imported_root", &self.imported_root)
             .finish()
     }
 }
@@ -456,6 +577,18 @@ mod tests {
         )
     }
 
+    fn sample_imported_root() -> KernelPoolImportedRoot {
+        KernelPoolImportedRoot::new(
+            [0xABu8; 16],
+            1,
+            7,
+            4096,
+            8192,
+            KernelPoolReplayCursor::new(0, 0, 1, 0, 0, true),
+        )
+        .expect("imported root")
+    }
+
     // ── Construction ──────────────────────────────────────────────────
 
     #[test]
@@ -464,6 +597,7 @@ mod tests {
         assert_eq!(pool.state(), KernelPoolState::Configured);
         assert_eq!(pool.ref_count(), 1);
         assert_eq!(pool.device_count(), 2);
+        assert_eq!(pool.imported_root(), None);
     }
 
     #[test]
@@ -540,6 +674,37 @@ mod tests {
         pool.begin_import().expect("begin_import");
         pool.complete_import().expect("complete_import");
         assert_eq!(pool.state(), KernelPoolState::Mounted);
+    }
+
+    #[test]
+    fn complete_import_with_root_records_imported_authority() {
+        let mut pool = KernelPoolCore::new(sample_config()).expect("new");
+        let root = sample_imported_root();
+
+        pool.begin_import().expect("begin_import");
+        pool.complete_import_with_root(root)
+            .expect("complete_import_with_root");
+
+        assert_eq!(pool.state(), KernelPoolState::Mounted);
+        assert_eq!(pool.imported_root(), Some(root));
+    }
+
+    #[test]
+    fn imported_root_rejects_missing_object_or_extent_authority() {
+        let replay = KernelPoolReplayCursor::new(0, 0, 0, 0, 1, false);
+
+        assert_eq!(
+            KernelPoolImportedRoot::new([0xABu8; 16], 0, 7, 4096, 8192, replay).unwrap_err(),
+            KernelPoolError::MissingImportedRoot
+        );
+        assert_eq!(
+            KernelPoolImportedRoot::new([0xABu8; 16], 1, 7, 0, 8192, replay).unwrap_err(),
+            KernelPoolError::MissingImportedRoot
+        );
+        assert_eq!(
+            KernelPoolImportedRoot::new([0xABu8; 16], 1, 7, 4096, 0, replay).unwrap_err(),
+            KernelPoolError::MissingImportedRoot
+        );
     }
 
     #[test]

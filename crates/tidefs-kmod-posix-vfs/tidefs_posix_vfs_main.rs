@@ -305,9 +305,10 @@ impl KernelEngine {
 
     /// Create a KernelEngine backed by a KernelPoolCore for write-path authority.
     ///
-    /// The pool core must be in Mounted state before any writeback or txg commit
-    /// operations will succeed. Callers should call `pool_core.complete_import()`
-    /// before passing it here.
+    /// The pool core must be in Mounted state with imported committed-root
+    /// authority before any writeback or txg commit operations will succeed.
+    /// Callers should call `pool_core.complete_import_with_root()` before
+    /// passing it here.
     #[allow(dead_code)]
     fn with_pool_core(
         statfs: Option<KernelEngineStatfs>,
@@ -2947,7 +2948,6 @@ impl KernelEngine {
         inode_table_root: u64,
         extent_map_root: u64,
         intent_log_tail: u64,
-        root_sector: u64,
     ) -> crate::tidefs_kmod_bridge::kernel_types::KmodVec<u8> {
         let mut block = crate::tidefs_kmod_bridge::kernel_types::KmodVec::new();
         block.extend_from_slice(&Self::VRBT_MAGIC);
@@ -2957,22 +2957,13 @@ impl KernelEngine {
         block.extend_from_slice(&inode_table_root.to_le_bytes());
         block.extend_from_slice(&extent_map_root.to_le_bytes());
         block.extend_from_slice(&intent_log_tail.to_le_bytes());
-        // Pad to header size with reserved bytes
         while block.len() < Self::VRBT_HEADER_SIZE {
             block.push(0u8);
         }
-        // Compute BLAKE3 hash over header
         let hash_bytes: [u8; 32] = crate::blake3::hash(&block[..Self::VRBT_HEADER_SIZE]).into();
         block.extend_from_slice(&hash_bytes);
-        // Pad to wire size
         while block.len() < Self::VRBT_WIRE_SIZE {
             block.push(0u8);
-        }
-        // Write root_sector into reserved bytes (past header, before hash padding)
-        // bytes 48..56: root_sector (little-endian)
-        let rs_bytes = root_sector.to_le_bytes();
-        for (i, b) in rs_bytes.iter().enumerate() {
-            block[48 + i] = *b;
         }
         block
     }
@@ -6710,7 +6701,7 @@ impl crate::tidefs_kmod_bridge::kernel_types::VfsEngine for KernelEngine {
     /// explicit read, write, flush, capacity, and teardown authority.
     fn write_committed_root(
         &self,
-        committed_root: &crate::tidefs_kmod_bridge::kernel_types::CommittedRoot,
+        _committed_root: &crate::tidefs_kmod_bridge::kernel_types::CommittedRoot,
         _device_index: u32,
     ) -> core::result::Result<(), crate::tidefs_kmod_bridge::kernel_types::Errno> {
         if !self.pool_is_mounted() {
@@ -6719,7 +6710,6 @@ impl crate::tidefs_kmod_bridge::kernel_types::VfsEngine for KernelEngine {
 
         let io_ctx = self.mounted_pool_io_ctx()?;
 
-        let root_hash = *committed_root.as_bytes();
         let committed_txg = io_ctx.committed_txg;
 
         // Determine where to place VRBT and VCRP within the superblock region.
@@ -6739,14 +6729,17 @@ impl crate::tidefs_kmod_bridge::kernel_types::VfsEngine for KernelEngine {
 
         // Encode the VRBT committed-root block.
         let intent_tail = self.intent_log_tail.get();
+        let inode_table_root = self.inode_table_root.get().max(io_ctx.root_ino);
+        let extent_map_root = self.extent_map_root.get().max(inode_table_root);
         let vrbt = Self::encode_vrbt_block(
             committed_txg,
             io_ctx.root_ino, // namespace_root
-            io_ctx.root_ino, // inode_table_root (same region for bootstrap)
-            0,               // extent_map_root
+            inode_table_root,
+            extent_map_root,
             intent_tail,     // intent_log_tail
-            root_sector,
         );
+        let mut root_hash = [0u8; 32];
+        root_hash.copy_from_slice(&vrbt[Self::VRBT_HASH_OFFSET..Self::VRBT_WIRE_SIZE]);
 
         // Encode the VCRP pointer record.
         let vcrp = Self::encode_vcrp_record(
@@ -8539,6 +8532,12 @@ pub extern "C" fn tidefs_posix_vfs_engine_init_mounted(
     minor: u32,
     inode_table_root: u64,
     extent_map_root: u64,
+    intent_log_head: u64,
+    intent_log_tail: u64,
+    replay_replayed: u64,
+    replay_skipped: u64,
+    replay_errored: u64,
+    clean_export: u8,
 ) -> core::ffi::c_int {
     if pool_uuid.is_null() {
         kernel::pr_err!("tidefs_posix_vfs: engine_init_mounted: null pool_uuid\n");
@@ -8558,14 +8557,18 @@ pub extern "C" fn tidefs_posix_vfs_engine_init_mounted(
         || sb_size == 0
         || sb_offset % u64::from(sector_size) != 0
         || root_ino == 0
+        || inode_table_root == 0
+        || extent_map_root == 0
     {
         kernel::pr_err!(
-            "tidefs_posix_vfs: engine_init_mounted: invalid pool geometry sector={} sb_off={} sb_size={} capacity={} root={}\n",
+            "tidefs_posix_vfs: engine_init_mounted: invalid pool import sector={} sb_off={} sb_size={} capacity={} root={} inode_root={} extent_root={}\n",
             sector_size,
             sb_offset,
             sb_size,
             device_capacity_bytes,
             root_ino,
+            inode_table_root,
+            extent_map_root,
         );
         return -22; // EINVAL
     }
@@ -8637,6 +8640,31 @@ pub extern "C" fn tidefs_posix_vfs_engine_init_mounted(
         }
     };
     pool_core.set_committed_root_io_ctx(io_ctx);
+    let replay_cursor = crate::tidefs_kmod_bridge::kernel_types::KernelPoolReplayCursor::new(
+        intent_log_head,
+        intent_log_tail,
+        replay_replayed,
+        replay_skipped,
+        replay_errored,
+        clean_export != 0,
+    );
+    let imported_root = match crate::tidefs_kmod_bridge::kernel_types::KernelPoolImportedRoot::new(
+        uuid,
+        root_ino,
+        committed_txg,
+        inode_table_root,
+        extent_map_root,
+        replay_cursor,
+    ) {
+        Ok(root) => root,
+        Err(e) => {
+            kernel::pr_err!(
+                "tidefs_posix_vfs: engine_init_mounted: invalid imported root: {:?}\n",
+                e
+            );
+            return -19; // ENODEV
+        }
+    };
     // Transition through the pool lifecycle: Configured → Importing → Mounted.
     // The C shim already validated the block device and committed-root ledger,
     // so we complete the full state machine here.
@@ -8647,7 +8675,7 @@ pub extern "C" fn tidefs_posix_vfs_engine_init_mounted(
         );
         return -5; // EIO
     }
-    if let Err(e) = pool_core.complete_import() {
+    if let Err(e) = pool_core.complete_import_with_root(imported_root) {
         kernel::pr_err!(
             "tidefs_posix_vfs: engine_init_mounted: complete_import failed: {:?}\n",
             e
@@ -8657,17 +8685,38 @@ pub extern "C" fn tidefs_posix_vfs_engine_init_mounted(
 
     let engine = KernelEngine::with_pool_core(None, pool_core);
     engine.set_vrbt_pointers(inode_table_root, extent_map_root);
+    engine.intent_log_tail.set(intent_log_tail);
     match engine.load_namespace_snapshot() {
         Ok(true) => {
-            engine.ensure_root_inode(root_ino, sector_size);
         }
         Ok(false) => {
-            engine.ensure_root_inode(root_ino, sector_size);
         }
         Err(e) => {
             kernel::pr_err!(
                 "tidefs_posix_vfs: engine_init_mounted: namespace snapshot load failed: {:?}\n",
                 e,
+            );
+            return -5; // EIO
+        }
+    }
+    engine.ensure_root_inode(root_ino, sector_size);
+    let request = crate::tidefs_kmod_bridge::kernel_types::RequestCtx::default();
+    match engine.getattr(
+        crate::tidefs_kmod_bridge::kernel_types::InodeId::new(root_ino),
+        None,
+        &request,
+    ) {
+        Ok(attr) if attr.inode_id.get() == root_ino => {}
+        Ok(_) => {
+            kernel::pr_err!(
+                "tidefs_posix_vfs: engine_init_mounted: imported root inode mismatch\n"
+            );
+            return -5; // EIO
+        }
+        Err(e) => {
+            kernel::pr_err!(
+                "tidefs_posix_vfs: engine_init_mounted: imported root inode unavailable: {:?}\n",
+                e
             );
             return -5; // EIO
         }
@@ -8684,9 +8733,15 @@ pub extern "C" fn tidefs_posix_vfs_engine_init_mounted(
     }
 
     kernel::pr_info!(
-        "tidefs_posix_vfs: engine initialized: txg={} root_ino={} sb_ofs={} sb_sz={} ss={}\n",
+        "tidefs_posix_vfs: engine initialized: txg={} root_ino={} inode_root={} extent_root={} replay={}/{}/{} clean={} sb_ofs={} sb_sz={} ss={}\n",
         committed_txg,
         root_ino,
+        inode_table_root,
+        extent_map_root,
+        replay_replayed,
+        replay_skipped,
+        replay_errored,
+        clean_export,
         sb_offset,
         sb_size,
         sector_size,

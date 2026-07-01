@@ -2734,6 +2734,72 @@ mod kbuild_impl {
         }
     }
 
+    /// Replay cursor and refusal evidence captured during committed-root import.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct KernelPoolReplayCursor {
+        pub intent_log_head: u64,
+        pub intent_log_tail: u64,
+        pub replay_replayed: u64,
+        pub replay_skipped: u64,
+        pub replay_errored: u64,
+        pub clean_export: bool,
+    }
+
+    impl KernelPoolReplayCursor {
+        #[must_use]
+        pub const fn new(
+            intent_log_head: u64,
+            intent_log_tail: u64,
+            replay_replayed: u64,
+            replay_skipped: u64,
+            replay_errored: u64,
+            clean_export: bool,
+        ) -> Self {
+            Self {
+                intent_log_head,
+                intent_log_tail,
+                replay_replayed,
+                replay_skipped,
+                replay_errored,
+                clean_export,
+            }
+        }
+    }
+
+    /// Immutable committed-root object/extent/inode import selected for mount.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct KernelPoolImportedRoot {
+        pub pool_uuid: [u8; 32],
+        pub root_ino: u64,
+        pub committed_txg: u64,
+        pub inode_table_root: u64,
+        pub extent_map_root: u64,
+        pub replay_cursor: KernelPoolReplayCursor,
+    }
+
+    impl KernelPoolImportedRoot {
+        pub fn new(
+            pool_uuid: [u8; 32],
+            root_ino: u64,
+            committed_txg: u64,
+            inode_table_root: u64,
+            extent_map_root: u64,
+            replay_cursor: KernelPoolReplayCursor,
+        ) -> Result<Self, KernelPoolError> {
+            if root_ino == 0 || inode_table_root == 0 || extent_map_root == 0 {
+                return Err(KernelPoolError::MissingImportedRoot);
+            }
+            Ok(Self {
+                pool_uuid,
+                root_ino,
+                committed_txg,
+                inode_table_root,
+                extent_map_root,
+                replay_cursor,
+            })
+        }
+    }
+
     /// Errors returned by KernelPoolCore operations.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum KernelPoolError {
@@ -2748,6 +2814,7 @@ mod kbuild_impl {
         AlreadyMounted,
         RefcountNotZero,
         NotMounted,
+        MissingImportedRoot,
     }
 
     impl fmt::Display for KernelPoolError {
@@ -2763,6 +2830,9 @@ mod kbuild_impl {
                 Self::AlreadyMounted => write!(f, "pool is already mounted"),
                 Self::RefcountNotZero => write!(f, "pool refcount is not zero"),
                 Self::NotMounted => write!(f, "pool is not mounted — writes require mounted state"),
+                Self::MissingImportedRoot => {
+                    write!(f, "pool import is missing committed-root object/extent/inode state")
+                }
             }
         }
     }
@@ -2918,6 +2988,8 @@ mod kbuild_impl {
         config: KernelPoolConfig,
         /// C-provided I/O context for on-disk committed-root writes.
         committed_root_io: CommittedRootIoCtx,
+        /// Immutable committed-root import selected before Mounted.
+        imported_root: Option<KernelPoolImportedRoot>,
     }
 
     impl KernelPoolCore {
@@ -2931,6 +3003,7 @@ mod kbuild_impl {
                 state: AtomicU64::new(KernelPoolState::Configured.to_u64()),
                 config,
                 committed_root_io: CommittedRootIoCtx::unset(),
+                imported_root: None,
             })
         }
 
@@ -2956,6 +3029,22 @@ mod kbuild_impl {
         #[inline]
         pub fn complete_import(&self) -> Result<(), KernelPoolError> {
             self.try_transition(KernelPoolState::Importing, KernelPoolState::Mounted)
+        }
+
+        #[inline]
+        pub fn complete_import_with_root(
+            &mut self,
+            imported_root: KernelPoolImportedRoot,
+        ) -> Result<(), KernelPoolError> {
+            if imported_root.root_ino == 0
+                || imported_root.inode_table_root == 0
+                || imported_root.extent_map_root == 0
+            {
+                return Err(KernelPoolError::MissingImportedRoot);
+            }
+            self.complete_import()?;
+            self.imported_root = Some(imported_root);
+            Ok(())
         }
 
         #[inline]
@@ -3024,6 +3113,10 @@ mod kbuild_impl {
         #[inline]
         pub fn is_mounted(&self) -> bool {
             self.state() == KernelPoolState::Mounted
+        }
+        #[inline]
+        pub fn imported_root(&self) -> Option<KernelPoolImportedRoot> {
+            self.imported_root
         }
 
         #[inline]

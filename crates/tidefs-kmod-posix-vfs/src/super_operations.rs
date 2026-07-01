@@ -560,12 +560,46 @@ mod tests {
         buf.to_vec()
     }
 
-    fn make_ledger(txg: u64, root_ino: u64) -> crate::TideVec<u8> {
+    fn make_anchor(txg: u64, root_ino: u64) -> crate::superblock::CommittedRootAnchor {
         use crate::superblock::CommittedRootAnchor;
         let mut uuid = [0u8; 32];
         uuid[0..16].copy_from_slice(&[0xAA; 16]);
-        let anchor = CommittedRootAnchor::new(InodeId::new(root_ino), uuid, txg);
+        CommittedRootAnchor::new(InodeId::new(root_ino), uuid, txg)
+    }
+
+    fn make_ledger(txg: u64, root_ino: u64) -> crate::TideVec<u8> {
+        let anchor = make_anchor(txg, root_ino);
         MountRootSelector::encode_ledger(&[anchor])
+    }
+
+    fn make_vrbt(
+        committed_txg: u64,
+        root_ino: u64,
+        inode_table_root: u64,
+        extent_map_root: u64,
+        intent_log_tail: u64,
+    ) -> crate::TideVec<u8> {
+        let mut block = vec![0u8; crate::replay_integration::VRBT_WIRE_SIZE];
+        block[0..4].copy_from_slice(b"VRBT");
+        block[4..8].copy_from_slice(&1u32.to_le_bytes());
+        block[8..16].copy_from_slice(&committed_txg.to_le_bytes());
+        block[16..24].copy_from_slice(&root_ino.to_le_bytes());
+        block[24..32].copy_from_slice(&inode_table_root.to_le_bytes());
+        block[32..40].copy_from_slice(&extent_map_root.to_le_bytes());
+        block[40..48].copy_from_slice(&intent_log_tail.to_le_bytes());
+        let digest: [u8; 32] = blake3::hash(&block[..56]).into();
+        block[56..88].copy_from_slice(&digest);
+        block
+    }
+
+    fn make_superblock_region(txg: u64, root_ino: u64) -> crate::TideVec<u8> {
+        let anchor = make_anchor(txg, root_ino);
+        let mut region = MountRootSelector::encode_ledger(&[anchor]);
+        let vrbt = make_vrbt(txg, root_ino, 4096, 8192, 0);
+        region.resize(3 * 4096 + crate::replay_integration::VRBT_WIRE_SIZE, 0);
+        region[3 * 4096..3 * 4096 + crate::replay_integration::VRBT_WIRE_SIZE]
+            .copy_from_slice(&vrbt);
+        region
     }
 
     fn make_intent_create(parent: u64, name: &[u8], mode: u32, ino: u64) -> crate::TideVec<u8> {
@@ -627,7 +661,7 @@ mod tests {
     fn fill_super_from_device_success_no_recovery() {
         let engine = build_fs_engine(1);
         let label_buf = make_label_buf(PoolState::Active, 7);
-        let ledger_buf = make_ledger(7, 1);
+        let ledger_buf = make_superblock_region(7, 1);
 
         let (result, _engine) = fill_super_from_device(
             engine,
@@ -652,7 +686,7 @@ mod tests {
     fn fill_super_from_device_with_recovery_replays_intents() {
         let engine = build_fs_engine(1);
         let label_buf = make_label_buf(PoolState::Active, 7);
-        let ledger_buf = make_ledger(7, 1);
+        let ledger_buf = make_superblock_region(7, 1);
         let intent = make_intent_create(1, b"recovered", 0o644, 42);
 
         let (result, _engine) = fill_super_from_device(
@@ -721,7 +755,7 @@ mod tests {
     fn fill_super_from_device_returns_engine_for_reuse() {
         let engine = build_fs_engine(1);
         let label_buf = make_label_buf(PoolState::Active, 7);
-        let ledger_buf = make_ledger(7, 1);
+        let ledger_buf = make_superblock_region(7, 1);
 
         let (_result, engine) = fill_super_from_device(
             engine,
