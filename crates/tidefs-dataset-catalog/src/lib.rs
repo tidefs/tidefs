@@ -333,6 +333,108 @@ impl fmt::Display for LifecycleState {
         }
     }
 }
+
+/// Same-dataset mutation observed by a future snapshot-pruner scheduler.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SnapshotPruneCatalogMutationKind {
+    /// A snapshot destroy is already mutating this dataset's snapshot set.
+    SnapshotDestroy,
+    /// Dataset destroy is already mutating this dataset.
+    DatasetDestroy,
+    /// Receive-delete handling is already mutating this dataset's snapshot set.
+    ReceiveDelete,
+    /// A snapshot-pruner job is already mutating this dataset's snapshot set.
+    SnapshotPrune,
+}
+
+/// Catalog-side admission request for future scheduled snapshot pruning.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SnapshotPruneCatalogAdmissionRequest<'a> {
+    /// Dataset path to admit.
+    pub path: &'a str,
+    /// Expected stable identity from the scheduler's current plan, if any.
+    pub expected_dataset_id: Option<DatasetId>,
+    /// Expected creation transaction group from the current plan, if any.
+    pub expected_creation_txg: Option<u64>,
+    /// Same-dataset mutation observed outside the catalog, if any.
+    pub same_dataset_mutation: Option<SnapshotPruneCatalogMutationKind>,
+}
+
+impl<'a> SnapshotPruneCatalogAdmissionRequest<'a> {
+    /// Create a request for `path` with no freshness or conflict hints.
+    #[must_use]
+    pub const fn new(path: &'a str) -> Self {
+        Self {
+            path,
+            expected_dataset_id: None,
+            expected_creation_txg: None,
+            same_dataset_mutation: None,
+        }
+    }
+
+    /// Attach the expected stable dataset identity.
+    #[must_use]
+    pub const fn with_expected_dataset_id(mut self, dataset_id: DatasetId) -> Self {
+        self.expected_dataset_id = Some(dataset_id);
+        self
+    }
+
+    /// Attach the expected creation transaction group.
+    #[must_use]
+    pub const fn with_expected_creation_txg(mut self, creation_txg: u64) -> Self {
+        self.expected_creation_txg = Some(creation_txg);
+        self
+    }
+
+    /// Attach an observed same-dataset mutation conflict.
+    #[must_use]
+    pub const fn with_same_dataset_mutation(
+        mut self,
+        mutation: SnapshotPruneCatalogMutationKind,
+    ) -> Self {
+        self.same_dataset_mutation = Some(mutation);
+        self
+    }
+}
+
+/// Current catalog evidence admitted for a fresh snapshot-prune plan.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SnapshotPruneCatalogEvidence {
+    /// Current path that resolved to this evidence.
+    pub path: String,
+    /// Stable dataset identity.
+    pub dataset_id: DatasetId,
+    /// Dataset type recorded in the catalog.
+    pub dataset_type: DatasetType,
+    /// Creation transaction group recorded in the catalog.
+    pub creation_txg: u64,
+    /// Dataset flags recorded in the catalog.
+    pub flags: DatasetFlags,
+    /// Published lineage summary for freshness checks.
+    pub lineage_summary: [u8; 32],
+}
+
+/// Fail-closed catalog refusal reason for snapshot-prune admission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SnapshotPruneCatalogRefusalReason {
+    /// The requested catalog entry was missing.
+    MissingCatalogEntry,
+    /// The caller's planned identity or creation generation is stale.
+    StaleCatalogEvidence {
+        expected_dataset_id: Option<DatasetId>,
+        actual_dataset_id: DatasetId,
+        expected_creation_txg: Option<u64>,
+        actual_creation_txg: u64,
+    },
+    /// The catalog lifecycle state is not active.
+    LifecycleFenced { state: LifecycleState },
+    /// The catalog root has not published lineage evidence.
+    MissingLineageEvidence,
+    /// Another same-dataset mutation is already in flight.
+    SameDatasetMutationConflict {
+        mutation: SnapshotPruneCatalogMutationKind,
+    },
+}
 // ---------------------------------------------------------------------------
 // CatalogError
 // ---------------------------------------------------------------------------
@@ -1119,6 +1221,62 @@ impl DatasetCatalog {
             .get(&path.to_string())
             .map(|e| e.published)
             .ok_or(CatalogError::NotFound)
+    }
+
+    /// Return catalog evidence required before scheduling snapshot pruning.
+    ///
+    /// This is an admission input only. It does not enumerate due datasets,
+    /// plan deletion candidates, or mutate snapshot state.
+    pub fn snapshot_prune_catalog_evidence(
+        &self,
+        request: SnapshotPruneCatalogAdmissionRequest<'_>,
+    ) -> Result<SnapshotPruneCatalogEvidence, SnapshotPruneCatalogRefusalReason> {
+        validate_path(request.path)
+            .map_err(|_| SnapshotPruneCatalogRefusalReason::MissingCatalogEntry)?;
+        let entry = self
+            .tree
+            .get(&request.path.to_string())
+            .ok_or(SnapshotPruneCatalogRefusalReason::MissingCatalogEntry)?;
+
+        if request
+            .expected_dataset_id
+            .is_some_and(|expected| expected != entry.dataset_id)
+            || request
+                .expected_creation_txg
+                .is_some_and(|expected| expected != entry.creation_txg)
+        {
+            return Err(SnapshotPruneCatalogRefusalReason::StaleCatalogEvidence {
+                expected_dataset_id: request.expected_dataset_id,
+                actual_dataset_id: entry.dataset_id,
+                expected_creation_txg: request.expected_creation_txg,
+                actual_creation_txg: entry.creation_txg,
+            });
+        }
+
+        if entry.lifecycle_state != LifecycleState::Active {
+            return Err(SnapshotPruneCatalogRefusalReason::LifecycleFenced {
+                state: entry.lifecycle_state,
+            });
+        }
+
+        if !entry.published {
+            return Err(SnapshotPruneCatalogRefusalReason::MissingLineageEvidence);
+        }
+
+        if let Some(mutation) = request.same_dataset_mutation {
+            return Err(
+                SnapshotPruneCatalogRefusalReason::SameDatasetMutationConflict { mutation },
+            );
+        }
+
+        Ok(SnapshotPruneCatalogEvidence {
+            path: request.path.to_string(),
+            dataset_id: entry.dataset_id,
+            dataset_type: entry.dataset_type,
+            creation_txg: entry.creation_txg,
+            flags: entry.flags,
+            lineage_summary: entry.lineage_summary,
+        })
     }
 
     // ------------------------------------------------------------------
@@ -2132,6 +2290,211 @@ mod tests {
         .unwrap();
         assert_eq!(cat.snapshot_lookup("root@snap1"), Ok(did(99)));
         assert!(cat.snapshot_lookup("root@nonexistent").is_err());
+    }
+
+    #[test]
+    fn snapshot_prune_catalog_evidence_admits_published_active_dataset() {
+        let mut cat = DatasetCatalog::new();
+        cat.create(
+            "pool",
+            did(0),
+            DatasetType::Filesystem,
+            1,
+            empty_props(),
+            DatasetFlags::NONE,
+            SyncGuarantee::default(),
+        )
+        .unwrap();
+        cat.create(
+            "pool/ds1",
+            did(7),
+            DatasetType::Filesystem,
+            44,
+            empty_props(),
+            DatasetFlags::NONE,
+            SyncGuarantee::default(),
+        )
+        .unwrap();
+        cat.publish_root("pool/ds1").unwrap();
+
+        let evidence = cat
+            .snapshot_prune_catalog_evidence(
+                SnapshotPruneCatalogAdmissionRequest::new("pool/ds1")
+                    .with_expected_dataset_id(did(7))
+                    .with_expected_creation_txg(44),
+            )
+            .unwrap();
+
+        assert_eq!(evidence.path, "pool/ds1");
+        assert_eq!(evidence.dataset_id, did(7));
+        assert_eq!(evidence.creation_txg, 44);
+        assert_eq!(evidence.dataset_type, DatasetType::Filesystem);
+    }
+
+    #[test]
+    fn snapshot_prune_catalog_evidence_refuses_missing_entry() {
+        let cat = DatasetCatalog::new();
+
+        let err = cat
+            .snapshot_prune_catalog_evidence(SnapshotPruneCatalogAdmissionRequest::new("pool/ds1"))
+            .unwrap_err();
+
+        assert_eq!(err, SnapshotPruneCatalogRefusalReason::MissingCatalogEntry);
+    }
+
+    #[test]
+    fn snapshot_prune_catalog_evidence_refuses_lifecycle_fence() {
+        let mut cat = DatasetCatalog::new();
+        cat.create(
+            "pool",
+            did(0),
+            DatasetType::Filesystem,
+            1,
+            empty_props(),
+            DatasetFlags::NONE,
+            SyncGuarantee::default(),
+        )
+        .unwrap();
+        cat.create(
+            "pool/ds1",
+            did(7),
+            DatasetType::Filesystem,
+            44,
+            empty_props(),
+            DatasetFlags::NONE,
+            SyncGuarantee::default(),
+        )
+        .unwrap();
+        cat.publish_root("pool/ds1").unwrap();
+        cat.transition_to_destroying("pool/ds1").unwrap();
+
+        let err = cat
+            .snapshot_prune_catalog_evidence(SnapshotPruneCatalogAdmissionRequest::new("pool/ds1"))
+            .unwrap_err();
+
+        assert_eq!(
+            err,
+            SnapshotPruneCatalogRefusalReason::LifecycleFenced {
+                state: LifecycleState::Destroying
+            }
+        );
+    }
+
+    #[test]
+    fn snapshot_prune_catalog_evidence_refuses_missing_lineage() {
+        let mut cat = DatasetCatalog::new();
+        cat.create(
+            "pool",
+            did(0),
+            DatasetType::Filesystem,
+            1,
+            empty_props(),
+            DatasetFlags::NONE,
+            SyncGuarantee::default(),
+        )
+        .unwrap();
+        cat.create(
+            "pool/ds1",
+            did(7),
+            DatasetType::Filesystem,
+            44,
+            empty_props(),
+            DatasetFlags::NONE,
+            SyncGuarantee::default(),
+        )
+        .unwrap();
+
+        let err = cat
+            .snapshot_prune_catalog_evidence(SnapshotPruneCatalogAdmissionRequest::new("pool/ds1"))
+            .unwrap_err();
+
+        assert_eq!(
+            err,
+            SnapshotPruneCatalogRefusalReason::MissingLineageEvidence
+        );
+    }
+
+    #[test]
+    fn snapshot_prune_catalog_evidence_refuses_stale_identity() {
+        let mut cat = DatasetCatalog::new();
+        cat.create(
+            "pool",
+            did(0),
+            DatasetType::Filesystem,
+            1,
+            empty_props(),
+            DatasetFlags::NONE,
+            SyncGuarantee::default(),
+        )
+        .unwrap();
+        cat.create(
+            "pool/ds1",
+            did(7),
+            DatasetType::Filesystem,
+            44,
+            empty_props(),
+            DatasetFlags::NONE,
+            SyncGuarantee::default(),
+        )
+        .unwrap();
+        cat.publish_root("pool/ds1").unwrap();
+
+        let err = cat
+            .snapshot_prune_catalog_evidence(
+                SnapshotPruneCatalogAdmissionRequest::new("pool/ds1")
+                    .with_expected_dataset_id(did(8)),
+            )
+            .unwrap_err();
+
+        assert_eq!(
+            err,
+            SnapshotPruneCatalogRefusalReason::StaleCatalogEvidence {
+                expected_dataset_id: Some(did(8)),
+                actual_dataset_id: did(7),
+                expected_creation_txg: None,
+                actual_creation_txg: 44,
+            }
+        );
+    }
+
+    #[test]
+    fn snapshot_prune_catalog_evidence_refuses_same_dataset_mutation() {
+        let mut cat = DatasetCatalog::new();
+        cat.create(
+            "pool",
+            did(0),
+            DatasetType::Filesystem,
+            1,
+            empty_props(),
+            DatasetFlags::NONE,
+            SyncGuarantee::default(),
+        )
+        .unwrap();
+        cat.create(
+            "pool/ds1",
+            did(7),
+            DatasetType::Filesystem,
+            44,
+            empty_props(),
+            DatasetFlags::NONE,
+            SyncGuarantee::default(),
+        )
+        .unwrap();
+        cat.publish_root("pool/ds1").unwrap();
+
+        let err = cat
+            .snapshot_prune_catalog_evidence(
+                SnapshotPruneCatalogAdmissionRequest::new("pool/ds1")
+                    .with_same_dataset_mutation(SnapshotPruneCatalogMutationKind::SnapshotDestroy),
+            )
+            .unwrap_err();
+
+        assert_eq!(
+            err,
+            SnapshotPruneCatalogRefusalReason::SameDatasetMutationConflict {
+                mutation: SnapshotPruneCatalogMutationKind::SnapshotDestroy
+            }
+        );
     }
 
     // ------------------------------------------------------------------

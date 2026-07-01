@@ -207,6 +207,41 @@ pub struct DatasetLifecycleStats {
     pub destroy_progress_ppm: u64,
 }
 
+/// Same-dataset lifecycle mutation that blocks scheduled snapshot pruning.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SnapshotPruneLifecycleMutationConflict {
+    /// A snapshot capture has frozen the dataset's mutation boundary.
+    FrozenSnapshotCapture,
+    /// A dataset destroy job is still in progress.
+    DestroyJob,
+}
+
+/// Lifecycle-side admission evidence for future scheduled snapshot pruning.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SnapshotPruneLifecycleAdmission {
+    /// Current lifecycle state.
+    pub state: DatasetStateV1,
+    /// Current poison state.
+    pub poison: PoisonState,
+    /// Whether the dataset was frozen at admission time.
+    pub frozen: bool,
+    /// Whether a destroy job was in progress at admission time.
+    pub destroy_job_in_progress: bool,
+}
+
+/// Fail-closed lifecycle refusal reason for snapshot-prune admission.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SnapshotPruneLifecycleRefusalReason {
+    /// The lifecycle state is not active.
+    LifecycleFenced { state: DatasetStateV1 },
+    /// The dataset is poisoned or mount-dead.
+    Poisoned { poison: PoisonState },
+    /// A same-dataset mutation is already in progress.
+    SameDatasetMutationConflict {
+        mutation: SnapshotPruneLifecycleMutationConflict,
+    },
+}
+
 // ---------------------------------------------------------------------------
 // PinnedRoot — handle returned by pin_root_for_service
 // ---------------------------------------------------------------------------
@@ -973,6 +1008,50 @@ impl DatasetLifecycle {
             destroy_in_progress: self.state == DatasetStateV1::Destroying,
             destroy_progress_ppm: self.destroy_progress_ppm(),
         }
+    }
+
+    /// Admit lifecycle state for future scheduled snapshot pruning.
+    ///
+    /// This query only reports whether snapshot mutation is safe to consider
+    /// at the dataset lifecycle boundary. It does not schedule work or mutate
+    /// snapshot state.
+    #[must_use]
+    pub fn snapshot_prune_lifecycle_admission(
+        &self,
+    ) -> Result<SnapshotPruneLifecycleAdmission, SnapshotPruneLifecycleRefusalReason> {
+        if self.state != DatasetStateV1::Active {
+            return Err(SnapshotPruneLifecycleRefusalReason::LifecycleFenced { state: self.state });
+        }
+        if !self.poison.is_healthy() {
+            return Err(SnapshotPruneLifecycleRefusalReason::Poisoned {
+                poison: self.poison,
+            });
+        }
+        if self.frozen {
+            return Err(
+                SnapshotPruneLifecycleRefusalReason::SameDatasetMutationConflict {
+                    mutation: SnapshotPruneLifecycleMutationConflict::FrozenSnapshotCapture,
+                },
+            );
+        }
+        if self
+            .destroy_job
+            .as_ref()
+            .is_some_and(|job| !job.is_completed())
+        {
+            return Err(
+                SnapshotPruneLifecycleRefusalReason::SameDatasetMutationConflict {
+                    mutation: SnapshotPruneLifecycleMutationConflict::DestroyJob,
+                },
+            );
+        }
+
+        Ok(SnapshotPruneLifecycleAdmission {
+            state: self.state,
+            poison: self.poison,
+            frozen: self.frozen,
+            destroy_job_in_progress: false,
+        })
     }
 
     /// Whether the dataset is mountable.
@@ -2085,6 +2164,63 @@ mod tests {
         let lc = DatasetLifecycle::new();
         assert!(lc.is_mountable());
         assert!(lc.accepts_writes());
+    }
+
+    #[test]
+    fn snapshot_prune_lifecycle_admits_active_healthy_dataset() {
+        let lc = DatasetLifecycle::new();
+
+        let admitted = lc.snapshot_prune_lifecycle_admission().unwrap();
+
+        assert_eq!(admitted.state, DatasetStateV1::Active);
+        assert_eq!(admitted.poison, PoisonState::MountOk);
+        assert!(!admitted.frozen);
+        assert!(!admitted.destroy_job_in_progress);
+    }
+
+    #[test]
+    fn snapshot_prune_lifecycle_refuses_destroying_dataset() {
+        let mut lc = DatasetLifecycle::new();
+        lc.transition_to_destroying(DestroyFlags::NONE, &[])
+            .unwrap();
+
+        let err = lc.snapshot_prune_lifecycle_admission().unwrap_err();
+
+        assert_eq!(
+            err,
+            SnapshotPruneLifecycleRefusalReason::LifecycleFenced {
+                state: DatasetStateV1::Destroying
+            }
+        );
+    }
+
+    #[test]
+    fn snapshot_prune_lifecycle_refuses_poisoned_dataset() {
+        let lc = DatasetLifecycle::from_parts(DatasetStateV1::Active, PoisonState::PoisonActive);
+
+        let err = lc.snapshot_prune_lifecycle_admission().unwrap_err();
+
+        assert_eq!(
+            err,
+            SnapshotPruneLifecycleRefusalReason::Poisoned {
+                poison: PoisonState::PoisonActive
+            }
+        );
+    }
+
+    #[test]
+    fn snapshot_prune_lifecycle_refuses_frozen_mutation_conflict() {
+        let mut lc = DatasetLifecycle::new();
+        lc.freeze().unwrap();
+
+        let err = lc.snapshot_prune_lifecycle_admission().unwrap_err();
+
+        assert_eq!(
+            err,
+            SnapshotPruneLifecycleRefusalReason::SameDatasetMutationConflict {
+                mutation: SnapshotPruneLifecycleMutationConflict::FrozenSnapshotCapture
+            }
+        );
     }
 
     // ── validate_transition ───────────────────────────────────────

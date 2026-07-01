@@ -62,6 +62,12 @@ use std::fmt;
 
 /// Canonical property name for the dataset capacity quota.
 pub const SPACE_QUOTA_PROPERTY_NAME: &str = "space.quota";
+/// Canonical property name for snapshot retention policy.
+pub const SNAPSHOT_RETENTION_PROPERTY_NAME: &str = "snapshot.retention";
+/// Canonical property name for live snapshot-pruner cadence in seconds.
+pub const SNAPSHOT_PRUNE_CADENCE_SECONDS_PROPERTY_NAME: &str = "snapshot.prune.cadence_seconds";
+/// Canonical property name admitting destructive scheduled snapshot pruning.
+pub const SNAPSHOT_PRUNE_ALLOW_DESTRUCTIVE_PROPERTY_NAME: &str = "snapshot.prune.allow_destructive";
 
 // ---------------------------------------------------------------------------
 // PropertyType — wire-type discriminant
@@ -492,6 +498,66 @@ impl CapacityAuthorityQuotaInput {
     }
 }
 
+/// Requested execution mode for a scheduled snapshot-pruner admission query.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SnapshotPruneRunMode {
+    /// Build and report a plan without deleting snapshots.
+    DryRun,
+    /// Admit a run that may delete snapshots through the later deletion path.
+    Destructive,
+}
+
+/// Execution mode configured by dataset policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SnapshotPruneExecutionMode {
+    /// A cadence exists, but scheduled execution is dry-run only.
+    DryRunOnly,
+    /// Dataset policy explicitly admits destructive scheduled execution.
+    DestructiveAllowed,
+}
+
+/// Dataset-property input admitted for future scheduled snapshot pruning.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SnapshotPruneAdmissionInput {
+    /// Effective `snapshot.retention` value anchoring the prune policy.
+    pub retention_policy: PropertyValue,
+    /// Source of the retention policy.
+    pub retention_source: PropertySource,
+    /// Effective live prune cadence in seconds.
+    pub cadence_seconds: u64,
+    /// Source of the cadence.
+    pub cadence_source: PropertySource,
+    /// Dataset-configured execution mode.
+    pub configured_execution_mode: SnapshotPruneExecutionMode,
+    /// Execution mode requested by the caller.
+    pub requested_mode: SnapshotPruneRunMode,
+    /// Source of `snapshot.prune.allow_destructive`.
+    pub destructive_mode_source: PropertySource,
+}
+
+/// Fail-closed refusal reason for dataset-property snapshot-prune admission.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SnapshotPrunePolicyRefusalReason {
+    /// No explicit retention policy anchors scheduled pruning.
+    MissingRetentionPolicy,
+    /// No explicit live cadence was set.
+    MissingCadence,
+    /// The retention value did not match the registry type.
+    InvalidRetentionPolicyType { actual: PropertyType },
+    /// The cadence value did not match the registry type.
+    InvalidCadenceType { actual: PropertyType },
+    /// The cadence was outside the supported range.
+    InvalidCadenceRange {
+        cadence_seconds: u64,
+        min: u64,
+        max: u64,
+    },
+    /// The destructive-mode value did not match the registry type.
+    InvalidDestructiveModeType { actual: PropertyType },
+    /// A destructive run was requested without explicit destructive admission.
+    DestructiveModeNotAdmitted,
+}
+
 // ---------------------------------------------------------------------------
 // PropertySet — per-dataset property collection
 // ---------------------------------------------------------------------------
@@ -913,6 +979,24 @@ pub fn space_quota_property_key() -> PropertyKey {
     PropertyKey::new(SPACE_QUOTA_PROPERTY_NAME)
 }
 
+/// Return the canonical `snapshot.retention` property key.
+#[must_use]
+pub fn snapshot_retention_property_key() -> PropertyKey {
+    PropertyKey::new(SNAPSHOT_RETENTION_PROPERTY_NAME)
+}
+
+/// Return the canonical live snapshot-pruner cadence property key.
+#[must_use]
+pub fn snapshot_prune_cadence_seconds_property_key() -> PropertyKey {
+    PropertyKey::new(SNAPSHOT_PRUNE_CADENCE_SECONDS_PROPERTY_NAME)
+}
+
+/// Return the canonical destructive snapshot-pruner admission property key.
+#[must_use]
+pub fn snapshot_prune_allow_destructive_property_key() -> PropertyKey {
+    PropertyKey::new(SNAPSHOT_PRUNE_ALLOW_DESTRUCTIVE_PROPERTY_NAME)
+}
+
 /// Return the standard `space.quota` property definition.
 #[must_use]
 pub fn space_quota_definition() -> PropertyDefinitionV1 {
@@ -927,6 +1011,60 @@ pub fn space_quota_definition() -> PropertyDefinitionV1 {
         feature_flag: None,
         cross_constraints: Vec::new(),
         range: Some((0, i64::MAX as u64)),
+        is_content_transform: false,
+    }
+}
+
+/// Return the standard `snapshot.retention` property definition.
+#[must_use]
+pub fn snapshot_retention_definition() -> PropertyDefinitionV1 {
+    PropertyDefinitionV1 {
+        name: snapshot_retention_property_key(),
+        value_type: PropertyType::Enum,
+        default_value: PropertyValue::EnumVariant(0),
+        inheritance: InheritanceMode::Parent,
+        change_policy: ChangePolicy::Always,
+        scope: PropertyScope::Dataset,
+        family: PropertyFamily::Snapshot,
+        feature_flag: None,
+        cross_constraints: Vec::new(),
+        range: None,
+        is_content_transform: false,
+    }
+}
+
+/// Return the standard live snapshot-pruner cadence property definition.
+#[must_use]
+pub fn snapshot_prune_cadence_seconds_definition() -> PropertyDefinitionV1 {
+    PropertyDefinitionV1 {
+        name: snapshot_prune_cadence_seconds_property_key(),
+        value_type: PropertyType::U64,
+        default_value: PropertyValue::None,
+        inheritance: InheritanceMode::Parent,
+        change_policy: ChangePolicy::Always,
+        scope: PropertyScope::Dataset,
+        family: PropertyFamily::Snapshot,
+        feature_flag: None,
+        cross_constraints: Vec::new(),
+        range: Some((1, i64::MAX as u64)),
+        is_content_transform: false,
+    }
+}
+
+/// Return the standard destructive snapshot-pruner admission property definition.
+#[must_use]
+pub fn snapshot_prune_allow_destructive_definition() -> PropertyDefinitionV1 {
+    PropertyDefinitionV1 {
+        name: snapshot_prune_allow_destructive_property_key(),
+        value_type: PropertyType::Bool,
+        default_value: PropertyValue::Bool(false),
+        inheritance: InheritanceMode::Parent,
+        change_policy: ChangePolicy::Always,
+        scope: PropertyScope::Dataset,
+        family: PropertyFamily::Snapshot,
+        feature_flag: None,
+        cross_constraints: Vec::new(),
+        range: None,
         is_content_transform: false,
     }
 }
@@ -963,6 +1101,121 @@ pub fn resolve_space_quota_for_capacity_authority(
     Ok(CapacityAuthorityQuotaInput {
         quota_bytes,
         source: resolved.source,
+    })
+}
+
+/// Resolve dataset properties into scheduled snapshot-pruner admission input.
+///
+/// The helper requires an explicit `snapshot.retention` source plus an
+/// explicit cadence. Destructive execution additionally requires an explicit
+/// `snapshot.prune.allow_destructive=true` source; the default value only
+/// admits dry-run scheduling.
+pub fn resolve_snapshot_prune_admission_input(
+    local_set: &PropertySet,
+    parent_sets: &[&PropertySet],
+    requested_mode: SnapshotPruneRunMode,
+) -> Result<SnapshotPruneAdmissionInput, SnapshotPrunePolicyRefusalReason> {
+    let retention_key = snapshot_retention_property_key();
+    let retention_def = snapshot_retention_definition();
+    let retention = resolve_effective(&retention_key, local_set, parent_sets, &retention_def);
+    if retention.value.is_some() {
+        validate_set(&retention_key, &retention.value, &retention_def, local_set).map_err(
+            |err| match err {
+                ValidationError::TypeMismatch { actual, .. } => {
+                    SnapshotPrunePolicyRefusalReason::InvalidRetentionPolicyType { actual }
+                }
+                _ => SnapshotPrunePolicyRefusalReason::InvalidRetentionPolicyType {
+                    actual: retention.value.property_type(),
+                },
+            },
+        )?;
+    }
+    if retention.value.is_none() || matches!(retention.source, PropertySource::Default) {
+        return Err(SnapshotPrunePolicyRefusalReason::MissingRetentionPolicy);
+    }
+
+    let cadence_key = snapshot_prune_cadence_seconds_property_key();
+    let cadence_def = snapshot_prune_cadence_seconds_definition();
+    let cadence = resolve_effective(&cadence_key, local_set, parent_sets, &cadence_def);
+    validate_set(&cadence_key, &cadence.value, &cadence_def, local_set).map_err(
+        |err| match err {
+            ValidationError::TypeMismatch { actual, .. } => {
+                SnapshotPrunePolicyRefusalReason::InvalidCadenceType { actual }
+            }
+            ValidationError::Range {
+                value, min, max, ..
+            } => SnapshotPrunePolicyRefusalReason::InvalidCadenceRange {
+                cadence_seconds: value,
+                min,
+                max,
+            },
+            _ => SnapshotPrunePolicyRefusalReason::InvalidCadenceType {
+                actual: cadence.value.property_type(),
+            },
+        },
+    )?;
+    let cadence_seconds = match cadence.value {
+        PropertyValue::None => return Err(SnapshotPrunePolicyRefusalReason::MissingCadence),
+        PropertyValue::U64(value) | PropertyValue::Size(value) => value,
+        other => {
+            return Err(SnapshotPrunePolicyRefusalReason::InvalidCadenceType {
+                actual: other.property_type(),
+            });
+        }
+    };
+    if matches!(cadence.source, PropertySource::Default) {
+        return Err(SnapshotPrunePolicyRefusalReason::MissingCadence);
+    }
+
+    let destructive_key = snapshot_prune_allow_destructive_property_key();
+    let destructive_def = snapshot_prune_allow_destructive_definition();
+    let destructive = resolve_effective(&destructive_key, local_set, parent_sets, &destructive_def);
+    validate_set(
+        &destructive_key,
+        &destructive.value,
+        &destructive_def,
+        local_set,
+    )
+    .map_err(|err| match err {
+        ValidationError::TypeMismatch { actual, .. } => {
+            SnapshotPrunePolicyRefusalReason::InvalidDestructiveModeType { actual }
+        }
+        _ => SnapshotPrunePolicyRefusalReason::InvalidDestructiveModeType {
+            actual: destructive.value.property_type(),
+        },
+    })?;
+    let destructive_allowed = match destructive.value {
+        PropertyValue::None => false,
+        PropertyValue::Bool(value) => value,
+        other => {
+            return Err(
+                SnapshotPrunePolicyRefusalReason::InvalidDestructiveModeType {
+                    actual: other.property_type(),
+                },
+            );
+        }
+    };
+    let explicit_destructive =
+        destructive_allowed && !matches!(destructive.source, PropertySource::Default);
+    let configured_execution_mode = if explicit_destructive {
+        SnapshotPruneExecutionMode::DestructiveAllowed
+    } else {
+        SnapshotPruneExecutionMode::DryRunOnly
+    };
+    if requested_mode == SnapshotPruneRunMode::Destructive
+        && configured_execution_mode != SnapshotPruneExecutionMode::DestructiveAllowed
+    {
+        return Err(SnapshotPrunePolicyRefusalReason::DestructiveModeNotAdmitted);
+    }
+
+    Ok(SnapshotPruneAdmissionInput {
+        retention_policy: retention.value,
+        retention_source: retention.source,
+        cadence_seconds,
+        cadence_source: cadence.source,
+        configured_execution_mode,
+        requested_mode,
+        destructive_mode_source: destructive.source,
     })
 }
 
@@ -1216,19 +1469,9 @@ pub fn build_registry() -> Vec<PropertyDefinitionV1> {
         // -- Space family --
         space_quota_definition(),
         // -- Snapshot family --
-        PropertyDefinitionV1 {
-            name: PropertyKey::new("snapshot.retention"),
-            value_type: PropertyType::Enum,
-            default_value: PropertyValue::EnumVariant(0),
-            inheritance: InheritanceMode::Parent,
-            change_policy: ChangePolicy::Always,
-            scope: PropertyScope::Dataset,
-            family: PropertyFamily::Snapshot,
-            feature_flag: None,
-            cross_constraints: Vec::new(),
-            range: None,
-            is_content_transform: false,
-        },
+        snapshot_retention_definition(),
+        snapshot_prune_cadence_seconds_definition(),
+        snapshot_prune_allow_destructive_definition(),
     ]
 }
 
@@ -2124,6 +2367,8 @@ mod tests {
         assert!(names.contains(&"compression.algorithm"));
         assert!(names.contains(&"space.quota"));
         assert!(names.contains(&"snapshot.retention"));
+        assert!(names.contains(&"snapshot.prune.cadence_seconds"));
+        assert!(names.contains(&"snapshot.prune.allow_destructive"));
     }
 
     #[test]
@@ -2205,6 +2450,10 @@ mod tests {
             get_family(&PropertyKey::new("snapshot.retention")),
             Some(PropertyFamily::Snapshot)
         );
+        assert_eq!(
+            get_family(&PropertyKey::new("snapshot.prune.cadence_seconds")),
+            Some(PropertyFamily::Snapshot)
+        );
         assert_eq!(get_family(&PropertyKey::new("unknown.prop")), None);
     }
 
@@ -2250,6 +2499,121 @@ mod tests {
                 def.name
             );
         }
+    }
+
+    // ── Snapshot prune admission ─────────────────────────────────
+
+    #[test]
+    fn snapshot_prune_admits_dry_run_policy() {
+        let mut local = PropertySet::new();
+        local.set_local(
+            snapshot_retention_property_key(),
+            PropertyValue::EnumVariant(1),
+        );
+        local.set_local(
+            snapshot_prune_cadence_seconds_property_key(),
+            PropertyValue::U64(3600),
+        );
+
+        let admitted =
+            resolve_snapshot_prune_admission_input(&local, &[], SnapshotPruneRunMode::DryRun)
+                .unwrap();
+
+        assert_eq!(admitted.cadence_seconds, 3600);
+        assert_eq!(
+            admitted.configured_execution_mode,
+            SnapshotPruneExecutionMode::DryRunOnly
+        );
+        assert_eq!(admitted.requested_mode, SnapshotPruneRunMode::DryRun);
+        assert!(matches!(admitted.retention_source, PropertySource::Local));
+    }
+
+    #[test]
+    fn snapshot_prune_refuses_destructive_without_explicit_mode() {
+        let mut local = PropertySet::new();
+        local.set_local(
+            snapshot_retention_property_key(),
+            PropertyValue::EnumVariant(1),
+        );
+        local.set_local(
+            snapshot_prune_cadence_seconds_property_key(),
+            PropertyValue::U64(3600),
+        );
+
+        let err =
+            resolve_snapshot_prune_admission_input(&local, &[], SnapshotPruneRunMode::Destructive)
+                .unwrap_err();
+
+        assert_eq!(
+            err,
+            SnapshotPrunePolicyRefusalReason::DestructiveModeNotAdmitted
+        );
+    }
+
+    #[test]
+    fn snapshot_prune_admits_explicit_destructive_mode() {
+        let mut local = PropertySet::new();
+        local.set_local(
+            snapshot_retention_property_key(),
+            PropertyValue::EnumVariant(1),
+        );
+        local.set_local(
+            snapshot_prune_cadence_seconds_property_key(),
+            PropertyValue::U64(3600),
+        );
+        local.set_local(
+            snapshot_prune_allow_destructive_property_key(),
+            PropertyValue::Bool(true),
+        );
+
+        let admitted =
+            resolve_snapshot_prune_admission_input(&local, &[], SnapshotPruneRunMode::Destructive)
+                .unwrap();
+
+        assert_eq!(
+            admitted.configured_execution_mode,
+            SnapshotPruneExecutionMode::DestructiveAllowed
+        );
+        assert!(matches!(
+            admitted.destructive_mode_source,
+            PropertySource::Local
+        ));
+    }
+
+    #[test]
+    fn snapshot_prune_refuses_missing_cadence() {
+        let mut local = PropertySet::new();
+        local.set_local(
+            snapshot_retention_property_key(),
+            PropertyValue::EnumVariant(1),
+        );
+
+        let err = resolve_snapshot_prune_admission_input(&local, &[], SnapshotPruneRunMode::DryRun)
+            .unwrap_err();
+
+        assert_eq!(err, SnapshotPrunePolicyRefusalReason::MissingCadence);
+    }
+
+    #[test]
+    fn snapshot_prune_default_retention_is_not_deletion_authority() {
+        let mut local = PropertySet::new();
+        local.set_local(
+            snapshot_prune_cadence_seconds_property_key(),
+            PropertyValue::U64(3600),
+        );
+        local.set_local(
+            snapshot_prune_allow_destructive_property_key(),
+            PropertyValue::Bool(true),
+        );
+
+        let err =
+            resolve_snapshot_prune_admission_input(&local, &[], SnapshotPruneRunMode::Destructive)
+                .unwrap_err();
+
+        assert_eq!(
+            err,
+            SnapshotPrunePolicyRefusalReason::MissingRetentionPolicy
+        );
     }
 
     // ── Integration: inheritance chain ────────────────────────
