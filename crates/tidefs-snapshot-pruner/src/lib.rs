@@ -32,6 +32,7 @@
 
 pub mod pruner;
 pub mod retention;
+pub mod scheduled;
 
 // Re-export public API
 pub use pruner::{
@@ -42,6 +43,14 @@ pub use pruner::{
     ORIGIN_INDEX_PREFIX, SNAPSHOT_CHECKSUM_PREFIX, SNAPSHOT_PIN_EVIDENCE_PREFIX,
 };
 pub use retention::SnapshotRetentionPolicy;
+pub use scheduled::{
+    ScheduledSnapshotPrunerCatalogEvidence, ScheduledSnapshotPrunerDataset,
+    ScheduledSnapshotPrunerDestructiveAdmission, ScheduledSnapshotPrunerDestructiveHandoff,
+    ScheduledSnapshotPrunerDestructiveHandoffResult, ScheduledSnapshotPrunerJob,
+    ScheduledSnapshotPrunerLifecycleEvidence, ScheduledSnapshotPrunerMutationEvidence,
+    ScheduledSnapshotPrunerOutcome, ScheduledSnapshotPrunerRecord, ScheduledSnapshotPrunerRefusal,
+    SnapshotPrunerCadenceEvidence,
+};
 // Tests
 // ---------------------------------------------------------------------------
 
