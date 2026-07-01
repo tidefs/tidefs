@@ -872,6 +872,11 @@ pub struct PrefetchExecutorCostState {
     pub unknown_waf: bool,
     pub unknown_egress_or_restore_cost: bool,
     pub missing_isolation_evidence: bool,
+    pub missing_operator_money_power_evidence: bool,
+    pub operator_money_cost_microunits: u64,
+    pub operator_money_budget_microunits: u64,
+    pub operator_power_cost_microunits: u64,
+    pub operator_power_budget_microunits: u64,
     pub over_budget: bool,
     pub cost_ref: StorageIntentEvidenceRef,
     pub isolation_ref: StorageIntentEvidenceRef,
@@ -885,6 +890,11 @@ impl Default for PrefetchExecutorCostState {
             unknown_waf: false,
             unknown_egress_or_restore_cost: false,
             missing_isolation_evidence: false,
+            missing_operator_money_power_evidence: false,
+            operator_money_cost_microunits: 0,
+            operator_money_budget_microunits: 0,
+            operator_power_cost_microunits: 0,
+            operator_power_budget_microunits: 0,
             over_budget: false,
             cost_ref: EMPTY_EVIDENCE_REF,
             isolation_ref: EMPTY_EVIDENCE_REF,
@@ -1455,6 +1465,8 @@ pub struct PrefetchExecutorInput {
     pub require_known_egress_restore_cost: bool,
     pub require_budget_owner: bool,
     pub require_isolation_evidence: bool,
+    pub require_operator_money_budget: bool,
+    pub require_operator_power_budget: bool,
 }
 
 impl Default for PrefetchExecutorInput {
@@ -1475,6 +1487,8 @@ impl Default for PrefetchExecutorInput {
             require_known_egress_restore_cost: false,
             require_budget_owner: false,
             require_isolation_evidence: false,
+            require_operator_money_budget: false,
+            require_operator_power_budget: false,
         }
     }
 }
@@ -1907,6 +1921,23 @@ pub fn evaluate_prefetch_execution(input: PrefetchExecutorInput) -> PrefetchExec
             PrefetchExecutorOutcome::Refused,
             PrefetchExecutorByteState::Refused,
             StorageIntentRefusalReason::EvidenceNotUsable,
+        );
+    }
+
+    if let Some(refusal) = operator_money_power_budget_refusal(input, cost_state) {
+        if refusal as u16 == StorageIntentRefusalReason::OverBudget as u16 {
+            return terminal(
+                record,
+                PrefetchExecutorOutcome::OverBudget,
+                PrefetchExecutorByteState::Blocked,
+                refusal,
+            );
+        }
+        return terminal(
+            record,
+            PrefetchExecutorOutcome::Refused,
+            PrefetchExecutorByteState::Refused,
+            refusal,
         );
     }
 
@@ -3332,6 +3363,68 @@ fn snapshot_contains_fresh_ref(
         && snapshot_contains_ref(input, evidence_ref)
 }
 
+fn operator_money_power_budget_refusal(
+    input: PrefetchExecutorInput,
+    cost_state: PrefetchExecutorCostState,
+) -> Option<StorageIntentRefusalReason> {
+    let weights = cost_state.snapshot.operator_weights;
+    let money_budget_required = input.require_operator_money_budget
+        || cost_state.operator_money_cost_microunits != 0
+        || cost_state.operator_money_budget_microunits != 0;
+    let power_budget_required = input.require_operator_power_budget
+        || cost_state.operator_power_cost_microunits != 0
+        || cost_state.operator_power_budget_microunits != 0;
+    let policy_weight_evidence_required = money_budget_required
+        || power_budget_required
+        || cost_state.missing_operator_money_power_evidence
+        || weights.money_weight != 0
+        || weights.power_weight != 0;
+
+    if !policy_weight_evidence_required {
+        return None;
+    }
+
+    if cost_state.missing_operator_money_power_evidence
+        || !operator_weight_ref_is_fresh(input, weights.evidence)
+    {
+        return Some(StorageIntentRefusalReason::EvidenceNotUsable);
+    }
+
+    if money_budget_required {
+        if weights.money_weight == 0 || cost_state.operator_money_budget_microunits == 0 {
+            return Some(StorageIntentRefusalReason::EvidenceNotUsable);
+        }
+        if cost_state.operator_money_cost_microunits > cost_state.operator_money_budget_microunits {
+            return Some(StorageIntentRefusalReason::OverBudget);
+        }
+    }
+
+    if power_budget_required {
+        if weights.power_weight == 0 || cost_state.operator_power_budget_microunits == 0 {
+            return Some(StorageIntentRefusalReason::EvidenceNotUsable);
+        }
+        if cost_state.operator_power_cost_microunits > cost_state.operator_power_budget_microunits {
+            return Some(StorageIntentRefusalReason::OverBudget);
+        }
+    }
+
+    None
+}
+
+fn operator_weight_ref_is_fresh(
+    input: PrefetchExecutorInput,
+    evidence_ref: StorageIntentEvidenceRef,
+) -> bool {
+    matches!(
+        evidence_ref.kind,
+        StorageIntentEvidenceKind::PolicyRolloutEvidence
+            | StorageIntentEvidenceKind::ServiceObjectiveEvidence
+    ) && input
+        .evidence_query_snapshot
+        .contains_fresh_authority_family(evidence_ref.kind)
+        && snapshot_contains_ref(input, evidence_ref)
+}
+
 fn runtime_dispatch_needs_transport_or_trust(
     input: PrefetchExecutorInput,
     family: PrefetchExecutorActionFamily,
@@ -3708,6 +3801,7 @@ mod tests {
         EvidenceFamilyFreshness, EvidenceFamilyFreshnessSet, EvidenceQuerySubjectScope,
         EvidenceQuerySubjectScopeClass, StorageIntentEvidenceRefs,
     };
+    use tidefs_storage_intent_cost::StorageIntentOperatorPolicyWeights;
 
     const POLICY: StorageIntentPolicyId = StorageIntentPolicyId([1; 16]);
     const DATASET: StorageIntentDomainId = StorageIntentDomainId([2; 16]);
@@ -4031,6 +4125,19 @@ mod tests {
             require_isolation_evidence: true,
             ..PrefetchExecutorInput::default()
         }
+    }
+
+    fn add_operator_budget_evidence(input: &mut PrefetchExecutorInput) -> StorageIntentEvidenceRef {
+        let operator_policy_ref = evidence(
+            StorageIntentEvidenceKind::PolicyRolloutEvidence,
+            POLICY_ROLLOUT,
+        );
+        add_fresh(
+            &mut input.evidence_query_snapshot,
+            StorageIntentEvidenceKind::PolicyRolloutEvidence,
+            POLICY_ROLLOUT,
+        );
+        operator_policy_ref
     }
 
     fn add_recovery_degradation_evidence(
@@ -5936,6 +6043,90 @@ mod tests {
             record.refusal,
             StorageIntentRefusalReason::EvidenceNotUsable
         );
+    }
+
+    #[test]
+    fn operator_money_power_budget_requires_policy_weight_evidence_inside_cut() {
+        let mut input = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        input.require_operator_money_budget = true;
+        input.cost_state.operator_money_cost_microunits = 40;
+        input.cost_state.operator_money_budget_microunits = 80;
+        input.cost_state.snapshot.operator_weights = StorageIntentOperatorPolicyWeights {
+            money_weight: 1,
+            evidence: evidence(
+                StorageIntentEvidenceKind::PolicyRolloutEvidence,
+                OUTSIDE_CUT,
+            ),
+            ..StorageIntentOperatorPolicyWeights::UNKNOWN
+        };
+
+        let record = evaluate_prefetch_execution(input);
+        assert_eq!(record.outcome, PrefetchExecutorOutcome::Refused);
+        assert_eq!(
+            record.executor_byte_state,
+            PrefetchExecutorByteState::Refused
+        );
+        assert_eq!(
+            record.refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+        assert_record_has_no_authority_claims(record);
+    }
+
+    #[test]
+    fn operator_money_power_budget_refuses_over_budget_without_dispatch() {
+        let mut input = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        let operator_policy_ref = add_operator_budget_evidence(&mut input);
+        input.require_operator_power_budget = true;
+        input.cost_state.operator_power_cost_microunits = 101;
+        input.cost_state.operator_power_budget_microunits = 100;
+        input.cost_state.snapshot.operator_weights = StorageIntentOperatorPolicyWeights {
+            power_weight: 1,
+            evidence: operator_policy_ref,
+            ..StorageIntentOperatorPolicyWeights::UNKNOWN
+        };
+
+        let record = evaluate_prefetch_execution(input);
+        assert_eq!(record.outcome, PrefetchExecutorOutcome::OverBudget);
+        assert_eq!(
+            record.executor_byte_state,
+            PrefetchExecutorByteState::Blocked
+        );
+        assert_eq!(record.refusal, StorageIntentRefusalReason::OverBudget);
+        assert_eq!(record.cost_state.operator_power_cost_microunits, 101);
+        assert_eq!(record.cost_state.operator_power_budget_microunits, 100);
+        assert_record_has_no_authority_claims(record);
+    }
+
+    #[test]
+    fn operator_money_power_budget_allows_proven_within_budget_dispatch() {
+        let mut input = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        let operator_policy_ref = add_operator_budget_evidence(&mut input);
+        input.require_operator_money_budget = true;
+        input.require_operator_power_budget = true;
+        input.cost_state.operator_money_cost_microunits = 70;
+        input.cost_state.operator_money_budget_microunits = 100;
+        input.cost_state.operator_power_cost_microunits = 7;
+        input.cost_state.operator_power_budget_microunits = 10;
+        input.cost_state.snapshot.operator_weights = StorageIntentOperatorPolicyWeights {
+            money_weight: 2,
+            power_weight: 3,
+            evidence: operator_policy_ref,
+            ..StorageIntentOperatorPolicyWeights::UNKNOWN
+        };
+
+        let record = evaluate_prefetch_execution(input);
+        assert_eq!(record.outcome, PrefetchExecutorOutcome::Started);
+        assert_eq!(
+            record.executor_byte_state,
+            PrefetchExecutorByteState::CacheOnly
+        );
+        assert_eq!(record.refusal, StorageIntentRefusalReason::None);
+        assert_eq!(record.cost_state.operator_money_cost_microunits, 70);
+        assert_eq!(record.cost_state.operator_money_budget_microunits, 100);
+        assert_eq!(record.cost_state.operator_power_cost_microunits, 7);
+        assert_eq!(record.cost_state.operator_power_budget_microunits, 10);
+        assert_record_has_no_authority_claims(record);
     }
 
     #[test]
