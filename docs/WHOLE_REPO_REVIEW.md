@@ -16,13 +16,13 @@ unsettled.
 
 The current policy is different:
 
-- source behavior, live issue state, repo docs, and git history are review
-  inputs;
+- source behavior, live GitHub issue/PR state, repo docs, and git history are
+  review inputs;
 - durable debt is recorded in `docs/REVIEW_TODO_REGISTER.md`;
 - anonymous inline debt markers are not allowed;
 - fixes should land as small, bisectable, Linux-style commits on `master`.
 - each commit should have one reason to exist; review notes, workspace
-  be lumped together.
+  cleanup, and behavior changes should not be lumped together.
 
 ## Incumbent Comparison Boundary
 
@@ -30,8 +30,11 @@ This review may refer to OpenZFS, ZFS, Ceph, DRBD, ext4/XFS, kernel parity,
 or production-scale incumbents when describing why TideFS is not yet honest
 to claim that class of behavior. Those references are fail-closed review
 blockers, not current superiority or successor claims. Any future positive
-product-facing comparison must route through a #875 claim id and the
-comparator evidence required by #928/#930.
+product-facing comparison must route through `validation/claims.toml`, the
+generated `docs/CLAIM_REGISTRY.md`, and the split blocked claim ids
+`storage.local.successor_comparator.v1`,
+`storage.distributed.successor_comparator.v1`, and
+`storage.intent.successor_comparator.v1`.
 
 ## Current Scope
 
@@ -60,13 +63,16 @@ with the old project name, `find` reports no non-target path names with that
 name, and Cargo metadata reports no workspace package names or manifest paths
 with that name.
 
-The Forgejo remote rename is now complete: `/root/tidefs` tracks
-`http://172.16.106.12/forgejo/forgeadmin/tidefs.git`, the live Forgejo
-repository reports `forgeadmin/tidefs`, and the checkout no longer needs a
-local `tidefs.forgejo-repo` override. This closes the mechanical remote-slug
-drift, not the whole documentation-authority drift. Historical process docs
-may still describe the old slug and remain `TFR-019` review input, not release
-truth.
+The active public repository authority is now the `tidefs/tidefs` repository on
+GitHub: `/root/tidefs` tracks `origin` at
+`https://github.com/tidefs/tidefs.git`, and current TideFS work is coordinated
+through live GitHub issues and pull requests. The older Forgejo remote/slug
+cleanup remains historical provenance from the import/rename era; any remaining
+local `forgejo` remote, Forgejo issue reference, or `forgeadmin/*` run metadata
+is review input only, not current work-selection or publication authority. This
+closes the current repository-authority wording gap, not the whole
+documentation-authority drift. Historical process docs may still describe the
+old slug and remain `TFR-019` review input, not release truth.
 
 ## Priority Findings
 
@@ -1278,17 +1284,19 @@ Concrete current drift:
   remaining documentation-authority surface, and it must be classified in
   follow-up slices before the doc tree can be trusted as current TideFS truth.
   The open queue is listed in `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`.
-- A live `check-claims-gate` run with
-  `CARGO_TARGET_DIR=/root/ai/tmp/tidefs-target` now passes against the
-  canonical `forgeadmin/tidefs` Forgejo slug after compiling with the
+- A historical `check-claims-gate` run with
+  `CARGO_TARGET_DIR=/root/ai/tmp/tidefs-target` passed against the
+  then-canonical `forgeadmin/tidefs` Forgejo slug after compiling with the
   then-pre-existing `private_interfaces` warning; commit `ef2cb86c`
-  subsequently removed that warning from `tidefs-local-filesystem`.
-  the current outside-sandbox FUSE QEMU runner
-  runner's stray/duplicated `--per-test` help/parser entries were removed.
-  Current-facing docs no longer send readers to deleted
-  owner map and docs index instead of deleted `MODULE_MAP`, `STATUS`, and
-  `FEATURE_MATRIX` files. This is documentation and gate-authority cleanup
-  FUSE `generic/001`-`generic/013` tranche.
+  subsequently removed that warning from `tidefs-local-filesystem`. Current
+  claims-gate authority is the GitHub repository state plus
+  `validation/claims.toml` and the generated claim registry. The same cleanup
+  removed the outside-sandbox FUSE QEMU runner's stray/duplicated `--per-test`
+  help/parser entries and redirected current-facing docs to surviving
+  owner-map/docs-index authority instead of deleted `MODULE_MAP`, `STATUS`, and
+  `FEATURE_MATRIX` files. That was documentation and gate-authority cleanup for
+  the FUSE `generic/001`-`generic/013` tranche, not a broader product-readiness
+  claim.
 - After that cleanup, a bounded outside-sandbox QEMU run on commit `a2b54d3f`
   KVM and Linux 7.0.0. The copied JSON at
   reports `passed=11`, `failed=0`, `blocked=0`, and `skipped=0`, including
