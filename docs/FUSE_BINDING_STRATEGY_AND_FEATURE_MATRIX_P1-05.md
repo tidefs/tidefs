@@ -25,7 +25,6 @@ See also:
 - `docs/TIDEFS_DOCTRINE.md` — authority model and projection charters
 - `docs/SHARED_DOCTRINE_NATIVE_SEAM_MAP_P0-03.md` — seam ownership
 - `docs/FUSE_MOUNT.md` — current FUSE mount surface
-- `docs/POSIX_SUBSET.md` — POSIX subset matrix
 - `docs/FUSE_REQUEST_WORKER_QUEUE_MODEL_P5-02.md` — worker/queue topology
 - `docs/UAPI_FFI_CANONICAL_SCHEMA_BOUNDARY_RULES_P1-03.md` — boundary mirror law
 - `docs/CURRENT_VS_FUTURE_CAPABILITIES.md` — capability tracking

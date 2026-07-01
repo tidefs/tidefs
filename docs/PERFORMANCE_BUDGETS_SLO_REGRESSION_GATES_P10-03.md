@@ -1,6 +1,12 @@
 # performance budgets / SLO / regression gates (P10-03) (v0.364)
 
-This document is the source-of-truth for the production-depth performance-budget, SLO, and regression-gate law.
+> TFR-019 authority classification: Historical input. See `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`.
+
+This imported document records historical production-depth performance-budget,
+SLO, and regression-gate target language. Current performance-gate authority is
+the source under `crates/tidefs-validation/src/performance_gate/`, current
+xtask behavior, release-candidate evidence, and the release-readiness verdict
+contract.
 
 It answers the question:
 
@@ -13,7 +19,6 @@ See also:
 - `docs/UPGRADE_FAILOVER_CUTOVER_OPERATOR_RUNBOOKS_P9-03.md`
 - `docs/SECRETS_POLICY_STORAGE_KEY_HANDLING_LAW_P9-04.md`
 - `docs/DASHBOARDS_TRACES_OPERATOR_TRUTH_SURFACES_P10-04.md` (missing from the repository; see #1270)
-- `docs/OPERATOR_MANUAL_DYNAMIC_TUNING_AND_REALTIME_OBSERVABILITY.md`
 - `docs/WORKLOAD_SIGNATURE_MATERIALIZATION_PLANE_LAW.md`
 - `docs/FIRST_RUST_USERSPACE_IMPLEMENTATION_STAIRCASE_P11-03.md`
 - `docs/KERNEL_MODULE_FAMILY_MATRIX_ROLLOUT_ORDER_P7-01.md`

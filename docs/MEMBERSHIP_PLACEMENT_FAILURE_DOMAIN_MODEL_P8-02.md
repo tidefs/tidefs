@@ -2,8 +2,8 @@
 
 > TFR-019 authority classification: Historical input. See `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`.
 
-This document is the source-of-truth for the production-depth membership,
-placement, and failure-domain model for tidefs.
+This imported document records historical production-depth membership,
+placement, and failure-domain target language for tidefs.
 
 It answers the question:
 
@@ -19,7 +19,6 @@ See also:
 - `docs/DASHBOARDS_TRACES_OPERATOR_TRUTH_SURFACES_P10-04.md` (missing from the repository; see #1270)
 - `docs/AUTHORITATIVE_DATA_STRUCTURES_ALGORITHMS.md`
 - `docs/WORKLOAD_SIGNATURE_MATERIALIZATION_PLANE_LAW.md`
-- `docs/OPERATOR_MANUAL_DYNAMIC_TUNING_AND_REALTIME_OBSERVABILITY.md`
 
 ## 1. Core result
 

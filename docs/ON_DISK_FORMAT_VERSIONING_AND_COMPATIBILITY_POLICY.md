@@ -27,7 +27,9 @@ compatibility promise.
 ### 1.1 Local Object Store (Segment Log)
 
 **Authority:** `crates/tidefs-local-object-store/src/format_manifest.rs`
-**Spec:** [LOCAL_OBJECT_STORE_ON_DISK_FORMAT.md](LOCAL_OBJECT_STORE_ON_DISK_FORMAT.md)
+**Format-family references:** `docs/design/on-media-format-strategy.md` and
+`docs/PRODUCTION_INTEGRITY_POLICY.md`; the deleted local object-store format
+lineage from #1612 remains historical input in git, the issue, and its PR.
 
 The local object store is the append-only segment log that holds all object
 data, metadata records, and integrity trailers.
@@ -275,7 +277,7 @@ boundary in current policy.
 
 - [UNRELEASED_AUTHORITY_POLICY.md](UNRELEASED_AUTHORITY_POLICY.md) -- pre-release compatibility, migration, downgrade, and fallback boundary
 - [FORMAT_IDENTITY_UPGRADE_REPLAY_CONTINUITY_LAW_P2-04.md](FORMAT_IDENTITY_UPGRADE_REPLAY_CONTINUITY_LAW_P2-04.md) -- design-level format identity, upgrade, and replay continuity law
-- [LOCAL_OBJECT_STORE_ON_DISK_FORMAT.md](LOCAL_OBJECT_STORE_ON_DISK_FORMAT.md) -- local object store on-disk format specification
+- `crates/tidefs-local-object-store/src/format_manifest.rs` -- local object store manifest and record-format version authority
 - [DATASET_FEATURE_FLAGS_DESIGN.md](DATASET_FEATURE_FLAGS_DESIGN.md) -- per-dataset feature flag architecture
 - [POOL_IMPORT_EXPORT_DEVICE_TOPOLOGY_DESIGN.md](POOL_IMPORT_EXPORT_DEVICE_TOPOLOGY_DESIGN.md) -- pool label format and import/export design
 - [TORN_COMMIT_RECOVERY_CONTRACT.md](TORN_COMMIT_RECOVERY_CONTRACT.md) -- committed-root and intent-log format contract

@@ -258,8 +258,8 @@ Follow-up scope: #789 tracks the 22 planned-authority surfaces and has split the
 - **Surface**: `docs/FUSE_BINDING_STRATEGY_AND_FEATURE_MATRIX_P1-05.md`
   - Documents implemented, partial-boundary, and explicitly unsupported status for each FUSE operation.
   - `FUSE_BMAP` was resolved by #786 as explicit non-support for the current userspace adapter boundary.
-  - #797 closed the historical non-BMAP FUSE feature-matrix stub triage, and #1081 refreshed the current callback audit in `docs/FUSE_OPERATION_COVERAGE_MATRIX.md`.
-- Classification: **Resolved by matrix refresh** — source inspection of `FuseVfsAdapter` found no live daemon callback left as a fuser-default ENOSYS stub. Partial boundaries such as unsupported ioctl command numbers now live in the coverage matrix instead of this stub inventory.
+  - #797 closed the historical non-BMAP FUSE feature-matrix stub triage, #1081 refreshed the source callback audit, and #1612 deleted the stale coverage-matrix file as historical lineage.
+- Classification: **Resolved by source audit** — source inspection of `FuseVfsAdapter` found no live daemon callback left as a fuser-default ENOSYS stub. Partial boundaries such as unsupported ioctl command numbers now live in current source and issue-scoped evidence instead of this stub inventory.
 - Follow-up issue: none from this audit; new FUSE behavior work should get a fresh issue with a non-overlapping source write set.
 
 ---
@@ -318,7 +318,7 @@ These surfaces were identified as stub/placeholder during the audit but already 
 | #783 | Section 1 (Wave Zero labels in Cargo.toml, lib.rs, xtask, WHOLE_REPO_REVIEW.md) | Delete | 4-5 files |
 | #784 | Section 2.1 (algorithm stubs in daemon_topology.rs) | Implement | `apps/tidefs-posix-filesystem-adapter-daemon/src/runtime/daemon_topology.rs` |
 | #785 | Section 2.2 (statfs stub in simple.rs) | Implement | `crates/tidefs-fuser/examples/simple.rs` |
-| #786 | Section 2.3 (FUSE_BMAP explicit non-support) | Resolved: explicit non-support | `docs/FUSE_BINDING_STRATEGY_AND_FEATURE_MATRIX_P1-05.md`, `docs/FUSE_OPERATION_COVERAGE_MATRIX.md`, `apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_vfs_adapter.rs` |
+| #786 | Section 2.3 (FUSE_BMAP explicit non-support) | Resolved: explicit non-support | `docs/FUSE_BINDING_STRATEGY_AND_FEATURE_MATRIX_P1-05.md`, `apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_vfs_adapter.rs` |
 | #787 | Section 3.1 (Claimed/NotReady test gates) | Implement | `apps/tidefs-posix-filesystem-adapter-daemon/tests/fuse_e2e_smoke.rs` |
 | #788 | Section 4.1 (Kbuild BLAKE3 stubs) | Implement | `crates/tidefs-kmod-posix-vfs/src/mount.rs`, `crates/tidefs-block-kmod/src/dispatch.rs` |
 | #799 | Section 4.2 (kernel VFS ENOSYS returns) | Implement | `crates/tidefs-kmod-posix-vfs/tidefs_posix_vfs_main.rs` |
@@ -335,7 +335,7 @@ These surfaces were identified as stub/placeholder during the audit but already 
 | #983 | Section 7.1 local-storage label retargeting | Implement | Local filesystem/object-store source, storage docs, and xtask storage gate paths |
 | #984 | Section 7.1 distributed/transport label retargeting | Implement | Membership, placement, replication, rebuild, rebalance, transport source and docs |
 | #985 | Section 7.1 validation/security/performance label retargeting | Implement | Validation, security, benchmarking, and `flake.nix` paths |
-| #797 | Section 7.3 (FUSE feature matrix stubs) | Resolved: #1081 refreshed current callback matrix | `docs/FUSE_BINDING_STRATEGY_AND_FEATURE_MATRIX_P1-05.md`, `docs/FUSE_OPERATION_COVERAGE_MATRIX.md` |
+| #797 | Section 7.3 (FUSE feature matrix stubs) | Resolved: #1081 refreshed source callback audit; #1612 deleted the stale historical matrix | `docs/FUSE_BINDING_STRATEGY_AND_FEATURE_MATRIX_P1-05.md`, `apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_vfs_adapter.rs` |
 
 The Wave Zero wording removal and the planned-authority tracking issue are the highest-priority slices because they touch the broadest surfaces with the lowest implementation risk.
 

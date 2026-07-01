@@ -4172,8 +4172,8 @@ This document composes existing authority surfaces:
 - `docs/SPACEMAP_ALLOCATOR_DESIGN.md`,
   `docs/SPACE_ACCOUNTING_MODEL_DESIGN.md`,
   `docs/LOCAL_STORAGE_ALLOCATOR_OW102.md`,
-  `docs/ALLOCATOR_RECLAIM_FREE_SPACE_SCHEMA_FAMILY_P2-02.md`, and
-  `docs/LOCAL_OBJECT_STORE_ON_DISK_FORMAT.md`: allocator, space accounting,
+  `docs/ALLOCATOR_RECLAIM_FREE_SPACE_SCHEMA_FAMILY_P2-02.md`, and the deleted
+  local object-store format lineage from #1612: allocator, space accounting,
   segment, reclaim, and object-store material inform #880, but historical or
   unclassified design wording is not current storage-intent evidence until live
   source, issue, and claim authority say so.

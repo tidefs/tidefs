@@ -100,13 +100,14 @@ This binds the transaction model to the `publication_pipeline` class
 
 ## Source Coverage
 
+| Boundary | Evidence |
 |---|---|
-| Commit groups have a visible publication boundary | `crates/tidefs-local-filesystem/src/lib.rs::persist_state_until_boundary` writes transaction objects, syncs them, publishes the root-slot commit, then syncs the root-slot commit; `docs/NO_PRODUCTION_FSCK_FAILURE_MODEL.md` names the same order. |
+| Commit groups have a visible publication boundary | `crates/tidefs-local-filesystem/src/lib.rs::persist_state_until_boundary` writes transaction objects, syncs them, publishes the root-slot commit, then syncs the root-slot commit; the recovery tests below exercise old/new/error selection. |
 | Dirty objects are staging until a committed root selects them | `crates/tidefs-local-filesystem/src/lib.rs::uncommitted_transaction_objects_are_ignored_on_reopen`. |
 | Invalid manifests cannot become live truth | `crates/tidefs-local-filesystem/src/lib.rs::invalid_transaction_manifest_makes_newer_root_candidate_unselectable`. |
 | Pre-publish sync failure rolls back live state | `crates/tidefs-local-filesystem/src/lib.rs::pre_publish_sync_failure_rolls_back_live_state`. |
 | Root-slot sync failure is old-or-new and does not reuse the transaction id | `crates/tidefs-local-filesystem/src/lib.rs::root_sync_failure_keeps_live_state_and_avoids_transaction_id_reuse`. |
-| Fsync succeeds only after the backing sync boundary | `crates/tidefs-local-filesystem/src/lib.rs::LocalFileSystem::sync_all`, `docs/POSIX_SEMANTICS_OW106.md`, and the FUSE `fsync`/`fsyncdir` path through `sync_all`. |
+| Fsync succeeds only after the backing sync boundary | `crates/tidefs-local-filesystem/src/lib.rs::LocalFileSystem::sync_all` and the FUSE `fsync`/`fsyncdir` path through `sync_all`. |
 | Page-cache/mmap durability cannot bypass publication | `crates/tidefs-local-filesystem/src/lib.rs::page_cache_writeback_mmap_spec_covers_open_work_204_acceptance_gate`. |
 
 ## Non-Claims
