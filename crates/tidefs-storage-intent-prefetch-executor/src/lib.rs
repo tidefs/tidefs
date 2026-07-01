@@ -1214,6 +1214,8 @@ impl Default for PrefetchExecutorMediaPath {
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub struct PrefetchExecutorEvidenceRefs {
     pub compiled_policy_ref: StorageIntentEvidenceRef,
+    pub operator_policy_ref: StorageIntentEvidenceRef,
+    pub service_objective_ref: StorageIntentEvidenceRef,
     pub prefetch_decision_ref: StorageIntentEvidenceRef,
     pub evidence_query_snapshot_ref: StorageIntentEvidenceRef,
     pub scheduler_admission_ref: StorageIntentEvidenceRef,
@@ -1753,6 +1755,16 @@ pub fn evaluate_prefetch_execution(input: PrefetchExecutorInput) -> PrefetchExec
         );
     }
 
+    let policy_objective_refusal = decision_policy_objective_refusal(input);
+    if policy_objective_refusal as u16 != StorageIntentRefusalReason::None as u16 {
+        return terminal(
+            record,
+            PrefetchExecutorOutcome::Blocked,
+            PrefetchExecutorByteState::Blocked,
+            policy_objective_refusal,
+        );
+    }
+
     if initial_result_detail_lacks_feedback_evidence(input) {
         return terminal(
             record,
@@ -2234,6 +2246,8 @@ fn base_record(input: PrefetchExecutorInput) -> PrefetchExecutorRecord {
         anti_waste: input.anti_waste,
         evidence_refs: PrefetchExecutorEvidenceRefs {
             compiled_policy_ref: input.decision.evidence_refs.compiled_policy_ref,
+            operator_policy_ref: input.decision.evidence_refs.operator_policy_ref,
+            service_objective_ref: input.decision.evidence_refs.service_objective_ref,
             prefetch_decision_ref: input.decision.evidence_refs.decision_frontier_ref,
             evidence_query_snapshot_ref: input.decision.evidence_refs.evidence_query_ref,
             scheduler_admission_ref: input.admission.scheduler_admission_ref,
@@ -2526,6 +2540,28 @@ fn terminal_update_lacks_started_dispatch_evidence(
             cut,
             record.evidence_refs.compiled_policy_ref,
             StorageIntentEvidenceKind::PolicyRolloutEvidence,
+        )
+    {
+        return true;
+    }
+
+    if record.evidence_refs.operator_policy_ref.is_bound()
+        && !terminal_ref_in_cut(
+            record,
+            cut,
+            record.evidence_refs.operator_policy_ref,
+            StorageIntentEvidenceKind::PolicyRolloutEvidence,
+        )
+    {
+        return true;
+    }
+
+    if record.evidence_refs.service_objective_ref.is_bound()
+        && !terminal_ref_in_cut(
+            record,
+            cut,
+            record.evidence_refs.service_objective_ref,
+            StorageIntentEvidenceKind::ServiceObjectiveEvidence,
         )
     {
         return true;
@@ -3065,6 +3101,39 @@ fn required_families_fresh(
             ))
         && snapshot
             .contains_fresh_authority_family(StorageIntentEvidenceKind::ReadFreshnessEvidence)
+}
+
+fn decision_policy_objective_refusal(input: PrefetchExecutorInput) -> StorageIntentRefusalReason {
+    let refs = input.decision.evidence_refs;
+    if refs.compiled_policy_ref.is_bound()
+        && !snapshot_contains_fresh_ref(
+            input,
+            StorageIntentEvidenceKind::PolicyRolloutEvidence,
+            refs.compiled_policy_ref,
+        )
+    {
+        return StorageIntentRefusalReason::EvidenceNotUsable;
+    }
+    if refs.operator_policy_ref.is_bound()
+        && !snapshot_contains_fresh_ref(
+            input,
+            StorageIntentEvidenceKind::PolicyRolloutEvidence,
+            refs.operator_policy_ref,
+        )
+    {
+        return StorageIntentRefusalReason::EvidenceNotUsable;
+    }
+    if refs.service_objective_ref.is_bound()
+        && !snapshot_contains_fresh_ref(
+            input,
+            StorageIntentEvidenceKind::ServiceObjectiveEvidence,
+            refs.service_objective_ref,
+        )
+    {
+        return StorageIntentRefusalReason::EvidenceNotUsable;
+    }
+
+    StorageIntentRefusalReason::None
 }
 
 fn runtime_dispatch_evidence_refusal(
@@ -3897,6 +3966,8 @@ mod tests {
     const RELOCATION: StorageIntentEvidenceId = StorageIntentEvidenceId([25; 32]);
     const RECOVERY: StorageIntentEvidenceId = StorageIntentEvidenceId([26; 32]);
     const POLICY_ROLLOUT: StorageIntentEvidenceId = StorageIntentEvidenceId([27; 32]);
+    const OPERATOR_POLICY: StorageIntentEvidenceId = StorageIntentEvidenceId([28; 32]);
+    const SERVICE_OBJECTIVE: StorageIntentEvidenceId = StorageIntentEvidenceId([29; 32]);
 
     fn evidence(
         kind: StorageIntentEvidenceKind,
@@ -4296,6 +4367,8 @@ mod tests {
     ) {
         push_terminal_ref(refs, record.evidence_refs.evidence_query_snapshot_ref);
         push_terminal_ref(refs, record.evidence_refs.compiled_policy_ref);
+        push_terminal_ref(refs, record.evidence_refs.operator_policy_ref);
+        push_terminal_ref(refs, record.evidence_refs.service_objective_ref);
         push_terminal_ref(refs, record.evidence_refs.prefetch_decision_ref);
         push_terminal_ref(refs, record.evidence_refs.scheduler_admission_ref);
         push_terminal_ref(refs, record.evidence_refs.dispatch_plan_ref);
@@ -4327,6 +4400,8 @@ mod tests {
             omitted,
         );
         push_terminal_start_ref_unless(refs, record.evidence_refs.compiled_policy_ref, omitted);
+        push_terminal_start_ref_unless(refs, record.evidence_refs.operator_policy_ref, omitted);
+        push_terminal_start_ref_unless(refs, record.evidence_refs.service_objective_ref, omitted);
         push_terminal_start_ref_unless(refs, record.evidence_refs.prefetch_decision_ref, omitted);
         push_terminal_start_ref_unless(refs, record.evidence_refs.scheduler_admission_ref, omitted);
         push_terminal_start_ref_unless(refs, record.evidence_refs.dispatch_plan_ref, omitted);
@@ -7042,11 +7117,11 @@ mod tests {
             POLICY_ROLLOUT,
         );
         input.decision.evidence_refs.compiled_policy_ref = compiled_policy_ref;
-        input
-            .evidence_query_snapshot
-            .included_refs
-            .push(compiled_policy_ref)
-            .unwrap();
+        add_fresh(
+            &mut input.evidence_query_snapshot,
+            StorageIntentEvidenceKind::PolicyRolloutEvidence,
+            POLICY_ROLLOUT,
+        );
 
         let started = evaluate_prefetch_execution(input);
         assert_eq!(started.outcome, PrefetchExecutorOutcome::Started);
@@ -7101,6 +7176,136 @@ mod tests {
         assert_eq!(
             completed.evidence_refs.compiled_policy_ref,
             compiled_policy_ref
+        );
+        assert_record_has_no_authority_claims(completed);
+    }
+
+    #[test]
+    fn policy_and_service_objective_refs_gate_dispatch_and_terminal_cuts() {
+        let detail = terminal_detail();
+        let operator_policy_ref = evidence(
+            StorageIntentEvidenceKind::PolicyRolloutEvidence,
+            OPERATOR_POLICY,
+        );
+        let service_objective_ref = evidence(
+            StorageIntentEvidenceKind::ServiceObjectiveEvidence,
+            SERVICE_OBJECTIVE,
+        );
+
+        let mut missing_operator =
+            admitted_charged_input(PrefetchResidencyCandidateClass::BoundedReadahead, detail);
+        missing_operator.decision.evidence_refs.operator_policy_ref = operator_policy_ref;
+        missing_operator
+            .evidence_query_snapshot
+            .included_refs
+            .push(operator_policy_ref)
+            .unwrap();
+        let missing_operator_record = evaluate_prefetch_execution(missing_operator);
+        assert_eq!(
+            missing_operator_record.outcome,
+            PrefetchExecutorOutcome::Blocked
+        );
+        assert_eq!(
+            missing_operator_record.refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+
+        let mut missing_service =
+            admitted_charged_input(PrefetchResidencyCandidateClass::BoundedReadahead, detail);
+        missing_service.decision.evidence_refs.service_objective_ref = service_objective_ref;
+        missing_service
+            .evidence_query_snapshot
+            .included_refs
+            .push(service_objective_ref)
+            .unwrap();
+        let missing_service_record = evaluate_prefetch_execution(missing_service);
+        assert_eq!(
+            missing_service_record.outcome,
+            PrefetchExecutorOutcome::Blocked
+        );
+        assert_eq!(
+            missing_service_record.refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+
+        let mut input =
+            admitted_charged_input(PrefetchResidencyCandidateClass::BoundedReadahead, detail);
+        input.decision.evidence_refs.operator_policy_ref = operator_policy_ref;
+        input.decision.evidence_refs.service_objective_ref = service_objective_ref;
+        add_fresh(
+            &mut input.evidence_query_snapshot,
+            StorageIntentEvidenceKind::PolicyRolloutEvidence,
+            OPERATOR_POLICY,
+        );
+        add_fresh(
+            &mut input.evidence_query_snapshot,
+            StorageIntentEvidenceKind::ServiceObjectiveEvidence,
+            SERVICE_OBJECTIVE,
+        );
+
+        let started = evaluate_prefetch_execution(input);
+        assert_eq!(started.outcome, PrefetchExecutorOutcome::Started);
+        assert_eq!(
+            started.evidence_refs.operator_policy_ref,
+            operator_policy_ref
+        );
+        assert_eq!(
+            started.evidence_refs.service_objective_ref,
+            service_objective_ref
+        );
+
+        for omitted in [
+            started.evidence_refs.operator_policy_ref,
+            started.evidence_refs.service_objective_ref,
+        ] {
+            let mut missing_start_refs = StorageIntentEvidenceRefs::EMPTY;
+            push_terminal_start_refs_except(&mut missing_start_refs, started, omitted);
+            push_terminal_ref(&mut missing_start_refs, detail.attribution_ref);
+            push_terminal_ref(&mut missing_start_refs, detail.retention_ref);
+            push_terminal_ref(&mut missing_start_refs, detail.validation_ref);
+
+            let rejected = finalize_prefetch_execution(
+                started,
+                PrefetchExecutorTerminalUpdate {
+                    outcome: PrefetchExecutorOutcome::Completed,
+                    result_detail: detail,
+                    evidence_cut: PrefetchExecutorTerminalEvidenceCut {
+                        evidence_query_snapshot_ref: started
+                            .evidence_refs
+                            .evidence_query_snapshot_ref,
+                        included_refs: missing_start_refs,
+                    },
+                    ..PrefetchExecutorTerminalUpdate::default()
+                },
+            );
+            assert_eq!(
+                rejected.outcome,
+                PrefetchExecutorOutcome::VerificationFailed
+            );
+            assert_eq!(
+                rejected.refusal,
+                StorageIntentRefusalReason::ValidationGateFailed
+            );
+            assert_record_has_no_authority_claims(rejected);
+        }
+
+        let completed = finalize_prefetch_execution(
+            started,
+            PrefetchExecutorTerminalUpdate {
+                outcome: PrefetchExecutorOutcome::Completed,
+                result_detail: detail,
+                evidence_cut: terminal_evidence_cut(started, detail, EMPTY_EVIDENCE_REF),
+                ..PrefetchExecutorTerminalUpdate::default()
+            },
+        );
+        assert_eq!(completed.outcome, PrefetchExecutorOutcome::Completed);
+        assert_eq!(
+            completed.evidence_refs.operator_policy_ref,
+            operator_policy_ref
+        );
+        assert_eq!(
+            completed.evidence_refs.service_objective_ref,
+            service_objective_ref
         );
         assert_record_has_no_authority_claims(completed);
     }
