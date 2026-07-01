@@ -591,7 +591,12 @@ fn mount_vfs(config: MountVfsConfig) -> Result<(), String> {
     let msp_for_sig = mount_state_path.clone();
 
     std::thread::spawn(move || {
+        // SAFETY: `sigset_t` is a C value type and zeroed storage is the libc
+        // initialization baseline before `sigemptyset` populates it.
         let mut sigset: libc::sigset_t = unsafe { std::mem::zeroed() };
+        // SAFETY: `sigset` is a valid stack-owned signal set. The selected
+        // signals are valid constants, and the null old-mask pointer records
+        // that the previous thread mask is intentionally not retained.
         unsafe {
             libc::sigemptyset(&mut sigset);
             libc::sigaddset(&mut sigset, libc::SIGINT);
@@ -601,6 +606,8 @@ fn mount_vfs(config: MountVfsConfig) -> Result<(), String> {
         }
         loop {
             let mut caught_sig: libc::c_int = 0;
+            // SAFETY: `sigset` remains initialized for the thread lifetime and
+            // `caught_sig` is a valid out pointer for the delivered signal.
             let rc = unsafe { libc::sigwait(&sigset, &mut caught_sig) };
             if rc == 0 {
                 shutdown_for_sig.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1556,6 +1563,9 @@ fn run_smoke_mount(config: SmokeMountConfig) -> Result<(), String> {
             let _ = child.kill();
             // Give it a moment, then SIGKILL.
             thread::sleep(Duration::from_millis(500));
+            // SAFETY: `child.id()` is the process id returned by `Command` for
+            // this daemon child; SIGKILL intentionally simulates a crash after
+            // gentler teardown attempts.
             unsafe {
                 libc::kill(child.id() as i32, libc::SIGKILL);
             }
@@ -1574,6 +1584,8 @@ fn run_smoke_mount(config: SmokeMountConfig) -> Result<(), String> {
     fn xattr_set(path: &str, name: &str, value: &[u8], flags: i32) -> Result<(), String> {
         let path_c = std::ffi::CString::new(path).map_err(|e| format!("path CString: {e}"))?;
         let name_c = std::ffi::CString::new(name).map_err(|e| format!("name CString: {e}"))?;
+        // SAFETY: `path_c` and `name_c` are NUL-terminated C strings alive for
+        // the call, and `value.as_ptr()` is valid for `value.len()` bytes.
         let rc = unsafe {
             libc::setxattr(
                 path_c.as_ptr(),
@@ -1586,6 +1598,8 @@ fn run_smoke_mount(config: SmokeMountConfig) -> Result<(), String> {
         if rc == 0 {
             Ok(())
         } else {
+            // SAFETY: errno is read immediately after the failing libc call on
+            // this thread.
             let e = unsafe { *libc::__errno_location() };
             Err(format!("setxattr {name}: errno={e}"))
         }
@@ -1594,13 +1608,19 @@ fn run_smoke_mount(config: SmokeMountConfig) -> Result<(), String> {
     fn xattr_get(path: &str, name: &str) -> Result<(Vec<u8>, usize), String> {
         let path_c = std::ffi::CString::new(path).map_err(|e| format!("path CString: {e}"))?;
         let name_c = std::ffi::CString::new(name).map_err(|e| format!("name CString: {e}"))?;
+        // SAFETY: The path and attribute name are valid C strings. The null
+        // buffer and zero length request only asks libc for the xattr size.
         let size =
             unsafe { libc::getxattr(path_c.as_ptr(), name_c.as_ptr(), std::ptr::null_mut(), 0) };
         if size < 0 {
+            // SAFETY: errno is read immediately after the failing libc call on
+            // this thread.
             let e = unsafe { *libc::__errno_location() };
             return Err(format!("getxattr size {name}: errno={e}"));
         }
         let mut buf = vec![0u8; size as usize];
+        // SAFETY: `buf` is allocated for `size` bytes, and the C string
+        // pointers remain alive while libc writes at most `buf.len()` bytes.
         let n = unsafe {
             libc::getxattr(
                 path_c.as_ptr(),
@@ -1610,6 +1630,8 @@ fn run_smoke_mount(config: SmokeMountConfig) -> Result<(), String> {
             )
         };
         if n < 0 {
+            // SAFETY: errno is read immediately after the failing libc call on
+            // this thread.
             let e = unsafe { *libc::__errno_location() };
             return Err(format!("getxattr {name}: errno={e}"));
         }
@@ -1619,10 +1641,14 @@ fn run_smoke_mount(config: SmokeMountConfig) -> Result<(), String> {
     fn xattr_remove(path: &str, name: &str) -> Result<(), String> {
         let path_c = std::ffi::CString::new(path).map_err(|e| format!("path CString: {e}"))?;
         let name_c = std::ffi::CString::new(name).map_err(|e| format!("name CString: {e}"))?;
+        // SAFETY: `path_c` and `name_c` are NUL-terminated C strings alive for
+        // the duration of the removexattr syscall.
         let rc = unsafe { libc::removexattr(path_c.as_ptr(), name_c.as_ptr()) };
         if rc == 0 {
             Ok(())
         } else {
+            // SAFETY: errno is read immediately after the failing libc call on
+            // this thread.
             let e = unsafe { *libc::__errno_location() };
             Err(format!("removexattr {name}: errno={e}"))
         }
@@ -2002,6 +2028,8 @@ fn run_smoke_mount(config: SmokeMountConfig) -> Result<(), String> {
     });
 
     smoke_test!("phase1c_trusted_rejected_nonroot", {
+        // SAFETY: `geteuid` has no pointer arguments and only reads the current
+        // process credentials.
         let uid = unsafe { libc::geteuid() };
         if uid == 0 {
             eprintln!("  INFO  running as root; trusted.* test identity-gated, skipping");
@@ -2016,6 +2044,8 @@ fn run_smoke_mount(config: SmokeMountConfig) -> Result<(), String> {
     });
 
     smoke_test!("phase1c_security_rejected_nonroot", {
+        // SAFETY: `geteuid` has no pointer arguments and only reads the current
+        // process credentials.
         let uid = unsafe { libc::geteuid() };
         if uid == 0 {
             eprintln!("  INFO  running as root; security.* test identity-gated, skipping");
@@ -2515,18 +2545,24 @@ fn run_smoke_mount(config: SmokeMountConfig) -> Result<(), String> {
         // Reading from the stale fd should fail because the FUSE daemon
         // is gone. Accept any I/O error (EIO, ENOTCONN, EBADF, ESTALE).
         let mut buf = [0u8; 64];
+        // SAFETY: `stale_fd` is an fd owned by this harness until the close
+        // probe below, and `buf` is a valid writable buffer for `buf.len()`.
         let n = unsafe { libc::read(stale_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
         if n >= 0 {
             return Err(format!(
                 "stale fd read succeeded (returned {n} bytes); expected error after daemon kill"
             ));
         }
+        // SAFETY: errno is read immediately after the failing read on this
+        // thread.
         let errno = unsafe { *libc::__errno_location() };
         eprintln!("  INFO  stale fd read got errno={errno} (expected)");
         Ok(())
     });
 
     smoke_test!("phase4_stale_handle_write_fails", {
+        // SAFETY: `stale_fd` is still owned by this harness, and the static
+        // byte string is valid for the explicit 12-byte write length.
         let n = unsafe {
             libc::write(
                 stale_fd,
@@ -2539,14 +2575,20 @@ fn run_smoke_mount(config: SmokeMountConfig) -> Result<(), String> {
                 "stale fd write succeeded (returned {n} bytes); expected error after daemon kill"
             ));
         }
+        // SAFETY: errno is read immediately after the failing write on this
+        // thread.
         let errno = unsafe { *libc::__errno_location() };
         eprintln!("  INFO  stale fd write got errno={errno} (expected)");
         Ok(())
     });
 
     smoke_test!("phase4_stale_handle_close", {
+        // SAFETY: `stale_fd` was produced by `into_raw_fd` and is closed
+        // exactly once here, transferring ownership back to the OS.
         let rc = unsafe { libc::close(stale_fd) };
         if rc != 0 {
+            // SAFETY: errno is read immediately after the failing close on this
+            // thread.
             let errno = unsafe { *libc::__errno_location() };
             eprintln!("  INFO  stale fd close got errno={errno} (expected, may happen)");
         }
@@ -2780,25 +2822,38 @@ fn run_smoke_mount(config: SmokeMountConfig) -> Result<(), String> {
 
     // POSIX F_SETLK non-blocking write-lock acquire.
     smoke_test!("phase6_posix_setlk_write_acquire", {
+        // SAFETY: Audit note: #1447 tracks converting this Rust `String`
+        // pointer to a NUL-terminated C string before calling `open`.
         let fd = unsafe { libc::open(lock_file.as_ptr() as *const libc::c_char, libc::O_RDWR) };
         if fd < 0 {
+            // SAFETY: errno is read immediately after the failing open on this
+            // thread.
             return Err(format!("open: errno={}", unsafe {
                 *libc::__errno_location()
             }));
         }
+        // SAFETY: `flock` is a C value type and zeroed storage is populated
+        // field-by-field before it is passed to `fcntl`.
         let mut fl: libc::flock = unsafe { std::mem::zeroed() };
         fl.l_type = libc::F_WRLCK as i16;
         fl.l_whence = libc::SEEK_SET as i16;
         fl.l_start = 0;
         fl.l_len = 100;
+        // SAFETY: `fd` is the owned descriptor returned by open, and `fl`
+        // points to an initialized lock request for the duration of the call.
         let rc = unsafe { libc::fcntl(fd, libc::F_SETLK, &fl) };
         if rc != 0 {
+            // SAFETY: errno is read immediately after the failing fcntl on this
+            // thread.
             let e = unsafe { *libc::__errno_location() };
+            // SAFETY: `fd` is owned by this probe and is not used after this
+            // close on the error path.
             unsafe {
                 libc::close(fd);
             }
             return Err(format!("F_SETLK write acquire failed: errno={e}"));
         }
+        // SAFETY: `fd` is owned by this probe and is not used after this close.
         unsafe {
             libc::close(fd);
         }
@@ -2808,40 +2863,64 @@ fn run_smoke_mount(config: SmokeMountConfig) -> Result<(), String> {
     // POSIX F_SETLK write-lock conflict: overlapping write locks from
     // two file descriptors should return EAGAIN/EWOULDBLOCK.
     smoke_test!("phase6_posix_setlk_write_conflict", {
+        // SAFETY: Audit note: #1447 tracks converting this Rust `String`
+        // pointer to a NUL-terminated C string before calling `open`.
         let fd1 = unsafe { libc::open(lock_file.as_ptr() as *const libc::c_char, libc::O_RDWR) };
         if fd1 < 0 {
+            // SAFETY: errno is read immediately after the failing open on this
+            // thread.
             return Err(format!("open fd1: errno={}", unsafe {
                 *libc::__errno_location()
             }));
         }
+        // SAFETY: `flock` is a C value type and zeroed storage is populated
+        // field-by-field before it is passed to `fcntl`.
         let mut fl1: libc::flock = unsafe { std::mem::zeroed() };
         fl1.l_type = libc::F_WRLCK as i16;
         fl1.l_whence = libc::SEEK_SET as i16;
         fl1.l_start = 0;
         fl1.l_len = 50;
+        // SAFETY: `fd1` is open and owned by this probe, and `fl1` points to an
+        // initialized lock request.
         if unsafe { libc::fcntl(fd1, libc::F_SETLK, &fl1) } != 0 {
+            // SAFETY: errno is read immediately after the failing fcntl on this
+            // thread.
             let e = unsafe { *libc::__errno_location() };
+            // SAFETY: `fd1` is owned by this probe and is not used after this
+            // close on the error path.
             unsafe {
                 libc::close(fd1);
             }
             return Err(format!("first F_SETLK failed: errno={e}"));
         }
+        // SAFETY: Audit note: #1447 tracks converting this Rust `String`
+        // pointer to a NUL-terminated C string before calling `open`.
         let fd2 = unsafe { libc::open(lock_file.as_ptr() as *const libc::c_char, libc::O_RDWR) };
         if fd2 < 0 {
+            // SAFETY: `fd1` is owned by this probe and is not used after this
+            // close on the error path.
             unsafe {
                 libc::close(fd1);
             }
+            // SAFETY: errno is read immediately after the failing open on this
+            // thread.
             return Err(format!("open fd2: errno={}", unsafe {
                 *libc::__errno_location()
             }));
         }
+        // SAFETY: `flock` is a C value type and zeroed storage is populated
+        // field-by-field before it is passed to `fcntl`.
         let mut fl2: libc::flock = unsafe { std::mem::zeroed() };
         fl2.l_type = libc::F_WRLCK as i16;
         fl2.l_whence = libc::SEEK_SET as i16;
         fl2.l_start = 10;
         fl2.l_len = 40;
+        // SAFETY: `fd2` is open and owned by this probe, and `fl2` points to an
+        // initialized lock request.
         let rc2 = unsafe { libc::fcntl(fd2, libc::F_SETLK, &fl2) };
         if rc2 == 0 {
+            // SAFETY: both fds are owned by this probe and are not used after
+            // this close on the unexpected-success path.
             unsafe {
                 libc::close(fd1);
                 libc::close(fd2);
@@ -2850,14 +2929,20 @@ fn run_smoke_mount(config: SmokeMountConfig) -> Result<(), String> {
                 "conflicting F_SETLK should have returned EAGAIN/EWOULDBLOCK but succeeded".into(),
             );
         }
+        // SAFETY: errno is read immediately after the failing fcntl on this
+        // thread.
         let errno2 = unsafe { *libc::__errno_location() };
         if errno2 != libc::EAGAIN && errno2 != libc::EWOULDBLOCK {
+            // SAFETY: both fds are owned by this probe and are not used after
+            // this close on the error path.
             unsafe {
                 libc::close(fd1);
                 libc::close(fd2);
             }
             return Err(format!("expected EAGAIN/EWOULDBLOCK, got errno={errno2}"));
         }
+        // SAFETY: both fds are owned by this probe and are not used after this
+        // close.
         unsafe {
             libc::close(fd1);
             libc::close(fd2);
@@ -2867,40 +2952,66 @@ fn run_smoke_mount(config: SmokeMountConfig) -> Result<(), String> {
 
     // POSIX F_GETLK query: should return the conflicting lock info.
     smoke_test!("phase6_posix_getlk_query", {
+        // SAFETY: Audit note: #1447 tracks converting this Rust `String`
+        // pointer to a NUL-terminated C string before calling `open`.
         let fd1 = unsafe { libc::open(lock_file.as_ptr() as *const libc::c_char, libc::O_RDWR) };
         if fd1 < 0 {
+            // SAFETY: errno is read immediately after the failing open on this
+            // thread.
             return Err(format!("open fd1: errno={}", unsafe {
                 *libc::__errno_location()
             }));
         }
+        // SAFETY: `flock` is a C value type and zeroed storage is populated
+        // field-by-field before it is passed to `fcntl`.
         let mut fl1: libc::flock = unsafe { std::mem::zeroed() };
         fl1.l_type = libc::F_WRLCK as i16;
         fl1.l_whence = libc::SEEK_SET as i16;
         fl1.l_start = 100;
         fl1.l_len = 100;
+        // SAFETY: `fd1` is open and owned by this probe, and `fl1` points to an
+        // initialized lock request.
         if unsafe { libc::fcntl(fd1, libc::F_SETLK, &fl1) } != 0 {
+            // SAFETY: errno is read immediately after the failing fcntl on this
+            // thread.
             let e = unsafe { *libc::__errno_location() };
+            // SAFETY: `fd1` is owned by this probe and is not used after this
+            // close on the error path.
             unsafe {
                 libc::close(fd1);
             }
             return Err(format!("write lock acquire failed: errno={e}"));
         }
+        // SAFETY: Audit note: #1447 tracks converting this Rust `String`
+        // pointer to a NUL-terminated C string before calling `open`.
         let fd2 = unsafe { libc::open(lock_file.as_ptr() as *const libc::c_char, libc::O_RDWR) };
         if fd2 < 0 {
+            // SAFETY: `fd1` is owned by this probe and is not used after this
+            // close on the error path.
             unsafe {
                 libc::close(fd1);
             }
+            // SAFETY: errno is read immediately after the failing open on this
+            // thread.
             return Err(format!("open fd2: errno={}", unsafe {
                 *libc::__errno_location()
             }));
         }
+        // SAFETY: `flock` is a C value type and zeroed storage is populated
+        // field-by-field before it is passed to `fcntl`.
         let mut fl_query: libc::flock = unsafe { std::mem::zeroed() };
         fl_query.l_type = libc::F_WRLCK as i16;
         fl_query.l_whence = libc::SEEK_SET as i16;
         fl_query.l_start = 150;
         fl_query.l_len = 10;
+        // SAFETY: `fd2` is open and owned by this probe, and `fl_query` points
+        // to initialized storage that fcntl may update for F_GETLK.
         if unsafe { libc::fcntl(fd2, libc::F_GETLK, &fl_query) } != 0 {
+            // SAFETY: errno is read immediately after the failing fcntl on this
+            // thread.
             let e = unsafe { *libc::__errno_location() };
+            // SAFETY: both fds are owned by this probe and are not used after
+            // this close on the error path.
             unsafe {
                 libc::close(fd1);
                 libc::close(fd2);
@@ -2908,6 +3019,8 @@ fn run_smoke_mount(config: SmokeMountConfig) -> Result<(), String> {
             return Err(format!("F_GETLK failed: errno={e}"));
         }
         if fl_query.l_type != (libc::F_WRLCK as i16) {
+            // SAFETY: both fds are owned by this probe and are not used after
+            // this close on the error path.
             unsafe {
                 libc::close(fd1);
                 libc::close(fd2);
@@ -2918,12 +3031,16 @@ fn run_smoke_mount(config: SmokeMountConfig) -> Result<(), String> {
             ));
         }
         if fl_query.l_pid <= 0 {
+            // SAFETY: both fds are owned by this probe and are not used after
+            // this close on the error path.
             unsafe {
                 libc::close(fd1);
                 libc::close(fd2);
             }
             return Err(format!("F_GETLK pid should be >0, got {}", fl_query.l_pid));
         }
+        // SAFETY: both fds are owned by this probe and are not used after this
+        // close.
         unsafe {
             libc::close(fd1);
             libc::close(fd2);
@@ -2933,40 +3050,65 @@ fn run_smoke_mount(config: SmokeMountConfig) -> Result<(), String> {
 
     // POSIX F_SETLK unlock: release a held lock and verify re-acquire succeeds.
     smoke_test!("phase6_posix_setlk_unlock", {
+        // SAFETY: Audit note: #1447 tracks converting this Rust `String`
+        // pointer to a NUL-terminated C string before calling `open`.
         let fd = unsafe { libc::open(lock_file.as_ptr() as *const libc::c_char, libc::O_RDWR) };
         if fd < 0 {
+            // SAFETY: errno is read immediately after the failing open on this
+            // thread.
             return Err(format!("open: errno={}", unsafe {
                 *libc::__errno_location()
             }));
         }
+        // SAFETY: `flock` is a C value type and zeroed storage is populated
+        // field-by-field before it is passed to `fcntl`.
         let mut fl: libc::flock = unsafe { std::mem::zeroed() };
         fl.l_type = libc::F_WRLCK as i16;
         fl.l_whence = libc::SEEK_SET as i16;
         fl.l_start = 200;
         fl.l_len = 50;
+        // SAFETY: `fd` is open and owned by this probe, and `fl` points to an
+        // initialized lock request.
         if unsafe { libc::fcntl(fd, libc::F_SETLK, &fl) } != 0 {
+            // SAFETY: errno is read immediately after the failing fcntl on this
+            // thread.
             let e = unsafe { *libc::__errno_location() };
+            // SAFETY: `fd` is owned by this probe and is not used after this
+            // close on the error path.
             unsafe {
                 libc::close(fd);
             }
             return Err(format!("acquire failed: errno={e}"));
         }
         fl.l_type = libc::F_UNLCK as i16;
+        // SAFETY: `fd` is open and owned by this probe, and `fl` remains an
+        // initialized lock request with only the lock type changed.
         if unsafe { libc::fcntl(fd, libc::F_SETLK, &fl) } != 0 {
+            // SAFETY: errno is read immediately after the failing fcntl on this
+            // thread.
             let e = unsafe { *libc::__errno_location() };
+            // SAFETY: `fd` is owned by this probe and is not used after this
+            // close on the error path.
             unsafe {
                 libc::close(fd);
             }
             return Err(format!("unlock failed: errno={e}"));
         }
         fl.l_type = libc::F_WRLCK as i16;
+        // SAFETY: `fd` is open and owned by this probe, and `fl` remains an
+        // initialized lock request with only the lock type changed.
         if unsafe { libc::fcntl(fd, libc::F_SETLK, &fl) } != 0 {
+            // SAFETY: errno is read immediately after the failing fcntl on this
+            // thread.
             let e = unsafe { *libc::__errno_location() };
+            // SAFETY: `fd` is owned by this probe and is not used after this
+            // close on the error path.
             unsafe {
                 libc::close(fd);
             }
             return Err(format!("re-acquire after unlock failed: errno={e}"));
         }
+        // SAFETY: `fd` is owned by this probe and is not used after this close.
         unsafe {
             libc::close(fd);
         }
@@ -2975,19 +3117,29 @@ fn run_smoke_mount(config: SmokeMountConfig) -> Result<(), String> {
 
     // BSD flock exclusive acquire.
     smoke_test!("phase6_flock_exclusive_acquire", {
+        // SAFETY: Audit note: #1447 tracks converting this Rust `String`
+        // pointer to a NUL-terminated C string before calling `open`.
         let fd = unsafe { libc::open(lock_file.as_ptr() as *const libc::c_char, libc::O_RDWR) };
         if fd < 0 {
+            // SAFETY: errno is read immediately after the failing open on this
+            // thread.
             return Err(format!("open: errno={}", unsafe {
                 *libc::__errno_location()
             }));
         }
+        // SAFETY: `fd` is open and owned by this probe for the flock call.
         if unsafe { libc::flock(fd, libc::LOCK_EX) } != 0 {
+            // SAFETY: errno is read immediately after the failing flock on this
+            // thread.
             let e = unsafe { *libc::__errno_location() };
+            // SAFETY: `fd` is owned by this probe and is not used after this
+            // close on the error path.
             unsafe {
                 libc::close(fd);
             }
             return Err(format!("flock LOCK_EX failed: errno={e}"));
         }
+        // SAFETY: `fd` is owned by this probe and is not used after this close.
         unsafe {
             libc::close(fd);
         }
@@ -2997,30 +3149,49 @@ fn run_smoke_mount(config: SmokeMountConfig) -> Result<(), String> {
     // BSD flock exclusive conflict: two fds competing for exclusive flock
     // on the same file, second with LOCK_NB should get EWOULDBLOCK.
     smoke_test!("phase6_flock_exclusive_conflict", {
+        // SAFETY: Audit note: #1447 tracks converting this Rust `String`
+        // pointer to a NUL-terminated C string before calling `open`.
         let fd1 = unsafe { libc::open(lock_file.as_ptr() as *const libc::c_char, libc::O_RDWR) };
         if fd1 < 0 {
+            // SAFETY: errno is read immediately after the failing open on this
+            // thread.
             return Err(format!("open fd1: errno={}", unsafe {
                 *libc::__errno_location()
             }));
         }
+        // SAFETY: `fd1` is open and owned by this probe for the flock call.
         if unsafe { libc::flock(fd1, libc::LOCK_EX) } != 0 {
+            // SAFETY: errno is read immediately after the failing flock on this
+            // thread.
             let e = unsafe { *libc::__errno_location() };
+            // SAFETY: `fd1` is owned by this probe and is not used after this
+            // close on the error path.
             unsafe {
                 libc::close(fd1);
             }
             return Err(format!("first flock LOCK_EX failed: errno={e}"));
         }
+        // SAFETY: Audit note: #1447 tracks converting this Rust `String`
+        // pointer to a NUL-terminated C string before calling `open`.
         let fd2 = unsafe { libc::open(lock_file.as_ptr() as *const libc::c_char, libc::O_RDWR) };
         if fd2 < 0 {
+            // SAFETY: `fd1` is owned by this probe and is not used after this
+            // close on the error path.
             unsafe {
                 libc::close(fd1);
             }
+            // SAFETY: errno is read immediately after the failing open on this
+            // thread.
             return Err(format!("open fd2: errno={}", unsafe {
                 *libc::__errno_location()
             }));
         }
+        // SAFETY: `fd2` is open and owned by this probe for the nonblocking
+        // flock conflict check.
         let rc2 = unsafe { libc::flock(fd2, libc::LOCK_EX | libc::LOCK_NB) };
         if rc2 == 0 {
+            // SAFETY: both fds are owned by this probe and are not used after
+            // this close on the unexpected-success path.
             unsafe {
                 libc::close(fd1);
                 libc::close(fd2);
@@ -3030,8 +3201,12 @@ fn run_smoke_mount(config: SmokeMountConfig) -> Result<(), String> {
                     .into(),
             );
         }
+        // SAFETY: errno is read immediately after the failing flock on this
+        // thread.
         let errno2 = unsafe { *libc::__errno_location() };
         if errno2 != libc::EWOULDBLOCK && errno2 != libc::EAGAIN {
+            // SAFETY: both fds are owned by this probe and are not used after
+            // this close on the error path.
             unsafe {
                 libc::close(fd1);
                 libc::close(fd2);
@@ -3040,6 +3215,8 @@ fn run_smoke_mount(config: SmokeMountConfig) -> Result<(), String> {
                 "expected EWOULDBLOCK/EAGAIN from flock conflict, got errno={errno2}"
             ));
         }
+        // SAFETY: both fds are owned by this probe and are not used after this
+        // close.
         unsafe {
             libc::close(fd1);
             libc::close(fd2);
@@ -3050,49 +3227,77 @@ fn run_smoke_mount(config: SmokeMountConfig) -> Result<(), String> {
     // OFD lock: two fds from the same process on overlapping byte ranges
     // must conflict (unlike traditional POSIX locks where same-pid replaces).
     smoke_test!("phase6_ofd_lock_two_fds_conflict", {
+        // SAFETY: Audit note: #1447 tracks converting this Rust `String`
+        // pointer to a NUL-terminated C string before calling `open`.
         let fd1 = unsafe { libc::open(lock_file.as_ptr() as *const libc::c_char, libc::O_RDWR) };
         if fd1 < 0 {
+            // SAFETY: errno is read immediately after the failing open on this
+            // thread.
             return Err(format!("open fd1: errno={}", unsafe {
                 *libc::__errno_location()
             }));
         }
         #[allow(non_upper_case_globals)]
         const F_OFD_SETLK: libc::c_int = 37;
+        // SAFETY: `flock` is a C value type and zeroed storage is populated
+        // field-by-field before it is passed to `fcntl`.
         let mut fl1: libc::flock = unsafe { std::mem::zeroed() };
         fl1.l_type = libc::F_WRLCK as i16;
         fl1.l_whence = libc::SEEK_SET as i16;
         fl1.l_start = 0;
         fl1.l_len = 200;
+        // SAFETY: `fd1` is open and owned by this probe, and `fl1` points to an
+        // initialized OFD lock request.
         if unsafe { libc::fcntl(fd1, F_OFD_SETLK, &fl1) } != 0 {
+            // SAFETY: errno is read immediately after the failing fcntl on this
+            // thread.
             let e = unsafe { *libc::__errno_location() };
+            // SAFETY: `fd1` is owned by this probe and is not used after this
+            // close on the error path.
             unsafe {
                 libc::close(fd1);
             }
             return Err(format!("OFD SETLK fd1 failed: errno={e}"));
         }
+        // SAFETY: Audit note: #1447 tracks converting this Rust `String`
+        // pointer to a NUL-terminated C string before calling `open`.
         let fd2 = unsafe { libc::open(lock_file.as_ptr() as *const libc::c_char, libc::O_RDWR) };
         if fd2 < 0 {
+            // SAFETY: `fd1` is owned by this probe and is not used after this
+            // close on the error path.
             unsafe {
                 libc::close(fd1);
             }
+            // SAFETY: errno is read immediately after the failing open on this
+            // thread.
             return Err(format!("open fd2: errno={}", unsafe {
                 *libc::__errno_location()
             }));
         }
+        // SAFETY: `flock` is a C value type and zeroed storage is populated
+        // field-by-field before it is passed to `fcntl`.
         let mut fl2: libc::flock = unsafe { std::mem::zeroed() };
         fl2.l_type = libc::F_WRLCK as i16;
         fl2.l_whence = libc::SEEK_SET as i16;
         fl2.l_start = 50;
         fl2.l_len = 50;
+        // SAFETY: `fd2` is open and owned by this probe, and `fl2` points to an
+        // initialized OFD lock request.
         if unsafe { libc::fcntl(fd2, F_OFD_SETLK, &fl2) } == 0 {
+            // SAFETY: both fds are owned by this probe and are not used after
+            // this close on the unexpected-success path.
             unsafe {
                 libc::close(fd1);
                 libc::close(fd2);
             }
             return Err("conflicting OFD lock should have been denied but succeeded".into());
         }
+        // SAFETY: errno is read immediately after the failing fcntl on this
+        // thread.
         let errno2 = unsafe { *libc::__errno_location() };
         if errno2 != libc::EAGAIN && errno2 != libc::EWOULDBLOCK {
+            // SAFETY: both fds are owned by this probe and are not used after
+            // this close on the error path.
             unsafe {
                 libc::close(fd1);
                 libc::close(fd2);
@@ -3101,6 +3306,8 @@ fn run_smoke_mount(config: SmokeMountConfig) -> Result<(), String> {
                 "expected EAGAIN/EWOULDBLOCK from OFD conflict, got errno={errno2}"
             ));
         }
+        // SAFETY: both fds are owned by this probe and are not used after this
+        // close.
         unsafe {
             libc::close(fd1);
             libc::close(fd2);
@@ -3110,8 +3317,12 @@ fn run_smoke_mount(config: SmokeMountConfig) -> Result<(), String> {
 
     // OFD lock query through F_OFD_GETLK.
     smoke_test!("phase6_ofd_lock_getlk_query", {
+        // SAFETY: Audit note: #1447 tracks converting this Rust `String`
+        // pointer to a NUL-terminated C string before calling `open`.
         let fd1 = unsafe { libc::open(lock_file.as_ptr() as *const libc::c_char, libc::O_RDWR) };
         if fd1 < 0 {
+            // SAFETY: errno is read immediately after the failing open on this
+            // thread.
             return Err(format!("open fd1: errno={}", unsafe {
                 *libc::__errno_location()
             }));
@@ -3120,34 +3331,56 @@ fn run_smoke_mount(config: SmokeMountConfig) -> Result<(), String> {
         const F_OFD_SETLK: libc::c_int = 37;
         #[allow(non_upper_case_globals)]
         const F_OFD_GETLK: libc::c_int = 36;
+        // SAFETY: `flock` is a C value type and zeroed storage is populated
+        // field-by-field before it is passed to `fcntl`.
         let mut fl1: libc::flock = unsafe { std::mem::zeroed() };
         fl1.l_type = libc::F_WRLCK as i16;
         fl1.l_whence = libc::SEEK_SET as i16;
         fl1.l_start = 300;
         fl1.l_len = 100;
+        // SAFETY: `fd1` is open and owned by this probe, and `fl1` points to an
+        // initialized OFD lock request.
         if unsafe { libc::fcntl(fd1, F_OFD_SETLK, &fl1) } != 0 {
+            // SAFETY: errno is read immediately after the failing fcntl on this
+            // thread.
             let e = unsafe { *libc::__errno_location() };
+            // SAFETY: `fd1` is owned by this probe and is not used after this
+            // close on the error path.
             unsafe {
                 libc::close(fd1);
             }
             return Err(format!("OFD SETLK acquire failed: errno={e}"));
         }
+        // SAFETY: Audit note: #1447 tracks converting this Rust `String`
+        // pointer to a NUL-terminated C string before calling `open`.
         let fd2 = unsafe { libc::open(lock_file.as_ptr() as *const libc::c_char, libc::O_RDWR) };
         if fd2 < 0 {
+            // SAFETY: `fd1` is owned by this probe and is not used after this
+            // close on the error path.
             unsafe {
                 libc::close(fd1);
             }
+            // SAFETY: errno is read immediately after the failing open on this
+            // thread.
             return Err(format!("open fd2: errno={}", unsafe {
                 *libc::__errno_location()
             }));
         }
+        // SAFETY: `flock` is a C value type and zeroed storage is populated
+        // field-by-field before it is passed to `fcntl`.
         let mut fl_query: libc::flock = unsafe { std::mem::zeroed() };
         fl_query.l_type = libc::F_WRLCK as i16;
         fl_query.l_whence = libc::SEEK_SET as i16;
         fl_query.l_start = 350;
         fl_query.l_len = 10;
+        // SAFETY: `fd2` is open and owned by this probe, and `fl_query` points
+        // to initialized storage that fcntl may update for F_OFD_GETLK.
         if unsafe { libc::fcntl(fd2, F_OFD_GETLK, &fl_query) } != 0 {
+            // SAFETY: errno is read immediately after the failing fcntl on this
+            // thread.
             let e = unsafe { *libc::__errno_location() };
+            // SAFETY: both fds are owned by this probe and are not used after
+            // this close on the error path.
             unsafe {
                 libc::close(fd1);
                 libc::close(fd2);
@@ -3155,6 +3388,8 @@ fn run_smoke_mount(config: SmokeMountConfig) -> Result<(), String> {
             return Err(format!("OFD GETLK failed: errno={e}"));
         }
         if fl_query.l_type != (libc::F_WRLCK as i16) {
+            // SAFETY: both fds are owned by this probe and are not used after
+            // this close on the error path.
             unsafe {
                 libc::close(fd1);
                 libc::close(fd2);
@@ -3164,6 +3399,8 @@ fn run_smoke_mount(config: SmokeMountConfig) -> Result<(), String> {
                 fl_query.l_type
             ));
         }
+        // SAFETY: both fds are owned by this probe and are not used after this
+        // close.
         unsafe {
             libc::close(fd1);
             libc::close(fd2);

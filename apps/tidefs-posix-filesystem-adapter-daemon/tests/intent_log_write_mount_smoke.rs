@@ -27,6 +27,8 @@ fn unique_test_root(prefix: &str) -> PathBuf {
 }
 
 fn request_ctx() -> RequestCtx {
+    // SAFETY: `geteuid`/`getegid` read the current process credentials and do
+    // not require pointer, fd, or buffer invariants.
     let gid = unsafe { libc::getegid() } as u32;
     RequestCtx {
         uid: unsafe { libc::geteuid() } as u32,

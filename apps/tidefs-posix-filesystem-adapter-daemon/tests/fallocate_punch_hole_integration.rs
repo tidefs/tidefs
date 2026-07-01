@@ -54,6 +54,8 @@ fn mount_options() -> Vec<fuser::MountOption> {
 }
 
 fn request_ctx() -> RequestCtx {
+    // SAFETY: `geteuid`/`getegid` read the current process credentials and do
+    // not require pointer, fd, or buffer invariants.
     let gid = unsafe { libc::getegid() } as u32;
     RequestCtx {
         uid: unsafe { libc::geteuid() } as u32,
@@ -131,6 +133,8 @@ impl Drop for MountedVfs {
 // ---------------------------------------------------------------------------
 
 fn do_fallocate(fd: RawFd, mode: i32, offset: i64, len: i64) -> io::Result<()> {
+    // SAFETY: `fd` is supplied by the caller as an open file descriptor; the
+    // mode and byte range are copied scalar syscall arguments.
     let rc = unsafe { libc::fallocate(fd, mode, offset, len) };
     if rc != 0 {
         Err(io::Error::last_os_error())
@@ -140,6 +144,8 @@ fn do_fallocate(fd: RawFd, mode: i32, offset: i64, len: i64) -> io::Result<()> {
 }
 
 fn pread_exact(fd: RawFd, buf: &mut [u8], offset: i64) -> io::Result<usize> {
+    // SAFETY: `fd` is caller-owned and open, and `buf` is a valid writable
+    // slice for `buf.len()` bytes at the requested offset.
     let n = unsafe { libc::pread64(fd, buf.as_mut_ptr().cast(), buf.len(), offset) };
     if n < 0 {
         Err(io::Error::last_os_error())
@@ -293,8 +299,12 @@ fn fallocate_punch_hole_concurrent_write_interleaving() {
         let w = write_data.clone();
         thread::spawn(move || {
             punched_rx.recv().expect("wait for punch completion");
+            // SAFETY: `fd2` is a raw duplicate kept open until both threads
+            // join, and `w` is an immutable byte buffer alive for the write.
             let n = unsafe { libc::pwrite(fd2, w.as_ptr().cast(), w.len(), (chunk + 128) as i64) };
             assert!(n > 0, "concurrent write should write some bytes");
+            // SAFETY: `fd2` remains open and owned by the harness until the
+            // final close after both worker threads have joined.
             unsafe {
                 libc::fsync(fd2);
             }
@@ -321,6 +331,8 @@ fn fallocate_punch_hole_concurrent_write_interleaving() {
         "concurrent write data should be visible at offset chunk+128"
     );
 
+    // SAFETY: both duplicated descriptors are owned by this harness and are not
+    // used after this final close.
     unsafe {
         libc::close(fd1);
         libc::close(fd2);
@@ -366,6 +378,8 @@ fn fallocate_punch_hole_survives_fsync_remount() {
             chunk as i64,
         )
         .expect("punch hole");
+        // SAFETY: `fd` is borrowed from a live `File` and remains open for the
+        // duration of the fsync call.
         unsafe {
             libc::fsync(fd);
         }

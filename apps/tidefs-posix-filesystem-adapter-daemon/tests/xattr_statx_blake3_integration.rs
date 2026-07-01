@@ -99,6 +99,10 @@ fn assert_acl_semantics_eq(actual: &[u8], expected: &[u8]) {
     }
 }
 
+/// # Safety
+///
+/// `path` and `name` must be valid NUL-terminated C strings alive for the
+/// call, and `value` must be readable for `value.len()` bytes.
 unsafe fn setxattr_sys(
     path: &CString,
     name: &CString,
@@ -119,6 +123,10 @@ unsafe fn setxattr_sys(
     }
 }
 
+/// # Safety
+///
+/// `path` and `name` must be valid NUL-terminated C strings alive for both the
+/// size query and the value read.
 unsafe fn getxattr_sys(path: &CString, name: &CString) -> std::io::Result<Vec<u8>> {
     let size = libc::getxattr(path.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0);
     if size < 0 {
@@ -140,6 +148,11 @@ unsafe fn getxattr_sys(path: &CString, name: &CString) -> std::io::Result<Vec<u8
 }
 
 /// statx via libc syscall(2). Returns (stx_mask, stx_attributes).
+///
+/// # Safety
+///
+/// `path` must be a valid NUL-terminated C string alive for the statx syscall;
+/// the scratch buffer is private writable storage for the kernel result.
 unsafe fn statx_probe(path: &CString, flags: i32) -> std::io::Result<(u32, u64)> {
     let mut buf = vec![0u8; 256];
     let r = libc::syscall(
@@ -199,6 +212,8 @@ fn mounted_statx_remains_usable_after_setxattr() {
     create_file(&file_path, 0o644);
     let pc = path_c(&file_path);
 
+    // SAFETY: `pc` is a live C-string path for the statx calls; `statx_probe`
+    // owns its scratch output buffer.
     unsafe {
         // Before setxattr: stx_attributes should not have XATTR_PRESENT.
         let (mask, attrs) = match statx_probe(&pc, 0x1000 /* AT_EMPTY_PATH */) {
@@ -249,6 +264,8 @@ fn mounted_statx_remains_usable_after_setxattr() {
 fn mounted_statx_remains_usable_when_acl_xattrs_set() {
     // ACL xattrs require root (CAP_SYS_ADMIN). This test is skipped
     // when running as non-root.
+    // SAFETY: `geteuid` reads the current process credentials and does not
+    // require pointer, fd, or buffer invariants.
     if unsafe { libc::geteuid() } != 0 {
         eprintln!("skipping ACL statx test (requires root)");
         return;
@@ -276,6 +293,8 @@ fn mounted_statx_remains_usable_when_acl_xattrs_set() {
 
     let acl_blob = encoded_named_user_acl();
 
+    // SAFETY: `pc` and the generated name C strings are live for the xattr
+    // calls, and `acl_blob` is readable for setxattr.
     unsafe {
         setxattr_sys(&pc, &name_c("system.posix_acl_access"), &acl_blob, 0)
             .expect("setxattr system.posix_acl_access");
@@ -335,6 +354,8 @@ fn xattr_blake3_digest_deterministic_across_remount() {
         create_file(&file_path, 0o644);
         let pc = path_c(&file_path);
 
+        // SAFETY: `pc` and the generated name C strings are live for the xattr
+        // calls, and the static values are readable.
         unsafe {
             setxattr_sys(&pc, &name_c("user.a"), b"val-a", 0).expect("set user.a");
             setxattr_sys(&pc, &name_c("user.b"), b"val-b", 0).expect("set user.b");
@@ -355,6 +376,9 @@ fn xattr_blake3_digest_deterministic_across_remount() {
 
         let pc = path_c(&file_path);
 
+        // SAFETY: Audit note: #1448 tracks converting split listxattr name
+        // slices to NUL-terminated C strings before getxattr. The list/value
+        // buffers here are allocated to the kernel-reported sizes.
         unsafe {
             // Read all xattrs and compute a simple deterministic digest
             let size = libc::listxattr(pc.as_ptr(), std::ptr::null_mut(), 0);
@@ -424,6 +448,9 @@ fn xattr_blake3_digest_deterministic_across_remount() {
 
         let pc = path_c(&file_path);
 
+        // SAFETY: Audit note: #1448 tracks converting split listxattr name
+        // slices to NUL-terminated C strings before getxattr. The list/value
+        // buffers here are allocated to the kernel-reported sizes.
         unsafe {
             let size = libc::listxattr(pc.as_ptr(), std::ptr::null_mut(), 0);
             assert!(size >= 0);

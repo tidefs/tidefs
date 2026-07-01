@@ -30,6 +30,8 @@ fn flock(typ: libc::c_short, start: i64, len: i64) -> libc::flock {
 
 fn setlk(fd: &impl AsRawFd, typ: libc::c_short, start: i64, len: i64) -> io::Result<()> {
     let lk = flock(typ, start, len);
+    // SAFETY: `fd` is borrowed from a live file handle, and `lk` is an
+    // initialized `flock` request alive for the fcntl call.
     let rc = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETLK, &lk) };
     if rc == -1 {
         Err(io::Error::last_os_error())
@@ -40,6 +42,8 @@ fn setlk(fd: &impl AsRawFd, typ: libc::c_short, start: i64, len: i64) -> io::Res
 
 fn getlk(fd: &impl AsRawFd, typ: libc::c_short, start: i64, len: i64) -> io::Result<libc::flock> {
     let mut lk = flock(typ, start, len);
+    // SAFETY: `fd` is borrowed from a live file handle, and `lk` is initialized
+    // storage that fcntl may update for F_GETLK.
     let rc = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETLK, &mut lk) };
     if rc == -1 {
         Err(io::Error::last_os_error())
@@ -50,6 +54,8 @@ fn getlk(fd: &impl AsRawFd, typ: libc::c_short, start: i64, len: i64) -> io::Res
 
 fn setlkw(fd: &impl AsRawFd, typ: libc::c_short, start: i64, len: i64) -> io::Result<()> {
     let lk = flock(typ, start, len);
+    // SAFETY: `fd` is borrowed from a live file handle, and `lk` is an
+    // initialized `flock` request alive for the blocking fcntl call.
     let rc = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETLKW, &lk) };
     if rc == -1 {
         Err(io::Error::last_os_error())
