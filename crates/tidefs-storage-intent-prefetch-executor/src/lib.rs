@@ -558,6 +558,42 @@ impl PrefetchExecutorCostRequirementMask {
             | PrefetchExecutorActionFamily::Unsupported => Self::EMPTY,
         }
     }
+
+    #[must_use]
+    pub const fn for_media_destination(media: StorageMediaClass, role: StorageMediaRole) -> Self {
+        let mut required = Self::EMPTY;
+        if matches!(
+            media,
+            StorageMediaClass::NvmeFlash
+                | StorageMediaClass::SsdFlash
+                | StorageMediaClass::ZonedFlash
+        ) {
+            required = required.union(Self::FLASH_WRITES);
+        }
+        if matches!(
+            media,
+            StorageMediaClass::SystemRam
+                | StorageMediaClass::RemoteRam
+                | StorageMediaClass::PersistentMemory
+        ) {
+            required = required.union(Self::RAM_PMEM_CAPACITY);
+        }
+        if matches!(
+            role,
+            StorageMediaRole::ReadCache | StorageMediaRole::RamCache
+        ) {
+            required = required.union(Self::CACHE_DEVICE_INDEXES);
+        }
+        if matches!(
+            role,
+            StorageMediaRole::ScratchVolatile
+                | StorageMediaRole::RepairTemp
+                | StorageMediaRole::OptimizerTemp
+        ) {
+            required = required.union(Self::STAGING_CAPACITY);
+        }
+        required
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
@@ -1597,11 +1633,18 @@ impl PrefetchExecutorRecord {
 pub fn evaluate_prefetch_execution(input: PrefetchExecutorInput) -> PrefetchExecutorRecord {
     let mut record = base_record(input);
     let family = record.action_family;
-    let cost_state = input
-        .cost_state
-        .with_required(input.cost_state.required.union(
-            PrefetchExecutorCostRequirementMask::for_action_family(family),
-        ));
+    let cost_state = input.cost_state.with_required(
+        input
+            .cost_state
+            .required
+            .union(PrefetchExecutorCostRequirementMask::for_action_family(
+                family,
+            ))
+            .union(PrefetchExecutorCostRequirementMask::for_media_destination(
+                input.media_path.target_media,
+                input.media_path.target_role,
+            )),
+    );
     record.cost_state = cost_state;
 
     if decision_identity_missing(input.decision) {
@@ -4016,6 +4059,16 @@ mod tests {
         );
     }
 
+    fn set_target_media(
+        input: &mut PrefetchExecutorInput,
+        media: StorageMediaClass,
+        role: StorageMediaRole,
+    ) {
+        input.decision.target_media = media;
+        input.media_path.target_media = media;
+        input.media_path.target_role = role;
+    }
+
     fn assert_record_has_no_authority_claims(record: PrefetchExecutorRecord) {
         assert!(!record.can_publish_replacement_receipt());
         assert!(!record.can_retire_source_receipt());
@@ -6053,6 +6106,117 @@ mod tests {
             .required
             .contains(PrefetchExecutorCostRequirementMask::STAGING_CAPACITY));
         assert_record_has_no_authority_claims(archive_record);
+    }
+
+    #[test]
+    fn local_media_destinations_derive_required_costs_before_dispatch() {
+        let mut flash = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        set_target_media(
+            &mut flash,
+            StorageMediaClass::NvmeFlash,
+            StorageMediaRole::ReadCache,
+        );
+        let flash_record = evaluate_prefetch_execution(flash);
+        assert_eq!(flash_record.outcome, PrefetchExecutorOutcome::Started);
+        assert!(flash_record
+            .cost_state
+            .required
+            .contains(PrefetchExecutorCostRequirementMask::FLASH_WRITES));
+        assert!(flash_record
+            .cost_state
+            .required
+            .contains(PrefetchExecutorCostRequirementMask::CACHE_DEVICE_INDEXES));
+        assert!(!flash_record
+            .cost_state
+            .required
+            .contains(PrefetchExecutorCostRequirementMask::RAM_PMEM_CAPACITY));
+        assert_record_has_no_authority_claims(flash_record);
+
+        let mut ram = admitted_input(PrefetchResidencyCandidateClass::SmallRandomHotsetTrial);
+        set_target_media(
+            &mut ram,
+            StorageMediaClass::SystemRam,
+            StorageMediaRole::RamCache,
+        );
+        let ram_record = evaluate_prefetch_execution(ram);
+        assert_eq!(ram_record.outcome, PrefetchExecutorOutcome::Started);
+        assert!(ram_record
+            .cost_state
+            .required
+            .contains(PrefetchExecutorCostRequirementMask::RAM_PMEM_CAPACITY));
+        assert!(ram_record
+            .cost_state
+            .required
+            .contains(PrefetchExecutorCostRequirementMask::CACHE_DEVICE_INDEXES));
+        assert_record_has_no_authority_claims(ram_record);
+
+        let mut pmem_stage = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        set_target_media(
+            &mut pmem_stage,
+            StorageMediaClass::PersistentMemory,
+            StorageMediaRole::OptimizerTemp,
+        );
+        let pmem_stage_record = evaluate_prefetch_execution(pmem_stage);
+        assert_eq!(pmem_stage_record.outcome, PrefetchExecutorOutcome::Started);
+        assert!(pmem_stage_record
+            .cost_state
+            .required
+            .contains(PrefetchExecutorCostRequirementMask::RAM_PMEM_CAPACITY));
+        assert!(pmem_stage_record
+            .cost_state
+            .required
+            .contains(PrefetchExecutorCostRequirementMask::STAGING_CAPACITY));
+        assert_record_has_no_authority_claims(pmem_stage_record);
+    }
+
+    #[test]
+    fn local_media_destinations_refuse_missing_derived_cost_evidence() {
+        let cases = [
+            (StorageMediaClass::NvmeFlash, StorageMediaRole::ReadCache),
+            (StorageMediaClass::SystemRam, StorageMediaRole::RamCache),
+            (
+                StorageMediaClass::PersistentMemory,
+                StorageMediaRole::OptimizerTemp,
+            ),
+        ];
+
+        for (media, role) in cases {
+            let mut input = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+            set_target_media(&mut input, media, role);
+            input.cost_state.snapshot.evidence_state = StorageIntentCostEvidenceState::FRESH
+                .with_missing(StorageIntentCostClass::CapacityMediaClass);
+
+            let record = evaluate_prefetch_execution(input);
+            assert_eq!(
+                record.outcome,
+                PrefetchExecutorOutcome::Refused,
+                "{media:?}/{role:?} did not refuse missing derived cost evidence"
+            );
+            assert_eq!(
+                record.refusal,
+                StorageIntentRefusalReason::EvidenceNotUsable
+            );
+            assert_record_has_no_authority_claims(record);
+        }
+    }
+
+    #[test]
+    fn flash_destination_refuses_unknown_waf_without_explicit_mask() {
+        let mut input = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        set_target_media(
+            &mut input,
+            StorageMediaClass::ZonedFlash,
+            StorageMediaRole::ReadCache,
+        );
+        input.cost_state.unknown_waf = true;
+
+        let record = evaluate_prefetch_execution(input);
+        assert_eq!(record.outcome, PrefetchExecutorOutcome::Refused);
+        assert_eq!(
+            record.refusal,
+            StorageIntentRefusalReason::FlashWearBudgetExceeded
+        );
+        assert_record_has_no_authority_claims(record);
     }
 
     #[test]
