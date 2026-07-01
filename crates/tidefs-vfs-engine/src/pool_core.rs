@@ -277,7 +277,10 @@ impl fmt::Display for KernelPoolError {
             Self::AlreadyMounted => write!(f, "pool is already mounted"),
             Self::RefcountNotZero => write!(f, "pool refcount is not zero"),
             Self::MissingImportedRoot => {
-                write!(f, "pool import is missing committed-root object/extent/inode state")
+                write!(
+                    f,
+                    "pool import is missing committed-root object/extent/inode state"
+                )
             }
         }
     }

@@ -287,10 +287,8 @@ impl<E: VfsEngine + VfsEngineStatFs> KernelMountSequence<E> {
         // authority pointers.  The VRBT is at offset 3 * block_size within the
         // superblock region (after VCRL at offset 0, VCRP primary at offset
         // block_size, VCRP backup at offset 2*block_size).
-        let vrbt = Self::try_decode_vrbt_from_region(
-            superblock_region_buf,
-            pool_ctx.superblock_size,
-        )?;
+        let vrbt =
+            Self::try_decode_vrbt_from_region(superblock_region_buf, pool_ctx.superblock_size)?;
         if root_anchor.root_ino.get() == 0 {
             return Err(MountSequenceError::MissingComponent {
                 detail: String::from("committed-root ledger root inode"),
@@ -451,7 +449,6 @@ mod tests {
         root_ino: u64,
         inode_table_root: u64,
         extent_map_root: u64,
-        intent_log_head: u64,
         intent_log_tail: u64,
     ) -> Vec<u8> {
         let mut block = vec![0u8; crate::replay_integration::VRBT_WIRE_SIZE];
@@ -461,8 +458,7 @@ mod tests {
         block[16..24].copy_from_slice(&root_ino.to_le_bytes());
         block[24..32].copy_from_slice(&inode_table_root.to_le_bytes());
         block[32..40].copy_from_slice(&extent_map_root.to_le_bytes());
-        block[40..48].copy_from_slice(&intent_log_head.to_le_bytes());
-        block[48..56].copy_from_slice(&intent_log_tail.to_le_bytes());
+        block[40..48].copy_from_slice(&intent_log_tail.to_le_bytes());
         let digest: [u8; 32] = blake3::hash(&block[..56]).into();
         block[56..88].copy_from_slice(&digest);
         block
@@ -470,7 +466,7 @@ mod tests {
 
     fn make_superblock_region(anchor: &CommittedRootAnchor) -> Vec<u8> {
         let ledger = make_ledger(core::slice::from_ref(anchor));
-        let vrbt = make_vrbt(anchor.txg, anchor.root_ino.get(), 4096, 8192, 0, 0);
+        let vrbt = make_vrbt(anchor.txg, anchor.root_ino.get(), 4096, 8192, 0);
         let mut region = ledger;
         region.resize(3 * 4096 + crate::replay_integration::VRBT_WIRE_SIZE, 0);
         region[3 * 4096..3 * 4096 + crate::replay_integration::VRBT_WIRE_SIZE]
@@ -638,7 +634,7 @@ mod tests {
             3,
         );
         let ledger = make_ledger(core::slice::from_ref(&anchor));
-        let vrbt = make_vrbt(anchor.txg, 2, 4096, 8192, 0, 0);
+        let vrbt = make_vrbt(anchor.txg, 2, 4096, 8192, 0);
         let mut region = ledger;
         region.resize(3 * 4096 + crate::replay_integration::VRBT_WIRE_SIZE, 0);
         region[3 * 4096..3 * 4096 + crate::replay_integration::VRBT_WIRE_SIZE]

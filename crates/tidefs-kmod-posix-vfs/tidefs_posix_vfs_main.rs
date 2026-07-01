@@ -2948,7 +2948,6 @@ impl KernelEngine {
         inode_table_root: u64,
         extent_map_root: u64,
         intent_log_tail: u64,
-        root_sector: u64,
     ) -> crate::tidefs_kmod_bridge::kernel_types::KmodVec<u8> {
         let mut block = crate::tidefs_kmod_bridge::kernel_types::KmodVec::new();
         block.extend_from_slice(&Self::VRBT_MAGIC);
@@ -2958,22 +2957,13 @@ impl KernelEngine {
         block.extend_from_slice(&inode_table_root.to_le_bytes());
         block.extend_from_slice(&extent_map_root.to_le_bytes());
         block.extend_from_slice(&intent_log_tail.to_le_bytes());
-        // Pad to header size with reserved bytes
         while block.len() < Self::VRBT_HEADER_SIZE {
             block.push(0u8);
         }
-        // Compute BLAKE3 hash over header
         let hash_bytes: [u8; 32] = crate::blake3::hash(&block[..Self::VRBT_HEADER_SIZE]).into();
         block.extend_from_slice(&hash_bytes);
-        // Pad to wire size
         while block.len() < Self::VRBT_WIRE_SIZE {
             block.push(0u8);
-        }
-        // Write root_sector into reserved bytes (past header, before hash padding)
-        // bytes 48..56: root_sector (little-endian)
-        let rs_bytes = root_sector.to_le_bytes();
-        for (i, b) in rs_bytes.iter().enumerate() {
-            block[48 + i] = *b;
         }
         block
     }
@@ -6711,7 +6701,7 @@ impl crate::tidefs_kmod_bridge::kernel_types::VfsEngine for KernelEngine {
     /// explicit read, write, flush, capacity, and teardown authority.
     fn write_committed_root(
         &self,
-        committed_root: &crate::tidefs_kmod_bridge::kernel_types::CommittedRoot,
+        _committed_root: &crate::tidefs_kmod_bridge::kernel_types::CommittedRoot,
         _device_index: u32,
     ) -> core::result::Result<(), crate::tidefs_kmod_bridge::kernel_types::Errno> {
         if !self.pool_is_mounted() {
@@ -6720,7 +6710,6 @@ impl crate::tidefs_kmod_bridge::kernel_types::VfsEngine for KernelEngine {
 
         let io_ctx = self.mounted_pool_io_ctx()?;
 
-        let root_hash = *committed_root.as_bytes();
         let committed_txg = io_ctx.committed_txg;
 
         // Determine where to place VRBT and VCRP within the superblock region.
@@ -6740,14 +6729,17 @@ impl crate::tidefs_kmod_bridge::kernel_types::VfsEngine for KernelEngine {
 
         // Encode the VRBT committed-root block.
         let intent_tail = self.intent_log_tail.get();
+        let inode_table_root = self.inode_table_root.get().max(io_ctx.root_ino);
+        let extent_map_root = self.extent_map_root.get().max(inode_table_root);
         let vrbt = Self::encode_vrbt_block(
             committed_txg,
             io_ctx.root_ino, // namespace_root
-            io_ctx.root_ino, // inode_table_root (same region for bootstrap)
-            0,               // extent_map_root
+            inode_table_root,
+            extent_map_root,
             intent_tail,     // intent_log_tail
-            root_sector,
         );
+        let mut root_hash = [0u8; 32];
+        root_hash.copy_from_slice(&vrbt[Self::VRBT_HASH_OFFSET..Self::VRBT_WIRE_SIZE]);
 
         // Encode the VCRP pointer record.
         let vcrp = Self::encode_vcrp_record(
@@ -8707,6 +8699,7 @@ pub extern "C" fn tidefs_posix_vfs_engine_init_mounted(
             return -5; // EIO
         }
     }
+    engine.ensure_root_inode(root_ino, sector_size);
     let request = crate::tidefs_kmod_bridge::kernel_types::RequestCtx::default();
     match engine.getattr(
         crate::tidefs_kmod_bridge::kernel_types::InodeId::new(root_ino),

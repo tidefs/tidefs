@@ -12,7 +12,9 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use tidefs_commit_group::{seal_commit_hash, CommitGroupId, RootPointer};
+use tidefs_commit_group::{
+    seal_commit_hash, CommitGroupId, CommitGroupWriter, CommittedRootBlock, RootPointer,
+};
 use tidefs_encryption::StoreKey;
 use tidefs_local_object_store::device_layout::{
     encode_device_layout_v1, DeviceLayoutPolicy, MIN_SEGMENT_SIZE_BYTES,
@@ -47,6 +49,10 @@ const INITIAL_SYSTEM_AREA_BLOCKS: u64 = 4;
 const INITIAL_SYSTEM_AREA_SIZE: u64 = INITIAL_SYSTEM_AREA_BLOCK_SIZE * INITIAL_SYSTEM_AREA_BLOCKS;
 const INITIAL_SYSTEM_AREA_OFFSET: u64 =
     COMMIT_RECORD_REGION_OFFSET + COMMIT_RECORD_REGION_MAX - INITIAL_SYSTEM_AREA_SIZE;
+const INITIAL_STATE_AREA_OFFSET: u64 = INITIAL_SYSTEM_AREA_OFFSET + INITIAL_SYSTEM_AREA_SIZE;
+const INITIAL_VCRP_RECORD_SIZE: usize = 96;
+const INITIAL_VCRP_HEADER_SIZE: usize = 64;
+const INITIAL_VCRP_HASH_OFFSET: usize = 64;
 
 // ---------------------------------------------------------------------------
 // PoolCreateConfig
@@ -618,25 +624,13 @@ impl PoolCreator {
         };
 
         let region_bytes = encode_commit_record_region(&[record]);
-        let vcrl_entry = VcrlEntry {
-            root_ino: INITIAL_ROOT_INO,
-            pool_uuid: pool_guid_to_uuid32(&pool_guid),
-            txg: INITIAL_TXG,
-        };
-        let vcrl_len = vcrl_required_len(1).ok_or_else(|| CreateError::Io {
-            device_path: None,
-            msg: "compute initial VCRL length".to_string(),
-        })?;
-        let mut vcrl_bytes = vec![0u8; vcrl_len];
-        encode_vcrl_ledger_into(&[vcrl_entry], &mut vcrl_bytes).map_err(|e| CreateError::Io {
-            device_path: None,
-            msg: format!("encode VCRL system area: {e:?}"),
-        })?;
+        let system_area = encode_initial_system_area(&pool_guid)?;
 
-        // Write the userspace VBCR region and kmod-readable VCRL system area.
+        // Write the userspace VBCR region and kmod-readable committed-root
+        // system area: VCRL, duplicate VCRP pointer records, and VRBT.
         for handle in &mut handles {
             handle.write_commit_region(&region_bytes)?;
-            handle.write_system_area(&vcrl_bytes)?;
+            handle.write_system_area(&system_area)?;
         }
 
         // Phase 5: zero the start of the data region on every device so
@@ -712,6 +706,70 @@ fn validate_redundancy_policy(
     }
 
     Ok(())
+}
+
+fn encode_initial_vcrp_pointer(
+    sequence: u64,
+    root_sector: u64,
+    commit_group_id: CommitGroupId,
+    root_hash: [u8; 32],
+) -> [u8; INITIAL_VCRP_RECORD_SIZE] {
+    let mut pointer = [0u8; INITIAL_VCRP_RECORD_SIZE];
+    pointer[0..4].copy_from_slice(b"VCRP");
+    pointer[4..8].copy_from_slice(&1u32.to_le_bytes());
+    pointer[8..16].copy_from_slice(&sequence.to_le_bytes());
+    pointer[16..24].copy_from_slice(&root_sector.to_le_bytes());
+    pointer[24..32].copy_from_slice(&commit_group_id.0.to_le_bytes());
+    pointer[32..64].copy_from_slice(&root_hash);
+    let checksum: [u8; 32] = blake3::hash(&pointer[..INITIAL_VCRP_HEADER_SIZE]).into();
+    pointer[INITIAL_VCRP_HASH_OFFSET..INITIAL_VCRP_RECORD_SIZE].copy_from_slice(&checksum);
+    pointer
+}
+
+fn encode_initial_system_area(pool_guid: &[u8; 16]) -> Result<Vec<u8>, CreateError> {
+    let vcrl_entry = VcrlEntry {
+        root_ino: INITIAL_ROOT_INO,
+        pool_uuid: pool_guid_to_uuid32(pool_guid),
+        txg: INITIAL_TXG,
+    };
+    let vcrl_len = vcrl_required_len(1).ok_or_else(|| CreateError::Io {
+        device_path: None,
+        msg: "compute initial VCRL length".to_string(),
+    })?;
+    let mut vcrl_bytes = vec![0u8; vcrl_len];
+    encode_vcrl_ledger_into(&[vcrl_entry], &mut vcrl_bytes).map_err(|e| CreateError::Io {
+        device_path: None,
+        msg: format!("encode VCRL system area: {e:?}"),
+    })?;
+
+    let committed_root = CommittedRootBlock::new(
+        CommitGroupId(INITIAL_TXG),
+        INITIAL_ROOT_INO,
+        INITIAL_STATE_AREA_OFFSET,
+        INITIAL_STATE_AREA_OFFSET,
+        0,
+    );
+    let sealed_root = CommitGroupWriter::seal_root_block(committed_root);
+    let root_bytes = sealed_root.to_bytes();
+    let root_sector = (INITIAL_SYSTEM_AREA_OFFSET
+        .saturating_add(3 * INITIAL_SYSTEM_AREA_BLOCK_SIZE))
+        / INITIAL_SYSTEM_AREA_BLOCK_SIZE;
+    let pointer = encode_initial_vcrp_pointer(
+        INITIAL_TXG,
+        root_sector,
+        CommitGroupId(INITIAL_TXG),
+        sealed_root.block_hash,
+    );
+
+    let mut area = vec![0u8; INITIAL_SYSTEM_AREA_SIZE as usize];
+    area[..vcrl_bytes.len()].copy_from_slice(&vcrl_bytes);
+    let pointer_a = INITIAL_SYSTEM_AREA_BLOCK_SIZE as usize;
+    let pointer_b = 2 * INITIAL_SYSTEM_AREA_BLOCK_SIZE as usize;
+    let root_off = 3 * INITIAL_SYSTEM_AREA_BLOCK_SIZE as usize;
+    area[pointer_a..pointer_a + INITIAL_VCRP_RECORD_SIZE].copy_from_slice(&pointer);
+    area[pointer_b..pointer_b + INITIAL_VCRP_RECORD_SIZE].copy_from_slice(&pointer);
+    area[root_off..root_off + CommittedRootBlock::WIRE_SIZE].copy_from_slice(&root_bytes);
+    Ok(area)
 }
 
 /// Read 16 random bytes from `/dev/urandom`.
@@ -847,7 +905,7 @@ mod tests {
     }
 
     #[test]
-    fn create_pool_writes_kmod_readable_vcrl_system_area() {
+    fn create_pool_writes_kmod_readable_committed_root_system_area() {
         let (_dir, dev) = setup_single_device(MIN_DEVICE_BYTES);
         let pool_guid = [0x41u8; 16];
         let config = PoolCreateConfig {
@@ -901,6 +959,47 @@ mod tests {
         let mut hasher = blake3::Hasher::new();
         hasher.update(&area[..payload_end]);
         assert_eq!(stored_footer, hasher.finalize().as_bytes());
+
+        let vrbt_off = (3 * INITIAL_SYSTEM_AREA_BLOCK_SIZE) as usize;
+        let vrbt = CommittedRootBlock::from_bytes(
+            &area[vrbt_off..vrbt_off + CommittedRootBlock::WIRE_SIZE],
+        )
+        .unwrap();
+        assert!(CommitGroupWriter::verify_root_block(&vrbt));
+        assert_eq!(vrbt.commit_group_id, CommitGroupId(INITIAL_TXG));
+        assert_eq!(vrbt.namespace_root, INITIAL_ROOT_INO);
+        assert_eq!(vrbt.inode_table_root, INITIAL_STATE_AREA_OFFSET);
+        assert_eq!(vrbt.extent_map_root, INITIAL_STATE_AREA_OFFSET);
+        assert_eq!(vrbt.intent_log_tail, 0);
+
+        let root_sector = (INITIAL_SYSTEM_AREA_OFFSET + 3 * INITIAL_SYSTEM_AREA_BLOCK_SIZE)
+            / INITIAL_SYSTEM_AREA_BLOCK_SIZE;
+        for pointer_off in [
+            INITIAL_SYSTEM_AREA_BLOCK_SIZE as usize,
+            (2 * INITIAL_SYSTEM_AREA_BLOCK_SIZE) as usize,
+        ] {
+            let pointer = &area[pointer_off..pointer_off + INITIAL_VCRP_RECORD_SIZE];
+            assert_eq!(&pointer[0..4], b"VCRP");
+            assert_eq!(u32::from_le_bytes(pointer[4..8].try_into().unwrap()), 1);
+            assert_eq!(
+                u64::from_le_bytes(pointer[8..16].try_into().unwrap()),
+                INITIAL_TXG
+            );
+            assert_eq!(
+                u64::from_le_bytes(pointer[16..24].try_into().unwrap()),
+                root_sector
+            );
+            assert_eq!(
+                u64::from_le_bytes(pointer[24..32].try_into().unwrap()),
+                INITIAL_TXG
+            );
+            assert_eq!(&pointer[32..64], &vrbt.block_hash);
+            let pointer_hash: [u8; 32] = blake3::hash(&pointer[..INITIAL_VCRP_HEADER_SIZE]).into();
+            assert_eq!(
+                &pointer[INITIAL_VCRP_HASH_OFFSET..INITIAL_VCRP_RECORD_SIZE],
+                &pointer_hash
+            );
+        }
     }
 
     #[test]

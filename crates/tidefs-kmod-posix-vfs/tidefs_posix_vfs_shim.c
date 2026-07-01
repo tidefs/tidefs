@@ -1116,10 +1116,10 @@ static int tidefs_kernel_pool_publish_committed_root(
 
 	ret = tidefs_posix_vfs_engine_encode_committed_root_vrbt(
 		pool->committed_txg,
+		pool->root_ino,
 		tidefs_kernel_pool_state_base(pool),
 		tidefs_kernel_pool_state_base(pool),
-		0,
-		0,
+		pool->intent_log_tail,
 		pool->committed_txg,
 		root_sector,
 		vrbt,

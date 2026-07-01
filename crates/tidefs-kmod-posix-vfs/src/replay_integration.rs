@@ -80,15 +80,14 @@ pub fn decode_vrbt(bytes: &[u8]) -> Result<VrbtRoot, VrbtError> {
     let root_ino = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
     let inode_table_root = u64::from_le_bytes(bytes[24..32].try_into().unwrap());
     let extent_map_root = u64::from_le_bytes(bytes[32..40].try_into().unwrap());
-    let intent_log_head = u64::from_le_bytes(bytes[40..48].try_into().unwrap());
-    let intent_log_tail = u64::from_le_bytes(bytes[48..56].try_into().unwrap());
+    let intent_log_tail = u64::from_le_bytes(bytes[40..48].try_into().unwrap());
 
     Ok(VrbtRoot {
         committed_txg,
         root_ino,
         inode_table_root,
         extent_map_root,
-        intent_log_head,
+        intent_log_head: 0,
         intent_log_tail,
     })
 }
@@ -514,6 +513,7 @@ mod tests {
         root_ino: u64,
         inode_table_root: u64,
         extent_map_root: u64,
+        intent_log_tail: u64,
     ) -> [u8; VRBT_WIRE_SIZE] {
         let mut buf = [0u8; VRBT_WIRE_SIZE];
         buf[0..4].copy_from_slice(&VRBT_MAGIC);
@@ -522,6 +522,7 @@ mod tests {
         buf[16..24].copy_from_slice(&root_ino.to_le_bytes());
         buf[24..32].copy_from_slice(&inode_table_root.to_le_bytes());
         buf[32..40].copy_from_slice(&extent_map_root.to_le_bytes());
+        buf[40..48].copy_from_slice(&intent_log_tail.to_le_bytes());
         let mut hasher = blake3::Hasher::new();
         hasher.update(&buf[..VRBT_HEADER_SIZE]);
         buf[VRBT_HASH_OFFSET..VRBT_WIRE_SIZE].copy_from_slice(hasher.finalize().as_bytes());
@@ -530,17 +531,19 @@ mod tests {
 
     #[test]
     fn decode_vrbt_valid() {
-        let vrbt = make_vrbt(42, 1, 4096, 8192);
+        let vrbt = make_vrbt(42, 1, 4096, 8192, 1234);
         let d = decode_vrbt(&vrbt).unwrap();
         assert_eq!(d.committed_txg, 42);
         assert_eq!(d.root_ino, 1);
         assert_eq!(d.inode_table_root, 4096);
         assert_eq!(d.extent_map_root, 8192);
+        assert_eq!(d.intent_log_head, 0);
+        assert_eq!(d.intent_log_tail, 1234);
     }
 
     #[test]
     fn decode_vrbt_bad_magic() {
-        let mut vrbt = make_vrbt(1, 1, 0, 0);
+        let mut vrbt = make_vrbt(1, 1, 0, 0, 0);
         vrbt[0] = b'X';
         assert!(matches!(
             decode_vrbt(&vrbt).unwrap_err(),
@@ -558,7 +561,7 @@ mod tests {
 
     #[test]
     fn decode_vrbt_hash_mismatch() {
-        let mut vrbt = make_vrbt(42, 1, 4096, 8192);
+        let mut vrbt = make_vrbt(42, 1, 4096, 8192, 0);
         vrbt[10] ^= 0xFF;
         assert!(matches!(
             decode_vrbt(&vrbt).unwrap_err(),
