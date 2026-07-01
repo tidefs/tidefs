@@ -144,6 +144,22 @@ block-device authority remains with the scoped OW-301 block-volume docs,
 breadth, mkfs/mount acceptance, online resize, crash durability, production
 block-device readiness, kernel block readiness, or OpenZFS/Ceph-class wording.
 
+## Publication P3 Historical Input Deletion (TFR-019 / #1617)
+
+Issue #1617 deleted the stale publication-pipeline runtime decomposition input
+whose live file still read like a production source-of-truth document:
+`docs/PUBLICATION_PIPELINE_RUNTIME_DECOMPOSITION_P3-02.md`.
+
+Its lineage now lives in git, issue #1617, and its pull request. Current
+publication, receipt, policy, and product-claim authority remains with
+source-backed current specs such as `docs/STORAGE_INTENT_POLICY_AUTHORITY.md`,
+`docs/LOCAL_DISTRIBUTED_RECEIPT_AUTHORITY.md`,
+`docs/TRANSFORM_PIPELINE_AUTHORITY.md`, `validation/claims.toml`, generated
+`docs/CLAIM_REGISTRY.md`, and `docs/CLAIMS_GATE_POLICY.md`. This deletion does
+not validate a full publication pipeline, response-emission runtime,
+distributed commit path, policy runtime service, production readiness, or
+OpenZFS/Ceph-class wording.
+
 ## Doc-Authority Drift Cleanup Coordination (#952)
 
 Recorded on 2026-06-22 for the `check-doc-authority-drift` follow-up from PR
@@ -470,7 +486,6 @@ xfstests coverage, distributed behavior, or runtime crash claims.
 | Path | State | Classification note |
 |---|---|---|
 | `docs/POLICY_AUTHORITY_RUNTIME_SURFACE_P3-01.md` | Historical input | Imported production-depth policy-authority runtime-surface design. It is not current authority for a complete kernel-hosted or runtime-fed policy authority service. |
-| `docs/PUBLICATION_PIPELINE_RUNTIME_DECOMPOSITION_P3-02.md` | Historical input | Imported publication-pipeline runtime decomposition. Useful queue/batch/commit vocabulary, but not current evidence of the full production publication pipeline. |
 | `docs/RECEIPT_RESPONSE_RUNTIME_EMISSION_PATH_P3-03.md` | Historical input | Imported receipt/response runtime-emission design. It is not current closure for the local/distributed receipt authority or response-envelope runtime surface. |
 | `docs/STORAGE_INTENT_POLICY_AUTHORITY.md` | Current spec | Design authority for the native storage-intent policy surface introduced by GitHub issue #839: guarantee/ack classes, receipt-satisfaction predicates, satisfaction reconciliation, proximity domains, workload prediction, media roles, flash-wear cost, RAM authority classes, relocation/defrag policy, operator receipt explanation, and the need for the #863 storage-intent fault-validation matrix. It is not runtime implementation evidence, a POSIX sync validation claim, a distributed availability claim, a completed fault-validation claim, or a performance superiority claim. |
 | `docs/STORAGE_INTENT_SERVICE_OBJECTIVE_DESIGN.md` | Current spec | Scoped current spec for GitHub issue #915 service-objective evidence: objective identity, workload and operation scope, latency percentile/tail, throughput/burst/dwell, topology/media/proximity, RPO/RTO, isolation, capacity, cost, wear, decision/action, measurement, comparator, claim, and typed refusal requirements. It is not runtime implementation evidence, a performance-validation artifact, or a superiority claim over OpenZFS, Ceph, DRBD, or any other system. |
