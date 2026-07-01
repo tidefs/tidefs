@@ -13,6 +13,7 @@ authors.workspace = true
 description = "VFS_RPC wire protocol and request/response multiplexer for forwarding VfsEngine operations over transport sessions"
 
 [dependencies]
+tidefs-bulk-service = { workspace = true }
 tidefs-transport = { workspace = true }
 tidefs-types-vfs-core = { workspace = true, features = ["alloc"] }
 tidefs-vfs-engine = { workspace = true }
