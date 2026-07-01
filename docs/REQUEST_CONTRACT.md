@@ -13,8 +13,10 @@ rebuild, reclaim, or offload runtime behavior.
 
 The canonical portable records live in `tidefs-types-vfs-core`. The fixed-width
 little-endian codecs live in `tidefs-schema-codec-vfs`. Issue #282 reuses
-those existing anchors from `docs/NEXTGEN_VERIFICATION_CONTRACT_ROADMAP.md`
-instead of creating a second VFS request type system.
+those existing anchors from the integrated nextgen verification program
+authority in `docs/NEXTGEN_VERIFICATION_PERFORMANCE_OFFLOAD_PLAN.md` instead
+of creating a second VFS request type system. The older issue #281 roadmap
+remains lineage in git, issue, and PR history only.
 
 External protocols refine into this boundary:
 

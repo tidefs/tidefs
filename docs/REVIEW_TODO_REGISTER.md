@@ -53,13 +53,14 @@ Important 2026-06-01 findings:
   prerequisites or transient runner contention as product failures. Broader
   low-value fixture cleanup remains itemized by `docs/TEST_SIGNAL_AUDIT.md`
   and should stay issue-scoped to the owning code.
-- `TFR-021`: issue #281 adds
-  `docs/NEXTGEN_VERIFICATION_CONTRACT_ROADMAP.md` as the current planning
-  authority for the nextgen verification, performance, and offload chain. The
-  roadmap maps the architecture onto existing workspace anchors and records
-  planned-blocked claim ids only. It does not close crash safety, performance
-  isolation, kernel correctness, distributed correctness, accelerator
-  correctness, TFR-008, TFR-017, or TFR-018.
+- `TFR-021`: issue #281 introduced the nextgen verification roadmap as staging
+  lineage; issue #483 and issue #1066 folded that lane into
+  `docs/NEXTGEN_VERIFICATION_PERFORMANCE_OFFLOAD_PLAN.md`, and issue #1656
+  deleted the old roadmap root as a live Markdown authority surface. The
+  integrated program authority maps the architecture onto existing workspace
+  anchors and records planned-blocked claim/evidence lanes only. It does not
+  close crash safety, performance isolation, kernel correctness, distributed
+  correctness, accelerator correctness, TFR-008, TFR-017, or TFR-018.
 - `TFR-002`: Earlier package-authority cleanup reported 148 packages and 148 workspace members.
   Five manifests are outside root workspace metadata after the abandoned POSIX
   adapter split-shard crates, broken `tidefs-chaos` app root, and five
