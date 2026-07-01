@@ -1335,11 +1335,10 @@ Important 2026-06-01 findings:
   `xfstests-runner` as a diagnostic scoreboard wrapper, and sends output under
   runner help path no longer carries a bare `--per-test` command or duplicate
   parser/help entries. Current navigation docs no longer point readers at the
-  or `docs/PUBLISHING_CHECKLIST.md` files, and `check-module-owners` is
-  retargeted to the current PC-002 owner map plus `docs/INDEX.md` instead of
-  passed `bash -n` for the touched xfstests scripts,
+  deleted status/matrix or `docs/PUBLISHING_CHECKLIST.md` files. GitHub issue
+  #1619 later retired the empty PC-002 module-owner scaffold and its xtask gate.
+  This slice passed `bash -n` for the touched xfstests scripts,
   `scripts/tidefs-xfstests-runner --help`,
-  `CARGO_TARGET_DIR=/root/ai/tmp/tidefs-target cargo run -q -p tidefs-xtask -- check-module-owners`,
   `CARGO_TARGET_DIR=/root/ai/tmp/tidefs-target cargo run -q -p tidefs-xtask -- check-platform-scaffolding`,
   `CARGO_TARGET_DIR=/root/ai/tmp/tidefs-target cargo run -q -p tidefs-xtask -- check-claims-gate`,
   `cargo fmt -p tidefs-xtask -- --check`, and `git diff --check`. This does

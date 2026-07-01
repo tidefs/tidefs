@@ -724,12 +724,6 @@ fn main() {
                 process::exit(1);
             }
         }
-        Some("check-module-owners" | "check-module-invariants") => {
-            if let Err(err) = storage::check_module_owners_current_workspace() {
-                eprintln!("{err}");
-                process::exit(1);
-            }
-        }
         Some("check-claims-gate" | "check-overclaims") => {
             if let Err(err) = claims::check_current_workspace() {
                 eprintln!("{err}");
@@ -1977,7 +1971,6 @@ fn print_summary() {
     println!("send_receive_check_command=check-send-receive");
     println!("online_verifier_check_command=check-online-verifier");
     println!("hot_read_cache_check_command=check-hot-read-cache");
-    println!("module_owners_check_command=check-module-owners");
     println!("claims_gate_check_command=check-claims-gate");
     println!("claim_validate_command=validate-claim");
     println!("claim_gate_check_command=check-claim-gate");
@@ -2254,8 +2247,6 @@ fn print_help() {
     println!("  check-online-scrub alias for check-online-verifier");
     println!("  check-hot-read-cache validate PC-003 hot read cache markers");
     println!("  check-read-cache alias for check-hot-read-cache");
-    println!("  check-module-owners validate PC-002 module owner and invariant markers");
-    println!("  check-module-invariants alias for check-module-owners");
     println!("  check-claims-gate       validate publish-facing capability claims");
     println!("  check-overclaims        alias for check-claims-gate");
     println!("  validate-claim <id>     validate a registered claim evidence set");
