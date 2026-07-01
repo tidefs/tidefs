@@ -1,10 +1,16 @@
-# Persistent Orphan Index Design (P1)
+# Persistent Orphan Index Design (Historical Input)
 
-Maturity: **design-spec** for the dataset-scoped persistent B+tree that tracks
-`nlink==0` inodes for bounded-memory crash recovery, replacing the naive O(total-inodes)
-mount-time scan with an O(orphan-count) indexed approach.
+Maturity: **historical input** - imported persistent-orphan-index target design,
+not current reclaim, crash-recovery, space-accounting, or claim-registry
+authority.
 
-This document closes Forgejo issue #1207.
+Authority classification: TFR-019 / `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`
+leaves this document as historical input. Use live source, current authority
+docs, and `validation/claims.toml` for current orphan-index and reclaim status.
+
+Historical note: this imported document recorded a Forgejo issue #1207
+closeout. It does not close any current GitHub persistent-orphan-index,
+reclaim, crash-recovery, release-readiness, or production-readiness item.
 
 ## Incumbent Comparison Boundary
 

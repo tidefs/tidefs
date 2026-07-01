@@ -193,10 +193,9 @@ stay out of this coordination slice:
   `docs/crates/workspace-structure.md`.
 - #1021 owns the deleted `docs/FEATURE_MATRIX.md` reference in
   `docs/design/deterministic-cluster-simnet-protocol-correctness-testing.md`.
-- #1022 owns deleted status/matrix closeout references in
-  `docs/design/deferred-cleanup-work-queues.md`.
-- #1023 owns feature-matrix/status wording in
-  `docs/design/persistent-orphan-index-consolidated-design.md`.
+- #1635 deleted the former #1022/#1023 design-subdir cleanup/orphan-index
+  duplicate roots as historical residue; git history and the GitHub issues/PR
+  retain the path lineage.
 - #1024 owns deleted status/matrix delivery outputs in
   `docs/design/node-lifecycle-management.md`.
 - #1590 deleted the
@@ -337,9 +336,16 @@ source behavior, `validation/claims.toml`, and `xtask check-claims-gate`.
 |---|---|---|
 | `docs/BLAKE3_USAGE_POLICY.md` | Current policy | Binding only as a BLAKE3 placement and review policy. It is not implementation-status evidence and does not validate production end-to-end checksum, scrub self-heal, erasure-coded integrity, or tamper-proof root claims. Because this is promoted to current policy, it is scanned by the claims gate. |
 | `docs/CHECKSUM_ARCHITECTURE_DESIGN.md` | Historical input | Imported G3 design target and old closeout text. Current source has object-store integrity pieces, but `validation/claims.toml` has no validated production checksum, repair, erasure, or committed-root tamper-detection claim covering the full architecture. |
-| `docs/design/1683-checksum-architecture-g3-pillar-design-spec.md` | Historical input | Duplicate imported G3 design target with implementation deferred to wire-up issues. It must not be cited as current TideFS checksum status. |
-| `docs/design/end-to-end-checksum-architecture-g3-pillar.md` | Historical input | Imported canonical-design wording remains useful as target architecture, but its mandatory end-to-end, scrub, repair, erasure, and chain-of-trust claims exceed current claim-registry evidence. |
 | `docs/security/blake3-integrity-boundary.md` | Historical input | Imported release-train closeout note. It may inform review of residual BLAKE3 overfit, but its conformant-crate and closeout language is not current release authority. |
+
+### Storage Design Duplicate Root Deletions (TFR-019 / #1635)
+
+Issue #1635 deleted duplicate `docs/design/` roots for checksum architecture,
+dataset lifecycle, commit-group/TXG ordering, deferred cleanup queues, and the
+persistent orphan index. The surviving historical inputs are the root design
+docs and historical ADRs already classified in this register. Git history and
+GitHub issue/PR history retain the deleted-path lineage; this register does not
+keep live per-file rows for those deleted duplicates.
 
 ### Kernel And Preview UAPI Authority
 

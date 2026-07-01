@@ -1241,10 +1241,9 @@ Important 2026-06-01 findings:
   a later source and claims-gate review that promotes the specific document.
 - `TFR-019`: The checksum/BLAKE3 authority slice for GitHub issue #332
   classified `docs/BLAKE3_USAGE_POLICY.md` as current policy only for BLAKE3
-  placement and review. `docs/CHECKSUM_ARCHITECTURE_DESIGN.md`,
-  `docs/design/1683-checksum-architecture-g3-pillar-design-spec.md`,
-  `docs/design/end-to-end-checksum-architecture-g3-pillar.md`, and
-  `docs/security/blake3-integrity-boundary.md` are historical input, not current
+  placement and review. `docs/CHECKSUM_ARCHITECTURE_DESIGN.md`, the deleted
+  design-subdir G3 duplicates, and `docs/security/blake3-integrity-boundary.md`
+  are historical input, not current
   production checksum, scrub self-heal, erasure-coded integrity, or tamper-proof
   root authority. This reduces the checksum/BLAKE3 documentation drift under
   TFR-019, but it does not close TFR-019 broadly and does not close any
