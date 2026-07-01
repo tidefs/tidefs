@@ -11,7 +11,6 @@ It is the source-of-truth for how the live system owns, allocates, frees, reloca
 See also:
 - `docs/END_TO_END_PRODUCTION_BLUEPRINT.md`
 - `docs/AUTHORITATIVE_DATA_STRUCTURES_ALGORITHMS.md`
-- `docs/BLOCK_VOLUME_PROJECTION_CHARTER_BLOCK_VOLUME_ADAPTER.md`
 
 ## 1. Decisive design choices
 

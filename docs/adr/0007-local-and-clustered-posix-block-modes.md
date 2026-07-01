@@ -25,10 +25,6 @@ The review covered the required sources:
   standalone/cluster migration.
 - `docs/POSIX_FILESYSTEM_ADAPTER_DAEMON_TOPOLOGY_P5-01.md` declares the
   FUSE daemon a bounded mirror rather than hidden production sovereignty.
-- `docs/BLOCK_VOLUME_PROJECTION_CHARTER_BLOCK_VOLUME_ADAPTER.md` makes block
-  export a first-class projection, defaults writable exports to a single
-  writer authority, and treats multi-writer behavior as explicit and
-  expensive.
 - `docs/design/metadata-engine-parallelism-multi-core-metadata-path.md`
   defines local-node concurrency with in-process directory and extent locks,
   while cluster-wide lock integration is a later lease-aware wrapper.
