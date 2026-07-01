@@ -4,8 +4,8 @@
 
 //! Authority type definitions for the persistent orphan index.
 //!
-//! Implements Phase 1 of the orphan index design from
-//! [`docs/PERSISTENT_ORPHAN_INDEX_DESIGN.md`] with six core types:
+//! Implements the narrow type vocabulary preserved by historical
+//! `docs/adr/0002-persistent-orphan-index.md` ADR lineage with six core types:
 //!
 //! - [`OrphanKey`] — B-tree key: 8-byte big-endian inode ID
 //! - [`OrphanCursor`] — crash-recovery cursor for resumable batch processing
@@ -30,9 +30,6 @@
 //!   limited to a fixed number of entries and tied to journal replay.
 //!   TideFS uses a first-class scalable B+tree with no hard limit.
 //!
-//! [`docs/PERSISTENT_ORPHAN_INDEX_DESIGN.md`]:
-//!     https://forgejo/forgeadmin/tidefs/docs/PERSISTENT_ORPHAN_INDEX_DESIGN.md
-
 use core::fmt;
 
 // alloc is always available in tests; crate is no_std
