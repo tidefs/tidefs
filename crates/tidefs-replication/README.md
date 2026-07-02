@@ -1,19 +1,25 @@
 # tidefs-replication
 
-Production replication protocol: fanout writes, collect quorum ACKs,
-handle partial failures, and commit through the flow commit coordinator.
+Replication write-path crate: fanout-write dispatch, quorum-ack collection,
+and flow-commit coordination for the `tidefs-replicated-object-store`
+replica set.
+
+This is a crate-local API note, not a distributed product claim.
+Distributed placement receipt, rebuild, reclaim, RDMA, and production
+readiness remain blocked behind the authority gates tracked by
+#18, #1745, #1795, and `validation/claims.toml`.
 
 ## Write-Path API
 
-The `write_path` module provides the core replication write-path: accept a
-write payload, dispatch it concurrently to every configured replica peer via
-the transport layer, collect per-replica acknowledgments, and signal quorum
-satisfaction or shortfall to the caller.
+The `write_path` module accepts a write payload, dispatches it concurrently
+to every configured replica peer through the transport layer, collects
+per-replica acknowledgments, and signals quorum satisfaction or shortfall
+to the caller.
 
 ### ReplicationWriteHandle
 
-The primary public entry point. Construct with a transport backend
-implementing `ReplicationWriteTransport` and call `submit_write`:
+Primary public entry point. Construct with a transport backend implementing
+`ReplicationWriteTransport` and call `submit_write`:
 
 ```ignore
 use tidefs_replication::write_path::{
@@ -56,8 +62,7 @@ Returned by `submit_write`. Variants:
 
 ### ReplicationWriteTransport
 
-Trait abstracting the transport layer. Implement this for production use
-against `tidefs_transport::Transport`:
+Trait abstracting the transport layer for the write path:
 
 ```ignore
 impl ReplicationWriteTransport for MyTransport {
@@ -91,14 +96,13 @@ let outcome = rx.recv().unwrap();
 
 ### Integration Notes
 
-- The transport security boundary (#5919, #5926) provides node-to-node
-  authenticity and integrity. Replication relies on that boundary; it does
-  not add per-message cryptographic layers.
-- Storage-node replication wiring (#5944) consumes `ReplicationWriteHandle`
-  as the transport-backed replication entry point.
-- The write path is intentionally synchronous (thread-per-fanout).
-  Production callers should invoke `submit_write` from a worker or I/O
-  pool thread.
+- The transport layer provides node-to-node authenticity and integrity for
+  replication messages. Replication relies on that boundary; it does not add
+  per-message cryptographic layers.
+- Storage-node replication wiring consumes `ReplicationWriteHandle` as the
+  transport-backed replication entry point.
+- The write path is intentionally synchronous (thread-per-fanout). Callers
+  should invoke `submit_write` from a worker or I/O pool thread.
 
 ### Architecture
 
