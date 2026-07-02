@@ -883,7 +883,7 @@ pub struct RelocationCandidate {
     pub live_bytes: u64,
     /// Dead bytes (total_bytes - live_bytes) available for reclamation.
     pub dead_bytes: u64,
-    /// Byte ranges `[start, end)` of live extents within the source segment.
+    /// Live extent ranges as `(logical_offset, length)` within the source segment.
     ///
     /// Runtime/product callers must populate this from extent-map/object
     /// metadata when `live_bytes > 0`. An empty vector is unambiguous: either
@@ -951,7 +951,7 @@ pub struct SegmentUsageRecord {
     pub live_bytes: u64,
     /// Monotonic age (generation counter or epoch) for tiebreaking.
     pub age: u64,
-    /// Byte ranges `[start, end)` of live extents within the segment.
+    /// Live extent ranges as `(logical_offset, length)` within the segment.
     ///
     /// Runtime/product callers must populate this from extent-map/object
     /// metadata when `live_bytes > 0`. Empty live ranges with nonzero live
@@ -1096,7 +1096,7 @@ pub struct ExtentMapUpdateEntry {
 pub struct RelocationAssignment {
     /// Source segment to drain.
     pub source_segment_id: u64,
-    /// Byte ranges `[start, end)` of live extents within the source.
+    /// Live extent ranges as `(logical_offset, length)` within the source.
     pub live_ranges: Vec<(u64, u64)>,
     /// Destination segment that will receive the live extents.
     pub destination_segment_id: u64,
@@ -1112,7 +1112,7 @@ pub struct RelocationAssignment {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RelocationPlanRefusalReason {
     /// The candidate reported nonzero live bytes but did not provide the exact
-    /// extent-map live ranges needed to move bytes safely.
+    /// extent-map `(logical_offset, length)` ranges needed to move bytes safely.
     MissingLiveRanges,
 }
 
