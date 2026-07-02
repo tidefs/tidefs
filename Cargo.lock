@@ -2700,6 +2700,7 @@ dependencies = [
  "tidefs-storage-intent-core",
  "tidefs-storage-intent-prefetch-executor",
  "tidefs-storage-intent-read-serving",
+ "tidefs-transport",
  "tidefs-types-cache-lattice-core",
  "tidefs-types-claim-ledger-core",
  "tidefs-types-dataset-feature-flags-core",

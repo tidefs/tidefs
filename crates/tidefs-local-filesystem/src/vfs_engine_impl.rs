@@ -10,6 +10,7 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::Write as _;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use serde_json::{json, Value};
@@ -61,6 +62,7 @@ use tidefs_types_dataset_feature_flags_core::{get_feature_class, FeatureClass, F
 use crate::{CopyFileRangeIntent, LocalFileSystem};
 
 use tidefs_inode_table::{Ino, InodeTable};
+use tidefs_transport::{NodeInfo, SessionCloseReason, Transport, TransportAddr};
 
 #[cfg(test)]
 const O_RDONLY: u32 = 0;
@@ -2987,27 +2989,7 @@ impl VfsLocalFileSystem {
             Err(err) => return live_admin_error(1, err),
         };
 
-        if let LiveSnapshotSendDestination::TargetAddress {
-            target_addr,
-            output,
-        } = &plan.destination
-        {
-            let output_note = output
-                .as_ref()
-                .map(|path| format!("; requested output {} was not written", path.display()))
-                .unwrap_or_default();
-            return live_admin_error(
-                1,
-                format!(
-                    "snapshot send: live owner target-address send to {target_addr} is not implemented; remote admission and response surfacing are not yet wired{output_note}"
-                ),
-            );
-        }
-
-        let output = match &plan.destination {
-            LiveSnapshotSendDestination::Output(output) => output,
-            LiveSnapshotSendDestination::TargetAddress { .. } => unreachable!(),
-        };
+        // Export the changed-record stream before any destination path.
         let stream = match live_snapshot_send_export(&mut fs, &plan) {
             Ok(stream) => stream,
             Err(err) => {
@@ -3017,41 +2999,157 @@ impl VfsLocalFileSystem {
                         "snapshot send: failed to export {} stream: {err}",
                         plan.mode.label()
                     ),
-                )
+                );
             }
         };
+        // Drop the borrow so transport can run without holding the filesystem lock.
+        drop(fs);
 
-        if let Err(err) = std::fs::write(output, &stream.encoded) {
-            return live_admin_error(
-                1,
-                format!(
-                    "snapshot send: failed to write stream to {}: {err}",
-                    output.display()
-                ),
-            );
-        }
+        match &plan.destination {
+            LiveSnapshotSendDestination::Output(output) => {
+                if let Err(err) = std::fs::write(output, stream.encoded.as_slice()) {
+                    return live_admin_error(
+                        1,
+                        format!(
+                            "snapshot send: failed to write stream to {}: {err}",
+                            output.display()
+                        ),
+                    );
+                }
+                if wants_json {
+                    live_admin_ok_json(json!({
+                        "output": output.display().to_string(),
+                        "bytes": stream.encoded.len(),
+                        "format": plan.format.label(),
+                        "incremental": plan.mode.is_incremental(),
+                        "roots": stream.roots_len,
+                        "records": stream.total_records,
+                        "payload_bytes": stream.payload_bytes,
+                    }))
+                } else {
+                    live_admin_ok_text(format!(
+                        "wrote {} stream to {} ({} bytes, format={}, roots={}, records={}, payload={} bytes)",
+                        plan.mode.label(),
+                        output.display(),
+                        stream.encoded.len(),
+                        plan.format.label(),
+                        stream.roots_len,
+                        stream.total_records,
+                        stream.payload_bytes,
+                    ))
+                }
+            }
+            LiveSnapshotSendDestination::TargetAddress {
+                target_addr,
+                node_id,
+                server_node_id,
+                output,
+            } => {
+                let addr: SocketAddr = match target_addr.parse() {
+                    Ok(a) => a,
+                    Err(err) => {
+                        return live_admin_error(
+                            1,
+                            format!("snapshot send: invalid target-address '{target_addr}': {err}"),
+                        );
+                    }
+                };
+                let auth_key = self.fs.borrow().root_authentication_key.as_bytes32();
+                let request = build_snap_push_message(&stream.encoded, &auth_key);
 
-        if wants_json {
-            live_admin_ok_json(json!({
-                "output": output.display().to_string(),
-                "bytes": stream.encoded.len(),
-                "format": plan.format.label(),
-                "incremental": plan.mode.is_incremental(),
-                "roots": stream.roots_len,
-                "records": stream.total_records,
-                "payload_bytes": stream.payload_bytes,
-            }))
-        } else {
-            live_admin_ok_text(format!(
-                "wrote {} stream to {} ({} bytes, format={}, roots={}, records={}, payload={} bytes)",
-                plan.mode.label(),
-                output.display(),
-                stream.encoded.len(),
-                plan.format.label(),
-                stream.roots_len,
-                stream.total_records,
-                stream.payload_bytes,
-            ))
+                let mut transport = Transport::new(*node_id);
+                transport.add_node(NodeInfo::new(
+                    *server_node_id,
+                    vec![TransportAddr::Tcp(addr)],
+                    0,
+                ));
+
+                let session_id = match transport.connect(*server_node_id) {
+                    Ok(id) => id,
+                    Err(err) => {
+                        return live_admin_error(
+                            1,
+                            format!("snapshot send: failed to connect to {target_addr}: {err:?}"),
+                        );
+                    }
+                };
+
+                if let Err(err) = transport.perform_handshake(session_id) {
+                    let _ = transport.close_session(session_id, SessionCloseReason::LocalShutdown);
+                    return live_admin_error(
+                        1,
+                        format!("snapshot send: handshake with {target_addr}: {err:?}"),
+                    );
+                }
+
+                if let Err(err) = transport.send_message(session_id, &request) {
+                    let _ = transport.close_session(session_id, SessionCloseReason::LocalShutdown);
+                    return live_admin_error(
+                        1,
+                        format!("snapshot send: send to {target_addr}: {err:?}"),
+                    );
+                }
+
+                let response = match transport.recv_message(session_id) {
+                    Ok(raw) => raw,
+                    Err(err) => {
+                        let _ =
+                            transport.close_session(session_id, SessionCloseReason::LocalShutdown);
+                        return live_admin_error(
+                            1,
+                            format!("snapshot send: recv from {target_addr}: {err:?}"),
+                        );
+                    }
+                };
+
+                let _ = transport.close_session(session_id, SessionCloseReason::LocalShutdown);
+
+                let remote_msg = match parse_snap_net_response(&response) {
+                    Ok(msg) => msg,
+                    Err(err) => return live_admin_error(1, err),
+                };
+
+                // Write local output file if --output was also requested.
+                if let Some(output_path) = output {
+                    if let Err(err) = std::fs::write(output_path, stream.encoded.as_slice()) {
+                        return live_admin_error(
+                            1,
+                            format!(
+                                "snapshot send: remote ack received but failed to also write output {}: {err}",
+                                output_path.display()
+                            ),
+                        );
+                    }
+                }
+
+                if wants_json {
+                    let mut result = json!({
+                        "target_addr": target_addr,
+                        "remote_response": remote_msg,
+                        "bytes": stream.encoded.len(),
+                        "format": plan.format.label(),
+                        "incremental": plan.mode.is_incremental(),
+                        "roots": stream.roots_len,
+                        "records": stream.total_records,
+                        "payload_bytes": stream.payload_bytes,
+                    });
+                    if let Some(output_path) = output {
+                        result["output"] = json!(output_path.display().to_string());
+                    }
+                    live_admin_ok_json(result)
+                } else {
+                    let mut text = format!(
+                        "pushed {} stream to {target_addr}: {remote_msg} ({} bytes, format={})",
+                        plan.mode.label(),
+                        stream.encoded.len(),
+                        plan.format.label(),
+                    );
+                    if let Some(output_path) = output {
+                        let _ = write!(text, "; also wrote output {}", output_path.display());
+                    }
+                    live_admin_ok_text(text)
+                }
+            }
         }
     }
 
@@ -3832,6 +3930,8 @@ enum LiveSnapshotSendDestination {
     Output(std::path::PathBuf),
     TargetAddress {
         target_addr: String,
+        node_id: u64,
+        server_node_id: u64,
         output: Option<std::path::PathBuf>,
     },
 }
@@ -3851,6 +3951,54 @@ struct LiveSnapshotEncodedStream {
     total_records: u64,
     payload_bytes: u64,
     roots_len: usize,
+}
+
+// ── VSNP snapshot network push protocol ────────────────────────────────────
+
+const SNAP_NET_MAGIC: &[u8; 4] = b"VSNP";
+const SNAP_KIND_PUSH: u8 = 1;
+const SNAP_KIND_ACK: u8 = 4;
+const SNAP_KIND_ERROR: u8 = 0;
+
+fn build_snap_push_message(export: &[u8], auth_key: &[u8; 32]) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(4 + 1 + 4 + 32 + 4 + export.len());
+    msg.extend_from_slice(SNAP_NET_MAGIC);
+    msg.push(SNAP_KIND_PUSH);
+    msg.extend_from_slice(&32u32.to_le_bytes());
+    msg.extend_from_slice(auth_key);
+    msg.extend_from_slice(&(export.len() as u32).to_le_bytes());
+    msg.extend_from_slice(export);
+    msg
+}
+
+fn parse_snap_net_response(data: &[u8]) -> Result<String, String> {
+    if data.len() < 9 {
+        return Err("snapshot send: remote response too short for VSNP header".into());
+    }
+    if data[0..4] != SNAP_NET_MAGIC[..] {
+        return Err(format!(
+            "snapshot send: bad remote response magic: {:?}",
+            &data[0..4]
+        ));
+    }
+    let kind = data[4];
+    let msg_len = u32::from_le_bytes(data[5..9].try_into().unwrap()) as usize;
+    let start = 9;
+    if data.len() < start + msg_len {
+        return Err(format!(
+            "snapshot send: remote response truncated: need {} bytes, got {}",
+            start + msg_len,
+            data.len()
+        ));
+    }
+    let message = String::from_utf8_lossy(&data[start..start + msg_len]).into_owned();
+    match kind {
+        SNAP_KIND_ACK => Ok(message),
+        SNAP_KIND_ERROR => Err(format!("snapshot send: remote error: {message}")),
+        other => Err(format!(
+            "snapshot send: unknown remote response kind {other}: {message}"
+        )),
+    }
 }
 
 fn live_snapshot_send_plan(
@@ -3887,10 +4035,22 @@ fn live_snapshot_send_plan(
 fn live_snapshot_send_destination(args: &Value) -> Result<LiveSnapshotSendDestination, String> {
     let output = live_admin_optional_arg(args, "output").map(std::path::PathBuf::from);
     match live_admin_optional_arg(args, "target_addr") {
-        Some(target_addr) => Ok(LiveSnapshotSendDestination::TargetAddress {
-            target_addr: target_addr.to_string(),
-            output,
-        }),
+        Some(target_addr) => {
+            let node_id = args
+                .get("node_id")
+                .and_then(Value::as_u64)
+                .unwrap_or(1);
+            let server_node_id = args
+                .get("server_node_id")
+                .and_then(Value::as_u64)
+                .unwrap_or(2);
+            Ok(LiveSnapshotSendDestination::TargetAddress {
+                target_addr: target_addr.to_string(),
+                node_id,
+                server_node_id,
+                output,
+            })
+        }
         None => output.map(LiveSnapshotSendDestination::Output).ok_or_else(|| {
             "snapshot send: --output is required for live pools unless target-address send is implemented"
                 .to_string()
@@ -7524,7 +7684,7 @@ mod tests {
     }
 
     #[test]
-    fn live_snapshot_send_rejects_target_addr_until_remote_admission_is_wired() {
+    fn live_snapshot_send_returns_connection_error_when_target_unreachable() {
         let root = tempfile::tempdir().expect("tempdir");
         let store = root.path().join("store");
         let mut fs = LocalFileSystem::open(&store).expect("open fs");
@@ -7550,12 +7710,10 @@ mod tests {
         assert_eq!(refused["exit_code"], 1);
         assert!(refused["json"].is_null());
         assert!(
-            refused["error"].as_str().is_some_and(|err| {
-                err.contains("target-address send")
-                    && err.contains("remote admission")
-                    && err.contains("127.0.0.1:9000")
-            }),
-            "target response should explain fail-closed remote boundary: {refused}"
+            refused["error"]
+                .as_str()
+                .is_some_and(|err| { err.contains("127.0.0.1:9000") }),
+            "target response should reference the target address: {refused}"
         );
         assert!(!output.exists());
     }

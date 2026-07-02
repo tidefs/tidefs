@@ -65,6 +65,7 @@ tidefs-types-incremental-job-core = { workspace = true }
 tidefs-orphan-index = { workspace = true }
 tidefs-types-orphan-index-core = { workspace = true }
 tidefs-posix-semantics = { workspace = true }
+tidefs-transport = { workspace = true }
 
 tidefs-quorum-write-runtime = { workspace = true }
 rand = "0.8"
