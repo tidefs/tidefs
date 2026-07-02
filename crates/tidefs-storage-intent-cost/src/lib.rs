@@ -546,7 +546,7 @@ impl StorageIntentNetworkPathCostWeight {
 pub struct StorageIntentCostCharge {
     /// Cost class charged.
     pub cost_class: StorageIntentCostClass,
-    /// Reason or attribution code (concrete value TBD by consumer; 0 = none).
+    /// Consumer-defined reason or attribution code; 0 = none.
     pub reason_code: u8,
     /// Byte count charged.
     pub byte_count: u64,
