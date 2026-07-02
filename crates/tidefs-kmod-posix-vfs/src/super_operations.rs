@@ -27,9 +27,10 @@
 //! - `freeze_fs` / `unfreeze_fs` -- filesystem freeze/thaw not implemented;
 //!   the C shim registers callbacks that return EOPNOTSUPP instead of
 //!   pretending dirty/writeback state reached a coherent frozen state.
-//! - `remount_fs` -- remount with updated mount options not implemented;
-//!   the C shim returns EOPNOTSUPP rather than silently accepting option
-//!   changes or ro/rw toggles that TideFS did not apply.
+//! - remount reconfiguration -- remount with updated mount options not
+//!   implemented; the C shim returns EOPNOTSUPP from the Linux 7.0
+//!   `fs_context_operations.reconfigure` hook rather than silently accepting
+//!   option changes or ro/rw toggles that TideFS did not apply.
 //!
 //! # Eviction Lifecycle (REL-KVFS-009)
 //!
@@ -111,8 +112,10 @@ pub enum AdministrativeSuperOperation {
 pub enum AdministrativeSuperOperationKernelPath {
     /// The callback is deliberately absent so Linux reports unsupported.
     UnregisteredUnsupported,
-    /// A callback is registered only to return a refusal errno.
-    RefusalCallback,
+    /// A `super_operations` callback is registered only to return a refusal.
+    SuperOperationRefusalCallback,
+    /// A `fs_context_operations.reconfigure` callback refuses remount.
+    FsContextReconfigureRefusal,
 }
 
 /// Support status for an administrative superblock operation.
@@ -170,20 +173,20 @@ pub const fn administrative_super_operation_policy(
         ),
         AdministrativeSuperOperation::FreezeFs => AdministrativeSuperOperationPolicy::unsupported(
             operation,
-            AdministrativeSuperOperationKernelPath::RefusalCallback,
+            AdministrativeSuperOperationKernelPath::SuperOperationRefusalCallback,
             "freeze cannot claim coherent dirty/writeback state yet",
         ),
         AdministrativeSuperOperation::UnfreezeFs => {
             AdministrativeSuperOperationPolicy::unsupported(
                 operation,
-                AdministrativeSuperOperationKernelPath::RefusalCallback,
+                AdministrativeSuperOperationKernelPath::SuperOperationRefusalCallback,
                 "thaw is unsupported because TideFS never enters frozen state",
             )
         }
         AdministrativeSuperOperation::RemountFs => AdministrativeSuperOperationPolicy::unsupported(
             operation,
-            AdministrativeSuperOperationKernelPath::RefusalCallback,
-            "remount option changes are refused instead of silently ignored",
+            AdministrativeSuperOperationKernelPath::FsContextReconfigureRefusal,
+            "remount option changes are refused through fs_context reconfigure instead of silently ignored",
         ),
     }
 }
@@ -415,9 +418,9 @@ mod tests {
 
         let cases = [
             (Op::Shutdown, KernelPath::UnregisteredUnsupported),
-            (Op::FreezeFs, KernelPath::RefusalCallback),
-            (Op::UnfreezeFs, KernelPath::RefusalCallback),
-            (Op::RemountFs, KernelPath::RefusalCallback),
+            (Op::FreezeFs, KernelPath::SuperOperationRefusalCallback),
+            (Op::UnfreezeFs, KernelPath::SuperOperationRefusalCallback),
+            (Op::RemountFs, KernelPath::FsContextReconfigureRefusal),
         ];
 
         for (operation, kernel_path) in cases {

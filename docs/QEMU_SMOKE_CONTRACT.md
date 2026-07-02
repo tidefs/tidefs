@@ -15,7 +15,8 @@ referenced `flake.nix` outputs.
 - **What it exercises**: loads `tidefs_posix_vfs.ko`, mounts the explicit
   bootstrap VFS root, exercises supported directory, symlink, readdir,
   statfs, write, and syncfs operations, and checks that unsupported
-  administrative superblock operations fail closed for freeze and remount.
+  administrative VFS operations fail closed for freeze and remount
+  reconfiguration.
   Engine-backed storage checks are kept in longer filesystem lanes.
 - **Evidence claim**: narrow kernel-module smoke.  It does not claim
   xfstests, RDMA, release-candidate, or broad filesystem-correctness
@@ -61,7 +62,7 @@ are checked by the `Host preflight` step before any target runs.
 | Command arguments  | `--timeout 1800` |
 | Output directory   | `/tmp/tidefs-validation/kmod-xfstests-smoke` |
 | Uploaded artifact  | `qemu-smoke-kmod-xfstests-smoke` (7-day retention) |
-| Evidence class     | kernel-module smoke (directory, symlink, readdir, statfs, write/syncfs, administrative freeze/remount refusal) |
+| Evidence class     | kernel-module smoke (directory, symlink, readdir, statfs, write/syncfs, administrative freeze/remount-reconfigure refusal) |
 
 ### 2. `kernel-fsync-validation`
 

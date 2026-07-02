@@ -6450,20 +6450,16 @@ static int tidefs_posix_vfs_unfreeze_fs(struct super_block *sb)
 }
 
 /*
- * remount_fs -- explicit unsupported option-reconfiguration path.
+ * remount/reconfigure -- explicit unsupported option-reconfiguration path.
  *
  * The mounted adapter can display its initial options but cannot yet apply
  * option changes, ro/rw transitions, recovery toggles, or commit-timeout
  * changes to the live engine. Refuse every remount request instead of leaving
  * callers with a silent flags-only no-op.
  */
-static int tidefs_posix_vfs_remount_fs(struct super_block *sb, int *flags,
-				       char *data)
+static int tidefs_posix_vfs_refuse_remount(struct super_block *sb)
 {
 	struct tidefs_posix_vfs_mount *ctx = sb ? sb->s_fs_info : NULL;
-
-	(void)flags;
-	(void)data;
 
 	if (!ctx) {
 		pr_warn("tidefs_posix_vfs: remount_fs refused without mount context\n");
@@ -6802,7 +6798,6 @@ static const struct super_operations tidefs_posix_vfs_super_ops = {
 	.umount_begin = tidefs_posix_vfs_umount_begin,
 	.freeze_fs = tidefs_posix_vfs_freeze_fs,
 	.unfreeze_fs = tidefs_posix_vfs_unfreeze_fs,
-	.remount_fs = tidefs_posix_vfs_remount_fs,
 	/*
 	 * .shutdown intentionally remains unregistered: Linux cannot surface an
 	 * errno from this callback, so FS_IOC_GOINGDOWN must stay unsupported
@@ -7278,6 +7273,16 @@ static int tidefs_posix_vfs_parse_param(struct fs_context *fc,
 	}
 }
 
+static int tidefs_posix_vfs_reconfigure(struct fs_context *fc)
+{
+	struct super_block *sb = NULL;
+
+	if (fc && fc->root)
+		sb = fc->root->d_sb;
+
+	return tidefs_posix_vfs_refuse_remount(sb);
+}
+
 static void tidefs_posix_vfs_free_fs_context(struct fs_context *fc)
 {
 	struct tidefs_posix_vfs_fs_context *ctx = fc->fs_private;
@@ -7295,6 +7300,7 @@ static const struct fs_context_operations tidefs_posix_vfs_context_ops = {
 	.free = tidefs_posix_vfs_free_fs_context,
 	.parse_param = tidefs_posix_vfs_parse_param,
 	.get_tree = tidefs_posix_vfs_get_tree,
+	.reconfigure = tidefs_posix_vfs_reconfigure,
 };
 
 static int tidefs_posix_vfs_init_fs_context(struct fs_context *fc)

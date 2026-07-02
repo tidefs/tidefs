@@ -27,8 +27,9 @@
 //! - `shutdown` -- not registered because `FS_IOC_GOINGDOWN` would otherwise
 //!   appear successful without the full shutdown/no-new-work contract.
 //! - `freeze_fs`/`unfreeze_fs` -- registered C callbacks return EOPNOTSUPP.
-//! - `remount_fs` -- registered C callback returns EOPNOTSUPP rather than
-//!   silently accepting unapplied option changes.
+//! - remount reconfiguration -- registered `fs_context_operations.reconfigure`
+//!   callback returns EOPNOTSUPP rather than silently accepting unapplied
+//!   option changes.
 //!
 //! # Safety: kernel callback registration contract
 //!

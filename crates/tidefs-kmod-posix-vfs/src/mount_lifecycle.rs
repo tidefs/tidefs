@@ -23,8 +23,9 @@
 //! Explicitly unsupported:
 //! - `shutdown` -- not registered because Linux cannot return a refusal errno.
 //! - `freeze_fs`/`unfreeze_fs` -- registered C callbacks return EOPNOTSUPP.
-//! - `remount_fs` -- registered C callback returns EOPNOTSUPP rather than
-//!   silently accepting unapplied option changes.
+//! - remount reconfiguration -- registered `fs_context_operations.reconfigure`
+//!   callback returns EOPNOTSUPP rather than silently accepting unapplied
+//!   option changes.
 
 #[cfg(CONFIG_RUST)]
 use crate::tidefs_kmod_bridge;
