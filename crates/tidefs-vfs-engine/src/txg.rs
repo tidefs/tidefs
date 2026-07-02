@@ -3,9 +3,9 @@
 //!
 //! This module defines the types used by the [`VfsEngine`] transaction-group
 //! trait methods ([`VfsEngine::txg_open`], [`VfsEngine::txg_commit_prepare`],
-//! [`VfsEngine::txg_commit_finish`]) to batch kernel-mode writes into
-//! crash-consistent transaction groups and advance the durable committed root
-//! without userspace daemon mediation.
+//! [`VfsEngine::txg_commit_finish`]) used by engines that batch kernel-mode
+//! writes into crash-consistent transaction groups and advance a durable
+//! committed root without userspace daemon mediation.
 
 use core::fmt;
 
@@ -61,6 +61,20 @@ impl CommittedRoot {
     #[must_use]
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
+    }
+
+    /// Returns `true` when this is the zero sentinel, not a durable root.
+    #[must_use]
+    pub const fn is_zero(&self) -> bool {
+        let bytes = self.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] != 0 {
+                return false;
+            }
+            i += 1;
+        }
+        true
     }
 }
 
@@ -136,9 +150,11 @@ pub struct TxgHandle {
 }
 
 impl TxgHandle {
-    /// Create a no-op handle for engines that do not support transaction groups.
+    /// Create an explicit no-transaction-group sentinel handle.
     ///
-    /// The no-op handle carries [`TxgId::NO_TXG`] and its drop is a no-op.
+    /// The sentinel carries [`TxgId::NO_TXG`] and its drop is a no-op. The
+    /// [`VfsEngine`](crate::VfsEngine) default methods do not return this as a
+    /// successful unsupported-engine transaction.
     #[must_use]
     pub const fn noop() -> Self {
         Self {
@@ -224,6 +240,7 @@ mod tests {
     fn committed_root_zero_is_default() {
         assert_eq!(CommittedRoot::default(), CommittedRoot::ZERO);
         assert_eq!(CommittedRoot::ZERO.as_bytes(), &[0u8; 32]);
+        assert!(CommittedRoot::ZERO.is_zero());
     }
 
     #[test]
@@ -235,6 +252,7 @@ mod tests {
         ];
         let root = CommittedRoot::new(bytes);
         assert_eq!(root.as_bytes(), &bytes);
+        assert!(!root.is_zero());
     }
 
     #[test]
