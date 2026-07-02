@@ -58,6 +58,7 @@ jobs:
           set -euo pipefail
 
           SUMMARY_DIR="$TIDEFS_FSYNC_SUMMARY_DIR"
+          mkdir -p "$SUMMARY_DIR"
           MANIFEST_PATH="$SUMMARY_DIR/evidence-manifest.json"
           GENERATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           RUN_ID="${{ github.run_id }}/${{ github.run_attempt }}"
