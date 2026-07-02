@@ -401,7 +401,7 @@ generated claim registry, and the claims gate. Current transaction and commit
 behavior remains with source, tests, live issues, validation claims, and the
 claims gate. This deletion does not validate checksum architecture completion,
 commit-group crash consistency, pool-layer production readiness, release
-readiness, comparator parity, or OpenZFS/Ceph-successor claims.
+readiness, comparator parity, or OpenZFS/Ceph successor/comparator wording.
 
 ### Historical Kbuild Toolchain Note Deletion (TFR-019 / #1685)
 
@@ -573,7 +573,7 @@ xfstests coverage, distributed behavior, or runtime crash claims.
 
 | Path | State | Classification note |
 |---|---|---|
-| `docs/ARCHITECTURE.md` | Current spec | Binding only as the high-level workspace layer map and harness/product separation reference. It is not evidence that every listed crate is complete, kernel-bound, production-ready, or validated by runtime CI. |
+| `docs/ARCHITECTURE.md` | Current spec | Binding only as the source-backed high-level workspace, app, layer, and runtime-mode ownership map. It is not evidence that every listed crate is complete, kernel-resident, production-ready, distributed, release-ready, or validated by runtime CI. |
 
 **Block-volume adapter and ublk source-boundary docs**
 
@@ -696,13 +696,11 @@ Child slices (all merged):
   SOTA, and coverage-matrix comparison wording.
 - #965: online defrag BPR subordinate to storage-intent relocation gates.
 
-Consolidation closure (this commit):
-- `docs/ARCHITECTURE.md`: ZFS and CephFS "Where TideFS is ahead" / "gaps to
-  close" comparison sections are historical design input, not current capability
-  or successor claims. A Incumbent Comparison Boundary section now gates both
-  comparison blocks, and the former "CephFS successor claims" product-surface
-  line is rewritten as a non-claim scope note citing the split
-  successor/comparator claim boundary.
+Consolidation closure (issue #1802):
+- `docs/ARCHITECTURE.md`: ZFS/CephFS comparison body text was deleted from the
+  live architecture map. Incumbent comparison lineage remains available through
+  git, issues, PRs, claim registry data, and validation evidence instead of a
+  live review section in this document.
 
 This consolidation closes the #931 audit. No live doc contains un-gated
 incumbent-comparison, successor, or product-superiority wording. Any future
