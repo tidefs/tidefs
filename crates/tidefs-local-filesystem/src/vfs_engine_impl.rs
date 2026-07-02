@@ -1263,10 +1263,23 @@ impl VfsLocalFileSystem {
         updated.metadata_version = updated.metadata_version.max(tick);
         updated.subtree_rev = updated.subtree_rev.saturating_add(1).max(1);
 
+        let intent_state = match fs.metadata_setattr_intent(&updated) {
+            Ok(state) => state,
+            Err(err) => {
+                fs.rollback_mutation_delta();
+                return Err(map_errno(&err));
+            }
+        };
+
         fs.mark_inode_metadata_dirty(inode_id);
         Arc::make_mut(&mut fs.state.inodes).insert(inode_id, updated);
         fs.inode_cache.borrow_mut().invalidate(inode_id);
-        fs.commit_mutation(()).map_err(|e| map_errno(&e))
+        let committed = if intent_state == IntentLogReplyState::Refused {
+            fs.force_commit(())
+        } else {
+            fs.commit_mutation(())
+        };
+        committed.map_err(|e| map_errno(&e))
     }
 
     fn create_metadata_only_node(

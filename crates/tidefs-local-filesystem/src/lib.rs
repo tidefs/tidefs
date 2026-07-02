@@ -237,8 +237,8 @@
 //! 3. **Intent-log replay**: `IntentLog::load` reads any persisted
 //!    intent-log entries. `replay_uncommitted` replays
 //!    `SyncWriteRange`, `OdsyncDataRange`, `SharedMmapMsync`,
-//!    `NamespaceSyncIntent`, and `NamespaceCreateIntent` entries against the
-//!    live `FileSystemState`.
+//!    `NamespaceSyncIntent`, `NamespaceCreateIntent`, and
+//!    `MetadataSetattrIntent` entries against the live `FileSystemState`.
 //!    If replay fails, mount is refused with
 //!    [`FileSystemError::CorruptState`].
 //! 4. **Intent-log clear**: replayed entries are cleared so they are not
@@ -11062,6 +11062,34 @@ impl LocalFileSystem {
                 entry,
                 inode: inode.clone(),
             }),
+            root_anchor,
+            timestamp_ns,
+        )?;
+
+        if !accepted {
+            return Ok(IntentLogReplyState::Refused);
+        }
+
+        self.intent_log.sync(self.store.raw_primary_store_mut())?;
+        Ok(IntentLogReplyState::IntentDurable)
+    }
+
+    pub(crate) fn metadata_setattr_intent(
+        &mut self,
+        updated_inode: &InodeRecord,
+    ) -> Result<IntentLogReplyState> {
+        let root_anchor = IntentLogRootAnchor {
+            transaction_id: self.state.generation.max(ROOT_COMMIT_MIN_TRANSACTION_ID),
+            generation: self.state.generation,
+            manifest_digest: IntegrityDigest64(0),
+        };
+        let timestamp_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        let accepted = self.intent_log.append(
+            self.store.raw_primary_store_mut(),
+            IntentLogEntryKind::MetadataSetattrIntent(updated_inode.clone()),
             root_anchor,
             timestamp_ns,
         )?;

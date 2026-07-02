@@ -286,6 +286,9 @@ fn referenced_inode_ids(kind: &IntentLogEntryKind) -> Vec<u64> {
         IntentLogEntryKind::NamespaceCreateIntent(intent) => {
             vec![intent.parent_inode_id.get()]
         }
+        IntentLogEntryKind::MetadataSetattrIntent(updated) => {
+            vec![updated.inode_id.get()]
+        }
         IntentLogEntryKind::PressureFallback | IntentLogEntryKind::CrashReplayReconcile => {
             Vec::new()
         }
