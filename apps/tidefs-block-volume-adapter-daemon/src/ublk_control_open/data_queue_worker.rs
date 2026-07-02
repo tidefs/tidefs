@@ -270,7 +270,7 @@ impl DataQueueWorker {
                     io_cmd: UblkSrvIoCmd {
                         q_id: self.queue_id,
                         tag,
-                        result: i32::try_from(n).unwrap_or(i32::MAX),
+                        result: UBLK_IO_RES_OK,
                         addr_or_zone_append_lba: 0,
                     },
                     byte_count: n,
@@ -336,7 +336,7 @@ impl DataQueueWorker {
                     io_cmd: UblkSrvIoCmd {
                         q_id: self.queue_id,
                         tag,
-                        result: i32::try_from(n).unwrap_or(i32::MAX),
+                        result: UBLK_IO_RES_OK,
                         addr_or_zone_append_lba: 0,
                     },
                     byte_count: n,
@@ -543,7 +543,7 @@ impl DataQueueWorker {
                         io_cmd: UblkSrvIoCmd {
                             q_id: self.queue_id,
                             tag,
-                            result: i32::try_from(byte_count).unwrap_or(i32::MAX),
+                            result: UBLK_IO_RES_OK,
                             addr_or_zone_append_lba: 0,
                         },
                         byte_count,
@@ -644,7 +644,7 @@ impl DataQueueWorker {
                     io_cmd: UblkSrvIoCmd {
                         q_id: self.queue_id,
                         tag,
-                        result: i32::try_from(byte_count).unwrap_or(i32::MAX),
+                        result: UBLK_IO_RES_OK,
                         addr_or_zone_append_lba: 0,
                     },
                     byte_count,
@@ -1192,7 +1192,7 @@ mod tests {
             result.completion_class,
             BlockVolumeCompletionClass::Completed
         );
-        assert_eq!(result.io_cmd.result, 4096);
+        assert_eq!(result.io_cmd.result, UBLK_IO_RES_OK);
         assert_eq!(result.io_cmd.tag, 1);
         assert_eq!(result.byte_count, 4096);
         assert_eq!(worker.bytes_read, 4096);
@@ -1309,7 +1309,7 @@ mod tests {
             result.completion_class,
             BlockVolumeCompletionClass::Completed
         );
-        assert_eq!(result.io_cmd.result, 4096);
+        assert_eq!(result.io_cmd.result, UBLK_IO_RES_OK);
         assert_eq!(result.byte_count, 4096);
         assert_eq!(worker.bytes_written, 4096);
         assert_eq!(worker.write_ops, 1);
@@ -1336,7 +1336,7 @@ mod tests {
             result.completion_class,
             BlockVolumeCompletionClass::Completed
         );
-        assert_eq!(result.io_cmd.result, 4096);
+        assert_eq!(result.io_cmd.result, UBLK_IO_RES_OK);
         assert_eq!(worker.bytes_written, 4096);
     }
 
@@ -1467,7 +1467,7 @@ mod tests {
             report.results[1].completion_class,
             BlockVolumeCompletionClass::Completed
         );
-        assert_eq!(report.results[1].io_cmd.result, 4096);
+        assert_eq!(report.results[1].io_cmd.result, UBLK_IO_RES_OK);
         assert_eq!(report.results[2].tag, 12);
         assert_eq!(
             report.results[2].request_class,

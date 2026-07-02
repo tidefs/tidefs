@@ -2758,6 +2758,8 @@ pub enum UblkDataQueueCommitAndFetchError {
     TagOutOfRange,
     /// Needgetdataresultunsupported.
     NeedGetDataResultUnsupported,
+    /// Positiveresultunsupported.
+    PositiveResultUnsupported,
     /// Zoneappendlbamustbezero.
     ZoneAppendLbaMustBeZero,
     /// Submissionqueuefull.
@@ -2785,6 +2787,7 @@ impl UblkDataQueueCommitAndFetchError {
             Self::QueueIdOutOfRange => "queue_id_out_of_range",
             Self::TagOutOfRange => "tag_out_of_range",
             Self::NeedGetDataResultUnsupported => "need_get_data_result_unsupported",
+            Self::PositiveResultUnsupported => "positive_result_unsupported",
             Self::ZoneAppendLbaMustBeZero => "zone_append_lba_must_be_zero",
             Self::SubmissionQueueFull => "submission_queue_full",
             Self::IoUringSubmitErrno(_) => "io_uring_submit_errno",
@@ -4874,6 +4877,9 @@ const fn validate_commit_and_fetch_input(
     }
     if input.result == UBLK_IO_RES_NEED_GET_DATA {
         return Err(UblkDataQueueCommitAndFetchError::NeedGetDataResultUnsupported);
+    }
+    if input.result > UBLK_IO_RES_OK {
+        return Err(UblkDataQueueCommitAndFetchError::PositiveResultUnsupported);
     }
     if input.addr_or_zone_append_lba != 0 {
         return Err(UblkDataQueueCommitAndFetchError::ZoneAppendLbaMustBeZero);
@@ -8007,9 +8013,9 @@ mod tests {
 
         input = UblkDataQueueCommitAndFetchInput::completed_user_copy(0, 7, 1, 64);
         input.result = 4096;
-        assert!(
-            build_commit_and_fetch_spec(input).is_ok(),
-            "Linux ublk uses positive byte-count completions for read/write requests"
+        assert_eq!(
+            build_commit_and_fetch_spec(input),
+            Err(UblkDataQueueCommitAndFetchError::PositiveResultUnsupported)
         );
 
         input = UblkDataQueueCommitAndFetchInput::completed_user_copy(0, 7, 1, 64);
