@@ -558,9 +558,15 @@ pub fn validate_kernel_teardown_no_work_after_artifact_json(
                 }
             }
         }
+        let mut unique_surfaces = BTreeSet::new();
         for (i, coverage) in artifact.runtime_scope_coverage.iter().enumerate() {
             if coverage.surface.is_empty() {
                 failures.push(format!("runtime_scope_coverage[{i}].surface is empty"));
+            } else if !unique_surfaces.insert(coverage.surface.as_str()) {
+                failures.push(format!(
+                    "runtime_scope_coverage[{i}].surface `{}` is duplicated",
+                    coverage.surface
+                ));
             }
             if !VALID_STATUSES.contains(&coverage.status.as_str()) {
                 failures.push(format!(
@@ -584,6 +590,12 @@ pub fn validate_kernel_teardown_no_work_after_artifact_json(
                 failures.push(format!(
                     "runtime_scope_coverage[{i}] passed without no-daemon proof (surface={})",
                     coverage.surface
+                ));
+            }
+            if artifact.status == "pass" && coverage.status != "pass" {
+                failures.push(format!(
+                    "status `pass` requires runtime_scope_coverage[{i}] surface `{}` to pass, got `{}`",
+                    coverage.surface, coverage.status
                 ));
             }
         }
