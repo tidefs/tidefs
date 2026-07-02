@@ -527,15 +527,18 @@ fn is_valid_scenario(value: &str) -> bool {
 
 /// Convert an io_uring completion result into a ublk I/O command result.
 ///
-/// Successful operations map to `UBLK_IO_RES_OK`; dispatcher errors carry the
-/// kernel errno as a negative result.
+/// Successful data operations report their transferred byte count to the
+/// kernel, zero-payload operations map to `UBLK_IO_RES_OK`, and dispatcher
+/// errors carry the kernel errno as a negative result.
 pub fn ublk_result_from_completion(
     completion: &crate::ublk_io_uring::UblkIoCompletionResult,
 ) -> i32 {
     match completion {
-        crate::ublk_io_uring::UblkIoCompletionResult::Read { .. }
-        | crate::ublk_io_uring::UblkIoCompletionResult::Write { .. }
-        | crate::ublk_io_uring::UblkIoCompletionResult::Flush { .. }
+        crate::ublk_io_uring::UblkIoCompletionResult::Read { bytes, .. }
+        | crate::ublk_io_uring::UblkIoCompletionResult::Write { bytes, .. } => {
+            i32::try_from(*bytes).unwrap_or(i32::MAX)
+        }
+        crate::ublk_io_uring::UblkIoCompletionResult::Flush { .. }
         | crate::ublk_io_uring::UblkIoCompletionResult::Discard { .. }
         | crate::ublk_io_uring::UblkIoCompletionResult::WriteZeroes { .. } => UBLK_IO_RES_OK,
         crate::ublk_io_uring::UblkIoCompletionResult::Error { errno, .. } => -errno,
@@ -580,18 +583,18 @@ mod dispatch_tests {
     }
 
     #[test]
-    fn ublk_result_maps_ok_to_zero() {
+    fn ublk_result_maps_data_to_byte_count_and_zero_payload_ops_to_ok() {
         use crate::ublk_io_uring::UblkIoCompletionResult;
         assert_eq!(
             ublk_result_from_completion(&UblkIoCompletionResult::Read { tag: 0, bytes: 512 }),
-            UBLK_IO_RES_OK
+            512
         );
         assert_eq!(
             ublk_result_from_completion(&UblkIoCompletionResult::Write {
                 tag: 1,
                 bytes: 1024
             }),
-            UBLK_IO_RES_OK
+            1024
         );
         assert_eq!(
             ublk_result_from_completion(&UblkIoCompletionResult::Flush { tag: 2 }),
@@ -642,9 +645,16 @@ mod dispatch_tests {
 
         let cmds = reap_ublk_completions(&mut dispatcher, 1);
         assert_eq!(cmds.len(), 3, "expected 3 completion cmds, got {cmds:?}");
+        assert!(
+            cmds.iter().any(|cmd| cmd.result == 512),
+            "read/write completions must include byte-count status: {cmds:?}"
+        );
+        assert!(
+            cmds.iter().any(|cmd| cmd.result == UBLK_IO_RES_OK),
+            "flush completion must keep OK status: {cmds:?}"
+        );
         for cmd in &cmds {
             assert_eq!(cmd.q_id, 1);
-            assert_eq!(cmd.result, UBLK_IO_RES_OK);
         }
         assert_eq!(&read_buf[..], &payload[..]);
     }
