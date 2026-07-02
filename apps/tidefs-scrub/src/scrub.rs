@@ -890,7 +890,7 @@ enum ObjectCheckResult {
 impl ObjectCheckResult {
     fn bytes_processed(&self) -> u64 {
         match self {
-            Self::Ok { bytes_processed }
+            Self::Ok { bytes_processed, .. }
             | Self::Finding {
                 bytes_processed, ..
             } => *bytes_processed,
