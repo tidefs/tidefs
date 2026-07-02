@@ -13,7 +13,7 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 
 use serde_json::{json, Value};
-use tidefs_local_object_store::StoreError;
+use tidefs_local_object_store::{IntegrityDigest64, StoreError};
 use tidefs_types_extent_map_core::ExtentMapOps;
 use tidefs_types_vfs_core::{
     DirEntry, DirHandleId, EngineDirHandle, EngineFileHandle, Errno, Generation, InodeAttr,
@@ -38,7 +38,7 @@ use crate::helpers::{kind_bits, validate_name};
 use crate::open_dispatch::{self, FileHandleState, FileHandleTable};
 use crate::readahead::ReadaheadTracker;
 use crate::release_dispatch;
-use crate::types::{InodeRecord, IntentLogReplyState, NamespaceEntry};
+use crate::types::{CommittedRootSummary, InodeRecord, IntentLogReplyState, NamespaceEntry};
 use crate::xattr_dispatch;
 use crate::ContentLayout;
 use tidefs_inode_attributes::timestamp::{TimestampPolicy, TimestampUpdate};
@@ -2918,82 +2918,47 @@ impl VfsLocalFileSystem {
     }
 
     fn live_snapshot_send(&self, args: &Value, wants_json: bool) -> Vec<u8> {
-        if live_admin_optional_arg(args, "target_addr").is_some() {
-            return live_admin_error(
-                1,
-                "snapshot send: live owner network push is not implemented; write an owner-mediated --output stream first",
-            );
-        }
-        if args
-            .get("incremental")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
+        let mut fs = self.fs.borrow_mut();
+        let plan = match live_snapshot_send_plan(args, &mut fs) {
+            Ok(plan) => plan,
+            Err(err) => return live_admin_error(1, err),
+        };
+
+        if let LiveSnapshotSendDestination::TargetAddress {
+            target_addr,
+            output,
+        } = &plan.destination
         {
+            let output_note = output
+                .as_ref()
+                .map(|path| format!("; requested output {} was not written", path.display()))
+                .unwrap_or_default();
             return live_admin_error(
                 1,
-                "snapshot send: live owner incremental export is not implemented",
+                format!(
+                    "snapshot send: live owner target-address send to {target_addr} is not implemented; remote admission and response surfacing are not yet wired{output_note}"
+                ),
             );
         }
-        let output = match live_admin_arg(args, "output") {
-            Ok(value) => std::path::PathBuf::from(value),
-            Err(_) => {
-                return live_admin_error(1, "snapshot send: --output is required for live pools")
-            }
+
+        let output = match &plan.destination {
+            LiveSnapshotSendDestination::Output(output) => output,
+            LiveSnapshotSendDestination::TargetAddress { .. } => unreachable!(),
         };
-        let format = live_admin_optional_arg(args, "format").unwrap_or("vfssend1");
-        let pool_id = match live_admin_hex_16_or_default(args, "pool_id") {
-            Ok(value) => value,
+        let stream = match live_snapshot_send_export(&mut fs, &plan) {
+            Ok(stream) => stream,
             Err(err) => {
-                return live_admin_error(1, format!("snapshot send: invalid pool-id: {err}"))
-            }
-        };
-        let dataset_id = match live_admin_hex_16_or_default(args, "dataset_id") {
-            Ok(value) => value,
-            Err(err) => {
-                return live_admin_error(1, format!("snapshot send: invalid dataset-id: {err}"))
+                return live_admin_error(
+                    1,
+                    format!(
+                        "snapshot send: failed to export {} stream: {err}",
+                        plan.mode.label()
+                    ),
+                )
             }
         };
 
-        let (encoded, total_records, payload_bytes, roots_len) = {
-            let mut fs = self.fs.borrow_mut();
-            let export = match fs.export_changed_records() {
-                Ok(export) => export,
-                Err(err) => {
-                    return live_admin_error(
-                        1,
-                        format!("snapshot send: failed to export changed records: {err}"),
-                    )
-                }
-            };
-            let encoded = match format {
-                "vfssend1" => export.encode(),
-                "vfssend2" => match crate::vfssend2_bridge::export_vfssend2_from_changed_records(
-                    &export, pool_id, dataset_id,
-                ) {
-                    Ok(encoded) => encoded,
-                    Err(err) => {
-                        return live_admin_error(
-                            1,
-                            format!("snapshot send: VFSSEND2 export failed: {err}"),
-                        )
-                    }
-                },
-                other => {
-                    return live_admin_error(
-                        1,
-                        format!("snapshot send: unknown stream format '{other}'"),
-                    )
-                }
-            };
-            (
-                encoded,
-                export.total_records,
-                export.payload_bytes,
-                export.roots.len(),
-            )
-        };
-
-        if let Err(err) = std::fs::write(&output, &encoded) {
+        if let Err(err) = std::fs::write(output, &stream.encoded) {
             return live_admin_error(
                 1,
                 format!(
@@ -3006,17 +2971,23 @@ impl VfsLocalFileSystem {
         if wants_json {
             live_admin_ok_json(json!({
                 "output": output.display().to_string(),
-                "bytes": encoded.len(),
-                "format": format,
-                "roots": roots_len,
-                "records": total_records,
-                "payload_bytes": payload_bytes,
+                "bytes": stream.encoded.len(),
+                "format": plan.format.label(),
+                "incremental": plan.mode.is_incremental(),
+                "roots": stream.roots_len,
+                "records": stream.total_records,
+                "payload_bytes": stream.payload_bytes,
             }))
         } else {
             live_admin_ok_text(format!(
-                "wrote stream to {} ({} bytes, format={format}, roots={roots_len}, records={total_records}, payload={payload_bytes} bytes)",
+                "wrote {} stream to {} ({} bytes, format={}, roots={}, records={}, payload={} bytes)",
+                plan.mode.label(),
                 output.display(),
-                encoded.len(),
+                stream.encoded.len(),
+                plan.format.label(),
+                stream.roots_len,
+                stream.total_records,
+                stream.payload_bytes,
             ))
         }
     }
@@ -3713,6 +3684,209 @@ fn live_admin_hex_to_16(value: &str) -> Result<[u8; 16], String> {
         out[i] = byte;
     }
     Ok(out)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LiveSnapshotSendFormat {
+    Vfssend1,
+    Vfssend2,
+}
+
+impl LiveSnapshotSendFormat {
+    fn parse(args: &Value) -> Result<Self, String> {
+        match live_admin_optional_arg(args, "format").unwrap_or("vfssend1") {
+            "vfssend1" => Ok(Self::Vfssend1),
+            "vfssend2" => Ok(Self::Vfssend2),
+            other => Err(format!("snapshot send: unknown stream format '{other}'")),
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Vfssend1 => "vfssend1",
+            Self::Vfssend2 => "vfssend2",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum LiveSnapshotSendMode {
+    Full,
+    Incremental { from_root: CommittedRootSummary },
+}
+
+impl LiveSnapshotSendMode {
+    const fn is_incremental(&self) -> bool {
+        matches!(self, Self::Incremental { .. })
+    }
+
+    const fn label(&self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Incremental { .. } => "incremental",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum LiveSnapshotSendDestination {
+    Output(std::path::PathBuf),
+    TargetAddress {
+        target_addr: String,
+        output: Option<std::path::PathBuf>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LiveSnapshotSendPlan {
+    destination: LiveSnapshotSendDestination,
+    format: LiveSnapshotSendFormat,
+    mode: LiveSnapshotSendMode,
+    pool_id: [u8; 16],
+    dataset_id: [u8; 16],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LiveSnapshotEncodedStream {
+    encoded: Vec<u8>,
+    total_records: u64,
+    payload_bytes: u64,
+    roots_len: usize,
+}
+
+fn live_snapshot_send_plan(
+    args: &Value,
+    fs: &mut LocalFileSystem,
+) -> Result<LiveSnapshotSendPlan, String> {
+    let format = LiveSnapshotSendFormat::parse(args)?;
+    let pool_id = live_admin_hex_16_or_default(args, "pool_id")
+        .map_err(|err| format!("snapshot send: invalid pool-id: {err}"))?;
+    let dataset_id = live_admin_hex_16_or_default(args, "dataset_id")
+        .map_err(|err| format!("snapshot send: invalid dataset-id: {err}"))?;
+    let mode = if args
+        .get("incremental")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        LiveSnapshotSendMode::Incremental {
+            from_root: live_snapshot_send_from_root_arg(args, fs)?,
+        }
+    } else {
+        LiveSnapshotSendMode::Full
+    };
+    let destination = live_snapshot_send_destination(args)?;
+
+    Ok(LiveSnapshotSendPlan {
+        destination,
+        format,
+        mode,
+        pool_id,
+        dataset_id,
+    })
+}
+
+fn live_snapshot_send_destination(args: &Value) -> Result<LiveSnapshotSendDestination, String> {
+    let output = live_admin_optional_arg(args, "output").map(std::path::PathBuf::from);
+    match live_admin_optional_arg(args, "target_addr") {
+        Some(target_addr) => Ok(LiveSnapshotSendDestination::TargetAddress {
+            target_addr: target_addr.to_string(),
+            output,
+        }),
+        None => output.map(LiveSnapshotSendDestination::Output).ok_or_else(|| {
+            "snapshot send: --output is required for live pools unless target-address send is implemented"
+                .to_string()
+        }),
+    }
+}
+
+fn live_snapshot_send_from_root_arg(
+    args: &Value,
+    fs: &mut LocalFileSystem,
+) -> Result<CommittedRootSummary, String> {
+    let hex = live_admin_arg(args, "from_root")
+        .map_err(|_| "snapshot send: --from-root required for incremental live-owner send")?;
+    let bytes = live_admin_hex_to_bytes(hex)
+        .map_err(|err| format!("snapshot send: invalid --from-root: {err}"))?;
+    if bytes.len() != 24 {
+        return Err(format!(
+            "snapshot send: --from-root must be 24 bytes (48 hex chars), got {}",
+            bytes.len()
+        ));
+    }
+
+    let tid = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+    let gen = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+    let csum = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
+    let audit = fs
+        .recovery_audit()
+        .map_err(|err| format!("snapshot send: audit recovery for --from-root: {err}"))?;
+    audit
+        .valid_committed_roots
+        .iter()
+        .find(|root| {
+            root.transaction_id == tid
+                && root.generation == gen
+                && root.superblock_checksum == IntegrityDigest64(csum)
+        })
+        .cloned()
+        .ok_or_else(|| {
+            format!(
+                "snapshot send: from_root not found in live owner committed roots: tid={tid} gen={gen} csum={csum:#016x}"
+            )
+        })
+}
+
+fn live_admin_hex_to_bytes(value: &str) -> Result<Vec<u8>, String> {
+    let hex = value.strip_prefix("0x").unwrap_or(value);
+    if !hex.len().is_multiple_of(2) {
+        return Err(format!(
+            "hex string must have even length, got {}",
+            hex.len()
+        ));
+    }
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| {
+            u8::from_str_radix(&hex[i..i + 2])
+                .map_err(|err| format!("invalid hex at position {i}: {err}"))
+        })
+        .collect()
+}
+
+fn live_snapshot_send_export(
+    fs: &mut LocalFileSystem,
+    plan: &LiveSnapshotSendPlan,
+) -> crate::Result<LiveSnapshotEncodedStream> {
+    let export = match &plan.mode {
+        LiveSnapshotSendMode::Full => fs.export_changed_records()?,
+        LiveSnapshotSendMode::Incremental { from_root } => {
+            fs.export_incremental_changed_records(from_root)?
+        }
+    };
+    let encoded = match plan.format {
+        LiveSnapshotSendFormat::Vfssend1 => export.encode(),
+        LiveSnapshotSendFormat::Vfssend2 if plan.mode.is_incremental() => {
+            crate::vfssend2_bridge::export_incremental_vfssend2_from_changed_records(
+                &export,
+                plan.pool_id,
+                plan.dataset_id,
+            )?
+        }
+        LiveSnapshotSendFormat::Vfssend2 => {
+            crate::vfssend2_bridge::export_vfssend2_from_changed_records(
+                &export,
+                plan.pool_id,
+                plan.dataset_id,
+            )?
+        }
+    };
+
+    Ok(LiveSnapshotEncodedStream {
+        encoded,
+        total_records: export.total_records,
+        payload_bytes: export.payload_bytes,
+        roots_len: export.roots.len(),
+    })
 }
 
 fn live_admin_ok_text(text: impl Into<String>) -> Vec<u8> {
@@ -6676,6 +6850,14 @@ mod tests {
         serde_json::from_slice(&response).expect("decode live admin response")
     }
 
+    fn live_from_root_hex(root: &CommittedRootSummary) -> String {
+        let mut bytes = Vec::with_capacity(24);
+        bytes.extend_from_slice(&root.transaction_id.to_le_bytes());
+        bytes.extend_from_slice(&root.generation.to_le_bytes());
+        bytes.extend_from_slice(&root.superblock_checksum.get().to_le_bytes());
+        live_admin_hex_encode(&bytes)
+    }
+
     fn live_device_admin(
         engine: &VfsLocalFileSystem,
         operation: &str,
@@ -6958,12 +7140,189 @@ mod tests {
 
         assert_eq!(sent["ok"], true, "send response: {sent}");
         assert_eq!(sent["json"]["format"], "vfssend1");
+        assert_eq!(sent["json"]["incremental"], false);
         assert!(sent["json"]["bytes"].as_u64().unwrap_or(0) > 0);
         let encoded = std::fs::read(&output).expect("read live send output");
         let decoded =
             crate::ChangedRecordExport::decode(&encoded).expect("decode live send output");
+        assert!(!decoded.incremental);
         assert!(decoded.total_records > 0);
         assert!(decoded.payload_bytes > 0);
+    }
+
+    #[test]
+    fn live_snapshot_send_incremental_exports_from_authorized_live_root() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = root.path().join("store");
+        let mut fs = LocalFileSystem::open(&store).expect("open fs");
+        fs.create_file("/base.txt", 0o644).expect("create base");
+        fs.write_file("/base.txt", 0, b"base bytes")
+            .expect("write base");
+        fs.sync_all().expect("sync baseline");
+        let baseline_root = fs
+            .recovery_audit()
+            .expect("audit baseline roots")
+            .selected_root
+            .expect("selected baseline root");
+        fs.replace_file("/base.txt", b"updated base bytes")
+            .expect("replace base");
+        fs.create_file("/delta.txt", 0o644).expect("create delta");
+        fs.write_file("/delta.txt", 0, b"incremental live bytes")
+            .expect("write delta");
+        let engine = VfsLocalFileSystem::new(fs);
+        let output = root.path().join("live-incremental.vfs");
+
+        let sent = live_snapshot_admin(
+            &engine,
+            "send",
+            json!({
+                "output": output.display().to_string(),
+                "format": "vfssend1",
+                "incremental": true,
+                "from_root": live_from_root_hex(&baseline_root),
+            }),
+            true,
+        );
+
+        assert_eq!(sent["ok"], true, "incremental send response: {sent}");
+        assert_eq!(sent["json"]["format"], "vfssend1");
+        assert_eq!(sent["json"]["incremental"], true);
+        assert!(sent["json"]["bytes"].as_u64().unwrap_or(0) > 0);
+        let encoded = std::fs::read(&output).expect("read incremental output");
+        let decoded =
+            crate::ChangedRecordExport::decode(&encoded).expect("decode incremental output");
+        assert!(decoded.incremental);
+        assert_eq!(decoded.from_root.as_ref(), Some(&baseline_root));
+        assert!(decoded.total_records > 0);
+    }
+
+    #[test]
+    fn live_snapshot_send_incremental_requires_authorized_from_root() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = root.path().join("store");
+        let mut fs = LocalFileSystem::open(&store).expect("open fs");
+        fs.create_file("/live.txt", 0o644).expect("create file");
+        fs.write_file("/live.txt", 0, b"live owner snapshot send")
+            .expect("write file");
+        let engine = VfsLocalFileSystem::new(fs);
+        let output = root.path().join("missing-from-root.vfs");
+
+        let missing = live_snapshot_admin(
+            &engine,
+            "send",
+            json!({
+                "output": output.display().to_string(),
+                "format": "vfssend1",
+                "incremental": true,
+            }),
+            true,
+        );
+        assert_eq!(missing["ok"], false, "missing response: {missing}");
+        assert_eq!(missing["exit_code"], 1);
+        assert!(missing["json"].is_null());
+        assert!(missing["text"].is_null());
+        assert!(
+            missing["error"]
+                .as_str()
+                .is_some_and(|err| err.contains("--from-root required")),
+            "missing response should explain from-root requirement: {missing}"
+        );
+        assert!(!output.exists());
+
+        let unknown = live_snapshot_admin(
+            &engine,
+            "send",
+            json!({
+                "output": output.display().to_string(),
+                "format": "vfssend1",
+                "incremental": true,
+                "from_root": "000000000000000000000000000000000000000000000000",
+            }),
+            false,
+        );
+        assert_eq!(unknown["ok"], false, "unknown response: {unknown}");
+        assert_eq!(unknown["exit_code"], 1);
+        assert!(unknown["json"].is_null());
+        assert!(unknown["text"].is_null());
+        assert!(
+            unknown["error"]
+                .as_str()
+                .is_some_and(|err| err.contains("from_root not found")),
+            "unknown response should explain root authority failure: {unknown}"
+        );
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn live_snapshot_send_rejects_target_addr_until_remote_admission_is_wired() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = root.path().join("store");
+        let mut fs = LocalFileSystem::open(&store).expect("open fs");
+        fs.create_file("/live.txt", 0o644).expect("create file");
+        fs.write_file("/live.txt", 0, b"live owner snapshot send")
+            .expect("write file");
+        let engine = VfsLocalFileSystem::new(fs);
+        let output = root.path().join("target-refusal.vfs");
+
+        let refused = live_snapshot_admin(
+            &engine,
+            "send",
+            json!({
+                "output": output.display().to_string(),
+                "target_addr": "127.0.0.1:9000",
+                "format": "vfssend1",
+                "incremental": false,
+            }),
+            true,
+        );
+
+        assert_eq!(refused["ok"], false, "target response: {refused}");
+        assert_eq!(refused["exit_code"], 1);
+        assert!(refused["json"].is_null());
+        assert!(
+            refused["error"].as_str().is_some_and(|err| {
+                err.contains("target-address send")
+                    && err.contains("remote admission")
+                    && err.contains("127.0.0.1:9000")
+            }),
+            "target response should explain fail-closed remote boundary: {refused}"
+        );
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn live_snapshot_send_rejects_unknown_format_before_exporting() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = root.path().join("store");
+        let mut fs = LocalFileSystem::open(&store).expect("open fs");
+        fs.create_file("/live.txt", 0o644).expect("create file");
+        fs.write_file("/live.txt", 0, b"live owner snapshot send")
+            .expect("write file");
+        let engine = VfsLocalFileSystem::new(fs);
+        let output = root.path().join("unknown-format.vfs");
+
+        let refused = live_snapshot_admin(
+            &engine,
+            "send",
+            json!({
+                "output": output.display().to_string(),
+                "format": "unknown",
+                "incremental": false,
+            }),
+            true,
+        );
+
+        assert_eq!(refused["ok"], false, "format response: {refused}");
+        assert_eq!(refused["exit_code"], 1);
+        assert!(refused["json"].is_null());
+        assert!(refused["text"].is_null());
+        assert!(
+            refused["error"]
+                .as_str()
+                .is_some_and(|err| err.contains("unknown stream format 'unknown'")),
+            "format response should name rejected format: {refused}"
+        );
+        assert!(!output.exists());
     }
 
     #[test]
