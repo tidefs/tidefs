@@ -28,7 +28,10 @@ use crate::xfstests_scoreboard::{XfstestsClassification, XfstestsScoreboard};
 
 // -- Validation tier --------------------------------------------------------
 
-/// Validation tiers as defined in `docs/CURRENT_RELEASE_FOCUS.md`.
+/// Validation tiers for xfstests scoring.
+///
+/// Keep this T0-T7 grouping aligned with `crate::validation_schema` and the
+/// CI/runtime lane authority in `docs/GITHUB_CI.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ValidationTier {

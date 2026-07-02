@@ -102,7 +102,8 @@ impl Subsystem {
     }
 }
 
-/// Reference to a release gate (from FEATURE_MATRIX.md or CURRENT_RELEASE_FOCUS.md).
+/// Reference to a validation or release gate from current source or docs
+/// authority.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ReleaseGateRef {
     /// Gate identifier (e.g. "FUSE crash recovery", "Kernel block crash consistency").
@@ -127,7 +128,7 @@ pub enum ScenarioCoverage {
     Gap,
 }
 
-/// Validation tier per the CURRENT_RELEASE_FOCUS.md tier table.
+/// Validation tier grouping aligned with `crate::validation_schema`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum ValidationTier {
     /// Tier 0: Source/model/schema/proposal state.
@@ -618,7 +619,7 @@ fn build_catalog() -> Vec<FaultInjectionScenario> {
         crash_injection_points: vec![],
         release_gates: vec![ReleaseGateRef {
             gate: "Kernel crash-loop replay campaign".into(),
-            source: "CURRENT_RELEASE_FOCUS.md".into(),
+            source: "docs/GITHUB_CI.md".into(),
         }],
         tickets: vec![6396],
         scripts: vec![],

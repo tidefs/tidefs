@@ -2,7 +2,11 @@
 
 This crate is validation support, not product acceptance by itself.
 
-**Focused validation commands:** `docs/release/focused-validation-command-registry.md` is the authoritative command map for narrow source/validation work.
+**Focused validation commands:** `docs/GITHUB_CI.md` and the workflow YAML in
+`.github/workflows/` are the authoritative command map for narrow
+source/validation work. Claims-specific validation is governed by
+`docs/CLAIMS_GATE_POLICY.md`, `validation/claims.toml`, and the generated
+`docs/CLAIM_REGISTRY.md`.
 
 Production release validation must come from executed runs: FUSE, ublk, RDMA,
 multi-node, Kbuild, Linux 7.0 QEMU, mounted-kernel VFS, kernel block-I/O, or

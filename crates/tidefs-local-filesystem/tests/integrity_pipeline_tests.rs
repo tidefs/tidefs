@@ -6,7 +6,7 @@
 //! manifests, and per-chunk checksums. Every test uses only the public API
 //! of tidefs-local-filesystem and tidefs-local-object-store.
 //!
-//! Integrity validation chain (see docs/INTEGRITY_REPAIR_VALIDATION_PC009.md):
+//! Integrity validation chain exercised by this test module:
 //!
 //!   validation_0: v3 BLAKE3-256 production-integrity trailers on every record
 //!   validation_1: keyed root-authentication records per committed root
