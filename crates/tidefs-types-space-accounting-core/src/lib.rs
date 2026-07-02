@@ -19,16 +19,11 @@
 //! - [`SpaceDomainCounters`] — domain-level aggregated counters for
 //!   statfs integration
 //!
-//! # Comparison to ZFS / Ceph
+//! # Type model
 //!
-//! - **ZFS**: `USED`/`AVAIL` in `zfs list` without explicit logical/physical
-//!   coupling; snapshot space tracked via periodic scans producing stale
-//!   results. This design provides O(1) deadlist accounting and explicit
-//!   coupling between logical ENOSPC decisions and physical allocator state.
-//! - **Ceph**: RADOS pool statistics (`ceph df`) are aggregate and don't
-//!   distinguish logical from physical space or track snapshot-pinned bytes
-//!   separately.  This design provides per-dataset granularity with
-//!   SpaceDomainId for correct clone-family statfs.
+//! The types keep logical ENOSPC decisions coupled to physical allocator
+//! state, track snapshot-pinned bytes, and use [`SpaceDomainId`] for
+//! clone-family statfs accounting.
 #[cfg(all(not(test), feature = "alloc"))]
 use alloc::vec::Vec;
 use core::fmt;
@@ -492,11 +487,9 @@ impl PoolPhysicalCountersV1 {
 /// tracks extent IDs exclusively pinned by this snapshot; `deadlist_bytes`
 /// provides O(1) observability without scanning the tree.
 ///
-/// ## Comparison to ZFS
+/// ## Deadlist-byte accounting
 ///
-/// ZFS tracks snapshot space via `usedbysnapshots` which requires periodic
-/// scanning and can be stale by minutes/hours under heavy write load.
-/// This record enables O(1) deadlist-byte queries — the counter is updated
+/// This record enables O(1) deadlist-byte queries: the counter is updated
 /// atomically with extent allocations and freed-block routing.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SnapshotSpaceRecord {
@@ -677,16 +670,10 @@ impl SpaceDomainCounters {
 /// (fallocate) from free-space ops (truncate, unlink, punch hole) for
 /// correct quota and physical-capacity enforcement.
 ///
-/// ## Comparison to ZFS / Ceph
+/// ## Admission model
 ///
-/// - **ZFS**: `object_store_tx_hold_write` estimates space per-operation but does
-///   not expose a typed mutation enum; quota enforcement is post-hoc
-///   against DSL dataset properties.  TideFS makes the operation type
-///   explicit at the admission gate so worst-case deltas are visible
-///   before any allocator state is touched.
-/// - **Ceph**: OSD `do_op` path has no per-operation space budgeting;
-///   ENOSPC surfaces late at the ObjectStore layer.  TideFS budgets
-///   per operation at the VFS boundary.
+/// The operation type is explicit at the admission gate so worst-case deltas
+/// are visible before allocator state is touched.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MutationOp {
     /// New data write (or overwrite).  Worst case: all bytes are new.

@@ -52,19 +52,11 @@
 //! implementation uses a length-delimited binary format with magic bytes
 //! and version number for forward compatibility.
 //!
-//! # Comparison to ZFS / Ceph
+//! # Shared job model
 //!
-//! - **ZFS**: Background operations (scrub, resilver, dataset destroy,
-//!   send/receive) each use ad-hoc progress tracking (`dsl_scan_phys_t`,
-//!   `device_rebuild` bitmaps, `bpobj` deferred-free lists) with no shared
-//!   contract, non-resumable checkpoints, and fragmented admin visibility.
-//! - **Ceph**: PG scrub/recovery/backfill use per-PG state machines with
-//!   no cluster-wide budget model, no unified cursor contract, and
-//!   duplicated crash-recovery logic across subsystems.
-//!
-//! TideFS eliminates this duplication with a single [`IncrementalJob`] trait
-//! that all subsystems implement, providing uniform budget enforcement,
-//! crash-resumable checkpoints, and consistent admin visibility.
+//! The trait removes per-subsystem control-plane duplication by requiring the
+//! same budget, checkpoint, idempotency, and completion semantics across
+//! cursor-driven maintenance and admin jobs.
 //!
 //! [`WorkBudget`]: tidefs_types_incremental_job_core::WorkBudget
 //! [`Checkpoint`]: tidefs_types_incremental_job_core::Checkpoint

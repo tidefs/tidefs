@@ -6,16 +6,11 @@
 //! dequeues a batch of `ReclaimQueueEntry` entries in deterministic
 //! [`ObjectKey`] order, processes deltas, and advances the cursor.
 //!
-//! ## Design (better than ZFS/Ceph)
+//! ## Reclaim model
 //!
-//! - **ZFS**: deferred frees use `bpobj` — an opaque, untyped linked
-//!   list processed in unpredictable order during `dsl_scan`. No budget
-//!   control; can stall the commit_group pipeline.
-//! - **Ceph**: PG logs are append-only mutation journals, not reclaim
-//!   queues. No equivalent of a sorted delta queue exists.
-//! - **TideFS**: deterministic, budgeted, resumable reclaim queue with
-//!   sorted B-tree key order. Decouples delta recording (O(1) per mutation)
-//!   from reclamation processing (O(budget) per tick).
+//! The service processes a deterministic, budgeted, resumable reclaim queue
+//! in sorted B-tree key order. Delta recording stays O(1) per mutation, while
+//! reclamation work is bounded by each scheduler tick.
 
 use std::sync::{Arc, Mutex};
 

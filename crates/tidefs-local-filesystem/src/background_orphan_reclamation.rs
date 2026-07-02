@@ -8,13 +8,11 @@
 //! the buffer after each scheduler cycle and performs the actual
 //! content-object deletion.
 //!
-//! ## Design (better than ZFS/Ceph)
+//! ## Orphan recovery model
 //!
-//! - **ZFS**: `zfs_unlinked_drain()` blocks mount, restarts from scratch
-//!   on crash, limited to ~100K entries.
-//! - **CephFS**: relies on full-dataset scrub after MDS journal replay.
-//! - **TideFS**: incremental, budgeted, resumable orphan recovery that
-//!   does not block mount and interleaves with other background services.
+//! The service keeps orphan reclamation incremental, budgeted, and resumable.
+//! Runtime cleanup work is queued through the persistent orphan index and
+//! interleaves with other background services.
 
 use std::sync::{Arc, Mutex};
 

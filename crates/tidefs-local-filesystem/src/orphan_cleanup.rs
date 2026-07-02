@@ -16,14 +16,6 @@
 //! - Complements the incremental `BackgroundOrphanReclamation` service which
 //!   handles runtime orphans under per-tick budget.
 //!
-//! ## Comparison to ZFS / Ceph
-//!
-//! - **ZFS**: `zfs_unlinked_drain()` blocks mount, restarts from scratch on
-//!   crash, limited to ~100K entries.
-//! - **CephFS**: relies on full-dataset scrub after MDS journal replay.
-//! - **TideFS**: O(orphans) synchronous cleanup at mount with cursor-based
-//!   resumption and per-tick background budget.
-
 use std::sync::{Arc, Mutex};
 
 use tidefs_local_object_store::LocalObjectStore;

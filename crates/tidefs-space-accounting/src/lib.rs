@@ -14,15 +14,12 @@
 //! This crate is the source-owned runtime reduction for the current space
 //! accounting model.
 //!
-//! # Comparison to ZFS / Ceph
+//! # Runtime model
 //!
-//! - **ZFS**: `statfs` derives from `used`/`available` in the DSL dataset
-//!   properties, but ENOSPC can fire late due to copy-on-write overhead and
-//!   snapshot space is not separately tracked. This runtime provides explicit
-//!   `check_enospc()` before allocation with snapshot-pinned byte awareness.
-//! - **Ceph**: RADOS pool statistics are aggregate; no per-dataset ENOSPC
-//!   gating. This runtime provides dataset-level gating with `SpaceDomainId`
-//!   for clone-family sharing.
+//! The runtime performs explicit `check_enospc()` admission before allocation,
+//! tracks snapshot-pinned bytes, and uses [`SpaceDomainId`] for clone-family
+//! sharing. It remains a crate-local reduction while TFR-007 capacity
+//! unification is open.
 
 use core::fmt;
 
@@ -458,7 +455,7 @@ impl SpaceAccounting {
     }
     // -- Slop management (Phase 3) --
 
-    /// Default slop ratio: 1/64 of quota (matches ZFS convention).
+    /// Default slop ratio: 1/64 of quota.
     pub const DEFAULT_SLOP_RATIO: u64 = 64;
 
     /// Current slop bytes.
@@ -1062,13 +1059,11 @@ impl DatasetQuotaDecision {
 /// - [`effective_capacity`](Self::effective_capacity) returns the most
 ///   restrictive hard-limit ceiling along the chain (or pool capacity).
 ///
-/// # Comparison to ZFS
+/// # Quota model
 ///
-/// ZFS enforces `quota` at the dataset level but `refquota` excludes
-/// descendants.  TideFS takes the simpler path: all ancestor quotas are
-/// cumulative (they include descendant usage), matching ZFS `quota`
-/// semantics.  A future `DatasetQuotaConfig::exclude_descendants` flag
-/// can add `refquota`-style exclusion without changing the hierarchy model.
+/// All ancestor quotas are cumulative and include descendant usage. A future
+/// `DatasetQuotaConfig::exclude_descendants` flag can add exclusion semantics
+/// without changing the hierarchy model.
 #[derive(Clone, Debug, Default)]
 pub struct DatasetQuotaHierarchy {
     entries: HashMap<[u8; 16], DatasetQuotaEntry>,
@@ -1582,20 +1577,13 @@ impl SpaceUsage {
 /// pinned by that snapshot — i.e. blocks whose refcount dropped to 1
 /// but are still reachable from a live snapshot root.
 ///
-/// This provides O(1) updates (unlike ZFS's O(n) periodic scans) and
-/// O(m) snapshot destroy where m = exclusively pinned blocks.
+/// This provides O(1) updates and O(m) snapshot destroy where m is the number
+/// of exclusively pinned blocks.
 ///
-/// # Comparison to ZFS / Ceph
+/// # Deadlist accounting model
 ///
-/// - **ZFS**: `usedbysnapshots` is computed via periodic `zfs list -t snapshot`
-///   scans that can be minutes or hours stale under heavy write load.
-///   Destroying a snapshot walks its deadlist internally but the accounting
-///   is not exposed for O(1) queries.
-/// - **Ceph**: RADOS pools have no per-snapshot space attribution;
-///   snapshot space is opaque.
-///
-/// TideFS maintains `deadlist_bytes` per snapshot with O(1) counter updates
-/// on every extent-pin / extent-unpin operation, giving real-time accuracy.
+/// `deadlist_bytes` is updated on every extent-pin and extent-unpin operation
+/// so snapshot-pinned bytes remain queryable without scanning all extents.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct SnapshotDeadlist {
     /// Total bytes pinned exclusively by this snapshot.
@@ -1710,8 +1698,8 @@ impl SnapshotDeadlist {
 /// Manages snapshot lifecycle and aggregates deadlist accounting
 /// across all snapshots in a dataset.
 ///
-/// Provides O(1) total-pinned-bytes queries (unlike ZFS's O(n) scan)
-/// and O(m) snapshot destroy where m = exclusively pinned extents.
+/// Provides O(1) total-pinned-bytes queries and O(m) snapshot destroy where
+/// m is the number of exclusively pinned extents.
 #[derive(Clone, Debug, Default)]
 pub struct SnapshotSpaceManager {
     /// All snapshot deadlists indexed by snap_commit_group for stable ordering.
@@ -1874,16 +1862,10 @@ impl SnapshotSpaceManager {
 /// reclaim_domain(id) ───────────────────┘  (last member destroyed)
 /// ```
 ///
-/// # Comparison to ZFS / Ceph
+/// # Domain accounting model
 ///
-/// - **ZFS**: No domain-scoped accounting for clone families — `zfs list` reports
-///   per-dataset `used` which double-counts blocks shared by clones.  `statfs`
-///   inside a clone reports the origin\'s quota, not the clone family aggregate.
-/// - **Ceph**: RADOS pool stats are fully aggregate with no per-clone-family
-///   awareness.
-///
-/// TideFS provides domain-scoped `statfs` so that every dataset in a clone family
-/// sees the same available space, correctly accounting for shared blocks.
+/// Domain-scoped `statfs` lets every dataset in a clone family see the same
+/// available space while accounting for shared blocks once.
 #[derive(Clone, Debug)]
 pub struct SpaceDomainRegistry {
     domains: hashbrown::HashMap<SpaceDomainId, SpaceDomainCounters>,

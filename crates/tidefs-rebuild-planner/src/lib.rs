@@ -24,15 +24,12 @@
 //! - `detect_stale_chunks_for_backfill()` — detect lagged chunks needing catchup
 //! - `detect_capacity_skew_for_rebalance()` — detect utilization skew needing rebalancing
 //!
-//! # Comparison to ZFS / Ceph
+//! # Rebuild model
 //!
-//! - ZFS: no native distributed rebuild — resilver is local disk-to-disk
-//!   within a single pool; no failure-domain-aware source selection
-//! - Ceph: backfill is PG-scoped, triggered by OSD health changes; rebuild
-//!   source selection is topology-based but not receipt-backed
-//! - TideFS: loss-event-scoped rebuild with receipt-backed source
-//!   verification, witness-set-driven batch scheduling, degradation-class
-//!   propagation, and explicit no-source/no-target refusal
+//! Rebuild opens from a loss or suspect event, freezes the affected scope and
+//! degradation class, selects receipt-backed witness sources, schedules
+//! batches, and records explicit no-source, no-target, and no-capacity
+//! refusal states.
 
 #![forbid(unsafe_code)]
 
