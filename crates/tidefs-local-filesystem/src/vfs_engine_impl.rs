@@ -7159,11 +7159,9 @@ mod tests {
         fs.write_file("/base.txt", 0, b"base bytes")
             .expect("write base");
         fs.sync_all().expect("sync baseline");
-        let baseline_root = fs
-            .recovery_audit()
-            .expect("audit baseline roots")
-            .selected_root
-            .expect("selected baseline root");
+        // Incremental send succeeds only while the base root's objects remain retained.
+        let baseline = fs.create_snapshot("baseline").expect("snapshot baseline");
+        let baseline_root = baseline.source_root;
         fs.set_auto_commit(false);
         fs.replace_file("/base.txt", b"updated base bytes")
             .expect("replace base");
