@@ -321,6 +321,14 @@ pub enum CommitGroupError {
         /// Human-readable reason.
         reason: String,
     },
+    /// Commit publication was refused because an integrity or root producer
+    /// could not provide non-placeholder authority for a non-empty group.
+    PublicationRefused {
+        /// Subsystem that could not publish real authority.
+        subsystem: &'static str,
+        /// Human-readable reason.
+        reason: String,
+    },
 }
 
 impl fmt::Display for CommitGroupError {
@@ -357,6 +365,9 @@ impl fmt::Display for CommitGroupError {
             }
             Self::CommitPhaseRejected { reason } => {
                 write!(f, "commit phase rejected: {reason}")
+            }
+            Self::PublicationRefused { subsystem, reason } => {
+                write!(f, "publication refused by {subsystem}: {reason}")
             }
             #[cfg(feature = "std")]
             Self::Io(kind) => write!(f, "I/O error: {kind:?}"),
