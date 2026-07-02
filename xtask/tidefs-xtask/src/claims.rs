@@ -112,21 +112,22 @@ const CLAIMS_GATE_ALLOWED_FRAMES: &[&str] = &[
 ];
 
 const APP_INDEX_LIMITATION_MARKERS: &[&str] = &[
-    "checked package-role authority",
-    "mirrors the current app-root inventory only for navigation",
-    "operator entrypoint for CLI/UAPI work; TFR-011 and TFR-019 remain open",
-    "non-production Local Filesystem exercise only",
-    "cluster authority remains TFR-017",
-    "non-production Local Object Store exercise only",
-    "not production-readiness claims",
+    "checked package-role authority is `docs/workspace-package-classification.md`",
+    "stable navigation only, not an app-root inventory table",
+    "roles, dispositions, and package counts",
+    "App roots are not production-readiness claims",
+    "issue-scoped checks",
+    "release-facing wording",
 ];
 
 const CRATE_INDEX_LIMITATION_MARKERS: &[&str] = &[
     "current package-role authority is `docs/workspace-package-classification.md`",
-    "validates that authority against Cargo metadata",
+    "check-workspace-policy",
+    "Cargo metadata",
     "manifest discovery",
-    "root `workspace.exclude` list",
-    "only a navigation aid, not a second package table",
+    "`workspace.exclude` list",
+    "stable navigation only",
+    "count surface",
     "Capability wording for crates remains behind implementation reality",
     "`docs/CLAIMS_GATE_POLICY.md`",
     "`cargo run -p tidefs-xtask -- check-claims-gate`",
@@ -4082,11 +4083,11 @@ mod tests {
     #[test]
     fn claims_gate_requires_top_level_index_limitations() {
         for marker in [
-            "checked package-role authority",
-            "operator entrypoint for CLI/UAPI work; TFR-011 and TFR-019 remain open",
-            "cluster authority remains TFR-017",
-            "non-production Local Object Store exercise only",
-            "not production-readiness claims",
+            "checked package-role authority is `docs/workspace-package-classification.md`",
+            "stable navigation only, not an app-root inventory table",
+            "roles, dispositions, and package counts",
+            "App roots are not production-readiness claims",
+            "release-facing wording",
         ] {
             assert!(
                 APP_INDEX_LIMITATION_MARKERS.contains(&marker),
@@ -4096,8 +4097,11 @@ mod tests {
 
         for marker in [
             "current package-role authority is `docs/workspace-package-classification.md`",
-            "validates that authority against Cargo metadata",
-            "only a navigation aid, not a second package table",
+            "check-workspace-policy",
+            "Cargo metadata",
+            "`workspace.exclude` list",
+            "stable navigation only",
+            "count surface",
             "Capability wording for crates remains behind implementation reality",
             "`docs/CLAIMS_GATE_POLICY.md`",
             "`cargo run -p tidefs-xtask -- check-claims-gate`",
