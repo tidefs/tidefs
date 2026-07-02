@@ -55,9 +55,6 @@ canonical storage-intent authority on the default branch.
 - GitHub issue #920 for storage-intent result/refusal evidence binding typed
   caller outcomes, including success, degraded-visible, blocked, refused,
   retryability, idempotency, and response-registry projection.
-- `docs/CACHE_TAXONOMY_INVARIANTS_P4-02.md`: cache is not authority, every
-  cache entry is evictable only under its cache law, and dirty state must drain
-  through explicit state machines.
 - `docs/PAGE_CACHE_WRITEBACK_AUTHORITY.md`: page-cache bytes are mirrors, and
   successful durability barriers require committed storage, durable replayable
   intent, or an equivalent receipt authority.

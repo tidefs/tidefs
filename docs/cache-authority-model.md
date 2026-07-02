@@ -136,7 +136,5 @@ successor/comparator claims.
 ## Related Documents
 
 - `docs/HOT_READ_CACHE_PC003.md` -- original hot read cache design (not authority)
-- `docs/CACHE_TAXONOMY_INVARIANTS_P4-02.md` -- cache taxonomy and invariants
 - `docs/PAGE_CACHE_WRITEBACK_MMAP_INTEGRATION_P5-03.md` -- page-cache/writeback/mmap law
-- `docs/MEMORY_PRESSURE_RECLAIM_RESERVE_INTERACTION_P4-03.md` -- memory pressure and reclaim
 - `docs/WHOLE_REPO_REVIEW.md` -- current review debt and unresolved TFR-008 cache/writeback/recovery boundary

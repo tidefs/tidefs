@@ -50,8 +50,6 @@ focused validation, and claim evidence.
   cache, volatile RAM authority, intent-backed RAM, and PMem durability.
 - `docs/PAGE_CACHE_WRITEBACK_AUTHORITY.md`, because durable POSIX barriers
   cannot be weakened by a latency objective.
-- `docs/CACHE_TAXONOMY_INVARIANTS_P4-02.md`, because cache warmth is not
-  authority.
 - `docs/TRANSPORT_CLUSTER_AUTHORITY.md`, because WAN and replicated objectives
   must consume path, epoch, and fencing evidence instead of assuming RDMA.
 - source-owned governor, scheduler, and admission paths, because queue, memory,
