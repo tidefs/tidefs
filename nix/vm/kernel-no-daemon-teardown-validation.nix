@@ -11,9 +11,10 @@
 # cycles, and writes kernel-teardown-runtime.json with an
 # evidence-manifest.json into the artifact directory.
 #
-# Produces claim-grade teardown runtime evidence for
-# kernel.teardown.no_work_after.v1 T6 full-kernel-no-daemon tier.
-# Does not update claim registry status or generated claim docs.
+# Produces a T6 full-kernel/no-daemon teardown runtime artifact. The artifact
+# carries explicit per-surface coverage and remains blocked unless every
+# required T6 surface is proven without required support daemons. It does not
+# update claim registry status or generated claim docs.
 {
   pkgs,
   linuxKernel_7_0,
@@ -861,6 +862,116 @@ PHASEEOF
         '$arr + [{"operation":$op,"expected_refusal":$expected,"observed_result":$result,"new_work_enqueued_or_started":$new_work}]')"
     fi
 
+    # Build explicit T6 surface coverage. This row is allowed to produce a
+    # blocked artifact, but it may not pass while required full-kernel surfaces
+    # are unproven.
+    all_passed() {
+      for marker in "$@"; do
+        grep -q "^PASS: $marker" "$QEMU_PARSE_LOG" 2>/dev/null || return 1
+      done
+      return 0
+    }
+
+    RUNTIME_SCOPE_JSON="$("$JQ" -n '[]')"
+    add_runtime_scope() {
+      local surface="$1"
+      local status="$2"
+      local evidence="$3"
+      local no_daemon="$4"
+      local residual="$5"
+
+      RUNTIME_SCOPE_JSON="$("$JQ" -n \
+        --arg surface "$surface" \
+        --arg status "$status" \
+        --arg evidence "$evidence" \
+        --argjson no_daemon "$no_daemon" \
+        --arg residual "$residual" \
+        --argjson arr "$RUNTIME_SCOPE_JSON" \
+        '$arr + [{
+          "surface": $surface,
+          "status": $status,
+          "evidence": $evidence,
+          "no_required_support_daemon": $no_daemon,
+          "residual_risk": $residual
+        }]')"
+
+      if [ "$status" != "pass" ]; then
+        if [ "$TEARDOWN_STATUS" = "pass" ]; then
+          TEARDOWN_STATUS="blocked"
+        fi
+        append_fail_reason "runtime_scope_''${surface}_''${status}"
+      fi
+    }
+
+    if all_passed configured_pool_mount write_test_file sync_after_write readback_verify readdir_before_teardown no_daemon_pre_teardown_io; then
+      add_runtime_scope \
+        "vfs" \
+        "pass" \
+        "configured_pool_mount, write_test_file, sync_after_write, readback_verify, readdir_before_teardown, no_daemon_pre_teardown_io" \
+        "true" \
+        "bounded mounted POSIX smoke row; xfstests breadth and object/extent replay remain outside this artifact"
+    else
+      add_runtime_scope \
+        "vfs" \
+        "blocked" \
+        "one or more mounted VFS/no-daemon probes did not pass in qemu.log" \
+        "false" \
+        "no T6 VFS coverage may pass until mount/write/sync/readback/readdir all pass without support daemons"
+    fi
+
+    add_runtime_scope \
+      "block" \
+      "blocked" \
+      "this row mounts through a lower virtio pool member but does not export or exercise tidefs-block-kmod queue_rq read/write/flush/discard" \
+      "false" \
+      "full-kernel/no-daemon block coverage needs a block-volume runtime row on the shared pool core"
+
+    if all_passed recovery_insmod recovery_remount recovery_write_verify no_daemon_recovery; then
+      add_runtime_scope \
+        "recovery" \
+        "pass" \
+        "recovery_insmod, recovery_remount, recovery_write_verify, no_daemon_recovery" \
+        "true" \
+        "bounded reload/remount recovery row; QEMU powercut and committed-root replay breadth remain separate gates"
+    else
+      add_runtime_scope \
+        "recovery" \
+        "blocked" \
+        "one or more no-daemon recovery probes did not pass in qemu.log" \
+        "false" \
+        "no T6 recovery coverage may pass until reload/remount/write verification passes without support daemons"
+    fi
+
+    add_runtime_scope \
+      "writeback" \
+      "blocked" \
+      "sync_after_write is covered, but this row does not prove page-cache writeback, mmap coherency, or dirty lifecycle authority" \
+      "false" \
+      "writeback remains gated by mounted writeback/page-cache evidence before full-kernel no-daemon wording can pass"
+
+    add_runtime_scope \
+      "placement_reserve_admission" \
+      "blocked" \
+      "configured_pool_member_created and configured_pool_label_verified are pool-member bring-up checks, not placement/reserve admission proof" \
+      "false" \
+      "placement and reserve admission need dedicated allocator/admission runtime evidence"
+
+    if all_passed unmount_ok rmmod_ok module_gone refusal_mount refusal_mount_check dmesg_clean no_daemon_final_teardown no_daemon_post_final_refusal_probe; then
+      add_runtime_scope \
+        "teardown_no_work_after" \
+        "pass" \
+        "unmount_ok, rmmod_ok, module_gone, refusal_mount, refusal_mount_check, dmesg_clean, no_daemon_final_teardown, no_daemon_post_final_refusal_probe" \
+        "true" \
+        "bounded lifecycle/refusal row; broad concurrent teardown stress remains outside this artifact"
+    else
+      add_runtime_scope \
+        "teardown_no_work_after" \
+        "blocked" \
+        "one or more teardown/refusal/no-daemon probes did not pass in qemu.log" \
+        "false" \
+        "no T6 teardown/no-work-after coverage may pass until final teardown, refusal, dmesg, and no-daemon probes pass"
+    fi
+
     # Trace identity
     artifact_body_missing() {
       local body="$1"
@@ -915,7 +1026,7 @@ PHASEEOF
     CLEANUP_DMESG="clean"
     REMAINING_WORK="none"
 
-    if echo "$FAIL_REASONS" | "$JQ" -e 'length > 0' >/dev/null 2>&1; then
+    if [ "$DMESG_DANGER_COUNT" -gt 0 ]; then
       CLEANUP_DMESG="signals_detected"
     fi
 
@@ -948,6 +1059,7 @@ PHASEEOF
       --arg callback_trace_artifact_path "$CB_TRACE_PATH" \
       --arg callback_trace_digest "$CB_TRACE_DIGEST" \
       --argjson refusal_observations "$REFUSAL_JSON" \
+      --argjson runtime_scope_coverage "$RUNTIME_SCOPE_JSON" \
       --arg unmount "$UNMOUNT_OUTCOME" \
       --arg rmmod "$RMMOD_OUTCOME" \
       --arg reload_remount_probe "$RELOAD_OUTCOME" \
@@ -986,6 +1098,7 @@ PHASEEOF
           dmesg_state: $dmesg_state,
           remaining_tidefs_work_observations: $remaining_tidefs_work_observations
         },
+        runtime_scope_coverage: $runtime_scope_coverage,
         status: $status,
         fail_closed_reasons: $fail_closed_reasons
       }' > "$OUTPUT_DIR/kernel-teardown-runtime.json"
