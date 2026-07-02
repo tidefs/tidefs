@@ -1229,6 +1229,7 @@ pub struct PrefetchExecutorEvidenceRefs {
     pub dispatch_plan_ref: StorageIntentEvidenceRef,
     pub runtime_support_ref: StorageIntentEvidenceRef,
     pub read_serving_boundary_ref: StorageIntentEvidenceRef,
+    pub metadata_namespace_ref: StorageIntentEvidenceRef,
     pub relocation_boundary_ref: StorageIntentEvidenceRef,
     pub result_refusal_ref: StorageIntentEvidenceRef,
     pub tenant_isolation_ref: StorageIntentEvidenceRef,
@@ -2266,6 +2267,10 @@ fn base_record(input: PrefetchExecutorInput) -> PrefetchExecutorRecord {
             dispatch_plan_ref: input.dispatch_plan.plan_ref,
             runtime_support_ref: input.runtime_support.support_ref,
             read_serving_boundary_ref: input.decision.evidence_refs.read_serving_boundary_ref,
+            metadata_namespace_ref: metadata_namespace_ref_for(
+                input.evidence_query_snapshot,
+                family,
+            ),
             relocation_boundary_ref: input.decision.evidence_refs.relocation_boundary_ref,
             result_refusal_ref: input.decision.evidence_refs.result_refusal_ref,
             tenant_isolation_ref: first_bound(
@@ -2625,6 +2630,17 @@ fn terminal_update_lacks_started_dispatch_evidence(
         record.evidence_refs.target_destination_ref,
         StorageIntentEvidenceKind::ActionExecutionEvidence,
     ) {
+        return true;
+    }
+
+    if record.action_family.needs_metadata_namespace_evidence()
+        && !terminal_ref_in_cut(
+            record,
+            cut,
+            record.evidence_refs.metadata_namespace_ref,
+            StorageIntentEvidenceKind::MetadataNamespaceEvidence,
+        )
+    {
         return true;
     }
 
@@ -3189,6 +3205,15 @@ fn runtime_dispatch_evidence_refusal(
     ) {
         return StorageIntentRefusalReason::EvidenceNotUsable;
     }
+    if family.needs_metadata_namespace_evidence()
+        && !snapshot_contains_fresh_ref(
+            input,
+            StorageIntentEvidenceKind::MetadataNamespaceEvidence,
+            metadata_namespace_ref_for(input.evidence_query_snapshot, family),
+        )
+    {
+        return StorageIntentRefusalReason::MetadataNamespaceEvidenceNotUsable;
+    }
     if !input.media_path.source_path_ref.is_bound()
         || !input.media_path.target_destination_ref.is_bound()
     {
@@ -3500,6 +3525,23 @@ fn freshness_rpo_floor_refusal(
         StorageIntentRefusalReason::None
     } else {
         StorageIntentRefusalReason::EvidenceNotUsable
+    }
+}
+
+fn metadata_namespace_ref_for(
+    snapshot: StorageIntentEvidenceQuerySnapshot,
+    family: PrefetchExecutorActionFamily,
+) -> StorageIntentEvidenceRef {
+    if !family.needs_metadata_namespace_evidence() {
+        return EMPTY_EVIDENCE_REF;
+    }
+
+    match snapshot
+        .family_freshness
+        .fresh_ref_for_kind(StorageIntentEvidenceKind::MetadataNamespaceEvidence)
+    {
+        Some(evidence_ref) if snapshot.included_refs.contains_ref(evidence_ref) => evidence_ref,
+        _ => EMPTY_EVIDENCE_REF,
     }
 }
 
@@ -4006,6 +4048,7 @@ mod tests {
     const POLICY_ROLLOUT: StorageIntentEvidenceId = StorageIntentEvidenceId([27; 32]);
     const OPERATOR_POLICY: StorageIntentEvidenceId = StorageIntentEvidenceId([28; 32]);
     const SERVICE_OBJECTIVE: StorageIntentEvidenceId = StorageIntentEvidenceId([29; 32]);
+    const METADATA_NAMESPACE: StorageIntentEvidenceId = StorageIntentEvidenceId([30; 32]);
 
     fn evidence(
         kind: StorageIntentEvidenceKind,
@@ -4047,6 +4090,16 @@ mod tests {
         let family = fresh(kind, id);
         snapshot.included_refs.push(family.evidence_ref).unwrap();
         snapshot.family_freshness.push(family).unwrap();
+    }
+
+    fn extra_evidence_id(kind: StorageIntentEvidenceKind) -> StorageIntentEvidenceId {
+        match kind {
+            StorageIntentEvidenceKind::MetadataNamespaceEvidence => METADATA_NAMESPACE,
+            StorageIntentEvidenceKind::TransportPathEvidence => TRANSPORT,
+            StorageIntentEvidenceKind::TrustDomainEvidence => TRUST,
+            StorageIntentEvidenceKind::RecoveryDegradationEvidence => RECOVERY,
+            _ => TRANSPORT,
+        }
     }
 
     fn rewrite_family_freshness(
@@ -4149,7 +4202,7 @@ mod tests {
             ))
             .unwrap();
         if let Some(kind) = extra_kind {
-            add_fresh(&mut snapshot, kind, TRANSPORT);
+            add_fresh(&mut snapshot, kind, extra_evidence_id(kind));
         }
         snapshot
     }
@@ -4332,6 +4385,21 @@ mod tests {
         recovery_ref
     }
 
+    fn add_metadata_namespace_evidence(
+        input: &mut PrefetchExecutorInput,
+    ) -> StorageIntentEvidenceRef {
+        let metadata_ref = evidence(
+            StorageIntentEvidenceKind::MetadataNamespaceEvidence,
+            METADATA_NAMESPACE,
+        );
+        add_fresh(
+            &mut input.evidence_query_snapshot,
+            StorageIntentEvidenceKind::MetadataNamespaceEvidence,
+            METADATA_NAMESPACE,
+        );
+        metadata_ref
+    }
+
     fn add_remote_path_evidence(input: &mut PrefetchExecutorInput) {
         input.evidence_query_snapshot =
             snapshot(Some(StorageIntentEvidenceKind::TransportPathEvidence));
@@ -4417,6 +4485,9 @@ mod tests {
         push_terminal_ref(refs, record.evidence_refs.media_capability_ref);
         push_terminal_ref(refs, record.evidence_refs.source_path_ref);
         push_terminal_ref(refs, record.evidence_refs.target_destination_ref);
+        if record.action_family.needs_metadata_namespace_evidence() {
+            push_terminal_ref(refs, record.evidence_refs.metadata_namespace_ref);
+        }
         push_terminal_start_charge_refs(refs, record, record.cost_state.required);
         if record_runtime_dispatch_needs_transport_or_trust(record) {
             push_terminal_ref(refs, record.evidence_refs.transport_budget_ref);
@@ -4454,6 +4525,13 @@ mod tests {
         push_terminal_start_ref_unless(refs, record.evidence_refs.media_capability_ref, omitted);
         push_terminal_start_ref_unless(refs, record.evidence_refs.source_path_ref, omitted);
         push_terminal_start_ref_unless(refs, record.evidence_refs.target_destination_ref, omitted);
+        if record.action_family.needs_metadata_namespace_evidence() {
+            push_terminal_start_ref_unless(
+                refs,
+                record.evidence_refs.metadata_namespace_ref,
+                omitted,
+            );
+        }
         push_terminal_start_charge_refs_except(refs, record, record.cost_state.required, omitted);
         if record_runtime_dispatch_needs_transport_or_trust(record) {
             push_terminal_start_ref_unless(
@@ -5744,8 +5822,7 @@ mod tests {
     #[test]
     fn metadata_namespace_dispatch_requires_bounded_walk_plan() {
         let mut input = admitted_input(PrefetchResidencyCandidateClass::MetadataNamespacePrefetch);
-        input.evidence_query_snapshot =
-            snapshot(Some(StorageIntentEvidenceKind::MetadataNamespaceEvidence));
+        let metadata_ref = add_metadata_namespace_evidence(&mut input);
         let record = evaluate_prefetch_execution(input);
         assert_eq!(record.outcome, PrefetchExecutorOutcome::Started);
         assert_eq!(
@@ -5754,6 +5831,7 @@ mod tests {
         );
         assert_eq!(record.dispatch_plan.fanout_limit, 16);
         assert_eq!(record.dispatch_plan.namespace_depth_limit, 2);
+        assert_eq!(record.evidence_refs.metadata_namespace_ref, metadata_ref);
 
         let mut unbounded = input;
         unbounded.dispatch_plan.range_bytes = 0;
@@ -5765,6 +5843,41 @@ mod tests {
             unbounded_record.refusal,
             StorageIntentRefusalReason::EvidenceNotUsable
         );
+    }
+
+    #[test]
+    fn metadata_family_dispatch_preserves_namespace_evidence_ref() {
+        for candidate in [
+            PrefetchResidencyCandidateClass::MetadataNamespacePrefetch,
+            PrefetchResidencyCandidateClass::ManifestIndexPrefetch,
+            PrefetchResidencyCandidateClass::SnapshotClonePrefetch,
+        ] {
+            let mut input = admitted_input(candidate);
+            let metadata_ref = add_metadata_namespace_evidence(&mut input);
+            let record = evaluate_prefetch_execution(input);
+
+            assert_eq!(record.outcome, PrefetchExecutorOutcome::Started);
+            assert!(record.action_family.needs_metadata_namespace_evidence());
+            assert_eq!(record.evidence_refs.metadata_namespace_ref, metadata_ref);
+            assert_record_has_no_authority_claims(record);
+        }
+    }
+
+    #[test]
+    fn metadata_family_dispatch_refuses_missing_namespace_evidence_anchor() {
+        let input = admitted_input(PrefetchResidencyCandidateClass::ManifestIndexPrefetch);
+        let record = evaluate_prefetch_execution(input);
+
+        assert_eq!(record.outcome, PrefetchExecutorOutcome::Blocked);
+        assert_eq!(
+            record.refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+        assert_eq!(
+            record.evidence_refs.metadata_namespace_ref,
+            EMPTY_EVIDENCE_REF
+        );
+        assert_record_has_no_authority_claims(record);
     }
 
     #[test]
@@ -7286,6 +7399,64 @@ mod tests {
             PrefetchExecutorByteState::Refused
         );
         assert_record_has_no_authority_claims(rejected);
+    }
+
+    #[test]
+    fn terminal_update_requires_metadata_namespace_ref_inside_terminal_cut() {
+        let detail = terminal_detail();
+        let mut input = admitted_charged_input(
+            PrefetchResidencyCandidateClass::MetadataNamespacePrefetch,
+            detail,
+        );
+        let metadata_ref = add_metadata_namespace_evidence(&mut input);
+        let started = evaluate_prefetch_execution(input);
+        assert_eq!(started.outcome, PrefetchExecutorOutcome::Started);
+        assert_eq!(started.evidence_refs.metadata_namespace_ref, metadata_ref);
+
+        let mut missing_metadata_refs = StorageIntentEvidenceRefs::EMPTY;
+        push_terminal_start_refs_except(
+            &mut missing_metadata_refs,
+            started,
+            started.evidence_refs.metadata_namespace_ref,
+        );
+        push_terminal_ref(&mut missing_metadata_refs, detail.attribution_ref);
+        push_terminal_ref(&mut missing_metadata_refs, detail.retention_ref);
+        push_terminal_ref(&mut missing_metadata_refs, detail.validation_ref);
+
+        let rejected = finalize_prefetch_execution(
+            started,
+            PrefetchExecutorTerminalUpdate {
+                outcome: PrefetchExecutorOutcome::Completed,
+                result_detail: detail,
+                evidence_cut: PrefetchExecutorTerminalEvidenceCut {
+                    evidence_query_snapshot_ref: started.evidence_refs.evidence_query_snapshot_ref,
+                    included_refs: missing_metadata_refs,
+                },
+                ..PrefetchExecutorTerminalUpdate::default()
+            },
+        );
+        assert_eq!(
+            rejected.outcome,
+            PrefetchExecutorOutcome::VerificationFailed
+        );
+        assert_eq!(
+            rejected.refusal,
+            StorageIntentRefusalReason::ValidationGateFailed
+        );
+        assert_record_has_no_authority_claims(rejected);
+
+        let completed = finalize_prefetch_execution(
+            started,
+            PrefetchExecutorTerminalUpdate {
+                outcome: PrefetchExecutorOutcome::Completed,
+                result_detail: detail,
+                evidence_cut: terminal_evidence_cut(started, detail, EMPTY_EVIDENCE_REF),
+                ..PrefetchExecutorTerminalUpdate::default()
+            },
+        );
+        assert_eq!(completed.outcome, PrefetchExecutorOutcome::Completed);
+        assert_eq!(completed.evidence_refs.metadata_namespace_ref, metadata_ref);
+        assert_record_has_no_authority_claims(completed);
     }
 
     #[test]
