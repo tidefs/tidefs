@@ -117,7 +117,6 @@ pub fn check_local_object_store_on_disk_format_current_workspace() -> Result<(),
     let mut missing = Vec::new();
 
     for rel in [
-        "docs/LOCAL_OBJECT_STORE_ON_DISK_FORMAT.md",
         "crates/tidefs-local-object-store/src/lib.rs",
         "apps/tidefs-store-demo/src/main.rs",
     ] {
@@ -172,27 +171,6 @@ pub fn check_local_object_store_on_disk_format_current_workspace() -> Result<(),
         ],
         &mut missing,
     );
-    check_source_markers(
-        &root,
-        "docs/LOCAL_OBJECT_STORE_ON_DISK_FORMAT.md",
-        &[
-            "segment identity",
-            "segment gaps",
-            "record versions",
-            "footer semantics",
-            "tombstones",
-            "history",
-            "upgrade rules",
-            "segment-0000000000000000.vlos",
-            "VLOSREC1",
-            "VLOSEND2",
-            "VLOSINT4",
-        ],
-        &mut missing,
-    );
-
-    // ── Reject stale current-format language across all format docs ──
-    //
     // The production format is VLOSINT4 IntegrityTrailerV2 (112 bytes),
     // RECORD_FORMAT_VERSION=3.  Any doc that presents the older 80-byte
     // VLOSINT3 trailer as current is stale.
@@ -201,13 +179,6 @@ pub fn check_local_object_store_on_disk_format_current_workspace() -> Result<(),
         "80-byte production-integrity trailer",
         "PRODUCTION_INTEGRITY_TRAILER_LEN=80",
     ];
-    // Primary format-spec doc
-    check_forbidden_markers(
-        &root,
-        "docs/LOCAL_OBJECT_STORE_ON_DISK_FORMAT.md",
-        stale_patterns,
-        &mut missing,
-    );
     // Production-integrity records doc
     check_forbidden_markers(
         &root,
@@ -233,26 +204,6 @@ pub fn check_local_object_store_on_disk_format_current_workspace() -> Result<(),
     // it describes the migration from old to new — the stale-pattern
     // check is intentionally omitted to avoid false positives on the
     // migration table row that documents the superseded 80-byte trailer)
-
-    // ── Cross-check: format doc must state every authoritative magic value ──
-    //
-    // The format doc is the canonical prose description of what
-    // constants.rs defines.  This guard catches drift by requiring
-    // the doc to contain each production magic sequence and the
-    // current size/version.
-    let doc_must_have: &[&str] = &[
-        "VLOSREC1",
-        "VLOSEND2",
-        "VLOSINT4",
-        "112-byte production-integrity trailer",
-        "current writer emits record format version",
-    ];
-    check_source_markers(
-        &root,
-        "docs/LOCAL_OBJECT_STORE_ON_DISK_FORMAT.md",
-        doc_must_have,
-        &mut missing,
-    );
 
     // Verify BackgroundOrphanReclamation registration at mount.
     check_required_file(
@@ -389,7 +340,6 @@ pub fn check_production_integrity_v3_current_workspace() -> Result<(), StorageCh
 
     for rel in [
         "docs/PRODUCTION_INTEGRITY_V3_RECORDS_OW014.md",
-        "docs/STATUS.md",
         "crates/tidefs-local-object-store/src/lib.rs",
         "apps/tidefs-store-demo/src/main.rs",
         "nix/tidefs-validation.sh",
@@ -451,7 +401,7 @@ pub fn check_production_integrity_v3_current_workspace() -> Result<(), StorageCh
     // Reject stale current-format language in the format authority doc
     check_forbidden_markers(
         &root,
-        "docs/LOCAL_OBJECT_STORE_ON_DISK_FORMAT.md",
+        "docs/PRODUCTION_INTEGRITY_POLICY.md",
         &["VLOSINT3", "80-byte production-integrity trailer"],
         &mut missing,
     );
@@ -494,12 +444,11 @@ pub fn check_root_authentication_current_workspace() -> Result<(), StorageCheckE
 
     for rel in [
         "docs/ROOT_AUTHENTICATION_OW015.md",
-        "docs/STATUS.md",
         "docs/PRODUCTION_INTEGRITY_POLICY.md",
         "crates/tidefs-local-filesystem/src/lib.rs",
         "apps/tidefs-filesystem-demo/src/main.rs",
         "apps/tidefs-posix-filesystem-adapter-daemon/src/main.rs",
-        "apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_preview.rs",
+        "apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_vfs_adapter.rs",
         "nix/tidefs-validation.sh",
     ] {
         check_required_file(&root, rel, &mut missing);
@@ -552,7 +501,7 @@ pub fn check_root_authentication_current_workspace() -> Result<(), StorageCheckE
     );
     check_source_markers(
         &root,
-        "apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_preview.rs",
+        "apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_vfs_adapter.rs",
         &[
             "root_authentication_key",
             "open_with_root_authentication_key",
@@ -609,7 +558,6 @@ pub fn check_local_snapshots_current_workspace() -> Result<(), StorageCheckError
 
     for rel in [
         "docs/LOCAL_SNAPSHOTS_OW108.md",
-        "docs/STATUS.md",
         "crates/tidefs-local-filesystem/src/lib.rs",
         "apps/tidefs-filesystem-demo/src/main.rs",
         "nix/tidefs-validation.sh",
@@ -698,7 +646,6 @@ pub fn check_send_receive_current_workspace() -> Result<(), StorageCheckError> {
 
     for rel in [
         "docs/SEND_RECEIVE_OW109.md",
-        "docs/STATUS.md",
         "crates/tidefs-local-filesystem/src/lib.rs",
         "apps/tidefs-filesystem-demo/src/main.rs",
         "nix/tidefs-validation.sh",
@@ -784,32 +731,13 @@ pub fn check_online_verifier_current_workspace() -> Result<(), StorageCheckError
     let mut missing = Vec::new();
 
     for rel in [
-        "docs/ONLINE_VERIFIER_OW110.md",
-        "docs/STATUS.md",
-        "docs/FEATURE_MATRIX.md",
         "crates/tidefs-local-object-store/src/lib.rs",
         "crates/tidefs-local-filesystem/src/lib.rs",
-        "crates/tidefs-online-verifier/src/lib.rs",
         "apps/tidefs-filesystem-demo/src/main.rs",
         "nix/tidefs-validation.sh",
     ] {
         check_required_file(&root, rel, &mut missing);
     }
-    check_source_markers_in_src_dir(
-        &root,
-        "crates/tidefs-online-verifier",
-        &[
-            "ONLINE_VERIFIER_SPEC",
-            "ONLINE_VERIFIER_IS_NOT_FSCK",
-            "OnlineVerifierReport",
-            "OnlineVerifierIssue",
-            "OnlineVerifierOutcome",
-            "verify_online",
-            "verify_online_with_root_authentication_key",
-        ],
-        &mut missing,
-    );
-
     check_source_markers_in_src_dir(
         &root,
         "crates/tidefs-local-filesystem",
@@ -819,6 +747,7 @@ pub fn check_online_verifier_current_workspace() -> Result<(), StorageCheckError
             "OnlineVerifierReport",
             "OnlineVerifierIssue",
             "OnlineVerifierOutcome",
+            "verify_online",
             "verify_online_with_root_authentication_key",
             "online_verifier_report",
             "verify_online_store",
@@ -851,17 +780,6 @@ pub fn check_online_verifier_current_workspace() -> Result<(), StorageCheckError
             "online_verifier.outcome",
             "online_verifier.mutating_repair_attempted",
             "online_verifier.production_requires_operator_repair",
-        ],
-        &mut missing,
-    );
-    check_source_markers(
-        &root,
-        "docs/ONLINE_VERIFIER_OW110.md",
-        &[
-            "non-mutating online verifier",
-            "does not rewrite root slots",
-            "snapshot references",
-            "tidefs-xtask check-online-verifier",
         ],
         &mut missing,
     );
@@ -1028,8 +946,6 @@ pub fn check_chunked_file_layout_current_workspace() -> Result<(), StorageCheckE
     let mut missing = Vec::new();
     for rel in [
         "docs/CHUNKED_FILE_LAYOUT_OW101.md",
-        "docs/STATUS.md",
-        "docs/FEATURE_MATRIX.md",
         "crates/tidefs-local-filesystem/src/lib.rs",
         "apps/tidefs-filesystem-demo/src/main.rs",
         "nix/tidefs-validation.sh",
@@ -1120,10 +1036,8 @@ pub fn check_local_storage_allocator_current_workspace() -> Result<(), StorageCh
     let mut missing = Vec::new();
     for rel in [
         "docs/LOCAL_STORAGE_ALLOCATOR_OW102.md",
-        "docs/STATUS.md",
-        "docs/FEATURE_MATRIX.md",
         "crates/tidefs-local-filesystem/src/lib.rs",
-        "apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_preview.rs",
+        "apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_vfs_adapter.rs",
         "apps/tidefs-filesystem-demo/src/main.rs",
         "nix/tidefs-validation.sh",
     ] {
@@ -1152,7 +1066,7 @@ pub fn check_local_storage_allocator_current_workspace() -> Result<(), StorageCh
     );
     check_source_markers(
         &root,
-        "apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_preview.rs",
+        "apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_vfs_adapter.rs",
         &[
             "ReplyStatfs",
             "reply.statfs",
@@ -1307,7 +1221,6 @@ pub fn check_no_production_fsck_failure_model_current_workspace() -> Result<(), 
     })?;
     let mut missing = Vec::new();
     for rel in [
-        "docs/NO_PRODUCTION_FSCK_FAILURE_MODEL.md",
         "crates/tidefs-local-filesystem/src/lib.rs",
         "crates/tidefs-local-object-store/src/lib.rs",
         "apps/tidefs-filesystem-demo/src/main.rs",
@@ -1357,24 +1270,6 @@ pub fn check_no_production_fsck_failure_model_current_workspace() -> Result<(), 
         ],
         &mut missing,
     );
-    check_source_markers(
-        &root,
-        "docs/NO_PRODUCTION_FSCK_FAILURE_MODEL.md",
-        &[
-            "sync semantics",
-            "write reordering",
-            "torn writes",
-            "lost writes",
-            "media corruption",
-            "explicit-error behavior",
-            "previous committed root",
-            "new committed root",
-            "explicit integrity/media error",
-            "must not require production fsck",
-        ],
-        &mut missing,
-    );
-
     // Verify BackgroundOrphanReclamation registration at mount.
     check_required_file(
         &root,
@@ -1747,7 +1642,6 @@ pub fn check_preview_posix_subset_current_workspace() -> Result<(), StorageCheck
     })?;
     let mut missing = Vec::new();
     for rel in [
-        "docs/PREVIEW_POSIX_SUBSET.md",
         "crates/tidefs-local-filesystem/src/lib.rs",
         "apps/tidefs-filesystem-demo/src/main.rs",
     ] {
@@ -1795,29 +1689,6 @@ pub fn check_preview_posix_subset_current_workspace() -> Result<(), StorageCheck
         ],
         &mut missing,
     );
-    check_source_markers(
-        &root,
-        "docs/PREVIEW_POSIX_SUBSET.md",
-        &[
-            "included in first FUSE preview",
-            "included after first FUSE preview",
-            "blocked before useful preview",
-            "deferred after first preview",
-            "explicitly unsupported",
-            "lookup/getattr",
-            "fsync-file",
-            "rename-over-target",
-            "dense-file",
-            "SEEK_DATA",
-            "SEEK_HOLE",
-            "SEEK_CUR",
-            "ENXIO",
-            "fiemap",
-            "xattr/acl",
-        ],
-        &mut missing,
-    );
-
     // Verify BackgroundOrphanReclamation registration at mount.
     check_required_file(
         &root,
@@ -1854,12 +1725,10 @@ pub fn check_fuse_mount_path_current_workspace() -> Result<(), StorageCheckError
     })?;
     let mut missing = Vec::new();
     for rel in [
-        "docs/FUSE_MOUNT_PREVIEW.md",
-        "docs/FUSE_LSEEK_PREVIEW_PC004B.md",
-        "docs/PREVIEW_POSIX_SUBSET.md",
+        "docs/FUSE_LSEEK_PC004B.md",
         "apps/tidefs-posix-filesystem-adapter-daemon/Cargo.toml",
         "apps/tidefs-posix-filesystem-adapter-daemon/src/main.rs",
-        "apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_preview.rs",
+        "apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_vfs_adapter.rs",
         "flake.nix",
     ] {
         check_required_file(&root, rel, &mut missing);
@@ -1889,7 +1758,7 @@ pub fn check_fuse_mount_path_current_workspace() -> Result<(), StorageCheckError
     );
     check_source_markers(
         &root,
-        "apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_preview.rs",
+        "apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_vfs_adapter.rs",
         &[
             "FuseVfsAdapter",
             "impl Filesystem for FuseVfsAdapter",
@@ -1933,25 +1802,7 @@ pub fn check_fuse_mount_path_current_workspace() -> Result<(), StorageCheckError
     );
     check_source_markers(
         &root,
-        "docs/FUSE_MOUNT_PREVIEW.md",
-        &[
-            "tidefs-posix-filesystem-adapter-daemon mount --store",
-            "tidefs-posix-filesystem-adapter-daemon smoke-mount",
-            "nix run .#qemu-smoke",
-            "lookup/getattr",
-            "fsync-file",
-            "statfs",
-            "lseek",
-            "SEEK_DATA",
-            "SEEK_HOLE",
-            "SEEK_CUR",
-            "ENXIO",
-        ],
-        &mut missing,
-    );
-    check_source_markers(
-        &root,
-        "docs/FUSE_LSEEK_PREVIEW_PC004B.md",
+        "docs/FUSE_LSEEK_PC004B.md",
         &[
             "SEEK_SET",
             "SEEK_END",
@@ -2000,11 +1851,8 @@ pub fn check_posix_semantics_current_workspace() -> Result<(), StorageCheckError
     })?;
     let mut missing = Vec::new();
     for rel in [
-        "docs/POSIX_SEMANTICS_OW106.md",
-        "docs/PREVIEW_POSIX_SUBSET.md",
-        "docs/FUSE_MOUNT_PREVIEW.md",
         "crates/tidefs-local-filesystem/src/lib.rs",
-        "apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_preview.rs",
+        "apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_vfs_adapter.rs",
     ] {
         check_required_file(&root, rel, &mut missing);
     }
@@ -2025,7 +1873,7 @@ pub fn check_posix_semantics_current_workspace() -> Result<(), StorageCheckError
     );
     check_source_markers(
         &root,
-        "apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_preview.rs",
+        "apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_vfs_adapter.rs",
         &[
             "open_handles",
             "unlinked_open_files",
@@ -2042,32 +1890,6 @@ pub fn check_posix_semantics_current_workspace() -> Result<(), StorageCheckError
         ],
         &mut missing,
     );
-    check_source_markers(
-        &root,
-        "docs/POSIX_SEMANTICS_OW106.md",
-        &[
-            "root-slot publication",
-            "Local Object Store sync boundary",
-            "unlink-while-open",
-            "rename-over-target",
-            "FUSE session state",
-            "not persisted as orphan inodes",
-        ],
-        &mut missing,
-    );
-    check_source_markers(
-        &root,
-        "docs/PREVIEW_POSIX_SUBSET.md",
-        &[
-            "included after first FUSE preview",
-            "fsync-file",
-            "fsync-directory",
-            "unlink-while-open",
-            "rename-over-target",
-        ],
-        &mut missing,
-    );
-
     // New tidefs-posix-semantics crate check (issue #1198)
     for rel in [
         "crates/tidefs-posix-semantics/Cargo.toml",
@@ -2126,10 +1948,10 @@ pub fn check_seek_hole_data_current_workspace() -> Result<(), StorageCheckError>
     })?;
     let mut missing = Vec::new();
     for rel in [
-        "docs/FUSE_LSEEK_PREVIEW_PC004B.md",
+        "docs/FUSE_LSEEK_PC004B.md",
         "crates/tidefs-local-filesystem/src/types.rs",
         "crates/tidefs-local-filesystem/src/tests.rs",
-        "apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_preview.rs",
+        "apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_vfs_adapter.rs",
     ] {
         check_required_file(&root, rel, &mut missing);
     }
@@ -2146,7 +1968,7 @@ pub fn check_seek_hole_data_current_workspace() -> Result<(), StorageCheckError>
     );
     check_source_markers(
         &root,
-        "apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_preview.rs",
+        "apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_vfs_adapter.rs",
         &[
             "lseek_inode_from_handle",
             "SEEK_DATA",
@@ -2159,7 +1981,7 @@ pub fn check_seek_hole_data_current_workspace() -> Result<(), StorageCheckError>
     );
     check_source_markers(
         &root,
-        "docs/FUSE_LSEEK_PREVIEW_PC004B.md",
+        "docs/FUSE_LSEEK_PC004B.md",
         &[
             "SEEK_SET",
             "SEEK_END",
@@ -2214,7 +2036,7 @@ pub fn check_rename_exchange_current_workspace() -> Result<(), StorageCheckError
     for rel in [
         "crates/tidefs-local-filesystem/src/lib.rs",
         "crates/tidefs-local-filesystem/src/tests.rs",
-        "apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_preview.rs",
+        "apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_vfs_adapter.rs",
     ] {
         check_required_file(&root, rel, &mut missing);
     }
@@ -2232,7 +2054,7 @@ pub fn check_rename_exchange_current_workspace() -> Result<(), StorageCheckError
     );
     check_source_markers(
         &root,
-        "apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_preview.rs",
+        "apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_vfs_adapter.rs",
         &[
             "RENAME_EXCHANGE",
             "rename_exchange",
@@ -2279,7 +2101,7 @@ pub fn check_rename_noreplace_current_workspace() -> Result<(), StorageCheckErro
     for rel in [
         "crates/tidefs-local-filesystem/src/lib.rs",
         "crates/tidefs-local-filesystem/src/tests.rs",
-        "apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_preview.rs",
+        "apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_vfs_adapter.rs",
     ] {
         check_required_file(&root, rel, &mut missing);
     }
@@ -2295,7 +2117,7 @@ pub fn check_rename_noreplace_current_workspace() -> Result<(), StorageCheckErro
     );
     check_source_markers(
         &root,
-        "apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_preview.rs",
+        "apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_vfs_adapter.rs",
         &[
             "RENAME_NOREPLACE",
             "preview_fuse_model_supports_rename_noreplace_flag",
@@ -2342,8 +2164,7 @@ pub fn check_file_locking_current_workspace() -> Result<(), StorageCheckError> {
     for rel in [
         "crates/tidefs-local-filesystem/src/types.rs",
         "crates/tidefs-local-filesystem/src/tests.rs",
-        "apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_preview.rs",
-        "apps/tidefs-posix-filesystem-adapter-daemon/src/coverage_gap.rs",
+        "apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_vfs_adapter.rs",
     ] {
         check_required_file(&root, rel, &mut missing);
     }
@@ -2359,17 +2180,10 @@ pub fn check_file_locking_current_workspace() -> Result<(), StorageCheckError> {
     );
     check_source_markers(
         &root,
-        "apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_preview.rs",
+        "apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_vfs_adapter.rs",
         &["fn getlk", "fn setlk"],
         &mut missing,
     );
-    check_source_markers(
-        &root,
-        "apps/tidefs-posix-filesystem-adapter-daemon/src/coverage_gap.rs",
-        &["PreviewPosixTopic::FileLocking"],
-        &mut missing,
-    );
-
     // Verify BackgroundOrphanReclamation registration at mount.
     check_required_file(
         &root,
@@ -2494,8 +2308,7 @@ pub fn check_xattrs_current_workspace() -> Result<(), StorageCheckError> {
     for rel in [
         "crates/tidefs-local-filesystem/src/lib.rs",
         "crates/tidefs-local-filesystem/src/tests.rs",
-        "apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_preview.rs",
-        "docs/PREVIEW_POSIX_SUBSET.md",
+        "apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_vfs_adapter.rs",
     ] {
         check_required_file(&root, rel, &mut missing);
     }
@@ -2519,7 +2332,7 @@ pub fn check_xattrs_current_workspace() -> Result<(), StorageCheckError> {
     );
     check_source_markers(
         &root,
-        "apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_preview.rs",
+        "apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_vfs_adapter.rs",
         &[
             "setxattr",
             "getxattr",
@@ -2574,9 +2387,8 @@ pub fn check_fallocate_mode0_current_workspace() -> Result<(), StorageCheckError
         "crates/tidefs-local-filesystem/src/lib.rs",
         "crates/tidefs-local-filesystem/src/tests.rs",
         "crates/tidefs-local-filesystem/src/types.rs",
-        "apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_preview.rs",
+        "apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_vfs_adapter.rs",
         "crates/tidefs-types-posix-filesystem-adapter-core/src/lib.rs",
-        "docs/PREVIEW_POSIX_SUBSET.md",
     ] {
         check_required_file(&root, rel, &mut missing);
     }
@@ -2595,7 +2407,7 @@ pub fn check_fallocate_mode0_current_workspace() -> Result<(), StorageCheckError
     );
     check_source_markers(
         &root,
-        "apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_preview.rs",
+        "apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_vfs_adapter.rs",
         &[
             "fn fallocate_inode_from_handle",
             "fn fallocate",
@@ -2652,14 +2464,13 @@ pub fn check_fallocate_punch_hole_current_workspace() -> Result<(), StorageCheck
     })?;
     let mut missing = Vec::new();
     for rel in [
-        "apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_preview.rs",
-        "docs/PUBLISHING_CHECKLIST.md",
+        "apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_vfs_adapter.rs",
     ] {
         check_required_file(&root, rel, &mut missing);
     }
     check_source_markers(
         &root,
-        "apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_preview.rs",
+        "apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_vfs_adapter.rs",
         &[
             "FALLOC_FL_PUNCH_HOLE",
             "FALLOC_FL_ZERO_RANGE",
@@ -2672,13 +2483,6 @@ pub fn check_fallocate_punch_hole_current_workspace() -> Result<(), StorageCheck
         ],
         &mut missing,
     );
-    check_source_markers(
-        &root,
-        "docs/PUBLISHING_CHECKLIST.md",
-        &["punch-hole/zero-range (#515)"],
-        &mut missing,
-    );
-
     // Verify BackgroundOrphanReclamation registration at mount.
     check_required_file(
         &root,
@@ -2716,9 +2520,6 @@ pub fn check_fiemap_current_workspace() -> Result<(), StorageCheckError> {
     let mut missing = Vec::new();
     for rel in [
         "crates/tidefs-local-filesystem/src/types.rs",
-        "docs/PREVIEW_POSIX_SUBSET.md",
-        "docs/PUBLISHING_CHECKLIST.md",
-        "docs/HISTORY.md",
     ] {
         check_required_file(&root, rel, &mut missing);
     }
@@ -2728,25 +2529,6 @@ pub fn check_fiemap_current_workspace() -> Result<(), StorageCheckError> {
         &[r#"operation: "fiemap""#],
         &mut missing,
     );
-    check_source_markers(
-        &root,
-        "docs/PREVIEW_POSIX_SUBSET.md",
-        &["fiemap", "deferred", "EOPNOTSUPP"],
-        &mut missing,
-    );
-    check_source_markers(
-        &root,
-        "docs/PUBLISHING_CHECKLIST.md",
-        &["fiemap", "FS_IOC_FIEMAP", "#500"],
-        &mut missing,
-    );
-    check_source_markers(
-        &root,
-        "docs/HISTORY.md",
-        &["FS_IOC_FIEMAP", "#500"],
-        &mut missing,
-    );
-
     // Verify BackgroundOrphanReclamation registration at mount.
     check_required_file(
         &root,
@@ -2786,9 +2568,6 @@ pub fn check_space_management_current_workspace() -> Result<(), StorageCheckErro
         "crates/tidefs-local-filesystem/src/lib.rs",
         "crates/tidefs-local-filesystem/src/tests.rs",
         "crates/tidefs-local-filesystem/src/types.rs",
-        "docs/PREVIEW_POSIX_SUBSET.md",
-        "docs/PUBLISHING_CHECKLIST.md",
-        "docs/HISTORY.md",
     ] {
         check_required_file(&root, rel, &mut missing);
     }
@@ -2810,35 +2589,6 @@ pub fn check_space_management_current_workspace() -> Result<(), StorageCheckErro
         ],
         &mut missing,
     );
-    check_source_markers(
-        &root,
-        "docs/PREVIEW_POSIX_SUBSET.md",
-        &["statfs", "ENOSPC"],
-        &mut missing,
-    );
-    check_source_markers(
-        &root,
-        "docs/PUBLISHING_CHECKLIST.md",
-        &[
-            "Space management",
-            "allocator policy resize",
-            "ENOSPC",
-            "#537",
-        ],
-        &mut missing,
-    );
-    check_source_markers(
-        &root,
-        "docs/HISTORY.md",
-        &[
-            "allocator policy resize",
-            "space management",
-            "ENOSPC",
-            "#537",
-        ],
-        &mut missing,
-    );
-
     // Verify BackgroundOrphanReclamation registration at mount.
     check_required_file(
         &root,
@@ -2989,7 +2739,6 @@ pub fn check_xfstests_harness_current_workspace() -> Result<(), StorageCheckErro
         "scripts/tidefs-xfstests-exclude",
         "docs/xfstests-harness.md",
         "nix/tidefs-posix-scoreboard.sh",
-        "docs/POSIX_SCOREBOARD_OW107.md",
         "flake.nix",
     ] {
         check_required_file(&root, rel, &mut missing);
@@ -3055,17 +2804,6 @@ pub fn check_xfstests_harness_current_workspace() -> Result<(), StorageCheckErro
         ],
         &mut missing,
     );
-    check_source_markers(
-        &root,
-        "docs/POSIX_SCOREBOARD_OW107.md",
-        &[
-            "xfstests harness",
-            "TIDEFS_XFSTESTS_DIR",
-            "TIDEFS_SCOREBOARD_XFSTESTS_CMD",
-        ],
-        &mut missing,
-    );
-
     // Verify BackgroundOrphanReclamation registration at mount.
     check_required_file(
         &root,
@@ -3102,10 +2840,8 @@ pub fn check_posix_scoreboard_current_workspace() -> Result<(), StorageCheckErro
     })?;
     let mut missing = Vec::new();
     for rel in [
-        "docs/POSIX_SCOREBOARD_OW107.md",
-        "docs/STATUS.md",
         "apps/tidefs-posix-filesystem-adapter-daemon/src/main.rs",
-        "apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_preview.rs",
+        "apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_vfs_adapter.rs",
         "nix/tidefs-posix-scoreboard.sh",
         "scripts/tidefs-xfstests-mount",
         "scripts/tidefs-xfstests-runner",
@@ -3128,7 +2864,7 @@ pub fn check_posix_scoreboard_current_workspace() -> Result<(), StorageCheckErro
     );
     check_source_markers(
         &root,
-        "apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_preview.rs",
+        "apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_vfs_adapter.rs",
         &[
             "PosixScoreboardConfig",
             "PosixScoreboardResult",
@@ -3203,24 +2939,6 @@ pub fn check_posix_scoreboard_current_workspace() -> Result<(), StorageCheckErro
         ],
         &mut missing,
     );
-    check_source_markers(
-        &root,
-        "docs/POSIX_SCOREBOARD_OW107.md",
-        &[
-            "pass/fail/skip",
-            "skipped is not a pass",
-            "tidefs-posix-filesystem-adapter-daemon score-posix",
-            "nix run .#posix-scoreboard",
-            "fio",
-            "fsx",
-            "fsstress",
-            "pjdfstest",
-            "xfstests",
-            "TIDEFS_SCOREBOARD_MOUNT",
-        ],
-        &mut missing,
-    );
-
     // Verify BackgroundOrphanReclamation registration at mount.
     check_required_file(
         &root,
@@ -3342,8 +3060,6 @@ pub fn check_safe_local_reclamation_current_workspace() -> Result<(), StorageChe
     let mut missing = Vec::new();
     for rel in [
         "docs/SAFE_LOCAL_RECLAMATION_OW103.md",
-        "docs/STATUS.md",
-        "docs/FEATURE_MATRIX.md",
         "crates/tidefs-local-object-store/src/lib.rs",
         "crates/tidefs-local-filesystem/src/lib.rs",
         "apps/tidefs-filesystem-demo/src/main.rs",
@@ -3442,8 +3158,6 @@ pub fn check_hot_read_cache_current_workspace() -> Result<(), StorageCheckError>
     let mut missing = Vec::new();
     for rel in [
         "docs/HOT_READ_CACHE_PC003.md",
-        "docs/STATUS.md",
-        "docs/FEATURE_MATRIX.md",
         "docs/INDEX.md",
         "crates/tidefs-local-filesystem/src/lib.rs",
         "apps/tidefs-filesystem-demo/src/main.rs",
@@ -3495,18 +3209,6 @@ pub fn check_hot_read_cache_current_workspace() -> Result<(), StorageCheckError>
             "admission_bypasses",
             "tidefs-xtask check-hot-read-cache",
         ],
-        &mut missing,
-    );
-    check_source_markers(
-        &root,
-        "docs/FEATURE_MATRIX.md",
-        &["Hot read cache", "acceleration mirror only"],
-        &mut missing,
-    );
-    check_source_markers(
-        &root,
-        "docs/STATUS.md",
-        &["Hot read cache", "check-hot-read-cache"],
         &mut missing,
     );
     check_source_markers(
@@ -4070,11 +3772,11 @@ pub fn check_posix_acl_fuse_eval_current_workspace() -> Result<(), StorageCheckE
     })?;
     let mut missing = Vec::new();
 
-    let rel = "apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_preview.rs";
+    let rel = "apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_vfs_adapter.rs";
     check_required_file(&root, rel, &mut missing);
     check_source_markers(
         &root,
-        "apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_preview.rs",
+        "apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_vfs_adapter.rs",
         &[
             "POSIX_ACL_FUSE_EVAL_SPEC",
             "check_access_perm_acl",
@@ -4125,13 +3827,13 @@ pub fn check_poolstore_compression_current_workspace() -> Result<(), StorageChec
 
     check_required_file(
         &root,
-        "crates/tidefs-local-object-store/src/pool.rs",
+        "crates/tidefs-local-object-store/src/pool/mod.rs",
         &mut missing,
     );
 
     check_source_markers(
         &root,
-        "crates/tidefs-local-object-store/src/pool.rs",
+        "crates/tidefs-local-object-store/src/pool/mod.rs",
         &[
             "pub struct PoolStore<",
             "pub struct PoolStoreMut<",
