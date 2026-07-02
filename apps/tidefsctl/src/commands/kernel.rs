@@ -19,6 +19,13 @@ const DEVICE_PROBE_SOURCE: &str = StatusSource::CachedLocalMetadata.label();
 const PASSIVE_BOUNDARY_SOURCE: &str = StatusSource::UnsupportedOrOffline.label();
 const RUNTIME_INVENTORY: &str = "static-source-inventory";
 const RUNTIME_INVENTORY_SOURCE: &str = StatusSource::StaticConfiguration.label();
+const CONTROL_CONTRACT_SOURCE: &str = StatusSource::StaticConfiguration.label();
+const PRODUCTION_CONTROL_CONTRACT: &str = "minimum-production-control-uapi-required-not-wired";
+const CONTROL_ENDPOINT_IDENTITY: &str = "declared-character-device";
+const CONTROL_UAPI_VERSIONING: &str = "versioned-handshake-required";
+const REQUIRED_READONLY_STATUS_CALLS: &[&str] = &["version", "status", "capabilities"];
+const ABI_COMPATIBILITY_BOUNDARY: &str = "pre-alpha-no-production-abi-freeze";
+const OWNER_AUTHORITY_PROOF: &str = "kernel-uapi-owner-proof-required-not-wired";
 
 #[derive(Subcommand, Debug)]
 pub enum KernelCommand {
@@ -59,8 +66,10 @@ struct KernelControlStatus {
     device_state: DeviceState,
     runtime_inventory: &'static str,
     control_endpoint_opened: bool,
+    readonly_status_calls_issued: bool,
     production_uapi_wired: bool,
     mutating_ioctls_issued: bool,
+    mutating_operation_admission: MutatingOperationAdmission,
     owner_manifest_authority: bool,
     tidefs_owned_kthreads: RuntimeSurfaceState,
     tidefs_owned_workqueues: RuntimeSurfaceState,
@@ -68,13 +77,19 @@ struct KernelControlStatus {
 
 impl KernelControlStatus {
     fn probe(control_device: &Path) -> Self {
+        let device_state = DeviceState::probe(control_device);
+        let mutating_operation_admission =
+            MutatingOperationAdmission::from_device_state(&device_state);
+
         Self {
             control_device: control_device.to_path_buf(),
-            device_state: DeviceState::probe(control_device),
+            device_state,
             runtime_inventory: RUNTIME_INVENTORY,
             control_endpoint_opened: false,
+            readonly_status_calls_issued: false,
             production_uapi_wired: false,
             mutating_ioctls_issued: false,
+            mutating_operation_admission,
             owner_manifest_authority: false,
             tidefs_owned_kthreads: RuntimeSurfaceState::NotWired,
             tidefs_owned_workqueues: RuntimeSurfaceState::NotWired,
@@ -92,10 +107,20 @@ impl KernelControlStatus {
             "device_kind_source": DEVICE_PROBE_SOURCE,
             "runtime_inventory": self.runtime_inventory,
             "runtime_inventory_source": RUNTIME_INVENTORY_SOURCE,
+            "production_control_contract": PRODUCTION_CONTROL_CONTRACT,
+            "production_control_contract_source": CONTROL_CONTRACT_SOURCE,
+            "control_endpoint_identity": CONTROL_ENDPOINT_IDENTITY,
+            "control_endpoint_identity_source": CONTROL_CONTRACT_SOURCE,
+            "control_uapi_versioning": CONTROL_UAPI_VERSIONING,
+            "control_uapi_versioning_source": CONTROL_CONTRACT_SOURCE,
+            "required_readonly_status_calls": REQUIRED_READONLY_STATUS_CALLS,
+            "required_readonly_status_calls_source": CONTROL_CONTRACT_SOURCE,
             "status_is_passive": self.status_is_passive(),
             "status_is_passive_source": PASSIVE_BOUNDARY_SOURCE,
             "control_endpoint_opened": self.control_endpoint_opened,
             "control_endpoint_opened_source": PASSIVE_BOUNDARY_SOURCE,
+            "readonly_status_calls_issued": self.readonly_status_calls_issued,
+            "readonly_status_calls_issued_source": PASSIVE_BOUNDARY_SOURCE,
             "control_device_present": self.control_device_present(),
             "control_device_present_source": DEVICE_PROBE_SOURCE,
             "control_device_character": self.control_device_character(),
@@ -106,8 +131,14 @@ impl KernelControlStatus {
             "control_uapi_usable_source": PASSIVE_BOUNDARY_SOURCE,
             "mutating_ioctls_issued": self.mutating_ioctls_issued,
             "mutating_ioctls_issued_source": PASSIVE_BOUNDARY_SOURCE,
+            "mutating_operation_admission": self.mutating_operation_admission.label(),
+            "mutating_operation_admission_source": self.mutating_operation_admission.source_label(),
+            "abi_compatibility_boundary": ABI_COMPATIBILITY_BOUNDARY,
+            "abi_compatibility_boundary_source": CONTROL_CONTRACT_SOURCE,
             "owner_manifest_authority": self.owner_manifest_authority,
             "owner_manifest_authority_source": PASSIVE_BOUNDARY_SOURCE,
+            "owner_authority_proof": OWNER_AUTHORITY_PROOF,
+            "owner_authority_proof_source": PASSIVE_BOUNDARY_SOURCE,
             "tidefs_owned_kthreads": self.tidefs_owned_kthreads.label(),
             "tidefs_owned_kthreads_source": self.tidefs_owned_kthreads.source_label(),
             "tidefs_owned_kthreads_wired": self.tidefs_owned_kthreads.is_wired(),
@@ -121,6 +152,7 @@ impl KernelControlStatus {
 
     fn status_is_passive(&self) -> bool {
         !self.control_endpoint_opened
+            && !self.readonly_status_calls_issued
             && !self.mutating_ioctls_issued
             && !self.owner_manifest_authority
     }
@@ -140,15 +172,44 @@ impl KernelControlStatus {
     fn message(&self) -> &'static str {
         match self.device_state {
             DeviceState::Missing => {
-                "declared TideFS kernel control device is absent; production kernel UAPI is not wired"
+                "declared TideFS kernel control device is absent; production kernel UAPI is not wired and all control operations are refused"
             }
             DeviceState::CharacterDevice => {
-                "declared TideFS kernel control device is present, but production UAPI wiring is not implemented"
+                "declared TideFS kernel control device is present, but production UAPI wiring is not implemented and all control operations are refused"
             }
             DeviceState::WrongType(_) => {
-                "declared TideFS kernel control path exists but is not a character device"
+                "declared TideFS kernel control path exists but is not a character device; all control operations are refused"
             }
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MutatingOperationAdmission {
+    RefusedMissingControlDevice,
+    RefusedWrongTypeControlPath,
+    RefusedProductionUapiUnwired,
+}
+
+impl MutatingOperationAdmission {
+    fn from_device_state(device_state: &DeviceState) -> Self {
+        match device_state {
+            DeviceState::Missing => Self::RefusedMissingControlDevice,
+            DeviceState::CharacterDevice => Self::RefusedProductionUapiUnwired,
+            DeviceState::WrongType(_) => Self::RefusedWrongTypeControlPath,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::RefusedMissingControlDevice => "refused-control-device-missing",
+            Self::RefusedWrongTypeControlPath => "refused-control-path-wrong-type",
+            Self::RefusedProductionUapiUnwired => "refused-production-uapi-unwired",
+        }
+    }
+
+    fn source_label(self) -> &'static str {
+        PASSIVE_BOUNDARY_SOURCE
     }
 }
 
@@ -273,6 +334,17 @@ fn plain_lines(report: &KernelControlStatus) -> Vec<String> {
         format!("device_kind_source: {DEVICE_PROBE_SOURCE}"),
         format!("runtime_inventory: {}", report.runtime_inventory),
         format!("runtime_inventory_source: {RUNTIME_INVENTORY_SOURCE}"),
+        format!("production_control_contract: {PRODUCTION_CONTROL_CONTRACT}"),
+        format!("production_control_contract_source: {CONTROL_CONTRACT_SOURCE}"),
+        format!("control_endpoint_identity: {CONTROL_ENDPOINT_IDENTITY}"),
+        format!("control_endpoint_identity_source: {CONTROL_CONTRACT_SOURCE}"),
+        format!("control_uapi_versioning: {CONTROL_UAPI_VERSIONING}"),
+        format!("control_uapi_versioning_source: {CONTROL_CONTRACT_SOURCE}"),
+        format!(
+            "required_readonly_status_calls: {}",
+            REQUIRED_READONLY_STATUS_CALLS.join(",")
+        ),
+        format!("required_readonly_status_calls_source: {CONTROL_CONTRACT_SOURCE}"),
         format!("status_is_passive: {}", report.status_is_passive()),
         format!("status_is_passive_source: {PASSIVE_BOUNDARY_SOURCE}"),
         format!(
@@ -280,6 +352,11 @@ fn plain_lines(report: &KernelControlStatus) -> Vec<String> {
             report.control_endpoint_opened
         ),
         format!("control_endpoint_opened_source: {PASSIVE_BOUNDARY_SOURCE}"),
+        format!(
+            "readonly_status_calls_issued: {}",
+            report.readonly_status_calls_issued
+        ),
+        format!("readonly_status_calls_issued_source: {PASSIVE_BOUNDARY_SOURCE}"),
         format!(
             "control_device_present: {}",
             report.control_device_present()
@@ -297,10 +374,22 @@ fn plain_lines(report: &KernelControlStatus) -> Vec<String> {
         format!("mutating_ioctls_issued: {}", report.mutating_ioctls_issued),
         format!("mutating_ioctls_issued_source: {PASSIVE_BOUNDARY_SOURCE}"),
         format!(
+            "mutating_operation_admission: {}",
+            report.mutating_operation_admission.label()
+        ),
+        format!(
+            "mutating_operation_admission_source: {}",
+            report.mutating_operation_admission.source_label()
+        ),
+        format!("abi_compatibility_boundary: {ABI_COMPATIBILITY_BOUNDARY}"),
+        format!("abi_compatibility_boundary_source: {CONTROL_CONTRACT_SOURCE}"),
+        format!(
             "owner_manifest_authority: {}",
             report.owner_manifest_authority
         ),
         format!("owner_manifest_authority_source: {PASSIVE_BOUNDARY_SOURCE}"),
+        format!("owner_authority_proof: {OWNER_AUTHORITY_PROOF}"),
+        format!("owner_authority_proof_source: {PASSIVE_BOUNDARY_SOURCE}"),
         format!(
             "tidefs_owned_kthreads: {}",
             report.tidefs_owned_kthreads.label()
@@ -344,8 +433,13 @@ mod tests {
         assert_eq!(report.runtime_inventory, RUNTIME_INVENTORY);
         assert!(report.status_is_passive());
         assert!(!report.control_endpoint_opened);
+        assert!(!report.readonly_status_calls_issued);
         assert!(!report.production_uapi_wired);
         assert!(!report.mutating_ioctls_issued);
+        assert_eq!(
+            report.mutating_operation_admission,
+            MutatingOperationAdmission::RefusedMissingControlDevice
+        );
         assert!(!report.owner_manifest_authority);
         assert_eq!(report.tidefs_owned_kthreads, RuntimeSurfaceState::NotWired);
         assert_eq!(
@@ -382,11 +476,17 @@ mod tests {
         assert_eq!(json["device_kind_source"], DEVICE_PROBE_SOURCE);
         assert_eq!(json["runtime_inventory"], RUNTIME_INVENTORY);
         assert_eq!(json["runtime_inventory_source"], RUNTIME_INVENTORY_SOURCE);
+        assert_production_contract_json(&json);
         assert_eq!(json["status_is_passive"], true);
         assert_eq!(json["status_is_passive_source"], PASSIVE_BOUNDARY_SOURCE);
         assert_eq!(json["control_endpoint_opened"], false);
         assert_eq!(
             json["control_endpoint_opened_source"],
+            PASSIVE_BOUNDARY_SOURCE
+        );
+        assert_eq!(json["readonly_status_calls_issued"], false);
+        assert_eq!(
+            json["readonly_status_calls_issued_source"],
             PASSIVE_BOUNDARY_SOURCE
         );
         assert_eq!(json["control_device_present"], false);
@@ -405,9 +505,27 @@ mod tests {
             json["mutating_ioctls_issued_source"],
             PASSIVE_BOUNDARY_SOURCE
         );
+        assert_eq!(
+            json["mutating_operation_admission"],
+            "refused-control-device-missing"
+        );
+        assert_eq!(
+            json["mutating_operation_admission_source"],
+            PASSIVE_BOUNDARY_SOURCE
+        );
+        assert_eq!(json["abi_compatibility_boundary"], ABI_COMPATIBILITY_BOUNDARY);
+        assert_eq!(
+            json["abi_compatibility_boundary_source"],
+            CONTROL_CONTRACT_SOURCE
+        );
         assert_eq!(json["owner_manifest_authority"], false);
         assert_eq!(
             json["owner_manifest_authority_source"],
+            PASSIVE_BOUNDARY_SOURCE
+        );
+        assert_eq!(json["owner_authority_proof"], OWNER_AUTHORITY_PROOF);
+        assert_eq!(
+            json["owner_authority_proof_source"],
             PASSIVE_BOUNDARY_SOURCE
         );
         assert_eq!(json["tidefs_owned_kthreads"], "not-wired");
@@ -442,6 +560,11 @@ mod tests {
         assert!(!report.control_device_character());
         assert!(!report.control_uapi_usable());
         assert!(report.status_is_passive());
+        assert!(!report.readonly_status_calls_issued);
+        assert_eq!(
+            report.mutating_operation_admission,
+            MutatingOperationAdmission::RefusedWrongTypeControlPath
+        );
         assert!(!report.tidefs_owned_kthreads.is_wired());
         assert!(!report.tidefs_owned_workqueues.is_wired());
 
@@ -453,6 +576,10 @@ mod tests {
         assert_eq!(json["control_device_present"], true);
         assert_eq!(json["control_device_character"], false);
         assert_eq!(json["control_uapi_usable"], false);
+        assert_eq!(
+            json["mutating_operation_admission"],
+            "refused-control-path-wrong-type"
+        );
     }
 
     #[test]
@@ -472,6 +599,11 @@ mod tests {
         assert!(!report.control_uapi_usable());
         assert!(report.status_is_passive());
         assert!(!report.control_endpoint_opened);
+        assert!(!report.readonly_status_calls_issued);
+        assert_eq!(
+            report.mutating_operation_admission,
+            MutatingOperationAdmission::RefusedProductionUapiUnwired
+        );
         assert!(!report.tidefs_owned_kthreads.is_wired());
         assert!(!report.tidefs_owned_workqueues.is_wired());
 
@@ -483,6 +615,10 @@ mod tests {
         assert_eq!(json["control_device_present"], true);
         assert_eq!(json["control_device_character"], true);
         assert_eq!(json["control_uapi_usable"], false);
+        assert_eq!(
+            json["mutating_operation_admission"],
+            "refused-production-uapi-unwired"
+        );
     }
 
     #[test]
@@ -507,6 +643,21 @@ mod tests {
             "runtime_inventory_source: {RUNTIME_INVENTORY_SOURCE}"
         )));
         assert!(lines.contains(&format!(
+            "production_control_contract_source: {CONTROL_CONTRACT_SOURCE}"
+        )));
+        assert!(lines.contains(&format!(
+            "required_readonly_status_calls_source: {CONTROL_CONTRACT_SOURCE}"
+        )));
+        assert!(lines.contains(&format!(
+            "readonly_status_calls_issued_source: {PASSIVE_BOUNDARY_SOURCE}"
+        )));
+        assert!(lines.contains(&format!(
+            "mutating_operation_admission_source: {PASSIVE_BOUNDARY_SOURCE}"
+        )));
+        assert!(lines.contains(&format!(
+            "owner_authority_proof_source: {PASSIVE_BOUNDARY_SOURCE}"
+        )));
+        assert!(lines.contains(&format!(
             "tidefs_owned_kthreads_source: {PASSIVE_BOUNDARY_SOURCE}"
         )));
         assert!(lines.contains(&format!(
@@ -524,6 +675,7 @@ mod tests {
         assert_eq!(json["device_kind_source"], DEVICE_PROBE_SOURCE);
         assert_eq!(json["runtime_inventory"], RUNTIME_INVENTORY);
         assert_eq!(json["runtime_inventory_source"], RUNTIME_INVENTORY_SOURCE);
+        assert_production_contract_json(json);
         assert_eq!(json["control_device_present_source"], DEVICE_PROBE_SOURCE);
         assert_eq!(json["control_device_character_source"], DEVICE_PROBE_SOURCE);
         assert_eq!(
@@ -544,6 +696,11 @@ mod tests {
             json["control_endpoint_opened_source"],
             PASSIVE_BOUNDARY_SOURCE
         );
+        assert_eq!(json["readonly_status_calls_issued"], false);
+        assert_eq!(
+            json["readonly_status_calls_issued_source"],
+            PASSIVE_BOUNDARY_SOURCE
+        );
         assert_eq!(json["production_uapi_wired"], false);
         assert_eq!(
             json["production_uapi_wired_source"],
@@ -556,14 +713,57 @@ mod tests {
             json["mutating_ioctls_issued_source"],
             PASSIVE_BOUNDARY_SOURCE
         );
+        assert_eq!(
+            json["mutating_operation_admission_source"],
+            PASSIVE_BOUNDARY_SOURCE
+        );
+        assert_eq!(json["abi_compatibility_boundary"], ABI_COMPATIBILITY_BOUNDARY);
+        assert_eq!(
+            json["abi_compatibility_boundary_source"],
+            CONTROL_CONTRACT_SOURCE
+        );
         assert_eq!(json["owner_manifest_authority"], false);
         assert_eq!(
             json["owner_manifest_authority_source"],
+            PASSIVE_BOUNDARY_SOURCE
+        );
+        assert_eq!(json["owner_authority_proof"], OWNER_AUTHORITY_PROOF);
+        assert_eq!(
+            json["owner_authority_proof_source"],
             PASSIVE_BOUNDARY_SOURCE
         );
         assert_eq!(json["tidefs_owned_kthreads"], "not-wired");
         assert_eq!(json["tidefs_owned_kthreads_wired"], false);
         assert_eq!(json["tidefs_owned_workqueues"], "not-wired");
         assert_eq!(json["tidefs_owned_workqueues_wired"], false);
+    }
+
+    fn assert_production_contract_json(json: &serde_json::Value) {
+        assert_eq!(
+            json["production_control_contract"],
+            PRODUCTION_CONTROL_CONTRACT
+        );
+        assert_eq!(
+            json["production_control_contract_source"],
+            CONTROL_CONTRACT_SOURCE
+        );
+        assert_eq!(json["control_endpoint_identity"], CONTROL_ENDPOINT_IDENTITY);
+        assert_eq!(
+            json["control_endpoint_identity_source"],
+            CONTROL_CONTRACT_SOURCE
+        );
+        assert_eq!(json["control_uapi_versioning"], CONTROL_UAPI_VERSIONING);
+        assert_eq!(
+            json["control_uapi_versioning_source"],
+            CONTROL_CONTRACT_SOURCE
+        );
+        assert_eq!(
+            json["required_readonly_status_calls"],
+            serde_json::json!(REQUIRED_READONLY_STATUS_CALLS)
+        );
+        assert_eq!(
+            json["required_readonly_status_calls_source"],
+            CONTROL_CONTRACT_SOURCE
+        );
     }
 }

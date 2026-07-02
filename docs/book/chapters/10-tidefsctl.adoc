@@ -318,8 +318,12 @@ It reports whether the path is missing, present as a character device, or
 present with the wrong file type. It also reports that the current kernel
 source does not wire TideFS-owned kthreads or runtime workqueues as product
 surfaces. It always reports that production kernel UAPI wiring is not
-implemented until a later kernel-control issue wires a real client. It must not
-open `/dev/tidefs-control`, issue control ioctls, or treat
+implemented until a later kernel-control issue wires a real client. The passive
+report names the minimum future control contract: the declared TideFS control
+character-device identity, a versioned readonly handshake, version, status, and
+capabilities status calls, mutating-operation refusal until admission and owner
+proof exist, and the `pre-alpha-no-production-abi-freeze` compatibility boundary.
+It must not open `/dev/tidefs-control`, issue control ioctls, or treat
 `/run/tidefs/pools/.../owner.json` manifests as kernel authority.
 
 [source,sh]
@@ -331,7 +335,9 @@ tidefsctl kernel status --control-dev /dev/null --json
 
 The JSON form exposes stable passive-inventory fields including
 `status_is_passive`, `control_endpoint_opened`,
-`tidefs_owned_kthreads_wired`, and `tidefs_owned_workqueues_wired`.
+`readonly_status_calls_issued`, `mutating_operation_admission`,
+`owner_authority_proof`, `tidefs_owned_kthreads_wired`, and
+`tidefs_owned_workqueues_wired`.
 
 === Command Classes
 

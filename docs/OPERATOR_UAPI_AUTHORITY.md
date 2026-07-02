@@ -225,6 +225,36 @@ This decision defines the current operator boundary as follows.
 | Kernel/FUSE/ublk preview surfaces | The current preview UAPI doc remains current spec only for the checked `tidefsctl` table and non-release VFS codec hooks. FUSE and ublk adapter entrypoints remain operator/harness surfaces that need issue-scoped runtime evidence before any release-facing claim can rely on them. |
 | Documentation authority | `docs/DOCUMENTATION_AUTHORITY_REGISTER.md` remains the authority for document classification. A command appearing in current code does not make an unclassified imported doc current policy or current spec. |
 
+## Minimal Kernel-Control UAPI Contract
+
+Issue #1768 records the minimum production kernel-control boundary that a
+future implementation must satisfy before `tidefsctl kernel status` can stop
+being passive. The current source records this contract as
+`minimum-production-control-uapi-required-not-wired`, and the command still
+opens no device and issues no ioctls.
+
+The future endpoint identity is the declared TideFS control character device:
+`/dev/tidefs-control` by default, or an explicit `--control-dev` path for
+diagnostic probing. A production client must first prove the opened endpoint is
+the TideFS control device, not merely any present character device.
+
+The first readonly operation must be a versioned handshake that returns at
+least version, status, and capabilities facts. Unknown versions, missing
+capabilities, wrong-type paths, or absent devices must fail closed. This
+versioning rule is not an ABI freeze; it is the minimum shape that future ABI
+review must validate before production wording can strengthen.
+
+Mutating kernel-control operations remain refused until the version/capability
+handshake proves production UAPI support, privileged admission is satisfied,
+and owner authority is proven through kernel UAPI evidence. The current live
+owner manifests under `/run/tidefs/pools/.../owner.json` are userspace routing
+evidence only; they are not kernel owner authority.
+
+This contract preserves the current ABI compatibility boundary:
+`pre-alpha-no-production-abi-freeze`. It does not claim kernelspace readiness,
+no-daemon product mode, mounted-kernel POSIX parity, release readiness, or
+successor/comparator status.
+
 ## Non-Claims Preserved
 
 - This decision is not a production Linux ioctl, statx, ublk, FUSE, or
