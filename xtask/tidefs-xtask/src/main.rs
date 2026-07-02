@@ -2280,7 +2280,9 @@ fn print_help() {
         "  check-mount-invariant-gate validate pre-mount namespace/link-count invariant markers"
     );
     println!("  check-mount-invariants alias for check-mount-invariant-gate");
-    println!("  check-preview-posix-subset validate first FUSE-preview POSIX matrix markers");
+    println!(
+        "  check-preview-posix-subset validate first FUSE-preview POSIX subset source markers"
+    );
     println!("  check-posix-subset alias for check-preview-posix-subset");
     println!("  check-fuse-mount-path validate userspace FUSE mount-path source markers");
     println!("  check-userspace-fuse alias for check-fuse-mount-path");

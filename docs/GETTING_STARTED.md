@@ -60,5 +60,6 @@ above.
 
 - `docs/ARCHITECTURE.md` — system architecture and layer model
 - `docs/REVIEW_TODO_REGISTER.md` — current review debt and capability blockers
-- `docs/PREVIEW_USER_MANUAL.md` — preview-only operation notes
+- `docs/PREVIEW_USER_MANUAL.md` — preview-only mount notes and limitations
+- `docs/CLAIM_REGISTRY.md` — generated product-admission gates
 - `docs/INDEX.md` — full documentation index

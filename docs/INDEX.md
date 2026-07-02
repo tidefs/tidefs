@@ -21,6 +21,14 @@ Book:
 - `docs/book/tidefs-book.adoc`
 - `docs/book/chapters/05-book-plan.adoc`
 
+Preview orientation:
+
+- `docs/GETTING_STARTED.md` gives a short developer quick start.
+- `docs/PREVIEW_USER_MANUAL.md` gives preview-only mount notes and limitations.
+
+These preview files are not product-admission, POSIX-complete, release, or
+per-operation status authorities.
+
 The remaining documents are design/reference material unless this index and
 `docs/DOCUMENTATION_AUTHORITY_REGISTER.md` classify a narrower current scope.
 Imported design files, issue-era implementation plans, old status matrices,

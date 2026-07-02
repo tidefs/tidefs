@@ -647,7 +647,8 @@ state.
 
 - [Clustered Pool Workflow](clustered-pool-workflow.md) — multi-node cluster pool operation
 - [Getting Started](../GETTING_STARTED.md) — developer workflow
-- [User Manual](../USER_MANUAL.md) — supported POSIX operations
+- [Preview User Manual](../PREVIEW_USER_MANUAL.md) — preview mount caveats
+- [Claim Registry](../CLAIM_REGISTRY.md) — generated product-admission gates
 - [FUSE Mount](../FUSE_MOUNT.md) — FUSE adapter details
 - [Review TODO Register](../REVIEW_TODO_REGISTER.md) — current capability blockers
 - [Cutover and Rollback Playbook](../release/cutover-fallback-rollback-playbook.md) — kernel-mode transitions

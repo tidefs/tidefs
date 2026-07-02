@@ -277,7 +277,9 @@ stay out of this coordination slice:
 
 - #1015 owns current-doc retired scaffold root references in
   `docs/ARCHITECTURE.md`.
-- #1016 owns deleted status/matrix links in `docs/USER_MANUAL.md`.
+- #1016 owned earlier status/matrix link cleanup inside the duplicate manual;
+  #1775 deletes the remaining duplicate manual/matrix pair, with exact path
+  lineage retained by git history and GitHub issues/PRs instead of live docs.
 - #1017 owns the visible historical-input treatment for retired crate paths in
   `docs/HUMAN_TERMINOLOGY.md`.
 - #1018 owned historical/evidence treatment for retired type-root
@@ -544,7 +546,7 @@ surface beyond adding `docs/CLAIMS_GATE_POLICY.md`, which was already scanned.
 | `docs/DISTRIBUTED_OPERATOR_PRODUCT_SURFACE_BLOCKER_MAP_OW307D.md` | Historical input | Imported OW-307D blocker map. Records typed truth rows and deterministic demo rows present in source, but the parent OW-307 gate remains open and a runtime-fed operator product surface is not yet present. |
 | `docs/OPERATOR_PRODUCT_SURFACE_DECISION.md` | Current policy | Design decision #1267 recording the current runtime-fed operator product-surface boundary after the OW-307D blocker map. States that no runtime-fed operator product surface exists, the P10-04 truth-surface law is missing from the repository, and no product carrier class is selectable until transport/cluster authority and the P10-04 gap close. The operator/UAPI command boundary is closed for the current pre-alpha command surface, but that closeout is not a runtime-fed product carrier. |
 | `docs/DASHBOARDS_TRACES_OPERATOR_TRUTH_SURFACES_P10-04.md` | Missing | Truth-surface law reference absent from the repository. Issue #1270 records the gap: the law expected to define mandatory surface classes, provenance/exactness/freshness rendering, carrier verification, and the `truth_view` concept does not exist, so citations to this path are not current authority. |
-| `docs/PREVIEW_USER_MANUAL.md` | Historical input | Deferred in #1720 because active issue #1722 owns the remaining `xtask` claims/storage citations. The file stays only as preview-scoped, claims-gated orientation; it is not binding operator policy, release authority, production readiness, or mounted transform evidence. |
+| `docs/PREVIEW_USER_MANUAL.md` | Historical input | Deferred in #1720 because active issue #1722 owns the remaining `xtask` claims/storage citations. After #1775 deletes the duplicate manual/matrix pair, this file stays only as preview-scoped, claims-gated orientation; it is not binding operator policy, release authority, production readiness, POSIX-complete status, mounted transform evidence, or per-operation behavior authority. |
 
 **Architecture, design, and feature docs**
 

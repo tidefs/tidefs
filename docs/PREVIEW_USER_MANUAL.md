@@ -32,6 +32,11 @@ cargo run -p tidefs-posix-filesystem-adapter-daemon -- \
 fusermount3 -u /tmp/tidefs-mnt
 ```
 
+The FUSE preview is for local experiments with standard tools. It intentionally
+does not carry a per-operation status matrix; use source, CI validation,
+generated claim registry gates, and live GitHub issues or pull requests for
+exact behavior evidence.
+
 ### ublk Block Volume (Development Preview)
 
 
