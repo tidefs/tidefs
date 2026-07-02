@@ -61,9 +61,18 @@ cargo check --workspace --locked
 
 ## Start Here
 
-- `CONTRIBUTING.md`
-- `docs/LICENSING.md`
-- `docs/TEST_SIGNAL_POLICY.md`
-- `docs/REVIEW_TODO_POLICY.md`
-- `docs/REVIEW_TODO_REGISTER.md`
-- `docs/INDEX.md`
+Use this repo-local reading order before changing behavior or documentation:
+
+1. `README.md` - repository overview and current policy summary
+2. `AGENTS.md` - agent and managed-worker contract
+3. `docs/GITHUB_PR_DEVELOPMENT.md` - GitHub issue, branch, worktree, and PR flow
+4. `docs/GITHUB_CI.md` - CI workflow, validation lanes, and secret boundary
+5. `docs/CLAIMS_GATE_POLICY.md` - publishing-facing claim guardrails
+6. `docs/REVIEW_TODO_POLICY.md` - durable review-debt policy
+7. `docs/REVIEW_TODO_REGISTER.md` - current review-debt register
+8. `docs/DOCUMENTATION_AUTHORITY_REGISTER.md` - document authority and classification
+9. `docs/INDEX.md` - documentation index and authority-family map
+
+Read `docs/LICENSING.md`, `docs/TEST_SIGNAL_POLICY.md`,
+`docs/UNRELEASED_AUTHORITY_POLICY.md`, and
+`docs/CONTROL_FORMAT_AND_JSON_POLICY.md` when a change touches those surfaces.

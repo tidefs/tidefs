@@ -6,6 +6,25 @@ when no active operator-authorized automation is running. The current
 live GitHub issue/PR state and repo docs when operator-authorized; do not start,
 depend on, or re-enable parked legacy Nexus/Factory automation.
 
+## Reading Order
+
+Start with these repo-local authority files before changing behavior or
+documentation:
+
+1. `README.md`
+2. `AGENTS.md`
+3. `docs/GITHUB_PR_DEVELOPMENT.md`
+4. `docs/GITHUB_CI.md`
+5. `docs/CLAIMS_GATE_POLICY.md`
+6. `docs/REVIEW_TODO_POLICY.md`
+7. `docs/REVIEW_TODO_REGISTER.md`
+8. `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`
+9. `docs/INDEX.md`
+
+Managed hosts may add local process constraints for their workers, but those
+host-local docs are not public product policy and are not prerequisite reading
+for ordinary contributors.
+
 ## Development Rules
 
 - Use GitHub issues and pull requests for Codex-authored source changes. Do
