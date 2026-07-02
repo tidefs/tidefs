@@ -1667,7 +1667,7 @@ impl MountedRawStoreDiagnostics<'_> {
         let Some(tree) = self.store.get_checksum_tree(key, block_size)? else {
             return Ok(None);
         };
-        self.store.verify_checksum_tree(key, &tree).map(Some)
+        Ok(self.store.verify_checksum_tree(key, &tree).map(Some)?)
     }
 
     fn suspect_log_stats(&self) -> SuspectLogStats {
