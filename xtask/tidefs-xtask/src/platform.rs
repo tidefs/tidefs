@@ -32,7 +32,7 @@ pub fn check_current_workspace() -> Result<(), PlatformCheckError> {
         "docs/DEBUGGING_WORKFLOWS.md",
         "docs/GITHUB_CI.md",
         "docs/xfstests-harness.md",
-        "docs/RDMA_TRANSPORT_POSITION.md",
+        "docs/TRANSPORT_CLUSTER_AUTHORITY.md",
     ] {
         check_required_file(&root, rel, &mut missing);
     }
@@ -51,14 +51,18 @@ pub fn check_current_workspace() -> Result<(), PlatformCheckError> {
     );
     check_source_markers(
         &root,
-        "docs/RDMA_TRANSPORT_POSITION.md",
+        "docs/TRANSPORT_CLUSTER_AUTHORITY.md",
         &[
-            "cut.linux_baseline.rdma_required_fastpath.x0",
-            "transport_session_0",
-            "TCP-class transport remains the baseline fallback",
-            "rdma_rxe",
-            "siw",
+            "Transport owns session-local admission",
+            "RDMA hardware validation and partition recovery",
+            "product claims require runtime",
         ],
+        &mut missing,
+    );
+    check_source_markers(
+        &root,
+        "nix/tidefs-rdma-probe.sh",
+        &["transport_session_0_fallback", "rdma_rxe", "siw"],
         &mut missing,
     );
     check_source_markers(

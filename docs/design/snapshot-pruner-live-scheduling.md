@@ -64,8 +64,8 @@ The selected boundary is therefore:
 - `docs/SNAPSHOT_CLONE_DEADLIST_AUTHORITY.md` keeps snapshot deletion as an
   authority mutation first and maps deadlist derivation and reclaim handoff to
   separate follow-ups.
-- `docs/SNAPSHOT_DEADLIST_PINNING_DESIGN.md` requires current per-snapshot pin
-  evidence before a retention candidate enters the delete set.
+- `docs/SNAPSHOT_CLONE_DEADLIST_AUTHORITY.md` keeps destructive snapshot
+  pruning behind current snapshot authority and per-candidate pin evidence.
 - `crates/tidefs-background-scheduler` already maps `JobKind::SnapshotPruner`
   into the scheduler priority model.
 - `crates/tidefs-incremental-job-core` defines the crash-resumable,

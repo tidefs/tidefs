@@ -23,7 +23,7 @@
 //! ## RDMA position
 //!
 //! RDMA may improve path evidence but missing RDMA must not invalidate
-//! TCP-class correctness (see `docs/RDMA_TRANSPORT_POSITION.md`).
+//! TCP-class correctness (see `docs/TRANSPORT_CLUSTER_AUTHORITY.md`).
 //! RDMA-only assumptions are rejected through [`PathCarrierClass`]
 //! tagging; TCP fallback remains a legal baseline.
 //!

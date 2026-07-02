@@ -312,16 +312,15 @@ or VFS generations.
 ### 4.1 Format Version Families
 
 TideFS on-disk state is organized into independent format families, each with
-its own version. The policy document
-`docs/ON_DISK_FORMAT_VERSIONING_AND_COMPATIBILITY_POLICY.md` is the
-operator-facing compatibility contract. This section records the authority
-boundaries relevant to TFR-005.
+its own version. TideFS has not shipped a public on-disk compatibility
+contract; pre-release format handling follows `docs/UNRELEASED_AUTHORITY_POLICY.md`.
+This section records the authority boundaries relevant to TFR-005.
 
 | Format family                    | Version field                | Current | Governing doc                                    |
 |----------------------------------|------------------------------|---------|--------------------------------------------------|
 | Local filesystem records         | `FILESYSTEM_FORMAT_VERSION`  | 6       | This document; `encoding.rs` constants           |
-| Local object store manifest      | `manifest_version`           | 1       | `format_manifest.rs`; `ON_DISK_FORMAT_VERSIONING_AND_COMPATIBILITY_POLICY.md` |
-| Local object store records       | `record_format_version`      | 1-3     | `format_manifest.rs`; `ON_DISK_FORMAT_VERSIONING_AND_COMPATIBILITY_POLICY.md` |
+| Local object store manifest      | `manifest_version`           | 1       | `format_manifest.rs`; local object-store format manifest source |
+| Local object store records       | `record_format_version`      | 1-3     | `format_manifest.rs`; local object-store format manifest source |
 | Pool labels                      | `version`                    | 1       | `POOL_IMPORT_EXPORT_DEVICE_TOPOLOGY_DESIGN.md`   |
 | Dataset feature flags            | per-dataset B-trees          | N/A     | `DATASET_FEATURE_FLAGS_DESIGN.md`                |
 | Committed roots / intent log     | version discriminant         | V1      | Source behavior plus TFR-005/TFR-008 review register |

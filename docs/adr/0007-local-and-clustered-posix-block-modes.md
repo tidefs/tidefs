@@ -23,8 +23,8 @@ The review covered the required sources:
   standalone pool import from cluster pool ownership, clears cluster
   membership on cross-system import, and requires export plus re-import for
   standalone/cluster migration.
-- `docs/POSIX_FILESYSTEM_ADAPTER_DAEMON_TOPOLOGY_P5-01.md` declares the
-  FUSE daemon a bounded mirror rather than hidden production sovereignty.
+- `docs/FUSE_ADAPTER_CONTRACT_ASSUMPTIONS.md` declares the FUSE adapter an
+  environment boundary rather than hidden production sovereignty.
 - `docs/design/metadata-engine-parallelism-multi-core-metadata-path.md`
   defines local-node concurrency with in-process directory and extent locks,
   while cluster-wide lock integration is a later lease-aware wrapper.

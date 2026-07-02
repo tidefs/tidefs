@@ -541,9 +541,6 @@ surface beyond adding `docs/CLAIMS_GATE_POLICY.md`, which was already scanned.
 | Path | State | Classification note |
 |---|---|---|
 | `docs/CLAIMS_GATE_POLICY.md` | Current policy | Binding claims-gate guardrail enforced by `xtask check-claims-gate`. The scanner hard-codes a policy spec constant, verifies this file exists, and checks that the required gate text is present. Because this is promoted to current policy, it is scanned by the claims gate (it was already in the scanned-surface list). |
-| `docs/ON_DISK_FORMAT_VERSIONING_AND_COMPATIBILITY_POLICY.md` | Historical input | Imported release-policy with well-articulated format versioning discipline, but references a stale Forgejo issue (#6518) and non-existent sub-documents (FORMAT_IDENTITY_UPGRADE_REPLAY_CONTINUITY_LAW_P2-04.md, TRANSPORT_SESSION_COHORT_GRAPH_P8-01.md, ZERO_COPY_DMA_PINNING_PAGE_LOAN_LAW_P4-04.md). The pre-release note correctly states no public release has shipped. |
-| `docs/RDMA_TRANSPORT_POSITION.md` | Historical input | Imported transport-position document referencing non-existent sub-documents and stating "TideFS does not have a product RDMA data path yet." Useful for future RDMA design reference. |
-| `docs/DISTRIBUTED_OPERATOR_PRODUCT_SURFACE_BLOCKER_MAP_OW307D.md` | Historical input | Imported OW-307D blocker map. Records typed truth rows and deterministic demo rows present in source, but the parent OW-307 gate remains open and a runtime-fed operator product surface is not yet present. |
 | `docs/OPERATOR_PRODUCT_SURFACE_DECISION.md` | Current policy | Design decision #1267 recording the current runtime-fed operator product-surface boundary after the OW-307D blocker map. States that no runtime-fed operator product surface exists, the P10-04 truth-surface law is missing from the repository, and no product carrier class is selectable until transport/cluster authority and the P10-04 gap close. The operator/UAPI command boundary is closed for the current pre-alpha command surface, but that closeout is not a runtime-fed product carrier. |
 | `docs/DASHBOARDS_TRACES_OPERATOR_TRUTH_SURFACES_P10-04.md` | Missing | Truth-surface law reference absent from the repository. Issue #1270 records the gap: the law expected to define mandatory surface classes, provenance/exactness/freshness rendering, carrier verification, and the `truth_view` concept does not exist, so citations to this path are not current authority. |
 | `docs/PREVIEW_USER_MANUAL.md` | Historical input | Deferred in #1720 because active issue #1722 owns the remaining `xtask` claims/storage citations. After #1775 deletes the duplicate manual/matrix pair, this file stays only as preview-scoped, claims-gated orientation; it is not binding operator policy, release authority, production readiness, POSIX-complete status, mounted transform evidence, or per-operation behavior authority. |
@@ -600,8 +597,6 @@ OpenZFS/Ceph successor status.
 | `docs/FUSE_ADAPTER_CONTRACT_ASSUMPTIONS.md` | Current policy | Binding only as the adapter-boundary guardrail that prevents runtime FUSE handlers from bypassing the TideFS request/VfsEngine path into storage mutation authority. It does not close xfstests rows or broader POSIX/FUSE completeness. |
 | `docs/FUSE_LSEEK_PC004B.md` | Current spec | Scoped current spec for the non-release dense-file preview `lseek` behavior described in the file. It does not claim sparse-file fidelity or parent POSIX-complete FUSE closure. |
 | `docs/design/clustered-posix-lock-forwarding-boundary.md` | Current spec | Scoped current spec for the clustered POSIX mounted LOCK forwarding boundary decided by GitHub issue #626. It names the future mounted owner for `LockServiceHandle` construction and follow-up issue split, but it is not implementation evidence that clustered POSIX mounts exist today. |
-| `docs/FUSE_REQUEST_WORKER_QUEUE_MODEL_P5-02.md` | Historical input | Imported production-depth FUSE worker/queue model. Useful design input, but it must not be cited as current runtime proof for queues, interrupts, forget handling, page runtime, or kernel parity. |
-| `docs/POSIX_FILESYSTEM_ADAPTER_DAEMON_TOPOLOGY_P5-01.md` | Historical input | Imported production-depth POSIX adapter topology. It contains useful residency and topology framing, but current FUSE runtime authority is issue-scoped evidence rather than this broad ledger. |
 | `docs/PAGE_CACHE_WRITEBACK_MMAP_INTEGRATION_P5-03.md` | Historical input | Imported page-cache, writeback, and mmap design target. It is not current proof of writeback, mmap coherency, direct-I/O, or no-daemon behavior. |
 
 **Operator, placement, and distributed-runtime docs**
@@ -722,7 +717,6 @@ larger than this documentation-authority cleanup.
 | Path | State | Classification note |
 |---|---|---|
 | `docs/POLYMORPHIC_XATTR_STORAGE_DESIGN.md` | Historical input | Imported Forgejo #1290 xattr storage design with proposed on-media records and ACL integration. Current xattr/ACL behavior and claims coverage were not audited here, so the document remains review material. |
-| `docs/SNAPSHOT_DEADLIST_PINNING_DESIGN.md` | Historical input | Imported snapshot deadlist/pinning design that reaches into reclamation, references, and snapshot lifecycle. It needs a dedicated snapshot/deadlist source and claims-gate review before promotion. |
 
 ### Background Service Framework Scheduler Authority (TFR-019 / #1537)
 

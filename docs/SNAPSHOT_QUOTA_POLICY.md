@@ -16,11 +16,11 @@ rebake, reclaim, or send/receive behavior.
   anchors. The document still leaves snapshot quota policy, unified deadlists,
   placement receipts, snapshot-reclaim accounting, and distributed snapshot
   replication open.
-- `docs/SNAPSHOT_DEADLIST_PINNING_DESIGN.md`: `pinned_snapshot_bytes` and
-  per-snapshot `deadlist_bytes` are O(1) observability counters for bytes held
-  by snapshot deadlists. The #638 statfs decision says those bytes are reported
-  through dataset, snapshot, and operator views, not by reducing POSIX
-  `statfs.f_bfree` or `statfs.f_bavail`.
+- `docs/SNAPSHOT_CLONE_DEADLIST_AUTHORITY.md`: snapshot lifecycle pins,
+  deadlist derivation, and reclaim handoff are tracked as authority work
+  outside POSIX statfs availability. The #638 statfs decision says those bytes
+  are reported through dataset, snapshot, and operator views, not by reducing
+  POSIX `statfs.f_bfree` or `statfs.f_bavail`.
 - `crates/tidefs-space-accounting/` and
   `crates/tidefs-types-space-accounting-core/`: `pinned_snapshot_bytes` is a
   classification of bytes already covered by `logical_used_bytes`, not an
