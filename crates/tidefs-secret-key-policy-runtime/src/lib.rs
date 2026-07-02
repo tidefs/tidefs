@@ -452,11 +452,20 @@ pub fn issue_bounded_secret_lease_for_runtime_use<S: SealProvider>(
     let handle = store.lookup_handle(handle_id)?;
     let state = handle.lifecycle_state()?;
 
-    if state.blocks_lease_issuance() {
-        return Err(SecretKeyPolicyRuntimeError::HandleNotActive {
-            handle_id,
-            actual: state,
-        });
+    match state {
+        SecretLifecycleState::Active | SecretLifecycleState::RotatingDualValid => {}
+        SecretLifecycleState::Revoked => {
+            return Err(SecretKeyPolicyRuntimeError::HandleRevoked { handle_id });
+        }
+        SecretLifecycleState::Quarantined => {
+            return Err(SecretKeyPolicyRuntimeError::HandleQuarantined { handle_id });
+        }
+        _ => {
+            return Err(SecretKeyPolicyRuntimeError::HandleNotActive {
+                handle_id,
+                actual: state,
+            });
+        }
     }
 
     if !runtime_residency.allows_plaintext() {
@@ -1717,14 +1726,56 @@ mod tests {
         );
     }
 
-    #[test]
-    fn lease_refuses_revoked_handle() {
-        let provider = MockSealProvider::new();
-        let store = InMemoryHandleStore::new();
-        let result = issue_bounded_secret_lease_for_runtime_use(
-            &provider,
-            &store,
-            SecretKeyPolicyId128::from_u128_le(0xDEAD),
+    fn make_lease_test_store(
+        handle_id: SecretKeyPolicyId128,
+        state: SecretLifecycleState,
+    ) -> InMemoryHandleStore {
+        let mut store = InMemoryHandleStore::new();
+        let wk_id = SecretKeyPolicyId128::from_u128_le(0x2000);
+        let env_id = SecretKeyPolicyId128::from_u128_le(0x4000);
+        store.wrapping_keys.insert(
+            wk_id.as_u128_le(),
+            WrappingKeyRecord {
+                wrapping_key_id: wk_id,
+                wrapping_key_class: WrappingKeyClass::ClusterRoot.as_u32(),
+                wrapping_key_version: 1,
+                ..Default::default()
+            },
+        );
+        store.handles.insert(
+            handle_id.as_u128_le(),
+            SecretHandleRecord {
+                handle_id,
+                secret_class: SecretClass::PolicySigner.as_u32(),
+                lifecycle_state: state.as_u32(),
+                active_envelope_version: 1,
+                active_envelope_id: env_id,
+                ..Default::default()
+            },
+        );
+        store.envelopes.insert(
+            env_id.as_u128_le(),
+            SecretEnvelopeRecord {
+                envelope_id: env_id,
+                handle_id,
+                envelope_version: 1,
+                wrapping_key_id: wk_id,
+                wrapping_key_version: 1,
+                ..Default::default()
+            },
+        );
+        store
+    }
+
+    fn issue_test_lease(
+        provider: &MockSealProvider,
+        store: &InMemoryHandleStore,
+        handle_id: SecretKeyPolicyId128,
+    ) -> Result<(Vec<u8>, SecretLeaseGrantRecord), SecretKeyPolicyRuntimeError> {
+        issue_bounded_secret_lease_for_runtime_use(
+            provider,
+            store,
+            handle_id,
             SecretKeyPolicyId128::from_u128_le(1),
             LeaseUsageClass::SignOrPublish,
             0,
@@ -1732,8 +1783,58 @@ mod tests {
             SecretKeyPolicyId128::from_u128_le(1),
             SecretKeyPolicyId128::from_u128_le(2),
             SecretKeyPolicyId128::from_u128_le(3),
-        );
-        assert!(result.is_err());
+        )
+    }
+
+    #[test]
+    fn lease_refuses_revoked_handle() {
+        let provider = MockSealProvider::new();
+        let handle_id = SecretKeyPolicyId128::from_u128_le(0xDEAD);
+        let store = make_lease_test_store(handle_id, SecretLifecycleState::Revoked);
+        let result = issue_test_lease(&provider, &store, handle_id);
+        assert!(matches!(
+            result,
+            Err(SecretKeyPolicyRuntimeError::HandleRevoked { handle_id: id }) if id == handle_id
+        ));
+    }
+
+    #[test]
+    fn lease_refuses_quarantined_handle() {
+        let provider = MockSealProvider::new();
+        let handle_id = SecretKeyPolicyId128::from_u128_le(0xCAFE);
+        let store = make_lease_test_store(handle_id, SecretLifecycleState::Quarantined);
+        let result = issue_test_lease(&provider, &store, handle_id);
+        assert!(matches!(
+            result,
+            Err(SecretKeyPolicyRuntimeError::HandleQuarantined { handle_id: id }) if id == handle_id
+        ));
+    }
+
+    #[test]
+    fn lease_refuses_retired_and_inactive_handles() {
+        let provider = MockSealProvider::new();
+        for state in [
+            SecretLifecycleState::Retired,
+            SecretLifecycleState::SealedInactive,
+        ] {
+            let handle_id = SecretKeyPolicyId128::from_u128_le(0xBEEF + state.as_u32() as u128);
+            let store = make_lease_test_store(handle_id, state);
+            let result = issue_test_lease(&provider, &store, handle_id);
+            assert!(matches!(
+                result,
+                Err(SecretKeyPolicyRuntimeError::HandleNotActive { handle_id: id, actual })
+                    if id == handle_id && actual == state
+            ));
+        }
+    }
+
+    #[test]
+    fn lease_allows_rotating_dual_valid_handle() {
+        let provider = MockSealProvider::new();
+        let handle_id = SecretKeyPolicyId128::from_u128_le(0xD00D);
+        let store = make_lease_test_store(handle_id, SecretLifecycleState::RotatingDualValid);
+        let result = issue_test_lease(&provider, &store, handle_id);
+        assert!(result.is_ok());
     }
 
     // ── Algorithm 4 tests ───
@@ -2880,6 +2981,40 @@ mod tests {
                 assert_eq!(handle_id, h);
             }
             other => panic!("expected HandleQuarantined, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn recovery_fails_retired_handle() {
+        let mut store = InMemoryHandleStore::new();
+        let h = SecretKeyPolicyId128::from_u128_le(0x100);
+        let e = SecretKeyPolicyId128::from_u128_le(0x1000);
+        let m_id = SecretKeyPolicyId128::from_u128_le(0x5000);
+
+        store.handles.insert(
+            h.as_u128_le(),
+            make_test_handle(h, SecretLifecycleState::Retired, e),
+        );
+        store
+            .envelopes
+            .insert(e.as_u128_le(), make_test_envelope(e, h));
+        store.manifests.insert(
+            m_id.as_u128_le(),
+            make_test_manifest(
+                m_id,
+                &[h],
+                SecretKeyPolicyId128::from_u128_le(0xAA),
+                SecretKeyPolicyId128::from_u128_le(0xBB),
+            ),
+        );
+
+        let result = recover_policy_store_and_handle_pointers(&store, m_id);
+        match result {
+            Err(SecretKeyPolicyRuntimeError::HandleNotActive { handle_id, actual }) => {
+                assert_eq!(handle_id, h);
+                assert_eq!(actual, SecretLifecycleState::Retired);
+            }
+            other => panic!("expected HandleNotActive retired refusal, got {other:?}"),
         }
     }
 

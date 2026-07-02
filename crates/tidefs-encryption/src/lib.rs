@@ -163,6 +163,11 @@ pub enum EncryptionError {
     InvalidKeyEmpty,
     /// Key derivation rejected by config (strict_key_derivation mode).
     KeyDerivationRejected,
+    /// Mounted pool key lifecycle or mount evidence refused lease access.
+    KeyLifecycleAccessRefused {
+        state: MountedPoolKeyAccessState,
+        reason: MountedPoolKeyAccessRefusal,
+    },
     /// The provided key has the wrong length.
     InvalidKeyLength { expected: usize, got: usize },
     /// Key derivation (Argon2id or similar) failed.
@@ -183,6 +188,9 @@ impl fmt::Display for EncryptionError {
             Self::DecryptionFailed => write!(f, "decryption failed: wrong key or corrupted data"),
             Self::InvalidKeyEmpty => write!(f, "key cannot be empty"),
             Self::KeyDerivationRejected => write!(f, "key derivation rejected: strict_key_derivation mode requires externally-derived key bytes"),
+            Self::KeyLifecycleAccessRefused { state, reason } => {
+                write!(f, "key lifecycle access refused: state={state} reason={reason}")
+            }
             Self::InvalidKeyLength { expected, got } => {
                 write!(f, "invalid key length: expected {expected}, got {got}")
             }

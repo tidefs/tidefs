@@ -147,6 +147,239 @@ impl SecretHandleLifecycle {
     }
 }
 
+/// Mounted pool key lifecycle state used by fail-closed access reporting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MountedPoolKeyAccessState {
+    Active,
+    Rotating,
+    Revoked,
+    Quarantined,
+    Retired,
+    Missing,
+    Stale,
+    RecoveryAfterCrash,
+}
+
+impl MountedPoolKeyAccessState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Rotating => "rotating",
+            Self::Revoked => "revoked",
+            Self::Quarantined => "quarantined",
+            Self::Retired => "retired",
+            Self::Missing => "missing",
+            Self::Stale => "stale",
+            Self::RecoveryAfterCrash => "recovery_after_crash",
+        }
+    }
+}
+
+impl fmt::Display for MountedPoolKeyAccessState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Crash-recovery evidence available before issuing a mounted pool key lease.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MountedPoolKeyRecoveryEvidence {
+    /// Normal active mount path with no recovery replay required.
+    #[default]
+    CurrentMount,
+    /// Recovery replay completed and restored the committed key binding.
+    ReplayedAfterCrash,
+    /// Recovery replay is required but missing or incomplete.
+    ReplayMissing,
+}
+
+/// Explicit refusal reason for mounted pool key access.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MountedPoolKeyAccessRefusal {
+    MissingHandleRecord,
+    MissingCommittedMountToken,
+    StaleCommittedMountToken,
+    HandleNotActive,
+    HandleRevoked,
+    HandleQuarantined,
+    HandleRetired,
+    RecoveryReplayMissing,
+}
+
+impl MountedPoolKeyAccessRefusal {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::MissingHandleRecord => "missing handle record",
+            Self::MissingCommittedMountToken => "missing committed mount token",
+            Self::StaleCommittedMountToken => "stale committed mount token",
+            Self::HandleNotActive => "handle is not active",
+            Self::HandleRevoked => "handle is revoked",
+            Self::HandleQuarantined => "handle is quarantined",
+            Self::HandleRetired => "handle is retired",
+            Self::RecoveryReplayMissing => "recovery replay is missing",
+        }
+    }
+}
+
+impl fmt::Display for MountedPoolKeyAccessRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MountedPoolKeyAccessDecision {
+    AllowLease,
+    RefuseMountAccess,
+}
+
+/// Mounted pool key access assessment with operator-visible refusal detail.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MountedPoolKeyAccessAssessment {
+    pub state: MountedPoolKeyAccessState,
+    pub decision: MountedPoolKeyAccessDecision,
+    pub refusal: Option<MountedPoolKeyAccessRefusal>,
+}
+
+impl MountedPoolKeyAccessAssessment {
+    pub fn allow(state: MountedPoolKeyAccessState) -> Self {
+        Self {
+            state,
+            decision: MountedPoolKeyAccessDecision::AllowLease,
+            refusal: None,
+        }
+    }
+
+    pub fn refuse(state: MountedPoolKeyAccessState, refusal: MountedPoolKeyAccessRefusal) -> Self {
+        Self {
+            state,
+            decision: MountedPoolKeyAccessDecision::RefuseMountAccess,
+            refusal: Some(refusal),
+        }
+    }
+
+    pub fn allows_lease(&self) -> bool {
+        self.decision == MountedPoolKeyAccessDecision::AllowLease
+    }
+
+    pub fn refusal_reason(&self) -> Option<MountedPoolKeyAccessRefusal> {
+        self.refusal
+    }
+}
+
+/// Payload class covered by a cryptographic-erase boundary assessment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransformPayloadClass {
+    FullyTransformedEncrypted,
+    Plaintext,
+    CompressedOnly,
+    Unencrypted,
+    PartiallyTransformed,
+    RawStoreBypassed,
+    PreviouslyExposedMedia,
+}
+
+/// Evidence required before revocation/destruction can enter claim review.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CryptographicEraseEvidence {
+    pub payload_class: TransformPayloadClass,
+    pub transform_metadata_persisted: bool,
+    pub stored_frame_reachability_proven: bool,
+    pub media_remanence_limits_documented: bool,
+}
+
+impl CryptographicEraseEvidence {
+    pub fn encrypted_with_full_proof() -> Self {
+        Self {
+            payload_class: TransformPayloadClass::FullyTransformedEncrypted,
+            transform_metadata_persisted: true,
+            stored_frame_reachability_proven: true,
+            media_remanence_limits_documented: true,
+        }
+    }
+}
+
+/// Explicit refusal reason for cryptographic erase claim review.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CryptographicEraseRefusal {
+    KeyLifecycleNotDestroyedOrRevoked,
+    MissingTransformMetadata,
+    StoredFrameReachabilityUnproven,
+    MediaRemanenceLimitsUnproven,
+    PayloadPlaintext,
+    PayloadCompressedOnly,
+    PayloadUnencrypted,
+    PayloadPartiallyTransformed,
+    PayloadRawStoreBypassed,
+    PayloadPreviouslyExposed,
+}
+
+impl CryptographicEraseRefusal {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::KeyLifecycleNotDestroyedOrRevoked => "key lifecycle is not destroyed or revoked",
+            Self::MissingTransformMetadata => "transform metadata is missing",
+            Self::StoredFrameReachabilityUnproven => "stored-frame reachability is unproven",
+            Self::MediaRemanenceLimitsUnproven => "media remanence limits are unproven",
+            Self::PayloadPlaintext => "payload is plaintext",
+            Self::PayloadCompressedOnly => "payload is compressed-only",
+            Self::PayloadUnencrypted => "payload is unencrypted",
+            Self::PayloadPartiallyTransformed => "payload is partially transformed",
+            Self::PayloadRawStoreBypassed => "payload bypassed the raw-store transform authority",
+            Self::PayloadPreviouslyExposed => "payload was previously exposed on media",
+        }
+    }
+}
+
+impl fmt::Display for CryptographicEraseRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CryptographicEraseVerdict {
+    Refused,
+    PrerequisitesSatisfiedForClaimReview,
+}
+
+/// Cryptographic erase boundary assessment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CryptographicEraseAssessment {
+    pub verdict: CryptographicEraseVerdict,
+    pub refusal: Option<CryptographicEraseRefusal>,
+    pub non_claim: &'static str,
+}
+
+impl CryptographicEraseAssessment {
+    pub fn refused(refusal: CryptographicEraseRefusal) -> Self {
+        Self {
+            verdict: CryptographicEraseVerdict::Refused,
+            refusal: Some(refusal),
+            non_claim: CRYPTOGRAPHIC_ERASE_NON_CLAIM,
+        }
+    }
+
+    pub fn prerequisites_satisfied_for_claim_review() -> Self {
+        Self {
+            verdict: CryptographicEraseVerdict::PrerequisitesSatisfiedForClaimReview,
+            refusal: None,
+            non_claim: CRYPTOGRAPHIC_ERASE_NON_CLAIM,
+        }
+    }
+
+    pub fn can_present_as_secure_erase(&self) -> bool {
+        false
+    }
+
+    pub fn eligible_for_claim_review(&self) -> bool {
+        self.verdict == CryptographicEraseVerdict::PrerequisitesSatisfiedForClaimReview
+    }
+}
+
+pub const CRYPTOGRAPHIC_ERASE_NON_CLAIM: &str =
+    "key revocation or destruction alone is not secure erase, sanitization, decommissioning, or remanence proof";
+
 impl fmt::Display for SecretHandleLifecycle {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -390,15 +623,33 @@ impl PoolEncryptionSecretHandleRecord {
         self.state_changed_at = now;
     }
 
+    /// Mark the handle as rotating with dual-valid key material.
+    pub fn begin_rotation(&mut self, now: u64) {
+        self.lifecycle = SecretHandleLifecycle::RotatingDualValid;
+        self.state_changed_at = now;
+    }
+
     /// Revoke the handle, blocking all future leases.
     pub fn revoke(&mut self, now: u64) {
         self.lifecycle = SecretHandleLifecycle::Revoked;
         self.state_changed_at = now;
     }
 
+    /// Quarantine the handle, blocking leases while compromise is investigated.
+    pub fn quarantine(&mut self, now: u64) {
+        self.lifecycle = SecretHandleLifecycle::Quarantined;
+        self.state_changed_at = now;
+    }
+
+    /// Retire the handle, blocking leases as a terminal lifecycle state.
+    pub fn retire(&mut self, now: u64) {
+        self.lifecycle = SecretHandleLifecycle::Retired;
+        self.state_changed_at = now;
+    }
+
     /// Whether a lease can be issued.
     pub fn can_issue_lease(&self) -> bool {
-        !self.lifecycle.blocks_lease()
+        self.lifecycle.allows_mount()
     }
 
     /// Whether this handle can be used for mount/import.
@@ -425,6 +676,143 @@ impl PoolEncryptionSecretHandleRecord {
         self.dataset_mount_commitment = dataset_mount_token.commitment;
         self.state_changed_at = now;
     }
+}
+
+pub fn assess_mounted_pool_key_access(
+    record: Option<&PoolEncryptionSecretHandleRecord>,
+    dataset_mount_token: Option<&CommittedDatasetMountToken>,
+    recovery: MountedPoolKeyRecoveryEvidence,
+) -> MountedPoolKeyAccessAssessment {
+    if recovery == MountedPoolKeyRecoveryEvidence::ReplayMissing {
+        return MountedPoolKeyAccessAssessment::refuse(
+            MountedPoolKeyAccessState::RecoveryAfterCrash,
+            MountedPoolKeyAccessRefusal::RecoveryReplayMissing,
+        );
+    }
+
+    let Some(record) = record else {
+        return MountedPoolKeyAccessAssessment::refuse(
+            MountedPoolKeyAccessState::Missing,
+            MountedPoolKeyAccessRefusal::MissingHandleRecord,
+        );
+    };
+
+    let state = match record.lifecycle {
+        SecretHandleLifecycle::SealedInactive => {
+            return MountedPoolKeyAccessAssessment::refuse(
+                MountedPoolKeyAccessState::Missing,
+                MountedPoolKeyAccessRefusal::HandleNotActive,
+            );
+        }
+        SecretHandleLifecycle::Active => MountedPoolKeyAccessState::Active,
+        SecretHandleLifecycle::RotatingDualValid => MountedPoolKeyAccessState::Rotating,
+        SecretHandleLifecycle::Revoked => {
+            return MountedPoolKeyAccessAssessment::refuse(
+                MountedPoolKeyAccessState::Revoked,
+                MountedPoolKeyAccessRefusal::HandleRevoked,
+            );
+        }
+        SecretHandleLifecycle::Quarantined => {
+            return MountedPoolKeyAccessAssessment::refuse(
+                MountedPoolKeyAccessState::Quarantined,
+                MountedPoolKeyAccessRefusal::HandleQuarantined,
+            );
+        }
+        SecretHandleLifecycle::Retired => {
+            return MountedPoolKeyAccessAssessment::refuse(
+                MountedPoolKeyAccessState::Retired,
+                MountedPoolKeyAccessRefusal::HandleRetired,
+            );
+        }
+    };
+
+    let Some(token) = dataset_mount_token else {
+        return MountedPoolKeyAccessAssessment::refuse(
+            MountedPoolKeyAccessState::Missing,
+            MountedPoolKeyAccessRefusal::MissingCommittedMountToken,
+        );
+    };
+
+    if !record.accepts_dataset_mount_token(token) {
+        return MountedPoolKeyAccessAssessment::refuse(
+            MountedPoolKeyAccessState::Stale,
+            MountedPoolKeyAccessRefusal::StaleCommittedMountToken,
+        );
+    }
+
+    if recovery == MountedPoolKeyRecoveryEvidence::ReplayedAfterCrash {
+        MountedPoolKeyAccessAssessment::allow(MountedPoolKeyAccessState::RecoveryAfterCrash)
+    } else {
+        MountedPoolKeyAccessAssessment::allow(state)
+    }
+}
+
+pub fn assess_cryptographic_erase_boundary(
+    key_state: MountedPoolKeyAccessState,
+    evidence: CryptographicEraseEvidence,
+) -> CryptographicEraseAssessment {
+    if !matches!(
+        key_state,
+        MountedPoolKeyAccessState::Revoked | MountedPoolKeyAccessState::Retired
+    ) {
+        return CryptographicEraseAssessment::refused(
+            CryptographicEraseRefusal::KeyLifecycleNotDestroyedOrRevoked,
+        );
+    }
+
+    match evidence.payload_class {
+        TransformPayloadClass::FullyTransformedEncrypted => {}
+        TransformPayloadClass::Plaintext => {
+            return CryptographicEraseAssessment::refused(
+                CryptographicEraseRefusal::PayloadPlaintext,
+            );
+        }
+        TransformPayloadClass::CompressedOnly => {
+            return CryptographicEraseAssessment::refused(
+                CryptographicEraseRefusal::PayloadCompressedOnly,
+            );
+        }
+        TransformPayloadClass::Unencrypted => {
+            return CryptographicEraseAssessment::refused(
+                CryptographicEraseRefusal::PayloadUnencrypted,
+            );
+        }
+        TransformPayloadClass::PartiallyTransformed => {
+            return CryptographicEraseAssessment::refused(
+                CryptographicEraseRefusal::PayloadPartiallyTransformed,
+            );
+        }
+        TransformPayloadClass::RawStoreBypassed => {
+            return CryptographicEraseAssessment::refused(
+                CryptographicEraseRefusal::PayloadRawStoreBypassed,
+            );
+        }
+        TransformPayloadClass::PreviouslyExposedMedia => {
+            return CryptographicEraseAssessment::refused(
+                CryptographicEraseRefusal::PayloadPreviouslyExposed,
+            );
+        }
+    }
+
+    if !evidence.transform_metadata_persisted {
+        return CryptographicEraseAssessment::refused(
+            CryptographicEraseRefusal::MissingTransformMetadata,
+        );
+    }
+
+    if !evidence.stored_frame_reachability_proven {
+        return CryptographicEraseAssessment::refused(
+            CryptographicEraseRefusal::StoredFrameReachabilityUnproven,
+        );
+    }
+
+    if !evidence.media_remanence_limits_documented {
+        return CryptographicEraseAssessment::refused(
+            CryptographicEraseRefusal::MediaRemanenceLimitsUnproven,
+        );
+    }
+
+    CryptographicEraseAssessment::prerequisites_satisfied_for_claim_review()
 }
 
 // ── Key lease ─────────────────────────────────────────────────────────────
@@ -600,8 +988,18 @@ impl PoolEncryptionSecretHandle {
         wrapping_key: &PoolWrappingKey,
         now: u64,
     ) -> Result<StoreKey> {
-        if self.record.lifecycle.blocks_lease() {
-            return Err(EncryptionError::KeyDerivationRejected);
+        if !self.record.lifecycle.allows_mount() {
+            let assessment = assess_mounted_pool_key_access(
+                Some(&self.record),
+                None,
+                MountedPoolKeyRecoveryEvidence::CurrentMount,
+            );
+            return Err(EncryptionError::KeyLifecycleAccessRefused {
+                state: assessment.state,
+                reason: assessment
+                    .refusal_reason()
+                    .unwrap_or(MountedPoolKeyAccessRefusal::HandleNotActive),
+            });
         }
 
         let store_key = StoreKey::generate();
@@ -631,8 +1029,18 @@ impl PoolEncryptionSecretHandle {
         duration: Duration,
         usage: LeaseUsageClass,
     ) -> Result<PoolEncryptionKeyLease> {
-        if self.record.lifecycle.blocks_lease() {
-            return Err(EncryptionError::KeyDerivationRejected);
+        let assessment = assess_mounted_pool_key_access(
+            Some(&self.record),
+            Some(dataset_mount_token),
+            MountedPoolKeyRecoveryEvidence::CurrentMount,
+        );
+        if !assessment.allows_lease() {
+            return Err(EncryptionError::KeyLifecycleAccessRefused {
+                state: assessment.state,
+                reason: assessment
+                    .refusal_reason()
+                    .unwrap_or(MountedPoolKeyAccessRefusal::HandleNotActive),
+            });
         }
 
         let dataset_mount_token =
@@ -683,6 +1091,21 @@ impl PoolEncryptionSecretHandle {
     /// Revoke the handle, blocking all future leases.
     pub fn revoke(&mut self, now: u64) {
         self.record.revoke(now);
+    }
+
+    /// Mark the handle as rotating with dual-valid key material.
+    pub fn begin_rotation(&mut self, now: u64) {
+        self.record.begin_rotation(now);
+    }
+
+    /// Quarantine the handle, blocking leases while compromise is investigated.
+    pub fn quarantine(&mut self, now: u64) {
+        self.record.quarantine(now);
+    }
+
+    /// Retire the handle, blocking leases as a terminal lifecycle state.
+    pub fn retire(&mut self, now: u64) {
+        self.record.retire(now);
     }
 
     /// The handle ID for operator display/logging.
@@ -800,7 +1223,217 @@ mod tests {
             Duration::from_secs(60),
             LeaseUsageClass::PoolMount,
         );
-        assert!(result.is_err());
+        assert!(matches!(
+            result,
+            Err(EncryptionError::KeyLifecycleAccessRefused {
+                state: MountedPoolKeyAccessState::Revoked,
+                reason: MountedPoolKeyAccessRefusal::HandleRevoked,
+            })
+        ));
+    }
+
+    #[test]
+    fn quarantined_and_retired_handles_block_lease_with_explicit_refusal() {
+        let wk = dummy_wrapping_key();
+        let token = dummy_mount_token();
+
+        let (mut quarantined, _) =
+            PoolEncryptionSecretHandle::mint("test-pool".into(), token.clone(), &wk, now())
+                .unwrap();
+        quarantined.activate(now());
+        quarantined.quarantine(now() + 1);
+        let result = quarantined.issue_lease(
+            &token,
+            &wk,
+            Duration::from_secs(60),
+            LeaseUsageClass::PoolMount,
+        );
+        assert!(matches!(
+            result,
+            Err(EncryptionError::KeyLifecycleAccessRefused {
+                state: MountedPoolKeyAccessState::Quarantined,
+                reason: MountedPoolKeyAccessRefusal::HandleQuarantined,
+            })
+        ));
+
+        let (mut retired, _) =
+            PoolEncryptionSecretHandle::mint("test-pool".into(), token.clone(), &wk, now())
+                .unwrap();
+        retired.activate(now());
+        retired.retire(now() + 1);
+        let result = retired.issue_lease(
+            &token,
+            &wk,
+            Duration::from_secs(60),
+            LeaseUsageClass::PoolMount,
+        );
+        assert!(matches!(
+            result,
+            Err(EncryptionError::KeyLifecycleAccessRefused {
+                state: MountedPoolKeyAccessState::Retired,
+                reason: MountedPoolKeyAccessRefusal::HandleRetired,
+            })
+        ));
+    }
+
+    #[test]
+    fn active_rotating_missing_stale_and_recovery_states_are_reported() {
+        let wk = dummy_wrapping_key();
+        let token = dummy_mount_token();
+        let stale_token = mount_token(DatasetMountIdentity::new("pool/ds1".into(), 2));
+        let (mut handle, _) =
+            PoolEncryptionSecretHandle::mint("test-pool".into(), token.clone(), &wk, now())
+                .unwrap();
+
+        let missing = assess_mounted_pool_key_access(
+            None,
+            Some(&token),
+            MountedPoolKeyRecoveryEvidence::CurrentMount,
+        );
+        assert_eq!(missing.state, MountedPoolKeyAccessState::Missing);
+        assert_eq!(
+            missing.refusal_reason(),
+            Some(MountedPoolKeyAccessRefusal::MissingHandleRecord)
+        );
+
+        handle.activate(now());
+        let active = assess_mounted_pool_key_access(
+            Some(&handle.record),
+            Some(&token),
+            MountedPoolKeyRecoveryEvidence::CurrentMount,
+        );
+        assert_eq!(active.state, MountedPoolKeyAccessState::Active);
+        assert!(active.allows_lease());
+
+        handle.begin_rotation(now() + 10);
+        let rotating = assess_mounted_pool_key_access(
+            Some(&handle.record),
+            Some(&token),
+            MountedPoolKeyRecoveryEvidence::CurrentMount,
+        );
+        assert_eq!(rotating.state, MountedPoolKeyAccessState::Rotating);
+        assert!(rotating.allows_lease());
+
+        let missing_token = assess_mounted_pool_key_access(
+            Some(&handle.record),
+            None,
+            MountedPoolKeyRecoveryEvidence::CurrentMount,
+        );
+        assert_eq!(missing_token.state, MountedPoolKeyAccessState::Missing);
+        assert_eq!(
+            missing_token.refusal_reason(),
+            Some(MountedPoolKeyAccessRefusal::MissingCommittedMountToken)
+        );
+
+        let stale = assess_mounted_pool_key_access(
+            Some(&handle.record),
+            Some(&stale_token),
+            MountedPoolKeyRecoveryEvidence::CurrentMount,
+        );
+        assert_eq!(stale.state, MountedPoolKeyAccessState::Stale);
+        assert_eq!(
+            stale.refusal_reason(),
+            Some(MountedPoolKeyAccessRefusal::StaleCommittedMountToken)
+        );
+
+        let replay_missing = assess_mounted_pool_key_access(
+            Some(&handle.record),
+            Some(&token),
+            MountedPoolKeyRecoveryEvidence::ReplayMissing,
+        );
+        assert_eq!(
+            replay_missing.state,
+            MountedPoolKeyAccessState::RecoveryAfterCrash
+        );
+        assert_eq!(
+            replay_missing.refusal_reason(),
+            Some(MountedPoolKeyAccessRefusal::RecoveryReplayMissing)
+        );
+
+        let replayed = assess_mounted_pool_key_access(
+            Some(&handle.record),
+            Some(&token),
+            MountedPoolKeyRecoveryEvidence::ReplayedAfterCrash,
+        );
+        assert_eq!(
+            replayed.state,
+            MountedPoolKeyAccessState::RecoveryAfterCrash
+        );
+        assert!(replayed.allows_lease());
+    }
+
+    #[test]
+    fn cryptographic_erase_refuses_without_full_transform_and_media_proof() {
+        let full = CryptographicEraseEvidence::encrypted_with_full_proof();
+        let active = assess_cryptographic_erase_boundary(MountedPoolKeyAccessState::Active, full);
+        assert_eq!(
+            active.refusal,
+            Some(CryptographicEraseRefusal::KeyLifecycleNotDestroyedOrRevoked)
+        );
+        assert!(!active.can_present_as_secure_erase());
+
+        let missing_metadata = assess_cryptographic_erase_boundary(
+            MountedPoolKeyAccessState::Revoked,
+            CryptographicEraseEvidence {
+                transform_metadata_persisted: false,
+                ..full
+            },
+        );
+        assert_eq!(
+            missing_metadata.refusal,
+            Some(CryptographicEraseRefusal::MissingTransformMetadata)
+        );
+
+        let payload_refusals = [
+            (
+                TransformPayloadClass::Plaintext,
+                CryptographicEraseRefusal::PayloadPlaintext,
+            ),
+            (
+                TransformPayloadClass::CompressedOnly,
+                CryptographicEraseRefusal::PayloadCompressedOnly,
+            ),
+            (
+                TransformPayloadClass::Unencrypted,
+                CryptographicEraseRefusal::PayloadUnencrypted,
+            ),
+            (
+                TransformPayloadClass::PartiallyTransformed,
+                CryptographicEraseRefusal::PayloadPartiallyTransformed,
+            ),
+            (
+                TransformPayloadClass::RawStoreBypassed,
+                CryptographicEraseRefusal::PayloadRawStoreBypassed,
+            ),
+            (
+                TransformPayloadClass::PreviouslyExposedMedia,
+                CryptographicEraseRefusal::PayloadPreviouslyExposed,
+            ),
+        ];
+
+        for (payload_class, expected) in payload_refusals {
+            let result = assess_cryptographic_erase_boundary(
+                MountedPoolKeyAccessState::Revoked,
+                CryptographicEraseEvidence {
+                    payload_class,
+                    ..full
+                },
+            );
+            assert_eq!(result.refusal, Some(expected));
+            assert!(!result.can_present_as_secure_erase());
+        }
+    }
+
+    #[test]
+    fn cryptographic_erase_prerequisites_do_not_widen_secure_erase_claims() {
+        let result = assess_cryptographic_erase_boundary(
+            MountedPoolKeyAccessState::Retired,
+            CryptographicEraseEvidence::encrypted_with_full_proof(),
+        );
+
+        assert!(result.eligible_for_claim_review());
+        assert!(!result.can_present_as_secure_erase());
+        assert_eq!(result.non_claim, CRYPTOGRAPHIC_ERASE_NON_CLAIM);
     }
 
     #[test]

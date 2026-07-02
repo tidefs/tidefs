@@ -37,7 +37,7 @@ authority boundary:
 |---|---|---|
 | `crates/tidefs-compression/src/lib.rs` | Describes itself as the compression helper/library tier. Mounted writes currently resolve `ContentCompressionPolicy` and call `encode_content_chunk()` in the local-filesystem content path. | Compression primitive and policy-report helper, not canonical transform dispatch. |
 | `crates/tidefs-compression/src/lib.rs` | Source-owned compression helper/library tier. | Primitive and policy-report helper, not canonical transform dispatch. |
-| `crates/tidefs-encryption/src/lib.rs` and `crates/tidefs-encryption/src/secret_handle.rs` | Provide frame/key helpers and secret-handle helpers, while warning that lower object-store encryption is not an end-to-end mounted filesystem proof. | Encryption primitive and key-handle helper, not canonical dispatch. |
+| `crates/tidefs-encryption/src/lib.rs` and `crates/tidefs-encryption/src/secret_handle.rs` | Provide frame/key helpers, secret-handle helpers, the #1823 mounted key-lifecycle access assessment, and the #1823 cryptographic-erase non-claim assessment, while warning that lower object-store encryption is not an end-to-end mounted filesystem proof. | Encryption primitive, key-handle helper, and key-lifecycle refusal boundary, not canonical transform dispatch or secure-erase proof. |
 | `docs/security/pool-encryption-secret-handle-boundary.md` | Defines the secret-handle/key-lease boundary for pool encryption access. | Key access policy boundary; not ciphertext ordering authority. |
 | `crates/tidefs-checksum-tree/src/lib.rs` | Provides BLAKE3 checksum trees, domain tags, `ChecksumTreeBuilder`, `ChecksumTreeVerifier`, and locator-bound verification helpers. | Checksum evidence primitive consumed by the pipeline. |
 | `crates/tidefs-verification-engine/src/lib.rs` and `crates/tidefs-verification-engine/src/object_verify.rs` | Provide `VerificationPlan`, object verification, batch verification, transfer receipts, and quorum/reporting helpers. | Verification consumer/projection of stored-frame evidence, not transform dispatch. |
@@ -206,6 +206,13 @@ the authority:
 - `docs/MOUNTED_TRANSFORM_AUTHORITY_RAW_STORE_INVENTORY.md` defines the
   guardrail vocabulary and keeps mounted compression/encryption blocked while
   production raw-store rows remain.
+- `tidefs_encryption::secret_handle` now defines the #1823 key-lifecycle
+  boundary for active, rotating, revoked, quarantined, retired, missing, stale,
+  and recovery-after-crash mounted access evidence. Its cryptographic-erase
+  assessment is a non-claim unless persisted transform metadata, stored-frame
+  reachability, media/remanence limits, and fully encrypted payload
+  classification are all proven; even then it only reaches claim review and
+  does not by itself claim secure erase.
 - `docs/ARCHITECTURE.md` lists `tidefs-compression`, `tidefs-encryption`, and
   `tidefs-dedup` as separate product-layer crates rather than one dispatch
   owner.
