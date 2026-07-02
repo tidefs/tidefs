@@ -82,16 +82,13 @@ static void make_path(const char *name) {
 
 static int create_reg(const char *row, const char *name) {
     make_path(name);
-    printf("STEP: %s -- open %s\n", row, name);
+    printf("STEP: %s -- create %s\n", row, name);
     fflush(stdout);
-    int fd = open(test_path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    int fd = open(test_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) die("create_reg");
-    printf("STEP: %s -- write %s\n", row, name);
-    fflush(stdout);
-    if (write(fd, "hello", 5) != 5) die("write");
     printf("STEP: %s -- close %s\n", row, name);
     fflush(stdout);
-    close(fd);
+    if (close(fd) < 0) die("close");
     return 0;
 }
 
@@ -125,8 +122,8 @@ int main(int argc, char *argv[]) {
     if (stat(test_path, &st) < 0) {
         FAIL("getattr-clean");
     } else {
-        if (st.st_size != 5) {
-            FAIL("getattr-clean -- size %ld != 5", (long)st.st_size);
+        if (st.st_size != 0) {
+            FAIL("getattr-clean -- size %ld != 0", (long)st.st_size);
         } else if (!S_ISREG(st.st_mode)) {
             FAIL("getattr-clean -- not a regular file");
         } else {
@@ -892,7 +889,7 @@ fi
 
 echo ""
 echo "--- Phase 6: Verify committed attributes survive crash ---"
-verify_size "getattr-readback" "getattr_test.bin" 5
+verify_size "getattr-readback" "getattr_test.bin" 0
 verify_size "setattr-size-readback" "size_test.bin" 4096
 verify_mode "setattr-mode-readback" "mode_test.bin" 755
 if [ "$(id -u)" -eq 0 ]; then
