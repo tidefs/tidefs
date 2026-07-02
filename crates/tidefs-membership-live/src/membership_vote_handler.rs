@@ -552,21 +552,20 @@ mod tests {
         let sent = sent.lock().unwrap();
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].0, MemberId::new(1));
-        match &sent[0].1 {
-            MembershipOutboundMessage::ProposalAck {
-                responder,
-                proposal_hash,
-                accepted,
-                reject_reason,
-                ..
-            } => {
-                assert_eq!(*responder, MemberId::new(2));
-                assert_eq!(*proposal_hash, [8u8; 32]);
-                assert!(*accepted);
-                assert!(reject_reason.is_none());
-            }
-            other => panic!("expected proposal ack, got {other:?}"),
-        }
+        let MembershipOutboundMessage::ProposalAck {
+            responder,
+            proposal_hash,
+            accepted,
+            reject_reason,
+            ..
+        } = &sent[0].1
+        else {
+            panic!("expected proposal ack, got {:?}", sent[0].1);
+        };
+        assert_eq!(*responder, MemberId::new(2));
+        assert_eq!(*proposal_hash, [8u8; 32]);
+        assert!(*accepted);
+        assert!(reject_reason.is_none());
     }
 
     #[test]
@@ -588,20 +587,19 @@ mod tests {
 
         let sent = sent.lock().unwrap();
         assert_eq!(sent.len(), 1);
-        match &sent[0].1 {
-            MembershipOutboundMessage::ProposalAck {
-                accepted,
-                reject_reason,
-                ..
-            } => {
-                assert!(!accepted);
-                assert!(reject_reason
-                    .as_deref()
-                    .unwrap_or_default()
-                    .contains("duplicate_join"));
-            }
-            other => panic!("expected proposal ack, got {other:?}"),
-        }
+        let MembershipOutboundMessage::ProposalAck {
+            accepted,
+            reject_reason,
+            ..
+        } = &sent[0].1
+        else {
+            panic!("expected proposal ack, got {:?}", sent[0].1);
+        };
+        assert!(!accepted);
+        assert!(reject_reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("duplicate_join"));
     }
 
     #[test]
@@ -611,15 +609,13 @@ mod tests {
             .handle_proposal_submission(&proposal_submission(MembershipDelta::NodeJoined(4)))
             .expect_err("missing vote sender must fail closed");
 
-        match err {
-            MembershipDispatchError::HandlerError(detail) => {
-                assert!(detail.contains("proposal vote delivery unavailable"));
-                assert!(detail.contains("target=1"));
-                assert!(detail.contains("responder=2"));
-                assert!(detail.contains("accepted=true"));
-            }
-            other => panic!("expected handler error, got {other:?}"),
-        }
+        let MembershipDispatchError::HandlerError(detail) = &err else {
+            panic!("expected handler error, got {err:?}");
+        };
+        assert!(detail.contains("proposal vote delivery unavailable"));
+        assert!(detail.contains("target=1"));
+        assert!(detail.contains("responder=2"));
+        assert!(detail.contains("accepted=true"));
     }
 
     #[test]
@@ -635,15 +631,13 @@ mod tests {
             .handle_proposal_submission(&proposal_submission(MembershipDelta::NodeJoined(4)))
             .expect_err("vote sender failure must fail proposal handling");
 
-        match err {
-            MembershipDispatchError::HandlerError(detail) => {
-                assert!(detail.contains("proposal vote delivery failed"));
-                assert!(detail.contains("transport send refused"));
-                assert!(detail.contains("target=1"));
-                assert!(detail.contains("responder=2"));
-            }
-            other => panic!("expected handler error, got {other:?}"),
-        }
+        let MembershipDispatchError::HandlerError(detail) = &err else {
+            panic!("expected handler error, got {err:?}");
+        };
+        assert!(detail.contains("proposal vote delivery failed"));
+        assert!(detail.contains("transport send refused"));
+        assert!(detail.contains("target=1"));
+        assert!(detail.contains("responder=2"));
     }
 
     // ── Config update ───────────────────────────────────────────
