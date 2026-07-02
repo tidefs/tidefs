@@ -675,10 +675,10 @@ evidence_requirements = [
   { class = "claims-gate-review", path = "validation/artifacts/kernel/teardown-no-work-after-claims-gate-review.toml", validation_tier = "source-model", blocking_issues = [] },
 ]
 blockers = [
-  "The recorded teardown proof review is bounded source/model evidence; runtime acceptance is limited to the T5 mounted-kernel-vfs cutover and teardown artifact from #1186 / PR #1463.",
+  "Historical lineage only: closed #1186 / merged PR #1463 recorded bounded T5 mounted-kernel-vfs cutover and teardown runtime acceptance; current proof for the full claim still requires an accepted T6 full-kernel/no-daemon teardown and recovery artifact.",
   "No accepted T6 full-kernel/no-daemon teardown and recovery artifact is registered for this claim.",
 ]
-generated_doc = "Blocked kernel no-work-after-teardown claim. TideFS has bounded source-model context-token and teardown race review evidence plus an accepted T5 mounted-kernel-vfs cutover/teardown artifact, but no accepted T6 full-kernel/no-daemon runtime artifact is registered, so product wording must not validate the full claim."
+generated_doc = "Blocked kernel no-work-after-teardown claim. TideFS has bounded source-model context-token and teardown race review evidence plus historical T5 mounted-kernel-vfs cutover/teardown lineage (closed #1186 / merged PR #1463), but no accepted T6 full-kernel/no-daemon runtime artifact is registered, so product wording must not validate the full claim."
 evidence_artifacts = [
   { class = "kernel-context-token-model", path = "validation/artifacts/kernel/teardown-race-proof-artifact.json" },
   { class = "teardown-race-proof-artifact", path = "validation/artifacts/kernel/teardown-race-proof-artifact.json" },
@@ -727,12 +727,12 @@ evidence_requirements = [
   { class = "claims-gate-review", path = "validation/artifacts/storage-intent/ack-receipt-claims-gate-review.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/ack-receipt-claims-gate-review.manifest.json", blocking_issues = [] },
 ]
 blockers = [
-  "Earned acknowledgment receipts from #842, policy source records from #855, consistent evidence cuts from #913, and caller-visible result/refusal evidence from #920 are not registered as validated runtime evidence for this claim.",
-  "Membership epoch #750, ordering/replay #894, and media capability #904 gates must prove the receipt participants before a volatile, local-intent, quorum-intent, full-placement, geo-async, or geo-intent acknowledgment can be called durable.",
-  "Fault rows from #863 and recovery/degradation evidence from #900 must reject kill-before-ack, crash-after-ack, stale media, and under-quorum cases without silently downgrading the promised receipt class.",
+  "Historical lineage only: closed #842, #855, #913, and #920 recorded bounded earned-receipt, policy-source, evidence-cut, and result/refusal work; current proof requires the `storage-intent-policy-receipt-authority` and `storage-intent-ack-receipt-runtime` manifests, with focused runtime/fault ownership in #1794.",
+  "Historical lineage only: closed #750, #894, and #904 recorded bounded membership, ordering/replay, and media-capability work; current proof requires the `storage-intent-ordering-membership-media-gates` manifest before a volatile, local-intent, quorum-intent, full-placement, geo-async, or geo-intent acknowledgment can be called durable.",
+  "Historical lineage only: closed #863 and #900 recorded bounded fault and recovery/degradation work; current proof requires the `storage-intent-ack-fault-matrix` manifest to reject kill-before-ack, crash-after-ack, stale media, and under-quorum cases without silently downgrading the promised receipt class.",
   "Non-claim boundary: a receipt label, source-model row, simulation, or successful local write is not proof of durable acknowledgment honesty and must not support product-facing durability wording.",
 ]
-generated_doc = "Blocked storage-intent acknowledgment receipt honesty claim. Future wording must show policy-source, earned-receipt, membership, ordering, media-capability, result/refusal, and fault evidence before TideFS may imply that acknowledgments avoid hidden durable-to-volatile downgrades."
+generated_doc = "Blocked storage-intent acknowledgment receipt honesty claim. Future wording must show current policy-source, earned-receipt runtime, membership/ordering/media gates, result/refusal, and fault manifests before TideFS may imply that acknowledgments avoid hidden durable-to-volatile downgrades; closed issue numbers are historical lineage only."
 evidence_artifacts = []
 
 [[claims]]
@@ -754,12 +754,12 @@ evidence_requirements = [
   { class = "claims-gate-review", path = "validation/artifacts/storage-intent/sync-latency-claims-gate-review.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/sync-latency-claims-gate-review.manifest.json", blocking_issues = [] },
 ]
 blockers = [
-  "Performance rows from #850 must bind the exact ack class, p50/p95/p99/tail envelope, media/topology profile, transport path #846, service objective #915, and comparator evidence #928 before any fast-sync claim can strengthen.",
-  "Scheduler admission #862, capacity admission #898, tenant isolation #902, media capability #904, and result/refusal #920 evidence must show low latency was not bought by illegal reserve borrowing, hidden throttling, or weaker receipt semantics.",
-  "Measurement attribution #912 and fault validation #863 must prove row evidence is causal and durable under crash, partition, media, recovery, and degraded-state cases; row-only or average-only evidence is not claim proof.",
+  "Historical lineage only: closed #850, #846, #915, and #928 recorded bounded performance, transport, service-objective, and comparator work; current proof requires the `storage-intent-service-objective-envelope` and `storage-intent-sync-performance-row` manifests for the exact ack class, p50/p95/p99/tail envelope, media/topology profile, and comparator scope.",
+  "Historical lineage only: closed #862, #898, #902, #904, and #920 recorded bounded scheduler, capacity, tenant-isolation, media-capability, and result/refusal work; current proof requires the `storage-intent-scheduler-admission-row` manifest to show low latency was not bought by illegal reserve borrowing, hidden throttling, or weaker receipt semantics.",
+  "Historical lineage only: closed #912 and #863 recorded bounded attribution and fault work; current proof requires the `storage-intent-sync-fault-row` and claims-gate manifests to prove row evidence is causal and durable under crash, partition, media, recovery, and degraded-state cases.",
   "Non-claim boundary: a benchmark row, simulator estimate, class label, or comparator name alone is diagnostic only and must not become OpenZFS/Ceph/DRBD or fast durable sync product wording.",
 ]
-generated_doc = "Blocked storage-intent sync latency envelope claim. Future wording must cite service-objective, performance-row, scheduler/admission, media, attribution, comparator, result/refusal, and fault evidence for the declared envelope before TideFS may claim fast local or quorum sync intent latency."
+generated_doc = "Blocked storage-intent sync latency envelope claim. Future wording must cite current service-objective, performance-row, scheduler/admission, attribution, comparator, result/refusal, fault, and claims-gate manifests for the declared envelope before TideFS may claim fast local or quorum sync intent latency; closed issue numbers are historical lineage only."
 evidence_artifacts = []
 
 [[claims]]
@@ -781,12 +781,12 @@ evidence_requirements = [
   { class = "claims-gate-review", path = "validation/artifacts/storage-intent/placement-satisfaction-claims-gate-review.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/placement-satisfaction-claims-gate-review.manifest.json", blocking_issues = [] },
 ]
 blockers = [
-  "Placement planning #843, predictor evidence #845, media capability #904, decision-frontier evidence #905, and preflight simulation #926 must distinguish candidate evaluation from authority-changing placement.",
-  "Satisfaction reconciliation #874, policy rollout #901, result/refusal #920, action execution #911, and relocation #848 must prove replacements are published and source receipts are retired only after satisfaction remains visible and earned.",
-  "Capacity #898, recovery/degradation #900, performance #850, fault #863, attribution #912, and evidence-query #913 rows must cover relocation, repair, rebuild, rebake, geo catch-up, and failure cases under the declared envelope.",
+  "Historical lineage only: closed #843, #845, #904, #905, and #926 recorded bounded placement-planning, predictor, media-capability, decision-frontier, and preflight work; current proof requires the `storage-intent-placement-decision-frontier` manifest to distinguish candidate evaluation from authority-changing placement.",
+  "Historical lineage only: closed #874, #901, #920, #911, and #848 recorded bounded satisfaction, rollout, result/refusal, action-execution, and relocation work; current proof requires the `storage-intent-satisfaction-reconciler` and `storage-intent-relocation-action-execution` manifests before replacements are published and source receipts are retired.",
+  "Historical lineage only: closed #898, #900, #850, #863, #912, and #913 recorded bounded capacity, recovery/degradation, performance, fault, attribution, and evidence-query work; current proof requires the `storage-intent-placement-performance-fault-rows` manifest for relocation, repair, rebuild, rebake, geo catch-up, and failure cases under the declared envelope.",
   "Non-claim boundary: adaptive placement, decision score, preflight output, simulation-only satisfaction, or copied bytes cannot prove placement correctness or source-retirement safety.",
 ]
-generated_doc = "Blocked storage-intent placement satisfaction claim. Future wording must prove decision frontiers, satisfaction reconciliation, action execution, relocation/source-retirement law, performance, attribution, capacity, recovery, and fault rows before TideFS may claim adaptive placement or relocation preserves satisfaction state and receipts."
+generated_doc = "Blocked storage-intent placement satisfaction claim. Future wording must prove current decision-frontier, satisfaction-reconciliation, relocation/action-execution, performance/fault, and claims-gate manifests before TideFS may claim adaptive placement or relocation preserves satisfaction state and receipts; closed issue numbers are historical lineage only."
 evidence_artifacts = []
 
 [[claims]]
@@ -808,12 +808,12 @@ evidence_requirements = [
   { class = "claims-gate-review", path = "validation/artifacts/storage-intent/flash-wear-claims-gate-review.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/flash-wear-claims-gate-review.manifest.json", blocking_issues = [] },
 ]
 blockers = [
-  "Media cost and wear ledger evidence from #844/#856, capacity admission #898, and media capability #904 must prove unknown WAF, endurance reserve exhaustion, and stale device labels are fail-closed.",
-  "Decision #905, prediction #845, service-objective #915, attribution #912, and evidence-query #913 evidence must bind every movement, promotion, demotion, or cooldown to causal wear and payback data.",
-  "Scheduler #862, relocation #848, prefetch decision #967, prefetch executor #972, performance #850, fault #863, and recovery #900 evidence must show movement does not hide flash-wear harm behind cache warming, relocation, rebuild, or rebake wins.",
+  "Historical lineage only: closed #844/#856, #898, and #904 recorded bounded media-cost, capacity-admission, and media-capability work; current proof requires the `storage-intent-media-cost-wear-ledger` manifest to prove unknown WAF, endurance reserve exhaustion, and stale device labels are fail-closed.",
+  "Historical lineage only: closed #905, #845, #915, #912, and #913 recorded bounded decision, prediction, service-objective, attribution, and evidence-query work; current proof requires the `storage-intent-wear-decision-attribution` manifest to bind every movement, promotion, demotion, or cooldown to causal wear and payback data.",
+  "Historical lineage only: closed #862, #848, #967, #850, #863, and #900 recorded bounded scheduler, relocation, prefetch-decision, performance, fault, and recovery work; current proof also has live executor ownership in #972 through `storage-intent-prefetch-residency-execution` and must show movement does not hide flash-wear harm behind cache warming, relocation, rebuild, or rebake wins.",
   "Non-claim boundary: WAF estimates, device-class labels, simulator projections, or row-only media counters are not proof of flash-wear protection or smarter tiering.",
 ]
-generated_doc = "Blocked storage-intent flash-wear budget claim. Future wording must prove media/cost ledgers, admission, decision and attribution evidence, prefetch/residency execution, performance rows, and fault rows before TideFS may claim flash-friendly placement, learned tiering, or write-amplification protection."
+generated_doc = "Blocked storage-intent flash-wear budget claim. Future wording must prove current media/cost-ledger, admission, decision-attribution, prefetch/residency execution, performance/fault, and claims-gate manifests before TideFS may claim flash-friendly placement, learned tiering, or write-amplification protection; closed issue numbers are historical lineage only."
 evidence_artifacts = []
 
 [[claims]]
@@ -835,12 +835,12 @@ evidence_requirements = [
   { class = "claims-gate-review", path = "validation/artifacts/storage-intent/data-shape-claims-gate-review.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/data-shape-claims-gate-review.manifest.json", blocking_issues = [] },
 ]
 blockers = [
-  "Data-shape policy evidence #878, dataset policy source #855, media capability #904, evidence-query cuts #913, and service objectives #915 must bind record size, compression, digest, dedup, encryption, EC, archive, coalescing, and refusal state.",
-  "Relocation/rebake #848, action execution #911, measurement attribution #912, result/refusal #920, satisfaction #874, and rollout #901 evidence must prove transformed bytes do not imply authority, source retirement, or degraded-read safety before receipts say so.",
-  "Performance #850, fault #863, capacity #898, and recovery #900 evidence must cover CPU cost, read amplification, degraded reconstruction, key epoch, illegal dedup domain, malformed transform frames, and EC/archive under-width cases.",
+  "Historical lineage only: closed #878, #855, #904, #913, and #915 recorded bounded data-shape policy, dataset policy, media-capability, evidence-query, and service-objective work; current proof is owned by #1981 and requires the `storage-intent-data-shape-policy-evidence` manifest to bind record size, compression, digest, dedup, encryption, EC, archive, coalescing, and refusal state.",
+  "Historical lineage only: closed #848, #911, #912, #920, #874, and #901 recorded bounded relocation/rebake, action-execution, attribution, result/refusal, satisfaction, and rollout work; current proof is owned by #1981 and requires the `storage-intent-transform-execution-evidence` and `storage-intent-data-shape-result-boundary` manifests before transformed bytes can imply authority, source retirement, or degraded-read safety.",
+  "Historical lineage only: closed #850, #863, #898, and #900 recorded bounded performance, fault, capacity, and recovery work; current proof is owned by #1981 and requires the `storage-intent-data-shape-performance-fault-rows` manifest to cover CPU cost, read amplification, degraded reconstruction, key epoch, illegal dedup domain, malformed transform frames, and EC/archive under-width cases.",
   "Non-claim boundary: transform labels, class-only evidence, rebake intent, compression ratio, or simulation-only output cannot become data-shape correctness, capacity, performance, or successor wording.",
 ]
-generated_doc = "Blocked storage-intent data-shape honesty claim. Future wording must prove policy evidence, transform execution, result/refusal and satisfaction boundaries, performance rows, and fault rows before TideFS may claim honest compression, digest, dedup, encryption, EC/archive, coalescing, or rebake behavior."
+generated_doc = "Blocked storage-intent data-shape honesty claim. Future wording must prove current policy, transform-execution, result/refusal, performance/fault, and claims-gate manifests before TideFS may claim honest compression, digest, dedup, encryption, EC/archive, coalescing, or rebake behavior; #1981 owns the focused evidence gap and closed issue numbers are historical lineage only."
 evidence_artifacts = []
 
 [[claims]]
@@ -862,12 +862,12 @@ evidence_requirements = [
   { class = "claims-gate-review", path = "validation/artifacts/storage-intent/layout-allocator-claims-gate-review.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/layout-allocator-claims-gate-review.manifest.json", blocking_issues = [] },
 ]
 blockers = [
-  "Layout evidence #880, dataset policy #855, media capability #904, decision frontier #905, and evidence-query #913 must bind fragmentation, free-run pressure, locality, zone/write-pointer, alignment, pending-free, and reclaim debt before allocator claims can strengthen.",
-  "Lifecycle #881, capacity/admission #898, recovery/degradation #900, and temporal #903 evidence must prove pending-free and reclaim frontiers are current and legal before reuse, defrag, compaction, or source retirement.",
-  "Relocation #848, action execution #911, attribution #912, scheduler #862, tenant isolation #902, performance #850, fault #863, and result/refusal #920 rows must cover crashes, ENOSPC, reserve erosion, wrong-generation layout evidence, and zone/alignment incompatibility.",
+  "Historical lineage only: closed #880, #855, #904, #905, and #913 recorded bounded layout, dataset-policy, media-capability, decision-frontier, and evidence-query work; current proof requires the `storage-intent-layout-policy-evidence` manifest to bind fragmentation, free-run pressure, locality, zone/write-pointer, alignment, pending-free, and reclaim debt before allocator claims can strengthen.",
+  "Historical lineage only: closed #881, #898, #900, and #903 recorded bounded lifecycle, capacity/admission, recovery/degradation, and temporal work; current proof requires the `storage-intent-lifecycle-capacity-evidence` manifest to prove pending-free and reclaim frontiers are current and legal before reuse, defrag, compaction, or source retirement.",
+  "Historical lineage only: closed #848, #911, #912, #862, #902, #850, #863, and #920 recorded bounded relocation, action-execution, attribution, scheduler, isolation, performance, fault, and result/refusal work; current proof requires the `storage-intent-layout-action-execution` and `storage-intent-layout-performance-fault-rows` manifests for crashes, ENOSPC, reserve erosion, wrong-generation layout evidence, and zone/alignment incompatibility.",
   "Non-claim boundary: free-space mirrors, fragmentation scores, pending-free queues, simulator output, or defrag row labels are not allocator/layout correctness proof.",
 ]
-generated_doc = "Blocked storage-intent allocator/layout honesty claim. Future wording must prove layout policy, lifecycle and capacity frontiers, action execution, result/refusal, performance rows, and fault rows before TideFS may claim safe defrag, compaction, zone alignment, pending-free reuse, reclaim, or fragmentation improvement."
+generated_doc = "Blocked storage-intent allocator/layout honesty claim. Future wording must prove current layout-policy, lifecycle/capacity, action-execution, performance/fault, and claims-gate manifests before TideFS may claim safe defrag, compaction, zone alignment, pending-free reuse, reclaim, or fragmentation improvement; closed issue numbers are historical lineage only."
 evidence_artifacts = []
 
 [[claims]]
@@ -889,12 +889,12 @@ evidence_requirements = [
   { class = "claims-gate-review", path = "validation/artifacts/storage-intent/geo-async-rpo-claims-gate-review.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/geo-async-rpo-claims-gate-review.manifest.json", blocking_issues = [] },
 ]
 blockers = [
-  "Transport path #846, membership #750, policy source #855, media capability #904, evidence-query #913, and result/refusal #920 evidence must bind WAN/internet and RDMA-absent baselines before geo claims can strengthen.",
-  "Temporal #903, lifecycle #881, recovery/degradation #900, policy rollout #901, satisfaction #874, capacity #898, and tenant isolation #902 evidence must prove lag, catch-up, freshness, backlog, and degraded-visible boundaries.",
-  "Performance #850, fault #863, service objective #915, attribution #912, and earned ack receipts #842 must cover partitions, latency stretch, packet loss, bandwidth clamp, stale clocks, and remote-lag forbidden outcomes.",
+  "Historical lineage only: closed #846, #750, #855, #904, #913, and #920 recorded bounded transport, membership, policy-source, media-capability, evidence-query, and result/refusal work; current proof is owned by #1795 and requires the `storage-intent-geo-transport-policy` and `storage-intent-geo-result-boundary` manifests to bind WAN/internet and RDMA-absent baselines.",
+  "Historical lineage only: closed #903, #881, #900, #901, #874, #898, and #902 recorded bounded temporal, lifecycle, recovery/degradation, rollout, satisfaction, capacity, and tenant-isolation work; current proof is owned by #1795 and requires the `storage-intent-geo-temporal-recovery` manifest for lag, catch-up, freshness, backlog, and degraded-visible boundaries.",
+  "Historical lineage only: closed #850, #863, #915, #912, and #842 recorded bounded performance, fault, service-objective, attribution, and earned-ack work; current proof is owned by #1795 and requires the `storage-intent-geo-performance-fault-rows` manifest for partitions, latency stretch, packet loss, bandwidth clamp, stale clocks, and remote-lag forbidden outcomes.",
   "Non-claim boundary: RDMA availability, TCP connectivity, geo backlog counters, stale-read labels, or simulation-only preflight output do not prove RPO seconds, latest-read freshness, or geo-intent correctness.",
 ]
-generated_doc = "Blocked storage-intent geo-async RPO claim. Future wording must prove WAN/internet transport, temporal lag, recovery/degradation, policy rollout, service-objective, performance, attribution, result/refusal, and fault evidence before TideFS may claim geo-async RPO or geo-intent behavior without RDMA as a correctness dependency."
+generated_doc = "Blocked storage-intent geo-async RPO claim. Future wording must prove current WAN/internet transport, temporal recovery, performance/fault, result-boundary, and claims-gate manifests before TideFS may claim geo-async RPO or geo-intent behavior without RDMA as a correctness dependency; #1795 owns the focused evidence gap and closed issue numbers are historical lineage only."
 evidence_artifacts = []
 
 [[claims]]
@@ -916,12 +916,12 @@ evidence_requirements = [
   { class = "claims-gate-review", path = "validation/artifacts/storage-intent/ram-authority-claims-gate-review.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/ram-authority-claims-gate-review.manifest.json", blocking_issues = [] },
 ]
 blockers = [
-  "RAM authority #847, dataset policy #855, evidence-query #913, service-objective #915, media capability #904, and media-native convergence #957 must distinguish volatile RAM, replicated volatile RAM, PMem persistence domains, and intent-backed authority.",
-  "Ack receipts #842, ordering #894, membership #750, satisfaction #874, rollout #901, isolation #902, and result/refusal #920 evidence must make loss boundaries caller-visible instead of silently treating volatile success as durable POSIX or block barriers.",
-  "Performance #850, fault #863, and recovery/degradation #900 rows must cover RAM loss, node loss, stale replicas, PMem flush/FUA/barrier gaps, and degradation without upgrading volatile evidence into durability proof.",
+  "Historical lineage only: closed #847, #855, #913, #915, #904, and #957 recorded bounded RAM-authority, dataset-policy, evidence-query, service-objective, media-capability, and media-native convergence work; current proof requires the `storage-intent-ram-authority-policy` manifest to distinguish volatile RAM, replicated volatile RAM, PMem persistence domains, and intent-backed authority.",
+  "Historical lineage only: closed #842, #894, #750, #874, #901, #902, and #920 recorded bounded ack-receipt, ordering, membership, satisfaction, rollout, isolation, and result/refusal work; current proof requires the `storage-intent-ram-media-receipt-gates` and `storage-intent-ram-result-boundary` manifests to make loss boundaries caller-visible instead of silently treating volatile success as durable POSIX or block barriers.",
+  "Historical lineage only: closed #850, #863, and #900 recorded bounded performance, fault, and recovery/degradation work; current proof requires the `storage-intent-ram-performance-fault-rows` manifest to cover RAM loss, node loss, stale replicas, PMem flush/FUA/barrier gaps, and degradation without upgrading volatile evidence into durability proof.",
   "Non-claim boundary: RAM-fast latency, replicated-copy counts, PMem labels, or source-model authority text do not prove durable RAM authority or loss-boundary safety.",
 ]
-generated_doc = "Blocked storage-intent RAM authority loss-boundary claim. Future wording must prove RAM authority policy, media/receipt gates, membership and ordering, result/refusal visibility, performance rows, and fault rows before TideFS may claim RAM-fast, replicated, PMem-backed, or intent-backed authority durability."
+generated_doc = "Blocked storage-intent RAM authority loss-boundary claim. Future wording must prove current RAM-authority policy, media/receipt gates, result-boundary, performance/fault, and claims-gate manifests before TideFS may claim RAM-fast, replicated, PMem-backed, or intent-backed authority durability; closed issue numbers are historical lineage only."
 evidence_artifacts = []
 
 [[claims]]
@@ -943,12 +943,12 @@ evidence_requirements = [
   { class = "claims-gate-review", path = "validation/artifacts/successor/local-successor-comparator-claims-gate-review.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/successor/local-successor-comparator-claims-gate-review.manifest.json", blocking_issues = [] },
 ]
 blockers = [
-  "Local comparator equivalence #928/#930, performance #850, attribution #912, service-objective #915, and fault #863 evidence must bind exact local filesystems, DRBD envelopes, media, mount mode, workload, and failure scope before local successor wording can strengthen.",
-  "Boundary review #875, result/refusal #920, and preflight #926 must keep local runtime artifacts from implying distributed, clustered, release-ready, or production-ready behavior.",
-  "Operator explanation #849 and evidence-query #913 must expose residual limitations, refusal states, measured envelopes, and non-comparable local-storage cases.",
+  "Historical lineage only: closed #928/#930, #850, #912, #915, and #863 recorded bounded comparator, performance, attribution, service-objective, and fault source/model work; current proof requires the `local-storage-comparator-equivalence-evidence` and `local-storage-successor-performance-fault-set` manifests under `validation/artifacts/successor/`.",
+  "Historical lineage only: closed #875, #920, and #926 recorded bounded boundary-review, result/refusal, and preflight work; current admission ownership remains in product-gap umbrellas #1733/#1734/#1737/#1739/#1740/#1741/#1743/#1744 plus a missing focused local-successor artifact child, and local runtime rows must not imply distributed, clustered, release-ready, or production-ready behavior.",
+  "Historical lineage only: closed #849 and #913 recorded bounded operator-explanation and evidence-query work; closed #1796 / merged PR #1948 recorded bounded successor-explanation CLI lineage; current proof still requires `local-storage-successor-claim-boundary-review`, `local-storage-operator-explanation-evidence`, and `claims-gate-review` manifests.",
   "Non-claim boundary: a local benchmark, source-model pass, row label, or incumbent name is not permission to claim OpenZFS, DRBD, ext4/XFS, or local-filesystem successor or superiority status.",
 ]
-generated_doc = "Blocked local-storage successor/comparator claim. Future wording must prove local comparator equivalence, mounted performance and fault evidence, attribution, operator explanation, and local claim-boundary review before TideFS may claim local OpenZFS, DRBD, ext4/XFS, local-filesystem successor, superiority, or comparator-performance status."
+generated_doc = "Blocked local-storage successor/comparator claim. Future wording must prove current local comparator-equivalence, mounted performance/fault, claim-boundary review, operator-explanation, and claims-gate manifests before TideFS may claim local OpenZFS, DRBD, ext4/XFS, local-filesystem successor, superiority, or comparator-performance status; closed issue numbers are historical lineage only."
 evidence_artifacts = []
 
 [[claims]]
@@ -970,12 +970,12 @@ evidence_requirements = [
   { class = "claims-gate-review", path = "validation/artifacts/successor/distributed-successor-comparator-claims-gate-review.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/successor/distributed-successor-comparator-claims-gate-review.manifest.json", blocking_issues = [] },
 ]
 blockers = [
-  "Distributed comparator equivalence #928/#930, transport #846, membership #750, service-objective #915, attribution #912, and evidence-query #913 must bind exact cluster topology, network, workload, media, cost, and failure envelopes before distributed successor wording can strengthen.",
-  "Performance #850, fault #863, recovery/degradation #900, and media capability #904 evidence must cover partitions, node loss, repair/rebuild, degraded-visible states, and non-comparable distributed envelopes.",
-  "Operator explanation #849, rollout #901, tenant isolation #902, result/refusal #920, and preflight #926 must expose residual limitations, refusal states, and degraded behavior before product-facing distributed comparisons are allowed.",
+  "Historical lineage only: closed #928/#930, #846, #750, #915, #912, and #913 recorded bounded comparator, transport, membership, service-objective, attribution, and evidence-query work; current proof requires the `distributed-storage-comparator-equivalence-evidence` manifest for exact cluster topology, network, workload, media, cost, and failure envelopes.",
+  "Historical lineage only: closed #850, #863, #900, and #904 recorded bounded performance, fault, recovery/degradation, and media-capability work; current proof requires the `distributed-storage-successor-performance-fault-set` manifest and live distributed admission ownership in #1735/#1741/#1745.",
+  "Historical lineage only: closed #849, #901, #902, #920, and #926 recorded bounded operator, rollout, isolation, result/refusal, and preflight work; closed #1796 / merged PR #1948 recorded bounded successor-explanation CLI lineage; current proof still requires `distributed-storage-successor-claim-boundary-review`, `distributed-storage-operator-explanation-evidence`, and `claims-gate-review` manifests.",
   "Non-claim boundary: a cluster prototype, placement receipt, source-model proof, row label, or incumbent name is not permission to claim OpenZFS, Ceph, DRBD, clustered-storage successor or superiority status.",
 ]
-generated_doc = "Blocked distributed-storage successor/comparator claim. Future wording must prove distributed comparator equivalence, multi-process performance and fault evidence, transport, membership, recovery, attribution, operator explanation, and distributed claim-boundary review before TideFS may claim OpenZFS, Ceph, DRBD, clustered-storage successor, superiority, or comparator-performance status."
+generated_doc = "Blocked distributed-storage successor/comparator claim. Future wording must prove current distributed comparator-equivalence, multi-process performance/fault, claim-boundary review, operator-explanation, and claims-gate manifests before TideFS may claim OpenZFS, Ceph, DRBD, clustered-storage successor, superiority, or comparator-performance status; closed issue numbers are historical lineage only."
 evidence_artifacts = []
 
 [[claims]]
@@ -998,9 +998,9 @@ evidence_requirements = [
 ]
 blockers = [
   "Split claim ids `storage.local.successor_comparator.v1` and `storage.distributed.successor_comparator.v1` must validate independently before the umbrella boundary can support product-facing successor or comparator wording.",
-  "Policy receipts #841, placement #843, media/wear #844, prediction #845, relocation #848, policy config #855, cost #856, scheduler #862, satisfaction #874, data-shape #878, layout #880, decision frontier #905, result/refusal #920, and preflight #926 boundaries must be claim-ready before successor wording can consume them.",
-  "Operator explanation #849, rollout #901, tenant isolation #902, temporal #903, evidence-query #913, and result/refusal #920 evidence must expose residual limitations, refusals, degraded-visible states, and non-comparable envelopes.",
+  "Historical lineage only: closed #841, #843, #844, #845, #848, #855, #856, #862, #874, #878, #880, #905, #920, and #926 recorded bounded storage-intent policy, placement, media/wear, prediction, relocation, config, cost, scheduler, satisfaction, data-shape, layout, decision-frontier, result/refusal, and preflight lineage; current proof requires the split claim receipts plus the `storage-intent-successor-claim-boundary-review` manifest, product-admission umbrellas #1733-#1745, and focused runtime/evidence owners such as #972, #1794, #1795, and #1981 where applicable.",
+  "Historical lineage only: closed #849, #901, #902, #903, #913, and #920 recorded bounded operator, rollout, isolation, temporal, evidence-query, and result/refusal work; closed #1796 / merged PR #1948 recorded bounded successor-explanation CLI lineage; current proof still requires `storage-intent-operator-explanation-evidence` and `claims-gate-review` manifests to expose residual limitations, refusals, degraded-visible states, and non-comparable envelopes.",
   "Non-claim boundary: naming OpenZFS, Ceph, DRBD, local filesystems, an average throughput win, a benchmark class, or a row label is not product-language permission without a validated claim for the exact scope.",
 ]
-generated_doc = "Blocked storage-intent successor/comparator umbrella claim. Future wording must keep local and distributed successor truth in their split claim ids, prove both split evidence trains plus every consumed storage-intent boundary, and preserve operator explanation before TideFS may use broad successor, superiority, or comparator-performance wording."
+generated_doc = "Blocked storage-intent successor/comparator umbrella claim. Future wording must keep local and distributed successor truth in their split claim ids, prove current split-claim receipts, storage-intent boundary review, operator-explanation, and claims-gate manifests, and preserve live product-admission ownership before TideFS may use broad successor, superiority, or comparator-performance wording; closed issue numbers are historical lineage only."
 evidence_artifacts = []
