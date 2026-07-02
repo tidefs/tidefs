@@ -120,8 +120,7 @@ du -sh /root/ai/tmp /root/ai/state /root/tidefs-worktrees 2>/dev/null || true
 
 ## Current Work Selection Note
 
-The active FUSE/xfstests top VFS burn-down may be owned by another Codex.
-Codex0 and helpers should prefer non-overlapping work such as storage
-durability, kernel pool authority, operator UAPI, device lifecycle, snapshots,
-transport/cluster authority, and coordination tooling unless explicitly taking
-over a VFS issue.
+This workflow is process authority, not a topical priority list. Work
+selection comes from live GitHub issues, pull requests, repository docs, and
+the current Codex Nexus view; choose only non-overlapping prepared work unless
+an existing owner explicitly hands off a slice.
