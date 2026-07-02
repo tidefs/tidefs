@@ -22,9 +22,10 @@ use tidefs_local_filesystem::{
     inspect_filesystem_content_objects_with_root_authentication_key, intent_log_head_object_key,
     orphan_index_object_key, plan_root_retention_with_root_authentication_key,
     space_counters_object_key, superblock_object_key, verify_online_with_root_authentication_key,
-    OnlineVerifierIssueSeverity, OnlineVerifierReport, RootAuthenticationKey, RootRetentionPolicy,
+    LocalFileSystem, OnlineVerifierIssueSeverity, OnlineVerifierReport, RootAuthenticationKey,
+    RootRetentionPolicy, ROOT_AUTHENTICATION_ENV_VAR,
 };
-use tidefs_local_object_store::{checksum64, LocalObjectStore, ObjectKey, StoreOptions};
+use tidefs_local_object_store::{checksum64, LocalObjectStore, ObjectKey, Pool, StoreOptions};
 
 // ── Finding types ──────────────────────────────────────────────────────
 
@@ -269,6 +270,40 @@ pub struct FilesystemContentInspectionSummary {
     pub malformed_records: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AuthenticatedFilesystemVerificationState {
+    NotPerformed,
+    Performed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct AuthenticatedFilesystemVerificationStatus {
+    pub status: AuthenticatedFilesystemVerificationState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl AuthenticatedFilesystemVerificationStatus {
+    fn not_performed(reason: impl Into<String>) -> Self {
+        Self {
+            status: AuthenticatedFilesystemVerificationState::NotPerformed,
+            key_source: Some(ROOT_AUTHENTICATION_ENV_VAR.to_string()),
+            reason: Some(reason.into()),
+        }
+    }
+
+    fn performed() -> Self {
+        Self {
+            status: AuthenticatedFilesystemVerificationState::Performed,
+            key_source: Some(ROOT_AUTHENTICATION_ENV_VAR.to_string()),
+            reason: None,
+        }
+    }
+}
+
 // ── Report ─────────────────────────────────────────────────────────────
 
 /// Aggregate scrub report collecting findings and statistics.
@@ -287,6 +322,8 @@ pub struct ScrubReport {
     pub elapsed_secs: f64,
     /// Store root path that was scrubbed.
     pub store_root: String,
+    /// Authenticated filesystem-root verification run status.
+    pub authenticated_filesystem_verification: AuthenticatedFilesystemVerificationStatus,
     /// Read-only local-filesystem verifier summary when filesystem roots are present.
     pub filesystem_verifier: Option<FilesystemVerifierSummary>,
     /// Read-only content reference inspection summary when filesystem roots are present.
@@ -325,6 +362,8 @@ impl ScrubReport {
             findings: Vec::new(),
             elapsed_secs,
             store_root,
+            authenticated_filesystem_verification:
+                AuthenticatedFilesystemVerificationStatus::not_performed("not evaluated"),
             filesystem_verifier: None,
             content_inspection: None,
             referenced_objects: 0,
@@ -398,22 +437,40 @@ impl ScrubReport {
             "  checksums:     {} ok / {} total ({:.1}% coverage)\n",
             self.records_checksummed, self.total_keys, self.checksum_coverage_pct,
         ));
-        if let Some(verifier) = &self.filesystem_verifier {
-            out.push_str(&format!(
-                "  fs verifier:   {} (roots={}, content_objects={}, chunks={}, issues={})\n",
-                verifier.outcome,
-                verifier.verified_committed_roots,
-                verifier.checked_content_objects,
-                verifier.checked_content_chunks,
-                verifier.issue_count
-            ));
-            if self.referenced_objects > 0 || self.unreachable_objects > 0 {
+        match self.authenticated_filesystem_verification.status {
+            AuthenticatedFilesystemVerificationState::NotPerformed => {
+                let reason = self
+                    .authenticated_filesystem_verification
+                    .reason
+                    .as_deref()
+                    .unwrap_or("root-authentication key unavailable");
                 out.push_str(&format!(
-                    "  fs objects:    {} referenced, {} unreachable (policy={})\n",
-                    self.referenced_objects,
-                    self.unreachable_objects,
-                    self.unreachable_object_policy.as_str()
+                    "  auth fs verify: not performed ({reason}); object checksums and segment chain reported separately\n"
                 ));
+            }
+            AuthenticatedFilesystemVerificationState::Performed => {
+                if let Some(verifier) = &self.filesystem_verifier {
+                    out.push_str(&format!(
+                        "  auth fs verify: {} (roots={}, content_objects={}, chunks={}, issues={})\n",
+                        verifier.outcome,
+                        verifier.verified_committed_roots,
+                        verifier.checked_content_objects,
+                        verifier.checked_content_chunks,
+                        verifier.issue_count
+                    ));
+                } else {
+                    out.push_str(
+                        "  auth fs verify: performed (no committed filesystem roots reported)\n",
+                    );
+                }
+                if self.referenced_objects > 0 || self.unreachable_objects > 0 {
+                    out.push_str(&format!(
+                        "  fs objects:    {} referenced, {} unreachable (policy={})\n",
+                        self.referenced_objects,
+                        self.unreachable_objects,
+                        self.unreachable_object_policy.as_str()
+                    ));
+                }
             }
         }
         if let Some(inspection) = &self.content_inspection {
@@ -454,10 +511,45 @@ impl ScrubReport {
 /// Read-only scrub walker that opens a local object store, walks every key,
 /// and verifies payload checksums and compression frame integrity.
 pub struct ScrubWalker {
-    store: LocalObjectStore,
+    store: ScrubObjectStore,
     root: String,
     root_path: PathBuf,
     unreachable_policy: UnreachableObjectPolicy,
+}
+
+enum ScrubObjectStore {
+    Local(LocalObjectStore),
+    DevelopmentPool(Pool),
+}
+
+impl ScrubObjectStore {
+    fn raw_store(&self) -> &LocalObjectStore {
+        match self {
+            Self::Local(store) => store,
+            Self::DevelopmentPool(pool) => pool.raw_primary_store(),
+        }
+    }
+
+    fn list_keys(&self) -> Vec<ObjectKey> {
+        self.raw_store().list_keys()
+    }
+
+    fn get(&self, key: ObjectKey) -> tidefs_local_object_store::Result<Option<Vec<u8>>> {
+        self.raw_store().get(key)
+    }
+
+    fn location_of(&self, key: ObjectKey) -> Option<tidefs_local_object_store::ObjectLocation> {
+        self.raw_store().location_of(key)
+    }
+
+    fn verify_segment_chain(
+        &self,
+    ) -> tidefs_local_object_store::Result<(
+        tidefs_local_object_store::SegmentChainStats,
+        tidefs_local_object_store::SuspectLog,
+    )> {
+        self.raw_store().verify_segment_chain()
+    }
 }
 
 impl ScrubWalker {
@@ -472,14 +564,28 @@ impl ScrubWalker {
         unreachable_policy: UnreachableObjectPolicy,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let root_path = root.as_ref().to_path_buf();
-        let store =
-            LocalObjectStore::open_read_only_with_options(&root_path, StoreOptions::default())?
-                .ok_or_else(|| {
-                    io::Error::new(
+        let store = match LocalObjectStore::open_read_only_with_options(
+            &root_path,
+            StoreOptions::default(),
+        )? {
+            Some(store) => ScrubObjectStore::Local(store),
+            None => {
+                let device_path = LocalFileSystem::default_development_device_path(&root_path);
+                if !device_path.is_file() {
+                    return Err(Box::new(io::Error::new(
                         io::ErrorKind::NotFound,
                         format!("store root does not exist: {}", root_path.display()),
-                    )
-                })?;
+                    )));
+                }
+                let options = StoreOptions {
+                    repair_torn_tail: false,
+                    ..Default::default()
+                };
+                ScrubObjectStore::DevelopmentPool(LocalFileSystem::default_development_pool(
+                    &root_path, &options, None, None,
+                )?)
+            }
+        };
         Ok(Self {
             store,
             root: root_path.display().to_string(),
@@ -561,8 +667,16 @@ impl ScrubWalker {
             repair_torn_tail: false,
             ..Default::default()
         };
-        let root_key = RootAuthenticationKey::from_environment()
-            .unwrap_or_else(|_| RootAuthenticationKey::demo_key());
+        let root_key = match RootAuthenticationKey::from_environment() {
+            Ok(root_key) => root_key,
+            Err(error) => {
+                report.authenticated_filesystem_verification =
+                    AuthenticatedFilesystemVerificationStatus::not_performed(error.to_string());
+                return Ok(());
+            }
+        };
+        report.authenticated_filesystem_verification =
+            AuthenticatedFilesystemVerificationStatus::performed();
         let verifier =
             verify_online_with_root_authentication_key(&self.root_path, options, root_key)?;
         if verifier.root_slot_records_seen == 0 && verifier.issues.is_empty() {
@@ -583,6 +697,9 @@ impl ScrubWalker {
             });
         }
         report.filesystem_verifier = Some(FilesystemVerifierSummary::from_report(&verifier));
+        if verifier.verified_committed_roots.is_empty() {
+            return Ok(());
+        }
 
         let inspection_options = StoreOptions {
             repair_torn_tail: false,
@@ -803,6 +920,71 @@ mod tests {
     };
     use tidefs_local_object_store::{LocalObjectStore, StoreOptions};
 
+    static ROOT_AUTH_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct RootAuthEnvGuard {
+        _guard: std::sync::MutexGuard<'static, ()>,
+        previous: Option<String>,
+    }
+
+    impl RootAuthEnvGuard {
+        fn set(value: Option<String>) -> Self {
+            let guard = ROOT_AUTH_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let previous = std::env::var(ROOT_AUTHENTICATION_ENV_VAR).ok();
+            match value {
+                Some(value) => std::env::set_var(ROOT_AUTHENTICATION_ENV_VAR, value),
+                None => std::env::remove_var(ROOT_AUTHENTICATION_ENV_VAR),
+            }
+            Self {
+                _guard: guard,
+                previous,
+            }
+        }
+    }
+
+    impl Drop for RootAuthEnvGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var(ROOT_AUTHENTICATION_ENV_VAR, value),
+                None => std::env::remove_var(ROOT_AUTHENTICATION_ENV_VAR),
+            }
+        }
+    }
+
+    fn root_auth_key(byte: u8) -> RootAuthenticationKey {
+        RootAuthenticationKey::from_bytes32([byte; 32])
+    }
+
+    fn root_auth_key_hex(byte: u8) -> String {
+        format!("{byte:02x}").repeat(32)
+    }
+
+    fn demo_key_hex() -> String {
+        "41".repeat(32)
+    }
+
+    fn open_test_pool(root: &Path) -> Pool {
+        LocalFileSystem::default_development_pool(root, &StoreOptions::test_fast(), None, None)
+            .expect("open test pool")
+    }
+
+    fn write_test_file(root: &Path, root_key: RootAuthenticationKey) -> ObjectKey {
+        let mut fs = LocalFileSystem::open_with_root_authentication_key(
+            root,
+            StoreOptions::test_fast(),
+            root_key,
+        )
+        .expect("open fs");
+        fs.create_file("/hello.txt", 0o644).expect("create file");
+        fs.write_file("/hello.txt", 0, b"hello verifier")
+            .expect("write file");
+        fs.sync_all().expect("sync committed root");
+        let record = fs.stat("/hello.txt").expect("stat file");
+        content_object_key_for_version(record.inode_id, record.data_version)
+    }
+
     fn create_test_store() -> (TempDir, LocalObjectStore) {
         let dir = TempDir::new().unwrap();
         let store_path = dir.path().join("store");
@@ -813,17 +995,8 @@ mod tests {
     fn scrub_report_with_orphan(policy: UnreachableObjectPolicy) -> (usize, ScrubReport) {
         let dir = TempDir::new().unwrap();
         let root = dir.path().join("fs");
-        let mut fs = LocalFileSystem::open_with_root_authentication_key(
-            &root,
-            StoreOptions::test_fast(),
-            RootAuthenticationKey::demo_key(),
-        )
-        .expect("open fs");
-        fs.create_file("/hello.txt", 0o644).expect("create file");
-        fs.write_file("/hello.txt", 0, b"hello verifier")
-            .expect("write file");
-        fs.sync_all().expect("sync committed root");
-        drop(fs);
+        write_test_file(&root, RootAuthenticationKey::demo_key());
+        let _env = RootAuthEnvGuard::set(Some(demo_key_hex()));
 
         let base_report = ScrubWalker::open(&root)
             .expect("open base scrub walker")
@@ -831,13 +1004,14 @@ mod tests {
             .expect("base scrub");
         let base_unreachable = base_report.unreachable_objects;
 
-        let mut store = LocalObjectStore::open_with_options(&root, StoreOptions::test_fast())
-            .expect("open store");
-        store
+        let mut pool = open_test_pool(&root);
+        pool.raw_primary_store_mut()
             .put_named("tidefs-scrub-test-orphan", b"orphan payload")
             .expect("write orphan object");
-        store.sync_all().expect("sync orphan object");
-        drop(store);
+        pool.raw_primary_store_mut()
+            .sync_all()
+            .expect("sync orphan object");
+        drop(pool);
 
         let report = ScrubWalker::open_with_unreachable_policy(&root, policy)
             .expect("open scrub walker")
@@ -849,6 +1023,7 @@ mod tests {
 
     #[test]
     fn clean_store_produces_no_findings() {
+        let _env = RootAuthEnvGuard::set(None);
         let (_dir, mut store) = create_test_store();
         for i in 0..5 {
             store
@@ -866,6 +1041,10 @@ mod tests {
         assert_eq!(report.total_keys, 5);
         assert_eq!(report.ok, 5);
         assert_eq!(report.bytes_processed, 40);
+        assert_eq!(
+            report.authenticated_filesystem_verification.status,
+            AuthenticatedFilesystemVerificationState::NotPerformed
+        );
         assert_eq!(report.exit_code(), 0);
     }
 
@@ -873,22 +1052,18 @@ mod tests {
     fn filesystem_committed_root_adds_verifier_summary() {
         let dir = TempDir::new().unwrap();
         let root = dir.path().join("fs");
-        let mut fs = LocalFileSystem::open_with_root_authentication_key(
-            &root,
-            StoreOptions::test_fast(),
-            RootAuthenticationKey::demo_key(),
-        )
-        .expect("open fs");
-        fs.create_file("/hello.txt", 0o644).expect("create file");
-        fs.write_file("/hello.txt", 0, b"hello verifier")
-            .expect("write file");
-        fs.sync_all().expect("sync committed root");
-        drop(fs);
+        let root_key = root_auth_key(0x11);
+        write_test_file(&root, root_key);
+        let _env = RootAuthEnvGuard::set(Some(root_auth_key_hex(0x11)));
 
         let walker = ScrubWalker::open(&root).expect("open scrub walker");
         let report = walker.walk().expect("scrub fs root");
 
         assert!(report.is_clean(), "{:?}", report.findings);
+        assert_eq!(
+            report.authenticated_filesystem_verification.status,
+            AuthenticatedFilesystemVerificationState::Performed
+        );
         let verifier = report
             .filesystem_verifier
             .expect("filesystem verifier summary");
@@ -897,6 +1072,102 @@ mod tests {
         assert!(verifier.checked_content_objects > 0);
         assert_eq!(verifier.issue_count, 0);
         assert!(!verifier.mutating_repair_attempted);
+    }
+
+    #[test]
+    fn filesystem_verifier_missing_env_reports_not_performed() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("fs");
+        write_test_file(&root, root_auth_key(0x11));
+        let _env = RootAuthEnvGuard::set(None);
+
+        let report = ScrubWalker::open(&root)
+            .expect("open scrub walker")
+            .walk()
+            .expect("scrub fs root");
+
+        assert!(report.is_clean(), "{:?}", report.findings);
+        assert_eq!(
+            report.authenticated_filesystem_verification.status,
+            AuthenticatedFilesystemVerificationState::NotPerformed
+        );
+        assert_eq!(
+            report
+                .authenticated_filesystem_verification
+                .key_source
+                .as_deref(),
+            Some(ROOT_AUTHENTICATION_ENV_VAR)
+        );
+        assert!(report
+            .authenticated_filesystem_verification
+            .reason
+            .as_deref()
+            .expect("not-performed reason")
+            .contains("missing root authentication key"));
+        assert!(report.filesystem_verifier.is_none());
+        assert!(report.content_inspection.is_none());
+        assert!(report.records_checksummed > 0);
+        assert!(report
+            .text_summary()
+            .contains("auth fs verify: not performed"));
+    }
+
+    #[test]
+    fn filesystem_verifier_invalid_env_reports_not_performed() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("fs");
+        write_test_file(&root, root_auth_key(0x11));
+        let _env = RootAuthEnvGuard::set(Some("not-a-root-auth-key".to_string()));
+
+        let report = ScrubWalker::open(&root)
+            .expect("open scrub walker")
+            .walk()
+            .expect("scrub fs root");
+
+        assert!(report.is_clean(), "{:?}", report.findings);
+        assert_eq!(
+            report.authenticated_filesystem_verification.status,
+            AuthenticatedFilesystemVerificationState::NotPerformed
+        );
+        assert!(report
+            .authenticated_filesystem_verification
+            .reason
+            .as_deref()
+            .expect("not-performed reason")
+            .contains("invalid root authentication key"));
+        assert!(report.filesystem_verifier.is_none());
+        assert!(report.content_inspection.is_none());
+    }
+
+    #[test]
+    fn filesystem_verifier_wrong_env_reports_authenticated_issue() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("fs");
+        write_test_file(&root, root_auth_key(0x11));
+        let _env = RootAuthEnvGuard::set(Some(root_auth_key_hex(0x22)));
+
+        let report = ScrubWalker::open(&root)
+            .expect("open scrub walker")
+            .walk()
+            .expect("scrub fs root");
+
+        assert_eq!(
+            report.authenticated_filesystem_verification.status,
+            AuthenticatedFilesystemVerificationState::Performed
+        );
+        assert!(report.findings.iter().any(|finding| {
+            matches!(
+                finding,
+                ScrubFinding::FilesystemVerifierIssue { issue_kind, .. }
+                    if issue_kind == "root-commit validation"
+            )
+        }));
+        assert!(report
+            .filesystem_verifier
+            .as_ref()
+            .map(|summary| summary.issue_count >= 1)
+            .unwrap_or(false));
+        assert_eq!(report.exit_code(), 1);
     }
 
     #[test]
@@ -968,25 +1239,18 @@ mod tests {
     fn missing_referenced_content_object_reports_verifier_issue() {
         let dir = TempDir::new().unwrap();
         let root = dir.path().join("fs");
-        let mut fs = LocalFileSystem::open_with_root_authentication_key(
-            &root,
-            StoreOptions::test_fast(),
-            RootAuthenticationKey::demo_key(),
-        )
-        .expect("open fs");
-        fs.create_file("/hello.txt", 0o644).expect("create file");
-        fs.write_file("/hello.txt", 0, b"hello verifier")
-            .expect("write file");
-        fs.sync_all().expect("sync committed root");
-        let record = fs.stat("/hello.txt").expect("stat file");
-        let content_key = content_object_key_for_version(record.inode_id, record.data_version);
-        drop(fs);
+        let content_key = write_test_file(&root, RootAuthenticationKey::demo_key());
+        let _env = RootAuthEnvGuard::set(Some(demo_key_hex()));
 
-        let mut store = LocalObjectStore::open_with_options(&root, StoreOptions::test_fast())
-            .expect("open store");
-        assert!(store.delete(content_key).expect("delete content object"));
-        store.sync_all().expect("sync delete");
-        drop(store);
+        let mut pool = open_test_pool(&root);
+        assert!(pool
+            .raw_primary_store_mut()
+            .delete(content_key)
+            .expect("delete content object"));
+        pool.raw_primary_store_mut()
+            .sync_all()
+            .expect("sync delete");
+        drop(pool);
 
         let report = ScrubWalker::open(&root)
             .expect("open scrub walker")
@@ -1011,25 +1275,17 @@ mod tests {
     fn zero_length_content_object_reports_verifier_issue() {
         let dir = TempDir::new().unwrap();
         let root = dir.path().join("fs");
-        let mut fs = LocalFileSystem::open_with_root_authentication_key(
-            &root,
-            StoreOptions::test_fast(),
-            RootAuthenticationKey::demo_key(),
-        )
-        .expect("open fs");
-        fs.create_file("/hello.txt", 0o644).expect("create file");
-        fs.write_file("/hello.txt", 0, b"hello verifier")
-            .expect("write file");
-        fs.sync_all().expect("sync committed root");
-        let record = fs.stat("/hello.txt").expect("stat file");
-        let content_key = content_object_key_for_version(record.inode_id, record.data_version);
-        drop(fs);
+        let content_key = write_test_file(&root, RootAuthenticationKey::demo_key());
+        let _env = RootAuthEnvGuard::set(Some(demo_key_hex()));
 
-        let mut store = LocalObjectStore::open_with_options(&root, StoreOptions::test_fast())
-            .expect("open store");
-        store.put(content_key, b"").expect("write zero content");
-        store.sync_all().expect("sync zero content");
-        drop(store);
+        let mut pool = open_test_pool(&root);
+        pool.raw_primary_store_mut()
+            .put(content_key, b"")
+            .expect("write zero content");
+        pool.raw_primary_store_mut()
+            .sync_all()
+            .expect("sync zero content");
+        drop(pool);
 
         let report = ScrubWalker::open(&root)
             .expect("open scrub walker")
@@ -1185,6 +1441,8 @@ mod tests {
         report.ok = 9;
         report.referenced_objects = 7;
         report.unreachable_objects = 2;
+        report.authenticated_filesystem_verification =
+            AuthenticatedFilesystemVerificationStatus::performed();
         report.content_inspection = Some(FilesystemContentInspectionSummary {
             file_like_inodes: 3,
             referenced_objects: 7,
@@ -1212,6 +1470,14 @@ mod tests {
         assert_eq!(value["referenced_objects"], 7);
         assert_eq!(value["unreachable_objects"], 2);
         assert_eq!(value["unreachable_object_policy"], "count-only");
+        assert_eq!(
+            value["authenticated_filesystem_verification"]["status"],
+            "performed"
+        );
+        assert_eq!(
+            value["authenticated_filesystem_verification"]["key_source"],
+            ROOT_AUTHENTICATION_ENV_VAR
+        );
         assert_eq!(value["content_inspection"]["file_like_inodes"], 3);
         assert_eq!(value["content_inspection"]["referenced_objects"], 7);
         assert_eq!(value["content_inspection"]["missing_objects"], 1);
