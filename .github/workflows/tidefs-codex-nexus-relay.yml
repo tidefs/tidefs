@@ -5,7 +5,7 @@ on:
     types: [opened, edited, reopened, closed, assigned, unassigned, labeled, unlabeled]
   pull_request:
     branches: [master]
-    types: [opened, edited, synchronize, reopened, ready_for_review, converted_to_draft, closed, labeled, unlabeled]
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft, closed]
   push:
     branches: [master]
   workflow_dispatch:
@@ -25,9 +25,9 @@ concurrency:
 jobs:
   relay:
     name: Relay event
-    # PR metadata-only edits are reconciled from live GitHub state by the next
-    # delivered wakeup or controller poll. Keep source-head and lifecycle
-    # wakeups, but skip metadata churn before allocating a runner.
+    # PR metadata-only edits are not trigger types. Keep source-head and
+    # lifecycle wakeups guarded here too, so future trigger expansions do not
+    # accidentally allocate runners for metadata churn.
     if: >-
       ${{
         github.event_name == 'workflow_dispatch' ||
