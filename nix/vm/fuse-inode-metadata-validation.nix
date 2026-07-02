@@ -735,14 +735,43 @@ fi
 echo ""
 echo "--- Phase 2: Inode metadata operations ---"
 TEST_TIMED_OUT=0
-if timeout --foreground --kill-after=5s "$TEST_TIMEOUT" \
-    /bin/tidefs-fuse-inode-metadata-test "$MNT" > "$TEST_LOG" 2>&1; then
-    TEST_RC=0
-else
-    TEST_RC=$?
-fi
-if [ "$TEST_RC" -eq 124 ] || [ "$TEST_RC" -eq 137 ]; then
-    TEST_TIMED_OUT=1
+TEST_RC=0
+TEST_DONE=/tmp/tidefs-validation/test.done
+TEST_RC_FILE=/tmp/tidefs-validation/test.rc
+rm -f "$TEST_DONE" "$TEST_RC_FILE"
+
+(
+    /bin/tidefs-fuse-inode-metadata-test "$MNT" > "$TEST_LOG" 2>&1
+    echo "$?" > "$TEST_RC_FILE"
+    : > "$TEST_DONE"
+) &
+TEST_PID=$!
+elapsed=0
+
+while [ ! -e "$TEST_DONE" ]; do
+    if [ "$elapsed" -ge "$TEST_TIMEOUT" ]; then
+        TEST_TIMED_OUT=1
+        TEST_RC=124
+        echo "WATCHDOG: metadata helper exceeded ''${TEST_TIMEOUT}s" >> "$TEST_LOG"
+        kill "$TEST_PID" 2>/dev/null || true
+        sleep 5
+        kill -9 "$TEST_PID" 2>/dev/null || true
+        for cmdline in /proc/[0-9]*/cmdline; do
+            pid="''${cmdline%/cmdline}"
+            pid="''${pid##*/}"
+            if tr '\0' ' ' < "$cmdline" 2>/dev/null | grep -q 'tidefs-fuse-inode-metadata-test'; then
+                kill -9 "$pid" 2>/dev/null || true
+            fi
+        done
+        break
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+done
+
+if [ "$TEST_TIMED_OUT" -eq 0 ]; then
+    TEST_RC="$(cat "$TEST_RC_FILE" 2>/dev/null || echo 1)"
+    wait "$TEST_PID" 2>/dev/null || true
 fi
 
 while IFS= read -r line; do
