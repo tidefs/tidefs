@@ -37,8 +37,8 @@ Manual `workflow_dispatch` accepts these `target` choices:
 `kmod-xfstests-smoke`, `kernel-fsync-validation`,
 `kernel-mmap-validation`, `kernel-teardown-validation`,
 `kernel-no-daemon-teardown-validation`, `two-node-carrier-validation`,
-`fuse-vm-test`, `qemu-ublk-smoke`, `receipt-bound-reclaim-runtime`, and
-`all`.
+`fuse-vm-test`, `qemu-ublk-smoke`, `qemu-ublk-qid-tag-runtime`,
+`receipt-bound-reclaim-runtime`, `scrub-foreground-read-runtime`, and `all`.
 
 ### Runner Labels
 
@@ -154,7 +154,19 @@ and serial concurrency.
 | Uploaded artifact  | `qemu-smoke-qemu-ublk-smoke` (7-day retention) |
 | Evidence class     | ublk completion artifact validation |
 
-### 9. `receipt-bound-reclaim-runtime`
+### 9. `qemu-ublk-qid-tag-runtime`
+
+| Field              | Value |
+|--------------------|-------|
+| Dispatch           | manual `workflow_dispatch` only |
+| Nix flake ref      | `.#qemu-ublk-qid-tag-runtime` |
+| Command arguments  | `--timeout 3600 --validation-dir /tmp/tidefs-validation/ublk-qid-tag-runtime` |
+| Output directory   | `/tmp/tidefs-validation/ublk-qid-tag-runtime` |
+| Uploaded artifact  | `qemu-smoke-qemu-ublk-qid-tag-runtime` (7-day retention) |
+| Evidence class     | bounded qid/tag ublk completion runtime row |
+| Artifacts          | `qid-tag-completion-runtime.json`, `qid-tag-completion-error-injection-runtime.json`, `started-export-admission-runtime.json`, `started-export-admission-error-injection-runtime.json`, `qemu-ublk-completion.json` |
+
+### 10. `receipt-bound-reclaim-runtime`
 
 | Field              | Value |
 |--------------------|-------|
@@ -165,12 +177,24 @@ and serial concurrency.
 | Evidence class     | receipt-bound reclaim runtime row for obsolete-location trim gating |
 | Artifacts          | `receipt-bound-reclaim-runtime.json`, `evidence-manifest.json` |
 
-### 10. `all`
+### 11. `scrub-foreground-read-runtime`
 
 | Field              | Value |
 |--------------------|-------|
 | Dispatch           | manual `workflow_dispatch` only |
-| Effect             | Runs every matrix entry (targets 1-9) concurrently (`fail-fast: false`) |
+| Nix flake ref      | `.#scrub-foreground-read-runtime` |
+| Command arguments  | `--row scrub-foreground-read-runtime --output-dir /tmp/tidefs-validation/scrub-foreground-read-runtime` |
+| Output directory   | `/tmp/tidefs-validation/scrub-foreground-read-runtime` |
+| Uploaded artifact  | `qemu-smoke-scrub-foreground-read-runtime` (7-day retention) |
+| Evidence class     | scrub foreground-read runtime row |
+| Artifacts          | `scrub-foreground-read-runtime.json`, `evidence-manifest.json` |
+
+### 12. `all`
+
+| Field              | Value |
+|--------------------|-------|
+| Dispatch           | manual `workflow_dispatch` only |
+| Effect             | Runs every matrix entry (targets 1-11) concurrently (`fail-fast: false`) |
 
 ## Evidence Limits
 
@@ -195,10 +219,17 @@ explicitly says so and the relevant dedicated workflow (e.g.
   not a filesystem stress or correctness run.
 - `qemu-ublk-smoke` validates ublk completion artifacts; it is not a
   block-storage correctness or performance benchmark.
+- `qemu-ublk-qid-tag-runtime` validates a bounded multi-queue qid/tag
+  completion row, including success and validation-only negative-write
+  artifacts.  It is not block-device product readiness, release readiness,
+  broad filesystem correctness, or successor/comparator evidence.
 - `receipt-bound-reclaim-runtime` proves the receipt-bound dead-object
   queue gate and durable queue replay boundary only; it is not mounted
   FUSE, kernel, xfstests, RDMA, allocator, segment-cleaner, or parent
   tracker closure evidence.
+- `scrub-foreground-read-runtime` exercises the focused foreground-read scrub
+  row only; it is not a general scrub/rebuild, allocator, or release-candidate
+  proof.
 
 ## Follow-Up Notes (dispatch and evidence boundaries)
 
@@ -209,8 +240,9 @@ are documentation boundaries, not requests for workflow or runtime changes.
    `kmod-xfstests-smoke`, `kernel-fsync-validation`,
    `kernel-mmap-validation`, `kernel-teardown-validation`,
    `kernel-no-daemon-teardown-validation`, `two-node-carrier-validation`,
-   `fuse-vm-test`, `qemu-ublk-smoke`, `receipt-bound-reclaim-runtime`, or
-   `all`.  Pushes to `master` still run only `kmod-xfstests-smoke`.
+   `fuse-vm-test`, `qemu-ublk-smoke`, `qemu-ublk-qid-tag-runtime`,
+   `receipt-bound-reclaim-runtime`, `scrub-foreground-read-runtime`, or `all`.
+   Pushes to `master` still run only `kmod-xfstests-smoke`.
 
 2. **Dual-surface targets.**  `kernel-fsync-validation` and
    `kernel-mmap-validation` exist both as QEMU Smoke matrix targets and
@@ -220,7 +252,15 @@ are documentation boundaries, not requests for workflow or runtime changes.
    validation lanes remain separate when an issue validation tier requires
    them.
 
-3. **Receipt-bound reclaim row.**  `receipt-bound-reclaim-runtime` is a
+3. **uBLK qid/tag runtime row.**  `qemu-ublk-qid-tag-runtime` is a distinct
+   QEMU Smoke target for issue #1793.  It broadens runtime completion evidence
+   beyond focused smoke by requiring at least two hardware queues, queue depth
+   64, all-slot initial fetch and teardown coverage, read/write/flush/discard
+   and write-zeroes terminal operations, and a separate validation-only
+   negative write artifact.  It deliberately keeps block-device product,
+   release, and successor/comparator claims blocked behind the claim registry.
+
+4. **Receipt-bound reclaim row.**  `receipt-bound-reclaim-runtime` is a
    QEMU Smoke matrix target that runs the validation binary through
    `nix develop .#ci --command cargo run`; it does not have a same-named
    flake app and does not widen the evidence boundary beyond the focused

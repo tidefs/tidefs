@@ -622,6 +622,13 @@ fn run_ublk_data_queue_io_loop_impl(
                                                                         error.linux_errno()
                                                                     }
                                                                 };
+                                                                result = completion_trace
+                                                                    .maybe_inject_terminal_result(
+                                                                        UblkCompletionOperationKind::from_ublk_op(
+                                                                            io_desc.op(),
+                                                                        ),
+                                                                        result,
+                                                                    );
 
                                                                 image_bytes_read += worker
                                                                     .bytes_read
@@ -899,6 +906,13 @@ fn run_ublk_data_queue_io_loop_impl(
                                                                             error.linux_errno()
                                                                         }
                                                                     };
+                                                                    result = completion_trace
+                                                                        .maybe_inject_terminal_result(
+                                                                            UblkCompletionOperationKind::from_ublk_op(
+                                                                                io_desc.op(),
+                                                                            ),
+                                                                            result,
+                                                                        );
                                                                 } else {
                                                                     result = -libc::EINVAL;
                                                                 }

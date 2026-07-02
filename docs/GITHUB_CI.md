@@ -146,8 +146,9 @@ may use non-secret repository variables for scheduling gates, such as
   `target` choice for `kmod-xfstests-smoke`, `kernel-fsync-validation`,
   `kernel-mmap-validation`, `kernel-teardown-validation`,
   `kernel-no-daemon-teardown-validation`, `two-node-carrier-validation`,
-  `fuse-vm-test`, `qemu-ublk-smoke`, `receipt-bound-reclaim-runtime`, and
-  `all`; the full dispatch contract and artifact boundaries live in
+  `fuse-vm-test`, `qemu-ublk-smoke`, `qemu-ublk-qid-tag-runtime`,
+  `receipt-bound-reclaim-runtime`, `scrub-foreground-read-runtime`, and `all`;
+  the full dispatch contract and artifact boundaries live in
   `docs/QEMU_SMOKE_CONTRACT.md`. The QEMU Smoke
   `kernel-fsync-validation` and `kernel-mmap-validation` rows are focused
   runtime evidence surfaces. Dedicated workflows with the same flake refs remain
