@@ -298,6 +298,36 @@ fn integration_full_kernel_no_daemon_blocked_scope_cannot_pass() {
     );
 }
 
+#[test]
+fn integration_full_kernel_no_daemon_duplicate_scope_cannot_hide_blocked_surface() {
+    let mut json_val: serde_json::Value = serde_json::from_str(&no_daemon_pass_json()).unwrap();
+    let scope = json_val
+        .as_object_mut()
+        .unwrap()
+        .get_mut("runtime_scope_coverage")
+        .unwrap()
+        .as_array_mut()
+        .unwrap();
+    scope.push(serde_json::json!({
+        "surface": "block",
+        "status": "blocked",
+        "evidence": "duplicate blocked block coverage must not be hidden by the passing entry",
+        "no_required_support_daemon": false,
+        "residual_risk": "duplicate surface proves the artifact is ambiguous"
+    }));
+    let json = serde_json::to_string_pretty(&json_val).unwrap();
+    let err = validate_kernel_teardown_no_work_after_artifact_json(&json).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("surface `block` is duplicated"),
+        "should reject duplicate T6 surface rows: {msg}"
+    );
+    assert!(
+        msg.contains("requires runtime_scope_coverage"),
+        "should reject pass status with any blocked duplicate scope: {msg}"
+    );
+}
+
 // ── Missing required field ───────────────────────────────────────────────
 
 #[test]
