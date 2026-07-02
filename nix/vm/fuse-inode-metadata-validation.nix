@@ -337,14 +337,35 @@ EOF
     }
 
     record_row() {
-      is_canonical_row "$1" || return 0
+      is_canonical_row "$1" || return 1
       printf '%s\n' "$1" >> "$OBSERVED_ROWS"
+      return 0
     }
 
-    pass() { echo "  PASS: $1"; PASSED=$((PASSED + 1)); record_row "$1"; }
-    fail() { echo "  FAIL: $1 -- $2"; FAILED=$((FAILED + 1)); record_row "$1"; }
-    refusal() { echo "  REFUSAL: $1 -- $2"; REFUSED=$((REFUSED + 1)); record_row "$1"; }
-    blocked() { echo "  BLOCKED: $1 -- $2"; BLOCKED=$((BLOCKED + 1)); record_row "$1"; }
+    pass() {
+      echo "  PASS: $1"
+      if record_row "$1"; then
+        PASSED=$((PASSED + 1))
+      fi
+    }
+    fail() {
+      echo "  FAIL: $1 -- $2"
+      if record_row "$1"; then
+        FAILED=$((FAILED + 1))
+      fi
+    }
+    refusal() {
+      echo "  REFUSAL: $1 -- $2"
+      if record_row "$1"; then
+        REFUSED=$((REFUSED + 1))
+      fi
+    }
+    blocked() {
+      echo "  BLOCKED: $1 -- $2"
+      if record_row "$1"; then
+        BLOCKED=$((BLOCKED + 1))
+      fi
+    }
 
     emit_unobserved_rows() {
       outcome="$1"
@@ -362,6 +383,28 @@ EOF
       done
     }
 
+    show_log_tail() {
+      log_path="$1"
+      label="$2"
+      if [ -s "$log_path" ]; then
+        echo ""
+        echo "--- $label tail ---"
+        tail -n 80 "$log_path" || true
+        echo "--- end $label tail ---"
+      fi
+    }
+
+    write_fusermount_helper() {
+      helper_name="$1"
+      target="$2"
+      helper_path="$FUSERMOUNT_HELPER_DIR/$helper_name"
+      cat > "$helper_path" <<EOF
+#!${pkgs.runtimeShell}
+exec "$target" "\$@"
+EOF
+      chmod 0755 "$helper_path"
+    }
+
     rm -rf "$TMPDIR"
     mkdir -p "$STORE" "$MNT" "$FUSERMOUNT_HELPER_DIR"
 
@@ -369,15 +412,27 @@ EOF
     # runners expose only a setuid /run/wrappers/bin/fusermount wrapper while
     # Nix supplies a non-setuid fusermount3 earlier in PATH; provide both names
     # in a helper directory so the daemon reaches the setuid wrapper first.
+    # Use tiny wrapper scripts instead of symlinks so artifact upload never
+    # tries to read the root-owned setuid wrapper target.
     if [ -x /run/wrappers/bin/fusermount3 ]; then
-      ln -s /run/wrappers/bin/fusermount3 "$FUSERMOUNT_HELPER_DIR/fusermount3"
+      FUSERMOUNT3_TARGET=/run/wrappers/bin/fusermount3
     elif [ -x /run/wrappers/bin/fusermount ]; then
-      ln -s /run/wrappers/bin/fusermount "$FUSERMOUNT_HELPER_DIR/fusermount3"
+      FUSERMOUNT3_TARGET=/run/wrappers/bin/fusermount
+    else
+      FUSERMOUNT3_TARGET=
     fi
     if [ -x /run/wrappers/bin/fusermount ]; then
-      ln -s /run/wrappers/bin/fusermount "$FUSERMOUNT_HELPER_DIR/fusermount"
+      FUSERMOUNT_TARGET=/run/wrappers/bin/fusermount
     elif [ -x /run/wrappers/bin/fusermount3 ]; then
-      ln -s /run/wrappers/bin/fusermount3 "$FUSERMOUNT_HELPER_DIR/fusermount"
+      FUSERMOUNT_TARGET=/run/wrappers/bin/fusermount3
+    else
+      FUSERMOUNT_TARGET=
+    fi
+    if [ -n "$FUSERMOUNT3_TARGET" ]; then
+      write_fusermount_helper fusermount3 "$FUSERMOUNT3_TARGET"
+    fi
+    if [ -n "$FUSERMOUNT_TARGET" ]; then
+      write_fusermount_helper fusermount "$FUSERMOUNT_TARGET"
     fi
     export PATH="$FUSERMOUNT_HELPER_DIR:/run/wrappers/bin:$PATH"
 
@@ -393,6 +448,8 @@ EOF
     echo "artifact_scope=$ARTIFACT_SCOPE"
     echo "fusermount3=$(command -v fusermount3 2>/dev/null || echo unavailable)"
     echo "fusermount=$(command -v fusermount 2>/dev/null || echo unavailable)"
+    echo "fusermount3_target=''${FUSERMOUNT3_TARGET:-unavailable}"
+    echo "fusermount_target=''${FUSERMOUNT_TARGET:-unavailable}"
     echo ""
     echo "Tier: mounted-userspace"
     echo ""
@@ -500,6 +557,7 @@ EOF
       else
         blocked "fuse_mount" "daemon died -- see $DAEMON_LOG"
       fi
+      show_log_tail "$DAEMON_LOG" "daemon.log"
       emit_unobserved_rows blocked "FUSE mount did not become available; see $DAEMON_LOG"
       echo ""
       echo "=== FUSE Inode Metadata Validation Summary ==="
@@ -596,6 +654,7 @@ EOF
       pass "remount_after_crash"
     else
       blocked "remount_after_crash" "remount failed -- see $TMPDIR/daemon_remount.log"
+      show_log_tail "$TMPDIR/daemon_remount.log" "daemon_remount.log"
       emit_unobserved_rows blocked "remount failed; see $TMPDIR/daemon_remount.log"
       kill "$REMOUNT_PID" 2>/dev/null || true
       exit 1
