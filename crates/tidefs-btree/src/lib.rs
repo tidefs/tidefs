@@ -37,14 +37,12 @@
 //! exempt from underflow. `compact()` rebuilds via `rebuild_compact()`
 //! to enforce these invariants.
 //!
-//! ## Comparison to ZFS / Ceph
+//! ## Component boundary
 //!
-//! - **ZFS**: ZFS uses a hybrid slab/btree allocator tied to the DMU
-//!   object layer and is not a standalone reusable B+tree. The TideFS
-//!   B+tree is a separate, generic, testable component.
-//! - **Ceph**: Ceph's OSDMap uses a custom in-memory map, and BlueStore
-//!   uses RocksDB (LSM-tree, not B+tree). Neither provides a standalone,
-//!   embeddable B+tree suitable for extent maps and cleanup queues.
+//! This crate is a standalone, reusable B+tree component for extent maps,
+//! cleanup queues, directory index, orphan index, and xattr storage. It favors
+//! auditable rebuild-on-mutation behavior over high-concurrency production
+//! tuning.
 
 extern crate alloc;
 
@@ -736,12 +734,11 @@ impl<K: Ord + Clone, V: Clone, const MAX_LEAF: usize, const MAX_INTERNAL: usize>
     /// Useful after bulk deletions or when entries have been loaded
     /// from disk into a tree that may have underfull nodes.
     ///
-    /// # Comparison to ZFS / Ceph
+    /// # Packing behavior
     ///
-    /// Neither ZFS nor Ceph exposes a standalone B+tree compaction API.
-    /// ZFS ZAP microzaps grow monotonically; Ceph RocksDB compaction is
-    /// write-amplifying and LSM-tree-specific. TideFS provides a simple
-    /// O(n) rebuild that guarantees strict B+tree packing invariants.
+    /// This standalone rebuild API is intended for bulk deletions or loaded
+    /// trees that may contain underfull nodes. It guarantees strict B+tree
+    /// packing invariants with a simple O(n) rebuild.
     pub fn compact(&mut self) {
         if self.is_empty() {
             return;

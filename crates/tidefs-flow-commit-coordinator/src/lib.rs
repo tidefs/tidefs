@@ -16,16 +16,12 @@
 //! Batch complete       → seal_batch_and_emit_completion()    → batch → parent flow
 //! ```
 //!
-//! # Comparison to ZFS / Ceph
+//! # Coordination model
 //!
-//! - ZFS: ZIL commit is single-node; no distributed receipt coordination,
-//!   no multi-flow state bridging
-//! - Ceph: PG state machine handles backfill but doesn't bridge verification
-//!   receipts to relocation/rebuild/replication flows under a unified
-//!   coordinator
-//! - TideFS: single coordinator bridges transfer→verification→placement
-//!   receipts across all six canonical flow classes with batch sealing
-//!   and parent flow notification
+//! The coordinator bridges transfer, verification, and placement receipts
+//! across rebuild, relocation, and replication flows. It seals completed
+//! batches and notifies parent flows through one source-owned state transition
+//! path.
 
 #![forbid(unsafe_code)]
 

@@ -10,16 +10,12 @@
 //! tracking placement state, and feeding the transfer orchestrator
 //! with the work needed to make verdicts reality.
 //!
-//! ## Comparison to ZFS / Ceph
+//! ## Runtime model
 //!
-//! - ZFS: No distributed placement engine; each pool is managed by a single
-//!   node with no cluster-level placement coordination.
-//! - Ceph: CRUSH produces placement decisions deterministically, but the OSD
-//!   backfill/reservation logic is separate from placement and does not use
-//!   lease-protected budget reservation.
-//! - TideFS: Placement runtime is a distributed engine that runs on every
-//!   node, coordinates through the plan registry, and uses lease-protected
-//!   budget reservation for conflict-safe concurrent placement.
+//! Each node executes deterministic plan-registry entries by reserving target
+//! capacity, tracking placement state, and dispatching transfer work.
+//! Lease-protected budget reservations keep concurrent placement plans
+//! conflict-aware.
 
 mod budget;
 mod dispatch;

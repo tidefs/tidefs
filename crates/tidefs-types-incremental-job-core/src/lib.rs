@@ -32,23 +32,12 @@
 //! persistence layer, and admin tooling, alongside the data-plane types
 //! in this crate.
 //!
-//! # Comparison to ZFS / Ceph
+//! # Job model boundary
 //!
-//! - **ZFS**: Background operations (scrub, resilver, dataset destroy) use
-//!   ad-hoc scan tickets and `spa_sync` pass callbacks without a unified
-//!   budget or checkpoint contract. Scrub progress is tracked via
-//!   `dsl_scan_phys_t` but is not resumable across imports without a full
-//!   pool re-scan. Resilver uses `device_rebuild` with internal bitmaps;
-//!   checkpoint granularity is coarse and not exposed to other subsystems.
-//!   This design provides a universal budget envelope and fine-grained
-//!   crash-resumable checkpoints for every maintenance operation.
-//!
-//! - **Ceph**: PGs self-repair via `pg_scrub` and `pg_deep_scrub` with
-//!   per-PG state machines, but there is no cluster-wide work budget or
-//!   unified checkpoint format. Backfill/recovery (analogous to resilver)
-//!   uses per-PG `RecoveryOp` queues with peer-to-peer push/pull, not a
-//!   cursor-based step contract. This design provides a single job model
-//!   with consistent budget enforcement across all background work.
+//! The type set provides one budget envelope and checkpoint vocabulary for
+//! long-running maintenance and admin work. Implementors choose their cursor
+//! state while exposing consistent progress, error, and step-result records to
+//! the scheduler and admin tooling.
 //!
 //! [`IncrementalJob`]:
 //!     ../../tidefs-incremental-job-core/trait.IncrementalJob.html

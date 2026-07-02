@@ -26,19 +26,11 @@
 //! Each service is assigned a [`ServicePriority`] and driven in strict
 //! 5-stage order with round-robin fairness within each stage.
 //!
-//! ## Comparison to ZFS / Ceph
+//! ## Scheduling model
 //!
-//! - **ZFS**: Background work (scrub, resilver, dataset destroy) uses ad-hoc
-//!   scan tickets and `spa_sync` pass callbacks with no unified budget or
-//!   priority model. Scrub/resilver use `zfs_scan_idle` / `zfs_resilver_delay`
-//!   (delay-based throttling), not operation-count caps.
-//! - **Ceph**: PG scrub, backfill, and recovery are per-PG state machines
-//!   with no cluster-wide budget or priority ordering. Throttling is
-//!   sleep-based (`osd_recovery_sleep`, `osd_max_backfills`).
-//! - **TideFS**: Single scheduler dispatching all background work with
-//!   explicit per-tick operation-count budgets, 5-stage priority ordering,
-//!   round-robin fairness, and budget cascading from higher to lower
-//!   priorities.
+//! The scheduler dispatches registered background work with explicit per-tick
+//! operation-count budgets, 5-stage priority ordering, round-robin fairness,
+//! and budget cascading from higher to lower priorities.
 //!
 //! [`docs/BACKGROUND_SERVICE_FRAMEWORK_DESIGN.md`]:
 //!     docs/BACKGROUND_SERVICE_FRAMEWORK_DESIGN.md

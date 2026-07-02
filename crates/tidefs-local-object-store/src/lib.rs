@@ -94,10 +94,10 @@
 //!
 //! # Pool & Device
 //!
-//! The [`pool`] module provides a `Pool` abstraction — the top-level storage
-//! container analogous to a ZFS zpool. A pool manages one or more devices,
-//! routes I/O by device class, and tracks health and statistics. Devices are
-//! configured via [`DeviceConfig`] and support several [`DeviceKind`] variants.
+//! The [`pool`] module provides a `Pool` abstraction: the top-level storage
+//! container for one or more devices. A pool routes I/O by device class and
+//! tracks health and statistics. Devices are configured via [`DeviceConfig`]
+//! and support several [`DeviceKind`] variants.
 //!
 //! # I/O scheduling
 //!
@@ -132,14 +132,12 @@
 //! frame-level compression.
 //! Encryption is provided by the `tidefs-encryption` crate via `EncryptedObjectStore`.
 //!
-//! # Comparison to ZFS / Ceph
+//! # Implementation boundary
 //!
-//! - **ZFS**: couples the DMU, ARC, and ZIO pipeline into a single kernel
-//!   subsystem. TideFS separates the local object store from the filesystem
-//!   layer and I/O scheduler so each can be tested in isolation.
-//! - **Ceph (BlueStore)**: writes objects to RocksDB-backed block devices
-//!   with a freelist allocator. TideFS uses append-only segments with
-//!   inline integrity trailers, avoiding LSM-tree compaction overhead.
+//! The local object store stays separate from filesystem semantics and I/O
+//! scheduling. Append-only segment records carry inline integrity trailers and
+//! are replayed into the latest-object index at open, keeping this crate
+//! focused on object persistence plus pool/device plumbing.
 
 use std::convert::TryFrom;
 use std::fmt;

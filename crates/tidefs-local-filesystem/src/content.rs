@@ -641,13 +641,13 @@ fn try_validate_chunk_bytes(
     Some((chunk, resolved_via_dedup))
 }
 
-/// Single-disk self-healing: try historical versions of a corrupt chunk.
+/// Local historical-version fallback for a corrupt chunk.
 ///
 /// The append-only object store preserves old copies of chunk keys in
 /// segments not yet reclaimed by compaction.  When the current version
-/// fails checksum, older copies may still be intact.  TideFS can self-heal
-/// on a single disk — ZFS requires mirrors or PARITY_RAID, Ceph requires at
-/// least one intact replica.
+/// fails checksum, an older same-key copy may still satisfy the chunk
+/// reference. This is a local recovery fallback, not a replica or media
+/// redundancy claim.
 fn try_self_heal_chunk(
     store: &LocalObjectStore,
     inode_id: InodeId,
@@ -695,11 +695,10 @@ pub(crate) fn read_content_chunk_from_store(
         return Ok(chunk);
     }
 
-    // Self-healing fallback: the current version failed integrity checks.
+    // Historical-version fallback: the current version failed integrity checks.
     // Because the object store is append-only, older copies of the same
-    // chunk key may still exist in segments not yet reclaimed.  TideFS
-    // can self-heal on a single disk — ZFS requires mirrors/PARITY_RAID,
-    // Ceph requires at least one intact replica.
+    // chunk key may still exist in segments not yet reclaimed. This is a
+    // local recovery fallback, not a replica or media redundancy guarantee.
     if let Some(chunk) = try_self_heal_chunk(store, inode_id, chunk_ref, key) {
         return Ok(chunk);
     }
@@ -1632,7 +1631,7 @@ pub(crate) fn write_chunked_content_with_overlay<S: ContentWriteStore>(
         overlay_chunk_bytes(chunk_index, overlay_offset, overlay_bytes, &mut chunk_bytes)?;
         // Hole (sparse) chunk detection: if the entire chunk lies beyond the old
         // file size and no overlay touches it, record a hole instead of storing zeros.
-        // ZFS uses hole birth times in block pointers for the same O(1) sparse truncation.
+        // The hole marker keeps sparse truncation O(1) without materializing data.
         let chunk_start = content_chunk_start(chunk_index)?;
         let is_beyond_old = chunk_start >= old_record.size;
         let is_overlay_empty = overlay_bytes.is_empty()

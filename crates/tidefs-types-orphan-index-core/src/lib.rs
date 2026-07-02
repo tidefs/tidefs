@@ -13,22 +13,12 @@
 //! - [`OrphanIntegrityError`] — error type for recovery anomalies
 //! - [`OrphanRecoveryBudget`] — per-tick processing limits
 //!
-//! ## Comparison to ZFS / Ceph
+//! ## Orphan index model
 //!
-//! - **ZFS**: `zfs_unlinked_drain()` uses a per-dataset ZAP limited to
-//!   ~100K entries, couples orphan tracking to the synchronous unlink
-//!   path (adding latency), and must fully restart on crash (no cursor
-//!   resumability).  TideFS improves with a persistent B+tree keyed by
-//!   inode_id (O(log N), no entry ceiling), same-commit_group atomic insert/delete,
-//!   and cursor-based resumable recovery processing only O(orphans) not
-//!   O(total inodes).
-//! - **CephFS**: has no persistent orphan index; relies on recovery scrub
-//!   that must replay the MDS journal and scan the full object index.
-//!   TideFS decouples orphan discovery (O(orphans) via B+tree scan) from
-//!   extent reclamation (budgeted per tick), avoiding full-dataset scans.
-//! - **ext4**: orphan list (ext4 3.11+) embedded in the journal superblock;
-//!   limited to a fixed number of entries and tied to journal replay.
-//!   TideFS uses a first-class scalable B+tree with no hard limit.
+//! The index is a persistent B+tree keyed by inode ID. The cursor enables
+//! recovery passes to resume from the last processed key, and budgeted batch
+//! processing keeps orphan discovery scoped to orphan entries rather than
+//! unrelated inode state.
 //!
 use core::fmt;
 
