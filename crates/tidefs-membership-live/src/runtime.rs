@@ -6,6 +6,7 @@ use crate::epoch_transition::*;
 use crate::event_bridge::*;
 use crate::failure_detector::*;
 use crate::fencing_watchdog::{FencingAction, FencingWatchdog};
+use crate::gossip::{GossipBroadcastEngine, GossipConfig, GossipMessage};
 use crate::gossip_batcher::{GossipBatcher, GossipBatcherConfig, GossipUpdate};
 use crate::heartbeat::*;
 use crate::join_response::JoinResponseDispatcher;
@@ -105,6 +106,8 @@ pub struct MembershipRuntime {
     pub epoch_fence: Option<Arc<MembershipEpochFence>>,
     /// Gossip batcher for disseminating suspicion and membership events.
     pub gossip_batcher: GossipBatcher,
+    /// Epidemic gossip broadcast engine for inbound message dedup/TTL.
+    pub gossip_broadcast: GossipBroadcastEngine,
     /// Heartbeat transmitter: periodically sends HealthReport messages
     pub heartbeat_tx: HeartbeatTransmitter,
     /// Deadline-based liveness tracker for heartbeat protocol
@@ -308,6 +311,10 @@ impl MembershipRuntime {
                 Box::new(now_millis),
                 my_id,
             ),
+            gossip_broadcast: GossipBroadcastEngine::new(
+                GossipConfig::default(),
+                Box::new(now_millis),
+            ),
             heartbeat_tx: HeartbeatTransmitter::new(HeartbeatConfig::default(), my_id),
             heartbeat_tracker: PeerLivenessTracker::new(HeartbeatConfig::default()),
             unreachable_tracker: PeerUnreachableTracker::new(PeerUnreachableConfig::default()),
@@ -478,6 +485,10 @@ impl MembershipRuntime {
                 GossipBatcherConfig::default(),
                 Box::new(now_millis),
                 my_id,
+            ),
+            gossip_broadcast: GossipBroadcastEngine::new(
+                GossipConfig::default(),
+                Box::new(now_millis),
             ),
             heartbeat_tx: HeartbeatTransmitter::new(HeartbeatConfig::default(), my_id),
             heartbeat_tracker: PeerLivenessTracker::new(HeartbeatConfig::default()),
@@ -1586,6 +1597,24 @@ impl MembershipRuntime {
         }
 
         Ok(applied)
+    }
+    /// Handle an inbound gossip broadcast message.
+    ///
+    /// Runs the message through the deduplication/TTL seen-set, and if accepted,
+    /// applies the member state change to the local roster. Returns `true` when
+    /// the message was accepted and applied.
+    pub fn handle_gossip_broadcast(&mut self, msg: &GossipMessage) -> bool {
+        if !self.gossip_broadcast.accept_message(msg) {
+            return false;
+        }
+        // Apply the gossip state to the roster when we know the member.
+        let new_state = match msg.state {
+            crate::gossip::MemberState::Alive => crate::roster::RosterState::Active,
+            crate::gossip::MemberState::Suspected => crate::roster::RosterState::Suspected,
+            crate::gossip::MemberState::Failed => crate::roster::RosterState::Failed,
+        };
+        let _ = self.roster.transition_state(msg.member_id, new_state);
+        true
     }
 
     fn fire_transition_callbacks(&mut self, transition: &AppliedTransition) {
