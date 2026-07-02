@@ -1624,6 +1624,7 @@ pub struct PrefetchExecutorRecord {
     pub target_media: StorageMediaClass,
     pub source_media_role: StorageMediaRole,
     pub target_media_role: StorageMediaRole,
+    pub rdma_available: bool,
     pub source_path_ref: StorageIntentEvidenceRef,
     pub target_destination_ref: StorageIntentEvidenceRef,
     pub dispatch_plan: PrefetchExecutorDispatchPlan,
@@ -1662,6 +1663,7 @@ impl Default for PrefetchExecutorRecord {
             target_media: StorageMediaClass::SystemRam,
             source_media_role: StorageMediaRole::ServingDataHot,
             target_media_role: StorageMediaRole::ReadCache,
+            rdma_available: false,
             source_path_ref: EMPTY_EVIDENCE_REF,
             target_destination_ref: EMPTY_EVIDENCE_REF,
             dispatch_plan: PrefetchExecutorDispatchPlan::default(),
@@ -2337,6 +2339,7 @@ fn base_record(input: PrefetchExecutorInput) -> PrefetchExecutorRecord {
         target_media: input.decision.target_media,
         source_media_role: input.media_path.source_role,
         target_media_role: input.media_path.target_role,
+        rdma_available: input.media_path.rdma_available,
         source_path_ref: input.media_path.source_path_ref,
         target_destination_ref: input.media_path.target_destination_ref,
         dispatch_plan: input.dispatch_plan,
@@ -7216,10 +7219,25 @@ mod tests {
         input.media_path.rdma_available = false;
         let record = evaluate_prefetch_execution(input);
         assert_eq!(record.outcome, PrefetchExecutorOutcome::Started);
+        assert!(!record.rdma_available);
         assert_ne!(
             record.refusal,
             StorageIntentRefusalReason::RdmaRequiredForCorrectness
         );
+        assert_record_has_no_authority_claims(record);
+    }
+
+    #[test]
+    fn rdma_availability_is_preserved_as_advisory_path_state() {
+        let mut input = admitted_input(PrefetchResidencyCandidateClass::WanGeoDeltaPrefetch);
+        add_remote_path_evidence(&mut input);
+        input.media_path.rdma_available = true;
+
+        let record = evaluate_prefetch_execution(input);
+
+        assert_eq!(record.outcome, PrefetchExecutorOutcome::Started);
+        assert!(record.rdma_available);
+        assert_record_has_no_authority_claims(record);
     }
 
     #[test]
