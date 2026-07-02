@@ -3888,6 +3888,7 @@ dependencies = [
  "tidefs-membership-epoch",
  "tidefs-namespace",
  "tidefs-object-io",
+ "tidefs-performance-contract",
  "tidefs-permission",
  "tidefs-posix-acl",
  "tidefs-posix-filesystem-adapter-daemon",
