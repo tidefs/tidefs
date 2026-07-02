@@ -439,20 +439,17 @@ fn list_keys() {
 }
 
 #[test]
-fn stats_returns_json() {
+fn stats_returns_typed_report() {
     let server = TestServer::spawn(1, scratch_store_paths("stats", 1));
 
     let resp = client::request(2, 1, server.addr, Frame::Stats, false).expect("stats");
     match resp {
-        Frame::StatsResponse { json } => {
-            assert!(
-                json.contains("object_count"),
-                "missing object_count in: {json}"
-            );
-            assert!(
-                json.contains("bytes_written"),
-                "missing bytes_written in: {json}"
-            );
+        Frame::StatsResponse { report } => {
+            assert_eq!(report.object_count, 0);
+            assert_eq!(report.bytes_written, 0);
+            let diagnostic: serde_json::Value =
+                serde_json::from_str(&report.diagnostic_json()).unwrap();
+            assert_eq!(diagnostic["object_count"], 0);
         }
         other => panic!("expected StatsResponse, got {other:?}"),
     }
@@ -886,25 +883,21 @@ fn live_backend_put_get_stats_discloses_transport_fields() {
     // ── STATS: verify backend disclosure and transport fields ────────
     let resp = client::request(2, 1, addr, Frame::Stats, false).expect("stats request");
     match resp {
-        Frame::StatsResponse { json } => {
-            let stats: serde_json::Value = serde_json::from_str(&json).expect("stats JSON parse");
+        Frame::StatsResponse { report } => {
             // Backend disclosure
             assert!(
-                stats["backend"].as_str().is_some_and(|b| b.contains("tcp")),
-                "stats backend should disclose TCP: {json}"
+                report.backend.contains("tcp"),
+                "stats backend should disclose TCP: {report:?}"
             );
             // Transport-backed fields populated by TransportReplicatedStore
+            assert!(report.object_count > 0, "stats should have object_count");
             assert!(
-                stats.get("object_count").is_some(),
-                "stats should have object_count: {json}"
+                report.committed_writes.is_some(),
+                "stats should have committed_writes: {report:?}"
             );
             assert!(
-                stats.get("committed_writes").is_some(),
-                "stats should have committed_writes: {json}"
-            );
-            assert!(
-                stats.get("bytes_written").is_some(),
-                "stats should have bytes_written: {json}"
+                report.bytes_written > 0,
+                "stats should have bytes_written: {report:?}"
             );
         }
         other => panic!("expected StatsResponse, got {other:?}"),
@@ -991,23 +984,22 @@ fn config_file_live_backend_uses_transport_store() {
 
     let resp = client::request(2, 1, addr, Frame::Stats, false).expect("stats request");
     match resp {
-        Frame::StatsResponse { json } => {
-            let stats: serde_json::Value = serde_json::from_str(&json).expect("stats JSON parse");
+        Frame::StatsResponse { report } => {
             assert!(
-                stats["backend"].as_str().is_some_and(|b| b.contains("tcp")),
-                "stats backend should disclose TCP: {json}"
+                report.backend.contains("tcp"),
+                "stats backend should disclose TCP: {report:?}"
             );
             assert!(
-                stats.get("failed_writes").is_some(),
-                "transport-backed stats should include failed_writes: {json}"
+                report.failed_writes.is_some(),
+                "transport-backed stats should include failed_writes: {report:?}"
             );
             assert!(
-                stats.get("degraded_reads").is_some(),
-                "transport-backed stats should include degraded_reads: {json}"
+                report.degraded_reads.is_some(),
+                "transport-backed stats should include degraded_reads: {report:?}"
             );
             assert!(
-                stats.get("replica_healthy").is_none(),
-                "config live path should not expose local-store replica_healthy: {json}"
+                report.replica_healthy.is_none(),
+                "config live path should not expose local-store replica_healthy: {report:?}"
             );
         }
         other => panic!("expected StatsResponse, got {other:?}"),
@@ -1522,27 +1514,21 @@ fn live_backend_frame_put_requires_receipt_authority() {
     // ── STATS on primary: verify backend disclosure ────────────────
     let resp = client::request(96, 10, primary_addr, Frame::Stats, false).expect("stats request");
     match resp {
-        Frame::StatsResponse { json } => {
-            let stats: serde_json::Value = serde_json::from_str(&json).expect("stats JSON parse");
-            let backend = stats["backend"].as_str().unwrap_or("");
+        Frame::StatsResponse { report } => {
             assert!(
-                backend.contains("tcp"),
-                "stats backend should disclose TCP: {json}"
+                report.backend.contains("tcp"),
+                "stats backend should disclose TCP: {report:?}"
             );
             assert!(
-                stats.get("object_count").is_some(),
-                "stats should have object_count"
+                report.committed_writes.is_some(),
+                "stats should have committed_writes: {report:?}"
             );
-            assert!(
-                stats.get("committed_writes").is_some(),
-                "stats should have committed_writes"
-            );
-            let committed: i64 = stats["committed_writes"].as_i64().unwrap_or(-1);
             assert_eq!(
-                committed, 0,
-                "receiptless rejected PUT should not commit writes: {json}"
+                report.committed_writes,
+                Some(0),
+                "receiptless rejected PUT should not commit writes: {report:?}"
             );
-            eprintln!("[fanout-test] primary stats (receiptless PUT rejected): {json}");
+            eprintln!("[fanout-test] primary stats (receiptless PUT rejected): {report:?}");
         }
         other => panic!("expected StatsResponse from primary, got {other:?}"),
     }
@@ -1551,15 +1537,12 @@ fn live_backend_frame_put_requires_receipt_authority() {
     let resp = client::request(95, 20, replica_addr, Frame::Stats, false)
         .expect("stats request on replica");
     match resp {
-        Frame::StatsResponse { json } => {
-            let stats: serde_json::Value =
-                serde_json::from_str(&json).expect("replica stats JSON parse");
-            let backend = stats["backend"].as_str().unwrap_or("");
+        Frame::StatsResponse { report } => {
             assert!(
-                backend.contains("tcp"),
-                "replica stats backend should disclose TCP: {json}"
+                report.backend.contains("tcp"),
+                "replica stats backend should disclose TCP: {report:?}"
             );
-            eprintln!("[fanout-test] replica stats: {json}");
+            eprintln!("[fanout-test] replica stats: {report:?}");
         }
         other => panic!("expected StatsResponse from replica, got {other:?}"),
     }

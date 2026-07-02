@@ -1642,6 +1642,126 @@ fn scrub_response_ack(report_json: &str, findings_count: u64) -> ReplicationMess
     }
 }
 
+fn stats_report_from_store(
+    store: &StoreBackend,
+    backend_disclosure: String,
+) -> protocol::StatsReport {
+    match store {
+        StoreBackend::Local(rs) => {
+            let stats = rs.stats();
+            protocol::StatsReport {
+                backend: backend_disclosure,
+                object_count: stats.object_count,
+                bytes_written: stats.bytes_written,
+                committed_writes: Some(stats.committed_writes),
+                degraded_writes: Some(stats.degraded_writes),
+                refused_writes: Some(stats.refused_writes),
+                failed_writes: None,
+                degraded_reads: Some(stats.degraded_reads.get()),
+                replica_healthy: Some(stats.replica_healthy.clone()),
+                total_capacity_bytes: None,
+                used_bytes: None,
+                available_bytes: None,
+                placement_receipt_ref_count: None,
+            }
+        }
+        StoreBackend::TransportBacked(ts) => {
+            let stats = ts.stats();
+            protocol::StatsReport {
+                backend: backend_disclosure,
+                object_count: stats.object_count,
+                bytes_written: stats.bytes_written,
+                committed_writes: Some(stats.committed_writes),
+                degraded_writes: Some(stats.degraded_writes),
+                refused_writes: None,
+                failed_writes: Some(stats.failed_writes),
+                degraded_reads: Some(stats.degraded_reads),
+                replica_healthy: None,
+                total_capacity_bytes: None,
+                used_bytes: None,
+                available_bytes: None,
+                placement_receipt_ref_count: None,
+            }
+        }
+        StoreBackend::PoolBacked(pool) => {
+            let stats = pool.pool_stats();
+            let op_stats = pool.stats();
+            let placement_receipt_ref_count = pool
+                .placement_receipt_refs(ObjectIoClass::Data)
+                .map(|refs| refs.len() as u64)
+                .unwrap_or(0);
+            protocol::StatsReport {
+                backend: "pool".into(),
+                object_count: stats.object_count,
+                bytes_written: op_stats.total_bytes,
+                committed_writes: None,
+                degraded_writes: None,
+                refused_writes: None,
+                failed_writes: None,
+                degraded_reads: None,
+                replica_healthy: None,
+                total_capacity_bytes: Some(stats.total_capacity_bytes),
+                used_bytes: Some(stats.used_bytes),
+                available_bytes: Some(stats.available_bytes),
+                placement_receipt_ref_count: Some(placement_receipt_ref_count),
+            }
+        }
+    }
+}
+
+fn receive_import_report(report: vfs::ChangedRecordImportReport) -> protocol::ReceiveImportReport {
+    protocol::ReceiveImportReport {
+        spec: report.spec.to_string(),
+        imported_roots: report.imported_roots,
+        imported_records: report.imported_records,
+        imported_payload_bytes: report.imported_payload_bytes,
+        selected_generation: report.selected_generation,
+        selected_transaction_id: report.selected_transaction_id,
+        snapshot_catalog_entries: report.snapshot_catalog_entries as u64,
+        stream_version: report.stream_version,
+        staging_validated_before_publish: report.staging_validated_before_publish,
+        destination_root_reauthentication: report.destination_root_reauthentication,
+        production_fsck_required: report.production_fsck_required,
+        placement_epoch: report.placement_epoch,
+        placement_verified_stable: report.placement_verified_stable,
+    }
+}
+
+fn snapshot_summary_report(summary: vfs::SnapshotSummary) -> protocol::SnapshotSummaryReport {
+    protocol::SnapshotSummaryReport {
+        name: summary.name,
+        source_transaction_id: summary.source_transaction_id,
+        source_generation: summary.source_generation,
+        created_at_generation: summary.created_at_generation,
+    }
+}
+
+fn snapshot_rollback_report(
+    report: vfs::SnapshotRollbackReport,
+) -> protocol::SnapshotRollbackReport {
+    protocol::SnapshotRollbackReport {
+        spec: report.spec.to_string(),
+        snapshot: snapshot_summary_report(report.snapshot),
+        generation_before: report.generation_before,
+        restored_source_generation: report.restored_source_generation,
+        published_generation: report.published_generation,
+        snapshot_catalog_entries: report.snapshot_catalog_entries as u64,
+        production_fsck_required: report.production_fsck_required,
+    }
+}
+
+fn snapshot_clone_summary_report(
+    summary: vfs::CloneSummary,
+) -> protocol::SnapshotCloneSummaryReport {
+    protocol::SnapshotCloneSummaryReport {
+        name: summary.name,
+        origin: summary.origin,
+        source_transaction_id: summary.source_transaction_id,
+        source_generation: summary.source_generation,
+        created_at_generation: summary.created_at_generation,
+    }
+}
+
 fn placement_receipt_inventory_json(store: &StoreBackend) -> serde_json::Value {
     match store {
         StoreBackend::PoolBacked(pool) => match pool.placement_receipt_refs(ObjectIoClass::Data) {
@@ -2420,29 +2540,21 @@ fn cross_check_rebuild_execution_candidates(
         .collect()
 }
 
-fn local_scrub_report_json(config: &StorageNodeConfig, store: &StoreBackend) -> (String, u64) {
+fn local_scrub_report(config: &StorageNodeConfig, store: &StoreBackend) -> protocol::ScrubReport {
     let placement_receipt_refs = placement_receipt_inventory_json(store);
     let placement_receipt_ref_count = placement_receipt_refs["count"].as_u64().unwrap_or(0);
-    let rebuild_admission = receipt_backed_rebuild_admission_json(config, store);
-    let rebuild_planner = receipt_backed_rebuild_planner_json(config, store);
-    let rebuild_execution_candidates =
-        receipt_backed_rebuild_execution_candidates_json(config, store);
     if matches!(store, StoreBackend::PoolBacked(_)) {
-        let json = serde_json::json!({
-            "backend": "pool",
-            "segments_scanned": 0,
-            "records_verified": 0,
-            "bytes_scanned": 0,
-            "chain_breaks_detected": 0,
-            "completed": true,
-            "findings_count": 0,
-            "placement_receipt_ref_count": placement_receipt_ref_count,
-            "placement_receipt_refs": placement_receipt_refs,
-            "rebuild_admission": rebuild_admission,
-            "rebuild_planner": rebuild_planner,
-            "rebuild_execution_candidates": rebuild_execution_candidates,
-        });
-        return (json.to_string(), 0);
+        return protocol::ScrubReport {
+            backend: Some("pool".into()),
+            segments_scanned: 0,
+            records_verified: 0,
+            bytes_scanned: 0,
+            chain_breaks_detected: 0,
+            completed: true,
+            findings_count: 0,
+            placement_receipt_ref_count,
+            error: None,
+        };
     }
 
     let store_dir = &config.store_paths[0];
@@ -2452,33 +2564,84 @@ fn local_scrub_report_json(config: &StorageNodeConfig, store: &StoreBackend) -> 
     match scrubber.scrub_full(&mut suspect_log) {
         Ok(report) => {
             let findings = report.outcomes.len() as u64;
-            let json = serde_json::json!({
-                "segments_scanned": report.segments_scanned,
-                "records_verified": report.records_verified,
-                "bytes_scanned": report.bytes_scanned,
-                "chain_breaks_detected": report.chain_breaks_detected,
-                "completed": report.completed,
-                "findings_count": findings,
-                "placement_receipt_ref_count": placement_receipt_ref_count,
-                "placement_receipt_refs": placement_receipt_refs,
-                "rebuild_admission": rebuild_admission,
-                "rebuild_planner": rebuild_planner,
-                "rebuild_execution_candidates": rebuild_execution_candidates,
-            });
-            (json.to_string(), findings)
+            protocol::ScrubReport {
+                backend: None,
+                segments_scanned: report.segments_scanned,
+                records_verified: report.records_verified,
+                bytes_scanned: report.bytes_scanned,
+                chain_breaks_detected: report.chain_breaks_detected,
+                completed: report.completed,
+                findings_count: findings,
+                placement_receipt_ref_count,
+                error: None,
+            }
         }
-        Err(e) => {
-            let json = serde_json::json!({
-                "error": format!("{e}"),
-                "placement_receipt_ref_count": placement_receipt_ref_count,
-                "placement_receipt_refs": placement_receipt_refs,
-                "rebuild_admission": rebuild_admission,
-                "rebuild_planner": rebuild_planner,
-                "rebuild_execution_candidates": rebuild_execution_candidates,
-            });
-            (json.to_string(), 0)
-        }
+        Err(e) => protocol::ScrubReport {
+            backend: None,
+            segments_scanned: 0,
+            records_verified: 0,
+            bytes_scanned: 0,
+            chain_breaks_detected: 0,
+            completed: false,
+            findings_count: 0,
+            placement_receipt_ref_count,
+            error: Some(format!("{e}")),
+        },
     }
+}
+
+fn local_scrub_report_json(config: &StorageNodeConfig, store: &StoreBackend) -> (String, u64) {
+    let report = local_scrub_report(config, store);
+    let placement_receipt_refs = placement_receipt_inventory_json(store);
+    let rebuild_admission = receipt_backed_rebuild_admission_json(config, store);
+    let rebuild_planner = receipt_backed_rebuild_planner_json(config, store);
+    let rebuild_execution_candidates =
+        receipt_backed_rebuild_execution_candidates_json(config, store);
+
+    let mut json = serde_json::Map::new();
+    if let Some(backend) = &report.backend {
+        json.insert("backend".into(), serde_json::json!(backend));
+    }
+    json.insert(
+        "segments_scanned".into(),
+        serde_json::json!(report.segments_scanned),
+    );
+    json.insert(
+        "records_verified".into(),
+        serde_json::json!(report.records_verified),
+    );
+    json.insert(
+        "bytes_scanned".into(),
+        serde_json::json!(report.bytes_scanned),
+    );
+    json.insert(
+        "chain_breaks_detected".into(),
+        serde_json::json!(report.chain_breaks_detected),
+    );
+    json.insert("completed".into(), serde_json::json!(report.completed));
+    json.insert(
+        "findings_count".into(),
+        serde_json::json!(report.findings_count),
+    );
+    json.insert(
+        "placement_receipt_ref_count".into(),
+        serde_json::json!(report.placement_receipt_ref_count),
+    );
+    if let Some(error) = &report.error {
+        json.insert("error".into(), serde_json::json!(error));
+    }
+    json.insert("placement_receipt_refs".into(), placement_receipt_refs);
+    json.insert("rebuild_admission".into(), rebuild_admission);
+    json.insert("rebuild_planner".into(), rebuild_planner);
+    json.insert(
+        "rebuild_execution_candidates".into(),
+        rebuild_execution_candidates,
+    );
+
+    (
+        serde_json::Value::Object(json).to_string(),
+        report.findings_count,
+    )
 }
 
 fn build_segment_fetch_response(
@@ -5096,51 +5259,8 @@ fn handle_frame_ctx(
                 .as_ref()
                 .map(|a| format!("{}", a.backend()))
                 .unwrap_or_else(|| "not-run".to_string());
-            let json = match &*s {
-                StoreBackend::Local(rs) => {
-                    let stats = rs.stats();
-                    serde_json::json!({
-                        "backend": backend_disclosure,
-                        "object_count": stats.object_count,
-                        "committed_writes": stats.committed_writes,
-                        "degraded_writes": stats.degraded_writes,
-                        "refused_writes": stats.refused_writes,
-                        "bytes_written": stats.bytes_written,
-                        "replica_healthy": stats.replica_healthy,
-                    })
-                }
-                StoreBackend::TransportBacked(ts) => {
-                    let stats = ts.stats();
-                    serde_json::json!({
-                        "backend": backend_disclosure,
-                        "object_count": stats.object_count,
-                        "committed_writes": stats.committed_writes,
-                        "degraded_writes": stats.degraded_writes,
-                        "failed_writes": stats.failed_writes,
-                        "degraded_reads": stats.degraded_reads,
-                        "bytes_written": stats.bytes_written,
-                    })
-                }
-                StoreBackend::PoolBacked(pool) => {
-                    let stats = pool.pool_stats();
-                    let op_stats = pool.stats();
-                    let placement_receipt_ref_count = pool
-                        .placement_receipt_refs(ObjectIoClass::Data)
-                        .map(|refs| refs.len())
-                        .unwrap_or(0);
-                    serde_json::json!({
-                        "backend": "pool",
-                        "object_count": stats.object_count,
-                        "total_capacity_bytes": stats.total_capacity_bytes,
-                        "used_bytes": stats.used_bytes,
-                        "available_bytes": stats.available_bytes,
-                        "bytes_written": op_stats.total_bytes,
-                        "placement_receipt_ref_count": placement_receipt_ref_count,
-                    })
-                }
-            };
             Some(Frame::StatsResponse {
-                json: json.to_string(),
+                report: stats_report_from_store(&s, backend_disclosure),
             })
         }
         Frame::Bye => Some(Frame::Bye),
@@ -5197,46 +5317,44 @@ fn handle_frame_ctx(
             // observability. This closes the "silent TCP fallback" gap (B9):
             // even when --rdma is requested, the actual negotiated backend
             // per connected peer is disclosed here.
-            let transport_backends: Vec<serde_json::Value> = {
+            let transport_backends: Vec<protocol::TransportBackendReport> = {
                 let t = ctx.transport.lock().unwrap();
                 let mut backends = Vec::new();
                 for sid in t.sessions.keys() {
                     if let Some(backend_kind) = t.session_backend_kind(*sid) {
                         let peer = t.peer_node(*sid);
                         let disclosure = peer.and_then(|p| t.carrier_disclosure(p).cloned());
-                        backends.push(serde_json::json!({
-                            "session_id": sid.0,
-                            "peer_node": peer,
-                            "backend_kind": backend_kind.to_string(),
-                            "disclosure": disclosure.map(|d| d.to_string()),
-                        }));
+                        backends.push(protocol::TransportBackendReport {
+                            session_id: sid.0,
+                            peer_node: peer,
+                            backend_kind: backend_kind.to_string(),
+                            disclosure: disclosure.map(|d| d.to_string()),
+                        });
                     }
                 }
                 backends
             };
 
-            let report_json = {
+            let report = {
                 let membership = ctx.membership.lock().unwrap();
                 let detector = &membership.detector;
                 let placement_version = membership.placement_version();
-                let peers: Vec<serde_json::Value> = detector
+                let peers: Vec<protocol::HealthPeerReport> = detector
                     .all_peers()
-                    .map(|p| {
-                        serde_json::json!({
-                            "member_id": p.member_id.0,
-                            "member_class": format!("{:?}", p.member_class),
-                            "health": format!("{:?}", p.health),
-                            "failure_domain": p.failure_domain,
-                            "failed_pings": p.failed_ping_count,
-                            "joining": p.joining,
-                            "draining": p.draining,
-                            "epoch": p.epoch.0,
-                        })
+                    .map(|p| protocol::HealthPeerReport {
+                        member_id: p.member_id.0,
+                        member_class: format!("{:?}", p.member_class),
+                        health: format!("{:?}", p.health),
+                        failure_domain: p.failure_domain,
+                        failed_pings: p.failed_ping_count,
+                        joining: p.joining,
+                        draining: p.draining,
+                        epoch: p.epoch.0,
                     })
                     .collect();
                 let alive_voters: Vec<u64> =
                     detector.alive_voters().into_iter().map(|m| m.0).collect();
-                let degraded_peers: Vec<serde_json::Value> = detector
+                let degraded_peers: Vec<protocol::DegradedPeerReport> = detector
                     .all_peers()
                     .filter(|p| {
                         matches!(
@@ -5245,15 +5363,13 @@ fn handle_frame_ctx(
                                 | tidefs_membership_epoch::HealthClass::Down
                         )
                     })
-                    .map(|p| {
-                        serde_json::json!({
-                            "member_id": p.member_id.0,
-                            "health": format!("{:?}", p.health),
-                            "failed_pings": p.failed_ping_count,
-                        })
+                    .map(|p| protocol::DegradedPeerReport {
+                        member_id: p.member_id.0,
+                        health: format!("{:?}", p.health),
+                        failed_pings: p.failed_ping_count,
                     })
                     .collect();
-                let health_counts = {
+                let health_summary = {
                     let mut healthy = 0u64;
                     let mut suspect = 0u64;
                     let mut down = 0u64;
@@ -5264,13 +5380,13 @@ fn handle_frame_ctx(
                             tidefs_membership_epoch::HealthClass::Down => down += 1,
                         }
                     }
-                    serde_json::json!({
-                        "healthy": healthy,
-                        "suspect": suspect,
-                        "down": down,
-                    })
+                    protocol::HealthSummary {
+                        healthy,
+                        suspect,
+                        down,
+                    }
                 };
-                let failure_domains: Vec<serde_json::Value> = {
+                let failure_domains: Vec<protocol::FailureDomainReport> = {
                     let mut domains: std::collections::BTreeMap<u64, Vec<u64>> =
                         std::collections::BTreeMap::new();
                     for p in detector.all_peers() {
@@ -5281,12 +5397,10 @@ fn handle_frame_ctx(
                     }
                     domains
                         .into_iter()
-                        .map(|(fd, members)| {
-                            serde_json::json!({
-                                "failure_domain": fd,
-                                "member_count": members.len(),
-                                "members": members,
-                            })
+                        .map(|(failure_domain, members)| protocol::FailureDomainReport {
+                            failure_domain,
+                            member_count: members.len() as u64,
+                            members,
                         })
                         .collect()
                 };
@@ -5307,31 +5421,30 @@ fn handle_frame_ctx(
                         tidefs_membership_live::roster::RosterState::Left => roster_left += 1,
                     }
                 }
-                serde_json::json!({
-                    "node_id": node_id,
-                    "node_member_class": node_member_class,
-                    "node_failure_domain": node_failure_domain,
-                    "carrier": carrier,
-                    "carrier_is_live": carrier_is_live,
-                    "replication_factor": replication_factor,
-                    "placement_version": placement_version,
-                    "peers": peers,
-                    "peer_count": detector.peer_count(),
-                    "alive_voters": alive_voters,
-                    "quorum_lost": quorum_lost,
-                    "roster_size": roster_snapshot.len(),
-                    "roster_state_summary": {
-                        "active": roster_active,
-                        "suspected": roster_suspected,
-                        "failed": roster_failed,
-                        "left": roster_left,
+                protocol::HealthReport {
+                    node_id,
+                    node_member_class,
+                    node_failure_domain,
+                    carrier: carrier.to_string(),
+                    carrier_is_live,
+                    replication_factor,
+                    placement_version,
+                    peers,
+                    peer_count: detector.peer_count() as u64,
+                    alive_voters,
+                    quorum_lost,
+                    roster_size: roster_snapshot.len() as u64,
+                    roster_state_summary: protocol::RosterStateSummary {
+                        active: roster_active,
+                        suspected: roster_suspected,
+                        failed: roster_failed,
+                        left: roster_left,
                     },
-                    "health_summary": health_counts,
-                    "degraded_peers": degraded_peers,
-                    "failure_domains": failure_domains,
-                    "transport_backends": transport_backends,
-                })
-                .to_string()
+                    health_summary,
+                    degraded_peers,
+                    failure_domains,
+                    transport_backends,
+                }
             };
 
             Some(Frame::HealthCheckResponse {
@@ -5339,7 +5452,7 @@ fn handle_frame_ctx(
                 pool_state,
                 uptime_secs,
                 backend,
-                report_json,
+                report,
             })
         }
         Frame::Send { key } => {
@@ -5380,24 +5493,9 @@ fn handle_frame_ctx(
             key_bytes.copy_from_slice(root_authentication_key);
             let auth_key = RootAuthenticationKey::from_bytes32(key_bytes);
             match receive_vfssend2_frame_export(fs_root, export, auth_key) {
-                Ok(r) => {
-                    let json = serde_json::json!({
-                        "spec": r.spec,
-                        "imported_roots": r.imported_roots,
-                        "imported_records": r.imported_records,
-                        "imported_payload_bytes": r.imported_payload_bytes,
-                        "selected_generation": r.selected_generation,
-                        "selected_transaction_id": r.selected_transaction_id,
-                        "snapshot_catalog_entries": r.snapshot_catalog_entries,
-                        "stream_version": r.stream_version,
-                        "staging_validated_before_publish": r.staging_validated_before_publish,
-                        "destination_root_reauthentication": r.destination_root_reauthentication,
-                        "production_fsck_required": r.production_fsck_required,
-                    });
-                    Some(Frame::ReceiveResponse {
-                        report_json: json.to_string(),
-                    })
-                }
+                Ok(report) => Some(Frame::ReceiveResponse {
+                    report: receive_import_report(report),
+                }),
                 Err(message) => Some(Frame::Error { message }),
             }
         }
@@ -5438,14 +5536,12 @@ fn handle_frame_ctx(
         // ── Multi-node scrub fanout ──
         Frame::ScrubRequest => {
             let s = store.lock().unwrap();
-            let (report_json, findings_count) = local_scrub_report_json(&ctx.config, &s);
+            let report = local_scrub_report(&ctx.config, &s);
             eprintln!(
-                "[storage-node] session {session_id}: scrub request completed findings_count={findings_count}"
+                "[storage-node] session {session_id}: scrub request completed findings_count={}",
+                report.findings_count
             );
-            Some(Frame::ScrubResponse {
-                report_json,
-                findings_count,
-            })
+            Some(Frame::ScrubResponse { report })
         }
         Frame::RepairObject {
             key,
@@ -5495,17 +5591,9 @@ fn handle_frame_ctx(
                 }
             };
             match fs.create_snapshot(snapshot_name) {
-                Ok(summary) => {
-                    let json = serde_json::json!({
-                        "name": summary.name,
-                        "source_transaction_id": summary.source_transaction_id,
-                        "source_generation": summary.source_generation,
-                        "created_at_generation": summary.created_at_generation,
-                    });
-                    Some(Frame::SnapshotCreateResponse {
-                        summary_json: json.to_string(),
-                    })
-                }
+                Ok(summary) => Some(Frame::SnapshotCreateResponse {
+                    summary: snapshot_summary_report(summary),
+                }),
                 Err(e) => Some(Frame::Error {
                     message: format!("create snapshot: {e}"),
                 }),
@@ -5527,17 +5615,9 @@ fn handle_frame_ctx(
                 }
             };
             match fs.delete_snapshot(snapshot_name) {
-                Ok(summary) => {
-                    let json = serde_json::json!({
-                        "name": summary.name,
-                        "source_transaction_id": summary.source_transaction_id,
-                        "source_generation": summary.source_generation,
-                        "created_at_generation": summary.created_at_generation,
-                    });
-                    Some(Frame::SnapshotDestroyResponse {
-                        summary_json: json.to_string(),
-                    })
-                }
+                Ok(summary) => Some(Frame::SnapshotDestroyResponse {
+                    summary: snapshot_summary_report(summary),
+                }),
                 Err(e) => Some(Frame::Error {
                     message: format!("destroy snapshot: {e}"),
                 }),
@@ -5559,25 +5639,9 @@ fn handle_frame_ctx(
                 }
             };
             match fs.rollback_to_snapshot(snapshot_name) {
-                Ok(report) => {
-                    let json = serde_json::json!({
-                        "spec": report.spec,
-                        "snapshot": {
-                            "name": report.snapshot.name,
-                            "source_transaction_id": report.snapshot.source_transaction_id,
-                            "source_generation": report.snapshot.source_generation,
-                            "created_at_generation": report.snapshot.created_at_generation,
-                        },
-                        "generation_before": report.generation_before,
-                        "restored_source_generation": report.restored_source_generation,
-                        "published_generation": report.published_generation,
-                        "snapshot_catalog_entries": report.snapshot_catalog_entries,
-                        "production_fsck_required": report.production_fsck_required,
-                    });
-                    Some(Frame::SnapshotRollbackResponse {
-                        report_json: json.to_string(),
-                    })
-                }
+                Ok(report) => Some(Frame::SnapshotRollbackResponse {
+                    report: snapshot_rollback_report(report),
+                }),
                 Err(e) => Some(Frame::Error {
                     message: format!("rollback to snapshot: {e}"),
                 }),
@@ -5649,18 +5713,9 @@ fn handle_frame_ctx(
                 }
             };
             match fs.create_clone(&clone_name, &source_snapshot) {
-                Ok(summary) => {
-                    let json = serde_json::json!({
-                        "name": summary.name,
-                        "origin": summary.origin,
-                        "source_transaction_id": summary.source_transaction_id,
-                        "source_generation": summary.source_generation,
-                        "created_at_generation": summary.created_at_generation,
-                    });
-                    Some(Frame::SnapshotCloneResponse {
-                        summary_json: json.to_string(),
-                    })
-                }
+                Ok(summary) => Some(Frame::SnapshotCloneResponse {
+                    summary: snapshot_clone_summary_report(summary),
+                }),
                 Err(e) => Some(Frame::Error {
                     message: format!("create clone: {e}"),
                 }),
@@ -6210,20 +6265,17 @@ mod cluster_pool_handler_tests {
         )
         .expect("receive response");
 
-        let report_json = match response {
-            Frame::ReceiveResponse { report_json } => report_json,
+        let report = match response {
+            Frame::ReceiveResponse { report } => report,
             other => panic!("expected receive response, got {other:?}"),
         };
-        let report: serde_json::Value = serde_json::from_str(&report_json).unwrap();
         assert!(
-            report["imported_records"].as_u64().unwrap_or(0) > 0,
-            "receive should import VFSSEND2 records: {report_json}"
+            report.imported_records > 0,
+            "receive should import VFSSEND2 records: {report:?}"
         );
         assert!(
-            report["staging_validated_before_publish"]
-                .as_bool()
-                .unwrap_or(false),
-            "receive should preserve staging validation evidence: {report_json}"
+            report.staging_validated_before_publish,
+            "receive should preserve staging validation evidence: {report:?}"
         );
     }
 
