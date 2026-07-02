@@ -60,7 +60,7 @@ use tidefs_ublk_abi::{
     control_command_size, params_size, ublk_control_plan_steps, UblkFeatureFlags, UblkParamBasic,
     UblkParamDiscard, UblkParamSegment, UblkParams, UblkSrvCtrlDevInfo, UblkSrvIoCmd,
     UblkSrvIoDesc, TIDEFS_UBLK_CONTROL_PLAN_REQUIRED_FEATURES, UBLK_ABI_GATE_OW_301I,
-    UBLK_ATTR_FUA, UBLK_ATTR_VOLATILE_CACHE, UBLK_FEATURES_LEN, UBLK_IO_BUF_BITS,
+    UBLK_ATTR_FUA, UBLK_FEATURES_LEN, UBLK_IO_BUF_BITS,
     UBLK_MAX_NR_QUEUES, UBLK_MAX_QUEUE_DEPTH, UBLK_MIN_SEGMENT_SIZE, UBLK_PARAM_TYPE_BASIC,
     UBLK_PARAM_TYPE_DISCARD, UBLK_PARAM_TYPE_SEGMENT,
 };
@@ -705,7 +705,7 @@ fn build_ublk_parameters(
         len: params_size() as u32,
         types: param_types,
         basic: UblkParamBasic {
-            attrs: UBLK_ATTR_VOLATILE_CACHE | UBLK_ATTR_FUA,
+            attrs: UBLK_ATTR_FUA,
             logical_bs_shift: block_shift,
             physical_bs_shift: block_shift,
             io_opt_shift: block_shift,
@@ -2497,7 +2497,6 @@ mod tests {
         assert_eq!(report.params.discard.max_write_zeroes_sectors, 2048);
         assert_eq!(report.params.seg.max_segment_size, 1024 * 1024);
         assert_eq!(report.params.seg.max_segments, 1);
-        assert!((report.params.basic.attrs & UBLK_ATTR_VOLATILE_CACHE) != 0);
         assert!((report.params.basic.attrs & UBLK_ATTR_FUA) != 0);
         assert!(!report.params_set_ioctl_issued);
     }

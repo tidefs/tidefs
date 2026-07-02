@@ -20,7 +20,7 @@ const UBLK_COMPLETION_REQUIRED_NON_CLAIMS: &[&str] = &[
     "not_successor_or_comparator_evidence",
 ];
 const UBLK_QID_TAG_RUNTIME_REQUIRED_OPS: &[&str] =
-    &["read", "write", "flush", "discard", "write_zeroes"];
+    &["read", "write", "discard", "write_zeroes"];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UblkCompletionArtifactSummary {
@@ -748,9 +748,9 @@ mod tests {
     fn rejects_runtime_contract_without_operation_breadth() {
         let text = qid_tag_runtime_artifact(
             UBLK_QID_TAG_RUNTIME_SCENARIO,
-            &[("read", 0, 0, 4096), ("write", 1, 0, 4096)],
+            &[("read", 0, 0, 4096), ("write", 1, 0, 4096), ("write_zeroes", 0, 1, 0)],
         );
-        assert_invalid_contains(text, "must terminally complete `flush`");
+        assert_invalid_contains(text, "must terminally complete `discard`");
     }
 
     #[test]
