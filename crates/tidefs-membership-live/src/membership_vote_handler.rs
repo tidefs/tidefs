@@ -274,7 +274,6 @@ impl MembershipVoteHandler {
 /// coordinator through the configured vote sender. Missing or failed vote
 /// delivery is reported as a handler error so callers cannot mistake a lost
 /// vote for successful proposal handling.
-
 struct VoteDispatchAdapter {
     handler: MembershipVoteHandler,
     send_vote: Option<MembershipVoteSender>,
