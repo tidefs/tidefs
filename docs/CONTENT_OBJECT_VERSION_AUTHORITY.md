@@ -185,9 +185,7 @@ change those paths.
 - Orphan cleanup may scan versioned key names to discover stale keys in the
   current format, but that scan does not define ordering, reachability, or
   storage-format compatibility.
-- Future implementation issues #675 and #676 own policy and runtime changes
-  for receipt-driven read/scrub/repair/rebuild consumers and rebake/reclaim
-  trims. This document only names the boundary those slices must preserve.
+- Implementation issues #675 and #676 (now closed) resolved the policy and runtime changes for receipt-driven read/scrub/repair/rebuild consumers and rebake/reclaim trims. This document named the boundary those slices preserved.
 
 ## Non-Claims
 
@@ -196,4 +194,4 @@ This document does not:
 - change code, on-disk format, object key names, or runtime behavior;
 - change reclaim dispatch, rebake policy, deadlist policy, or orphan cleanup;
 - close TFR-005;
-- close issues #675 or #676.
+- does not implement the runtime changes that #675 and #676 resolved.

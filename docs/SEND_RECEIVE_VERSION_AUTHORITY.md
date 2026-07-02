@@ -150,27 +150,20 @@ The following are not allowed:
 - treating VFSSEND2 lineage or sender identity metadata as an override for
   local record payload field authority.
 
-## Follow-up implementation map
+## Follow-up implementation map (closed)
 
-- #1002 (`send-receive-vfssend1-version-authority-guards`) is the focused
-  VFSSEND1 guard issue. Its expected write set is limited to
+- #1002 (`send-receive-vfssend1-version-authority-guards`, now closed) added
+  the focused VFSSEND1 authority guards. Its expected write set was limited to
   `crates/tidefs-local-filesystem/src/encoding.rs`, focused tests under
   `crates/tidefs-local-filesystem/tests/**` or an encoding-only adjacent test
   module, and `crates/tidefs-local-filesystem/src/types.rs` only if a narrow
-  testable helper is needed. It must not edit
-  `crates/tidefs-local-filesystem/src/send_receive.rs` or local receive tests
-  while #703 has a live branch or PR touching those paths.
-- #777 (`receive-stream-sender-authority-fields`) owns distributed sender
-  authority fields and stream-header evidence. That issue should consume this
-  document when deciding whether VFSSEND1 remains local-only or gains new
-  sender evidence, and it must not use sender identity fields to reinterpret
-  timestamp or local storage-version payloads.
-- #703 (`receive-conflicting-target-error`) remains the receive merge-policy
-  error-classification follow-up. It is not a timestamp/version projection
-  issue and should not absorb #1002 unless live issue state records a deliberate
-  handoff.
+  testable helper was needed. It did not edit
+  `crates/tidefs-local-filesystem/src/send_receive.rs` or local receive tests.
+- #777 (`receive-stream-sender-authority-fields`, now closed) resolved
+  distributed sender authority fields and stream-header evidence.
+- #703 (`receive-conflicting-target-error`, now closed) resolved the receive
+  merge-policy error-classification follow-up.
 
-Runtime send/receive validation, Focused Rust runs, and any source changes
-belong to those follow-up issues. Issue #695 remains complete as a design
-slice when this document is reviewed with source inspection and
-`git diff --check`.
+Issue #695 remains complete as a design slice; #1002, #777, and #703 are
+closed. Runtime send/receive validation for those closed slices was completed
+through their respective focused validation dispatches.
