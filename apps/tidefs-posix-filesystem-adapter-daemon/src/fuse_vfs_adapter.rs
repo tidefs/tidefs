@@ -32,6 +32,7 @@ use crate::handler_prelude::*;
 use crate::lock_dispatch::{DaemonLockDispatch, LockDispatchError};
 use crate::materialized_cache::MaterializedSignatureCache;
 use crate::mmap_coherency::MmapCoherency;
+use crate::writeback_cache_projection::WritebackProjection;
 use crate::read_cache::ReadCache;
 use crate::reply::{LookupEntryAttr, LookupEntryReply};
 use crate::workers_meta::{
@@ -3017,6 +3018,12 @@ pub struct FuseVfsAdapter {
     suppress_dir_atime: bool,
     /// Mmap cluster coherency: page invalidation on remote writes.
     mmap_coherency: Arc<MmapCoherency>,
+    /// Writeback-cache and mmap-coherency runtime projection.
+    ///
+    /// Provides a unified observable view of all dirty/writeback/clean
+    /// state transitions.  Used by claim-gate validation and no-hidden-
+    /// queue evidence collection.  Does not own durability authority.
+    pub(crate) writeback_projection: Arc<WritebackProjection>,
     /// FUSE kernel cache invalidation notifier, filled after mount.
     notifier: Arc<Mutex<Option<fuser::Notifier>>>,
     /// Orphan index for tracking inodes unlinked while still open.
@@ -3064,6 +3071,22 @@ impl FuseVfsAdapter {
         let notifier = Arc::new(Mutex::new(None));
         let mmap_coherency = Arc::new(MmapCoherency::new(Arc::clone(&notifier)));
         let engine = Arc::new(Mutex::new(engine));
+        let write_page_cache = Arc::new(PageCache::new(1024, 4096));
+        let writeback_projection = Arc::new(WritebackProjection::new(
+            Some(Arc::clone(&write_page_cache)),
+            Arc::clone(&mmap_coherency),
+        ));
+
+        // Install the dirty-state check callback so mmap-coherency
+        // invalidation preserves dirty/writeback pages ahead of the
+        // durability barrier.
+        {
+            let proj = Arc::clone(&writeback_projection);
+            mmap_coherency.set_dirty_check(Some(Box::new(move |ino| {
+                proj.is_dirty_or_writeback(ino)
+            })));
+        }
+
         let timestamp_policy = TimestampPolicy::default();
         let base_dentry_policy = DentryPolicy::default();
         let governor = Governor::new(GovernorConfig::default()).map_err(|_| Errno::EINVAL)?;
@@ -3092,7 +3115,7 @@ impl FuseVfsAdapter {
             fuse_read_dispatch: None,
             writeback_page_cache: None,
             readahead_state: Mutex::new(None),
-            write_page_cache: Arc::new(PageCache::new(1024, 4096)),
+            write_page_cache: Arc::clone(&write_page_cache),
             write_dispatch: Mutex::new(DaemonWriteDispatch::new()),
             getattr_cache: Mutex::new(HashMap::new()),
             path_lookup_cache: Mutex::new(PathLookupCache::new(
@@ -3117,6 +3140,7 @@ impl FuseVfsAdapter {
             suppress_dir_atime: false,
             notifier: notifier.clone(),
             mmap_coherency,
+            writeback_projection: Arc::clone(&writeback_projection),
             orphan_index: Mutex::new(OrphanIndex::new()),
             writeback_seen_inodes: Mutex::new(HashSet::new()),
             relatime_read_atime_pending: Mutex::new(HashSet::new()),
@@ -6924,6 +6948,17 @@ impl FuseVfsAdapter {
             if written > 0 {
                 self.mark_relatime_read_atime_pending_after_write(ino);
             }
+            // Record the write in the runtime projection so the dirty
+            // lifecycle is observable for claim-gate validation
+            // (no hidden writeback queues).
+            if written > 0 {
+                let total_dirty = WritebackProjection::total_observable_dirty_bytes(
+                    &self.dirty_state,
+                    self.writeback_page_cache.as_ref(),
+                    ino,
+                );
+                self.writeback_projection.record_dirty(ino, total_dirty);
+            }
             Ok(written)
         } else {
             let efh = resolved_efh.ok_or(Errno::EBADF)?;
@@ -7799,6 +7834,10 @@ impl FuseVfsAdapter {
         self.writeback_cache.lock().unwrap().mark_clean(ino);
         self.write_page_cache.clear_dirty_for_inode(ino);
         self.writeback_cache_stats.lock().unwrap().record_flush();
+
+        // Record the clean transition in the runtime projection so the
+        // dirty-to-clean lifecycle is observable for claim-gate validation.
+        self.writeback_projection.record_clean(ino);
 
         // Drain the DirtyPageTracker for this inode after writeback so
         // the background flush service (#4657) sees a clean inode.

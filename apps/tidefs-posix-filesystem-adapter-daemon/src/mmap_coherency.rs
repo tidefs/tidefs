@@ -66,10 +66,36 @@ struct MmapRegistration {
 }
 
 /// Mmap cluster coherency manager.
+///
+/// # Dirty/writeback preservation
+///
+/// When a [`DirtyStateCheck`] callback is set (via [`set_dirty_check`]),
+/// the invalidation sink consults it before sending
+/// `FUSE_NOTIFY_INVAL_INODE`.  Inodes with dirty or writeback-pending
+/// bytes are preserved—their page-cache entries are not invalidated—per
+/// the authority contract in
+/// [`docs/PAGE_CACHE_WRITEBACK_AUTHORITY.md`].
+///
+/// # Type alias
+///
+/// A dirty/writeback-state check callback.
+///
+/// The callback receives an inode number and returns `true` when the inode
+/// has dirty or writeback-pending bytes.  When set, the invalidation sink
+/// consults this callback before sending `FUSE_NOTIFY_INVAL_INODE` so that
+/// dirty/writeback pages are preserved (authority contract:
+/// "Dirty and writeback pages must not be silently invalidated").
+pub type DirtyStateCheck = Box<dyn Fn(u64) -> bool + Send + Sync>;
+
 pub struct MmapCoherency {
     registrations: Mutex<BTreeMap<u64, MmapRegistration>>,
     processor: Mutex<FollowerInvalidationProcessor>,
     notifier: Arc<Mutex<Option<fuser::Notifier>>>,
+    /// Optional callback to check whether an inode has dirty or
+    /// writeback-pending bytes.  When set and the callback returns
+    /// `true`, mmap invalidation for that inode is skipped or deferred
+    /// until the dirty state is resolved.
+    dirty_check: Mutex<Option<DirtyStateCheck>>,
     pub stats: MmapCoherencyStats,
 }
 
@@ -79,8 +105,18 @@ impl MmapCoherency {
             registrations: Mutex::new(BTreeMap::new()),
             processor: Mutex::new(FollowerInvalidationProcessor::new()),
             notifier,
+            dirty_check: Mutex::new(None),
             stats: MmapCoherencyStats::new(),
         }
+    }
+
+    /// Install a dirty-state check callback.
+    ///
+    /// When set, the invalidation sink calls this callback before sending
+    /// `FUSE_NOTIFY_INVAL_INODE`.  If the callback returns `true` (inode
+    /// has dirty or writeback-pending bytes), the invalidation is skipped.
+    pub fn set_dirty_check(&self, check: Option<DirtyStateCheck>) {
+        *self.dirty_check.lock().unwrap() = check;
     }
 
     pub fn register(&self, ino: u64, generation: u64) {
@@ -133,6 +169,7 @@ impl MmapCoherency {
         let mut sink = MmapInvalidationSink {
             registrations: &self.registrations,
             notifier: &self.notifier,
+            dirty_check: &self.dirty_check,
             stats: &self.stats,
         };
         self.processor
@@ -149,6 +186,10 @@ impl MmapCoherency {
 struct MmapInvalidationSink<'a> {
     registrations: &'a Mutex<BTreeMap<u64, MmapRegistration>>,
     notifier: &'a Arc<Mutex<Option<fuser::Notifier>>>,
+    /// Reference to the optional dirty-state check callback owned by
+    /// [`MmapCoherency`].  When the callback is set and returns `true`,
+    /// invalidation for dirty/writeback inodes is skipped.
+    dirty_check: &'a Mutex<Option<DirtyStateCheck>>,
     stats: &'a MmapCoherencyStats,
 }
 
@@ -158,6 +199,21 @@ impl InvalidationSink for MmapInvalidationSink<'_> {
             .invalidations_received
             .fetch_add(1, Ordering::Relaxed);
         let ino_u64 = ino.0;
+
+        // Dirty/writeback guard: consult the optional dirty_check callback.
+        // When the inode has dirty or writeback-pending bytes, skip the
+        // invalidation to preserve dirty/writeback pages per the authority
+        // contract in docs/PAGE_CACHE_WRITEBACK_AUTHORITY.md.
+        let is_dirty = self
+            .dirty_check
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|check| check(ino_u64));
+        if is_dirty {
+            return;
+        }
+
         let should_invalidate = {
             let mut regs = self.registrations.lock().unwrap();
             match regs.get_mut(&ino_u64) {
