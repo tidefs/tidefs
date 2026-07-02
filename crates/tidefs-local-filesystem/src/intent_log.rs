@@ -1378,29 +1378,29 @@ impl IntentLog {
     /// This reclaims memory and updates `used_bytes`.
     ///
     /// Returns the number of entries trimmed.
-    pub fn trim_committed(&mut self, committed_entry_id: u64) -> usize {
+    pub fn trim_committed(&mut self, committed_entry_id: u64) -> Result<usize> {
         if committed_entry_id == 0 || self.entries.is_empty() {
-            return 0;
+            return Ok(0);
         }
         // Find the split point: first entry with entry_id > committed_entry_id.
         let split_idx = self
             .entries
             .partition_point(|e| e.entry_id <= committed_entry_id);
         if split_idx == 0 {
-            return 0;
+            return Ok(0);
         }
         let trimmed: Vec<IntentLogEntry> = self.entries.drain(..split_idx).collect();
         let trimmed_count = trimmed.len();
         // Reclaim byte usage.
         let mut reclaimed: u64 = 0;
         for entry in &trimmed {
-            reclaimed += encoded_entry_len(entry) as u64;
+            reclaimed += try_encoded_entry_len(entry)? as u64;
         }
         self.used_bytes = self.used_bytes.saturating_sub(reclaimed);
         // Adjust flushed_entry_count.
         self.flushed_entry_count = self.flushed_entry_count.saturating_sub(trimmed_count);
         self.segments_trimmed += 1;
-        trimmed_count
+        Ok(trimmed_count)
     }
 
     /// Trim all entries that have been flushed to durable storage.
@@ -1410,9 +1410,9 @@ impl IntentLog {
     /// `trim_committed`.
     ///
     /// Returns the number of entries trimmed.
-    pub fn trim_flushed(&mut self) -> usize {
+    pub fn trim_flushed(&mut self) -> Result<usize> {
         if self.flushed_entry_count == 0 {
-            return 0;
+            return Ok(0);
         }
         // The last flushed entry's id is the committed high-water mark.
         let last_flushed_id = self.entries[self.flushed_entry_count - 1].entry_id;
@@ -2018,7 +2018,7 @@ mod tests {
             root_anchor: test_root_anchor(),
             timestamp_ns: test_timestamp(),
         };
-        let bytes = encode_intent_log_entry(&entry);
+        let bytes = try_encode_intent_log_entry(&entry).expect("encode");
         let decoded = decode_intent_log_entry(&bytes).expect("decode");
         assert_eq!(decoded.entry_id, entry.entry_id);
         assert_eq!(decoded.root_anchor, entry.root_anchor);
@@ -2063,7 +2063,7 @@ mod tests {
             root_anchor: test_root_anchor(),
             timestamp_ns: test_timestamp(),
         };
-        let bytes = encode_intent_log_entry(&entry);
+        let bytes = try_encode_intent_log_entry(&entry).expect("encode");
         let decoded = decode_intent_log_entry(&bytes).expect("decode");
         match &decoded.entry_kind {
             IntentLogEntryKind::OdsyncDataRange { has_size_delta, .. } => {
@@ -2083,7 +2083,7 @@ mod tests {
             root_anchor: test_root_anchor(),
             timestamp_ns: test_timestamp(),
         };
-        let bytes = encode_intent_log_entry(&entry);
+        let bytes = try_encode_intent_log_entry(&entry).expect("encode");
         let decoded = decode_intent_log_entry(&bytes).expect("decode");
         match &decoded.entry_kind {
             IntentLogEntryKind::FsyncDirtyDrain { inode_ids } => {
@@ -2101,7 +2101,7 @@ mod tests {
             root_anchor: test_root_anchor(),
             timestamp_ns: test_timestamp(),
         };
-        let bytes = encode_intent_log_entry(&entry);
+        let bytes = try_encode_intent_log_entry(&entry).expect("encode");
         let decoded = decode_intent_log_entry(&bytes).expect("decode");
         assert!(matches!(
             decoded.entry_kind,
@@ -2121,7 +2121,7 @@ mod tests {
             root_anchor: test_root_anchor(),
             timestamp_ns: test_timestamp(),
         };
-        let bytes = encode_intent_log_entry(&entry);
+        let bytes = try_encode_intent_log_entry(&entry).expect("encode");
         let decoded = decode_intent_log_entry(&bytes).expect("decode");
         match &decoded.entry_kind {
             IntentLogEntryKind::NamespaceSyncIntent {
@@ -2152,7 +2152,7 @@ mod tests {
             timestamp_ns: test_timestamp(),
         };
 
-        let bytes = encode_intent_log_entry(&entry);
+        let bytes = try_encode_intent_log_entry(&entry).expect("encode");
         let decoded = decode_intent_log_entry(&bytes).expect("decode");
         match &decoded.entry_kind {
             IntentLogEntryKind::NamespaceCreateIntent(intent) => {
@@ -2295,7 +2295,7 @@ mod tests {
             root_anchor: test_root_anchor(),
             timestamp_ns: 0,
         };
-        let mut bytes = encode_intent_log_entry(&entry);
+        let mut bytes = try_encode_intent_log_entry(&entry).expect("encode");
         let kind_pos = bytes.len().saturating_sub(41);
         bytes[kind_pos] = 99;
         assert!(decode_intent_log_entry(&bytes).is_err());
@@ -2332,7 +2332,7 @@ mod tests {
             root_anchor: test_root_anchor(),
             timestamp_ns: test_timestamp(),
         };
-        let bytes = encode_intent_log_entry(&entry);
+        let bytes = try_encode_intent_log_entry(&entry).expect("encode");
         log_device.append(&bytes).expect("log_device append");
 
         let recovered = log_device.read_all_entries().expect("read log_device");
@@ -2372,7 +2372,7 @@ mod tests {
                     timestamp_ns: test_timestamp(),
                 };
                 log_device
-                    .append(&encode_intent_log_entry(&entry))
+                    .append(&try_encode_intent_log_entry(&entry).expect("encode"))
                     .expect("log_device append");
             }
         }
@@ -2959,7 +2959,7 @@ mod tests {
         let bytes_before = log.bytes_used();
 
         // Trim entries with ids <= 4
-        let trimmed = log.trim_committed(4);
+        let trimmed = log.trim_committed(4).expect("trim_committed");
         assert_eq!(trimmed, 5);
         assert_eq!(log.len(), 5);
         assert!(log.bytes_used() < bytes_before);
@@ -2990,7 +2990,7 @@ mod tests {
         assert_eq!(log.pending_flush_count(), 0);
         assert_eq!(log.len(), 4);
 
-        let trimmed = log.trim_flushed();
+        let trimmed = log.trim_flushed().expect("trim_flushed");
         assert_eq!(trimmed, 4);
         assert!(log.is_empty());
         assert_eq!(log.bytes_used(), 0);
@@ -2999,8 +2999,8 @@ mod tests {
     #[test]
     fn trim_committed_zero_or_empty_is_noop() {
         let mut log = IntentLog::new();
-        assert_eq!(log.trim_committed(0), 0);
-        assert_eq!(log.trim_flushed(), 0);
+        assert_eq!(log.trim_committed(0).expect("trim_committed"), 0);
+        assert_eq!(log.trim_flushed().expect("trim_flushed"), 0);
     }
 
     #[test]
@@ -3050,8 +3050,8 @@ mod tests {
             root_anchor: test_root_anchor(),
             timestamp_ns: test_timestamp(),
         };
-        let encoded = encode_intent_log_entry(&entry);
-        assert_eq!(encoded_entry_len(&entry), encoded.len());
+        let encoded = try_encode_intent_log_entry(&entry).expect("encode");
+        assert_eq!(try_encoded_entry_len(&entry).expect("entry_len"), encoded.len());
     }
 
     #[test]
@@ -3104,8 +3104,8 @@ mod tests {
             },
         ];
         for entry in &cases {
-            let encoded = encode_intent_log_entry(entry);
-            assert_eq!(encoded_entry_len(entry), encoded.len(), "mismatch for kind");
+            let encoded = try_encode_intent_log_entry(entry).expect("encode");
+            assert_eq!(try_encoded_entry_len(entry).expect("entry_len"), encoded.len(), "mismatch for kind");
         }
     }
 
