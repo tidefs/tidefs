@@ -7,9 +7,13 @@ Durable local filesystem model built on the TideFS Local Object Store.
 `tidefs-local-filesystem` is the primary filesystem implementation crate in
 TideFS. It publishes namespace changes through immutable transaction objects
 and root-slot commits on top of [`tidefs_local_object_store`]. On reopen,
-incomplete commits are ignored and the newest valid committed root is
-selected automatically — production recovery never requires an operator
-repair pass.
+the implementation ignores incomplete commits and selects the newest valid
+committed root. That is committed-root replay behavior only; it is not a
+product-grade crash recovery, automatic repair, or release-readiness claim.
+Product recovery and writeback claims remain gated by
+`docs/PAGE_CACHE_WRITEBACK_AUTHORITY.md`, `validation/claims.toml`,
+`docs/CLAIM_REGISTRY.md`, the registry-listed validation artifacts, and live
+GitHub issues.
 
 The crate sits between the FUSE daemon
 (`tidefs_posix_filesystem_adapter_daemon`) above and
@@ -76,11 +80,16 @@ groups after a crash.
 ## Recovery Model
 
 On open, [`crash_recovery`] replays the intent log and selects the
-newest valid committed root. The [`recovery`] module handles torn-tail
-repair without operator intervention. [`repair`] applies corruption
-resolution strategies (truncate, mark-corrupt, reconstruct), and
+newest valid committed root. The [`recovery`] module implements the current
+torn-tail repair path. [`repair`] applies corruption resolution strategies
+(truncate, mark-corrupt, reconstruct), and
 [`scrub`] runs a full block-level checksum pipeline with outcome
 classification.
+
+These mechanics describe current source behavior and focused tests. Broader
+recovery, write/fsync/writeback, mmap, and automatic repair admission remains
+non-claim authority tracked by `docs/PAGE_CACHE_WRITEBACK_AUTHORITY.md`,
+TFR-008, `validation/claims.toml`, and the claim-registry product gates.
 
 ### Txg Commit Replay
 
@@ -120,9 +129,9 @@ drain in `tidefs-local-object-store`. `LocalObjectStore::drain_dead_segments`
 now inspects the older object-store reclaim queue and fails closed without
 committed receipt evidence. `BackgroundReclaim` and `ProcessedDelta` in
 `background_reclaim.rs` are model/test surfaces quarantined behind
-`#[cfg(test)]` and are not release reclaim validation.
+`#[cfg(test)]` and are not product reclaim evidence.
 
-Production reclaim chain:
+Current implementation reclaim path (non-claim):
 
 1. `record_reclaim_delta()` — records refcount deltas into the local
    `BPlusTreeReclaimQueue` during unlink, truncate, and rename-overwrite.
@@ -133,6 +142,12 @@ Production reclaim chain:
 4. Receipt-bound dead-object drain — frees physical segments only after
    committed deadlist and snapshot-pin clearance evidence authorizes the
    dead object ids.
+
+This sequence records current source behavior and focused tests. Product
+reclaim, source-retirement, and lifecycle wording remains blocked by
+`docs/SNAPSHOT_CLONE_DEADLIST_AUTHORITY.md`, TFR-010,
+`validation/claims.toml`, `docs/CLAIM_REGISTRY.md`, and the open follow-ups
+named there.
 
 ## Dedup
 
