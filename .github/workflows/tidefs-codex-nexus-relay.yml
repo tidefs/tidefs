@@ -26,7 +26,20 @@ concurrency:
 jobs:
   relay:
     name: Relay event
-    if: ${{ github.event_name == 'workflow_dispatch' || vars.TIDEFS_SELF_HOSTED_READY == '1' }}
+    # Draft PRs are not integration candidates. Keep source-head and lifecycle
+    # wakeups, but skip metadata-only draft churn before allocating a runner.
+    if: >-
+      ${{
+        github.event_name == 'workflow_dispatch' ||
+        (
+          vars.TIDEFS_SELF_HOSTED_READY == '1' &&
+          (
+            github.event_name != 'pull_request' ||
+            github.event.pull_request.draft != true ||
+            contains(fromJSON('["opened","synchronize","reopened","ready_for_review","converted_to_draft","closed"]'), github.event.action)
+          )
+        )
+      }}
     runs-on: [self-hosted, linux, x64, tidefs]
     timeout-minutes: 5
     env:
