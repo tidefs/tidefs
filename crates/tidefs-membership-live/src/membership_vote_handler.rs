@@ -22,6 +22,13 @@ use tidefs_membership_epoch::roster_validation::{self, RosterChangeProposal};
 use tidefs_membership_epoch::MemberId;
 use tidefs_membership_types::RosterChangeVote;
 
+/// Callback type for delivering proposal votes to the coordinator.
+pub type MembershipVoteSender = Arc<
+    dyn Fn(MemberId, MembershipOutboundMessage) -> Result<(), MembershipDispatchError>
+        + Send
+        + Sync,
+>;
+
 // ---------------------------------------------------------------------------
 // VoteValidationOutcome
 // ---------------------------------------------------------------------------
@@ -241,14 +248,15 @@ impl MembershipVoteHandler {
     }
 
     /// Create a `MembershipMessageHandler` that validates proposals and sends
-    /// votes back through `outbound`. Pass `None` if outbound delivery is
-    /// not available (votes will be validated and dropped silently).
+    /// votes back through `send_vote`.
+    ///
+    /// If `send_vote` is `None`, proposal handling fails closed with a
+    /// [`MembershipDispatchError::HandlerError`] that names the missing vote
+    /// delivery path instead of validating and silently dropping the vote.
     #[must_use]
     pub fn into_handler(
         self,
-        send_vote: Option<
-            std::sync::Arc<dyn Fn(MemberId, MembershipOutboundMessage) + Send + Sync>,
-        >,
+        send_vote: Option<MembershipVoteSender>,
     ) -> Box<dyn crate::dispatch_router::MembershipMessageHandler> {
         Box::new(VoteDispatchAdapter::new(self, send_vote))
     }
@@ -261,21 +269,32 @@ impl MembershipVoteHandler {
 /// Adapter that bridges [`MembershipVoteHandler`] to the
 /// [`MembershipMessageHandler`] dispatch trait.
 ///
-/// On receiving a `ProposalSubmission`, validates the proposal and — when
-/// `outbound` is configured — constructs a [`MembershipOutboundMessage::ProposalAck`]
-/// and enqueues it via [`MembershipOutboundDispatch::send_to_peer`] back to
-/// the coordinator.
-/// Callback type for sending votes: receives (target MemberId, outbound message).
-type VoteSender = std::sync::Arc<dyn Fn(MemberId, MembershipOutboundMessage) + Send + Sync>;
+/// On receiving a `ProposalSubmission`, validates the proposal, constructs a
+/// [`MembershipOutboundMessage::ProposalAck`], and sends it back to the
+/// coordinator through the configured vote sender. Missing or failed vote
+/// delivery is reported as a handler error so callers cannot mistake a lost
+/// vote for successful proposal handling.
 
 struct VoteDispatchAdapter {
     handler: MembershipVoteHandler,
-    send_vote: Option<VoteSender>,
+    send_vote: Option<MembershipVoteSender>,
 }
 
 impl VoteDispatchAdapter {
-    fn new(handler: MembershipVoteHandler, send_vote: Option<VoteSender>) -> Self {
+    fn new(handler: MembershipVoteHandler, send_vote: Option<MembershipVoteSender>) -> Self {
         Self { handler, send_vote }
+    }
+
+    fn vote_delivery_error(
+        reason: &str,
+        proposer: MemberId,
+        vote: &RosterChangeVote,
+        proposal_hash: &[u8; 32],
+    ) -> MembershipDispatchError {
+        MembershipDispatchError::HandlerError(format!(
+            "proposal vote delivery {reason}: target={}, responder={}, proposal_id={}, accepted={}, proposal_hash={:?}",
+            proposer.0, vote.voter_id, vote.proposal_id, vote.accepted, proposal_hash
+        ))
     }
 }
 
@@ -322,17 +341,31 @@ impl crate::dispatch_router::MembershipMessageHandler for VoteDispatchAdapter {
 
             let vote = self.handler.validate_and_vote(&proposal);
 
-            // Send the vote back to the coordinator via the registered callback.
-            if let Some(ref sender) = self.send_vote {
-                let ack_msg = MembershipOutboundMessage::ProposalAck {
-                    responder: MemberId::new(vote.voter_id),
-                    proposal_hash: *proposal_hash,
-                    accepted: vote.accepted,
-                    reject_reason: vote.reject_reason.clone(),
-                    acked_at_millis: vote.voted_at_millis,
-                };
-                sender(*proposer, ack_msg);
-            }
+            let ack_msg = MembershipOutboundMessage::ProposalAck {
+                responder: MemberId::new(vote.voter_id),
+                proposal_hash: *proposal_hash,
+                accepted: vote.accepted,
+                reject_reason: vote.reject_reason.clone(),
+                acked_at_millis: vote.voted_at_millis,
+            };
+
+            let Some(ref sender) = self.send_vote else {
+                return Err(Self::vote_delivery_error(
+                    "unavailable",
+                    *proposer,
+                    &vote,
+                    proposal_hash,
+                ));
+            };
+
+            sender(*proposer, ack_msg).map_err(|err| {
+                Self::vote_delivery_error(
+                    &format!("failed: {err}"),
+                    *proposer,
+                    &vote,
+                    proposal_hash,
+                )
+            })?;
         } else {
             return Err(MembershipDispatchError::HandlerError(
                 "VoteDispatchAdapter received non-ProposalSubmission message".to_string(),
@@ -349,6 +382,9 @@ impl crate::dispatch_router::MembershipMessageHandler for VoteDispatchAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dispatch_router::{MembershipDispatchError, MembershipMessage};
+    use std::sync::{Arc, Mutex};
+    use tidefs_membership_epoch::epoch_proposal::MembershipDelta;
     use tidefs_membership_epoch::MemberId;
 
     fn cfg(my_id: u64, coordinator: u64, epoch: u64, members: Vec<u64>) -> MembershipVoteConfig {
@@ -374,6 +410,19 @@ mod tests {
             added,
             removed,
             created_at_millis: 1000,
+        }
+    }
+
+    fn proposal_submission(delta: MembershipDelta) -> MembershipMessage {
+        MembershipMessage::ProposalSubmission {
+            proposer: MemberId::new(1),
+            current_epoch: 5,
+            proposed_epoch: 6,
+            delta,
+            resulting_members: vec![1, 2, 3, 4],
+            proposal_hash: [8u8; 32],
+            submitted_at_millis: 1000,
+            catalog_delta_bytes: None,
         }
     }
 
@@ -485,39 +534,116 @@ mod tests {
 
     #[test]
     fn adapter_sends_accept_vote_to_coordinator() {
-        // Validate that a valid join proposal produces an accept vote.
-        // Full outbound integration requires a real SendDispatcher;
-        // here we verify the vote's shape matches the proposal.
-        let handler = MembershipVoteHandler::new(cfg(2, 1, 5, vec![1, 2, 3]));
-        let proposal = tidefs_membership_types::RosterChangeProposal {
-            proposal_id: 1000,
-            coordinator_id: 1,
-            current_epoch: 5,
-            added: vec![4],
-            removed: vec![],
-            created_at_millis: 1000,
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let sender: MembershipVoteSender = {
+            let sent = Arc::clone(&sent);
+            Arc::new(move |target, message| {
+                sent.lock().unwrap().push((target, message));
+                Ok(())
+            })
         };
-        let vote = handler.validate_and_vote(&proposal);
-        assert!(vote.accepted);
-        assert_eq!(vote.voter_id, 2);
-        assert_eq!(vote.proposal_id, 1000);
-        assert!(vote.reject_reason.is_none());
+
+        let handler =
+            MembershipVoteHandler::new(cfg(2, 1, 5, vec![1, 2, 3])).into_handler(Some(sender));
+        handler
+            .handle_proposal_submission(&proposal_submission(MembershipDelta::NodeJoined(4)))
+            .expect("valid proposal vote should be delivered");
+
+        let sent = sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].0, MemberId::new(1));
+        match &sent[0].1 {
+            MembershipOutboundMessage::ProposalAck {
+                responder,
+                proposal_hash,
+                accepted,
+                reject_reason,
+                ..
+            } => {
+                assert_eq!(*responder, MemberId::new(2));
+                assert_eq!(*proposal_hash, [8u8; 32]);
+                assert!(*accepted);
+                assert!(reject_reason.is_none());
+            }
+            other => panic!("expected proposal ack, got {other:?}"),
+        }
     }
 
     #[test]
     fn adapter_produces_reject_for_invalid_proposal() {
-        let handler = MembershipVoteHandler::new(cfg(2, 1, 5, vec![1, 2, 3]));
-        let proposal = tidefs_membership_types::RosterChangeProposal {
-            proposal_id: 42,
-            coordinator_id: 1,
-            current_epoch: 5,
-            added: vec![2], // 2 already in roster -> duplicate join
-            removed: vec![],
-            created_at_millis: 2000,
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let sender: MembershipVoteSender = {
+            let sent = Arc::clone(&sent);
+            Arc::new(move |target, message| {
+                sent.lock().unwrap().push((target, message));
+                Ok(())
+            })
         };
-        let vote = handler.validate_and_vote(&proposal);
-        assert!(!vote.accepted);
-        assert!(vote.reject_reason.unwrap().contains("duplicate_join"));
+
+        let handler =
+            MembershipVoteHandler::new(cfg(2, 1, 5, vec![1, 2, 3])).into_handler(Some(sender));
+        handler
+            .handle_proposal_submission(&proposal_submission(MembershipDelta::NodeJoined(2)))
+            .expect("invalid proposal should still deliver a reject vote");
+
+        let sent = sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        match &sent[0].1 {
+            MembershipOutboundMessage::ProposalAck {
+                accepted,
+                reject_reason,
+                ..
+            } => {
+                assert!(!accepted);
+                assert!(reject_reason
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("duplicate_join"));
+            }
+            other => panic!("expected proposal ack, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn adapter_fails_closed_without_vote_sender() {
+        let handler = MembershipVoteHandler::new(cfg(2, 1, 5, vec![1, 2, 3])).into_handler(None);
+        let err = handler
+            .handle_proposal_submission(&proposal_submission(MembershipDelta::NodeJoined(4)))
+            .expect_err("missing vote sender must fail closed");
+
+        match err {
+            MembershipDispatchError::HandlerError(detail) => {
+                assert!(detail.contains("proposal vote delivery unavailable"));
+                assert!(detail.contains("target=1"));
+                assert!(detail.contains("responder=2"));
+                assert!(detail.contains("accepted=true"));
+            }
+            other => panic!("expected handler error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn adapter_propagates_vote_sender_failure() {
+        let sender: MembershipVoteSender = Arc::new(|_, _| {
+            Err(MembershipDispatchError::HandlerError(
+                "transport send refused".to_string(),
+            ))
+        });
+        let handler =
+            MembershipVoteHandler::new(cfg(2, 1, 5, vec![1, 2, 3])).into_handler(Some(sender));
+        let err = handler
+            .handle_proposal_submission(&proposal_submission(MembershipDelta::NodeJoined(4)))
+            .expect_err("vote sender failure must fail proposal handling");
+
+        match err {
+            MembershipDispatchError::HandlerError(detail) => {
+                assert!(detail.contains("proposal vote delivery failed"));
+                assert!(detail.contains("transport send refused"));
+                assert!(detail.contains("target=1"));
+                assert!(detail.contains("responder=2"));
+            }
+            other => panic!("expected handler error, got {other:?}"),
+        }
     }
 
     // ── Config update ───────────────────────────────────────────
