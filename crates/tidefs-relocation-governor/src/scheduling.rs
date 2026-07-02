@@ -458,9 +458,7 @@ impl RelocationRuntimeJob {
         if self.policy_id.is_zero() || self.policy_revision.0 == 0 {
             return Some(RelocationRuntimeRefusal::MissingPolicyEvidence);
         }
-        if current_policy_revision
-            .map(|revision| revision != self.policy_revision)
-            .unwrap_or(false)
+        if current_policy_revision.is_some_and(|revision| revision != self.policy_revision)
             || self.action_evidence.policy_revision != self.policy_revision
             || self.action_evidence.action_id != self.action_id
             || self.action_evidence.replay.retry_generation != self.retry_generation
@@ -718,20 +716,20 @@ fn drive_relocation_job(
     }
 
     if job.state == RelocationRuntimeState::Verifying {
-        match job.action_evidence.target_verification.state {
+        if matches!(
+            job.action_evidence.target_verification.state,
             StorageIntentActionTargetVerificationState::DigestMismatch
-            | StorageIntentActionTargetVerificationState::PartialWrite
-            | StorageIntentActionTargetVerificationState::DegradedPartial
-            | StorageIntentActionTargetVerificationState::Refused => {
-                job.state = RelocationRuntimeState::RolledBack;
-                job.last_refusal = Some(RelocationRuntimeRefusal::TargetVerificationFailed);
-                report.errors = 1;
-                return RelocationRuntimeDriveResult {
-                    report,
-                    completion: None,
-                };
-            }
-            _ => {}
+                | StorageIntentActionTargetVerificationState::PartialWrite
+                | StorageIntentActionTargetVerificationState::DegradedPartial
+                | StorageIntentActionTargetVerificationState::Refused
+        ) {
+            job.state = RelocationRuntimeState::RolledBack;
+            job.last_refusal = Some(RelocationRuntimeRefusal::TargetVerificationFailed);
+            report.errors = 1;
+            return RelocationRuntimeDriveResult {
+                report,
+                completion: None,
+            };
         }
 
         if !job.action_evidence.target_verification.is_complete() {
@@ -799,11 +797,8 @@ const fn preflight_action_refusal(
     refusal: StorageIntentActionExecutionRefusalReason,
 ) -> Option<RelocationRuntimeRefusal> {
     match refusal {
-        StorageIntentActionExecutionRefusalReason::None => None,
-        StorageIntentActionExecutionRefusalReason::DuplicateActionDelivery => {
-            Some(RelocationRuntimeRefusal::DuplicateDeliverySuppressed)
-        }
-        StorageIntentActionExecutionRefusalReason::MissingTargetVerification
+        StorageIntentActionExecutionRefusalReason::None
+        | StorageIntentActionExecutionRefusalReason::MissingTargetVerification
         | StorageIntentActionExecutionRefusalReason::PartialTargetWrite
         | StorageIntentActionExecutionRefusalReason::TargetWriteIsNotCompletion
         | StorageIntentActionExecutionRefusalReason::MissingPublicationEvidence
@@ -811,6 +806,9 @@ const fn preflight_action_refusal(
         | StorageIntentActionExecutionRefusalReason::MissingRecoveryDegradationEvidence
         | StorageIntentActionExecutionRefusalReason::MissingActionCompletionEvidence
         | StorageIntentActionExecutionRefusalReason::SourceRetirementForbidden => None,
+        StorageIntentActionExecutionRefusalReason::DuplicateActionDelivery => {
+            Some(RelocationRuntimeRefusal::DuplicateDeliverySuppressed)
+        }
         other => Some(RelocationRuntimeRefusal::ActionEvidenceRefused(other)),
     }
 }
@@ -920,6 +918,7 @@ mod tests {
     use crate::governor::RelocationGovernorConfig;
     use crate::hard_gates::HardGateEvidence;
     use crate::heuristics::{HeuristicInput, RelocationActionClass};
+    use std::collections::VecDeque;
     use tidefs_background_scheduler::BackgroundScheduler;
     use tidefs_storage_intent_core::{
         StorageIntentActionBudgetOutcomeRecord, StorageIntentActionClass,
@@ -933,12 +932,14 @@ mod tests {
 
     #[derive(Clone)]
     struct ScriptedMover {
-        outcomes: Vec<RelocationMoveOutcome>,
+        outcomes: VecDeque<RelocationMoveOutcome>,
     }
 
     impl ScriptedMover {
         fn new(outcomes: Vec<RelocationMoveOutcome>) -> Self {
-            Self { outcomes }
+            Self {
+                outcomes: outcomes.into(),
+            }
         }
     }
 
@@ -948,10 +949,10 @@ mod tests {
             job: &RelocationRuntimeJob,
             _budget: ServiceBudget,
         ) -> RelocationMoveOutcome {
-            if self.outcomes.is_empty() {
-                return RelocationMoveOutcome::deferred(job.action_evidence);
+            match self.outcomes.pop_front() {
+                Some(outcome) => outcome,
+                None => RelocationMoveOutcome::deferred(job.action_evidence),
             }
-            self.outcomes.remove(0)
         }
     }
 
