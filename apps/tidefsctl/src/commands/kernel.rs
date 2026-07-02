@@ -97,7 +97,7 @@ impl KernelControlStatus {
     }
 
     fn to_json(&self) -> String {
-        let value = serde_json::json!({
+        let mut value = serde_json::json!({
             "probe_completed": true,
             "control_device": self.control_device.display().to_string(),
             "control_device_source": CONTROL_DEVICE_SOURCE,
@@ -115,38 +115,48 @@ impl KernelControlStatus {
             "control_uapi_versioning_source": CONTROL_CONTRACT_SOURCE,
             "required_readonly_status_calls": REQUIRED_READONLY_STATUS_CALLS,
             "required_readonly_status_calls_source": CONTROL_CONTRACT_SOURCE,
-            "status_is_passive": self.status_is_passive(),
-            "status_is_passive_source": PASSIVE_BOUNDARY_SOURCE,
-            "control_endpoint_opened": self.control_endpoint_opened,
-            "control_endpoint_opened_source": PASSIVE_BOUNDARY_SOURCE,
-            "readonly_status_calls_issued": self.readonly_status_calls_issued,
-            "readonly_status_calls_issued_source": PASSIVE_BOUNDARY_SOURCE,
-            "control_device_present": self.control_device_present(),
-            "control_device_present_source": DEVICE_PROBE_SOURCE,
-            "control_device_character": self.control_device_character(),
-            "control_device_character_source": DEVICE_PROBE_SOURCE,
-            "production_uapi_wired": self.production_uapi_wired,
-            "production_uapi_wired_source": PASSIVE_BOUNDARY_SOURCE,
-            "control_uapi_usable": self.control_uapi_usable(),
-            "control_uapi_usable_source": PASSIVE_BOUNDARY_SOURCE,
-            "mutating_ioctls_issued": self.mutating_ioctls_issued,
-            "mutating_ioctls_issued_source": PASSIVE_BOUNDARY_SOURCE,
-            "mutating_operation_admission": self.mutating_operation_admission.label(),
-            "mutating_operation_admission_source": self.mutating_operation_admission.source_label(),
-            "abi_compatibility_boundary": ABI_COMPATIBILITY_BOUNDARY,
-            "abi_compatibility_boundary_source": CONTROL_CONTRACT_SOURCE,
-            "owner_manifest_authority": self.owner_manifest_authority,
-            "owner_manifest_authority_source": PASSIVE_BOUNDARY_SOURCE,
-            "owner_authority_proof": OWNER_AUTHORITY_PROOF,
-            "owner_authority_proof_source": PASSIVE_BOUNDARY_SOURCE,
-            "tidefs_owned_kthreads": self.tidefs_owned_kthreads.label(),
-            "tidefs_owned_kthreads_source": self.tidefs_owned_kthreads.source_label(),
-            "tidefs_owned_kthreads_wired": self.tidefs_owned_kthreads.is_wired(),
-            "tidefs_owned_workqueues": self.tidefs_owned_workqueues.label(),
-            "tidefs_owned_workqueues_source": self.tidefs_owned_workqueues.source_label(),
-            "tidefs_owned_workqueues_wired": self.tidefs_owned_workqueues.is_wired(),
-            "message": self.message(),
         });
+        extend_json_object(
+            &mut value,
+            serde_json::json!({
+                "status_is_passive": self.status_is_passive(),
+                "status_is_passive_source": PASSIVE_BOUNDARY_SOURCE,
+                "control_endpoint_opened": self.control_endpoint_opened,
+                "control_endpoint_opened_source": PASSIVE_BOUNDARY_SOURCE,
+                "readonly_status_calls_issued": self.readonly_status_calls_issued,
+                "readonly_status_calls_issued_source": PASSIVE_BOUNDARY_SOURCE,
+                "control_device_present": self.control_device_present(),
+                "control_device_present_source": DEVICE_PROBE_SOURCE,
+                "control_device_character": self.control_device_character(),
+                "control_device_character_source": DEVICE_PROBE_SOURCE,
+                "production_uapi_wired": self.production_uapi_wired,
+                "production_uapi_wired_source": PASSIVE_BOUNDARY_SOURCE,
+                "control_uapi_usable": self.control_uapi_usable(),
+                "control_uapi_usable_source": PASSIVE_BOUNDARY_SOURCE,
+                "mutating_ioctls_issued": self.mutating_ioctls_issued,
+                "mutating_ioctls_issued_source": PASSIVE_BOUNDARY_SOURCE,
+                "mutating_operation_admission": self.mutating_operation_admission.label(),
+                "mutating_operation_admission_source": self.mutating_operation_admission.source_label(),
+            }),
+        );
+        extend_json_object(
+            &mut value,
+            serde_json::json!({
+                "abi_compatibility_boundary": ABI_COMPATIBILITY_BOUNDARY,
+                "abi_compatibility_boundary_source": CONTROL_CONTRACT_SOURCE,
+                "owner_manifest_authority": self.owner_manifest_authority,
+                "owner_manifest_authority_source": PASSIVE_BOUNDARY_SOURCE,
+                "owner_authority_proof": OWNER_AUTHORITY_PROOF,
+                "owner_authority_proof_source": PASSIVE_BOUNDARY_SOURCE,
+                "tidefs_owned_kthreads": self.tidefs_owned_kthreads.label(),
+                "tidefs_owned_kthreads_source": self.tidefs_owned_kthreads.source_label(),
+                "tidefs_owned_kthreads_wired": self.tidefs_owned_kthreads.is_wired(),
+                "tidefs_owned_workqueues": self.tidefs_owned_workqueues.label(),
+                "tidefs_owned_workqueues_source": self.tidefs_owned_workqueues.source_label(),
+                "tidefs_owned_workqueues_wired": self.tidefs_owned_workqueues.is_wired(),
+                "message": self.message(),
+            }),
+        );
         serde_json::to_string_pretty(&value).expect("kernel status JSON should format")
     }
 
@@ -236,6 +246,21 @@ impl RuntimeSurfaceState {
             Self::NotWired => PASSIVE_BOUNDARY_SOURCE,
         }
     }
+}
+
+fn extend_json_object(value: &mut serde_json::Value, fields: serde_json::Value) {
+    let target = value
+        .as_object_mut()
+        .expect("kernel status JSON root should be an object");
+    let fields = fields
+        .as_object()
+        .expect("kernel status JSON extension should be an object");
+
+    target.extend(
+        fields
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone())),
+    );
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -513,7 +538,10 @@ mod tests {
             json["mutating_operation_admission_source"],
             PASSIVE_BOUNDARY_SOURCE
         );
-        assert_eq!(json["abi_compatibility_boundary"], ABI_COMPATIBILITY_BOUNDARY);
+        assert_eq!(
+            json["abi_compatibility_boundary"],
+            ABI_COMPATIBILITY_BOUNDARY
+        );
         assert_eq!(
             json["abi_compatibility_boundary_source"],
             CONTROL_CONTRACT_SOURCE
@@ -717,7 +745,10 @@ mod tests {
             json["mutating_operation_admission_source"],
             PASSIVE_BOUNDARY_SOURCE
         );
-        assert_eq!(json["abi_compatibility_boundary"], ABI_COMPATIBILITY_BOUNDARY);
+        assert_eq!(
+            json["abi_compatibility_boundary"],
+            ABI_COMPATIBILITY_BOUNDARY
+        );
         assert_eq!(
             json["abi_compatibility_boundary_source"],
             CONTROL_CONTRACT_SOURCE
