@@ -978,7 +978,9 @@ mod tests {
         assert_eq!((pass, fail, refusal, blocked), (0, 0, 0, 32));
         for row in &report.rows {
             assert!(
-                row.blocker.as_deref().is_some_and(|blocker| !blocker.is_empty()),
+                row.blocker
+                    .as_deref()
+                    .is_some_and(|blocker| !blocker.is_empty()),
                 "{} should carry an explicit blocker",
                 row.name
             );
@@ -997,8 +999,7 @@ mod tests {
         for row in report.rows.iter().filter(|row| {
             matches!(
                 row.tier,
-                AttrValidationTier::CrashDuringMutation
-                    | AttrValidationTier::CommittedRootVerify
+                AttrValidationTier::CrashDuringMutation | AttrValidationTier::CommittedRootVerify
             )
         }) {
             assert_eq!(row.outcome, AttrOutcome::Blocked);
@@ -1056,10 +1057,7 @@ PASS: metadata_test_exit_zero
             .find(|row| row.name == "setattr-mode-readback")
             .unwrap();
         assert_eq!(mode.outcome, AttrOutcome::Fail);
-        assert_eq!(
-            mode.blocker.as_deref(),
-            Some("mode changed after remount")
-        );
+        assert_eq!(mode.blocker.as_deref(), Some("mode changed after remount"));
 
         let untouched = report
             .rows
@@ -1067,12 +1065,10 @@ PASS: metadata_test_exit_zero
             .find(|row| row.name == "utimens-verify")
             .unwrap();
         assert_eq!(untouched.outcome, AttrOutcome::Blocked);
-        assert!(
-            untouched
-                .blocker
-                .as_deref()
-                .is_some_and(|blocker| blocker.contains("committed-root"))
-        );
+        assert!(untouched
+            .blocker
+            .as_deref()
+            .is_some_and(|blocker| blocker.contains("committed-root")));
     }
 
     #[test]

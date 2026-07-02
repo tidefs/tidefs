@@ -402,11 +402,11 @@ Important 2026-06-01 findings:
 - `TFR-006`: issue #218 adds the checked raw-store inventory at
   `docs/MOUNTED_TRANSFORM_AUTHORITY_RAW_STORE_INVENTORY.md`. The source check
   guards current `raw_primary_store()` and `raw_primary_store_mut()` matches:
-  `crates/tidefs-local-filesystem/src/lib.rs` has 67,
+  `crates/tidefs-local-filesystem/src/lib.rs` has 69,
   `crates/tidefs-local-filesystem/src/crash_recovery.rs` has 1,
   `crates/tidefs-local-filesystem/src/journal_cleaner.rs` has 7,
   `crates/tidefs-local-filesystem/src/vfs_engine_impl.rs` has 6, and
-  `crates/tidefs-local-object-store/src/pool/mod.rs` has 7 lower accessor or
+  `crates/tidefs-local-object-store/src/pool/mod.rs` has 9 lower accessor or
   escape-hatch matches. The inventory classifies production mounted paths as
   transform-aware, metadata/raw-only, blocked, or owned by later
   receipt/placement issues, and it names the ordering terms plaintext identity,
