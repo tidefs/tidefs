@@ -6,17 +6,23 @@ This crate implements the kernel-side adapter that delegates Linux VFS operation
 (lookup, getattr, read, write, create, mkdir, rmdir, rename, xattr, etc.) to
 the canonical `VfsEngine` trait through the kmod-bridge substrate.
 
+This README is crate-local source orientation. Product-level kernel residency,
+full-kernel/no-daemon, and release-readiness authority stays with
+`docs/KERNEL_RESIDENCY_AUTHORITY.md`, `docs/KERNEL_RESIDENT_POOL_ENGINE_ARCHITECTURE.md`,
+`validation/claims.toml`, and the generated claim registry.
+
 ## Mount Path Tiers
 
-The kernel filesystem driver supports four mount-path tiers, classified by
-progress toward full-kernel autonomy:
+The kernel filesystem driver currently exposes source-backed refusal and
+engine-backed mount behavior, with the full-kernel/no-daemon tier kept as a
+blocked future target rather than a current product claim:
 
 | Tier | Mount Command | Behavior | Kernel Context |
 |------|---------------|----------|----------------|
 | **Tier 0: Authority refusal** | `mount -t tidefs -o bootstrap none <mnt>` | Refused with EOPNOTSUPP: no explicit kernel pool I/O authority is bound. | None |
 | **Tier 1: Fail-closed** | `mount -t tidefs none <mnt>` | Refused with ENODEV: no block device supplied. | None |
 | **Tier 2: Engine-backed** | `mount -t tidefs /dev/... <mnt>` | Reads PoolLabelV1 from block device, locates and validates committed-root ledger via Rust replay adapter (`tidefs_posix_vfs_kernel_replay_mount` — #6262), creates real root inode with engine-derived superblock parameters. Statfs reports pool-backed capacity. Individual VFS operation rewiring to object/extent/intent readers is owned by sibling work items #6258-#6261. | `tidefs_posix_vfs_mount` with `engine_backed=true`, populated from `TidefsReplayMountOut`; `fill_super_bdev` delegates mount authority to the Rust replay adapter. Validation tier: Kbuild (module build). QEMU guest mount validation is owned by #6263 (K7-REPLAY-008). |
-| **Tier 3: Full-kernel** | (future) | No userspace daemon required for any normal mounted I/O, writeback, recovery, placement, reserve, or admission. | Full kernel-resident VfsEngine with all 29 VFS operations active |
+| **Tier 3: Full-kernel** | (future; blocked) | Not current behavior. This tier requires accepted evidence for normal mounted I/O, writeback, recovery, placement, reserve, and admission without required support daemons before the wording can strengthen. | Future kernel-resident `VfsEngine`/`KernelPoolCore` path with the claim gate updated for the exact tier |
 
 The C registration shim ([tidefs_posix_vfs_shim.c](tidefs_posix_vfs_shim.c))
 and Rust bridge ([tidefs_posix_vfs_main.rs](tidefs_posix_vfs_main.rs))
@@ -25,28 +31,15 @@ coordinate the Tier 2 mount path through three extern-C bridges:
 `tidefs_posix_vfs_engine_mount_with_label`, and
 `tidefs_posix_vfs_kernel_replay_mount` (the Rust replay adapter, #6262).
 
+Tier 3 remains blocked by the `kernel-residency-boundary` gate in
+`validation/claims.toml`; the Tier 2 rows above do not imply production
+kernel-resident storage authority or full-kernel/no-daemon readiness.
+
 ## Daemon Independence
 
 This crate has zero dependencies on userspace daemon crates
 (`tidefs-fuser`, `tidefs-posix-filesystem-adapter-*`,
 `tidefs-block-volume-adapter-*`). Its dependency tree consists solely of
-
-## Mount Path Tiers
-
-The kernel filesystem driver supports four mount-path tiers, classified by
-progress toward full-kernel autonomy:
-
-| Tier | Mount Command | Behavior | Kernel Context |
-|------|---------------|----------|----------------|
-| **Tier 0: Authority refusal** | `mount -t tidefs -o bootstrap none <mnt>` | Refused with EOPNOTSUPP: no explicit kernel pool I/O authority is bound. | None |
-| **Tier 1: Fail-closed** | `mount -t tidefs none <mnt>` | Refused with ENODEV: no block device supplied. | None |
-| **Tier 2: Engine-backed** | `mount -t tidefs /dev/... <mnt>` | Reads PoolLabelV1 from block device, locates and validates committed-root ledger via Rust bridge, creates real root inode with engine-derived superblock parameters. Statfs reports pool-backed capacity. | `tidefs_posix_vfs_mount` with `engine_backed=true`, populated from `TidefsMountOut` |
-| **Tier 3: Full-kernel** | (future) | No userspace daemon required for any normal mounted I/O, writeback, recovery, placement, reserve, or admission. | Full kernel-resident VfsEngine with all 29 VFS operations active |
-
-The C registration shim and Rust bridge coordinate the Tier 2 mount path
-through two extern-C bridges: `tidefs_posix_vfs_engine_parse_label` and
-`tidefs_posix_vfs_engine_mount_with_label`.
-
 no_std-compatible types crates, the canonical `VfsEngine` abstraction, and
 the kmod-bridge substrate. No daemon-only contracts, types, or initialization
 patterns are transitively pulled into the kernel build.
@@ -127,6 +120,8 @@ Mount option behaviour for read-only and recovery-mode control:
 All three phases operate entirely through the kernel-resident VfsEngine
 and kmod-bridge substrate. No FUSE daemon, ublk daemon, policy daemon, or
 usermode worker thread is required during any phase of mount initialization.
+That statement is limited to mount initialization and does not validate Tier 3
+full-kernel/no-daemon storage behavior.
 
 ### Current mounted basic-ops slice (#6144)
 
