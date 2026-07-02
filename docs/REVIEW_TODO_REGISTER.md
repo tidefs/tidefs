@@ -334,10 +334,10 @@ Important 2026-06-01 findings:
   `ScrubBlockId` is `(inode_id, data_version)` and excludes POSIX timestamps,
   wall-clock time, `metadata_version`, storage-generation ticks, and intent-log
   epochs from scrub identity authority. Issue #650 closed the mounted
-  content-scrub read authority slice; live issues #651 and #652 own scrub
+  content-scrub read authority slice; issues #651 and #652 (now closed) resolved scrub
   routing and repair dispatch gating.
-- `TFR-005`: issue #695 adds `docs/SEND_RECEIVE_VERSION_AUTHORITY.md`, issue
-  #1002 adds the focused VFSSEND1 authority guards, and related sender/receive
+- `TFR-005`: issue #695 (now closed) added `docs/SEND_RECEIVE_VERSION_AUTHORITY.md`, issue
+  #1002 (now closed) added the focused VFSSEND1 authority guards, and related sender/receive
   follow-ups #777 and #703 are closed. Send/receive stream versions own only
   envelope shape; local payload format versions own POSIX timestamp,
   `data_version`, and `metadata_version` layout. No separate
@@ -348,7 +348,7 @@ Important 2026-06-01 findings:
   reclaim clock, and names the separate reclaim liveness guard:
   `death_commit_group`, `stable_committed_txg`, replacement/base placement
   receipt epoch and generation evidence, and `OrphanReplayWatermark` when
-  orphan recovery participates. Live issues #675 and #676 still own receipt
+  orphan recovery participates. Issues #675 and #676 (now closed) resolved receipt
   consumer policy and rebake/reclaim trim implementation.
 - `TFR-005`: issue #696 resolves the section 9 format-golden/codec gate for
   the current ABI by making VFS codec/vector manifest drift fail in focused
