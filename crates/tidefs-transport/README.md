@@ -1,6 +1,8 @@
 # tidefs-transport
 
-Transport/session layer for the TideFS distributed runtime.
+Transport/session crate for TideFS transport APIs, local session plumbing, and
+distributed-runtime experiments. Product-mode distributed and RDMA wording
+remains claim-gated by the repo authority docs and `validation/claims.toml`.
 
 ## Capabilities
 
@@ -10,10 +12,11 @@ Transport/session layer for the TideFS distributed runtime.
 - Chunk shipping with BLAKE3-verified integrity
 - Reconnection with exponential backoff and jitter
 - Transport-layer connection keepalive with deadline-based failure detection and health-score integration
-- RDMA carrier support (TCP fallback)
-- Deterministic carrier selection from membership peer capability advertisements with RDMA preference and TCP fallback (module )
-- TLS session encryption
-- Session handshake with mutual attestation
+- `TransportAddr` type coverage for TCP, RDMA, and Unix endpoint variants; TCP bind/listen is the current implemented carrier path
+- RDMA-related carrier state, error, and downgrade/refusal plumbing for non-product transport experiments
+- Carrier-selection APIs that consume membership capability advertisements and fail closed around unproven RDMA downgrade claims
+- `tls` feature-gated Rustls certificate/session test support; not default product security
+- Ed25519-backed session attestation handshake APIs and loopback tests for non-`LocalEmbed` endpoints
 - Receive-side flow control with credit-based windowing for inbound frame backpressure
 - TDMA gate for time-division multiplexing
 - Send coalescing with session-and-priority-aware batching for reduced per-frame overhead
@@ -76,9 +79,10 @@ lifecycle state machine. Endpoint typing now uses the canonical
 
 ## TransportAddr — Unified Endpoint Address
 
-`TransportAddr` is a single address enum in `tidefs-transport` that represents
-all three transport carriers — TCP, RDMA, and Unix domain sockets — so the
-send path, receive path, and peer admission code never branch on carrier type.
+`TransportAddr` is a single address enum in `tidefs-transport` that can name
+TCP, RDMA, and Unix-domain endpoint variants. It is address/type plumbing:
+current listener binding is TCP-only, and non-TCP variants can still return
+`UnsupportedCarrier` on concrete bind/listen paths.
 
 ### Variants
 
@@ -180,8 +184,8 @@ availability before framing.
 
 ### Follow-on
 
-Wire flow control into the ublk block-volume data path for backpressured
-RDMA transfer.
+Wire flow control into the ublk block-volume data path before using it for
+future carrier transfer experiments.
 
 ### Per-peer flow control
 

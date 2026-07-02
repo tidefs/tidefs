@@ -308,10 +308,10 @@ placement, and replication subsystems.
 
 ### Variants
 
-| Variant | Live | Purpose |
+| Variant | `is_live()` | Purpose |
 |---|---|---|
-| `Rdma(addr)` | yes | RDMA transport with device/address string |
-| `Tcp(addr)` | yes | TCP transport bound to a socket address |
+| `Rdma(addr)` | yes | Network backend disclosure for an RDMA address or device string; enum state only, not proof of an executable RDMA path |
+| `Tcp(addr)` | yes | Network backend disclosure for TCP bound to a socket address |
 | `Loopback` | no | In-process loopback for single-node deterministic testing |
 | `DeterministicInMemory` | no | Fully deterministic in-memory for unit/validation harnesses |
 | `NotRun` | no | Authority spine constructed, no transport active |
@@ -321,7 +321,7 @@ placement, and replication subsystems.
 The storage-node constructs a `BackendDisclosure` from CLI flags and
 passes it to `RuntimeAuthority::build()`. Every subsystem queries
 `authority.backend()` to learn which backend is active. The `is_live()`
-predicate distinguishes production networks from harness/test modes
+predicate distinguishes live-network disclosures from harness/test modes
 without subsystem-specific backend inspection.
 
 `BackendDisclosure` is intentionally a pure data type with no
@@ -942,8 +942,9 @@ connection endpoints.
 
 - No per-message crypto, BLAKE3, or auth tokens — the registry is a plain
   address-index data structure.
-- Carrier-agnostic: stores full [`TransportAddr`] values supporting TCP,
-  RDMA, and Unix variants.
+- Carrier-agnostic: stores full [`TransportAddr`] enum values, including TCP,
+  RDMA, and Unix variants. This is address bookkeeping, not a carrier
+  readiness claim.
 - `resolve_one` is a convenience for callers that only operate over TCP
   and want a bare `SocketAddr`.
 
