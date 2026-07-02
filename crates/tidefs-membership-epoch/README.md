@@ -2,6 +2,12 @@
 
 Deterministic membership_placement_0 epoch model and failure/rejoin tests.
 
+This README is a crate-local source map. System-wide membership authority,
+runtime boundaries, and publishing-facing claim limits live in
+[`docs/MEMBERSHIP_AUTHORITY.md`](../../docs/MEMBERSHIP_AUTHORITY.md) and
+[`docs/CLAIMS_GATE_POLICY.md`](../../docs/CLAIMS_GATE_POLICY.md); this file is
+not evidence for distributed membership availability or persistence.
+
 ## Epoch Commit Subscriber Dispatch
 
 The `epoch_commit_subscriber` module provides a multi-subscriber notification bus
@@ -11,8 +17,7 @@ so transport subsystems receive structured epoch-transition events without polli
 
 - **`EpochCommitSubscriber`** — Trait (`Send + Sync`) with a single method
   `on_epoch_committed(&self, notification: &EpochCommitNotification)`. Transport
-  consumers (epoch-gate enforcement #5889, admission control #5892) implement
-  this trait to react to roster epoch transitions.
+  consumers implement this trait to react to roster epoch transitions.
 
 - **`EpochCommitBus`** — Registry supporting `register`, `unregister`, and
   `dispatch_commit`. Uses `RefCell` interior mutability for single-threaded
@@ -41,9 +46,9 @@ so transport subsystems receive structured epoch-transition events without polli
 
 ### Intended Consumers
 
-- **#5889** transport epoch-gate enforcement: rejects stale-epoch connection
+- Transport epoch-gate enforcement can reject stale-epoch connection
   messages by comparing current epoch against the latest notification.
-- **#5892** transport connection admission control: admits or rejects new
+- Transport connection admission control can admit or reject new
   connections based on authoritative roster membership.
 
 ## Epoch Agreement Protocol
@@ -93,8 +98,8 @@ Idle.
 ### Commit Bus Integration
 
 Attach an `EpochCommitBus` via `set_commit_bus()`. On commit, each registered
-`EpochCommitSubscriber` receives an `EpochCommitNotification` for transport
-epoch-gate enforcement (#5889) and admission control (#5892).
+`EpochCommitSubscriber` receives an `EpochCommitNotification` that transport
+consumers can use for epoch-gate enforcement and admission control.
 
 ### Protocol Guarantees
 
@@ -106,31 +111,31 @@ epoch-gate enforcement (#5889) and admission control (#5892).
 
 ## Epoch Durable Persistence
 
-The `epoch_persistence` module provides durable epoch-state persistence with
+The `epoch_persistence` module defines pluggable epoch-state persistence with
 restart recovery and epoch-chain integrity verification.
 
 ### Types
 
 - **`DurableEpochStore`** — Pluggable storage backend trait (`Send + Sync`) with
-  `write_epoch`, `read_epoch`, `list_epochs`, and `clear`. Production
-  implementations can use a local object store or intent-log; tests use the
-  provided `InMemoryDurableStore`.
+  `write_epoch`, `read_epoch`, `list_epochs`, and `clear`. This crate provides
+  the trait and an `InMemoryDurableStore` for tests; callers provide any
+  object-store, intent-log, or other backend outside this crate.
 
 - **`EpochStateStore`** — Persists committed `CommittedRoster` views keyed by
   monotonic epoch number. Exposes `persist_epoch()` to write a roster and
   `load_chain()` to read all rosters in sorted epoch order.
 
 - **`EpochChainLoader`** — Loads the complete epoch chain on restart and
-  validates each transition through the existing `EpochChainVerifier` (#6000).
+  validates each transition through `EpochChainVerifier`.
   Rejects truncated chains, non-monotonic sequences, gaps, and corrupt
   roster hashes. Returns an empty chain for first-start/bootstrap.
 
 - **`EpochPersistenceHandle`** — Implements `EpochCommitSubscriber` to bridge
-  `EpochCommitBus` commit events to automatic durable persistence. Every
-  committed epoch is written to the store without caller coordination.
+  `EpochCommitBus` commit events to writes against the configured store. Every
+  committed epoch is passed to the store without caller coordination.
   Persistence failures are logged but non-blocking.
 
-### On-Disk Format
+### Serialized Record
 
 Each epoch is stored as a serialized JSON record of `CommittedRoster`:
 
@@ -620,9 +625,9 @@ sequential journal replay for long-running clusters.
 - **`TransportAddress`** — A host:port string for reaching a member node.
 
 - **`EpochSnapshotStore`** — Pluggable storage backend trait (Send + Sync) with
-  `write_snapshot`, `read_snapshot`, `list_snapshots`, and `clear`.  Production
-  implementations persist to the pool label system area; tests use
-  `InMemorySnapshotStore`.
+  `write_snapshot`, `read_snapshot`, `list_snapshots`, and `clear`. This crate
+  provides the trait and an `InMemorySnapshotStore` for tests; callers provide
+  the storage backend used by their runtime.
 
 - **`RecoveredRoster`** — Result of recovery: sorted `member_ids`, current
   `epoch`, and deterministic `coordinator` (lowest MemberId).
@@ -732,6 +737,8 @@ a high-level `CheckpointManager` for bounded-replay crash recovery.
 
 ### Crate Integration
 
-The `tidefs-membership-live` crate provides a `CheckpointPersistence`
-implementation of `EpochSnapshotStore` backed by `LocalObjectStore` for
-durable on-disk checkpoint persistence in production environments.
+This crate does not define a runtime checkpoint backend. Runtime callers that
+need checkpoint storage provide an `EpochSnapshotStore` implementation and use
+`CheckpointManager` only to create and load `MembershipEpochSnapshot` records.
+System-level runtime and claim boundaries remain owned by
+`docs/MEMBERSHIP_AUTHORITY.md`.
