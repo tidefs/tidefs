@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Storage node client: connect and issue put/get/delete/list/stats/send/receive commands.
 
+use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 use tidefs_transport::{NodeInfo, SessionCloseReason, Transport, TransportError};
@@ -75,6 +76,273 @@ fn close_request_session(transport: &mut Transport, session_id: tidefs_transport
     }
 
     let _ = transport.close_session(session_id, SessionCloseReason::LocalShutdown);
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value {
+        "yes"
+    } else {
+        "no"
+    }
+}
+
+fn render_optional_u64(out: &mut String, label: &str, value: Option<u64>) {
+    if let Some(value) = value {
+        let _ = writeln!(out, "{label}: {value}");
+    }
+}
+
+fn render_u64_list(values: &[u64]) -> String {
+    if values.is_empty() {
+        return "none".into();
+    }
+
+    let mut rendered = String::new();
+    for (idx, value) in values.iter().enumerate() {
+        if idx > 0 {
+            rendered.push_str(", ");
+        }
+        let _ = write!(rendered, "{value}");
+    }
+    rendered
+}
+
+pub(crate) fn render_stats_response(report: &protocol::StatsReport) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "backend: {}", report.backend);
+    let _ = writeln!(out, "object_count: {}", report.object_count);
+    let _ = writeln!(out, "bytes_written: {}", report.bytes_written);
+    render_optional_u64(&mut out, "committed_writes", report.committed_writes);
+    render_optional_u64(&mut out, "degraded_writes", report.degraded_writes);
+    render_optional_u64(&mut out, "refused_writes", report.refused_writes);
+    render_optional_u64(&mut out, "failed_writes", report.failed_writes);
+    render_optional_u64(&mut out, "degraded_reads", report.degraded_reads);
+    if let Some(replica_healthy) = &report.replica_healthy {
+        let healthy = replica_healthy.iter().filter(|healthy| **healthy).count();
+        let _ = writeln!(out, "replica_healthy: {healthy}/{}", replica_healthy.len());
+    }
+    render_optional_u64(
+        &mut out,
+        "total_capacity_bytes",
+        report.total_capacity_bytes,
+    );
+    render_optional_u64(&mut out, "used_bytes", report.used_bytes);
+    render_optional_u64(&mut out, "available_bytes", report.available_bytes);
+    render_optional_u64(
+        &mut out,
+        "placement_receipt_ref_count",
+        report.placement_receipt_ref_count,
+    );
+    out
+}
+
+pub(crate) fn render_receive_response(report: &protocol::ReceiveImportReport) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "spec: {}", report.spec);
+    let _ = writeln!(out, "imported_roots: {}", report.imported_roots);
+    let _ = writeln!(out, "imported_records: {}", report.imported_records);
+    let _ = writeln!(
+        out,
+        "imported_payload_bytes: {}",
+        report.imported_payload_bytes
+    );
+    let _ = writeln!(out, "selected_generation: {}", report.selected_generation);
+    let _ = writeln!(
+        out,
+        "selected_transaction_id: {}",
+        report.selected_transaction_id
+    );
+    let _ = writeln!(
+        out,
+        "snapshot_catalog_entries: {}",
+        report.snapshot_catalog_entries
+    );
+    let _ = writeln!(out, "stream_version: {}", report.stream_version);
+    let _ = writeln!(
+        out,
+        "staging_validated_before_publish: {}",
+        yes_no(report.staging_validated_before_publish)
+    );
+    let _ = writeln!(
+        out,
+        "destination_root_reauthentication: {}",
+        yes_no(report.destination_root_reauthentication)
+    );
+    let _ = writeln!(
+        out,
+        "production_fsck_required: {}",
+        yes_no(report.production_fsck_required)
+    );
+    match report.placement_epoch {
+        Some(epoch) => {
+            let _ = writeln!(out, "placement_epoch: {epoch}");
+        }
+        None => out.push_str("placement_epoch: none\n"),
+    }
+    let _ = writeln!(
+        out,
+        "placement_verified_stable: {}",
+        yes_no(report.placement_verified_stable)
+    );
+    out
+}
+
+pub(crate) fn render_scrub_response(report: &protocol::ScrubReport) -> String {
+    let mut out = String::new();
+    if let Some(backend) = &report.backend {
+        let _ = writeln!(out, "backend: {backend}");
+    }
+    let _ = writeln!(out, "completed: {}", yes_no(report.completed));
+    let _ = writeln!(out, "findings_count: {}", report.findings_count);
+    let _ = writeln!(out, "segments_scanned: {}", report.segments_scanned);
+    let _ = writeln!(out, "records_verified: {}", report.records_verified);
+    let _ = writeln!(out, "bytes_scanned: {}", report.bytes_scanned);
+    let _ = writeln!(
+        out,
+        "chain_breaks_detected: {}",
+        report.chain_breaks_detected
+    );
+    let _ = writeln!(
+        out,
+        "placement_receipt_ref_count: {}",
+        report.placement_receipt_ref_count
+    );
+    if let Some(error) = &report.error {
+        let _ = writeln!(out, "error: {error}");
+    }
+    out
+}
+
+pub(crate) fn render_health_response(
+    node_identity: &str,
+    pool_state: &str,
+    uptime_secs: u64,
+    backend: &str,
+    report: &protocol::HealthReport,
+) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "node_identity: {node_identity}");
+    let _ = writeln!(out, "pool_state: {pool_state}");
+    let _ = writeln!(out, "uptime_secs: {uptime_secs}");
+    let _ = writeln!(out, "backend: {backend}");
+    let _ = writeln!(out, "node_id: {}", report.node_id);
+    if let Some(member_class) = &report.node_member_class {
+        let _ = writeln!(out, "node_member_class: {member_class}");
+    }
+    render_optional_u64(&mut out, "node_failure_domain", report.node_failure_domain);
+    let _ = writeln!(out, "carrier: {}", report.carrier);
+    let _ = writeln!(out, "carrier_live: {}", yes_no(report.carrier_is_live));
+    let _ = writeln!(out, "replication_factor: {}", report.replication_factor);
+    let _ = writeln!(out, "placement_version: {}", report.placement_version);
+    let _ = writeln!(out, "peer_count: {}", report.peer_count);
+    let _ = writeln!(
+        out,
+        "alive_voters: {}",
+        render_u64_list(&report.alive_voters)
+    );
+    let _ = writeln!(out, "quorum_lost: {}", yes_no(report.quorum_lost));
+    let _ = writeln!(
+        out,
+        "roster: active={} suspected={} failed={} left={}",
+        report.roster_state_summary.active,
+        report.roster_state_summary.suspected,
+        report.roster_state_summary.failed,
+        report.roster_state_summary.left
+    );
+    let _ = writeln!(
+        out,
+        "health: healthy={} suspect={} down={}",
+        report.health_summary.healthy, report.health_summary.suspect, report.health_summary.down
+    );
+    if report.degraded_peers.is_empty() {
+        out.push_str("degraded_peers: none\n");
+    } else {
+        out.push_str("degraded_peers:\n");
+        for peer in &report.degraded_peers {
+            let _ = writeln!(
+                out,
+                "  member={} health={} failed_pings={}",
+                peer.member_id, peer.health, peer.failed_pings
+            );
+        }
+    }
+    if report.transport_backends.is_empty() {
+        out.push_str("transport_backends: none\n");
+    } else {
+        out.push_str("transport_backends:\n");
+        for backend in &report.transport_backends {
+            let peer = backend
+                .peer_node
+                .map(|peer| peer.to_string())
+                .unwrap_or_else(|| "unknown".into());
+            let disclosure = backend.disclosure.as_deref().unwrap_or("none");
+            let _ = writeln!(
+                out,
+                "  session={} peer={} backend={} disclosure={}",
+                backend.session_id, peer, backend.backend_kind, disclosure
+            );
+        }
+    }
+    out
+}
+
+pub(crate) fn render_snapshot_summary(report: &protocol::SnapshotSummaryReport) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "snapshot: {}", report.name);
+    let _ = writeln!(
+        out,
+        "source_transaction_id: {}",
+        report.source_transaction_id
+    );
+    let _ = writeln!(out, "source_generation: {}", report.source_generation);
+    let _ = writeln!(
+        out,
+        "created_at_generation: {}",
+        report.created_at_generation
+    );
+    out
+}
+
+pub(crate) fn render_snapshot_rollback(report: &protocol::SnapshotRollbackReport) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "spec: {}", report.spec);
+    out.push_str(&render_snapshot_summary(&report.snapshot));
+    let _ = writeln!(out, "generation_before: {}", report.generation_before);
+    let _ = writeln!(
+        out,
+        "restored_source_generation: {}",
+        report.restored_source_generation
+    );
+    let _ = writeln!(out, "published_generation: {}", report.published_generation);
+    let _ = writeln!(
+        out,
+        "snapshot_catalog_entries: {}",
+        report.snapshot_catalog_entries
+    );
+    let _ = writeln!(
+        out,
+        "production_fsck_required: {}",
+        yes_no(report.production_fsck_required)
+    );
+    out
+}
+
+pub(crate) fn render_snapshot_clone(report: &protocol::SnapshotCloneSummaryReport) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "clone: {}", report.name);
+    let _ = writeln!(out, "origin: {}", report.origin);
+    let _ = writeln!(
+        out,
+        "source_transaction_id: {}",
+        report.source_transaction_id
+    );
+    let _ = writeln!(out, "source_generation: {}", report.source_generation);
+    let _ = writeln!(
+        out,
+        "created_at_generation: {}",
+        report.created_at_generation
+    );
+    out
 }
 
 /// Run client commands interactively or as one-shot.
@@ -164,7 +432,7 @@ pub fn run_client(
         "stats" => {
             let resp = request(node_id, server_node_id, server_addr, Frame::Stats, rdma)?;
             match resp {
-                Frame::StatsResponse { json } => println!("{json}"),
+                Frame::StatsResponse { report } => print!("{}", render_stats_response(&report)),
                 Frame::Error { message } => return Err(format!("server error: {message}")),
                 other => return Err(format!("unexpected response: {other:?}")),
             }
@@ -178,13 +446,7 @@ pub fn run_client(
                 rdma,
             )?;
             match resp {
-                Frame::ScrubResponse {
-                    report_json,
-                    findings_count,
-                } => {
-                    println!("findings_count: {findings_count}");
-                    println!("{report_json}");
-                }
+                Frame::ScrubResponse { report } => print!("{}", render_scrub_response(&report)),
                 Frame::Error { message } => return Err(format!("server error: {message}")),
                 other => return Err(format!("unexpected response: {other:?}")),
             }
@@ -265,7 +527,7 @@ pub fn run_client(
                 rdma,
             )?;
             match resp {
-                Frame::ReceiveResponse { report_json } => println!("{report_json}"),
+                Frame::ReceiveResponse { report } => print!("{}", render_receive_response(&report)),
                 Frame::Error { message } => return Err(format!("server error: {message}")),
                 other => return Err(format!("unexpected response: {other:?}")),
             }
@@ -284,16 +546,18 @@ pub fn run_client(
                     pool_state,
                     uptime_secs,
                     backend,
-                    report_json,
+                    report,
                 } => {
-                    println!("node_identity: {node_identity}");
-                    println!("pool_state:    {pool_state}");
-                    println!("uptime_secs:   {uptime_secs}");
-                    println!("backend:       {backend}");
-                    if !report_json.is_empty() {
-                        println!("report:");
-                        println!("{report_json}");
-                    }
+                    print!(
+                        "{}",
+                        render_health_response(
+                            &node_identity,
+                            &pool_state,
+                            uptime_secs,
+                            &backend,
+                            &report
+                        )
+                    );
                 }
                 Frame::Error { message } => return Err(format!("server error: {message}")),
                 other => return Err(format!("unexpected response: {other:?}")),
@@ -314,10 +578,8 @@ pub fn run_client(
                 rdma,
             )?;
             match resp {
-                Frame::SnapshotCreateResponse { summary_json } => {
-                    let _ =
-                        std::io::Write::write_all(&mut std::io::stdout(), summary_json.as_bytes());
-                    let _ = std::io::Write::write_all(&mut std::io::stdout(), b"\n");
+                Frame::SnapshotCreateResponse { summary } => {
+                    print!("{}", render_snapshot_summary(&summary));
                 }
                 Frame::Error { message } => return Err(format!("server error: {message}")),
                 other => return Err(format!("unexpected response: {other:?}")),
@@ -338,10 +600,8 @@ pub fn run_client(
                 rdma,
             )?;
             match resp {
-                Frame::SnapshotDestroyResponse { summary_json } => {
-                    let _ =
-                        std::io::Write::write_all(&mut std::io::stdout(), summary_json.as_bytes());
-                    let _ = std::io::Write::write_all(&mut std::io::stdout(), b"\n");
+                Frame::SnapshotDestroyResponse { summary } => {
+                    print!("{}", render_snapshot_summary(&summary));
                 }
                 Frame::Error { message } => return Err(format!("server error: {message}")),
                 other => return Err(format!("unexpected response: {other:?}")),
@@ -362,10 +622,8 @@ pub fn run_client(
                 rdma,
             )?;
             match resp {
-                Frame::SnapshotRollbackResponse { report_json } => {
-                    let _ =
-                        std::io::Write::write_all(&mut std::io::stdout(), report_json.as_bytes());
-                    let _ = std::io::Write::write_all(&mut std::io::stdout(), b"\n");
+                Frame::SnapshotRollbackResponse { report } => {
+                    print!("{}", render_snapshot_rollback(&report));
                 }
                 Frame::Error { message } => return Err(format!("server error: {message}")),
                 other => return Err(format!("unexpected response: {other:?}")),
@@ -468,10 +726,8 @@ pub fn run_client(
                 rdma,
             )?;
             match resp {
-                Frame::SnapshotCloneResponse { summary_json } => {
-                    let _ =
-                        std::io::Write::write_all(&mut std::io::stdout(), summary_json.as_bytes());
-                    let _ = std::io::Write::write_all(&mut std::io::stdout(), b"\n");
+                Frame::SnapshotCloneResponse { summary } => {
+                    print!("{}", render_snapshot_clone(&summary));
                 }
                 Frame::Error { message } => return Err(format!("server error: {message}")),
                 other => return Err(format!("unexpected response: {other:?}")),
@@ -484,4 +740,81 @@ pub fn run_client(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stats_report() -> protocol::StatsReport {
+        protocol::StatsReport {
+            backend: "tcp".into(),
+            object_count: 3,
+            bytes_written: 4096,
+            committed_writes: Some(2),
+            degraded_writes: Some(1),
+            refused_writes: Some(0),
+            failed_writes: None,
+            degraded_reads: None,
+            replica_healthy: Some(vec![true, false]),
+            total_capacity_bytes: None,
+            used_bytes: None,
+            available_bytes: None,
+            placement_receipt_ref_count: None,
+        }
+    }
+
+    fn receive_report() -> protocol::ReceiveImportReport {
+        protocol::ReceiveImportReport {
+            spec: "VFSSEND2".into(),
+            imported_roots: 1,
+            imported_records: 42,
+            imported_payload_bytes: 8192,
+            selected_generation: 5,
+            selected_transaction_id: 6,
+            snapshot_catalog_entries: 2,
+            stream_version: 2,
+            staging_validated_before_publish: true,
+            destination_root_reauthentication: true,
+            production_fsck_required: false,
+            placement_epoch: Some(7),
+            placement_verified_stable: true,
+        }
+    }
+
+    #[test]
+    fn stats_renderer_is_human_oriented_by_default() {
+        let report = stats_report();
+        let rendered = render_stats_response(&report);
+
+        assert!(rendered.contains("backend: tcp"));
+        assert!(rendered.contains("object_count: 3"));
+        assert!(rendered.contains("replica_healthy: 1/2"));
+        assert!(
+            !rendered.contains('{'),
+            "default renderer should not emit JSON: {rendered}"
+        );
+
+        let diagnostic: serde_json::Value =
+            serde_json::from_str(&report.diagnostic_json()).unwrap();
+        assert_eq!(diagnostic["object_count"], 3);
+    }
+
+    #[test]
+    fn receive_renderer_is_human_oriented_by_default() {
+        let report = receive_report();
+        let rendered = render_receive_response(&report);
+
+        assert!(rendered.contains("spec: VFSSEND2"));
+        assert!(rendered.contains("imported_records: 42"));
+        assert!(rendered.contains("placement_verified_stable: yes"));
+        assert!(
+            !rendered.contains('{'),
+            "default renderer should not emit JSON: {rendered}"
+        );
+
+        let diagnostic: serde_json::Value =
+            serde_json::from_str(&report.diagnostic_json()).unwrap();
+        assert_eq!(diagnostic["imported_records"], 42);
+    }
 }
