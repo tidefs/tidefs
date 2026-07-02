@@ -3098,7 +3098,7 @@ mod tests {
         assert!(!plan.is_empty());
         assert!(plan.has_refusals());
         assert!(!plan.is_executable());
-        assert_eq!(planner.allocator().allocated_segments(), &[]);
+        assert!(planner.allocator().allocated_segments().is_empty());
         assert_eq!(
             plan.refusals,
             vec![RelocationPlanRefusal {
