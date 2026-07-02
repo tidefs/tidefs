@@ -1379,7 +1379,7 @@ mod tests {
     #[test]
     fn scheduler_budget_processes_one_job_per_bounded_tick() {
         let (mut gov, first_admission) = admitted_record(GovernorRelocationReason::HddDefrag);
-        gov.evaluate_proposal(
+        let _ = gov.evaluate_proposal(
             43,
             GovernorRelocationReason::HddDefrag,
             &defrag_input(),
@@ -1434,7 +1434,7 @@ mod tests {
     #[test]
     fn scheduler_byte_budget_preempts_follow_on_job() {
         let (mut gov, first_admission) = admitted_record(GovernorRelocationReason::HddDefrag);
-        gov.evaluate_proposal(
+        let _ = gov.evaluate_proposal(
             43,
             GovernorRelocationReason::HddDefrag,
             &defrag_input(),
