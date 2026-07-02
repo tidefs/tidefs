@@ -14,8 +14,7 @@ use tidefs_ublk_abi::{
 pub const UBLK_COMPLETION_ARTIFACT_ENV: &str = "TIDEFS_UBLK_COMPLETION_ARTIFACT";
 pub const UBLK_COMPLETION_ARTIFACT_MAX_COMPLETIONS_ENV: &str =
     "TIDEFS_UBLK_COMPLETION_ARTIFACT_MAX_COMPLETIONS";
-pub const UBLK_COMPLETION_ARTIFACT_SCENARIO_ENV: &str =
-    "TIDEFS_UBLK_COMPLETION_ARTIFACT_SCENARIO";
+pub const UBLK_COMPLETION_ARTIFACT_SCENARIO_ENV: &str = "TIDEFS_UBLK_COMPLETION_ARTIFACT_SCENARIO";
 pub const UBLK_COMPLETION_ARTIFACT_INJECT_ERROR_OP_ENV: &str =
     "TIDEFS_UBLK_COMPLETION_ARTIFACT_INJECT_ERROR_OP";
 pub const UBLK_COMPLETION_ARTIFACT_INJECT_ERROR_RESULT_ENV: &str =
@@ -198,9 +197,9 @@ impl UblkCompletionTrace {
         operation_kind: UblkCompletionOperationKind,
         result: i32,
     ) -> i32 {
-        self.error_injection
-            .as_mut()
-            .map_or(result, |injection| injection.maybe_inject(operation_kind, result))
+        self.error_injection.as_mut().map_or(result, |injection| {
+            injection.maybe_inject(operation_kind, result)
+        })
     }
 
     pub fn record_fetch_submitted(&mut self, qid: u16, tag: u16) {

@@ -534,7 +534,10 @@ fn validate_scenario_contract(
             ));
         }
         for operation in UBLK_QID_TAG_RUNTIME_REQUIRED_OPS {
-            if !terminal_ops.iter().any(|actual| actual.as_str() == *operation) {
+            if !terminal_ops
+                .iter()
+                .any(|actual| actual.as_str() == *operation)
+            {
                 failures.push(format!(
                     "scenario `{}` must terminally complete `{operation}`",
                     artifact.scenario
@@ -756,7 +759,10 @@ mod tests {
             UBLK_QID_TAG_RUNTIME_ERROR_INJECTION_SCENARIO,
             &[("read", 0, 0, 4096), ("write", 0, 0, 4096)],
         );
-        assert_invalid_contains(text, "must record at least one negative terminal completion");
+        assert_invalid_contains(
+            text,
+            "must record at least one negative terminal completion",
+        );
     }
 
     #[test]
