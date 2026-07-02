@@ -855,14 +855,14 @@ fn decode_xattr_bundle_v1(decoder: &mut Decoder) -> Result<BTreeMap<Vec<u8>, Vec
     Ok(xattrs)
 }
 
-fn encode_xattr_btree_root_v1(out: &mut Vec<u8>, xattrs: &BTreeMap<Vec<u8>, Vec<u8>>) {
-    out.extend_from_slice(XATTR_BTREE_ROOT_MAGIC);
-    push_u64(out, xattrs.len() as u64);
-    push_u64(out, xattrs.values().map(|v| v.len() as u64).sum());
-    push_u64(out, 0); // root_page_locator (stub for Phase 1)
-    out.push(0); // depth
-    out.push(0); // flags
-    out.extend_from_slice(&[0u8; 6]); // reserved
+fn encode_xattr_btree_root_v1(
+    _out: &mut Vec<u8>,
+    _xattrs: &BTreeMap<Vec<u8>, Vec<u8>>,
+) -> Result<()> {
+    Err(FileSystemError::Unsupported {
+        operation: "encode external xattr B-tree root",
+        reason: "external xattr B-tree storage is not implemented",
+    })
 }
 
 fn decode_xattr_btree_root_v1(decoder: &mut Decoder) -> Result<BTreeMap<Vec<u8>, Vec<u8>>> {
@@ -875,17 +875,36 @@ fn decode_xattr_btree_root_v1(decoder: &mut Decoder) -> Result<BTreeMap<Vec<u8>,
             reason: "magic bytes do not match",
         });
     }
-    let _entry_count = decoder.read_u64()?;
+    let entry_count = decoder.read_u64()?;
     let _total_value_bytes = decoder.read_u64()?;
-    let _root_page_locator = decoder.read_u64()?;
+    let root_page_locator = decoder.read_u64()?;
     let _depth = decoder.read_u8()?;
     let _flags = decoder.read_u8()?;
-    decoder.read_bytes(6)?; // reserved
-                            // Phase 1: External xattrs return empty map (B-tree pages not yet traversable)
-    Ok(BTreeMap::new())
+    if decoder.read_bytes(6)?.iter().any(|byte| *byte != 0) {
+        return Err(FileSystemError::Decode {
+            object: "XattrBtreeRootV1",
+            reason: "reserved field is non-zero",
+        });
+    }
+    if root_page_locator == 0 {
+        return Err(FileSystemError::Decode {
+            object: "XattrBtreeRootV1",
+            reason: "external xattr B-tree root locator is zero",
+        });
+    }
+    if entry_count > 0 {
+        return Err(FileSystemError::Decode {
+            object: "XattrBtreeRootV1",
+            reason: "external xattr B-tree page traversal is not implemented",
+        });
+    }
+    Err(FileSystemError::Decode {
+        object: "XattrBtreeRootV1",
+        reason: "external xattr B-tree storage is not implemented",
+    })
 }
 
-pub(crate) fn encode_inode(inode: &InodeRecord) -> Vec<u8> {
+pub(crate) fn try_encode_inode(inode: &InodeRecord) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     out.extend_from_slice(&INODE_MAGIC);
     push_u16(&mut out, FILESYSTEM_FORMAT_VERSION);
@@ -908,14 +927,18 @@ pub(crate) fn encode_inode(inode: &InodeRecord) -> Vec<u8> {
     push_i64(&mut out, inode.posix_time.btime_ns);
     match inode.xattr_storage_kind {
         0 => encode_xattr_bundle_v1(&mut out, &inode.xattrs),
-        1 => encode_xattr_btree_root_v1(&mut out, &inode.xattrs),
-        _ => encode_xattr_bundle_v1(&mut out, &inode.xattrs),
+        1 => encode_xattr_btree_root_v1(&mut out, &inode.xattrs)?,
+        _ => {
+            return Err(FileSystemError::Decode {
+                object: "local filesystem inode",
+                reason: "unknown xattr storage kind",
+            })
+        }
     }
     push_u64(&mut out, inode.subtree_rev);
     push_u64(&mut out, inode.dir_rev);
-    out
+    Ok(out)
 }
-
 pub(crate) fn decode_inode(bytes: &[u8]) -> Result<InodeRecord> {
     let mut decoder = Decoder::new("local filesystem inode", bytes);
     decoder.expect_magic(INODE_MAGIC)?;
@@ -1851,6 +1874,68 @@ impl ConflictInventory {
 mod tests {
     use super::*;
 
+    fn sample_file_inode(
+        xattr_storage_kind: u8,
+        xattrs: BTreeMap<Vec<u8>, Vec<u8>>,
+    ) -> InodeRecord {
+        InodeRecord {
+            dir_storage_kind: 0,
+            inode_id: InodeId::new(42),
+            generation: Generation::new(7),
+            facets: NodeKind::File.to_facets(),
+            mode: 0o100644,
+            uid: 1000,
+            gid: 1000,
+            nlink: 1,
+            size: 0,
+            data_version: 1,
+            metadata_version: 1,
+            posix_time: PosixTimeRecord::new(11, 12, 13, 14),
+            xattr_storage_kind,
+            xattrs,
+            dir_rev: 17,
+            subtree_rev: 19,
+            rdev: 0,
+        }
+    }
+
+    fn external_xattr_inode_bytes(
+        entry_count: u64,
+        total_value_bytes: u64,
+        root_page_locator: u64,
+    ) -> Vec<u8> {
+        let inode = sample_file_inode(0, BTreeMap::new());
+        let mut bytes = try_encode_inode(&inode).expect("encode inline inode");
+        let xattr_kind_offset = INODE_MAGIC.len() + 2;
+        bytes[xattr_kind_offset..xattr_kind_offset + 2].copy_from_slice(&1_u16.to_le_bytes());
+        let payload_offset = bytes
+            .windows(XATTR_BUNDLE_MAGIC.len())
+            .position(|window| window == XATTR_BUNDLE_MAGIC)
+            .expect("inline xattr payload is present");
+        bytes.truncate(payload_offset);
+        bytes.extend_from_slice(XATTR_BTREE_ROOT_MAGIC);
+        push_u64(&mut bytes, entry_count);
+        push_u64(&mut bytes, total_value_bytes);
+        push_u64(&mut bytes, root_page_locator);
+        bytes.push(0);
+        bytes.push(0);
+        bytes.extend_from_slice(&[0_u8; 6]);
+        push_u64(&mut bytes, inode.subtree_rev);
+        push_u64(&mut bytes, inode.dir_rev);
+        bytes
+    }
+
+    fn assert_xattr_root_decode_refusal(bytes: &[u8], expected_reason: &'static str) {
+        let err = decode_inode(bytes).expect_err("external xattr root must be refused");
+        assert!(matches!(
+            err,
+            FileSystemError::Decode {
+                object: "XattrBtreeRootV1",
+                reason
+            } if reason == expected_reason
+        ));
+    }
+
     fn root_summary(transaction_id: u64) -> CommittedRootSummary {
         CommittedRootSummary {
             slot: 0,
@@ -1903,6 +1988,71 @@ mod tests {
                 .try_into()
                 .unwrap(),
         )
+    }
+
+    #[test]
+    fn inline_xattr_inode_roundtrips_current_bundle_encoding() {
+        let mut xattrs = BTreeMap::new();
+        xattrs.insert(b"user.alpha".to_vec(), b"alpha-value".to_vec());
+        xattrs.insert(b"user.beta".to_vec(), b"beta-value".to_vec());
+        let inode = sample_file_inode(0, xattrs.clone());
+
+        let encoded = try_encode_inode(&inode).expect("inline xattrs encode");
+        let decoded = decode_inode(&encoded).expect("inline xattrs decode");
+
+        assert_eq!(decoded.xattr_storage_kind, 0);
+        assert_eq!(decoded.xattrs, xattrs);
+        assert_eq!(decoded.subtree_rev, inode.subtree_rev);
+        assert_eq!(decoded.dir_rev, inode.dir_rev);
+    }
+
+    #[test]
+    fn external_xattr_selection_path_refuses_encode_before_publish() {
+        let mut xattrs = BTreeMap::new();
+        xattrs.insert(b"user.large".to_vec(), vec![7_u8; 4097]);
+        let inode = sample_file_inode(1, xattrs);
+
+        let err = try_encode_inode(&inode).expect_err("external xattrs must not encode");
+        assert!(matches!(
+            err,
+            FileSystemError::Unsupported {
+                operation: "encode external xattr B-tree root",
+                reason: "external xattr B-tree storage is not implemented"
+            }
+        ));
+    }
+
+    #[test]
+    fn external_xattr_root_with_zero_locator_refuses_decode() {
+        let bytes = external_xattr_inode_bytes(1, 5, 0);
+        assert_xattr_root_decode_refusal(&bytes, "external xattr B-tree root locator is zero");
+    }
+
+    #[test]
+    fn external_xattr_root_with_nonzero_locator_refuses_without_traversal() {
+        let bytes = external_xattr_inode_bytes(1, 5, 42);
+        assert_xattr_root_decode_refusal(
+            &bytes,
+            "external xattr B-tree page traversal is not implemented",
+        );
+    }
+
+    #[test]
+    fn external_xattr_root_with_reserved_bytes_refuses_decode() {
+        let mut bytes = external_xattr_inode_bytes(1, 5, 42);
+        let reserved_offset = bytes
+            .windows(XATTR_BTREE_ROOT_MAGIC.len())
+            .position(|window| window == XATTR_BTREE_ROOT_MAGIC)
+            .expect("external root is present")
+            + XATTR_BTREE_ROOT_MAGIC.len()
+            + 8
+            + 8
+            + 8
+            + 1
+            + 1;
+        bytes[reserved_offset] = 1;
+
+        assert_xattr_root_decode_refusal(&bytes, "reserved field is non-zero");
     }
 
     #[test]

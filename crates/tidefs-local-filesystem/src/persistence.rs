@@ -253,7 +253,7 @@ pub(crate) fn persist_transaction_objects(
 
         if needs_inode_write {
             let inode_key = transaction_inode_object_key(transaction_id, inode.inode_id);
-            let inode_bytes = encode_inode(inode);
+            let inode_bytes = try_encode_inode(inode)?;
             store.put(inode_key, &inode_bytes)?;
             manifest_entries.push(TransactionManifestEntry {
                 role: TransactionManifestObjectRole::TransactionInode,
@@ -263,7 +263,7 @@ pub(crate) fn persist_transaction_objects(
         } else {
             let last_tx = state.last_inode_write_tx[&inode.inode_id];
             let last_key = transaction_inode_object_key(last_tx, inode.inode_id);
-            let current_bytes = encode_inode(inode);
+            let current_bytes = try_encode_inode(inode)?;
             let existing_bytes = store.get(last_key)?.ok_or(FileSystemError::CorruptState {
                 reason: "clean inode reference points to missing object",
             })?;
