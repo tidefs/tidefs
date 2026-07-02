@@ -1,23 +1,26 @@
-# TideFS: ublk block-volume sector-pattern data integrity validation in QEMU.
+# TideFS: ublk block-volume sector-pattern data integrity validation refusal.
 #
-# Boots a Linux 7.0 QEMU guest, starts the tidefs-block-volume-adapter-daemon,
-# attaches a ublk block-volume, and exercises 4 deterministic sector-fill
-# patterns (LBA-indexed, all-zeros, all-ones, counter-fill) across 4 validation
-# tiers (single-sector round-trip, multi-sector sequential, staggered-offset
+# This entry point records the intended Linux 7.0 QEMU guest row shape, but the
+# prepared guest image/test runner for that workload is not wired yet. Until
+# that substrate exists, the harness must fail closed as missing-evidence
+# refusal output and must not be counted as product validation coverage.
+#
+# Intended workload: start the tidefs-block-volume-adapter-daemon, attach a
+# ublk block-volume, and exercise 4 deterministic sector-fill patterns
+# (LBA-indexed, all-zeros, all-ones, counter-fill) across 4 validation tiers
+# (single-sector round-trip, multi-sector sequential, staggered-offset
 # overlapped, full-volume sweep) with committed-root consistency verification.
-#
-# Every sector read must match its written pattern byte-for-byte. Produces
-# tier-classified validation output at the qemu-guest tier.
 #
 # Dependencies:
 #   - Linux 7.0 kernel with ublk driver support
 #   - tidefs-block-volume-adapter-daemon compiled for the guest
 #   - QEMU with QMP monitor support
 #   - Persistently-backed block volume image
+#   - Prepared guest image/test runner for the sector-pattern workload
 #
-# Environment refusal: this test requires /dev/kvm and a prepared
-# Linux 7.0 QEMU image. In environments without these, it produces
-# REFUSAL-classified validation rows.
+# Missing-evidence refusal: this test currently requires substrate that is not
+# available in this derivation. It exits non-success with explicit refusal
+# output instead of emitting PASS rows or qemu-guest validation evidence.
 
 { pkgs, linuxKernel_7_0 }:
 
@@ -39,14 +42,14 @@ let
       cat <<EOF
 Usage: tidefs-ublk-integrity-validation [--timeout SECONDS] [--sectors N] [--keep-tmp]
 
-Validate ublk block-volume sector-pattern data integrity across 4 patterns
-(LBA-indexed, all-zeros, all-ones, counter-fill) and 4 validation tiers
-(single-sector round-trip, multi-sector sequential, staggered-offset
-overlapped, full-volume sweep) with committed-root verification in a
-Linux 7.0 QEMU guest.
+Fail closed for the not-yet-wired ublk block-volume sector-pattern data
+integrity workload. The intended workload covers 4 patterns (LBA-indexed,
+all-zeros, all-ones, counter-fill) and 4 validation tiers (single-sector
+round-trip, multi-sector sequential, staggered-offset overlapped,
+full-volume sweep) with committed-root verification in a Linux 7.0 QEMU guest.
 
-Every sector read must match its written pattern byte-for-byte. Produces
-tier-classified validation at the qemu-guest tier.
+Until a prepared guest image/test runner is available, this command emits only
+missing-evidence/refusal output and provides no product validation coverage.
 
 Options:
   --timeout SECONDS    QEMU boot timeout (default: $TIMEOUT_SEC)
@@ -55,9 +58,9 @@ Options:
   --help, -h           Show this message
 
 Exit codes:
-  0   All tiers PASS (every sector verified byte-identical)
-  1   One or more tiers FAIL (miscompare detected)
-  2   ENVIRONMENT REFUSAL (no /dev/kvm, no ublk kernel support)
+  0   All tiers PASS (only after the guest workload is implemented)
+  1   One or more tiers FAIL (only after the guest workload is implemented)
+  2   REFUSAL (no /dev/kvm, no guest runner, or missing execution substrate)
 EOF
     }
 
@@ -77,23 +80,28 @@ EOF
     if [ ! -e /dev/kvm ]; then
       echo "ENVIRONMENT REFUSAL: /dev/kvm not available"
       echo "ublk integrity QEMU validation requires KVM acceleration"
+      echo "validation_coverage: none"
+      echo "pass_rows: 0"
       exit 2
     fi
 
     if [ ! -e "$KERNEL_IMG" ]; then
       echo "ENVIRONMENT REFUSAL: Linux 7.0 kernel image not found at $KERNEL_IMG"
+      echo "validation_coverage: none"
+      echo "pass_rows: 0"
       exit 2
     fi
 
-    echo "=== ublk sector-pattern integrity validation ==="
+    echo "=== ublk sector-pattern integrity validation refusal ==="
     echo "device_sectors=$DEVICE_SECTORS sector_size=$SECTOR_SIZE"
     echo "patterns: LBA-indexed, all-zeros, all-ones, counter-fill"
     echo "tiers: single-sector, multi-sector, staggered-offset, full-volume-sweep"
 
     # ── Validation workload ────────────────────────────────────────────
     #
-    # Executed inside the QEMU guest via a serial-attached test binary or
-    # shell script. The guest performs:
+    # Intended future guest workload, once a prepared guest image/test runner
+    # exists. It must execute inside the QEMU guest via a serial-attached test
+    # binary or shell script. The guest will perform:
     #
     #   For each pattern in {LbaIndexed, AllZeros, AllOnes, CounterFill}:
     #     For each tier in {SingleSector, MultiSector, Staggered, FullSweep}:
@@ -105,10 +113,13 @@ EOF
     #       6. Record validation row (pattern, tier, range, outcome, message)
     #   After all tiers, verify committed-root consistency across remount.
     #
-    # The canonical 24-row validation report (16 core + 8 edge) is emitted
-    # as tier-classified JSON to stdout.
+    # When implemented, the canonical 24-row validation report (16 core + 8
+    # edge) must be emitted as tier-classified JSON to stdout.
 
-    echo "ublk integrity QEMU validation: TBD when guest image is available"
+    echo "MISSING-EVIDENCE REFUSAL: ublk integrity QEMU validation is not wired"
+    echo "reason: no prepared Linux 7.0 guest image/test runner for the sector-pattern workload"
+    echo "validation_coverage: none"
+    echo "pass_rows: 0"
     echo "See crates/tidefs-block-volume-adapter-ublk-control-runtime/src/integrity_validation.rs"
     echo "Validation schema: 24 rows (16 core 4x4 + 8 edge cases)"
     exit 2
