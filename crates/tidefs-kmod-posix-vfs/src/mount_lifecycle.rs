@@ -17,14 +17,14 @@
 //! # Super_operations Dispatch Status
 //!
 //! Wired (C shim): `fill_super`, `kill_sb`, `statfs`, `sync_fs`,
-//!   `put_super`, `umount_begin`, `shutdown`, `show_options`,
+//!   `put_super`, `umount_begin`, `show_options`,
 //!   plus inode-level ops (`evict_inode`, `write_inode`, `free_inode`).
 //!
-//! Explicitly deferred (not registered in super_ops table):
-//! - `remount_fs` -- the kernel VFS treats MS_REMOUNT as a flags-only
-//!   no-op (ro/rw toggle); custom mount-option propagation is not supported.
-//! - `freeze_fs`/`unfreeze_fs` -- the kernel VFS returns EOPNOTSUPP for
-//!   any freeze/thaw request on this superblock.
+//! Explicitly unsupported:
+//! - `shutdown` -- not registered because Linux cannot return a refusal errno.
+//! - `freeze_fs`/`unfreeze_fs` -- registered C callbacks return EOPNOTSUPP.
+//! - `remount_fs` -- registered C callback returns EOPNOTSUPP rather than
+//!   silently accepting unapplied option changes.
 
 #[cfg(CONFIG_RUST)]
 use crate::tidefs_kmod_bridge;
@@ -32,6 +32,10 @@ use crate::tidefs_kmod_bridge;
 #[cfg(CONFIG_RUST)]
 use crate::blake3;
 use crate::intent_replay::replay_intent_records_ref;
+use crate::super_operations::{
+    administrative_super_operation_policy, refuse_administrative_super_operation,
+    AdministrativeSuperOperation, AdministrativeSuperOperationPolicy,
+};
 use crate::superblock::{mount_validate, MountError, MountResult};
 use crate::KmodPosixVfs;
 use crate::TideString as String;
@@ -242,6 +246,26 @@ impl<E: VfsEngine + VfsEngineStatFs> MountLifecycle<E> {
         Ok(())
     }
 
+    /// Return the current policy for an administrative superblock operation.
+    ///
+    /// These operations are intentionally refused without altering lifecycle
+    /// state until TideFS has the matching quiesce, dirty/writeback, or
+    /// remount-option authority.
+    pub fn administrative_operation_policy(
+        &self,
+        operation: AdministrativeSuperOperation,
+    ) -> AdministrativeSuperOperationPolicy {
+        administrative_super_operation_policy(operation)
+    }
+
+    /// Refuse an unsupported administrative operation without changing state.
+    pub fn refuse_administrative_operation(
+        &self,
+        operation: AdministrativeSuperOperation,
+    ) -> Result<(), Errno> {
+        refuse_administrative_super_operation(operation)
+    }
+
     /// Return true if the filesystem is currently mounted.
     pub fn is_mounted(&self) -> bool {
         self.state.is_mounted()
@@ -331,6 +355,34 @@ mod tests {
         });
         e.syncfs_fn = Box::new(|_| Ok(()));
         e
+    }
+
+    #[test]
+    fn administrative_refusals_do_not_change_mounted_state() {
+        let mut lc = MountLifecycle::new(mount_ready_engine());
+        lc.mount(&MockEngine::test_ctx(), None, None, 7, &[], false)
+            .unwrap();
+
+        let before = lc.snapshot().digest_bytes();
+        assert_eq!(
+            lc.refuse_administrative_operation(AdministrativeSuperOperation::FreezeFs),
+            Err(Errno::EOPNOTSUPP)
+        );
+        assert_eq!(
+            lc.refuse_administrative_operation(AdministrativeSuperOperation::UnfreezeFs),
+            Err(Errno::EOPNOTSUPP)
+        );
+        assert_eq!(
+            lc.refuse_administrative_operation(AdministrativeSuperOperation::RemountFs),
+            Err(Errno::EOPNOTSUPP)
+        );
+        assert_eq!(
+            lc.administrative_operation_policy(AdministrativeSuperOperation::Shutdown)
+                .errno,
+            Errno::EOPNOTSUPP
+        );
+        assert!(lc.is_mounted());
+        assert_eq!(before, lc.snapshot().digest_bytes());
     }
 
     #[test]

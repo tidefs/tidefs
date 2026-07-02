@@ -33,6 +33,7 @@ let
     MODULE_DIR="${linuxKernel_7_0}/lib/modules/${linuxKernel_7_0.version}"
     KERNEL_VERSION="${linuxKernel_7_0.version}"
     TIDEFSCTL="${tidefsPackage}/bin/tidefsctl"
+    FSFREEZE="${pkgs.util-linux}/bin/fsfreeze"
 
     TMPDIR="''${TIDEFS_KMOD_XFSTESTS_TMPDIR:-/tmp/tidefs-kmod-xfstests-smoke}"
     TIMEOUT_SEC="''${TIDEFS_KMOD_XFSTESTS_TIMEOUT:-600}"
@@ -117,7 +118,7 @@ EOF
     echo "  Timeout:    ''${TIMEOUT_SEC}s"
     echo ""
 
-    for dep in "$QEMU_BIN" "$BUSYBOX" "$KERNEL_IMG" "$CPIO" "$TIDEFSCTL"; do
+    for dep in "$QEMU_BIN" "$BUSYBOX" "$KERNEL_IMG" "$CPIO" "$TIDEFSCTL" "$FSFREEZE"; do
       if [ ! -f "$dep" ] && [ ! -x "$dep" ]; then
         echo "ERROR: dependency not found: $dep" >&2
         exit 2
@@ -217,6 +218,24 @@ EOF
       chmod +x "$RUN_DIR$TIDEFSCTL_LD_SO" 2>/dev/null || true
     fi
 
+    cp "$FSFREEZE" "$RUN_DIR/bin/fsfreeze"
+    chmod +x "$RUN_DIR/bin/fsfreeze"
+    FSFREEZE_DEPS=$("$LDD_BIN" "$FSFREEZE" 2>/dev/null | grep -o '/nix/store/[^ ]*' | sort -u || true)
+    for lib in $FSFREEZE_DEPS; do
+      if [ -f "$lib" ]; then
+        lib_dir=$(dirname "$lib")
+        mkdir -p "$RUN_DIR$lib_dir"
+        cp "$lib" "$RUN_DIR$lib" 2>/dev/null || true
+      fi
+    done
+    FSFREEZE_LD_SO=$("$LDD_BIN" "$FSFREEZE" 2>/dev/null | grep -o '/nix/store/[^ ]*ld-linux[^ ]*' | head -1 || true)
+    if [ -n "$FSFREEZE_LD_SO" ] && [ -f "$FSFREEZE_LD_SO" ]; then
+      ld_dir=$(dirname "$FSFREEZE_LD_SO")
+      mkdir -p "$RUN_DIR$ld_dir"
+      cp "$FSFREEZE_LD_SO" "$RUN_DIR$FSFREEZE_LD_SO" 2>/dev/null || true
+      chmod +x "$RUN_DIR$FSFREEZE_LD_SO" 2>/dev/null || true
+    fi
+
     # Copy module if available
     MODULE_FOUND=0
     if [ -n "$KO_PATH" ] && [ -f "$KO_PATH" ]; then
@@ -264,6 +283,8 @@ pass() { echo "PASS: $1"; PASSED=$((PASSED + 1)); TOTAL_TESTS=$((TOTAL_TESTS + 1
 fail() { echo "FAIL: $1 -- $2"; FAILED=$((FAILED + 1)); TOTAL_TESTS=$((TOTAL_TESTS + 1)); }
 blocked() { echo "BLOCKED: $1 -- $2"; BLOCKED=$((BLOCKED + 1)); }
 refusal() { echo "REFUSAL: $1 -- $2"; REFUSAL=$((REFUSAL + 1)); }
+dmesg_count() { dmesg 2>/dev/null | grep -c "$1" 2>/dev/null || true; }
+dmesg_last() { dmesg 2>/dev/null | grep "$1" 2>/dev/null | tail -1 || true; }
 
 MNT=/mnt/tidefs
 SCRATCH_DIR=/var/lib/tidefs/scratch
@@ -463,6 +484,41 @@ if [ "$MOUNTED" -eq 1 ]; then
     fi
 
     echo ""
+    echo "-- smoke: administrative super_operation refusals --"
+    freeze_before=$(dmesg_count "tidefs_posix_vfs: freeze_fs refused")
+    if fsfreeze -f "$MNT" 2>/tmp/freeze.err; then
+        fail "configured_pool_freeze_fs_refused" "fsfreeze unexpectedly succeeded"
+        fsfreeze -u "$MNT" 2>/dev/null || true
+    else
+        freeze_after=$(dmesg_count "tidefs_posix_vfs: freeze_fs refused")
+        if [ "''${freeze_after:-0}" -gt "''${freeze_before:-0}" ] 2>/dev/null; then
+            pass "configured_pool_freeze_fs_refused"
+            echo "  kernel: $(dmesg_last "tidefs_posix_vfs: freeze_fs refused")"
+        else
+            fail "configured_pool_freeze_fs_refused" "$(head -1 /tmp/freeze.err)"
+        fi
+    fi
+
+    remount_before=$(dmesg_count "tidefs_posix_vfs: remount_fs refused")
+    if mount -o remount,ro "$MNT" 2>/tmp/remount.err; then
+        fail "configured_pool_remount_fs_refused" "remount,ro unexpectedly succeeded"
+    else
+        remount_after=$(dmesg_count "tidefs_posix_vfs: remount_fs refused")
+        if [ "''${remount_after:-0}" -gt "''${remount_before:-0}" ] 2>/dev/null; then
+            pass "configured_pool_remount_fs_refused"
+            echo "  kernel: $(dmesg_last "tidefs_posix_vfs: remount_fs refused")"
+        else
+            fail "configured_pool_remount_fs_refused" "$(head -1 /tmp/remount.err)"
+        fi
+    fi
+
+    if printf 'admin refusal kept mount writable\n' > "$MNT/admin_refusal_alive.txt" 2>/tmp/admin-refusal-write.err; then
+        pass "configured_pool_admin_refusal_write"
+    else
+        fail "configured_pool_admin_refusal_write" "$(head -1 /tmp/admin-refusal-write.err)"
+    fi
+
+    echo ""
     echo "-- smoke: clean teardown --"
     if umount "$MNT" 2>/tmp/umount.err; then
         pass "configured_pool_umount"
@@ -480,6 +536,9 @@ else
     blocked "configured_pool_readdir" "filesystem not mounted"
     blocked "configured_pool_write" "filesystem not mounted"
     blocked "configured_pool_syncfs" "filesystem not mounted"
+    blocked "configured_pool_freeze_fs_refused" "filesystem not mounted"
+    blocked "configured_pool_remount_fs_refused" "filesystem not mounted"
+    blocked "configured_pool_admin_refusal_write" "filesystem not mounted"
     blocked "configured_pool_umount" "filesystem not mounted"
 fi
 

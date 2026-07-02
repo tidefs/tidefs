@@ -21,11 +21,14 @@
 //! Wired (C shim + bridge, per `tidefs_posix_vfs_super_ops`):
 //! - `fill_super`, `kill_sb`, `statfs`, `evict_inode`, `write_inode`,
 //!   `free_inode`, `put_super`, `sync_fs`, `umount_begin`,
-//!   `shutdown`, `show_options`.
+//!   `show_options`.
 //!
-//! Explicitly deferred (not in super_ops table):
-//! - `freeze_fs`/`unfreeze_fs` -- kernel returns EOPNOTSUPP.
-//! - `remount_fs` -- kernel treats MS_REMOUNT as a no-op.
+//! Explicitly unsupported:
+//! - `shutdown` -- not registered because `FS_IOC_GOINGDOWN` would otherwise
+//!   appear successful without the full shutdown/no-new-work contract.
+//! - `freeze_fs`/`unfreeze_fs` -- registered C callbacks return EOPNOTSUPP.
+//! - `remount_fs` -- registered C callback returns EOPNOTSUPP rather than
+//!   silently accepting unapplied option changes.
 //!
 //! # Safety: kernel callback registration contract
 //!
@@ -66,6 +69,7 @@
 use crate::tidefs_kmod_bridge;
 
 use crate::mount_lifecycle::MountLifecycle;
+use crate::super_operations::{AdministrativeSuperOperation, AdministrativeSuperOperationPolicy};
 use crate::superblock::{MountError, MountResult};
 use crate::KmodPosixVfs;
 use tidefs_kmod_bridge::kernel_types::{Errno, RequestCtx, StatFs};
@@ -255,6 +259,22 @@ pub fn kmod_statfs<E: VfsEngine + VfsEngineStatFs>(
     crate::super_operations::statfs(ctx.engine(), request)
 }
 
+/// Return the typed policy for an administrative superblock operation.
+pub fn kmod_administrative_super_operation_policy<E: VfsEngine + VfsEngineStatFs>(
+    ctx: &KmodSuperContext<E>,
+    operation: AdministrativeSuperOperation,
+) -> AdministrativeSuperOperationPolicy {
+    ctx.lifecycle.administrative_operation_policy(operation)
+}
+
+/// Refuse an unsupported administrative superblock operation.
+pub fn kmod_refuse_administrative_super_operation<E: VfsEngine + VfsEngineStatFs>(
+    ctx: &KmodSuperContext<E>,
+    operation: AdministrativeSuperOperation,
+) -> Result<(), Errno> {
+    ctx.lifecycle.refuse_administrative_operation(operation)
+}
+
 // ---------------------------------------------------------------------------
 // Error mapping (unchanged)
 // ---------------------------------------------------------------------------
@@ -412,6 +432,41 @@ mod tests {
         });
         e.syncfs_fn = Box::new(|_| Ok(()));
         e
+    }
+
+    #[test]
+    fn kmod_administrative_super_operations_refuse_without_unmounting() {
+        let mut ctx = KmodSuperContext::new(mount_ready_engine());
+        kmod_fill_super(&mut ctx, &MockEngine::test_ctx(), None, None, 1, &[], false).unwrap();
+
+        assert_eq!(
+            kmod_refuse_administrative_super_operation(
+                &ctx,
+                AdministrativeSuperOperation::FreezeFs
+            ),
+            Err(Errno::EOPNOTSUPP)
+        );
+        assert_eq!(
+            kmod_refuse_administrative_super_operation(
+                &ctx,
+                AdministrativeSuperOperation::UnfreezeFs
+            ),
+            Err(Errno::EOPNOTSUPP)
+        );
+        assert_eq!(
+            kmod_refuse_administrative_super_operation(
+                &ctx,
+                AdministrativeSuperOperation::RemountFs
+            ),
+            Err(Errno::EOPNOTSUPP)
+        );
+
+        let shutdown = kmod_administrative_super_operation_policy(
+            &ctx,
+            AdministrativeSuperOperation::Shutdown,
+        );
+        assert_eq!(shutdown.errno, Errno::EOPNOTSUPP);
+        assert!(ctx.is_mounted());
     }
 
     #[test]
