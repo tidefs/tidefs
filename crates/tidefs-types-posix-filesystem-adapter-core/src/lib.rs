@@ -342,7 +342,7 @@ pub const FUSE_MOUNT_SURFACE_VALIDATION_CASES: &[PosixFilesystemAdapterSurfaceVa
         validation_class: PosixFilesystemAdapterSurfaceValidationClass::MountLifecycle,
         status: PosixFilesystemAdapterValidationStatus::ExecutedSmoke,
         current_surface: "foreground mount command, smoke-mount command, and QEMU /dev/fuse smoke path",
-        validation_output: "docs/FUSE_MOUNT.md plus qemu-smoke and validation logs",
+        validation_output: ".github/workflows/qemu-smoke.yml qemu-smoke-fuse-vm-test artifact class and check-fuse-mount-path",
         parent_gate_boundary: "does not prove long-running, multi-client, unmount-race, or broad xfstests mount lifecycle correctness",
         closes_parent_publishing_checklist_item: false,
     },
@@ -351,7 +351,7 @@ pub const FUSE_MOUNT_SURFACE_VALIDATION_CASES: &[PosixFilesystemAdapterSurfaceVa
         validation_class: PosixFilesystemAdapterSurfaceValidationClass::NamespaceTraversal,
         status: PosixFilesystemAdapterValidationStatus::SourceBound,
         current_surface: "lookup, getattr, opendir, readdir, releasedir, mkdir, rmdir-empty, symlink, and readlink",
-        validation_output: "apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_FUSE userspace implementation.rs source markers and check-fuse-mount-path",
+        validation_output: "apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_vfs_adapter.rs source markers and check-fuse-mount-path",
         parent_gate_boundary: "does not prove full path encoding, ACL, xattr, hard error, or all core VFS namespace behavior",
         closes_parent_publishing_checklist_item: false,
     },
@@ -360,7 +360,7 @@ pub const FUSE_MOUNT_SURFACE_VALIDATION_CASES: &[PosixFilesystemAdapterSurfaceVa
         validation_class: PosixFilesystemAdapterSurfaceValidationClass::FileDataIo,
         status: PosixFilesystemAdapterValidationStatus::RecordedScoreboard,
         current_surface: "create, open, release, read, write, truncate, live FUSE smoke, and fio lane",
-        validation_output: "docs/POSIX_SCOREBOARD_OW107.md and scoreboard logs",
+        validation_output: "nix/tidefs-posix-scoreboard.sh scoreboard.md/scoreboard.tsv outputs",
         parent_gate_boundary: "does not prove mmap-heavy correctness, complete direct I/O semantics, or a broad external-suite pass",
         closes_parent_publishing_checklist_item: false,
     },
@@ -369,7 +369,7 @@ pub const FUSE_MOUNT_SURFACE_VALIDATION_CASES: &[PosixFilesystemAdapterSurfaceVa
         validation_class: PosixFilesystemAdapterSurfaceValidationClass::DurabilityBarrier,
         status: PosixFilesystemAdapterValidationStatus::SourceBound,
         current_surface: "file fsync and directory fsync route through committed root-slot publication and backing sync failure maps to EIO",
-        validation_output: "docs/POSIX_SEMANTICS_OW106.md and check-posix-semantics",
+        validation_output: "apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_vfs_adapter.rs fsync source markers and check-posix-semantics",
         parent_gate_boundary: "does not prove all Linux writeback, mmap, O_SYNC, O_DSYNC, or crash-powercut FUSE combinations",
         closes_parent_publishing_checklist_item: false,
     },
@@ -378,7 +378,7 @@ pub const FUSE_MOUNT_SURFACE_VALIDATION_CASES: &[PosixFilesystemAdapterSurfaceVa
         validation_class: PosixFilesystemAdapterSurfaceValidationClass::SessionHandleSemantics,
         status: PosixFilesystemAdapterValidationStatus::ExecutedSmoke,
         current_surface: "unlink-while-open and rename-over-open-target regular-file handles retain session-local content until final release",
-        validation_output: "docs/POSIX_SEMANTICS_OW106.md plus live FUSE smoke and targeted xfstests generic/035 validation",
+        validation_output: "apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_vfs_adapter.rs handle-lifetime source markers, live FUSE smoke, and xfstests focused artifact class generic/035",
         parent_gate_boundary: "does not persist orphan inodes or prove complete Linux file-handle lifetime behavior",
         closes_parent_publishing_checklist_item: false,
     },
@@ -387,7 +387,7 @@ pub const FUSE_MOUNT_SURFACE_VALIDATION_CASES: &[PosixFilesystemAdapterSurfaceVa
         validation_class: PosixFilesystemAdapterSurfaceValidationClass::CapacityAccounting,
         status: PosixFilesystemAdapterValidationStatus::SourceBound,
         current_surface: "statfs reports allocator truth and fallocate mode zero zero-extends through allocator admission",
-        validation_output: "docs/FUSE_MOUNT.md, docs/LOCAL_STORAGE_ALLOCATOR_OW102.md, and check-local-storage-allocator",
+        validation_output: "docs/LOCAL_STORAGE_ALLOCATOR_OW102.md and check-local-storage-allocator",
         parent_gate_boundary: "does not prove production block-volume free-space semantics or unsupported fallocate modes",
         closes_parent_publishing_checklist_item: false,
     },
@@ -396,7 +396,7 @@ pub const FUSE_MOUNT_SURFACE_VALIDATION_CASES: &[PosixFilesystemAdapterSurfaceVa
         validation_class: PosixFilesystemAdapterSurfaceValidationClass::UnsupportedBoundary,
         status: PosixFilesystemAdapterValidationStatus::ExplicitSkip,
         current_surface: "xattrs return EOPNOTSUPP, unsupported fallocate flags return EOPNOTSUPP, and non-UTF-8 path names are rejected",
-        validation_output: "docs/FUSE_MOUNT.md and FUSE userspace implementation POSIX subset boundaries",
+        validation_output: "docs/FUSE_ADAPTER_CONTRACT_ASSUMPTIONS.md and FUSE adapter EOPNOTSUPP source boundaries",
         parent_gate_boundary: "unsupported rows are explicit non-closing validation for full PC-004 correctness",
         closes_parent_publishing_checklist_item: false,
     },
@@ -405,7 +405,7 @@ pub const FUSE_MOUNT_SURFACE_VALIDATION_CASES: &[PosixFilesystemAdapterSurfaceVa
         validation_class: PosixFilesystemAdapterSurfaceValidationClass::ExternalSuiteCoverage,
         status: PosixFilesystemAdapterValidationStatus::RecordedScoreboard,
         current_surface: "scoreboard records pass, fail, and skip rows, including targeted real xfstests generic/035 when configured",
-        validation_output: "docs/POSIX_SCOREBOARD_OW107.md and /root/ai/tmp/tidefs-validation/20260428-issue56-integration-generic035-hardening/",
+        validation_output: "nix/tidefs-posix-scoreboard.sh scoreboard outputs and xfstests focused artifact class generic/035",
         parent_gate_boundary: "targeted generic/035 validation and explicit skips are not broad xfstests-grade coverage",
         closes_parent_publishing_checklist_item: false,
     },
@@ -414,7 +414,7 @@ pub const FUSE_MOUNT_SURFACE_VALIDATION_CASES: &[PosixFilesystemAdapterSurfaceVa
         validation_class: PosixFilesystemAdapterSurfaceValidationClass::FutureFullGate,
         status: PosixFilesystemAdapterValidationStatus::DeferredNonClosing,
         current_surface: "parent PC-004 still requires xfstests-grade breadth, mmap-heavy correctness, and no missing core VFS behavior skips",
-        validation_output: "none for full parent gate in this surface",
+        validation_output: "explicit non-closing boundary: parent PC-004 remains blocked pending broad xfstests, mmap, and VFS coverage",
         parent_gate_boundary: "this validation surface map keeps parent PC-004 open",
         closes_parent_publishing_checklist_item: false,
     },
@@ -1086,7 +1086,7 @@ mod tests {
         }
         assert!(FUSE_MOUNT_SURFACE_VALIDATION_CASES.iter().any(|case| {
             case.status == PosixFilesystemAdapterValidationStatus::RecordedScoreboard
-                && case.validation_output.contains("generic035")
+                && case.validation_output.contains("generic/035")
         }));
         assert!(FUSE_MOUNT_SURFACE_VALIDATION_CASES.iter().any(|case| {
             case.status == PosixFilesystemAdapterValidationStatus::ExplicitSkip
