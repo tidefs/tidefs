@@ -3,6 +3,12 @@
 
 TideFS block-volume kernel module — fixed-capacity block device export consuming the kmod-bridge.
 
+This README is crate-local source orientation. Product block-device wording,
+kernel-residency wording, successor/comparator wording, and release-readiness
+authority are owned by `docs/KERNEL_RESIDENCY_AUTHORITY.md`,
+`docs/KERNEL_RESIDENT_POOL_ENGINE_ARCHITECTURE.md`, `validation/claims.toml`,
+and the generated claim registry.
+
 ## Daemon Independence
 
 This crate has zero dependencies on userspace daemon crates
@@ -33,9 +39,12 @@ PoolCoreBackend → KernelPoolCore logical-volume I/O
 BlockExport → BlockExportQueue → backing buffer
 ```
 
-All I/O arrives through the blk-mq `queue_rq` callback. The production-shaped
-entrypoint requires a pool-backed backend before registering `/dev/tidefs`.
-Bio data (pages,
+All I/O arrives through the blk-mq `queue_rq` callback. The pool-backed
+registration path refuses to register `/dev/tidefs` unless a pool-backed backend
+is available. That fail-closed shape is current bring-up behavior, not a
+full block-volume product claim. Bio data pages and segments are accessed
+through Linux 7.0 C bindings because the current Rust-for-Linux baseline has
+no safe Rust `Bio` wrapper.
 
 ### Linux 7.0 Rust-for-Linux API Gaps
 
@@ -57,12 +66,11 @@ following gaps in the Linux 7.0 Rust-for-Linux block bindings:
    All I/O dispatches through `queue_rq`.
 5. **No `BlockMutex`** — `kernel::sync::Mutex` is used instead.
 
-These gaps are recorded per the release gate acceptance criteria.  When
+These gaps are recorded per the kernel bring-up acceptance criteria. When
 upstream Rust-for-Linux adds bio abstractions, the `unsafe` C-struct
 access in `queue_rq` can be replaced with safe wrapper calls.
 
-segments) is accessed through `unsafe` C-struct dereference because Linux 7.0
-provides no Rust `Bio` wrapper.  The `submit_bio` method used in earlier
+The `submit_bio` method used in earlier
 versions was a design placeholder — the real `Operations` trait in Linux 7.0
 has no `submit_bio` method.
 
@@ -94,7 +102,7 @@ tidefs block device.
 
 | `io_opt` | 4096 bytes | Optimal I/O size (matches physical block). The I/O scheduler targets this size for throughput-sensitive operations. |
 
-| `max_hw_sectors` | 512 sectors (256 KiB) | Maximum hardware transfer size. Derived from [`tidefs_vfs_engine::BlockQueueGeometry::production()`]. Prevents excessive bio splitting while keeping latency bounded for small-I/O interleaving under VfsEngine dispatch. |
+| `max_hw_sectors` | 512 sectors (256 KiB) | Maximum hardware transfer size. Derived from the source default [`tidefs_vfs_engine::BlockQueueGeometry::production()`] helper. The helper name is historical source API; this fallback geometry does not imply product-ready block storage. |
 
 | `max_segments` | 128 segments | Sufficient for bio_vec chaining from the block layer; matches VfsEngine segment-processing capacity. |
 
@@ -110,9 +118,9 @@ tidefs block device.
    logical block size (from [`BlockQueueGeometry::logical_block_size`])
    and capacity.
 
-2. [`BlockQueueGeometry::production()`] provides the canonical queue-limit
+2. [`BlockQueueGeometry::production()`] provides the default queue-limit
    values. When a full [`VfsEngine`] is wired (post module-registration bridge),
-   these values come from [`VfsEngine::queue_limits()`] instead of the production
+   these values come from [`VfsEngine::queue_limits()`] instead of the fallback
    defaults, giving device-specific storage geometry to the Linux block layer.
 
 3. Additional queue limits (`physical_block_size`, `io_min`, `io_opt`,
@@ -131,7 +139,7 @@ Queue limits flow through a single method on the [`VfsEngine`] trait:
 ```rust
 use tidefs_vfs_engine::{BlockQueueGeometry, VfsEngine};
 
-// Production defaults (used when no engine is wired):
+// Default queue geometry used when no engine is wired:
 let geometry = BlockQueueGeometry::production();
 
 // Engine-wired (overrides any field):
@@ -146,8 +154,8 @@ disk.set_max_segments(geometry.max_segments);
 
 Engines that back block devices override [`VfsEngine::queue_limits()`] to
 return device-specific geometry. The default implementation (present in every
-`VfsEngine` implementation through the trait default) returns production values
-suitable for general-purpose block-device pools.
+`VfsEngine` implementation through the trait default) returns conservative
+bring-up geometry until a real pool engine supplies exact device limits.
 
 ### Runtime Inspection
 
@@ -197,7 +205,7 @@ cat /sys/block/tidefs/queue/rotational  # 0
 
 The `BlockExport` + `BlockExportQueue` backend is a **fixed-capacity in-memory
 buffer**. It is the bring-up and test backend for the typed userspace model and
-kernel module smoke tests, not the production storage backend. The Kbuild module
+kernel module smoke tests, not a product storage backend. The Kbuild module
 entrypoint no longer falls back to this backend implicitly: by default,
 `tidefs_block` refuses to register `/dev/tidefs` when `/dev/tidefs_pool_member`
 cannot be opened.
@@ -209,10 +217,11 @@ parameters, so this cfg is the current explicit kernel-facing switch. A runtime
 module parameter can replace it once the supported Rust-for-Linux parameter
 shape is wired.
 
-- **Production backend**: In kernel mode, the production backend is the shared
-  kernel pool authority exposed as `PoolCoreBackend`/`KernelPoolCore`
-  logical-volume I/O. The current hard-coded `/dev/tidefs_pool_member` open
-  remains a bring-up bridge toward that authority, not final pool import.
+- **Pool-core backend target**: The intended kernel path is the shared pool
+  authority exposed as `PoolCoreBackend`/`KernelPoolCore` logical-volume I/O.
+  The current hard-coded `/dev/tidefs_pool_member` open remains a bring-up
+  bridge toward that authority, not final pool import, full block-volume
+  product evidence, or release-readiness evidence.
 - **Data movement guarantee**: The in-memory backend does move data
   (read/write/flush/discard against the flat byte buffer), so the dispatch
   path is exercised for correctness.  However, it does **not** exercise
@@ -229,7 +238,7 @@ shape is wired.
 
 `tidefs-block-kmod` exports TideFS logical volumes as Linux block devices. It
 does not import the physical member devices for a pool, and it does not own a
-separate store. Production kernel block I/O must route:
+separate store. Future product block I/O is required to route:
 
 ```text
 Linux blk-mq queue_rq
@@ -242,7 +251,7 @@ Linux blk-mq queue_rq
 The physical member devices are opened and owned by the kernel-resident pool
 engine shared with `tidefs-kmod-posix-vfs`. The block export front-end consumes
 that engine through logical-volume operations. It must not use the in-memory
-`BlockExport` backend as production storage, and it must reject self-stacking
+`BlockExport` backend as final or product storage, and it must reject self-stacking
 where a TideFS exported block device is supplied as a member device for the
 same TideFS pool.
 
@@ -293,7 +302,7 @@ digests.
 
 The old crate-local in-memory submit_bio validation harness was removed.
 Submit-bio and queue_rq claims must be proven by Linux 7.0 QEMU or mounted
-kernel block-device artifacts that load the product module and exercise the
+kernel block-device artifacts that load the kernel module and exercise the
 real device node.
 
 
