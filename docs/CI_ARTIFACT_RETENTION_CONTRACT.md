@@ -65,7 +65,7 @@ Terms used below:
 
 | Workflow file | Evidence surface |
 |---|---|
-| `tidefs-codex-nexus-relay.yml` | Signs and POSTs the original GitHub event payload to the local `tidefs-codex-nexus` webhook endpoint. Never runs tests or checks out source. These workflow runs, checks, and statuses must not be treated as CI gates. |
+| `tidefs-codex-nexus-relay.yml` | Signs and POSTs the original GitHub event payload to the local `tidefs-codex-nexus` webhook endpoint. Never runs tests or checks out source. Pull-request relay runs use isolated concurrency to avoid intentional cancelled telemetry checks being reported as failing PR checks; issue, push, and manual-dispatch wakeups still coalesce globally. These workflow runs, checks, and statuses must not be treated as CI gates. |
 
 ---
 
@@ -124,7 +124,9 @@ when their profile is active.
   the only artifact of a failure is the run log.
 - The `Codex Nexus Relay` workflow is controller telemetry, not validation
   evidence. It must not be counted as pending, failing, or passing CI when
-  evaluating PR readiness or merge gates. The Current queue summary in
+  evaluating PR readiness or merge gates. Pull-request relay runs avoid
+  intentional concurrency cancellation because GitHub exposes cancelled
+  PR-attached workflow runs as failed PR checks. The Current queue summary in
   `tidefs-codex-nexus` already separates relay and non-relay check/run
   evidence.
 

@@ -240,10 +240,13 @@ Draft pull requests are not integration candidates, so required self-hosted PR
 checks skip them until the PR is marked ready for review. The `ready_for_review`
 event reruns the standing checks on the current head before integration.
 Manual workflow dispatch remains available for draft branches that need early
-evidence. Codex Nexus Relay jobs use one global concurrency group and may
-cancel stale relay runs across issues, PRs, and refs because any delivered
-relay wakeup causes Nexus to reconcile live GitHub state rather than treating
-each queued relay job as durable work.
+evidence. Codex Nexus Relay jobs are controller telemetry, not TideFS
+validation. Pull-request relay runs use isolated concurrency so intentional
+relay coalescing does not create cancelled PR check conclusions that GitHub
+tools report as failing checks. Issue, push, and manual-dispatch relay wakeups
+still share a global cancelling concurrency group because any delivered relay
+wakeup causes Nexus to reconcile live GitHub state rather than treating each
+queued relay job as durable work.
 
 Runner host configuration and bring-up notes live in
 `tidefs/tidefs-infra-configuration`.

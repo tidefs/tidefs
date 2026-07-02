@@ -15,11 +15,13 @@ permissions:
 
 concurrency:
   # Nexus reconciles from live GitHub state, so any delivered relay wakeup is
-  # enough to refresh the controller. Collapse stale relay jobs globally
-  # instead of letting event bursts compete with validation for self-hosted
-  # runners.
-  group: ${{ github.workflow }}
-  cancel-in-progress: true
+  # enough to refresh the controller. Pull-request relay runs are attached to
+  # PR check state, so do not intentionally cancel them; GitHub surfaces those
+  # cancelled telemetry checks as failing PR checks. Other wakeups still share a
+  # global group so issue/push/manual bursts do not compete with validation for
+  # self-hosted runners.
+  group: ${{ github.event_name == 'pull_request' && format('{0}-pull-request-{1}', github.workflow, github.run_id) || github.workflow }}
+  cancel-in-progress: ${{ github.event_name != 'pull_request' }}
 
 jobs:
   relay:
