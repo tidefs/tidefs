@@ -2930,6 +2930,7 @@ EOF
 
           fuseInodeMetadataValidation = import ./nix/vm/fuse-inode-metadata-validation.nix {
             inherit pkgs;
+            linuxKernel_7_0 = linuxKernel_7_0;
             tidefsPackage = default;
           };
 

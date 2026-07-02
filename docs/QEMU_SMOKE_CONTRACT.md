@@ -152,10 +152,10 @@ and serial concurrency.
 |--------------------|-------|
 | Dispatch           | manual `workflow_dispatch` only |
 | Nix flake ref      | `.#fuse-inode-metadata-validation` |
-| Command arguments  | `--keep-tmp`, with `TIDEFS_SOURCE_COMMIT`, `TIDEFS_FUSE_INODE_METADATA_TMPDIR`, `TIDEFS_FUSE_INODE_METADATA_ARTIFACT_SCOPE`, and non-secret `TIDEFS_ROOT_AUTHENTICATION_KEY_HEX` set by the workflow |
+| Command arguments  | `--timeout 900 --validation-dir /tmp/tidefs-validation/fuse-inode-metadata-validation --keep-tmp`, with `TIDEFS_SOURCE_COMMIT` and non-secret `TIDEFS_ROOT_AUTHENTICATION_KEY_HEX` set by the workflow |
 | Output directory   | `/tmp/tidefs-validation/fuse-inode-metadata-validation` |
 | Uploaded artifact  | `qemu-smoke-fuse-inode-metadata-validation` (7-day retention) |
-| Evidence class     | mounted FUSE inode metadata clean/readback row observations with explicit crash-window and committed-root blockers |
+| Evidence class     | mounted FUSE inode metadata clean/readback row observations inside a Linux 7.0 QEMU guest with explicit crash-window and committed-root blockers |
 
 ### 9. `qemu-ublk-smoke`
 
@@ -233,9 +233,9 @@ explicitly says so and the relevant dedicated workflow (e.g.
 - `fuse-vm-test` measures queue depth under a FUSE VM workload; it is
   not a filesystem stress or correctness run.
 - `fuse-inode-metadata-validation` records mounted FUSE inode metadata
-  clean/readback rows and explicit blockers for unexercised crash-window
-  and committed-root rows; it is not POSIX completeness, xfstests, or
-  broad crash-safety evidence.
+  clean/readback rows inside a Linux 7.0 QEMU guest and explicit blockers
+  for unexercised crash-window and committed-root rows; it is not POSIX
+  completeness, xfstests, or broad crash-safety evidence.
 - `qemu-ublk-smoke` validates ublk completion artifacts; it is not a
   block-storage correctness or performance benchmark.
 - `qemu-ublk-qid-tag-runtime` validates a bounded multi-queue qid/tag
