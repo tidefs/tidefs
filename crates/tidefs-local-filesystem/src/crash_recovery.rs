@@ -19,10 +19,10 @@ use crate::{
 use crate::{FileSystemState, LocalFileSystem, Result};
 
 use crate::{
-    content_object_key_for_version, encode_content, encode_directory, encode_inode,
-    encode_superblock, mode_for_kind, root_authentication_record_for_bytes, root_slot_object_key,
+    content_object_key_for_version, encode_content, encode_directory, encode_superblock,
+    mode_for_kind, root_authentication_record_for_bytes, root_slot_object_key,
     transaction_directory_object_key, transaction_inode_object_key,
-    transaction_superblock_object_key, validate_name,
+    transaction_superblock_object_key, try_encode_inode, validate_name,
 };
 pub(crate) fn prepare_empty_crash_matrix_root(root: &Path) -> Result<()> {
     if root.exists() {
@@ -334,9 +334,10 @@ impl<'a> CrashMatrixRawStagingAuthority<'a> {
         transaction_id: u64,
     ) -> Result<()> {
         for inode in staged.inodes.values() {
+            let inode_bytes = try_encode_inode(inode)?;
             self.raw_store().put(
                 transaction_inode_object_key(transaction_id, inode.inode_id),
-                &encode_inode(inode),
+                &inode_bytes,
             )?;
         }
         Ok(())

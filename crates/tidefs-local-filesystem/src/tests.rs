@@ -418,7 +418,7 @@ fn write_transaction_inodes(
         store
             .put(
                 transaction_inode_object_key(transaction_id, inode.inode_id),
-                &encode_inode(inode),
+                &try_encode_inode(inode).expect("encode test inode"),
             )
             .expect("write staged transaction inode");
     }
@@ -11358,7 +11358,7 @@ fn encode_decode_round_trip_preserves_separate_authorities() {
         rdev: 0,
     };
 
-    let encoded = crate::encoding::encode_inode(&record);
+    let encoded = crate::encoding::try_encode_inode(&record).expect("encode test inode");
     let decoded = crate::encoding::decode_inode(&encoded).expect("decode round-trip");
 
     // POSIX timestamps must survive the round-trip exactly.
@@ -11658,7 +11658,7 @@ fn encode_decode_round_trip_preserves_namespace_revisions() {
         rdev: 0,
     };
 
-    let encoded = crate::encoding::encode_inode(&record);
+    let encoded = crate::encoding::try_encode_inode(&record).expect("encode test inode");
     let decoded = crate::encoding::decode_inode(&encoded).expect("decode round-trip");
 
     assert_eq!(decoded.subtree_rev, subtree_rev, "subtree_rev round-trip");
@@ -11715,7 +11715,7 @@ fn old_format_inode_record_without_revision_tail_defaults_to_zero() {
         subtree_rev: 0,
         rdev: 0,
     };
-    let encoded = crate::encoding::encode_inode(&record);
+    let encoded = crate::encoding::try_encode_inode(&record).expect("encode test inode");
     // Truncate off the 16-byte tail (subtree_rev + dir_rev) to simulate
     // a record written before the tail extension.
     let truncated = &encoded[..encoded.len() - 16];

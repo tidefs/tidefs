@@ -338,7 +338,10 @@ const KIND_NAMESPACE_CREATE_INTENT: u8 = 8;
 // Encoding / decoding
 // ---------------------------------------------------------------------------
 
-fn encode_namespace_create_intent(out: &mut Vec<u8>, intent: &NamespaceCreateIntentRecord) {
+fn try_encode_namespace_create_intent(
+    out: &mut Vec<u8>,
+    intent: &NamespaceCreateIntentRecord,
+) -> Result<()> {
     push_u64(out, intent.parent_inode_id.get());
     push_u64(out, intent.entry.name.len() as u64);
     out.extend_from_slice(&intent.entry.name);
@@ -347,9 +350,10 @@ fn encode_namespace_create_intent(out: &mut Vec<u8>, intent: &NamespaceCreateInt
     push_u32(out, intent.entry.kind().as_u32());
     push_u32(out, intent.entry.mode);
 
-    let inode = encode_inode(&intent.inode);
+    let inode = try_encode_inode(&intent.inode)?;
     push_u64(out, inode.len() as u64);
     out.extend_from_slice(&inode);
+    Ok(())
 }
 
 fn read_decoder_vec(decoder: &mut Decoder<'_>, len: usize) -> Result<Vec<u8>> {
@@ -403,7 +407,7 @@ fn decode_namespace_create_intent(
     })
 }
 
-fn encode_intent_log_entry(entry: &IntentLogEntry) -> Vec<u8> {
+fn try_encode_intent_log_entry(entry: &IntentLogEntry) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     out.extend_from_slice(&INTENT_LOG_MAGIC_BYTES);
     push_u16(&mut out, INTENT_LOG_ENTRY_VERSION);
@@ -488,7 +492,7 @@ fn encode_intent_log_entry(entry: &IntentLogEntry) -> Vec<u8> {
         }
         IntentLogEntryKind::NamespaceCreateIntent(intent) => {
             out.push(KIND_NAMESPACE_CREATE_INTENT);
-            encode_namespace_create_intent(&mut out, intent);
+            try_encode_namespace_create_intent(&mut out, intent)?;
         }
         IntentLogEntryKind::PressureFallback => {
             out.push(KIND_PRESSURE_FALLBACK);
@@ -497,9 +501,8 @@ fn encode_intent_log_entry(entry: &IntentLogEntry) -> Vec<u8> {
             out.push(KIND_CRASH_REPLAY_RECONCILE);
         }
     }
-    out
+    Ok(out)
 }
-
 fn decode_intent_log_entry(bytes: &[u8]) -> Result<IntentLogEntry> {
     let mut decoder = Decoder::new("intent log entry", bytes);
     decoder.expect_magic(INTENT_LOG_MAGIC_BYTES)?;
@@ -746,7 +749,7 @@ pub struct LogSpaceStats {
 
 /// Compute the wire-format byte length of an intent log entry *without*
 /// actually allocating a Vec.  Used for byte-pressure accounting.
-fn encoded_entry_len(entry: &IntentLogEntry) -> usize {
+fn try_encoded_entry_len(entry: &IntentLogEntry) -> Result<usize> {
     // Header: magic(8) + version(2) + reserved(2) + entry_id(8) + timestamp_ns(8)
     //        + root_anchor(8+8+8) = 44 bytes
     let mut len: usize = 8 + 2 + 2 + 8 + 8 + 8 + 8 + 8; // 52
@@ -781,7 +784,7 @@ fn encoded_entry_len(entry: &IntentLogEntry) -> usize {
             len += 8; // parent_inode_id
             len += 8 + intent.entry.name.len(); // name length + bytes
             len += 8 + 8 + 4 + 4; // inode_id + generation + kind + mode
-            len += 8 + encode_inode(&intent.inode).len(); // inode payload length + bytes
+            len += 8 + try_encode_inode(&intent.inode)?.len(); // inode payload length + bytes
         }
         IntentLogEntryKind::PressureFallback => {
             len += 1; // kind byte only
@@ -790,9 +793,8 @@ fn encoded_entry_len(entry: &IntentLogEntry) -> usize {
             len += 1; // kind byte only
         }
     }
-    len
+    Ok(len)
 }
-
 /// A fast-path write-ahead log that records mutations with bounded latency.
 ///
 /// The intent log sits in front of the full transaction-root commit path.
@@ -1011,7 +1013,7 @@ impl IntentLog {
                 root_anchor,
                 timestamp_ns,
             };
-            let fallback_bytes = encode_intent_log_entry(&fallback);
+            let fallback_bytes = try_encode_intent_log_entry(&fallback)?;
             if let Some(ref mut log_device) = self.log_device {
                 log_device.append(&fallback_bytes)?;
             }
@@ -1053,11 +1055,11 @@ impl IntentLog {
         };
 
         // Track byte usage without a separate allocation.
-        let entry_len = encoded_entry_len(&entry) as u64;
+        let entry_len = try_encoded_entry_len(&entry)? as u64;
         self.used_bytes = self.used_bytes.saturating_add(entry_len);
 
         // Encode once for both LOG_DEVICE and deferred main-store write.
-        let bytes = encode_intent_log_entry(&entry);
+        let bytes = try_encode_intent_log_entry(&entry)?;
 
         // Write to log device first for fast durable acknowledgment before the
         // batch lands in the main object store.  On crash, log device is
@@ -1123,7 +1125,7 @@ impl IntentLog {
         // into the object store for the group commit.
         for idx in flush_from..flush_to {
             let entry = &self.entries[idx];
-            let bytes = encode_intent_log_entry(entry);
+            let bytes = try_encode_intent_log_entry(entry)?;
             store.put(intent_log_entry_object_key(entry.entry_id), &bytes)?;
         }
 
