@@ -5,8 +5,8 @@
 //! Leverages extent_id indirection (#1191): file->extent_id (extent map, unchanged),
 //! extent_id->physical_shards (locator table, rewritten during conversion).
 //!
-//! Implements the geometry conversion design (#3387).
-//! Canonical design spec:
+//! Implements the geometry conversion source slice (#3387).
+//! Current design pointer:
 //! [`docs/design/online-pool-geometry-conversion.md`].
 //!
 //! # Current scope

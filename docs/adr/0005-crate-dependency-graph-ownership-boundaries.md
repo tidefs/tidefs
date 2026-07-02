@@ -58,14 +58,15 @@ execution), or `daemon` (binary).
   parallel Codex work.
 - The naming convention (`tidefs-<domain>-<layer>`) provides immediate
   navigability for all 177 crates.
-- All 5 categories, 48-layer-1 leaf crates, and dependency invariants are
-  documented in a single source of truth.
+- Current package roles and dependency-surface classification live in
+  `docs/workspace-package-classification.md`; use `cargo metadata` for the
+  live dependency graph.
 - Zero cyclic dependencies confirmed in the current workspace.
 
-Design spec: `docs/design/crate-dependency-graph-ownership-boundaries.md`
 Related:
+  `docs/workspace-package-classification.md`
   `crates/README.md`
 
-The former 11-layer DESIGN issue matrix was deleted as stale historical
-coordination material; git history and GitHub issue/PR lineage retain the
-path for archaeological review.
+Former design-spec and 11-layer issue-matrix prose was stale historical
+coordination material; git history and GitHub issue/PR lineage retain it for
+archaeological review.
