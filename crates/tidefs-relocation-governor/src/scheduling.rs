@@ -921,7 +921,8 @@ mod tests {
     use std::collections::VecDeque;
     use tidefs_background_scheduler::BackgroundScheduler;
     use tidefs_storage_intent_core::{
-        StorageIntentActionBudgetOutcomeRecord, StorageIntentActionClass,
+        StorageIntentActionAbortRollbackRecord, StorageIntentActionBudgetOutcomeRecord,
+        StorageIntentActionClass,
         StorageIntentActionExecutionAdmissionRefs, StorageIntentActionExecutionFlags,
         StorageIntentActionExecutionReplayRecord, StorageIntentActionExecutionStepState,
         StorageIntentActionPublicationBoundaryRecord, StorageIntentActionPublicationState,
@@ -1227,7 +1228,7 @@ mod tests {
                 ),
                 publication_sequence: 1,
             },
-            abort_rollback: Default::default(),
+            abort_rollback: StorageIntentActionAbortRollbackRecord::default(),
             budget: StorageIntentActionBudgetOutcomeRecord {
                 work_bytes: 1024,
                 foreground_disruption_us: 10,
@@ -1501,7 +1502,7 @@ mod tests {
     fn job_kind_from_all_reasons() {
         for reason in &GovernorRelocationReason::ALL {
             let kind = RelocationJobKind::from_reason(*reason);
-            assert!(!format!("{kind}").is_empty());
+            assert!(!kind.to_string().is_empty());
         }
     }
 }
