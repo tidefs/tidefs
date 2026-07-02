@@ -72,6 +72,7 @@ static char mnt_dir[4096];
 
 static void die(const char *msg) {
     fprintf(stderr, "fuse-inode-metadata-test: %s: %s\n", msg, strerror(errno));
+    fflush(stderr);
     exit(1);
 }
 
@@ -101,11 +102,16 @@ int main(int argc, char *argv[]) {
     int refused = 0;
     int failed = 0;
 
-#define PASS(name) do { printf("PASS: %s\n", name); passed++; } while(0)
-#define REFUSAL(name) do { printf("REFUSAL: %s\n", name); refused++; } while(0)
-#define FAIL(name, ...) do { fprintf(stderr, "FAIL: " name "\n", ##__VA_ARGS__); failed++; } while(0)
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    setvbuf(stderr, NULL, _IOLBF, 0);
+
+#define BEGIN(name) do { printf("BEGIN: %s\n", name); fflush(stdout); } while(0)
+#define PASS(name) do { printf("PASS: %s\n", name); fflush(stdout); passed++; } while(0)
+#define REFUSAL(name) do { printf("REFUSAL: %s\n", name); fflush(stdout); refused++; } while(0)
+#define FAIL(name, ...) do { fprintf(stderr, "FAIL: " name "\n", ##__VA_ARGS__); fflush(stderr); failed++; } while(0)
 
     /* ── 1. getattr: retrieve attributes after file creation ── */
+    BEGIN("getattr-clean");
     create_reg("getattr_test.bin");
     make_path("getattr_test.bin");
     if (stat(test_path, &st) < 0) {
@@ -121,6 +127,7 @@ int main(int argc, char *argv[]) {
     }
 
     /* ── 2. setattr-size: change file size via truncate ── */
+    BEGIN("setattr-size-clean");
     create_reg("size_test.bin");
     make_path("size_test.bin");
     if (truncate(test_path, 4096) < 0) {
@@ -134,6 +141,7 @@ int main(int argc, char *argv[]) {
     }
 
     /* ── 3. setattr-mode: change permissions via chmod ── */
+    BEGIN("setattr-mode-clean");
     create_reg("mode_test.bin");
     make_path("mode_test.bin");
     if (chmod(test_path, 0755) < 0) {
@@ -147,6 +155,7 @@ int main(int argc, char *argv[]) {
     }
 
     /* ── 4. setattr-owner: change owner via chown (skip if not root) ── */
+    BEGIN("setattr-owner-clean");
     if (getuid() == 0) {
         create_reg("owner_test.bin");
         make_path("owner_test.bin");
@@ -164,6 +173,7 @@ int main(int argc, char *argv[]) {
     }
 
     /* ── 5. setattr-timestamps: set atime/mtime via utime ── */
+    BEGIN("setattr-timestamps-clean");
     create_reg("timestamps_test.bin");
     make_path("timestamps_test.bin");
     time_t set_time = 1000000000; /* epoch-based deterministic time */
@@ -182,6 +192,7 @@ int main(int argc, char *argv[]) {
     }
 
     /* ── 6. chmod: dedicated chmod path ── */
+    BEGIN("chmod-clean");
     create_reg("chmod_test.bin");
     make_path("chmod_test.bin");
     if (chmod(test_path, 0600) < 0) {
@@ -195,6 +206,7 @@ int main(int argc, char *argv[]) {
     }
 
     /* ── 7. chown: dedicated chown path ── */
+    BEGIN("chown-clean");
     if (getuid() == 0) {
         create_reg("chown_test.bin");
         make_path("chown_test.bin");
@@ -221,6 +233,7 @@ int main(int argc, char *argv[]) {
     }
 
     /* ── 8. utimens: dedicated utimens path ── */
+    BEGIN("utimens-clean");
     create_reg("utimens_test.bin");
     make_path("utimens_test.bin");
     struct timespec ts[2];
@@ -258,6 +271,7 @@ CEOF
     BUSYBOX="${pkgs.busybox}/bin/busybox"
     CPIO="${pkgs.cpio}/bin/cpio"
     XZ_BIN="${pkgs.xz}/bin/xz"
+    TIMEOUT_BIN="${pkgs.coreutils}/bin/timeout"
     KERNEL_IMG="${linuxKernel_7_0}/bzImage"
     MODULE_DIR="${linuxKernel_7_0}/lib/modules/${linuxKernel_7_0.version}"
     DAEMON_BIN="${tidefsPackage}/bin/tidefs-posix-filesystem-adapter-daemon"
@@ -308,7 +322,7 @@ EOF
       exit 2
     fi
 
-    for dep in "$QEMU_BIN" "$BUSYBOX" "$CPIO" "$XZ_BIN" "$KERNEL_IMG" "$DAEMON_BIN" "$METADATA_TEST"; do
+    for dep in "$QEMU_BIN" "$BUSYBOX" "$CPIO" "$XZ_BIN" "$TIMEOUT_BIN" "$KERNEL_IMG" "$DAEMON_BIN" "$METADATA_TEST"; do
       if [ ! -f "$dep" ] && [ ! -x "$dep" ]; then
         echo "ERROR: dependency not found: $dep" >&2
         exit 2
@@ -402,7 +416,8 @@ EOF
 
     copy_binary "$DAEMON_BIN" "$RUN_DIR/bin/tidefs-posix-filesystem-adapter-daemon"
     copy_binary "$METADATA_TEST" "$RUN_DIR/bin/tidefs-fuse-inode-metadata-test"
-    copy_runtime_deps "$BUSYBOX" "$DAEMON_BIN" "$METADATA_TEST"
+    copy_binary "$TIMEOUT_BIN" "$RUN_DIR/bin/timeout"
+    copy_runtime_deps "$BUSYBOX" "$DAEMON_BIN" "$METADATA_TEST" "$TIMEOUT_BIN"
 
     FUSE_KO=""
     for candidate in \
@@ -445,6 +460,7 @@ OBSERVED_ROWS=/tmp/tidefs-validation/observed_rows.txt
 DAEMON_LOG=/tmp/tidefs-validation/daemon.log
 REMOUNT_LOG=/tmp/tidefs-validation/daemon_remount.log
 TEST_LOG=/tmp/tidefs-validation/test.log
+TEST_TIMEOUT=120
 ROOT_LIST=/tmp/tidefs-validation/root_list.txt
 PRE_CRASH_ATTRS=/tmp/tidefs-validation/pre_crash_attrs.txt
 
@@ -544,6 +560,17 @@ show_log_tail() {
         tail -n 80 "$log_path" || true
         echo "--- end $label tail ---"
     fi
+}
+
+last_unfinished_test_row() {
+    candidate=""
+    for row in $(grep '^BEGIN: ' "$TEST_LOG" 2>/dev/null | sed 's/^BEGIN: //'); do
+        if grep -Eq "^(PASS|FAIL|REFUSAL|BLOCKED): $row($| --)" "$TEST_LOG" 2>/dev/null; then
+            continue
+        fi
+        candidate="$row"
+    done
+    echo "$candidate"
 }
 
 finish() {
@@ -707,10 +734,15 @@ fi
 
 echo ""
 echo "--- Phase 2: Inode metadata operations ---"
-if /bin/tidefs-fuse-inode-metadata-test "$MNT" > "$TEST_LOG" 2>&1; then
+TEST_TIMED_OUT=0
+if timeout --foreground --kill-after=5s "$TEST_TIMEOUT" \
+    /bin/tidefs-fuse-inode-metadata-test "$MNT" > "$TEST_LOG" 2>&1; then
     TEST_RC=0
 else
     TEST_RC=$?
+fi
+if [ "$TEST_RC" -eq 124 ] || [ "$TEST_RC" -eq 137 ]; then
+    TEST_TIMED_OUT=1
 fi
 
 while IFS= read -r line; do
@@ -739,6 +771,18 @@ while IFS= read -r line; do
             ;;
     esac
 done < "$TEST_LOG"
+
+if [ "$TEST_TIMED_OUT" -eq 1 ]; then
+    HUNG_ROW="$(last_unfinished_test_row)"
+    [ -n "$HUNG_ROW" ] || HUNG_ROW="getattr-clean"
+    fail "$HUNG_ROW" "metadata helper timed out after ''${TEST_TIMEOUT}s while exercising this row"
+    show_log_tail "$TEST_LOG" "test.log"
+    show_log_tail "$DAEMON_LOG" "daemon.log"
+    emit_unobserved_rows blocked "metadata helper timed out before row execution completed; inspect test and daemon logs"
+    kill "$DAEMON_PID" 2>/dev/null || true
+    umount -l "$MNT" 2>/dev/null || true
+    finish
+fi
 
 if [ "$TEST_RC" -eq 0 ]; then
     pass "metadata_test_exit_zero"
