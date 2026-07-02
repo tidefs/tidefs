@@ -291,9 +291,13 @@ impl VoteDispatchAdapter {
         vote: &RosterChangeVote,
         proposal_hash: &[u8; 32],
     ) -> MembershipDispatchError {
+        let target = proposer.0;
+        let responder = vote.voter_id;
+        let proposal_id = vote.proposal_id;
+        let accepted = vote.accepted;
+
         MembershipDispatchError::HandlerError(format!(
-            "proposal vote delivery {reason}: target={}, responder={}, proposal_id={}, accepted={}, proposal_hash={:?}",
-            proposer.0, vote.voter_id, vote.proposal_id, vote.accepted, proposal_hash
+            "proposal vote delivery {reason}: target={target}, responder={responder}, proposal_id={proposal_id}, accepted={accepted}, proposal_hash={proposal_hash:?}"
         ))
     }
 }
@@ -359,12 +363,8 @@ impl crate::dispatch_router::MembershipMessageHandler for VoteDispatchAdapter {
             };
 
             sender(*proposer, ack_msg).map_err(|err| {
-                Self::vote_delivery_error(
-                    &format!("failed: {err}"),
-                    *proposer,
-                    &vote,
-                    proposal_hash,
-                )
+                let reason = format!("failed: {err}");
+                Self::vote_delivery_error(&reason, *proposer, &vote, proposal_hash)
             })?;
         } else {
             return Err(MembershipDispatchError::HandlerError(
