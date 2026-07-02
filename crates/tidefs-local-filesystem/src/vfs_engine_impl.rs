@@ -3844,11 +3844,15 @@ fn live_admin_hex_to_bytes(value: &str) -> Result<Vec<u8>, String> {
             hex.len()
         ));
     }
-    (0..hex.len())
-        .step_by(2)
-        .map(|i| {
-            u8::from_str_radix(&hex[i..i + 2], 16)
-                .map_err(|err| format!("invalid hex at position {i}: {err}"))
+
+    hex.as_bytes()
+        .chunks(2)
+        .enumerate()
+        .map(|(i, chunk)| {
+            let byte = std::str::from_utf8(chunk)
+                .map_err(|_| format!("invalid UTF-8 in hex string at position {}", i * 2))?;
+            u8::from_str_radix(byte, 16)
+                .map_err(|err| format!("invalid hex at position {}: {err}", i * 2))
         })
         .collect()
 }
@@ -7248,6 +7252,29 @@ mod tests {
                 .as_str()
                 .is_some_and(|err| err.contains("from_root not found")),
             "unknown response should explain root authority failure: {unknown}"
+        );
+        assert!(!output.exists());
+
+        let malformed = live_snapshot_admin(
+            &engine,
+            "send",
+            json!({
+                "output": output.display().to_string(),
+                "format": "vfssend1",
+                "incremental": true,
+                "from_root": "\u{20ac}a",
+            }),
+            true,
+        );
+        assert_eq!(malformed["ok"], false, "malformed response: {malformed}");
+        assert_eq!(malformed["exit_code"], 1);
+        assert!(malformed["json"].is_null());
+        assert!(malformed["text"].is_null());
+        assert!(
+            malformed["error"]
+                .as_str()
+                .is_some_and(|err| err.contains("invalid --from-root")),
+            "malformed response should stay structured for non-ASCII hex: {malformed}"
         );
         assert!(!output.exists());
     }
