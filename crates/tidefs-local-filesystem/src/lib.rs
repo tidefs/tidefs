@@ -386,7 +386,9 @@ use tidefs_background_scheduler::{
 };
 use tidefs_block_allocator::TrimRequest;
 use tidefs_claim_ledger::{ClaimClass, ClaimEntryRecord, ClaimantRef};
-use tidefs_commit_group::{CommitGroupId, CommitGroupRecovery, CommitGroupSync, RootPointer, SyncGate};
+use tidefs_commit_group::{
+    CommitGroupId, CommitGroupRecovery, CommitGroupSync, RootPointer, SyncGate,
+};
 use tidefs_dataset_feature_flags::{FeatureFlags, SupportedFeaturesV1};
 use tidefs_dataset_lifecycle::{
     DatasetCatalog, DatasetFlags, DatasetId, DatasetLifecycle, DatasetType, PoisonNotification,
@@ -3924,7 +3926,6 @@ impl LocalFileSystem {
     pub fn segments_dir(&self) -> &Path {
         self.store.segments_dir()
     }
-
 
     fn mounted_raw_store_diagnostics(&self) -> MountedRawStoreDiagnostics<'_> {
         MountedRawStoreDiagnostics {

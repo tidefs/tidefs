@@ -11039,9 +11039,7 @@ mod tests {
             "whole-file copy should materialize destination chunks"
         );
         assert!(
-            receipt_generations
-                .iter()
-                .all(|generation| *generation > 0),
+            receipt_generations.iter().all(|generation| *generation > 0),
             "whole-file copy chunks must carry durable pool receipt generations"
         );
     }

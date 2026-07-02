@@ -16,9 +16,7 @@
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tidefs_local_filesystem::{
-    LocalFileSystem, RootAuthenticationKey, DEFAULT_FILE_PERMISSIONS,
-};
+use tidefs_local_filesystem::{LocalFileSystem, RootAuthenticationKey, DEFAULT_FILE_PERMISSIONS};
 use tidefs_local_object_store::StoreOptions;
 
 // ── Helpers ──────────────────────────────────────────────────────────────
