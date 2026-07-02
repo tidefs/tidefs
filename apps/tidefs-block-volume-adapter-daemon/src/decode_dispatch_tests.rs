@@ -92,11 +92,7 @@ fn assert_completed(
         entry.completion_class,
         BlockVolumeCompletionClass::Completed
     );
-    assert!(
-        entry.io_cmd.result >= 0,
-        "result must be non-negative, got {}",
-        entry.io_cmd.result
-    );
+    assert_eq!(entry.io_cmd.result, UBLK_IO_RES_OK);
 }
 
 // ── Raw byte decode tests ──────────────────────────────────────────────
@@ -696,7 +692,8 @@ fn raw_decode_read_completion_has_ok_status_and_preserves_tag_and_queue() {
     let desc = desc_from_raw_bytes(&raw);
 
     let result = worker.process_one(&mut image, 77, &desc).expect("read");
-    assert_eq!(result.io_cmd.result, 4096);
+    assert_eq!(result.io_cmd.result, UBLK_IO_RES_OK);
+    assert_eq!(result.byte_count, 4096);
     assert_eq!(result.io_cmd.q_id, qid);
     assert_eq!(result.io_cmd.tag, 77);
     assert_eq!(result.io_cmd.addr_or_zone_append_lba, 0);
@@ -717,7 +714,8 @@ fn raw_decode_write_completion_has_ok_status_and_preserves_tag_and_queue() {
     let result = worker
         .process_one_with_buffers(&mut image, 42, &desc, None, Some(&write_payload))
         .expect("write");
-    assert_eq!(result.io_cmd.result, 4096);
+    assert_eq!(result.io_cmd.result, UBLK_IO_RES_OK);
+    assert_eq!(result.byte_count, 4096);
     assert_eq!(result.io_cmd.q_id, qid);
     assert_eq!(result.io_cmd.tag, 42);
 }
@@ -786,7 +784,7 @@ fn raw_decode_run_bounded_batch_of_read_write_flush_all_complete() {
         report.results[1].completion_class,
         BlockVolumeCompletionClass::Completed
     );
-    assert_eq!(report.results[2].io_cmd.result, 4096);
+    assert_eq!(report.results[2].io_cmd.result, UBLK_IO_RES_OK);
     assert_eq!(
         report.results[2].completion_class,
         BlockVolumeCompletionClass::Completed
@@ -823,7 +821,7 @@ fn raw_decode_run_bounded_mixed_valid_and_malformed_results() {
     assert_eq!(report.error_ops, 2);
     assert_eq!(report.unsupported_ops, 1);
 
-    assert_eq!(report.results[0].io_cmd.result, 4096);
+    assert_eq!(report.results[0].io_cmd.result, UBLK_IO_RES_OK);
     assert_eq!(report.results[1].io_cmd.result, -95); // EOPNOTSUPP
                                                       // Write without buffer correctly errors
     assert!(

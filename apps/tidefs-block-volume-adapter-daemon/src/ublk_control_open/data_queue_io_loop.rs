@@ -1285,7 +1285,7 @@ mod tests {
             io_cmd: UblkSrvIoCmd {
                 q_id: 0,
                 tag: 7,
-                result: i32::try_from(byte_count).unwrap_or(i32::MAX),
+                result: UBLK_IO_RES_OK,
                 addr_or_zone_append_lba: 0,
             },
             byte_count,
