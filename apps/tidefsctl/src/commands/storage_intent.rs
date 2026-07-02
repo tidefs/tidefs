@@ -69,6 +69,10 @@ pub struct StorageIntentExplainArgs {
     #[arg(long = "range", value_name = "START..END")]
     pub range: Option<String>,
 
+    /// Include fail-closed successor/comparator boundary explanation.
+    #[arg(long = "successor-boundary")]
+    pub successor_boundary: bool,
+
     /// Emit machine-parseable JSON.
     #[arg(long = "json")]
     pub json: bool,
@@ -502,6 +506,97 @@ struct PolicySupportReport {
     reason: String,
 }
 
+#[derive(Clone, Copy)]
+struct SuccessorBoundaryFamily {
+    label: &'static str,
+    kind: StorageIntentEvidenceKind,
+}
+
+const SUCCESSOR_BOUNDARY_CLAIM_IDS: &[&str] = &[
+    "storage.local.successor_comparator.v1",
+    "storage.distributed.successor_comparator.v1",
+    "storage.intent.successor_comparator.v1",
+];
+
+const SUCCESSOR_BOUNDARY_REQUIRED_FAMILIES: &[SuccessorBoundaryFamily] = &[
+    SuccessorBoundaryFamily {
+        label: "service-objective",
+        kind: StorageIntentEvidenceKind::ServiceObjectiveEvidence,
+    },
+    SuccessorBoundaryFamily {
+        label: "workload",
+        kind: StorageIntentEvidenceKind::WorkloadEvidence,
+    },
+    SuccessorBoundaryFamily {
+        label: "scheduler-admission",
+        kind: StorageIntentEvidenceKind::SchedulerAdmissionRecord,
+    },
+    SuccessorBoundaryFamily {
+        label: "capacity-admission",
+        kind: StorageIntentEvidenceKind::CapacityAdmissionEvidence,
+    },
+    SuccessorBoundaryFamily {
+        label: "tenant-isolation",
+        kind: StorageIntentEvidenceKind::TenantIsolationEvidence,
+    },
+    SuccessorBoundaryFamily {
+        label: "media-capability",
+        kind: StorageIntentEvidenceKind::MediaCapabilityEvidence,
+    },
+    SuccessorBoundaryFamily {
+        label: "recovery-degradation",
+        kind: StorageIntentEvidenceKind::RecoveryDegradationEvidence,
+    },
+    SuccessorBoundaryFamily {
+        label: "policy-rollout",
+        kind: StorageIntentEvidenceKind::PolicyRolloutEvidence,
+    },
+    SuccessorBoundaryFamily {
+        label: "transport-path",
+        kind: StorageIntentEvidenceKind::TransportPathEvidence,
+    },
+    SuccessorBoundaryFamily {
+        label: "temporal",
+        kind: StorageIntentEvidenceKind::TemporalEvidence,
+    },
+    SuccessorBoundaryFamily {
+        label: "cost-wear",
+        kind: StorageIntentEvidenceKind::MediaCostWearLedger,
+    },
+    SuccessorBoundaryFamily {
+        label: "decision-frontier",
+        kind: StorageIntentEvidenceKind::DecisionFrontierEvidence,
+    },
+    SuccessorBoundaryFamily {
+        label: "action-execution",
+        kind: StorageIntentEvidenceKind::ActionExecutionEvidence,
+    },
+    SuccessorBoundaryFamily {
+        label: "result-refusal",
+        kind: StorageIntentEvidenceKind::ResultRefusalEvidence,
+    },
+    SuccessorBoundaryFamily {
+        label: "measurement-attribution",
+        kind: StorageIntentEvidenceKind::MeasurementAttributionEvidence,
+    },
+    SuccessorBoundaryFamily {
+        label: "comparator",
+        kind: StorageIntentEvidenceKind::ComparatorEvidence,
+    },
+    SuccessorBoundaryFamily {
+        label: "claim-gate",
+        kind: StorageIntentEvidenceKind::ClaimGateEvidence,
+    },
+    SuccessorBoundaryFamily {
+        label: "evidence-retention",
+        kind: StorageIntentEvidenceKind::EvidenceRetentionEvidence,
+    },
+    SuccessorBoundaryFamily {
+        label: "operator-explanation",
+        kind: StorageIntentEvidenceKind::OperatorExplanationProjection,
+    },
+];
+
 pub fn handle_storage_intent(cmd: StorageIntentCommand) {
     match cmd {
         StorageIntentCommand::Explain(args) => handle_explain(args),
@@ -512,7 +607,7 @@ pub fn handle_storage_intent(cmd: StorageIntentCommand) {
 fn handle_explain(args: StorageIntentExplainArgs) {
     let (input, source) = read_input_or_default(&args);
     let subject = subject_from_args(&input.subject, &args);
-    let report = build_report(&input, subject, source);
+    let report = build_report(&input, subject, source, args.successor_boundary);
 
     if args.json {
         match serde_json::to_string_pretty(&report) {
@@ -1646,6 +1741,7 @@ fn build_report(
     input: &StorageIntentExplainInput,
     subject: ExplainSubject,
     input_source: String,
+    include_successor_boundary: bool,
 ) -> ExplainReport {
     let mut report = ExplainReport {
         command: "storage-intent explain",
@@ -1689,6 +1785,9 @@ fn build_report(
         input.prefetch_residency.as_ref(),
         input.relocation.as_ref(),
     );
+    if include_successor_boundary {
+        push_successor_boundary_section(&mut report, input);
+    }
 
     report
 }
@@ -2371,6 +2470,313 @@ fn push_refusal_section(
     }
 }
 
+fn push_successor_boundary_section(report: &mut ExplainReport, input: &StorageIntentExplainInput) {
+    let snapshot = input.query_snapshot.as_ref();
+    let mut facts = vec![
+        "non-claim: this output explains bounded evidence and blockers only; it is not a successor, replacement, superiority, release-readiness, or production-readiness claim"
+            .to_string(),
+        format!(
+            "blocked-claim-ids: {}",
+            comma_or_none(SUCCESSOR_BOUNDARY_CLAIM_IDS.iter().copied())
+        ),
+        "claim-boundary: storage-intent umbrella wording remains blocked until local, distributed, and umbrella claim ids validate with current manifests and a release verdict consumes them"
+            .to_string(),
+    ];
+
+    push_successor_policy_receipt_facts(&mut facts, input);
+    push_successor_degraded_fact(&mut facts, input);
+    push_successor_refusal_fact(&mut facts, input);
+    push_successor_measured_envelope_fact(&mut facts, snapshot, input);
+    push_successor_comparator_limit_fact(&mut facts, snapshot);
+    push_successor_residual_risk_fact(&mut facts, input, snapshot);
+
+    report.sections.push(ExplainSection {
+        name: "successor-boundary-explanation",
+        source: "#849/#913/#920 operator explanation evidence plus validation/claims.toml blocked successor claims",
+        availability: successor_boundary_availability(input),
+        facts,
+    });
+}
+
+fn push_successor_policy_receipt_facts(facts: &mut Vec<String>, input: &StorageIntentExplainInput) {
+    match &input.policy {
+        Some(policy) => facts.push(format!(
+            "policy: supplied revision={} requested-guarantee={} durability-floor={}",
+            policy.revision.0,
+            policy.requested_guarantee.as_str(),
+            policy.durability.min_state.as_str()
+        )),
+        None => facts.push(
+            "policy: missing; requested guarantee and policy scope are not inferred".to_string(),
+        ),
+    }
+
+    if input.receipts.is_empty() {
+        facts.push(
+            "receipts: missing; earned acknowledgment and placement authority remain unknown"
+                .to_string(),
+        );
+    } else {
+        facts.push(format!(
+            "receipts: count={} {}",
+            input.receipts.len(),
+            comma_or_none(
+                input
+                    .receipts
+                    .iter()
+                    .map(|receipt| receipt.ack_class.as_str())
+            )
+        ));
+    }
+}
+
+fn push_successor_degraded_fact(facts: &mut Vec<String>, input: &StorageIntentExplainInput) {
+    let mut states = Vec::new();
+    if let Some(snapshot) = &input.query_snapshot {
+        states.push(format!("evidence-cut={}", snapshot.completeness.as_str()));
+    }
+    if let Some(relocation) = &input.relocation {
+        states.push(format!(
+            "relocation={} reason={} skipped={}",
+            relocation.state.as_str(),
+            relocation.reason.as_str(),
+            relocation.cost_wear.skipped_reason.as_str()
+        ));
+    }
+    let volatile_receipts = input
+        .receipts
+        .iter()
+        .filter(|receipt| {
+            matches!(receipt.durability.state, DurabilityState::Volatile)
+                || matches!(
+                    receipt.media_role,
+                    StorageMediaRole::ScratchVolatile
+                        | StorageMediaRole::ReadCache
+                        | StorageMediaRole::RamCache
+                        | StorageMediaRole::RamVolatileAuthority
+                )
+        })
+        .count();
+    if volatile_receipts > 0 {
+        states.push(format!("volatile-visible-receipts={volatile_receipts}"));
+    }
+
+    if states.is_empty() {
+        facts.push(
+            "degraded-state: no supplied degraded, volatile, relocation, repair, or recovery evidence; absence is not healthy-state proof"
+                .to_string(),
+        );
+    } else {
+        facts.push(format!("degraded-state: {}", states.join(" ")));
+    }
+}
+
+fn push_successor_refusal_fact(facts: &mut Vec<String>, input: &StorageIntentExplainInput) {
+    let mut refusals = Vec::new();
+    for refusal in &input.refusals {
+        refusals.push(refusal.reason.as_str());
+    }
+    if let Some(snapshot) = &input.query_snapshot {
+        if snapshot.refusal != StorageIntentRefusalReason::None {
+            refusals.push(snapshot.refusal.as_str());
+        }
+    }
+    if let Some(decision) = &input.prefetch_residency {
+        if decision.refusal != StorageIntentRefusalReason::None {
+            refusals.push(decision.refusal.as_str());
+        }
+    }
+    if let Some(relocation) = &input.relocation {
+        if relocation.cost_wear.skipped_reason != SkippedMoveReason::None {
+            refusals.push(relocation.cost_wear.skipped_reason.as_str());
+        }
+    }
+
+    if refusals.is_empty() {
+        facts.push(
+            "refusals: missing; no supplied refusal evidence means unknown, not successful"
+                .to_string(),
+        );
+    } else {
+        facts.push(format!(
+            "refusals: count={} {}",
+            refusals.len(),
+            comma_or_none(refusals)
+        ));
+    }
+}
+
+fn push_successor_measured_envelope_fact(
+    facts: &mut Vec<String>,
+    snapshot: Option<&StorageIntentEvidenceQuerySnapshot>,
+    input: &StorageIntentExplainInput,
+) {
+    let Some(snapshot) = snapshot else {
+        facts.push(
+            "measured-envelope: unavailable; no evidence-query snapshot binds workload, topology, media, time, cost, attribution, or comparator scope"
+                .to_string(),
+        );
+        return;
+    };
+
+    let freshness = &snapshot.family_freshness;
+    facts.push(format!(
+        "measured-envelope: subject={} completeness={} freshness-frontier={}ms allowed-staleness={}ms service-objective={} attribution={} temporal={} cost={} comparator={}",
+        snapshot.subject.scope_class.as_str(),
+        snapshot.completeness.as_str(),
+        snapshot.freshness_frontier_ms,
+        snapshot.allowed_staleness_ms,
+        family_status(snapshot, StorageIntentEvidenceKind::ServiceObjectiveEvidence),
+        family_status(snapshot, StorageIntentEvidenceKind::MeasurementAttributionEvidence),
+        family_status(snapshot, StorageIntentEvidenceKind::TemporalEvidence),
+        family_status(snapshot, StorageIntentEvidenceKind::MediaCostWearLedger),
+        family_status(snapshot, StorageIntentEvidenceKind::ComparatorEvidence)
+    ));
+    push_reserve_family_fact(
+        facts,
+        "measured-envelope recovery",
+        freshness,
+        StorageIntentEvidenceKind::RecoveryDegradationEvidence,
+    );
+    push_reserve_family_fact(
+        facts,
+        "measured-envelope result-refusal",
+        freshness,
+        StorageIntentEvidenceKind::ResultRefusalEvidence,
+    );
+    if let Some(read_freshness) = &input.read_freshness {
+        facts.push(format!(
+            "measured-envelope read-freshness: source={} lag={} frontier={}ms evidence={}",
+            read_freshness.source.as_str(),
+            if read_freshness.lag_known {
+                format!("{}ms", read_freshness.geo_lag_ms)
+            } else {
+                "unknown".to_string()
+            },
+            read_freshness.freshness_frontier_ms,
+            evidence_ref(read_freshness.evidence)
+        ));
+    }
+    if let Some(cost_wear) = &input.cost_wear {
+        facts.push(format!(
+            "measured-envelope cost-wear: {}",
+            cost_wear_fact(cost_wear)
+        ));
+    }
+}
+
+fn push_successor_comparator_limit_fact(
+    facts: &mut Vec<String>,
+    snapshot: Option<&StorageIntentEvidenceQuerySnapshot>,
+) {
+    let comparator_state = snapshot
+        .map(|snapshot| family_status(snapshot, StorageIntentEvidenceKind::ComparatorEvidence))
+        .unwrap_or("missing-snapshot");
+    let claim_gate_state = snapshot
+        .map(|snapshot| family_status(snapshot, StorageIntentEvidenceKind::ClaimGateEvidence))
+        .unwrap_or("missing-snapshot");
+    facts.push(format!(
+        "comparator-limits: comparator-evidence={} claim-gate={} incumbent names, row labels, average wins, prototypes, and source-model proofs are not product-language permission",
+        comparator_state, claim_gate_state
+    ));
+}
+
+fn push_successor_residual_risk_fact(
+    facts: &mut Vec<String>,
+    input: &StorageIntentExplainInput,
+    snapshot: Option<&StorageIntentEvidenceQuerySnapshot>,
+) {
+    let missing_families = missing_successor_families(snapshot);
+    let missing_inputs = missing_successor_inputs(input);
+    if missing_families.is_empty() && missing_inputs.is_empty() {
+        facts.push(
+            "residual-risk: required explanation families are fresh in the supplied cut, but successor/comparator claims remain blocked until split claim ids and release verdict validation pass"
+                .to_string(),
+        );
+    } else {
+        if !missing_families.is_empty() {
+            facts.push(format!(
+                "residual-risk: missing-or-nonfresh-families={}",
+                missing_families.join(",")
+            ));
+        }
+        if !missing_inputs.is_empty() {
+            facts.push(format!(
+                "residual-risk: missing-inputs={}",
+                missing_inputs.join(",")
+            ));
+        }
+    }
+}
+
+fn successor_boundary_availability(input: &StorageIntentExplainInput) -> &'static str {
+    let Some(snapshot) = input.query_snapshot.as_ref() else {
+        return "blocked";
+    };
+    if snapshot.refusal != StorageIntentRefusalReason::None {
+        return "refused";
+    }
+    if !successor_inputs_available(input) {
+        return "blocked";
+    }
+    if !missing_successor_families(Some(snapshot)).is_empty() {
+        return "blocked";
+    }
+    match snapshot.completeness.as_str() {
+        "degraded-visible" => "degraded-visible",
+        "partial-admissible" | "complete-for-purpose" => "limited",
+        "refused" => "refused",
+        "unsafe-visible" => "unsafe-visible",
+        _ => "blocked",
+    }
+}
+
+fn successor_inputs_available(input: &StorageIntentExplainInput) -> bool {
+    input.policy.is_some() && !input.receipts.is_empty()
+}
+
+fn missing_successor_inputs(input: &StorageIntentExplainInput) -> Vec<&'static str> {
+    let mut missing = Vec::new();
+    if input.policy.is_none() {
+        missing.push("policy");
+    }
+    if input.receipts.is_empty() {
+        missing.push("receipts");
+    }
+    missing
+}
+
+fn missing_successor_families(
+    snapshot: Option<&StorageIntentEvidenceQuerySnapshot>,
+) -> Vec<&'static str> {
+    let Some(snapshot) = snapshot else {
+        return SUCCESSOR_BOUNDARY_REQUIRED_FAMILIES
+            .iter()
+            .map(|family| family.label)
+            .collect();
+    };
+
+    SUCCESSOR_BOUNDARY_REQUIRED_FAMILIES
+        .iter()
+        .filter_map(|family| {
+            (!snapshot.contains_fresh_authority_family(family.kind)).then_some(family.label)
+        })
+        .collect()
+}
+
+fn family_status(
+    snapshot: &StorageIntentEvidenceQuerySnapshot,
+    kind: StorageIntentEvidenceKind,
+) -> &'static str {
+    if snapshot.contains_fresh_authority_family(kind) {
+        "fresh-authority"
+    } else if snapshot.contains_evidence_kind(kind) {
+        "included-without-fresh-authority"
+    } else {
+        snapshot.family_freshness.state_for_kind(kind).as_str()
+    }
+}
+
 fn push_unavailable(
     report: &mut ExplainReport,
     name: &'static str,
@@ -2722,7 +3128,58 @@ mod tests {
         }
     }
 
-    fn text_for(input: StorageIntentExplainInput) -> String {
+    fn successor_snapshot(
+        completeness: EvidenceCompletenessVerdict,
+    ) -> StorageIntentEvidenceQuerySnapshot {
+        let mut included = StorageIntentEvidenceRefs::EMPTY;
+        let mut freshness = tidefs_storage_intent_core::EvidenceFamilyFreshnessSet::EMPTY;
+        for (index, family) in SUCCESSOR_BOUNDARY_REQUIRED_FAMILIES.iter().enumerate() {
+            let byte = 50 + index as u8;
+            let reference = evidence(family.kind, byte);
+            included.push(reference).unwrap();
+            freshness
+                .push(EvidenceFamilyFreshness {
+                    kind: family.kind,
+                    state: EvidenceFamilyFreshnessState::Fresh,
+                    source_index_generation: byte as u64,
+                    producer_generation: byte as u64,
+                    freshness_frontier_ms: 10_000 + byte as u64,
+                    allowed_staleness_ms: 250,
+                    evidence_ref: reference,
+                })
+                .unwrap();
+        }
+
+        StorageIntentEvidenceQuerySnapshot {
+            snapshot_id: id32(61),
+            query_id: id32(62),
+            consumer: EvidenceConsumerClass::OperatorExplanation,
+            context: EvidenceQueryContextClass::OperatorExplanation,
+            subject: EvidenceQuerySubjectScope {
+                scope_class: EvidenceQuerySubjectScopeClass::Claim,
+                request_ref: evidence(StorageIntentEvidenceKind::ClaimGateEvidence, 63),
+                ..EvidenceQuerySubjectScope::default()
+            },
+            policy_id: StorageIntentPolicyId(id16(7)),
+            policy_revision: StorageIntentPolicyRevision(3),
+            temporal_frontier_ms: 10_000,
+            freshness_frontier_ms: 10_000,
+            allowed_staleness_ms: 250,
+            source_catalog_ref: evidence(StorageIntentEvidenceKind::EvidenceQuerySnapshot, 64),
+            source_index_ref: evidence(StorageIntentEvidenceKind::EvidenceQuerySnapshot, 65),
+            source_index_generation: 6,
+            producer_generation: 7,
+            included_refs: included,
+            family_freshness: freshness,
+            completeness,
+            ..StorageIntentEvidenceQuerySnapshot::default()
+        }
+    }
+
+    fn text_for_with_successor_boundary(
+        input: StorageIntentExplainInput,
+        include_successor_boundary: bool,
+    ) -> String {
         let report = build_report(
             &input,
             ExplainSubject {
@@ -2731,8 +3188,17 @@ mod tests {
                 range: Some("0..4096".to_string()),
             },
             "test".to_string(),
+            include_successor_boundary,
         );
         render_report_text(&report)
+    }
+
+    fn text_for(input: StorageIntentExplainInput) -> String {
+        text_for_with_successor_boundary(input, false)
+    }
+
+    fn text_for_successor(input: StorageIntentExplainInput) -> String {
+        text_for_with_successor_boundary(input, true)
     }
 
     fn policy_set_args(allow: Vec<PolicyActionArg>) -> StorageIntentPolicySetArgs {
@@ -2979,6 +3445,104 @@ mod tests {
         assert!(text.contains("critical-reserve scheduler"));
         assert!(text.contains("critical-reserve transport"));
         assert!(text.contains("critical-reserve wear"));
+    }
+
+    #[test]
+    fn successor_boundary_missing_evidence_fails_closed_and_non_claiming() {
+        let text = text_for_successor(StorageIntentExplainInput::default());
+
+        assert!(text.contains("successor-boundary-explanation [blocked"));
+        assert!(text.contains("non-claim:"));
+        assert!(text.contains("storage.intent.successor_comparator.v1"));
+        assert!(text.contains("policy: missing"));
+        assert!(text.contains("receipts: missing"));
+        assert!(text.contains("refusals: missing"));
+        assert!(text.contains("measured-envelope: unavailable"));
+        assert!(text.contains("residual-risk: missing-or-nonfresh-families="));
+        assert!(text.contains("operator-explanation"));
+    }
+
+    #[test]
+    fn successor_boundary_requires_policy_and_receipts_with_fresh_snapshot() {
+        let text = text_for_successor(StorageIntentExplainInput {
+            query_snapshot: Some(successor_snapshot(
+                EvidenceCompletenessVerdict::CompleteForPurpose,
+            )),
+            ..StorageIntentExplainInput::default()
+        });
+
+        assert!(text.contains("successor-boundary-explanation [blocked"));
+        assert!(text.contains("policy: missing"));
+        assert!(text.contains("receipts: missing"));
+        assert!(text.contains("residual-risk: missing-inputs=policy,receipts"));
+        assert!(!text.contains("residual-risk: required explanation families are fresh"));
+    }
+
+    #[test]
+    fn successor_boundary_reports_refusal_and_degraded_state() {
+        let mut snapshot = successor_snapshot(EvidenceCompletenessVerdict::DegradedVisible);
+        snapshot.refusal = StorageIntentRefusalReason::EvidenceNotUsable;
+        let relocation = RelocationLifecycleRecord {
+            reason: RelocationReasonClass::FlashServingPromotion,
+            state: RelocationLifecycleState::Cooldown,
+            cost_wear: CostWearRecord {
+                skipped_reason: SkippedMoveReason::FlashWearBudgetExceeded,
+                ..CostWearRecord::default()
+            },
+            ..RelocationLifecycleRecord::default()
+        };
+        let text = text_for_successor(StorageIntentExplainInput {
+            policy: Some(policy()),
+            receipts: vec![receipt(
+                StorageIntentGuaranteeClass::VolatileLocal,
+                StorageMediaRole::RamVolatileAuthority,
+                StorageMediaClass::SystemRam,
+                ReadServingSourceClass::Cache,
+            )],
+            query_snapshot: Some(snapshot),
+            refusals: vec![StorageIntentRefusal {
+                policy_id: StorageIntentPolicyId(id16(7)),
+                policy_revision: StorageIntentPolicyRevision(3),
+                attempted_receipt: StorageIntentReceiptId(id16(9)),
+                reason: StorageIntentRefusalReason::GuaranteeFloorNotMet,
+                evidence: evidence(StorageIntentEvidenceKind::ResultRefusalEvidence, 90),
+            }],
+            relocation: Some(relocation),
+            ..StorageIntentExplainInput::default()
+        });
+
+        assert!(text.contains("successor-boundary-explanation [refused"));
+        assert!(text.contains("degraded-state: evidence-cut=degraded-visible"));
+        assert!(text.contains("volatile-visible-receipts=1"));
+        assert!(text.contains("refusals: count=3"));
+        assert!(text.contains("guarantee-floor-not-met"));
+        assert!(text.contains("evidence-not-usable"));
+        assert!(text.contains("flash-wear-budget-exceeded"));
+    }
+
+    #[test]
+    fn successor_boundary_bounded_evidence_remains_non_claiming() {
+        let text = text_for_successor(StorageIntentExplainInput {
+            policy: Some(policy()),
+            receipts: vec![receipt(
+                StorageIntentGuaranteeClass::LocalIntent,
+                StorageMediaRole::PlacementAuthority,
+                StorageMediaClass::NvmeFlash,
+                ReadServingSourceClass::PlacementReceipt,
+            )],
+            query_snapshot: Some(successor_snapshot(
+                EvidenceCompletenessVerdict::CompleteForPurpose,
+            )),
+            ..StorageIntentExplainInput::default()
+        });
+
+        assert!(text.contains("successor-boundary-explanation [limited"));
+        assert!(text.contains("measured-envelope: subject=claim completeness=complete-for-purpose"));
+        assert!(text.contains("comparator-evidence=fresh-authority"));
+        assert!(text.contains("claim-gate=fresh-authority"));
+        assert!(text.contains("residual-risk: required explanation families are fresh"));
+        assert!(text.contains("successor/comparator claims remain blocked"));
+        assert!(!text.contains("successor-boundary-explanation [available"));
     }
 
     #[test]
