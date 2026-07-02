@@ -1,14 +1,20 @@
 # tidefs-cluster
 
-Deterministic cluster membership lease transitions with BLAKE3-verified state
-integrity for multi-node validation.
+Cluster membership lease and state-transfer crate: deterministic
+`LeaseStateMachine`, BLAKE3-verified protocol messages, and
+`ClusterLeaseRuntime` coordination for the storage-node daemon.
+
+This is a crate-local API note, not a distributed product claim.
+Distributed placement receipt, rebuild, reclaim, RDMA, replacement-node
+orchestration, cluster-state convergence, and production readiness
+remain blocked behind the authority gates tracked by #18, #1745,
+#1795, and `validation/claims.toml`.
 
 ## Membership Lease Transitions
 
-Each cluster member drives a `LeaseStateMachine` to manage its membership
-slot lease. The machine is deliberately small and deterministic: every state
-transition produces a new BLAKE3-256 digest covering the full machine state,
-enabling peer verification without relying on wall-clock trust.
+`LeaseStateMachine` manages a membership slot lease. Every state transition
+produces a BLAKE3-256 digest covering the full machine state, enabling
+digest-based integrity verification.
 
 ### State diagram
 
@@ -84,8 +90,7 @@ Nine message types cover the full lease lifecycle:
 ## Runtime
 
 `ClusterLeaseRuntime` coordinates the state machine with transport-layer
-message exchange and epoch transition events. It is designed to be embedded
-in a node's main event loop.
+message exchange and epoch transition events.
 
 ### Configuration
 
@@ -111,7 +116,6 @@ in a node's main event loop.
 - `active_backfill_count()` — count of in-flight backfills
 - `backfill_pending_objects()` — total objects not yet transferred
 
-
 ## Integration Points
 
 - **tidefs-transport**: Protocol messages are sent/received over established
@@ -120,55 +124,17 @@ in a node's main event loop.
 - **tidefs-membership-live**: Epoch transition events trigger lease
   renegotiation via `ClusterLeaseRuntime::on_epoch_transition()`.
 
-## Validation
-
-```sh
-cargo test -p tidefs-cluster
-```
-
-Tests cover all state transitions, expiry, duplicate rejection, concurrent
-isolation (3 simulated peers), epoch-boundary renegotiation, BLAKE3 digest
-determinism, and protocol message encoding/decoding with digest verification.
-
 ## Placement Transfer
 
-The placement transfer coordinator bridges placement plans to transport-layer
-data movement, moving data ownership between nodes in the deterministic
-multi-node harness.
-
-### Transfer lifecycle
-
-```
-Idle ──open()──> Planning ──initiate()──> Initiating
-                                                │
-                                         ┌──────┘
-                                         v
-                                   Transferring ──complete()──> Confirm
-                                        │                          │
-                                   abort()                   finalize()
-                                        │                          │
-                                        v                          v
-                                     Aborted                   Complete
-```
-
-### States
-
-| State | Description |
-|---|---|
-| `Idle` | No transfer in progress |
-| `Planning` | Transfer plan is being built from placement diffs |
-| `Initiating` | Initiate message sent to source; awaiting acknowledgement |
-| `Transferring` | Data chunks streaming from source to destination |
-| `Confirming` | Transfer complete; final confirmation pending |
-| `Complete` | Transfer finished successfully |
-| `Failed` | Transfer failed and was rolled back |
-| `Aborted` | Transfer was explicitly aborted |
+The `placement_transfer` module moves object data from source nodes to
+destination nodes using the transport transfer control protocol.
 
 ### Core types
 
-- **TransferPlan**: A placement diff identifying source nodes, destination
-  nodes, and object ranges to move. Supports construction from placement-runtime
-  transfer tickets via `from_entries()` and merging with `merge()`.
+- **MemberReplicaObjectRange**: A descriptor specifying source and destination
+  member IDs plus the object ranges to move. Supports construction from
+  placement-runtime transfer tickets via `from_entries()` and merging with
+  `merge()`.
 - **TransferSession**: Per-transfer state tracking with progress counters,
   retry hooks, and epoch-bound validation.
 - **PlacementTransferCoordinator**: Drives the transfer lifecycle, owns
@@ -179,8 +145,7 @@ Idle ──open()──> Planning ──initiate()──> Initiating
 
 Transfers are epoch-bounded: a session is only valid within the epoch it was
 opened under. Epoch transitions abort in-flight transfers via
-`on_epoch_transition()`. Source nodes must hold an active lease (Held or
-Renewing) to serve data during transfer.
+`on_epoch_transition()`.
 
 ### Transport integration
 
@@ -194,10 +159,6 @@ Transfer control messages are exchanged over the transport layer:
 | `TransferAbort` | 0x44 | Abort transfer and release resources |
 | `TransferChunk` | 0x45 | Data payload chunk from source to destination |
 
-Node-to-node authenticity and integrity are provided by the transport/session
-security boundary.
-
-
 ### Validation
 
 ```sh
@@ -206,9 +167,8 @@ cargo test -p tidefs-cluster -- placement_transfer
 
 ## Rebuild Backfill
 
-The rebuild backfill initiator bridges rebuild-planner outputs to transport
-state-transfer commands, making node/device loss recovery observable in the
-userspace cluster harness.
+The rebuild backfill initiator consumes rebuild-planner outputs and
+dispatches transport state-transfer commands for per-object recovery.
 
 ### Backfill lifecycle
 
@@ -248,8 +208,8 @@ Idle ──open()──> Planning ──initiate()──> Initiating
   node sets and priority ordering.
 - **BackfillBatch**: Groups `BackfillCommand`s destined for a single target
   member, enabling grouped dispatch and progress tracking.
-- **BackfillCommand**: A source→target data movement for a set of object IDs.
-  Maps directly to a transport `StateTransferRequest`.
+- **BackfillCommand**: A source-to-target data movement for a set of object
+  IDs. Maps directly to a transport `StateTransferRequest`.
 - **BackfillSession**: Per-backfill progress tracking with retry hooks and
   epoch-bound validation.
 - **RebuildBackfillInitiator**: Drives the backfill lifecycle, owns session
@@ -258,17 +218,16 @@ Idle ──open()──> Planning ──initiate()──> Initiating
 
 ### Plan partitioning
 
-The initiator partitions a rebuild plan by target member: for each target node
-across all reconstruction tasks, tasks are grouped by source node. One
+The initiator partitions a rebuild plan by target member: for each target
+node across all reconstruction tasks, tasks are grouped by source node. One
 `BackfillCommand` is created per (source, target) pair carrying the relevant
 object IDs. Tasks with no viable sources are silently skipped.
 
 ### Epoch bounding
 
 Backfills are epoch-bounded: a session is only valid within the epoch it was
-opened under. Epoch transitions (via `on_epoch_transition()`) abort all active
-backfills. Source nodes must hold an active lease (Held or Renewing) to serve
-backfill data, enforced via `validate_epoch_and_sources()`.
+opened under. Epoch transitions (via `on_epoch_transition()`) abort all
+active backfills.
 
 ### Transport integration
 
