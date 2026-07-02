@@ -439,7 +439,7 @@ A-register finding:
 | Local unprivileged process (cold storage) | At-rest encryption (3.1) | Source-level |
 | Local unprivileged process (running mount) | Not covered | Requires kernel page-cache isolation |
 | Compromised node (key extraction) | Secret handle/key lease (3.4), zeroization (3.6) | Type boundary; runtime pending |
-| Supply-chain adversary | Unsafe-code inventory, focused boundary docs, lockfile policy (#6493) | Partial |
+| Supply-chain adversary | Unsafe-code inventory, focused boundary docs, `Cargo.lock`/`flake.lock` pins, `deny.toml`, dependency CI | Partial |
 | Metadata tampering | BLAKE3 integrity (3.13), committed-root chains | T1 (cargo) |
 | Audit trail forgery | Not covered | #6490 (design-level) |
 
