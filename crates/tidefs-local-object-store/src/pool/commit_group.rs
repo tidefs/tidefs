@@ -1,13 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
-//! Canonical commit ordering and multi-phase commit_group state machine.
+//! Local object-store commit_group lifecycle and dirty-state accounting.
 //!
-//! Implements the design specified in
-//! `docs/design/canonical-commit-ordering-commit_group-state-machine.md` (#1267).
-//!
-//! The commit_group state machine provides the write-path durability contract:
-//! a pointer is never persisted before what it points to. It implements
-//! a three-phase lifecycle (OPEN → QUIESCE → SYNC → OPEN) with four-tier
-//! auto-sync triggers and back-pressure throttling.
+//! [`CommitGroupManager`] batches mutations into an OPEN -> QUIESCE -> SYNC
+//! lifecycle, tracks dirty metadata/data by segment-store family, and classifies
+//! explicit, threshold, and back-pressure triggers for the sync path. The public
+//! types in this module are the source-owned description of the commit_group
+//! state machine used by the pool.
 
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};

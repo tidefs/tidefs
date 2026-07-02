@@ -9,9 +9,9 @@
 //! Adaptive subsystems (prefetch, recordsize, ARC, scheduler) can
 //! consume the materialized [`WorkloadStats`] to tune their behavior.
 //!
-//! # Design doc
-//!
-//! `docs/design/workload-signature-materialization.md` (#1262)
+//! Use [`WorkloadMaterializer`] or [`WorkloadClassifier`] to feed observations
+//! and consume the current [`WorkloadStats`] snapshot; [`WorkloadSignature`]
+//! provides the stable labels exposed by the crate.
 //!
 //! # Quick start
 //!
