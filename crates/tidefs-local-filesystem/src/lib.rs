@@ -3925,15 +3925,6 @@ impl LocalFileSystem {
         self.store.segments_dir()
     }
 
-    /// Temporary mounted raw-store bypass retained for the remaining POSIX
-    /// diagnostic caller that reads the committed root pointer.  New callers
-    /// should use [`committed_root_pointer`](Self::committed_root_pointer) or
-    /// the other typed diagnostic projections instead.  Mounted device-level
-    /// compression and encryption remain blocked while this raw-store escape
-    /// hatch is present.
-    pub fn object_store(&self) -> &LocalObjectStore {
-        self.store.raw_primary_store()
-    }
 
     fn mounted_raw_store_diagnostics(&self) -> MountedRawStoreDiagnostics<'_> {
         MountedRawStoreDiagnostics {

@@ -377,7 +377,7 @@ fn mount_vfs(config: MountVfsConfig) -> Result<(), String> {
         // Validate the committed root discovered during pool import via
         // BLAKE3 domain-separated chain verification.
         {
-            let committed_root = lfs.object_store().txg_manager().committed_root();
+            let committed_root = lfs.committed_root_pointer();
             if committed_root.commit_group_id.is_valid() {
                 let root_path = config.store_root.join("tidefs-committed-root");
                 let chain_digest = std::fs::read(&root_path)
