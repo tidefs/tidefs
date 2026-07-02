@@ -440,14 +440,14 @@ fn unified_acl_named_group_with_mask() {
             id: 0,
         },
         PosixAclEntry {
-            tag: ACL_GROUP,
-            perm: 6,
-            id: 500,
-        },
-        PosixAclEntry {
             tag: ACL_GROUP_OBJ,
             perm: 0,
             id: 0,
+        },
+        PosixAclEntry {
+            tag: ACL_GROUP,
+            perm: 6,
+            id: 500,
         },
         PosixAclEntry {
             tag: ACL_MASK,

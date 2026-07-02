@@ -4,9 +4,10 @@ Historical issue: Forgejo #6489
 Current authority: `docs/OPERATOR_UAPI_AUTHORITY.md` and the checked
 `tidefsctl` command classification/admission tables.
 
-The boundary is documented and the LocalOnlyGuard is source-integrated; runtime
-enforcement of remote authz is deferred to cluster operator path
-completion.
+The boundary is documented and the LocalOnlyGuard is source-integrated.
+`tidefs-auth` now also owns a bounded remote privileged-action decision/audit
+primitive, but runtime handler enforcement of remote authz remains deferred to
+cluster operator path completion.
 
 ## Posture
 
@@ -19,8 +20,12 @@ to execute in a remote, proxied, or cluster-routed context.
 When TideFS gains full multi-node cluster operation with remote operator
 access, privileged actions will be gated through the source-owned authorization
 pipeline (Principal, RoleBinding, AuthorizationRequest, AuthorizationDecision,
-AuditLog). Until that path is product-grade, the local-only guard prevents
-ambiguous operation.
+AuditLog). The current remote primitive can produce fail-closed decisions and
+audit records for allow, deny, missing identity, missing capability,
+stale/invalid policy, and unavailable/refusing owner states. Until the
+transport/session/live-owner path is product-grade and explicit remote context
+is passed into privileged handlers, the local-only guard prevents ambiguous
+operation.
 
 ## Privileged Action Classification
 
@@ -159,15 +164,16 @@ let _guard = LocalOnlyGuard::new("pool create")
 When either check fails, the guard returns `LocalOnlyError`, blocking the
 privileged operation.
 
-## Source-Owned Authorization Pipeline (Future)
+## Source-Owned Authorization Pipeline
 
-When cluster-routed operator access is product-grade, the current
-`LocalOnlyGuard` will be replaced by the full `tidefs-auth` pipeline:
+When cluster-routed operator access is product-grade, privileged handlers will
+use the full `tidefs-auth` pipeline instead of bare `LocalOnlyGuard`:
 
 1. **Principal resolution** — `resolve_principal_from_presented_credential_chain()`
    maps the caller's credentials to a `Principal` with class, roles, and
    node binding.
-   binds the principal to a short-lived session with a `SessionToken`.
+2. **Session binding** — authenticated session material such as a
+   `SessionToken` binds the principal to a short-lived session id.
 3. **Authorization request** — an `AuthorizationRequest` is constructed with
    the principal, session_id, ActionClass, and resource ScopeSelector.
 4. **Decision** — `derive_authorization_decision_for_request()` evaluates
@@ -176,13 +182,17 @@ When cluster-routed operator access is product-grade, the current
 5. **Audit** — `append_audit_event_and_seal_chain_if_needed()` records the
    decision in the audit log with chain sealing.
 
-This pipeline is already implemented in `tidefs-auth` but is not yet wired
-to any CLI/API privileged action paths. Wiring it requires:
+The record-level pipeline and a remote privileged-action decision/audit helper
+are implemented in `tidefs-auth`, but they are not yet wired to any CLI/API
+privileged action handlers as a remote control path. Wiring handler execution
+requires:
 - A cluster transport path that can route operator requests to the pool owner
   node
 - A session establishment path that provides `AuthenticatedPeer` identity
 - An admin peer set configuration for `admin_access_check()`
 - Integration of the authorization decision into each privileged handler
+  with explicit remote authorization evidence; otherwise handlers remain
+  local-only by default
 
 ## Related Documents
 
@@ -228,6 +238,12 @@ to any CLI/API privileged action paths. Wiring it requires:
 - `apps/tidefsctl/src/commands/authz.rs` — shared command admission helper
   with guard/classification tests for privileged and unguarded command
   surfaces.
+- `tidefs-auth::authorize_remote_privileged_action()` — source-owned helper
+  that evaluates authenticated principal/session/scope/policy/owner evidence,
+  records allow and deny decisions into the audit log, and fails closed for
+  missing identity, missing session, missing capability, missing/stale/invalid
+  policy, and unavailable/refusing owner states. This does not make a CLI/API
+  handler remote-capable by itself.
 - `tidefsctl pool create/import/export/destroy/set`,
   `device remove`, `snapshot create/destroy/rollback/send/receive`,
   `snapshot clone create/delete/promote`,
@@ -246,6 +262,7 @@ to any CLI/API privileged action paths. Wiring it requires:
 - Keep new `tidefsctl` public operator commands wired through
   `apps/tidefsctl/src/commands/authz.rs` so every command has an explicit
   guarded or unguarded admission decision.
-- Replace the local-only guard with the full source-owned authorization pipeline only
-  after the cluster operator path has product-grade principal, session,
-  transport, admin peer, authorization, and audit behavior.
+- Replace the local-only guard at privileged handlers with the full
+  source-owned authorization pipeline only after the cluster operator path has
+  product-grade principal, session, transport, admin peer, authorization, and
+  audit behavior.

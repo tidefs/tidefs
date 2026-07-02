@@ -4,6 +4,9 @@
 #[cfg(test)]
 use crate::commands::classification::COMMAND_SURFACES;
 use tidefs_auth::local_only::{LocalOnlyError, LocalOnlyGuard};
+use tidefs_auth::{
+    AuthorizationOutcome, RemotePrivilegedAuthorizationEvidence, RemotePrivilegedRefusalReason,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CommandAdmission {
@@ -23,6 +26,60 @@ impl CommandAdmission {
             Self::LocalOnly => "local-only",
             Self::LocalOnlyWhenMutating => "local-only-when-mutating",
             Self::Unguarded => "unguarded",
+        }
+    }
+}
+
+pub(crate) enum PrivilegedAdmission<'a> {
+    LocalOnly(LocalOnlyGuard),
+    Remote(RemotePrivilegedAdmission<'a>),
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RemotePrivilegedAdmission<'a> {
+    pub(crate) evidence: &'a RemotePrivilegedAuthorizationEvidence,
+}
+
+impl RemotePrivilegedAdmission<'_> {
+    #[cfg(test)]
+    pub(crate) const fn evidence(&self) -> &RemotePrivilegedAuthorizationEvidence {
+        self.evidence
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum RemoteAdmissionRefusal {
+    MissingRemoteAuthorizationContext,
+    MissingAuditRecord,
+    CommandNotPrivileged {
+        command: &'static str,
+    },
+    CommandMismatch {
+        expected: &'static str,
+        got: String,
+    },
+    DecisionDenied {
+        reason: RemotePrivilegedRefusalReason,
+    },
+}
+
+impl std::fmt::Display for RemoteAdmissionRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingRemoteAuthorizationContext => {
+                write!(f, "missing remote authorization context")
+            }
+            Self::MissingAuditRecord => write!(f, "missing remote authorization audit record"),
+            Self::CommandNotPrivileged { command } => {
+                write!(f, "`{command}` is not a privileged admission entry")
+            }
+            Self::CommandMismatch { expected, got } => {
+                write!(
+                    f,
+                    "remote authorization is for `{got}`, expected `{expected}`"
+                )
+            }
+            Self::DecisionDenied { reason } => write!(f, "{reason}"),
         }
     }
 }
@@ -151,7 +208,72 @@ pub(crate) fn require_local_only(command: &'static str) -> LocalOnlyGuard {
         ),
         "missing local-only admission for privileged command {command}"
     );
+    match require_privileged_admission(command, None) {
+        PrivilegedAdmission::LocalOnly(guard) => guard,
+        PrivilegedAdmission::Remote(remote) => unreachable!(
+            "remote context for {} was supplied unexpectedly",
+            remote.evidence.command
+        ),
+    }
+}
+
+fn require_local_only_guard(command: &'static str) -> LocalOnlyGuard {
     LocalOnlyGuard::new(command).unwrap_or_else(|err| refuse(command, err))
+}
+
+pub(crate) fn require_privileged_admission<'a>(
+    command: &'static str,
+    remote_authorization: Option<&'a RemotePrivilegedAuthorizationEvidence>,
+) -> PrivilegedAdmission<'a> {
+    if let Some(evidence) = remote_authorization {
+        match remote_privileged_admission(command, Some(evidence)) {
+            Ok(admission) => PrivilegedAdmission::Remote(admission),
+            Err(err) => refuse_remote(command, err),
+        }
+    } else {
+        PrivilegedAdmission::LocalOnly(require_local_only_guard(command))
+    }
+}
+
+pub(crate) fn remote_privileged_admission<'a>(
+    command: &'static str,
+    remote_authorization: Option<&'a RemotePrivilegedAuthorizationEvidence>,
+) -> Result<RemotePrivilegedAdmission<'a>, RemoteAdmissionRefusal> {
+    if !matches!(
+        command_admission(command),
+        Some(CommandAdmission::LocalOnly | CommandAdmission::LocalOnlyWhenMutating)
+    ) {
+        return Err(RemoteAdmissionRefusal::CommandNotPrivileged { command });
+    }
+
+    let evidence =
+        remote_authorization.ok_or(RemoteAdmissionRefusal::MissingRemoteAuthorizationContext)?;
+
+    if evidence.command != command {
+        return Err(RemoteAdmissionRefusal::CommandMismatch {
+            expected: command,
+            got: evidence.command.clone(),
+        });
+    }
+
+    if evidence.audit_event_id.0 == 0 {
+        return Err(RemoteAdmissionRefusal::MissingAuditRecord);
+    }
+
+    match &evidence.decision.outcome {
+        AuthorizationOutcome::Allowed | AuthorizationOutcome::AllowedWithOverride { .. }
+            if evidence.refusal.is_none() =>
+        {
+            Ok(RemotePrivilegedAdmission { evidence })
+        }
+        _ => Err(RemoteAdmissionRefusal::DecisionDenied {
+            reason: evidence.refusal.clone().unwrap_or_else(|| {
+                RemotePrivilegedRefusalReason::AuthorizationDenied {
+                    reason: "remote authorization decision denied".into(),
+                }
+            }),
+        }),
+    }
 }
 
 pub(crate) fn require_local_only_when_mutating(
@@ -170,10 +292,46 @@ fn refuse(command: &'static str, err: LocalOnlyError) -> ! {
     std::process::exit(1);
 }
 
+fn refuse_remote(command: &'static str, err: RemoteAdmissionRefusal) -> ! {
+    eprintln!("tidefsctl {command}: remote authorization refused: {err}");
+    std::process::exit(1);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::commands::classification::CommandClass;
+    use tidefs_auth::{
+        ActionClass, AuditEventId, AuthorizationDecision, AuthorizationRequest, Principal,
+        PrincipalClass, PrincipalId, ScopeSelector,
+    };
+
+    fn allowed_remote_evidence(command: &str) -> RemotePrivilegedAuthorizationEvidence {
+        let principal = Principal::new(
+            PrincipalId::new(7),
+            PrincipalClass::HumanOperator,
+            11,
+            Vec::new(),
+        );
+        RemotePrivilegedAuthorizationEvidence {
+            command: command.into(),
+            decision: AuthorizationDecision {
+                request: AuthorizationRequest::new(
+                    principal,
+                    44,
+                    ActionClass::Publish,
+                    ScopeSelector::All,
+                ),
+                outcome: AuthorizationOutcome::Allowed,
+                matched_roles: vec!["operator".into()],
+                decided_at_millis: 123,
+                decider_node_id: 9,
+            },
+            audit_event_id: AuditEventId::new(1),
+            chain_anchor: None,
+            refusal: None,
+        }
+    }
 
     #[test]
     fn issue_239_privileged_commands_require_local_only() {
@@ -357,6 +515,75 @@ mod tests {
                 surface.path
             );
         }
+    }
+
+    #[test]
+    fn remote_privileged_admission_requires_explicit_context() {
+        assert_eq!(
+            remote_privileged_admission("pool destroy", None).unwrap_err(),
+            RemoteAdmissionRefusal::MissingRemoteAuthorizationContext
+        );
+    }
+
+    #[test]
+    fn remote_privileged_admission_rejects_missing_audit_record() {
+        let mut evidence = allowed_remote_evidence("pool destroy");
+        evidence.audit_event_id = AuditEventId::new(0);
+
+        assert_eq!(
+            remote_privileged_admission("pool destroy", Some(&evidence)).unwrap_err(),
+            RemoteAdmissionRefusal::MissingAuditRecord
+        );
+    }
+
+    #[test]
+    fn remote_privileged_admission_rejects_unguarded_command() {
+        let evidence = allowed_remote_evidence("pool status");
+
+        assert_eq!(
+            remote_privileged_admission("pool status", Some(&evidence)).unwrap_err(),
+            RemoteAdmissionRefusal::CommandNotPrivileged {
+                command: "pool status"
+            }
+        );
+    }
+
+    #[test]
+    fn remote_privileged_admission_rejects_mismatched_command() {
+        let evidence = allowed_remote_evidence("pool export");
+
+        assert_eq!(
+            remote_privileged_admission("pool destroy", Some(&evidence)).unwrap_err(),
+            RemoteAdmissionRefusal::CommandMismatch {
+                expected: "pool destroy",
+                got: "pool export".into()
+            }
+        );
+    }
+
+    #[test]
+    fn remote_privileged_admission_rejects_denied_decision() {
+        let mut evidence = allowed_remote_evidence("pool destroy");
+        let reason = RemotePrivilegedRefusalReason::MissingCapability {
+            capability: "publish".into(),
+        };
+        evidence.decision.outcome = AuthorizationOutcome::Denied(reason.to_string());
+        evidence.refusal = Some(reason.clone());
+
+        assert_eq!(
+            remote_privileged_admission("pool destroy", Some(&evidence)).unwrap_err(),
+            RemoteAdmissionRefusal::DecisionDenied { reason }
+        );
+    }
+
+    #[test]
+    fn remote_privileged_admission_accepts_allowed_audited_decision() {
+        let evidence = allowed_remote_evidence("pool destroy");
+        let admission =
+            remote_privileged_admission("pool destroy", Some(&evidence)).expect("admission");
+
+        assert_eq!(admission.evidence().audit_event_id, AuditEventId::new(1));
+        assert!(admission.evidence().is_allowed());
     }
 
     #[test]
