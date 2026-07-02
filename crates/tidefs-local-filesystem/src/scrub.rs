@@ -709,7 +709,7 @@ mod tests {
     fn scrub_empty_filesystem_is_clean() {
         let (root, fs) = temp_fs();
         let _cleanup = Cleanup(Some(root));
-        let report = scrub_inodes_content(fs.store_ref(), fs.inode_records()).expect("scrub");
+        let report = fs.scrub_mounted_content_for_test().expect("scrub");
         assert!(report.is_clean());
         assert_eq!(report.blocks_scanned, 0);
         assert_eq!(report.blocks_clean, 0);
@@ -722,10 +722,12 @@ mod tests {
         fs.create_file("/test.txt", 0o644).expect("create");
         fs.write_file("/test.txt", 0, b"hello world")
             .expect("write");
-        fs.flush_all_write_buffers().expect("flush writes");
+        fs.sync_all().expect("sync scrub test content");
 
         let inodes = fs.inode_records();
-        let report = scrub_inodes_content(fs.store_ref(), inodes).expect("scrub");
+        let report = fs
+            .scrub_mounted_content_records_for_test(inodes)
+            .expect("scrub");
         assert!(report.is_clean());
         assert!(report.blocks_scanned > 0);
         assert_eq!(report.blocks_corrupt, 0);
@@ -739,10 +741,12 @@ mod tests {
         // Write enough data to span multiple chunks (chunk size = 2048)
         let data = vec![0xAB; 5000];
         fs.write_file("/big.bin", 0, &data).expect("write");
-        fs.flush_all_write_buffers().expect("flush writes");
+        fs.sync_all().expect("sync scrub test content");
 
         let inodes = fs.inode_records();
-        let report = scrub_inodes_content(fs.store_ref(), inodes).expect("scrub");
+        let report = fs
+            .scrub_mounted_content_records_for_test(inodes)
+            .expect("scrub");
         assert!(report.is_clean());
         assert!(
             report.blocks_scanned > 1,
@@ -777,10 +781,12 @@ mod tests {
         fs.write_file("/a.txt", 0, b"file a").expect("write");
         fs.create_file("/b.txt", 0o644).expect("create");
         fs.write_file("/b.txt", 0, b"file b").expect("write");
-        fs.flush_all_write_buffers().expect("flush writes");
+        fs.sync_all().expect("sync scrub test content");
 
         let inodes = fs.inode_records();
-        let report = scrub_inodes_content(fs.store_ref(), inodes).expect("scrub");
+        let report = fs
+            .scrub_mounted_content_records_for_test(inodes)
+            .expect("scrub");
         assert!(report.is_clean());
         assert!(report.blocks_scanned >= 2);
     }
@@ -792,7 +798,9 @@ mod tests {
         fs.create_file("/empty.txt", 0o644).expect("create");
 
         let inodes = fs.inode_records();
-        let report = scrub_inodes_content(fs.store_ref(), inodes).expect("scrub");
+        let report = fs
+            .scrub_mounted_content_records_for_test(inodes)
+            .expect("scrub");
         assert!(report.is_clean());
         assert_eq!(report.blocks_scanned, 0);
     }
@@ -805,25 +813,25 @@ mod tests {
     }
 
     #[test]
-    fn scrub_report_records_chunk_plaintext_and_checksum_evidence() {
+    fn scrub_report_records_committed_plaintext_and_checksum_evidence() {
         let (_root, mut fs) = temp_fs();
         let _cleanup = Cleanup(Some(_root));
-        fs.create_file("/inline.txt", 0o644).expect("create");
-        fs.write_file("/inline.txt", 0, b"inline scrub evidence")
+        fs.create_file("/committed.txt", 0o644).expect("create");
+        fs.write_file("/committed.txt", 0, b"inline scrub evidence")
             .expect("write");
-        fs.flush_all_write_buffers().expect("flush writes");
+        fs.sync_all().expect("sync scrub test content");
 
-        let report = scrub_inodes_content(fs.store_ref(), fs.inode_records()).expect("scrub");
+        let report = fs.scrub_mounted_content_for_test().expect("scrub");
         let evidence = report
             .block_evidence
             .values()
             .find(|entry| {
                 matches!(
                     entry.plaintext_identity.block_id.kind,
-                    ScrubBlockKind::ContentChunk { .. }
+                    ScrubBlockKind::ContentChunk { chunk_index: 0 }
                 )
             })
-            .expect("chunk evidence");
+            .expect("committed content evidence");
 
         assert_eq!(evidence.plaintext_identity.expected_plaintext_len, 21);
         assert_eq!(evidence.plaintext_identity.observed_plaintext_len, Some(21));
@@ -970,7 +978,9 @@ mod tests {
 
         // Read back through scrub
         let inodes = fs.inode_records();
-        let report = scrub_inodes_content(fs.store_ref(), inodes).expect("scrub");
+        let report = fs
+            .scrub_mounted_content_records_for_test(inodes)
+            .expect("scrub");
         assert!(report.is_clean());
         assert_eq!(report.blocks_corrupt, 0);
     }
@@ -988,7 +998,7 @@ mod tests {
             placement_receipt_generation: 0,
         };
         let record = test_file_record(999, 1, 100);
-        let outcome = scrub_content_chunk(fs.store_ref(), record.inode_id, &record, &chunk_ref);
+        let outcome = fs.scrub_content_chunk_for_test(&record, &chunk_ref);
         match outcome {
             ScrubBlockOutcome::Unreadable(_) => {} // expected
             other => panic!("expected Unreadable, got {other:?}"),

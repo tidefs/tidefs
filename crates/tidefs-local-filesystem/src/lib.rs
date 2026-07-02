@@ -398,7 +398,8 @@ use tidefs_local_object_store::{
     device_layout::DeviceMediaClass, CompressionConfig, CrashInjectionPoint, DeviceBacking,
     DeviceClass, DeviceConfig, DeviceIoClass, DeviceKind, EncryptionConfig, IntegrityDigest64,
     IoClass, LocalObjectStore, ObjectKey, ObjectLocation, Pool, PoolConfig, PoolProperties,
-    StoreEncryptionKey, StoreError, StoreOptions, DEFAULT_MAX_SEGMENT_BYTES, RECORD_OVERHEAD_BYTES,
+    StoreEncryptionKey, StoreError, StoreOptions, SuspectLogStats, DEFAULT_MAX_SEGMENT_BYTES,
+    RECORD_OVERHEAD_BYTES,
 };
 use tidefs_orphan_index::{OrphanEntry, OrphanEntryFlags, OrphanIndex, OrphanIndexAdmissionError};
 use tidefs_performance_contract::AdmissionPermit;
@@ -420,7 +421,7 @@ use tidefs_types_claim_ledger_core::{
     BudgetDomainId, ClaimEntry, ClaimId, ClaimReason, ObligationLedger,
 };
 use tidefs_types_space_accounting_core::{
-    DatasetSpaceCountersV1, PoolPhysicalCountersV1, SpaceDelta, SpaceDomainId,
+    DatasetSpaceCountersV1, DatasetSpaceUsage, PoolPhysicalCountersV1, SpaceDelta, SpaceDomainId,
 };
 use tidefs_types_vfs_core::{
     Errno, Generation, InodeAttr, InodeId, NodeKind, SetAttr, FALLOC_FL_COLLAPSE_RANGE,
@@ -1646,6 +1647,55 @@ pub struct LocalFileSystem {
     cleanup_engine: Option<CleanupEngine<Box<dyn JobExecutor + Send>>>,
     /// Current placement epoch for send/receive stream attribution.
     placement_epoch: Option<u64>,
+}
+
+struct MountedRawStoreDiagnostics<'a> {
+    store: &'a LocalObjectStore,
+}
+
+impl MountedRawStoreDiagnostics<'_> {
+    fn dataset_space_usage(&self, dataset_id: [u8; 16]) -> Option<DatasetSpaceUsage> {
+        self.store.get_dataset_usage(dataset_id)
+    }
+
+    fn verify_file_checksum_tree(
+        &self,
+        record: &InodeRecord,
+        block_size: usize,
+    ) -> Result<Option<bool>> {
+        let key = content_object_key_for_version(record.inode_id, record.data_version);
+        let Some(tree) = self.store.get_checksum_tree(key, block_size)? else {
+            return Ok(None);
+        };
+        self.store.verify_checksum_tree(key, &tree).map(Some)
+    }
+
+    fn suspect_log_stats(&self) -> SuspectLogStats {
+        self.store.suspect_log().stats()
+    }
+
+    #[cfg(test)]
+    fn contains_transaction_superblock(&self, transaction_id: u64) -> bool {
+        self.store
+            .contains_key(transaction_superblock_object_key(transaction_id))
+    }
+
+    #[cfg(test)]
+    fn scrub_mounted_content(
+        &self,
+        inodes: &BTreeMap<InodeId, InodeRecord>,
+    ) -> Result<crate::scrub::ScrubReport> {
+        crate::scrub::scrub_inodes_content(self.store, inodes)
+    }
+
+    #[cfg(test)]
+    fn scrub_content_chunk(
+        &self,
+        record: &InodeRecord,
+        chunk_ref: &crate::records::ContentChunkRef,
+    ) -> crate::scrub::ScrubBlockOutcome {
+        crate::scrub::scrub_content_chunk(self.store, record.inode_id, record, chunk_ref)
+    }
 }
 
 #[derive(Default)]
@@ -3871,13 +3921,96 @@ impl LocalFileSystem {
         self.store.segments_dir()
     }
 
+    /// Temporary mounted raw-store bypass retained for the remaining POSIX
+    /// diagnostic caller. New mounted callers should use typed projections.
+    /// Mounted device-level compression and encryption remain blocked while
+    /// this raw-store escape hatch is present.
     pub fn object_store(&self) -> &LocalObjectStore {
         self.store.raw_primary_store()
     }
 
-    #[allow(dead_code)] // INTENT: kept for planned architecture; callers in test modules or pending wiring into FUSE dispatch
-    pub(crate) fn store_ref(&self) -> &LocalObjectStore {
-        self.store.raw_primary_store()
+    fn mounted_raw_store_diagnostics(&self) -> MountedRawStoreDiagnostics<'_> {
+        MountedRawStoreDiagnostics {
+            store: self.store.raw_primary_store(),
+        }
+    }
+
+    /// Read the persisted dataset-space counters for a dataset without exposing
+    /// the mounted filesystem's lower raw object store.
+    pub fn dataset_space_usage(&self, dataset_id: [u8; 16]) -> Option<DatasetSpaceUsage> {
+        self.mounted_raw_store_diagnostics()
+            .dataset_space_usage(dataset_id)
+    }
+
+    /// Diagnostic checksum-tree projection for mounted validation callers.
+    ///
+    /// This intentionally answers only whether the file's current content
+    /// checksum tree can be rebuilt and verified. It does not expose raw
+    /// object-store keys, payloads, or store handles to mounted callers.
+    pub fn verify_file_checksum_tree_for_diagnostic(
+        &self,
+        path: impl AsRef<str>,
+        block_size: usize,
+    ) -> Result<Option<bool>> {
+        let record = self.stat(path)?;
+        self.mounted_raw_store_diagnostics()
+            .verify_file_checksum_tree(&record, block_size)
+    }
+
+    /// Diagnostic suspect-log statistics without exposing the raw object store.
+    pub fn suspect_log_stats(&self) -> SuspectLogStats {
+        self.mounted_raw_store_diagnostics().suspect_log_stats()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn transaction_superblock_exists_for_test(&self, transaction_id: u64) -> bool {
+        self.mounted_raw_store_diagnostics()
+            .contains_transaction_superblock(transaction_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scrub_mounted_content_for_test(&self) -> Result<crate::scrub::ScrubReport> {
+        self.mounted_raw_store_diagnostics()
+            .scrub_mounted_content(&self.state.inodes)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scrub_mounted_content_records_for_test(
+        &self,
+        inodes: &BTreeMap<InodeId, InodeRecord>,
+    ) -> Result<crate::scrub::ScrubReport> {
+        self.mounted_raw_store_diagnostics()
+            .scrub_mounted_content(inodes)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scrub_content_chunk_for_test(
+        &self,
+        record: &InodeRecord,
+        chunk_ref: &crate::records::ContentChunkRef,
+    ) -> crate::scrub::ScrubBlockOutcome {
+        self.mounted_raw_store_diagnostics()
+            .scrub_content_chunk(record, chunk_ref)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn chunked_content_receipt_generations_for_test(
+        &self,
+        inode_id: InodeId,
+        record: &InodeRecord,
+    ) -> Result<Option<Vec<u64>>> {
+        let layout = self.read_committed_content_layout_cached(inode_id, record)?;
+        let ContentLayout::Chunked(manifest) = layout else {
+            return Ok(None);
+        };
+        Ok(Some(
+            manifest
+                .chunks
+                .iter()
+                .filter(|chunk| !chunk.is_hole())
+                .map(|chunk| chunk.placement_receipt_generation)
+                .collect(),
+        ))
     }
 
     #[allow(dead_code)] // INTENT: kept for planned architecture; callers in test modules or pending wiring into FUSE dispatch

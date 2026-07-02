@@ -3,8 +3,8 @@
 
 //! Local-filesystem integrity integration tests.
 //!
-//! Exercises the LocalFileSystem → LocalObjectStore pipeline end-to-end:
-//! BLAKE3 checksum tree verification through the composed stack, and
+//! Exercises mounted LocalFileSystem integrity diagnostics end-to-end:
+//! BLAKE3 checksum tree verification through a typed projection, and
 //! read-after-write byte-for-byte consistency within a single session.
 //!
 //! No FUSE mount required — these tests exercise the in-memory harness
@@ -17,8 +17,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tidefs_local_filesystem::{
-    content_object_key_for_version, LocalFileSystem, RootAuthenticationKey,
-    DEFAULT_FILE_PERMISSIONS,
+    LocalFileSystem, RootAuthenticationKey, DEFAULT_FILE_PERMISSIONS,
 };
 use tidefs_local_object_store::StoreOptions;
 
@@ -83,17 +82,10 @@ fn alternating_data(len: usize) -> Vec<u8> {
 /// Verify the BLAKE3 checksum tree for a file exists and verifies correctly.
 /// Uses the versioned content object key derived from the inode record.
 fn assert_file_blake3_tree_verifies(fs: &LocalFileSystem, path: &str) {
-    let rec = fs.stat(path).expect("stat");
-    let store = fs.object_store();
-    let versioned_key = content_object_key_for_version(rec.inode_id, rec.data_version);
-
-    let tree = store
-        .get_checksum_tree(versioned_key, 4096)
-        .expect("get_checksum_tree")
+    let verified = fs
+        .verify_file_checksum_tree_for_diagnostic(path, 4096)
+        .expect("verify checksum tree")
         .expect("checksum tree must exist for versioned content key");
-    let verified = store
-        .verify_checksum_tree(versioned_key, &tree)
-        .expect("verify_checksum_tree");
     assert!(
         verified,
         "BLAKE3 checksum tree must verify intact data for {path}"
@@ -195,16 +187,13 @@ fn local_fs_blake3_integrity_empty_file() {
             .expect("create_file");
         fs.fsync_file("/empty.bin").expect("fsync empty");
 
-        let rec = fs.stat("/empty.bin").expect("stat");
-        let versioned_key = content_object_key_for_version(rec.inode_id, rec.data_version);
-        let store = fs.object_store();
         // Zero-length content: tree may or may not exist depending on
         // whether the object store writes an empty payload. Verify
         // read-back is correct either way.
-        if let Ok(Some(tree)) = store.get_checksum_tree(versioned_key, 4096) {
-            let verified = store
-                .verify_checksum_tree(versioned_key, &tree)
-                .expect("verify_checksum_tree empty");
+        if let Some(verified) = fs
+            .verify_file_checksum_tree_for_diagnostic("/empty.bin", 4096)
+            .expect("verify empty checksum tree")
+        {
             assert!(verified, "BLAKE3 tree must verify empty content");
         }
 
