@@ -611,9 +611,13 @@ impl ScrubWalker {
 
         let mut report = ScrubReport::new(total, self.root.clone(), 0.0);
         report.unreachable_object_policy = self.unreachable_policy;
+        let mut records_checksummed = 0_usize;
 
         for (idx, key) in keys.iter().enumerate() {
             let outcome = self.check_object(*key);
+            if outcome.checksum_checked() {
+                records_checksummed += 1;
+            }
             report.bytes_processed = report
                 .bytes_processed
                 .saturating_add(outcome.bytes_processed());
@@ -661,7 +665,7 @@ impl ScrubWalker {
         }
 
         // Compute checksum coverage.
-        report.records_checksummed = report.ok + report.findings.len();
+        report.records_checksummed = records_checksummed;
         if total > 0 {
             report.checksum_coverage_pct = report.records_checksummed as f64 / total as f64;
         }
@@ -756,6 +760,7 @@ impl ScrubWalker {
             Ok(None) => {
                 return ObjectCheckResult::Finding {
                     bytes_processed: 0,
+                    checksum_checked: false,
                     finding: ScrubFinding::MissingObject {
                         key_hex: key.to_string(),
                     },
@@ -764,6 +769,7 @@ impl ScrubWalker {
             Err(e) => {
                 return ObjectCheckResult::Finding {
                     bytes_processed: 0,
+                    checksum_checked: false,
                     finding: ScrubFinding::IoError {
                         key_hex: key.to_string(),
                         message: format!("{e}"),
@@ -780,6 +786,7 @@ impl ScrubWalker {
             if recomputed_val != stored_val {
                 return ObjectCheckResult::Finding {
                     bytes_processed: raw.len() as u64,
+                    checksum_checked: true,
                     finding: ScrubFinding::ChecksumMismatch {
                         key_hex: key.to_string(),
                         stored_checksum: stored_val,
@@ -794,6 +801,7 @@ impl ScrubWalker {
             if let Err(reason) = check_compression_frame(&raw) {
                 return ObjectCheckResult::Finding {
                     bytes_processed: raw.len() as u64,
+                    checksum_checked: true,
                     finding: ScrubFinding::CompressionError {
                         key_hex: key.to_string(),
                         message: reason,
@@ -804,6 +812,7 @@ impl ScrubWalker {
 
         ObjectCheckResult::Ok {
             bytes_processed: raw.len() as u64,
+            checksum_checked: true,
         }
     }
 }
@@ -869,9 +878,11 @@ fn attach_content_inspection_findings(
 enum ObjectCheckResult {
     Ok {
         bytes_processed: u64,
+        checksum_checked: bool,
     },
     Finding {
         bytes_processed: u64,
+        checksum_checked: bool,
         finding: ScrubFinding,
     },
 }
@@ -883,6 +894,17 @@ impl ObjectCheckResult {
             | Self::Finding {
                 bytes_processed, ..
             } => *bytes_processed,
+        }
+    }
+
+    fn checksum_checked(&self) -> bool {
+        match self {
+            Self::Ok {
+                checksum_checked, ..
+            }
+            | Self::Finding {
+                checksum_checked, ..
+            } => *checksum_checked,
         }
     }
 }
@@ -1180,6 +1202,8 @@ mod tests {
             .as_ref()
             .map(|summary| summary.issue_count >= 1)
             .unwrap_or(false));
+        assert_eq!(report.records_checksummed, report.total_keys);
+        assert_eq!(report.checksum_coverage_pct, 1.0);
         assert_eq!(report.exit_code(), 1);
     }
 
@@ -1281,6 +1305,8 @@ mod tests {
             .as_ref()
             .map(|summary| summary.issue_count >= 1)
             .unwrap_or(false));
+        assert_eq!(report.records_checksummed, report.total_keys);
+        assert_eq!(report.checksum_coverage_pct, 1.0);
         assert_eq!(report.exit_code(), 1);
     }
 
