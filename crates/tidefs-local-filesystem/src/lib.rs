@@ -11963,7 +11963,7 @@ impl LocalFileSystem {
         // longer needed for crash replay.  This reclaims memory and
         // reduces byte-pressure.
         {
-            let trimmed = self.intent_log.trim_flushed();
+            let trimmed = self.intent_log.trim_flushed()?;
             if trimmed > 0 {
                 let stats = self.intent_log.space_stats();
                 let level = stats.pressure_level.label();
