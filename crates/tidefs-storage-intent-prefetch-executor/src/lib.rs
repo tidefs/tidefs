@@ -480,6 +480,39 @@ impl PrefetchExecutorAntiWasteMask {
     }
 
     #[must_use]
+    pub const fn primary_cancellation(self) -> PrefetchExecutorAntiWasteCancellation {
+        if self.intersects(Self::UNKNOWN_WAF) {
+            PrefetchExecutorAntiWasteCancellation::UnknownWaf
+        } else if self.intersects(Self::UNKNOWN_EGRESS_OR_RESTORE_COST) {
+            PrefetchExecutorAntiWasteCancellation::UnknownEgressOrRestoreCost
+        } else if self.intersects(Self::PROTECTED_RESERVE_PRESSURE) {
+            PrefetchExecutorAntiWasteCancellation::ProtectedReservePressure
+        } else if self.intersects(Self::NOISY_NEIGHBOR_PRESSURE) {
+            PrefetchExecutorAntiWasteCancellation::NoisyNeighborPressure
+        } else if self.intersects(Self::FAILED_PAYBACK) {
+            PrefetchExecutorAntiWasteCancellation::FailedPayback
+        } else if self.intersects(Self::LOW_DWELL) {
+            PrefetchExecutorAntiWasteCancellation::LowDwell
+        } else if self.intersects(Self::COOLDOWN) {
+            PrefetchExecutorAntiWasteCancellation::Cooldown
+        } else if self.intersects(Self::ONE_PASS_SCAN) {
+            PrefetchExecutorAntiWasteCancellation::OnePassScan
+        } else if self.intersects(Self::PHASE_CHANGE) {
+            PrefetchExecutorAntiWasteCancellation::PhaseChange
+        } else if self.intersects(Self::LOW_SAMPLE_MASS) {
+            PrefetchExecutorAntiWasteCancellation::LowSampleMass
+        } else if self.intersects(Self::CONTRADICTED_HINTS) {
+            PrefetchExecutorAntiWasteCancellation::ContradictedHints
+        } else if self.intersects(Self::MEMORY_ONLY_EVIDENCE) {
+            PrefetchExecutorAntiWasteCancellation::MemoryOnlyEvidence
+        } else if self.intersects(Self::SAMPLED_AWAY) {
+            PrefetchExecutorAntiWasteCancellation::SampledAway
+        } else {
+            PrefetchExecutorAntiWasteCancellation::None
+        }
+    }
+
+    #[must_use]
     pub const fn cancellation_mask() -> Self {
         Self(
             Self::ONE_PASS_SCAN.0
@@ -496,6 +529,68 @@ impl PrefetchExecutorAntiWasteMask {
                 | Self::UNKNOWN_EGRESS_OR_RESTORE_COST.0
                 | Self::PROTECTED_RESERVE_PRESSURE.0,
         )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum PrefetchExecutorAntiWasteCancellation {
+    #[default]
+    None = 0,
+    OnePassScan = 1,
+    PhaseChange = 2,
+    LowSampleMass = 3,
+    ContradictedHints = 4,
+    MemoryOnlyEvidence = 5,
+    SampledAway = 6,
+    NoisyNeighborPressure = 7,
+    FailedPayback = 8,
+    LowDwell = 9,
+    Cooldown = 10,
+    UnknownWaf = 11,
+    UnknownEgressOrRestoreCost = 12,
+    ProtectedReservePressure = 13,
+}
+
+impl_u8_canonical!(PrefetchExecutorAntiWasteCancellation, {
+    None = 0 => "none",
+    OnePassScan = 1 => "one-pass-scan",
+    PhaseChange = 2 => "phase-change",
+    LowSampleMass = 3 => "low-sample-mass",
+    ContradictedHints = 4 => "contradicted-hints",
+    MemoryOnlyEvidence = 5 => "memory-only-evidence",
+    SampledAway = 6 => "sampled-away",
+    NoisyNeighborPressure = 7 => "noisy-neighbor-pressure",
+    FailedPayback = 8 => "failed-payback",
+    LowDwell = 9 => "low-dwell",
+    Cooldown = 10 => "cooldown",
+    UnknownWaf = 11 => "unknown-waf",
+    UnknownEgressOrRestoreCost = 12 => "unknown-egress-or-restore-cost",
+    ProtectedReservePressure = 13 => "protected-reserve-pressure",
+});
+
+impl PrefetchExecutorAntiWasteCancellation {
+    #[must_use]
+    pub const fn refusal_reason(self) -> StorageIntentRefusalReason {
+        match self {
+            Self::None => StorageIntentRefusalReason::None,
+            Self::UnknownWaf => StorageIntentRefusalReason::FlashWearBudgetExceeded,
+            Self::UnknownEgressOrRestoreCost => StorageIntentRefusalReason::OverBudget,
+            Self::ProtectedReservePressure => {
+                StorageIntentRefusalReason::ProtectedReserveWouldBeBreached
+            }
+            Self::NoisyNeighborPressure => StorageIntentRefusalReason::NoisyNeighborPressure,
+            Self::FailedPayback | Self::LowDwell | Self::Cooldown => {
+                StorageIntentRefusalReason::MovementDebtNotPaidBack
+            }
+            Self::OnePassScan
+            | Self::PhaseChange
+            | Self::LowSampleMass
+            | Self::ContradictedHints
+            | Self::MemoryOnlyEvidence
+            | Self::SampledAway => StorageIntentRefusalReason::EvidenceNotUsable,
+        }
     }
 }
 
@@ -1635,6 +1730,11 @@ impl PrefetchExecutorRecord {
     #[must_use]
     pub const fn has_feedback_payback_inputs(self) -> bool {
         self.result_detail.has_feedback_payback_inputs()
+    }
+
+    #[must_use]
+    pub const fn anti_waste_cancellation(self) -> PrefetchExecutorAntiWasteCancellation {
+        self.anti_waste.primary_cancellation()
     }
 
     #[must_use]
@@ -3948,21 +4048,11 @@ fn admission_refusal(admission: PrefetchExecutorAdmissionRecord) -> StorageInten
 }
 
 fn anti_waste_refusal(mask: PrefetchExecutorAntiWasteMask) -> StorageIntentRefusalReason {
-    if mask.intersects(PrefetchExecutorAntiWasteMask::UNKNOWN_WAF) {
-        StorageIntentRefusalReason::FlashWearBudgetExceeded
-    } else if mask.intersects(PrefetchExecutorAntiWasteMask::UNKNOWN_EGRESS_OR_RESTORE_COST) {
-        StorageIntentRefusalReason::OverBudget
-    } else if mask.intersects(PrefetchExecutorAntiWasteMask::NOISY_NEIGHBOR_PRESSURE) {
-        StorageIntentRefusalReason::NoisyNeighborPressure
-    } else if mask.intersects(PrefetchExecutorAntiWasteMask::FAILED_PAYBACK)
-        || mask.intersects(PrefetchExecutorAntiWasteMask::LOW_DWELL)
-        || mask.intersects(PrefetchExecutorAntiWasteMask::COOLDOWN)
-    {
-        StorageIntentRefusalReason::MovementDebtNotPaidBack
-    } else if mask.intersects(PrefetchExecutorAntiWasteMask::PROTECTED_RESERVE_PRESSURE) {
-        StorageIntentRefusalReason::ProtectedReserveWouldBeBreached
-    } else {
+    let refusal = mask.primary_cancellation().refusal_reason();
+    if refusal as u16 == StorageIntentRefusalReason::None as u16 {
         StorageIntentRefusalReason::EvidenceNotUsable
+    } else {
+        refusal
     }
 }
 
@@ -6367,6 +6457,133 @@ mod tests {
             StorageIntentRefusalReason::OverBudget
         );
         assert!(!egress_record.can_publish_replacement_receipt());
+    }
+
+    #[test]
+    fn anti_waste_cancellation_classifies_issue_predicates() {
+        let cases = [
+            (
+                PrefetchExecutorAntiWasteMask::ONE_PASS_SCAN,
+                PrefetchExecutorAntiWasteCancellation::OnePassScan,
+                StorageIntentRefusalReason::EvidenceNotUsable,
+            ),
+            (
+                PrefetchExecutorAntiWasteMask::PHASE_CHANGE,
+                PrefetchExecutorAntiWasteCancellation::PhaseChange,
+                StorageIntentRefusalReason::EvidenceNotUsable,
+            ),
+            (
+                PrefetchExecutorAntiWasteMask::LOW_SAMPLE_MASS,
+                PrefetchExecutorAntiWasteCancellation::LowSampleMass,
+                StorageIntentRefusalReason::EvidenceNotUsable,
+            ),
+            (
+                PrefetchExecutorAntiWasteMask::CONTRADICTED_HINTS,
+                PrefetchExecutorAntiWasteCancellation::ContradictedHints,
+                StorageIntentRefusalReason::EvidenceNotUsable,
+            ),
+            (
+                PrefetchExecutorAntiWasteMask::MEMORY_ONLY_EVIDENCE,
+                PrefetchExecutorAntiWasteCancellation::MemoryOnlyEvidence,
+                StorageIntentRefusalReason::EvidenceNotUsable,
+            ),
+            (
+                PrefetchExecutorAntiWasteMask::SAMPLED_AWAY,
+                PrefetchExecutorAntiWasteCancellation::SampledAway,
+                StorageIntentRefusalReason::EvidenceNotUsable,
+            ),
+            (
+                PrefetchExecutorAntiWasteMask::NOISY_NEIGHBOR_PRESSURE,
+                PrefetchExecutorAntiWasteCancellation::NoisyNeighborPressure,
+                StorageIntentRefusalReason::NoisyNeighborPressure,
+            ),
+            (
+                PrefetchExecutorAntiWasteMask::FAILED_PAYBACK,
+                PrefetchExecutorAntiWasteCancellation::FailedPayback,
+                StorageIntentRefusalReason::MovementDebtNotPaidBack,
+            ),
+            (
+                PrefetchExecutorAntiWasteMask::LOW_DWELL,
+                PrefetchExecutorAntiWasteCancellation::LowDwell,
+                StorageIntentRefusalReason::MovementDebtNotPaidBack,
+            ),
+            (
+                PrefetchExecutorAntiWasteMask::COOLDOWN,
+                PrefetchExecutorAntiWasteCancellation::Cooldown,
+                StorageIntentRefusalReason::MovementDebtNotPaidBack,
+            ),
+            (
+                PrefetchExecutorAntiWasteMask::UNKNOWN_WAF,
+                PrefetchExecutorAntiWasteCancellation::UnknownWaf,
+                StorageIntentRefusalReason::FlashWearBudgetExceeded,
+            ),
+            (
+                PrefetchExecutorAntiWasteMask::UNKNOWN_EGRESS_OR_RESTORE_COST,
+                PrefetchExecutorAntiWasteCancellation::UnknownEgressOrRestoreCost,
+                StorageIntentRefusalReason::OverBudget,
+            ),
+            (
+                PrefetchExecutorAntiWasteMask::PROTECTED_RESERVE_PRESSURE,
+                PrefetchExecutorAntiWasteCancellation::ProtectedReservePressure,
+                StorageIntentRefusalReason::ProtectedReserveWouldBeBreached,
+            ),
+        ];
+
+        for (mask, expected_cancellation, expected_refusal) in cases {
+            let mut input = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+            input.anti_waste = mask;
+
+            let record = evaluate_prefetch_execution(input);
+
+            assert_eq!(
+                record.outcome,
+                PrefetchExecutorOutcome::Dropped,
+                "{expected_cancellation:?} did not cancel dispatch"
+            );
+            assert_eq!(record.anti_waste_cancellation(), expected_cancellation);
+            assert_eq!(record.refusal, expected_refusal);
+            assert_eq!(
+                record.anti_waste_cancellation().refusal_reason(),
+                expected_refusal
+            );
+            assert_record_has_no_authority_claims(record);
+        }
+    }
+
+    #[test]
+    fn anti_waste_cancellation_prioritizes_conservative_cost_and_reserve_proof() {
+        let cases = [
+            (
+                PrefetchExecutorAntiWasteMask::ONE_PASS_SCAN
+                    .union(PrefetchExecutorAntiWasteMask::UNKNOWN_WAF),
+                PrefetchExecutorAntiWasteCancellation::UnknownWaf,
+                StorageIntentRefusalReason::FlashWearBudgetExceeded,
+            ),
+            (
+                PrefetchExecutorAntiWasteMask::PHASE_CHANGE
+                    .union(PrefetchExecutorAntiWasteMask::UNKNOWN_EGRESS_OR_RESTORE_COST),
+                PrefetchExecutorAntiWasteCancellation::UnknownEgressOrRestoreCost,
+                StorageIntentRefusalReason::OverBudget,
+            ),
+            (
+                PrefetchExecutorAntiWasteMask::LOW_SAMPLE_MASS
+                    .union(PrefetchExecutorAntiWasteMask::PROTECTED_RESERVE_PRESSURE),
+                PrefetchExecutorAntiWasteCancellation::ProtectedReservePressure,
+                StorageIntentRefusalReason::ProtectedReserveWouldBeBreached,
+            ),
+        ];
+
+        for (mask, expected_cancellation, expected_refusal) in cases {
+            let mut input = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+            input.anti_waste = mask;
+
+            let record = evaluate_prefetch_execution(input);
+
+            assert_eq!(record.outcome, PrefetchExecutorOutcome::Dropped);
+            assert_eq!(record.anti_waste_cancellation(), expected_cancellation);
+            assert_eq!(record.refusal, expected_refusal);
+            assert_record_has_no_authority_claims(record);
+        }
     }
 
     #[test]
