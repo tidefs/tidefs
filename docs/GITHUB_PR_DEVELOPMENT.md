@@ -117,10 +117,3 @@ du -sh /root/ai/tmp /root/ai/state /root/tidefs-worktrees 2>/dev/null || true
 - If `/root` has less than 20 percent free or less than 50 GiB free, stop
   starting heavy validation and clean only owned or clearly stale temp
   artifacts.
-
-## Current Work Selection Note
-
-This workflow is process authority, not a topical priority list. Work
-selection comes from live GitHub issues, pull requests, repository docs, and
-the current Codex Nexus view; choose only non-overlapping prepared work unless
-an existing owner explicitly hands off a slice.
