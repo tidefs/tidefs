@@ -241,12 +241,13 @@ checks skip them until the PR is marked ready for review. The `ready_for_review`
 event reruns the standing checks on the current head before integration.
 Manual workflow dispatch remains available for draft branches that need early
 evidence. Codex Nexus Relay jobs are controller telemetry, not TideFS
-validation. Pull-request relay runs use isolated concurrency so intentional
-relay coalescing does not create cancelled PR check conclusions that GitHub
-tools report as failing checks. Issue, push, and manual-dispatch relay wakeups
-still share a global cancelling concurrency group because any delivered relay
-wakeup causes Nexus to reconcile live GitHub state rather than treating each
-queued relay job as durable work.
+validation. Pull-request relay runs allocate a runner only for source-head and
+lifecycle wakeups, while metadata-only PR edits wait for the next delivered
+wakeup or controller poll to refresh live state. Pending pull-request relay
+wakeups coalesce per PR while already-running deliveries finish; issue, push,
+and manual-dispatch relay wakeups still share a global cancelling concurrency
+group. Any delivered relay wakeup causes Nexus to reconcile live GitHub state
+rather than treating each queued relay job as durable work.
 
 Runner host configuration and bring-up notes live in
 `tidefs/tidefs-infra-configuration`.
