@@ -134,6 +134,8 @@ jobs:
             started_at="$(awk -F= '$1 == "utc" {print substr($0, 5); exit}' "$ARTIFACT_ROOT/artifact-root.env")"
           fi
           finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          MANIFEST_NAME="xfstests-run-manifest.json"
+          MANIFEST_PATH="$ARTIFACT_ROOT/$MANIFEST_NAME"
 
           normalize_kmod_smoke_tests() {
             local input="$1"
@@ -195,7 +197,7 @@ jobs:
             tests_json="$(printf '%s' "${MANIFEST_TESTS_INPUT:-}" | jq -R 'split(" ") | map(select(. != ""))')"
             artifact_paths_json="[]"
             if [ -d "$ARTIFACT_ROOT" ]; then
-              artifact_paths_json="$(cd "$ARTIFACT_ROOT" && find . -type f -not -name 'evidence-manifest.json' | sed 's|^\./||' | sort | jq -R -s 'split("\n") | map(select(. != ""))')"
+              artifact_paths_json="$(cd "$ARTIFACT_ROOT" && find . -type f -not -name "$MANIFEST_NAME" | sed 's|^\./||' | sort | jq -R -s 'split("\n") | map(select(. != ""))')"
             fi
             jq -n \
               --arg manifest_version "1" \
@@ -226,7 +228,7 @@ jobs:
               + if $selection_error != "" then {selection_error: $selection_error} else {} end
               + if $started_at != "" then {started_at: $started_at} else {} end
               + {finished_at: $finished_at}' \
-              > "$ARTIFACT_ROOT/evidence-manifest.json"
+              > "$MANIFEST_PATH"
           else
             json_string() {
               local escaped
@@ -268,7 +270,7 @@ jobs:
             tests_json="$(json_array_from_words "${MANIFEST_TESTS_INPUT:-}")"
             artifact_paths_json="[]"
             if [ -d "$ARTIFACT_ROOT" ]; then
-              artifact_paths_json="$(cd "$ARTIFACT_ROOT" && find . -type f -not -name 'evidence-manifest.json' | sed 's|^\./||' | sort | json_array_from_lines)"
+              artifact_paths_json="$(cd "$ARTIFACT_ROOT" && find . -type f -not -name "$MANIFEST_NAME" | sed 's|^\./||' | sort | json_array_from_lines)"
             fi
             started_at_field=""
             if [ -n "$started_at" ]; then
@@ -278,7 +280,7 @@ jobs:
             if [ -n "$SELECTION_ERROR" ]; then
               selection_error_field="\"selection_error\": $(json_string "$SELECTION_ERROR"),"
             fi
-            cat > "$ARTIFACT_ROOT/evidence-manifest.json" << MANIFEST_EOF
+            cat > "$MANIFEST_PATH" << MANIFEST_EOF
           {
             "manifest_version": 1,
             "workflow": $(json_string "$EVIDENCE_WORKFLOW"),
@@ -296,6 +298,19 @@ jobs:
           }
           MANIFEST_EOF
           fi
+
+          nix develop .#ci --command cargo run --locked -p tidefs-xtask -- validate-xfstests-evidence-manifest "$MANIFEST_PATH"
+          {
+            echo "## xfstests run-level evidence manifest"
+            echo ""
+            echo "- Target: \`$EVIDENCE_TARGET\`"
+            echo "- Scope: \`$evidence_scope\`"
+            echo "- Manifest: \`$MANIFEST_NAME\`"
+            echo ""
+            echo '```json'
+            cat "$MANIFEST_PATH"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
 
       - name: Upload xfstests output

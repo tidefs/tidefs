@@ -60,7 +60,7 @@ jobs:
           SUMMARY_DIR="$TIDEFS_FSYNC_SUMMARY_DIR"
           MANIFEST_PATH="$SUMMARY_DIR/evidence-manifest.json"
           GENERATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          RUN_ID="${{ github.run_id }}"
+          RUN_ID="${{ github.run_id }}/${{ github.run_attempt }}"
           SOURCE_REF="${{ github.sha }}"
           TIMEOUT="${{ inputs.timeout_seconds }}"
           POOL_SIZE="${{ inputs.pool_size_mb }}"
@@ -99,45 +99,78 @@ jobs:
 
             if [[ "$FAILED" -gt 0 || "$STATUS" == "FAIL" ]]; then
               STATUS_LABEL="fail"
+              OUTCOME="product-fail"
             elif [[ "$BLOCKED" -gt 0 || "$STATUS" == "BLOCKED" ]]; then
               STATUS_LABEL="blocked"
+              OUTCOME="environment-refusal"
             elif [[ "$PASSED" -gt 0 || "$STATUS" == "PASS" ]]; then
               STATUS_LABEL="pass"
+              OUTCOME="pass"
             else
               STATUS_LABEL="no-result"
+              OUTCOME="harness-fail"
             fi
 
             ARTIFACT_PATH="$(realpath --relative-to="$SUMMARY_DIR" "$LATEST_SUMMARY" 2>/dev/null || echo summary.env)"
-            DIGEST="$(nix shell nixpkgs#b3sum --command b3sum "$LATEST_SUMMARY" | awk '{print $1}')"
-            CONTENT_DIGEST="blake3:${DIGEST}"
+            PRIMARY_PATH="$LATEST_SUMMARY"
           else
             PASSED=0
             FAILED=0
             BLOCKED=0
             STATUS_LABEL="no-summary"
+            OUTCOME="harness-fail"
             ARTIFACT_PATH="summary.env.missing"
-            CONTENT_DIGEST="blake3:0000000000000000000000000000000000000000000000000000000000000000"
+            PRIMARY_PATH="$SUMMARY_DIR/$ARTIFACT_PATH"
+            {
+              printf 'status=missing-summary\n'
+              printf 'workflow=%s\n' "${{ github.workflow }}"
+              printf 'run_id=%s\n' "$RUN_ID"
+              printf 'source_ref=%s\n' "$SOURCE_REF"
+              printf 'timeout_seconds=%s\n' "$TIMEOUT"
+              printf 'pool_size_mb=%s\n' "$POOL_SIZE"
+            } > "$PRIMARY_PATH"
 
             echo "## Evidence manifest: no summary.env found" >> "$GITHUB_STEP_SUMMARY"
           fi
 
+          DIGEST="$(nix shell nixpkgs#b3sum --command b3sum "$PRIMARY_PATH" | awk '{print $1}')"
+          CONTENT_DIGEST="blake3:${DIGEST}"
+          RESIDUAL_RISK="Kernel fsync evidence is bounded to fsync/syncfs durability across one QEMU power-loss validation row with timeout=${TIMEOUT}s and pool=${POOL_SIZE}MB; it does not close broader mounted kernel, xfstests, RDMA, or release-candidate evidence."
           SCOPE="${SCOPE_BASE} status=${STATUS_LABEL} passed=${PASSED} failed=${FAILED} blocked=${BLOCKED} run=${RUN_ID} source=${SOURCE_REF} timeout=${TIMEOUT}s pool=${POOL_SIZE}MB summary_path=${ARTIFACT_PATH} log_paths=${LOG_PATHS}"
 
-          cat > "$MANIFEST_PATH" << MANIFESTEOF
-          {
-            "manifest_version": 1,
-            "claim_id": "${CLAIM_ID}",
-            "evidence_class": "${EVIDENCE_CLASS}",
-            "validation_tier": "full-kernel-no-daemon",
-            "source": "${SOURCE_LABEL}",
-            "scope": "${SCOPE}",
-            "artifact_path": "${ARTIFACT_PATH}",
-            "content_digest": "${CONTENT_DIGEST}",
-            "generated_at": "${GENERATED_AT}"
-          }
-          MANIFESTEOF
+          jq -n \
+            --arg claim_id "$CLAIM_ID" \
+            --arg evidence_class "$EVIDENCE_CLASS" \
+            --arg validation_tier "full-kernel-no-daemon" \
+            --arg scope "$SCOPE" \
+            --arg artifact_path "$ARTIFACT_PATH" \
+            --arg content_digest "$CONTENT_DIGEST" \
+            --arg run_id "$RUN_ID" \
+            --arg source_ref "$SOURCE_REF" \
+            --arg outcome "$OUTCOME" \
+            --arg residual_risk "$RESIDUAL_RISK" \
+            --arg source "$SOURCE_LABEL" \
+            --arg generated_at "$GENERATED_AT" \
+            '{
+              manifest_version: 2,
+              claim_id: $claim_id,
+              evidence_class: $evidence_class,
+              validation_tier: $validation_tier,
+              scope: $scope,
+              artifact_path: $artifact_path,
+              content_digest: $content_digest,
+              run_id: $run_id,
+              source_ref: $source_ref,
+              outcome: $outcome,
+              residual_risk: $residual_risk,
+              source: $source,
+              generated_at: $generated_at,
+              blocking_issues: []
+            }' > "$MANIFEST_PATH"
 
-          echo "## Evidence manifest written" >> "$GITHUB_STEP_SUMMARY"
+          nix develop .#ci --command cargo run --locked -p tidefs-xtask -- validate-evidence-manifest "$MANIFEST_PATH"
+
+          echo "## Evidence manifest written and validated" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo '```json' >> "$GITHUB_STEP_SUMMARY"
           cat "$MANIFEST_PATH" >> "$GITHUB_STEP_SUMMARY"
