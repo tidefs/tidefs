@@ -528,10 +528,11 @@ Important 2026-06-01 findings:
   authorities, while the FUSE daemon adds writeback page cache, writeback inode
   cache, dirty-state ranges, block-volume dirty flushing, adapter txg barriers,
   and fsync-handler barriers. Mmap and kmod writeback remain open because the
-  local intent log has `SharedMmapMsync` replay support, the POSIX matrix still
-  records live mmap coherency as deferred, kmod trait defaults allow mmap/fault
-  and cache callbacks without a complete engine contract, and kmod
-  address-space writeback still depends on mounted-kernel engine authority.
+  local intent log has `SharedMmapMsync` replay support, the generated claim
+  registry still blocks mounted POSIX operator-runtime admission, kmod trait
+  defaults allow mmap/fault and cache callbacks without a complete engine
+  contract, and kmod address-space writeback still depends on mounted-kernel
+  engine authority.
 - `TFR-008`: issue #329 makes crash claim evidence source-qualified at the
   claims gate. The model crash matrix remains model-only evidence, runtime
   crash evidence classes must not point at model-only artifacts, and a
