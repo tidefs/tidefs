@@ -176,75 +176,12 @@ overflow events. On overflow:
 
 [`poll_completed_fetch_reqs`]: crate::ublk_io::poll_completed_fetch_reqs
 
-## Integrity Validation Validation
+## Integrity Validation
 
-The [`integrity_validation`] module produces tier-classified ublk block-volume
-sector-pattern data integrity validation exercising deterministic write/read-back
-verification across the full ublk I/O path with committed-root consistency
-checks. This closes the normal-operation data-correctness gap between
-crash-consistency (#5844) and discard durability (#5857).
-
-### Sector Patterns
-
-Four deterministic sector-fill patterns keyed by LBA (logical block address):
-
-- **LbaIndexed** — fills each 512-byte sector with the 8-byte LBA repeated 64
-  times. Detects misdirected I/O and off-by-one addressing errors.
-- **AllZeros** — fills each sector with 0x00. Detects stale data / uninitialized
-  read paths.
-- **AllOnes** — fills each sector with 0xFF. Detects bit-stuck-low errors.
-- **CounterFill** — fills each sector with a repeating 8-byte counter starting
-  at `LBA * 7 + 1` and incrementing per chunk. Detects intra-sector byte-order
-  errors.
-
-### Validation Tiers
-
-| Tier | Level | Description | Min Sectors |
-|---|---|---|---|
-| `SingleSectorRoundTrip` | 1 | Write one sector, read back, verify byte-identical | 1 |
-| `MultiSectorSequential` | 2 | Write contiguous range, read back, verify each sector | 8 |
-| `StaggeredOffsetOverlapped` | 3 | Write at staggered offsets; verify no cross-contamination | 16 |
-| `FullVolumeSweep` | 4 | Write and read every sector in the device volume | device-dependent |
-
-### Validation Report
-
-[`IntegrityValidationReport::canonical`] produces a 24-row validation report:
-
-- 16 core rows (4 patterns × 4 tiers) with canonical sector ranges
-- 8 edge-case rows: LBA 0 round-trip, last-sector round-trip, boundary-crossing
-  verify, unaligned-start staggered, zero-length refusal, intentional miscompare
-  diagnostic, past-end refusal, and overflow refusal
-
-Each row records the pattern, tier, start LBA, sector count, outcome (Pass /
-Fail / Refusal), and a diagnostic message.
-
-### QEMU Harness
-
-The Nix QEMU test harness at `nix/vm/ublk-integrity-validation.nix` exercises
-all four I/O patterns through the ublk device with deterministic sector-level
-write/read-back verification, mounting and re-mounting across committed-root
-checkpoints. Every sector read must match its written pattern byte-for-byte.
-
-```sh
-nix build -f nix/vm/ublk-integrity-validation.nix
-```
-
-### Outcome Classification
-
-- **Pass** — all sectors matched expected pattern byte-for-byte
-- **Fail** — one or more sectors miscompared (first-byte offset reported)
-- **Refusal** — test could not execute (no /dev/kvm, no ublk support, device unavailable)
-
-[`integrity_validation`]: crate::integrity_validation
-[`IntegrityValidationReport::canonical`]: crate::integrity_validation::IntegrityValidationReport::canonical
-
-## Integrity Validation Validation
-
-The [`integrity_validation`] module produces tier-classified ublk block-volume
-sector-pattern data integrity validation exercising deterministic write/read-back
-verification across the full ublk I/O path with committed-root consistency
-checks. This closes the normal-operation data-correctness gap between
-crash-consistency (#5844) and discard durability (#5857).
+The [`integrity_validation`] module defines crate-local, tier-classified ublk
+block-volume sector-pattern rows for deterministic write/read-back checks. The
+rows are validation inputs and reports for this adapter surface; product
+admission stays behind the claim registry and claims gate.
 
 ### Sector Patterns
 
@@ -282,10 +219,13 @@ Fail / Refusal), and a diagnostic message.
 
 ### QEMU Harness
 
-The Nix QEMU test harness at `nix/vm/ublk-integrity-validation.nix` exercises
-all four I/O patterns through the ublk device with deterministic sector-level
-write/read-back verification, mounting and re-mounting across committed-root
-checkpoints. Every sector read must match its written pattern byte-for-byte.
+The Nix QEMU harness entry point at
+`nix/vm/ublk-integrity-validation.nix` records the intended guest-side row
+shape and currently returns a refusal until a guest image/test runner is
+available.
+Treat its output as missing-evidence/refusal evidence, not product validation
+coverage, and do not widen the current block-device claim boundary beyond the
+registered uBLK completion and started-export admission artifacts.
 
 ```sh
 nix build -f nix/vm/ublk-integrity-validation.nix
@@ -296,6 +236,10 @@ nix build -f nix/vm/ublk-integrity-validation.nix
 - **Pass** — all sectors matched expected pattern byte-for-byte
 - **Fail** — one or more sectors miscompared (first-byte offset reported)
 - **Refusal** — test could not execute (no /dev/kvm, no ublk support, device unavailable)
+
+This section does not claim fio workload breadth, mkfs/mount acceptance, online
+resize, crash durability, production block-device readiness, or
+successor/comparator status.
 
 [`integrity_validation`]: crate::integrity_validation
 [`IntegrityValidationReport::canonical`]: crate::integrity_validation::IntegrityValidationReport::canonical
