@@ -507,7 +507,7 @@ fn run_ublk_data_queue_io_loop_impl(
                                                     for (q_id, tag, is_reissued_fetch) in
                                                         pending_fetch_tags
                                                     {
-                                                        let result: i32;
+                                                        let mut result: i32;
                                                         if let Some(worker) =
                                                             data_workers.get_mut(usize::from(q_id))
                                                         {
@@ -806,7 +806,7 @@ fn run_ublk_data_queue_io_loop_impl(
                                                         for (q_id, tag, is_reissued_fetch) in
                                                             pending_tags
                                                         {
-                                                            let result: i32;
+                                                            let mut result: i32;
                                                             if let Some(ref mut worker) =
                                                                 data_workers
                                                                     .get_mut(usize::from(q_id))
