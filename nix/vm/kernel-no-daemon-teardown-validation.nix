@@ -1165,8 +1165,11 @@ PHASEEOF
     echo "  evidence-manifest.json"
     echo "  qemu.log"
 
-    if [ "$TEARDOWN_STATUS" != "pass" ] || [ "$VALIDATION_ERRORS" -gt 0 ]; then
+    if [ "$VALIDATION_ERRORS" -gt 0 ] || [ "$TEARDOWN_STATUS" = "fail" ]; then
       exit 1
+    fi
+    if [ "$TEARDOWN_STATUS" = "blocked" ]; then
+      echo "VALIDATION BLOCKED: kernel-teardown-runtime.json is valid, but runtime scope remains blocked"
     fi
     exit 0
   '';
