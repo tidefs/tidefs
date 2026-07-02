@@ -1681,31 +1681,35 @@ pub trait VfsEngine {
 
     /// Write the committed root to the pool-label superblock on a lower device.
     ///
-    /// Bridges [`txg_commit_finish`](VfsEngine::txg_commit_finish) to durable
-    /// on-disk label persistence. After a transaction group commits, the new
-    /// committed root is flushed to the pool label so the next mount discovers
-    /// the latest committed state without userspace daemon mediation.
+    /// Engines with committed-root authority bridge
+    /// [`txg_commit_finish`](VfsEngine::txg_commit_finish) to durable on-disk
+    /// label persistence. After a transaction group commits, the new committed
+    /// root is flushed to the pool label so the next mount discovers the latest
+    /// committed state through that engine's mounted authority.
     ///
     /// `device_index` identifies the lower device whose label should be
     /// updated (0-based index into the pool device list).
     ///
-    /// The default implementation is a no-op. Engines that back real block
-    /// devices must override this to serialize the committed root into
+    /// The default implementation fails closed. Engines that back real block
+    /// devices must override this to serialize a non-zero committed root into
     /// [`PoolLabelV1`](tidefs_types_pool_label_core::PoolLabelV1) and issue a
     /// synchronous write to the label region on the lower block device.
     ///
-    /// # No-daemon boundary
+    /// # Errors
     ///
-    /// Committed-root writeback resolves within kernel authority through
-    /// the engine. No userspace daemon is required.
+    /// - [`Errno::EINVAL`] if `committed_root` is [`CommittedRoot::ZERO`].
+    /// - [`Errno::ENOSYS`] if the engine does not implement committed-root
+    ///   persistence authority.
     fn write_committed_root(
         &self,
         committed_root: &CommittedRoot,
         device_index: u32,
     ) -> Result<(), Errno> {
-        let _ = committed_root;
         let _ = device_index;
-        Ok(())
+        if committed_root.is_zero() {
+            return Err(Errno::EINVAL);
+        }
+        Err(Errno::ENOSYS)
     }
 
     // ── Transaction-group lifecycle ───────────────────────────────────
@@ -1718,16 +1722,18 @@ pub trait VfsEngine {
     /// transaction group. If the handle is dropped before being consumed,
     /// the transaction group is implicitly aborted.
     ///
-    /// The default implementation returns a no-op handle. Engines that
-    /// support transaction-group semantics must override this.
+    /// The default implementation fails closed. Engines that support
+    /// transaction-group semantics must override this.
     ///
-    /// # No-daemon boundary
+    /// # Errors
     ///
-    /// Transaction-group open resolves within kernel authority through
-    /// the engine. No userspace daemon is required.
+    /// - [`Errno::EINVAL`] if `txg_id` is [`TxgId::NO_TXG`].
+    /// - [`Errno::ENOSYS`] if the engine does not implement transaction groups.
     fn txg_open(&self, txg_id: TxgId) -> Result<TxgHandle, Errno> {
-        let _ = txg_id;
-        Ok(TxgHandle::noop())
+        if !txg_id.is_valid() {
+            return Err(Errno::EINVAL);
+        }
+        Err(Errno::ENOSYS)
     }
 
     /// Prepare an open transaction group for commit.
@@ -1737,17 +1743,19 @@ pub trait VfsEngine {
     /// requires quorum acknowledgement (multi-node operation), it sets
     /// `quorum_needed` in the returned [`TxgPrepareResult`].
     ///
-    /// The default implementation returns an immediate result with a
-    /// zero committed root. Engines that support transaction groups
-    /// must override this.
+    /// The default implementation fails closed. Engines that support
+    /// transaction groups must override this and must not report
+    /// [`CommittedRoot::ZERO`] as a successful non-empty commit result.
     ///
-    /// # No-daemon boundary
+    /// # Errors
     ///
-    /// Commit preparation resolves within kernel authority through
-    /// the engine. No userspace daemon is required.
+    /// - [`Errno::EINVAL`] if `handle` is already consumed.
+    /// - [`Errno::ENOSYS`] if the engine does not implement transaction groups.
     fn txg_commit_prepare(&self, handle: &TxgHandle) -> Result<TxgPrepareResult, Errno> {
-        let _ = handle;
-        Ok(TxgPrepareResult::immediate(CommittedRoot::ZERO))
+        if handle.is_consumed() {
+            return Err(Errno::EINVAL);
+        }
+        Err(Errno::ENOSYS)
     }
 
     /// Finalize a transaction group commit.
@@ -1757,50 +1765,48 @@ pub trait VfsEngine {
     /// transaction group is closed, the committed root is advanced, and
     /// the handle is marked consumed so its drop does not trigger an abort.
     ///
-    /// The default implementation is a no-op. Engines that support
+    /// The default implementation fails closed. Engines that support
     /// transaction groups must override this to persist the commit
     /// record and advance the durable committed root.
     ///
-    /// # No-daemon boundary
-    ///
-    /// Commit finalization resolves within kernel authority through
-    /// the engine. No userspace daemon is required.
-    ///
     /// # Errors
     ///
+    /// - [`Errno::ENOSYS`] if the engine does not implement transaction groups.
     /// - [`Errno::EIO`] if the commit record cannot be written.
     /// - [`Errno::EINVAL`] if the handle was already consumed.
+    /// - [`Errno::EINVAL`] if `committed_root` is [`CommittedRoot::ZERO`].
     fn txg_commit_finish(
         &self,
-        mut handle: TxgHandle,
+        handle: TxgHandle,
         committed_root: CommittedRoot,
     ) -> Result<(), Errno> {
-        // committed_root durability delegated to write_committed_root below.
-        handle.mark_consumed();
-        self.write_committed_root(&committed_root, 0)
+        if handle.is_consumed() || committed_root.is_zero() {
+            return Err(Errno::EINVAL);
+        }
+        Err(Errno::ENOSYS)
     }
 
-    /// Store the latest committed root for use by [].
+    /// Store the latest committed root for later barrier publication.
     ///
     /// Called by mount and txg-commit paths so the engine can later publish
     /// the root during fsync/syncfs/unmount without an explicit handle.
-    /// The default is a no-op; engines that support kernel-mode txg
-    /// barriers must override this.
+    /// The default drops the value because this callback has no error channel;
+    /// product paths must still require [`VfsEngine::txg_commit_barrier`] or
+    /// [`VfsEngine::txg_commit_finish`] to report durable publication.
     fn set_committed_root(&self, _root: CommittedRoot) {}
 
     /// Commit the current transaction group without an explicit root hash or handle.
     ///
     /// Engines that track the committed-root hash internally must override
-    /// this to publish the latest root.  The default no-op is compatible
-    /// with engines that use [`txg_commit_finish`] directly or do not
-    /// support kernel-mode txg barriers yet.
+    /// this to publish the latest root. The default fails closed for engines
+    /// that do not support kernel-mode txg barriers.
     ///
     /// The mounted POSIX kmod adapter calls this from
     /// `KmodPosixVfs::commit_fs_barrier` after fsync, syncfs,
     /// and clean unmount to establish a txg commit point without knowing
     /// the root hash or owning a TxgHandle.
     fn txg_commit_barrier(&self) -> Result<(), Errno> {
-        Ok(())
+        Err(Errno::ENOSYS)
     }
 }
 
@@ -2137,6 +2143,8 @@ mod tests {
         next_dh: u64,
         max_nlink: u32,
         cross_device_link_targets: Vec<InodeId>,
+        prepared_root: CommittedRoot,
+        committed_roots: Vec<(CommittedRoot, u32)>,
         entries: HashMap<(InodeId, Vec<u8>), InodeId>,
         inodes: HashMap<InodeId, FileIoInodeRecord>,
         handles: HashMap<FileHandleId, OpenHandle>,
@@ -2166,6 +2174,8 @@ mod tests {
                     next_dh: 1,
                     max_nlink: u32::MAX,
                     cross_device_link_targets: Vec::new(),
+                    prepared_root: CommittedRoot::new([0x5au8; 32]),
+                    committed_roots: Vec::new(),
                     entries: HashMap::new(),
                     inodes,
                     handles: HashMap::new(),
@@ -2185,6 +2195,10 @@ mod tests {
                 .borrow_mut()
                 .cross_device_link_targets
                 .push(inode_id);
+        }
+
+        fn committed_roots(&self) -> Vec<(CommittedRoot, u32)> {
+            self.state.borrow().committed_roots.clone()
         }
 
         fn attr_for(
@@ -3330,6 +3344,49 @@ mod tests {
 
         fn setlk(&self, _inode: InodeId, _lock: &LockSpec, _ctx: &RequestCtx) -> Result<(), Errno> {
             Err(Errno::ENOSYS)
+        }
+
+        fn write_committed_root(
+            &self,
+            committed_root: &CommittedRoot,
+            device_index: u32,
+        ) -> Result<(), Errno> {
+            if committed_root.is_zero() {
+                return Err(Errno::EINVAL);
+            }
+            self.state
+                .borrow_mut()
+                .committed_roots
+                .push((*committed_root, device_index));
+            Ok(())
+        }
+
+        fn txg_open(&self, txg_id: TxgId) -> Result<TxgHandle, Errno> {
+            if !txg_id.is_valid() {
+                return Err(Errno::EINVAL);
+            }
+            Ok(TxgHandle::new(txg_id))
+        }
+
+        fn txg_commit_prepare(&self, handle: &TxgHandle) -> Result<TxgPrepareResult, Errno> {
+            if !handle.id().is_valid() || handle.is_consumed() {
+                return Err(Errno::EINVAL);
+            }
+            Ok(TxgPrepareResult::immediate(
+                self.state.borrow().prepared_root,
+            ))
+        }
+
+        fn txg_commit_finish(
+            &self,
+            mut handle: TxgHandle,
+            committed_root: CommittedRoot,
+        ) -> Result<(), Errno> {
+            if !handle.id().is_valid() || handle.is_consumed() || committed_root.is_zero() {
+                return Err(Errno::EINVAL);
+            }
+            handle.mark_consumed();
+            self.write_committed_root(&committed_root, 0)
         }
     }
 
@@ -6747,122 +6804,126 @@ mod tests {
     // ── Transaction-group lifecycle trait tests ───────────────────────
 
     #[test]
-    fn txg_open_default_returns_noop_handle() {
+    fn txg_open_default_fails_closed() {
         let engine = EmptyTestEngine;
-        let handle = engine.txg_open(TxgId(1)).expect("txg_open should succeed");
-        assert_eq!(handle.id(), TxgId::NO_TXG);
-        assert!(!handle.is_consumed());
+        assert_eq!(engine.txg_open(TxgId(1)).unwrap_err(), Errno::ENOSYS);
+        assert_eq!(engine.txg_open(TxgId::NO_TXG).unwrap_err(), Errno::EINVAL);
     }
 
     #[test]
-    fn txg_commit_prepare_default_returns_immediate_zero_root() {
+    fn txg_commit_prepare_default_fails_closed() {
         let engine = EmptyTestEngine;
-        let handle = TxgHandle::noop();
-        let result = engine
-            .txg_commit_prepare(&handle)
-            .expect("txg_commit_prepare should succeed");
-        assert_eq!(result.committed_root, CommittedRoot::ZERO);
-        assert!(!result.quorum_needed);
-        assert_eq!(result.flags, 0);
+        let handle = TxgHandle::new(TxgId(7));
+        assert_eq!(engine.txg_commit_prepare(&handle), Err(Errno::ENOSYS));
     }
 
     #[test]
-    fn txg_commit_finish_default_consumes_handle() {
+    fn txg_commit_finish_default_fails_closed() {
         let engine = EmptyTestEngine;
         let handle = TxgHandle::new(TxgId(42));
         let root = CommittedRoot::new([0xabu8; 32]);
-        engine
-            .txg_commit_finish(handle, root)
-            .expect("txg_commit_finish should succeed");
-        // The handle was moved into txg_commit_finish; if we got here
-        // without panicking, the default impl worked.
+        assert_eq!(engine.txg_commit_finish(handle, root), Err(Errno::ENOSYS));
     }
 
     #[test]
-    fn txg_full_lifecycle_round_trip() {
+    fn txg_commit_finish_default_rejects_zero_root() {
         let engine = EmptyTestEngine;
+        let handle = TxgHandle::new(TxgId(42));
+        assert_eq!(
+            engine.txg_commit_finish(handle, CommittedRoot::ZERO),
+            Err(Errno::EINVAL)
+        );
+    }
+
+    #[test]
+    fn txg_explicit_engine_lifecycle_records_committed_root() {
+        let engine = FileIoTestEngine::new();
         let handle = engine.txg_open(TxgId(1)).expect("txg_open");
         let result = engine
             .txg_commit_prepare(&handle)
             .expect("txg_commit_prepare");
         let root = result.committed_root;
+        assert_ne!(root, CommittedRoot::ZERO);
         engine
             .txg_commit_finish(handle, root)
             .expect("txg_commit_finish");
+        assert_eq!(engine.committed_roots(), alloc::vec![(root, 0)]);
     }
 
     #[test]
     fn txg_handle_drop_without_commit_is_noop() {
-        let engine = EmptyTestEngine;
-        let handle = engine.txg_open(TxgId(2)).expect("txg_open");
+        let handle = TxgHandle::new(TxgId(2));
         // Drop the handle without calling txg_commit_finish.
-        // This should not panic — the default impl is a noop abort.
+        // This should not panic; abort side effects are engine-specific.
         drop(handle);
     }
 
     #[test]
     fn txg_object_safe_through_boxed_trait() {
         let engine: std::boxed::Box<dyn VfsEngine> = std::boxed::Box::new(EmptyTestEngine);
-        let handle = engine
-            .txg_open(TxgId(3))
-            .expect("txg_open via trait object");
-        let result = engine
-            .txg_commit_prepare(&handle)
-            .expect("txg_commit_prepare via trait object");
-        engine
-            .txg_commit_finish(handle, result.committed_root)
-            .expect("txg_commit_finish via trait object");
+        assert_eq!(engine.txg_open(TxgId(3)).unwrap_err(), Errno::ENOSYS);
+    }
+
+    #[test]
+    fn txg_commit_barrier_default_fails_closed() {
+        let engine = EmptyTestEngine;
+        assert_eq!(engine.txg_commit_barrier(), Err(Errno::ENOSYS));
     }
 
     // ── Committed-root writeback tests ────────────────────────────
 
     #[test]
-    fn write_committed_root_default_is_noop() {
+    fn write_committed_root_default_fails_closed() {
         let engine = EmptyTestEngine;
         let root = CommittedRoot::new([0x42u8; 32]);
-        let result = engine.write_committed_root(&root, 0);
-        assert!(
-            result.is_ok(),
-            "default write_committed_root should succeed"
-        );
+        assert_eq!(engine.write_committed_root(&root, 0), Err(Errno::ENOSYS));
     }
 
     #[test]
-    fn write_committed_root_multiple_device_indices_are_ok() {
-        let engine = EmptyTestEngine;
+    fn write_committed_root_explicit_engine_records_device_indices() {
+        let engine = FileIoTestEngine::new();
         let root = CommittedRoot::new([0xffu8; 32]);
         assert!(engine.write_committed_root(&root, 0).is_ok());
         assert!(engine.write_committed_root(&root, 1).is_ok());
         assert!(engine.write_committed_root(&root, 7).is_ok());
+        assert_eq!(
+            engine.committed_roots(),
+            alloc::vec![(root, 0), (root, 1), (root, 7)]
+        );
     }
 
     #[test]
     fn write_committed_root_object_safe_through_boxed_trait() {
         let engine: std::boxed::Box<dyn VfsEngine> = std::boxed::Box::new(EmptyTestEngine);
         let root = CommittedRoot::new([0xabu8; 32]);
-        engine
-            .write_committed_root(&root, 0)
-            .expect("write_committed_root via trait object");
+        assert_eq!(engine.write_committed_root(&root, 0), Err(Errno::ENOSYS));
     }
 
     #[test]
-    fn txg_commit_finish_calls_write_committed_root() {
-        // The default txg_commit_finish calls write_committed_root(&root, 0).
-        // Since EmptyTestEngine uses the default impls, this verifies the call chain
-        // completes without error.
-        let engine = EmptyTestEngine;
+    fn txg_commit_finish_explicit_engine_calls_write_committed_root() {
+        let engine = FileIoTestEngine::new();
         let handle = TxgHandle::new(TxgId(5));
         let root = CommittedRoot::new([0x11u8; 32]);
         engine
             .txg_commit_finish(handle, root)
-            .expect("txg_commit_finish should call write_committed_root successfully");
+            .expect("txg_commit_finish should call write_committed_root");
+        assert_eq!(engine.committed_roots(), alloc::vec![(root, 0)]);
     }
 
     #[test]
-    fn write_committed_root_with_zero_root() {
+    fn write_committed_root_rejects_zero_root() {
         let engine = EmptyTestEngine;
-        let result = engine.write_committed_root(&CommittedRoot::ZERO, 0);
-        assert!(result.is_ok());
+        assert_eq!(
+            engine.write_committed_root(&CommittedRoot::ZERO, 0),
+            Err(Errno::EINVAL)
+        );
+
+        let recording_engine = FileIoTestEngine::new();
+        assert_eq!(
+            recording_engine.write_committed_root(&CommittedRoot::ZERO, 0),
+            Err(Errno::EINVAL)
+        );
+        assert!(recording_engine.committed_roots().is_empty());
     }
     // ── Mmap and fault tests ─────────────────────────────────────────
 

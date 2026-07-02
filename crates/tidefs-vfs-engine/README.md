@@ -26,9 +26,10 @@ to share one engine abstraction.
 
 ## Transaction-Group Lifecycle
 
-The transaction-group (txg) trait methods enable kernel-mode write batching
-and autonomous committed-root advancement without userspace daemon mediation.
-This closes the crash-consistency gap in full-kernel no-daemon operation.
+The transaction-group (txg) trait methods are the VFS engine boundary for
+kernel-mode write batching and committed-root advancement. The trait defaults
+do not provide durability: engines without explicit txg and committed-root
+authority fail closed instead of reporting a successful no-op commit.
 
 ### Types
 
@@ -46,43 +47,41 @@ This closes the crash-consistency gap in full-kernel no-daemon operation.
 fn txg_open(&self, txg_id: TxgId) -> Result<TxgHandle, Errno>
 ```
 
-Opens a new transaction group. The default returns a no-op handle. Engines
-must override this to create a real transaction group.
+Opens a new transaction group. The default returns `ENOSYS`, or `EINVAL` for
+`TxgId::NO_TXG`. Engines must override this to create a real transaction group.
 
 ```rust
 fn txg_commit_prepare(&self, handle: &TxgHandle) -> Result<TxgPrepareResult, Errno>
 ```
 
 Prepares the txg for commit: flushes dirty data, finalizes intent-log entries,
-and returns the proposed committed-root identifier. The default returns an
-immediate result with a zero committed root.
+and returns the proposed committed-root identifier. The default returns
+`ENOSYS`. Engines must not report `CommittedRoot::ZERO` as a successful
+non-empty commit result.
 
 ```rust
 fn txg_commit_finish(&self, handle: TxgHandle, committed_root: CommittedRoot) -> Result<(), Errno>
 ```
 
-Confirms the committed root is durable and closes the txg. Consumes the handle
-and marks it consumed so its drop does not trigger an abort. The default
-delegates durability to [`write_committed_root`], writing the root to device 0.
+Confirms the committed root is durable and closes the txg. Engines that support
+txg commits consume the handle and mark it consumed so its drop does not
+trigger an abort. The default returns `ENOSYS`, or `EINVAL` for
+`CommittedRoot::ZERO`.
 
 ```rust
 fn write_committed_root(&self, committed_root: &CommittedRoot, device_index: u32) -> Result<(), Errno>
 ```
 
 Writes the committed root to the pool-label superblock on the specified lower
-device. This bridges `txg_commit_finish` to durable on-disk persistence: after
-a transaction group commits, the new committed root is flushed to the pool
-label so the next mount discovers the latest committed state without userspace
-daemon mediation.
-
-The default implementation is a no-op. Engines that back real block devices
-must override this to serialize the committed root into
-PoolLabelV1 and issue a synchronous block write to the label region.
+device. Engines that back real block devices must override this to serialize a
+non-zero committed root into PoolLabelV1 and issue a synchronous block write to
+the label region. The default returns `ENOSYS`, or `EINVAL` for
+`CommittedRoot::ZERO`.
 
 ### Usage Example
 
 ```rust
-use tidefs_vfs_engine::{VfsEngine, TxgId, CommittedRoot};
+use tidefs_vfs_engine::{CommittedRoot, Errno, TxgId, VfsEngine};
 
 fn commit_write_batch(engine: &dyn VfsEngine) -> Result<(), Errno> {
     // Open a new transaction group.
@@ -93,6 +92,9 @@ fn commit_write_batch(engine: &dyn VfsEngine) -> Result<(), Errno> {
 
     // Prepare for commit: flush and get proposed root.
     let result = engine.txg_commit_prepare(&handle)?;
+    if result.committed_root.is_zero() {
+        return Err(Errno::EINVAL);
+    }
 
     // If multi-node quorum is needed, collect peer acknowledgements here.
     if result.quorum_needed {
@@ -108,9 +110,10 @@ fn commit_write_batch(engine: &dyn VfsEngine) -> Result<(), Errno> {
 
 ### No-Daemon Boundary
 
-All three txg lifecycle methods resolve within kernel authority through the
-engine. No userspace daemon is required for normal filesystem operation.
-This is a key enabler for full-kernel no-daemon crash consistency.
+No-daemon transaction-group durability is available only through engines that
+explicitly implement txg lifecycle and committed-root writeback authority. The
+default trait methods intentionally refuse that authority so scaffolding cannot
+be mistaken for mounted full-kernel durability.
 
 ## Authority
 
