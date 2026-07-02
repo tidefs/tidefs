@@ -1483,8 +1483,6 @@ fn main() {
                 "claims" => run_checks!(
                     claims::check_current_workspace(),
                     forgejo_work::check_claim_gate_current_workspace(),
-                    forgejo_work::check_stale_claims_current_workspace(),
-                    forgejo_work::check_duplicate_claims_current_workspace(),
                     forgejo_work::check_abandoned_worktrees_current_workspace(),
                 ),
                 "format" => run_checks!(
@@ -1731,18 +1729,13 @@ fn run_all_checks() {
     // claims
     if let Err(e) = claims::check_current_workspace() {
         errors.push(format!("claims/check-claims-gate: {e}"));
-        // legacy claim tracker
-        if let Err(e) = forgejo_work::check_claim_gate_current_workspace() {
-            errors.push(format!("legacy-claim-tracker/check-claim-gate: {e}"));
-        }
-        if let Err(e) = forgejo_work::check_stale_claims_current_workspace() {
-            errors.push(format!("legacy-claim-tracker/check-stale-claims: {e}"));
-        }
-        if let Err(e) = forgejo_work::check_abandoned_worktrees_current_workspace() {
-            errors.push(format!(
-                "legacy-claim-tracker/check-abandoned-worktrees: {e}"
-            ));
-        }
+    }
+    // worktree claim gate and abandoned worktrees check
+    if let Err(e) = forgejo_work::check_claim_gate_current_workspace() {
+        errors.push(format!("worktree/check-claim-gate: {e}"));
+    }
+    if let Err(e) = forgejo_work::check_abandoned_worktrees_current_workspace() {
+        errors.push(format!("worktree/check-abandoned-worktrees: {e}"));
     }
     // kernel closure
     if let Err(e) = kernel_closure::check_current_workspace() {
@@ -2359,14 +2352,6 @@ fn print_summary() {
     println!("hot_read_cache_check_command=check-hot-read-cache");
     println!("claims_gate_check_command=check-claims-gate");
     println!("release_readiness_verdict_command=release-readiness-verdict");
-    println!("claim_validate_command=validate-claim");
-    println!("claim_gate_check_command=check-claim-gate");
-    println!("stale_claims_check_command=check-stale-claims");
-    println!("duplicate_claims_check_command=check-duplicate-claims");
-    println!("abandoned_worktrees_check_command=check-abandoned-worktrees");
-    println!("auto_release_stale_check_command=auto-release-stale-claims");
-    println!("coordination_health_command=coordination-health");
-    println!("acquire_claim_command=acquire-claim");
     println!("group_check_command=check-group");
     println!("local_filesystem_check_command=check-local-filesystem");
     println!("chunked_file_layout_check_command=check-chunked-file-layout");
@@ -2656,17 +2641,21 @@ fn print_help() {
     println!(
         "  validate-no-hidden-queues-receipt <path> validate a source/registry queue review receipt"
     );
-    println!("  check-claim-gate        validate current worktree has a valid issue owner");
+    println!("  check-claim-gate        validate current worktree has a valid GitHub issue owner");
     println!("  check-worktree-claim    alias for check-claim-gate");
     println!(
-        "  check-stale-claims      scan legacy claim tracker state for stale codex:claimed issues"
+        "  check-stale-claims      unsupported: the legacy Forgejo claim tracker has been retired"
     );
-    println!("  check-duplicate-claims  scan legacy claim tracker state for duplicate codex:claimed work keys");
-    println!("  auto-release-stale-claims auto-release stale codex:claimed issues (set TIDEFS_AUTO_RELEASE_STALE=1 to enable)");
     println!(
-        "  coordination-health      print a coordination health report from legacy tracker issue metrics"
+        "  check-duplicate-claims  unsupported: the legacy Forgejo claim tracker has been retired"
     );
-    println!("  acquire-claim <N>     atomically claim issue N (adds codex:claimed label with optimistic locking)");
+    println!("  auto-release-stale-claims unsupported: the legacy Forgejo claim tracker has been retired");
+    println!(
+        "  coordination-health      unsupported: the legacy Forgejo claim tracker has been retired"
+    );
+    println!(
+        "  acquire-claim <N>     unsupported: the legacy Forgejo claim tracker has been retired"
+    );
     println!("  check-abandoned-worktrees detect stale local worktree directories");
     println!("  check-stale-worktrees   alias for check-abandoned-worktrees");
     println!("  check-local-filesystem   validate the local filesystem MVP source slice");
