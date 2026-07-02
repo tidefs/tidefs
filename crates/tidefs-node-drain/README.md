@@ -1,157 +1,138 @@
 # tidefs-node-drain
 
-Staged node drain with resource migration, forced fencing, and decommission
-for TideFS distributed clusters.
+Crate-local staged node-drain state machines, message types, and trait-driven
+orchestration helpers.
 
-## Architecture
+This crate models drain progress for a node that is leaving membership duties.
+It does not by itself prove live multi-node behavior, roster updates, transport
+teardown, pool-wide data movement, or release-facing operator behavior. Those
+claims require the membership authority, claim registry, issue-owned source
+follow-ups, and current CI/runtime artifacts named below.
 
-The node drain protocol safely removes a storage node from the cluster in
-five ordered stages:
+## Current Boundary
 
-```
-DrainRequested -> DrainingLeases -> DrainingData -> DrainingCache -> DrainingAdmin -> Drained
-```
+The crate contains source-level building blocks:
 
-Each stage must complete before the next begins. Progress is tracked per-stage
-through `DrainProgress`, and the entire drain is bounded by a configurable
-timeout.
+- drain stages and progress counters;
+- BLAKE3-verified protocol snapshots and drain message structs;
+- forced-fence tokens and epoch-gate helpers;
+- migration, health verification, pool-label, and runtime drivers behind
+  caller-supplied traits;
+- unit tests and mock-driven runtime/orchestrator paths.
 
-### Modules
+The crate does not currently supply end-to-end evidence for:
 
-- **`drain`** — Core types: `NodeState`, `DrainStage`, `DrainProgress`,
-  `NodeDrain` (state machine), `DrainHandle` (read-only observer), and
-  `DrainError`.
+- a live membership roster transition across running nodes;
+- transport session admission or teardown in a deployed topology;
+- real object rebuild/relocation over an operator pool;
+- a final public operator command surface for node removal;
+- release-readiness, successor/comparator, or product-safety wording.
 
-- **`executor`** — `DrainExecutor` drives the drain through each stage by
-  calling `DrainOps` trait methods. `LockTableDrainOps` is a production
-  implementation backed by the lease lock table.
+Membership truth is owned by `docs/MEMBERSHIP_AUTHORITY.md`. That document
+classifies `tidefs-node-drain` as a consumer of membership epoch identity and
+records the remaining source work for epoch-transition-barrier fencing. It also
+states that cluster drain claims require the follow-up issues and runtime
+validation evidence.
 
-- **`forced_fencing`** — `ForcedFencing` handles unresponsive nodes: monotonic
-  `FenceToken` per node, `FencingStats` tracking, and `FenceExclusionProposal`
-  metadata for membership epoch transitions. Configurable max consecutive
-  fences before operator intervention.
+Publishing-facing capability wording is governed by
+`docs/CLAIMS_GATE_POLICY.md`, `validation/claims.toml`, and generated
+`docs/CLAIM_REGISTRY.md`. Validation artifacts, not this README, decide whether
+any future distributed-storage or operator-facing claim is admissible.
 
-- **`epoch_gate`** — `EpochGate` coordinates the membership epoch transition
-  that excludes a draining node. Uses a 3-phase protocol (propose,
-  accept-collect, commit) via the `EpochGateOps` trait.
+## Modules
 
-- **`migration`** — `MigrationDriver` orchestrates object-store enumeration,
-  placement-target assignment, send-stream transfers, and BLAKE3 checksum
-  verification via the `MigrationOps` trait.
+- `drain` - Core types: `NodeState`, `DrainStage`, `DrainProgress`,
+  `NodeDrain`, `DrainHandle`, and `DrainError`.
 
-- **`health_verify`** — `DrainHealthVerifier` validates that zero replicas
-  remain on the draining node after evacuation and that every object meets
-  its durability requirements. Uses the `HealthVerifyOps` trait.
+- `executor` - `DrainExecutor` advances the local drain stages by calling
+  `DrainOps` trait methods. The current lease-lock-table adapter can enumerate
+  and release leases; data, cache, and admin-role hooks remain service
+  integration points until their runtime owners are wired.
 
-- **`pool_label`** — `DrainPoolLabelUpdater` removes the drained node's
-  devices from pool labels via the `PoolLabelOps` trait, ensuring subsequent
-  pool imports do not rediscover evacuated devices.
+- `forced_fencing` - `ForcedFencing`, monotonic `FenceToken` values per node,
+  `FencingStats`, and fence-exclusion proposal metadata for membership epoch
+  transitions.
 
-- **`orchestrator`** — Top-level `drain_node()` entry point composing all
-  phases: drain executor, data migration, replication health verification,
-  epoch gate transition, and drain completion. Configured via
-  `NodeDrainConfig` with result in `DrainNodeOutcome`.
+- `epoch_gate` - `EpochGate` models the membership epoch transition that
+  excludes a draining node through `EpochGateOps`. Its state machine covers
+  proposal, accept collection, commit, timeout, failure, and cancellation.
 
-## Public API
+- `drain_state` - `DrainStateMachine` validates `DrainRequest` values against
+  `MembershipVerificationOps` and placement evidence before admitting a local
+  drain transition.
+
+- `state_machine` - `DrainProtocolMachine` tracks the protocol-level states
+  `Idle -> DrainAnnounced -> Draining -> DrainComplete -> Drained`, producing
+  BLAKE3-256 domain-separated state digests.
+
+- `protocol` - BLAKE3-verified drain messages: `DrainAnnounce`, `DrainAck`,
+  `StateTransferRequest`, `StateTransferChunk`, and `DrainComplete`. Each
+  message implements `DrainWireMessage::verify_full()`.
+
+- `config` - `DrainConfig` validates drain timeouts, transfer batch size, and
+  concurrency limits.
+
+- `runtime` - `DrainRuntime<O: DrainRuntimeOps>` drives announce, ack
+  collection, state-transfer messages, roster-removal callbacks,
+  transport-drain callbacks, and completion broadcasts through caller-provided
+  operations.
+
+- `migration` - `MigrationDriver` builds and executes object-transfer plans
+  through `MigrationOps`, including placement targets and checksum fields.
+
+- `health_verify` - `DrainHealthVerifier` asks `HealthVerifyOps` for remaining
+  replicas and durability status before a drain can be treated as complete.
+
+- `pool_label` - `DrainPoolLabelUpdater` calls `PoolLabelOps` to update the
+  drained node's device entries in pool-label metadata.
+
+- `orchestrator` - `drain_node()` composes request validation, lease-stage
+  execution, migration, health verification, epoch-gate commit, pool-label
+  update, and final state completion using caller-supplied implementations.
+
+## Public API Shape
+
+The top-level entry point is trait-backed. The caller supplies the live or test
+operations; the crate supplies the ordering and state checks.
 
 ```rust
-// Top-level entry point
 let outcome = tidefs_node_drain::drain_node(
     &config,
     &mut drain_ops,
     &mut migration_ops,
     &health_verify_ops,
     &mut gate_ops,
+    &verify_ops,
+    &placement_verifier,
 )?;
+```
 
-// Individual components
-let (mut drain, handle) = NodeDrain::drain(node_id);
-let (mut executor, handle) = DrainExecutor::start(node_id);
+Individual state-machine components can be exercised separately:
+
+```rust
+let (mut drain, _drain_handle) = NodeDrain::drain(node_id);
+let (mut executor, _executor_handle) = DrainExecutor::start(node_id);
 let mut migration = MigrationDriver::new(node_id);
 let mut gate = EpochGate::new(node_id, EpochGateConfig::default());
 let mut verifier = DrainHealthVerifier::new(node_id);
 let mut updater = DrainPoolLabelUpdater::new(node_id);
 ```
 
-## Protocol-level state machine
-
-The `DrainProtocolMachine` tracks the cluster-coordination drain lifecycle
-in five phases, each producing a BLAKE3-256 domain-separated state digest
-(domain: `tidefs-membership-drain-state-v1`):
-
-```
-Idle → DrainAnnounced → Draining → DrainComplete → Drained
-```
-
-- **Idle**: No drain in progress.
-- **DrainAnnounced**: Drain intent broadcast to peers; awaiting acks.
-- **Draining**: State transfer underway (leases, data, cache offloaded).
-- **DrainComplete**: Transfer finished; epoch gate pending.
-- **Drained**: Terminal — node excluded from roster.
-
-Cancellation is supported from any non-terminal state back to Idle.
-`Drained → Drained` is idempotent for retry safety.
+Protocol-level state can also be advanced directly in tests or model-style
+source checks:
 
 ```rust
 use tidefs_node_drain::state_machine::{DrainProtocolMachine, DrainProtocolState};
 
 let mut machine = DrainProtocolMachine::new();
-let snap = machine.announce_drain(node_id, epoch_id, 5)?;
-// Collect acks from peers...
-while !snap.all_acks_received() {
+machine.announce_drain(node_id, epoch_id, 5)?;
+while machine.acks_received() < machine.acks_expected() {
     machine.record_ack()?;
 }
 machine.start_draining()?;
-// Execute state transfers...
 machine.complete_draining()?;
 machine.finalize_drain()?;
 assert_eq!(machine.state(), DrainProtocolState::Drained);
-```
-
-## Wire protocol messages
-
-Five BLAKE3-verified message types (domain: `tidefs-membership-drain-v1`):
-
-| Message | Direction | Purpose |
-|---|---|---|
-| `DrainAnnounce` | Initiator → peers | Broadcast drain intent |
-| `DrainAck` | Peer → initiator | Accept or reject the drain |
-| `StateTransferRequest` | Peer → initiator | Request state handoff |
-| `StateTransferChunk` | Initiator → peer | Transfer a chunk of state |
-| `DrainComplete` | Initiator → peers | Confirm drain finalization |
-
-All messages implement `DrainWireMessage` with `verify_full()` for
-cryptographic integrity verification.
-
-## Runtime integration
-
-`DrainRuntime<O: DrainRuntimeOps>` orchestrates the full protocol:
-
-1. Broadcast `DrainAnnounce` to all peers.
-2. Collect `DrainAck` responses (with configurable timeout).
-3. Execute state transfer chunks via `StateTransferChunk`.
-4. Remove the drained node from the membership roster.
-5. Signal transport peer manager drain → teardown.
-6. Broadcast `DrainComplete`.
-
-The `DrainRuntimeOps` trait abstracts external services (messaging,
-roster, transport, event bridge). The membership-live runtime bridges
-`DrainRuntimeEvent` variants into `MembershipEvent::{Draining, Drained}`
-so that subscribers (transport peer manager, epoch transition engine)
-react to drain lifecycle progress.
-
-```rust
-use tidefs_node_drain::config::DrainConfig;
-use tidefs_node_drain::runtime::{DrainRuntime, DrainRuntimeOps};
-
-let config = DrainConfig::default(); // 30s timeout, batch=64, concurrent=4
-let mut runtime = DrainRuntime::new(config, my_ops);
-runtime.start_drain(node_id, "maintenance window".into())?;
-// ... collect acks, transfer state ...
-runtime.begin_state_transfer()?;
-runtime.transfer_chunk(target, 0, 0, payload)?;
-runtime.complete_state_transfer()?;
-runtime.finalize_drain()?;
 ```
 
 ## Testing
@@ -160,7 +141,8 @@ runtime.finalize_drain()?;
 cargo test -p tidefs-node-drain
 ```
 
-251 unit tests covering the full drain protocol: state machine transitions,
-BLAKE3 wire-message integrity, config validation, runtime orchestration,
-multi-peer ack collection, state transfer, timeout enforcement, roster
-integration, transport signaling, and concurrent drain serialization.
+The crate tests cover module-local state transitions, BLAKE3 message integrity,
+configuration validation, mock runtime/orchestrator paths, state-transfer
+messages, timeout handling, roster-callback hooks, transport-callback hooks,
+and concurrent-drain serialization. They are source and unit-test evidence, not
+live multi-node validation.
