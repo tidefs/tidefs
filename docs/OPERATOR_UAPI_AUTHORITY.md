@@ -48,11 +48,10 @@ claim release readiness.
   classification source, and states that the preview boundary is not a
   production Linux ioctl, statx, or ublk ABI freeze and is not kernelspace
   readiness evidence.
-- `apps/README.md` classifies `apps/tidefsctl`, the FUSE adapter daemon, the
-  block-volume adapter daemon, scrub, and storage-node as bounded userspace
-  entrypoints. It states that FUSE, ublk, storage-node, scrub, and CLI behavior
-  still require issue-scoped validation before release-facing wording can rely
-  on them.
+- `docs/workspace-package-classification.md` classifies `apps/tidefsctl`, the
+  FUSE adapter daemon, the block-volume adapter daemon, scrub, and storage-node
+  as bounded userspace entrypoints. `apps/README.md` is only a navigation
+  pointer to that checked authority and the issue-scoped validation boundary.
 - `apps/tidefsctl/src/commands/classification.rs` is the current command
   class, routing, help-visibility, and summary registry for public operator,
   userspace harness, operator diagnostic, prototype, development diagnostic,

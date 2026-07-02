@@ -75,15 +75,15 @@ anchors instead of creating parallel systems.
 
 Before adding any crate, trace format, artifact class, claim path, or harness,
 workers must rediscover the current workspace through
-`docs/workspace-package-classification.md`, root `Cargo.toml`, `crates/README.md`,
-live issue/PR state, and focused `rg --files` inspection. The uploaded guide's
+`docs/workspace-package-classification.md`, root `Cargo.toml`, live issue/PR
+state, and focused `rg --files` inspection. The uploaded guide's
 crate names describe desired authority roles. They are not permission to create
 duplicate packages when the repository already has an authority with a different
 name or a narrower scope.
 
 | Program area | Current TideFS authority | Status and finishing direction |
 | --- | --- | --- |
-| Workspace inventory | `docs/workspace-package-classification.md`, root `Cargo.toml`, `crates/README.md`, `xtask check-workspace-policy` | Use this before creating or deleting packages. Package role classification is navigation and policy evidence, not product proof. |
+| Workspace inventory | `docs/workspace-package-classification.md`, root `Cargo.toml`, `xtask check-workspace-policy` | Use this before creating or deleting packages. Package role classification is navigation and policy evidence, not product proof. |
 | Integrated program authority | `docs/NEXTGEN_VERIFICATION_PERFORMANCE_OFFLOAD_PLAN.md` | This document is the integrated program authority for issue #483 and issue #1066. The old issue #281 roadmap root was deleted by issue #1656; use git, issue, and PR history for staging lineage. |
 | Request contract | `docs/REQUEST_CONTRACT.md`, `crates/tidefs-types-vfs-core`, `crates/tidefs-schema-codec-vfs` from PRs #300 and #315 | Reuse these instead of adding `tidefs-contract-core` or `tidefs-contract-codec` unless a future issue proves the split is needed. |
 | Contract codecs | `xtask check-contract-codecs`, fixed v1 request/completion codec, golden vectors, reserved-field rejection | Good seed for contract-shape validation. This is codec/tooling evidence, not runtime adapter proof. |
