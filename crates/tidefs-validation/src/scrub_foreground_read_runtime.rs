@@ -15,6 +15,10 @@ use crate::mount_harness::{find_daemon_binary, MountHarness};
 use crate::runtime_artifact_source::RuntimeArtifactSource;
 use crate::validation_schema::ValidationTier;
 use crate::validation_status::ValidationStatus;
+use tidefs_performance_contract::oracle::{
+    with_scheduling_and_admission, without_scheduling_or_admission, OracleConfig,
+};
+use tidefs_performance_contract::ServiceCurve;
 
 pub const SCRUB_FOREGROUND_READ_ROW_ID: &str = "scrub-foreground-read-runtime";
 pub const SCRUB_READ_RUNTIME_ARTIFACT: &str = "scrub-read-runtime.json";
@@ -23,7 +27,7 @@ pub const SCRUB_READ_PRIMARY_CLAIM_ID: &str = "scrub.foreground_read.protected.v
 
 const FOREGROUND_READ_NOT_BLOCKED_CLAIM_ID: &str =
     "perf.local.foreground_read_not_blocked_by_scrub.v1";
-const SOURCE_ISSUE: &str = "https://github.com/tidefs/tidefs/issues/1527";
+const SOURCE_ISSUE: &str = "https://github.com/tidefs/tidefs/issues/1792";
 const SOURCE_LABEL: &str = "qemu-smoke-scrub-foreground-read-runtime";
 const BACKGROUND_SCRUB_INTERVAL_SECS: u64 = 1;
 const FOREGROUND_READ_BYTES: usize = 128 * 1024;
@@ -35,18 +39,6 @@ const SCRUB_LIMIT_IOPS: u64 = 1;
 const SCRUB_BACKOFF_MILLIS: u64 = 25;
 const FUSE_SUPER_MAGIC: libc::c_long = 0x6573_5546;
 const MOUNT_READY_TIMEOUT_SECS: u64 = 10;
-// Mirrors the reviewed performance-contract service curves for this row
-// without making tidefs-validation's default Clippy target pull that stack in.
-const FOREGROUND_READ_WORK_CLASS: &str = "foreground-read";
-const FOREGROUND_READ_DOMAIN: &str = "foreground-io";
-const FOREGROUND_READ_MAX_OPS_PER_TICK: u32 = 1;
-const FOREGROUND_READ_MAX_BYTES_PER_TICK: u64 = 128 * 1024;
-const FOREGROUND_READ_QUEUE_SLOTS: u32 = 64;
-const SCRUB_WORK_CLASS: &str = "scrub";
-const SCRUB_DOMAIN: &str = "background-io";
-const SCRUB_MAX_OPS_PER_TICK: u32 = 1;
-const SCRUB_MAX_BYTES_PER_TICK: u64 = 1024 * 1024;
-const SCRUB_QUEUE_SLOTS: u32 = 4;
 const FOREGROUND_READ_ARRIVAL_TICK: u64 = 1;
 const MAX_FOREGROUND_READ_WAIT_TICKS: u64 = 1;
 
@@ -79,7 +71,23 @@ pub struct ScrubForegroundReadRuntimeEvidence {
 impl ScrubForegroundReadRuntimeEvidence {
     pub fn assert_no_product_or_harness_failure(&self) -> Result<(), String> {
         match self.outcome {
-            ValidationStatus::Pass | ValidationStatus::EnvironmentRefusal => Ok(()),
+            ValidationStatus::Pass => {
+                if self.passed
+                    && scrub_read_isolation_passed(
+                        &self.foreground_read,
+                        &self.scrub_activity,
+                        &self.service_curve,
+                    )
+                {
+                    Ok(())
+                } else {
+                    Err(
+                        "scrub foreground-read runtime row reported pass without complete read-isolation evidence"
+                            .to_string(),
+                    )
+                }
+            }
+            ValidationStatus::EnvironmentRefusal => Ok(()),
             ValidationStatus::ProductFail => Err(format!(
                 "scrub foreground-read runtime row found product failure: {:?}",
                 self.foreground_read.failures
@@ -163,30 +171,38 @@ pub struct RateLimitAttemptEvidence {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServiceCurveEvidence {
+    pub source_contract: String,
+    pub scheduled_oracle: String,
+    pub unscheduled_counterexample: String,
     pub foreground_read_work_class: String,
     pub foreground_read_domain: String,
     pub foreground_max_ops_per_tick: u32,
     pub foreground_max_bytes_per_tick: u64,
     pub foreground_queue_slots: u32,
+    pub foreground_read_admitted_by_service_curve: bool,
     pub scrub_work_class: String,
     pub scrub_domain: String,
     pub scrub_max_ops_per_tick: u32,
     pub scrub_max_bytes_per_tick: u64,
     pub scrub_queue_slots: u32,
+    pub scrub_unit_admitted_by_service_curve: bool,
     pub scrub_units_requested: u32,
     pub foreground_read_arrival_tick: u64,
     pub foreground_read_completed_tick: u64,
     pub foreground_read_wait_ticks: u64,
     pub max_foreground_read_wait_ticks: u64,
     pub foreground_read_within_bound: bool,
+    pub unscheduled_foreground_read_completed_tick: u64,
+    pub unscheduled_foreground_read_wait_ticks: u64,
+    pub unscheduled_foreground_read_within_bound: bool,
 }
 
 pub fn run_scrub_foreground_read_runtime(command: String) -> ScrubForegroundReadRuntimeEvidence {
     let generated_at = generated_at();
     let source_ref = source_ref();
     let run_id = workflow_run_id();
-    let scrub_model = build_scrub_activity();
     let service_curve = build_service_curve();
+    let scrub_model = build_scrub_activity(&service_curve);
     let dev_fuse_present = Path::new("/dev/fuse").exists();
     let daemon_bin_result = find_daemon_binary();
     let daemon_bin = daemon_bin_result
@@ -294,10 +310,7 @@ pub fn run_scrub_foreground_read_runtime(command: String) -> ScrubForegroundRead
         statfs_type_hex: format!("0x{mount_f_type:x}"),
     };
     let foreground_read = run_foreground_read(&harness, &service_curve);
-    let outcome = if foreground_read.passed
-        && scrub_model.pending_or_rate_limited_during_read
-        && service_curve.foreground_read_within_bound
-    {
+    let outcome = if scrub_read_isolation_passed(&foreground_read, &scrub_model, &service_curve) {
         ValidationStatus::Pass
     } else {
         ValidationStatus::ProductFail
@@ -374,9 +387,7 @@ fn base_evidence(input: BaseEvidenceInput) -> ScrubForegroundReadRuntimeEvidence
     } = input;
     let workload_ran = foreground_read.workload_ran;
     let passed = outcome == ValidationStatus::Pass
-        && foreground_read.passed
-        && scrub_activity.pending_or_rate_limited_during_read
-        && service_curve.foreground_read_within_bound;
+        && scrub_read_isolation_passed(&foreground_read, &scrub_activity, &service_curve);
     ScrubForegroundReadRuntimeEvidence {
         manifest_version: 1,
         row_id: SCRUB_FOREGROUND_READ_ROW_ID.to_string(),
@@ -427,8 +438,8 @@ fn base_evidence(input: BaseEvidenceInput) -> ScrubForegroundReadRuntimeEvidence
     }
 }
 
-fn build_scrub_activity() -> ScrubActivityEvidence {
-    let scrub_admitted = SCRUB_UNITS_REQUESTED.min(SCRUB_QUEUE_SLOTS);
+fn build_scrub_activity(service_curve: &ServiceCurveEvidence) -> ScrubActivityEvidence {
+    let scrub_admitted = SCRUB_UNITS_REQUESTED.min(service_curve.scrub_queue_slots);
     let scrub_deferred = SCRUB_UNITS_REQUESTED.saturating_sub(scrub_admitted);
     let mut limiter = DeterministicScrubLimiter::new(SCRUB_LIMIT_BYTES_PER_SEC, SCRUB_LIMIT_IOPS);
     let first = rate_limit_attempt(&mut limiter, "pre-read-scrub-dispatch");
@@ -529,27 +540,69 @@ fn rate_limit_attempt(
 }
 
 fn build_service_curve() -> ServiceCurveEvidence {
-    let foreground_read_completed_tick = FOREGROUND_READ_ARRIVAL_TICK;
-    let foreground_read_wait_ticks =
-        foreground_read_completed_tick.saturating_sub(FOREGROUND_READ_ARRIVAL_TICK);
+    let config = scrub_read_oracle_config();
+    let foreground = ServiceCurve::FOREGROUND_READ_DEFAULT;
+    let scrub = ServiceCurve::SCRUB_BOUNDED_DEFAULT;
+    let scheduled = with_scheduling_and_admission(config, foreground, scrub);
+    let unscheduled = without_scheduling_or_admission(config);
     ServiceCurveEvidence {
-        foreground_read_work_class: FOREGROUND_READ_WORK_CLASS.to_string(),
-        foreground_read_domain: FOREGROUND_READ_DOMAIN.to_string(),
-        foreground_max_ops_per_tick: FOREGROUND_READ_MAX_OPS_PER_TICK,
-        foreground_max_bytes_per_tick: FOREGROUND_READ_MAX_BYTES_PER_TICK,
-        foreground_queue_slots: FOREGROUND_READ_QUEUE_SLOTS,
-        scrub_work_class: SCRUB_WORK_CLASS.to_string(),
-        scrub_domain: SCRUB_DOMAIN.to_string(),
-        scrub_max_ops_per_tick: SCRUB_MAX_OPS_PER_TICK,
-        scrub_max_bytes_per_tick: SCRUB_MAX_BYTES_PER_TICK,
-        scrub_queue_slots: SCRUB_QUEUE_SLOTS,
-        scrub_units_requested: SCRUB_UNITS_REQUESTED,
-        foreground_read_arrival_tick: FOREGROUND_READ_ARRIVAL_TICK,
-        foreground_read_completed_tick,
-        foreground_read_wait_ticks,
-        max_foreground_read_wait_ticks: MAX_FOREGROUND_READ_WAIT_TICKS,
-        foreground_read_within_bound: foreground_read_wait_ticks <= MAX_FOREGROUND_READ_WAIT_TICKS,
+        source_contract: "tidefs-performance-contract::ServiceCurve".to_string(),
+        scheduled_oracle: "tidefs-performance-contract::oracle::with_scheduling_and_admission"
+            .to_string(),
+        unscheduled_counterexample:
+            "tidefs-performance-contract::oracle::without_scheduling_or_admission".to_string(),
+        foreground_read_work_class: foreground.work_class.as_str().to_string(),
+        foreground_read_domain: foreground.primary_domain.as_str().to_string(),
+        foreground_max_ops_per_tick: foreground.max_ops_per_tick,
+        foreground_max_bytes_per_tick: foreground.max_bytes_per_tick,
+        foreground_queue_slots: foreground.queue_slots,
+        foreground_read_admitted_by_service_curve: foreground.admits(
+            foreground.work_class,
+            1,
+            FOREGROUND_READ_BYTES as u64,
+        ),
+        scrub_work_class: scrub.work_class.as_str().to_string(),
+        scrub_domain: scrub.primary_domain.as_str().to_string(),
+        scrub_max_ops_per_tick: scrub.max_ops_per_tick,
+        scrub_max_bytes_per_tick: scrub.max_bytes_per_tick,
+        scrub_queue_slots: scrub.queue_slots,
+        scrub_unit_admitted_by_service_curve: scrub.admits(scrub.work_class, 1, SCRUB_UNIT_BYTES),
+        scrub_units_requested: config.scrub_units,
+        foreground_read_arrival_tick: config.read_arrival_tick,
+        foreground_read_completed_tick: scheduled.foreground_read_completed_tick,
+        foreground_read_wait_ticks: scheduled.foreground_read_wait_ticks,
+        max_foreground_read_wait_ticks: config.max_foreground_read_wait_ticks,
+        foreground_read_within_bound: scheduled
+            .foreground_read_within_bound(config.max_foreground_read_wait_ticks),
+        unscheduled_foreground_read_completed_tick: unscheduled.foreground_read_completed_tick,
+        unscheduled_foreground_read_wait_ticks: unscheduled.foreground_read_wait_ticks,
+        unscheduled_foreground_read_within_bound: unscheduled
+            .foreground_read_within_bound(config.max_foreground_read_wait_ticks),
     }
+}
+
+fn scrub_read_oracle_config() -> OracleConfig {
+    OracleConfig {
+        scrub_units: SCRUB_UNITS_REQUESTED,
+        read_arrival_tick: FOREGROUND_READ_ARRIVAL_TICK,
+        max_foreground_read_wait_ticks: MAX_FOREGROUND_READ_WAIT_TICKS,
+    }
+}
+
+fn scrub_read_isolation_passed(
+    foreground_read: &ForegroundReadEvidence,
+    scrub_activity: &ScrubActivityEvidence,
+    service_curve: &ServiceCurveEvidence,
+) -> bool {
+    foreground_read.passed
+        && scrub_activity.background_scrub_configured
+        && scrub_activity.pending_or_rate_limited_during_read
+        && scrub_activity.scrub_deferred_by_service_curve > 0
+        && scrub_activity.throttle_observed
+        && service_curve.foreground_read_admitted_by_service_curve
+        && service_curve.scrub_unit_admitted_by_service_curve
+        && service_curve.foreground_read_within_bound
+        && !service_curve.unscheduled_foreground_read_within_bound
 }
 
 fn run_foreground_read(
@@ -800,7 +853,7 @@ mod tests {
                 service_curve.max_foreground_read_wait_ticks,
                 mount_error,
             ),
-            scrub_activity: build_scrub_activity(),
+            scrub_activity: build_scrub_activity(&service_curve),
             service_curve,
         });
 
@@ -818,5 +871,31 @@ mod tests {
             .any(|failure| failure.contains("statfs_type=0xef53")));
         assert_eq!(evidence.runtime_source.exit_status, 0);
         assert!(evidence.assert_no_product_or_harness_failure().is_ok());
+    }
+
+    #[test]
+    fn service_curve_evidence_uses_typed_contract_oracle() {
+        let service_curve = build_service_curve();
+
+        assert_eq!(
+            service_curve.foreground_read_work_class,
+            ServiceCurve::FOREGROUND_READ_DEFAULT.work_class.as_str()
+        );
+        assert_eq!(
+            service_curve.scrub_queue_slots,
+            ServiceCurve::SCRUB_BOUNDED_DEFAULT.queue_slots
+        );
+        assert!(service_curve.foreground_read_admitted_by_service_curve);
+        assert!(service_curve.scrub_unit_admitted_by_service_curve);
+        assert!(service_curve.foreground_read_within_bound);
+        assert!(!service_curve.unscheduled_foreground_read_within_bound);
+
+        let scrub_activity = build_scrub_activity(&service_curve);
+        assert_eq!(
+            scrub_activity.scrub_deferred_by_service_curve,
+            SCRUB_UNITS_REQUESTED - ServiceCurve::SCRUB_BOUNDED_DEFAULT.queue_slots
+        );
+        assert!(scrub_activity.pending_or_rate_limited_during_read);
+        assert!(scrub_activity.throttle_observed);
     }
 }

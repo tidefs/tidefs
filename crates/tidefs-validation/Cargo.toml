@@ -141,6 +141,7 @@ tidefs-object-io = { workspace = true, optional = true }
 tidefs-local-filesystem = { workspace = true, optional = true }
 tidefs-storage-intent-core = { workspace = true, optional = true }
 tidefs-intent-log = { workspace = true, optional = true }
+tidefs-performance-contract = { workspace = true }
 tidefs-reclaim = { workspace = true, optional = true }
 tidefs-reclaim-queue-core = { workspace = true }
 tidefs-segment-cleaner = { workspace = true, optional = true }
