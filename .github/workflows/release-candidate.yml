@@ -262,22 +262,40 @@ jobs:
                 name: $name,
                 expected_path_patterns: $paths
               };
-            def lane_manifest($owner_issue; $evidence_class):
-              if $owner_issue == null then
+            def manifest_missing_input:
+              "lane-local manifest is not produced by the release-candidate workflow";
+            def historical_manifest_provenance($completed_issue):
+              {
+                completed_issue: $completed_issue,
+                state: "closed",
+                role: "historical lane-local manifest producer lineage"
+              };
+            def manifest_boundary($completed_issue; $evidence_class):
+              {
+                status: "absent",
+                current_owner_issue: null,
+                evidence_class: $evidence_class,
+                missing_input: manifest_missing_input,
+                historical_provenance: historical_manifest_provenance($completed_issue)
+              };
+            def lane_manifest($completed_issue; $evidence_class):
+              if $completed_issue == null then
                 {
                   status: "not_applicable",
-                  owner_issue: null,
+                  current_owner_issue: null,
                   evidence_class: $evidence_class
                 }
               else
                 {
                   status: "absent",
-                  owner_issue: $owner_issue,
+                  current_owner_issue: null,
                   evidence_class: $evidence_class,
+                  missing_input: manifest_missing_input,
+                  historical_provenance: historical_manifest_provenance($completed_issue),
                   note: (
                     "Lane-local manifests are outside this workflow slice; "
-                    + "the candidate index records their absence instead of "
-                    + "synthesizing a pass claim."
+                    + "historical closed issue lineage is provenance only, "
+                    + "not a current owner or synthesized pass claim."
                   )
                 }
               end;
@@ -308,26 +326,22 @@ jobs:
                 lane_local_manifests_synthesized: false
               },
               lane_local_manifest_boundaries: [
-                {
-                  owner_issue: 643,
-                  evidence_class: "xfstests lane-local evidence manifest",
-                  status: "absent"
-                },
-                {
-                  owner_issue: 644,
-                  evidence_class: "Kernel fsync lane-local evidence manifest",
-                  status: "absent"
-                },
-                {
-                  owner_issue: 645,
-                  evidence_class: "Focused Rust lane-local evidence manifest",
-                  status: "absent"
-                },
-                {
-                  owner_issue: 646,
-                  evidence_class: "RDMA lane-local evidence manifest",
-                  status: "absent"
-                }
+                manifest_boundary(
+                  643;
+                  "xfstests lane-local evidence manifest"
+                ),
+                manifest_boundary(
+                  644;
+                  "Kernel fsync lane-local evidence manifest"
+                ),
+                manifest_boundary(
+                  645;
+                  "Focused Rust lane-local evidence manifest"
+                ),
+                manifest_boundary(
+                  646;
+                  "RDMA lane-local evidence manifest"
+                )
               ],
               lanes: [
                 {
@@ -526,10 +540,18 @@ jobs:
                 true
               end) and
               (if .lane_local_manifest.status == "absent" then
-                .lane_local_manifest.owner_issue != null
+                (.lane_local_manifest.current_owner_issue == null) and
+                (.lane_local_manifest.missing_input == "lane-local manifest is not produced by the release-candidate workflow") and
+                (.lane_local_manifest.historical_provenance.state == "closed")
               else
                 true
               end)
+            )) and
+            all(.lane_local_manifest_boundaries[]; (
+              (.status == "absent") and
+              (.current_owner_issue == null) and
+              (.missing_input == "lane-local manifest is not produced by the release-candidate workflow") and
+              (.historical_provenance.state == "closed")
             ))
             ' "$out_path" >/dev/null
 
