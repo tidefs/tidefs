@@ -46,8 +46,10 @@ The selected boundary is therefore:
   `tidefs-snapshot-pruner` as current product-code authority, with live daemon
   integration and dataset-level automated scheduling still open before this
   decision.
-- `docs/STUB_PLACEHOLDER_INVENTORY.md` records the same residual live daemon
-  follow-up after closed #834 established the crate authority.
+- `docs/REVIEW_TODO_REGISTER.md` keeps TFR-013/TFR-016 stage-residue cleanup
+  open broadly; this decision and its follow-up map own only the
+  snapshot-pruner live-scheduling boundary after closed #834 established the
+  crate authority.
 - Closed #834 established the authority claim for retention planning,
   integrity-gated prune, clone/origin protection, deadlist evidence management,
   explicit destroy, and validation evidence. It left live scheduling as a

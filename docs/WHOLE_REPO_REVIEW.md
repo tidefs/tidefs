@@ -706,9 +706,9 @@ Examples include:
   after `7dbb0759` removed `pool list` scaffolding and downgraded exercise
   wording;
 - `apps/tidefs-posix-filesystem-adapter-daemon/Cargo.toml` now follows
-  `docs/workspace-package-classification.md` adapter-operator authority, and
-  `docs/STUB_PLACEHOLDER_INVENTORY.md` section 1 records the stale wording
-  cleanup;
+  `docs/workspace-package-classification.md` adapter-operator authority; any
+  remaining source-level stub/placeholder cleanup is tracked by TFR-013/TFR-016
+  and live issue #1721;
 - `apps/tidefs-posix-filesystem-adapter-daemon/tests/fuse_e2e_smoke.rs`
   defining Claimed/NotReady test stubs;
 - kernel compatibility stubs in `kmod/src/kernel_types.rs`;
