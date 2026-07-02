@@ -777,6 +777,7 @@ struct tidefs_posix_vfs_mount {
 
 enum {
 	Opt_bootstrap,
+	Opt_engine_backed,
 	Opt_device,
 	Opt_ro,
 	Opt_rw,
@@ -804,6 +805,7 @@ struct tidefs_posix_vfs_fs_context {
 
 static const struct fs_parameter_spec tidefs_posix_vfs_fs_parameters[] = {
 	fsparam_flag("bootstrap", Opt_bootstrap),
+	fsparam_flag("engine-backed", Opt_engine_backed),
 	fsparam_string("device", Opt_device),
 	fsparam_flag("ro", Opt_ro),
 	fsparam_flag("rw", Opt_rw),
@@ -7222,6 +7224,14 @@ static int tidefs_posix_vfs_parse_param(struct fs_context *fc,
 	switch (opt) {
 	case Opt_bootstrap:
 		ctx->bootstrap = true;
+		return 0;
+	case Opt_engine_backed:
+		/*
+		 * show_options reports engine-backed mounts so remount(8) can
+		 * replay the token. Accept it only as descriptive input; the
+		 * actual engine-backed authority still comes from the block
+		 * device mount path, and reconfigure refuses remount below.
+		 */
 		return 0;
 	case Opt_device:
 		kfree(ctx->device_path);
