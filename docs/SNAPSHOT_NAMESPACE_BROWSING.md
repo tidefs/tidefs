@@ -41,9 +41,10 @@ snapshot browsing support.
   operations, lookup(parent, name) -> InodeAttr, generation tracking for
   ESTALE, and the contract that InodeId, InodeAttr, and Generation are the
   canonical VFS vocabulary.
-- `docs/design/posix-acl-xattr-codec-and-evaluation-design.md` — ACL evaluation
-  against caller credentials,
-  mode-ACL synchronisation, and default-ACL inheritance.
+- `crates/tidefs-posix-acl/src/lib.rs` and `crates/tidefs-permission/src/lib.rs`
+  — ACL evaluation against caller credentials, mode-ACL synchronisation, default
+  ACL inheritance, xattr namespace validation, and mount-identity keyed access
+  decisions.
 - Open issue #295 / PR #613 — active FUSE namespace stress work.
 - Closed issue #442 / merged PR #682 — POSIX ACL inheritance boundaries.
 
