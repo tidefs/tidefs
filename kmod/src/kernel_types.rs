@@ -665,7 +665,7 @@ mod kbuild_impl {
         #[must_use]
         pub const fn new() -> Self {
             Self {
-                inner: kernel::alloc::KVec::new(),
+                inner: kernel::alloc::KVec::<T>::new(),
             }
         }
 
@@ -676,7 +676,7 @@ mod kbuild_impl {
                     capacity,
                     kernel::alloc::flags::GFP_KERNEL,
                 )
-                .unwrap_or_else(|_| kernel::alloc::KVec::new()),
+                .unwrap_or_else(|_| kernel::alloc::KVec::<T>::new()),
             }
         }
 
@@ -691,7 +691,7 @@ mod kbuild_impl {
         {
             Self {
                 inner: kernel::alloc::KVec::from_elem(value, n, kernel::alloc::flags::GFP_KERNEL)
-                    .unwrap_or_else(|_| kernel::alloc::KVec::new()),
+                    .unwrap_or_else(|_| kernel::alloc::KVec::<T>::new()),
             }
         }
 
@@ -2519,7 +2519,7 @@ mod kbuild_impl {
         Ok(KernelPoolSuperblock::from_label(&label))
     }
 
-    // ── Xattr storage types (kernel-compatible stubs for CONFIG_RUST builds) ──
+    // ── Xattr storage types (kernel-compatible mirrors for CONFIG_RUST builds) ──
 
     /// Xattr store error kind — must match tidefs_xattr_storage::XattrStoreError.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2528,7 +2528,7 @@ mod kbuild_impl {
         EntryNotFound,
     }
 
-    /// Dataset xattr policy stub — must match tidefs_xattr_storage::DatasetXattrPolicy.
+    /// Dataset xattr policy mirror — must match tidefs_xattr_storage::DatasetXattrPolicy.
     #[derive(Debug, Clone, Copy)]
     pub struct DatasetXattrPolicy {
         max_entries: u32,
@@ -2549,23 +2549,90 @@ mod kbuild_impl {
         }
     }
 
+    pub const POSIX_XATTR_NAME_MAX: usize = 255;
+
     /// Error returned by pack_posix_xattr_name_list.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum XattrNameListError {
-        NameTooLong,
+        EmptyName,
+        NameContainsNul,
+        NameTooLong { len: usize, max: usize },
+        DuplicateName,
+        NameListTooLarge,
     }
 
     /// Pack a list of xattr name byte slices into a POSIX listxattr buffer.
     pub fn pack_posix_xattr_name_list(
-        _names: &[KmodVec<u8>],
+        names: &[KmodVec<u8>],
     ) -> Result<KmodVec<u8>, XattrNameListError> {
-        Ok(KmodVec::new())
+        let mut sorted = KmodVec::with_capacity(names.len());
+        for name in names {
+            validate_xattr_name_for_list(name)?;
+            sorted.push(name.clone());
+        }
+
+        let mut i = 1usize;
+        while i < sorted.len() {
+            let mut j = i;
+            while j > 0 && xattr_name_less(&sorted[j], &sorted[j - 1]) {
+                sorted.swap(j, j - 1);
+                j -= 1;
+            }
+            i += 1;
+        }
+
+        let mut total_len = 0usize;
+        for (index, name) in sorted.iter().enumerate() {
+            if index > 0 && sorted[index - 1][..] == name[..] {
+                return Err(XattrNameListError::DuplicateName);
+            }
+            total_len = total_len
+                .checked_add(name.len())
+                .and_then(|len| len.checked_add(1))
+                .ok_or(XattrNameListError::NameListTooLarge)?;
+        }
+
+        let mut packed = KmodVec::with_capacity(total_len);
+        for name in &sorted {
+            packed.extend_from_slice(name);
+            packed.push(0);
+        }
+        Ok(packed)
     }
 
-    /// Kernel-compatible xattr store stub.
-    #[derive(Debug)]
+    fn validate_xattr_name_for_list(name: &[u8]) -> Result<(), XattrNameListError> {
+        if name.is_empty() {
+            return Err(XattrNameListError::EmptyName);
+        }
+        if name.contains(&0) {
+            return Err(XattrNameListError::NameContainsNul);
+        }
+        if name.len() > POSIX_XATTR_NAME_MAX {
+            return Err(XattrNameListError::NameTooLong {
+                len: name.len(),
+                max: POSIX_XATTR_NAME_MAX,
+            });
+        }
+        Ok(())
+    }
+
+    fn xattr_name_less(left: &KmodVec<u8>, right: &KmodVec<u8>) -> bool {
+        left[..] < right[..]
+    }
+
+    #[derive(Debug, Clone)]
+    struct XattrEntry {
+        name: KmodVec<u8>,
+        value: KmodVec<u8>,
+        flags: u8,
+    }
+
+    /// Kernel-compatible xattr store for one inode.
+    #[derive(Debug, Clone)]
     pub struct XattrStore {
-        _policy: DatasetXattrPolicy,
+        policy: DatasetXattrPolicy,
+        entries: KmodVec<XattrEntry>,
+        acl_flag: bool,
         version_counter: u64,
     }
 
@@ -2573,42 +2640,137 @@ mod kbuild_impl {
         #[must_use]
         pub fn new(policy: DatasetXattrPolicy) -> Self {
             Self {
-                _policy: policy,
+                policy,
+                entries: KmodVec::new(),
+                acl_flag: false,
                 version_counter: 0,
             }
         }
 
         #[must_use]
-        pub fn get(&self, _name: &[u8]) -> Option<KmodVec<u8>> {
-            None
-        }
-
-        pub fn set(&mut self, _name: &[u8], _value: &[u8], _flags: u8) {
-            self.version_counter += 1;
+        pub fn new_with_acl(policy: DatasetXattrPolicy) -> Self {
+            Self {
+                policy,
+                entries: KmodVec::new(),
+                acl_flag: true,
+                version_counter: 0,
+            }
         }
 
         #[must_use]
-        pub fn contains(&self, _name: &[u8]) -> bool {
-            false
+        pub fn get(&self, name: &[u8]) -> Option<KmodVec<u8>> {
+            for entry in &self.entries {
+                if &entry.name[..] == name {
+                    return Some(entry.value.clone());
+                }
+            }
+            None
         }
 
-        pub fn remove(&mut self, _name: &[u8]) -> Result<(), XattrStoreError> {
+        pub fn set(&mut self, name: &[u8], value: &[u8], flags: u8) -> Option<KmodVec<u8>> {
+            for entry in &mut self.entries {
+                if &entry.name[..] == name {
+                    let previous = entry.value.clone();
+                    entry.value.clear();
+                    entry.value.extend_from_slice(value);
+                    entry.flags = flags;
+                    self.version_counter += 1;
+                    return Some(previous);
+                }
+            }
+
+            let mut stored_name = KmodVec::with_capacity(name.len());
+            stored_name.extend_from_slice(name);
+            let mut stored_value = KmodVec::with_capacity(value.len());
+            stored_value.extend_from_slice(value);
+            let before = self.entries.len();
+            self.entries.push(XattrEntry {
+                name: stored_name,
+                value: stored_value,
+                flags,
+            });
+            if self.entries.len() == before.saturating_add(1) {
+                self.version_counter += 1;
+            }
+            None
+        }
+
+        #[must_use]
+        pub fn flags(&self, name: &[u8]) -> Option<u8> {
+            for entry in &self.entries {
+                if &entry.name[..] == name {
+                    return Some(entry.flags);
+                }
+            }
+            None
+        }
+
+        pub fn set_has_acl(&mut self, acl: bool) {
+            self.acl_flag = acl;
+        }
+
+        #[must_use]
+        pub fn has_acl(&self) -> bool {
+            self.acl_flag
+        }
+
+        #[must_use]
+        pub fn list(&self) -> KmodVec<(KmodVec<u8>, KmodVec<u8>)> {
+            let mut out = KmodVec::with_capacity(self.entries.len());
+            for entry in &self.entries {
+                out.push((entry.name.clone(), entry.value.clone()));
+            }
+            out
+        }
+
+        pub fn list_posix_name_bytes(&self) -> Result<KmodVec<u8>, XattrNameListError> {
+            pack_posix_xattr_name_list(&self.list_names())
+        }
+
+        #[must_use]
+        pub fn total_value_bytes(&self) -> u64 {
+            let mut total = 0u64;
+            for entry in &self.entries {
+                total = total.saturating_add(entry.value.len() as u64);
+            }
+            total
+        }
+
+        #[must_use]
+        pub fn contains(&self, name: &[u8]) -> bool {
+            self.get(name).is_some()
+        }
+
+        pub fn remove(&mut self, name: &[u8]) -> Result<(), XattrStoreError> {
+            if let Some(index) = self
+                .entries
+                .iter()
+                .position(|entry| &entry.name[..] == name)
+            {
+                self.entries.remove(index);
+                self.version_counter += 1;
+                return Ok(());
+            }
             Err(XattrStoreError::EntryNotFound)
         }
 
         #[must_use]
         pub fn list_names(&self) -> KmodVec<KmodVec<u8>> {
-            KmodVec::new()
+            let mut names = KmodVec::with_capacity(self.entries.len());
+            for entry in &self.entries {
+                names.push(entry.name.clone());
+            }
+            names
         }
 
         #[must_use]
         pub fn len(&self) -> u64 {
-            0
+            self.entries.len() as u64
         }
 
         #[must_use]
         pub fn is_empty(&self) -> bool {
-            true
+            self.entries.is_empty()
         }
 
         #[must_use]
@@ -2618,7 +2780,7 @@ mod kbuild_impl {
 
         #[must_use]
         pub fn policy(&self) -> DatasetXattrPolicy {
-            self._policy
+            self.policy
         }
     }
 
@@ -2831,7 +2993,10 @@ mod kbuild_impl {
                 Self::RefcountNotZero => write!(f, "pool refcount is not zero"),
                 Self::NotMounted => write!(f, "pool is not mounted — writes require mounted state"),
                 Self::MissingImportedRoot => {
-                    write!(f, "pool import is missing committed-root object/extent/inode state")
+                    write!(
+                        f,
+                        "pool import is missing committed-root object/extent/inode state"
+                    )
                 }
             }
         }
