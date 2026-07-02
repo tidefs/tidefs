@@ -10,17 +10,24 @@ Start with these files before changing behavior or documentation:
 
 1. `README.md`
 2. `AGENTS.md`
-3. `docs/ARCHITECTURE.md`
-4. `docs/LICENSING.md`
-5. `docs/GITHUB_CI.md`
-6. `docs/TEST_SIGNAL_POLICY.md`
-7. `docs/REVIEW_TODO_POLICY.md`
-8. `docs/REVIEW_TODO_REGISTER.md`
+3. `docs/GITHUB_PR_DEVELOPMENT.md`
+4. `docs/GITHUB_CI.md`
+5. `docs/CLAIMS_GATE_POLICY.md`
+6. `docs/REVIEW_TODO_POLICY.md`
+7. `docs/REVIEW_TODO_REGISTER.md`
+8. `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`
 9. `docs/INDEX.md`
 
 The review register is the durable debt map. The documentation index names
 additional design docs and explains that a listed document is not automatically
 current authority.
+
+Read `docs/LICENSING.md`, `docs/TEST_SIGNAL_POLICY.md`,
+`docs/UNRELEASED_AUTHORITY_POLICY.md`, and
+`docs/CONTROL_FORMAT_AND_JSON_POLICY.md` when a change touches those surfaces.
+Do not treat broad reference/status files such as `docs/ARCHITECTURE.md` or
+`docs/WHOLE_REPO_REVIEW.md` as mandatory first-read authority unless live issue
+and repository-doc state explicitly reclassify them.
 
 ## Development Environment
 

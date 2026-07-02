@@ -4,16 +4,19 @@ Start here for active project authority:
 
 1. `README.md`
 2. `AGENTS.md`
-3. `docs/LICENSING.md`
+3. `docs/GITHUB_PR_DEVELOPMENT.md`
 4. `docs/GITHUB_CI.md`
-5. `docs/TEST_SIGNAL_POLICY.md`
+5. `docs/CLAIMS_GATE_POLICY.md`
 6. `docs/REVIEW_TODO_POLICY.md`
-7. `docs/UNRELEASED_AUTHORITY_POLICY.md`
-8. `docs/REVIEW_TODO_REGISTER.md`
-9. `docs/WHOLE_REPO_REVIEW.md`
-10. `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`
-11. `docs/CLAIMS_GATE_POLICY.md`
-12. `docs/CONTROL_FORMAT_AND_JSON_POLICY.md`
+7. `docs/REVIEW_TODO_REGISTER.md`
+8. `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`
+9. `docs/INDEX.md`
+
+Read `docs/LICENSING.md`, `docs/TEST_SIGNAL_POLICY.md`,
+`docs/UNRELEASED_AUTHORITY_POLICY.md`, and
+`docs/CONTROL_FORMAT_AND_JSON_POLICY.md` when a change touches those surfaces.
+Managed-worker host docs may impose local process constraints, but they are not
+public product policy or prerequisite reading for ordinary contributors.
 
 Book:
 
@@ -36,6 +39,9 @@ coordination packets, and closeout snapshots are historical input by default;
 old maturity/status labels, Forgejo references, phase-completion wording, or
 canonical-design wording inside those files does not make them current
 authority.
+Broad reference/status files such as `docs/ARCHITECTURE.md` and
+`docs/WHOLE_REPO_REVIEW.md` are not mandatory first-read authority unless live
+issue and repository-doc state explicitly reclassify them.
 
 Release readiness boundary and evidence inputs:
 
@@ -82,8 +88,9 @@ Current authority families:
   `docs/OPERATOR_PRODUCT_SURFACE_DECISION.md`, `docs/REQUEST_CONTRACT.md`,
   `docs/CONTROL_FORMAT_AND_JSON_POLICY.md`, and
   `docs/TRACE_ORACLE_ARTIFACT_SCHEMA.md`.
-- Validation, CI, and workspace policy: `docs/GITHUB_CI.md`,
-  `docs/TEST_SIGNAL_POLICY.md`, `docs/XFSTESTS_DISPATCH_CONTRACT.md`,
+- Validation, CI, and workspace policy: `docs/GITHUB_PR_DEVELOPMENT.md`,
+  `docs/GITHUB_CI.md`, `docs/TEST_SIGNAL_POLICY.md`,
+  `docs/XFSTESTS_DISPATCH_CONTRACT.md`,
   `docs/workspace-package-classification.md`, and
   `docs/CLAIMS_GATE_POLICY.md`.
 
