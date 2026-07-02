@@ -111,7 +111,7 @@
 //! mapping and the evacuation read/write closures.  This module provides
 //! the anchor, label, and import primitives that the CLI composes.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use tidefs_local_object_store::ObjectKey;
 use tidefs_pool_scan::{DeviceRemovalPlan, DeviceRemovalResult, PoolConfig};
@@ -130,9 +130,10 @@ pub const DEVICE_REMOVAL_RECORD_KEY: &str = "tidefs-device-removal-record";
 
 /// A record of a completed (or in-progress) device removal.
 ///
-/// Serialized as JSON and persisted through the commit_group system so that
-/// recovery can replay or finalize the removal.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+/// Encoded with the typed/versioned durable codec selected by this module and
+/// persisted through the commit_group system so recovery can replay or finalize
+/// the removal.
+#[derive(Clone, Debug)]
 pub struct DeviceRemovalRecord {
     /// Path of the removed device.
     pub removed_device: PathBuf,
@@ -176,6 +177,22 @@ impl DeviceRemovalRecord {
             removal_complete: result.objects_failed == 0 && result.committed_root_anchored,
         }
     }
+
+    /// Encode this record as the durable device-removal record format.
+    ///
+    /// The format is intentionally local to the current source authority. It is
+    /// not a compatibility promise for older pre-release JSON records.
+    pub fn encode_durable(&self) -> Result<Vec<u8>, DeviceRemovalAnchorError> {
+        encode_device_removal_record(self).map_err(DeviceRemovalAnchorError::Serialize)
+    }
+
+    /// Decode the durable device-removal record format.
+    ///
+    /// Unknown versions, malformed bytes, trailing bytes, and invalid field
+    /// combinations return an explicit error.
+    pub fn decode_durable(bytes: &[u8]) -> Result<Self, DeviceRemovalAnchorError> {
+        decode_device_removal_record(bytes).map_err(DeviceRemovalAnchorError::Serialize)
+    }
 }
 
 /// Well-known object key for persisting in-progress evacuation state.
@@ -190,7 +207,7 @@ pub const EVACUATION_PROGRESS_KEY: &str = "tidefs-evacuation-progress";
 /// recovery can resume from the last committed checkpoint.  When all objects
 /// have been processed this record is superseded by the final
 /// [`DeviceRemovalRecord`].
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug)]
 pub struct EvacuationProgressRecord {
     /// Path of the device being evacuated.
     pub target_device: std::path::PathBuf,
@@ -293,6 +310,405 @@ impl EvacuationProgressRecord {
         }
         set
     }
+
+    /// Encode this record as the durable evacuation-progress format.
+    ///
+    /// The format is intentionally local to the current source authority. It is
+    /// not a compatibility promise for older pre-release JSON records.
+    pub fn encode_durable(&self) -> Result<Vec<u8>, DeviceRemovalAnchorError> {
+        encode_evacuation_progress_record(self).map_err(DeviceRemovalAnchorError::Serialize)
+    }
+
+    /// Decode the durable evacuation-progress format.
+    ///
+    /// Unknown versions, malformed bytes, trailing bytes, and invalid field
+    /// combinations return an explicit error.
+    pub fn decode_durable(bytes: &[u8]) -> Result<Self, DeviceRemovalAnchorError> {
+        decode_evacuation_progress_record(bytes).map_err(DeviceRemovalAnchorError::Serialize)
+    }
+}
+
+const DEVICE_REMOVAL_RECORD_MAGIC: &[u8; 8] = b"TFSRMV\0\0";
+const EVACUATION_PROGRESS_RECORD_MAGIC: &[u8; 8] = b"TFSEVAC\0";
+const DURABLE_RECORD_VERSION: u16 = 1;
+const MAX_DURABLE_RECORD_PATH_BYTES: usize = 4096;
+const MAX_DURABLE_RECORD_ITEMS: usize = 1_000_000;
+
+fn encode_device_removal_record(record: &DeviceRemovalRecord) -> Result<Vec<u8>, String> {
+    validate_device_removal_record(record)?;
+
+    let mut out = Vec::new();
+    write_record_header(&mut out, DEVICE_REMOVAL_RECORD_MAGIC);
+    write_path(&mut out, &record.removed_device)?;
+    out.extend_from_slice(&record.device_guid);
+    write_u32(&mut out, record.device_index);
+    write_path_vec(&mut out, &record.surviving_devices)?;
+    write_u32(&mut out, record.device_count_before);
+    write_u32(&mut out, record.device_count_after);
+    write_u64(&mut out, record.objects_evacuated);
+    write_u64(&mut out, record.bytes_evacuated);
+    write_u64(&mut out, record.objects_failed);
+    write_u64(&mut out, record.topology_generation);
+    write_bool(&mut out, record.removal_complete);
+    Ok(out)
+}
+
+fn decode_device_removal_record(bytes: &[u8]) -> Result<DeviceRemovalRecord, String> {
+    let mut cursor = DurableRecordCursor::new(bytes);
+    read_record_header(&mut cursor, DEVICE_REMOVAL_RECORD_MAGIC, "device removal")?;
+    let removed_device = cursor.read_path("removed_device")?;
+    let device_guid = cursor.read_array_16("device_guid")?;
+    let device_index = cursor.read_u32("device_index")?;
+    let surviving_devices = cursor.read_path_vec("surviving_devices")?;
+    let device_count_before = cursor.read_u32("device_count_before")?;
+    let device_count_after = cursor.read_u32("device_count_after")?;
+    let objects_evacuated = cursor.read_u64("objects_evacuated")?;
+    let bytes_evacuated = cursor.read_u64("bytes_evacuated")?;
+    let objects_failed = cursor.read_u64("objects_failed")?;
+    let topology_generation = cursor.read_u64("topology_generation")?;
+    let removal_complete = cursor.read_bool("removal_complete")?;
+    cursor.finish("device removal")?;
+
+    let record = DeviceRemovalRecord {
+        removed_device,
+        device_guid,
+        device_index,
+        surviving_devices,
+        device_count_before,
+        device_count_after,
+        objects_evacuated,
+        bytes_evacuated,
+        objects_failed,
+        topology_generation,
+        removal_complete,
+    };
+    validate_device_removal_record(&record)?;
+    Ok(record)
+}
+
+fn validate_device_removal_record(record: &DeviceRemovalRecord) -> Result<(), String> {
+    validate_nonempty_path(&record.removed_device, "removed_device")?;
+    if record.device_count_before == 0 {
+        return Err("device_count_before must be nonzero".into());
+    }
+    if record.device_index >= record.device_count_before {
+        return Err(format!(
+            "device_index {} is outside device_count_before {}",
+            record.device_index, record.device_count_before
+        ));
+    }
+    if record.device_count_after > record.device_count_before {
+        return Err(format!(
+            "device_count_after {} exceeds device_count_before {}",
+            record.device_count_after, record.device_count_before
+        ));
+    }
+    if record.removal_complete && record.objects_failed != 0 {
+        return Err("removal_complete record cannot report failed objects".into());
+    }
+    Ok(())
+}
+
+fn encode_evacuation_progress_record(record: &EvacuationProgressRecord) -> Result<Vec<u8>, String> {
+    validate_evacuation_progress_record(record)?;
+
+    let mut out = Vec::new();
+    write_record_header(&mut out, EVACUATION_PROGRESS_RECORD_MAGIC);
+    write_path(&mut out, &record.target_device)?;
+    out.extend_from_slice(&record.target_device_guid);
+    write_u32(&mut out, record.target_device_index);
+    write_path_vec(&mut out, &record.surviving_devices)?;
+    write_u32(&mut out, record.device_count_before);
+    write_u32(&mut out, record.device_count_after);
+    write_u64(&mut out, record.topology_generation);
+    write_u64(&mut out, record.next_object_index);
+    write_u64(&mut out, record.total_objects);
+    write_u64(&mut out, record.objects_evacuated);
+    write_u64(&mut out, record.bytes_evacuated);
+    write_u64(&mut out, record.objects_failed);
+    write_u64_vec(&mut out, &record.evacuated_object_ids)?;
+    write_u64_vec(&mut out, &record.failed_object_ids)?;
+    Ok(out)
+}
+
+fn decode_evacuation_progress_record(bytes: &[u8]) -> Result<EvacuationProgressRecord, String> {
+    let mut cursor = DurableRecordCursor::new(bytes);
+    read_record_header(
+        &mut cursor,
+        EVACUATION_PROGRESS_RECORD_MAGIC,
+        "evacuation progress",
+    )?;
+    let target_device = cursor.read_path("target_device")?;
+    let target_device_guid = cursor.read_array_16("target_device_guid")?;
+    let target_device_index = cursor.read_u32("target_device_index")?;
+    let surviving_devices = cursor.read_path_vec("surviving_devices")?;
+    let device_count_before = cursor.read_u32("device_count_before")?;
+    let device_count_after = cursor.read_u32("device_count_after")?;
+    let topology_generation = cursor.read_u64("topology_generation")?;
+    let next_object_index = cursor.read_u64("next_object_index")?;
+    let total_objects = cursor.read_u64("total_objects")?;
+    let objects_evacuated = cursor.read_u64("objects_evacuated")?;
+    let bytes_evacuated = cursor.read_u64("bytes_evacuated")?;
+    let objects_failed = cursor.read_u64("objects_failed")?;
+    let evacuated_object_ids = cursor.read_u64_vec("evacuated_object_ids")?;
+    let failed_object_ids = cursor.read_u64_vec("failed_object_ids")?;
+    cursor.finish("evacuation progress")?;
+
+    let record = EvacuationProgressRecord {
+        target_device,
+        target_device_guid,
+        target_device_index,
+        surviving_devices,
+        device_count_before,
+        device_count_after,
+        topology_generation,
+        next_object_index,
+        total_objects,
+        objects_evacuated,
+        bytes_evacuated,
+        objects_failed,
+        evacuated_object_ids,
+        failed_object_ids,
+    };
+    validate_evacuation_progress_record(&record)?;
+    Ok(record)
+}
+
+fn validate_evacuation_progress_record(record: &EvacuationProgressRecord) -> Result<(), String> {
+    validate_nonempty_path(&record.target_device, "target_device")?;
+    if record.device_count_before == 0 {
+        return Err("device_count_before must be nonzero".into());
+    }
+    if record.target_device_index >= record.device_count_before {
+        return Err(format!(
+            "target_device_index {} is outside device_count_before {}",
+            record.target_device_index, record.device_count_before
+        ));
+    }
+    if record.device_count_after > record.device_count_before {
+        return Err(format!(
+            "device_count_after {} exceeds device_count_before {}",
+            record.device_count_after, record.device_count_before
+        ));
+    }
+    if record.next_object_index > record.total_objects {
+        return Err(format!(
+            "next_object_index {} exceeds total_objects {}",
+            record.next_object_index, record.total_objects
+        ));
+    }
+    if record.objects_evacuated != record.evacuated_object_ids.len() as u64 {
+        return Err("objects_evacuated does not match evacuated_object_ids length".into());
+    }
+    if record.objects_failed != record.failed_object_ids.len() as u64 {
+        return Err("objects_failed does not match failed_object_ids length".into());
+    }
+    let processed = record
+        .objects_evacuated
+        .checked_add(record.objects_failed)
+        .ok_or_else(|| "processed object counters overflow".to_string())?;
+    if processed > record.next_object_index {
+        return Err("processed object counters exceed next_object_index".into());
+    }
+    Ok(())
+}
+
+fn validate_nonempty_path(path: &Path, field: &str) -> Result<(), String> {
+    if path.as_os_str().is_empty() {
+        return Err(format!("{field} must not be empty"));
+    }
+    Ok(())
+}
+
+fn write_record_header(out: &mut Vec<u8>, magic: &[u8; 8]) {
+    out.extend_from_slice(magic);
+    write_u16(out, DURABLE_RECORD_VERSION);
+}
+
+fn read_record_header(
+    cursor: &mut DurableRecordCursor<'_>,
+    magic: &[u8; 8],
+    record_name: &str,
+) -> Result<(), String> {
+    let found_magic = cursor.read_exact(8, "record magic")?;
+    if found_magic != magic.as_slice() {
+        return Err(format!("{record_name} record magic mismatch"));
+    }
+    let version = cursor.read_u16("record version")?;
+    if version != DURABLE_RECORD_VERSION {
+        return Err(format!(
+            "{record_name} record version {version} is not supported"
+        ));
+    }
+    Ok(())
+}
+
+fn write_u16(out: &mut Vec<u8>, value: u16) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn write_u32(out: &mut Vec<u8>, value: u32) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn write_u64(out: &mut Vec<u8>, value: u64) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn write_bool(out: &mut Vec<u8>, value: bool) {
+    out.push(u8::from(value));
+}
+
+fn write_len(out: &mut Vec<u8>, len: usize, field: &str) -> Result<(), String> {
+    let len = u32::try_from(len).map_err(|_| format!("{field} length exceeds u32"))?;
+    write_u32(out, len);
+    Ok(())
+}
+
+fn write_path(out: &mut Vec<u8>, path: &Path) -> Result<(), String> {
+    let path = path
+        .to_str()
+        .ok_or_else(|| "path is not valid UTF-8".to_string())?;
+    let bytes = path.as_bytes();
+    if bytes.is_empty() {
+        return Err("path must not be empty".into());
+    }
+    if bytes.len() > MAX_DURABLE_RECORD_PATH_BYTES {
+        return Err(format!(
+            "path is {} bytes, max {}",
+            bytes.len(),
+            MAX_DURABLE_RECORD_PATH_BYTES
+        ));
+    }
+    write_len(out, bytes.len(), "path")?;
+    out.extend_from_slice(bytes);
+    Ok(())
+}
+
+fn write_path_vec(out: &mut Vec<u8>, paths: &[PathBuf]) -> Result<(), String> {
+    if paths.len() > MAX_DURABLE_RECORD_ITEMS {
+        return Err(format!("path vector has {} items", paths.len()));
+    }
+    write_len(out, paths.len(), "path vector")?;
+    for path in paths {
+        write_path(out, path)?;
+    }
+    Ok(())
+}
+
+fn write_u64_vec(out: &mut Vec<u8>, values: &[u64]) -> Result<(), String> {
+    if values.len() > MAX_DURABLE_RECORD_ITEMS {
+        return Err(format!("u64 vector has {} items", values.len()));
+    }
+    write_len(out, values.len(), "u64 vector")?;
+    for value in values {
+        write_u64(out, *value);
+    }
+    Ok(())
+}
+
+struct DurableRecordCursor<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> DurableRecordCursor<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, offset: 0 }
+    }
+
+    fn read_exact(&mut self, len: usize, field: &str) -> Result<&'a [u8], String> {
+        let end = self
+            .offset
+            .checked_add(len)
+            .ok_or_else(|| format!("{field} length overflows record offset"))?;
+        let slice = self
+            .bytes
+            .get(self.offset..end)
+            .ok_or_else(|| format!("truncated {field}"))?;
+        self.offset = end;
+        Ok(slice)
+    }
+
+    fn read_u16(&mut self, field: &str) -> Result<u16, String> {
+        let bytes = self.read_exact(2, field)?;
+        Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
+    }
+
+    fn read_u32(&mut self, field: &str) -> Result<u32, String> {
+        let bytes = self.read_exact(4, field)?;
+        Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+
+    fn read_u64(&mut self, field: &str) -> Result<u64, String> {
+        let bytes = self.read_exact(8, field)?;
+        Ok(u64::from_le_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ]))
+    }
+
+    fn read_bool(&mut self, field: &str) -> Result<bool, String> {
+        let value = self.read_exact(1, field)?[0];
+        match value {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(format!("{field} has invalid boolean value {value}")),
+        }
+    }
+
+    fn read_array_16(&mut self, field: &str) -> Result<[u8; 16], String> {
+        let bytes = self.read_exact(16, field)?;
+        let mut array = [0u8; 16];
+        array.copy_from_slice(bytes);
+        Ok(array)
+    }
+
+    fn read_len(&mut self, field: &str, max: usize) -> Result<usize, String> {
+        let len = self.read_u32(field)? as usize;
+        if len > max {
+            return Err(format!("{field} length {len} exceeds max {max}"));
+        }
+        Ok(len)
+    }
+
+    fn read_path(&mut self, field: &str) -> Result<PathBuf, String> {
+        let len = self.read_len(field, MAX_DURABLE_RECORD_PATH_BYTES)?;
+        let bytes = self.read_exact(len, field)?;
+        let value =
+            std::str::from_utf8(bytes).map_err(|_| format!("{field} is not valid UTF-8"))?;
+        if value.is_empty() {
+            return Err(format!("{field} must not be empty"));
+        }
+        Ok(PathBuf::from(value))
+    }
+
+    fn read_path_vec(&mut self, field: &str) -> Result<Vec<PathBuf>, String> {
+        let len = self.read_len(field, MAX_DURABLE_RECORD_ITEMS)?;
+        let mut paths = Vec::with_capacity(len);
+        for _ in 0..len {
+            paths.push(self.read_path(field)?);
+        }
+        Ok(paths)
+    }
+
+    fn read_u64_vec(&mut self, field: &str) -> Result<Vec<u64>, String> {
+        let len = self.read_len(field, MAX_DURABLE_RECORD_ITEMS)?;
+        let mut values = Vec::with_capacity(len);
+        for _ in 0..len {
+            values.push(self.read_u64(field)?);
+        }
+        Ok(values)
+    }
+
+    fn finish(&self, record_name: &str) -> Result<(), String> {
+        if self.offset != self.bytes.len() {
+            return Err(format!(
+                "{record_name} record has {} trailing bytes",
+                self.bytes.len() - self.offset
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Persist in-progress evacuation state to the target store.
@@ -304,8 +720,7 @@ pub fn persist_evacuation_progress(
     store: &mut tidefs_local_object_store::LocalObjectStore,
     progress: &EvacuationProgressRecord,
 ) -> Result<(), DeviceRemovalAnchorError> {
-    let payload = serde_json::to_vec(progress)
-        .map_err(|e| DeviceRemovalAnchorError::Serialize(e.to_string()))?;
+    let payload = progress.encode_durable()?;
     let key = ObjectKey::from_name(EVACUATION_PROGRESS_KEY);
     store
         .put(key, &payload)
@@ -327,11 +742,7 @@ pub fn load_evacuation_progress(
         .get(key)
         .map_err(|e| DeviceRemovalAnchorError::StoreWrite(format!("read progress: {e}")))?;
     match bytes {
-        Some(data) => {
-            let record: EvacuationProgressRecord = serde_json::from_slice(&data)
-                .map_err(|e| DeviceRemovalAnchorError::Serialize(e.to_string()))?;
-            Ok(Some(record))
-        }
+        Some(data) => Ok(Some(EvacuationProgressRecord::decode_durable(&data)?)),
         None => Ok(None),
     }
 }
@@ -561,8 +972,7 @@ pub fn anchor_device_removal(
 ) -> Result<(), DeviceRemovalAnchorError> {
     let record = DeviceRemovalRecord::from_plan_and_result(plan, result);
 
-    let payload = serde_json::to_vec(&record)
-        .map_err(|e| DeviceRemovalAnchorError::Serialize(e.to_string()))?;
+    let payload = record.encode_durable()?;
 
     let key = ObjectKey::from_name(DEVICE_REMOVAL_RECORD_KEY);
 
@@ -651,8 +1061,8 @@ pub fn write_updated_labels_to_devices(
 /// Errors that can occur during device removal anchoring.
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum DeviceRemovalAnchorError {
-    /// Failed to serialize the removal record.
-    #[error("failed to serialize device removal record: {0}")]
+    /// Failed to encode or decode a durable removal/progress record.
+    #[error("failed to encode or decode device removal record: {0}")]
     Serialize(String),
 
     /// Failed to write the removal record to the store.
@@ -775,7 +1185,7 @@ mod tests {
         // Verify the removal record was persisted.
         let record_key = ObjectKey::from_name(DEVICE_REMOVAL_RECORD_KEY);
         let record_bytes = store.get(record_key).unwrap().unwrap();
-        let record: DeviceRemovalRecord = serde_json::from_slice(&record_bytes).unwrap();
+        let record = DeviceRemovalRecord::decode_durable(&record_bytes).unwrap();
         assert_eq!(
             record.removed_device,
             std::path::PathBuf::from("/dev/disk1")
@@ -847,6 +1257,111 @@ mod tests {
 
         let record_key = ObjectKey::from_name(DEVICE_REMOVAL_RECORD_KEY);
         assert!(store.get(record_key).unwrap().is_some());
+    }
+
+    #[test]
+    fn device_removal_record_durable_codec_roundtrip() {
+        let record = DeviceRemovalRecord {
+            removed_device: std::path::PathBuf::from("/dev/disk1"),
+            device_guid: [0x11u8; 16],
+            device_index: 1,
+            surviving_devices: vec![
+                std::path::PathBuf::from("/dev/disk0"),
+                std::path::PathBuf::from("/dev/disk2"),
+            ],
+            device_count_before: 3,
+            device_count_after: 2,
+            objects_evacuated: 7,
+            bytes_evacuated: 4096,
+            objects_failed: 0,
+            topology_generation: 9,
+            removal_complete: true,
+        };
+
+        let encoded = record.encode_durable().expect("encode");
+        let decoded = DeviceRemovalRecord::decode_durable(&encoded).expect("decode");
+        assert_eq!(decoded.removed_device, record.removed_device);
+        assert_eq!(decoded.device_guid, record.device_guid);
+        assert_eq!(decoded.device_index, record.device_index);
+        assert_eq!(decoded.surviving_devices, record.surviving_devices);
+        assert_eq!(decoded.objects_evacuated, record.objects_evacuated);
+        assert_eq!(decoded.bytes_evacuated, record.bytes_evacuated);
+        assert!(decoded.removal_complete);
+    }
+
+    #[test]
+    fn device_removal_record_rejects_unknown_version() {
+        let record = DeviceRemovalRecord {
+            removed_device: std::path::PathBuf::from("/dev/disk1"),
+            device_guid: [0x11u8; 16],
+            device_index: 1,
+            surviving_devices: vec![std::path::PathBuf::from("/dev/disk0")],
+            device_count_before: 2,
+            device_count_after: 1,
+            objects_evacuated: 1,
+            bytes_evacuated: 512,
+            objects_failed: 0,
+            topology_generation: 3,
+            removal_complete: true,
+        };
+
+        let mut encoded = record.encode_durable().expect("encode");
+        encoded[8..10].copy_from_slice(&2u16.to_le_bytes());
+        let err = DeviceRemovalRecord::decode_durable(&encoded).unwrap_err();
+        assert!(
+            err.to_string().contains("version"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn device_removal_record_rejects_truncated_input() {
+        let record = DeviceRemovalRecord {
+            removed_device: std::path::PathBuf::from("/dev/disk1"),
+            device_guid: [0x11u8; 16],
+            device_index: 1,
+            surviving_devices: vec![std::path::PathBuf::from("/dev/disk0")],
+            device_count_before: 2,
+            device_count_after: 1,
+            objects_evacuated: 1,
+            bytes_evacuated: 512,
+            objects_failed: 0,
+            topology_generation: 3,
+            removal_complete: true,
+        };
+
+        let mut encoded = record.encode_durable().expect("encode");
+        encoded.pop();
+        let err = DeviceRemovalRecord::decode_durable(&encoded).unwrap_err();
+        assert!(
+            err.to_string().contains("truncated"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn device_removal_record_rejects_corrupt_bool_field() {
+        let record = DeviceRemovalRecord {
+            removed_device: std::path::PathBuf::from("/dev/disk1"),
+            device_guid: [0x11u8; 16],
+            device_index: 1,
+            surviving_devices: vec![std::path::PathBuf::from("/dev/disk0")],
+            device_count_before: 2,
+            device_count_after: 1,
+            objects_evacuated: 1,
+            bytes_evacuated: 512,
+            objects_failed: 0,
+            topology_generation: 3,
+            removal_complete: true,
+        };
+
+        let mut encoded = record.encode_durable().expect("encode");
+        *encoded.last_mut().expect("bool byte") = 7;
+        let err = DeviceRemovalRecord::decode_durable(&encoded).unwrap_err();
+        assert!(
+            err.to_string().contains("boolean"),
+            "unexpected error: {err}"
+        );
     }
 
     // ── EvacuationProgressRecord tests ──────────────────────────────
@@ -994,12 +1509,113 @@ mod tests {
     }
 
     #[test]
+    fn evacuation_progress_durable_codec_roundtrip() {
+        let mut progress = EvacuationProgressRecord::new(EvacuationProgressInit {
+            target_device: std::path::PathBuf::from("/dev/disk0"),
+            target_device_guid: [0xABu8; 16],
+            target_device_index: 0,
+            surviving_devices: vec![std::path::PathBuf::from("/dev/disk1")],
+            device_count_before: 2,
+            device_count_after: 1,
+            topology_generation: 7,
+            total_objects: 3,
+        });
+        progress.record_evacuated(10, 1024);
+        progress.record_failed(12);
+
+        let encoded = progress.encode_durable().expect("encode");
+        let decoded = EvacuationProgressRecord::decode_durable(&encoded).expect("decode");
+        assert_eq!(decoded.target_device, progress.target_device);
+        assert_eq!(decoded.target_device_guid, progress.target_device_guid);
+        assert_eq!(decoded.next_object_index, progress.next_object_index);
+        assert_eq!(decoded.objects_evacuated, progress.objects_evacuated);
+        assert_eq!(decoded.failed_object_ids, progress.failed_object_ids);
+    }
+
+    #[test]
+    fn evacuation_progress_rejects_unknown_version() {
+        let progress = EvacuationProgressRecord::new(EvacuationProgressInit {
+            target_device: std::path::PathBuf::from("/dev/disk0"),
+            target_device_guid: [0xABu8; 16],
+            target_device_index: 0,
+            surviving_devices: vec![],
+            device_count_before: 1,
+            device_count_after: 0,
+            topology_generation: 7,
+            total_objects: 0,
+        });
+
+        let mut encoded = progress.encode_durable().expect("encode");
+        encoded[8..10].copy_from_slice(&2u16.to_le_bytes());
+        let err = EvacuationProgressRecord::decode_durable(&encoded).unwrap_err();
+        assert!(
+            err.to_string().contains("version"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn evacuation_progress_rejects_truncated_input() {
+        let progress = EvacuationProgressRecord::new(EvacuationProgressInit {
+            target_device: std::path::PathBuf::from("/dev/disk0"),
+            target_device_guid: [0xABu8; 16],
+            target_device_index: 0,
+            surviving_devices: vec![],
+            device_count_before: 1,
+            device_count_after: 0,
+            topology_generation: 7,
+            total_objects: 0,
+        });
+
+        let mut encoded = progress.encode_durable().expect("encode");
+        encoded.truncate(encoded.len() - 3);
+        let err = EvacuationProgressRecord::decode_durable(&encoded).unwrap_err();
+        assert!(
+            err.to_string().contains("truncated"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn evacuation_progress_rejects_corrupt_counter_fields() {
+        let mut progress = EvacuationProgressRecord::new(EvacuationProgressInit {
+            target_device: std::path::PathBuf::from("x"),
+            target_device_guid: [0xABu8; 16],
+            target_device_index: 0,
+            surviving_devices: vec![],
+            device_count_before: 1,
+            device_count_after: 0,
+            topology_generation: 7,
+            total_objects: 0,
+        });
+        progress.objects_evacuated = 1;
+
+        let err = progress.encode_durable().unwrap_err();
+        assert!(
+            err.to_string().contains("objects_evacuated"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn load_evacuation_progress_returns_none_when_no_record() {
         let dir = tempfile::tempdir().unwrap();
         let store = tidefs_local_object_store::LocalObjectStore::open(dir.path()).unwrap();
 
         let loaded = load_evacuation_progress(&store).unwrap();
         assert!(loaded.is_none());
+    }
+
+    #[test]
+    fn load_evacuation_progress_rejects_malformed_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = tidefs_local_object_store::LocalObjectStore::open(dir.path()).unwrap();
+        let key = ObjectKey::from_name(EVACUATION_PROGRESS_KEY);
+        store.put(key, b"not-a-durable-record").unwrap();
+        store.sync().unwrap();
+
+        let err = load_evacuation_progress(&store).unwrap_err();
+        assert!(err.to_string().contains("magic"), "unexpected error: {err}");
     }
 
     #[test]

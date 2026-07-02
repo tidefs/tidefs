@@ -192,10 +192,11 @@ pub const REBUILD_COMPLETION_RECORD_KEY: &str = "tidefs-rebuild-completion-recor
 
 /// A record of a completed rebuild from surviving replicas.
 ///
-/// Serialized as JSON and persisted through the commit_group system so
-/// that recovery can detect completed rebuilds and pool import can
-/// verify that the rebuilt device is no longer missing.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+/// Encoded with the typed/versioned durable codec selected by this module and
+/// persisted through the commit_group system so recovery can detect completed
+/// rebuilds and pool import can verify that the rebuilt device is no longer
+/// missing.
+#[derive(Clone, Debug)]
 pub struct RebuildCompletionRecord {
     /// Pool UUID from labels.
     pub pool_uuid: [u8; 16],
@@ -232,6 +233,155 @@ impl RebuildCompletionRecord {
             objects_rebuilt: report.objects_rebuilt,
             rebuild_complete: report.is_complete(),
         }
+    }
+
+    /// Encode this record as the durable rebuild-completion format.
+    ///
+    /// The format is intentionally local to the current source authority. It is
+    /// not a compatibility promise for older pre-release JSON records.
+    pub fn encode_durable(&self) -> Result<Vec<u8>, String> {
+        encode_rebuild_completion_record(self)
+    }
+
+    /// Decode the durable rebuild-completion format.
+    ///
+    /// Unknown versions, malformed bytes, trailing bytes, and invalid field
+    /// combinations return an explicit error.
+    pub fn decode_durable(bytes: &[u8]) -> Result<Self, String> {
+        decode_rebuild_completion_record(bytes)
+    }
+}
+
+const REBUILD_COMPLETION_RECORD_MAGIC: &[u8; 8] = b"TFSRBLD\0";
+const REBUILD_COMPLETION_RECORD_VERSION: u16 = 1;
+
+fn encode_rebuild_completion_record(record: &RebuildCompletionRecord) -> Result<Vec<u8>, String> {
+    validate_rebuild_completion_record(record)?;
+
+    let mut out = Vec::new();
+    out.extend_from_slice(REBUILD_COMPLETION_RECORD_MAGIC);
+    out.extend_from_slice(&REBUILD_COMPLETION_RECORD_VERSION.to_le_bytes());
+    out.extend_from_slice(&record.pool_uuid);
+    out.extend_from_slice(&record.rebuilt_device_index.to_le_bytes());
+    out.extend_from_slice(&record.rebuilt_device_guid);
+    out.extend_from_slice(&record.device_count.to_le_bytes());
+    out.extend_from_slice(&record.topology_generation.to_le_bytes());
+    out.extend_from_slice(&record.objects_rebuilt.to_le_bytes());
+    out.push(u8::from(record.rebuild_complete));
+    Ok(out)
+}
+
+fn decode_rebuild_completion_record(bytes: &[u8]) -> Result<RebuildCompletionRecord, String> {
+    let mut cursor = RebuildRecordCursor::new(bytes);
+    let magic = cursor.read_exact(8, "record magic")?;
+    if magic != REBUILD_COMPLETION_RECORD_MAGIC.as_slice() {
+        return Err("rebuild completion record magic mismatch".into());
+    }
+    let version = cursor.read_u16("record version")?;
+    if version != REBUILD_COMPLETION_RECORD_VERSION {
+        return Err(format!(
+            "rebuild completion record version {version} is not supported"
+        ));
+    }
+    let pool_uuid = cursor.read_array_16("pool_uuid")?;
+    let rebuilt_device_index = cursor.read_u32("rebuilt_device_index")?;
+    let rebuilt_device_guid = cursor.read_array_16("rebuilt_device_guid")?;
+    let device_count = cursor.read_u32("device_count")?;
+    let topology_generation = cursor.read_u64("topology_generation")?;
+    let objects_rebuilt = cursor.read_u64("objects_rebuilt")?;
+    let rebuild_complete = cursor.read_bool("rebuild_complete")?;
+    cursor.finish()?;
+
+    let record = RebuildCompletionRecord {
+        pool_uuid,
+        rebuilt_device_index,
+        rebuilt_device_guid,
+        device_count,
+        topology_generation,
+        objects_rebuilt,
+        rebuild_complete,
+    };
+    validate_rebuild_completion_record(&record)?;
+    Ok(record)
+}
+
+fn validate_rebuild_completion_record(record: &RebuildCompletionRecord) -> Result<(), String> {
+    if record.device_count == 0 {
+        return Err("device_count must be nonzero".into());
+    }
+    if record.rebuilt_device_index >= record.device_count {
+        return Err(format!(
+            "rebuilt_device_index {} is outside device_count {}",
+            record.rebuilt_device_index, record.device_count
+        ));
+    }
+    Ok(())
+}
+
+struct RebuildRecordCursor<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> RebuildRecordCursor<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, offset: 0 }
+    }
+
+    fn read_exact(&mut self, len: usize, field: &str) -> Result<&'a [u8], String> {
+        let end = self
+            .offset
+            .checked_add(len)
+            .ok_or_else(|| format!("{field} length overflows record offset"))?;
+        let slice = self
+            .bytes
+            .get(self.offset..end)
+            .ok_or_else(|| format!("truncated {field}"))?;
+        self.offset = end;
+        Ok(slice)
+    }
+
+    fn read_u16(&mut self, field: &str) -> Result<u16, String> {
+        let bytes = self.read_exact(2, field)?;
+        Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
+    }
+
+    fn read_u32(&mut self, field: &str) -> Result<u32, String> {
+        let bytes = self.read_exact(4, field)?;
+        Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+
+    fn read_u64(&mut self, field: &str) -> Result<u64, String> {
+        let bytes = self.read_exact(8, field)?;
+        Ok(u64::from_le_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ]))
+    }
+
+    fn read_bool(&mut self, field: &str) -> Result<bool, String> {
+        let value = self.read_exact(1, field)?[0];
+        match value {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(format!("{field} has invalid boolean value {value}")),
+        }
+    }
+
+    fn read_array_16(&mut self, field: &str) -> Result<[u8; 16], String> {
+        let bytes = self.read_exact(16, field)?;
+        let mut array = [0u8; 16];
+        array.copy_from_slice(bytes);
+        Ok(array)
+    }
+
+    fn finish(&self) -> Result<(), String> {
+        if self.offset != self.bytes.len() {
+            return Err(format!(
+                "rebuild completion record has {} trailing bytes",
+                self.bytes.len() - self.offset
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -305,11 +455,13 @@ pub fn anchor_rebuild(
     use tidefs_local_object_store::ObjectKey;
 
     let payload =
-        serde_json::to_vec(record).map_err(|e| tidefs_local_object_store::StoreError::Io {
-            operation: "serialize_rebuild_record",
-            path: std::path::PathBuf::new(),
-            source: std::io::Error::other(format!("{e}")),
-        })?;
+        record
+            .encode_durable()
+            .map_err(|e| tidefs_local_object_store::StoreError::Io {
+                operation: "serialize_rebuild_record",
+                path: std::path::PathBuf::new(),
+                source: std::io::Error::other(format!("{e}")),
+            })?;
 
     let key = ObjectKey::from_name(REBUILD_COMPLETION_RECORD_KEY.as_bytes());
     store
@@ -563,8 +715,7 @@ mod tests {
         use tidefs_local_object_store::ObjectKey;
         let key = ObjectKey::from_name(REBUILD_COMPLETION_RECORD_KEY.as_bytes());
         let payload = store.get(key).expect("get record").expect("record present");
-        let read_back: RebuildCompletionRecord =
-            serde_json::from_slice(&payload).expect("deserialize");
+        let read_back = RebuildCompletionRecord::decode_durable(&payload).expect("decode");
         assert_eq!(read_back.rebuilt_device_index, 1);
         assert_eq!(read_back.objects_rebuilt, 42);
         assert!(read_back.rebuild_complete);
@@ -573,7 +724,7 @@ mod tests {
     }
 
     #[test]
-    fn rebuild_record_serde_roundtrip() {
+    fn rebuild_record_durable_codec_roundtrip() {
         let record = RebuildCompletionRecord {
             pool_uuid: [0x42u8; 16],
             rebuilt_device_index: 0,
@@ -584,12 +735,85 @@ mod tests {
             rebuild_complete: true,
         };
 
-        let json = serde_json::to_string(&record).unwrap();
-        let round: RebuildCompletionRecord = serde_json::from_str(&json).unwrap();
+        let encoded = record.encode_durable().expect("encode");
+        let round = RebuildCompletionRecord::decode_durable(&encoded).expect("decode");
         assert_eq!(record.pool_uuid, round.pool_uuid);
         assert_eq!(record.rebuilt_device_index, round.rebuilt_device_index);
         assert_eq!(record.objects_rebuilt, round.objects_rebuilt);
         assert!(round.rebuild_complete);
+    }
+
+    #[test]
+    fn rebuild_record_rejects_unknown_version() {
+        let record = RebuildCompletionRecord {
+            pool_uuid: [0x42u8; 16],
+            rebuilt_device_index: 0,
+            rebuilt_device_guid: [0xABu8; 16],
+            device_count: 3,
+            topology_generation: 7,
+            objects_rebuilt: 100,
+            rebuild_complete: true,
+        };
+
+        let mut encoded = record.encode_durable().expect("encode");
+        encoded[8..10].copy_from_slice(&2u16.to_le_bytes());
+        let err = RebuildCompletionRecord::decode_durable(&encoded).unwrap_err();
+        assert!(err.contains("version"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn rebuild_record_rejects_truncated_input() {
+        let record = RebuildCompletionRecord {
+            pool_uuid: [0x42u8; 16],
+            rebuilt_device_index: 0,
+            rebuilt_device_guid: [0xABu8; 16],
+            device_count: 3,
+            topology_generation: 7,
+            objects_rebuilt: 100,
+            rebuild_complete: true,
+        };
+
+        let mut encoded = record.encode_durable().expect("encode");
+        encoded.truncate(encoded.len() - 4);
+        let err = RebuildCompletionRecord::decode_durable(&encoded).unwrap_err();
+        assert!(err.contains("truncated"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn rebuild_record_rejects_corrupt_bool_field() {
+        let record = RebuildCompletionRecord {
+            pool_uuid: [0x42u8; 16],
+            rebuilt_device_index: 0,
+            rebuilt_device_guid: [0xABu8; 16],
+            device_count: 3,
+            topology_generation: 7,
+            objects_rebuilt: 100,
+            rebuild_complete: true,
+        };
+
+        let mut encoded = record.encode_durable().expect("encode");
+        *encoded.last_mut().expect("bool byte") = 9;
+        let err = RebuildCompletionRecord::decode_durable(&encoded).unwrap_err();
+        assert!(err.contains("boolean"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn rebuild_record_rejects_invalid_device_index() {
+        let record = RebuildCompletionRecord {
+            pool_uuid: [0x42u8; 16],
+            rebuilt_device_index: 3,
+            rebuilt_device_guid: [0xABu8; 16],
+            device_count: 3,
+            topology_generation: 7,
+            objects_rebuilt: 100,
+            rebuild_complete: true,
+        };
+
+        let err = record.encode_durable().unwrap_err();
+        assert!(
+            err.contains("rebuilt_device_index"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

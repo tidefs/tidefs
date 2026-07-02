@@ -231,8 +231,7 @@ fn three_device_mirror_remove_middle_device_with_blake3_verification() {
         .get(record_key)
         .unwrap()
         .expect("removal record should exist");
-    let record: DeviceRemovalRecord =
-        serde_json::from_slice(&record_bytes).expect("record should deserialize");
+    let record = DeviceRemovalRecord::decode_durable(&record_bytes).expect("record should decode");
     assert_eq!(record.removed_device, disk1_path);
     assert_eq!(record.device_count_before, 3);
     assert_eq!(record.device_count_after, 2);
