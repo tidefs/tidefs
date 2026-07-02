@@ -7770,9 +7770,9 @@ impl FuseVfsAdapter {
         };
 
         // Delegate writeback and engine.flush() through the
-        // local-filesystem dispatch layer via PageCacheDirtyFlush
-        // (issue #3583).  This drains the PageCache dirty set and
-        // calls engine.flush().
+        // local-filesystem dispatch layer via PageCacheDirtyFlush.  This
+        // bridges the adapter daemon's PageCache mirror into the DirtyFlush
+        // contract while TFR-008 remains the broader writeback authority.
         let flush_result = {
             let engine = self.engine.lock().unwrap();
             let bridge = crate::fuse_flush_fsync::PageCacheDirtyFlush::new(
@@ -7859,9 +7859,11 @@ impl FuseVfsAdapter {
         // Reject fsync on read-only mounts early (EROFS).
         if self.read_only {
             return Err(Errno::EROFS);
-        } // Phase 1: Writeback dirty pages through the local-filesystem
-          // dispatch layer via PageCacheDirtyFlush (issue #3583).
-          // This drains the PageCache dirty set and calls engine.flush().
+        }
+        // Phase 1: Writeback dirty pages through the local-filesystem
+        // dispatch layer via PageCacheDirtyFlush.  This bridges the adapter
+        // daemon's PageCache mirror into the DirtyFlush contract while
+        // TFR-008 remains the broader writeback authority.
         {
             let engine = self.engine.lock().unwrap();
             let bridge = crate::fuse_flush_fsync::PageCacheDirtyFlush::new(
@@ -8014,9 +8016,9 @@ impl FuseVfsAdapter {
         let e = self.engine.lock().unwrap();
         let handle = self.resolve_dir_handle(ino, fh, ctx, &**e)?;
 
-        // Flush dirty page-cache pages for the directory inode through
-        // the PageCacheDirtyFlush bridge (issue #3583).  Construct a
-        // synthetic EngineFileHandle since the bridge requires one.
+        // Flush dirty page-cache pages for the directory inode through the
+        // PageCacheDirtyFlush bridge. Construct a synthetic EngineFileHandle
+        // since the bridge requires one.
         let synthetic_fh = EngineFileHandle::new(
             handle.dh.inode_id,
             0, // O_RDONLY
