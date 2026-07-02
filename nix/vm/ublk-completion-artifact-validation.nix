@@ -73,7 +73,7 @@ USAGE
         ;;
       qemu-ublk-qid-tag-runtime)
         NR_HW_QUEUES=2
-        MAX_COMPLETIONS=512
+        MAX_COMPLETIONS=1024
         QEMU_SMP=2
         BLOCK_COUNT=4096
         RUN_ERROR_INJECTION=1
@@ -378,6 +378,12 @@ if [ "$SCENARIO" = "qemu-ublk-qid-tag-runtime" ]; then
         --bs=4k --iodepth=8 --numjobs=2 --ioengine=io_uring --filename=/dev/ublkb0 \
         --allow_file_create=0 --group_reporting --output=/tmp/fio-read.json \
         --output-format=json
+    if ! blockdev --flushbufs /dev/ublkb0 2>/tmp/blockdev-flushbufs.err; then
+        echo "FAIL: blockdev flushbufs"
+        cat /tmp/blockdev-flushbufs.err 2>&1 || true
+        cat "$DAEMON_LOG" 2>&1 || true
+        poweroff -f
+    fi
     if ! blkdiscard -f --offset 4194304 --length 65536 /dev/ublkb0 2>/tmp/blkdiscard.err; then
         echo "FAIL: blkdiscard discard"
         cat /tmp/blkdiscard.err 2>&1 || true
