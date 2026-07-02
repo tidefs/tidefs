@@ -18,12 +18,14 @@ FUSE handler / ublk target
 
 This crate owns the lower physical free-block bitmap, concrete allocation
 selection, allocator-local reservation bookkeeping, commit-epoch allocation
-fences, root-reserve/free-space diagnostics, and TRIM input. It is not the
-mounted quota, POSIX/FUSE `statfs`, or mounted write-admission authority.
+fences, root-reserve/free-space diagnostics, and TRIM input. Those reservations
+and counters are allocator-local inputs; they do not decide mounted quota,
+POSIX/FUSE `statfs`, or mounted write-admission authority.
 `docs/CAPACITY_ACCOUNTING_AUTHORITY.md` records that boundary for TFR-007:
 mounted capacity semantics belong to `tidefs-local-filesystem::CapacityAuthority`
 backed by the space-accounting crates, while allocator reports remain lower
-free-space inputs.
+free-space inputs. Product-admission state for capacity, pool/device lifecycle,
+and successor wording remains in `validation/claims.toml`.
 
 ## Architecture
 
@@ -40,15 +42,14 @@ Internal components:
 - [`QuotaTable`](src/quota.rs) — allocator-local per-inode
   reserve → commit → release lifecycle with caller-supplied hard-limit
   enforcement. Entries are lazily created on first access and pruned when both
-  reserved and committed counts reach zero. Production mounted quota policy
-  lives above this crate.
+  reserved and committed counts reach zero. Mounted quota policy lives above
+  this crate.
 - `AllocatorTopology` / `DeviceTopology` — sector-alignment contracts and
   per-device physical geometry (logical/physical sector size, min I/O size,
   alignment offset). The allocator resolves the correct topology at allocation
   time and rejects cross-device requests.
 - [`Statfs`](src/statfs.rs) — allocator-local Linux-shaped block counters for
-  isolated allocator reporting; production mounted `statfs` is derived above
-  this crate.
+  isolated allocator reporting; mounted `statfs` is derived above this crate.
 - `TrimSink` — optional TRIM/UNMAP dispatch (file-backed `fallocate` or
   block-device `BLKDISCARD`). Coalesces adjacent freed ranges and enforces a
   configurable `min_discard_bytes` threshold.
