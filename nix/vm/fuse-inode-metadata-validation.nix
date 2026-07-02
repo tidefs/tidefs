@@ -3,21 +3,22 @@
 # Builds a self-contained C test binary that exercises FUSE inode attribute
 # operations (getattr, setattr size/mode/owner/timestamps, stat, chmod,
 # chown, utimens) on a mounted TideFS FUSE filesystem inside a QEMU guest,
-# simulates daemon crashes, and verifies committed-root attribute integrity
-# on remount.
+# simulates daemon death, verifies post-crash attribute readback on remount,
+# and records explicit blockers for mutation-window crash and committed-root
+# verification rows that this lane does not exercise.
 #
 # Crash-consistency cycle:
 #   1. Mount TideFS via FUSE daemon.
 #   2. Create files, set attributes, verify with getattr/stat.
-#   3. Commit some operations, leave others uncommitted.
+#   3. Sync and snapshot the mounted attribute state.
 #   4. Kill the FUSE daemon (SIGKILL) to simulate crash.
-#   5. Remount and verify: committed attributes survive, uncommitted revert.
+#   5. Remount and verify: synced attributes survive readback.
 #
 # Validation tiers:
 #   T0 - clean getattr/setattr round-trip
-#   T1 - crash-during-setattr durability
+#   T1 - crash-during-setattr durability (explicit blocker in this lane)
 #   T2 - post-crash attribute readback
-#   T3 - committed-root hash-chain verification
+#   T3 - committed-root hash-chain verification (explicit blocker in this lane)
 #
 # Dependencies:
 #   - Linux kernel with FUSE support
@@ -92,25 +93,27 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    snprintf(mnt_dir, sizeof(mnt_dir), "%s", argv[0]);
+    snprintf(mnt_dir, sizeof(mnt_dir), "%s", argv[1]);
 
     struct stat st;
     int passed = 0;
+    int refused = 0;
     int failed = 0;
 
 #define PASS(name) do { printf("PASS: %s\n", name); passed++; } while(0)
+#define REFUSAL(name) do { printf("REFUSAL: %s\n", name); refused++; } while(0)
 #define FAIL(name, ...) do { fprintf(stderr, "FAIL: " name "\n", ##__VA_ARGS__); failed++; } while(0)
 
     /* ── 1. getattr: retrieve attributes after file creation ── */
     create_reg("getattr_test.bin");
     make_path("getattr_test.bin");
     if (stat(test_path, &st) < 0) {
-        FAIL("getattr-clean", );
+        FAIL("getattr-clean");
     } else {
         if (st.st_size != 5) {
             FAIL("getattr-clean -- size %ld != 5", (long)st.st_size);
         } else if (!S_ISREG(st.st_mode)) {
-            FAIL("getattr-clean -- not a regular file", );
+            FAIL("getattr-clean -- not a regular file");
         } else {
             PASS("getattr-clean");
         }
@@ -120,9 +123,9 @@ int main(int argc, char *argv[]) {
     create_reg("size_test.bin");
     make_path("size_test.bin");
     if (truncate(test_path, 4096) < 0) {
-        FAIL("setattr-size-clean -- truncate failed", );
+        FAIL("setattr-size-clean -- truncate failed");
     } else if (stat(test_path, &st) < 0) {
-        FAIL("setattr-size-clean -- stat after truncate failed", );
+        FAIL("setattr-size-clean -- stat after truncate failed");
     } else if (st.st_size != 4096) {
         FAIL("setattr-size-clean -- size %ld != 4096", (long)st.st_size);
     } else {
@@ -133,9 +136,9 @@ int main(int argc, char *argv[]) {
     create_reg("mode_test.bin");
     make_path("mode_test.bin");
     if (chmod(test_path, 0755) < 0) {
-        FAIL("setattr-mode-clean -- chmod failed", );
+        FAIL("setattr-mode-clean -- chmod failed");
     } else if (stat(test_path, &st) < 0) {
-        FAIL("setattr-mode-clean -- stat after chmod failed", );
+        FAIL("setattr-mode-clean -- stat after chmod failed");
     } else if ((st.st_mode & 0777) != 0755) {
         FAIL("setattr-mode-clean -- mode 0%o != 0755", st.st_mode & 0777);
     } else {
@@ -147,25 +150,16 @@ int main(int argc, char *argv[]) {
         create_reg("owner_test.bin");
         make_path("owner_test.bin");
         if (chown(test_path, 1, 1) < 0) {
-            FAIL("setattr-owner-clean -- chown failed", );
+            FAIL("setattr-owner-clean -- chown failed");
         } else if (stat(test_path, &st) < 0) {
-            FAIL("setattr-owner-clean -- stat after chown failed", );
+            FAIL("setattr-owner-clean -- stat after chown failed");
         } else if (st.st_uid != 1 || st.st_gid != 1) {
             FAIL("setattr-owner-clean -- uid %d gid %d != 1/1", st.st_uid, st.st_gid);
         } else {
             PASS("setattr-owner-clean");
         }
     } else {
-        /* Non-root: verify owner matches current user */
-        create_reg("owner_test.bin");
-        make_path("owner_test.bin");
-        if (stat(test_path, &st) < 0) {
-            FAIL("setattr-owner-clean -- stat failed", );
-        } else if (st.st_uid != getuid()) {
-            FAIL("setattr-owner-clean -- uid %d != %d", st.st_uid, getuid());
-        } else {
-            PASS("setattr-owner-clean");
-        }
+        REFUSAL("setattr-owner-clean -- root-capable mounted execution required");
     }
 
     /* ── 5. setattr-timestamps: set atime/mtime via utime ── */
@@ -176,9 +170,9 @@ int main(int argc, char *argv[]) {
     ut.actime = set_time;
     ut.modtime = set_time;
     if (utime(test_path, &ut) < 0) {
-        FAIL("setattr-timestamps-clean -- utime failed", );
+        FAIL("setattr-timestamps-clean -- utime failed");
     } else if (stat(test_path, &st) < 0) {
-        FAIL("setattr-timestamps-clean -- stat after utime failed", );
+        FAIL("setattr-timestamps-clean -- stat after utime failed");
     } else if (st.st_atime != set_time || st.st_mtime != set_time) {
         FAIL("setattr-timestamps-clean -- atime %ld mtime %ld != %ld",
              (long)st.st_atime, (long)st.st_mtime, (long)set_time);
@@ -190,9 +184,9 @@ int main(int argc, char *argv[]) {
     create_reg("chmod_test.bin");
     make_path("chmod_test.bin");
     if (chmod(test_path, 0600) < 0) {
-        FAIL("chmod-clean -- chmod failed", );
+        FAIL("chmod-clean -- chmod failed");
     } else if (stat(test_path, &st) < 0) {
-        FAIL("chmod-clean -- stat after chmod failed", );
+        FAIL("chmod-clean -- stat after chmod failed");
     } else if ((st.st_mode & 0777) != 0600) {
         FAIL("chmod-clean -- mode 0%o != 0600", st.st_mode & 0777);
     } else {
@@ -204,22 +198,22 @@ int main(int argc, char *argv[]) {
         create_reg("chown_test.bin");
         make_path("chown_test.bin");
         if (chown(test_path, 2, 2) < 0) {
-            FAIL("chown-clean -- chown failed", );
+            FAIL("chown-clean -- chown failed");
         } else if (stat(test_path, &st) < 0) {
-            FAIL("chown-clean -- stat after chown failed", );
+            FAIL("chown-clean -- stat after chown failed");
         } else if (st.st_uid != 2) {
             FAIL("chown-clean -- uid %d != 2", st.st_uid);
         } else {
             PASS("chown-clean");
         }
     } else {
-        /* Non-root: chown fails with EPERM (expected) */
+        /* Non-root: chown fails with EPERM; record this as environment refusal. */
         create_reg("chown_test.bin");
         make_path("chown_test.bin");
         if (chown(test_path, 2, 2) == 0) {
-            FAIL("chown-clean -- chown succeeded unexpectedly as non-root", );
+            FAIL("chown-clean -- chown succeeded unexpectedly as non-root");
         } else if (errno == EPERM) {
-            PASS("chown-clean");
+            REFUSAL("chown-clean -- root-capable mounted execution required");
         } else {
             FAIL("chown-clean -- unexpected errno %d (expected EPERM)", errno);
         }
@@ -234,59 +228,26 @@ int main(int argc, char *argv[]) {
     ts[1].tv_sec = 500000000;
     ts[1].tv_nsec = 987654321;
     if (utimensat(AT_FDCWD, test_path, ts, 0) < 0) {
-        FAIL("utimens-clean -- utimensat failed", );
+        FAIL("utimens-clean -- utimensat failed");
     } else if (stat(test_path, &st) < 0) {
-        FAIL("utimens-clean -- stat after utimensat failed", );
+        FAIL("utimens-clean -- stat after utimensat failed");
     } else if (st.st_atim.tv_sec != ts[0].tv_sec || st.st_mtim.tv_sec != ts[1].tv_sec) {
-        FAIL("utimens-clean -- timestamps mismatch", );
+        FAIL("utimens-clean -- timestamps mismatch");
     } else {
         PASS("utimens-clean");
     }
 
-    /* ── 9. getattr after crash: remount and re-read ── */
-    /* Skipped in clean mode; exercised by crash-remount cycle in harness. */
-    PASS("getattr-readback");
-
-    /* ── 10-16. crash-tier rows exercised by harness crash loop ── */
-    PASS("setattr-size-crash");
-    PASS("setattr-mode-crash");
-    PASS("setattr-owner-crash");
-    PASS("setattr-timestamps-crash");
-    PASS("chmod-crash");
-    PASS("chown-crash");
-    PASS("utimens-crash");
-
-    /* ── 17-24. readback tier rows ── */
-    PASS("setattr-size-readback");
-    PASS("setattr-mode-readback");
-    PASS("setattr-owner-readback");
-    PASS("setattr-timestamps-readback");
-    PASS("chmod-readback");
-    PASS("chown-readback");
-    PASS("utimens-readback");
-    PASS("getattr-readback");
-
-    /* ── 25-32. verify tier rows ── */
-    PASS("getattr-verify");
-    PASS("setattr-size-verify");
-    PASS("setattr-mode-verify");
-    PASS("setattr-owner-verify");
-    PASS("setattr-timestamps-verify");
-    PASS("chmod-verify");
-    PASS("chown-verify");
-    PASS("utimens-verify");
-
-    fprintf(stderr, "FUSE inode metadata test: %d passed, %d failed\n", passed, failed);
+    fprintf(stderr, "FUSE inode metadata test: %d passed, %d refused, %d failed\n", passed, refused, failed);
     return failed > 0 ? 1 : 0;
 }
 CEOF
 
-    cc -O2 -Wall -static fuse_inode_metadata_test.c -o "$out/bin/tidefs-fuse-inode-metadata-test"
+    cc -O2 -Wall fuse_inode_metadata_test.c -o "$out/bin/tidefs-fuse-inode-metadata-test"
     strip "$out/bin/tidefs-fuse-inode-metadata-test"
   '';
 
   # Validation script that mounts FUSE, runs the inode metadata test,
-  # simulates crash, and verifies committed-root attribute integrity.
+  # simulates daemon death, and verifies post-crash attribute readback.
   fuseInodeMetadataValidationScript = pkgs.writeShellScriptBin "tidefs-fuse-inode-metadata-validation" ''
     set -euo pipefail
 
@@ -294,16 +255,20 @@ CEOF
     METADATA_TEST="${fuseInodeMetadataTestBin}/bin/tidefs-fuse-inode-metadata-test"
 
     TMPDIR="''${TIDEFS_FUSE_INODE_METADATA_TMPDIR:-/tmp/tidefs-fuse-inode-metadata-validation}"
+    ARTIFACT_SCOPE="''${TIDEFS_FUSE_INODE_METADATA_ARTIFACT_SCOPE:-$TMPDIR}"
+    SOURCE_COMMIT="''${TIDEFS_SOURCE_COMMIT:-$(git rev-parse HEAD 2>/dev/null || echo unknown)}"
     STORE="$TMPDIR/store"
     MNT="$TMPDIR/mnt"
+    OBSERVED_ROWS="$TMPDIR/observed_rows.txt"
+    FUSERMOUNT_HELPER_DIR="$TMPDIR/fuse-helper-bin"
 
     usage() {
       cat <<EOF
 Usage: tidefs-fuse-inode-metadata-validation [--keep-tmp]
 
 Validate FUSE userspace inode metadata operations (getattr, setattr, stat,
-chmod, chown, utimens) with crash-consistency verification through
-committed-root attribute integrity checks.
+chmod, chown, utimens) with clean/readback validation and explicit blockers
+for mutation-window crash and committed-root verification rows.
 
 Environment:
   TIDEFS_FUSE_INODE_METADATA_TMPDIR  scratch directory (default /tmp/tidefs-fuse-inode-metadata-validation)
@@ -321,44 +286,202 @@ EOF
       esac
     done
 
-    if [ -z "''${TIDEFS_ROOT_AUTHENTICATION_KEY_HEX:-}" ]; then
-      echo "REFUSAL: TIDEFS_ROOT_AUTHENTICATION_KEY_HEX not set"
-      echo "Set it to a 64-hex-char key for validation."
-      exit 2
+    PASSED=0
+    FAILED=0
+    REFUSED=0
+    BLOCKED=0
+
+    CANONICAL_ROWS="
+    getattr-clean
+    getattr-crash
+    getattr-readback
+    getattr-verify
+    setattr-size-clean
+    setattr-size-crash
+    setattr-size-readback
+    setattr-size-verify
+    setattr-mode-clean
+    setattr-mode-crash
+    setattr-mode-readback
+    setattr-mode-verify
+    setattr-owner-clean
+    setattr-owner-crash
+    setattr-owner-readback
+    setattr-owner-verify
+    setattr-timestamps-clean
+    setattr-timestamps-crash
+    setattr-timestamps-readback
+    setattr-timestamps-verify
+    chmod-clean
+    chmod-crash
+    chmod-readback
+    chmod-verify
+    chown-clean
+    chown-crash
+    chown-readback
+    chown-verify
+    utimens-clean
+    utimens-crash
+    utimens-readback
+    utimens-verify
+    "
+
+    is_canonical_row() {
+      needle="$1"
+      for canonical in $CANONICAL_ROWS; do
+        if [ "$canonical" = "$needle" ]; then
+          return 0
+        fi
+      done
+      return 1
+    }
+
+    record_row() {
+      is_canonical_row "$1" || return 0
+      printf '%s\n' "$1" >> "$OBSERVED_ROWS"
+    }
+
+    pass() { echo "  PASS: $1"; PASSED=$((PASSED + 1)); record_row "$1"; }
+    fail() { echo "  FAIL: $1 -- $2"; FAILED=$((FAILED + 1)); record_row "$1"; }
+    refusal() { echo "  REFUSAL: $1 -- $2"; REFUSED=$((REFUSED + 1)); record_row "$1"; }
+    blocked() { echo "  BLOCKED: $1 -- $2"; BLOCKED=$((BLOCKED + 1)); record_row "$1"; }
+
+    emit_unobserved_rows() {
+      outcome="$1"
+      reason="$2"
+      for row in $CANONICAL_ROWS; do
+        if grep -Fxq "$row" "$OBSERVED_ROWS"; then
+          continue
+        fi
+        case "$outcome" in
+          refusal) refusal "$row" "$reason" ;;
+          blocked) blocked "$row" "$reason" ;;
+          fail) fail "$row" "$reason" ;;
+          *) blocked "$row" "$reason" ;;
+        esac
+      done
+    }
+
+    rm -rf "$TMPDIR"
+    mkdir -p "$STORE" "$MNT" "$FUSERMOUNT_HELPER_DIR"
+
+    # The fuser crate probes fusermount3 before fusermount.  Some NixOS
+    # runners expose only a setuid /run/wrappers/bin/fusermount wrapper while
+    # Nix supplies a non-setuid fusermount3 earlier in PATH; provide both names
+    # in a helper directory so the daemon reaches the setuid wrapper first.
+    if [ -x /run/wrappers/bin/fusermount3 ]; then
+      ln -s /run/wrappers/bin/fusermount3 "$FUSERMOUNT_HELPER_DIR/fusermount3"
+    elif [ -x /run/wrappers/bin/fusermount ]; then
+      ln -s /run/wrappers/bin/fusermount "$FUSERMOUNT_HELPER_DIR/fusermount3"
     fi
+    if [ -x /run/wrappers/bin/fusermount ]; then
+      ln -s /run/wrappers/bin/fusermount "$FUSERMOUNT_HELPER_DIR/fusermount"
+    elif [ -x /run/wrappers/bin/fusermount3 ]; then
+      ln -s /run/wrappers/bin/fusermount3 "$FUSERMOUNT_HELPER_DIR/fusermount"
+    fi
+    export PATH="$FUSERMOUNT_HELPER_DIR:/run/wrappers/bin:$PATH"
+
+    : > "$OBSERVED_ROWS"
+    exec > >(tee "$TMPDIR/validation.log") 2>&1
 
     echo "=== TideFS FUSE Inode Metadata Validation ==="
     echo "timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "commit=$SOURCE_COMMIT"
     echo "kernel=$(uname -r)"
     echo "daemon=$DAEMON_BIN"
     echo "test=$METADATA_TEST"
+    echo "artifact_scope=$ARTIFACT_SCOPE"
+    echo "fusermount3=$(command -v fusermount3 2>/dev/null || echo unavailable)"
+    echo "fusermount=$(command -v fusermount 2>/dev/null || echo unavailable)"
     echo ""
     echo "Tier: mounted-userspace"
     echo ""
 
-    rm -rf "$TMPDIR"
-    mkdir -p "$STORE" "$MNT"
-
-    # Check /dev/fuse
-    if [ ! -e /dev/fuse ]; then
-      echo "REFUSAL: /dev/fuse not available in this environment"
-      echo "Run inside a QEMU guest or on a host with FUSE support."
+    if [ -z "''${TIDEFS_ROOT_AUTHENTICATION_KEY_HEX:-}" ]; then
+      refusal "root-auth-key" "TIDEFS_ROOT_AUTHENTICATION_KEY_HEX not set"
+      echo "Set it to a 64-hex-char key for validation."
+      emit_unobserved_rows refusal "TIDEFS_ROOT_AUTHENTICATION_KEY_HEX not set"
       exit 2
     fi
 
-    PASSED=0
-    FAILED=0
-    BLOCKED=0
+    # Check /dev/fuse
+    if [ ! -e /dev/fuse ]; then
+      refusal "/dev/fuse" "not available in this environment"
+      echo "Run inside a QEMU guest or on a host with FUSE support."
+      emit_unobserved_rows refusal "/dev/fuse not available in this environment"
+      exit 2
+    fi
 
-    pass() { echo "  PASS: $1"; PASSED=$((PASSED + 1)); }
-    fail() { echo "  FAIL: $1 -- $2"; FAILED=$((FAILED + 1)); }
-    blocked() { echo "  BLOCKED: $1 -- $2"; BLOCKED=$((BLOCKED + 1)); }
+    verify_file() {
+      row="$1"
+      file="$2"
+      if [ -e "$MNT/$file" ]; then
+        return 0
+      fi
+      fail "$row" "$file missing after crash/remount"
+      return 1
+    }
+
+    verify_size() {
+      row="$1"
+      file="$2"
+      expected="$3"
+      verify_file "$row" "$file" || return 0
+      got="$(stat -c '%s' "$MNT/$file" 2>/dev/null || echo missing)"
+      if [ "$got" = "$expected" ]; then
+        pass "$row"
+      else
+        fail "$row" "$file size $got != $expected"
+      fi
+    }
+
+    verify_mode() {
+      row="$1"
+      file="$2"
+      expected="$3"
+      verify_file "$row" "$file" || return 0
+      got="$(stat -c '%a' "$MNT/$file" 2>/dev/null || echo missing)"
+      if [ "$got" = "$expected" ]; then
+        pass "$row"
+      else
+        fail "$row" "$file mode $got != $expected"
+      fi
+    }
+
+    verify_owner() {
+      row="$1"
+      file="$2"
+      expected_uid="$3"
+      expected_gid="$4"
+      verify_file "$row" "$file" || return 0
+      got_uid="$(stat -c '%u' "$MNT/$file" 2>/dev/null || echo missing)"
+      got_gid="$(stat -c '%g' "$MNT/$file" 2>/dev/null || echo missing)"
+      if [ "$got_uid" = "$expected_uid" ] && [ "$got_gid" = "$expected_gid" ]; then
+        pass "$row"
+      else
+        fail "$row" "$file owner $got_uid:$got_gid != $expected_uid:$expected_gid"
+      fi
+    }
+
+    verify_mtime() {
+      row="$1"
+      file="$2"
+      expected="$3"
+      verify_file "$row" "$file" || return 0
+      got="$(stat -c '%Y' "$MNT/$file" 2>/dev/null || echo missing)"
+      if [ "$got" = "$expected" ]; then
+        pass "$row"
+      else
+        fail "$row" "$file mtime $got != $expected"
+      fi
+    }
 
     # ── Phase 1: Start FUSE daemon ──────────────────────────────────
     echo "--- Phase 1: Start FUSE daemon ---"
     DAEMON_LOG="$TMPDIR/daemon.log"
     "$DAEMON_BIN" mount-vfs \
       --store "$STORE" --mount "$MNT" \
+      --root-auth-key-hex "$TIDEFS_ROOT_AUTHENTICATION_KEY_HEX" \
       > "$DAEMON_LOG" 2>&1 &
     DAEMON_PID=$!
 
@@ -377,9 +500,10 @@ EOF
       else
         blocked "fuse_mount" "daemon died -- see $DAEMON_LOG"
       fi
+      emit_unobserved_rows blocked "FUSE mount did not become available; see $DAEMON_LOG"
       echo ""
       echo "=== FUSE Inode Metadata Validation Summary ==="
-      echo "PASSED=$PASSED FAILED=$FAILED BLOCKED=$BLOCKED"
+      echo "PASSED=$PASSED REFUSED=$REFUSED FAILED=$FAILED BLOCKED=$BLOCKED"
       echo "tier=mounted-userspace"
       exit 1
     fi
@@ -397,7 +521,27 @@ EOF
     while IFS= read -r line; do
       case "$line" in
         PASS:*) pass "''${line#PASS: }" ;;
-        FAIL:*) fail "''${line#FAIL: }" "''${line}" ;;
+        FAIL:*)
+          payload="''${line#FAIL: }"
+          case "$payload" in
+            *" -- "*) fail "''${payload%% -- *}" "''${payload#* -- }" ;;
+            *) fail "$payload" "$line" ;;
+          esac
+          ;;
+        REFUSAL:*)
+          payload="''${line#REFUSAL: }"
+          case "$payload" in
+            *" -- "*) refusal "''${payload%% -- *}" "''${payload#* -- }" ;;
+            *) refusal "$payload" "$line" ;;
+          esac
+          ;;
+        BLOCKED:*)
+          payload="''${line#BLOCKED: }"
+          case "$payload" in
+            *" -- "*) blocked "''${payload%% -- *}" "''${payload#* -- }" ;;
+            *) blocked "$payload" "$line" ;;
+          esac
+          ;;
       esac
     done < "$TEST_LOG"
 
@@ -437,6 +581,7 @@ EOF
     mkdir -p "$MNT"
     "$DAEMON_BIN" mount-vfs \
       --store "$STORE" --mount "$MNT" \
+      --root-auth-key-hex "$TIDEFS_ROOT_AUTHENTICATION_KEY_HEX" \
       > "$TMPDIR/daemon_remount.log" 2>&1 &
     REMOUNT_PID=$!
 
@@ -451,35 +596,63 @@ EOF
       pass "remount_after_crash"
     else
       blocked "remount_after_crash" "remount failed -- see $TMPDIR/daemon_remount.log"
+      emit_unobserved_rows blocked "remount failed; see $TMPDIR/daemon_remount.log"
       kill "$REMOUNT_PID" 2>/dev/null || true
       exit 1
     fi
 
-    # Verify committed files still exist and have correct attributes
+    # Verify committed files still exist and have correct attributes.
     echo ""
     echo "--- Phase 6: Verify committed attributes survive crash ---"
-    "$METADATA_TEST" "$MNT" > "$TMPDIR/test_verify.log" 2>&1 || true
-    while IFS= read -r line; do
-      case "$line" in
-        PASS:*) pass "post_crash_''${line#PASS: }" ;;
-        FAIL:*) fail "post_crash_''${line#FAIL: }" "''${line}" ;;
-      esac
-    done < "$TMPDIR/test_verify.log"
+    verify_size "getattr-readback" "getattr_test.bin" 5
+    verify_size "setattr-size-readback" "size_test.bin" 4096
+    verify_mode "setattr-mode-readback" "mode_test.bin" 755
+    if [ "$(id -u)" -eq 0 ]; then
+      verify_owner "setattr-owner-readback" "owner_test.bin" 1 1
+    else
+      refusal "setattr-owner-readback" "root-capable mounted execution required"
+    fi
+    verify_mtime "setattr-timestamps-readback" "timestamps_test.bin" 1000000000
+    verify_mode "chmod-readback" "chmod_test.bin" 600
+    if [ "$(id -u)" -eq 0 ]; then
+      verify_owner "chown-readback" "chown_test.bin" 2 2
+    else
+      refusal "chown-readback" "root-capable mounted execution required"
+    fi
+    verify_mtime "utimens-readback" "utimens_test.bin" 500000000
+
+    for row in \
+      getattr-crash setattr-size-crash setattr-mode-crash setattr-owner-crash \
+      setattr-timestamps-crash chmod-crash chown-crash utimens-crash; do
+      blocked "$row" "no mounted FUSE fault-injection harness currently crashes inside the metadata mutation window"
+    done
+
+    for row in \
+      getattr-verify setattr-size-verify setattr-mode-verify setattr-owner-verify \
+      setattr-timestamps-verify chmod-verify chown-verify utimens-verify; do
+      blocked "$row" "committed-root hash-chain verification is not emitted by this mounted metadata lane"
+    done
 
     # Cleanup
     kill "$REMOUNT_PID" 2>/dev/null || true
     fusermount -u "$MNT" 2>/dev/null || umount -l "$MNT" 2>/dev/null || true
 
+    emit_unobserved_rows blocked "row was not observed before validation summary; inspect $TEST_LOG and daemon logs"
+
     # ── Summary ─────────────────────────────────────────────────────
     echo ""
     echo "=== FUSE Inode Metadata Validation Summary ==="
     echo "PASSED=$PASSED"
+    echo "REFUSED=$REFUSED"
     echo "FAILED=$FAILED"
     echo "BLOCKED=$BLOCKED"
     echo "tier=mounted-userspace"
+    echo "commit=$SOURCE_COMMIT"
+    echo "artifact_scope=$ARTIFACT_SCOPE"
     echo "timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "daemon_log=$TMPDIR/daemon.log"
     echo "test_log=$TMPDIR/test.log"
+    echo "validation_log=$TMPDIR/validation.log"
     echo "=== End ==="
 
     if [ -z "$KEEP_TMP" ]; then

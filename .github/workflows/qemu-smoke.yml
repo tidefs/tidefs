@@ -18,6 +18,7 @@ on:
           - kernel-no-daemon-teardown-validation
           - two-node-carrier-validation
           - fuse-vm-test
+          - fuse-inode-metadata-validation
           - qemu-ublk-smoke
           - qemu-ublk-qid-tag-runtime
           - receipt-bound-reclaim-runtime
@@ -74,6 +75,10 @@ jobs:
             name: fuse-vm-test
             command: nix run .#fuse-vm-test -- --timeout 900 --validation-dir /tmp/tidefs-validation/fuse-vm-test --queue-depth-artifact /tmp/tidefs-validation/fuse-vm-test/performance/queue-depth-runtime.json
             output_dir: /tmp/tidefs-validation/fuse-vm-test
+          - id: fuse-inode-metadata-validation
+            name: fuse-inode-metadata-validation
+            command: TIDEFS_SOURCE_COMMIT="$(git rev-parse HEAD)" TIDEFS_FUSE_INODE_METADATA_TMPDIR=/tmp/tidefs-validation/fuse-inode-metadata-validation TIDEFS_FUSE_INODE_METADATA_ARTIFACT_SCOPE=/tmp/tidefs-validation/fuse-inode-metadata-validation TIDEFS_ROOT_AUTHENTICATION_KEY_HEX=0000000000000000000000000000000000000000000000000000000000000001 nix run .#fuse-inode-metadata-validation -- --keep-tmp
+            output_dir: /tmp/tidefs-validation/fuse-inode-metadata-validation
           - id: qemu-ublk-smoke
             name: qemu-ublk-smoke
             command: nix run .#qemu-ublk-smoke -- --timeout 3600

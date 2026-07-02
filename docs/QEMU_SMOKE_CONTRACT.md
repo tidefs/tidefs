@@ -39,8 +39,9 @@ Manual `workflow_dispatch` accepts these `target` choices:
 `kmod-xfstests-smoke`, `kernel-fsync-validation`,
 `kernel-mmap-validation`, `kernel-teardown-validation`,
 `kernel-no-daemon-teardown-validation`, `two-node-carrier-validation`,
-`fuse-vm-test`, `qemu-ublk-smoke`, `qemu-ublk-qid-tag-runtime`,
-`receipt-bound-reclaim-runtime`, `scrub-foreground-read-runtime`, and `all`.
+`fuse-vm-test`, `fuse-inode-metadata-validation`, `qemu-ublk-smoke`,
+`qemu-ublk-qid-tag-runtime`, `receipt-bound-reclaim-runtime`,
+`scrub-foreground-read-runtime`, and `all`.
 
 ### Runner Labels
 
@@ -145,7 +146,18 @@ and serial concurrency.
 | Uploaded artifact  | `qemu-smoke-fuse-vm-test` (7-day retention) |
 | Evidence class     | FUSE VM test with queue-depth measurement |
 
-### 8. `qemu-ublk-smoke`
+### 8. `fuse-inode-metadata-validation`
+
+| Field              | Value |
+|--------------------|-------|
+| Dispatch           | manual `workflow_dispatch` only |
+| Nix flake ref      | `.#fuse-inode-metadata-validation` |
+| Command arguments  | `--keep-tmp`, with `TIDEFS_SOURCE_COMMIT`, `TIDEFS_FUSE_INODE_METADATA_TMPDIR`, `TIDEFS_FUSE_INODE_METADATA_ARTIFACT_SCOPE`, and non-secret `TIDEFS_ROOT_AUTHENTICATION_KEY_HEX` set by the workflow |
+| Output directory   | `/tmp/tidefs-validation/fuse-inode-metadata-validation` |
+| Uploaded artifact  | `qemu-smoke-fuse-inode-metadata-validation` (7-day retention) |
+| Evidence class     | mounted FUSE inode metadata clean/readback row observations with explicit crash-window and committed-root blockers |
+
+### 9. `qemu-ublk-smoke`
 
 | Field              | Value |
 |--------------------|-------|
@@ -156,7 +168,7 @@ and serial concurrency.
 | Uploaded artifact  | `qemu-smoke-qemu-ublk-smoke` (7-day retention) |
 | Evidence class     | ublk completion artifact validation |
 
-### 9. `qemu-ublk-qid-tag-runtime`
+### 10. `qemu-ublk-qid-tag-runtime`
 
 | Field              | Value |
 |--------------------|-------|
@@ -168,7 +180,7 @@ and serial concurrency.
 | Evidence class     | bounded qid/tag ublk completion runtime row |
 | Artifacts          | `qid-tag-completion-runtime.json`, `qid-tag-completion-error-injection-runtime.json`, `started-export-admission-runtime.json`, `started-export-admission-error-injection-runtime.json`, `qemu-ublk-completion.json` |
 
-### 10. `receipt-bound-reclaim-runtime`
+### 11. `receipt-bound-reclaim-runtime`
 
 | Field              | Value |
 |--------------------|-------|
@@ -179,7 +191,7 @@ and serial concurrency.
 | Evidence class     | receipt-bound reclaim runtime row for obsolete-location trim gating |
 | Artifacts          | `receipt-bound-reclaim-runtime.json`, `evidence-manifest.json` |
 
-### 11. `scrub-foreground-read-runtime`
+### 12. `scrub-foreground-read-runtime`
 
 | Field              | Value |
 |--------------------|-------|
@@ -191,12 +203,12 @@ and serial concurrency.
 | Evidence class     | scrub foreground-read runtime row |
 | Artifacts          | `scrub-foreground-read-runtime.json`, `evidence-manifest.json` |
 
-### 12. `all`
+### 13. `all`
 
 | Field              | Value |
 |--------------------|-------|
 | Dispatch           | manual `workflow_dispatch` only |
-| Effect             | Runs every matrix entry (targets 1-11) concurrently (`fail-fast: false`) |
+| Effect             | Runs every matrix entry (targets 1-12) concurrently (`fail-fast: false`) |
 
 ## Evidence Limits
 
@@ -220,6 +232,10 @@ explicitly says so and the relevant dedicated workflow (e.g.
   scenario; it is not a distributed-system correctness or recovery proof.
 - `fuse-vm-test` measures queue depth under a FUSE VM workload; it is
   not a filesystem stress or correctness run.
+- `fuse-inode-metadata-validation` records mounted FUSE inode metadata
+  clean/readback rows and explicit blockers for unexercised crash-window
+  and committed-root rows; it is not POSIX completeness, xfstests, or
+  broad crash-safety evidence.
 - `qemu-ublk-smoke` validates ublk completion artifacts; it is not a
   block-storage correctness or performance benchmark.
 - `qemu-ublk-qid-tag-runtime` validates a bounded multi-queue qid/tag
@@ -243,9 +259,10 @@ are documentation boundaries, not requests for workflow or runtime changes.
    `kmod-xfstests-smoke`, `kernel-fsync-validation`,
    `kernel-mmap-validation`, `kernel-teardown-validation`,
    `kernel-no-daemon-teardown-validation`, `two-node-carrier-validation`,
-   `fuse-vm-test`, `qemu-ublk-smoke`, `qemu-ublk-qid-tag-runtime`,
-   `receipt-bound-reclaim-runtime`, `scrub-foreground-read-runtime`, or `all`.
-   Pushes to `master` still run only `kmod-xfstests-smoke`.
+   `fuse-vm-test`, `fuse-inode-metadata-validation`, `qemu-ublk-smoke`,
+   `qemu-ublk-qid-tag-runtime`, `receipt-bound-reclaim-runtime`,
+   `scrub-foreground-read-runtime`, or `all`.  Pushes to `master` still run
+   only `kmod-xfstests-smoke`.
 
 2. **Dual-surface targets.**  `kernel-fsync-validation` and
    `kernel-mmap-validation` exist both as QEMU Smoke matrix targets and
