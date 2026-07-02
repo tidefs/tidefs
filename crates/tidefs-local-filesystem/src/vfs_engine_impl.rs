@@ -3847,7 +3847,7 @@ fn live_admin_hex_to_bytes(value: &str) -> Result<Vec<u8>, String> {
     (0..hex.len())
         .step_by(2)
         .map(|i| {
-            u8::from_str_radix(&hex[i..i + 2])
+            u8::from_str_radix(&hex[i..i + 2], 16)
                 .map_err(|err| format!("invalid hex at position {i}: {err}"))
         })
         .collect()
@@ -7164,6 +7164,7 @@ mod tests {
             .expect("audit baseline roots")
             .selected_root
             .expect("selected baseline root");
+        fs.set_auto_commit(false);
         fs.replace_file("/base.txt", b"updated base bytes")
             .expect("replace base");
         fs.create_file("/delta.txt", 0o644).expect("create delta");
