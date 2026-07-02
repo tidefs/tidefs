@@ -139,6 +139,54 @@ const COMMAND_AUTHORITY_TABLE_DOCS: &[&str] = &[
     "docs/security/operator-authz-boundary.md",
     "docs/CLAIMS_GATE_POLICY.md",
 ];
+const COMMAND_CLASSIFICATION_DOC_MARKER_VALUE: &str = "tidefsctl-command-classification-v1";
+const COMMAND_CLASSIFICATION_SOURCE_PATH_VALUE: &str =
+    "apps/tidefsctl/src/commands/classification.rs";
+const REQUIRED_COMMAND_CLASS_LABELS: &[&str] = &[
+    "public-operator",
+    "userspace-harness",
+    "operator-diagnostic",
+    "prototype",
+    "development-diagnostic",
+    "removed-or-unsupported",
+];
+const REQUIRED_COMMAND_SURFACE_FACTS: &[(&str, &str, &str, &str, &str)] = &[
+    (
+        "cluster pool create",
+        "prototype",
+        "prototype-only",
+        "unguarded",
+        "not final",
+    ),
+    (
+        "cluster placement exercise",
+        "development-diagnostic",
+        "development-exercise",
+        "unguarded",
+        "development diagnostic",
+    ),
+    (
+        "cluster heal exercise",
+        "development-diagnostic",
+        "development-exercise",
+        "unguarded",
+        "development diagnostic",
+    ),
+    (
+        "pool list",
+        "removed-or-unsupported",
+        "removed",
+        "unguarded",
+        "no authoritative pool registry",
+    ),
+    (
+        "device rebuild",
+        "removed-or-unsupported",
+        "removed",
+        "unguarded",
+        "retired",
+    ),
+];
 
 pub const CLAIM_REGISTRY_PATH: &str = "validation/claims.toml";
 pub const CLAIM_REGISTRY_DOC_PATH: &str = "docs/CLAIM_REGISTRY.md";
@@ -194,6 +242,11 @@ struct CommandSurfaceFact {
     class: String,
     routing: String,
     summary: String,
+}
+
+#[derive(Clone, Debug)]
+struct CommandAuthority {
+    table: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -599,28 +652,6 @@ pub fn check_current_workspace() -> Result<(), ClaimsGateCheckError> {
         ],
         &mut missing,
     );
-    check_source_markers(
-        &root,
-        "apps/tidefsctl/src/commands/classification.rs",
-        &[
-            "tidefsctl-command-classification-v1",
-            "COMMAND_SURFACES",
-            "public-operator",
-            "userspace-harness",
-            "operator-diagnostic",
-            "prototype",
-            "development-diagnostic",
-            "removed-or-unsupported",
-            "cluster placement exercise",
-            "cluster heal exercise",
-            "not final distributed operator UAPI",
-            "pool list",
-            "device rebuild",
-            "live-owner-or-offline-input",
-        ],
-        &mut missing,
-    );
-
     for rel in CLAIMS_GATE_SCANNED_DOCS
         .iter()
         .copied()
@@ -680,11 +711,6 @@ pub fn check_current_workspace() -> Result<(), ClaimsGateCheckError> {
             "Unreleased Authority Boundary",
             "Mounted Transform Authority",
             "raw-store inventory",
-            "Operator Command Classification",
-            "tidefsctl-command-classification-v1",
-            "apps/tidefsctl/src/commands/authz.rs",
-            "command_admission",
-            "cluster placement exercise",
         ],
         &mut missing,
     );
@@ -741,20 +767,6 @@ pub fn check_current_workspace() -> Result<(), ClaimsGateCheckError> {
             "vfs_boundary_mirror",
             "production Linux ioctl, statx, or ublk ABI",
             "not proof that TideFS is kernelspace-ready",
-            "tidefsctl-command-classification-v1",
-            "apps/tidefsctl/src/commands/classification.rs",
-            "public-operator",
-            "userspace-harness",
-            "operator-diagnostic",
-            "prototype",
-            "development-diagnostic",
-            "removed-or-unsupported",
-            "cluster placement exercise",
-            "cluster heal exercise",
-            "not final distributed operator UAPI",
-            "pool list",
-            "device rebuild",
-            "pool integrity-check --backing-dir",
         ],
         &mut missing,
     );
@@ -2993,8 +3005,8 @@ fn markdown_cell(value: &str) -> String {
 }
 
 fn check_command_authority_docs(root: &Path, missing: &mut Vec<String>) {
-    let table = match command_authority_table_from_workspace(root) {
-        Ok(table) => table,
+    let authority = match command_authority_from_workspace(root) {
+        Ok(authority) => authority,
         Err(err) => {
             missing.push(err);
             return;
@@ -3007,7 +3019,7 @@ fn check_command_authority_docs(root: &Path, missing: &mut Vec<String>) {
             missing.push(format!("could not read `{rel}`"));
             continue;
         };
-        if !text.contains(&table) {
+        if !text.contains(&authority.table) {
             missing.push(format!(
                 "`{rel}` does not match the exact tidefsctl command authority table from COMMAND_SURFACES and command_admission"
             ));
@@ -3015,17 +3027,106 @@ fn check_command_authority_docs(root: &Path, missing: &mut Vec<String>) {
     }
 }
 
-fn command_authority_table_from_workspace(root: &Path) -> Result<String, String> {
+fn command_authority_from_workspace(root: &Path) -> Result<CommandAuthority, String> {
     let classification =
         fs::read_to_string(root.join("apps/tidefsctl/src/commands/classification.rs"))
             .map_err(|err| format!("read tidefsctl command classification registry: {err}"))?;
     let authz = fs::read_to_string(root.join("apps/tidefsctl/src/commands/authz.rs"))
         .map_err(|err| format!("read tidefsctl command admission registry: {err}"))?;
 
-    render_command_authority_table(
-        parse_command_surfaces(&classification)?,
-        parse_command_admissions(&authz)?,
+    command_authority_from_sources(
+        COMMAND_CLASSIFICATION_SOURCE_PATH_VALUE,
+        &classification,
+        &authz,
     )
+}
+
+fn command_authority_from_sources(
+    expected_source_path: &str,
+    classification: &str,
+    authz: &str,
+) -> Result<CommandAuthority, String> {
+    let doc_marker = parse_string_const(classification, "COMMAND_CLASSIFICATION_DOC_MARKER")?;
+    if doc_marker != COMMAND_CLASSIFICATION_DOC_MARKER_VALUE {
+        return Err(format!(
+            "COMMAND_CLASSIFICATION_DOC_MARKER must be `{COMMAND_CLASSIFICATION_DOC_MARKER_VALUE}`, found `{doc_marker}`"
+        ));
+    }
+    let source_path = parse_string_const(classification, "COMMAND_CLASSIFICATION_SOURCE_PATH")?;
+    if source_path != expected_source_path {
+        return Err(format!(
+            "COMMAND_CLASSIFICATION_SOURCE_PATH must be `{expected_source_path}`, found `{source_path}`"
+        ));
+    }
+
+    let surfaces = parse_command_surfaces(classification)?;
+    let admissions = parse_command_admissions(authz)?;
+    validate_command_authority_facts(&surfaces, &admissions)?;
+    let table = render_command_authority_table(surfaces, admissions)?;
+
+    Ok(CommandAuthority { table })
+}
+
+fn validate_command_authority_facts(
+    surfaces: &[CommandSurfaceFact],
+    admissions: &BTreeMap<String, String>,
+) -> Result<(), String> {
+    let mut seen_paths = BTreeSet::new();
+    for surface in surfaces {
+        if !seen_paths.insert(surface.path.as_str()) {
+            return Err(format!(
+                "COMMAND_SURFACES repeats command path `{}`",
+                surface.path
+            ));
+        }
+    }
+
+    for label in REQUIRED_COMMAND_CLASS_LABELS {
+        if !surfaces.iter().any(|surface| surface.class == *label) {
+            return Err(format!(
+                "COMMAND_SURFACES is missing required command class `{label}`"
+            ));
+        }
+    }
+
+    for (path, class, routing, admission, summary_marker) in REQUIRED_COMMAND_SURFACE_FACTS {
+        let surface = surfaces
+            .iter()
+            .find(|surface| surface.path == *path)
+            .ok_or_else(|| format!("COMMAND_SURFACES is missing required command `{path}`"))?;
+        if surface.class != *class {
+            return Err(format!(
+                "command `{path}` must be classified `{class}`, found `{}`",
+                surface.class
+            ));
+        }
+        if surface.routing != *routing {
+            return Err(format!(
+                "command `{path}` must use routing `{routing}`, found `{}`",
+                surface.routing
+            ));
+        }
+        match admissions.get(*path) {
+            Some(actual) if actual == admission => {}
+            Some(actual) => {
+                return Err(format!(
+                    "command `{path}` must use admission `{admission}`, found `{actual}`"
+                ));
+            }
+            None => return Err(format!("missing command_admission entry for `{path}`")),
+        }
+        if !surface
+            .summary
+            .to_ascii_lowercase()
+            .contains(summary_marker)
+        {
+            return Err(format!(
+                "command `{path}` summary must preserve `{summary_marker}` boundary wording"
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 fn render_command_authority_table(
@@ -3114,6 +3215,15 @@ fn parse_command_admissions(source: &str) -> Result<BTreeMap<String, String>, St
         }
     }
     Ok(admissions)
+}
+
+fn parse_string_const(source: &str, const_name: &str) -> Result<String, String> {
+    let after_name = source
+        .split_once(const_name)
+        .map(|(_, after)| after)
+        .ok_or_else(|| format!("missing `{const_name}` const"))?;
+    parse_first_string_literal(after_name)
+        .ok_or_else(|| format!("missing string literal for `{const_name}` const"))
 }
 
 fn parse_string_array(source: &str, const_name: &str) -> Result<Vec<String>, String> {
@@ -3336,15 +3446,17 @@ mod tests {
     use tidefs_validation::validation_status::ValidationStatus;
 
     use super::{
-        build_claim_validation_receipt, claims_gate_rules, line_has_present_tense_overclaim,
-        parse_claim_registry, parse_command_admissions, parse_command_surfaces,
-        render_claim_registry_doc, render_claim_validation_summary, render_command_authority_table,
-        validate_claim_record, validate_crash_claims_gate_review_artifact_content,
+        build_claim_validation_receipt, claims_gate_rules, command_authority_from_sources,
+        line_has_present_tense_overclaim, parse_claim_registry, parse_command_admissions,
+        parse_command_surfaces, render_claim_registry_doc, render_claim_validation_summary,
+        render_command_authority_table, validate_claim_record,
+        validate_crash_claims_gate_review_artifact_content,
         validate_model_crash_matrix_artifact_content, validate_registered_crash_artifacts,
         validate_runtime_crash_artifact_content, ClaimEvidenceArtifact, ClaimEvidenceRequirement,
         ClaimGateRuleTopic, ClaimReceiptStatus, ClaimRecord, ClaimStatus, EvidenceClassStatus,
         APP_INDEX_LIMITATION_MARKERS, CLAIMS_GATE_POLICY_SPEC, CLAIMS_GATE_REQUIRED_COMMAND,
-        CLAIMS_GATE_REVIEW_EVIDENCE_CLASS, CLAIMS_GATE_SCANNED_DOCS, CRASH_CLAIMS_GATE_REVIEW_PATH,
+        CLAIMS_GATE_REVIEW_EVIDENCE_CLASS, CLAIMS_GATE_SCANNED_DOCS,
+        COMMAND_CLASSIFICATION_SOURCE_PATH_VALUE, CRASH_CLAIMS_GATE_REVIEW_PATH,
         CRASH_CLAIMS_GATE_REVIEW_SCOPE, CRASH_CLAIMS_GATE_REVIEW_SOURCE, CRASH_CLAIM_IDS,
         CRASH_MODEL_EVIDENCE_SCOPE, CRASH_MODEL_EVIDENCE_SOURCE, CRASH_MODEL_MATRIX_PATH,
         CRATE_INDEX_LIMITATION_MARKERS, LOCAL_VFS_RENAME_CRASH_CLAIM_ID,
@@ -3354,6 +3466,77 @@ mod tests {
     };
 
     const MANIFEST_FIXTURE_SOURCE_REF: &str = "0123456789abcdef0123456789abcdef01234567";
+    const COMMAND_AUTHORITY_FIXTURE_CLASSIFICATION: &str = r#"
+pub(crate) const COMMAND_CLASSIFICATION_DOC_MARKER: &str = "tidefsctl-command-classification-v1";
+pub(crate) const COMMAND_CLASSIFICATION_SOURCE_PATH: &str =
+    "apps/tidefsctl/src/commands/classification.rs";
+
+// This prose is intentionally free to change; COMMAND_SURFACES is the authority.
+pub(crate) const COMMAND_SURFACES: &[CommandSurface] = &[
+    CommandSurface {
+        path: "pool scan",
+        class: CommandClass::PublicOperator,
+        routing: RoutingSemantics::OfflineDiscoveryOrImportInput,
+        summary: "scan explicit devices for pool labels",
+    },
+    CommandSurface {
+        path: "mount",
+        class: CommandClass::UserspaceHarness,
+        routing: RoutingSemantics::UserspaceHarness,
+        summary: "mount through the userspace FUSE harness",
+    },
+    CommandSurface {
+        path: "diag",
+        class: CommandClass::OperatorDiagnostic,
+        routing: RoutingSemantics::PassiveDiagnostic,
+        summary: "collect a redacted diagnostic support bundle",
+    },
+    CommandSurface {
+        path: "cluster pool create",
+        class: CommandClass::Prototype,
+        routing: RoutingSemantics::PrototypeOnly,
+        summary: "prototype clustered pool creation; not final distributed operator UAPI",
+    },
+    CommandSurface {
+        path: "cluster placement exercise",
+        class: CommandClass::DevelopmentDiagnostic,
+        routing: RoutingSemantics::DevelopmentExercise,
+        summary: "development diagnostic exercise for placement-map code",
+    },
+    CommandSurface {
+        path: "cluster heal exercise",
+        class: CommandClass::DevelopmentDiagnostic,
+        routing: RoutingSemantics::DevelopmentExercise,
+        summary: "development diagnostic exercise for placement-heal code",
+    },
+    CommandSurface {
+        path: "pool list",
+        class: CommandClass::RemovedOrUnsupported,
+        routing: RoutingSemantics::Removed,
+        summary: "no authoritative pool registry exists; use pool scan --devices",
+    },
+    CommandSurface {
+        path: "device rebuild",
+        class: CommandClass::RemovedOrUnsupported,
+        routing: RoutingSemantics::Removed,
+        summary: "offline directory object-store rebuild is retired",
+    },
+];
+"#;
+    const COMMAND_AUTHORITY_FIXTURE_AUTHZ: &str = r#"
+const LOCAL_ONLY_COMMANDS: &[&str] = &[];
+const LOCAL_ONLY_WHEN_MUTATING_COMMANDS: &[&str] = &[];
+const UNGUARDED_COMMANDS: &[&str] = &[
+    "pool scan",
+    "mount",
+    "diag",
+    "cluster pool create",
+    "cluster placement exercise",
+    "cluster heal exercise",
+    "pool list",
+    "device rebuild",
+];
+"#;
 
     #[test]
     fn claims_gate_policy_covers_current_claim_boundaries() {
@@ -4111,6 +4294,84 @@ mod tests {
                 "crates index should require marker {marker}"
             );
         }
+    }
+
+    #[test]
+    fn command_authority_accepts_harmless_source_prose_rewrite() {
+        let rewritten = COMMAND_AUTHORITY_FIXTURE_CLASSIFICATION.replace(
+            "This prose is intentionally free to change",
+            "Comment wording can move without weakening the authority",
+        );
+        let authority = command_authority_from_sources(
+            COMMAND_CLASSIFICATION_SOURCE_PATH_VALUE,
+            &rewritten,
+            COMMAND_AUTHORITY_FIXTURE_AUTHZ,
+        )
+        .expect("structured command authority should parse");
+
+        assert!(authority
+            .table
+            .contains("| `cluster pool create` | `prototype` | `prototype-only`"));
+        assert!(authority.table.contains(
+            "| `cluster placement exercise` | `development-diagnostic` | `development-exercise`"
+        ));
+        assert!(authority
+            .table
+            .contains("| `pool list` | `removed-or-unsupported` | `removed`"));
+    }
+
+    #[test]
+    fn command_authority_fails_closed_for_missing_or_malformed_structure() {
+        let missing_marker = COMMAND_AUTHORITY_FIXTURE_CLASSIFICATION.replace(
+            "tidefsctl-command-classification-v1",
+            "tidefsctl-command-classification-test-drift",
+        );
+        assert!(command_authority_from_sources(
+            COMMAND_CLASSIFICATION_SOURCE_PATH_VALUE,
+            &missing_marker,
+            COMMAND_AUTHORITY_FIXTURE_AUTHZ,
+        )
+        .expect_err("wrong marker should fail")
+        .contains("COMMAND_CLASSIFICATION_DOC_MARKER"));
+
+        let missing_table = COMMAND_AUTHORITY_FIXTURE_CLASSIFICATION.replace(
+            "pub(crate) const COMMAND_SURFACES",
+            "pub(crate) const COMMAND_SURFACE_ROWS",
+        );
+        assert!(command_authority_from_sources(
+            COMMAND_CLASSIFICATION_SOURCE_PATH_VALUE,
+            &missing_table,
+            COMMAND_AUTHORITY_FIXTURE_AUTHZ,
+        )
+        .expect_err("missing COMMAND_SURFACES should fail")
+        .contains("missing COMMAND_SURFACES array"));
+
+        let reclassified = COMMAND_AUTHORITY_FIXTURE_CLASSIFICATION.replace(
+            r#"path: "cluster pool create",
+        class: CommandClass::Prototype,"#,
+            r#"path: "cluster pool create",
+        class: CommandClass::PublicOperator,"#,
+        );
+        let reclassified_error = command_authority_from_sources(
+            COMMAND_CLASSIFICATION_SOURCE_PATH_VALUE,
+            &reclassified,
+            COMMAND_AUTHORITY_FIXTURE_AUTHZ,
+        )
+        .expect_err("prototype command reclassification should fail");
+        assert!(
+            reclassified_error.contains("prototype")
+                || reclassified_error.contains("cluster pool create")
+        );
+
+        let missing_admission =
+            COMMAND_AUTHORITY_FIXTURE_AUTHZ.replace("    \"cluster pool create\",\n", "");
+        assert!(command_authority_from_sources(
+            COMMAND_CLASSIFICATION_SOURCE_PATH_VALUE,
+            COMMAND_AUTHORITY_FIXTURE_CLASSIFICATION,
+            &missing_admission,
+        )
+        .expect_err("missing admission should fail")
+        .contains("missing command_admission entry"));
     }
 
     #[test]
