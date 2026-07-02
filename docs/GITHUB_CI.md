@@ -159,6 +159,17 @@ may use non-secret repository variables for scheduling gates, such as
   state-transfer scenario, and uploads `carrier-report.json`, `qemu.log`,
   `summary.json`, and environment metadata under
   `two-node-carrier-validation`.
+- `Geo RPO WAN TCP` is a manual self-hosted workflow for the bounded
+  `storage.intent.geo_async_rpo.v1` runtime row. It runs
+  `tidefs-geo-rpo-wan-tcp-validation` from `tidefs-two-node-harness`, starts
+  sender and receiver child processes over live `tidefs-transport` TCP, applies
+  application-level WAN impairment rows for lag, catch-up, freshness/RPO,
+  degraded/refusal visibility, partitions, stale clocks, loss/jitter, and
+  bandwidth clamps, and uploads the three registered
+  `validation/artifacts/storage-intent/geo-*` evidence artifacts with
+  manifests. This is RDMA-absent WAN/TCP row evidence, not production cluster
+  readiness, storage-node runtime proof, successor/comparator permission, or a
+  release-candidate gate.
 - `Kernel fsync/syncfs validation` is a narrow manual self-hosted workflow for
   the fsync/fdatasync/syncfs durability row. It runs
   `.#kernel-fsync-validation` against the selected branch with
