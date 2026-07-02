@@ -776,18 +776,15 @@ pub fn verify_device_emptiness_after_evacuation(
     store: &tidefs_local_object_store::LocalObjectStore,
 ) -> Result<(), DeviceRemovalAnchorError> {
     let all_keys = store.list_keys();
-    let known_label_prefix_bytes = POOL_LABEL_KEY_PREFIX.as_bytes();
-    let removal_key_bytes = DEVICE_REMOVAL_RECORD_KEY.as_bytes();
-    let progress_key_bytes = EVACUATION_PROGRESS_KEY.as_bytes();
+    let known_label_keys: std::collections::BTreeSet<ObjectKey> = (0u32..64u32)
+        .map(|idx| ObjectKey::from_name(format!("{POOL_LABEL_KEY_PREFIX}{idx}")))
+        .collect();
+    let removal_key = ObjectKey::from_name(DEVICE_REMOVAL_RECORD_KEY.as_bytes());
+    let progress_key = ObjectKey::from_name(EVACUATION_PROGRESS_KEY.as_bytes());
 
     let data_keys: Vec<ObjectKey> = all_keys
         .iter()
-        .filter(|k| {
-            let kb = k.as_bytes();
-            !kb.starts_with(known_label_prefix_bytes)
-                && kb != removal_key_bytes
-                && kb != progress_key_bytes
-        })
+        .filter(|k| !known_label_keys.contains(*k) && **k != removal_key && **k != progress_key)
         .cloned()
         .collect();
 
@@ -1696,10 +1693,37 @@ mod tests {
         store.put(label_key, &vec![0u8; 1024]).unwrap();
 
         let record_key = ObjectKey::from_name(DEVICE_REMOVAL_RECORD_KEY);
-        store.put(record_key, b"{\"removal\": true}").unwrap();
+        let record = DeviceRemovalRecord {
+            removed_device: std::path::PathBuf::from("/dev/disk0"),
+            device_guid: [0x01u8; 16],
+            device_index: 0,
+            surviving_devices: vec![std::path::PathBuf::from("/dev/disk1")],
+            device_count_before: 2,
+            device_count_after: 1,
+            objects_evacuated: 0,
+            bytes_evacuated: 0,
+            objects_failed: 0,
+            topology_generation: 2,
+            removal_complete: true,
+        };
+        store
+            .put(record_key, &record.encode_durable().unwrap())
+            .unwrap();
 
         let progress_key = ObjectKey::from_name(EVACUATION_PROGRESS_KEY);
-        store.put(progress_key, b"{\"progress\": true}").unwrap();
+        let progress = EvacuationProgressRecord::new(EvacuationProgressInit {
+            target_device: std::path::PathBuf::from("/dev/disk0"),
+            target_device_guid: [0x01u8; 16],
+            target_device_index: 0,
+            surviving_devices: vec![std::path::PathBuf::from("/dev/disk1")],
+            device_count_before: 2,
+            device_count_after: 1,
+            topology_generation: 2,
+            total_objects: 0,
+        });
+        store
+            .put(progress_key, &progress.encode_durable().unwrap())
+            .unwrap();
 
         store.sync().unwrap();
 
@@ -1749,13 +1773,14 @@ mod tests {
 #[test]
 fn imported_config_preserves_authoritative_fields_through_remove_device() {
     use tidefs_pool_scan::{DeviceHealth, DeviceType, PoolConfig};
-    use tidefs_types_pool_label_core::{DeviceClass, PoolState};
+    use tidefs_types_pool_label_core::{features, DeviceClass, PoolState};
 
     let dir = tempfile::tempdir().unwrap();
     let mut store = tidefs_local_object_store::LocalObjectStore::open(dir.path()).unwrap();
 
     let pool_uuid = [0x7Fu8; 16];
     let pool_name = "auth-test-pool".to_string();
+    let feature_flags = 0xFEED & !features::DEVICE_LAYOUT_V1;
 
     let leaf0 = DeviceType::Leaf {
         device_path: std::path::PathBuf::from("/dev/disk0"),
@@ -1801,7 +1826,7 @@ fn imported_config_preserves_authoritative_fields_through_remove_device() {
         state: PoolState::Active,
         total_capacity_bytes: 3 * 1024 * 1024 * 1024,
         allocated_bytes: 0,
-        feature_flags: 0xFEED,
+        feature_flags,
         topology_generation: 5,
         device_count: 3,
         missing_indices: vec![],
@@ -1827,7 +1852,7 @@ fn imported_config_preserves_authoritative_fields_through_remove_device() {
         "pool name must survive import"
     );
     assert_eq!(
-        imported.feature_flags, 0xFEED,
+        imported.feature_flags, feature_flags,
         "feature flags must survive import"
     );
     assert_eq!(
@@ -1868,7 +1893,7 @@ fn imported_config_preserves_authoritative_fields_through_remove_device() {
         "pool name must survive remove_device"
     );
     assert_eq!(
-        post_config.feature_flags, 0xFEED,
+        post_config.feature_flags, feature_flags,
         "feature flags must survive remove_device"
     );
 

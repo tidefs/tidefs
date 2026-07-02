@@ -581,7 +581,7 @@ mod tests {
                     make_leaf("/dev/disk1", 1, 0x02, DeviceHealth::Online),
                 ],
             },
-            redundancy_policy: tidefs_types_pool_label_core::PoolRedundancyPolicy::replicated(1),
+            redundancy_policy: tidefs_types_pool_label_core::PoolRedundancyPolicy::replicated(2),
             health: DeviceHealth::Degraded,
             state: PoolState::Active,
             total_capacity_bytes: 2 * 1024 * 1024 * 1024,
