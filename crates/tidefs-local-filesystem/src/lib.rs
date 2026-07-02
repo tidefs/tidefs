@@ -386,7 +386,7 @@ use tidefs_background_scheduler::{
 };
 use tidefs_block_allocator::TrimRequest;
 use tidefs_claim_ledger::{ClaimClass, ClaimEntryRecord, ClaimantRef};
-use tidefs_commit_group::{CommitGroupId, CommitGroupRecovery, CommitGroupSync, SyncGate};
+use tidefs_commit_group::{CommitGroupId, CommitGroupRecovery, CommitGroupSync, RootPointer, SyncGate};
 use tidefs_dataset_feature_flags::{FeatureFlags, SupportedFeaturesV1};
 use tidefs_dataset_lifecycle::{
     DatasetCatalog, DatasetFlags, DatasetId, DatasetLifecycle, DatasetType, PoisonNotification,
@@ -1672,6 +1672,10 @@ impl MountedRawStoreDiagnostics<'_> {
 
     fn suspect_log_stats(&self) -> SuspectLogStats {
         self.store.suspect_log().stats()
+    }
+
+    fn committed_root_pointer(&self) -> RootPointer {
+        self.store.txg_manager().committed_root()
     }
 
     #[cfg(test)]
@@ -3922,9 +3926,11 @@ impl LocalFileSystem {
     }
 
     /// Temporary mounted raw-store bypass retained for the remaining POSIX
-    /// diagnostic caller. New mounted callers should use typed projections.
-    /// Mounted device-level compression and encryption remain blocked while
-    /// this raw-store escape hatch is present.
+    /// diagnostic caller that reads the committed root pointer.  New callers
+    /// should use [`committed_root_pointer`](Self::committed_root_pointer) or
+    /// the other typed diagnostic projections instead.  Mounted device-level
+    /// compression and encryption remain blocked while this raw-store escape
+    /// hatch is present.
     pub fn object_store(&self) -> &LocalObjectStore {
         self.store.raw_primary_store()
     }
@@ -3955,6 +3961,17 @@ impl LocalFileSystem {
         let record = self.stat(path)?;
         self.mounted_raw_store_diagnostics()
             .verify_file_checksum_tree(&record, block_size)
+    }
+
+    /// Return the committed root pointer from the transaction-group manager
+    /// without exposing the raw object store to the caller.
+    ///
+    /// This projection exists so mounted diagnostic callers (including the
+    /// POSIX committed-root validation path) can read the committed root
+    /// without going through [`object_store`](Self::object_store).
+    pub fn committed_root_pointer(&self) -> RootPointer {
+        self.mounted_raw_store_diagnostics()
+            .committed_root_pointer()
     }
 
     /// Diagnostic suspect-log statistics without exposing the raw object store.
