@@ -12,6 +12,9 @@ use crate::hard_gates::HardGateEvidence;
 use crate::heuristics::HeuristicInput;
 use crate::lifecycle::GovernorLifecycleState;
 use crate::reasons::GovernorRelocationReason;
+use tidefs_storage_intent_core::{
+    evidence_ref_is_kind, StorageIntentEvidenceKind, StorageIntentEvidenceRef,
+};
 
 /// Configuration for the relocation governor.
 #[derive(Clone, Debug)]
@@ -69,6 +72,9 @@ pub struct RelocationGovernor {
 /// An admitted relocation subject tracked by the governor.
 #[allow(dead_code)]
 struct AdmittedSubject {
+    /// Relocation subject identifier.
+    subject_id: u64,
+
     #[allow(dead_code)]
     /// Admission record.
     record: AdmissionRecord,
@@ -78,6 +84,61 @@ struct AdmittedSubject {
 
     /// Bytes in flight for this relocation.
     bytes_in_flight: u64,
+}
+
+/// Evidence that a runtime relocation job has completed lawfully.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RelocationCompletionRecord {
+    /// Admission record being completed.
+    pub admission_id: u64,
+
+    /// Relocation subject identifier.
+    pub subject_id: u64,
+
+    /// Source receipt identity from the admitted governor decision.
+    pub source_receipt_id: [u8; 16],
+
+    /// Relocation reason from the admitted governor decision.
+    pub reason: GovernorRelocationReason,
+
+    /// Bytes moved by the completed runtime job.
+    pub bytes: u64,
+
+    /// Completion timestamp (ms since epoch).
+    pub completed_at_ms: u64,
+
+    /// Replacement placement receipt published before source retirement.
+    pub replacement_receipt_ref: StorageIntentEvidenceRef,
+
+    /// Evidence proving old/source receipt retirement is lawful.
+    pub source_retirement_ref: StorageIntentEvidenceRef,
+
+    /// #911 action-completion evidence.
+    pub action_completion_ref: StorageIntentEvidenceRef,
+
+    /// Caller-visible #920 result/refusal evidence.
+    pub result_refusal_ref: StorageIntentEvidenceRef,
+}
+
+/// Refusal returned when runtime completion evidence does not match admission.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RelocationCompletionError {
+    /// No admitted subject matches the completion admission id.
+    NotAdmitted,
+    /// Completion names a different subject than the admitted decision.
+    SubjectMismatch,
+    /// Completion names a different source receipt than the admitted decision.
+    SourceReceiptMismatch,
+    /// Completion names a different relocation reason than the admitted decision.
+    ReasonMismatch,
+    /// Replacement placement receipt evidence is missing.
+    MissingReplacementReceipt,
+    /// Source-retirement evidence is missing.
+    MissingSourceRetirementEvidence,
+    /// Action-completion evidence is missing.
+    MissingActionCompletionEvidence,
+    /// Caller-visible result/refusal evidence is missing.
+    MissingResultRefusalEvidence,
 }
 
 impl RelocationGovernor {
@@ -139,6 +200,7 @@ impl RelocationGovernor {
             // Track admitted subject.
             if decision.verdict == crate::admission::AdmissionVerdict::Admitted {
                 self.admitted_subjects.push(AdmittedSubject {
+                    subject_id,
                     record: record.clone(),
                     state: decision.target_state,
                     bytes_in_flight: heuristic_input.relocation_bytes.unwrap_or(0),
@@ -160,24 +222,64 @@ impl RelocationGovernor {
         decision
     }
 
-    /// Record that a relocation has completed successfully.
+    /// Record that a runtime relocation has completed successfully.
+    ///
+    /// Completion must match one admitted subject and must carry the evidence
+    /// chain that makes replacement publication and source retirement lawful.
     pub fn record_relocation_completed(
         &mut self,
-        subject_id: u64,
-        bytes: u64,
-        now_ms: u64,
-        reason: GovernorRelocationReason,
-    ) {
-        let at_state = self.get_or_create_anti_thrash(subject_id);
-        at_state
-            .movement_debt
-            .record_relocation(bytes, now_ms, reason);
+        completion: RelocationCompletionRecord,
+    ) -> Result<(), RelocationCompletionError> {
+        let admitted_index = self
+            .admitted_subjects
+            .iter()
+            .position(|subject| subject.record.admission_id == completion.admission_id)
+            .ok_or(RelocationCompletionError::NotAdmitted)?;
 
-        // Remove from admitted subjects.
-        self.admitted_subjects
-            .retain(|s| s.record.source_receipt_id != [0u8; 16] || s.record.admission_id != 0);
-        // In practice, match by admission_id; simplified for first slice.
-        self.admitted_subjects.clear(); // stub
+        let admitted = &self.admitted_subjects[admitted_index];
+        if admitted.subject_id != completion.subject_id {
+            return Err(RelocationCompletionError::SubjectMismatch);
+        }
+        if admitted.record.source_receipt_id != completion.source_receipt_id {
+            return Err(RelocationCompletionError::SourceReceiptMismatch);
+        }
+        if admitted.record.reason != completion.reason {
+            return Err(RelocationCompletionError::ReasonMismatch);
+        }
+        if !evidence_ref_is_kind(
+            completion.replacement_receipt_ref,
+            StorageIntentEvidenceKind::PlacementReceipt,
+        ) {
+            return Err(RelocationCompletionError::MissingReplacementReceipt);
+        }
+        if !evidence_ref_is_kind(
+            completion.source_retirement_ref,
+            StorageIntentEvidenceKind::ActionExecutionEvidence,
+        ) {
+            return Err(RelocationCompletionError::MissingSourceRetirementEvidence);
+        }
+        if !evidence_ref_is_kind(
+            completion.action_completion_ref,
+            StorageIntentEvidenceKind::ActionExecutionEvidence,
+        ) {
+            return Err(RelocationCompletionError::MissingActionCompletionEvidence);
+        }
+        if !evidence_ref_is_kind(
+            completion.result_refusal_ref,
+            StorageIntentEvidenceKind::ResultRefusalEvidence,
+        ) {
+            return Err(RelocationCompletionError::MissingResultRefusalEvidence);
+        }
+
+        let at_state = self.get_or_create_anti_thrash(completion.subject_id);
+        at_state.movement_debt.record_relocation(
+            completion.bytes,
+            completion.completed_at_ms,
+            completion.reason,
+        );
+
+        self.admitted_subjects.remove(admitted_index);
+        Ok(())
     }
 
     /// Record a failed payback for a subject.
@@ -243,6 +345,20 @@ impl RelocationGovernor {
     #[must_use]
     pub fn admitted_count(&self) -> usize {
         self.admitted_subjects.len()
+    }
+
+    /// Return an admission record by durable admission id.
+    #[must_use]
+    pub fn admission_record(&self, admission_id: u64) -> Option<&AdmissionRecord> {
+        self.admission_history
+            .iter()
+            .find(|record| record.admission_id == admission_id)
+    }
+
+    /// Return the most recently recorded admission decision.
+    #[must_use]
+    pub fn latest_admission_record(&self) -> Option<&AdmissionRecord> {
+        self.admission_history.last()
     }
 
     /// Get the total bytes in flight.
@@ -413,15 +529,38 @@ mod tests {
     #[test]
     fn records_relocation_updates_debt() {
         let mut gov = RelocationGovernor::default();
-        gov.record_relocation_completed(
+        gov.evaluate_proposal(
             1,
-            1024 * 1024,
-            500_000,
             GovernorRelocationReason::HddDefrag,
+            &defrag_input(),
+            &clean_evidence(),
+            0,
+            [1u8; 16],
+            [2u8; 16],
         );
+        gov.record_relocation_completed(RelocationCompletionRecord {
+            admission_id: 1,
+            subject_id: 1,
+            source_receipt_id: [1u8; 16],
+            reason: GovernorRelocationReason::HddDefrag,
+            bytes: 1024 * 1024,
+            completed_at_ms: 500_000,
+            replacement_receipt_ref: evidence_ref(StorageIntentEvidenceKind::PlacementReceipt, 1),
+            source_retirement_ref: evidence_ref(
+                StorageIntentEvidenceKind::ActionExecutionEvidence,
+                2,
+            ),
+            action_completion_ref: evidence_ref(
+                StorageIntentEvidenceKind::ActionExecutionEvidence,
+                3,
+            ),
+            result_refusal_ref: evidence_ref(StorageIntentEvidenceKind::ResultRefusalEvidence, 4),
+        })
+        .unwrap();
         let state = gov.get_or_create_anti_thrash(1);
         assert_eq!(state.movement_debt.bytes_moved, 1024 * 1024);
         assert_eq!(state.movement_debt.last_move_completed_ms, 500_000);
+        assert_eq!(gov.admitted_count(), 0);
     }
 
     #[test]
@@ -467,5 +606,14 @@ mod tests {
         // Both admitted.
         assert_eq!(gov.admitted_count(), 2);
         assert!(!gov.can_admit());
+    }
+
+    fn evidence_ref(kind: StorageIntentEvidenceKind, seed: u8) -> StorageIntentEvidenceRef {
+        StorageIntentEvidenceRef::new(
+            kind,
+            tidefs_storage_intent_core::StorageIntentEvidenceId([seed; 32]),
+            1,
+            1,
+        )
     }
 }
