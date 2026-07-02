@@ -171,6 +171,53 @@ fn no_daemon_pass_json() -> String {
         "target_id".into(),
         serde_json::Value::String(KERNEL_TEARDOWN_NO_WORK_AFTER_NO_DAEMON_TARGET_ID.into()),
     );
+    obj.insert(
+        "runtime_scope_coverage".into(),
+        serde_json::json!([
+            {
+                "surface": "vfs",
+                "status": "pass",
+                "evidence": "configured_pool_mount, write_test_file, readback_verify, readdir_before_teardown",
+                "no_required_support_daemon": true,
+                "residual_risk": "bounded mounted POSIX smoke row, not xfstests breadth"
+            },
+            {
+                "surface": "block",
+                "status": "pass",
+                "evidence": "shared pool member mounted through lower virtio block authority",
+                "no_required_support_daemon": true,
+                "residual_risk": "does not prove block-volume export or queue_rq breadth"
+            },
+            {
+                "surface": "recovery",
+                "status": "pass",
+                "evidence": "reload_remount and recovery_write_verify",
+                "no_required_support_daemon": true,
+                "residual_risk": "bounded reload/remount recovery row, not powercut campaign"
+            },
+            {
+                "surface": "writeback",
+                "status": "pass",
+                "evidence": "sync_after_write before teardown and post-reload recovery write",
+                "no_required_support_daemon": true,
+                "residual_risk": "bounded sync path only, not mmap or page-cache coherency"
+            },
+            {
+                "surface": "placement_reserve_admission",
+                "status": "pass",
+                "evidence": "configured_pool_member_created and configured_pool_label_verified",
+                "no_required_support_daemon": true,
+                "residual_risk": "configured pool admission smoke only, not allocator policy breadth"
+            },
+            {
+                "surface": "teardown_no_work_after",
+                "status": "pass",
+                "evidence": "unmount_ok, rmmod_ok, refusal_mount, refusal_mount_check, dmesg_clean",
+                "no_required_support_daemon": true,
+                "residual_risk": "bounded lifecycle row, not broad concurrent teardown stress"
+            }
+        ]),
+    );
     obj.remove("cutover_phases");
     obj.remove("cutover_fence_observations");
     obj.remove("cutover_truth_observations");
@@ -191,6 +238,7 @@ fn integration_pass_artifact_validates() {
     assert_eq!(summary.cutover_phase_count, 6);
     assert_eq!(summary.cutover_fence_observation_count, 4);
     assert_eq!(summary.cutover_truth_observation_count, 1);
+    assert_eq!(summary.runtime_scope_coverage_count, 0);
     assert_eq!(summary.target_id, KERNEL_TEARDOWN_NO_WORK_AFTER_TARGET_ID);
     assert_eq!(summary.source_ref, "refs/heads/master");
 }
@@ -204,6 +252,49 @@ fn integration_full_kernel_no_daemon_artifact_validates() {
     assert_eq!(
         summary.target_id,
         KERNEL_TEARDOWN_NO_WORK_AFTER_NO_DAEMON_TARGET_ID
+    );
+    assert_eq!(summary.runtime_scope_coverage_count, 6);
+}
+
+#[test]
+fn integration_full_kernel_no_daemon_missing_scope_fails() {
+    let mut json_val: serde_json::Value = serde_json::from_str(&no_daemon_pass_json()).unwrap();
+    json_val
+        .as_object_mut()
+        .unwrap()
+        .remove("runtime_scope_coverage");
+    let json = serde_json::to_string_pretty(&json_val).unwrap();
+    let err = validate_kernel_teardown_no_work_after_artifact_json(&json).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("runtime_scope_coverage"),
+        "should require no-daemon runtime scope coverage: {msg}"
+    );
+}
+
+#[test]
+fn integration_full_kernel_no_daemon_blocked_scope_cannot_pass() {
+    let mut json_val: serde_json::Value = serde_json::from_str(&no_daemon_pass_json()).unwrap();
+    let scope = json_val
+        .as_object_mut()
+        .unwrap()
+        .get_mut("runtime_scope_coverage")
+        .unwrap()
+        .as_array_mut()
+        .unwrap();
+    scope
+        .iter_mut()
+        .find(|entry| entry["surface"] == "block")
+        .unwrap()
+        .as_object_mut()
+        .unwrap()
+        .insert("status".into(), serde_json::Value::String("blocked".into()));
+    let json = serde_json::to_string_pretty(&json_val).unwrap();
+    let err = validate_kernel_teardown_no_work_after_artifact_json(&json).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("surface `block`"),
+        "should reject pass status with blocked T6 surface: {msg}"
     );
 }
 

@@ -988,7 +988,7 @@ fn main() {
             ) {
                 Ok(summary) => {
                     println!(
-                        "kernel teardown no-work-after artifact validated: status={} fail_closed_count={} phases={} refusals={} cutover_phases={} cutover_fences={} cutover_truth={} target={} source_ref={}",
+                        "kernel teardown no-work-after artifact validated: status={} fail_closed_count={} phases={} refusals={} cutover_phases={} cutover_fences={} cutover_truth={} runtime_scope_coverage={} target={} source_ref={}",
                         summary.status,
                         summary.fail_closed_count,
                         summary.phase_count,
@@ -996,6 +996,7 @@ fn main() {
                         summary.cutover_phase_count,
                         summary.cutover_fence_observation_count,
                         summary.cutover_truth_observation_count,
+                        summary.runtime_scope_coverage_count,
                         summary.target_id,
                         summary.source_ref
                     );

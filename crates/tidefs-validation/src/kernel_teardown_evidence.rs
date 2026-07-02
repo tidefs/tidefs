@@ -105,6 +105,16 @@ pub struct CutoverTruthObservation {
     pub verified: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeScopeCoverage {
+    pub surface: String,
+    pub status: String,
+    pub evidence: String,
+    pub no_required_support_daemon: bool,
+    pub residual_risk: String,
+}
+
 // ---------------------------------------------------------------------------
 // Main artifact struct
 // ---------------------------------------------------------------------------
@@ -153,6 +163,12 @@ pub struct KernelTeardownNoWorkAfterV1 {
     // Cleanup outcome
     pub cleanup_outcome: CleanupOutcome,
 
+    // Full-kernel/no-daemon rows must explicitly account for every product
+    // surface in the T6 claim boundary. A non-pass surface keeps the artifact
+    // blocked; a pass artifact may not omit or paper over a required surface.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runtime_scope_coverage: Vec<RuntimeScopeCoverage>,
+
     // Mounted-kernel cutover/fence transcript. Existing non-cutover T6
     // teardown rows may omit these fields; mounted-kernel-vfs rows must
     // populate them and the validator fails closed when they are missing.
@@ -183,6 +199,7 @@ pub struct KernelTeardownNoWorkAfterSummary {
     pub cutover_phase_count: usize,
     pub cutover_fence_observation_count: usize,
     pub cutover_truth_observation_count: usize,
+    pub runtime_scope_coverage_count: usize,
     pub target_id: String,
     pub source_ref: String,
 }
@@ -251,6 +268,14 @@ const VALID_TIER_TARGET_PAIRS: &[(&str, &str)] = &[
         KERNEL_TEARDOWN_NO_WORK_AFTER_FULL_KERNEL_NO_DAEMON_TIER,
         KERNEL_TEARDOWN_NO_WORK_AFTER_NO_DAEMON_TARGET_ID,
     ),
+];
+const REQUIRED_FULL_KERNEL_NO_DAEMON_SURFACES: &[&str] = &[
+    "vfs",
+    "block",
+    "recovery",
+    "writeback",
+    "placement_reserve_admission",
+    "teardown_no_work_after",
 ];
 const NEWLINE_ONLY_BLAKE3_DIGEST: &str =
     "blake3:295192ea1ec8566d563b1a7587e5f0198580cdbd043842f5090a4c197c20c67a";
@@ -511,6 +536,58 @@ pub fn validate_kernel_teardown_no_work_after_artifact_json(
     // --- mounted cutover transcript ---
     let is_mounted_kernel_vfs =
         artifact.target_id == KERNEL_TEARDOWN_NO_WORK_AFTER_MOUNTED_KERNEL_VFS_TARGET_ID;
+    let is_full_kernel_no_daemon =
+        artifact.target_id == KERNEL_TEARDOWN_NO_WORK_AFTER_NO_DAEMON_TARGET_ID;
+    if is_full_kernel_no_daemon && artifact.runtime_scope_coverage.is_empty() {
+        failures.push(
+            "runtime_scope_coverage must be non-empty for full-kernel-no-daemon artifacts".into(),
+        );
+    }
+    if !artifact.runtime_scope_coverage.is_empty() {
+        let seen: BTreeSet<&str> = artifact
+            .runtime_scope_coverage
+            .iter()
+            .map(|coverage| coverage.surface.as_str())
+            .collect();
+        if is_full_kernel_no_daemon {
+            for &required in REQUIRED_FULL_KERNEL_NO_DAEMON_SURFACES {
+                if !seen.contains(required) {
+                    failures.push(format!(
+                        "required full-kernel/no-daemon surface `{required}` is missing"
+                    ));
+                }
+            }
+        }
+        for (i, coverage) in artifact.runtime_scope_coverage.iter().enumerate() {
+            if coverage.surface.is_empty() {
+                failures.push(format!("runtime_scope_coverage[{i}].surface is empty"));
+            }
+            if !VALID_STATUSES.contains(&coverage.status.as_str()) {
+                failures.push(format!(
+                    "runtime_scope_coverage[{i}].status must be one of {:?}, got `{}`",
+                    VALID_STATUSES, coverage.status
+                ));
+            }
+            if coverage.evidence.is_empty() {
+                failures.push(format!(
+                    "runtime_scope_coverage[{i}].evidence is empty (surface={})",
+                    coverage.surface
+                ));
+            }
+            if coverage.residual_risk.is_empty() {
+                failures.push(format!(
+                    "runtime_scope_coverage[{i}].residual_risk is empty (surface={})",
+                    coverage.surface
+                ));
+            }
+            if coverage.status == "pass" && !coverage.no_required_support_daemon {
+                failures.push(format!(
+                    "runtime_scope_coverage[{i}] passed without no-daemon proof (surface={})",
+                    coverage.surface
+                ));
+            }
+        }
+    }
     if is_mounted_kernel_vfs && artifact.cutover_phases.is_empty() {
         failures.push("cutover_phases must be non-empty for mounted-kernel-vfs artifacts".into());
     }
@@ -643,6 +720,24 @@ pub fn validate_kernel_teardown_no_work_after_artifact_json(
     if artifact.status == "pass" && !artifact.fail_closed_reasons.is_empty() {
         failures.push("fail_closed_reasons must be empty when status is `pass`".into());
     }
+    if is_full_kernel_no_daemon && artifact.status == "pass" {
+        for &required in REQUIRED_FULL_KERNEL_NO_DAEMON_SURFACES {
+            match artifact
+                .runtime_scope_coverage
+                .iter()
+                .find(|coverage| coverage.surface == required)
+            {
+                Some(coverage) if coverage.status == "pass" => {}
+                Some(coverage) => failures.push(format!(
+                    "full-kernel/no-daemon pass requires surface `{required}` to pass, got `{}`",
+                    coverage.status
+                )),
+                None => failures.push(format!(
+                    "full-kernel/no-daemon pass requires surface `{required}`"
+                )),
+            }
+        }
+    }
     if artifact.status != "pass" && artifact.fail_closed_reasons.is_empty() {
         failures.push(format!(
             "fail_closed_reasons must be non-empty when status is `{}`",
@@ -662,6 +757,7 @@ pub fn validate_kernel_teardown_no_work_after_artifact_json(
         cutover_phase_count: artifact.cutover_phases.len(),
         cutover_fence_observation_count: artifact.cutover_fence_observations.len(),
         cutover_truth_observation_count: artifact.cutover_truth_observations.len(),
+        runtime_scope_coverage_count: artifact.runtime_scope_coverage.len(),
         target_id: artifact.target_id,
         source_ref: artifact.source_ref,
     })
@@ -1285,6 +1381,7 @@ mod tests {
                 dmesg_state: "clean".into(),
                 remaining_tidefs_work_observations: "none".into(),
             },
+            runtime_scope_coverage: vec![],
             cutover_phases: REQUIRED_MOUNTED_CUTOVER_PHASES
                 .iter()
                 .map(|&p| CutoverPhase {
