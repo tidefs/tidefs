@@ -21,10 +21,9 @@ use tidefs_background_scheduler::{
 use tidefs_storage_intent_core::{
     action_execution_allows_source_retirement, action_execution_satisfies_completion,
     evidence_ref_is_kind, StorageIntentActionEvidenceState, StorageIntentActionExecutionEvidence,
-    StorageIntentActionExecutionRefusalReason, StorageIntentActionPublicationState,
-    StorageIntentActionTargetVerificationState, StorageIntentEvidenceId, StorageIntentEvidenceKind,
-    StorageIntentEvidenceRef, StorageIntentObjectScope, StorageIntentPolicyId,
-    StorageIntentPolicyRevision,
+    StorageIntentActionExecutionRefusalReason, StorageIntentActionTargetVerificationState,
+    StorageIntentEvidenceId, StorageIntentEvidenceKind, StorageIntentEvidenceRef,
+    StorageIntentObjectScope, StorageIntentPolicyId, StorageIntentPolicyRevision,
 };
 use tidefs_types_incremental_job_core::{JobId, JobKind};
 
@@ -926,10 +925,10 @@ mod tests {
         StorageIntentActionBudgetOutcomeRecord, StorageIntentActionClass,
         StorageIntentActionExecutionAdmissionRefs, StorageIntentActionExecutionFlags,
         StorageIntentActionExecutionReplayRecord, StorageIntentActionExecutionStepState,
-        StorageIntentActionPublicationBoundaryRecord, StorageIntentActionReplayState,
-        StorageIntentActionSourceProtectionRecord, StorageIntentActionTargetVerificationRecord,
-        StorageIntentDomainId, StorageIntentReplayIdempotencyKey,
-        StorageIntentSourceRetirementState,
+        StorageIntentActionPublicationBoundaryRecord, StorageIntentActionPublicationState,
+        StorageIntentActionReplayState, StorageIntentActionSourceProtectionRecord,
+        StorageIntentActionTargetVerificationRecord, StorageIntentDomainId,
+        StorageIntentReplayIdempotencyKey, StorageIntentSourceRetirementState,
     };
 
     #[derive(Clone)]
@@ -1065,7 +1064,25 @@ mod tests {
         retirement_state: StorageIntentSourceRetirementState,
         replay_state: StorageIntentActionReplayState,
     ) -> StorageIntentActionExecutionEvidence {
-        let action_id = StorageIntentEvidenceId([8u8; 32]);
+        action_evidence_with_identity(
+            8,
+            step_state,
+            target_state,
+            publication_state,
+            retirement_state,
+            replay_state,
+        )
+    }
+
+    fn action_evidence_with_identity(
+        identity_seed: u8,
+        step_state: StorageIntentActionExecutionStepState,
+        target_state: StorageIntentActionTargetVerificationState,
+        publication_state: StorageIntentActionPublicationState,
+        retirement_state: StorageIntentSourceRetirementState,
+        replay_state: StorageIntentActionReplayState,
+    ) -> StorageIntentActionExecutionEvidence {
+        let action_id = StorageIntentEvidenceId([identity_seed; 32]);
         let flags = StorageIntentActionExecutionFlags::ACTION_IDENTITY
             .union(StorageIntentActionExecutionFlags::DECISION_FRONTIER_REF)
             .union(StorageIntentActionExecutionFlags::HARD_GATE_REF)
@@ -1141,7 +1158,7 @@ mod tests {
             },
             step_state,
             replay: StorageIntentActionExecutionReplayRecord {
-                idempotency_key: StorageIntentReplayIdempotencyKey([5u8; 16]),
+                idempotency_key: StorageIntentReplayIdempotencyKey([identity_seed; 16]),
                 step_sequence: 1,
                 retry_generation: 0,
                 state: replay_state,
@@ -1370,21 +1387,29 @@ mod tests {
             [4u8; 16],
         );
         let second_admission = gov.latest_admission_record().unwrap().clone();
-        let evidence = action_evidence(
+        let first_evidence = action_evidence(
             StorageIntentActionExecutionStepState::Complete,
             StorageIntentActionTargetVerificationState::Verified,
             StorageIntentActionPublicationState::SourceRetirementPublished,
             StorageIntentSourceRetirementState::Ready,
             StorageIntentActionReplayState::FirstAttempt,
         );
-        let mut first = runtime_job(first_admission, evidence);
+        let second_evidence = action_evidence_with_identity(
+            9,
+            StorageIntentActionExecutionStepState::Complete,
+            StorageIntentActionTargetVerificationState::Verified,
+            StorageIntentActionPublicationState::SourceRetirementPublished,
+            StorageIntentSourceRetirementState::Ready,
+            StorageIntentActionReplayState::FirstAttempt,
+        );
+        let mut first = runtime_job(first_admission, first_evidence);
         first.job_id = JobId(70);
-        let mut second = runtime_job(second_admission, evidence);
+        let mut second = runtime_job(second_admission, second_evidence);
         second.job_id = JobId(71);
         second.subject_id = 43;
         let mover = ScriptedMover::new(vec![
-            RelocationMoveOutcome::complete(1024, evidence),
-            RelocationMoveOutcome::complete(1024, evidence),
+            RelocationMoveOutcome::complete(1024, first_evidence),
+            RelocationMoveOutcome::complete(1024, second_evidence),
         ]);
         let mut service = RelocationGovernorService::new(gov).with_data_mover(Box::new(mover));
         service.set_current_policy_revision(StorageIntentPolicyRevision(7));
@@ -1417,21 +1442,29 @@ mod tests {
             [4u8; 16],
         );
         let second_admission = gov.latest_admission_record().unwrap().clone();
-        let evidence = action_evidence(
+        let first_evidence = action_evidence(
             StorageIntentActionExecutionStepState::Complete,
             StorageIntentActionTargetVerificationState::Verified,
             StorageIntentActionPublicationState::SourceRetirementPublished,
             StorageIntentSourceRetirementState::Ready,
             StorageIntentActionReplayState::FirstAttempt,
         );
-        let mut first = runtime_job(first_admission, evidence);
+        let second_evidence = action_evidence_with_identity(
+            9,
+            StorageIntentActionExecutionStepState::Complete,
+            StorageIntentActionTargetVerificationState::Verified,
+            StorageIntentActionPublicationState::SourceRetirementPublished,
+            StorageIntentSourceRetirementState::Ready,
+            StorageIntentActionReplayState::FirstAttempt,
+        );
+        let mut first = runtime_job(first_admission, first_evidence);
         first.job_id = JobId(80);
-        let mut second = runtime_job(second_admission, evidence);
+        let mut second = runtime_job(second_admission, second_evidence);
         second.job_id = JobId(81);
         second.subject_id = 43;
         let mover = ScriptedMover::new(vec![
-            RelocationMoveOutcome::complete(1024, evidence),
-            RelocationMoveOutcome::complete(1024, evidence),
+            RelocationMoveOutcome::complete(1024, first_evidence),
+            RelocationMoveOutcome::complete(1024, second_evidence),
         ]);
         let mut service = RelocationGovernorService::new(gov).with_data_mover(Box::new(mover));
         service.set_current_policy_revision(StorageIntentPolicyRevision(7));
