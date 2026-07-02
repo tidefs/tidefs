@@ -80,11 +80,17 @@ static void make_path(const char *name) {
     snprintf(test_path, sizeof(test_path), "%s/%s", mnt_dir, name);
 }
 
-static int create_reg(const char *name) {
+static int create_reg(const char *row, const char *name) {
     make_path(name);
+    printf("STEP: %s -- open %s\n", row, name);
+    fflush(stdout);
     int fd = open(test_path, O_RDWR | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) die("create_reg");
+    printf("STEP: %s -- write %s\n", row, name);
+    fflush(stdout);
     if (write(fd, "hello", 5) != 5) die("write");
+    printf("STEP: %s -- close %s\n", row, name);
+    fflush(stdout);
     close(fd);
     return 0;
 }
@@ -112,8 +118,10 @@ int main(int argc, char *argv[]) {
 
     /* ── 1. getattr: retrieve attributes after file creation ── */
     BEGIN("getattr-clean");
-    create_reg("getattr_test.bin");
+    create_reg("getattr-clean", "getattr_test.bin");
     make_path("getattr_test.bin");
+    printf("STEP: getattr-clean -- stat getattr_test.bin\n");
+    fflush(stdout);
     if (stat(test_path, &st) < 0) {
         FAIL("getattr-clean");
     } else {
@@ -128,8 +136,10 @@ int main(int argc, char *argv[]) {
 
     /* ── 2. setattr-size: change file size via truncate ── */
     BEGIN("setattr-size-clean");
-    create_reg("size_test.bin");
+    create_reg("setattr-size-clean", "size_test.bin");
     make_path("size_test.bin");
+    printf("STEP: setattr-size-clean -- truncate size_test.bin\n");
+    fflush(stdout);
     if (truncate(test_path, 4096) < 0) {
         FAIL("setattr-size-clean -- truncate failed");
     } else if (stat(test_path, &st) < 0) {
@@ -142,8 +152,10 @@ int main(int argc, char *argv[]) {
 
     /* ── 3. setattr-mode: change permissions via chmod ── */
     BEGIN("setattr-mode-clean");
-    create_reg("mode_test.bin");
+    create_reg("setattr-mode-clean", "mode_test.bin");
     make_path("mode_test.bin");
+    printf("STEP: setattr-mode-clean -- chmod mode_test.bin\n");
+    fflush(stdout);
     if (chmod(test_path, 0755) < 0) {
         FAIL("setattr-mode-clean -- chmod failed");
     } else if (stat(test_path, &st) < 0) {
@@ -157,8 +169,10 @@ int main(int argc, char *argv[]) {
     /* ── 4. setattr-owner: change owner via chown (skip if not root) ── */
     BEGIN("setattr-owner-clean");
     if (getuid() == 0) {
-        create_reg("owner_test.bin");
+        create_reg("setattr-owner-clean", "owner_test.bin");
         make_path("owner_test.bin");
+        printf("STEP: setattr-owner-clean -- chown owner_test.bin\n");
+        fflush(stdout);
         if (chown(test_path, 1, 1) < 0) {
             FAIL("setattr-owner-clean -- chown failed");
         } else if (stat(test_path, &st) < 0) {
@@ -174,12 +188,14 @@ int main(int argc, char *argv[]) {
 
     /* ── 5. setattr-timestamps: set atime/mtime via utime ── */
     BEGIN("setattr-timestamps-clean");
-    create_reg("timestamps_test.bin");
+    create_reg("setattr-timestamps-clean", "timestamps_test.bin");
     make_path("timestamps_test.bin");
     time_t set_time = 1000000000; /* epoch-based deterministic time */
     struct utimbuf ut;
     ut.actime = set_time;
     ut.modtime = set_time;
+    printf("STEP: setattr-timestamps-clean -- utime timestamps_test.bin\n");
+    fflush(stdout);
     if (utime(test_path, &ut) < 0) {
         FAIL("setattr-timestamps-clean -- utime failed");
     } else if (stat(test_path, &st) < 0) {
@@ -193,8 +209,10 @@ int main(int argc, char *argv[]) {
 
     /* ── 6. chmod: dedicated chmod path ── */
     BEGIN("chmod-clean");
-    create_reg("chmod_test.bin");
+    create_reg("chmod-clean", "chmod_test.bin");
     make_path("chmod_test.bin");
+    printf("STEP: chmod-clean -- chmod chmod_test.bin\n");
+    fflush(stdout);
     if (chmod(test_path, 0600) < 0) {
         FAIL("chmod-clean -- chmod failed");
     } else if (stat(test_path, &st) < 0) {
@@ -208,8 +226,10 @@ int main(int argc, char *argv[]) {
     /* ── 7. chown: dedicated chown path ── */
     BEGIN("chown-clean");
     if (getuid() == 0) {
-        create_reg("chown_test.bin");
+        create_reg("chown-clean", "chown_test.bin");
         make_path("chown_test.bin");
+        printf("STEP: chown-clean -- chown chown_test.bin\n");
+        fflush(stdout);
         if (chown(test_path, 2, 2) < 0) {
             FAIL("chown-clean -- chown failed");
         } else if (stat(test_path, &st) < 0) {
@@ -221,8 +241,10 @@ int main(int argc, char *argv[]) {
         }
     } else {
         /* Non-root: chown fails with EPERM; record this as environment refusal. */
-        create_reg("chown_test.bin");
+        create_reg("chown-clean", "chown_test.bin");
         make_path("chown_test.bin");
+        printf("STEP: chown-clean -- chown chown_test.bin\n");
+        fflush(stdout);
         if (chown(test_path, 2, 2) == 0) {
             FAIL("chown-clean -- chown succeeded unexpectedly as non-root");
         } else if (errno == EPERM) {
@@ -234,13 +256,15 @@ int main(int argc, char *argv[]) {
 
     /* ── 8. utimens: dedicated utimens path ── */
     BEGIN("utimens-clean");
-    create_reg("utimens_test.bin");
+    create_reg("utimens-clean", "utimens_test.bin");
     make_path("utimens_test.bin");
     struct timespec ts[2];
     ts[0].tv_sec = 500000000;
     ts[0].tv_nsec = 123456789;
     ts[1].tv_sec = 500000000;
     ts[1].tv_nsec = 987654321;
+    printf("STEP: utimens-clean -- utimensat utimens_test.bin\n");
+    fflush(stdout);
     if (utimensat(AT_FDCWD, test_path, ts, 0) < 0) {
         FAIL("utimens-clean -- utimensat failed");
     } else if (stat(test_path, &st) < 0) {
@@ -950,7 +974,47 @@ INITSCRIPT
 
     extract_value() {
       local key="$1"
-      grep "^$key=" "$VAL_LOG" 2>/dev/null | tail -1 | cut -d= -f2 | awk '{print $1}'
+      awk -F= -v key="$key" '
+        { sub(/\r$/, "") }
+        $1 == key {
+          value = $2
+          sub(/[[:space:]].*/, "", value)
+          found = value
+        }
+        END {
+          if (found != "") print found
+        }
+      ' "$VAL_LOG"
+    }
+
+    extract_line_value() {
+      local key="$1"
+      awk -F= -v key="$key" '
+        { sub(/\r$/, "") }
+        $1 == key {
+          value = substr($0, length(key) + 2)
+          found = value
+        }
+        END {
+          if (found != "") print found
+        }
+      ' "$VAL_LOG"
+    }
+
+    marker_count() {
+      local marker="$1"
+      awk -v marker="$marker" '
+        { sub(/\r$/, "") }
+        $0 == marker { count++ }
+        END { print count + 0 }
+      ' "$VAL_LOG"
+    }
+
+    json_escape() {
+      sed \
+        -e 's/\\/\\\\/g' \
+        -e 's/"/\\"/g' \
+        -e 's/\t/\\t/g'
     }
 
     extract_between "TIDEFS_OBSERVED_ROWS_BEGIN" "TIDEFS_OBSERVED_ROWS_END" > "$VALIDATION_DIR/observed_rows.txt" || true
@@ -970,18 +1034,21 @@ INITSCRIPT
     REFUSED="$(extract_value REFUSED)"; REFUSED="''${REFUSED:-0}"
     FAILED="$(extract_value FAILED)"; FAILED="''${FAILED:-0}"
     BLOCKED="$(extract_value BLOCKED)"; BLOCKED="''${BLOCKED:-0}"
-    DONEC="$(grep -c '^TIDEFS_FUSE_INODE_METADATA_VALIDATION_DONE$' "$VAL_LOG" 2>/dev/null || true)"
-    KERNEL_VERSION="$(grep '^kernel=' "$VAL_LOG" 2>/dev/null | tail -1 | cut -d= -f2- || echo unknown)"
+    DONEC="$(marker_count TIDEFS_FUSE_INODE_METADATA_VALIDATION_DONE)"
+    KERNEL_VERSION="$(extract_line_value kernel)"
     [ -n "$KERNEL_VERSION" ] || KERNEL_VERSION=unknown
+    SOURCE_COMMIT_JSON="$(printf '%s' "$SOURCE_COMMIT" | json_escape)"
+    ARTIFACT_SCOPE_JSON="$(printf '%s' "$ARTIFACT_SCOPE" | json_escape)"
+    KERNEL_VERSION_JSON="$(printf '%s' "$KERNEL_VERSION" | json_escape)"
 
     cat > "$VALIDATION_DIR/fuse-inode-metadata-validation.json" <<JSON
 {
   "test": "tidefs-fuse-inode-metadata-validation",
   "version": 2,
   "tier": "mounted-userspace-qemu-guest",
-  "commit": "$SOURCE_COMMIT",
-  "artifact_scope": "$ARTIFACT_SCOPE",
-  "kernel_version": "$KERNEL_VERSION",
+  "commit": "$SOURCE_COMMIT_JSON",
+  "artifact_scope": "$ARTIFACT_SCOPE_JSON",
+  "kernel_version": "$KERNEL_VERSION_JSON",
   "kernel_package": "linuxKernel_7_0",
   "qemu_status": $QEMU_STATUS,
   "done_marker_seen": $DONEC,
