@@ -970,7 +970,6 @@ impl UblkDataQueueCommitAndFetchFailureClass {
             | UblkDataQueueCommitAndFetchError::QueueIdOutOfRange
             | UblkDataQueueCommitAndFetchError::TagOutOfRange
             | UblkDataQueueCommitAndFetchError::NeedGetDataResultUnsupported
-            | UblkDataQueueCommitAndFetchError::PositiveResultUnsupported
             | UblkDataQueueCommitAndFetchError::ZoneAppendLbaMustBeZero => {
                 Self::InvalidCommitAndFetchInput
             }
@@ -1251,7 +1250,6 @@ const fn is_pre_submit_commit_and_fetch_error(error: UblkDataQueueCommitAndFetch
             | UblkDataQueueCommitAndFetchError::QueueIdOutOfRange
             | UblkDataQueueCommitAndFetchError::TagOutOfRange
             | UblkDataQueueCommitAndFetchError::NeedGetDataResultUnsupported
-            | UblkDataQueueCommitAndFetchError::PositiveResultUnsupported
             | UblkDataQueueCommitAndFetchError::ZoneAppendLbaMustBeZero
     )
 }
