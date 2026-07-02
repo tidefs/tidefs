@@ -1,15 +1,17 @@
 # tidefs-namespace
 
-TideFS namespace layer: directory entry management with intent-log crash safety.
+TideFS namespace layer: directory entry management with optional intent-log
+recording.
 
 ## Overview
 
 The namespace crate is the primary directory-entry primitive that the FUSE
 adapter and higher-level filesystem consumers call. It maps directory paths
-to inodes through the polymorphic directory index and provides entry types
-for crash-safe insert, lookup, and remove operations. Entry content hashing
-uses `rustc-hash`'s fast non-cryptographic `FxHasher` for in-memory lookup
-efficiency; durability and integrity are provided by the storage layer.
+to inodes through the polymorphic directory index and provides entry types for
+insert, lookup, and remove operations. Entry content hashing uses
+`rustc-hash`'s fast non-cryptographic `FxHasher` for in-memory lookup
+checks; durability, recovery, and cryptographic integrity are storage-layer
+and authority-doc responsibilities.
 
 ## Architecture
 
@@ -29,7 +31,7 @@ FUSE handlers (tidefs-fuser)
   DirIndex (polymorphic: in-memory / persistent)
          │
          ▼
-  tidefs-intent-log (IntentLogBuffer for crash safety)
+  tidefs-intent-log (optional IntentLogBuffer records)
 ```
 
 ## Modules
@@ -51,18 +53,18 @@ Every `NamespaceEntry` carries a u64 content hash computed over
 `(parent, name, ino, kind)` using `rustc_hash::FxHasher`, a fast
 non-cryptographic hash function. This enables:
 
-- **Tamper detection**: `entry.verify()` returns false if any field is
-  corrupted.
-- **Idempotent replay**: identical entries produce identical hashes, so
-  intent-log replay can detect already-applied operations.
+- **Field-change detection**: `entry.verify()` returns false if any hashed
+  field changes.
+- **Replay comparison**: identical entries produce identical hashes, so replay
+  code can compare already-applied operations.
 - **Tombstone verification**: `NamespaceEntryTombstone` carries the removed
-  entry's hash, proving the removal was intentional.
+  entry's hash.
 
 Durability and cryptographic integrity are provided by the storage layer
 (BLAKE3-256 on-disk records); the namespace hash is purely for in-memory
 lookup performance.
 
-## Intent-Log Crash Safety
+## Intent-Log Recording
 
 `insert_entry`, `insert_directory_entry`, and `remove_entry` accept an optional
 `Arc<IntentLogBuffer>`. When provided, each operation appends a corresponding
@@ -76,8 +78,8 @@ lookup performance.
 | File/symlink remove | `IntentLogRecord::Unlink` |
 | Directory remove | `IntentLogRecord::Rmdir` |
 
-On crash recovery, the intent-log reader replays these records to restore the
-namespace to its pre-crash state.
+The records are inputs to replay consumers. They are not standalone evidence
+for namespace recovery, rename atomicity, or product admission.
 
 ## Usage
 

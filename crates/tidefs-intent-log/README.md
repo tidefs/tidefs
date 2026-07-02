@@ -1,6 +1,7 @@
 # tidefs-intent-log
 
-BLAKE3-authenticated intent-log for TideFS crash-consistent mutation recording.
+BLAKE3-authenticated intent-log records, replay helpers, and kernel append/scan
+primitives for TideFS mutation intent records.
 
 ## Record Types
 
@@ -11,24 +12,23 @@ Tmpfile, Lseek, Fsync, CleanupQueue, and CopyFileRange.
 
 ## Replay Architecture
 
-`IntentReplayEngine` provides deterministic intent-log replay for mount-time
-crash recovery. The engine iterates intent-log segments, filters records by
-the applied-transaction-group watermark, and dispatches each record through a
+`IntentReplayEngine` provides deterministic dispatch of unapplied intent-log
+records. The engine iterates intent-log segments, filters records by the
+applied-transaction-group watermark, and dispatches each record through a
 trait-based `IntentReplayHandler`.
 
 ### Design
 
 - **Segment iteration**: the engine reads BLAKE3-verified intent-log segments
   via `IntentLogReader`, handling both fully committed segments and truncated
-  segments (crashed mid-write).
+  segments.
 - **LSN filtering**: records with LSN <= the committed root's transaction group
   are skipped — the filesystem state already reflects those mutations.
 - **Record-type dispatch**: each replayable record variant is dispatched through
   `IntentReplayHandler::handle_record()`. Implementations bridge records back to
   filesystem operations (e.g., VfsEngine dispatch).
 - **BLAKE3 checkpoint**: after replay completes, `compute_checkpoint()` produces
-  a domain-separated digest (`tidefs-intent-replay-v1`) over the replay state,
-  enabling deterministic verification of recovery consistency.
+  a domain-separated digest (`tidefs-intent-replay-v1`) over the replay state.
 
 ### Idempotency
 
@@ -41,24 +41,14 @@ Replay is naturally idempotent:
 
 ### Partial-Record Handling
 
-Truncated segments (crashed mid-write, no valid footer) are replayed up to the
-last valid record checksum. Corrupt segments are skipped with a warning but do
-not abort recovery — the filesystem is still consistent up to the previous
-segment.
-
-### No-fsck Recovery Contract
-
-Recovery is automatic through committed roots and intent replay. No fsck-style
-scanning or repair is required. On mount, the system:
-1. Selects the newest valid committed root.
-2. Replays any unapplied intent-log records through `IntentReplayEngine`.
-3. The filesystem reaches a consistent state without manual intervention.
+Truncated segments with no valid footer are replayed up to the last valid
+record checksum. Corrupt segments are reported as skipped by this helper.
 
 ### Record-Type Dispatch Table
 
 | Record Type        | Replayable | Dispatch Strategy                  |
 |--------------------|-----------|------------------------------------|
-| Write              | No        | Data lost in crash                 |
+| Write              | No        | Hash-only record; no inline data   |
 | BufferedWrite      | Yes       | Open file, write inline data       |
 | Truncate           | Yes       | setattr with FATTR_SIZE            |
 | Setattr            | Yes       | setattr with decoded attr blob     |
@@ -75,17 +65,17 @@ scanning or repair is required. On mount, the system:
 | Fallocate          | No        | Requires open file handle          |
 | CopyFileRange      | No        | Requires open file handles         |
 | Flush              | No        | Acknowledgment marker              |
-| Fsync              | No        | Durability barrier marker          |
-| WriteIntentAck     | No        | Durable-commit acknowledgment      |
+| Fsync              | No        | Barrier marker                     |
+| WriteIntentAck     | No        | Completion marker                  |
 | Lseek              | No        | Read-path metadata marker          |
 | CleanupQueue       | No        | GC ledger state marker             |
 
 ## Integrations
 
 - `tidefs-recovery-loop`: wires `IntentReplayEngine` with `VfsReplayHandler`
-  for mount-time crash recovery replay through VfsEngine.
-- `tidefs-local-filesystem`: invokes replay during mount after committed-root
-  selection and before marking the filesystem clean.
+  for replay through `VfsEngine`.
+- `tidefs-local-filesystem`: can invoke replay after committed-root selection
+  as part of its mount flow.
 
 ## KernelStorageIo Append Path
 
@@ -96,7 +86,7 @@ kernel code:
   `KernelStorageIo`.
 - Each append assigns the next monotonic record sequence, pads only the final
   physical sector, checks for short writes, and optionally calls
-  `KernelStorageIo::flush()` for commit-barrier durability.
+  `KernelStorageIo::flush()` when the caller selects the flush policy.
 - The frame checksum is the existing BLAKE3 `IntentLogFrame` checksum. There is
   no zero checksum placeholder, fake digest, or compatibility shim in this
   path.
@@ -109,8 +99,8 @@ kernel code:
   moving, while fatal storage or callback errors abort replay.
 
 These primitives are consumed by the mounted `KernelPoolCore` path. They do not
-by themselves replace the current kernel bring-up table or close mounted
-object/extent replay.
+by themselves replace the current kernel bring-up table, complete mounted
+object/extent replay, or validate crash-recovery product claims.
 
 ## Retired Validation Report
 
