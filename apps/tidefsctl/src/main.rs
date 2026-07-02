@@ -505,6 +505,30 @@ mod tests {
     }
 
     #[test]
+    fn cli_parse_pool_destroy_json() {
+        use clap::Parser;
+        let args = Cli::try_parse_from(["tidefsctl", "pool", "destroy", "mypool", "--json"])
+            .expect("pool destroy --json should parse");
+
+        match args.command {
+            Command::Pool {
+                cmd:
+                    commands::pool::PoolCommand::Destroy {
+                        pool_name,
+                        devices,
+                        json,
+                        ..
+                    },
+            } => {
+                assert_eq!(pool_name, "mypool");
+                assert_eq!(devices, None);
+                assert!(json);
+            }
+            other => panic!("expected pool destroy, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn cli_parse_pool_destroy_rejects_no_name() {
         use clap::Parser;
         let args = Cli::try_parse_from(["tidefsctl", "pool", "destroy"]);
