@@ -885,9 +885,10 @@ pub struct RelocationCandidate {
     pub dead_bytes: u64,
     /// Byte ranges `[start, end)` of live extents within the source segment.
     ///
-    /// Populated from extent-map/object metadata in production paths.
-    /// When empty, callers fall back to `[(0, live_bytes)]` as a
-    /// contiguous-prefix approximation.
+    /// Runtime/product callers must populate this from extent-map/object
+    /// metadata when `live_bytes > 0`. An empty vector is unambiguous: either
+    /// the segment is fully dead (`live_bytes == 0`) or the live-range
+    /// evidence is unavailable and product planning must refuse relocation.
     pub live_ranges: Vec<(u64, u64)>,
 }
 
@@ -923,6 +924,13 @@ impl RelocationCandidate {
     pub fn is_dead(&self, max_live_byte_ratio: f64) -> bool {
         self.live_byte_ratio <= max_live_byte_ratio
     }
+
+    /// Whether this candidate carries enough live-range evidence for product
+    /// relocation planning.
+    #[must_use]
+    pub fn has_live_range_evidence(&self) -> bool {
+        self.live_bytes == 0 || !self.live_ranges.is_empty()
+    }
 }
 
 // ── Segment usage table (mock / source-of-truth abstraction) ──────────
@@ -945,8 +953,9 @@ pub struct SegmentUsageRecord {
     pub age: u64,
     /// Byte ranges `[start, end)` of live extents within the segment.
     ///
-    /// Populated from extent-map/object metadata. When empty, callers
-    /// fall back to `[(0, live_bytes)]` contiguous-prefix approximation.
+    /// Runtime/product callers must populate this from extent-map/object
+    /// metadata when `live_bytes > 0`. Empty live ranges with nonzero live
+    /// bytes represent unavailable evidence and are refused by the planner.
     pub live_ranges: Vec<(u64, u64)>,
 }
 
@@ -1099,12 +1108,37 @@ pub struct RelocationAssignment {
     pub post_relocation_entries: Vec<ExtentMapUpdateEntry>,
 }
 
-/// An ordered relocation plan: the list of assignments produced by the
-/// planner, ready for the object relocation engine to execute.
+/// Why the segment relocation planner refused to admit a candidate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RelocationPlanRefusalReason {
+    /// The candidate reported nonzero live bytes but did not provide the exact
+    /// extent-map live ranges needed to move bytes safely.
+    MissingLiveRanges,
+}
+
+/// A typed fail-closed refusal emitted instead of synthesizing relocation
+/// authority from placeholder live ranges.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RelocationPlanRefusal {
+    /// Source segment whose relocation was refused.
+    pub source_segment_id: u64,
+    /// Total usable bytes reported for the source segment.
+    pub total_bytes: u64,
+    /// Nonzero live bytes that lacked exact live-range evidence.
+    pub live_bytes: u64,
+    /// Reason this candidate was refused.
+    pub reason: RelocationPlanRefusalReason,
+}
+
+/// An ordered relocation plan: admitted assignments plus any fail-closed
+/// refusals produced by the planner. Plans are ready for execution only when
+/// [`RelocationPlan::has_refusals`] is false.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RelocationPlan {
     /// Ordered list of relocation assignments.
     pub assignments: Vec<RelocationAssignment>,
+    /// Typed refusals that make the plan non-executable.
+    pub refusals: Vec<RelocationPlanRefusal>,
     /// Total dead bytes that will be reclaimed after execution.
     pub total_dead_bytes_reclaimed: u64,
     /// Number of source segments involved.
@@ -1120,10 +1154,22 @@ impl RelocationPlan {
         Self::default()
     }
 
-    /// Whether the plan has any work to do.
+    /// Whether the plan has no assignments and no refusals.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.assignments.is_empty()
+        self.assignments.is_empty() && self.refusals.is_empty()
+    }
+
+    /// Whether any candidate was refused.
+    #[must_use]
+    pub fn has_refusals(&self) -> bool {
+        !self.refusals.is_empty()
+    }
+
+    /// Whether this plan may be handed to a relocation executor.
+    #[must_use]
+    pub fn is_executable(&self) -> bool {
+        !self.has_refusals()
     }
 
     /// Number of relocation assignments in the plan.
@@ -1196,6 +1242,21 @@ impl<A: SegmentAllocator> SegmentRelocationPlanner<A> {
         let mut plan = RelocationPlan::new();
 
         for candidate in candidates {
+            if !candidate.has_live_range_evidence() {
+                plan.refusals.push(RelocationPlanRefusal {
+                    source_segment_id: candidate.segment_id,
+                    total_bytes: candidate.total_bytes,
+                    live_bytes: candidate.live_bytes,
+                    reason: RelocationPlanRefusalReason::MissingLiveRanges,
+                });
+            }
+        }
+
+        if plan.has_refusals() {
+            return plan;
+        }
+
+        for candidate in candidates {
             // Fully-dead segments: no data to move, just reclaim.
             if candidate.live_bytes == 0 {
                 plan.total_dead_bytes_reclaimed += candidate.dead_bytes;
@@ -1209,22 +1270,9 @@ impl<A: SegmentAllocator> SegmentRelocationPlanner<A> {
                 break;
             };
 
-            // Use real extent-map live ranges when available;
-            // fall back to contiguous prefix placeholder for callers
-            // that haven't been updated yet.
-            let live_ranges = if candidate.live_ranges.is_empty() {
-                if candidate.live_bytes > 0 {
-                    vec![(0, candidate.live_bytes)]
-                } else {
-                    vec![]
-                }
-            } else {
-                candidate.live_ranges.clone()
-            };
-
             plan.assignments.push(RelocationAssignment {
                 source_segment_id: candidate.segment_id,
-                live_ranges,
+                live_ranges: candidate.live_ranges.clone(),
                 destination_segment_id: destination,
                 destination_device_id: 0,
                 destination_offset_hint: 0,
@@ -1751,7 +1799,8 @@ impl RelocationOutcome {
 ///
 /// This trait is the contract for writing relocated data to destination
 /// segments and updating extent maps. Implementations are wired into the
-/// local-object-store write path (not wired in this change).
+/// local-object-store write path (not wired in this change). Executors must
+/// reject plans where [`RelocationPlan::has_refusals`] is true.
 pub trait RelocationExecutor {
     /// Execute a relocation plan.
     ///
@@ -2645,6 +2694,14 @@ mod tests {
 
     // ── Segment relocation candidate tests ───────────────────────────
 
+    fn test_live_ranges(live: u64) -> Vec<(u64, u64)> {
+        if live == 0 {
+            Vec::new()
+        } else {
+            vec![(0, live)]
+        }
+    }
+
     fn make_usage(segments: &[(u64, u64, u64, u64)]) -> Vec<SegmentUsageRecord> {
         segments
             .iter()
@@ -2653,7 +2710,7 @@ mod tests {
                 total_bytes: total,
                 live_bytes: live,
                 age,
-                live_ranges: vec![],
+                live_ranges: test_live_ranges(live),
             })
             .collect()
     }
@@ -2665,6 +2722,7 @@ mod tests {
         assert_eq!(c.dead_bytes, 1024);
         assert_eq!(c.live_bytes, 0);
         assert!(c.is_dead(0.25));
+        assert!(c.has_live_range_evidence());
     }
 
     #[test]
@@ -2673,6 +2731,7 @@ mod tests {
         assert_eq!(c.live_byte_ratio, 1.0);
         assert_eq!(c.dead_bytes, 0);
         assert!(!c.is_dead(0.25));
+        assert!(!c.has_live_range_evidence());
     }
 
     #[test]
@@ -2684,6 +2743,7 @@ mod tests {
         assert!(!c.is_dead(0.25));
         // but is dead with a higher threshold
         assert!(c.is_dead(0.5));
+        assert!(!c.has_live_range_evidence());
     }
 
     #[test]
@@ -2700,6 +2760,7 @@ mod tests {
         // defaults to 1.0 (safe).
         let c = RelocationCandidate::new(4, 0, 100, 1, vec![]);
         assert_eq!(c.live_byte_ratio, 1.0);
+        assert!(!c.has_live_range_evidence());
     }
 
     #[test]
@@ -2849,6 +2910,8 @@ mod tests {
         let plan = RelocationPlan::new();
         assert!(plan.is_empty());
         assert_eq!(plan.len(), 0);
+        assert!(!plan.has_refusals());
+        assert!(plan.is_executable());
         assert_eq!(plan.total_dead_bytes_reclaimed, 0);
         assert_eq!(plan.source_segment_count, 0);
         assert_eq!(plan.destination_segment_count, 0);
@@ -2875,11 +2938,13 @@ mod tests {
                     post_relocation_entries: Vec::new(),
                 },
             ],
+            refusals: vec![],
             total_dead_bytes_reclaimed: 7168,
             source_segment_count: 2,
             destination_segment_count: 2,
         };
         assert!(!plan.is_empty());
+        assert!(plan.is_executable());
         assert_eq!(plan.len(), 2);
         assert_eq!(plan.total_dead_bytes_reclaimed, 7168);
         assert_eq!(plan.assignments[0].source_segment_id, 10);
@@ -2908,31 +2973,34 @@ mod tests {
         assert_eq!(candidates[1].segment_id, 1); // 12.5% live
         assert_eq!(candidates[2].segment_id, 2); // 25% live
 
-        // Build a mock plan: one destination per candidate
+        // Build a mock plan: fully dead segments need no destination; live
+        // candidates use the explicit mock live ranges from make_usage().
         let mut plan = RelocationPlan::new();
-        for (i, candidate) in candidates.iter().enumerate() {
+        let mut destination_index = 0;
+        for candidate in &candidates {
+            plan.total_dead_bytes_reclaimed += candidate.dead_bytes;
+            plan.source_segment_count += 1;
+            if candidate.live_bytes == 0 {
+                continue;
+            }
             plan.assignments.push(RelocationAssignment {
                 source_segment_id: candidate.segment_id,
                 live_ranges: candidate.live_ranges.clone(),
-                destination_segment_id: 100 + i as u64,
+                destination_segment_id: 100 + destination_index,
                 destination_device_id: 0,
                 destination_offset_hint: 0,
                 post_relocation_entries: Vec::new(),
             });
-            plan.total_dead_bytes_reclaimed += candidate.dead_bytes;
+            destination_index += 1;
         }
-        plan.source_segment_count = 3;
-        plan.destination_segment_count = 3;
+        plan.destination_segment_count = plan.assignments.len();
 
-        assert_eq!(plan.len(), 3);
+        assert_eq!(plan.len(), 2);
         // Dead bytes: seg0=4096 + seg1=3584 + seg2=3072 = 10752
         assert_eq!(plan.total_dead_bytes_reclaimed, 10752);
-        // seg0 has no live ranges (fully dead)
-        assert!(plan.assignments[0].live_ranges.is_empty());
-        // seg1 has live ranges at the start
-        // seg1 has no live_ranges from the scanner (make_usage doesn't populate them),
-        // so the assignment gets empty live_ranges as well.
-        assert!(plan.assignments[1].live_ranges.is_empty());
+        // seg1 carries explicit mock live-range evidence from the test helper.
+        assert_eq!(plan.assignments[0].source_segment_id, 1);
+        assert_eq!(plan.assignments[0].live_ranges, vec![(0, 512)]);
     }
 
     #[test]
@@ -2999,6 +3067,7 @@ mod tests {
 
         let plan = planner.plan(&candidates);
         assert_eq!(plan.assignments.len(), 1);
+        assert!(plan.is_executable());
 
         let assignment = &plan.assignments[0];
         assert_eq!(assignment.source_segment_id, 42);
@@ -3012,9 +3081,7 @@ mod tests {
     }
 
     #[test]
-    fn planner_falls_back_to_contiguous_when_no_live_ranges() {
-        // Backward compat: when candidate.live_ranges is empty, the planner
-        // synthesizes [(0, live_bytes)] as a fallback.
+    fn planner_refuses_live_candidate_without_live_ranges() {
         let alloc = MockSegmentAllocator::new(vec![200]);
         let mut planner = SegmentRelocationPlanner::new(alloc);
 
@@ -3023,15 +3090,24 @@ mod tests {
             4096,   // total_bytes
             2048,   // live_bytes
             3,      // age
-            vec![], // empty live_ranges -> fallback
+            vec![], // empty live_ranges -> refuse
         )];
 
         let plan = planner.plan(&candidates);
-        assert_eq!(plan.assignments.len(), 1);
-
-        let assignment = &plan.assignments[0];
-        // Fallback: single contiguous range from 0 to live_bytes
-        assert_eq!(assignment.live_ranges, vec![(0, 2048)]);
+        assert!(plan.assignments.is_empty());
+        assert!(!plan.is_empty());
+        assert!(plan.has_refusals());
+        assert!(!plan.is_executable());
+        assert_eq!(planner.allocator().allocated_segments(), &[]);
+        assert_eq!(
+            plan.refusals,
+            vec![RelocationPlanRefusal {
+                source_segment_id: 10,
+                total_bytes: 4096,
+                live_bytes: 2048,
+                reason: RelocationPlanRefusalReason::MissingLiveRanges,
+            }]
+        );
     }
 
     #[test]
@@ -3071,7 +3147,9 @@ mod tests {
     fn make_candidates(entries: &[(u64, u64, u64, u64)]) -> Vec<RelocationCandidate> {
         entries
             .iter()
-            .map(|&(id, total, live, age)| RelocationCandidate::new(id, total, live, age, vec![]))
+            .map(|&(id, total, live, age)| {
+                RelocationCandidate::new(id, total, live, age, test_live_ranges(live))
+            })
             .collect()
     }
 
@@ -3229,13 +3307,12 @@ mod tests {
     }
 
     #[test]
-    fn planner_live_ranges_contiguous_placeholder() {
-        // The planner uses a single contiguous range [(0, live_bytes)]
-        // as a placeholder for the extent map data.
+    fn planner_accepts_explicit_test_mock_live_ranges() {
         let alloc = MockSegmentAllocator::new(vec![42]);
         let mut planner = SegmentRelocationPlanner::new(alloc);
         let candidates = make_candidates(&[(5, 4096, 1024, 1)]);
         let plan = planner.plan(&candidates);
+        assert!(plan.is_executable());
         assert_eq!(plan.assignments[0].live_ranges, vec![(0, 1024)]);
     }
 
