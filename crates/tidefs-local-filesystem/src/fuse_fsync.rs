@@ -26,12 +26,12 @@ use crate::LocalFileSystem;
 
 /// Trait for flushing dirty page-cache data to stable storage.
 ///
-/// The PageCache in `tidefs-cache-core` will implement this trait once the
-/// FUSE write batch (#3581) lands. Until then, a stub implementation
-/// returns `Ok(())`.  The trait is hosted here rather than in
-/// `tidefs-cache-core` to avoid a circular dependency: the local-filesystem
-/// owns the dispatch logic, and the cache crate is not yet part of the dep
-/// graph for this crate.
+/// The trait is hosted with the local-filesystem fsync dispatch so handle
+/// validation, errno mapping, and durability barriers share one call contract.
+/// Current implementations include [`LocalFsDirtyFlush`] for
+/// [`LocalFileSystem`] and the adapter daemon's `PageCacheDirtyFlush` bridge.
+/// Broader recovery/fsync/writeback/mmap authority remains tracked by
+/// TFR-008.
 pub trait DirtyFlush {
     /// Flush all dirty pages belonging to `inode_id`.
     ///
@@ -126,7 +126,8 @@ fn validate_handle(
 ///
 /// # Parameters
 ///
-/// - `dirty_flush`: the flush implementation (stub until #3581 lands).
+/// - `dirty_flush`: the flush implementation, such as [`LocalFsDirtyFlush`]
+///   or the adapter daemon's `PageCacheDirtyFlush` bridge.
 /// - `fh`: the engine file handle obtained from `engine_open`.
 /// - `datasync`: if true, only data pages are flushed; metadata may be
 ///   skipped.
@@ -226,8 +227,8 @@ pub fn dispatch_syncfs(dirty_flush: &dyn DirtyFlush) -> Result<(), Errno> {
 
 /// A stub [`DirtyFlush`] that always returns `Ok(())`.
 ///
-/// Used in tests until the PageCache dirty-flush implementation
-/// (#3581) lands.
+/// Used in tests and dispatch-only callers that need to exercise handle
+/// validation and errno mapping without a backing dirty-page owner.
 pub struct StubDirtyFlush {
     /// Count of `flush_inode` calls (for verification in tests).
     pub flush_inode_calls: RefCell<Vec<(InodeId, bool)>>,
