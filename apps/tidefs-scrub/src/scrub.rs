@@ -544,11 +544,20 @@ impl ScrubObjectStore {
 
     fn verify_segment_chain(
         &self,
-    ) -> tidefs_local_object_store::Result<(
-        tidefs_local_object_store::SegmentChainStats,
-        tidefs_local_object_store::SuspectLog,
-    )> {
-        self.raw_store().verify_segment_chain()
+    ) -> Option<
+        tidefs_local_object_store::Result<(
+            tidefs_local_object_store::SegmentChainStats,
+            tidefs_local_object_store::SuspectLog,
+        )>,
+    > {
+        match self {
+            Self::Local(store) => Some(store.verify_segment_chain()),
+            Self::DevelopmentPool(_) => None,
+        }
+    }
+
+    fn verifies_object_store_compression_frames(&self) -> bool {
+        matches!(self, Self::Local(_))
     }
 }
 
@@ -631,21 +640,23 @@ impl ScrubWalker {
         self.attach_filesystem_verifier(&mut report)?;
 
         // Segment chain-of-trust verification.
-        match self.store.verify_segment_chain() {
-            Ok((stats, suspect_log)) => {
-                report.segments_in_chain = stats.segments_in_chain;
-                report.chain_breaks_detected = stats.chain_breaks_detected;
-                report.chain_of_trust_valid =
-                    stats.chain_breaks_detected == 0 && stats.segments_in_chain > 0;
-                report.suspect_log_entries = suspect_log.len();
-            }
-            Err(e) => {
-                report.add_finding(ScrubFinding::IoError {
-                    key_hex: "<segment-chain>".to_string(),
-                    message: format!("segment chain verification failed: {e}"),
-                });
-                report.chain_of_trust_valid = false;
-                report.chain_breaks_detected = 1;
+        if let Some(segment_chain) = self.store.verify_segment_chain() {
+            match segment_chain {
+                Ok((stats, suspect_log)) => {
+                    report.segments_in_chain = stats.segments_in_chain;
+                    report.chain_breaks_detected = stats.chain_breaks_detected;
+                    report.chain_of_trust_valid =
+                        stats.chain_breaks_detected == 0 && stats.segments_in_chain > 0;
+                    report.suspect_log_entries = suspect_log.len();
+                }
+                Err(e) => {
+                    report.add_finding(ScrubFinding::IoError {
+                        key_hex: "<segment-chain>".to_string(),
+                        message: format!("segment chain verification failed: {e}"),
+                    });
+                    report.chain_of_trust_valid = false;
+                    report.chain_breaks_detected = 1;
+                }
             }
         }
 
@@ -779,14 +790,16 @@ impl ScrubWalker {
         }
 
         // Compression frame integrity check
-        if let Err(reason) = check_compression_frame(&raw) {
-            return ObjectCheckResult::Finding {
-                bytes_processed: raw.len() as u64,
-                finding: ScrubFinding::CompressionError {
-                    key_hex: key.to_string(),
-                    message: reason,
-                },
-            };
+        if self.store.verifies_object_store_compression_frames() {
+            if let Err(reason) = check_compression_frame(&raw) {
+                return ObjectCheckResult::Finding {
+                    bytes_processed: raw.len() as u64,
+                    finding: ScrubFinding::CompressionError {
+                        key_hex: key.to_string(),
+                        message: reason,
+                    },
+                };
+            }
         }
 
         ObjectCheckResult::Ok {
