@@ -189,24 +189,48 @@ script inside a `nix develop .#ci` shell. Its top-level shape:
   },
   "lane_local_manifest_boundaries": [
     {
-      "owner_issue": 643,
+      "status": "absent",
+      "current_owner_issue": null,
       "evidence_class": "xfstests lane-local evidence manifest",
-      "status": "absent"
+      "missing_input": "lane-local manifest is not produced by the release-candidate workflow",
+      "historical_provenance": {
+        "completed_issue": 643,
+        "state": "closed",
+        "role": "historical lane-local manifest producer lineage"
+      }
     },
     {
-      "owner_issue": 644,
+      "status": "absent",
+      "current_owner_issue": null,
       "evidence_class": "Kernel fsync lane-local evidence manifest",
-      "status": "absent"
+      "missing_input": "lane-local manifest is not produced by the release-candidate workflow",
+      "historical_provenance": {
+        "completed_issue": 644,
+        "state": "closed",
+        "role": "historical lane-local manifest producer lineage"
+      }
     },
     {
-      "owner_issue": 645,
+      "status": "absent",
+      "current_owner_issue": null,
       "evidence_class": "Focused Rust lane-local evidence manifest",
-      "status": "absent"
+      "missing_input": "lane-local manifest is not produced by the release-candidate workflow",
+      "historical_provenance": {
+        "completed_issue": 645,
+        "state": "closed",
+        "role": "historical lane-local manifest producer lineage"
+      }
     },
     {
-      "owner_issue": 646,
+      "status": "absent",
+      "current_owner_issue": null,
       "evidence_class": "RDMA lane-local evidence manifest",
-      "status": "absent"
+      "missing_input": "lane-local manifest is not produced by the release-candidate workflow",
+      "historical_provenance": {
+        "completed_issue": 646,
+        "state": "closed",
+        "role": "historical lane-local manifest producer lineage"
+      }
     }
   ],
   "lanes": [ /* per-lane entries, see below */ ]
@@ -233,8 +257,14 @@ Each lane records its job result, artifacts, and lane-local manifest status:
   ],
   "lane_local_manifest": {
     "status": "absent | not_applicable",
-    "owner_issue": <issue number or null>,
+    "current_owner_issue": null,
     "evidence_class": "<description>",
+    "missing_input": "<explanation when absent>",
+    "historical_provenance": {
+      "completed_issue": <historical issue number>,
+      "state": "closed",
+      "role": "historical lane-local manifest producer lineage"
+    },
     "note": "<explanation when absent>"
   }
 }
@@ -270,7 +300,9 @@ before uploading it. The assertions verify:
   `missing_evidence`.
 - On `smoke`: `xfstests` and `rdma` are `skipped_by_profile`; `rust-smoke`,
   `nix`, and `qemu` are not `skipped_by_profile`.
-- Every lane-local manifest that is `absent` has a non-null `owner_issue`.
+- Every lane-local manifest that is `absent` has no current owner issue,
+  records the explicit missing input, and keeps any closed issue lineage under
+  historical provenance.
 
 If the assertions fail, the step exits non-zero and the evidence index is not
 uploaded. An index that passes self-validation is structurally self-consistent
@@ -280,11 +312,15 @@ but does not assert lane-level correctness or product readiness.
 
 ## Lane-Local Manifest Handling
 
-The evidence index explicitly records that four lane-local manifests (issues
-643, 644, 645, 646) are `absent`. These manifests are outside the Release
-Candidate workflow slice; the index does not synthesize pass claims from their
-absence. The `claim_boundary.lane_local_manifests_synthesized` field is always
-`false`.
+The evidence index explicitly records that four lane-local manifests are
+`absent`. These manifests are outside the Release Candidate workflow slice; the
+index does not synthesize pass claims from their absence. The
+`claim_boundary.lane_local_manifests_synthesized` field is always `false`.
+
+Closed issues 643, 644, 645, and 646 are retained only as historical completed
+lineage under `historical_provenance`. They are not emitted as current owner
+issues for absent lane-local manifests, and the index records
+`current_owner_issue: null` for those absent inputs.
 
 The `nix` lane has no associated lane-local manifest and is recorded as
 `not_applicable`: its job exit code is the evidence.
@@ -334,7 +370,8 @@ standalone lane workflows.
 - That a lane's artifact content is correct or complete. The index records
   artifact names and expected path patterns, not artifact hashes or content
   validation.
-- That any lane-local manifest has been reviewed or closed.
+- That any lane-local manifest has been reviewed for the current release
+  candidate.
 - That the candidate is product-ready. The `claim_boundary.product_readiness`
   field is always `not_claimed`.
 - That issue/PR-specific acceptance criteria are satisfied. Those criteria
@@ -367,7 +404,9 @@ contract records required evidence families, explicit non-claims, and the
 distinction between gate-local readiness receipts and whole-product admission.
 A product readiness decision must combine the index with:
 
-- Lane-local manifest review (issues 643-646).
+- Lane-local manifest review through current workflow/source state or live
+  issue state. Historical completed issues 643-646 are provenance only, not
+  current missing-input owners.
 - Issue/PR-specific validation evidence (focused Rust, focused claim
   validation, targeted xfstests rows, etc.).
 - Standing CI gate status (Rust Fast, Nix Checks, Clippy, Secret Policy).
@@ -423,8 +462,7 @@ source, or behavior changes are made by this contract.
    downloadable artifacts after the corresponding standalone lane artifacts
    have expired.
 
-4. **Lane-local manifest owner issues**: Issues 643-646 are referenced as the
-   owners of the four absent lane-local manifests. This document records the
-   mapping without checking whether those issues are open, closed, or have
-   been superseded. A gate auditor should verify current issue state at
-   decision time.
+4. **Lane-local manifest historical lineage**: Issues 643-646 are closed
+   historical producer-lineage issues for the four absent lane-local manifests.
+   The evidence index keeps that lineage as provenance while representing the
+   current missing inputs with `current_owner_issue: null`.
