@@ -2463,9 +2463,7 @@ pub fn check_fallocate_punch_hole_current_workspace() -> Result<(), StorageCheck
         missing: vec!["could not locate workspace root Cargo.toml".to_string()],
     })?;
     let mut missing = Vec::new();
-    for rel in [
-        "apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_vfs_adapter.rs",
-    ] {
+    for rel in ["apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_vfs_adapter.rs"] {
         check_required_file(&root, rel, &mut missing);
     }
     check_source_markers(
@@ -2518,9 +2516,7 @@ pub fn check_fiemap_current_workspace() -> Result<(), StorageCheckError> {
         missing: vec!["could not locate workspace root Cargo.toml".to_string()],
     })?;
     let mut missing = Vec::new();
-    for rel in [
-        "crates/tidefs-local-filesystem/src/types.rs",
-    ] {
+    for rel in ["crates/tidefs-local-filesystem/src/types.rs"] {
         check_required_file(&root, rel, &mut missing);
     }
     check_source_markers(
