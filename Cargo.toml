@@ -226,7 +226,7 @@ tidefs-cleanup-job-core = { path = "crates/tidefs-cleanup-job-core" }
 tidefs-cleanup-queue-core = { path = "crates/tidefs-cleanup-queue-core" }
 tidefs-clock-timing = { path = "crates/tidefs-clock-timing" }
 tidefs-cluster = { path = "crates/tidefs-cluster" }
-tidefs-commit_group = { path = "crates/tidefs-commit_group" }
+tidefs-commit_group = { path = "crates/tidefs-commit_group", default-features = false, features = ["std"] }
 tidefs-compaction = { path = "crates/tidefs-compaction" }
 tidefs-compression = { path = "crates/tidefs-compression" }
 tidefs-coordination-strategy = { path = "crates/tidefs-coordination-strategy" }
@@ -246,12 +246,12 @@ tidefs-extent-map = { path = "crates/tidefs-extent-map" }
 tidefs-flow-commit-coordinator = { path = "crates/tidefs-flow-commit-coordinator" }
 tidefs-frame = { path = "crates/tidefs-frame" }
 tidefs-gc-pin-set = { path = "crates/tidefs-gc-pin-set" }
-tidefs-incremental-job-core = { path = "crates/tidefs-incremental-job-core" }
+tidefs-incremental-job-core = { path = "crates/tidefs-incremental-job-core", default-features = false, features = ["alloc"] }
 tidefs-inode-attributes = { path = "crates/tidefs-inode-attributes" }
 tidefs-inode-table = { path = "crates/tidefs-inode-table" }
 tidefs-intent-log = { path = "crates/tidefs-intent-log" }
 tidefs-invalidation-feed = { path = "crates/tidefs-invalidation-feed" }
-tidefs-kernel-storage-io = { path = "crates/tidefs-kernel-storage-io" }
+tidefs-kernel-storage-io = { path = "crates/tidefs-kernel-storage-io", default-features = false, features = ["alloc"] }
 tidefs-kmod-bridge = { path = "kmod" }
 tidefs-lease = { path = "crates/tidefs-lease" }
 tidefs-lease-manager = { path = "crates/tidefs-lease-manager" }
@@ -325,24 +325,24 @@ tidefs-two-node-harness = { path = "crates/tidefs-two-node-harness" }
 tidefs-types-cache-lattice-core = { path = "crates/tidefs-types-cache-lattice-core" }
 tidefs-types-claim-ledger-core = { path = "crates/tidefs-types-claim-ledger-core" }
 tidefs-types-dataset-feature-flags-core = { path = "crates/tidefs-types-dataset-feature-flags-core" }
-tidefs-types-dataset-lifecycle-core = { path = "crates/tidefs-types-dataset-lifecycle-core" }
+tidefs-types-dataset-lifecycle-core = { path = "crates/tidefs-types-dataset-lifecycle-core", default-features = false }
 tidefs-types-deferred-cleanup-core = { path = "crates/tidefs-types-deferred-cleanup-core" }
 tidefs-types-extent-map-core = { path = "crates/tidefs-types-extent-map-core" }
-tidefs-types-incremental-job-core = { path = "crates/tidefs-types-incremental-job-core" }
+tidefs-types-incremental-job-core = { path = "crates/tidefs-types-incremental-job-core", default-features = false, features = ["alloc"] }
 tidefs-types-orphan-index-core = { path = "crates/tidefs-types-orphan-index-core" }
 tidefs-types-package-profile-catalog = { path = "crates/tidefs-types-package-profile-catalog" }
 tidefs-types-polymorphic-directory-index-core = { path = "crates/tidefs-types-polymorphic-directory-index-core" }
 tidefs-types-polymorphic-xattr-core = { path = "crates/tidefs-types-polymorphic-xattr-core" }
 tidefs-types-pool-label-core = { path = "crates/tidefs-types-pool-label-core" }
 tidefs-types-posix-filesystem-adapter-core = { path = "crates/tidefs-types-posix-filesystem-adapter-core" }
-tidefs-types-reclaim-queue-core = { path = "crates/tidefs-types-reclaim-queue-core" }
+tidefs-types-reclaim-queue-core = { path = "crates/tidefs-types-reclaim-queue-core", default-features = false }
 tidefs-types-secret-key-policy-core = { path = "crates/tidefs-types-secret-key-policy-core" }
 tidefs-types-space-accounting-core = { path = "crates/tidefs-types-space-accounting-core" }
 tidefs-types-transport-session = { path = "crates/tidefs-types-transport-session" }
 tidefs-types-vfs-core = { path = "crates/tidefs-types-vfs-core" }
 tidefs-types-vfs-owned = { path = "crates/tidefs-types-vfs-owned" }
 tidefs-ublk-abi = { path = "crates/tidefs-ublk-abi" }
-tidefs-validation = { path = "crates/tidefs-validation" }
+tidefs-validation = { path = "crates/tidefs-validation", default-features = false }
 tidefs-verification-engine = { path = "crates/tidefs-verification-engine" }
 tidefs-vfs-engine = { path = "crates/tidefs-vfs-engine" }
 tidefs-witness-set = { path = "crates/tidefs-witness-set" }
