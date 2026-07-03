@@ -14,6 +14,9 @@ use std::path::{Path, PathBuf};
 use crate::pool_label::{
     decode_label, LabelPoolState, PoolLabelV1, POOL_LABEL_SIZE, POOL_LABEL_V1_WIRE_SIZE,
 };
+use crate::pool_lifecycle_evidence::{
+    PoolLifecycleAction, PoolLifecycleContext, PoolLifecycleEvidence,
+};
 use tidefs_auth::local_only::LocalOnlyGuard;
 
 // Error types
@@ -256,6 +259,35 @@ impl CandidatePool {
         }
 
         Ok(())
+    }
+
+    /// Build source-backed lifecycle evidence for scan/import/reopen review.
+    #[must_use]
+    pub fn lifecycle_evidence(&self, action: PoolLifecycleAction) -> PoolLifecycleEvidence {
+        let context = PoolLifecycleContext {
+            pool_guid: Some(self.pool_guid),
+            pool_name: Some(self.pool_name.clone()),
+            device_count: self.devices.len(),
+            expected_device_count: self.device_count as usize,
+            capacity_bytes: self.devices.iter().map(|d| d.device_size).sum(),
+            topology_generation: self.topology_generation,
+            commit_group: self.recovery_commit_group,
+        };
+
+        if self.topology_complete && self.cluster_authorized_or_not_clustered() {
+            PoolLifecycleEvidence::executed(action, context)
+        } else {
+            let reason = if !self.topology_complete {
+                "topology evidence incomplete"
+            } else {
+                "cluster ownership authority missing"
+            };
+            PoolLifecycleEvidence::refused(PoolLifecycleAction::FailClosed, context, reason)
+        }
+    }
+
+    fn cluster_authorized_or_not_clustered(&self) -> bool {
+        self.cluster_authorized || !self.devices.iter().any(|d| d.label.is_clustered())
     }
 }
 
@@ -703,6 +735,49 @@ mod tests {
 
         let result = pool.validate();
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn candidate_pool_emits_import_lifecycle_evidence() {
+        let pool = CandidatePool {
+            pool_guid: [0x34; 16],
+            pool_name: "evidence".into(),
+            pool_state: LabelPoolState::Exported,
+            devices: vec![],
+            topology_generation: 3,
+            device_count: 0,
+            recovery_commit_group: 44,
+            topology_complete: true,
+            cluster_authorized: false,
+        };
+
+        let evidence = pool.lifecycle_evidence(PoolLifecycleAction::Import);
+
+        assert_eq!(evidence.action, PoolLifecycleAction::Import);
+        assert_eq!(evidence.commit_group, 44);
+        assert!(evidence.topology_complete);
+        assert!(evidence.owner_authorized);
+    }
+
+    #[test]
+    fn incomplete_candidate_pool_emits_fail_closed_evidence() {
+        let pool = CandidatePool {
+            pool_guid: [0x35; 16],
+            pool_name: "missing".into(),
+            pool_state: LabelPoolState::Exported,
+            devices: vec![],
+            topology_generation: 3,
+            device_count: 2,
+            recovery_commit_group: 44,
+            topology_complete: false,
+            cluster_authorized: false,
+        };
+
+        let evidence = pool.lifecycle_evidence(PoolLifecycleAction::Scan);
+
+        assert_eq!(evidence.action, PoolLifecycleAction::FailClosed);
+        assert!(evidence.is_fail_closed());
+        assert!(evidence.reason.contains("topology"));
     }
 
     #[test]

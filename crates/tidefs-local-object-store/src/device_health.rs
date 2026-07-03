@@ -10,6 +10,10 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::time::{Duration, Instant};
 
+use crate::pool_lifecycle_evidence::{
+    PoolLifecycleAction, PoolLifecycleContext, PoolLifecycleEvidence,
+};
+
 // ---------------------------------------------------------------------------
 // DeviceHealth — the three health states
 // ---------------------------------------------------------------------------
@@ -422,6 +426,37 @@ impl DeviceHealthTransitionEntry {
             window_errors,
         }
     }
+
+    /// Build fail-closed lifecycle evidence for health transitions to FAULTED.
+    #[must_use]
+    pub fn fail_closed_lifecycle_evidence(
+        &self,
+        pool_guid: [u8; 16],
+        pool_name: impl Into<String>,
+    ) -> Option<PoolLifecycleEvidence> {
+        if self.to != DeviceHealth::Faulted {
+            return None;
+        }
+
+        let context = PoolLifecycleContext {
+            pool_guid: Some(pool_guid),
+            pool_name: Some(pool_name.into()),
+            device_count: 1,
+            expected_device_count: 1,
+            capacity_bytes: 0,
+            topology_generation: 0,
+            commit_group: 0,
+        };
+
+        Some(PoolLifecycleEvidence::refused(
+            PoolLifecycleAction::FailClosed,
+            context,
+            format!(
+                "device health transitioned from {} to {} after {} {:?} error(s)",
+                self.from, self.to, self.window_errors, self.trigger
+            ),
+        ))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -480,6 +515,7 @@ impl fmt::Display for DeviceHealthTransition {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pool_lifecycle_evidence::PoolLifecycleOutcome;
 
     // Default thresholds for tests: degrade at 5, fault at 20, 60s window.
     fn test_state(non_redundant: bool) -> DeviceHealthState {
@@ -922,5 +958,41 @@ mod tests {
             t.window_errors >= 4,
             "transition entry should capture window error count at transition time"
         );
+    }
+
+    #[test]
+    fn faulted_transition_emits_fail_closed_lifecycle_evidence() {
+        let transition = DeviceHealthTransitionEntry::new(
+            DeviceHealth::Degraded,
+            DeviceHealth::Faulted,
+            DeviceErrorKind::Write,
+            21,
+        );
+
+        let evidence = transition
+            .fail_closed_lifecycle_evidence([0x17; 16], "pool-a")
+            .expect("faulted transition should emit fail-closed evidence");
+
+        assert_eq!(evidence.action, PoolLifecycleAction::FailClosed);
+        assert_eq!(evidence.outcome, PoolLifecycleOutcome::Refused);
+        assert!(evidence.is_fail_closed());
+        assert_eq!(evidence.pool_guid, Some([0x17; 16]));
+        assert_eq!(evidence.pool_name.as_deref(), Some("pool-a"));
+        assert!(evidence.reason.contains("DEGRADED to FAULTED"));
+        assert!(evidence.reason.contains("21 Write"));
+    }
+
+    #[test]
+    fn non_faulted_transition_does_not_emit_fail_closed_lifecycle_evidence() {
+        let transition = DeviceHealthTransitionEntry::new(
+            DeviceHealth::Online,
+            DeviceHealth::Degraded,
+            DeviceErrorKind::Read,
+            6,
+        );
+
+        assert!(transition
+            .fail_closed_lifecycle_evidence([0x17; 16], "pool-a")
+            .is_none());
     }
 }

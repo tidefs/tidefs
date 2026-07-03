@@ -902,6 +902,7 @@ pub mod error;
 pub mod io_scheduler;
 pub mod pool;
 pub mod pool_exporter;
+pub mod pool_lifecycle_evidence;
 pub mod scrub;
 pub mod scrub_core;
 pub mod segment_builder;

@@ -21,6 +21,9 @@ use crate::pool_label::{
     decode_label, encode_label, features, seal_label, LabelDeviceClass, PoolLabelV1,
     PoolRedundancyPolicy, POOL_LABEL_SIZE, POOL_LABEL_V1_WIRE_SIZE,
 };
+use crate::pool_lifecycle_evidence::{
+    PoolLifecycleAction, PoolLifecycleContext, PoolLifecycleEvidence,
+};
 use crate::{Result, StoreError};
 
 // ---------------------------------------------------------------------------
@@ -116,6 +119,39 @@ struct ExistingLabelUpdate<'a> {
 pub struct DeviceManager;
 
 impl DeviceManager {
+    /// Build source-backed lifecycle evidence for device topology changes.
+    #[must_use]
+    pub fn topology_lifecycle_evidence(
+        action: PoolLifecycleAction,
+        pool_guid: [u8; 16],
+        pool_name: impl Into<String>,
+        device_count: usize,
+        expected_device_count: usize,
+        topology_generation: u64,
+        commit_group: u64,
+    ) -> PoolLifecycleEvidence {
+        let context = PoolLifecycleContext {
+            pool_guid: Some(pool_guid),
+            pool_name: Some(pool_name.into()),
+            device_count,
+            expected_device_count,
+            capacity_bytes: 0,
+            topology_generation,
+            commit_group,
+        };
+
+        match action {
+            PoolLifecycleAction::AddDevice
+            | PoolLifecycleAction::RemoveDevice
+            | PoolLifecycleAction::ReplaceDevice => PoolLifecycleEvidence::executed(action, context),
+            _ => PoolLifecycleEvidence::refused(
+                PoolLifecycleAction::FailClosed,
+                context,
+                "unsupported device topology lifecycle action",
+            ),
+        }
+    }
+
     /// Add a device to a pool. Writes a label to the new device and updates
     /// all existing device labels with an incremented topology_generation
     /// and device_count.
@@ -758,6 +794,41 @@ impl DeviceManager {
 mod tests {
     use super::*;
     use crate::device::{DeviceBacking, DeviceClass, DeviceConfig, DeviceKind};
+
+    #[test]
+    fn topology_lifecycle_evidence_records_device_add() {
+        let evidence = DeviceManager::topology_lifecycle_evidence(
+            PoolLifecycleAction::AddDevice,
+            [0x55; 16],
+            "topology",
+            3,
+            3,
+            9,
+            8,
+        );
+
+        assert_eq!(evidence.action, PoolLifecycleAction::AddDevice);
+        assert_eq!(evidence.device_count, 3);
+        assert!(evidence.topology_complete);
+        assert!(evidence.owner_authorized);
+    }
+
+    #[test]
+    fn topology_lifecycle_evidence_refuses_unsupported_action() {
+        let evidence = DeviceManager::topology_lifecycle_evidence(
+            PoolLifecycleAction::Export,
+            [0x56; 16],
+            "topology",
+            1,
+            1,
+            9,
+            8,
+        );
+
+        assert_eq!(evidence.action, PoolLifecycleAction::FailClosed);
+        assert!(evidence.is_fail_closed());
+        assert!(evidence.reason.contains("unsupported"));
+    }
 
     fn temp_dir(label: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(

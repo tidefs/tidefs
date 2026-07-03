@@ -18,6 +18,9 @@ use crate::pool_label::{
     decode_label, encode_label, seal_label, LabelDeviceClass, LabelPoolState, PoolLabelV1,
     PoolRedundancyPolicy, POOL_LABEL_SIZE, POOL_LABEL_V1_WIRE_SIZE,
 };
+use crate::pool_lifecycle_evidence::{
+    PoolLifecycleAction, PoolLifecycleContext, PoolLifecycleEvidence,
+};
 use crate::txg_manager::CommitGroupManager;
 use tidefs_auth::local_only::LocalOnlyGuard;
 
@@ -458,6 +461,30 @@ impl ExportOrchestrator {
     #[must_use]
     pub fn final_commit_group(&self) -> u64 {
         self.final_commit_group
+    }
+
+    /// Build source-backed lifecycle evidence for export execution/refusal.
+    #[must_use]
+    pub fn lifecycle_evidence(&self) -> PoolLifecycleEvidence {
+        let context = PoolLifecycleContext {
+            pool_guid: Some(self.pool_guid),
+            pool_name: Some(self.pool_name.clone()),
+            device_count: self.device_configs.len(),
+            expected_device_count: self.device_guids.len(),
+            capacity_bytes: 0,
+            topology_generation: 0,
+            commit_group: self.final_commit_group,
+        };
+
+        if self.active_mounts > 0 && !self.forced {
+            PoolLifecycleEvidence::refused(
+                PoolLifecycleAction::Export,
+                context,
+                format!("{} active mount(s) still own the pool", self.active_mounts),
+            )
+        } else {
+            PoolLifecycleEvidence::executed(PoolLifecycleAction::Export, context)
+        }
     }
 
     // ── Phase transitions ──────────────────────────────────────────
@@ -1124,6 +1151,28 @@ mod tests {
             .with_active_mounts(1);
         let err = orch.check_no_active_mounts().unwrap_err();
         assert_eq!(err, ExportError::HasActiveMounts { count: 1 });
+    }
+
+    #[test]
+    fn orchestrator_emits_export_lifecycle_evidence() {
+        let orch = make_orchestrator();
+
+        let evidence = orch.lifecycle_evidence();
+
+        assert_eq!(evidence.action, PoolLifecycleAction::Export);
+        assert!(evidence.owner_authorized);
+        assert!(!evidence.is_fail_closed());
+    }
+
+    #[test]
+    fn orchestrator_emits_fail_closed_evidence_for_active_mounts() {
+        let orch = make_orchestrator().with_active_mounts(1);
+
+        let evidence = orch.lifecycle_evidence();
+
+        assert_eq!(evidence.action, PoolLifecycleAction::Export);
+        assert!(evidence.is_fail_closed());
+        assert!(evidence.reason.contains("active mount"));
     }
 
     #[test]
