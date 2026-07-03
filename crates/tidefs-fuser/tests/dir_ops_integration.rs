@@ -419,7 +419,14 @@ fn mount(label: &str) -> (std::path::PathBuf, fuser::BackgroundSession) {
 
     let mnt = tmpdir.path().join(label);
     std::fs::create_dir(&mnt).expect("mkdir mountpoint");
-    let se = fuser::spawn_mount2(DirTestFS::new(), &mnt, &[]).expect("spawn_mount2");
+    let se = match fuser::spawn_mount2(DirTestFS::new(), &mnt, &[]) {
+        Ok(session) => session,
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+            eprintln!("SKIP: /dev/fuse mount not permitted: {err}");
+            std::process::exit(0);
+        }
+        Err(err) => panic!("spawn_mount2: {}", err),
+    };
     std::thread::sleep(std::time::Duration::from_millis(50));
     (mnt, se)
 }

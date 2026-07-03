@@ -19,10 +19,10 @@ pub trait DrainOps {
     fn release_lease(&mut self, lease_id: u64) -> Result<(), String>;
 
     /// Number of objects (primary replicas) stored on a node.
-    fn object_count_for_node(&self, node_id: MemberId) -> u64;
+    fn object_count_for_node(&self, node_id: MemberId) -> Result<u64, String>;
 
     /// Number of cache bytes held by a node.
-    fn cache_bytes_for_node(&self, node_id: MemberId) -> u64;
+    fn cache_bytes_for_node(&self, node_id: MemberId) -> Result<u64, String>;
 
     /// Migrate one object off the node. Returns true if more objects remain.
     fn migrate_one_object(&mut self, node_id: MemberId) -> Result<bool, String>;
@@ -42,11 +42,11 @@ pub trait DrainOps {
 // LockTableDrainOps — production implementation backed by LockTable
 // ---------------------------------------------------------------------------
 
-/// Production [`DrainOps`] backed by a [`LockTable`].
+/// Lease-only [`DrainOps`] backed by a [`LockTable`].
 ///
 /// Lease enumeration and release delegate to the lock table. Data, cache, and
-/// admin operations are stubbed — they return "not yet wired" until the
-/// placement-runtime and cache services are integrated.
+/// admin transfers require callers to supply a fuller [`DrainOps`]
+/// implementation that can prove evacuation, invalidation, and role handoff.
 pub struct LockTableDrainOps<'a> {
     lock_table: &'a mut LockTable,
     /// Target node to receive migrated admin roles.
@@ -86,19 +86,25 @@ impl DrainOps for LockTableDrainOps<'_> {
         Ok(())
     }
 
-    fn object_count_for_node(&self, _node_id: MemberId) -> u64 {
-        // Stub: placement-runtime integration not yet wired.
-        0
+    fn object_count_for_node(&self, _node_id: MemberId) -> Result<u64, String> {
+        Err(
+            "LockTableDrainOps cannot enumerate data replicas; use placement-backed DrainOps"
+                .to_string(),
+        )
     }
 
-    fn cache_bytes_for_node(&self, _node_id: MemberId) -> u64 {
-        // Stub: cache service integration not yet wired.
-        0
+    fn cache_bytes_for_node(&self, _node_id: MemberId) -> Result<u64, String> {
+        Err(
+            "LockTableDrainOps cannot enumerate cache residency; use cache-backed DrainOps"
+                .to_string(),
+        )
     }
 
     fn migrate_one_object(&mut self, _node_id: MemberId) -> Result<bool, String> {
-        // Stub: placement-runtime rebuild integration not yet wired.
-        Ok(false)
+        Err(
+            "LockTableDrainOps cannot migrate data replicas; use placement-backed DrainOps"
+                .to_string(),
+        )
     }
 
     fn invalidate_cache_chunk(
@@ -106,13 +112,14 @@ impl DrainOps for LockTableDrainOps<'_> {
         _node_id: MemberId,
         _max_bytes: u64,
     ) -> Result<(u64, u64), String> {
-        // Stub: cache invalidation integration not yet wired.
-        Ok((0, 0))
+        Err(
+            "LockTableDrainOps cannot invalidate cache residency; use cache-backed DrainOps"
+                .to_string(),
+        )
     }
 
     fn transfer_admin(&mut self, _from: MemberId, _to: MemberId) -> Result<(), String> {
-        // Stub: admin role transfer not yet wired.
-        Ok(())
+        Err("LockTableDrainOps cannot transfer admin roles; use admin-backed DrainOps".to_string())
     }
 }
 
@@ -309,7 +316,13 @@ impl DrainExecutor {
             return Ok(self.drain.progress());
         }
 
-        let mut remaining = ops.object_count_for_node(node);
+        let mut remaining =
+            ops.object_count_for_node(node)
+                .map_err(|_e| DrainError::StageNotComplete {
+                    node_id: node,
+                    stage: DrainStage::DrainingData,
+                    progress: self.drain.progress(),
+                })?;
         if remaining > 0 {
             self.drain.mark_data_relocation_required();
         }
@@ -327,6 +340,13 @@ impl DrainExecutor {
                         objects_remaining: remaining,
                         ..DrainProgress::ZERO
                     });
+                    if !more && remaining > 0 {
+                        return Err(DrainError::StageNotComplete {
+                            node_id: node,
+                            stage: DrainStage::DrainingData,
+                            progress: self.drain.progress(),
+                        });
+                    }
                     if !more {
                         break;
                     }
@@ -360,7 +380,13 @@ impl DrainExecutor {
             return Ok(self.drain.progress());
         }
 
-        let mut remaining = ops.cache_bytes_for_node(node);
+        let mut remaining =
+            ops.cache_bytes_for_node(node)
+                .map_err(|_e| DrainError::StageNotComplete {
+                    node_id: node,
+                    stage: DrainStage::DrainingCache,
+                    progress: self.drain.progress(),
+                })?;
         const CHUNK_SIZE: u64 = 64 * 1024 * 1024; // 64 MiB chunks
 
         self.drain.update_progress(DrainProgress {
@@ -381,10 +407,21 @@ impl DrainExecutor {
                     }
                 }
                 Err(_e) => {
-                    // Non-fatal: cache invalidation can be retried or skipped
-                    break;
+                    return Err(DrainError::StageNotComplete {
+                        node_id: node,
+                        stage: DrainStage::DrainingCache,
+                        progress: self.drain.progress(),
+                    });
                 }
             }
+        }
+
+        if remaining > 0 {
+            return Err(DrainError::StageNotComplete {
+                node_id: node,
+                stage: DrainStage::DrainingCache,
+                progress: self.drain.progress(),
+            });
         }
 
         self.drain.advance_stage()?;
@@ -406,7 +443,12 @@ impl DrainExecutor {
             return Ok(self.drain.progress());
         }
 
-        ops.transfer_admin(node, MemberId::new(0))?;
+        ops.transfer_admin(node, MemberId::new(0))
+            .map_err(|_e| DrainError::StageNotComplete {
+                node_id: node,
+                stage: DrainStage::DrainingAdmin,
+                progress: self.drain.progress(),
+            })?;
         self.drain.update_progress(DrainProgress::ZERO);
         self.drain.advance_stage()?;
         Ok(self.drain.progress())
@@ -444,6 +486,10 @@ mod tests {
         cache_bytes: BTreeMap<u64, u64>, // node_id -> cache bytes
         admin_transfer_called: Arc<AtomicBool>,
         released_leases: Vec<u64>,
+        object_count_fails: bool,
+        cache_count_fails: bool,
+        cache_invalidation_fails: bool,
+        admin_transfer_fails: bool,
     }
 
     impl MockDrainOps {
@@ -454,6 +500,10 @@ mod tests {
                 cache_bytes: BTreeMap::new(),
                 admin_transfer_called: Arc::new(AtomicBool::new(false)),
                 released_leases: Vec::new(),
+                object_count_fails: false,
+                cache_count_fails: false,
+                cache_invalidation_fails: false,
+                admin_transfer_fails: false,
             }
         }
 
@@ -471,6 +521,26 @@ mod tests {
             self.cache_bytes.insert(node, bytes);
             self
         }
+
+        fn with_object_count_failure(mut self) -> Self {
+            self.object_count_fails = true;
+            self
+        }
+
+        fn with_cache_count_failure(mut self) -> Self {
+            self.cache_count_fails = true;
+            self
+        }
+
+        fn with_cache_invalidation_failure(mut self) -> Self {
+            self.cache_invalidation_fails = true;
+            self
+        }
+
+        fn with_admin_transfer_failure(mut self) -> Self {
+            self.admin_transfer_fails = true;
+            self
+        }
     }
 
     impl DrainOps for MockDrainOps {
@@ -483,12 +553,18 @@ mod tests {
             Ok(())
         }
 
-        fn object_count_for_node(&self, node_id: MemberId) -> u64 {
-            self.objects.get(&node_id.0).copied().unwrap_or(0)
+        fn object_count_for_node(&self, node_id: MemberId) -> Result<u64, String> {
+            if self.object_count_fails {
+                return Err("object count unavailable".to_string());
+            }
+            Ok(self.objects.get(&node_id.0).copied().unwrap_or(0))
         }
 
-        fn cache_bytes_for_node(&self, node_id: MemberId) -> u64 {
-            self.cache_bytes.get(&node_id.0).copied().unwrap_or(0)
+        fn cache_bytes_for_node(&self, node_id: MemberId) -> Result<u64, String> {
+            if self.cache_count_fails {
+                return Err("cache count unavailable".to_string());
+            }
+            Ok(self.cache_bytes.get(&node_id.0).copied().unwrap_or(0))
         }
 
         fn migrate_one_object(&mut self, node_id: MemberId) -> Result<bool, String> {
@@ -507,6 +583,9 @@ mod tests {
             node_id: MemberId,
             max_bytes: u64,
         ) -> Result<(u64, u64), String> {
+            if self.cache_invalidation_fails {
+                return Err("cache invalidation unavailable".to_string());
+            }
             if let Some(bytes) = self.cache_bytes.get_mut(&node_id.0) {
                 let chunk = (*bytes).min(max_bytes);
                 *bytes -= chunk;
@@ -517,6 +596,9 @@ mod tests {
         }
 
         fn transfer_admin(&mut self, _from: MemberId, _to: MemberId) -> Result<(), String> {
+            if self.admin_transfer_fails {
+                return Err("admin transfer unavailable".to_string());
+            }
             self.admin_transfer_called.store(true, Ordering::SeqCst);
             Ok(())
         }
@@ -564,6 +646,24 @@ mod tests {
     }
 
     #[test]
+    fn executor_data_stage_fails_closed_when_object_count_unavailable() {
+        let mut ops = MockDrainOps::new().with_object_count_failure();
+        let (mut exec, _handle) = DrainExecutor::start(node_id(12));
+
+        exec.execute_lease_stage(&mut ops).unwrap();
+        let err = exec.execute_data_stage(&mut ops).unwrap_err();
+
+        assert!(matches!(
+            err,
+            DrainError::StageNotComplete {
+                stage: DrainStage::DrainingData,
+                ..
+            }
+        ));
+        assert_eq!(exec.drain().stage(), DrainStage::DrainingData);
+    }
+
+    #[test]
     fn executor_drain_with_cache() {
         let mut ops = MockDrainOps::new().with_cache_bytes(4, 200 * 1024 * 1024); // 200 MiB
         let (mut exec, _handle) = DrainExecutor::start(node_id(4));
@@ -571,6 +671,46 @@ mod tests {
         let result = exec.execute(&mut ops);
         assert!(result.is_ok());
         assert_eq!(ops.cache_bytes.get(&4), Some(&0));
+    }
+
+    #[test]
+    fn executor_cache_stage_fails_closed_when_cache_count_unavailable() {
+        let mut ops = MockDrainOps::new().with_cache_count_failure();
+        let (mut exec, _handle) = DrainExecutor::start(node_id(13));
+
+        exec.execute_lease_stage(&mut ops).unwrap();
+        exec.complete_data_stage_with_evacuation(None).unwrap();
+        let err = exec.execute_cache_stage(&mut ops).unwrap_err();
+
+        assert!(matches!(
+            err,
+            DrainError::StageNotComplete {
+                stage: DrainStage::DrainingCache,
+                ..
+            }
+        ));
+        assert_eq!(exec.drain().stage(), DrainStage::DrainingCache);
+    }
+
+    #[test]
+    fn executor_cache_stage_fails_closed_when_invalidation_errors() {
+        let mut ops = MockDrainOps::new()
+            .with_cache_bytes(14, 64 * 1024 * 1024)
+            .with_cache_invalidation_failure();
+        let (mut exec, _handle) = DrainExecutor::start(node_id(14));
+
+        exec.execute_lease_stage(&mut ops).unwrap();
+        exec.complete_data_stage_with_evacuation(None).unwrap();
+        let err = exec.execute_cache_stage(&mut ops).unwrap_err();
+
+        assert!(matches!(
+            err,
+            DrainError::StageNotComplete {
+                stage: DrainStage::DrainingCache,
+                ..
+            }
+        ));
+        assert_eq!(exec.drain().stage(), DrainStage::DrainingCache);
     }
 
     #[test]
@@ -646,6 +786,27 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(exec.drain().stage(), DrainStage::Drained);
         assert!(ops.admin_transfer_called.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn executor_admin_stage_fails_closed_when_transfer_unavailable() {
+        let mut ops = MockDrainOps::new().with_admin_transfer_failure();
+        let (mut exec, _handle) = DrainExecutor::start(node_id(15));
+
+        for _ in 0..4 {
+            exec.drain.update_progress(DrainProgress::ZERO);
+            exec.drain.advance_stage().unwrap();
+        }
+
+        let err = exec.execute_admin_stage(&mut ops).unwrap_err();
+        assert!(matches!(
+            err,
+            DrainError::StageNotComplete {
+                stage: DrainStage::DrainingAdmin,
+                ..
+            }
+        ));
+        assert_eq!(exec.drain().stage(), DrainStage::DrainingAdmin);
     }
 
     #[test]

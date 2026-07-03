@@ -72,8 +72,7 @@ pub enum ReadDirError {
     NotADirectory,
     /// The FUSE offset is negative (invalid for directory iteration).
     InvalidOffset,
-    /// Caller lacks read permission on the directory (stub; wired
-    /// when `tidefs-permission` integration lands — see #5378).
+    /// Caller lacks read permission on the directory.
     PermissionDenied,
 }
 

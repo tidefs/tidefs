@@ -615,11 +615,11 @@ mod tests {
         fn release_lease(&mut self, _: u64) -> Result<(), String> {
             Ok(())
         }
-        fn object_count_for_node(&self, _: MemberId) -> u64 {
-            0
+        fn object_count_for_node(&self, _: MemberId) -> Result<u64, String> {
+            Ok(0)
         }
-        fn cache_bytes_for_node(&self, _: MemberId) -> u64 {
-            0
+        fn cache_bytes_for_node(&self, _: MemberId) -> Result<u64, String> {
+            Ok(0)
         }
         fn migrate_one_object(&mut self, _: MemberId) -> Result<bool, String> {
             Ok(false)

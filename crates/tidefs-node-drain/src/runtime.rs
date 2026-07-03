@@ -582,7 +582,7 @@ mod tests {
             _announce: &DrainAnnounce,
             _peer: MemberId,
         ) -> Result<DrainAck, String> {
-            unimplemented!("use broadcast_announce for tests")
+            panic!("tests should use broadcast_announce")
         }
 
         fn broadcast_announce(
