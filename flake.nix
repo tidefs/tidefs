@@ -2951,11 +2951,6 @@ EOF
             tidefsPackage = tidefsCtlRuntime;
           };
 
-          kernelXfstestsValidation = import ./nix/vm/kernel-xfstests-validation.nix {
-            inherit pkgs;
-            linuxKernel_7_0 = linuxKernel_7_0;
-          };
-
           kernelRenameValidation = import ./nix/vm/kernel-rename-validation.nix {
             inherit pkgs;
             linuxKernel_7_0 = linuxKernel_7_0;
@@ -3946,19 +3941,6 @@ EOF
             exec ${self.packages.${system}.kmodXfstestsSmoke}/bin/tidefs-kmod-xfstests-smoke \
               --module ${self.packages.${system}.tidefsPosixVfsKmod}/tidefs_posix_vfs.ko "$@"
           '';
-
-          kmod-xfstests-validation = script "tidefs-kmod-xfstests-validation" [
-            pkgs.bash
-            pkgs.coreutils
-            pkgs.busybox
-            pkgs.kmod
-            pkgs.cpio
-            pkgs.qemu
-            self.packages.${system}.kernelXfstestsValidation
-          ] ''
-            exec ${self.packages.${system}.kernelXfstestsValidation}/bin/tidefs-kmod-xfstests-validation "$@"
-          '';
-
 
           kernel-rename-validation = script "tidefs-kmod-rename-validation" [
             pkgs.bash

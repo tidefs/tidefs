@@ -211,29 +211,35 @@ In practice this means:
 - **Manual runs** (`workflow_dispatch` trigger): Always run regardless of
   `TIDEFS_SELF_HOSTED_READY`. The `target` and `tests` inputs are available.
 
+## Flake App Classification
+
+The xfstests workflow and release-candidate lanes use the following canonical
+flake apps:
+
+| App | Classification | Evidence role |
+| --- | --- | --- |
+| `.#fuse-xfstests-validation` | Canonical workflow entrypoint. | Full FUSE xfstests validation for the `fuse` workflow target. |
+| `.#kmod-xfstests-smoke` | Canonical workflow entrypoint. | Lightweight kmod smoke coverage for the `kmod-smoke` workflow target; it is not a full generic-group xfstests runner. |
+| `.#k7-vfs-xfstests-validation` | Canonical workflow entrypoint. | Full K7 VFS xfstests validation for the `k7-vfs` workflow target. |
+
+The flake also keeps two compatibility aliases. They are convenience names for
+manual invocations only and must not be cited as stronger validation evidence
+than the canonical app they execute:
+
+| Alias | Canonical app | Rationale |
+| --- | --- | --- |
+| `.#fuse-xfstests-vm` | `.#fuse-xfstests-validation` | Historical VM-oriented name for the same FUSE validation binary and arguments. |
+| `.#qemu-k7-vfs-xfstests-validation` | `.#k7-vfs-xfstests-validation` | Historical QEMU-oriented name for the same K7 VFS validation binary and arguments. |
+
+The former `.#kmod-xfstests-validation` app is retired. It was an unwired
+full-generic kmod harness with stale issue-era classification labels and no
+current workflow, manifest, or fail-closed evidence semantics. Current kmod
+xfstests evidence comes from `.#kmod-xfstests-smoke` only until a future issue
+designs and wires a full kmod generic-group lane.
+
 ## Follow-Up Notes
 
-These observations record ambiguity or naming gaps between the referenced
-sources. They are not addressed in this documentation slice.
-
-1.  **`kmod-xfstests-smoke` vs `kmod-xfstests-validation`**: The workflow
-    dispatches `.#kmod-xfstests-smoke`, but the flake also defines
-    `.#kmod-xfstests-validation` (a separate app pointing at a different
-    package, `kernelXfstestsValidation`). The `kmod-xfstests-validation` app is
-    not wired into any workflow. Its relationship to the smoke harness and
-    whether it should replace or supplement it is not documented.
-
-2.  **`fuse-xfstests-vm` vs `fuse-xfstests-validation`**: The flake defines
-    both `.#fuse-xfstests-vm` and `.#fuse-xfstests-validation`. They invoke the
-    same binary with the same arguments. Only `.#fuse-xfstests-validation` is
-    wired into the workflow. The `-vm` alias is unused and may be stale.
-
-3.  **`qemu-k7-vfs-xfstests-validation`**: The flake defines
-    `.#qemu-k7-vfs-xfstests-validation` as an alias for
-    `.#k7-vfs-xfstests-validation`. It is not referenced by any workflow.
-    Intentional alias or stale naming is not recorded.
-
-4.  **`kmod-smoke` artifact paths**: Unlike `fuse` and `k7-vfs`, the
+1.  **`kmod-smoke` artifact paths**: Unlike `fuse` and `k7-vfs`, the
     `kmod-smoke` harness writes its `qemu.log` into a timestamped subdirectory
     under the artifact root. The `xfstests-run-manifest.json` `artifact_paths`
     array records these relative paths, but the shape differs from the flat
