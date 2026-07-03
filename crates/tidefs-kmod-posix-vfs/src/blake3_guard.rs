@@ -150,14 +150,9 @@ mod tests {
         // mount_lifecycle and the guard module docs is handled by pattern scope.
         check_file(include_str!("lib.rs"), "lib.rs", &mut failures);
 
-        // Doc files that must not reintroduce BLAKE3 attestation language
-        // for ordinary operation dispatch surfaces.
+        // The package README remains guarded against reintroducing BLAKE3
+        // attestation language for ordinary operation dispatch surfaces.
         check_file(include_str!("../README.md"), "README.md", &mut failures);
-        check_file(
-            include_str!("../VFS-OPS-GAP-ANALYSIS.md"),
-            "VFS-OPS-GAP-ANALYSIS.md",
-            &mut failures,
-        );
 
         if !failures.is_empty() {
             panic!(

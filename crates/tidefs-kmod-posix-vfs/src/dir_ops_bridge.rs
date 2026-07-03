@@ -4,7 +4,7 @@
 //! Provides no_std-compatible bridge functions that translate kernel VFS
 //! directory inode_operations dispatch parameters into VfsEngine calls.
 //! These functions are pure delegation wrappers without BLAKE3 attestation,
-//! serving as the production kernel namespace mutation surface.
+//! keeping namespace mutation policy in the delegated VfsEngine path.
 #[cfg(CONFIG_RUST)]
 use crate::tidefs_kmod_bridge;
 use crate::TideVec as Vec;
