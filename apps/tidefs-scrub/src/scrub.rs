@@ -1003,14 +1003,19 @@ mod tests {
     }
 
     fn open_test_pool(root: &Path) -> Pool {
-        LocalFileSystem::default_development_pool(root, &StoreOptions::test_fast(), None, None)
-            .expect("open test pool")
+        LocalFileSystem::default_development_pool(
+            root,
+            &StoreOptions::durable(),
+            None,
+            None,
+        )
+        .expect("open test pool")
     }
 
     fn write_test_file(root: &Path, root_key: RootAuthenticationKey) -> ObjectKey {
         let mut fs = LocalFileSystem::open_with_root_authentication_key(
             root,
-            StoreOptions::test_fast(),
+            StoreOptions::durable(),
             root_key,
         )
         .expect("open fs");
@@ -1022,7 +1027,7 @@ mod tests {
         content_object_key_for_version(record.inode_id, record.data_version)
     }
 
-    fn create_test_store() -> (TempDir, LocalObjectStore) {
+    fn create_fast_fixture_store() -> (TempDir, LocalObjectStore) {
         let dir = TempDir::new().unwrap();
         let store_path = dir.path().join("store");
         let store = LocalObjectStore::open_with_options(&store_path, StoreOptions::test_fast());
@@ -1061,7 +1066,7 @@ mod tests {
     #[test]
     fn clean_store_produces_no_findings() {
         let _env = RootAuthEnvGuard::set(None);
-        let (_dir, mut store) = create_test_store();
+        let (_dir, mut store) = create_fast_fixture_store();
         for i in 0..5 {
             store
                 .put_named(format!("obj{i}"), format!("payload{i}").as_bytes())
@@ -1442,7 +1447,7 @@ mod tests {
 
     #[test]
     fn missing_object_produces_finding() {
-        let (_dir, store) = create_test_store();
+        let (_dir, store) = create_fast_fixture_store();
         let key = ObjectKey::from_name("nonexistent");
         let outcome = ScrubWalker::open(store.root()).unwrap().check_object(key);
 
@@ -1457,7 +1462,7 @@ mod tests {
 
     #[test]
     fn checksum_mismatch_detected() {
-        let (_dir, mut store) = create_test_store();
+        let (_dir, mut store) = create_fast_fixture_store();
         store.put_named("data", b"original").unwrap();
         store.put_named("data", b"DIFFERENT_PAYLOAD").unwrap();
 
