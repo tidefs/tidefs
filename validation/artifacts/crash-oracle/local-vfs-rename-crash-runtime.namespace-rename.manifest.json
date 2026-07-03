@@ -5,7 +5,7 @@
   "validation_tier": "mounted-userspace",
   "scope": "bounded local VFS rename -> fsync -> read -> crash/recover runtime path; not namespace-wide atomicity proof",
   "artifact_path": "validation/artifacts/crash-oracle/local-vfs-rename-crash-runtime.json",
-  "content_digest": "blake3:a22a99178f09228bccda0c4fc8718766a71e5a59f3ff79fc1da3f3ee291b4e77",
+  "content_digest": "blake3:0b7521767cbef8b2d8f13eae5ecf0c342345972ef9bee4396e156e4363564b60",
   "run_id": "deterministic-fixture:crash-oracle-local-vfs-rename-runtime-v1",
   "source_ref": "refs/heads/gpt3/issue-1484-crash-oracle-manifests",
   "outcome": "pass",

@@ -68,7 +68,7 @@ struct LocalVfsRuntimeCrashArtifact {
     interrupted_fsync: InterruptedFsyncObservation,
     recovery: RecoveryObservation,
     dependencies: Vec<RuntimeDependency>,
-    non_claims: Vec<String>,
+    non_claims: Vec<NonClaimBoundary>,
     validation_hint: String,
     events: Vec<RuntimeCrashEvent>,
 }
@@ -90,9 +90,21 @@ struct LocalVfsRenameRuntimeCrashArtifact {
     renamed_file: RenamedFileObservation,
     recovery: RenameRecoveryObservation,
     dependencies: Vec<RuntimeDependency>,
-    non_claims: Vec<String>,
+    non_claims: Vec<NonClaimBoundary>,
     validation_hint: String,
     events: Vec<RuntimeCrashEvent>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NonClaimBoundary {
+    category: String,
+    claim_id: String,
+    evidence_class: String,
+    evidence_scope: String,
+    excluded_product_claim: String,
+    remaining_risk: String,
+    blocking_issue: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -235,7 +247,19 @@ fn validate_local_vfs_runtime_crash_artifact(
     validate_runtime_observations(&artifact, &mut failures);
     validate_events(&artifact.events, &mut failures);
     validate_dependencies(&artifact.dependencies, &mut failures);
-    validate_non_claims(&artifact.non_claims, &mut failures);
+    validate_non_claims(
+        &artifact.non_claims,
+        LOCAL_VFS_WRITE_FSYNC_RUNTIME_CRASH_CLAIM_ID,
+        LOCAL_VFS_WRITE_FSYNC_RUNTIME_CRASH_EVIDENCE_CLASS,
+        &artifact.evidence_scope,
+        &[
+            "production-crash-safety",
+            "model-crash-matrix",
+            "queue-depth-no-hidden-queue",
+            "interrupted-fsync-durability",
+        ],
+        &mut failures,
+    );
 
     if failures.is_empty() {
         Ok(LocalVfsRuntimeCrashArtifactSummary {
@@ -256,7 +280,19 @@ fn validate_local_vfs_rename_runtime_crash_artifact(
     validate_rename_runtime_observations(&artifact, &mut failures);
     validate_rename_events(&artifact.events, &mut failures);
     validate_rename_dependencies(&artifact.dependencies, &mut failures);
-    validate_non_claims(&artifact.non_claims, &mut failures);
+    validate_non_claims(
+        &artifact.non_claims,
+        LOCAL_VFS_RENAME_RUNTIME_CRASH_CLAIM_ID,
+        LOCAL_VFS_RENAME_RUNTIME_CRASH_EVIDENCE_CLASS,
+        &artifact.evidence_scope,
+        &[
+            "production-crash-safety",
+            "model-crash-matrix",
+            "queue-depth-no-hidden-queue",
+            "broader-namespace-atomicity",
+        ],
+        &mut failures,
+    );
 
     if failures.is_empty() {
         Ok(LocalVfsRuntimeCrashArtifactSummary {
@@ -660,16 +696,65 @@ fn validate_rename_dependencies(dependencies: &[RuntimeDependency], failures: &m
     }
 }
 
-fn validate_non_claims(non_claims: &[String], failures: &mut Vec<String>) {
-    let text = non_claims.join("\n").to_ascii_lowercase();
-    if !text.contains("production crash safety") {
-        failures.push("non_claims must exclude production crash safety".to_string());
+fn validate_non_claims(
+    non_claims: &[NonClaimBoundary],
+    claim_id: &str,
+    evidence_class: &str,
+    evidence_scope: &str,
+    required_categories: &[&str],
+    failures: &mut Vec<String>,
+) {
+    let mut categories = BTreeSet::new();
+    for non_claim in non_claims {
+        if !categories.insert(non_claim.category.as_str()) {
+            failures.push(format!(
+                "non_claims must not duplicate category `{}`",
+                non_claim.category
+            ));
+        }
+        if non_claim.claim_id != claim_id {
+            failures.push(format!(
+                "non_claim `{}` must bind claim_id `{claim_id}`, found `{}`",
+                non_claim.category, non_claim.claim_id
+            ));
+        }
+        if non_claim.evidence_class != evidence_class {
+            failures.push(format!(
+                "non_claim `{}` must bind evidence_class `{evidence_class}`, found `{}`",
+                non_claim.category, non_claim.evidence_class
+            ));
+        }
+        if non_claim.evidence_scope != evidence_scope {
+            failures.push(format!(
+                "non_claim `{}` must bind the artifact evidence_scope",
+                non_claim.category
+            ));
+        }
+        if non_claim.excluded_product_claim.trim().is_empty() {
+            failures.push(format!(
+                "non_claim `{}` must name the excluded product claim",
+                non_claim.category
+            ));
+        }
+        if non_claim.remaining_risk.trim().is_empty() {
+            failures.push(format!(
+                "non_claim `{}` must record the remaining blocker or risk",
+                non_claim.category
+            ));
+        }
+        if non_claim.blocking_issue == Some(0) {
+            failures.push(format!(
+                "non_claim `{}` blocking_issue must be a nonzero issue number when present",
+                non_claim.category
+            ));
+        }
     }
-    if !text.contains("model") {
-        failures.push("non_claims must preserve the model/runtime boundary".to_string());
-    }
-    if !text.contains("queue-depth") {
-        failures.push("non_claims must exclude queue-depth runtime evidence".to_string());
+    for required in required_categories {
+        if !categories.contains(required) {
+            failures.push(format!(
+                "non_claims must include structured category `{required}`"
+            ));
+        }
     }
 }
 
@@ -718,9 +803,42 @@ mod tests {
         {"issue": 445, "subject": "intent log", "status": "open"}
       ],
       "non_claims": [
-        "This does not validate production crash safety.",
-        "This is not model-only evidence.",
-        "This does not provide queue-depth runtime evidence."
+        {
+          "category": "production-crash-safety",
+          "claim_id": "local.vfs.write_fsync_crash.v1",
+          "evidence_class": "runtime-crash-oracle",
+          "evidence_scope": "local VFS runtime write/fsync/read crash/recover",
+          "excluded_product_claim": "production crash safety",
+          "remaining_risk": "storage-wide crash-safety coverage remains outside this local VFS hook artifact",
+          "blocking_issue": 493
+        },
+        {
+          "category": "model-crash-matrix",
+          "claim_id": "local.vfs.write_fsync_crash.v1",
+          "evidence_class": "runtime-crash-oracle",
+          "evidence_scope": "local VFS runtime write/fsync/read crash/recover",
+          "excluded_product_claim": "model crash matrix replacement",
+          "remaining_risk": "model crash matrix validation remains separate from this runtime artifact",
+          "blocking_issue": null
+        },
+        {
+          "category": "queue-depth-no-hidden-queue",
+          "claim_id": "local.vfs.write_fsync_crash.v1",
+          "evidence_class": "runtime-crash-oracle",
+          "evidence_scope": "local VFS runtime write/fsync/read crash/recover",
+          "excluded_product_claim": "queue-depth and no-hidden-queue admission coverage",
+          "remaining_risk": "runtime queue-depth evidence remains required for no-hidden-queue admission",
+          "blocking_issue": null
+        },
+        {
+          "category": "interrupted-fsync-durability",
+          "claim_id": "local.vfs.write_fsync_crash.v1",
+          "evidence_class": "runtime-crash-oracle",
+          "evidence_scope": "local VFS runtime write/fsync/read crash/recover",
+          "excluded_product_claim": "interrupted fsync payload durability",
+          "remaining_risk": "the interrupted fsync exits before completion and does not prove the interrupted payload is durable",
+          "blocking_issue": null
+        }
       ],
       "validation_hint": "cargo test -p tidefs-local-filesystem",
       "events": [
@@ -774,9 +892,42 @@ mod tests {
         {"issue": 597, "subject": "rename no-hidden-queue", "status": "tracked separately"}
       ],
       "non_claims": [
-        "This does not validate production crash safety.",
-        "This is not model-only evidence.",
-        "This does not provide queue-depth or no-hidden-queue evidence."
+        {
+          "category": "production-crash-safety",
+          "claim_id": "local.vfs.rename_atomic_crash.v1",
+          "evidence_class": "runtime-namespace-crash-artifact",
+          "evidence_scope": "local VFS runtime rename/fsync/read crash/recover",
+          "excluded_product_claim": "production crash safety",
+          "remaining_risk": "production crash-safety coverage remains outside this local VFS rename artifact",
+          "blocking_issue": 493
+        },
+        {
+          "category": "model-crash-matrix",
+          "claim_id": "local.vfs.rename_atomic_crash.v1",
+          "evidence_class": "runtime-namespace-crash-artifact",
+          "evidence_scope": "local VFS runtime rename/fsync/read crash/recover",
+          "excluded_product_claim": "model crash matrix replacement",
+          "remaining_risk": "model crash matrix validation remains separate from this runtime artifact",
+          "blocking_issue": null
+        },
+        {
+          "category": "queue-depth-no-hidden-queue",
+          "claim_id": "local.vfs.rename_atomic_crash.v1",
+          "evidence_class": "runtime-namespace-crash-artifact",
+          "evidence_scope": "local VFS runtime rename/fsync/read crash/recover",
+          "excluded_product_claim": "queue-depth and no-hidden-queue admission coverage",
+          "remaining_risk": "rename directory-entry, link/unlink, and orphan-index queue coverage remains tracked separately",
+          "blocking_issue": 597
+        },
+        {
+          "category": "broader-namespace-atomicity",
+          "claim_id": "local.vfs.rename_atomic_crash.v1",
+          "evidence_class": "runtime-namespace-crash-artifact",
+          "evidence_scope": "local VFS runtime rename/fsync/read crash/recover",
+          "excluded_product_claim": "broader namespace atomicity and distributed filesystem behavior",
+          "remaining_risk": "kernel, distributed recovery, OpenZFS, and Ceph-class behavior remain outside this artifact",
+          "blocking_issue": null
+        }
       ],
       "validation_hint": "cargo test -p tidefs-local-filesystem",
       "events": [
