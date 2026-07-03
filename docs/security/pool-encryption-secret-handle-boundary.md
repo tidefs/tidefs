@@ -1,6 +1,5 @@
 # Pool Encryption Secret-Handle/Key-Lease Boundary (REL-SEC-003)
 
-Status: implemented (committed mount-token boundary + unit evidence, 2026-06-20)
 Crate: `tidefs-encryption` (`secret_handle` module)
 
 ## What this boundary is
@@ -108,14 +107,6 @@ and the caller also proves persisted transform metadata, stored-frame
 reachability, and documented media/remanence limits for fully encrypted
 payloads. That assessment is still a non-claim: key revocation or destruction
 alone is not secure erase, sanitization, decommissioning, or remanence proof.
-
-## A-register impact
-
-This implements the type-boundary portion of A17 (Security/Auth/Encryption
-Design Is Split Between Strong Laws And Weak Live Boundaries):
-- Advances: "Resolve mounted at-rest encryption authority" by providing the
-  P9-04 handle/lease types needed for product-path wiring.
-- Does not yet close: product reachability (pool create/import/mount wiring)
 
 ## Tests
 
