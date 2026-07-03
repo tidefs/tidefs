@@ -2,7 +2,7 @@
 //! Kernel-compatible xattr bridge -- K7-19 xattr-storage seam.
 //!
 //! Bridges kernel extended attribute operations to the canonical
-//! [`tidefs_xattr_storage::XattrStore`] persistence primitives.
+//! xattr store semantics used by cargo and Kbuild builds.
 //!
 //! This module provides pure bridge functions that translate
 //! kernel VFS xattr dispatch parameters into xattr-storage calls,
@@ -14,9 +14,10 @@
 //!
 //! # No-daemon boundary
 //!
-//! All operations in this module resolve locally within kernel
-//! authority through `XattrStore`. No userspace daemon, helper,
-//! or upcall is required for xattr persistence.
+//! All operations in this module resolve locally within kernel authority
+//! through `XattrStore`. No userspace daemon, helper, or upcall is required
+//! for the xattr operation surface; durable mounted persistence remains the
+//! responsibility of the engine authority that owns each inode's store.
 //!
 //! # Integration
 //!
@@ -33,7 +34,7 @@ use crate::errno::KernelErrno;
 use tidefs_kmod_bridge::kernel_types::{Errno, InodeId, RequestCtx};
 
 // Under cargo, use the real tidefs-xattr-storage crate.
-// Under Kbuild, use the kernel-compatible stubs from the bridge.
+// Under Kbuild, use the kernel-compatible mirror from the bridge.
 #[cfg(CONFIG_RUST)]
 use crate::tidefs_kmod_bridge::kernel_types::{
     pack_posix_xattr_name_list, DatasetXattrPolicy, XattrStore, XattrStoreError,
