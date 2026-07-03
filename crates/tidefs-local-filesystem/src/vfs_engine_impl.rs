@@ -27,8 +27,8 @@ use tidefs_types_vfs_core::{LockRange, LockType};
 use tidefs_vfs_engine::{LseekDataRange, VfsEngine, VfsEngineStatFs};
 
 use crate::content::{
-    content_chunk_start, read_content_chunk_from_store, read_content_layout_from_store,
-    reflink_chunked_content,
+    content_chunk_start, read_content_layout_from_store, reflink_chunked_content,
+    MountedContentReadAuthority,
 };
 use crate::error::FileSystemError;
 use crate::fuse_getattr;
@@ -226,12 +226,8 @@ impl SparseAnonymousData {
     }
 
     fn from_local_file(fs: &LocalFileSystem, record: &InodeRecord) -> crate::Result<Self> {
-        let layout = read_content_layout_from_store(
-            fs.store.raw_primary_store(),
-            record.inode_id,
-            record,
-            true,
-        )?;
+        let content_reader = MountedContentReadAuthority::new(&fs.store);
+        let layout = content_reader.read_layout(record.inode_id, record, true)?;
         match layout {
             ContentLayout::Inline(content) => Ok(Self::from_vec(content.bytes)),
             ContentLayout::Chunked(manifest) => {
@@ -241,12 +237,7 @@ impl SparseAnonymousData {
                     .iter()
                     .filter(|chunk_ref| !chunk_ref.is_hole())
                 {
-                    let chunk = read_content_chunk_from_store(
-                        fs.store.raw_primary_store(),
-                        record.inode_id,
-                        chunk_ref,
-                        Some(&fs.store),
-                    )?;
+                    let chunk = content_reader.read_chunk(record.inode_id, chunk_ref)?;
                     let offset = content_chunk_start(chunk_ref.chunk_index)?;
                     data.insert_if_data(offset, chunk.bytes);
                 }

@@ -4130,25 +4130,23 @@ impl LocalFileSystem {
         }
         let dv = record.as_ref().map(|r| r.data_version);
         let chunk_reclaim_indexes = match record.as_ref().filter(|record| record.nlink == 0) {
-            Some(record) => match read_content_layout_from_store(
-                self.store.raw_primary_store(),
-                inode_id,
-                record,
-                true,
-            ) {
-                Ok(ContentLayout::Chunked(manifest)) => Some(
-                    manifest
-                        .chunks
-                        .iter()
-                        .filter(|chunk_ref| !chunk_ref.is_hole())
-                        .map(|chunk_ref| chunk_ref.chunk_index)
-                        .collect::<Vec<_>>(),
-                ),
-                Ok(ContentLayout::Inline(_)) => Some(Vec::new()),
-                Err(_) => content_chunk_count(record.size)
-                    .ok()
-                    .map(|chunk_count| (0..chunk_count).collect()),
-            },
+            Some(record) => {
+                let content_reader = MountedContentReadAuthority::new(&self.store);
+                match content_reader.read_layout(inode_id, record, true) {
+                    Ok(ContentLayout::Chunked(manifest)) => Some(
+                        manifest
+                            .chunks
+                            .iter()
+                            .filter(|chunk_ref| !chunk_ref.is_hole())
+                            .map(|chunk_ref| chunk_ref.chunk_index)
+                            .collect::<Vec<_>>(),
+                    ),
+                    Ok(ContentLayout::Inline(_)) => Some(Vec::new()),
+                    Err(_) => content_chunk_count(record.size)
+                        .ok()
+                        .map(|chunk_count| (0..chunk_count).collect()),
+                }
+            }
             None => None,
         };
 
@@ -4663,12 +4661,8 @@ impl LocalFileSystem {
         let mut plan = RewriteTrimPlan::default();
         match old_layout {
             ContentLayout::Chunked(ref old_manifest) => {
-                let new_layout = read_content_layout_from_store(
-                    self.store.raw_primary_store(),
-                    inode_id,
-                    new_record,
-                    false,
-                )?;
+                let content_reader = MountedContentReadAuthority::new(&self.store);
+                let new_layout = content_reader.read_layout(inode_id, new_record, false)?;
                 if let ContentLayout::Chunked(ref new_manifest) = new_layout {
                     let (trimmable, deferred) =
                         crate::allocation::obsolete_extent_keys_for_full_replace(
@@ -5448,12 +5442,8 @@ impl LocalFileSystem {
         source_record: &InodeRecord,
         dest_record: &InodeRecord,
     ) -> Result<(BTreeMap<ObjectKey, u64>, u64, u64)> {
-        let source_layout = read_content_layout_from_store(
-            self.store.raw_primary_store(),
-            source_inode_id,
-            source_record,
-            true,
-        )?;
+        let content_reader = MountedContentReadAuthority::new(&self.store);
+        let source_layout = content_reader.read_layout(source_inode_id, source_record, true)?;
         let planned_entries =
             planned_reflink_allocation_entries_for_source_layout(dest_record, &source_layout)?;
         let allocation_bytes = allocation_bytes(&planned_entries)?;
@@ -5466,8 +5456,8 @@ impl LocalFileSystem {
         inode_id: InodeId,
         record: &InodeRecord,
     ) -> Result<()> {
-        let layout =
-            read_content_layout_from_store(self.store.raw_primary_store(), inode_id, record, true)?;
+        let content_reader = MountedContentReadAuthority::new(&self.store);
+        let layout = content_reader.read_layout(inode_id, record, true)?;
         let mut recorded = false;
         match layout {
             ContentLayout::Inline(content) => {
@@ -8892,12 +8882,8 @@ impl LocalFileSystem {
     /// manifests are persisted (#873).
     pub fn find_next_hole_offset(&self, inode_id: InodeId, offset: u64) -> Result<u64> {
         let record = self.inode(inode_id)?.clone();
-        let layout = read_content_layout_from_store(
-            self.store.raw_primary_store(),
-            inode_id,
-            &record,
-            false,
-        )?;
+        let content_reader = MountedContentReadAuthority::new(&self.store);
+        let layout = content_reader.read_layout(inode_id, &record, false)?;
         match layout {
             ContentLayout::Inline(_) => Ok(record.size),
             ContentLayout::Chunked(manifest) => {
@@ -8936,12 +8922,8 @@ impl LocalFileSystem {
         if offset >= record.size {
             return Ok(None);
         }
-        let layout = read_content_layout_from_store(
-            self.store.raw_primary_store(),
-            inode_id,
-            &record,
-            false,
-        )?;
+        let content_reader = MountedContentReadAuthority::new(&self.store);
+        let layout = content_reader.read_layout(inode_id, &record, false)?;
         match layout {
             ContentLayout::Inline(_) => Ok(Some(offset)),
             ContentLayout::Chunked(manifest) => {
@@ -12691,13 +12673,8 @@ impl LocalFileSystem {
         if let Some(bytes) = self.hot_read_cache.borrow_mut().get(key) {
             return Ok(bytes);
         }
-        let bytes = read_content_from_store(
-            self.store.raw_primary_store(),
-            inode_id,
-            record,
-            true,
-            Some(&self.store),
-        )?;
+        let content_reader = MountedContentReadAuthority::new(&self.store);
+        let bytes = content_reader.read_all(inode_id, record, true)?;
         self.hot_read_cache.borrow_mut().admit(key, &bytes);
         Ok(bytes)
     }
@@ -12763,35 +12740,20 @@ impl LocalFileSystem {
         }
 
         if offset == 0 && length_u64 >= record.size {
-            let bytes = read_content_from_store(
-                self.store.raw_primary_store(),
-                inode_id,
-                record,
-                true,
-                Some(&self.store),
-            )?;
+            let content_reader = MountedContentReadAuthority::new(&self.store);
+            let bytes = content_reader.read_all(inode_id, record, true)?;
             self.hot_read_cache.borrow_mut().admit(key, &bytes);
             return Ok(bytes);
         }
 
         if let Some(layout) = self.content_layout_cache.borrow().get(&key).cloned() {
-            return read_content_range_from_layout(
-                self.store.raw_primary_store(),
-                &layout,
-                offset,
-                clipped_len,
-                Some(&self.store),
-            );
+            let content_reader = MountedContentReadAuthority::new(&self.store);
+            return content_reader.read_range(&layout, offset, clipped_len);
         }
 
         let layout = self.read_committed_content_layout_cached(inode_id, record)?;
-        let bytes = read_content_range_from_layout(
-            self.store.raw_primary_store(),
-            &layout,
-            offset,
-            clipped_len,
-            Some(&self.store),
-        )?;
+        let content_reader = MountedContentReadAuthority::new(&self.store);
+        let bytes = content_reader.read_range(&layout, offset, clipped_len)?;
         Ok(bytes)
     }
 
@@ -12823,8 +12785,8 @@ impl LocalFileSystem {
             return Ok(layout);
         }
 
-        let layout =
-            read_content_layout_from_store(self.store.raw_primary_store(), inode_id, record, true)?;
+        let content_reader = MountedContentReadAuthority::new(&self.store);
+        let layout = content_reader.read_layout(inode_id, record, true)?;
         if matches!(layout, ContentLayout::Chunked(_)) {
             self.content_layout_cache
                 .borrow_mut()

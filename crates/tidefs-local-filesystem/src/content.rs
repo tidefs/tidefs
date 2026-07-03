@@ -426,6 +426,61 @@ pub(crate) fn read_content_from_store(
     }
 }
 
+pub(crate) struct MountedContentReadAuthority<'a> {
+    store: &'a LocalObjectStore,
+    pool: &'a Pool,
+}
+
+impl<'a> MountedContentReadAuthority<'a> {
+    pub(crate) fn new(pool: &'a Pool) -> Self {
+        Self {
+            store: pool.raw_primary_store(),
+            pool,
+        }
+    }
+
+    pub(crate) fn read_layout(
+        &self,
+        inode_id: InodeId,
+        record: &InodeRecord,
+        allow_v0390_fixed_content: bool,
+    ) -> Result<ContentLayout> {
+        read_content_layout_from_store(self.store, inode_id, record, allow_v0390_fixed_content)
+    }
+
+    pub(crate) fn read_all(
+        &self,
+        inode_id: InodeId,
+        record: &InodeRecord,
+        allow_v0390_fixed_content: bool,
+    ) -> Result<Vec<u8>> {
+        read_content_from_store(
+            self.store,
+            inode_id,
+            record,
+            allow_v0390_fixed_content,
+            Some(self.pool),
+        )
+    }
+
+    pub(crate) fn read_range(
+        &self,
+        layout: &ContentLayout,
+        offset: u64,
+        len: usize,
+    ) -> Result<Vec<u8>> {
+        read_content_range_from_layout(self.store, layout, offset, len, Some(self.pool))
+    }
+
+    pub(crate) fn read_chunk(
+        &self,
+        inode_id: InodeId,
+        chunk_ref: &ContentChunkRef,
+    ) -> Result<ContentChunkObject> {
+        read_content_chunk_from_store(self.store, inode_id, chunk_ref, Some(self.pool))
+    }
+}
+
 pub(crate) fn read_content_layout_from_store(
     store: &LocalObjectStore,
     inode_id: InodeId,
