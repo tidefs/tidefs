@@ -71,14 +71,14 @@ are checked by the `Host preflight` step before any target runs.
 | Command arguments  | `--timeout 600 --pool-size 256` |
 | Output directory   | `/tmp/tidefs-validation/kernel-fsync-validation` |
 | Uploaded artifact  | `qemu-smoke-kernel-fsync-validation` (7-day retention) |
-| Extra step         | Writes `evidence-manifest.json` with claim `kernel.fsync.durability.v1`, source label `qemu-smoke-kernel-fsync-validation` |
+| Extra step         | Writes and validates a v2 `evidence-manifest.json` with claim `kernel.fsync.durability.v1`, explicit outcome, source label `qemu-smoke-kernel-fsync-validation`, and non-pass missing-summary state |
 | Evidence class     | runtime-kernel-fsync-validation (syncfs durability across QEMU power-loss cycle) |
 
 A separate dedicated workflow, `Kernel fsync/syncfs validation`
 (`.github/workflows/kernel-fsync-validation.yml`), also runs
 `.#kernel-fsync-validation` with configurable `timeout_seconds` and
 `pool_size_mb` inputs, serial concurrency (`cancel-in-progress: false`),
-and a richer evidence manifest that includes pass/fail/blocked counts.
+and a standalone v2 evidence manifest that includes pass/fail/blocked counts.
 
 ### 3. `kernel-mmap-validation`
 

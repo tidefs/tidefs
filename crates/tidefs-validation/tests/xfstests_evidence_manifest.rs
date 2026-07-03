@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 use tidefs_validation::xfstests_evidence_manifest::{
     parse_xfstests_evidence_manifest_json, XfstestsEvidenceManifest,
-    XFSTESTS_EVIDENCE_MANIFEST_VERSION,
+    XFSTESTS_EVIDENCE_MANIFEST_FILENAME, XFSTESTS_EVIDENCE_MANIFEST_VERSION,
 };
 
 fn valid_focused_manifest() -> XfstestsEvidenceManifest {
@@ -63,6 +63,18 @@ fn broad_manifest_omits_empty_optional() {
     assert!(!obj.contains_key("tests"));
     assert!(!obj.contains_key("started_at"));
     assert!(!obj.contains_key("finished_at"));
+}
+
+#[test]
+fn manifest_filename_is_run_level_not_claim_artifact_name() {
+    assert_eq!(
+        XFSTESTS_EVIDENCE_MANIFEST_FILENAME,
+        "xfstests-run-manifest.json"
+    );
+    assert_ne!(
+        XFSTESTS_EVIDENCE_MANIFEST_FILENAME,
+        "evidence-manifest.json"
+    );
 }
 
 #[test]

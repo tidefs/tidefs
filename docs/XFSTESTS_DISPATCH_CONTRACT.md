@@ -47,7 +47,7 @@ fourth (`all`) dispatches every matrix job.
   (13 smoke tests).
 - **Guest VM**: Linux 7.0 QEMU guest, FUSE mount of TideFS userspace daemon.
 - **Output artifact**: `xfstests-fuse`
-- **Key artifact files**: `validation.json`, `evidence-manifest.json`,
+- **Key artifact files**: `validation.json`, `xfstests-run-manifest.json`,
   `artifact-root.env`
 - **Evidence scope**: `focused` when `tests` input is non-empty, otherwise
   `broad`.
@@ -70,9 +70,9 @@ fourth (`all`) dispatches every matrix job.
   authority and mount smoke checks.
 - **Output artifact**: `xfstests-kmod-smoke`
 - **Key artifact files**: `qemu.log` (copied into a timestamped subdirectory
-  under the artifact root), `evidence-manifest.json`, `artifact-root.env`
+  under the artifact root), `xfstests-run-manifest.json`, `artifact-root.env`
 - **Evidence scope**: `focused` when a non-empty supported internal label list
-  is supplied, otherwise `broad`. The evidence manifest records the resolved
+  is supplied, otherwise `broad`. The run-level manifest records the resolved
   internal label set actually selected by the harness. Unsupported labels are
   recorded as a selection error, not focused smoke evidence.
 
@@ -90,7 +90,7 @@ fourth (`all`) dispatches every matrix job.
 - **Guest VM**: NixOS VM booted with Linux 7.0 and loaded `tidefs_posix_vfs.ko`.
   Real upstream `xfstests-check` inside the guest.
 - **Output artifact**: `xfstests-k7-vfs`
-- **Key artifact files**: `validation.json`, `evidence-manifest.json`,
+- **Key artifact files**: `validation.json`, `xfstests-run-manifest.json`,
   `artifact-root.env`, `nix-vm-build.log` (when present).
 - **Evidence scope**: `focused` when `tests` input is non-empty, otherwise
   `broad`.
@@ -132,7 +132,10 @@ on the same label set. The host must provide `/dev/kvm` and `/dev/fuse`.
 
 All artifacts have `retention-days: 7`.
 
-Each artifact contains an `evidence-manifest.json` with the following fields:
+Each artifact contains an `xfstests-run-manifest.json` run-level manifest with
+the following fields. This is the xfstests-specific schema validated by
+`validate-xfstests-evidence-manifest`; it is not the generic claim
+`EvidenceArtifactManifest` schema used by `evidence-manifest.json` files.
 
 - `manifest_version` (number, currently `1`)
 - `workflow` (e.g. `xfstests`)
@@ -232,6 +235,6 @@ sources. They are not addressed in this documentation slice.
 
 4.  **`kmod-smoke` artifact paths**: Unlike `fuse` and `k7-vfs`, the
     `kmod-smoke` harness writes its `qemu.log` into a timestamped subdirectory
-    under the artifact root. The `evidence-manifest.json` `artifact_paths`
+    under the artifact root. The `xfstests-run-manifest.json` `artifact_paths`
     array records these relative paths, but the shape differs from the flat
     `validation.json` output of the other targets.

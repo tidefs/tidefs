@@ -241,29 +241,57 @@ jobs:
             ARTIFACT_PATHS="none"
           fi
 
-          DIGEST="$(nix shell nixpkgs#b3sum --command b3sum "$ARTIFACT_ROOT/$PRIMARY_PATH" 2>/dev/null | awk '{print $1}' || true)"
-          if [[ ! "$DIGEST" =~ ^[0-9a-fA-F]{64}$ ]]; then
-            DIGEST="0000000000000000000000000000000000000000000000000000000000000000"
-          fi
+          DIGEST="$(nix shell nixpkgs#b3sum --command b3sum "$ARTIFACT_ROOT/$PRIMARY_PATH" | awk '{print $1}')"
           CONTENT_DIGEST="blake3:${DIGEST}"
 
           CLAIM_ID="rdma.validation.${MATRIX_TARGET}.v1"
           SOURCE_LABEL="rdma-workflow"
+          MANIFEST_RUN_ID="${EVIDENCE_RUN_ID}/${EVIDENCE_RUN_ATTEMPT}"
+          if [[ "$RESULT_STATUS" == "pass" ]]; then
+            OUTCOME="pass"
+          elif [[ "$RESULT_STATUS" == "fail" || "$RESULT_STATUS" == "timeout" ]]; then
+            if [[ "$VALIDATION_TIER" == "multi-process-distributed" ]]; then
+              OUTCOME="product-fail"
+            else
+              OUTCOME="harness-fail"
+            fi
+          else
+            OUTCOME="harness-fail"
+          fi
+          RESIDUAL_RISK="RDMA workflow evidence is bounded to matrix target ${MATRIX_TARGET} at validation tier ${VALIDATION_TIER}; static-carrier and host-probe rows are harness/host evidence only, and this manifest does not broaden release, production, or successor/comparator claims."
           SCOPE="workflow=${EVIDENCE_WORKFLOW} run_id=${EVIDENCE_RUN_ID} run_attempt=${EVIDENCE_RUN_ATTEMPT} source_ref=${EVIDENCE_SOURCE_REF} source_sha=${EVIDENCE_SOURCE_SHA} matrix_target=${MATRIX_TARGET} command_class=${COMMAND_CLASS} command=${RDMA_COMMAND} status=${RESULT_STATUS} command_status=${COMMAND_STATUS} validation_tier=${VALIDATION_TIER} artifact_root=${ARTIFACT_ROOT} output_dir_state=${OUTPUT_DIR_STATE} primary_artifact=${PRIMARY_PATH} primary_artifact_state=${PRIMARY_STATE} artifact_paths=${ARTIFACT_PATHS}"
 
-          cat > "$ARTIFACT_ROOT/evidence-manifest.json" << MANIFESTEOF
-          {
-            "manifest_version": 1,
-            "claim_id": $(json_string "$CLAIM_ID"),
-            "evidence_class": $(json_string "$EVIDENCE_CLASS"),
-            "validation_tier": $(json_string "$VALIDATION_TIER"),
-            "source": $(json_string "$SOURCE_LABEL"),
-            "scope": $(json_string "$SCOPE"),
-            "artifact_path": $(json_string "$PRIMARY_PATH"),
-            "content_digest": $(json_string "$CONTENT_DIGEST"),
-            "generated_at": $(json_string "$FINISHED_AT")
-          }
-          MANIFESTEOF
+          jq -n \
+            --arg claim_id "$CLAIM_ID" \
+            --arg evidence_class "$EVIDENCE_CLASS" \
+            --arg validation_tier "$VALIDATION_TIER" \
+            --arg scope "$SCOPE" \
+            --arg artifact_path "$PRIMARY_PATH" \
+            --arg content_digest "$CONTENT_DIGEST" \
+            --arg run_id "$MANIFEST_RUN_ID" \
+            --arg source_ref "$EVIDENCE_SOURCE_SHA" \
+            --arg outcome "$OUTCOME" \
+            --arg residual_risk "$RESIDUAL_RISK" \
+            --arg source "$SOURCE_LABEL" \
+            --arg generated_at "$FINISHED_AT" \
+            '{
+              manifest_version: 2,
+              claim_id: $claim_id,
+              evidence_class: $evidence_class,
+              validation_tier: $validation_tier,
+              scope: $scope,
+              artifact_path: $artifact_path,
+              content_digest: $content_digest,
+              run_id: $run_id,
+              source_ref: $source_ref,
+              outcome: $outcome,
+              residual_risk: $residual_risk,
+              source: $source,
+              generated_at: $generated_at,
+              blocking_issues: []
+            }' > "$ARTIFACT_ROOT/evidence-manifest.json"
+
+          nix develop .#ci --command cargo run --locked -p tidefs-xtask -- validate-evidence-manifest "$ARTIFACT_ROOT/evidence-manifest.json"
 
           {
             echo "## RDMA evidence manifest"
@@ -271,6 +299,7 @@ jobs:
             echo "- Matrix target: \`$MATRIX_TARGET\`"
             echo "- Command class: \`$COMMAND_CLASS\`"
             echo "- Status: \`$RESULT_STATUS\`"
+            echo "- Outcome: \`$OUTCOME\`"
             echo "- Manifest: \`$ARTIFACT_ROOT/evidence-manifest.json\`"
             if [[ -n "$STARTED_AT" ]]; then
               echo "- Started: \`$STARTED_AT\`"

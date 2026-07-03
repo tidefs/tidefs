@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! xfstests evidence manifest.
 //!
-//! The xfstests workflow writes a per-target manifest alongside uploaded
-//! artifacts so later issue/PR reports can cite a machine-checkable evidence
-//! record instead of only a workflow URL.
+//! The xfstests workflow writes a per-target run-level manifest named
+//! [`XFSTESTS_EVIDENCE_MANIFEST_FILENAME`] alongside uploaded artifacts so
+//! later issue/PR reports can cite a machine-checkable evidence record instead
+//! of only a workflow URL.
 //!
 //! This manifest records run identity, source provenance, target, requested
 //! row set, artifact-relative result paths, timestamps, and evidence scope
@@ -17,6 +18,12 @@ use std::fs;
 use std::path::{Component, Path};
 
 pub const XFSTESTS_EVIDENCE_MANIFEST_VERSION: u32 = 1;
+
+/// Filename used by the xfstests workflow for this run-level manifest.
+///
+/// This is intentionally not `evidence-manifest.json`, which is reserved for
+/// claim artifact manifests such as [`super::evidence_artifact_manifest::EvidenceArtifactManifest`].
+pub const XFSTESTS_EVIDENCE_MANIFEST_FILENAME: &str = "xfstests-run-manifest.json";
 
 /// Valid xfstests targets.
 const VALID_TARGETS: &[&str] = &["fuse", "kmod-smoke", "k7-vfs", "all"];

@@ -252,7 +252,7 @@
       "exit_code": 0
     },
     "tidefs-local-filesystem": {
-      "warnings": 165,
+      "warnings": 167,
       "exit_code": 0
     },
     "tidefs-local-object-store": {
@@ -444,7 +444,7 @@
       "exit_code": 0
     },
     "tidefs-scrub": {
-      "warnings": 113,
+      "warnings": 114,
       "exit_code": 0
     },
     "tidefs-scrub-core": {

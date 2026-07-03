@@ -164,8 +164,9 @@ may use non-secret repository variables for scheduling gates, such as
   `.#kernel-fsync-validation` against the selected branch with
   `timeout_seconds` and `pool_size_mb` inputs, exercises a QEMU power-loss
   cycle with persistent virtio-blk backing storage, and uploads phase logs,
-  `summary.env`, and `evidence-manifest.json` under
-  `kernel-fsync-validation`.
+  `summary.env`, and a v2 claim evidence `evidence-manifest.json` under
+  `kernel-fsync-validation`; missing summaries are recorded as non-pass
+  harness evidence rather than placeholder pass artifacts.
 - `Kernel mmap validation` is a narrow manual self-hosted workflow for the
   mounted mmap/writeback QEMU row. It runs `.#kernel-mmap-validation` against
   the selected branch with a `timeout_seconds` input and uploads `summary.env`
@@ -204,7 +205,9 @@ may use non-secret repository variables for scheduling gates, such as
   structure, `host-probe` for non-mutating runner capability inspection, and
   `qemu-two-node` for multi-process distributed transport evidence. The first
   two are harness/host evidence only; they do not prove live two-node transport
-  behavior.
+  behavior. xfstests uploads its run-level manifest as
+  `xfstests-run-manifest.json`; RDMA claim-shaped rows use v2
+  `evidence-manifest.json` records with explicit outcomes.
 - `Release Candidate` is a manual-only self-hosted workflow. The `smoke`
   profile runs Rust, Nix, and QEMU smoke lanes; the `full` profile also runs
   xfstests and RDMA. Each run uploads a top-level

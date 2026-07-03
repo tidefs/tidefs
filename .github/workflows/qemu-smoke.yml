@@ -124,9 +124,10 @@ jobs:
           set -euo pipefail
 
           SUMMARY_DIR="${{ matrix.output_dir }}"
+          mkdir -p "$SUMMARY_DIR"
           MANIFEST_PATH="$SUMMARY_DIR/evidence-manifest.json"
           GENERATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          RUN_ID="${{ github.run_id }}"
+          RUN_ID="${{ github.run_id }}/${{ github.run_attempt }}"
           SOURCE_REF="${{ github.sha }}"
 
           CLAIM_ID="kernel.fsync.durability.v1"
@@ -140,33 +141,96 @@ jobs:
             LOG_PATHS="none"
           fi
 
+          read_summary_value() {
+            local key="$1"
+            local default="$2"
+            awk -F= -v key="$key" -v default="$default" '
+              $1 == key { print $2; found = 1; exit }
+              END { if (!found) print default }
+            ' "$LATEST_SUMMARY"
+          }
+
           if [[ -n "$LATEST_SUMMARY" && -f "$LATEST_SUMMARY" ]]; then
+            PASSED="$(read_summary_value TIDEFS_FSYNC_PASSED 0)"
+            FAILED="$(read_summary_value TIDEFS_FSYNC_FAILED 0)"
+            BLOCKED="$(read_summary_value TIDEFS_FSYNC_BLOCKED 0)"
+            STATUS="$(read_summary_value TIDEFS_FSYNC_STATUS UNKNOWN)"
+
+            [[ "$PASSED" =~ ^[0-9]+$ ]] || PASSED=0
+            [[ "$FAILED" =~ ^[0-9]+$ ]] || FAILED=0
+            [[ "$BLOCKED" =~ ^[0-9]+$ ]] || BLOCKED=0
+
+            if [[ "$FAILED" -gt 0 || "$STATUS" == "FAIL" ]]; then
+              STATUS_LABEL="fail"
+              OUTCOME="product-fail"
+            elif [[ "$BLOCKED" -gt 0 || "$STATUS" == "BLOCKED" ]]; then
+              STATUS_LABEL="blocked"
+              OUTCOME="environment-refusal"
+            elif [[ "$PASSED" -gt 0 || "$STATUS" == "PASS" ]]; then
+              STATUS_LABEL="pass"
+              OUTCOME="pass"
+            else
+              STATUS_LABEL="no-result"
+              OUTCOME="harness-fail"
+            fi
+
             ARTIFACT_PATH="$(realpath --relative-to="$SUMMARY_DIR" "$LATEST_SUMMARY" 2>/dev/null || echo summary.env)"
-            DIGEST="$(nix shell nixpkgs#b3sum --command b3sum "$LATEST_SUMMARY" | awk '{print $1}')"
-            CONTENT_DIGEST="blake3:${DIGEST}"
+            PRIMARY_PATH="$LATEST_SUMMARY"
           else
+            PASSED=0
+            FAILED=0
+            BLOCKED=0
+            STATUS_LABEL="no-summary"
+            OUTCOME="harness-fail"
             ARTIFACT_PATH="summary.env.missing"
-            CONTENT_DIGEST="blake3:0000000000000000000000000000000000000000000000000000000000000000"
+            PRIMARY_PATH="$SUMMARY_DIR/$ARTIFACT_PATH"
+            {
+              printf 'status=missing-summary\n'
+              printf 'workflow=%s\n' "${{ github.workflow }}"
+              printf 'run_id=%s\n' "$RUN_ID"
+              printf 'source_ref=%s\n' "$SOURCE_REF"
+            } > "$PRIMARY_PATH"
             echo "## Evidence manifest: no summary.env found" >> "$GITHUB_STEP_SUMMARY"
           fi
 
-          SCOPE="${SCOPE_BASE} source=qemu-smoke (claims-gate authority is standalone kernel-fsync-validation workflow) run=${RUN_ID} ref=${SOURCE_REF} summary_path=${ARTIFACT_PATH} log_paths=${LOG_PATHS}"
+          DIGEST="$(nix shell nixpkgs#b3sum --command b3sum "$PRIMARY_PATH" | awk '{print $1}')"
+          CONTENT_DIGEST="blake3:${DIGEST}"
+          RESIDUAL_RISK="QEMU Smoke kernel-fsync output is diagnostic; the standalone kernel-fsync-validation workflow remains the claims-gate authority, and this artifact does not broaden runtime coverage by itself."
+          SCOPE="${SCOPE_BASE} source=qemu-smoke (claims-gate authority is standalone kernel-fsync-validation workflow) status=${STATUS_LABEL} passed=${PASSED} failed=${FAILED} blocked=${BLOCKED} run=${RUN_ID} ref=${SOURCE_REF} summary_path=${ARTIFACT_PATH} log_paths=${LOG_PATHS}"
 
-          cat > "$MANIFEST_PATH" << MANIFESTEOF
-          {
-            "manifest_version": 1,
-            "claim_id": "${CLAIM_ID}",
-            "evidence_class": "${EVIDENCE_CLASS}",
-            "validation_tier": "full-kernel-no-daemon",
-            "source": "${SOURCE_LABEL}",
-            "scope": "${SCOPE}",
-            "artifact_path": "${ARTIFACT_PATH}",
-            "content_digest": "${CONTENT_DIGEST}",
-            "generated_at": "${GENERATED_AT}"
-          }
-          MANIFESTEOF
+          jq -n \
+            --arg claim_id "$CLAIM_ID" \
+            --arg evidence_class "$EVIDENCE_CLASS" \
+            --arg validation_tier "full-kernel-no-daemon" \
+            --arg scope "$SCOPE" \
+            --arg artifact_path "$ARTIFACT_PATH" \
+            --arg content_digest "$CONTENT_DIGEST" \
+            --arg run_id "$RUN_ID" \
+            --arg source_ref "$SOURCE_REF" \
+            --arg outcome "$OUTCOME" \
+            --arg residual_risk "$RESIDUAL_RISK" \
+            --arg source "$SOURCE_LABEL" \
+            --arg generated_at "$GENERATED_AT" \
+            '{
+              manifest_version: 2,
+              claim_id: $claim_id,
+              evidence_class: $evidence_class,
+              validation_tier: $validation_tier,
+              scope: $scope,
+              artifact_path: $artifact_path,
+              content_digest: $content_digest,
+              run_id: $run_id,
+              source_ref: $source_ref,
+              outcome: $outcome,
+              residual_risk: $residual_risk,
+              source: $source,
+              generated_at: $generated_at,
+              blocking_issues: []
+            }' > "$MANIFEST_PATH"
 
-          echo "## Evidence manifest written (qemu-smoke, claims-gate authority is standalone workflow)" >> "$GITHUB_STEP_SUMMARY"
+          nix develop .#ci --command cargo run --locked -p tidefs-xtask -- validate-evidence-manifest "$MANIFEST_PATH"
+
+          echo "## Evidence manifest written and validated (qemu-smoke, claims-gate authority is standalone workflow)" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo '```json' >> "$GITHUB_STEP_SUMMARY"
           cat "$MANIFEST_PATH" >> "$GITHUB_STEP_SUMMARY"
