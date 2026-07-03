@@ -10039,18 +10039,21 @@ impl tidefs_reclaim::SegmentFreer for LocalObjectStore {
     fn free_segment(&mut self, segment_id: u64) -> std::result::Result<(), Self::Error> {
         self.free_map.add_free(segment_id)?;
         self.free_segment_counter.freed();
-        // Issue TRIM/DISCARD for the freed segment's backing file so the
-        // underlying storage knows the space is available.  Best-effort.
-        self.discard_segment_file(segment_id);
+        // Capacity-only sparse-file hint. This must not be reported as
+        // discard, secure erase, sanitization, or remanence evidence.
+        self.release_segment_file_capacity_best_effort(segment_id);
         Ok(())
     }
 }
 
 impl LocalObjectStore {
-    /// Punch a hole in a freed segment's backing file via fallocate(1).
-    /// Best-effort: silently skips if the segment file doesn't exist or
-    /// the fallocate utility is unavailable.
-    fn discard_segment_file(&self, segment_id: u64) {
+    /// Best-effort sparse-file capacity release for a freed segment file.
+    ///
+    /// This is only a local space-reclamation hint. It does not prove discard
+    /// acceptance, secure erase, sanitization, decommissioning, or any media
+    /// remanence outcome, and failures are intentionally ignored so capacity
+    /// accounting remains driven by the committed free map.
+    fn release_segment_file_capacity_best_effort(&self, segment_id: u64) {
         let max_segment = self.max_segment_bytes();
         if max_segment == 0 {
             return;
@@ -10194,11 +10197,22 @@ mod segment_cleaner_integration_tests {
         store.put(key, &[0xCC; 1024]).expect("put");
         store.sync_all().expect("sync");
 
+        let free_before = store.free_segment_count();
         let result = tidefs_segment_cleaner::SegmentStore::free_segment(&mut store, 0);
         assert!(result.is_ok(), "add_free must be idempotent");
+        assert_eq!(
+            store.free_segment_count(),
+            free_before + 1,
+            "segment free records capacity reclaim without remanence evidence"
+        );
 
         let result2 = tidefs_segment_cleaner::SegmentStore::free_segment(&mut store, 999);
         assert!(result2.is_ok());
+        assert_eq!(
+            store.free_segment_count(),
+            free_before + 2,
+            "best-effort sparse deallocation must not block capacity accounting"
+        );
     }
 
     // ── compact_segment ────────────────────────────────────────
