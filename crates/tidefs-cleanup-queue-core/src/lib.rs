@@ -5,14 +5,12 @@
 
 //! The GC pipeline cleanup-queue ledger is in [`ledger`].
 //!
-//! Phase 6 of deferred cleanup ([#2079]):
-//! persist the cleanup queue B+tree to disk with TXG-atomic commits,
-//! so that enqueued work items survive crashes.
+//! Persists the cleanup queue B+tree to disk with TXG-atomic commits so
+//! enqueued work items survive crashes.
 //!
-//! Uses the generic [`tidefs_btree::BPlusTree`] as the in-memory index
-//! and serializes its entries as a named page through [`tidefs_commit_group::CommitGroupStore`].
-//!
-//! [#2079]: https://forgejo/forgeadmin/tidefs/issues/2079
+//! Uses the generic [`tidefs_btree::BPlusTree`] as the in-memory index and
+//! serializes its entries as a named page through
+//! [`tidefs_commit_group::CommitGroupStore`].
 
 use std::fmt;
 

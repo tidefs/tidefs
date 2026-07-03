@@ -4,23 +4,14 @@
 
 //! Authority type definitions for the per-dataset lifecycle state machine.
 //!
-//! Implements the ACTIVE/DESTROYING/TOMBSTONE state machine from
-//! the canonical design spec at
-//! [`docs/design/dataset-lifecycle-state-machine.md`] (sealed via
-//! [#1938](http://172.16.106.12/forgejo/forgeadmin/tidefs/issues/1938))
-//! with mount-time gating, foundational poison types, pinned traversal
-//! root types for GC safety, and destroy job tracking types.
+//! Defines the source-owned ACTIVE/DESTROYING/TOMBSTONE state machine with
+//! mount-time gating, foundational poison types, pinned traversal root types
+//! for GC safety, and destroy job tracking types.
 //!
-//! This crate covers Phase 1 (types + mount gating + validation) of the
-//! design spec. Phases 3 (poison semantics in FUSE daemon),
-//! 4 (pinned roots GC integration), 5 (destroy worker block traversal),
-//! and 7 (cluster consensus integration) are deferred to wire-up
-//! issues. Phase 2 (runtime state machine) is implemented in
-//! `tidefs-dataset-lifecycle`. Phase 6 (tombstone reaper) is implemented
-//! in #1461.
-//!
-//! [`docs/design/dataset-lifecycle-state-machine.md`]:
-//!     https://forgejo/forgeadmin/tidefs/docs/design/dataset-lifecycle-state-machine.md
+//! This crate owns the shared types, mount gating, and validation helpers.
+//! Runtime transitions are implemented in `tidefs-dataset-lifecycle`; broader
+//! destroy-worker, GC, and consensus behavior remains owned by the crates,
+//! validation, and live GitHub issues that implement those slices.
 
 use core::fmt;
 
