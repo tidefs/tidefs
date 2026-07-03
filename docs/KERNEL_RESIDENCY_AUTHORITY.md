@@ -79,22 +79,33 @@ This decision reviewed the evidence named by issue #1288:
   `docs/PAGE_CACHE_INVALIDATION_AUTHORITY.md`, which own TFR-008 dirty data,
   writeback, mmap, and invalidation boundaries that kernel residency must
   consume rather than redefine.
-- `crates/tidefs-kmod-posix-vfs/README.md` and
-  `crates/tidefs-block-kmod/README.md`, including mount tiers, daemon
-  independence, fixed-table bring-up, xfstests caveats, block-kmod QEMU
+- POSIX VFS source under `crates/tidefs-kmod-posix-vfs/src/` and
+  `crates/tidefs-block-kmod/README.md`, including mounted bring-up behavior,
+  daemon independence, fixed-table bring-up, xfstests caveats, block-kmod QEMU
   evidence requirements, and block-kmod production-backend refusal.
-- `validation/claims.toml` and `docs/CLAIM_REGISTRY.md`, especially the
-  blocked `kernel.teardown.no_work_after.v1` and
-  `local.vfs.page_cache_writeback_authority.v1` claim rows.
+- `validation/claims.toml`, `docs/CLAIM_REGISTRY.md`, and
+  `docs/GITHUB_CI.md`, especially the blocked
+  `kernel.teardown.no_work_after.v1` and
+  `local.vfs.page_cache_writeback_authority.v1` claim rows plus the workflow
+  boundary that routes T5/T6 kernel evidence through self-hosted validation.
 - Live issue #1186 and PR #1463, which closed on 2026-06-27 with accepted T5
   mounted-kernel-vfs cutover/teardown evidence and no T6 claim-registry
   upgrade.
 - Live issue #825 and PR #1189, which closed on 2026-06-23 by establishing
   `tidefs-kernel-cutover-runtime` as current source/model authority and
   leaving mounted runtime evidence to #1186.
-- `docs/VFS_BLOCK_INTEGRATION_KERNEL_UAPI_LAW_P7-04.md` was referenced by the
-  kernel architecture and rollout docs but is absent in this checkout. This
-  decision therefore does not derive a new VFS/block UAPI law from that file.
+- Live issue #1739 remains the umbrella gap for production kernel residency,
+  full-kernel/no-daemon operation, mounted-kernel parity, and kernel-mode
+  successor wording. It is not implementation authority and keeps those product
+  claims blocked until child evidence lands.
+- Live issue #1797 owns the T6 full-kernel/no-daemon teardown and recovery
+  artifact. Current T5 evidence does not satisfy that row, does not update the
+  claim registry, and does not prove full-kernel/no-daemon behavior.
+- `docs/VFS_BLOCK_INTEGRATION_KERNEL_UAPI_LAW_P7-04.md` is a deleted or absent
+  lineage reference, not an authority input. Any architecture or rollout text
+  that historically referenced it fails closed here: this decision derives no
+  VFS/block UAPI law, production kernel-residency claim, kernelspace-ready
+  claim, or T5/T6 upgrade from that file.
 
 ## Alternatives Considered
 
