@@ -49,6 +49,21 @@ pub mod page_flags {
     pub const LOCKED: u8 = 1 << 2;
     /// Page is pinned (cannot be evicted).
     pub const PINNED: u8 = 1 << 3;
+    /// Page carries a retained writeback error and must not be reported clean.
+    pub const WRITEBACK_ERROR: u8 = 1 << 4;
+}
+
+/// Observable local lifecycle state for a cached page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PageLifecycleState {
+    /// Page has no dirty, writeback-pending, pinned, or retained-error state.
+    Clean,
+    /// Page is dirty and not currently in writeback.
+    Dirty,
+    /// Page is sealed into an active writeback batch.
+    WritebackPending,
+    /// Page retained a writeback error and remains non-clean until retry success.
+    ErrorPoisoned,
 }
 
 // ---------------------------------------------------------------------------
@@ -102,10 +117,36 @@ impl Page {
         self.flags & page_flags::PINNED != 0
     }
 
-    /// Returns `true` if the page is clean (no dirty, writeback, or pin).
+    /// Returns `true` if a previous writeback error is retained on this page.
+    #[must_use]
+    pub fn has_writeback_error(&self) -> bool {
+        self.flags & page_flags::WRITEBACK_ERROR != 0
+    }
+
+    /// Returns `true` if the page is poisoned by a retained writeback error.
+    #[must_use]
+    pub fn is_poisoned(&self) -> bool {
+        self.has_writeback_error()
+    }
+
+    /// Returns `true` if the page carries no lifecycle or access flags.
     #[must_use]
     pub fn is_clean(&self) -> bool {
         self.flags == page_flags::CLEAN
+    }
+
+    /// Return the reconciled lifecycle state for this page.
+    #[must_use]
+    pub fn lifecycle_state(&self) -> PageLifecycleState {
+        if self.is_writeback() {
+            PageLifecycleState::WritebackPending
+        } else if self.has_writeback_error() {
+            PageLifecycleState::ErrorPoisoned
+        } else if self.is_dirty() {
+            PageLifecycleState::Dirty
+        } else {
+            PageLifecycleState::Clean
+        }
     }
 }
 
@@ -310,6 +351,52 @@ impl PageCacheInner {
         }
     }
 
+    fn reconcile_lifecycle_indexes(&mut self) {
+        let promote_to_dirty: Vec<u64> = self
+            .pages
+            .iter()
+            .filter_map(|(key, page)| {
+                let indexed_dirty = self
+                    .dirty_pages_by_inode
+                    .get(&key.inode)
+                    .is_some_and(|offsets| offsets.contains(&key.offset));
+                let must_be_dirty =
+                    indexed_dirty || page.is_writeback() || page.has_writeback_error();
+                (must_be_dirty && !page.is_dirty()).then_some(page.data.len() as u64)
+            })
+            .collect();
+        for size in promote_to_dirty {
+            let _ = self.transfer_page_budget(
+                Self::clean_page_category(),
+                Self::dirty_page_category(),
+                size,
+            );
+        }
+
+        let mut dirty_pages_by_inode: BTreeMap<u64, BTreeSet<u64>> = BTreeMap::new();
+        let mut writeback_count = 0u64;
+        for (key, page) in &mut self.pages {
+            let indexed_dirty = self
+                .dirty_pages_by_inode
+                .get(&key.inode)
+                .is_some_and(|offsets| offsets.contains(&key.offset));
+            if indexed_dirty || page.is_writeback() || page.has_writeback_error() {
+                page.flags |= page_flags::DIRTY;
+            }
+            if page.is_writeback() {
+                writeback_count = writeback_count.saturating_add(1);
+            }
+            if page.is_dirty() {
+                dirty_pages_by_inode
+                    .entry(key.inode)
+                    .or_default()
+                    .insert(key.offset);
+            }
+        }
+        self.dirty_pages_by_inode = dirty_pages_by_inode;
+        self.writeback_count = writeback_count;
+    }
+
     /// Insert a page, evicting one clean page if at capacity.
     /// Returns the evicted page, if any.
     fn insert_page(&mut self, key: PageKey, page: Page) -> Result<Option<Page>, InsertError> {
@@ -348,12 +435,12 @@ impl PageCacheInner {
     /// writeback lifecycle) before they become evictable.  This
     /// prevents silent data loss from automatic eviction.
     fn evict_one_inner(&mut self) -> Option<Page> {
+        self.reconcile_lifecycle_indexes();
         // Find the first eligible page from the LRU end.
-        let idx = self.lru_order.iter().position(|key| {
-            self.pages
-                .get(key)
-                .is_some_and(|p| !p.is_dirty() && !p.is_writeback() && !p.is_pinned())
-        })?;
+        let idx = self
+            .lru_order
+            .iter()
+            .position(|key| self.pages.get(key).is_some_and(Page::is_clean))?;
 
         let key = self.lru_order.remove(idx).unwrap();
         let removed = self.pages.remove(&key);
@@ -375,17 +462,16 @@ impl PageCacheInner {
         else {
             return false;
         };
-        if became_dirty {
-            if self
+        if became_dirty
+            && self
                 .transfer_page_budget(
                     Self::clean_page_category(),
                     Self::dirty_page_category(),
                     size,
                 )
                 .is_err()
-            {
-                return false;
-            }
+        {
+            return false;
         }
         if let Some(page) = self.pages.get_mut(key) {
             page.flags |= page_flags::DIRTY;
@@ -398,24 +484,31 @@ impl PageCacheInner {
 
     /// Clear the dirty flag on a page.  Returns false if the page does not exist.
     fn clear_dirty_inner(&mut self, key: &PageKey) -> bool {
-        let Some((was_dirty, size)) = self
-            .pages
-            .get(key)
-            .map(|page| (page.is_dirty(), page.data.len() as u64))
+        let Some((was_dirty, was_writeback, has_writeback_error, size)) =
+            self.pages.get(key).map(|page| {
+                (
+                    page.is_dirty(),
+                    page.is_writeback(),
+                    page.has_writeback_error(),
+                    page.data.len() as u64,
+                )
+            })
         else {
             return false;
         };
-        if was_dirty {
-            if self
+        if was_writeback || has_writeback_error {
+            return false;
+        }
+        if was_dirty
+            && self
                 .transfer_page_budget(
                     Self::dirty_page_category(),
                     Self::clean_page_category(),
                     size,
                 )
                 .is_err()
-            {
-                return false;
-            }
+        {
+            return false;
         }
         if let Some(page) = self.pages.get_mut(key) {
             page.flags &= !page_flags::DIRTY;
@@ -426,12 +519,15 @@ impl PageCacheInner {
         true
     }
 
-    /// Start writeback: pin the page and set the writeback flag.
-    /// Returns false if the page does not exist or is already in writeback.
+    /// Start writeback: pin a dirty page and set the writeback flag.
+    /// Returns false if the page does not exist, is clean, or is already in writeback.
     fn start_writeback_inner(&mut self, key: &PageKey) -> bool {
         if let Some(page) = self.pages.get_mut(key) {
             if page.flags & page_flags::WRITEBACK != 0 {
                 return false; // already in writeback
+            }
+            if page.flags & page_flags::DIRTY == 0 {
+                return false;
             }
             page.flags |= page_flags::WRITEBACK | page_flags::PINNED;
             self.writeback_count += 1;
@@ -445,15 +541,27 @@ impl PageCacheInner {
     /// Unpins regardless of success.  Returns false if the page does not exist.
     fn complete_writeback_inner(&mut self, key: &PageKey, success: bool) -> bool {
         let clear_dirty = if let Some(page) = self.pages.get_mut(key) {
+            if !page.is_writeback() {
+                return false;
+            }
             page.flags &= !page_flags::WRITEBACK;
             page.flags &= !page_flags::PINNED;
             self.writeback_count = self.writeback_count.saturating_sub(1);
-            success && page.is_dirty()
+            if success {
+                page.flags &= !page_flags::WRITEBACK_ERROR;
+                page.is_dirty()
+            } else {
+                page.flags |= page_flags::DIRTY | page_flags::WRITEBACK_ERROR;
+                true
+            }
         } else {
             return false;
         };
-        if clear_dirty && !self.clear_dirty_inner(key) {
+        if success && clear_dirty && !self.clear_dirty_inner(key) {
             return false;
+        }
+        if !success {
+            self.record_dirty_page(*key);
         }
         true
     }
@@ -461,18 +569,26 @@ impl PageCacheInner {
     /// Abort writeback: clear writeback flag and unpin, but preserve dirty.
     /// Returns false if the page does not exist.
     fn abort_writeback_inner(&mut self, key: &PageKey) -> bool {
-        if let Some(page) = self.pages.get_mut(key) {
+        let preserve_dirty = if let Some(page) = self.pages.get_mut(key) {
+            if !page.is_writeback() {
+                return false;
+            }
             page.flags &= !page_flags::WRITEBACK;
             self.writeback_count = self.writeback_count.saturating_sub(1);
             page.flags &= !page_flags::PINNED;
-            true
+            page.is_dirty()
         } else {
-            false
+            return false;
+        };
+        if preserve_dirty {
+            self.record_dirty_page(*key);
         }
+        true
     }
 
     /// Collect keys of all dirty pages.
-    fn dirty_page_keys(&self) -> Vec<PageKey> {
+    fn dirty_page_keys(&mut self) -> Vec<PageKey> {
+        self.reconcile_lifecycle_indexes();
         self.dirty_pages_by_inode
             .iter()
             .flat_map(|(inode, offsets)| {
@@ -491,7 +607,8 @@ impl PageCacheInner {
     }
 
     /// Collect keys of all dirty pages for a given inode.
-    fn dirty_page_keys_for_inode(&self, inode: u64) -> Vec<PageKey> {
+    fn dirty_page_keys_for_inode(&mut self, inode: u64) -> Vec<PageKey> {
+        self.reconcile_lifecycle_indexes();
         if self.dirty_page_count_for_inode(inode) == 0 {
             return Vec::new();
         }
@@ -513,7 +630,8 @@ impl PageCacheInner {
     }
 
     /// Return true when `inode` has at least one dirty page.
-    fn has_dirty_pages_for_inode(&self, inode: u64) -> bool {
+    fn has_dirty_pages_for_inode(&mut self, inode: u64) -> bool {
+        self.reconcile_lifecycle_indexes();
         if self.dirty_page_count_for_inode(inode) == 0 {
             return false;
         }
@@ -532,7 +650,8 @@ impl PageCacheInner {
 
     /// Collect keys of all dirty pages for a given inode whose byte range
     /// [offset, offset + page_size) overlaps with [start, end).
-    fn dirty_page_keys_in_range(&self, inode: u64, start: u64, end: u64) -> Vec<PageKey> {
+    fn dirty_page_keys_in_range(&mut self, inode: u64, start: u64, end: u64) -> Vec<PageKey> {
+        self.reconcile_lifecycle_indexes();
         if self.dirty_page_count_for_inode(inode) == 0 {
             return Vec::new();
         }
@@ -555,7 +674,8 @@ impl PageCacheInner {
 
     /// Return true when `inode` has at least one dirty page whose byte range
     /// [offset, offset + page_size) overlaps with [start, end).
-    fn has_dirty_pages_in_range(&self, inode: u64, start: u64, end: u64) -> bool {
+    fn has_dirty_pages_in_range(&mut self, inode: u64, start: u64, end: u64) -> bool {
+        self.reconcile_lifecycle_indexes();
         if start >= end || self.dirty_page_count_for_inode(inode) == 0 {
             return false;
         }
@@ -577,6 +697,7 @@ impl PageCacheInner {
 
     /// Clear dirty flag on all pages for a given inode. Returns count cleared.
     fn clear_dirty_for_inode(&mut self, inode: u64) -> usize {
+        self.reconcile_lifecycle_indexes();
         let dirty_count = self.dirty_page_count_for_inode(inode);
         if dirty_count == 0 {
             return 0;
@@ -604,17 +725,13 @@ impl PageCacheInner {
     ///
     /// Returns the count of pages removed.
     fn invalidate_range_inner(&mut self, inode: u64, start: u64, end: u64) -> usize {
+        self.reconcile_lifecycle_indexes();
         let page_size = self.page_size as u64;
         let keys_to_remove: Vec<PageKey> = self
             .pages
             .iter()
             .filter(|(k, p)| {
-                k.inode == inode
-                    && k.offset < end
-                    && k.offset + page_size > start
-                    && !p.is_dirty()
-                    && !p.is_writeback()
-                    && !p.is_pinned()
+                k.inode == inode && k.offset < end && k.offset + page_size > start && p.is_clean()
             })
             .map(|(k, _)| *k)
             .collect();
@@ -638,12 +755,14 @@ impl PageCacheInner {
     }
 
     /// Number of pages currently in the writeback state.
-    fn writeback_queue_len(&self) -> usize {
+    fn writeback_queue_len(&mut self) -> usize {
+        self.reconcile_lifecycle_indexes();
         self.writeback_count as usize
     }
 
     /// Collect keys of all pages currently in the writeback state.
-    fn writeback_queue_keys(&self) -> Vec<PageKey> {
+    fn writeback_queue_keys(&mut self) -> Vec<PageKey> {
+        self.reconcile_lifecycle_indexes();
         self.pages
             .iter()
             .filter(|(_, p)| p.is_writeback())
@@ -720,10 +839,11 @@ impl PageCacheInner {
     /// Invalidate all clean, unpinned, non-writeback pages across the
     /// entire cache.  Returns the count of pages removed.
     fn invalidate_all_clean_inner(&mut self) -> usize {
+        self.reconcile_lifecycle_indexes();
         let keys: Vec<PageKey> = self
             .pages
             .iter()
-            .filter(|(_, p)| !p.is_dirty() && !p.is_writeback() && !p.is_pinned())
+            .filter(|(_, p)| p.is_clean())
             .map(|(k, _)| *k)
             .collect();
         let count = keys.len();
@@ -820,6 +940,24 @@ impl<'a> PageHandle<'a> {
             .is_some_and(|p| p.is_pinned())
     }
 
+    /// Returns `true` if this page carries a retained writeback error.
+    #[must_use]
+    pub fn has_writeback_error(&self) -> bool {
+        self.guard
+            .pages
+            .get(&self.key)
+            .is_some_and(|p| p.has_writeback_error())
+    }
+
+    /// Return the reconciled lifecycle state for this page.
+    #[must_use]
+    pub fn lifecycle_state(&self) -> PageLifecycleState {
+        self.guard
+            .pages
+            .get(&self.key)
+            .map_or(PageLifecycleState::Clean, Page::lifecycle_state)
+    }
+
     /// Returns the raw flags byte.
     #[must_use]
     pub fn flags(&self) -> u8 {
@@ -842,16 +980,8 @@ impl<'a> PageHandle<'a> {
     /// Returns `true` if the transition succeeded, `false` if already
     /// in writeback.
     pub fn start_writeback(&mut self) -> bool {
-        if let Some(page) = self.guard.pages.get_mut(&self.key) {
-            if page.flags & page_flags::WRITEBACK != 0 {
-                return false;
-            }
-            page.flags |= page_flags::WRITEBACK | page_flags::PINNED;
-            self.guard.writeback_count += 1;
-            true
-        } else {
-            false
-        }
+        let key = self.key;
+        self.guard.start_writeback_inner(&key)
     }
 
     /// Complete writeback.  If `success`, the page is marked clean.
@@ -864,10 +994,8 @@ impl<'a> PageHandle<'a> {
     /// Abort writeback: clear writeback flag and unpin, but leave the
     /// dirty flag intact.
     pub fn abort_writeback(&mut self) {
-        if let Some(page) = self.guard.pages.get_mut(&self.key) {
-            page.flags &= !(page_flags::WRITEBACK | page_flags::PINNED);
-            self.guard.writeback_count = self.guard.writeback_count.saturating_sub(1);
-        }
+        let key = self.key;
+        self.guard.abort_writeback_inner(&key);
     }
 }
 
@@ -1126,9 +1254,9 @@ impl PageCache {
 
     // ── Writeback coordination (convenience, lock-acquiring) ────────
 
-    /// Start writeback on the page at `(inode, offset)`: pin and set
-    /// writeback flag.  Returns `true` on success, `false` if the page
-    /// does not exist or is already in writeback.
+    /// Start writeback on the page at `(inode, offset)`: pin a dirty page and
+    /// set its writeback flag. Returns `true` on success, `false` if the page
+    /// does not exist, is clean, or is already in writeback.
     pub fn start_writeback(&self, inode: u64, offset: u64) -> bool {
         let key = PageKey { inode, offset };
         self.inner.lock().unwrap().start_writeback_inner(&key)
@@ -1234,13 +1362,11 @@ impl PageCache {
             return Ok(());
         }
 
-        // Start writeback on all matching pages.
-        for key in &keys {
-            self.start_writeback(key.inode, key.offset);
-        }
-
         let mut first_error: Option<PageFlushError> = None;
         for key in &keys {
+            if !self.start_writeback(key.inode, key.offset) {
+                continue;
+            }
             if let Some(page_handle) = self.lookup(key.inode, key.offset) {
                 let data = page_handle.data().to_vec();
                 drop(page_handle);
@@ -2196,6 +2322,11 @@ mod tests {
         // First page clean, second and third remain dirty
         let dirty = cache.dirty_pages_for_inode(1);
         assert_eq!(dirty.len(), 2);
+        assert_eq!(
+            cache.writeback_queue_size(),
+            0,
+            "failed range flush must not leave unattempted pages pending"
+        );
     }
 
     #[test]
@@ -2421,7 +2552,8 @@ mod tests {
         cache.insert(2, 0).unwrap();
 
         // Start writeback on page 1 (pins it)
-        cache.start_writeback(1, 0);
+        cache.mark_dirty(1, 0);
+        assert!(cache.start_writeback(1, 0));
 
         // Insert page 3: page 2 is clean and evictable, page 1 is pinned
         cache.insert(3, 0).unwrap();
@@ -2529,7 +2661,8 @@ mod tests {
         let cache = new_cache(10);
         cache.insert(1, 0).unwrap();
         cache.insert(1, 4096).unwrap();
-        cache.start_writeback(1, 4096); // pins + sets writeback
+        cache.mark_dirty(1, 4096);
+        assert!(cache.start_writeback(1, 4096)); // pins + sets writeback
 
         let removed = cache.invalidate_range(1, 0, 8192);
         assert_eq!(removed, 1, "only clean page at offset 0 should be removed");
@@ -2741,6 +2874,79 @@ mod tests {
             assert!(!h.is_dirty());
             assert!(!h.is_writeback());
         }
+    }
+
+    #[test]
+    fn lifecycle_reconcile_restores_missing_dirty_index() {
+        let cache = new_cache(10);
+        cache.insert(1, 0).unwrap();
+        cache.mark_dirty(1, 0);
+        {
+            let mut inner = cache.inner.lock().unwrap();
+            inner.dirty_pages_by_inode.clear();
+        }
+
+        assert_eq!(
+            cache.dirty_pages_for_inode(1),
+            vec![PageKey {
+                inode: 1,
+                offset: 0
+            }]
+        );
+        let h = cache.lookup(1, 0).unwrap();
+        assert_eq!(h.lifecycle_state(), PageLifecycleState::Dirty);
+    }
+
+    #[test]
+    fn lifecycle_reconcile_preserves_stale_dirty_index_before_evict_or_invalidate() {
+        let governor = data_dirty_governor();
+        let cache = PageCache::with_governor(3, PAGE_SIZE, governor.clone());
+        cache.insert(2, 0).unwrap();
+        cache.insert(1, 0).unwrap();
+        cache.insert(1, 4096).unwrap();
+        {
+            let mut inner = cache.inner.lock().unwrap();
+            inner.dirty_pages_by_inode.entry(1).or_default().insert(0);
+            assert!(inner
+                .pages
+                .get(&PageKey {
+                    inode: 1,
+                    offset: 0
+                })
+                .unwrap()
+                .is_clean());
+        }
+
+        let evicted = cache.evict_one().expect("clean page remains evictable");
+        assert_eq!(
+            evicted.key,
+            PageKey {
+                inode: 2,
+                offset: 0
+            },
+            "dirty-index evidence must make the older indexed page non-evictable"
+        );
+        assert_eq!(
+            cache.dirty_pages_for_inode(1),
+            vec![PageKey {
+                inode: 1,
+                offset: 0
+            }],
+            "reconciliation promotes stale dirty-index evidence to page flags"
+        );
+        assert_eq!(
+            governor.category_used(BudgetCategory::DirtyBytes),
+            PAGE_SIZE as u64,
+            "reconciliation moves promoted pages into dirty budget"
+        );
+
+        let removed = cache.invalidate_range(1, 0, 8192);
+        assert_eq!(
+            removed, 1,
+            "only the truly clean sibling can be invalidated"
+        );
+        assert!(cache.lookup(1, 0).is_some());
+        assert!(cache.lookup(1, 4096).is_none());
     }
 
     #[test]

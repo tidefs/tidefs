@@ -30,6 +30,15 @@ use tidefs_types_vfs_core::InodeId;
 
 use crate::constants::DEFAULT_FILESYSTEM_CONTENT_CHUNK_SIZE;
 
+/// Reconciled local lifecycle for a cached page shadow entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PageLifecycleState {
+    Clean,
+    Dirty,
+    WritebackPending,
+    ErrorPoisoned,
+}
+
 /// Default page cache high watermark: 256 MiB.
 pub const DEFAULT_PAGE_CACHE_HIGH_WATERMARK_BYTES: u64 = 256 * 1024 * 1024;
 /// Default page cache low watermark: 128 MiB.
@@ -87,6 +96,7 @@ pub struct DirtyPageTracker {
     dirty_pages: BTreeSet<PageKey>,
     /// Per-inode count of dirty pages for quick queries.
     per_inode_dirty_count: BTreeMap<InodeId, usize>,
+    page_lifecycle: BTreeMap<PageKey, PageLifecycleState>,
 }
 
 impl DirtyPageTracker {
@@ -95,24 +105,56 @@ impl DirtyPageTracker {
     }
 
     pub fn mark_dirty(&mut self, key: PageKey) {
-        if self.dirty_pages.insert(key) {
-            *self.per_inode_dirty_count.entry(key.inode_id).or_insert(0) += 1;
-        }
+        self.set_lifecycle(key, PageLifecycleState::Dirty);
+    }
+
+    pub fn mark_writeback_pending(&mut self, key: PageKey) {
+        self.set_lifecycle(key, PageLifecycleState::WritebackPending);
+    }
+
+    pub fn mark_error_poisoned(&mut self, key: PageKey) {
+        self.set_lifecycle(key, PageLifecycleState::ErrorPoisoned);
     }
 
     pub fn mark_clean(&mut self, key: PageKey) {
-        if self.dirty_pages.remove(&key) {
-            if let Some(count) = self.per_inode_dirty_count.get_mut(&key.inode_id) {
-                *count = count.saturating_sub(1);
-                if *count == 0 {
-                    self.per_inode_dirty_count.remove(&key.inode_id);
+        self.set_lifecycle(key, PageLifecycleState::Clean);
+    }
+
+    fn set_lifecycle(&mut self, key: PageKey, lifecycle: PageLifecycleState) {
+        let was_non_clean = self.dirty_pages.contains(&key);
+        let is_non_clean = lifecycle != PageLifecycleState::Clean;
+        match (was_non_clean, is_non_clean) {
+            (false, true) => {
+                self.dirty_pages.insert(key);
+                *self.per_inode_dirty_count.entry(key.inode_id).or_insert(0) += 1;
+            }
+            (true, false) => {
+                self.dirty_pages.remove(&key);
+                if let Some(count) = self.per_inode_dirty_count.get_mut(&key.inode_id) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        self.per_inode_dirty_count.remove(&key.inode_id);
+                    }
                 }
             }
+            _ => {}
+        }
+        if is_non_clean {
+            self.page_lifecycle.insert(key, lifecycle);
+        } else {
+            self.page_lifecycle.remove(&key);
         }
     }
 
     pub fn is_dirty(&self, key: &PageKey) -> bool {
         self.dirty_pages.contains(key)
+    }
+
+    pub fn lifecycle_state(&self, key: &PageKey) -> PageLifecycleState {
+        self.page_lifecycle
+            .get(key)
+            .copied()
+            .unwrap_or(PageLifecycleState::Clean)
     }
 
     pub fn dirty_page_count(&self) -> usize {
@@ -149,6 +191,7 @@ impl DirtyPageTracker {
             .collect();
         for key in keys {
             self.dirty_pages.remove(&key);
+            self.page_lifecycle.remove(&key);
         }
         self.per_inode_dirty_count.remove(&inode_id);
     }
@@ -316,10 +359,48 @@ impl PageCache {
         count
     }
 
+    /// Invalidate clean pages while reconciling against the page-level dirty
+    /// lifecycle shadow used by reclaim/writeback scheduling.
+    pub fn invalidate_range_reconciled(
+        &mut self,
+        dirty_tracker: &DirtyPageTracker,
+        inode_id: InodeId,
+        start_byte: u64,
+        end_byte: u64,
+    ) -> usize {
+        let keys_to_remove: Vec<PageKey> = self
+            .pages
+            .iter()
+            .filter(|(k, p)| {
+                k.inode_id == inode_id
+                    && k.page_offset < end_byte
+                    && k.page_offset + self.page_size > start_byte
+                    && !p.dirty
+                    && !dirty_tracker.is_dirty(k)
+            })
+            .map(|(k, _)| *k)
+            .collect();
+        let count = keys_to_remove.len();
+        for key in &keys_to_remove {
+            self.remove(key);
+        }
+        count
+    }
+
     /// Invalidate all clean pages for an inode (entire file).
     /// Convenience wrapper around [`invalidate_range`] with [0, u64::MAX).
     pub fn invalidate_inode(&mut self, inode_id: InodeId) -> usize {
         self.invalidate_range(inode_id, 0, u64::MAX)
+    }
+
+    /// Invalidate all clean pages for an inode after reconciling the dirty
+    /// lifecycle shadow.
+    pub fn invalidate_inode_reconciled(
+        &mut self,
+        dirty_tracker: &DirtyPageTracker,
+        inode_id: InodeId,
+    ) -> usize {
+        self.invalidate_range_reconciled(dirty_tracker, inode_id, 0, u64::MAX)
     }
 
     /// Iterate LRU pages for an inode (oldest first) for eviction scanning.
@@ -403,8 +484,10 @@ mod tests {
         let mut dt = DirtyPageTracker::new();
         let k = key(1, 0);
         assert!(!dt.is_dirty(&k));
+        assert_eq!(dt.lifecycle_state(&k), PageLifecycleState::Clean);
         dt.mark_dirty(k);
         assert!(dt.is_dirty(&k));
+        assert_eq!(dt.lifecycle_state(&k), PageLifecycleState::Dirty);
         assert_eq!(dt.dirty_page_count(), 1);
         assert_eq!(dt.per_inode_dirty_count(InodeId::new(1)), 1);
     }
@@ -416,8 +499,36 @@ mod tests {
         dt.mark_dirty(k);
         dt.mark_clean(k);
         assert!(!dt.is_dirty(&k));
+        assert_eq!(dt.lifecycle_state(&k), PageLifecycleState::Clean);
         assert_eq!(dt.dirty_page_count(), 0);
         assert_eq!(dt.per_inode_dirty_count(InodeId::new(1)), 0);
+    }
+
+    #[test]
+    fn dirty_page_tracker_counts_pending_and_error_as_non_clean() {
+        let mut dt = DirtyPageTracker::new();
+        let pending = key(1, 0);
+        let poisoned = key(1, 4096);
+
+        dt.mark_writeback_pending(pending);
+        dt.mark_error_poisoned(poisoned);
+
+        assert!(dt.is_dirty(&pending));
+        assert!(dt.is_dirty(&poisoned));
+        assert_eq!(
+            dt.lifecycle_state(&pending),
+            PageLifecycleState::WritebackPending
+        );
+        assert_eq!(
+            dt.lifecycle_state(&poisoned),
+            PageLifecycleState::ErrorPoisoned
+        );
+        assert_eq!(dt.dirty_page_count(), 2);
+        assert_eq!(dt.per_inode_dirty_count(InodeId::new(1)), 2);
+
+        dt.mark_clean(pending);
+        assert!(!dt.is_dirty(&pending));
+        assert_eq!(dt.per_inode_dirty_count(InodeId::new(1)), 1);
     }
 
     #[test]
@@ -479,6 +590,24 @@ mod tests {
         assert_eq!(removed, 1, "only clean page should be removed");
         assert!(cache.get(&key(1, 0)).is_none(), "clean page removed");
         assert!(cache.get(&key(1, 4096)).is_some(), "dirty page preserved");
+    }
+
+    #[test]
+    fn reconciled_invalidation_preserves_shadow_pending_and_error_pages() {
+        let mut cache = PageCache::new(4096);
+        let mut tracker = DirtyPageTracker::new();
+        cache.insert(key(1, 0), page(b"clean"));
+        cache.insert(key(1, 4096), page(b"pending"));
+        cache.insert(key(1, 8192), page(b"poison"));
+
+        tracker.mark_writeback_pending(key(1, 4096));
+        tracker.mark_error_poisoned(key(1, 8192));
+
+        let removed = cache.invalidate_range_reconciled(&tracker, InodeId::new(1), 0, 12288);
+        assert_eq!(removed, 1, "only the clean page should be removed");
+        assert!(cache.get(&key(1, 0)).is_none());
+        assert!(cache.get(&key(1, 4096)).is_some());
+        assert!(cache.get(&key(1, 8192)).is_some());
     }
 
     #[test]

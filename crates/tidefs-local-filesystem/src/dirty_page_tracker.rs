@@ -21,17 +21,33 @@ use std::collections::BTreeMap;
 use std::time::Instant;
 use tidefs_types_vfs_core::InodeId;
 
+/// Reconciled local lifecycle for a dirty byte range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DirtyLifecycleState {
+    /// Range has accepted bytes that still need writeback.
+    Dirty,
+    /// Range is sealed into a writeback attempt and remains non-clean.
+    WritebackPending,
+    /// Range retained a writeback/readback error and remains non-clean.
+    ErrorPoisoned,
+}
+
 /// A contiguous byte range [offset, offset+length) that is dirty.
 #[derive(Clone, Debug)]
 pub struct DirtyRange {
     pub offset: u64,
     pub length: u64,
     pub dirty_since: Instant,
+    pub lifecycle: DirtyLifecycleState,
+    pub writeback_error: Option<String>,
 }
 
 impl PartialEq for DirtyRange {
     fn eq(&self, other: &Self) -> bool {
-        self.offset == other.offset && self.length == other.length
+        self.offset == other.offset
+            && self.length == other.length
+            && self.lifecycle == other.lifecycle
+            && self.writeback_error == other.writeback_error
     }
 }
 impl Eq for DirtyRange {}
@@ -42,6 +58,8 @@ impl DirtyRange {
             offset,
             length,
             dirty_since: Instant::now(),
+            lifecycle: DirtyLifecycleState::Dirty,
+            writeback_error: None,
         }
     }
 
@@ -58,6 +76,34 @@ impl DirtyRange {
         self.dirty_since.elapsed() >= threshold
     }
 
+    pub fn lifecycle_state(&self) -> DirtyLifecycleState {
+        self.lifecycle
+    }
+
+    pub fn writeback_error(&self) -> Option<&str> {
+        self.writeback_error.as_deref()
+    }
+
+    fn with_lifecycle(
+        offset: u64,
+        length: u64,
+        dirty_since: Instant,
+        lifecycle: DirtyLifecycleState,
+        writeback_error: Option<String>,
+    ) -> Self {
+        Self {
+            offset,
+            length,
+            dirty_since,
+            lifecycle,
+            writeback_error,
+        }
+    }
+
+    fn merge_compatible(&self, other: &DirtyRange) -> bool {
+        self.lifecycle == other.lifecycle && self.writeback_error == other.writeback_error
+    }
+
     fn merge(&self, other: &DirtyRange) -> DirtyRange {
         let start = self.offset.min(other.offset);
         let end = self.end().max(other.end());
@@ -65,6 +111,8 @@ impl DirtyRange {
             offset: start,
             length: end.saturating_sub(start),
             dirty_since: self.dirty_since.min(other.dirty_since),
+            lifecycle: self.lifecycle,
+            writeback_error: self.writeback_error.clone(),
         }
     }
 }
@@ -102,12 +150,14 @@ impl DirtyPageTracker {
     /// Overlapping and adjacent ranges are coalesced so that the flush
     /// path sees the minimum number of contiguous regions.
     pub fn mark_dirty(&mut self, inode: InodeId, offset: u64, length: u64) {
-        if length == 0 {
-            return;
-        }
-        let range = DirtyRange::new(offset, length);
-        let entry = self.ranges.entry(inode).or_default();
-        Self::insert_coalesced(entry, range);
+        self.replace_range(
+            inode,
+            offset,
+            length,
+            DirtyLifecycleState::Dirty,
+            None,
+            Instant::now(),
+        );
     }
 
     #[allow(dead_code)] // INTENT: dirty page tracker types for planned writeback scheduling
@@ -128,6 +178,60 @@ impl DirtyPageTracker {
     pub(crate) fn restore_ranges(&mut self, ranges: BTreeMap<InodeId, Vec<DirtyRange>>) {
         self.ranges = ranges;
     }
+
+    /// Mark a non-clean range as sealed into writeback.
+    pub fn start_writeback_range(&mut self, inode: InodeId, offset: u64, length: u64) -> bool {
+        if length == 0
+            || !self.overlaps_range(inode, offset, length)
+            || self.overlaps_lifecycle(inode, offset, length, DirtyLifecycleState::WritebackPending)
+        {
+            return false;
+        }
+        let dirty_since = self
+            .oldest_dirty_since_in_range(inode, offset, length)
+            .unwrap_or_else(Instant::now);
+        self.replace_range(
+            inode,
+            offset,
+            length,
+            DirtyLifecycleState::WritebackPending,
+            None,
+            dirty_since,
+        );
+        true
+    }
+
+    /// Complete writeback successfully and move the range to clean.
+    pub fn complete_writeback_success(
+        &mut self,
+        inode: InodeId,
+        offset: u64,
+        length: u64,
+    ) -> usize {
+        self.clear_lifecycle_range(inode, offset, length, DirtyLifecycleState::WritebackPending)
+    }
+
+    /// Retain a failed writeback range as poisoned dirty state.
+    pub fn record_writeback_error(
+        &mut self,
+        inode: InodeId,
+        offset: u64,
+        length: u64,
+        error: impl Into<String>,
+    ) {
+        let dirty_since = self
+            .oldest_dirty_since_in_range(inode, offset, length)
+            .unwrap_or_else(Instant::now);
+        self.replace_range(
+            inode,
+            offset,
+            length,
+            DirtyLifecycleState::ErrorPoisoned,
+            Some(error.into()),
+            dirty_since,
+        );
+    }
+
     /// Clear dirty tracking for bytes [offset, offset+length) within `inode`.
     /// Ranges that fall entirely outside the cleared span are kept; ranges that
     /// overlap are split or removed so that no dirty byte within
@@ -138,49 +242,42 @@ impl DirtyPageTracker {
             return 0;
         }
         let end = offset.saturating_add(length);
-        let entry = match self.ranges.get_mut(&inode) {
+        let ranges = match self.ranges.remove(&inode) {
             Some(v) => v,
             None => return 0,
         };
         let mut touched = 0usize;
-        let mut i = 0;
-        while i < entry.len() {
-            let r_off = entry[i].offset;
-            let r_end = entry[i].end();
+        let mut kept = Vec::with_capacity(ranges.len());
+        for range in ranges {
+            let r_off = range.offset;
+            let r_end = range.end();
             if r_end <= offset || r_off >= end {
-                // Range is entirely outside the cleared span.
-                i += 1;
+                kept.push(range);
                 continue;
             }
             touched += 1;
-            if r_off >= offset && r_end <= end {
-                // Range is entirely inside — remove it.
-                entry.remove(i);
-                continue; // don't advance i; removal shifts remaining left
-            }
-            if r_off < offset && r_end > end {
-                // Range spans the cleared range — split into left + right.
-                let right_off = end;
-                let right_len = r_end - end;
-                entry[i].length = offset - r_off; // left fragment
-                entry.insert(i + 1, DirtyRange::new(right_off, right_len));
-                i += 2;
-                continue;
-            }
             if r_off < offset {
-                // Left-edge overlap only — truncate right side.
-                entry[i].length = offset - r_off;
-            } else {
-                // Right-edge overlap only — truncate left side.
-                entry[i].offset = end;
-                entry[i].length = r_end - end;
+                kept.push(DirtyRange::with_lifecycle(
+                    r_off,
+                    offset - r_off,
+                    range.dirty_since,
+                    range.lifecycle,
+                    range.writeback_error.clone(),
+                ));
             }
-            i += 1;
+            if r_end > end {
+                kept.push(DirtyRange::with_lifecycle(
+                    end,
+                    r_end - end,
+                    range.dirty_since,
+                    range.lifecycle,
+                    range.writeback_error,
+                ));
+            }
         }
-        // Prune zero-length ranges that may result from edge cases.
-        entry.retain(|r| r.length > 0);
-        if entry.is_empty() {
-            self.ranges.remove(&inode);
+        if !kept.is_empty() {
+            kept.sort_by_key(|range| range.offset);
+            self.ranges.insert(inode, kept);
         }
         touched
     }
@@ -207,6 +304,26 @@ impl DirtyPageTracker {
             .is_some_and(|range| range.offset < end && offset < range.end())
     }
 
+    /// Check whether any tracked range with a specific lifecycle overlaps
+    /// `[offset, offset + length)`.
+    pub fn overlaps_lifecycle(
+        &self,
+        inode: InodeId,
+        offset: u64,
+        length: u64,
+        lifecycle: DirtyLifecycleState,
+    ) -> bool {
+        if length == 0 {
+            return false;
+        }
+        let end = offset.saturating_add(length);
+        self.ranges.get(&inode).is_some_and(|ranges| {
+            ranges.iter().any(|range| {
+                range.lifecycle == lifecycle && range.offset < end && offset < range.end()
+            })
+        })
+    }
+
     #[allow(dead_code)] // INTENT: dirty page tracker types for planned writeback scheduling
     /// Check whether `inode` has any dirty pages.
     pub fn is_dirty(&self, inode: InodeId) -> bool {
@@ -224,35 +341,124 @@ impl DirtyPageTracker {
     }
 
     pub fn collect_dirty_ranges(&mut self) -> Vec<(InodeId, Vec<DirtyRange>)> {
-        let ranges = std::mem::take(&mut self.ranges);
-        let mut result: Vec<(InodeId, Vec<DirtyRange>)> = Vec::with_capacity(ranges.len());
-        for (inode, ranges) in ranges {
-            result.push((inode, ranges));
+        let mut result: Vec<(InodeId, Vec<DirtyRange>)> = Vec::with_capacity(self.ranges.len());
+        for (inode, ranges) in &self.ranges {
+            let ranges: Vec<DirtyRange> = ranges
+                .iter()
+                .filter(|range| range.lifecycle != DirtyLifecycleState::WritebackPending)
+                .cloned()
+                .collect();
+            if !ranges.is_empty() {
+                result.push((*inode, ranges));
+            }
         }
         result
     }
 
     // ── private helpers ────────────────────────────────────────────
 
+    fn replace_range(
+        &mut self,
+        inode: InodeId,
+        offset: u64,
+        length: u64,
+        lifecycle: DirtyLifecycleState,
+        writeback_error: Option<String>,
+        dirty_since: Instant,
+    ) {
+        if length == 0 {
+            return;
+        }
+        self.clear_range(inode, offset, length);
+        let range =
+            DirtyRange::with_lifecycle(offset, length, dirty_since, lifecycle, writeback_error);
+        let entry = self.ranges.entry(inode).or_default();
+        Self::insert_coalesced(entry, range);
+    }
+
+    fn oldest_dirty_since_in_range(
+        &self,
+        inode: InodeId,
+        offset: u64,
+        length: u64,
+    ) -> Option<Instant> {
+        let end = offset.saturating_add(length);
+        self.ranges.get(&inode).and_then(|ranges| {
+            ranges
+                .iter()
+                .filter(|range| range.offset < end && offset < range.end())
+                .map(|range| range.dirty_since)
+                .min()
+        })
+    }
+
+    fn clear_lifecycle_range(
+        &mut self,
+        inode: InodeId,
+        offset: u64,
+        length: u64,
+        lifecycle: DirtyLifecycleState,
+    ) -> usize {
+        if length == 0 {
+            return 0;
+        }
+        let end = offset.saturating_add(length);
+        let ranges = match self.ranges.remove(&inode) {
+            Some(v) => v,
+            None => return 0,
+        };
+        let mut touched = 0usize;
+        let mut kept = Vec::with_capacity(ranges.len());
+        for range in ranges {
+            let r_off = range.offset;
+            let r_end = range.end();
+            if r_end <= offset || r_off >= end || range.lifecycle != lifecycle {
+                kept.push(range);
+                continue;
+            }
+            touched += 1;
+            if r_off < offset {
+                kept.push(DirtyRange::with_lifecycle(
+                    r_off,
+                    offset - r_off,
+                    range.dirty_since,
+                    range.lifecycle,
+                    range.writeback_error.clone(),
+                ));
+            }
+            if r_end > end {
+                kept.push(DirtyRange::with_lifecycle(
+                    end,
+                    r_end - end,
+                    range.dirty_since,
+                    range.lifecycle,
+                    range.writeback_error,
+                ));
+            }
+        }
+        if !kept.is_empty() {
+            kept.sort_by_key(|range| range.offset);
+            self.ranges.insert(inode, kept);
+        }
+        touched
+    }
+
     /// Insert one range into the sorted non-overlapping set, merging only the
     /// adjacent/overlapping window touched by the new range.
-    fn insert_coalesced(ranges: &mut Vec<DirtyRange>, mut range: DirtyRange) {
-        let mut start = 0;
-        while start < ranges.len() && ranges[start].end() < range.offset {
-            start += 1;
+    fn insert_coalesced(ranges: &mut Vec<DirtyRange>, range: DirtyRange) {
+        ranges.push(range);
+        ranges.sort_by_key(|range| range.offset);
+        let mut merged: Vec<DirtyRange> = Vec::with_capacity(ranges.len());
+        for range in ranges.drain(..) {
+            if let Some(last) = merged.last_mut() {
+                if last.merge_compatible(&range) && last.end() >= range.offset {
+                    *last = last.merge(&range);
+                    continue;
+                }
+            }
+            merged.push(range);
         }
-
-        let mut end = start;
-        while end < ranges.len() && ranges[end].offset <= range.end() {
-            range = range.merge(&ranges[end]);
-            end += 1;
-        }
-
-        if start == end {
-            ranges.insert(start, range);
-        } else {
-            ranges.splice(start..end, std::iter::once(range));
-        }
+        *ranges = merged;
     }
 }
 
@@ -382,6 +588,90 @@ mod tests {
         tracker.mark_dirty(ino, 0, 4096);
         assert!(tracker.is_dirty(ino));
         assert_eq!(tracker.dirty_ranges(ino).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn writeback_pending_remains_non_clean_but_not_reselected() {
+        let mut tracker = DirtyPageTracker::new();
+        let ino = id(60);
+        tracker.mark_dirty(ino, 0, 4096);
+
+        assert!(tracker.start_writeback_range(ino, 0, 4096));
+        assert!(tracker.is_dirty(ino));
+        assert!(tracker.overlaps_lifecycle(ino, 0, 4096, DirtyLifecycleState::WritebackPending));
+        assert!(
+            tracker.collect_dirty_ranges().is_empty(),
+            "pending writeback is not reselected as fresh dirty work"
+        );
+    }
+
+    #[test]
+    fn writeback_error_poison_is_observable_and_retryable() {
+        let mut tracker = DirtyPageTracker::new();
+        let ino = id(61);
+        tracker.mark_dirty(ino, 0, 4096);
+
+        assert!(tracker.start_writeback_range(ino, 0, 4096));
+        tracker.record_writeback_error(ino, 0, 4096, "flush failed");
+
+        let ranges = tracker.dirty_ranges(ino).unwrap();
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(
+            ranges[0].lifecycle_state(),
+            DirtyLifecycleState::ErrorPoisoned
+        );
+        assert_eq!(ranges[0].writeback_error(), Some("flush failed"));
+        assert!(tracker.is_dirty(ino));
+
+        let selected = tracker.collect_dirty_ranges();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(
+            selected[0].1[0].lifecycle_state(),
+            DirtyLifecycleState::ErrorPoisoned
+        );
+
+        assert!(tracker.start_writeback_range(ino, 0, 4096));
+        let ranges = tracker.dirty_ranges(ino).unwrap();
+        assert_eq!(
+            ranges[0].lifecycle_state(),
+            DirtyLifecycleState::WritebackPending
+        );
+        assert_eq!(ranges[0].writeback_error(), None);
+        assert_eq!(tracker.complete_writeback_success(ino, 0, 4096), 1);
+        assert!(!tracker.is_dirty(ino));
+    }
+
+    #[test]
+    fn successful_writeback_completion_clears_range_to_clean() {
+        let mut tracker = DirtyPageTracker::new();
+        let ino = id(62);
+        tracker.mark_dirty(ino, 0, 8192);
+
+        assert!(tracker.start_writeback_range(ino, 0, 4096));
+        assert_eq!(tracker.complete_writeback_success(ino, 0, 4096), 1);
+
+        let ranges = tracker.dirty_ranges(ino).unwrap();
+        assert_eq!(ranges, &[DirtyRange::new(4096, 4096)]);
+    }
+
+    #[test]
+    fn writeback_success_cannot_clear_non_pending_range() {
+        let mut tracker = DirtyPageTracker::new();
+        let ino = id(63);
+        tracker.mark_dirty(ino, 0, 4096);
+
+        assert_eq!(tracker.complete_writeback_success(ino, 0, 4096), 0);
+        let ranges = tracker.dirty_ranges(ino).unwrap();
+        assert_eq!(ranges[0].lifecycle_state(), DirtyLifecycleState::Dirty);
+
+        assert!(tracker.start_writeback_range(ino, 0, 4096));
+        tracker.record_writeback_error(ino, 0, 4096, "flush failed");
+        assert_eq!(tracker.complete_writeback_success(ino, 0, 4096), 0);
+        let ranges = tracker.dirty_ranges(ino).unwrap();
+        assert_eq!(
+            ranges[0].lifecycle_state(),
+            DirtyLifecycleState::ErrorPoisoned
+        );
     }
 
     #[test]
