@@ -22,9 +22,10 @@ use serde_json::json;
 use tidefs_types_vfs_core::RequestCtx;
 use tidefs_vfs_engine::{
     LivePoolAdminArg, LivePoolAdminArgs, LivePoolAdminCommand, LivePoolAdminError,
-    LivePoolAdminOutput, LivePoolAdminRequest, LivePoolAdminResponse, LivePoolAdminResponseBody,
-    VfsEngineStatFs, LIVE_POOL_ADMIN_PROTOCOL_VERSION,
+    LivePoolAdminRequest, LivePoolAdminResponse, VfsEngineStatFs, LIVE_POOL_ADMIN_PROTOCOL_VERSION,
 };
+#[cfg(test)]
+use tidefs_vfs_engine::{LivePoolAdminOutput, LivePoolAdminResponseBody};
 
 pub type LiveOwnerEngine = Arc<Mutex<Box<dyn VfsEngineStatFs + Send>>>;
 
@@ -199,7 +200,7 @@ fn handle_client(
         Err(err) => {
             let _ = writeln!(
                 stream,
-                "{{\"version\":{},\"exit_code\":2,\"body\":{\"kind\":\"error\",\"message\":\"encode response: {err}\",\"machine_json\":null}}}",
+                "{{\"version\":{},\"exit_code\":2,\"body\":{{\"kind\":\"error\",\"message\":\"encode response: {err}\",\"machine_json\":null}}}}",
                 LIVE_POOL_ADMIN_PROTOCOL_VERSION
             );
         }
@@ -261,6 +262,7 @@ fn dispatch_request(
         | LivePoolAdminCommand::SnapshotRollback
         | LivePoolAdminCommand::SnapshotExtract
         | LivePoolAdminCommand::SnapshotSend
+        | LivePoolAdminCommand::PerformanceAdmissionSnapshot
         | LivePoolAdminCommand::DeviceRemove => delegate_admin_request(&request, engine),
     }
 }
