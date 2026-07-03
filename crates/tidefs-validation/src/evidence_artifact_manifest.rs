@@ -161,7 +161,29 @@ impl EvidenceArtifactManifest {
         let mut failures = Vec::new();
         validate_relative_artifact_path(&self.artifact_path, &mut failures);
         EvidenceArtifactManifestError::from_failures(failures)?;
-        Ok(root.as_ref().join(&self.artifact_path))
+        let root = root.as_ref();
+        let canonical_root = root.canonicalize().map_err(|error| {
+            EvidenceArtifactManifestError::single(format!(
+                "resolve artifact root `{}`: {error}",
+                root.display()
+            ))
+        })?;
+        let artifact_path = canonical_root.join(&self.artifact_path);
+        let canonical_artifact_path = artifact_path.canonicalize().map_err(|error| {
+            EvidenceArtifactManifestError::single(format!(
+                "read artifact_path `{}` under `{}`: {error}",
+                self.artifact_path,
+                canonical_root.display()
+            ))
+        })?;
+        if !canonical_artifact_path.starts_with(&canonical_root) {
+            return Err(EvidenceArtifactManifestError::single(format!(
+                "artifact_path `{}` resolves outside artifact root `{}`",
+                self.artifact_path,
+                canonical_root.display()
+            )));
+        }
+        Ok(canonical_artifact_path)
     }
 
     pub fn verify_artifact_digest(
