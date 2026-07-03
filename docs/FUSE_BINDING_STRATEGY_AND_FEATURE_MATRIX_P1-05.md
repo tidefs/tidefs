@@ -24,7 +24,7 @@ See also:
 
 - `docs/TIDEFS_DOCTRINE.md` — authority model and projection charters
 - `docs/SHARED_DOCTRINE_NATIVE_SEAM_MAP_P0-03.md` — seam ownership
-- `docs/FUSE_MOUNT.md` — current FUSE mount surface
+- `docs/xfstests-harness.md` — current FUSE mount validation harness context
 - `docs/FUSE_ADAPTER_CONTRACT_ASSUMPTIONS.md` — current FUSE adapter boundary
 - `docs/PREVIEW_UAPI_ABI_BOUNDARY_OW202.md` — preview boundary mirror spec
 - `docs/CURRENT_VS_FUTURE_CAPABILITIES.md` — capability tracking
