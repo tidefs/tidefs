@@ -922,13 +922,13 @@ mod tests {
     use tidefs_background_scheduler::BackgroundScheduler;
     use tidefs_storage_intent_core::{
         StorageIntentActionAbortRollbackRecord, StorageIntentActionBudgetOutcomeRecord,
-        StorageIntentActionClass,
-        StorageIntentActionExecutionAdmissionRefs, StorageIntentActionExecutionFlags,
-        StorageIntentActionExecutionReplayRecord, StorageIntentActionExecutionStepState,
-        StorageIntentActionPublicationBoundaryRecord, StorageIntentActionPublicationState,
-        StorageIntentActionReplayState, StorageIntentActionSourceProtectionRecord,
-        StorageIntentActionTargetVerificationRecord, StorageIntentDomainId,
-        StorageIntentReplayIdempotencyKey, StorageIntentSourceRetirementState,
+        StorageIntentActionClass, StorageIntentActionExecutionAdmissionRefs,
+        StorageIntentActionExecutionFlags, StorageIntentActionExecutionReplayRecord,
+        StorageIntentActionExecutionStepState, StorageIntentActionPublicationBoundaryRecord,
+        StorageIntentActionPublicationState, StorageIntentActionReplayState,
+        StorageIntentActionSourceProtectionRecord, StorageIntentActionTargetVerificationRecord,
+        StorageIntentDomainId, StorageIntentReplayIdempotencyKey,
+        StorageIntentSourceRetirementState,
     };
 
     #[derive(Clone)]
