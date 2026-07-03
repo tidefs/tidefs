@@ -143,7 +143,9 @@ impl DeviceManager {
         match action {
             PoolLifecycleAction::AddDevice
             | PoolLifecycleAction::RemoveDevice
-            | PoolLifecycleAction::ReplaceDevice => PoolLifecycleEvidence::executed(action, context),
+            | PoolLifecycleAction::ReplaceDevice => {
+                PoolLifecycleEvidence::executed(action, context)
+            }
             _ => PoolLifecycleEvidence::refused(
                 PoolLifecycleAction::FailClosed,
                 context,
