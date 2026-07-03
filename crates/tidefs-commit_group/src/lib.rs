@@ -94,7 +94,8 @@ pub use accumulator::{
 };
 #[cfg(feature = "std")]
 pub use commit::{
-    CommitGroupCommit, InodeTableCommit, NamespaceCommit, NoopInodeTable, NoopNamespace,
+    CommitGroupCommit, ExtentMapCommit, InodeTableCommit, NamespaceCommit, NoopInodeTable,
+    NoopNamespace,
 };
 #[cfg(feature = "std")]
 pub use coordinator::CommitGroupCoordinator;

@@ -312,12 +312,97 @@ impl tidefs_commit_group::CommitGroupStore for LoStoreAdapter<'_> {
     }
 }
 
+const TEST_NAMESPACE_ROOT: u64 = 0x1001;
+const TEST_INODE_TABLE_ROOT: u64 = 0x2002;
+
+struct PublishingInodeTable {
+    root: u64,
+}
+
+impl Default for PublishingInodeTable {
+    fn default() -> Self {
+        Self {
+            root: TEST_INODE_TABLE_ROOT,
+        }
+    }
+}
+
+impl tidefs_commit_group::InodeTableCommit for PublishingInodeTable {
+    fn apply_setattr(
+        &mut self,
+        _ino: u64,
+        _new_size: Option<u64>,
+        _new_mtime: Option<u64>,
+        _new_ctime: Option<u64>,
+    ) -> Result<(), tidefs_commit_group::CommitGroupError> {
+        Ok(())
+    }
+
+    fn publish_inode_table_root(
+        &mut self,
+        _commit_group_id: CommitGroupId,
+    ) -> Result<u64, tidefs_commit_group::CommitGroupError> {
+        Ok(self.root)
+    }
+}
+
+struct PublishingNamespace {
+    root: u64,
+}
+
+impl Default for PublishingNamespace {
+    fn default() -> Self {
+        Self {
+            root: TEST_NAMESPACE_ROOT,
+        }
+    }
+}
+
+impl tidefs_commit_group::NamespaceCommit for PublishingNamespace {
+    fn apply_link(
+        &mut self,
+        _dir_ino: u64,
+        _name: &[u8],
+        _target_ino: u64,
+    ) -> Result<(), tidefs_commit_group::CommitGroupError> {
+        Ok(())
+    }
+
+    fn apply_unlink(
+        &mut self,
+        _dir_ino: u64,
+        _name: &[u8],
+    ) -> Result<(), tidefs_commit_group::CommitGroupError> {
+        Ok(())
+    }
+
+    fn publish_namespace_root(
+        &mut self,
+        _commit_group_id: CommitGroupId,
+    ) -> Result<u64, tidefs_commit_group::CommitGroupError> {
+        Ok(self.root)
+    }
+}
+
+#[derive(Default)]
+struct ZeroKeyStore;
+
+impl tidefs_commit_group::CommitGroupStore for ZeroKeyStore {
+    fn put_named(&mut self, _name: &str, _payload: &[u8]) -> Result<CommitGroupKey, String> {
+        Ok(CommitGroupKey::ZERO)
+    }
+
+    fn get_named(&self, _name: &str) -> Result<Option<Vec<u8>>, String> {
+        Ok(None)
+    }
+}
+
 #[test]
 fn commit_group_succeeds_with_real_store() {
     use std::collections::BTreeMap;
     use tidefs_commit_group::{
-        CommitGroup, CommitGroupCommit, CommitGroupId, CommitGroupPhase, NoopInodeTable,
-        NoopNamespace, RootPointer,
+        CommitGroup, CommitGroupCommit, CommitGroupId, CommitGroupPhase, CommitGroupReader,
+        RootPointer,
     };
     use tidefs_extent_map::btree::BTreeExtentMap;
     use tidefs_local_object_store::{LocalObjectStore, StoreOptions};
@@ -325,7 +410,7 @@ fn commit_group_succeeds_with_real_store() {
 
     let dir = tempfile::tempdir().unwrap();
     let mut store =
-        LocalObjectStore::open_with_options(dir.path(), StoreOptions::test_fast()).unwrap();
+        LocalObjectStore::open_with_options(dir.path(), StoreOptions::durable()).unwrap();
 
     let mut group = CommitGroup::new(CommitGroupId::FIRST, RootPointer::NIL);
     group.queue_write(1, 0, vec![0x42u8; 64]).unwrap();
@@ -342,8 +427,8 @@ fn commit_group_succeeds_with_real_store() {
         &mut group,
         &mut LoStoreAdapter(&mut store),
         &mut extent_maps,
-        &mut NoopInodeTable,
-        &mut NoopNamespace,
+        &mut PublishingInodeTable::default(),
+        &mut PublishingNamespace::default(),
     )
     .unwrap();
 
@@ -351,6 +436,25 @@ fn commit_group_succeeds_with_real_store() {
     assert_eq!(committed_root.commit_group_id, CommitGroupId::FIRST);
     assert!(committed_root.is_valid());
     assert_eq!(committed_keys.len(), 1);
+
+    let entries = extent_maps.get(&1).unwrap().lookup_range(0, 64).unwrap();
+    assert_eq!(entries.len(), 1);
+    let expected_checksum: [u8; 32] = blake3::hash(&[0x42u8; 64]).into();
+    assert_eq!(entries[0].checksum, expected_checksum);
+    assert_ne!(entries[0].checksum, [0u8; 32]);
+
+    drop(store);
+
+    let mut reopened =
+        LocalObjectStore::open_with_options(dir.path(), StoreOptions::durable()).unwrap();
+    let reader = LoStoreAdapter(&mut reopened);
+    let block = CommitGroupReader::require_root_block(&reader, CommitGroupId::FIRST).unwrap();
+    assert_eq!(block.namespace_root, TEST_NAMESPACE_ROOT);
+    assert_eq!(block.inode_table_root, TEST_INODE_TABLE_ROOT);
+    assert_ne!(block.extent_map_root, 0);
+    assert!(tidefs_commit_group::CommitGroupWriter::verify_root_block(
+        &block
+    ));
 }
 
 #[test]
@@ -379,5 +483,86 @@ fn commit_group_preserves_prepared_on_io_error() {
         &mut NoopNamespace,
     );
     assert!(result.is_err());
+    assert_eq!(group.phase(), CommitGroupPhase::Prepared);
+}
+
+#[test]
+fn commit_group_refuses_missing_root_publishers() {
+    use std::collections::BTreeMap;
+    use tidefs_commit_group::{
+        CommitGroup, CommitGroupCommit, CommitGroupError, CommitGroupId, CommitGroupPhase,
+        NoopInodeTable, NoopNamespace, RootPointer,
+    };
+    use tidefs_extent_map::btree::BTreeExtentMap;
+    use tidefs_local_object_store::{LocalObjectStore, StoreOptions};
+    use tidefs_types_extent_map_core::{ExtentMapEntryV2, ExtentMapOps};
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut store =
+        LocalObjectStore::open_with_options(dir.path(), StoreOptions::test_fast()).unwrap();
+
+    let mut group = CommitGroup::new(CommitGroupId(1), RootPointer::NIL);
+    group.queue_write(1, 0, vec![0x42u8; 64]).unwrap();
+    group.prepare().unwrap();
+
+    let mut extent_maps: BTreeMap<u64, BTreeExtentMap> = BTreeMap::new();
+    let mut em = BTreeExtentMap::new();
+    em.insert_extent(&[ExtentMapEntryV2::new_unwritten(0, 64, 1)])
+        .unwrap();
+    extent_maps.insert(1, em);
+
+    let result = CommitGroupCommit::commit_group(
+        &mut group,
+        &mut LoStoreAdapter(&mut store),
+        &mut extent_maps,
+        &mut NoopInodeTable,
+        &mut NoopNamespace,
+    );
+
+    assert!(matches!(
+        result,
+        Err(CommitGroupError::PublicationRefused {
+            subsystem: "namespace",
+            ..
+        })
+    ));
+    assert_eq!(group.phase(), CommitGroupPhase::Prepared);
+}
+
+#[test]
+fn commit_group_refuses_placeholder_extent_object_key() {
+    use std::collections::BTreeMap;
+    use tidefs_commit_group::{
+        CommitGroup, CommitGroupCommit, CommitGroupError, CommitGroupId, CommitGroupPhase,
+        RootPointer,
+    };
+    use tidefs_extent_map::btree::BTreeExtentMap;
+    use tidefs_types_extent_map_core::{ExtentMapEntryV2, ExtentMapOps};
+
+    let mut group = CommitGroup::new(CommitGroupId(1), RootPointer::NIL);
+    group.queue_write(1, 0, vec![0x42u8; 64]).unwrap();
+    group.prepare().unwrap();
+
+    let mut extent_maps: BTreeMap<u64, BTreeExtentMap> = BTreeMap::new();
+    let mut em = BTreeExtentMap::new();
+    em.insert_extent(&[ExtentMapEntryV2::new_unwritten(0, 64, 1)])
+        .unwrap();
+    extent_maps.insert(1, em);
+
+    let result = CommitGroupCommit::commit_group(
+        &mut group,
+        &mut ZeroKeyStore,
+        &mut extent_maps,
+        &mut PublishingInodeTable::default(),
+        &mut PublishingNamespace::default(),
+    );
+
+    assert!(matches!(
+        result,
+        Err(CommitGroupError::PublicationRefused {
+            subsystem: "extent-content",
+            ..
+        })
+    ));
     assert_eq!(group.phase(), CommitGroupPhase::Prepared);
 }

@@ -170,6 +170,13 @@ impl CommittedRootBlock {
         blake3::hash(&header).into()
     }
 
+    /// Returns `true` when all subsystem roots required for a non-empty
+    /// commit group carry non-placeholder handles.
+    #[must_use]
+    pub const fn has_non_placeholder_subsystem_roots(&self) -> bool {
+        self.namespace_root != 0 && self.inode_table_root != 0 && self.extent_map_root != 0
+    }
+
     /// Return the header bytes (everything except the hash) for hashing.
     fn header_bytes(&self) -> [u8; HEADER_SIZE] {
         let mut header = [0u8; HEADER_SIZE];
@@ -215,6 +222,32 @@ impl CommitGroupWriter {
     pub fn verify_root_block(block: &CommittedRootBlock) -> bool {
         let recomputed = block.compute_hash();
         recomputed == block.block_hash
+    }
+
+    /// Validate the root-block contract for a non-empty commit group.
+    ///
+    /// Format-level code can still round-trip an all-zero identity block, but
+    /// product commit publication must fail closed unless namespace,
+    /// inode-table, and extent-map roots are all non-placeholder handles.
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable refusal reason when the block cannot represent
+    /// a non-empty committed root.
+    pub fn validate_non_empty_root_block(block: &CommittedRootBlock) -> Result<(), String> {
+        if !block.commit_group_id.is_valid() {
+            return Err("commit group id is not valid".into());
+        }
+        if block.namespace_root == 0 {
+            return Err("namespace root handle is the placeholder value".into());
+        }
+        if block.inode_table_root == 0 {
+            return Err("inode-table root handle is the placeholder value".into());
+        }
+        if block.extent_map_root == 0 {
+            return Err("extent-map root handle is the placeholder value".into());
+        }
+        Ok(())
     }
 
     /// Write a sealed root block to the store and return its root pointer.
@@ -396,11 +429,41 @@ mod tests {
 
     #[test]
     fn empty_root_handles_are_valid() {
-        // All-zero handles (identity root) should work.
+        // All-zero handles (identity root) are valid at the wire-format layer.
         let block = CommittedRootBlock::new(CommitGroupId(1), 0, 0, 0, 0);
         let sealed = CommitGroupWriter::seal_root_block(block);
         assert!(CommitGroupWriter::verify_root_block(&sealed));
         assert_ne!(sealed.block_hash, [0u8; 32]);
+        assert!(!sealed.has_non_placeholder_subsystem_roots());
+        assert!(CommitGroupWriter::validate_non_empty_root_block(&sealed).is_err());
+    }
+
+    #[test]
+    fn non_empty_root_block_validation_requires_subsystem_roots() {
+        let valid = CommittedRootBlock::new(CommitGroupId(1), 10, 20, 30, 40);
+        assert!(valid.has_non_placeholder_subsystem_roots());
+        assert!(CommitGroupWriter::validate_non_empty_root_block(&valid).is_ok());
+
+        let missing_namespace = CommittedRootBlock::new(CommitGroupId(1), 0, 20, 30, 40);
+        assert!(
+            CommitGroupWriter::validate_non_empty_root_block(&missing_namespace)
+                .unwrap_err()
+                .contains("namespace")
+        );
+
+        let missing_inode_table = CommittedRootBlock::new(CommitGroupId(1), 10, 0, 30, 40);
+        assert!(
+            CommitGroupWriter::validate_non_empty_root_block(&missing_inode_table)
+                .unwrap_err()
+                .contains("inode-table")
+        );
+
+        let missing_extent_map = CommittedRootBlock::new(CommitGroupId(1), 10, 20, 0, 40);
+        assert!(
+            CommitGroupWriter::validate_non_empty_root_block(&missing_extent_map)
+                .unwrap_err()
+                .contains("extent-map")
+        );
     }
 
     #[test]

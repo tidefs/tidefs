@@ -18,6 +18,11 @@ use crate::accumulator::CommitGroupAccumulator;
 use crate::store::{CommitGroupKey, CommitGroupStore};
 use crate::types::{CommitGroupError, CommitGroupId};
 
+const EXTENT_CONTENT_SUBSYSTEM: &str = "extent-content";
+const EXTENT_MAP_SUBSYSTEM: &str = "extent-map";
+const INODE_TABLE_SUBSYSTEM: &str = "inode-table";
+const NAMESPACE_SUBSYSTEM: &str = "namespace";
+
 /// Trait abstracting the inode-table operations needed by the commit path.
 ///
 /// This is a narrow interface; the full `tidefs-inode-table` crate (issue
@@ -31,6 +36,13 @@ pub trait InodeTableCommit {
         new_mtime: Option<u64>,
         new_ctime: Option<u64>,
     ) -> Result<(), CommitGroupError>;
+
+    /// Publish the inode-table root that reflects all applied mutations in
+    /// this commit group.
+    fn publish_inode_table_root(
+        &mut self,
+        commit_group_id: CommitGroupId,
+    ) -> Result<u64, CommitGroupError>;
 }
 
 /// Trait abstracting the namespace operations needed by the commit path.
@@ -47,6 +59,19 @@ pub trait NamespaceCommit {
     ) -> Result<(), CommitGroupError>;
     /// Apply an unlink operation.
     fn apply_unlink(&mut self, dir_ino: u64, name: &[u8]) -> Result<(), CommitGroupError>;
+
+    /// Publish the namespace root that reflects all applied directory
+    /// mutations in this commit group.
+    fn publish_namespace_root(
+        &mut self,
+        commit_group_id: CommitGroupId,
+    ) -> Result<u64, CommitGroupError>;
+}
+
+/// Trait abstracting extent-map root publication for the commit path.
+pub trait ExtentMapCommit: ExtentMapOps {
+    /// Publish a root handle for this extent-map state.
+    fn publish_extent_map_root(&self) -> Result<u64, CommitGroupError>;
 }
 
 /// A no-op implementation of `InodeTableCommit` for testing.
@@ -60,6 +85,16 @@ impl InodeTableCommit for NoopInodeTable {
         _new_ctime: Option<u64>,
     ) -> Result<(), CommitGroupError> {
         Ok(())
+    }
+
+    fn publish_inode_table_root(
+        &mut self,
+        _commit_group_id: CommitGroupId,
+    ) -> Result<u64, CommitGroupError> {
+        Err(CommitGroupError::PublicationRefused {
+            subsystem: INODE_TABLE_SUBSYSTEM,
+            reason: "noop inode table cannot publish a committed root".into(),
+        })
     }
 }
 
@@ -76,6 +111,28 @@ impl NamespaceCommit for NoopNamespace {
     }
     fn apply_unlink(&mut self, _dir_ino: u64, _name: &[u8]) -> Result<(), CommitGroupError> {
         Ok(())
+    }
+
+    fn publish_namespace_root(
+        &mut self,
+        _commit_group_id: CommitGroupId,
+    ) -> Result<u64, CommitGroupError> {
+        Err(CommitGroupError::PublicationRefused {
+            subsystem: NAMESPACE_SUBSYSTEM,
+            reason: "noop namespace cannot publish a committed root".into(),
+        })
+    }
+}
+
+impl ExtentMapCommit for tidefs_extent_map::btree::BTreeExtentMap {
+    fn publish_extent_map_root(&self) -> Result<u64, CommitGroupError> {
+        let mut bytes = Vec::new();
+        self.serialize(&mut bytes)
+            .map_err(|e| CommitGroupError::PublicationRefused {
+                subsystem: EXTENT_MAP_SUBSYSTEM,
+                reason: format!("extent map serialization failed: {e:?}"),
+            })?;
+        CommitGroupCommit::digest_to_root_handle(EXTENT_MAP_SUBSYSTEM, blake3::hash(&bytes).into())
     }
 }
 
@@ -128,10 +185,12 @@ impl CommitGroupCommit {
         let mut committed_keys: Vec<CommitGroupKey> = Vec::new();
 
         // Step 1: Persist all queued writes to the store.
-        // Map: (ino, offset) -> (txg_key, length)
-        let mut blob_map: BTreeMap<(u64, u64), (CommitGroupKey, u64)> = BTreeMap::new();
+        // Map: (ino, offset) -> (txg_key, length, content checksum)
+        let mut blob_map: BTreeMap<(u64, u64), (CommitGroupKey, u64, [u8; 32])> = BTreeMap::new();
 
         for write in accumulator.writes() {
+            let checksum = Self::content_checksum(&write.data)
+                .map_err(|e| Box::new((e, accumulator.clone_for_retry())))?;
             let key_name = format!(
                 "commit_group-{}-ino-{}-off-{}",
                 commit_group_id.0, write.ino, write.offset
@@ -144,9 +203,14 @@ impl CommitGroupCommit {
                 };
                 Box::new((err, accumulator.clone_for_retry()))
             })?;
+            Self::require_nonzero_object_key(write.ino, write.offset, stored)
+                .map_err(|e| Box::new((e, accumulator.clone_for_retry())))?;
 
             committed_keys.push(stored);
-            blob_map.insert((write.ino, write.offset), (stored, write.data.len() as u64));
+            blob_map.insert(
+                (write.ino, write.offset),
+                (stored, write.data.len() as u64, checksum),
+            );
         }
 
         // Step 2: Update extent maps — convert unwritten extents to data
@@ -170,7 +234,7 @@ impl CommitGroupCommit {
                 .collect();
 
             for w in writes_for_ino {
-                let (obj_key, len) = blob_map
+                let (obj_key, len, checksum) = blob_map
                     .get(&(w.ino, w.offset))
                     .expect("blob must exist after put");
 
@@ -180,7 +244,7 @@ impl CommitGroupCommit {
                     w.offset,
                     *len,
                     locator,
-                    [0u8; 32],         // checksum placeholder
+                    *checksum,
                     commit_group_id.0, // birth_commit_group
                 )
                 .map_err(|e| {
@@ -245,8 +309,9 @@ impl CommitGroupCommit {
     ///
     /// # Errors
     ///
-    /// If any I/O step fails, `group` remains in the `Prepared` phase so the
-    /// caller can retry. No partial state is left behind.
+    /// If any I/O or publication step fails, `group` remains in the
+    /// `Prepared` phase so the caller can retry, and the new root is not made
+    /// visible.
     ///
     /// Returns `CommitGroupError::CommitPhaseRejected` if the group is not
     /// in the `Prepared` phase.
@@ -258,7 +323,7 @@ impl CommitGroupCommit {
         namespace: &mut NS,
     ) -> Result<(crate::types::RootPointer, Vec<CommitGroupKey>), CommitGroupError>
     where
-        EM: ExtentMapOps,
+        EM: ExtentMapCommit,
         IT: InodeTableCommit,
         NS: NamespaceCommit,
         S: CommitGroupStore,
@@ -284,9 +349,10 @@ impl CommitGroupCommit {
         let mut committed_keys: Vec<CommitGroupKey> = Vec::new();
 
         // Step 1: Persist all queued writes to the store.
-        let mut blob_map: BTreeMap<(u64, u64), (CommitGroupKey, u64)> = BTreeMap::new();
+        let mut blob_map: BTreeMap<(u64, u64), (CommitGroupKey, u64, [u8; 32])> = BTreeMap::new();
 
         for write in accumulator.writes() {
+            let checksum = Self::content_checksum(&write.data)?;
             let key_name = format!(
                 "commit_group-{}-ino-{}-off-{}",
                 commit_group_id.0, write.ino, write.offset
@@ -298,9 +364,13 @@ impl CommitGroupCommit {
                     reason: e,
                 }
             })?;
+            Self::require_nonzero_object_key(write.ino, write.offset, stored)?;
 
             committed_keys.push(stored);
-            blob_map.insert((write.ino, write.offset), (stored, write.data.len() as u64));
+            blob_map.insert(
+                (write.ino, write.offset),
+                (stored, write.data.len() as u64, checksum),
+            );
         }
 
         // Step 2: Update extent maps.
@@ -323,12 +393,12 @@ impl CommitGroupCommit {
                 .collect();
 
             for w in writes_for_ino {
-                let (obj_key, len) = blob_map
+                let (obj_key, len, checksum) = blob_map
                     .get(&(w.ino, w.offset))
                     .expect("blob must exist after put");
 
                 let locator = Self::key_to_locator(*obj_key);
-                em.convert_unwritten_to_data(w.offset, *len, locator, [0u8; 32], commit_group_id.0)
+                em.convert_unwritten_to_data(w.offset, *len, locator, *checksum, commit_group_id.0)
                     .map_err(|e| CommitGroupError::ExtentMapFailed {
                         ino,
                         reason: format!("{e:?}"),
@@ -366,20 +436,34 @@ impl CommitGroupCommit {
                 reason: format!("journal write failed: {e}"),
             })?;
 
-        // Step 6: Atomic root switch.
-        // First transition the pipeline phase (Prepared -> Committed).
-        let _pipeline_root = group.commit()?;
+        // Step 6: Publish subsystem roots. Non-empty commit groups must never
+        // turn placeholder roots into a sealed committed-root block.
+        let namespace_root = Self::require_nonzero_root(
+            NAMESPACE_SUBSYSTEM,
+            namespace.publish_namespace_root(commit_group_id)?,
+        )?;
+        let inode_table_root = Self::require_nonzero_root(
+            INODE_TABLE_SUBSYSTEM,
+            inode_table.publish_inode_table_root(commit_group_id)?,
+        )?;
+        let extent_map_root = Self::publish_extent_maps_root(extent_maps)?;
 
-        // Then write the committed-root block via CommitGroupWriter
-        // for BLAKE3-verified durability.
+        // Step 7: Write the committed-root block via CommitGroupWriter for
+        // BLAKE3-verified durability.
         let root_block = crate::writer::CommittedRootBlock::new(
             commit_group_id,
-            0,                 // namespace_root placeholder (set by namespace subsystem)
-            0,                 // inode_table_root placeholder (set by inode-table subsystem)
-            0,                 // extent_map_root placeholder (set by extent-map subsystem)
+            namespace_root,
+            inode_table_root,
+            extent_map_root,
             commit_group_id.0, // intent_log_tail
         );
-        // Seal the root block and write the primary copy.
+        crate::writer::CommitGroupWriter::validate_non_empty_root_block(&root_block).map_err(
+            |reason| CommitGroupError::PublicationRefused {
+                subsystem: "committed-root",
+                reason,
+            },
+        )?;
+
         let sealed = crate::writer::CommitGroupWriter::seal_root_block(root_block);
         let committed_root = crate::writer::CommitGroupWriter::write_root_block(store, &sealed)
             .map_err(|e| CommitGroupError::StorePutFailed {
@@ -394,6 +478,10 @@ impl CommitGroupCommit {
             &sealed,
             committed_root.commit_group_id.0,
         );
+
+        // Step 8: Atomic root switch. The visible pipeline transition only
+        // happens after the verified committed-root block is durable.
+        let _pipeline_root = group.commit()?;
         Ok((committed_root, committed_keys))
     }
 
@@ -407,6 +495,80 @@ impl CommitGroupCommit {
             bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
         ]);
         LocatorId(val)
+    }
+
+    fn content_checksum(payload: &[u8]) -> Result<[u8; 32], CommitGroupError> {
+        let checksum = blake3::hash(payload).into();
+        if checksum == [0u8; 32] {
+            return Err(CommitGroupError::PublicationRefused {
+                subsystem: EXTENT_CONTENT_SUBSYSTEM,
+                reason: "content digest producer returned the placeholder checksum".into(),
+            });
+        }
+        Ok(checksum)
+    }
+
+    fn require_nonzero_object_key(
+        ino: u64,
+        offset: u64,
+        key: CommitGroupKey,
+    ) -> Result<(), CommitGroupError> {
+        if key == CommitGroupKey::ZERO {
+            return Err(CommitGroupError::PublicationRefused {
+                subsystem: EXTENT_CONTENT_SUBSYSTEM,
+                reason: format!(
+                    "object store returned placeholder key for ino {ino} at offset {offset}"
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    fn require_nonzero_root(subsystem: &'static str, root: u64) -> Result<u64, CommitGroupError> {
+        if root == 0 {
+            return Err(CommitGroupError::PublicationRefused {
+                subsystem,
+                reason: "root producer returned the placeholder handle".into(),
+            });
+        }
+        Ok(root)
+    }
+
+    fn publish_extent_maps_root<EM>(
+        extent_maps: &BTreeMap<u64, EM>,
+    ) -> Result<u64, CommitGroupError>
+    where
+        EM: ExtentMapCommit,
+    {
+        if extent_maps.is_empty() {
+            return Err(CommitGroupError::PublicationRefused {
+                subsystem: EXTENT_MAP_SUBSYSTEM,
+                reason: "no extent-map root producer was supplied".into(),
+            });
+        }
+
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"tidefs-commit_group:extent-map-root:v1");
+        for (ino, extent_map) in extent_maps {
+            let map_root = Self::require_nonzero_root(
+                EXTENT_MAP_SUBSYSTEM,
+                extent_map.publish_extent_map_root()?,
+            )?;
+            hasher.update(&ino.to_le_bytes());
+            hasher.update(&map_root.to_le_bytes());
+        }
+
+        Self::digest_to_root_handle(EXTENT_MAP_SUBSYSTEM, hasher.finalize().into())
+    }
+
+    fn digest_to_root_handle(
+        subsystem: &'static str,
+        digest: [u8; 32],
+    ) -> Result<u64, CommitGroupError> {
+        let handle = u64::from_le_bytes([
+            digest[0], digest[1], digest[2], digest[3], digest[4], digest[5], digest[6], digest[7],
+        ]);
+        Self::require_nonzero_root(subsystem, handle)
     }
 
     pub(crate) fn build_journal_payload(
