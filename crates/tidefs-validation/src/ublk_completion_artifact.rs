@@ -418,15 +418,17 @@ fn validate_ublk_completion_artifact(
         }
     }
 
-    for (state, saw) in [
-        ("fetch_submitted", saw_fetch_submitted),
-        ("request_fetched", saw_request_fetched),
-        ("request_reissued", saw_request_reissued),
-        ("completion_submitted", saw_completion_submitted),
-        ("completion_cqe", saw_completion_cqe),
-        ("queue_released", saw_queue_released),
+    let require_reissue_and_cqe =
+        artifact.scenario.as_str() != UBLK_QID_TAG_RUNTIME_ERROR_INJECTION_SCENARIO;
+    for (state, saw, required) in [
+        ("fetch_submitted", saw_fetch_submitted, true),
+        ("request_fetched", saw_request_fetched, true),
+        ("request_reissued", saw_request_reissued, require_reissue_and_cqe),
+        ("completion_submitted", saw_completion_submitted, true),
+        ("completion_cqe", saw_completion_cqe, require_reissue_and_cqe),
+        ("queue_released", saw_queue_released, true),
     ] {
-        if !saw {
+        if required && !saw {
             failures.push(format!(
                 "artifact does not observe lifecycle state `{state}`"
             ));
@@ -733,6 +735,25 @@ mod tests {
         );
         let summary = validate_ublk_completion_artifact_json(&text).expect("valid artifact");
         assert_eq!(summary.terminal_completion_count, 2);
+    }
+
+    #[test]
+    fn accepts_qid_tag_error_injection_without_reissue_or_completion_cqe() {
+        let text = qid_tag_runtime_artifact(
+            UBLK_QID_TAG_RUNTIME_ERROR_INJECTION_SCENARIO,
+            &[
+                ("read", 1, 16, 4096),
+                ("read", 1, 17, 4096),
+                ("write", 1, 18, -5),
+            ],
+        )
+        .lines()
+        .filter(|line| !line.contains(r#""lifecycle_state": "completion_cqe""#))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+        let summary = validate_ublk_completion_artifact_json(&text).expect("valid artifact");
+        assert_eq!(summary.terminal_completion_count, 3);
     }
 
     #[test]
