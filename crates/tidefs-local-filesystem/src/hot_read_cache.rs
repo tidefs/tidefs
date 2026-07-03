@@ -11,7 +11,6 @@
 //! remove it entirely in favor of cache-core delegation.
 //!
 //! The canonical cache authority table is at `docs/cache-authority-model.md`.
-//! See also `docs/HOT_READ_CACHE_PC003.md` for the original design document.
 //!
 use tidefs_types_vfs_core::{InodeId, NodeKind};
 
