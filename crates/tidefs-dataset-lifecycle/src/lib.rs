@@ -7,32 +7,18 @@
 //! Wraps [`tidefs_types_dataset_lifecycle_core::DatasetStateV1`] with
 //! validated state transitions, mount-time gating, foundational poison
 //! primitives, GC pin-set integration, and destroy job tracking.
-//! Implements Phases 2 (runtime state machine) and 4 (pinned traversal
-//! roots) from the canonical
-//! design spec at [`docs/design/dataset-lifecycle-state-machine.md`],
-//! closing Forgejo issues #1431, #1439, #1452, and #1454.
-//!
-//! Phases 5 (destroy worker block traversal) and
-//! 7 (cluster consensus integration) are deferred to wire-up issues per
-//! [#1938](http://172.16.106.12/forgejo/forgeadmin/tidefs/issues/1938).
-//!
-//! # Comparison to ZFS / Ceph
-//!
-//! - **ZFS**: Destroy is immediate via `zfs destroy` — blocks commit_group commit
-//!   pipeline, no abort capability, no tombstone phase.
-//! - **Ceph**: Pool deletion is a monitor flag; no explicit state machine.
+//! Implements the source-owned runtime state machine and pinned traversal root
+//! integration for the shared types in
+//! [`tidefs_types_dataset_lifecycle_core`].
 //!
 //! TideFS separates lifecycle from space reclamation with an explicit
-//! ACTIVE → DESTROYING → TOMBSTONE state machine, poison gating, and
-//! admin abort recovery.
+//! ACTIVE/DESTROYING/TOMBSTONE state machine, poison gating, and admin abort
+//! recovery.
 //!
 //! Foundational destroy worker tracking types (`DestroyJobRecordV1`)
 //! are defined in `tidefs-types-dataset-lifecycle-core` and integrated
-//! here. The full async destroy worker runtime (Phase 5) is deferred to
-//! a wire-up issue.
-//!
-//! [`docs/design/dataset-lifecycle-state-machine.md`]:
-//!     https://forgejo/forgeadmin/tidefs/docs/design/dataset-lifecycle-state-machine.md
+//! here. Full async destroy-worker behavior remains owned by the crates,
+//! validation, and live GitHub issues that implement that runtime slice.
 
 use core::fmt;
 
