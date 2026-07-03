@@ -60,7 +60,9 @@ may use non-secret repository variables for scheduling gates, such as
   `docs/clippy-baseline.json`, and fails when a crate introduces warnings
   above the recorded baseline. Manual dispatch can run either changed-crate or
   full-workspace clippy checks against a feature branch and uploads
-  `clippy-baseline-summary`.
+  `clippy-baseline-summary`. Root lint policy remains in `Cargo.toml`;
+  kernel, FFI, and capability-test crates that cannot inherit those lints use
+  explicit crate-local manifest policy instead of weakening the baseline gate.
 - `Dependency License` (`.github/workflows/dependency-license.yml`) runs
   `cargo deny check licenses` through the repo `.#ci` Nix development shell on
   every `master` push, on pull requests that touch `Cargo.toml`, `Cargo.lock`,
