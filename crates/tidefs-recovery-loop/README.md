@@ -1,15 +1,15 @@
 # tidefs-recovery-loop
 
-Continuous failure recovery loop: detect, scope, plan, execute, verify.
+Source orientation for recovery-loop planning and state-machine code.
 
-The recovery loop is the central crash-recovery coordinator for TideFS. It validates
-committed roots via BLAKE3 chain verification, replays intent-log records through a
-replay target, restores consistency, and health-gates rebuild decisions. No fsck —
-recovery is automatic through committed roots and intent replay.
+This crate contains APIs for sequencing committed-root inspection, intent-log
+replay hooks, recovery planning, throttling, and health-gate decisions. These
+types are crate-local building blocks; they are not product proof for mounted
+crash recovery, automatic repair, or release readiness.
 
 ## Crate modules
 
-- **`recovery_loop`** — Committed-root-validated crash recovery state machine
+- **`recovery_loop`** — Committed-root inspection and replay-hook state machine
   (`RecoveryLoop`, `RecoveryPhase`, `RecoveryLoopConfig`, `RecoveryError`,
   `RecoveryOutcome`, `HealthGateDecision`, `ReplayTarget` trait with `NoOpReplayTarget`).
 - **`replay`** — VfsEngine-aware intent-log replay engine (`ReplayEngine`,

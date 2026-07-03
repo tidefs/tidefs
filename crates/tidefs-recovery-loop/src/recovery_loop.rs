@@ -297,11 +297,11 @@ pub struct RecoveryOutcome {
     pub rebuild_needed: bool,
 }
 
-/// Committed-root-validated crash recovery loop.
+/// Recovery-loop state machine for committed-root inspection and replay hooks.
 ///
 /// Bootstraps from a committed root pointer, validates it via BLAKE3
-/// chain verification, replays intent-log records since that root,
-/// restores consistency, and health-gates rebuild decisions.
+/// chain verification, runs configured replay-target hooks for records
+/// since that root, and records the health-gate decision for callers.
 #[derive(Debug)]
 pub struct RecoveryLoop {
     /// Current phase.
