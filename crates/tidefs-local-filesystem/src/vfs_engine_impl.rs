@@ -25,10 +25,11 @@ use tidefs_types_vfs_core::{
 };
 use tidefs_types_vfs_core::{LockRange, LockType};
 use tidefs_vfs_engine::{
-    LivePoolAdminArg, LivePoolAdminArgs, LivePoolAdminCommand, LivePoolAdminOutput,
-    LivePoolAdminRequest, LivePoolAdminResponse, LivePoolAdminResponseBody, LseekDataRange,
-    VfsEngine, VfsEngineStatFs,
+    LivePoolAdminArg, LivePoolAdminArgs, LivePoolAdminCommand, LivePoolAdminRequest,
+    LivePoolAdminResponse, LseekDataRange, VfsEngine, VfsEngineStatFs,
 };
+#[cfg(test)]
+use tidefs_vfs_engine::{LivePoolAdminOutput, LivePoolAdminResponseBody};
 
 use crate::content::{content_chunk_start, reflink_chunked_content, MountedContentReadAuthority};
 use crate::error::FileSystemError;
@@ -1791,7 +1792,7 @@ impl VfsLocalFileSystem {
         let wants_json = request.output.wants_json();
         let args = live_admin_args_to_json(&request.args);
 
-        Ok(match request.command {
+        Ok(match &request.command {
             LivePoolAdminCommand::DatasetCreate => {
                 self.live_dataset_create(pool, &args, wants_json)
             }
