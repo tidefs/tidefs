@@ -11,7 +11,6 @@ const CLAIMS_PATH: &str = "validation/claims.toml";
 const RECEIPT_DIR: &str = "validation/artifacts/performance";
 const RECEIPT_FILE_PREFIX: &str = "no-hidden-queues-";
 const RECEIPT_FILE_SUFFIX: &str = ".toml";
-const QUEUE_ROOT_MARKER: &str = "tidefs-queue-root:";
 const REVIEW_RECEIPT_VERSION: u32 = 1;
 const REVIEW_RECEIPT_EVIDENCE_CLASS: &str = "no-hidden-queues-review-receipt";
 const REVIEW_RECEIPT_EVIDENCE_TIER: &str = "source-registry-review";
@@ -19,7 +18,7 @@ const REVIEW_RECEIPT_SOURCE_COVERAGE_KIND: &str = "recursive-source-registry-rev
 const REVIEW_RECEIPT_RUNTIME_BOUNDARY: &str =
     "source-registry-review-only-does-not-satisfy-queue-depth-runtime-artifact";
 const REVIEW_RECEIPT_DECISION: &str = "claims-remain-blocked";
-const QUEUE_ROOT_COVERAGE_KIND: &str = "registered-source-marker-present";
+const QUEUE_ROOT_COVERAGE_KIND: &str = "registered-source-semantics-present";
 const QUEUE_DEPTH_RUNTIME_ARTIFACT: &str = "queue-depth-runtime-artifact";
 
 const VALID_WORK_CLASSES: &[&str] = &[
@@ -347,19 +346,11 @@ fn validate_queue_root(root: &Path, queue: &QueueRoot, failures: &mut Vec<String
         }
     };
 
-    let marker = queue_marker(&queue.id);
-    for required in [
-        marker.as_str(),
-        queue.symbol.as_str(),
-        queue.admission.as_str(),
-        queue.service_curve.as_str(),
-    ] {
-        if !text.contains(required) {
-            failures.push(format!(
-                "queue root `{}` source `{}` does not contain required marker `{required}`",
-                queue.id, queue.path
-            ));
-        }
+    for missing in missing_queue_source_semantics(queue, &text) {
+        failures.push(format!(
+            "queue root `{}` source `{}` does not contain required structured source evidence `{missing}`",
+            queue.id, queue.path
+        ));
     }
 
     match package_name_for_path(root, rel) {
@@ -1011,7 +1002,7 @@ fn scan_source_files(
             .map(|queues| {
                 queues
                     .iter()
-                    .any(|queue| text.contains(&queue_marker(&queue.id)))
+                    .any(|queue| queue_source_has_required_semantics(queue, &text))
             })
             .unwrap_or(false);
         if classified {
@@ -1021,7 +1012,7 @@ fn scan_source_files(
         let package = package_name_for_path(root, rel).unwrap_or_else(|| "unknown".to_string());
         for (line, pattern) in candidates {
             failures.push(format!(
-                "touched package `{package}` has unclassified queue-like root in `{rel_display}` line {line}: matched `{pattern}`; add `{REGISTRY_PATH}` metadata and a `{QUEUE_ROOT_MARKER}` marker"
+                "touched package `{package}` has unclassified queue-like root in `{rel_display}` line {line}: matched `{pattern}`; add `{REGISTRY_PATH}` metadata with path, symbol, admission, and service curve evidence"
             ));
         }
     }
@@ -1209,8 +1200,19 @@ fn queue_patterns() -> Vec<String> {
     .collect()
 }
 
-fn queue_marker(id: &str) -> String {
-    format!("{QUEUE_ROOT_MARKER} {id}")
+fn queue_source_has_required_semantics(queue: &QueueRoot, text: &str) -> bool {
+    missing_queue_source_semantics(queue, text).is_empty()
+}
+
+fn missing_queue_source_semantics<'a>(queue: &'a QueueRoot, text: &str) -> Vec<&'a str> {
+    [
+        queue.symbol.as_str(),
+        queue.admission.as_str(),
+        queue.service_curve.as_str(),
+    ]
+    .into_iter()
+    .filter(|required| !text.contains(required))
+    .collect()
 }
 
 fn package_name_for_path(root: &Path, rel: &Path) -> Option<String> {
@@ -1321,6 +1323,56 @@ struct Root {
     }
 
     #[test]
+    fn source_scan_classifies_registered_queue_by_semantics() {
+        let root = tempfile::tempdir().expect("temp workspace");
+        let source_rel = PathBuf::from("crates/tidefs-example/src/lib.rs");
+        let source_path = root.path().join(&source_rel);
+        fs::create_dir_all(source_path.parent().expect("source parent"))
+            .expect("create source dir");
+        fs::write(
+            &source_path,
+            "struct QueueRoot { pending: VecDeque<Item> }\n// admission: AdmissionPermit service_curve: ServiceCurve\n",
+        )
+        .expect("write source");
+        let registry = test_queue_registry();
+        let mut failures = Vec::new();
+
+        scan_source_files(root.path(), &registry, &[source_rel], &mut failures);
+
+        assert_eq!(failures, Vec::<String>::new());
+    }
+
+    #[test]
+    fn source_scan_rejects_registered_queue_without_semantics() {
+        let root = tempfile::tempdir().expect("temp workspace");
+        let package_root = root.path().join("crates/tidefs-example");
+        fs::create_dir_all(package_root.join("src")).expect("create package src");
+        fs::write(
+            package_root.join("Cargo.toml"),
+            r#"[package]
+name = "tidefs-example"
+version = "0.1.0"
+edition = "2021"
+"#,
+        )
+        .expect("write manifest");
+        let source_rel = PathBuf::from("crates/tidefs-example/src/lib.rs");
+        fs::write(
+            root.path().join(&source_rel),
+            "struct QueueRoot { pending: VecDeque<Item> }\n",
+        )
+        .expect("write source");
+        let registry = test_queue_registry();
+        let mut failures = Vec::new();
+
+        scan_source_files(root.path(), &registry, &[source_rel], &mut failures);
+
+        assert!(failures
+            .iter()
+            .any(|failure| failure.contains("unclassified queue-like root")));
+    }
+
+    #[test]
     fn review_receipt_accepts_registered_source_coverage() {
         let root = test_receipt_workspace();
         let failures = validate_test_receipt(root.path(), &valid_receipt());
@@ -1396,6 +1448,26 @@ edition = "2021"
     fn validate_test_receipt(root: &Path, text: &str) -> Vec<String> {
         let receipt =
             toml::from_str::<NoHiddenQueuesReviewReceipt>(text).expect("parse test receipt");
+        let registry = test_queue_registry();
+        let claims = ClaimRegistry {
+            claims: vec![RegisteredClaim {
+                id: "perf.local.no_unbounded_dirty_debt.v1".to_string(),
+                status: "blocked".to_string(),
+            }],
+        };
+        let mut failures = Vec::new();
+        validate_review_receipt(
+            root,
+            Path::new("validation/artifacts/performance/no-hidden-queues-review-receipt.toml"),
+            &receipt,
+            &registry,
+            &claims,
+            &mut failures,
+        );
+        failures
+    }
+
+    fn test_queue_registry() -> QueueRegistry {
         let registry = QueueRegistry {
             schema_version: 1,
             queue_roots: vec![QueueRoot {
@@ -1415,22 +1487,7 @@ edition = "2021"
                 ],
             }],
         };
-        let claims = ClaimRegistry {
-            claims: vec![RegisteredClaim {
-                id: "perf.local.no_unbounded_dirty_debt.v1".to_string(),
-                status: "blocked".to_string(),
-            }],
-        };
-        let mut failures = Vec::new();
-        validate_review_receipt(
-            root,
-            Path::new("validation/artifacts/performance/no-hidden-queues-review-receipt.toml"),
-            &receipt,
-            &registry,
-            &claims,
-            &mut failures,
-        );
-        failures
+        registry
     }
 
     fn valid_receipt() -> String {
@@ -1475,7 +1532,7 @@ package = "tidefs-example"
 path = "crates/tidefs-example/src/lib.rs"
 symbol = "Queue"
 source_root = "crates/tidefs-example/src"
-coverage = "registered-source-marker-present"
+coverage = "registered-source-semantics-present"
 
 [[out_of_scope]]
 root = "mounted-runtime-queue-depth"

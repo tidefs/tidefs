@@ -44,8 +44,6 @@
 //! `SendQueueDepthEvidence` exposes this governor as compact source/adapter
 //! metadata for no-hidden-queue review.
 //!
-//! tidefs-queue-root: transport.send_queue_depth
-//!
 //!
 //! Each lane is an `AdmissionPermit`-class resource tracked under a
 //! `ServiceCurve`-compatible queue-slots budget. The evidence uses the

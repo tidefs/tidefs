@@ -1158,7 +1158,6 @@ pub struct QueueMetadata {
 
 /// An alloc-backed queue that requires an admission permit for each item.
 ///
-/// tidefs-queue-root: performance_contract.budgeted_queue
 #[cfg(feature = "alloc")]
 #[derive(Debug)]
 pub struct BudgetedQueue<T> {

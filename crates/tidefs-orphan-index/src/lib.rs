@@ -284,7 +284,6 @@ fn validate_orphan_index_permit(permit: &AdmissionPermit) -> Result<(), OrphanIn
 // OrphanIndex
 // ---------------------------------------------------------------------------
 
-/// tidefs-queue-root: orphan_index.persistent_index
 /// admission: AdmissionPermit  service_curve: ServiceCurve
 ///
 /// Queue root for the persistent orphan index. All insert/remove/recover

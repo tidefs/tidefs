@@ -54,7 +54,6 @@ impl Default for LocalAdmissionCaps {
 
 /// Runtime write-admission state for the local filesystem.
 ///
-/// tidefs-queue-root: local_fs.write_admission
 /// admission: AdmissionPermit  service_curve: ServiceCurve
 #[derive(Debug)]
 pub struct LocalWriteAdmission {
@@ -117,7 +116,6 @@ impl LocalWriteAdmission {
     /// Try to admit a metadata-mutation charge for rename, link, unlink,
     /// or orphan-index operations.
     ///
-    /// tidefs-queue-root: local_fs.metadata_mutation_admission
     /// admission: AdmissionPermit  service_curve: ServiceCurve
     ///
     /// Metadata mutations are gated on permit count; they do not consume
