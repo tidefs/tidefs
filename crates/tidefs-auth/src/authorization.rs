@@ -1,8 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
+use ed25519_dalek::Keypair;
 use serde::{Deserialize, Serialize};
 
+use crate::audit::{append_audit_event_and_seal_chain_if_needed, AuditEventId, AuditLog};
 use crate::capability::{CapabilityGrant, CapabilityGrantConsumeResult};
+use crate::error::AuthorizationError;
 use crate::principal::{Principal, PrincipalClass, ScopeSelector};
+use crate::records::AuditChainAnchorRecord;
 
 // ---------------------------------------------------------------------------
 // Action classes: what operation is being requested
@@ -88,6 +92,143 @@ pub enum AuthorizationOutcome {
     Allowed,
     AllowedWithOverride { ticket_id: u64 },
     Denied(String),
+}
+
+// ---------------------------------------------------------------------------
+// Remote privileged action admission
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct RemotePrivilegedAction {
+    pub command: String,
+    pub action: ActionClass,
+    pub resource: ScopeSelector,
+}
+
+impl RemotePrivilegedAction {
+    #[must_use]
+    pub fn new(command: impl Into<String>, action: ActionClass, resource: ScopeSelector) -> Self {
+        Self {
+            command: command.into(),
+            action,
+            resource,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct RemotePrivilegedAuthorizationContext {
+    pub principal: Option<Principal>,
+    pub session_id: Option<u64>,
+    pub policy_state: RemotePrivilegedPolicyState,
+    pub cluster_owner_state: ClusterOwnerAuthorizationState,
+    pub override_ticket_id: Option<u64>,
+    pub valid_override_ticket_ids: Vec<u64>,
+}
+
+impl RemotePrivilegedAuthorizationContext {
+    #[must_use]
+    pub fn available(principal: Principal, session_id: u64, decider_node_id: u64) -> Self {
+        Self {
+            principal: Some(principal),
+            session_id: Some(session_id),
+            policy_state: RemotePrivilegedPolicyState::Current,
+            cluster_owner_state: ClusterOwnerAuthorizationState::Available { decider_node_id },
+            override_ticket_id: None,
+            valid_override_ticket_ids: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn with_override(mut self, ticket_id: u64) -> Self {
+        self.override_ticket_id = Some(ticket_id);
+        self.valid_override_ticket_ids.push(ticket_id);
+        self
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub enum RemotePrivilegedPolicyState {
+    Current,
+    Missing,
+    Stale { reason: String },
+    Invalid { reason: String },
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub enum ClusterOwnerAuthorizationState {
+    Available { decider_node_id: u64 },
+    Unavailable { reason: String },
+    Refused { reason: String },
+}
+
+impl ClusterOwnerAuthorizationState {
+    const fn decider_node_id(&self) -> u64 {
+        match self {
+            Self::Available { decider_node_id } => *decider_node_id,
+            Self::Unavailable { .. } | Self::Refused { .. } => 0,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub enum RemotePrivilegedRefusalReason {
+    MissingIdentity,
+    MissingSession,
+    MissingPolicy,
+    StalePolicy { reason: String },
+    InvalidPolicy { reason: String },
+    ClusterOwnerUnavailable { reason: String },
+    ClusterOwnerRefused { reason: String },
+    MissingCapability { capability: String },
+    AuthorizationDenied { reason: String },
+}
+
+impl std::fmt::Display for RemotePrivilegedRefusalReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingIdentity => write!(f, "missing authenticated identity"),
+            Self::MissingSession => write!(f, "missing authenticated session"),
+            Self::MissingPolicy => write!(f, "missing remote authorization policy"),
+            Self::StalePolicy { reason } => {
+                write!(f, "stale remote authorization policy: {reason}")
+            }
+            Self::InvalidPolicy { reason } => {
+                write!(f, "invalid remote authorization policy: {reason}")
+            }
+            Self::ClusterOwnerUnavailable { reason } => {
+                write!(f, "cluster owner unavailable for authorization: {reason}")
+            }
+            Self::ClusterOwnerRefused { reason } => {
+                write!(f, "cluster owner refused authorization: {reason}")
+            }
+            Self::MissingCapability { capability } => {
+                write!(f, "missing capability '{capability}'")
+            }
+            Self::AuthorizationDenied { reason } => write!(f, "authorization denied: {reason}"),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct RemotePrivilegedAuthorizationEvidence {
+    pub command: String,
+    pub decision: AuthorizationDecision,
+    pub audit_event_id: AuditEventId,
+    pub chain_anchor: Option<AuditChainAnchorRecord>,
+    pub refusal: Option<RemotePrivilegedRefusalReason>,
+}
+
+impl RemotePrivilegedAuthorizationEvidence {
+    #[must_use]
+    pub fn is_allowed(&self) -> bool {
+        self.refusal.is_none()
+            && matches!(
+                self.decision.outcome,
+                AuthorizationOutcome::Allowed | AuthorizationOutcome::AllowedWithOverride { .. }
+            )
+            && self.audit_event_id.0 != 0
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -417,4 +558,219 @@ pub fn derive_authorization_decision_for_request(
             decider_node_id,
         }
     }
+}
+
+/// Evaluate and audit one remote privileged operator action.
+///
+/// This is the fail-closed source-owned admission path for cluster-routed
+/// privileged work. It does not transport a request or make any CLI command
+/// remote-capable by itself: callers must supply an authenticated principal,
+/// session, fresh policy state, reachable owner state, and an audit log.
+pub fn authorize_remote_privileged_action(
+    action: RemotePrivilegedAction,
+    context: RemotePrivilegedAuthorizationContext,
+    audit_log: &mut AuditLog,
+    sealing_key: &Keypair,
+    batch_size_threshold: usize,
+) -> Result<RemotePrivilegedAuthorizationEvidence, AuthorizationError> {
+    let decider_node_id = context.cluster_owner_state.decider_node_id();
+
+    let (decision, principal_id, session_id, refusal) =
+        remote_privileged_decision(action.clone(), context, decider_node_id);
+
+    let (audit_event_id, chain_anchor) = append_audit_event_and_seal_chain_if_needed(
+        audit_log,
+        &decision,
+        principal_id,
+        session_id,
+        sealing_key,
+        batch_size_threshold,
+    )?;
+
+    Ok(RemotePrivilegedAuthorizationEvidence {
+        command: action.command,
+        decision,
+        audit_event_id,
+        chain_anchor,
+        refusal,
+    })
+}
+
+fn remote_privileged_decision(
+    action: RemotePrivilegedAction,
+    context: RemotePrivilegedAuthorizationContext,
+    decider_node_id: u64,
+) -> (
+    AuthorizationDecision,
+    crate::principal::PrincipalId,
+    u64,
+    Option<RemotePrivilegedRefusalReason>,
+) {
+    let principal = match context.principal {
+        Some(principal) => principal,
+        None => anonymous_remote_principal(),
+    };
+    let principal_id = principal.principal_id;
+    let session_id = context.session_id.unwrap_or(0);
+
+    if principal_id.0 == 0 {
+        return denied_remote_privileged_decision(
+            &action,
+            principal,
+            session_id,
+            decider_node_id,
+            RemotePrivilegedRefusalReason::MissingIdentity,
+        );
+    }
+
+    if session_id == 0 {
+        return denied_remote_privileged_decision(
+            &action,
+            principal,
+            session_id,
+            decider_node_id,
+            RemotePrivilegedRefusalReason::MissingSession,
+        );
+    }
+
+    match context.policy_state {
+        RemotePrivilegedPolicyState::Current => {}
+        RemotePrivilegedPolicyState::Missing => {
+            return denied_remote_privileged_decision(
+                &action,
+                principal,
+                session_id,
+                decider_node_id,
+                RemotePrivilegedRefusalReason::MissingPolicy,
+            );
+        }
+        RemotePrivilegedPolicyState::Stale { reason } => {
+            return denied_remote_privileged_decision(
+                &action,
+                principal,
+                session_id,
+                decider_node_id,
+                RemotePrivilegedRefusalReason::StalePolicy { reason },
+            );
+        }
+        RemotePrivilegedPolicyState::Invalid { reason } => {
+            return denied_remote_privileged_decision(
+                &action,
+                principal,
+                session_id,
+                decider_node_id,
+                RemotePrivilegedRefusalReason::InvalidPolicy { reason },
+            );
+        }
+    }
+
+    match context.cluster_owner_state {
+        ClusterOwnerAuthorizationState::Available { decider_node_id } => {
+            let mut request = AuthorizationRequest::new(
+                principal.clone(),
+                session_id,
+                action.action,
+                action.resource.clone(),
+            );
+            if let Some(ticket_id) = context.override_ticket_id {
+                request = request.with_override(ticket_id);
+            }
+
+            let mut decision = derive_authorization_decision_for_request(
+                &request,
+                decider_node_id,
+                &context.valid_override_ticket_ids,
+            );
+            let refusal = remote_privileged_refusal_for_decision(&decision);
+            if let Some(ref refusal) = refusal {
+                decision.outcome = AuthorizationOutcome::Denied(refusal.to_string());
+            }
+
+            (decision, principal_id, session_id, refusal)
+        }
+        ClusterOwnerAuthorizationState::Unavailable { reason } => {
+            denied_remote_privileged_decision(
+                &action,
+                principal,
+                session_id,
+                decider_node_id,
+                RemotePrivilegedRefusalReason::ClusterOwnerUnavailable { reason },
+            )
+        }
+        ClusterOwnerAuthorizationState::Refused { reason } => denied_remote_privileged_decision(
+            &action,
+            principal,
+            session_id,
+            decider_node_id,
+            RemotePrivilegedRefusalReason::ClusterOwnerRefused { reason },
+        ),
+    }
+}
+
+fn remote_privileged_refusal_for_decision(
+    decision: &AuthorizationDecision,
+) -> Option<RemotePrivilegedRefusalReason> {
+    match &decision.outcome {
+        AuthorizationOutcome::Allowed | AuthorizationOutcome::AllowedWithOverride { .. } => None,
+        AuthorizationOutcome::Denied(reason) => {
+            let capability = required_capability(decision.request.action);
+            let has_capability =
+                principal_has_unexpired_capability(&decision.request.principal, capability);
+            if has_capability {
+                Some(RemotePrivilegedRefusalReason::AuthorizationDenied {
+                    reason: reason.clone(),
+                })
+            } else {
+                Some(RemotePrivilegedRefusalReason::MissingCapability {
+                    capability: capability.to_string(),
+                })
+            }
+        }
+    }
+}
+
+fn principal_has_unexpired_capability(principal: &Principal, capability: &str) -> bool {
+    principal
+        .roles
+        .iter()
+        .any(|role| role.capabilities.iter().any(|cap| cap == capability) && !role.is_expired())
+}
+
+fn denied_remote_privileged_decision(
+    action: &RemotePrivilegedAction,
+    principal: Principal,
+    session_id: u64,
+    decider_node_id: u64,
+    refusal: RemotePrivilegedRefusalReason,
+) -> (
+    AuthorizationDecision,
+    crate::principal::PrincipalId,
+    u64,
+    Option<RemotePrivilegedRefusalReason>,
+) {
+    let principal_id = principal.principal_id;
+    let decision = AuthorizationDecision {
+        request: AuthorizationRequest {
+            principal,
+            session_id,
+            action: action.action,
+            resource: action.resource.clone(),
+            override_ticket_id: None,
+        },
+        outcome: AuthorizationOutcome::Denied(refusal.to_string()),
+        matched_roles: Vec::new(),
+        decided_at_millis: crate::identity::current_time_utils(),
+        decider_node_id,
+    };
+
+    (decision, principal_id, session_id, Some(refusal))
+}
+
+fn anonymous_remote_principal() -> Principal {
+    Principal::new(
+        crate::principal::PrincipalId::new(0),
+        PrincipalClass::ClusterNode,
+        0,
+        Vec::new(),
+    )
 }
