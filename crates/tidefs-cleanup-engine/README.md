@@ -1,11 +1,11 @@
 # tidefs-cleanup-engine
 
 `tidefs-cleanup-engine` drains deferred cleanup queue entries through the
-cleanup job executors and records progress for resume.
+cleanup job executors and records per-entry decisions.
 
-## Replay Decision Receipts
+## Cleanup Decision Receipts
 
-Cleanup replay decision receipts are per-entry engine evidence. A receipt
+Cleanup decision receipts are local engine records. A receipt
 records:
 
 - cleanup queue entry id;
@@ -17,14 +17,13 @@ records:
 - validation tier represented by that evidence;
 - optional external artifact digest.
 
-The receipt format is deterministic and machine-readable, but it is scoped to
-engine decisions only. It does not change the cleanup queue root format,
-background scheduling policy, or reclaim runtime behavior.
+The receipt format is deterministic and machine-readable, and it is scoped to
+why this engine accepted, skipped, deferred, or rejected an observed cleanup
+entry. It does not define the cleanup queue root format, background scheduling
+policy, allocator publication, mounted capacity accounting, or reclaim behavior.
 
-Before TideFS can strengthen cleanup/reclaim product claims, the remaining
-evidence must still show cleanup queue root replay across crash/remount,
-runtime reclaim side effects against the allocator and namespace state, and
-mounted workload recovery that proves reclaimed space remains correct after
-interruption. These receipts explain why the cleanup engine accepted, skipped,
-deferred, or rejected an observed entry; they do not by themselves prove
-end-to-end reclaim crash safety.
+Product-level cleanup, reclaim, capacity, snapshot/deadlist, and compaction
+boundaries live in the authority documents and validation claims. For this
+crate, the useful invariant is narrower: a receipt must describe one engine
+decision without promoting that local decision into filesystem recovery,
+capacity, or release-readiness evidence.
