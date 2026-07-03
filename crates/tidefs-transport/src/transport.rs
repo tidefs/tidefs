@@ -2166,10 +2166,28 @@ impl Transport {
             payload
         };
 
-        // If payload exceeds MTU, fragment and send each fragment.
-        if payload.len() > self.mtu {
+        let send_byte_count = payload.len() as u64;
+
+        // Per-session ChaCha20-Poly1305 encryption. Encryption is part of the
+        // wire frame, so fragmentation must split encrypted bytes, not raw
+        // plaintext from a ciphered session.
+        let encrypted_payload;
+        let wire_payload: &[u8] = if self.session_has_ciphers(session_id) {
+            encrypted_payload = self
+                .sessions
+                .get(&session_id)
+                .and_then(|s| s.lock().ok())
+                .and_then(|mut s| s.seal_message(payload).ok())
+                .ok_or_else(|| TransportError::Generic("encryption failed".into()))?;
+            &encrypted_payload
+        } else {
+            payload
+        };
+
+        // If the wire payload exceeds MTU, fragment and send each fragment.
+        if wire_payload.len() > self.mtu {
             let msg_id = self.fragment_reassembler.next_message_id();
-            let fragments = fragment_message(msg_id, payload, self.mtu, 0);
+            let fragments = fragment_message(msg_id, wire_payload, self.mtu, 0);
             let conn = self
                 .active_connections
                 .get_mut(&session_id)
@@ -2181,7 +2199,7 @@ impl Transport {
             // Advance session HLC once per logical message.
             if let Some(session) = self.sessions.get(&session_id) {
                 if let Ok(mut s) = session.lock() {
-                    s.on_send(payload.len() as u64, priority);
+                    s.on_send(send_byte_count, priority);
                 }
             }
             for frag in &fragments {
@@ -2200,29 +2218,11 @@ impl Transport {
         // Advance session HLC on send.
         if let Some(session) = self.sessions.get(&session_id) {
             if let Ok(mut s) = session.lock() {
-                s.on_send(payload.len() as u64, priority);
+                s.on_send(send_byte_count, priority);
             }
         }
 
-        // Per-session ChaCha20-Poly1305 encryption.
-        let has_ciphers = self
-            .sessions
-            .get(&session_id)
-            .and_then(|s| s.lock().ok().map(|s| s.has_ciphers()))
-            .unwrap_or(false);
-
-        if has_ciphers {
-            let encrypted = self
-                .sessions
-                .get(&session_id)
-                .and_then(|s| s.lock().ok())
-                .and_then(|mut s| s.seal_message(payload).ok())
-                .ok_or_else(|| TransportError::Generic("encryption failed".into()))?;
-
-            conn.write_frame(&encrypted)
-        } else {
-            conn.write_frame(payload)
-        }
+        conn.write_frame(wire_payload)
     }
 
     /// Receive a message frame on an established session.
@@ -2285,7 +2285,8 @@ impl Transport {
 
             return match maybe_complete {
                 Some(reassembled) => {
-                    let unwrapped = self.apply_epoch_barrier_recv(reassembled)?;
+                    let frame = self.open_received_frame_if_ciphered(session_id, reassembled)?;
+                    let unwrapped = self.apply_epoch_barrier_recv(frame)?;
                     Ok(Some(
                         self.decompress_received_payload(session_id, unwrapped)?,
                     ))
@@ -2303,21 +2304,7 @@ impl Transport {
             }
         }
 
-        let has_ciphers = self
-            .sessions
-            .get(&session_id)
-            .and_then(|s| s.lock().ok().map(|s| s.has_ciphers()))
-            .unwrap_or(false);
-
-        let frame = if has_ciphers {
-            self.sessions
-                .get(&session_id)
-                .and_then(|s| s.lock().ok())
-                .and_then(|mut s| s.open_message(&raw_frame).ok())
-                .unwrap_or(raw_frame)
-        } else {
-            raw_frame
-        };
+        let frame = self.open_received_frame_if_ciphered(session_id, raw_frame)?;
 
         let unwrapped = self.apply_epoch_barrier_recv(frame)?;
         Ok(Some(
@@ -2345,7 +2332,9 @@ impl Transport {
     /// Record receive errors on the session statistics before propagating.
     pub fn recv_message(&mut self, session_id: SessionId) -> Result<Vec<u8>, TransportError> {
         let result = self.recv_message_inner(session_id);
-        if result.is_err() {
+        if result.is_err()
+            && !self.session_closed_with_reason(session_id, SessionCloseReason::TransportError)
+        {
             self.record_recv_err(session_id);
         }
         result
@@ -2421,18 +2410,9 @@ impl Transport {
 
             match maybe_complete {
                 Some(reassembled) => {
-                    let unwrapped = self.apply_epoch_barrier_recv(reassembled)?;
-                    // Per-session decompression for reassembled fragmented messages.
-                    if let Some(session) = self.sessions.get(&session_id) {
-                        if let Ok(mut s) = session.lock() {
-                            return s.decompress_inbound(&unwrapped).map_err(|e| {
-                                TransportError::Generic(format!(
-                                    "decompression failed after reassembly: {e}"
-                                ))
-                            });
-                        }
-                    }
-                    return Ok(unwrapped);
+                    let frame = self.open_received_frame_if_ciphered(session_id, reassembled)?;
+                    let unwrapped = self.apply_epoch_barrier_recv(frame)?;
+                    return self.decompress_received_payload(session_id, unwrapped);
                 }
                 None => {
                     self.fragment_reassembler.evict_expired();
@@ -3457,6 +3437,72 @@ impl Transport {
             }
         }
     }
+
+    fn session_has_ciphers(&self, session_id: SessionId) -> bool {
+        self.sessions
+            .get(&session_id)
+            .and_then(|s| s.lock().ok().map(|s| s.has_ciphers()))
+            .unwrap_or(false)
+    }
+
+    fn session_closed_with_reason(
+        &self,
+        session_id: SessionId,
+        expected_reason: SessionCloseReason,
+    ) -> bool {
+        let Some(session) = self.sessions.get(&session_id) else {
+            return false;
+        };
+        let Ok(session) = session.lock() else {
+            return false;
+        };
+        matches!(
+            &session.state,
+            SessionState::Closed { reason } if *reason == expected_reason
+        )
+    }
+
+    fn open_received_frame_if_ciphered(
+        &mut self,
+        session_id: SessionId,
+        frame: Vec<u8>,
+    ) -> Result<Vec<u8>, TransportError> {
+        if !self.session_has_ciphers(session_id) {
+            return Ok(frame);
+        }
+
+        let session = self
+            .sessions
+            .get(&session_id)
+            .cloned()
+            .ok_or(TransportError::SessionNotFound { session_id })?;
+        let opened = {
+            let mut session = session
+                .lock()
+                .map_err(|e| TransportError::Generic(format!("session lock poisoned: {e}")))?;
+            session.open_message(&frame)
+        };
+
+        match opened {
+            Ok(opened) => Ok(opened),
+            Err(error) => Err(self.refuse_ciphered_frame(session_id, error.to_string())),
+        }
+    }
+
+    fn refuse_ciphered_frame(
+        &mut self,
+        session_id: SessionId,
+        open_error: String,
+    ) -> TransportError {
+        self.record_recv_err(session_id);
+        let close_result = self.close_session(session_id, SessionCloseReason::TransportError);
+        let mut message =
+            format!("encrypted frame open failed for session {session_id}: {open_error}");
+        if let Err(close_error) = close_result {
+            message.push_str(&format!("; close failed: {close_error}"));
+        }
+        TransportError::Generic(message)
+    }
 }
 
 impl std::fmt::Debug for Transport {
@@ -3498,6 +3544,7 @@ mod tests {
     use crate::carrier_selection::{CarrierPolicy, CarrierSelectionFallback};
     use crate::session_cohort::NodeInfo;
     use crate::session_drain::{DrainOutcome, GracefulDrainConfig};
+    use std::collections::VecDeque;
     use tidefs_types_transport_session::{ClosureClass, CohortClass};
 
     use crate::ReconnectState;
@@ -3548,6 +3595,228 @@ mod tests {
             sid,
             Arc::new(std::sync::Mutex::new(make_established_session(sid))),
         );
+    }
+
+    fn make_ciphered_session(sid: SessionId, as_initiator: bool) -> Session {
+        let mut session = make_established_session(sid);
+        session.init_ciphers_from_key(&[0x5Au8; 32], as_initiator);
+        session
+    }
+
+    fn insert_ciphered_responder_session(t: &mut Transport, sid: SessionId) {
+        t.sessions.insert(
+            sid,
+            Arc::new(std::sync::Mutex::new(make_ciphered_session(sid, false))),
+        );
+    }
+
+    fn seal_from_ciphered_initiator(sid: SessionId, payload: &[u8]) -> Vec<u8> {
+        make_ciphered_session(sid, true)
+            .seal_message(payload)
+            .expect("initiator seals payload")
+    }
+
+    fn assert_transport_error_close(t: &Transport, sid: SessionId) {
+        let session = t
+            .sessions
+            .get(&sid)
+            .expect("session exists")
+            .lock()
+            .unwrap();
+        assert!(matches!(
+            &session.state,
+            SessionState::Closed { reason } if *reason == SessionCloseReason::TransportError
+        ));
+        drop(session);
+
+        let receipt = t
+            .session_closure_receipt(sid)
+            .expect("cipher refusal records close receipt");
+        assert_eq!(
+            receipt.trigger_ref,
+            SessionCloseReason::TransportError.trigger_ref()
+        );
+        assert_eq!(receipt.closure_class, ClosureClass::ForcedClose);
+        assert_eq!(receipt.drain_result_class, DrainResultClass::Force);
+    }
+
+    struct QueuedConnection {
+        frames: VecDeque<Vec<u8>>,
+        closed: bool,
+        nonblocking: bool,
+    }
+
+    impl QueuedConnection {
+        fn new(frames: Vec<Vec<u8>>) -> Self {
+            Self {
+                frames: frames.into_iter().collect(),
+                closed: false,
+                nonblocking: false,
+            }
+        }
+    }
+
+    impl ConnectionLike for QueuedConnection {
+        fn read_frame(&mut self) -> Result<Vec<u8>, TransportError> {
+            if self.closed {
+                return Err(TransportError::Generic("test connection closed".into()));
+            }
+
+            match self.frames.pop_front() {
+                Some(frame) => Ok(frame),
+                None if self.nonblocking => Err(TransportError::WouldBlock(
+                    "test connection queue empty".into(),
+                )),
+                None => Err(TransportError::Generic(
+                    "test connection queue empty".into(),
+                )),
+            }
+        }
+
+        fn write_frame(&mut self, _data: &[u8]) -> Result<(), TransportError> {
+            if self.closed {
+                return Err(TransportError::Generic("test connection closed".into()));
+            }
+
+            Ok(())
+        }
+
+        fn close(&mut self) {
+            self.closed = true;
+        }
+
+        fn set_nonblocking(&mut self, nonblocking: bool) -> Result<(), TransportError> {
+            self.nonblocking = nonblocking;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn ciphered_receive_opens_encrypted_frame() {
+        let sid = SessionId::new(3000);
+        let mut transport = Transport::new(2);
+        insert_ciphered_responder_session(&mut transport, sid);
+
+        let sealed = seal_from_ciphered_initiator(sid, b"authenticated payload");
+        let decoded = transport
+            .decode_received_frame(sid, sealed)
+            .expect("encrypted frame opens")
+            .expect("message decoded");
+
+        assert_eq!(decoded, b"authenticated payload");
+        let stats = transport.session_stats(sid).expect("stats available");
+        assert_eq!(stats.messages_received, 1);
+        assert_eq!(stats.receive_errors, 0);
+        assert!(transport.session_closure_receipt(sid).is_none());
+    }
+
+    #[test]
+    fn ciphered_receive_opens_fragmented_encrypted_frame() {
+        let sid = SessionId::new(3001);
+        let mut transport = Transport::new(2);
+        insert_ciphered_responder_session(&mut transport, sid);
+
+        let plaintext = vec![0xA5; 128];
+        let sealed = seal_from_ciphered_initiator(sid, &plaintext);
+        let fragments = fragment_message(77, &sealed, 64, 0);
+        assert!(
+            fragments.len() > 1,
+            "test must exercise reassembled encrypted frame"
+        );
+
+        let mut decoded = None;
+        for fragment in fragments {
+            decoded = transport
+                .decode_received_frame(sid, fragment)
+                .expect("fragment accepted");
+        }
+
+        assert_eq!(decoded.expect("final fragment decodes"), plaintext);
+        let stats = transport.session_stats(sid).expect("stats available");
+        assert_eq!(stats.receive_errors, 0);
+    }
+
+    #[test]
+    fn ciphered_recv_message_opens_fragmented_encrypted_frame() {
+        let sid = SessionId::new(3010);
+        let mut transport = Transport::new(2);
+        insert_ciphered_responder_session(&mut transport, sid);
+
+        let plaintext = vec![0xC3; 128];
+        let sealed = seal_from_ciphered_initiator(sid, &plaintext);
+        let fragments = fragment_message(78, &sealed, 64, 0);
+        assert!(
+            fragments.len() > 1,
+            "test must exercise recv_message reassembly"
+        );
+        transport
+            .active_connections
+            .insert(sid, Box::new(QueuedConnection::new(fragments)));
+
+        let decoded = transport.recv_message(sid).expect("message decoded");
+        assert_eq!(decoded, plaintext);
+        let stats = transport.session_stats(sid).expect("stats available");
+        assert_eq!(stats.receive_errors, 0);
+        assert!(transport.session_closure_receipt(sid).is_none());
+    }
+
+    #[test]
+    fn ciphered_receive_closes_on_corrupted_ciphertext() {
+        let sid = SessionId::new(3002);
+        let mut transport = Transport::new(2);
+        insert_ciphered_responder_session(&mut transport, sid);
+
+        let mut sealed = seal_from_ciphered_initiator(sid, b"corrupt me");
+        let last = sealed.len() - 1;
+        sealed[last] ^= 0x01;
+
+        let err = transport
+            .decode_received_frame(sid, sealed)
+            .expect_err("corrupted ciphertext is refused");
+        let err = err.to_string();
+        assert!(err.contains("encrypted frame open failed"));
+        assert!(err.contains("AEAD open failed"));
+
+        let stats = transport.session_stats(sid).expect("stats available");
+        assert_eq!(stats.messages_received, 1);
+        assert_eq!(stats.receive_errors, 1);
+        assert_transport_error_close(&transport, sid);
+    }
+
+    #[test]
+    fn ciphered_receive_closes_on_plaintext_frame() {
+        let sid = SessionId::new(3003);
+        let mut transport = Transport::new(2);
+        insert_ciphered_responder_session(&mut transport, sid);
+
+        let err = transport
+            .decode_received_frame(sid, b"plaintext injected into encrypted transport".to_vec())
+            .expect_err("plaintext frame is refused");
+        assert!(err.to_string().contains("encrypted frame open failed"));
+
+        let stats = transport.session_stats(sid).expect("stats available");
+        assert_eq!(stats.messages_received, 1);
+        assert_eq!(stats.receive_errors, 1);
+        assert_transport_error_close(&transport, sid);
+    }
+
+    #[test]
+    fn plaintext_receive_remains_allowed_without_ciphers() {
+        let sid = SessionId::new(3004);
+        let mut transport = Transport::new(2);
+        insert_established_session(&mut transport, sid);
+
+        let payload = b"plaintext local frame".to_vec();
+        let decoded = transport
+            .decode_received_frame(sid, payload.clone())
+            .expect("plaintext session accepts raw frame")
+            .expect("message decoded");
+
+        assert_eq!(decoded, payload);
+        let stats = transport.session_stats(sid).expect("stats available");
+        assert_eq!(stats.messages_received, 1);
+        assert_eq!(stats.receive_errors, 0);
+        assert!(transport.session_closure_receipt(sid).is_none());
     }
 
     fn insert_established_rdma_session(t: &mut Transport, sid: SessionId) {
