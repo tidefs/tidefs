@@ -49,8 +49,8 @@ TideFS pool member and emit a classified pass/fail/blocked report.
 Options:
   --timeout SECONDS    QEMU boot timeout (default: $TIMEOUT_SEC)
   --keep-tmp           Do not remove temp directory on exit
-  --tests "T1 T2 ..."  Space-separated test labels to report
-                       (default: authority/missing-pool)
+  --tests "T1 T2 ..."  Space-separated internal smoke labels to exercise
+                       (default: authority/missing-pool configured-pool-member)
   --module PATH        Path to pre-built .ko file
                        (default: auto-build from repo tree)
   --help, -h           Show this message
@@ -63,7 +63,8 @@ EOF
     }
 
     KEEP_TMP=""
-    SMOKE_TESTS="authority/missing-pool configured-pool-member"
+    SMOKE_TESTS_DEFAULT="authority/missing-pool configured-pool-member"
+    SMOKE_TESTS="$SMOKE_TESTS_DEFAULT"
     KO_PATH_ARG=""
 
     while [[ "$#" -gt 0 ]]; do
@@ -77,11 +78,42 @@ EOF
       esac
     done
 
+    smoke_tests_without_space="''${SMOKE_TESTS//[[:space:]]/}"
+    if [ -z "$smoke_tests_without_space" ]; then
+      SMOKE_TESTS="$SMOKE_TESTS_DEFAULT"
+    fi
+
+    RUN_SMOKE_MISSING_POOL=0
+    RUN_SMOKE_CONFIGURED_POOL=0
+    SMOKE_TESTS_SELECTED=""
+    for smoke_test in $SMOKE_TESTS; do
+      case "$smoke_test" in
+        authority/missing-pool)
+          if [ "$RUN_SMOKE_MISSING_POOL" -eq 0 ]; then
+            RUN_SMOKE_MISSING_POOL=1
+            SMOKE_TESTS_SELECTED="$SMOKE_TESTS_SELECTED authority/missing-pool"
+          fi
+          ;;
+        configured-pool-member)
+          if [ "$RUN_SMOKE_CONFIGURED_POOL" -eq 0 ]; then
+            RUN_SMOKE_CONFIGURED_POOL=1
+            SMOKE_TESTS_SELECTED="$SMOKE_TESTS_SELECTED configured-pool-member"
+          fi
+          ;;
+        *)
+          echo "ERROR: unsupported kmod-smoke test label: $smoke_test" >&2
+          echo "Supported labels: $SMOKE_TESTS_DEFAULT" >&2
+          exit 2
+          ;;
+      esac
+    done
+    SMOKE_TESTS_SELECTED="''${SMOKE_TESTS_SELECTED# }"
+
     echo "=== TideFS K7-VAL: kmod-posix-vfs Kernel XFSTests Smoke Harness ==="
     echo "  Kernel:     $KERNEL_IMG ($KERNEL_VERSION)"
     echo "  QEMU:       $QEMU_BIN"
     echo "  Module:     kmod-posix-vfs (tidefs_posix_vfs)"
-    echo "  Tests:      $SMOKE_TESTS"
+    echo "  Tests:      $SMOKE_TESTS_SELECTED"
     echo "  Timeout:    ''${TIMEOUT_SEC}s"
     echo ""
 
@@ -196,11 +228,18 @@ EOF
     # Create /etc/passwd and /etc/group for smoke tests
     echo "root:x:0:0:root:/root:/bin/sh" > "$RUN_DIR/etc/passwd"
     echo "root:x:0:" > "$RUN_DIR/etc/group"
+    {
+      printf "SMOKE_TESTS_SELECTED='%s'\n" "$SMOKE_TESTS_SELECTED"
+      printf 'RUN_SMOKE_MISSING_POOL=%s\n' "$RUN_SMOKE_MISSING_POOL"
+      printf 'RUN_SMOKE_CONFIGURED_POOL=%s\n' "$RUN_SMOKE_CONFIGURED_POOL"
+    } > "$RUN_DIR/etc/tidefs-smoke-tests.env"
 
     # Build the init script
     cat > "$RUN_DIR/init" << 'INITSCRIPT'
 #!/bin/sh
 export PATH=/bin:/usr/bin:/sbin:/usr/sbin
+
+. /etc/tidefs-smoke-tests.env
 
 mount -t proc proc /proc
 mount -t sysfs sysfs /sys
@@ -211,6 +250,7 @@ echo "================================================================"
 echo "=== TideFS K7 KmodXFSTests: kernel xfstests smoke harness ==="
 echo "kernel_version=$(uname -r)"
 echo "timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+echo "selected_tests=$SMOKE_TESTS_SELECTED"
 echo "================================================================"
 echo ""
 
@@ -260,61 +300,71 @@ echo "--- Phase 1: Configured Pool Member Setup ---"
 mkdir -p "$SCRATCH_DIR"
 POOL_DEVICE_READY=0
 POOL_READY=0
-echo "Waiting for virtio pool member $POOL_DEV..."
-for _ in $(seq 1 30); do
-    [ -b "$POOL_DEV" ] && break
-    sleep 1
-done
-if [ -b "$POOL_DEV" ]; then
-    POOL_DEVICE_READY=1
-    pass "configured_pool_device_present"
-else
-    blocked "configured_pool_device_present" "$POOL_DEV missing"
-fi
+if [ "$RUN_SMOKE_CONFIGURED_POOL" -eq 1 ]; then
+    echo "Waiting for virtio pool member $POOL_DEV..."
+    for _ in $(seq 1 30); do
+        [ -b "$POOL_DEV" ] && break
+        sleep 1
+    done
+    if [ -b "$POOL_DEV" ]; then
+        POOL_DEVICE_READY=1
+        pass "configured_pool_device_present"
+    else
+        blocked "configured_pool_device_present" "$POOL_DEV missing"
+    fi
 
-if [ "$POOL_DEVICE_READY" -eq 1 ] && command -v tidefsctl >/dev/null 2>&1; then
-    echo "tidefsctl pool create $POOL_NAME --devices $POOL_DEV --json"
-    COUT=$(tidefsctl pool create "$POOL_NAME" --devices "$POOL_DEV" --json 2>&1); RC=$?
-    echo "  create exit=$RC"
-    if [ "$RC" -eq 0 ]; then
-        pass "configured_pool_member_created"
-        SOUT=$(tidefsctl pool scan --devices "$POOL_DEV" 2>&1); SRC=$?
-        if [ "$SRC" -eq 0 ] && echo "$SOUT" | grep -qi "label"; then
-            pass "configured_pool_label_verified"
-            POOL_READY=1
+    if [ "$POOL_DEVICE_READY" -eq 1 ] && command -v tidefsctl >/dev/null 2>&1; then
+        echo "tidefsctl pool create $POOL_NAME --devices $POOL_DEV --json"
+        COUT=$(tidefsctl pool create "$POOL_NAME" --devices "$POOL_DEV" --json 2>&1); RC=$?
+        echo "  create exit=$RC"
+        if [ "$RC" -eq 0 ]; then
+            pass "configured_pool_member_created"
+            SOUT=$(tidefsctl pool scan --devices "$POOL_DEV" 2>&1); SRC=$?
+            if [ "$SRC" -eq 0 ] && echo "$SOUT" | grep -qi "label"; then
+                pass "configured_pool_label_verified"
+                POOL_READY=1
+            else
+                fail "configured_pool_label_verified" "$SOUT"
+            fi
         else
-            fail "configured_pool_label_verified" "$SOUT"
+            fail "configured_pool_member_created" "$COUT"
         fi
     else
-        fail "configured_pool_member_created" "$COUT"
+        if [ "$POOL_DEVICE_READY" -eq 0 ]; then
+            blocked "configured_pool_member_created" "virtio pool device missing"
+        else
+            blocked "configured_pool_member_created" "tidefsctl not found in initramfs"
+        fi
+        blocked "configured_pool_label_verified" "pool member was not created"
     fi
 else
-    if [ "$POOL_DEVICE_READY" -eq 0 ]; then
-        blocked "configured_pool_member_created" "virtio pool device missing"
-    else
-        blocked "configured_pool_member_created" "tidefsctl not found in initramfs"
-    fi
-    blocked "configured_pool_label_verified" "pool member was not created"
+    echo "Skipping configured pool member setup; configured-pool-member not selected."
 fi
 
 echo ""
 echo "--- Phase 2: Missing Pool Authority Mount Attempt ---"
 MOUNTED=0
 mkdir -p "$MNT"
-echo "mount -o bootstrap -t tidefs none $MNT"
-if mount -o bootstrap -t tidefs none "$MNT" 2>/tmp/mount.err; then
-    fail "missing_pool_member_rejected" "bootstrap mount unexpectedly succeeded without explicit pool I/O authority"
-    umount "$MNT" 2>/dev/null || true
+if [ "$RUN_SMOKE_MISSING_POOL" -eq 1 ]; then
+    echo "mount -o bootstrap -t tidefs none $MNT"
+    if mount -o bootstrap -t tidefs none "$MNT" 2>/tmp/mount.err; then
+        fail "missing_pool_member_rejected" "bootstrap mount unexpectedly succeeded without explicit pool I/O authority"
+        umount "$MNT" 2>/dev/null || true
+    else
+        err="$(head -3 /tmp/mount.err | tr '\n' ' ')"
+        pass "missing_pool_member_rejected"
+        echo "  refusal: $err"
+    fi
 else
-    err="$(head -3 /tmp/mount.err | tr '\n' ' ')"
-    pass "missing_pool_member_rejected"
-    echo "  refusal: $err"
+    echo "Skipping missing pool authority check; authority/missing-pool not selected."
 fi
 
 echo ""
 echo "--- Phase 3: Configured Pool Member Mount Tests ---"
 
-if [ "$POOL_READY" -eq 1 ]; then
+if [ "$RUN_SMOKE_CONFIGURED_POOL" -ne 1 ]; then
+    echo "Skipping configured pool member mount tests; configured-pool-member not selected."
+elif [ "$POOL_READY" -eq 1 ]; then
     echo "mount -t tidefs $POOL_DEV $MNT"
     if mount -t tidefs "$POOL_DEV" "$MNT" 2>/tmp/configured-mount.err; then
         pass "configured_pool_mount"
@@ -435,7 +485,9 @@ fi
 
 echo ""
 echo "--- Phase 4: No-daemon Residency Check ---"
-if mountpoint -q "$MNT" 2>/dev/null; then
+if [ "$RUN_SMOKE_CONFIGURED_POOL" -ne 1 ]; then
+    echo "Skipping no-daemon residency checks; configured-pool-member not selected."
+elif mountpoint -q "$MNT" 2>/dev/null; then
     mounts_fuse=$(mount 2>/dev/null | grep tidefs | grep fuse || true)
     if [ -z "$mounts_fuse" ]; then
         pass "no_daemon_fuse_mount"
@@ -446,11 +498,13 @@ else
     pass "no_daemon_fuse_mount"
 fi
 
-ublk_run=$(ps 2>/dev/null | grep -v grep | grep ublk || true)
-if [ -z "$ublk_run" ]; then
-    pass "no_daemon_ublk"
-else
-    refusal "no_daemon_ublk" "ublk process detected"
+if [ "$RUN_SMOKE_CONFIGURED_POOL" -eq 1 ]; then
+    ublk_run=$(ps 2>/dev/null | grep -v grep | grep ublk || true)
+    if [ -z "$ublk_run" ]; then
+        pass "no_daemon_ublk"
+    else
+        refusal "no_daemon_ublk" "ublk process detected"
+    fi
 fi
 
 echo ""

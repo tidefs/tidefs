@@ -14,7 +14,7 @@ on:
           - kmod-smoke
           - k7-vfs
       tests:
-        description: Optional space-separated focused tests, e.g. generic/003
+        description: Optional space-separated focused tests, e.g. generic/003 or kmod-smoke labels
         required: false
         default: ''
         type: string
@@ -135,9 +135,56 @@ jobs:
           fi
           finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
-          # Evidence scope: focused when tests are supplied, broad otherwise.
+          normalize_kmod_smoke_tests() {
+            local input="$1"
+            local default_tests="authority/missing-pool configured-pool-member"
+            local selected=""
+            local saw_missing=0
+            local saw_configured=0
+            local input_without_space="${input//[[:space:]]/}"
+            local test_name
+
+            if [ -z "$input_without_space" ]; then
+              printf '%s\n' "$default_tests"
+              return 0
+            fi
+
+            for test_name in $input; do
+              case "$test_name" in
+                authority/missing-pool)
+                  if [ "$saw_missing" -eq 0 ]; then
+                    saw_missing=1
+                    selected="$selected authority/missing-pool"
+                  fi
+                  ;;
+                configured-pool-member)
+                  if [ "$saw_configured" -eq 0 ]; then
+                    saw_configured=1
+                    selected="$selected configured-pool-member"
+                  fi
+                  ;;
+                *)
+                  printf '%s\n' "$test_name"
+                  return 1
+                  ;;
+              esac
+            done
+
+            printf '%s\n' "${selected# }"
+          }
+
+          MANIFEST_TESTS_INPUT="${EVIDENCE_TESTS_INPUT:-}"
+          SELECTION_ERROR=""
+          if [ "$EVIDENCE_TARGET" = "kmod-smoke" ]; then
+            if ! MANIFEST_TESTS_INPUT="$(normalize_kmod_smoke_tests "${EVIDENCE_TESTS_INPUT:-}")"; then
+              SELECTION_ERROR="unsupported kmod-smoke test label: $MANIFEST_TESTS_INPUT"
+              MANIFEST_TESTS_INPUT=""
+            fi
+          fi
+
+          # Evidence scope: focused when supported tests are supplied, broad otherwise.
           tests_input_without_space="${EVIDENCE_TESTS_INPUT//[[:space:]]/}"
-          if [ -n "$tests_input_without_space" ]; then
+          if [ -n "$tests_input_without_space" ] && [ -z "$SELECTION_ERROR" ]; then
             evidence_scope="focused"
           else
             evidence_scope="broad"
@@ -145,7 +192,7 @@ jobs:
 
           # Write manifest via jq when available, else fall back to a minimal valid manifest.
           if command -v jq >/dev/null 2>&1; then
-            tests_json="$(printf '%s' "${EVIDENCE_TESTS_INPUT:-}" | jq -R 'split(" ") | map(select(. != ""))')"
+            tests_json="$(printf '%s' "${MANIFEST_TESTS_INPUT:-}" | jq -R 'split(" ") | map(select(. != ""))')"
             artifact_paths_json="[]"
             if [ -d "$ARTIFACT_ROOT" ]; then
               artifact_paths_json="$(cd "$ARTIFACT_ROOT" && find . -type f -not -name 'evidence-manifest.json' | sed 's|^\./||' | sort | jq -R -s 'split("\n") | map(select(. != ""))')"
@@ -161,6 +208,7 @@ jobs:
               --arg evidence_scope "$evidence_scope" \
               --argjson tests "$tests_json" \
               --argjson artifact_paths "$artifact_paths_json" \
+              --arg selection_error "$SELECTION_ERROR" \
               --arg started_at "$started_at" \
               --arg finished_at "$finished_at" \
               '{
@@ -175,6 +223,7 @@ jobs:
               }
               + if $tests != [] then {tests: $tests} else {} end
               + if $artifact_paths != [] then {artifact_paths: $artifact_paths} else {} end
+              + if $selection_error != "" then {selection_error: $selection_error} else {} end
               + if $started_at != "" then {started_at: $started_at} else {} end
               + {finished_at: $finished_at}' \
               > "$ARTIFACT_ROOT/evidence-manifest.json"
@@ -216,7 +265,7 @@ jobs:
               printf ']'
             }
 
-            tests_json="$(json_array_from_words "${EVIDENCE_TESTS_INPUT:-}")"
+            tests_json="$(json_array_from_words "${MANIFEST_TESTS_INPUT:-}")"
             artifact_paths_json="[]"
             if [ -d "$ARTIFACT_ROOT" ]; then
               artifact_paths_json="$(cd "$ARTIFACT_ROOT" && find . -type f -not -name 'evidence-manifest.json' | sed 's|^\./||' | sort | json_array_from_lines)"
@@ -224,6 +273,10 @@ jobs:
             started_at_field=""
             if [ -n "$started_at" ]; then
               started_at_field="\"started_at\": $(json_string "$started_at"),"
+            fi
+            selection_error_field=""
+            if [ -n "$SELECTION_ERROR" ]; then
+              selection_error_field="\"selection_error\": $(json_string "$SELECTION_ERROR"),"
             fi
             cat > "$ARTIFACT_ROOT/evidence-manifest.json" << MANIFEST_EOF
           {
@@ -237,6 +290,7 @@ jobs:
             "evidence_scope": $(json_string "$evidence_scope"),
             "tests": ${tests_json},
             "artifact_paths": ${artifact_paths_json},
+            ${selection_error_field}
             ${started_at_field}
             "finished_at": $(json_string "$finished_at")
           }

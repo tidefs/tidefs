@@ -60,6 +60,10 @@ pub struct XfstestsEvidenceManifest {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub artifact_paths: Vec<String>,
 
+    /// Unsupported selector rejected before focused evidence was recorded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selection_error: Option<String>,
+
     /// UTC timestamp when the run started (if available).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub started_at: Option<String>,
@@ -177,6 +181,10 @@ impl XfstestsEvidenceManifest {
 
         for path in &self.artifact_paths {
             validate_relative_artifact_path(path, &mut failures);
+        }
+
+        if matches!(self.selection_error.as_deref(), Some(error) if error.trim().is_empty()) {
+            failures.push("selection_error must not be blank when present".to_string());
         }
 
         XfstestsEvidenceManifestError::from_failures(failures)

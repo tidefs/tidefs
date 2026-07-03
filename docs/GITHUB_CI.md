@@ -194,9 +194,12 @@ may use non-secret repository variables for scheduling gates, such as
 - `xfstests` and `RDMA` are scheduled/manual lanes for longer filesystem and
   transport work. Manual `xfstests` dispatch accepts a `target` and an
   optional space-separated `tests` list. Use the smallest known failing row set
-  such as `generic/003` while debugging an isolated failure; reserve broad
-  target dispatches such as `target=fuse` or `target=all` for acceptance gates,
-  scheduled coverage, or when the failure set is not yet isolated. `RDMA`
+  such as `generic/003` for `fuse` or `k7-vfs` while debugging an isolated
+  failure. The `kmod-smoke` target accepts only its internal smoke labels,
+  `authority/missing-pool` and `configured-pool-member`, and fails closed for
+  upstream xfstests row names. Reserve broad target dispatches such as
+  `target=fuse` or `target=all` for acceptance gates, scheduled coverage, or
+  when the failure set is not yet isolated. `RDMA`
   dispatch runs three matrix targets: `static-carrier-check` for source/harness
   structure, `host-probe` for non-mutating runner capability inspection, and
   `qemu-two-node` for multi-process distributed transport evidence. The first
