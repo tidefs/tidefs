@@ -10,6 +10,7 @@
 //! closed instead of acting as operator pool media.
 
 use std::path::PathBuf;
+use std::process;
 
 use clap::Subcommand;
 use tidefs_device_removal::admission::DEVICE_REMOVAL_AUTHORITY_KIND;
@@ -208,8 +209,30 @@ fn device_remove_live_args(
 /// Query live device status through the live owner, or fail closed
 /// with source-classified refusal when no live owner is reachable.
 fn handle_device_status(pool_name: String, json: bool) {
+    let live_truth =
+        super::operator_truth::OperatorTruthCarrier::live_route("device", "status", &pool_name);
+    if !json {
+        eprintln!(
+            "operator truth carrier: routing tidefsctl device status pool '{}' as {}",
+            pool_name,
+            live_truth.freshness.as_str()
+        );
+    }
     super::live_owner::route_status_if_owner_exists("device", "status", &pool_name, json);
-    super::live_owner::refuse_no_live_status_evidence("device", "status", &pool_name, json);
+    let refusal_truth = super::operator_truth::OperatorTruthCarrier::no_live_refusal(
+        "device", "status", &pool_name,
+    );
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&refusal_truth.json_value()).unwrap()
+        );
+    } else {
+        for line in refusal_truth.operator_lines() {
+            eprintln!("{line}");
+        }
+    }
+    process::exit(1);
 }
 
 #[cfg(test)]
@@ -357,6 +380,21 @@ mod tests {
             args.is_err(),
             "device status without pool name must be rejected"
         );
+    }
+
+    #[test]
+    fn device_status_truth_carrier_refuses_without_live_owner() {
+        let carrier = super::super::operator_truth::OperatorTruthCarrier::no_live_refusal(
+            "device", "status", "testpool",
+        );
+        let lines = carrier.operator_lines();
+        let json = carrier.json_value();
+
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("evidence:   refused")));
+        assert_eq!(json["freshness"], "fresh.truth_view.refused.f4");
+        assert_eq!(json["source"], "source.truth_view.runtime_mirror.a2");
     }
 
     #[test]

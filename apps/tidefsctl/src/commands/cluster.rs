@@ -1100,11 +1100,33 @@ fn handle_heal_exercise(epoch: u64, lost_member: u64, json: bool) {
 /// Query live cluster status through the live owner, or fail closed
 /// with source-classified refusal when no live owner is reachable.
 fn handle_cluster_status(pool_name: String, json: bool) {
+    let live_truth =
+        super::operator_truth::OperatorTruthCarrier::live_route("cluster", "status", &pool_name);
     // Try the live owner first; exits if reachable.
+    if !json {
+        eprintln!(
+            "operator truth carrier: routing tidefsctl cluster status pool '{}' as {}",
+            pool_name,
+            live_truth.freshness.as_str()
+        );
+    }
     super::live_owner::route_status_if_owner_exists("cluster", "status", &pool_name, json);
 
     // No live owner reachable; fail closed with source classification.
-    super::live_owner::refuse_no_live_status_evidence("cluster", "status", &pool_name, json);
+    let refusal_truth = super::operator_truth::OperatorTruthCarrier::no_live_refusal(
+        "cluster", "status", &pool_name,
+    );
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&refusal_truth.json_value()).unwrap()
+        );
+    } else {
+        for line in refusal_truth.operator_lines() {
+            eprintln!("{line}");
+        }
+    }
+    process::exit(1);
 }
 
 // Helpers
@@ -1642,5 +1664,20 @@ mod tests {
             args.is_err(),
             "cluster status without pool name must be rejected"
         );
+    }
+
+    #[test]
+    fn cluster_status_truth_carrier_refuses_without_live_owner() {
+        let carrier = super::super::operator_truth::OperatorTruthCarrier::no_live_refusal(
+            "cluster", "status", "testpool",
+        );
+        let lines = carrier.operator_lines();
+        let json = carrier.json_value();
+
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("evidence:   refused")));
+        assert_eq!(json["freshness"], "fresh.truth_view.refused.f4");
+        assert_eq!(json["source"], "source.truth_view.runtime_mirror.a2");
     }
 }
