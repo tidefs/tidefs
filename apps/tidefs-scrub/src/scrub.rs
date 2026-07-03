@@ -1003,9 +1003,10 @@ mod tests {
     }
 
     fn open_test_pool(root: &Path) -> Pool {
+        let options = StoreOptions::durable();
         LocalFileSystem::default_development_pool(
             root,
-            &StoreOptions::durable(),
+            &options,
             None,
             None,
         )
