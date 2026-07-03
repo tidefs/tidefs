@@ -59,6 +59,9 @@ const fn label_media_class(device_class: LocalPoolDeviceClass) -> StorageMediaCl
         LocalPoolDeviceClass::Nvme | LocalPoolDeviceClass::LogDevice => {
             StorageMediaClass::NvmeFlash
         }
+        LocalPoolDeviceClass::Pmem | LocalPoolDeviceClass::Nvdimm => {
+            StorageMediaClass::PersistentMemory
+        }
         LocalPoolDeviceClass::Cache => StorageMediaClass::SsdFlash,
         LocalPoolDeviceClass::Special => StorageMediaClass::SsdFlash,
         LocalPoolDeviceClass::Spare => StorageMediaClass::HddRotational,
@@ -95,6 +98,8 @@ pub enum LocalPoolDeviceClass {
     Hdd,
     Ssd,
     Nvme,
+    Pmem,
+    Nvdimm,
     LogDevice,
     Cache,
     Special,
@@ -1441,6 +1446,56 @@ mod tests {
             .with_latency_class_us(80)
     }
 
+    fn strong_pmem_facts() -> LocalMediaCapabilityFacts {
+        let block = LocalBlockIoCapabilities {
+            read: true,
+            write: true,
+            flush: true,
+            discard: false,
+            write_zeroes: false,
+            zero_range: false,
+            teardown: true,
+            sector_size: 64,
+            capacity_sectors: 4096,
+        };
+
+        LocalMediaCapabilityFacts::new(StorageMediaClass::PersistentMemory, evidence(21))
+            .with_identity(LocalMediaIdentityFacts::stable(
+                21,
+                evidence(22),
+                evidence(23),
+            ))
+            .with_persistence(LocalPersistenceFacts::new(
+                MediaPersistenceDomain::PersistentMemory,
+                evidence(24),
+            ))
+            .with_block_io(
+                LocalBlockIoFacts::from_block_capabilities(block, evidence(25))
+                    .with_flush_ordering(MediaFlushOrderingClass::PmemFlushFence)
+                    .with_max_queue_depth(1),
+            )
+            .with_atomicity(LocalAtomicityFacts::block_atomic(
+                MediaAtomicityClass::AtomicWriteUnit,
+                64,
+                64,
+                evidence(26),
+            ))
+            .with_geometry(LocalGeometryFacts::new(
+                MediaProtocolGeometryClass::PmemByteAddressable,
+                64,
+                evidence(27),
+            ))
+            .with_health(LocalHealthFacts::new(
+                MediaHealthState::Healthy,
+                evidence(28),
+            ))
+            .with_freshness(LocalFreshnessFacts::new(
+                MediaCapabilityFreshnessState::Fresh,
+                evidence(29),
+            ))
+            .with_latency_class_us(1)
+    }
+
     fn durable_sync_result(record: StorageIntentMediaCapabilityRecord) -> ReceiptPredicateResult {
         media_capability_satisfies_role(
             MediaRoleRequirement::AUTHORITY,
@@ -2053,5 +2108,101 @@ mod tests {
             result.refusal,
             StorageIntentRefusalReason::PmemFlushFenceMissing
         );
+    }
+
+    #[test]
+    fn pmem_label_maps_media_class_without_persistence_receipt() {
+        let mut label = pool_label();
+        label.device_class = LocalPoolDeviceClass::Pmem;
+        let identity = LocalPoolMemberIdentitySnapshot::from_decoded_label(
+            label,
+            true,
+            true,
+            LocalPathIdentityClass::StableSinglePath,
+            3,
+        );
+        let facts = LocalMediaCapabilityFacts::new(identity.media_class(), evidence(31))
+            .with_identity(identity.identity_facts(
+                LocalFirmwareSettingsSnapshot::proven(13, 13),
+                evidence(32),
+                evidence(33),
+            ))
+            .with_persistence(LocalPersistenceSnapshot::label_only(evidence(34)).facts())
+            .with_block_io(
+                LocalBlockIoFacts::from_block_capabilities(
+                    LocalBlockIoCapabilities::read_write_flush(64, 4096, true),
+                    evidence(35),
+                )
+                .with_flush_ordering(MediaFlushOrderingClass::PmemFlushFence),
+            )
+            .with_atomicity(LocalAtomicityFacts::block_atomic(
+                MediaAtomicityClass::AtomicWriteUnit,
+                64,
+                64,
+                evidence(36),
+            ))
+            .with_geometry(LocalGeometryFacts::new(
+                MediaProtocolGeometryClass::PmemByteAddressable,
+                64,
+                evidence(37),
+            ))
+            .with_health(identity.health_facts(evidence(38)))
+            .with_freshness(LocalFreshnessFacts::new(
+                MediaCapabilityFreshnessState::Fresh,
+                evidence(39),
+            ));
+
+        let record = produce_local_media_capability(facts);
+        let result = durable_sync_result(record);
+
+        assert_eq!(record.media_class, StorageMediaClass::PersistentMemory);
+        assert!(!record
+            .flags
+            .contains_all(MediaCapabilityFlags::PERSISTENCE_DOMAIN));
+        assert!(!result.satisfied);
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::UnknownPersistenceDomain
+        );
+    }
+
+    #[test]
+    fn nvdimm_pmem_flush_fence_receipt_satisfies_sync_role() {
+        let mut label = pool_label();
+        label.device_class = LocalPoolDeviceClass::Nvdimm;
+        let identity = LocalPoolMemberIdentitySnapshot::from_decoded_label(
+            label,
+            true,
+            true,
+            LocalPathIdentityClass::StableSinglePath,
+            4,
+        );
+
+        let record = produce_local_media_capability(strong_pmem_facts().with_identity(
+            identity.identity_facts(
+                LocalFirmwareSettingsSnapshot::proven(14, 14),
+                evidence(41),
+                evidence(42),
+            ),
+        ));
+        let result = durable_sync_result(record);
+
+        assert!(result.satisfied);
+        assert_eq!(record.media_class, StorageMediaClass::PersistentMemory);
+        assert_eq!(record.persistence, MediaPersistenceDomain::PersistentMemory);
+        assert_eq!(
+            record.flush_ordering,
+            MediaFlushOrderingClass::PmemFlushFence
+        );
+        assert_eq!(
+            record.geometry,
+            MediaProtocolGeometryClass::PmemByteAddressable
+        );
+        assert!(record.flags.contains_all(
+            MediaCapabilityFlags::PERSISTENCE_DOMAIN
+                .union(MediaCapabilityFlags::PMEM_FLUSH_FENCE)
+                .union(MediaCapabilityFlags::STABLE_DEVICE_IDENTITY)
+                .union(MediaCapabilityFlags::STABLE_NAMESPACE_IDENTITY)
+        ));
     }
 }
