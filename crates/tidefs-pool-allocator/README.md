@@ -1,24 +1,27 @@
 # tidefs-pool-allocator
 
-Pool-level segment allocator: the single authority on free-segment tracking,
-segment_group selection, and space-pressure signalling for the entire storage
-pool.
+Lower-layer segment allocator for caller-provided free-segment maps. It tracks
+free segments, picks segment_groups, reports allocator-local pressure
+transitions, and serialises its own free-map checkpoints.
 
-Answers "where can I put this data?" at the segment granularity — one level
-above the block allocator's byte-range decisions and one level below the
-dataset lifecycle's capacity-planning layer. Every object-store write, reclaim
-cycle, and pool checkpoint flows through the allocation decisions made here.
+This crate answers "which free segment can this caller use next?" at segment
+granularity. It is a placement input below mounted capacity accounting,
+reclaim policy, and pool/device lifecycle authority. Product-facing capacity,
+quota, `statfs`, reclaim, and pool/device lifecycle truth lives in
+`docs/CAPACITY_ACCOUNTING_AUTHORITY.md`,
+`docs/POOL_IMPORT_EXPORT_DEVICE_TOPOLOGY_DESIGN.md`, and
+`validation/claims.toml`.
 
 ## Position in the stack
 
 ```
-dataset lifecycle / capacity planning
+mounted capacity / pool-device lifecycle authority
         |
-  pool-import / pool-scan   -- "what devices and free segments exist?"
+  pool-import / pool-scan   -- provide device and free-segment inputs
         |
-  PoolAllocator             -- "here is the next free segment" or ENOSPC
+  PoolAllocator             -- allocator-local next-segment choice or ENOSPC
         |
-  object store / reclaim    -- commit segments, drain dead objects, checkpoint
+  object store / reclaim    -- callers consume/free/checkpoint segments
         |
   BlockAllocator            -- "here are N free blocks within this segment"
 ```
@@ -99,7 +102,7 @@ allocate() --> use segment --> add_free(segment) --> back in free pool
 | `MultiDevicePoolAllocator` | Multi-device coordinator |
 | `PoolAllocatorError` | Error enum (wraps `FreeMapError`) |
 | `SpacePressureEvent` | Pressure transition (enter/exit) |
-| `PoolAllocatorStats` | Snapshot of pool-wide state |
+| `PoolAllocatorStats` | Snapshot of allocator-visible free-segment state |
 | `SegmentGroupAllocStats` | Per-segment_group allocation counters |
 | `AllocDeviceClass` | Device class for multi-device routing |
 | `MultiDeviceAllocError` | Multi-device error enum |
