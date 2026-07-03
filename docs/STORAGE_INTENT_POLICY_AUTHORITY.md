@@ -4355,9 +4355,10 @@ This document composes existing authority surfaces:
   quota, statfs, allocator, pending-free, allocation-ticket, claim, and reserve
   evidence inform #898, but storage intent consumes typed refs instead of
   originating a parallel capacity authority.
-- `docs/design/unified-scheduling-classes-lane-priority-model.md`: storage
-  intent maps onto the shared lane vocabulary for admission, dispatch,
-  starvation prevention, and pressure throttling.
+- `crates/tidefs-types-transport-session/src/lib.rs` and
+  `crates/tidefs-storage-intent-scheduler/src/lib.rs`: storage intent maps
+  onto source-owned lane types, admission, dispatch, starvation prevention, and
+  pressure throttling.
 - `docs/BACKGROUND_SERVICE_FRAMEWORK_DESIGN.md`: relocation, repair, rebuild,
   scrub, compaction, and geo catch-up use the shared job/scheduler vocabulary
   when they are not serving a foreground or critical policy risk.
