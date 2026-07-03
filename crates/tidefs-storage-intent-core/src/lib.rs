@@ -5882,6 +5882,86 @@ impl Default for RamAuthorityRecord {
     }
 }
 
+/// Evaluate whether a RAM authority receipt may satisfy a durable POSIX barrier.
+#[must_use]
+pub const fn ram_authority_satisfies_durable_posix_barrier(
+    record: RamAuthorityRecord,
+) -> ReceiptPredicateResult {
+    if record.downgrade_refusal as u16 != StorageIntentRefusalReason::None as u16 {
+        return ReceiptPredicateResult::refused(record.downgrade_refusal);
+    }
+    match record.authority_class {
+        RamAuthorityClass::NonAuthoritativeCache => {
+            ReceiptPredicateResult::refused(StorageIntentRefusalReason::CacheCannotBeAuthority)
+        }
+        RamAuthorityClass::RamVolatileLocal | RamAuthorityClass::RamVolatileReplicated => {
+            ReceiptPredicateResult::refused(
+                StorageIntentRefusalReason::VolatileRamCannotSatisfyDurableIntent,
+            )
+        }
+        RamAuthorityClass::RamIntentBacked => {
+            if bytes16_are_zero(record.earned_receipt.0)
+                || !record.earned_ack_class_is_durable_intent()
+                || !record.has_durable_intent_evidence()
+            {
+                return ReceiptPredicateResult::refused(
+                    StorageIntentRefusalReason::PersistentMediaRequired,
+                );
+            }
+            if !evidence_ref_has_id(record.ordering_ref)
+                || !record
+                    .survives
+                    .contains(AuthorityEvent::ReplayAfterDurableIntent)
+            {
+                return ReceiptPredicateResult::refused(
+                    StorageIntentRefusalReason::MissingOrderingEvidence,
+                );
+            }
+            if !record.has_resource_governor_admission() {
+                return ReceiptPredicateResult::refused(
+                    StorageIntentRefusalReason::EvidenceNotUsable,
+                );
+            }
+            ReceiptPredicateResult::SATISFIED
+        }
+        RamAuthorityClass::PmemDurable => {
+            if evidence_ref_has_id(record.pmem_ref) {
+                ReceiptPredicateResult::SATISFIED
+            } else {
+                ReceiptPredicateResult::refused(
+                    StorageIntentRefusalReason::PmemFlushFenceMissing,
+                )
+            }
+        }
+    }
+}
+
+impl RamAuthorityRecord {
+    /// Returns true when the record carries resource-governor admission evidence.
+    #[must_use]
+    pub const fn has_resource_governor_admission(self) -> bool {
+        evidence_ref_has_id(self.resource_budget_ref)
+            && evidence_ref_has_id(self.admission_ref)
+            && evidence_ref_has_id(self.capacity_admission_ref)
+    }
+
+    /// Returns true when the earned ack class is durable intent, not volatile RAM.
+    #[must_use]
+    pub const fn earned_ack_class_is_durable_intent(self) -> bool {
+        matches!(
+            self.earned_ack_class,
+            StorageIntentGuaranteeClass::LocalIntent | StorageIntentGuaranteeClass::QuorumIntent
+        )
+    }
+
+    /// Returns true when local or quorum durable intent evidence backs the RAM receipt.
+    #[must_use]
+    pub const fn has_durable_intent_evidence(self) -> bool {
+        evidence_ref_has_id(self.local_intent_ref) || evidence_ref_has_id(self.quorum_intent_ref)
+    }
+
+}
+
 /// Workload shape used by predictors and policy explanation.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
@@ -24037,6 +24117,86 @@ mod tests {
         assert_eq!(
             ram_record.media_capability_ref.kind,
             StorageIntentEvidenceKind::MediaCapabilityEvidence
+        );
+    }
+
+    #[test]
+    fn volatile_ram_authority_receipts_do_not_satisfy_durable_barriers() {
+        let local = RamAuthorityRecord {
+            authority_class: RamAuthorityClass::RamVolatileLocal,
+            earned_receipt: StorageIntentReceiptId([1_u8; 16]),
+            ..RamAuthorityRecord::default()
+        };
+        let replicated = RamAuthorityRecord {
+            authority_class: RamAuthorityClass::RamVolatileReplicated,
+            earned_receipt: StorageIntentReceiptId([2_u8; 16]),
+            membership_epoch_ref: evidence_ref(StorageIntentEvidenceKind::MembershipEvidence, 1),
+            fencing_ref: evidence_ref(StorageIntentEvidenceKind::MembershipEvidence, 2),
+            ..RamAuthorityRecord::default()
+        };
+
+        let local_result = ram_authority_satisfies_durable_posix_barrier(local);
+        let replicated_result = ram_authority_satisfies_durable_posix_barrier(replicated);
+
+        assert!(!local_result.satisfied);
+        assert_eq!(
+            local_result.refusal,
+            StorageIntentRefusalReason::VolatileRamCannotSatisfyDurableIntent
+        );
+        assert!(!replicated_result.satisfied);
+        assert_eq!(
+            replicated_result.refusal,
+            StorageIntentRefusalReason::VolatileRamCannotSatisfyDurableIntent
+        );
+    }
+
+    #[test]
+    fn intent_backed_ram_requires_durable_intent_ordering_and_admission() {
+        let base = RamAuthorityRecord {
+            authority_class: RamAuthorityClass::RamIntentBacked,
+            earned_receipt: StorageIntentReceiptId([3_u8; 16]),
+            earned_ack_class: StorageIntentGuaranteeClass::LocalIntent,
+            local_intent_ref: evidence_ref(StorageIntentEvidenceKind::LocalIntentRecord, 3),
+            ordering_ref: evidence_ref(StorageIntentEvidenceKind::OrderingEvidence, 4),
+            resource_budget_ref: evidence_ref(
+                StorageIntentEvidenceKind::SchedulerAdmissionRecord,
+                5,
+            ),
+            admission_ref: evidence_ref(StorageIntentEvidenceKind::SchedulerAdmissionRecord, 6),
+            capacity_admission_ref: evidence_ref(
+                StorageIntentEvidenceKind::CapacityAdmissionEvidence,
+                7,
+            ),
+            survives: AuthorityEventMask::from_event(AuthorityEvent::ReplayAfterDurableIntent),
+            ..RamAuthorityRecord::default()
+        };
+
+        assert!(ram_authority_satisfies_durable_posix_barrier(base).satisfied);
+
+        let volatile_ack = RamAuthorityRecord {
+            earned_ack_class: StorageIntentGuaranteeClass::VolatileLocal,
+            ..base
+        };
+        let no_ordering = RamAuthorityRecord {
+            ordering_ref: StorageIntentEvidenceRef::default(),
+            ..base
+        };
+        let no_admission = RamAuthorityRecord {
+            admission_ref: StorageIntentEvidenceRef::default(),
+            ..base
+        };
+
+        assert_eq!(
+            ram_authority_satisfies_durable_posix_barrier(volatile_ack).refusal,
+            StorageIntentRefusalReason::PersistentMediaRequired
+        );
+        assert_eq!(
+            ram_authority_satisfies_durable_posix_barrier(no_ordering).refusal,
+            StorageIntentRefusalReason::MissingOrderingEvidence
+        );
+        assert_eq!(
+            ram_authority_satisfies_durable_posix_barrier(no_admission).refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
         );
     }
 
