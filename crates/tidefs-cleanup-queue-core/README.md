@@ -6,8 +6,8 @@ serialized queue entries.
 
 `CleanupQueueReplayReceipt` verifies that a cleanup queue root and sealed page
 agree on the root magic/version, page digest, entry count, and zeroed reserved
-fields before the page is treated as durable replay evidence.
+fields before queue entries are replayed from that page.
 
-The receipt is cleanup queue replay evidence only. It is not, by itself, a full
-filesystem crash-recovery proof and does not change background scheduler
-dispatch policy or reclaim behavior.
+The receipt is a cleanup queue consistency check only. It does not define
+background scheduler dispatch, allocator publication, mounted capacity
+accounting, reclaim behavior, or filesystem recovery guarantees.
