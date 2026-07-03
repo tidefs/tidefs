@@ -45,7 +45,7 @@ transport messaging, transport framing, network I/O, or repair dispatch.
 - #18, #674, and #675: placement receipt authority is the local/distributed
   source of truth for replica placement, read source selection, scrub, repair,
   and rebuild consumers.
-- #616 and `docs/SNAPSHOT_DEADLIST_PINNING_DESIGN.md`: consistency decisions
+- #616 and `docs/SNAPSHOT_CLONE_DEADLIST_AUTHORITY.md`: consistency decisions
   should carry explicit evidence, commit/epoch bounds, bounded progress, and a
   fail-closed verification gate rather than inferring correctness from a
   convenient scan.

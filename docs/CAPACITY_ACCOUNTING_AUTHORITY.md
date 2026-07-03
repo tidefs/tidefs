@@ -46,7 +46,7 @@ mirrors.
   source-owned logical admission, physical allocator pressure,
   `DatasetSpaceCountersV1`, `SpaceDelta`, `PoolPhysicalCountersV1`, space
   domains, and POSIX `statfs` projection inputs.
-- `docs/SNAPSHOT_DEADLIST_PINNING_DESIGN.md` and
+- `docs/SNAPSHOT_CLONE_DEADLIST_AUTHORITY.md` and
   `docs/LOCAL_SNAPSHOTS_OW108.md`: snapshot-pinned bytes are separately
   observable and must not be double-counted in POSIX `statfs`; snapshot
   reclaim remains tied to lifecycle pins, deadlists, and placement/rebuild

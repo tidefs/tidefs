@@ -4165,7 +4165,7 @@ This document composes existing authority surfaces:
   local snapshot and send/receive authority inform #881, including their
   still-open placement, reclaim, deadlist, distributed replication, and
   incremental-resume gaps.
-- `docs/SNAPSHOT_DEADLIST_PINNING_DESIGN.md`,
+- `docs/SNAPSHOT_CLONE_DEADLIST_AUTHORITY.md`,
   `docs/RECEIVE_STREAM_MERGE_POLICY.md`, and source-owned dataset lifecycle
   evidence: deadlist, receive-base, and dataset
   lifecycle material inform #881, but historical or issue-scoped wording is not
@@ -4174,11 +4174,11 @@ This document composes existing authority surfaces:
 - `docs/SPACEMAP_ALLOCATOR_DESIGN.md`,
   source-owned space-accounting crates,
   `docs/LOCAL_STORAGE_ALLOCATOR_OW102.md`,
-  `docs/ALLOCATOR_RECLAIM_FREE_SPACE_SCHEMA_FAMILY_P2-02.md`, and the deleted
-  local object-store format lineage from #1612: allocator, space accounting,
-  segment, reclaim, and object-store material inform #880, but historical or
-  unclassified design wording is not current storage-intent evidence until live
-  source, issue, and claim authority say so.
+  source-owned reclaim/allocation code paths, and the deleted local
+  object-store format lineage from #1612: allocator, space accounting, segment,
+  reclaim, and object-store material inform #880, but historical or
+  unclassified design wording is not current storage-intent evidence until
+  live source, issue, and claim authority say so.
 - `crates/tidefs-local-object-store/src/device_layout.rs`: media class and
   device segment sizing are placement inputs; storage intent owns the
   workload-facing record/extent/stripe shape policy that uses those inputs.
@@ -4337,12 +4337,13 @@ This document composes existing authority surfaces:
   receipt-backed placement. Storage intent may consume their receipt refs but
   still needs #750 membership evidence for clustered quorum, fence, witness,
   and failure-domain freshness.
-- `docs/RDMA_TRANSPORT_POSITION.md`: RDMA is optional acceleration; TCP-class
-  transport remains the correctness baseline.
 - `docs/TRANSPORT_CLUSTER_AUTHORITY.md`: transport owns session-local mechanics
-  while membership/runtime own epoch, fencing, and roster decisions.
-- `docs/CACHE_TAXONOMY_INVARIANTS_P4-02.md`: caches are not authority; RAM
-  authority must be modeled explicitly.
+  while membership/runtime own epoch, fencing, and roster decisions. RDMA is
+  optional acceleration; TCP-class transport remains the correctness baseline.
+- `docs/PAGE_CACHE_WRITEBACK_AUTHORITY.md`,
+  `docs/PAGE_CACHE_INVALIDATION_AUTHORITY.md`, and source-owned cache/governor
+  code paths: caches are not authority; RAM authority must be modeled
+  explicitly.
 - source-owned resource-governor, admission, dirty debt, transport queue, and
   memory-budget code paths are hard gates for any optimizer.
 - #893 and source-owned governor pressure evidence cover per-dataset memory

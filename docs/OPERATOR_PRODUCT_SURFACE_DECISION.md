@@ -21,20 +21,17 @@ surface, widen publishing claims, or preselect a runtime carrier.
   Registered claims are filesystem-scoped (crash safety, rename atomicity,
   page-cache writeback, kernel teardown, distributed combined safety
   model). The combined safety claim is bounded model-check evidence only.
-- `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`:
-  `docs/DISTRIBUTED_OPERATOR_PRODUCT_SURFACE_BLOCKER_MAP_OW307D.md` is
-  classified as Historical input. The register states the parent OW-307
-  gate remains open and a runtime-fed operator product surface is not yet
-  present.
-- `docs/DISTRIBUTED_OPERATOR_PRODUCT_SURFACE_BLOCKER_MAP_OW307D.md`:
-  Records typed distributed operator truth rows (OW-307A), deterministic
-  demo rows (OW-307B), summary rows (OW-307C), and source/cut/provenance/
-  exactness/freshness headers (OW-307E) as implementation-tracked
-  non-release building blocks. Explicitly states that deterministic demo
-  output is not a production operator product. Lists six required product
-  properties (runtime source data, source/cut headers,
+- `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`: imported OW-307 operator
+  blocker-map material was classified as historical input. The useful
+  current boundary is recorded here: no runtime-fed operator product surface
+  is present.
+- Imported OW-307 material recorded typed distributed operator truth rows,
+  deterministic demo rows, summary rows, and source/cut/provenance/
+  exactness/freshness headers as implementation-tracked non-release building
+  blocks. Deterministic demo output is not a production operator product. Six
+  required product properties (runtime source data, source/cut headers,
   provenance/exactness/freshness, product carrier, render proof, refusal
-  behavior) and records that none are satisfied.
+  behavior) remain unsatisfied.
 - `docs/DASHBOARDS_TRACES_OPERATOR_TRUTH_SURFACES_P10-04.md`: **Does not
   exist in the repository.** Referenced by OW-307D as the production truth
   grammar and by at least ten other documents as the truth-surface law
@@ -69,7 +66,8 @@ surface, widen publishing claims, or preselect a runtime carrier.
   deleted performance/fault production-depth lineage,
   deleted kernel-boundary production-depth lineage,
   deleted operator-runbook production-depth lineage,
-  `docs/WORKSPACE_FAMILY_LAYOUT_CRATE_SERVICE_BOUNDARIES_P1-01.md`, deleted
+  `docs/workspace-package-classification.md`, source-owned Cargo metadata,
+  deleted
   operator-manual lineage docs, and deleted scrub/repair/resilver historical
   lineage docs.
   All references treat it as an existing law document; none of them

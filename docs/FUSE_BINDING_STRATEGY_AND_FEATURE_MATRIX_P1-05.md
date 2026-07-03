@@ -25,7 +25,7 @@ See also:
 - `docs/TIDEFS_DOCTRINE.md` — authority model and projection charters
 - `docs/SHARED_DOCTRINE_NATIVE_SEAM_MAP_P0-03.md` — seam ownership
 - `docs/FUSE_MOUNT.md` — current FUSE mount surface
-- `docs/FUSE_REQUEST_WORKER_QUEUE_MODEL_P5-02.md` — worker/queue topology
+- `docs/FUSE_ADAPTER_CONTRACT_ASSUMPTIONS.md` — current FUSE adapter boundary
 - `docs/PREVIEW_UAPI_ABI_BOUNDARY_OW202.md` — preview boundary mirror spec
 - `docs/CURRENT_VS_FUTURE_CAPABILITIES.md` — capability tracking
 - `docs/KERNEL_RESIDENCY_AUTHORITY.md` — current kernel residency boundary
@@ -329,8 +329,10 @@ Allowed patterns:
 
 ### 6.1 Profile-gated capability sets
 
-The FUSE daemon operates in one of three coherency profiles (from v0.262 §3.4 and
-`docs/CACHE_TAXONOMY_INVARIANTS_P4-02.md`):
+The FUSE daemon operates in one of three coherency profiles, with current
+page-cache and invalidation authority in
+`docs/PAGE_CACHE_WRITEBACK_AUTHORITY.md` and
+`docs/PAGE_CACHE_INVALIDATION_AUTHORITY.md`:
 
 |---|---|---|---|---|
 | `strict` | No writeback, no auto-inval, `FOPEN_DIRECT_IO` | Bypass kernel page cache | Not needed (direct I/O) | Direct-I/O diagnostics and non-mmap correctness verification |
@@ -485,7 +487,7 @@ This design does not:
 - Design the kernel module FUSE replacement. That lives in `docs/KERNELSPACE_ENTRY_GATE_OW201.md`.
 - Design the full ACL state machine. That lives in the v0.262 design book §6.4.6 and its Rust
   implementation issue.
-- Design mmap/page-cache/writeback integration. That lives in `docs/PAGE_CACHE_WRITEBACK_MMAP_INTEGRATION_P5-03.md`.
+- Design mmap/page-cache/writeback integration. That lives in `docs/PAGE_CACHE_WRITEBACK_AUTHORITY.md` and `docs/PAGE_CACHE_INVALIDATION_AUTHORITY.md`.
 
 ---
 

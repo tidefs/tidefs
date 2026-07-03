@@ -21,7 +21,8 @@ The review covered the required evidence:
   a narrow improvement only. Sent-but-unacknowledged replicas, replica
   inventory, partition recovery, scrub/repair authority, and distributed
   transaction authority remain open.
-- `docs/RDMA_TRANSPORT_POSITION.md` keeps RDMA as an optional accelerator:
+- `docs/TRANSPORT_CLUSTER_AUTHORITY.md` keeps transport carrier decisions
+  below membership/runtime authority: RDMA is optional acceleration,
   TCP-class transport remains legal, and missing RDMA is a carrier degrade or
   refusal rather than a product correctness failure.
 - `docs/design/distributed-snapshot-shipping.md` defers concrete transport

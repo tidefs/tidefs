@@ -57,10 +57,10 @@ contract:
   P10-04 gap close.
 - `docs/DOCUMENTATION_AUTHORITY_REGISTER.md` (TFR-019): Classifies existing
   release-facing documents and records the P10-04 missing-doc gap.
-- `docs/DISTRIBUTED_OPERATOR_PRODUCT_SURFACE_BLOCKER_MAP_OW307D.md`: Records six
-  required product properties (runtime source data, source/cut headers,
-  provenance/exactness/freshness, product carrier, render proof, refusal behavior)
-  and states none are satisfied. Classified as Historical input.
+- `docs/OPERATOR_PRODUCT_SURFACE_DECISION.md`: Records the six required
+  runtime-fed product-surface properties (runtime source data, source/cut
+  headers, provenance/exactness/freshness, product carrier, render proof, and
+  refusal behavior) and states none are satisfied.
 - `README.md` and `AGENTS.md`: TideFS is pre-alpha. Claims must stay behind
   implementation reality. OpenZFS/Ceph-class target is aspirational.
 - Bounded inspection of `crates/tidefs-validation/src/performance_gate/runner.rs`:
@@ -141,7 +141,7 @@ as open gaps in the verdict artifact.
 | Claims gate | `docs/CLAIMS_GATE_POLICY.md`, `validation/claims.toml`, `xtask check-claims-gate` | Enforced; individual claims validated; no product-admission claim exists |
 | Performance budget gate | `crates/tidefs-validation/src/performance_gate/`, `GateReceipt` | Gate-local `perf_gate_ready` implemented; minimum suite families remain incomplete |
 | Standing CI gate | `docs/GITHUB_CI.md`, Rust Fast, Nix Checks, Clippy, Secret Policy | Active on self-hosted runners; path-filtered for docs-only PRs |
-| Operator truth surfaces | `docs/DASHBOARDS_TRACES_OPERATOR_TRUTH_SURFACES_P10-04.md` (missing), `docs/DISTRIBUTED_OPERATOR_PRODUCT_SURFACE_BLOCKER_MAP_OW307D.md` (historical input) | P10-04 document does not exist; OW-307D blocker map records six unsatisfied properties |
+| Operator truth surfaces | `docs/DASHBOARDS_TRACES_OPERATOR_TRUTH_SURFACES_P10-04.md` (missing), `docs/OPERATOR_PRODUCT_SURFACE_DECISION.md` | P10-04 document does not exist; the current decision record keeps the six runtime-fed product-surface properties unsatisfied |
 | Operator UAPI authority | `docs/OPERATOR_UAPI_AUTHORITY.md` | Pre-alpha command boundary is closed, but it does not create a runtime-fed product carrier |
 | Transport/cluster authority | TFR-017 | Open; no current transport authority document |
 | Unreleased authority | `docs/UNRELEASED_AUTHORITY_POLICY.md` | Current policy; enforced in review |
