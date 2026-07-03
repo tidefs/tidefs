@@ -30,5 +30,5 @@ authority debt around workspace/package ownership, dataset-scoped inode
 identity, timestamp/version semantics, capacity, writeback/fsync/mmap,
 kernel residency, snapshots, device lifecycle, and distributed behavior.
 
-The current blocker list is `docs/REVIEW_TODO_REGISTER.md`; the current review
-snapshot is `docs/WHOLE_REPO_REVIEW.md`.
+The current blocker list is `docs/REVIEW_TODO_REGISTER.md`; current work state
+belongs in live GitHub issues and pull requests.

@@ -57,7 +57,7 @@ an end-to-end mounted filesystem capability while the raw-store inventory in
 [docs/MOUNTED_TRANSFORM_AUTHORITY_RAW_STORE_INVENTORY.md](MOUNTED_TRANSFORM_AUTHORITY_RAW_STORE_INVENTORY.md)
 still has blocked production rows.
 
-For current status see [docs/REVIEW_TODO_REGISTER.md](REVIEW_TODO_REGISTER.md)
-and [docs/WHOLE_REPO_REVIEW.md](WHOLE_REPO_REVIEW.md). The old status,
-feature-matrix, and release-focus docs are not current TideFS authority unless
-they are recreated through the review register.
+For current status see [docs/REVIEW_TODO_REGISTER.md](REVIEW_TODO_REGISTER.md),
+the generated claim registry, and live GitHub issues and pull requests. The old
+status, feature-matrix, and release-focus docs are not current TideFS authority
+unless they are recreated through the review register.

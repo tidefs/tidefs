@@ -1,8 +1,8 @@
 # Safe local reclamation
 
 > TFR-019 authority note: this imported implementation note is review material,
-> the behavior below as needing reconciliation with current source,
-> `docs/REVIEW_TODO_REGISTER.md`, and `docs/WHOLE_REPO_REVIEW.md`.
+> the behavior below as needing reconciliation with current source and
+> `docs/REVIEW_TODO_REGISTER.md`.
 
 This document describes historical tracker item 103 for the local filesystem
 preview. The implemented slice is mutating local GC over the append-only Local

@@ -9,8 +9,7 @@ readiness, or discard/TRIM readiness.
 
 ## Evidence Reviewed
 
-- `docs/REVIEW_TODO_REGISTER.md` TFR-012 and
-  `docs/WHOLE_REPO_REVIEW.md` TFR-012.
+- `docs/REVIEW_TODO_REGISTER.md` TFR-012.
 - Closed GitHub issues #14 and #16 for directory-media rejection and the
   byte-addressable pool-member contract.
 - GitHub issues #1137 and #983 as nearby documentation-authority and stale-label

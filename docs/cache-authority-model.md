@@ -139,4 +139,4 @@ successor/comparator claims.
 - `docs/PAGE_CACHE_WRITEBACK_AUTHORITY.md` and
   `docs/PAGE_CACHE_INVALIDATION_AUTHORITY.md` -- current
   page-cache/writeback/mmap and invalidation authority
-- `docs/WHOLE_REPO_REVIEW.md` -- current review debt and unresolved TFR-008 cache/writeback/recovery boundary
+- `docs/REVIEW_TODO_REGISTER.md` -- current review debt and unresolved TFR-008 cache/writeback/recovery boundary

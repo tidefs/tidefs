@@ -56,7 +56,7 @@ surface, widen publishing claims, or preselect a runtime carrier.
   for the current pre-alpha command boundary. TFR-017 (Transport/cluster
   authority) remains open and still blocks runtime-fed distributed product
   surfaces.
-- `docs/WHOLE_REPO_REVIEW.md`: Reports that the OW-307D blocker map says
+- `docs/REVIEW_TODO_REGISTER.md`: Reports that the OW-307D blocker map says
   deterministic demo rows do not prove a production operator surface.
 - Bounded `rg` inspection for `DASHBOARDS_TRACES_OPERATOR_TRUTH_SURFACES`,
   `truth_view`, runtime-fed operator surfaces, render receipts, and

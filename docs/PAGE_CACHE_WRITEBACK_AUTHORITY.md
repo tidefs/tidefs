@@ -82,9 +82,9 @@ The current authority is narrow:
 
 Documentation reviewed:
 
-- `docs/REVIEW_TODO_REGISTER.md` and `docs/WHOLE_REPO_REVIEW.md` record that
-  recovery, fsync, dirty writeback, mmap, page-cache invalidation, and lease
-  coherency are still split across several mechanisms.
+- `docs/REVIEW_TODO_REGISTER.md` records that recovery, fsync, dirty writeback,
+  mmap, page-cache invalidation, and lease coherency are still split across
+  several mechanisms.
 - `docs/PAGE_CACHE_INVALIDATION_AUTHORITY.md` decides the invalidation trigger
   surface, stale-generation rule, and FUSE/kernel/cluster lease model.
 - `docs/PAGE_CACHE_WRITEBACK_MMAP_INTEGRATION_P5-03.md` and the
