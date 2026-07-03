@@ -2300,7 +2300,7 @@ fn print_help() {
     println!(
         "  check-background-scheduler-fs validate LocalFileSystem BackgroundScheduler integration"
     );
-    println!("  check-background-service-framework validate background service framework gate (#3404): all services registered, priority ordering, budget enforcement, starvation prevention");
+    println!("  check-background-service-framework validate background service framework gate: all services registered, priority ordering, budget enforcement, starvation prevention");
     println!("  check-bg-framework     alias for check-background-service-framework");
     println!("  check-feature-flags      validate dataset feature flags type definitions and canonical registry");
     println!("  check-dataset-feature-flags alias for check-feature-flags");

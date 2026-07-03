@@ -4620,7 +4620,7 @@ pub fn check_background_scheduler_fs_current_workspace() -> Result<(), StorageCh
 
 pub fn check_background_reclaim_current_workspace() -> Result<(), StorageCheckError> {
     let root = find_workspace_root().ok_or_else(|| StorageCheckError {
-        title: "#6166 single reclaim-authority verification",
+        title: "single reclaim-authority source verification",
         missing: vec!["could not locate workspace root Cargo.toml".to_string()],
     })?;
     let mut missing = Vec::new();
@@ -4687,11 +4687,11 @@ pub fn check_background_reclaim_current_workspace() -> Result<(), StorageCheckEr
     );
 
     if missing.is_empty() {
-        println!("#6166 background reclaim authority verified: LocalObjectStore::drain_dead_segments is the sole segment-freeing authority; LocalFileSystem reclaim entries feed into object-store reclaim queue via drain_local_reclaim_queue_into_store(); DataCleaner/SegmentCleaner/BackgroundReclaim are model/test/dead-code surfaces");
+        println!("background reclaim authority verified: LocalObjectStore::drain_dead_segments is the sole segment-freeing authority; LocalFileSystem reclaim entries feed into object-store reclaim queue via drain_local_reclaim_queue_into_store(); DataCleaner/SegmentCleaner/BackgroundReclaim are model/test/dead-code surfaces");
         Ok(())
     } else {
         Err(StorageCheckError {
-            title: "#6166 single reclaim-authority verification",
+            title: "single reclaim-authority source verification",
             missing,
         })
     }

@@ -634,7 +634,7 @@ pub fn check_current_workspace() -> Result<(), ClaimsGateCheckError> {
             "dispatches per-node create requests through",
             "Review debt TFR-017",
             "import, lease ownership, and clustered mount remain",
-            "POOLCLUSTER tracker work (#6605-#6610)",
+            "historical POOLCLUSTER tracker work",
         ],
         &mut missing,
     );

@@ -3,7 +3,7 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-// ── Gate receipt types inlined from tidefs-types-gate-receipt (removed per #3291) ──
+// Gate receipt types inlined from the retired tidefs-types-gate-receipt crate.
 // Only the subset needed by xtask coverage closure checker is kept here.
 // Original crate: crates/tidefs-types-gate-receipt/src/lib.rs (413 lines, zero other consumers).
 
