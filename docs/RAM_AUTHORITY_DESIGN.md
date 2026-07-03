@@ -21,52 +21,23 @@ performance gate. It does not prove that current TideFS runtime code satisfies
 POSIX durability, cluster availability, PMem power-fail behavior, or replay
 correctness.
 
-PR #840 (the storage-intent authority document gate for this design) is now merged
-into `origin/master`; `docs/STORAGE_INTENT_POLICY_AUTHORITY.md` is the
-canonical storage-intent authority on the default branch.
+`docs/STORAGE_INTENT_POLICY_AUTHORITY.md` remains the canonical
+storage-intent policy authority. This document is the narrower authority for
+memory-speed receipt classes and must stay within that boundary.
 
-## Evidence Reviewed
+Neighbor authorities still own their own records and runtime producers:
 
-- GitHub issue #847, including the docs-first write set and no-runtime-edit
-  boundary.
-- GitHub issue #839 and PR #840, especially the storage-intent receipt classes,
-  POSIX sync honesty rule, RAM pool class list, and child issue map.
-- GitHub issues #841, #842, and #846 for the intended storage-intent record,
-  local acknowledgment receipt, and transport path evidence slices.
-- GitHub issue #894 for storage-intent ordering and replay evidence: barrier
-  scope, dirty epoch, dependency closure, replay idempotency, intent sequence,
-  publication boundary, and completion state.
-- GitHub issue #898 for storage-intent capacity/admission evidence around
-  logical, physical, dirty-window, reserve, and ENOSPC legality.
-- GitHub issue #901 for policy-revision rollout evidence, including
-  publication, downgrade authorization, in-flight fences, and mixed-revision
-  convergence state.
-- GitHub issue #902 for tenant, budget, fair-share, noisy-neighbor,
-  reserve-exemption, throttle, and refusal evidence.
-- GitHub issue #903 for temporal evidence around timebase identity, clock
-  health, staleness, expiry, lease, lag, and freshness claims.
-- GitHub issue #904 for media-capability evidence covering persistence domain,
-  flush/FUA/barrier semantics, atomicity, geometry, health, freshness, and role
-  eligibility.
-- GitHub issue #915 for compiled service-objective evidence binding latency
-  percentile/tail, throughput floor/ceiling, concurrency/queue, burst/dwell,
-  degradation/RPO/RTO, isolation, topology/media, cost, wear, attribution,
-  query-snapshot, comparator/claim, and refusal state to a policy revision.
-- GitHub issue #920 for storage-intent result/refusal evidence binding typed
-  caller outcomes, including success, degraded-visible, blocked, refused,
-  retryability, idempotency, and response-registry projection.
+- `docs/CACHE_TAXONOMY_INVARIANTS_P4-02.md`: cache entries are evictable under
+  cache law and are not authority.
 - `docs/PAGE_CACHE_WRITEBACK_AUTHORITY.md`: page-cache bytes are mirrors, and
-  successful durability barriers require committed storage, durable replayable
-  intent, or an equivalent receipt authority.
-- `docs/TRANSPORT_CLUSTER_AUTHORITY.md`: transport owns session-local mechanics
-  and evidence, while membership/runtime own roster, epoch, and fencing
+  durable barriers require committed storage, durable replayable intent, or an
+  equivalent receipt authority.
+- `docs/TRANSPORT_CLUSTER_AUTHORITY.md`: transport owns session-local path
+  mechanics, while membership/runtime own roster, epoch, quorum, and fencing
   decisions.
-- source-owned governor and admission paths: daemon memory must be admitted and
-  explained through one budget authority rather than hidden per-subsystem
-  buffers.
-
-The required `~/ai/docs` searches found no additional RAM-authority-specific
-process document beyond the general TideFS and Nexus workflow rules.
+- `validation/claims.toml` and generated `docs/CLAIM_REGISTRY.md`: publishing
+  claims for RAM-fast, replicated, PMem-backed, or intent-backed authority stay
+  blocked until their registered evidence validates.
 
 ## Scope
 
@@ -85,8 +56,9 @@ It also defines the refusal boundary between those classes and:
 - PMem/NVDIMM persistence;
 - ordinary durable media placement.
 
-This design does not authorize runtime edits outside docs. Runtime work must
-use issue-scoped follow-ups with non-overlapping write sets.
+This design is not runtime implementation permission. Runtime RAM authority,
+PMem/NVDIMM flush and recovery behavior, validation evidence, and operator UX
+changes require their own issue-owned write sets.
 
 ## Authority Classes
 
@@ -429,28 +401,6 @@ file, range, or pool:
 
 The explanation must be receipt-backed. It must not infer durability or
 volatility only from current topology, cache warmth, or device names.
-
-## Runtime Follow-Up Boundaries
-
-This docs slice maps to existing and future implementation work as follows:
-
-| Surface | Issue or owner | Expected write set |
-| --- | --- | --- |
-| Storage-intent RAM class records and receipt spellings | #841 | `crates/tidefs-storage-intent-core/`, workspace manifests |
-| Local durable intent receipt emission | #842 | `crates/tidefs-local-filesystem/src/` and local intent-log/writeback-adjacent modules |
-| Storage-intent ordering and replay evidence | #894 | model surface selected by #894, with runtime paths excluded until that issue expands its write set |
-| Capacity/admission evidence for RAM intent and PMem roles | #898 | storage-intent capacity/admission record or model crate selected by #898 |
-| Policy-revision rollout evidence for RAM authority changes | #901 | storage-intent rollout record or model crate selected by #901 |
-| Tenant and budget isolation evidence for shared RAM authority | #902 | storage-intent isolation record or model crate selected by #902 |
-| Temporal evidence for loss windows, leases, expiry, and freshness | #903 | storage-intent temporal record or model crate selected by #903 |
-| Media-capability evidence for PMem persistence and flush/FUA roles | #904 | storage-intent media-capability record or model crate selected by #904 |
-| Compiled service-objective evidence for RAM authority latency, throughput, tail, isolation, and cost envelopes | #915 | storage-intent service-objective record or model crate selected by #915 |
-| Result/refusal evidence for caller-visible RAM authority outcomes and retryability | #920 | storage-intent result/refusal record or model crate selected by #920 |
-| Transport path evidence for volatile peer receipts | #846 | `crates/tidefs-transport/src/` |
-| Intent-aware admission and memory/QoS scheduling | #862 | scheduler or admission crate named by that issue |
-| Operator explanation of volatility and receipts | #849 | `apps/tidefsctl/` and operator docs |
-| Runtime RAM pool implementation | future issue before code edits | storage/runtime crate paths selected by that issue |
-| PMem/NVDIMM runtime implementation | future issue before code edits | PMem media, flush/fence, recovery, and validation paths selected by that issue |
 
 No implementation issue may represent authoritative RAM as an evictable cache
 entry, bypass the resource governor, or claim durable POSIX sync success from
