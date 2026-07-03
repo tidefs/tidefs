@@ -1003,20 +1003,15 @@ mod tests {
     }
 
     fn open_test_pool(root: &Path) -> Pool {
-        let options = StoreOptions::durable();
-        LocalFileSystem::default_development_pool(
-            root,
-            &options,
-            None,
-            None,
-        )
-        .expect("open test pool")
+        let options = StoreOptions::default();
+        LocalFileSystem::default_development_pool(root, &options, None, None)
+            .expect("open test pool")
     }
 
     fn write_test_file(root: &Path, root_key: RootAuthenticationKey) -> ObjectKey {
         let mut fs = LocalFileSystem::open_with_root_authentication_key(
             root,
-            StoreOptions::durable(),
+            StoreOptions::default(),
             root_key,
         )
         .expect("open fs");
