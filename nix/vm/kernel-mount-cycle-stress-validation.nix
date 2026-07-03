@@ -1,14 +1,5 @@
 # TideFS: kernel-mode no-daemon mount-cycle resource-cleanup validation.
 #
-# QEMU Validation Validation (2026-05-21): 50-cycle bootstrap mount+umount stress
-# Result: PASS (8/8)
-#   PASS: insmod, module_visible, all_cycles (mounts=50 umounts=50 fails=0)
-#   PASS: rmmod, module_gone, reinsmod, post_reload_readdir, dmesg_clean
-#   INFO: dmesg_WARNING=0 dmesg_BUG=0
-#   Validation: /root/ai/tmp/tidefs-validation/kernel-mount-cycle-stress/2026-05-21T174108Z/qemu.log
-# Tier: QEMU guest (Tier 4) — real qemu-system-x86_64 process with guest log
-#
-#
 # Boots a Linux 7.0 kernel with kmod-posix-vfs, performs 50
 # mount→write(1MiB)→sync→umount cycles in bootstrap mode, tracks kernel
 # slab/dentry/inode counters and dmesg for WARNING/BUG/leak indicators,
@@ -378,6 +369,19 @@ INITSCRIPT
     mkdir -p "$OUTPUT_DIR"
     cp "$RUN_DIR/qemu.log" "$OUTPUT_DIR/qemu.log"
 
+    SOURCE_DIR="''${TIDEFS_SOURCE_DIR:-$PWD}"
+    SOURCE_COMMIT="''${TIDEFS_SOURCE_COMMIT:-}"
+    WORKTREE_DIRTY=null
+    if [ -z "$SOURCE_COMMIT" ] && git -C "$SOURCE_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+      SOURCE_COMMIT="$(git -C "$SOURCE_DIR" rev-parse HEAD 2>/dev/null || echo unknown)"
+      if git -C "$SOURCE_DIR" diff --quiet -- . && git -C "$SOURCE_DIR" diff --cached --quiet -- .; then
+        WORKTREE_DIRTY=false
+      else
+        WORKTREE_DIRTY=true
+      fi
+    fi
+    SOURCE_COMMIT="''${SOURCE_COMMIT:-unknown}"
+
     cat > "$OUTPUT_DIR/manifest.json" << MANIFEST
 {
   "test": "kernel-mount-cycle-stress-validation",
@@ -389,8 +393,8 @@ INITSCRIPT
   "fail": $FAIL_COUNT,
   "blocked": $BLOCKED_COUNT,
   "skip": $SKIP_COUNT,
-  "commit": "$(git -C /root/tidefs rev-parse HEAD 2>/dev/null || echo unknown)",
-  "worktree_dirty": $(git -C /root/tidefs diff --quiet -- . && git -C /root/tidefs diff --cached --quiet -- . && echo false || echo true),
+  "commit": "$SOURCE_COMMIT",
+  "worktree_dirty": $WORKTREE_DIRTY,
   "result": "bootstrap mount-cycle stress with write/verify and slab tracking"
 }
 MANIFEST

@@ -1,8 +1,5 @@
 # TideFS: kernel-mode mount namespace, bind-mount, and remount validation.
 #
-# QEMU Validation Validation (2026-05-24): mount namespace, bind mount,
-# remount flags, mount propagation, and teardown in kernel bootstrap mode.
-#
 # Boots a Linux 7.0 kernel with kmod-posix-vfs, mounts TideFS, then
 # exercises: remount (ro↔rw), bind mount, mount propagation (shared subtree
 # peer test), recursive bind mount, and clean teardown of all mounts.
@@ -423,6 +420,19 @@ INITSCRIPT
     mkdir -p "$OUTPUT_DIR"
     cp "$RUN_DIR/qemu.log" "$OUTPUT_DIR/qemu.log"
 
+    SOURCE_DIR="''${TIDEFS_SOURCE_DIR:-$PWD}"
+    SOURCE_COMMIT="''${TIDEFS_SOURCE_COMMIT:-}"
+    WORKTREE_DIRTY=null
+    if [ -z "$SOURCE_COMMIT" ] && git -C "$SOURCE_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+      SOURCE_COMMIT="$(git -C "$SOURCE_DIR" rev-parse HEAD 2>/dev/null || echo unknown)"
+      if git -C "$SOURCE_DIR" diff --quiet -- . && git -C "$SOURCE_DIR" diff --cached --quiet -- .; then
+        WORKTREE_DIRTY=false
+      else
+        WORKTREE_DIRTY=true
+      fi
+    fi
+    SOURCE_COMMIT="''${SOURCE_COMMIT:-unknown}"
+
     cat > "$OUTPUT_DIR/manifest.json" << MANIFEST
 {
   "test": "kernel-mount-namespace-validation",
@@ -433,8 +443,8 @@ INITSCRIPT
   "fail": $FAIL_COUNT,
   "blocked": $BLOCKED_COUNT,
   "skip": $SKIP_COUNT,
-  "commit": "$(git -C /root/tidefs rev-parse HEAD 2>/dev/null || echo unknown)",
-  "worktree_dirty": $(git -C /root/tidefs diff --quiet -- . && git -C /root/tidefs diff --cached --quiet -- . && echo false || echo true),
+  "commit": "$SOURCE_COMMIT",
+  "worktree_dirty": $WORKTREE_DIRTY,
   "result": "kernel mount namespace, bind mount, remount, propagation, and teardown validation"
 }
 MANIFEST
