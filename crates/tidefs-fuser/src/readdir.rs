@@ -4,6 +4,8 @@
 //! - [`check_readdir_allowed`]: validate that a readdir operation is
 //!   applicable to the given file kind (directories only; reject regular
 //!   files, pipes, sockets, symlinks, and devices).
+//! - [`check_readdir_permission`]: enforce POSIX directory read permission
+//!   against the caller credentials supplied by the FUSE request.
 //! - [`check_readdir_offset`]: validate and convert the FUSE `offset`
 //!   parameter from `i64` to `u64`, rejecting negative offsets.
 //! - [`ReadDirPlan`]: structured plan for a readdir operation carrying
@@ -154,6 +156,38 @@ pub fn check_readdir_offset(offset: i64) -> Result<u64, c_int> {
 }
 
 // ---------------------------------------------------------------------------
+// Directory read permission
+// ---------------------------------------------------------------------------
+
+/// Check that the caller has read permission on the directory.
+///
+/// POSIX requires directory read permission to enumerate entries. Search
+/// permission controls traversal; callers that reach this helper have already
+/// resolved the directory inode and must still prove read permission before
+/// `readdir`/`readdirplus` dispatch.
+pub fn check_readdir_permission(
+    dir_mode: u32,
+    dir_uid: u32,
+    dir_gid: u32,
+    caller_uid: u32,
+    caller_gid: u32,
+    caller_groups: &[u32],
+    mount_identity: &tidefs_permission::MountIdentity,
+) -> Result<(), ReadDirError> {
+    crate::access::check_fuse_access(
+        dir_mode,
+        dir_uid,
+        dir_gid,
+        caller_uid,
+        caller_gid,
+        caller_groups,
+        crate::access::ACCESS_READ,
+        mount_identity,
+    )
+    .map_err(|_e| ReadDirError::PermissionDenied)
+}
+
+// ---------------------------------------------------------------------------
 // ReadDirPlan
 // ---------------------------------------------------------------------------
 
@@ -240,6 +274,38 @@ pub fn handle_readdir(kind: FileType, offset: i64) -> Result<ReadDirPlan, ReadDi
     Ok(ReadDirPlan {
         offset: offset as u64,
     })
+}
+
+/// Permission-aware dispatch entry-point for FUSE `readdir` requests.
+///
+/// This is the daemon-facing path when FUSE `default_permissions` are not
+/// delegated to the kernel: it validates the target is a directory, validates
+/// the offset, then enforces directory read permission with the same FUSE
+/// access authority used by `access(2)`.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub fn handle_readdir_with_permission(
+    kind: FileType,
+    offset: i64,
+    dir_mode: u32,
+    dir_uid: u32,
+    dir_gid: u32,
+    caller_uid: u32,
+    caller_gid: u32,
+    caller_groups: &[u32],
+    mount_identity: &tidefs_permission::MountIdentity,
+) -> Result<ReadDirPlan, ReadDirError> {
+    let plan = handle_readdir(kind, offset)?;
+    check_readdir_permission(
+        dir_mode,
+        dir_uid,
+        dir_gid,
+        caller_uid,
+        caller_gid,
+        caller_groups,
+        mount_identity,
+    )?;
+    Ok(plan)
 }
 
 // ---------------------------------------------------------------------------
@@ -592,6 +658,9 @@ mod tests {
     use super::*;
     use crate::reply::CapturingSender;
 
+    const VALID_MOUNT: tidefs_permission::MountIdentity =
+        tidefs_permission::MountIdentity::new([0x41; 16], 1);
+
     // -- check_readdir_allowed --------------------------------------------
 
     #[test]
@@ -666,6 +735,129 @@ mod tests {
     #[test]
     fn very_negative_offset_is_rejected() {
         assert_eq!(check_readdir_offset(i64::MIN), Err(libc::EINVAL));
+    }
+
+    // -- check_readdir_permission ------------------------------------------
+
+    #[test]
+    fn readdir_permission_owner_read_allowed() {
+        assert_eq!(
+            check_readdir_permission(0o400, 1000, 100, 1000, 200, &[], &VALID_MOUNT),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn readdir_permission_group_read_allowed() {
+        assert_eq!(
+            check_readdir_permission(0o040, 1000, 100, 2000, 100, &[], &VALID_MOUNT),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn readdir_permission_supplementary_group_read_allowed() {
+        assert_eq!(
+            check_readdir_permission(0o040, 1000, 100, 2000, 200, &[100], &VALID_MOUNT),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn readdir_permission_other_read_allowed() {
+        assert_eq!(
+            check_readdir_permission(0o004, 1000, 100, 2000, 200, &[], &VALID_MOUNT),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn readdir_permission_root_allowed_without_read_bits() {
+        assert_eq!(
+            check_readdir_permission(0o000, 1000, 100, 0, 0, &[], &VALID_MOUNT),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn readdir_permission_denied_maps_to_eacces() {
+        let err = check_readdir_permission(0o000, 1000, 100, 2000, 200, &[], &VALID_MOUNT)
+            .unwrap_err();
+        assert_eq!(err, ReadDirError::PermissionDenied);
+        assert_eq!(err.to_errno(), libc::EACCES);
+    }
+
+    #[test]
+    fn handle_readdir_with_permission_allows_readable_directory() {
+        let plan = handle_readdir_with_permission(
+            FileType::Directory,
+            7,
+            0o400,
+            1000,
+            100,
+            1000,
+            200,
+            &[],
+            &VALID_MOUNT,
+        )
+        .unwrap();
+
+        assert_eq!(plan.offset, 7);
+    }
+
+    #[test]
+    fn handle_readdir_with_permission_denies_unreadable_directory() {
+        let err = handle_readdir_with_permission(
+            FileType::Directory,
+            0,
+            0o000,
+            1000,
+            100,
+            2000,
+            200,
+            &[],
+            &VALID_MOUNT,
+        )
+        .unwrap_err();
+
+        assert_eq!(err, ReadDirError::PermissionDenied);
+        assert_eq!(err.to_errno(), libc::EACCES);
+    }
+
+    #[test]
+    fn handle_readdir_with_permission_checks_kind_before_permission() {
+        assert_eq!(
+            handle_readdir_with_permission(
+                FileType::RegularFile,
+                0,
+                0o000,
+                1000,
+                100,
+                2000,
+                200,
+                &[],
+                &VALID_MOUNT,
+            ),
+            Err(ReadDirError::NotADirectory)
+        );
+    }
+
+    #[test]
+    fn handle_readdir_with_permission_checks_offset_before_permission() {
+        assert_eq!(
+            handle_readdir_with_permission(
+                FileType::Directory,
+                -1,
+                0o000,
+                1000,
+                100,
+                2000,
+                200,
+                &[],
+                &VALID_MOUNT,
+            ),
+            Err(ReadDirError::InvalidOffset)
+        );
     }
 
     // -- plan_readdir -----------------------------------------------------

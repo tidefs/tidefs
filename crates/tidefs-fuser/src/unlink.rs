@@ -11,19 +11,24 @@
 //!   returns `Ok(())` or a [`UnlinkError`].
 //! - [`check_unlink_readonly`]: reject read-only mounts; returns
 //!   `Ok(())` or a [`UnlinkError`].
-//! - [`plan_unlink`]: combined name validation + sticky-bit check
-//!   returning `Ok(())` or a [`UnlinkError`].
+//! - [`plan_unlink`]: combined name validation + sticky-bit +
+//!   parent-directory permission check returning a validated
+//!   [`UnlinkPlan`] or a [`UnlinkError`].
 //! - [`UnlinkPlan`]: validated unlink request ready for backend dispatch.
 //! - [`handle_unlink`]: canonical FUSE dispatch entry-point combining
-//!   read-only guard, name validation, and sticky-bit enforcement;
-//!   returns `Ok(`[`UnlinkPlan`]`)` or a [`UnlinkError`].
+//!   read-only guard, name validation, sticky-bit enforcement, and
+//!   parent-directory permission checking; returns `Ok(`[`UnlinkPlan`]`)`
+//!   or a [`UnlinkError`].
 //!
 //! # Usage
 //!
 //! ```rust,ignore
 //! use fuser::unlink;
 //!
-//! let plan = unlink::handle_unlink(b"myfile", false, false, true, false, false)?;
+//! let plan = unlink::handle_unlink(
+//!     b"myfile", false, false, true, false, false,
+//!     0o300, 1000, 100, 1000, 100, &[], &mount_identity,
+//! )?;
 //! ```
 
 use crate::errno;
@@ -38,8 +43,6 @@ pub const UNLINK_MAX_NAME_BYTES: usize = 255;
 // UnlinkError -- domain error type for unlink(2) operations
 // ---------------------------------------------------------------------------
 
-/// Errors that can occur during unlink name validation or sticky-bit
-/// enforcement.
 /// Check that the caller has write and execute (search) permission
 /// on the parent directory for an unlink operation.
 ///
@@ -205,31 +208,45 @@ pub fn check_unlink_sticky_bit(
 // Combined validation (convenience)
 // ---------------------------------------------------------------------------
 
-/// Validate the unlink name and enforce sticky-bit semantics in one
-/// call.
+/// Validate the unlink name, enforce sticky-bit semantics, and check
+/// parent-directory write+execute permission in one call.
 ///
-/// Returns `Ok(())` on success.
-/// On failure returns a [`UnlinkError`].
-///
-/// # Permission check
-///
-/// Parent-directory write/search permission depends on caller credentials and
-/// mount identity. Use [`check_unlink_parent_permission`] before backend
-/// dispatch when that context is available.
+/// Returns `Ok(`[`UnlinkPlan`]`)` on success. On failure returns a
+/// [`UnlinkError`].
+#[allow(clippy::too_many_arguments)]
 pub fn plan_unlink(
     name: &[u8],
     dir_has_sticky: bool,
     caller_is_owner: bool,
     caller_is_dir_owner: bool,
     caller_is_root: bool,
-) -> Result<(), UnlinkError> {
+    parent_mode: u32,
+    parent_uid: u32,
+    parent_gid: u32,
+    caller_uid: u32,
+    caller_gid: u32,
+    caller_groups: &[u32],
+    mount_identity: &tidefs_permission::MountIdentity,
+) -> Result<UnlinkPlan, UnlinkError> {
     validate_unlink_name(name)?;
     check_unlink_sticky_bit(
         dir_has_sticky,
         caller_is_owner,
         caller_is_dir_owner,
         caller_is_root,
-    )
+    )?;
+    check_unlink_parent_permission(
+        parent_mode,
+        parent_uid,
+        parent_gid,
+        caller_uid,
+        caller_gid,
+        caller_groups,
+        mount_identity,
+    )?;
+    Ok(UnlinkPlan {
+        name: name.to_vec(),
+    })
 }
 // ---------------------------------------------------------------------------
 // UnlinkPlan -- validated unlink request
@@ -238,8 +255,8 @@ pub fn plan_unlink(
 /// A validated `unlink` request ready for backend dispatch.
 ///
 /// Created by [`handle_unlink`], which performs all client-visible
-/// validation (name checks, read-only mount guard, sticky-bit
-/// enforcement) before the backend is invoked.
+/// validation (name checks, read-only mount guard, sticky-bit enforcement,
+/// and parent-directory permission checking) before the backend is invoked.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnlinkPlan {
     /// The validated file name.  Guaranteed to be non-empty,
@@ -281,6 +298,8 @@ pub fn check_unlink_readonly(read_only: bool) -> Result<(), UnlinkError> {
 ///    not `"."` / `".."`, no NUL, no slash).
 /// 3. Sticky-bit ownership rules are satisfied when the parent directory
 ///    has `S_ISVTX` set.
+/// 4. The caller has write and execute/search permission on the parent
+///    directory.
 ///
 /// Returns `Ok(`[`UnlinkPlan`]`)` with the validated name on success.
 ///
@@ -290,6 +309,8 @@ pub fn check_unlink_readonly(read_only: bool) -> Result<(), UnlinkError> {
 /// [`UnlinkError::InvalidName`] for invalid names,
 /// [`UnlinkError::NameTooLong`] for overlong names, and
 /// [`UnlinkError::StickyPermissionDenied`] for sticky-bit violations.
+/// Returns [`UnlinkError::PermissionDenied`] when the caller lacks
+/// parent-directory write or execute/search permission.
 pub fn handle_unlink(
     name: &[u8],
     read_only: bool,
@@ -297,6 +318,13 @@ pub fn handle_unlink(
     caller_is_owner: bool,
     caller_is_dir_owner: bool,
     caller_is_root: bool,
+    parent_mode: u32,
+    parent_uid: u32,
+    parent_gid: u32,
+    caller_uid: u32,
+    caller_gid: u32,
+    caller_groups: &[u32],
+    mount_identity: &tidefs_permission::MountIdentity,
 ) -> Result<UnlinkPlan, UnlinkError> {
     check_unlink_readonly(read_only)?;
     plan_unlink(
@@ -305,10 +333,14 @@ pub fn handle_unlink(
         caller_is_owner,
         caller_is_dir_owner,
         caller_is_root,
-    )?;
-    Ok(UnlinkPlan {
-        name: name.to_vec(),
-    })
+        parent_mode,
+        parent_uid,
+        parent_gid,
+        caller_uid,
+        caller_gid,
+        caller_groups,
+        mount_identity,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -319,6 +351,117 @@ pub fn handle_unlink(
 mod tests {
     use super::*;
     use std::error::Error;
+
+    const VALID_MOUNT: tidefs_permission::MountIdentity =
+        tidefs_permission::MountIdentity::new([0x41; 16], 1);
+
+    fn plan_unlink_for_owner(
+        name: &[u8],
+        dir_has_sticky: bool,
+        caller_is_owner: bool,
+        caller_is_dir_owner: bool,
+        caller_is_root: bool,
+    ) -> Result<UnlinkPlan, UnlinkError> {
+        plan_unlink(
+            name,
+            dir_has_sticky,
+            caller_is_owner,
+            caller_is_dir_owner,
+            caller_is_root,
+            0o300,
+            1000,
+            100,
+            1000,
+            100,
+            &[],
+            &VALID_MOUNT,
+        )
+    }
+
+    fn handle_unlink_for_owner(
+        name: &[u8],
+        read_only: bool,
+        dir_has_sticky: bool,
+        caller_is_owner: bool,
+        caller_is_dir_owner: bool,
+        caller_is_root: bool,
+    ) -> Result<UnlinkPlan, UnlinkError> {
+        handle_unlink(
+            name,
+            read_only,
+            dir_has_sticky,
+            caller_is_owner,
+            caller_is_dir_owner,
+            caller_is_root,
+            0o300,
+            1000,
+            100,
+            1000,
+            100,
+            &[],
+            &VALID_MOUNT,
+        )
+    }
+
+    // -- check_unlink_parent_permission ---------------------------------------
+
+    #[test]
+    fn unlink_parent_permission_owner_write_execute_allowed() {
+        assert_eq!(
+            check_unlink_parent_permission(0o300, 1000, 100, 1000, 200, &[], &VALID_MOUNT),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn unlink_parent_permission_group_write_execute_allowed() {
+        assert_eq!(
+            check_unlink_parent_permission(0o030, 1000, 100, 2000, 100, &[], &VALID_MOUNT),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn unlink_parent_permission_supplementary_group_write_execute_allowed() {
+        assert_eq!(
+            check_unlink_parent_permission(0o030, 1000, 100, 2000, 200, &[100], &VALID_MOUNT),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn unlink_parent_permission_other_write_execute_allowed() {
+        assert_eq!(
+            check_unlink_parent_permission(0o003, 1000, 100, 2000, 200, &[], &VALID_MOUNT),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn unlink_parent_permission_root_allowed_without_permission_bits() {
+        assert_eq!(
+            check_unlink_parent_permission(0o000, 1000, 100, 0, 0, &[], &VALID_MOUNT),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn unlink_parent_permission_denied_without_write_bit() {
+        let err =
+            check_unlink_parent_permission(0o100, 1000, 100, 1000, 100, &[], &VALID_MOUNT)
+                .unwrap_err();
+        assert_eq!(err, UnlinkError::PermissionDenied);
+        assert_eq!(err.to_errno(), errno::EACCES);
+    }
+
+    #[test]
+    fn unlink_parent_permission_denied_without_execute_bit() {
+        let err =
+            check_unlink_parent_permission(0o200, 1000, 100, 1000, 100, &[], &VALID_MOUNT)
+                .unwrap_err();
+        assert_eq!(err, UnlinkError::PermissionDenied);
+        assert_eq!(err.to_errno(), errno::EACCES);
+    }
 
     // -- validate_unlink_name -----------------------------------------------
 
@@ -445,18 +588,20 @@ mod tests {
 
     #[test]
     fn plan_unlink_valid_no_sticky() {
-        assert_eq!(plan_unlink(b"myfile", false, false, false, false), Ok(()));
+        let plan = plan_unlink_for_owner(b"myfile", false, false, false, false).unwrap();
+        assert_eq!(plan.name, b"myfile");
     }
 
     #[test]
     fn plan_unlink_valid_with_sticky_as_owner() {
-        assert_eq!(plan_unlink(b"myfile", true, true, false, false), Ok(()));
+        let plan = plan_unlink_for_owner(b"myfile", true, true, false, false).unwrap();
+        assert_eq!(plan.name, b"myfile");
     }
 
     #[test]
     fn plan_unlink_empty_name() {
         assert_eq!(
-            plan_unlink(b"", false, false, false, false),
+            plan_unlink_for_owner(b"", false, false, false, false),
             Err(UnlinkError::InvalidName)
         );
     }
@@ -464,7 +609,7 @@ mod tests {
     #[test]
     fn plan_unlink_dot_name() {
         assert_eq!(
-            plan_unlink(b".", false, false, false, false),
+            plan_unlink_for_owner(b".", false, false, false, false),
             Err(UnlinkError::InvalidName)
         );
     }
@@ -472,7 +617,7 @@ mod tests {
     #[test]
     fn plan_unlink_dotdot_name() {
         assert_eq!(
-            plan_unlink(b"..", false, false, false, false),
+            plan_unlink_for_owner(b"..", false, false, false, false),
             Err(UnlinkError::InvalidName)
         );
     }
@@ -481,7 +626,7 @@ mod tests {
     fn plan_unlink_name_too_long() {
         let long = vec![b'a'; 256];
         assert_eq!(
-            plan_unlink(&long, false, false, false, false),
+            plan_unlink_for_owner(&long, false, false, false, false),
             Err(UnlinkError::NameTooLong)
         );
     }
@@ -489,7 +634,7 @@ mod tests {
     #[test]
     fn plan_unlink_nul_byte() {
         assert_eq!(
-            plan_unlink(b"bad\0name", false, false, false, false),
+            plan_unlink_for_owner(b"bad\0name", false, false, false, false),
             Err(UnlinkError::InvalidName)
         );
     }
@@ -497,7 +642,7 @@ mod tests {
     #[test]
     fn plan_unlink_slash() {
         assert_eq!(
-            plan_unlink(b"a/b", false, false, false, false),
+            plan_unlink_for_owner(b"a/b", false, false, false, false),
             Err(UnlinkError::InvalidName)
         );
     }
@@ -505,7 +650,7 @@ mod tests {
     #[test]
     fn plan_unlink_sticky_no_ownership() {
         assert_eq!(
-            plan_unlink(b"myfile", true, false, false, false),
+            plan_unlink_for_owner(b"myfile", true, false, false, false),
             Err(UnlinkError::StickyPermissionDenied)
         );
     }
@@ -513,9 +658,53 @@ mod tests {
     #[test]
     fn plan_unlink_name_error_takes_priority_over_sticky() {
         assert_eq!(
-            plan_unlink(b"", true, true, true, true),
+            plan_unlink_for_owner(b"", true, true, true, true),
             Err(UnlinkError::InvalidName)
         );
+    }
+
+    #[test]
+    fn plan_unlink_sticky_takes_priority_over_parent_permission() {
+        let err = plan_unlink(
+            b"myfile",
+            true,
+            false,
+            false,
+            false,
+            0o000,
+            1000,
+            100,
+            2000,
+            200,
+            &[],
+            &VALID_MOUNT,
+        )
+        .unwrap_err();
+
+        assert_eq!(err, UnlinkError::StickyPermissionDenied);
+        assert_eq!(err.to_errno(), errno::EPERM);
+    }
+
+    #[test]
+    fn plan_unlink_parent_permission_denied_maps_to_eacces() {
+        let err = plan_unlink(
+            b"myfile",
+            false,
+            false,
+            false,
+            false,
+            0o000,
+            1000,
+            100,
+            2000,
+            200,
+            &[],
+            &VALID_MOUNT,
+        )
+        .unwrap_err();
+
+        assert_eq!(err, UnlinkError::PermissionDenied);
+        assert_eq!(err.to_errno(), errno::EACCES);
     }
 
     // -- UnlinkError --------------------------------------------------------
@@ -590,14 +779,14 @@ mod tests {
 
     #[test]
     fn handle_unlink_valid_no_sticky() {
-        let plan = handle_unlink(b"myfile", false, false, false, false, false);
+        let plan = handle_unlink_for_owner(b"myfile", false, false, false, false, false);
         assert!(plan.is_ok());
         assert_eq!(plan.unwrap().name, b"myfile");
     }
 
     #[test]
     fn handle_unlink_valid_with_sticky_as_owner() {
-        let plan = handle_unlink(b"myfile", false, true, true, false, false);
+        let plan = handle_unlink_for_owner(b"myfile", false, true, true, false, false);
         assert!(plan.is_ok());
         assert_eq!(plan.unwrap().name, b"myfile");
     }
@@ -605,7 +794,7 @@ mod tests {
     #[test]
     fn handle_unlink_read_only_rejected() {
         assert_eq!(
-            handle_unlink(b"myfile", true, false, false, false, false),
+            handle_unlink_for_owner(b"myfile", true, false, false, false, false),
             Err(UnlinkError::ReadOnlyFilesystem)
         );
     }
@@ -613,7 +802,7 @@ mod tests {
     #[test]
     fn handle_unlink_empty_name() {
         assert_eq!(
-            handle_unlink(b"", false, false, false, false, false),
+            handle_unlink_for_owner(b"", false, false, false, false, false),
             Err(UnlinkError::InvalidName)
         );
     }
@@ -621,7 +810,7 @@ mod tests {
     #[test]
     fn handle_unlink_dot_name() {
         assert_eq!(
-            handle_unlink(b".", false, false, false, false, false),
+            handle_unlink_for_owner(b".", false, false, false, false, false),
             Err(UnlinkError::InvalidName)
         );
     }
@@ -629,7 +818,7 @@ mod tests {
     #[test]
     fn handle_unlink_dotdot_name() {
         assert_eq!(
-            handle_unlink(b"..", false, false, false, false, false),
+            handle_unlink_for_owner(b"..", false, false, false, false, false),
             Err(UnlinkError::InvalidName)
         );
     }
@@ -638,7 +827,7 @@ mod tests {
     fn handle_unlink_name_too_long() {
         let long = vec![b'a'; 256];
         assert_eq!(
-            handle_unlink(&long, false, false, false, false, false),
+            handle_unlink_for_owner(&long, false, false, false, false, false),
             Err(UnlinkError::NameTooLong)
         );
     }
@@ -646,7 +835,7 @@ mod tests {
     #[test]
     fn handle_unlink_nul_byte() {
         assert_eq!(
-            handle_unlink(b"bad\0name", false, false, false, false, false),
+            handle_unlink_for_owner(b"bad\0name", false, false, false, false, false),
             Err(UnlinkError::InvalidName)
         );
     }
@@ -654,7 +843,7 @@ mod tests {
     #[test]
     fn handle_unlink_slash() {
         assert_eq!(
-            handle_unlink(b"a/b", false, false, false, false, false),
+            handle_unlink_for_owner(b"a/b", false, false, false, false, false),
             Err(UnlinkError::InvalidName)
         );
     }
@@ -662,7 +851,7 @@ mod tests {
     #[test]
     fn handle_unlink_sticky_no_ownership() {
         assert_eq!(
-            handle_unlink(b"myfile", false, true, false, false, false),
+            handle_unlink_for_owner(b"myfile", false, true, false, false, false),
             Err(UnlinkError::StickyPermissionDenied)
         );
     }
@@ -670,14 +859,60 @@ mod tests {
     #[test]
     fn handle_unlink_read_only_takes_priority_over_name_error() {
         assert_eq!(
-            handle_unlink(b"", true, false, false, false, false),
+            handle_unlink_for_owner(b"", true, false, false, false, false),
             Err(UnlinkError::ReadOnlyFilesystem)
         );
     }
 
     #[test]
+    fn handle_unlink_read_only_takes_priority_over_parent_permission() {
+        let err = handle_unlink(
+            b"myfile",
+            true,
+            false,
+            false,
+            false,
+            false,
+            0o000,
+            1000,
+            100,
+            2000,
+            200,
+            &[],
+            &VALID_MOUNT,
+        )
+        .unwrap_err();
+
+        assert_eq!(err, UnlinkError::ReadOnlyFilesystem);
+        assert_eq!(err.to_errno(), errno::EROFS);
+    }
+
+    #[test]
+    fn handle_unlink_parent_permission_denied_maps_to_eacces() {
+        let err = handle_unlink(
+            b"myfile",
+            false,
+            false,
+            false,
+            false,
+            false,
+            0o000,
+            1000,
+            100,
+            2000,
+            200,
+            &[],
+            &VALID_MOUNT,
+        )
+        .unwrap_err();
+
+        assert_eq!(err, UnlinkError::PermissionDenied);
+        assert_eq!(err.to_errno(), errno::EACCES);
+    }
+
+    #[test]
     fn handle_unlink_name_preserves_exact_bytes() {
-        let plan = handle_unlink(b"MiXeDcAsE", false, false, false, false, false);
+        let plan = handle_unlink_for_owner(b"MiXeDcAsE", false, false, false, false, false);
         assert!(plan.is_ok());
         assert_eq!(plan.unwrap().name, b"MiXeDcAsE");
     }
@@ -686,7 +921,7 @@ mod tests {
 
     #[test]
     fn unlink_plan_debug_includes_name() {
-        let plan = handle_unlink(b"testfile", false, false, false, false, false).unwrap();
+        let plan = handle_unlink_for_owner(b"testfile", false, false, false, false, false).unwrap();
         let dbg = format!("{plan:?}");
         assert!(dbg.contains("UnlinkPlan"));
         assert!(dbg.contains("116")); // t byte
@@ -694,7 +929,7 @@ mod tests {
 
     #[test]
     fn unlink_plan_clone_preserves_name() {
-        let plan = handle_unlink(b"testfile", false, false, false, false, false).unwrap();
+        let plan = handle_unlink_for_owner(b"testfile", false, false, false, false, false).unwrap();
         let clone = plan.clone();
         assert_eq!(plan.name, clone.name);
     }
@@ -702,7 +937,7 @@ mod tests {
     #[test]
     fn handle_unlink_plan_longest_valid_name() {
         let max = vec![b'a'; 255];
-        let plan = handle_unlink(&max, false, false, false, false, false);
+        let plan = handle_unlink_for_owner(&max, false, false, false, false, false);
         assert!(plan.is_ok());
         assert_eq!(plan.unwrap().name.len(), 255);
     }
