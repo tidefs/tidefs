@@ -1,42 +1,37 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
-//! Failure-to-blocker triage: maps validation failure surfaces to the exact
-//! Forgejo blocker issues that own them.
+//! Failure-to-blocker triage for validation failure surfaces.
 //!
-//! When a validation command fails, the triage lookup answers: which existing
-//! blocker issue owns this failure surface?  If no issue maps, the caller gets
-//! back the surface metadata needed to propose a precise candidate.
-//!
-//! The mapping data is derived from the `docs/FEATURE_MATRIX.md`
-//! "Remaining * Blockers" sections, which are the repo-tracked source of truth
-//! for first-order blocker-to-surface relationships. This module does not
-//! invent new blockers; it encodes the existing documented ones.
-//!
-//! This lets validation runs answer "what blocks this" without re-parsing
-//! markdown tables by hand.
+//! Validation failures must not inherit ownership from historical, deleted
+//! planning catalogs. The default triage map therefore contains no static issue
+//! numbers. It returns enough surface and claim-gate context for a caller to
+//! file or attach a current `tidefs/tidefs` issue, and it fails closed with a
+//! `no-live-blocker-mapped` status until a live issue mapping is supplied.
 
 use serde::{Deserialize, Serialize};
+
+const NO_LIVE_BLOCKER_NOTE: &str = "no live GitHub blocker mapped; inspect current tidefs/tidefs issues and validation/claims.toml before treating this failure as owned";
 
 // ---------------------------------------------------------------------------
 // Data types
 // ---------------------------------------------------------------------------
 
-/// A known blocker issue that owns one or more validation failure surfaces.
+/// A live GitHub blocker issue that owns one or more validation failure surfaces.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockerIssue {
-    /// Forgejo issue number.
+    /// GitHub issue number in `tidefs/tidefs`.
     pub issue: u64,
-    /// Human-readable issue title (abbreviated).
+    /// Human-readable issue title.
     pub title: String,
-    /// Release domain this blocker belongs to.
+    /// Product or validation domain this blocker belongs to.
     pub domain: BlockerDomain,
     /// Validation tier required to close the blocker.
     pub required_tier: String,
-    /// Which rollup or dependency chain this blocker sits under.
+    /// Which live rollup issue or dependency chain this blocker sits under.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rollup: Option<String>,
 }
 
-/// Release domain taxonomy matching FEATURE_MATRIX.md sections.
+/// Product or validation domain for live blocker records supplied by callers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum BlockerDomain {
@@ -65,7 +60,7 @@ impl BlockerDomain {
     }
 }
 
-/// A concrete failure surface that maps to one or more blocker issues.
+/// A concrete failure surface that may map to one or more live blocker issues.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FailureSurface {
     /// Broad subsystem area, e.g. "fuse-writeback", "ublk-discard".
@@ -80,412 +75,432 @@ pub struct FailureSurface {
     pub error_hint: Option<String>,
 }
 
+/// Current claim/product-admission context that may own the evidence class for a
+/// failure surface. These ids and evidence classes mirror `validation/claims.toml`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimContext {
+    pub product_admission_gate: String,
+    pub required_evidence_classes: Vec<String>,
+    pub authority_paths: Vec<String>,
+}
+
+/// Lookup disposition for the current triage result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TriageStatus {
+    LiveBlockerMapped,
+    NoLiveBlockerMapped,
+}
+
 /// Outcome of a failure triage lookup.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TriageResult {
     pub surface: FailureSurface,
-    /// Matching known blocker issues (empty if no mapping exists).
+    /// Matching live blocker issues supplied by the caller.
     pub matched_blockers: Vec<BlockerIssue>,
-    /// When true, no known blocker owns this surface; a precise candidate
-    /// should be proposed.
+    /// Current claim/product-admission context inferred from the surface.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub claim_context: Vec<ClaimContext>,
+    /// Fail-closed disposition. `NoLiveBlockerMapped` means no current GitHub
+    /// issue owner is known to this triage input.
+    pub status: TriageStatus,
+    /// Backward-compatible flag for callers that treat unmapped failures as
+    /// needing an explicit blocker before validation can be accepted.
     pub needs_new_blocker: bool,
+    /// Human-readable fail-closed note for reports and manifests.
+    pub note: String,
 }
 
 impl TriageResult {
-    /// True when at least one known blocker owns this failure surface.
+    /// True when at least one live blocker owns this failure surface.
     pub fn has_known_blocker(&self) -> bool {
         !self.matched_blockers.is_empty()
     }
 
-    /// The first matching blocker issue number, if any.
+    /// The first matching live blocker issue number, if any.
     pub fn first_blocker_issue(&self) -> Option<u64> {
         self.matched_blockers.first().map(|b| b.issue)
+    }
+
+    /// True when no current live blocker was supplied or matched.
+    pub fn no_live_blocker_mapped(&self) -> bool {
+        self.status == TriageStatus::NoLiveBlockerMapped
     }
 }
 
 // ---------------------------------------------------------------------------
-// Blocker catalog -- derived from docs/FEATURE_MATRIX.md
+// Current claim-gate context
 // ---------------------------------------------------------------------------
 
-/// Build the static catalog of all known blocker issues from
-/// `docs/FEATURE_MATRIX.md` "Remaining * Blockers" sections.
-fn build_blocker_catalog() -> Vec<BlockerIssue> {
-    vec![
-        // FUSE POSIX backlog (blocked on #6308)
-        BlockerIssue {
-            issue: 6416,
-            title: "FUSE readdirplus large-directory parity".into(),
-            domain: BlockerDomain::FusePosix,
-            required_tier: "Tier 3 (mounted userspace / QEMU guest)".to_string(),
-            rollup: Some("#6308".into()),
-        },
-        BlockerIssue {
-            issue: 6417,
-            title: "FUSE xattr ACL and security namespace matrix".into(),
-            domain: BlockerDomain::FusePosix,
-            required_tier: "Tier 3 (mounted userspace / QEMU guest)".to_string(),
-            rollup: Some("#6308".into()),
-        },
-        BlockerIssue {
-            issue: 6418,
-            title: "FUSE idmapped mount refusal or support contract".into(),
-            domain: BlockerDomain::FusePosix,
-            required_tier: "Tier 3 (mounted userspace / QEMU guest)".to_string(),
-            rollup: Some("#6308".into()),
-        },
-        BlockerIssue {
-            issue: 6419,
-            title: "FUSE copy_file_range splice and sendfile semantics".into(),
-            domain: BlockerDomain::FusePosix,
-            required_tier: "Tier 3 (mounted userspace / QEMU guest)".to_string(),
-            rollup: Some("#6308".into()),
-        },
-        BlockerIssue {
-            issue: 6420,
-            title: "FUSE direct I/O plus writeback cache conflict guard".into(),
-            domain: BlockerDomain::FusePosix,
-            required_tier: "Tier 3 (mounted userspace / QEMU guest)".to_string(),
-            rollup: Some("#6308".into()),
-        },
-        BlockerIssue {
-            issue: 6421,
-            title: "FUSE open-unlink and rename-over-open soak".into(),
-            domain: BlockerDomain::FusePosix,
-            required_tier: "Tier 3 (mounted userspace / QEMU guest)".to_string(),
-            rollup: Some("#6308".into()),
-        },
-        BlockerIssue {
-            issue: 6422,
-            title: "FUSE lock recovery after daemon restart".into(),
-            domain: BlockerDomain::FusePosix,
-            required_tier: "Tier 3 (mounted userspace / QEMU guest)".to_string(),
-            rollup: Some("#6308".into()),
-        },
-        BlockerIssue {
-            issue: 6423,
-            title: "FUSE statfs quota and reservation consistency".into(),
-            domain: BlockerDomain::FusePosix,
-            required_tier: "Tier 3 (mounted userspace / QEMU guest)".to_string(),
-            rollup: Some("#6308".into()),
-        },
-        BlockerIssue {
-            issue: 6424,
-            title: "FUSE mount teardown under blocked writers".into(),
-            domain: BlockerDomain::FusePosix,
-            required_tier: "Tier 3 (mounted userspace / QEMU guest)".to_string(),
-            rollup: Some("#6308".into()),
-        },
-        BlockerIssue {
-            issue: 6425,
-            title: "FUSE fsx fsstress nightly seed corpus".into(),
-            domain: BlockerDomain::FusePosix,
-            required_tier: "Tier 3 (mounted userspace / QEMU guest)".to_string(),
-            rollup: Some("#6308".into()),
-        },
-        BlockerIssue {
-            issue: 6426,
-            title: "FUSE mmap coherence with truncate and hole punch".into(),
-            domain: BlockerDomain::FusePosix,
-            required_tier: "Tier 3 (mounted userspace / QEMU guest)".to_string(),
-            rollup: Some("#6308".into()),
-        },
-        BlockerIssue {
-            issue: 6427,
-            title: "FUSE crash replay after mixed directory and data workload".into(),
-            domain: BlockerDomain::FusePosix,
-            required_tier: "Tier 3 (mounted userspace / QEMU guest)".to_string(),
-            rollup: Some("#6308".into()),
-        },
-        BlockerIssue {
-            issue: 6428,
-            title: "FUSE operator mount option matrix".into(),
-            domain: BlockerDomain::FusePosix,
-            required_tier: "Tier 1 (source/docs)".to_string(),
-            rollup: Some("#6308".into()),
-        },
-        BlockerIssue {
-            issue: 6429,
-            title: "FUSE sparse file and dedup interaction validation".into(),
-            domain: BlockerDomain::FusePosix,
-            required_tier: "Tier 3 (mounted userspace / QEMU guest)".to_string(),
-            rollup: Some("#6308".into()),
-        },
-        BlockerIssue {
-            issue: 6430,
-            title: "FUSE permission nlink and sticky-bit corner cases".into(),
-            domain: BlockerDomain::FusePosix,
-            required_tier: "Tier 3 (mounted userspace / QEMU guest)".to_string(),
-            rollup: Some("#6308".into()),
-        },
-        BlockerIssue {
-            issue: 6431,
-            title: "FUSE long-haul product demo soak".into(),
-            domain: BlockerDomain::FusePosix,
-            required_tier: "Tier 3 (mounted userspace / QEMU guest)".to_string(),
-            rollup: Some("#6308".into()),
-        },
-        // ublk Block-Volume blockers (blocked on #6316)
-        BlockerIssue {
-            issue: 6309,
-            title: "ublk QEMU entrypoint and Linux 7.0 pin".into(),
-            domain: BlockerDomain::UblkBlockVolume,
-            required_tier: "Tier 3 (QEMU guest)".to_string(),
-            rollup: Some("#6316".into()),
-        },
-        BlockerIssue {
-            issue: 6311,
-            title: "ublk read/write boundary and short I/O handling".into(),
-            domain: BlockerDomain::UblkBlockVolume,
-            required_tier: "Tier 3 (QEMU guest)".to_string(),
-            rollup: Some("#6316".into()),
-        },
-        BlockerIssue {
-            issue: 6312,
-            title: "ublk flush FUA discard zero".into(),
-            domain: BlockerDomain::UblkBlockVolume,
-            required_tier: "Tier 3 (QEMU guest)".to_string(),
-            rollup: Some("#6316".into()),
-        },
-        BlockerIssue {
-            issue: 6313,
-            title: "ublk guest filesystem mkfs mount remount".into(),
-            domain: BlockerDomain::UblkBlockVolume,
-            required_tier: "Tier 3 (QEMU guest)".to_string(),
-            rollup: Some("#6316".into()),
-        },
-        BlockerIssue {
-            issue: 6315,
-            title: "integrated FUSE+ublk workflow".into(),
-            domain: BlockerDomain::UblkBlockVolume,
-            required_tier: "Tier 3 (QEMU guest)".to_string(),
-            rollup: Some("#6316".into()),
-        },
-        // Kernel Block backlog (blocked on #6296)
-        BlockerIssue {
-            issue: 6414,
-            title: "Kernel block ext4 xfs btrfs guest filesystem matrix".into(),
-            domain: BlockerDomain::KernelBlock,
-            required_tier: "Tier 5 (mounted kernel VFS / kernel block I/O)".to_string(),
-            rollup: Some("#6296".into()),
-        },
-        BlockerIssue {
-            issue: 6415,
-            title: "Kernel block long-haul fio powercut campaign".into(),
-            domain: BlockerDomain::KernelBlock,
-            required_tier: "Tier 5 (mounted kernel VFS / kernel block I/O)".to_string(),
-            rollup: Some("#6296".into()),
-        },
-        BlockerIssue {
-            issue: 6404,
-            title: "Kernel block partition table and reread behavior".into(),
-            domain: BlockerDomain::KernelBlock,
-            required_tier: "Tier 5 (mounted kernel VFS / kernel block I/O)".to_string(),
-            rollup: Some("#6296".into()),
-        },
-        BlockerIssue {
-            issue: 6405,
-            title: "Kernel block queue-depth saturation and fairness".into(),
-            domain: BlockerDomain::KernelBlock,
-            required_tier: "Tier 5 (mounted kernel VFS / kernel block I/O)".to_string(),
-            rollup: Some("#6296".into()),
-        },
-        BlockerIssue {
-            issue: 6406,
-            title: "Kernel block timeout and reset recovery path".into(),
-            domain: BlockerDomain::KernelBlock,
-            required_tier: "Tier 5 (mounted kernel VFS / kernel block I/O)".to_string(),
-            rollup: Some("#6296".into()),
-        },
-        // Kernel POSIX VFS blockers (blocked on #6358)
-        BlockerIssue {
-            issue: 6280,
-            title: "Crash replay and recovery campaign".into(),
-            domain: BlockerDomain::KernelPosixVfs,
-            required_tier: "Tier 5 (mounted kernel VFS / kernel block I/O)".to_string(),
-            rollup: Some("#6358".into()),
-        },
-        BlockerIssue {
-            issue: 6281,
-            title: "Kernel xfstests smoke slice".into(),
-            domain: BlockerDomain::KernelPosixVfs,
-            required_tier: "Tier 5 (mounted kernel VFS / kernel block I/O)".to_string(),
-            rollup: Some("#6358".into()),
-        },
-        BlockerIssue {
-            issue: 6395,
-            title: "Kernel lockdep KCSAN KASAN smoke campaign".into(),
-            domain: BlockerDomain::KernelPosixVfs,
-            required_tier: "Tier 5 (mounted kernel VFS / kernel block I/O)".to_string(),
-            rollup: Some("#6358".into()),
-        },
-        BlockerIssue {
-            issue: 6394,
-            title: "Kernel memory-pressure reclaim and page invalidation suite".into(),
-            domain: BlockerDomain::KernelPosixVfs,
-            required_tier: "Tier 5 (mounted kernel VFS / kernel block I/O)".to_string(),
-            rollup: Some("#6358".into()),
-        },
-        BlockerIssue {
-            issue: 6385,
-            title: "Kernel readdirplus and dcache coherency under rename storm".into(),
-            domain: BlockerDomain::KernelPosixVfs,
-            required_tier: "Tier 5 (mounted kernel VFS / kernel block I/O)".to_string(),
-            rollup: Some("#6358".into()),
-        },
-        BlockerIssue {
-            issue: 6389,
-            title: "Kernel sparse file hole punching parity suite".into(),
-            domain: BlockerDomain::KernelPosixVfs,
-            required_tier: "Tier 5 (mounted kernel VFS / kernel block I/O)".to_string(),
-            rollup: Some("#6358".into()),
-        },
-        BlockerIssue {
-            issue: 6393,
-            title: "Kernel read-only mount and emergency recovery mode".into(),
-            domain: BlockerDomain::KernelPosixVfs,
-            required_tier: "Tier 5 (mounted kernel VFS / kernel block I/O)".to_string(),
-            rollup: Some("#6358".into()),
-        },
-        BlockerIssue {
-            issue: 6396,
-            title: "Kernel crash-loop replay campaign across every mutating inode op".into(),
-            domain: BlockerDomain::KernelPosixVfs,
-            required_tier: "Tier 5 (mounted kernel VFS / kernel block I/O)".to_string(),
-            rollup: Some("#6358".into()),
-        },
-        BlockerIssue {
-            issue: 6384,
-            title: "Kernel exportfs file-handle and stable inode generation validation".into(),
-            domain: BlockerDomain::KernelPosixVfs,
-            required_tier: "Tier 5 (mounted kernel VFS / kernel block I/O)".to_string(),
-            rollup: Some("#6358".into()),
-        },
-        // Storage Durability blockers
-        BlockerIssue {
-            issue: 5937,
-            title: "Reconstructed-without-writeback gap: repair writes not durably committed"
-                .into(),
-            domain: BlockerDomain::StorageDurability,
-            required_tier: "Tier 1 (source/cargo)".to_string(),
-            rollup: None,
-        },
-        // Multi-Node / RDMA blockers
-        BlockerIssue {
-            issue: 5998,
-            title: "Transport flow control not wired".into(),
-            domain: BlockerDomain::MultiNodeRdma,
-            required_tier: "Tier 3 (mounted userspace / QEMU guest)".to_string(),
-            rollup: None,
-        },
-        BlockerIssue {
-            issue: 5999,
-            title: "Membership eviction not wired".into(),
-            domain: BlockerDomain::MultiNodeRdma,
-            required_tier: "Tier 3 (mounted userspace / QEMU guest)".to_string(),
-            rollup: None,
-        },
-    ]
+struct GateSpec {
+    id: &'static str,
+    keywords: &'static [&'static str],
+    required_evidence_classes: &'static [&'static str],
+    authority_paths: &'static [&'static str],
 }
 
+const GATE_SPECS: &[GateSpec] = &[
+    GateSpec {
+        id: "local-pool-device-lifecycle",
+        keywords: &["pool", "device", "import", "export", "topology", "owner"],
+        required_evidence_classes: &[
+            "storage-intent-layout-policy-evidence",
+            "storage-intent-lifecycle-capacity-evidence",
+            "storage-intent-layout-action-execution",
+            "local-storage-successor-claim-boundary-review",
+            "storage-intent-successor-claim-boundary-review",
+            "claims-gate-review",
+        ],
+        authority_paths: &[
+            "docs/POOL_IMPORT_EXPORT_DEVICE_TOPOLOGY_DESIGN.md",
+            "docs/STORAGE_INTENT_POLICY_AUTHORITY.md",
+            "docs/REVIEW_TODO_REGISTER.md",
+            "validation/claims.toml",
+        ],
+    },
+    GateSpec {
+        id: "mounted-posix-operator-runtime",
+        keywords: &[
+            "fuse",
+            "posix",
+            "mount",
+            "namespace",
+            "rename",
+            "readdir",
+            "sticky",
+            "nlink",
+        ],
+        required_evidence_classes: &[
+            "fuse-adapter-lifecycle-model",
+            "model-crash-matrix",
+            "runtime-namespace-crash-artifact",
+            "no-hidden-queue-gate",
+            "local-storage-successor-claim-boundary-review",
+            "claims-gate-review",
+        ],
+        authority_paths: &[
+            "docs/FUSE_ADAPTER_CONTRACT_ASSUMPTIONS.md",
+            "docs/OPERATOR_UAPI_AUTHORITY.md",
+            "docs/CLAIMS_GATE_POLICY.md",
+            "validation/claims.toml",
+        ],
+    },
+    GateSpec {
+        id: "transaction-replay-crash-recovery",
+        keywords: &[
+            "transaction",
+            "replay",
+            "crash",
+            "fsync",
+            "recovery",
+            "durability",
+        ],
+        required_evidence_classes: &[
+            "model-crash-matrix",
+            "runtime-crash-oracle",
+            "runtime-namespace-crash-artifact",
+            "storage-intent-ack-fault-matrix",
+            "claims-gate-review",
+        ],
+        authority_paths: &[
+            "docs/REVIEW_TODO_REGISTER.md",
+            "docs/STORAGE_INTENT_POLICY_AUTHORITY.md",
+            "docs/RELEASE_READINESS_VERDICT_CONTRACT.md",
+            "validation/claims.toml",
+        ],
+    },
+    GateSpec {
+        id: "integrity-scrub-repair-rebuild",
+        keywords: &[
+            "integrity",
+            "scrub",
+            "repair",
+            "rebuild",
+            "checksum",
+            "data-shape",
+        ],
+        required_evidence_classes: &[
+            "scrub-read-isolation-model",
+            "runtime-scrub-read-artifact",
+            "storage-intent-data-shape-policy-evidence",
+            "storage-intent-data-shape-performance-fault-rows",
+            "distributed-combined-safety-model",
+            "distributed-storage-successor-claim-boundary-review",
+            "claims-gate-review",
+        ],
+        authority_paths: &[
+            "docs/SCRUB_IDENTITY_AUTHORITY.md",
+            "docs/STORAGE_INTENT_POLICY_AUTHORITY.md",
+            "docs/LOCAL_DISTRIBUTED_RECEIPT_AUTHORITY.md",
+            "validation/claims.toml",
+        ],
+    },
+    GateSpec {
+        id: "snapshot-clone-send-receive-reclaim",
+        keywords: &[
+            "snapshot", "clone", "send", "receive", "reclaim", "deadlist",
+        ],
+        required_evidence_classes: &[
+            "storage-intent-lifecycle-capacity-evidence",
+            "storage-intent-layout-action-execution",
+            "local-storage-successor-claim-boundary-review",
+            "distributed-storage-successor-claim-boundary-review",
+            "claims-gate-review",
+        ],
+        authority_paths: &[
+            "docs/SNAPSHOT_CLONE_DEADLIST_AUTHORITY.md",
+            "docs/STORAGE_INTENT_POLICY_AUTHORITY.md",
+            "docs/REVIEW_TODO_REGISTER.md",
+            "validation/claims.toml",
+        ],
+    },
+    GateSpec {
+        id: "capacity-quota-reserve-accounting",
+        keywords: &["capacity", "quota", "reserve", "statfs", "accounting"],
+        required_evidence_classes: &[
+            "storage-intent-layout-policy-evidence",
+            "storage-intent-lifecycle-capacity-evidence",
+            "admission-budget-model",
+            "queue-depth-runtime-artifact",
+            "storage-intent-scheduler-admission-row",
+            "claims-gate-review",
+        ],
+        authority_paths: &[
+            "docs/CAPACITY_ACCOUNTING_AUTHORITY.md",
+            "docs/STORAGE_INTENT_POLICY_AUTHORITY.md",
+            "docs/REVIEW_TODO_REGISTER.md",
+            "validation/claims.toml",
+        ],
+    },
+    GateSpec {
+        id: "page-cache-writeback-fsync",
+        keywords: &[
+            "page-cache",
+            "writeback",
+            "mmap",
+            "dirty",
+            "invalidate",
+            "truncate",
+            "hole",
+        ],
+        required_evidence_classes: &[
+            "claims-gate-review",
+            "model-crash-matrix",
+            "runtime-crash-oracle",
+            "admission-budget-model",
+            "queue-depth-runtime-artifact",
+        ],
+        authority_paths: &[
+            "docs/PAGE_CACHE_WRITEBACK_AUTHORITY.md",
+            "docs/FUSE_ADAPTER_CONTRACT_ASSUMPTIONS.md",
+            "docs/REVIEW_TODO_REGISTER.md",
+            "validation/claims.toml",
+        ],
+    },
+    GateSpec {
+        id: "block-device-product-boundary",
+        keywords: &["ublk", "block", "discard", "fua", "flush", "qid", "tag"],
+        required_evidence_classes: &[
+            "qid-tag-state-model",
+            "runtime-ublk-completion-artifact",
+            "started-export-service-loop-model",
+            "runtime-ublk-started-export-admission-artifact",
+            "local-storage-successor-claim-boundary-review",
+            "claims-gate-review",
+        ],
+        authority_paths: &[
+            "docs/BLOCK_VOLUME_UBLK_STARTED_EXPORT_ADMISSION_BOUNDARY_ISSUE_341.md",
+            "docs/REQUEST_CONTRACT.md",
+            "docs/CLAIMS_GATE_POLICY.md",
+            "validation/claims.toml",
+        ],
+    },
+    GateSpec {
+        id: "kernel-residency-boundary",
+        keywords: &[
+            "kernel",
+            "kmod",
+            "teardown",
+            "workqueue",
+            "lockdep",
+            "kasan",
+            "kcsan",
+        ],
+        required_evidence_classes: &[
+            "kernel-context-token-model",
+            "teardown-race-proof-artifact",
+            "local-storage-successor-claim-boundary-review",
+            "storage-intent-successor-claim-boundary-review",
+            "claims-gate-review",
+        ],
+        authority_paths: &[
+            "docs/KERNEL_RESIDENCY_AUTHORITY.md",
+            "docs/KERNEL_RESIDENT_POOL_ENGINE_ARCHITECTURE.md",
+            "docs/GITHUB_CI.md",
+            "validation/claims.toml",
+        ],
+    },
+    GateSpec {
+        id: "distributed-product-mode",
+        keywords: &[
+            "distributed",
+            "transport",
+            "rdma",
+            "cluster",
+            "membership",
+            "placement",
+            "geo",
+            "quorum",
+            "partition",
+        ],
+        required_evidence_classes: &[
+            "distributed-combined-safety-model",
+            "distributed-storage-comparator-equivalence-evidence",
+            "distributed-storage-successor-performance-fault-set",
+            "storage-intent-geo-policy-transport-evidence",
+            "storage-intent-placement-decision-frontier",
+            "storage-intent-ack-receipt-runtime",
+            "claims-gate-review",
+        ],
+        authority_paths: &[
+            "docs/LOCAL_DISTRIBUTED_RECEIPT_AUTHORITY.md",
+            "docs/STORAGE_INTENT_POLICY_AUTHORITY.md",
+            "docs/REVIEW_TODO_REGISTER.md",
+            "validation/claims.toml",
+        ],
+    },
+    GateSpec {
+        id: "operator-uapi-release-verdict",
+        keywords: &["operator", "uapi", "release", "verdict", "cli", "tidefsctl"],
+        required_evidence_classes: &[
+            "local-storage-operator-explanation-evidence",
+            "distributed-storage-operator-explanation-evidence",
+            "storage-intent-operator-explanation-evidence",
+            "claims-gate-review",
+        ],
+        authority_paths: &[
+            "docs/OPERATOR_UAPI_AUTHORITY.md",
+            "docs/PREVIEW_UAPI_ABI_BOUNDARY_OW202.md",
+            "docs/RELEASE_READINESS_VERDICT_CONTRACT.md",
+            "docs/CLAIMS_GATE_POLICY.md",
+            "validation/claims.toml",
+        ],
+    },
+    GateSpec {
+        id: "evidence-proof-train-packet",
+        keywords: &[
+            "xfstests",
+            "qemu",
+            "fio",
+            "performance",
+            "soak",
+            "proof",
+            "evidence",
+        ],
+        required_evidence_classes: &[
+            "model-crash-matrix",
+            "runtime-crash-oracle",
+            "runtime-ublk-completion-artifact",
+            "teardown-race-proof-artifact",
+            "distributed-combined-safety-model",
+            "local-storage-successor-performance-fault-set",
+            "distributed-storage-successor-performance-fault-set",
+            "claims-gate-review",
+        ],
+        authority_paths: &[
+            "docs/RELEASE_CANDIDATE_EVIDENCE_CONTRACT.md",
+            "docs/RELEASE_READINESS_VERDICT_CONTRACT.md",
+            "docs/GITHUB_CI.md",
+            "validation/claims.toml",
+        ],
+    },
+];
+
 // ---------------------------------------------------------------------------
-// Triage engine
+// Triage lookup
 // ---------------------------------------------------------------------------
 
-/// The failure-to-blocker triage map.
+/// Failure blocker triage map.
 ///
-/// Constructed once from the static catalog; supports lookup by surface area,
-/// operation keyword, and issue number.
+/// `new()` intentionally starts with no issue catalog. Use
+/// `with_live_blockers()` when a caller has already resolved current GitHub
+/// issue owners for the failure surface.
 #[derive(Debug, Clone)]
 pub struct FailureBlockerTriage {
     catalog: Vec<BlockerIssue>,
 }
 
 impl FailureBlockerTriage {
-    /// Build the triage map from the canonical blocker catalog.
+    /// Build a fail-closed triage map with no static issue numbers.
     pub fn new() -> Self {
         Self {
-            catalog: build_blocker_catalog(),
+            catalog: Vec::new(),
         }
     }
 
-    /// Return the full blocker catalog (all known blocker issues).
+    /// Build a triage map from caller-supplied live GitHub blocker issues.
+    pub fn with_live_blockers(catalog: Vec<BlockerIssue>) -> Self {
+        Self { catalog }
+    }
+
+    /// Return the supplied live blocker catalog.
     pub fn catalog(&self) -> &[BlockerIssue] {
         &self.catalog
     }
 
-    /// Number of known blocker issues in the catalog.
+    /// Number of live blocker issues supplied to this triage map.
     pub fn len(&self) -> usize {
         self.catalog.len()
     }
 
-    /// True when the catalog is empty.
+    /// True when no live blocker catalog was supplied.
     pub fn is_empty(&self) -> bool {
         self.catalog.is_empty()
     }
 
-    /// Find blocker issues that match a given failure surface.
+    /// Find live blocker issues that match a given failure surface.
     ///
-    /// Matching is based on keyword intersection between the surface's area
-    /// and operation fields and the blocker's domain and title.
-    /// Returns all matching blockers sorted by issue number.
+    /// Matching is intentionally best-effort: it can only map issue ownership
+    /// from the caller-supplied live catalog. Without that catalog, the result
+    /// stays fail-closed and reports claim-gate context only.
     pub fn triage(&self, surface: &FailureSurface) -> TriageResult {
-        let area_lower = surface.area.to_lowercase();
-        let op_lower = surface.operation.to_lowercase();
-        let hint_lower = surface.error_hint.as_ref().map(|h| h.to_lowercase());
-
         let mut matched: Vec<BlockerIssue> = self
             .catalog
             .iter()
-            .filter(|b| {
-                let title_lower = b.title.to_lowercase();
-                let domain_label = b.domain.label().to_lowercase();
-
-                let surface_tokens: Vec<&str> = area_lower
-                    .split(['-', '_', ' ', '/'])
-                    .chain(op_lower.split(['-', '_', ' ', '/']))
-                    .filter(|t| t.len() >= 2)
-                    .collect();
-
-                let hint_tokens: Vec<&str> = hint_lower
-                    .as_deref()
-                    .map(|h| {
-                        h.split(['-', '_', ' ', '/'])
-                            .filter(|t| t.len() >= 2)
-                            .collect()
-                    })
-                    .unwrap_or_default();
-
-                let all_tokens: Vec<&str> = surface_tokens
-                    .iter()
-                    .chain(hint_tokens.iter())
-                    .copied()
-                    .collect();
-
-                all_tokens
-                    .iter()
-                    .any(|token| title_lower.contains(token) || domain_label.contains(token))
-            })
+            .filter(|b| blocker_matches_surface(b, surface))
             .cloned()
             .collect();
 
         matched.sort_by_key(|b| b.issue);
         matched.dedup_by_key(|b| b.issue);
 
-        let needs_new_blocker = matched.is_empty();
+        let has_live_blocker = !matched.is_empty();
+        let status = if has_live_blocker {
+            TriageStatus::LiveBlockerMapped
+        } else {
+            TriageStatus::NoLiveBlockerMapped
+        };
 
         TriageResult {
             surface: surface.clone(),
             matched_blockers: matched,
-            needs_new_blocker,
+            claim_context: claim_context_for_surface(surface),
+            status,
+            needs_new_blocker: !has_live_blocker,
+            note: if has_live_blocker {
+                "live GitHub blocker mapped by caller-supplied catalog".to_string()
+            } else {
+                NO_LIVE_BLOCKER_NOTE.to_string()
+            },
         }
     }
 
-    /// Find a blocker by exact issue number.
+    /// Find a supplied live blocker by exact issue number.
     pub fn by_issue(&self, issue: u64) -> Option<&BlockerIssue> {
         self.catalog.iter().find(|b| b.issue == issue)
     }
 
-    /// Return all blockers in a given domain.
+    /// Return all supplied live blockers in a given domain.
     pub fn by_domain(&self, domain: BlockerDomain) -> Vec<&BlockerIssue> {
         self.catalog.iter().filter(|b| b.domain == domain).collect()
     }
@@ -495,6 +510,53 @@ impl Default for FailureBlockerTriage {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn blocker_matches_surface(blocker: &BlockerIssue, surface: &FailureSurface) -> bool {
+    let title_lower = blocker.title.to_lowercase();
+    let domain_label = blocker.domain.label().to_lowercase();
+    surface_tokens(surface)
+        .iter()
+        .any(|token| title_lower.contains(token) || domain_label.contains(token))
+}
+
+fn claim_context_for_surface(surface: &FailureSurface) -> Vec<ClaimContext> {
+    let text = surface_text(surface);
+    GATE_SPECS
+        .iter()
+        .filter(|spec| spec.keywords.iter().any(|keyword| text.contains(keyword)))
+        .map(|spec| ClaimContext {
+            product_admission_gate: spec.id.to_string(),
+            required_evidence_classes: spec
+                .required_evidence_classes
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            authority_paths: spec.authority_paths.iter().map(|s| s.to_string()).collect(),
+        })
+        .collect()
+}
+
+fn surface_text(surface: &FailureSurface) -> String {
+    [
+        Some(surface.area.as_str()),
+        Some(surface.operation.as_str()),
+        surface.tier.as_deref(),
+        surface.error_hint.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" ")
+    .to_lowercase()
+}
+
+fn surface_tokens(surface: &FailureSurface) -> Vec<String> {
+    surface_text(surface)
+        .split(['-', '_', ' ', '/'])
+        .filter(|token| token.len() >= 3)
+        .map(str::to_string)
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -509,101 +571,56 @@ mod tests {
         FailureBlockerTriage::new()
     }
 
-    #[test]
-    fn catalog_is_non_empty() {
-        let t = triage();
-        assert!(!t.is_empty(), "blocker catalog must contain entries");
-        assert!(t.len() > 20, "expected at least 20 known blockers");
-    }
-
-    #[test]
-    fn triage_fuse_writeback_maps_to_6420() {
-        let t = triage();
-        let surface = FailureSurface {
+    fn fuse_writeback_surface() -> FailureSurface {
+        FailureSurface {
             area: "fuse-writeback".into(),
             operation: "direct-io-cache-conflict".into(),
-            tier: Some("Tier 3".into()),
+            tier: Some("mounted-userspace".into()),
             error_hint: Some("direct I/O writeback cache conflict".into()),
-        };
-        let result = t.triage(&surface);
-        assert!(result.has_known_blocker());
-        let issues: Vec<u64> = result.matched_blockers.iter().map(|b| b.issue).collect();
-        assert!(
-            issues.contains(&6420),
-            "fuse-writeback direct-io-cache-conflict should map to #6420, got {issues:?}"
-        );
+        }
     }
 
     #[test]
-    fn triage_fuse_crash_replay_maps_to_6427() {
+    fn default_catalog_is_empty() {
         let t = triage();
-        let surface = FailureSurface {
-            area: "fuse-crash-replay".into(),
-            operation: "mixed-dir-data-remount-verify".into(),
-            tier: Some("Tier 3".into()),
-            error_hint: Some("crash replay directory data integrity".into()),
-        };
-        let result = t.triage(&surface);
-        assert!(result.has_known_blocker());
-        assert!(
-            result.matched_blockers.iter().any(|b| b.issue == 6427),
-            "fuse-crash-replay should map to #6427"
-        );
+        assert!(t.is_empty(), "default triage must not embed issue numbers");
+        assert_eq!(t.len(), 0);
+        assert!(t.catalog().is_empty());
     }
 
     #[test]
-    fn triage_ublk_discard_maps_to_6312() {
+    fn default_triage_fails_closed_without_live_blocker() {
         let t = triage();
-        let surface = FailureSurface {
-            area: "ublk-discard".into(),
-            operation: "fstrim-guest".into(),
-            tier: Some("Tier 3".into()),
-            error_hint: Some("flush FUA discard zero".into()),
-        };
-        let result = t.triage(&surface);
-        assert!(result.has_known_blocker());
-        assert!(
-            result.matched_blockers.iter().any(|b| b.issue == 6312),
-            "ublk-discard should map to #6312"
-        );
+        let result = t.triage(&fuse_writeback_surface());
+
+        assert!(!result.has_known_blocker());
+        assert_eq!(result.first_blocker_issue(), None);
+        assert_eq!(result.status, TriageStatus::NoLiveBlockerMapped);
+        assert!(result.no_live_blocker_mapped());
+        assert!(result.needs_new_blocker);
+        assert!(result.note.contains("no live GitHub blocker mapped"));
     }
 
     #[test]
-    fn triage_kernel_lockdep_maps_to_6395() {
+    fn fuse_writeback_surface_reports_current_claim_context() {
         let t = triage();
-        let surface = FailureSurface {
-            area: "kernel-lockdep".into(),
-            operation: "kasan-lockdep-concurrent".into(),
-            tier: Some("Tier 5".into()),
-            error_hint: Some("lockdep KCSAN KASAN".into()),
-        };
-        let result = t.triage(&surface);
-        assert!(result.has_known_blocker());
-        assert!(
-            result.matched_blockers.iter().any(|b| b.issue == 6395),
-            "kernel-lockdep should map to #6395"
-        );
+        let result = t.triage(&fuse_writeback_surface());
+        let gates: Vec<&str> = result
+            .claim_context
+            .iter()
+            .map(|ctx| ctx.product_admission_gate.as_str())
+            .collect();
+
+        assert!(gates.contains(&"mounted-posix-operator-runtime"));
+        assert!(gates.contains(&"page-cache-writeback-fsync"));
+        assert!(result.claim_context.iter().any(|ctx| ctx
+            .required_evidence_classes
+            .iter()
+            .any(|class| class == "claims-gate-review")));
     }
 
     #[test]
-    fn triage_kernel_crash_replay_maps_to_6280() {
-        let t = triage();
-        let surface = FailureSurface {
-            area: "kernel-vfs-crash".into(),
-            operation: "replay-recovery-campaign".into(),
-            tier: Some("Tier 5".into()),
-            error_hint: None,
-        };
-        let result = t.triage(&surface);
-        assert!(result.has_known_blocker());
-        assert!(
-            result.matched_blockers.iter().any(|b| b.issue == 6280),
-            "kernel crash replay should map to #6280"
-        );
-    }
-
-    #[test]
-    fn triage_unknown_surface_returns_needs_new_blocker() {
+    fn unknown_surface_still_needs_explicit_blocker() {
         let t = triage();
         let surface = FailureSurface {
             area: "completely-unknown-area".into(),
@@ -612,168 +629,63 @@ mod tests {
             error_hint: None,
         };
         let result = t.triage(&surface);
+
+        assert_eq!(result.status, TriageStatus::NoLiveBlockerMapped);
         assert!(result.needs_new_blocker);
         assert!(result.matched_blockers.is_empty());
+        assert!(result.claim_context.is_empty());
     }
 
     #[test]
-    fn triage_transport_flow_control_maps_to_5998() {
-        let t = triage();
-        let surface = FailureSurface {
-            area: "transport".into(),
-            operation: "flow-control".into(),
-            tier: Some("Tier 3".into()),
-            error_hint: Some("transport flow control backlog".into()),
-        };
-        let result = t.triage(&surface);
+    fn injected_live_catalog_can_map_current_owner() {
+        let t = FailureBlockerTriage::with_live_blockers(vec![BlockerIssue {
+            issue: 42,
+            title: "direct writeback cache conflict runtime owner".into(),
+            domain: BlockerDomain::FusePosix,
+            required_tier: "mounted-userspace".into(),
+            rollup: None,
+        }]);
+
+        let result = t.triage(&fuse_writeback_surface());
         assert!(result.has_known_blocker());
-        assert!(
-            result.matched_blockers.iter().any(|b| b.issue == 5998),
-            "transport flow-control should map to #5998"
-        );
+        assert_eq!(result.first_blocker_issue(), Some(42));
+        assert_eq!(result.status, TriageStatus::LiveBlockerMapped);
+        assert!(!result.no_live_blocker_mapped());
+        assert!(!result.needs_new_blocker);
     }
 
     #[test]
-    fn triage_membership_eviction_maps_to_5999() {
-        let t = triage();
-        let surface = FailureSurface {
-            area: "membership".into(),
-            operation: "eviction".into(),
-            tier: Some("Tier 3".into()),
-            error_hint: None,
-        };
-        let result = t.triage(&surface);
-        assert!(result.has_known_blocker());
-        assert!(
-            result.matched_blockers.iter().any(|b| b.issue == 5999),
-            "membership eviction should map to #5999"
-        );
+    fn by_issue_and_domain_only_use_supplied_live_catalog() {
+        let t = FailureBlockerTriage::with_live_blockers(vec![BlockerIssue {
+            issue: 42,
+            title: "transport flow-control runtime owner".into(),
+            domain: BlockerDomain::MultiNodeRdma,
+            required_tier: "multi-process-distributed".into(),
+            rollup: Some("live-rollup".into()),
+        }]);
+
+        let blocker = t.by_issue(42).unwrap();
+        assert_eq!(blocker.title, "transport flow-control runtime owner");
+        assert!(t.by_issue(43).is_none());
+
+        let distributed = t.by_domain(BlockerDomain::MultiNodeRdma);
+        assert_eq!(distributed.len(), 1);
+        assert!(t.by_domain(BlockerDomain::FusePosix).is_empty());
     }
 
     #[test]
-    fn by_issue_returns_correct_blocker() {
+    fn triage_result_serde_roundtrip_preserves_fail_closed_status() {
         let t = triage();
-        let b = t.by_issue(6280).unwrap();
-        assert_eq!(b.issue, 6280);
-        assert!(b.title.contains("Crash replay"));
-    }
-
-    #[test]
-    fn by_domain_filters_correctly() {
-        let t = triage();
-        let fuse = t.by_domain(BlockerDomain::FusePosix);
-        assert!(fuse.len() >= 16, "expected 16+ FUSE blockers");
-        assert!(fuse.iter().all(|b| b.domain == BlockerDomain::FusePosix));
-    }
-
-    #[test]
-    fn kernel_posix_vfs_blockers_all_tier5() {
-        let t = triage();
-        let kvfs = t.by_domain(BlockerDomain::KernelPosixVfs);
-        for b in &kvfs {
-            assert!(
-                b.required_tier.contains("Tier 5"),
-                "{} (#{}) should require Tier 5, got {}",
-                b.title,
-                b.issue,
-                b.required_tier
-            );
-        }
-    }
-
-    #[test]
-    fn triage_kernel_readdirplus_maps_to_6385() {
-        let t = triage();
-        let surface = FailureSurface {
-            area: "kernel-readdir".into(),
-            operation: "readdirplus-dcache-rename".into(),
-            tier: Some("Tier 5".into()),
-            error_hint: Some("readdirplus dcache coherency rename storm".into()),
-        };
-        let result = t.triage(&surface);
-        assert!(result.has_known_blocker());
-        assert!(
-            result.matched_blockers.iter().any(|b| b.issue == 6385),
-            "kernel readdirplus should map to #6385"
-        );
-    }
-
-    #[test]
-    fn triage_kernel_hole_punch_maps_to_6389() {
-        let t = triage();
-        let surface = FailureSurface {
-            area: "kernel-hole-punch".into(),
-            operation: "sparse-extent-accounting".into(),
-            tier: Some("Tier 5".into()),
-            error_hint: Some("hole punching sparse file".into()),
-        };
-        let result = t.triage(&surface);
-        assert!(result.has_known_blocker());
-        assert!(
-            result.matched_blockers.iter().any(|b| b.issue == 6389),
-            "kernel hole punch should map to #6389"
-        );
-    }
-
-    #[test]
-    fn triage_repair_reconstructed_maps_to_5937() {
-        let t = triage();
-        let surface = FailureSurface {
-            area: "repair".into(),
-            operation: "reconstructed-writeback".into(),
-            tier: Some("Tier 1".into()),
-            error_hint: Some("Reconstructed without writeback".into()),
-        };
-        let result = t.triage(&surface);
-        assert!(result.has_known_blocker());
-        assert!(
-            result.matched_blockers.iter().any(|b| b.issue == 5937),
-            "repair reconstructed should map to #5937"
-        );
-    }
-
-    #[test]
-    fn triage_result_serde_roundtrip() {
-        let t = triage();
-        let surface = FailureSurface {
-            area: "fuse-mmap".into(),
-            operation: "truncate-hole-punch".into(),
-            tier: Some("Tier 3".into()),
-            error_hint: None,
-        };
-        let result = t.triage(&surface);
+        let result = t.triage(&fuse_writeback_surface());
         let json = serde_json::to_string(&result).unwrap();
         let roundtripped: TriageResult = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(roundtripped.status, TriageStatus::NoLiveBlockerMapped);
         assert_eq!(result.needs_new_blocker, roundtripped.needs_new_blocker);
         assert_eq!(
             result.matched_blockers.len(),
             roundtripped.matched_blockers.len()
         );
-    }
-
-    #[test]
-    fn all_fuse_next_blockers_reference_rollup_6308() {
-        let t = triage();
-        for b in t.by_domain(BlockerDomain::FusePosix) {
-            assert_eq!(
-                b.rollup.as_deref(),
-                Some("#6308"),
-                "FUSE NEXT blocker #{} should have rollup #6308",
-                b.issue
-            );
-        }
-    }
-
-    #[test]
-    fn all_kvfs_next_blockers_reference_rollup_6358() {
-        let t = triage();
-        for b in t.by_domain(BlockerDomain::KernelPosixVfs) {
-            assert_eq!(
-                b.rollup.as_deref(),
-                Some("#6358"),
-                "KVFS NEXT blocker #{} should have rollup #6358",
-                b.issue
-            );
-        }
+        assert_eq!(result.claim_context.len(), roundtripped.claim_context.len());
     }
 }
