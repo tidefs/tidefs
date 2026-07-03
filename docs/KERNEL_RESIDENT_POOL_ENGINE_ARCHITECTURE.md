@@ -14,7 +14,10 @@ Current authority and implementation inputs:
 - `docs/KERNEL_RESIDENCY_AUTHORITY.md`
 - `docs/KERNEL_MODULE_DEVELOPMENT_WORKFLOW_P7-05.md`
 - `crates/tidefs-kmod-posix-vfs/README.md`
-- `crates/tidefs-block-kmod/README.md`
+- `crates/tidefs-block-kmod/tidefs_block_kmod.rs`
+- `crates/tidefs-block-kmod/src/device.rs`
+- `crates/tidefs-block-kmod/src/dispatch.rs`
+- `crates/tidefs-block-kmod/src/pool_core_backend.rs`
 
 Historical kernel production-depth lineage reviewed during TFR-019 now lives
 in git and issue #1707. It is not current authority for this architecture.
