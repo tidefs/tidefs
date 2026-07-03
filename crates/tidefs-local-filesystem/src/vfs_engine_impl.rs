@@ -26,10 +26,7 @@ use tidefs_types_vfs_core::{
 use tidefs_types_vfs_core::{LockRange, LockType};
 use tidefs_vfs_engine::{LseekDataRange, VfsEngine, VfsEngineStatFs};
 
-use crate::content::{
-    content_chunk_start, read_content_layout_from_store, reflink_chunked_content,
-    MountedContentReadAuthority,
-};
+use crate::content::{content_chunk_start, reflink_chunked_content, MountedContentReadAuthority};
 use crate::error::FileSystemError;
 use crate::fuse_getattr;
 use crate::fuse_setattr;
