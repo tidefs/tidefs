@@ -2,13 +2,8 @@
 # Boots a Linux 7.0 QEMU guest, provisions two loop block devices from
 # file-backed images, verifies kernel-reported device sizes, then exercises
 # pool create (tidefsctl pool create), label scan, and pool import.
-#
-# Dependency status:
-#   #6063 (capacity detection fix)  — published on master 1298422ae
-#   #6064 (tidefsctl pool create)   — published on master c98e67133
-#
 # Validation tier: qemu-guest (loop-device provisioning plus pool
-# create/scan/import exercised against the published CLI path).
+# create/scan/import exercised against tidefsctl).
 {
   pkgs,
   linuxKernel_7_0,
@@ -28,8 +23,6 @@ let
     TMPDIR="''${TIDEFS_POOL_CREATE_TMPDIR:-/tmp/tidefs-pool-create-blockdev-validation}"
     TIMEOUT_SEC="''${TIDEFS_POOL_CREATE_TIMEOUT:-300}"
 
-    COMMIT_SHA="04f1721d3"
-    COMMIT_DATE="2026-05-19"
     VALIDATION_TIER="qemu-guest"
 
     usage() {
@@ -85,7 +78,6 @@ EOF
     echo "  QEMU:       $QEMU_BIN"
     echo "  tidefsctl:  $TIDEFSCTL"
     echo "  Timeout:    ''${TIMEOUT_SEC}s"
-    echo "  Commit:     $COMMIT_SHA"
     echo ""
 
     # ── Build temp directory and backing images ───────────────────────
@@ -213,7 +205,6 @@ if [ -z "$LOOP0" ] || [ -z "$LOOP1" ]; then
              loop0_detach loop1_detach sync_done; do
         blocked "$op" "loop devices not provisioned"
     done
-    echo "commit_sha=04f1721d3"
     echo "validation_tier=qemu-guest"
     echo "PASSED=$PASSED FAILED=$FAILED BLOCKED=$BLOCKED"
     sync; poweroff -f
@@ -370,14 +361,10 @@ sync && pass "sync_done"
 
 echo ""
 echo "=== Validation Summary ==="
-echo "commit_sha=04f1721d3"
-echo "commit_date=2026-05-19"
 echo "validation_tier=qemu-guest"
 echo "kernel_version=$(uname -r)"
 echo "backend=loop_block_device_file_backed"
 echo "mode=qemu_guest_userspace"
-echo "dependency_6063=published_1298422ae"
-echo "dependency_6064=published_c98e67133"
 echo "loop0=$LOOP0 loop0_size=$LOOP0_SIZE"
 echo "loop1=$LOOP1 loop1_size=$LOOP1_SIZE"
 echo "PASSED=$PASSED FAILED=$FAILED BLOCKED=$BLOCKED"
