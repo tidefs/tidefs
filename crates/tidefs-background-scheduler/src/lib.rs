@@ -44,6 +44,8 @@
 #[cfg(any(test, feature = "std"))]
 pub mod multi_threaded;
 pub mod scheduling;
+#[cfg(feature = "alloc")]
+pub mod snapshot_pruner;
 use core::fmt;
 #[cfg(feature = "alloc")]
 extern crate alloc;
