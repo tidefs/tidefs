@@ -33,7 +33,6 @@ use crate::commit_group::DurabilityClass;
 /// - Catalog dirty: always forces pool-map commit
 /// - None dirty: do_commit() returns immediately (unless intent log
 ///   is non-empty)
-/// tidefs-queue-root: local_fs.dirty_set
 /// admission: AdmissionPermit  service_curve: ServiceCurve
 #[derive(Clone, Debug, Default)]
 pub(crate) struct DirtySet {

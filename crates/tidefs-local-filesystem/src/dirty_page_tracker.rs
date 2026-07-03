@@ -123,7 +123,6 @@ impl DirtyRange {
 /// `DirtyRange`s sorted by offset.  `mark_dirty` inserts and
 /// coalesces; `flush_inode` removes and returns the dirty set
 /// so the writeback path can issue writes.
-/// tidefs-queue-root: local_fs.dirty_page_tracker
 /// admission: AdmissionPermit  service_curve: ServiceCurve
 #[derive(Clone, Debug, Default)]
 pub struct DirtyPageTracker {

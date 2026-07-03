@@ -205,7 +205,6 @@ impl DirtyPageTracker {
 pub struct PageCache {
     pages: HashMap<PageKey, CachedPage>,
     /// Per-inode LRU: oldest pages at the front (pop_front for eviction).
-    /// tidefs-queue-root: local_fs.page_cache_lru
     /// admission: AdmissionPermit  service_curve: ServiceCurve
     lru: BTreeMap<InodeId, VecDeque<PageKey>>,
     /// Approximate resident memory in bytes.
