@@ -26,9 +26,14 @@ mod terminology;
 mod trace_oracle;
 
 use std::env;
+use std::path::Path;
 use std::process;
 use std::process::Command;
 use tidefs_types_package_profile_catalog::SURFACES;
+use tidefs_validation::evidence_artifact_manifest::{
+    load_evidence_artifact_manifest_json_path, EvidenceArtifactManifest,
+    EvidenceArtifactManifestError,
+};
 // Group check macros: call check functions directly (no re-exec)
 macro_rules! run_checks {
     ($($check:expr),* $(,)?) => {{
@@ -863,10 +868,10 @@ fn main() {
             }
         }
         Some("validate-evidence-manifest") => {
-            let artifact_path = match args.next() {
+            let manifest_path = match args.next() {
                 Some(path) => path,
                 None => {
-                    eprintln!("validate-evidence-manifest requires an artifact path");
+                    eprintln!("validate-evidence-manifest requires a manifest path");
                     process::exit(2);
                 }
             };
@@ -876,12 +881,10 @@ fn main() {
                 );
                 process::exit(2);
             }
-            match tidefs_validation::evidence_artifact_manifest::load_evidence_artifact_manifest_json_path(
-                &artifact_path,
-            ) {
+            match validate_evidence_manifest_path(&manifest_path) {
                 Ok(manifest) => {
                     println!(
-                        "evidence manifest validated: claim_id={} evidence_class={} tier={} outcome={} run_id={} source_ref={} source={} scope={}",
+                        "evidence manifest validated with artifact digest: claim_id={} evidence_class={} tier={} outcome={} run_id={} source_ref={} source={} scope={}",
                         manifest.claim_id,
                         manifest.evidence_class,
                         manifest.validation_tier,
@@ -1784,9 +1787,57 @@ fn clippy_output_excerpt(stdout: &str, stderr: &str, max_lines: usize) -> Vec<St
         .collect()
 }
 
+fn validate_evidence_manifest_path(
+    path: impl AsRef<Path>,
+) -> Result<EvidenceArtifactManifest, EvidenceArtifactManifestError> {
+    let path = path.as_ref();
+    let manifest = load_evidence_artifact_manifest_json_path(path)?;
+    let artifact_root = path.parent().unwrap_or_else(|| Path::new("."));
+    manifest.verify_artifact_digest(artifact_root)?;
+    Ok(manifest)
+}
+
 #[cfg(test)]
 mod code_navigability_tests {
     use super::*;
+    use std::fs;
+    use tidefs_validation::evidence_artifact_manifest::{
+        content_digest_for_bytes, BlockingIssueRef, EVIDENCE_ARTIFACT_MANIFEST_VERSION,
+    };
+    use tidefs_validation::validation_schema::ValidationTier;
+    use tidefs_validation::validation_status::ValidationStatus;
+
+    fn evidence_manifest_for(
+        artifact_path: &str,
+        artifact_bytes: &[u8],
+    ) -> EvidenceArtifactManifest {
+        EvidenceArtifactManifest {
+            manifest_version: EVIDENCE_ARTIFACT_MANIFEST_VERSION,
+            claim_id: "local.vfs.write_fsync_crash.v1".to_string(),
+            evidence_class: "claims-gate-review".to_string(),
+            validation_tier: ValidationTier::CargoUnit,
+            scope: "xtask evidence manifest fixture".to_string(),
+            artifact_path: artifact_path.to_string(),
+            content_digest: content_digest_for_bytes(artifact_bytes),
+            run_id: "123456789/1".to_string(),
+            source_ref: "774b48046851ee844284b62a484573597c96a013".to_string(),
+            outcome: ValidationStatus::Pass,
+            residual_risk: "Fixture validates digest plumbing only.".to_string(),
+            source: "tidefs-xtask-test".to_string(),
+            generated_at: "2026-06-22T13:00:00Z".to_string(),
+            blocking_issues: Vec::<BlockingIssueRef>::new(),
+        }
+    }
+
+    fn write_manifest(dir: &Path, manifest: &EvidenceArtifactManifest) -> std::path::PathBuf {
+        let manifest_path = dir.join("manifest.json");
+        fs::write(
+            &manifest_path,
+            manifest.to_json_pretty().expect("serialize manifest"),
+        )
+        .expect("write manifest");
+        manifest_path
+    }
 
     #[test]
     fn clippy_warning_lines_counts_warning_lines() {
@@ -1822,6 +1873,95 @@ error[E0308]: mismatched types
                 "stdout detail"
             ]
         );
+    }
+
+    #[test]
+    fn validate_evidence_manifest_verifies_matching_artifact_digest() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let artifact_path = temp.path().join("artifact.json");
+        let artifact_bytes = br#"{"ok":true}"#;
+        fs::write(&artifact_path, artifact_bytes).expect("write artifact");
+        let manifest = evidence_manifest_for("artifact.json", artifact_bytes);
+        let manifest_path = write_manifest(temp.path(), &manifest);
+
+        let validated =
+            validate_evidence_manifest_path(&manifest_path).expect("manifest digest validates");
+
+        assert_eq!(validated.claim_id, manifest.claim_id);
+    }
+
+    #[test]
+    fn validate_evidence_manifest_rejects_mismatched_artifact_digest() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(temp.path().join("artifact.json"), b"actual bytes").expect("write artifact");
+        let manifest = evidence_manifest_for("artifact.json", b"different bytes");
+        let manifest_path = write_manifest(temp.path(), &manifest);
+
+        let err = validate_evidence_manifest_path(&manifest_path)
+            .expect_err("mismatched digest must fail");
+
+        assert!(err
+            .failures()
+            .iter()
+            .any(|failure| failure.contains("content_digest mismatch")));
+    }
+
+    #[test]
+    fn validate_evidence_manifest_rejects_missing_artifact() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let manifest = evidence_manifest_for("missing.json", b"missing bytes");
+        let manifest_path = write_manifest(temp.path(), &manifest);
+
+        let err =
+            validate_evidence_manifest_path(&manifest_path).expect_err("missing artifact fails");
+
+        assert!(err
+            .failures()
+            .iter()
+            .any(|failure| failure.contains("read artifact_path `missing.json`")));
+    }
+
+    #[test]
+    fn validate_evidence_manifest_resolves_artifact_relative_to_manifest_dir() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let manifest_dir = temp.path().join("evidence");
+        fs::create_dir(&manifest_dir).expect("create manifest dir");
+        fs::write(temp.path().join("artifact.json"), b"wrong root").expect("write root artifact");
+        let artifact_bytes = b"manifest-relative bytes";
+        fs::write(manifest_dir.join("artifact.json"), artifact_bytes).expect("write artifact");
+        let manifest = evidence_manifest_for("artifact.json", artifact_bytes);
+        let manifest_path = write_manifest(&manifest_dir, &manifest);
+
+        validate_evidence_manifest_path(&manifest_path).expect("manifest-relative artifact passes");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_evidence_manifest_rejects_symlink_escape_from_manifest_dir() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let manifest_dir = temp.path().join("evidence");
+        let outside_dir = temp.path().join("outside");
+        fs::create_dir(&manifest_dir).expect("create manifest dir");
+        fs::create_dir(&outside_dir).expect("create outside dir");
+        let artifact_bytes = b"outside bytes";
+        fs::write(outside_dir.join("artifact.json"), artifact_bytes).expect("write artifact");
+        symlink(
+            outside_dir.join("artifact.json"),
+            manifest_dir.join("artifact.json"),
+        )
+        .expect("create artifact symlink");
+        let manifest = evidence_manifest_for("artifact.json", artifact_bytes);
+        let manifest_path = write_manifest(&manifest_dir, &manifest);
+
+        let err =
+            validate_evidence_manifest_path(&manifest_path).expect_err("symlink escape must fail");
+
+        assert!(err
+            .failures()
+            .iter()
+            .any(|failure| failure.contains("resolves outside artifact root")));
     }
 }
 
@@ -2243,7 +2383,7 @@ fn print_help() {
         "  validate-ublk-started-export-admission-artifact <path> validate started uBLK export admission evidence"
     );
     println!("  check-no-hidden-queues  validate queue roots in touched implementation packages");
-    println!("  validate-evidence-manifest <path> validate a claim evidence artifact manifest JSON against schema");
+    println!("  validate-evidence-manifest <path> validate a claim evidence artifact manifest JSON and verify artifact_path digest under the manifest directory");
     println!("  validate-xfstests-evidence-manifest <path> validate an xfstests evidence manifest JSON against schema");
     println!("  validate-kernel-teardown-runtime-artifact <path> validate a kernel teardown no-work-after artifact JSON against schema");
     println!(
