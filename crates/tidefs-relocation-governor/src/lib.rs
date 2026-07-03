@@ -10,12 +10,14 @@
 //! `docs/STORAGE_INTENT_POLICY_AUTHORITY.md`). It consumes storage-intent
 //! records from #841 / PR #959 and authority rules from #839 / PR #840.
 //!
-//! # First-slice scope (issue #848)
+//! # Scope
 //!
-//! Law/model/admission surface only. This crate defines the governor
-//! types, hard-gate predicate, anti-thrash rules, HDD/SSD/WAN heuristics,
-//! and background/incremental-job integration stubs. It never executes
-//! an unbounded data mover or retires a source receipt.
+//! This crate defines the governor types, hard-gate predicate, anti-thrash
+//! rules, HDD/SSD/WAN heuristics, and the bounded background-service handoff
+//! for admitted relocation runtime jobs. Concrete local/distributed data movers
+//! remain separate components; the governor service refuses or blocks instead
+//! of fabricating mover, verification, publication, or source-retirement
+//! evidence.
 //!
 //! # Relocation reasons
 //!
@@ -34,10 +36,10 @@
 //!
 //! # Non-claim boundary
 //!
-//! This crate is a source-model surface. It does not claim runtime relocation,
-//! mounted-filesystem behavior, or product superiority over existing storage
-//! systems. Runtime activation remains gated on the evidence producers and
-//! action-execution surfaces named by issue #848.
+//! This crate is not a mounted-filesystem or concrete data-mover implementation
+//! and does not claim product superiority over existing storage systems.
+//! Runtime activation remains gated on the evidence producers and
+//! action-execution surfaces named by issue #848 and issue #1864.
 
 pub mod admission;
 pub mod anti_thrash;

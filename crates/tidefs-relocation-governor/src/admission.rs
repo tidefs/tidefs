@@ -80,7 +80,7 @@ impl AdmissionVerdict {
 // ── Admission record ─────────────────────────────────────────────────
 
 /// A durable record of a relocation admission decision.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct AdmissionRecord {
     /// Unique identifier for this admission decision.
