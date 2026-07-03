@@ -3937,6 +3937,7 @@ dependencies = [
 name = "tidefs-vfs-engine"
 version = "0.421.0"
 dependencies = [
+ "serde",
  "tidefs-permission",
  "tidefs-types-extent-map-core",
  "tidefs-types-pool-label-core",
@@ -4042,6 +4043,7 @@ dependencies = [
  "tidefs-types-pool-label-core",
  "tidefs-types-vfs-core",
  "tidefs-validation",
+ "tidefs-vfs-engine",
 ]
 
 [[package]]
