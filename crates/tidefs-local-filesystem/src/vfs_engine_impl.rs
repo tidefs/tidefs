@@ -24,7 +24,11 @@ use tidefs_types_vfs_core::{
     ROOT_INODE_ID, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFMT, S_IFREG, S_IFSOCK,
 };
 use tidefs_types_vfs_core::{LockRange, LockType};
-use tidefs_vfs_engine::{LseekDataRange, VfsEngine, VfsEngineStatFs};
+use tidefs_vfs_engine::{
+    LivePoolAdminArg, LivePoolAdminArgs, LivePoolAdminCommand, LivePoolAdminOutput,
+    LivePoolAdminRequest, LivePoolAdminResponse, LivePoolAdminResponseBody, LseekDataRange,
+    VfsEngine, VfsEngineStatFs,
+};
 
 use crate::content::{content_chunk_start, reflink_chunked_content, MountedContentReadAuthority};
 use crate::error::FileSystemError;
@@ -1778,52 +1782,62 @@ impl VfsLocalFileSystem {
 
     fn handle_live_pool_admin_request(
         &self,
-        request_json: &[u8],
-    ) -> std::result::Result<Vec<u8>, Errno> {
-        let request: Value = serde_json::from_slice(request_json).map_err(|_| Errno::EINVAL)?;
-        let command = live_admin_str(&request, "command")?;
-        let operation = live_admin_str(&request, "operation")?;
-        let pool = live_admin_str(&request, "pool")?;
-        let wants_json = request
-            .get("json")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let args = request.get("args").unwrap_or(&Value::Null);
+        request: &LivePoolAdminRequest,
+    ) -> std::result::Result<LivePoolAdminResponse, Errno> {
+        if let Err(err) = request.validate_version() {
+            return Ok(LivePoolAdminResponse::error(err.exit_code, err.message));
+        }
+        let pool = request.pool.as_str();
+        let wants_json = request.output.wants_json();
+        let args = live_admin_args_to_json(&request.args);
 
-        Ok(match (command, operation) {
-            ("dataset", "create") => self.live_dataset_create(pool, args, wants_json),
-            ("dataset", "list") => self.live_dataset_list(pool, args, wants_json),
-            ("dataset", "rename") => self.live_dataset_rename(pool, args),
-            ("dataset", "destroy") => self.live_dataset_destroy(pool, args, wants_json),
-            ("dataset", "set-strategy") => self.live_dataset_set_strategy(args),
-            ("dataset", "upgrade") => self.live_dataset_upgrade(args),
-            ("dataset", "seal-key") => self.live_dataset_seal_key(args),
-            ("dataset", "rotate-key") => self.live_dataset_rotate_key(args),
-            ("dataset", "get") => self.live_dataset_get(pool, args, wants_json),
-            ("dataset", "set") => self.live_dataset_set(pool, args, wants_json),
-            ("dataset", "list-props") => self.live_dataset_list_props(pool, args),
-            ("snapshot", "create") => self.live_snapshot_create(args),
-            ("snapshot", "list") => self.live_snapshot_list(wants_json),
-            ("snapshot", "destroy") => self.live_snapshot_destroy(args),
-            ("snapshot", "rollback") => self.live_snapshot_rollback(args),
-            ("snapshot", "extract") => self.live_snapshot_extract(args, wants_json),
-            ("snapshot", "send") => self.live_snapshot_send(args, wants_json),
-            ("pool", "get") => self.live_pool_get(args),
-            ("pool", "set") => self.live_pool_set(args),
-            ("pool", "list-props") => self.live_pool_list_props(args),
-            ("pool", "integrity-check") => self.live_pool_integrity_check(pool, args, wants_json),
-            ("performance", "admission-snapshot") => {
-                self.live_performance_admission_snapshot(pool, args)
+        Ok(match request.command {
+            LivePoolAdminCommand::DatasetCreate => {
+                self.live_dataset_create(pool, &args, wants_json)
             }
-            ("device", "remove") => self.live_device_remove(args, wants_json),
-            _ => live_admin_error(
-                1,
-                format!("live engine does not implement tidefsctl {command} {operation}"),
-            ),
+            LivePoolAdminCommand::DatasetList => self.live_dataset_list(pool, &args, wants_json),
+            LivePoolAdminCommand::DatasetRename => self.live_dataset_rename(pool, &args),
+            LivePoolAdminCommand::DatasetDestroy => {
+                self.live_dataset_destroy(pool, &args, wants_json)
+            }
+            LivePoolAdminCommand::DatasetSetStrategy => self.live_dataset_set_strategy(&args),
+            LivePoolAdminCommand::DatasetUpgrade => self.live_dataset_upgrade(&args),
+            LivePoolAdminCommand::DatasetSealKey => self.live_dataset_seal_key(&args),
+            LivePoolAdminCommand::DatasetRotateKey => self.live_dataset_rotate_key(&args),
+            LivePoolAdminCommand::DatasetGet => self.live_dataset_get(pool, &args, wants_json),
+            LivePoolAdminCommand::DatasetSet => self.live_dataset_set(pool, &args, wants_json),
+            LivePoolAdminCommand::DatasetListProps => self.live_dataset_list_props(pool, &args),
+            LivePoolAdminCommand::SnapshotCreate => self.live_snapshot_create(&args),
+            LivePoolAdminCommand::SnapshotList => self.live_snapshot_list(wants_json),
+            LivePoolAdminCommand::SnapshotDestroy => self.live_snapshot_destroy(&args),
+            LivePoolAdminCommand::SnapshotRollback => self.live_snapshot_rollback(&args),
+            LivePoolAdminCommand::SnapshotExtract => self.live_snapshot_extract(&args, wants_json),
+            LivePoolAdminCommand::SnapshotSend => self.live_snapshot_send(&args, wants_json),
+            LivePoolAdminCommand::PoolGet => self.live_pool_get(&args),
+            LivePoolAdminCommand::PoolSet => self.live_pool_set(&args),
+            LivePoolAdminCommand::PoolListProps => self.live_pool_list_props(&args),
+            LivePoolAdminCommand::PoolIntegrityCheck => {
+                self.live_pool_integrity_check(pool, &args, wants_json)
+            }
+            LivePoolAdminCommand::PerformanceAdmissionSnapshot => {
+                self.live_performance_admission_snapshot(pool, &args)
+            }
+            LivePoolAdminCommand::DeviceRemove => self.live_device_remove(&args, wants_json),
+            command => {
+                let (command_name, operation) = command.parts();
+                LivePoolAdminResponse::error(
+                    1,
+                    format!("live engine does not implement tidefsctl {command_name} {operation}"),
+                )
+            }
         })
     }
 
-    fn live_performance_admission_snapshot(&self, pool: &str, args: &Value) -> Vec<u8> {
+    fn live_performance_admission_snapshot(
+        &self,
+        pool: &str,
+        args: &Value,
+    ) -> LivePoolAdminResponse {
         let workload = live_admin_arg(args, "workload").unwrap_or("fuse-smoke-mount-quick");
         let mount_adapter = live_admin_arg(args, "mount_adapter").unwrap_or("fuse");
         let artifact_path = live_admin_arg(args, "artifact_path").ok();
@@ -1902,7 +1916,12 @@ impl VfsLocalFileSystem {
         }))
     }
 
-    fn live_dataset_create(&self, pool: &str, args: &Value, wants_json: bool) -> Vec<u8> {
+    fn live_dataset_create(
+        &self,
+        pool: &str,
+        args: &Value,
+        wants_json: bool,
+    ) -> LivePoolAdminResponse {
         let name = match live_admin_arg(args, "name") {
             Ok(value) => value,
             Err(err) => return live_admin_error(2, err),
@@ -2004,7 +2023,12 @@ impl VfsLocalFileSystem {
         ))
     }
 
-    fn live_dataset_list(&self, pool: &str, args: &Value, wants_json: bool) -> Vec<u8> {
+    fn live_dataset_list(
+        &self,
+        pool: &str,
+        args: &Value,
+        wants_json: bool,
+    ) -> LivePoolAdminResponse {
         let type_filter = match live_dataset_type_filter_arg(args) {
             Ok(value) => value,
             Err(err) => return live_admin_error(1, err),
@@ -2074,7 +2098,7 @@ impl VfsLocalFileSystem {
         live_admin_ok_text(out)
     }
 
-    fn live_dataset_rename(&self, pool: &str, args: &Value) -> Vec<u8> {
+    fn live_dataset_rename(&self, pool: &str, args: &Value) -> LivePoolAdminResponse {
         let old_name = match live_admin_arg(args, "old_name") {
             Ok(value) => value,
             Err(err) => return live_admin_error(2, err),
@@ -2120,7 +2144,12 @@ impl VfsLocalFileSystem {
         ))
     }
 
-    fn live_dataset_destroy(&self, pool: &str, args: &Value, wants_json: bool) -> Vec<u8> {
+    fn live_dataset_destroy(
+        &self,
+        pool: &str,
+        args: &Value,
+        wants_json: bool,
+    ) -> LivePoolAdminResponse {
         let name = match live_admin_arg(args, "name") {
             Ok(value) => value,
             Err(err) => return live_admin_error(2, err),
@@ -2208,7 +2237,7 @@ impl VfsLocalFileSystem {
         live_admin_ok_text(format!("dataset '{name}' destroyed"))
     }
 
-    fn live_dataset_set_strategy(&self, args: &Value) -> Vec<u8> {
+    fn live_dataset_set_strategy(&self, args: &Value) -> LivePoolAdminResponse {
         let name = match live_admin_arg(args, "name") {
             Ok(value) => value,
             Err(err) => return live_admin_error(2, err),
@@ -2329,7 +2358,7 @@ impl VfsLocalFileSystem {
         }
     }
 
-    fn live_dataset_upgrade(&self, args: &Value) -> Vec<u8> {
+    fn live_dataset_upgrade(&self, args: &Value) -> LivePoolAdminResponse {
         let name = match live_admin_arg(args, "name") {
             Ok(value) => value,
             Err(err) => return live_admin_error(2, err),
@@ -2450,7 +2479,7 @@ impl VfsLocalFileSystem {
     }
 
     #[cfg(feature = "encryption")]
-    fn live_dataset_seal_key(&self, args: &Value) -> Vec<u8> {
+    fn live_dataset_seal_key(&self, args: &Value) -> LivePoolAdminResponse {
         let name = match live_admin_arg(args, "name") {
             Ok(value) => value,
             Err(err) => return live_admin_error(2, err),
@@ -2501,7 +2530,7 @@ impl VfsLocalFileSystem {
     }
 
     #[cfg(not(feature = "encryption"))]
-    fn live_dataset_seal_key(&self, _args: &Value) -> Vec<u8> {
+    fn live_dataset_seal_key(&self, _args: &Value) -> LivePoolAdminResponse {
         live_admin_error(
             1,
             "dataset seal-key: live owner was built without encryption support",
@@ -2509,7 +2538,7 @@ impl VfsLocalFileSystem {
     }
 
     #[cfg(feature = "encryption")]
-    fn live_dataset_rotate_key(&self, args: &Value) -> Vec<u8> {
+    fn live_dataset_rotate_key(&self, args: &Value) -> LivePoolAdminResponse {
         let old_passphrase = match live_admin_arg(args, "old_passphrase") {
             Ok(value) => value,
             Err(err) => return live_admin_error(2, err),
@@ -2571,14 +2600,19 @@ impl VfsLocalFileSystem {
     }
 
     #[cfg(not(feature = "encryption"))]
-    fn live_dataset_rotate_key(&self, _args: &Value) -> Vec<u8> {
+    fn live_dataset_rotate_key(&self, _args: &Value) -> LivePoolAdminResponse {
         live_admin_error(
             1,
             "dataset rotate-key: live owner was built without encryption support",
         )
     }
 
-    fn live_dataset_get(&self, pool: &str, args: &Value, wants_json: bool) -> Vec<u8> {
+    fn live_dataset_get(
+        &self,
+        pool: &str,
+        args: &Value,
+        wants_json: bool,
+    ) -> LivePoolAdminResponse {
         let name = match live_admin_arg(args, "name") {
             Ok(value) => value,
             Err(err) => return live_admin_error(2, err),
@@ -2631,7 +2665,12 @@ impl VfsLocalFileSystem {
         }
     }
 
-    fn live_dataset_set(&self, pool: &str, args: &Value, wants_json: bool) -> Vec<u8> {
+    fn live_dataset_set(
+        &self,
+        pool: &str,
+        args: &Value,
+        wants_json: bool,
+    ) -> LivePoolAdminResponse {
         let name = match live_admin_arg(args, "name") {
             Ok(value) => value,
             Err(err) => return live_admin_error(2, err),
@@ -2736,7 +2775,7 @@ impl VfsLocalFileSystem {
         }
     }
 
-    fn live_dataset_list_props(&self, _pool: &str, args: &Value) -> Vec<u8> {
+    fn live_dataset_list_props(&self, _pool: &str, args: &Value) -> LivePoolAdminResponse {
         let name = match live_admin_arg(args, "name") {
             Ok(value) => value,
             Err(err) => return live_admin_error(2, err),
@@ -2756,7 +2795,7 @@ impl VfsLocalFileSystem {
         live_property_table("dataset list-props", &props, family)
     }
 
-    fn live_snapshot_create(&self, args: &Value) -> Vec<u8> {
+    fn live_snapshot_create(&self, args: &Value) -> LivePoolAdminResponse {
         let name = match live_admin_arg(args, "name") {
             Ok(value) => value,
             Err(err) => return live_admin_error(2, err),
@@ -2773,7 +2812,7 @@ impl VfsLocalFileSystem {
         }
     }
 
-    fn live_snapshot_list(&self, wants_json: bool) -> Vec<u8> {
+    fn live_snapshot_list(&self, wants_json: bool) -> LivePoolAdminResponse {
         let fs = self.fs.borrow();
         let mut snapshots = fs.list_snapshots();
         snapshots.sort_by(|a, b| {
@@ -2808,7 +2847,7 @@ impl VfsLocalFileSystem {
         live_admin_ok_text(out)
     }
 
-    fn live_snapshot_destroy(&self, args: &Value) -> Vec<u8> {
+    fn live_snapshot_destroy(&self, args: &Value) -> LivePoolAdminResponse {
         let name = match live_admin_arg(args, "name") {
             Ok(value) => value,
             Err(err) => return live_admin_error(2, err),
@@ -2825,7 +2864,7 @@ impl VfsLocalFileSystem {
         }
     }
 
-    fn live_snapshot_rollback(&self, args: &Value) -> Vec<u8> {
+    fn live_snapshot_rollback(&self, args: &Value) -> LivePoolAdminResponse {
         let name = match live_admin_arg(args, "name") {
             Ok(value) => value,
             Err(err) => return live_admin_error(2, err),
@@ -2847,7 +2886,7 @@ impl VfsLocalFileSystem {
         }
     }
 
-    fn live_snapshot_extract(&self, args: &Value, wants_json: bool) -> Vec<u8> {
+    fn live_snapshot_extract(&self, args: &Value, wants_json: bool) -> LivePoolAdminResponse {
         let name = match live_admin_arg(args, "snapshot_name") {
             Ok(value) => value,
             Err(err) => return live_admin_error(2, err),
@@ -2918,7 +2957,7 @@ impl VfsLocalFileSystem {
         }
     }
 
-    fn live_snapshot_send(&self, args: &Value, wants_json: bool) -> Vec<u8> {
+    fn live_snapshot_send(&self, args: &Value, wants_json: bool) -> LivePoolAdminResponse {
         let mut fs = self.fs.borrow_mut();
         let plan = match live_snapshot_send_plan(args, &mut fs) {
             Ok(plan) => plan,
@@ -2993,7 +3032,7 @@ impl VfsLocalFileSystem {
         }
     }
 
-    fn live_pool_get(&self, args: &Value) -> Vec<u8> {
+    fn live_pool_get(&self, args: &Value) -> LivePoolAdminResponse {
         let property = match live_admin_arg(args, "property") {
             Ok(value) => value,
             Err(err) => return live_admin_error(2, err),
@@ -3016,7 +3055,7 @@ impl VfsLocalFileSystem {
         }
     }
 
-    fn live_pool_set(&self, args: &Value) -> Vec<u8> {
+    fn live_pool_set(&self, args: &Value) -> LivePoolAdminResponse {
         let assignment = match live_admin_arg(args, "assignment") {
             Ok(value) => value,
             Err(err) => return live_admin_error(2, err),
@@ -3077,13 +3116,18 @@ impl VfsLocalFileSystem {
         }
     }
 
-    fn live_pool_list_props(&self, args: &Value) -> Vec<u8> {
+    fn live_pool_list_props(&self, args: &Value) -> LivePoolAdminResponse {
         let family = live_admin_optional_arg(args, "family");
         let fs = self.fs.borrow();
         live_property_table("pool list-props", fs.pool_properties(), family)
     }
 
-    fn live_pool_integrity_check(&self, pool: &str, args: &Value, wants_json: bool) -> Vec<u8> {
+    fn live_pool_integrity_check(
+        &self,
+        pool: &str,
+        args: &Value,
+        wants_json: bool,
+    ) -> LivePoolAdminResponse {
         let max_records = args.get("max_records").and_then(Value::as_u64);
         let max_bytes = args.get("max_bytes").and_then(Value::as_u64);
         let backing_dir_arg = live_admin_optional_arg(args, "backing_dir").map(ToString::to_string);
@@ -3294,7 +3338,7 @@ impl VfsLocalFileSystem {
         live_admin_ok_text(out)
     }
 
-    fn live_device_remove(&self, args: &Value, wants_json: bool) -> Vec<u8> {
+    fn live_device_remove(&self, args: &Value, wants_json: bool) -> LivePoolAdminResponse {
         let device_path = match live_admin_arg(args, "device_path") {
             Ok(value) => std::path::PathBuf::from(value),
             Err(err) => return live_admin_error(2, err),
@@ -3894,43 +3938,20 @@ fn live_snapshot_send_export(
     })
 }
 
-fn live_admin_ok_text(text: impl Into<String>) -> Vec<u8> {
-    live_admin_encode(json!({
-        "ok": true,
-        "exit_code": 0,
-        "text": text.into(),
-    }))
+fn live_admin_ok_text(text: impl Into<String>) -> LivePoolAdminResponse {
+    LivePoolAdminResponse::ok_text(text)
 }
 
-fn live_admin_ok_json(value: Value) -> Vec<u8> {
-    live_admin_encode(json!({
-        "ok": true,
-        "exit_code": 0,
-        "json": value,
-    }))
+fn live_admin_ok_json(value: Value) -> LivePoolAdminResponse {
+    LivePoolAdminResponse::ok_machine_json(value.to_string())
 }
 
-fn live_admin_ok_bytes_hex(bytes: &[u8]) -> Vec<u8> {
-    live_admin_encode(json!({
-        "ok": true,
-        "exit_code": 0,
-        "bytes_hex": live_admin_hex_encode(bytes),
-        "bytes": bytes.len(),
-    }))
+fn live_admin_ok_bytes_hex(bytes: &[u8]) -> LivePoolAdminResponse {
+    LivePoolAdminResponse::ok_bytes_hex(live_admin_hex_encode(bytes), bytes.len())
 }
 
-fn live_admin_error(exit_code: i32, message: impl Into<String>) -> Vec<u8> {
-    live_admin_encode(json!({
-        "ok": false,
-        "exit_code": exit_code,
-        "error": message.into(),
-    }))
-}
-
-fn live_admin_encode(value: Value) -> Vec<u8> {
-    serde_json::to_vec(&value).unwrap_or_else(|_| {
-        br#"{"ok":false,"exit_code":2,"error":"encode live admin response"}"#.to_vec()
-    })
+fn live_admin_error(exit_code: i32, message: impl Into<String>) -> LivePoolAdminResponse {
+    LivePoolAdminResponse::error(exit_code, message)
 }
 
 fn live_admin_hex_encode(bytes: &[u8]) -> String {
@@ -3941,6 +3962,33 @@ fn live_admin_hex_encode(bytes: &[u8]) -> String {
         out.push(HEX[(byte & 0x0f) as usize] as char);
     }
     out
+}
+
+fn live_admin_args_to_json(args: &LivePoolAdminArgs) -> Value {
+    let mut out = serde_json::Map::new();
+    for (key, value) in &args.0 {
+        out.insert(key.clone(), live_admin_arg_to_json(value));
+    }
+    Value::Object(out)
+}
+
+fn live_admin_arg_to_json(value: &LivePoolAdminArg) -> Value {
+    match value {
+        LivePoolAdminArg::Null => Value::Null,
+        LivePoolAdminArg::Bool(value) => Value::Bool(*value),
+        LivePoolAdminArg::I64(value) => Value::Number((*value).into()),
+        LivePoolAdminArg::U64(value) => Value::Number((*value).into()),
+        LivePoolAdminArg::String(value) => Value::String(value.clone()),
+        LivePoolAdminArg::Array(values) => {
+            Value::Array(values.iter().map(live_admin_arg_to_json).collect())
+        }
+        LivePoolAdminArg::Object(values) => Value::Object(
+            values
+                .iter()
+                .map(|(key, value)| (key.clone(), live_admin_arg_to_json(value)))
+                .collect(),
+        ),
+    }
 }
 
 #[cfg(feature = "encryption")]
@@ -4055,7 +4103,7 @@ fn live_property_table(
     operation: &str,
     props: &tidefs_dataset_properties::PropertySet,
     family: Option<&str>,
-) -> Vec<u8> {
+) -> LivePoolAdminResponse {
     let registry = tidefs_dataset_properties::build_registry();
     let defs: Vec<_> = if let Some(family_str) = family {
         let Some(family) = property_family_from_str(family_str) else {
@@ -6212,8 +6260,11 @@ impl VfsEngineStatFs for VfsLocalFileSystem {
         fuse_statfs::engine_statfs(&mut fs).map_err(|e| e.to_errno())
     }
 
-    fn live_pool_admin_request(&self, request_json: &[u8]) -> std::result::Result<Vec<u8>, Errno> {
-        self.handle_live_pool_admin_request(request_json)
+    fn live_pool_admin_request(
+        &self,
+        request: &LivePoolAdminRequest,
+    ) -> std::result::Result<LivePoolAdminResponse, Errno> {
+        self.handle_live_pool_admin_request(request)
     }
 
     fn snapshot_catalog_generation(&self) -> Option<Generation> {
@@ -6830,18 +6881,7 @@ mod tests {
     }
 
     fn live_dataset_admin(engine: &VfsLocalFileSystem, operation: &str, args: Value) -> Value {
-        let request = json!({
-            "command": "dataset",
-            "operation": operation,
-            "pool": "tank",
-            "json": false,
-            "args": args,
-        });
-        let request = serde_json::to_vec(&request).expect("encode live admin request");
-        let response = engine
-            .handle_live_pool_admin_request(&request)
-            .expect("dispatch live admin request");
-        serde_json::from_slice(&response).expect("decode live admin response")
+        live_admin(engine, "dataset", operation, args, false)
     }
 
     fn live_snapshot_admin(
@@ -6850,18 +6890,7 @@ mod tests {
         args: Value,
         wants_json: bool,
     ) -> Value {
-        let request = json!({
-            "command": "snapshot",
-            "operation": operation,
-            "pool": "tank",
-            "json": wants_json,
-            "args": args,
-        });
-        let request = serde_json::to_vec(&request).expect("encode live admin request");
-        let response = engine
-            .handle_live_pool_admin_request(&request)
-            .expect("dispatch live admin request");
-        serde_json::from_slice(&response).expect("decode live admin response")
+        live_admin(engine, "snapshot", operation, args, wants_json)
     }
 
     fn live_from_root_hex(root: &CommittedRootSummary) -> String {
@@ -6878,18 +6907,7 @@ mod tests {
         args: Value,
         wants_json: bool,
     ) -> Value {
-        let request = json!({
-            "command": "device",
-            "operation": operation,
-            "pool": "tank",
-            "json": wants_json,
-            "args": args,
-        });
-        let request = serde_json::to_vec(&request).expect("encode live admin request");
-        let response = engine
-            .handle_live_pool_admin_request(&request)
-            .expect("dispatch live admin request");
-        serde_json::from_slice(&response).expect("decode live admin response")
+        live_admin(engine, "device", operation, args, wants_json)
     }
 
     fn live_pool_admin(
@@ -6898,18 +6916,99 @@ mod tests {
         args: Value,
         wants_json: bool,
     ) -> Value {
-        let request = json!({
-            "command": "pool",
-            "operation": operation,
-            "pool": "tank",
-            "json": wants_json,
-            "args": args,
-        });
-        let request = serde_json::to_vec(&request).expect("encode live admin request");
+        live_admin(engine, "pool", operation, args, wants_json)
+    }
+
+    fn live_admin(
+        engine: &VfsLocalFileSystem,
+        command: &str,
+        operation: &str,
+        args: Value,
+        wants_json: bool,
+    ) -> Value {
+        let command =
+            LivePoolAdminCommand::from_parts(command, operation).expect("test live admin command");
+        let mut request = LivePoolAdminRequest::new(command, "tank");
+        request.output = if wants_json {
+            LivePoolAdminOutput::MachineJson
+        } else {
+            LivePoolAdminOutput::Human
+        };
+        request.args = live_admin_args_from_json(args);
         let response = engine
             .handle_live_pool_admin_request(&request)
             .expect("dispatch live admin request");
-        serde_json::from_slice(&response).expect("decode live admin response")
+        live_admin_response_to_legacy_json(response)
+    }
+
+    fn live_admin_args_from_json(args: Value) -> LivePoolAdminArgs {
+        let Value::Object(values) = args else {
+            return LivePoolAdminArgs::default();
+        };
+        LivePoolAdminArgs(
+            values
+                .into_iter()
+                .map(|(key, value)| (key, live_admin_arg_from_json(value)))
+                .collect(),
+        )
+    }
+
+    fn live_admin_arg_from_json(value: Value) -> LivePoolAdminArg {
+        match value {
+            Value::Null => LivePoolAdminArg::Null,
+            Value::Bool(value) => LivePoolAdminArg::Bool(value),
+            Value::Number(value) => value
+                .as_i64()
+                .map(LivePoolAdminArg::I64)
+                .or_else(|| value.as_u64().map(LivePoolAdminArg::U64))
+                .expect("test live admin number must fit typed arg"),
+            Value::String(value) => LivePoolAdminArg::String(value),
+            Value::Array(values) => {
+                LivePoolAdminArg::Array(values.into_iter().map(live_admin_arg_from_json).collect())
+            }
+            Value::Object(values) => LivePoolAdminArg::Object(
+                values
+                    .into_iter()
+                    .map(|(key, value)| (key, live_admin_arg_from_json(value)))
+                    .collect(),
+            ),
+        }
+    }
+
+    fn live_admin_response_to_legacy_json(response: LivePoolAdminResponse) -> Value {
+        match response.body {
+            LivePoolAdminResponseBody::Empty => {
+                json!({ "ok": response.exit_code == 0 })
+            }
+            LivePoolAdminResponseBody::Text(text) => {
+                json!({ "ok": response.exit_code == 0, "text": text })
+            }
+            LivePoolAdminResponseBody::MachineJson(machine_json) => json!({
+                "ok": response.exit_code == 0,
+                "json": serde_json::from_str::<Value>(&machine_json)
+                    .expect("test live admin machine JSON")
+            }),
+            LivePoolAdminResponseBody::BytesHex { bytes_hex, bytes } => json!({
+                "ok": response.exit_code == 0,
+                "bytes_hex": bytes_hex,
+                "bytes": bytes
+            }),
+            LivePoolAdminResponseBody::Error {
+                message,
+                machine_json,
+            } => {
+                let mut value = json!({
+                    "ok": false,
+                    "exit_code": response.exit_code,
+                    "error": message,
+                });
+                if let Some(machine_json) = machine_json {
+                    value["json"] = serde_json::from_str::<Value>(&machine_json)
+                        .expect("test live admin error machine JSON");
+                }
+                value
+            }
+        }
     }
 
     fn temp_fs_with_block_devices(

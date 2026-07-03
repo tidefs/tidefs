@@ -38,8 +38,8 @@ use tidefs_types_vfs_core::{
     DirEntry, EngineDirHandle, EngineFileHandle, Errno, InodeAttr, InodeId, LockSpec, NodeKind,
     RequestCtx, SetAttr, StatFs,
 };
-use tidefs_vfs_engine::LseekDataRange;
 use tidefs_vfs_engine::{AllocatedInode, PageOwnershipMode, VfsEngine, VfsEngineStatFs};
+use tidefs_vfs_engine::{LivePoolAdminRequest, LivePoolAdminResponse, LseekDataRange};
 
 /// File name for the persisted placement map inside the backing directory.
 const PLACEMENT_MAP_FILENAME: &str = "cluster_placement_map.bincode";
@@ -527,8 +527,11 @@ impl VfsEngineStatFs for ClusterPlacementVfsEngine {
         self.inner.statfs(ctx)
     }
 
-    fn live_pool_admin_request(&self, request_json: &[u8]) -> Result<Vec<u8>, Errno> {
-        self.inner.live_pool_admin_request(request_json)
+    fn live_pool_admin_request(
+        &self,
+        request: &LivePoolAdminRequest,
+    ) -> Result<LivePoolAdminResponse, Errno> {
+        self.inner.live_pool_admin_request(request)
     }
 }
 

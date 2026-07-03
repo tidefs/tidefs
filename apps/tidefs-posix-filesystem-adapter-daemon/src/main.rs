@@ -38,6 +38,7 @@ mod write_dispatch;
 mod writeback_reclaim;
 mod xattr_integrity;
 mod xfstests_harness;
+use std::collections::BTreeMap;
 use std::env;
 use std::fmt::Debug;
 use std::path::{Path, PathBuf};
@@ -64,6 +65,10 @@ use tidefs_types_package_profile_catalog::{
 use tidefs_types_posix_filesystem_adapter_core::{
     PosixFilesystemAdapterId128, PosixFilesystemAdapterPolicyBudgetRecipeWitnessRefs,
     PosixFilesystemAdapterProductWakeReceiptRecord,
+};
+use tidefs_vfs_engine::{
+    LivePoolAdminArg, LivePoolAdminArgs, LivePoolAdminCommand, LivePoolAdminOutput,
+    LivePoolAdminRequest, LivePoolAdminResponseBody,
 };
 
 use crate::mount_options::MountOptions;
@@ -830,43 +835,42 @@ fn write_queue_depth_runtime_artifact(
     workload: &str,
     mount_adapter: &str,
 ) -> Result<(), String> {
-    let request = serde_json::json!({
-        "command": "performance",
-        "operation": "admission-snapshot",
-        "pool": "root",
-        "json": true,
-        "args": {
-            "workload": workload,
-            "mount_adapter": mount_adapter,
-            "artifact_path": path.display().to_string()
-        }
-    });
-    let request_bytes = serde_json::to_vec(&request)
-        .map_err(|err| format!("encode queue-depth artifact request: {err}"))?;
-    let response_bytes = {
+    let mut args = BTreeMap::new();
+    args.insert(
+        "workload".to_string(),
+        LivePoolAdminArg::String(workload.to_string()),
+    );
+    args.insert(
+        "mount_adapter".to_string(),
+        LivePoolAdminArg::String(mount_adapter.to_string()),
+    );
+    args.insert(
+        "artifact_path".to_string(),
+        LivePoolAdminArg::String(path.display().to_string()),
+    );
+    let mut request =
+        LivePoolAdminRequest::new(LivePoolAdminCommand::PerformanceAdmissionSnapshot, "root");
+    request.output = LivePoolAdminOutput::MachineJson;
+    request.args = LivePoolAdminArgs(args);
+    let response = {
         let engine = engine
             .lock()
             .map_err(|_| "queue-depth artifact engine lock poisoned".to_string())?;
         engine
-            .live_pool_admin_request(&request_bytes)
+            .live_pool_admin_request(&request)
             .map_err(|err| format!("queue-depth artifact request failed: {err:?}"))?
     };
-    let response: serde_json::Value = serde_json::from_slice(&response_bytes)
-        .map_err(|err| format!("decode queue-depth artifact response: {err}"))?;
-    if !response
-        .get("ok")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
-    {
-        let message = response
-            .get("error")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("unknown error");
+    if response.exit_code != 0 {
+        let message = match &response.body {
+            LivePoolAdminResponseBody::Error { message, .. } => message.as_str(),
+            _ => "unknown error",
+        };
         return Err(format!("queue-depth artifact response failed: {message}"));
     }
-    let artifact = response
-        .get("json")
-        .ok_or("queue-depth artifact response did not include json payload")?;
+    let artifact = match response.body {
+        LivePoolAdminResponseBody::MachineJson(json) => json,
+        _ => return Err("queue-depth artifact response did not include machine JSON".to_string()),
+    };
     if let Some(parent) = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -878,7 +882,9 @@ fn write_queue_depth_runtime_artifact(
             )
         })?;
     }
-    let bytes = serde_json::to_vec_pretty(artifact)
+    let artifact: serde_json::Value = serde_json::from_str(&artifact)
+        .map_err(|err| format!("decode queue-depth artifact JSON: {err}"))?;
+    let bytes = serde_json::to_vec_pretty(&artifact)
         .map_err(|err| format!("encode queue-depth artifact JSON: {err}"))?;
     std::fs::write(path, bytes)
         .map_err(|err| format!("write queue-depth artifact {}: {err}", path.display()))?;
