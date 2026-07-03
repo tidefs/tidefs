@@ -37,240 +37,25 @@
 //! [`RequestCtx`]: tidefs_types_vfs_core::RequestCtx
 //! [`Errno`]: tidefs_vfs_engine::Errno
 //!
-//! # Error taxonomy
+//! # Error handling ownership
 //!
-//! Every error path in the daemon maps to a POSIX errno before reaching
-//! the kernel.  Errors are grouped into five categories by recovery
-//! semantics.  See [`doc/ERROR_TAXONOMY.md`] for the full reference.
+//! Every dispatched failure that reaches the kernel is returned as an
+//! [`Errno`]. The mappings are source-owned: ingress validation lives in
+//! [`ingress`] and [`fusewire`], operation-specific translation lives in the
+//! dispatch modules below, and mounted errno regressions live in
+//! `tests/posix_error_regression.rs`.
 //!
-//! ## 1. Transport errors (FUSE channel)
+//! Transport and mount setup failures still surface from [`run_mount`] as
+//! process-level errors. Unsupported FUSE capabilities are explicit adapter
+//! boundary outcomes, not POSIX-completeness claims; the scoped policy boundary
+//! is `docs/FUSE_ADAPTER_CONTRACT_ASSUMPTIONS.md`.
 //!
-//! The FUSE session itself can fail during mount or while reading
-//! requests from `/dev/fuse`.  These are surfaced in [`run_mount`] as
-//! `String` errors and terminate the daemon process.
+//! Keep per-operation errno tables, validation status, and recovery guidance in
+//! source, tests, GitHub issue or PR evidence, and CI artifacts instead of this
+//! crate-level overview.
 //!
-//! | Condition | Errno | Recovery |
-//! |-----------|-------|----------|
-//! | `fuser::spawn_mount2` failure | (process exit) | Daemon restart |
-//! | `/dev/fuse` read failure (session lost) | (process exit) | Daemon restart |
-//!
-//! ## 2. Protocol errors (malformed requests)
-//!
-//! The daemon validates request parameters before dispatching.
-//!
-//! | Condition | Errno | Recovery |
-//! |-----------|-------|----------|
-//! | Invalid `offset`/`length` for read/write/copy-range | `EINVAL` | Propagate to client |
-//! | Offset+length overflow (checked_add fails) | `EFBIG` | Propagate to client |
-//! | Cookie overflow in readdir (cast to i64 fails) | `EOVERFLOW` | Propagate to client |
-//! | Cookie value out of i64 range | `ERANGE` | Propagate to client |
-//! | Unknown `ioctl` command | `EOPNOTSUPP` | Propagate to client |
-//! | Malformed FIEMAP header | `EINVAL` | Propagate to client |
-//! | Non-UTF-8 name in namespace operation | `EINVAL` | Propagate to client |
-//!
-//! ## 3. Filesystem errors (POSIX semantics)
-//!
-//! These correspond to standard POSIX error conditions.  The
-//! `namespace_error_to_errno` function (in [`fuse_vfs_adapter`]) maps
-//! [`NamespaceError`] variants:
-//!
-//! [`NamespaceError`]: tidefs_namespace::NamespaceError
-//!
-//! | Namespace variant | Errno |
-//! |-------------------|-------|
-//! | `InodeNotFound` | `ENOENT` |
-//! | `AlreadyExists` | `EEXIST` |
-//! | `NotEmpty` | `ENOTEMPTY` |
-//! | `NotDirectory` | `ENOTDIR` |
-//! | `IsDirectory` | `EISDIR` |
-//! | `InvalidName` | `EINVAL` |
-//! | `TooManySymlinks` | `ELOOP` |
-//! | `NotSymlink` | `EINVAL` |
-//! | `LinkCountOverflow` | `EMLINK` |
-//! | `RenameCycle` | `EINVAL` |
-//! | (other) | `EIO` |
-//!
-//! Additional filesystem-level errors returned directly by the dispatch layer:
-//!
-//! | Condition | Errno | Recovery |
-//! |-----------|-------|----------|
-//! | Bad or closed file handle | `EBADF` | Propagate to client |
-//! | Handle exists but not writable | `EBADF` | Propagate to client |
-//! | Handle exists but inode is not a directory | `ENOTDIR` | Propagate to client |
-//! | Handle exists but inode is a directory (write/read on dir) | `EISDIR` | Propagate to client |
-//! | Name exceeds `PATH_MAX_BYTES` | `ENAMETOOLONG` | Propagate to client |
-//! | Permission denied (access check) | `EACCES` | Propagate to client |
-//! | Permission denied (owner/priv check) | `EPERM` | Propagate to client |
-//! | Read-only filesystem | `EROFS` | Propagate to client |
-//! | Inode no longer valid after lookup | `ESTALE` | Propagate to client |
-//! | xattr does not exist on inode | `ENODATA` | Propagate to client |
-//! | Seek offset beyond end of file | `ENXIO` | Propagate to client |
-//! | Lock conflict / resource busy | `EBUSY` | Propagate to client |
-//! | Operation not implemented | `ENOSYS` | Propagate to client |
-//!
-//! ## 4. Crate-level error enums
-//!
-//! Several modules define typed error enums with their own `to_errno()` methods:
-//!
-//! | Error enum | Defined in | Variants / mapping |
-//! |------------|-----------|-------------------|
-//! | [`WriteError`] | [`fuse_write`] | `BadFileDescriptor→EBADF`, `NotWritable→EBADF`, `NoSpace→ENOSPC`, `IoError→EIO`, `InvalidArgument→EINVAL` |
-//! | [`FlushError`] | [`fuse_flush_fsync`] | `BadFileDescriptor→EBADF`, `IoError→EIO`, `NoSpace→ENOSPC`, `Interrupted→EINTR` |
-//! | [`FsyncError`] | [`fuse_flush_fsync`] | `BadFileDescriptor→EBADF`, `IoError→EIO`, `NoSpace→ENOSPC`, `Interrupted→EINTR` |
-//! | [`ReaddirError`] | [`readdir_dispatch`] | `NotFound→ENOENT`, `NotDirectory→ENOTDIR`, `Io→EIO` |
-//! | [`DaemonWriteDispatchError`] | [`write_dispatch`] | `Rejected{errno}→errno`, `Staging→(staging errno)`, `Scheduler(Full)→EAGAIN`, `Scheduler(InvalidRange)→EINVAL`, `Scheduler(OutOfWorkItemIds)→EIO` |
-//!
-//! [`WriteError`]: crate::fuse_write::WriteError
-//! [`FlushError`]: crate::fuse_flush_fsync::FlushError
-//! [`FsyncError`]: crate::fuse_flush_fsync::FsyncError
-//! [`ReaddirError`]: crate::readdir_dispatch::ReaddirError
-//! [`DaemonWriteDispatchError`]: crate::write_dispatch::DaemonWriteDispatchError
-//! [`fuse_write`]: crate::fuse_write
-//! [`fuse_flush_fsync`]: crate::fuse_flush_fsync
-//! [`readdir_dispatch`]: crate::readdir_dispatch
-//! [`write_dispatch`]: crate::write_dispatch
-//!
-//! ## 5. Internal errors (daemon-local faults)
-//!
-//! | Condition | Errno | Recovery |
-//! |-----------|-------|----------|
-//! | PageCache writeback or engine flush/fsync failure | `EIO` | Log; propagate to client |
-//! | Extent-map allocation exhausted | `ENOSPC` | Propagate to client |
-//! | Extent-map corruption or wrong version | `EIO` | Log; propagate to client |
-//! | Dirty-extent scheduler full (back-pressure) | `EAGAIN` | Client retries |
-//! | Dirty-extent scheduler out of work-item ids | `EIO` | Log; propagate to client |
-//! | Dirty-extent scheduler invalid range | `EINVAL` | Propagate to client |
-//! | Internal iteration error (corrupt DirIndex) | `EIO` | Log; propagate to client |
-//! | Lock conflict (resource busy) | `EBUSY` | Client retries or blocks |
-//! | Inode link-count store failure | `ENOLINK` | Log; propagate to client |
-//!
-//! # Per-operation errno reference
-//!
-//! The tables below list every errno value each FUSE operation can return,
-//! with rationale for each mapping.
-//!
-//! ## lookup (opcode 1)
-//!
-//! - `ENOENT` — component not found in namespace
-//! - `ENOTDIR` — intermediate component is not a directory
-//! - `ENAMETOOLONG` — name exceeds `PATH_MAX_BYTES`
-//! - `EACCES` — search permission denied on parent directory
-//! - `ESTALE` — ENOENT escalated when attributes are expected after lookup
-//! - `EIO` — namespace engine internal error
-//!
-//! ## getattr (opcode 3)
-//!
-//! - `ENOENT` — inode not found in table
-//! - `EBADF` — file-handle resolution failed (when `FATTR_FH` is set)
-//! - `ESTALE` — inode lookup succeeded but attributes unavailable
-//! - `EIO` — internal metadata lookup failure
-//!
-//! ## read (opcode 15)
-//!
-//! - `EBADF` — handle unknown, closed, or not open for reading
-//! - `EISDIR` — handle points to a directory
-//! - `EINVAL` — offset or length out of range
-//! - `EFBIG` — offset+length exceeds representable range
-//! - `ENXIO` — seek position beyond end of file
-//! - `EIO` — page-cache read or extent-map lookup failed
-//!
-//! ## write (opcode 16)
-//!
-//! - `EBADF` — handle unknown, closed, or not open for writing
-//! - `ENOSPC` — extent-map allocation full; no space on device
-//! - `EINVAL` — offset or length out of range
-//! - `EFBIG` — offset+length exceeds representable range
-//! - `EAGAIN` — dirty-extent scheduler backpressure
-//! - `EIO` — I/O-level error during cache insertion
-//!
-//! ## fsync (opcode 26) / fdatasync
-//!
-//! - `EBADF` — handle unknown or closed
-//! - `EIO` — page-cache writeback or engine fsync failed
-//! - `ENOSPC` — extent-map commit failed due to no space
-//! - `EINTR` — operation interrupted by signal
-//!
-//! ## flush (opcode 25)
-//!
-//! - `EBADF` — handle unknown or closed
-//! - `EIO` — writeback failed
-//! - `ENOSPC` — extent commit failed due to no space
-//! - `EINTR` — operation interrupted by signal
-//!
-//! ## create / mkdir / mknod (opcodes 35, 9, 8)
-//!
-//! - `ENOENT` — parent inode does not exist
-//! - `ENOTDIR` — parent exists but is not a directory
-//! - `EEXIST` — name already exists (or O_EXCL conflict)
-//! - `ENOSPC` — inode table exhausted
-//! - `ENAMETOOLONG` — name exceeds `PATH_MAX_BYTES`
-//! - `EACCES` — write permission denied on parent
-//! - `EIO` — engine-level insertion failure
-//!
-//! ## unlink / rmdir (opcodes 10, 11)
-//!
-//! - `ENOENT` — parent or child inode not found
-//! - `ENOTDIR` — intermediate component is not a directory (rmdir)
-//! - `ENOTEMPTY` — directory not empty (rmdir)
-//! - `EACCES` — write permission denied
-//! - `EIO` — engine-level removal failure
-//!
-//! ## rename (opcode 12)
-//!
-//! - `ENOENT` — source not found
-//! - `ENOTDIR` — source or destination parent is not a directory
-//! - `EEXIST` — destination exists and `RENAME_NOREPLACE` is set
-//! - `EISDIR` — attempting to rename directory over non-directory or vice versa
-//! - `ENOTEMPTY` — destination is a non-empty directory
-//! - `EINVAL` — rename would create a cycle
-//! - `EIO` — namespace engine error
-//!
-//! ## readdir / readdirplus (opcodes 28, 44)
-//!
-//! - `EBADF` — directory handle unknown or closed (opendir)
-//! - `ENOTDIR` — handle points to a non-directory inode
-//! - `ENOENT` — inode in directory index not found in inode table
-//! - `EOVERFLOW` — cookie value exceeds i64 range
-//! - `EIO` — internal iteration error (corrupt DirIndex)
-//!
-//! ## fallocate (opcode 43)
-//!
-//! - `EBADF` — handle unknown, closed, or pointing to a directory
-//! - `EISDIR` — handle points to a directory
-//! - `EOPNOTSUPP` — unsupported fallocate mode (`FALLOC_FL_COLLAPSE_RANGE`, etc.)
-//! - `EINVAL` — offset/length invalid or overlapping extent
-//! - `ENOSPC` — extent-map full or allocator exhausted
-//! - `EIO` — internal engine failure
-//!
-//! ## xattr operations (getxattr, setxattr, listxattr, removexattr)
-//!
-//! - `ENODATA` — attribute name not found (getxattr, removexattr)
-//! - `ENOENT` — inode not found
-//! - `ENOSYS` — not yet implemented (most backends currently stub)
-//! - `EIO` — engine-level xattr store failure
-//!
-//! ## Advisory locks (getlk, setlk, setlkw, flock)
-//!
-//! POSIX advisory byte-range locks (F_SETLK, F_SETLKW, F_GETLK) and BSD
-//! flock (LOCK_SH, LOCK_EX, LOCK_UN) are dispatched through the lease-backed
-//! [`DaemonLockDispatch`] in-process lock service.  Lock state is held entirely
-//! in memory and is not persisted to the backing store.
-//!
-//! ### Lock recovery after daemon restart
-//!
-//! TideFS **does not recover** POSIX or BSD flock lock state across daemon
-//! restarts.  This is the correct POSIX/FUSE semantics:
-//!
-//! - When the daemon process exits (crash or graceful shutdown), the kernel
-//!   closes the associated FUSE file descriptors, which automatically releases
-//!   all kernel-side locks for those open file descriptions.
-//!
-//! - The new daemon starts with an empty lock table (see
-//!   [`DaemonLockDispatch::reset`]).
-//!
-//! - Client applications holding locks before the crash will receive errors
-//!   on subsequent lock operations, just as they would for any other
-//!   filesystem where the lock server has restarted.
+//! [`ingress`]: crate::ingress
+//! [`fusewire`]: crate::fusewire
 //!
 //! # Module overview
 //!
