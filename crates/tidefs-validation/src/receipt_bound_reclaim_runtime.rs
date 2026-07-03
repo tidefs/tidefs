@@ -4,6 +4,10 @@
 use std::{cell::RefCell, collections::BTreeMap, fmt::Write as _};
 
 use serde::{Deserialize, Serialize};
+use crate::evidence_artifact_manifest::{
+    content_digest_for_bytes, BlockingIssueRef, EvidenceArtifactManifest,
+    EVIDENCE_ARTIFACT_MANIFEST_VERSION,
+};
 use tidefs_reclaim::{
     ClearanceEvidence, GateDecision, ReclaimConsumerStats, ReclaimGate, SegmentFreer,
     SegmentLiveCounts, SegmentResolver,
@@ -19,6 +23,12 @@ pub const RECEIPT_BOUND_RECLAIM_ROW_ID: &str = "receipt-bound-obsolete-location-
 
 /// The primary evidence artifact filename emitted by the runtime row.
 pub const RECEIPT_BOUND_RECLAIM_ARTIFACT: &str = "receipt-bound-reclaim-runtime.json";
+
+pub const RECEIPT_BOUND_RECLAIM_CLAIM_ID: &str =
+    "receipt-bound-reclaim.physical-drain-runtime-row.v1";
+pub const RECEIPT_BOUND_RECLAIM_EVIDENCE_CLASS: &str = "receipt-bound-reclaim-runtime-row";
+pub const RECEIPT_BOUND_RECLAIM_SOURCE_LABEL: &str = "receipt-bound-reclaim-validation";
+pub const RECEIPT_BOUND_RECLAIM_RESIDUAL_RISK: &str = "This row proves the receipt-bound dead-object queue replay into the physical drain boundary with a SegmentFreer observer only; it is not mounted FUSE, kernel, xfstests, RDMA, whole allocator, or release-candidate evidence.";
 
 const OBSERVED_SEGMENT_ID: u64 = 0x1528;
 const CLEARANCE_PIN_EPOCH: u64 = 9;
@@ -56,6 +66,39 @@ impl ReceiptBoundReclaimRuntimeEvidence {
                 failed.join(", ")
             ))
         }
+    }
+}
+
+pub fn build_receipt_bound_reclaim_evidence_manifest(
+    evidence: &ReceiptBoundReclaimRuntimeEvidence,
+    artifact_bytes: &[u8],
+    run_id: String,
+    source_ref: String,
+    generated_at: String,
+    source: String,
+) -> EvidenceArtifactManifest {
+    EvidenceArtifactManifest {
+        manifest_version: EVIDENCE_ARTIFACT_MANIFEST_VERSION,
+        claim_id: RECEIPT_BOUND_RECLAIM_CLAIM_ID.to_string(),
+        evidence_class: RECEIPT_BOUND_RECLAIM_EVIDENCE_CLASS.to_string(),
+        validation_tier: crate::validation_schema::ValidationTier::HarnessOnly,
+        scope: format!(
+            "row={} issue=#1528 parent=#676 disposition={} artifact={}",
+            evidence.row_id, evidence.parent_tracker_disposition, RECEIPT_BOUND_RECLAIM_ARTIFACT
+        ),
+        artifact_path: RECEIPT_BOUND_RECLAIM_ARTIFACT.to_string(),
+        content_digest: content_digest_for_bytes(artifact_bytes),
+        run_id,
+        source_ref,
+        outcome: if evidence.passed {
+            crate::validation_status::ValidationStatus::Pass
+        } else {
+            crate::validation_status::ValidationStatus::ProductFail
+        },
+        residual_risk: RECEIPT_BOUND_RECLAIM_RESIDUAL_RISK.to_string(),
+        source,
+        generated_at,
+        blocking_issues: Vec::<BlockingIssueRef>::new(),
     }
 }
 
@@ -944,6 +987,12 @@ fn digest_for_key(key: ObjectKey) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::evidence_artifact_manifest::{
+        content_digest_for_bytes, parse_evidence_artifact_manifest_json,
+        EVIDENCE_ARTIFACT_MANIFEST_VERSION,
+    };
+    use crate::validation_schema::ValidationTier;
+    use crate::validation_status::ValidationStatus;
 
     #[test]
     fn receipt_bound_obsolete_location_trim_gate_passes() {
@@ -1023,5 +1072,56 @@ mod tests {
         let decoded: ReceiptBoundReclaimRuntimeEvidence =
             serde_json::from_slice(&encoded).expect("decode evidence");
         assert_eq!(decoded, evidence);
+    }
+
+    #[test]
+    fn receipt_bound_reclaim_manifest_uses_standard_artifact_contract() {
+        let evidence = run_receipt_bound_obsolete_location_trim_gate();
+        let artifact_bytes = serde_json::to_vec_pretty(&evidence).expect("serialize evidence");
+
+        let manifest = build_receipt_bound_reclaim_evidence_manifest(
+            &evidence,
+            &artifact_bytes,
+            "123456789/1".to_string(),
+            "0123456789abcdef0123456789abcdef01234567".to_string(),
+            "2026-07-03T00:00:00Z".to_string(),
+            "qemu-smoke".to_string(),
+        );
+        let json = manifest.to_json_pretty().expect("manifest should validate");
+        let parsed = parse_evidence_artifact_manifest_json(&json).expect("parse v2 manifest");
+
+        assert_eq!(parsed.manifest_version, EVIDENCE_ARTIFACT_MANIFEST_VERSION);
+        assert_eq!(parsed.claim_id, RECEIPT_BOUND_RECLAIM_CLAIM_ID);
+        assert_eq!(
+            parsed.evidence_class,
+            RECEIPT_BOUND_RECLAIM_EVIDENCE_CLASS
+        );
+        assert_eq!(parsed.validation_tier, ValidationTier::HarnessOnly);
+        assert_eq!(parsed.artifact_path, RECEIPT_BOUND_RECLAIM_ARTIFACT);
+        assert_eq!(parsed.content_digest, content_digest_for_bytes(&artifact_bytes));
+        assert_eq!(parsed.outcome, ValidationStatus::Pass);
+        assert!(parsed.blocking_issues.is_empty());
+    }
+
+    #[test]
+    fn receipt_bound_reclaim_manifest_failed_evidence_is_not_pass_shaped() {
+        let mut evidence = run_receipt_bound_obsolete_location_trim_gate();
+        evidence.passed = false;
+        let artifact_bytes = serde_json::to_vec_pretty(&evidence).expect("serialize evidence");
+
+        let manifest = build_receipt_bound_reclaim_evidence_manifest(
+            &evidence,
+            &artifact_bytes,
+            "123456789/1".to_string(),
+            "0123456789abcdef0123456789abcdef01234567".to_string(),
+            "2026-07-03T00:00:00Z".to_string(),
+            "qemu-smoke".to_string(),
+        );
+        let json = manifest.to_json_pretty().expect("manifest should validate");
+        let parsed = parse_evidence_artifact_manifest_json(&json).expect("parse v2 manifest");
+
+        assert_eq!(parsed.outcome, ValidationStatus::ProductFail);
+        assert_ne!(parsed.outcome, ValidationStatus::Pass);
+        assert_eq!(parsed.content_digest, content_digest_for_bytes(&artifact_bytes));
     }
 }

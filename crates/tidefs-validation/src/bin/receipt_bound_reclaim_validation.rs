@@ -2,36 +2,19 @@
 
 use std::env;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+use std::process::Command;
 
-use serde::Serialize;
 use tidefs_validation::receipt_bound_reclaim_runtime::{
-    run_receipt_bound_obsolete_location_trim_gate, RECEIPT_BOUND_RECLAIM_ARTIFACT,
-    RECEIPT_BOUND_RECLAIM_ROW_ID,
+    build_receipt_bound_reclaim_evidence_manifest, run_receipt_bound_obsolete_location_trim_gate,
+    RECEIPT_BOUND_RECLAIM_ARTIFACT, RECEIPT_BOUND_RECLAIM_ROW_ID,
+    RECEIPT_BOUND_RECLAIM_SOURCE_LABEL,
 };
 
 #[derive(Debug)]
 struct Args {
     row: String,
     output_dir: PathBuf,
-}
-
-#[derive(Serialize)]
-struct EvidenceManifest {
-    manifest_version: u8,
-    claim_id: String,
-    evidence_class: String,
-    validation_tier: String,
-    source: String,
-    scope: String,
-    artifact_path: String,
-    content_digest: String,
-    run_id: String,
-    source_ref: String,
-    outcome: String,
-    residual_risk: String,
-    generated_at: String,
-    blocking_issues: Vec<String>,
 }
 
 fn main() {
@@ -57,30 +40,17 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
     let artifact_json = serde_json::to_vec_pretty(&evidence)?;
     fs::write(&artifact_path, &artifact_json)?;
 
-    let digest = blake3::hash(&artifact_json);
-    let manifest = EvidenceManifest {
-        manifest_version: 3,
-        claim_id: "receipt-bound-reclaim.physical-drain-runtime-row.v1".to_string(),
-        evidence_class: "receipt-bound-reclaim-runtime-row".to_string(),
-        validation_tier: "github-actions-runtime-harness".to_string(),
-        source: workflow_name(),
-        scope: format!(
-            "row={} issue=#1528 parent=#676 disposition={} artifact={}",
-            evidence.row_id,
-            evidence.parent_tracker_disposition,
-            RECEIPT_BOUND_RECLAIM_ARTIFACT
-        ),
-        artifact_path: relative_artifact_path(&args.output_dir, &artifact_path),
-        content_digest: format!("blake3:{digest}"),
-        run_id: workflow_run_id(),
-        source_ref: source_ref(),
-        outcome: if evidence.passed { "pass" } else { "product-fail" }.to_string(),
-        residual_risk: "This row proves the receipt-bound dead-object queue replay into the physical drain boundary with a SegmentFreer observer only; it is not mounted FUSE, kernel, xfstests, RDMA, whole allocator, or release-candidate evidence.".to_string(),
-        generated_at: generated_at(),
-        blocking_issues: Vec::new(),
-    };
+    let manifest = build_receipt_bound_reclaim_evidence_manifest(
+        &evidence,
+        &artifact_json,
+        workflow_run_id(),
+        source_ref(),
+        generated_at(),
+        workflow_name(),
+    );
+    manifest.verify_artifact_digest(&args.output_dir)?;
     let manifest_path = args.output_dir.join("evidence-manifest.json");
-    fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
+    fs::write(&manifest_path, manifest.to_json_pretty()?)?;
 
     evidence.assert_passed()?;
     println!(
@@ -119,16 +89,8 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
     Ok(Args { row, output_dir })
 }
 
-fn relative_artifact_path(output_dir: &Path, artifact_path: &Path) -> String {
-    artifact_path
-        .strip_prefix(output_dir)
-        .unwrap_or(artifact_path)
-        .display()
-        .to_string()
-}
-
 fn workflow_name() -> String {
-    env::var("GITHUB_WORKFLOW").unwrap_or_else(|_| "local-receipt-bound-reclaim-validation".into())
+    env::var("GITHUB_WORKFLOW").unwrap_or_else(|_| RECEIPT_BOUND_RECLAIM_SOURCE_LABEL.into())
 }
 
 fn workflow_run_id() -> String {
@@ -146,5 +108,20 @@ fn source_ref() -> String {
 }
 
 fn generated_at() -> String {
-    env::var("TIDEFS_GENERATED_AT").unwrap_or_else(|_| "unknown".to_string())
+    env::var("TIDEFS_GENERATED_AT")
+        .or_else(|_| env::var("GITHUB_EVENT_CREATED_AT"))
+        .unwrap_or_else(|_| {
+            command_output("date", &["-u", "+%Y-%m-%dT%H:%M:%SZ"])
+                .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string())
+        })
+}
+
+fn command_output(program: &str, args: &[&str]) -> Option<String> {
+    let output = Command::new(program).args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    let trimmed = text.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
