@@ -254,6 +254,32 @@ pub struct ReceiptFrontier {
     pub frontier_millis: u64,
 }
 
+/// Why receipt-frontier based healing could not safely proceed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HealingFrontierError {
+    HealingNotInProgress,
+    MissingQuorumFrontier,
+    WrongFrontierSide {
+        expected: PartitionHazardClass,
+        actual: PartitionHazardClass,
+    },
+    FrontierEpochMismatch {
+        expected: EpochId,
+        actual: EpochId,
+    },
+    EmptyFrontierMembers,
+    UnexpectedMinorityMembers {
+        expected: Vec<MemberId>,
+        actual: Vec<MemberId>,
+    },
+    StaleFrontier {
+        frontier_millis: u64,
+        now_millis: u64,
+        max_age_millis: u64,
+    },
+    InvalidReceiptId(u64),
+}
+
 /// Reconciliation strategy selected after analyzing divergence.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReconciliationStrategy {
@@ -268,6 +294,51 @@ pub enum ReconciliationStrategy {
     },
     OperatorEscalation {
         reason: String,
+    },
+}
+
+/// Evidence that the selected reconciliation strategy has actually completed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReconciliationEvidence {
+    NoneNeeded {
+        frontier_epoch: EpochId,
+        verified_at_millis: u64,
+    },
+    Scoped {
+        shipped_receipts: Vec<u64>,
+        rolled_back_receipts: Vec<u64>,
+        verified_at_millis: u64,
+    },
+    FullCatchup {
+        replayed_epochs: Vec<EpochId>,
+        replayed_receipt_count: usize,
+        verified_at_millis: u64,
+    },
+    OperatorEscalation {
+        reason: String,
+        admitted_at_millis: u64,
+    },
+}
+
+/// Why catch-up evidence was rejected.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReconciliationEvidenceError {
+    HealingNotInProgress,
+    UnknownRejoiningMember(MemberId),
+    MissingStrategy,
+    EvidenceDoesNotMatchStrategy,
+    MissingRequiredReceiptShipment {
+        missing_receipts: Vec<u64>,
+    },
+    MissingRequiredRollback {
+        missing_receipts: Vec<u64>,
+    },
+    MissingRequiredEpochReplay {
+        missing_epochs: Vec<EpochId>,
+    },
+    InsufficientReceiptReplay {
+        expected_at_least: usize,
+        actual: usize,
     },
 }
 

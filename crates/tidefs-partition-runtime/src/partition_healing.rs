@@ -2,7 +2,10 @@
 //! PartitionHealingProtocol: c2 joint config creation, receipt frontier
 //! exchange, divergence classification, and reconciliation strategy selection.
 
-use crate::types::{DivergenceClass, ReceiptFrontier, ReconciliationStrategy};
+use crate::types::{
+    now_millis, DivergenceClass, HealingFrontierError, PartitionHazardClass, ReceiptFrontier,
+    ReconciliationEvidence, ReconciliationEvidenceError, ReconciliationStrategy,
+};
 use std::collections::BTreeSet;
 use tidefs_membership_epoch::{EpochId, MemberId};
 
@@ -40,6 +43,8 @@ pub struct PartitionHealingProtocol {
     /// Whether healing is complete.
     pub healing_complete: bool,
 }
+
+const MAX_FRONTIER_AGE_MILLIS: u64 = 30_000;
 
 impl PartitionHealingProtocol {
     /// Create a new healing protocol instance.
@@ -83,31 +88,60 @@ impl PartitionHealingProtocol {
         &mut self,
         quorum_frontier: ReceiptFrontier,
         minority_frontier: ReceiptFrontier,
-    ) {
+    ) -> Result<(), HealingFrontierError> {
+        self.validate_frontiers(&quorum_frontier, &minority_frontier)?;
         self.quorum_frontier = Some(quorum_frontier);
         self.minority_frontier = Some(minority_frontier);
+        Ok(())
+    }
+
+    fn validate_frontiers(
+        &self,
+        quorum_frontier: &ReceiptFrontier,
+        minority_frontier: &ReceiptFrontier,
+    ) -> Result<(), HealingFrontierError> {
+        if !self.healing_in_progress {
+            return Err(HealingFrontierError::HealingNotInProgress);
+        }
+
+        let joint_epoch = self
+            .joint_epoch
+            .ok_or(HealingFrontierError::HealingNotInProgress)?;
+        validate_frontier_shape(
+            quorum_frontier,
+            PartitionHazardClass::QuorumSide,
+            joint_epoch,
+        )?;
+        validate_frontier_shape(
+            minority_frontier,
+            PartitionHazardClass::MinoritySide,
+            joint_epoch,
+        )?;
+
+        let expected: BTreeSet<MemberId> = self.rejoining_members.iter().copied().collect();
+        let actual: BTreeSet<MemberId> = minority_frontier.members.iter().copied().collect();
+        if expected != actual {
+            return Err(HealingFrontierError::UnexpectedMinorityMembers {
+                expected: expected.into_iter().collect(),
+                actual: actual.into_iter().collect(),
+            });
+        }
+
+        Ok(())
     }
 
     /// Classify the divergence between the two frontiers.
     ///
     /// Compares receipt IDs known to each side to determine if there
     /// are conflicts, simple divergence, or no divergence.
-    pub fn classify_divergence(&mut self) -> DivergenceClass {
+    pub fn classify_divergence(&mut self) -> Result<DivergenceClass, HealingFrontierError> {
         let quorum = match &self.quorum_frontier {
             Some(f) => f.receipt_ids.clone(),
-            None => {
-                let result = DivergenceClass::None;
-                self.divergence = Some(result.clone());
-                return result;
-            }
+            None => return Err(HealingFrontierError::MissingQuorumFrontier),
         };
         let minority = match &self.minority_frontier {
             Some(f) => f.receipt_ids.clone(),
-            None => {
-                let result = DivergenceClass::None;
-                self.divergence = Some(result.clone());
-                return result;
-            }
+            None => return Err(HealingFrontierError::MissingQuorumFrontier),
         };
 
         let quorum_set: BTreeSet<u64> = quorum.iter().copied().collect();
@@ -126,7 +160,7 @@ impl PartitionHealingProtocol {
                 conflict_count: minority_only.len(),
             };
             self.divergence = Some(result.clone());
-            return result;
+            return Ok(result);
         }
 
         // If quorum side has receipts the minority doesn't: simple catch-up
@@ -136,12 +170,12 @@ impl PartitionHealingProtocol {
                 quorum_side_receipt_count: quorum.len(),
             };
             self.divergence = Some(result.clone());
-            return result;
+            return Ok(result);
         }
 
         let result = DivergenceClass::None;
         self.divergence = Some(result.clone());
-        result
+        Ok(result)
     }
 
     /// Select a reconciliation strategy based on divergence classification.
@@ -220,9 +254,109 @@ impl PartitionHealingProtocol {
     }
 
     /// Mark a rejoining member as caught up.
-    pub fn mark_caught_up(&mut self, member_id: MemberId) {
+    pub fn mark_caught_up(
+        &mut self,
+        member_id: MemberId,
+        evidence: ReconciliationEvidence,
+    ) -> Result<(), ReconciliationEvidenceError> {
+        if !self.healing_in_progress {
+            return Err(ReconciliationEvidenceError::HealingNotInProgress);
+        }
+        if !self.rejoining_members.contains(&member_id) {
+            return Err(ReconciliationEvidenceError::UnknownRejoiningMember(
+                member_id,
+            ));
+        }
+        self.validate_reconciliation_evidence(&evidence)?;
         if !self.caught_up_members.contains(&member_id) {
             self.caught_up_members.push(member_id);
+        }
+        Ok(())
+    }
+
+    fn validate_reconciliation_evidence(
+        &self,
+        evidence: &ReconciliationEvidence,
+    ) -> Result<(), ReconciliationEvidenceError> {
+        let strategy = self
+            .strategy
+            .as_ref()
+            .ok_or(ReconciliationEvidenceError::MissingStrategy)?;
+        match (strategy, evidence) {
+            (
+                ReconciliationStrategy::NoneNeeded,
+                ReconciliationEvidence::NoneNeeded { frontier_epoch, .. },
+            ) => {
+                let expected_epoch = self
+                    .joint_epoch
+                    .or_else(|| self.quorum_frontier.as_ref().map(|f| f.frontier_epoch));
+                if expected_epoch == Some(*frontier_epoch) {
+                    Ok(())
+                } else {
+                    Err(ReconciliationEvidenceError::EvidenceDoesNotMatchStrategy)
+                }
+            }
+            (
+                ReconciliationStrategy::Scoped {
+                    receipts_to_ship,
+                    receipts_to_rollback,
+                },
+                ReconciliationEvidence::Scoped {
+                    shipped_receipts,
+                    rolled_back_receipts,
+                    ..
+                },
+            ) => {
+                ensure_contains_all(shipped_receipts, receipts_to_ship).map_err(|missing| {
+                    ReconciliationEvidenceError::MissingRequiredReceiptShipment {
+                        missing_receipts: missing,
+                    }
+                })?;
+                ensure_contains_all(rolled_back_receipts, receipts_to_rollback).map_err(
+                    |missing| ReconciliationEvidenceError::MissingRequiredRollback {
+                        missing_receipts: missing,
+                    },
+                )?;
+                Ok(())
+            }
+            (
+                ReconciliationStrategy::FullCatchup {
+                    missed_epochs,
+                    estimated_receipts,
+                },
+                ReconciliationEvidence::FullCatchup {
+                    replayed_epochs,
+                    replayed_receipt_count,
+                    ..
+                },
+            ) => {
+                let replayed: BTreeSet<EpochId> = replayed_epochs.iter().copied().collect();
+                let missing_epochs: Vec<EpochId> = missed_epochs
+                    .iter()
+                    .copied()
+                    .filter(|epoch| !replayed.contains(epoch))
+                    .collect();
+                if !missing_epochs.is_empty() {
+                    return Err(ReconciliationEvidenceError::MissingRequiredEpochReplay {
+                        missing_epochs,
+                    });
+                }
+                if *replayed_receipt_count < *estimated_receipts {
+                    return Err(ReconciliationEvidenceError::InsufficientReceiptReplay {
+                        expected_at_least: *estimated_receipts,
+                        actual: *replayed_receipt_count,
+                    });
+                }
+                Ok(())
+            }
+            (
+                ReconciliationStrategy::OperatorEscalation { reason },
+                ReconciliationEvidence::OperatorEscalation {
+                    reason: evidence_reason,
+                    ..
+                },
+            ) if reason == evidence_reason => Ok(()),
+            _ => Err(ReconciliationEvidenceError::EvidenceDoesNotMatchStrategy),
         }
     }
 
@@ -275,6 +409,57 @@ impl PartitionHealingProtocol {
     }
 }
 
+fn validate_frontier_shape(
+    frontier: &ReceiptFrontier,
+    expected_side: PartitionHazardClass,
+    expected_epoch: EpochId,
+) -> Result<(), HealingFrontierError> {
+    if frontier.side != expected_side {
+        return Err(HealingFrontierError::WrongFrontierSide {
+            expected: expected_side,
+            actual: frontier.side,
+        });
+    }
+    if frontier.frontier_epoch != expected_epoch {
+        return Err(HealingFrontierError::FrontierEpochMismatch {
+            expected: expected_epoch,
+            actual: frontier.frontier_epoch,
+        });
+    }
+    if frontier.members.is_empty() {
+        return Err(HealingFrontierError::EmptyFrontierMembers);
+    }
+    if let Some(invalid) = frontier.receipt_ids.iter().copied().find(|id| *id == 0) {
+        return Err(HealingFrontierError::InvalidReceiptId(invalid));
+    }
+
+    let now = now_millis();
+    let age = now.saturating_sub(frontier.frontier_millis);
+    if age > MAX_FRONTIER_AGE_MILLIS {
+        return Err(HealingFrontierError::StaleFrontier {
+            frontier_millis: frontier.frontier_millis,
+            now_millis: now,
+            max_age_millis: MAX_FRONTIER_AGE_MILLIS,
+        });
+    }
+
+    Ok(())
+}
+
+fn ensure_contains_all(actual: &[u64], required: &[u64]) -> Result<(), Vec<u64>> {
+    let actual: BTreeSet<u64> = actual.iter().copied().collect();
+    let missing: Vec<u64> = required
+        .iter()
+        .copied()
+        .filter(|receipt| !actual.contains(receipt))
+        .collect();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(missing)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -285,55 +470,70 @@ mod tests {
     use crate::types::PartitionHazardClass;
 
     fn front(side: PartitionHazardClass, receipt_ids: Vec<u64>, epoch: u64) -> ReceiptFrontier {
+        let members = match side {
+            PartitionHazardClass::QuorumSide => vec![MemberId::new(1)],
+            PartitionHazardClass::MinoritySide => vec![MemberId::new(2)],
+            PartitionHazardClass::PartitionAmbiguous => vec![MemberId::new(3)],
+        };
         ReceiptFrontier {
             side,
-            members: vec![MemberId::new(1)],
+            members,
             receipt_ids,
             frontier_epoch: EpochId::new(epoch),
             frontier_millis: crate::types::now_millis(),
         }
     }
 
+    fn healing_proto_for_epoch(epoch: u64) -> PartitionHealingProtocol {
+        let mut proto = PartitionHealingProtocol::new(MemberId::new(1));
+        proto.begin_healing(EpochId::new(epoch - 1), vec![MemberId::new(2)]);
+        proto
+    }
+
     #[test]
     fn test_no_divergence_when_identical() {
-        let mut proto = PartitionHealingProtocol::new(MemberId::new(1));
-        proto.exchange_frontiers(
-            front(PartitionHazardClass::QuorumSide, vec![1, 2, 3], 5),
-            front(PartitionHazardClass::MinoritySide, vec![1, 2, 3], 5),
-        );
-        let div = proto.classify_divergence();
+        let mut proto = healing_proto_for_epoch(5);
+        proto
+            .exchange_frontiers(
+                front(PartitionHazardClass::QuorumSide, vec![1, 2, 3], 5),
+                front(PartitionHazardClass::MinoritySide, vec![1, 2, 3], 5),
+            )
+            .unwrap();
+        let div = proto.classify_divergence().unwrap();
         assert!(matches!(div, DivergenceClass::None));
     }
 
     #[test]
     fn test_divergence_when_quorum_has_more() {
-        let mut proto = PartitionHealingProtocol::new(MemberId::new(1));
-        proto.exchange_frontiers(
-            front(PartitionHazardClass::QuorumSide, vec![1, 2, 3, 4, 5], 5),
-            front(PartitionHazardClass::MinoritySide, vec![1, 2, 3], 5),
-        );
-        let div = proto.classify_divergence();
+        let mut proto = healing_proto_for_epoch(5);
+        proto
+            .exchange_frontiers(
+                front(PartitionHazardClass::QuorumSide, vec![1, 2, 3, 4, 5], 5),
+                front(PartitionHazardClass::MinoritySide, vec![1, 2, 3], 5),
+            )
+            .unwrap();
+        let div = proto.classify_divergence().unwrap();
         assert!(matches!(div, DivergenceClass::Divergent { .. }));
     }
 
     #[test]
     fn test_conflict_when_minority_has_receipts_not_on_quorum() {
-        let mut proto = PartitionHealingProtocol::new(MemberId::new(1));
-        proto.exchange_frontiers(
-            front(PartitionHazardClass::QuorumSide, vec![1, 2, 3], 5),
-            front(PartitionHazardClass::MinoritySide, vec![1, 2, 3, 10, 11], 5),
-        );
-        let div = proto.classify_divergence();
+        let mut proto = healing_proto_for_epoch(5);
+        proto
+            .exchange_frontiers(
+                front(PartitionHazardClass::QuorumSide, vec![1, 2, 3], 5),
+                front(PartitionHazardClass::MinoritySide, vec![1, 2, 3, 10, 11], 5),
+            )
+            .unwrap();
+        let div = proto.classify_divergence().unwrap();
         assert!(matches!(div, DivergenceClass::Conflicts { .. }));
     }
 
     #[test]
     fn test_missed_epochs_computation() {
         let mut proto = PartitionHealingProtocol::new(MemberId::new(1));
-        proto.exchange_frontiers(
-            front(PartitionHazardClass::QuorumSide, vec![1, 2], 10),
-            front(PartitionHazardClass::MinoritySide, vec![1], 7),
-        );
+        proto.quorum_frontier = Some(front(PartitionHazardClass::QuorumSide, vec![1, 2], 10));
+        proto.minority_frontier = Some(front(PartitionHazardClass::MinoritySide, vec![1], 7));
         let missed = proto.compute_missed_epochs();
         assert_eq!(missed.len(), 3); // epochs 8, 9, 10
     }
@@ -362,12 +562,14 @@ mod tests {
 
     #[test]
     fn test_select_scoped_for_small_divergence() {
-        let mut proto = PartitionHealingProtocol::new(MemberId::new(1));
-        proto.exchange_frontiers(
-            front(PartitionHazardClass::QuorumSide, vec![1, 2, 3, 4], 2),
-            front(PartitionHazardClass::MinoritySide, vec![1, 2], 1),
-        );
-        proto.classify_divergence();
+        let mut proto = healing_proto_for_epoch(2);
+        proto
+            .exchange_frontiers(
+                front(PartitionHazardClass::QuorumSide, vec![1, 2, 3, 4], 2),
+                front(PartitionHazardClass::MinoritySide, vec![1, 2], 2),
+            )
+            .unwrap();
+        proto.classify_divergence().unwrap();
         let divergence = DivergenceClass::Divergent {
             minority_receipt_count: 2,
             quorum_side_receipt_count: 4,
@@ -378,11 +580,13 @@ mod tests {
 
     #[test]
     fn test_witness_only_rejoin() {
-        let mut proto = PartitionHealingProtocol::new(MemberId::new(1));
-        proto.exchange_frontiers(
-            front(PartitionHazardClass::QuorumSide, vec![1, 2, 3], 5),
-            front(PartitionHazardClass::MinoritySide, vec![], 5),
-        );
+        let mut proto = healing_proto_for_epoch(5);
+        proto
+            .exchange_frontiers(
+                front(PartitionHazardClass::QuorumSide, vec![1, 2, 3], 5),
+                front(PartitionHazardClass::MinoritySide, vec![], 5),
+            )
+            .unwrap();
         assert!(proto.is_witness_only_rejoin());
     }
 
@@ -396,11 +600,76 @@ mod tests {
         assert_eq!(joint_epoch, EpochId::new(6));
         assert_eq!(proto.rejoining_members, vec![MemberId::new(2)]);
 
-        proto.mark_caught_up(MemberId::new(2));
+        proto.strategy = Some(ReconciliationStrategy::NoneNeeded);
+        proto
+            .mark_caught_up(
+                MemberId::new(2),
+                ReconciliationEvidence::NoneNeeded {
+                    frontier_epoch: joint_epoch,
+                    verified_at_millis: now_millis(),
+                },
+            )
+            .unwrap();
         assert!(proto.all_caught_up());
 
         proto.complete_healing();
         assert!(!proto.healing_in_progress);
         assert!(proto.healing_complete);
+    }
+
+    #[test]
+    fn test_classify_requires_frontiers() {
+        let mut proto = healing_proto_for_epoch(5);
+        assert_eq!(
+            proto.classify_divergence(),
+            Err(HealingFrontierError::MissingQuorumFrontier)
+        );
+    }
+
+    #[test]
+    fn test_mismatched_minority_members_refused() {
+        let mut proto = healing_proto_for_epoch(5);
+        let mut minority = front(PartitionHazardClass::MinoritySide, vec![1], 5);
+        minority.members = vec![MemberId::new(3)];
+        assert!(matches!(
+            proto.exchange_frontiers(
+                front(PartitionHazardClass::QuorumSide, vec![1, 2], 5),
+                minority
+            ),
+            Err(HealingFrontierError::UnexpectedMinorityMembers { .. })
+        ));
+    }
+
+    #[test]
+    fn test_caught_up_requires_strategy_matching_evidence() {
+        let mut proto = healing_proto_for_epoch(5);
+        proto.strategy = Some(ReconciliationStrategy::Scoped {
+            receipts_to_ship: vec![4, 5],
+            receipts_to_rollback: vec![9],
+        });
+
+        assert!(matches!(
+            proto.mark_caught_up(
+                MemberId::new(2),
+                ReconciliationEvidence::Scoped {
+                    shipped_receipts: vec![4],
+                    rolled_back_receipts: vec![9],
+                    verified_at_millis: now_millis(),
+                },
+            ),
+            Err(ReconciliationEvidenceError::MissingRequiredReceiptShipment { .. })
+        ));
+
+        proto
+            .mark_caught_up(
+                MemberId::new(2),
+                ReconciliationEvidence::Scoped {
+                    shipped_receipts: vec![4, 5],
+                    rolled_back_receipts: vec![9],
+                    verified_at_millis: now_millis(),
+                },
+            )
+            .unwrap();
+        assert!(proto.all_caught_up());
     }
 }

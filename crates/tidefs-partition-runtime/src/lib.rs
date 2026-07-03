@@ -64,7 +64,8 @@ pub use publication_gate::{PublicationGateResult, PublicationPipelineEpochGate};
 pub use single_writer_fence::SingleWriterFence;
 pub use split_brain_guard::SplitBrainGuard;
 pub use types::{
-    DivergenceClass, PartitionDetectionConfig, PartitionEvent, PartitionEventClass, PartitionFence,
-    PartitionHazardClass, PartitionState, PartitionSuspect, ReachabilityEntry, ReachabilityMatrix,
-    ReceiptFrontier, ReconciliationStrategy,
+    DivergenceClass, HealingFrontierError, PartitionDetectionConfig, PartitionEvent,
+    PartitionEventClass, PartitionFence, PartitionHazardClass, PartitionState, PartitionSuspect,
+    ReachabilityEntry, ReachabilityMatrix, ReceiptFrontier, ReconciliationEvidence,
+    ReconciliationEvidenceError, ReconciliationStrategy,
 };

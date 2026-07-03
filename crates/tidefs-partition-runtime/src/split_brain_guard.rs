@@ -45,8 +45,7 @@ impl SplitBrainGuard {
 
         if components.len() <= 1 {
             if matches!(self.partition_state, PartitionState::Healing { .. }) {
-                self.partition_state = PartitionState::Connected;
-                self.fence.lower_all();
+                return (self.partition_state.clone(), None);
             }
             return (self.partition_state.clone(), None);
         }
@@ -525,6 +524,40 @@ mod tests {
         assert!(guard.fence.leases_frozen);
         assert!(guard.fence.receipts_frozen);
         assert!(guard.fence.authority_homes_invalidated);
+    }
+
+    #[test]
+    fn restored_connectivity_keeps_healing_fenced_until_completion() {
+        let mut guard = SplitBrainGuard::new(MemberId::new(1), EpochId::new(1), 2);
+        guard.partition_state = PartitionState::Healing {
+            joint_epoch: EpochId::new(2),
+            rejoining_members: vec![MemberId::new(2)],
+            since_millis: 1000,
+        };
+        guard.fence = PartitionFence::raise_all();
+
+        let detector = make_detector();
+        let matrix = ReachabilityMatrix {
+            entries: vec![
+                reachability_entry(1, vec![2, 3]),
+                reachability_entry(2, vec![1, 3]),
+                reachability_entry(3, vec![1, 2]),
+            ],
+            computed_at_millis: 1000,
+        };
+        let members: Vec<ClusterMemberRecord> = (1..=3).map(voter_member).collect();
+
+        let (state, hazard) = guard.evaluate(&matrix, &detector, &members);
+
+        assert!(matches!(state, PartitionState::Healing { .. }));
+        assert!(hazard.is_none());
+        assert!(guard.fence.publication_frozen);
+        assert!(guard.fence.leases_frozen);
+        assert!(guard.fence.receipts_frozen);
+        assert!(!guard.can_accept_writes());
+        assert!(!guard.can_commit_publications());
+        assert!(!guard.can_grant_leases());
+        assert!(!guard.can_mint_receipts());
     }
 
     #[test]

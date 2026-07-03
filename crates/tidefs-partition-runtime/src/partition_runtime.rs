@@ -10,7 +10,11 @@ use crate::partition_audit::PartitionAuditRecorder;
 use crate::partition_detector::PartitionDetector;
 use crate::partition_healing::PartitionHealingProtocol;
 use crate::split_brain_guard::SplitBrainGuard;
-use crate::types::{now_millis, PartitionDetectionConfig, PartitionHazardClass, PartitionState};
+use crate::types::{
+    now_millis, HealingFrontierError, PartitionDetectionConfig, PartitionHazardClass,
+    PartitionState, ReceiptFrontier, ReconciliationEvidence, ReconciliationEvidenceError,
+    ReconciliationStrategy,
+};
 
 use std::sync::Arc;
 use tidefs_membership_epoch::{
@@ -63,6 +67,8 @@ pub struct PartitionRuntime {
     bootstrapped: bool,
     /// Shared epoch fence from the membership runtime for unified write-safety.
     pub epoch_fence: Option<Arc<MembershipEpochFence>>,
+    /// Latest quorum-side receipt frontier supplied by receipt tracking.
+    quorum_receipt_frontier: Option<ReceiptFrontier>,
 }
 
 impl PartitionRuntime {
@@ -93,6 +99,7 @@ impl PartitionRuntime {
             total_known_voters: 0,
             bootstrapped: false,
             epoch_fence: None,
+            quorum_receipt_frontier: None,
         }
     }
 
@@ -303,11 +310,7 @@ impl PartitionRuntime {
 
         // Begin healing: create c2 joint config
         let joint_epoch = self.healing.begin_healing(self.epoch, rejoining.clone());
-
-        // Create receipt frontiers (stubs — populated by actual receipt exchange
-        // via the transfer orchestrator #901)
-        // For the quorum side: we know all our receipts
-        // For the minority side: we'll receive their frontier via network
+        self.quorum_receipt_frontier = None;
 
         self.guard.partition_state = PartitionState::Healing {
             joint_epoch,
@@ -337,9 +340,7 @@ impl PartitionRuntime {
         receipt_ids: Vec<u64>,
         minority_members: Vec<MemberId>,
         frontier_epoch: EpochId,
-    ) {
-        use crate::types::ReceiptFrontier;
-
+    ) -> Result<ReconciliationStrategy, HealingFrontierError> {
         let minority_frontier = ReceiptFrontier {
             side: PartitionHazardClass::MinoritySide,
             members: minority_members,
@@ -348,29 +349,42 @@ impl PartitionRuntime {
             frontier_millis: now_millis(),
         };
 
-        // Build our quorum-side frontier from known state
-        let quorum_frontier = ReceiptFrontier {
-            side: PartitionHazardClass::QuorumSide,
-            members: self.members.iter().map(|m| m.member_id).collect(),
-            receipt_ids: Vec::new(), // Populated by actual receipt tracking
-            frontier_epoch: self.epoch,
-            frontier_millis: now_millis(),
-        };
+        let quorum_frontier = self
+            .quorum_receipt_frontier
+            .clone()
+            .ok_or(HealingFrontierError::MissingQuorumFrontier)?;
 
         self.healing
-            .exchange_frontiers(quorum_frontier, minority_frontier);
+            .exchange_frontiers(quorum_frontier, minority_frontier)?;
 
-        let divergence = self.healing.classify_divergence();
+        let divergence = self.healing.classify_divergence()?;
         let missed_epochs = self.healing.compute_missed_epochs();
-        let _strategy = self.healing.select_strategy(&divergence, missed_epochs);
-
-        // The selected strategy determines what the transfer orchestrator (#901)
-        // should ship to the minority side.
+        Ok(self.healing.select_strategy(&divergence, missed_epochs))
     }
 
-    /// Mark a rejoining member as caught up (called after reconciliation shipment).
-    pub fn mark_member_caught_up(&mut self, member_id: MemberId) {
-        self.healing.mark_caught_up(member_id);
+    /// Install the quorum-side receipt frontier from live receipt tracking.
+    pub fn set_quorum_receipt_frontier(
+        &mut self,
+        receipt_ids: Vec<u64>,
+        quorum_members: Vec<MemberId>,
+        frontier_epoch: EpochId,
+    ) {
+        self.quorum_receipt_frontier = Some(ReceiptFrontier {
+            side: PartitionHazardClass::QuorumSide,
+            members: quorum_members,
+            receipt_ids,
+            frontier_epoch,
+            frontier_millis: now_millis(),
+        });
+    }
+
+    /// Mark a rejoining member as caught up after reconciliation evidence is admitted.
+    pub fn mark_member_caught_up(
+        &mut self,
+        member_id: MemberId,
+        evidence: ReconciliationEvidence,
+    ) -> Result<(), ReconciliationEvidenceError> {
+        self.healing.mark_caught_up(member_id, evidence)
     }
 
     /// Check whether this node can accept writes.
@@ -738,8 +752,18 @@ mod tests {
     #[test]
     fn test_mark_member_caught_up() {
         let mut rt = make_runtime();
-        rt.healing.rejoining_members = vec![MemberId::new(2), MemberId::new(3)];
-        rt.mark_member_caught_up(MemberId::new(2));
+        let joint_epoch = rt
+            .healing
+            .begin_healing(EpochId::new(5), vec![MemberId::new(2), MemberId::new(3)]);
+        rt.healing.strategy = Some(ReconciliationStrategy::NoneNeeded);
+        rt.mark_member_caught_up(
+            MemberId::new(2),
+            ReconciliationEvidence::NoneNeeded {
+                frontier_epoch: joint_epoch,
+                verified_at_millis: now_millis(),
+            },
+        )
+        .unwrap();
         assert!(rt.healing.caught_up_members.contains(&MemberId::new(2)));
         assert!(!rt.healing.caught_up_members.contains(&MemberId::new(3)));
     }
@@ -775,7 +799,12 @@ mod tests {
             ),
         ];
         rt.bootstrap(members);
-        rt.handle_minority_frontier(vec![1, 2, 3], vec![MemberId::new(2)], EpochId::new(5));
+        let joint_epoch = rt
+            .healing
+            .begin_healing(EpochId::new(4), vec![MemberId::new(2)]);
+        rt.set_quorum_receipt_frontier(vec![1, 2, 3], vec![MemberId::new(1)], joint_epoch);
+        rt.handle_minority_frontier(vec![1, 2, 3], vec![MemberId::new(2)], joint_epoch)
+            .unwrap();
         // Should have populated healing state
         assert!(rt.healing.divergence.is_some());
     }
