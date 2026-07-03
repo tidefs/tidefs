@@ -2,18 +2,20 @@
 
 Userspace-to-kernel transition state machine with fence management, gate evaluation, and rollback.
 
-## Authority Boundary
+## Crate Boundary
 
-This crate is the current source/model authority for kernel cutover mode
+This crate models the userspace-to-kernel cutover state machine: mode
 sequencing, dry-run gate admission, cutover fence token lifecycle, rollback
-receipts, deterministic validation digests, and the T4 source/model teardown
+receipts, deterministic validation digests, and the source/model teardown
 review receipt for `kernel.teardown.no_work_after.v1`.
 
-It is not mounted Linux runtime authority yet. Mounted-kernel cutover/fence
-evidence remains tracked by
-[#1186](https://github.com/tidefs/tidefs/issues/1186), and full kernel-mode
-product claims stay blocked until accepted T5/T6 runtime artifacts and
-claim-registry review justify them.
+Kernel residency and product-claim state are owned by
+`docs/KERNEL_RESIDENCY_AUTHORITY.md`, `validation/claims.toml`, and the
+generated `docs/CLAIM_REGISTRY.md`. Those surfaces record the bounded T5
+mounted-kernel-vfs lineage and the remaining T6 full-kernel/no-daemon block for
+the teardown claim. This crate-local model does not by itself validate
+mounted-kernel, full-kernel, no-daemon, production, release, successor,
+OpenZFS, or Ceph claims.
 
 ## Daemon Independence
 
@@ -70,16 +72,17 @@ Each digest is computed with `blake3::Hasher::new_derive_key(DOMAIN)` where `DOM
 
 **step_chain_digest**: `[b"step-chain", step_ordinals...]`
 
-## Teardown Proof Review Receipt
+## Teardown Review Receipt
 
 `teardown_proof_review_receipt()` exports the claims-gate review fields for
 `kernel.teardown.no_work_after.v1`: the covered teardown token states,
 forbidden post-teardown work cases, source proof artifact digest, validation
 tier, and claim id.
 
-The receipt is T4 source/model evidence only. It deliberately records
-`mounted_linux_runtime_evidence = false` and keeps the claim blocked until
-additional T5/T6 evidence exists:
+The receipt is source/model evidence only. It deliberately records
+`mounted_linux_runtime_evidence = false`; claim admission remains fail-closed
+to the registry and kernel authority docs. The current T5/T6 evidence boundary
+there does not imply full kernel-mode product readiness.
 
 - T5 mounted-kernel teardown stress with Linux workqueue and callback activity tracing.
 - T6 full-kernel/no-daemon teardown and recovery rows across the filesystem runtime.
