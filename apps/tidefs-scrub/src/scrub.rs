@@ -518,14 +518,14 @@ pub struct ScrubWalker {
 }
 
 enum ScrubObjectStore {
-    Local(LocalObjectStore),
-    DevelopmentPool(Pool),
+    Local(Box<LocalObjectStore>),
+    DevelopmentPool(Box<Pool>),
 }
 
 impl ScrubObjectStore {
     fn raw_store(&self) -> &LocalObjectStore {
         match self {
-            Self::Local(store) => store,
+            Self::Local(store) => store.as_ref(),
             Self::DevelopmentPool(pool) => pool.raw_primary_store(),
         }
     }
@@ -577,7 +577,7 @@ impl ScrubWalker {
             &root_path,
             StoreOptions::default(),
         )? {
-            Some(store) => ScrubObjectStore::Local(store),
+            Some(store) => ScrubObjectStore::Local(Box::new(store)),
             None => {
                 let device_path = LocalFileSystem::default_development_device_path(&root_path);
                 if !device_path.is_file() {
@@ -590,9 +590,9 @@ impl ScrubWalker {
                     repair_torn_tail: false,
                     ..Default::default()
                 };
-                ScrubObjectStore::DevelopmentPool(LocalFileSystem::default_development_pool(
-                    &root_path, &options, None, None,
-                )?)
+                ScrubObjectStore::DevelopmentPool(Box::new(
+                    LocalFileSystem::default_development_pool(&root_path, &options, None, None)?,
+                ))
             }
         };
         Ok(Self {
@@ -1005,13 +1005,8 @@ mod tests {
     const DURABLE_VERIFIER_STORE_OPTIONS: StoreOptions = StoreOptions::durable();
 
     fn open_test_pool(root: &Path) -> Pool {
-        LocalFileSystem::default_development_pool(
-            root,
-            &DURABLE_VERIFIER_STORE_OPTIONS,
-            None,
-            None,
-        )
-        .expect("open test pool")
+        LocalFileSystem::default_development_pool(root, &DURABLE_VERIFIER_STORE_OPTIONS, None, None)
+            .expect("open test pool")
     }
 
     fn write_test_file(root: &Path, root_key: RootAuthenticationKey) -> ObjectKey {
