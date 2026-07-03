@@ -3051,7 +3051,10 @@ mod tests {
             timestamp_ns: test_timestamp(),
         };
         let encoded = try_encode_intent_log_entry(&entry).expect("encode");
-        assert_eq!(try_encoded_entry_len(&entry).expect("entry_len"), encoded.len());
+        assert_eq!(
+            try_encoded_entry_len(&entry).expect("entry_len"),
+            encoded.len()
+        );
     }
 
     #[test]
@@ -3105,7 +3108,11 @@ mod tests {
         ];
         for entry in &cases {
             let encoded = try_encode_intent_log_entry(entry).expect("encode");
-            assert_eq!(try_encoded_entry_len(entry).expect("entry_len"), encoded.len(), "mismatch for kind");
+            assert_eq!(
+                try_encoded_entry_len(entry).expect("entry_len"),
+                encoded.len(),
+                "mismatch for kind"
+            );
         }
     }
 
