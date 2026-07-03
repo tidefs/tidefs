@@ -85,7 +85,7 @@ branch can pass the guard.
 | Snapshot export/import and send/receive | `rollback_to_snapshot`, `export_changed_records`, `export_incremental_changed_records` | blocked | Changed-record export/import now carries an explicit stored-frame/no-device-transform contract for transform-disabled streams and receive validation rejects transform-required streams before publish. The row remains blocked until typed transform metadata can replay mounted device transform frames through the ordered contract. |
 | Intent log, fsync, commit, rollback | `sync_write_intent`, `namespace_create_intent`, `flush_intent_log_if_needed`, `fsync_*`, `sync_*`, `fdatasync_inode`, `do_commit`, `rollback_mutation_delta`, `selected_current_root_summary` | blocked | Durability barriers, replay anchors, and metadata-only namespace create intents still write and clear raw state/log objects. |
 | Directory/inode fallback reads | `inode`, `inode_record_only`, `ensure_inode_loaded_for_write` | blocked | These paths recover inode and directory records directly from raw store keys. |
-| Live dataset key administration | `live_dataset_seal_key`, `live_dataset_rotate_key` in `vfs_engine_impl.rs` | metadata/raw-only | These paths store sealed key records rather than file payloads, but the format still needs transform-authority review before it becomes a product encryption claim. |
+| Live dataset key administration | `live_dataset_seal_key`, `live_dataset_rotate_key` in `vfs_engine_impl.rs` plus `tidefs_encryption::secret_handle` lifecycle assessment | metadata/raw-only | These paths store sealed key records rather than file payloads. Issue #1823 adds source-owned key access states for active, rotating, revoked, quarantined, retired, missing, stale, and recovery-after-crash evidence, and it refuses cryptographic-erase claim review unless transform metadata, stored-frame reachability, media/remanence limits, and fully encrypted payload classification are present. The row remains metadata/raw-only and non-enabling for mounted device-level encryption while production blocked rows remain. |
 | Crash-matrix boundary staging | `CrashMatrixRawStagingAuthority` in `src/crash_recovery.rs` | validation-only raw staging | This private helper stages raw commit-boundary objects for crash-matrix validation only. It is not a mounted product write path and does not authorize mounted device-level compression or encryption claims while production `blocked` rows remain. |
 | Placement, locator, rebuild, and default pool-media writes | #17, #18, #91 surfaces | later receipt/placement issue | This issue deliberately does not edit those write paths. |
 
@@ -146,3 +146,10 @@ Mounted local-filesystem device-level compression and encryption are blocked
 behind this inventory. The lower object-store stack may still expose transform
 wrappers, but a mounted filesystem open with device compression or encryption
 must fail closed while any production `blocked` row remains.
+
+Issue #1823 narrows key-lifecycle behavior without changing this claim: revoked
+or retired key state, by itself, is not cryptographic erase, secure erase,
+sanitization, decommissioning readiness, or remanence proof. Plaintext,
+compressed-only, unencrypted, partially transformed, raw-store-bypassed, or
+previously exposed media remain explicit non-claim/refusal inputs until the
+transform authority and media/remanence evidence prove otherwise.

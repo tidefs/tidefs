@@ -33,6 +33,8 @@ closed before plaintext key access is granted.
 | `PoolEncryptionSecretHandle` | `tidefs_encryption::secret_handle` | Top-level handle bundling record + sealed envelope |
 | `PoolEncryptionKeyLease` | `tidefs_encryption::secret_handle` | Short-lived plaintext key access bound to the handle mount identity; zeroized on drop |
 | `LeaseUsageClass` | `tidefs_encryption::secret_handle` | PoolMount, PoolMaintenance, DatasetAccess |
+| `MountedPoolKeyAccessAssessment` | `tidefs_encryption::secret_handle` | Source-owned mounted-access state/refusal report for active, rotating, revoked, quarantined, retired, missing, stale, and recovery-after-crash key evidence |
+| `CryptographicEraseAssessment` | `tidefs_encryption::secret_handle` | Non-claim assessment proving key revocation/destruction alone cannot be presented as secure erase without transform metadata, stored-frame reachability, and media-remanence evidence |
 
 ## Integration chain
 
@@ -60,9 +62,12 @@ activates the handle before issuing leases.
 `CommittedDatasetMountToken` to match the handle binding. Only then does it
 unseal the envelope and return a time-bounded `PoolEncryptionKeyLease`
 carrying the same committed token. Leases are clamped to `MAX_LEASE_DURATION`
-(1 hour). Missing token evidence, tampered commitments, wrong mount
-generation, foreign dataset, and revoked/quarantined/retired handles refuse
-lease issuance.
+(1 hour). The #1823 mounted access assessment now records fail-closed states
+for active, rotating, revoked, quarantined, retired, missing, stale, and
+recovery-after-crash evidence before any plaintext lease is issued. Missing
+token evidence, tampered commitments, wrong mount generation, foreign dataset,
+incomplete recovery replay, and revoked/quarantined/retired handles refuse
+lease issuance with explicit refusal reasons.
 
 ## Durable storage
 
@@ -93,6 +98,17 @@ fail-closed behavior. Mounted local-filesystem encryption remains blocked on
 the broader transform authority work; this document is not an end-to-end
 mounted encryption claim.
 
+Issue #1823 adds the source-owned lifecycle and cryptographic-erase boundary:
+key access is allowed only for active or rotating handles with current
+committed mount evidence, or after crash recovery has replayed the committed
+binding. Revoked, quarantined, retired, missing, stale, and replay-missing
+states fail closed. The cryptographic-erase assessment can make a branch
+eligible for future claim review only when the key state is revoked or retired
+and the caller also proves persisted transform metadata, stored-frame
+reachability, and documented media/remanence limits for fully encrypted
+payloads. That assessment is still a non-claim: key revocation or destruction
+alone is not secure erase, sanitization, decommissioning, or remanence proof.
+
 ## A-register impact
 
 This implements the type-boundary portion of A17 (Security/Auth/Encryption
@@ -103,10 +119,13 @@ Design Is Split Between Strong Laws And Weak Live Boundaries):
 
 ## Tests
 
-19 unit tests in `secret_handle::tests` covering: mint+lease roundtrip,
-revoked-handle refusal, wrong wrapping key rejection, lease duration clamping,
-lease consumption, handle ID hex roundtrip, uniqueness, lifecycle transitions,
-envelope integrity digest stability, correct committed-token success, missing
-token rejection, tampered commitment rejection, wrong generation rejection,
-foreign dataset rejection, encryption round-trip through the mount-token gate,
-key rotation across remount, and mount identity display/matching helpers.
+Unit tests in `secret_handle::tests` cover: mint+lease roundtrip,
+revoked/quarantined/retired-handle refusal, wrong wrapping key rejection, lease
+duration clamping, lease consumption, handle ID hex roundtrip, uniqueness,
+lifecycle transitions, active/rotating/missing/stale/recovery-after-crash
+assessment output, envelope integrity digest stability, correct
+committed-token success, missing token rejection, tampered commitment
+rejection, wrong generation rejection, foreign dataset rejection, encryption
+round-trip through the mount-token gate, key rotation across remount,
+cryptographic-erase non-claim/refusal output, and mount identity
+display/matching helpers.
