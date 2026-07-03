@@ -89,7 +89,7 @@ fn smoke_dispatch_helpers(h: &mut SmokeHarness) {
     );
     h.assert_ev(
         "seam family doc names workers-locks",
-        SEAM_FAMILY_DOC.contains("tidefs-posix-filesystem-adapter-daemon"),
+        SEAM_FAMILY_DOC.contains("tidefs-posix-filesystem-adapter-workers-locks"),
     );
 }
 
