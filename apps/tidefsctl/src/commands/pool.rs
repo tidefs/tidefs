@@ -109,6 +109,10 @@ pub enum PoolCommand {
         /// Zero the superblock region on each device
         #[arg(long = "zero-superblock")]
         zero_superblock: bool,
+
+        /// Output as JSON
+        #[arg(long = "json")]
+        json: bool,
     },
 
     /// Import an existing pool by name through a live owner
@@ -335,7 +339,8 @@ pub fn handle_pool(cmd: PoolCommand) {
             devices,
             force,
             zero_superblock,
-        } => handle_pool_destroy(pool_name, devices, force, zero_superblock),
+            json,
+        } => handle_pool_destroy(pool_name, devices, force, zero_superblock, json),
         PoolCommand::Mount {
             pool_name,
             mountpoint,
@@ -1583,47 +1588,70 @@ fn handle_pool_destroy(
     devices: Option<Vec<PathBuf>>,
     force: bool,
     zero_superblock: bool,
+    json: bool,
 ) {
     let _guard = super::authz::require_local_only("pool destroy");
 
+    let live_args = pool_destroy_live_args(force, zero_superblock);
     let Some(devices) = devices.filter(|devices| !devices.is_empty()) else {
-        super::live_owner::route_with_args(
-            "pool",
-            "destroy",
-            &pool_name,
-            serde_json::json!({
-                "force": force,
-                "zero_superblock": zero_superblock,
-            }),
+        super::live_owner::route_with_format_and_args(
+            "pool", "destroy", &pool_name, json, live_args,
         );
     };
 
     let config = assemble_device_pool_config(&devices, "destroy");
     ensure_device_pool_name(&pool_name, "destroy", &config);
-    super::live_owner::route_or_refuse_active_for_uuid_with_args(
+    super::live_owner::route_or_refuse_active_for_uuid_with_format_and_args(
         "pool",
         "destroy",
         &pool_name,
         config.pool_uuid,
         config.state == tidefs_types_pool_label_core::PoolState::Active,
-        serde_json::json!({
-            "force": force,
-            "zero_superblock": zero_superblock,
-        }),
+        json,
+        live_args,
     );
 
     match tidefs_pool_import::pool_destroy(&devices, zero_superblock) {
         Ok(()) => {
-            println!("pool destroyed: {pool_name}");
-            if zero_superblock {
-                println!("  superblock zeroed: yes");
+            if json {
+                let out = serde_json::json!({
+                    "ok": true,
+                    "operation": "destroy",
+                    "pool_name": pool_name,
+                    "device_count": devices.len(),
+                    "zero_superblock": zero_superblock,
+                });
+                println!("{}", serde_json::to_string_pretty(&out).unwrap());
+            } else {
+                println!("pool destroyed: {pool_name}");
+                if zero_superblock {
+                    println!("  superblock zeroed: yes");
+                }
             }
         }
         Err(err) => {
-            eprintln!("tidefsctl: pool destroy failed: {err}");
+            if json {
+                let out = serde_json::json!({
+                    "ok": false,
+                    "operation": "destroy",
+                    "pool_name": pool_name,
+                    "zero_superblock": zero_superblock,
+                    "error": err.to_string(),
+                });
+                println!("{}", serde_json::to_string_pretty(&out).unwrap());
+            } else {
+                eprintln!("tidefsctl: pool destroy failed: {err}");
+            }
             process::exit(1);
         }
     }
+}
+
+fn pool_destroy_live_args(force: bool, zero_superblock: bool) -> serde_json::Value {
+    serde_json::json!({
+        "force": force,
+        "zero_superblock": zero_superblock,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2010,6 +2038,21 @@ mod tests {
         let err = validate_pool_create_device_paths(&[dir.path().to_path_buf()], true).unwrap_err();
 
         assert!(err.contains("directory"));
+    }
+
+    #[test]
+    fn pool_destroy_live_args_preserve_force_and_zero_superblock() {
+        let args = pool_destroy_live_args(true, true);
+
+        assert_eq!(
+            args.get("force").and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            args.get("zero_superblock")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
     }
 
     // -- integrity-check --devices parser tests --

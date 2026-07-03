@@ -225,6 +225,18 @@ impl LiveOwnerResponse {
             error: Some(message.into()),
         }
     }
+
+    fn error_json(exit_code: i32, message: impl Into<String>, value: serde_json::Value) -> Self {
+        Self {
+            ok: false,
+            exit_code,
+            text: None,
+            json: Some(value),
+            bytes_hex: None,
+            bytes: None,
+            error: Some(message.into()),
+        }
+    }
 }
 
 fn handle_client(
@@ -283,7 +295,7 @@ fn dispatch_request(
         ("pool", "import") => already_owned("import", manifest, request.json),
         ("pool", "mount") => pool_mount_refused(&request, manifest),
         ("pool", "export") => pool_export(request.json, manifest, shutdown),
-        ("pool", "destroy") => pool_destroy_refused(request.json, manifest),
+        ("pool", "destroy") => pool_destroy_refused(&request, manifest),
         ("pool", "get" | "set" | "list-props" | "integrity-check")
         | (
             "dataset",
@@ -514,19 +526,115 @@ fn pool_export(
     }
 }
 
-fn pool_destroy_refused(wants_json: bool, manifest: &LiveOwnerManifest) -> LiveOwnerResponse {
-    let message = "pool destroy is not implemented for the live userspace owner; export or unmount the pool, then destroy exported storage with --devices";
-    if wants_json {
-        LiveOwnerResponse::error(1, message)
+fn pool_destroy_refused(
+    request: &LiveOwnerRequest,
+    manifest: &LiveOwnerManifest,
+) -> LiveOwnerResponse {
+    let message = pool_destroy_refusal_message(request, manifest);
+    if request.json {
+        LiveOwnerResponse::error_json(1, message, pool_destroy_refusal_json(request, manifest))
     } else {
-        LiveOwnerResponse::error(
-            1,
-            format!(
-                "{message} (pool '{}' owner={} pid={} mountpoint={})",
-                manifest.pool_name, manifest.owner_kind, manifest.pid, manifest.mountpoint
-            ),
-        )
+        LiveOwnerResponse::error(1, pool_destroy_refusal_text(request, manifest))
     }
+}
+
+fn pool_destroy_refusal_json(
+    request: &LiveOwnerRequest,
+    manifest: &LiveOwnerManifest,
+) -> serde_json::Value {
+    let force = request
+        .args
+        .get("force")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let zero_superblock = request
+        .args
+        .get("zero_superblock")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let safe_path = format!(
+        "tidefsctl pool export {}; tidefsctl pool destroy {} --devices <exported-device>...{}",
+        manifest.pool_name,
+        manifest.pool_name,
+        if zero_superblock {
+            " --zero-superblock"
+        } else {
+            ""
+        },
+    );
+    json!({
+        "ok": false,
+        "code": "live-owner-pool-destroy-refused",
+        "operation": "destroy",
+        "pool_name": manifest.pool_name,
+        "pool_uuid": manifest.pool_uuid,
+        "state": "DestroyRefusedLiveOwnerMounted",
+        "owner_kind": manifest.owner_kind,
+        "pid": manifest.pid,
+        "backing_dir": manifest.backing_dir,
+        "mountpoint": manifest.mountpoint,
+        "force_requested": force,
+        "zero_superblock_requested": zero_superblock,
+        "allowed_states": ["exported-offline-explicit-devices"],
+        "force_semantics": "force cannot override an imported or mounted live-owner refusal; the existing offline explicit-device destroy path keeps its confirmation semantics",
+        "mounted_dataset_refusal": true,
+        "shutdown_requested": false,
+        "shutdown_sequence": "export or unmount the pool first, wait for live-owner shutdown, then destroy exported storage with explicit --devices",
+        "label_superblock_action": "none",
+        "safe_path": safe_path,
+        "crash_retry": "no destructive live-owner action has started; retry after the pool is exported/offline",
+        "product_claim_evidence": false,
+        "claim_boundary": "local-pool-device-lifecycle remains blocked until runtime/device evidence validates live-owner destroy behavior",
+        "error": pool_destroy_refusal_message(request, manifest),
+    })
+}
+
+fn pool_destroy_refusal_message(
+    request: &LiveOwnerRequest,
+    manifest: &LiveOwnerManifest,
+) -> String {
+    let force = request
+        .args
+        .get("force")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let zero_superblock = request
+        .args
+        .get("zero_superblock")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    format!(
+        "live-owner pool destroy refused for imported pool '{}' (owner={} pid={} mountpoint={}): mounted/imported destruction is fail-closed; force_requested={force} cannot override this boundary; zero_superblock_requested={zero_superblock} is not applied while the owner is live; export or unmount the pool, wait for owner shutdown, then destroy exported storage with explicit --devices",
+        manifest.pool_name, manifest.owner_kind, manifest.pid, manifest.mountpoint
+    )
+}
+
+fn pool_destroy_refusal_text(request: &LiveOwnerRequest, manifest: &LiveOwnerManifest) -> String {
+    let value = pool_destroy_refusal_json(request, manifest);
+    format!(
+        "{}\n  allowed_state: exported/offline pool with explicit --devices\n  shutdown_sequence: {}\n  label_superblock_action: {}\n  crash_retry: {}\n  safe_path: {}\n  claim_evidence: none; {}",
+        pool_destroy_refusal_message(request, manifest),
+        value
+            .get("shutdown_sequence")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("export/offline before destroy"),
+        value
+            .get("label_superblock_action")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("none"),
+        value
+            .get("crash_retry")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("no live destroy started"),
+        value
+            .get("safe_path")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("tidefsctl pool destroy <pool> --devices <exported-device>..."),
+        value
+            .get("claim_boundary")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("local-pool-device-lifecycle remains blocked")
+    )
 }
 
 fn hex_uuid(uuid: &[u8; 16]) -> String {
@@ -627,5 +735,98 @@ mod tests {
         assert!(error.contains("live owner"));
         assert!(error.contains("/mnt/other"));
         assert!(error.contains("no secondary mount implementation"));
+    }
+
+    fn destroy_request(wants_json: bool) -> LiveOwnerRequest {
+        LiveOwnerRequest {
+            command: "pool".to_string(),
+            operation: "destroy".to_string(),
+            pool: "tank".to_string(),
+            pool_uuid: Some("0123456789abcdeffedcba9876543210".to_string()),
+            json: wants_json,
+            args: json!({
+                "force": true,
+                "zero_superblock": true,
+            }),
+        }
+    }
+
+    #[test]
+    fn pool_destroy_json_refusal_names_safe_offline_boundary() {
+        let manifest = manifest();
+        let request = destroy_request(true);
+
+        let response = pool_destroy_refused(&request, &manifest);
+
+        assert!(!response.ok);
+        assert_eq!(response.exit_code, 1);
+        let value = response.json.expect("destroy refusal should carry JSON");
+        assert_eq!(
+            value.get("code").and_then(serde_json::Value::as_str),
+            Some("live-owner-pool-destroy-refused")
+        );
+        assert_eq!(
+            value
+                .get("force_requested")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            value
+                .get("zero_superblock_requested")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            value
+                .get("shutdown_requested")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            value
+                .get("label_superblock_action")
+                .and_then(serde_json::Value::as_str),
+            Some("none")
+        );
+        assert_eq!(
+            value
+                .get("product_claim_evidence")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        let safe_path = value
+            .get("safe_path")
+            .and_then(serde_json::Value::as_str)
+            .unwrap();
+        assert!(safe_path.contains("pool export tank"));
+        assert!(safe_path.contains("--devices <exported-device>"));
+        assert!(safe_path.contains("--zero-superblock"));
+        let error = value
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .unwrap();
+        assert!(error.contains("fail-closed"));
+        assert!(!error.contains("not implemented"));
+    }
+
+    #[test]
+    fn pool_destroy_text_refusal_records_state_machine() {
+        let manifest = manifest();
+        let request = destroy_request(false);
+
+        let response = pool_destroy_refused(&request, &manifest);
+
+        assert!(!response.ok);
+        assert_eq!(response.exit_code, 1);
+        assert!(response.json.is_none());
+        let error = response.error.expect("destroy refusal should explain why");
+        assert!(error.contains("allowed_state: exported/offline pool"));
+        assert!(error.contains("shutdown_sequence"));
+        assert!(error.contains("label_superblock_action: none"));
+        assert!(error.contains("crash_retry"));
+        assert!(error.contains("pool destroy tank --devices"));
+        assert!(error.contains("local-pool-device-lifecycle remains blocked"));
+        assert!(!error.contains("not implemented"));
     }
 }
