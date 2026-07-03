@@ -6214,6 +6214,10 @@ impl VfsEngineStatFs for VfsLocalFileSystem {
     fn live_pool_admin_request(&self, request_json: &[u8]) -> std::result::Result<Vec<u8>, Errno> {
         self.handle_live_pool_admin_request(request_json)
     }
+
+    fn has_snapshot_catalog_entries(&self) -> bool {
+        !self.fs.borrow().list_snapshots().is_empty()
+    }
 }
 
 /// Convert a LockSpec (FUSE protocol) to a LockRange (internal tracker type).

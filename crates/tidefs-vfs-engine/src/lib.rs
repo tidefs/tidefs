@@ -55,9 +55,10 @@ pub use tidefs_types_vfs_core::{
     FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE, FALLOC_FL_UNSHARE_RANGE, FALLOC_FL_ZERO_RANGE,
     FATTR_ATIME, FATTR_ATIME_NOW, FATTR_CTIME, FATTR_FH, FATTR_GID, FATTR_LOCKOWNER, FATTR_MODE,
     FATTR_MTIME, FATTR_MTIME_NOW, FATTR_SIZE, FATTR_UID, F_RDLCK, F_UNLCK, F_WRLCK,
-    RENAME_EXCHANGE, RENAME_NOREPLACE, RENAME_WHITEOUT, ROOT_INODE_ID, SEEK_CUR, SEEK_END,
-    SEEK_SET, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK, S_ISGID,
-    S_ISUID, S_ISVTX, XATTR_CREATE, XATTR_REPLACE,
+    RENAME_EXCHANGE, RENAME_NOREPLACE, RENAME_WHITEOUT, ROOT_INODE_ID,
+    SNAPSHOT_NAMESPACE_ROOT_INODE_ID, SEEK_CUR, SEEK_END, SEEK_SET, S_IFBLK, S_IFCHR, S_IFDIR,
+    S_IFIFO, S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK, S_ISGID, S_ISUID, S_ISVTX, XATTR_CREATE,
+    XATTR_REPLACE,
 };
 
 // Re-export new VFS engine types from sub-modules.
@@ -1842,6 +1843,15 @@ pub trait VfsEngineStatFs: VfsEngine {
     /// without such authority must leave the default unsupported response.
     fn live_pool_admin_request(&self, _request_json: &[u8]) -> Result<Vec<u8>, Errno> {
         Err(Errno::EOPNOTSUPP)
+    }
+
+    /// Return whether this dataset has at least one snapshot catalog entry.
+    ///
+    /// This is an adapter-facing namespace capability. Engines without a
+    /// snapshot catalog keep the default so synthetic snapshot browsing
+    /// entries are not exposed.
+    fn has_snapshot_catalog_entries(&self) -> bool {
+        false
     }
 }
 
