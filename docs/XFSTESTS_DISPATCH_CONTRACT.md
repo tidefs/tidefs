@@ -63,13 +63,18 @@ fourth (`all`) dispatches every matrix job.
 - **Default tests** (when no `tests` input): `authority/missing-pool
   configured-pool-member` (two internal smoke labels, not upstream xfstests
   group/test names).
+- **Supported focused `tests` labels**: `authority/missing-pool` and
+  `configured-pool-member`. Unknown labels fail closed with exit code 2 before
+  QEMU starts.
 - **Guest VM**: Linux 7.0 QEMU guest, `tidefs_posix_vfs.ko` loaded, minimal
   authority and mount smoke checks.
 - **Output artifact**: `xfstests-kmod-smoke`
 - **Key artifact files**: `qemu.log` (copied into a timestamped subdirectory
   under the artifact root), `evidence-manifest.json`, `artifact-root.env`
-- **Evidence scope**: `focused` when `tests` input is non-empty, otherwise
-  `broad`.
+- **Evidence scope**: `focused` when a non-empty supported internal label list
+  is supplied, otherwise `broad`. The evidence manifest records the resolved
+  internal label set actually selected by the harness. Unsupported labels are
+  recorded as a selection error, not focused smoke evidence.
 
 ### Target: `k7-vfs`
 
@@ -138,6 +143,8 @@ Each artifact contains an `evidence-manifest.json` with the following fields:
 - `tests` (array of requested test names, omitted when empty)
 - `artifact_paths` (array of relative paths to all non-manifest files in the
   artifact root)
+- `selection_error` (unsupported selector rejected before focused evidence was
+  recorded, omitted when empty)
 - `started_at` (UTC timestamp from `artifact-root.env` when available)
 - `finished_at` (UTC timestamp written at manifest creation time)
 
@@ -145,8 +152,10 @@ Each artifact contains an `evidence-manifest.json` with the following fields:
 
 - **Row-specific evidence**: A run with a non-empty `tests` list produces
   `evidence_scope: focused`. The `tests` array names exactly which xfstests
-  rows or smoke labels were requested. Only those rows' classifications are
-  evidence for the dispatched ref.
+  rows or supported smoke labels were exercised. Only those rows'
+  classifications are evidence for the dispatched ref. Unsupported `kmod-smoke`
+  labels fail closed and are recorded as a selection error rather than focused
+  evidence.
 - **Target-wide evidence**: A run without a `tests` list (or with an empty
   `tests` input) produces `evidence_scope: broad`. The result covers the
   target's full default tranche.
@@ -188,7 +197,8 @@ In practice this means:
   (`authority/missing-pool`, `configured-pool-member`), not upstream xfstests
   rows. The kmod-smoke target is a lightweight smoke harness, not a full
   xfstests runner; its `tests` input narrows the smoke check set rather than
-  selecting upstream xfstests rows.
+  selecting upstream xfstests rows. Unsupported labels such as `generic/003`
+  fail closed and must not be interpreted as focused `kmod-smoke` evidence.
 
 ## Scheduling and Manual-Only Behaviour
 
@@ -220,14 +230,7 @@ sources. They are not addressed in this documentation slice.
     `.#k7-vfs-xfstests-validation`. It is not referenced by any workflow.
     Intentional alias or stale naming is not recorded.
 
-4.  **`kmod-smoke` test label namespace**: The `kmod-smoke` target's `tests`
-    input accepts internal labels (`authority/missing-pool`,
-    `configured-pool-member`) that do not follow the upstream xfstests
-    `group/number` convention. This is not a bug, but the difference is not
-    called out in `docs/GITHUB_CI.md`. Users may assume all targets accept
-    upstream xfstests row names.
-
-5.  **`kmod-smoke` artifact paths**: Unlike `fuse` and `k7-vfs`, the
+4.  **`kmod-smoke` artifact paths**: Unlike `fuse` and `k7-vfs`, the
     `kmod-smoke` harness writes its `qemu.log` into a timestamped subdirectory
     under the artifact root. The `evidence-manifest.json` `artifact_paths`
     array records these relative paths, but the shape differs from the flat
