@@ -32,7 +32,6 @@ pub mod local_vfs_runtime_crash_artifact;
 pub mod metadata_durability;
 pub mod mount_harness;
 pub mod performance_gate;
-pub mod pool_rollback_import_validation;
 pub mod qemu;
 pub mod qemu_pin_manifest;
 #[cfg(feature = "receipt-bound-physical-reclaim")]
