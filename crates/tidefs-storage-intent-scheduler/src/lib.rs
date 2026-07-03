@@ -6,9 +6,9 @@
 //!
 //! This crate is the first #862 source slice. It consumes compiled
 //! storage-intent policy from #855 and storage-intent records from #841,
-//! maps work into the unified LaneClass lane model from
-//! `docs/design/unified-scheduling-classes-lane-priority-model.md`, and
-//! enforces intent-aware admission, QoS budget caps, backpressure,
+//! maps work into the source-owned `LaneClass` lane vocabulary from
+//! `tidefs_types_transport_session`, and enforces intent-aware admission,
+//! QoS budget caps, backpressure,
 //! speculative-drop behaviour, and read-only scheduling evidence.
 //!
 //! It does not implement placement planning, ack receipt emission, media/cost
@@ -53,8 +53,8 @@ pub const MAX_REQUIRED_EVIDENCE_KINDS: usize = 24;
 
 /// Maps a storage-intent action class to its canonical scheduling lane.
 ///
-/// The mapping follows the priority order defined in
-/// `docs/design/unified-scheduling-classes-lane-priority-model.md`.
+/// The mapping follows the priority order encoded by `LaneClass`,
+/// `lane_priority`, and `LANE_CLASSES_BY_PRIORITY` in this crate.
 /// CONTROL > METADATA > DEMAND > SPECULATIVE > BACKGROUND.
 ///
 /// Unknown or unmapped action classes map to the most conservative lane
