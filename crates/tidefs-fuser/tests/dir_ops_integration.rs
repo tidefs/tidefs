@@ -425,7 +425,7 @@ fn mount(label: &str) -> (std::path::PathBuf, fuser::BackgroundSession) {
             eprintln!("SKIP: /dev/fuse mount not permitted: {err}");
             std::process::exit(0);
         }
-        Err(err) => panic!("spawn_mount2: {err}"),
+        Err(err) => panic!("spawn_mount2: {}", err),
     };
     std::thread::sleep(std::time::Duration::from_millis(50));
     (mnt, se)
