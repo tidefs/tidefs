@@ -176,8 +176,8 @@ pub fn iter_dir_entries(
         } else if snapshot_catalog_generation.is_some() {
             pending_synthetic = true;
         }
-    } else if let Some(generation) = snapshot_catalog_generation
-        .filter(|_| cookie.0 == DOTDOT_COOKIE)
+    } else if let Some(generation) =
+        snapshot_catalog_generation.filter(|_| cookie.0 == DOTDOT_COOKIE)
     {
         // `.` and `..` were emitted previously; `.snapshot` still remains.
         next_cookie = SNAPSHOT_DOTDIR_COOKIE;
@@ -387,14 +387,8 @@ mod tests {
     #[test]
     fn iter_empty_dir_with_snapshots_returns_snapshot_dotdir() {
         let dir = make_dir();
-        let outcome = iter_dir_entries(
-            &dir,
-            10,
-            1,
-            Some(Generation::new(7)),
-            DirCookie::START,
-            128,
-        );
+        let outcome =
+            iter_dir_entries(&dir, 10, 1, Some(Generation::new(7)), DirCookie::START, 128);
 
         assert_eq!(outcome.entries.len(), 3);
         assert_eq!(outcome.entries[0].name, b".");
@@ -433,14 +427,8 @@ mod tests {
         insert_entry(&mut dir, b"alpha", 42, 0o100000);
         insert_entry(&mut dir, b"beta", 43, 0o100000);
 
-        let outcome = iter_dir_entries(
-            &dir,
-            10,
-            1,
-            Some(Generation::new(7)),
-            DirCookie::START,
-            128,
-        );
+        let outcome =
+            iter_dir_entries(&dir, 10, 1, Some(Generation::new(7)), DirCookie::START, 128);
 
         assert_eq!(outcome.entries.len(), 5);
         assert_eq!(outcome.entries[0].name, b".");
@@ -536,38 +524,17 @@ mod tests {
     fn iter_limited_snapshot_synthetics_report_more_until_dotdir_emits() {
         let dir = make_dir();
 
-        let first = iter_dir_entries(
-            &dir,
-            10,
-            1,
-            Some(Generation::new(7)),
-            DirCookie::START,
-            1,
-        );
+        let first = iter_dir_entries(&dir, 10, 1, Some(Generation::new(7)), DirCookie::START, 1);
         assert_eq!(first.entries.len(), 1);
         assert_eq!(first.entries[0].name, b".");
         assert!(first.has_more);
 
-        let second = iter_dir_entries(
-            &dir,
-            10,
-            1,
-            Some(Generation::new(7)),
-            first.last_cookie,
-            1,
-        );
+        let second = iter_dir_entries(&dir, 10, 1, Some(Generation::new(7)), first.last_cookie, 1);
         assert_eq!(second.entries.len(), 1);
         assert_eq!(second.entries[0].name, b"..");
         assert!(second.has_more);
 
-        let third = iter_dir_entries(
-            &dir,
-            10,
-            1,
-            Some(Generation::new(7)),
-            second.last_cookie,
-            1,
-        );
+        let third = iter_dir_entries(&dir, 10, 1, Some(Generation::new(7)), second.last_cookie, 1);
         assert_eq!(third.entries.len(), 1);
         assert_eq!(third.entries[0].name, b".snapshot");
         assert_eq!(third.entries[0].cookie, 3);
