@@ -471,9 +471,42 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use tidefs_lease::types::{LeaseClass, LeaseDomain, LeaseGrant, RaftCommand};
+    use tidefs_membership_epoch::{DatasetMountIdentity, EpochId};
 
     fn node_id(id: u64) -> MemberId {
         MemberId::new(id)
+    }
+
+    fn grant_lease(lock_table: &mut LockTable, lease_id: u64, holder_id: MemberId) {
+        let grant = LeaseGrant::request(
+            lease_id,
+            LeaseClass::Exclusive,
+            LeaseDomain::Inode {
+                dataset_id: 1,
+                ino: lease_id,
+            },
+            holder_id,
+            1,
+            60_000,
+            1,
+            EpochId::new(10),
+            DatasetMountIdentity::ZERO,
+            1,
+            1,
+            1,
+        );
+        lock_table.apply(&RaftCommand::Grant { grant });
+    }
+
+    fn assert_err_contains<T>(result: Result<T, String>, needle: &str) {
+        match result {
+            Ok(_) => panic!("expected error containing {needle:?}"),
+            Err(err) => assert!(
+                err.contains(needle),
+                "expected {err:?} to contain {needle:?}"
+            ),
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -607,6 +640,62 @@ mod tests {
     // -----------------------------------------------------------------------
     // Tests
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn lock_table_drain_ops_releases_lock_table_leases() {
+        let draining_node = node_id(42);
+        let other_node = node_id(43);
+        let mut lock_table = LockTable::new(1, EpochId::new(10));
+
+        grant_lease(&mut lock_table, 100, draining_node);
+        grant_lease(&mut lock_table, 101, draining_node);
+        grant_lease(&mut lock_table, 200, other_node);
+
+        {
+            let mut ops = LockTableDrainOps::new(&mut lock_table, other_node);
+
+            assert_eq!(ops.admin_target(), other_node);
+            assert_eq!(ops.lease_ids_for_node(draining_node), vec![100, 101]);
+            assert_eq!(ops.lease_ids_for_node(other_node), vec![200]);
+
+            ops.release_lease(100).unwrap();
+            assert_eq!(ops.lease_ids_for_node(draining_node), vec![101]);
+            assert_err_contains(ops.release_lease(999), "lease 999 not found");
+        }
+
+        assert!(lock_table.get_grant(100).is_none());
+        assert!(lock_table.get_grant(101).is_some());
+        assert!(lock_table.get_grant(200).is_some());
+    }
+
+    #[test]
+    fn lock_table_drain_ops_fails_closed_without_data_cache_admin_services() {
+        let draining_node = node_id(44);
+        let target_node = node_id(45);
+        let mut lock_table = LockTable::new(1, EpochId::new(10));
+        let mut ops = LockTableDrainOps::new(&mut lock_table, target_node);
+
+        assert_err_contains(
+            ops.object_count_for_node(draining_node),
+            "placement-backed DrainOps",
+        );
+        assert_err_contains(
+            ops.cache_bytes_for_node(draining_node),
+            "cache-backed DrainOps",
+        );
+        assert_err_contains(
+            ops.migrate_one_object(draining_node),
+            "placement-backed DrainOps",
+        );
+        assert_err_contains(
+            ops.invalidate_cache_chunk(draining_node, 64 * 1024 * 1024),
+            "cache-backed DrainOps",
+        );
+        assert_err_contains(
+            ops.transfer_admin(draining_node, target_node),
+            "admin-backed DrainOps",
+        );
+    }
 
     #[test]
     fn executor_full_drain_with_leases() {
