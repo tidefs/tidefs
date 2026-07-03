@@ -1792,7 +1792,10 @@ fn validate_evidence_manifest_path(
 ) -> Result<EvidenceArtifactManifest, EvidenceArtifactManifestError> {
     let path = path.as_ref();
     let manifest = load_evidence_artifact_manifest_json_path(path)?;
-    let artifact_root = path.parent().unwrap_or_else(|| Path::new("."));
+    let artifact_root = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
     manifest.verify_artifact_digest(artifact_root)?;
     Ok(manifest)
 }
@@ -1801,11 +1804,14 @@ fn validate_evidence_manifest_path(
 mod code_navigability_tests {
     use super::*;
     use std::fs;
+    use std::sync::Mutex;
     use tidefs_validation::evidence_artifact_manifest::{
         content_digest_for_bytes, BlockingIssueRef, EVIDENCE_ARTIFACT_MANIFEST_VERSION,
     };
     use tidefs_validation::validation_schema::ValidationTier;
     use tidefs_validation::validation_status::ValidationStatus;
+
+    static CURRENT_DIR_LOCK: Mutex<()> = Mutex::new(());
 
     fn evidence_manifest_for(
         artifact_path: &str,
@@ -1933,6 +1939,24 @@ error[E0308]: mismatched types
         let manifest_path = write_manifest(&manifest_dir, &manifest);
 
         validate_evidence_manifest_path(&manifest_path).expect("manifest-relative artifact passes");
+    }
+
+    #[test]
+    fn validate_evidence_manifest_accepts_manifest_in_current_dir() {
+        let _guard = CURRENT_DIR_LOCK.lock().expect("current-dir lock");
+        let original_dir = env::current_dir().expect("current dir");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let artifact_bytes = b"focused rust summary bytes";
+        fs::write(temp.path().join("ci-test-summary.json"), artifact_bytes)
+            .expect("write artifact");
+        let manifest = evidence_manifest_for("ci-test-summary.json", artifact_bytes);
+        write_manifest(temp.path(), &manifest);
+
+        env::set_current_dir(temp.path()).expect("enter tempdir");
+        let result = validate_evidence_manifest_path("manifest.json");
+        env::set_current_dir(original_dir).expect("restore current dir");
+
+        result.expect("current-dir manifest path validates");
     }
 
     #[cfg(unix)]
