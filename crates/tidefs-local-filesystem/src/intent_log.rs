@@ -502,7 +502,7 @@ fn try_encode_intent_log_entry(entry: &IntentLogEntry) -> Result<Vec<u8>> {
         }
         IntentLogEntryKind::MetadataSetattrIntent(inode) => {
             out.push(KIND_METADATA_SETATTR_INTENT);
-            let inode = encode_inode(inode);
+            let inode = try_encode_inode(inode)?;
             push_u64(&mut out, inode.len() as u64);
             out.extend_from_slice(&inode);
         }
@@ -806,7 +806,7 @@ fn try_encoded_entry_len(entry: &IntentLogEntry) -> Result<usize> {
         }
         IntentLogEntryKind::MetadataSetattrIntent(inode) => {
             len += 1; // kind
-            len += 8 + encode_inode(inode).len(); // inode payload length + bytes
+            len += 8 + try_encode_inode(inode)?.len(); // inode payload length + bytes
         }
         IntentLogEntryKind::PressureFallback => {
             len += 1; // kind byte only
