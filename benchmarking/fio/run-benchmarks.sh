@@ -26,8 +26,8 @@ Modes:
   ublk        Benchmark a ublk block device
 
 Profiles:
-  smoke          Minimal viability (default)
-  quick-required Pre-release validation
+  smoke          Shortest local fio sampling profile (default)
+  quick-required Broader local fio sampling profile
   pressure       Stress and degradation
   all            Run all profiles
 
