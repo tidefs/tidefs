@@ -5,9 +5,9 @@
 # fail closed without explicit kernel pool I/O authority, and mounts a
 # formatted virtio pool member through the configured kernel authority path.
 #
-# This harness is the prerequisite for #5832 (full generic-group
-# classification). It provides the build, boot, load, and mount
-# infrastructure that #5832 consumes.
+# This harness is the canonical kmod xfstests smoke entrypoint. It provides
+# build, boot, load, and mount coverage, but it is not a full generic-group
+# xfstests validation lane.
 #
 # Dependencies:
 #   - Linux 7.0 kernel with Rust-for-Linux support (CONFIG_RUST=y)
