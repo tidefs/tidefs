@@ -1888,7 +1888,9 @@ pub fn evaluate_prefetch_execution(input: PrefetchExecutorInput) -> PrefetchExec
     }
 
     if family.is_negative_enforcement() || no_prefetch_decision(input.decision) {
-        if result_detail_has_execution_measurements(input.result_detail) {
+        if negative_enforcement_has_dispatch_claims(input)
+            || result_detail_has_execution_measurements(input.result_detail)
+        {
             return terminal(
                 record,
                 PrefetchExecutorOutcome::VerificationFailed,
@@ -3010,6 +3012,11 @@ fn initial_result_detail_lacks_feedback_evidence(input: PrefetchExecutorInput) -
 
 fn result_detail_has_execution_measurements(detail: PrefetchExecutorResultDetail) -> bool {
     detail.has_feedback_payback_inputs()
+}
+
+fn negative_enforcement_has_dispatch_claims(input: PrefetchExecutorInput) -> bool {
+    input.dispatch_plan != PrefetchExecutorDispatchPlan::default()
+        || input.admission != PrefetchExecutorAdmissionRecord::default()
 }
 
 fn initial_result_detail_has_snapshot_feedback_roots(input: PrefetchExecutorInput) -> bool {
@@ -7358,6 +7365,51 @@ mod tests {
         input.admission = PrefetchExecutorAdmissionRecord::default();
         input.result_detail = terminal_detail();
         add_initial_feedback_roots(&mut input.evidence_query_snapshot, input.result_detail);
+
+        let record = evaluate_prefetch_execution(input);
+
+        assert_eq!(record.outcome, PrefetchExecutorOutcome::VerificationFailed);
+        assert_eq!(
+            record.executor_byte_state,
+            PrefetchExecutorByteState::Refused
+        );
+        assert_eq!(
+            record.refusal,
+            StorageIntentRefusalReason::ValidationGateFailed
+        );
+        assert_record_has_no_authority_claims(record);
+    }
+
+    #[test]
+    fn no_prefetch_rejects_dispatch_plan_claims() {
+        let mut input = admitted_input(PrefetchResidencyCandidateClass::NoPrefetch);
+        input.decision.outcome = PrefetchResidencyDecisionOutcome::NoAction;
+        input.admission = PrefetchExecutorAdmissionRecord::default();
+        input.dispatch_plan = PrefetchExecutorDispatchPlan::bounded_range(
+            4096,
+            4096,
+            evidence(StorageIntentEvidenceKind::ActionExecutionEvidence, ACTION),
+        );
+
+        let record = evaluate_prefetch_execution(input);
+
+        assert_eq!(record.outcome, PrefetchExecutorOutcome::VerificationFailed);
+        assert_eq!(
+            record.executor_byte_state,
+            PrefetchExecutorByteState::Refused
+        );
+        assert_eq!(
+            record.refusal,
+            StorageIntentRefusalReason::ValidationGateFailed
+        );
+        assert_record_has_no_authority_claims(record);
+    }
+
+    #[test]
+    fn no_prefetch_rejects_scheduler_admission_claims() {
+        let mut input = admitted_input(PrefetchResidencyCandidateClass::NoPrefetch);
+        input.decision.outcome = PrefetchResidencyDecisionOutcome::NoAction;
+        input.dispatch_plan = PrefetchExecutorDispatchPlan::default();
 
         let record = evaluate_prefetch_execution(input);
 
