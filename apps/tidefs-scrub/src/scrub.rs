@@ -1002,16 +1002,22 @@ mod tests {
         "41".repeat(32)
     }
 
+    const DURABLE_VERIFIER_STORE_OPTIONS: StoreOptions = StoreOptions::durable();
+
     fn open_test_pool(root: &Path) -> Pool {
-        let options = StoreOptions::durable();
-        LocalFileSystem::default_development_pool(root, &options, None, None)
-            .expect("open test pool")
+        LocalFileSystem::default_development_pool(
+            root,
+            &DURABLE_VERIFIER_STORE_OPTIONS,
+            None,
+            None,
+        )
+        .expect("open test pool")
     }
 
     fn write_test_file(root: &Path, root_key: RootAuthenticationKey) -> ObjectKey {
         let mut fs = LocalFileSystem::open_with_root_authentication_key(
             root,
-            StoreOptions::durable(),
+            DURABLE_VERIFIER_STORE_OPTIONS,
             root_key,
         )
         .expect("open fs");
