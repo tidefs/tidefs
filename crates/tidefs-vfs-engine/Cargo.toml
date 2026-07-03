@@ -19,6 +19,7 @@ path = "src/lib.rs"
 tidefs-types-vfs-core = { workspace = true }
 tidefs-types-extent-map-core = { workspace = true }
 tidefs-types-pool-label-core = { workspace = true }
+serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
 
 [dev-dependencies]
 tidefs-permission = { workspace = true }

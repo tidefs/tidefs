@@ -32,6 +32,11 @@
 
 extern crate alloc;
 
+use alloc::collections::BTreeMap;
+use alloc::string::String;
+use alloc::vec::Vec;
+use serde::{Deserialize, Serialize};
+
 pub mod directory;
 pub mod dispatch;
 pub mod inode;
@@ -41,8 +46,6 @@ pub mod pool_core;
 pub mod trace;
 pub mod txg;
 pub mod xattr_bridge;
-
-use alloc::vec::Vec;
 
 // ── Core types re-export ────────────────────────────────────────────────
 //
@@ -1836,11 +1839,14 @@ pub trait VfsEngineStatFs: VfsEngine {
 
     /// Handle an imported-pool admin request owned by this live engine.
     ///
-    /// The request and response are intentionally byte-oriented so the VFS
-    /// contract does not grow a second userspace-only schema. Engines that own
-    /// live pool state may decode their selected control UAPI here; engines
-    /// without such authority must leave the default unsupported response.
-    fn live_pool_admin_request(&self, _request_json: &[u8]) -> Result<Vec<u8>, Errno> {
+    /// Live-owner control records are typed and versioned here so adapters do
+    /// not treat an incidental debug/export encoding as the control authority.
+    /// Engines without live-owner authority must leave the default unsupported
+    /// response.
+    fn live_pool_admin_request(
+        &self,
+        _request: &LivePoolAdminRequest,
+    ) -> Result<LivePoolAdminResponse, Errno> {
         Err(Errno::EOPNOTSUPP)
     }
 
@@ -1853,6 +1859,303 @@ pub trait VfsEngineStatFs: VfsEngine {
     fn snapshot_catalog_generation(&self) -> Option<Generation> {
         None
     }
+}
+
+/// Current live-owner admin/control request version.
+pub const LIVE_POOL_ADMIN_PROTOCOL_VERSION: u16 = 1;
+
+/// Versioned request accepted by a live pool owner.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LivePoolAdminRequest {
+    pub version: u16,
+    pub command: LivePoolAdminCommand,
+    pub pool: String,
+    pub pool_uuid: Option<String>,
+    pub output: LivePoolAdminOutput,
+    #[serde(default)]
+    pub args: LivePoolAdminArgs,
+}
+
+impl LivePoolAdminRequest {
+    pub fn new(command: LivePoolAdminCommand, pool: impl Into<String>) -> Self {
+        Self {
+            version: LIVE_POOL_ADMIN_PROTOCOL_VERSION,
+            command,
+            pool: pool.into(),
+            pool_uuid: None,
+            output: LivePoolAdminOutput::Human,
+            args: LivePoolAdminArgs::default(),
+        }
+    }
+
+    pub fn validate_version(&self) -> Result<(), LivePoolAdminError> {
+        if self.version == LIVE_POOL_ADMIN_PROTOCOL_VERSION {
+            Ok(())
+        } else {
+            Err(LivePoolAdminError::unsupported_version(self.version))
+        }
+    }
+}
+
+/// Explicit operator-output mode for live-owner responses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LivePoolAdminOutput {
+    Human,
+    MachineJson,
+}
+
+impl LivePoolAdminOutput {
+    pub fn wants_json(self) -> bool {
+        matches!(self, Self::MachineJson)
+    }
+}
+
+/// Typed live-owner command authority.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LivePoolAdminCommand {
+    PoolStatus,
+    PoolImport,
+    PoolMount,
+    PoolExport,
+    PoolDestroy,
+    PoolGet,
+    PoolSet,
+    PoolListProps,
+    PoolIntegrityCheck,
+    DatasetCreate,
+    DatasetList,
+    DatasetRename,
+    DatasetDestroy,
+    DatasetSetStrategy,
+    DatasetUpgrade,
+    DatasetGet,
+    DatasetSet,
+    DatasetListProps,
+    DatasetSealKey,
+    DatasetRotateKey,
+    SnapshotCreate,
+    SnapshotList,
+    SnapshotDestroy,
+    SnapshotRollback,
+    SnapshotExtract,
+    SnapshotSend,
+    PerformanceAdmissionSnapshot,
+    DeviceRemove,
+}
+
+impl LivePoolAdminCommand {
+    pub fn from_parts(command: &str, operation: &str) -> Result<Self, LivePoolAdminError> {
+        let typed = match (command, operation) {
+            ("pool", "status") => Self::PoolStatus,
+            ("pool", "import") => Self::PoolImport,
+            ("pool", "mount") => Self::PoolMount,
+            ("pool", "export") => Self::PoolExport,
+            ("pool", "destroy") => Self::PoolDestroy,
+            ("pool", "get") => Self::PoolGet,
+            ("pool", "set") => Self::PoolSet,
+            ("pool", "list-props") => Self::PoolListProps,
+            ("pool", "integrity-check") => Self::PoolIntegrityCheck,
+            ("dataset", "create") => Self::DatasetCreate,
+            ("dataset", "list") => Self::DatasetList,
+            ("dataset", "rename") => Self::DatasetRename,
+            ("dataset", "destroy") => Self::DatasetDestroy,
+            ("dataset", "set-strategy") => Self::DatasetSetStrategy,
+            ("dataset", "upgrade") => Self::DatasetUpgrade,
+            ("dataset", "get") => Self::DatasetGet,
+            ("dataset", "set") => Self::DatasetSet,
+            ("dataset", "list-props") => Self::DatasetListProps,
+            ("dataset", "seal-key") => Self::DatasetSealKey,
+            ("dataset", "rotate-key") => Self::DatasetRotateKey,
+            ("snapshot", "create") => Self::SnapshotCreate,
+            ("snapshot", "list") => Self::SnapshotList,
+            ("snapshot", "destroy") => Self::SnapshotDestroy,
+            ("snapshot", "rollback") => Self::SnapshotRollback,
+            ("snapshot", "extract") => Self::SnapshotExtract,
+            ("snapshot", "send") => Self::SnapshotSend,
+            ("performance", "admission-snapshot") => Self::PerformanceAdmissionSnapshot,
+            ("device", "remove") => Self::DeviceRemove,
+            _ => return Err(LivePoolAdminError::unsupported_command(command, operation)),
+        };
+        Ok(typed)
+    }
+
+    pub fn parts(&self) -> (&'static str, &'static str) {
+        match self {
+            Self::PoolStatus => ("pool", "status"),
+            Self::PoolImport => ("pool", "import"),
+            Self::PoolMount => ("pool", "mount"),
+            Self::PoolExport => ("pool", "export"),
+            Self::PoolDestroy => ("pool", "destroy"),
+            Self::PoolGet => ("pool", "get"),
+            Self::PoolSet => ("pool", "set"),
+            Self::PoolListProps => ("pool", "list-props"),
+            Self::PoolIntegrityCheck => ("pool", "integrity-check"),
+            Self::DatasetCreate => ("dataset", "create"),
+            Self::DatasetList => ("dataset", "list"),
+            Self::DatasetRename => ("dataset", "rename"),
+            Self::DatasetDestroy => ("dataset", "destroy"),
+            Self::DatasetSetStrategy => ("dataset", "set-strategy"),
+            Self::DatasetUpgrade => ("dataset", "upgrade"),
+            Self::DatasetGet => ("dataset", "get"),
+            Self::DatasetSet => ("dataset", "set"),
+            Self::DatasetListProps => ("dataset", "list-props"),
+            Self::DatasetSealKey => ("dataset", "seal-key"),
+            Self::DatasetRotateKey => ("dataset", "rotate-key"),
+            Self::SnapshotCreate => ("snapshot", "create"),
+            Self::SnapshotList => ("snapshot", "list"),
+            Self::SnapshotDestroy => ("snapshot", "destroy"),
+            Self::SnapshotRollback => ("snapshot", "rollback"),
+            Self::SnapshotExtract => ("snapshot", "extract"),
+            Self::SnapshotSend => ("snapshot", "send"),
+            Self::PerformanceAdmissionSnapshot => ("performance", "admission-snapshot"),
+            Self::DeviceRemove => ("device", "remove"),
+        }
+    }
+}
+
+/// Generic typed argument atoms for command-specific live-owner operations.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LivePoolAdminArgs(pub BTreeMap<String, LivePoolAdminArg>);
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "type", content = "value")]
+pub enum LivePoolAdminArg {
+    Null,
+    Bool(bool),
+    I64(i64),
+    U64(u64),
+    String(String),
+    Array(Vec<LivePoolAdminArg>),
+    Object(BTreeMap<String, LivePoolAdminArg>),
+}
+
+/// Typed live-owner response.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LivePoolAdminResponse {
+    pub version: u16,
+    pub exit_code: i32,
+    pub body: LivePoolAdminResponseBody,
+}
+
+impl LivePoolAdminResponse {
+    pub fn ok_text(text: impl Into<String>) -> Self {
+        Self {
+            version: LIVE_POOL_ADMIN_PROTOCOL_VERSION,
+            exit_code: 0,
+            body: LivePoolAdminResponseBody::Text(text.into()),
+        }
+    }
+
+    pub fn ok_machine_json(json: impl Into<String>) -> Self {
+        Self {
+            version: LIVE_POOL_ADMIN_PROTOCOL_VERSION,
+            exit_code: 0,
+            body: LivePoolAdminResponseBody::MachineJson(json.into()),
+        }
+    }
+
+    pub fn ok_bytes_hex(bytes_hex: impl Into<String>, bytes: usize) -> Self {
+        Self {
+            version: LIVE_POOL_ADMIN_PROTOCOL_VERSION,
+            exit_code: 0,
+            body: LivePoolAdminResponseBody::BytesHex {
+                bytes_hex: bytes_hex.into(),
+                bytes,
+            },
+        }
+    }
+
+    pub fn error(exit_code: i32, message: impl Into<String>) -> Self {
+        Self {
+            version: LIVE_POOL_ADMIN_PROTOCOL_VERSION,
+            exit_code,
+            body: LivePoolAdminResponseBody::Error {
+                message: message.into(),
+                machine_json: None,
+            },
+        }
+    }
+
+    pub fn error_machine_json(
+        exit_code: i32,
+        message: impl Into<String>,
+        machine_json: impl Into<String>,
+    ) -> Self {
+        Self {
+            version: LIVE_POOL_ADMIN_PROTOCOL_VERSION,
+            exit_code,
+            body: LivePoolAdminResponseBody::Error {
+                message: message.into(),
+                machine_json: Some(machine_json.into()),
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum LivePoolAdminResponseBody {
+    Empty,
+    Text(String),
+    MachineJson(String),
+    BytesHex {
+        bytes_hex: String,
+        bytes: usize,
+    },
+    Error {
+        message: String,
+        machine_json: Option<String>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LivePoolAdminError {
+    pub exit_code: i32,
+    pub kind: LivePoolAdminErrorKind,
+    pub message: String,
+}
+
+impl LivePoolAdminError {
+    pub fn malformed(message: impl Into<String>) -> Self {
+        Self {
+            exit_code: 2,
+            kind: LivePoolAdminErrorKind::Malformed,
+            message: message.into(),
+        }
+    }
+
+    pub fn unsupported_version(version: u16) -> Self {
+        Self {
+            exit_code: 2,
+            kind: LivePoolAdminErrorKind::UnsupportedVersion { version },
+            message: alloc::format!(
+                "unsupported live-owner request version {version}; expected {LIVE_POOL_ADMIN_PROTOCOL_VERSION}"
+            ),
+        }
+    }
+
+    pub fn unsupported_command(command: &str, operation: &str) -> Self {
+        Self {
+            exit_code: 1,
+            kind: LivePoolAdminErrorKind::UnsupportedCommand {
+                command: command.into(),
+                operation: operation.into(),
+            },
+            message: alloc::format!(
+                "unsupported live-owner command tidefsctl {command} {operation}"
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum LivePoolAdminErrorKind {
+    Malformed,
+    UnsupportedVersion { version: u16 },
+    UnsupportedCommand { command: String, operation: String },
 }
 
 /// O_EXCL: fail if the file already exists (used with O_CREAT).

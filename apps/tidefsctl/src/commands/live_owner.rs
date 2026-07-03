@@ -17,6 +17,10 @@ use std::process;
 use tidefs_device_removal::admission::{
     validate_live_owner_response, DeviceRemovalAdmissionRequest, DEVICE_REMOVAL_AUTHORITY_KIND,
 };
+use tidefs_vfs_engine::{
+    LivePoolAdminArg, LivePoolAdminArgs, LivePoolAdminCommand, LivePoolAdminError,
+    LivePoolAdminOutput, LivePoolAdminRequest, LivePoolAdminResponse, LivePoolAdminResponseBody,
+};
 
 #[derive(Debug, Clone)]
 pub(crate) struct LivePoolRoute<'a> {
@@ -619,9 +623,17 @@ fn send_live_owner_request_at(
     let mut stream = UnixStream::connect(&socket_path).map_err(|err| {
         LiveOwnerRequestError::Unavailable(format!("connect {}: {err}", socket_path.display()))
     })?;
-    let request = live_owner_request_json(route);
+    let request = live_owner_request(route)?;
     stream
-        .write_all(request.to_string().as_bytes())
+        .write_all(
+            serde_json::to_string(&request)
+                .map_err(|err| LiveOwnerRequestError::Owner {
+                    exit_code: 2,
+                    message: format!("encode live-owner request: {err}"),
+                    detail: None,
+                })?
+                .as_bytes(),
+        )
         .map_err(|err| {
             LiveOwnerRequestError::Unavailable(format!("write live-owner request: {err}"))
         })?;
@@ -641,30 +653,32 @@ fn send_live_owner_request_at(
             detail: None,
         });
     }
-    let response: serde_json::Value =
+    let response: LivePoolAdminResponse =
         serde_json::from_str(&line).map_err(|err| LiveOwnerRequestError::Owner {
             exit_code: 2,
             message: format!("decode live-owner response: {err}"),
             detail: None,
         })?;
-    let ok = response
-        .get("ok")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    if ok {
-        validate_required_owner_evidence(route, &response)?;
-        if let Some(bytes_hex) = response
-            .get("bytes_hex")
-            .and_then(serde_json::Value::as_str)
-        {
-            let bytes = decode_live_owner_hex(bytes_hex)?;
+    if response.version != tidefs_vfs_engine::LIVE_POOL_ADMIN_PROTOCOL_VERSION {
+        return Err(LiveOwnerRequestError::Owner {
+            exit_code: 2,
+            message: format!(
+                "unsupported live-owner response version {}; expected {}",
+                response.version,
+                tidefs_vfs_engine::LIVE_POOL_ADMIN_PROTOCOL_VERSION
+            ),
+            detail: None,
+        });
+    }
+    match response.body {
+        LivePoolAdminResponseBody::BytesHex { bytes_hex, bytes } => {
+            let response_json = live_owner_bytes_json(&bytes_hex, bytes);
+            validate_required_owner_evidence(route, &response_json)?;
+            let bytes = decode_live_owner_hex(&bytes_hex)?;
             if route.json {
                 let out = serde_json::json!({
                     "ok": true,
-                    "bytes": response
-                        .get("bytes")
-                        .and_then(serde_json::Value::as_u64)
-                        .unwrap_or(bytes.len() as u64),
+                    "bytes": bytes.len(),
                     "bytes_hex": bytes_hex,
                 });
                 println!(
@@ -687,11 +701,12 @@ fn send_live_owner_request_at(
                         detail: None,
                     })?;
             }
-            return Ok(());
+            Ok(())
         }
-        if route.json {
-            if let Some(value) = response.get("json") {
-                let mut value = value.clone();
+        LivePoolAdminResponseBody::MachineJson(machine_json) => {
+            let mut value = parse_live_owner_machine_json(&machine_json)?;
+            validate_required_owner_evidence(route, &value)?;
+            if route.json {
                 annotate_live_owner_status_json(route, &mut value);
                 println!(
                     "{}",
@@ -703,65 +718,76 @@ fn send_live_owner_request_at(
                         }
                     })?
                 );
-            } else if let Some(text) = response.get("text").and_then(serde_json::Value::as_str) {
+            } else {
+                annotate_live_owner_status_json(route, &mut value);
+                print_live_owner_status_classification(route);
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&live_owner_status_text_json(route, text))
-                        .map_err(|err| LiveOwnerRequestError::Owner {
-                            exit_code: 2,
-                            message: format!("format live-owner JSON: {err}"),
-                            detail: None,
-                        })?
-                );
-            } else if is_status_route(route) {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&live_owner_status_text_json(route, "")).map_err(
-                        |err| LiveOwnerRequestError::Owner {
+                    serde_json::to_string_pretty(&value).map_err(|err| {
+                        LiveOwnerRequestError::Owner {
                             exit_code: 2,
                             message: format!("format live-owner JSON: {err}"),
                             detail: None,
                         }
-                    )?
+                    })?
                 );
             }
-        } else if let Some(text) = response.get("text").and_then(serde_json::Value::as_str) {
-            print_live_owner_status_classification(route);
-            println!("{text}");
-        } else if let Some(value) = response.get("json") {
-            let mut value = value.clone();
-            annotate_live_owner_status_json(route, &mut value);
-            print_live_owner_status_classification(route);
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&value).map_err(|err| {
-                    LiveOwnerRequestError::Owner {
-                        exit_code: 2,
-                        message: format!("format live-owner JSON: {err}"),
-                        detail: None,
-                    }
-                })?
-            );
-        } else {
-            print_live_owner_status_classification(route);
+            Ok(())
         }
-        Ok(())
-    } else {
-        let message = response
-            .get("error")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("live owner returned an error");
-        let exit_code = response
-            .get("exit_code")
-            .and_then(serde_json::Value::as_i64)
-            .and_then(|code| i32::try_from(code).ok())
-            .unwrap_or(1);
-        let detail = response.get("json").cloned();
-        Err(LiveOwnerRequestError::Owner {
-            exit_code,
-            message: message.to_string(),
-            detail,
-        })
+        LivePoolAdminResponseBody::Text(text) => {
+            let response_json = live_owner_status_text_json(route, &text);
+            validate_required_owner_evidence(route, &response_json)?;
+            if route.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&response_json).map_err(|err| {
+                        LiveOwnerRequestError::Owner {
+                            exit_code: 2,
+                            message: format!("format live-owner JSON: {err}"),
+                            detail: None,
+                        }
+                    })?
+                );
+            } else {
+                print_live_owner_status_classification(route);
+                println!("{text}");
+            }
+            Ok(())
+        }
+        LivePoolAdminResponseBody::Empty => {
+            let response_json = live_owner_status_text_json(route, "");
+            validate_required_owner_evidence(route, &response_json)?;
+            if route.json && is_status_route(route) {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&response_json).map_err(|err| {
+                        LiveOwnerRequestError::Owner {
+                            exit_code: 2,
+                            message: format!("format live-owner JSON: {err}"),
+                            detail: None,
+                        }
+                    })?
+                );
+            } else {
+                print_live_owner_status_classification(route);
+            }
+            Ok(())
+        }
+        LivePoolAdminResponseBody::Error {
+            message,
+            machine_json,
+        } => Err(LiveOwnerRequestError::Owner {
+            exit_code: if response.exit_code == 0 {
+                1
+            } else {
+                response.exit_code
+            },
+            message,
+            detail: machine_json
+                .as_deref()
+                .map(parse_live_owner_machine_json)
+                .transpose()?,
+        }),
     }
 }
 
@@ -779,6 +805,22 @@ fn validate_required_owner_evidence(
             message: err.to_string(),
             detail: None,
         })
+}
+
+fn parse_live_owner_machine_json(value: &str) -> Result<serde_json::Value, LiveOwnerRequestError> {
+    serde_json::from_str(value).map_err(|err| LiveOwnerRequestError::Owner {
+        exit_code: 2,
+        message: format!("decode live-owner machine JSON: {err}"),
+        detail: None,
+    })
+}
+
+fn live_owner_bytes_json(bytes_hex: &str, bytes: usize) -> serde_json::Value {
+    serde_json::json!({
+        "ok": true,
+        "bytes": bytes,
+        "bytes_hex": bytes_hex,
+    })
 }
 
 fn device_removal_admission_request(
@@ -923,18 +965,82 @@ fn print_live_owner_status_classification(route: &LivePoolRoute<'_>) {
     }
 }
 
-fn live_owner_request_json(route: &LivePoolRoute<'_>) -> serde_json::Value {
-    let mut request = serde_json::json!({
-        "command": route.command,
-        "operation": route.operation,
-        "pool": route.pool,
-        "json": route.json,
-        "args": &route.args,
-    });
+fn live_owner_request(
+    route: &LivePoolRoute<'_>,
+) -> Result<LivePoolAdminRequest, LiveOwnerRequestError> {
+    let command = LivePoolAdminCommand::from_parts(route.command, route.operation)
+        .map_err(live_admin_error_to_request_error)?;
+    let mut request = LivePoolAdminRequest::new(command, route.pool);
+    request.output = if route.json {
+        LivePoolAdminOutput::MachineJson
+    } else {
+        LivePoolAdminOutput::Human
+    };
     if let Some(pool_uuid) = route.pool_uuid {
-        request["pool_uuid"] = serde_json::Value::String(hex_uuid(&pool_uuid));
+        request.pool_uuid = Some(hex_uuid(&pool_uuid));
     }
-    request
+    request.args = live_admin_args_from_json(route.args.clone())?;
+    Ok(request)
+}
+
+fn live_admin_error_to_request_error(err: LivePoolAdminError) -> LiveOwnerRequestError {
+    LiveOwnerRequestError::Owner {
+        exit_code: err.exit_code,
+        message: err.message,
+        detail: serde_json::to_value(err.kind).ok(),
+    }
+}
+
+fn live_admin_args_from_json(
+    args: serde_json::Value,
+) -> Result<LivePoolAdminArgs, LiveOwnerRequestError> {
+    if args.is_null() {
+        return Ok(LivePoolAdminArgs::default());
+    }
+    let serde_json::Value::Object(values) = args else {
+        return Err(LiveOwnerRequestError::Owner {
+            exit_code: 2,
+            message: "live-owner request args must be an object".to_string(),
+            detail: None,
+        });
+    };
+    Ok(LivePoolAdminArgs(
+        values
+            .into_iter()
+            .map(|(key, value)| live_admin_arg_from_json(value).map(|value| (key, value)))
+            .collect::<Result<_, _>>()?,
+    ))
+}
+
+fn live_admin_arg_from_json(
+    value: serde_json::Value,
+) -> Result<LivePoolAdminArg, LiveOwnerRequestError> {
+    Ok(match value {
+        serde_json::Value::Null => LivePoolAdminArg::Null,
+        serde_json::Value::Bool(value) => LivePoolAdminArg::Bool(value),
+        serde_json::Value::Number(value) => value
+            .as_i64()
+            .map(LivePoolAdminArg::I64)
+            .or_else(|| value.as_u64().map(LivePoolAdminArg::U64))
+            .ok_or_else(|| LiveOwnerRequestError::Owner {
+                exit_code: 2,
+                message: format!("live-owner request number is not an integer: {value}"),
+                detail: None,
+            })?,
+        serde_json::Value::String(value) => LivePoolAdminArg::String(value),
+        serde_json::Value::Array(values) => LivePoolAdminArg::Array(
+            values
+                .into_iter()
+                .map(live_admin_arg_from_json)
+                .collect::<Result<_, _>>()?,
+        ),
+        serde_json::Value::Object(values) => LivePoolAdminArg::Object(
+            values
+                .into_iter()
+                .map(|(key, value)| live_admin_arg_from_json(value).map(|value| (key, value)))
+                .collect::<Result<_, _>>()?,
+        ),
+    })
 }
 
 fn find_live_owner_manifest_at(
@@ -1497,8 +1603,8 @@ mod tests {
 
     fn spawn_owner_response(
         listener: UnixListener,
-        response: serde_json::Value,
-    ) -> thread::JoinHandle<serde_json::Value> {
+        response: LivePoolAdminResponse,
+    ) -> thread::JoinHandle<LivePoolAdminRequest> {
         thread::spawn(move || {
             for _ in 0..2 {
                 let (mut stream, _) = listener.accept().unwrap();
@@ -1509,8 +1615,10 @@ mod tests {
                 if line.trim().is_empty() {
                     continue;
                 }
-                let request: serde_json::Value = serde_json::from_str(&line).unwrap();
-                stream.write_all(response.to_string().as_bytes()).unwrap();
+                let request: LivePoolAdminRequest = serde_json::from_str(&line).unwrap();
+                stream
+                    .write_all(serde_json::to_string(&response).unwrap().as_bytes())
+                    .unwrap();
                 stream.write_all(b"\n").unwrap();
                 return request;
             }
@@ -1562,18 +1670,17 @@ mod tests {
         let socket_path = dir.path().join("owner.sock");
         let listener = UnixListener::bind(&socket_path).unwrap();
         write_owner_manifest(dir.path(), &socket_path);
-        let handle =
-            spawn_owner_response(listener, serde_json::json!({"ok": true, "text": "removed"}));
+        let handle = spawn_owner_response(listener, LivePoolAdminResponse::ok_text("removed"));
         let route = device_remove_route();
 
         let err = send_live_owner_request_at(dir.path(), &route).unwrap_err();
         let request = handle.join().unwrap();
 
         assert_eq!(
-            request
-                .pointer("/args/required_authority")
-                .and_then(serde_json::Value::as_str),
-            Some(DEVICE_REMOVAL_AUTHORITY_KIND)
+            request.args.0.get("required_authority"),
+            Some(&LivePoolAdminArg::String(
+                DEVICE_REMOVAL_AUTHORITY_KIND.to_string()
+            ))
         );
         match err {
             LiveOwnerRequestError::Owner { message, .. } => {
@@ -1599,20 +1706,16 @@ mod tests {
             "text": "removed",
         });
         response[DEVICE_REMOVAL_AUTHORITY_FIELD] = serde_json::to_value(authority).unwrap();
-        let handle = spawn_owner_response(listener, response);
+        let handle = spawn_owner_response(
+            listener,
+            LivePoolAdminResponse::ok_machine_json(serde_json::to_string(&response).unwrap()),
+        );
         let route = device_remove_route();
 
         send_live_owner_request_at(dir.path(), &route).unwrap();
         let request = handle.join().unwrap();
 
-        assert_eq!(
-            request.get("command").and_then(serde_json::Value::as_str),
-            Some("device")
-        );
-        assert_eq!(
-            request.get("operation").and_then(serde_json::Value::as_str),
-            Some("remove")
-        );
+        assert_eq!(request.command, LivePoolAdminCommand::DeviceRemove);
     }
 
     #[test]
@@ -1623,16 +1726,16 @@ mod tests {
         write_owner_manifest(dir.path(), &socket_path);
         let handle = spawn_owner_response(
             listener,
-            serde_json::json!({
-                "ok": false,
-                "exit_code": 1,
-                "error": "destroy refused",
-                "json": {
+            LivePoolAdminResponse::error_machine_json(
+                1,
+                "destroy refused",
+                serde_json::json!({
                     "code": "live-owner-pool-destroy-refused",
                     "force_requested": true,
                     "zero_superblock_requested": true
-                }
-            }),
+                })
+                .to_string(),
+            ),
         );
         let route = LivePoolRoute {
             command: "pool",
@@ -1649,29 +1752,18 @@ mod tests {
         let err = send_live_owner_request_at(dir.path(), &route).unwrap_err();
         let request = handle.join().unwrap();
 
+        assert_eq!(request.command, LivePoolAdminCommand::PoolDestroy);
         assert_eq!(
-            request.get("command").and_then(serde_json::Value::as_str),
-            Some("pool")
-        );
-        assert_eq!(
-            request.get("operation").and_then(serde_json::Value::as_str),
-            Some("destroy")
-        );
-        assert_eq!(
-            request.get("pool_uuid").and_then(serde_json::Value::as_str),
+            request.pool_uuid.as_deref(),
             Some("42424242424242424242424242424242")
         );
         assert_eq!(
-            request
-                .pointer("/args/force")
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
+            request.args.0.get("force"),
+            Some(&LivePoolAdminArg::Bool(true))
         );
         assert_eq!(
-            request
-                .pointer("/args/zero_superblock")
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
+            request.args.0.get("zero_superblock"),
+            Some(&LivePoolAdminArg::Bool(true))
         );
         match err {
             LiveOwnerRequestError::Owner {
@@ -2289,10 +2381,10 @@ mod tests {
             args: serde_json::json!({"device_path": "/dev/sdc"}),
         };
 
-        let request = live_owner_request_json(&route);
+        let request = live_owner_request(&route).unwrap();
 
         assert_eq!(
-            request.get("pool_uuid").and_then(serde_json::Value::as_str),
+            request.pool_uuid.as_deref(),
             Some("abababababababababababababababab")
         );
     }
@@ -2308,8 +2400,8 @@ mod tests {
             args: serde_json::Value::Null,
         };
 
-        let request = live_owner_request_json(&route);
+        let request = live_owner_request(&route).unwrap();
 
-        assert!(request.get("pool_uuid").is_none());
+        assert!(request.pool_uuid.is_none());
     }
 }

@@ -34,6 +34,7 @@ tidefs-cluster = { workspace = true }
 tidefs-membership-epoch = { workspace = true }
 blake3 = "=1.5.5"
 tidefs-transport = { workspace = true }
+tidefs-vfs-engine = { workspace = true }
 tidefs-block-volume-adapter-daemon = { workspace = true }
 tidefs-block-volume-adapter-ublk-control-runtime = { workspace = true }
 clap = { version = "4", features = ["derive"] }

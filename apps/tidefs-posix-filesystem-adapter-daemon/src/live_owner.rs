@@ -20,7 +20,11 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tidefs_types_vfs_core::RequestCtx;
-use tidefs_vfs_engine::VfsEngineStatFs;
+use tidefs_vfs_engine::{
+    LivePoolAdminArg, LivePoolAdminArgs, LivePoolAdminCommand, LivePoolAdminError,
+    LivePoolAdminOutput, LivePoolAdminRequest, LivePoolAdminResponse, LivePoolAdminResponseBody,
+    VfsEngineStatFs, LIVE_POOL_ADMIN_PROTOCOL_VERSION,
+};
 
 pub type LiveOwnerEngine = Arc<Mutex<Box<dyn VfsEngineStatFs + Send>>>;
 
@@ -96,7 +100,7 @@ pub fn start_fuse_owner(
     let _ = fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o660));
 
     let manifest = LiveOwnerManifest {
-        protocol: "tidefs-live-owner-json-v1".to_string(),
+        protocol: "tidefs-live-owner-admin-v1".to_string(),
         owner_kind: "fuse".to_string(),
         pool_name: config.pool_name.clone(),
         pool_uuid: hex_uuid(&config.pool_uuid),
@@ -166,79 +170,6 @@ fn cleanup_endpoint(socket_path: &Path, manifest_path: &Path) {
     let _ = fs::remove_file(manifest_path);
 }
 
-#[derive(Debug, Deserialize)]
-struct LiveOwnerRequest {
-    command: String,
-    operation: String,
-    pool: String,
-    #[serde(default)]
-    pool_uuid: Option<String>,
-    json: bool,
-    #[serde(default)]
-    args: serde_json::Value,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct LiveOwnerResponse {
-    ok: bool,
-    exit_code: i32,
-    text: Option<String>,
-    json: Option<serde_json::Value>,
-    bytes_hex: Option<String>,
-    bytes: Option<usize>,
-    error: Option<String>,
-}
-
-impl LiveOwnerResponse {
-    fn ok_text(text: String) -> Self {
-        Self {
-            ok: true,
-            exit_code: 0,
-            text: Some(text),
-            json: None,
-            bytes_hex: None,
-            bytes: None,
-            error: None,
-        }
-    }
-
-    fn ok_json(value: serde_json::Value) -> Self {
-        Self {
-            ok: true,
-            exit_code: 0,
-            text: None,
-            json: Some(value),
-            bytes_hex: None,
-            bytes: None,
-            error: None,
-        }
-    }
-
-    fn error(exit_code: i32, message: impl Into<String>) -> Self {
-        Self {
-            ok: false,
-            exit_code,
-            text: None,
-            json: None,
-            bytes_hex: None,
-            bytes: None,
-            error: Some(message.into()),
-        }
-    }
-
-    fn error_json(exit_code: i32, message: impl Into<String>, value: serde_json::Value) -> Self {
-        Self {
-            ok: false,
-            exit_code,
-            text: None,
-            json: Some(value),
-            bytes_hex: None,
-            bytes: None,
-            error: Some(message.into()),
-        }
-    }
-}
-
 fn handle_client(
     stream: UnixStream,
     manifest: &LiveOwnerManifest,
@@ -248,12 +179,15 @@ fn handle_client(
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     let response = match reader.read_line(&mut line) {
-        Ok(0) => LiveOwnerResponse::error(2, "empty live-owner request"),
-        Ok(_) => match serde_json::from_str::<LiveOwnerRequest>(&line) {
+        Ok(0) => LivePoolAdminResponse::error(2, "empty live-owner request"),
+        Ok(_) => match serde_json::from_str::<LivePoolAdminRequest>(&line) {
             Ok(request) => dispatch_request(request, manifest, engine, shutdown),
-            Err(err) => LiveOwnerResponse::error(2, format!("decode live-owner request: {err}")),
+            Err(err) => LivePoolAdminResponse::error(
+                2,
+                LivePoolAdminError::malformed(format!("decode live-owner request: {err}")).message,
+            ),
         },
-        Err(err) => LiveOwnerResponse::error(2, format!("read live-owner request: {err}")),
+        Err(err) => LivePoolAdminResponse::error(2, format!("read live-owner request: {err}")),
     };
 
     let mut stream = reader.into_inner();
@@ -265,20 +199,24 @@ fn handle_client(
         Err(err) => {
             let _ = writeln!(
                 stream,
-                "{{\"ok\":false,\"exit_code\":2,\"error\":\"encode response: {err}\"}}"
+                "{{\"version\":{},\"exit_code\":2,\"body\":{\"kind\":\"error\",\"message\":\"encode response: {err}\",\"machine_json\":null}}}",
+                LIVE_POOL_ADMIN_PROTOCOL_VERSION
             );
         }
     }
 }
 
 fn dispatch_request(
-    request: LiveOwnerRequest,
+    request: LivePoolAdminRequest,
     manifest: &LiveOwnerManifest,
     engine: &LiveOwnerEngine,
     shutdown: &Arc<AtomicBool>,
-) -> LiveOwnerResponse {
+) -> LivePoolAdminResponse {
+    if let Err(err) = request.validate_version() {
+        return LivePoolAdminResponse::error(err.exit_code, err.message);
+    }
     if request.pool != manifest.pool_name {
-        return LiveOwnerResponse::error(
+        return LivePoolAdminResponse::error(
             2,
             format!(
                 "live owner for pool '{}' cannot serve pool '{}'",
@@ -287,30 +225,43 @@ fn dispatch_request(
         );
     }
     if let Err(message) = validate_requested_pool_uuid(request.pool_uuid.as_deref(), manifest) {
-        return LiveOwnerResponse::error(2, message);
+        return LivePoolAdminResponse::error(2, message);
     }
 
-    match (request.command.as_str(), request.operation.as_str()) {
-        ("pool", "status") => pool_status(request.json, manifest, engine),
-        ("pool", "import") => already_owned("import", manifest, request.json),
-        ("pool", "mount") => pool_mount_refused(&request, manifest),
-        ("pool", "export") => pool_export(request.json, manifest, shutdown),
-        ("pool", "destroy") => pool_destroy_refused(&request, manifest),
-        ("pool", "get" | "set" | "list-props" | "integrity-check")
-        | (
-            "dataset",
-            "create" | "list" | "rename" | "destroy" | "set-strategy" | "upgrade" | "get" | "set"
-            | "list-props" | "seal-key" | "rotate-key",
-        )
-        | ("snapshot", "create" | "list" | "destroy" | "rollback" | "extract" | "send")
-        | ("device", "remove") => delegate_admin_request(&request, engine),
-        _ => LiveOwnerResponse::error(
-            1,
-            format!(
-                "live owner '{}' does not yet implement tidefsctl {} {}",
-                manifest.owner_kind, request.command, request.operation
-            ),
-        ),
+    match request.command {
+        LivePoolAdminCommand::PoolStatus => {
+            pool_status(request.output.wants_json(), manifest, engine)
+        }
+        LivePoolAdminCommand::PoolImport => {
+            already_owned("import", manifest, request.output.wants_json())
+        }
+        LivePoolAdminCommand::PoolMount => pool_mount_refused(&request, manifest),
+        LivePoolAdminCommand::PoolExport => {
+            pool_export(request.output.wants_json(), manifest, shutdown)
+        }
+        LivePoolAdminCommand::PoolDestroy => pool_destroy_refused(&request, manifest),
+        LivePoolAdminCommand::PoolGet
+        | LivePoolAdminCommand::PoolSet
+        | LivePoolAdminCommand::PoolListProps
+        | LivePoolAdminCommand::PoolIntegrityCheck
+        | LivePoolAdminCommand::DatasetCreate
+        | LivePoolAdminCommand::DatasetList
+        | LivePoolAdminCommand::DatasetRename
+        | LivePoolAdminCommand::DatasetDestroy
+        | LivePoolAdminCommand::DatasetSetStrategy
+        | LivePoolAdminCommand::DatasetUpgrade
+        | LivePoolAdminCommand::DatasetGet
+        | LivePoolAdminCommand::DatasetSet
+        | LivePoolAdminCommand::DatasetListProps
+        | LivePoolAdminCommand::DatasetSealKey
+        | LivePoolAdminCommand::DatasetRotateKey
+        | LivePoolAdminCommand::SnapshotCreate
+        | LivePoolAdminCommand::SnapshotList
+        | LivePoolAdminCommand::SnapshotDestroy
+        | LivePoolAdminCommand::SnapshotRollback
+        | LivePoolAdminCommand::SnapshotExtract
+        | LivePoolAdminCommand::SnapshotSend
+        | LivePoolAdminCommand::DeviceRemove => delegate_admin_request(&request, engine),
     }
 }
 
@@ -331,49 +282,26 @@ fn validate_requested_pool_uuid(
 }
 
 fn delegate_admin_request(
-    request: &LiveOwnerRequest,
+    request: &LivePoolAdminRequest,
     engine: &LiveOwnerEngine,
-) -> LiveOwnerResponse {
-    let bytes = match delegate_admin_payload(request) {
-        Ok(bytes) => bytes,
-        Err(err) => return LiveOwnerResponse::error(2, err),
-    };
-    let response_bytes = match engine.lock() {
-        Ok(engine) => match engine.live_pool_admin_request(&bytes) {
-            Ok(bytes) => bytes,
-            Err(errno) => {
-                return LiveOwnerResponse::error(
-                    1,
-                    format!("live engine does not support this admin request: {errno:?}"),
-                )
-            }
+) -> LivePoolAdminResponse {
+    match engine.lock() {
+        Ok(engine) => match engine.live_pool_admin_request(request) {
+            Ok(response) => response,
+            Err(errno) => LivePoolAdminResponse::error(
+                1,
+                format!("live engine does not support this admin request: {errno:?}"),
+            ),
         },
-        Err(_) => return LiveOwnerResponse::error(1, "live owner engine lock poisoned"),
-    };
-    serde_json::from_slice::<LiveOwnerResponse>(&response_bytes).unwrap_or_else(|err| {
-        LiveOwnerResponse::error(2, format!("decode live admin response: {err}"))
-    })
-}
-
-fn delegate_admin_payload(request: &LiveOwnerRequest) -> Result<Vec<u8>, String> {
-    let mut payload = json!({
-        "command": request.command.as_str(),
-        "operation": request.operation.as_str(),
-        "pool": request.pool.as_str(),
-        "json": request.json,
-        "args": &request.args,
-    });
-    if let Some(pool_uuid) = request.pool_uuid.as_deref() {
-        payload["pool_uuid"] = serde_json::Value::String(pool_uuid.to_string());
+        Err(_) => LivePoolAdminResponse::error(1, "live owner engine lock poisoned"),
     }
-    serde_json::to_vec(&payload).map_err(|err| format!("encode live admin request: {err}"))
 }
 
 fn pool_status(
     wants_json: bool,
     manifest: &LiveOwnerManifest,
     engine: &LiveOwnerEngine,
-) -> LiveOwnerResponse {
+) -> LivePoolAdminResponse {
     let ctx = RequestCtx {
         uid: 0,
         gid: 0,
@@ -385,13 +313,13 @@ fn pool_status(
         Ok(engine) => match engine.statfs(&ctx) {
             Ok(statfs) => statfs,
             Err(errno) => {
-                return LiveOwnerResponse::error(
+                return LivePoolAdminResponse::error(
                     1,
                     format!("live owner statfs failed with {errno:?}"),
                 )
             }
         },
-        Err(_) => return LiveOwnerResponse::error(1, "live owner engine lock poisoned"),
+        Err(_) => return LivePoolAdminResponse::error(1, "live owner engine lock poisoned"),
     };
 
     let value = json!({
@@ -418,9 +346,9 @@ fn pool_status(
     });
 
     if wants_json {
-        LiveOwnerResponse::ok_json(value)
+        LivePoolAdminResponse::ok_machine_json(value.to_string())
     } else {
-        LiveOwnerResponse::ok_text(format!(
+        LivePoolAdminResponse::ok_text(format!(
             "pool: {}\n  pool uuid:   {}\n  state:       Active\n  owner:       {} (pid {})\n  backing dir: {}\n  mountpoint:  {}\n  blocks:      total={} free={} avail={}\n  files:       total={} free={}",
             manifest.pool_name,
             manifest.pool_uuid,
@@ -441,7 +369,7 @@ fn already_owned(
     operation: &str,
     manifest: &LiveOwnerManifest,
     wants_json: bool,
-) -> LiveOwnerResponse {
+) -> LivePoolAdminResponse {
     let value = json!({
         "pool_name": manifest.pool_name,
         "pool_uuid": manifest.pool_uuid,
@@ -454,9 +382,9 @@ fn already_owned(
         "already_owned": true,
     });
     if wants_json {
-        LiveOwnerResponse::ok_json(value)
+        LivePoolAdminResponse::ok_machine_json(value.to_string())
     } else {
-        LiveOwnerResponse::ok_text(format!(
+        LivePoolAdminResponse::ok_text(format!(
             "pool already imported: {}\n  owner:      {} (pid {})\n  mountpoint: {}",
             manifest.pool_name, manifest.owner_kind, manifest.pid, manifest.mountpoint
         ))
@@ -464,29 +392,13 @@ fn already_owned(
 }
 
 fn pool_mount_refused(
-    request: &LiveOwnerRequest,
+    request: &LivePoolAdminRequest,
     manifest: &LiveOwnerManifest,
-) -> LiveOwnerResponse {
-    let mountpoint = request
-        .args
-        .get("mountpoint")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("<unspecified>");
-    let dataset = request
-        .args
-        .get("dataset")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("root");
-    let read_only = request
-        .args
-        .get("read_only")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    let relatime = request
-        .args
-        .get("relatime")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
+) -> LivePoolAdminResponse {
+    let mountpoint = request_arg_str(&request.args, "mountpoint").unwrap_or("<unspecified>");
+    let dataset = request_arg_str(&request.args, "dataset").unwrap_or("root");
+    let read_only = request_arg_bool(&request.args, "read_only").unwrap_or(false);
+    let relatime = request_arg_bool(&request.args, "relatime").unwrap_or(false);
     let message = format!(
         "pool mount for already-imported pool '{}' must be performed by the live owner; the current {} owner has no secondary mount implementation for mountpoint '{}' dataset '{}' (read_only={}, relatime={})",
         manifest.pool_name,
@@ -496,14 +408,14 @@ fn pool_mount_refused(
         read_only,
         relatime,
     );
-    LiveOwnerResponse::error(1, message)
+    LivePoolAdminResponse::error(1, message)
 }
 
 fn pool_export(
     wants_json: bool,
     manifest: &LiveOwnerManifest,
     shutdown: &Arc<AtomicBool>,
-) -> LiveOwnerResponse {
+) -> LivePoolAdminResponse {
     shutdown.store(true, Ordering::Release);
     let value = json!({
         "pool_name": manifest.pool_name,
@@ -517,9 +429,9 @@ fn pool_export(
         "shutdown_requested": true,
     });
     if wants_json {
-        LiveOwnerResponse::ok_json(value)
+        LivePoolAdminResponse::ok_machine_json(value.to_string())
     } else {
-        LiveOwnerResponse::ok_text(format!(
+        LivePoolAdminResponse::ok_text(format!(
             "pool export requested: {}\n  owner:      {} (pid {})\n  mountpoint: {}\n  action:     live owner shutdown requested",
             manifest.pool_name, manifest.owner_kind, manifest.pid, manifest.mountpoint
         ))
@@ -527,31 +439,27 @@ fn pool_export(
 }
 
 fn pool_destroy_refused(
-    request: &LiveOwnerRequest,
+    request: &LivePoolAdminRequest,
     manifest: &LiveOwnerManifest,
-) -> LiveOwnerResponse {
+) -> LivePoolAdminResponse {
     let message = pool_destroy_refusal_message(request, manifest);
-    if request.json {
-        LiveOwnerResponse::error_json(1, message, pool_destroy_refusal_json(request, manifest))
+    if request.output.wants_json() {
+        LivePoolAdminResponse::error_machine_json(
+            1,
+            message,
+            pool_destroy_refusal_json(request, manifest).to_string(),
+        )
     } else {
-        LiveOwnerResponse::error(1, pool_destroy_refusal_text(request, manifest))
+        LivePoolAdminResponse::error(1, pool_destroy_refusal_text(request, manifest))
     }
 }
 
 fn pool_destroy_refusal_json(
-    request: &LiveOwnerRequest,
+    request: &LivePoolAdminRequest,
     manifest: &LiveOwnerManifest,
 ) -> serde_json::Value {
-    let force = request
-        .args
-        .get("force")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    let zero_superblock = request
-        .args
-        .get("zero_superblock")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
+    let force = request_arg_bool(&request.args, "force").unwrap_or(false);
+    let zero_superblock = request_arg_bool(&request.args, "zero_superblock").unwrap_or(false);
     let safe_path = format!(
         "tidefsctl pool export {}; tidefsctl pool destroy {} --devices <exported-device>...{}",
         manifest.pool_name,
@@ -590,26 +498,21 @@ fn pool_destroy_refusal_json(
 }
 
 fn pool_destroy_refusal_message(
-    request: &LiveOwnerRequest,
+    request: &LivePoolAdminRequest,
     manifest: &LiveOwnerManifest,
 ) -> String {
-    let force = request
-        .args
-        .get("force")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    let zero_superblock = request
-        .args
-        .get("zero_superblock")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
+    let force = request_arg_bool(&request.args, "force").unwrap_or(false);
+    let zero_superblock = request_arg_bool(&request.args, "zero_superblock").unwrap_or(false);
     format!(
         "live-owner pool destroy refused for imported pool '{}' (owner={} pid={} mountpoint={}): mounted/imported destruction is fail-closed; force_requested={force} cannot override this boundary; zero_superblock_requested={zero_superblock} is not applied while the owner is live; export or unmount the pool, wait for owner shutdown, then destroy exported storage with explicit --devices",
         manifest.pool_name, manifest.owner_kind, manifest.pid, manifest.mountpoint
     )
 }
 
-fn pool_destroy_refusal_text(request: &LiveOwnerRequest, manifest: &LiveOwnerManifest) -> String {
+fn pool_destroy_refusal_text(
+    request: &LivePoolAdminRequest,
+    manifest: &LiveOwnerManifest,
+) -> String {
     let value = pool_destroy_refusal_json(request, manifest);
     format!(
         "{}\n  allowed_state: exported/offline pool with explicit --devices\n  shutdown_sequence: {}\n  label_superblock_action: {}\n  crash_retry: {}\n  safe_path: {}\n  claim_evidence: none; {}",
@@ -637,6 +540,20 @@ fn pool_destroy_refusal_text(request: &LiveOwnerRequest, manifest: &LiveOwnerMan
     )
 }
 
+fn request_arg_bool(args: &LivePoolAdminArgs, name: &str) -> Option<bool> {
+    match args.0.get(name) {
+        Some(LivePoolAdminArg::Bool(value)) => Some(*value),
+        _ => None,
+    }
+}
+
+fn request_arg_str<'a>(args: &'a LivePoolAdminArgs, name: &str) -> Option<&'a str> {
+    match args.0.get(name) {
+        Some(LivePoolAdminArg::String(value)) => Some(value.as_str()),
+        _ => None,
+    }
+}
+
 fn hex_uuid(uuid: &[u8; 16]) -> String {
     uuid.iter()
         .map(|byte| format!("{byte:02x}"))
@@ -650,7 +567,7 @@ mod tests {
 
     fn manifest() -> LiveOwnerManifest {
         LiveOwnerManifest {
-            protocol: "tidefs-live-owner-json-v1".to_string(),
+            protocol: "tidefs-live-owner-admin-v1".to_string(),
             owner_kind: "fuse".to_string(),
             pool_name: "tank".to_string(),
             pool_uuid: "0123456789abcdeffedcba9876543210".to_string(),
@@ -690,18 +607,18 @@ mod tests {
     }
 
     #[test]
-    fn delegated_admin_payload_preserves_pool_uuid() {
-        let request = LiveOwnerRequest {
-            command: "dataset".to_string(),
-            operation: "list".to_string(),
+    fn typed_request_payload_preserves_pool_uuid() {
+        let request = LivePoolAdminRequest {
+            version: LIVE_POOL_ADMIN_PROTOCOL_VERSION,
+            command: LivePoolAdminCommand::DatasetList,
             pool: "tank".to_string(),
             pool_uuid: Some("0123456789abcdeffedcba9876543210".to_string()),
-            json: true,
-            args: serde_json::Value::Null,
+            output: LivePoolAdminOutput::MachineJson,
+            args: LivePoolAdminArgs::default(),
         };
 
         let payload: serde_json::Value =
-            serde_json::from_slice(&delegate_admin_payload(&request).unwrap()).unwrap();
+            serde_json::from_slice(&serde_json::to_vec(&request).unwrap()).unwrap();
 
         assert_eq!(
             payload.get("pool_uuid").and_then(serde_json::Value::as_str),
@@ -712,42 +629,61 @@ mod tests {
     #[test]
     fn pool_mount_request_fails_until_owner_can_mount() {
         let manifest = manifest();
-        let request = LiveOwnerRequest {
-            command: "pool".to_string(),
-            operation: "mount".to_string(),
+        let request = LivePoolAdminRequest {
+            version: LIVE_POOL_ADMIN_PROTOCOL_VERSION,
+            command: LivePoolAdminCommand::PoolMount,
             pool: "tank".to_string(),
             pool_uuid: None,
-            json: false,
-            args: json!({
-                "mountpoint": "/mnt/other",
-                "dataset": "root",
-                "read_only": true,
-                "relatime": false,
-            }),
+            output: LivePoolAdminOutput::Human,
+            args: LivePoolAdminArgs(
+                [
+                    (
+                        "mountpoint".to_string(),
+                        LivePoolAdminArg::String("/mnt/other".to_string()),
+                    ),
+                    (
+                        "dataset".to_string(),
+                        LivePoolAdminArg::String("root".to_string()),
+                    ),
+                    ("read_only".to_string(), LivePoolAdminArg::Bool(true)),
+                    ("relatime".to_string(), LivePoolAdminArg::Bool(false)),
+                ]
+                .into_iter()
+                .collect(),
+            ),
         };
 
         let response = pool_mount_refused(&request, &manifest);
 
-        assert!(!response.ok);
         assert_eq!(response.exit_code, 1);
-        let error = response.error.expect("mount refusal should explain why");
+        let LivePoolAdminResponseBody::Error { message: error, .. } = response.body else {
+            panic!("mount refusal should explain why");
+        };
         assert!(error.contains("already-imported pool 'tank'"));
         assert!(error.contains("live owner"));
         assert!(error.contains("/mnt/other"));
         assert!(error.contains("no secondary mount implementation"));
     }
 
-    fn destroy_request(wants_json: bool) -> LiveOwnerRequest {
-        LiveOwnerRequest {
-            command: "pool".to_string(),
-            operation: "destroy".to_string(),
+    fn destroy_request(wants_json: bool) -> LivePoolAdminRequest {
+        LivePoolAdminRequest {
+            version: LIVE_POOL_ADMIN_PROTOCOL_VERSION,
+            command: LivePoolAdminCommand::PoolDestroy,
             pool: "tank".to_string(),
             pool_uuid: Some("0123456789abcdeffedcba9876543210".to_string()),
-            json: wants_json,
-            args: json!({
-                "force": true,
-                "zero_superblock": true,
-            }),
+            output: if wants_json {
+                LivePoolAdminOutput::MachineJson
+            } else {
+                LivePoolAdminOutput::Human
+            },
+            args: LivePoolAdminArgs(
+                [
+                    ("force".to_string(), LivePoolAdminArg::Bool(true)),
+                    ("zero_superblock".to_string(), LivePoolAdminArg::Bool(true)),
+                ]
+                .into_iter()
+                .collect(),
+            ),
         }
     }
 
@@ -758,9 +694,15 @@ mod tests {
 
         let response = pool_destroy_refused(&request, &manifest);
 
-        assert!(!response.ok);
         assert_eq!(response.exit_code, 1);
-        let value = response.json.expect("destroy refusal should carry JSON");
+        let LivePoolAdminResponseBody::Error {
+            message: _,
+            machine_json: Some(machine_json),
+        } = response.body
+        else {
+            panic!("destroy refusal should carry machine JSON");
+        };
+        let value: serde_json::Value = serde_json::from_str(&machine_json).unwrap();
         assert_eq!(
             value.get("code").and_then(serde_json::Value::as_str),
             Some("live-owner-pool-destroy-refused")
@@ -817,10 +759,15 @@ mod tests {
 
         let response = pool_destroy_refused(&request, &manifest);
 
-        assert!(!response.ok);
         assert_eq!(response.exit_code, 1);
-        assert!(response.json.is_none());
-        let error = response.error.expect("destroy refusal should explain why");
+        let LivePoolAdminResponseBody::Error {
+            message: error,
+            machine_json,
+        } = response.body
+        else {
+            panic!("destroy refusal should explain why");
+        };
+        assert!(machine_json.is_none());
         assert!(error.contains("allowed_state: exported/offline pool"));
         assert!(error.contains("shutdown_sequence"));
         assert!(error.contains("label_superblock_action: none"));
