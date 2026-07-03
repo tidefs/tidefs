@@ -65,7 +65,7 @@ Terms used below:
 
 | Workflow file | Evidence surface |
 |---|---|
-| `tidefs-codex-nexus-relay.yml` | Signs and POSTs the original GitHub event payload to the local `tidefs-codex-nexus` webhook endpoint. Never runs tests or checks out source. Pull-request relay runs use isolated concurrency to avoid intentional cancelled telemetry checks being reported as failing PR checks; issue, push, and manual-dispatch wakeups still coalesce globally. These workflow runs, checks, and statuses must not be treated as CI gates. |
+| `tidefs-codex-nexus-relay.yml` | Signs and POSTs the original GitHub event payload to the local `tidefs-codex-nexus` webhook endpoint. Never runs tests or checks out source. Pull-request relay runs allocate runners only for source-head and lifecycle wakeups; pending PR wakeups coalesce per PR while running deliveries finish, and issue, push, and manual-dispatch wakeups still coalesce globally. These workflow runs, checks, and statuses must not be treated as CI gates. |
 
 ---
 
@@ -124,11 +124,11 @@ when their profile is active.
   the only artifact of a failure is the run log.
 - The `Codex Nexus Relay` workflow is controller telemetry, not validation
   evidence. It must not be counted as pending, failing, or passing CI when
-  evaluating PR readiness or merge gates. Pull-request relay runs avoid
-  intentional concurrency cancellation because GitHub exposes cancelled
-  PR-attached workflow runs as failed PR checks. The Current queue summary in
-  `tidefs-codex-nexus` already separates relay and non-relay check/run
-  evidence.
+  evaluating PR readiness or merge gates. Pull-request relay runs skip
+  metadata-only edits before allocating a runner and coalesce stale pending
+  wakeups by PR because Nexus reconciles from live GitHub state. The Current
+  queue summary in `tidefs-codex-nexus` already separates relay and non-relay
+  check/run evidence.
 
 ---
 

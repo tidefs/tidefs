@@ -5,7 +5,7 @@ on:
     types: [opened, edited, reopened, closed, assigned, unassigned, labeled, unlabeled]
   pull_request:
     branches: [master]
-    types: [opened, edited, synchronize, reopened, ready_for_review, converted_to_draft, closed, labeled, unlabeled]
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft, closed]
   push:
     branches: [master]
   workflow_dispatch:
@@ -15,19 +15,19 @@ permissions:
 
 concurrency:
   # Nexus reconciles from live GitHub state, so any delivered relay wakeup is
-  # enough to refresh the controller. Pull-request relay runs are attached to
-  # PR check state, so do not intentionally cancel them; GitHub surfaces those
-  # cancelled telemetry checks as failing PR checks. Other wakeups still share a
-  # global group so issue/push/manual bursts do not compete with validation for
-  # self-hosted runners.
-  group: ${{ github.event_name == 'pull_request' && format('{0}-pull-request-{1}', github.workflow, github.run_id) || github.workflow }}
+  # enough to refresh the controller. Pull-request relay checks are telemetry,
+  # not merge gates: keep any running delivery, but coalesce stale pending
+  # wakeups per PR so event bursts do not queue one self-hosted runner job per
+  # GitHub delivery. Other wakeups still share a global group.
+  group: ${{ github.event_name == 'pull_request' && format('{0}-pull-request-{1}', github.workflow, github.event.pull_request.number) || github.workflow }}
   cancel-in-progress: ${{ github.event_name != 'pull_request' }}
 
 jobs:
   relay:
     name: Relay event
-    # Draft PRs are not integration candidates. Keep source-head and lifecycle
-    # wakeups, but skip metadata-only draft churn before allocating a runner.
+    # PR metadata-only edits are not trigger types. Keep source-head and
+    # lifecycle wakeups guarded here too, so future trigger expansions do not
+    # accidentally allocate runners for metadata churn.
     if: >-
       ${{
         github.event_name == 'workflow_dispatch' ||
@@ -35,7 +35,6 @@ jobs:
           vars.TIDEFS_SELF_HOSTED_READY == '1' &&
           (
             github.event_name != 'pull_request' ||
-            github.event.pull_request.draft != true ||
             contains(fromJSON('["opened","synchronize","reopened","ready_for_review","converted_to_draft","closed"]'), github.event.action)
           )
         )
