@@ -9119,8 +9119,12 @@ impl FuseVfsAdapter {
     ) -> Result<(Vec<DirEntry>, bool), Errno> {
         let e = self.engine.lock().unwrap();
         let handle = self.resolve_dir_handle(ino, fh, ctx, &**e)?;
-        let has_snapshots = e.has_snapshot_catalog_entries();
-        let synthetic_cookie_count = if has_snapshots { 3 } else { 2 };
+        let snapshot_catalog_generation = e.snapshot_catalog_generation();
+        let synthetic_cookie_count = if snapshot_catalog_generation.is_some() {
+            3
+        } else {
+            2
+        };
 
         let mut entries: Vec<DirEntry> = Vec::new();
 
@@ -9150,12 +9154,12 @@ impl FuseVfsAdapter {
             ));
         }
 
-        if has_snapshots && offset <= 2 {
+        if let Some(generation) = snapshot_catalog_generation.filter(|_| offset <= 2) {
             entries.push(DirEntry::new(
                 b".snapshot".to_vec(),
                 SNAPSHOT_NAMESPACE_ROOT_INODE_ID,
                 NodeKind::Dir,
-                Generation::new(0),
+                generation,
                 3,
             ));
         }

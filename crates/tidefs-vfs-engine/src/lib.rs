@@ -1845,13 +1845,14 @@ pub trait VfsEngineStatFs: VfsEngine {
         Err(Errno::EOPNOTSUPP)
     }
 
-    /// Return whether this dataset has at least one snapshot catalog entry.
+    /// Return the current snapshot catalog generation when this dataset has at
+    /// least one snapshot catalog entry.
     ///
     /// This is an adapter-facing namespace capability. Engines without a
     /// snapshot catalog keep the default so synthetic snapshot browsing
     /// entries are not exposed.
-    fn has_snapshot_catalog_entries(&self) -> bool {
-        false
+    fn snapshot_catalog_generation(&self) -> Option<Generation> {
+        None
     }
 }
 

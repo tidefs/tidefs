@@ -6215,8 +6215,13 @@ impl VfsEngineStatFs for VfsLocalFileSystem {
         self.handle_live_pool_admin_request(request_json)
     }
 
-    fn has_snapshot_catalog_entries(&self) -> bool {
-        !self.fs.borrow().list_snapshots().is_empty()
+    fn snapshot_catalog_generation(&self) -> Option<Generation> {
+        let fs = self.fs.borrow();
+        if fs.list_snapshots().is_empty() {
+            None
+        } else {
+            Some(Generation::new(fs.generation()))
+        }
     }
 }
 
