@@ -5,7 +5,7 @@
 # ublk UPDATE_SIZE resize path by doubling the backing device capacity and
 # verifying the guest kernel observes the uevent and exposes the new capacity.
 #
-# Produces Tier 3 QEMU guest ublk/block-volume runtime validation.
+# Produces qemu-guest ublk/block-volume resize runtime evidence.
 #
 # Dependencies:
 #   - Linux 7.0 kernel with ublk driver and UPDATE_SIZE feature support

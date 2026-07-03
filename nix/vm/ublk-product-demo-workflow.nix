@@ -1,11 +1,11 @@
-# TideFS: ublk integrated product-demo block workflow (#6443).
+# TideFS: ublk integrated block runtime evidence workflow (#6443).
 #
 # Boots a Linux 7.0 QEMU guest with two raw virtio-blk disks and exercises:
 # pool create -> ublk block-device export -> mkfs.ext4 -> mount ->
 # file I/O -> unmount -> ublk stop -> ublk re-export -> remount ext4 ->
 # data persistence verification.
 #
-# Validation tier: Tier 3 QEMU guest ublk/block-volume runtime.
+# Evidence class: qemu-guest ublk/block-volume runtime evidence.
 {
   pkgs,
   linuxKernel_7_0,
@@ -26,16 +26,16 @@ let
     UBLK_DAEMON="${tidefsPackage}/bin/tidefs-block-volume-adapter-daemon"
     MKFS="${pkgs.e2fsprogs}/bin/mkfs.ext4"
 
-    TMPDIR="''${TIDEFS_UBLK_DEMO_TMPDIR:-/tmp/tidefs-ublk-product-demo}"
+    TMPDIR="''${TIDEFS_UBLK_DEMO_TMPDIR:-/tmp/tidefs-ublk-runtime-evidence}"
     TIMEOUT_SEC="''${TIDEFS_UBLK_DEMO_TIMEOUT:-600}"
     DISK_SIZE_MB="''${TIDEFS_UBLK_DEMO_DISK_MB:-1024}"
-    VALIDATION_TIER="Tier 3 QEMU guest ublk/block-volume runtime"
+    VALIDATION_TIER="qemu-guest ublk/block-volume runtime evidence"
 
     usage() {
       cat <<USAGE
 Usage: tidefs-ublk-product-demo [--timeout SECONDS] [--disk-size-mb MB] [--keep-tmp]
 
-Full ublk product-demo block workflow in a Linux 7.0 QEMU guest:
+Full ublk block runtime evidence workflow in a Linux 7.0 QEMU guest:
   pool create -> ublk export -> mkfs.ext4 -> mount -> file I/O ->
   unmount -> ublk stop -> ublk re-export -> remount -> verify.
 
@@ -73,7 +73,7 @@ USAGE
       QEMU_ACCEL_LABEL="tcg"
     fi
 
-    echo "=== TideFS VAL: ublk-product-demo QEMU ==="
+    echo "=== TideFS VAL: ublk block runtime evidence QEMU ==="
     echo "  Kernel:    $KERNEL_IMG"
     echo "  tidefsctl: $TIDEFSCTL"
     echo "  ublk daemon: $UBLK_DAEMON"
@@ -373,7 +373,7 @@ else
 fi
 
 TF="$EXT4_MNT/demo_test.txt"
-TC="TideFS-ublk-product-demo-$(date +%s 2>/dev/null || echo 0)"
+TC="TideFS-ublk-runtime-evidence-$(date +%s 2>/dev/null || echo 0)"
 
 if [ "$MOUNTED" -eq 1 ]; then
     echo "$TC" > "$TF" 2>/tmp/werr
@@ -537,10 +537,10 @@ sync && pass "sync_done"
 
 echo ""
 echo "=== Validation Summary ==="
-echo "validation_tier=Tier 3 QEMU guest ublk/block-volume runtime"
+echo "validation_tier=qemu-guest ublk/block-volume runtime evidence"
 echo "kernel=$(uname -r 2>/dev/null || echo unknown)"
 echo "backend=virtio_blk_raw_disks_pool_ublk_ext4"
-echo "mode=ublk_product_demo_block_workflow"
+echo "mode=ublk_runtime_evidence_block_workflow"
 echo "pool_name=$POOL_NAME"
 echo "dev0=$DEV0 dev0_size=$D0SIZE"
 echo "dev1=$DEV1 dev1_size=$D1SIZE"
@@ -611,8 +611,8 @@ INITSCRIPT
     TS=$(date -u +%Y%m%d-%H%M%S)
     RUNS_DIR="''${TIDEFS_VALIDATION_RUNS_DIR:-/root/ai/tmp/tidefs-validation}"
     mkdir -p "$RUNS_DIR" 2>/dev/null || true
-    cp "$VAL_LOG" "$RUNS_DIR/ublk-product-demo-$TS.log" 2>/dev/null || true
-    echo "  Validation output: $RUNS_DIR/ublk-product-demo-$TS.log"
+    cp "$VAL_LOG" "$RUNS_DIR/ublk-runtime-evidence-$TS.log" 2>/dev/null || true
+    echo "  Validation output: $RUNS_DIR/ublk-runtime-evidence-$TS.log"
 
     [ "$FAILC" -gt 0 ] && { echo "VALIDATION: FAIL ($FAILC failures)"; exit 1; }
     [ "$BLOCKC" -gt 0 ] && { echo "VALIDATION: BLOCKED ($BLOCKC blocked)"; exit 2; }

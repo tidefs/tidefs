@@ -1,8 +1,8 @@
 # TideFS: FUSE+ublk+storage integrated userspace workflow validation.
 #
 # Mounts a TideFS FUSE filesystem and attaches a ublk block-volume to the
-# same storage pool in a Linux 7.0 QEMU guest and produces validation output
-# at the qemu-guest tier.
+# same storage pool in a Linux 7.0 QEMU guest and produces qemu-guest
+# runtime evidence output.
 #
 # Integrated workflow operations (sequential daemon access):
 #   1. ublkWritePlusRead — ublk writes block data, reads back, stops
@@ -16,11 +16,11 @@
 #   mounted-userspace - live FUSE mount plus live ublk device
 #   qemu-guest        - Nix/QEMU Linux 7.0 guest
 #
-# This harness is the production QEMU runtime for the mounted-userspace and
-# qemu-guest tiers. It boots a Linux 7.0 QEMU guest, runs daemons sequentially
-# (only one writer at a time because LocalObjectStore segment-file append lacks
-# cross-process offset coordination), and verifies shared-pool persistence
-# through remount and crash-recovery cycles.
+# This harness produces mounted-userspace/qemu-guest runtime evidence. It
+# boots a Linux 7.0 QEMU guest, runs daemons sequentially (only one writer at a
+# time because LocalObjectStore segment-file append lacks cross-process offset
+# coordination), and verifies shared-pool persistence through remount and
+# crash-recovery cycles.
 #
 # Dependencies:
 #   - Linux 7.0 kernel with FUSE and ublk built-in (CONFIG_FUSE_FS=y,
@@ -58,8 +58,8 @@ let
       cat <<EOF
 Usage: tidefs-fuse-ublk-integrated-workflow [--timeout SECONDS] [--keep-tmp]
 
-Produce tier-classified FUSE+ublk+storage integrated workflow validation
-validation in a reproducible Nix/QEMU Linux 7.0 environment. Daemons access
+Produce FUSE+ublk+storage integrated workflow runtime evidence in a
+reproducible Nix/QEMU Linux 7.0 environment. Daemons access
 the pool sequentially (one writer at a time) to avoid segment-file append
 corruption from uncoordinated cross-process offset tracking.
 

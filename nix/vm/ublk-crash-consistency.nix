@@ -12,7 +12,7 @@
 #   4. Read-back: fio seq-read + rand-read with crc32c verification
 #   5. Integrity: committed-root validation via .tidefs_mount_state tracking
 #
-# Validation tier: Tier 3 QEMU guest ublk/block-volume runtime.
+# Evidence class: qemu-guest ublk/block-volume crash-recovery runtime evidence.
 #
 # Dependencies:
 #   - Linux 7.0 kernel with ublk driver support
