@@ -18,9 +18,13 @@
 //! or worse suspicion state to be skipped during quorum writes, preventing
 //! data placement on known-unhealthy nodes.
 
+use serde::{Deserialize, Serialize};
 use std::cell::{Cell, RefCell};
-use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::collections::HashSet;
+use std::fs::{File, OpenOptions};
+use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tidefs_flow_commit_coordinator::FlowCommitCoordinator;
 use tidefs_local_object_store::{LocalObjectStore, ObjectKey, StoreOptions};
 use tidefs_membership_epoch::{
@@ -1456,6 +1460,86 @@ pub struct TransportReplicatedPutResult {
     pub recorded_receipt_ref: Option<PlacementReceiptRef>,
 }
 
+/// Mutation operation recorded when a transport-backed replicated mutation
+/// fails to reach quorum.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum UnresolvedMutationKind {
+    Put {
+        /// Digest of the requested replacement payload.
+        payload_digest: [u8; 32],
+        /// Length of the requested replacement payload.
+        payload_len: u64,
+    },
+    Delete,
+}
+
+/// Previous local primary state captured before a failed-quorum mutation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PreviousLocalPayloadRef {
+    /// Digest of the previous primary payload.
+    pub payload_digest: [u8; 32],
+    /// Previous primary payload length.
+    pub payload_len: u64,
+}
+
+/// Per-replica result for the original failed-quorum mutation attempt.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ReplicaMutationAttempt {
+    Acknowledged { node_id: u64 },
+    Rejected { node_id: u64, reason: String },
+    SentWithoutAck { node_id: u64, error: String },
+    NoSession { node_id: u64, error: String },
+    NoSend { node_id: u64, error: String },
+}
+
+/// Local primary rollback result after a no-quorum mutation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum LocalRollbackResult {
+    RestoredPreviousPayload,
+    DeletedNewPayload,
+    NotAttempted,
+    Failed { error: String },
+}
+
+/// Compensating message result sent to a replica that acknowledged a mutation
+/// later found to be below quorum.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CompensatingMutationAttempt {
+    pub node_id: u64,
+    pub sent: bool,
+    pub acknowledged: bool,
+    pub detail: String,
+}
+
+/// Durable unresolved mutation row for failed-quorum transport mutations.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct UnresolvedMutationRecord {
+    /// Process-local mutation identity persisted in the ledger row.
+    pub mutation_id: String,
+    /// Object key as stable hex text.
+    pub object_key: String,
+    /// Original object name, lossy UTF-8 encoded when needed.
+    pub object_name: String,
+    /// Put payload digest/length or delete intent.
+    pub mutation: UnresolvedMutationKind,
+    /// Previous primary payload digest/length when it existed.
+    pub previous_local_payload: Option<PreviousLocalPayloadRef>,
+    /// Membership/roster/fence evidence available at the authority boundary.
+    pub membership_evidence: Option<String>,
+    /// Write quorum required at mutation time.
+    pub quorum_size: usize,
+    /// Total local plus remote targets attempted at mutation time.
+    pub total_targets: usize,
+    /// Positive local plus remote acknowledgement count.
+    pub acks: usize,
+    /// Per-replica original mutation outcomes.
+    pub replica_attempts: Vec<ReplicaMutationAttempt>,
+    /// Local primary rollback outcome.
+    pub local_rollback: LocalRollbackResult,
+    /// Per-replica compensating-message outcomes.
+    pub compensating_attempts: Vec<CompensatingMutationAttempt>,
+}
+
 impl TransportReplicatedPutResult {
     /// Project this transport-backed write result into #961 remote media input facts.
     ///
@@ -1684,6 +1768,10 @@ pub struct TransportReplicatedStore {
     placement: Option<PlacementDispatch>,
     /// Lazily-initialized replicated object reader for degraded reads.
     reader: Option<ReplicatedObjectReader>,
+    /// Append-only unresolved failed-quorum mutation ledger path.
+    unresolved_mutation_ledger_path: PathBuf,
+    /// Replayed unresolved failed-quorum mutation rows.
+    unresolved_mutations: Vec<UnresolvedMutationRecord>,
 }
 
 /// Coarse-grained statistics for a transport-backed replicated store.
@@ -1708,6 +1796,134 @@ pub struct TransportReplicatedStoreStats {
 }
 
 impl TransportReplicatedStore {
+    fn unresolved_mutation_ledger_path(primary_path: &Path) -> PathBuf {
+        primary_path.join("unresolved-mutations.jsonl")
+    }
+
+    fn load_unresolved_mutation_ledger(
+        path: &Path,
+    ) -> Result<Vec<UnresolvedMutationRecord>, String> {
+        let file = match File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => {
+                return Err(format!(
+                    "failed to open unresolved mutation ledger {}: {error}",
+                    path.display()
+                ));
+            }
+        };
+
+        let reader = BufReader::new(file);
+        let mut records = Vec::new();
+        for (line_index, line) in reader.lines().enumerate() {
+            let line = line.map_err(|error| {
+                format!(
+                    "failed to read unresolved mutation ledger {} line {}: {error}",
+                    path.display(),
+                    line_index + 1
+                )
+            })?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let record = serde_json::from_str(&line).map_err(|error| {
+                format!(
+                    "failed to decode unresolved mutation ledger {} line {}: {error}",
+                    path.display(),
+                    line_index + 1
+                )
+            })?;
+            records.push(record);
+        }
+        Ok(records)
+    }
+
+    fn append_unresolved_mutation(
+        &mut self,
+        record: UnresolvedMutationRecord,
+    ) -> Result<(), String> {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.unresolved_mutation_ledger_path)
+            .map_err(|error| {
+                format!(
+                    "failed to open unresolved mutation ledger {} for append: {error}",
+                    self.unresolved_mutation_ledger_path.display()
+                )
+            })?;
+        serde_json::to_writer(&mut file, &record).map_err(|error| {
+            format!(
+                "failed to encode unresolved mutation record {}: {error}",
+                record.mutation_id
+            )
+        })?;
+        file.write_all(b"\n").map_err(|error| {
+            format!(
+                "failed to write unresolved mutation ledger {}: {error}",
+                self.unresolved_mutation_ledger_path.display()
+            )
+        })?;
+        file.sync_data().map_err(|error| {
+            format!(
+                "failed to sync unresolved mutation ledger {}: {error}",
+                self.unresolved_mutation_ledger_path.display()
+            )
+        })?;
+        self.unresolved_mutations.push(record);
+        Ok(())
+    }
+
+    fn next_unresolved_mutation_id(&self) -> String {
+        let since_epoch = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        format!(
+            "failed-quorum-{}-{}",
+            since_epoch,
+            self.unresolved_mutations.len() + 1
+        )
+    }
+
+    fn previous_payload_ref(previous_payload: Option<&[u8]>) -> Option<PreviousLocalPayloadRef> {
+        previous_payload.map(|payload| PreviousLocalPayloadRef {
+            payload_digest: *blake3::hash(payload).as_bytes(),
+            payload_len: payload.len() as u64,
+        })
+    }
+
+    fn record_missing_replica_sessions(&self, replica_attempts: &mut Vec<ReplicaMutationAttempt>) {
+        let configured_total = match u64::try_from(self.config.total_replicas) {
+            Ok(configured_total) => configured_total,
+            Err(_) => {
+                replica_attempts.push(ReplicaMutationAttempt::NoSession {
+                    node_id: 0,
+                    error: format!(
+                        "configured total_replicas {} does not fit in u64",
+                        self.config.total_replicas
+                    ),
+                });
+                return;
+            }
+        };
+        let local_node_id = self.local_node_id();
+        let session_nodes: HashSet<u64> = self
+            .replicas
+            .iter()
+            .map(|replica| replica.node_id)
+            .collect();
+        for node_id in 1..=configured_total {
+            if node_id != local_node_id && !session_nodes.contains(&node_id) {
+                replica_attempts.push(ReplicaMutationAttempt::NoSession {
+                    node_id,
+                    error: "no transport session available for configured replica".to_string(),
+                });
+            }
+        }
+    }
+
     fn recv_replication_ack_bounded(
         transport: &mut Transport,
         session_id: SessionId,
@@ -1746,13 +1962,20 @@ impl TransportReplicatedStore {
         name: impl AsRef<[u8]>,
         key: tidefs_local_object_store::ObjectKey,
         previous_payload: Option<&[u8]>,
-    ) {
+    ) -> LocalRollbackResult {
         let result = match previous_payload {
             Some(payload) => self.primary.put_named(name, payload).map(|_| ()),
             None => self.primary.delete(key).map(|_| ()),
         };
-        if let Err(error) = result {
-            tracing::warn!("failed to restore primary after no-quorum mutation: {error}");
+        match (previous_payload.is_some(), result) {
+            (true, Ok(())) => LocalRollbackResult::RestoredPreviousPayload,
+            (false, Ok(())) => LocalRollbackResult::DeletedNewPayload,
+            (_, Err(error)) => {
+                tracing::warn!("failed to restore primary after no-quorum mutation: {error}");
+                LocalRollbackResult::Failed {
+                    error: error.to_string(),
+                }
+            }
         }
     }
 
@@ -1761,7 +1984,8 @@ impl TransportReplicatedStore {
         name: &str,
         previous_payload: Option<&[u8]>,
         acked_replicas: &[(u64, SessionId)],
-    ) {
+    ) -> Vec<CompensatingMutationAttempt> {
+        let mut attempts = Vec::new();
         for (node_id, session_id) in acked_replicas {
             let send_result = match previous_payload {
                 Some(payload) => send_replication_msg(
@@ -1783,22 +2007,48 @@ impl TransportReplicatedStore {
             };
             if let Err(error) = send_result {
                 tracing::warn!("replica node {node_id}: rollback send failed: {error}");
+                attempts.push(CompensatingMutationAttempt {
+                    node_id: *node_id,
+                    sent: false,
+                    acknowledged: false,
+                    detail: error.to_string(),
+                });
                 continue;
             }
 
             match Self::recv_replication_ack_bounded(transport, *session_id) {
                 Ok(ReplicationMessage::Ack { success: true, .. })
-                | Ok(ReplicationMessage::DeleteAck { .. }) => {}
+                | Ok(ReplicationMessage::DeleteAck { .. }) => {
+                    attempts.push(CompensatingMutationAttempt {
+                        node_id: *node_id,
+                        sent: true,
+                        acknowledged: true,
+                        detail: "acknowledged".to_string(),
+                    });
+                }
                 Ok(other) => {
                     tracing::warn!(
                         "replica node {node_id}: unexpected rollback response: {other:?}"
                     );
+                    attempts.push(CompensatingMutationAttempt {
+                        node_id: *node_id,
+                        sent: true,
+                        acknowledged: false,
+                        detail: format!("unexpected response: {other:?}"),
+                    });
                 }
                 Err(error) => {
                     tracing::warn!("replica node {node_id}: rollback ack failed: {error}");
+                    attempts.push(CompensatingMutationAttempt {
+                        node_id: *node_id,
+                        sent: true,
+                        acknowledged: false,
+                        detail: error.to_string(),
+                    });
                 }
             }
         }
+        attempts
     }
 
     /// Open a transport-backed replicated store.
@@ -1842,6 +2092,10 @@ impl TransportReplicatedStore {
             .bind(tidefs_transport::TransportAddr::Tcp(bind_addr))
             .map_err(|e| format!("transport bind failed: {e}"))?;
 
+        let unresolved_mutation_ledger_path = Self::unresolved_mutation_ledger_path(primary_path);
+        let unresolved_mutations =
+            Self::load_unresolved_mutation_ledger(&unresolved_mutation_ledger_path)?;
+
         Ok(Self {
             primary,
             transport,
@@ -1852,7 +2106,18 @@ impl TransportReplicatedStore {
             verification_receipts: Vec::new(),
             placement: None,
             reader: None,
+            unresolved_mutation_ledger_path,
+            unresolved_mutations,
         })
+    }
+
+    /// Replayed unresolved failed-quorum mutation rows.
+    ///
+    /// Rows remain unresolved until a future repair or reconciliation owner
+    /// proves convergence or records a typed refusal.
+    #[must_use]
+    pub fn unresolved_mutations(&self) -> &[UnresolvedMutationRecord] {
+        &self.unresolved_mutations
     }
 
     /// Connect to a remote replica with all three endpoint families.
@@ -2027,6 +2292,7 @@ impl TransportReplicatedStore {
         let total_targets = 1 + target_replicas.len();
         let mut acks: usize = 1; // primary counts
         let mut acked_replicas: Vec<(u64, SessionId)> = Vec::new();
+        let mut replica_attempts = Vec::new();
 
         // Fan out to targeted replicas over Control (e1) session
         for replica in &target_replicas {
@@ -2044,21 +2310,36 @@ impl TransportReplicatedStore {
                         Ok(ReplicationMessage::Ack { success: true, .. }) => {
                             acks += 1;
                             acked_replicas.push((replica.node_id, replica.control_session_id));
+                            replica_attempts.push(ReplicaMutationAttempt::Acknowledged {
+                                node_id: replica.node_id,
+                            });
                         }
                         Ok(ReplicationMessage::Ack { success: false, .. }) => {
                             tracing::warn!("replica node {}: write rejected", replica.node_id);
+                            replica_attempts.push(ReplicaMutationAttempt::Rejected {
+                                node_id: replica.node_id,
+                                reason: "ack success=false".to_string(),
+                            });
                         }
                         Ok(other) => {
                             tracing::warn!(
                                 "replica node {}: unexpected response: {other:?}",
                                 replica.node_id
                             );
+                            replica_attempts.push(ReplicaMutationAttempt::Rejected {
+                                node_id: replica.node_id,
+                                reason: format!("unexpected response: {other:?}"),
+                            });
                         }
                         Err(e) => {
                             tracing::warn!(
                                 "replica node {}: recv ack failed: {e}",
                                 replica.node_id
                             );
+                            replica_attempts.push(ReplicaMutationAttempt::SentWithoutAck {
+                                node_id: replica.node_id,
+                                error: e.to_string(),
+                            });
                             if let Err(close_err) = self.transport.close_session(
                                 replica.control_session_id,
                                 SessionCloseReason::TransportError,
@@ -2073,6 +2354,10 @@ impl TransportReplicatedStore {
                 }
                 Err(e) => {
                     tracing::warn!("replica node {}: send put failed: {e}", replica.node_id);
+                    replica_attempts.push(ReplicaMutationAttempt::NoSend {
+                        node_id: replica.node_id,
+                        error: e.to_string(),
+                    });
                 }
             }
         }
@@ -2090,13 +2375,36 @@ impl TransportReplicatedStore {
             self.stats.degraded_writes += 1;
         } else {
             drop(target_replicas);
-            self.restore_primary_after_failed_mutation(&name, key, previous_payload.as_deref());
-            Self::restore_acked_replicas_after_failed_mutation(
+            self.record_missing_replica_sessions(&mut replica_attempts);
+            let local_rollback =
+                self.restore_primary_after_failed_mutation(&name, key, previous_payload.as_deref());
+            let compensating_attempts = Self::restore_acked_replicas_after_failed_mutation(
                 &mut self.transport,
                 &name_str,
                 previous_payload.as_deref(),
                 &acked_replicas,
             );
+            self.append_unresolved_mutation(UnresolvedMutationRecord {
+                mutation_id: self.next_unresolved_mutation_id(),
+                object_key: key.short_hex(),
+                object_name: name_str.clone(),
+                mutation: UnresolvedMutationKind::Put {
+                    payload_digest: *blake3::hash(payload).as_bytes(),
+                    payload_len: payload.len() as u64,
+                },
+                previous_local_payload: Self::previous_payload_ref(previous_payload.as_deref()),
+                membership_evidence: Some(format!(
+                    "local_node={} remote_targets={}",
+                    self.local_node_id(),
+                    total_targets.saturating_sub(1)
+                )),
+                quorum_size: self.config.write_quorum,
+                total_targets,
+                acks,
+                replica_attempts,
+                local_rollback,
+                compensating_attempts,
+            })?;
             self.stats.failed_writes += 1;
         }
 
@@ -2173,6 +2481,7 @@ impl TransportReplicatedStore {
         let mut acks: usize = 1; // primary counts
         let mut acked_replicas: Vec<(u64, SessionId)> = Vec::new();
         let mut recorded_receipt_ref: Option<PlacementReceiptRef> = None;
+        let mut replica_attempts = Vec::new();
 
         // Fan out to targeted replicas over Control (e1) session using
         // PutWithReceipt to carry durable placement authority.
@@ -2203,12 +2512,19 @@ impl TransportReplicatedStore {
                                     acked_replicas
                                         .push((replica.node_id, replica.control_session_id));
                                     recorded_receipt_ref = Some(replica_receipt_ref);
+                                    replica_attempts.push(ReplicaMutationAttempt::Acknowledged {
+                                        node_id: replica.node_id,
+                                    });
                                 }
                                 Err(error) => {
                                     tracing::warn!(
                                         "replica node {}: PutWithReceipt ack receipt invalid: {error}",
                                         replica.node_id
                                     );
+                                    replica_attempts.push(ReplicaMutationAttempt::Rejected {
+                                        node_id: replica.node_id,
+                                        reason: format!("invalid recorded receipt: {error}"),
+                                    });
                                 }
                             }
                         }
@@ -2221,24 +2537,40 @@ impl TransportReplicatedStore {
                                 "replica node {}: PutWithReceipt ack omitted recorded receipt",
                                 replica.node_id
                             );
+                            replica_attempts.push(ReplicaMutationAttempt::Rejected {
+                                node_id: replica.node_id,
+                                reason: "ack omitted recorded receipt".to_string(),
+                            });
                         }
                         Ok(ReplicationMessage::PutWithReceiptAck { success: false, .. }) => {
                             tracing::warn!(
                                 "replica node {}: receipt-authorized write rejected",
                                 replica.node_id
                             );
+                            replica_attempts.push(ReplicaMutationAttempt::Rejected {
+                                node_id: replica.node_id,
+                                reason: "ack success=false".to_string(),
+                            });
                         }
                         Ok(other) => {
                             tracing::warn!(
                                 "replica node {}: unexpected response to PutWithReceipt: {other:?}",
                                 replica.node_id
                             );
+                            replica_attempts.push(ReplicaMutationAttempt::Rejected {
+                                node_id: replica.node_id,
+                                reason: format!("unexpected response: {other:?}"),
+                            });
                         }
                         Err(e) => {
                             tracing::warn!(
                                 "replica node {}: PutWithReceipt ack recv failed: {e}",
                                 replica.node_id
                             );
+                            replica_attempts.push(ReplicaMutationAttempt::SentWithoutAck {
+                                node_id: replica.node_id,
+                                error: e.to_string(),
+                            });
                             if let Err(close_err) = self.transport.close_session(
                                 replica.control_session_id,
                                 SessionCloseReason::TransportError,
@@ -2256,6 +2588,10 @@ impl TransportReplicatedStore {
                         "replica node {}: send PutWithReceipt failed: {e}",
                         replica.node_id
                     );
+                    replica_attempts.push(ReplicaMutationAttempt::NoSend {
+                        node_id: replica.node_id,
+                        error: e.to_string(),
+                    });
                 }
             }
         }
@@ -2273,13 +2609,36 @@ impl TransportReplicatedStore {
             self.stats.degraded_writes += 1;
         } else {
             drop(target_replicas);
-            self.restore_primary_after_failed_mutation(&name, key, previous_payload.as_deref());
-            Self::restore_acked_replicas_after_failed_mutation(
+            self.record_missing_replica_sessions(&mut replica_attempts);
+            let local_rollback =
+                self.restore_primary_after_failed_mutation(&name, key, previous_payload.as_deref());
+            let compensating_attempts = Self::restore_acked_replicas_after_failed_mutation(
                 &mut self.transport,
                 &name_str,
                 previous_payload.as_deref(),
                 &acked_replicas,
             );
+            self.append_unresolved_mutation(UnresolvedMutationRecord {
+                mutation_id: self.next_unresolved_mutation_id(),
+                object_key: key.short_hex(),
+                object_name: name_str.clone(),
+                mutation: UnresolvedMutationKind::Put {
+                    payload_digest: *blake3::hash(payload).as_bytes(),
+                    payload_len: payload.len() as u64,
+                },
+                previous_local_payload: Self::previous_payload_ref(previous_payload.as_deref()),
+                membership_evidence: Some(format!(
+                    "local_node={} remote_targets={}",
+                    self.local_node_id(),
+                    total_targets.saturating_sub(1)
+                )),
+                quorum_size: self.config.write_quorum,
+                total_targets,
+                acks,
+                replica_attempts,
+                local_rollback,
+                compensating_attempts,
+            })?;
             self.stats.failed_writes += 1;
         }
 
@@ -2424,6 +2783,7 @@ impl TransportReplicatedStore {
         // Primary always counts as one ack (it's local)
         let mut acks: usize = 1;
         let mut acked_replicas: Vec<(u64, SessionId)> = Vec::new();
+        let mut replica_attempts = Vec::new();
 
         // Fan out delete to targeted replicas over Control sessions, waiting for
         // DeleteAck responses to count toward quorum.
@@ -2444,23 +2804,38 @@ impl TransportReplicatedStore {
                             // the object or not — idempotent).
                             acks += 1;
                             acked_replicas.push((replica.node_id, replica.control_session_id));
+                            replica_attempts.push(ReplicaMutationAttempt::Acknowledged {
+                                node_id: replica.node_id,
+                            });
                         }
                         Ok(other) => {
                             tracing::warn!(
                                 "replica node {}: unexpected delete response: {other:?}",
                                 replica.node_id
                             );
+                            replica_attempts.push(ReplicaMutationAttempt::Rejected {
+                                node_id: replica.node_id,
+                                reason: format!("unexpected response: {other:?}"),
+                            });
                         }
                         Err(e) => {
                             tracing::warn!(
                                 "replica node {}: delete ack recv failed: {e}",
                                 replica.node_id
                             );
+                            replica_attempts.push(ReplicaMutationAttempt::SentWithoutAck {
+                                node_id: replica.node_id,
+                                error: e.to_string(),
+                            });
                         }
                     }
                 }
                 Err(e) => {
                     tracing::warn!("replica node {}: delete send failed: {e}", replica.node_id);
+                    replica_attempts.push(ReplicaMutationAttempt::NoSend {
+                        node_id: replica.node_id,
+                        error: e.to_string(),
+                    });
                 }
             }
         }
@@ -2471,10 +2846,17 @@ impl TransportReplicatedStore {
             Ok(primary_deleted)
         } else {
             drop(target_replicas);
+            self.record_missing_replica_sessions(&mut replica_attempts);
+            let mut local_rollback = LocalRollbackResult::NotAttempted;
+            let mut compensating_attempts = Vec::new();
             if primary_deleted {
-                self.restore_primary_after_failed_mutation(&name, key, previous_payload.as_deref());
+                local_rollback = self.restore_primary_after_failed_mutation(
+                    &name,
+                    key,
+                    previous_payload.as_deref(),
+                );
                 if let Some(previous_payload) = previous_payload.as_deref() {
-                    Self::restore_acked_replicas_after_failed_mutation(
+                    compensating_attempts = Self::restore_acked_replicas_after_failed_mutation(
                         &mut self.transport,
                         &name_str,
                         Some(previous_payload),
@@ -2482,6 +2864,24 @@ impl TransportReplicatedStore {
                     );
                 }
             }
+            self.append_unresolved_mutation(UnresolvedMutationRecord {
+                mutation_id: self.next_unresolved_mutation_id(),
+                object_key: key.short_hex(),
+                object_name: name_str.clone(),
+                mutation: UnresolvedMutationKind::Delete,
+                previous_local_payload: Self::previous_payload_ref(previous_payload.as_deref()),
+                membership_evidence: Some(format!(
+                    "local_node={} remote_targets={}",
+                    self.local_node_id(),
+                    total_targets.saturating_sub(1)
+                )),
+                quorum_size: self.config.write_quorum,
+                total_targets,
+                acks,
+                replica_attempts,
+                local_rollback,
+                compensating_attempts,
+            })?;
             Err(format!(
                 "delete quorum failed: {}/{} replicas acknowledged (need {})",
                 acks, total_targets, self.config.write_quorum
@@ -5668,6 +6068,42 @@ mod tests {
             assert_eq!(primary.stats().failed_writes, 1);
             assert_eq!(primary.stats().object_count, 0);
             assert_eq!(primary.get_local("unacked").unwrap(), None);
+
+            let records = primary.unresolved_mutations().to_vec();
+            assert_eq!(records.len(), 1);
+            let record = &records[0];
+            assert!(matches!(
+                record.mutation,
+                UnresolvedMutationKind::Put { .. }
+            ));
+            assert_eq!(record.object_name, "unacked");
+            assert_eq!(record.acks, 1);
+            assert_eq!(record.quorum_size, 2);
+            assert_eq!(
+                record.local_rollback,
+                LocalRollbackResult::DeletedNewPayload
+            );
+            assert!(record
+                .replica_attempts
+                .contains(&ReplicaMutationAttempt::SentWithoutAck {
+                    node_id: 2,
+                    error: "replica ack timeout after 200ms".to_string(),
+                }));
+
+            drop(primary);
+            let replayed = TransportReplicatedStore::open(
+                primary_dir.path(),
+                1,
+                TransportReplicatedStoreConfig {
+                    write_quorum: 2,
+                    total_replicas: 2,
+                    enable_degraded_reads: false,
+                    rdma: false,
+                    store_options: tidefs_local_object_store::StoreOptions::test_fast(),
+                },
+            )
+            .unwrap();
+            assert_eq!(replayed.unresolved_mutations(), records.as_slice());
         }
 
         #[test]
@@ -5798,6 +6234,39 @@ mod tests {
                 primary.get_local("rollback").unwrap(),
                 Some(b"old".to_vec())
             );
+            let records = primary.unresolved_mutations();
+            assert_eq!(records.len(), 1);
+            let record = &records[0];
+            assert_eq!(record.object_name, "rollback");
+            assert_eq!(
+                record.previous_local_payload,
+                Some(PreviousLocalPayloadRef {
+                    payload_digest: *blake3::hash(b"old").as_bytes(),
+                    payload_len: 3,
+                })
+            );
+            assert!(record
+                .replica_attempts
+                .contains(&ReplicaMutationAttempt::Acknowledged { node_id: 2 }));
+            assert!(record
+                .replica_attempts
+                .contains(&ReplicaMutationAttempt::NoSession {
+                    node_id: 3,
+                    error: "no transport session available for configured replica".to_string(),
+                }));
+            assert_eq!(
+                record.local_rollback,
+                LocalRollbackResult::RestoredPreviousPayload
+            );
+            assert_eq!(
+                record.compensating_attempts,
+                vec![CompensatingMutationAttempt {
+                    node_id: 2,
+                    sent: true,
+                    acknowledged: true,
+                    detail: "acknowledged".to_string(),
+                }]
+            );
             assert_eq!(
                 replica_thread.join().unwrap(),
                 Some(b"old".to_vec()),
@@ -5904,6 +6373,40 @@ mod tests {
             assert_eq!(
                 primary.get_local("delete-rollback").unwrap(),
                 Some(b"old".to_vec())
+            );
+            let records = primary.unresolved_mutations();
+            assert_eq!(records.len(), 1);
+            let record = &records[0];
+            assert_eq!(record.object_name, "delete-rollback");
+            assert_eq!(record.mutation, UnresolvedMutationKind::Delete);
+            assert_eq!(
+                record.previous_local_payload,
+                Some(PreviousLocalPayloadRef {
+                    payload_digest: *blake3::hash(b"old").as_bytes(),
+                    payload_len: 3,
+                })
+            );
+            assert!(record
+                .replica_attempts
+                .contains(&ReplicaMutationAttempt::Acknowledged { node_id: 2 }));
+            assert!(record
+                .replica_attempts
+                .contains(&ReplicaMutationAttempt::NoSession {
+                    node_id: 3,
+                    error: "no transport session available for configured replica".to_string(),
+                }));
+            assert_eq!(
+                record.local_rollback,
+                LocalRollbackResult::RestoredPreviousPayload
+            );
+            assert_eq!(
+                record.compensating_attempts,
+                vec![CompensatingMutationAttempt {
+                    node_id: 2,
+                    sent: true,
+                    acknowledged: true,
+                    detail: "acknowledged".to_string(),
+                }]
             );
             assert_eq!(
                 replica_thread.join().unwrap(),
