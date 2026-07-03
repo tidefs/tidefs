@@ -3,11 +3,11 @@
 
 use std::{cell::RefCell, collections::BTreeMap, fmt::Write as _};
 
-use serde::{Deserialize, Serialize};
 use crate::evidence_artifact_manifest::{
     content_digest_for_bytes, BlockingIssueRef, EvidenceArtifactManifest,
     EVIDENCE_ARTIFACT_MANIFEST_VERSION,
 };
+use serde::{Deserialize, Serialize};
 use tidefs_reclaim::{
     ClearanceEvidence, GateDecision, ReclaimConsumerStats, ReclaimGate, SegmentFreer,
     SegmentLiveCounts, SegmentResolver,
@@ -1092,13 +1092,13 @@ mod tests {
 
         assert_eq!(parsed.manifest_version, EVIDENCE_ARTIFACT_MANIFEST_VERSION);
         assert_eq!(parsed.claim_id, RECEIPT_BOUND_RECLAIM_CLAIM_ID);
-        assert_eq!(
-            parsed.evidence_class,
-            RECEIPT_BOUND_RECLAIM_EVIDENCE_CLASS
-        );
+        assert_eq!(parsed.evidence_class, RECEIPT_BOUND_RECLAIM_EVIDENCE_CLASS);
         assert_eq!(parsed.validation_tier, ValidationTier::HarnessOnly);
         assert_eq!(parsed.artifact_path, RECEIPT_BOUND_RECLAIM_ARTIFACT);
-        assert_eq!(parsed.content_digest, content_digest_for_bytes(&artifact_bytes));
+        assert_eq!(
+            parsed.content_digest,
+            content_digest_for_bytes(&artifact_bytes)
+        );
         assert_eq!(parsed.outcome, ValidationStatus::Pass);
         assert!(parsed.blocking_issues.is_empty());
     }
@@ -1122,6 +1122,9 @@ mod tests {
 
         assert_eq!(parsed.outcome, ValidationStatus::ProductFail);
         assert_ne!(parsed.outcome, ValidationStatus::Pass);
-        assert_eq!(parsed.content_digest, content_digest_for_bytes(&artifact_bytes));
+        assert_eq!(
+            parsed.content_digest,
+            content_digest_for_bytes(&artifact_bytes)
+        );
     }
 }
