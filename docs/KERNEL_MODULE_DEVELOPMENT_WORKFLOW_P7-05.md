@@ -28,22 +28,17 @@ See also:
 Nix is the reproducible kernel acceptance layer, not the per-edit kernel hot
 loop.
 
-The canonical TideFS Linux source mirror is:
-
-```text
-http://172.16.106.12/forgejo/forgeadmin/linux
-http://172.16.106.12/forgejo/forgeadmin/linux.git
-```
-
-The baseline branch is `tidefs/linux-7.0`, rooted at the signed `v7.0` Linux
-tag. TideFS kernel source changes belong on issue-bound branches in that Linux
-repository, not as vendored Linux trees, submodules, or hidden local patches in
-the TideFS repository.
+The TideFS Linux source mirror is private operator-owned infrastructure outside
+this public repository. The baseline branch is `tidefs/linux-7.0`, rooted at the
+signed `v7.0` Linux tag. TideFS kernel source changes belong on issue-bound
+branches in that Linux repository, not as vendored Linux trees, submodules, or
+hidden local patches in the TideFS repository.
 
 The hot loop for kernel work is:
 
-1. use the Nexus Linux helper to prepare one shared Linux 7.0 source/build
-   baseline under `/root/ai/state/tidefs/kernel-dev/shared/linux-7.0`;
+1. use `nix/kmod-hot-loop.sh prepare` or explicit `KERNEL_TREE`,
+   `KERNEL_BUILD`, and `MODULE_OUT` paths to prepare a Linux 7.0 source/build
+   baseline outside the TideFS repository;
 2. use per-slot `module-out` and `qemu-runs` directories for ordinary external
    module build products and disposable guest artifacts;
 3. for external modules, build with
@@ -72,8 +67,8 @@ for ordinary kernel edits.
 The TideFS repository owns filesystem code, userspace control utilities, and
 TideFS-owned module/crate code that is part of the product tree.
 
-The `forgeadmin/linux` repository owns Linux source changes needed by TideFS.
-Use this branch shape for Linux work:
+The private Linux mirror owns Linux source changes needed by TideFS. Use this
+branch shape for Linux work:
 
 ```text
 tidefs/linux-7.0
@@ -90,8 +85,8 @@ Issue closeout for kernel-source work must record:
 - the Nix acceptance command and result when the work is being admitted.
 
 A Linux patch must never exist only in a prepared build directory. If it is
-needed, commit it to `forgeadmin/linux` on an issue branch and make the TideFS
-issue or acceptance note point at that branch.
+needed, commit it to the private Linux mirror on an issue branch and make the
+TideFS issue or acceptance note point at that branch.
 
 ## 3. Nix role
 
@@ -111,8 +106,8 @@ Kbuild, or Linux source changes.
 
 The fast loop owns developer throughput.
 
-The default Nexus module mode uses one shared baseline plus lightweight
-per-slot output directories:
+The default public hot-loop helper uses one Linux 7.0 baseline plus lightweight
+per-issue output directories:
 
 ```text
 /root/ai/state/tidefs/kernel-dev/shared/linux-7.0/source
@@ -121,24 +116,31 @@ per-slot output directories:
 /root/ai/state/tidefs/kernel-dev/<slot>/issue-<issue>/qemu-runs
 ```
 
-Workers obtain those paths from:
+Workers may let the helper prepare its default paths:
 
 ```sh
-~/ai/bin/tidefs-nexus-worker-tool linux-prepare --slot <slot> --issue <issue>
+nix/kmod-hot-loop.sh prepare
 ```
 
-The shared source path is a clean Git checkout of
-`forgeadmin/linux:tidefs/linux-7.0`. The shared build path is out-of-tree
+Workers may also pass explicit paths when a prepared baseline already exists:
+
+```sh
+KERNEL_TREE=<linux-src> KERNEL_BUILD=<linux-build> MODULE_OUT=<module-out> \
+  nix/kmod-hot-loop.sh prepare
+```
+
+The source path is a clean Linux 7.0 checkout. The build path is out-of-tree
 Kbuild output/cache state: it may be deleted and recreated, must not be
 committed, and must not be treated as the source of any Linux patch.
 
 External module edit loop:
 
 ```sh
-eval "$(
-  ~/ai/bin/tidefs-nexus-worker-tool linux-prepare --slot <slot> --issue <issue> |
-    jq -r '"LINUX_SRC=\(.linux_src)\nLINUX_BUILD=\(.linux_build)\nMODULE_OUT=\(.module_out)\nQEMU_KERNEL=\(.qemu_kernel)\nQEMU_RUN_DIR=\(.qemu_run_dir)"'
-)"
+LINUX_SRC=<linux-src>
+LINUX_BUILD=<linux-build>
+MODULE_OUT=<module-out>
+KERNEL_TREE="$LINUX_SRC" KERNEL_BUILD="$LINUX_BUILD" MODULE_OUT="$MODULE_OUT" \
+  nix/kmod-hot-loop.sh prepare
 RUSTC="$(cd <tidefs-worktree> && rustc --print sysroot)/bin/rustc" RUSTC_BOOTSTRAP=1 \
 make -j8 -C "$LINUX_SRC" LLVM=1 O="$LINUX_BUILD" \
   M="<tidefs-worktree>/crates/tidefs-kmod-posix-vfs" \
@@ -149,11 +151,9 @@ make -j8 -C "$LINUX_SRC" LLVM=1 O="$LINUX_BUILD" \
   MO="$MODULE_OUT/block-kmod" modules
 ```
 
-Writable Linux patch setup:
-
-```sh
-~/ai/bin/tidefs-nexus-worker-tool linux-prepare --mode patch --slot <slot> --issue <issue>
-```
+Writable Linux patch setup is private-infra work: create or use an
+issue-scoped writable Linux checkout/build pair from the operator-owned Linux
+mirror, then pass those paths explicitly as `KERNEL_TREE` and `KERNEL_BUILD`.
 
 In-tree Linux patch edit loop:
 
@@ -181,21 +181,14 @@ parallelism.
 
 ## 4a. Disk and cache ownership
 
-The shared Linux baseline is the only normal full source/build copy. Per-slot
-state is limited to module outputs, QEMU run artifacts, and the rare writable
-patch checkout created by `linux-prepare --mode patch`.
+The shared Linux baseline is the only normal full source/build copy. Per-issue
+state is limited to module outputs, QEMU run artifacts, and rare writable patch
+checkouts created through the private-infra process.
 
-Nexus may prune stale inactive per-issue kernel-dev directories with:
-
-```sh
-~/ai/bin/tidefs-nexus-worker-tool linux-gc --apply
-```
-
-The GC guard preserves active Nexus slots, paths referenced by live processes,
-and Linux source checkouts with dirty or ahead commits. It may also scan the
-legacy `/tmp/tidefs-kernel-dev` root so the old per-issue Linux tree copies do
-not permanently consume tmpfs. Do not manually delete another slot's
-kernel-dev directory unless the GC output shows it is inactive and clean.
+There is no public-repo garbage-collection command for TideFS kernel-dev state.
+Clean only paths owned by the current issue after checking live process,
+worktree, and Git state. Do not manually delete another slot's kernel-dev
+directory or a dirty/ahead Linux checkout.
 
 ## 5. QEMU load/test rule
 
@@ -281,8 +274,8 @@ The following shortcuts are forbidden:
 
 If TideFS needs a Linux patch, a non-exported symbol, or a different kernel
 configuration to make forward progress, that is valid kernel-source work only
-when it is visible in `forgeadmin/linux`, tied to the TideFS issue or release
-packet, and proven through QEMU and Nix acceptance.
+when it is visible in the private Linux mirror, tied to the TideFS issue or
+release packet, and proven through QEMU and Nix acceptance.
 
 ## 8. Issue implications
 
@@ -298,8 +291,8 @@ Kernel issues must interpret the build surfaces this way:
 - Nix acceptance must exist for admission; it must not be used as the ordinary
   edit loop.
 - Any issue that discovers a real Linux source requirement must either push a
-  Linux issue branch to `forgeadmin/linux` or split a child issue that owns
-  that branch.
+  Linux issue branch to the private Linux mirror or split a child issue that
+  owns that branch.
 
 Completed work stays completed unless the Linux 7.0 hot-loop proof exposes a
 specific incompatibility. The purpose of this rule is to keep throughput high

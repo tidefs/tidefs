@@ -134,7 +134,7 @@ require_kernel_feature() {
       echo "  ${feature}=y exists in .config but not auto.conf; the prepared Kbuild metadata is stale or unavailable." >&2
     fi
     echo "  Do not patch the shared kernel config from a module build." >&2
-    echo "  Re-bootstrap the Linux 7.0 shared baseline/toolchain, then rerun linux-prepare." >&2
+    echo "  Re-bootstrap the Linux 7.0 shared baseline/toolchain, then rerun 'nix/kmod-hot-loop.sh prepare' or pass fresh KERNEL_TREE/KERNEL_BUILD paths." >&2
     exit 1
   fi
 }
@@ -270,12 +270,12 @@ cmd_prepare() {
   if [ -n "$KERNEL_BUILD" ]; then
     if [ ! -f "$KERNEL_TREE/Makefile" ]; then
       echo "ERROR: KERNEL_TREE=$KERNEL_TREE is not a Linux source tree." >&2
-      echo "Use linux-prepare and pass --kernel-tree LINUX_SRC --kernel-build LINUX_BUILD." >&2
+      echo "Pass KERNEL_TREE=<linux-src> and KERNEL_BUILD=<linux-build>, then rerun 'nix/kmod-hot-loop.sh prepare'." >&2
       exit 1
     fi
     if shared_kernel_build && [ "${TIDEFS_KMOD_MUTATE_SHARED_BASELINE:-0}" != "1" ]; then
       echo "ERROR: refusing to mutate shared kernel build metadata in $KERNEL_BUILD" >&2
-      echo "The shared baseline is operator-owned. Use linux-prepare for module paths, or set" >&2
+      echo "The shared baseline is operator-owned. Use explicit KERNEL_TREE/KERNEL_BUILD/MODULE_OUT paths, or set" >&2
       echo "TIDEFS_KMOD_MUTATE_SHARED_BASELINE=1 only during an explicit baseline bootstrap." >&2
       exit 1
     fi
@@ -445,7 +445,7 @@ cmd_build() {
 
   if [ ! -f "$build_dir/include/config/auto.conf" ]; then
     echo "ERROR: prepared kernel metadata missing at $build_dir/include/config/auto.conf" >&2
-    echo "Run linux-prepare and use its returned linux_src/linux_build paths; do not run a hidden full kernel prepare from the module loop." >&2
+    echo "Run 'nix/kmod-hot-loop.sh prepare' or pass explicit KERNEL_TREE/KERNEL_BUILD paths; do not run a hidden full kernel prepare from the module loop." >&2
     exit 1
   fi
   require_kernel_feature CONFIG_MODULES

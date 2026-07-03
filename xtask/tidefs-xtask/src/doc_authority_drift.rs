@@ -21,10 +21,7 @@ const ACTIVE_ENTRYPOINT_DOCS: &[&str] = &[
     "docs/TEST_SIGNAL_POLICY.md",
 ];
 
-const STALE_AUTHORITY_MARKER_ALLOWED_DOCS: &[&str] = &[
-    // Current policy for TideFS kernel development names the local Linux mirror.
-    concat!("docs/KERNEL_MODULE_DEVELOPMENT_WORKFLOW_", "P7", "-05.md"),
-];
+const STALE_AUTHORITY_MARKER_ALLOWED_DOCS: &[&str] = &[];
 
 const LEGACY_DESIGN_SEALED_BOLD: &str = concat!("Maturity: **design", "-sealed**");
 const LEGACY_DESIGN_SEALED: &str = concat!("Maturity: design", "-sealed");
