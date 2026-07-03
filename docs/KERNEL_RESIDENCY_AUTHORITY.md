@@ -69,9 +69,10 @@ This decision reviewed the evidence named by issue #1288:
   TFR-017, TFR-018, and TFR-019 notes.
 - `docs/KERNEL_RESIDENT_POOL_ENGINE_ARCHITECTURE.md`, which remains the target
   architecture and evidence-tier map.
-- `docs/KERNEL_TEARDOWN_RUNTIME_EVIDENCE_DECISION.md`, whose T5/T6 model is
-  still the teardown tiering vocabulary even though #1186 / PR #1463 has since
-  accepted the T5 mounted-kernel cutover/teardown artifact.
+- `validation/claims.toml`, generated `docs/CLAIM_REGISTRY.md`,
+  `docs/CLAIMS_GATE_POLICY.md`, and `docs/GITHUB_CI.md`, which keep the
+  teardown claim blocked, define the source/model, T5, and T6 tier boundary,
+  and route mounted runtime evidence through self-hosted kernel workflows.
 - Historical kernel production-depth lineage reviewed during #1288. That
   lineage is now kept in git and issue #1707; it is not current evidence.
 - `docs/PAGE_CACHE_WRITEBACK_AUTHORITY.md` and
@@ -120,8 +121,10 @@ Split final authority into independent POSIX and block stores.
 
 ## T5/T6 Claim Upgrade Model
 
-TideFS uses the claim tiers in `docs/CLAIMS_GATE_POLICY.md` and the teardown
-model in `docs/KERNEL_TEARDOWN_RUNTIME_EVIDENCE_DECISION.md`.
+TideFS uses the claim tiers in `docs/CLAIMS_GATE_POLICY.md`, the blocked
+teardown claim row in `validation/claims.toml` and generated
+`docs/CLAIM_REGISTRY.md`, and the self-hosted runtime lanes in
+`docs/GITHUB_CI.md`.
 
 | Tier | What it can upgrade | Required evidence before upgrade |
 |---|---|---|
