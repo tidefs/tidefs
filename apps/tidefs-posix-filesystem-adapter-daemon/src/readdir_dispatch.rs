@@ -103,6 +103,7 @@ pub fn iter_dir_entries(
     } else {
         DOTDOT_COOKIE
     };
+    let mut pending_synthetic = max_entries == 0 && cookie.0 < synthetic_cookie_count;
 
     // Determine the starting cookie value and whether to emit
     // synthetic entries.  Cookies 1 through synthetic_cookie_count are
@@ -119,6 +120,8 @@ pub fn iter_dir_entries(
                 next_cookie,
             ));
             next_cookie = DOTDOT_COOKIE;
+        } else {
+            pending_synthetic = true;
         }
         if entries.len() < max_entries {
             entries.push(DirEntry::new(
@@ -141,6 +144,8 @@ pub fn iter_dir_entries(
                 next_cookie,
             ));
             next_cookie = SNAPSHOT_DOTDIR_COOKIE + 1;
+        } else if snapshot_catalog_generation.is_some() {
+            pending_synthetic = true;
         }
     } else if cookie.0 == DOT_COOKIE {
         // Only `.` was emitted previously; still need `..`.
@@ -154,6 +159,8 @@ pub fn iter_dir_entries(
                 next_cookie,
             ));
             next_cookie = SNAPSHOT_DOTDIR_COOKIE;
+        } else {
+            pending_synthetic = true;
         }
         if let Some(generation) =
             snapshot_catalog_generation.filter(|_| entries.len() < max_entries)
@@ -166,6 +173,8 @@ pub fn iter_dir_entries(
                 next_cookie,
             ));
             next_cookie = SNAPSHOT_DOTDIR_COOKIE + 1;
+        } else if snapshot_catalog_generation.is_some() {
+            pending_synthetic = true;
         }
     } else if let Some(generation) = snapshot_catalog_generation
         .filter(|_| cookie.0 == DOTDOT_COOKIE)
@@ -181,6 +190,8 @@ pub fn iter_dir_entries(
                 next_cookie,
             ));
             next_cookie = SNAPSHOT_DOTDIR_COOKIE + 1;
+        } else {
+            pending_synthetic = true;
         }
     } else {
         // Synthetic entries emitted (or offset beyond them): only real entries
@@ -220,7 +231,7 @@ pub fn iter_dir_entries(
         next_cookie += 1;
     }
 
-    let has_more = !iter.is_empty();
+    let has_more = pending_synthetic || !iter.is_empty();
     let last_cookie = if entries.is_empty() {
         cookie
     } else {
@@ -519,6 +530,48 @@ mod tests {
         assert_eq!(after_snapshot.entries.len(), 1);
         assert_eq!(after_snapshot.entries[0].name, b"alpha");
         assert_eq!(after_snapshot.entries[0].cookie, 4);
+    }
+
+    #[test]
+    fn iter_limited_snapshot_synthetics_report_more_until_dotdir_emits() {
+        let dir = make_dir();
+
+        let first = iter_dir_entries(
+            &dir,
+            10,
+            1,
+            Some(Generation::new(7)),
+            DirCookie::START,
+            1,
+        );
+        assert_eq!(first.entries.len(), 1);
+        assert_eq!(first.entries[0].name, b".");
+        assert!(first.has_more);
+
+        let second = iter_dir_entries(
+            &dir,
+            10,
+            1,
+            Some(Generation::new(7)),
+            first.last_cookie,
+            1,
+        );
+        assert_eq!(second.entries.len(), 1);
+        assert_eq!(second.entries[0].name, b"..");
+        assert!(second.has_more);
+
+        let third = iter_dir_entries(
+            &dir,
+            10,
+            1,
+            Some(Generation::new(7)),
+            second.last_cookie,
+            1,
+        );
+        assert_eq!(third.entries.len(), 1);
+        assert_eq!(third.entries[0].name, b".snapshot");
+        assert_eq!(third.entries[0].cookie, 3);
+        assert!(!third.has_more);
     }
 
     #[test]
