@@ -3414,10 +3414,6 @@ impl VfsLocalFileSystem {
     }
 }
 
-fn live_admin_str<'a>(value: &'a Value, key: &str) -> std::result::Result<&'a str, Errno> {
-    value.get(key).and_then(Value::as_str).ok_or(Errno::EINVAL)
-}
-
 fn live_admin_arg<'a>(args: &'a Value, key: &str) -> std::result::Result<&'a str, String> {
     args.get(key)
         .and_then(Value::as_str)
