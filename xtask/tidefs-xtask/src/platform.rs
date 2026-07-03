@@ -29,7 +29,7 @@ pub fn check_current_workspace() -> Result<(), PlatformCheckError> {
         "nix/tidefs-validation.sh",
         "nix/tidefs-qemu-direct.sh",
         "nix/tidefs-rdma-probe.sh",
-        "docs/DEBUGGING_WORKFLOWS.md",
+        "docs/GETTING_STARTED.md",
         "docs/GITHUB_CI.md",
         "docs/xfstests-harness.md",
         "docs/TRANSPORT_CLUSTER_AUTHORITY.md",
@@ -67,8 +67,8 @@ pub fn check_current_workspace() -> Result<(), PlatformCheckError> {
     );
     check_source_markers(
         &root,
-        "docs/DEBUGGING_WORKFLOWS.md",
-        &["nix develop", "POSIX scoreboard", "Output artifacts"],
+        "docs/GETTING_STARTED.md",
+        &["nix develop", "posix-scoreboard", "xfstests-runner"],
         &mut missing,
     );
     check_source_markers(
