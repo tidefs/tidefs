@@ -4040,6 +4040,7 @@ dependencies = [
  "tidefs-transport",
  "tidefs-types-dataset-feature-flags-core",
  "tidefs-types-pool-label-core",
+ "tidefs-types-vfs-core",
  "tidefs-validation",
 ]
 
