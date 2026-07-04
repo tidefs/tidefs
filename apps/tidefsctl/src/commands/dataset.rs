@@ -1302,7 +1302,7 @@ fn handle_set_strategy(args: DatasetSetStrategyArgs) {
             ("list", LivePoolAdminArg::Bool(args.list)),
             (
                 "class",
-                super::live_owner::live_admin_optional_string(args.class.clone()),
+                super::live_owner::live_admin_optional_string(Some(args.class.clone())),
             ),
         ]),
     );
