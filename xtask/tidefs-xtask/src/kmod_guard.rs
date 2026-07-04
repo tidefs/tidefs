@@ -64,7 +64,7 @@ const GUARDED_SOURCE_FILES: &[&str] = &[
 ];
 
 /// Guarded doc files under crates/tidefs-kmod-posix-vfs/.
-const GUARDED_DOC_FILES: &[&str] = &["README.md", "VFS-OPS-GAP-ANALYSIS.md"];
+const GUARDED_DOC_FILES: &[&str] = &["README.md"];
 
 #[derive(Debug)]
 pub struct KmodGuardError {
