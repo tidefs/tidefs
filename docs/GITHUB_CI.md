@@ -146,10 +146,17 @@ may use non-secret repository variables for scheduling gates, such as
   `target` choice for `kmod-xfstests-smoke`, `kernel-fsync-validation`,
   `kernel-mmap-validation`, `kernel-teardown-validation`,
   `kernel-no-daemon-teardown-validation`, `two-node-carrier-validation`,
-  `fuse-vm-test`, `qemu-ublk-smoke`, `qemu-ublk-qid-tag-runtime`,
-  `receipt-bound-reclaim-runtime`, `scrub-foreground-read-runtime`, and `all`;
-  the full dispatch contract and artifact boundaries live in
-  `docs/QEMU_SMOKE_CONTRACT.md`. The QEMU Smoke
+  `fuse-vm-test`, `fuse-inode-metadata-validation`, `qemu-ublk-smoke`,
+  `qemu-ublk-qid-tag-runtime`, `receipt-bound-reclaim-runtime`,
+  `scrub-foreground-read-runtime`, and `all`; `.github/workflows/qemu-smoke.yml`
+  remains the exact source for matrix commands, output directories, artifact
+  upload names, and retention. Except for the standing `master` smoke target,
+  non-default targets and `all` are manual validation tiers; dispatch them only
+  when the issue or pull request validation tier names the row set. QEMU Smoke
+  artifacts are not xfstests, RDMA, release-candidate, broad filesystem
+  correctness, product-readiness, performance-comparator, or
+  successor/comparator evidence unless the relevant validation tier and
+  dedicated evidence authority say so. The QEMU Smoke
   `kernel-fsync-validation` and `kernel-mmap-validation` rows are focused
   runtime evidence surfaces. Dedicated workflows with the same flake refs remain
   separate validation lanes when an issue tier requires standalone fsync/mmap
