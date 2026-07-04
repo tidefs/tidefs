@@ -308,6 +308,13 @@ If the assertions fail, the step exits non-zero and the evidence index is not
 uploaded. An index that passes self-validation is structurally self-consistent
 but does not assert lane-level correctness or product readiness.
 
+The `tidefs-xtask release-readiness-verdict` command is the executable
+fail-closed consumer for a downloaded
+`release-candidate-evidence-index/index.json`. It reads that path explicitly
+alongside the claim registry, source identity, and any other admission inputs,
+then emits a separate verdict artifact. The evidence index remains an input to
+that verdict boundary and still carries `product_readiness: not_claimed`.
+
 ---
 
 ## Lane-Local Manifest Handling
