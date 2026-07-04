@@ -21,6 +21,7 @@ use std::sync::Arc;
 
 use clap::Subcommand;
 use tidefs_local_filesystem::{RootAuthenticationKey, ROOT_AUTHENTICATION_ENV_VAR};
+use tidefs_vfs_engine::LivePoolAdminArg;
 
 /// Subcommands for the `tidefsctl block` group.
 #[derive(Subcommand, Debug)]
@@ -203,12 +204,15 @@ fn handle_attach(
 ) -> Result<(), String> {
     let _guard = super::authz::require_local_only("block attach");
 
-    let live_args = serde_json::json!({
-        "nr_hw_queues": nr_hw_queues,
-        "queue_depth": queue_depth,
-        "drain_deadline_secs": drain_deadline_secs,
-        "io_uring": io_uring,
-    });
+    let live_args = super::live_owner::live_admin_args([
+        ("nr_hw_queues", LivePoolAdminArg::U64(nr_hw_queues.into())),
+        ("queue_depth", LivePoolAdminArg::U64(queue_depth.into())),
+        (
+            "drain_deadline_secs",
+            LivePoolAdminArg::U64(drain_deadline_secs),
+        ),
+        ("io_uring", LivePoolAdminArg::Bool(io_uring)),
+    ]);
 
     let Some(pool_path) = backing_dir else {
         super::live_owner::route_with_args("block", "attach", pool, live_args);
@@ -450,11 +454,14 @@ fn handle_block_send(
 ) -> Result<(), String> {
     let _guard = super::authz::require_local_only("block send");
 
-    let live_args = serde_json::json!({
-        "target_addr": target_addr.to_string(),
-        "node_id": node_id,
-        "server_node_id": server_node_id,
-    });
+    let live_args = super::live_owner::live_admin_args([
+        (
+            "target_addr",
+            LivePoolAdminArg::String(target_addr.to_string()),
+        ),
+        ("node_id", LivePoolAdminArg::U64(node_id)),
+        ("server_node_id", LivePoolAdminArg::U64(server_node_id)),
+    ]);
 
     let Some(pool_path) = backing_dir else {
         super::live_owner::route_with_args("block", "send", pool, live_args);
@@ -514,11 +521,14 @@ fn handle_block_receive(
 ) -> Result<(), String> {
     let _guard = super::authz::require_local_only("block receive");
 
-    let live_args = serde_json::json!({
-        "source_addr": source_addr.to_string(),
-        "node_id": node_id,
-        "server_node_id": server_node_id,
-    });
+    let live_args = super::live_owner::live_admin_args([
+        (
+            "source_addr",
+            LivePoolAdminArg::String(source_addr.to_string()),
+        ),
+        ("node_id", LivePoolAdminArg::U64(node_id)),
+        ("server_node_id", LivePoolAdminArg::U64(server_node_id)),
+    ]);
 
     let Some(pool_path) = backing_dir else {
         super::live_owner::route_with_args("block", "receive", pool, live_args);

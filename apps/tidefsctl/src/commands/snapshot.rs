@@ -17,6 +17,7 @@ use tidefs_local_filesystem::{
 };
 use tidefs_local_object_store::StoreOptions;
 use tidefs_transport::{NodeInfo, SessionCloseReason, Transport};
+use tidefs_vfs_engine::{LivePoolAdminArg, LivePoolAdminArgs};
 
 // ---------------------------------------------------------------------------
 // Snapshot network transfer protocol (simple VFSSEND1 push/pull via VSNP)
@@ -928,7 +929,7 @@ fn open_filesystem(
         devices,
         operation,
         recovery_policy,
-        serde_json::Value::Null,
+        LivePoolAdminArgs::default(),
     )
 }
 
@@ -938,7 +939,7 @@ fn open_filesystem_with_live_args(
     devices: Option<&[PathBuf]>,
     operation: &str,
     recovery_policy: RecoveryPolicy,
-    live_args: serde_json::Value,
+    live_args: LivePoolAdminArgs,
 ) -> LocalFileSystem {
     if let Some(devs) = devices.filter(|devs| !devs.is_empty()) {
         let pool_name = pool.unwrap_or("<unnamed>");
@@ -1009,7 +1010,7 @@ fn import_devices_metadata_dir(
     devices: &[PathBuf],
     pool_name: &str,
     operation: &str,
-    live_args: serde_json::Value,
+    live_args: LivePoolAdminArgs,
 ) -> PathBuf {
     let config = scan_device_pool_config(pool_name, devices, operation);
     super::live_owner::route_or_refuse_active_for_uuid_with_args(
@@ -1369,7 +1370,7 @@ fn snapshot_backing_path(
     pool: Option<&str>,
     devices: Option<&[PathBuf]>,
     operation: &str,
-    live_args: serde_json::Value,
+    live_args: LivePoolAdminArgs,
 ) -> PathBuf {
     match (backing_dir, pool, devices.filter(|devs| !devs.is_empty())) {
         (Some(p), _, _) => {
@@ -1383,7 +1384,7 @@ fn snapshot_backing_path(
             devs,
             pool_name.unwrap_or("<unnamed>"),
             operation,
-            serde_json::Value::Null,
+            LivePoolAdminArgs::default(),
         ),
         (None, Some(pool_name), None) => {
             super::live_owner::route_with_args("snapshot", operation, pool_name, live_args)
@@ -1435,9 +1436,10 @@ fn handle_create(args: SnapshotCreateArgs) {
         args.devices.as_deref(),
         "create",
         RecoveryPolicy::default(),
-        serde_json::json!({
-            "name": &snapshot_name,
-        }),
+        super::live_owner::live_admin_args([(
+            "name",
+            LivePoolAdminArg::String(snapshot_name.clone()),
+        )]),
     );
 
     match fs.create_snapshot(&snapshot_name) {
@@ -1497,10 +1499,10 @@ fn handle_clone_create(args: SnapshotCloneCreateArgs) {
         args.devices.as_deref(),
         "clone create",
         RecoveryPolicy::default(),
-        serde_json::json!({
-            "clone": &clone_name,
-            "source": &source_name,
-        }),
+        super::live_owner::live_admin_args([
+            ("clone", LivePoolAdminArg::String(clone_name.clone())),
+            ("source", LivePoolAdminArg::String(source_name.clone())),
+        ]),
     );
 
     match fs.create_clone(&clone_name, &source_name) {
@@ -1534,9 +1536,10 @@ fn handle_clone_delete(args: SnapshotCloneDeleteArgs) {
         args.devices.as_deref(),
         "clone delete",
         RecoveryPolicy::default(),
-        serde_json::json!({
-            "clone": &clone_name,
-        }),
+        super::live_owner::live_admin_args([(
+            "clone",
+            LivePoolAdminArg::String(clone_name.clone()),
+        )]),
     );
 
     match fs.delete_clone(&clone_name) {
@@ -1569,9 +1572,10 @@ fn handle_clone_promote(args: SnapshotClonePromoteArgs) {
         args.devices.as_deref(),
         "clone promote",
         RecoveryPolicy::default(),
-        serde_json::json!({
-            "clone": &clone_name,
-        }),
+        super::live_owner::live_admin_args([(
+            "clone",
+            LivePoolAdminArg::String(clone_name.clone()),
+        )]),
     );
 
     match fs.promote_clone(&clone_name) {
@@ -1608,10 +1612,10 @@ fn handle_bookmark_create(args: SnapshotBookmarkCreateArgs) {
         args.devices.as_deref(),
         "bookmark create",
         RecoveryPolicy::default(),
-        serde_json::json!({
-            "bookmark": &bookmark_name,
-            "source": &source_name,
-        }),
+        super::live_owner::live_admin_args([
+            ("bookmark", LivePoolAdminArg::String(bookmark_name.clone())),
+            ("source", LivePoolAdminArg::String(source_name.clone())),
+        ]),
     );
 
     match fs.create_bookmark(&bookmark_name, &source_name) {
@@ -1645,9 +1649,10 @@ fn handle_bookmark_delete(args: SnapshotBookmarkDeleteArgs) {
         args.devices.as_deref(),
         "bookmark delete",
         RecoveryPolicy::default(),
-        serde_json::json!({
-            "bookmark": &bookmark_name,
-        }),
+        super::live_owner::live_admin_args([(
+            "bookmark",
+            LivePoolAdminArg::String(bookmark_name.clone()),
+        )]),
     );
 
     match fs.delete_bookmark(&bookmark_name) {
@@ -1680,9 +1685,7 @@ fn handle_hold(args: SnapshotHoldArgs) {
         args.devices.as_deref(),
         "hold",
         RecoveryPolicy::default(),
-        serde_json::json!({
-            "name": &name,
-        }),
+        super::live_owner::live_admin_args([("name", LivePoolAdminArg::String(name.clone()))]),
     );
 
     match fs.hold_snapshot(&name) {
@@ -1707,9 +1710,7 @@ fn handle_release(args: SnapshotReleaseArgs) {
         args.devices.as_deref(),
         "release",
         RecoveryPolicy::default(),
-        serde_json::json!({
-            "name": &name,
-        }),
+        super::live_owner::live_admin_args([("name", LivePoolAdminArg::String(name.clone()))]),
     );
 
     match fs.release_snapshot(&name) {
@@ -1732,9 +1733,10 @@ fn handle_holds(args: SnapshotHoldsArgs) {
         args.devices.as_deref(),
         "holds",
         RecoveryPolicy::ReadOnly,
-        serde_json::json!({
-            "name": name.as_deref(),
-        }),
+        super::live_owner::live_admin_args([(
+            "name",
+            super::live_owner::live_admin_optional_string(name.clone()),
+        )]),
     );
 
     if let Some(name) = name {
@@ -1775,10 +1777,18 @@ fn handle_prune(args: SnapshotPruneArgs) {
         args.devices.as_deref(),
         "prune",
         RecoveryPolicy::default(),
-        serde_json::json!({
-            "keep_latest": args.keep_latest,
-            "max_age_generations": args.max_age_generations,
-        }),
+        super::live_owner::live_admin_args([
+            (
+                "keep_latest",
+                super::live_owner::live_admin_optional_u64(
+                    args.keep_latest.map(|value| value as u64),
+                ),
+            ),
+            (
+                "max_age_generations",
+                super::live_owner::live_admin_optional_u64(args.max_age_generations),
+            ),
+        ]),
     );
 
     match fs.prune_snapshots(policy) {
@@ -1847,9 +1857,10 @@ fn handle_destroy(args: SnapshotDestroyArgs) {
         args.devices.as_deref(),
         "destroy",
         RecoveryPolicy::default(),
-        serde_json::json!({
-            "name": &snapshot_name,
-        }),
+        super::live_owner::live_admin_args([(
+            "name",
+            LivePoolAdminArg::String(snapshot_name.clone()),
+        )]),
     );
 
     // delete_snapshot validates the entry is a Snapshot (not clone/bookmark),
@@ -1879,9 +1890,10 @@ fn handle_rollback(args: SnapshotRollbackArgs) {
         args.devices.as_deref(),
         "rollback",
         RecoveryPolicy::default(),
-        serde_json::json!({
-            "name": &snapshot_name,
-        }),
+        super::live_owner::live_admin_args([(
+            "name",
+            LivePoolAdminArg::String(snapshot_name.clone()),
+        )]),
     );
 
     match fs.rollback_to_snapshot(&snapshot_name) {
@@ -1931,10 +1943,16 @@ fn handle_export(args: SnapshotExportArgs) {
             "snapshot",
             "export",
             store_path,
-            serde_json::json!({
-                "export_path": args.export_path.display().to_string(),
-                "snapshot_name": &snapshot_name,
-            }),
+            super::live_owner::live_admin_args([
+                (
+                    "export_path",
+                    LivePoolAdminArg::String(args.export_path.display().to_string()),
+                ),
+                (
+                    "snapshot_name",
+                    LivePoolAdminArg::String(snapshot_name.clone()),
+                ),
+            ]),
         );
         store_path.clone()
     } else {
@@ -2000,28 +2018,61 @@ fn handle_extract(args: SnapshotExtractArgs) {
         "snapshot",
         "extract",
         &pool_name,
-        serde_json::json!({
-            "snapshot_name": &snapshot_name,
-            "file_path": &file_path,
-            "output": args.output.as_ref().map(|path| path.display().to_string()),
-        }),
+        super::live_owner::live_admin_args([
+            (
+                "snapshot_name",
+                LivePoolAdminArg::String(snapshot_name.clone()),
+            ),
+            ("file_path", LivePoolAdminArg::String(file_path.clone())),
+            (
+                "output",
+                super::live_owner::live_admin_optional_string(
+                    args.output.as_ref().map(|path| path.display().to_string()),
+                ),
+            ),
+        ]),
     );
 }
 
 fn handle_send(args: SnapshotSendArgs) {
     let _guard = super::authz::require_local_only("snapshot send");
 
-    let live_args = serde_json::json!({
-        "output": args.output.as_ref().map(|path| path.display().to_string()),
-        "target_addr": args.target_addr.map(|addr| addr.to_string()),
-        "node_id": args.node_id,
-        "server_node_id": args.server_node_id,
-        "format": &args.format,
-        "incremental": args.incremental,
-        "from_root": args.from_root.as_deref(),
-        "pool_id": args.pool_id.as_deref(),
-        "dataset_id": args.dataset_id.as_deref(),
-    });
+    let live_args = super::live_owner::live_admin_args([
+        (
+            "output",
+            super::live_owner::live_admin_optional_string(
+                args.output.as_ref().map(|path| path.display().to_string()),
+            ),
+        ),
+        (
+            "target_addr",
+            super::live_owner::live_admin_optional_string(
+                args.target_addr.map(|addr| addr.to_string()),
+            ),
+        ),
+        (
+            "node_id",
+            super::live_owner::live_admin_optional_u64(args.node_id),
+        ),
+        (
+            "server_node_id",
+            super::live_owner::live_admin_optional_u64(args.server_node_id),
+        ),
+        ("format", LivePoolAdminArg::String(args.format.clone())),
+        ("incremental", LivePoolAdminArg::Bool(args.incremental)),
+        (
+            "from_root",
+            super::live_owner::live_admin_optional_string(args.from_root.clone()),
+        ),
+        (
+            "pool_id",
+            super::live_owner::live_admin_optional_string(args.pool_id.clone()),
+        ),
+        (
+            "dataset_id",
+            super::live_owner::live_admin_optional_string(args.dataset_id.clone()),
+        ),
+    ]);
     let mut fs = open_filesystem_with_live_args(
         args.backing_dir.as_ref(),
         args.pool.as_deref(),
@@ -2197,14 +2248,33 @@ fn handle_receive(args: SnapshotReceiveArgs) {
     super::live_owner::route_with_args("snapshot", "receive", &args.pool, live_args);
 }
 
-fn snapshot_receive_live_args(args: &SnapshotReceiveArgs) -> serde_json::Value {
-    serde_json::json!({
-        "input": args.input.as_ref().map(|path| path.display().to_string()),
-        "source_addr": args.source_addr.map(|addr| addr.to_string()),
-        "node_id": args.node_id,
-        "server_node_id": args.server_node_id,
-        "merge_policy": args.merge_policy,
-    })
+fn snapshot_receive_live_args(args: &SnapshotReceiveArgs) -> LivePoolAdminArgs {
+    super::live_owner::live_admin_args([
+        (
+            "input",
+            super::live_owner::live_admin_optional_string(
+                args.input.as_ref().map(|path| path.display().to_string()),
+            ),
+        ),
+        (
+            "source_addr",
+            super::live_owner::live_admin_optional_string(
+                args.source_addr.map(|addr| addr.to_string()),
+            ),
+        ),
+        (
+            "node_id",
+            super::live_owner::live_admin_optional_u64(args.node_id),
+        ),
+        (
+            "server_node_id",
+            super::live_owner::live_admin_optional_u64(args.server_node_id),
+        ),
+        (
+            "merge_policy",
+            super::live_owner::live_admin_optional_string(args.merge_policy.clone()),
+        ),
+    ])
 }
 
 #[cfg(test)]
@@ -2366,17 +2436,15 @@ mod tests {
 
         let live_args = snapshot_receive_live_args(&args);
         assert_eq!(
-            live_args.get("input").and_then(|value| value.as_str()),
-            Some("/tmp/stream.vfssend1")
+            live_args.0.get("input"),
+            Some(&LivePoolAdminArg::String("/tmp/stream.vfssend1".into()))
         );
         assert_eq!(
-            live_args
-                .get("source_addr")
-                .and_then(|value| value.as_str()),
-            Some("127.0.0.1:9000")
+            live_args.0.get("source_addr"),
+            Some(&LivePoolAdminArg::String("127.0.0.1:9000".into()))
         );
-        assert!(!live_args.as_object().unwrap().contains_key("devices"));
-        assert!(!live_args.as_object().unwrap().contains_key("backing_dir"));
+        assert!(!live_args.0.contains_key("devices"));
+        assert!(!live_args.0.contains_key("backing_dir"));
     }
 
     #[test]
