@@ -254,12 +254,7 @@ fn raw_decode_then_dispatch_write_and_read_round_trip() {
     let write_result = worker
         .process_one_with_buffers(&mut image, 1, &write_desc, None, Some(&payload))
         .expect("write should succeed");
-    assert_completed(
-        &write_result,
-        1,
-        BlockVolumeRequestClass::Write,
-        4096,
-    );
+    assert_completed(&write_result, 1, BlockVolumeRequestClass::Write, 4096);
     assert_eq!(write_result.byte_count, payload.len());
 
     // Flush to persist
@@ -277,12 +272,7 @@ fn raw_decode_then_dispatch_write_and_read_round_trip() {
     let read_result = worker
         .process_one_with_buffers(&mut image, 3, &read_desc, Some(&mut read_buf), None)
         .expect("read should succeed");
-    assert_completed(
-        &read_result,
-        3,
-        BlockVolumeRequestClass::Read,
-        4096,
-    );
+    assert_completed(&read_result, 3, BlockVolumeRequestClass::Read, 4096);
     assert_eq!(read_buf, payload);
 
     assert_eq!(worker.write_ops, 1);
@@ -314,12 +304,7 @@ fn raw_decode_then_dispatch_fua_write_is_visible_without_explicit_flush() {
     let write_result = worker
         .process_one_with_buffers(&mut image, 4, &desc, None, Some(&payload))
         .expect("fua write should succeed");
-    assert_completed(
-        &write_result,
-        4,
-        BlockVolumeRequestClass::Write,
-        4096,
-    );
+    assert_completed(&write_result, 4, BlockVolumeRequestClass::Write, 4096);
     assert_eq!(write_result.byte_count, payload.len());
 
     // Read back without explicit flush
@@ -330,12 +315,7 @@ fn raw_decode_then_dispatch_fua_write_is_visible_without_explicit_flush() {
         .process_one_with_buffers(&mut image, 5, &read_desc, Some(&mut read_buf), None)
         .expect("read after fua write");
 
-    assert_completed(
-        &read_result,
-        5,
-        BlockVolumeRequestClass::Read,
-        4096,
-    );
+    assert_completed(&read_result, 5, BlockVolumeRequestClass::Read, 4096);
     assert_eq!(read_buf, payload);
 }
 
@@ -598,12 +578,7 @@ fn raw_decode_read_at_last_valid_block_succeeds() {
     let result = worker
         .process_one(&mut image, 10, &desc)
         .expect("last block read should succeed");
-    assert_completed(
-        &result,
-        10,
-        BlockVolumeRequestClass::Read,
-        4096,
-    );
+    assert_completed(&result, 10, BlockVolumeRequestClass::Read, 4096);
     assert_eq!(result.byte_count, geom.block_size_bytes);
 }
 
@@ -622,12 +597,7 @@ fn raw_decode_write_at_last_valid_block_succeeds() {
     let result = worker
         .process_one_with_buffers(&mut image, 11, &desc, None, Some(&write_payload))
         .expect("last block write should succeed");
-    assert_completed(
-        &result,
-        11,
-        BlockVolumeRequestClass::Write,
-        4096,
-    );
+    assert_completed(&result, 11, BlockVolumeRequestClass::Write, 4096);
     assert_eq!(result.byte_count, geom.block_size_bytes);
 }
 

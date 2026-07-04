@@ -32,10 +32,10 @@ bincode = { workspace = true }
 blake3 = "1"
 tidefs-witness-set = { workspace = true }
 serde = { version = "1", features = ["derive"] }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-serde_json = { workspace = true }
 tidefs-durability-layout = { workspace = true }
 
 [lib]

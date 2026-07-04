@@ -69,10 +69,7 @@ pub const fn ublk_cmd_buf_mmap_offset(queue_id: u16) -> Option<u64> {
     if queue_id as u64 > UBLK_QID_BITS_MASK {
         return None;
     }
-    Some(
-        UBLKSRV_CMD_BUF_OFFSET
-            + (queue_id as u64) * (ublk_max_cmd_buf_size() as u64),
-    )
+    Some(UBLKSRV_CMD_BUF_OFFSET + (queue_id as u64) * (ublk_max_cmd_buf_size() as u64))
 }
 
 // Compile-time assertion: UblkSrvIoDesc must match the kernel's struct ublksrv_io_desc size.
