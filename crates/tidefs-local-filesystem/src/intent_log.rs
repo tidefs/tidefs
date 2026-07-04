@@ -7,6 +7,7 @@ use crate::encoding::*;
 use crate::error::FileSystemError;
 use crate::object_keys::*;
 use crate::records::NamespaceCreateIntentRecord;
+use crate::types::InodeRecord;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -275,6 +276,9 @@ pub enum IntentLogEntryKind {
     /// Replayable metadata-only create/mknod intent. The embedded inode
     /// record is the authority for mode, facets, and special-node `rdev`.
     NamespaceCreateIntent(NamespaceCreateIntentRecord),
+    /// Replayable inode metadata setattr/truncate intent. The embedded inode
+    /// record is the post-setattr authority for POSIX metadata and logical size.
+    MetadataSetattrIntent(InodeRecord),
     /// Fast path refused: system under pressure, fell back to full commit.
     PressureFallback,
     /// Marker written during crash-recovery reconcile pass.
@@ -298,6 +302,7 @@ impl IntentLogEntryKind {
             IntentLogEntryKind::FsyncDirtyDrain { .. }
             | IntentLogEntryKind::NamespaceSyncIntent { .. }
             | IntentLogEntryKind::NamespaceCreateIntent(_)
+            | IntentLogEntryKind::MetadataSetattrIntent(_)
             | IntentLogEntryKind::PressureFallback
             | IntentLogEntryKind::CrashReplayReconcile => false,
         }
@@ -333,6 +338,7 @@ const KIND_NAMESPACE_SYNC_INTENT: u8 = 5;
 const KIND_PRESSURE_FALLBACK: u8 = 6;
 const KIND_CRASH_REPLAY_RECONCILE: u8 = 7;
 const KIND_NAMESPACE_CREATE_INTENT: u8 = 8;
+const KIND_METADATA_SETATTR_INTENT: u8 = 9;
 
 // ---------------------------------------------------------------------------
 // Encoding / decoding
@@ -494,6 +500,12 @@ fn try_encode_intent_log_entry(entry: &IntentLogEntry) -> Result<Vec<u8>> {
             out.push(KIND_NAMESPACE_CREATE_INTENT);
             try_encode_namespace_create_intent(&mut out, intent)?;
         }
+        IntentLogEntryKind::MetadataSetattrIntent(inode) => {
+            out.push(KIND_METADATA_SETATTR_INTENT);
+            let inode = try_encode_inode(inode)?;
+            push_u64(&mut out, inode.len() as u64);
+            out.extend_from_slice(&inode);
+        }
         IntentLogEntryKind::PressureFallback => {
             out.push(KIND_PRESSURE_FALLBACK);
         }
@@ -581,6 +593,12 @@ fn decode_intent_log_entry(bytes: &[u8]) -> Result<IntentLogEntry> {
         }
         KIND_NAMESPACE_CREATE_INTENT => {
             IntentLogEntryKind::NamespaceCreateIntent(decode_namespace_create_intent(&mut decoder)?)
+        }
+        KIND_METADATA_SETATTR_INTENT => {
+            let inode_len =
+                decoder.read_count_bounded(decoder.bytes.len().saturating_sub(decoder.offset))?;
+            let inode = decode_inode(&read_decoder_vec(&mut decoder, inode_len)?)?;
+            IntentLogEntryKind::MetadataSetattrIntent(inode)
         }
         KIND_PRESSURE_FALLBACK => IntentLogEntryKind::PressureFallback,
         KIND_CRASH_REPLAY_RECONCILE => IntentLogEntryKind::CrashReplayReconcile,
@@ -785,6 +803,10 @@ fn try_encoded_entry_len(entry: &IntentLogEntry) -> Result<usize> {
             len += 8 + intent.entry.name.len(); // name length + bytes
             len += 8 + 8 + 4 + 4; // inode_id + generation + kind + mode
             len += 8 + try_encode_inode(&intent.inode)?.len(); // inode payload length + bytes
+        }
+        IntentLogEntryKind::MetadataSetattrIntent(inode) => {
+            len += 1; // kind
+            len += 8 + try_encode_inode(inode)?.len(); // inode payload length + bytes
         }
         IntentLogEntryKind::PressureFallback => {
             len += 1; // kind byte only
@@ -1530,6 +1552,45 @@ fn replay_namespace_create_intent(
     Ok(())
 }
 
+fn replay_metadata_setattr_intent(
+    updated: &InodeRecord,
+    state: &mut crate::FileSystemState,
+) -> Result<()> {
+    use std::sync::Arc;
+
+    let current = state
+        .inodes
+        .get(&updated.inode_id)
+        .ok_or(FileSystemError::CorruptState {
+            reason: "intent log replay: metadata setattr inode not found",
+        })?;
+    if current.generation != updated.generation {
+        return Err(FileSystemError::CorruptState {
+            reason: "intent log replay: metadata setattr generation mismatch",
+        });
+    }
+    if current.facets != updated.facets || current.kind() != updated.kind() {
+        return Err(FileSystemError::CorruptState {
+            reason: "intent log replay: metadata setattr kind mismatch",
+        });
+    }
+    if current.rdev != updated.rdev {
+        return Err(FileSystemError::CorruptState {
+            reason: "intent log replay: metadata setattr rdev mismatch",
+        });
+    }
+
+    let content_changed =
+        current.size != updated.size || current.data_version != updated.data_version;
+    Arc::make_mut(&mut state.inodes).insert(updated.inode_id, updated.clone());
+    state.observe_explicit_inode_id(updated.inode_id);
+    state.dirty_inodes.insert(updated.inode_id);
+    if content_changed {
+        state.dirty_content.insert(updated.inode_id);
+    }
+    Ok(())
+}
+
 /// Replay a single intent log entry against the filesystem state.
 ///
 /// Dispatches on [`IntentLogEntryKind`]:
@@ -1539,6 +1600,7 @@ fn replay_namespace_create_intent(
 ///   parent directory dirty.
 /// - NamespaceCreateIntent: restore metadata-only create/mknod inodes and
 ///   directory entries, using the embedded inode record as `rdev` authority.
+/// - MetadataSetattrIntent: restore post-setattr inode metadata and logical size.
 /// - FsyncDirtyDrain / PressureFallback / CrashReplayReconcile: no-op.
 pub(crate) fn replay_entry(
     entry: &IntentLogEntry,
@@ -1702,6 +1764,9 @@ pub(crate) fn replay_entry(
         }
         IntentLogEntryKind::NamespaceCreateIntent(intent) => {
             replay_namespace_create_intent(intent, state)?;
+        }
+        IntentLogEntryKind::MetadataSetattrIntent(updated) => {
+            replay_metadata_setattr_intent(updated, state)?;
         }
     }
     Ok(())
@@ -1963,6 +2028,11 @@ pub(crate) fn batched_replay_uncommitted(
                 batcher.push(*inode_id, *offset, *length, payload);
             }
             // Non-write entries are replayed individually.
+            IntentLogEntryKind::MetadataSetattrIntent(_) => {
+                count += batcher.flush(state, store)?;
+                replay_entry(entry, state, store)?;
+                count += 1;
+            }
             _ => {
                 replay_entry(entry, state, store)?;
                 count += 1;
@@ -2169,6 +2239,35 @@ mod tests {
     }
 
     #[test]
+    fn round_trip_metadata_setattr_intent_preserves_inode_record() {
+        let mut inode = special_inode(InodeId::new(45), NodeKind::File, S_IFREG | 0o600, 0);
+        inode.uid = 1000;
+        inode.gid = 1001;
+        inode.size = 4096;
+        inode.data_version = 7;
+        inode.metadata_version = 8;
+        inode.posix_time = crate::types::PosixTimeRecord::new(11, 22, 33, 44);
+        inode.subtree_rev = 3;
+        let entry = IntentLogEntry {
+            entry_id: 45,
+            entry_kind: IntentLogEntryKind::MetadataSetattrIntent(inode.clone()),
+            root_anchor: test_root_anchor(),
+            timestamp_ns: test_timestamp(),
+        };
+
+        let bytes = encode_intent_log_entry(&entry);
+        let decoded = decode_intent_log_entry(&bytes).expect("decode");
+        match &decoded.entry_kind {
+            IntentLogEntryKind::MetadataSetattrIntent(decoded_inode) => {
+                assert_eq!(decoded_inode, &inode);
+                assert!(!decoded.entry_kind.references_data_inode(inode.inode_id));
+                assert!(!decoded.entry_kind.is_namespace_sync_for_dir(ROOT_INODE_ID));
+            }
+            _ => panic!("wrong kind"),
+        }
+    }
+
+    #[test]
     fn replayable_data_reference_excludes_barrier_and_namespace_markers() {
         let inode_id = InodeId::new(77);
 
@@ -2209,6 +2308,12 @@ mod tests {
                 affected_inode_ids: vec![inode_id],
                 link_count_deltas: vec![(inode_id, 1)],
             },
+            IntentLogEntryKind::MetadataSetattrIntent(special_inode(
+                inode_id,
+                NodeKind::File,
+                S_IFREG | 0o644,
+                0,
+            )),
             IntentLogEntryKind::PressureFallback,
             IntentLogEntryKind::CrashReplayReconcile,
         ];
@@ -3105,6 +3210,17 @@ mod tests {
                 root_anchor: test_root_anchor(),
                 timestamp_ns: ts,
             },
+            IntentLogEntry {
+                entry_id: 4,
+                entry_kind: IntentLogEntryKind::MetadataSetattrIntent(special_inode(
+                    InodeId::new(104),
+                    NodeKind::File,
+                    S_IFREG | 0o600,
+                    0,
+                )),
+                root_anchor: test_root_anchor(),
+                timestamp_ns: ts,
+            },
         ];
         for entry in &cases {
             let encoded = try_encode_intent_log_entry(entry).expect("encode");
@@ -3538,6 +3654,36 @@ mod tests {
     }
 
     #[test]
+    fn replay_metadata_setattr_intent_restores_post_setattr_record() {
+        let (mut store, _dir) = test_store();
+        let mut state = minimal_state();
+        let file_id = InodeId::new(260);
+        make_test_inode(&mut state, file_id, 0);
+
+        let mut updated = state.inodes.get(&file_id).expect("inode").clone();
+        updated.mode = S_IFREG | 0o600;
+        updated.uid = 1000;
+        updated.gid = 1001;
+        updated.size = 4096;
+        updated.data_version = 5;
+        updated.metadata_version = 6;
+        updated.posix_time = crate::types::PosixTimeRecord::new(10, 20, 30, 40);
+        updated.subtree_rev = 2;
+        let entry = IntentLogEntry {
+            entry_id: 260,
+            entry_kind: IntentLogEntryKind::MetadataSetattrIntent(updated.clone()),
+            root_anchor: anchor_for_tx(2),
+            timestamp_ns: 0,
+        };
+
+        replay_entry(&entry, &mut state, &mut store).expect("replay metadata setattr");
+
+        assert_eq!(state.inodes.get(&file_id), Some(&updated));
+        assert!(state.dirty_inodes.contains(&file_id));
+        assert!(state.dirty_content.contains(&file_id));
+    }
+
+    #[test]
     fn replay_uncommitted_skips_committed_entries() {
         let (mut store, _dir) = test_store();
         let mut state = minimal_state();
@@ -3856,6 +4002,36 @@ mod tests {
         let record = state.inodes.get(&file_id).unwrap();
         assert_eq!(record.size, 12);
         assert_eq!(record.nlink, 2);
+    }
+
+    #[test]
+    fn batched_replay_flushes_before_metadata_setattr_intent() {
+        let (mut store, _dir) = test_store();
+        let mut state = minimal_state();
+        let file_id = InodeId::new(72);
+        make_test_inode(&mut state, file_id, 0);
+
+        let mut truncated = state.inodes.get(&file_id).expect("inode").clone();
+        truncated.size = 2;
+        truncated.data_version = 3;
+        truncated.metadata_version = 3;
+        truncated.subtree_rev = 1;
+
+        let entries = vec![
+            make_write_entry(&mut store, 0, file_id, 0, b"aaaa", 2),
+            IntentLogEntry {
+                entry_id: 1,
+                entry_kind: IntentLogEntryKind::MetadataSetattrIntent(truncated.clone()),
+                root_anchor: anchor_for_tx(3),
+                timestamp_ns: 0,
+            },
+        ];
+
+        let log = log_from_entries(entries);
+        let count =
+            batched_replay_uncommitted(&log, &mut state, &mut store, 0).expect("batched replay");
+        assert_eq!(count, 2);
+        assert_eq!(state.inodes.get(&file_id), Some(&truncated));
     }
 
     #[test]

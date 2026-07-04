@@ -3,8 +3,9 @@
 //!
 //! Produces tier-classified validation output for FUSE userspace inode
 //! attribute operations (getattr, setattr with size/mode/owner/timestamps,
-//! stat, chmod, chown, utimens) exercising correctness and committed-root
-//! crash-consistency verification across crash-mount-verify cycles.
+//! stat, chmod, chown, utimens). Mounted runtime logs may advance clean and
+//! post-crash readback rows; rows without matching runtime evidence remain
+//! explicitly blocked or refused.
 //!
 //! FUSE getattr and setattr handlers are implemented with intent-log crash
 //! safety. This module produces the validation output rows exercising the
@@ -283,10 +284,36 @@ pub struct AttrMetadataValidationReport {
     pub collected_at: String,
     /// Environment description (host kernel, FUSE availability, backend).
     pub environment: String,
+    /// Artifact or workflow scope that produced or owns the row observations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_scope: Option<String>,
     /// Individual validation rows.
     pub rows: Vec<AttrMetadataValidationRow>,
     /// Register status after this validation collection.
     pub register_status: AttrMetadataRegisterStatus,
+}
+
+/// Summary of row observations applied from a mounted runtime log.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct AttrMetadataRuntimeApplySummary {
+    pub observed_rows: usize,
+    pub ignored_lines: usize,
+    pub pass: usize,
+    pub fail: usize,
+    pub refusal: usize,
+    pub blocked: usize,
+}
+
+impl AttrMetadataRuntimeApplySummary {
+    fn record(&mut self, outcome: AttrOutcome) {
+        self.observed_rows += 1;
+        match outcome {
+            AttrOutcome::Pass => self.pass += 1,
+            AttrOutcome::Fail => self.fail += 1,
+            AttrOutcome::Refusal => self.refusal += 1,
+            AttrOutcome::Blocked => self.blocked += 1,
+        }
+    }
 }
 
 /// What this validation implies for the FUSE inode metadata register entry.
@@ -365,8 +392,51 @@ impl AttrMetadataValidationReport {
             commit: commit.to_string(),
             collected_at: collected_at.to_string(),
             environment: environment.to_string(),
+            artifact_scope: None,
             rows: canonical_fuse_inode_metadata_rows(),
             register_status: AttrMetadataRegisterStatus::Advanced,
+        }
+    }
+
+    /// Create the issue #1770 baseline with every blocked row explained.
+    ///
+    /// This records the current boundary without converting existing mounted
+    /// tests or harness presence into runtime evidence. A mounted runtime log
+    /// can then be applied with [`Self::apply_runtime_log`].
+    pub fn issue_1770_baseline(
+        commit: &str,
+        collected_at: &str,
+        environment: &str,
+        artifact_scope: &str,
+    ) -> Self {
+        let mut report = Self::new(commit, collected_at, environment);
+        report.set_artifact_scope(artifact_scope);
+        report.apply_issue_1770_blockers();
+        report
+    }
+
+    /// Set the report-level artifact scope.
+    pub fn set_artifact_scope(&mut self, artifact_scope: impl Into<String>) {
+        self.artifact_scope = Some(artifact_scope.into());
+    }
+
+    /// Attach explicit blockers for the current issue #1770 boundary.
+    pub fn apply_issue_1770_blockers(&mut self) {
+        for row in &mut self.rows {
+            row.outcome = AttrOutcome::Blocked;
+            row.output_note = None;
+            row.blocker = Some(match row.tier {
+                AttrValidationTier::CleanRoundTrip => match row.op_kind {
+                    AttrOp::Getattr => "pending mounted userspace artifact; apps/tidefs-posix-filesystem-adapter-daemon/tests/getattr_stat_smoke.rs can satisfy clean getattr after execution".to_string(),
+                    AttrOp::SetattrSize => "pending mounted userspace artifact; crates/tidefs-validation/tests/metadata_ops.rs truncate rows can satisfy clean setattr-size after execution".to_string(),
+                    AttrOp::SetattrMode | AttrOp::Chmod => "pending mounted userspace artifact; crates/tidefs-validation/tests/metadata_ops.rs chmod rows can satisfy clean mode metadata after execution".to_string(),
+                    AttrOp::SetattrOwner | AttrOp::Chown => "pending mounted userspace artifact; crates/tidefs-validation/tests/metadata_ops.rs chown rows require root-capable mounted execution or an explicit environment refusal".to_string(),
+                    AttrOp::SetattrTimestamps | AttrOp::Utimens => "pending mounted userspace artifact; crates/tidefs-validation/tests/metadata_ops.rs utimens rows can satisfy clean timestamp metadata after execution".to_string(),
+                },
+                AttrValidationTier::CrashDuringMutation => "blocked: no mounted FUSE fault-injection harness currently crashes inside the metadata mutation window for this row".to_string(),
+                AttrValidationTier::PostCrashReadback => "pending fuse-inode-metadata-validation runtime artifact; existing crash tests cover selected data/mode rows but not all eight metadata operations until the row lane records readback".to_string(),
+                AttrValidationTier::CommittedRootVerify => "blocked: current mounted FUSE inode metadata lane does not verify a committed-root hash chain for this row".to_string(),
+            });
         }
     }
 
@@ -415,6 +485,45 @@ impl AttrMetadataValidationReport {
             }
         }
         false
+    }
+
+    /// Apply row observations emitted by the mounted FUSE metadata lane.
+    ///
+    /// Accepted lines are of the form `PASS: row-name`,
+    /// `FAIL: row-name -- reason`, `REFUSAL: row-name -- reason`, or
+    /// `BLOCKED: row-name -- reason`. Non-row harness status lines are ignored.
+    pub fn apply_runtime_log(
+        &mut self,
+        log: &str,
+        artifact_scope: &str,
+    ) -> AttrMetadataRuntimeApplySummary {
+        self.set_artifact_scope(artifact_scope);
+        let mut summary = AttrMetadataRuntimeApplySummary::default();
+
+        for line in log.lines() {
+            let Some((outcome, row_name, detail)) = parse_runtime_row_line(line) else {
+                continue;
+            };
+
+            if let Some(row) = self.rows.iter_mut().find(|row| row.name == row_name) {
+                row.outcome = outcome;
+                row.blocker = match outcome {
+                    AttrOutcome::Pass => None,
+                    AttrOutcome::Fail | AttrOutcome::Refusal | AttrOutcome::Blocked => {
+                        detail.clone()
+                    }
+                };
+                row.output_note = Some(match detail {
+                    Some(detail) => format!("{artifact_scope}: {detail}"),
+                    None => artifact_scope.to_string(),
+                });
+                summary.record(outcome);
+            } else {
+                summary.ignored_lines += 1;
+            }
+        }
+
+        summary
     }
 
     /// Apply an outcome to all rows of a given op_kind.
@@ -472,6 +581,9 @@ impl AttrMetadataValidationReport {
             "Commit: `{}`  \nCollected: {}  \nEnvironment: {}\n\n",
             self.commit, self.collected_at, self.environment,
         ));
+        if let Some(artifact_scope) = &self.artifact_scope {
+            out.push_str(&format!("Artifact scope: `{artifact_scope}`\n\n"));
+        }
 
         let (pass, fail, refusal, blocked) = self.count_by_outcome();
         out.push_str("## Summary\n\n");
@@ -512,6 +624,42 @@ impl AttrMetadataValidationReport {
         out.push('\n');
 
         out
+    }
+}
+
+fn parse_runtime_row_line(line: &str) -> Option<(AttrOutcome, String, Option<String>)> {
+    let line = line.trim();
+    let (outcome, rest) = if let Some(rest) = line.strip_prefix("PASS:") {
+        (AttrOutcome::Pass, rest)
+    } else if let Some(rest) = line.strip_prefix("FAIL:") {
+        (AttrOutcome::Fail, rest)
+    } else if let Some(rest) = line.strip_prefix("REFUSAL:") {
+        (AttrOutcome::Refusal, rest)
+    } else if let Some(rest) = line.strip_prefix("BLOCKED:") {
+        (AttrOutcome::Blocked, rest)
+    } else {
+        return None;
+    };
+
+    let rest = rest.trim();
+    let (row_name, detail) = rest
+        .split_once(" -- ")
+        .map_or((rest, None), |(name, detail)| {
+            let detail = detail.trim();
+            (
+                name.trim(),
+                if detail.is_empty() {
+                    None
+                } else {
+                    Some(detail.to_string())
+                },
+            )
+        });
+
+    if row_name.is_empty() {
+        None
+    } else {
+        Some((outcome, row_name.to_string(), detail))
     }
 }
 
@@ -812,6 +960,117 @@ mod tests {
         assert_eq!(readback, 32);
         assert_eq!(verify, 0);
     }
+
+    #[test]
+    fn issue_1770_baseline_explains_every_blocked_row() {
+        let report = AttrMetadataValidationReport::issue_1770_baseline(
+            "abc123",
+            "2026-07-02T00:00:00Z",
+            "mounted FUSE runtime pending",
+            "workflow_dispatch:qemu-smoke:fuse-inode-metadata-validation",
+        );
+
+        assert_eq!(
+            report.artifact_scope.as_deref(),
+            Some("workflow_dispatch:qemu-smoke:fuse-inode-metadata-validation")
+        );
+        let (pass, fail, refusal, blocked) = report.count_by_outcome();
+        assert_eq!((pass, fail, refusal, blocked), (0, 0, 0, 32));
+        for row in &report.rows {
+            assert!(
+                row.blocker
+                    .as_deref()
+                    .is_some_and(|blocker| !blocker.is_empty()),
+                "{} should carry an explicit blocker",
+                row.name
+            );
+        }
+    }
+
+    #[test]
+    fn issue_1770_baseline_does_not_claim_crash_or_root_verification() {
+        let report = AttrMetadataValidationReport::issue_1770_baseline(
+            "abc123",
+            "2026-07-02T00:00:00Z",
+            "mounted FUSE runtime pending",
+            "pending artifact",
+        );
+
+        for row in report.rows.iter().filter(|row| {
+            matches!(
+                row.tier,
+                AttrValidationTier::CrashDuringMutation | AttrValidationTier::CommittedRootVerify
+            )
+        }) {
+            assert_eq!(row.outcome, AttrOutcome::Blocked);
+            let blocker = row.blocker.as_deref().unwrap_or_default();
+            assert!(
+                blocker.contains("fault-injection") || blocker.contains("committed-root"),
+                "{} blocker should name the missing proof boundary: {blocker}",
+                row.name
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_log_updates_only_canonical_rows() {
+        let mut report = AttrMetadataValidationReport::issue_1770_baseline(
+            "abc123",
+            "2026-07-02T00:00:00Z",
+            "mounted FUSE runtime",
+            "pending artifact",
+        );
+        let summary = report.apply_runtime_log(
+            "\
+PASS: getattr-clean
+  PASS: setattr-size-readback
+FAIL: setattr-mode-readback -- mode changed after remount
+REFUSAL: chown-clean -- root-capable mounted execution required
+BLOCKED: chmod-crash -- no mid-mutation fault injector
+PASS: metadata_test_exit_zero
+",
+            "actions/run/123/artifacts/fuse-inode-metadata-validation",
+        );
+
+        assert_eq!(summary.observed_rows, 5);
+        assert_eq!(summary.ignored_lines, 1);
+        assert_eq!(summary.pass, 2);
+        assert_eq!(summary.fail, 1);
+        assert_eq!(summary.refusal, 1);
+        assert_eq!(summary.blocked, 1);
+
+        let getattr = report
+            .rows
+            .iter()
+            .find(|row| row.name == "getattr-clean")
+            .unwrap();
+        assert_eq!(getattr.outcome, AttrOutcome::Pass);
+        assert!(getattr.blocker.is_none());
+        assert_eq!(
+            getattr.output_note.as_deref(),
+            Some("actions/run/123/artifacts/fuse-inode-metadata-validation")
+        );
+
+        let mode = report
+            .rows
+            .iter()
+            .find(|row| row.name == "setattr-mode-readback")
+            .unwrap();
+        assert_eq!(mode.outcome, AttrOutcome::Fail);
+        assert_eq!(mode.blocker.as_deref(), Some("mode changed after remount"));
+
+        let untouched = report
+            .rows
+            .iter()
+            .find(|row| row.name == "utimens-verify")
+            .unwrap();
+        assert_eq!(untouched.outcome, AttrOutcome::Blocked);
+        assert!(untouched
+            .blocker
+            .as_deref()
+            .is_some_and(|blocker| blocker.contains("committed-root")));
+    }
+
     #[test]
     fn update_row_finds_by_name() {
         let mut report = AttrMetadataValidationReport::new("x", "y", "z");
