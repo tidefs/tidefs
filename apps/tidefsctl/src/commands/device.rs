@@ -14,6 +14,7 @@ use std::process;
 
 use clap::Subcommand;
 use tidefs_device_removal::admission::DEVICE_REMOVAL_AUTHORITY_KIND;
+use tidefs_vfs_engine::{LivePoolAdminArg, LivePoolAdminArgs};
 
 /// Device management subcommands.
 #[derive(Subcommand, Debug)]
@@ -196,14 +197,26 @@ fn device_remove_live_args(
     replication_factor: u8,
     failure_domain: &str,
     force: bool,
-) -> serde_json::Value {
-    serde_json::json!({
-        "device_path": device_path.to_string_lossy(),
-        "replication_factor": replication_factor,
-        "failure_domain": failure_domain,
-        "force": force,
-        "required_authority": DEVICE_REMOVAL_AUTHORITY_KIND,
-    })
+) -> LivePoolAdminArgs {
+    super::live_owner::live_admin_args([
+        (
+            "device_path",
+            LivePoolAdminArg::String(device_path.to_string_lossy().into_owned()),
+        ),
+        (
+            "replication_factor",
+            LivePoolAdminArg::U64(replication_factor.into()),
+        ),
+        (
+            "failure_domain",
+            LivePoolAdminArg::String(failure_domain.to_string()),
+        ),
+        ("force", LivePoolAdminArg::Bool(force)),
+        (
+            "required_authority",
+            LivePoolAdminArg::String(DEVICE_REMOVAL_AUTHORITY_KIND.to_string()),
+        ),
+    ])
 }
 
 /// Query live device status through the live owner, or fail closed
@@ -418,13 +431,14 @@ mod tests {
         let args = device_remove_live_args(&PathBuf::from("/dev/disk0"), 2, "device", false);
 
         assert_eq!(
-            args.get("required_authority")
-                .and_then(serde_json::Value::as_str),
-            Some(DEVICE_REMOVAL_AUTHORITY_KIND)
+            args.0.get("required_authority"),
+            Some(&LivePoolAdminArg::String(
+                DEVICE_REMOVAL_AUTHORITY_KIND.to_string()
+            ))
         );
         assert_eq!(
-            args.get("device_path").and_then(serde_json::Value::as_str),
-            Some("/dev/disk0")
+            args.0.get("device_path"),
+            Some(&LivePoolAdminArg::String("/dev/disk0".to_string()))
         );
     }
 }
