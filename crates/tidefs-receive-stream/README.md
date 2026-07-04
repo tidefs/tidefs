@@ -1,88 +1,73 @@
 # tidefs-receive-stream
 
-Receive-stream chunk decoding with BLAKE3 verification and object reassembly
-for multi-node state transfer.
+Developer orientation for the receive-stream crate.
 
-This crate completes the send/receive transport pair: it decodes wire-format
-chunk frames produced by `tidefs-send-stream::framer::ChunkFramer`, verifies
-BLAKE3-256 domain-separated authentication tags under the `TransferStream`
-domain, reassembles ordered chunks into complete objects, and dispatches
-received objects to local storage through the `ReceiveDispatch` trait.
+This README describes crate-local APIs and invariants that are visible in the
+source and tests. It does not define send/receive roadmap, snapshot shipping,
+durability admission, or TideFS status decisions. Those decisions live in the
+repository authority docs and claim registry.
 
-## Architecture
+## Crate Scope
 
-```
-Wire bytes --> ChunkDecoder --> FramedChunk (verified)
-                                    |
-                                    v
-                              ObjectAssembler
-                                    |
-                                    v
-                             ReceiveDispatch
-                                    |
-                                    v
-                             Local storage
-```
+`tidefs-receive-stream` decodes receive-stream chunk frames, verifies their
+per-frame authentication tag, reassembles object chunks, and hands assembled
+objects to a caller-provided dispatch implementation. The crate also contains
+receive persistence and session admission helpers used by higher-level receive
+paths.
 
 ## Modules
 
-- **`decoder`** (`ChunkDecoder`, `FramedChunk`, `ChunkDecodeError`):
-  Parses wire-format chunk frames (64-byte header with magic, object_id,
-  offset, chunk_index, total_chunks, payload_len, chunk_flags, and CRC32C
-  header integrity), extracts the payload and 32-byte BLAKE3-256 auth tag,
-  and verifies the tag against the `TransferStream` domain.
+- `decoder` (`ChunkDecoder`, `FramedChunk`, `ChunkDecodeError`): parses frames
+  with a fixed 64-byte header, 32-byte authentication tag, and payload. The
+  decoder validates frame magic, header CRC, payload length, and the BLAKE3
+  domain tag before yielding a `FramedChunk`.
+- `assembler` (`ObjectAssembler`, `AssembledObject`, `AssemblerError`):
+  buffers chunks by object, orders them by chunk index, and yields an
+  `AssembledObject` after all chunks for an object are present.
+- `dispatch` (`ReceiveDispatch`, `NoOpDispatch`, `receive_object`): abstracts
+  object storage behind `store_object` and `flush`. `receive_object` wires
+  decode, assembly, and dispatch for callers that already have frame bytes.
+- `receive_persistence` (`ReceiveContract`, `BaseRootPinLookup`,
+  `ReceivePersistenceBridge`): checks base-root pins, lineage, and generation
+  constraints before handing accepted receive output to persistence.
+- `session`: tracks receiver authority, admission, checkpoint, and refusal
+  state for receive sessions.
 
-- **`assembler`** (`ObjectAssembler`, `AssembledObject`, `AssemblerError`):
-  Buffers and reassembles ordered chunks into complete objects, handling
-  out-of-order arrival via sequence-number ordering. Tracks per-object
-  progress and yields a complete `AssembledObject` when all chunks arrive.
-
-- **`dispatch`** (`ReceiveDispatch` trait, `NoOpDispatch`, `receive_object`):
-  The `ReceiveDispatch` trait abstracts storage backends behind
-  `store_object` and `flush`. A `NoOpDispatch` collects objects into a
-  `Vec` for testing. The top-level `receive_object()` entry point runs
-  the full pipeline: decode, assemble, dispatch.
-
-## Usage
+## Local API Example
 
 ```rust
 use tidefs_receive_stream::dispatch::{receive_object, NoOpDispatch};
 use tidefs_receive_stream::decoder::ChunkDecoder;
 
 let mut dispatch = NoOpDispatch::new();
-let mut decoder = ChunkDecoder::new(1024 * 1024); // max payload 1 MiB
+let mut decoder = ChunkDecoder::new(1024 * 1024);
+let wire: &[u8] = &[/* frame bytes from a caller-owned source */];
 
-// Wire bytes from send-stream ChunkFramer:
-let wire: &[u8] = &[...];
-
-let (n_objects, n_bytes) = receive_object(&mut decoder, wire, &mut dispatch)
-    .expect("receive pipeline succeeded");
-
+let (n_objects, _n_bytes) = receive_object(&mut decoder, wire, &mut dispatch)?;
 assert_eq!(dispatch.objects_received.len(), n_objects);
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-## Wire Format
+## Test Scope
 
-Each chunk frame on the wire (little-endian):
+At this snapshot, the crate source and tests contain 85 receive-stream tests:
 
-| Offset | Size | Field            |
-|--------|------|------------------|
-| 0      | 4    | magic (0x5653_4352 = "VSCR") |
-| 4      | 32   | object_id        |
-| 36     | 8    | offset (u64)     |
-| 44     | 4    | chunk_index (u32)|
-| 48     | 4    | total_chunks (u32)|
-| 52     | 4    | payload_len (u32)|
-| 56     | 4    | chunk_flags (bit 0 = is_last)|
-| 60     | 4    | header_crc32c (of bytes 0..60)|
-| 64     | 32   | auth_tag (BLAKE3-256, TransferStream domain)|
-| 96     | N    | payload          |
+- 64 unit tests across decoder, assembler, dispatch, receive persistence, and
+  session behavior.
+- 21 integration tests covering send-stream round trips and receive
+  persistence integration.
 
-## Testing
+Treat this count as a source snapshot, not an authority claim. Recount the
+tests before updating it.
 
-```sh
-cargo test -p tidefs-receive-stream
-```
+## Authority Pointers
 
-44 tests: 34 unit (decoder, assembler, dispatch) + 10 cross-crate round-trip
-integration tests with `tidefs-send-stream`.
+Use these repository-level authorities for broader send/receive, snapshot,
+distributed shipping, transform, and claim-gate decisions:
+
+- `docs/SEND_RECEIVE_VERSION_AUTHORITY.md`
+- `docs/SNAPSHOT_CLONE_DEADLIST_AUTHORITY.md`
+- `docs/design/distributed-snapshot-shipping.md`
+- `docs/TRANSFORM_PIPELINE_AUTHORITY.md`
+- `validation/claims.toml`
+- `docs/CLAIM_REGISTRY.md`
