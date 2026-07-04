@@ -19,8 +19,7 @@ const UBLK_COMPLETION_REQUIRED_NON_CLAIMS: &[&str] = &[
     "not_release_or_production_readiness",
     "not_successor_or_comparator_evidence",
 ];
-const UBLK_QID_TAG_RUNTIME_REQUIRED_OPS: &[&str] =
-    &["read", "write", "discard", "write_zeroes"];
+const UBLK_QID_TAG_RUNTIME_REQUIRED_OPS: &[&str] = &["read", "write", "discard", "write_zeroes"];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UblkCompletionArtifactSummary {
@@ -423,9 +422,17 @@ fn validate_ublk_completion_artifact(
     for (state, saw, required) in [
         ("fetch_submitted", saw_fetch_submitted, true),
         ("request_fetched", saw_request_fetched, true),
-        ("request_reissued", saw_request_reissued, require_reissue_and_cqe),
+        (
+            "request_reissued",
+            saw_request_reissued,
+            require_reissue_and_cqe,
+        ),
         ("completion_submitted", saw_completion_submitted, true),
-        ("completion_cqe", saw_completion_cqe, require_reissue_and_cqe),
+        (
+            "completion_cqe",
+            saw_completion_cqe,
+            require_reissue_and_cqe,
+        ),
         ("queue_released", saw_queue_released, true),
     ] {
         if required && !saw {
@@ -769,7 +776,11 @@ mod tests {
     fn rejects_runtime_contract_without_operation_breadth() {
         let text = qid_tag_runtime_artifact(
             UBLK_QID_TAG_RUNTIME_SCENARIO,
-            &[("read", 0, 0, 4096), ("write", 1, 0, 4096), ("write_zeroes", 0, 1, 0)],
+            &[
+                ("read", 0, 0, 4096),
+                ("write", 1, 0, 4096),
+                ("write_zeroes", 0, 1, 0),
+            ],
         );
         assert_invalid_contains(text, "must terminally complete `discard`");
     }
