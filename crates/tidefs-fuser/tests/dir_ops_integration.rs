@@ -9,12 +9,13 @@ use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::path::Path;
 use std::sync::Mutex;
 use std::time::Duration;
 
 use fuser::{
-    FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyDirectory, ReplyDirectoryPlus,
-    ReplyEmpty, ReplyEntry, ReplyOpen, Request, FUSE_ROOT_ID,
+    FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyDirectory,
+    ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyOpen, Request, FUSE_ROOT_ID,
 };
 
 // ---------------------------------------------------------------------------
@@ -22,12 +23,18 @@ use fuser::{
 // ---------------------------------------------------------------------------
 
 type Ino = u64;
+const VALID_MOUNT: tidefs_permission::MountIdentity =
+    tidefs_permission::MountIdentity::new([0x41; 16], 1);
+const DENIED_UID: libc::uid_t = 65_534;
+const DENIED_GID: libc::gid_t = 65_534;
 
 #[derive(Clone, Debug)]
 struct Inode {
     ino: Ino,
     kind: FileType,
     perm: u16,
+    uid: u32,
+    gid: u32,
     nlink: u32,
     /// Directory entries: name bytes -> (child ino, FileType).
     /// Only meaningful when kind == Directory.
@@ -35,7 +42,7 @@ struct Inode {
 }
 
 impl Inode {
-    fn dir(ino: Ino, parent_ino: Ino, perm: u16) -> Self {
+    fn dir(ino: Ino, parent_ino: Ino, perm: u16, uid: u32, gid: u32) -> Self {
         let mut entries = BTreeMap::new();
         entries.insert(b".".to_vec(), (ino, FileType::Directory));
         entries.insert(b"..".to_vec(), (parent_ino, FileType::Directory));
@@ -43,16 +50,20 @@ impl Inode {
             ino,
             kind: FileType::Directory,
             perm,
+            uid,
+            gid,
             nlink: 2,
             entries,
         }
     }
 
-    fn file(ino: Ino, perm: u16) -> Self {
+    fn file(ino: Ino, perm: u16, uid: u32, gid: u32) -> Self {
         Inode {
             ino,
             kind: FileType::RegularFile,
             perm,
+            uid,
+            gid,
             nlink: 1,
             entries: BTreeMap::new(),
         }
@@ -70,8 +81,8 @@ impl Inode {
             kind: self.kind,
             perm: self.perm,
             nlink: self.nlink,
-            uid: 0,
-            gid: 0,
+            uid: self.uid,
+            gid: self.gid,
             rdev: 0,
             blksize: 512,
             flags: 0,
@@ -86,12 +97,35 @@ struct DirTestFS {
 
 impl DirTestFS {
     fn new() -> Self {
-        let root = Inode::dir(FUSE_ROOT_ID, FUSE_ROOT_ID, 0o755);
+        let root = Inode::dir(FUSE_ROOT_ID, FUSE_ROOT_ID, 0o755, 0, 0);
         let mut inodes = BTreeMap::new();
         inodes.insert(FUSE_ROOT_ID, root);
         DirTestFS {
             inodes: Mutex::new(inodes),
             next_ino: Mutex::new(FUSE_ROOT_ID + 1),
+        }
+    }
+
+    fn with_permission_denial_fixture() -> Self {
+        let root = Inode::dir(FUSE_ROOT_ID, FUSE_ROOT_ID, 0o755, 0, 0);
+        let mut private = Inode::dir(FUSE_ROOT_ID + 1, FUSE_ROOT_ID, 0o700, 0, 0);
+        private.entries.insert(
+            b"victim".to_vec(),
+            (FUSE_ROOT_ID + 2, FileType::RegularFile),
+        );
+        let victim = Inode::file(FUSE_ROOT_ID + 2, 0o600, 0, 0);
+        let mut inodes = BTreeMap::new();
+        inodes.insert(FUSE_ROOT_ID, root);
+        inodes
+            .get_mut(&FUSE_ROOT_ID)
+            .unwrap()
+            .entries
+            .insert(b"private".to_vec(), (FUSE_ROOT_ID + 1, FileType::Directory));
+        inodes.insert(FUSE_ROOT_ID + 1, private);
+        inodes.insert(FUSE_ROOT_ID + 2, victim);
+        DirTestFS {
+            inodes: Mutex::new(inodes),
+            next_ino: Mutex::new(FUSE_ROOT_ID + 3),
         }
     }
 
@@ -168,7 +202,7 @@ impl Filesystem for DirTestFS {
         }
 
         let ino = self.alloc_ino();
-        let child = Inode::dir(ino, parent, (mode & 0o777) as u16);
+        let child = Inode::dir(ino, parent, (mode & 0o777) as u16, 0, 0);
 
         if let Some(p) = inodes.get_mut(&parent) {
             p.nlink += 1;
@@ -230,12 +264,12 @@ impl Filesystem for DirTestFS {
         reply.ok();
     }
 
-    fn unlink(&mut self, _req: &Request, parent: Ino, name: &OsStr, reply: ReplyEmpty) {
+    fn unlink(&mut self, req: &Request, parent: Ino, name: &OsStr, reply: ReplyEmpty) {
         let mut inodes = self.lock();
 
-        let child_ino = match inodes.get(&parent) {
+        let (parent_inode, child_ino) = match inodes.get(&parent) {
             Some(p) => match p.entries.get(name.as_bytes()) {
-                Some((ino, _)) => *ino,
+                Some((ino, _)) => (p.clone(), *ino),
                 None => {
                     reply.error(libc::ENOENT);
                     return;
@@ -246,6 +280,34 @@ impl Filesystem for DirTestFS {
                 return;
             }
         };
+        let child = match inodes.get(&child_ino) {
+            Some(child) => child,
+            None => {
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+        let caller_uid = req.uid();
+        let caller_gid = req.gid();
+        let plan = fuser::unlink::handle_unlink(
+            name.as_bytes(),
+            false,
+            parent_inode.perm & libc::S_ISVTX as u16 != 0,
+            caller_uid == child.uid,
+            caller_uid == parent_inode.uid,
+            caller_uid == 0,
+            parent_inode.perm as u32,
+            parent_inode.uid,
+            parent_inode.gid,
+            caller_uid,
+            caller_gid,
+            &[],
+            &VALID_MOUNT,
+        );
+        if let Err(err) = plan {
+            reply.error(err.to_errno());
+            return;
+        }
 
         inodes.remove(&child_ino);
         if let Some(p) = inodes.get_mut(&parent) {
@@ -290,7 +352,7 @@ impl Filesystem for DirTestFS {
         }
 
         let ino = self.alloc_ino();
-        let child = Inode::file(ino, (mode & 0o777) as u16);
+        let child = Inode::file(ino, (mode & 0o777) as u16, 0, 0);
         let attr = child.to_attr();
 
         if let Some(p) = inodes.get_mut(&parent) {
@@ -308,7 +370,7 @@ impl Filesystem for DirTestFS {
 
     fn readdir(
         &mut self,
-        _req: &Request,
+        req: &Request,
         ino: Ino,
         _fh: u64,
         offset: i64,
@@ -326,6 +388,21 @@ impl Filesystem for DirTestFS {
                 return;
             }
         };
+        let plan = fuser::readdir::handle_readdir_with_permission(
+            dir.kind,
+            offset,
+            dir.perm as u32,
+            dir.uid,
+            dir.gid,
+            req.uid(),
+            req.gid(),
+            &[],
+            &VALID_MOUNT,
+        );
+        if let Err(err) = plan {
+            reply.error(err.to_errno());
+            return;
+        }
 
         let entries: Vec<_> = dir.entries.iter().collect();
         for (i, (name, (child_ino, child_kind))) in entries.iter().enumerate().skip(offset as usize)
@@ -344,7 +421,7 @@ impl Filesystem for DirTestFS {
 
     fn readdirplus(
         &mut self,
-        _req: &Request,
+        req: &Request,
         ino: Ino,
         _fh: u64,
         offset: i64,
@@ -362,6 +439,21 @@ impl Filesystem for DirTestFS {
                 return;
             }
         };
+        let plan = fuser::readdir::handle_readdir_with_permission(
+            dir.kind,
+            offset,
+            dir.perm as u32,
+            dir.uid,
+            dir.gid,
+            req.uid(),
+            req.gid(),
+            &[],
+            &VALID_MOUNT,
+        );
+        if let Err(err) = plan {
+            reply.error(err.to_errno());
+            return;
+        }
 
         let entries: Vec<_> = dir.entries.iter().collect();
         for (i, (name, (child_ino, child_kind))) in entries.iter().enumerate().skip(offset as usize)
@@ -411,6 +503,22 @@ impl Filesystem for DirTestFS {
 
 /// Returns (mountpoint_path, BackgroundSession).  Drop the session to unmount.
 fn mount(label: &str) -> (std::path::PathBuf, fuser::BackgroundSession) {
+    mount_with_fs(label, DirTestFS::new(), &[])
+}
+
+fn mount_permission_fixture(label: &str) -> (std::path::PathBuf, fuser::BackgroundSession) {
+    mount_with_fs(
+        label,
+        DirTestFS::with_permission_denial_fixture(),
+        &[MountOption::AllowOther],
+    )
+}
+
+fn mount_with_fs(
+    label: &str,
+    fs: DirTestFS,
+    options: &[MountOption],
+) -> (std::path::PathBuf, fuser::BackgroundSession) {
     let tmpdir = tempfile::tempdir().expect("tempdir");
     if !std::path::Path::new("/dev/fuse").exists() {
         eprintln!("SKIP: /dev/fuse not available");
@@ -419,7 +527,7 @@ fn mount(label: &str) -> (std::path::PathBuf, fuser::BackgroundSession) {
 
     let mnt = tmpdir.path().join(label);
     std::fs::create_dir(&mnt).expect("mkdir mountpoint");
-    let se = match fuser::spawn_mount2(DirTestFS::new(), &mnt, &[]) {
+    let se = match fuser::spawn_mount2(fs, &mnt, options) {
         Ok(session) => session,
         Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
             eprintln!("SKIP: /dev/fuse mount not permitted: {err}");
@@ -429,6 +537,57 @@ fn mount(label: &str) -> (std::path::PathBuf, fuser::BackgroundSession) {
     };
     std::thread::sleep(std::time::Duration::from_millis(50));
     (mnt, se)
+}
+
+fn run_as_denied_user(op: impl FnOnce() -> std::io::Result<()>) -> i32 {
+    if unsafe { libc::geteuid() } != 0 {
+        eprintln!("SKIP: permission-denial runtime row requires root to drop credentials");
+        std::process::exit(0);
+    }
+
+    let pid = unsafe { libc::fork() };
+    assert!(pid >= 0, "fork failed");
+    if pid == 0 {
+        if unsafe { libc::setgid(DENIED_GID) } != 0 {
+            let code = std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO);
+            unsafe { libc::_exit(code) };
+        }
+        if unsafe { libc::setuid(DENIED_UID) } != 0 {
+            let code = std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO);
+            unsafe { libc::_exit(code) };
+        }
+        let code = match op() {
+            Ok(()) => 0,
+            Err(err) => err.raw_os_error().unwrap_or(libc::EIO),
+        };
+        unsafe { libc::_exit(code) };
+    }
+
+    let mut status = 0;
+    let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+    assert_eq!(waited, pid, "waitpid failed");
+    assert!(
+        libc::WIFEXITED(status),
+        "child did not exit normally: {status}"
+    );
+    libc::WEXITSTATUS(status)
+}
+
+fn denied_user_readdir_errno(path: &Path) -> i32 {
+    run_as_denied_user(|| {
+        for entry in std::fs::read_dir(path)? {
+            entry?;
+        }
+        Ok(())
+    })
+}
+
+fn denied_user_unlink_errno(path: &Path) -> i32 {
+    run_as_denied_user(|| std::fs::remove_file(path))
 }
 
 // ---------------------------------------------------------------------------
@@ -586,6 +745,15 @@ fn readdir_on_file_returns_enotdir() {
 
 #[test]
 #[cfg(target_os = "linux")]
+fn readdir_denies_unreadable_directory_without_default_permissions() {
+    let (mnt, _bg) = mount_permission_fixture("readdir-eacces");
+
+    let errno = denied_user_readdir_errno(&mnt.join("private"));
+    assert_eq!(errno, libc::EACCES);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
 fn readdirplus_dir_with_children() {
     let (mnt, _bg) = mount("readdirplus");
     std::fs::create_dir(mnt.join("sub")).expect("mkdir");
@@ -651,6 +819,17 @@ fn combined_mkdir_create_readdir_unlink_rmdir() {
     // rmdir
     std::fs::remove_dir(mnt.join("d")).expect("rmdir");
     assert!(!mnt.join("d").exists());
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn unlink_denies_unwritable_parent_without_default_permissions() {
+    let (mnt, _bg) = mount_permission_fixture("unlink-eacces");
+    let victim = mnt.join("private").join("victim");
+
+    let errno = denied_user_unlink_errno(&victim);
+    assert_eq!(errno, libc::EACCES);
+    assert!(victim.exists(), "denied unlink must not remove victim");
 }
 
 // ---------------------------------------------------------------------------
