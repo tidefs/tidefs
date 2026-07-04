@@ -1589,9 +1589,7 @@ fn handle_pool_export(pool_name: String, devices: Option<Vec<PathBuf>>, force: b
                 "pool",
                 "export",
                 &pool_name,
-                serde_json::json!({
-                    "force": force,
-                }),
+                pool_export_live_args(force),
             );
         }
     };
@@ -1604,9 +1602,7 @@ fn handle_pool_export(pool_name: String, devices: Option<Vec<PathBuf>>, force: b
         &pool_name,
         config.pool_uuid,
         config.state == tidefs_types_pool_label_core::PoolState::Active,
-        serde_json::json!({
-            "force": force,
-        }),
+        pool_export_live_args(force),
     );
 
     let lock_dir = PathBuf::from("/run/tidefs/import");
@@ -1699,6 +1695,10 @@ fn pool_destroy_live_args(force: bool, zero_superblock: bool) -> LivePoolAdminAr
     ])
 }
 
+fn pool_export_live_args(force: bool) -> LivePoolAdminArgs {
+    super::live_owner::live_admin_args([("force", LivePoolAdminArg::Bool(force))])
+}
+
 // ---------------------------------------------------------------------------
 // Pool property handlers
 // ---------------------------------------------------------------------------
@@ -1752,9 +1752,10 @@ fn handle_pool_get(pool: &str, devices: Option<&[PathBuf]>, property: &str) {
         devices,
         "get",
         RecoveryPolicy::ReadOnly,
-        serde_json::json!({
-            "property": property,
-        }),
+        super::live_owner::live_admin_args([(
+            "property",
+            LivePoolAdminArg::String(property.to_string()),
+        )]),
     );
 
     let registry = tidefs_dataset_properties::build_registry();
@@ -1789,9 +1790,10 @@ fn handle_pool_set(pool: &str, devices: Option<&[PathBuf]>, assignment: &str) {
         devices,
         "set",
         RecoveryPolicy::default(),
-        serde_json::json!({
-            "assignment": assignment,
-        }),
+        super::live_owner::live_admin_args([(
+            "assignment",
+            LivePoolAdminArg::String(assignment.to_string()),
+        )]),
     );
 
     let (prop_name, prop_val_str) = match assignment.split_once('=') {
@@ -1863,9 +1865,10 @@ fn handle_pool_list_props(pool: &str, devices: Option<&[PathBuf]>, family: Optio
         devices,
         "list-props",
         RecoveryPolicy::ReadOnly,
-        serde_json::json!({
-            "family": family,
-        }),
+        super::live_owner::live_admin_args([(
+            "family",
+            super::live_owner::live_admin_optional_string(family.map(str::to_string)),
+        )]),
     );
 
     let registry = tidefs_dataset_properties::build_registry();
