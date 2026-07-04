@@ -28,6 +28,8 @@ developer entry points are mount, smoke-mount, VFS-backed mount, POSIX
 scoreboard, coverage-gap diagnostics, charter rendering, and receipt-demo
 diagnostics.
 
-Worked commands and debugging notes live in `docs/GETTING_STARTED.md` and
-`docs/DEBUGGING_WORKFLOWS.md`. Validation scope and required GitHub Actions
-lanes belong in the issue or pull request that changes the adapter behavior.
+Current entry-point commands live in `docs/GETTING_STARTED.md`; CI lane and
+artifact authority lives in `docs/GITHUB_CI.md`; xfstests scoreboard details
+live in `docs/xfstests-harness.md`. Validation scope and required GitHub
+Actions lanes belong in the issue or pull request that changes the adapter
+behavior.
