@@ -1,10 +1,10 @@
-# TideFS: FUSE long-haul product demo soak validation.
+# TideFS: FUSE long-haul mounted runtime evidence soak.
 #
 # Boots a Linux 7.0 QEMU guest, creates a TideFS pool, mounts via FUSE, runs
 # sustained create/write/read/snapshot/recovery workload cycles, and produces
-# tier-classified validation rows.
+# runtime-evidence validation rows.
 #
-# Validation tier: Tier 3 mounted userspace/QEMU FUSE runtime.
+# Evidence class: mounted-userspace/qemu-guest FUSE runtime evidence.
 {
   pkgs,
   linuxKernel_7_0,
@@ -24,7 +24,7 @@ let
     TIDEFSCTL="${tidefsPackage}/bin/tidefsctl"
     FUSE_DAEMON="${tidefsPackage}/bin/tidefs-posix-filesystem-adapter-daemon"
 
-    TMPDIR="''${TIDEFS_FUSE_DEMO_SOAK_TMPDIR:-/tmp/tidefs-fuse-product-demo-soak}"
+    TMPDIR="''${TIDEFS_FUSE_DEMO_SOAK_TMPDIR:-/tmp/tidefs-fuse-runtime-evidence-soak}"
     TIMEOUT_SEC="''${TIDEFS_FUSE_DEMO_SOAK_TIMEOUT:-3600}"
     SOAK_CYCLES="''${TIDEFS_FUSE_DEMO_SOAK_CYCLES:-20}"
     DISK_SIZE_MB="''${TIDEFS_FUSE_DEMO_SOAK_DISK_MB:-1024}"
@@ -65,7 +65,7 @@ let
       fi
     done
 
-    echo "=== TideFS FUSE Product Demo Soak ==="
+    echo "=== TideFS FUSE Runtime Evidence Soak ==="
     echo "  Kernel:     $KERNEL_IMG"
     echo "  Cycles:     $SOAK_CYCLES"
     echo "  Timeout:    ''${TIMEOUT_SEC}s"
@@ -597,13 +597,13 @@ if [ -n "$DAEMON_PID" ]; then
 fi
 
 echo ""
-echo "=== FUSE Product Demo Soak Summary ==="
+echo "=== FUSE Runtime Evidence Soak Summary ==="
 echo "PASSED=$PASSED"
 echo "FAILED=$FAILED"
 echo "BLOCKED=$BLOCKED"
 echo "timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-echo "validation_tier=Tier-3-mounted-userspace-QEMU-FUSE-runtime"
-echo "test=fuse-product-demo-soak"
+echo "validation_tier=mounted-userspace/qemu-guest FUSE runtime evidence"
+echo "test=fuse-runtime-evidence-soak"
 echo "soak_cycles_total=$SOAK_N"
 echo "soak_cycles_passed=$CYCLE_PASS"
 echo "soak_cycles_failed=$CYCLE_FAIL"
@@ -646,7 +646,7 @@ INITSCRIPT
 
     # Parse validation rows
     echo ""
-    echo "=== FUSE Product Demo Soak Results ==="
+    echo "=== FUSE Runtime Evidence Soak Results ==="
 
     PASSC=0; FAILC=0; BLOCKC=0
 
@@ -679,13 +679,13 @@ INITSCRIPT
 
     cat > "$VALIDATION_DIR/validation.json" << JSONEOF
 {
-  "run_id": "fuse-product-demo-soak-$EPOCH",
+  "run_id": "fuse-runtime-evidence-soak-$EPOCH",
   "commit": "$COMMIT",
   "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
   "kernel_version": "$KERNEL_VERSION",
   "backend": "block-device",
-  "validation_tier": "Tier-3-mounted-userspace-QEMU-FUSE-runtime",
-  "test": "fuse-product-demo-soak",
+  "validation_tier": "mounted-userspace/qemu-guest FUSE runtime evidence",
+  "test": "fuse-runtime-evidence-soak",
   "qemu_exit_code": $QEMU_RC,
   "soak_cycles_requested": $SOAK_CYCLES,
   "soak_cycles_passed": $SOAK_CYCLES_PASSED,

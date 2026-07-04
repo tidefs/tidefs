@@ -6,8 +6,8 @@
 #   2. Flush/FUA write overhead (plain vs fsync vs FUA writes)
 #      -> per-phase write latency and IOPS
 #
-# Validation tier: Tier 3 QEMU guest ublk/block-volume runtime.
-# Close standard: measured runtime performance validation with command/log/output
+# Evidence class: qemu-guest ublk/block-volume runtime performance evidence.
+# Close standard: measured runtime performance evidence with command/log/output
 # paths (fio JSON output, KPIs, validation manifest).
 #
 # Environment refusal: in environments without /dev/kvm or Linux 7.0,
@@ -459,7 +459,7 @@ cat > /tmp/validation/validation.json << EVIDEOF
   "version": 3,
   "validation_id": "ublk-perf-baseline",
   "kernel_version": "$KVER",
-  "validation_tier": "Tier 3 QEMU guest ublk/block-volume runtime",
+  "validation_tier": "qemu-guest ublk/block-volume runtime performance evidence",
   "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown)",
   "passed": $PASSED,
   "failed": $FAILED,
@@ -523,7 +523,7 @@ INITSCRIPT
 
     echo ""
     echo "=== ublk-perf-baseline complete ==="
-    echo "validation_tier=Tier 3 QEMU guest ublk/block-volume runtime"
+    echo "validation_tier=qemu-guest ublk/block-volume runtime performance evidence"
     echo "qemu_exit_code=$QEMU_EXIT"
     echo "validation_dir=$VALIDATION_DIR"
   '';
