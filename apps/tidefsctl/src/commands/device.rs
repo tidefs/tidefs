@@ -227,12 +227,13 @@ fn handle_device_status(pool_name: String, json: bool) {
             "{}",
             serde_json::to_string_pretty(&refusal_truth.json_value()).unwrap()
         );
+        process::exit(1);
     } else {
         for line in refusal_truth.operator_lines() {
             eprintln!("{line}");
         }
+        super::live_owner::refuse_no_live_status_evidence("device", "status", &pool_name, json);
     }
-    process::exit(1);
 }
 
 #[cfg(test)]
