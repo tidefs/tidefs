@@ -33,7 +33,8 @@ use tidefs_partition_runtime::partition_healing::PartitionHealingProtocol;
 use tidefs_partition_runtime::split_brain_guard::SplitBrainGuard;
 use tidefs_partition_runtime::types::{
     DivergenceClass, PartitionDetectionConfig, PartitionHazardClass, PartitionState,
-    ReachabilityEntry, ReachabilityMatrix, ReceiptFrontier, ReconciliationStrategy,
+    ReachabilityEntry, ReachabilityMatrix, ReceiptFrontier, ReconciliationEvidence,
+    ReconciliationStrategy,
 };
 use tidefs_two_node_harness::{StateObject, TwoNodeHarness};
 
@@ -63,6 +64,37 @@ fn make_frontier(receipt_ids: Vec<u64>, frontier_epoch: u64) -> ReceiptFrontier 
         receipt_ids,
         frontier_epoch: epoch(frontier_epoch),
         frontier_millis: 1000,
+    }
+}
+
+fn evidence_for_strategy(strategy: &ReconciliationStrategy) -> ReconciliationEvidence {
+    match strategy {
+        ReconciliationStrategy::NoneNeeded => ReconciliationEvidence::NoneNeeded {
+            frontier_epoch: epoch(6),
+            verified_at_millis: 1000,
+        },
+        ReconciliationStrategy::Scoped {
+            receipts_to_ship,
+            receipts_to_rollback,
+        } => ReconciliationEvidence::Scoped {
+            shipped_receipts: receipts_to_ship.clone(),
+            rolled_back_receipts: receipts_to_rollback.clone(),
+            verified_at_millis: 1000,
+        },
+        ReconciliationStrategy::FullCatchup {
+            missed_epochs,
+            estimated_receipts,
+        } => ReconciliationEvidence::FullCatchup {
+            replayed_epochs: missed_epochs.clone(),
+            replayed_receipt_count: *estimated_receipts,
+            verified_at_millis: 1000,
+        },
+        ReconciliationStrategy::OperatorEscalation { reason } => {
+            ReconciliationEvidence::OperatorEscalation {
+                reason: reason.clone(),
+                admitted_at_millis: 1000,
+            }
+        }
     }
 }
 
@@ -203,12 +235,16 @@ fn fence_reset_after_healing() {
 fn healing_protocol_classifies_divergence() {
     let mut healing = PartitionHealingProtocol::new(mid(1));
 
-    healing.exchange_frontiers(
-        make_frontier(vec![1, 2, 3, 4, 5], 5),
-        make_frontier(vec![1, 2, 3], 5),
-    );
+    healing
+        .exchange_frontiers(
+            make_frontier(vec![1, 2, 3, 4, 5], 5),
+            make_frontier(vec![1, 2, 3], 5),
+        )
+        .expect("frontiers are fresh and well-formed");
 
-    let div = healing.classify_divergence();
+    let div = healing
+        .classify_divergence()
+        .expect("frontiers classify without healing-frontier errors");
     assert!(
         matches!(div, DivergenceClass::Divergent { .. }),
         "quorum-has-more should be Divergent, got: {div:?}"
@@ -224,12 +260,16 @@ fn healing_protocol_classifies_divergence() {
 fn healing_protocol_detects_conflicts() {
     let mut healing = PartitionHealingProtocol::new(mid(1));
 
-    healing.exchange_frontiers(
-        make_frontier(vec![1, 2, 3], 5),
-        make_frontier(vec![1, 2, 3, 10, 11, 12], 5),
-    );
+    healing
+        .exchange_frontiers(
+            make_frontier(vec![1, 2, 3], 5),
+            make_frontier(vec![1, 2, 3, 10, 11, 12], 5),
+        )
+        .expect("frontiers are fresh and well-formed");
 
-    let div = healing.classify_divergence();
+    let div = healing
+        .classify_divergence()
+        .expect("frontiers classify without healing-frontier errors");
     assert!(
         matches!(div, DivergenceClass::Conflicts { .. }),
         "minority-only receipts should be Conflicts, got: {div:?}"
@@ -249,19 +289,28 @@ fn healing_protocol_full_lifecycle() {
     assert_eq!(joint_epoch, epoch(6));
     assert_eq!(healing.rejoining_members, vec![mid(2), mid(3)]);
 
-    healing.exchange_frontiers(
-        make_frontier(vec![1, 2, 3, 4, 5], 10),
-        make_frontier(vec![1, 2, 3], 7),
-    );
-    let div = healing.classify_divergence();
+    healing
+        .exchange_frontiers(
+            make_frontier(vec![1, 2, 3, 4, 5], 10),
+            make_frontier(vec![1, 2, 3], 7),
+        )
+        .expect("frontiers are fresh and well-formed");
+    let div = healing
+        .classify_divergence()
+        .expect("frontiers classify without healing-frontier errors");
 
     let missed = healing.compute_missed_epochs();
     let strategy = healing.select_strategy(&div, missed);
     assert!(!matches!(strategy, ReconciliationStrategy::NoneNeeded));
+    let evidence = evidence_for_strategy(&strategy);
 
-    healing.mark_caught_up(mid(2));
+    healing
+        .mark_caught_up(mid(2), evidence.clone())
+        .expect("first rejoining member has reconciliation evidence");
     assert!(!healing.all_caught_up());
-    healing.mark_caught_up(mid(3));
+    healing
+        .mark_caught_up(mid(3), evidence)
+        .expect("second rejoining member has reconciliation evidence");
     assert!(healing.all_caught_up());
 
     healing.complete_healing();
@@ -426,12 +475,16 @@ fn partition_detection_config_timeout_escalation() {
 #[test]
 fn healing_protocol_no_divergence_when_identical() {
     let mut healing = PartitionHealingProtocol::new(mid(1));
-    healing.exchange_frontiers(
-        make_frontier(vec![1, 2, 3], 5),
-        make_frontier(vec![1, 2, 3], 5),
-    );
+    healing
+        .exchange_frontiers(
+            make_frontier(vec![1, 2, 3], 5),
+            make_frontier(vec![1, 2, 3], 5),
+        )
+        .expect("frontiers are fresh and well-formed");
 
-    let div = healing.classify_divergence();
+    let div = healing
+        .classify_divergence()
+        .expect("frontiers classify without healing-frontier errors");
     assert!(matches!(div, DivergenceClass::None));
     assert!(healing.compute_missed_epochs().is_empty());
 }
@@ -441,7 +494,9 @@ fn healing_protocol_no_divergence_when_identical() {
 #[test]
 fn healing_protocol_witness_only_rejoin() {
     let mut healing = PartitionHealingProtocol::new(mid(1));
-    healing.exchange_frontiers(make_frontier(vec![1, 2, 3], 5), make_frontier(vec![], 5));
+    healing
+        .exchange_frontiers(make_frontier(vec![1, 2, 3], 5), make_frontier(vec![], 5))
+        .expect("frontiers are fresh and well-formed");
 
     assert!(healing.is_witness_only_rejoin());
 }
@@ -496,12 +551,16 @@ fn full_partition_lifecycle_detect_fence_heal_converge() {
     assert!(healing.healing_in_progress);
 
     // Exchange frontiers.
-    healing.exchange_frontiers(
-        make_frontier(vec![1, 2, 3, 4, 5], 10),
-        make_frontier(vec![1, 2], 7),
-    );
+    healing
+        .exchange_frontiers(
+            make_frontier(vec![1, 2, 3, 4, 5], 10),
+            make_frontier(vec![1, 2], 7),
+        )
+        .expect("frontiers are fresh and well-formed");
 
-    let div = healing.classify_divergence();
+    let div = healing
+        .classify_divergence()
+        .expect("frontiers classify without healing-frontier errors");
     assert!(
         matches!(div, DivergenceClass::Divergent { .. }),
         "quorum has more receipts"
@@ -515,10 +574,15 @@ fn full_partition_lifecycle_detect_fence_heal_converge() {
         matches!(strategy, ReconciliationStrategy::Scoped { .. })
             || matches!(strategy, ReconciliationStrategy::FullCatchup { .. })
     );
+    let evidence = evidence_for_strategy(&strategy);
 
     // Mark caught up and complete.
-    healing.mark_caught_up(mid(1));
-    healing.mark_caught_up(mid(2));
+    healing
+        .mark_caught_up(mid(1), evidence.clone())
+        .expect("first rejoining member has reconciliation evidence");
+    healing
+        .mark_caught_up(mid(2), evidence)
+        .expect("second rejoining member has reconciliation evidence");
     assert!(healing.all_caught_up());
     healing.complete_healing();
 

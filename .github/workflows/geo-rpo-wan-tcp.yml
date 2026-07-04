@@ -1,0 +1,84 @@
+name: Geo RPO WAN TCP
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_HOME: /var/tmp/tidefs-ci/cargo-home
+  CARGO_INCREMENTAL: 0
+  CARGO_TARGET_DIR: /var/tmp/tidefs-ci/cargo-target/${{ github.run_id }}-${{ github.run_attempt }}
+
+jobs:
+  geo-rpo-wan-tcp:
+    name: Geo RPO WAN/TCP without RDMA
+    if: ${{ github.event_name == 'workflow_dispatch' || vars.TIDEFS_SELF_HOSTED_READY == '1' }}
+    runs-on: [self-hosted, linux, x64, tidefs, nix]
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Prepare output
+        run: mkdir -p validation/artifacts/storage-intent "$CARGO_HOME" "$CARGO_TARGET_DIR"
+
+      - name: Run geo RPO WAN/TCP validation
+        env:
+          TIDEFS_GEO_RPO_EVIDENCE_DIR: validation/artifacts/storage-intent
+          TIDEFS_GEO_RPO_GITHUB_ARTIFACT_NAME: geo-rpo-wan-tcp-validation
+        run: |
+          set -euo pipefail
+          TIDEFS_GENERATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          export TIDEFS_GENERATED_AT
+          nix develop .#ci --command cargo run --locked -p tidefs-two-node-harness --bin tidefs-geo-rpo-wan-tcp-validation
+
+      - name: Validate geo RPO evidence manifests
+        run: |
+          set -euo pipefail
+          for manifest in \
+            validation/artifacts/storage-intent/geo-policy-transport-evidence.manifest.json \
+            validation/artifacts/storage-intent/geo-temporal-recovery-evidence.manifest.json \
+            validation/artifacts/storage-intent/geo-performance-fault-rows.manifest.json
+          do
+            nix develop .#ci --command cargo run -p tidefs-xtask -- validate-evidence-manifest "$manifest"
+          done
+
+      - name: Upload geo RPO evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: geo-rpo-wan-tcp-validation
+          path: |
+            validation/artifacts/storage-intent/geo-policy-transport-evidence.json
+            validation/artifacts/storage-intent/geo-policy-transport-evidence.manifest.json
+            validation/artifacts/storage-intent/geo-temporal-recovery-evidence.json
+            validation/artifacts/storage-intent/geo-temporal-recovery-evidence.manifest.json
+            validation/artifacts/storage-intent/geo-performance-fault-rows.json
+            validation/artifacts/storage-intent/geo-performance-fault-rows.manifest.json
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Report summary
+        if: always()
+        run: |
+          {
+            echo '## Geo RPO WAN/TCP validation'
+            echo ''
+            echo 'Artifacts are uploaded as `geo-rpo-wan-tcp-validation`.'
+            echo ''
+            echo '- `geo-policy-transport-evidence.json`'
+            echo '- `geo-temporal-recovery-evidence.json`'
+            echo '- `geo-performance-fault-rows.json`'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Clean cargo target
+        if: always()
+        run: rm -rf "$CARGO_TARGET_DIR"

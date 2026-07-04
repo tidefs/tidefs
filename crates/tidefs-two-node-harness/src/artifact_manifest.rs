@@ -17,11 +17,18 @@ pub const EVIDENCE_ARTIFACT_DIGEST_ALGORITHM: &str = "blake3";
 pub const TWO_NODE_SOURCE: &str = "tidefs-two-node-harness";
 pub const TWO_NODE_DETERMINISTIC_EVIDENCE_CLASS: &str = "two-node-deterministic-harness";
 pub const TWO_NODE_QEMU_TCP_EVIDENCE_CLASS: &str = "two-node-qemu-tcp-carrier-validation";
+pub const GEO_ASYNC_RPO_CLAIM_ID: &str = "storage.intent.geo_async_rpo.v1";
+pub const GEO_POLICY_TRANSPORT_EVIDENCE_CLASS: &str =
+    "storage-intent-geo-policy-transport-evidence";
+pub const GEO_TEMPORAL_RECOVERY_EVIDENCE_CLASS: &str =
+    "storage-intent-geo-temporal-recovery-evidence";
+pub const GEO_PERFORMANCE_FAULT_EVIDENCE_CLASS: &str = "storage-intent-geo-performance-fault-rows";
 pub const TWO_NODE_DETERMINISTIC_NON_CLAIM_SCOPE: &str =
     "two-node.harness.deterministic-loopback.v1";
 pub const TWO_NODE_QEMU_TCP_NON_CLAIM_SCOPE: &str = "two-node.qemu-tcp-carrier.v1";
 
 const TWO_NODE_RISK_BOUNDARY: &str = "Two-node harness evidence does not validate multi-process distributed execution, RDMA, production cluster behavior, storage-node runtime behavior, release-candidate coverage, mounted runtime behavior, or OpenZFS/Ceph-class status.";
+const GEO_RPO_RISK_BOUNDARY: &str = "Multi-process WAN/TCP geo-RPO evidence is bounded to two child processes on one runner, application-level WAN impairment rows, and live TCP transport; it does not validate RDMA, production cluster behavior, storage-node runtime, release-candidate coverage, successor/comparator wording, or OpenZFS/Ceph-class status.";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -57,6 +64,7 @@ pub struct BlockingIssueRef {
 pub enum EvidenceValidationTier {
     HarnessOnly,
     QemuGuest,
+    MultiProcessDistributed,
     SourceModel,
 }
 
@@ -98,6 +106,18 @@ pub struct QemuTcpCarrierManifestInput<'a> {
     pub generated_at: &'a str,
     pub outcome: EvidenceOutcome,
     pub qemu_guest_detected: bool,
+    pub blocking_issues: Vec<BlockingIssueRef>,
+}
+
+#[derive(Clone, Debug)]
+pub struct GeoRpoWanTcpManifestInput<'a> {
+    pub evidence_class: &'a str,
+    pub artifact_path: &'a str,
+    pub artifact_bytes: &'a [u8],
+    pub github_actions: GitHubActionsArtifactRef<'a>,
+    pub source_ref: &'a str,
+    pub generated_at: &'a str,
+    pub outcome: EvidenceOutcome,
     pub blocking_issues: Vec<BlockingIssueRef>,
 }
 
@@ -214,6 +234,43 @@ impl EvidenceArtifactManifest {
                 "QEMU TCP carrier evidence proves only the bounded live TCP carrier state-transfer row captured by the named GitHub Actions artifact. {TWO_NODE_RISK_BOUNDARY}"
             ),
             source: format!("{TWO_NODE_SOURCE}:qemu-tcp-carrier-validation"),
+            generated_at: input.generated_at.to_string(),
+            blocking_issues: input.blocking_issues,
+        };
+        manifest.validate()?;
+        Ok(manifest)
+    }
+
+    pub fn geo_rpo_wan_tcp(
+        input: GeoRpoWanTcpManifestInput<'_>,
+    ) -> Result<Self, EvidenceManifestError> {
+        validate_geo_rpo_evidence_class(input.evidence_class)?;
+        input.github_actions.validate()?;
+
+        let manifest = Self {
+            manifest_version: EVIDENCE_ARTIFACT_MANIFEST_VERSION,
+            claim_id: GEO_ASYNC_RPO_CLAIM_ID.to_string(),
+            evidence_class: input.evidence_class.to_string(),
+            validation_tier: EvidenceValidationTier::MultiProcessDistributed,
+            scope: format!(
+                "WAN/TCP RDMA-absent geo-RPO runtime row for `{}`; github_actions_workflow={} github_actions_run={} artifact_name={}; exercises lag, catch-up, freshness/RPO reporting, degraded-visible/refusal states, partitions, stale clocks, loss/jitter, and bandwidth clamps without treating RDMA as a correctness dependency",
+                input.evidence_class,
+                input.github_actions.workflow,
+                input.github_actions.run_url,
+                input.github_actions.artifact_name
+            ),
+            artifact_path: input.artifact_path.to_string(),
+            content_digest: content_digest_for_bytes(input.artifact_bytes),
+            run_id: format!(
+                "github-actions:{}:attempt:{}:artifact:{}",
+                input.github_actions.run_id,
+                input.github_actions.run_attempt,
+                input.github_actions.artifact_name
+            ),
+            source_ref: input.source_ref.to_string(),
+            outcome: input.outcome,
+            residual_risk: GEO_RPO_RISK_BOUNDARY.to_string(),
+            source: format!("{TWO_NODE_SOURCE}:geo-rpo-wan-tcp-validation"),
             generated_at: input.generated_at.to_string(),
             blocking_issues: input.blocking_issues,
         };
@@ -395,6 +452,47 @@ fn validate_two_node_boundary(manifest: &EvidenceArtifactManifest, failures: &mu
             validate_no_runner_local_reference(field, value, failures);
         }
     }
+    if is_geo_rpo_evidence_class(&manifest.evidence_class) {
+        if manifest.claim_id != GEO_ASYNC_RPO_CLAIM_ID {
+            failures.push(format!(
+                "geo-RPO evidence must bind claim_id `{GEO_ASYNC_RPO_CLAIM_ID}`"
+            ));
+        }
+        if manifest.validation_tier != EvidenceValidationTier::MultiProcessDistributed {
+            failures
+                .push("geo-RPO WAN/TCP evidence must use multi-process-distributed tier".into());
+        }
+        if !manifest.run_id.starts_with("github-actions:") {
+            failures
+                .push("multi-process geo-RPO manifests must record a GitHub Actions run_id".into());
+        }
+        if !manifest
+            .artifact_path
+            .starts_with("validation/artifacts/storage-intent/geo-")
+        {
+            failures.push(
+                "geo-RPO artifact_path must stay under validation/artifacts/storage-intent/geo-*"
+                    .into(),
+            );
+        }
+        let lower_scope = manifest.scope.to_ascii_lowercase();
+        for required in [
+            "wan/tcp",
+            "rdma-absent",
+            "lag",
+            "catch-up",
+            "freshness",
+            "refusal",
+            "partitions",
+            "stale clocks",
+            "loss/jitter",
+            "bandwidth clamps",
+        ] {
+            if !lower_scope.contains(required) {
+                failures.push(format!("geo-RPO scope must mention `{required}`"));
+            }
+        }
+    }
 
     let lower_risk = manifest.residual_risk.to_ascii_lowercase();
     for required in [
@@ -410,6 +508,25 @@ fn validate_two_node_boundary(manifest: &EvidenceArtifactManifest, failures: &mu
             ));
         }
     }
+}
+
+fn validate_geo_rpo_evidence_class(evidence_class: &str) -> Result<(), EvidenceManifestError> {
+    if is_geo_rpo_evidence_class(evidence_class) {
+        Ok(())
+    } else {
+        Err(EvidenceManifestError::single(format!(
+            "unsupported geo-RPO evidence class `{evidence_class}`"
+        )))
+    }
+}
+
+fn is_geo_rpo_evidence_class(evidence_class: &str) -> bool {
+    matches!(
+        evidence_class,
+        GEO_POLICY_TRANSPORT_EVIDENCE_CLASS
+            | GEO_TEMPORAL_RECOVERY_EVIDENCE_CLASS
+            | GEO_PERFORMANCE_FAULT_EVIDENCE_CLASS
+    )
 }
 
 fn validate_outcome_blockers(
@@ -552,6 +669,23 @@ mod tests {
         }
     }
 
+    fn geo_input<'a>(
+        evidence_class: &'a str,
+        artifact_path: &'a str,
+        artifact: &'a [u8],
+    ) -> GeoRpoWanTcpManifestInput<'a> {
+        GeoRpoWanTcpManifestInput {
+            evidence_class,
+            artifact_path,
+            artifact_bytes: artifact,
+            github_actions: github_actions_ref(),
+            source_ref: "6d78ddfa4f64bc8643061b514dc911578fd4f53b5a4e92d7d5130db296b68d63",
+            generated_at: "2026-07-02T09:00:00Z",
+            outcome: EvidenceOutcome::Pass,
+            blocking_issues: Vec::new(),
+        }
+    }
+
     #[test]
     fn deterministic_manifest_is_harness_only_non_claim() {
         let artifact = br#"{"harness":"tidefs-two-node-harness","carrier":"loopback"}"#;
@@ -620,6 +754,49 @@ mod tests {
         assert!(!json.contains("/tmp/"));
         assert!(!json.contains("secrets."));
         assert!(json.contains("\"validation_tier\": \"qemu-guest\""));
+    }
+
+    #[test]
+    fn geo_rpo_manifest_binds_registered_claim_and_runtime_tier() {
+        let artifact = br#"{"test":"tidefs-geo-rpo-wan-tcp-validation"}"#;
+        let manifest = EvidenceArtifactManifest::geo_rpo_wan_tcp(geo_input(
+            GEO_TEMPORAL_RECOVERY_EVIDENCE_CLASS,
+            "validation/artifacts/storage-intent/geo-temporal-recovery-evidence.json",
+            artifact,
+        ))
+        .expect("geo manifest");
+
+        assert_eq!(manifest.claim_id, GEO_ASYNC_RPO_CLAIM_ID);
+        assert_eq!(
+            manifest.validation_tier,
+            EvidenceValidationTier::MultiProcessDistributed
+        );
+        assert_eq!(
+            manifest.evidence_class,
+            GEO_TEMPORAL_RECOVERY_EVIDENCE_CLASS
+        );
+        assert!(manifest.residual_risk.contains("RDMA"));
+        assert!(manifest.scope.contains("RDMA-absent"));
+
+        let json = manifest.to_json_pretty().expect("json");
+        assert!(json.contains("\"validation_tier\": \"multi-process-distributed\""));
+        assert!(json.contains("\"claim_id\": \"storage.intent.geo_async_rpo.v1\""));
+    }
+
+    #[test]
+    fn geo_rpo_manifest_rejects_unregistered_evidence_class() {
+        let artifact = br#"{"test":"tidefs-geo-rpo-wan-tcp-validation"}"#;
+        let err = EvidenceArtifactManifest::geo_rpo_wan_tcp(geo_input(
+            "storage-intent-geo-unregistered-evidence",
+            "validation/artifacts/storage-intent/geo-unregistered.json",
+            artifact,
+        ))
+        .expect_err("unregistered class must fail");
+
+        assert!(err
+            .failures()
+            .iter()
+            .any(|failure| failure.contains("unsupported geo-RPO evidence class")));
     }
 
     #[test]

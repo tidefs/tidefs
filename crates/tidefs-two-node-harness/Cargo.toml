@@ -21,6 +21,10 @@ name = "tidefs-two-node-qemu-carrier-validation"
 path = "src/bin/qemu_tcp_carrier_validation.rs"
 required-features = ["qemu"]
 
+[[bin]]
+name = "tidefs-geo-rpo-wan-tcp-validation"
+path = "src/bin/geo_rpo_wan_tcp_validation.rs"
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = { workspace = true }
