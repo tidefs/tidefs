@@ -2095,7 +2095,7 @@ impl LivePoolAdminResponse {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "kind")]
+#[serde(rename_all = "snake_case", tag = "kind", content = "value")]
 pub enum LivePoolAdminResponseBody {
     Empty,
     Text(String),

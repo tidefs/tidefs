@@ -200,7 +200,7 @@ fn handle_client(
         Err(err) => {
             let _ = writeln!(
                 stream,
-                "{{\"version\":{},\"exit_code\":2,\"body\":{{\"kind\":\"error\",\"message\":\"encode response: {err}\",\"machine_json\":null}}}}",
+                "{{\"version\":{},\"exit_code\":2,\"body\":{{\"kind\":\"error\",\"value\":{{\"message\":\"encode response: {err}\",\"machine_json\":null}}}}}}",
                 LIVE_POOL_ADMIN_PROTOCOL_VERSION
             );
         }
