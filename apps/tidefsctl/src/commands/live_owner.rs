@@ -29,7 +29,7 @@ pub(crate) struct LivePoolRoute<'a> {
     pub(crate) pool: &'a str,
     pub(crate) pool_uuid: Option<[u8; 16]>,
     pub(crate) json: bool,
-    pub(crate) args: serde_json::Value,
+    pub(crate) args: LivePoolAdminArgs,
 }
 
 pub(crate) trait LivePoolOwnerClient {
@@ -89,7 +89,7 @@ pub(crate) fn route_with_format(command: &str, operation: &str, pool: &str, json
         pool,
         pool_uuid: None,
         json,
-        args: serde_json::Value::Null,
+        args: LivePoolAdminArgs::default(),
     })
 }
 
@@ -97,7 +97,7 @@ pub(crate) fn route_with_args(
     command: &str,
     operation: &str,
     pool: &str,
-    args: serde_json::Value,
+    args: LivePoolAdminArgs,
 ) -> ! {
     route_with_format_and_args(command, operation, pool, false, args)
 }
@@ -107,7 +107,7 @@ pub(crate) fn route_with_format_and_args(
     operation: &str,
     pool: &str,
     json: bool,
-    args: serde_json::Value,
+    args: LivePoolAdminArgs,
 ) -> ! {
     MissingLivePoolOwnerClient.route_live_pool(LivePoolRoute {
         command,
@@ -123,7 +123,7 @@ pub(crate) fn route_if_owner_exists_with_args(
     command: &str,
     operation: &str,
     pool: &str,
-    args: serde_json::Value,
+    args: LivePoolAdminArgs,
 ) {
     route_if_owner_exists_with_format_and_args(command, operation, pool, false, args);
 }
@@ -133,7 +133,7 @@ pub(crate) fn route_if_owner_exists_with_format_and_args(
     operation: &str,
     pool: &str,
     json: bool,
-    args: serde_json::Value,
+    args: LivePoolAdminArgs,
 ) {
     let root = pool_runtime_root();
     if owner_interface_reachable_by_pool_at(&root, pool) {
@@ -149,7 +149,7 @@ pub(crate) fn route_if_owner_exists_for_pool_backing_dir_with_args(
     operation: &str,
     pool: &str,
     backing_dir: &Path,
-    args: serde_json::Value,
+    args: LivePoolAdminArgs,
 ) {
     let root = pool_runtime_root();
     match imported_backing_dir_decision_at(&root, pool, backing_dir) {
@@ -177,7 +177,7 @@ pub(crate) fn route_if_owner_exists_for_backing_dir_with_args(
     command: &str,
     operation: &str,
     backing_dir: &Path,
-    args: serde_json::Value,
+    args: LivePoolAdminArgs,
 ) {
     let root = pool_runtime_root();
     match imported_owner_by_backing_dir_at(&root, backing_dir) {
@@ -210,7 +210,7 @@ pub(crate) fn route_or_refuse_active_for_uuid_with_args(
     pool: &str,
     pool_uuid: [u8; 16],
     active_label: bool,
-    args: serde_json::Value,
+    args: LivePoolAdminArgs,
 ) {
     route_or_refuse_active_for_uuid_with_format_and_args(
         command,
@@ -230,7 +230,7 @@ pub(crate) fn route_or_refuse_active_for_uuid_with_format_and_args(
     pool_uuid: [u8; 16],
     active_label: bool,
     json: bool,
-    args: serde_json::Value,
+    args: LivePoolAdminArgs,
 ) {
     let root = pool_runtime_root();
     if owner_interface_reachable_for_uuid_at(&root, pool, &pool_uuid) {
@@ -250,7 +250,7 @@ pub(crate) fn route_imported_with_format_and_args(
     pool: &str,
     pool_uuid: [u8; 16],
     json: bool,
-    args: serde_json::Value,
+    args: LivePoolAdminArgs,
 ) -> ! {
     MissingLivePoolOwnerClient.route_live_pool(LivePoolRoute {
         command,
@@ -260,6 +260,55 @@ pub(crate) fn route_imported_with_format_and_args(
         json,
         args,
     })
+}
+
+pub(crate) fn live_admin_args(
+    entries: impl IntoIterator<Item = (&'static str, LivePoolAdminArg)>,
+) -> LivePoolAdminArgs {
+    LivePoolAdminArgs(
+        entries
+            .into_iter()
+            .map(|(key, value)| (key.to_string(), value))
+            .collect(),
+    )
+}
+
+pub(crate) fn live_admin_optional_string(value: Option<String>) -> LivePoolAdminArg {
+    value
+        .map(LivePoolAdminArg::String)
+        .unwrap_or(LivePoolAdminArg::Null)
+}
+
+pub(crate) fn live_admin_optional_u64(value: Option<u64>) -> LivePoolAdminArg {
+    value
+        .map(LivePoolAdminArg::U64)
+        .unwrap_or(LivePoolAdminArg::Null)
+}
+
+pub(crate) fn live_admin_arg_from_json(value: serde_json::Value) -> LivePoolAdminArg {
+    match value {
+        serde_json::Value::Null => LivePoolAdminArg::Null,
+        serde_json::Value::Bool(value) => LivePoolAdminArg::Bool(value),
+        serde_json::Value::Number(value) => {
+            if let Some(value) = value.as_u64() {
+                LivePoolAdminArg::U64(value)
+            } else if let Some(value) = value.as_i64() {
+                LivePoolAdminArg::I64(value)
+            } else {
+                LivePoolAdminArg::String(value.to_string())
+            }
+        }
+        serde_json::Value::String(value) => LivePoolAdminArg::String(value),
+        serde_json::Value::Array(values) => {
+            LivePoolAdminArg::Array(values.into_iter().map(live_admin_arg_from_json).collect())
+        }
+        serde_json::Value::Object(values) => LivePoolAdminArg::Object(
+            values
+                .into_iter()
+                .map(|(key, value)| (key, live_admin_arg_from_json(value)))
+                .collect(),
+        ),
+    }
 }
 
 /// Route a status command to the live owner if reachable. Returns true
@@ -979,7 +1028,7 @@ fn live_owner_request(
     if let Some(pool_uuid) = route.pool_uuid {
         request.pool_uuid = Some(hex_uuid(&pool_uuid));
     }
-    request.args = live_admin_args_from_json(route.args.clone())?;
+    request.args = route.args.clone();
     Ok(request)
 }
 
@@ -989,58 +1038,6 @@ fn live_admin_error_to_request_error(err: LivePoolAdminError) -> LiveOwnerReques
         message: err.message,
         detail: serde_json::to_value(err.kind).ok(),
     }
-}
-
-fn live_admin_args_from_json(
-    args: serde_json::Value,
-) -> Result<LivePoolAdminArgs, LiveOwnerRequestError> {
-    if args.is_null() {
-        return Ok(LivePoolAdminArgs::default());
-    }
-    let serde_json::Value::Object(values) = args else {
-        return Err(LiveOwnerRequestError::Owner {
-            exit_code: 2,
-            message: "live-owner request args must be an object".to_string(),
-            detail: None,
-        });
-    };
-    Ok(LivePoolAdminArgs(
-        values
-            .into_iter()
-            .map(|(key, value)| live_admin_arg_from_json(value).map(|value| (key, value)))
-            .collect::<Result<_, _>>()?,
-    ))
-}
-
-fn live_admin_arg_from_json(
-    value: serde_json::Value,
-) -> Result<LivePoolAdminArg, LiveOwnerRequestError> {
-    Ok(match value {
-        serde_json::Value::Null => LivePoolAdminArg::Null,
-        serde_json::Value::Bool(value) => LivePoolAdminArg::Bool(value),
-        serde_json::Value::Number(value) => value
-            .as_i64()
-            .map(LivePoolAdminArg::I64)
-            .or_else(|| value.as_u64().map(LivePoolAdminArg::U64))
-            .ok_or_else(|| LiveOwnerRequestError::Owner {
-                exit_code: 2,
-                message: format!("live-owner request number is not an integer: {value}"),
-                detail: None,
-            })?,
-        serde_json::Value::String(value) => LivePoolAdminArg::String(value),
-        serde_json::Value::Array(values) => LivePoolAdminArg::Array(
-            values
-                .into_iter()
-                .map(live_admin_arg_from_json)
-                .collect::<Result<_, _>>()?,
-        ),
-        serde_json::Value::Object(values) => LivePoolAdminArg::Object(
-            values
-                .into_iter()
-                .map(|(key, value)| live_admin_arg_from_json(value).map(|value| (key, value)))
-                .collect::<Result<_, _>>()?,
-        ),
-    })
 }
 
 fn find_live_owner_manifest_at(
@@ -1633,10 +1630,13 @@ mod tests {
             pool: "tank",
             pool_uuid: None,
             json: false,
-            args: serde_json::json!({
-                "device_path": "/dev/disk2",
-                "required_authority": DEVICE_REMOVAL_AUTHORITY_KIND,
-            }),
+            args: live_admin_args([
+                ("device_path", LivePoolAdminArg::String("/dev/disk2".into())),
+                (
+                    "required_authority",
+                    LivePoolAdminArg::String(DEVICE_REMOVAL_AUTHORITY_KIND.into()),
+                ),
+            ]),
         }
     }
 
@@ -1743,10 +1743,10 @@ mod tests {
             pool: "tank",
             pool_uuid: Some([0x42; 16]),
             json: true,
-            args: serde_json::json!({
-                "force": true,
-                "zero_superblock": true,
-            }),
+            args: live_admin_args([
+                ("force", LivePoolAdminArg::Bool(true)),
+                ("zero_superblock", LivePoolAdminArg::Bool(true)),
+            ]),
         };
 
         let err = send_live_owner_request_at(dir.path(), &route).unwrap_err();
@@ -1850,7 +1850,7 @@ mod tests {
             pool: "tank",
             pool_uuid: None,
             json: true,
-            args: serde_json::Value::Null,
+            args: LivePoolAdminArgs::default(),
         };
         let mut value = serde_json::json!({"ok": true, "devices": []});
 
@@ -2157,7 +2157,7 @@ mod tests {
             pool: "tank",
             pool_uuid: Some([0x42; 16]),
             json: false,
-            args: serde_json::Value::Null,
+            args: LivePoolAdminArgs::default(),
         };
 
         let manifest = find_live_owner_manifest_at(dir.path(), &route).unwrap();
@@ -2191,7 +2191,7 @@ mod tests {
             pool: "tank",
             pool_uuid: Some([0x42; 16]),
             json: false,
-            args: serde_json::Value::Null,
+            args: LivePoolAdminArgs::default(),
         };
 
         let err = find_live_owner_manifest_at(dir.path(), &route).unwrap_err();
@@ -2242,7 +2242,7 @@ mod tests {
             pool: "tank",
             pool_uuid: Some(uuid),
             json: false,
-            args: serde_json::Value::Null,
+            args: LivePoolAdminArgs::default(),
         };
 
         let manifest = find_live_owner_manifest_at(dir.path(), &route).unwrap();
@@ -2295,7 +2295,7 @@ mod tests {
             pool: "tank",
             pool_uuid: Some(uuid),
             json: false,
-            args: serde_json::Value::Null,
+            args: LivePoolAdminArgs::default(),
         };
 
         let manifest = find_live_owner_manifest_at(dir.path(), &route).unwrap();
@@ -2325,7 +2325,7 @@ mod tests {
             pool: "tank",
             pool_uuid: Some([0x42; 16]),
             json: false,
-            args: serde_json::Value::Null,
+            args: LivePoolAdminArgs::default(),
         };
 
         let err = manifest_socket_endpoint(&manifest, &route).unwrap_err();
@@ -2362,7 +2362,7 @@ mod tests {
             pool: "tank",
             pool_uuid: Some([0x42; 16]),
             json: false,
-            args: serde_json::Value::Null,
+            args: LivePoolAdminArgs::default(),
         };
 
         let err = find_live_owner_manifest_at(dir.path(), &route).unwrap_err();
@@ -2378,7 +2378,7 @@ mod tests {
             pool: "tank",
             pool_uuid: Some([0xab; 16]),
             json: false,
-            args: serde_json::json!({"device_path": "/dev/sdc"}),
+            args: live_admin_args([("device_path", LivePoolAdminArg::String("/dev/sdc".into()))]),
         };
 
         let request = live_owner_request(&route).unwrap();
@@ -2397,7 +2397,7 @@ mod tests {
             pool: "tank",
             pool_uuid: None,
             json: false,
-            args: serde_json::Value::Null,
+            args: LivePoolAdminArgs::default(),
         };
 
         let request = live_owner_request(&route).unwrap();

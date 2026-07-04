@@ -29,6 +29,7 @@ use clap::Parser;
 use tidefs_dataset_properties;
 use tidefs_local_filesystem::{LocalFileSystem, RecoveryPolicy};
 use tidefs_local_object_store::StoreOptions;
+use tidefs_vfs_engine::{LivePoolAdminArg, LivePoolAdminArgs};
 
 #[derive(Parser, Debug)]
 pub enum PoolCommand {
@@ -645,13 +646,23 @@ fn handle_pool_import(
 ) {
     let _guard = super::authz::require_local_only("pool import");
 
-    let live_args = serde_json::json!({
-        "read_only": read_only,
-        "lock_dir": lock_dir.as_ref().map(|path| path.display().to_string()),
-        "encryption_envelope": encryption_envelope
-            .as_ref()
-            .map(|path| path.display().to_string()),
-    });
+    let live_args = super::live_owner::live_admin_args([
+        ("read_only", LivePoolAdminArg::Bool(read_only)),
+        (
+            "lock_dir",
+            super::live_owner::live_admin_optional_string(
+                lock_dir.as_ref().map(|path| path.display().to_string()),
+            ),
+        ),
+        (
+            "encryption_envelope",
+            super::live_owner::live_admin_optional_string(
+                encryption_envelope
+                    .as_ref()
+                    .map(|path| path.display().to_string()),
+            ),
+        ),
+    ]);
     let Some(devices) = devices.filter(|devices| !devices.is_empty()) else {
         super::live_owner::route_with_format_and_args(
             "pool", "import", &pool_name, json, live_args,
@@ -908,7 +919,7 @@ fn route_live_device_pool_owner_with_format(
         config.pool_uuid,
         config.state == tidefs_types_pool_label_core::PoolState::Active,
         json,
-        serde_json::Value::Null,
+        super::live_owner::LivePoolAdminArgs::default(),
     );
 }
 
@@ -1050,17 +1061,34 @@ fn handle_pool_integrity_check(
     devices: Option<Vec<PathBuf>>,
 ) {
     let device_paths = devices.filter(|devices| !devices.is_empty());
-    let live_args = serde_json::json!({
-        "backing_dir": backing_dir.as_ref().map(|path| path.display().to_string()),
-        "devices": device_paths.as_ref().map(|paths| {
-            paths
-                .iter()
-                .map(|path| path.display().to_string())
-                .collect::<Vec<_>>()
-        }),
-        "max_records": max_records,
-        "max_bytes": max_bytes,
-    });
+    let live_args = super::live_owner::live_admin_args([
+        (
+            "backing_dir",
+            super::live_owner::live_admin_optional_string(
+                backing_dir.as_ref().map(|path| path.display().to_string()),
+            ),
+        ),
+        (
+            "devices",
+            match device_paths.as_ref() {
+                Some(paths) => LivePoolAdminArg::Array(
+                    paths
+                        .iter()
+                        .map(|path| LivePoolAdminArg::String(path.display().to_string()))
+                        .collect(),
+                ),
+                None => LivePoolAdminArg::Null,
+            },
+        ),
+        (
+            "max_records",
+            super::live_owner::live_admin_optional_u64(max_records),
+        ),
+        (
+            "max_bytes",
+            super::live_owner::live_admin_optional_u64(max_bytes),
+        ),
+    ]);
 
     if backing_dir.is_none() && device_paths.is_none() {
         super::live_owner::route_if_owner_exists_with_format_and_args(
@@ -1661,11 +1689,11 @@ fn handle_pool_destroy(
     }
 }
 
-fn pool_destroy_live_args(force: bool, zero_superblock: bool) -> serde_json::Value {
-    serde_json::json!({
-        "force": force,
-        "zero_superblock": zero_superblock,
-    })
+fn pool_destroy_live_args(force: bool, zero_superblock: bool) -> LivePoolAdminArgs {
+    super::live_owner::live_admin_args([
+        ("force", LivePoolAdminArg::Bool(force)),
+        ("zero_superblock", LivePoolAdminArg::Bool(zero_superblock)),
+    ])
 }
 
 // ---------------------------------------------------------------------------
@@ -1677,7 +1705,7 @@ fn open_pool_property_filesystem_with_live_args(
     devices: Option<&[PathBuf]>,
     operation: &str,
     recovery_policy: RecoveryPolicy,
-    live_args: serde_json::Value,
+    live_args: LivePoolAdminArgs,
 ) -> LocalFileSystem {
     let Some(devs) = devices.filter(|devs| !devs.is_empty()) else {
         super::live_owner::route_with_args("pool", operation, pool, live_args);
@@ -2157,14 +2185,10 @@ mod tests {
     fn pool_destroy_live_args_preserve_force_and_zero_superblock() {
         let args = pool_destroy_live_args(true, true);
 
+        assert_eq!(args.0.get("force"), Some(&LivePoolAdminArg::Bool(true)));
         assert_eq!(
-            args.get("force").and_then(serde_json::Value::as_bool),
-            Some(true)
-        );
-        assert_eq!(
-            args.get("zero_superblock")
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
+            args.0.get("zero_superblock"),
+            Some(&LivePoolAdminArg::Bool(true))
         );
     }
 

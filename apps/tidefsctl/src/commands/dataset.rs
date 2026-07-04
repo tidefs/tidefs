@@ -20,6 +20,7 @@ use tidefs_dataset_properties::{self, PropertyKey, PropertySet, PropertyValue};
 use tidefs_local_filesystem::{FileSystemStatfs, LocalFileSystem, RecoveryPolicy};
 use tidefs_local_object_store::StoreOptions;
 use tidefs_types_dataset_feature_flags_core::{get_feature_class, FeatureClass, FeatureName};
+use tidefs_vfs_engine::LivePoolAdminArgs;
 
 use bincode;
 
@@ -446,7 +447,7 @@ fn open_filesystem_with_live_args(
     operation: &str,
     recovery_policy: RecoveryPolicy,
     json: bool,
-    live_args: serde_json::Value,
+    live_args: LivePoolAdminArgs,
 ) -> LocalFileSystem {
     if let Some(devs) = devices.filter(|devs| !devs.is_empty()) {
         let config = scan_device_pool_config(pool, devs, operation);
@@ -1920,10 +1921,16 @@ fn handle_seal_key(args: DatasetSealKeyArgs) {
     use tidefs_encryption::key_manager::{KeyManager, KeyStore};
     use tidefs_local_object_store::StoreOptions;
 
-    let live_args = serde_json::json!({
-        "name": args.name.as_str(),
-        "passphrase": args.passphrase.as_str(),
-    });
+    let live_args = super::live_owner::live_admin_args([
+        (
+            "name",
+            tidefs_vfs_engine::LivePoolAdminArg::String(args.name.clone()),
+        ),
+        (
+            "passphrase",
+            tidefs_vfs_engine::LivePoolAdminArg::String(args.passphrase.clone()),
+        ),
+    ]);
     let devices_ref = args.devices.as_deref();
     let pool_path =
         resolve_pool_path_with_live_args(&args.pool, devices_ref, "seal-key", live_args);
@@ -1987,11 +1994,20 @@ fn handle_rotate_key(args: DatasetRotateKeyArgs) {
     use tidefs_encryption::key_manager::{KeyRotation, KeyStore};
     use tidefs_local_object_store::StoreOptions;
 
-    let live_args = serde_json::json!({
-        "old_passphrase": args.old_passphrase.as_str(),
-        "old_salt": args.old_salt.as_str(),
-        "new_passphrase": args.new_passphrase.as_str(),
-    });
+    let live_args = super::live_owner::live_admin_args([
+        (
+            "old_passphrase",
+            tidefs_vfs_engine::LivePoolAdminArg::String(args.old_passphrase.clone()),
+        ),
+        (
+            "old_salt",
+            tidefs_vfs_engine::LivePoolAdminArg::String(args.old_salt.clone()),
+        ),
+        (
+            "new_passphrase",
+            tidefs_vfs_engine::LivePoolAdminArg::String(args.new_passphrase.clone()),
+        ),
+    ]);
     let devices_ref = args.devices.as_deref();
     let pool_path =
         resolve_pool_path_with_live_args(&args.pool, devices_ref, "rotate-key", live_args);
@@ -2073,7 +2089,7 @@ fn resolve_pool_path_with_live_args(
     pool: &str,
     devices: Option<&[PathBuf]>,
     operation: &str,
-    live_args: serde_json::Value,
+    live_args: LivePoolAdminArgs,
 ) -> PathBuf {
     if let Some(devs) = devices.filter(|devs| !devs.is_empty()) {
         let config = scan_device_pool_config(pool, devs, operation);

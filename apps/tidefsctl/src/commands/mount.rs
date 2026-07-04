@@ -17,6 +17,7 @@ use tidefs_encryption;
 use tidefs_local_filesystem::RootAuthenticationKey;
 use tidefs_transport::{NodeInfo, Transport, TransportAddr};
 use tidefs_types_pool_label_core::features;
+use tidefs_vfs_engine::LivePoolAdminArg;
 
 /// `pool mount <pool_name> <mount_point> [--devices <dev>...] [--read-only] [--relatime]`
 ///
@@ -220,12 +221,15 @@ fn resolve_encryption_for_import(
 pub fn handle_mount(args: PoolMountArgs) {
     let mountpoint = args.mount_point.clone();
     let lock_dir = std::path::PathBuf::from("/run/tidefs/import");
-    let live_args = serde_json::json!({
-        "mountpoint": mountpoint.display().to_string(),
-        "read_only": args.read_only,
-        "relatime": args.relatime,
-        "dataset": &args.dataset,
-    });
+    let live_args = super::live_owner::live_admin_args([
+        (
+            "mountpoint",
+            LivePoolAdminArg::String(mountpoint.display().to_string()),
+        ),
+        ("read_only", LivePoolAdminArg::Bool(args.read_only)),
+        ("relatime", LivePoolAdminArg::Bool(args.relatime)),
+        ("dataset", LivePoolAdminArg::String(args.dataset.clone())),
+    ]);
 
     // Cluster mount parameter validation: when --cluster is set,
     // refuse missing or invalid parameters before any pool work.
