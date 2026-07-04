@@ -670,11 +670,14 @@ fn handle_pool_import(
     };
 
     let mut owner_args = live_args;
-    owner_args["devices"] = serde_json::Value::Array(
-        devices
-            .iter()
-            .map(|path| serde_json::Value::String(path.display().to_string()))
-            .collect(),
+    owner_args.0.insert(
+        "devices".to_string(),
+        LivePoolAdminArg::Array(
+            devices
+                .iter()
+                .map(|path| LivePoolAdminArg::String(path.display().to_string()))
+                .collect(),
+        ),
     );
 
     let config = assemble_device_pool_config(&devices, "import");
@@ -919,7 +922,7 @@ fn route_live_device_pool_owner_with_format(
         config.pool_uuid,
         config.state == tidefs_types_pool_label_core::PoolState::Active,
         json,
-        super::live_owner::LivePoolAdminArgs::default(),
+        LivePoolAdminArgs::default(),
     );
 }
 

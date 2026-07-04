@@ -880,8 +880,12 @@ fn device_removal_admission_request(
     }
     let device_path = route
         .args
+        .0
         .get("device_path")
-        .and_then(serde_json::Value::as_str)
+        .and_then(|value| match value {
+            LivePoolAdminArg::String(value) => Some(value.as_str()),
+            _ => None,
+        })
         .unwrap_or_default();
     Some(DeviceRemovalAdmissionRequest::new(route.pool, device_path))
 }
@@ -893,8 +897,12 @@ fn is_device_removal_route(command: &str, operation: &str) -> bool {
 fn route_device_path<'route>(route: &'route LivePoolRoute<'_>) -> Option<&'route str> {
     route
         .args
+        .0
         .get("device_path")
-        .and_then(serde_json::Value::as_str)
+        .and_then(|value| match value {
+            LivePoolAdminArg::String(value) => Some(value.as_str()),
+            _ => None,
+        })
 }
 
 fn annotate_device_removal_authority_json(

@@ -20,7 +20,7 @@ use tidefs_dataset_properties::{self, PropertyKey, PropertySet, PropertyValue};
 use tidefs_local_filesystem::{FileSystemStatfs, LocalFileSystem, RecoveryPolicy};
 use tidefs_local_object_store::StoreOptions;
 use tidefs_types_dataset_feature_flags_core::{get_feature_class, FeatureClass, FeatureName};
-use tidefs_vfs_engine::LivePoolAdminArgs;
+use tidefs_vfs_engine::{LivePoolAdminArg, LivePoolAdminArgs};
 
 use bincode;
 
@@ -1007,16 +1007,36 @@ fn handle_create(args: DatasetCreateArgs) {
         "create",
         RecoveryPolicy::default(),
         args.json,
-        serde_json::json!({
-            "target": &args.target,
-            "name": leaf,
-            "parent": parent,
-            "type": args.dataset_type.label(),
-            "mountpoint": mountpoint.as_deref(),
-            "properties": property_assignments_json(&properties),
-            "features": &features,
-            "sync": &args.sync,
-        }),
+        super::live_owner::live_admin_args([
+            ("target", LivePoolAdminArg::String(args.target.clone())),
+            ("name", LivePoolAdminArg::String(leaf.clone())),
+            ("parent", LivePoolAdminArg::String(parent.clone())),
+            (
+                "type",
+                LivePoolAdminArg::String(args.dataset_type.label().to_string()),
+            ),
+            (
+                "mountpoint",
+                super::live_owner::live_admin_optional_string(
+                    mountpoint.as_ref().map(|path| path.display().to_string()),
+                ),
+            ),
+            (
+                "properties",
+                super::live_owner::live_admin_arg_from_json(property_assignments_json(&properties)),
+            ),
+            (
+                "features",
+                LivePoolAdminArg::Array(
+                    features
+                        .iter()
+                        .cloned()
+                        .map(LivePoolAdminArg::String)
+                        .collect(),
+                ),
+            ),
+            ("sync", LivePoolAdminArg::String(args.sync.clone())),
+        ]),
     );
 
     if let Err(err) = require_create_admission(fs.dataset_catalog(), &full_path, &parent) {
@@ -1144,9 +1164,13 @@ fn handle_list(args: DatasetListArgs) {
         "list",
         RecoveryPolicy::ReadOnly,
         args.json,
-        serde_json::json!({
-            "type": args.dataset_type.map(|dataset_type| dataset_type.label()),
-        }),
+        super::live_owner::live_admin_args([(
+            "type",
+            super::live_owner::live_admin_optional_string(
+                args.dataset_type
+                    .map(|dataset_type| dataset_type.label().to_string()),
+            ),
+        )]),
     );
     let capacity = match fs.statfs() {
         Ok(stats) => dataset_capacity_projection_from_statfs(stats),
@@ -1199,10 +1223,10 @@ fn handle_rename(args: DatasetRenameArgs) {
         "rename",
         RecoveryPolicy::default(),
         false,
-        serde_json::json!({
-            "old_name": &args.old_name,
-            "new_name": &args.new_name,
-        }),
+        super::live_owner::live_admin_args([
+            ("old_name", LivePoolAdminArg::String(args.old_name.clone())),
+            ("new_name", LivePoolAdminArg::String(args.new_name.clone())),
+        ]),
     );
 
     // Verify the old name exists
@@ -1248,13 +1272,34 @@ fn handle_set_strategy(args: DatasetSetStrategyArgs) {
         "set-strategy",
         RecoveryPolicy::default(),
         false,
-        serde_json::json!({
-            "name": &args.name,
-            "enable": &args.enable,
-            "disable": &args.disable,
-            "list": args.list,
-            "class": &args.class,
-        }),
+        super::live_owner::live_admin_args([
+            ("name", LivePoolAdminArg::String(args.name.clone())),
+            (
+                "enable",
+                LivePoolAdminArg::Array(
+                    args.enable
+                        .iter()
+                        .cloned()
+                        .map(LivePoolAdminArg::String)
+                        .collect(),
+                ),
+            ),
+            (
+                "disable",
+                LivePoolAdminArg::Array(
+                    args.disable
+                        .iter()
+                        .cloned()
+                        .map(LivePoolAdminArg::String)
+                        .collect(),
+                ),
+            ),
+            ("list", LivePoolAdminArg::Bool(args.list)),
+            (
+                "class",
+                super::live_owner::live_admin_optional_string(args.class.clone()),
+            ),
+        ]),
     );
 
     // Verify dataset exists in catalog
@@ -1425,9 +1470,7 @@ fn handle_upgrade(args: DatasetUpgradeArgs) {
         "upgrade",
         RecoveryPolicy::default(),
         false,
-        serde_json::json!({
-            "name": &args.name,
-        }),
+        super::live_owner::live_admin_args([("name", LivePoolAdminArg::String(args.name.clone()))]),
     );
 
     // Verify dataset exists in catalog
@@ -1571,11 +1614,11 @@ fn handle_get(args: DatasetGetArgs) {
         "get",
         RecoveryPolicy::ReadOnly,
         args.json,
-        serde_json::json!({
-            "target": &args.target,
-            "name": &target.dataset,
-            "property": &property,
-        }),
+        super::live_owner::live_admin_args([
+            ("target", LivePoolAdminArg::String(args.target.clone())),
+            ("name", LivePoolAdminArg::String(target.dataset.clone())),
+            ("property", LivePoolAdminArg::String(property.to_string())),
+        ]),
     );
 
     let path = target.dataset.as_str();
@@ -1634,15 +1677,24 @@ fn handle_set(args: DatasetSetArgs) {
         "set",
         RecoveryPolicy::RepairWriteback,
         args.json,
-        serde_json::json!({
-            "target": &args.target,
-            "name": &target.dataset,
-            "property": &assignment.key,
-            "assignment": live_assignment,
-            "value": property_value_json(&assignment.value),
-            "display_value": assignment.value.to_string(),
-            "clear": assignment.clear,
-        }),
+        super::live_owner::live_admin_args([
+            ("target", LivePoolAdminArg::String(args.target.clone())),
+            ("name", LivePoolAdminArg::String(target.dataset.clone())),
+            (
+                "property",
+                LivePoolAdminArg::String(assignment.key.to_string()),
+            ),
+            ("assignment", LivePoolAdminArg::String(live_assignment)),
+            (
+                "value",
+                super::live_owner::live_admin_arg_from_json(property_value_json(&assignment.value)),
+            ),
+            (
+                "display_value",
+                LivePoolAdminArg::String(assignment.value.to_string()),
+            ),
+            ("clear", LivePoolAdminArg::Bool(assignment.clear)),
+        ]),
     );
 
     let registry = tidefs_dataset_properties::build_registry();
@@ -1721,10 +1773,13 @@ fn handle_list_props(args: DatasetListPropsArgs) {
         "list-props",
         RecoveryPolicy::ReadOnly,
         false,
-        serde_json::json!({
-            "name": &args.name,
-            "family": args.family.as_deref(),
-        }),
+        super::live_owner::live_admin_args([
+            ("name", LivePoolAdminArg::String(args.name.clone())),
+            (
+                "family",
+                super::live_owner::live_admin_optional_string(args.family.clone()),
+            ),
+        ]),
     );
 
     let path = args.name.as_str();
@@ -1850,11 +1905,11 @@ fn handle_destroy(args: DatasetDestroyArgs) {
         "destroy",
         RecoveryPolicy::default(),
         args.json,
-        serde_json::json!({
-            "target": &args.target,
-            "name": &name,
-            "force": args.force,
-        }),
+        super::live_owner::live_admin_args([
+            ("target", LivePoolAdminArg::String(args.target.clone())),
+            ("name", LivePoolAdminArg::String(name.clone())),
+            ("force", LivePoolAdminArg::Bool(args.force)),
+        ]),
     );
 
     // Check dataset exists
