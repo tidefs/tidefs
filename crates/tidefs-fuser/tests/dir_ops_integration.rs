@@ -14,8 +14,8 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use fuser::{
-    FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyDirectory, ReplyDirectoryPlus,
-    ReplyEmpty, ReplyEntry, ReplyOpen, Request, FUSE_ROOT_ID, MountOption,
+    FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyDirectory,
+    ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyOpen, Request, FUSE_ROOT_ID,
 };
 
 // ---------------------------------------------------------------------------
@@ -570,7 +570,10 @@ fn run_as_denied_user(op: impl FnOnce() -> std::io::Result<()>) -> i32 {
     let mut status = 0;
     let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
     assert_eq!(waited, pid, "waitpid failed");
-    assert!(libc::WIFEXITED(status), "child did not exit normally: {status}");
+    assert!(
+        libc::WIFEXITED(status),
+        "child did not exit normally: {status}"
+    );
     libc::WEXITSTATUS(status)
 }
 

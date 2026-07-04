@@ -447,18 +447,16 @@ mod tests {
 
     #[test]
     fn unlink_parent_permission_denied_without_write_bit() {
-        let err =
-            check_unlink_parent_permission(0o100, 1000, 100, 1000, 100, &[], &VALID_MOUNT)
-                .unwrap_err();
+        let err = check_unlink_parent_permission(0o100, 1000, 100, 1000, 100, &[], &VALID_MOUNT)
+            .unwrap_err();
         assert_eq!(err, UnlinkError::PermissionDenied);
         assert_eq!(err.to_errno(), errno::EACCES);
     }
 
     #[test]
     fn unlink_parent_permission_denied_without_execute_bit() {
-        let err =
-            check_unlink_parent_permission(0o200, 1000, 100, 1000, 100, &[], &VALID_MOUNT)
-                .unwrap_err();
+        let err = check_unlink_parent_permission(0o200, 1000, 100, 1000, 100, &[], &VALID_MOUNT)
+            .unwrap_err();
         assert_eq!(err, UnlinkError::PermissionDenied);
         assert_eq!(err.to_errno(), errno::EACCES);
     }

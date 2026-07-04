@@ -781,8 +781,8 @@ mod tests {
 
     #[test]
     fn readdir_permission_denied_maps_to_eacces() {
-        let err = check_readdir_permission(0o000, 1000, 100, 2000, 200, &[], &VALID_MOUNT)
-            .unwrap_err();
+        let err =
+            check_readdir_permission(0o000, 1000, 100, 2000, 200, &[], &VALID_MOUNT).unwrap_err();
         assert_eq!(err, ReadDirError::PermissionDenied);
         assert_eq!(err.to_errno(), libc::EACCES);
     }
