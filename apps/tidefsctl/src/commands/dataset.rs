@@ -1009,7 +1009,7 @@ fn handle_create(args: DatasetCreateArgs) {
         args.json,
         super::live_owner::live_admin_args([
             ("target", LivePoolAdminArg::String(args.target.clone())),
-            ("name", LivePoolAdminArg::String(leaf.clone())),
+            ("name", LivePoolAdminArg::String(leaf.to_string())),
             ("parent", LivePoolAdminArg::String(parent.clone())),
             (
                 "type",
@@ -1018,12 +1018,17 @@ fn handle_create(args: DatasetCreateArgs) {
             (
                 "mountpoint",
                 super::live_owner::live_admin_optional_string(
-                    mountpoint.as_ref().map(|path| path.display().to_string()),
+                    mountpoint.as_ref().map(|path| path.to_string()),
                 ),
             ),
             (
                 "properties",
-                super::live_owner::live_admin_arg_from_json(property_assignments_json(&properties)),
+                LivePoolAdminArg::Array(
+                    property_assignments_json(&properties)
+                        .into_iter()
+                        .map(super::live_owner::live_admin_arg_from_json)
+                        .collect(),
+                ),
             ),
             (
                 "features",
