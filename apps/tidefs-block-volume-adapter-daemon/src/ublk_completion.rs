@@ -14,9 +14,21 @@ use tidefs_ublk_abi::{
 pub const UBLK_COMPLETION_ARTIFACT_ENV: &str = "TIDEFS_UBLK_COMPLETION_ARTIFACT";
 pub const UBLK_COMPLETION_ARTIFACT_MAX_COMPLETIONS_ENV: &str =
     "TIDEFS_UBLK_COMPLETION_ARTIFACT_MAX_COMPLETIONS";
+pub const UBLK_COMPLETION_ARTIFACT_SCENARIO_ENV: &str = "TIDEFS_UBLK_COMPLETION_ARTIFACT_SCENARIO";
+pub const UBLK_COMPLETION_ARTIFACT_INJECT_ERROR_OP_ENV: &str =
+    "TIDEFS_UBLK_COMPLETION_ARTIFACT_INJECT_ERROR_OP";
+pub const UBLK_COMPLETION_ARTIFACT_INJECT_ERROR_RESULT_ENV: &str =
+    "TIDEFS_UBLK_COMPLETION_ARTIFACT_INJECT_ERROR_RESULT";
 pub const UBLK_COMPLETION_ARTIFACT_DEFAULT_MAX_COMPLETIONS: usize = 512;
+pub const UBLK_COMPLETION_ARTIFACT_DEFAULT_SCENARIO: &str = "qemu-ublk-smoke";
 pub const UBLK_COMPLETION_ARTIFACT_EVIDENCE_CLASS: &str = "runtime-ublk-completion-artifact";
 pub const UBLK_COMPLETION_ARTIFACT_CLAIM_ID: &str = "ublk.qid_tag.exactly_once_completion.v1";
+pub const UBLK_COMPLETION_ARTIFACT_NON_CLAIMS: &[&str] = &[
+    "bounded_qemu_runtime_row",
+    "not_block_device_product_readiness",
+    "not_release_or_production_readiness",
+    "not_successor_or_comparator_evidence",
+];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UblkCompletionOperationKind {
@@ -56,6 +68,51 @@ impl UblkCompletionOperationKind {
             Self::Release => "release",
         }
     }
+
+    #[must_use]
+    fn from_trace_str(value: &str) -> Option<Self> {
+        match value {
+            "read" => Some(Self::Read),
+            "write" => Some(Self::Write),
+            "flush" => Some(Self::Flush),
+            "discard" => Some(Self::Discard),
+            "write_zeroes" => Some(Self::WriteZeroes),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct UblkCompletionErrorInjection {
+    operation_kind: UblkCompletionOperationKind,
+    terminal_result: i32,
+    consumed: bool,
+}
+
+impl UblkCompletionErrorInjection {
+    fn from_env() -> Option<Self> {
+        let operation_kind = env::var(UBLK_COMPLETION_ARTIFACT_INJECT_ERROR_OP_ENV)
+            .ok()
+            .and_then(|value| UblkCompletionOperationKind::from_trace_str(value.trim()))?;
+        let terminal_result = env::var(UBLK_COMPLETION_ARTIFACT_INJECT_ERROR_RESULT_ENV)
+            .ok()
+            .and_then(|value| value.parse::<i32>().ok())
+            .filter(|result| *result < 0)
+            .unwrap_or(-libc::EIO);
+        Some(Self {
+            operation_kind,
+            terminal_result,
+            consumed: false,
+        })
+    }
+
+    fn maybe_inject(&mut self, operation_kind: UblkCompletionOperationKind, result: i32) -> i32 {
+        if self.consumed || self.operation_kind != operation_kind || result < 0 {
+            return result;
+        }
+        self.consumed = true;
+        self.terminal_result
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -88,6 +145,7 @@ struct UblkCompletionSlotTrace {
 
 pub struct UblkCompletionTrace {
     path: Option<PathBuf>,
+    scenario: String,
     nr_hw_queues: u16,
     queue_depth: u16,
     max_completed_requests: usize,
@@ -95,6 +153,7 @@ pub struct UblkCompletionTrace {
     next_sequence: u64,
     slots: BTreeMap<(u16, u16), UblkCompletionSlotTrace>,
     events: Vec<UblkCompletionTraceEvent>,
+    error_injection: Option<UblkCompletionErrorInjection>,
 }
 
 impl UblkCompletionTrace {
@@ -108,9 +167,15 @@ impl UblkCompletionTrace {
             .and_then(|value| value.parse::<usize>().ok())
             .filter(|value| *value > 0)
             .unwrap_or(UBLK_COMPLETION_ARTIFACT_DEFAULT_MAX_COMPLETIONS);
+        let scenario = env::var(UBLK_COMPLETION_ARTIFACT_SCENARIO_ENV)
+            .ok()
+            .filter(|value| is_valid_scenario(value))
+            .unwrap_or_else(|| UBLK_COMPLETION_ARTIFACT_DEFAULT_SCENARIO.to_string());
+        let error_injection = UblkCompletionErrorInjection::from_env();
 
         Self {
             path,
+            scenario,
             nr_hw_queues,
             queue_depth,
             max_completed_requests,
@@ -118,12 +183,23 @@ impl UblkCompletionTrace {
             next_sequence: 1,
             slots: BTreeMap::new(),
             events: Vec::new(),
+            error_injection,
         }
     }
 
     #[must_use]
     pub const fn is_enabled(&self) -> bool {
         self.path.is_some()
+    }
+
+    pub fn maybe_inject_terminal_result(
+        &mut self,
+        operation_kind: UblkCompletionOperationKind,
+        result: i32,
+    ) -> i32 {
+        self.error_injection.as_mut().map_or(result, |injection| {
+            injection.maybe_inject(operation_kind, result)
+        })
     }
 
     pub fn record_fetch_submitted(&mut self, qid: u16, tag: u16) {
@@ -384,7 +460,17 @@ impl UblkCompletionTrace {
             UBLK_COMPLETION_ARTIFACT_EVIDENCE_CLASS
         );
         out.push_str("  \"evidence_scope\": \"bounded runtime uBLK daemon qid/tag completion lifecycle trace\",\n");
-        out.push_str("  \"scenario\": \"qemu-ublk-smoke\",\n");
+        let _ = writeln!(out, "  \"scenario\": \"{}\",", self.scenario);
+        out.push_str("  \"non_claims\": [\n");
+        for (index, non_claim) in UBLK_COMPLETION_ARTIFACT_NON_CLAIMS.iter().enumerate() {
+            let comma = if index + 1 == UBLK_COMPLETION_ARTIFACT_NON_CLAIMS.len() {
+                ""
+            } else {
+                ","
+            };
+            let _ = writeln!(out, "    \"{}\"{}", non_claim, comma);
+        }
+        out.push_str("  ],\n");
         let _ = writeln!(out, "  \"nr_hw_queues\": {},", self.nr_hw_queues);
         let _ = writeln!(out, "  \"queue_depth\": {},", self.queue_depth);
         let _ = writeln!(
@@ -432,17 +518,27 @@ impl UblkCompletionTrace {
     }
 }
 
+fn is_valid_scenario(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
 /// Convert an io_uring completion result into a ublk I/O command result.
 ///
-/// Successful operations map to `UBLK_IO_RES_OK`; dispatcher errors carry the
-/// kernel errno as a negative result.
+/// Successful data operations report their transferred byte count to the
+/// kernel, zero-payload operations map to `UBLK_IO_RES_OK`, and dispatcher
+/// errors carry the kernel errno as a negative result.
 pub fn ublk_result_from_completion(
     completion: &crate::ublk_io_uring::UblkIoCompletionResult,
 ) -> i32 {
     match completion {
-        crate::ublk_io_uring::UblkIoCompletionResult::Read { .. }
-        | crate::ublk_io_uring::UblkIoCompletionResult::Write { .. }
-        | crate::ublk_io_uring::UblkIoCompletionResult::Flush { .. }
+        crate::ublk_io_uring::UblkIoCompletionResult::Read { bytes, .. }
+        | crate::ublk_io_uring::UblkIoCompletionResult::Write { bytes, .. } => {
+            i32::try_from(*bytes).unwrap_or(i32::MAX)
+        }
+        crate::ublk_io_uring::UblkIoCompletionResult::Flush { .. }
         | crate::ublk_io_uring::UblkIoCompletionResult::Discard { .. }
         | crate::ublk_io_uring::UblkIoCompletionResult::WriteZeroes { .. } => UBLK_IO_RES_OK,
         crate::ublk_io_uring::UblkIoCompletionResult::Error { errno, .. } => -errno,
@@ -487,18 +583,18 @@ mod dispatch_tests {
     }
 
     #[test]
-    fn ublk_result_maps_ok_to_zero() {
+    fn ublk_result_maps_data_to_byte_count_and_zero_payload_ops_to_ok() {
         use crate::ublk_io_uring::UblkIoCompletionResult;
         assert_eq!(
             ublk_result_from_completion(&UblkIoCompletionResult::Read { tag: 0, bytes: 512 }),
-            UBLK_IO_RES_OK
+            512
         );
         assert_eq!(
             ublk_result_from_completion(&UblkIoCompletionResult::Write {
                 tag: 1,
                 bytes: 1024
             }),
-            UBLK_IO_RES_OK
+            1024
         );
         assert_eq!(
             ublk_result_from_completion(&UblkIoCompletionResult::Flush { tag: 2 }),
@@ -549,9 +645,16 @@ mod dispatch_tests {
 
         let cmds = reap_ublk_completions(&mut dispatcher, 1);
         assert_eq!(cmds.len(), 3, "expected 3 completion cmds, got {cmds:?}");
+        assert!(
+            cmds.iter().any(|cmd| cmd.result == 512),
+            "read/write completions must include byte-count status: {cmds:?}"
+        );
+        assert!(
+            cmds.iter().any(|cmd| cmd.result == UBLK_IO_RES_OK),
+            "flush completion must keep OK status: {cmds:?}"
+        );
         for cmd in &cmds {
             assert_eq!(cmd.q_id, 1);
-            assert_eq!(cmd.result, UBLK_IO_RES_OK);
         }
         assert_eq!(&read_buf[..], &payload[..]);
     }

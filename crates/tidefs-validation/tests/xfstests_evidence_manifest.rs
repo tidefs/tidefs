@@ -16,6 +16,7 @@ fn valid_focused_manifest() -> XfstestsEvidenceManifest {
         evidence_scope: "focused".to_string(),
         tests: vec!["generic/001".to_string(), "generic/002".to_string()],
         artifact_paths: vec!["validation.json".to_string()],
+        selection_error: None,
         started_at: Some("2026-06-20T18:00:00Z".to_string()),
         finished_at: Some("2026-06-20T20:00:00Z".to_string()),
     }
@@ -33,6 +34,7 @@ fn valid_broad_manifest() -> XfstestsEvidenceManifest {
         evidence_scope: "broad".to_string(),
         tests: vec![],
         artifact_paths: vec!["validation.json".to_string()],
+        selection_error: None,
         started_at: None,
         finished_at: None,
     }

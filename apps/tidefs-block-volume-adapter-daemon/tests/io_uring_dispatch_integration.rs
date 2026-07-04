@@ -174,10 +174,16 @@ fn reap_ublk_completions_returns_correct_ublk_cmds() {
     let cmds = reap_ublk_completions(&mut d, 7);
     assert_eq!(cmds.len(), 2, "expected 2 ublk cmds, got {cmds:?}");
 
-    for cmd in &cmds {
-        assert_eq!(cmd.q_id, 7);
-        assert_eq!(cmd.result, UBLK_IO_RES_OK);
-    }
+    assert!(
+        cmds.iter()
+            .any(|cmd| cmd.q_id == 7 && cmd.result == UBLK_IO_RES_OK),
+        "expected one payload-free flush completion, got {cmds:?}"
+    );
+    assert!(
+        cmds.iter()
+            .any(|cmd| cmd.q_id == 7 && cmd.result == BLOCK_SIZE as i32),
+        "expected one read byte-count completion, got {cmds:?}"
+    );
 
     assert_eq!(&rbuf[..], &wpayload[..]);
     assert_eq!(d.read_ops, 1);

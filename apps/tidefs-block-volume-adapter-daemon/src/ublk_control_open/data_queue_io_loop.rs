@@ -507,7 +507,7 @@ fn run_ublk_data_queue_io_loop_impl(
                                                     for (q_id, tag, is_reissued_fetch) in
                                                         pending_fetch_tags
                                                     {
-                                                        let result: i32;
+                                                        let mut result: i32;
                                                         if let Some(worker) =
                                                             data_workers.get_mut(usize::from(q_id))
                                                         {
@@ -622,6 +622,13 @@ fn run_ublk_data_queue_io_loop_impl(
                                                                         error.linux_errno()
                                                                     }
                                                                 };
+                                                                result = completion_trace
+                                                                    .maybe_inject_terminal_result(
+                                                                        UblkCompletionOperationKind::from_ublk_op(
+                                                                            io_desc.op(),
+                                                                        ),
+                                                                        result,
+                                                                    );
 
                                                                 image_bytes_read += worker
                                                                     .bytes_read
@@ -799,7 +806,7 @@ fn run_ublk_data_queue_io_loop_impl(
                                                         for (q_id, tag, is_reissued_fetch) in
                                                             pending_tags
                                                         {
-                                                            let result: i32;
+                                                            let mut result: i32;
                                                             if let Some(ref mut worker) =
                                                                 data_workers
                                                                     .get_mut(usize::from(q_id))
@@ -899,6 +906,13 @@ fn run_ublk_data_queue_io_loop_impl(
                                                                             error.linux_errno()
                                                                         }
                                                                     };
+                                                                    result = completion_trace
+                                                                        .maybe_inject_terminal_result(
+                                                                            UblkCompletionOperationKind::from_ublk_op(
+                                                                                io_desc.op(),
+                                                                            ),
+                                                                            result,
+                                                                        );
                                                                 } else {
                                                                     result = -libc::EINVAL;
                                                                 }
@@ -1271,7 +1285,7 @@ mod tests {
             io_cmd: UblkSrvIoCmd {
                 q_id: 0,
                 tag: 7,
-                result: i32::try_from(byte_count).unwrap_or(i32::MAX),
+                result: UBLK_IO_RES_OK,
                 addr_or_zone_append_lba: 0,
             },
             byte_count,

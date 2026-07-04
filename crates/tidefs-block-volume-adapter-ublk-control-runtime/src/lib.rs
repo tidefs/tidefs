@@ -3665,10 +3665,12 @@ pub fn open_data_queue_runtime(
     let mut cmd_buf_ptrs: Vec<*const u8> = Vec::with_capacity(nr_hw_queues);
     let mut cmd_buf_lens: Vec<usize> = Vec::with_capacity(nr_hw_queues);
 
-    // Linux 7.0 ublk_ch_mmap: per-queue PROT_READ command buffer.
-    // Stride = PAGE_SIZE stride: all queues alias q0; nr_hw_queues=1() matching kernel's max_sz.
+    // Linux 7.0 ublk_ch_mmap indexes command buffers by max-depth stride:
+    // q_id = (phys_off - UBLKSRV_CMD_BUF_OFFSET) / ublk_max_cmd_buf_size().
     for q_id in 0..nr_hw_queues {
-        let mmap_offset = (q_id * 4096) as libc::off_t; /* PAGE_SIZE stride; nr_hw_queues=1 ensures all queues alias q0 */
+        let Some(mmap_offset) = tidefs_ublk_abi::ublk_cmd_buf_mmap_offset(q_id as u16) else {
+            return Err(UblkDataQueueRuntimeOpenError::MmapFailed(libc::EINVAL));
+        };
         // SAFETY: data_queue_file is the open /dev/ublkcN fd; the kernel ublk
         // mmap contract provides a read-only command buffer for this offset.
         let ptr = unsafe {
@@ -3678,7 +3680,7 @@ pub fn open_data_queue_runtime(
                 libc::PROT_READ,
                 libc::MAP_SHARED,
                 data_queue_file.as_raw_fd(),
-                mmap_offset,
+                mmap_offset as libc::off_t,
             )
         };
         if ptr == libc::MAP_FAILED {

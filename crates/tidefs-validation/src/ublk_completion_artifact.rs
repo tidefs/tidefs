@@ -8,6 +8,19 @@ use std::path::Path;
 
 pub const UBLK_COMPLETION_ARTIFACT_EVIDENCE_CLASS: &str = "runtime-ublk-completion-artifact";
 pub const UBLK_COMPLETION_ARTIFACT_CLAIM_ID: &str = "ublk.qid_tag.exactly_once_completion.v1";
+pub const UBLK_QID_TAG_RUNTIME_SCENARIO: &str = "qemu-ublk-qid-tag-runtime";
+pub const UBLK_QID_TAG_RUNTIME_ERROR_INJECTION_SCENARIO: &str =
+    "qemu-ublk-qid-tag-runtime-error-injection";
+const UBLK_QID_TAG_RUNTIME_MIN_QUEUES: u16 = 2;
+const UBLK_QID_TAG_RUNTIME_MIN_QUEUE_DEPTH: u16 = 64;
+const UBLK_COMPLETION_REQUIRED_NON_CLAIMS: &[&str] = &[
+    "bounded_qemu_runtime_row",
+    "not_block_device_product_readiness",
+    "not_release_or_production_readiness",
+    "not_successor_or_comparator_evidence",
+];
+const UBLK_QID_TAG_RUNTIME_REQUIRED_OPS: &[&str] =
+    &["read", "write", "discard", "write_zeroes"];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UblkCompletionArtifactSummary {
@@ -50,6 +63,8 @@ struct UblkCompletionArtifact {
     evidence_class: String,
     evidence_scope: String,
     scenario: String,
+    #[serde(default)]
+    non_claims: Vec<String>,
     nr_hw_queues: u16,
     queue_depth: u16,
     max_completed_requests: usize,
@@ -159,6 +174,13 @@ fn validate_ublk_completion_artifact(
     let mut saw_completion_submitted = false;
     let mut saw_completion_cqe = false;
     let mut saw_queue_released = false;
+    let mut fetch_submitted_slots = BTreeSet::<(u16, u16)>::new();
+    let mut queue_released_slots = BTreeSet::<(u16, u16)>::new();
+    let mut terminal_qids = BTreeSet::<u16>::new();
+    let mut terminal_tags = BTreeSet::<u16>::new();
+    let mut terminal_ops = BTreeSet::<String>::new();
+    let mut negative_terminal_count = 0usize;
+    let mut negative_terminal_ops = BTreeSet::<String>::new();
 
     for event in &artifact.events {
         if let Some(previous) = last_sequence {
@@ -194,6 +216,7 @@ fn validate_ublk_completion_artifact(
         match event.lifecycle_state.as_str() {
             "fetch_submitted" => {
                 saw_fetch_submitted = true;
+                fetch_submitted_slots.insert((event.qid, event.tag));
                 if event.terminal_result.is_some() {
                     failures.push(format!(
                         "event {} fetch_submitted must not carry terminal_result",
@@ -283,7 +306,13 @@ fn validate_ublk_completion_artifact(
                 }
                 slot.in_flight_generation_token = None;
                 slot.pending_completion_cqe = Some(event.generation_token);
-                let _ = terminal_result;
+                terminal_qids.insert(event.qid);
+                terminal_tags.insert(event.tag);
+                terminal_ops.insert(event.operation_kind.clone());
+                if terminal_result < 0 {
+                    negative_terminal_count = negative_terminal_count.saturating_add(1);
+                    negative_terminal_ops.insert(event.operation_kind.clone());
+                }
                 terminal_completion_count = terminal_completion_count.saturating_add(1);
             }
             "completion_cqe" => {
@@ -334,11 +363,18 @@ fn validate_ublk_completion_artifact(
                     ));
                 }
                 slot.in_flight_generation_token = None;
-                let _ = terminal_result;
+                terminal_qids.insert(event.qid);
+                terminal_tags.insert(event.tag);
+                terminal_ops.insert(event.operation_kind.clone());
+                if terminal_result < 0 {
+                    negative_terminal_count = negative_terminal_count.saturating_add(1);
+                    negative_terminal_ops.insert(event.operation_kind.clone());
+                }
                 terminal_completion_count = terminal_completion_count.saturating_add(1);
             }
             "queue_released" => {
                 saw_queue_released = true;
+                queue_released_slots.insert((event.qid, event.tag));
                 if event.terminal_result.is_some() {
                     failures.push(format!(
                         "event {} queue_released must not carry terminal_result",
@@ -382,15 +418,17 @@ fn validate_ublk_completion_artifact(
         }
     }
 
-    for (state, saw) in [
-        ("fetch_submitted", saw_fetch_submitted),
-        ("request_fetched", saw_request_fetched),
-        ("request_reissued", saw_request_reissued),
-        ("completion_submitted", saw_completion_submitted),
-        ("completion_cqe", saw_completion_cqe),
-        ("queue_released", saw_queue_released),
+    let require_reissue_and_cqe =
+        artifact.scenario.as_str() != UBLK_QID_TAG_RUNTIME_ERROR_INJECTION_SCENARIO;
+    for (state, saw, required) in [
+        ("fetch_submitted", saw_fetch_submitted, true),
+        ("request_fetched", saw_request_fetched, true),
+        ("request_reissued", saw_request_reissued, require_reissue_and_cqe),
+        ("completion_submitted", saw_completion_submitted, true),
+        ("completion_cqe", saw_completion_cqe, require_reissue_and_cqe),
+        ("queue_released", saw_queue_released, true),
     ] {
-        if !saw {
+        if required && !saw {
             failures.push(format!(
                 "artifact does not observe lifecycle state `{state}`"
             ));
@@ -399,6 +437,17 @@ fn validate_ublk_completion_artifact(
     if terminal_completion_count == 0 {
         failures.push("artifact records no terminal completions".to_string());
     }
+    validate_scenario_contract(
+        &artifact,
+        &fetch_submitted_slots,
+        &queue_released_slots,
+        &terminal_qids,
+        &terminal_tags,
+        &terminal_ops,
+        negative_terminal_count,
+        &negative_terminal_ops,
+        &mut failures,
+    );
 
     if failures.is_empty() {
         Ok(UblkCompletionArtifactSummary {
@@ -412,9 +461,120 @@ fn validate_ublk_completion_artifact(
     }
 }
 
+fn validate_scenario_contract(
+    artifact: &UblkCompletionArtifact,
+    fetch_submitted_slots: &BTreeSet<(u16, u16)>,
+    queue_released_slots: &BTreeSet<(u16, u16)>,
+    terminal_qids: &BTreeSet<u16>,
+    terminal_tags: &BTreeSet<u16>,
+    terminal_ops: &BTreeSet<String>,
+    negative_terminal_count: usize,
+    negative_terminal_ops: &BTreeSet<String>,
+    failures: &mut Vec<String>,
+) {
+    let require_operation_breadth = match artifact.scenario.as_str() {
+        UBLK_QID_TAG_RUNTIME_SCENARIO => true,
+        UBLK_QID_TAG_RUNTIME_ERROR_INJECTION_SCENARIO => false,
+        _ => return,
+    };
+
+    if artifact.nr_hw_queues < UBLK_QID_TAG_RUNTIME_MIN_QUEUES {
+        failures.push(format!(
+            "scenario `{}` requires nr_hw_queues >= {}, found {}",
+            artifact.scenario, UBLK_QID_TAG_RUNTIME_MIN_QUEUES, artifact.nr_hw_queues
+        ));
+    }
+    if artifact.queue_depth < UBLK_QID_TAG_RUNTIME_MIN_QUEUE_DEPTH {
+        failures.push(format!(
+            "scenario `{}` requires queue_depth >= {}, found {}",
+            artifact.scenario, UBLK_QID_TAG_RUNTIME_MIN_QUEUE_DEPTH, artifact.queue_depth
+        ));
+    }
+
+    for non_claim in UBLK_COMPLETION_REQUIRED_NON_CLAIMS {
+        if !artifact
+            .non_claims
+            .iter()
+            .any(|actual| actual.as_str() == *non_claim)
+        {
+            failures.push(format!(
+                "scenario `{}` non_claims must include `{non_claim}`",
+                artifact.scenario
+            ));
+        }
+    }
+
+    let expected_slots = usize::from(artifact.nr_hw_queues) * usize::from(artifact.queue_depth);
+    if fetch_submitted_slots.len() != expected_slots {
+        failures.push(format!(
+            "scenario `{}` must submit FETCH_REQ for every configured qid/tag slot; expected {}, found {}",
+            artifact.scenario,
+            expected_slots,
+            fetch_submitted_slots.len()
+        ));
+    }
+    if queue_released_slots.len() != expected_slots {
+        failures.push(format!(
+            "scenario `{}` must release every configured qid/tag slot during teardown; expected {}, found {}",
+            artifact.scenario,
+            expected_slots,
+            queue_released_slots.len()
+        ));
+    }
+
+    if require_operation_breadth {
+        if terminal_qids.len() < usize::from(UBLK_QID_TAG_RUNTIME_MIN_QUEUES) {
+            failures.push(format!(
+                "scenario `{}` must terminally complete requests on at least two queues; found qids {:?}",
+                artifact.scenario, terminal_qids
+            ));
+        }
+        if terminal_tags.len() < 2 {
+            failures.push(format!(
+                "scenario `{}` must terminally complete multiple tags; found tags {:?}",
+                artifact.scenario, terminal_tags
+            ));
+        }
+        for operation in UBLK_QID_TAG_RUNTIME_REQUIRED_OPS {
+            if !terminal_ops
+                .iter()
+                .any(|actual| actual.as_str() == *operation)
+            {
+                failures.push(format!(
+                    "scenario `{}` must terminally complete `{operation}`",
+                    artifact.scenario
+                ));
+            }
+        }
+        if negative_terminal_count != 0 {
+            failures.push(format!(
+                "scenario `{}` success artifact must not contain negative terminal results",
+                artifact.scenario
+            ));
+        }
+    } else {
+        if negative_terminal_count == 0 {
+            failures.push(format!(
+                "scenario `{}` must record at least one negative terminal completion",
+                artifact.scenario
+            ));
+        }
+        if !negative_terminal_ops
+            .iter()
+            .any(|operation| operation.as_str() == "write")
+        {
+            failures.push(format!(
+                "scenario `{}` must include a negative write terminal completion",
+                artifact.scenario
+            ));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
 
     fn valid_artifact() -> String {
         r#"{
@@ -457,6 +617,88 @@ mod tests {
         text.clear();
     }
 
+    fn qid_tag_runtime_artifact(scenario: &str, operations: &[(&str, u16, u16, i32)]) -> String {
+        let nr_hw_queues = 2_u16;
+        let queue_depth = 64_u16;
+        let mut sequence = 1_u64;
+        let mut current_generation =
+            vec![vec![0_u64; usize::from(queue_depth)]; usize::from(nr_hw_queues)];
+        let mut events = Vec::<String>::new();
+
+        for qid in 0..nr_hw_queues {
+            for tag in 0..queue_depth {
+                events.push(format!(
+                    r#"    {{"sequence": {sequence}, "qid": {qid}, "tag": {tag}, "generation_token": 0, "operation_kind": "fetch", "lifecycle_state": "fetch_submitted", "terminal_result": null, "source": "initial_fetch_req_submit"}}"#
+                ));
+                sequence += 1;
+            }
+        }
+
+        for (operation, qid, tag, terminal_result) in operations {
+            let generation = current_generation[usize::from(*qid)][usize::from(*tag)] + 1;
+            current_generation[usize::from(*qid)][usize::from(*tag)] = generation;
+            let fetch_state = if generation == 1 {
+                "request_fetched"
+            } else {
+                "request_reissued"
+            };
+            let fetch_source = if generation == 1 {
+                "fetch_req_cqe"
+            } else {
+                "commit_and_fetch_cqe"
+            };
+            events.push(format!(
+                r#"    {{"sequence": {sequence}, "qid": {qid}, "tag": {tag}, "generation_token": {generation}, "operation_kind": "{operation}", "lifecycle_state": "{fetch_state}", "terminal_result": null, "source": "{fetch_source}"}}"#
+            ));
+            sequence += 1;
+            events.push(format!(
+                r#"    {{"sequence": {sequence}, "qid": {qid}, "tag": {tag}, "generation_token": {generation}, "operation_kind": "{operation}", "lifecycle_state": "completion_submitted", "terminal_result": {terminal_result}, "source": "daemon_commit_and_fetch_submit"}}"#
+            ));
+            sequence += 1;
+            events.push(format!(
+                r#"    {{"sequence": {sequence}, "qid": {qid}, "tag": {tag}, "generation_token": {generation}, "operation_kind": "{operation}", "lifecycle_state": "completion_cqe", "terminal_result": {terminal_result}, "source": "commit_and_fetch_cqe"}}"#
+            ));
+            sequence += 1;
+        }
+
+        for qid in 0..nr_hw_queues {
+            for tag in 0..queue_depth {
+                let generation = current_generation[usize::from(qid)][usize::from(tag)];
+                events.push(format!(
+                    r#"    {{"sequence": {sequence}, "qid": {qid}, "tag": {tag}, "generation_token": {generation}, "operation_kind": "release", "lifecycle_state": "queue_released", "terminal_result": null, "source": "data_queue_release"}}"#
+                ));
+                sequence += 1;
+            }
+        }
+
+        let mut text = String::new();
+        let _ = writeln!(
+            text,
+            r#"{{
+  "report_version": 1,
+  "generated_by": "tidefs-block-volume-adapter-daemon",
+  "claim_ids": ["ublk.qid_tag.exactly_once_completion.v1"],
+  "evidence_class": "runtime-ublk-completion-artifact",
+  "evidence_scope": "bounded runtime uBLK daemon qid/tag completion lifecycle trace",
+  "scenario": "{scenario}",
+  "non_claims": [
+    "bounded_qemu_runtime_row",
+    "not_block_device_product_readiness",
+    "not_release_or_production_readiness",
+    "not_successor_or_comparator_evidence"
+  ],
+  "nr_hw_queues": {nr_hw_queues},
+  "queue_depth": {queue_depth},
+  "max_completed_requests": 512,
+  "events": [
+{}
+  ]
+}}"#,
+            events.join(",\n")
+        );
+        text
+    }
+
     #[test]
     fn accepts_bounded_runtime_completion_artifact() {
         let summary =
@@ -465,6 +707,83 @@ mod tests {
         assert_eq!(summary.terminal_completion_count, 3);
         assert_eq!(summary.nr_hw_queues, 1);
         assert_eq!(summary.queue_depth, 2);
+    }
+
+    #[test]
+    fn accepts_qid_tag_runtime_contract_artifact() {
+        let text = qid_tag_runtime_artifact(
+            UBLK_QID_TAG_RUNTIME_SCENARIO,
+            &[
+                ("read", 0, 0, 4096),
+                ("write", 1, 0, 4096),
+                ("flush", 0, 0, 0),
+                ("discard", 1, 1, 0),
+                ("write_zeroes", 0, 2, 0),
+            ],
+        );
+        let summary = validate_ublk_completion_artifact_json(&text).expect("valid artifact");
+        assert_eq!(summary.nr_hw_queues, 2);
+        assert_eq!(summary.queue_depth, 64);
+        assert_eq!(summary.terminal_completion_count, 5);
+    }
+
+    #[test]
+    fn accepts_qid_tag_error_injection_contract_artifact() {
+        let text = qid_tag_runtime_artifact(
+            UBLK_QID_TAG_RUNTIME_ERROR_INJECTION_SCENARIO,
+            &[("read", 0, 0, 4096), ("write", 0, 0, -5)],
+        );
+        let summary = validate_ublk_completion_artifact_json(&text).expect("valid artifact");
+        assert_eq!(summary.terminal_completion_count, 2);
+    }
+
+    #[test]
+    fn accepts_qid_tag_error_injection_without_reissue_or_completion_cqe() {
+        let text = qid_tag_runtime_artifact(
+            UBLK_QID_TAG_RUNTIME_ERROR_INJECTION_SCENARIO,
+            &[
+                ("read", 1, 16, 4096),
+                ("read", 1, 17, 4096),
+                ("write", 1, 18, -5),
+            ],
+        )
+        .lines()
+        .filter(|line| !line.contains(r#""lifecycle_state": "completion_cqe""#))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+        let summary = validate_ublk_completion_artifact_json(&text).expect("valid artifact");
+        assert_eq!(summary.terminal_completion_count, 3);
+    }
+
+    #[test]
+    fn rejects_focused_smoke_shape_for_qid_tag_runtime_contract() {
+        let text = valid_artifact().replace(
+            r#""scenario": "qemu-ublk-smoke""#,
+            r#""scenario": "qemu-ublk-qid-tag-runtime""#,
+        );
+        assert_invalid_contains(text, "requires nr_hw_queues >= 2");
+    }
+
+    #[test]
+    fn rejects_runtime_contract_without_operation_breadth() {
+        let text = qid_tag_runtime_artifact(
+            UBLK_QID_TAG_RUNTIME_SCENARIO,
+            &[("read", 0, 0, 4096), ("write", 1, 0, 4096), ("write_zeroes", 0, 1, 0)],
+        );
+        assert_invalid_contains(text, "must terminally complete `discard`");
+    }
+
+    #[test]
+    fn rejects_error_injection_contract_without_negative_completion() {
+        let text = qid_tag_runtime_artifact(
+            UBLK_QID_TAG_RUNTIME_ERROR_INJECTION_SCENARIO,
+            &[("read", 0, 0, 4096), ("write", 0, 0, 4096)],
+        );
+        assert_invalid_contains(
+            text,
+            "must record at least one negative terminal completion",
+        );
     }
 
     #[test]

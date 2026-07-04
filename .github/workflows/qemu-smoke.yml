@@ -19,6 +19,7 @@ on:
           - two-node-carrier-validation
           - fuse-vm-test
           - qemu-ublk-smoke
+          - qemu-ublk-qid-tag-runtime
           - receipt-bound-reclaim-runtime
           - scrub-foreground-read-runtime
           - all
@@ -77,6 +78,10 @@ jobs:
             name: qemu-ublk-smoke
             command: nix run .#qemu-ublk-smoke -- --timeout 3600
             output_dir: /tmp/tidefs-validation/ublk
+          - id: qemu-ublk-qid-tag-runtime
+            name: qemu-ublk-qid-tag-runtime
+            command: nix run .#qemu-ublk-qid-tag-runtime -- --timeout 3600 --validation-dir /tmp/tidefs-validation/ublk-qid-tag-runtime
+            output_dir: /tmp/tidefs-validation/ublk-qid-tag-runtime
           - id: receipt-bound-reclaim-runtime
             name: receipt-bound-reclaim-runtime
             command: nix develop .#ci --command cargo run --locked -p tidefs-validation --features receipt-bound-physical-reclaim --bin receipt-bound-reclaim-validation -- --row receipt-bound-obsolete-location-trim --output-dir /tmp/tidefs-validation/receipt-bound-reclaim-runtime

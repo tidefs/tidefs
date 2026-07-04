@@ -3446,9 +3446,21 @@ EOF
             pkgs.busybox
             pkgs.cpio
             pkgs.qemu
+            pkgs.util-linux
             self.packages.${system}.ublkCompletionArtifactValidation
           ] ''
             exec ${self.packages.${system}.ublkCompletionArtifactValidation}/bin/tidefs-ublk-completion-artifact-validation "$@"
+          '';
+          qemu-ublk-qid-tag-runtime = script "tidefs-qemu-ublk-qid-tag-runtime" [
+            pkgs.bash
+            pkgs.coreutils
+            pkgs.busybox
+            pkgs.cpio
+            pkgs.qemu
+            pkgs.util-linux
+            self.packages.${system}.ublkCompletionArtifactValidation
+          ] ''
+            exec ${self.packages.${system}.ublkCompletionArtifactValidation}/bin/tidefs-ublk-completion-artifact-validation --scenario qemu-ublk-qid-tag-runtime "$@"
           '';
           two-node-carrier-validation = script "tidefs-two-node-carrier-validation" [
             pkgs.bash

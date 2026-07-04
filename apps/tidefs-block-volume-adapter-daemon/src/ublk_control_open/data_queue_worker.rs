@@ -18,7 +18,7 @@ use crate::LINUX_SECTOR_SIZE_BYTES;
 use crate::{BarrierAuditLog, BarrierResult, BarrierType};
 
 pub const BLOCK_VOLUME_UBLK_DATA_QUEUE_WORKER_GATE_OW_301Z: &str =
-    "OW-301Z block-volume adapter ublk data-queue worker dispatches read/write/flush descriptors to the backing image and returns kernel-visible completion status";
+    "OW-301Z block-volume adapter ublk data-queue worker dispatches read/write/flush descriptors to the backing image and returns kernel-visible completion results";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DataQueueWorkerError {
@@ -270,9 +270,6 @@ impl DataQueueWorker {
                     io_cmd: UblkSrvIoCmd {
                         q_id: self.queue_id,
                         tag,
-                        // Return byte_count as the ublk result so the kernel does not
-                        // misinterpret UBLK_IO_RES_OK (0) as "nothing read" in
-                        // __ublk_complete_rq (!io->res && REQ_OP_READ).
                         result: i32::try_from(n).unwrap_or(i32::MAX),
                         addr_or_zone_append_lba: 0,
                     },
@@ -296,7 +293,37 @@ impl DataQueueWorker {
         write_payload: Option<&[u8]>,
     ) -> Result<DataQueueWorkerResultEntry, DataQueueWorkerError> {
         // Accept all kernel raw flags; FUA handled below for write durability.
-        let _ = raw_flags;
+        if desc.count_or_zones == 0 {
+            if desc.start_sector != 0 || raw_flags & UBLK_IO_F_FUA == 0 {
+                return Err(DataQueueWorkerError::ZeroLengthDataOperation);
+            }
+            return match dispatcher.flush() {
+                Ok(()) => {
+                    self.barrier_audit
+                        .record(BarrierType::FuaWrite, BarrierResult::Completed);
+                    self.write_ops += 1;
+                    self.completed_ops += 1;
+                    Ok(DataQueueWorkerResultEntry {
+                        tag,
+                        request_class: BlockVolumeRequestClass::Write,
+                        completion_class: BlockVolumeCompletionClass::Completed,
+                        io_cmd: UblkSrvIoCmd {
+                            q_id: self.queue_id,
+                            tag,
+                            result: UBLK_IO_RES_OK,
+                            addr_or_zone_append_lba: 0,
+                        },
+                        byte_count: 0,
+                    })
+                }
+                Err(e) => {
+                    self.error_ops += 1;
+                    self.barrier_audit
+                        .record(BarrierType::FuaWrite, BarrierResult::Failed);
+                    Err(DataQueueWorkerError::BackingStoreError(e.linux_errno()))
+                }
+            };
+        }
         let range = match self.project_range(desc) {
             Ok(range) => range,
             Err(DataQueueWorkerError::OutOfRange) => {
@@ -339,8 +366,6 @@ impl DataQueueWorker {
                     io_cmd: UblkSrvIoCmd {
                         q_id: self.queue_id,
                         tag,
-                        // Return byte_count so the kernel does not misinterpret
-                        // UBLK_IO_RES_OK (0) as "nothing written" and requeue.
                         result: i32::try_from(n).unwrap_or(i32::MAX),
                         addr_or_zone_append_lba: 0,
                     },
@@ -583,7 +608,46 @@ impl DataQueueWorker {
         write_payload: Option<&[u8]>,
     ) -> Result<DataQueueWorkerResultEntry, DataQueueWorkerError> {
         // Accept all kernel raw flags; FUA handled below for write durability.
-        let _ = raw_flags;
+        if desc.count_or_zones == 0 {
+            if desc.start_sector != 0 || raw_flags & UBLK_IO_F_FUA == 0 {
+                return Err(DataQueueWorkerError::ZeroLengthDataOperation);
+            }
+            return match backend.flush() {
+                Ok(()) => {
+                    let cr = backend.last_committed_root();
+                    self.barrier_audit.record_with_root(
+                        BarrierType::FuaWrite,
+                        BarrierResult::Completed,
+                        cr,
+                    );
+                    self.write_ops += 1;
+                    self.completed_ops += 1;
+                    Ok(DataQueueWorkerResultEntry {
+                        tag,
+                        request_class: BlockVolumeRequestClass::Write,
+                        completion_class: BlockVolumeCompletionClass::Completed,
+                        io_cmd: UblkSrvIoCmd {
+                            q_id: self.queue_id,
+                            tag,
+                            result: UBLK_IO_RES_OK,
+                            addr_or_zone_append_lba: 0,
+                        },
+                        byte_count: 0,
+                    })
+                }
+                Err(error) => {
+                    self.error_ops += 1;
+                    self.barrier_audit
+                        .record(BarrierType::FuaWrite, BarrierResult::Failed);
+                    let errno = match error {
+                        BackendError::Io(io) => -io.raw_os_error().unwrap_or(libc::EIO),
+                        BackendError::NoSpace => -libc::ENOSPC,
+                        _ => -libc::EIO,
+                    };
+                    Err(DataQueueWorkerError::BackingStoreError(errno))
+                }
+            };
+        }
         let range = match self.project_range(desc) {
             Ok(range) => range,
             Err(DataQueueWorkerError::OutOfRange) => {
@@ -649,8 +713,6 @@ impl DataQueueWorker {
                     io_cmd: UblkSrvIoCmd {
                         q_id: self.queue_id,
                         tag,
-                        // Return byte_count so the kernel does not misinterpret
-                        // UBLK_IO_RES_OK (0) as "nothing written" and requeue.
                         result: i32::try_from(byte_count).unwrap_or(i32::MAX),
                         addr_or_zone_append_lba: 0,
                     },
@@ -1132,7 +1194,7 @@ mod tests {
     fn worker_gate_constant_is_stable() {
         assert_eq!(
             BLOCK_VOLUME_UBLK_DATA_QUEUE_WORKER_GATE_OW_301Z,
-            "OW-301Z block-volume adapter ublk data-queue worker dispatches read/write/flush descriptors to the backing image and returns kernel-visible completion status"
+            "OW-301Z block-volume adapter ublk data-queue worker dispatches read/write/flush descriptors to the backing image and returns kernel-visible completion results"
         );
     }
 
@@ -1199,7 +1261,7 @@ mod tests {
             result.completion_class,
             BlockVolumeCompletionClass::Completed
         );
-        assert_eq!(result.io_cmd.result, 4096); // byte_count, not UBLK_IO_RES_OK
+        assert_eq!(result.io_cmd.result, 4096);
         assert_eq!(result.io_cmd.tag, 1);
         assert_eq!(result.byte_count, 4096);
         assert_eq!(worker.bytes_read, 4096);
@@ -1316,7 +1378,7 @@ mod tests {
             result.completion_class,
             BlockVolumeCompletionClass::Completed
         );
-        assert_eq!(result.io_cmd.result, 4096); // byte_count, not UBLK_IO_RES_OK
+        assert_eq!(result.io_cmd.result, 4096);
         assert_eq!(result.byte_count, 4096);
         assert_eq!(worker.bytes_written, 4096);
         assert_eq!(worker.write_ops, 1);
@@ -1343,7 +1405,7 @@ mod tests {
             result.completion_class,
             BlockVolumeCompletionClass::Completed
         );
-        assert_eq!(result.io_cmd.result, 4096); // byte_count, not UBLK_IO_RES_OK
+        assert_eq!(result.io_cmd.result, 4096);
         assert_eq!(worker.bytes_written, 4096);
     }
 
@@ -1474,7 +1536,7 @@ mod tests {
             report.results[1].completion_class,
             BlockVolumeCompletionClass::Completed
         );
-        assert_eq!(report.results[1].io_cmd.result, 4096); // byte_count, not UBLK_IO_RES_OK
+        assert_eq!(report.results[1].io_cmd.result, 4096);
         assert_eq!(report.results[2].tag, 12);
         assert_eq!(
             report.results[2].request_class,
@@ -1603,6 +1665,31 @@ mod tests {
             result.unwrap_err(),
             DataQueueWorkerError::ZeroLengthDataOperation
         );
+    }
+
+    #[test]
+    fn worker_zero_length_fua_write_completes_as_barrier() {
+        let geometry = test_geometry();
+        let (_dir, mut image) = test_image();
+        let mut worker = DataQueueWorker::new(0, geometry);
+        let result = worker
+            .process_one(
+                &mut image,
+                0,
+                &io_desc(UBLK_IO_OP_WRITE, UBLK_IO_F_FUA, 0, 0, DEMO_BUFFER_ADDR),
+            )
+            .expect("zero-length FUA write should complete as a barrier");
+
+        assert_eq!(result.request_class, BlockVolumeRequestClass::Write);
+        assert_eq!(
+            result.completion_class,
+            BlockVolumeCompletionClass::Completed
+        );
+        assert_eq!(result.io_cmd.result, UBLK_IO_RES_OK);
+        assert_eq!(result.byte_count, 0);
+        assert_eq!(worker.write_ops, 1);
+        assert_eq!(worker.completed_ops, 1);
+        assert_eq!(worker.error_ops, 0);
     }
 
     #[test]

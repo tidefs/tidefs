@@ -63,6 +63,18 @@ pub const fn ublk_queue_cmd_buf_size(queue_depth: u16) -> usize {
 pub const fn ublk_max_cmd_buf_size() -> usize {
     ublk_queue_cmd_buf_size(UBLK_MAX_QUEUE_DEPTH)
 }
+
+#[must_use]
+pub const fn ublk_cmd_buf_mmap_offset(queue_id: u16) -> Option<u64> {
+    if queue_id as u64 > UBLK_QID_BITS_MASK {
+        return None;
+    }
+    Some(
+        UBLKSRV_CMD_BUF_OFFSET
+            + (queue_id as u64) * (ublk_max_cmd_buf_size() as u64),
+    )
+}
+
 // Compile-time assertion: UblkSrvIoDesc must match the kernel's struct ublksrv_io_desc size.
 // If this fails, the mmap size calculation will not match Linux 7.0's ublk_ch_mmap check.
 const _UBLK_SRV_IO_DESC_SIZE_CHECK: () = assert!(
@@ -1349,6 +1361,25 @@ mod tests {
         for raw in [0u16, 1, 2, 3, 99] {
             assert_eq!(UblkDeviceState::from_raw(raw).raw(), raw);
         }
+    }
+
+    #[test]
+    fn command_buffer_mmap_offset_uses_linux_max_depth_stride() {
+        let stride = ublk_max_cmd_buf_size() as u64;
+        assert!(
+            stride > ublk_queue_cmd_buf_size(64) as u64,
+            "multi-queue command buffers are spaced by Linux max depth, not active queue depth"
+        );
+        assert_eq!(ublk_cmd_buf_mmap_offset(0), Some(UBLKSRV_CMD_BUF_OFFSET));
+        assert_eq!(
+            ublk_cmd_buf_mmap_offset(1),
+            Some(UBLKSRV_CMD_BUF_OFFSET + stride)
+        );
+        assert_eq!(
+            ublk_cmd_buf_mmap_offset(2),
+            Some(UBLKSRV_CMD_BUF_OFFSET + 2 * stride)
+        );
+        assert_eq!(ublk_cmd_buf_mmap_offset(UBLK_MAX_NR_QUEUES), None);
     }
 
     // -----------------------------------------------------------------------
