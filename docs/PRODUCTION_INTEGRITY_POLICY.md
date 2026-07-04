@@ -1,8 +1,8 @@
 # Production integrity policy
 
 > TFR-019 authority note: this imported implementation note is review material,
-> the behavior below as needing reconciliation with current source,
-> `docs/REVIEW_TODO_REGISTER.md`, and `docs/WHOLE_REPO_REVIEW.md`.
+> the behavior below as needing reconciliation with current source and
+> `docs/REVIEW_TODO_REGISTER.md`.
 
 Historical tracker wording: item 006.
 

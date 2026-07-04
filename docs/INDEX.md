@@ -39,9 +39,8 @@ coordination packets, and closeout snapshots are historical input by default;
 old maturity/status labels, Forgejo references, phase-completion wording, or
 canonical-design wording inside those files does not make them current
 authority.
-Broad reference/status files such as `docs/ARCHITECTURE.md` and
-`docs/WHOLE_REPO_REVIEW.md` are not mandatory first-read authority unless live
-issue and repository-doc state explicitly reclassify them.
+Broad reference/status files are not mandatory first-read authority unless
+live issue and repository-doc state explicitly reclassify them.
 
 Release readiness boundary and evidence inputs:
 

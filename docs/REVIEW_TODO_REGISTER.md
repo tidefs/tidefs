@@ -25,7 +25,7 @@ OpenZFS/Ceph-class claims.
 
 ## Current Review Notes
 
-Detailed current review notes are recorded in `docs/WHOLE_REPO_REVIEW.md`.
+This section retains the current review notes that still map to TFR rows.
 
 Important 2026-06-01 findings:
 

@@ -25,9 +25,9 @@ current authority.
 Read `docs/LICENSING.md`, `docs/TEST_SIGNAL_POLICY.md`,
 `docs/UNRELEASED_AUTHORITY_POLICY.md`, and
 `docs/CONTROL_FORMAT_AND_JSON_POLICY.md` when a change touches those surfaces.
-Do not treat broad reference/status files such as `docs/ARCHITECTURE.md` or
-`docs/WHOLE_REPO_REVIEW.md` as mandatory first-read authority unless live issue
-and repository-doc state explicitly reclassify them.
+Do not treat broad reference/status files such as `docs/ARCHITECTURE.md` as
+mandatory first-read authority unless live issue and repository-doc state
+explicitly reclassify them.
 
 ## Development Environment
 

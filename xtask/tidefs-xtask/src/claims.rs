@@ -42,7 +42,6 @@ pub const CLAIMS_GATE_SCANNED_DOCS: &[&str] = &[
     "docs/PREVIEW_UAPI_ABI_BOUNDARY_OW202.md",
     "docs/REVIEW_TODO_REGISTER.md",
     "docs/UNRELEASED_AUTHORITY_POLICY.md",
-    "docs/WHOLE_REPO_REVIEW.md",
     "docs/workspace-package-classification.md",
 ];
 
@@ -577,7 +576,7 @@ pub struct ClaimGateRule {
 pub const CLAIMS_GATE_RULES: &[ClaimGateRule] = &[
     ClaimGateRule {
         topic: ClaimGateRuleTopic::ScannedPublishingSurfaces,
-        rule: "The gate scans README, current policy docs, preview handoff docs, the review register, and whole-repo review docs as user-facing publishing surfaces.",
+        rule: "The gate scans README, current policy docs, preview handoff docs, and the review register as user-facing publishing surfaces.",
     },
     ClaimGateRule {
         topic: ClaimGateRuleTopic::ForbiddenCurrentCapabilityClaims,
@@ -3592,7 +3591,6 @@ const UNGUARDED_COMMANDS: &[&str] = &[
         assert!(CLAIMS_GATE_SCANNED_DOCS.contains(&"docs/REVIEW_TODO_REGISTER.md"));
         assert!(CLAIMS_GATE_SCANNED_DOCS.contains(&"docs/UNRELEASED_AUTHORITY_POLICY.md"));
         assert!(CLAIMS_GATE_SCANNED_DOCS.contains(&"docs/BLAKE3_USAGE_POLICY.md"));
-        assert!(CLAIMS_GATE_SCANNED_DOCS.contains(&"docs/WHOLE_REPO_REVIEW.md"));
         assert!(CLAIMS_GATE_SCANNED_DOCS.contains(&"docs/workspace-package-classification.md"));
         assert!(CLAIMS_GATE_SCANNED_DOCS.contains(&"docs/PREVIEW_UAPI_ABI_BOUNDARY_OW202.md"));
         assert!(CLAIMS_GATE_SCANNED_DOCS.contains(&"docs/CLAIM_REGISTRY.md"));

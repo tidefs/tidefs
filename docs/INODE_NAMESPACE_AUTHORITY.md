@@ -30,7 +30,7 @@ The decision is based on the following current evidence.
 
 Documentation:
 
-- `docs/WHOLE_REPO_REVIEW.md` records TFR-004 split authority between
+- `docs/REVIEW_TODO_REGISTER.md` records TFR-004 split authority between
   `LocalFileSystem`, `tidefs-namespace`, `tidefs-inode-table`, and FUSE
   lookup/forget state.
 - `docs/REVIEW_TODO_REGISTER.md` records recent TFR-004 cleanup commits:

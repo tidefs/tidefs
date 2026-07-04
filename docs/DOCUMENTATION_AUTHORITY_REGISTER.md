@@ -10,8 +10,7 @@ documents current policy, and it does not close any storage behavior claim.
 
 The active entry points are `README.md`, `AGENTS.md`, `docs/INDEX.md`,
 `docs/LICENSING.md`, `docs/REVIEW_TODO_POLICY.md`,
-`docs/REVIEW_TODO_REGISTER.md`, `docs/WHOLE_REPO_REVIEW.md`,
-`docs/CLAIMS_GATE_POLICY.md`, and this file.
+`docs/REVIEW_TODO_REGISTER.md`, `docs/CLAIMS_GATE_POLICY.md`, and this file.
 
 The active TideFS Book authoring decision is `docs/book/README.adoc`. The
 assembled book source starts at `docs/book/tidefs-book.adoc`; book chapters are
@@ -63,8 +62,7 @@ by the classification itself.
 Before promoting a document to current policy or current spec, check the live
 source behavior, `validation/claims.toml`, and the claims gate. If that review is
 too large for the current slice, leave the document as historical input and
-record the blocker in `docs/REVIEW_TODO_REGISTER.md` or
-`docs/WHOLE_REPO_REVIEW.md`.
+record the blocker in `docs/REVIEW_TODO_REGISTER.md`.
 
 Consolidation work must collapse duplicate truth surfaces instead of creating
 new status files. Keep generated outputs generated, especially
@@ -268,9 +266,10 @@ as historical input or delete candidates. Historical-input docs and
 delete-candidate docs are intentional skip surfaces for the guard; they may
 preserve retired paths as review material but must not be cited as current
 status. Evidence-only docs are `docs/workspace-package-classification.md`,
-`docs/REVIEW_TODO_REGISTER.md`, this register, and
-`docs/WHOLE_REPO_REVIEW.md`; those files intentionally record retired crates,
-deleted docs, and old paths as authority evidence rather than rewrite targets.
+`docs/REVIEW_TODO_REGISTER.md`, this register, generated claim registry data,
+and live GitHub/git evidence; those surfaces intentionally record retired
+crates, deleted docs, and old paths as authority evidence rather than rewrite
+targets.
 
 The #952 live-doc cleanup is split into exact-file child slices. Those paths
 stay out of this coordination slice:
@@ -662,8 +661,8 @@ required by those registry entries:
   BPR mechanism is subordinate to #848 storage-intent relocation gates, #844/#856
   cost and wear evidence, #845 prediction/payback evidence, and #904 media
   capability evidence.
-- `docs/WHOLE_REPO_REVIEW.md`: incumbent references are fail-closed review
-  blockers only.
+- Retired review surfaces: incumbent references are fail-closed review blockers
+  only.
 
 ### ADR-Backed Historical Root Deletions (TFR-019 / #1675)
 
@@ -707,7 +706,7 @@ successor/comparator claim id and comparator evidence.
 ## Initial Open Queue Resolution (#689)
 
 Classified for TFR-019 / GitHub issue #689 on 2026-06-21 after reviewing the
-register method, `docs/WHOLE_REPO_REVIEW.md`, `validation/claims.toml`, and
+register method, repository review history, `validation/claims.toml`, and
 bounded source search for the tempting implementation references. This slice
 does not promote any initial-queue document to current policy or current spec:
 the documents below carry old Forgejo issue-closeout, sealed-design, maturity,
@@ -722,7 +721,7 @@ larger than this documentation-authority cleanup.
 
 Classified for TFR-019 / GitHub issue #1537 on 2026-06-29 after reviewing this
 register's authority rule and review method, the TFR-019 notes in
-`docs/REVIEW_TODO_REGISTER.md`, `docs/WHOLE_REPO_REVIEW.md`, the root
+`docs/REVIEW_TODO_REGISTER.md`, repository review history, the root
 background-service redirect, the tracked deleted background-service design
 family, live scheduler source in
 `crates/tidefs-background-scheduler/src/lib.rs`,
