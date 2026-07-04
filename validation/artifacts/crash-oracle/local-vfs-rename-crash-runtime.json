@@ -47,10 +47,42 @@
     }
   ],
   "non_claims": [
-    "This artifact is bounded runtime evidence for the local VFS rename -> fsync -> read -> process crash/recover -> read path, not production crash safety.",
-    "This artifact is not model-only evidence and does not replace the model crash matrix.",
-    "This artifact does not provide queue-depth or no-hidden-queue evidence for rename directory-entry, link/unlink, or orphan-index work.",
-    "This artifact does not validate broader namespace atomicity, mounted kernel behavior, distributed recovery, or OpenZFS/Ceph-class status."
+    {
+      "category": "production-crash-safety",
+      "claim_id": "local.vfs.rename_atomic_crash.v1",
+      "evidence_class": "runtime-namespace-crash-artifact",
+      "evidence_scope": "local VFS runtime rename/fsync/read crash/recover artifact for process exit after pre-crash read",
+      "excluded_product_claim": "production crash safety",
+      "remaining_risk": "production crash-safety coverage remains outside this local VFS rename artifact",
+      "blocking_issue": 493
+    },
+    {
+      "category": "model-crash-matrix",
+      "claim_id": "local.vfs.rename_atomic_crash.v1",
+      "evidence_class": "runtime-namespace-crash-artifact",
+      "evidence_scope": "local VFS runtime rename/fsync/read crash/recover artifact for process exit after pre-crash read",
+      "excluded_product_claim": "model crash matrix replacement",
+      "remaining_risk": "model crash matrix validation remains separate from this bounded runtime artifact",
+      "blocking_issue": null
+    },
+    {
+      "category": "queue-depth-no-hidden-queue",
+      "claim_id": "local.vfs.rename_atomic_crash.v1",
+      "evidence_class": "runtime-namespace-crash-artifact",
+      "evidence_scope": "local VFS runtime rename/fsync/read crash/recover artifact for process exit after pre-crash read",
+      "excluded_product_claim": "queue-depth and no-hidden-queue admission coverage",
+      "remaining_risk": "rename directory-entry, link/unlink, and orphan-index queue coverage remains tracked separately",
+      "blocking_issue": 597
+    },
+    {
+      "category": "broader-namespace-atomicity",
+      "claim_id": "local.vfs.rename_atomic_crash.v1",
+      "evidence_class": "runtime-namespace-crash-artifact",
+      "evidence_scope": "local VFS runtime rename/fsync/read crash/recover artifact for process exit after pre-crash read",
+      "excluded_product_claim": "broader namespace atomicity and distributed filesystem behavior",
+      "remaining_risk": "mounted kernel behavior, distributed recovery, OpenZFS, and Ceph-class status remain outside this artifact",
+      "blocking_issue": null
+    }
   ],
   "validation_hint": "cargo test -p tidefs-local-filesystem --locked --test crash_injection_tests local_vfs_rename_runtime_crash_oracle_artifact -- --nocapture",
   "events": [

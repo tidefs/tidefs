@@ -53,10 +53,42 @@
     }
   ],
   "non_claims": [
-    "This artifact is bounded runtime evidence for the local VFS OpFsyncBeforeFlush hook, not production crash safety.",
-    "This artifact is not model-only evidence and does not replace the model crash matrix.",
-    "This artifact does not provide queue-depth runtime evidence or change no-hidden-queue admission coverage.",
-    "The interrupted fsync exits before fsync completion; the artifact proves last completed fsync data survives this hook, not that the interrupted payload is durable."
+    {
+      "category": "production-crash-safety",
+      "claim_id": "local.vfs.write_fsync_crash.v1",
+      "evidence_class": "runtime-crash-oracle",
+      "evidence_scope": "local VFS runtime write/fsync/read crash/recover artifact for OpFsyncBeforeFlush",
+      "excluded_product_claim": "production crash safety",
+      "remaining_risk": "storage-wide, kernel, distributed, mmap/writeback, xfstests, RDMA, and production crash-safety coverage remain outside this local VFS hook artifact",
+      "blocking_issue": 493
+    },
+    {
+      "category": "model-crash-matrix",
+      "claim_id": "local.vfs.write_fsync_crash.v1",
+      "evidence_class": "runtime-crash-oracle",
+      "evidence_scope": "local VFS runtime write/fsync/read crash/recover artifact for OpFsyncBeforeFlush",
+      "excluded_product_claim": "model crash matrix replacement",
+      "remaining_risk": "model crash matrix validation remains separate from this bounded runtime artifact",
+      "blocking_issue": null
+    },
+    {
+      "category": "queue-depth-no-hidden-queue",
+      "claim_id": "local.vfs.write_fsync_crash.v1",
+      "evidence_class": "runtime-crash-oracle",
+      "evidence_scope": "local VFS runtime write/fsync/read crash/recover artifact for OpFsyncBeforeFlush",
+      "excluded_product_claim": "queue-depth and no-hidden-queue admission coverage",
+      "remaining_risk": "runtime queue-depth evidence remains required before no-hidden-queue admission coverage can strengthen",
+      "blocking_issue": null
+    },
+    {
+      "category": "interrupted-fsync-durability",
+      "claim_id": "local.vfs.write_fsync_crash.v1",
+      "evidence_class": "runtime-crash-oracle",
+      "evidence_scope": "local VFS runtime write/fsync/read crash/recover artifact for OpFsyncBeforeFlush",
+      "excluded_product_claim": "interrupted fsync payload durability",
+      "remaining_risk": "the interrupted fsync exits before completion; this artifact proves only that the last completed fsync data survives this hook",
+      "blocking_issue": null
+    }
   ],
   "validation_hint": "cargo test -p tidefs-local-filesystem --locked --test crash_injection_tests local_vfs_write_fsync_runtime_crash_oracle_artifact -- --nocapture",
   "events": [
