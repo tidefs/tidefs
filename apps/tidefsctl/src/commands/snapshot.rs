@@ -1141,19 +1141,61 @@ fn snapshot_summary_line(summary: &SnapshotSummary) -> String {
     )
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SnapshotCapacityClassification {
+    capacity_class: &'static str,
+    lifecycle_state: &'static str,
+    retained_root: &'static str,
+    retained_byte_consumer: &'static str,
+    pinned_snapshot_bytes: &'static str,
+    deadlist_bytes: &'static str,
+    reclaimable_bytes: &'static str,
+}
+
+fn snapshot_capacity_classification(kind: SnapshotKind) -> SnapshotCapacityClassification {
+    match kind {
+        SnapshotKind::Snapshot | SnapshotKind::Clone => SnapshotCapacityClassification {
+            capacity_class: "retained-root",
+            lifecycle_state: "unavailable",
+            retained_root: "yes",
+            retained_byte_consumer: "yes",
+            pinned_snapshot_bytes: "unavailable",
+            deadlist_bytes: "unavailable",
+            reclaimable_bytes: "unavailable",
+        },
+        SnapshotKind::Bookmark => SnapshotCapacityClassification {
+            capacity_class: "metadata-anchor",
+            lifecycle_state: "not-applicable",
+            retained_root: "no",
+            retained_byte_consumer: "no",
+            pinned_snapshot_bytes: "not-applicable",
+            deadlist_bytes: "not-applicable",
+            reclaimable_bytes: "not-applicable",
+        },
+    }
+}
+
 fn snapshot_descriptor_line(descriptor: &SnapshotDescriptor) -> String {
     let kind = snapshot_kind_label(descriptor.kind);
+    let capacity = snapshot_capacity_classification(descriptor.kind);
     let origin = descriptor
         .origin
         .as_ref()
         .map(|origin| format!("'{origin}'"))
         .unwrap_or_else(|| "-".to_string());
     format!(
-        "snapshot entry '{}' kind={} origin={} holds={} source tx={} source gen={} created gen={}",
+        "snapshot entry '{}' kind={} origin={} holds={} capacity_class={} lifecycle_state={} retained_root={} retained_byte_consumer={} pinned_snapshot_bytes={} deadlist_bytes={} reclaimable_bytes={} source tx={} source gen={} created gen={}",
         descriptor.name,
         kind,
         origin,
         descriptor.hold_count,
+        capacity.capacity_class,
+        capacity.lifecycle_state,
+        capacity.retained_root,
+        capacity.retained_byte_consumer,
+        capacity.pinned_snapshot_bytes,
+        capacity.deadlist_bytes,
+        capacity.reclaimable_bytes,
         descriptor.source_transaction_id,
         descriptor.source_generation,
         descriptor.created_at_generation
@@ -2275,6 +2317,73 @@ mod tests {
         assert!(line.contains("source tx=7"));
         assert!(line.contains("source gen=9"));
         assert!(line.contains("created gen=11"));
+    }
+
+    #[test]
+    fn snapshot_extended_line_reports_snapshot_retained_root_capacity() {
+        let line = snapshot_descriptor_line(&SnapshotDescriptor {
+            name: "snap-a".into(),
+            kind: SnapshotKind::Snapshot,
+            origin: None,
+            hold_count: 0,
+            source_transaction_id: 7,
+            source_generation: 9,
+            created_at_generation: 11,
+        });
+
+        assert!(line.contains("kind=snapshot"));
+        assert!(line.contains("capacity_class=retained-root"));
+        assert!(line.contains("lifecycle_state=unavailable"));
+        assert!(line.contains("retained_root=yes"));
+        assert!(line.contains("retained_byte_consumer=yes"));
+        assert!(line.contains("pinned_snapshot_bytes=unavailable"));
+        assert!(line.contains("deadlist_bytes=unavailable"));
+        assert!(line.contains("reclaimable_bytes=unavailable"));
+    }
+
+    #[test]
+    fn snapshot_extended_line_reports_clone_retained_root_capacity() {
+        let line = snapshot_descriptor_line(&SnapshotDescriptor {
+            name: "clone-a".into(),
+            kind: SnapshotKind::Clone,
+            origin: Some("snap-a".into()),
+            hold_count: 2,
+            source_transaction_id: 7,
+            source_generation: 9,
+            created_at_generation: 11,
+        });
+
+        assert!(line.contains("kind=clone"));
+        assert!(line.contains("origin='snap-a'"));
+        assert!(line.contains("capacity_class=retained-root"));
+        assert!(line.contains("lifecycle_state=unavailable"));
+        assert!(line.contains("retained_root=yes"));
+        assert!(line.contains("retained_byte_consumer=yes"));
+        assert!(line.contains("pinned_snapshot_bytes=unavailable"));
+        assert!(line.contains("deadlist_bytes=unavailable"));
+        assert!(line.contains("reclaimable_bytes=unavailable"));
+    }
+
+    #[test]
+    fn snapshot_extended_line_reports_bookmark_as_non_retaining_anchor() {
+        let line = snapshot_descriptor_line(&SnapshotDescriptor {
+            name: "bookmark-a".into(),
+            kind: SnapshotKind::Bookmark,
+            origin: None,
+            hold_count: 0,
+            source_transaction_id: 7,
+            source_generation: 9,
+            created_at_generation: 11,
+        });
+
+        assert!(line.contains("kind=bookmark"));
+        assert!(line.contains("capacity_class=metadata-anchor"));
+        assert!(line.contains("lifecycle_state=not-applicable"));
+        assert!(line.contains("retained_root=no"));
+        assert!(line.contains("retained_byte_consumer=no"));
+        assert!(line.contains("pinned_snapshot_bytes=not-applicable"));
+        assert!(line.contains("deadlist_bytes=not-applicable"));
+        assert!(line.contains("reclaimable_bytes=not-applicable"));
     }
 
     #[test]
