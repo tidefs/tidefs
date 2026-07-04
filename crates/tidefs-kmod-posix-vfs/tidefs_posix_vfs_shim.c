@@ -749,6 +749,9 @@ struct tidefs_posix_vfs_mount {
 	u32 write_inode_calls;
 	u32 evict_orphan_calls;
 	u32 shutdown_calls;
+	u32 freeze_fs_refusals;
+	u32 unfreeze_fs_refusals;
+	u32 remount_fs_refusals;
 	u32 report_error_calls;
 	u32 dentry_delete_calls;
 	u32 dentry_release_calls;
@@ -774,6 +777,7 @@ struct tidefs_posix_vfs_mount {
 
 enum {
 	Opt_bootstrap,
+	Opt_engine_backed,
 	Opt_device,
 	Opt_ro,
 	Opt_rw,
@@ -801,6 +805,7 @@ struct tidefs_posix_vfs_fs_context {
 
 static const struct fs_parameter_spec tidefs_posix_vfs_fs_parameters[] = {
 	fsparam_flag("bootstrap", Opt_bootstrap),
+	fsparam_flag("engine-backed", Opt_engine_backed),
 	fsparam_string("device", Opt_device),
 	fsparam_flag("ro", Opt_ro),
 	fsparam_flag("rw", Opt_rw),
@@ -6408,6 +6413,67 @@ static void __maybe_unused tidefs_posix_vfs_shutdown(struct super_block *sb)
 	ctx->pool.bdev = NULL;
 }
 
+/*
+ * freeze_fs / unfreeze_fs -- explicit unsupported administrative operations.
+ *
+ * TideFS does not yet have mounted-kernel authority to stop new mutating work,
+ * drain dirty/writeback state into a coherent frozen point, and then restart
+ * admission on thaw. Register refusal callbacks so Linux sees EOPNOTSUPP
+ * instead of interpreting a missing path as implemented product behavior.
+ */
+static int tidefs_posix_vfs_freeze_fs(struct super_block *sb)
+{
+	struct tidefs_posix_vfs_mount *ctx = sb ? sb->s_fs_info : NULL;
+
+	if (!ctx) {
+		pr_warn("tidefs_posix_vfs: freeze_fs refused without mount context\n");
+		return -EIO;
+	}
+
+	ctx->freeze_fs_refusals++;
+	pr_info("tidefs_posix_vfs: freeze_fs refused: dirty/writeback freeze authority unsupported txg=%llu refusal=%u ret=%d\n",
+		ctx->committed_txg, ctx->freeze_fs_refusals, -EOPNOTSUPP);
+	return -EOPNOTSUPP;
+}
+
+static int tidefs_posix_vfs_unfreeze_fs(struct super_block *sb)
+{
+	struct tidefs_posix_vfs_mount *ctx = sb ? sb->s_fs_info : NULL;
+
+	if (!ctx) {
+		pr_warn("tidefs_posix_vfs: unfreeze_fs refused without mount context\n");
+		return -EIO;
+	}
+
+	ctx->unfreeze_fs_refusals++;
+	pr_info("tidefs_posix_vfs: unfreeze_fs refused: no TideFS frozen state exists txg=%llu refusal=%u ret=%d\n",
+		ctx->committed_txg, ctx->unfreeze_fs_refusals, -EOPNOTSUPP);
+	return -EOPNOTSUPP;
+}
+
+/*
+ * remount/reconfigure -- explicit unsupported option-reconfiguration path.
+ *
+ * The mounted adapter can display its initial options but cannot yet apply
+ * option changes, ro/rw transitions, recovery toggles, or commit-timeout
+ * changes to the live engine. Refuse every remount request instead of leaving
+ * callers with a silent flags-only no-op.
+ */
+static int tidefs_posix_vfs_refuse_remount(struct super_block *sb)
+{
+	struct tidefs_posix_vfs_mount *ctx = sb ? sb->s_fs_info : NULL;
+
+	if (!ctx) {
+		pr_warn("tidefs_posix_vfs: remount_fs refused without mount context\n");
+		return -EIO;
+	}
+
+	ctx->remount_fs_refusals++;
+	pr_info("tidefs_posix_vfs: remount_fs refused: live option changes unsupported txg=%llu refusal=%u ret=%d\n",
+		ctx->committed_txg, ctx->remount_fs_refusals, -EOPNOTSUPP);
+	return -EOPNOTSUPP;
+}
+
 #if TIDEFS_HAVE_FSERROR
 /*
  * report_error -- kernel VFS callback for filesystem error reporting.
@@ -6557,7 +6623,7 @@ static void tidefs_posix_vfs_kill_sb(struct super_block *sb)
 		mutex_unlock(&tidefs_posix_vfs_engine_switch_lock);
 	}
 
-	pr_info("tidefs_posix_vfs: lifecycle summary: txg=%llu sync_fs_calls=%u put_super_calls=%u umount_begin_calls=%u evict_inode_calls=%u evict_orphan_calls=%u write_inode_calls=%u write_begin_calls=%u write_end_calls=%u dirty_folio_calls=%u writepages_calls=%u dentry_delete=%u dentry_release=%u dentry_iput=%u dentry_iput_orphan=%u shutdown_calls=%u report_error_calls=%u\n",
+	pr_info("tidefs_posix_vfs: lifecycle summary: txg=%llu sync_fs_calls=%u put_super_calls=%u umount_begin_calls=%u evict_inode_calls=%u evict_orphan_calls=%u write_inode_calls=%u write_begin_calls=%u write_end_calls=%u dirty_folio_calls=%u writepages_calls=%u dentry_delete=%u dentry_release=%u dentry_iput=%u dentry_iput_orphan=%u shutdown_calls=%u freeze_fs_refusals=%u unfreeze_fs_refusals=%u remount_fs_refusals=%u report_error_calls=%u\n",
 		ctx ? ctx->committed_txg : 0,
 		ctx ? ctx->sync_fs_calls : 0,
 		ctx ? ctx->put_super_calls : 0,
@@ -6574,6 +6640,9 @@ static void tidefs_posix_vfs_kill_sb(struct super_block *sb)
 		ctx ? ctx->dentry_iput_calls : 0,
 		ctx ? ctx->dentry_iput_orphan_calls : 0,
 		ctx ? ctx->shutdown_calls : 0,
+		ctx ? ctx->freeze_fs_refusals : 0,
+		ctx ? ctx->unfreeze_fs_refusals : 0,
+		ctx ? ctx->remount_fs_refusals : 0,
 		ctx ? ctx->report_error_calls : 0);
 	sb->s_fs_info = NULL;
 	tidefs_posix_vfs_pool_core_teardown(ctx);
@@ -6729,7 +6798,13 @@ static const struct super_operations tidefs_posix_vfs_super_ops = {
 	.free_inode = tidefs_posix_vfs_free_inode,
 	.statfs = tidefs_posix_vfs_statfs,
 	.umount_begin = tidefs_posix_vfs_umount_begin,
-	/* .shutdown intentionally deferred: FS_IOC_GOINGDOWN is not implemented. */
+	.freeze_fs = tidefs_posix_vfs_freeze_fs,
+	.unfreeze_fs = tidefs_posix_vfs_unfreeze_fs,
+	/*
+	 * .shutdown intentionally remains unregistered: Linux cannot surface an
+	 * errno from this callback, so FS_IOC_GOINGDOWN must stay unsupported
+	 * until TideFS has a full quiesce/no-new-work shutdown implementation.
+	 */
 #if TIDEFS_HAVE_FSERROR
 	.report_error = tidefs_posix_vfs_report_error,
 #endif
@@ -7150,6 +7225,14 @@ static int tidefs_posix_vfs_parse_param(struct fs_context *fc,
 	case Opt_bootstrap:
 		ctx->bootstrap = true;
 		return 0;
+	case Opt_engine_backed:
+		/*
+		 * show_options reports engine-backed mounts so remount(8) can
+		 * replay the token. Accept it only as descriptive input; the
+		 * actual engine-backed authority still comes from the block
+		 * device mount path, and reconfigure refuses remount below.
+		 */
+		return 0;
 	case Opt_device:
 		kfree(ctx->device_path);
 		ctx->device_path = kstrdup(param->string, GFP_KERNEL);
@@ -7200,6 +7283,16 @@ static int tidefs_posix_vfs_parse_param(struct fs_context *fc,
 	}
 }
 
+static int tidefs_posix_vfs_reconfigure(struct fs_context *fc)
+{
+	struct super_block *sb = NULL;
+
+	if (fc && fc->root)
+		sb = fc->root->d_sb;
+
+	return tidefs_posix_vfs_refuse_remount(sb);
+}
+
 static void tidefs_posix_vfs_free_fs_context(struct fs_context *fc)
 {
 	struct tidefs_posix_vfs_fs_context *ctx = fc->fs_private;
@@ -7217,6 +7310,7 @@ static const struct fs_context_operations tidefs_posix_vfs_context_ops = {
 	.free = tidefs_posix_vfs_free_fs_context,
 	.parse_param = tidefs_posix_vfs_parse_param,
 	.get_tree = tidefs_posix_vfs_get_tree,
+	.reconfigure = tidefs_posix_vfs_reconfigure,
 };
 
 static int tidefs_posix_vfs_init_fs_context(struct fs_context *fc)

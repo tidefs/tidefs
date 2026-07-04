@@ -13,9 +13,11 @@ referenced `flake.nix` outputs.
 - **Runs on**: every push to `master`.
 - **Manual dispatch**: available as the default `target` input value.
 - **What it exercises**: loads `tidefs_posix_vfs.ko`, mounts the explicit
-  bootstrap VFS root, and exercises supported directory, symlink, readdir,
-  and statfs operations. Engine-backed storage checks are kept in longer
-  filesystem lanes.
+  bootstrap VFS root, exercises supported directory, symlink, readdir,
+  statfs, write, and syncfs operations, and checks that unsupported
+  administrative VFS operations fail closed for freeze and remount
+  reconfiguration.
+  Engine-backed storage checks are kept in longer filesystem lanes.
 - **Evidence claim**: narrow kernel-module smoke.  It does not claim
   xfstests, RDMA, release-candidate, or broad filesystem-correctness
   coverage.
@@ -60,7 +62,7 @@ are checked by the `Host preflight` step before any target runs.
 | Command arguments  | `--timeout 1800` |
 | Output directory   | `/tmp/tidefs-validation/kmod-xfstests-smoke` |
 | Uploaded artifact  | `qemu-smoke-kmod-xfstests-smoke` (7-day retention) |
-| Evidence class     | kernel-module smoke (directory, symlink, readdir, statfs) |
+| Evidence class     | kernel-module smoke (directory, symlink, readdir, statfs, write/syncfs, administrative freeze/remount-reconfigure refusal) |
 
 ### 2. `kernel-fsync-validation`
 
@@ -204,8 +206,9 @@ performance-comparator evidence unless the issue or PR validation tier
 explicitly says so and the relevant dedicated workflow (e.g.
 `xfstests.yml`, `rdma.yml`, `release-candidate.yml`) is also dispatched.
 
-- `kmod-xfstests-smoke` exercises basic VFS operations; it does not run
-  xfstests test cases.
+- `kmod-xfstests-smoke` exercises basic VFS operations and fail-closed
+  administrative freeze/remount refusal; it does not run xfstests test
+  cases.
 - `kernel-fsync-validation` and `kernel-mmap-validation` exercise
   specific QEMU Smoke runtime rows; the standalone workflows with the same
   flake refs remain separate validation lanes when an issue tier requires

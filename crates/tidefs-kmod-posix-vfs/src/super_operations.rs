@@ -21,16 +21,16 @@
 //!
 //! Explicitly deferred:
 //! - `shutdown` / `FS_IOC_GOINGDOWN` -- not registered in the C-shim
-//!   `super_operations` table yet. The current implementation records only a
-//!   lifecycle counter; xfstests must see this as unsupported rather than
-//!   advertising an incomplete shutdown path.
+//!   `super_operations` table. Linux's shutdown callback cannot return an
+//!   errno, so registration is withheld until TideFS can quiesce writes,
+//!   refuse new mutation, and prove no-work-after-shutdown.
 //! - `freeze_fs` / `unfreeze_fs` -- filesystem freeze/thaw not implemented;
-//!   not registered in the C-shim super_ops table.  The kernel VFS returns
-//!   EOPNOTSUPP to any freeze/thaw ioctl on this superblock.
-//! - `remount_fs` -- remount with updated mount options not implemented;
-//!   not registered in the C-shim super_ops table.  The kernel VFS treats
-//!   MS_REMOUNT as a no-op (flags-only remount for ro/rw toggle, no
-//!   custom option propagation).
+//!   the C shim registers callbacks that return EOPNOTSUPP instead of
+//!   pretending dirty/writeback state reached a coherent frozen state.
+//! - remount reconfiguration -- remount with updated mount options not
+//!   implemented; the C shim returns EOPNOTSUPP from the Linux 7.0
+//!   `fs_context_operations.reconfigure` hook rather than silently accepting
+//!   option changes or ro/rw toggles that TideFS did not apply.
 //!
 //! # Eviction Lifecycle (REL-KVFS-009)
 //!
@@ -93,6 +93,110 @@ use tidefs_kmod_bridge::kernel_types::{
     EngineFileHandle, Errno, FileHandleId, InodeId, RequestCtx, StatFs, WritebackRange,
 };
 use tidefs_kmod_bridge::kernel_types::{VfsEngine, VfsEngineStatFs};
+
+/// Administrative superblock operations tracked by the mounted-kernel policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdministrativeSuperOperation {
+    /// Linux `FS_IOC_GOINGDOWN` / `super_operations.shutdown`.
+    Shutdown,
+    /// Linux filesystem freeze entry point.
+    FreezeFs,
+    /// Linux filesystem thaw entry point.
+    UnfreezeFs,
+    /// Linux remount-with-new-options entry point.
+    RemountFs,
+}
+
+/// How the C shim exposes the operation to Linux VFS today.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdministrativeSuperOperationKernelPath {
+    /// The callback is deliberately absent so Linux reports unsupported.
+    UnregisteredUnsupported,
+    /// A `super_operations` callback is registered only to return a refusal.
+    SuperOperationRefusalCallback,
+    /// A `fs_context_operations.reconfigure` callback refuses remount.
+    FsContextReconfigureRefusal,
+}
+
+/// Support status for an administrative superblock operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdministrativeSuperOperationSupport {
+    /// The operation is an implemented product capability.
+    Supported,
+    /// The operation is not a TideFS product capability yet.
+    Unsupported,
+}
+
+/// Typed status for an administrative superblock operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AdministrativeSuperOperationPolicy {
+    pub operation: AdministrativeSuperOperation,
+    pub support: AdministrativeSuperOperationSupport,
+    pub kernel_path: AdministrativeSuperOperationKernelPath,
+    pub errno: Errno,
+    pub reason: &'static str,
+}
+
+impl AdministrativeSuperOperationPolicy {
+    const fn unsupported(
+        operation: AdministrativeSuperOperation,
+        kernel_path: AdministrativeSuperOperationKernelPath,
+        reason: &'static str,
+    ) -> Self {
+        Self {
+            operation,
+            support: AdministrativeSuperOperationSupport::Unsupported,
+            kernel_path,
+            errno: Errno::EOPNOTSUPP,
+            reason,
+        }
+    }
+
+    /// Return true when this operation is an implemented product capability.
+    pub const fn is_supported(self) -> bool {
+        match self.support {
+            AdministrativeSuperOperationSupport::Supported => true,
+            AdministrativeSuperOperationSupport::Unsupported => false,
+        }
+    }
+}
+
+/// Return the mounted-kernel product policy for an administrative operation.
+pub const fn administrative_super_operation_policy(
+    operation: AdministrativeSuperOperation,
+) -> AdministrativeSuperOperationPolicy {
+    match operation {
+        AdministrativeSuperOperation::Shutdown => AdministrativeSuperOperationPolicy::unsupported(
+            operation,
+            AdministrativeSuperOperationKernelPath::UnregisteredUnsupported,
+            "FS_IOC_GOINGDOWN is withheld until quiesce and no-new-work shutdown exists",
+        ),
+        AdministrativeSuperOperation::FreezeFs => AdministrativeSuperOperationPolicy::unsupported(
+            operation,
+            AdministrativeSuperOperationKernelPath::SuperOperationRefusalCallback,
+            "freeze cannot claim coherent dirty/writeback state yet",
+        ),
+        AdministrativeSuperOperation::UnfreezeFs => {
+            AdministrativeSuperOperationPolicy::unsupported(
+                operation,
+                AdministrativeSuperOperationKernelPath::SuperOperationRefusalCallback,
+                "thaw is unsupported because TideFS never enters frozen state",
+            )
+        }
+        AdministrativeSuperOperation::RemountFs => AdministrativeSuperOperationPolicy::unsupported(
+            operation,
+            AdministrativeSuperOperationKernelPath::FsContextReconfigureRefusal,
+            "remount option changes are refused through fs_context reconfigure instead of silently ignored",
+        ),
+    }
+}
+
+/// Refuse an administrative operation through the typed policy status.
+pub fn refuse_administrative_super_operation(
+    operation: AdministrativeSuperOperation,
+) -> Result<(), Errno> {
+    Err(administrative_super_operation_policy(operation).errno)
+}
 
 /// fill_super: Initialize the kernel VFS superblock from the backing device.
 ///
@@ -305,6 +409,34 @@ mod tests {
     };
 
     // -- fill_super tests --
+
+    #[test]
+    fn administrative_super_operations_are_typed_unsupported() {
+        use AdministrativeSuperOperation as Op;
+        use AdministrativeSuperOperationKernelPath as KernelPath;
+        use AdministrativeSuperOperationSupport as Support;
+
+        let cases = [
+            (Op::Shutdown, KernelPath::UnregisteredUnsupported),
+            (Op::FreezeFs, KernelPath::SuperOperationRefusalCallback),
+            (Op::UnfreezeFs, KernelPath::SuperOperationRefusalCallback),
+            (Op::RemountFs, KernelPath::FsContextReconfigureRefusal),
+        ];
+
+        for (operation, kernel_path) in cases {
+            let policy = administrative_super_operation_policy(operation);
+            assert_eq!(policy.operation, operation);
+            assert_eq!(policy.support, Support::Unsupported);
+            assert_eq!(policy.kernel_path, kernel_path);
+            assert_eq!(policy.errno, Errno::EOPNOTSUPP);
+            assert!(!policy.reason.is_empty());
+            assert!(!policy.is_supported());
+            assert_eq!(
+                refuse_administrative_super_operation(operation),
+                Err(Errno::EOPNOTSUPP)
+            );
+        }
+    }
 
     #[test]
     fn fill_super_success_delegates_to_mount_validate() {
