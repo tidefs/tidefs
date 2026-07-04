@@ -665,6 +665,12 @@ pub type RenameFlags = u32;
 pub type LseekOffset = i64;
 
 pub const ROOT_INODE_ID: InodeId = InodeId(1);
+/// Synthetic inode id reserved for the transparent snapshot namespace root.
+///
+/// Dataset-allocated inode ids must not use this value. It is only a VFS
+/// projection sentinel for the read-only `.snapshot` directory entry; lookup
+/// into that namespace is implemented by later snapshot browsing slices.
+pub const SNAPSHOT_NAMESPACE_ROOT_INODE_ID: InodeId = InodeId(u64::MAX);
 
 pub const RENAME_NOREPLACE: u32 = 1;
 pub const RENAME_EXCHANGE: u32 = 2;
@@ -7901,6 +7907,12 @@ mod tests {
     #[test]
     fn root_inode_id_is_one() {
         assert_eq!(ROOT_INODE_ID, InodeId::new(1));
+    }
+
+    #[test]
+    fn snapshot_namespace_root_inode_id_is_reserved_sentinel() {
+        assert_eq!(SNAPSHOT_NAMESPACE_ROOT_INODE_ID, InodeId::new(u64::MAX));
+        assert_ne!(SNAPSHOT_NAMESPACE_ROOT_INODE_ID, ROOT_INODE_ID);
     }
 
     // ── NodeKind boundary tests ────────────────────────────────────────

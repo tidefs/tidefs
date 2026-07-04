@@ -75,7 +75,9 @@ use tidefs_types_vfs_core::{
     FATTR_FH, FATTR_GID, FATTR_LOCKOWNER, FATTR_MODE, FATTR_MTIME, FATTR_MTIME_NOW, FATTR_SIZE,
     FATTR_UID, F_UNLCK, S_IFMT, S_IFREG, S_ISGID, S_ISUID,
 };
-use tidefs_vfs_engine::{LockSpec, LseekDataRange, VfsEngine, VfsEngineStatFs};
+use tidefs_vfs_engine::{
+    LockSpec, LseekDataRange, VfsEngine, VfsEngineStatFs, SNAPSHOT_NAMESPACE_ROOT_INODE_ID,
+};
 
 use crate::mount_options::TimestampPolicy;
 use tidefs_dir_index::DirCookie;
@@ -9117,6 +9119,12 @@ impl FuseVfsAdapter {
     ) -> Result<(Vec<DirEntry>, bool), Errno> {
         let e = self.engine.lock().unwrap();
         let handle = self.resolve_dir_handle(ino, fh, ctx, &**e)?;
+        let snapshot_catalog_generation = e.snapshot_catalog_generation();
+        let synthetic_cookie_count = if snapshot_catalog_generation.is_some() {
+            3
+        } else {
+            2
+        };
 
         let mut entries: Vec<DirEntry> = Vec::new();
 
@@ -9146,17 +9154,30 @@ impl FuseVfsAdapter {
             ));
         }
 
-        // Engine entries: offset adjusted past adapter-owned . and ..
-        let engine_offset = if offset <= 2 {
+        if let Some(generation) = snapshot_catalog_generation.filter(|_| offset <= 2) {
+            entries.push(DirEntry::new(
+                b".snapshot".to_vec(),
+                SNAPSHOT_NAMESPACE_ROOT_INODE_ID,
+                NodeKind::Dir,
+                generation,
+                3,
+            ));
+        }
+
+        // Engine entries: offset adjusted past adapter-owned synthetic entries.
+        let engine_offset = if offset <= synthetic_cookie_count {
             0
         } else {
-            offset.saturating_sub(2)
+            offset.saturating_sub(synthetic_cookie_count)
         };
         let (engine_entries, has_more) = e.readdir(&handle.dh, engine_offset, ctx)?;
 
-        // Shift opaque engine cookies after the adapter-owned dot entries.
+        // Shift opaque engine cookies after the adapter-owned synthetic entries.
         for engine_entry in engine_entries {
-            let cookie = engine_entry.cookie.checked_add(2).ok_or(Errno::EOVERFLOW)?;
+            let cookie = engine_entry
+                .cookie
+                .checked_add(synthetic_cookie_count)
+                .ok_or(Errno::EOVERFLOW)?;
             entries.push(DirEntry {
                 cookie,
                 ..engine_entry
@@ -11815,6 +11836,27 @@ mod tests {
             RootAuthenticationKey::demo_key(),
         )
         .expect("open local filesystem");
+        let engine = VfsLocalFileSystem::new(local_fs);
+        let adapter = FuseVfsAdapter::new(Box::new(engine)).expect("create adapter");
+        AdapterFixture { adapter, root }
+    }
+
+    fn adapter_fixture_with_snapshot() -> AdapterFixture {
+        let temp_id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "tidefs-vfs-adapter-snapshot-{}-{temp_id}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("create temp root");
+        let mut local_fs = LocalFileSystem::open_with_root_authentication_key(
+            &root,
+            StoreOptions::test_fast(),
+            RootAuthenticationKey::demo_key(),
+        )
+        .expect("open local filesystem");
+        local_fs
+            .create_snapshot("snap0")
+            .expect("create catalog snapshot");
         let engine = VfsLocalFileSystem::new(local_fs);
         let adapter = FuseVfsAdapter::new(Box::new(engine)).expect("create adapter");
         AdapterFixture { adapter, root }
@@ -35239,6 +35281,93 @@ mod tests {
 
         assert_eq!(entries.len(), 2);
         assert!(!has_more);
+        fixture
+            .adapter
+            .dispatch_releasedir(dh.dh_id.get())
+            .expect("releasedir");
+    }
+
+    #[test]
+    fn readdir_emits_snapshot_dotdir_when_catalog_is_non_empty() {
+        let mut fixture = adapter_fixture_with_snapshot();
+        let ctx = root_ctx();
+        let root_ino = fixture
+            .adapter
+            .engine
+            .lock()
+            .unwrap()
+            .get_root_inode(&ctx)
+            .expect("root inode");
+        fixture
+            .adapter
+            .dispatch_mkdir(&ctx, root_ino.get(), b"real-dir", 0o755)
+            .expect("mkdir");
+
+        let dh = fixture
+            .adapter
+            .dispatch_opendir(&ctx, root_ino.get())
+            .expect("opendir");
+        let (entries, has_more) = fixture
+            .adapter
+            .dispatch_readdir(&ctx, root_ino.get(), dh.dh_id.get(), 0)
+            .expect("readdir");
+
+        assert!(!has_more);
+        assert_eq!(entries[0].name, b".");
+        assert_eq!(entries[0].cookie, 1);
+        assert_eq!(entries[1].name, b"..");
+        assert_eq!(entries[1].cookie, 2);
+        assert_eq!(entries[2].name, b".snapshot");
+        assert_eq!(entries[2].inode_id, SNAPSHOT_NAMESPACE_ROOT_INODE_ID);
+        assert_eq!(entries[2].kind, NodeKind::Dir);
+        assert_eq!(entries[2].cookie, 3);
+
+        let real = entries
+            .iter()
+            .find(|entry| entry.name == b"real-dir")
+            .expect("real directory entry");
+        assert_eq!(real.cookie, 4);
+
+        fixture
+            .adapter
+            .dispatch_releasedir(dh.dh_id.get())
+            .expect("releasedir");
+    }
+
+    #[test]
+    fn readdir_resume_offsets_account_for_snapshot_dotdir() {
+        let mut fixture = adapter_fixture_with_snapshot();
+        let ctx = root_ctx();
+        let root_ino = fixture
+            .adapter
+            .engine
+            .lock()
+            .unwrap()
+            .get_root_inode(&ctx)
+            .expect("root inode");
+        fixture
+            .adapter
+            .dispatch_mkdir(&ctx, root_ino.get(), b"real-dir", 0o755)
+            .expect("mkdir");
+
+        let dh = fixture
+            .adapter
+            .dispatch_opendir(&ctx, root_ino.get())
+            .expect("opendir");
+        let (after_dotdot, _) = fixture
+            .adapter
+            .dispatch_readdir(&ctx, root_ino.get(), dh.dh_id.get(), 2)
+            .expect("readdir after dotdot");
+        assert_eq!(after_dotdot[0].name, b".snapshot");
+        assert_eq!(after_dotdot[0].cookie, 3);
+
+        let (after_snapshot, _) = fixture
+            .adapter
+            .dispatch_readdir(&ctx, root_ino.get(), dh.dh_id.get(), 3)
+            .expect("readdir after snapshot dotdir");
+        assert_eq!(after_snapshot[0].name, b"real-dir");
+        assert_eq!(after_snapshot[0].cookie, 4);
+
         fixture
             .adapter
             .dispatch_releasedir(dh.dh_id.get())
