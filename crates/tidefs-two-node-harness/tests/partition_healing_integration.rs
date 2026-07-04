@@ -235,11 +235,12 @@ fn fence_reset_after_healing() {
 fn healing_protocol_classifies_divergence() {
     let mut healing = PartitionHealingProtocol::new(mid(1));
 
-    healing.exchange_frontiers(
-        make_frontier(vec![1, 2, 3, 4, 5], 5),
-        make_frontier(vec![1, 2, 3], 5),
-    )
-    .expect("frontiers are fresh and well-formed");
+    healing
+        .exchange_frontiers(
+            make_frontier(vec![1, 2, 3, 4, 5], 5),
+            make_frontier(vec![1, 2, 3], 5),
+        )
+        .expect("frontiers are fresh and well-formed");
 
     let div = healing
         .classify_divergence()
@@ -259,11 +260,12 @@ fn healing_protocol_classifies_divergence() {
 fn healing_protocol_detects_conflicts() {
     let mut healing = PartitionHealingProtocol::new(mid(1));
 
-    healing.exchange_frontiers(
-        make_frontier(vec![1, 2, 3], 5),
-        make_frontier(vec![1, 2, 3, 10, 11, 12], 5),
-    )
-    .expect("frontiers are fresh and well-formed");
+    healing
+        .exchange_frontiers(
+            make_frontier(vec![1, 2, 3], 5),
+            make_frontier(vec![1, 2, 3, 10, 11, 12], 5),
+        )
+        .expect("frontiers are fresh and well-formed");
 
     let div = healing
         .classify_divergence()
@@ -287,11 +289,12 @@ fn healing_protocol_full_lifecycle() {
     assert_eq!(joint_epoch, epoch(6));
     assert_eq!(healing.rejoining_members, vec![mid(2), mid(3)]);
 
-    healing.exchange_frontiers(
-        make_frontier(vec![1, 2, 3, 4, 5], 10),
-        make_frontier(vec![1, 2, 3], 7),
-    )
-    .expect("frontiers are fresh and well-formed");
+    healing
+        .exchange_frontiers(
+            make_frontier(vec![1, 2, 3, 4, 5], 10),
+            make_frontier(vec![1, 2, 3], 7),
+        )
+        .expect("frontiers are fresh and well-formed");
     let div = healing
         .classify_divergence()
         .expect("frontiers classify without healing-frontier errors");
@@ -472,11 +475,12 @@ fn partition_detection_config_timeout_escalation() {
 #[test]
 fn healing_protocol_no_divergence_when_identical() {
     let mut healing = PartitionHealingProtocol::new(mid(1));
-    healing.exchange_frontiers(
-        make_frontier(vec![1, 2, 3], 5),
-        make_frontier(vec![1, 2, 3], 5),
-    )
-    .expect("frontiers are fresh and well-formed");
+    healing
+        .exchange_frontiers(
+            make_frontier(vec![1, 2, 3], 5),
+            make_frontier(vec![1, 2, 3], 5),
+        )
+        .expect("frontiers are fresh and well-formed");
 
     let div = healing
         .classify_divergence()
@@ -547,11 +551,12 @@ fn full_partition_lifecycle_detect_fence_heal_converge() {
     assert!(healing.healing_in_progress);
 
     // Exchange frontiers.
-    healing.exchange_frontiers(
-        make_frontier(vec![1, 2, 3, 4, 5], 10),
-        make_frontier(vec![1, 2], 7),
-    )
-    .expect("frontiers are fresh and well-formed");
+    healing
+        .exchange_frontiers(
+            make_frontier(vec![1, 2, 3, 4, 5], 10),
+            make_frontier(vec![1, 2], 7),
+        )
+        .expect("frontiers are fresh and well-formed");
 
     let div = healing
         .classify_divergence()
