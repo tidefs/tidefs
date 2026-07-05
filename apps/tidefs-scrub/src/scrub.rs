@@ -712,9 +712,6 @@ impl ScrubWalker {
             });
         }
         report.filesystem_verifier = Some(FilesystemVerifierSummary::from_report(&verifier));
-        if verifier.verified_committed_roots.is_empty() {
-            return Ok(());
-        }
 
         let inspection_options = StoreOptions {
             repair_torn_tail: false,
@@ -726,6 +723,10 @@ impl ScrubWalker {
             root_key,
         )?;
         attach_content_inspection_findings(report, &inspection);
+
+        if verifier.verified_committed_roots.is_empty() {
+            return Ok(());
+        }
 
         let retention_options = StoreOptions {
             repair_torn_tail: false,
