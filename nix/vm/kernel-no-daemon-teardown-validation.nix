@@ -1110,27 +1110,43 @@ PHASEEOF
     ARTIFACT_DIGEST="blake3:$("$B3SUM" "$OUTPUT_DIR/$ARTIFACT_PATH" | awk '{print $1}')"
     EVIDENCE_CLASS_MANIFEST="runtime-kernel-teardown-no-work-after-artifact"
     SOURCE_LABEL="qemu-smoke-kernel-no-daemon-teardown-validation"
-    SCOPE="kernel-teardown-no-daemon source=qemu-smoke run=$RUN_ID ref=$SOURCE_REF sha=$SOURCE_SHA repo=$SOURCE_REPO"
+    SCOPE="kernel-teardown-no-daemon tier=$VALIDATION_TIER status=$TEARDOWN_STATUS passed=$PASS_COUNT failed=$FAIL_COUNT blocked=$BLOCKED_COUNT skipped=$SKIP_COUNT run=$RUN_ID/$RUN_ATTEMPT ref=$SOURCE_REF sha=$SOURCE_SHA repo=$SOURCE_REPO artifact=$ARTIFACT_PATH surfaces=vfs,block,recovery,writeback,placement_reserve_admission,teardown_no_work_after no_required_support_daemon=true"
+    RESIDUAL_RISK="T6 no-daemon artifact remains claim-review input only; kernelspace-ready/full-kernel/product/successor wording and claim registry state stay blocked unless all required runtime surfaces pass and claim validation accepts this current artifact."
+    case "$TEARDOWN_STATUS" in
+      pass) MANIFEST_OUTCOME="pass" ;;
+      blocked) MANIFEST_OUTCOME="environment-refusal" ;;
+      fail) MANIFEST_OUTCOME="product-fail" ;;
+      *) MANIFEST_OUTCOME="harness-fail" ;;
+    esac
 
     "$JQ" -n \
       --arg claim_id "$CLAIM_ID" \
       --arg evidence_class "$EVIDENCE_CLASS_MANIFEST" \
       --arg validation_tier "$VALIDATION_TIER" \
-      --arg source "$SOURCE_LABEL" \
       --arg scope "$SCOPE" \
       --arg artifact_path "$ARTIFACT_PATH" \
       --arg content_digest "$ARTIFACT_DIGEST" \
+      --arg run_id "$RUN_ID/$RUN_ATTEMPT" \
+      --arg source_ref "$SOURCE_REF" \
+      --arg outcome "$MANIFEST_OUTCOME" \
+      --arg residual_risk "$RESIDUAL_RISK" \
+      --arg source "$SOURCE_LABEL" \
       --arg generated_at "$GENERATED_AT" \
       '{
-        manifest_version: 1,
+        manifest_version: 2,
         claim_id: $claim_id,
         evidence_class: $evidence_class,
         validation_tier: $validation_tier,
-        source: $source,
         scope: $scope,
         artifact_path: $artifact_path,
         content_digest: $content_digest,
-        generated_at: $generated_at
+        run_id: $run_id,
+        source_ref: $source_ref,
+        outcome: $outcome,
+        residual_risk: $residual_risk,
+        source: $source,
+        generated_at: $generated_at,
+        blocking_issues: []
       }' > "$OUTPUT_DIR/evidence-manifest.json"
 
     echo "## evidence-manifest.json written" >> /dev/stderr
@@ -1143,6 +1159,11 @@ PHASEEOF
 
     if ! "$VALIDATOR" validate-kernel-teardown-runtime-artifact "$OUTPUT_DIR/kernel-teardown-runtime.json"; then
       echo "VALIDATE FAIL: xtask teardown artifact validator rejected kernel-teardown-runtime.json"
+      VALIDATION_ERRORS=$((VALIDATION_ERRORS + 1))
+    fi
+
+    if ! "$VALIDATOR" validate-evidence-manifest "$OUTPUT_DIR/evidence-manifest.json"; then
+      echo "VALIDATE FAIL: xtask evidence manifest validator rejected evidence-manifest.json"
       VALIDATION_ERRORS=$((VALIDATION_ERRORS + 1))
     fi
 
