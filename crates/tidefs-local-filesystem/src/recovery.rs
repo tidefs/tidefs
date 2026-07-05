@@ -422,13 +422,19 @@ pub fn inspect_filesystem_content_objects_store(
 ) -> Result<FilesystemContentInspectionReport> {
     let audit = audit_recovery_store(store, root_authentication_key)?;
     let mut report = FilesystemContentInspectionReport::empty();
-    let Some(selected_root) = audit.selected_root else {
-        return Ok(report);
+    let state = if let Some(selected_root) = audit.selected_root {
+        report.selected_root = Some(selected_root.clone());
+        let root = root_commit_from_summary(&selected_root);
+        load_state_from_transaction(store, &root, root_authentication_key)?
+    } else {
+        let Some((_root, state)) =
+            load_newest_content_inspection_state(store, root_authentication_key)?
+        else {
+            return Ok(report);
+        };
+        state
     };
-    report.selected_root = Some(selected_root.clone());
 
-    let root = root_commit_from_summary(&selected_root);
-    let state = load_state_from_transaction(store, &root, root_authentication_key)?;
     for inode in state.inodes.values() {
         if !inode.is_file_like() {
             continue;
@@ -437,6 +443,56 @@ pub fn inspect_filesystem_content_objects_store(
         inspect_inode_content_objects(store, inode, &mut report, pool)?;
     }
     Ok(report)
+}
+
+fn load_newest_content_inspection_state(
+    store: &mut LocalObjectStore,
+    root_authentication_key: RootAuthenticationKey,
+) -> Result<Option<(CommittedRootSummary, FileSystemState)>> {
+    let mut best: Option<(CommittedRootSummary, FileSystemState)> = None;
+
+    for slot in 0..FILESYSTEM_ROOT_SLOT_COUNT {
+        let slot_key = root_slot_object_key(slot);
+        let locations = store.version_locations_of(slot_key);
+        if locations.is_empty() {
+            continue;
+        }
+
+        for location in locations.into_iter().rev() {
+            let bytes = match store.get_at_location(location) {
+                Ok(bytes) => bytes,
+                Err(err) if is_skippable_store_error(&err) => continue,
+                Err(err) => return Err(FileSystemError::from(err)),
+            };
+            let root = match decode_root_commit(&bytes) {
+                Ok(root) => root,
+                Err(_) => continue,
+            };
+            if root.slot != slot || root.transaction_id < ROOT_COMMIT_MIN_TRANSACTION_ID {
+                continue;
+            }
+            let state = match load_state_from_transaction_for_content_inspection(
+                store,
+                &root,
+                root_authentication_key,
+            ) {
+                Ok(state) => state,
+                Err(err) if is_skippable_recovery_error(&err) => continue,
+                Err(err) => return Err(err),
+            };
+            let summary = root.summary();
+            if best
+                .as_ref()
+                .map(|(current, _)| summary.transaction_id > current.transaction_id)
+                .unwrap_or(true)
+            {
+                best = Some((summary, state));
+            }
+            break;
+        }
+    }
+
+    Ok(best)
 }
 
 fn inspect_inode_content_objects(
@@ -1058,6 +1114,33 @@ pub(crate) fn load_state_from_transaction(
     root: &RootCommitRecord,
     root_authentication_key: RootAuthenticationKey,
 ) -> Result<FileSystemState> {
+    load_state_from_transaction_with_manifest_validation(
+        store,
+        root,
+        root_authentication_key,
+        true,
+    )
+}
+
+fn load_state_from_transaction_for_content_inspection(
+    store: &mut LocalObjectStore,
+    root: &RootCommitRecord,
+    root_authentication_key: RootAuthenticationKey,
+) -> Result<FileSystemState> {
+    load_state_from_transaction_with_manifest_validation(
+        store,
+        root,
+        root_authentication_key,
+        false,
+    )
+}
+
+fn load_state_from_transaction_with_manifest_validation(
+    store: &mut LocalObjectStore,
+    root: &RootCommitRecord,
+    root_authentication_key: RootAuthenticationKey,
+    validate_manifest_against_loaded_state: bool,
+) -> Result<FileSystemState> {
     let superblock_bytes = store
         .get(transaction_superblock_object_key(root.transaction_id))?
         .ok_or(FileSystemError::CorruptState {
@@ -1111,20 +1194,36 @@ pub(crate) fn load_state_from_transaction(
             reason: "transaction superblock does not match root commit",
         });
     }
-    let state = load_state_from_superblock(
-        store,
-        &superblock,
-        Some(root.transaction_id),
-        legacy_snapshots,
-    )?;
-    if let Some(manifest) = manifest {
-        validate_transaction_manifest_matches_loaded_state(
+    let state = if validate_manifest_against_loaded_state {
+        load_state_from_superblock(
             store,
-            root,
-            &state,
-            &manifest,
-            &superblock_bytes,
-        )?;
+            &superblock,
+            Some(root.transaction_id),
+            legacy_snapshots,
+        )?
+    } else {
+        if manifest.is_none() {
+            return Err(FileSystemError::CorruptState {
+                reason: "content inspection requires a manifest-backed committed root",
+            });
+        }
+        load_state_from_superblock_for_content_inspection(
+            store,
+            &superblock,
+            root.transaction_id,
+            legacy_snapshots,
+        )?
+    };
+    if validate_manifest_against_loaded_state {
+        if let Some(manifest) = manifest {
+            validate_transaction_manifest_matches_loaded_state(
+                store,
+                root,
+                &state,
+                &manifest,
+                &superblock_bytes,
+            )?;
+        }
     }
     Ok(state)
 }
@@ -1132,7 +1231,7 @@ pub(crate) fn load_state_from_transaction(
 pub(crate) fn validate_root_transaction_manifest(
     store: &LocalObjectStore,
     root: &RootCommitRecord,
-    superblock_bytes: &[u8],
+    _superblock_bytes: &[u8],
     root_authentication: &RootAuthenticationRecord,
 ) -> Result<TransactionManifestRecord> {
     let manifest_bytes = store
@@ -1154,98 +1253,23 @@ pub(crate) fn validate_root_transaction_manifest(
         });
     }
     let manifest = decode_transaction_manifest(&manifest_bytes)?;
-    if manifest.transaction_id != root.transaction_id || manifest.generation != root.generation {
+    validate_root_transaction_manifest_record(root, &manifest)?;
+    Ok(manifest)
+}
+
+pub(crate) fn validate_root_transaction_manifest_record(
+    root: &RootCommitRecord,
+    manifest: &TransactionManifestRecord,
+) -> Result<()> {
+    if manifest.transaction_id != root.transaction_id
+        || manifest.generation != root.generation
+        || manifest.entries.len() as u64 != root.manifest_entry_count
+    {
         return Err(FileSystemError::CorruptState {
             reason: "transaction manifest does not match root commit",
         });
     }
-    if manifest.entries.len() as u64 != root.manifest_entry_count {
-        return Err(FileSystemError::CorruptState {
-            reason: "transaction manifest entry count does not match root commit",
-        });
-    }
-
-    let mut saw_superblock = false;
-    for entry in &manifest.entries {
-        let bytes = store
-            .get(entry.object_key)?
-            .ok_or(FileSystemError::CorruptState {
-                reason: "transaction manifest references a missing object",
-            })?;
-        let actual = checksum64(&bytes);
-        if actual != entry.checksum {
-            return Err(FileSystemError::CorruptState {
-                reason: "transaction manifest object checksum does not match",
-            });
-        }
-        if entry.role == TransactionManifestObjectRole::TransactionSuperblock {
-            if entry.object_key != transaction_superblock_object_key(root.transaction_id) {
-                return Err(FileSystemError::CorruptState {
-                    reason: "transaction manifest superblock key does not match transaction id",
-                });
-            }
-            if bytes != superblock_bytes {
-                return Err(FileSystemError::CorruptState {
-                    reason: "transaction manifest superblock bytes do not match root superblock",
-                });
-            }
-            if entry.checksum != root.superblock_checksum {
-                return Err(FileSystemError::CorruptState {
-                    reason: "transaction manifest superblock checksum does not match root commit",
-                });
-            }
-            saw_superblock = true;
-        }
-    }
-    if !saw_superblock {
-        return Err(FileSystemError::CorruptState {
-            reason: "transaction manifest has no superblock entry",
-        });
-    }
-    Ok(manifest)
-}
-
-/// Find the transaction key where an inode object currently resides,
-/// scanning backwards from `transaction_id`. Needed because dirty-only
-/// commits reference older transaction keys for clean inodes.
-fn find_inode_key(
-    store: &LocalObjectStore,
-    transaction_id: u64,
-    inode_id: InodeId,
-) -> Option<ObjectKey> {
-    let mut tx = transaction_id;
-    while tx >= ROOT_COMMIT_MIN_TRANSACTION_ID {
-        let key = transaction_inode_object_key(tx, inode_id);
-        if store.get(key).ok()?.is_some() {
-            return Some(key);
-        }
-        if tx == 1 {
-            break;
-        }
-        tx -= 1;
-    }
-    None
-}
-
-/// Find the transaction key where a directory object currently resides,
-/// scanning backwards from `transaction_id`.
-fn find_directory_key(
-    store: &LocalObjectStore,
-    transaction_id: u64,
-    inode_id: InodeId,
-) -> Option<ObjectKey> {
-    let mut tx = transaction_id;
-    while tx >= ROOT_COMMIT_MIN_TRANSACTION_ID {
-        let key = transaction_directory_object_key(tx, inode_id);
-        if store.get(key).ok()?.is_some() {
-            return Some(key);
-        }
-        if tx == 1 {
-            break;
-        }
-        tx -= 1;
-    }
-    None
+    Ok(())
 }
 
 pub(crate) fn validate_transaction_manifest_matches_loaded_state(
@@ -1335,6 +1359,49 @@ pub(crate) fn validate_transaction_manifest_matches_loaded_state(
     Ok(())
 }
 
+/// Find the transaction key where an inode object currently resides,
+/// scanning backwards from `transaction_id`. Needed because dirty-only
+/// commits reference older transaction keys for clean inodes.
+fn find_inode_key(
+    store: &LocalObjectStore,
+    transaction_id: u64,
+    inode_id: InodeId,
+) -> Option<ObjectKey> {
+    let mut tx = transaction_id;
+    while tx >= ROOT_COMMIT_MIN_TRANSACTION_ID {
+        let key = transaction_inode_object_key(tx, inode_id);
+        if store.get(key).ok()?.is_some() {
+            return Some(key);
+        }
+        if tx == 1 {
+            break;
+        }
+        tx -= 1;
+    }
+    None
+}
+
+/// Find the transaction key where a directory object currently resides,
+/// scanning backwards from `transaction_id`.
+fn find_directory_key(
+    store: &LocalObjectStore,
+    transaction_id: u64,
+    inode_id: InodeId,
+) -> Option<ObjectKey> {
+    let mut tx = transaction_id;
+    while tx >= ROOT_COMMIT_MIN_TRANSACTION_ID {
+        let key = transaction_directory_object_key(tx, inode_id);
+        if store.get(key).ok()?.is_some() {
+            return Some(key);
+        }
+        if tx == 1 {
+            break;
+        }
+        tx -= 1;
+    }
+    None
+}
+
 pub(crate) fn load_v0390_fixed_object_state(
     store: &mut LocalObjectStore,
     superblock_bytes: &[u8],
@@ -1348,6 +1415,37 @@ pub(crate) fn load_state_from_superblock(
     superblock: &SuperblockRecord,
     transaction_id: Option<u64>,
     legacy_snapshots: Option<Vec<SnapshotRecord>>,
+) -> Result<FileSystemState> {
+    load_state_from_superblock_with_content_validation(
+        store,
+        superblock,
+        transaction_id,
+        legacy_snapshots,
+        true,
+    )
+}
+
+fn load_state_from_superblock_for_content_inspection(
+    store: &mut LocalObjectStore,
+    superblock: &SuperblockRecord,
+    transaction_id: u64,
+    legacy_snapshots: Option<Vec<SnapshotRecord>>,
+) -> Result<FileSystemState> {
+    load_state_from_superblock_with_content_validation(
+        store,
+        superblock,
+        Some(transaction_id),
+        legacy_snapshots,
+        false,
+    )
+}
+
+fn load_state_from_superblock_with_content_validation(
+    store: &mut LocalObjectStore,
+    superblock: &SuperblockRecord,
+    transaction_id: Option<u64>,
+    legacy_snapshots: Option<Vec<SnapshotRecord>>,
+    validate_file_content: bool,
 ) -> Result<FileSystemState> {
     let mut known_inode_ids = BTreeSet::new();
     let mut inodes = BTreeMap::new();
@@ -1388,7 +1486,11 @@ pub(crate) fn load_state_from_superblock(
             inodes.insert(inode_id, inode);
         }
     }
-    validate_loaded_state(store, &inodes, &directories, transaction_id.is_none())?;
+    if validate_file_content {
+        validate_loaded_state(store, &inodes, &directories, transaction_id.is_none())?;
+    } else {
+        validate_loaded_namespace_state(&inodes, &directories)?;
+    }
     let mut snapshots = BTreeMap::new();
     if let Some(legacy) = legacy_snapshots {
         // Old-format superblock: snapshots embedded inline.
@@ -1812,39 +1914,7 @@ fn validate_loaded_state_incremental(
     reloaded_inode_ids: &[InodeId],
     allow_v0390_fixed_content: bool,
 ) -> Result<()> {
-    if !inodes.contains_key(&ROOT_INODE_ID) {
-        return Err(FileSystemError::CorruptState {
-            reason: "root inode is missing",
-        });
-    }
-    if !directories.contains_key(&ROOT_INODE_ID) {
-        return Err(FileSystemError::CorruptState {
-            reason: "root directory object is missing",
-        });
-    }
-    validate_namespace_invariants(inodes, directories)?;
-    for (dir_id, directory) in directories {
-        let dir_inode = inodes.get(dir_id).ok_or(FileSystemError::CorruptState {
-            reason: "directory table has no matching inode",
-        })?;
-        if !dir_inode.is_directory() {
-            return Err(FileSystemError::CorruptState {
-                reason: "non-directory inode owns a directory table",
-            });
-        }
-        for entry in directory.values() {
-            let target = inodes
-                .get(&entry.inode_id)
-                .ok_or(FileSystemError::CorruptState {
-                    reason: "directory entry references a missing inode",
-                })?;
-            if !namespace_entry_matches_target_inode(entry, target) {
-                return Err(FileSystemError::CorruptState {
-                    reason: "directory entry does not match target inode",
-                });
-            }
-        }
-    }
+    validate_loaded_namespace_state(inodes, directories)?;
     // Only read content for inodes that were reloaded from the
     // snapshot; unchanged inodes carried from current_state were
     // already validated when they were originally loaded.
@@ -1864,11 +1934,9 @@ fn validate_loaded_state_incremental(
     Ok(())
 }
 
-pub(crate) fn validate_loaded_state(
-    store: &LocalObjectStore,
+fn validate_loaded_namespace_state(
     inodes: &BTreeMap<InodeId, InodeRecord>,
     directories: &BTreeMap<InodeId, BTreeMap<Vec<u8>, NamespaceEntry>>,
-    allow_v0390_fixed_content: bool,
 ) -> Result<()> {
     if !inodes.contains_key(&ROOT_INODE_ID) {
         return Err(FileSystemError::CorruptState {
@@ -1903,6 +1971,24 @@ pub(crate) fn validate_loaded_state(
             }
         }
     }
+    Ok(())
+}
+
+pub(crate) fn validate_loaded_state(
+    store: &LocalObjectStore,
+    inodes: &BTreeMap<InodeId, InodeRecord>,
+    directories: &BTreeMap<InodeId, BTreeMap<Vec<u8>, NamespaceEntry>>,
+    allow_v0390_fixed_content: bool,
+) -> Result<()> {
+    validate_loaded_namespace_state(inodes, directories)?;
+    validate_loaded_file_content(store, inodes, allow_v0390_fixed_content)
+}
+
+fn validate_loaded_file_content(
+    store: &LocalObjectStore,
+    inodes: &BTreeMap<InodeId, InodeRecord>,
+    allow_v0390_fixed_content: bool,
+) -> Result<()> {
     for inode in inodes.values() {
         if inode.is_file_like() {
             let _ = read_content_from_store(
