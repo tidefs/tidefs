@@ -1,6 +1,6 @@
 # tidefs-intent-log
 
-BLAKE3-authenticated intent-log records, replay helpers, and kernel append/scan
+BLAKE3-authenticated intent-log records, replay helpers, and no_std append/scan
 primitives for TideFS mutation intent records.
 
 ## Record Types
@@ -70,17 +70,15 @@ record checksum. Corrupt segments are reported as skipped by this helper.
 | Lseek              | No        | Read-path metadata marker          |
 | CleanupQueue       | No        | GC ledger state marker             |
 
-## Integrations
+## Replay Consumers
 
-- `tidefs-recovery-loop`: wires `IntentReplayEngine` with `VfsReplayHandler`
-  for replay through `VfsEngine`.
-- `tidefs-local-filesystem`: can invoke replay after committed-root selection
-  as part of its mount flow.
+- Consumers can wire `IntentReplayEngine` with `VfsReplayHandler`.
+- `tidefs-local-filesystem`: can invoke replay after committed-root selection.
 
-## KernelStorageIo Append Path
+## KernelStorageIo Append API
 
-The `kernel-io` feature exposes no_std append and scan surfaces for mounted
-kernel code:
+The `kernel-io` feature exposes no_std append and scan APIs over
+`KernelStorageIo`:
 
 - `IntentLogKernelWriter` writes real `IntentLogFrame` bytes through
   `KernelStorageIo`.
@@ -98,15 +96,5 @@ kernel code:
   `KernelScanError::CorruptedRecord`; `scan_and_replay()` skips them and keeps
   moving, while fatal storage or callback errors abort replay.
 
-These primitives are consumed by the mounted `KernelPoolCore` path. They do not
-by themselves replace the current kernel bring-up table, complete mounted
-object/extent replay, or validate crash-recovery product claims.
-
-## Retired Validation Report
-
-The old `tests/intent_log_replay_validation.rs` validation report was retired.
-It mixed source-model and single-process PASS rows into a release-facing
-validation shape. Intent-log replay closure now belongs to mounted recovery
-validation that exercises committed-root selection and replay through the
-product storage path, or to ordinary focused unit tests that do not claim
-release readiness.
+These primitives provide record append and scan helpers only; higher-level
+replay validation belongs to their consuming layers.
