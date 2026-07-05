@@ -248,25 +248,9 @@ pub fn check_current_workspace() -> Result<(), WorkspacePolicyError> {
         eprintln!("note: {w}");
     }
 
-    // ── Dead crate audit: report library members with zero reverse deps ──
-    let mut rev_count: BTreeMap<&str, usize> = BTreeMap::new();
-    for member in &members {
-        for dep in &member.dependencies {
-            if member_map.contains_key(dep.as_str()) {
-                *rev_count.entry(dep.as_str()).or_insert(0) += 1;
-            }
-        }
-    }
-    for member in &members {
-        if member.kind != NodeKind::Library {
-            continue;
-        }
-        if rev_count.get(member.name.as_str()).copied().unwrap_or(0) == 0 {
-            eprintln!(
-                "note: {} has zero intra-workspace Cargo.toml consumers -- verify before removal",
-                member.name
-            );
-        }
+    // ── Zero-consumer audit: report checked classifications for library roots ──
+    if let Ok(rows) = load_package_classification_rows(&root) {
+        report_checked_zero_reverse_package_notes(&members, &rows);
     }
 
     if violations.is_empty() {
@@ -1047,17 +1031,20 @@ fn check_package_classification_authority(
 
     let reverse_counts = workspace_reverse_dependency_counts(members);
     for member in members {
+        let zero_reverse_library = member.kind == NodeKind::Library
+            && has_zero_workspace_reverse_dependencies(member, &reverse_counts);
         let Some(row) = rows_by_package.get(member.name.as_str()) else {
+            if zero_reverse_library {
+                violations.push(zero_reverse_missing_classification_violation(
+                    member.name.as_str(),
+                ));
+            }
             continue;
         };
-        let reverse_count = reverse_counts
-            .get(member.name.as_str())
-            .copied()
-            .unwrap_or(0);
-        if reverse_count == 0 && !has_concrete_zero_reverse_disposition(&row.disposition) {
-            violations.push(format!(
-                "{PACKAGE_CLASSIFICATION_DOC} row `{}` has zero workspace reverse dependencies but disposition `{}` is not concrete",
-                row.package_name, row.disposition
+        if zero_reverse_library && !has_concrete_zero_reverse_disposition(&row.disposition) {
+            violations.push(zero_reverse_classification_violation(
+                &row.package_name,
+                &row.disposition,
             ));
         }
         if row.role == PackageRole::ScaffoldTransitional
@@ -1071,6 +1058,34 @@ fn check_package_classification_authority(
     }
 
     check_dependency_role_boundaries(members, &rows_by_package, violations);
+}
+
+fn report_checked_zero_reverse_package_notes(
+    members: &[Member],
+    rows: &[PackageClassificationRow],
+) {
+    let reverse_counts = workspace_reverse_dependency_counts(members);
+    let rows_by_package: BTreeMap<&str, &PackageClassificationRow> = rows
+        .iter()
+        .map(|row| (row.package_name.as_str(), row))
+        .collect();
+
+    for member in members {
+        if member.kind != NodeKind::Library
+            || !has_zero_workspace_reverse_dependencies(member, &reverse_counts)
+        {
+            continue;
+        }
+        let Some(row) = rows_by_package.get(member.name.as_str()) else {
+            continue;
+        };
+        if has_concrete_zero_reverse_disposition(&row.disposition) {
+            eprintln!(
+                "note: {} has zero intra-workspace Cargo.toml consumers; checked disposition in {}: {}",
+                member.name, PACKAGE_CLASSIFICATION_DOC, row.disposition
+            );
+        }
+    }
 }
 
 fn load_package_classification_rows(root: &Path) -> Result<Vec<PackageClassificationRow>, String> {
@@ -1494,6 +1509,17 @@ fn workspace_reverse_dependency_counts(members: &[Member]) -> BTreeMap<String, u
     reverse_counts
 }
 
+fn has_zero_workspace_reverse_dependencies(
+    member: &Member,
+    reverse_counts: &BTreeMap<String, usize>,
+) -> bool {
+    reverse_counts
+        .get(member.name.as_str())
+        .copied()
+        .unwrap_or(0)
+        == 0
+}
+
 fn has_concrete_zero_reverse_disposition(disposition: &str) -> bool {
     let lower = disposition.to_ascii_lowercase();
     [
@@ -1509,6 +1535,18 @@ fn has_concrete_zero_reverse_disposition(disposition: &str) -> bool {
     ]
     .iter()
     .any(|needle| lower.contains(needle))
+}
+
+fn zero_reverse_classification_violation(package_name: &str, disposition: &str) -> String {
+    format!(
+        "{PACKAGE_CLASSIFICATION_DOC} row `{package_name}` has zero workspace reverse dependencies but disposition `{disposition}` is not a checked classification; classify it as an intentional external entrypoint/module/harness/model, a product or validation gap owned by a live issue, or a removal/rewire candidate requiring a focused child issue before source deletion"
+    )
+}
+
+fn zero_reverse_missing_classification_violation(package_name: &str) -> String {
+    format!(
+        "{PACKAGE_CLASSIFICATION_DOC} lacks checked zero-consumer classification for `{package_name}`; add a disposition that identifies an intentional external entrypoint/module/harness/model, a product or validation gap owned by a live issue, or a removal/rewire candidate requiring a focused child issue before source deletion"
+    )
 }
 
 fn has_scaffold_followup_disposition(disposition: &str) -> bool {
@@ -3018,6 +3056,34 @@ mod tests {
         assert!(violations
             .iter()
             .any(|violation| violation.contains("retired role `archive-delete-candidate`")));
+    }
+
+    #[test]
+    fn zero_reverse_dispositions_require_checked_classification() {
+        assert!(has_concrete_zero_reverse_disposition(
+            "planned authority surface for issue #862"
+        ));
+        assert!(has_concrete_zero_reverse_disposition(
+            "standalone-checkable proof harness"
+        ));
+        assert!(has_concrete_zero_reverse_disposition(
+            "follow-up issue required before release claims"
+        ));
+
+        assert!(!has_concrete_zero_reverse_disposition(
+            "current product component; capability claims remain limited"
+        ));
+    }
+
+    #[test]
+    fn zero_reverse_violation_names_actionable_states() {
+        let violation =
+            zero_reverse_classification_violation("tidefs-example", "current product component");
+
+        assert!(violation.contains("not a checked classification"));
+        assert!(violation.contains("intentional external entrypoint/module/harness/model"));
+        assert!(violation.contains("product or validation gap owned by a live issue"));
+        assert!(violation.contains("removal/rewire candidate requiring a focused child issue"));
     }
 
     #[test]
