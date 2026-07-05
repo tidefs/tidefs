@@ -41,17 +41,16 @@ jobs:
       }}
     runs-on: [self-hosted, linux, x64, tidefs]
     timeout-minutes: 5
-    env:
-      NEXUS_WEBHOOK_URL: http://172.16.106.12/tidefs-codex-nexus/webhook/github
-      NEXUS_SECRET_FILE: /etc/tidefs-codex-nexus/webhook-secret
 
     steps:
       - name: Post signed event
         shell: bash
         run: |
           set -euo pipefail
+          : "${TIDEFS_CODEX_NEXUS_WEBHOOK_URL:?runner host must provide TIDEFS_CODEX_NEXUS_WEBHOOK_URL}"
+          : "${TIDEFS_CODEX_NEXUS_SECRET_FILE:?runner host must provide TIDEFS_CODEX_NEXUS_SECRET_FILE}"
           test -r "$GITHUB_EVENT_PATH"
-          test -r "$NEXUS_SECRET_FILE"
+          test -r "$TIDEFS_CODEX_NEXUS_SECRET_FILE"
           export PATH="/run/current-system/sw/bin:/usr/bin:/bin:${PATH:-}"
           perl_bin="$(command -v perl)"
 
@@ -66,7 +65,7 @@ jobs:
               open my $efh, "<", $event_path or die "open event: $!";
               my $payload = <$efh>;
               print "sha256=", hmac_sha256_hex($payload, $secret);
-            ' "$NEXUS_SECRET_FILE" "$GITHUB_EVENT_PATH"
+            ' "$TIDEFS_CODEX_NEXUS_SECRET_FILE" "$GITHUB_EVENT_PATH"
           )"
 
           curl --fail --show-error --silent --max-time 20 \
@@ -75,4 +74,4 @@ jobs:
             -H "X-GitHub-Delivery: ${delivery}" \
             -H "X-Hub-Signature-256: ${signature}" \
             --data-binary @"$GITHUB_EVENT_PATH" \
-            "$NEXUS_WEBHOOK_URL"
+            "$TIDEFS_CODEX_NEXUS_WEBHOOK_URL"
