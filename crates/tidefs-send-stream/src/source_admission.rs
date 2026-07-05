@@ -80,7 +80,7 @@ pub enum ResumeCheckpointStatus {
     Unknown,
 }
 
-/// Optional evidence from adjacent source layers.
+/// Evidence from adjacent source layers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EvidenceStatus {
     /// The adjacent evidence surface is not implemented or not wired yet.
@@ -97,6 +97,21 @@ impl Default for EvidenceStatus {
     }
 }
 
+/// Shipment scope for adjacent source-admission evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ShipmentAdmissionScope {
+    /// Production or distributed VFSSEND2 send; all adjacent evidence is mandatory.
+    DistributedRuntime,
+    /// Local/offline model path that deliberately does not claim distributed admission.
+    LocalOfflineModel,
+}
+
+impl Default for ShipmentAdmissionScope {
+    fn default() -> Self {
+        Self::DistributedRuntime
+    }
+}
+
 /// Transport-path evidence consumed when #846-style path state is available.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct TransportPathEvidence {
@@ -107,6 +122,7 @@ pub struct TransportPathEvidence {
 /// All source-side evidence considered for one admission attempt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SourceAdmissionEvidence {
+    pub scope: ShipmentAdmissionScope,
     pub required_work_clear: bool,
     pub transport_path: TransportPathEvidence,
     pub storage_intent_allows_bulk: EvidenceStatus,
@@ -116,10 +132,41 @@ pub struct SourceAdmissionEvidence {
 impl Default for SourceAdmissionEvidence {
     fn default() -> Self {
         Self {
+            scope: ShipmentAdmissionScope::DistributedRuntime,
             required_work_clear: true,
             transport_path: TransportPathEvidence::default(),
             storage_intent_allows_bulk: EvidenceStatus::NotProvided,
             governor_allows_bulk: EvidenceStatus::NotProvided,
+        }
+    }
+}
+
+impl SourceAdmissionEvidence {
+    /// Explicit model-only evidence for local/offline send paths.
+    ///
+    /// This preserves the early local snapshot-send model without making
+    /// missing distributed transport, storage-intent, or governor evidence look
+    /// like production admission.
+    #[must_use]
+    pub fn local_offline_model() -> Self {
+        Self {
+            scope: ShipmentAdmissionScope::LocalOfflineModel,
+            ..Self::default()
+        }
+    }
+
+    /// Positive adjacent evidence required before distributed runtime admission.
+    #[must_use]
+    pub fn distributed_runtime_allows() -> Self {
+        Self {
+            scope: ShipmentAdmissionScope::DistributedRuntime,
+            transport_path: TransportPathEvidence {
+                peer_available: EvidenceStatus::Allows,
+                transfer_bulk_ready: EvidenceStatus::Allows,
+            },
+            storage_intent_allows_bulk: EvidenceStatus::Allows,
+            governor_allows_bulk: EvidenceStatus::Allows,
+            ..Self::default()
         }
     }
 }
@@ -385,10 +432,11 @@ impl SourceAdmissionController {
                 });
             }
         }
-        if let Some(reason) = transport_reason(evidence.transport_path) {
+        if let Some(reason) = transport_reason(evidence.scope, evidence.transport_path) {
             return SendAdmissionDecision::Deferred(reason);
         }
         if let Some(reason) = policy_reason(
+            evidence.scope,
             evidence.storage_intent_allows_bulk,
             SendDeferReason::StorageIntentUnavailable,
             SendDeferReason::StorageIntentRefused,
@@ -396,6 +444,7 @@ impl SourceAdmissionController {
             return SendAdmissionDecision::Deferred(reason);
         }
         if let Some(reason) = policy_reason(
+            evidence.scope,
             evidence.governor_allows_bulk,
             SendDeferReason::GovernorUnavailable,
             SendDeferReason::GovernorBackpressure,
@@ -527,20 +576,30 @@ impl Default for SourceAdmissionController {
     }
 }
 
-fn transport_reason(evidence: TransportPathEvidence) -> Option<SendDeferReason> {
+fn transport_reason(
+    scope: ShipmentAdmissionScope,
+    evidence: TransportPathEvidence,
+) -> Option<SendDeferReason> {
     match evidence.peer_available {
         EvidenceStatus::Refuses => return Some(SendDeferReason::PeerUnavailable),
         EvidenceStatus::Unknown => return Some(SendDeferReason::TransportPathUnknown),
+        EvidenceStatus::NotProvided if scope == ShipmentAdmissionScope::DistributedRuntime => {
+            return Some(SendDeferReason::TransportPathUnknown);
+        }
         EvidenceStatus::NotProvided | EvidenceStatus::Allows => {}
     }
     match evidence.transfer_bulk_ready {
         EvidenceStatus::Refuses => Some(SendDeferReason::TransferBulkBackpressured),
         EvidenceStatus::Unknown => Some(SendDeferReason::TransportPathUnknown),
+        EvidenceStatus::NotProvided if scope == ShipmentAdmissionScope::DistributedRuntime => {
+            Some(SendDeferReason::TransportPathUnknown)
+        }
         EvidenceStatus::NotProvided | EvidenceStatus::Allows => None,
     }
 }
 
 fn policy_reason(
+    scope: ShipmentAdmissionScope,
     status: EvidenceStatus,
     unknown: SendDeferReason,
     refused: SendDeferReason,
@@ -548,6 +607,9 @@ fn policy_reason(
     match status {
         EvidenceStatus::Unknown => Some(unknown),
         EvidenceStatus::Refuses => Some(refused),
+        EvidenceStatus::NotProvided if scope == ShipmentAdmissionScope::DistributedRuntime => {
+            Some(unknown)
+        }
         EvidenceStatus::NotProvided | EvidenceStatus::Allows => None,
     }
 }
@@ -588,7 +650,11 @@ mod tests {
             ShipmentCandidate::incremental(key(2, 10, 3), id(9), ReceiverBaseRootStatus::Missing);
 
         assert_eq!(
-            controller.admit(candidate, SourceAdmissionEvidence::default(), 0),
+            controller.admit(
+                candidate,
+                SourceAdmissionEvidence::distributed_runtime_allows(),
+                0,
+            ),
             SendAdmissionDecision::Deferred(SendDeferReason::MissingIncrementalBase)
         );
     }
@@ -598,13 +664,21 @@ mod tests {
         let mut controller = SourceAdmissionController::default();
         let first = ShipmentCandidate::full(key(2, 10, 3));
         assert!(matches!(
-            controller.admit(first, SourceAdmissionEvidence::default(), 0),
+            controller.admit(
+                first,
+                SourceAdmissionEvidence::distributed_runtime_allows(),
+                0,
+            ),
             SendAdmissionDecision::Admitted(_)
         ));
 
         let second = ShipmentCandidate::full(key(2, 10, 4));
         assert_eq!(
-            controller.admit(second, SourceAdmissionEvidence::default(), 1),
+            controller.admit(
+                second,
+                SourceAdmissionEvidence::distributed_runtime_allows(),
+                1,
+            ),
             SendAdmissionDecision::Deferred(SendDeferReason::AdmissionLimitPressure {
                 scope: AdmissionLimitScope::Dataset
             })
@@ -649,7 +723,7 @@ mod tests {
             controller.admit(
                 ShipmentCandidate::full(key),
                 SourceAdmissionEvidence::default(),
-                550
+                550,
             ),
             SendAdmissionDecision::Deferred(SendDeferReason::RetryBackoffActive {
                 retry_after_ms: 50
@@ -658,7 +732,63 @@ mod tests {
     }
 
     #[test]
-    fn optional_adjacent_evidence_is_consumed_when_present() {
+    fn distributed_runtime_requires_transport_path_evidence() {
+        let mut controller = SourceAdmissionController::default();
+
+        assert_eq!(
+            controller.admit(
+                ShipmentCandidate::full(key(2, 10, 3)),
+                SourceAdmissionEvidence::default(),
+                0,
+            ),
+            SendAdmissionDecision::Deferred(SendDeferReason::TransportPathUnknown)
+        );
+    }
+
+    #[test]
+    fn distributed_runtime_requires_storage_intent_evidence() {
+        let mut controller = SourceAdmissionController::default();
+        let evidence = SourceAdmissionEvidence {
+            storage_intent_allows_bulk: EvidenceStatus::NotProvided,
+            ..SourceAdmissionEvidence::distributed_runtime_allows()
+        };
+
+        assert_eq!(
+            controller.admit(ShipmentCandidate::full(key(2, 10, 3)), evidence, 0,),
+            SendAdmissionDecision::Deferred(SendDeferReason::StorageIntentUnavailable)
+        );
+    }
+
+    #[test]
+    fn distributed_runtime_requires_governor_evidence() {
+        let mut controller = SourceAdmissionController::default();
+        let evidence = SourceAdmissionEvidence {
+            governor_allows_bulk: EvidenceStatus::NotProvided,
+            ..SourceAdmissionEvidence::distributed_runtime_allows()
+        };
+
+        assert_eq!(
+            controller.admit(ShipmentCandidate::full(key(2, 10, 3)), evidence, 0,),
+            SendAdmissionDecision::Deferred(SendDeferReason::GovernorUnavailable)
+        );
+    }
+
+    #[test]
+    fn local_offline_model_keeps_unwired_evidence_boundary_explicit() {
+        let mut controller = SourceAdmissionController::default();
+
+        assert!(matches!(
+            controller.admit(
+                ShipmentCandidate::full(key(2, 10, 3)),
+                SourceAdmissionEvidence::local_offline_model(),
+                0,
+            ),
+            SendAdmissionDecision::Admitted(_)
+        ));
+    }
+
+    #[test]
+    fn adjacent_refusal_evidence_is_consumed_when_present() {
         let mut controller = SourceAdmissionController::default();
         let evidence = SourceAdmissionEvidence {
             transport_path: TransportPathEvidence {
@@ -669,7 +799,7 @@ mod tests {
         };
 
         assert_eq!(
-            controller.admit(ShipmentCandidate::full(key(2, 10, 3)), evidence, 0),
+            controller.admit(ShipmentCandidate::full(key(2, 10, 3)), evidence, 0,),
             SendAdmissionDecision::Deferred(SendDeferReason::PeerUnavailable)
         );
     }
