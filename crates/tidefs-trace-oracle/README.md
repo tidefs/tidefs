@@ -74,9 +74,8 @@ Operations are replayed through the TideFS request contract
 `tidefs-schema-codec-vfs`). The model backend routes every operation
 through `tidefs-model-core`'s `ModelFs` via the contract envelope path.
 
-## Program Authority
+## Authority
 
-- Nextgen verification plan: `docs/NEXTGEN_VERIFICATION_PERFORMANCE_OFFLOAD_PLAN.md`
 - Claims gate policy: `docs/CLAIMS_GATE_POLICY.md`
 - Validation tier vocabulary: `crates/tidefs-validation/src/validation_schema.rs`
 - Request contract: `docs/REQUEST_CONTRACT.md`

@@ -128,11 +128,11 @@ evidence for the exact claimed scope.
 
 ## Validation Tier Evidence Map
 
-The nextgen program authority is
-`docs/NEXTGEN_VERIFICATION_PERFORMANCE_OFFLOAD_PLAN.md`. This policy document
-is the claims-facing reference for mapping the validation tiers implemented by
-`tidefs-validation` to the evidence classes required by
-`validation/claims.toml`.
+This policy document is the claims-facing reference for mapping the validation
+tiers implemented by `tidefs-validation` to the evidence classes required by
+`validation/claims.toml`. Historical roadmap documents may describe lineage,
+but they do not override the claim registry, evidence manifests, or this
+policy.
 
 The rule is intentionally conservative: the claim registry names the required
 evidence classes, while the validation tier describes where the artifact came

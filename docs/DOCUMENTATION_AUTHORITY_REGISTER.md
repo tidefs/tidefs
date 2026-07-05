@@ -426,24 +426,25 @@ claim-gate coverage for an exact scope.
 ### Nextgen Verification Root Retirements (TFR-021 / #1656, #1660)
 
 Issue #1656 deleted the old issue #281 nextgen verification roadmap as a
-superseded live roadmap root. The current TFR-021 authority remains the
-integrated program document
-`docs/NEXTGEN_VERIFICATION_PERFORMANCE_OFFLOAD_PLAN.md`, together with
-`validation/claims.toml`, `docs/CLAIMS_GATE_POLICY.md`, and focused producer
-issues for evidence-manifest adoption. The deleted #281 roadmap remains
-lineage in git, issue, and PR history only; it is not a current planning
-authority surface and must not be cited as product-readiness, release,
-successor, crash-safety, performance-isolation, kernel, distributed, RDMA, or
-offload evidence.
+superseded live roadmap root. This cleanup collapses
+`docs/NEXTGEN_VERIFICATION_PERFORMANCE_OFFLOAD_PLAN.md` itself from an
+integrated program roadmap into a bounded historical pointer and current
+authority index. Current TFR-021 authority lives in `docs/CLAIMS_GATE_POLICY.md`,
+`validation/claims.toml`, generated `docs/CLAIM_REGISTRY.md`, evidence manifest
+schemas/source, focused subsystem docs, CI docs, and live GitHub issues/PRs for
+the exact slice. The deleted #281 roadmap and the retired nextgen follow-up map
+remain lineage in git, issue, and PR history only; they are not current planning
+authority and must not be cited as product-readiness, release, successor,
+crash-safety, performance-isolation, kernel, distributed, RDMA, or offload
+evidence.
 
 Issue #1660 deleted the standalone issue #751 evidence-chain authority root for
-the same reason: its useful evidence-chain decision is already carried by the
-integrated TFR-021 program document, `validation/claims.toml`,
-`docs/CLAIMS_GATE_POLICY.md`, generated `docs/CLAIM_REGISTRY.md`, and the
-source-backed `EvidenceArtifactManifest` tooling. The deleted path remains
-lineage in git, issue, and PR history only. It is not a separate current
-authority and must not be cited as claim closure, product proof, or
-release-readiness evidence.
+the same reason: its useful evidence-chain decision is carried by
+`validation/claims.toml`, `docs/CLAIMS_GATE_POLICY.md`, generated
+`docs/CLAIM_REGISTRY.md`, and the source-backed `EvidenceArtifactManifest`
+tooling. The deleted path remains lineage in git, issue, and PR history only.
+It is not a separate current authority and must not be cited as claim closure,
+product proof, or release-readiness evidence.
 
 ### Request Contract Authority (TFR-019 / #1136)
 

@@ -12,11 +12,11 @@ rebuild, reclaim, or offload runtime behavior.
 ## Authority
 
 The canonical portable records live in `tidefs-types-vfs-core`. The fixed-width
-little-endian codecs live in `tidefs-schema-codec-vfs`. Issue #282 reuses
-those existing anchors from the integrated nextgen verification program
-authority in `docs/NEXTGEN_VERIFICATION_PERFORMANCE_OFFLOAD_PLAN.md` instead
-of creating a second VFS request type system. The older issue #281 roadmap
-remains lineage in git, issue, and PR history only.
+little-endian codecs live in `tidefs-schema-codec-vfs`. Claim and validation
+authority for request-contract evidence lives in `docs/CLAIMS_GATE_POLICY.md`,
+`validation/claims.toml`, generated `docs/CLAIM_REGISTRY.md`, and any live
+issue/PR for the exact slice. Older roadmap issues remain lineage in git,
+issue, and PR history only.
 
 External protocols refine into this boundary:
 
