@@ -415,7 +415,7 @@ evidence_artifacts = [
 
 [[claims]]
 id = "local.vfs.write_fsync_crash.v1"
-status = "validated"
+status = "blocked"
 scope = "local VFS write and fsync crash recovery"
 required_evidence_classes = [
   "model-crash-matrix",
@@ -423,12 +423,14 @@ required_evidence_classes = [
   "claims-gate-review",
 ]
 evidence_requirements = [
-  { class = "model-crash-matrix", path = "validation/artifacts/crash-oracle/model-crash-matrices.json", validation_tier = "source-model", blocking_issues = [] },
-  { class = "runtime-crash-oracle", path = "validation/artifacts/crash-oracle/local-vfs-write-fsync-runtime-crash.json", validation_tier = "mounted-userspace", blocking_issues = [] },
-  { class = "claims-gate-review", path = "validation/artifacts/crash-oracle/claims-gate-review.toml", validation_tier = "source-model", blocking_issues = [] },
+  { class = "model-crash-matrix", path = "validation/artifacts/crash-oracle/model-crash-matrices.json", validation_tier = "source-model", manifest_path = "validation/artifacts/crash-oracle/model-crash-matrices.local-vfs-write-fsync.manifest.json", blocking_issues = [] },
+  { class = "runtime-crash-oracle", path = "validation/artifacts/crash-oracle/local-vfs-write-fsync-runtime-crash.json", validation_tier = "mounted-userspace", manifest_path = "validation/artifacts/crash-oracle/local-vfs-write-fsync-runtime-crash.local-vfs-write-fsync.manifest.json", blocking_issues = [] },
+  { class = "claims-gate-review", path = "validation/artifacts/crash-oracle/claims-gate-review.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/crash-oracle/claims-gate-review.local-vfs-write-fsync.manifest.json", blocking_issues = [] },
 ]
-blockers = []
-generated_doc = "Validated bounded local VFS write/fsync crash claim. TideFS has model-crash-matrix, OpFsyncBeforeFlush runtime-crash-oracle, and claims-gate review evidence for the local write -> fsync -> read -> crash/recover path. This is not production crash-safety proof beyond the local VFS hook scope."
+blockers = [
+  "The recorded local VFS write/fsync runtime manifest is a deterministic fixture from a stale issue branch, not current-source mounted runtime evidence.",
+]
+generated_doc = "Blocked local VFS write/fsync crash claim. TideFS has model evidence and a bounded local runtime fixture for the write -> fsync -> read -> crash/recover path, but current-source mounted runtime evidence must replace the deterministic fixture before product wording may validate this scope."
 evidence_artifacts = [
   { class = "model-crash-matrix", path = "validation/artifacts/crash-oracle/model-crash-matrices.json", source = "tidefs-crash-oracle", scope = "model-only" },
   { class = "runtime-crash-oracle", path = "validation/artifacts/crash-oracle/local-vfs-write-fsync-runtime-crash.json", source = "tidefs-local-filesystem", scope = "local-vfs-runtime-write-fsync-crash" },
@@ -505,7 +507,7 @@ evidence_artifacts = []
 
 [[claims]]
 id = "perf.local.no_unbounded_dirty_debt.v1"
-status = "validated"
+status = "blocked"
 scope = "local dirty write admission and budgeted queue accounting"
 required_evidence_classes = [
   "admission-budget-model",
@@ -514,13 +516,16 @@ required_evidence_classes = [
   "claims-gate-review",
 ]
 evidence_requirements = [
-  { class = "admission-budget-model", path = "validation/performance/no-hidden-queues.toml", validation_tier = "source-model", blocking_issues = [] },
-  { class = "no-hidden-queue-gate", path = "validation/performance/no-hidden-queues.toml", validation_tier = "cargo-unit", blocking_issues = [] },
-  { class = "queue-depth-runtime-artifact", path = "validation/artifacts/performance/queue-depth-runtime.json", validation_tier = "mounted-userspace", blocking_issues = [] },
-  { class = "claims-gate-review", path = "validation/artifacts/performance/claims-gate-review.toml", validation_tier = "source-model", blocking_issues = [] },
+  { class = "admission-budget-model", path = "validation/performance/no-hidden-queues.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/performance/local-no-unbounded-dirty-debt-admission-budget-model.manifest.json", blocking_issues = [] },
+  { class = "no-hidden-queue-gate", path = "validation/performance/no-hidden-queues.toml", validation_tier = "cargo-unit", manifest_path = "validation/artifacts/performance/local-no-unbounded-dirty-debt-no-hidden-queue-gate.manifest.json", blocking_issues = [] },
+  { class = "queue-depth-runtime-artifact", path = "validation/artifacts/performance/queue-depth-runtime.json", validation_tier = "mounted-userspace", manifest_path = "validation/artifacts/performance/local-no-unbounded-dirty-debt-queue-depth-runtime.manifest.json", blocking_issues = [] },
+  { class = "claims-gate-review", path = "validation/artifacts/performance/claims-gate-review.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/performance/local-no-unbounded-dirty-debt-claims-gate-review.manifest.json", blocking_issues = [] },
 ]
-blockers = []
-generated_doc = "Validated bounded local no-unbounded-dirty-debt claim. TideFS has admission-budget model evidence, no-hidden-queue gate evidence, mounted FUSE queue-depth runtime evidence, and claims-gate review evidence for the local smoke-mount quick workload. This does not validate scheduler-wide dirty-debt coverage, scrub/read isolation, crash recovery, or production performance readiness."
+blockers = [
+  "The queue-depth runtime artifact explicitly says it does not move this claim out of blocked status.",
+  "The recorded queue-depth runtime manifest predates current source and must be refreshed before this mounted-runtime claim can validate.",
+]
+generated_doc = "Blocked bounded local no-unbounded-dirty-debt claim. TideFS has admission-budget model evidence, no-hidden-queue gate evidence, and a mounted FUSE queue-depth runtime artifact for the local smoke-mount quick workload, but the artifact boundary keeps the claim blocked and current-source runtime evidence is required before validation."
 evidence_artifacts = [
   { class = "admission-budget-model", path = "validation/performance/no-hidden-queues.toml", source = "tidefs-performance-contract", scope = "source-model" },
   { class = "no-hidden-queue-gate", path = "validation/performance/no-hidden-queues.toml", source = "tidefs-xtask", scope = "cargo-unit" },
