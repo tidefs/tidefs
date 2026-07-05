@@ -1357,13 +1357,11 @@ fn validate_manifest_matches_requirement(
             requirement.blocking_issues.join(", ")
         ));
     }
-    if enforce_freshness
-        && claim.status == ClaimStatus::Validated
-        && manifest
-            .run_id
-            .starts_with(DETERMINISTIC_FIXTURE_RUN_ID_PREFIX)
-        && (requirement.validation_tier.is_runtime() || manifest.validation_tier.is_runtime())
-    {
+    let is_runtime_fixture_manifest = manifest
+        .run_id
+        .starts_with(DETERMINISTIC_FIXTURE_RUN_ID_PREFIX)
+        && (requirement.validation_tier.is_runtime() || manifest.validation_tier.is_runtime());
+    if is_runtime_fixture_manifest {
         status = worse_evidence_status(status, EvidenceClassStatus::Stale);
         details.push(format!(
             "claim `{}` evidence manifest `{manifest_path}` uses deterministic fixture run_id `{}` for runtime-tier `{}` evidence; validated runtime evidence must come from a current source run",
