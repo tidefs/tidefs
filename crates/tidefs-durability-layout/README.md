@@ -1,7 +1,11 @@
 # tidefs-durability-layout
 
-TideFS-native durability layout descriptor unifying mirror and erasure-style
-policies across device and node failure domains.
+Crate-local durability layout descriptors, topology helpers, and placement
+checks used by TideFS storage code.
+
+This README orients contributors to the APIs in this crate. Product placement,
+pool recovery, and release-admission authority lives in the repo-level docs and
+issues listed in [Scope Boundaries](#scope-boundaries).
 
 ## Durability Policy
 
@@ -16,9 +20,8 @@ Self-verification uses BLAKE3 domain-separated checksums
 
 ## Failure Domain Model
 
-`FailureDomainLevel` defines the four-tier hierarchical failure boundary
-model that applies identically to local multi-device and clustered
-multi-node topologies:
+`FailureDomainLevel` defines the four-tier hierarchical failure boundary model
+used by this crate:
 
 | Level       | Scope                     |
 |-------------|---------------------------|
@@ -33,14 +36,15 @@ placement queries like "do these two devices share a rack?".
 
 ### FailureDomainTopology
 
-Flat topology registry (`failure_domain.rs`): nodes assigned to racks
-and datacenters, devices assigned to nodes. Provides:
+Flat topology registry (`failure_domain.rs`): nodes assigned to racks and
+datacenters, devices assigned to nodes. Provides modeled topology helpers:
 
-- Failure simulation: `simulate_node_failure` computes worst-case
+- `simulate_node_failure`: computes worst-case modeled
   replica loss using ceil-based distribution.
-- Survival checks: `can_survive_any_single_node_failure`,
+- Boolean helpers named `can_survive_any_single_node_failure`,
   `can_survive_any_single_rack_failure`,
-  `can_survive_n_node_failures`.
+  `can_survive_n_node_failures`. These report crate-local topology/policy
+  calculations; they are not product admission evidence by themselves.
 
 ### FailureDomainTree
 
@@ -59,12 +63,11 @@ for offline integrity verification. Provides:
 
 ### LayoutValidator
 
-Stateless validator (`layout_validator.rs`): takes a
-`DurabilityLayoutV1` and a `FailureDomainTopology`, checks that the
-policy can survive single-node, multi-node, rack-level, and
-datacenter-level failures. Emits `LayoutValidationError` for hard
-violations and `ValidationWarning` for suboptimal configurations
-(single rack, over-provisioned, replicas sharing nodes).
+Stateless validator (`layout_validator.rs`): takes a `DurabilityLayoutV1` and a
+`FailureDomainTopology`, then reports modeled policy/topology inconsistencies.
+It emits `LayoutValidationError` for hard violations and `ValidationWarning`
+for suboptimal configurations such as a single rack, over-provisioning, or
+replicas sharing nodes.
 
 ## Placement
 
@@ -76,26 +79,24 @@ placement.
 `DeviceGroupMapper` (`device_group.rs`) assigns shards to
 failure-domain-separated device groups for multi-level redundancy.
 
-`LayoutPolicy` (`policy.rs`) defines the placement contract:
-target selection, replica counts, failure-domain separation constraints,
-and rebuild-trigger thresholds. `DefaultLayoutPolicy` is the concrete
-single-policy implementation.
+`LayoutPolicy` (`policy.rs`) defines crate-local target selection, replica
+counts, failure-domain separation constraints, and rebuild-trigger thresholds.
+`DefaultLayoutPolicy` is the concrete single-policy implementation.
 
 `LayoutVerifier` (`verify.rs`) validates actual object placements
 against the declared policy, detecting co-located replicas,
 under-replication, and constraint breaches.
 
-## Single Durability Mechanism
+## Scope Boundaries
 
-The same `DurabilityPolicy`, `FailureDomainLevel` hierarchy, and
-`LayoutValidator` cover local (single-host multi-device) and clustered
-(multi-node) deployments. The placement planner, rebuild runtime,
-and scrub repair engine all consume the same failure-domain types
-and validators — there is no separate local vs. clustered code path.
+The types in this crate are source-backed building blocks. They do not, by
+themselves, prove pool-wide placement behavior, recovery orchestration,
+read-after-topology-change behavior, or any release-admission claim.
 
-## Retired Validation Validation
+Use these existing authorities for broader behavior:
 
-The old `durability_validation` source-model validation module was retired.
-Durability-layout APIs remain product code, but release closure must come from
-mounted filesystem, block-volume, or multi-node artifacts that exercise real
-placement and recovery behavior rather than canonical source-model rows.
+- `../../docs/POOL_WIDE_REDUNDANCY_PLACEMENT_CONTRACT.md` for pool-wide
+  placement and receipt behavior.
+- `../../docs/ERASURE_CODED_STORE_AUTHORITY.md` for erasure-coded store scope.
+- GitHub issues #18, #1735, #1745, #1792, #1860, and #1861 for remaining
+  placement, recovery, scrub, and product-admission work.
