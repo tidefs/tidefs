@@ -10,8 +10,8 @@ adapter and higher-level filesystem consumers call. It maps directory paths
 to inodes through the polymorphic directory index and provides entry types for
 insert, lookup, and remove operations. Entry content hashing uses
 `rustc-hash`'s fast non-cryptographic `FxHasher` for in-memory lookup
-checks; durability, recovery, and cryptographic integrity are storage-layer
-and authority-doc responsibilities.
+checks; storage persistence and cryptographic integrity are outside this
+crate's directory-entry API.
 
 ## Architecture
 
@@ -55,13 +55,12 @@ non-cryptographic hash function. This enables:
 
 - **Field-change detection**: `entry.verify()` returns false if any hashed
   field changes.
-- **Replay comparison**: identical entries produce identical hashes, so replay
-  code can compare already-applied operations.
+- **Record comparison**: identical entries produce identical hashes, so
+  consumers can compare already-applied operations.
 - **Tombstone verification**: `NamespaceEntryTombstone` carries the removed
   entry's hash.
 
-Durability and cryptographic integrity are provided by the storage layer
-(BLAKE3-256 on-disk records); the namespace hash is purely for in-memory
+The namespace hash is not a storage-integrity check; it is only for in-memory
 lookup performance.
 
 ## Intent-Log Recording
@@ -78,8 +77,8 @@ lookup performance.
 | File/symlink remove | `IntentLogRecord::Unlink` |
 | Directory remove | `IntentLogRecord::Rmdir` |
 
-The records are inputs to replay consumers. They are not standalone evidence
-for namespace recovery, rename atomicity, or product admission.
+The records are inputs to replay consumers. They do not settle rename atomicity
+or higher-level replay behavior by themselves.
 
 ## Usage
 

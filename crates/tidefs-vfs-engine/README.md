@@ -26,18 +26,18 @@ to share one engine abstraction.
 
 ## Transaction-Group Lifecycle
 
-The transaction-group (txg) trait methods are the VFS engine boundary for
-kernel-mode write batching and committed-root advancement. The trait defaults
-do not provide durability: engines without explicit txg and committed-root
-authority fail closed instead of reporting a successful no-op commit.
+The transaction-group (txg) trait methods are the VFS engine API boundary for
+write batching and committed-root advancement. The trait defaults fail closed:
+engines without explicit txg support return errors instead of reporting a
+successful no-op commit.
 
 ### Types
 
 - `TxgId` — u64 newtype identifying a transaction group (0 = NO_TXG sentinel)
 - `TxgHandle` — opaque handle returned by `txg_open`, consumed by
   `txg_commit_finish`; drop without consumption implicitly aborts
-- `CommittedRoot` — 32-byte content digest identifying a durable committed
-  filesystem state
+- `CommittedRoot` — 32-byte content digest identifying a committed filesystem
+  state
 - `TxgPrepareResult` — committed root, quorum flag, and engine-specific flags
   returned by `txg_commit_prepare`
 
@@ -63,20 +63,18 @@ non-empty commit result.
 fn txg_commit_finish(&self, handle: TxgHandle, committed_root: CommittedRoot) -> Result<(), Errno>
 ```
 
-Confirms the committed root is durable and closes the txg. Engines that support
-txg commits consume the handle and mark it consumed so its drop does not
-trigger an abort. The default returns `ENOSYS`, or `EINVAL` for
-`CommittedRoot::ZERO`.
+Closes the txg using the prepared committed root. Engines that support txg
+commits consume the handle and mark it consumed so its drop does not trigger an
+abort. The default returns `ENOSYS`, or `EINVAL` for `CommittedRoot::ZERO`.
 
 ```rust
 fn write_committed_root(&self, committed_root: &CommittedRoot, device_index: u32) -> Result<(), Errno>
 ```
 
 Writes the committed root to the pool-label superblock on the specified lower
-device. Engines that back real block devices must override this to serialize a
-non-zero committed root into PoolLabelV1 and issue a synchronous block write to
-the label region. The default returns `ENOSYS`, or `EINVAL` for
-`CommittedRoot::ZERO`.
+device. Engines that expose this operation must override the default to
+serialize a non-zero committed root into `PoolLabelV1` for the label region. The
+default returns `ENOSYS`, or `EINVAL` for `CommittedRoot::ZERO`.
 
 ### Usage Example
 
@@ -101,19 +99,12 @@ fn commit_write_batch(engine: &dyn VfsEngine) -> Result<(), Errno> {
         // ... collect quorum ...
     }
 
-    // Finalize: advance the durable committed root.
+    // Finalize: advance the committed root.
     engine.txg_commit_finish(handle, result.committed_root)?;
 
     Ok(())
 }
 ```
-
-### No-Daemon Boundary
-
-No-daemon transaction-group durability is available only through engines that
-explicitly implement txg lifecycle and committed-root writeback authority. The
-default trait methods intentionally refuse that authority so scaffolding cannot
-be mistaken for mounted full-kernel durability.
 
 ## Authority
 
@@ -123,10 +114,10 @@ shape is documented in `docs/REQUEST_CONTRACT.md`.
 
 ## KernelPoolCore (pool_core module)
 
-`KernelPoolCore` is the shared kernel-resident pool context for POSIX VFS
-and block-kmod frontends. It lives in `tidefs-vfs-engine` alongside other
-shared kernel types (CommittedRoot, TxgId, TxgHandle, BlockQueueGeometry,
-FiemapExtent) so every kernel crate sees one canonical pool-core API.
+`KernelPoolCore` is the shared pool context type used by kernel-facing POSIX
+VFS and block-kmod crates. It lives in `tidefs-vfs-engine` alongside other
+shared types (`CommittedRoot`, `TxgId`, `TxgHandle`, `BlockQueueGeometry`,
+`FiemapExtent`) so those crates use one pool-core API.
 
 ### Types
 
