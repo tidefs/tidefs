@@ -3754,7 +3754,7 @@ const UNGUARDED_COMMANDS: &[&str] = &[
     }
 
     #[test]
-    fn validate_claim_receipt_accepts_local_write_runtime_artifact() {
+    fn validate_claim_receipt_blocks_demoted_local_write_runtime_artifact() {
         let root = workspace_root();
         let registry = parse_claim_registry(include_str!("../../../validation/claims.toml"))
             .expect("claim registry parses");
@@ -3765,7 +3765,7 @@ const UNGUARDED_COMMANDS: &[&str] = &[
             .expect("local VFS write/fsync crash claim registered");
 
         let receipt = build_claim_validation_receipt(&root, SystemTime::UNIX_EPOCH, claim);
-        assert_eq!(receipt.status, ClaimReceiptStatus::Pass);
+        assert_eq!(receipt.status, ClaimReceiptStatus::Blocked);
 
         let runtime = receipt
             .required_evidence
@@ -3784,12 +3784,12 @@ const UNGUARDED_COMMANDS: &[&str] = &[
         );
         assert!(
             runtime.details.is_empty(),
-            "runtime artifact verifier should accept committed local VFS crash evidence: {:?}",
+            "demoted claim should keep committed local VFS crash evidence present: {:?}",
             runtime.details
         );
 
         let summary = render_claim_validation_summary(&receipt);
-        assert!(summary.contains("status: PASS"));
+        assert!(summary.contains("status: BLOCKED"));
         assert!(summary.contains("class: runtime-crash-oracle"));
         assert!(!summary.contains("blocking_issues: #493"));
     }
