@@ -128,11 +128,11 @@ may use non-secret repository variables for scheduling gates, such as
 - `Codex Nexus Relay` is a self-hosted event bridge for the local
   `tidefs-codex-nexus` dashboard. It does not run tests or checkout source; it
   relays issue, pull-request, push, and manual-dispatch events by signing the
-  original GitHub event payload with the host-local
-  `/etc/tidefs-codex-nexus/webhook-secret` file on `ci1`/`ci2` and posting it
-  to `http://172.16.106.12/tidefs-codex-nexus/webhook/github`. Comment and
-  workflow-run events stay out of the relay to avoid recursive automation
-  chatter; the Nexus safety poll still refreshes workflow state.
+  original GitHub event payload with the host-local relay HMAC secret and
+  posting it to the operator-owned Nexus webhook endpoint configured on the
+  self-hosted runner hosts. Comment and workflow-run events stay out of the
+  relay to avoid recursive automation chatter; the Nexus safety poll still
+  refreshes workflow state.
 - `Nix Checks` runs on self-hosted TideFS runners and builds pure check
   derivations plus core Nix packages. It is a compile/build gate only: a green
   run does not prove FUSE, uBLK, RDMA, mounted-kernel behavior, filesystem
@@ -277,20 +277,19 @@ rather than treating each queued relay job as durable work.
 Runner host configuration and bring-up notes live in
 `tidefs/tidefs-infra-configuration`.
 
-## Codex Nexus Relay Recovery
+## Codex Nexus Relay Operator Boundary
 
-The relay HMAC secret is intentionally host-local. It must be present on each
-self-hosted runner VM as:
-
-```text
-/etc/tidefs-codex-nexus/webhook-secret
-```
-
-The file should be owned by `root:github-runner` with mode `0640`. To validate
-the event bridge after runner maintenance, confirm that the NixOS system
-profile still exposes the relay signer tools on each runner, dispatch the
-`Codex Nexus Relay` workflow against the target branch, and confirm the local
-dashboard event log records a signed `workflow_dispatch` event.
+The relay HMAC secret, webhook endpoint, runner host environment, bring-up
+steps, and post-maintenance recovery checks are intentionally host-local
+operator state. Keep those values and procedures in private infrastructure or
+operator-owned process documentation, such as
+`tidefs/tidefs-infra-configuration` and the Codex Nexus operator docs. The
+public workflow consumes `TIDEFS_CODEX_NEXUS_WEBHOOK_URL` and
+`TIDEFS_CODEX_NEXUS_SECRET_FILE` from that runner-host environment; those
+variables must not be replaced with GitHub secrets, repository variables, or
+public endpoint literals. The public repo owns only the relay contract: signed
+original GitHub event payloads are delivered from self-hosted runners to Nexus,
+and relay jobs remain controller telemetry rather than TideFS validation.
 
 - `Kernel no-daemon teardown validation` is a manual self-hosted QEMU Smoke
   target for the T6 full-kernel-no-daemon teardown and recovery runtime
