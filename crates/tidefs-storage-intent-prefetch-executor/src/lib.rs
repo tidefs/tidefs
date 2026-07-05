@@ -3388,8 +3388,12 @@ fn dispatch_plan_refusal(
     }
 
     let plan = input.dispatch_plan;
-    if !plan.shape.matches_action_family(family) || !dispatch_plan_has_shape_bounds(plan) {
+    if !dispatch_plan_has_shape_bounds(plan) {
         return StorageIntentRefusalReason::EvidenceNotUsable;
+    }
+
+    if !plan.shape.matches_action_family(family) {
+        return StorageIntentRefusalReason::PolicyConflict;
     }
 
     if !snapshot_contains_fresh_ref(
@@ -5773,7 +5777,7 @@ mod tests {
         assert_eq!(wrong_shape_record.outcome, PrefetchExecutorOutcome::Blocked);
         assert_eq!(
             wrong_shape_record.refusal,
-            StorageIntentRefusalReason::EvidenceNotUsable
+            StorageIntentRefusalReason::PolicyConflict
         );
 
         let mut missing_ref = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
