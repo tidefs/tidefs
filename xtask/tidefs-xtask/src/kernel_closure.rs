@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
-//! Kernel-portable dependency closure guard (#6174).
+//! Kernel-portable storage-core dependency closure guard.
 //!
 //! Replaces the manifest-string "transitive guard" from
 //! `crates/tidefs-local-filesystem/build.rs` with a real `cargo metadata`
@@ -115,8 +115,9 @@ impl fmt::Display for ClosureCheckError {
         writeln!(
             f,
             "\nStorage-core crates must not depend on control-plane or \
-             POSIX-adapter scaffold crates. Check the dependency chain and \
-             remove the offending edge. See issue #6174."
+             POSIX-adapter scaffold crates. Check the dependency chain, keep \
+             the canonical kernel-portable storage-core set below the adapter \
+             boundary, and remove the offending edge."
         )?;
         Ok(())
     }
