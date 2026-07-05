@@ -425,7 +425,7 @@ pub fn inspect_filesystem_content_objects_store(
     let state = if let Some(selected_root) = audit.selected_root {
         report.selected_root = Some(selected_root.clone());
         let root = root_commit_from_summary(&selected_root);
-        load_state_from_transaction(store, &root, root_authentication_key)?
+        load_state_from_transaction_for_content_inspection(store, &root, root_authentication_key)?
     } else {
         let Some((_root, state)) =
             load_newest_content_inspection_state(store, root_authentication_key)?
