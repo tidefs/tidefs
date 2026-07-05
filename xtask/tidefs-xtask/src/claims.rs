@@ -1357,6 +1357,19 @@ fn validate_manifest_matches_requirement(
             requirement.blocking_issues.join(", ")
         ));
     }
+    if enforce_freshness
+        && claim.status == ClaimStatus::Validated
+        && manifest
+            .run_id
+            .starts_with(DETERMINISTIC_FIXTURE_RUN_ID_PREFIX)
+        && (requirement.validation_tier.is_runtime() || manifest.validation_tier.is_runtime())
+    {
+        status = worse_evidence_status(status, EvidenceClassStatus::Stale);
+        details.push(format!(
+            "claim `{}` evidence manifest `{manifest_path}` uses deterministic fixture run_id `{}` for runtime-tier `{}` evidence; validated runtime evidence must come from a current source run",
+            claim.id, manifest.run_id, manifest.validation_tier
+        ));
+    }
     if enforce_freshness {
         status =
             validate_manifest_source_ref(root, claim, manifest_path, manifest, status, details);
@@ -4022,6 +4035,46 @@ const UNGUARDED_COMMANDS: &[&str] = &[
     }
 
     #[test]
+    fn validate_claim_rejects_runtime_deterministic_fixture_for_validated_claim() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let artifact_body = "deterministic runtime fixture evidence body";
+        write_artifact(temp.path(), "evidence/summary.txt", artifact_body);
+        write_manifest_fixture_with_tier_run_id_and_source_ref(
+            temp.path(),
+            "evidence/summary.manifest.json",
+            "example.manifest.validated.v1",
+            "cargo-fixture",
+            "evidence/summary.txt",
+            artifact_body,
+            ValidationStatus::Pass,
+            Vec::new(),
+            ValidationTier::MountedUserspace,
+            "deterministic-fixture:example-runtime-manifest-v1",
+            "refs/heads/gpt2/issue-811-runtime-evidence-fixture",
+        );
+        let mut claim = manifest_fixture_claim(
+            "example.manifest.validated.v1",
+            ClaimStatus::Validated,
+            Vec::new(),
+            Vec::new(),
+        );
+        claim.evidence_requirements[0].validation_tier = ValidationTier::MountedUserspace;
+
+        let receipt = build_claim_validation_receipt(temp.path(), SystemTime::UNIX_EPOCH, &claim);
+        assert_eq!(receipt.status, ClaimReceiptStatus::Fail);
+        let evidence = receipt
+            .required_evidence
+            .iter()
+            .find(|evidence| evidence.class == "cargo-fixture")
+            .expect("manifest-backed evidence receipt");
+        assert_eq!(evidence.status, EvidenceClassStatus::Stale);
+        assert!(evidence.details.iter().any(|detail| {
+            detail.contains("uses deterministic fixture run_id")
+                && detail.contains("validated runtime evidence")
+        }));
+    }
+
+    #[test]
     fn validate_claim_reports_blocked_missing_manifest_requirement() {
         let temp = tempfile::tempdir().expect("tempdir");
         let claim = manifest_fixture_claim(
@@ -4595,11 +4648,40 @@ const UNGUARDED_COMMANDS: &[&str] = &["pool scan", "diag"];
         run_id: &str,
         source_ref: &str,
     ) {
+        write_manifest_fixture_with_tier_run_id_and_source_ref(
+            root,
+            manifest_path,
+            claim_id,
+            evidence_class,
+            artifact_path,
+            artifact_body,
+            outcome,
+            blocking_issues,
+            ValidationTier::CargoUnit,
+            run_id,
+            source_ref,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_manifest_fixture_with_tier_run_id_and_source_ref(
+        root: &Path,
+        manifest_path: &str,
+        claim_id: &str,
+        evidence_class: &str,
+        artifact_path: &str,
+        artifact_body: &str,
+        outcome: ValidationStatus,
+        blocking_issues: Vec<BlockingIssueRef>,
+        validation_tier: ValidationTier,
+        run_id: &str,
+        source_ref: &str,
+    ) {
         let manifest = EvidenceArtifactManifest {
             manifest_version: EVIDENCE_ARTIFACT_MANIFEST_VERSION,
             claim_id: claim_id.to_string(),
             evidence_class: evidence_class.to_string(),
-            validation_tier: ValidationTier::CargoUnit,
+            validation_tier,
             scope: "manifest-backed cargo fixture".to_string(),
             artifact_path: artifact_path.to_string(),
             content_digest: content_digest_for_bytes(artifact_body.as_bytes()),
