@@ -7,8 +7,10 @@
 //! persistent segment_group-partitioned checkpointing. Generation counters
 //! defend against stale-pointer corruption.
 //!
-//! This crate implements Phases 1-3 of the spacemap/allocator design
-//! spec (docs/SPACEMAP_ALLOCATOR_DESIGN.md, #1189).
+//! This crate is the source-owned authority for the segment free-map,
+//! checkpoint bitmap encoding, and space-pressure classification implemented
+//! below. `docs/SPACEMAP_ALLOCATOR_DESIGN.md` is historical provenance until
+//! issue #1842 retargets the xtask fixture that still names it.
 #![forbid(unsafe_code)]
 
 use core::fmt;
