@@ -24,7 +24,6 @@ runner or change the model replay semantics owned by issue #509.
   `tidefs-schema-codec-vfs` (contract version 1)
 - Validation tier vocabulary:
   `crates/tidefs-validation/src/validation_schema.rs` (`ValidationTier`)
-- Program authority: `docs/NEXTGEN_VERIFICATION_PERFORMANCE_OFFLOAD_PLAN.md`
 - Claims gate: `docs/CLAIMS_GATE_POLICY.md`, `validation/claims.toml`
 - Workspace classification: `docs/workspace-package-classification.md`
   (trace-oracle is `proof-harness`, not `product-code`)
@@ -121,9 +120,9 @@ The manifest records two related boundaries:
 - `evidence_class` records the claim-review boundary between model-only,
   harness-only, and runtime evidence.
 
-The model/runtime distinction is program law from
-`docs/NEXTGEN_VERIFICATION_PERFORMANCE_OFFLOAD_PLAN.md` and
-`docs/CLAIMS_GATE_POLICY.md`.
+The model/runtime distinction is claim-gate law from
+`docs/CLAIMS_GATE_POLICY.md`, `validation/claims.toml`, and the validation tier
+vocabulary in `crates/tidefs-validation/src/validation_schema.rs`.
 
 ### Model-Only Evidence (`evidence_class: "model-only"`)
 
@@ -321,8 +320,8 @@ git diff --check
 
 And docs review against:
 
-- `docs/NEXTGEN_VERIFICATION_PERFORMANCE_OFFLOAD_PLAN.md`
 - `docs/CLAIMS_GATE_POLICY.md`
+- `validation/claims.toml`
 
 If doc tests or schema-related tests are added to `crates/tidefs-trace-oracle`,
 run (only when disk headroom permits):
