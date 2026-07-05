@@ -5928,9 +5928,7 @@ pub const fn ram_authority_satisfies_durable_posix_barrier(
             if evidence_ref_has_id(record.pmem_ref) {
                 ReceiptPredicateResult::SATISFIED
             } else {
-                ReceiptPredicateResult::refused(
-                    StorageIntentRefusalReason::PmemFlushFenceMissing,
-                )
+                ReceiptPredicateResult::refused(StorageIntentRefusalReason::PmemFlushFenceMissing)
             }
         }
     }
@@ -5959,7 +5957,6 @@ impl RamAuthorityRecord {
     pub const fn has_durable_intent_evidence(self) -> bool {
         evidence_ref_has_id(self.local_intent_ref) || evidence_ref_has_id(self.quorum_intent_ref)
     }
-
 }
 
 /// Workload shape used by predictors and policy explanation.
