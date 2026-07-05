@@ -3678,7 +3678,7 @@ const UNGUARDED_COMMANDS: &[&str] = &[
             .iter()
             .find(|evidence| evidence.class == RUNTIME_NAMESPACE_CRASH_ARTIFACT_EVIDENCE_CLASS)
             .expect("runtime crash evidence receipt");
-        assert_eq!(runtime.status, EvidenceClassStatus::Present);
+        assert_eq!(runtime.status, EvidenceClassStatus::Stale);
         assert_eq!(
             runtime.artifact_path,
             "validation/artifacts/crash-oracle/local-vfs-rename-crash-runtime.json"
@@ -3686,8 +3686,11 @@ const UNGUARDED_COMMANDS: &[&str] = &[
         assert_eq!(runtime.validation_tier, "mounted-userspace");
         assert!(runtime.blocking_issues.is_empty());
         assert!(
-            runtime.details.is_empty(),
-            "runtime artifact verifier should accept committed local VFS rename crash evidence: {:?}",
+            runtime
+                .details
+                .iter()
+                .any(|detail| detail.contains("uses deterministic fixture run_id")),
+            "rename claim should report fixture-backed local VFS crash evidence as stale: {:?}",
             runtime.details
         );
 
@@ -3820,7 +3823,7 @@ const UNGUARDED_COMMANDS: &[&str] = &[
             .iter()
             .find(|entry| entry["class"] == RUNTIME_NAMESPACE_CRASH_ARTIFACT_EVIDENCE_CLASS)
             .expect("runtime crash evidence entry");
-        assert_eq!(runtime["status"], "PRESENT");
+        assert_eq!(runtime["status"], "STALE");
         assert_eq!(runtime["validation_tier"], "mounted-userspace");
         assert_eq!(
             runtime["artifact_path"],
