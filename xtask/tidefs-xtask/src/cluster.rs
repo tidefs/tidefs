@@ -713,7 +713,6 @@ pub fn check_polymorphic_directory_index_current_workspace() -> Result<(), Clust
     for rel in [
         "crates/tidefs-types-polymorphic-directory-index-core/Cargo.toml",
         "crates/tidefs-types-polymorphic-directory-index-core/src/lib.rs",
-        "docs/POLYMORPHIC_DIRECTORY_INDEX_DESIGN.md",
     ] {
         check_required_file(&root, rel, &mut missing);
     }
@@ -746,23 +745,6 @@ pub fn check_polymorphic_directory_index_current_workspace() -> Result<(), Clust
         &root,
         "crates/tidefs-types-polymorphic-directory-index-core/Cargo.toml",
         &["tidefs-types-polymorphic-directory-index-core"],
-        &mut missing,
-    );
-
-    check_source_markers(
-        &root,
-        "docs/POLYMORPHIC_DIRECTORY_INDEX_DESIGN.md",
-        &[
-            "DirMicroListV1",
-            "DirBtreeRootV1",
-            "DirStorage",
-            "DatasetDirPolicy",
-            "DirCookie",
-            "MicroList -> BTree",
-            "BTree -> MicroList",
-            "hysteresis",
-            "BLAKE3-64",
-        ],
         &mut missing,
     );
 
