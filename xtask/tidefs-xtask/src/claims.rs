@@ -3772,7 +3772,7 @@ const UNGUARDED_COMMANDS: &[&str] = &[
             .iter()
             .find(|evidence| evidence.class == RUNTIME_CRASH_ORACLE_EVIDENCE_CLASS)
             .expect("runtime crash evidence receipt");
-        assert_eq!(runtime.status, EvidenceClassStatus::Present);
+        assert_eq!(runtime.status, EvidenceClassStatus::Stale);
         assert_eq!(
             runtime.artifact_path,
             "validation/artifacts/crash-oracle/local-vfs-write-fsync-runtime-crash.json"
@@ -3780,11 +3780,18 @@ const UNGUARDED_COMMANDS: &[&str] = &[
         assert_eq!(runtime.validation_tier, "mounted-userspace");
         assert!(
             runtime.blocking_issues.is_empty(),
-            "present runtime artifact should not keep #493 as a blocking issue"
+            "stale committed runtime artifact should not keep #493 as a blocking issue"
         );
         assert!(
-            runtime.details.is_empty(),
-            "demoted claim should keep committed local VFS crash evidence present: {:?}",
+            !runtime.details.is_empty(),
+            "demoted claim should explain why committed local VFS crash evidence is stale"
+        );
+        assert!(
+            runtime
+                .details
+                .iter()
+                .any(|detail| detail.contains("uses deterministic fixture run_id")),
+            "demoted claim should report fixture-backed local VFS crash evidence as stale: {:?}",
             runtime.details
         );
 
