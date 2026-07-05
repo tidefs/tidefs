@@ -1031,6 +1031,13 @@ mod tests {
         (dir, store.unwrap())
     }
 
+    fn create_durable_fixture_store() -> (TempDir, LocalObjectStore) {
+        let dir = TempDir::new().unwrap();
+        let store_path = dir.path().join("store");
+        let store = LocalObjectStore::open_with_options(&store_path, StoreOptions::durable());
+        (dir, store.unwrap())
+    }
+
     fn scrub_report_with_orphan(policy: UnreachableObjectPolicy) -> (usize, ScrubReport) {
         let dir = TempDir::new().unwrap();
         let root = dir.path().join("fs");
@@ -1061,7 +1068,7 @@ mod tests {
     }
 
     #[test]
-    fn clean_store_produces_no_findings() {
+    fn fast_fixture_clean_store_walk_counts_objects() {
         let _env = RootAuthEnvGuard::set(None);
         let (_dir, mut store) = create_fast_fixture_store();
         for i in 0..5 {
@@ -1277,7 +1284,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_referenced_content_object_reports_verifier_issue() {
+    fn missing_referenced_content_object_reports_verifier_and_missing_object() {
         let dir = TempDir::new().unwrap();
         let root = dir.path().join("fs");
         let content_key = write_test_file(&root, RootAuthenticationKey::demo_key());
@@ -1302,6 +1309,13 @@ mod tests {
                 finding,
                 ScrubFinding::FilesystemVerifierIssue { issue_kind, .. }
                     if issue_kind == "root-commit validation"
+            )
+        }));
+        assert!(report.findings.iter().any(|finding| {
+            matches!(
+                finding,
+                ScrubFinding::MissingObject { key_hex }
+                    if key_hex == &content_key.to_string()
             )
         }));
         assert!(report
@@ -1443,7 +1457,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_object_produces_finding() {
+    fn fast_fixture_missing_object_check_maps_absent_key_to_finding() {
         let (_dir, store) = create_fast_fixture_store();
         let key = ObjectKey::from_name("nonexistent");
         let outcome = ScrubWalker::open(store.root()).unwrap().check_object(key);
@@ -1458,8 +1472,8 @@ mod tests {
     }
 
     #[test]
-    fn checksum_mismatch_detected() {
-        let (_dir, mut store) = create_fast_fixture_store();
+    fn durable_fixture_older_version_location_checksum_matches_payload() {
+        let (_dir, mut store) = create_durable_fixture_store();
         store.put_named("data", b"original").unwrap();
         store.put_named("data", b"DIFFERENT_PAYLOAD").unwrap();
 
