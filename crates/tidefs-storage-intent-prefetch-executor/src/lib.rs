@@ -2257,6 +2257,7 @@ pub fn finalize_prefetch_execution(
     if terminal_update_refs_outside_evidence_cut(record, update)
         || terminal_result_detail_lacks_feedback_evidence(record, update)
         || terminal_update_lacks_completion_result_evidence(update)
+        || terminal_update_has_negative_feedback_payback_detail(update)
         || terminal_result_detail_exceeds_started_action(record, update.result_detail)
         || terminal_update_has_contradictory_refusal(update)
         || terminal_update_lacks_protected_reserve_pressure_lowering(update)
@@ -2497,6 +2498,38 @@ fn terminal_update_lacks_completion_result_evidence(
 ) -> bool {
     update.outcome == PrefetchExecutorOutcome::Completed
         && !update.result_detail.has_feedback_payback_inputs()
+}
+
+fn terminal_update_has_negative_feedback_payback_detail(
+    update: PrefetchExecutorTerminalUpdate,
+) -> bool {
+    terminal_result_detail_has_feedback_payback_measurements(update.result_detail)
+        && !matches!(
+            update.outcome,
+            PrefetchExecutorOutcome::Completed
+                | PrefetchExecutorOutcome::DegradedVisible
+                | PrefetchExecutorOutcome::HandoffRequired
+        )
+}
+
+fn terminal_result_detail_has_feedback_payback_measurements(
+    detail: PrefetchExecutorResultDetail,
+) -> bool {
+    detail.has_usage_measurement()
+        || detail.has_latency_measurement()
+        || detail.flash_write_bytes != 0
+        || detail.pmem_write_bytes != 0
+        || detail.waf_micros != 0
+        || detail.ram_pressure_bytes != 0
+        || detail.cache_index_write_bytes != 0
+        || detail.predictor_metadata_write_bytes != 0
+        || detail.retained_evidence_bytes != 0
+        || detail.wan_bytes != 0
+        || detail.egress_cost_microunits != 0
+        || detail.restore_cost_microunits != 0
+        || detail.staging_capacity_bytes != 0
+        || detail.cpu_us != 0
+        || detail.memory_bytes != 0
 }
 
 fn terminal_result_detail_exceeds_started_action(
@@ -8521,10 +8554,58 @@ mod tests {
     }
 
     #[test]
+    fn terminal_update_rejects_negative_feedback_payback_measurements() {
+        let detail = terminal_detail();
+        let started = evaluate_prefetch_execution(admitted_charged_input(
+            PrefetchResidencyCandidateClass::BoundedReadahead,
+            detail,
+        ));
+        assert_eq!(started.outcome, PrefetchExecutorOutcome::Started);
+
+        let result_ref = evidence(
+            StorageIntentEvidenceKind::ResultRefusalEvidence,
+            RESULT_REFUSAL,
+        );
+        let rejected = finalize_prefetch_execution(
+            started,
+            PrefetchExecutorTerminalUpdate {
+                outcome: PrefetchExecutorOutcome::Dropped,
+                result_detail: detail,
+                result_refusal_ref: result_ref,
+                evidence_cut: terminal_evidence_cut(started, detail, result_ref),
+                ..PrefetchExecutorTerminalUpdate::default()
+            },
+        );
+
+        assert_eq!(
+            rejected.outcome,
+            PrefetchExecutorOutcome::VerificationFailed
+        );
+        assert_eq!(
+            rejected.refusal,
+            StorageIntentRefusalReason::ValidationGateFailed
+        );
+        assert_eq!(
+            rejected.executor_byte_state,
+            PrefetchExecutorByteState::Refused
+        );
+        assert_record_has_no_authority_claims(rejected);
+    }
+
+    #[test]
     fn terminal_update_records_protected_reserve_pressure_as_over_budget() {
         let detail = PrefetchExecutorResultDetail {
             protected_reserve_pressure: true,
-            ..terminal_detail()
+            attribution_ref: evidence(
+                StorageIntentEvidenceKind::MeasurementAttributionEvidence,
+                ATTRIBUTION,
+            ),
+            retention_ref: evidence(
+                StorageIntentEvidenceKind::EvidenceRetentionEvidence,
+                RETENTION,
+            ),
+            validation_ref: evidence(StorageIntentEvidenceKind::ValidationArtifact, VALIDATION),
+            ..PrefetchExecutorResultDetail::default()
         };
         let started = evaluate_prefetch_execution(admitted_charged_input(
             PrefetchResidencyCandidateClass::BoundedReadahead,
