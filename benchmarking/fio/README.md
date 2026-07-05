@@ -1,31 +1,35 @@
-# TideFS fio benchmarking profiles
+# TideFS fio benchmarking harness
 
 Standardised I/O benchmarking for the TideFS FUSE and ublk paths using fio.
-This directory provides profile taxonomy, job files, and a runner harness that
-work identically against a FUSE mount or a raw ublk block device.
+This directory contains local job presets and a runner harness for collecting
+throughput and latency observations against either a FUSE mount or a raw ublk
+block device.
+
+This README is an orientation for the local harness only. It is not a CI,
+release-readiness, block-device admission, successor/comparator, crash
+durability, online-resize, mkfs/mount, or product-readiness authority surface.
+Project-facing capability wording is governed by `validation/claims.toml`,
+generated `docs/CLAIM_REGISTRY.md`, `docs/CLAIMS_GATE_POLICY.md`,
+`docs/GITHUB_CI.md`, and the release-readiness contracts.
 
 ## Profile taxonomy
 
-Three profiles, ordered by runtime and destructiveness:
+Three local profiles are available, ordered by runtime and destructiveness:
 
-**smoke** — minimal viability (< 30 s)
+**smoke** — shortest local fio sampling profile (< 30 s)
 - Single-queue-depth read/write latency (seq + rand, 4K, QD1)
 - High-queue-depth sequential throughput (128K, QD32)
-- Run on every integration loop; catches basic path regressions.
-- Maps to `profile.block_acceptance_profile_0.smoke`.
 
-**quick-required** — pre-release validation (~2-5 min)
+**quick-required** — broader local fio sampling profile (~2-5 min)
 - Mixed read/write (70/30 and 50/50 at QD4, 4K)
 - Queue-depth sweep (QD 1, 4, 16, 64 for seq read and write, 4K)
 - Block-size sweep (512B, 4K, 64K, 1M seq read at QD4)
 - Sync-heavy writes (fsync and fdatasync per I/O at QD1, 4K)
-- Maps to `profile.block_acceptance_profile_1.quick_required`.
 
-**pressure** — stress and degradation (~1-3 min)
+**pressure** — stress and degradation sampling profile (~1-3 min)
 - Mixed read/write storm (70/30, QD64, rate-limited 5000 IOPS, 30 s)
 - Discard/TRIM pressure (unmap then write-after, 4K QD4)
 - Overlapping read/write within the same region (50/50, QD16, 15 s)
-- Maps to `profile.block_acceptance_profile_2.quick_pressure`.
 
 ## Usage
 
@@ -117,14 +121,14 @@ job file with `include common/global.inc` (paths relative to the job file).
 
 The three benchmarking profiles are local fio presets for smoke and pressure
 experiments. They do not establish block-device product admission by
-themselves; publishing-facing block wording is gated by `validation/claims.toml`
+themselves; project-facing block wording is gated by `validation/claims.toml`
 and generated `docs/CLAIM_REGISTRY.md`.
 
 | Benchmark profile | Acceptance profile | Purpose |
 |---|---|---|
-| `smoke` | `profile.block_acceptance_profile_0.smoke` | Fast viability proof |
-| `quick-required` | `profile.block_acceptance_profile_1.quick_required` | Pre-release charter validation |
-| `pressure` | `profile.block_acceptance_profile_2.quick_pressure` | Stress and degradation |
+| `smoke` | Historical local profile 0 | Shortest fio sampling run |
+| `quick-required` | Historical local profile 1 | Broader fio sampling run |
+| `pressure` | Historical local profile 2 | Stress and degradation sampling |
 
 The historical block-acceptance matrix lineage was deleted by #1614. Broader
 fio workload breadth, mkfs/mount acceptance, online resize, crash durability,
