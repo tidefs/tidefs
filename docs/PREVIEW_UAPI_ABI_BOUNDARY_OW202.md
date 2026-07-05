@@ -75,6 +75,13 @@ Command groups must not claim stronger stability than the class recorded here:
 | `snapshot release` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | release local deletion-prevention holds on snapshots or clones |
 | `snapshot holds` | `public-operator` | `live-owner-or-offline-input` | `unguarded` | `visible` | inspect local snapshot and clone hold counts |
 | `snapshot prune` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | prune regular local snapshots by retention policy while excluding clones and bookmarks |
+| `snapshot prune-scheduled policy` | `public-operator` | `live-owner` | `unguarded` | `visible` | inspect live scheduled snapshot prune policy admission state |
+| `snapshot prune-scheduled plan` | `public-operator` | `live-owner` | `unguarded` | `visible` | inspect live scheduled snapshot prune dry-run plans |
+| `snapshot prune-scheduled enable` | `public-operator` | `live-owner` | `local-only` | `visible` | admit destructive scheduled snapshot prune execution through live authority |
+| `snapshot prune-scheduled disable` | `public-operator` | `live-owner` | `local-only` | `visible` | disable destructive scheduled snapshot prune execution through live authority |
+| `snapshot prune-scheduled status` | `public-operator` | `live-owner` | `unguarded` | `visible` | inspect live scheduled snapshot prune job status |
+| `snapshot prune-scheduled refusals` | `public-operator` | `live-owner` | `unguarded` | `visible` | inspect live scheduled snapshot prune refusal reasons |
+| `snapshot prune-scheduled results` | `public-operator` | `live-owner` | `unguarded` | `visible` | inspect live scheduled snapshot prune result summaries |
 | `snapshot destroy` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | destroy snapshots through the live owner or explicit offline devices |
 | `snapshot export` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | register runtime-pending read-only snapshot export mount surface |
 | `snapshot extract` | `public-operator` | `live-owner` | `local-only` | `visible` | extract one regular file from a snapshot through the live owner |

@@ -1037,6 +1037,40 @@ mod tests {
     }
 
     #[test]
+    fn cli_parse_snapshot_prune_scheduled_surfaces() {
+        use clap::Parser;
+        for surface in [
+            "policy", "plan", "enable", "disable", "status", "refusals", "results",
+        ] {
+            let args = Cli::try_parse_from([
+                "tidefsctl",
+                "snapshot",
+                "prune-scheduled",
+                surface,
+                "mypool",
+            ]);
+            assert!(
+                args.is_ok(),
+                "snapshot prune-scheduled {surface} should parse"
+            );
+        }
+    }
+
+    #[test]
+    fn cli_parse_snapshot_prune_manual_surface_still_accepts_policy_flags() {
+        use clap::Parser;
+        let args = Cli::try_parse_from([
+            "tidefsctl",
+            "snapshot",
+            "prune",
+            "mypool",
+            "--keep-latest",
+            "2",
+        ]);
+        assert!(args.is_ok(), "manual snapshot prune should keep parsing");
+    }
+
+    #[test]
     fn cli_parse_snapshot_receive_live_pool_positional() {
         use clap::Parser;
         let args = Cli::try_parse_from([

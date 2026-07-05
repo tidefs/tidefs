@@ -272,6 +272,9 @@ pub enum SnapshotCommand {
     Holds(SnapshotHoldsArgs),
     /// Prune regular local snapshots by retention policy
     Prune(SnapshotPruneArgs),
+    /// Inspect and control live scheduled snapshot pruning
+    #[command(name = "prune-scheduled")]
+    PruneScheduled(SnapshotPruneScheduledArgs),
     /// Destroy a named snapshot, unpinning its object graph from GC
     Destroy(SnapshotDestroyArgs),
     /// Export a changed-record snapshot stream from the current filesystem root
@@ -636,6 +639,39 @@ pub struct SnapshotPruneArgs {
     pub max_age_generations: Option<u64>,
 }
 
+/// `snapshot prune-scheduled <policy|plan|enable|disable|status|refusals|results> <pool>`
+#[derive(Args, Debug)]
+pub struct SnapshotPruneScheduledArgs {
+    #[command(subcommand)]
+    pub cmd: SnapshotPruneScheduledCommand,
+}
+
+/// Subcommands for `snapshot prune-scheduled`.
+#[derive(Subcommand, Debug)]
+pub enum SnapshotPruneScheduledCommand {
+    /// Show the scheduled prune policy admission state
+    Policy(SnapshotPruneScheduledPoolArgs),
+    /// Show the current scheduled prune dry-run plan
+    Plan(SnapshotPruneScheduledPoolArgs),
+    /// Admit destructive scheduled prune execution
+    Enable(SnapshotPruneScheduledPoolArgs),
+    /// Disable destructive scheduled prune execution
+    Disable(SnapshotPruneScheduledPoolArgs),
+    /// Show scheduled prune job status
+    Status(SnapshotPruneScheduledPoolArgs),
+    /// Show current scheduled prune refusal reasons
+    Refusals(SnapshotPruneScheduledPoolArgs),
+    /// Show recent scheduled prune result summaries
+    Results(SnapshotPruneScheduledPoolArgs),
+}
+
+/// Pool selector for scheduled prune operator commands.
+#[derive(Args, Debug)]
+pub struct SnapshotPruneScheduledPoolArgs {
+    /// Pool name for live scheduled prune visibility and controls
+    pub pool: String,
+}
+
 /// `snapshot destroy <pool> <name> [--devices <dev>...]`
 #[derive(Args, Debug)]
 pub struct SnapshotDestroyArgs {
@@ -869,6 +905,7 @@ pub fn handle_snapshot(cmd: SnapshotCommand) {
         SnapshotCommand::Release(args) => handle_release(args),
         SnapshotCommand::Holds(args) => handle_holds(args),
         SnapshotCommand::Prune(args) => handle_prune(args),
+        SnapshotCommand::PruneScheduled(args) => handle_prune_scheduled(args.cmd),
         SnapshotCommand::Destroy(args) => handle_destroy(args),
         SnapshotCommand::Send(args) => handle_send(args),
         SnapshotCommand::Receive(args) => handle_receive(args),
@@ -1757,6 +1794,48 @@ fn handle_prune(args: SnapshotPruneArgs) {
     }
 }
 
+fn handle_prune_scheduled(cmd: SnapshotPruneScheduledCommand) {
+    match cmd {
+        SnapshotPruneScheduledCommand::Policy(args) => {
+            print_scheduled_prune_read_only("policy", &args.pool);
+        }
+        SnapshotPruneScheduledCommand::Plan(args) => {
+            print_scheduled_prune_read_only("dry-run plan", &args.pool);
+        }
+        SnapshotPruneScheduledCommand::Enable(args) => {
+            let _guard = super::authz::require_local_only("snapshot prune-scheduled enable");
+            print_scheduled_prune_control("enable", &args.pool);
+        }
+        SnapshotPruneScheduledCommand::Disable(args) => {
+            let _guard = super::authz::require_local_only("snapshot prune-scheduled disable");
+            print_scheduled_prune_control("disable", &args.pool);
+        }
+        SnapshotPruneScheduledCommand::Status(args) => {
+            print_scheduled_prune_read_only("job status", &args.pool);
+        }
+        SnapshotPruneScheduledCommand::Refusals(args) => {
+            print_scheduled_prune_read_only("refusal reasons", &args.pool);
+        }
+        SnapshotPruneScheduledCommand::Results(args) => {
+            print_scheduled_prune_read_only("result summaries", &args.pool);
+        }
+    }
+}
+
+fn print_scheduled_prune_read_only(surface: &str, pool: &str) {
+    println!("scheduled snapshot prune {surface} for pool '{pool}': unavailable");
+    println!(
+        "refusal: live scheduled prune policy, scheduler job state, and result evidence are not implemented in this operator slice"
+    );
+}
+
+fn print_scheduled_prune_control(action: &str, pool: &str) {
+    println!("scheduled snapshot prune destructive {action} for pool '{pool}': refused");
+    println!(
+        "refusal: destructive scheduled pruning is not admitted until dataset policy and scheduler job authority provide live evidence"
+    );
+}
+
 fn handle_destroy(args: SnapshotDestroyArgs) {
     let _guard = super::authz::require_local_only("snapshot destroy");
 
@@ -2224,6 +2303,7 @@ mod tests {
             | SnapshotCommand::Release(_)
             | SnapshotCommand::Holds(_)
             | SnapshotCommand::Prune(_)
+            | SnapshotCommand::PruneScheduled(_)
             | SnapshotCommand::Send(_)
             | SnapshotCommand::Receive(_)
             | SnapshotCommand::Rollback(_)
