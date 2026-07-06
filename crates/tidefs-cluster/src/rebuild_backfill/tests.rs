@@ -401,20 +401,20 @@ fn partition_keeps_distinct_receipt_generations_separate() {
 }
 
 #[test]
-fn open_backfill_skips_no_source_tasks() {
+fn open_backfill_rejects_no_source_tasks_before_session_creation() {
     let mut init = RebuildBackfillInitiator::new(eid(1));
     let plan = make_plan(
         100,
         vec![
-            synthetic_task(1, vec![], vec![20], 0),
+            make_task(1, vec![], vec![20], 0),
             make_task(2, vec![10], vec![20], 0),
         ],
     );
-    let id = init.open_backfill(plan, eid(1)).unwrap();
-    let session = init.session(id).unwrap();
-    let batch = &session.batches[0];
-    assert_eq!(batch.total_objects(), 1);
-    assert_eq!(batch.commands[0].object_ids, vec![2]);
+
+    let err = init.open_backfill(plan, eid(1)).unwrap_err();
+    assert_eq!(err, BackfillError::NoViableSource(1));
+    assert_eq!(init.session_ids().next(), None);
+    assert_eq!(init.active_count(), 0);
 }
 
 #[test]
@@ -633,7 +633,7 @@ fn preview_batches() {
             make_task(2, vec![10], vec![20], 0),
         ],
     );
-    let batches = RebuildBackfillInitiator::preview_batches(&plan, eid(1), 65536);
+    let batches = RebuildBackfillInitiator::preview_batches(&plan, eid(1), 65536).unwrap();
     assert_eq!(batches.len(), 1);
     assert_eq!(batches[0].target_node, 20);
     assert_eq!(batches[0].commands.len(), 2);

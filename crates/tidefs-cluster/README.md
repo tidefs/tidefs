@@ -221,7 +221,7 @@ Idle ──open()──> Planning ──initiate()──> Initiating
 The initiator partitions a rebuild plan by target member: for each target
 node across all reconstruction tasks, tasks are grouped by source node. One
 `BackfillCommand` is created per (source, target) pair carrying the relevant
-object IDs. Tasks with no viable sources are silently skipped.
+object IDs. Tasks with no viable sources fail closed before session creation.
 
 ### Epoch bounding
 
