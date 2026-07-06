@@ -476,8 +476,7 @@ fn load_newest_content_inspection_state(
             let summary = root.summary();
             if best
                 .as_ref()
-                .map(|(current, _)| summary.transaction_id > current.transaction_id)
-                .unwrap_or(true)
+                .is_none_or(|(current, _)| summary.transaction_id > current.transaction_id)
             {
                 best = Some((summary, state));
             }
