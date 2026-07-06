@@ -1011,6 +1011,10 @@ INITSCRIPT
     echo ""
     echo "First-boot summary: $PASSED passed, $FAILED failed, $BLOCKED blocked, $UNSUPPORTED unsupported"
     echo "Validation log: $VAL_LOG"
+    LANE_LOCAL_PASS=false
+    if [ "$FAILED" -eq 0 ] && [ "$BLOCKED" -eq 0 ]; then
+      LANE_LOCAL_PASS=true
+    fi
 
     OUTPUT_ROOT="''${TIDEFS_OUTPUT_ROOT:-/tmp/tidefs-validation}"
     OUTPUT_DIR="$OUTPUT_ROOT/kernel-mmap-validation/$(date -u +%Y-%m-%dT%H%M%SZ)"
@@ -1022,6 +1026,9 @@ INITSCRIPT
       echo "fail=$FAILED"
       echo "blocked=$BLOCKED"
       echo "unsupported=$UNSUPPORTED"
+      echo "unsupported_rows=$UNSUPPORTED"
+      echo "lane_local_pass=$LANE_LOCAL_PASS"
+      echo "claim_closure=false"
       echo "validation_log=$OUTPUT_DIR/qemu.log"
       echo "row_summary=$OUTPUT_DIR/row-summary.txt"
     } > "$OUTPUT_DIR/summary.env"
@@ -1037,7 +1044,7 @@ INITSCRIPT
       exit 1
     fi
 
-    echo "VALIDATION: PASS -- mounted first-boot mmap/writeback rows succeeded; unsupported rows are disclosed"
+    echo "VALIDATION: PASS -- lane-local mounted first-boot mmap/writeback rows succeeded; unsupported_rows=$UNSUPPORTED claim_closure=false"
     exit 0
   '';
 in
