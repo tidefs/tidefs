@@ -9,13 +9,13 @@
 
 use tidefs_local_object_store::pool::PlacementReceipt;
 use tidefs_storage_intent_core::{
-    DurabilityReceiptState, DurabilityRequirement, DurabilityState, FailureDomainMask,
-    ProximityClass, ReadServingSourceClass, StorageIntentActionClass, StorageIntentEvidenceId,
-    StorageIntentEvidenceKind, StorageIntentEvidenceRef, StorageIntentEvidenceRefs,
-    StorageIntentGuaranteeClass, StorageIntentPolicy, StorageIntentPolicyId,
-    StorageIntentPolicyRevision, StorageIntentReceipt, StorageIntentReceiptId,
-    StorageIntentRefusal, StorageIntentRefusalReason, StorageMediaClass, StorageMediaRole,
-    TrustEvidenceState,
+    evaluate_receipt_against_policy, DurabilityReceiptState, DurabilityRequirement,
+    DurabilityState, FailureDomainMask, ProximityClass, ReadServingSourceClass,
+    StorageIntentActionClass, StorageIntentEvidenceId, StorageIntentEvidenceKind,
+    StorageIntentEvidenceRef, StorageIntentEvidenceRefs, StorageIntentGuaranteeClass,
+    StorageIntentPolicy, StorageIntentPolicyId, StorageIntentPolicyRevision, StorageIntentReceipt,
+    StorageIntentReceiptId, StorageIntentRefusal, StorageIntentRefusalReason, StorageMediaClass,
+    StorageMediaRole, TrustEvidenceState,
 };
 
 /// Local filesystem receipt surface version for issue #842.
@@ -490,6 +490,45 @@ impl LocalAckReceipt {
             )
     }
 
+    /// Returns true only when this receipt earned its requested ack floor.
+    #[must_use]
+    pub fn satisfies_requested_ack_floor(self) -> bool {
+        self.is_posix_durable_success()
+            && self.refusal_reason() == StorageIntentRefusalReason::None
+            && self.has_requested_ack_floor_evidence()
+            && matches!(
+                self.convergence,
+                LocalAckConvergenceState::Satisfied
+                    | LocalAckConvergenceState::PendingFullPlacement
+                    | LocalAckConvergenceState::Converging
+            )
+            && evaluate_receipt_against_policy(
+                local_ack_policy(self.requested_ack_floor),
+                self.receipt,
+            )
+            .satisfied
+    }
+
+    fn has_requested_ack_floor_evidence(self) -> bool {
+        let has_local_evidence = self.local_intent_record_ref.is_bound()
+            && self.ordering_ref.is_bound()
+            && self.flush_fence_ref.is_bound()
+            && self.media_capability_ref.is_bound()
+            && self.reserve_ref.is_bound()
+            && self.dirty_window_ref.is_bound()
+            && self.rollout_ref.is_bound()
+            && self.tenant_isolation_ref.is_bound();
+        let needs_full_placement = matches!(
+            self.requested_ack_floor,
+            StorageIntentGuaranteeClass::FullPlacement
+                | StorageIntentGuaranteeClass::GeoAsync
+                | StorageIntentGuaranteeClass::GeoFullPlacement
+                | StorageIntentGuaranteeClass::ArchiveEc
+        );
+
+        has_local_evidence && (!needs_full_placement || self.placement_ref.is_bound())
+    }
+
     /// Refusal reason carried by this envelope.
     #[must_use]
     pub const fn refusal_reason(self) -> StorageIntentRefusalReason {
@@ -856,6 +895,7 @@ mod tests {
             StorageIntentGuaranteeClass::LocalIntent
         );
         assert!(receipt.is_posix_durable_success());
+        assert!(receipt.satisfies_requested_ack_floor());
         assert!(receipt.local_intent_record_ref.is_bound());
         assert!(receipt.flush_fence_ref.is_bound());
         assert_eq!(
@@ -890,11 +930,12 @@ mod tests {
             receipt.receipt,
         );
         assert!(result.satisfied, "refusal was {:?}", result.refusal);
+        assert!(receipt.satisfies_requested_ack_floor());
     }
 
     #[test]
     fn pending_convergence_does_not_imply_full_placement() {
-        let receipt = LocalAckReceipt::durable_intent(
+        let mut receipt = LocalAckReceipt::durable_intent(
             3,
             LocalAckOperation::Fdatasync,
             LocalAckReceiptTarget::inode(9),
@@ -917,6 +958,9 @@ mod tests {
             result.refusal,
             StorageIntentRefusalReason::GuaranteeFloorNotMet
         );
+
+        receipt.requested_ack_floor = StorageIntentGuaranteeClass::FullPlacement;
+        assert!(!receipt.satisfies_requested_ack_floor());
     }
 
     #[test]
@@ -947,6 +991,7 @@ mod tests {
             receipt.receipt,
         );
         assert!(!result.satisfied);
+        assert!(!receipt.satisfies_requested_ack_floor());
     }
 
     #[test]
@@ -974,6 +1019,73 @@ mod tests {
             receipt.refusal.attempted_receipt,
             receipt.receipt.receipt_id
         );
+        assert!(!receipt.satisfies_requested_ack_floor());
+    }
+
+    #[test]
+    fn requested_full_placement_floor_requires_full_placement_receipt() {
+        let mut local_receipt = LocalAckReceipt::durable_intent(
+            6,
+            LocalAckOperation::FsyncDirectory,
+            LocalAckReceiptTarget::inode(17),
+            None,
+        );
+        local_receipt.requested_ack_floor = StorageIntentGuaranteeClass::FullPlacement;
+
+        let mut full_receipt = LocalAckReceipt::full_local_placement(
+            7,
+            LocalAckOperation::Syncfs,
+            LocalAckReceiptTarget::inode(17),
+            None,
+        );
+        full_receipt.requested_ack_floor = StorageIntentGuaranteeClass::FullPlacement;
+
+        assert!(local_receipt.is_posix_durable_success());
+        assert!(!local_receipt.satisfies_requested_ack_floor());
+        assert!(full_receipt.satisfies_requested_ack_floor());
+    }
+
+    #[test]
+    fn requested_floor_receipt_fails_closed_without_bound_evidence() {
+        let mut missing_local_intent = LocalAckReceipt::durable_intent(
+            8,
+            LocalAckOperation::SyncWrite,
+            LocalAckReceiptTarget::inode(19),
+            None,
+        );
+        missing_local_intent.local_intent_record_ref = StorageIntentEvidenceRef::default();
+
+        let mut missing_placement = LocalAckReceipt::full_local_placement(
+            9,
+            LocalAckOperation::Fsync,
+            LocalAckReceiptTarget::inode(19),
+            None,
+        );
+        missing_placement.requested_ack_floor = StorageIntentGuaranteeClass::FullPlacement;
+        missing_placement.placement_ref = StorageIntentEvidenceRef::default();
+
+        assert!(missing_local_intent.is_posix_durable_success());
+        assert!(!missing_local_intent.satisfies_requested_ack_floor());
+        assert!(missing_placement.is_posix_durable_success());
+        assert!(!missing_placement.satisfies_requested_ack_floor());
+    }
+
+    #[test]
+    fn ack_operation_spelling_and_discriminants_cover_receipt_surface() {
+        let operations = [
+            (LocalAckOperation::SyncWrite, "sync-write", 0),
+            (LocalAckOperation::Fsync, "fsync", 1),
+            (LocalAckOperation::Fdatasync, "fdatasync", 2),
+            (LocalAckOperation::Odsync, "odsync", 3),
+            (LocalAckOperation::SharedMmapMsync, "shared-mmap-msync", 4),
+            (LocalAckOperation::Syncfs, "syncfs", 5),
+            (LocalAckOperation::FsyncDirectory, "fsync-directory", 6),
+        ];
+
+        for (operation, spelling, discriminant) in operations {
+            assert_eq!(operation.as_str(), spelling);
+            assert_eq!(operation.to_discriminant(), discriminant);
+        }
     }
 
     #[test]
