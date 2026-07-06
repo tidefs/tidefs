@@ -492,7 +492,7 @@ pub fn classify_report(json: &str) -> Result<ReportClass, RuntimeReportError> {
             if envelope
                 .evidence_scope
                 .as_deref()
-                .map_or(false, |s| s.starts_with("model."))
+                .is_some_and(|s| s.starts_with("model."))
             {
                 return Ok(ReportClass::Model);
             }
