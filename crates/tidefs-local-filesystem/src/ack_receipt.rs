@@ -514,6 +514,10 @@ impl LocalAckReceipt {
     }
 
     fn has_requested_ack_floor_evidence(self) -> bool {
+        if !local_ack_floor_has_evidence_surface(self.requested_ack_floor) {
+            return false;
+        }
+
         let has_local_evidence = self.local_intent_record_ref.is_bound()
             && self.ordering_ref.is_bound()
             && self.flush_fence_ref.is_bound()
@@ -525,9 +529,6 @@ impl LocalAckReceipt {
         let needs_full_placement = matches!(
             self.requested_ack_floor,
             StorageIntentGuaranteeClass::FullPlacement
-                | StorageIntentGuaranteeClass::GeoAsync
-                | StorageIntentGuaranteeClass::GeoFullPlacement
-                | StorageIntentGuaranteeClass::ArchiveEc
         );
 
         has_local_evidence && (!needs_full_placement || self.placement_ref.is_bound())
@@ -538,6 +539,17 @@ impl LocalAckReceipt {
     pub const fn refusal_reason(self) -> StorageIntentRefusalReason {
         self.refusal.reason
     }
+}
+
+const fn local_ack_floor_has_evidence_surface(
+    requested_ack_floor: StorageIntentGuaranteeClass,
+) -> bool {
+    matches!(
+        requested_ack_floor,
+        StorageIntentGuaranteeClass::VolatileLocal
+            | StorageIntentGuaranteeClass::LocalIntent
+            | StorageIntentGuaranteeClass::FullPlacement
+    )
 }
 
 // ---------------------------------------------------------------------
@@ -1097,6 +1109,34 @@ mod tests {
             receipt.convergence = state;
             assert!(receipt.is_posix_durable_success());
             assert_eq!(receipt.refusal_reason(), StorageIntentRefusalReason::None);
+            assert!(!receipt.satisfies_requested_ack_floor());
+        }
+    }
+
+    #[test]
+    fn unsupported_requested_floors_fail_closed_without_external_evidence_surface() {
+        let unsupported_floors = [
+            StorageIntentGuaranteeClass::VolatileReplicated,
+            StorageIntentGuaranteeClass::RemoteVolatilePlusLocal,
+            StorageIntentGuaranteeClass::QuorumIntent,
+            StorageIntentGuaranteeClass::GeoAsync,
+            StorageIntentGuaranteeClass::GeoIntent,
+            StorageIntentGuaranteeClass::GeoFullPlacement,
+            StorageIntentGuaranteeClass::ArchiveEc,
+        ];
+
+        for (offset, floor) in unsupported_floors.into_iter().enumerate() {
+            let mut receipt = LocalAckReceipt::full_local_placement(
+                20 + u64::try_from(offset).expect("small floor index"),
+                LocalAckOperation::Syncfs,
+                LocalAckReceiptTarget::FILESYSTEM,
+                None,
+            );
+            receipt.requested_ack_floor = floor;
+            receipt.receipt.ack_class = floor;
+
+            assert!(receipt.is_posix_durable_success());
+            assert!(!local_ack_floor_has_evidence_surface(floor));
             assert!(!receipt.satisfies_requested_ack_floor());
         }
     }
