@@ -2581,7 +2581,7 @@ mod receipt_validation_tests {
         let (_stored, receipt) = pool
             .put_with_receipt(DeviceIoClass::Data, chunk_key, b"pool-chunk-data")
             .expect("put_with_receipt in pool");
-        let gen = receipt.generation;
+        let receipt_generation = receipt.generation;
 
         // Verify the pool can find its own receipt before inspection.
         let pool_receipt = pool
@@ -2590,12 +2590,12 @@ mod receipt_validation_tests {
             .expect("pool must find its own receipt");
         assert_eq!(
             pool_receipt.generation,
-            gen,
-            "pool receipt gen {pool_gen} must match put_with_receipt return {gen}",
+            receipt_generation,
+            "pool receipt gen {pool_gen} must match put_with_receipt return {receipt_generation}",
             pool_gen = pool_receipt.generation
         );
 
-        let chunk_ref = make_chunk_ref(0, 1, 4096, gen);
+        let chunk_ref = make_chunk_ref(0, 1, 4096, receipt_generation);
         put_chunk_data(&mut store, &inode, &chunk_ref);
 
         let mut report = FilesystemContentInspectionReport::empty();
