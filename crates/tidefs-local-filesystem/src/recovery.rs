@@ -1107,12 +1107,7 @@ pub(crate) fn load_state_from_transaction(
     root: &RootCommitRecord,
     root_authentication_key: RootAuthenticationKey,
 ) -> Result<FileSystemState> {
-    load_state_from_transaction_with_manifest_validation(
-        store,
-        root,
-        root_authentication_key,
-        true,
-    )
+    load_state_from_transaction_with_manifest_validation(store, root, root_authentication_key, true)
 }
 
 fn load_state_from_transaction_for_content_inspection(
