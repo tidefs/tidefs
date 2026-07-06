@@ -38,7 +38,8 @@ jobs:
       - name: Build pure check derivations
         run: |
           nix build -L \
-            .#checks.x86_64-linux.rdmaCarrierTwoNode
+            .#checks.x86_64-linux.rdmaCarrierTwoNode \
+            .#checks.x86_64-linux.kernelMmapSummaryContract
 
       - name: Build core packages
         run: |
