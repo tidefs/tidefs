@@ -1047,6 +1047,27 @@ fn build_claim_evidence_class_receipt(
                 details: manifest_details.details,
             };
         }
+        if enforce_freshness {
+            return ClaimEvidenceClassReceipt {
+                class: class.to_string(),
+                status: EvidenceClassStatus::Missing,
+                artifact_path: requirement.path.clone(),
+                validation_tier,
+                blocking_issues,
+                manifest_path: None,
+                content_digest: None,
+                run_id: None,
+                source_ref: None,
+                outcome: None,
+                residual_risk: None,
+                source: None,
+                evidence_scope: None,
+                details: vec![format!(
+                    "claim `{}` validated evidence requirement for class `{class}` must set manifest_path",
+                    claim.id
+                )],
+            };
+        }
     }
 
     if matching.is_empty() {
@@ -2828,6 +2849,13 @@ fn validate_registered_evidence_artifacts_for_claim(
                 failures.extend(manifest_details.details);
                 continue;
             }
+            if claim.status.is_validated() {
+                failures.push(format!(
+                    "claim `{}` validated evidence requirement for class `{class}` must set manifest_path",
+                    claim.id
+                ));
+                continue;
+            }
         }
 
         let matching = claim
@@ -3958,6 +3986,44 @@ const UNGUARDED_COMMANDS: &[&str] = &[
         assert!(summary.contains("run_id: fixture-run-810/1"));
         assert!(summary.contains(&format!("source_ref: {MANIFEST_FIXTURE_SOURCE_REF}")));
         assert!(summary.contains("residual_risk: Fixture proves manifest gate behavior only."));
+    }
+
+    #[test]
+    fn validate_claim_fails_closed_for_validated_requirement_without_manifest_path() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_artifact(temp.path(), "evidence/summary.txt", "legacy evidence body");
+        let mut claim = manifest_fixture_claim(
+            "example.manifest.validated.v1",
+            ClaimStatus::Validated,
+            Vec::new(),
+            Vec::new(),
+        );
+        claim.evidence_requirements[0].manifest_path = None;
+        claim.evidence_artifacts.push(ClaimEvidenceArtifact {
+            class: "cargo-fixture".to_string(),
+            path: "evidence/summary.txt".to_string(),
+            ..Default::default()
+        });
+
+        let receipt = build_claim_validation_receipt(temp.path(), SystemTime::UNIX_EPOCH, &claim);
+        assert_eq!(receipt.status, ClaimReceiptStatus::Fail);
+        let evidence = receipt
+            .required_evidence
+            .iter()
+            .find(|evidence| evidence.class == "cargo-fixture")
+            .expect("manifest-backed evidence receipt");
+        assert_eq!(evidence.status, EvidenceClassStatus::Missing);
+        assert_eq!(evidence.artifact_path, "evidence/summary.txt");
+        assert!(evidence.manifest_path.is_none());
+        assert!(evidence
+            .details
+            .iter()
+            .any(|detail| detail.contains("must set manifest_path")));
+
+        let failures = validate_claim_record(temp.path(), SystemTime::UNIX_EPOCH, &claim);
+        assert!(failures
+            .iter()
+            .any(|failure| failure.contains("must set manifest_path")));
     }
 
     #[test]
