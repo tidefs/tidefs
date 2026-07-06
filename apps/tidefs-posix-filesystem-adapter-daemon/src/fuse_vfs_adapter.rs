@@ -1456,6 +1456,22 @@ fn unsupported_vfs_bmap_errno() -> Errno {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VfsIoctlCommand {
+    Fiemap,
+    Fsgetxattr,
+    Defrag,
+}
+
+fn classify_vfs_ioctl_command(cmd: u32) -> Result<VfsIoctlCommand, Errno> {
+    match cmd {
+        FS_IOC_FIEMAP => Ok(VfsIoctlCommand::Fiemap),
+        FS_IOC_FSGETXATTR => Ok(VfsIoctlCommand::Fsgetxattr),
+        TIDEFS_IOC_DEFRAG => Ok(VfsIoctlCommand::Defrag),
+        _ => Err(Errno::EOPNOTSUPP),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct FiemapRequest {
     start: u64,
     length: u64,
@@ -11085,37 +11101,40 @@ impl Filesystem for FuseVfsAdapter {
         let _p5_02 =
             Self::classify_fuse_ioctl(req.unique(), ino, fh, req.uid(), req.gid(), req.pid());
         let ctx = Self::ctx_from_req(req);
-        if cmd == FS_IOC_FIEMAP {
-            let input = match parse_fiemap_input(in_data) {
-                Some(input) => input,
-                None => {
-                    reply.reply_errno(Errno::EINVAL);
-                    return;
+        match classify_vfs_ioctl_command(cmd) {
+            Ok(VfsIoctlCommand::Fiemap) => {
+                let input = match parse_fiemap_input(in_data) {
+                    Some(input) => input,
+                    None => {
+                        reply.reply_errno(Errno::EINVAL);
+                        return;
+                    }
+                };
+                match self.dispatch_fiemap(&ctx, ino, fh, input, out_size) {
+                    Ok(buf) => reply.ioctl(0, &buf),
+                    Err(errno) => reply.reply_errno(errno),
                 }
-            };
-            match self.dispatch_fiemap(&ctx, ino, fh, input, out_size) {
-                Ok(buf) => reply.ioctl(0, &buf),
-                Err(errno) => reply.reply_errno(errno),
             }
-        } else if cmd == FS_IOC_FSGETXATTR {
-            match self.dispatch_fsgetxattr(&ctx, ino, out_size) {
-                Ok(buf) => reply.ioctl(0, &buf),
-                Err(errno) => reply.reply_errno(errno),
-            }
-        } else if cmd == TIDEFS_IOC_DEFRAG {
-            let input = match parse_defrag_input(in_data) {
-                Some(input) => input,
-                None => {
-                    reply.reply_errno(Errno::EINVAL);
-                    return;
+            Ok(VfsIoctlCommand::Fsgetxattr) => {
+                match self.dispatch_fsgetxattr(&ctx, ino, out_size) {
+                    Ok(buf) => reply.ioctl(0, &buf),
+                    Err(errno) => reply.reply_errno(errno),
                 }
-            };
-            match self.dispatch_defrag(&ctx, input) {
-                Ok(buf) => reply.ioctl(0, &buf),
-                Err(errno) => reply.reply_errno(errno),
             }
-        } else {
-            reply.reply_errno(Errno::EOPNOTSUPP);
+            Ok(VfsIoctlCommand::Defrag) => {
+                let input = match parse_defrag_input(in_data) {
+                    Some(input) => input,
+                    None => {
+                        reply.reply_errno(Errno::EINVAL);
+                        return;
+                    }
+                };
+                match self.dispatch_defrag(&ctx, input) {
+                    Ok(buf) => reply.ioctl(0, &buf),
+                    Err(errno) => reply.reply_errno(errno),
+                }
+            }
+            Err(errno) => reply.reply_errno(errno),
         }
     }
 
@@ -22799,6 +22818,23 @@ mod tests {
     }
 
     #[test]
+    fn ioctl_command_classification_rejects_unsupported_commands() {
+        assert_eq!(
+            classify_vfs_ioctl_command(FS_IOC_FIEMAP),
+            Ok(VfsIoctlCommand::Fiemap)
+        );
+        assert_eq!(
+            classify_vfs_ioctl_command(FS_IOC_FSGETXATTR),
+            Ok(VfsIoctlCommand::Fsgetxattr)
+        );
+        assert_eq!(
+            classify_vfs_ioctl_command(TIDEFS_IOC_DEFRAG),
+            Ok(VfsIoctlCommand::Defrag)
+        );
+        assert_eq!(classify_vfs_ioctl_command(0xFFFF), Err(Errno::EOPNOTSUPP));
+    }
+
+    #[test]
     fn fiemap_parse_rejects_unsupported_command_and_short_header() {
         assert_eq!(
             parse_vfs_fiemap_request(0xFFFF, &fiemap_request_bytes(0, 4096, 1)),
@@ -22904,25 +22940,6 @@ mod tests {
         assert_eq!(second.1, 0);
         assert_eq!(second.2, 10);
         assert_eq!(second.3 & FIEMAP_EXTENT_LAST, FIEMAP_EXTENT_LAST);
-    }
-
-    #[test]
-    fn dispatch_fiemap_rejects_eopnotsupp_for_unsupported_cmd() {
-        let fixture = adapter_fixture();
-        let ctx = root_ctx();
-        // Call ioctl with a non-FIEMAP command directly via dispatch
-        // The ioctl handler checks cmd != FS_IOC_FIEMAP and returns EOPNOTSUPP
-        // We test dispatch_fiemap with a valid input on a non-existent file
-        let input = FiemapInput {
-            fm_start: 0,
-            fm_length: 4096,
-            fm_flags: 0,
-            fm_extent_count: 1,
-        };
-        // Bad file handle should return EBADF
-        let result = fixture.adapter.dispatch_fiemap(&ctx, 1, 999, input, 4096);
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), Errno::EBADF);
     }
 
     #[test]
