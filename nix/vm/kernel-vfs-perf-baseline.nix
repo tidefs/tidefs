@@ -310,6 +310,8 @@ echo "timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo ""
 
 PASSED=0; FAILED=0; BLOCKED=0; SKIPPED=0
+write_throughput_mbps=0
+read_throughput_mbps=0
 pass()   { echo "PASS: $1"; PASSED=$((PASSED + 1)); }
 fail()   { echo "FAIL: $1 -- $2"; FAILED=$((FAILED + 1)); }
 blocked(){ echo "BLOCKED: $1 -- $2"; BLOCKED=$((BLOCKED + 1)); }
@@ -368,16 +370,16 @@ else
     done
     sync
     end_ns=$(date +%s%N 2>/dev/null || echo 0)
-    duration_s=0; throughput_mbps=0
+    duration_s=0; write_throughput_mbps=0
     if [ "$start_ns" -gt 0 ] && [ "$end_ns" -gt 0 ]; then
         duration_ns=$((end_ns - start_ns))
         duration_s=$(awk "BEGIN {printf \"%.3f\", $duration_ns / 1000000000}" 2>/dev/null || echo "0")
         if [ "$duration_ns" -gt 0 ]; then
-            throughput_mbps=$(awk "BEGIN {printf \"%.2f\", 1000000000 / $duration_ns}" 2>/dev/null || echo "0")
+            write_throughput_mbps=$(awk "BEGIN {printf \"%.2f\", 1000000000 / $duration_ns}" 2>/dev/null || echo "0")
         fi
     fi
     echo "  write_duration_s=$duration_s"
-    echo "  write_throughput_MBps=$throughput_mbps"
+    echo "  write_throughput_MBps=$write_throughput_mbps"
     ws=$(stat -c %s "$MNT/perf_write_test" 2>/dev/null || echo 0)
     [ "$ws" -ge 1048576 ] && pass "phase2_write_data" || fail "phase2_write_data" "file_size=$ws"
 fi
@@ -392,16 +394,16 @@ else
     start_ns=$(date +%s%N 2>/dev/null || echo 0)
     dd if="$MNT/perf_write_test" of=/dev/null bs=4096 count=256 2>/dev/null
     end_ns=$(date +%s%N 2>/dev/null || echo 0)
-    duration_s=0; throughput_mbps=0
+    duration_s=0; read_throughput_mbps=0
     if [ "$start_ns" -gt 0 ] && [ "$end_ns" -gt 0 ]; then
         duration_ns=$((end_ns - start_ns))
         duration_s=$(awk "BEGIN {printf \"%.3f\", $duration_ns / 1000000000}" 2>/dev/null || echo "0")
         if [ "$duration_ns" -gt 0 ]; then
-            throughput_mbps=$(awk "BEGIN {printf \"%.2f\", 1000000000 / $duration_ns}" 2>/dev/null || echo "0")
+            read_throughput_mbps=$(awk "BEGIN {printf \"%.2f\", 1000000000 / $duration_ns}" 2>/dev/null || echo "0")
         fi
     fi
     echo "  read_duration_s=$duration_s"
-    echo "  read_throughput_MBps=$throughput_mbps"
+    echo "  read_throughput_MBps=$read_throughput_mbps"
     pass "phase3_read"
 fi
 
@@ -455,8 +457,8 @@ rmmod tidefs_posix_vfs 2>/tmp/rm.err && pass "phase7_rmmod" || fail "phase7_rmmo
 echo ""
 echo "============================================================"
 echo "=== PERFORMANCE BASELINE SUMMARY ==="
-echo "  write_throughput_MBps=$throughput_mbps"
-echo "  read_throughput_MBps=$throughput_mbps"
+echo "  write_throughput_MBps=$write_throughput_mbps"
+echo "  read_throughput_MBps=$read_throughput_mbps"
 echo "  stat_avg_latency_us=$avg_us"
 echo "  dmesg_BUG=$DB"
 echo "  PASS=$PASSED FAIL=$FAILED BLOCKED=$BLOCKED SKIP=$SKIPPED"
