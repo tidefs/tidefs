@@ -24,7 +24,7 @@
 //! | Surface | Source/Cargo (T0-T1) | Harness (T2) | QEMU Guest (T3) | Kernel (T4+) |
 //! |---|---|---|---|---|
 //! | Pool export | `pool_api.rs` tests + `pool_export_*` unit tests | `pool-e2e-blockdev-validation.nix` | **GAP**: no QEMU validation output for export→reimport cycle | N/A |
-//! | Pool import | `tidefs-pool-import` + `tidefs-storage-node` integration tests | `pool-remount-lifecycle-validation.nix` + `pool-e2e-blockdev-validation.nix` | **GAP**: no QEMU validation output | `kernel-pool-import-validation.nix` retired |
+//! | Pool import | `tidefs-pool-import` + `tidefs-storage-node` integration tests | `pool-remount-lifecycle-validation.nix` + `pool-e2e-blockdev-validation.nix` | **GAP**: no QEMU validation output | no active kernel lane; replacement tracked as blocker |
 //! | Snapshot rollback | `snapshot.rs` + `tests.rs` rollback tests | none dedicated | **GAP**: no QEMU harness for rollback persistence after export/import | N/A |
 //!
 //! ## Current-Head Blockers
@@ -34,11 +34,10 @@
 //!    are harness-functional but no `/root/ai/tmp/tidefs-validation/` artifact with a real
 //!    `qemu-system-x86_64` log exists for the export→reimport persistence
 //!    cycle.
-//! 2. **Kernel pool import validation retired.** `kernel-pool-import-validation.nix`
-//!    intentionally fails closed because the previous wrapper used regular-file
-//!    backing and lazy unmount/remount cycles as crash validation.  A real
-//!    replacement requires Linux 7.0 QEMU with kmod-posix-vfs loaded and
-//!    actual hard reset cycles.
+//! 2. **No active kernel pool import validation lane.** The previous wrapper
+//!    used regular-file backing and lazy unmount/remount cycles as crash
+//!    validation.  A real replacement requires Linux 7.0 QEMU with
+//!    kmod-posix-vfs loaded and actual hard reset cycles.
 //! 3. **Snapshot rollback persistence after pool export/import is not
 //!    validated.** The `rollback_to_snapshot` path is tested at the cargo/unit
 //!    tier but no harness exercises rollback across pool export→reimport→mount
@@ -109,7 +108,7 @@ pub fn rollback_import_surfaces() -> Vec<RollbackImportSurface> {
             blockers: vec![
                 "No QEMU validation output for import-after-export persistence"
                     .into(),
-                "Kernel pool-import validation wrapper retired; needs Linux 7.0 QEMU replacement"
+                "No active kernel pool-import validation lane; needs Linux 7.0 QEMU replacement"
                     .into(),
             ],
         },

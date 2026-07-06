@@ -2918,11 +2918,6 @@ EOF
             linuxKernel_7_0 = linuxKernel_7_0;
           };
 
-
-          kernelPerformanceBudgetValidation = import ./nix/vm/kernel-performance-budget-validation.nix {
-            inherit pkgs;
-            linuxKernel_7_0 = linuxKernel_7_0;
-          };
           fuseExtentValidation = import ./nix/vm/fuse-extent-validation.nix {
             inherit pkgs;
             tidefsPackage = default;
@@ -2950,25 +2945,6 @@ EOF
             inherit pkgs;
             linuxKernel_7_0 = linuxKernel_7_0;
             tidefsPackage = tidefsCtlRuntime;
-          };
-
-          kernelRenameValidation = import ./nix/vm/kernel-rename-validation.nix {
-            inherit pkgs;
-            linuxKernel_7_0 = linuxKernel_7_0;
-          };
-
-          kernelSymlinkValidation = import ./nix/vm/kernel-symlink-validation.nix {
-            inherit pkgs;
-            linuxKernel_7_0 = linuxKernel_7_0;
-          };
-
-          kernelMkdirRmdirValidation = import ./nix/vm/kernel-mkdir-rmdir-validation.nix {
-            inherit pkgs;
-            linuxKernel_7_0 = linuxKernel_7_0;
-          };
-          kernelLinkCrashValidation = import ./nix/vm/kernel-link-crash-validation.nix {
-            inherit pkgs;
-            linuxKernel_7_0 = linuxKernel_7_0;
           };
 
           fuseWritebackCacheValidation = import ./nix/vm/fuse-writeback-cache-validation.nix {
@@ -3054,11 +3030,6 @@ EOF
             tidefsPosixVfsKmod = tidefsPosixVfsKmod;
           };
 
-          kernelXfstestsCrashConsistency = import ./nix/vm/kernel-xfstests-crash-consistency.nix {
-            inherit pkgs;
-            linuxKernel_7_0 = linuxKernel_7_0;
-          };
-
           kernelBlockValidation = import ./nix/vm/kernel-block-kmod-validation.nix {
             inherit pkgs;
             linuxKernel_7_0 = linuxKernel_7_0;
@@ -3075,11 +3046,6 @@ EOF
           };
 
           kernelCopySpliceValidation = import ./nix/vm/kernel-copy-splice-validation.nix {
-            inherit pkgs;
-            linuxKernel_7_0 = linuxKernel_7_0;
-          };
-
-          blockKmodIoDispatchValidation = import ./nix/vm/block-kmod-io-dispatch-validation.nix {
             inherit pkgs;
             linuxKernel_7_0 = linuxKernel_7_0;
           };
@@ -3109,32 +3075,12 @@ EOF
             inherit rustToolchain;
             bindgenPkg = rustBindgenLinuxKbuild;
           };
-          kernelReaddirValidation = import ./nix/vm/kernel-readdir-validation.nix {
-            inherit pkgs;
-            linuxKernel_7_0 = linuxKernel_7_0;
-          };
-
           kernelFallocateValidation = import ./nix/vm/kernel-fallocate-validation.nix {
             inherit pkgs;
             linuxKernel_7_0 = linuxKernel_7_0;
           };
 
-          kernelTruncateValidation = import ./nix/vm/kernel-truncate-validation.nix {
-            inherit pkgs;
-            linuxKernel_7_0 = linuxKernel_7_0;
-          };
-
-          kernelLinkUnlinkValidation = import ./nix/vm/kernel-link-unlink-validation.nix {
-            inherit pkgs;
-            linuxKernel_7_0 = linuxKernel_7_0;
-          };
-
           kernelConcurrentValidation = import ./nix/vm/kernel-concurrent-validation.nix {
-            inherit pkgs;
-            linuxKernel_7_0 = linuxKernel_7_0;
-          };
-
-          kernelLookupValidation = import ./nix/vm/kernel-lookup-validation.nix {
             inherit pkgs;
             linuxKernel_7_0 = linuxKernel_7_0;
           };
@@ -3145,12 +3091,6 @@ EOF
             tidefsPackage = tidefsCtlRuntime;
           };
           kernelInotifyFanotifyValidation = import ./nix/vm/kernel-inotify-fanotify-validation.nix {
-            inherit pkgs;
-            linuxKernel_7_0 = linuxKernel_7_0;
-          };
-
-          kernelStatfsValidation = import ./nix/vm/kernel-statfs-validation.nix {
-
             inherit pkgs;
             linuxKernel_7_0 = linuxKernel_7_0;
           };
@@ -3189,11 +3129,6 @@ EOF
             inherit pkgs;
             linuxKernel_7_0 = linuxKernel_7_0;
             tidefsPackage = default;
-          };
-
-          kernelPoolImportValidation = import ./nix/vm/kernel-pool-import-validation.nix {
-            inherit pkgs;
-            linuxKernel_7_0 = linuxKernel_7_0;
           };
 
           poolE2EBlockdevValidation = import ./nix/vm/pool-e2e-blockdev-validation.nix {
@@ -3981,31 +3916,6 @@ EOF
               --module ${self.packages.${system}.tidefsPosixVfsKmod}/tidefs_posix_vfs.ko "$@"
           '';
 
-          kernel-pool-import-validation = script "tidefs-kmod-pool-import-validation" [
-            pkgs.bash
-            pkgs.coreutils
-            pkgs.busybox
-            pkgs.kmod
-            pkgs.cpio
-            pkgs.qemu
-            self.packages.${system}.kernelPoolImportValidation
-          ] ''
-            exec ${self.packages.${system}.kernelPoolImportValidation}/bin/tidefs-kmod-pool-import-validation "$@"
-          '';
-
-
-          kernel-performance-budget-validation = script "tidefs-kmod-perf-budget-validation" [
-            pkgs.bash
-            pkgs.coreutils
-            pkgs.busybox
-            pkgs.kmod
-            pkgs.cpio
-            pkgs.qemu
-            pkgs.fio
-            self.packages.${system}.kernelPerformanceBudgetValidation
-          ] ''
-            exec ${self.packages.${system}.kernelPerformanceBudgetValidation}/bin/tidefs-kmod-perf-budget-validation "$@"
-          '';
           fuse-extent-validation = script "tidefs-fuse-extent-validation" [
             pkgs.bash
             pkgs.coreutils
@@ -4063,53 +3973,6 @@ EOF
               --module ${self.packages.${system}.tidefsPosixVfsKmod}/tidefs_posix_vfs.ko "$@"
           '';
 
-          kernel-rename-validation = script "tidefs-kmod-rename-validation" [
-            pkgs.bash
-            pkgs.coreutils
-            pkgs.busybox
-            pkgs.kmod
-            pkgs.cpio
-            pkgs.qemu
-            self.packages.${system}.kernelRenameValidation
-          ] ''
-            exec ${self.packages.${system}.kernelRenameValidation}/bin/tidefs-kmod-rename-validation "$@"
-          '';
-
-
-          kernel-symlink-validation = script "tidefs-kmod-symlink-validation" [
-            pkgs.bash
-            pkgs.coreutils
-            pkgs.busybox
-            pkgs.kmod
-            pkgs.cpio
-            pkgs.qemu
-            self.packages.${system}.kernelSymlinkValidation
-          ] ''
-            exec ${self.packages.${system}.kernelSymlinkValidation}/bin/tidefs-kmod-symlink-validation "$@"
-          '';
-
-          kernel-mkdir-rmdir-validation = script "tidefs-kmod-mkdir-rmdir-validation" [
-            pkgs.bash
-            pkgs.coreutils
-            pkgs.busybox
-            pkgs.kmod
-            pkgs.cpio
-            pkgs.qemu
-            self.packages.${system}.kernelMkdirRmdirValidation
-          ] ''
-            exec ${self.packages.${system}.kernelMkdirRmdirValidation}/bin/tidefs-kmod-mkdir-rmdir-validation "$@"
-          '';
-          kernel-link-crash-validation = script "tidefs-kmod-link-crash-validation" [
-            pkgs.bash
-            pkgs.coreutils
-            pkgs.busybox
-            pkgs.kmod
-            pkgs.cpio
-            pkgs.qemu
-            self.packages.${system}.kernelLinkCrashValidation
-          ] ''
-            exec ${self.packages.${system}.kernelLinkCrashValidation}/bin/tidefs-kmod-link-crash-validation "$@"
-          '';
           fuse-writeback-cache-validation = qemuSourceApp "tidefs-fuse-writeback-cache-validation";
 
           fuse-xfstests-validation = script "tidefs-fuse-xfstests-validation" [
@@ -4228,18 +4091,6 @@ EOF
             exec ${self.packages.${system}.k7VfsXfstestsValidation}/bin/tidefs-k7-vfs-xfstests-validation "$@"
           '';
 
-
-          kernel-xfstests-crash-consistency = script "tidefs-kernel-xfstests-crash-consistency" [
-            pkgs.bash
-            pkgs.coreutils
-            pkgs.busybox
-            pkgs.cpio
-            pkgs.qemu
-            self.packages.${system}.kernelXfstestsCrashConsistency
-          ] ''
-            exec ${self.packages.${system}.kernelXfstestsCrashConsistency}/bin/tidefs-kernel-xfstests-crash-consistency "$@"
-          '';
-
           kernel-block-validation = script "tidefs-kmod-block-validation" [
             pkgs.bash
             pkgs.coreutils
@@ -4314,18 +4165,6 @@ EOF
             exec ${self.packages.${system}.kernelBlockGuestFilesystemMatrix}/bin/tidefs-kblock-guest-fs-matrix "$@"
           '';
 
-          block-kmod-io-dispatch-validation = script "tidefs-block-kmod-io-dispatch-validation"  [
-            pkgs.bash
-            pkgs.coreutils
-            pkgs.busybox
-            pkgs.kmod
-            pkgs.cpio
-            pkgs.qemu
-            self.packages.${system}.blockKmodIoDispatchValidation
-          ] ''
-            exec ${self.packages.${system}.blockKmodIoDispatchValidation}/bin/tidefs-block-kmod-io-dispatch-validation "$@"
-          '';
-
           k7-kbuild-toolchain = script "k7-kbuild-toolchain-prepare" [
             pkgs.bash
             pkgs.coreutils
@@ -4357,29 +4196,6 @@ EOF
             self.packages.${system}.kernelCopySpliceValidation
           ] ''
             exec ${self.packages.${system}.kernelCopySpliceValidation}/bin/tidefs-kernel-copy-splice-validation "$@"
-          '';
-          kernel-readdir-validation = script "tidefs-kmod-readdir-validation" [
-            pkgs.bash
-            pkgs.coreutils
-            pkgs.busybox
-            pkgs.kmod
-            pkgs.cpio
-            pkgs.qemu
-            self.packages.${system}.kernelReaddirValidation
-          ] ''
-            exec ${self.packages.${system}.kernelReaddirValidation}/bin/tidefs-kmod-readdir-validation "$@"
-          '';
-
-          kernel-lookup-validation = script "tidefs-kmod-lookup-validation" [
-            pkgs.bash
-            pkgs.coreutils
-            pkgs.busybox
-            pkgs.kmod
-            pkgs.cpio
-            pkgs.qemu
-            self.packages.${system}.kernelLookupValidation
-          ] ''
-            exec ${self.packages.${system}.kernelLookupValidation}/bin/tidefs-kmod-lookup-validation "$@"
           '';
           kernel-fallocate-validation = script "tidefs-kmod-fallocate-validation" [
             pkgs.bash
@@ -4418,43 +4234,6 @@ EOF
           ] ''
             exec ${self.packages.${system}.kernelInotifyFanotifyValidation}/bin/tidefs-kmod-inotify-fanotify-validation "$@"
           '';
-          kernel-statfs-validation = script "tidefs-kmod-statfs-validation" [
-            pkgs.bash
-            pkgs.coreutils
-            pkgs.busybox
-            pkgs.kmod
-            pkgs.cpio
-            pkgs.qemu
-            self.packages.${system}.kernelStatfsValidation
-          ] ''
-            exec ${self.packages.${system}.kernelStatfsValidation}/bin/tidefs-kmod-statfs-validation "$@"
-          '';
-
-
-          kernel-truncate-validation = script "tidefs-kmod-truncate-validation" [
-            pkgs.bash
-            pkgs.coreutils
-            pkgs.busybox
-            pkgs.kmod
-            pkgs.cpio
-            pkgs.qemu
-            self.packages.${system}.kernelTruncateValidation
-          ] ''
-            exec ${self.packages.${system}.kernelTruncateValidation}/bin/tidefs-kmod-truncate-validation "$@"
-          '';
-
-          kernel-link-unlink-validation = script "tidefs-kmod-link-unlink-validation" [
-            pkgs.bash
-            pkgs.coreutils
-            pkgs.busybox
-            pkgs.kmod
-            pkgs.cpio
-            pkgs.qemu
-            self.packages.${system}.kernelLinkUnlinkValidation
-          ] ''
-            exec ${self.packages.${system}.kernelLinkUnlinkValidation}/bin/tidefs-kmod-link-unlink-validation "$@"
-          '';
-
           kernel-concurrent-validation = script "tidefs-kmod-concurrent-validation" [
             pkgs.bash
             pkgs.coreutils
