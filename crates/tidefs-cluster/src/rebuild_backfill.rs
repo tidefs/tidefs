@@ -569,7 +569,7 @@ impl RebuildBackfillInitiator {
         Self::validate_plan_receipts(&plan)?;
 
         let batches =
-            Self::partition_plan(&plan, epoch, self.default_max_chunk_bytes, self.carrier);
+            Self::partition_plan(&plan, epoch, self.default_max_chunk_bytes, self.carrier)?;
 
         let backfill_id = self.next_backfill_id;
         self.next_backfill_id += 1;
@@ -588,7 +588,10 @@ impl RebuildBackfillInitiator {
 
     fn validate_plan_receipts(plan: &RebuildPlan) -> Result<(), BackfillError> {
         for task in &plan.tasks {
-            if task.source_nodes.is_empty() || task.target_nodes.is_empty() {
+            if task.source_nodes.is_empty() {
+                return Err(BackfillError::NoViableSource(task.object_id));
+            }
+            if task.target_nodes.is_empty() {
                 continue;
             }
             let receipt = task.placement_receipt_ref;
@@ -624,14 +627,14 @@ impl RebuildBackfillInitiator {
         epoch: EpochId,
         max_chunk_bytes: u64,
         carrier: DataPathCarrier,
-    ) -> Vec<BackfillBatch> {
+    ) -> Result<Vec<BackfillBatch>, BackfillError> {
         // Build: target_node -> { (source_node, receipt_ref) -> [object_ids] }
         let mut target_map: BTreeMap<u64, BTreeMap<(u64, PlacementReceiptRef), Vec<u64>>> =
             BTreeMap::new();
 
         for task in &plan.tasks {
             if task.source_nodes.is_empty() {
-                continue; // Skip tasks with no viable sources
+                return Err(BackfillError::NoViableSource(task.object_id));
             }
             for &target in &task.target_nodes {
                 let source_buckets = target_map.entry(target).or_default();
@@ -661,7 +664,7 @@ impl RebuildBackfillInitiator {
             batches.push(batch);
         }
 
-        batches
+        Ok(batches)
     }
 
     // ── Lifecycle methods ───────────────────────────────────────────
@@ -845,7 +848,7 @@ impl RebuildBackfillInitiator {
         plan: &RebuildPlan,
         epoch: EpochId,
         max_chunk_bytes: u64,
-    ) -> Vec<BackfillBatch> {
+    ) -> Result<Vec<BackfillBatch>, BackfillError> {
         Self::partition_plan(plan, epoch, max_chunk_bytes, DataPathCarrier::Unknown)
     }
 }
