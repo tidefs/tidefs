@@ -145,6 +145,25 @@ EOF
   analyze_qemu_log "$test_dir/timeout.log" 124
   expect_parser_verdict timeout-log BLOCKED qemu_timeout 2
 
+  cat > "$test_dir/qemu-exit-nonzero.log" <<'EOF'
+PASS: insmod
+PASS: mount
+PASS: no_daemon
+write_throughput_MBps=10.00
+read_throughput_MBps=20.00
+stat_avg_us=30
+EOF
+  analyze_qemu_log "$test_dir/qemu-exit-nonzero.log" 1
+  expect_parser_verdict qemu-exit-nonzero BLOCKED qemu_exit_1 2
+
+  cat > "$test_dir/zero-pass.log" <<'EOF'
+write_throughput_MBps=10.00
+read_throughput_MBps=20.00
+stat_avg_us=30
+EOF
+  analyze_qemu_log "$test_dir/zero-pass.log" 0
+  expect_parser_verdict zero-pass BLOCKED zero_pass_rows 2
+
   cat > "$test_dir/missing-metrics.log" <<'EOF'
 PASS: insmod
 PASS: mount
