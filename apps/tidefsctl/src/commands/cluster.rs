@@ -1104,11 +1104,7 @@ fn handle_cluster_status(pool_name: String, json: bool) {
         super::operator_truth::OperatorTruthCarrier::live_route("cluster", "status", &pool_name);
     // Try the live owner first; exits if reachable.
     if !json {
-        eprintln!(
-            "operator truth carrier: routing tidefsctl cluster status pool '{}' as {}",
-            pool_name,
-            live_truth.freshness.as_str()
-        );
+        eprintln!("{}", live_truth.live_route_attempt_line());
     }
     super::live_owner::route_status_if_owner_exists("cluster", "status", &pool_name, json);
 

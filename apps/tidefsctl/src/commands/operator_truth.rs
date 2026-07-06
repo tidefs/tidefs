@@ -122,6 +122,18 @@ impl OperatorTruthCarrier {
     }
 
     #[must_use]
+    pub(crate) fn live_route_attempt_line(&self) -> String {
+        format!(
+            "operator truth carrier: attempting live route for tidefsctl {} {} pool '{}' with evidence {} and freshness {}",
+            self.command,
+            self.operation,
+            self.pool_name,
+            self.evidence_state.as_str(),
+            self.freshness.as_str()
+        )
+    }
+
+    #[must_use]
     pub(crate) fn json_value(&self) -> serde_json::Value {
         serde_json::json!({
             "command": self.command,
@@ -186,6 +198,16 @@ mod tests {
         assert_eq!(carrier.source, TruthViewSourceClass::RuntimeMirror);
         assert_eq!(carrier.freshness, TruthViewFreshnessClass::LiveWithinBudget);
         assert_eq!(carrier.refusal, None);
+    }
+
+    #[test]
+    fn live_route_attempt_line_exposes_truth_state() {
+        let carrier = OperatorTruthCarrier::live_route("cluster", "status", "alpha");
+
+        assert_eq!(
+            carrier.live_route_attempt_line(),
+            "operator truth carrier: attempting live route for tidefsctl cluster status pool 'alpha' with evidence live-within-budget and freshness fresh.truth_view.live_within_budget.f0"
+        );
     }
 
     #[test]
