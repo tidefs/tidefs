@@ -646,6 +646,20 @@ fn preview_batches() {
 }
 
 #[test]
+fn preview_batches_rejects_no_source_tasks() {
+    let plan = make_plan(
+        100,
+        vec![
+            make_task(1, vec![], vec![20], 0),
+            make_task(2, vec![10], vec![20], 0),
+        ],
+    );
+
+    let err = RebuildBackfillInitiator::preview_batches(&plan, eid(1), 65536).unwrap_err();
+    assert_eq!(err, BackfillError::NoViableSource(1));
+}
+
+#[test]
 fn total_pending_objects() {
     let mut init = RebuildBackfillInitiator::new(eid(1));
     let p1 = make_plan(
