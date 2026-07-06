@@ -621,7 +621,7 @@ fn build_catalog() -> Vec<FaultInjectionScenario> {
             source: "CURRENT_RELEASE_FOCUS.md".into(),
         }],
         tickets: vec![6396],
-        scripts: vec!["nix/vm/kernel-xfstests-crash-consistency.nix".into()],
+        scripts: vec![],
         coverage: ScenarioCoverage::TicketOwned,
         required_validation_tier: ValidationTier::Tier5,
     });
