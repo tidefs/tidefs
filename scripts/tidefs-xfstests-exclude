@@ -26,7 +26,12 @@ generic/444
 # --- Capabilities ---
 generic/694
 
-# --- Encryption (fscrypt) ---
+# --- Linux fscrypt policy/key ioctls (unsupported/refused) ---
+#   generic/397-401 exercise Linux fscrypt policy/key behavior. The TideFS
+#   FUSE preview does not implement fscrypt compatibility; its ioctl boundary
+#   wires only FS_IOC_FIEMAP, FS_IOC_FSGETXATTR, and TIDEFS_IOC_DEFRAG, with
+#   other commands refused as EOPNOTSUPP. This is separate from mounted
+#   device-transform encryption, which remains blocked by transform authority.
 generic/397
 generic/398
 generic/399

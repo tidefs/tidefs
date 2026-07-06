@@ -79,13 +79,13 @@ Debug with `TIDEFS_XFSTESTS_DEBUG=1`.
 ## Exclude list
 
 `scripts/tidefs-xfstests-exclude` contains tests excluded because they
-require features not yet in the TideFS FUSE adapter:
+require features outside the current TideFS FUSE adapter boundary:
 
 | Feature area          | Tests excluded |
 |-----------------------|---------------|
 | ACLs                  | generic/099, 237, 307, 318, 319, 375, 444 |
 | Capabilities          | generic/694 |
-| Encryption (fscrypt)  | generic/397, 398, 399, 400, 401 |
+| Linux fscrypt policy/key ioctls | generic/397, 398, 399, 400, 401 |
 | Immutable/append-only | generic/079 |
 | FS_IOC ioctls         | generic/009 |
 | Kernel-specific       | generic/048, 054, 058, 062 |
@@ -97,6 +97,11 @@ require features not yet in the TideFS FUSE adapter:
 Delivered (no longer excluded): O_DIRECT (#876), POSIX file locks (#491/#791),
 FIEMAP (#500), fallocate modes (#515), RENAME_EXCHANGE (#532), special-node
 `mknod` for `generic/184`.
+
+The fscrypt rows are an unsupported/refused Linux fscrypt API boundary, not a
+mounted device-transform encryption claim. The current FUSE ioctl dispatcher
+wires `FS_IOC_FIEMAP`, `FS_IOC_FSGETXATTR`, and `TIDEFS_IOC_DEFRAG`; other
+ioctl commands return `EOPNOTSUPP`.
 
 The exclude file is passed to xfstests-check via `-E` when `TIDEFS_XFSTESTS_EXCLUDE` is set. Override with:
 
