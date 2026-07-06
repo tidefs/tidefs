@@ -8,8 +8,10 @@
 //   - Abandoned worktrees: no stale worktree directories exist locally.
 //
 // Legacy Forgejo claim-tracker commands (check-stale-claims,
-// check-duplicate-claims, coordination-health, auto-release-stale-claims,
-// acquire-claim) fail closed with an explicit unsupported message.
+// check-stale-forgejo-claims, check-duplicate-claims,
+// check-duplicate-forgejo-claims, coordination-health,
+// auto-release-stale-claims, acquire-claim) fail closed with an explicit
+// unsupported message.
 //
 // GitHub issue checks use the `gh` CLI; no hard-coded API credentials.
 
@@ -148,9 +150,9 @@ fn check_foreground_main_claim(repo_root: &Path) -> Result<(), ForgejoWorkError>
 // check-stale-claims -- legacy Forgejo command, now unsupported
 // ---------------------------------------------------------------------------
 
-pub fn check_stale_claims_current_workspace() -> Result<(), ForgejoWorkError> {
+pub fn check_stale_claims_command(command: &str) -> Result<(), ForgejoWorkError> {
     Err(retired_forgejo_command_error(
-        "check-stale-claims",
+        command,
         "Stale-work coordination is now managed through GitHub issues, pull requests, and the \
          current Codex Nexus controller.",
     ))
@@ -160,9 +162,9 @@ pub fn check_stale_claims_current_workspace() -> Result<(), ForgejoWorkError> {
 // check-duplicate-claims -- legacy Forgejo command, now unsupported
 // ---------------------------------------------------------------------------
 
-pub fn check_duplicate_claims_current_workspace() -> Result<(), ForgejoWorkError> {
+pub fn check_duplicate_claims_command(command: &str) -> Result<(), ForgejoWorkError> {
     Err(retired_forgejo_command_error(
-        "check-duplicate-claims",
+        command,
         "Duplicate-work coordination is now managed through GitHub issues, pull requests, and the \
          current Codex Nexus controller.",
     ))
@@ -544,12 +546,20 @@ mod tests {
     #[test]
     fn retired_legacy_forgejo_commands_fail_closed() {
         assert_retired_forgejo_command_error(
-            check_stale_claims_current_workspace(),
+            check_stale_claims_command("check-stale-claims"),
             "check-stale-claims",
         );
         assert_retired_forgejo_command_error(
-            check_duplicate_claims_current_workspace(),
+            check_stale_claims_command("check-stale-forgejo-claims"),
+            "check-stale-forgejo-claims",
+        );
+        assert_retired_forgejo_command_error(
+            check_duplicate_claims_command("check-duplicate-claims"),
             "check-duplicate-claims",
+        );
+        assert_retired_forgejo_command_error(
+            check_duplicate_claims_command("check-duplicate-forgejo-claims"),
+            "check-duplicate-forgejo-claims",
         );
         assert_retired_forgejo_command_error(
             auto_release_stale_claims(),

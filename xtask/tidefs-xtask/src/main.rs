@@ -1049,14 +1049,14 @@ fn main() {
                 }
             }
         }
-        Some("check-stale-claims") => {
-            if let Err(err) = forgejo_work::check_stale_claims_current_workspace() {
+        Some(command @ ("check-stale-claims" | "check-stale-forgejo-claims")) => {
+            if let Err(err) = forgejo_work::check_stale_claims_command(command) {
                 eprintln!("{err}");
                 process::exit(1);
             }
         }
-        Some("check-duplicate-claims") => {
-            if let Err(err) = forgejo_work::check_duplicate_claims_current_workspace() {
+        Some(command @ ("check-duplicate-claims" | "check-duplicate-forgejo-claims")) => {
+            if let Err(err) = forgejo_work::check_duplicate_claims_command(command) {
                 eprintln!("{err}");
                 process::exit(1);
             }
@@ -2647,7 +2647,13 @@ fn print_help() {
         "  check-stale-claims      unsupported: the legacy Forgejo claim tracker has been retired"
     );
     println!(
+        "  check-stale-forgejo-claims unsupported: the legacy Forgejo claim tracker has been retired"
+    );
+    println!(
         "  check-duplicate-claims  unsupported: the legacy Forgejo claim tracker has been retired"
+    );
+    println!(
+        "  check-duplicate-forgejo-claims unsupported: the legacy Forgejo claim tracker has been retired"
     );
     println!("  auto-release-stale-claims unsupported: the legacy Forgejo claim tracker has been retired");
     println!(
