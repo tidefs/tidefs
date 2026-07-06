@@ -101,7 +101,9 @@ FIEMAP (#500), fallocate modes (#515), RENAME_EXCHANGE (#532), special-node
 The fscrypt rows are an unsupported/refused Linux fscrypt API boundary, not a
 mounted device-transform encryption claim. The current FUSE ioctl dispatcher
 wires `FS_IOC_FIEMAP`, `FS_IOC_FSGETXATTR`, and `TIDEFS_IOC_DEFRAG`; other
-ioctl commands return `EOPNOTSUPP`.
+ioctl commands return `EOPNOTSUPP` in
+`apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_vfs_adapter.rs`
+`FuseVfsAdapter::ioctl`.
 
 The exclude file is passed to xfstests-check via `-E` when `TIDEFS_XFSTESTS_EXCLUDE` is set. Override with:
 
