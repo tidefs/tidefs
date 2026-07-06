@@ -2,10 +2,13 @@
 
 Issue #1276 records the current TFR-012 device lifecycle decision boundary.
 Issue #1536 records the zeroing and media-privacy boundary inside that
-decision. This is a documentation authority slice only. It does not change
-product behavior, admit a new device mode, or claim production secure erase,
-cryptographic erase, online replacement, online removal, decommissioning
-readiness, or discard/TRIM readiness.
+decision. Issue #2006 records the follow-up source re-scan for zero-visible
+operations, label/superblock zeroing, discard acceptance, cryptographic erase,
+secure erase, sanitization, and decommissioning readiness. This is a
+documentation authority slice only. It does not change product behavior, admit a
+new device mode, or claim production secure erase, cryptographic erase, online
+replacement, online removal, decommissioning readiness, or discard/TRIM
+readiness.
 
 ## Evidence Reviewed
 
@@ -32,6 +35,14 @@ readiness, or discard/TRIM readiness.
   current block-volume file-image zeroing source, the deleted OW-301 lineage
   retained by git history and issue #1637, and transform privacy guardrails
   before choosing a docs-only clarification for this slice.
+- Issue #2006 re-scanned this document, `pool_destroy(..., zero_superblock)`,
+  `tidefsctl pool destroy --zero-superblock` reporting, live-owner destroy
+  argument routing, block-volume/file-image discard and write-zeroes source, the
+  #1823 cryptographic-erase/key-lifecycle authority, the #2004 discard
+  capability boundary, the #2005 segment-reclaim remanence boundary, and open PR
+  changed files on 2026-07-06. The scan found no source hook required for this
+  slice: the current operator-facing wording says which label or zero-visible
+  operation ran, not that backing media became private or unrecoverable.
 
 ## Current Surfaces
 
@@ -112,7 +123,8 @@ TideFS current authority is:
 | Accepted discard/TRIM requests | Not product-ready. Current pool paths can forward ranges only when a backing reports discard support, and directory compatibility refuses non-zero discard. | A stronger claim needs per-backing capability probing, accepted-byte reporting, fail-closed refusals, and focused validation for the exact device class. |
 | Segment/object reclaim and file-image hole punching | Capacity and sparse-file space-reuse hints only. | A stronger remanence claim needs policy that consumes committed placement/reclaim evidence and proves backing-media behavior; best-effort hole punching is insufficient. |
 | Transform-wrapper discard forwarding | Implementation detail only. | Compression/encryption privacy claims need transform-authority conformance, stored-frame metadata, key lifecycle policy, and validation; byte-range pass-through is not enough. |
-| Cryptographic erase, secure erase, sanitization, or decommissioning readiness | Not supported and not claimed. | These need separate design authority, source hooks or command projection as applicable, media/key lifecycle evidence, and targeted validation before product wording may change. |
+| Cryptographic erase | Not supported and not claimed by zeroing, discard, label deletion, or key-state changes alone. #1823 owns the narrow key-lifecycle assessment. | A stronger claim needs transform metadata, stored-frame reachability, fully encrypted payload classification, documented media/remanence limits, and targeted validation before product wording may change. |
+| Secure erase, sanitization, or decommissioning readiness | Not supported and not claimed. | These need separate design authority, source hooks or command projection as applicable, whole-device or media-specific evidence, and targeted validation before product wording may change. |
 
 ## Explicit Non-Claims
 
@@ -128,6 +140,8 @@ This decision does not claim:
   hole punching, or segment free proves TRIM on real backing devices;
 - that zero-visible reads after discard/write-zeroes imply data is unrecoverable
   from the backing medium;
+- that `--zero-superblock`, `"zero_superblock"`, or `superblock zeroed: yes`
+  means more than TideFS label/superblock-area hygiene and import refusal;
 - that directory-backed compatibility paths are valid pool-member devices;
 - that label-only topology edits are sufficient without evacuation/refcount and
   durability evidence;
@@ -161,7 +175,7 @@ rows are intended to keep write sets non-overlapping.
 | Segment-reclaim remanence policy | `crates/tidefs-local-object-store/src/store.rs`, reclaim queue/drain surfaces, and a narrow docs update to this authority if behavior changes. | Decide whether segment free remains capacity-only or emits typed remanence/refusal evidence; never count best-effort hole punching as secure erase. | Documentation/source inspection first, then focused reclaim/object-store validation if behavior changes. |
 | Online removal authority closeout | `crates/tidefs-local-object-store/src/pool/mod.rs`, mounted live-owner routing/reporting in `crates/tidefs-local-filesystem/`, pool label persistence helpers, and focused `apps/tidefsctl device remove` projection. | Removal completes only after committed evacuation/refcount evidence, durable label/topology update, resumable crash state, and explicit no-remanence claim or policy hook. | Focused Rust plus targeted runtime workflow for the smallest mounted/live-owner removal row. |
 | Online replacement and rebuild authority | Replacement/rebuild state in `crates/tidefs-local-object-store/src/pool/mod.rs`, placement/rebuild receipt consumers, label persistence helpers, and focused operator projection. | Replacement records durable replacement/rebuild evidence, detaches the old device only after evidence is stable, and states media-remanence treatment. | Focused Rust plus targeted runtime workflow for replacement/rebuild once isolated. |
-| Zeroing and media privacy policy | This authority doc, pool destroy/zero-superblock docs and command projection, block-volume/file-image zero docs, and any narrow source hook needed for typed policy/refusal reporting. | Separate zero-visible data semantics, label/superblock zeroing, discard acceptance, cryptographic erase, secure erase, sanitization, and decommissioning readiness. Product wording must name exact non-claims. | Documentation/source inspection; no runtime unless behavior changes. |
+| Zeroing and media privacy policy | Issue #2006 re-scanned this authority doc, pool destroy/zero-superblock docs and command projection, block-volume/file-image zero docs, live-owner destroy argument routing, #1823, #2004, #2005, and open PR changed files. | Zero-visible data semantics, label/superblock zeroing, discard acceptance, cryptographic erase, secure erase, sanitization, and decommissioning readiness are separate. Current wording may report the exact zeroing/discard action, but must not imply privacy, remanence, sanitization, or decommissioning evidence from that action. | Documentation/source inspection completed for the current wording; no runtime unless behavior changes or a later issue adds typed reporting/refusal hooks. |
 | Cryptographic erase and key lifecycle semantics | Issue #1823 narrows this source boundary in `docs/TRANSFORM_PIPELINE_AUTHORITY.md`, `docs/MOUNTED_TRANSFORM_AUTHORITY_RAW_STORE_INVENTORY.md`, `docs/security/pool-encryption-secret-handle-boundary.md`, `crates/tidefs-encryption/`, and `crates/tidefs-secret-key-policy-runtime/`. | Source-owned lifecycle assessment covers active, rotating, revoked, quarantined, retired, missing, stale, and recovery-after-crash mounted access states. Key revocation/destruction cannot be presented as secure erase unless transform metadata, stored-frame reachability, media/remanence limits, and fully encrypted payload classification are explicitly proven; plaintext, compressed-only, unencrypted, partially transformed, raw-store-bypassed, or previously exposed media remain fail-closed non-claims. | Focused encryption/key-lifecycle Rust validation plus mounted-transform and claims-gate checks; no remanence, decommissioning, or secure-erase claim is admitted by this row alone. |
 | Device lifecycle runtime validation matrix | Workflow inputs or validation harness metadata only after implementation slices define exact behavior. | Add smallest supported rows for discard, removal, replacement, rebuild, and remanence-policy refusals without broadening this design issue. | GitHub Actions focused validation; no local heavy validation. |
 
