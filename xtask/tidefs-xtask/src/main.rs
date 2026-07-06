@@ -2352,6 +2352,9 @@ fn print_summary() {
     println!("hot_read_cache_check_command=check-hot-read-cache");
     println!("claims_gate_check_command=check-claims-gate");
     println!("release_readiness_verdict_command=release-readiness-verdict");
+    println!("claim_validate_command=validate-claim");
+    println!("claim_gate_check_command=check-claim-gate");
+    println!("abandoned_worktrees_check_command=check-abandoned-worktrees");
     println!("group_check_command=check-group");
     println!("local_filesystem_check_command=check-local-filesystem");
     println!("chunked_file_layout_check_command=check-chunked-file-layout");
