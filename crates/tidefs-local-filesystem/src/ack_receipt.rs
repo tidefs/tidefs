@@ -518,7 +518,7 @@ impl LocalAckReceipt {
             return false;
         }
 
-        let has_local_evidence = self.local_intent_record_ref.is_bound()
+        let required_local_refs_bound = self.local_intent_record_ref.is_bound()
             && self.ordering_ref.is_bound()
             && self.flush_fence_ref.is_bound()
             && self.media_capability_ref.is_bound()
@@ -526,12 +526,39 @@ impl LocalAckReceipt {
             && self.dirty_window_ref.is_bound()
             && self.rollout_ref.is_bound()
             && self.tenant_isolation_ref.is_bound();
+        let required_local_refs_carried = self
+            .receipt
+            .evidence_refs
+            .contains_ref(self.local_intent_record_ref)
+            && self.receipt.evidence_refs.contains_ref(self.ordering_ref)
+            && self
+                .receipt
+                .evidence_refs
+                .contains_ref(self.flush_fence_ref)
+            && self
+                .receipt
+                .evidence_refs
+                .contains_ref(self.media_capability_ref)
+            && self.receipt.evidence_refs.contains_ref(self.reserve_ref)
+            && self
+                .receipt
+                .evidence_refs
+                .contains_ref(self.dirty_window_ref)
+            && self.receipt.evidence_refs.contains_ref(self.rollout_ref)
+            && self
+                .receipt
+                .evidence_refs
+                .contains_ref(self.tenant_isolation_ref);
+        let has_local_evidence = required_local_refs_bound && required_local_refs_carried;
         let needs_full_placement = matches!(
             self.requested_ack_floor,
             StorageIntentGuaranteeClass::FullPlacement
         );
 
-        has_local_evidence && (!needs_full_placement || self.placement_ref.is_bound())
+        has_local_evidence
+            && (!needs_full_placement
+                || (self.placement_ref.is_bound()
+                    && self.receipt.evidence_refs.contains_ref(self.placement_ref)))
     }
 
     /// Refusal reason carried by this envelope.
@@ -1084,6 +1111,36 @@ mod tests {
         assert!(!missing_local_intent.satisfies_requested_ack_floor());
         assert!(missing_placement.is_posix_durable_success());
         assert!(!missing_placement.satisfies_requested_ack_floor());
+    }
+
+    #[test]
+    fn requested_floor_receipt_fails_closed_without_shared_evidence_refs() {
+        let mut missing_shared_refs = LocalAckReceipt::durable_intent(
+            10,
+            LocalAckOperation::SyncWrite,
+            LocalAckReceiptTarget::inode(21),
+            None,
+        );
+        assert!(missing_shared_refs.satisfies_requested_ack_floor());
+        assert!(missing_shared_refs.local_intent_record_ref.is_bound());
+        missing_shared_refs.receipt.evidence_refs = StorageIntentEvidenceRefs::EMPTY;
+
+        assert!(missing_shared_refs.is_posix_durable_success());
+        assert!(!missing_shared_refs.satisfies_requested_ack_floor());
+
+        let mut missing_full_shared_refs = LocalAckReceipt::full_local_placement(
+            11,
+            LocalAckOperation::Fsync,
+            LocalAckReceiptTarget::inode(21),
+            None,
+        );
+        missing_full_shared_refs.requested_ack_floor = StorageIntentGuaranteeClass::FullPlacement;
+        assert!(missing_full_shared_refs.satisfies_requested_ack_floor());
+        assert!(missing_full_shared_refs.placement_ref.is_bound());
+        missing_full_shared_refs.receipt.evidence_refs = StorageIntentEvidenceRefs::EMPTY;
+
+        assert!(missing_full_shared_refs.is_posix_durable_success());
+        assert!(!missing_full_shared_refs.satisfies_requested_ack_floor());
     }
 
     #[test]
