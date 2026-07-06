@@ -2126,10 +2126,7 @@ mod tests {
 
         assert_eq!(record.media_class, StorageMediaClass::PersistentMemory);
         assert_eq!(record.persistence, MediaPersistenceDomain::PersistentMemory);
-        assert_eq!(
-            record.flush_ordering,
-            MediaFlushOrderingClass::FlushAndFua
-        );
+        assert_eq!(record.flush_ordering, MediaFlushOrderingClass::FlushAndFua);
         assert!(record
             .flags
             .contains_all(MediaCapabilityFlags::FLUSH_FUA_ORDERING));
