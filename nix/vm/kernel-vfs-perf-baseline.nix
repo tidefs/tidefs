@@ -39,7 +39,7 @@ let
 
     usage() {
       cat <<EOF
-Usage: tidefs-kmod-perf-baseline [--keep-tmp]
+Usage: tidefs-kmod-perf-baseline [--keep-tmp] [--self-test-parser]
 
 Kernel VFS throughput latency baseline.
 Boots Linux 7.0 QEMU, mounts kmod-posix-vfs in bootstrap mode, runs
@@ -47,6 +47,7 @@ sequential read/write throughput and stat latency measurements.
 
 Options:
   --keep-tmp           Do not remove temp directory on exit
+  --self-test-parser   Run parser fixtures without booting QEMU
   --help, -h           Show this message
 
 Exit codes:
@@ -57,9 +58,11 @@ EOF
     }
 
     KEEP_TMP=""
+    SELF_TEST_PARSER=0
     while [[ "$#" -gt 0 ]]; do
       case "$1" in
         --keep-tmp) KEEP_TMP=1; shift ;;
+        --self-test-parser) SELF_TEST_PARSER=1; shift ;;
         --help|-h) usage; exit 0 ;;
         *) echo "ERROR: unknown option: $1" >&2; usage >&2; exit 2 ;;
       esac
@@ -160,6 +163,66 @@ EOF
         VERDICT_EXIT=2
       fi
     }
+
+    expect_parser_verdict() {
+      local name="$1"
+      local expected_status="$2"
+      local expected_reason="$3"
+      local expected_exit="$4"
+
+      if [ "$VERDICT_STATUS" != "$expected_status" ] ||
+         [ "$VERDICT_REASON" != "$expected_reason" ] ||
+         [ "$VERDICT_EXIT" -ne "$expected_exit" ]; then
+        echo "parser self-test failed: $name" >&2
+        echo "  expected: $expected_status/$expected_reason/$expected_exit" >&2
+        echo "  actual:   $VERDICT_STATUS/$VERDICT_REASON/$VERDICT_EXIT" >&2
+        exit 1
+      fi
+    }
+
+    self_test_parser() {
+      local test_dir
+      test_dir="$(mktemp -d)"
+      trap 'rm -rf "$test_dir"' RETURN
+
+      : > "$test_dir/empty.log"
+      analyze_qemu_log "$test_dir/empty.log" 0
+      expect_parser_verdict empty-log BLOCKED empty_qemu_log 2
+
+      cat > "$test_dir/timeout.log" <<'EOF'
+=== TideFS Kernel VFS Throughput Latency Baseline ===
+kernel_version=7.0.0
+--- Phase 0: Module Load ---
+EOF
+      analyze_qemu_log "$test_dir/timeout.log" 124
+      expect_parser_verdict timeout-log BLOCKED qemu_timeout 2
+
+      cat > "$test_dir/missing-metrics.log" <<'EOF'
+PASS: insmod
+PASS: mount
+PASS: no_daemon
+EOF
+      analyze_qemu_log "$test_dir/missing-metrics.log" 0
+      expect_parser_verdict missing-metrics BLOCKED missing_required_metrics 2
+
+      cat > "$test_dir/pass.log" <<'EOF'
+PASS: insmod
+PASS: mount
+PASS: no_daemon
+write_throughput_MBps=10.00
+read_throughput_MBps=20.00
+stat_avg_latency_us=30
+EOF
+      analyze_qemu_log "$test_dir/pass.log" 0
+      expect_parser_verdict pass-log PASS complete 0
+
+      echo "parser self-test: ok"
+    }
+
+    if [ "$SELF_TEST_PARSER" -eq 1 ]; then
+      self_test_parser
+      exit 0
+    fi
 
     echo "=== TideFS Kernel VFS Throughput Latency Baseline ==="
     echo "  Kernel:    $KERNEL_IMG"
