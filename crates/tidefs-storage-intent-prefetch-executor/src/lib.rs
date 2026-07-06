@@ -2475,14 +2475,27 @@ fn terminal_update_refusal(update: PrefetchExecutorTerminalUpdate) -> StorageInt
 }
 
 fn terminal_result_detail_is_inconsistent(detail: PrefetchExecutorResultDetail) -> bool {
-    match detail
+    let has_impossible_byte_accounting = match detail
         .used_bytes
         .checked_add(detail.unused_bytes)
         .and_then(|accounted_bytes| accounted_bytes.checked_add(detail.expired_bytes))
     {
         Some(accounted_bytes) => accounted_bytes > detail.prefetched_bytes,
         None => true,
-    }
+    };
+
+    has_impossible_byte_accounting
+        || terminal_result_detail_has_inverted_disruption_percentiles(detail)
+}
+
+fn terminal_result_detail_has_inverted_disruption_percentiles(
+    detail: PrefetchExecutorResultDetail,
+) -> bool {
+    let p50 = detail.foreground_p50_disruption_us;
+    let p95 = detail.foreground_p95_disruption_us;
+    let p99 = detail.foreground_p99_disruption_us;
+
+    (p50 != 0 && p95 != 0 && p95 < p50) || (p95 != 0 && p99 != 0 && p99 < p95)
 }
 
 fn terminal_result_detail_lacks_feedback_evidence(
@@ -9556,6 +9569,102 @@ mod tests {
             PrefetchExecutorByteState::Blocked
         );
         assert_record_has_no_authority_claims(over_limit);
+    }
+
+    #[test]
+    fn terminal_update_rejects_inverted_foreground_disruption_percentiles() {
+        let started = evaluate_prefetch_execution(admitted_input(
+            PrefetchResidencyCandidateClass::BoundedReadahead,
+        ));
+
+        let p95_below_p50 = finalize_prefetch_execution(
+            started,
+            PrefetchExecutorTerminalUpdate {
+                outcome: PrefetchExecutorOutcome::Completed,
+                result_detail: PrefetchExecutorResultDetail {
+                    foreground_p50_disruption_us: 40,
+                    foreground_p95_disruption_us: 30,
+                    foreground_p99_disruption_us: 50,
+                    ..terminal_detail()
+                },
+                ..PrefetchExecutorTerminalUpdate::default()
+            },
+        );
+        assert_eq!(
+            p95_below_p50.outcome,
+            PrefetchExecutorOutcome::VerificationFailed
+        );
+        assert_eq!(
+            p95_below_p50.refusal,
+            StorageIntentRefusalReason::ValidationGateFailed
+        );
+        assert_eq!(
+            p95_below_p50.executor_byte_state,
+            PrefetchExecutorByteState::Refused
+        );
+        assert_record_has_no_authority_claims(p95_below_p50);
+
+        let p99_below_p95 = finalize_prefetch_execution(
+            started,
+            PrefetchExecutorTerminalUpdate {
+                outcome: PrefetchExecutorOutcome::Completed,
+                result_detail: PrefetchExecutorResultDetail {
+                    foreground_p50_disruption_us: 20,
+                    foreground_p95_disruption_us: 40,
+                    foreground_p99_disruption_us: 30,
+                    ..terminal_detail()
+                },
+                ..PrefetchExecutorTerminalUpdate::default()
+            },
+        );
+        assert_eq!(
+            p99_below_p95.outcome,
+            PrefetchExecutorOutcome::VerificationFailed
+        );
+        assert_eq!(
+            p99_below_p95.refusal,
+            StorageIntentRefusalReason::ValidationGateFailed
+        );
+        assert_eq!(
+            p99_below_p95.executor_byte_state,
+            PrefetchExecutorByteState::Refused
+        );
+        assert_record_has_no_authority_claims(p99_below_p95);
+    }
+
+    #[test]
+    fn terminal_update_allows_sparse_foreground_disruption_percentiles() {
+        let detail = PrefetchExecutorResultDetail {
+            foreground_p50_disruption_us: 20,
+            foreground_p95_disruption_us: 0,
+            foreground_p99_disruption_us: 40,
+            ..terminal_detail()
+        };
+        let started = evaluate_prefetch_execution(admitted_charged_input(
+            PrefetchResidencyCandidateClass::BoundedReadahead,
+            detail,
+        ));
+        assert_eq!(started.outcome, PrefetchExecutorOutcome::Started);
+
+        let result_ref = evidence(
+            StorageIntentEvidenceKind::ResultRefusalEvidence,
+            RESULT_REFUSAL,
+        );
+        let completed = finalize_prefetch_execution(
+            started,
+            PrefetchExecutorTerminalUpdate {
+                outcome: PrefetchExecutorOutcome::Completed,
+                result_detail: detail,
+                result_refusal_ref: result_ref,
+                evidence_cut: terminal_evidence_cut(started, detail, result_ref),
+                ..PrefetchExecutorTerminalUpdate::default()
+            },
+        );
+
+        assert_eq!(completed.outcome, PrefetchExecutorOutcome::Completed);
+        assert_eq!(completed.refusal, StorageIntentRefusalReason::None);
+        assert_eq!(completed.result_detail, detail);
+        assert_record_has_no_authority_claims(completed);
     }
 
     #[test]
