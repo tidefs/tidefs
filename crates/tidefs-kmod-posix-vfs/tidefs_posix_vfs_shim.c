@@ -4782,8 +4782,6 @@ static const struct inode_operations tidefs_posix_vfs_symlink_inode_operations =
 	.getattr    = tidefs_posix_vfs_getattr,
 	.listxattr  = tidefs_posix_vfs_listxattr,
 	.permission = tidefs_posix_vfs_permission,
-	.get_acl    = tidefs_posix_vfs_get_acl,
-	.set_acl    = tidefs_posix_vfs_set_acl,
 	.get_link   = tidefs_posix_vfs_get_link,
 	.setattr    = tidefs_posix_vfs_setattr,
 };
