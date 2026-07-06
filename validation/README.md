@@ -3,6 +3,18 @@
 This directory is for small, source-controlled validation fixtures such as
 golden binary records, seed inputs, and static compatibility samples.
 
+Committed files under `validation/artifacts/` have two allowed roles:
+
+- source-controlled fixtures, which are deterministic inputs or model outputs
+  kept for replay, compatibility, or schema checks; or
+- promoted evidence, which is runtime or tool output intentionally retained as
+  claim evidence.
+
+Promoted runtime evidence must carry a version-2 evidence artifact manifest
+with explicit provenance, including the producing source, run id, source ref,
+validation tier, outcome, residual risk, workspace-relative artifact path, and
+matching content digest.
+
 Runtime validation output must stay outside the repository, normally under:
 
 ```text
@@ -12,8 +24,11 @@ Runtime validation output must stay outside the repository, normally under:
 Do not create repo-local validation output, output indexes, promotion state, or
 policy surface here. A validation command may record commit, branch, dirty
 state, command, kernel, backend, and result in its external output directory,
-but those files are scratch state unless the operator explicitly requests a
-separate handoff outside this repository.
+but those files are scratch state until explicitly promoted as fixture or
+evidence. Committed artifact payloads and manifests must not embed scratch-only
+paths such as `/tmp/tidefs-validation/...` or
+`/root/ai/tmp/tidefs-validation/...` unless a documented fixture exception
+explains why the literal path is the value under test.
 
 ## Evidence Artifact Manifests
 

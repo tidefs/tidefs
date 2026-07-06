@@ -5,7 +5,7 @@
   "validation_tier": "mounted-userspace",
   "scope": "bounded mounted FUSE dirty-write admission queue-depth snapshot from QEMU Smoke fuse-vm-test run 27857392701; not scheduler-wide dirty-debt proof",
   "artifact_path": "validation/artifacts/performance/queue-depth-runtime.json",
-  "content_digest": "blake3:666ff0024fade0991cc395e4db7b2d19695a5f192e1871e946eec6f66696285c",
+  "content_digest": "blake3:4740f1bf1e3644ae68970ff546e872f8debee6c62d4da5ecf26f15f67badd98f",
   "run_id": "github-actions:27857392701/1",
   "source_ref": "0fb49f422c3a38c80041e331d7724ea77514e68e",
   "outcome": "pass",

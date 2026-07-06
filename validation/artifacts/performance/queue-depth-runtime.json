@@ -8,7 +8,7 @@
     "peak_dirty_ops": 4,
     "peak_outstanding_permits": 4
   },
-  "artifact_path": "/tmp/tidefs-validation/fuse-vm-test/performance/queue-depth-runtime.json",
+  "artifact_path": "validation/artifacts/performance/queue-depth-runtime.json",
   "claim_ids": [
     "perf.local.no_unbounded_dirty_debt.v1"
   ],

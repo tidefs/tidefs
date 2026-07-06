@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 use std::fs;
+use std::path::{Path, PathBuf};
 
 use tidefs_validation::evidence_artifact_manifest::{
     content_digest_for_bytes, parse_evidence_artifact_manifest_json, EvidenceArtifactManifest,
@@ -43,6 +44,69 @@ fn assert_failure_contains(
             .any(|failure| failure.contains(needle)),
         "expected failure containing `{needle}`, got {:?}",
         error.failures()
+    );
+}
+
+fn collect_committed_artifact_files(root: &Path, files: &mut Vec<PathBuf>) {
+    let mut entries = fs::read_dir(root)
+        .unwrap_or_else(|error| panic!("read {}: {error}", root.display()))
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap_or_else(|error| panic!("walk {}: {error}", root.display()));
+    entries.sort_by_key(|entry| entry.path());
+
+    for entry in entries {
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .unwrap_or_else(|error| panic!("stat {}: {error}", path.display()));
+        if file_type.is_dir() {
+            collect_committed_artifact_files(&path, files);
+        } else if file_type.is_file() {
+            files.push(path);
+        }
+    }
+}
+
+#[test]
+fn committed_validation_artifacts_do_not_embed_scratch_paths() {
+    const SCRATCH_PATH_NEEDLES: &[&[u8]] = &[
+        b"/tmp/tidefs-validation",
+        b"/root/ai/tmp/tidefs-validation",
+    ];
+
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("crate should live under crates/tidefs-validation");
+    let artifacts_root = repo_root.join("validation/artifacts");
+
+    let mut artifact_files = Vec::new();
+    collect_committed_artifact_files(&artifacts_root, &mut artifact_files);
+
+    let mut failures = Vec::new();
+    for path in artifact_files {
+        let bytes = fs::read(&path).unwrap_or_else(|error| {
+            panic!("read committed validation artifact {}: {error}", path.display())
+        });
+        for needle in SCRATCH_PATH_NEEDLES {
+            if bytes.windows(needle.len()).any(|window| window == *needle) {
+                let relative_path = path
+                    .strip_prefix(repo_root)
+                    .unwrap_or(&path)
+                    .display()
+                    .to_string();
+                failures.push(format!(
+                    "{relative_path} embeds scratch path `{}`",
+                    String::from_utf8_lossy(needle)
+                ));
+            }
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "committed validation artifacts must be fixtures or promoted evidence, not scratch output:\n{}",
+        failures.join("\n")
     );
 }
 
