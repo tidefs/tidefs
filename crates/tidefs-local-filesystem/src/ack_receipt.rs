@@ -157,6 +157,15 @@ impl LocalAckConvergenceState {
     pub const fn has_pending_full_placement(self) -> bool {
         matches!(self, Self::PendingFullPlacement | Self::Converging)
     }
+
+    /// True when this convergence state can satisfy the synchronous ack floor.
+    #[must_use]
+    pub const fn satisfies_ack_floor(self) -> bool {
+        matches!(
+            self,
+            Self::Satisfied | Self::PendingFullPlacement | Self::Converging
+        )
+    }
 }
 
 /// Local receipt envelope that preserves issue #842 evidence refs.
@@ -496,12 +505,7 @@ impl LocalAckReceipt {
         self.is_posix_durable_success()
             && self.refusal_reason() == StorageIntentRefusalReason::None
             && self.has_requested_ack_floor_evidence()
-            && matches!(
-                self.convergence,
-                LocalAckConvergenceState::Satisfied
-                    | LocalAckConvergenceState::PendingFullPlacement
-                    | LocalAckConvergenceState::Converging
-            )
+            && self.convergence.satisfies_ack_floor()
             && evaluate_receipt_against_policy(
                 local_ack_policy(self.requested_ack_floor),
                 self.receipt,
@@ -1068,6 +1072,33 @@ mod tests {
         assert!(!missing_local_intent.satisfies_requested_ack_floor());
         assert!(missing_placement.is_posix_durable_success());
         assert!(!missing_placement.satisfies_requested_ack_floor());
+    }
+
+    #[test]
+    fn requested_floor_receipt_fails_closed_for_blocked_convergence() {
+        let blocked_states = [
+            LocalAckConvergenceState::DegradedVisible,
+            LocalAckConvergenceState::Unknown,
+            LocalAckConvergenceState::Blocked,
+            LocalAckConvergenceState::Refused,
+        ];
+
+        for (offset, state) in blocked_states.into_iter().enumerate() {
+            let mut receipt = LocalAckReceipt::durable_intent(
+                10 + u64::try_from(offset).expect("small state index"),
+                LocalAckOperation::Fsync,
+                LocalAckReceiptTarget::inode(23),
+                None,
+            );
+
+            assert!(receipt.satisfies_requested_ack_floor());
+            assert!(!state.satisfies_ack_floor());
+
+            receipt.convergence = state;
+            assert!(receipt.is_posix_durable_success());
+            assert_eq!(receipt.refusal_reason(), StorageIntentRefusalReason::None);
+            assert!(!receipt.satisfies_requested_ack_floor());
+        }
     }
 
     #[test]
