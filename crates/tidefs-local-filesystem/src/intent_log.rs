@@ -2255,7 +2255,7 @@ mod tests {
             timestamp_ns: test_timestamp(),
         };
 
-        let bytes = encode_intent_log_entry(&entry);
+        let bytes = try_encode_intent_log_entry(&entry).expect("encode");
         let decoded = decode_intent_log_entry(&bytes).expect("decode");
         match &decoded.entry_kind {
             IntentLogEntryKind::MetadataSetattrIntent(decoded_inode) => {
