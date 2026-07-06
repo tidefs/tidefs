@@ -1,0 +1,16 @@
+{
+  "manifest_version": 2,
+  "claim_id": "ublk.started_export.live_service_loop.v1",
+  "evidence_class": "runtime-ublk-started-export-admission-artifact",
+  "validation_tier": "qemu-guest",
+  "scope": "bounded runtime uBLK started-export admission trace covering host preflight, control open, ADD_DEV, SET_PARAMS, data-queue open, FETCH_REQ queue/tag coverage, START_DEV, daemon service-loop ownership, first serviced request, and DEL_DEV cleanup",
+  "artifact_path": "validation/artifacts/ublk/started-export-admission-runtime.json",
+  "content_digest": "blake3:133b79902a48e95332591f37cadb3d47747e489068cfa2f5f96c0eafdf49fd1f",
+  "run_id": "qemu-ublk-smoke:2026-06-20T23:35:01+02:00",
+  "source_ref": "209a4796c0663f791050f6ac8fba09cd83a70f13",
+  "outcome": "pass",
+  "residual_risk": "This runtime artifact does not cover fio workload breadth, mkfs or mount acceptance, online resize, crash durability, production block-device readiness, multi-queue scaling, capacity sizing, persistent identity, or userspace recovery.",
+  "source": "qemu-ublk-smoke",
+  "generated_at": "2026-06-20T23:35:01+02:00",
+  "blocking_issues": []
+}

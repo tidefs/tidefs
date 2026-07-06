@@ -1,0 +1,16 @@
+{
+  "manifest_version": 2,
+  "claim_id": "ublk.started_export.live_service_loop.v1",
+  "evidence_class": "runtime-ublk-completion-artifact",
+  "validation_tier": "qemu-guest",
+  "scope": "focused runtime uBLK qid/tag completion lifecycle trace consumed by the started-export live service-loop claim, with one hardware queue, queue depth 2, and five completed requests through read, write, flush, discard, and write-zeroes transitions",
+  "artifact_path": "validation/artifacts/ublk/qid-tag-completion-runtime.json",
+  "content_digest": "blake3:a7499077cc52525623985b459ef617500b28ac207b4d26ca3258ee524fc5d302",
+  "run_id": "qemu-ublk-smoke:2026-06-15T19:36:58+02:00",
+  "source_ref": "d03788ddafe1f46a8ab4fdfdff084959026bcdaf",
+  "outcome": "pass",
+  "residual_risk": "This runtime artifact does not cover fio workload breadth, mkfs or mount acceptance, online resize, crash durability, production block-device readiness, broader uBLK ABI behavior, or multi-queue scaling.",
+  "source": "qemu-ublk-smoke",
+  "generated_at": "2026-06-15T19:36:58+02:00",
+  "blocking_issues": []
+}

@@ -69,10 +69,8 @@ fn collect_committed_artifact_files(root: &Path, files: &mut Vec<PathBuf>) {
 
 #[test]
 fn committed_validation_artifacts_do_not_embed_scratch_paths() {
-    const SCRATCH_PATH_NEEDLES: &[&[u8]] = &[
-        b"/tmp/tidefs-validation",
-        b"/root/ai/tmp/tidefs-validation",
-    ];
+    const SCRATCH_PATH_NEEDLES: &[&[u8]] =
+        &[b"/tmp/tidefs-validation", b"/root/ai/tmp/tidefs-validation"];
 
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -86,7 +84,10 @@ fn committed_validation_artifacts_do_not_embed_scratch_paths() {
     let mut failures = Vec::new();
     for path in artifact_files {
         let bytes = fs::read(&path).unwrap_or_else(|error| {
-            panic!("read committed validation artifact {}: {error}", path.display())
+            panic!(
+                "read committed validation artifact {}: {error}",
+                path.display()
+            )
         });
         for needle in SCRATCH_PATH_NEEDLES {
             if bytes.windows(needle.len()).any(|window| window == *needle) {
