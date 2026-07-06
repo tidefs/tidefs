@@ -28,6 +28,14 @@ let
     TMPDIR="''${TIDEFS_PERF_TMPDIR:-/tmp/tidefs-kmod-perf-baseline}"
     QEMU_MEM="''${TIDEFS_PERF_QEMU_MEM:-512M}"
     TIMEOUT_SEC=600
+    SOURCE_DIR="''${TIDEFS_SOURCE_DIR:-}"
+    if [ -z "$SOURCE_DIR" ]; then
+      SOURCE_DIR="''${TIDEFS_REPO_ROOT:-}"
+    fi
+    if [ -z "$SOURCE_DIR" ]; then
+      SOURCE_DIR="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+    fi
+    SOURCE_COMMIT="''${TIDEFS_SOURCE_COMMIT:-}"
 
     usage() {
       cat <<EOF
@@ -70,11 +78,19 @@ EOF
     }
 
     git_dirty_json_bool() {
-      if git -C /root/tidefs rev-parse --is-inside-work-tree >/dev/null 2>&1 &&
-         [ -z "$(git -C /root/tidefs status --porcelain --untracked-files=normal 2>/dev/null)" ]; then
+      if git -C "$SOURCE_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1 &&
+         [ -z "$(git -C "$SOURCE_DIR" status --porcelain --untracked-files=normal 2>/dev/null)" ]; then
         echo false
       else
         echo true
+      fi
+    }
+
+    git_commit_value() {
+      if [ -n "$SOURCE_COMMIT" ]; then
+        echo "$SOURCE_COMMIT"
+      else
+        git -C "$SOURCE_DIR" rev-parse HEAD 2>/dev/null || echo unknown
       fi
     }
 
@@ -411,7 +427,7 @@ INITSCRIPT
   "fail": $FAIL_COUNT,
   "blocked": $BLOCKED_COUNT,
   "skip": $SKIP_COUNT,
-  "commit": "$(cd /root/tidefs && git rev-parse HEAD 2>/dev/null || echo unknown)",
+  "commit": "$(git_commit_value)",
   "worktree_dirty": $(git_dirty_json_bool),
   "module_source": "configured external module path",
   "status": "$VERDICT_STATUS",
