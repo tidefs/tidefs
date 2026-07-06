@@ -29,7 +29,12 @@ count_log_prefix() {
 }
 
 first_log_value() {
-  awk -F= -v key="$2" '$1 == key { print $2; exit }' "$1" 2>/dev/null || true
+  awk -F= -v key="$2" '{
+    lhs = $1
+    sub(/^[[:space:]]+/, "", lhs)
+    sub(/[[:space:]]+$/, "", lhs)
+    if (lhs == key) { print $2; exit }
+  }' "$1" 2>/dev/null || true
 }
 
 is_positive_number() {
@@ -176,9 +181,9 @@ EOF
 PASS: insmod
 PASS: mount
 PASS: no_daemon
-write_throughput_MBps=10.00
-read_throughput_MBps=20.00
-stat_avg_us=30
+  write_throughput_MBps=10.00
+  read_throughput_MBps=20.00
+  stat_avg_us=30
 EOF
   analyze_qemu_log "$test_dir/pass.log" 0
   expect_parser_verdict pass-log PASS complete 0
