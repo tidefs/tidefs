@@ -57,6 +57,94 @@ EOF
       esac
     done
 
+    count_log_prefix() {
+      awk -v prefix="$2" 'index($0, prefix) == 1 { n++ } END { print n + 0 }' "$1" 2>/dev/null || echo 0
+    }
+
+    first_log_value() {
+      awk -F= -v key="$2" '$1 == key { print $2; exit }' "$1" 2>/dev/null || true
+    }
+
+    is_positive_number() {
+      awk -v n="$1" 'BEGIN { exit !(n ~ /^[0-9]+([.][0-9]+)?$/ && n > 0) }'
+    }
+
+    git_dirty_json_bool() {
+      if git -C /root/tidefs rev-parse --is-inside-work-tree >/dev/null 2>&1 &&
+         [ -z "$(git -C /root/tidefs status --porcelain --untracked-files=normal 2>/dev/null)" ]; then
+        echo false
+      else
+        echo true
+      fi
+    }
+
+    analyze_qemu_log() {
+      local log_file="$1"
+      local qemu_exit="$2"
+
+      PASS_COUNT=$(count_log_prefix "$log_file" "PASS:")
+      FAIL_COUNT=$(count_log_prefix "$log_file" "FAIL:")
+      BLOCKED_COUNT=$(count_log_prefix "$log_file" "BLOCKED:")
+      SKIP_COUNT=$(count_log_prefix "$log_file" "SKIP:")
+
+      WRITE_TP=$(first_log_value "$log_file" "write_throughput_MBps")
+      READ_TP=$(first_log_value "$log_file" "read_throughput_MBps")
+      STAT_LAT=$(first_log_value "$log_file" "stat_avg_latency_us")
+
+      WRITE_TP_VAL="''${WRITE_TP:-0}"
+      READ_TP_VAL="''${READ_TP:-0}"
+      STAT_LAT_VAL="''${STAT_LAT:-0}"
+
+      QEMU_SUCCESS=false
+      QEMU_TIMED_OUT=false
+      LOG_EMPTY=false
+      REQUIRED_METRICS_PRESENT=false
+      VERDICT_STATUS=PASS
+      VERDICT_REASON=complete
+      VERDICT_EXIT=0
+
+      [ "$qemu_exit" -eq 0 ] && QEMU_SUCCESS=true
+      if [ "$qemu_exit" -eq 124 ] || [ "$qemu_exit" -eq 137 ]; then
+        QEMU_TIMED_OUT=true
+      fi
+      [ ! -s "$log_file" ] && LOG_EMPTY=true
+
+      if is_positive_number "$WRITE_TP_VAL" &&
+         is_positive_number "$READ_TP_VAL" &&
+         is_positive_number "$STAT_LAT_VAL"; then
+        REQUIRED_METRICS_PRESENT=true
+      fi
+
+      if [ "$qemu_exit" -ne 0 ]; then
+        VERDICT_STATUS=BLOCKED
+        VERDICT_REASON=qemu_exit_$qemu_exit
+        VERDICT_EXIT=2
+        if [ "$QEMU_TIMED_OUT" = true ]; then
+          VERDICT_REASON=qemu_timeout
+        fi
+      elif [ "$LOG_EMPTY" = true ]; then
+        VERDICT_STATUS=BLOCKED
+        VERDICT_REASON=empty_qemu_log
+        VERDICT_EXIT=2
+      elif [ "$PASS_COUNT" -eq 0 ]; then
+        VERDICT_STATUS=BLOCKED
+        VERDICT_REASON=zero_pass_rows
+        VERDICT_EXIT=2
+      elif [ "$FAIL_COUNT" -gt 0 ]; then
+        VERDICT_STATUS=FAIL
+        VERDICT_REASON=fail_rows
+        VERDICT_EXIT=1
+      elif [ "$BLOCKED_COUNT" -gt 0 ]; then
+        VERDICT_STATUS=BLOCKED
+        VERDICT_REASON=blocked_rows
+        VERDICT_EXIT=2
+      elif [ "$REQUIRED_METRICS_PRESENT" != true ]; then
+        VERDICT_STATUS=BLOCKED
+        VERDICT_REASON=missing_required_metrics
+        VERDICT_EXIT=2
+      fi
+    }
+
     echo "=== TideFS Kernel VFS Throughput Latency Baseline ==="
     echo "  Kernel:    $KERNEL_IMG"
     echo "  QEMU:      $QEMU_BIN"
@@ -280,6 +368,8 @@ INITSCRIPT
     (cd "$RUN_DIR" && find . | cpio -o -H newc) | gzip > "$RUN_DIR/initramfs.gz"
 
     echo "--- Booting QEMU ---"
+    QEMU_EXIT=0
+    set +e
     timeout "$TIMEOUT_SEC" "$QEMU_BIN" \
       -kernel "$KERNEL_IMG" \
       -initrd "$RUN_DIR/initramfs.gz" \
@@ -287,28 +377,19 @@ INITSCRIPT
       -nographic \
       -m "$QEMU_MEM" \
       -no-reboot \
-      2>&1 | tee "$RUN_DIR/qemu.log" || true
+      2>&1 | tee "$RUN_DIR/qemu.log"
+    QEMU_EXIT="''${PIPESTATUS[0]}"
+    set -e
 
-    echo "--- QEMU exited ---"
-    PASS_COUNT=$(grep -c "^PASS:" "$RUN_DIR/qemu.log" 2>/dev/null || echo 0)
-    FAIL_COUNT=$(grep -c "^FAIL:" "$RUN_DIR/qemu.log" 2>/dev/null || echo 0)
-    BLOCKED_COUNT=$(grep -c "^BLOCKED:" "$RUN_DIR/qemu.log" 2>/dev/null || echo 0)
-    SKIP_COUNT=$(grep -c "^SKIP:" "$RUN_DIR/qemu.log" 2>/dev/null || echo 0)
+    echo "--- QEMU exited with code $QEMU_EXIT ---"
+    analyze_qemu_log "$RUN_DIR/qemu.log" "$QEMU_EXIT"
 
     echo "PASS: $PASS_COUNT  FAIL: $FAIL_COUNT  BLOCKED: $BLOCKED_COUNT  SKIP: $SKIP_COUNT"
-
-    # Extract throughput/latency values from log
-    WRITE_TP=$(grep "write_throughput_MBps=" "$RUN_DIR/qemu.log" 2>/dev/null | cut -d= -f2 | head -1)
-    READ_TP=$(grep "read_throughput_MBps=" "$RUN_DIR/qemu.log" 2>/dev/null | cut -d= -f2 | head -1)
-    STAT_LAT=$(grep "stat_avg_latency_us=" "$RUN_DIR/qemu.log" 2>/dev/null | cut -d= -f2 | head -1)
+    echo "QEMU success: $QEMU_SUCCESS  Required metrics: $REQUIRED_METRICS_PRESENT  Verdict: $VERDICT_STATUS ($VERDICT_REASON)"
 
     OUTPUT_DIR="/root/ai/tmp/tidefs-validation/kernel-vfs-perf-baseline/$(date -u +%Y-%m-%dT%H%M%SZ)"
     mkdir -p "$OUTPUT_DIR"
     cp "$RUN_DIR/qemu.log" "$OUTPUT_DIR/qemu.log"
-
-    WRITE_TP_VAL="''${WRITE_TP:-0}"
-    READ_TP_VAL="''${READ_TP:-0}"
-    STAT_LAT_VAL="''${STAT_LAT:-0}"
 
     cat > "$OUTPUT_DIR/validation-manifest.json" << MANIFEST
 {
@@ -316,6 +397,11 @@ INITSCRIPT
   "date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
   "mode": "bootstrap",
   "validation_tier": "Tier 5 mounted Linux 7.0 kernel VFS",
+  "qemu_exit": $QEMU_EXIT,
+  "qemu_success": $QEMU_SUCCESS,
+  "qemu_timed_out": $QEMU_TIMED_OUT,
+  "log_empty": $LOG_EMPTY,
+  "required_metrics_present": $REQUIRED_METRICS_PRESENT,
   "metrics": {
     "write_throughput_MBps": "$WRITE_TP_VAL",
     "read_throughput_MBps": "$READ_TP_VAL",
@@ -326,21 +412,15 @@ INITSCRIPT
   "blocked": $BLOCKED_COUNT,
   "skip": $SKIP_COUNT,
   "commit": "$(cd /root/tidefs && git rev-parse HEAD 2>/dev/null || echo unknown)",
-  "worktree_dirty": true,
+  "worktree_dirty": $(git_dirty_json_bool),
   "module_source": "configured external module path",
-  "result": "kernel VFS throughput latency baseline: write $WRITE_TP_VAL MB/s, read $READ_TP_VAL MB/s, stat $STAT_LAT_VAL us avg latency"
+  "status": "$VERDICT_STATUS",
+  "result": "kernel VFS throughput latency baseline $VERDICT_STATUS: $VERDICT_REASON; write $WRITE_TP_VAL MB/s, read $READ_TP_VAL MB/s, stat $STAT_LAT_VAL us avg latency"
 }
 MANIFEST
 
     echo "Validation output directory: $OUTPUT_DIR"
-
-    if [ "$FAIL_COUNT" -gt 0 ]; then
-      exit 1
-    fi
-    if [ "$BLOCKED_COUNT" -gt 0 ] && [ "$PASS_COUNT" -eq 0 ]; then
-      exit 2
-    fi
-    exit 0
+    exit "$VERDICT_EXIT"
   '';
 in
   kmodPerfScript

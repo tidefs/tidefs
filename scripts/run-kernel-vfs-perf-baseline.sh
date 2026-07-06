@@ -22,6 +22,150 @@ TMPDIR="${TIDEFS_KERNEL_PERF_TMPDIR:-/tmp/tidefs-kernel-perf-baseline}"
 TIMEOUT_SEC="${TIDEFS_KERNEL_PERF_TIMEOUT:-600}"
 
 KEEP_TMP=0
+SELF_TEST_PARSER=0
+
+count_log_prefix() {
+  awk -v prefix="$2" 'index($0, prefix) == 1 { n++ } END { print n + 0 }' "$1" 2>/dev/null || echo 0
+}
+
+first_log_value() {
+  awk -F= -v key="$2" '$1 == key { print $2; exit }' "$1" 2>/dev/null || true
+}
+
+is_positive_number() {
+  awk -v n="$1" 'BEGIN { exit !(n ~ /^[0-9]+([.][0-9]+)?$/ && n > 0) }'
+}
+
+git_dirty_json_bool() {
+  if git -C "$REPO_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1 &&
+     [ -z "$(git -C "$REPO_ROOT" status --porcelain --untracked-files=normal 2>/dev/null)" ]; then
+    echo false
+  else
+    echo true
+  fi
+}
+
+analyze_qemu_log() {
+  local log_file="$1"
+  local qemu_exit="$2"
+
+  PASS_COUNT=$(count_log_prefix "$log_file" "PASS:")
+  FAIL_COUNT=$(count_log_prefix "$log_file" "FAIL:")
+  BLOCKED_COUNT=$(count_log_prefix "$log_file" "BLOCKED:")
+
+  WD=$(first_log_value "$log_file" "write_duration_ms")
+  RD=$(first_log_value "$log_file" "read_duration_ms")
+  WTP=$(first_log_value "$log_file" "write_throughput_MBps")
+  RTP=$(first_log_value "$log_file" "read_throughput_MBps")
+  SU=$(first_log_value "$log_file" "stat_avg_us")
+
+  WD="${WD:-0}"
+  RD="${RD:-0}"
+  WTP="${WTP:-0}"
+  RTP="${RTP:-0}"
+  SU="${SU:-0}"
+
+  QEMU_SUCCESS=false
+  QEMU_TIMED_OUT=false
+  LOG_EMPTY=false
+  REQUIRED_METRICS_PRESENT=false
+  VERDICT_STATUS=PASS
+  VERDICT_REASON=complete
+  VERDICT_EXIT=0
+
+  [ "$qemu_exit" -eq 0 ] && QEMU_SUCCESS=true
+  if [ "$qemu_exit" -eq 124 ] || [ "$qemu_exit" -eq 137 ]; then
+    QEMU_TIMED_OUT=true
+  fi
+  [ ! -s "$log_file" ] && LOG_EMPTY=true
+
+  if is_positive_number "$WTP" && is_positive_number "$RTP" && is_positive_number "$SU"; then
+    REQUIRED_METRICS_PRESENT=true
+  fi
+
+  if [ "$qemu_exit" -ne 0 ]; then
+    VERDICT_STATUS=BLOCKED
+    VERDICT_REASON=qemu_exit_$qemu_exit
+    VERDICT_EXIT=2
+    if [ "$QEMU_TIMED_OUT" = true ]; then
+      VERDICT_REASON=qemu_timeout
+    fi
+  elif [ "$LOG_EMPTY" = true ]; then
+    VERDICT_STATUS=BLOCKED
+    VERDICT_REASON=empty_qemu_log
+    VERDICT_EXIT=2
+  elif [ "$PASS_COUNT" -eq 0 ]; then
+    VERDICT_STATUS=BLOCKED
+    VERDICT_REASON=zero_pass_rows
+    VERDICT_EXIT=2
+  elif [ "$FAIL_COUNT" -gt 0 ]; then
+    VERDICT_STATUS=FAIL
+    VERDICT_REASON=fail_rows
+    VERDICT_EXIT=1
+  elif [ "$BLOCKED_COUNT" -gt 0 ]; then
+    VERDICT_STATUS=BLOCKED
+    VERDICT_REASON=blocked_rows
+    VERDICT_EXIT=2
+  elif [ "$REQUIRED_METRICS_PRESENT" != true ]; then
+    VERDICT_STATUS=BLOCKED
+    VERDICT_REASON=missing_required_metrics
+    VERDICT_EXIT=2
+  fi
+}
+
+expect_parser_verdict() {
+  local name="$1"
+  local want_status="$2"
+  local want_reason="$3"
+  local want_exit="$4"
+
+  if [ "$VERDICT_STATUS" != "$want_status" ] ||
+     [ "$VERDICT_REASON" != "$want_reason" ] ||
+     [ "$VERDICT_EXIT" -ne "$want_exit" ]; then
+    echo "parser self-test failed for $name: got status=$VERDICT_STATUS reason=$VERDICT_REASON exit=$VERDICT_EXIT" >&2
+    echo "expected status=$want_status reason=$want_reason exit=$want_exit" >&2
+    exit 1
+  fi
+}
+
+self_test_parser() {
+  local test_dir
+  test_dir="$(mktemp -d)"
+  trap 'rm -rf "$test_dir"' RETURN
+
+  : > "$test_dir/empty.log"
+  analyze_qemu_log "$test_dir/empty.log" 0
+  expect_parser_verdict empty-log BLOCKED empty_qemu_log 2
+
+  cat > "$test_dir/timeout.log" <<'EOF'
+=== TideFS Kernel VFS Throughput Latency Baseline ===
+kernel=7.0.0
+--- Phase 0: Module Load ---
+EOF
+  analyze_qemu_log "$test_dir/timeout.log" 124
+  expect_parser_verdict timeout-log BLOCKED qemu_timeout 2
+
+  cat > "$test_dir/missing-metrics.log" <<'EOF'
+PASS: insmod
+PASS: mount
+PASS: no_daemon
+EOF
+  analyze_qemu_log "$test_dir/missing-metrics.log" 0
+  expect_parser_verdict missing-metrics BLOCKED missing_required_metrics 2
+
+  cat > "$test_dir/pass.log" <<'EOF'
+PASS: insmod
+PASS: mount
+PASS: no_daemon
+write_throughput_MBps=10.00
+read_throughput_MBps=20.00
+stat_avg_us=30
+EOF
+  analyze_qemu_log "$test_dir/pass.log" 0
+  expect_parser_verdict pass-log PASS complete 0
+
+  echo "parser self-test: ok"
+}
 
 usage() {
   cat <<EOF
@@ -35,6 +179,7 @@ Validation output directory:
 Options:
   --keep-tmp         Do not remove temp directory on exit
   --timeout SECONDS  QEMU boot timeout (default: $TIMEOUT_SEC)
+  --self-test-parser Run parser fixtures without booting QEMU
   --help, -h         Show this message
 
 Exit codes:
@@ -48,10 +193,16 @@ while [ "$#" -gt 0 ]; do
   case "$1" in
     --keep-tmp) KEEP_TMP=1; shift ;;
     --timeout) TIMEOUT_SEC="$2"; shift 2 ;;
+    --self-test-parser) SELF_TEST_PARSER=1; shift ;;
     --help|-h) usage; exit 0 ;;
     *) echo "Unknown option: $1"; usage >&2; exit 2 ;;
   esac
 done
+
+if [ "$SELF_TEST_PARSER" -eq 1 ]; then
+  self_test_parser
+  exit 0
+fi
 
 # ---- Dependency resolution -------------------------------------------
 
@@ -248,7 +399,7 @@ mkdir -p "$RUN_DIR_VALIDATION"
 cat > "$RUN_DIR_VALIDATION/environment.txt" << ENVEOF
 timestamp=$RUN_ID
 commit=$(cd "$REPO_ROOT" && git rev-parse HEAD 2>/dev/null || echo unknown)
-dirty=true
+dirty=$(git_dirty_json_bool)
 kernel_img=$KERNEL_IMG
 module_ko=$MODULE_KO
 qemu_bin=$QEMU_BIN
@@ -279,15 +430,7 @@ echo "  QEMU exit: $QEMU_EXIT"
 
 # ---- Extract results -------------------------------------------------
 
-PASS_COUNT=$(grep -c "^PASS:" "$RUN_LOG" 2>/dev/null || echo 0)
-FAIL_COUNT=$(grep -c "^FAIL:" "$RUN_LOG" 2>/dev/null || echo 0)
-BLOCKED_COUNT=$(grep -c "^BLOCKED:" "$RUN_LOG" 2>/dev/null || echo 0)
-
-WD=$(grep "write_duration_ms=" "$RUN_LOG" 2>/dev/null | cut -d= -f2 | head -1 || echo "0")
-RD=$(grep "read_duration_ms=" "$RUN_LOG" 2>/dev/null | cut -d= -f2 | head -1 || echo "0")
-WTP=$(grep "write_throughput_MBps=" "$RUN_LOG" 2>/dev/null | cut -d= -f2 | head -1 || echo "0")
-RTP=$(grep "read_throughput_MBps=" "$RUN_LOG" 2>/dev/null | cut -d= -f2 | head -1 || echo "0")
-SU=$(grep "stat_avg_us=" "$RUN_LOG" 2>/dev/null | cut -d= -f2 | head -1 || echo "0")
+analyze_qemu_log "$RUN_LOG" "$QEMU_EXIT"
 
 echo ""
 echo "=== Results ==="
@@ -297,6 +440,9 @@ echo "  BLOCKED: $BLOCKED_COUNT"
 echo "  Write:  ${WD}ms (${WTP} MB/s)"
 echo "  Read:   ${RD}ms (${RTP} MB/s)"
 echo "  Stat:   ${SU}us avg"
+echo "  QEMU success: $QEMU_SUCCESS"
+echo "  Required metrics: $REQUIRED_METRICS_PRESENT"
+echo "  Verdict reason: $VERDICT_REASON"
 
 # ---- Validation manifest -----------------------------------------------
 
@@ -307,6 +453,11 @@ cat > "$RUN_DIR_VALIDATION/validation-manifest.json" << MANIFEST
   "mode": "bootstrap",
   "validation_tier": "Tier 5 mounted Linux 7.0 kernel VFS",
   "qemu_accel": "$(test -e /dev/kvm && echo kvm || echo tcg)",
+  "qemu_exit": $QEMU_EXIT,
+  "qemu_success": $QEMU_SUCCESS,
+  "qemu_timed_out": $QEMU_TIMED_OUT,
+  "log_empty": $LOG_EMPTY,
+  "required_metrics_present": $REQUIRED_METRICS_PRESENT,
   "metrics": {
     "write_duration_ms": "${WD}",
     "read_duration_ms": "${RD}",
@@ -318,9 +469,10 @@ cat > "$RUN_DIR_VALIDATION/validation-manifest.json" << MANIFEST
   "fail": $FAIL_COUNT,
   "blocked": $BLOCKED_COUNT,
   "commit": "$(cd "$REPO_ROOT" && git rev-parse HEAD 2>/dev/null || echo unknown)",
-  "worktree_dirty": true,
+  "worktree_dirty": $(git_dirty_json_bool),
   "module_source": "configured external module path",
-  "result": "kernel VFS perf baseline: write=${WD}ms (${WTP}MB/s) read=${RD}ms (${RTP}MB/s) stat=${SU}us"
+  "status": "$VERDICT_STATUS",
+  "result": "kernel VFS perf baseline $VERDICT_STATUS: $VERDICT_REASON; write=${WD}ms (${WTP}MB/s) read=${RD}ms (${RTP}MB/s) stat=${SU}us"
 }
 MANIFEST
 
@@ -330,13 +482,5 @@ ls -la "$RUN_DIR_VALIDATION/"
 
 # ---- Verdict ---------------------------------------------------------
 
-if [ "$BLOCKED_COUNT" -gt 0 ] && [ "$PASS_COUNT" -eq 0 ]; then
-  echo "  Verdict: BLOCKED (all phases blocked)"
-  exit 2
-elif [ "$FAIL_COUNT" -gt 0 ]; then
-  echo "  Verdict: FAIL ($FAIL_COUNT failures)"
-  exit 1
-else
-  echo "  Verdict: PASS"
-  exit 0
-fi
+echo "  Verdict: $VERDICT_STATUS ($VERDICT_REASON)"
+exit "$VERDICT_EXIT"
