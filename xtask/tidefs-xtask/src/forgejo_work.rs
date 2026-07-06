@@ -149,14 +149,11 @@ fn check_foreground_main_claim(repo_root: &Path) -> Result<(), ForgejoWorkError>
 // ---------------------------------------------------------------------------
 
 pub fn check_stale_claims_current_workspace() -> Result<(), ForgejoWorkError> {
-    Err(ForgejoWorkError {
-        violations: vec![
-            "check-stale-claims is no longer supported: the legacy Forgejo claim tracker has been \
-             retired. Stale-work coordination is now managed through GitHub issues, pull requests, \
-             and the current Codex Nexus controller."
-                .to_string(),
-        ],
-    })
+    Err(retired_forgejo_command_error(
+        "check-stale-claims",
+        "Stale-work coordination is now managed through GitHub issues, pull requests, and the \
+         current Codex Nexus controller.",
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -164,14 +161,11 @@ pub fn check_stale_claims_current_workspace() -> Result<(), ForgejoWorkError> {
 // ---------------------------------------------------------------------------
 
 pub fn check_duplicate_claims_current_workspace() -> Result<(), ForgejoWorkError> {
-    Err(ForgejoWorkError {
-        violations: vec![
-            "check-duplicate-claims is no longer supported: the legacy Forgejo claim tracker has \
-             been retired. Duplicate-work coordination is now managed through GitHub issues, pull \
-             requests, and the current Codex Nexus controller."
-                .to_string(),
-        ],
-    })
+    Err(retired_forgejo_command_error(
+        "check-duplicate-claims",
+        "Duplicate-work coordination is now managed through GitHub issues, pull requests, and the \
+         current Codex Nexus controller.",
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -253,14 +247,11 @@ pub fn check_abandoned_worktrees_current_workspace() -> Result<(), ForgejoWorkEr
 // ---------------------------------------------------------------------------
 
 pub fn auto_release_stale_claims() -> Result<(), ForgejoWorkError> {
-    Err(ForgejoWorkError {
-        violations: vec![
-            "auto-release-stale-claims is no longer supported: the legacy Forgejo claim tracker \
-             has been retired. Stale-claim release is now managed through GitHub issue state and \
-             the current Codex Nexus controller."
-                .to_string(),
-        ],
-    })
+    Err(retired_forgejo_command_error(
+        "auto-release-stale-claims",
+        "Stale-claim release is now managed through GitHub issue state and the current Codex Nexus \
+         controller.",
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -268,14 +259,11 @@ pub fn auto_release_stale_claims() -> Result<(), ForgejoWorkError> {
 // ---------------------------------------------------------------------------
 
 pub fn print_coordination_health_report() -> Result<(), ForgejoWorkError> {
-    Err(ForgejoWorkError {
-        violations: vec![
-            "coordination-health is no longer supported: the legacy Forgejo claim tracker has been \
-             retired. Coordination health is now reported through GitHub Actions CI posture, \
-             Codex Nexus dashboard state, and live GitHub issue/PR state."
-                .to_string(),
-        ],
-    })
+    Err(retired_forgejo_command_error(
+        "coordination-health",
+        "Coordination health is now reported through GitHub Actions CI posture, Codex Nexus \
+         dashboard state, and live GitHub issue/PR state.",
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -283,12 +271,11 @@ pub fn print_coordination_health_report() -> Result<(), ForgejoWorkError> {
 // ---------------------------------------------------------------------------
 
 pub fn acquire_claim(_issue_num: u64) -> Result<bool, String> {
-    Err(
-        "acquire-claim is no longer supported: the legacy Forgejo claim tracker has been retired. \
-         Issue claim is now managed through GitHub issue assignment and the current Codex Nexus \
-         worker pool."
-            .to_string(),
-    )
+    Err(retired_forgejo_command_message(
+        "acquire-claim",
+        "Issue claim is now managed through GitHub issue assignment and the current Codex Nexus \
+         worker pool.",
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -301,6 +288,19 @@ fn home_dir() -> Result<PathBuf, ForgejoWorkError> {
         .map_err(|_| ForgejoWorkError {
             violations: vec!["cannot determine home directory ($HOME not set)".to_string()],
         })
+}
+
+fn retired_forgejo_command_error(command: &str, current_authority: &str) -> ForgejoWorkError {
+    ForgejoWorkError {
+        violations: vec![retired_forgejo_command_message(command, current_authority)],
+    }
+}
+
+fn retired_forgejo_command_message(command: &str, current_authority: &str) -> String {
+    format!(
+        "{command} is no longer supported: the legacy Forgejo claim tracker has been retired. \
+         {current_authority}"
+    )
 }
 
 fn detect_issue_number_from_path(cwd: &Path, worktree_root: &Path) -> Option<u64> {
@@ -509,6 +509,72 @@ fn check_github_issue_open(issue_num: u64) -> Result<bool, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_retired_forgejo_command_error(result: Result<(), ForgejoWorkError>, command: &str) {
+        let message = format!(
+            "{}",
+            result.expect_err("retired command should fail closed")
+        );
+        assert!(
+            message.contains(command),
+            "retired diagnostic should name command: {message}"
+        );
+        assert!(
+            message.contains("no longer supported"),
+            "retired diagnostic should reject use: {message}"
+        );
+        assert!(
+            message.contains("legacy Forgejo claim tracker"),
+            "retired diagnostic should name retired tracker: {message}"
+        );
+        assert!(
+            message.contains("retired"),
+            "retired diagnostic should name retirement: {message}"
+        );
+        assert!(
+            message.contains("GitHub"),
+            "retired diagnostic should name current GitHub authority: {message}"
+        );
+        assert!(
+            message.contains("Codex Nexus"),
+            "retired diagnostic should name current Codex Nexus authority: {message}"
+        );
+    }
+
+    #[test]
+    fn retired_legacy_forgejo_commands_fail_closed() {
+        assert_retired_forgejo_command_error(
+            check_stale_claims_current_workspace(),
+            "check-stale-claims",
+        );
+        assert_retired_forgejo_command_error(
+            check_duplicate_claims_current_workspace(),
+            "check-duplicate-claims",
+        );
+        assert_retired_forgejo_command_error(
+            auto_release_stale_claims(),
+            "auto-release-stale-claims",
+        );
+        assert_retired_forgejo_command_error(
+            print_coordination_health_report(),
+            "coordination-health",
+        );
+
+        let message = acquire_claim(1805).expect_err("retired acquire-claim should fail closed");
+        for fragment in [
+            "acquire-claim",
+            "no longer supported",
+            "legacy Forgejo claim tracker",
+            "retired",
+            "GitHub",
+            "Codex Nexus",
+        ] {
+            assert!(
+                message.contains(fragment),
+                "retired acquire-claim diagnostic should contain '{fragment}': {message}"
+            );
+        }
+    }
 
     #[test]
     fn detect_issue_number_from_valid_path() {
