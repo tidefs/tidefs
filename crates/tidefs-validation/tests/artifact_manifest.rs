@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -67,15 +68,46 @@ fn collect_committed_artifact_files(root: &Path, files: &mut Vec<PathBuf>) {
     }
 }
 
+fn repo_root() -> &'static Path {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("crate should live under crates/tidefs-validation")
+}
+
+fn repo_relative_path(repo_root: &Path, path: &Path) -> String {
+    path.strip_prefix(repo_root)
+        .unwrap_or(path)
+        .display()
+        .to_string()
+}
+
+fn is_manifest_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(".manifest.json"))
+}
+
+fn is_runtime_artifact_path(path: &Path) -> bool {
+    if is_manifest_path(path) {
+        return false;
+    }
+
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    let extension = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
+
+    file_name.contains("runtime") && matches!(extension, "json" | "toml")
+}
+
 #[test]
 fn committed_validation_artifacts_do_not_embed_scratch_paths() {
     const SCRATCH_PATH_NEEDLES: &[&[u8]] =
         &[b"/tmp/tidefs-validation", b"/root/ai/tmp/tidefs-validation"];
 
-    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("crate should live under crates/tidefs-validation");
+    let repo_root = repo_root();
     let artifacts_root = repo_root.join("validation/artifacts");
 
     let mut artifact_files = Vec::new();
@@ -91,11 +123,7 @@ fn committed_validation_artifacts_do_not_embed_scratch_paths() {
         });
         for needle in SCRATCH_PATH_NEEDLES {
             if bytes.windows(needle.len()).any(|window| window == *needle) {
-                let relative_path = path
-                    .strip_prefix(repo_root)
-                    .unwrap_or(&path)
-                    .display()
-                    .to_string();
+                let relative_path = repo_relative_path(repo_root, &path);
                 failures.push(format!(
                     "{relative_path} embeds scratch path `{}`",
                     String::from_utf8_lossy(needle)
@@ -107,6 +135,54 @@ fn committed_validation_artifacts_do_not_embed_scratch_paths() {
     assert!(
         failures.is_empty(),
         "committed validation artifacts must be fixtures or promoted evidence, not scratch output:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn committed_runtime_artifacts_have_runtime_tier_manifests() {
+    let repo_root = repo_root();
+    let artifacts_root = repo_root.join("validation/artifacts");
+
+    let mut artifact_files = Vec::new();
+    collect_committed_artifact_files(&artifacts_root, &mut artifact_files);
+
+    let mut live_runtime_artifacts = BTreeSet::new();
+    for path in artifact_files.iter().filter(|path| is_manifest_path(path)) {
+        let text = fs::read_to_string(path).unwrap_or_else(|error| {
+            panic!(
+                "read committed validation manifest {}: {error}",
+                path.display()
+            )
+        });
+        let manifest = parse_evidence_artifact_manifest_json(&text).unwrap_or_else(|error| {
+            panic!(
+                "parse committed validation manifest {}: {:?}",
+                path.display(),
+                error.failures()
+            )
+        });
+        if manifest.validation_tier.is_live_runtime() {
+            live_runtime_artifacts.insert(manifest.artifact_path);
+        }
+    }
+
+    let mut failures = Vec::new();
+    for path in artifact_files
+        .iter()
+        .filter(|path| is_runtime_artifact_path(path))
+    {
+        let relative_path = repo_relative_path(repo_root, path);
+        if !live_runtime_artifacts.contains(&relative_path) {
+            failures.push(format!(
+                "{relative_path} is unclassified runtime output missing v2 live-runtime evidence manifest"
+            ));
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "committed runtime artifacts must be promoted evidence:\n{}",
         failures.join("\n")
     );
 }
