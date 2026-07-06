@@ -14,14 +14,8 @@ fn sequenced_test_data(len_bytes: usize) -> Vec<u8> {
     (0..len_bytes).map(|i| (i % 256) as u8).collect()
 }
 
-fn new_harness_or_skip(test_name: &str) -> Option<MountHarness> {
-    match MountHarness::new() {
-        Ok(harness) => Some(harness),
-        Err(e) => {
-            eprintln!("SKIP {test_name}: daemon not available -- {e}");
-            None
-        }
-    }
+fn new_harness_or_fail(test_name: &str) -> MountHarness {
+    MountHarness::new_or_fail(test_name)
 }
 
 #[test]
@@ -30,13 +24,7 @@ fn remount_persistence_64kib_sequenced() {
 
     // ── Session 1: mount, write, fsync, unmount ──────────────────────
 
-    let mut harness = match MountHarness::new() {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("SKIP remount_persistence_64kib_sequenced: daemon not available -- {e}");
-            return;
-        }
-    };
+    let mut harness = MountHarness::new_or_fail("remount_persistence_64kib_sequenced");
     harness
         .create_file("remount_test.bin", &test_data)
         .expect("create_file session 1");
@@ -71,13 +59,7 @@ fn remount_persistence_multiple_files() {
     let data_b = b"file beta content\n".to_vec();
     let data_c = (0..4096).map(|i| (i % 256) as u8).collect::<Vec<u8>>();
 
-    let mut harness = match MountHarness::new() {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("SKIP remount_persistence_multiple_files: daemon not available -- {e}");
-            return;
-        }
-    };
+    let mut harness = MountHarness::new_or_fail("remount_persistence_multiple_files");
 
     harness
         .create_file("alpha.txt", &data_a)
@@ -118,13 +100,7 @@ fn remount_persistence_subdir_files() {
     let data_x = b"nested file x data\n".to_vec();
     let data_y = b"nested file y data\n".to_vec();
 
-    let mut harness = match MountHarness::new() {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("SKIP remount_persistence_subdir_files: daemon not available -- {e}");
-            return;
-        }
-    };
+    let mut harness = MountHarness::new_or_fail("remount_persistence_subdir_files");
 
     harness.mkdir_all("subdir/deep").expect("mkdir subdir/deep");
     harness
@@ -186,10 +162,7 @@ fn remount_persistence_subdir_files() {
 fn same_session_write_read_roundtrip() {
     let test_data = b"same-session write-then-read roundtrip payload\n";
 
-    let harness = match new_harness_or_skip("same_session_write_read_roundtrip") {
-        Some(harness) => harness,
-        None => return,
-    };
+    let harness = new_harness_or_fail("same_session_write_read_roundtrip");
     harness
         .create_file("ss_wr.bin", test_data)
         .expect("create_file same-session");
@@ -212,10 +185,7 @@ fn same_session_write_read_multiblock() {
         .map(|i| (i.wrapping_mul(7) % 251) as u8)
         .collect();
 
-    let harness = match new_harness_or_skip("same_session_write_read_multiblock") {
-        Some(harness) => harness,
-        None => return,
-    };
+    let harness = new_harness_or_fail("same_session_write_read_multiblock");
     harness
         .create_file("ss_multiblock.bin", &test_data)
         .expect("create_file multiblock");
@@ -241,10 +211,7 @@ fn same_session_write_read_multiblock() {
 fn same_session_write_fsync_read() {
     let test_data = b"write, fsync, read in same session\n";
 
-    let harness = match new_harness_or_skip("same_session_write_fsync_read") {
-        Some(harness) => harness,
-        None => return,
-    };
+    let harness = new_harness_or_fail("same_session_write_fsync_read");
     harness
         .create_file("ss_fsync.bin", test_data)
         .expect("create_file");
@@ -269,10 +236,7 @@ fn same_session_write_fdatasync_read() {
     use std::os::unix::io::AsRawFd;
     let test_data = b"write, fdatasync, read in same session\n";
 
-    let harness = match new_harness_or_skip("same_session_write_fdatasync_read") {
-        Some(harness) => harness,
-        None => return,
-    };
+    let harness = new_harness_or_fail("same_session_write_fdatasync_read");
     let rel = "ss_fdatasync.bin";
     harness.create_file(rel, test_data).expect("create_file");
 

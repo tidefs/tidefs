@@ -13,9 +13,9 @@
 //! `tidefs-posix-filesystem-adapter-daemon`, perform IO through the FUSE
 //! mount, and remount the same backing store after a daemon restart.
 //!
-//! When a test cannot pass due to missing infrastructure (e.g. writeback
-//! flush on fsync not yet wired, or empty object-store after remount), the
-//! test is marked `#[ignore]` with a comment identifying the exact blocker.
+//! Missing mounted-runtime substrate fails closed with an explicit runtime
+//! refusal so ordinary `cargo test` output cannot be mistaken for mounted
+//! durability coverage.
 
 use tidefs_validation::mount_harness::MountHarness;
 
@@ -83,13 +83,7 @@ fn sequenced_test_data(len_bytes: usize) -> Vec<u8> {
 /// and read-dispatch are wired correctly.
 #[test]
 fn same_session_write_read_8kib() {
-    let harness = match MountHarness::new() {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("SKIP same_session_write_read_8kib: daemon not available -- {e}");
-            return;
-        }
-    };
+    let harness = MountHarness::new_or_fail("same_session_write_read_8kib");
 
     let data = sequenced_test_data(8192);
     harness
@@ -115,15 +109,7 @@ fn same_session_write_read_8kib() {
 /// verify byte-for-byte within the same session.
 #[test]
 fn same_session_write_read_16kib_checksummed() {
-    let harness = match MountHarness::new() {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!(
-                "SKIP same_session_write_read_16kib_checksummed: daemon not available -- {e}"
-            );
-            return;
-        }
-    };
+    let harness = MountHarness::new_or_fail("same_session_write_read_16kib_checksummed");
 
     let seed: u64 = 0xfeedface_c0ffee12;
     let data = make_test_buffer(seed, 16384);
@@ -149,13 +135,7 @@ fn same_session_write_read_16kib_checksummed() {
 #[test]
 fn write_fsync_remount_verify_8kib() {
     let data = sequenced_test_data(8192);
-    let mut harness = match MountHarness::new() {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("SKIP write_fsync_remount_verify_8kib: daemon not available -- {e}");
-            return;
-        }
-    };
+    let mut harness = MountHarness::new_or_fail("write_fsync_remount_verify_8kib");
 
     harness
         .create_file("durable.bin", &data)
@@ -199,15 +179,7 @@ fn write_fsync_remount_verify_4kib_checksummed() {
     let seed: u64 = 0xdeadbeef_cafebabe;
     let data = make_test_buffer(seed, 4096);
 
-    let mut harness = match MountHarness::new() {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!(
-                "SKIP write_fsync_remount_verify_4kib_checksummed: daemon not available -- {e}"
-            );
-            return;
-        }
-    };
+    let mut harness = MountHarness::new_or_fail("write_fsync_remount_verify_4kib_checksummed");
 
     harness
         .create_file("cksum_durable.bin", &data)
@@ -245,13 +217,7 @@ fn full_write_fsync_remount_verify_cycle() {
     let data_len: usize = 8192;
     let test_data = make_test_buffer(seed, data_len);
 
-    let mut harness = match MountHarness::new() {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("SKIP full_write_fsync_remount_verify_cycle: daemon not available -- {e}");
-            return;
-        }
-    };
+    let mut harness = MountHarness::new_or_fail("full_write_fsync_remount_verify_cycle");
 
     // Session 1: write, fsync, unmount.
     harness
@@ -290,13 +256,7 @@ fn full_write_fsync_remount_verify_cycle() {
 /// block-alignment or extent-boundary paths in the write dispatch.
 #[test]
 fn same_session_write_read_varying_sizes() {
-    let harness = match MountHarness::new() {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("SKIP same_session_write_read_varying_sizes: daemon not available -- {e}");
-            return;
-        }
-    };
+    let harness = MountHarness::new_or_fail("same_session_write_read_varying_sizes");
 
     let sizes: &[usize] = &[
         1, 63, 64, 65, 255, 256, 257, 1023, 1024, 1025, 4095, 4096, 4097, 65536,
@@ -324,13 +284,7 @@ fn same_session_write_read_varying_sizes() {
 /// Write three files of varying sizes, fsync each, remount, verify all three.
 #[test]
 fn multi_file_write_fsync_remount_verify() {
-    let mut harness = match MountHarness::new() {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("SKIP multi_file_write_fsync_remount_verify: daemon not available -- {e}");
-            return;
-        }
-    };
+    let mut harness = MountHarness::new_or_fail("multi_file_write_fsync_remount_verify");
 
     let data_a = sequenced_test_data(512);
     let seed_b: u64 = 0xaaaa_bbbb_cccc_dddd;
@@ -442,13 +396,7 @@ fn kill_daemon(pid: u32) {
 fn write_durability_multi_chunk_64kib() {
     let test_data = sequenced_test_data(64 * 1024);
 
-    let mut harness = match MountHarness::new() {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("SKIP write_durability_multi_chunk_64kib: daemon not available -- {e}");
-            return;
-        }
-    };
+    let mut harness = MountHarness::new_or_fail("write_durability_multi_chunk_64kib");
 
     harness
         .create_file("wd_64k.bin", &test_data)
@@ -473,13 +421,7 @@ fn write_durability_fdatasync_4kib() {
 
     let test_data = prng_test_data(0x42, 4096);
 
-    let mut harness = match MountHarness::new() {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("SKIP write_durability_fdatasync_4kib: daemon not available -- {e}");
-            return;
-        }
-    };
+    let mut harness = MountHarness::new_or_fail("write_durability_fdatasync_4kib");
 
     harness
         .create_file("wd_fdatasync.bin", &test_data)
@@ -511,13 +453,7 @@ fn write_durability_fdatasync_4kib() {
 fn write_durability_nested_dirs() {
     let data_deep = prng_test_data(0xDEAD, 1024);
 
-    let mut harness = match MountHarness::new() {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("SKIP write_durability_nested_dirs: daemon not available -- {e}");
-            return;
-        }
-    };
+    let mut harness = MountHarness::new_or_fail("write_durability_nested_dirs");
 
     harness.mkdir_all("a/b/c").expect("mkdir -p a/b/c");
     harness
@@ -567,13 +503,7 @@ fn write_durability_nested_dirs() {
 fn write_durability_overwrite_then_remount() {
     let overwrite = b"NEW CONTENT AFTER OVERWRITE!\n".to_vec();
 
-    let mut harness = match MountHarness::new() {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("SKIP write_durability_overwrite_then_remount: daemon not available -- {e}");
-            return;
-        }
-    };
+    let mut harness = MountHarness::new_or_fail("write_durability_overwrite_then_remount");
 
     harness
         .create_file("overwrite.bin", b"original content\n")
@@ -600,15 +530,7 @@ fn write_durability_overwrite_then_remount() {
 
 #[test]
 fn write_durability_empty_file_survives_remount() {
-    let mut harness = match MountHarness::new() {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!(
-                "SKIP write_durability_empty_file_survives_remount: daemon not available -- {e}"
-            );
-            return;
-        }
-    };
+    let mut harness = MountHarness::new_or_fail("write_durability_empty_file_survives_remount");
 
     harness.create_file("empty.bin", b"").expect("create empty");
     harness.fsync_file("empty.bin").expect("fsync empty");
@@ -626,13 +548,7 @@ fn write_durability_empty_file_survives_remount() {
 
 #[test]
 fn write_durability_unlink_survives_remount() {
-    let mut harness = match MountHarness::new() {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("SKIP write_durability_unlink_survives_remount: daemon not available -- {e}");
-            return;
-        }
-    };
+    let mut harness = MountHarness::new_or_fail("write_durability_unlink_survives_remount");
 
     harness
         .create_file("to_delete.txt", b"delete me\n")
@@ -654,15 +570,7 @@ fn write_durability_unlink_survives_remount() {
 fn write_durability_fsync_crash_remount_4kib() {
     let test_data = prng_test_data(0xCAFE, 4096);
 
-    let harness = match MountHarness::new() {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!(
-                "SKIP write_durability_fsync_crash_remount_4kib: daemon not available -- {e}"
-            );
-            return;
-        }
-    };
+    let harness = MountHarness::new_or_fail("write_durability_fsync_crash_remount_4kib");
 
     harness
         .create_file("crash_test.bin", &test_data)
@@ -730,13 +638,7 @@ fn write_durability_fsync_crash_remount_4kib() {
 fn write_durability_no_fsync_crash_test() {
     let test_data = prng_test_data(0xBEEF, 2048);
 
-    let harness = match MountHarness::new() {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("SKIP write_durability_no_fsync_crash_test: daemon not available -- {e}");
-            return;
-        }
-    };
+    let harness = MountHarness::new_or_fail("write_durability_no_fsync_crash_test");
 
     harness
         .create_file("no_fsync.bin", &test_data)
@@ -799,13 +701,7 @@ fn write_durability_no_fsync_crash_test() {
 fn write_durability_rename_survives_remount() {
     let data = b"renamed file content\n".to_vec();
 
-    let mut harness = match MountHarness::new() {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("SKIP write_durability_rename_survives_remount: daemon not available -- {e}");
-            return;
-        }
-    };
+    let mut harness = MountHarness::new_or_fail("write_durability_rename_survives_remount");
 
     harness
         .create_file("old_name.txt", &data)
@@ -836,15 +732,7 @@ fn write_durability_rename_survives_remount() {
 fn write_durability_file_size_survives_remount() {
     let sizes: &[u64] = &[0, 1, 511, 512, 4095, 4096, 8192, 65536];
 
-    let mut harness = match MountHarness::new() {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!(
-                "SKIP write_durability_file_size_survives_remount: daemon not available -- {e}"
-            );
-            return;
-        }
-    };
+    let mut harness = MountHarness::new_or_fail("write_durability_file_size_survives_remount");
 
     for &size in sizes {
         let fname = format!("size_{size}.bin");
@@ -869,15 +757,7 @@ fn write_durability_file_size_survives_remount() {
 
 #[test]
 fn write_durability_append_extend_survives_remount() {
-    let mut harness = match MountHarness::new() {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!(
-                "SKIP write_durability_append_extend_survives_remount: daemon not available -- {e}"
-            );
-            return;
-        }
-    };
+    let mut harness = MountHarness::new_or_fail("write_durability_append_extend_survives_remount");
 
     // Create with initial data, then extend by overwriting with larger content.
     harness
@@ -946,15 +826,7 @@ fn fsync_dir_impl(dir: &std::path::Path) -> std::io::Result<()> {
 /// flushes dirty writeback for children to durable storage.
 #[test]
 fn multi_file_dir_fsync_propagation_remount_verify() {
-    let mut harness = match MountHarness::new() {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!(
-                "SKIP multi_file_dir_fsync_propagation_remount_verify: daemon not available -- {e}"
-            );
-            return;
-        }
-    };
+    let mut harness = MountHarness::new_or_fail("multi_file_dir_fsync_propagation_remount_verify");
 
     let data_a = sequenced_test_data(1024);
     let seed_b: u64 = 0x1111_2222_3333_4444;
@@ -1005,13 +877,7 @@ fn large_file_write_fsync_remount_verify() {
     let data_len: usize = 1_572_864; // 1.5 MiB exactly
     let data = make_test_buffer(seed, data_len);
 
-    let mut harness = match MountHarness::new() {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("SKIP large_file_write_fsync_remount_verify: daemon not available -- {e}");
-            return;
-        }
-    };
+    let mut harness = MountHarness::new_or_fail("large_file_write_fsync_remount_verify");
 
     harness
         .create_file("large.bin", &data)
@@ -1068,13 +934,7 @@ fn incremental_fsync_both_durable() {
     let mut combined = data_a.clone();
     combined.extend_from_slice(&data_b);
 
-    let mut harness = match MountHarness::new() {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("SKIP incremental_fsync_both_durable: daemon not available -- {e}");
-            return;
-        }
-    };
+    let mut harness = MountHarness::new_or_fail("incremental_fsync_both_durable");
 
     // Write A (initial write).
     harness
@@ -1118,13 +978,7 @@ fn incremental_fsync_second_not_durable() {
     let data_a = sequenced_test_data(1024);
     let data_b = sequenced_test_data(256);
 
-    let mut harness = match MountHarness::new() {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("SKIP incremental_fsync_second_not_durable: daemon not available -- {e}");
-            return;
-        }
-    };
+    let mut harness = MountHarness::new_or_fail("incremental_fsync_second_not_durable");
 
     // Write A (fsync immediately).
     harness
@@ -1180,13 +1034,7 @@ fn incremental_fsync_second_not_durable() {
 /// the upstream single-file crash test by exercising multi-file recovery.
 #[test]
 fn crash_after_fsync_multi_file_survives() {
-    let mut harness = match MountHarness::new() {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("SKIP crash_after_fsync_multi_file_survives: daemon not available -- {e}");
-            return;
-        }
-    };
+    let mut harness = MountHarness::new_or_fail("crash_after_fsync_multi_file_survives");
 
     let data_a = sequenced_test_data(512);
     let data_b = prng_test_data(0xBEEF, 2048);
@@ -1255,13 +1103,7 @@ fn crash_after_fsync_multi_file_survives() {
 fn crash_after_fdatasync_data_survives() {
     let data = prng_test_data(0xF00D, 4096);
 
-    let mut harness = match MountHarness::new() {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("SKIP crash_after_fdatasync_data_survives: daemon not available -- {e}");
-            return;
-        }
-    };
+    let mut harness = MountHarness::new_or_fail("crash_after_fdatasync_data_survives");
 
     harness
         .create_file("fdatasync_crash.bin", &data)
@@ -1299,15 +1141,7 @@ fn write_durability_selective_fsync_isolation() {
     let data_b = make_test_buffer(0xAAAA_BBBB_CCCC_DDDD, 2048);
     let data_c = sequenced_test_data(512);
 
-    let mut harness = match MountHarness::new() {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!(
-                "SKIP write_durability_selective_fsync_isolation: daemon not available -- {e}"
-            );
-            return;
-        }
-    };
+    let mut harness = MountHarness::new_or_fail("write_durability_selective_fsync_isolation");
 
     harness
         .create_file("iso_a.bin", &data_a)
@@ -1382,13 +1216,7 @@ fn write_durability_otrunc_fsync_remount() {
     let initial = sequenced_test_data(8192);
     let after_trunc = b"TRUNCATED-NEW-CONTENT\n".to_vec();
 
-    let mut harness = match MountHarness::new() {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("SKIP write_durability_otrunc_fsync_remount: daemon not available -- {e}");
-            return;
-        }
-    };
+    let mut harness = MountHarness::new_or_fail("write_durability_otrunc_fsync_remount");
 
     // Session 1: write initial data + fsync.
     harness
@@ -1464,15 +1292,7 @@ fn write_durability_fdatasync_vs_fsync_metadata() {
     let data_a = prng_test_data(0xFDA7, 2048);
     let data_b = prng_test_data(0xF5AC, 2048);
 
-    let mut harness = match MountHarness::new() {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!(
-                "SKIP write_durability_fdatasync_vs_fsync_metadata: daemon not available -- {e}"
-            );
-            return;
-        }
-    };
+    let mut harness = MountHarness::new_or_fail("write_durability_fdatasync_vs_fsync_metadata");
 
     // Write and fdatasync file A (metadata may be stale).
     harness
@@ -1553,13 +1373,7 @@ fn write_durability_crash_mixed_sync_states() {
     let data_a = prng_test_data(0xAAAA, 2048);
     let data_b = prng_test_data(0xBBBB, 1024);
 
-    let mut harness = match MountHarness::new() {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("SKIP write_durability_crash_mixed_sync_states: daemon not available -- {e}");
-            return;
-        }
-    };
+    let mut harness = MountHarness::new_or_fail("write_durability_crash_mixed_sync_states");
 
     // Write file A and fsync immediately.
     harness
@@ -1615,13 +1429,7 @@ fn write_durability_crash_mixed_sync_states() {
 fn write_durability_crash_partial_block() {
     let partial_data: Vec<u8> = (0..100).map(|i: usize| (i * 7 + 13) as u8).collect();
 
-    let mut harness = match MountHarness::new() {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("SKIP write_durability_crash_partial_block: daemon not available -- {e}");
-            return;
-        }
-    };
+    let mut harness = MountHarness::new_or_fail("write_durability_crash_partial_block");
 
     harness
         .create_file("partial.bin", &partial_data)
@@ -1660,15 +1468,7 @@ fn write_durability_crash_fdatasync_vs_fsync() {
     let data_f = prng_test_data(0xFDA7, 2048);
     let data_s = prng_test_data(0xF5C7, 2048);
 
-    let mut harness = match MountHarness::new() {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!(
-                "SKIP write_durability_crash_fdatasync_vs_fsync: daemon not available -- {e}"
-            );
-            return;
-        }
-    };
+    let mut harness = MountHarness::new_or_fail("write_durability_crash_fdatasync_vs_fsync");
 
     // Write and fdatasync file F.
     harness
@@ -1748,13 +1548,7 @@ fn write_durability_crash_append_chain() {
     expected.extend_from_slice(&chunk_b);
     expected.extend_from_slice(&chunk_c);
 
-    let mut harness = match MountHarness::new() {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("SKIP write_durability_crash_append_chain: daemon not available -- {e}");
-            return;
-        }
-    };
+    let mut harness = MountHarness::new_or_fail("write_durability_crash_append_chain");
 
     // Initial create with chunk A, fsync.
     harness
