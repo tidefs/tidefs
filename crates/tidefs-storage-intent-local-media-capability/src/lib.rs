@@ -2111,6 +2111,36 @@ mod tests {
     }
 
     #[test]
+    fn pmem_block_flush_fua_does_not_emit_flush_fence_flag() {
+        let record = produce_local_media_capability(
+            strong_pmem_facts().with_block_io(
+                LocalBlockIoFacts::from_block_capabilities(
+                    LocalBlockIoCapabilities::read_write_flush(64, 4096, true),
+                    evidence(25),
+                )
+                .with_flush_ordering(MediaFlushOrderingClass::FlushAndFua)
+                .with_max_queue_depth(1),
+            ),
+        );
+        let result = durable_sync_result(record);
+
+        assert_eq!(record.media_class, StorageMediaClass::PersistentMemory);
+        assert_eq!(record.persistence, MediaPersistenceDomain::PersistentMemory);
+        assert_eq!(record.flush_ordering, MediaFlushOrderingClass::FlushAndFua);
+        assert!(record
+            .flags
+            .contains_all(MediaCapabilityFlags::FLUSH_FUA_ORDERING));
+        assert!(!record
+            .flags
+            .contains_all(MediaCapabilityFlags::PMEM_FLUSH_FENCE));
+        assert!(!result.satisfied);
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::PmemFlushFenceMissing
+        );
+    }
+
+    #[test]
     fn pmem_label_maps_media_class_without_persistence_receipt() {
         let mut label = pool_label();
         label.device_class = LocalPoolDeviceClass::Pmem;
