@@ -420,20 +420,13 @@ pub fn inspect_filesystem_content_objects_store(
     root_authentication_key: RootAuthenticationKey,
     pool: Option<&Pool>,
 ) -> Result<FilesystemContentInspectionReport> {
-    let audit = audit_recovery_store(store, root_authentication_key)?;
     let mut report = FilesystemContentInspectionReport::empty();
-    let state = if let Some(selected_root) = audit.selected_root {
-        report.selected_root = Some(selected_root.clone());
-        let root = root_commit_from_summary(&selected_root);
-        load_state_from_transaction_for_content_inspection(store, &root, root_authentication_key)?
-    } else {
-        let Some((_root, state)) =
-            load_newest_content_inspection_state(store, root_authentication_key)?
-        else {
-            return Ok(report);
-        };
-        state
+    let Some((selected_root, state)) =
+        load_newest_content_inspection_state(store, root_authentication_key)?
+    else {
+        return Ok(report);
     };
+    report.selected_root = Some(selected_root);
 
     for inode in state.inodes.values() {
         if !inode.is_file_like() {
