@@ -212,11 +212,7 @@ fn handle_device_status(pool_name: String, json: bool) {
     let live_truth =
         super::operator_truth::OperatorTruthCarrier::live_route("device", "status", &pool_name);
     if !json {
-        eprintln!(
-            "operator truth carrier: routing tidefsctl device status pool '{}' as {}",
-            pool_name,
-            live_truth.freshness.as_str()
-        );
+        eprintln!("{}", live_truth.live_route_attempt_line());
     }
     super::live_owner::route_status_if_owner_exists("device", "status", &pool_name, json);
     let refusal_truth = super::operator_truth::OperatorTruthCarrier::no_live_refusal(
