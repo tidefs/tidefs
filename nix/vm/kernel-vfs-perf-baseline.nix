@@ -367,8 +367,8 @@ else
     if [ "$start_ns" -gt 0 ] && [ "$end_ns" -gt 0 ]; then
         duration_ns=$((end_ns - start_ns))
         duration_s=$(awk "BEGIN {printf \"%.3f\", $duration_ns / 1000000000}" 2>/dev/null || echo "0")
-        if [ "$duration_s" != "0" ] && [ "$(echo "$duration_s > 0" | bc 2>/dev/null || echo 0)" != "0" ]; then
-            throughput_mbps=$(awk "BEGIN {printf \"%.2f\", 1.0 / $duration_s}" 2>/dev/null || echo "0")
+        if [ "$duration_ns" -gt 0 ]; then
+            throughput_mbps=$(awk "BEGIN {printf \"%.2f\", 1000000000 / $duration_ns}" 2>/dev/null || echo "0")
         fi
     fi
     echo "  write_duration_s=$duration_s"
@@ -391,8 +391,8 @@ else
     if [ "$start_ns" -gt 0 ] && [ "$end_ns" -gt 0 ]; then
         duration_ns=$((end_ns - start_ns))
         duration_s=$(awk "BEGIN {printf \"%.3f\", $duration_ns / 1000000000}" 2>/dev/null || echo "0")
-        if [ "$duration_s" != "0" ] && [ "$(echo "$duration_s > 0" | bc 2>/dev/null || echo 0)" != "0" ]; then
-            throughput_mbps=$(awk "BEGIN {printf \"%.2f\", 1.0 / $duration_s}" 2>/dev/null || echo "0")
+        if [ "$duration_ns" -gt 0 ]; then
+            throughput_mbps=$(awk "BEGIN {printf \"%.2f\", 1000000000 / $duration_ns}" 2>/dev/null || echo "0")
         fi
     fi
     echo "  read_duration_s=$duration_s"
