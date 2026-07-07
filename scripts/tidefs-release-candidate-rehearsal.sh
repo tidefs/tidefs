@@ -101,13 +101,8 @@ fi
 
 echo ""
 echo "--- Release Matrix ---"
-GNG="$REPO_ROOT/docs/release/release-candidate-go-no-go-checklist.md"
-if [[ -f "$GNG" ]]; then
-    GO_C="$(rg -c '\*\*GO\*\*' "$GNG" 2>/dev/null || echo 0)"
-    NGO_C="$(rg -c '\*\*NO-GO\*\*' "$GNG" 2>/dev/null || echo 0)"
-    record_step "go-no-go-checklist" "ASSESSED" "go=$GO_C no-go=$NGO_C rows"
-    cp "$GNG" "$RUN_DIR/release-candidate-go-no-go-checklist.md"
-fi
+record_step "release-candidate-authority" "RECORDED" "docs/GITHUB_CI.md; docs/RELEASE_CANDIDATE_EVIDENCE_CONTRACT.md; docs/RELEASE_READINESS_VERDICT_CONTRACT.md; .github/workflows/release-candidate.yml"
+record_step "go-no-go-checklist" "ABSENT" "deleted checklist is not current authority and is not read or copied"
 
 echo ""
 echo "--- Rollback ---"
@@ -124,7 +119,8 @@ Commit: $CURRENT_SHA
 1. git push origin :refs/tags/$RC_TAG
 2. git push origin :refs/heads/$RC_BRANCH
 3. Remove published release artifacts if any.
-4. Commit a rollback notice to docs/release/.
+4. Record any required rollback notice through the current release-readiness
+   issue, PR, or verdict artifact owner.
 
 ## Verify
 1. git tag -l '$RC_TAG'  → should be empty
@@ -179,9 +175,9 @@ cat > "$RUN_DIR/SUMMARY.md" << SEOF
 
 ## Next Steps
 1. Resolve pre-flight refusals (dirty tree, HEAD != master).
-2. Run full Nix artifact build.
-3. Execute runtime release matrix from candidate tag.
-4. If accepted, promote rc tag to final release tag.
+2. Dispatch the manual Release Candidate workflow for the selected branch/profile.
+3. Interpret release-candidate-evidence-index through the release-readiness verdict contract.
+4. Promote only after the verdict owner records the required release decision.
 SEOF
 
 echo ""
