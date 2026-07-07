@@ -503,6 +503,7 @@ impl LocalAckReceipt {
     #[must_use]
     pub fn satisfies_requested_ack_floor(self) -> bool {
         self.is_posix_durable_success()
+            && self.has_local_ack_policy_identity()
             && self.refusal_reason() == StorageIntentRefusalReason::None
             && self.has_requested_ack_floor_evidence()
             && self.convergence.satisfies_ack_floor()
@@ -511,6 +512,13 @@ impl LocalAckReceipt {
                 self.receipt,
             )
             .satisfied
+    }
+
+    fn has_local_ack_policy_identity(self) -> bool {
+        self.receipt.policy_id == LOCAL_ACK_POLICY_ID
+            && self.receipt.policy_revision == LOCAL_ACK_POLICY_REVISION
+            && self.refusal.policy_id == LOCAL_ACK_POLICY_ID
+            && self.refusal.policy_revision == LOCAL_ACK_POLICY_REVISION
     }
 
     fn has_requested_ack_floor_evidence(self) -> bool {
@@ -1141,6 +1149,73 @@ mod tests {
 
         assert!(missing_full_shared_refs.is_posix_durable_success());
         assert!(!missing_full_shared_refs.satisfies_requested_ack_floor());
+    }
+
+    #[test]
+    fn requested_floor_receipt_fails_closed_for_mismatched_policy_identity() {
+        const OTHER_POLICY_ID: StorageIntentPolicyId = StorageIntentPolicyId([0x42; 16]);
+        const OTHER_POLICY_REVISION: StorageIntentPolicyRevision =
+            StorageIntentPolicyRevision(LOCAL_ACK_POLICY_REVISION.0 + 1);
+
+        let mut receipt_policy_id = LocalAckReceipt::durable_intent(
+            12,
+            LocalAckOperation::SyncWrite,
+            LocalAckReceiptTarget::inode(22),
+            None,
+        );
+        assert!(receipt_policy_id.satisfies_requested_ack_floor());
+        receipt_policy_id.receipt.policy_id = OTHER_POLICY_ID;
+        assert!(receipt_policy_id.is_posix_durable_success());
+        assert_eq!(
+            receipt_policy_id.refusal_reason(),
+            StorageIntentRefusalReason::None
+        );
+        assert!(!receipt_policy_id.satisfies_requested_ack_floor());
+
+        let mut receipt_policy_revision = LocalAckReceipt::durable_intent(
+            13,
+            LocalAckOperation::SyncWrite,
+            LocalAckReceiptTarget::inode(22),
+            None,
+        );
+        assert!(receipt_policy_revision.satisfies_requested_ack_floor());
+        receipt_policy_revision.receipt.policy_revision = OTHER_POLICY_REVISION;
+        assert!(receipt_policy_revision.is_posix_durable_success());
+        assert_eq!(
+            receipt_policy_revision.refusal_reason(),
+            StorageIntentRefusalReason::None
+        );
+        assert!(!receipt_policy_revision.satisfies_requested_ack_floor());
+
+        let mut refusal_policy_id = LocalAckReceipt::durable_intent(
+            14,
+            LocalAckOperation::SyncWrite,
+            LocalAckReceiptTarget::inode(22),
+            None,
+        );
+        assert!(refusal_policy_id.satisfies_requested_ack_floor());
+        refusal_policy_id.refusal.policy_id = OTHER_POLICY_ID;
+        assert!(refusal_policy_id.is_posix_durable_success());
+        assert_eq!(
+            refusal_policy_id.refusal_reason(),
+            StorageIntentRefusalReason::None
+        );
+        assert!(!refusal_policy_id.satisfies_requested_ack_floor());
+
+        let mut refusal_policy_revision = LocalAckReceipt::durable_intent(
+            15,
+            LocalAckOperation::SyncWrite,
+            LocalAckReceiptTarget::inode(22),
+            None,
+        );
+        assert!(refusal_policy_revision.satisfies_requested_ack_floor());
+        refusal_policy_revision.refusal.policy_revision = OTHER_POLICY_REVISION;
+        assert!(refusal_policy_revision.is_posix_durable_success());
+        assert_eq!(
+            refusal_policy_revision.refusal_reason(),
+            StorageIntentRefusalReason::None
+        );
+        assert!(!refusal_policy_revision.satisfies_requested_ack_floor());
     }
 
     #[test]
