@@ -6896,15 +6896,12 @@ impl FuseVfsAdapter {
                     release_fallback(&mut fallback_to_release);
                     return Err(Errno::EIO);
                 };
-                if let Err(errno) = self.record_clean_write_through_after_write(
+                self.record_clean_write_through_after_write(
                     ino,
                     effective_offset as u64,
                     written,
                     written_data,
-                ) {
-                    release_fallback(&mut fallback_to_release);
-                    return Err(errno);
-                }
+                );
             }
             if let Some(attr) = post_write_attr {
                 self.sync_namespace_attrs_after_engine_write(ino, &attr);
@@ -7038,7 +7035,7 @@ impl FuseVfsAdapter {
                                         effective_offset as u64,
                                         written,
                                         written_data,
-                                    )?;
+                                    );
                                 } else {
                                     self.mark_dirty_after_write(
                                         &**e,
@@ -7382,9 +7379,9 @@ impl FuseVfsAdapter {
         offset: u64,
         written: u32,
         written_data: &[u8],
-    ) -> Result<(), Errno> {
+    ) {
         if written == 0 {
-            return Ok(());
+            return;
         }
 
         let length = u64::from(written);
@@ -7398,12 +7395,20 @@ impl FuseVfsAdapter {
         let has_dirty_overlap = self.dirty_trackers_overlap_range(ino, offset, length)
             || self.dirty_page_caches_overlap_range(ino, offset, length);
         if has_dirty_overlap {
-            self.reconcile_dirty_mirrors_for_authoritative_range(
+            if let Err(errno) = self.reconcile_dirty_mirrors_for_authoritative_range(
                 ino,
                 offset,
                 length,
                 AuthoritativeRangePayload::Bytes(written_data),
-            )?;
+            ) {
+                tracing::warn!(
+                    %ino,
+                    %offset,
+                    %length,
+                    ?errno,
+                    "clean write-through mirror reconciliation failed after lower write accepted bytes"
+                );
+            }
         } else if let Some(ref wb_cache) = self.writeback_page_cache {
             self.update_clean_write_through_page_cache(wb_cache, ino, offset, written_data);
             if !Arc::ptr_eq(wb_cache, &self.write_page_cache) {
@@ -7429,7 +7434,6 @@ impl FuseVfsAdapter {
         }
         self.reconcile_writeback_inode_cache_after_authoritative_range(ino);
         self.txg_cycle.queue_write(ino, offset, written_data);
-        Ok(())
     }
 
     fn update_clean_write_through_page_cache(
@@ -43073,6 +43077,80 @@ mod tests {
                 .is_dirty(ino),
             Some(false),
             "clean write-through writes must leave the inode reclaim cache clean"
+        );
+    }
+
+    #[test]
+    fn writeback_cached_clean_write_through_helper_patches_resident_clean_mirror() {
+        let fixture = adapter_fixture_with_writeback_cache();
+        let ctx = root_ctx();
+        let (inode, _adapter_fh, _engine_fh) = create_adapter_file_handle(
+            &fixture.adapter,
+            &ctx,
+            b"wb-clean-write-through-helper-page-cache.bin",
+            libc::O_RDWR as u32,
+        );
+        let ino = inode.get();
+        let page_size = fixture.adapter.write_page_cache.page_size();
+        let mut expected = vec![0x29; page_size];
+        fixture
+            .adapter
+            .write_page_cache
+            .insert(ino, 0)
+            .expect("insert resident clean mirror");
+        {
+            let mut page = fixture
+                .adapter
+                .write_page_cache
+                .lookup(ino, 0)
+                .expect("lookup resident clean mirror");
+            page.data_mut().copy_from_slice(&expected);
+            page.clear_dirty();
+            assert!(!page.is_dirty());
+        }
+        let stale_snapshot = fixture
+            .adapter
+            .data_cache_generation_snapshot(ino, 1024, 512);
+
+        let replacement = vec![0xC4; 512];
+        fixture.adapter.record_clean_write_through_after_write(
+            ino,
+            1024,
+            replacement.len() as u32,
+            &replacement,
+        );
+        expected[1024..1024 + replacement.len()].copy_from_slice(&replacement);
+
+        assert!(
+            !fixture
+                .adapter
+                .data_cache_snapshot_still_current(ino, 1024, 512, stale_snapshot),
+            "clean write-through helper must fence overlapping daemon read-cache generations"
+        );
+        let page = fixture
+            .adapter
+            .write_page_cache
+            .lookup(ino, 0)
+            .expect("resident clean mirror should be patched, not evicted");
+        assert_eq!(page.data(), expected.as_slice());
+        assert!(!page.is_dirty());
+        assert!(
+            fixture
+                .adapter
+                .write_page_cache
+                .dirty_pages_for_inode(ino)
+                .is_empty(),
+            "clean write-through helper must not create dirty page mirrors"
+        );
+        assert_eq!(
+            fixture
+                .adapter
+                .writeback_cache
+                .lock()
+                .unwrap()
+                .is_dirty(ino),
+            Some(false),
+            "clean write-through helper must leave the inode reclaim cache clean"
         );
     }
 
