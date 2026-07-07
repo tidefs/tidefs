@@ -3,8 +3,7 @@
 //! through a real FUSE mount, remount persistence, and the full basic-ops cycle.
 //!
 //! Uses `MountHarness` for daemon lifecycle and mountpoint operations.
-//! Gated on `feature = "fuse-basic-ops"` which transitively requires
-//! `local-filesystem`.
+//! Gated on `feature = "fuse"` which includes `local-filesystem`.
 
 #[cfg(test)]
 mod tests {
@@ -19,6 +18,7 @@ mod tests {
     ///   - namespace mutations survive remount
     ///   - integration test validates the full basic-ops cycle
     #[test]
+    #[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
     fn test_basic_ops_cycle_with_remount() {
         let mut harness = MountHarness::new_or_fail(module_path!());
 
@@ -81,6 +81,7 @@ mod tests {
     /// Advancement criterion 2:
     ///   - rename completes successfully via real FUSE mount
     #[test]
+    #[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
     fn test_rename_directory_with_remount() {
         let mut harness = MountHarness::new_or_fail(module_path!());
 
@@ -143,6 +144,7 @@ mod tests {
 
     /// Edge case: rmdir on a non-empty directory must fail.
     #[test]
+    #[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
     fn test_rmdir_nonempty_fails() {
         let harness = MountHarness::new_or_fail(module_path!());
 
@@ -158,6 +160,7 @@ mod tests {
 
     /// Edge case: ENOENT on rmdir of non-existent directory.
     #[test]
+    #[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
     fn test_rmdir_nonexistent_fails() {
         let harness = MountHarness::new_or_fail(module_path!());
 
