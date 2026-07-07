@@ -800,11 +800,16 @@ fn marker_context_is_classified(lines: &[&str], marker_idx: usize) -> bool {
 
 fn line_has_fixture_or_refusal_classification(line: &str) -> bool {
     let lower = line.to_ascii_lowercase();
-    lower.contains("negative-test")
-        || lower.contains("negative test")
-        || lower.contains("refusal")
-        || lower.contains("refuse")
-        || lower.contains("fixture")
+    let negative_test = lower.contains("negative-test") || lower.contains("negative test");
+    let fixture_text =
+        contains_ascii_word(&lower, "fixture") || contains_ascii_word(&lower, "text");
+    let refusal = contains_ascii_word(&lower, "refusal") || lower.contains("refuse");
+    let refusal_context = contains_ascii_word(&lower, "fixture")
+        || contains_ascii_word(&lower, "placeholder")
+        || contains_ascii_word(&lower, "sandbox")
+        || contains_ascii_word(&lower, "text");
+
+    (negative_test && fixture_text) || (refusal && refusal_context)
 }
 
 fn contains_debt_later_phrase(line: &str) -> bool {
@@ -1221,6 +1226,34 @@ mod tests {
         assert!(
             result.is_ok(),
             "classified fixture text should pass: {result:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_bare_fixture_context_for_validation_marker_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("validation/review-marker-fixture.toml");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "# fixture setup\nmarker = \"TODO\"\n").unwrap();
+
+        let result = check_review_debt_markers_in_paths(dir.path(), &[path]);
+        assert!(
+            result.is_err(),
+            "bare fixture wording should not classify debt markers"
+        );
+    }
+
+    #[test]
+    fn rejects_bare_refusal_context_for_validation_marker_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("validation/review-marker-refusal.toml");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "# refusal path\nmarker = \"TODO\"\n").unwrap();
+
+        let result = check_review_debt_markers_in_paths(dir.path(), &[path]);
+        assert!(
+            result.is_err(),
+            "bare refusal wording should not classify debt markers"
         );
     }
 
