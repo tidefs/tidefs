@@ -6916,7 +6916,20 @@ impl FuseVfsAdapter {
                         .txg_cycle
                         .current_commit_group_id
                         .load(Ordering::Relaxed);
-                    let written_data = &data[..written as usize];
+                    let Ok(written_len) = usize::try_from(written) else {
+                        if let Some(fallback) = fallback_to_release.take() {
+                            let e = self.engine.lock().unwrap();
+                            let _ = e.release(&fallback);
+                        }
+                        return Err(Errno::EIO);
+                    };
+                    let Some(written_data) = data.get(..written_len) else {
+                        if let Some(fallback) = fallback_to_release.take() {
+                            let e = self.engine.lock().unwrap();
+                            let _ = e.release(&fallback);
+                        }
+                        return Err(Errno::EIO);
+                    };
                     if written_data.len() <= 256 {
                         let record = IlRecord::BufferedWrite {
                             ino,
@@ -7079,7 +7092,10 @@ impl FuseVfsAdapter {
                                             .txg_cycle
                                             .current_commit_group_id
                                             .load(Ordering::Relaxed);
-                                        let written_data = &data[..written as usize];
+                                        let written_len =
+                                            usize::try_from(written).map_err(|_| Errno::EIO)?;
+                                        let written_data =
+                                            data.get(..written_len).ok_or(Errno::EIO)?;
                                         if written_data.len() <= 256 {
                                             let record = IlRecord::BufferedWrite {
                                                 ino,
