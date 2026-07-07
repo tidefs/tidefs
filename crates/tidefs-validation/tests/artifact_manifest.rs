@@ -140,6 +140,52 @@ fn committed_validation_artifacts_do_not_embed_scratch_paths() {
 }
 
 #[test]
+fn committed_evidence_manifests_verify_artifact_payloads() {
+    let repo_root = repo_root();
+    let artifacts_root = repo_root.join("validation/artifacts");
+
+    let mut artifact_files = Vec::new();
+    collect_committed_artifact_files(&artifacts_root, &mut artifact_files);
+
+    let mut failures = Vec::new();
+    for path in artifact_files.iter().filter(|path| is_manifest_path(path)) {
+        let manifest_path = repo_relative_path(repo_root, path);
+        let text = fs::read_to_string(path).unwrap_or_else(|error| {
+            panic!(
+                "read committed validation manifest {}: {error}",
+                path.display()
+            )
+        });
+        let manifest = parse_evidence_artifact_manifest_json(&text).unwrap_or_else(|error| {
+            panic!(
+                "parse committed validation manifest {}: {:?}",
+                path.display(),
+                error.failures()
+            )
+        });
+
+        if is_manifest_path(Path::new(&manifest.artifact_path)) {
+            failures.push(format!(
+                "{manifest_path} points at manifest `{}` instead of an artifact payload",
+                manifest.artifact_path
+            ));
+        }
+        if let Err(error) = manifest.verify_artifact_digest(repo_root) {
+            failures.push(format!(
+                "{manifest_path} has invalid artifact digest: {}",
+                error.failures().join("; ")
+            ));
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "committed evidence manifests must match their artifact payloads:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
 fn committed_runtime_artifacts_have_runtime_tier_manifests() {
     let repo_root = repo_root();
     let artifacts_root = repo_root.join("validation/artifacts");
