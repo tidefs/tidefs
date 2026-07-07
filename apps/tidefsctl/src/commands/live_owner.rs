@@ -709,15 +709,9 @@ fn send_live_owner_request_at(
             detail: None,
         })?;
     if response.version != tidefs_vfs_engine::LIVE_POOL_ADMIN_PROTOCOL_VERSION {
-        return Err(LiveOwnerRequestError::Owner {
-            exit_code: 2,
-            message: format!(
-                "unsupported live-owner response version {}; expected {}",
-                response.version,
-                tidefs_vfs_engine::LIVE_POOL_ADMIN_PROTOCOL_VERSION
-            ),
-            detail: None,
-        });
+        return Err(live_admin_error_to_request_error(
+            LivePoolAdminError::unsupported_version(response.version),
+        ));
     }
     match response.body {
         LivePoolAdminResponseBody::BytesHex { bytes_hex, bytes } => {
@@ -1724,6 +1718,60 @@ mod tests {
         let request = handle.join().unwrap();
 
         assert_eq!(request.command, LivePoolAdminCommand::DeviceRemove);
+    }
+
+    #[test]
+    fn live_owner_response_version_refusal_preserves_typed_detail() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("owner.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        write_owner_manifest(dir.path(), &socket_path);
+        let mut response = LivePoolAdminResponse::ok_text("unused");
+        response.version = 42;
+        let handle = spawn_owner_response(listener, response);
+        let route = LivePoolRoute {
+            command: "pool",
+            operation: "status",
+            pool: "tank",
+            pool_uuid: Some([0x42; 16]),
+            json: true,
+            args: LivePoolAdminArgs::default(),
+        };
+
+        let err = send_live_owner_request_at(dir.path(), &route).unwrap_err();
+        let request = handle.join().unwrap();
+
+        assert_eq!(request.command, LivePoolAdminCommand::PoolStatus);
+        match err {
+            LiveOwnerRequestError::Owner {
+                exit_code,
+                message,
+                detail,
+            } => {
+                assert_eq!(exit_code, 2);
+                assert_eq!(
+                    message,
+                    "unsupported live-owner request version 42; expected 1"
+                );
+                assert_eq!(
+                    detail
+                        .as_ref()
+                        .and_then(|value| value.get("kind"))
+                        .and_then(serde_json::Value::as_str),
+                    Some("unsupported_version")
+                );
+                assert_eq!(
+                    detail
+                        .as_ref()
+                        .and_then(|value| value.get("version"))
+                        .and_then(serde_json::Value::as_u64),
+                    Some(42)
+                );
+            }
+            LiveOwnerRequestError::Unavailable(message) => {
+                panic!("reachable owner should return typed version refusal, got {message}");
+            }
+        }
     }
 
     #[test]
