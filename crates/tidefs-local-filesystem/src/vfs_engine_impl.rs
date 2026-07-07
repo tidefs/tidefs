@@ -6576,6 +6576,16 @@ mod tests {
         engine.path_cache.borrow().get(&inode).cloned()
     }
 
+    #[test]
+    fn parse_snap_net_response_accepts_empty_ack() {
+        let mut ack = Vec::new();
+        ack.extend_from_slice(SNAP_NET_MAGIC);
+        ack.push(SNAP_KIND_ACK);
+        ack.extend_from_slice(&0u32.to_le_bytes());
+
+        assert_eq!(parse_snap_net_response(&ack), Ok(String::new()));
+    }
+
     const PREFETCH_POLICY: StorageIntentPolicyId = StorageIntentPolicyId([0x31; 16]);
     const PREFETCH_BUDGET: StorageIntentDomainId = StorageIntentDomainId([0x41; 16]);
     const PREFETCH_OBJECT: StorageIntentEvidenceId = StorageIntentEvidenceId([0x51; 32]);
