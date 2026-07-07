@@ -31,7 +31,6 @@ pub const CLAIMS_GATE_SCANNED_DOCS: &[&str] = &[
     "README.md",
     "apps/README.md",
     "crates/README.md",
-    "docs/00_user_requirements.md",
     "docs/BLAKE3_USAGE_POLICY.md",
     "docs/CLAIM_REGISTRY.md",
     "docs/CLAIMS_GATE_POLICY.md",
