@@ -283,7 +283,7 @@ impl CandidatePool {
                 "cluster ownership authority missing"
             };
             PoolLifecycleEvidence::refused_with_authority(
-                PoolLifecycleAction::FailClosed,
+                action,
                 context,
                 self.topology_complete,
                 self.cluster_authorized_or_not_clustered(),
@@ -781,7 +781,7 @@ mod tests {
 
         let evidence = pool.lifecycle_evidence(PoolLifecycleAction::Scan);
 
-        assert_eq!(evidence.action, PoolLifecycleAction::FailClosed);
+        assert_eq!(evidence.action, PoolLifecycleAction::Scan);
         assert!(evidence.is_fail_closed());
         assert!(evidence.reason.contains("topology"));
     }
@@ -835,7 +835,7 @@ mod tests {
 
         let evidence = pool.lifecycle_evidence(PoolLifecycleAction::Import);
 
-        assert_eq!(evidence.action, PoolLifecycleAction::FailClosed);
+        assert_eq!(evidence.action, PoolLifecycleAction::Import);
         assert!(evidence.topology_complete);
         assert!(!evidence.owner_authorized);
         assert!(evidence.is_fail_closed());

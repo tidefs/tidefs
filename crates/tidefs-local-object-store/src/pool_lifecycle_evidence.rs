@@ -182,15 +182,17 @@ mod tests {
     #[test]
     fn refused_evidence_is_fail_closed_without_complete_authority() {
         let evidence = PoolLifecycleEvidence::refused(
-            PoolLifecycleAction::FailClosed,
+            PoolLifecycleAction::Import,
             context(),
             "missing owner token",
         );
 
+        assert_eq!(evidence.action, PoolLifecycleAction::Import);
         assert_eq!(evidence.outcome, PoolLifecycleOutcome::Refused);
         assert!(!evidence.topology_complete);
         assert!(!evidence.owner_authorized);
         assert!(evidence.is_fail_closed());
+        assert!(evidence.summary().contains("action=import"));
         assert!(evidence.summary().contains("missing owner token"));
     }
 }
