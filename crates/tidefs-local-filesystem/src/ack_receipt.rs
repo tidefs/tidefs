@@ -521,43 +521,30 @@ impl LocalAckReceipt {
             && self.refusal.policy_revision == LOCAL_ACK_POLICY_REVISION
     }
 
+    fn required_local_evidence_refs(self) -> [StorageIntentEvidenceRef; 8] {
+        [
+            self.local_intent_record_ref,
+            self.ordering_ref,
+            self.flush_fence_ref,
+            self.media_capability_ref,
+            self.reserve_ref,
+            self.dirty_window_ref,
+            self.rollout_ref,
+            self.tenant_isolation_ref,
+        ]
+    }
+
     fn has_requested_ack_floor_evidence(self) -> bool {
         if !local_ack_floor_has_evidence_surface(self.requested_ack_floor) {
             return false;
         }
 
-        let required_local_refs_bound = self.local_intent_record_ref.is_bound()
-            && self.ordering_ref.is_bound()
-            && self.flush_fence_ref.is_bound()
-            && self.media_capability_ref.is_bound()
-            && self.reserve_ref.is_bound()
-            && self.dirty_window_ref.is_bound()
-            && self.rollout_ref.is_bound()
-            && self.tenant_isolation_ref.is_bound();
-        let required_local_refs_carried = self
-            .receipt
-            .evidence_refs
-            .contains_ref(self.local_intent_record_ref)
-            && self.receipt.evidence_refs.contains_ref(self.ordering_ref)
-            && self
-                .receipt
-                .evidence_refs
-                .contains_ref(self.flush_fence_ref)
-            && self
-                .receipt
-                .evidence_refs
-                .contains_ref(self.media_capability_ref)
-            && self.receipt.evidence_refs.contains_ref(self.reserve_ref)
-            && self
-                .receipt
-                .evidence_refs
-                .contains_ref(self.dirty_window_ref)
-            && self.receipt.evidence_refs.contains_ref(self.rollout_ref)
-            && self
-                .receipt
-                .evidence_refs
-                .contains_ref(self.tenant_isolation_ref);
-        let has_local_evidence = required_local_refs_bound && required_local_refs_carried;
+        let has_local_evidence = self
+            .required_local_evidence_refs()
+            .iter()
+            .all(|evidence_ref| {
+                evidence_ref.is_bound() && self.receipt.evidence_refs.contains_ref(*evidence_ref)
+            });
         let needs_full_placement = matches!(
             self.requested_ack_floor,
             StorageIntentGuaranteeClass::FullPlacement
@@ -1149,6 +1136,62 @@ mod tests {
 
         assert!(missing_full_shared_refs.is_posix_durable_success());
         assert!(!missing_full_shared_refs.satisfies_requested_ack_floor());
+    }
+
+    #[test]
+    fn requested_floor_receipt_fails_closed_for_stale_shared_evidence_refs() {
+        let target = LocalAckReceiptTarget::inode(21);
+        let mut stale_local_ref =
+            LocalAckReceipt::durable_intent(12, LocalAckOperation::SyncWrite, target, None);
+        let other_local_intent_ref = evidence_ref(
+            StorageIntentEvidenceKind::LocalIntentRecord,
+            "local-intent",
+            112,
+            LocalAckOperation::SyncWrite,
+            target,
+            None,
+        );
+        stale_local_ref.receipt.evidence_refs = evidence_refs(&[
+            other_local_intent_ref,
+            stale_local_ref.ordering_ref,
+            stale_local_ref.flush_fence_ref,
+            stale_local_ref.media_capability_ref,
+            stale_local_ref.reserve_ref,
+            stale_local_ref.dirty_window_ref,
+            stale_local_ref.rollout_ref,
+            stale_local_ref.tenant_isolation_ref,
+        ]);
+
+        assert!(stale_local_ref.is_posix_durable_success());
+        assert!(other_local_intent_ref.is_bound());
+        assert!(!stale_local_ref.satisfies_requested_ack_floor());
+
+        let mut stale_placement_ref =
+            LocalAckReceipt::full_local_placement(13, LocalAckOperation::Fsync, target, None);
+        stale_placement_ref.requested_ack_floor = StorageIntentGuaranteeClass::FullPlacement;
+        let other_placement_ref = evidence_ref(
+            StorageIntentEvidenceKind::PlacementReceipt,
+            "placement",
+            113,
+            LocalAckOperation::Fsync,
+            target,
+            None,
+        );
+        stale_placement_ref.receipt.evidence_refs = evidence_refs(&[
+            stale_placement_ref.local_intent_record_ref,
+            stale_placement_ref.ordering_ref,
+            stale_placement_ref.flush_fence_ref,
+            stale_placement_ref.media_capability_ref,
+            other_placement_ref,
+            stale_placement_ref.reserve_ref,
+            stale_placement_ref.dirty_window_ref,
+            stale_placement_ref.rollout_ref,
+            stale_placement_ref.tenant_isolation_ref,
+        ]);
+
+        assert!(stale_placement_ref.is_posix_durable_success());
+        assert!(other_placement_ref.is_bound());
+        assert!(!stale_placement_ref.satisfies_requested_ack_floor());
     }
 
     #[test]
