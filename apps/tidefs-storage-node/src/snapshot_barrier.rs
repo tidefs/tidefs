@@ -276,13 +276,11 @@ pub fn snapshot_barrier_send_report(
             max_txg,
             total_objects,
         }),
-        BarrierOutcome::Timeout { responded, missing } => {
-            Err(SnapshotBarrierSendError::Timeout {
-                barrier_id,
-                responded,
-                missing,
-            })
-        }
+        BarrierOutcome::Timeout { responded, missing } => Err(SnapshotBarrierSendError::Timeout {
+            barrier_id,
+            responded,
+            missing,
+        }),
         BarrierOutcome::Inconsistent {
             min_txg, max_txg, ..
         } => Err(SnapshotBarrierSendError::Inconsistent {
@@ -476,6 +474,11 @@ impl SnapshotCoordinator {
         Self {
             collector: BarrierCollector::new(barrier_id, snapshot_name, expected_peers, config),
         }
+    }
+
+    /// Return the active barrier id for diagnostics and refusal paths.
+    pub fn barrier_id(&self) -> BarrierId {
+        self.collector.barrier_id
     }
 
     /// Return the encoded barrier request frame bytes (for fanout).

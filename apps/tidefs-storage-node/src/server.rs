@@ -811,8 +811,10 @@ fn run_snapshot_barrier_before_send(
     let request_bytes = coordinator.request_bytes();
     {
         let mut active = ctx.active_barrier.lock().unwrap();
-        if active.is_some() {
-            return Err(SnapshotBarrierSendError::AlreadyActive { barrier_id });
+        if let Some(active) = active.as_ref() {
+            return Err(SnapshotBarrierSendError::AlreadyActive {
+                barrier_id: active.barrier_id(),
+            });
         }
         if peer_sessions.is_empty() {
             return snapshot_barrier_send_report(
@@ -6564,6 +6566,39 @@ mod cluster_pool_handler_tests {
             Frame::Error { message } => {
                 assert!(message.contains("snapshot barrier before VFSSEND2 send"));
                 assert!(message.contains("already active"));
+                assert!(message.contains("barrier 99"));
+            }
+            other => panic!("expected barrier error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn frame_send_chunked_aborts_when_snapshot_barrier_is_active() {
+        let (_dir, store) = frame_local_store();
+        let mut ctx = frame_test_context(Arc::clone(&store));
+        let fs_dir = tempfile::tempdir().unwrap();
+        ctx.config.fs_root = Some(fs_dir.path().join("fs"));
+        ctx.config.root_auth_key = Some(RootAuthenticationKey::demo_key());
+        *ctx.active_barrier.lock().unwrap() = Some(SnapshotCoordinator::new(
+            123,
+            "active".into(),
+            Vec::new(),
+            SnapshotBarrierConfig::default(),
+        ));
+
+        let response = handle_frame_ctx(
+            tidefs_transport::SessionId::new(1),
+            &Frame::SendChunked { key: Vec::new() },
+            &store,
+            &ctx,
+        )
+        .expect("chunked send returns barrier error");
+
+        match response {
+            Frame::Error { message } => {
+                assert!(message.contains("snapshot barrier before VFSSEND2 send"));
+                assert!(message.contains("already active"));
+                assert!(message.contains("barrier 123"));
             }
             other => panic!("expected barrier error, got {other:?}"),
         }
