@@ -504,6 +504,7 @@ impl LocalAckReceipt {
     pub fn satisfies_requested_ack_floor(self) -> bool {
         self.is_posix_durable_success()
             && self.has_local_ack_policy_identity()
+            && self.has_local_ack_result_projection()
             && self.refusal_reason() == StorageIntentRefusalReason::None
             && self.has_requested_ack_floor_evidence()
             && self.convergence.satisfies_ack_floor()
@@ -519,6 +520,11 @@ impl LocalAckReceipt {
             && self.receipt.policy_revision == LOCAL_ACK_POLICY_REVISION
             && self.refusal.policy_id == LOCAL_ACK_POLICY_ID
             && self.refusal.policy_revision == LOCAL_ACK_POLICY_REVISION
+    }
+
+    fn has_local_ack_result_projection(self) -> bool {
+        self.refusal.attempted_receipt == self.receipt.receipt_id
+            && self.refusal.evidence.is_bound()
     }
 
     fn required_local_evidence_refs(self) -> [StorageIntentEvidenceRef; 8] {
@@ -1259,6 +1265,39 @@ mod tests {
             StorageIntentRefusalReason::None
         );
         assert!(!refusal_policy_revision.satisfies_requested_ack_floor());
+    }
+
+    #[test]
+    fn requested_floor_receipt_fails_closed_for_mismatched_result_projection() {
+        let mut wrong_attempt = LocalAckReceipt::full_local_placement(
+            22,
+            LocalAckOperation::Syncfs,
+            LocalAckReceiptTarget::FILESYSTEM,
+            None,
+        );
+        wrong_attempt.refusal.attempted_receipt = StorageIntentReceiptId::ZERO;
+
+        assert!(wrong_attempt.is_posix_durable_success());
+        assert_eq!(
+            wrong_attempt.refusal_reason(),
+            StorageIntentRefusalReason::None
+        );
+        assert!(!wrong_attempt.satisfies_requested_ack_floor());
+
+        let mut unbound_evidence = LocalAckReceipt::full_local_placement(
+            23,
+            LocalAckOperation::Syncfs,
+            LocalAckReceiptTarget::FILESYSTEM,
+            None,
+        );
+        unbound_evidence.refusal.evidence = StorageIntentEvidenceRef::default();
+
+        assert!(unbound_evidence.is_posix_durable_success());
+        assert_eq!(
+            unbound_evidence.refusal_reason(),
+            StorageIntentRefusalReason::None
+        );
+        assert!(!unbound_evidence.satisfies_requested_ack_floor());
     }
 
     #[test]
