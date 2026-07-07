@@ -1044,6 +1044,7 @@ mod tests {
 
     /// Smoke test: verify the harness can mount and unmount cleanly.
     #[test]
+    #[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
     fn test_mount_unmount_cleanup() {
         let harness = MountHarness::new_or_fail("test_mount_unmount_cleanup");
         let md = harness.stat(".").expect("stat mount root");
@@ -1059,6 +1060,7 @@ mod tests {
 
     /// Basic IO round-trip: create, write, read, verify byte-identical.
     #[test]
+    #[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
     fn test_create_read_write_roundtrip() {
         let harness = MountHarness::new_or_fail("test_create_read_write_roundtrip");
         let data = b"Hello, TideFS! This is a round-trip test.\n";
@@ -1069,6 +1071,7 @@ mod tests {
 
     /// Metadata round-trip: chmod then stat, verify mode bits changed.
     #[test]
+    #[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
     fn test_metadata_chmod_roundtrip() {
         let harness = MountHarness::new_or_fail("test_metadata_chmod_roundtrip");
         harness
@@ -1098,6 +1101,7 @@ mod tests {
 
     /// Directory round-trip: mkdir, create entries, readdir, verify.
     #[test]
+    #[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
     fn test_directory_roundtrip() {
         let harness = MountHarness::new_or_fail("test_directory_roundtrip");
         harness.mkdir("subdir").expect("mkdir subdir");
@@ -1122,6 +1126,7 @@ mod tests {
     /// Persistence: unmount, verify backing store exists, remount,
     /// verify all files and data survive.
     #[test]
+    #[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
     fn test_persistence_roundtrip() {
         let data = b"persistent data that survives remount\n";
 
@@ -1184,6 +1189,7 @@ mod tests {
     /// Concurrent FD: open two fds on the same file, write from one,
     /// read from the other, verify visibility after flush.
     #[test]
+    #[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
     fn test_concurrent_fd_visibility() {
         use std::fs::{File, OpenOptions};
         use std::io::{Read, Seek, SeekFrom, Write};
@@ -1312,6 +1318,7 @@ mod tests {
     /// remounts the same backing store via MountHarness::remount,
     /// reads the file back, and asserts byte-for-byte equality.
     #[test]
+    #[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
     fn test_remount_persistence() {
         let seed: u64 = 0xcafef00d_deadbeef;
         let data_len: usize = 4096;
@@ -1389,6 +1396,7 @@ mod tests {
     /// Verify that two MountHarness instances can coexist on different
     /// store/mount paths without interfering with each other.
     #[test]
+    #[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
     fn two_independent_harnesses() {
         let h1 = MountHarness::new_or_fail("two_independent_harnesses h1");
         let h2 = MountHarness::new_or_fail("two_independent_harnesses h2");
@@ -1429,6 +1437,7 @@ mod tests {
 
     /// Verify that FuseMountFixture type alias works as MountHarness.
     #[test]
+    #[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
     fn fuse_mount_fixture_alias() {
         let harness: FuseMountFixture = MountHarness::new_or_fail("fuse_mount_fixture_alias");
         assert!(harness.mount_path().exists(), "mount path must exist");

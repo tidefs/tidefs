@@ -82,6 +82,7 @@ fn sequenced_test_data(len_bytes: usize) -> Vec<u8> {
 /// within the same session without any unmount.  Confirms write-dispatch
 /// and read-dispatch are wired correctly.
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn same_session_write_read_8kib() {
     let harness = MountHarness::new_or_fail("same_session_write_read_8kib");
 
@@ -108,6 +109,7 @@ fn same_session_write_read_8kib() {
 /// Write pseudo-random multi-block data (16 KiB) with checksum footer and
 /// verify byte-for-byte within the same session.
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn same_session_write_read_16kib_checksummed() {
     let harness = MountHarness::new_or_fail("same_session_write_read_16kib_checksummed");
 
@@ -133,6 +135,7 @@ fn same_session_write_read_16kib_checksummed() {
 /// so data survives a daemon restart.  The writeback-flush-on-fsync wiring in
 /// LocalFileSystem is already complete (verified via MountHarness integration).
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn write_fsync_remount_verify_8kib() {
     let data = sequenced_test_data(8192);
     let mut harness = MountHarness::new_or_fail("write_fsync_remount_verify_8kib");
@@ -175,6 +178,7 @@ fn write_fsync_remount_verify_8kib() {
 
 /// Write pseudo-random 4 KiB data with checksum, fsync, remount, verify.
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn write_fsync_remount_verify_4kib_checksummed() {
     let seed: u64 = 0xdeadbeef_cafebabe;
     let data = make_test_buffer(seed, 4096);
@@ -212,6 +216,7 @@ fn write_fsync_remount_verify_4kib_checksummed() {
 /// daemon process on the same backing store directory.  The mount point
 /// path is preserved across sessions by the harness lifetime.
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn full_write_fsync_remount_verify_cycle() {
     let seed: u64 = 0x01234567_89abcdef;
     let data_len: usize = 8192;
@@ -255,6 +260,7 @@ fn full_write_fsync_remount_verify_cycle() {
 /// Verify same-session write-read for several block sizes to exercise any
 /// block-alignment or extent-boundary paths in the write dispatch.
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn same_session_write_read_varying_sizes() {
     let harness = MountHarness::new_or_fail("same_session_write_read_varying_sizes");
 
@@ -283,6 +289,7 @@ fn same_session_write_read_varying_sizes() {
 
 /// Write three files of varying sizes, fsync each, remount, verify all three.
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn multi_file_write_fsync_remount_verify() {
     let mut harness = MountHarness::new_or_fail("multi_file_write_fsync_remount_verify");
 
@@ -393,6 +400,7 @@ fn kill_daemon(pid: u32) {
 // ── multi-chunk large-file durability ─────────────────────────────────────
 
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn write_durability_multi_chunk_64kib() {
     let test_data = sequenced_test_data(64 * 1024);
 
@@ -416,6 +424,7 @@ fn write_durability_multi_chunk_64kib() {
 // ── fdatasync durability ──────────────────────────────────────────────────
 
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn write_durability_fdatasync_4kib() {
     use std::os::unix::io::AsRawFd;
 
@@ -450,6 +459,7 @@ fn write_durability_fdatasync_4kib() {
 // ── nested directory structure preservation ───────────────────────────────
 
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn write_durability_nested_dirs() {
     let data_deep = prng_test_data(0xDEAD, 1024);
 
@@ -500,6 +510,7 @@ fn write_durability_nested_dirs() {
 // ── overwrite durability ──────────────────────────────────────────────────
 
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn write_durability_overwrite_then_remount() {
     let overwrite = b"NEW CONTENT AFTER OVERWRITE!\n".to_vec();
 
@@ -529,6 +540,7 @@ fn write_durability_overwrite_then_remount() {
 // ── empty file durability ─────────────────────────────────────────────────
 
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn write_durability_empty_file_survives_remount() {
     let mut harness = MountHarness::new_or_fail("write_durability_empty_file_survives_remount");
 
@@ -547,6 +559,7 @@ fn write_durability_empty_file_survives_remount() {
 // ── unlink persistence across remount ─────────────────────────────────────
 
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn write_durability_unlink_survives_remount() {
     let mut harness = MountHarness::new_or_fail("write_durability_unlink_survives_remount");
 
@@ -567,6 +580,7 @@ fn write_durability_unlink_survives_remount() {
 // ── crash simulation: SIGKILL daemon with prior fsync ─────────────────────
 
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn write_durability_fsync_crash_remount_4kib() {
     let test_data = prng_test_data(0xCAFE, 4096);
 
@@ -635,6 +649,7 @@ fn write_durability_fsync_crash_remount_4kib() {
 // ── negative test: write without fsync before crash ────────────────────────
 
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn write_durability_no_fsync_crash_test() {
     let test_data = prng_test_data(0xBEEF, 2048);
 
@@ -698,6 +713,7 @@ fn write_durability_no_fsync_crash_test() {
 // ── rename durability across remount ──────────────────────────────────────
 
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn write_durability_rename_survives_remount() {
     let data = b"renamed file content\n".to_vec();
 
@@ -729,6 +745,7 @@ fn write_durability_rename_survives_remount() {
 // ── file size metadata persistence ────────────────────────────────────────
 
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn write_durability_file_size_survives_remount() {
     let sizes: &[u64] = &[0, 1, 511, 512, 4095, 4096, 8192, 65536];
 
@@ -756,6 +773,7 @@ fn write_durability_file_size_survives_remount() {
 // ── append/extend durability ──────────────────────────────────────────────
 
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn write_durability_append_extend_survives_remount() {
     let mut harness = MountHarness::new_or_fail("write_durability_append_extend_survives_remount");
 
@@ -825,6 +843,7 @@ fn fsync_dir_impl(dir: &std::path::Path) -> std::io::Result<()> {
 /// with correct contents.  Validates that directory-fsync propagation
 /// flushes dirty writeback for children to durable storage.
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn multi_file_dir_fsync_propagation_remount_verify() {
     let mut harness = MountHarness::new_or_fail("multi_file_dir_fsync_propagation_remount_verify");
 
@@ -870,6 +889,7 @@ fn multi_file_dir_fsync_propagation_remount_verify() {
 /// #3731's multi_chunk_64kib covers 64 KiB — this test exercises an order
 /// of magnitude more data to stress multi-extent paths.
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn large_file_write_fsync_remount_verify() {
     let seed: u64 = 0xabcdef01_23456789;
     // 1.5 MiB exceeds a typical FUSE page/EIO extent size and exercises
@@ -928,6 +948,7 @@ fn append_to_file(
 /// record, fsync, write another record, fsync.  Contrast with #3731's
 /// append_extend test which uses full-file overwrite.
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn incremental_fsync_both_durable() {
     let data_a = sequenced_test_data(2048);
     let data_b = sequenced_test_data(4096);
@@ -974,6 +995,7 @@ fn incremental_fsync_both_durable() {
 /// daemon exited.  This is a negative-space bridge toward crash-consistency
 /// semantics where non-fsynced data may be lost.
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn incremental_fsync_second_not_durable() {
     let data_a = sequenced_test_data(1024);
     let data_b = sequenced_test_data(256);
@@ -1033,6 +1055,7 @@ fn incremental_fsync_second_not_durable() {
 /// verify all files intact and directory entries preserved.  This complements
 /// the upstream single-file crash test by exercising multi-file recovery.
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn crash_after_fsync_multi_file_survives() {
     let mut harness = MountHarness::new_or_fail("crash_after_fsync_multi_file_survives");
 
@@ -1100,6 +1123,7 @@ fn crash_after_fsync_multi_file_survives() {
 /// may be stale, but file content must survive the crash.  The upstream
 /// write_durability_fdatasync_4kib test only covers clean unmount, not crash.
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn crash_after_fdatasync_data_survives() {
     let data = prng_test_data(0xF00D, 4096);
 
@@ -1136,6 +1160,7 @@ fn crash_after_fdatasync_data_survives() {
 /// - File B (fsynced) is intact byte-for-byte.
 /// - Files A and C (not fsynced) state is documented (not asserted).
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn write_durability_selective_fsync_isolation() {
     let data_a = sequenced_test_data(1024);
     let data_b = make_test_buffer(0xAAAA_BBBB_CCCC_DDDD, 2048);
@@ -1210,6 +1235,7 @@ fn write_durability_selective_fsync_isolation() {
 /// entirely new (smaller) data, fsync.  Remount and verify only the new
 /// data survives with the correct (shorter) length.
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn write_durability_otrunc_fsync_remount() {
     use std::io::Write;
 
@@ -1288,6 +1314,7 @@ fn write_durability_otrunc_fsync_remount() {
 /// plausible metadata timestamp while the fdatasync'd file may or may not
 /// have its metadata persisted (fdatasync skips metadata sync).
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn write_durability_fdatasync_vs_fsync_metadata() {
     let data_a = prng_test_data(0xFDA7, 2048);
     let data_b = prng_test_data(0xF5AC, 2048);
@@ -1369,6 +1396,7 @@ fn write_durability_fdatasync_vs_fsync_metadata() {
 /// fsync ordering is respected across a crash boundary: fsynced data must
 /// survive; non-fsynced data may be lost.
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn write_durability_crash_mixed_sync_states() {
     let data_a = prng_test_data(0xAAAA, 2048);
     let data_b = prng_test_data(0xBBBB, 1024);
@@ -1426,6 +1454,7 @@ fn write_durability_crash_mixed_sync_states() {
 /// Exercises the writeback path for unaligned / sub-block data that does
 /// not fill a full FUSE page.
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn write_durability_crash_partial_block() {
     let partial_data: Vec<u8> = (0..100).map(|i: usize| (i * 7 + 13) as u8).collect();
 
@@ -1464,6 +1493,7 @@ fn write_durability_crash_partial_block() {
 /// fdatasync may or may not.  Unlike the clean-unmount variant, the crash
 /// path gives the daemon no chance to flush metadata on Drop.
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn write_durability_crash_fdatasync_vs_fsync() {
     let data_f = prng_test_data(0xFDA7, 2048);
     let data_s = prng_test_data(0xF5C7, 2048);
@@ -1538,6 +1568,7 @@ fn write_durability_crash_fdatasync_vs_fsync() {
 /// This is the journal / WAL append pattern: commit records one at a time
 /// with fsync between each, then crash.
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn write_durability_crash_append_chain() {
     let chunk_a: Vec<u8> = (0..256).map(|i| i as u8).collect();
     let chunk_b: Vec<u8> = (0..512).map(|i: u32| (i.wrapping_add(128)) as u8).collect();

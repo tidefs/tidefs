@@ -52,6 +52,7 @@ mod tests {
     // ═══════════════════════════════════════════════════════════════════
 
     #[test]
+    #[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
     fn basic_readback_verify_byte_for_byte() {
         let h = mount_for_read_validation();
 
@@ -62,6 +63,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
     fn basic_readback_single_byte() {
         let h = mount_for_read_validation();
 
@@ -71,6 +73,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
     fn basic_readback_empty_file() {
         let h = mount_for_read_validation();
 
@@ -88,6 +91,7 @@ mod tests {
     // ═══════════════════════════════════════════════════════════════════
 
     #[test]
+    #[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
     fn multichunk_128kib_read_full() {
         let h = mount_for_read_validation();
 
@@ -98,6 +102,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
     fn multichunk_128kib_read_in_4kib_chunks() {
         let h = mount_for_read_validation();
 
@@ -125,6 +130,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
     fn multichunk_unaligned_read_512b() {
         let h = mount_for_read_validation();
 
@@ -160,6 +166,7 @@ mod tests {
     // ═══════════════════════════════════════════════════════════════════
 
     #[test]
+    #[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
     fn pread_offset_start() {
         let h = mount_for_read_validation();
 
@@ -175,6 +182,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
     fn pread_offset_middle() {
         let h = mount_for_read_validation();
 
@@ -194,6 +202,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
     fn pread_offset_last_byte() {
         let h = mount_for_read_validation();
 
@@ -215,6 +224,7 @@ mod tests {
     // ═══════════════════════════════════════════════════════════════════
 
     #[test]
+    #[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
     fn sparse_file_hole_reads_as_zero() {
         let h = mount_for_read_validation();
 
@@ -246,6 +256,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
     fn sparse_file_data_after_hole_is_preserved() {
         let h = mount_for_read_validation();
 
@@ -275,6 +286,7 @@ mod tests {
     // ═══════════════════════════════════════════════════════════════════
 
     #[test]
+    #[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
     fn read_beyond_eof_returns_zero_bytes() {
         let h = mount_for_read_validation();
 
@@ -292,6 +304,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
     fn read_partially_beyond_eof_short_read() {
         let h = mount_for_read_validation();
 
@@ -309,6 +322,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
     fn read_at_exact_eof_returns_zero() {
         let h = mount_for_read_validation();
 
@@ -327,6 +341,7 @@ mod tests {
     // ═══════════════════════════════════════════════════════════════════
 
     #[test]
+    #[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
     fn concurrent_reads_same_file_consistent() {
         let h = mount_for_read_validation();
 
@@ -354,6 +369,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
     fn concurrent_reads_different_offsets() {
         let h = mount_for_read_validation();
 
@@ -392,6 +408,7 @@ mod tests {
     // ═══════════════════════════════════════════════════════════════════
 
     #[test]
+    #[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
     fn read_after_unlink_other_file_preserves_data() {
         let h = mount_for_read_validation();
 
@@ -414,6 +431,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
     fn read_unchanged_after_write_to_other_file() {
         let h = mount_for_read_validation();
 
@@ -448,6 +466,7 @@ mod tests {
     /// This is the Tier 3 mounted-FUSE validation that dedup does not
     /// collapse holes or corrupt sparse reads.
     #[test]
+    #[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
     fn sparse_file_with_duplicate_data_preserves_holes_and_data() {
         let h = MountHarness::builder()
             .enable_dedup()

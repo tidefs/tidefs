@@ -19,6 +19,7 @@ fn new_harness_or_fail(test_name: &str) -> MountHarness {
 }
 
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn remount_persistence_64kib_sequenced() {
     let test_data = sequenced_test_data(64 * 1024);
 
@@ -54,6 +55,7 @@ fn remount_persistence_64kib_sequenced() {
 }
 
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn remount_persistence_multiple_files() {
     let data_a = b"file alpha content\n".to_vec();
     let data_b = b"file beta content\n".to_vec();
@@ -96,6 +98,7 @@ fn remount_persistence_multiple_files() {
 }
 
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn remount_persistence_subdir_files() {
     let data_x = b"nested file x data\n".to_vec();
     let data_y = b"nested file y data\n".to_vec();
@@ -159,6 +162,7 @@ fn remount_persistence_subdir_files() {
 /// mount session and verify byte-for-byte equality.  This proves that the
 /// FUSE write dispatch path is functional end-to-end.
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn same_session_write_read_roundtrip() {
     let test_data = b"same-session write-then-read roundtrip payload\n";
 
@@ -180,6 +184,7 @@ fn same_session_write_read_roundtrip() {
 /// Write a multi-block payload (32 KiB) and read back within the same
 /// session to verify correctness across block boundaries.
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn same_session_write_read_multiblock() {
     let test_data: Vec<u8> = (0..32768u32)
         .map(|i| (i.wrapping_mul(7) % 251) as u8)
@@ -208,6 +213,7 @@ fn same_session_write_read_multiblock() {
 /// Write data, fsync via FUSE (sync_all), then immediately read back within
 /// the same session to confirm flush does not invalidate the read path.
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn same_session_write_fsync_read() {
     let test_data = b"write, fsync, read in same session\n";
 
@@ -232,6 +238,7 @@ fn same_session_write_fsync_read() {
 /// Write data, fdatasync via FUSE (sync_data), then read back.
 /// Fdatasync is a data-only sync; read-back must return the written bytes.
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn same_session_write_fdatasync_read() {
     use std::os::unix::io::AsRawFd;
     let test_data = b"write, fdatasync, read in same session\n";
