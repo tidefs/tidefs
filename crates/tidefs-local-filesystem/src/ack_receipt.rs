@@ -505,6 +505,7 @@ impl LocalAckReceipt {
         self.is_posix_durable_success()
             && self.has_local_ack_policy_identity()
             && self.has_local_ack_result_projection()
+            && self.has_no_receipt_retirement_projection()
             && self.refusal_reason() == StorageIntentRefusalReason::None
             && self.has_requested_ack_floor_evidence()
             && self.convergence.satisfies_ack_floor()
@@ -525,6 +526,12 @@ impl LocalAckReceipt {
     fn has_local_ack_result_projection(self) -> bool {
         self.refusal.attempted_receipt == self.receipt.receipt_id
             && self.refusal.evidence.is_bound()
+    }
+
+    fn has_no_receipt_retirement_projection(self) -> bool {
+        self.replacement_receipt == StorageIntentReceiptId::ZERO
+            && self.retires_receipt == StorageIntentReceiptId::ZERO
+            && !self.old_receipt_retired
     }
 
     fn required_local_evidence_refs(self) -> [StorageIntentEvidenceRef; 8] {
@@ -1298,6 +1305,42 @@ mod tests {
             StorageIntentRefusalReason::None
         );
         assert!(!unbound_evidence.satisfies_requested_ack_floor());
+    }
+
+    #[test]
+    fn requested_floor_receipt_fails_closed_for_retirement_projection_without_proof() {
+        let mut replacement_receipt = LocalAckReceipt::full_local_placement(
+            24,
+            LocalAckOperation::Fsync,
+            LocalAckReceiptTarget::inode(24),
+            None,
+        );
+        assert!(replacement_receipt.satisfies_requested_ack_floor());
+        replacement_receipt.replacement_receipt = StorageIntentReceiptId([1; 16]);
+        assert!(replacement_receipt.is_posix_durable_success());
+        assert!(!replacement_receipt.satisfies_requested_ack_floor());
+
+        let mut retires_receipt = LocalAckReceipt::full_local_placement(
+            25,
+            LocalAckOperation::Fsync,
+            LocalAckReceiptTarget::inode(25),
+            None,
+        );
+        assert!(retires_receipt.satisfies_requested_ack_floor());
+        retires_receipt.retires_receipt = StorageIntentReceiptId([2; 16]);
+        assert!(retires_receipt.is_posix_durable_success());
+        assert!(!retires_receipt.satisfies_requested_ack_floor());
+
+        let mut old_receipt_retired = LocalAckReceipt::full_local_placement(
+            26,
+            LocalAckOperation::Fsync,
+            LocalAckReceiptTarget::inode(26),
+            None,
+        );
+        assert!(old_receipt_retired.satisfies_requested_ack_floor());
+        old_receipt_retired.old_receipt_retired = true;
+        assert!(old_receipt_retired.is_posix_durable_success());
+        assert!(!old_receipt_retired.satisfies_requested_ack_floor());
     }
 
     #[test]
