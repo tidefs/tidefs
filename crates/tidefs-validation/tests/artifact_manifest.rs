@@ -183,6 +183,12 @@ fn committed_runtime_artifacts_have_runtime_tier_manifests() {
                     manifest.artifact_path
                 ));
             }
+            if !is_runtime_artifact_path(Path::new(&manifest.artifact_path)) {
+                failures.push(format!(
+                    "{manifest_path} is a live-runtime manifest pointing at non-runtime artifact `{}`",
+                    manifest.artifact_path
+                ));
+            }
             if let Err(error) = manifest.verify_artifact_digest(repo_root) {
                 failures.push(format!(
                     "{manifest_path} has invalid live-runtime artifact digest: {}",
