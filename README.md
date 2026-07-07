@@ -18,26 +18,139 @@ and TideFS infrastructure, runner credentials, deployment keys, API tokens, TLS
 keys, and other secrets remain outside this repository. The companion
 `tidefs/tidefs-infra-configuration` repository remains private.
 
-## Product Shape
+## Product Contract
 
-The finished TideFS product shape is local-first storage with explicit local
-and clustered modes for both mounted POSIX filesystem access and block-volume
-export. Local modes are first-class single-node product modes, not temporary
-cluster bring-up shortcuts.
+This section is the canonical product shape for TideFS. It is a product
+contract, not a roadmap and not a status report. It defines the final target
+shape; current capability remains controlled by the claim registry, review
+register, and live issues/PRs.
 
-A finished TideFS must make storage behavior durable and inspectable across
-local pools/devices, mounted filesystem and block-export paths, crash recovery
-to committed roots or explicit integrity/media failure, integrity checking,
-scrub/rebuild/device lifecycle, snapshots and reclaim, capacity/reserve
-accounting, page-cache/writeback/fsync/mmap durability, kernel-resident paths
-where claimed, operator truth from current runtime state, and validation proof
-packets tied to the claim registry.
+No other document, issue, prototype, crate, daemon, command, test, or
+automation path may add a user-facing TideFS product mode or public product
+surface by implication. If the final product shape changes, this section must
+change in the same reviewable path.
 
-That is the target shape, not current capability. Current status and blockers
-belong in `docs/CLAIMS_GATE_POLICY.md`, generated `docs/CLAIM_REGISTRY.md`,
-`docs/REVIEW_TODO_REGISTER.md`, and live GitHub issues and pull requests. Do
-not maintain a separate requirements, roadmap, or status Markdown root for the
-same product story.
+### Canonical Shape
+
+TideFS is installable host storage software. The finished product manages
+operator-selected local storage devices as TideFS pools, then exposes storage
+from those pools as mounted filesystems or block volumes. It is local-first:
+single-node local operation is a final product mode, not a temporary bring-up
+shortcut. Clustered operation is an additional final product mode, not a
+replacement for local operation.
+
+The final product object model is limited to:
+
+- Device: a local storage device admitted to, removed from, or rejected by a
+  TideFS pool.
+- Pool: an imported or importable ownership boundary over one or more devices.
+- Filesystem: a mountable namespace allocated from one pool.
+- Volume: a block-volume object allocated from one pool.
+- Snapshot: a read-only point-in-time state of a filesystem or volume.
+- Clone: a writable object derived from a snapshot, if and only if the relevant
+  mode admits clone support.
+
+Objects outside that list are not product objects unless this contract is
+updated.
+
+The finished product has exactly these user-facing storage modes:
+
+- Local mounted filesystem: one node owns local devices, imports a local pool,
+  and exposes a mounted filesystem path.
+- Local block-volume export: one node owns local devices, imports a local pool,
+  and exposes block volumes.
+- Clustered mounted filesystem: two or more nodes use explicit membership,
+  ownership, fencing, and recovery rules to expose mounted filesystem access.
+- Clustered block-volume export: two or more nodes use explicit membership,
+  ownership, fencing, and recovery rules to expose block volumes.
+
+For this contract, local means no peer is required for correct operation.
+Clustered means peer membership, ownership transfer, loss handling, and fencing
+are part of the product behavior. Mounted filesystem means a path mounted on a
+host. Block-volume export means a block device or export endpoint with
+documented read, write, flush, barrier, resize, discard, and fencing behavior.
+
+### Product Surfaces
+
+The finished product exposes storage behavior only through these public
+surfaces:
+
+- `tidefsctl` for operator inspection and control.
+- Mounted filesystem paths for advertised filesystem modes.
+- Block device or block export paths for advertised block-volume modes.
+- Runtime state for the current owner, peer membership, devices, pools,
+  filesystems, volumes, snapshots, clones, and recovery state.
+- Validation evidence packets tied to the claim registry for publishable
+  capability claims.
+- Repository documentation and generated claim registers as the publication
+  authority for what is promised, proven, blocked, or intentionally excluded.
+
+Internal crates, helper binaries, test fixtures, validation harnesses, service
+protocols, on-disk implementation details, and automation endpoints are not
+public product surfaces merely because they exist. A daemon, kernel module, or
+background worker may be required implementation machinery, but it is not an
+operator product interface unless this contract or a current repo-local
+authority document names that interface as public.
+
+### Required Final Behavior
+
+Every finished mode above must define its supported, refused, and failure
+behavior before that mode can be treated as part of the product. Silent
+best-effort behavior is not a product contract. Each mode must have explicit
+answers for:
+
+- Device admission, rejection, identity, ownership, loss, replacement, rebuild,
+  removal, and offline handling.
+- Pool create, import, export, destroy, device membership, degraded import, and
+  refused import behavior.
+- Filesystem create, mount, unmount, destroy, capacity limit, reserve, snapshot,
+  restore, and reclaim behavior for mounted filesystem modes.
+- Volume create, open/export, close/unexport, destroy, capacity limit, resize,
+  snapshot, restore, and reclaim behavior for block-volume modes.
+- Clone behavior, either as supported behavior with validation evidence or as an
+  explicit refusal in each mode.
+- Crash recovery to the last committed root, or an explicit integrity or media
+  failure when recovery cannot be completed.
+- Integrity verification using checksums or equivalent end-to-end protection,
+  plus operator-visible scrub and repair outcomes.
+- Mounted filesystem durability boundaries for writeback, page cache, `fsync`,
+  `fdatasync`, `mmap`, rename, link, unlink, truncate, and directory updates.
+- Block-volume durability boundaries for flush, FUA or equivalent barriers,
+  resize, discard, fencing, and ownership transfer.
+- Local and clustered accounting from live state, not stale declarations.
+- Operator-visible truth for current ownership, peer health, offline devices,
+  rebuild progress, scrub findings, blocked operations, refused operations, and
+  recovery state.
+- Kernel-resident data paths where the product claims kernel-resident behavior;
+  user-space shims do not satisfy those claims.
+- Repeatable validation that records the tested build, configuration, devices,
+  commands, results, and claim identifiers.
+
+### Exclusions
+
+The product contract also excludes interpretations that would make the target
+ambiguous:
+
+- TideFS is not defined as a cloud service, hosted control plane, or appliance.
+- TideFS is not cluster-only; local operation remains a first-class product
+  mode.
+- TideFS is not a generic object store, key-value store, database, backup
+  product, orchestration platform, or Kubernetes storage product.
+- TideFS does not include a browser UI, REST API, multi-tenant control plane,
+  remote management service, package repository, installer appliance, or hosted
+  telemetry service as final product surface.
+- TideFS is not production-ready.
+- TideFS does not claim matching OpenZFS or Ceph behavior.
+- TideFS is not POSIX-complete.
+- TideFS does not claim a final distributed operator UAPI.
+- Unreleased data formats and control surfaces do not carry compatibility
+  promises unless a repo-local authority document says so explicitly.
+- Separate requirements, roadmap, status, or vision Markdown roots must not be
+  created for this same product story.
+
+Current implementation status and blockers belong in
+`docs/CLAIMS_GATE_POLICY.md`, generated `docs/CLAIM_REGISTRY.md`,
+`docs/REVIEW_TODO_REGISTER.md`, and live GitHub issues and pull requests.
 
 ## Current Policy
 
