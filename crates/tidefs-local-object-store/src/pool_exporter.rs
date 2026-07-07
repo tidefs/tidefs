@@ -481,7 +481,7 @@ impl ExportOrchestrator {
                 PoolLifecycleAction::Export,
                 context,
                 self.device_configs.len() >= self.device_guids.len(),
-                true,
+                false,
                 format!("{} active mount(s) still own the pool", self.active_mounts),
             )
         } else {
@@ -1174,8 +1174,8 @@ mod tests {
 
         assert_eq!(evidence.action, PoolLifecycleAction::Export);
         assert!(evidence.topology_complete);
-        assert!(evidence.owner_authorized);
-        assert!(!evidence.is_fail_closed());
+        assert!(!evidence.owner_authorized);
+        assert!(evidence.is_fail_closed());
         assert!(evidence.reason.contains("active mount"));
     }
 
