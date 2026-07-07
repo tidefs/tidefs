@@ -445,7 +445,7 @@ impl<'a> MountedContentReadAuthority<'a> {
         record: &InodeRecord,
         allow_v0390_fixed_content: bool,
     ) -> Result<ContentLayout> {
-        read_content_layout_from_store(self.store, inode_id, record, allow_v0390_fixed_content)
+        read_content_layout_from_pool(self.pool, inode_id, record, allow_v0390_fixed_content)
     }
 
     pub(crate) fn read_all(
@@ -454,13 +454,14 @@ impl<'a> MountedContentReadAuthority<'a> {
         record: &InodeRecord,
         allow_v0390_fixed_content: bool,
     ) -> Result<Vec<u8>> {
-        read_content_from_store(
-            self.store,
-            inode_id,
-            record,
-            allow_v0390_fixed_content,
-            Some(self.pool),
-        )
+        let layout =
+            read_content_layout_from_pool(self.pool, inode_id, record, allow_v0390_fixed_content)?;
+        match &layout {
+            ContentLayout::Inline(content) => Ok(content.bytes.clone()),
+            ContentLayout::Chunked(manifest) => {
+                read_chunked_content(self.store, manifest, record.size, Some(self.pool))
+            }
+        }
     }
 
     pub(crate) fn read_range(
@@ -503,6 +504,44 @@ pub(crate) fn read_content_layout_from_store(
                 })
             }
         },
+        None if record.size == 0 => {
+            return Ok(empty_chunked_layout(inode_id, record.data_version));
+        }
+        None => {
+            return Err(FileSystemError::CorruptState {
+                reason: "file-like inode is missing its versioned content object",
+            })
+        }
+    };
+    let layout = decode_content_layout(&bytes)?;
+    validate_content_layout(inode_id, record, &layout)?;
+    Ok(layout)
+}
+
+pub(crate) fn read_content_layout_from_pool(
+    pool: &Pool,
+    inode_id: InodeId,
+    record: &InodeRecord,
+    allow_v0390_fixed_content: bool,
+) -> Result<ContentLayout> {
+    let bytes = match pool.get(
+        DeviceIoClass::Data,
+        content_object_key_for_version(inode_id, record.data_version),
+    )? {
+        Some(bytes) => bytes,
+        None if allow_v0390_fixed_content => {
+            match pool.get(DeviceIoClass::Data, content_object_key(inode_id))? {
+                Some(bytes) => bytes,
+                None if record.size == 0 => {
+                    return Ok(empty_chunked_layout(inode_id, record.data_version));
+                }
+                None => {
+                    return Err(FileSystemError::CorruptState {
+                        reason: "file-like inode is missing its content object",
+                    })
+                }
+            }
+        }
         None if record.size == 0 => {
             return Ok(empty_chunked_layout(inode_id, record.data_version));
         }
