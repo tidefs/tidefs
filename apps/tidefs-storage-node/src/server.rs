@@ -79,10 +79,11 @@ use tidefs_send_stream::{
 use tidefs_transport::carrier_selection::CarrierPolicy;
 use tidefs_transport::connection_registry::ConnectionRegistry;
 use tidefs_transport::{
-    build_read_responses, send_replication_msg, send_segment_fetch_response, ObjectTransferMessage,
-    PlacementMap as TransportPlacementMap, PlacementMapRefusalReason, PlacementVersionTracker,
-    ReplicationMessage, SegmentFetchRequest, SegmentFetchResponse, SessionCloseReason, SyncEntry,
-    Transport, TransportError, MAX_CHUNK_PAYLOAD, SEGMENT_FETCH_REQUEST_MAGIC,
+    build_read_responses, send_replication_msg, send_segment_fetch_response, MessagePriority,
+    ObjectTransferMessage, PlacementMap as TransportPlacementMap, PlacementMapRefusalReason,
+    PlacementVersionTracker, ReplicationMessage, SegmentFetchRequest, SegmentFetchResponse,
+    SessionCloseReason, SyncEntry, Transport, TransportError, MAX_CHUNK_PAYLOAD,
+    SEGMENT_FETCH_REQUEST_MAGIC,
 };
 use tidefs_types_pool_label_core::PoolRedundancyPolicy as LabelPoolRedundancyPolicy;
 
@@ -773,7 +774,11 @@ fn build_bridged_vfssend2_send_payload(
 }
 
 fn snapshot_barrier_send_label(barrier_id: u64, key: &[u8]) -> String {
-    let class = if key.is_empty() { "full" } else { "incremental" };
+    let class = if key.is_empty() {
+        "full"
+    } else {
+        "incremental"
+    };
     format!("vfssend2-{class}-send-{barrier_id}")
 }
 
@@ -807,9 +812,7 @@ fn run_snapshot_barrier_before_send(
     {
         let mut active = ctx.active_barrier.lock().unwrap();
         if active.is_some() {
-            return Err(SnapshotBarrierSendError::AlreadyActive {
-                barrier_id,
-            });
+            return Err(SnapshotBarrierSendError::AlreadyActive { barrier_id });
         }
         if peer_sessions.is_empty() {
             return snapshot_barrier_send_report(
@@ -823,7 +826,9 @@ fn run_snapshot_barrier_before_send(
     }
 
     for (&peer_id, &peer_session) in &peer_sessions {
-        if let Err(err) = transport.send_message(peer_session, &request_bytes) {
+        if let Err(err) =
+            transport.send_priority(peer_session, &request_bytes, MessagePriority::Control)
+        {
             *ctx.active_barrier.lock().unwrap() = None;
             return Err(SnapshotBarrierSendError::SendFailed {
                 barrier_id,
@@ -3945,7 +3950,7 @@ impl StorageNode {
         // Fan out the barrier request to every peer session.
         let mut send_errors = 0usize;
         for (peer_id, session_id) in &peer_sessions {
-            if let Err(e) = t.send_message(*session_id, &request_bytes) {
+            if let Err(e) = t.send_priority(*session_id, &request_bytes, MessagePriority::Control) {
                 eprintln!(
                     "[storage-node] barrier {barrier_id}: send to peer {peer_id} failed: {e:?}"
                 );
