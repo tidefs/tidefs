@@ -295,9 +295,16 @@ EOF
     echo "  Module:    kmod-posix-vfs"
     echo ""
 
-    for dep in "$QEMU_BIN" "$BUSYBOX" "$KERNEL_IMG" "$CPIO"; do
-      if [ ! -f "$dep" ] && [ ! -x "$dep" ]; then
-        echo "ERROR: dependency not found: $dep" >&2
+    for dep in "$QEMU_BIN" "$BUSYBOX" "$CPIO"; do
+      if [ ! -x "$dep" ]; then
+        echo "ERROR: executable dependency not found: $dep" >&2
+        write_blocked_manifest missing_dependency
+        exit 2
+      fi
+    done
+    for dep in "$KERNEL_IMG"; do
+      if [ ! -f "$dep" ]; then
+        echo "ERROR: file dependency not found: $dep" >&2
         write_blocked_manifest missing_dependency
         exit 2
       fi

@@ -274,9 +274,15 @@ echo ""
 # ---- Validate dependencies -------------------------------------------
 
 MISSING=""
-for dep in QEMU_BIN BUSYBOX KERNEL_IMG CPIO MODULE_KO; do
+for dep in QEMU_BIN BUSYBOX CPIO; do
   val="${!dep}"
-  if [ -z "$val" ] || [ ! -f "$val" ] && [ ! -x "$val" ]; then
+  if [ -z "$val" ] || [ ! -x "$val" ]; then
+    MISSING="$MISSING $dep=${val:-<empty>}"
+  fi
+done
+for dep in KERNEL_IMG MODULE_KO; do
+  val="${!dep}"
+  if [ -z "$val" ] || [ ! -f "$val" ]; then
     MISSING="$MISSING $dep=${val:-<empty>}"
   fi
 done
