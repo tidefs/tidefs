@@ -180,12 +180,10 @@ fn handle_client(
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     let response = match reader.read_line(&mut line) {
-        Ok(0) => LivePoolAdminResponse::error(2, "empty live-owner request"),
+        Ok(0) => live_admin_malformed("empty live-owner request"),
         Ok(_) => match serde_json::from_str::<LivePoolAdminRequest>(&line) {
             Ok(request) => dispatch_request(request, manifest, engine, shutdown),
-            Err(err) => live_admin_typed_error(LivePoolAdminError::malformed(format!(
-                "decode live-owner request: {err}"
-            ))),
+            Err(err) => live_admin_malformed(format!("decode live-owner request: {err}")),
         },
         Err(err) => LivePoolAdminResponse::error(2, format!("read live-owner request: {err}")),
     };
@@ -462,6 +460,10 @@ fn live_admin_typed_error(err: LivePoolAdminError) -> LivePoolAdminResponse {
         }
         Err(_) => LivePoolAdminResponse::error(err.exit_code, err.message),
     }
+}
+
+fn live_admin_malformed(message: impl Into<String>) -> LivePoolAdminResponse {
+    live_admin_typed_error(LivePoolAdminError::malformed(message))
 }
 
 fn pool_destroy_refusal_json(
@@ -783,6 +785,27 @@ mod tests {
         assert_eq!(
             value.get("version").and_then(serde_json::Value::as_u64),
             Some(42)
+        );
+    }
+
+    #[test]
+    fn empty_live_owner_request_uses_typed_malformed_error() {
+        let response = live_admin_malformed("empty live-owner request");
+
+        assert_eq!(response.exit_code, 2);
+        let LivePoolAdminResponseBody::Error {
+            message,
+            machine_json: Some(machine_json),
+        } = response.body
+        else {
+            panic!("empty request should carry typed malformed machine JSON");
+        };
+
+        assert_eq!(message, "empty live-owner request");
+        let value: serde_json::Value = serde_json::from_str(&machine_json).unwrap();
+        assert_eq!(
+            value.get("kind").and_then(serde_json::Value::as_str),
+            Some("malformed")
         );
     }
 
