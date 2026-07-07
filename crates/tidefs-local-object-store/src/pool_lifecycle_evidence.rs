@@ -76,13 +76,30 @@ pub struct PoolLifecycleContext {
     pub commit_group: u64,
 }
 
+impl PoolLifecycleContext {
+    #[must_use]
+    pub fn topology_complete(&self) -> bool {
+        self.device_count >= self.expected_device_count
+    }
+}
+
 impl PoolLifecycleEvidence {
     #[must_use]
     pub fn executed(action: PoolLifecycleAction, context: PoolLifecycleContext) -> Self {
+        if !context.topology_complete() {
+            return Self::refused_with_authority(
+                action,
+                context,
+                false,
+                true,
+                "topology evidence incomplete",
+            );
+        }
+
         Self {
             action,
             outcome: PoolLifecycleOutcome::Executed,
-            topology_complete: context.device_count >= context.expected_device_count,
+            topology_complete: true,
             owner_authorized: true,
             pool_guid: context.pool_guid,
             pool_name: context.pool_name,
@@ -177,6 +194,21 @@ mod tests {
         assert!(evidence.owner_authorized);
         assert!(!evidence.is_fail_closed());
         assert!(evidence.summary().contains("action=import"));
+    }
+
+    #[test]
+    fn executed_evidence_refuses_incomplete_topology() {
+        let mut incomplete = context();
+        incomplete.device_count = 1;
+
+        let evidence = PoolLifecycleEvidence::executed(PoolLifecycleAction::Import, incomplete);
+
+        assert_eq!(evidence.outcome, PoolLifecycleOutcome::Refused);
+        assert!(!evidence.topology_complete);
+        assert!(evidence.owner_authorized);
+        assert!(evidence.is_fail_closed());
+        assert_eq!(evidence.reason, "topology evidence incomplete");
+        assert!(evidence.summary().contains("outcome=refused"));
     }
 
     #[test]
