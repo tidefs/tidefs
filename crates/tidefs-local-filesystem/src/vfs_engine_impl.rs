@@ -3055,7 +3055,10 @@ impl VfsLocalFileSystem {
                     }
                 };
                 let auth_key = self.fs.borrow().root_authentication_key.as_bytes32();
-                let request = build_snap_push_message(&stream.encoded, &auth_key);
+                let request = match build_snap_push_message(&stream.encoded, &auth_key) {
+                    Ok(request) => request,
+                    Err(err) => return live_admin_error(1, err),
+                };
 
                 let mut transport = Transport::new(*node_id);
                 transport.add_node(NodeInfo::new(
@@ -3959,16 +3962,27 @@ const SNAP_NET_MAGIC: &[u8; 4] = b"VSNP";
 const SNAP_KIND_PUSH: u8 = 1;
 const SNAP_KIND_ACK: u8 = 4;
 const SNAP_KIND_ERROR: u8 = 0;
+const SNAP_NET_PUSH_HEADER_LEN: usize = 4 + 1 + 4 + 32 + 4;
 
-fn build_snap_push_message(export: &[u8], auth_key: &[u8; 32]) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(4 + 1 + 4 + 32 + 4 + export.len());
+fn snap_net_payload_len(payload_len: usize) -> Result<u32, String> {
+    u32::try_from(payload_len).map_err(|_| {
+        format!("snapshot send: export payload is too large for VSNP frame: {payload_len} bytes")
+    })
+}
+
+fn build_snap_push_message(export: &[u8], auth_key: &[u8; 32]) -> Result<Vec<u8>, String> {
+    let export_len = snap_net_payload_len(export.len())?;
+    let capacity = SNAP_NET_PUSH_HEADER_LEN
+        .checked_add(export.len())
+        .ok_or_else(|| "snapshot send: VSNP push frame length overflow".to_string())?;
+    let mut msg = Vec::with_capacity(capacity);
     msg.extend_from_slice(SNAP_NET_MAGIC);
     msg.push(SNAP_KIND_PUSH);
     msg.extend_from_slice(&32u32.to_le_bytes());
     msg.extend_from_slice(auth_key);
-    msg.extend_from_slice(&(export.len() as u32).to_le_bytes());
+    msg.extend_from_slice(&export_len.to_le_bytes());
     msg.extend_from_slice(export);
-    msg
+    Ok(msg)
 }
 
 fn parse_snap_net_response(data: &[u8]) -> Result<String, String> {
@@ -3983,7 +3997,7 @@ fn parse_snap_net_response(data: &[u8]) -> Result<String, String> {
     }
     let kind = data[4];
     let msg_len = u32::from_le_bytes(data[5..9].try_into().unwrap()) as usize;
-    let start = 9;
+    let start: usize = 9;
     let frame_len = start
         .checked_add(msg_len)
         .ok_or_else(|| "snapshot send: remote response length overflow".to_string())?;
@@ -6649,6 +6663,18 @@ mod tests {
                 "snapshot send: remote response has trailing bytes: expected 11 bytes, got 12"
                     .to_string()
             )
+        );
+    }
+
+    #[test]
+    fn snap_net_payload_len_rejects_lengths_above_frame_limit() {
+        let oversized = usize::try_from(u64::from(u32::MAX) + 1).expect("64-bit test target");
+
+        assert_eq!(
+            snap_net_payload_len(oversized),
+            Err(format!(
+                "snapshot send: export payload is too large for VSNP frame: {oversized} bytes"
+            ))
         );
     }
 
