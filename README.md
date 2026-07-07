@@ -18,6 +18,27 @@ and TideFS infrastructure, runner credentials, deployment keys, API tokens, TLS
 keys, and other secrets remain outside this repository. The companion
 `tidefs/tidefs-infra-configuration` repository remains private.
 
+## Product Shape
+
+The finished TideFS product shape is local-first storage with explicit local
+and clustered modes for both mounted POSIX filesystem access and block-volume
+export. Local modes are first-class single-node product modes, not temporary
+cluster bring-up shortcuts.
+
+A finished TideFS must make storage behavior durable and inspectable across
+local pools/devices, mounted filesystem and block-export paths, crash recovery
+to committed roots or explicit integrity/media failure, integrity checking,
+scrub/rebuild/device lifecycle, snapshots and reclaim, capacity/reserve
+accounting, page-cache/writeback/fsync/mmap durability, kernel-resident paths
+where claimed, operator truth from current runtime state, and validation proof
+packets tied to the claim registry.
+
+That is the target shape, not current capability. Current status and blockers
+belong in `docs/CLAIMS_GATE_POLICY.md`, generated `docs/CLAIM_REGISTRY.md`,
+`docs/REVIEW_TODO_REGISTER.md`, and live GitHub issues and pull requests. Do
+not maintain a separate requirements, roadmap, or status Markdown root for the
+same product story.
+
 ## Current Policy
 
 - License: `GPL-2.0-only WITH Linux-syscall-note`.

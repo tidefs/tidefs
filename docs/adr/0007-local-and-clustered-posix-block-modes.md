@@ -14,8 +14,9 @@ must not accidentally inherit a cluster coordination bottleneck.
 
 The review covered the required sources:
 
-- `docs/00_user_requirements.md` requires source behavior, live issue state,
-  current repo docs, and git history as review inputs.
+- `README.md` records the current product shape, while `AGENTS.md` requires
+  source behavior, live issue and pull-request state, current repo docs, and
+  git history as review inputs.
 - `docs/ARCHITECTURE.md` classifies the FUSE and ublk daemons as userspace
   harnesses above product layers, and lists lock, lease, membership, POSIX,
   and block-volume crates as distinct architectural pieces.
