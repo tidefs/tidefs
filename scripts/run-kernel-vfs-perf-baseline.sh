@@ -219,7 +219,15 @@ EOF
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --keep-tmp) KEEP_TMP=1; shift ;;
-    --timeout) TIMEOUT_SEC="$2"; shift 2 ;;
+    --timeout)
+      if [ "$#" -lt 2 ] || [[ "$2" == -* ]]; then
+        echo "ERROR: --timeout requires SECONDS" >&2
+        usage >&2
+        exit 2
+      fi
+      TIMEOUT_SEC="$2"
+      shift 2
+      ;;
     --self-test-parser) SELF_TEST_PARSER=1; shift ;;
     --help|-h) usage; exit 0 ;;
     *) echo "Unknown option: $1"; usage >&2; exit 2 ;;
