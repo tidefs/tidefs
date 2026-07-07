@@ -6874,23 +6874,26 @@ impl FuseVfsAdapter {
                     clean_write_through_pending,
                 )
             };
+            let release_fallback = |fallback_to_release: &mut Option<EngineFileHandle>| {
+                if let Some(fallback) = fallback_to_release.take() {
+                    let e = self.engine.lock().unwrap();
+                    let _ = e.release(&fallback);
+                }
+            };
             let written = match write_result {
                 Ok(written) => written,
                 Err(errno) => {
-                    if let Some(fallback) = fallback_to_release.take() {
-                        let e = self.engine.lock().unwrap();
-                        let _ = e.release(&fallback);
-                    }
+                    release_fallback(&mut fallback_to_release);
                     return Err(errno);
                 }
             };
             if written > 0 && clean_write_through_pending {
-                let written_len = usize::try_from(written).map_err(|_| Errno::EIO)?;
+                let Ok(written_len) = usize::try_from(written) else {
+                    release_fallback(&mut fallback_to_release);
+                    return Err(Errno::EIO);
+                };
                 let Some(written_data) = data.get(..written_len) else {
-                    if let Some(fallback) = fallback_to_release.take() {
-                        let e = self.engine.lock().unwrap();
-                        let _ = e.release(&fallback);
-                    }
+                    release_fallback(&mut fallback_to_release);
                     return Err(Errno::EIO);
                 };
                 if let Err(errno) = self.record_clean_write_through_after_write(
@@ -6899,10 +6902,7 @@ impl FuseVfsAdapter {
                     written,
                     written_data,
                 ) {
-                    if let Some(fallback) = fallback_to_release.take() {
-                        let e = self.engine.lock().unwrap();
-                        let _ = e.release(&fallback);
-                    }
+                    release_fallback(&mut fallback_to_release);
                     return Err(errno);
                 }
             }
@@ -6917,17 +6917,11 @@ impl FuseVfsAdapter {
                         .current_commit_group_id
                         .load(Ordering::Relaxed);
                     let Ok(written_len) = usize::try_from(written) else {
-                        if let Some(fallback) = fallback_to_release.take() {
-                            let e = self.engine.lock().unwrap();
-                            let _ = e.release(&fallback);
-                        }
+                        release_fallback(&mut fallback_to_release);
                         return Err(Errno::EIO);
                     };
                     let Some(written_data) = data.get(..written_len) else {
-                        if let Some(fallback) = fallback_to_release.take() {
-                            let e = self.engine.lock().unwrap();
-                            let _ = e.release(&fallback);
-                        }
+                        release_fallback(&mut fallback_to_release);
                         return Err(Errno::EIO);
                     };
                     if written_data.len() <= 256 {
@@ -6946,12 +6940,12 @@ impl FuseVfsAdapter {
                     .lock()
                     .unwrap()
                     .record_write_buf(written);
-                let written_len = usize::try_from(written).map_err(|_| Errno::EIO)?;
+                let Ok(written_len) = usize::try_from(written) else {
+                    release_fallback(&mut fallback_to_release);
+                    return Err(Errno::EIO);
+                };
                 let Some(written_data) = data.get(..written_len) else {
-                    if let Some(fallback) = fallback_to_release.take() {
-                        let e = self.engine.lock().unwrap();
-                        let _ = e.release(&fallback);
-                    }
+                    release_fallback(&mut fallback_to_release);
                     return Err(Errno::EIO);
                 };
                 // Direct I/O conflict guard: clear stale cached dirty ranges
@@ -6967,10 +6961,7 @@ impl FuseVfsAdapter {
                         u64::from(written),
                         AuthoritativeRangePayload::Bytes(written_data),
                     ) {
-                        if let Some(fallback) = fallback_to_release.take() {
-                            let e = self.engine.lock().unwrap();
-                            let _ = e.release(&fallback);
-                        }
+                        release_fallback(&mut fallback_to_release);
                         return Err(errno);
                     }
                 } else if let Err(errno) = self
@@ -6981,10 +6972,7 @@ impl FuseVfsAdapter {
                         written_data,
                     )
                 {
-                    if let Some(fallback) = fallback_to_release.take() {
-                        let e = self.engine.lock().unwrap();
-                        let _ = e.release(&fallback);
-                    }
+                    release_fallback(&mut fallback_to_release);
                     return Err(errno);
                 }
             }
@@ -7001,17 +6989,11 @@ impl FuseVfsAdapter {
                 if let Some(datasync) = sync_datasync {
                     let sync_result =
                         self.dispatch_fsync_file_handle(ctx, ino, &sync_efh, datasync);
-                    if let Some(fallback) = fallback_to_release.take() {
-                        let e = self.engine.lock().unwrap();
-                        let _ = e.release(&fallback);
-                    }
+                    release_fallback(&mut fallback_to_release);
                     sync_result?;
                 }
             }
-            if let Some(fallback) = fallback_to_release.take() {
-                let e = self.engine.lock().unwrap();
-                let _ = e.release(&fallback);
-            }
+            release_fallback(&mut fallback_to_release);
             if written > 0 {
                 self.mark_relatime_read_atime_pending_after_write(ino);
             }
