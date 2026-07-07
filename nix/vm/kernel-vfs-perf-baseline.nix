@@ -322,6 +322,11 @@ EOF
       write_blocked_manifest missing_module
       exit 2
     fi
+    if [ ! -f "$POSIX_VFS_KO" ]; then
+      echo "BLOCKED: tidefs_posix_vfs.ko path is not a file: $POSIX_VFS_KO"
+      write_blocked_manifest missing_module
+      exit 2
+    fi
     echo "  Module .ko: $POSIX_VFS_KO"
 
     RUN_DIR="$TMPDIR/validation-$$"
