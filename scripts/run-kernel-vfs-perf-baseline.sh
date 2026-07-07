@@ -53,6 +53,49 @@ git_dirty_json_bool() {
   fi
 }
 
+write_blocked_manifest() {
+  local reason="$1"
+  local run_id
+  local output_dir
+
+  mkdir -p "$VALIDATION_DIR"
+  run_id="$(date -u +%Y-%m-%dT%H%M%SZ)"
+  output_dir="$VALIDATION_DIR/$run_id"
+  mkdir -p "$output_dir"
+
+  cat > "$output_dir/validation-manifest.json" << MANIFEST
+{
+  "test": "kernel-vfs-perf-baseline",
+  "date": "$run_id",
+  "mode": "bootstrap",
+  "validation_tier": "Tier 5 mounted Linux 7.0 kernel VFS",
+  "qemu_accel": "$(test -e /dev/kvm && echo kvm || echo tcg)",
+  "qemu_exit": null,
+  "qemu_success": false,
+  "qemu_timed_out": false,
+  "log_empty": true,
+  "required_metrics_present": false,
+  "metrics": {
+    "write_duration_ms": "0",
+    "read_duration_ms": "0",
+    "write_throughput_MBps": "0",
+    "read_throughput_MBps": "0",
+    "stat_avg_us": "0"
+  },
+  "pass": 0,
+  "fail": 0,
+  "blocked": 1,
+  "commit": "$(cd "$REPO_ROOT" && git rev-parse HEAD 2>/dev/null || echo unknown)",
+  "worktree_dirty": $(git_dirty_json_bool),
+  "module_source": "configured external module path",
+  "status": "BLOCKED",
+  "result": "kernel VFS perf baseline BLOCKED: $reason"
+}
+MANIFEST
+
+  echo "Validation output directory: $output_dir"
+}
+
 analyze_qemu_log() {
   local log_file="$1"
   local qemu_exit="$2"
@@ -288,6 +331,7 @@ for dep in KERNEL_IMG MODULE_KO; do
 done
 if [ -n "$MISSING" ]; then
   echo "FATAL: missing dependencies:$MISSING" >&2
+  write_blocked_manifest missing_dependency
   exit 2
 fi
 
