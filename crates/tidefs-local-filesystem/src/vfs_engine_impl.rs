@@ -3984,14 +3984,24 @@ fn parse_snap_net_response(data: &[u8]) -> Result<String, String> {
     let kind = data[4];
     let msg_len = u32::from_le_bytes(data[5..9].try_into().unwrap()) as usize;
     let start = 9;
-    if data.len() < start + msg_len {
+    let frame_len = start
+        .checked_add(msg_len)
+        .ok_or_else(|| "snapshot send: remote response length overflow".to_string())?;
+    if data.len() < frame_len {
         return Err(format!(
             "snapshot send: remote response truncated: need {} bytes, got {}",
-            start + msg_len,
+            frame_len,
             data.len()
         ));
     }
-    let message = String::from_utf8_lossy(&data[start..start + msg_len]).into_owned();
+    if data.len() != frame_len {
+        return Err(format!(
+            "snapshot send: remote response has trailing bytes: expected {} bytes, got {}",
+            frame_len,
+            data.len()
+        ));
+    }
+    let message = String::from_utf8_lossy(&data[start..frame_len]).into_owned();
     match kind {
         SNAP_KIND_ACK => Ok(message),
         SNAP_KIND_ERROR => Err(format!("snapshot send: remote error: {message}")),
@@ -6584,6 +6594,62 @@ mod tests {
         ack.extend_from_slice(&0u32.to_le_bytes());
 
         assert_eq!(parse_snap_net_response(&ack), Ok(String::new()));
+    }
+
+    #[test]
+    fn parse_snap_net_response_accepts_ack_message() {
+        let mut ack = Vec::new();
+        ack.extend_from_slice(SNAP_NET_MAGIC);
+        ack.push(SNAP_KIND_ACK);
+        ack.extend_from_slice(&2u32.to_le_bytes());
+        ack.extend_from_slice(b"ok");
+
+        assert_eq!(parse_snap_net_response(&ack), Ok("ok".to_string()));
+    }
+
+    #[test]
+    fn parse_snap_net_response_surfaces_remote_error() {
+        let mut error = Vec::new();
+        error.extend_from_slice(SNAP_NET_MAGIC);
+        error.push(SNAP_KIND_ERROR);
+        error.extend_from_slice(&6u32.to_le_bytes());
+        error.extend_from_slice(b"denied");
+
+        assert_eq!(
+            parse_snap_net_response(&error),
+            Err("snapshot send: remote error: denied".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_snap_net_response_rejects_truncated_message() {
+        let mut ack = Vec::new();
+        ack.extend_from_slice(SNAP_NET_MAGIC);
+        ack.push(SNAP_KIND_ACK);
+        ack.extend_from_slice(&2u32.to_le_bytes());
+        ack.push(b'o');
+
+        assert_eq!(
+            parse_snap_net_response(&ack),
+            Err("snapshot send: remote response truncated: need 11 bytes, got 10".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_snap_net_response_rejects_trailing_bytes() {
+        let mut ack = Vec::new();
+        ack.extend_from_slice(SNAP_NET_MAGIC);
+        ack.push(SNAP_KIND_ACK);
+        ack.extend_from_slice(&2u32.to_le_bytes());
+        ack.extend_from_slice(b"ok!");
+
+        assert_eq!(
+            parse_snap_net_response(&ack),
+            Err(
+                "snapshot send: remote response has trailing bytes: expected 11 bytes, got 12"
+                    .to_string()
+            )
+        );
     }
 
     const PREFETCH_POLICY: StorageIntentPolicyId = StorageIntentPolicyId([0x31; 16]);
