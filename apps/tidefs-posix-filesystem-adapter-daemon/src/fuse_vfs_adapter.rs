@@ -7423,19 +7423,12 @@ impl FuseVfsAdapter {
                 AuthoritativeRangePayload::Bytes(written_data),
             )?;
         } else if let Some(ref wb_cache) = self.writeback_page_cache {
-            self.update_clean_write_through_page_cache(
-                wb_cache,
-                ino,
-                offset,
-                written,
-                written_data,
-            );
+            self.update_clean_write_through_page_cache(wb_cache, ino, offset, written_data);
             if !Arc::ptr_eq(wb_cache, &self.write_page_cache) {
                 self.update_clean_write_through_page_cache(
                     &self.write_page_cache,
                     ino,
                     offset,
-                    written,
                     written_data,
                 );
             }
@@ -7444,7 +7437,6 @@ impl FuseVfsAdapter {
                 &self.write_page_cache,
                 ino,
                 offset,
-                written,
                 written_data,
             );
         }
@@ -7463,16 +7455,12 @@ impl FuseVfsAdapter {
         cache: &PageCache,
         ino: u64,
         offset: u64,
-        written: u32,
         data: &[u8],
     ) {
-        if written == 0 {
+        if data.is_empty() {
             return;
         }
-        let patch_len = usize::try_from(written)
-            .unwrap_or(data.len())
-            .min(data.len());
-        let _ = cache.patch_resident_clean_range(ino, offset, &data[..patch_len]);
+        let _ = cache.patch_resident_clean_range(ino, offset, data);
     }
 
     fn reconcile_write_through_dirty_range_without_block_volume(
