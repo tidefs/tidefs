@@ -147,6 +147,13 @@ fn committed_runtime_artifacts_have_runtime_tier_manifests() {
     let mut artifact_files = Vec::new();
     collect_committed_artifact_files(&artifacts_root, &mut artifact_files);
 
+    let committed_artifacts = artifact_files
+        .iter()
+        .filter(|path| !is_manifest_path(path))
+        .map(|path| repo_relative_path(repo_root, path))
+        .collect::<BTreeSet<_>>();
+
+    let mut failures = Vec::new();
     let mut live_runtime_artifacts = BTreeSet::new();
     for path in artifact_files.iter().filter(|path| is_manifest_path(path)) {
         let text = fs::read_to_string(path).unwrap_or_else(|error| {
@@ -163,11 +170,29 @@ fn committed_runtime_artifacts_have_runtime_tier_manifests() {
             )
         });
         if manifest.validation_tier.is_live_runtime() {
+            let manifest_path = repo_relative_path(repo_root, path);
+            if is_manifest_path(Path::new(&manifest.artifact_path)) {
+                failures.push(format!(
+                    "{manifest_path} is a live-runtime manifest pointing at manifest `{}`",
+                    manifest.artifact_path
+                ));
+            }
+            if !committed_artifacts.contains(&manifest.artifact_path) {
+                failures.push(format!(
+                    "{manifest_path} is a live-runtime manifest pointing at non-committed artifact `{}`",
+                    manifest.artifact_path
+                ));
+            }
+            if let Err(error) = manifest.verify_artifact_digest(repo_root) {
+                failures.push(format!(
+                    "{manifest_path} has invalid live-runtime artifact digest: {}",
+                    error.failures().join("; ")
+                ));
+            }
             live_runtime_artifacts.insert(manifest.artifact_path);
         }
     }
 
-    let mut failures = Vec::new();
     for path in artifact_files
         .iter()
         .filter(|path| is_runtime_artifact_path(path))
