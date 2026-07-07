@@ -105,6 +105,44 @@ EOF
       fi
     }
 
+    write_blocked_manifest() {
+      local reason="$1"
+      local output_dir
+
+      output_dir="/root/ai/tmp/tidefs-validation/kernel-vfs-perf-baseline/$(date -u +%Y-%m-%dT%H%M%SZ)"
+      mkdir -p "$output_dir"
+
+      cat > "$output_dir/validation-manifest.json" << MANIFEST
+{
+  "test": "kernel-vfs-perf-baseline",
+  "date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "mode": "bootstrap",
+  "validation_tier": "Tier 5 mounted Linux 7.0 kernel VFS",
+  "qemu_exit": null,
+  "qemu_success": false,
+  "qemu_timed_out": false,
+  "log_empty": true,
+  "required_metrics_present": false,
+  "metrics": {
+    "write_throughput_MBps": "0",
+    "read_throughput_MBps": "0",
+    "stat_avg_latency_us": "0"
+  },
+  "pass": 0,
+  "fail": 0,
+  "blocked": 1,
+  "skip": 0,
+  "commit": "$(git_commit_value)",
+  "worktree_dirty": $(git_dirty_json_bool),
+  "module_source": "configured external module path",
+  "status": "BLOCKED",
+  "result": "kernel VFS throughput latency baseline BLOCKED: $reason"
+}
+MANIFEST
+
+      echo "Validation output directory: $output_dir"
+    }
+
     analyze_qemu_log() {
       local log_file="$1"
       local qemu_exit="$2"
@@ -260,6 +298,7 @@ EOF
     for dep in "$QEMU_BIN" "$BUSYBOX" "$KERNEL_IMG" "$CPIO"; do
       if [ ! -f "$dep" ] && [ ! -x "$dep" ]; then
         echo "ERROR: dependency not found: $dep" >&2
+        write_blocked_manifest missing_dependency
         exit 2
       fi
     done
@@ -273,7 +312,8 @@ EOF
 
     if [ -z "$POSIX_VFS_KO" ]; then
       echo "BLOCKED: tidefs_posix_vfs.ko not found in MODULE_DIR=$MODULE_DIR"
-      exit 1
+      write_blocked_manifest missing_module
+      exit 2
     fi
     echo "  Module .ko: $POSIX_VFS_KO"
 
