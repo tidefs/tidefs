@@ -28,10 +28,14 @@ pub fn check_workspace_hygiene() -> Result<(), String> {
     if let Err(e) = check_duplicate_test_names(&workspace_root) {
         errors.push(e);
     }
+    if let Err(e) = check_validation_harness_review_debt_markers(&workspace_root) {
+        errors.push(e);
+    }
 
     if errors.is_empty() {
         println!(
-            "workspace hygiene ok: no duplicate deps, mod decls, use imports, or test names found"
+            "workspace hygiene ok: no duplicate deps, mod decls, use imports, test names, \
+             or anonymous validation debt markers found"
         );
         Ok(())
     } else {
@@ -631,6 +635,217 @@ pub fn check_no_build_artifacts(workspace_root: &Path) -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------------------
+// Review-debt marker gate for active validation and harness text
+// ---------------------------------------------------------------------------
+
+/// Reject anonymous debt-marker wording in active validation scripts and
+/// harness surfaces. Negative-test/refusal fixtures remain allowed when the
+/// surrounding text classifies them explicitly.
+pub fn check_validation_harness_review_debt_markers(workspace_root: &Path) -> Result<(), String> {
+    let paths = tracked_validation_harness_files(workspace_root)?;
+    check_review_debt_markers_in_paths(workspace_root, &paths)
+}
+
+fn tracked_validation_harness_files(workspace_root: &Path) -> Result<Vec<PathBuf>, String> {
+    let output = std::process::Command::new("git")
+        .args(["ls-files", "--", "nix/vm", "scripts", "validation"])
+        .current_dir(workspace_root)
+        .output();
+
+    let files = match output {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
+        _ => return Err("git ls-files failed for validation harness debt scan".to_string()),
+    };
+
+    Ok(files
+        .lines()
+        .map(str::trim)
+        .filter(|p| is_active_validation_harness_path(p))
+        .map(|p| workspace_root.join(p))
+        .collect())
+}
+
+fn check_review_debt_markers_in_paths(
+    workspace_root: &Path,
+    paths: &[PathBuf],
+) -> Result<(), String> {
+    let mut errors = Vec::new();
+
+    for path in paths {
+        let content = match fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(e) => {
+                errors.push(format!("{}: read error: {e}", path.display()));
+                continue;
+            }
+        };
+        let lines: Vec<&str> = content.lines().collect();
+
+        for (idx, line) in lines.iter().enumerate() {
+            if !line_can_carry_review_marker(path, line) {
+                continue;
+            }
+            let Some(marker) = review_debt_marker_in_line(line) else {
+                continue;
+            };
+            if marker_context_is_classified(&lines, idx) {
+                continue;
+            }
+            let display_path = path.strip_prefix(workspace_root).unwrap_or(path);
+            errors.push(format!(
+                "{}:{}: anonymous review-debt marker '{}'; use a TFR id/register entry or \
+                 classify negative-test/refusal fixture text",
+                display_path.display(),
+                idx + 1,
+                marker
+            ));
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("\n"))
+    }
+}
+
+fn is_active_validation_harness_path(path: &str) -> bool {
+    let scanned_root = path.starts_with("nix/vm/")
+        || path.starts_with("scripts/")
+        || path.starts_with("validation/");
+    if !scanned_root {
+        return false;
+    }
+
+    if path.starts_with("validation/artifacts/") || path.starts_with("validation/format-golden/") {
+        return false;
+    }
+
+    let Some(file_name) = Path::new(path).file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    if file_name == "README.md" || file_name == "claims.toml" || file_name == "xfstests_git_rev.txt"
+    {
+        return true;
+    }
+
+    matches!(
+        Path::new(path).extension().and_then(|e| e.to_str()),
+        Some(
+            "bash"
+                | "c"
+                | "cfg"
+                | "conf"
+                | "fio"
+                | "h"
+                | "json"
+                | "md"
+                | "nix"
+                | "py"
+                | "rs"
+                | "sh"
+                | "toml"
+                | "txt"
+                | "yaml"
+                | "yml"
+        )
+    )
+}
+
+fn line_can_carry_review_marker(path: &Path, line: &str) -> bool {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    match ext {
+        "c" | "h" | "rs" => {
+            let trimmed = line.trim_start();
+            trimmed.starts_with("//")
+                || trimmed.starts_with("/*")
+                || trimmed.starts_with('*')
+                || trimmed.contains("//")
+                || trimmed.contains("/*")
+                || trimmed.contains('"')
+        }
+        _ => true,
+    }
+}
+
+fn review_debt_marker_in_line(line: &str) -> Option<&'static str> {
+    let lower = line.to_ascii_lowercase();
+    for marker in [
+        "todo",
+        "fixme",
+        "hack",
+        "tbd",
+        "placeholder",
+        "fake",
+        "dummy",
+        "continuation",
+    ] {
+        if contains_ascii_word(&lower, marker) {
+            return Some(marker);
+        }
+    }
+    if contains_debt_later_phrase(&lower) {
+        return Some("later");
+    }
+    None
+}
+
+fn marker_context_is_classified(lines: &[&str], marker_idx: usize) -> bool {
+    let start = marker_idx.saturating_sub(2);
+    let end = (marker_idx + 3).min(lines.len());
+    lines[start..end]
+        .iter()
+        .any(|line| line_has_fixture_or_refusal_classification(line))
+}
+
+fn line_has_fixture_or_refusal_classification(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    let negative_test = lower.contains("negative-test") || lower.contains("negative test");
+    let fixture_text =
+        contains_ascii_word(&lower, "fixture") || contains_ascii_word(&lower, "text");
+    let refusal = contains_ascii_word(&lower, "refusal") || lower.contains("refuse");
+    let refusal_context = contains_ascii_word(&lower, "fixture")
+        || contains_ascii_word(&lower, "placeholder")
+        || contains_ascii_word(&lower, "sandbox")
+        || contains_ascii_word(&lower, "text");
+
+    (negative_test && fixture_text) || (refusal && refusal_context)
+}
+
+fn contains_debt_later_phrase(line: &str) -> bool {
+    [
+        "do later",
+        "fix later",
+        "implement later",
+        "remove later",
+        "replace later",
+        "clean later",
+        "wire later",
+        "later todo",
+        "later fix",
+    ]
+    .iter()
+    .any(|phrase| line.contains(phrase))
+}
+
+fn contains_ascii_word(line: &str, needle: &str) -> bool {
+    let mut rest = line;
+    while let Some(pos) = rest.find(needle) {
+        let before = rest[..pos].chars().next_back();
+        let after = rest[pos + needle.len()..].chars().next();
+        if !is_ascii_word_char(before) && !is_ascii_word_char(after) {
+            return true;
+        }
+        rest = &rest[pos + needle.len()..];
+    }
+    false
+}
+
+fn is_ascii_word_char(ch: Option<char>) -> bool {
+    ch.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -960,6 +1175,99 @@ mod tests {
         assert!(
             result.is_ok(),
             "should not flag non-#[test] duplicates, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_anonymous_validation_marker_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nix/vm/example-validation.nix");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "# TODO: wire this validation later\n").unwrap();
+
+        let result = check_review_debt_markers_in_paths(dir.path(), &[path]);
+        assert!(result.is_err(), "anonymous marker should fail");
+        let err = result.unwrap_err();
+        assert!(err.contains("anonymous review-debt marker"), "{err}");
+        assert!(err.contains("nix/vm/example-validation.nix:1"), "{err}");
+    }
+
+    #[test]
+    fn allows_classified_refusal_placeholder_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nix/vm/example-validation.nix");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "echo \"WARNING: placeholder for Nix sandbox\"\n\
+             echo \"REFUSAL: kernel module unavailable in this sandbox\"\n",
+        )
+        .unwrap();
+
+        let result = check_review_debt_markers_in_paths(dir.path(), &[path]);
+        assert!(
+            result.is_ok(),
+            "classified refusal text should pass: {result:?}"
+        );
+    }
+
+    #[test]
+    fn allows_classified_negative_test_fixture_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("validation/review-marker-negative.toml");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "# negative-test fixture for debt-marker policy\nmarker = \"TODO\"\n",
+        )
+        .unwrap();
+
+        let result = check_review_debt_markers_in_paths(dir.path(), &[path]);
+        assert!(
+            result.is_ok(),
+            "classified fixture text should pass: {result:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_bare_fixture_context_for_validation_marker_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("validation/review-marker-fixture.toml");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "# fixture setup\nmarker = \"TODO\"\n").unwrap();
+
+        let result = check_review_debt_markers_in_paths(dir.path(), &[path]);
+        assert!(
+            result.is_err(),
+            "bare fixture wording should not classify debt markers"
+        );
+    }
+
+    #[test]
+    fn rejects_bare_refusal_context_for_validation_marker_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("validation/review-marker-refusal.toml");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "# refusal path\nmarker = \"TODO\"\n").unwrap();
+
+        let result = check_review_debt_markers_in_paths(dir.path(), &[path]);
+        assert!(
+            result.is_err(),
+            "bare refusal wording should not classify debt markers"
+        );
+    }
+
+    #[test]
+    fn ignores_non_text_code_identifiers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scripts/tidefs-mmap-workload.c");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "char dummy = vp[PAGE + 1];\n(void)dummy;\n").unwrap();
+
+        let result = check_review_debt_markers_in_paths(dir.path(), &[path]);
+        assert!(
+            result.is_ok(),
+            "ordinary code identifier should pass: {result:?}"
         );
     }
 }
