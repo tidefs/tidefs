@@ -3963,6 +3963,7 @@ const SNAP_KIND_PUSH: u8 = 1;
 const SNAP_KIND_ACK: u8 = 4;
 const SNAP_KIND_ERROR: u8 = 0;
 const SNAP_NET_PUSH_HEADER_LEN: usize = 4 + 1 + 4 + 32 + 4;
+const SNAP_NET_RESPONSE_HEADER_LEN: usize = 4 + 1 + 4;
 
 fn snap_net_payload_len(payload_len: usize) -> Result<u32, String> {
     u32::try_from(payload_len).map_err(|_| {
@@ -3986,7 +3987,7 @@ fn build_snap_push_message(export: &[u8], auth_key: &[u8; 32]) -> Result<Vec<u8>
 }
 
 fn parse_snap_net_response(data: &[u8]) -> Result<String, String> {
-    if data.len() < 9 {
+    if data.len() < SNAP_NET_RESPONSE_HEADER_LEN {
         return Err("snapshot send: remote response too short for VSNP header".into());
     }
     if data[0..4] != SNAP_NET_MAGIC[..] {
@@ -3997,7 +3998,7 @@ fn parse_snap_net_response(data: &[u8]) -> Result<String, String> {
     }
     let kind = data[4];
     let msg_len = u32::from_le_bytes(data[5..9].try_into().unwrap()) as usize;
-    let start: usize = 9;
+    let start = SNAP_NET_RESPONSE_HEADER_LEN;
     let frame_len = start
         .checked_add(msg_len)
         .ok_or_else(|| "snapshot send: remote response length overflow".to_string())?;
@@ -6632,6 +6633,33 @@ mod tests {
         assert_eq!(
             parse_snap_net_response(&error),
             Err("snapshot send: remote error: denied".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_snap_net_response_rejects_bad_magic() {
+        let mut ack = Vec::new();
+        ack.extend_from_slice(b"NOPE");
+        ack.push(SNAP_KIND_ACK);
+        ack.extend_from_slice(&0u32.to_le_bytes());
+
+        assert_eq!(
+            parse_snap_net_response(&ack),
+            Err("snapshot send: bad remote response magic: [78, 79, 80, 69]".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_snap_net_response_rejects_unknown_kind() {
+        let mut ack = Vec::new();
+        ack.extend_from_slice(SNAP_NET_MAGIC);
+        ack.push(9);
+        ack.extend_from_slice(&7u32.to_le_bytes());
+        ack.extend_from_slice(b"mystery");
+
+        assert_eq!(
+            parse_snap_net_response(&ack),
+            Err("snapshot send: unknown remote response kind 9: mystery".to_string())
         );
     }
 
