@@ -163,6 +163,22 @@ count_json_warnings() {
     ' < "$json_file"
 }
 
+diagnostic_json_excerpt() {
+    local json_file="$1"
+
+    jq -Rn '
+      [inputs
+       | fromjson?
+       | select(.reason == "compiler-message")
+       | .message
+       | select(.level == "error")
+       | ((.rendered // "") as $rendered
+          | if ($rendered | length) > 0 then $rendered else (.message // "") end)
+       | select(. != "")]
+      | join("\n\n")
+    ' < "$json_file" | tail -n "${CLIPPY_BASELINE_ERROR_LINES:-80}"
+}
+
 run_clippy_for_crate() {
     local ws_root="$1" crate="$2" out_json="$3" err_log="$4"
 
@@ -178,7 +194,7 @@ run_clippy_for_crate() {
 }
 
 result_object() {
-    local crate="$1" status="$2" warnings="$3" baseline="$4" exit_code="$5" stderr_excerpt="$6"
+    local crate="$1" status="$2" warnings="$3" baseline="$4" exit_code="$5" stderr_excerpt="$6" diagnostic_excerpt="$7"
 
     local baseline_json
     if [[ "$baseline" == "null" ]]; then
@@ -194,13 +210,15 @@ result_object() {
         --argjson baseline "$baseline_json" \
         --argjson exit_code "$exit_code" \
         --arg stderr_excerpt "$stderr_excerpt" \
+        --arg diagnostic_excerpt "$diagnostic_excerpt" \
         '{
           crate: $crate,
           status: $status,
           warnings: $warnings,
           baseline_warnings: $baseline,
           cargo_exit_code: $exit_code,
-          stderr_excerpt: $stderr_excerpt
+          stderr_excerpt: $stderr_excerpt,
+          diagnostic_excerpt: $diagnostic_excerpt
         }'
 }
 
@@ -356,7 +374,7 @@ main() {
 
         echo "clippy-baseline: running cargo clippy for $crate"
 
-        local out_json err_log rc warnings baseline status stderr_excerpt
+        local out_json err_log rc warnings baseline status stderr_excerpt diagnostic_excerpt
         out_json="$tmpdir/$crate.stdout.json"
         err_log="$tmpdir/$crate.stderr.log"
 
@@ -396,7 +414,8 @@ main() {
         fi
 
         stderr_excerpt="$(tail -n "${CLIPPY_BASELINE_ERROR_LINES:-80}" "$err_log" 2>/dev/null || true)"
-        result_object "$crate" "$status" "$warnings" "$baseline" "$rc" "$stderr_excerpt" > "$result_dir/$crate.json"
+        diagnostic_excerpt="$(diagnostic_json_excerpt "$out_json")"
+        result_object "$crate" "$status" "$warnings" "$baseline" "$rc" "$stderr_excerpt" "$diagnostic_excerpt" > "$result_dir/$crate.json"
 
         if [[ "$status" != "pass" ]]; then
             failures=$((failures + 1))
