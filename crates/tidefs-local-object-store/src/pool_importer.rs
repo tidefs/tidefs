@@ -629,6 +629,7 @@ impl PoolImporter {
 mod tests {
     use super::*;
     use crate::pool_label::{LabelDeviceClass, PoolRedundancyPolicy, POOL_LABEL_MAGIC};
+    use crate::pool_lifecycle_evidence::PoolLifecycleOutcome;
 
     #[test]
     fn import_error_display() {
@@ -763,6 +764,67 @@ mod tests {
         assert_eq!(evidence.commit_group, 44);
         assert!(evidence.topology_complete);
         assert!(evidence.owner_authorized);
+    }
+
+    #[test]
+    fn candidate_pool_emits_reopen_lifecycle_evidence() {
+        let pool = CandidatePool {
+            pool_guid: [0x38; 16],
+            pool_name: "reopen".into(),
+            pool_state: LabelPoolState::Exported,
+            devices: vec![DeviceCandidate {
+                path: std::path::PathBuf::from("/dev/tidefs-reopen"),
+                label: PoolLabelV1 {
+                    magic: POOL_LABEL_MAGIC,
+                    version: 1,
+                    pool_guid: [0x38; 16],
+                    device_guid: [0x39; 16],
+                    pool_name_len: 0,
+                    pool_name: [0u8; 255],
+                    pool_state: LabelPoolState::Exported,
+                    commit_group: 45,
+                    label_commit_group: 45,
+                    device_index: 0,
+                    topology_generation: 4,
+                    device_count: 1,
+                    device_class: LabelDeviceClass::Hdd,
+                    device_capacity_bytes: 4096,
+                    system_area_pointer: 0,
+                    system_area_size: 0,
+                    features_incompat: 0,
+                    features_ro_compat: 0,
+                    features_compat: 0,
+                    device_health: 0,
+                    device_read_errors: 0,
+                    device_write_errors: 0,
+                    device_checksum_errors: 0,
+                    redundancy_policy: PoolRedundancyPolicy::default(),
+                    checksum: [0; 32],
+                },
+                label_copy: 0,
+                device_size: 4096,
+            }],
+            topology_generation: 4,
+            device_count: 1,
+            recovery_commit_group: 45,
+            topology_complete: true,
+            cluster_authorized: false,
+        };
+
+        let evidence = pool.lifecycle_evidence(PoolLifecycleAction::Reopen);
+
+        assert_eq!(evidence.action, PoolLifecycleAction::Reopen);
+        assert_eq!(evidence.outcome, PoolLifecycleOutcome::Executed);
+        assert_eq!(evidence.pool_guid, Some([0x38; 16]));
+        assert_eq!(evidence.pool_name.as_deref(), Some("reopen"));
+        assert_eq!(evidence.device_count, 1);
+        assert_eq!(evidence.expected_device_count, 1);
+        assert_eq!(evidence.capacity_bytes, 4096);
+        assert_eq!(evidence.topology_generation, 4);
+        assert_eq!(evidence.commit_group, 45);
+        assert!(evidence.topology_complete);
+        assert!(evidence.owner_authorized);
+        assert!(!evidence.is_fail_closed());
     }
 
     #[test]

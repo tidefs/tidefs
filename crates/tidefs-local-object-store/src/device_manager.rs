@@ -798,23 +798,32 @@ impl DeviceManager {
 mod tests {
     use super::*;
     use crate::device::{DeviceBacking, DeviceClass, DeviceConfig, DeviceKind};
+    use crate::pool_lifecycle_evidence::PoolLifecycleOutcome;
 
     #[test]
-    fn topology_lifecycle_evidence_records_device_add() {
-        let evidence = DeviceManager::topology_lifecycle_evidence(
+    fn topology_lifecycle_evidence_records_device_actions() {
+        for action in [
             PoolLifecycleAction::AddDevice,
-            [0x55; 16],
-            "topology",
-            3,
-            3,
-            9,
-            8,
-        );
+            PoolLifecycleAction::RemoveDevice,
+            PoolLifecycleAction::ReplaceDevice,
+        ] {
+            let evidence = DeviceManager::topology_lifecycle_evidence(
+                action, [0x55; 16], "topology", 3, 3, 9, 8,
+            );
 
-        assert_eq!(evidence.action, PoolLifecycleAction::AddDevice);
-        assert_eq!(evidence.device_count, 3);
-        assert!(evidence.topology_complete);
-        assert!(evidence.owner_authorized);
+            assert_eq!(evidence.action, action);
+            assert_eq!(evidence.outcome, PoolLifecycleOutcome::Executed);
+            assert_eq!(evidence.pool_guid, Some([0x55; 16]));
+            assert_eq!(evidence.pool_name.as_deref(), Some("topology"));
+            assert_eq!(evidence.device_count, 3);
+            assert_eq!(evidence.expected_device_count, 3);
+            assert_eq!(evidence.capacity_bytes, 0);
+            assert_eq!(evidence.topology_generation, 9);
+            assert_eq!(evidence.commit_group, 8);
+            assert!(evidence.topology_complete);
+            assert!(evidence.owner_authorized);
+            assert!(!evidence.is_fail_closed());
+        }
     }
 
     #[test]
