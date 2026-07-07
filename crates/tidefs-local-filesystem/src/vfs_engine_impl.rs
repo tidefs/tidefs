@@ -6602,6 +6602,23 @@ mod tests {
     }
 
     #[test]
+    fn build_snap_push_message_encodes_frame_layout() {
+        let export = b"vfssend payload";
+        let auth_key = [0x5a; 32];
+
+        let frame = build_snap_push_message(export, &auth_key).expect("build frame");
+
+        let mut expected = Vec::new();
+        expected.extend_from_slice(SNAP_NET_MAGIC);
+        expected.push(SNAP_KIND_PUSH);
+        expected.extend_from_slice(&32u32.to_le_bytes());
+        expected.extend_from_slice(&auth_key);
+        expected.extend_from_slice(&(export.len() as u32).to_le_bytes());
+        expected.extend_from_slice(export);
+        assert_eq!(frame, expected);
+    }
+
+    #[test]
     fn parse_snap_net_response_accepts_empty_ack() {
         let mut ack = Vec::new();
         ack.extend_from_slice(SNAP_NET_MAGIC);
