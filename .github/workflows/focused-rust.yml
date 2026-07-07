@@ -60,38 +60,6 @@ jobs:
           CARGO_TEST_ARGS: ${{ inputs.cargo_test_args }}
         run: nix develop .#ci --command bash -c './scripts/ci-validate-focused-inputs.sh'
 
-      - name: Build validation daemon
-        run: |
-          set -euo pipefail
-
-          needs_daemon=0
-          IFS=',' read -ra focused_crates <<< "$TIDEFS_FOCUSED_CRATES"
-          for raw_crate in "${focused_crates[@]}"; do
-            crate="$(printf '%s' "$raw_crate" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-            if [[ "$crate" == "tidefs-validation" ]]; then
-              needs_daemon=1
-              break
-            fi
-          done
-
-          if [[ "$needs_daemon" -ne 1 ]]; then
-            echo "Focused crate selection does not include tidefs-validation; skipping daemon build."
-            exit 0
-          fi
-
-          nix develop .#ci --command cargo build --locked \
-            -p tidefs-posix-filesystem-adapter-daemon \
-            --bin tidefs-posix-filesystem-adapter-daemon
-
-          daemon_bin="$CARGO_TARGET_DIR/debug/tidefs-posix-filesystem-adapter-daemon"
-          if [[ ! -x "$daemon_bin" ]]; then
-            echo "::error::validation daemon binary was not built at $daemon_bin"
-            exit 1
-          fi
-
-          echo "TIDEFS_DAEMON_BIN=$daemon_bin" >> "$GITHUB_ENV"
-          echo "Validation daemon: $daemon_bin"
-
       - name: Run focused crate tests
         id: focused-tests
         continue-on-error: true
