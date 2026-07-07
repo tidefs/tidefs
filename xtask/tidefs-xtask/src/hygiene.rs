@@ -1200,7 +1200,10 @@ mod tests {
         .unwrap();
 
         let result = check_review_debt_markers_in_paths(dir.path(), &[path]);
-        assert!(result.is_ok(), "classified refusal text should pass: {result:?}");
+        assert!(
+            result.is_ok(),
+            "classified refusal text should pass: {result:?}"
+        );
     }
 
     #[test]
@@ -1215,7 +1218,10 @@ mod tests {
         .unwrap();
 
         let result = check_review_debt_markers_in_paths(dir.path(), &[path]);
-        assert!(result.is_ok(), "classified fixture text should pass: {result:?}");
+        assert!(
+            result.is_ok(),
+            "classified fixture text should pass: {result:?}"
+        );
     }
 
     #[test]
@@ -1226,6 +1232,9 @@ mod tests {
         std::fs::write(&path, "char dummy = vp[PAGE + 1];\n(void)dummy;\n").unwrap();
 
         let result = check_review_debt_markers_in_paths(dir.path(), &[path]);
-        assert!(result.is_ok(), "ordinary code identifier should pass: {result:?}");
+        assert!(
+            result.is_ok(),
+            "ordinary code identifier should pass: {result:?}"
+        );
     }
 }
