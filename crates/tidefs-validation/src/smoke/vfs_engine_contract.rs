@@ -10,12 +10,15 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
+#[cfg(test)]
+use tidefs_vfs_engine::O_RDWR;
 use tidefs_vfs_engine::{
-    DirEntry, EngineDirHandle, EngineFileHandle, Errno, Generation, InodeAttr, InodeFlags, InodeId,
-    LockSpec, NodeKind, PosixAttrs, RequestCtx, SetAttr, StatFs, VfsEngine, VfsEngineStatFs,
-    FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE, FALLOC_FL_ZERO_RANGE, FATTR_GID, FATTR_MODE,
-    FATTR_MTIME, FATTR_MTIME_NOW, FATTR_SIZE, FATTR_UID, RENAME_EXCHANGE, RENAME_NOREPLACE,
-    ROOT_INODE_ID, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG, XATTR_CREATE, XATTR_REPLACE,
+    DirEntry, EngineDirHandle, EngineFileHandle, Errno, FileHandleId, Generation, InodeAttr,
+    InodeFlags, InodeId, LockSpec, NodeKind, PosixAttrs, RequestCtx, SetAttr, StatFs, VfsEngine,
+    VfsEngineStatFs, FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE, FALLOC_FL_ZERO_RANGE, FATTR_GID,
+    FATTR_MODE, FATTR_MTIME, FATTR_MTIME_NOW, FATTR_SIZE, FATTR_UID, O_EXCL, O_TRUNC,
+    RENAME_EXCHANGE, RENAME_NOREPLACE, ROOT_INODE_ID, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG,
+    XATTR_CREATE, XATTR_REPLACE,
 };
 
 // ── Factory type ────────────────────────────────────────────────────────────
@@ -106,6 +109,18 @@ impl ContractTestEngine {
     fn set_size(attr: &mut InodeAttr, size: u64) {
         attr.posix.size = size;
         attr.posix.blocks_512 = Self::blocks(size);
+    }
+
+    fn allocate_handle(
+        state: &mut ContractFileState,
+        inode_id: InodeId,
+        flags: u32,
+    ) -> EngineFileHandle {
+        let fh_id = state.next_fh;
+        state.next_fh += 1;
+        let fh = EngineFileHandle::new(inode_id, flags, FileHandleId::new(fh_id), 0);
+        state.handles.insert(fh_id, (inode_id, flags));
+        fh
     }
 }
 
@@ -260,8 +275,24 @@ impl VfsEngine for ContractTestEngine {
         let mut state = self.state.borrow_mut();
         Self::ensure_dir(&state, parent)?;
         let key = Self::entry_key(parent, name);
-        if state.entries.contains_key(&key) {
-            return Err(Errno::EEXIST);
+        if let Some(inode_id) = state.entries.get(&key).copied() {
+            if flags & O_EXCL != 0 {
+                return Err(Errno::EEXIST);
+            }
+
+            let attr = {
+                let (attr, data, _) = state.inodes.get_mut(&inode_id).ok_or(Errno::ENOENT)?;
+                if attr.kind != NodeKind::File {
+                    return Err(Errno::EISDIR);
+                }
+                if flags & O_TRUNC != 0 {
+                    data.clear();
+                    Self::set_size(attr, 0);
+                }
+                *attr
+            };
+            let fh = Self::allocate_handle(&mut state, inode_id, flags);
+            return Ok((attr, fh));
         }
 
         let inode_id = InodeId::new(state.next_inode);
@@ -293,15 +324,7 @@ impl VfsEngine for ContractTestEngine {
             .insert(inode_id, (attr, Vec::new(), HashMap::new()));
         state.entries.insert(key, inode_id);
 
-        let fh_id = state.next_fh;
-        state.next_fh += 1;
-        let fh = EngineFileHandle::new(
-            inode_id,
-            flags,
-            tidefs_vfs_engine::FileHandleId::new(fh_id),
-            0,
-        );
-        state.handles.insert(fh_id, (inode_id, flags));
+        let fh = Self::allocate_handle(&mut state, inode_id, flags);
         Ok((attr, fh))
     }
 
@@ -564,16 +587,11 @@ impl VfsEngine for ContractTestEngine {
         if attr.kind == NodeKind::Dir {
             return Err(Errno::EISDIR);
         }
-        if flags & 0o1000 != 0 {
-            // O_TRUNC
+        if flags & O_TRUNC != 0 {
             data.clear();
             Self::set_size(attr, 0);
         }
-        let fh_id = state.next_fh;
-        state.next_fh += 1;
-        let fh =
-            EngineFileHandle::new(inode, flags, tidefs_vfs_engine::FileHandleId::new(fh_id), 0);
-        state.handles.insert(fh_id, (inode, flags));
+        let fh = Self::allocate_handle(&mut state, inode, flags);
         Ok(fh)
     }
 
@@ -1161,14 +1179,29 @@ fn contract_remove_then_lookup_returns_enoent() {
 }
 
 #[test]
-fn contract_create_existing_name_returns_eexist() {
+fn contract_create_existing_name_honors_create_flags() {
     let engine = factory_contract_test_engine();
     let root = engine.get_root_inode(&ctx()).unwrap();
-    engine.create(root, b"dup", 0o644, 0, &ctx()).unwrap();
+    let (created, fh) = engine.create(root, b"dup", 0o644, O_RDWR, &ctx()).unwrap();
+    engine.write(&fh, 0, b"stays", &ctx()).unwrap();
+
+    let (opened, opened_fh) = engine.create(root, b"dup", 0o644, O_RDWR, &ctx()).unwrap();
+    assert_eq!(opened.inode_id, created.inode_id);
+    assert_eq!(engine.read(&opened_fh, 0, 8, &ctx()).unwrap(), b"stays");
+
     assert_eq!(
-        engine.create(root, b"dup", 0o644, 0, &ctx()).unwrap_err(),
+        engine
+            .create(root, b"dup", 0o644, O_RDWR | O_EXCL, &ctx())
+            .unwrap_err(),
         Errno::EEXIST
     );
+
+    let (truncated, truncated_fh) = engine
+        .create(root, b"dup", 0o644, O_RDWR | O_TRUNC, &ctx())
+        .unwrap();
+    assert_eq!(truncated.inode_id, created.inode_id);
+    assert_eq!(truncated.posix.size, 0);
+    assert_eq!(engine.read(&truncated_fh, 0, 8, &ctx()).unwrap(), b"");
 }
 
 #[test]
@@ -1183,7 +1216,7 @@ fn contract_lookup_nonexistent_returns_enoent() {
 #[test]
 fn contract_write_then_read_returns_written_data() {
     let engine = factory_contract_test_engine();
-    let (_attr, fh) = create_file(&*engine, b"rw.txt", 0o2); // O_RDWR
+    let (_attr, fh) = create_file(&*engine, b"rw.txt", O_RDWR);
     let written = engine.write(&fh, 0, b"hello world", &ctx()).unwrap();
     assert_eq!(written, 11);
 
@@ -2554,13 +2587,31 @@ mod local_fs_contract_tests {
     }
 
     #[test]
-    fn local_fs_error_eexist_on_dup_create() {
+    fn local_fs_existing_create_honors_create_flags() {
         let engine = make();
         let root = engine.get_root_inode(&ctx()).unwrap();
-        engine.create(root, b"dup", 0o644, 0, &ctx()).unwrap();
+        let (created, fh) = engine.create(root, b"dup", 0o644, O_RDWR, &ctx()).unwrap();
+        engine.write(&fh, 0, b"stays", &ctx()).unwrap();
+        engine.release(&fh).unwrap();
+
+        let (opened, opened_fh) = engine.create(root, b"dup", 0o644, O_RDWR, &ctx()).unwrap();
+        assert_eq!(opened.inode_id, created.inode_id);
+        assert_eq!(engine.read(&opened_fh, 0, 8, &ctx()).unwrap(), b"stays");
+        engine.release(&opened_fh).unwrap();
+
         assert_eq!(
-            engine.create(root, b"dup", 0o644, 0, &ctx()).unwrap_err(),
+            engine
+                .create(root, b"dup", 0o644, O_RDWR | O_EXCL, &ctx())
+                .unwrap_err(),
             Errno::EEXIST
         );
+
+        let (truncated, truncated_fh) = engine
+            .create(root, b"dup", 0o644, O_RDWR | O_TRUNC, &ctx())
+            .unwrap();
+        assert_eq!(truncated.inode_id, created.inode_id);
+        assert_eq!(truncated.posix.size, 0);
+        assert_eq!(engine.read(&truncated_fh, 0, 8, &ctx()).unwrap(), b"");
+        engine.release(&truncated_fh).unwrap();
     }
 }
