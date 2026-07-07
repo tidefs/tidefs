@@ -6838,7 +6838,7 @@ impl FuseVfsAdapter {
                                             KernelPageCacheInvalidation::for_write_request(
                                                 is_writeback_cached,
                                             ),
-                                        );
+                                        )?;
                                     }
                                     if post_write_attr.is_none()
                                         && Self::write_requires_namespace_attr_sync(
@@ -7070,7 +7070,7 @@ impl FuseVfsAdapter {
                                         KernelPageCacheInvalidation::for_write_request(
                                             is_writeback_cached,
                                         ),
-                                    );
+                                    )?;
                                 }
                                 if post_write_attr.is_none()
                                     && Self::write_requires_namespace_attr_sync(
@@ -7268,7 +7268,10 @@ impl FuseVfsAdapter {
         data: &[u8],
         write_flags: u32,
         kernel_page_cache_invalidation: KernelPageCacheInvalidation,
-    ) {
+    ) -> Result<(), Errno> {
+        let written_len = usize::try_from(written).map_err(|_| Errno::EIO)?;
+        let written_data = data.get(..written_len).ok_or(Errno::EIO)?;
+
         // Submit dirty extent to the writeback scheduler for
         // later flush/fsync writeback.
         let outcome = PosixFilesystemAdapterWriteStagingOutcome {
@@ -7277,7 +7280,7 @@ impl FuseVfsAdapter {
             offset,
             length: written,
             buffer_handle: 0,
-            content_hash64: staged_write_hash64(&data[..written as usize]),
+            content_hash64: staged_write_hash64(written_data),
             write_flags,
             _reserved: [0_u32; 1],
         };
@@ -7351,7 +7354,7 @@ impl FuseVfsAdapter {
                         let dst_start = (copy_start - off) as usize;
                         let copy_len = (copy_end - copy_start) as usize;
                         page.data_mut()[dst_start..dst_start + copy_len]
-                            .copy_from_slice(&data[src_start..src_start + copy_len]);
+                            .copy_from_slice(&written_data[src_start..src_start + copy_len]);
                     }
                     page.mark_dirty();
                 } else {
@@ -7366,8 +7369,7 @@ impl FuseVfsAdapter {
             wc.mark_dirty(ino, u64::from(written));
             // Queue the write into the commit_group accumulator for periodic
             // transaction group commit.
-            self.txg_cycle
-                .queue_write(ino, offset, &data[..written as usize]);
+            self.txg_cycle.queue_write(ino, offset, written_data);
         }
         // Notify the shared writeback range tracker so the writeback
         // flush service can drain dirty ranges to storage.
@@ -7388,7 +7390,8 @@ impl FuseVfsAdapter {
             .dirty_page_tracker_arc()
             .lock()
             .unwrap()
-            .accept_write(ino, offset, &data[..written as usize]);
+            .accept_write(ino, offset, written_data);
+        Ok(())
     }
 
     fn record_clean_write_through_after_write(
@@ -43135,17 +43138,20 @@ mod tests {
 
         {
             let engine = fixture.adapter.engine.lock().unwrap();
-            fixture.adapter.mark_dirty_after_write(
-                &**engine,
-                &ctx,
-                &engine_fh,
-                ino,
-                0,
-                payload.len() as u32,
-                &payload,
-                FUSE_WRITE_CACHE,
-                KernelPageCacheInvalidation::SkipSameRequestWriteback,
-            );
+            fixture
+                .adapter
+                .mark_dirty_after_write(
+                    &**engine,
+                    &ctx,
+                    &engine_fh,
+                    ino,
+                    0,
+                    payload.len() as u32,
+                    &payload,
+                    FUSE_WRITE_CACHE,
+                    KernelPageCacheInvalidation::SkipSameRequestWriteback,
+                )
+                .expect("mark dirty after write");
         }
 
         assert!(
