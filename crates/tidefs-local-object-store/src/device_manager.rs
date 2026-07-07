@@ -146,9 +146,11 @@ impl DeviceManager {
             | PoolLifecycleAction::ReplaceDevice => {
                 PoolLifecycleEvidence::executed(action, context)
             }
-            _ => PoolLifecycleEvidence::refused(
+            _ => PoolLifecycleEvidence::refused_with_authority(
                 PoolLifecycleAction::FailClosed,
                 context,
+                device_count >= expected_device_count,
+                true,
                 "unsupported device topology lifecycle action",
             ),
         }
@@ -828,7 +830,9 @@ mod tests {
         );
 
         assert_eq!(evidence.action, PoolLifecycleAction::FailClosed);
-        assert!(evidence.is_fail_closed());
+        assert!(evidence.topology_complete);
+        assert!(evidence.owner_authorized);
+        assert!(!evidence.is_fail_closed());
         assert!(evidence.reason.contains("unsupported"));
     }
 

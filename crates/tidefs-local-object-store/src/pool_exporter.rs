@@ -477,9 +477,11 @@ impl ExportOrchestrator {
         };
 
         if self.active_mounts > 0 && !self.forced {
-            PoolLifecycleEvidence::refused(
+            PoolLifecycleEvidence::refused_with_authority(
                 PoolLifecycleAction::Export,
                 context,
+                self.device_configs.len() >= self.device_guids.len(),
+                true,
                 format!("{} active mount(s) still own the pool", self.active_mounts),
             )
         } else {
@@ -1171,7 +1173,9 @@ mod tests {
         let evidence = orch.lifecycle_evidence();
 
         assert_eq!(evidence.action, PoolLifecycleAction::Export);
-        assert!(evidence.is_fail_closed());
+        assert!(evidence.topology_complete);
+        assert!(evidence.owner_authorized);
+        assert!(!evidence.is_fail_closed());
         assert!(evidence.reason.contains("active mount"));
     }
 

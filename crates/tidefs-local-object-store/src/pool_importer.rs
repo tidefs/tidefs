@@ -282,7 +282,13 @@ impl CandidatePool {
             } else {
                 "cluster ownership authority missing"
             };
-            PoolLifecycleEvidence::refused(PoolLifecycleAction::FailClosed, context, reason)
+            PoolLifecycleEvidence::refused_with_authority(
+                PoolLifecycleAction::FailClosed,
+                context,
+                self.topology_complete,
+                self.cluster_authorized_or_not_clustered(),
+                reason,
+            )
         }
     }
 
@@ -778,6 +784,62 @@ mod tests {
         assert_eq!(evidence.action, PoolLifecycleAction::FailClosed);
         assert!(evidence.is_fail_closed());
         assert!(evidence.reason.contains("topology"));
+    }
+
+    #[test]
+    fn clustered_candidate_pool_refusal_preserves_topology_evidence() {
+        use crate::pool_label::features;
+
+        let pool = CandidatePool {
+            pool_guid: [0x36; 16],
+            pool_name: "clustered".into(),
+            pool_state: LabelPoolState::Exported,
+            devices: vec![DeviceCandidate {
+                path: std::path::PathBuf::from("/dev/tidefs-clustered"),
+                label: PoolLabelV1 {
+                    magic: POOL_LABEL_MAGIC,
+                    version: 1,
+                    pool_guid: [0x36; 16],
+                    device_guid: [0x37; 16],
+                    pool_name_len: 0,
+                    pool_name: [0u8; 255],
+                    pool_state: LabelPoolState::Exported,
+                    commit_group: 44,
+                    label_commit_group: 44,
+                    device_index: 0,
+                    topology_generation: 3,
+                    device_count: 1,
+                    device_class: LabelDeviceClass::Hdd,
+                    device_capacity_bytes: 4096,
+                    system_area_pointer: 0,
+                    system_area_size: 0,
+                    features_incompat: features::CLUSTER_POOL_INCOMPAT,
+                    features_ro_compat: 0,
+                    features_compat: features::CLUSTER_POOL_COMPAT,
+                    device_health: 0,
+                    device_read_errors: 0,
+                    device_write_errors: 0,
+                    device_checksum_errors: 0,
+                    redundancy_policy: PoolRedundancyPolicy::default(),
+                    checksum: [0; 32],
+                },
+                label_copy: 0,
+                device_size: 4096,
+            }],
+            topology_generation: 3,
+            device_count: 1,
+            recovery_commit_group: 44,
+            topology_complete: true,
+            cluster_authorized: false,
+        };
+
+        let evidence = pool.lifecycle_evidence(PoolLifecycleAction::Import);
+
+        assert_eq!(evidence.action, PoolLifecycleAction::FailClosed);
+        assert!(evidence.topology_complete);
+        assert!(!evidence.owner_authorized);
+        assert!(evidence.is_fail_closed());
+        assert!(evidence.reason.contains("cluster ownership authority"));
     }
 
     #[test]

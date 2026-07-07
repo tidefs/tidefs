@@ -101,11 +101,22 @@ impl PoolLifecycleEvidence {
         context: PoolLifecycleContext,
         reason: impl Into<String>,
     ) -> Self {
+        Self::refused_with_authority(action, context, false, false, reason)
+    }
+
+    #[must_use]
+    pub fn refused_with_authority(
+        action: PoolLifecycleAction,
+        context: PoolLifecycleContext,
+        topology_complete: bool,
+        owner_authorized: bool,
+        reason: impl Into<String>,
+    ) -> Self {
         Self {
             action,
             outcome: PoolLifecycleOutcome::Refused,
-            topology_complete: false,
-            owner_authorized: false,
+            topology_complete,
+            owner_authorized,
             pool_guid: context.pool_guid,
             pool_name: context.pool_name,
             device_count: context.device_count,
