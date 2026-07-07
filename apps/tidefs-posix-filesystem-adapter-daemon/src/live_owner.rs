@@ -213,17 +213,8 @@ fn dispatch_request(
     if let Err(err) = request.validate_version() {
         return live_admin_typed_error(err);
     }
-    if request.pool != manifest.pool_name {
-        return LivePoolAdminResponse::error(
-            2,
-            format!(
-                "live owner for pool '{}' cannot serve pool '{}'",
-                manifest.pool_name, request.pool
-            ),
-        );
-    }
-    if let Err(message) = validate_requested_pool_uuid(request.pool_uuid.as_deref(), manifest) {
-        return LivePoolAdminResponse::error(2, message);
+    if let Err(response) = validate_request_pool_identity(&request, manifest) {
+        return response;
     }
 
     match request.command {
@@ -262,6 +253,22 @@ fn dispatch_request(
         | LivePoolAdminCommand::PerformanceAdmissionSnapshot
         | LivePoolAdminCommand::DeviceRemove => delegate_admin_request(&request, engine),
     }
+}
+
+fn validate_request_pool_identity(
+    request: &LivePoolAdminRequest,
+    manifest: &LiveOwnerManifest,
+) -> Result<(), LivePoolAdminResponse> {
+    if request.pool != manifest.pool_name {
+        return Err(live_admin_malformed(format!(
+            "live owner for pool '{}' cannot serve pool '{}'",
+            manifest.pool_name, request.pool
+        )));
+    }
+    if let Err(message) = validate_requested_pool_uuid(request.pool_uuid.as_deref(), manifest) {
+        return Err(live_admin_malformed(message));
+    }
+    Ok(())
 }
 
 fn validate_requested_pool_uuid(
@@ -616,6 +623,49 @@ mod tests {
 
         assert!(err.contains("owns uuid 0123456789abcdeffedcba9876543210"));
         assert!(err.contains("not requested uuid aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+    }
+
+    fn assert_typed_malformed(response: LivePoolAdminResponse) -> String {
+        assert_eq!(response.exit_code, 2);
+        let LivePoolAdminResponseBody::Error {
+            message,
+            machine_json: Some(machine_json),
+        } = response.body
+        else {
+            panic!("malformed request should carry typed machine JSON");
+        };
+
+        let value: serde_json::Value = serde_json::from_str(&machine_json).unwrap();
+        assert_eq!(
+            value.get("kind").and_then(serde_json::Value::as_str),
+            Some("malformed")
+        );
+        message
+    }
+
+    #[test]
+    fn pool_name_mismatch_uses_typed_malformed_error() {
+        let manifest = manifest();
+        let mut request = LivePoolAdminRequest::new(LivePoolAdminCommand::PoolStatus, "other");
+        request.pool_uuid = Some("0123456789abcdeffedcba9876543210".to_string());
+
+        let response = validate_request_pool_identity(&request, &manifest).unwrap_err();
+        let message = assert_typed_malformed(response);
+
+        assert!(message.contains("cannot serve pool 'other'"));
+    }
+
+    #[test]
+    fn pool_uuid_mismatch_uses_typed_malformed_error() {
+        let manifest = manifest();
+        let mut request = LivePoolAdminRequest::new(LivePoolAdminCommand::PoolStatus, "tank");
+        request.pool_uuid = Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string());
+
+        let response = validate_request_pool_identity(&request, &manifest).unwrap_err();
+        let message = assert_typed_malformed(response);
+
+        assert!(message.contains("owns uuid 0123456789abcdeffedcba9876543210"));
+        assert!(message.contains("not requested uuid aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
     }
 
     #[test]
