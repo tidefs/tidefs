@@ -20,9 +20,7 @@ mod tests {
     ///   - integration test validates the full basic-ops cycle
     #[test]
     fn test_basic_ops_cycle_with_remount() {
-        let Some(mut harness) = MountHarness::new_or_skip(module_path!()) else {
-            return;
-        };
+        let mut harness = MountHarness::new_or_fail(module_path!());
 
         // ── mkdir ───────────────────────────────────────────────────
         harness.mkdir("testdir").expect("mkdir testdir");
@@ -84,9 +82,7 @@ mod tests {
     ///   - rename completes successfully via real FUSE mount
     #[test]
     fn test_rename_directory_with_remount() {
-        let Some(mut harness) = MountHarness::new_or_skip(module_path!()) else {
-            return;
-        };
+        let mut harness = MountHarness::new_or_fail(module_path!());
 
         // ── create source directory ─────────────────────────────────
         harness.mkdir("olddir").expect("mkdir olddir");
@@ -148,9 +144,7 @@ mod tests {
     /// Edge case: rmdir on a non-empty directory must fail.
     #[test]
     fn test_rmdir_nonempty_fails() {
-        let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
-            return;
-        };
+        let harness = MountHarness::new_or_fail(module_path!());
 
         harness.mkdir("dir").expect("mkdir dir");
         harness
@@ -165,9 +159,7 @@ mod tests {
     /// Edge case: ENOENT on rmdir of non-existent directory.
     #[test]
     fn test_rmdir_nonexistent_fails() {
-        let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
-            return;
-        };
+        let harness = MountHarness::new_or_fail(module_path!());
 
         let full_path = harness.mount_path().join("nonexistent");
         let result = fs::remove_dir(&full_path);
