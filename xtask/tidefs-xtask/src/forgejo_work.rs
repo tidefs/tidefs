@@ -3,7 +3,8 @@
 //
 // Provides checks that validate:
 //   - Worktree ownership: the current directory is a valid tidefs worktree
-//     with a branch matching the current codexN/issue-N-* pattern.
+//     with a branch matching an accepted codexN/issue-N-* or dsN/issue-N-*
+//     identity pattern.
 //   - GitHub issue state: the corresponding issue is open on GitHub.
 //   - Abandoned worktrees: no stale worktree directories exist locally.
 //
