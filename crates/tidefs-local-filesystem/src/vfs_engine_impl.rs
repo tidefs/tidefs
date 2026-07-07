@@ -25,8 +25,8 @@ use tidefs_types_vfs_core::{
 };
 use tidefs_types_vfs_core::{LockRange, LockType};
 use tidefs_vfs_engine::{
-    LivePoolAdminArg, LivePoolAdminArgs, LivePoolAdminCommand, LivePoolAdminRequest,
-    LivePoolAdminResponse, LseekDataRange, VfsEngine, VfsEngineStatFs,
+    LivePoolAdminArg, LivePoolAdminArgs, LivePoolAdminCommand, LivePoolAdminError,
+    LivePoolAdminRequest, LivePoolAdminResponse, LseekDataRange, VfsEngine, VfsEngineStatFs,
 };
 #[cfg(test)]
 use tidefs_vfs_engine::{LivePoolAdminOutput, LivePoolAdminResponseBody};
@@ -1786,7 +1786,7 @@ impl VfsLocalFileSystem {
         request: &LivePoolAdminRequest,
     ) -> std::result::Result<LivePoolAdminResponse, Errno> {
         if let Err(err) = request.validate_version() {
-            return Ok(LivePoolAdminResponse::error(err.exit_code, err.message));
+            return Ok(live_admin_typed_error(err));
         }
         let pool = request.pool.as_str();
         let wants_json = request.output.wants_json();
@@ -3949,6 +3949,15 @@ fn live_admin_ok_bytes_hex(bytes: &[u8]) -> LivePoolAdminResponse {
 
 fn live_admin_error(exit_code: i32, message: impl Into<String>) -> LivePoolAdminResponse {
     LivePoolAdminResponse::error(exit_code, message)
+}
+
+fn live_admin_typed_error(err: LivePoolAdminError) -> LivePoolAdminResponse {
+    match serde_json::to_string(&err.kind) {
+        Ok(machine_json) => {
+            LivePoolAdminResponse::error_machine_json(err.exit_code, err.message, machine_json)
+        }
+        Err(_) => LivePoolAdminResponse::error(err.exit_code, err.message),
+    }
 }
 
 fn live_admin_hex_encode(bytes: &[u8]) -> String {

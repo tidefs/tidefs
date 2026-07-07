@@ -183,10 +183,9 @@ fn handle_client(
         Ok(0) => LivePoolAdminResponse::error(2, "empty live-owner request"),
         Ok(_) => match serde_json::from_str::<LivePoolAdminRequest>(&line) {
             Ok(request) => dispatch_request(request, manifest, engine, shutdown),
-            Err(err) => LivePoolAdminResponse::error(
-                2,
-                LivePoolAdminError::malformed(format!("decode live-owner request: {err}")).message,
-            ),
+            Err(err) => live_admin_typed_error(LivePoolAdminError::malformed(format!(
+                "decode live-owner request: {err}"
+            ))),
         },
         Err(err) => LivePoolAdminResponse::error(2, format!("read live-owner request: {err}")),
     };
@@ -214,7 +213,7 @@ fn dispatch_request(
     shutdown: &Arc<AtomicBool>,
 ) -> LivePoolAdminResponse {
     if let Err(err) = request.validate_version() {
-        return LivePoolAdminResponse::error(err.exit_code, err.message);
+        return live_admin_typed_error(err);
     }
     if request.pool != manifest.pool_name {
         return LivePoolAdminResponse::error(
@@ -453,6 +452,15 @@ fn pool_destroy_refused(
         )
     } else {
         LivePoolAdminResponse::error(1, pool_destroy_refusal_text(request, manifest))
+    }
+}
+
+fn live_admin_typed_error(err: LivePoolAdminError) -> LivePoolAdminResponse {
+    match serde_json::to_string(&err.kind) {
+        Ok(machine_json) => {
+            LivePoolAdminResponse::error_machine_json(err.exit_code, err.message, machine_json)
+        }
+        Err(_) => LivePoolAdminResponse::error(err.exit_code, err.message),
     }
 }
 
@@ -752,6 +760,30 @@ mod tests {
             .unwrap();
         assert!(error.contains("fail-closed"));
         assert!(!error.contains("not implemented"));
+    }
+
+    #[test]
+    fn typed_error_response_preserves_error_kind_machine_json() {
+        let response = live_admin_typed_error(LivePoolAdminError::unsupported_version(42));
+
+        assert_eq!(response.exit_code, 2);
+        let LivePoolAdminResponseBody::Error {
+            message: _,
+            machine_json: Some(machine_json),
+        } = response.body
+        else {
+            panic!("typed error should carry machine JSON");
+        };
+
+        let value: serde_json::Value = serde_json::from_str(&machine_json).unwrap();
+        assert_eq!(
+            value.get("kind").and_then(serde_json::Value::as_str),
+            Some("unsupported_version")
+        );
+        assert_eq!(
+            value.get("version").and_then(serde_json::Value::as_u64),
+            Some(42)
+        );
     }
 
     #[test]
