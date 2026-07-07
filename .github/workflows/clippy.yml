@@ -13,7 +13,6 @@ on:
       - 'kmod/**'
       - 'xtask/**'
       - 'scripts/clippy-baseline.sh'
-      - 'docs/CARGO_CLIPPY_BASELINE.md'
       - 'docs/clippy-baseline.json'
   workflow_dispatch:
     inputs:

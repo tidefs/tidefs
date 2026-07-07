@@ -98,7 +98,7 @@ policy_path_changed() {
     local changed_file="$1"
 
     case "$changed_file" in
-        Cargo.toml|Cargo.lock|docs/clippy-baseline.json|docs/CARGO_CLIPPY_BASELINE.md|scripts/clippy-baseline.sh|.github/workflows/clippy.yml)
+        Cargo.toml|Cargo.lock|docs/clippy-baseline.json|scripts/clippy-baseline.sh|.github/workflows/clippy.yml)
             return 0
             ;;
         *)
