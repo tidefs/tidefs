@@ -30,7 +30,7 @@ and `validation/claims.toml`.
 | **WeightedArc** | `tidefs-cache-core` | Generic ARC eviction policy (T1/T2/B1/B2) with byte-weight tracking for metadata entries | None (metadata-only, no dirty data) | **Authoritative** (for metadata placement) | ARC policy may inform kernel LRU |
 | **L2ARC** | `tidefs-cache-core` | Persistent second-level read cache on fast NVMe/SSD devices | None -- every entry has an authoritative copy on main pool devices | **Derived** | Kernel page cache is the final L1; L2ARC is a userspace flash tier |
 | **Prefetch** | `tidefs-cache-core` | Sequential-read detection and readahead planning | None (populates PageCache) | **Derived** | Kernel readahead is authoritative in kernel mode |
-| **HotReadCache** | `tidefs-local-filesystem` | Whole-file read cache for `read_file`/`read_symlink` with ARC eviction | None -- already documented as "not authority" in the historical hot read cache note | **Derived** (superseded by cache-core PageCache) | Not applicable in kernel mode |
+| **HotReadCache** | `tidefs-local-filesystem` | Whole-file read cache for `read_file`/`read_symlink` with ARC eviction | None -- source-owned as a non-authoritative runtime mirror | **Derived** (superseded by cache-core PageCache) | Not applicable in kernel mode |
 | **InodeCache** | `tidefs-local-filesystem` | ARC cache for inode metadata with lazy on-demand loading | None (metadata-only) | **Authoritative** (for inode metadata caching) | Future kernel inode cache |
 | **local-fs PageCache** | `tidefs-local-filesystem/src/page_cache/` | Page cache mirroring object-store content with its own DirtyPageTracker and reclaim | Derived from object store; never authoritative for durability | **Derived** (delegates to cache-core PageCache for page-level authority) | Merged into kernel page cache in kernel mode |
 | **DirtyPageTracker (range)** | `tidefs-local-filesystem/src/dirty_page_tracker.rs` | Per-inode dirty range tracking with coalescing for writeback flush path | Authoritative for dirty byte ranges awaiting flush | **Authoritative** | Replaced by kernel dirty-folio tracking in kernel mode |
@@ -135,7 +135,6 @@ successor/comparator claims.
 
 ## Related Documents
 
-- `docs/HOT_READ_CACHE_PC003.md` -- original hot read cache design (not authority)
 - `docs/PAGE_CACHE_WRITEBACK_AUTHORITY.md` and
   `docs/PAGE_CACHE_INVALIDATION_AUTHORITY.md` -- current
   page-cache/writeback/mmap and invalidation authority

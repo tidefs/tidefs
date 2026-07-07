@@ -179,13 +179,6 @@ pub fn check_local_object_store_on_disk_format_current_workspace() -> Result<(),
         "80-byte production-integrity trailer",
         "PRODUCTION_INTEGRITY_TRAILER_LEN=80",
     ];
-    // Production-integrity records doc
-    check_forbidden_markers(
-        &root,
-        "docs/PRODUCTION_INTEGRITY_V3_RECORDS_OW014.md",
-        stale_patterns,
-        &mut missing,
-    );
     // Production-integrity policy doc
     check_forbidden_markers(
         &root,
@@ -339,7 +332,6 @@ pub fn check_production_integrity_v3_current_workspace() -> Result<(), StorageCh
     let mut missing = Vec::new();
 
     for rel in [
-        "docs/PRODUCTION_INTEGRITY_V3_RECORDS_OW014.md",
         "crates/tidefs-local-object-store/src/lib.rs",
         "apps/tidefs-store-demo/src/main.rs",
         "nix/tidefs-validation.sh",
@@ -382,19 +374,6 @@ pub fn check_production_integrity_v3_current_workspace() -> Result<(), StorageCh
             "production_integrity.trailer_len",
             "replay.v3_records_seen",
             "replay.production_integrity_records_seen",
-        ],
-        &mut missing,
-    );
-    check_source_markers(
-        &root,
-        "docs/PRODUCTION_INTEGRITY_V3_RECORDS_OW014.md",
-        &[
-            "record version 3",
-            "BLAKE3-256",
-            "production-integrity trailer",
-            "v1/v2 compatibility",
-            "root authentication is delivered by the root-authentication slice",
-            "tidefs-xtask check-production-integrity-v3",
         ],
         &mut missing,
     );
@@ -945,7 +924,6 @@ pub fn check_chunked_file_layout_current_workspace() -> Result<(), StorageCheckE
     })?;
     let mut missing = Vec::new();
     for rel in [
-        "docs/CHUNKED_FILE_LAYOUT_OW101.md",
         "crates/tidefs-local-filesystem/src/lib.rs",
         "apps/tidefs-filesystem-demo/src/main.rs",
         "nix/tidefs-validation.sh",
@@ -982,20 +960,6 @@ pub fn check_chunked_file_layout_current_workspace() -> Result<(), StorageCheckE
             "content_layout.chunk_size",
             "content_layout.manifest_object=versioned-content-object",
             "content_layout.chunk_objects=versioned-content-chunks",
-        ],
-        &mut missing,
-    );
-    check_source_markers(
-        &root,
-        "docs/CHUNKED_FILE_LAYOUT_OW101.md",
-        &[
-            "chunk manifest",
-            "per-chunk object",
-            "random writes",
-            "truncate",
-            "unchanged chunk references",
-            "transaction manifest",
-            "tidefs-xtask check-chunked-file-layout",
         ],
         &mut missing,
     );
@@ -3153,8 +3117,6 @@ pub fn check_hot_read_cache_current_workspace() -> Result<(), StorageCheckError>
     })?;
     let mut missing = Vec::new();
     for rel in [
-        "docs/HOT_READ_CACHE_PC003.md",
-        "docs/INDEX.md",
         "crates/tidefs-local-filesystem/src/lib.rs",
         "apps/tidefs-filesystem-demo/src/main.rs",
         "nix/tidefs-validation.sh",
@@ -3191,26 +3153,6 @@ pub fn check_hot_read_cache_current_workspace() -> Result<(), StorageCheckError>
             "hot_read_cache.misses",
             "hot_read_cache.is_bounded",
         ],
-        &mut missing,
-    );
-    check_source_markers(
-        &root,
-        "docs/HOT_READ_CACHE_PC003.md",
-        &[
-            "hot read cache",
-            "bounded runtime mirror",
-            "not authority",
-            "inode id",
-            "data version",
-            "admission_bypasses",
-            "tidefs-xtask check-hot-read-cache",
-        ],
-        &mut missing,
-    );
-    check_source_markers(
-        &root,
-        "docs/INDEX.md",
-        &["docs/HOT_READ_CACHE_PC003.md"],
         &mut missing,
     );
     // Verify BackgroundOrphanReclamation registration at mount.
