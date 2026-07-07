@@ -1826,10 +1826,10 @@ impl VfsLocalFileSystem {
             LivePoolAdminCommand::DeviceRemove => self.live_device_remove(&args, wants_json),
             command => {
                 let (command_name, operation) = command.parts();
-                LivePoolAdminResponse::error(
-                    1,
-                    format!("live engine does not implement tidefsctl {command_name} {operation}"),
-                )
+                live_admin_typed_error(LivePoolAdminError::unsupported_command(
+                    command_name,
+                    operation,
+                ))
             }
         })
     }
@@ -7038,6 +7038,22 @@ mod tests {
         )
         .expect("open block-device filesystem");
         (VfsLocalFileSystem::new(fs), root, devices)
+    }
+
+    #[test]
+    fn live_pool_admin_unsupported_local_command_returns_typed_error() {
+        let (engine, _td) = temp_fs();
+        let request = LivePoolAdminRequest::new(LivePoolAdminCommand::PoolStatus, "tank");
+        let response = engine
+            .handle_live_pool_admin_request(&request)
+            .expect("dispatch live admin request");
+        let value = live_admin_response_to_legacy_json(response);
+
+        assert_eq!(value["ok"], false);
+        assert_eq!(value["exit_code"], 1);
+        assert_eq!(value["json"]["kind"], "unsupported_command");
+        assert_eq!(value["json"]["command"], "pool");
+        assert_eq!(value["json"]["operation"], "status");
     }
 
     #[test]
