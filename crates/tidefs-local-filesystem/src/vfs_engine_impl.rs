@@ -3041,19 +3041,11 @@ impl VfsLocalFileSystem {
             }
             LiveSnapshotSendDestination::TargetAddress {
                 target_addr,
+                addr,
                 node_id,
                 server_node_id,
                 output,
             } => {
-                let addr: SocketAddr = match target_addr.parse() {
-                    Ok(a) => a,
-                    Err(err) => {
-                        return live_admin_error(
-                            1,
-                            format!("snapshot send: invalid target-address '{target_addr}': {err}"),
-                        );
-                    }
-                };
                 let auth_key = self.fs.borrow().root_authentication_key.as_bytes32();
                 let request = match build_snap_push_message(&stream.encoded, &auth_key) {
                     Ok(request) => request,
@@ -3063,7 +3055,7 @@ impl VfsLocalFileSystem {
                 let mut transport = Transport::new(*node_id);
                 transport.add_node(NodeInfo::new(
                     *server_node_id,
-                    vec![TransportAddr::Tcp(addr)],
+                    vec![TransportAddr::Tcp(*addr)],
                     0,
                 ));
 
@@ -3933,6 +3925,7 @@ enum LiveSnapshotSendDestination {
     Output(std::path::PathBuf),
     TargetAddress {
         target_addr: String,
+        addr: SocketAddr,
         node_id: u64,
         server_node_id: u64,
         output: Option<std::path::PathBuf>,
@@ -4073,6 +4066,9 @@ fn live_snapshot_send_destination(args: &Value) -> Result<LiveSnapshotSendDestin
     let output = live_admin_optional_arg(args, "output").map(std::path::PathBuf::from);
     match live_admin_optional_arg(args, "target_addr") {
         Some(target_addr) => {
+            let addr = target_addr.parse().map_err(|err| {
+                format!("snapshot send: invalid target-address '{target_addr}': {err}")
+            })?;
             let node_id = args
                 .get("node_id")
                 .and_then(Value::as_u64)
@@ -4083,6 +4079,7 @@ fn live_snapshot_send_destination(args: &Value) -> Result<LiveSnapshotSendDestin
                 .unwrap_or(2);
             Ok(LiveSnapshotSendDestination::TargetAddress {
                 target_addr: target_addr.to_string(),
+                addr,
                 node_id,
                 server_node_id,
                 output,
@@ -7922,6 +7919,42 @@ mod tests {
                 .as_str()
                 .is_some_and(|err| { err.contains("target-address") && err.contains("vfssend2") }),
             "target response should explain VFSSEND2 target-address requirement: {refused}"
+        );
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn live_snapshot_send_rejects_invalid_target_address_before_exporting() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = root.path().join("store");
+        let mut fs = LocalFileSystem::open(&store).expect("open fs");
+        fs.create_file("/live.txt", 0o644).expect("create file");
+        fs.write_file("/live.txt", 0, b"live owner snapshot send")
+            .expect("write file");
+        let engine = VfsLocalFileSystem::new(fs);
+        let output = root.path().join("invalid-target.vfs");
+
+        let refused = live_snapshot_admin(
+            &engine,
+            "send",
+            json!({
+                "output": output.display().to_string(),
+                "target_addr": "not-a-socket-address",
+                "format": "vfssend2",
+                "incremental": false,
+            }),
+            true,
+        );
+
+        assert_eq!(refused["ok"], false, "target response: {refused}");
+        assert_eq!(refused["exit_code"], 1);
+        assert!(refused["json"].is_null());
+        assert!(refused["text"].is_null());
+        assert!(
+            refused["error"]
+                .as_str()
+                .is_some_and(|err| err.contains("invalid target-address")),
+            "target response should explain target-address parsing failure: {refused}"
         );
         assert!(!output.exists());
     }
