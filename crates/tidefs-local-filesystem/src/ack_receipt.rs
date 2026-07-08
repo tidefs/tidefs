@@ -541,6 +541,14 @@ impl LocalAckReceipt {
 
     fn has_local_ack_result_projection(self) -> bool {
         self.refusal.attempted_receipt == self.receipt.receipt_id
+            && self.refusal.evidence.kind == StorageIntentEvidenceKind::ResultRefusalEvidence
+            && self.refusal.evidence.version == LOCAL_ACK_RECEIPT_RECORD_VERSION
+            && self.refusal.evidence.id
+                == StorageIntentEvidenceId(hash_refusal_context(
+                    self.refusal.evidence.generation,
+                    self.refusal.attempted_receipt,
+                    self.refusal.reason,
+                ))
             && self.refusal.evidence.is_bound()
             && self
                 .receipt
@@ -1360,6 +1368,58 @@ mod tests {
             StorageIntentRefusalReason::None
         );
         assert!(!missing_result_ref.satisfies_requested_ack_floor());
+    }
+
+    #[test]
+    fn requested_floor_receipt_fails_closed_for_wrong_result_evidence_kind() {
+        let mut wrong_result_kind = LocalAckReceipt::full_local_placement(
+            28,
+            LocalAckOperation::Syncfs,
+            LocalAckReceiptTarget::FILESYSTEM,
+            None,
+        );
+        assert!(wrong_result_kind.satisfies_requested_ack_floor());
+        wrong_result_kind.refusal.evidence = wrong_result_kind.local_intent_record_ref;
+
+        assert!(wrong_result_kind.is_posix_durable_success());
+        assert_eq!(
+            wrong_result_kind.refusal_reason(),
+            StorageIntentRefusalReason::None
+        );
+        assert!(wrong_result_kind.has_requested_ack_floor_evidence());
+        assert!(!wrong_result_kind.satisfies_requested_ack_floor());
+    }
+
+    #[test]
+    fn requested_floor_receipt_fails_closed_for_wrong_result_evidence_identity() {
+        let mut wrong_result_identity = LocalAckReceipt::full_local_placement(
+            29,
+            LocalAckOperation::Syncfs,
+            LocalAckReceiptTarget::FILESYSTEM,
+            None,
+        );
+        assert!(wrong_result_identity.satisfies_requested_ack_floor());
+        let wrong_result_ref = evidence_ref(
+            StorageIntentEvidenceKind::ResultRefusalEvidence,
+            "unlinked-result-refusal",
+            2400,
+            LocalAckOperation::Syncfs,
+            LocalAckReceiptTarget::FILESYSTEM,
+            None,
+        );
+        let _ = wrong_result_identity
+            .receipt
+            .evidence_refs
+            .push(wrong_result_ref);
+        wrong_result_identity.refusal.evidence = wrong_result_ref;
+
+        assert!(wrong_result_identity.is_posix_durable_success());
+        assert_eq!(
+            wrong_result_identity.refusal_reason(),
+            StorageIntentRefusalReason::None
+        );
+        assert!(wrong_result_identity.has_requested_ack_floor_evidence());
+        assert!(!wrong_result_identity.satisfies_requested_ack_floor());
     }
 
     #[test]
