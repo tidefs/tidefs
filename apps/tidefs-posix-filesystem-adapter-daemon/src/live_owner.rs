@@ -294,13 +294,15 @@ fn delegate_admin_request(
     match engine.lock() {
         Ok(engine) => match engine.live_pool_admin_request(request) {
             Ok(response) => response,
-            Err(errno) => LivePoolAdminResponse::error(
-                1,
-                format!("live engine does not support this admin request: {errno:?}"),
-            ),
+            Err(_) => unsupported_admin_command_response(request),
         },
         Err(_) => LivePoolAdminResponse::error(1, "live owner engine lock poisoned"),
     }
+}
+
+fn unsupported_admin_command_response(request: &LivePoolAdminRequest) -> LivePoolAdminResponse {
+    let (command, operation) = request.command.parts();
+    live_admin_typed_error(LivePoolAdminError::unsupported_command(command, operation))
 }
 
 fn pool_status(
@@ -685,6 +687,39 @@ mod tests {
         assert_eq!(
             payload.get("pool_uuid").and_then(serde_json::Value::as_str),
             Some("0123456789abcdeffedcba9876543210")
+        );
+    }
+
+    #[test]
+    fn delegated_unsupported_admin_request_uses_typed_command_error() {
+        let request = LivePoolAdminRequest::new(LivePoolAdminCommand::DatasetList, "tank");
+
+        let response = unsupported_admin_command_response(&request);
+
+        assert_eq!(response.exit_code, 1);
+        let LivePoolAdminResponseBody::Error {
+            message,
+            machine_json: Some(machine_json),
+        } = response.body
+        else {
+            panic!("unsupported admin request should carry typed machine JSON");
+        };
+        assert_eq!(
+            message,
+            "unsupported live-owner command tidefsctl dataset list"
+        );
+        let value: serde_json::Value = serde_json::from_str(&machine_json).unwrap();
+        assert_eq!(
+            value.get("kind").and_then(serde_json::Value::as_str),
+            Some("unsupported_command")
+        );
+        assert_eq!(
+            value.get("command").and_then(serde_json::Value::as_str),
+            Some("dataset")
+        );
+        assert_eq!(
+            value.get("operation").and_then(serde_json::Value::as_str),
+            Some("list")
         );
     }
 
