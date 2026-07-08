@@ -2,6 +2,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use tidefs_validation::evidence_artifact_manifest::{
     content_digest_for_bytes, parse_evidence_artifact_manifest_json, EvidenceArtifactManifest,
@@ -82,6 +83,26 @@ fn repo_relative_path(repo_root: &Path, path: &Path) -> String {
         .to_string()
 }
 
+fn committed_repo_files(repo_root: &Path) -> BTreeSet<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .arg("ls-files")
+        .output()
+        .expect("run git ls-files");
+    assert!(
+        output.status.success(),
+        "git ls-files failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    String::from_utf8(output.stdout)
+        .expect("git ls-files output should be UTF-8")
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
 fn is_manifest_path(path: &Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
@@ -147,6 +168,8 @@ fn committed_evidence_manifests_verify_artifact_payloads() {
     let mut artifact_files = Vec::new();
     collect_committed_artifact_files(&artifacts_root, &mut artifact_files);
 
+    let committed_files = committed_repo_files(repo_root);
+
     let mut failures = Vec::new();
     for path in artifact_files.iter().filter(|path| is_manifest_path(path)) {
         let manifest_path = repo_relative_path(repo_root, path);
@@ -167,6 +190,12 @@ fn committed_evidence_manifests_verify_artifact_payloads() {
         if is_manifest_path(Path::new(&manifest.artifact_path)) {
             failures.push(format!(
                 "{manifest_path} points at manifest `{}` instead of an artifact payload",
+                manifest.artifact_path
+            ));
+        }
+        if !committed_files.contains(&manifest.artifact_path) {
+            failures.push(format!(
+                "{manifest_path} points at non-committed artifact payload `{}`",
                 manifest.artifact_path
             ));
         }

@@ -65,6 +65,9 @@ The `artifact_path` must be relative to the repository or validation artifact
 root, and `content_digest` must match the bytes at that path. Use the
 manifest helpers in `tidefs-validation` to serialize, parse, and verify the
 record instead of parsing per-tool output shapes.
+For committed manifests, the referenced payload must also be a committed
+repository file; it may live outside `validation/artifacts/` when the registry
+intentionally names a repo-relative fixture or source-model input.
 
 Version-1 manifests are retired pre-standardization input. They can be read as
 historical review material, but `validate-evidence-manifest` rejects them for
