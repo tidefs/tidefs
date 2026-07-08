@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use tidefs_validation::evidence_artifact_manifest::{
-    content_digest_for_bytes, parse_evidence_artifact_manifest_json, EvidenceArtifactManifest,
-    EVIDENCE_ARTIFACT_MANIFEST_VERSION,
+    content_digest_for_bytes, parse_evidence_artifact_manifest_json, validate_artifact_path_shape,
+    EvidenceArtifactManifest, EVIDENCE_ARTIFACT_MANIFEST_VERSION,
 };
 use tidefs_validation::validation_schema::ValidationTier;
 use tidefs_validation::validation_status::ValidationStatus;
@@ -222,6 +222,14 @@ fn committed_evidence_manifests_verify_artifact_payloads() {
             )
         });
 
+        if let Err(error) = validate_artifact_path_shape(&manifest.artifact_path) {
+            failures.push(format!(
+                "{manifest_path} has invalid artifact_path `{}`: {}",
+                manifest.artifact_path,
+                error.failures().join("; ")
+            ));
+            continue;
+        }
         if is_manifest_path(Path::new(&manifest.artifact_path)) {
             failures.push(format!(
                 "{manifest_path} points at manifest `{}` instead of an artifact payload",

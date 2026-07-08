@@ -120,7 +120,9 @@ impl EvidenceArtifactManifest {
         if self.scope.trim().is_empty() {
             failures.push("scope must not be empty".to_string());
         }
-        validate_relative_artifact_path(&self.artifact_path, &mut failures);
+        if let Err(error) = validate_artifact_path_shape(&self.artifact_path) {
+            failures.extend(error.failures().iter().cloned());
+        }
         validate_content_digest(&self.content_digest, &mut failures);
         validate_required_text("run_id", &self.run_id, &mut failures);
         validate_required_text("source_ref", &self.source_ref, &mut failures);
@@ -158,9 +160,7 @@ impl EvidenceArtifactManifest {
         &self,
         root: impl AsRef<Path>,
     ) -> Result<PathBuf, EvidenceArtifactManifestError> {
-        let mut failures = Vec::new();
-        validate_relative_artifact_path(&self.artifact_path, &mut failures);
-        EvidenceArtifactManifestError::from_failures(failures)?;
+        validate_artifact_path_shape(&self.artifact_path)?;
         let root = root.as_ref();
         let canonical_root = root.canonicalize().map_err(|error| {
             EvidenceArtifactManifestError::single(format!(
@@ -272,6 +272,12 @@ pub fn content_digest_for_path(
         EvidenceArtifactManifestError::single(format!("read `{}`: {error}", path.display()))
     })?;
     Ok(content_digest_for_bytes(&bytes))
+}
+
+pub fn validate_artifact_path_shape(path: &str) -> Result<(), EvidenceArtifactManifestError> {
+    let mut failures = Vec::new();
+    validate_relative_artifact_path(path, &mut failures);
+    EvidenceArtifactManifestError::from_failures(failures)
 }
 
 fn validate_relative_artifact_path(path: &str, failures: &mut Vec<String>) {
