@@ -630,6 +630,9 @@ impl LocalAckReceipt {
         let needs_full_placement = matches!(
             self.requested_ack_floor,
             StorageIntentGuaranteeClass::FullPlacement
+        ) || matches!(
+            self.receipt.ack_class,
+            StorageIntentGuaranteeClass::FullPlacement
         );
 
         has_local_evidence
@@ -1588,6 +1591,42 @@ mod tests {
         assert!(wrong_placement_identity.has_local_ack_result_projection());
         assert!(!wrong_placement_identity.has_requested_ack_floor_evidence());
         assert!(!wrong_placement_identity.satisfies_requested_ack_floor());
+    }
+
+    #[test]
+    fn full_placement_ack_label_requires_placement_evidence_with_local_floor() {
+        let mut receipt = LocalAckReceipt::full_local_placement(
+            21,
+            LocalAckOperation::Fsync,
+            LocalAckReceiptTarget::inode(21),
+            None,
+        );
+        assert_eq!(
+            receipt.receipt.ack_class,
+            StorageIntentGuaranteeClass::FullPlacement
+        );
+        assert_eq!(
+            receipt.requested_ack_floor,
+            StorageIntentGuaranteeClass::LocalIntent
+        );
+        assert!(receipt.satisfies_requested_ack_floor());
+
+        receipt.receipt.evidence_refs = evidence_refs(&[
+            receipt.local_intent_record_ref,
+            receipt.ordering_ref,
+            receipt.flush_fence_ref,
+            receipt.media_capability_ref,
+            receipt.reserve_ref,
+            receipt.dirty_window_ref,
+            receipt.rollout_ref,
+            receipt.tenant_isolation_ref,
+            receipt.refusal.evidence,
+        ]);
+
+        assert!(receipt.is_posix_durable_success());
+        assert!(receipt.has_local_ack_result_projection());
+        assert!(!receipt.has_requested_ack_floor_evidence());
+        assert!(!receipt.satisfies_requested_ack_floor());
     }
 
     #[test]
