@@ -245,7 +245,7 @@ impl CandidatePool {
 
         // Mark topology completeness
         let found_count = self.devices.len() as u32;
-        self.topology_complete = found_count >= self.device_count;
+        self.topology_complete = found_count == self.device_count;
 
         // Cluster pool detection: if any device label has the
         // CLUSTER_POOL_INCOMPAT flag and cluster authority has not been
@@ -848,6 +848,71 @@ mod tests {
         assert_eq!(evidence.action, PoolLifecycleAction::Scan);
         assert!(evidence.is_fail_closed());
         assert!(evidence.reason.contains("topology"));
+    }
+
+    #[test]
+    fn surplus_candidate_pool_emits_fail_closed_evidence() {
+        let pool_guid = [0x3A; 16];
+        let make_candidate = |index, byte| DeviceCandidate {
+            path: std::path::PathBuf::from(format!("/dev/tidefs-surplus-{index}")),
+            label: PoolLabelV1 {
+                magic: POOL_LABEL_MAGIC,
+                version: 1,
+                pool_guid,
+                device_guid: [byte; 16],
+                pool_name_len: 0,
+                pool_name: [0u8; 255],
+                pool_state: LabelPoolState::Exported,
+                commit_group: 46,
+                label_commit_group: 46,
+                device_index: index,
+                topology_generation: 5,
+                device_count: 2,
+                device_class: LabelDeviceClass::Hdd,
+                device_capacity_bytes: 4096,
+                system_area_pointer: 0,
+                system_area_size: 0,
+                features_incompat: 0,
+                features_ro_compat: 0,
+                features_compat: 0,
+                device_health: 0,
+                device_read_errors: 0,
+                device_write_errors: 0,
+                device_checksum_errors: 0,
+                redundancy_policy: PoolRedundancyPolicy::default(),
+                checksum: [0; 32],
+            },
+            label_copy: 0,
+            device_size: 4096,
+        };
+        let mut pool = CandidatePool {
+            pool_guid,
+            pool_name: "surplus".into(),
+            pool_state: LabelPoolState::Exported,
+            devices: vec![
+                make_candidate(0, 0x3B),
+                make_candidate(1, 0x3C),
+                make_candidate(2, 0x3D),
+            ],
+            topology_generation: 5,
+            device_count: 2,
+            recovery_commit_group: 46,
+            topology_complete: false,
+            cluster_authorized: false,
+        };
+
+        assert!(pool.validate().is_ok());
+        assert!(!pool.topology_complete);
+
+        let evidence = pool.lifecycle_evidence(PoolLifecycleAction::Import);
+
+        assert_eq!(evidence.outcome, PoolLifecycleOutcome::Refused);
+        assert_eq!(evidence.reason, "topology evidence incomplete");
+        assert_eq!(evidence.device_count, 3);
+        assert_eq!(evidence.expected_device_count, 2);
+        assert!(!evidence.topology_complete);
+        assert!(evidence.owner_authorized);
+        assert!(evidence.is_fail_closed());
     }
 
     #[test]

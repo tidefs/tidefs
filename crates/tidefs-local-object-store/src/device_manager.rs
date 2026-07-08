@@ -149,7 +149,7 @@ impl DeviceManager {
             _ => PoolLifecycleEvidence::refused_with_authority(
                 PoolLifecycleAction::FailClosed,
                 context,
-                device_count >= expected_device_count,
+                device_count == expected_device_count,
                 true,
                 "unsupported device topology lifecycle action",
             ),
@@ -842,6 +842,25 @@ mod tests {
         assert!(evidence.topology_complete);
         assert!(evidence.owner_authorized);
         assert!(!evidence.is_fail_closed());
+        assert!(evidence.reason.contains("unsupported"));
+    }
+
+    #[test]
+    fn topology_lifecycle_evidence_refuses_unsupported_surplus_topology() {
+        let evidence = DeviceManager::topology_lifecycle_evidence(
+            PoolLifecycleAction::Export,
+            [0x57; 16],
+            "topology",
+            4,
+            3,
+            9,
+            8,
+        );
+
+        assert_eq!(evidence.action, PoolLifecycleAction::FailClosed);
+        assert!(!evidence.topology_complete);
+        assert!(evidence.owner_authorized);
+        assert!(evidence.is_fail_closed());
         assert!(evidence.reason.contains("unsupported"));
     }
 
