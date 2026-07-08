@@ -20,7 +20,7 @@ mod tests {
     #[test]
     #[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
     fn test_basic_ops_cycle_with_remount() {
-        let mut harness = MountHarness::new_or_fail(module_path!());
+        let mut harness = MountHarness::new_or_fail("test_basic_ops_cycle_with_remount");
 
         // ── mkdir ───────────────────────────────────────────────────
         harness.mkdir("testdir").expect("mkdir testdir");
@@ -83,7 +83,7 @@ mod tests {
     #[test]
     #[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
     fn test_rename_directory_with_remount() {
-        let mut harness = MountHarness::new_or_fail(module_path!());
+        let mut harness = MountHarness::new_or_fail("test_rename_directory_with_remount");
 
         // ── create source directory ─────────────────────────────────
         harness.mkdir("olddir").expect("mkdir olddir");
@@ -146,7 +146,7 @@ mod tests {
     #[test]
     #[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
     fn test_rmdir_nonempty_fails() {
-        let harness = MountHarness::new_or_fail(module_path!());
+        let harness = MountHarness::new_or_fail("test_rmdir_nonempty_fails");
 
         harness.mkdir("dir").expect("mkdir dir");
         harness
@@ -162,7 +162,7 @@ mod tests {
     #[test]
     #[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
     fn test_rmdir_nonexistent_fails() {
-        let harness = MountHarness::new_or_fail(module_path!());
+        let harness = MountHarness::new_or_fail("test_rmdir_nonexistent_fails");
 
         let full_path = harness.mount_path().join("nonexistent");
         let result = fs::remove_dir(&full_path);
