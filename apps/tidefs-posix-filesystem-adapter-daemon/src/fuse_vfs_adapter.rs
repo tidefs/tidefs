@@ -7411,6 +7411,8 @@ impl FuseVfsAdapter {
         // already accepted the exact bytes from this request; refresh daemon
         // caches/mirrors here and leave the kernel page cache alone.
         self.fence_daemon_read_caches_after_engine_data_mutation(ino, offset, length);
+        // Resident dirty page mirrors still carry unflushed bytes after range
+        // trackers have been partially or fully drained.
         let has_dirty_overlap = self.dirty_trackers_overlap_range(ino, offset, length)
             || self.dirty_page_caches_overlap_range(ino, offset, length);
         if has_dirty_overlap {
@@ -43215,6 +43217,249 @@ mod tests {
                 .is_dirty(ino),
             Some(false),
             "clean write-through helper must leave the inode reclaim cache clean"
+        );
+    }
+
+    #[test]
+    fn writeback_cached_clean_write_through_helper_reconciles_dirty_page_cache_overlap() {
+        let fixture = adapter_fixture_with_writeback_cache();
+        let ctx = root_ctx();
+        let (inode, _adapter_fh, _engine_fh) = create_adapter_file_handle(
+            &fixture.adapter,
+            &ctx,
+            b"wb-clean-write-through-helper-dirty-page-cache.bin",
+            libc::O_RDWR as u32,
+        );
+        let ino = inode.get();
+        let worker_tracker = fixture
+            .adapter
+            .write_dispatch
+            .lock()
+            .unwrap()
+            .dirty_page_tracker_arc();
+        let page_size = fixture.adapter.write_page_cache.page_size();
+        let page_size_u64 = u64::try_from(page_size).expect("page size fits u64");
+        let mut expected = vec![0xAA; page_size];
+        fixture
+            .adapter
+            .write_page_cache
+            .insert(ino, 0)
+            .expect("insert resident dirty mirror");
+        {
+            let mut page = fixture
+                .adapter
+                .write_page_cache
+                .lookup(ino, 0)
+                .expect("lookup resident dirty mirror");
+            page.data_mut().copy_from_slice(&expected);
+            page.mark_dirty();
+            assert!(page.is_dirty());
+        }
+        {
+            let mut cache = fixture.adapter.writeback_cache.lock().unwrap();
+            cache.insert(ino);
+            cache.mark_dirty(ino, page_size_u64);
+        }
+        assert!(fixture
+            .adapter
+            .dirty_state
+            .lock()
+            .unwrap()
+            .get(&ino)
+            .is_none_or(|ranges| ranges.is_empty()));
+        assert!(worker_tracker
+            .lock()
+            .unwrap()
+            .get_dirty_ranges(ino)
+            .is_empty());
+        let stale_snapshot = fixture
+            .adapter
+            .data_cache_generation_snapshot(ino, 1024, 512);
+
+        let replacement = vec![0xC4; 512];
+        let accepted_len = 256;
+        fixture.adapter.record_clean_write_through_after_write(
+            ino,
+            1024,
+            accepted_len,
+            &replacement,
+        );
+        expected[1024..1024 + accepted_len as usize]
+            .copy_from_slice(&replacement[..accepted_len as usize]);
+
+        assert!(
+            !fixture
+                .adapter
+                .data_cache_snapshot_still_current(ino, 1024, 512, stale_snapshot),
+            "dirty page-cache overlap must still fence daemon read-cache generations"
+        );
+        assert!(fixture
+            .adapter
+            .dirty_state
+            .lock()
+            .unwrap()
+            .get(&ino)
+            .is_none_or(|ranges| ranges.is_empty()));
+        assert!(worker_tracker
+            .lock()
+            .unwrap()
+            .get_dirty_ranges(ino)
+            .is_empty());
+        {
+            let page = fixture
+                .adapter
+                .write_page_cache
+                .lookup(ino, 0)
+                .expect("resident dirty mirror remains resident");
+            assert_eq!(page.data(), expected.as_slice());
+            assert!(
+                page.is_dirty(),
+                "partial authoritative bytes must preserve unrelated dirty page-cache bytes"
+            );
+        }
+        assert_eq!(
+            fixture
+                .adapter
+                .writeback_cache
+                .lock()
+                .unwrap()
+                .is_dirty(ino),
+            Some(true),
+            "dirty page-cache mirrors must keep the inode reclaim cache dirty"
+        );
+    }
+
+    #[test]
+    fn writeback_cached_clean_write_through_helper_full_dirty_page_replacement_clears_dirty_mirror()
+    {
+        let mut fixture = adapter_fixture_with_writeback_cache();
+        let ctx = root_ctx();
+        let (inode, _adapter_fh, _engine_fh) = create_adapter_file_handle(
+            &fixture.adapter,
+            &ctx,
+            b"wb-clean-write-through-helper-full-dirty-page.bin",
+            libc::O_RDWR as u32,
+        );
+        let ino = inode.get();
+        let page_size = fixture.adapter.write_page_cache.page_size();
+        let page_size_u64 = u64::try_from(page_size).expect("page size fits u64");
+        let page_size_u32 = u32::try_from(page_size).expect("page size fits u32");
+        fixture
+            .adapter
+            .write_page_cache
+            .insert(ino, 0)
+            .expect("insert resident dirty mirror");
+        {
+            let mut page = fixture
+                .adapter
+                .write_page_cache
+                .lookup(ino, 0)
+                .expect("lookup resident dirty mirror");
+            page.data_mut().fill(0xAA);
+            page.mark_dirty();
+            assert!(page.is_dirty());
+        }
+        fixture
+            .adapter
+            .dirty_state
+            .lock()
+            .unwrap()
+            .entry(ino)
+            .or_default()
+            .mark_dirty(0, page_size_u32);
+        let shared_tracker = Arc::new(Mutex::new(
+            tidefs_local_filesystem::dirty_page_tracker::DirtyPageTracker::new(),
+        ));
+        shared_tracker
+            .lock()
+            .unwrap()
+            .mark_dirty(inode, 0, page_size_u64);
+        fixture.adapter.writeback_range_tracker = Some(Arc::clone(&shared_tracker));
+        let worker_tracker = fixture
+            .adapter
+            .write_dispatch
+            .lock()
+            .unwrap()
+            .dirty_page_tracker_arc();
+        worker_tracker
+            .lock()
+            .unwrap()
+            .mark_dirty(ino, 0, page_size_u64)
+            .expect("seed worker dirty range");
+        {
+            let mut cache = fixture.adapter.writeback_cache.lock().unwrap();
+            cache.insert(ino);
+            cache.mark_dirty(ino, page_size_u64);
+        }
+        let stale_snapshot = fixture
+            .adapter
+            .data_cache_generation_snapshot(ino, 0, page_size_u64);
+
+        let replacement = vec![0xC4; page_size];
+        fixture
+            .adapter
+            .record_clean_write_through_after_write(ino, 0, page_size_u32, &replacement);
+
+        assert!(
+            !fixture.adapter.data_cache_snapshot_still_current(
+                ino,
+                0,
+                page_size_u64,
+                stale_snapshot
+            ),
+            "full dirty mirror reconciliation must still fence daemon read-cache generations"
+        );
+        assert!(
+            fixture
+                .adapter
+                .dirty_state
+                .lock()
+                .unwrap()
+                .get(&ino)
+                .is_none(),
+            "daemon dirty ranges should be cleared"
+        );
+        assert!(
+            shared_tracker.lock().unwrap().dirty_ranges(inode).is_none(),
+            "shared writeback tracker should be cleared"
+        );
+        assert!(
+            worker_tracker
+                .lock()
+                .unwrap()
+                .get_dirty_ranges(ino)
+                .is_empty(),
+            "worker dirty ranges should be cleared"
+        );
+        {
+            let page = fixture
+                .adapter
+                .write_page_cache
+                .lookup(ino, 0)
+                .expect("resident dirty mirror remains resident");
+            assert_eq!(page.data(), replacement.as_slice());
+            assert!(
+                !page.is_dirty(),
+                "full authoritative clean write-through bytes should clear the dirty mirror"
+            );
+        }
+        assert!(
+            fixture
+                .adapter
+                .write_page_cache
+                .dirty_pages_for_inode(ino)
+                .is_empty(),
+            "fully replaced page should not remain dirty"
+        );
+        assert_eq!(
+            fixture
+                .adapter
+                .writeback_cache
+                .lock()
+                .unwrap()
+                .is_dirty(ino),
+            Some(false),
+            "fully reconciled inode reclaim cache should be clean"
         );
     }
 
