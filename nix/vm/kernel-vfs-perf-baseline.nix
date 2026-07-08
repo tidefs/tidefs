@@ -145,9 +145,12 @@ EOF
   "log_empty": true,
   "required_metrics_present": false,
   "metrics": {
+    "write_duration_s": "0",
     "write_throughput_MBps": "0",
+    "read_duration_s": "0",
     "read_throughput_MBps": "0",
-    "stat_avg_latency_us": "0"
+    "stat_avg_latency_us": "0",
+    "stat_total_duration_s": "0"
   },
   "pass": 0,
   "fail": 0,
@@ -173,16 +176,22 @@ MANIFEST
       BLOCKED_COUNT=$(count_log_prefix "$log_file" "BLOCKED:")
       SKIP_COUNT=$(count_log_prefix "$log_file" "SKIP:")
 
+      WRITE_DURATION=$(first_log_value "$log_file" "write_duration_s")
       WRITE_TP=$(first_log_value "$log_file" "write_throughput_MBps")
+      READ_DURATION=$(first_log_value "$log_file" "read_duration_s")
       READ_TP=$(first_log_value "$log_file" "read_throughput_MBps")
       STAT_LAT=$(first_log_value "$log_file" "stat_avg_latency_us")
       if [ -z "$STAT_LAT" ]; then
         STAT_LAT=$(first_log_value "$log_file" "stat_avg_us")
       fi
+      STAT_TOTAL_DURATION=$(first_log_value "$log_file" "stat_total_duration_s")
 
+      WRITE_DURATION_VAL="''${WRITE_DURATION:-0}"
       WRITE_TP_VAL="''${WRITE_TP:-0}"
+      READ_DURATION_VAL="''${READ_DURATION:-0}"
       READ_TP_VAL="''${READ_TP:-0}"
       STAT_LAT_VAL="''${STAT_LAT:-0}"
+      STAT_TOTAL_DURATION_VAL="''${STAT_TOTAL_DURATION:-0}"
 
       QEMU_SUCCESS=false
       QEMU_TIMED_OUT=false
@@ -279,6 +288,22 @@ MANIFEST
         echo "parser self-test failed: $name" >&2
         echo "  expected metrics: write=$expected_write_tp read=$expected_read_tp stat=$expected_stat_lat" >&2
         echo "  actual metrics:   write=$WRITE_TP_VAL read=$READ_TP_VAL stat=$STAT_LAT_VAL" >&2
+        exit 1
+      fi
+    }
+
+    expect_parser_durations() {
+      local name="$1"
+      local expected_write_duration="$2"
+      local expected_read_duration="$3"
+      local expected_stat_duration="$4"
+
+      if [ "$WRITE_DURATION_VAL" != "$expected_write_duration" ] ||
+         [ "$READ_DURATION_VAL" != "$expected_read_duration" ] ||
+         [ "$STAT_TOTAL_DURATION_VAL" != "$expected_stat_duration" ]; then
+        echo "parser self-test failed: $name" >&2
+        echo "  expected durations: write=$expected_write_duration read=$expected_read_duration stat=$expected_stat_duration" >&2
+        echo "  actual durations:   write=$WRITE_DURATION_VAL read=$READ_DURATION_VAL stat=$STAT_TOTAL_DURATION_VAL" >&2
         exit 1
       fi
     }
@@ -476,13 +501,17 @@ EOF
 PASS: insmod
 PASS: mount
 PASS: no_daemon
+  write_duration_s = 0.125
   write_throughput_MBps = 10.00
+  read_duration_s = 0.250
   read_throughput_MBps = 20.00
   stat_avg_latency_us = 30
+  stat_total_duration_s = 0.003
 EOF
       analyze_qemu_log "$test_dir/pass.log" 0
       expect_parser_verdict pass-log PASS complete 0
       expect_parser_metrics pass-log 10.00 20.00 30
+      expect_parser_durations pass-log 0.125 0.250 0.003
       expect_parser_counts pass-log 3 0 0 0
       expect_parser_state pass-log true false false true
 
@@ -797,9 +826,12 @@ INITSCRIPT
   "log_empty": $LOG_EMPTY,
   "required_metrics_present": $REQUIRED_METRICS_PRESENT,
   "metrics": {
+    "write_duration_s": $(json_string "$WRITE_DURATION_VAL"),
     "write_throughput_MBps": $(json_string "$WRITE_TP_VAL"),
+    "read_duration_s": $(json_string "$READ_DURATION_VAL"),
     "read_throughput_MBps": $(json_string "$READ_TP_VAL"),
-    "stat_avg_latency_us": $(json_string "$STAT_LAT_VAL")
+    "stat_avg_latency_us": $(json_string "$STAT_LAT_VAL"),
+    "stat_total_duration_s": $(json_string "$STAT_TOTAL_DURATION_VAL")
   },
   "pass": $PASS_COUNT,
   "fail": $FAIL_COUNT,
