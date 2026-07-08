@@ -4016,7 +4016,9 @@ fn parse_snap_net_response(data: &[u8]) -> Result<String, String> {
             data.len()
         ));
     }
-    let message = String::from_utf8_lossy(&data[start..frame_len]).into_owned();
+    let message = std::str::from_utf8(&data[start..frame_len])
+        .map_err(|err| format!("snapshot send: remote response message is not UTF-8: {err}"))?
+        .to_string();
     match kind {
         SNAP_KIND_ACK => Ok(message),
         SNAP_KIND_ERROR => Err(format!("snapshot send: remote error: {message}")),
@@ -6709,6 +6711,19 @@ mod tests {
                     .to_string()
             )
         );
+    }
+
+    #[test]
+    fn parse_snap_net_response_rejects_invalid_utf8_message() {
+        let mut ack = Vec::new();
+        ack.extend_from_slice(SNAP_NET_MAGIC);
+        ack.push(SNAP_KIND_ACK);
+        ack.extend_from_slice(&2u32.to_le_bytes());
+        ack.extend_from_slice(&[0xff, 0xff]);
+
+        assert!(parse_snap_net_response(&ack).is_err_and(
+            |err| err.starts_with("snapshot send: remote response message is not UTF-8:")
+        ));
     }
 
     #[test]
