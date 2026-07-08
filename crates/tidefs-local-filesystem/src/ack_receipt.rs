@@ -533,7 +533,7 @@ impl LocalAckReceipt {
             && self.refusal_reason() == StorageIntentRefusalReason::None
             && self.has_posix_durable_requested_ack_floor()
             && self.has_requested_ack_floor_evidence()
-            && self.convergence.satisfies_ack_floor()
+            && self.has_requested_ack_floor_convergence()
             && evaluate_receipt_against_policy(
                 local_ack_policy(self.requested_ack_floor),
                 self.receipt,
@@ -563,6 +563,16 @@ impl LocalAckReceipt {
             self.requested_ack_floor,
             StorageIntentGuaranteeClass::LocalIntent | StorageIntentGuaranteeClass::FullPlacement
         )
+    }
+
+    fn has_requested_ack_floor_convergence(self) -> bool {
+        match self.requested_ack_floor {
+            StorageIntentGuaranteeClass::LocalIntent => self.convergence.satisfies_ack_floor(),
+            StorageIntentGuaranteeClass::FullPlacement => {
+                self.convergence == LocalAckConvergenceState::Satisfied
+            }
+            _ => false,
+        }
     }
 
     fn has_local_ack_policy_identity(self) -> bool {
@@ -2108,6 +2118,43 @@ mod tests {
             receipt.convergence = state;
             assert!(receipt.is_posix_durable_success());
             assert_eq!(receipt.refusal_reason(), StorageIntentRefusalReason::None);
+            assert!(!receipt.satisfies_requested_ack_floor());
+        }
+    }
+
+    #[test]
+    fn full_placement_floor_requires_satisfied_convergence() {
+        let pending_states = [
+            LocalAckConvergenceState::PendingFullPlacement,
+            LocalAckConvergenceState::Converging,
+        ];
+
+        for (offset, state) in pending_states.into_iter().enumerate() {
+            let mut receipt = LocalAckReceipt::full_local_placement(
+                30 + u64::try_from(offset).expect("small state index"),
+                LocalAckOperation::Fsync,
+                LocalAckReceiptTarget::inode(30),
+                None,
+            );
+            receipt.requested_ack_floor = StorageIntentGuaranteeClass::FullPlacement;
+
+            assert!(receipt.satisfies_requested_ack_floor());
+
+            receipt.convergence = state;
+            let policy_result = evaluate_receipt_against_policy(
+                local_ack_policy(StorageIntentGuaranteeClass::FullPlacement),
+                receipt.receipt,
+            );
+
+            assert!(receipt.is_posix_durable_success());
+            assert!(receipt.has_local_ack_shape_consistency());
+            assert!(receipt.has_requested_ack_floor_evidence());
+            assert!(
+                policy_result.satisfied,
+                "refusal was {:?}",
+                policy_result.refusal
+            );
+            assert!(state.satisfies_ack_floor());
             assert!(!receipt.satisfies_requested_ack_floor());
         }
     }
