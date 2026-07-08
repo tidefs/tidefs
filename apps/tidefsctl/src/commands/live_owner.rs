@@ -285,32 +285,6 @@ pub(crate) fn live_admin_optional_u64(value: Option<u64>) -> LivePoolAdminArg {
         .unwrap_or(LivePoolAdminArg::Null)
 }
 
-pub(crate) fn live_admin_arg_from_json(value: serde_json::Value) -> LivePoolAdminArg {
-    match value {
-        serde_json::Value::Null => LivePoolAdminArg::Null,
-        serde_json::Value::Bool(value) => LivePoolAdminArg::Bool(value),
-        serde_json::Value::Number(value) => {
-            if let Some(value) = value.as_u64() {
-                LivePoolAdminArg::U64(value)
-            } else if let Some(value) = value.as_i64() {
-                LivePoolAdminArg::I64(value)
-            } else {
-                LivePoolAdminArg::String(value.to_string())
-            }
-        }
-        serde_json::Value::String(value) => LivePoolAdminArg::String(value),
-        serde_json::Value::Array(values) => {
-            LivePoolAdminArg::Array(values.into_iter().map(live_admin_arg_from_json).collect())
-        }
-        serde_json::Value::Object(values) => LivePoolAdminArg::Object(
-            values
-                .into_iter()
-                .map(|(key, value)| (key, live_admin_arg_from_json(value)))
-                .collect(),
-        ),
-    }
-}
-
 /// Route a status command to the live owner if reachable. Returns true
 /// if the request was routed (the process exits inside the route),
 /// returns false if no live owner was found so the caller can produce
