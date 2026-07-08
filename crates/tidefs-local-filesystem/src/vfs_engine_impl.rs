@@ -3851,6 +3851,15 @@ fn live_admin_string_vec(args: &Value, key: &str) -> Result<Vec<String>, String>
     }
 }
 
+fn live_admin_u64_arg_or_default(args: &Value, key: &str, default: u64) -> Result<u64, String> {
+    let Some(value) = args.get(key) else {
+        return Ok(default);
+    };
+    value
+        .as_u64()
+        .ok_or_else(|| format!("live admin argument '{key}' must be an unsigned integer"))
+}
+
 fn live_admin_hex_16_or_default(args: &Value, key: &str) -> Result<[u8; 16], String> {
     match live_admin_optional_arg(args, key) {
         Some(value) => live_admin_hex_to_16(value),
@@ -4069,11 +4078,8 @@ fn live_snapshot_send_destination(args: &Value) -> Result<LiveSnapshotSendDestin
             let addr = target_addr.parse().map_err(|err| {
                 format!("snapshot send: invalid target-addr '{target_addr}': {err}")
             })?;
-            let node_id = args.get("node_id").and_then(Value::as_u64).unwrap_or(1);
-            let server_node_id = args
-                .get("server_node_id")
-                .and_then(Value::as_u64)
-                .unwrap_or(2);
+            let node_id = live_admin_u64_arg_or_default(args, "node_id", 1)?;
+            let server_node_id = live_admin_u64_arg_or_default(args, "server_node_id", 2)?;
             Ok(LiveSnapshotSendDestination::TargetAddress {
                 target_addr: target_addr.to_string(),
                 addr,
@@ -7985,6 +7991,44 @@ mod tests {
             "target response should explain target-addr parsing failure: {refused}"
         );
         assert!(!output.exists());
+    }
+
+    #[test]
+    fn live_snapshot_send_rejects_malformed_target_node_ids_before_exporting() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = root.path().join("store");
+        let mut fs = LocalFileSystem::open(&store).expect("open fs");
+        fs.create_file("/live.txt", 0o644).expect("create file");
+        fs.write_file("/live.txt", 0, b"live owner snapshot send")
+            .expect("write file");
+        let engine = VfsLocalFileSystem::new(fs);
+
+        for (key, value) in [("node_id", "local"), ("server_node_id", "remote")] {
+            let output = root.path().join(format!("{key}-malformed-target.vfs"));
+            let mut args = json!({
+                "output": output.display().to_string(),
+                "target_addr": "127.0.0.1:9000",
+                "format": "vfssend2",
+                "incremental": false,
+            });
+            args.as_object_mut()
+                .expect("snapshot send args object")
+                .insert(key.to_string(), Value::String(value.to_string()));
+
+            let refused = live_snapshot_admin(&engine, "send", args, true);
+
+            assert_eq!(refused["ok"], false, "target response: {refused}");
+            assert_eq!(refused["exit_code"], 1);
+            assert!(refused["json"].is_null());
+            assert!(refused["text"].is_null());
+            assert!(
+                refused["error"]
+                    .as_str()
+                    .is_some_and(|err| { err.contains(key) && err.contains("unsigned integer") }),
+                "target response should explain malformed {key}: {refused}"
+            );
+            assert!(!output.exists());
+        }
     }
 
     #[test]
