@@ -162,10 +162,7 @@ impl WritebackProjection {
     /// projection uses it to check mmap registration during invalidation
     /// guards.
     #[must_use]
-    pub fn new(
-        page_cache: Option<Arc<PageCache>>,
-        mmap_coherency: Arc<MmapCoherency>,
-    ) -> Self {
+    pub fn new(page_cache: Option<Arc<PageCache>>, mmap_coherency: Arc<MmapCoherency>) -> Self {
         Self {
             lanes: Mutex::new(BTreeMap::new()),
             page_cache,
@@ -184,9 +181,12 @@ impl WritebackProjection {
     /// [`PageCache`].
     pub fn record_dirty(&self, ino: u64, _total_dirty_bytes: u64) {
         let mut lanes = self.lanes.lock().unwrap();
-        let prev = lanes.insert(ino, WritebackLane::Dirty {
-            bytes: _total_dirty_bytes,
-        });
+        let prev = lanes.insert(
+            ino,
+            WritebackLane::Dirty {
+                bytes: _total_dirty_bytes,
+            },
+        );
         if prev.is_none() || matches!(prev, Some(WritebackLane::Clean)) {
             self.stats.dirty_transitions.fetch_add(1, Ordering::Relaxed);
         }
@@ -196,10 +196,11 @@ impl WritebackProjection {
     /// been written through to the engine but have not yet passed the
     /// durability barrier).
     pub fn record_writeback_pending(&self, ino: u64, total_bytes: u64) {
-        let _prev = self.lanes.lock().unwrap().insert(
-            ino,
-            WritebackLane::WritebackPending { bytes: total_bytes },
-        );
+        let _prev = self
+            .lanes
+            .lock()
+            .unwrap()
+            .insert(ino, WritebackLane::WritebackPending { bytes: total_bytes });
         self.stats
             .writeback_pending_transitions
             .fetch_add(1, Ordering::Relaxed);
@@ -265,12 +266,7 @@ impl WritebackProjection {
     /// all tracked inodes.
     #[must_use]
     pub fn total_dirty_or_writeback_bytes(&self) -> u64 {
-        self.lanes
-            .lock()
-            .unwrap()
-            .values()
-            .map(|l| l.bytes())
-            .sum()
+        self.lanes.lock().unwrap().values().map(|l| l.bytes()).sum()
     }
 
     /// Return a snapshot of the observable projection stats.
@@ -328,20 +324,12 @@ impl WritebackProjection {
     /// Return the total dirty byte count from the adapter's per-inode
     /// [`DirtyRanges`] for `ino`.
     #[must_use]
-    pub fn dirty_ranges_total(
-        dirty_state: &Mutex<BTreeMap<u64, DirtyRanges>>,
-        ino: u64,
-    ) -> u64 {
+    pub fn dirty_ranges_total(dirty_state: &Mutex<BTreeMap<u64, DirtyRanges>>, ino: u64) -> u64 {
         dirty_state
             .lock()
             .unwrap()
             .get(&ino)
-            .map(|dr| {
-                dr.ranges()
-                    .iter()
-                    .map(|&(start, end)| end - start)
-                    .sum()
-            })
+            .map(|dr| dr.ranges().iter().map(|&(start, end)| end - start).sum())
             .unwrap_or(0)
     }
 
@@ -367,8 +355,7 @@ impl WritebackProjection {
         page_cache: Option<&Arc<PageCache>>,
         ino: u64,
     ) -> u64 {
-        Self::dirty_ranges_total(dirty_state, ino)
-            + Self::page_cache_dirty_total(page_cache, ino)
+        Self::dirty_ranges_total(dirty_state, ino) + Self::page_cache_dirty_total(page_cache, ino)
     }
 
     // ── Mmap coherency accessor ──────────────────────────────────────
@@ -529,18 +516,13 @@ mod tests {
     fn writeback_lane_bytes() {
         assert_eq!(WritebackLane::Clean.bytes(), 0);
         assert_eq!(WritebackLane::Dirty { bytes: 42 }.bytes(), 42);
-        assert_eq!(
-            WritebackLane::WritebackPending { bytes: 99 }.bytes(),
-            99
-        );
+        assert_eq!(WritebackLane::WritebackPending { bytes: 99 }.bytes(), 99);
     }
 
     #[test]
     fn writeback_lane_is_dirty_or_writeback() {
         assert!(!WritebackLane::Clean.is_dirty_or_writeback());
         assert!(WritebackLane::Dirty { bytes: 1 }.is_dirty_or_writeback());
-        assert!(
-            WritebackLane::WritebackPending { bytes: 1 }.is_dirty_or_writeback()
-        );
+        assert!(WritebackLane::WritebackPending { bytes: 1 }.is_dirty_or_writeback());
     }
 }

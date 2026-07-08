@@ -32,7 +32,6 @@ use crate::handler_prelude::*;
 use crate::lock_dispatch::{DaemonLockDispatch, LockDispatchError};
 use crate::materialized_cache::MaterializedSignatureCache;
 use crate::mmap_coherency::MmapCoherency;
-use crate::writeback_cache_projection::WritebackProjection;
 use crate::read_cache::ReadCache;
 use crate::reply::{LookupEntryAttr, LookupEntryReply};
 use crate::workers_meta::{
@@ -42,6 +41,7 @@ use crate::workers_meta::{
 use crate::workers_writeback::WritebackCacheStats;
 use crate::workload_observer::WorkloadObserver;
 use crate::write_dispatch::DaemonWriteDispatch;
+use crate::writeback_cache_projection::WritebackProjection;
 use crate::writeback_reclaim::WritebackInodeCache;
 use fuser::{
     FileAttr, FileType, Filesystem, KernelConfig, ReplyAttr, ReplyBmap, ReplyCreate, ReplyData,
@@ -3082,9 +3082,8 @@ impl FuseVfsAdapter {
         // durability barrier.
         {
             let proj = Arc::clone(&writeback_projection);
-            mmap_coherency.set_dirty_check(Some(Box::new(move |ino| {
-                proj.is_dirty_or_writeback(ino)
-            })));
+            mmap_coherency
+                .set_dirty_check(Some(Box::new(move |ino| proj.is_dirty_or_writeback(ino))));
         }
 
         let timestamp_policy = TimestampPolicy::default();

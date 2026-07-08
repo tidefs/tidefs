@@ -332,8 +332,8 @@ pub mod txg_cycle;
 pub mod workload_observer;
 pub mod write_dispatch;
 
-pub mod writeback_reclaim;
 pub mod writeback_cache_projection;
+pub mod writeback_reclaim;
 pub mod xattr_integrity;
 pub mod xfstests_harness;
 
