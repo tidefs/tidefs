@@ -85,6 +85,7 @@ write_blocked_manifest() {
   "pass": 0,
   "fail": 0,
   "blocked": 1,
+  "skip": 0,
   "commit": "$(cd "$REPO_ROOT" && git rev-parse HEAD 2>/dev/null || echo unknown)",
   "worktree_dirty": $(git_dirty_json_bool),
   "module_source": "configured external module path",
@@ -103,6 +104,7 @@ analyze_qemu_log() {
   PASS_COUNT=$(count_log_prefix "$log_file" "PASS:")
   FAIL_COUNT=$(count_log_prefix "$log_file" "FAIL:")
   BLOCKED_COUNT=$(count_log_prefix "$log_file" "BLOCKED:")
+  SKIP_COUNT=$(count_log_prefix "$log_file" "SKIP:")
 
   WD=$(first_log_value "$log_file" "write_duration_ms")
   RD=$(first_log_value "$log_file" "read_duration_ms")
@@ -198,6 +200,23 @@ expect_parser_metrics() {
   fi
 }
 
+expect_parser_counts() {
+  local name="$1"
+  local want_pass="$2"
+  local want_fail="$3"
+  local want_blocked="$4"
+  local want_skip="$5"
+
+  if [ "$PASS_COUNT" -ne "$want_pass" ] ||
+     [ "$FAIL_COUNT" -ne "$want_fail" ] ||
+     [ "$BLOCKED_COUNT" -ne "$want_blocked" ] ||
+     [ "$SKIP_COUNT" -ne "$want_skip" ]; then
+    echo "parser self-test failed for $name: got pass=$PASS_COUNT fail=$FAIL_COUNT blocked=$BLOCKED_COUNT skip=$SKIP_COUNT" >&2
+    echo "expected pass=$want_pass fail=$want_fail blocked=$want_blocked skip=$want_skip" >&2
+    exit 1
+  fi
+}
+
 self_test_parser() {
   local test_dir
   test_dir="$(mktemp -d)"
@@ -286,6 +305,19 @@ EOF
   analyze_qemu_log "$test_dir/pass.log" 0
   expect_parser_verdict pass-log PASS complete 0
   expect_parser_metrics pass-log 10.00 20.00 30
+
+  cat > "$test_dir/skip-row.log" <<'EOF'
+PASS: insmod
+PASS: mount
+SKIP: optional cache warmup unavailable
+write_throughput_MBps=10.00
+read_throughput_MBps=20.00
+stat_avg_us=30
+EOF
+  analyze_qemu_log "$test_dir/skip-row.log" 0
+  expect_parser_verdict skip-row PASS complete 0
+  expect_parser_metrics skip-row 10.00 20.00 30
+  expect_parser_counts skip-row 2 0 0 1
 
   cat > "$test_dir/stat-latency-alias.log" <<'EOF'
 PASS: insmod
@@ -587,6 +619,7 @@ echo "=== Results ==="
 echo "  PASS:   $PASS_COUNT"
 echo "  FAIL:   $FAIL_COUNT"
 echo "  BLOCKED: $BLOCKED_COUNT"
+echo "  SKIP:   $SKIP_COUNT"
 echo "  Write:  ${WD}ms (${WTP} MB/s)"
 echo "  Read:   ${RD}ms (${RTP} MB/s)"
 echo "  Stat:   ${SU}us avg"
@@ -618,6 +651,7 @@ cat > "$RUN_DIR_VALIDATION/validation-manifest.json" << MANIFEST
   "pass": $PASS_COUNT,
   "fail": $FAIL_COUNT,
   "blocked": $BLOCKED_COUNT,
+  "skip": $SKIP_COUNT,
   "commit": "$(cd "$REPO_ROOT" && git rev-parse HEAD 2>/dev/null || echo unknown)",
   "worktree_dirty": $(git_dirty_json_bool),
   "module_source": "configured external module path",
