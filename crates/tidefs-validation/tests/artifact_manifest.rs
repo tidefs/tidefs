@@ -280,6 +280,11 @@ fn committed_runtime_artifacts_have_runtime_tier_manifests() {
         .filter(|path| !is_manifest_path(path))
         .map(|path| repo_relative_path(repo_root, path))
         .collect::<BTreeSet<_>>();
+    let committed_runtime_artifacts = committed_artifacts
+        .iter()
+        .filter(|path| is_runtime_artifact_path(Path::new(path)))
+        .cloned()
+        .collect::<BTreeSet<_>>();
 
     let mut failures = Vec::new();
     let mut live_runtime_artifacts = BTreeSet::new();
@@ -344,14 +349,10 @@ fn committed_runtime_artifacts_have_runtime_tier_manifests() {
         }
     }
 
-    for path in artifact_files
-        .iter()
-        .filter(|path| is_runtime_artifact_path(path))
-    {
-        let relative_path = repo_relative_path(repo_root, path);
-        if !live_runtime_artifacts.contains(&relative_path) {
+    for artifact_path in committed_runtime_artifacts {
+        if !live_runtime_artifacts.contains(&artifact_path) {
             failures.push(format!(
-                "{relative_path} is unclassified runtime output missing v2 live-runtime evidence manifest"
+                "{artifact_path} is unclassified runtime output missing v2 live-runtime evidence manifest"
             ));
         }
     }
