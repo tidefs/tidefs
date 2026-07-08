@@ -25,7 +25,11 @@ KEEP_TMP=0
 SELF_TEST_PARSER=0
 
 count_log_prefix() {
-  awk -v prefix="$2" 'index($0, prefix) == 1 { n++ } END { print n + 0 }' "$1" 2>/dev/null || echo 0
+  awk -v prefix="$2" '{
+    line = $0
+    sub(/^[[:space:]]+/, "", line)
+    if (index(line, prefix) == 1) n++
+  } END { print n + 0 }' "$1" 2>/dev/null || echo 0
 }
 
 first_log_value() {
@@ -387,6 +391,22 @@ EOF
   expect_parser_verdict fail-row FAIL fail_rows 1
   expect_parser_counts fail-row 2 1 0 0
   expect_parser_state fail-row true false false true
+
+  cat > "$test_dir/indented-rows.log" <<'EOF'
+  PASS: insmod
+  PASS: mount
+  FAIL: stat latency regression
+  BLOCKED: missing kernel tracepoint
+  SKIP: optional cache warmup unavailable
+  write_throughput_MBps = 10.00
+  read_throughput_MBps = 20.00
+  stat_avg_us = 30
+EOF
+  analyze_qemu_log "$test_dir/indented-rows.log" 0
+  expect_parser_verdict indented-rows FAIL fail_rows 1
+  expect_parser_metrics indented-rows 10.00 20.00 30
+  expect_parser_counts indented-rows 2 1 1 1
+  expect_parser_state indented-rows true false false true
 
   cat > "$test_dir/blocked-row.log" <<'EOF'
 PASS: insmod
