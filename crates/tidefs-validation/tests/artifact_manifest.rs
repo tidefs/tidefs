@@ -141,6 +141,15 @@ fn runtime_artifact_classifier_is_token_based() {
     assert!(is_runtime_artifact_path(Path::new(
         "validation/artifacts/kernel/runtime/output.json"
     )));
+    assert!(is_runtime_artifact_path(Path::new(
+        "validation/artifacts/kernel/runtime-output.log"
+    )));
+    assert!(is_runtime_artifact_path(Path::new(
+        "validation/artifacts/kernel/runtime-output.txt"
+    )));
+    assert!(is_runtime_artifact_path(Path::new(
+        "validation/artifacts/kernel/runtime/output"
+    )));
     assert!(!is_runtime_artifact_path(Path::new(
         "validation/artifacts/crash-oracle/model-crash-matrices.json"
     )));
