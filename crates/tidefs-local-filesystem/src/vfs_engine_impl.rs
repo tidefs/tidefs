@@ -4069,10 +4069,7 @@ fn live_snapshot_send_destination(args: &Value) -> Result<LiveSnapshotSendDestin
             let addr = target_addr.parse().map_err(|err| {
                 format!("snapshot send: invalid target-address '{target_addr}': {err}")
             })?;
-            let node_id = args
-                .get("node_id")
-                .and_then(Value::as_u64)
-                .unwrap_or(1);
+            let node_id = args.get("node_id").and_then(Value::as_u64).unwrap_or(1);
             let server_node_id = args
                 .get("server_node_id")
                 .and_then(Value::as_u64)
@@ -4085,10 +4082,11 @@ fn live_snapshot_send_destination(args: &Value) -> Result<LiveSnapshotSendDestin
                 output,
             })
         }
-        None => output.map(LiveSnapshotSendDestination::Output).ok_or_else(|| {
-            "snapshot send: --output is required for live pools unless target-address send is implemented"
-                .to_string()
-        }),
+        None => output
+            .map(LiveSnapshotSendDestination::Output)
+            .ok_or_else(|| {
+                "snapshot send: --output or --target-address is required for live pools".to_string()
+            }),
     }
 }
 
@@ -7885,6 +7883,36 @@ mod tests {
             "malformed response should stay structured for non-ASCII hex: {malformed}"
         );
         assert!(!output.exists());
+    }
+
+    #[test]
+    fn live_snapshot_send_requires_output_or_target_address() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = root.path().join("store");
+        let mut fs = LocalFileSystem::open(&store).expect("open fs");
+        fs.create_file("/live.txt", 0o644).expect("create file");
+        fs.write_file("/live.txt", 0, b"live owner snapshot send")
+            .expect("write file");
+        let engine = VfsLocalFileSystem::new(fs);
+
+        let refused = live_snapshot_admin(
+            &engine,
+            "send",
+            json!({
+                "format": "vfssend2",
+                "incremental": false,
+            }),
+            true,
+        );
+
+        assert_eq!(refused["ok"], false, "send response: {refused}");
+        assert_eq!(refused["exit_code"], 1);
+        assert!(refused["json"].is_null());
+        assert!(refused["text"].is_null());
+        assert_eq!(
+            refused["error"],
+            "snapshot send: --output or --target-address is required for live pools"
+        );
     }
 
     #[test]
