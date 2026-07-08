@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -201,6 +201,7 @@ fn committed_runtime_artifacts_have_runtime_tier_manifests() {
 
     let mut failures = Vec::new();
     let mut live_runtime_artifacts = BTreeSet::new();
+    let mut artifact_runtime_classes = BTreeMap::<String, BTreeSet<bool>>::new();
     for path in artifact_files.iter().filter(|path| is_manifest_path(path)) {
         let text = fs::read_to_string(path).unwrap_or_else(|error| {
             panic!(
@@ -215,9 +216,17 @@ fn committed_runtime_artifacts_have_runtime_tier_manifests() {
                 error.failures()
             )
         });
+        let artifact_path = Path::new(&manifest.artifact_path);
+        if !is_manifest_path(artifact_path) && committed_artifacts.contains(&manifest.artifact_path)
+        {
+            artifact_runtime_classes
+                .entry(manifest.artifact_path.clone())
+                .or_default()
+                .insert(manifest.validation_tier.is_live_runtime());
+        }
         if manifest.validation_tier.is_live_runtime() {
             let manifest_path = repo_relative_path(repo_root, path);
-            if is_manifest_path(Path::new(&manifest.artifact_path)) {
+            if is_manifest_path(artifact_path) {
                 failures.push(format!(
                     "{manifest_path} is a live-runtime manifest pointing at manifest `{}`",
                     manifest.artifact_path
@@ -242,6 +251,14 @@ fn committed_runtime_artifacts_have_runtime_tier_manifests() {
                 ));
             }
             live_runtime_artifacts.insert(manifest.artifact_path);
+        }
+    }
+
+    for (artifact_path, runtime_classes) in artifact_runtime_classes {
+        if runtime_classes.contains(&true) && runtime_classes.contains(&false) {
+            failures.push(format!(
+                "{artifact_path} has both live-runtime and non-runtime evidence manifests"
+            ));
         }
     }
 
