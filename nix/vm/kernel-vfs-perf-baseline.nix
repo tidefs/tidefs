@@ -270,6 +270,28 @@ EOF
       analyze_qemu_log "$test_dir/missing-metrics.log" 0
       expect_parser_verdict missing-metrics BLOCKED missing_required_metrics 2
 
+      cat > "$test_dir/fail-row.log" <<'EOF'
+PASS: insmod
+PASS: mount
+FAIL: stat latency regression
+write_throughput_MBps=10.00
+read_throughput_MBps=20.00
+stat_avg_latency_us=30
+EOF
+      analyze_qemu_log "$test_dir/fail-row.log" 0
+      expect_parser_verdict fail-row FAIL fail_rows 1
+
+      cat > "$test_dir/blocked-row.log" <<'EOF'
+PASS: insmod
+PASS: mount
+BLOCKED: missing kernel tracepoint
+write_throughput_MBps=10.00
+read_throughput_MBps=20.00
+stat_avg_latency_us=30
+EOF
+      analyze_qemu_log "$test_dir/blocked-row.log" 0
+      expect_parser_verdict blocked-row BLOCKED blocked_rows 2
+
       cat > "$test_dir/pass.log" <<'EOF'
 PASS: insmod
 PASS: mount
