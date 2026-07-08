@@ -229,6 +229,23 @@ MANIFEST
       fi
     }
 
+    expect_parser_metrics() {
+      local name="$1"
+      local expected_write_tp="$2"
+      local expected_read_tp="$3"
+      local expected_stat_lat="$4"
+
+      if [ "$WRITE_TP_VAL" != "$expected_write_tp" ] ||
+         [ "$READ_TP_VAL" != "$expected_read_tp" ] ||
+         [ "$STAT_LAT_VAL" != "$expected_stat_lat" ] ||
+         [ "$REQUIRED_METRICS_PRESENT" != true ]; then
+        echo "parser self-test failed: $name" >&2
+        echo "  expected metrics: write=$expected_write_tp read=$expected_read_tp stat=$expected_stat_lat required=true" >&2
+        echo "  actual metrics:   write=$WRITE_TP_VAL read=$READ_TP_VAL stat=$STAT_LAT_VAL required=$REQUIRED_METRICS_PRESENT" >&2
+        exit 1
+      fi
+    }
+
     self_test_parser() {
       local test_dir
       test_dir="$(mktemp -d)"
@@ -316,6 +333,7 @@ PASS: no_daemon
 EOF
       analyze_qemu_log "$test_dir/pass.log" 0
       expect_parser_verdict pass-log PASS complete 0
+      expect_parser_metrics pass-log 10.00 20.00 30
 
       cat > "$test_dir/stat-short-alias.log" <<'EOF'
 PASS: insmod
@@ -327,6 +345,7 @@ stat_avg_us=30
 EOF
       analyze_qemu_log "$test_dir/stat-short-alias.log" 0
       expect_parser_verdict stat-short-alias PASS complete 0
+      expect_parser_metrics stat-short-alias 10.00 20.00 30
 
       echo "parser self-test: ok"
     }

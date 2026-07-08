@@ -182,6 +182,22 @@ expect_parser_verdict() {
   fi
 }
 
+expect_parser_metrics() {
+  local name="$1"
+  local want_write_tp="$2"
+  local want_read_tp="$3"
+  local want_stat_us="$4"
+
+  if [ "$WTP" != "$want_write_tp" ] ||
+     [ "$RTP" != "$want_read_tp" ] ||
+     [ "$SU" != "$want_stat_us" ] ||
+     [ "$REQUIRED_METRICS_PRESENT" != true ]; then
+    echo "parser self-test failed for $name: got write=$WTP read=$RTP stat=$SU required=$REQUIRED_METRICS_PRESENT" >&2
+    echo "expected write=$want_write_tp read=$want_read_tp stat=$want_stat_us required=true" >&2
+    exit 1
+  fi
+}
+
 self_test_parser() {
   local test_dir
   test_dir="$(mktemp -d)"
@@ -269,6 +285,7 @@ PASS: no_daemon
 EOF
   analyze_qemu_log "$test_dir/pass.log" 0
   expect_parser_verdict pass-log PASS complete 0
+  expect_parser_metrics pass-log 10.00 20.00 30
 
   cat > "$test_dir/stat-latency-alias.log" <<'EOF'
 PASS: insmod
@@ -280,6 +297,7 @@ stat_avg_latency_us=30
 EOF
   analyze_qemu_log "$test_dir/stat-latency-alias.log" 0
   expect_parser_verdict stat-latency-alias PASS complete 0
+  expect_parser_metrics stat-latency-alias 10.00 20.00 30
 
   echo "parser self-test: ok"
 }
