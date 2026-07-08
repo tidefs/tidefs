@@ -3957,43 +3957,55 @@ impl StorageNode {
         snapshot_name: String,
         config: SnapshotBarrierConfig,
     ) -> Result<Vec<u8>, String> {
-        use tidefs_transport::SessionId;
-        // Collect peer ids and session bindings from live transport sessions.
-        let mut t = self.transport.lock().unwrap();
-        let stats = t.all_stats();
-        let mut peer_ids: Vec<u64> = Vec::new();
-        let mut peer_sessions: Vec<(u64, SessionId)> = Vec::new();
-        for sid in stats.sessions.keys() {
-            if let Some(peer_id) = t.peer_node(*sid) {
-                if !peer_ids.contains(&peer_id) {
-                    peer_ids.push(peer_id);
+        let peer_sessions = {
+            let transport = self.transport.lock().unwrap();
+            let mut peer_sessions = BTreeMap::new();
+            for sid in transport.all_stats().sessions.keys() {
+                if let Some(peer_id) = transport.peer_node(*sid) {
+                    peer_sessions.entry(peer_id).or_insert(*sid);
                 }
-                peer_sessions.push((peer_id, *sid));
             }
-        }
+            peer_sessions
+        };
+
         // Build the coordinator and encode the barrier request.
-        let coord =
-            SnapshotCoordinator::new(barrier_id, snapshot_name.clone(), peer_ids.clone(), config);
+        let peer_ids = peer_sessions.keys().copied().collect::<Vec<_>>();
+        let coord = SnapshotCoordinator::new(barrier_id, snapshot_name, peer_ids.clone(), config);
         let request_bytes = coord.request_bytes();
-        // Fan out the barrier request to every peer session.
-        let mut send_errors = 0usize;
-        for (peer_id, session_id) in &peer_sessions {
-            if let Err(e) = t.send_priority(*session_id, &request_bytes, MessagePriority::Control) {
+
+        {
+            let mut active = self.active_barrier.lock().unwrap();
+            if let Some(active) = active.as_ref() {
+                return Err(format!(
+                    "barrier {barrier_id} refused because another barrier is already active: barrier {}",
+                    active.barrier_id(),
+                ));
+            }
+            if peer_sessions.is_empty() {
+                eprintln!("[storage-node] barrier {barrier_id} initiated: 0 peers");
+                return Ok(request_bytes);
+            }
+            *active = Some(coord);
+        }
+
+        // Fan out after the coordinator is visible so fast responses are not lost.
+        for (&peer_id, &session_id) in &peer_sessions {
+            let send_result = self.transport.lock().unwrap().send_priority(
+                session_id,
+                &request_bytes,
+                MessagePriority::Control,
+            );
+            if let Err(e) = send_result {
+                *self.active_barrier.lock().unwrap() = None;
                 eprintln!(
                     "[storage-node] barrier {barrier_id}: send to peer {peer_id} failed: {e:?}"
                 );
-                send_errors += 1;
+                return Err(format!(
+                    "barrier {barrier_id} send to peer {peer_id} failed: {e}"
+                ));
             }
         }
-        drop(t); // release transport lock before locking active_barrier
-                 // Store the coordinator for asynchronous response collection.
-        *self.active_barrier.lock().unwrap() = Some(coord);
-        if send_errors > 0 {
-            eprintln!(
-                "[storage-node] barrier {barrier_id}: {send_errors}/{total} sends failed",
-                total = peer_sessions.len(),
-            );
-        }
+
         eprintln!(
             "[storage-node] barrier {barrier_id} initiated: {count} peers",
             count = peer_ids.len(),
@@ -6730,6 +6742,44 @@ mod cluster_pool_handler_tests {
             }
             other => panic!("expected barrier error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn initiate_snapshot_barrier_refuses_active_barrier_without_clobbering() {
+        let node = StorageNode::start(minimal_config()).unwrap();
+        *node.active_barrier.lock().unwrap() = Some(SnapshotCoordinator::new(
+            55,
+            "active".into(),
+            Vec::new(),
+            SnapshotBarrierConfig::default(),
+        ));
+
+        let err = node
+            .initiate_snapshot_barrier(56, "next".into(), SnapshotBarrierConfig::default())
+            .unwrap_err();
+
+        assert!(err.contains("already active"));
+        assert!(err.contains("55"));
+        let active = node.active_barrier.lock().unwrap();
+        assert_eq!(
+            active
+                .as_ref()
+                .expect("active barrier is preserved")
+                .barrier_id(),
+            55
+        );
+    }
+
+    #[test]
+    fn initiate_snapshot_barrier_zero_peer_returns_request_without_active_barrier() {
+        let node = StorageNode::start(minimal_config()).unwrap();
+
+        let request = node
+            .initiate_snapshot_barrier(57, "zero-peer".into(), SnapshotBarrierConfig::default())
+            .expect("zero-peer barrier returns encoded request");
+
+        assert!(!request.is_empty());
+        assert!(node.active_barrier.lock().unwrap().is_none());
     }
 
     fn config_with_rebuild_peer() -> StorageNodeConfig {
