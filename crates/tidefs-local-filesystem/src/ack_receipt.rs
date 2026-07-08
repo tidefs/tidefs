@@ -531,6 +531,7 @@ impl LocalAckReceipt {
             && self.has_local_ack_result_projection()
             && self.has_no_receipt_retirement_projection()
             && self.refusal_reason() == StorageIntentRefusalReason::None
+            && self.has_posix_durable_requested_ack_floor()
             && self.has_requested_ack_floor_evidence()
             && self.convergence.satisfies_ack_floor()
             && evaluate_receipt_against_policy(
@@ -555,6 +556,13 @@ impl LocalAckReceipt {
             }
             _ => false,
         }
+    }
+
+    fn has_posix_durable_requested_ack_floor(self) -> bool {
+        matches!(
+            self.requested_ack_floor,
+            StorageIntentGuaranteeClass::LocalIntent | StorageIntentGuaranteeClass::FullPlacement
+        )
     }
 
     fn has_local_ack_policy_identity(self) -> bool {
@@ -1238,6 +1246,43 @@ mod tests {
         );
         assert!(!result.satisfied);
         assert!(!receipt.satisfies_requested_ack_floor());
+    }
+
+    #[test]
+    fn volatile_requested_floor_does_not_downgrade_posix_durable_receipts() {
+        let mut durable_intent = LocalAckReceipt::durable_intent(
+            28,
+            LocalAckOperation::Fsync,
+            LocalAckReceiptTarget::inode(28),
+            None,
+        );
+        durable_intent.requested_ack_floor = StorageIntentGuaranteeClass::VolatileLocal;
+
+        let mut full_placement = LocalAckReceipt::full_local_placement(
+            29,
+            LocalAckOperation::Syncfs,
+            LocalAckReceiptTarget::FILESYSTEM,
+            None,
+        );
+        full_placement.requested_ack_floor = StorageIntentGuaranteeClass::VolatileLocal;
+
+        for receipt in [durable_intent, full_placement] {
+            let shared_result = evaluate_receipt_against_policy(
+                local_ack_policy(receipt.requested_ack_floor),
+                receipt.receipt,
+            );
+
+            assert!(receipt.is_posix_durable_success());
+            assert!(receipt.has_local_ack_shape_consistency());
+            assert!(receipt.has_requested_ack_floor_evidence());
+            assert!(
+                shared_result.satisfied,
+                "refusal was {:?}",
+                shared_result.refusal
+            );
+            assert!(!receipt.has_posix_durable_requested_ack_floor());
+            assert!(!receipt.satisfies_requested_ack_floor());
+        }
     }
 
     #[test]
