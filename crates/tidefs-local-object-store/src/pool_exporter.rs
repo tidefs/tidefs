@@ -477,10 +477,11 @@ impl ExportOrchestrator {
         };
 
         if self.active_mounts > 0 && !self.forced {
+            let topology_complete = context.topology_complete();
             PoolLifecycleEvidence::refused_with_authority(
                 PoolLifecycleAction::Export,
                 context,
-                self.device_configs.len() >= self.device_guids.len(),
+                topology_complete,
                 false,
                 format!("{} active mount(s) still own the pool", self.active_mounts),
             )
@@ -1174,6 +1175,48 @@ mod tests {
 
         assert_eq!(evidence.action, PoolLifecycleAction::Export);
         assert!(evidence.topology_complete);
+        assert!(!evidence.owner_authorized);
+        assert!(evidence.is_fail_closed());
+        assert!(evidence.reason.contains("active mount"));
+    }
+
+    #[test]
+    fn orchestrator_active_mount_evidence_refuses_surplus_topology() {
+        let path_a = PathBuf::from("/tmp/tidefs-export-surplus-a");
+        let path_b = PathBuf::from("/tmp/tidefs-export-surplus-b");
+        let config_a = DeviceConfig {
+            media_class: Default::default(),
+            path: path_a.clone(),
+            backing: DeviceBacking::DirectoryObjectStoreCompat,
+            class: DeviceClass::Data,
+            kind: DeviceKind::Single { path: path_a },
+            compression: None,
+            encryption: None,
+        };
+        let config_b = DeviceConfig {
+            media_class: Default::default(),
+            path: path_b.clone(),
+            backing: DeviceBacking::DirectoryObjectStoreCompat,
+            class: DeviceClass::Data,
+            kind: DeviceKind::Single { path: path_b },
+            compression: None,
+            encryption: None,
+        };
+        let orch = ExportOrchestrator::new(
+            [0xAAu8; 16],
+            "surplus",
+            vec![config_a, config_b],
+            vec![[0x01u8; 16]],
+            false,
+        )
+        .with_active_mounts(1);
+
+        let evidence = orch.lifecycle_evidence();
+
+        assert_eq!(evidence.action, PoolLifecycleAction::Export);
+        assert_eq!(evidence.device_count, 2);
+        assert_eq!(evidence.expected_device_count, 1);
+        assert!(!evidence.topology_complete);
         assert!(!evidence.owner_authorized);
         assert!(evidence.is_fail_closed());
         assert!(evidence.reason.contains("active mount"));
