@@ -444,10 +444,28 @@ fn smoke_write_classifier(h: &mut SmokeHarness) {
         write_flags: FUSE_WRITE_CACHE,
         ..write_req()
     };
+    let cache_classification = WriteClassifier::new().classify(&write_handles(), cache_flag);
     h.assert_eq_ev(
-        "unsupported cache flag rejects with EINVAL",
+        "cache flag should not reject at ingress",
+        cache_classification.errno(),
+        None,
+    );
+    if let ClassifiedWrite::DirtyExtent(staging) = cache_classification {
+        h.assert_eq_ev(
+            "cache flag is preserved for handler gating",
+            staging.write_flags,
+            FUSE_WRITE_CACHE,
+        );
+    }
+
+    let unsupported_flag = RawFuseWriteRequest {
+        write_flags: 0x08,
+        ..write_req()
+    };
+    h.assert_eq_ev(
+        "unsupported write flag rejects with EINVAL",
         WriteClassifier::new()
-            .classify(&write_handles(), cache_flag)
+            .classify(&write_handles(), unsupported_flag)
             .errno(),
         Some(WRITE_ERRNO_EINVAL),
     );
