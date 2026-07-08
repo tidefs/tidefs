@@ -197,6 +197,7 @@ pub struct LocalAckReceipt {
 struct ExpectedLocalEvidenceRef {
     evidence_ref: StorageIntentEvidenceRef,
     kind: StorageIntentEvidenceKind,
+    label: &'static str,
 }
 
 impl LocalAckReceipt {
@@ -573,34 +574,42 @@ impl LocalAckReceipt {
             ExpectedLocalEvidenceRef {
                 evidence_ref: self.local_intent_record_ref,
                 kind: StorageIntentEvidenceKind::LocalIntentRecord,
+                label: "local-intent",
             },
             ExpectedLocalEvidenceRef {
                 evidence_ref: self.ordering_ref,
                 kind: StorageIntentEvidenceKind::OrderingEvidence,
+                label: "ordering",
             },
             ExpectedLocalEvidenceRef {
                 evidence_ref: self.flush_fence_ref,
                 kind: StorageIntentEvidenceKind::ActionExecutionEvidence,
+                label: "flush-fence",
             },
             ExpectedLocalEvidenceRef {
                 evidence_ref: self.media_capability_ref,
                 kind: StorageIntentEvidenceKind::MediaCapabilityEvidence,
+                label: "media-capability",
             },
             ExpectedLocalEvidenceRef {
                 evidence_ref: self.reserve_ref,
                 kind: StorageIntentEvidenceKind::CapacityAdmissionEvidence,
+                label: "reserve",
             },
             ExpectedLocalEvidenceRef {
                 evidence_ref: self.dirty_window_ref,
                 kind: StorageIntentEvidenceKind::CapacityAdmissionEvidence,
+                label: "dirty-window",
             },
             ExpectedLocalEvidenceRef {
                 evidence_ref: self.rollout_ref,
                 kind: StorageIntentEvidenceKind::PolicyRolloutEvidence,
+                label: "rollout",
             },
             ExpectedLocalEvidenceRef {
                 evidence_ref: self.tenant_isolation_ref,
                 kind: StorageIntentEvidenceKind::TenantIsolationEvidence,
+                label: "tenant-isolation",
             },
         ]
     }
@@ -629,6 +638,7 @@ impl LocalAckReceipt {
                     ExpectedLocalEvidenceRef {
                         evidence_ref: self.placement_ref,
                         kind: StorageIntentEvidenceKind::PlacementReceipt,
+                        label: "placement",
                     },
                     generation,
                 ))
@@ -668,6 +678,14 @@ impl LocalAckReceipt {
     ) -> bool {
         expected.evidence_ref.kind == expected.kind
             && expected.evidence_ref.version == LOCAL_ACK_RECEIPT_RECORD_VERSION
+            && expected.evidence_ref.id
+                == StorageIntentEvidenceId(hash_context(
+                    expected.label,
+                    generation,
+                    self.operation,
+                    self.target,
+                    self.payload_or_replay_digest,
+                ))
             && self.receipt_carries_local_evidence_ref(expected.evidence_ref, generation)
     }
 
@@ -1441,6 +1459,41 @@ mod tests {
     }
 
     #[test]
+    fn requested_floor_receipt_fails_closed_for_wrong_local_evidence_identity() {
+        let mut wrong_identity = LocalAckReceipt::durable_intent(
+            18,
+            LocalAckOperation::SyncWrite,
+            LocalAckReceiptTarget::inode(21),
+            None,
+        );
+        assert!(wrong_identity.satisfies_requested_ack_floor());
+        wrong_identity.ordering_ref = evidence_ref(
+            StorageIntentEvidenceKind::OrderingEvidence,
+            "foreign-ordering",
+            18,
+            LocalAckOperation::SyncWrite,
+            LocalAckReceiptTarget::inode(21),
+            None,
+        );
+        wrong_identity.receipt.evidence_refs = evidence_refs(&[
+            wrong_identity.local_intent_record_ref,
+            wrong_identity.ordering_ref,
+            wrong_identity.flush_fence_ref,
+            wrong_identity.media_capability_ref,
+            wrong_identity.reserve_ref,
+            wrong_identity.dirty_window_ref,
+            wrong_identity.rollout_ref,
+            wrong_identity.tenant_isolation_ref,
+            wrong_identity.refusal.evidence,
+        ]);
+
+        assert!(wrong_identity.is_posix_durable_success());
+        assert!(wrong_identity.has_local_ack_result_projection());
+        assert!(!wrong_identity.has_requested_ack_floor_evidence());
+        assert!(!wrong_identity.satisfies_requested_ack_floor());
+    }
+
+    #[test]
     fn requested_floor_receipt_fails_closed_for_wrong_placement_evidence_version() {
         let mut wrong_placement_version = LocalAckReceipt::full_local_placement(
             18,
@@ -1498,6 +1551,43 @@ mod tests {
         assert!(wrong_placement_kind.has_local_ack_result_projection());
         assert!(!wrong_placement_kind.has_requested_ack_floor_evidence());
         assert!(!wrong_placement_kind.satisfies_requested_ack_floor());
+    }
+
+    #[test]
+    fn requested_floor_receipt_fails_closed_for_wrong_placement_evidence_identity() {
+        let mut wrong_placement_identity = LocalAckReceipt::full_local_placement(
+            20,
+            LocalAckOperation::Fsync,
+            LocalAckReceiptTarget::inode(21),
+            None,
+        );
+        wrong_placement_identity.requested_ack_floor = StorageIntentGuaranteeClass::FullPlacement;
+        assert!(wrong_placement_identity.satisfies_requested_ack_floor());
+        wrong_placement_identity.placement_ref = evidence_ref(
+            StorageIntentEvidenceKind::PlacementReceipt,
+            "foreign-placement",
+            20,
+            LocalAckOperation::Fsync,
+            LocalAckReceiptTarget::inode(21),
+            None,
+        );
+        wrong_placement_identity.receipt.evidence_refs = evidence_refs(&[
+            wrong_placement_identity.local_intent_record_ref,
+            wrong_placement_identity.ordering_ref,
+            wrong_placement_identity.flush_fence_ref,
+            wrong_placement_identity.media_capability_ref,
+            wrong_placement_identity.placement_ref,
+            wrong_placement_identity.reserve_ref,
+            wrong_placement_identity.dirty_window_ref,
+            wrong_placement_identity.rollout_ref,
+            wrong_placement_identity.tenant_isolation_ref,
+            wrong_placement_identity.refusal.evidence,
+        ]);
+
+        assert!(wrong_placement_identity.is_posix_durable_success());
+        assert!(wrong_placement_identity.has_local_ack_result_projection());
+        assert!(!wrong_placement_identity.has_requested_ack_floor_evidence());
+        assert!(!wrong_placement_identity.satisfies_requested_ack_floor());
     }
 
     #[test]
