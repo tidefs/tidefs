@@ -4239,17 +4239,19 @@ fn serve_session(session_id: tidefs_transport::SessionId, ctx: SessionContext) {
 
         // Try Frame protocol first (4-byte ASCII tag prefix)
         if let Some(frame) = protocol::decode(&raw) {
-            let store = Arc::clone(&ctx.store);
-            let response = handle_frame_ctx(session_id, &frame, &store, &ctx);
-
-            // Route snapshot barrier responses to the active coordinator.
+            // Snapshot barrier responses complete coordinator-side control
+            // state and must not fall through ordinary request dispatch.
             if matches!(&frame, Frame::SnapshotBarrierResponse { .. }) {
                 if record_snapshot_barrier_response(session_id, &frame, &ctx) {
                     eprintln!(
                         "[storage-node] barrier: recorded response from session {session_id}"
                     );
                 }
+                continue;
             }
+
+            let store = Arc::clone(&ctx.store);
+            let response = handle_frame_ctx(session_id, &frame, &store, &ctx);
 
             if let Some(resp) = response {
                 if matches!(resp, Frame::Bye) {
