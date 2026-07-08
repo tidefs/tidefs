@@ -440,9 +440,25 @@ mod tests {
 
     #[test]
     fn harness_refuses_bad_path() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_nanos();
+        let parent = std::env::temp_dir().join(format!(
+            "tidefs-meta-harness-bad-parent-{}-{stamp}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&parent);
+        let _ = std::fs::remove_dir_all(&parent);
+        std::fs::File::create(&parent).expect("create bad path parent");
+
         let h = MetadataHarness::new("/tmp");
-        let res = h.run_baseline("/nonexistent/p/tidefs-meta-harness", 10);
-        assert!(!res.executed);
+        let path = parent.join("child");
+        let res = h.run_baseline(path.to_str().expect("utf-8 temp path"), 10);
+        let executed = res.executed;
+
+        let _ = std::fs::remove_file(&parent);
+        assert!(!executed);
     }
 
     #[test]
