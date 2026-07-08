@@ -114,11 +114,6 @@ fn is_runtime_artifact_path(path: &Path) -> bool {
         return false;
     }
 
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
     let extension = path
         .extension()
         .and_then(|ext| ext.to_str())
@@ -126,9 +121,13 @@ fn is_runtime_artifact_path(path: &Path) -> bool {
         .to_ascii_lowercase();
 
     matches!(extension.as_str(), "json" | "toml")
-        && file_name
-            .split(|byte: char| !byte.is_ascii_alphanumeric())
-            .any(|token| token == "runtime")
+        && path.components().any(|component| {
+            component.as_os_str().to_str().is_some_and(|component| {
+                component
+                    .split(|byte: char| !byte.is_ascii_alphanumeric())
+                    .any(|token| token.eq_ignore_ascii_case("runtime"))
+            })
+        })
 }
 
 #[test]
@@ -142,11 +141,20 @@ fn runtime_artifact_classifier_is_token_based() {
     assert!(is_runtime_artifact_path(Path::new(
         "validation/artifacts/kernel/runtime-output.JSON"
     )));
+    assert!(is_runtime_artifact_path(Path::new(
+        "validation/artifacts/kernel/runtime/output.json"
+    )));
     assert!(!is_runtime_artifact_path(Path::new(
         "validation/artifacts/crash-oracle/model-crash-matrices.json"
     )));
     assert!(!is_runtime_artifact_path(Path::new(
+        "validation/artifacts/kernel/nonruntime-output.json"
+    )));
+    assert!(!is_runtime_artifact_path(Path::new(
         "validation/artifacts/crash-oracle/runtime.manifest.json"
+    )));
+    assert!(!is_runtime_artifact_path(Path::new(
+        "validation/artifacts/kernel/runtime/output.manifest.json"
     )));
 }
 
