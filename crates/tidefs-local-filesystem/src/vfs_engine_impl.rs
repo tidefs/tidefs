@@ -4084,6 +4084,11 @@ fn live_snapshot_send_destination(args: &Value) -> Result<LiveSnapshotSendDestin
             })?;
             let node_id = live_admin_u64_arg_or_default(args, "node_id", 1)?;
             let server_node_id = live_admin_u64_arg_or_default(args, "server_node_id", 2)?;
+            if node_id == 0 {
+                return Err(
+                    "snapshot send: node_id must be non-zero for target-addr sends".to_string(),
+                );
+            }
             if server_node_id == 0 {
                 return Err(
                     "snapshot send: server_node_id must be non-zero for target-addr sends"
@@ -8055,7 +8060,7 @@ mod tests {
     }
 
     #[test]
-    fn live_snapshot_send_rejects_zero_target_server_node_id_before_exporting() {
+    fn live_snapshot_send_rejects_zero_target_node_ids_before_exporting() {
         let root = tempfile::tempdir().expect("tempdir");
         let store = root.path().join("store");
         let mut fs = LocalFileSystem::open(&store).expect("open fs");
@@ -8063,32 +8068,33 @@ mod tests {
         fs.write_file("/live.txt", 0, b"live owner snapshot send")
             .expect("write file");
         let engine = VfsLocalFileSystem::new(fs);
-        let output = root.path().join("zero-server-node-id-target.vfs");
 
-        let refused = live_snapshot_admin(
-            &engine,
-            "send",
-            json!({
+        for key in ["node_id", "server_node_id"] {
+            let output = root.path().join(format!("zero-{key}-target.vfs"));
+            let mut args = json!({
                 "output": output.display().to_string(),
                 "target_addr": "127.0.0.1:9000",
                 "format": "vfssend2",
                 "incremental": false,
-                "server_node_id": 0,
-            }),
-            true,
-        );
+            });
+            args.as_object_mut()
+                .expect("snapshot send args object")
+                .insert(key.to_string(), Value::Number(0.into()));
 
-        assert_eq!(refused["ok"], false, "target response: {refused}");
-        assert_eq!(refused["exit_code"], 1);
-        assert!(refused["json"].is_null());
-        assert!(refused["text"].is_null());
-        assert!(
-            refused["error"]
-                .as_str()
-                .is_some_and(|err| err.contains("server_node_id") && err.contains("non-zero")),
-            "target response should explain zero server_node_id: {refused}"
-        );
-        assert!(!output.exists());
+            let refused = live_snapshot_admin(&engine, "send", args, true);
+
+            assert_eq!(refused["ok"], false, "target response: {refused}");
+            assert_eq!(refused["exit_code"], 1);
+            assert!(refused["json"].is_null());
+            assert!(refused["text"].is_null());
+            assert!(
+                refused["error"]
+                    .as_str()
+                    .is_some_and(|err| err.contains(key) && err.contains("non-zero")),
+                "target response should explain zero {key}: {refused}"
+            );
+            assert!(!output.exists());
+        }
     }
 
     #[test]
