@@ -810,32 +810,34 @@ pub(crate) fn read_content_chunk_from_store(
     })
 }
 
-/// Read chunk bytes, preferring receipt-aware routing through the pool when
-/// the chunk ref carries a non-zero placement receipt generation that can be
-/// verified against the pool's stored receipt.
+/// Read chunk bytes, preferring pool routing whenever a pool is available.
 ///
-/// Receiptless chunks (generation == 0) and reads where no pool is available
-/// fall back to the raw store get.
+/// Receiptless chunks (generation == 0) use the pool's no-receipt read
+/// behavior when possible. Reads where no pool is available fall back to the
+/// raw store get.
 fn read_chunk_bytes_with_receipt(
     store: &LocalObjectStore,
     pool: Option<&Pool>,
     chunk_ref: &ContentChunkRef,
     key: ObjectKey,
 ) -> Result<Vec<u8>> {
-    // Fast path: no receipt generation recorded, or no pool available —
-    // use raw store without receipt authority gating.
-    if chunk_ref.placement_receipt_generation == 0 {
-        return store.get(key)?.ok_or(FileSystemError::CorruptState {
-            reason: "content manifest references a missing chunk object",
-        });
-    }
-
     let Some(pool) = pool else {
         return store.get(key)?.ok_or(FileSystemError::CorruptState {
             reason: "content manifest references a missing chunk object",
         });
     };
+
     let expected_gen = chunk_ref.placement_receipt_generation;
+
+    if expected_gen == 0 {
+        return match pool.get(DeviceIoClass::Data, key) {
+            Ok(Some(bytes)) => Ok(bytes),
+            Ok(None) => Err(FileSystemError::CorruptState {
+                reason: "content manifest references a missing chunk object",
+            }),
+            Err(e) => Err(FileSystemError::Store(e)),
+        };
+    }
 
     // Query the pool receipt authority for this key.
     let receipt = match pool.placement_receipt_for_key(DeviceIoClass::Data, key) {
@@ -3038,6 +3040,31 @@ mod receipt_readback_authority_tests {
         let result =
             read_chunk_bytes_with_receipt(pool.raw_primary_store(), Some(&pool), &chunk_ref, key)
                 .expect("valid receipt should read through pool");
+        assert_eq!(result, payload);
+    }
+
+    /// Receiptless chunk refs should still route through the pool when a pool
+    /// is available, using the pool's no-receipt read behavior.
+    #[test]
+    fn receiptless_chunk_reads_through_pool_when_available() {
+        let raw_store = temp_store("receiptless-pool-empty-raw");
+        let mut pool = temp_pool("receiptless-pool-rdbk");
+        let key = tidefs_local_object_store::ObjectKey::from_name(b"chunk-receiptless-pool");
+        let payload = b"receiptless pool read payload";
+
+        pool.put(DeviceIoClass::Data, key, payload)
+            .expect("pool put");
+
+        let chunk_ref = ContentChunkRef {
+            chunk_index: 0,
+            data_version: 1,
+            len: payload.len() as u32,
+            checksum: IntegrityDigest64(0),
+            placement_receipt_generation: 0,
+        };
+
+        let result = read_chunk_bytes_with_receipt(&raw_store, Some(&pool), &chunk_ref, key)
+            .expect("receiptless chunk should read through pool");
         assert_eq!(result, payload);
     }
 
