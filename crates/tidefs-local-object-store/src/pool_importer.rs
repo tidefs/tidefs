@@ -274,7 +274,9 @@ impl CandidatePool {
             commit_group: self.recovery_commit_group,
         };
 
-        if self.topology_complete && self.cluster_authorized_or_not_clustered() {
+        let owner_authorized = self.cluster_authorized_or_not_clustered();
+
+        if self.topology_complete && owner_authorized {
             PoolLifecycleEvidence::executed(action, context)
         } else {
             let reason = if !self.topology_complete {
@@ -286,7 +288,7 @@ impl CandidatePool {
                 action,
                 context,
                 self.topology_complete,
-                self.cluster_authorized_or_not_clustered(),
+                owner_authorized,
                 reason,
             )
         }
@@ -898,10 +900,13 @@ mod tests {
         let evidence = pool.lifecycle_evidence(PoolLifecycleAction::Import);
 
         assert_eq!(evidence.action, PoolLifecycleAction::Import);
+        assert_eq!(evidence.outcome, PoolLifecycleOutcome::Refused);
+        assert_eq!(evidence.device_count, 1);
+        assert_eq!(evidence.expected_device_count, 1);
         assert!(evidence.topology_complete);
         assert!(!evidence.owner_authorized);
         assert!(evidence.is_fail_closed());
-        assert!(evidence.reason.contains("cluster ownership authority"));
+        assert_eq!(evidence.reason, "cluster ownership authority missing");
     }
 
     #[test]
