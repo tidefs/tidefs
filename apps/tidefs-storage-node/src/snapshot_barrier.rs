@@ -182,7 +182,7 @@ pub enum BarrierOutcome {
         /// Peers that did not respond.
         missing: Vec<u64>,
     },
-    /// Committed roots are inconsistent (txg range too wide).
+    /// Committed roots are inconsistent (txg mismatch).
     Inconsistent {
         min_txg: u64,
         max_txg: u64,
@@ -381,9 +381,9 @@ impl BarrierCollector {
             let total_objects: u64 = self.responses.values().map(|r| r.object_count).sum();
 
             // Consistency check: all peers must report the same
-            // committed-root txg. A txg spread > 1 indicates a peer
+            // committed-root txg. Any txg spread indicates a peer
             // advanced while the barrier was in flight.
-            if max_txg.saturating_sub(min_txg) <= 1 {
+            if max_txg == min_txg {
                 Some(BarrierOutcome::Consistent {
                     min_txg,
                     max_txg,
@@ -839,18 +839,18 @@ mod tests {
     }
 
     #[test]
-    fn collector_outcome_consistent_with_one_txg_difference() {
+    fn collector_outcome_inconsistent_with_one_txg_difference() {
         let mut c = BarrierCollector::new(1, "snap".into(), vec![10, 20], make_config());
         c.record_response(make_response(10, 1, 100, 5, 10));
         c.record_response(make_response(20, 1, 101, 5, 20));
         match c.outcome() {
-            Some(BarrierOutcome::Consistent {
+            Some(BarrierOutcome::Inconsistent {
                 min_txg, max_txg, ..
             }) => {
                 assert_eq!(min_txg, 100);
                 assert_eq!(max_txg, 101);
             }
-            other => panic!("expected Consistent, got {other:?}"),
+            other => panic!("expected Inconsistent, got {other:?}"),
         }
     }
 
@@ -1281,7 +1281,7 @@ mod tests {
                 BarrierResponse {
                     peer_id: 3,
                     barrier_id: 7,
-                    committed_root_txg: 42,
+                    committed_root_txg: 41,
                     committed_root_generation: 6,
                     object_count: 12,
                     received_at: Instant::now(),
@@ -1293,7 +1293,7 @@ mod tests {
             7,
             BarrierOutcome::Consistent {
                 min_txg: 41,
-                max_txg: 42,
+                max_txg: 41,
                 total_objects: 22,
                 responses,
             },
@@ -1303,7 +1303,7 @@ mod tests {
         assert_eq!(report.barrier_id, 7);
         assert_eq!(report.peer_count, 2);
         assert_eq!(report.min_txg, 41);
-        assert_eq!(report.max_txg, 42);
+        assert_eq!(report.max_txg, 41);
         assert_eq!(report.total_objects, 22);
     }
 
