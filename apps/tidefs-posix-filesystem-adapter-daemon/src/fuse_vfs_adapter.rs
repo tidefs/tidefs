@@ -43072,13 +43072,15 @@ mod tests {
                 .data_cache_snapshot_still_current(ino, 1024, 512, stale_snapshot),
             "clean write-through writes must still fence daemon read-cache generations"
         );
-        let page = fixture
-            .adapter
-            .write_page_cache
-            .lookup(ino, 0)
-            .expect("resident clean mirror should be patched, not evicted");
-        assert_eq!(page.data(), expected.as_slice());
-        assert!(!page.is_dirty());
+        {
+            let page = fixture
+                .adapter
+                .write_page_cache
+                .lookup(ino, 0)
+                .expect("resident clean mirror should be patched, not evicted");
+            assert_eq!(page.data(), expected.as_slice());
+            assert!(!page.is_dirty());
+        }
         assert!(
             fixture
                 .adapter
@@ -43148,13 +43150,15 @@ mod tests {
                 .data_cache_snapshot_still_current(ino, 1024, 512, stale_snapshot),
             "clean write-through helper must fence overlapping daemon read-cache generations"
         );
-        let page = fixture
-            .adapter
-            .write_page_cache
-            .lookup(ino, 0)
-            .expect("resident clean mirror should be patched, not evicted");
-        assert_eq!(page.data(), expected.as_slice());
-        assert!(!page.is_dirty());
+        {
+            let page = fixture
+                .adapter
+                .write_page_cache
+                .lookup(ino, 0)
+                .expect("resident clean mirror should be patched, not evicted");
+            assert_eq!(page.data(), expected.as_slice());
+            assert!(!page.is_dirty());
+        }
         assert!(
             fixture
                 .adapter
