@@ -735,6 +735,44 @@ fn property_assignments_json(assignments: &[PropertyAssignment]) -> Vec<serde_js
         .collect()
 }
 
+fn property_assignments_live_admin_args(
+    assignments: &[PropertyAssignment],
+) -> Vec<LivePoolAdminArg> {
+    assignments
+        .iter()
+        .map(property_assignment_live_admin_arg)
+        .collect()
+}
+
+fn property_assignment_live_admin_arg(assignment: &PropertyAssignment) -> LivePoolAdminArg {
+    LivePoolAdminArg::Object(
+        [
+            (
+                "key".to_string(),
+                LivePoolAdminArg::String(assignment.key.clone()),
+            ),
+            (
+                "value".to_string(),
+                property_value_live_admin_arg(&assignment.value),
+            ),
+            (
+                "display_value".to_string(),
+                LivePoolAdminArg::String(assignment.value.to_string()),
+            ),
+            (
+                "raw_value".to_string(),
+                LivePoolAdminArg::String(assignment.raw_value.clone()),
+            ),
+            (
+                "clear".to_string(),
+                LivePoolAdminArg::Bool(assignment.clear),
+            ),
+        ]
+        .into_iter()
+        .collect(),
+    )
+}
+
 fn property_value_json(value: &PropertyValue) -> serde_json::Value {
     match value {
         PropertyValue::None => serde_json::Value::Null,
@@ -745,6 +783,26 @@ fn property_value_json(value: &PropertyValue) -> serde_json::Value {
         PropertyValue::EnumVariant(value) => serde_json::json!(value),
         PropertyValue::Bytes(value) => serde_json::json!(value),
         PropertyValue::Size(value) => serde_json::json!(value),
+    }
+}
+
+fn property_value_live_admin_arg(value: &PropertyValue) -> LivePoolAdminArg {
+    match value {
+        PropertyValue::None => LivePoolAdminArg::Null,
+        PropertyValue::U64(value) => LivePoolAdminArg::U64(*value),
+        PropertyValue::I64(value) => LivePoolAdminArg::I64(*value),
+        PropertyValue::String(value) => LivePoolAdminArg::String(value.clone()),
+        PropertyValue::Bool(value) => LivePoolAdminArg::Bool(*value),
+        PropertyValue::EnumVariant(value) => LivePoolAdminArg::U64(u64::from(*value)),
+        PropertyValue::Bytes(value) => LivePoolAdminArg::Array(
+            value
+                .iter()
+                .copied()
+                .map(u64::from)
+                .map(LivePoolAdminArg::U64)
+                .collect(),
+        ),
+        PropertyValue::Size(value) => LivePoolAdminArg::U64(*value),
     }
 }
 
@@ -1023,12 +1081,7 @@ fn handle_create(args: DatasetCreateArgs) {
             ),
             (
                 "properties",
-                LivePoolAdminArg::Array(
-                    property_assignments_json(&properties)
-                        .into_iter()
-                        .map(super::live_owner::live_admin_arg_from_json)
-                        .collect(),
-                ),
+                LivePoolAdminArg::Array(property_assignments_live_admin_args(&properties)),
             ),
             (
                 "features",
@@ -1690,10 +1743,7 @@ fn handle_set(args: DatasetSetArgs) {
                 LivePoolAdminArg::String(assignment.key.to_string()),
             ),
             ("assignment", LivePoolAdminArg::String(live_assignment)),
-            (
-                "value",
-                super::live_owner::live_admin_arg_from_json(property_value_json(&assignment.value)),
-            ),
+            ("value", property_value_live_admin_arg(&assignment.value)),
             (
                 "display_value",
                 LivePoolAdminArg::String(assignment.value.to_string()),
