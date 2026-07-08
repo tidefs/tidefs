@@ -1045,6 +1045,27 @@ fn build_claim_evidence_class_receipt(
                 details: manifest_details.details,
             };
         }
+        if requirement.validation_tier.is_runtime() {
+            return ClaimEvidenceClassReceipt {
+                class: class.to_string(),
+                status: EvidenceClassStatus::Malformed,
+                artifact_path,
+                validation_tier,
+                blocking_issues,
+                manifest_path: None,
+                content_digest: None,
+                run_id: None,
+                source_ref: None,
+                outcome: None,
+                residual_risk: None,
+                source: None,
+                evidence_scope: None,
+                details: vec![format!(
+                    "claim `{}` evidence requirement for runtime-tier class `{class}` must name manifest_path",
+                    claim.id
+                )],
+            };
+        }
         if enforce_freshness {
             return ClaimEvidenceClassReceipt {
                 class: class.to_string(),
@@ -4206,6 +4227,43 @@ const UNGUARDED_COMMANDS: &[&str] = &[
             detail.contains("uses deterministic fixture run_id")
                 && detail.contains("validated runtime evidence")
         }));
+    }
+
+    #[test]
+    fn validate_claim_rejects_runtime_requirement_without_manifest() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_artifact(
+            temp.path(),
+            "evidence/summary.txt",
+            "raw runtime evidence body",
+        );
+        let mut claim = manifest_fixture_claim(
+            "example.manifest.validated.v1",
+            ClaimStatus::Validated,
+            Vec::new(),
+            Vec::new(),
+        );
+        claim.evidence_requirements[0].validation_tier = ValidationTier::MountedUserspace;
+        claim.evidence_requirements[0].manifest_path = None;
+        claim.evidence_artifacts.push(ClaimEvidenceArtifact {
+            class: "cargo-fixture".to_string(),
+            path: "evidence/summary.txt".to_string(),
+            ..Default::default()
+        });
+
+        let receipt = build_claim_validation_receipt(temp.path(), SystemTime::UNIX_EPOCH, &claim);
+
+        assert_eq!(receipt.status, ClaimReceiptStatus::Fail);
+        let evidence = receipt
+            .required_evidence
+            .iter()
+            .find(|evidence| evidence.class == "cargo-fixture")
+            .expect("manifest-backed evidence receipt");
+        assert_eq!(evidence.status, EvidenceClassStatus::Malformed);
+        assert!(evidence
+            .details
+            .iter()
+            .any(|detail| detail.contains("runtime-tier") && detail.contains("manifest_path")));
     }
 
     #[test]
