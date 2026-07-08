@@ -1073,14 +1073,14 @@ fn main() {
                 process::exit(1);
             }
         }
-        Some("auto-release-stale-claims" | "auto-release-stale" | "auto-release") => {
-            if let Err(err) = forgejo_work::auto_release_stale_claims() {
+        Some(command @ ("auto-release-stale-claims" | "auto-release-stale" | "auto-release")) => {
+            if let Err(err) = forgejo_work::auto_release_stale_claims(command) {
                 eprintln!("{err}");
                 process::exit(1);
             }
         }
-        Some("coordination-health" | "coordination-health-report") => {
-            if let Err(err) = forgejo_work::print_coordination_health_report() {
+        Some(command @ ("coordination-health" | "coordination-health-report")) => {
+            if let Err(err) = forgejo_work::print_coordination_health_report(command) {
                 eprintln!("{err}");
                 process::exit(1);
             }

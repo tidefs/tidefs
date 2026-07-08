@@ -249,9 +249,9 @@ pub fn check_abandoned_worktrees_current_workspace() -> Result<(), ForgejoWorkEr
 // auto-release-stale-claims -- legacy Forgejo command, now unsupported
 // ---------------------------------------------------------------------------
 
-pub fn auto_release_stale_claims() -> Result<(), ForgejoWorkError> {
+pub fn auto_release_stale_claims(command: &str) -> Result<(), ForgejoWorkError> {
     Err(retired_forgejo_command_error(
-        "auto-release-stale-claims",
+        command,
         "Stale-claim release is now managed through GitHub issue state and the current Codex Nexus \
          controller.",
     ))
@@ -261,9 +261,9 @@ pub fn auto_release_stale_claims() -> Result<(), ForgejoWorkError> {
 // coordination-health -- legacy Forgejo command, now unsupported
 // ---------------------------------------------------------------------------
 
-pub fn print_coordination_health_report() -> Result<(), ForgejoWorkError> {
+pub fn print_coordination_health_report(command: &str) -> Result<(), ForgejoWorkError> {
     Err(retired_forgejo_command_error(
-        "coordination-health",
+        command,
         "Coordination health is now reported through GitHub Actions CI posture, Codex Nexus \
          dashboard state, and live GitHub issue/PR state.",
     ))
@@ -563,12 +563,24 @@ mod tests {
             "check-duplicate-forgejo-claims",
         );
         assert_retired_forgejo_command_error(
-            auto_release_stale_claims(),
+            auto_release_stale_claims("auto-release-stale-claims"),
             "auto-release-stale-claims",
         );
         assert_retired_forgejo_command_error(
-            print_coordination_health_report(),
+            auto_release_stale_claims("auto-release-stale"),
+            "auto-release-stale",
+        );
+        assert_retired_forgejo_command_error(
+            auto_release_stale_claims("auto-release"),
+            "auto-release",
+        );
+        assert_retired_forgejo_command_error(
+            print_coordination_health_report("coordination-health"),
             "coordination-health",
+        );
+        assert_retired_forgejo_command_error(
+            print_coordination_health_report("coordination-health-report"),
+            "coordination-health-report",
         );
 
         let message = acquire_claim_command("acquire-claim", 1805)
