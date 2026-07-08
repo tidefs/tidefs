@@ -36,25 +36,27 @@ pub fn run_reclaim_smoke() -> SmokeHarness {
         scheduler.total_reclaimed(),
         0,
     );
-    h.assert_eq_ev(
-        "scheduler exposes configured waste threshold",
-        scheduler.waste_threshold(),
-        0.25,
+    h.assert_ev(
+        "retired scheduler exposes sentinel waste threshold",
+        scheduler.waste_threshold().is_infinite(),
     );
 
     record_reclaim_op(&mut h, "scheduler.activate", 0, Vec::new());
     scheduler.activate();
-    h.assert_ev("activated scheduler is active", scheduler.is_active());
     h.assert_ev(
-        "first reclaim attempt is allowed before cooldown marker",
-        scheduler.can_reclaim(10),
+        "activated retired scheduler remains inactive",
+        !scheduler.is_active(),
+    );
+    h.assert_ev(
+        "retired scheduler does not authorize reclaim",
+        !scheduler.can_reclaim(10),
     );
 
     record_reclaim_op(&mut h, "scheduler.mark_reclaimed", 10, Vec::new());
     scheduler.mark_reclaimed(10);
     h.assert_ev(
-        "cooldown of one segment permits next segment",
-        scheduler.can_reclaim(11),
+        "retired scheduler ignores cooldown authorization",
+        !scheduler.can_reclaim(11),
     );
 
     let segments = [
@@ -74,18 +76,18 @@ pub fn run_reclaim_smoke() -> SmokeHarness {
     let plan = scheduler.plan_batch(segments);
     h.assert_eq_ev("batch plan respects configured limit", plan.len(), 2);
     h.assert_eq_ev(
-        "batch plan selects highest waste candidates deterministically",
+        "batch plan selects partial-live candidates in segment order",
         candidate_ids(&plan.candidates),
-        vec![2, 5],
+        vec![1, 2],
     );
     h.assert_eq_ev(
         "batch plan sums selected reclaimable bytes",
         plan.total_reclaimable_bytes,
-        90,
+        95,
     );
     h.assert_ev(
-        "low-waste segment is excluded from reclaim batch",
-        !candidate_ids(&plan.candidates).contains(&1),
+        "partial-live low-waste segment is included in handoff batch",
+        candidate_ids(&plan.candidates).contains(&1),
     );
     h.assert_ev(
         "empty segment is excluded from reclaim batch",
