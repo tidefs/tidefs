@@ -6556,9 +6556,12 @@ mod tests {
     use super::*;
     use crate::write_buffer::WriteBufferConfig;
     use crate::RootAuthenticationKey;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::thread;
+    use std::time::Duration;
     use tidefs_space_accounting::{DatasetQuotaConfig, DatasetQuotaHierarchy};
     use tidefs_storage_intent_core::{
         EvidenceCompletenessVerdict, EvidenceFamilyFreshness, EvidenceFamilyFreshnessSet,
@@ -6576,6 +6579,7 @@ mod tests {
         PrefetchExecutorOutcome, PrefetchExecutorRuntimeSupport,
         PrefetchExecutorRuntimeSupportMask, PrefetchExecutorSchedulerLane,
     };
+    use tidefs_transport::{SessionId, TransportError};
     use tidefs_types_vfs_core::{
         FileHandleId, FATTR_ATIME, FATTR_CTIME, FATTR_GID, FATTR_MODE, FATTR_MTIME, FATTR_SIZE,
         FATTR_UID, RENAME_EXCHANGE, RENAME_NOREPLACE, S_IFDIR, S_IFMT, S_ISGID, XATTR_CREATE,
@@ -6736,6 +6740,28 @@ mod tests {
                 "snapshot send: export payload is too large for VSNP frame: {oversized} bytes"
             ))
         );
+    }
+
+    fn snap_net_ack(message: &[u8]) -> Vec<u8> {
+        let mut ack = Vec::new();
+        ack.extend_from_slice(SNAP_NET_MAGIC);
+        ack.push(SNAP_KIND_ACK);
+        ack.extend_from_slice(&(message.len() as u32).to_le_bytes());
+        ack.extend_from_slice(message);
+        ack
+    }
+
+    fn accept_snapshot_transport_session(server: &mut Transport) -> SessionId {
+        for _ in 0..200 {
+            match server.accept_incoming() {
+                Ok(session_id) => return session_id,
+                Err(TransportError::Generic(ref err)) if err.contains("no pending connections") => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(err) => panic!("accept snapshot transport session: {err:?}"),
+            }
+        }
+        panic!("timeout waiting for snapshot transport session");
     }
 
     const PREFETCH_POLICY: StorageIntentPolicyId = StorageIntentPolicyId([0x31; 16]);
@@ -7878,6 +7904,90 @@ mod tests {
             "target response should reference the target address: {refused}"
         );
         assert!(!output.exists());
+    }
+
+    #[test]
+    fn live_snapshot_send_snap_net_target_address_receives_ack() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = root.path().join("store");
+        let mut fs = LocalFileSystem::open(&store).expect("open fs");
+        fs.create_file("/live.txt", 0o644).expect("create file");
+        fs.write_file("/live.txt", 0, b"live owner snapshot send")
+            .expect("write file");
+        let engine = VfsLocalFileSystem::new(fs);
+        let output = root.path().join("target-ack.vfs");
+
+        let mut server = Transport::new(2);
+        server
+            .bind(TransportAddr::Tcp(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                0,
+            )))
+            .expect("bind");
+        let target_addr = match server.bind_addr.as_ref().expect("bind_addr") {
+            TransportAddr::Tcp(addr) => addr.to_string(),
+            _ => unreachable!("test binds TCP transport"),
+        };
+
+        let server_handle = thread::spawn(move || {
+            let session_id = accept_snapshot_transport_session(&mut server);
+            server.perform_handshake(session_id).expect("handshake");
+            let frame = server.recv_message(session_id).expect("recv push frame");
+
+            assert!(frame.len() >= SNAP_NET_PUSH_HEADER_LEN);
+            assert_eq!(&frame[0..4], SNAP_NET_MAGIC);
+            assert_eq!(frame[4], SNAP_KIND_PUSH);
+
+            let auth_len = u32::from_le_bytes(frame[5..9].try_into().expect("auth len")) as usize;
+            assert_eq!(auth_len, 32);
+            let export_len_offset = 9 + auth_len;
+            let export_len = u32::from_le_bytes(
+                frame[export_len_offset..export_len_offset + 4]
+                    .try_into()
+                    .expect("export len"),
+            ) as usize;
+            let export_start = export_len_offset + 4;
+            let export_end = export_start + export_len;
+            assert_eq!(frame.len(), export_end);
+
+            let decoded = crate::ChangedRecordExport::decode(&frame[export_start..export_end])
+                .expect("decode pushed export");
+            assert!(!decoded.incremental);
+            assert!(decoded.total_records > 0);
+            assert!(decoded.payload_bytes > 0);
+
+            server
+                .send_message(session_id, &snap_net_ack(b"received"))
+                .expect("send ack");
+            let _ = server.close_session(session_id, SessionCloseReason::LocalShutdown);
+        });
+
+        let sent = live_snapshot_admin(
+            &engine,
+            "send",
+            json!({
+                "output": output.display().to_string(),
+                "target_addr": target_addr.clone(),
+                "format": "vfssend1",
+                "incremental": false,
+            }),
+            true,
+        );
+
+        assert_eq!(sent["ok"], true, "send response: {sent}");
+        assert_eq!(sent["json"]["target_addr"], target_addr);
+        assert_eq!(sent["json"]["remote_response"], "received");
+        assert_eq!(sent["json"]["format"], "vfssend1");
+        assert_eq!(sent["json"]["incremental"], false);
+        assert!(sent["json"]["bytes"].as_u64().unwrap_or(0) > 0);
+
+        let encoded = std::fs::read(&output).expect("read acked output");
+        let decoded = crate::ChangedRecordExport::decode(&encoded).expect("decode acked output");
+        assert!(!decoded.incremental);
+        assert!(decoded.total_records > 0);
+        assert!(decoded.payload_bytes > 0);
+
+        server_handle.join().expect("server thread");
     }
 
     #[test]
