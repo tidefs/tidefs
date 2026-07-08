@@ -20,7 +20,7 @@
 //! - strengthen the durability or coherency guarantee on its own.
 //!
 //! The projection is the concrete FUSE adapter-side counterpart of the
-//! authority contract in [`docs/PAGE_CACHE_WRITEBACK_AUTHORITY.md`].
+//! authority contract in `docs/PAGE_CACHE_WRITEBACK_AUTHORITY.md`.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -289,7 +289,7 @@ impl WritebackProjection {
     /// because the inode has dirty or writeback-pending bytes.
     ///
     /// This implements the authority contract in
-    /// [`docs/PAGE_CACHE_WRITEBACK_AUTHORITY.md`]:
+    /// `docs/PAGE_CACHE_WRITEBACK_AUTHORITY.md`:
     /// "Dirty and writeback pages must not be silently invalidated."
     pub fn invalidation_allowed(&self, ino: u64) -> bool {
         if self.is_dirty_or_writeback(ino) {

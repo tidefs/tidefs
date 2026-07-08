@@ -79,7 +79,7 @@ struct MmapRegistration {
 /// `FUSE_NOTIFY_INVAL_INODE`.  Inodes with dirty or writeback-pending
 /// bytes are preserved—their page-cache entries are not invalidated—per
 /// the authority contract in
-/// [`docs/PAGE_CACHE_WRITEBACK_AUTHORITY.md`].
+/// `docs/PAGE_CACHE_WRITEBACK_AUTHORITY.md`.
 ///
 /// # Type alias
 ///
