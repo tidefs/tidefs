@@ -179,16 +179,35 @@ impl WritebackProjection {
     /// This is called after a buffered write has been processed and dirty
     /// state has been recorded in the adapter's [`DirtyRanges`] and/or
     /// [`PageCache`].
-    pub fn record_dirty(&self, ino: u64, _total_dirty_bytes: u64) {
+    pub fn record_dirty(&self, ino: u64, total_dirty_bytes: u64) {
         let mut lanes = self.lanes.lock().unwrap();
-        let prev = lanes.insert(
-            ino,
-            WritebackLane::Dirty {
-                bytes: _total_dirty_bytes,
-            },
-        );
-        if prev.is_none() || matches!(prev, Some(WritebackLane::Clean)) {
-            self.stats.dirty_transitions.fetch_add(1, Ordering::Relaxed);
+        let prev = lanes.get(&ino).copied().unwrap_or(WritebackLane::Clean);
+        match prev {
+            WritebackLane::Clean => {
+                lanes.insert(
+                    ino,
+                    WritebackLane::Dirty {
+                        bytes: total_dirty_bytes,
+                    },
+                );
+                self.stats.dirty_transitions.fetch_add(1, Ordering::Relaxed);
+            }
+            WritebackLane::Dirty { .. } => {
+                lanes.insert(
+                    ino,
+                    WritebackLane::Dirty {
+                        bytes: total_dirty_bytes,
+                    },
+                );
+            }
+            WritebackLane::WritebackPending { bytes } => {
+                lanes.insert(
+                    ino,
+                    WritebackLane::WritebackPending {
+                        bytes: bytes.max(total_dirty_bytes),
+                    },
+                );
+            }
         }
     }
 
@@ -450,6 +469,20 @@ mod tests {
         p.record_dirty(42, 4096);
         p.record_dirty(42, 8192); // more bytes, but same inode already dirty
         assert_eq!(p.stats_snapshot().dirty_transitions, 1);
+    }
+
+    #[test]
+    fn dirty_observation_preserves_writeback_pending_lane() {
+        let p = new_projection();
+        p.record_dirty(42, 4096);
+        p.record_writeback_pending(42, 4096);
+        p.record_dirty(42, 8192);
+        assert_eq!(
+            p.lane(42),
+            Some(WritebackLane::WritebackPending { bytes: 8192 })
+        );
+        assert_eq!(p.stats_snapshot().dirty_transitions, 1);
+        assert!(p.is_writeback_pending(42));
     }
 
     #[test]
