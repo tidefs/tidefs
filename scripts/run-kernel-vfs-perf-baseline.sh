@@ -255,6 +255,19 @@ EOF
   expect_parser_counts timeout-log 0 0 0 0
   expect_parser_state timeout-log false true false false
 
+  cat > "$test_dir/timeout-complete-log.log" <<'EOF'
+PASS: insmod
+PASS: mount
+PASS: no_daemon
+write_throughput_MBps=10.00
+read_throughput_MBps=20.00
+stat_avg_us=30
+EOF
+  analyze_qemu_log "$test_dir/timeout-complete-log.log" 137
+  expect_parser_verdict timeout-complete-log BLOCKED qemu_timeout 2
+  expect_parser_counts timeout-complete-log 3 0 0 0
+  expect_parser_state timeout-complete-log false true false true
+
   cat > "$test_dir/qemu-exit-nonzero.log" <<'EOF'
 PASS: insmod
 PASS: mount
