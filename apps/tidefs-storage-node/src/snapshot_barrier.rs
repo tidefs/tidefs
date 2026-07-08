@@ -155,6 +155,8 @@ pub struct BarrierCollector {
     expected_peers: Vec<u64>,
     /// Responses received so far, keyed by peer_id.
     responses: BTreeMap<u64, BarrierResponse>,
+    /// Peer-side failures received during the barrier, keyed by peer_id.
+    failures: BTreeMap<u64, String>,
     /// Wall-clock time when the collector was created.
     started_at: Instant,
     /// Configuration for this barrier.
@@ -188,6 +190,8 @@ pub enum BarrierOutcome {
         max_txg: u64,
         responses: BTreeMap<u64, BarrierResponse>,
     },
+    /// A peer reported an explicit barrier failure.
+    Failed { peer_id: u64, reason: String },
 }
 
 /// Successful pre-send snapshot barrier summary.
@@ -207,6 +211,11 @@ pub enum SnapshotBarrierSendError {
         barrier_id: BarrierId,
     },
     SendFailed {
+        barrier_id: BarrierId,
+        peer_id: u64,
+        reason: String,
+    },
+    PeerFailed {
         barrier_id: BarrierId,
         peer_id: u64,
         reason: String,
@@ -237,6 +246,14 @@ impl fmt::Display for SnapshotBarrierSendError {
             } => write!(
                 f,
                 "barrier {barrier_id} send to peer {peer_id} failed: {reason}"
+            ),
+            Self::PeerFailed {
+                barrier_id,
+                peer_id,
+                reason,
+            } => write!(
+                f,
+                "barrier {barrier_id} peer {peer_id} failed before responding: {reason}"
             ),
             Self::Timeout {
                 barrier_id,
@@ -288,6 +305,11 @@ pub fn snapshot_barrier_send_report(
             min_txg,
             max_txg,
         }),
+        BarrierOutcome::Failed { peer_id, reason } => Err(SnapshotBarrierSendError::PeerFailed {
+            barrier_id,
+            peer_id,
+            reason,
+        }),
     }
 }
 
@@ -304,6 +326,7 @@ impl BarrierCollector {
             snapshot_name,
             expected_peers,
             responses: BTreeMap::new(),
+            failures: BTreeMap::new(),
             started_at: Instant::now(),
             config,
         }
@@ -334,7 +357,25 @@ impl BarrierCollector {
         if self.responses.contains_key(&response.peer_id) {
             return false;
         }
+        if self.failures.contains_key(&response.peer_id) {
+            return false;
+        }
         self.responses.insert(response.peer_id, response);
+        true
+    }
+
+    /// Record a peer-side barrier failure. Returns `true` if accepted.
+    pub fn record_failure(&mut self, peer_id: u64, reason: String) -> bool {
+        if !self.expected_peers.contains(&peer_id) {
+            return false;
+        }
+        if self.responses.contains_key(&peer_id) {
+            return false;
+        }
+        if self.failures.contains_key(&peer_id) {
+            return false;
+        }
+        self.failures.insert(peer_id, reason);
         true
     }
 
@@ -347,7 +388,7 @@ impl BarrierCollector {
     pub fn missing_count(&self) -> usize {
         self.expected_peers
             .len()
-            .saturating_sub(self.responses.len())
+            .saturating_sub(self.responses.len() + self.failures.len())
     }
 
     /// Whether all expected peers have responded.
@@ -365,7 +406,12 @@ impl BarrierCollector {
     /// Returns `None` if the barrier is still in progress (not
     /// complete and not timed out).
     pub fn outcome(&self) -> Option<BarrierOutcome> {
-        if self.is_complete() {
+        if let Some((&peer_id, reason)) = self.failures.iter().next() {
+            Some(BarrierOutcome::Failed {
+                peer_id,
+                reason: reason.clone(),
+            })
+        } else if self.is_complete() {
             let min_txg = self
                 .responses
                 .values()
@@ -402,7 +448,7 @@ impl BarrierCollector {
             let missing: Vec<u64> = self
                 .expected_peers
                 .iter()
-                .filter(|id| !self.responses.contains_key(id))
+                .filter(|id| !self.responses.contains_key(id) && !self.failures.contains_key(id))
                 .copied()
                 .collect();
             Some(BarrierOutcome::Timeout { responded, missing })
@@ -528,6 +574,14 @@ impl SnapshotCoordinator {
         } else {
             false
         }
+    }
+
+    /// Record a peer-side barrier failure.
+    ///
+    /// Returns `true` if the failure was accepted (peer in the expected
+    /// set and not already recorded).
+    pub fn record_failure(&mut self, peer_id: u64, reason: String) -> bool {
+        self.collector.record_failure(peer_id, reason)
     }
 
     /// Number of responses received so far.
@@ -808,6 +862,24 @@ mod tests {
     }
 
     #[test]
+    fn collector_records_peer_failure() {
+        let mut c = BarrierCollector::new(1, "snap".into(), vec![10], make_config());
+
+        assert!(c.record_failure(10, "sync failed".into()));
+        assert_eq!(c.responded_count(), 0);
+        assert_eq!(c.missing_count(), 0);
+        assert!(!c.record_response(make_response(10, 1, 100, 5, 10)));
+
+        match c.outcome() {
+            Some(BarrierOutcome::Failed { peer_id, reason }) => {
+                assert_eq!(peer_id, 10);
+                assert_eq!(reason, "sync failed");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn collector_completes_with_all_responses() {
         let mut c = BarrierCollector::new(1, "snap".into(), vec![10, 20, 30], make_config());
         assert!(c.record_response(make_response(10, 1, 100, 5, 10)));
@@ -1060,6 +1132,32 @@ mod tests {
                 assert_eq!(total_objects, 30);
             }
             other => panic!("expected Consistent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn coordinator_records_peer_failure() {
+        let mut coord = SnapshotCoordinator::new(1, "snap".into(), vec![10], make_config());
+
+        assert!(coord.record_failure(10, "barrier failed".into()));
+        assert_eq!(coord.responded_count(), 0);
+        assert_eq!(coord.missing_count(), 0);
+        assert!(!coord.record_response(
+            10,
+            &Frame::SnapshotBarrierResponse {
+                barrier_id: 1,
+                committed_root_txg: 100,
+                committed_root_generation: 5,
+                object_count: 10,
+            },
+        ));
+
+        match coord.outcome() {
+            Some(BarrierOutcome::Failed { peer_id, reason }) => {
+                assert_eq!(peer_id, 10);
+                assert_eq!(reason, "barrier failed");
+            }
+            other => panic!("expected Failed, got {other:?}"),
         }
     }
 
@@ -1398,5 +1496,27 @@ mod tests {
             }
         );
         assert!(err.to_string().contains("inconsistent"));
+    }
+
+    #[test]
+    fn snapshot_barrier_send_report_rejects_peer_failure() {
+        let err = snapshot_barrier_send_report(
+            10,
+            BarrierOutcome::Failed {
+                peer_id: 2,
+                reason: "sync failed".into(),
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            SnapshotBarrierSendError::PeerFailed {
+                barrier_id: 10,
+                peer_id: 2,
+                reason: "sync failed".into(),
+            }
+        );
+        assert!(err.to_string().contains("peer 2 failed"));
     }
 }

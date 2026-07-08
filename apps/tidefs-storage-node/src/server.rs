@@ -907,6 +907,23 @@ fn record_snapshot_barrier_response(
     coord.record_response(peer_id, frame)
 }
 
+fn record_snapshot_barrier_error(
+    session_id: tidefs_transport::SessionId,
+    message: &str,
+    ctx: &SessionContext,
+) -> bool {
+    let Some(peer_id) = ctx.transport.lock().unwrap().peer_node(session_id) else {
+        return false;
+    };
+
+    let mut active = ctx.active_barrier.lock().unwrap();
+    let Some(coord) = active.as_mut() else {
+        return false;
+    };
+
+    coord.record_failure(peer_id, message.to_string())
+}
+
 fn advance_tracker_after_peer_replica_read_map(
     tracker: &PlacementVersionTracker,
     request: &StorageNodePeerReplicaReadMapRequest,
@@ -4266,6 +4283,14 @@ fn serve_session(session_id: tidefs_transport::SessionId, ctx: SessionContext) {
                 }
                 continue;
             }
+            if let Frame::Error { message } = &frame {
+                if record_snapshot_barrier_error(session_id, message, &ctx) {
+                    eprintln!(
+                        "[storage-node] barrier: recorded peer error from session {session_id}: {message}"
+                    );
+                    continue;
+                }
+            }
 
             let store = Arc::clone(&ctx.store);
             let response = handle_frame_ctx(session_id, &frame, &store, &ctx);
@@ -6689,6 +6714,74 @@ mod cluster_pool_handler_tests {
         assert_eq!(coord.responded_count(), 1);
         assert_eq!(coord.missing_count(), 0);
         assert!(coord.is_complete());
+    }
+
+    #[test]
+    fn snapshot_barrier_error_records_mapped_session() {
+        let (_dir, store) = frame_local_store();
+        let ctx = frame_test_context(Arc::clone(&store));
+        let peer_session_id = tidefs_transport::SessionId::new(2);
+        let peer_session = tidefs_transport::session::Session::new(
+            peer_session_id,
+            1,
+            2,
+            tidefs_transport::TransportAddr::Tcp("127.0.0.1:9002".parse().unwrap()),
+            tidefs_transport::EndpointFamily::LocalEmbed,
+            tidefs_transport::TransportBackendKind::Tcp,
+        );
+        ctx.transport
+            .lock()
+            .unwrap()
+            .sessions
+            .insert(peer_session_id, Arc::new(Mutex::new(peer_session)));
+        *ctx.active_barrier.lock().unwrap() = Some(SnapshotCoordinator::new(
+            7,
+            "active".into(),
+            vec![2],
+            SnapshotBarrierConfig::default(),
+        ));
+
+        assert!(record_snapshot_barrier_error(
+            peer_session_id,
+            "sync failed",
+            &ctx
+        ));
+
+        let active = ctx.active_barrier.lock().unwrap();
+        let coord = active.as_ref().expect("barrier remains active");
+        assert_eq!(coord.responded_count(), 0);
+        assert_eq!(coord.missing_count(), 0);
+        match coord.outcome() {
+            Some(crate::snapshot_barrier::BarrierOutcome::Failed { peer_id, reason }) => {
+                assert_eq!(peer_id, 2);
+                assert_eq!(reason, "sync failed");
+            }
+            other => panic!("expected failed barrier outcome, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn snapshot_barrier_error_ignores_unmapped_session() {
+        let (_dir, store) = frame_local_store();
+        let ctx = frame_test_context(Arc::clone(&store));
+        *ctx.active_barrier.lock().unwrap() = Some(SnapshotCoordinator::new(
+            7,
+            "active".into(),
+            vec![2],
+            SnapshotBarrierConfig::default(),
+        ));
+
+        assert!(!record_snapshot_barrier_error(
+            tidefs_transport::SessionId::new(44),
+            "sync failed",
+            &ctx
+        ));
+
+        let active = ctx.active_barrier.lock().unwrap();
+        let coord = active.as_ref().expect("barrier remains active");
+        assert_eq!(coord.responded_count(), 0);
+        assert_eq!(coord.missing_count(), 1);
+        assert!(coord.outcome().is_none());
     }
 
     #[test]
