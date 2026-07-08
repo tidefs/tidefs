@@ -434,10 +434,10 @@ fn branch_issue_authority(branch: &str, issue_num: u64) -> Option<WorktreeIssueA
 fn is_codex_identity_dir(name: &str) -> bool {
     // Accept codexN (e.g. codex0) and dsN (e.g. ds10) identity dirs.
     if let Some(suffix) = name.strip_prefix("codex") {
-        return !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_alphanumeric());
+        return !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit());
     }
     if let Some(suffix) = name.strip_prefix("ds") {
-        return !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_alphanumeric());
+        return !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit());
     }
     false
 }
@@ -689,8 +689,12 @@ mod tests {
         assert!(is_codex_identity_dir("ds0"));
         // Legacy bare "codex" without numeric suffix is not an identity dir.
         assert!(!is_codex_identity_dir("codex"));
+        assert!(!is_codex_identity_dir("codexA"));
+        assert!(!is_codex_identity_dir("codex1a"));
         assert!(!is_codex_identity_dir("codex-"));
         assert!(!is_codex_identity_dir("ds"));
+        assert!(!is_codex_identity_dir("dsA"));
+        assert!(!is_codex_identity_dir("ds1a"));
         assert!(!is_codex_identity_dir("foreground"));
         assert!(!is_codex_identity_dir("gpt0")); // other prefixes are not identity dirs
     }
