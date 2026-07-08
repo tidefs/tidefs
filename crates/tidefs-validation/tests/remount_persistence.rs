@@ -159,8 +159,8 @@ fn remount_persistence_subdir_files() {
 // ===========================================================================
 
 /// Write known data through a FUSE mount, then read it back within the same
-/// mount session and verify byte-for-byte equality.  This proves that the
-/// FUSE write dispatch path is functional end-to-end.
+/// mount session and verify byte-for-byte equality.  This exercises the
+/// FUSE write dispatch path end-to-end when the mounted runtime is present.
 #[test]
 #[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn same_session_write_read_roundtrip() {
