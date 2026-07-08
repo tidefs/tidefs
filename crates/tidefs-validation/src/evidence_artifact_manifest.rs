@@ -123,6 +123,12 @@ impl EvidenceArtifactManifest {
         if let Err(error) = validate_artifact_path_shape(&self.artifact_path) {
             failures.extend(error.failures().iter().cloned());
         }
+        if is_runtime_artifact_path(Path::new(&self.artifact_path))
+            && !self.validation_tier.is_live_runtime()
+        {
+            failures
+                .push("runtime artifact_path requires live-runtime validation_tier".to_string());
+        }
         validate_content_digest(&self.content_digest, &mut failures);
         validate_required_text("run_id", &self.run_id, &mut failures);
         validate_required_text("source_ref", &self.source_ref, &mut failures);

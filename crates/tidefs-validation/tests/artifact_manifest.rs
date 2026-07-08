@@ -138,6 +138,30 @@ fn runtime_artifact_classifier_is_token_based() {
 }
 
 #[test]
+fn runtime_artifact_manifest_paths_require_live_runtime_tier() {
+    let payload = br#"{"report_version":1,"kind":"runtime"}"#;
+    let mut manifest = valid_manifest(
+        payload,
+        "validation/artifacts/local-vfs/runtime-crash/runtime-summary.json",
+    );
+
+    let error = manifest
+        .validate()
+        .expect_err("runtime artifact path with source-model tier should fail");
+    assert!(
+        error.failures().iter().any(|failure| failure
+            .contains("runtime artifact_path requires live-runtime validation_tier")),
+        "expected live-runtime tier failure, got {:?}",
+        error.failures()
+    );
+
+    manifest.validation_tier = ValidationTier::MountedUserspace;
+    manifest
+        .validate()
+        .expect("runtime artifact path with live-runtime tier should pass");
+}
+
+#[test]
 fn committed_validation_artifacts_do_not_embed_scratch_paths() {
     const SCRATCH_PATH_NEEDLES: &[(&[u8], &str)] = &[
         (b"/tmp/tidefs-validation", "/tmp/tidefs-validation"),
