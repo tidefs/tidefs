@@ -7057,6 +7057,21 @@ mod tests {
     }
 
     #[test]
+    fn live_block_admin_commands_return_typed_unsupported_errors() {
+        let (engine, _td) = temp_fs();
+
+        for operation in ["attach", "send", "receive"] {
+            let value = live_admin(&engine, "block", operation, json!({}), true);
+
+            assert_eq!(value["ok"], false);
+            assert_eq!(value["exit_code"], 1);
+            assert_eq!(value["json"]["kind"], "unsupported_command");
+            assert_eq!(value["json"]["command"], "block");
+            assert_eq!(value["json"]["operation"], operation);
+        }
+    }
+
+    #[test]
     fn live_dataset_properties_use_pool_local_catalog_path() {
         let (engine, _td) = temp_fs();
 

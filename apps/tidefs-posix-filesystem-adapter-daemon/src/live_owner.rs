@@ -251,7 +251,10 @@ fn dispatch_request(
         | LivePoolAdminCommand::SnapshotExtract
         | LivePoolAdminCommand::SnapshotSend
         | LivePoolAdminCommand::PerformanceAdmissionSnapshot
-        | LivePoolAdminCommand::DeviceRemove => delegate_admin_request(&request, engine),
+        | LivePoolAdminCommand::DeviceRemove
+        | LivePoolAdminCommand::BlockAttach
+        | LivePoolAdminCommand::BlockSend
+        | LivePoolAdminCommand::BlockReceive => delegate_admin_request(&request, engine),
     }
 }
 
