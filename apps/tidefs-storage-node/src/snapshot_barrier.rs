@@ -323,12 +323,15 @@ impl BarrierCollector {
     }
 
     /// Record a peer's response. Returns `true` if the response was
-    /// accepted (correct barrier_id, expected peer).
+    /// accepted (correct barrier_id, expected peer, not already recorded).
     pub fn record_response(&mut self, response: BarrierResponse) -> bool {
         if response.barrier_id != self.barrier_id {
             return false;
         }
         if !self.expected_peers.contains(&response.peer_id) {
+            return false;
+        }
+        if self.responses.contains_key(&response.peer_id) {
             return false;
         }
         self.responses.insert(response.peer_id, response);
@@ -789,6 +792,22 @@ mod tests {
     }
 
     #[test]
+    fn collector_rejects_duplicate_peer_response() {
+        let mut c = BarrierCollector::new(1, "snap".into(), vec![10, 20], make_config());
+        assert!(c.record_response(make_response(10, 1, 100, 5, 10)));
+        assert!(!c.record_response(make_response(10, 1, 200, 5, 99)));
+        assert_eq!(c.responded_count(), 1);
+
+        match c.responses.get(&10) {
+            Some(response) => {
+                assert_eq!(response.committed_root_txg, 100);
+                assert_eq!(response.object_count, 10);
+            }
+            None => panic!("expected response from peer 10"),
+        }
+    }
+
+    #[test]
     fn collector_completes_with_all_responses() {
         let mut c = BarrierCollector::new(1, "snap".into(), vec![10, 20, 30], make_config());
         assert!(c.record_response(make_response(10, 1, 100, 5, 10)));
@@ -978,6 +997,70 @@ mod tests {
         };
         assert!(!coord.record_response(10, &resp_frame));
         assert_eq!(coord.responded_count(), 0);
+    }
+
+    #[test]
+    fn coordinator_rejects_unexpected_peer_response() {
+        let mut coord = SnapshotCoordinator::new(1, "snap".into(), vec![10], make_config());
+        let resp_frame = Frame::SnapshotBarrierResponse {
+            barrier_id: 1,
+            committed_root_txg: 100,
+            committed_root_generation: 5,
+            object_count: 10,
+        };
+        assert!(!coord.record_response(99, &resp_frame));
+        assert_eq!(coord.responded_count(), 0);
+
+        assert!(coord.record_response(10, &resp_frame));
+        assert_eq!(coord.responded_count(), 1);
+    }
+
+    #[test]
+    fn coordinator_rejects_duplicate_peer_response() {
+        let mut coord = SnapshotCoordinator::new(1, "snap".into(), vec![10, 20], make_config());
+        assert!(coord.record_response(
+            10,
+            &Frame::SnapshotBarrierResponse {
+                barrier_id: 1,
+                committed_root_txg: 100,
+                committed_root_generation: 5,
+                object_count: 10,
+            },
+        ));
+        assert!(!coord.record_response(
+            10,
+            &Frame::SnapshotBarrierResponse {
+                barrier_id: 1,
+                committed_root_txg: 200,
+                committed_root_generation: 5,
+                object_count: 99,
+            },
+        ));
+        assert_eq!(coord.responded_count(), 1);
+
+        assert!(coord.record_response(
+            20,
+            &Frame::SnapshotBarrierResponse {
+                barrier_id: 1,
+                committed_root_txg: 100,
+                committed_root_generation: 5,
+                object_count: 20,
+            },
+        ));
+
+        match coord.outcome() {
+            Some(BarrierOutcome::Consistent {
+                min_txg,
+                max_txg,
+                total_objects,
+                ..
+            }) => {
+                assert_eq!(min_txg, 100);
+                assert_eq!(max_txg, 100);
+                assert_eq!(total_objects, 30);
+            }
+            other => panic!("expected Consistent, got {other:?}"),
+        }
     }
 
     #[test]
