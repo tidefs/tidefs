@@ -4049,6 +4049,16 @@ fn live_snapshot_send_plan(
         LiveSnapshotSendMode::Full
     };
     let destination = live_snapshot_send_destination(args)?;
+    if matches!(
+        destination,
+        LiveSnapshotSendDestination::TargetAddress { .. }
+    ) && format != LiveSnapshotSendFormat::Vfssend2
+    {
+        return Err(format!(
+            "snapshot send: target-address sends require format 'vfssend2' for storage-node VSNP import; got '{}'",
+            format.label()
+        ));
+    }
 
     Ok(LiveSnapshotSendPlan {
         destination,
@@ -7881,6 +7891,42 @@ mod tests {
     }
 
     #[test]
+    fn live_snapshot_send_rejects_vfssend1_target_address_before_exporting() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = root.path().join("store");
+        let mut fs = LocalFileSystem::open(&store).expect("open fs");
+        fs.create_file("/live.txt", 0o644).expect("create file");
+        fs.write_file("/live.txt", 0, b"live owner snapshot send")
+            .expect("write file");
+        let engine = VfsLocalFileSystem::new(fs);
+        let output = root.path().join("target-vfssend1.vfs");
+
+        let refused = live_snapshot_admin(
+            &engine,
+            "send",
+            json!({
+                "output": output.display().to_string(),
+                "target_addr": "127.0.0.1:9000",
+                "format": "vfssend1",
+                "incremental": false,
+            }),
+            true,
+        );
+
+        assert_eq!(refused["ok"], false, "target response: {refused}");
+        assert_eq!(refused["exit_code"], 1);
+        assert!(refused["json"].is_null());
+        assert!(refused["text"].is_null());
+        assert!(
+            refused["error"]
+                .as_str()
+                .is_some_and(|err| { err.contains("target-address") && err.contains("vfssend2") }),
+            "target response should explain VFSSEND2 target-address requirement: {refused}"
+        );
+        assert!(!output.exists());
+    }
+
+    #[test]
     fn live_snapshot_send_returns_connection_error_when_target_unreachable() {
         let root = tempfile::tempdir().expect("tempdir");
         let store = root.path().join("store");
@@ -7897,7 +7943,7 @@ mod tests {
             json!({
                 "output": output.display().to_string(),
                 "target_addr": "127.0.0.1:9000",
-                "format": "vfssend1",
+                "format": "vfssend2",
                 "incremental": false,
             }),
             true,
@@ -7959,8 +8005,10 @@ mod tests {
             let export_end = export_start + export_len;
             assert_eq!(frame.len(), export_end);
 
-            let decoded = crate::ChangedRecordExport::decode(&frame[export_start..export_end])
-                .expect("decode pushed export");
+            let decoded = crate::vfssend2_bridge::receive_vfssend2_to_changed_records(
+                &frame[export_start..export_end],
+            )
+            .expect("decode pushed export");
             assert!(!decoded.incremental);
             assert!(decoded.total_records > 0);
             assert!(decoded.payload_bytes > 0);
@@ -7977,7 +8025,7 @@ mod tests {
             json!({
                 "output": output.display().to_string(),
                 "target_addr": target_addr.clone(),
-                "format": "vfssend1",
+                "format": "vfssend2",
                 "incremental": false,
             }),
             true,
@@ -7986,12 +8034,13 @@ mod tests {
         assert_eq!(sent["ok"], true, "send response: {sent}");
         assert_eq!(sent["json"]["target_addr"], target_addr);
         assert_eq!(sent["json"]["remote_response"], "received");
-        assert_eq!(sent["json"]["format"], "vfssend1");
+        assert_eq!(sent["json"]["format"], "vfssend2");
         assert_eq!(sent["json"]["incremental"], false);
         assert!(sent["json"]["bytes"].as_u64().unwrap_or(0) > 0);
 
         let encoded = std::fs::read(&output).expect("read acked output");
-        let decoded = crate::ChangedRecordExport::decode(&encoded).expect("decode acked output");
+        let decoded = crate::vfssend2_bridge::receive_vfssend2_to_changed_records(&encoded)
+            .expect("decode acked output");
         assert!(!decoded.incremental);
         assert!(decoded.total_records > 0);
         assert!(decoded.payload_bytes > 0);
@@ -8043,7 +8092,7 @@ mod tests {
             json!({
                 "output": output.display().to_string(),
                 "target_addr": target_addr,
-                "format": "vfssend1",
+                "format": "vfssend2",
                 "incremental": false,
             }),
             true,
