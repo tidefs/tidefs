@@ -7384,6 +7384,25 @@ impl FuseVfsAdapter {
             return;
         }
 
+        let Ok(written_len) = usize::try_from(written) else {
+            tracing::warn!(
+                %ino,
+                %offset,
+                %written,
+                "clean write-through accepted byte count does not fit in memory slice length"
+            );
+            return;
+        };
+        let Some(written_data) = written_data.get(..written_len) else {
+            tracing::warn!(
+                %ino,
+                %offset,
+                %written,
+                provided_len = written_data.len(),
+                "clean write-through accepted byte count exceeds provided request data"
+            );
+            return;
+        };
         let length = u64::from(written);
         // This path runs inside the kernel's FUSE WRITE request.  In
         // writeback-cache mode the kernel can still hold the written page
@@ -43081,7 +43100,7 @@ mod tests {
     }
 
     #[test]
-    fn writeback_cached_clean_write_through_helper_patches_resident_clean_mirror() {
+    fn writeback_cached_clean_write_through_helper_patches_accepted_bytes_only() {
         let fixture = adapter_fixture_with_writeback_cache();
         let ctx = root_ctx();
         let (inode, _adapter_fh, _engine_fh) = create_adapter_file_handle(
@@ -43113,13 +43132,15 @@ mod tests {
             .data_cache_generation_snapshot(ino, 1024, 512);
 
         let replacement = vec![0xC4; 512];
+        let accepted_len = 256;
         fixture.adapter.record_clean_write_through_after_write(
             ino,
             1024,
-            replacement.len() as u32,
+            accepted_len,
             &replacement,
         );
-        expected[1024..1024 + replacement.len()].copy_from_slice(&replacement);
+        expected[1024..1024 + accepted_len as usize]
+            .copy_from_slice(&replacement[..accepted_len as usize]);
 
         assert!(
             !fixture
