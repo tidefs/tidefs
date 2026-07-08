@@ -270,6 +270,17 @@ EOF
       analyze_qemu_log "$test_dir/missing-metrics.log" 0
       expect_parser_verdict missing-metrics BLOCKED missing_required_metrics 2
 
+      cat > "$test_dir/invalid-metrics.log" <<'EOF'
+PASS: insmod
+PASS: mount
+PASS: no_daemon
+write_throughput_MBps=nan
+read_throughput_MBps=0
+stat_avg_latency_us=-1
+EOF
+      analyze_qemu_log "$test_dir/invalid-metrics.log" 0
+      expect_parser_verdict invalid-metrics BLOCKED missing_required_metrics 2
+
       cat > "$test_dir/fail-row.log" <<'EOF'
 PASS: insmod
 PASS: mount
