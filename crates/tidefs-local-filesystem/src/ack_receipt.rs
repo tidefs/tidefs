@@ -266,6 +266,8 @@ impl LocalAckReceipt {
             target,
             payload_or_replay_digest,
         );
+        let receipt_id = receipt_id(sequence, operation, target, payload_or_replay_digest);
+        let refusal = refusal(sequence, receipt_id, StorageIntentRefusalReason::None);
         let evidence_refs = evidence_refs(&[
             local_intent_record_ref,
             ordering_ref,
@@ -275,9 +277,10 @@ impl LocalAckReceipt {
             dirty_window_ref,
             rollout_ref,
             tenant_isolation_ref,
+            refusal.evidence,
         ]);
         let receipt = StorageIntentReceipt {
-            receipt_id: receipt_id(sequence, operation, target, payload_or_replay_digest),
+            receipt_id,
             policy_id: LOCAL_ACK_POLICY_ID,
             policy_revision: LOCAL_ACK_POLICY_REVISION,
             ack_class: StorageIntentGuaranteeClass::LocalIntent,
@@ -314,11 +317,7 @@ impl LocalAckReceipt {
             replacement_receipt: StorageIntentReceiptId::ZERO,
             retires_receipt: StorageIntentReceiptId::ZERO,
             old_receipt_retired: false,
-            refusal: refusal(
-                sequence,
-                receipt.receipt_id,
-                StorageIntentRefusalReason::None,
-            ),
+            refusal,
             disposition: LocalAckReceiptDisposition::DurablePosix,
         }
     }
@@ -349,6 +348,7 @@ impl LocalAckReceipt {
         let dirty_window_ref = receipt.dirty_window_ref;
         let rollout_ref = receipt.rollout_ref;
         let tenant_isolation_ref = receipt.tenant_isolation_ref;
+        let result_refusal_ref = receipt.refusal.evidence;
         receipt.receipt.ack_class = StorageIntentGuaranteeClass::FullPlacement;
         receipt.receipt.durability = DurabilityReceiptState {
             state: DurabilityState::FullPlacement,
@@ -367,6 +367,7 @@ impl LocalAckReceipt {
             dirty_window_ref,
             rollout_ref,
             tenant_isolation_ref,
+            result_refusal_ref,
         ]);
         receipt.requested_ack_floor = StorageIntentGuaranteeClass::LocalIntent;
         receipt.placement_ref = placement_ref;
@@ -394,6 +395,8 @@ impl LocalAckReceipt {
         let mut evidence_refs = StorageIntentEvidenceRefs::EMPTY;
         let _ = evidence_refs.push(flush_fence_ref);
         let receipt_id = receipt_id(sequence, operation, target, payload_or_replay_digest);
+        let refusal = refusal(sequence, receipt_id, reason);
+        let _ = evidence_refs.push(refusal.evidence);
         let receipt = StorageIntentReceipt {
             receipt_id,
             policy_id: LOCAL_ACK_POLICY_ID,
@@ -432,7 +435,7 @@ impl LocalAckReceipt {
             replacement_receipt: StorageIntentReceiptId::ZERO,
             retires_receipt: StorageIntentReceiptId::ZERO,
             old_receipt_retired: false,
-            refusal: refusal(sequence, receipt_id, reason),
+            refusal,
             disposition: LocalAckReceiptDisposition::WeakerUnsafeVolatile,
         }
     }
@@ -450,6 +453,19 @@ impl LocalAckReceipt {
         let attempted = Self::durable_intent(sequence, operation, target, None);
         let mut receipt = attempted.receipt;
         receipt.ack_class = earned_ack_class;
+        let refusal = refusal(sequence, receipt.receipt_id, reason);
+        receipt.evidence_refs = evidence_refs(&[
+            attempted.local_intent_record_ref,
+            attempted.ordering_ref,
+            attempted.flush_fence_ref,
+            attempted.media_capability_ref,
+            attempted.placement_ref,
+            attempted.reserve_ref,
+            attempted.dirty_window_ref,
+            attempted.rollout_ref,
+            attempted.tenant_isolation_ref,
+            refusal.evidence,
+        ]);
         if !matches!(
             earned_ack_class,
             StorageIntentGuaranteeClass::LocalIntent
@@ -484,7 +500,7 @@ impl LocalAckReceipt {
             replacement_receipt: StorageIntentReceiptId::ZERO,
             retires_receipt: StorageIntentReceiptId::ZERO,
             old_receipt_retired: false,
-            refusal: refusal(sequence, receipt.receipt_id, reason),
+            refusal,
             disposition: LocalAckReceiptDisposition::Refused,
         }
     }
@@ -526,6 +542,10 @@ impl LocalAckReceipt {
     fn has_local_ack_result_projection(self) -> bool {
         self.refusal.attempted_receipt == self.receipt.receipt_id
             && self.refusal.evidence.is_bound()
+            && self
+                .receipt
+                .evidence_refs
+                .contains_ref(self.refusal.evidence)
     }
 
     fn has_no_receipt_retirement_projection(self) -> bool {
@@ -1314,6 +1334,32 @@ mod tests {
             StorageIntentRefusalReason::None
         );
         assert!(!unbound_evidence.satisfies_requested_ack_floor());
+    }
+
+    #[test]
+    fn requested_floor_receipt_fails_closed_without_result_evidence_ref() {
+        let mut missing_result_ref = LocalAckReceipt::full_local_placement(
+            27,
+            LocalAckOperation::Syncfs,
+            LocalAckReceiptTarget::FILESYSTEM,
+            None,
+        );
+        assert!(missing_result_ref.satisfies_requested_ack_floor());
+        missing_result_ref.refusal.evidence = evidence_ref(
+            StorageIntentEvidenceKind::ResultRefusalEvidence,
+            "unlinked-result-refusal",
+            2400,
+            LocalAckOperation::Syncfs,
+            LocalAckReceiptTarget::FILESYSTEM,
+            None,
+        );
+
+        assert!(missing_result_ref.is_posix_durable_success());
+        assert_eq!(
+            missing_result_ref.refusal_reason(),
+            StorageIntentRefusalReason::None
+        );
+        assert!(!missing_result_ref.satisfies_requested_ack_floor());
     }
 
     #[test]
