@@ -109,6 +109,9 @@ analyze_qemu_log() {
   WTP=$(first_log_value "$log_file" "write_throughput_MBps")
   RTP=$(first_log_value "$log_file" "read_throughput_MBps")
   SU=$(first_log_value "$log_file" "stat_avg_us")
+  if [ -z "$SU" ]; then
+    SU=$(first_log_value "$log_file" "stat_avg_latency_us")
+  fi
 
   WD="${WD:-0}"
   RD="${RD:-0}"
@@ -266,6 +269,17 @@ PASS: no_daemon
 EOF
   analyze_qemu_log "$test_dir/pass.log" 0
   expect_parser_verdict pass-log PASS complete 0
+
+  cat > "$test_dir/stat-latency-alias.log" <<'EOF'
+PASS: insmod
+PASS: mount
+PASS: no_daemon
+write_throughput_MBps=10.00
+read_throughput_MBps=20.00
+stat_avg_latency_us=30
+EOF
+  analyze_qemu_log "$test_dir/stat-latency-alias.log" 0
+  expect_parser_verdict stat-latency-alias PASS complete 0
 
   echo "parser self-test: ok"
 }

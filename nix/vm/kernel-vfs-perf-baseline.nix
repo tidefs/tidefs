@@ -155,6 +155,9 @@ MANIFEST
       WRITE_TP=$(first_log_value "$log_file" "write_throughput_MBps")
       READ_TP=$(first_log_value "$log_file" "read_throughput_MBps")
       STAT_LAT=$(first_log_value "$log_file" "stat_avg_latency_us")
+      if [ -z "$STAT_LAT" ]; then
+        STAT_LAT=$(first_log_value "$log_file" "stat_avg_us")
+      fi
 
       WRITE_TP_VAL="''${WRITE_TP:-0}"
       READ_TP_VAL="''${READ_TP:-0}"
@@ -313,6 +316,17 @@ PASS: no_daemon
 EOF
       analyze_qemu_log "$test_dir/pass.log" 0
       expect_parser_verdict pass-log PASS complete 0
+
+      cat > "$test_dir/stat-short-alias.log" <<'EOF'
+PASS: insmod
+PASS: mount
+PASS: no_daemon
+write_throughput_MBps=10.00
+read_throughput_MBps=20.00
+stat_avg_us=30
+EOF
+      analyze_qemu_log "$test_dir/stat-short-alias.log" 0
+      expect_parser_verdict stat-short-alias PASS complete 0
 
       echo "parser self-test: ok"
     }
