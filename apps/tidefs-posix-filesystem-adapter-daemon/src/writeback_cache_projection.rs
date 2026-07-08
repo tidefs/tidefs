@@ -209,7 +209,7 @@ impl WritebackProjection {
     /// Record that `ino` has transitioned to Clean after a successful
     /// fsync, flush, commit-group, or storage-commit barrier.
     pub fn record_clean(&self, ino: u64) {
-        let prev = self.lanes.lock().unwrap().insert(ino, WritebackLane::Clean);
+        let prev = self.lanes.lock().unwrap().remove(&ino);
         if prev.is_some_and(|p| p.is_dirty_or_writeback()) {
             self.stats.clean_transitions.fetch_add(1, Ordering::Relaxed);
         }
@@ -421,16 +421,27 @@ mod tests {
         p.record_dirty(42, 4096);
         p.record_clean(42);
         assert!(!p.is_dirty_or_writeback(42));
-        assert_eq!(p.lane(42), Some(WritebackLane::Clean));
+        assert_eq!(p.lane(42), None);
         assert_eq!(p.stats_snapshot().clean_transitions, 1);
     }
 
     #[test]
-    fn clean_to_clean_no_transition_counted() {
+    fn untracked_clean_no_transition_counted() {
         let p = new_projection();
         p.record_clean(42); // no prior dirty state
-        assert_eq!(p.lane(42), Some(WritebackLane::Clean));
+        assert_eq!(p.lane(42), None);
         assert_eq!(p.stats_snapshot().clean_transitions, 0);
+    }
+
+    #[test]
+    fn writeback_pending_clean_removes_lane() {
+        let p = new_projection();
+        p.record_dirty(42, 4096);
+        p.record_writeback_pending(42, 4096);
+        p.record_clean(42);
+        assert_eq!(p.lane(42), None);
+        assert_eq!(p.stats_snapshot().clean_transitions, 1);
+        assert!(p.invalidation_allowed(42));
     }
 
     #[test]
