@@ -671,19 +671,19 @@ pub fn process_barrier_request(
     barrier_id: u64,
     store: &mut dyn BarrierStore,
     barrier_state: &BarrierState,
-) -> Frame {
+) -> Result<Frame, String> {
     // Sync before capturing stats so the response reflects durable state.
-    let _ = store.sync_all();
+    store.sync_all()?;
     let generation = barrier_state.next_generation();
     barrier_state.set_last_barrier_id(barrier_id);
     let txg = store.committed_root_txg();
 
-    Frame::SnapshotBarrierResponse {
+    Ok(Frame::SnapshotBarrierResponse {
         barrier_id,
         committed_root_txg: txg,
         committed_root_generation: generation,
         object_count: store.object_count(),
-    }
+    })
 }
 
 // Tests
@@ -1129,6 +1129,7 @@ mod tests {
         committed_root_txg: u64,
         committed_root_generation: u64,
         sync_called: bool,
+        sync_error: Option<String>,
     }
 
     impl MockStore {
@@ -1138,13 +1139,22 @@ mod tests {
                 committed_root_txg: txg,
                 committed_root_generation: gen,
                 sync_called: false,
+                sync_error: None,
             }
+        }
+
+        fn with_sync_error(mut self, message: &str) -> Self {
+            self.sync_error = Some(message.to_string());
+            self
         }
     }
 
     impl BarrierStore for MockStore {
         fn sync_all(&mut self) -> Result<(), String> {
             self.sync_called = true;
+            if let Some(message) = &self.sync_error {
+                return Err(message.clone());
+            }
             Ok(())
         }
         fn object_count(&self) -> u64 {
@@ -1196,7 +1206,7 @@ mod tests {
     fn process_barrier_request_syncs_and_returns_response() {
         let mut store = MockStore::new(100, 42, 5);
         let state = BarrierState::new();
-        let response = process_barrier_request(7, &mut store, &state);
+        let response = process_barrier_request(7, &mut store, &state).expect("barrier response");
         assert!(store.sync_called);
         match response {
             Frame::SnapshotBarrierResponse {
@@ -1218,11 +1228,11 @@ mod tests {
     fn process_barrier_request_increments_generation() {
         let mut store = MockStore::new(0, 0, 0);
         let state = BarrierState::new();
-        process_barrier_request(1, &mut store, &state);
+        process_barrier_request(1, &mut store, &state).expect("barrier response");
         assert_eq!(state.current_generation(), 1);
-        process_barrier_request(2, &mut store, &state);
+        process_barrier_request(2, &mut store, &state).expect("barrier response");
         assert_eq!(state.current_generation(), 2);
-        process_barrier_request(3, &mut store, &state);
+        process_barrier_request(3, &mut store, &state).expect("barrier response");
         assert_eq!(state.current_generation(), 3);
     }
 
@@ -1230,7 +1240,7 @@ mod tests {
     fn process_barrier_request_uses_store_txg() {
         let mut store = MockStore::new(50, 999, 0);
         let state = BarrierState::new();
-        let response = process_barrier_request(1, &mut store, &state);
+        let response = process_barrier_request(1, &mut store, &state).expect("barrier response");
         match response {
             Frame::SnapshotBarrierResponse {
                 committed_root_txg, ..
@@ -1245,7 +1255,7 @@ mod tests {
     fn process_barrier_request_zero_txg_ok() {
         let mut store = MockStore::new(10, 0, 0);
         let state = BarrierState::new();
-        let response = process_barrier_request(0, &mut store, &state);
+        let response = process_barrier_request(0, &mut store, &state).expect("barrier response");
         match response {
             Frame::SnapshotBarrierResponse {
                 barrier_id,
@@ -1260,6 +1270,19 @@ mod tests {
             }
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    #[test]
+    fn process_barrier_request_does_not_advance_state_on_sync_error() {
+        let mut store = MockStore::new(10, 42, 5).with_sync_error("sync failed");
+        let state = BarrierState::new();
+
+        let err = process_barrier_request(9, &mut store, &state).expect_err("sync error");
+
+        assert_eq!(err, "sync failed");
+        assert!(store.sync_called);
+        assert_eq!(state.current_generation(), 0);
+        assert_eq!(state.last_barrier_id(), 0);
     }
 
     #[test]

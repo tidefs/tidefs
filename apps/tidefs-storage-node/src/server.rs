@@ -5753,26 +5753,37 @@ fn handle_frame_ctx(
         } => {
             let _snap_name = snapshot_name.clone();
             let mut s = store.lock().unwrap();
-            let (committed_root_txg, committed_root_generation, object_count) = match &mut *s {
-                StoreBackend::Local(rs) => {
-                    let _ = rs.sync_all();
-                    let txg = rs.committed_root_txg();
-                    let gen = rs.committed_root_generation();
-                    let count = rs.stats().object_count;
-                    (txg, gen, count)
-                }
-                StoreBackend::TransportBacked(ts) => {
-                    let _ = ts.sync_all();
-                    let txg = ts.committed_root_txg();
-                    let gen = ts.committed_root_generation();
-                    let count = ts.stats().object_count;
-                    (txg, gen, count)
-                }
-                StoreBackend::PoolBacked(pool) => {
-                    let _ = pool.sync_all();
-                    let count = pool.pool_stats().object_count;
-                    (0, 0, count)
-                }
+            let barrier_result = match &mut *s {
+                StoreBackend::Local(rs) => match rs.sync_all() {
+                    Ok(()) => {
+                        let txg = rs.committed_root_txg();
+                        let gen = rs.committed_root_generation();
+                        let count = rs.stats().object_count;
+                        Ok((txg, gen, count))
+                    }
+                    Err(message) => Err(format!("snapshot barrier sync failed: {message}")),
+                },
+                StoreBackend::TransportBacked(ts) => match ts.sync_all() {
+                    Ok(()) => {
+                        let txg = ts.committed_root_txg();
+                        let gen = ts.committed_root_generation();
+                        let count = ts.stats().object_count;
+                        Ok((txg, gen, count))
+                    }
+                    Err(message) => Err(format!("snapshot barrier sync failed: {message}")),
+                },
+                StoreBackend::PoolBacked(pool) => match pool.sync_all() {
+                    Ok(()) => {
+                        let count = pool.pool_stats().object_count;
+                        Ok((0, 0, count))
+                    }
+                    Err(err) => Err(format!("snapshot barrier sync failed: {err}")),
+                },
+            };
+            let (committed_root_txg, committed_root_generation, object_count) = match barrier_result
+            {
+                Ok(barrier_result) => barrier_result,
+                Err(message) => return Some(Frame::Error { message }),
             };
             Some(Frame::SnapshotBarrierResponse {
                 barrier_id: *barrier_id,
