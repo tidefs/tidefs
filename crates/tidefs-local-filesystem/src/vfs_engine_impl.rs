@@ -6751,6 +6751,15 @@ mod tests {
         ack
     }
 
+    fn snap_net_error(message: &[u8]) -> Vec<u8> {
+        let mut error = Vec::new();
+        error.extend_from_slice(SNAP_NET_MAGIC);
+        error.push(SNAP_KIND_ERROR);
+        error.extend_from_slice(&(message.len() as u32).to_le_bytes());
+        error.extend_from_slice(message);
+        error
+    }
+
     fn accept_snapshot_transport_session(server: &mut Transport) -> SessionId {
         for _ in 0..200 {
             match server.accept_incoming() {
@@ -7986,6 +7995,66 @@ mod tests {
         assert!(!decoded.incremental);
         assert!(decoded.total_records > 0);
         assert!(decoded.payload_bytes > 0);
+
+        server_handle.join().expect("server thread");
+    }
+
+    #[test]
+    fn live_snapshot_send_snap_net_target_address_surfaces_remote_error_without_output() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = root.path().join("store");
+        let mut fs = LocalFileSystem::open(&store).expect("open fs");
+        fs.create_file("/live.txt", 0o644).expect("create file");
+        fs.write_file("/live.txt", 0, b"live owner snapshot send")
+            .expect("write file");
+        let engine = VfsLocalFileSystem::new(fs);
+        let output = root.path().join("target-error.vfs");
+
+        let mut server = Transport::new(2);
+        server
+            .bind(TransportAddr::Tcp(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                0,
+            )))
+            .expect("bind");
+        let target_addr = match server.bind_addr.as_ref().expect("bind_addr") {
+            TransportAddr::Tcp(addr) => addr.to_string(),
+            _ => unreachable!("test binds TCP transport"),
+        };
+
+        let server_handle = thread::spawn(move || {
+            let session_id = accept_snapshot_transport_session(&mut server);
+            server.perform_handshake(session_id).expect("handshake");
+            let frame = server.recv_message(session_id).expect("recv push frame");
+
+            assert!(frame.len() >= SNAP_NET_PUSH_HEADER_LEN);
+            assert_eq!(&frame[0..4], SNAP_NET_MAGIC);
+            assert_eq!(frame[4], SNAP_KIND_PUSH);
+
+            server
+                .send_message(session_id, &snap_net_error(b"denied"))
+                .expect("send remote error");
+            let _ = server.close_session(session_id, SessionCloseReason::LocalShutdown);
+        });
+
+        let refused = live_snapshot_admin(
+            &engine,
+            "send",
+            json!({
+                "output": output.display().to_string(),
+                "target_addr": target_addr,
+                "format": "vfssend1",
+                "incremental": false,
+            }),
+            true,
+        );
+
+        assert_eq!(refused["ok"], false, "send response: {refused}");
+        assert_eq!(refused["exit_code"], 1);
+        assert!(refused["json"].is_null());
+        assert!(refused["text"].is_null());
+        assert_eq!(refused["error"], "snapshot send: remote error: denied");
+        assert!(!output.exists());
 
         server_handle.join().expect("server thread");
     }
