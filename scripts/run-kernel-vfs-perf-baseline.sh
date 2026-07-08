@@ -728,7 +728,7 @@ kernel_img=$KERNEL_IMG
 module_ko=$MODULE_KO
 qemu_bin=$QEMU_BIN
 qemu_accel=$QEMU_ACCEL
-kvm_available=$(test -e /dev/kvm && echo true || echo false)
+kvm_available=$([ "$QEMU_ACCEL" = kvm ] && echo true || echo false)
 ENVEOF
 
 # ---- Run QEMU --------------------------------------------------------
