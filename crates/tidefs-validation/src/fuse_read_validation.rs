@@ -22,8 +22,8 @@ use std::os::unix::fs::FileExt;
 
 #[cfg(test)]
 /// Create a mount harness for tests that claim mounted read-path behavior.
-fn mount_for_read_validation() -> MountHarness {
-    MountHarness::new_or_fail("fuse_read_validation mounted read-path test")
+fn mount_for_read_validation(test_name: &str) -> MountHarness {
+    MountHarness::new_or_fail(test_name)
 }
 
 #[cfg(test)]
@@ -54,7 +54,7 @@ mod tests {
     #[test]
     #[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
     fn basic_readback_verify_byte_for_byte() {
-        let h = mount_for_read_validation();
+        let h = mount_for_read_validation("basic_readback_verify_byte_for_byte");
 
         let data = make_test_data(4096);
         h.create_file("basic.bin", &data).expect("create basic.bin");
@@ -65,7 +65,7 @@ mod tests {
     #[test]
     #[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
     fn basic_readback_single_byte() {
-        let h = mount_for_read_validation();
+        let h = mount_for_read_validation("basic_readback_single_byte");
 
         h.create_file("one.bin", b"X").expect("create");
         let got = h.read_file("one.bin").expect("read");
@@ -75,7 +75,7 @@ mod tests {
     #[test]
     #[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
     fn basic_readback_empty_file() {
-        let h = mount_for_read_validation();
+        let h = mount_for_read_validation("basic_readback_empty_file");
 
         h.create_file("empty.bin", b"").expect("create");
         let got = h.read_file("empty.bin").expect("read");
@@ -93,7 +93,7 @@ mod tests {
     #[test]
     #[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
     fn multichunk_128kib_read_full() {
-        let h = mount_for_read_validation();
+        let h = mount_for_read_validation("multichunk_128kib_read_full");
 
         let data = make_test_data(128 * 1024);
         h.create_file("big.bin", &data).expect("create");
@@ -104,7 +104,7 @@ mod tests {
     #[test]
     #[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
     fn multichunk_128kib_read_in_4kib_chunks() {
-        let h = mount_for_read_validation();
+        let h = mount_for_read_validation("multichunk_128kib_read_in_4kib_chunks");
 
         let data = make_test_data(128 * 1024);
         h.create_file("big.bin", &data).expect("create");
@@ -132,7 +132,7 @@ mod tests {
     #[test]
     #[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
     fn multichunk_unaligned_read_512b() {
-        let h = mount_for_read_validation();
+        let h = mount_for_read_validation("multichunk_unaligned_read_512b");
 
         // Start with an unaligned offset and read small chunks.
         let data = make_test_data(16384);
@@ -168,7 +168,7 @@ mod tests {
     #[test]
     #[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
     fn pread_offset_start() {
-        let h = mount_for_read_validation();
+        let h = mount_for_read_validation("pread_offset_start");
 
         let data = make_test_data(8192);
         h.create_file("pread.bin", &data).expect("create");
@@ -184,7 +184,7 @@ mod tests {
     #[test]
     #[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
     fn pread_offset_middle() {
-        let h = mount_for_read_validation();
+        let h = mount_for_read_validation("pread_offset_middle");
 
         let data = make_test_data(8192);
         h.create_file("pread.bin", &data).expect("create");
@@ -204,7 +204,7 @@ mod tests {
     #[test]
     #[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
     fn pread_offset_last_byte() {
-        let h = mount_for_read_validation();
+        let h = mount_for_read_validation("pread_offset_last_byte");
 
         let data = make_test_data(4096);
         h.create_file("last.bin", &data).expect("create");
@@ -226,7 +226,7 @@ mod tests {
     #[test]
     #[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
     fn sparse_file_hole_reads_as_zero() {
-        let h = mount_for_read_validation();
+        let h = mount_for_read_validation("sparse_file_hole_reads_as_zero");
 
         let path = h.mount_path().join("sparse.bin");
 
@@ -258,7 +258,7 @@ mod tests {
     #[test]
     #[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
     fn sparse_file_data_after_hole_is_preserved() {
-        let h = mount_for_read_validation();
+        let h = mount_for_read_validation("sparse_file_data_after_hole_is_preserved");
 
         let path = h.mount_path().join("sparse2.bin");
 
@@ -288,7 +288,7 @@ mod tests {
     #[test]
     #[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
     fn read_beyond_eof_returns_zero_bytes() {
-        let h = mount_for_read_validation();
+        let h = mount_for_read_validation("read_beyond_eof_returns_zero_bytes");
 
         let data = b"hello";
         h.create_file("short.bin", data).expect("create");
@@ -306,7 +306,7 @@ mod tests {
     #[test]
     #[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
     fn read_partially_beyond_eof_short_read() {
-        let h = mount_for_read_validation();
+        let h = mount_for_read_validation("read_partially_beyond_eof_short_read");
 
         let data = b"abcdefghij"; // 10 bytes
         h.create_file("ten.bin", data).expect("create");
@@ -324,7 +324,7 @@ mod tests {
     #[test]
     #[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
     fn read_at_exact_eof_returns_zero() {
-        let h = mount_for_read_validation();
+        let h = mount_for_read_validation("read_at_exact_eof_returns_zero");
 
         h.create_file("exact.bin", b"1234").expect("create");
 
@@ -343,7 +343,7 @@ mod tests {
     #[test]
     #[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
     fn concurrent_reads_same_file_consistent() {
-        let h = mount_for_read_validation();
+        let h = mount_for_read_validation("concurrent_reads_same_file_consistent");
 
         let data = make_test_data(65536);
         h.create_file("shared.bin", &data).expect("create");
@@ -371,7 +371,7 @@ mod tests {
     #[test]
     #[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
     fn concurrent_reads_different_offsets() {
-        let h = mount_for_read_validation();
+        let h = mount_for_read_validation("concurrent_reads_different_offsets");
 
         let data = make_test_data(16384);
         h.create_file("multi.bin", &data).expect("create");
@@ -410,7 +410,7 @@ mod tests {
     #[test]
     #[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
     fn read_after_unlink_other_file_preserves_data() {
-        let h = mount_for_read_validation();
+        let h = mount_for_read_validation("read_after_unlink_other_file_preserves_data");
 
         let data_a = make_test_data(2048);
         let data_b = make_test_data(1024);
@@ -433,7 +433,7 @@ mod tests {
     #[test]
     #[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
     fn read_unchanged_after_write_to_other_file() {
-        let h = mount_for_read_validation();
+        let h = mount_for_read_validation("read_unchanged_after_write_to_other_file");
 
         let data_a = make_test_data(1024);
         h.create_file("a.bin", &data_a).expect("create a.bin");
@@ -475,7 +475,7 @@ mod tests {
                 panic!(
                     "{}",
                     MountHarness::runtime_refusal_message(
-                        "fuse_read_validation dedup sparse read test",
+                        "sparse_file_with_duplicate_data_preserves_holes_and_data",
                         e
                     )
                 )
