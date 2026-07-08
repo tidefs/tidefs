@@ -103,11 +103,12 @@ write_blocked_manifest() {
   "log_empty": true,
   "required_metrics_present": false,
   "metrics": {
-    "write_duration_ms": "0",
-    "read_duration_ms": "0",
+    "write_duration_s": "0",
     "write_throughput_MBps": "0",
+    "read_duration_s": "0",
     "read_throughput_MBps": "0",
-    "stat_avg_us": "0"
+    "stat_avg_latency_us": "0",
+    "stat_total_duration_s": "0"
   },
   "pass": 0,
   "fail": 0,
@@ -117,7 +118,7 @@ write_blocked_manifest() {
   "worktree_dirty": $(git_dirty_json_bool),
   "module_source": "configured external module path",
   "status": "BLOCKED",
-  "result": $(json_string "kernel VFS perf baseline BLOCKED: $reason")
+  "result": $(json_string "kernel VFS throughput latency baseline BLOCKED: $reason")
 }
 MANIFEST
 
@@ -133,20 +134,22 @@ analyze_qemu_log() {
   BLOCKED_COUNT=$(count_log_prefix "$log_file" "BLOCKED:")
   SKIP_COUNT=$(count_log_prefix "$log_file" "SKIP:")
 
-  WD=$(first_log_value "$log_file" "write_duration_ms")
-  RD=$(first_log_value "$log_file" "read_duration_ms")
-  WTP=$(first_log_value "$log_file" "write_throughput_MBps")
-  RTP=$(first_log_value "$log_file" "read_throughput_MBps")
-  SU=$(first_log_value "$log_file" "stat_avg_us")
-  if [ -z "$SU" ]; then
-    SU=$(first_log_value "$log_file" "stat_avg_latency_us")
+  WRITE_DURATION=$(first_log_value "$log_file" "write_duration_s")
+  WRITE_TP=$(first_log_value "$log_file" "write_throughput_MBps")
+  READ_DURATION=$(first_log_value "$log_file" "read_duration_s")
+  READ_TP=$(first_log_value "$log_file" "read_throughput_MBps")
+  STAT_LAT=$(first_log_value "$log_file" "stat_avg_latency_us")
+  if [ -z "$STAT_LAT" ]; then
+    STAT_LAT=$(first_log_value "$log_file" "stat_avg_us")
   fi
+  STAT_TOTAL_DURATION=$(first_log_value "$log_file" "stat_total_duration_s")
 
-  WD="${WD:-0}"
-  RD="${RD:-0}"
-  WTP="${WTP:-0}"
-  RTP="${RTP:-0}"
-  SU="${SU:-0}"
+  WRITE_DURATION_VAL="${WRITE_DURATION:-0}"
+  WRITE_TP_VAL="${WRITE_TP:-0}"
+  READ_DURATION_VAL="${READ_DURATION:-0}"
+  READ_TP_VAL="${READ_TP:-0}"
+  STAT_LAT_VAL="${STAT_LAT:-0}"
+  STAT_TOTAL_DURATION_VAL="${STAT_TOTAL_DURATION:-0}"
 
   QEMU_SUCCESS=false
   QEMU_TIMED_OUT=false
@@ -162,7 +165,9 @@ analyze_qemu_log() {
   fi
   [ ! -s "$log_file" ] && LOG_EMPTY=true
 
-  if is_positive_number "$WTP" && is_positive_number "$RTP" && is_positive_number "$SU"; then
+  if is_positive_number "$WRITE_TP_VAL" &&
+     is_positive_number "$READ_TP_VAL" &&
+     is_positive_number "$STAT_LAT_VAL"; then
     REQUIRED_METRICS_PRESENT=true
   fi
 
@@ -217,11 +222,11 @@ expect_parser_metrics() {
   local want_read_tp="$3"
   local want_stat_us="$4"
 
-  if [ "$WTP" != "$want_write_tp" ] ||
-     [ "$RTP" != "$want_read_tp" ] ||
-     [ "$SU" != "$want_stat_us" ] ||
+  if [ "$WRITE_TP_VAL" != "$want_write_tp" ] ||
+     [ "$READ_TP_VAL" != "$want_read_tp" ] ||
+     [ "$STAT_LAT_VAL" != "$want_stat_us" ] ||
      [ "$REQUIRED_METRICS_PRESENT" != true ]; then
-    echo "parser self-test failed for $name: got write=$WTP read=$RTP stat=$SU required=$REQUIRED_METRICS_PRESENT" >&2
+    echo "parser self-test failed for $name: got write=$WRITE_TP_VAL read=$READ_TP_VAL stat=$STAT_LAT_VAL required=$REQUIRED_METRICS_PRESENT" >&2
     echo "expected write=$want_write_tp read=$want_read_tp stat=$want_stat_us required=true" >&2
     exit 1
   fi
@@ -233,11 +238,26 @@ expect_parser_metric_values() {
   local want_read_tp="$3"
   local want_stat_us="$4"
 
-  if [ "$WTP" != "$want_write_tp" ] ||
-     [ "$RTP" != "$want_read_tp" ] ||
-     [ "$SU" != "$want_stat_us" ]; then
-    echo "parser self-test failed for $name: got write=$WTP read=$RTP stat=$SU" >&2
+  if [ "$WRITE_TP_VAL" != "$want_write_tp" ] ||
+     [ "$READ_TP_VAL" != "$want_read_tp" ] ||
+     [ "$STAT_LAT_VAL" != "$want_stat_us" ]; then
+    echo "parser self-test failed for $name: got write=$WRITE_TP_VAL read=$READ_TP_VAL stat=$STAT_LAT_VAL" >&2
     echo "expected write=$want_write_tp read=$want_read_tp stat=$want_stat_us" >&2
+    exit 1
+  fi
+}
+
+expect_parser_durations() {
+  local name="$1"
+  local want_write_duration="$2"
+  local want_read_duration="$3"
+  local want_stat_duration="$4"
+
+  if [ "$WRITE_DURATION_VAL" != "$want_write_duration" ] ||
+     [ "$READ_DURATION_VAL" != "$want_read_duration" ] ||
+     [ "$STAT_TOTAL_DURATION_VAL" != "$want_stat_duration" ]; then
+    echo "parser self-test failed for $name: got write_duration=$WRITE_DURATION_VAL read_duration=$READ_DURATION_VAL stat_duration=$STAT_TOTAL_DURATION_VAL" >&2
+    echo "expected write_duration=$want_write_duration read_duration=$want_read_duration stat_duration=$want_stat_duration" >&2
     exit 1
   fi
 }
@@ -319,7 +339,7 @@ PASS: mount
 PASS: no_daemon
 write_throughput_MBps=10.00
 read_throughput_MBps=20.00
-stat_avg_us=30
+stat_avg_latency_us=30
 EOF
   analyze_qemu_log "$test_dir/timeout-complete-log.log" 137
   expect_parser_verdict timeout-complete-log BLOCKED qemu_timeout 2
@@ -332,7 +352,7 @@ PASS: mount
 PASS: no_daemon
 write_throughput_MBps=10.00
 read_throughput_MBps=20.00
-stat_avg_us=30
+stat_avg_latency_us=30
 EOF
   analyze_qemu_log "$test_dir/qemu-exit-nonzero.log" 1
   expect_parser_verdict qemu-exit-nonzero BLOCKED qemu_exit_1 2
@@ -342,7 +362,7 @@ EOF
   cat > "$test_dir/zero-pass.log" <<'EOF'
 write_throughput_MBps=10.00
 read_throughput_MBps=20.00
-stat_avg_us=30
+stat_avg_latency_us=30
 EOF
   analyze_qemu_log "$test_dir/zero-pass.log" 0
   expect_parser_verdict zero-pass BLOCKED zero_pass_rows 2
@@ -365,7 +385,7 @@ PASS: mount
 PASS: no_daemon
 write_throughput_MBps=nan
 read_throughput_MBps=0
-stat_avg_us=-1
+stat_avg_latency_us=-1
 EOF
   analyze_qemu_log "$test_dir/invalid-metrics.log" 0
   expect_parser_verdict invalid-metrics BLOCKED missing_required_metrics 2
@@ -379,7 +399,7 @@ PASS: mount
 PASS: no_daemon
 write_throughput_MBps=10.00=trailing
 read_throughput_MBps=20.00=trailing
-stat_avg_us=30=trailing
+stat_avg_latency_us=30=trailing
 EOF
   analyze_qemu_log "$test_dir/value-delimiter-metrics.log" 0
   expect_parser_verdict value-delimiter-metrics BLOCKED missing_required_metrics 2
@@ -393,7 +413,7 @@ PASS: mount
 FAIL: stat latency regression
 write_throughput_MBps=10.00
 read_throughput_MBps=20.00
-stat_avg_us=30
+stat_avg_latency_us=30
 EOF
   analyze_qemu_log "$test_dir/fail-row.log" 0
   expect_parser_verdict fail-row FAIL fail_rows 1
@@ -408,7 +428,7 @@ EOF
   SKIP: optional cache warmup unavailable
   write_throughput_MBps = 10.00
   read_throughput_MBps = 20.00
-  stat_avg_us = 30
+  stat_avg_latency_us = 30
 EOF
   analyze_qemu_log "$test_dir/indented-rows.log" 0
   expect_parser_verdict indented-rows FAIL fail_rows 1
@@ -422,7 +442,7 @@ PASS: mount
 BLOCKED: missing kernel tracepoint
 write_throughput_MBps=10.00
 read_throughput_MBps=20.00
-stat_avg_us=30
+stat_avg_latency_us=30
 EOF
   analyze_qemu_log "$test_dir/blocked-row.log" 0
   expect_parser_verdict blocked-row BLOCKED blocked_rows 2
@@ -433,13 +453,17 @@ EOF
 PASS: insmod
 PASS: mount
 PASS: no_daemon
+  write_duration_s = 0.125
   write_throughput_MBps = 10.00
+  read_duration_s = 0.250
   read_throughput_MBps = 20.00
-  stat_avg_us = 30
+  stat_avg_latency_us = 30
+  stat_total_duration_s = 0.003
 EOF
   analyze_qemu_log "$test_dir/pass.log" 0
   expect_parser_verdict pass-log PASS complete 0
   expect_parser_metrics pass-log 10.00 20.00 30
+  expect_parser_durations pass-log 0.125 0.250 0.003
   expect_parser_counts pass-log 3 0 0 0
   expect_parser_state pass-log true false false true
 
@@ -449,7 +473,7 @@ PASS: mount
 SKIP: optional cache warmup unavailable
 write_throughput_MBps=10.00
 read_throughput_MBps=20.00
-stat_avg_us=30
+stat_avg_latency_us=30
 EOF
   analyze_qemu_log "$test_dir/skip-row.log" 0
   expect_parser_verdict skip-row PASS complete 0
@@ -457,19 +481,19 @@ EOF
   expect_parser_counts skip-row 2 0 0 1
   expect_parser_state skip-row true false false true
 
-  cat > "$test_dir/stat-latency-alias.log" <<'EOF'
+  cat > "$test_dir/stat-short-alias.log" <<'EOF'
 PASS: insmod
 PASS: mount
 PASS: no_daemon
 write_throughput_MBps=10.00
 read_throughput_MBps=20.00
-stat_avg_latency_us=30
+stat_avg_us=30
 EOF
-  analyze_qemu_log "$test_dir/stat-latency-alias.log" 0
-  expect_parser_verdict stat-latency-alias PASS complete 0
-  expect_parser_metrics stat-latency-alias 10.00 20.00 30
-  expect_parser_counts stat-latency-alias 3 0 0 0
-  expect_parser_state stat-latency-alias true false false true
+  analyze_qemu_log "$test_dir/stat-short-alias.log" 0
+  expect_parser_verdict stat-short-alias PASS complete 0
+  expect_parser_metrics stat-short-alias 10.00 20.00 30
+  expect_parser_counts stat-short-alias 3 0 0 0
+  expect_parser_state stat-short-alias true false false true
 
   echo "parser self-test: ok"
 }
@@ -645,16 +669,16 @@ if [ "$M" -eq 1 ]; then
   done
   sync
   E=$(date +%s%N 2>/dev/null || echo 0)
+  write_duration_s=0; write_throughput_mbps=0
   if [ "$S" -gt 0 ] && [ "$E" -gt 0 ]; then
-    DMS=$(( (E - S) / 1000000 ))
-    DUS=$(( (E - S) / 1000 ))
-    echo "write_duration_ms=$DMS"
-    echo "write_duration_us=$DUS"
-    if [ "$DMS" -gt 0 ]; then
-      TP=$(awk "BEGIN {printf \"%.2f\", 1.0 / ($DMS / 1000.0)}" 2>/dev/null || echo "0")
-      echo "write_throughput_MBps=$TP"
+    duration_ns=$((E - S))
+    write_duration_s=$(awk "BEGIN {printf \"%.3f\", $duration_ns / 1000000000}" 2>/dev/null || echo "0")
+    if [ "$duration_ns" -gt 0 ]; then
+      write_throughput_mbps=$(awk "BEGIN {printf \"%.2f\", 1000000000 / $duration_ns}" 2>/dev/null || echo "0")
     fi
   fi
+  echo "write_duration_s=$write_duration_s"
+  echo "write_throughput_MBps=$write_throughput_mbps"
   WS=$(stat -c %s "$MNT/pf" 2>/dev/null || echo 0)
   [ "$WS" -ge 1048576 ] && pass write_data || fail write_data "file_size=$WS"
 
@@ -663,16 +687,16 @@ if [ "$M" -eq 1 ]; then
   S=$(date +%s%N 2>/dev/null || echo 0)
   dd if="$MNT/pf" of=/dev/null bs=4096 count=256 2>/dev/null
   E=$(date +%s%N 2>/dev/null || echo 0)
+  read_duration_s=0; read_throughput_mbps=0
   if [ "$S" -gt 0 ] && [ "$E" -gt 0 ]; then
-    DMS=$(( (E - S) / 1000000 ))
-    DUS=$(( (E - S) / 1000 ))
-    echo "read_duration_ms=$DMS"
-    echo "read_duration_us=$DUS"
-    if [ "$DMS" -gt 0 ]; then
-      TP=$(awk "BEGIN {printf \"%.2f\", 1.0 / ($DMS / 1000.0)}" 2>/dev/null || echo "0")
-      echo "read_throughput_MBps=$TP"
+    duration_ns=$((E - S))
+    read_duration_s=$(awk "BEGIN {printf \"%.3f\", $duration_ns / 1000000000}" 2>/dev/null || echo "0")
+    if [ "$duration_ns" -gt 0 ]; then
+      read_throughput_mbps=$(awk "BEGIN {printf \"%.2f\", 1000000000 / $duration_ns}" 2>/dev/null || echo "0")
     fi
   fi
+  echo "read_duration_s=$read_duration_s"
+  echo "read_throughput_MBps=$read_throughput_mbps"
   pass read_data
 
   echo "--- Phase 4: Stat Latency (100 calls) ---"
@@ -680,10 +704,15 @@ if [ "$M" -eq 1 ]; then
   S=$(date +%s%N 2>/dev/null || echo 0)
   i=0; while [ $i -lt 100 ]; do stat "$MNT/pf" >/dev/null 2>&1; i=$((i+1)); done
   E=$(date +%s%N 2>/dev/null || echo 0)
+  stat_duration_s=0; avg_us=0
   if [ "$S" -gt 0 ] && [ "$E" -gt 0 ]; then
-    AVGUS=$(( (E - S) / 100000 ))
-    echo "stat_avg_us=$AVGUS"
+    duration_ns=$((E - S))
+    avg_ns=$((duration_ns / 100))
+    avg_us=$(awk "BEGIN {printf \"%.2f\", $avg_ns / 1000}" 2>/dev/null || echo "0")
+    stat_duration_s=$(awk "BEGIN {printf \"%.3f\", $duration_ns / 1000000000}" 2>/dev/null || echo "0")
   fi
+  echo "stat_avg_latency_us=$avg_us"
+  echo "stat_total_duration_s=$stat_duration_s"
   pass stat_latency
 fi
 
@@ -762,9 +791,9 @@ echo "  PASS:   $PASS_COUNT"
 echo "  FAIL:   $FAIL_COUNT"
 echo "  BLOCKED: $BLOCKED_COUNT"
 echo "  SKIP:   $SKIP_COUNT"
-echo "  Write:  ${WD}ms (${WTP} MB/s)"
-echo "  Read:   ${RD}ms (${RTP} MB/s)"
-echo "  Stat:   ${SU}us avg"
+echo "  Write:  ${WRITE_DURATION_VAL}s (${WRITE_TP_VAL} MB/s)"
+echo "  Read:   ${READ_DURATION_VAL}s (${READ_TP_VAL} MB/s)"
+echo "  Stat:   ${STAT_LAT_VAL}us avg (${STAT_TOTAL_DURATION_VAL}s total)"
 echo "  QEMU success: $QEMU_SUCCESS"
 echo "  Required metrics: $REQUIRED_METRICS_PRESENT"
 echo "  Verdict reason: $VERDICT_REASON"
@@ -784,11 +813,12 @@ cat > "$RUN_DIR_VALIDATION/validation-manifest.json" << MANIFEST
   "log_empty": $LOG_EMPTY,
   "required_metrics_present": $REQUIRED_METRICS_PRESENT,
   "metrics": {
-    "write_duration_ms": $(json_string "$WD"),
-    "read_duration_ms": $(json_string "$RD"),
-    "write_throughput_MBps": $(json_string "$WTP"),
-    "read_throughput_MBps": $(json_string "$RTP"),
-    "stat_avg_us": $(json_string "$SU")
+    "write_duration_s": $(json_string "$WRITE_DURATION_VAL"),
+    "write_throughput_MBps": $(json_string "$WRITE_TP_VAL"),
+    "read_duration_s": $(json_string "$READ_DURATION_VAL"),
+    "read_throughput_MBps": $(json_string "$READ_TP_VAL"),
+    "stat_avg_latency_us": $(json_string "$STAT_LAT_VAL"),
+    "stat_total_duration_s": $(json_string "$STAT_TOTAL_DURATION_VAL")
   },
   "pass": $PASS_COUNT,
   "fail": $FAIL_COUNT,
@@ -798,7 +828,7 @@ cat > "$RUN_DIR_VALIDATION/validation-manifest.json" << MANIFEST
   "worktree_dirty": $(git_dirty_json_bool),
   "module_source": "configured external module path",
   "status": $(json_string "$VERDICT_STATUS"),
-  "result": $(json_string "kernel VFS perf baseline $VERDICT_STATUS: $VERDICT_REASON; write=${WD}ms (${WTP}MB/s) read=${RD}ms (${RTP}MB/s) stat=${SU}us")
+  "result": $(json_string "kernel VFS throughput latency baseline $VERDICT_STATUS: $VERDICT_REASON; write $WRITE_TP_VAL MB/s, read $READ_TP_VAL MB/s, stat $STAT_LAT_VAL us avg latency")
 }
 MANIFEST
 
