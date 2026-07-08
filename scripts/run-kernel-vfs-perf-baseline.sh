@@ -72,6 +72,14 @@ git_dirty_json_bool() {
   fi
 }
 
+qemu_accel_value() {
+  if [ -e /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+    echo kvm
+  else
+    echo tcg
+  fi
+}
+
 write_blocked_manifest() {
   local reason="$1"
   local run_id
@@ -88,7 +96,7 @@ write_blocked_manifest() {
   "date": "$run_id",
   "mode": "bootstrap",
   "validation_tier": "Tier 5 mounted Linux 7.0 kernel VFS",
-  "qemu_accel": "$(test -e /dev/kvm && echo kvm || echo tcg)",
+  "qemu_accel": "$(qemu_accel_value)",
   "qemu_exit": null,
   "qemu_success": false,
   "qemu_timed_out": false,
@@ -566,8 +574,10 @@ fi
 
 # Check for KVM acceleration
 KVM_FLAG=""
+QEMU_ACCEL="tcg"
 if [ -e /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
   KVM_FLAG="-enable-kvm -cpu host"
+  QEMU_ACCEL="kvm"
   echo "  KVM:        enabled"
 else
   echo "  KVM:        not available (software emulation, expect slow boot)"
@@ -717,7 +727,7 @@ dirty=$(git_dirty_json_bool)
 kernel_img=$KERNEL_IMG
 module_ko=$MODULE_KO
 qemu_bin=$QEMU_BIN
-qemu_accel=$(test -e /dev/kvm && test -r /dev/kvm && echo kvm || echo tcg)
+qemu_accel=$QEMU_ACCEL
 kvm_available=$(test -e /dev/kvm && echo true || echo false)
 ENVEOF
 
@@ -767,7 +777,7 @@ cat > "$RUN_DIR_VALIDATION/validation-manifest.json" << MANIFEST
   "date": "$RUN_ID",
   "mode": "bootstrap",
   "validation_tier": "Tier 5 mounted Linux 7.0 kernel VFS",
-  "qemu_accel": "$(test -e /dev/kvm && echo kvm || echo tcg)",
+  "qemu_accel": "$QEMU_ACCEL",
   "qemu_exit": $QEMU_EXIT,
   "qemu_success": $QEMU_SUCCESS,
   "qemu_timed_out": $QEMU_TIMED_OUT,

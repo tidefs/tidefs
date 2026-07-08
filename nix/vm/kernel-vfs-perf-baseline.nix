@@ -27,6 +27,7 @@ let
 
     TMPDIR="''${TIDEFS_PERF_TMPDIR:-/tmp/tidefs-kmod-perf-baseline}"
     QEMU_MEM="''${TIDEFS_PERF_QEMU_MEM:-512M}"
+    QEMU_ACCEL="tcg"
     TIMEOUT_SEC=600
     SOURCE_DIR="''${TIDEFS_SOURCE_DIR:-}"
     if [ -z "$SOURCE_DIR" ]; then
@@ -137,6 +138,7 @@ EOF
   "date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
   "mode": "bootstrap",
   "validation_tier": "Tier 5 mounted Linux 7.0 kernel VFS",
+  "qemu_accel": "$QEMU_ACCEL",
   "qemu_exit": null,
   "qemu_success": false,
   "qemu_timed_out": false,
@@ -788,6 +790,7 @@ INITSCRIPT
   "date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
   "mode": "bootstrap",
   "validation_tier": "Tier 5 mounted Linux 7.0 kernel VFS",
+  "qemu_accel": "$QEMU_ACCEL",
   "qemu_exit": $QEMU_EXIT,
   "qemu_success": $QEMU_SUCCESS,
   "qemu_timed_out": $QEMU_TIMED_OUT,
