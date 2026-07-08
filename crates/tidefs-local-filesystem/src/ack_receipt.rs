@@ -615,7 +615,10 @@ impl LocalAckReceipt {
     }
 
     fn has_requested_ack_floor_evidence(self) -> bool {
-        if !local_ack_floor_has_evidence_surface(self.requested_ack_floor) {
+        if !local_ack_class_has_evidence_surface(self.requested_ack_floor) {
+            return false;
+        }
+        if !local_ack_class_has_evidence_surface(self.receipt.ack_class) {
             return false;
         }
 
@@ -707,11 +710,9 @@ impl LocalAckReceipt {
     }
 }
 
-const fn local_ack_floor_has_evidence_surface(
-    requested_ack_floor: StorageIntentGuaranteeClass,
-) -> bool {
+const fn local_ack_class_has_evidence_surface(ack_class: StorageIntentGuaranteeClass) -> bool {
     matches!(
-        requested_ack_floor,
+        ack_class,
         StorageIntentGuaranteeClass::VolatileLocal
             | StorageIntentGuaranteeClass::LocalIntent
             | StorageIntentGuaranteeClass::FullPlacement
@@ -1630,6 +1631,34 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_ack_label_fails_closed_with_local_requested_floor() {
+        let mut receipt = LocalAckReceipt::full_local_placement(
+            22,
+            LocalAckOperation::Fsync,
+            LocalAckReceiptTarget::inode(21),
+            None,
+        );
+        assert_eq!(
+            receipt.requested_ack_floor,
+            StorageIntentGuaranteeClass::LocalIntent
+        );
+        assert!(receipt.satisfies_requested_ack_floor());
+
+        receipt.receipt.ack_class = StorageIntentGuaranteeClass::GeoFullPlacement;
+
+        let shared_result = evaluate_receipt_against_policy(
+            local_ack_policy(StorageIntentGuaranteeClass::LocalIntent),
+            receipt.receipt,
+        );
+        assert!(shared_result.satisfied);
+        assert!(!local_ack_class_has_evidence_surface(
+            receipt.receipt.ack_class
+        ));
+        assert!(!receipt.has_requested_ack_floor_evidence());
+        assert!(!receipt.satisfies_requested_ack_floor());
+    }
+
+    #[test]
     fn requested_floor_receipt_fails_closed_for_mismatched_policy_identity() {
         const OTHER_POLICY_ID: StorageIntentPolicyId = StorageIntentPolicyId([0x42; 16]);
         const OTHER_POLICY_REVISION: StorageIntentPolicyRevision =
@@ -1967,7 +1996,7 @@ mod tests {
             receipt.receipt.ack_class = floor;
 
             assert!(receipt.is_posix_durable_success());
-            assert!(!local_ack_floor_has_evidence_surface(floor));
+            assert!(!local_ack_class_has_evidence_surface(floor));
             assert!(!receipt.satisfies_requested_ack_floor());
         }
     }
