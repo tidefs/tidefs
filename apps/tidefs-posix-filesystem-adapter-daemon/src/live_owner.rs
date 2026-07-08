@@ -185,7 +185,7 @@ fn handle_client(
             Ok(request) => dispatch_request(request, manifest, engine, shutdown),
             Err(err) => live_admin_malformed(format!("decode live-owner request: {err}")),
         },
-        Err(err) => LivePoolAdminResponse::error(2, format!("read live-owner request: {err}")),
+        Err(err) => live_admin_malformed(format!("read live-owner request: {err}")),
     };
 
     let mut stream = reader.into_inner();
