@@ -160,53 +160,7 @@ impl MountHarness {
     /// is initialised with a demo root authentication key so no environment
     /// setup is required.
     pub fn new() -> io::Result<Self> {
-        let daemon_bin = find_daemon_binary()?;
-        let work_dir = tempfile::TempDir::new()
-            .map_err(|e| io::Error::other(format!("create harness work dir: {e}")))?;
-
-        let store_path = work_dir.path().join("store");
-        let mount_path = work_dir.path().join("mnt");
-
-        fs::create_dir_all(&store_path).map_err(|e| {
-            io::Error::other(format!("create store dir {}: {e}", store_path.display()))
-        })?;
-        fs::create_dir_all(&mount_path).map_err(|e| {
-            io::Error::other(format!("create mount dir {}: {e}", mount_path.display()))
-        })?;
-
-        // Demo root authentication key avoids requiring env setup.
-        let root_auth_key_hex = "0000000000000000000000000000000000000000000000000000000000000001";
-
-        let child = Command::new(&daemon_bin)
-            .arg("mount-vfs")
-            .arg("--store")
-            .arg(&store_path)
-            .arg("--mount")
-            .arg(&mount_path)
-            .arg("--root-auth-key-hex")
-            .arg(root_auth_key_hex)
-            .spawn()
-            .map_err(|e| io::Error::other(format!("spawn daemon {}: {e}", daemon_bin.display())))?;
-
-        let daemon_pid = child.id();
-
-        // Wait for the mount point to become ready.  Polling with stat is
-        // more reliable across versions than parsing daemon stderr.
-        wait_for_mount(&mount_path, Duration::from_secs(10)).map_err(|e| {
-            kill_child(daemon_pid);
-            io::Error::other(format!(
-                "mount point {} did not become ready: {e}",
-                mount_path.display()
-            ))
-        })?;
-
-        Ok(Self {
-            work_dir,
-            store_path,
-            mount_path,
-            child,
-            daemon_pid,
-        })
+        Self::builder().build()
     }
 
     /// Format the mounted-runtime refusal emitted when the daemon, FUSE device,
