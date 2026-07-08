@@ -1162,6 +1162,14 @@ fn evaluate_claim_evidence(
                     ));
                     outcome = VerdictOutcome::Malformed;
                 }
+                let manifest_validation_tier = manifest.validation_tier.label();
+                if manifest_validation_tier != requirement.validation_tier {
+                    details.push(format!(
+                        "manifest validation_tier `{manifest_validation_tier}` does not match registry tier `{}`",
+                        requirement.validation_tier
+                    ));
+                    outcome = VerdictOutcome::Malformed;
+                }
                 if manifest.source_ref != config.source_ref {
                     details.push(format!(
                         "manifest source_ref `{}` does not match verdict source `{}`",
@@ -1708,6 +1716,37 @@ mod tests {
     }
 
     #[test]
+    fn release_readiness_manifest_validation_tier_mismatch_fails_closed() {
+        let fixture = Fixture::new();
+        fixture.write_rc_index(&fixture.source_ref, &fixture.source_sha, "full");
+        fixture.write_pass_manifest_with_validation_tier(
+            "storage.intent.successor_comparator.v1",
+            "cargo-unit",
+        );
+        fixture.write_claim_registry("validated");
+        fixture.write_non_claim_inputs();
+
+        let artifact = assemble_verdict(&fixture.config());
+
+        assert_eq!(
+            artifact.product_readiness_verdict,
+            ProductReadinessVerdict::NotReady
+        );
+        assert!(artifact
+            .claim_evidence
+            .iter()
+            .any(
+                |claim| claim.required_evidence.iter().any(|evidence| evidence.class
+                    == "claims-gate-review"
+                    && evidence.outcome == VerdictOutcome::Malformed
+                    && evidence
+                        .details
+                        .iter()
+                        .any(|detail| detail.contains("validation_tier")))
+            ));
+    }
+
+    #[test]
     fn release_readiness_stale_source_ref_fails_closed() {
         let fixture = Fixture::new();
         fixture.write_rc_index("refs/heads/other", &fixture.source_sha, "full");
@@ -1872,6 +1911,10 @@ generated_doc = "Fixture wording"
         }
 
         fn write_pass_manifest(&self, claim_id: &str) {
+            self.write_pass_manifest_with_validation_tier(claim_id, "source-model");
+        }
+
+        fn write_pass_manifest_with_validation_tier(&self, claim_id: &str, validation_tier: &str) {
             let artifact_path = self
                 .temp
                 .path()
@@ -1883,7 +1926,7 @@ generated_doc = "Fixture wording"
   "manifest_version": 2,
   "claim_id": "{claim_id}",
   "evidence_class": "claims-gate-review",
-  "validation_tier": "source-model",
+  "validation_tier": "{validation_tier}",
   "scope": "fixture",
   "artifact_path": "validation/artifacts/test/claims-gate-review.json",
   "content_digest": "{digest}",
