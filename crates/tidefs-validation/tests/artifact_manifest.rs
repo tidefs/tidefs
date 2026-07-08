@@ -109,6 +109,24 @@ fn is_manifest_path(path: &Path) -> bool {
         .is_some_and(|name| name.ends_with(".manifest.json"))
 }
 
+fn bytes_contain(bytes: &[u8], needle: &[u8]) -> bool {
+    bytes.windows(needle.len()).any(|window| window == needle)
+}
+
+fn normalize_json_unicode_slash_escapes(bytes: &[u8]) -> Vec<u8> {
+    let mut normalized = bytes.to_vec();
+    let mut offset = 0;
+    while let Some(relative_offset) = normalized[offset..]
+        .windows(br"\u002F".len())
+        .position(|window| window == br"\u002F")
+    {
+        let escape_offset = offset + relative_offset;
+        normalized[escape_offset + br"\u002".len()] = b'f';
+        offset = escape_offset + br"\u002F".len();
+    }
+    normalized
+}
+
 #[test]
 fn runtime_artifact_classifier_is_token_based() {
     assert!(is_runtime_artifact_path(Path::new(
@@ -175,6 +193,16 @@ fn committed_validation_artifacts_do_not_embed_scratch_paths() {
             r"\/root\/ai\/tmp\/tidefs-validation",
         ),
     ];
+    const JSON_UNICODE_SLASH_SCRATCH_PATH_NEEDLES: &[(&[u8], &str)] = &[
+        (
+            br"\u002ftmp\u002ftidefs-validation",
+            r"\u002ftmp\u002ftidefs-validation",
+        ),
+        (
+            br"\u002froot\u002fai\u002ftmp\u002ftidefs-validation",
+            r"\u002froot\u002fai\u002ftmp\u002ftidefs-validation",
+        ),
+    ];
 
     let repo_root = repo_root();
     let artifacts_root = repo_root.join("validation/artifacts");
@@ -191,7 +219,14 @@ fn committed_validation_artifacts_do_not_embed_scratch_paths() {
             )
         });
         for (needle, display) in SCRATCH_PATH_NEEDLES {
-            if bytes.windows(needle.len()).any(|window| window == *needle) {
+            if bytes_contain(&bytes, needle) {
+                let relative_path = repo_relative_path(repo_root, &path);
+                failures.push(format!("{relative_path} embeds scratch path `{display}`"));
+            }
+        }
+        let normalized_bytes = normalize_json_unicode_slash_escapes(&bytes);
+        for (needle, display) in JSON_UNICODE_SLASH_SCRATCH_PATH_NEEDLES {
+            if bytes_contain(&normalized_bytes, needle) {
                 let relative_path = repo_relative_path(repo_root, &path);
                 failures.push(format!("{relative_path} embeds scratch path `{display}`"));
             }

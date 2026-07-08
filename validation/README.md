@@ -29,7 +29,8 @@ evidence. Committed artifact payloads and manifests must not embed scratch-only
 paths such as `/tmp/tidefs-validation/...`,
 `/root/ai/tmp/tidefs-validation/...`, or their JSON-escaped slash forms unless
 a documented fixture exception explains why the literal path is the value under
-test.
+test. This includes both `\/` and case-insensitive `\u002f` slash escapes
+because they decode to the same scratch paths.
 
 ## Evidence Artifact Manifests
 
