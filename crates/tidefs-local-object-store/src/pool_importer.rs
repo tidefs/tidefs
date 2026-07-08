@@ -275,6 +275,20 @@ impl CandidatePool {
         };
 
         let owner_authorized = self.cluster_authorized_or_not_clustered();
+        let supported_action = matches!(
+            action,
+            PoolLifecycleAction::Scan | PoolLifecycleAction::Import | PoolLifecycleAction::Reopen
+        );
+
+        if !supported_action {
+            return PoolLifecycleEvidence::refused_with_authority(
+                PoolLifecycleAction::FailClosed,
+                context,
+                self.topology_complete,
+                owner_authorized,
+                "unsupported import lifecycle action",
+            );
+        }
 
         if self.topology_complete && owner_authorized {
             PoolLifecycleEvidence::executed(action, context)
@@ -972,6 +986,36 @@ mod tests {
         assert!(!evidence.owner_authorized);
         assert!(evidence.is_fail_closed());
         assert_eq!(evidence.reason, "cluster ownership authority missing");
+    }
+
+    #[test]
+    fn candidate_pool_lifecycle_evidence_refuses_unsupported_action() {
+        let pool = CandidatePool {
+            pool_guid: [0x3E; 16],
+            pool_name: "unsupported".into(),
+            pool_state: LabelPoolState::Exported,
+            devices: vec![],
+            topology_generation: 7,
+            device_count: 0,
+            recovery_commit_group: 48,
+            topology_complete: true,
+            cluster_authorized: false,
+        };
+
+        let evidence = pool.lifecycle_evidence(PoolLifecycleAction::Export);
+
+        assert_eq!(evidence.action, PoolLifecycleAction::FailClosed);
+        assert_eq!(evidence.outcome, PoolLifecycleOutcome::Refused);
+        assert_eq!(evidence.pool_guid, Some([0x3E; 16]));
+        assert_eq!(evidence.pool_name.as_deref(), Some("unsupported"));
+        assert_eq!(evidence.device_count, 0);
+        assert_eq!(evidence.expected_device_count, 0);
+        assert_eq!(evidence.topology_generation, 7);
+        assert_eq!(evidence.commit_group, 48);
+        assert!(evidence.topology_complete);
+        assert!(evidence.owner_authorized);
+        assert!(evidence.is_fail_closed());
+        assert!(evidence.reason.contains("unsupported"));
     }
 
     #[test]
