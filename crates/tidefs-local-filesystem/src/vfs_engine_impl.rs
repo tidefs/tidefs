@@ -4048,7 +4048,7 @@ fn live_snapshot_send_plan(
     ) && format != LiveSnapshotSendFormat::Vfssend2
     {
         return Err(format!(
-            "snapshot send: target-address sends require format 'vfssend2' for storage-node VSNP import; got '{}'",
+            "snapshot send: target-addr sends require format 'vfssend2' for storage-node VSNP import; got '{}'",
             format.label()
         ));
     }
@@ -4067,7 +4067,7 @@ fn live_snapshot_send_destination(args: &Value) -> Result<LiveSnapshotSendDestin
     match live_admin_optional_arg(args, "target_addr") {
         Some(target_addr) => {
             let addr = target_addr.parse().map_err(|err| {
-                format!("snapshot send: invalid target-address '{target_addr}': {err}")
+                format!("snapshot send: invalid target-addr '{target_addr}': {err}")
             })?;
             let node_id = args.get("node_id").and_then(Value::as_u64).unwrap_or(1);
             let server_node_id = args
@@ -4085,7 +4085,7 @@ fn live_snapshot_send_destination(args: &Value) -> Result<LiveSnapshotSendDestin
         None => output
             .map(LiveSnapshotSendDestination::Output)
             .ok_or_else(|| {
-                "snapshot send: --output or --target-address is required for live pools".to_string()
+                "snapshot send: --output or --target-addr is required for live pools".to_string()
             }),
     }
 }
@@ -7886,7 +7886,7 @@ mod tests {
     }
 
     #[test]
-    fn live_snapshot_send_requires_output_or_target_address() {
+    fn live_snapshot_send_requires_output_or_target_addr() {
         let root = tempfile::tempdir().expect("tempdir");
         let store = root.path().join("store");
         let mut fs = LocalFileSystem::open(&store).expect("open fs");
@@ -7911,12 +7911,12 @@ mod tests {
         assert!(refused["text"].is_null());
         assert_eq!(
             refused["error"],
-            "snapshot send: --output or --target-address is required for live pools"
+            "snapshot send: --output or --target-addr is required for live pools"
         );
     }
 
     #[test]
-    fn live_snapshot_send_rejects_vfssend1_target_address_before_exporting() {
+    fn live_snapshot_send_rejects_vfssend1_target_addr_before_exporting() {
         let root = tempfile::tempdir().expect("tempdir");
         let store = root.path().join("store");
         let mut fs = LocalFileSystem::open(&store).expect("open fs");
@@ -7945,14 +7945,14 @@ mod tests {
         assert!(
             refused["error"]
                 .as_str()
-                .is_some_and(|err| { err.contains("target-address") && err.contains("vfssend2") }),
-            "target response should explain VFSSEND2 target-address requirement: {refused}"
+                .is_some_and(|err| { err.contains("target-addr") && err.contains("vfssend2") }),
+            "target response should explain VFSSEND2 target-addr requirement: {refused}"
         );
         assert!(!output.exists());
     }
 
     #[test]
-    fn live_snapshot_send_rejects_invalid_target_address_before_exporting() {
+    fn live_snapshot_send_rejects_invalid_target_addr_before_exporting() {
         let root = tempfile::tempdir().expect("tempdir");
         let store = root.path().join("store");
         let mut fs = LocalFileSystem::open(&store).expect("open fs");
@@ -7981,8 +7981,8 @@ mod tests {
         assert!(
             refused["error"]
                 .as_str()
-                .is_some_and(|err| err.contains("invalid target-address")),
-            "target response should explain target-address parsing failure: {refused}"
+                .is_some_and(|err| err.contains("invalid target-addr")),
+            "target response should explain target-addr parsing failure: {refused}"
         );
         assert!(!output.exists());
     }
