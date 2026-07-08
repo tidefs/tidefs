@@ -7617,18 +7617,19 @@ impl FuseVfsAdapter {
             let copy_start = offset.max(poff);
             let copy_end = end.min(page_end);
             if copy_start < copy_end {
-                let page_present = cache.lookup(ino, poff).is_some();
-                if !page_present {
+                let Some(page) = cache.lookup(ino, poff) else {
                     poff = poff.saturating_add(page_size);
                     continue;
-                }
+                };
+                let page_was_dirty = page.is_dirty();
+                drop(page);
                 let dst_start = (copy_start - poff) as usize;
                 let dst_end = (copy_end - poff) as usize;
                 let mut authoritative = vec![0_u8; dst_end.saturating_sub(dst_start)];
                 payload.fill(offset, copy_start, &mut authoritative)?;
                 let page_fully_replaced = copy_start == poff && copy_end == page_end;
-                let page_should_remain_dirty =
-                    !page_fully_replaced && self.dirty_trackers_overlap_range(ino, poff, page_size);
+                let page_should_remain_dirty = !page_fully_replaced
+                    && (page_was_dirty || self.dirty_trackers_overlap_range(ino, poff, page_size));
                 if let Some(mut page) = cache.lookup(ino, poff) {
                     page.data_mut()[dst_start..dst_end].copy_from_slice(&authoritative);
                     if page_should_remain_dirty {
@@ -41970,6 +41971,44 @@ mod tests {
                 .is_dirty(ino),
             Some(true),
             "unrelated dirty ranges must keep the inode reclaim cache dirty"
+        );
+    }
+
+    #[test]
+    fn partial_authoritative_reconcile_preserves_dirty_mirror_without_tracker() {
+        let mut fixture = adapter_fixture();
+        fixture.adapter.writeback_page_cache = Some(Arc::new(PageCache::new(64, 4096)));
+        let ino = 654;
+        let wb_cache = fixture
+            .adapter
+            .writeback_page_cache
+            .as_ref()
+            .expect("writeback page cache")
+            .clone();
+        wb_cache.insert(ino, 0).expect("insert dirty mirror");
+        {
+            let mut page = wb_cache.lookup(ino, 0).expect("lookup dirty mirror");
+            page.data_mut().fill(0xAA);
+            page.mark_dirty();
+        }
+
+        fixture
+            .adapter
+            .reconcile_dirty_mirrors_for_authoritative_range(
+                ino,
+                1024,
+                512,
+                AuthoritativeRangePayload::Zeroes,
+            )
+            .expect("reconcile partial page");
+
+        let page = wb_cache.lookup(ino, 0).expect("lookup reconciled mirror");
+        assert_eq!(&page.data()[0..1024], &[0xAA_u8; 1024]);
+        assert_eq!(&page.data()[1024..1536], &[0_u8; 512]);
+        assert_eq!(&page.data()[1536..4096], &[0xAA_u8; 2560]);
+        assert!(
+            page.is_dirty(),
+            "partial authoritative reconciliation must not clear unrelated dirty bytes"
         );
     }
 
