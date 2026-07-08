@@ -73,9 +73,11 @@ EOF
     }
 
     first_log_value() {
-      awk -F= -v key="$2" '{
-        lhs = $1
-        rhs = $2
+      awk -v key="$2" '{
+        sep = index($0, "=")
+        if (sep == 0) next
+        lhs = substr($0, 1, sep - 1)
+        rhs = substr($0, sep + 1)
         sub(/^[[:space:]]+/, "", lhs)
         sub(/[[:space:]]+$/, "", lhs)
         sub(/^[[:space:]]+/, "", rhs)
@@ -259,6 +261,22 @@ MANIFEST
       fi
     }
 
+    expect_parser_metric_values() {
+      local name="$1"
+      local expected_write_tp="$2"
+      local expected_read_tp="$3"
+      local expected_stat_lat="$4"
+
+      if [ "$WRITE_TP_VAL" != "$expected_write_tp" ] ||
+         [ "$READ_TP_VAL" != "$expected_read_tp" ] ||
+         [ "$STAT_LAT_VAL" != "$expected_stat_lat" ]; then
+        echo "parser self-test failed: $name" >&2
+        echo "  expected metrics: write=$expected_write_tp read=$expected_read_tp stat=$expected_stat_lat" >&2
+        echo "  actual metrics:   write=$WRITE_TP_VAL read=$READ_TP_VAL stat=$STAT_LAT_VAL" >&2
+        exit 1
+      fi
+    }
+
     expect_parser_counts() {
       local name="$1"
       local expected_pass="$2"
@@ -388,8 +406,23 @@ stat_avg_latency_us=-1
 EOF
       analyze_qemu_log "$test_dir/invalid-metrics.log" 0
       expect_parser_verdict invalid-metrics BLOCKED missing_required_metrics 2
+      expect_parser_metric_values invalid-metrics nan 0 -1
       expect_parser_counts invalid-metrics 3 0 0 0
       expect_parser_state invalid-metrics true false false false
+
+      cat > "$test_dir/value-delimiter-metrics.log" <<'EOF'
+PASS: insmod
+PASS: mount
+PASS: no_daemon
+write_throughput_MBps=10.00=trailing
+read_throughput_MBps=20.00=trailing
+stat_avg_latency_us=30=trailing
+EOF
+      analyze_qemu_log "$test_dir/value-delimiter-metrics.log" 0
+      expect_parser_verdict value-delimiter-metrics BLOCKED missing_required_metrics 2
+      expect_parser_metric_values value-delimiter-metrics 10.00=trailing 20.00=trailing 30=trailing
+      expect_parser_counts value-delimiter-metrics 3 0 0 0
+      expect_parser_state value-delimiter-metrics true false false false
 
       cat > "$test_dir/fail-row.log" <<'EOF'
 PASS: insmod

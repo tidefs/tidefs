@@ -29,9 +29,11 @@ count_log_prefix() {
 }
 
 first_log_value() {
-  awk -F= -v key="$2" '{
-    lhs = $1
-    rhs = $2
+  awk -v key="$2" '{
+    sep = index($0, "=")
+    if (sep == 0) next
+    lhs = substr($0, 1, sep - 1)
+    rhs = substr($0, sep + 1)
     sub(/^[[:space:]]+/, "", lhs)
     sub(/[[:space:]]+$/, "", lhs)
     sub(/^[[:space:]]+/, "", rhs)
@@ -213,6 +215,21 @@ expect_parser_metrics() {
   fi
 }
 
+expect_parser_metric_values() {
+  local name="$1"
+  local want_write_tp="$2"
+  local want_read_tp="$3"
+  local want_stat_us="$4"
+
+  if [ "$WTP" != "$want_write_tp" ] ||
+     [ "$RTP" != "$want_read_tp" ] ||
+     [ "$SU" != "$want_stat_us" ]; then
+    echo "parser self-test failed for $name: got write=$WTP read=$RTP stat=$SU" >&2
+    echo "expected write=$want_write_tp read=$want_read_tp stat=$want_stat_us" >&2
+    exit 1
+  fi
+}
+
 expect_parser_counts() {
   local name="$1"
   local want_pass="$2"
@@ -340,8 +357,23 @@ stat_avg_us=-1
 EOF
   analyze_qemu_log "$test_dir/invalid-metrics.log" 0
   expect_parser_verdict invalid-metrics BLOCKED missing_required_metrics 2
+  expect_parser_metric_values invalid-metrics nan 0 -1
   expect_parser_counts invalid-metrics 3 0 0 0
   expect_parser_state invalid-metrics true false false false
+
+  cat > "$test_dir/value-delimiter-metrics.log" <<'EOF'
+PASS: insmod
+PASS: mount
+PASS: no_daemon
+write_throughput_MBps=10.00=trailing
+read_throughput_MBps=20.00=trailing
+stat_avg_us=30=trailing
+EOF
+  analyze_qemu_log "$test_dir/value-delimiter-metrics.log" 0
+  expect_parser_verdict value-delimiter-metrics BLOCKED missing_required_metrics 2
+  expect_parser_metric_values value-delimiter-metrics 10.00=trailing 20.00=trailing 30=trailing
+  expect_parser_counts value-delimiter-metrics 3 0 0 0
+  expect_parser_state value-delimiter-metrics true false false false
 
   cat > "$test_dir/fail-row.log" <<'EOF'
 PASS: insmod
