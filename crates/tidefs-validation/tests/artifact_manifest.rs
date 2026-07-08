@@ -186,6 +186,17 @@ fn runtime_artifact_manifest_paths_require_live_runtime_tier() {
     manifest
         .validate()
         .expect("runtime artifact path with live-runtime tier should pass");
+
+    manifest.artifact_path = "validation/artifacts/local-vfs/summary.json".to_string();
+    let error = manifest
+        .validate()
+        .expect_err("live-runtime tier with non-runtime artifact path should fail");
+    assert!(
+        error.failures().iter().any(|failure| failure
+            .contains("live-runtime validation_tier requires runtime artifact_path")),
+        "expected runtime artifact path failure, got {:?}",
+        error.failures()
+    );
 }
 
 #[test]
