@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
-//! Remount-persistence integration test for the FUSE RW persistence slice.
-//! Tests the advancement criterion: mount(RW) → write → sync → unmount →
-//! remount → read → verify bytes match exactly.  Uses the `MountHarness`
-//! infrastructure to spawn the posix-filesystem-adapter-daemon, perform IO
-//! through the FUSE mount, and remount the same backing store.
-//! This test proves that write data survives a clean unmount/remount cycle
-//! and is the gate for the `fuse-mount-rw-persistence` slice advancement.
+//! Remount-persistence mounted-runtime rows for the FUSE RW persistence slice.
+//! When run explicitly with daemon/FUSE substrate available, these tests
+//! exercise mount(RW) -> write -> sync -> unmount -> remount -> read ->
+//! byte-for-byte verification through `MountHarness`.
+//! Ordinary `cargo test` leaves these rows ignored, and missing mounted
+//! runtime substrate fails closed through the harness instead of producing
+//! product evidence.
 
 use tidefs_validation::mount_harness::MountHarness;
 
