@@ -148,7 +148,9 @@ impl PoolLifecycleEvidence {
     #[must_use]
     pub fn is_fail_closed(&self) -> bool {
         self.outcome == PoolLifecycleOutcome::Refused
-            && (!self.topology_complete || !self.owner_authorized)
+            && (self.action == PoolLifecycleAction::FailClosed
+                || !self.topology_complete
+                || !self.owner_authorized)
     }
 
     #[must_use]
@@ -241,5 +243,22 @@ mod tests {
         assert!(evidence.is_fail_closed());
         assert!(evidence.summary().contains("action=import"));
         assert!(evidence.summary().contains("missing owner token"));
+    }
+
+    #[test]
+    fn explicit_refused_fail_closed_action_is_fail_closed() {
+        let evidence = PoolLifecycleEvidence::refused_with_authority(
+            PoolLifecycleAction::FailClosed,
+            context(),
+            true,
+            true,
+            "unsupported lifecycle action",
+        );
+
+        assert_eq!(evidence.outcome, PoolLifecycleOutcome::Refused);
+        assert!(evidence.topology_complete);
+        assert!(evidence.owner_authorized);
+        assert!(evidence.is_fail_closed());
+        assert!(evidence.summary().contains("action=fail-closed"));
     }
 }

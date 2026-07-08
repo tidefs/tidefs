@@ -841,7 +841,7 @@ mod tests {
         assert_eq!(evidence.action, PoolLifecycleAction::FailClosed);
         assert!(evidence.topology_complete);
         assert!(evidence.owner_authorized);
-        assert!(!evidence.is_fail_closed());
+        assert!(evidence.is_fail_closed());
         assert!(evidence.reason.contains("unsupported"));
     }
 
