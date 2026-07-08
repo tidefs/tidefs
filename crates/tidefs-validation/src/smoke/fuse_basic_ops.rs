@@ -13,7 +13,7 @@ mod tests {
     /// Full basic-ops cycle: mkdir → create → write → read → unlink → rmdir
     /// → remount → verify directory is empty.
     ///
-    /// Advancement criteria 1, 3, 5:
+    /// Mounted basic-ops coverage:
     ///   - create/mkdir/rmdir/unlink complete successfully via real FUSE mount
     ///   - namespace mutations survive remount
     ///   - integration test validates the full basic-ops cycle

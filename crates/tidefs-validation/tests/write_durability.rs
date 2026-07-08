@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! FUSE write-durability integration test.
 //!
-//! Exercises advancement criteria 1-3 of the `fuse-write-durability` focus
-//! slice through a real read-write FUSE mount:
+//! Exercises the mounted write-durability coverage points through a real
+//! read-write FUSE mount:
 //!
 //! 1. write data and read it back in the same session (write-read coherence)
 //! 2. fsync flushes dirty writeback buffers to durable object-store storage
