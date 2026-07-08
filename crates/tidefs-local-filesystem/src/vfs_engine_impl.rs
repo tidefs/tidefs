@@ -4022,7 +4022,11 @@ fn parse_snap_net_response(data: &[u8]) -> Result<String, String> {
         .map_err(|err| format!("snapshot send: remote response message is not UTF-8: {err}"))?
         .to_string();
     match kind {
+        SNAP_KIND_ACK if message.is_empty() => Ok("ack".to_string()),
         SNAP_KIND_ACK => Ok(message),
+        SNAP_KIND_ERROR if message.is_empty() => {
+            Err("snapshot send: remote error without message".to_string())
+        }
         SNAP_KIND_ERROR => Err(format!("snapshot send: remote error: {message}")),
         other => Err(format!(
             "snapshot send: unknown remote response kind {other}: {message}"
@@ -6636,13 +6640,13 @@ mod tests {
     }
 
     #[test]
-    fn parse_snap_net_response_accepts_empty_ack() {
+    fn parse_snap_net_response_names_empty_ack() {
         let mut ack = Vec::new();
         ack.extend_from_slice(SNAP_NET_MAGIC);
         ack.push(SNAP_KIND_ACK);
         ack.extend_from_slice(&0u32.to_le_bytes());
 
-        assert_eq!(parse_snap_net_response(&ack), Ok(String::new()));
+        assert_eq!(parse_snap_net_response(&ack), Ok("ack".to_string()));
     }
 
     #[test]
@@ -6667,6 +6671,19 @@ mod tests {
         assert_eq!(
             parse_snap_net_response(&error),
             Err("snapshot send: remote error: denied".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_snap_net_response_names_empty_remote_error() {
+        let mut error = Vec::new();
+        error.extend_from_slice(SNAP_NET_MAGIC);
+        error.push(SNAP_KIND_ERROR);
+        error.extend_from_slice(&0u32.to_le_bytes());
+
+        assert_eq!(
+            parse_snap_net_response(&error),
+            Err("snapshot send: remote error without message".to_string())
         );
     }
 
