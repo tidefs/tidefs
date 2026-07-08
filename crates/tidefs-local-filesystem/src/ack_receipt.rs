@@ -1092,6 +1092,15 @@ mod tests {
         full_receipt.requested_ack_floor = StorageIntentGuaranteeClass::FullPlacement;
 
         assert!(local_receipt.is_posix_durable_success());
+        let local_result = evaluate_receipt_against_policy(
+            local_ack_policy(StorageIntentGuaranteeClass::FullPlacement),
+            local_receipt.receipt,
+        );
+        assert!(!local_result.satisfied);
+        assert_eq!(
+            local_result.refusal,
+            StorageIntentRefusalReason::GuaranteeFloorNotMet
+        );
         assert!(!local_receipt.satisfies_requested_ack_floor());
         assert!(full_receipt.satisfies_requested_ack_floor());
     }
