@@ -1047,6 +1047,47 @@ fn build_claim_evidence_class_receipt(
                 details: manifest_details.details,
             };
         }
+        if enforce_freshness {
+            return ClaimEvidenceClassReceipt {
+                class: class.to_string(),
+                status: EvidenceClassStatus::Missing,
+                artifact_path: requirement.path.clone(),
+                validation_tier,
+                blocking_issues,
+                manifest_path: None,
+                content_digest: None,
+                run_id: None,
+                source_ref: None,
+                outcome: None,
+                residual_risk: None,
+                source: None,
+                evidence_scope: None,
+                details: vec![format!(
+                    "claim `{}` validated evidence requirement for class `{class}` must set manifest_path",
+                    claim.id
+                )],
+            };
+        }
+    } else if enforce_freshness {
+        return ClaimEvidenceClassReceipt {
+            class: class.to_string(),
+            status: EvidenceClassStatus::Missing,
+            artifact_path,
+            validation_tier,
+            blocking_issues,
+            manifest_path: None,
+            content_digest: None,
+            run_id: None,
+            source_ref: None,
+            outcome: None,
+            residual_risk: None,
+            source: None,
+            evidence_scope: None,
+            details: vec![format!(
+                "claim `{}` validated evidence class `{class}` must register a manifest-backed evidence requirement",
+                claim.id
+            )],
+        };
     }
 
     if matching.is_empty() {
@@ -2828,6 +2869,19 @@ fn validate_registered_evidence_artifacts_for_claim(
                 failures.extend(manifest_details.details);
                 continue;
             }
+            if claim.status.is_validated() {
+                failures.push(format!(
+                    "claim `{}` validated evidence requirement for class `{class}` must set manifest_path",
+                    claim.id
+                ));
+                continue;
+            }
+        } else if claim.status.is_validated() {
+            failures.push(format!(
+                "claim `{}` validated evidence class `{class}` must register a manifest-backed evidence requirement",
+                claim.id
+            ));
+            continue;
         }
 
         let matching = claim
@@ -3875,13 +3929,13 @@ const UNGUARDED_COMMANDS: &[&str] = &[
         let registry_modified = artifact_modified + Duration::from_secs(1);
 
         let mut claim = ClaimRecord {
-            id: "example.validated.v1".to_string(),
-            status: ClaimStatus::Validated,
+            id: "example.blocked.v1".to_string(),
+            status: ClaimStatus::Blocked,
             scope: "test scope".to_string(),
             required_evidence_classes: vec!["runtime-artifact".to_string()],
             evidence_requirements: Vec::new(),
             blockers: Vec::new(),
-            generated_doc: "Validated fixture claim.".to_string(),
+            generated_doc: "Blocked fixture claim.".to_string(),
             evidence_artifacts: Vec::new(),
         };
         let missing = validate_claim_record(temp.path(), registry_modified, &claim);
@@ -3958,6 +4012,81 @@ const UNGUARDED_COMMANDS: &[&str] = &[
         assert!(summary.contains("run_id: fixture-run-810/1"));
         assert!(summary.contains(&format!("source_ref: {MANIFEST_FIXTURE_SOURCE_REF}")));
         assert!(summary.contains("residual_risk: Fixture proves manifest gate behavior only."));
+    }
+
+    #[test]
+    fn validate_claim_fails_closed_for_validated_requirement_without_manifest_path() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_artifact(temp.path(), "evidence/summary.txt", "legacy evidence body");
+        let mut claim = manifest_fixture_claim(
+            "example.manifest.validated.v1",
+            ClaimStatus::Validated,
+            Vec::new(),
+            Vec::new(),
+        );
+        claim.evidence_requirements[0].manifest_path = None;
+        claim.evidence_artifacts.push(ClaimEvidenceArtifact {
+            class: "cargo-fixture".to_string(),
+            path: "evidence/summary.txt".to_string(),
+            ..Default::default()
+        });
+
+        let receipt = build_claim_validation_receipt(temp.path(), SystemTime::UNIX_EPOCH, &claim);
+        assert_eq!(receipt.status, ClaimReceiptStatus::Fail);
+        let evidence = receipt
+            .required_evidence
+            .iter()
+            .find(|evidence| evidence.class == "cargo-fixture")
+            .expect("manifest-backed evidence receipt");
+        assert_eq!(evidence.status, EvidenceClassStatus::Missing);
+        assert_eq!(evidence.artifact_path, "evidence/summary.txt");
+        assert!(evidence.manifest_path.is_none());
+        assert!(evidence
+            .details
+            .iter()
+            .any(|detail| detail.contains("must set manifest_path")));
+
+        let failures = validate_claim_record(temp.path(), SystemTime::UNIX_EPOCH, &claim);
+        assert!(failures
+            .iter()
+            .any(|failure| failure.contains("must set manifest_path")));
+    }
+
+    #[test]
+    fn validate_claim_fails_closed_for_validated_required_class_without_requirement() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_artifact(temp.path(), "evidence/summary.txt", "legacy evidence body");
+        let mut claim = manifest_fixture_claim(
+            "example.manifest.validated.v1",
+            ClaimStatus::Validated,
+            Vec::new(),
+            Vec::new(),
+        );
+        claim.evidence_requirements.clear();
+        claim.evidence_artifacts.push(ClaimEvidenceArtifact {
+            class: "cargo-fixture".to_string(),
+            path: "evidence/summary.txt".to_string(),
+            ..Default::default()
+        });
+
+        let receipt = build_claim_validation_receipt(temp.path(), SystemTime::UNIX_EPOCH, &claim);
+        assert_eq!(receipt.status, ClaimReceiptStatus::Fail);
+        let evidence = receipt
+            .required_evidence
+            .iter()
+            .find(|evidence| evidence.class == "cargo-fixture")
+            .expect("required class receipt");
+        assert_eq!(evidence.status, EvidenceClassStatus::Missing);
+        assert_eq!(evidence.artifact_path, "evidence/summary.txt");
+        assert!(evidence.manifest_path.is_none());
+        assert!(evidence.details.iter().any(|detail| {
+            detail.contains("must register a manifest-backed evidence requirement")
+        }));
+
+        let failures = validate_claim_record(temp.path(), SystemTime::UNIX_EPOCH, &claim);
+        assert!(failures.iter().any(|failure| {
+            failure.contains("must register a manifest-backed evidence requirement")
+        }));
     }
 
     #[test]
@@ -4275,12 +4404,13 @@ const UNGUARDED_COMMANDS: &[&str] = &[
         let failures = validate_claim_record(temp.path(), SystemTime::UNIX_EPOCH, &claim);
         assert!(failures
             .iter()
-            .any(|failure| failure
-                .contains("missing evidence artifact for class `claims-gate-review`")));
+            .any(|failure| failure.contains(
+                "validated evidence class `claims-gate-review` must register a manifest-backed evidence requirement"
+            )));
     }
 
     #[test]
-    fn crash_review_artifact_rejects_malformed_or_stale_boundary() {
+    fn crash_review_artifact_rejects_malformed_or_legacy_boundary() {
         let temp = tempfile::tempdir().expect("tempdir");
         write_malformed_crash_review(temp.path());
         let claim = validated_crash_claim(
@@ -4302,23 +4432,18 @@ const UNGUARDED_COMMANDS: &[&str] = &[
             .any(|failure| failure.contains("model/runtime evidence boundary")));
 
         write_valid_crash_review(temp.path());
-        let artifact_path = temp.path().join(CRASH_CLAIMS_GATE_REVIEW_PATH);
-        let artifact_modified = fs::metadata(&artifact_path)
-            .and_then(|metadata| metadata.modified())
-            .expect("review mtime");
-        let stale_claim = validated_crash_claim(
+        let legacy_claim = validated_crash_claim(
             STORAGE_WRITE_FSYNC_CRASH_CLAIM_ID,
             vec![CLAIMS_GATE_REVIEW_EVIDENCE_CLASS.to_string()],
             vec![artifact],
         );
-        let stale = validate_claim_record(
-            temp.path(),
-            artifact_modified + Duration::from_secs(1),
-            &stale_claim,
-        );
-        assert!(stale
+        let legacy_failures =
+            validate_claim_record(temp.path(), SystemTime::UNIX_EPOCH, &legacy_claim);
+        assert!(legacy_failures
             .iter()
-            .any(|failure| failure.contains("stale evidence artifact")));
+            .any(|failure| failure.contains(
+                "validated evidence class `claims-gate-review` must register a manifest-backed evidence requirement"
+            )));
     }
 
     #[test]
