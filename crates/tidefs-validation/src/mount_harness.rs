@@ -1177,39 +1177,19 @@ mod tests {
 
     // ── remount persistence ─────────────────────────────────────────
     //
-    // These tests exercise the primary advancement gate for the
-    // `fuse-mount-rw-persistence` strategy slice:
+    // These ignored tests exercise mounted remount persistence when run
+    // explicitly with daemon, FUSE, and read-write mount substrate:
     //
     //   mount(RW) -> write -> sync -> unmount -> remount -> read -> verify
     //
-    // Prerequisites (tracked as separate Forgejo issues):
+    // Missing substrate is an explicit runtime refusal through
+    // `MountHarness::new_or_fail`, not a successful mounted product signal.
+    // Expected failure classes include:
     //
-    //   #3651  mount-vfs subcommand uses MountOption::RW by default
-    //     The daemon must spawn with a read-write FUSE mount.
-    //     The current mount-vfs subcommand already uses RW; if a
-    //     future build regresses to RO, writes will fail with a
-    //     permission-denied or read-only-fs error.
-    //
-    //   #3652  LocalFileSystem::Drop calls do_commit/sync_all
-    //     Without explicit commit on Drop, dirty writeback data
-    //     may not reach the object store before the daemon exits.
-    //     Remount reads will return zeros, stale content, or a
-    //     file-not-found error.
-    //
-    //     On remount the filesystem must reconstruct namespace,
-    //     inode metadata, and extent maps from the object store's
-    //     committed roots.  Without this the remount may not find
-    //     the previously written file at all.
-    //
-    // Expected failure modes (before all prerequisites land):
-    //
-    //   - mount fails: RO mount option (#3651)
-    //   - write succeeds, remount reads zeros or stale data (#3652)
-    //   - test harness fails to find daemon binary (build needed)
-    //
-    // Once all three prerequisites land, test_remount_persistence
-    // must pass 5/5 consecutive runs (matching the strategy
-    // advancement_criteria reliability requirement).
+    //   - daemon, FUSE, or read-write mount setup is unavailable
+    //   - write data reaches the first mount but remount reads zeros, stale
+    //     content, or a missing file because flush/reopen persistence is broken
+    //   - harness construction cannot find the daemon binary or build substrate
 
     /// Build a reproducible test buffer: `count` bytes of seeded
     /// pseudo-random data followed by a 16-byte checksum footer.
