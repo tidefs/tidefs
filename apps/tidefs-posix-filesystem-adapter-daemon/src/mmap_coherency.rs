@@ -29,6 +29,7 @@ pub struct MmapCoherencyStats {
     pub mmap_registrations: AtomicU64,
     pub mmap_deregistrations: AtomicU64,
     pub invalidations_received: AtomicU64,
+    pub dirty_invalidations_preserved: AtomicU64,
     pub pages_invalidated: AtomicU64,
     pub coherency_conflicts: AtomicU64,
 }
@@ -43,6 +44,9 @@ impl MmapCoherencyStats {
             mmap_registrations: self.mmap_registrations.load(Ordering::Relaxed),
             mmap_deregistrations: self.mmap_deregistrations.load(Ordering::Relaxed),
             invalidations_received: self.invalidations_received.load(Ordering::Relaxed),
+            dirty_invalidations_preserved: self
+                .dirty_invalidations_preserved
+                .load(Ordering::Relaxed),
             pages_invalidated: self.pages_invalidated.load(Ordering::Relaxed),
             coherency_conflicts: self.coherency_conflicts.load(Ordering::Relaxed),
         }
@@ -55,6 +59,7 @@ pub struct MmapCoherencyStatsSnapshot {
     pub mmap_registrations: u64,
     pub mmap_deregistrations: u64,
     pub invalidations_received: u64,
+    pub dirty_invalidations_preserved: u64,
     pub pages_invalidated: u64,
     pub coherency_conflicts: u64,
 }
@@ -211,6 +216,9 @@ impl InvalidationSink for MmapInvalidationSink<'_> {
             .as_ref()
             .is_some_and(|check| check(ino_u64));
         if is_dirty {
+            self.stats
+                .dirty_invalidations_preserved
+                .fetch_add(1, Ordering::Relaxed);
             return;
         }
 
@@ -290,6 +298,27 @@ mod tests {
         assert_eq!(s.invalidations_received, 1);
         assert_eq!(s.coherency_conflicts, 1);
         assert_eq!(s.pages_invalidated, 1);
+    }
+
+    #[test]
+    fn dirty_check_preserves_dirty_inode_invalidation_state() {
+        let c = new_coherency();
+        c.register(42, 1);
+        c.set_dirty_check(Some(Box::new(|ino| ino == 42)));
+
+        c.enqueue_batch(batch(42, 2));
+        assert_eq!(c.process_tick(10), 1);
+
+        let s = c.stats.snapshot();
+        assert_eq!(s.invalidations_received, 1);
+        assert_eq!(s.dirty_invalidations_preserved, 1);
+        assert_eq!(s.coherency_conflicts, 0);
+        assert_eq!(s.pages_invalidated, 0);
+
+        let regs = c.registrations.lock().unwrap();
+        let registration = regs.get(&42).expect("registered inode remains tracked");
+        assert!(registration.active);
+        assert_eq!(registration.generation, 1);
     }
 
     #[test]
