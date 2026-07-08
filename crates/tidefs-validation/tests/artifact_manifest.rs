@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use tidefs_validation::evidence_artifact_manifest::{
-    content_digest_for_bytes, parse_evidence_artifact_manifest_json, validate_artifact_path_shape,
-    EvidenceArtifactManifest, EVIDENCE_ARTIFACT_MANIFEST_VERSION,
+    content_digest_for_bytes, is_runtime_artifact_path, parse_evidence_artifact_manifest_json,
+    validate_artifact_path_shape, EvidenceArtifactManifest, EVIDENCE_ARTIFACT_MANIFEST_VERSION,
 };
 use tidefs_validation::validation_schema::ValidationTier;
 use tidefs_validation::validation_status::ValidationStatus;
@@ -107,27 +107,6 @@ fn is_manifest_path(path: &Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
         .is_some_and(|name| name.ends_with(".manifest.json"))
-}
-
-fn is_runtime_artifact_path(path: &Path) -> bool {
-    if is_manifest_path(path) {
-        return false;
-    }
-
-    let extension = path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-
-    matches!(extension.as_str(), "json" | "toml")
-        && path.components().any(|component| {
-            component.as_os_str().to_str().is_some_and(|component| {
-                component
-                    .split(|byte: char| !byte.is_ascii_alphanumeric())
-                    .any(|token| token.eq_ignore_ascii_case("runtime"))
-            })
-        })
 }
 
 #[test]

@@ -280,6 +280,33 @@ pub fn validate_artifact_path_shape(path: &str) -> Result<(), EvidenceArtifactMa
     EvidenceArtifactManifestError::from_failures(failures)
 }
 
+#[must_use]
+pub fn is_runtime_artifact_path(path: impl AsRef<Path>) -> bool {
+    let path = path.as_ref();
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    if file_name.ends_with(".manifest.json") {
+        return false;
+    }
+
+    let extension = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    matches!(extension.as_str(), "json" | "toml")
+        && path.components().any(|component| {
+            component.as_os_str().to_str().is_some_and(|component| {
+                component
+                    .split(|byte: char| !byte.is_ascii_alphanumeric())
+                    .any(|token| token.eq_ignore_ascii_case("runtime"))
+            })
+        })
+}
+
 fn validate_relative_artifact_path(path: &str, failures: &mut Vec<String>) {
     if path.trim().is_empty() {
         failures.push("artifact_path must not be empty".to_string());
