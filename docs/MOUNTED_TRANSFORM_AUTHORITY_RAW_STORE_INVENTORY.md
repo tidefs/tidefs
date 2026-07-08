@@ -64,7 +64,7 @@ Current `raw_primary_store()` and `raw_primary_store_mut()` matches:
 |---|---:|---|
 | `crates/tidefs-local-object-store/src/pool/mod.rs` | 9 | Pool accessors, pool-level accounting, and transform-pipeline `PoolStore` escape hatches. This is the lower object-store authority, not a mounted-filesystem proof. |
 | `crates/tidefs-local-filesystem/src/lib.rs` | 56 | Mounted production, recovery, reclaim, capacity, a scoped raw-store diagnostic projection, a pool-backed content-inspection diagnostic fallback, fail-closed recovery corruption fixtures, and raw drain/test assertions that remain blocked, raw-only, or transform-aware as classified below. |
-| `crates/tidefs-local-filesystem/src/content.rs` | 6 | Mounted content read authority and focused tests that remain transform-aware through the mounted `Pool` or explicitly raw-staged for the authority boundary. |
+| `crates/tidefs-local-filesystem/src/content.rs` | 6 | `MountedContentReadAuthority`, mounted scrub reads, and focused receipt tests route chunk bytes through the pool when a pool is available while keeping receipt evidence visible. |
 | `crates/tidefs-local-filesystem/src/intent_log.rs` | 1 | `IntentLogRawStateAuthority` owns the direct raw-store payload write for durability/replay metadata. |
 | `crates/tidefs-local-filesystem/src/crash_recovery.rs` | 1 | `CrashMatrixRawStagingAuthority` owns validation-only raw commit-boundary staging. |
 | `crates/tidefs-local-filesystem/src/journal_cleaner.rs` | 7 | One production key-scan path plus six unit-test assertions. |
