@@ -25,7 +25,7 @@ fn remount_persistence_64kib_sequenced() {
 
     // ── Session 1: mount, write, fsync, unmount ──────────────────────
 
-    let mut harness = MountHarness::new_or_fail("remount_persistence_64kib_sequenced");
+    let mut harness = new_harness_or_fail("remount_persistence_64kib_sequenced");
     harness
         .create_file("remount_test.bin", &test_data)
         .expect("create_file session 1");
@@ -61,7 +61,7 @@ fn remount_persistence_multiple_files() {
     let data_b = b"file beta content\n".to_vec();
     let data_c = (0..4096).map(|i| (i % 256) as u8).collect::<Vec<u8>>();
 
-    let mut harness = MountHarness::new_or_fail("remount_persistence_multiple_files");
+    let mut harness = new_harness_or_fail("remount_persistence_multiple_files");
 
     harness
         .create_file("alpha.txt", &data_a)
@@ -103,7 +103,7 @@ fn remount_persistence_subdir_files() {
     let data_x = b"nested file x data\n".to_vec();
     let data_y = b"nested file y data\n".to_vec();
 
-    let mut harness = MountHarness::new_or_fail("remount_persistence_subdir_files");
+    let mut harness = new_harness_or_fail("remount_persistence_subdir_files");
 
     harness.mkdir_all("subdir/deep").expect("mkdir subdir/deep");
     harness
