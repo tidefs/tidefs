@@ -26,9 +26,10 @@ policy surface here. A validation command may record commit, branch, dirty
 state, command, kernel, backend, and result in its external output directory,
 but those files are scratch state until explicitly promoted as fixture or
 evidence. Committed artifact payloads and manifests must not embed scratch-only
-paths such as `/tmp/tidefs-validation/...` or
-`/root/ai/tmp/tidefs-validation/...` unless a documented fixture exception
-explains why the literal path is the value under test.
+paths such as `/tmp/tidefs-validation/...`,
+`/root/ai/tmp/tidefs-validation/...`, or their JSON-escaped slash forms unless
+a documented fixture exception explains why the literal path is the value under
+test.
 
 ## Evidence Artifact Manifests
 

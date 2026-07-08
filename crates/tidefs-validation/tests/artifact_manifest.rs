@@ -160,8 +160,18 @@ fn runtime_artifact_classifier_is_token_based() {
 
 #[test]
 fn committed_validation_artifacts_do_not_embed_scratch_paths() {
-    const SCRATCH_PATH_NEEDLES: &[&[u8]] =
-        &[b"/tmp/tidefs-validation", b"/root/ai/tmp/tidefs-validation"];
+    const SCRATCH_PATH_NEEDLES: &[(&[u8], &str)] = &[
+        (b"/tmp/tidefs-validation", "/tmp/tidefs-validation"),
+        (br"\/tmp\/tidefs-validation", r"\/tmp\/tidefs-validation"),
+        (
+            b"/root/ai/tmp/tidefs-validation",
+            "/root/ai/tmp/tidefs-validation",
+        ),
+        (
+            br"\/root\/ai\/tmp\/tidefs-validation",
+            r"\/root\/ai\/tmp\/tidefs-validation",
+        ),
+    ];
 
     let repo_root = repo_root();
     let artifacts_root = repo_root.join("validation/artifacts");
@@ -177,13 +187,10 @@ fn committed_validation_artifacts_do_not_embed_scratch_paths() {
                 path.display()
             )
         });
-        for needle in SCRATCH_PATH_NEEDLES {
+        for (needle, display) in SCRATCH_PATH_NEEDLES {
             if bytes.windows(needle.len()).any(|window| window == *needle) {
                 let relative_path = repo_relative_path(repo_root, &path);
-                failures.push(format!(
-                    "{relative_path} embeds scratch path `{}`",
-                    String::from_utf8_lossy(needle)
-                ));
+                failures.push(format!("{relative_path} embeds scratch path `{display}`"));
             }
         }
     }
