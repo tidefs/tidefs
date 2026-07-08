@@ -217,6 +217,23 @@ expect_parser_counts() {
   fi
 }
 
+expect_parser_state() {
+  local name="$1"
+  local want_qemu_success="$2"
+  local want_qemu_timed_out="$3"
+  local want_log_empty="$4"
+  local want_required_metrics="$5"
+
+  if [ "$QEMU_SUCCESS" != "$want_qemu_success" ] ||
+     [ "$QEMU_TIMED_OUT" != "$want_qemu_timed_out" ] ||
+     [ "$LOG_EMPTY" != "$want_log_empty" ] ||
+     [ "$REQUIRED_METRICS_PRESENT" != "$want_required_metrics" ]; then
+    echo "parser self-test failed for $name: got qemu_success=$QEMU_SUCCESS timed_out=$QEMU_TIMED_OUT log_empty=$LOG_EMPTY required=$REQUIRED_METRICS_PRESENT" >&2
+    echo "expected qemu_success=$want_qemu_success timed_out=$want_qemu_timed_out log_empty=$want_log_empty required=$want_required_metrics" >&2
+    exit 1
+  fi
+}
+
 self_test_parser() {
   local test_dir
   test_dir="$(mktemp -d)"
@@ -225,6 +242,8 @@ self_test_parser() {
   : > "$test_dir/empty.log"
   analyze_qemu_log "$test_dir/empty.log" 0
   expect_parser_verdict empty-log BLOCKED empty_qemu_log 2
+  expect_parser_counts empty-log 0 0 0 0
+  expect_parser_state empty-log true false true false
 
   cat > "$test_dir/timeout.log" <<'EOF'
 === TideFS Kernel VFS Throughput Latency Baseline ===
@@ -233,6 +252,8 @@ kernel=7.0.0
 EOF
   analyze_qemu_log "$test_dir/timeout.log" 124
   expect_parser_verdict timeout-log BLOCKED qemu_timeout 2
+  expect_parser_counts timeout-log 0 0 0 0
+  expect_parser_state timeout-log false true false false
 
   cat > "$test_dir/qemu-exit-nonzero.log" <<'EOF'
 PASS: insmod
@@ -244,6 +265,8 @@ stat_avg_us=30
 EOF
   analyze_qemu_log "$test_dir/qemu-exit-nonzero.log" 1
   expect_parser_verdict qemu-exit-nonzero BLOCKED qemu_exit_1 2
+  expect_parser_counts qemu-exit-nonzero 3 0 0 0
+  expect_parser_state qemu-exit-nonzero false false false true
 
   cat > "$test_dir/zero-pass.log" <<'EOF'
 write_throughput_MBps=10.00
@@ -252,6 +275,8 @@ stat_avg_us=30
 EOF
   analyze_qemu_log "$test_dir/zero-pass.log" 0
   expect_parser_verdict zero-pass BLOCKED zero_pass_rows 2
+  expect_parser_counts zero-pass 0 0 0 0
+  expect_parser_state zero-pass true false false true
 
   cat > "$test_dir/missing-metrics.log" <<'EOF'
 PASS: insmod
@@ -260,6 +285,8 @@ PASS: no_daemon
 EOF
   analyze_qemu_log "$test_dir/missing-metrics.log" 0
   expect_parser_verdict missing-metrics BLOCKED missing_required_metrics 2
+  expect_parser_counts missing-metrics 3 0 0 0
+  expect_parser_state missing-metrics true false false false
 
   cat > "$test_dir/invalid-metrics.log" <<'EOF'
 PASS: insmod
@@ -271,6 +298,8 @@ stat_avg_us=-1
 EOF
   analyze_qemu_log "$test_dir/invalid-metrics.log" 0
   expect_parser_verdict invalid-metrics BLOCKED missing_required_metrics 2
+  expect_parser_counts invalid-metrics 3 0 0 0
+  expect_parser_state invalid-metrics true false false false
 
   cat > "$test_dir/fail-row.log" <<'EOF'
 PASS: insmod
@@ -282,6 +311,8 @@ stat_avg_us=30
 EOF
   analyze_qemu_log "$test_dir/fail-row.log" 0
   expect_parser_verdict fail-row FAIL fail_rows 1
+  expect_parser_counts fail-row 2 1 0 0
+  expect_parser_state fail-row true false false true
 
   cat > "$test_dir/blocked-row.log" <<'EOF'
 PASS: insmod
@@ -293,6 +324,8 @@ stat_avg_us=30
 EOF
   analyze_qemu_log "$test_dir/blocked-row.log" 0
   expect_parser_verdict blocked-row BLOCKED blocked_rows 2
+  expect_parser_counts blocked-row 2 0 1 0
+  expect_parser_state blocked-row true false false true
 
   cat > "$test_dir/pass.log" <<'EOF'
 PASS: insmod
@@ -305,6 +338,8 @@ EOF
   analyze_qemu_log "$test_dir/pass.log" 0
   expect_parser_verdict pass-log PASS complete 0
   expect_parser_metrics pass-log 10.00 20.00 30
+  expect_parser_counts pass-log 3 0 0 0
+  expect_parser_state pass-log true false false true
 
   cat > "$test_dir/skip-row.log" <<'EOF'
 PASS: insmod
@@ -318,6 +353,7 @@ EOF
   expect_parser_verdict skip-row PASS complete 0
   expect_parser_metrics skip-row 10.00 20.00 30
   expect_parser_counts skip-row 2 0 0 1
+  expect_parser_state skip-row true false false true
 
   cat > "$test_dir/stat-latency-alias.log" <<'EOF'
 PASS: insmod
@@ -330,6 +366,8 @@ EOF
   analyze_qemu_log "$test_dir/stat-latency-alias.log" 0
   expect_parser_verdict stat-latency-alias PASS complete 0
   expect_parser_metrics stat-latency-alias 10.00 20.00 30
+  expect_parser_counts stat-latency-alias 3 0 0 0
+  expect_parser_state stat-latency-alias true false false true
 
   echo "parser self-test: ok"
 }
