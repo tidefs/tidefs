@@ -44,6 +44,19 @@ is_positive_number() {
   awk -v n="$1" 'BEGIN { exit !(n ~ /^[0-9]+([.][0-9]+)?$/ && n > 0) }'
 }
 
+json_string() {
+  local value="${1-}"
+
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  value="${value//$'\b'/\\b}"
+  value="${value//$'\f'/\\f}"
+  value="${value//$'\n'/\\n}"
+  value="${value//$'\r'/\\r}"
+  value="${value//$'\t'/\\t}"
+  printf '"%s"' "$value"
+}
+
 git_dirty_json_bool() {
   if git -C "$REPO_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1 &&
      [ -z "$(git -C "$REPO_ROOT" status --porcelain --untracked-files=normal 2>/dev/null)" ]; then
@@ -86,11 +99,11 @@ write_blocked_manifest() {
   "fail": 0,
   "blocked": 1,
   "skip": 0,
-  "commit": "$(cd "$REPO_ROOT" && git rev-parse HEAD 2>/dev/null || echo unknown)",
+  "commit": $(json_string "$(cd "$REPO_ROOT" && git rev-parse HEAD 2>/dev/null || echo unknown)"),
   "worktree_dirty": $(git_dirty_json_bool),
   "module_source": "configured external module path",
   "status": "BLOCKED",
-  "result": "kernel VFS perf baseline BLOCKED: $reason"
+  "result": $(json_string "kernel VFS perf baseline BLOCKED: $reason")
 }
 MANIFEST
 
@@ -234,10 +247,26 @@ expect_parser_state() {
   fi
 }
 
+expect_json_string() {
+  local name="$1"
+  local input="$2"
+  local expected="$3"
+  local actual
+
+  actual="$(json_string "$input")"
+  if [ "$actual" != "$expected" ]; then
+    echo "json string self-test failed for $name: got $actual expected $expected" >&2
+    exit 1
+  fi
+}
+
 self_test_parser() {
   local test_dir
   test_dir="$(mktemp -d)"
   trap 'rm -rf "$test_dir"' RETURN
+
+  expect_json_string quote-and-backslash 'quote"slash\' '"quote\"slash\\"'
+  expect_json_string control-bytes $'line\nnext\tcarriage\rreturn' '"line\nnext\tcarriage\rreturn"'
 
   : > "$test_dir/empty.log"
   analyze_qemu_log "$test_dir/empty.log" 0
@@ -693,21 +722,21 @@ cat > "$RUN_DIR_VALIDATION/validation-manifest.json" << MANIFEST
   "log_empty": $LOG_EMPTY,
   "required_metrics_present": $REQUIRED_METRICS_PRESENT,
   "metrics": {
-    "write_duration_ms": "${WD}",
-    "read_duration_ms": "${RD}",
-    "write_throughput_MBps": "${WTP}",
-    "read_throughput_MBps": "${RTP}",
-    "stat_avg_us": "${SU}"
+    "write_duration_ms": $(json_string "$WD"),
+    "read_duration_ms": $(json_string "$RD"),
+    "write_throughput_MBps": $(json_string "$WTP"),
+    "read_throughput_MBps": $(json_string "$RTP"),
+    "stat_avg_us": $(json_string "$SU")
   },
   "pass": $PASS_COUNT,
   "fail": $FAIL_COUNT,
   "blocked": $BLOCKED_COUNT,
   "skip": $SKIP_COUNT,
-  "commit": "$(cd "$REPO_ROOT" && git rev-parse HEAD 2>/dev/null || echo unknown)",
+  "commit": $(json_string "$(cd "$REPO_ROOT" && git rev-parse HEAD 2>/dev/null || echo unknown)"),
   "worktree_dirty": $(git_dirty_json_bool),
   "module_source": "configured external module path",
-  "status": "$VERDICT_STATUS",
-  "result": "kernel VFS perf baseline $VERDICT_STATUS: $VERDICT_REASON; write=${WD}ms (${WTP}MB/s) read=${RD}ms (${RTP}MB/s) stat=${SU}us"
+  "status": $(json_string "$VERDICT_STATUS"),
+  "result": $(json_string "kernel VFS perf baseline $VERDICT_STATUS: $VERDICT_REASON; write=${WD}ms (${WTP}MB/s) read=${RD}ms (${RTP}MB/s) stat=${SU}us")
 }
 MANIFEST
 

@@ -88,6 +88,19 @@ EOF
       awk -v n="$1" 'BEGIN { exit !(n ~ /^[0-9]+([.][0-9]+)?$/ && n > 0) }'
     }
 
+    json_string() {
+      local value="''${1-}"
+
+      value="''${value//\\/\\\\}"
+      value="''${value//\"/\\\"}"
+      value="''${value//$'\b'/\\b}"
+      value="''${value//$'\f'/\\f}"
+      value="''${value//$'\n'/\\n}"
+      value="''${value//$'\r'/\\r}"
+      value="''${value//$'\t'/\\t}"
+      printf '"%s"' "$value"
+    }
+
     git_dirty_json_bool() {
       if git -C "$SOURCE_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1 &&
          [ -z "$(git -C "$SOURCE_DIR" status --porcelain --untracked-files=normal 2>/dev/null)" ]; then
@@ -132,11 +145,11 @@ EOF
   "fail": 0,
   "blocked": 1,
   "skip": 0,
-  "commit": "$(git_commit_value)",
+  "commit": $(json_string "$(git_commit_value)"),
   "worktree_dirty": $(git_dirty_json_bool),
   "module_source": "configured external module path",
   "status": "BLOCKED",
-  "result": "kernel VFS throughput latency baseline BLOCKED: $reason"
+  "result": $(json_string "kernel VFS throughput latency baseline BLOCKED: $reason")
 }
 MANIFEST
 
@@ -282,10 +295,26 @@ MANIFEST
       fi
     }
 
+    expect_json_string() {
+      local name="$1"
+      local input="$2"
+      local expected="$3"
+      local actual
+
+      actual="$(json_string "$input")"
+      if [ "$actual" != "$expected" ]; then
+        echo "json string self-test failed for $name: got $actual expected $expected" >&2
+        exit 1
+      fi
+    }
+
     self_test_parser() {
       local test_dir
       test_dir="$(mktemp -d)"
       trap 'rm -rf "$test_dir"' RETURN
+
+      expect_json_string quote-and-backslash 'quote"slash\' '"quote\"slash\\"'
+      expect_json_string control-bytes $'line\nnext\tcarriage\rreturn' '"line\nnext\tcarriage\rreturn"'
 
       : > "$test_dir/empty.log"
       analyze_qemu_log "$test_dir/empty.log" 0
@@ -712,19 +741,19 @@ INITSCRIPT
   "log_empty": $LOG_EMPTY,
   "required_metrics_present": $REQUIRED_METRICS_PRESENT,
   "metrics": {
-    "write_throughput_MBps": "$WRITE_TP_VAL",
-    "read_throughput_MBps": "$READ_TP_VAL",
-    "stat_avg_latency_us": "$STAT_LAT_VAL"
+    "write_throughput_MBps": $(json_string "$WRITE_TP_VAL"),
+    "read_throughput_MBps": $(json_string "$READ_TP_VAL"),
+    "stat_avg_latency_us": $(json_string "$STAT_LAT_VAL")
   },
   "pass": $PASS_COUNT,
   "fail": $FAIL_COUNT,
   "blocked": $BLOCKED_COUNT,
   "skip": $SKIP_COUNT,
-  "commit": "$(git_commit_value)",
+  "commit": $(json_string "$(git_commit_value)"),
   "worktree_dirty": $(git_dirty_json_bool),
   "module_source": "configured external module path",
-  "status": "$VERDICT_STATUS",
-  "result": "kernel VFS throughput latency baseline $VERDICT_STATUS: $VERDICT_REASON; write $WRITE_TP_VAL MB/s, read $READ_TP_VAL MB/s, stat $STAT_LAT_VAL us avg latency"
+  "status": $(json_string "$VERDICT_STATUS"),
+  "result": $(json_string "kernel VFS throughput latency baseline $VERDICT_STATUS: $VERDICT_REASON; write $WRITE_TP_VAL MB/s, read $READ_TP_VAL MB/s, stat $STAT_LAT_VAL us avg latency")
 }
 MANIFEST
 
