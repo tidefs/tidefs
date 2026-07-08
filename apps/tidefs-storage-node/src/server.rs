@@ -782,6 +782,10 @@ fn snapshot_barrier_send_label(barrier_id: u64, key: &[u8]) -> String {
     format!("vfssend2-{class}-send-{barrier_id}")
 }
 
+fn clear_active_snapshot_barrier(ctx: &SessionContext) {
+    *ctx.active_barrier.lock().unwrap() = None;
+}
+
 fn run_snapshot_barrier_before_send(
     session_id: tidefs_transport::SessionId,
     ctx: &SessionContext,
@@ -831,7 +835,7 @@ fn run_snapshot_barrier_before_send(
         if let Err(err) =
             transport.send_priority(peer_session, &request_bytes, MessagePriority::Control)
         {
-            *ctx.active_barrier.lock().unwrap() = None;
+            clear_active_snapshot_barrier(ctx);
             return Err(SnapshotBarrierSendError::SendFailed {
                 barrier_id,
                 peer_id,
@@ -847,7 +851,7 @@ fn run_snapshot_barrier_before_send(
             active.as_ref().and_then(SnapshotCoordinator::outcome)
         };
         if let Some(outcome) = outcome {
-            *ctx.active_barrier.lock().unwrap() = None;
+            clear_active_snapshot_barrier(ctx);
             return snapshot_barrier_send_report(barrier_id, outcome);
         }
         std::thread::sleep(Duration::from_millis(1));
@@ -6537,6 +6541,37 @@ mod cluster_pool_handler_tests {
         assert_eq!(report.peer_count, 0);
         assert_eq!(report.min_txg, 0);
         assert_eq!(report.max_txg, 0);
+        assert!(ctx.active_barrier.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn snapshot_barrier_before_send_clears_active_barrier_on_send_failure() {
+        let (_dir, store) = frame_local_store();
+        let ctx = frame_test_context(Arc::clone(&store));
+        let peer_session_id = tidefs_transport::SessionId::new(2);
+        let peer_session = tidefs_transport::session::Session::new(
+            peer_session_id,
+            1,
+            2,
+            tidefs_transport::TransportAddr::Tcp("127.0.0.1:9002".parse().unwrap()),
+            tidefs_transport::EndpointFamily::LocalEmbed,
+            tidefs_transport::TransportBackendKind::Tcp,
+        );
+
+        ctx.transport
+            .lock()
+            .unwrap()
+            .sessions
+            .insert(peer_session_id, Arc::new(Mutex::new(peer_session)));
+
+        let err =
+            run_snapshot_barrier_before_send(tidefs_transport::SessionId::new(1), &ctx, &[])
+                .expect_err("barrier request send should fail without an active connection");
+
+        match err {
+            SnapshotBarrierSendError::SendFailed { peer_id, .. } => assert_eq!(peer_id, 2),
+            other => panic!("expected send failure, got {other:?}"),
+        }
         assert!(ctx.active_barrier.lock().unwrap().is_none());
     }
 
