@@ -1328,4 +1328,52 @@ mod tests {
         );
         assert!(err.to_string().contains("timed out"));
     }
+
+    #[test]
+    fn snapshot_barrier_send_report_rejects_inconsistent() {
+        let responses = BTreeMap::from([
+            (
+                2,
+                BarrierResponse {
+                    peer_id: 2,
+                    barrier_id: 9,
+                    committed_root_txg: 41,
+                    committed_root_generation: 5,
+                    object_count: 10,
+                    received_at: Instant::now(),
+                },
+            ),
+            (
+                3,
+                BarrierResponse {
+                    peer_id: 3,
+                    barrier_id: 9,
+                    committed_root_txg: 45,
+                    committed_root_generation: 6,
+                    object_count: 12,
+                    received_at: Instant::now(),
+                },
+            ),
+        ]);
+
+        let err = snapshot_barrier_send_report(
+            9,
+            BarrierOutcome::Inconsistent {
+                min_txg: 41,
+                max_txg: 45,
+                responses,
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            SnapshotBarrierSendError::Inconsistent {
+                barrier_id: 9,
+                min_txg: 41,
+                max_txg: 45,
+            }
+        );
+        assert!(err.to_string().contains("inconsistent"));
+    }
 }
