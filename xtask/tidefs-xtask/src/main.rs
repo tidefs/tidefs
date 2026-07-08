@@ -1085,15 +1085,15 @@ fn main() {
                 process::exit(1);
             }
         }
-        Some("acquire-claim" | "claim-issue") => {
+        Some(command @ ("acquire-claim" | "claim-issue")) => {
             let issue_num: u64 = match args.next().and_then(|s| s.parse().ok()) {
                 Some(n) => n,
                 None => {
-                    eprintln!("usage: tidefs-xtask acquire-claim <issue-number>");
+                    eprintln!("usage: tidefs-xtask {command} <issue-number>");
                     process::exit(1);
                 }
             };
-            match forgejo_work::acquire_claim(issue_num) {
+            match forgejo_work::acquire_claim_command(command, issue_num) {
                 Ok(true) => {
                     println!("claimed issue #{issue_num}");
                 }
@@ -2663,7 +2663,7 @@ fn print_help() {
         "  coordination-health      unsupported: the legacy Forgejo claim tracker has been retired"
     );
     println!(
-        "  acquire-claim <N>     unsupported: the legacy Forgejo claim tracker has been retired"
+        "  acquire-claim|claim-issue <N> unsupported: the legacy Forgejo claim tracker has been retired"
     );
     println!("  check-abandoned-worktrees detect stale local worktree directories");
     println!("  check-stale-worktrees   alias for check-abandoned-worktrees");

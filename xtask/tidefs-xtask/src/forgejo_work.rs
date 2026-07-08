@@ -11,7 +11,7 @@
 // Legacy Forgejo claim-tracker commands (check-stale-claims,
 // check-stale-forgejo-claims, check-duplicate-claims,
 // check-duplicate-forgejo-claims, coordination-health,
-// auto-release-stale-claims, acquire-claim) fail closed with an explicit
+// auto-release-stale-claims, acquire-claim, claim-issue) fail closed with an explicit
 // unsupported message.
 //
 // GitHub issue checks use the `gh` CLI; no hard-coded API credentials.
@@ -270,12 +270,12 @@ pub fn print_coordination_health_report() -> Result<(), ForgejoWorkError> {
 }
 
 // ---------------------------------------------------------------------------
-// acquire-claim -- legacy Forgejo command, now unsupported
+// acquire-claim/claim-issue -- legacy Forgejo command, now unsupported
 // ---------------------------------------------------------------------------
 
-pub fn acquire_claim(_issue_num: u64) -> Result<bool, String> {
+pub fn acquire_claim_command(command: &str, _issue_num: u64) -> Result<bool, String> {
     Err(retired_forgejo_command_message(
-        "acquire-claim",
+        command,
         "Issue claim is now managed through GitHub issue assignment and the current Codex Nexus \
          worker pool.",
     ))
@@ -571,7 +571,8 @@ mod tests {
             "coordination-health",
         );
 
-        let message = acquire_claim(1805).expect_err("retired acquire-claim should fail closed");
+        let message = acquire_claim_command("acquire-claim", 1805)
+            .expect_err("retired acquire-claim should fail closed");
         for fragment in [
             "acquire-claim",
             "no longer supported",
@@ -583,6 +584,22 @@ mod tests {
             assert!(
                 message.contains(fragment),
                 "retired acquire-claim diagnostic should contain '{fragment}': {message}"
+            );
+        }
+
+        let message = acquire_claim_command("claim-issue", 1805)
+            .expect_err("retired claim-issue should fail closed");
+        for fragment in [
+            "claim-issue",
+            "no longer supported",
+            "legacy Forgejo claim tracker",
+            "retired",
+            "GitHub",
+            "Codex Nexus",
+        ] {
+            assert!(
+                message.contains(fragment),
+                "retired claim-issue diagnostic should contain '{fragment}': {message}"
             );
         }
     }
