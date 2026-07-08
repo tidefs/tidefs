@@ -1943,6 +1943,9 @@ pub enum LivePoolAdminCommand {
     SnapshotSend,
     PerformanceAdmissionSnapshot,
     DeviceRemove,
+    BlockAttach,
+    BlockSend,
+    BlockReceive,
 }
 
 impl LivePoolAdminCommand {
@@ -1976,6 +1979,9 @@ impl LivePoolAdminCommand {
             ("snapshot", "send") => Self::SnapshotSend,
             ("performance", "admission-snapshot") => Self::PerformanceAdmissionSnapshot,
             ("device", "remove") => Self::DeviceRemove,
+            ("block", "attach") => Self::BlockAttach,
+            ("block", "send") => Self::BlockSend,
+            ("block", "receive") => Self::BlockReceive,
             _ => return Err(LivePoolAdminError::unsupported_command(command, operation)),
         };
         Ok(typed)
@@ -2011,6 +2017,9 @@ impl LivePoolAdminCommand {
             Self::SnapshotSend => ("snapshot", "send"),
             Self::PerformanceAdmissionSnapshot => ("performance", "admission-snapshot"),
             Self::DeviceRemove => ("device", "remove"),
+            Self::BlockAttach => ("block", "attach"),
+            Self::BlockSend => ("block", "send"),
+            Self::BlockReceive => ("block", "receive"),
         }
     }
 }

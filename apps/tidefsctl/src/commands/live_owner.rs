@@ -1841,6 +1841,52 @@ mod tests {
     }
 
     #[test]
+    fn block_live_owner_routes_build_typed_requests() {
+        for (operation, expected_command, expected_arg) in [
+            (
+                "attach",
+                LivePoolAdminCommand::BlockAttach,
+                ("queue_depth", LivePoolAdminArg::U64(64)),
+            ),
+            (
+                "send",
+                LivePoolAdminCommand::BlockSend,
+                (
+                    "target_addr",
+                    LivePoolAdminArg::String("127.0.0.1:9000".to_string()),
+                ),
+            ),
+            (
+                "receive",
+                LivePoolAdminCommand::BlockReceive,
+                (
+                    "source_addr",
+                    LivePoolAdminArg::String("127.0.0.1:9001".to_string()),
+                ),
+            ),
+        ] {
+            let route = LivePoolRoute {
+                command: "block",
+                operation,
+                pool: "tank",
+                pool_uuid: Some([0x42; 16]),
+                json: true,
+                args: live_admin_args([expected_arg.clone()]),
+            };
+
+            let request = live_owner_request(&route).expect("build block live-owner request");
+
+            assert_eq!(request.command, expected_command);
+            assert_eq!(request.output, LivePoolAdminOutput::MachineJson);
+            assert_eq!(
+                request.pool_uuid.as_deref(),
+                Some("42424242424242424242424242424242")
+            );
+            assert_eq!(request.args.0.get(expected_arg.0), Some(&expected_arg.1));
+        }
+    }
+
+    #[test]
     fn device_remove_cached_owner_refusal_names_receipt_authority() {
         let json = cached_without_owner_json("device", "remove", "tank", None);
 
