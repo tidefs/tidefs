@@ -540,20 +540,20 @@ impl LocalAckReceipt {
     }
 
     fn has_local_ack_result_projection(self) -> bool {
+        let Some(generation) = self.local_ack_receipt_generation() else {
+            return false;
+        };
+
         self.refusal.attempted_receipt == self.receipt.receipt_id
             && self.refusal.evidence.kind == StorageIntentEvidenceKind::ResultRefusalEvidence
             && self.refusal.evidence.version == LOCAL_ACK_RECEIPT_RECORD_VERSION
             && self.refusal.evidence.id
                 == StorageIntentEvidenceId(hash_refusal_context(
-                    self.refusal.evidence.generation,
+                    generation,
                     self.refusal.attempted_receipt,
                     self.refusal.reason,
                 ))
-            && self.refusal.evidence.is_bound()
-            && self
-                .receipt
-                .evidence_refs
-                .contains_ref(self.refusal.evidence)
+            && self.evidence_ref_matches_local_generation(self.refusal.evidence, generation)
     }
 
     fn has_no_receipt_retirement_projection(self) -> bool {
@@ -580,11 +580,15 @@ impl LocalAckReceipt {
             return false;
         }
 
+        let Some(generation) = self.local_ack_receipt_generation() else {
+            return false;
+        };
+
         let has_local_evidence = self
             .required_local_evidence_refs()
             .iter()
             .all(|evidence_ref| {
-                evidence_ref.is_bound() && self.receipt.evidence_refs.contains_ref(*evidence_ref)
+                self.evidence_ref_matches_local_generation(*evidence_ref, generation)
             });
         let needs_full_placement = matches!(
             self.requested_ack_floor,
@@ -593,8 +597,35 @@ impl LocalAckReceipt {
 
         has_local_evidence
             && (!needs_full_placement
-                || (self.placement_ref.is_bound()
-                    && self.receipt.evidence_refs.contains_ref(self.placement_ref)))
+                || self.evidence_ref_matches_local_generation(self.placement_ref, generation))
+    }
+
+    fn local_ack_receipt_generation(self) -> Option<u64> {
+        let generation = self.local_intent_record_ref.generation;
+        if generation != 0
+            && self.local_intent_record_ref.is_bound()
+            && self.receipt.receipt_id
+                == receipt_id(
+                    generation,
+                    self.operation,
+                    self.target,
+                    self.payload_or_replay_digest,
+                )
+        {
+            Some(generation)
+        } else {
+            None
+        }
+    }
+
+    fn evidence_ref_matches_local_generation(
+        self,
+        evidence_ref: StorageIntentEvidenceRef,
+        generation: u64,
+    ) -> bool {
+        evidence_ref.is_bound()
+            && evidence_ref.generation == generation
+            && self.receipt.evidence_refs.contains_ref(evidence_ref)
     }
 
     /// Refusal reason carried by this envelope.
@@ -1245,6 +1276,64 @@ mod tests {
     }
 
     #[test]
+    fn requested_floor_receipt_fails_closed_for_cross_generation_local_evidence() {
+        let mut stale_ordering = LocalAckReceipt::durable_intent(
+            14,
+            LocalAckOperation::SyncWrite,
+            LocalAckReceiptTarget::inode(21),
+            None,
+        );
+        assert!(stale_ordering.satisfies_requested_ack_floor());
+        stale_ordering.ordering_ref.generation += 1;
+        stale_ordering.receipt.evidence_refs = evidence_refs(&[
+            stale_ordering.local_intent_record_ref,
+            stale_ordering.ordering_ref,
+            stale_ordering.flush_fence_ref,
+            stale_ordering.media_capability_ref,
+            stale_ordering.reserve_ref,
+            stale_ordering.dirty_window_ref,
+            stale_ordering.rollout_ref,
+            stale_ordering.tenant_isolation_ref,
+            stale_ordering.refusal.evidence,
+        ]);
+
+        assert!(stale_ordering.is_posix_durable_success());
+        assert!(stale_ordering.has_local_ack_result_projection());
+        assert!(!stale_ordering.has_requested_ack_floor_evidence());
+        assert!(!stale_ordering.satisfies_requested_ack_floor());
+    }
+
+    #[test]
+    fn requested_floor_receipt_fails_closed_for_cross_generation_placement_evidence() {
+        let mut stale_placement = LocalAckReceipt::full_local_placement(
+            15,
+            LocalAckOperation::Fsync,
+            LocalAckReceiptTarget::inode(21),
+            None,
+        );
+        stale_placement.requested_ack_floor = StorageIntentGuaranteeClass::FullPlacement;
+        assert!(stale_placement.satisfies_requested_ack_floor());
+        stale_placement.placement_ref.generation += 1;
+        stale_placement.receipt.evidence_refs = evidence_refs(&[
+            stale_placement.local_intent_record_ref,
+            stale_placement.ordering_ref,
+            stale_placement.flush_fence_ref,
+            stale_placement.media_capability_ref,
+            stale_placement.placement_ref,
+            stale_placement.reserve_ref,
+            stale_placement.dirty_window_ref,
+            stale_placement.rollout_ref,
+            stale_placement.tenant_isolation_ref,
+            stale_placement.refusal.evidence,
+        ]);
+
+        assert!(stale_placement.is_posix_durable_success());
+        assert!(stale_placement.has_local_ack_result_projection());
+        assert!(!stale_placement.has_requested_ack_floor_evidence());
+        assert!(!stale_placement.satisfies_requested_ack_floor());
+    }
+
+    #[test]
     fn requested_floor_receipt_fails_closed_for_mismatched_policy_identity() {
         const OTHER_POLICY_ID: StorageIntentPolicyId = StorageIntentPolicyId([0x42; 16]);
         const OTHER_POLICY_REVISION: StorageIntentPolicyRevision =
@@ -1420,6 +1509,47 @@ mod tests {
         );
         assert!(wrong_result_identity.has_requested_ack_floor_evidence());
         assert!(!wrong_result_identity.satisfies_requested_ack_floor());
+    }
+
+    #[test]
+    fn requested_floor_receipt_fails_closed_for_cross_generation_result_evidence() {
+        let mut stale_result = LocalAckReceipt::full_local_placement(
+            30,
+            LocalAckOperation::Syncfs,
+            LocalAckReceiptTarget::FILESYSTEM,
+            None,
+        );
+        assert!(stale_result.satisfies_requested_ack_floor());
+        let stale_generation = stale_result.refusal.evidence.generation + 1;
+        let stale_result_ref = StorageIntentEvidenceRef::new(
+            StorageIntentEvidenceKind::ResultRefusalEvidence,
+            StorageIntentEvidenceId(hash_refusal_context(
+                stale_generation,
+                stale_result.refusal.attempted_receipt,
+                stale_result.refusal.reason,
+            )),
+            stale_generation,
+            LOCAL_ACK_RECEIPT_RECORD_VERSION,
+        );
+        stale_result.refusal.evidence = stale_result_ref;
+        stale_result.receipt.evidence_refs = evidence_refs(&[
+            stale_result.local_intent_record_ref,
+            stale_result.ordering_ref,
+            stale_result.flush_fence_ref,
+            stale_result.media_capability_ref,
+            stale_result.placement_ref,
+            stale_result.reserve_ref,
+            stale_result.dirty_window_ref,
+            stale_result.rollout_ref,
+            stale_result.tenant_isolation_ref,
+            stale_result.refusal.evidence,
+        ]);
+
+        assert!(stale_result.is_posix_durable_success());
+        assert!(stale_result.refusal.evidence.is_bound());
+        assert!(stale_result.has_requested_ack_floor_evidence());
+        assert!(!stale_result.has_local_ack_result_projection());
+        assert!(!stale_result.satisfies_requested_ack_floor());
     }
 
     #[test]
