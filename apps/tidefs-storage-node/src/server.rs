@@ -793,16 +793,19 @@ fn run_snapshot_barrier_before_send(
 ) -> Result<SnapshotBarrierSendReport, SnapshotBarrierSendError> {
     let barrier_id = allocate_barrier_id();
     let snapshot_name = snapshot_barrier_send_label(barrier_id, key);
-    let mut transport = ctx.transport.lock().unwrap();
-    let mut peer_sessions = BTreeMap::new();
-    for sid in transport.all_stats().sessions.keys() {
-        if *sid == session_id {
-            continue;
+    let peer_sessions = {
+        let transport = ctx.transport.lock().unwrap();
+        let mut peer_sessions = BTreeMap::new();
+        for sid in transport.all_stats().sessions.keys() {
+            if *sid == session_id {
+                continue;
+            }
+            if let Some(peer_id) = transport.peer_node(*sid) {
+                peer_sessions.entry(peer_id).or_insert(*sid);
+            }
         }
-        if let Some(peer_id) = transport.peer_node(*sid) {
-            peer_sessions.entry(peer_id).or_insert(*sid);
-        }
-    }
+        peer_sessions
+    };
 
     let peer_ids = peer_sessions.keys().copied().collect::<Vec<_>>();
     let coordinator = SnapshotCoordinator::new(
@@ -832,9 +835,12 @@ fn run_snapshot_barrier_before_send(
     }
 
     for (&peer_id, &peer_session) in &peer_sessions {
-        if let Err(err) =
-            transport.send_priority(peer_session, &request_bytes, MessagePriority::Control)
-        {
+        let send_result = ctx.transport.lock().unwrap().send_priority(
+            peer_session,
+            &request_bytes,
+            MessagePriority::Control,
+        );
+        if let Err(err) = send_result {
             clear_active_snapshot_barrier(ctx);
             return Err(SnapshotBarrierSendError::SendFailed {
                 barrier_id,
@@ -843,7 +849,6 @@ fn run_snapshot_barrier_before_send(
             });
         }
     }
-    drop(transport);
 
     loop {
         let outcome = {
