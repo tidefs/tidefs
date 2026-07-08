@@ -246,6 +246,24 @@ MANIFEST
       fi
     }
 
+    expect_parser_counts() {
+      local name="$1"
+      local expected_pass="$2"
+      local expected_fail="$3"
+      local expected_blocked="$4"
+      local expected_skip="$5"
+
+      if [ "$PASS_COUNT" -ne "$expected_pass" ] ||
+         [ "$FAIL_COUNT" -ne "$expected_fail" ] ||
+         [ "$BLOCKED_COUNT" -ne "$expected_blocked" ] ||
+         [ "$SKIP_COUNT" -ne "$expected_skip" ]; then
+        echo "parser self-test failed: $name" >&2
+        echo "  expected counts: pass=$expected_pass fail=$expected_fail blocked=$expected_blocked skip=$expected_skip" >&2
+        echo "  actual counts:   pass=$PASS_COUNT fail=$FAIL_COUNT blocked=$BLOCKED_COUNT skip=$SKIP_COUNT" >&2
+        exit 1
+      fi
+    }
+
     self_test_parser() {
       local test_dir
       test_dir="$(mktemp -d)"
@@ -334,6 +352,19 @@ EOF
       analyze_qemu_log "$test_dir/pass.log" 0
       expect_parser_verdict pass-log PASS complete 0
       expect_parser_metrics pass-log 10.00 20.00 30
+
+      cat > "$test_dir/skip-row.log" <<'EOF'
+PASS: insmod
+PASS: mount
+SKIP: optional cache warmup unavailable
+write_throughput_MBps=10.00
+read_throughput_MBps=20.00
+stat_avg_latency_us=30
+EOF
+      analyze_qemu_log "$test_dir/skip-row.log" 0
+      expect_parser_verdict skip-row PASS complete 0
+      expect_parser_metrics skip-row 10.00 20.00 30
+      expect_parser_counts skip-row 2 0 0 1
 
       cat > "$test_dir/stat-short-alias.log" <<'EOF'
 PASS: insmod
