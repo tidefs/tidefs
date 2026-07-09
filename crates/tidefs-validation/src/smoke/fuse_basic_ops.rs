@@ -78,7 +78,7 @@ mod tests {
     /// Rename test: mkdir → rename directory → remount →
     /// verify new name exists and old name is gone.
     ///
-    /// Advancement criterion 2:
+    /// Mounted rename coverage:
     ///   - rename completes successfully via real FUSE mount
     #[test]
     #[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
