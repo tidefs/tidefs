@@ -170,10 +170,19 @@ pub struct RateLimitAttemptEvidence {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OracleConfigEvidence {
+    pub source_contract: String,
+    pub scrub_units: u32,
+    pub read_arrival_tick: u64,
+    pub max_foreground_read_wait_ticks: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServiceCurveEvidence {
     pub source_contract: String,
     pub scheduled_oracle: String,
     pub unscheduled_counterexample: String,
+    pub oracle_config: OracleConfigEvidence,
     pub foreground_read_work_class: String,
     pub foreground_read_domain: String,
     pub foreground_max_ops_per_tick: u32,
@@ -551,6 +560,12 @@ fn build_service_curve() -> ServiceCurveEvidence {
             .to_string(),
         unscheduled_counterexample:
             "tidefs-performance-contract::oracle::without_scheduling_or_admission".to_string(),
+        oracle_config: OracleConfigEvidence {
+            source_contract: "tidefs-performance-contract::oracle::OracleConfig".to_string(),
+            scrub_units: config.scrub_units,
+            read_arrival_tick: config.read_arrival_tick,
+            max_foreground_read_wait_ticks: config.max_foreground_read_wait_ticks,
+        },
         foreground_read_work_class: foreground.work_class.as_str().to_string(),
         foreground_read_domain: foreground.primary_domain.as_str().to_string(),
         foreground_max_ops_per_tick: foreground.max_ops_per_tick,
@@ -876,6 +891,7 @@ mod tests {
     #[test]
     fn service_curve_evidence_uses_typed_contract_oracle() {
         let service_curve = build_service_curve();
+        let config = scrub_read_oracle_config();
 
         assert_eq!(
             service_curve.foreground_read_work_class,
@@ -884,6 +900,25 @@ mod tests {
         assert_eq!(
             service_curve.scrub_queue_slots,
             ServiceCurve::SCRUB_BOUNDED_DEFAULT.queue_slots
+        );
+        assert_eq!(
+            service_curve.oracle_config.source_contract,
+            "tidefs-performance-contract::oracle::OracleConfig"
+        );
+        assert_eq!(service_curve.oracle_config.scrub_units, config.scrub_units);
+        assert_eq!(
+            service_curve.oracle_config.read_arrival_tick,
+            config.read_arrival_tick
+        );
+        assert_eq!(
+            service_curve.oracle_config.max_foreground_read_wait_ticks,
+            config.max_foreground_read_wait_ticks
+        );
+        assert_eq!(config.scrub_units, SCRUB_UNITS_REQUESTED);
+        assert_eq!(config.read_arrival_tick, FOREGROUND_READ_ARRIVAL_TICK);
+        assert_eq!(
+            config.max_foreground_read_wait_ticks,
+            MAX_FOREGROUND_READ_WAIT_TICKS
         );
         assert!(service_curve.foreground_read_admitted_by_service_curve);
         assert!(service_curve.scrub_unit_admitted_by_service_curve);
