@@ -27,10 +27,11 @@ state, command, kernel, backend, and result in its external output directory,
 but those files are scratch state until explicitly promoted as fixture or
 evidence. Committed artifact payloads and manifests must not embed scratch-only
 paths such as `/tmp/tidefs-validation/...`,
-`/root/ai/tmp/tidefs-validation/...`, or their JSON-escaped slash forms unless
-a documented fixture exception explains why the literal path is the value under
-test. This includes both `\/` and case-insensitive `\u002f` slash escapes
-because they decode to the same scratch paths.
+`/root/ai/tmp/tidefs-validation/...`, or JSON escapes that decode to those
+paths unless a documented fixture exception explains why the literal path is
+the value under test. This includes both `\/` and case-insensitive `\u002f`
+slash escapes, plus ASCII `\u00XX` escapes for scratch-root bytes, because they
+decode to the same scratch paths.
 
 ## Evidence Artifact Manifests
 

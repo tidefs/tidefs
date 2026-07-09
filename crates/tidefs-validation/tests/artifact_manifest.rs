@@ -113,7 +113,16 @@ fn bytes_contain(bytes: &[u8], needle: &[u8]) -> bool {
     bytes.windows(needle.len()).any(|window| window == needle)
 }
 
-fn normalize_json_slash_escapes(bytes: &[u8]) -> Vec<u8> {
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn normalize_json_ascii_path_escapes(bytes: &[u8]) -> Vec<u8> {
     let mut normalized = Vec::with_capacity(bytes.len());
     let mut offset = 0;
     while offset < bytes.len() {
@@ -121,12 +130,20 @@ fn normalize_json_slash_escapes(bytes: &[u8]) -> Vec<u8> {
         if remaining.starts_with(br"\/") {
             normalized.push(b'/');
             offset += br"\/".len();
-        } else if remaining.len() >= br"\u002f".len()
-            && &remaining[..br"\u002".len()] == br"\u002"
-            && matches!(remaining[br"\u002".len()], b'f' | b'F')
-        {
-            normalized.push(b'/');
-            offset += br"\u002f".len();
+        } else if remaining.len() >= br"\u0000".len() && &remaining[..br"\u00".len()] == br"\u00" {
+            match (
+                hex_nibble(remaining[br"\u00".len()]),
+                hex_nibble(remaining[br"\u00".len() + 1]),
+            ) {
+                (Some(high), Some(low)) => {
+                    normalized.push((high << 4) | low);
+                    offset += br"\u0000".len();
+                }
+                _ => {
+                    normalized.push(bytes[offset]);
+                    offset += 1;
+                }
+            }
         } else {
             normalized.push(bytes[offset]);
             offset += 1;
@@ -138,11 +155,15 @@ fn normalize_json_slash_escapes(bytes: &[u8]) -> Vec<u8> {
 #[test]
 fn json_slash_escape_normalization_catches_mixed_scratch_paths() {
     assert_eq!(
-        normalize_json_slash_escapes(br"\u002Ftmp/tidefs-validation"),
+        normalize_json_ascii_path_escapes(br"\u002Ftmp/tidefs-validation"),
         b"/tmp/tidefs-validation"
     );
     assert_eq!(
-        normalize_json_slash_escapes(br"\/root\u002Fai/tmp\/tidefs-validation"),
+        normalize_json_ascii_path_escapes(br"\/root\u002Fai/tmp\/tidefs-validation"),
+        b"/root/ai/tmp/tidefs-validation"
+    );
+    assert_eq!(
+        normalize_json_ascii_path_escapes(br"/r\u006fot/ai/tmp/tidefs-validati\u006fn"),
         b"/root/ai/tmp/tidefs-validation"
     );
 }
@@ -249,7 +270,7 @@ fn committed_validation_artifacts_do_not_embed_scratch_paths() {
                 path.display()
             )
         });
-        let normalized_bytes = normalize_json_slash_escapes(&bytes);
+        let normalized_bytes = normalize_json_ascii_path_escapes(&bytes);
         for (needle, display) in SCRATCH_PATH_NEEDLES {
             if bytes_contain(&normalized_bytes, needle) {
                 let relative_path = repo_relative_path(repo_root, &path);
