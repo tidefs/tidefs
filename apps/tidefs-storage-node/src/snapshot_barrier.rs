@@ -143,8 +143,9 @@ impl BarrierResponse {
 /// Collects snapshot barrier responses from peers.
 ///
 /// The coordinator creates one `BarrierCollector` per snapshot barrier
-/// round. It records responses as they arrive and provides a
-/// `is_complete()` check plus a `result()` that summarises the outcome.
+/// round. It records responses or explicit failures as they arrive and
+/// provides an `is_complete()` check plus an `outcome()` that summarises the
+/// result.
 #[derive(Debug)]
 pub struct BarrierCollector {
     /// Barrier id for this round.
@@ -391,9 +392,9 @@ impl BarrierCollector {
             .saturating_sub(self.responses.len() + self.failures.len())
     }
 
-    /// Whether all expected peers have responded.
+    /// Whether all expected peers have responded or failed.
     pub fn is_complete(&self) -> bool {
-        self.responses.len() == self.expected_peers.len()
+        self.responses.len() + self.failures.len() == self.expected_peers.len()
     }
 
     /// Whether the barrier has timed out.
@@ -594,7 +595,7 @@ impl SnapshotCoordinator {
         self.collector.missing_count()
     }
 
-    /// Whether all expected peers have responded.
+    /// Whether all expected peers have responded or failed.
     pub fn is_complete(&self) -> bool {
         self.collector.is_complete()
     }
@@ -868,6 +869,7 @@ mod tests {
         assert!(c.record_failure(10, "sync failed".into()));
         assert_eq!(c.responded_count(), 0);
         assert_eq!(c.missing_count(), 0);
+        assert!(c.is_complete());
         assert!(!c.record_response(make_response(10, 1, 100, 5, 10)));
 
         match c.outcome() {
@@ -1142,6 +1144,7 @@ mod tests {
         assert!(coord.record_failure(10, "barrier failed".into()));
         assert_eq!(coord.responded_count(), 0);
         assert_eq!(coord.missing_count(), 0);
+        assert!(coord.is_complete());
         assert!(!coord.record_response(
             10,
             &Frame::SnapshotBarrierResponse {
