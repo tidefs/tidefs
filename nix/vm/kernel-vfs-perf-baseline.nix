@@ -28,7 +28,7 @@ let
     TMPDIR="''${TIDEFS_PERF_TMPDIR:-/tmp/tidefs-kmod-perf-baseline}"
     QEMU_MEM="''${TIDEFS_PERF_QEMU_MEM:-512M}"
     QEMU_ACCEL="tcg"
-    TIMEOUT_SEC=600
+    TIMEOUT_SEC="''${TIDEFS_KERNEL_PERF_TIMEOUT:-600}"
     SOURCE_DIR="''${TIDEFS_SOURCE_DIR:-}"
     if [ -z "$SOURCE_DIR" ]; then
       SOURCE_DIR="''${TIDEFS_REPO_ROOT:-}"
@@ -40,7 +40,7 @@ let
 
     usage() {
       cat <<EOF
-Usage: tidefs-kmod-perf-baseline [--keep-tmp] [--self-test-parser]
+Usage: tidefs-kmod-perf-baseline [--keep-tmp] [--timeout SECONDS] [--self-test-parser]
 
 Kernel VFS throughput latency baseline.
 Boots Linux 7.0 QEMU, mounts kmod-posix-vfs in bootstrap mode, runs
@@ -48,6 +48,7 @@ sequential read/write throughput and stat latency measurements.
 
 Options:
   --keep-tmp           Do not remove temp directory on exit
+  --timeout SECONDS    QEMU boot timeout (default: $TIMEOUT_SEC)
   --self-test-parser   Run parser fixtures without booting QEMU
   --help, -h           Show this message
 
@@ -63,6 +64,15 @@ EOF
     while [[ "$#" -gt 0 ]]; do
       case "$1" in
         --keep-tmp) KEEP_TMP=1; shift ;;
+        --timeout)
+          if [[ "$#" -lt 2 || "$2" == -* ]]; then
+            echo "ERROR: --timeout requires SECONDS" >&2
+            usage >&2
+            exit 2
+          fi
+          TIMEOUT_SEC="$2"
+          shift 2
+          ;;
         --self-test-parser) SELF_TEST_PARSER=1; shift ;;
         --help|-h) usage; exit 0 ;;
         *) echo "ERROR: unknown option: $1" >&2; usage >&2; exit 2 ;;
