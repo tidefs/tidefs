@@ -1790,46 +1790,66 @@ impl VfsLocalFileSystem {
         }
         let pool = request.pool.as_str();
         let wants_json = request.output.wants_json();
-        let args = live_admin_args_to_json(&request.args);
 
         Ok(match &request.command {
-            LivePoolAdminCommand::DatasetCreate => {
-                self.live_dataset_create(pool, &args, wants_json)
-            }
-            LivePoolAdminCommand::DatasetList => self.live_dataset_list(pool, &args, wants_json),
-            LivePoolAdminCommand::DatasetRename => self.live_dataset_rename(pool, &args),
-            LivePoolAdminCommand::DatasetDestroy => {
-                self.live_dataset_destroy(pool, &args, wants_json)
-            }
-            LivePoolAdminCommand::DatasetSetStrategy => self.live_dataset_set_strategy(&args),
-            LivePoolAdminCommand::DatasetUpgrade => self.live_dataset_upgrade(&args),
-            LivePoolAdminCommand::DatasetSealKey => self.live_dataset_seal_key(&args),
-            LivePoolAdminCommand::DatasetRotateKey => self.live_dataset_rotate_key(&args),
-            LivePoolAdminCommand::DatasetGet => self.live_dataset_get(pool, &args, wants_json),
-            LivePoolAdminCommand::DatasetSet => self.live_dataset_set(pool, &args, wants_json),
-            LivePoolAdminCommand::DatasetListProps => self.live_dataset_list_props(pool, &args),
-            LivePoolAdminCommand::SnapshotCreate => self.live_snapshot_create(&args),
-            LivePoolAdminCommand::SnapshotList => self.live_snapshot_list(wants_json),
-            LivePoolAdminCommand::SnapshotDestroy => self.live_snapshot_destroy(&args),
-            LivePoolAdminCommand::SnapshotRollback => self.live_snapshot_rollback(&args),
-            LivePoolAdminCommand::SnapshotExtract => self.live_snapshot_extract(&args, wants_json),
-            LivePoolAdminCommand::SnapshotSend => self.live_snapshot_send(&args, wants_json),
-            LivePoolAdminCommand::PoolGet => self.live_pool_get(&args),
-            LivePoolAdminCommand::PoolSet => self.live_pool_set(&args),
-            LivePoolAdminCommand::PoolListProps => self.live_pool_list_props(&args),
-            LivePoolAdminCommand::PoolIntegrityCheck => {
-                self.live_pool_integrity_check(pool, &args, wants_json)
-            }
             LivePoolAdminCommand::PerformanceAdmissionSnapshot => {
-                self.live_performance_admission_snapshot(pool, &args)
+                self.live_performance_admission_snapshot(pool, &request.args)
             }
-            LivePoolAdminCommand::DeviceRemove => self.live_device_remove(&args, wants_json),
             command => {
-                let (command_name, operation) = command.parts();
-                live_admin_typed_error(LivePoolAdminError::unsupported_command(
-                    command_name,
-                    operation,
-                ))
+                let args = live_admin_args_to_json(&request.args);
+                match command {
+                    LivePoolAdminCommand::DatasetCreate => {
+                        self.live_dataset_create(pool, &args, wants_json)
+                    }
+                    LivePoolAdminCommand::DatasetList => {
+                        self.live_dataset_list(pool, &args, wants_json)
+                    }
+                    LivePoolAdminCommand::DatasetRename => self.live_dataset_rename(pool, &args),
+                    LivePoolAdminCommand::DatasetDestroy => {
+                        self.live_dataset_destroy(pool, &args, wants_json)
+                    }
+                    LivePoolAdminCommand::DatasetSetStrategy => {
+                        self.live_dataset_set_strategy(&args)
+                    }
+                    LivePoolAdminCommand::DatasetUpgrade => self.live_dataset_upgrade(&args),
+                    LivePoolAdminCommand::DatasetSealKey => self.live_dataset_seal_key(&args),
+                    LivePoolAdminCommand::DatasetRotateKey => self.live_dataset_rotate_key(&args),
+                    LivePoolAdminCommand::DatasetGet => {
+                        self.live_dataset_get(pool, &args, wants_json)
+                    }
+                    LivePoolAdminCommand::DatasetSet => {
+                        self.live_dataset_set(pool, &args, wants_json)
+                    }
+                    LivePoolAdminCommand::DatasetListProps => {
+                        self.live_dataset_list_props(pool, &args)
+                    }
+                    LivePoolAdminCommand::SnapshotCreate => self.live_snapshot_create(&args),
+                    LivePoolAdminCommand::SnapshotList => self.live_snapshot_list(wants_json),
+                    LivePoolAdminCommand::SnapshotDestroy => self.live_snapshot_destroy(&args),
+                    LivePoolAdminCommand::SnapshotRollback => self.live_snapshot_rollback(&args),
+                    LivePoolAdminCommand::SnapshotExtract => {
+                        self.live_snapshot_extract(&args, wants_json)
+                    }
+                    LivePoolAdminCommand::SnapshotSend => {
+                        self.live_snapshot_send(&args, wants_json)
+                    }
+                    LivePoolAdminCommand::PoolGet => self.live_pool_get(&args),
+                    LivePoolAdminCommand::PoolSet => self.live_pool_set(&args),
+                    LivePoolAdminCommand::PoolListProps => self.live_pool_list_props(&args),
+                    LivePoolAdminCommand::PoolIntegrityCheck => {
+                        self.live_pool_integrity_check(pool, &args, wants_json)
+                    }
+                    LivePoolAdminCommand::DeviceRemove => {
+                        self.live_device_remove(&args, wants_json)
+                    }
+                    command => {
+                        let (command_name, operation) = command.parts();
+                        live_admin_typed_error(LivePoolAdminError::unsupported_command(
+                            command_name,
+                            operation,
+                        ))
+                    }
+                }
             }
         })
     }
@@ -1837,11 +1857,12 @@ impl VfsLocalFileSystem {
     fn live_performance_admission_snapshot(
         &self,
         pool: &str,
-        args: &Value,
+        args: &LivePoolAdminArgs,
     ) -> LivePoolAdminResponse {
-        let workload = live_admin_arg(args, "workload").unwrap_or("fuse-smoke-mount-quick");
-        let mount_adapter = live_admin_arg(args, "mount_adapter").unwrap_or("fuse");
-        let artifact_path = live_admin_arg(args, "artifact_path").ok();
+        let workload =
+            live_admin_typed_optional_arg(args, "workload").unwrap_or("fuse-smoke-mount-quick");
+        let mount_adapter = live_admin_typed_optional_arg(args, "mount_adapter").unwrap_or("fuse");
+        let artifact_path = live_admin_typed_optional_arg(args, "artifact_path");
         let mut fs = self.fs.borrow_mut();
         let config = fs.admission_config();
         let snapshot = fs.take_admission_snapshot().as_evidence_record();
@@ -3424,6 +3445,16 @@ fn live_admin_arg<'a>(args: &'a Value, key: &str) -> std::result::Result<&'a str
 fn live_admin_optional_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
     args.get(key)
         .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+}
+
+fn live_admin_typed_optional_arg<'a>(args: &'a LivePoolAdminArgs, key: &str) -> Option<&'a str> {
+    args.0
+        .get(key)
+        .and_then(|value| match value {
+            LivePoolAdminArg::String(value) => Some(value.as_str()),
+            _ => None,
+        })
         .filter(|value| !value.is_empty())
 }
 
