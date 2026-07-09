@@ -162,6 +162,12 @@ fn runtime_artifact_classifier_is_token_based() {
     assert!(!is_runtime_artifact_path(Path::new(
         "validation/artifacts/kernel/runtime/output.manifest.json"
     )));
+    assert!(!is_runtime_artifact_path(Path::new(
+        "validation/artifacts/crash-oracle/runtime.MANIFEST.JSON"
+    )));
+    assert!(!is_runtime_artifact_path(Path::new(
+        "validation/artifacts/kernel/runtime/output.Manifest.Json"
+    )));
 }
 
 #[test]

@@ -299,7 +299,7 @@ pub fn is_runtime_artifact_path(path: impl AsRef<Path>) -> bool {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("");
-    if file_name.ends_with(".manifest.json") {
+    if file_name.to_ascii_lowercase().ends_with(".manifest.json") {
         return false;
     }
 
