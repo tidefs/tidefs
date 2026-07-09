@@ -737,17 +737,9 @@ fn send_live_owner_request_at(
                 );
             } else {
                 annotate_live_owner_status_json(route, &mut value);
-                print_live_owner_status_classification(route);
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&value).map_err(|err| {
-                        LiveOwnerRequestError::Owner {
-                            exit_code: 2,
-                            message: format!("format live-owner JSON: {err}"),
-                            detail: None,
-                        }
-                    })?
-                );
+                for line in live_owner_machine_json_human_lines(route, &value) {
+                    println!("{line}");
+                }
             }
             Ok(())
         }
@@ -953,6 +945,42 @@ fn live_owner_status_text_json(route: &LivePoolRoute<'_>, text: &str) -> serde_j
             "text": text,
         })
     }
+}
+
+fn live_owner_machine_json_human_lines(
+    route: &LivePoolRoute<'_>,
+    value: &serde_json::Value,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    if is_status_route(route) {
+        lines.push(format!(
+            "source_classification: {}",
+            super::classification::StatusSource::LiveOwner.label()
+        ));
+    }
+
+    if let Some(object) = value.as_object() {
+        for key in ["text", "message", "error"] {
+            if let Some(text) = object.get(key).and_then(serde_json::Value::as_str) {
+                let message_lines: Vec<String> = text
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .map(ToOwned::to_owned)
+                    .collect();
+                if !message_lines.is_empty() {
+                    lines.extend(message_lines);
+                    return lines;
+                }
+            }
+        }
+    }
+
+    lines.push(format!(
+        "tidefsctl {} {}: live owner returned machine JSON; rerun with --json for details",
+        route.command, route.operation
+    ));
+    lines
 }
 
 fn decode_live_owner_hex(value: &str) -> Result<Vec<u8>, LiveOwnerRequestError> {
@@ -1983,6 +2011,58 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some(super::super::classification::StatusSource::LiveOwner.label())
         );
+    }
+
+    #[test]
+    fn live_owner_machine_json_human_lines_preserve_status_source() {
+        let route = LivePoolRoute {
+            command: "device",
+            operation: "status",
+            pool: "tank",
+            pool_uuid: None,
+            json: false,
+            args: LivePoolAdminArgs::default(),
+        };
+        let value = serde_json::json!({
+            "ok": true,
+            "text": "live status\n\nready",
+        });
+
+        let lines = live_owner_machine_json_human_lines(&route, &value);
+        let expected_source = format!(
+            "source_classification: {}",
+            super::super::classification::StatusSource::LiveOwner.label()
+        );
+
+        assert_eq!(
+            lines.first().map(String::as_str),
+            Some(expected_source.as_str())
+        );
+        assert!(lines.iter().any(|line| line == "live status"));
+        assert!(lines.iter().any(|line| line == "ready"));
+    }
+
+    #[test]
+    fn live_owner_machine_json_human_lines_avoid_raw_json_fallback() {
+        let route = LivePoolRoute {
+            command: "dataset",
+            operation: "list",
+            pool: "tank",
+            pool_uuid: None,
+            json: false,
+            args: LivePoolAdminArgs::default(),
+        };
+        let value = serde_json::json!({
+            "ok": true,
+            "devices": [],
+        });
+
+        let lines = live_owner_machine_json_human_lines(&route, &value);
+        let output = lines.join("\n");
+
+        assert!(!output.contains("devices"));
+        assert!(!output.contains("[]"));
+        assert!(output.contains("--json"));
     }
 
     #[test]
