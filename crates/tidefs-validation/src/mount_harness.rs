@@ -1243,7 +1243,7 @@ mod tests {
         Ok(())
     }
 
-    /// Primary advancement-gate test:
+    /// Manual mounted remount-persistence row:
     ///
     ///   mount(RW) -> write -> sync -> unmount -> remount -> read -> verify
     ///

@@ -209,7 +209,7 @@ fn write_fsync_remount_verify_4kib_checksummed() {
 
 // ── criterion 3: crash-recovery simulation ─────────────────────────────────
 
-/// Full advancement-gate test: write → fsync → unmount (simulate crash) →
+/// Manual mounted write-durability row: write → fsync → unmount (simulate crash) →
 /// daemon restart → remount → read → verify byte-for-byte.
 ///
 /// Uses the same `MountHarness::remount()` helper which spawns a fresh
