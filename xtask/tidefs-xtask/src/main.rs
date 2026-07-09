@@ -2645,7 +2645,16 @@ fn print_help() {
     );
     println!("  auto-release-stale-claims unsupported: the legacy Forgejo claim tracker has been retired");
     println!(
+        "  auto-release-stale   unsupported: the legacy Forgejo claim tracker has been retired"
+    );
+    println!(
+        "  auto-release         unsupported: the legacy Forgejo claim tracker has been retired"
+    );
+    println!(
         "  coordination-health      unsupported: the legacy Forgejo claim tracker has been retired"
+    );
+    println!(
+        "  coordination-health-report unsupported: the legacy Forgejo claim tracker has been retired"
     );
     println!("  acquire-claim|claim-issue unsupported: the legacy Forgejo claim tracker has been retired");
     println!("  check-abandoned-worktrees detect stale local worktree directories");

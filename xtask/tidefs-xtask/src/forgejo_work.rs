@@ -11,8 +11,9 @@
 // Legacy Forgejo claim-tracker commands (check-stale-claims,
 // check-stale-forgejo-claims, check-duplicate-claims,
 // check-duplicate-forgejo-claims, coordination-health,
-// auto-release-stale-claims, acquire-claim, claim-issue) fail closed with an explicit
-// unsupported message.
+// coordination-health-report, auto-release-stale-claims,
+// auto-release-stale, auto-release, acquire-claim, claim-issue)
+// fail closed with an explicit unsupported message.
 //
 // GitHub issue checks use the `gh` CLI; no hard-coded API credentials.
 
