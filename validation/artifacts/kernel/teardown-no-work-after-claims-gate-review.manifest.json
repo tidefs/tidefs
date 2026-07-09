@@ -1,0 +1,16 @@
+{
+  "manifest_version": 2,
+  "claim_id": "kernel.teardown.no_work_after.v1",
+  "evidence_class": "claims-gate-review",
+  "validation_tier": "source-model",
+  "scope": "kernel-teardown-runtime-acceptance-review",
+  "artifact_path": "validation/artifacts/kernel/teardown-no-work-after-claims-gate-review.toml",
+  "content_digest": "blake3:6f658e976e1ed8b8c46c8f7a92b25ed355356436c1c202d3c1cd669f5da2f342",
+  "run_id": "deterministic-fixture:kernel-teardown-claims-gate-review-v1",
+  "source_ref": "refs/heads/codex2/issue-1851-validation-artifacts",
+  "outcome": "pass",
+  "residual_risk": "This manifest records the claims-gate review artifact only. The claim remains blocked because accepted T6 full-kernel/no-daemon runtime evidence is missing, and this artifact does not create production runtime proof.",
+  "source": "tidefs-kernel-teardown-claims-review",
+  "generated_at": "2026-07-09T02:59:23Z",
+  "blocking_issues": []
+}

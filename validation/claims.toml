@@ -675,9 +675,9 @@ required_evidence_classes = [
   "claims-gate-review",
 ]
 evidence_requirements = [
-  { class = "kernel-context-token-model", path = "validation/artifacts/kernel/teardown-race-proof-artifact.json", validation_tier = "source-model", blocking_issues = [] },
-  { class = "teardown-race-proof-artifact", path = "validation/artifacts/kernel/teardown-race-proof-artifact.json", validation_tier = "source-model", blocking_issues = [] },
-  { class = "claims-gate-review", path = "validation/artifacts/kernel/teardown-no-work-after-claims-gate-review.toml", validation_tier = "source-model", blocking_issues = [] },
+  { class = "kernel-context-token-model", path = "validation/artifacts/kernel/teardown-race-proof-artifact.json", validation_tier = "source-model", manifest_path = "validation/artifacts/kernel/teardown-race-proof-artifact.kernel-context-token-model.manifest.json", blocking_issues = [] },
+  { class = "teardown-race-proof-artifact", path = "validation/artifacts/kernel/teardown-race-proof-artifact.json", validation_tier = "source-model", manifest_path = "validation/artifacts/kernel/teardown-race-proof-artifact.manifest.json", blocking_issues = [] },
+  { class = "claims-gate-review", path = "validation/artifacts/kernel/teardown-no-work-after-claims-gate-review.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/kernel/teardown-no-work-after-claims-gate-review.manifest.json", blocking_issues = [] },
 ]
 blockers = [
   "Historical lineage only: closed #1186 / merged PR #1463 recorded bounded T5 mounted-kernel-vfs cutover and teardown runtime acceptance; current proof for the full claim still requires an accepted T6 full-kernel/no-daemon teardown and recovery artifact.",
