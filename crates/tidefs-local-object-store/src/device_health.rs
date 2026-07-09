@@ -431,22 +431,11 @@ impl DeviceHealthTransitionEntry {
     #[must_use]
     pub fn fail_closed_lifecycle_evidence(
         &self,
-        pool_guid: [u8; 16],
-        pool_name: impl Into<String>,
+        context: PoolLifecycleContext,
     ) -> Option<PoolLifecycleEvidence> {
         if self.to != DeviceHealth::Faulted {
             return None;
         }
-
-        let context = PoolLifecycleContext {
-            pool_guid: Some(pool_guid),
-            pool_name: Some(pool_name.into()),
-            device_count: 1,
-            expected_device_count: 1,
-            capacity_bytes: 0,
-            topology_generation: 0,
-            commit_group: 0,
-        };
 
         let topology_complete = context.topology_complete();
 
@@ -520,6 +509,18 @@ impl fmt::Display for DeviceHealthTransition {
 mod tests {
     use super::*;
     use crate::pool_lifecycle_evidence::PoolLifecycleOutcome;
+
+    fn lifecycle_context() -> PoolLifecycleContext {
+        PoolLifecycleContext {
+            pool_guid: Some([0x17; 16]),
+            pool_name: Some("pool-a".to_string()),
+            device_count: 2,
+            expected_device_count: 2,
+            capacity_bytes: 4096,
+            topology_generation: 7,
+            commit_group: 11,
+        }
+    }
 
     // Default thresholds for tests: degrade at 5, fault at 20, 60s window.
     fn test_state(non_redundant: bool) -> DeviceHealthState {
@@ -974,7 +975,7 @@ mod tests {
         );
 
         let evidence = transition
-            .fail_closed_lifecycle_evidence([0x17; 16], "pool-a")
+            .fail_closed_lifecycle_evidence(lifecycle_context())
             .expect("faulted transition should emit fail-closed evidence");
 
         assert_eq!(evidence.action, PoolLifecycleAction::FailClosed);
@@ -984,8 +985,39 @@ mod tests {
         assert!(evidence.is_fail_closed());
         assert_eq!(evidence.pool_guid, Some([0x17; 16]));
         assert_eq!(evidence.pool_name.as_deref(), Some("pool-a"));
+        assert_eq!(evidence.device_count, 2);
+        assert_eq!(evidence.expected_device_count, 2);
+        assert_eq!(evidence.capacity_bytes, 4096);
+        assert_eq!(evidence.topology_generation, 7);
+        assert_eq!(evidence.commit_group, 11);
         assert!(evidence.reason.contains("DEGRADED to FAULTED"));
         assert!(evidence.reason.contains("21 Write"));
+    }
+
+    #[test]
+    fn faulted_transition_preserves_incomplete_topology_fail_closed() {
+        let transition = DeviceHealthTransitionEntry::new(
+            DeviceHealth::Online,
+            DeviceHealth::Faulted,
+            DeviceErrorKind::Checksum,
+            51,
+        );
+        let mut context = lifecycle_context();
+        context.device_count = 1;
+
+        let evidence = transition
+            .fail_closed_lifecycle_evidence(context)
+            .expect("faulted transition should emit fail-closed evidence");
+
+        assert_eq!(evidence.action, PoolLifecycleAction::FailClosed);
+        assert_eq!(evidence.outcome, PoolLifecycleOutcome::Refused);
+        assert_eq!(evidence.device_count, 1);
+        assert_eq!(evidence.expected_device_count, 2);
+        assert!(!evidence.topology_complete);
+        assert!(!evidence.owner_authorized);
+        assert!(evidence.is_fail_closed());
+        assert!(evidence.reason.contains("ONLINE to FAULTED"));
+        assert!(evidence.reason.contains("51 Checksum"));
     }
 
     #[test]
@@ -998,7 +1030,7 @@ mod tests {
         );
 
         assert!(transition
-            .fail_closed_lifecycle_evidence([0x17; 16], "pool-a")
+            .fail_closed_lifecycle_evidence(lifecycle_context())
             .is_none());
     }
 }
