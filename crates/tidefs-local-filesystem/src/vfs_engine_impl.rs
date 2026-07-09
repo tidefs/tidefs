@@ -6944,7 +6944,7 @@ mod tests {
         let response = engine
             .handle_live_pool_admin_request(&request)
             .expect("dispatch live admin request");
-        live_admin_response_to_legacy_json(response)
+        live_admin_response_to_assertion_json(response)
     }
 
     fn live_admin_args_from_json(args: Value) -> LivePoolAdminArgs {
@@ -6981,7 +6981,7 @@ mod tests {
         }
     }
 
-    fn live_admin_response_to_legacy_json(response: LivePoolAdminResponse) -> Value {
+    fn live_admin_response_to_assertion_json(response: LivePoolAdminResponse) -> Value {
         match response.body {
             LivePoolAdminResponseBody::Empty => {
                 json!({ "ok": response.exit_code == 0 })
@@ -7047,7 +7047,7 @@ mod tests {
         let response = engine
             .handle_live_pool_admin_request(&request)
             .expect("dispatch live admin request");
-        let value = live_admin_response_to_legacy_json(response);
+        let value = live_admin_response_to_assertion_json(response);
 
         assert_eq!(value["ok"], false);
         assert_eq!(value["exit_code"], 1);
