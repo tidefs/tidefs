@@ -641,12 +641,12 @@ fn send_live_owner_request_at(
     root: &Path,
     route: &LivePoolRoute<'_>,
 ) -> Result<(), LiveOwnerRequestError> {
+    let request = live_owner_request(route)?;
     let manifest = find_live_owner_manifest_at(root, route)?;
     let socket_path = manifest_socket_endpoint(&manifest, route)?;
     let mut stream = UnixStream::connect(&socket_path).map_err(|err| {
         LiveOwnerRequestError::Unavailable(format!("connect {}: {err}", socket_path.display()))
     })?;
-    let request = live_owner_request(route)?;
     stream
         .write_all(
             serde_json::to_string(&request)
@@ -1857,6 +1857,51 @@ mod tests {
                 Some("42424242424242424242424242424242")
             );
             assert_eq!(request.args.0.get(expected_arg.0), Some(&expected_arg.1));
+        }
+    }
+
+    #[test]
+    fn send_live_owner_request_rejects_unsupported_command_before_manifest_lookup() {
+        let dir = tempfile::tempdir().unwrap();
+        let route = LivePoolRoute {
+            command: "pool",
+            operation: "unknown",
+            pool: "tank",
+            pool_uuid: Some([0x42; 16]),
+            json: false,
+            args: LivePoolAdminArgs::default(),
+        };
+
+        let err = send_live_owner_request_at(dir.path(), &route).unwrap_err();
+
+        match err {
+            LiveOwnerRequestError::Owner {
+                exit_code,
+                message,
+                detail,
+            } => {
+                assert_eq!(exit_code, 1);
+                assert_eq!(
+                    message,
+                    "unsupported live-owner command tidefsctl pool unknown"
+                );
+                let detail = detail.expect("typed unsupported-command detail");
+                assert_eq!(
+                    detail.get("kind").and_then(serde_json::Value::as_str),
+                    Some("unsupported_command")
+                );
+                assert_eq!(
+                    detail.get("command").and_then(serde_json::Value::as_str),
+                    Some("pool")
+                );
+                assert_eq!(
+                    detail.get("operation").and_then(serde_json::Value::as_str),
+                    Some("unknown")
+                );
+            }
+            LiveOwnerRequestError::Unavailable(message) => {
+                panic!("unsupported route should fail before socket lookup, got {message}");
+            }
         }
     }
 
