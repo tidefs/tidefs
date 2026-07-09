@@ -542,20 +542,29 @@ impl LocalAckReceipt {
     }
 
     fn has_local_ack_shape_consistency(self) -> bool {
-        match self.receipt.ack_class {
-            StorageIntentGuaranteeClass::LocalIntent => {
-                self.receipt.durability.state == DurabilityState::DurableIntent
-                    && self.receipt.media_role == StorageMediaRole::SyncIntent
-                    && self.receipt.action_class == StorageIntentActionClass::NewWriteShaping
+        self.has_local_ack_receipt_authority_shape()
+            && match self.receipt.ack_class {
+                StorageIntentGuaranteeClass::LocalIntent => {
+                    self.receipt.durability.state == DurabilityState::DurableIntent
+                        && self.receipt.media_role == StorageMediaRole::SyncIntent
+                        && self.receipt.action_class == StorageIntentActionClass::NewWriteShaping
+                }
+                StorageIntentGuaranteeClass::FullPlacement => {
+                    self.receipt.durability.state == DurabilityState::FullPlacement
+                        && self.receipt.media_role == StorageMediaRole::PlacementAuthority
+                        && self.receipt.action_class
+                            == StorageIntentActionClass::DurablePlacementMovement
+                }
+                _ => false,
             }
-            StorageIntentGuaranteeClass::FullPlacement => {
-                self.receipt.durability.state == DurabilityState::FullPlacement
-                    && self.receipt.media_role == StorageMediaRole::PlacementAuthority
-                    && self.receipt.action_class
-                        == StorageIntentActionClass::DurablePlacementMovement
-            }
-            _ => false,
-        }
+    }
+
+    fn has_local_ack_receipt_authority_shape(self) -> bool {
+        self.receipt.failure_domains == FailureDomainMask::LOCAL
+            && self.receipt.proximity == ProximityClass::LocalMedia
+            && self.receipt.trust == TrustEvidenceState::EMPTY
+            && self.receipt.media_class == StorageMediaClass::ObjectAppliance
+            && self.receipt.read_source == ReadServingSourceClass::PlacementReceipt
     }
 
     fn has_posix_durable_requested_ack_floor(self) -> bool {
@@ -1098,6 +1107,7 @@ mod tests {
     use super::*;
     use tidefs_storage_intent_core::{
         ack_receipt_satisfies_requested_floor, evaluate_receipt_against_policy,
+        FailureDomainDimension,
     };
 
     #[test]
@@ -1195,6 +1205,53 @@ mod tests {
         assert!(receipt.has_requested_ack_floor_evidence());
         assert!(!receipt.has_local_ack_shape_consistency());
         assert!(!receipt.satisfies_requested_ack_floor());
+    }
+
+    #[test]
+    fn local_ack_floor_requires_exact_receipt_authority_shape() {
+        let receipt = LocalAckReceipt::full_local_placement(
+            30,
+            LocalAckOperation::Fsync,
+            LocalAckReceiptTarget::inode(30),
+            None,
+        );
+
+        assert!(receipt.satisfies_requested_ack_floor());
+
+        let mut widened_failure_domain = receipt;
+        widened_failure_domain.receipt.failure_domains =
+            FailureDomainMask::LOCAL.with(FailureDomainDimension::Node);
+        let shared_result = evaluate_receipt_against_policy(
+            local_ack_policy(widened_failure_domain.requested_ack_floor),
+            widened_failure_domain.receipt,
+        );
+        assert!(
+            shared_result.satisfied,
+            "refusal was {:?}",
+            shared_result.refusal
+        );
+        assert!(!widened_failure_domain.has_local_ack_shape_consistency());
+        assert!(!widened_failure_domain.satisfies_requested_ack_floor());
+
+        let mut node_proximity = receipt;
+        node_proximity.receipt.proximity = ProximityClass::Node;
+
+        let mut trust_epoch = receipt;
+        trust_epoch.receipt.trust = TrustEvidenceState {
+            key_epoch: 1,
+            ..TrustEvidenceState::EMPTY
+        };
+
+        let mut nvme_media = receipt;
+        nvme_media.receipt.media_class = StorageMediaClass::NvmeFlash;
+
+        let mut cache_read_source = receipt;
+        cache_read_source.receipt.read_source = ReadServingSourceClass::Cache;
+
+        for receipt in [node_proximity, trust_epoch, nvme_media, cache_read_source] {
+            assert!(!receipt.has_local_ack_shape_consistency());
+            assert!(!receipt.satisfies_requested_ack_floor());
+        }
     }
 
     #[test]
