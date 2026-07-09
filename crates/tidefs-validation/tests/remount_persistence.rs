@@ -155,7 +155,7 @@ fn remount_persistence_subdir_files() {
 }
 
 // ===========================================================================
-// Same-session write-read smoke tests (issue #3732 advancement criterion 1)
+// Same-session write-read mounted-runtime rows
 // ===========================================================================
 
 /// Write known data through a FUSE mount, then read it back within the same
