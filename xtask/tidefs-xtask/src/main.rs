@@ -1086,24 +1086,9 @@ fn main() {
             }
         }
         Some(command @ ("acquire-claim" | "claim-issue")) => {
-            let issue_num: u64 = match args.next().and_then(|s| s.parse().ok()) {
-                Some(n) => n,
-                None => {
-                    eprintln!("usage: tidefs-xtask {command} <issue-number>");
-                    process::exit(1);
-                }
-            };
-            match forgejo_work::acquire_claim_command(command, issue_num) {
-                Ok(true) => {
-                    println!("claimed issue #{issue_num}");
-                }
-                Ok(false) => {
-                    println!("issue #{issue_num} is already claimed");
-                }
-                Err(err) => {
-                    eprintln!("claim failed: {err}");
-                    process::exit(1);
-                }
+            if let Err(err) = forgejo_work::acquire_claim_command(command, 0) {
+                eprintln!("{err}");
+                process::exit(1);
             }
         }
         Some("generate-format-golden") => {
@@ -2662,9 +2647,7 @@ fn print_help() {
     println!(
         "  coordination-health      unsupported: the legacy Forgejo claim tracker has been retired"
     );
-    println!(
-        "  acquire-claim|claim-issue <N> unsupported: the legacy Forgejo claim tracker has been retired"
-    );
+    println!("  acquire-claim|claim-issue unsupported: the legacy Forgejo claim tracker has been retired");
     println!("  check-abandoned-worktrees detect stale local worktree directories");
     println!("  check-stale-worktrees   alias for check-abandoned-worktrees");
     println!("  check-local-filesystem   validate the local filesystem MVP source slice");
