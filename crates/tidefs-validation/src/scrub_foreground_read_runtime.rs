@@ -201,9 +201,15 @@ pub struct ServiceCurveEvidence {
     pub foreground_read_wait_ticks: u64,
     pub max_foreground_read_wait_ticks: u64,
     pub foreground_read_within_bound: bool,
+    pub scheduled_scrub_admitted: u32,
+    pub scheduled_scrub_deferred: u32,
+    pub scheduled_max_scrub_queue_depth: u32,
     pub unscheduled_foreground_read_completed_tick: u64,
     pub unscheduled_foreground_read_wait_ticks: u64,
     pub unscheduled_foreground_read_within_bound: bool,
+    pub unscheduled_scrub_admitted: u32,
+    pub unscheduled_scrub_deferred: u32,
+    pub unscheduled_max_scrub_queue_depth: u32,
 }
 
 pub fn run_scrub_foreground_read_runtime(command: String) -> ScrubForegroundReadRuntimeEvidence {
@@ -448,8 +454,8 @@ fn base_evidence(input: BaseEvidenceInput) -> ScrubForegroundReadRuntimeEvidence
 }
 
 fn build_scrub_activity(service_curve: &ServiceCurveEvidence) -> ScrubActivityEvidence {
-    let scrub_admitted = SCRUB_UNITS_REQUESTED.min(service_curve.scrub_queue_slots);
-    let scrub_deferred = SCRUB_UNITS_REQUESTED.saturating_sub(scrub_admitted);
+    let scrub_admitted = service_curve.scheduled_scrub_admitted;
+    let scrub_deferred = service_curve.scheduled_scrub_deferred;
     let mut limiter = DeterministicScrubLimiter::new(SCRUB_LIMIT_BYTES_PER_SEC, SCRUB_LIMIT_IOPS);
     let first = rate_limit_attempt(&mut limiter, "pre-read-scrub-dispatch");
     let pending_before_read = if first.accepted {
@@ -472,7 +478,7 @@ fn build_scrub_activity(service_curve: &ServiceCurveEvidence) -> ScrubActivityEv
         scrub_unit_bytes: SCRUB_UNIT_BYTES,
         pending_units_before_read: pending_before_read,
         pending_units_after_read: pending_after_read,
-        max_scrub_queue_depth: scrub_admitted,
+        max_scrub_queue_depth: service_curve.scheduled_max_scrub_queue_depth,
         scrub_admitted_by_service_curve: scrub_admitted,
         scrub_deferred_by_service_curve: scrub_deferred,
         rate_limiter_active: limiter.is_active(),
@@ -589,10 +595,16 @@ fn build_service_curve() -> ServiceCurveEvidence {
         max_foreground_read_wait_ticks: config.max_foreground_read_wait_ticks,
         foreground_read_within_bound: scheduled
             .foreground_read_within_bound(config.max_foreground_read_wait_ticks),
+        scheduled_scrub_admitted: scheduled.scrub_admitted,
+        scheduled_scrub_deferred: scheduled.scrub_deferred,
+        scheduled_max_scrub_queue_depth: scheduled.max_scrub_queue_depth,
         unscheduled_foreground_read_completed_tick: unscheduled.foreground_read_completed_tick,
         unscheduled_foreground_read_wait_ticks: unscheduled.foreground_read_wait_ticks,
         unscheduled_foreground_read_within_bound: unscheduled
             .foreground_read_within_bound(config.max_foreground_read_wait_ticks),
+        unscheduled_scrub_admitted: unscheduled.scrub_admitted,
+        unscheduled_scrub_deferred: unscheduled.scrub_deferred,
+        unscheduled_max_scrub_queue_depth: unscheduled.max_scrub_queue_depth,
     }
 }
 
@@ -924,11 +936,40 @@ mod tests {
         assert!(service_curve.scrub_unit_admitted_by_service_curve);
         assert!(service_curve.foreground_read_within_bound);
         assert!(!service_curve.unscheduled_foreground_read_within_bound);
+        assert_eq!(
+            service_curve.scheduled_scrub_admitted,
+            ServiceCurve::SCRUB_BOUNDED_DEFAULT.queue_slots
+        );
+        assert_eq!(
+            service_curve.scheduled_scrub_deferred,
+            SCRUB_UNITS_REQUESTED - ServiceCurve::SCRUB_BOUNDED_DEFAULT.queue_slots
+        );
+        assert_eq!(
+            service_curve.scheduled_max_scrub_queue_depth,
+            ServiceCurve::SCRUB_BOUNDED_DEFAULT.queue_slots
+        );
+        assert_eq!(
+            service_curve.unscheduled_scrub_admitted,
+            SCRUB_UNITS_REQUESTED
+        );
+        assert_eq!(service_curve.unscheduled_scrub_deferred, 0);
+        assert_eq!(
+            service_curve.unscheduled_max_scrub_queue_depth,
+            SCRUB_UNITS_REQUESTED
+        );
 
         let scrub_activity = build_scrub_activity(&service_curve);
         assert_eq!(
             scrub_activity.scrub_deferred_by_service_curve,
-            SCRUB_UNITS_REQUESTED - ServiceCurve::SCRUB_BOUNDED_DEFAULT.queue_slots
+            service_curve.scheduled_scrub_deferred
+        );
+        assert_eq!(
+            scrub_activity.scrub_admitted_by_service_curve,
+            service_curve.scheduled_scrub_admitted
+        );
+        assert_eq!(
+            scrub_activity.max_scrub_queue_depth,
+            service_curve.scheduled_max_scrub_queue_depth
         );
         assert!(scrub_activity.pending_or_rate_limited_during_read);
         assert!(scrub_activity.throttle_observed);
