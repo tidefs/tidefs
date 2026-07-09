@@ -7652,7 +7652,6 @@ impl FuseVfsAdapter {
         if length == 0 {
             return Ok(());
         }
-        self.clear_dirty_trackers_for_authoritative_range(ino, offset, length);
         if let Some(ref wb_cache) = self.writeback_page_cache {
             self.reconcile_page_cache_after_authoritative_range(
                 wb_cache, ino, offset, length, payload,
@@ -7675,6 +7674,7 @@ impl FuseVfsAdapter {
                 payload,
             )?;
         }
+        self.clear_dirty_trackers_for_authoritative_range(ino, offset, length);
         self.reconcile_writeback_inode_cache_after_authoritative_range(ino);
         Ok(())
     }
@@ -42007,6 +42007,104 @@ mod tests {
         assert!(
             page.is_dirty(),
             "partial authoritative reconciliation must not clear unrelated dirty bytes"
+        );
+    }
+
+    #[test]
+    fn failed_authoritative_reconcile_preserves_dirty_ownership() {
+        let mut fixture = adapter_fixture();
+        fixture.adapter.writeback_page_cache = Some(Arc::new(PageCache::new(64, 4096)));
+        let ino = 655;
+        let inode = InodeId::new(ino);
+        let wb_cache = fixture
+            .adapter
+            .writeback_page_cache
+            .as_ref()
+            .expect("writeback page cache")
+            .clone();
+        wb_cache.insert(ino, 0).expect("insert dirty mirror");
+        {
+            let mut page = wb_cache.lookup(ino, 0).expect("lookup dirty mirror");
+            page.data_mut().fill(0xAA);
+            page.mark_dirty();
+        }
+        fixture
+            .adapter
+            .dirty_state
+            .lock()
+            .unwrap()
+            .entry(ino)
+            .or_default()
+            .mark_dirty(0, 4096);
+        let shared_tracker = Arc::new(Mutex::new(
+            tidefs_local_filesystem::dirty_page_tracker::DirtyPageTracker::new(),
+        ));
+        shared_tracker.lock().unwrap().mark_dirty(inode, 0, 4096);
+        fixture.adapter.writeback_range_tracker = Some(Arc::clone(&shared_tracker));
+        let worker_tracker = fixture
+            .adapter
+            .write_dispatch
+            .lock()
+            .unwrap()
+            .dirty_page_tracker_arc();
+        worker_tracker
+            .lock()
+            .unwrap()
+            .mark_dirty(ino, 0, 4096)
+            .expect("seed worker dirty range");
+        {
+            let mut cache = fixture.adapter.writeback_cache.lock().unwrap();
+            cache.insert(ino);
+            cache.mark_dirty(ino, 4096);
+        }
+
+        let err = fixture
+            .adapter
+            .reconcile_dirty_mirrors_for_authoritative_range(
+                ino,
+                0,
+                4096,
+                AuthoritativeRangePayload::Bytes(&[1, 2, 3]),
+            )
+            .expect_err("short authoritative payload should fail");
+
+        assert_eq!(err, Errno::EIO);
+        assert!(
+            fixture
+                .adapter
+                .dirty_state
+                .lock()
+                .unwrap()
+                .get(&ino)
+                .is_some(),
+            "daemon dirty ranges must survive failed reconciliation"
+        );
+        assert!(
+            shared_tracker.lock().unwrap().dirty_ranges(inode).is_some(),
+            "shared writeback dirty ranges must survive failed reconciliation"
+        );
+        assert!(
+            !worker_tracker
+                .lock()
+                .unwrap()
+                .get_dirty_ranges(ino)
+                .is_empty(),
+            "worker dirty ranges must survive failed reconciliation"
+        );
+        {
+            let page = wb_cache.lookup(ino, 0).expect("lookup dirty mirror");
+            assert_eq!(page.data(), &[0xAA_u8; 4096]);
+            assert!(page.is_dirty(), "dirty mirror must remain dirty");
+        }
+        assert_eq!(
+            fixture
+                .adapter
+                .writeback_cache
+                .lock()
+                .unwrap()
+                .is_dirty(ino),
+            Some(true),
+            "inode reclaim cache must remain dirty"
         );
     }
 
