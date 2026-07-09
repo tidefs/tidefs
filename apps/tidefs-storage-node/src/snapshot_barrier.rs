@@ -319,9 +319,12 @@ impl BarrierCollector {
     pub fn new(
         barrier_id: BarrierId,
         snapshot_name: String,
-        expected_peers: Vec<u64>,
+        mut expected_peers: Vec<u64>,
         config: SnapshotBarrierConfig,
     ) -> Self {
+        expected_peers.sort_unstable();
+        expected_peers.dedup();
+
         Self {
             barrier_id,
             snapshot_name,
@@ -834,6 +837,28 @@ mod tests {
         assert_eq!(c.responded_count(), 0);
         assert_eq!(c.missing_count(), 2);
         assert!(c.outcome().is_none());
+    }
+
+    #[test]
+    fn collector_deduplicates_expected_peers() {
+        let mut c = BarrierCollector::new(1, "snap".into(), vec![20, 10, 10, 20], make_config());
+        assert!(!c.is_complete());
+        assert_eq!(c.missing_count(), 2);
+
+        assert!(c.record_response(make_response(10, 1, 100, 5, 10)));
+        assert!(!c.is_complete());
+        assert_eq!(c.missing_count(), 1);
+
+        assert!(c.record_response(make_response(20, 1, 100, 5, 20)));
+        assert!(c.is_complete());
+        assert_eq!(c.missing_count(), 0);
+
+        match c.outcome() {
+            Some(BarrierOutcome::Consistent { responses, .. }) => {
+                assert_eq!(responses.len(), 2);
+            }
+            other => panic!("expected Consistent, got {other:?}"),
+        }
     }
 
     #[test]
