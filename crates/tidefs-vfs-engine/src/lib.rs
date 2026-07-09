@@ -1912,7 +1912,7 @@ impl LivePoolAdminOutput {
 }
 
 /// Typed live-owner command authority.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LivePoolAdminCommand {
     PoolStatus,
@@ -1948,79 +1948,81 @@ pub enum LivePoolAdminCommand {
     BlockReceive,
 }
 
+const LIVE_POOL_ADMIN_COMMAND_ROUTES: &[(LivePoolAdminCommand, &str, &str)] = &[
+    (LivePoolAdminCommand::PoolStatus, "pool", "status"),
+    (LivePoolAdminCommand::PoolImport, "pool", "import"),
+    (LivePoolAdminCommand::PoolMount, "pool", "mount"),
+    (LivePoolAdminCommand::PoolExport, "pool", "export"),
+    (LivePoolAdminCommand::PoolDestroy, "pool", "destroy"),
+    (LivePoolAdminCommand::PoolGet, "pool", "get"),
+    (LivePoolAdminCommand::PoolSet, "pool", "set"),
+    (LivePoolAdminCommand::PoolListProps, "pool", "list-props"),
+    (
+        LivePoolAdminCommand::PoolIntegrityCheck,
+        "pool",
+        "integrity-check",
+    ),
+    (LivePoolAdminCommand::DatasetCreate, "dataset", "create"),
+    (LivePoolAdminCommand::DatasetList, "dataset", "list"),
+    (LivePoolAdminCommand::DatasetRename, "dataset", "rename"),
+    (LivePoolAdminCommand::DatasetDestroy, "dataset", "destroy"),
+    (
+        LivePoolAdminCommand::DatasetSetStrategy,
+        "dataset",
+        "set-strategy",
+    ),
+    (LivePoolAdminCommand::DatasetUpgrade, "dataset", "upgrade"),
+    (LivePoolAdminCommand::DatasetGet, "dataset", "get"),
+    (LivePoolAdminCommand::DatasetSet, "dataset", "set"),
+    (
+        LivePoolAdminCommand::DatasetListProps,
+        "dataset",
+        "list-props",
+    ),
+    (LivePoolAdminCommand::DatasetSealKey, "dataset", "seal-key"),
+    (
+        LivePoolAdminCommand::DatasetRotateKey,
+        "dataset",
+        "rotate-key",
+    ),
+    (LivePoolAdminCommand::SnapshotCreate, "snapshot", "create"),
+    (LivePoolAdminCommand::SnapshotList, "snapshot", "list"),
+    (LivePoolAdminCommand::SnapshotDestroy, "snapshot", "destroy"),
+    (
+        LivePoolAdminCommand::SnapshotRollback,
+        "snapshot",
+        "rollback",
+    ),
+    (LivePoolAdminCommand::SnapshotExtract, "snapshot", "extract"),
+    (LivePoolAdminCommand::SnapshotSend, "snapshot", "send"),
+    (
+        LivePoolAdminCommand::PerformanceAdmissionSnapshot,
+        "performance",
+        "admission-snapshot",
+    ),
+    (LivePoolAdminCommand::DeviceRemove, "device", "remove"),
+    (LivePoolAdminCommand::BlockAttach, "block", "attach"),
+    (LivePoolAdminCommand::BlockSend, "block", "send"),
+    (LivePoolAdminCommand::BlockReceive, "block", "receive"),
+];
+
 impl LivePoolAdminCommand {
     pub fn from_parts(command: &str, operation: &str) -> Result<Self, LivePoolAdminError> {
-        let typed = match (command, operation) {
-            ("pool", "status") => Self::PoolStatus,
-            ("pool", "import") => Self::PoolImport,
-            ("pool", "mount") => Self::PoolMount,
-            ("pool", "export") => Self::PoolExport,
-            ("pool", "destroy") => Self::PoolDestroy,
-            ("pool", "get") => Self::PoolGet,
-            ("pool", "set") => Self::PoolSet,
-            ("pool", "list-props") => Self::PoolListProps,
-            ("pool", "integrity-check") => Self::PoolIntegrityCheck,
-            ("dataset", "create") => Self::DatasetCreate,
-            ("dataset", "list") => Self::DatasetList,
-            ("dataset", "rename") => Self::DatasetRename,
-            ("dataset", "destroy") => Self::DatasetDestroy,
-            ("dataset", "set-strategy") => Self::DatasetSetStrategy,
-            ("dataset", "upgrade") => Self::DatasetUpgrade,
-            ("dataset", "get") => Self::DatasetGet,
-            ("dataset", "set") => Self::DatasetSet,
-            ("dataset", "list-props") => Self::DatasetListProps,
-            ("dataset", "seal-key") => Self::DatasetSealKey,
-            ("dataset", "rotate-key") => Self::DatasetRotateKey,
-            ("snapshot", "create") => Self::SnapshotCreate,
-            ("snapshot", "list") => Self::SnapshotList,
-            ("snapshot", "destroy") => Self::SnapshotDestroy,
-            ("snapshot", "rollback") => Self::SnapshotRollback,
-            ("snapshot", "extract") => Self::SnapshotExtract,
-            ("snapshot", "send") => Self::SnapshotSend,
-            ("performance", "admission-snapshot") => Self::PerformanceAdmissionSnapshot,
-            ("device", "remove") => Self::DeviceRemove,
-            ("block", "attach") => Self::BlockAttach,
-            ("block", "send") => Self::BlockSend,
-            ("block", "receive") => Self::BlockReceive,
-            _ => return Err(LivePoolAdminError::unsupported_command(command, operation)),
-        };
-        Ok(typed)
+        LIVE_POOL_ADMIN_COMMAND_ROUTES
+            .iter()
+            .find_map(|(typed, route_command, route_operation)| {
+                ((*route_command, *route_operation) == (command, operation)).then_some(*typed)
+            })
+            .ok_or_else(|| LivePoolAdminError::unsupported_command(command, operation))
     }
 
     pub fn parts(&self) -> (&'static str, &'static str) {
-        match self {
-            Self::PoolStatus => ("pool", "status"),
-            Self::PoolImport => ("pool", "import"),
-            Self::PoolMount => ("pool", "mount"),
-            Self::PoolExport => ("pool", "export"),
-            Self::PoolDestroy => ("pool", "destroy"),
-            Self::PoolGet => ("pool", "get"),
-            Self::PoolSet => ("pool", "set"),
-            Self::PoolListProps => ("pool", "list-props"),
-            Self::PoolIntegrityCheck => ("pool", "integrity-check"),
-            Self::DatasetCreate => ("dataset", "create"),
-            Self::DatasetList => ("dataset", "list"),
-            Self::DatasetRename => ("dataset", "rename"),
-            Self::DatasetDestroy => ("dataset", "destroy"),
-            Self::DatasetSetStrategy => ("dataset", "set-strategy"),
-            Self::DatasetUpgrade => ("dataset", "upgrade"),
-            Self::DatasetGet => ("dataset", "get"),
-            Self::DatasetSet => ("dataset", "set"),
-            Self::DatasetListProps => ("dataset", "list-props"),
-            Self::DatasetSealKey => ("dataset", "seal-key"),
-            Self::DatasetRotateKey => ("dataset", "rotate-key"),
-            Self::SnapshotCreate => ("snapshot", "create"),
-            Self::SnapshotList => ("snapshot", "list"),
-            Self::SnapshotDestroy => ("snapshot", "destroy"),
-            Self::SnapshotRollback => ("snapshot", "rollback"),
-            Self::SnapshotExtract => ("snapshot", "extract"),
-            Self::SnapshotSend => ("snapshot", "send"),
-            Self::PerformanceAdmissionSnapshot => ("performance", "admission-snapshot"),
-            Self::DeviceRemove => ("device", "remove"),
-            Self::BlockAttach => ("block", "attach"),
-            Self::BlockSend => ("block", "send"),
-            Self::BlockReceive => ("block", "receive"),
-        }
+        LIVE_POOL_ADMIN_COMMAND_ROUTES
+            .iter()
+            .find_map(|(typed, command, operation)| {
+                (typed == self).then_some((*command, *operation))
+            })
+            .expect("live pool admin command route table covers every command")
     }
 }
 
@@ -2187,6 +2189,32 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
     use std::collections::HashMap;
+
+    #[test]
+    fn live_pool_admin_command_routes_round_trip() {
+        for (command, command_part, operation_part) in LIVE_POOL_ADMIN_COMMAND_ROUTES {
+            assert_eq!(command.parts(), (*command_part, *operation_part));
+            assert_eq!(
+                LivePoolAdminCommand::from_parts(command_part, operation_part).unwrap(),
+                *command
+            );
+        }
+    }
+
+    #[test]
+    fn live_pool_admin_unknown_route_returns_typed_unsupported_command() {
+        let err = LivePoolAdminCommand::from_parts("cluster", "promote").unwrap_err();
+
+        assert_eq!(err.exit_code, 1);
+        assert_eq!(
+            err.kind,
+            LivePoolAdminErrorKind::UnsupportedCommand {
+                command: "cluster".into(),
+                operation: "promote".into(),
+            }
+        );
+        assert!(err.message.contains("tidefsctl cluster promote"));
+    }
 
     /// Minimal mock that returns a fixed error for every operation.
     ///
