@@ -113,18 +113,38 @@ fn bytes_contain(bytes: &[u8], needle: &[u8]) -> bool {
     bytes.windows(needle.len()).any(|window| window == needle)
 }
 
-fn normalize_json_unicode_slash_escapes(bytes: &[u8]) -> Vec<u8> {
-    let mut normalized = bytes.to_vec();
+fn normalize_json_slash_escapes(bytes: &[u8]) -> Vec<u8> {
+    let mut normalized = Vec::with_capacity(bytes.len());
     let mut offset = 0;
-    while let Some(relative_offset) = normalized[offset..]
-        .windows(br"\u002F".len())
-        .position(|window| window == br"\u002F")
-    {
-        let escape_offset = offset + relative_offset;
-        normalized[escape_offset + br"\u002".len()] = b'f';
-        offset = escape_offset + br"\u002F".len();
+    while offset < bytes.len() {
+        let remaining = &bytes[offset..];
+        if remaining.starts_with(br"\/") {
+            normalized.push(b'/');
+            offset += br"\/".len();
+        } else if remaining.len() >= br"\u002f".len()
+            && &remaining[..br"\u002".len()] == br"\u002"
+            && matches!(remaining[br"\u002".len()], b'f' | b'F')
+        {
+            normalized.push(b'/');
+            offset += br"\u002f".len();
+        } else {
+            normalized.push(bytes[offset]);
+            offset += 1;
+        }
     }
     normalized
+}
+
+#[test]
+fn json_slash_escape_normalization_catches_mixed_scratch_paths() {
+    assert_eq!(
+        normalize_json_slash_escapes(br"\u002Ftmp/tidefs-validation"),
+        b"/tmp/tidefs-validation"
+    );
+    assert_eq!(
+        normalize_json_slash_escapes(br"\/root\u002Fai/tmp\/tidefs-validation"),
+        b"/root/ai/tmp/tidefs-validation"
+    );
 }
 
 #[test]
@@ -209,24 +229,9 @@ fn runtime_artifact_manifest_paths_require_live_runtime_tier() {
 fn committed_validation_artifacts_do_not_embed_scratch_paths() {
     const SCRATCH_PATH_NEEDLES: &[(&[u8], &str)] = &[
         (b"/tmp/tidefs-validation", "/tmp/tidefs-validation"),
-        (br"\/tmp\/tidefs-validation", r"\/tmp\/tidefs-validation"),
         (
             b"/root/ai/tmp/tidefs-validation",
             "/root/ai/tmp/tidefs-validation",
-        ),
-        (
-            br"\/root\/ai\/tmp\/tidefs-validation",
-            r"\/root\/ai\/tmp\/tidefs-validation",
-        ),
-    ];
-    const JSON_UNICODE_SLASH_SCRATCH_PATH_NEEDLES: &[(&[u8], &str)] = &[
-        (
-            br"\u002ftmp\u002ftidefs-validation",
-            r"\u002ftmp\u002ftidefs-validation",
-        ),
-        (
-            br"\u002froot\u002fai\u002ftmp\u002ftidefs-validation",
-            r"\u002froot\u002fai\u002ftmp\u002ftidefs-validation",
         ),
     ];
 
@@ -244,14 +249,8 @@ fn committed_validation_artifacts_do_not_embed_scratch_paths() {
                 path.display()
             )
         });
+        let normalized_bytes = normalize_json_slash_escapes(&bytes);
         for (needle, display) in SCRATCH_PATH_NEEDLES {
-            if bytes_contain(&bytes, needle) {
-                let relative_path = repo_relative_path(repo_root, &path);
-                failures.push(format!("{relative_path} embeds scratch path `{display}`"));
-            }
-        }
-        let normalized_bytes = normalize_json_unicode_slash_escapes(&bytes);
-        for (needle, display) in JSON_UNICODE_SLASH_SCRATCH_PATH_NEEDLES {
             if bytes_contain(&normalized_bytes, needle) {
                 let relative_path = repo_relative_path(repo_root, &path);
                 failures.push(format!("{relative_path} embeds scratch path `{display}`"));
