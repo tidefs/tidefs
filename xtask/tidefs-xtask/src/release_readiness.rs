@@ -8,7 +8,9 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process;
-use tidefs_validation::evidence_artifact_manifest::load_evidence_artifact_manifest_json_path;
+use tidefs_validation::evidence_artifact_manifest::{
+    is_runtime_artifact_path, load_evidence_artifact_manifest_json_path,
+};
 
 const SCHEMA_VERSION: u32 = 1;
 const VERDICT_BOUNDARY: &str = "release-readiness-verdict";
@@ -1239,6 +1241,12 @@ fn evaluate_claim_evidence(
                 "runtime-tier evidence requirement for class `{class}` must name manifest_path"
             ));
             outcome = VerdictOutcome::Malformed;
+        } else if is_runtime_artifact_path(requirement.path.as_str()) {
+            details.push(format!(
+                "runtime artifact path `{}` for class `{class}` requires live-runtime validation_tier and manifest_path",
+                requirement.path
+            ));
+            outcome = VerdictOutcome::Malformed;
         } else {
             let artifact_path = config.workspace_root.join(&requirement.path);
             if !artifact_path.exists() {
@@ -1273,6 +1281,7 @@ fn is_runtime_validation_tier(validation_tier: &str) -> bool {
         validation_tier,
         "mounted-userspace"
             | "qemu-guest"
+            | "qemu-module-load"
             | "mounted-kernel-vfs"
             | "kernel-block-io"
             | "full-kernel-no-daemon"
@@ -1800,6 +1809,43 @@ mod tests {
     }
 
     #[test]
+    fn release_readiness_runtime_artifact_path_without_manifest_fails_closed() {
+        let fixture = Fixture::new();
+        fixture.write_rc_index(&fixture.source_ref, &fixture.source_sha, "full");
+        let artifact_path = fixture
+            .temp
+            .path()
+            .join("validation/artifacts/test/claims-gate-review-runtime.json");
+        fs::create_dir_all(artifact_path.parent().unwrap()).unwrap();
+        fs::write(&artifact_path, r#"{"decision":"pass"}"#).unwrap();
+        fixture.write_claim_registry_with_requirement_path(
+            "validated",
+            "source-model",
+            "validation/artifacts/test/claims-gate-review-runtime.json",
+            None,
+        );
+        fixture.write_non_claim_inputs();
+
+        let artifact = assemble_verdict(&fixture.config());
+
+        assert_eq!(
+            artifact.product_readiness_verdict,
+            ProductReadinessVerdict::NotReady
+        );
+        assert!(artifact.claim_evidence.iter().any(|claim| {
+            claim.required_evidence.iter().any(|evidence| {
+                evidence.class == "claims-gate-review"
+                    && evidence.outcome == VerdictOutcome::Malformed
+                    && evidence.details.iter().any(|detail| {
+                        detail.contains("runtime artifact path")
+                            && detail.contains("live-runtime")
+                            && detail.contains("manifest_path")
+                    })
+            })
+        }));
+    }
+
+    #[test]
     fn release_readiness_stale_source_ref_fails_closed() {
         let fixture = Fixture::new();
         fixture.write_rc_index("refs/heads/other", &fixture.source_sha, "full");
@@ -1948,6 +1994,21 @@ mod tests {
             validation_tier: &str,
             manifest_path: Option<&str>,
         ) {
+            self.write_claim_registry_with_requirement_path(
+                status,
+                validation_tier,
+                "validation/artifacts/test/claims-gate-review.json",
+                manifest_path,
+            );
+        }
+
+        fn write_claim_registry_with_requirement_path(
+            &self,
+            status: &str,
+            validation_tier: &str,
+            path: &str,
+            manifest_path: Option<&str>,
+        ) {
             let manifest_path = manifest_path
                 .map(|manifest_path| format!(r#", manifest_path = "{manifest_path}""#))
                 .unwrap_or_default();
@@ -1969,7 +2030,7 @@ status = "{status}"
 scope = "fixture claim"
 required_evidence_classes = ["claims-gate-review"]
 evidence_requirements = [
-  {{ class = "claims-gate-review", path = "validation/artifacts/test/claims-gate-review.json", validation_tier = "{validation_tier}"{manifest_path}, blocking_issues = [] }},
+  {{ class = "claims-gate-review", path = "{path}", validation_tier = "{validation_tier}"{manifest_path}, blocking_issues = [] }},
 ]
 blockers = ["Fixture claim remains blocked #1740"]
 generated_doc = "Fixture wording"
