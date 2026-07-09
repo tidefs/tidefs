@@ -8262,6 +8262,104 @@ mod tests {
     }
 
     #[test]
+    fn live_snapshot_send_snap_net_target_address_incremental_receives_ack() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = root.path().join("store");
+        let mut fs = LocalFileSystem::open(&store).expect("open fs");
+        fs.create_file("/base.txt", 0o644).expect("create base");
+        fs.write_file("/base.txt", 0, b"base bytes")
+            .expect("write base");
+        fs.sync_all().expect("sync baseline");
+        let baseline = fs.create_snapshot("baseline").expect("snapshot baseline");
+        let baseline_root = baseline.source_root;
+        fs.set_auto_commit(false);
+        fs.replace_file("/base.txt", b"updated base bytes")
+            .expect("replace base");
+        fs.create_file("/delta.txt", 0o644).expect("create delta");
+        fs.write_file("/delta.txt", 0, b"incremental live bytes")
+            .expect("write delta");
+        let engine = VfsLocalFileSystem::new(fs);
+        let expected_auth_key = engine.fs.borrow().root_authentication_key.as_bytes32();
+
+        let mut server = Transport::new(2);
+        server
+            .bind(TransportAddr::Tcp(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                0,
+            )))
+            .expect("bind");
+        let target_addr = match server.bind_addr.as_ref().expect("bind_addr") {
+            TransportAddr::Tcp(addr) => addr.to_string(),
+            _ => unreachable!("test binds TCP transport"),
+        };
+
+        let server_handle = thread::spawn({
+            let baseline_root = baseline_root.clone();
+            move || {
+                let session_id = accept_snapshot_transport_session(&mut server);
+                server.perform_handshake(session_id).expect("handshake");
+                let frame = server.recv_message(session_id).expect("recv push frame");
+
+                assert!(frame.len() >= SNAP_NET_PUSH_HEADER_LEN);
+                assert_eq!(&frame[0..4], SNAP_NET_MAGIC);
+                assert_eq!(frame[4], SNAP_KIND_PUSH);
+
+                let auth_len =
+                    u32::from_le_bytes(frame[5..9].try_into().expect("auth len")) as usize;
+                assert_eq!(auth_len, SNAP_NET_AUTH_KEY_LEN);
+                let auth_start = 9;
+                let auth_end = auth_start + auth_len;
+                assert_eq!(&frame[auth_start..auth_end], &expected_auth_key[..]);
+
+                let export_len_offset = auth_end;
+                let export_len = u32::from_le_bytes(
+                    frame[export_len_offset..export_len_offset + 4]
+                        .try_into()
+                        .expect("export len"),
+                ) as usize;
+                let export_start = export_len_offset + 4;
+                let export_end = export_start + export_len;
+                assert_eq!(frame.len(), export_end);
+
+                let decoded = crate::vfssend2_bridge::receive_vfssend2_to_changed_records(
+                    &frame[export_start..export_end],
+                )
+                .expect("decode pushed export");
+                assert!(decoded.incremental);
+                assert_eq!(decoded.from_root.as_ref(), Some(&baseline_root));
+                assert!(decoded.total_records > 0);
+                assert!(decoded.payload_bytes > 0);
+
+                server
+                    .send_message(session_id, &snap_net_ack(b"received incremental"))
+                    .expect("send ack");
+                let _ = server.close_session(session_id, SessionCloseReason::LocalShutdown);
+            }
+        });
+
+        let sent = live_snapshot_admin(
+            &engine,
+            "send",
+            json!({
+                "target_addr": target_addr.clone(),
+                "format": "vfssend2",
+                "incremental": true,
+                "from_root": live_from_root_hex(&baseline_root),
+            }),
+            true,
+        );
+
+        assert_eq!(sent["ok"], true, "incremental target send response: {sent}");
+        assert_eq!(sent["json"]["target_addr"], target_addr);
+        assert_eq!(sent["json"]["remote_response"], "received incremental");
+        assert_eq!(sent["json"]["format"], "vfssend2");
+        assert_eq!(sent["json"]["incremental"], true);
+        assert!(sent["json"]["bytes"].as_u64().unwrap_or(0) > 0);
+
+        server_handle.join().expect("server thread");
+    }
+
+    #[test]
     fn live_snapshot_send_snap_net_target_address_surfaces_remote_error_without_output() {
         let root = tempfile::tempdir().expect("tempdir");
         let store = root.path().join("store");
