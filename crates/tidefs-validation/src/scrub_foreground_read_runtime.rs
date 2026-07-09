@@ -65,6 +65,7 @@ pub struct ScrubForegroundReadRuntimeEvidence {
     pub foreground_read: ForegroundReadEvidence,
     pub scrub_activity: ScrubActivityEvidence,
     pub service_curve: ServiceCurveEvidence,
+    pub admission_state: AdmissionStateEvidence,
     pub passed: bool,
 }
 
@@ -108,6 +109,18 @@ pub struct RuntimeEnvironmentEvidence {
     pub dev_fuse_present: bool,
     pub daemon_bin: Option<String>,
     pub environment_refusal: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdmissionStateEvidence {
+    pub environment_refusal: Option<String>,
+    pub environment_refused: bool,
+    pub foreground_read_admitted_by_service_curve: bool,
+    pub foreground_read_refused_by_service_curve: bool,
+    pub scrub_units_requested: u32,
+    pub scrub_units_admitted_by_service_curve: u32,
+    pub scrub_units_deferred_by_service_curve: u32,
+    pub max_scrub_queue_depth: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -403,6 +416,7 @@ fn base_evidence(input: BaseEvidenceInput) -> ScrubForegroundReadRuntimeEvidence
     let workload_ran = foreground_read.workload_ran;
     let passed = outcome == ValidationStatus::Pass
         && scrub_read_isolation_passed(&foreground_read, &scrub_activity, &service_curve);
+    let admission_state = build_admission_state(&environment, &scrub_activity, &service_curve);
     ScrubForegroundReadRuntimeEvidence {
         manifest_version: 1,
         row_id: SCRUB_FOREGROUND_READ_ROW_ID.to_string(),
@@ -449,7 +463,27 @@ fn base_evidence(input: BaseEvidenceInput) -> ScrubForegroundReadRuntimeEvidence
         foreground_read,
         scrub_activity,
         service_curve,
+        admission_state,
         passed,
+    }
+}
+
+fn build_admission_state(
+    environment: &RuntimeEnvironmentEvidence,
+    scrub_activity: &ScrubActivityEvidence,
+    service_curve: &ServiceCurveEvidence,
+) -> AdmissionStateEvidence {
+    AdmissionStateEvidence {
+        environment_refusal: environment.environment_refusal.clone(),
+        environment_refused: environment.environment_refusal.is_some(),
+        foreground_read_admitted_by_service_curve: service_curve
+            .foreground_read_admitted_by_service_curve,
+        foreground_read_refused_by_service_curve: !service_curve
+            .foreground_read_admitted_by_service_curve,
+        scrub_units_requested: scrub_activity.scrub_units_requested,
+        scrub_units_admitted_by_service_curve: scrub_activity.scrub_admitted_by_service_curve,
+        scrub_units_deferred_by_service_curve: scrub_activity.scrub_deferred_by_service_curve,
+        max_scrub_queue_depth: scrub_activity.max_scrub_queue_depth,
     }
 }
 
@@ -891,6 +925,21 @@ mod tests {
             .as_deref()
             .expect("refusal reason")
             .contains("FUSE mount unavailable"));
+        assert!(evidence.admission_state.environment_refused);
+        assert_eq!(
+            evidence.admission_state.environment_refusal.as_deref(),
+            evidence.environment.environment_refusal.as_deref()
+        );
+        assert!(
+            evidence
+                .admission_state
+                .foreground_read_admitted_by_service_curve
+        );
+        assert!(
+            !evidence
+                .admission_state
+                .foreground_read_refused_by_service_curve
+        );
         assert!(evidence
             .foreground_read
             .failures
@@ -959,6 +1008,39 @@ mod tests {
         );
 
         let scrub_activity = build_scrub_activity(&service_curve);
+        let environment = RuntimeEnvironmentEvidence {
+            host: "linux x86_64 kernel=test".to_string(),
+            dev_fuse_present: true,
+            daemon_bin: Some("/nix/store/test/bin/tidefs-posix-filesystem-adapter-daemon".into()),
+            environment_refusal: None,
+        };
+        let admission_state = build_admission_state(&environment, &scrub_activity, &service_curve);
+        assert_eq!(admission_state.environment_refusal, None);
+        assert!(!admission_state.environment_refused);
+        assert_eq!(
+            admission_state.foreground_read_admitted_by_service_curve,
+            service_curve.foreground_read_admitted_by_service_curve
+        );
+        assert_eq!(
+            admission_state.foreground_read_refused_by_service_curve,
+            !service_curve.foreground_read_admitted_by_service_curve
+        );
+        assert_eq!(
+            admission_state.scrub_units_requested,
+            scrub_activity.scrub_units_requested
+        );
+        assert_eq!(
+            admission_state.scrub_units_admitted_by_service_curve,
+            service_curve.scheduled_scrub_admitted
+        );
+        assert_eq!(
+            admission_state.scrub_units_deferred_by_service_curve,
+            service_curve.scheduled_scrub_deferred
+        );
+        assert_eq!(
+            admission_state.max_scrub_queue_depth,
+            service_curve.scheduled_max_scrub_queue_depth
+        );
         assert_eq!(
             scrub_activity.scrub_deferred_by_service_curve,
             service_curve.scheduled_scrub_deferred
