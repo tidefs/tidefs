@@ -448,9 +448,13 @@ impl DeviceHealthTransitionEntry {
             commit_group: 0,
         };
 
-        Some(PoolLifecycleEvidence::refused(
+        let topology_complete = context.topology_complete();
+
+        Some(PoolLifecycleEvidence::refused_with_authority(
             PoolLifecycleAction::FailClosed,
             context,
+            topology_complete,
+            false,
             format!(
                 "device health transitioned from {} to {} after {} {:?} error(s)",
                 self.from, self.to, self.window_errors, self.trigger
@@ -975,6 +979,8 @@ mod tests {
 
         assert_eq!(evidence.action, PoolLifecycleAction::FailClosed);
         assert_eq!(evidence.outcome, PoolLifecycleOutcome::Refused);
+        assert!(evidence.topology_complete);
+        assert!(!evidence.owner_authorized);
         assert!(evidence.is_fail_closed());
         assert_eq!(evidence.pool_guid, Some([0x17; 16]));
         assert_eq!(evidence.pool_name.as_deref(), Some("pool-a"));
