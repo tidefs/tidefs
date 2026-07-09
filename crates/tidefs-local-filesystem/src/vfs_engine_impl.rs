@@ -3999,7 +3999,7 @@ fn parse_snap_net_response(data: &[u8]) -> Result<String, String> {
         ));
     }
     let kind = data[4];
-    let msg_len = u32::from_le_bytes(data[5..9].try_into().unwrap()) as usize;
+    let msg_len = u32::from_le_bytes([data[5], data[6], data[7], data[8]]) as usize;
     let start = SNAP_NET_RESPONSE_HEADER_LEN;
     let frame_len = start
         .checked_add(msg_len)
@@ -6695,6 +6695,18 @@ mod tests {
         assert_eq!(
             parse_snap_net_response(&error),
             Err("snapshot send: remote error without message".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_snap_net_response_rejects_short_header() {
+        let mut ack = Vec::new();
+        ack.extend_from_slice(SNAP_NET_MAGIC);
+        ack.push(SNAP_KIND_ACK);
+
+        assert_eq!(
+            parse_snap_net_response(&ack),
+            Err("snapshot send: remote response too short for VSNP header".to_string())
         );
     }
 
