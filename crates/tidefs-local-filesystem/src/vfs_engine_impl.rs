@@ -3964,7 +3964,8 @@ const SNAP_NET_MAGIC: &[u8; 4] = b"VSNP";
 const SNAP_KIND_PUSH: u8 = 1;
 const SNAP_KIND_ACK: u8 = 4;
 const SNAP_KIND_ERROR: u8 = 0;
-const SNAP_NET_PUSH_HEADER_LEN: usize = 4 + 1 + 4 + 32 + 4;
+const SNAP_NET_AUTH_KEY_LEN: usize = 32;
+const SNAP_NET_PUSH_HEADER_LEN: usize = 4 + 1 + 4 + SNAP_NET_AUTH_KEY_LEN + 4;
 const SNAP_NET_RESPONSE_HEADER_LEN: usize = 4 + 1 + 4;
 
 fn snap_net_payload_len(payload_len: usize) -> Result<u32, String> {
@@ -3981,7 +3982,7 @@ fn build_snap_push_message(export: &[u8], auth_key: &[u8; 32]) -> Result<Vec<u8>
     let mut msg = Vec::with_capacity(capacity);
     msg.extend_from_slice(SNAP_NET_MAGIC);
     msg.push(SNAP_KIND_PUSH);
-    msg.extend_from_slice(&32u32.to_le_bytes());
+    msg.extend_from_slice(&(SNAP_NET_AUTH_KEY_LEN as u32).to_le_bytes());
     msg.extend_from_slice(auth_key);
     msg.extend_from_slice(&export_len.to_le_bytes());
     msg.extend_from_slice(export);
@@ -8177,6 +8178,7 @@ mod tests {
         fs.write_file("/live.txt", 0, b"live owner snapshot send")
             .expect("write file");
         let engine = VfsLocalFileSystem::new(fs);
+        let expected_auth_key = engine.fs.borrow().root_authentication_key.as_bytes32();
         let output = root.path().join("target-ack.vfs");
 
         let mut server = Transport::new(2);
@@ -8201,8 +8203,12 @@ mod tests {
             assert_eq!(frame[4], SNAP_KIND_PUSH);
 
             let auth_len = u32::from_le_bytes(frame[5..9].try_into().expect("auth len")) as usize;
-            assert_eq!(auth_len, 32);
-            let export_len_offset = 9 + auth_len;
+            assert_eq!(auth_len, SNAP_NET_AUTH_KEY_LEN);
+            let auth_start = 9;
+            let auth_end = auth_start + auth_len;
+            assert_eq!(&frame[auth_start..auth_end], &expected_auth_key[..]);
+
+            let export_len_offset = auth_end;
             let export_len = u32::from_le_bytes(
                 frame[export_len_offset..export_len_offset + 4]
                     .try_into()
