@@ -352,6 +352,9 @@ impl BarrierCollector {
         if response.barrier_id != self.barrier_id {
             return false;
         }
+        if self.is_timed_out() {
+            return false;
+        }
         if !self.expected_peers.contains(&response.peer_id) {
             return false;
         }
@@ -367,6 +370,9 @@ impl BarrierCollector {
 
     /// Record a peer-side barrier failure. Returns `true` if accepted.
     pub fn record_failure(&mut self, peer_id: u64, reason: String) -> bool {
+        if self.is_timed_out() {
+            return false;
+        }
         if !self.expected_peers.contains(&peer_id) {
             return false;
         }
@@ -879,6 +885,40 @@ mod tests {
             }
             other => panic!("expected Failed, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn collector_rejects_late_response_after_timeout() {
+        let mut c = BarrierCollector::new(1, "snap".into(), vec![10, 20], make_config());
+        assert!(c.record_response(make_response(10, 1, 100, 5, 10)));
+        c.started_at = Instant::now() - c.config.peer_timeout - Duration::from_secs(1);
+
+        assert!(!c.record_response(make_response(20, 1, 100, 5, 20)));
+        assert_eq!(c.responded_count(), 1);
+        assert_eq!(
+            c.outcome(),
+            Some(BarrierOutcome::Timeout {
+                responded: vec![10],
+                missing: vec![20],
+            })
+        );
+    }
+
+    #[test]
+    fn collector_rejects_late_failure_after_timeout() {
+        let mut c = BarrierCollector::new(1, "snap".into(), vec![10, 20], make_config());
+        assert!(c.record_response(make_response(10, 1, 100, 5, 10)));
+        c.started_at = Instant::now() - c.config.peer_timeout - Duration::from_secs(1);
+
+        assert!(!c.record_failure(20, "late failure".into()));
+        assert_eq!(c.missing_count(), 1);
+        assert_eq!(
+            c.outcome(),
+            Some(BarrierOutcome::Timeout {
+                responded: vec![10],
+                missing: vec![20],
+            })
+        );
     }
 
     #[test]
