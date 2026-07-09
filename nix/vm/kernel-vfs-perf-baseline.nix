@@ -105,6 +105,12 @@ EOF
       awk -v n="$1" 'BEGIN { exit !(n ~ /^[0-9]+([.][0-9]+)?$/ && n > 0) }'
     }
 
+    if ! is_positive_number "$TIMEOUT_SEC"; then
+      echo "ERROR: --timeout requires a positive numeric SECONDS value" >&2
+      usage >&2
+      exit 2
+    fi
+
     json_string() {
       local value="''${1-}"
 

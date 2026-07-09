@@ -538,6 +538,12 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
+if ! is_positive_number "$TIMEOUT_SEC"; then
+  echo "ERROR: --timeout requires a positive numeric SECONDS value" >&2
+  usage >&2
+  exit 2
+fi
+
 if [ "$SELF_TEST_PARSER" -eq 1 ]; then
   self_test_parser
   exit 0
