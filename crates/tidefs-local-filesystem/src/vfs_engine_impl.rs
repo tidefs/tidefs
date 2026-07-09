@@ -4028,6 +4028,9 @@ fn parse_snap_net_response(data: &[u8]) -> Result<String, String> {
             Err("snapshot send: remote error without message".to_string())
         }
         SNAP_KIND_ERROR => Err(format!("snapshot send: remote error: {message}")),
+        other if message.is_empty() => Err(format!(
+            "snapshot send: unknown remote response kind {other} without message"
+        )),
         other => Err(format!(
             "snapshot send: unknown remote response kind {other}: {message}"
         )),
@@ -6738,6 +6741,19 @@ mod tests {
     }
 
     #[test]
+    fn parse_snap_net_response_rejects_empty_unknown_kind() {
+        let mut ack = Vec::new();
+        ack.extend_from_slice(SNAP_NET_MAGIC);
+        ack.push(9);
+        ack.extend_from_slice(&0u32.to_le_bytes());
+
+        assert_eq!(
+            parse_snap_net_response(&ack),
+            Err("snapshot send: unknown remote response kind 9 without message".to_string())
+        );
+    }
+
+    #[test]
     fn parse_snap_net_response_rejects_truncated_message() {
         let mut ack = Vec::new();
         ack.extend_from_slice(SNAP_NET_MAGIC);
@@ -6809,6 +6825,14 @@ mod tests {
         error.extend_from_slice(&(message.len() as u32).to_le_bytes());
         error.extend_from_slice(message);
         error
+    }
+
+    fn snap_net_unknown_empty_response() -> Vec<u8> {
+        let mut response = Vec::new();
+        response.extend_from_slice(SNAP_NET_MAGIC);
+        response.push(9);
+        response.extend_from_slice(&0u32.to_le_bytes());
+        response
     }
 
     fn accept_snapshot_transport_session(server: &mut Transport) -> SessionId {
@@ -8286,6 +8310,69 @@ mod tests {
         assert!(refused["json"].is_null());
         assert!(refused["text"].is_null());
         assert_eq!(refused["error"], "snapshot send: remote error: denied");
+        assert!(!output.exists());
+
+        server_handle.join().expect("server thread");
+    }
+
+    #[test]
+    fn live_snapshot_send_snap_net_target_address_rejects_malformed_ack_without_output() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = root.path().join("store");
+        let mut fs = LocalFileSystem::open(&store).expect("open fs");
+        fs.create_file("/live.txt", 0o644).expect("create file");
+        fs.write_file("/live.txt", 0, b"live owner snapshot send")
+            .expect("write file");
+        let engine = VfsLocalFileSystem::new(fs);
+        let output = root.path().join("target-malformed-response.vfs");
+
+        let mut server = Transport::new(2);
+        server
+            .bind(TransportAddr::Tcp(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                0,
+            )))
+            .expect("bind");
+        let target_addr = match server.bind_addr.as_ref().expect("bind_addr") {
+            TransportAddr::Tcp(addr) => addr.to_string(),
+            _ => unreachable!("test binds TCP transport"),
+        };
+
+        let server_handle = thread::spawn(move || {
+            let session_id = accept_snapshot_transport_session(&mut server);
+            server.perform_handshake(session_id).expect("handshake");
+            let frame = server.recv_message(session_id).expect("recv push frame");
+
+            assert!(frame.len() >= SNAP_NET_PUSH_HEADER_LEN);
+            assert_eq!(&frame[0..4], SNAP_NET_MAGIC);
+            assert_eq!(frame[4], SNAP_KIND_PUSH);
+
+            server
+                .send_message(session_id, &snap_net_unknown_empty_response())
+                .expect("send malformed response");
+            let _ = server.close_session(session_id, SessionCloseReason::LocalShutdown);
+        });
+
+        let refused = live_snapshot_admin(
+            &engine,
+            "send",
+            json!({
+                "output": output.display().to_string(),
+                "target_addr": target_addr,
+                "format": "vfssend2",
+                "incremental": false,
+            }),
+            true,
+        );
+
+        assert_eq!(refused["ok"], false, "send response: {refused}");
+        assert_eq!(refused["exit_code"], 1);
+        assert!(refused["json"].is_null());
+        assert!(refused["text"].is_null());
+        assert_eq!(
+            refused["error"],
+            "snapshot send: unknown remote response kind 9 without message"
+        );
         assert!(!output.exists());
 
         server_handle.join().expect("server thread");
