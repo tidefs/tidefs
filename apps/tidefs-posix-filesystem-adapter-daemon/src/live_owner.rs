@@ -25,7 +25,7 @@ use tidefs_vfs_engine::{
     LivePoolAdminRequest, LivePoolAdminResponse, VfsEngineStatFs, LIVE_POOL_ADMIN_PROTOCOL_VERSION,
 };
 #[cfg(test)]
-use tidefs_vfs_engine::{LivePoolAdminOutput, LivePoolAdminResponseBody};
+use tidefs_vfs_engine::{LivePoolAdminErrorKind, LivePoolAdminOutput, LivePoolAdminResponseBody};
 
 pub type LiveOwnerEngine = Arc<Mutex<Box<dyn VfsEngineStatFs + Send>>>;
 
@@ -209,6 +209,8 @@ fn decode_live_pool_admin_request(line: &str) -> Result<LivePoolAdminRequest, Li
         LivePoolAdminError::malformed(format!("decode live-owner request: {err}"))
     })?;
 
+    reject_unsupported_live_pool_admin_version(&value)?;
+
     if let Some(command) = value
         .get("command")
         .and_then(serde_json::Value::as_str)
@@ -219,6 +221,22 @@ fn decode_live_pool_admin_request(line: &str) -> Result<LivePoolAdminRequest, Li
 
     serde_json::from_value::<LivePoolAdminRequest>(value)
         .map_err(|err| LivePoolAdminError::malformed(format!("decode live-owner request: {err}")))
+}
+
+fn reject_unsupported_live_pool_admin_version(
+    value: &serde_json::Value,
+) -> Result<(), LivePoolAdminError> {
+    if let Some(version) = value
+        .get("version")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|version| u16::try_from(version).ok())
+    {
+        if version != LIVE_POOL_ADMIN_PROTOCOL_VERSION {
+            return Err(LivePoolAdminError::unsupported_version(version));
+        }
+    }
+
+    Ok(())
 }
 
 fn parse_wire_command_parts(command: &str) -> Option<(&str, String)> {
@@ -789,6 +807,37 @@ mod tests {
         assert_eq!(
             value.get("operation").and_then(serde_json::Value::as_str),
             Some("promote")
+        );
+    }
+
+    #[test]
+    fn unsupported_version_takes_precedence_over_unknown_wire_command() {
+        let err = decode_live_pool_admin_request(
+            r#"{"version":42,"command":"cluster_promote","pool":"tank","pool_uuid":null,"output":"human","args":{}}"#,
+        )
+        .unwrap_err();
+
+        assert_eq!(err.exit_code, 2);
+        assert_eq!(
+            err.kind,
+            LivePoolAdminErrorKind::UnsupportedVersion { version: 42 }
+        );
+        let response = live_admin_typed_error(err);
+        let LivePoolAdminResponseBody::Error {
+            message: _,
+            machine_json: Some(machine_json),
+        } = response.body
+        else {
+            panic!("unsupported version should carry typed machine JSON");
+        };
+        let value: serde_json::Value = serde_json::from_str(&machine_json).unwrap();
+        assert_eq!(
+            value.get("kind").and_then(serde_json::Value::as_str),
+            Some("unsupported_version")
+        );
+        assert_eq!(
+            value.get("version").and_then(serde_json::Value::as_u64),
+            Some(42)
         );
     }
 
