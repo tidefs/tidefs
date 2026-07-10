@@ -544,13 +544,17 @@ EOF
 PASS: insmod
 PASS: mount
 PASS: no_daemon
+write_duration_s=0.125
 write_throughput_MBps=nan
+read_duration_s=0.250
 read_throughput_MBps=0
 stat_avg_latency_us=-1
+stat_total_duration_s=0.003
 EOF
       analyze_qemu_log "$test_dir/invalid-metrics.log" 0
       expect_parser_verdict invalid-metrics BLOCKED missing_required_metrics 2
       expect_parser_metric_values invalid-metrics nan 0 -1
+      expect_parser_durations invalid-metrics 0.125 0.250 0.003
       expect_parser_counts invalid-metrics 3 0 0 0
       expect_parser_state invalid-metrics true false false false
 
@@ -558,13 +562,17 @@ EOF
 PASS: insmod
 PASS: mount
 PASS: no_daemon
+write_duration_s=0.125
 write_throughput_MBps=10.00=trailing
+read_duration_s=0.250
 read_throughput_MBps=20.00=trailing
 stat_avg_latency_us=30=trailing
+stat_total_duration_s=0.003
 EOF
       analyze_qemu_log "$test_dir/value-delimiter-metrics.log" 0
       expect_parser_verdict value-delimiter-metrics BLOCKED missing_required_metrics 2
       expect_parser_metric_values value-delimiter-metrics 10.00=trailing 20.00=trailing 30=trailing
+      expect_parser_durations value-delimiter-metrics 0.125 0.250 0.003
       expect_parser_counts value-delimiter-metrics 3 0 0 0
       expect_parser_state value-delimiter-metrics true false false false
 
