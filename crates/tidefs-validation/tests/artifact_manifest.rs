@@ -109,16 +109,34 @@ fn is_manifest_path(path: &Path) -> bool {
         .is_some_and(|name| name.to_ascii_lowercase().ends_with(".manifest.json"))
 }
 
-fn implied_sidecar_artifact_path(manifest_path: &str) -> Option<String> {
+fn implied_sidecar_artifact_paths(
+    manifest_path: &str,
+    committed_artifacts: &BTreeSet<String>,
+) -> Vec<String> {
     const MANIFEST_SUFFIX: &str = ".manifest.json";
 
     let lower_path = manifest_path.to_ascii_lowercase();
     if !lower_path.ends_with(MANIFEST_SUFFIX) {
-        return None;
+        return Vec::new();
     }
 
     let stem_len = manifest_path.len() - MANIFEST_SUFFIX.len();
-    Some(format!("{}.json", &manifest_path[..stem_len]))
+    let stem = &manifest_path[..stem_len];
+    let extension_prefix = format!("{stem}.");
+    committed_artifacts
+        .iter()
+        .filter(|candidate| {
+            candidate.as_str() == stem
+                || candidate
+                    .strip_prefix(&extension_prefix)
+                    .is_some_and(|extension| {
+                        !extension.is_empty()
+                            && !extension.contains('/')
+                            && !extension.contains('.')
+                    })
+        })
+        .cloned()
+        .collect()
 }
 
 fn bytes_contain(bytes: &[u8], needle: &[u8]) -> bool {
@@ -224,6 +242,32 @@ fn runtime_artifact_classifier_is_token_based() {
     assert!(is_manifest_path(Path::new(
         "validation/artifacts/kernel/runtime/output.Manifest.Json"
     )));
+}
+
+#[test]
+fn runtime_manifest_sidecar_candidates_follow_committed_payloads() {
+    let committed_artifacts = BTreeSet::from([
+        "validation/artifacts/kernel/runtime-output.toml".to_string(),
+        "validation/artifacts/kernel/runtime-output.log".to_string(),
+        "validation/artifacts/kernel/runtime-output.txt".to_string(),
+        "validation/artifacts/kernel/runtime-output".to_string(),
+        "validation/artifacts/kernel/runtime-output.detail.json".to_string(),
+        "validation/artifacts/kernel/runtime-output-extra.json".to_string(),
+        "validation/artifacts/kernel/other-runtime-output.json".to_string(),
+    ]);
+
+    assert_eq!(
+        implied_sidecar_artifact_paths(
+            "validation/artifacts/kernel/runtime-output.manifest.json",
+            &committed_artifacts,
+        ),
+        vec![
+            "validation/artifacts/kernel/runtime-output".to_string(),
+            "validation/artifacts/kernel/runtime-output.log".to_string(),
+            "validation/artifacts/kernel/runtime-output.toml".to_string(),
+            "validation/artifacts/kernel/runtime-output.txt".to_string(),
+        ]
+    );
 }
 
 #[test]
@@ -409,9 +453,10 @@ fn committed_runtime_artifacts_have_runtime_tier_manifests() {
         }
         if manifest.validation_tier.is_live_runtime() {
             let manifest_path = repo_relative_path(repo_root, path);
-            if let Some(implied_artifact_path) = implied_sidecar_artifact_path(&manifest_path) {
+            for implied_artifact_path in
+                implied_sidecar_artifact_paths(&manifest_path, &committed_artifacts)
+            {
                 if implied_artifact_path != manifest.artifact_path
-                    && committed_artifacts.contains(&implied_artifact_path)
                     && is_runtime_artifact_path(Path::new(&implied_artifact_path))
                 {
                     failures.push(format!(
