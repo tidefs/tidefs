@@ -70,19 +70,6 @@ struct MmapRegistration {
     active: bool,
 }
 
-/// Mmap cluster coherency manager.
-///
-/// # Dirty/writeback preservation
-///
-/// When a [`DirtyStateCheck`] callback is set (via [`set_dirty_check`]),
-/// the invalidation sink consults it before sending
-/// `FUSE_NOTIFY_INVAL_INODE`.  Inodes with dirty or writeback-pending
-/// bytes are preserved—their page-cache entries are not invalidated—per
-/// the authority contract in
-/// `docs/PAGE_CACHE_WRITEBACK_AUTHORITY.md`.
-///
-/// # Type alias
-///
 /// A dirty/writeback-state check callback.
 ///
 /// The callback receives an inode number and returns `true` when the inode
@@ -92,6 +79,17 @@ struct MmapRegistration {
 /// "Dirty and writeback pages must not be silently invalidated").
 pub type DirtyStateCheck = Box<dyn Fn(u64) -> bool + Send + Sync>;
 
+/// Mmap cluster coherency manager.
+///
+/// # Dirty/writeback preservation
+///
+/// When a [`DirtyStateCheck`] callback is set (via
+/// [`MmapCoherency::set_dirty_check`]),
+/// the invalidation sink consults it before sending
+/// `FUSE_NOTIFY_INVAL_INODE`.  Inodes with dirty or writeback-pending
+/// bytes are preserved; their page-cache entries are not invalidated, per
+/// the authority contract in
+/// `docs/PAGE_CACHE_WRITEBACK_AUTHORITY.md`.
 pub struct MmapCoherency {
     registrations: Mutex<BTreeMap<u64, MmapRegistration>>,
     processor: Mutex<FollowerInvalidationProcessor>,
