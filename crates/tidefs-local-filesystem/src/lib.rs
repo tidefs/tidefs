@@ -3981,7 +3981,7 @@ impl LocalFileSystem {
     ///
     /// This projection exists so mounted diagnostic callers (including the
     /// POSIX committed-root validation path) can read the committed root
-    /// without going through [`object_store`](Self::object_store).
+    /// without reintroducing a raw-store accessor.
     pub fn committed_root_pointer(&self) -> RootPointer {
         self.mounted_raw_store_diagnostics()
             .committed_root_pointer()
