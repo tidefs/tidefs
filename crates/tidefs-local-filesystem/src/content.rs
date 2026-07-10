@@ -513,9 +513,7 @@ pub(crate) fn read_content_layout_from_store(
             })
         }
     };
-    let layout = decode_content_layout(&bytes)?;
-    validate_content_layout(inode_id, record, &layout)?;
-    Ok(layout)
+    decode_and_validate_content_layout(inode_id, record, &bytes)
 }
 
 pub(crate) fn read_content_layout_from_pool(
@@ -551,7 +549,15 @@ pub(crate) fn read_content_layout_from_pool(
             })
         }
     };
-    let layout = decode_content_layout(&bytes)?;
+    decode_and_validate_content_layout(inode_id, record, &bytes)
+}
+
+fn decode_and_validate_content_layout(
+    inode_id: InodeId,
+    record: &InodeRecord,
+    bytes: &[u8],
+) -> Result<ContentLayout> {
+    let layout = decode_content_layout(bytes)?;
     validate_content_layout(inode_id, record, &layout)?;
     Ok(layout)
 }
