@@ -273,6 +273,7 @@ impl CandidatePool {
             topology_generation: self.topology_generation,
             commit_group: self.recovery_commit_group,
         };
+        let topology_complete = context.topology_complete();
 
         let owner_authorized = self.cluster_authorized_or_not_clustered();
         let supported_action = matches!(
@@ -284,16 +285,16 @@ impl CandidatePool {
             return PoolLifecycleEvidence::refused_with_authority(
                 PoolLifecycleAction::FailClosed,
                 context,
-                self.topology_complete,
+                topology_complete,
                 owner_authorized,
                 "unsupported import lifecycle action",
             );
         }
 
-        if self.topology_complete && owner_authorized {
+        if topology_complete && owner_authorized {
             PoolLifecycleEvidence::executed(action, context)
         } else {
-            let reason = if !self.topology_complete {
+            let reason = if !topology_complete {
                 "topology evidence incomplete"
             } else {
                 "cluster ownership authority missing"
@@ -301,7 +302,7 @@ impl CandidatePool {
             PoolLifecycleEvidence::refused_with_authority(
                 action,
                 context,
-                self.topology_complete,
+                topology_complete,
                 owner_authorized,
                 reason,
             )
@@ -780,6 +781,32 @@ mod tests {
         assert_eq!(evidence.commit_group, 44);
         assert!(evidence.topology_complete);
         assert!(evidence.owner_authorized);
+    }
+
+    #[test]
+    fn candidate_pool_lifecycle_evidence_derives_topology_from_context() {
+        let pool = CandidatePool {
+            pool_guid: [0x35; 16],
+            pool_name: "stale-topology".into(),
+            pool_state: LabelPoolState::Exported,
+            devices: vec![],
+            topology_generation: 3,
+            device_count: 1,
+            recovery_commit_group: 44,
+            topology_complete: true,
+            cluster_authorized: false,
+        };
+
+        let evidence = pool.lifecycle_evidence(PoolLifecycleAction::Import);
+
+        assert_eq!(evidence.action, PoolLifecycleAction::Import);
+        assert_eq!(evidence.outcome, PoolLifecycleOutcome::Refused);
+        assert_eq!(evidence.device_count, 0);
+        assert_eq!(evidence.expected_device_count, 1);
+        assert!(!evidence.topology_complete);
+        assert!(evidence.owner_authorized);
+        assert!(evidence.is_fail_closed());
+        assert_eq!(evidence.reason, "topology evidence incomplete");
     }
 
     #[test]
