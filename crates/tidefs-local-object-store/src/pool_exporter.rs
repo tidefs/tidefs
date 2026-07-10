@@ -761,7 +761,23 @@ mod tests {
     // ── ExportOrchestrator tests ─────────────────────────────────
 
     fn make_orchestrator() -> ExportOrchestrator {
-        ExportOrchestrator::new([0xAAu8; 16], "testpool", Vec::new(), Vec::new(), false)
+        let path = PathBuf::from("/tmp/tidefs-export-evidence");
+        let config = DeviceConfig {
+            media_class: Default::default(),
+            path: path.clone(),
+            backing: DeviceBacking::DirectoryObjectStoreCompat,
+            class: DeviceClass::Data,
+            kind: DeviceKind::Single { path },
+            compression: None,
+            encryption: None,
+        };
+        ExportOrchestrator::new(
+            [0xAAu8; 16],
+            "testpool",
+            vec![config],
+            vec![[0x01u8; 16]],
+            false,
+        )
     }
 
     #[test]
@@ -1163,6 +1179,9 @@ mod tests {
         let evidence = orch.lifecycle_evidence();
 
         assert_eq!(evidence.action, PoolLifecycleAction::Export);
+        assert_eq!(evidence.device_count, 1);
+        assert_eq!(evidence.expected_device_count, 1);
+        assert!(evidence.topology_complete);
         assert!(evidence.owner_authorized);
         assert!(!evidence.is_fail_closed());
     }

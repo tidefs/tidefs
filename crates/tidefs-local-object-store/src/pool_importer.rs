@@ -245,7 +245,7 @@ impl CandidatePool {
 
         // Mark topology completeness
         let found_count = self.devices.len() as u32;
-        self.topology_complete = found_count == self.device_count;
+        self.topology_complete = self.device_count > 0 && found_count == self.device_count;
 
         // Cluster pool detection: if any device label has the
         // CLUSTER_POOL_INCOMPAT flag and cluster authority has not been
@@ -767,9 +767,40 @@ mod tests {
             pool_guid: [0x34; 16],
             pool_name: "evidence".into(),
             pool_state: LabelPoolState::Exported,
-            devices: vec![],
+            devices: vec![DeviceCandidate {
+                path: std::path::PathBuf::from("/dev/tidefs-import"),
+                label: PoolLabelV1 {
+                    magic: POOL_LABEL_MAGIC,
+                    version: 1,
+                    pool_guid: [0x34; 16],
+                    device_guid: [0x33; 16],
+                    pool_name_len: 0,
+                    pool_name: [0u8; 255],
+                    pool_state: LabelPoolState::Exported,
+                    commit_group: 44,
+                    label_commit_group: 44,
+                    device_index: 0,
+                    topology_generation: 3,
+                    device_count: 1,
+                    device_class: LabelDeviceClass::Hdd,
+                    device_capacity_bytes: 4096,
+                    system_area_pointer: 0,
+                    system_area_size: 0,
+                    features_incompat: 0,
+                    features_ro_compat: 0,
+                    features_compat: 0,
+                    device_health: 0,
+                    device_read_errors: 0,
+                    device_write_errors: 0,
+                    device_checksum_errors: 0,
+                    redundancy_policy: PoolRedundancyPolicy::default(),
+                    checksum: [0; 32],
+                },
+                label_copy: 0,
+                device_size: 4096,
+            }],
             topology_generation: 3,
-            device_count: 0,
+            device_count: 1,
             recovery_commit_group: 44,
             topology_complete: true,
             cluster_authorized: false,
@@ -779,6 +810,9 @@ mod tests {
 
         assert_eq!(evidence.action, PoolLifecycleAction::Import);
         assert_eq!(evidence.commit_group, 44);
+        assert_eq!(evidence.device_count, 1);
+        assert_eq!(evidence.expected_device_count, 1);
+        assert_eq!(evidence.capacity_bytes, 4096);
         assert!(evidence.topology_complete);
         assert!(evidence.owner_authorized);
     }
@@ -1039,7 +1073,7 @@ mod tests {
         assert_eq!(evidence.expected_device_count, 0);
         assert_eq!(evidence.topology_generation, 7);
         assert_eq!(evidence.commit_group, 48);
-        assert!(evidence.topology_complete);
+        assert!(!evidence.topology_complete);
         assert!(evidence.owner_authorized);
         assert!(evidence.is_fail_closed());
         assert!(evidence.reason.contains("unsupported"));

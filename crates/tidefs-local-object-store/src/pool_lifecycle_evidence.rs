@@ -79,7 +79,7 @@ pub struct PoolLifecycleContext {
 impl PoolLifecycleContext {
     #[must_use]
     pub fn topology_complete(&self) -> bool {
-        self.device_count == self.expected_device_count
+        self.expected_device_count > 0 && self.device_count == self.expected_device_count
     }
 }
 
@@ -248,6 +248,24 @@ mod tests {
         let evidence = PoolLifecycleEvidence::executed(PoolLifecycleAction::Import, surplus);
 
         assert_eq!(evidence.outcome, PoolLifecycleOutcome::Refused);
+        assert!(!evidence.topology_complete);
+        assert!(evidence.owner_authorized);
+        assert!(evidence.is_fail_closed());
+        assert_eq!(evidence.reason, "topology evidence incomplete");
+    }
+
+    #[test]
+    fn executed_evidence_refuses_empty_topology() {
+        let mut empty = context();
+        empty.device_count = 0;
+        empty.expected_device_count = 0;
+        empty.capacity_bytes = 0;
+
+        let evidence = PoolLifecycleEvidence::executed(PoolLifecycleAction::Import, empty);
+
+        assert_eq!(evidence.outcome, PoolLifecycleOutcome::Refused);
+        assert_eq!(evidence.device_count, 0);
+        assert_eq!(evidence.expected_device_count, 0);
         assert!(!evidence.topology_complete);
         assert!(evidence.owner_authorized);
         assert!(evidence.is_fail_closed());
