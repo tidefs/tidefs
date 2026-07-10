@@ -1672,6 +1672,11 @@ impl MountedRawStoreDiagnostics<'_> {
         Ok(self.store.verify_checksum_tree(key, &tree).map(Some)?)
     }
 
+    fn current_content_object_exists(&self, record: &InodeRecord) -> bool {
+        let key = content_object_key_for_version(record.inode_id, record.data_version);
+        self.store.contains_key(key)
+    }
+
     fn suspect_log_stats(&self) -> SuspectLogStats {
         self.store.suspect_log().stats()
     }
@@ -3953,6 +3958,22 @@ impl LocalFileSystem {
         let record = self.stat(path)?;
         self.mounted_raw_store_diagnostics()
             .verify_file_checksum_tree(&record, block_size)
+    }
+
+    /// Diagnostic current content-object presence projection.
+    ///
+    /// This intentionally answers only whether the file's current
+    /// `(inode_id, data_version)` content object exists in the mounted
+    /// filesystem's lower store. It does not expose raw object-store keys,
+    /// payloads, or store handles to mounted callers.
+    pub fn current_content_object_exists_for_diagnostic(
+        &self,
+        path: impl AsRef<str>,
+    ) -> Result<bool> {
+        let record = self.stat(path)?;
+        Ok(self
+            .mounted_raw_store_diagnostics()
+            .current_content_object_exists(&record))
     }
 
     /// Return the committed root pointer from the transaction-group manager
@@ -11775,6 +11796,7 @@ impl LocalFileSystem {
     pub fn sync_inode_data_only(&mut self, inode_id: InodeId) -> Result<()> {
         check_crash_hook(CrashInjectionPoint::OpFsyncBeforeFlush);
         let started = Instant::now();
+        self.flush_write_buffer(inode_id)?;
         let had_pending_intent = self.intent_log.has_pending_data_for_inode(inode_id);
         if self.intent_log.has_pending_data_for_inode(inode_id) {
             self.intent_log

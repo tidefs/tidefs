@@ -9605,7 +9605,8 @@ fn extent_map_persist_roundtrip_via_object_store() {
     let mut serialized = Vec::new();
     emap.serialize(&mut serialized).unwrap();
 
-    let opts = StoreOptions::test_fast();
+    let mut opts = StoreOptions::test_fast();
+    opts.max_segment_bytes = 8192;
     let key = ObjectKey::from_name("extent-map-roundtrip-test-key");
     {
         let mut store =

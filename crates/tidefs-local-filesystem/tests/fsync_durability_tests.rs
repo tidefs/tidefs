@@ -5,10 +5,10 @@
 //! writes through to the LocalObjectStore, covering edge cases that the
 //! broader in-session and reopen-based tests may not exercise directly.
 //!
-//! Each test writes data, calls fsync (or fdatasync), and then verifies
-//! the object store contains the expected content objects via
-//! `content_object_key_for_version`. The test then reopens the filesystem
-//! to confirm byte-for-byte data survival.
+//! Each test writes data, calls fsync (or fdatasync), and then verifies the
+//! expected current content-object presence or absence through a mounted
+//! diagnostic projection. The test then reopens the filesystem to confirm
+//! byte-for-byte data survival.
 //!
 //! Edge-case coverage:
 //!   - Basic fsync flush → object-store verification
@@ -27,10 +27,8 @@ use std::sync::Barrier;
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use tidefs_local_filesystem::{
-    content_object_key_for_version, InodeRecord, LocalFileSystem, DEFAULT_FILE_PERMISSIONS,
-};
-use tidefs_local_object_store::{LocalObjectStore, StoreOptions};
+use tidefs_local_filesystem::{LocalFileSystem, DEFAULT_FILE_PERMISSIONS};
+use tidefs_local_object_store::StoreOptions;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -73,60 +71,30 @@ fn opts() -> StoreOptions {
     }
 }
 
-/// Stat a file inside an already-open filesystem, returning its InodeRecord.
-fn stat_inode(fs: &LocalFileSystem, path: &str) -> InodeRecord {
-    fs.stat(path).expect("stat")
-}
-
-/// Verify that a content object for the given inode exists in the store.
-fn assert_content_object_exists(store: &LocalObjectStore, inode: &InodeRecord) {
-    let key = content_object_key_for_version(inode.inode_id, inode.data_version);
-    assert!(
-        store.location_of(key).is_some(),
-        "content object must exist in store after fsync (inode={}, version={})",
-        inode.inode_id.get(),
-        inode.data_version,
-    );
-}
-
-/// Verify that NO content object for the given inode exists in the store.
-#[allow(dead_code)]
-fn assert_content_object_absent(store: &LocalObjectStore, inode: &InodeRecord) {
-    let key = content_object_key_for_version(inode.inode_id, inode.data_version);
-    assert!(
-        store.location_of(key).is_none(),
-        "content object must NOT exist in store (inode={})",
-        inode.inode_id.get(),
-    );
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 /// Write 4 KiB to a file, fsync, and verify the content object is present
-/// in the object store via direct inspection. Then reopen and verify data.
+/// through a mounted diagnostic projection. Then reopen and verify data.
 #[test]
 fn fsync_flush_writes_to_object_store() {
     setup_auth_env();
     let root = temp_root("fsync-flush-to-store");
     let data = vec![0xABu8; 4096];
 
-    let inode = {
+    {
         let mut fs = LocalFileSystem::open_with_options(&root, opts()).expect("open fs");
         fs.set_auto_commit(false);
         fs.create_file("/f", DEFAULT_FILE_PERMISSIONS)
             .expect("create /f");
         fs.write_file("/f", 0, &data).expect("write 4 KiB");
-        let inode = stat_inode(&fs, "/f");
         fs.fsync_file("/f").expect("fsync /f");
-        inode
-    };
-
-    // Verify content object exists in the store.
-    {
-        let store = LocalObjectStore::open_with_options(&root, opts()).expect("open store");
-        assert_content_object_exists(&store, &inode);
+        assert!(
+            fs.current_content_object_exists_for_diagnostic("/f")
+                .expect("content object diagnostic"),
+            "current content object must exist in store after fsync",
+        );
     }
 
     // Verify data survives reopen.
@@ -153,23 +121,21 @@ fn fdatasync_persists_data_object_skips_metadata_commit() {
     let root = temp_root("fdatasync-data-only");
     let data = vec![0xCDu8; 2048];
 
-    let inode = {
+    {
         let mut fs = LocalFileSystem::open_with_options(&root, opts()).expect("open fs");
         fs.set_auto_commit(false);
         fs.create_file("/fdat.txt", DEFAULT_FILE_PERMISSIONS)
             .expect("create /fdat.txt");
         fs.write_file("/fdat.txt", 0, &data).expect("write");
-        let inode = stat_inode(&fs, "/fdat.txt");
+        let inode_id = fs.stat("/fdat.txt").expect("stat").inode_id;
         // sync_inode_data_only = fdatasync semantics
-        fs.sync_inode_data_only(inode.inode_id)
+        fs.sync_inode_data_only(inode_id)
             .expect("sync_inode_data_only");
-        inode
-    };
-
-    // Content object is present.
-    {
-        let store = LocalObjectStore::open_with_options(&root, opts()).expect("open store");
-        assert_content_object_exists(&store, &inode);
+        assert!(
+            fs.current_content_object_exists_for_diagnostic("/fdat.txt")
+                .expect("content object diagnostic"),
+            "current content object must exist in store after fdatasync",
+        );
     }
 
     // Without a metadata commit, the file may be unreachable on reopen.
@@ -228,35 +194,28 @@ fn fsync_vs_fdatasync_reachability_after_reopen() {
     cleanup(&root);
 }
 
-/// fsync on a newly created zero-length file must succeed and produce a
-/// valid (possibly empty-layout) content object in the store.
+/// fsync on a newly created zero-length file must succeed without creating a
+/// content object, while the metadata commit preserves the empty file.
 #[test]
-fn fsync_empty_file_creates_valid_content_object() {
+fn fsync_empty_file_preserves_empty_file_without_content_object() {
     setup_auth_env();
     let root = temp_root("fsync-empty-file");
 
-    let inode = {
+    {
         let mut fs = LocalFileSystem::open_with_options(&root, opts()).expect("open fs");
         fs.set_auto_commit(false);
         fs.create_file("/empty.bin", DEFAULT_FILE_PERMISSIONS)
             .expect("create empty.bin");
-        let inode = stat_inode(&fs, "/empty.bin");
+        let inode = fs.stat("/empty.bin").expect("stat empty.bin");
         assert_eq!(inode.size, 0, "newly created file must have size 0");
         fs.fsync_file("/empty.bin").expect("fsync empty file");
-        inode
-    };
-
-    // Empty files are metadata-only: no content object should exist.
-    {
-        let pool = tidefs_local_filesystem::LocalFileSystem::default_development_pool(
-            &root,
-            &opts(),
-            None,
-            None,
-        )
-        .expect("open pool");
-        assert_content_object_absent(pool.raw_primary_store(), &inode);
+        assert!(
+            !fs.current_content_object_exists_for_diagnostic("/empty.bin")
+                .expect("content object diagnostic"),
+            "empty file must not create a content object after fsync",
+        );
     }
+
     // Reopen: empty file still exists and is empty.
     {
         let fs = LocalFileSystem::open_with_options(&root, opts()).expect("reopen fs");
