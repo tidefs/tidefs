@@ -385,6 +385,7 @@ pub fn build_evidence_manifest(
 
 fn evidence_manifest_scope(evidence: &ScrubForegroundReadRuntimeEvidence) -> String {
     let admission = &evidence.admission_state;
+    let service_curve = &evidence.service_curve;
     format!(
         concat!(
             "row={} supported_claims={} non_claims={} outcome={:?} artifact={} ",
@@ -393,7 +394,11 @@ fn evidence_manifest_scope(evidence: &ScrubForegroundReadRuntimeEvidence) -> Str
             "foreground_read_refused_by_service_curve={} scrub_units_requested={} ",
             "scrub_units_admitted_by_service_curve={} ",
             "scrub_units_deferred_by_service_curve={} ",
-            "scrub_work_deferred_by_service_curve={} max_scrub_queue_depth={}"
+            "scrub_work_deferred_by_service_curve={} max_scrub_queue_depth={} ",
+            "foreground_read_within_bound={} ",
+            "unscheduled_foreground_read_within_bound={} ",
+            "scheduled_max_scrub_queue_depth={} ",
+            "unscheduled_max_scrub_queue_depth={}"
         ),
         evidence.row_id,
         evidence.supported_claims.join(","),
@@ -409,7 +414,11 @@ fn evidence_manifest_scope(evidence: &ScrubForegroundReadRuntimeEvidence) -> Str
         admission.scrub_units_admitted_by_service_curve,
         admission.scrub_units_deferred_by_service_curve,
         admission.scrub_work_deferred_by_service_curve,
-        admission.max_scrub_queue_depth
+        admission.max_scrub_queue_depth,
+        service_curve.foreground_read_within_bound,
+        service_curve.unscheduled_foreground_read_within_bound,
+        service_curve.scheduled_max_scrub_queue_depth,
+        service_curve.unscheduled_max_scrub_queue_depth
     )
 }
 
@@ -1015,6 +1024,24 @@ mod tests {
         assert!(scope.contains(&format!(
             "max_scrub_queue_depth={}",
             evidence.admission_state.max_scrub_queue_depth
+        )));
+        assert!(scope.contains(&format!(
+            "foreground_read_within_bound={}",
+            evidence.service_curve.foreground_read_within_bound
+        )));
+        assert!(scope.contains(&format!(
+            "unscheduled_foreground_read_within_bound={}",
+            evidence
+                .service_curve
+                .unscheduled_foreground_read_within_bound
+        )));
+        assert!(scope.contains(&format!(
+            "scheduled_max_scrub_queue_depth={}",
+            evidence.service_curve.scheduled_max_scrub_queue_depth
+        )));
+        assert!(scope.contains(&format!(
+            "unscheduled_max_scrub_queue_depth={}",
+            evidence.service_curve.unscheduled_max_scrub_queue_depth
         )));
     }
 
