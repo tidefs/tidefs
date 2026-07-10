@@ -3,7 +3,7 @@ evidence_class = "scrub-read-isolation-model"
 source = "tidefs-performance-contract"
 scope = "local-mounted-foreground-read-service-while-scrub-work-is-pending"
 issue = 1792
-reviewed_at = "2026-07-02"
+reviewed_at = "2026-07-10"
 
 reviewed_claim_ids = [
   "scrub.foreground_read.protected.v1",
@@ -13,7 +13,7 @@ reviewed_claim_ids = [
 validation_tier = "source-model"
 runtime_artifact = "validation/artifacts/performance/scrub-read-runtime.json"
 runtime_artifact_source = "QEMU Smoke target=scrub-foreground-read-runtime"
-runtime_evidence_status = "pending-runtime-dispatch"
+runtime_evidence_status = "bounded-qemu-scrub-foreground-read-runtime-present-claims-remain-blocked"
 decision = "claims-remain-blocked-until-runtime-artifact-and-claims-gate-review"
 
 typed_contracts = [
