@@ -50,11 +50,14 @@ is_positive_number() {
   awk -v n="$1" 'BEGIN { exit !(n ~ /^[0-9]+([.][0-9]+)?$/ && n > 0) }'
 }
 
-is_integer() {
+is_qemu_exit_code() {
   [ -n "$1" ] || return 1
   case "$1" in
     *[!0-9]*) return 1 ;;
-    *) return 0 ;;
+  esac
+  case "$1" in
+    0|[1-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5]) return 0 ;;
+    *) return 1 ;;
   esac
 }
 
@@ -72,7 +75,7 @@ json_string() {
 }
 
 qemu_exit_json_value() {
-  if is_integer "$1"; then
+  if is_qemu_exit_code "$1"; then
     printf '%s' "$1"
   else
     json_string "$1"
@@ -186,7 +189,7 @@ analyze_qemu_log() {
     REQUIRED_METRICS_PRESENT=true
   fi
 
-  if ! is_integer "$qemu_exit"; then
+  if ! is_qemu_exit_code "$qemu_exit"; then
     VERDICT_STATUS=BLOCKED
     VERDICT_REASON=qemu_exit_invalid
     VERDICT_EXIT=2
@@ -357,7 +360,10 @@ self_test_parser() {
   expect_json_string quote-and-backslash 'quote"slash\' '"quote\"slash\\"'
   expect_json_string control-bytes $'line\nnext\tcarriage\rreturn' '"line\nnext\tcarriage\rreturn"'
   expect_qemu_exit_json_value numeric 124 124
+  expect_qemu_exit_json_value max 255 255
   expect_qemu_exit_json_value invalid unknown '"unknown"'
+  expect_qemu_exit_json_value invalid-range 256 '"256"'
+  expect_qemu_exit_json_value oversized 999999999999999999999999999999999999999999999999999 '"999999999999999999999999999999999999999999999999999"'
 
   : > "$test_dir/empty.log"
   analyze_qemu_log "$test_dir/empty.log" 0
@@ -422,6 +428,16 @@ EOF
   expect_parser_verdict qemu-exit-invalid BLOCKED qemu_exit_invalid 2
   expect_parser_counts qemu-exit-invalid 3 0 0 0
   expect_parser_state qemu-exit-invalid false false false true
+
+  analyze_qemu_log "$test_dir/qemu-exit-invalid.log" 256
+  expect_parser_verdict qemu-exit-out-of-range BLOCKED qemu_exit_invalid 2
+  expect_parser_counts qemu-exit-out-of-range 3 0 0 0
+  expect_parser_state qemu-exit-out-of-range false false false true
+
+  analyze_qemu_log "$test_dir/qemu-exit-invalid.log" 999999999999999999999999999999999999999999999999999
+  expect_parser_verdict qemu-exit-oversized BLOCKED qemu_exit_invalid 2
+  expect_parser_counts qemu-exit-oversized 3 0 0 0
+  expect_parser_state qemu-exit-oversized false false false true
 
   cat > "$test_dir/zero-pass.log" <<'EOF'
 write_duration_s=0.125
