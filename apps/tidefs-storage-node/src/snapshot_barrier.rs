@@ -434,12 +434,24 @@ impl BarrierCollector {
                 .map(|r| r.committed_root_txg)
                 .max()
                 .unwrap_or(0);
+            let min_generation = self
+                .responses
+                .values()
+                .map(|r| r.committed_root_generation)
+                .min()
+                .unwrap_or(0);
+            let max_generation = self
+                .responses
+                .values()
+                .map(|r| r.committed_root_generation)
+                .max()
+                .unwrap_or(0);
             let total_objects: u64 = self.responses.values().map(|r| r.object_count).sum();
 
             // Consistency check: all peers must report the same
-            // committed-root txg. Any txg spread indicates a peer
-            // advanced while the barrier was in flight.
-            if max_txg == min_txg {
+            // committed-root txg and generation. Any spread indicates a
+            // peer advanced while the barrier was in flight.
+            if max_txg == min_txg && max_generation == min_generation {
                 Some(BarrierOutcome::Consistent {
                     min_txg,
                     max_txg,
@@ -994,6 +1006,22 @@ mod tests {
     }
 
     #[test]
+    fn collector_outcome_inconsistent_with_generation_difference() {
+        let mut c = BarrierCollector::new(1, "snap".into(), vec![10, 20], make_config());
+        c.record_response(make_response(10, 1, 100, 5, 10));
+        c.record_response(make_response(20, 1, 100, 6, 20));
+        match c.outcome() {
+            Some(BarrierOutcome::Inconsistent {
+                min_txg, max_txg, ..
+            }) => {
+                assert_eq!(min_txg, 100);
+                assert_eq!(max_txg, 100);
+            }
+            other => panic!("expected Inconsistent, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn collector_outcome_inconsistent_wide_txg_spread() {
         let mut c = BarrierCollector::new(1, "snap".into(), vec![10, 20], make_config());
         c.record_response(make_response(10, 1, 100, 5, 10));
@@ -1471,7 +1499,7 @@ mod tests {
                     peer_id: 3,
                     barrier_id: 7,
                     committed_root_txg: 41,
-                    committed_root_generation: 6,
+                    committed_root_generation: 5,
                     object_count: 12,
                     received_at: Instant::now(),
                 },
