@@ -109,6 +109,18 @@ fn is_manifest_path(path: &Path) -> bool {
         .is_some_and(|name| name.to_ascii_lowercase().ends_with(".manifest.json"))
 }
 
+fn implied_sidecar_artifact_path(manifest_path: &str) -> Option<String> {
+    const MANIFEST_SUFFIX: &str = ".manifest.json";
+
+    let lower_path = manifest_path.to_ascii_lowercase();
+    if !lower_path.ends_with(MANIFEST_SUFFIX) {
+        return None;
+    }
+
+    let stem_len = manifest_path.len() - MANIFEST_SUFFIX.len();
+    Some(format!("{}.json", &manifest_path[..stem_len]))
+}
+
 fn bytes_contain(bytes: &[u8], needle: &[u8]) -> bool {
     bytes.windows(needle.len()).any(|window| window == needle)
 }
@@ -397,6 +409,17 @@ fn committed_runtime_artifacts_have_runtime_tier_manifests() {
         }
         if manifest.validation_tier.is_live_runtime() {
             let manifest_path = repo_relative_path(repo_root, path);
+            if let Some(implied_artifact_path) = implied_sidecar_artifact_path(&manifest_path) {
+                if implied_artifact_path != manifest.artifact_path
+                    && committed_artifacts.contains(&implied_artifact_path)
+                    && is_runtime_artifact_path(Path::new(&implied_artifact_path))
+                {
+                    failures.push(format!(
+                        "{manifest_path} is adjacent to runtime artifact `{implied_artifact_path}` but points at `{}`",
+                        manifest.artifact_path
+                    ));
+                }
+            }
             if is_manifest_path(artifact_path) {
                 failures.push(format!(
                     "{manifest_path} is a live-runtime manifest pointing at manifest `{}`",
