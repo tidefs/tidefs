@@ -6822,6 +6822,55 @@ mod tests {
         ack
     }
 
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct DecodedSnapPush {
+        export_len: usize,
+        incremental: bool,
+        roots_len: usize,
+        total_records: u64,
+        payload_bytes: u64,
+        from_root: Option<CommittedRootSummary>,
+    }
+
+    fn decode_snap_push_frame(
+        frame: &[u8],
+        expected_auth_key: &[u8; SNAP_NET_AUTH_KEY_LEN],
+    ) -> DecodedSnapPush {
+        assert!(frame.len() >= SNAP_NET_PUSH_HEADER_LEN);
+        assert_eq!(&frame[0..4], SNAP_NET_MAGIC);
+        assert_eq!(frame[4], SNAP_KIND_PUSH);
+
+        let auth_len = u32::from_le_bytes(frame[5..9].try_into().expect("auth len")) as usize;
+        assert_eq!(auth_len, SNAP_NET_AUTH_KEY_LEN);
+        let auth_start = 9;
+        let auth_end = auth_start + auth_len;
+        assert_eq!(&frame[auth_start..auth_end], &expected_auth_key[..]);
+
+        let export_len_offset = auth_end;
+        let export_len = u32::from_le_bytes(
+            frame[export_len_offset..export_len_offset + 4]
+                .try_into()
+                .expect("export len"),
+        ) as usize;
+        let export_start = export_len_offset + 4;
+        let export_end = export_start + export_len;
+        assert_eq!(frame.len(), export_end);
+
+        let decoded = crate::vfssend2_bridge::receive_vfssend2_to_changed_records(
+            &frame[export_start..export_end],
+        )
+        .expect("decode pushed export");
+
+        DecodedSnapPush {
+            export_len,
+            incremental: decoded.incremental,
+            roots_len: decoded.roots.len(),
+            total_records: decoded.total_records,
+            payload_bytes: decoded.payload_bytes,
+            from_root: decoded.from_root,
+        }
+    }
+
     fn snap_net_error(message: &[u8]) -> Vec<u8> {
         let mut error = Vec::new();
         error.extend_from_slice(SNAP_NET_MAGIC);
@@ -8195,39 +8244,18 @@ mod tests {
             TransportAddr::Tcp(addr) => addr.to_string(),
             _ => unreachable!("test binds TCP transport"),
         };
+        let (decoded_tx, decoded_rx) = std::sync::mpsc::channel();
 
         let server_handle = thread::spawn(move || {
             let session_id = accept_snapshot_transport_session(&mut server);
             server.perform_handshake(session_id).expect("handshake");
             let frame = server.recv_message(session_id).expect("recv push frame");
 
-            assert!(frame.len() >= SNAP_NET_PUSH_HEADER_LEN);
-            assert_eq!(&frame[0..4], SNAP_NET_MAGIC);
-            assert_eq!(frame[4], SNAP_KIND_PUSH);
-
-            let auth_len = u32::from_le_bytes(frame[5..9].try_into().expect("auth len")) as usize;
-            assert_eq!(auth_len, SNAP_NET_AUTH_KEY_LEN);
-            let auth_start = 9;
-            let auth_end = auth_start + auth_len;
-            assert_eq!(&frame[auth_start..auth_end], &expected_auth_key[..]);
-
-            let export_len_offset = auth_end;
-            let export_len = u32::from_le_bytes(
-                frame[export_len_offset..export_len_offset + 4]
-                    .try_into()
-                    .expect("export len"),
-            ) as usize;
-            let export_start = export_len_offset + 4;
-            let export_end = export_start + export_len;
-            assert_eq!(frame.len(), export_end);
-
-            let decoded = crate::vfssend2_bridge::receive_vfssend2_to_changed_records(
-                &frame[export_start..export_end],
-            )
-            .expect("decode pushed export");
+            let decoded = decode_snap_push_frame(&frame, &expected_auth_key);
             assert!(!decoded.incremental);
             assert!(decoded.total_records > 0);
             assert!(decoded.payload_bytes > 0);
+            decoded_tx.send(decoded).expect("send decoded push");
 
             server
                 .send_message(session_id, &snap_net_ack(b"received"))
@@ -8253,11 +8281,19 @@ mod tests {
         assert_eq!(sent["json"]["format"], "vfssend2");
         assert_eq!(sent["json"]["incremental"], false);
         assert!(sent["json"]["bytes"].as_u64().unwrap_or(0) > 0);
+        let pushed = decoded_rx.recv().expect("decoded pushed stream");
+        assert_eq!(sent["json"]["bytes"], pushed.export_len as u64);
+        assert_eq!(sent["json"]["roots"], pushed.roots_len as u64);
+        assert_eq!(sent["json"]["records"], pushed.total_records);
+        assert_eq!(sent["json"]["payload_bytes"], pushed.payload_bytes);
 
         let encoded = std::fs::read(&output).expect("read acked output");
         let decoded = crate::vfssend2_bridge::receive_vfssend2_to_changed_records(&encoded)
             .expect("decode acked output");
         assert!(!decoded.incremental);
+        assert_eq!(decoded.roots.len(), pushed.roots_len);
+        assert_eq!(decoded.total_records, pushed.total_records);
+        assert_eq!(decoded.payload_bytes, pushed.payload_bytes);
         assert!(decoded.total_records > 0);
         assert!(decoded.payload_bytes > 0);
 
@@ -8295,6 +8331,7 @@ mod tests {
             TransportAddr::Tcp(addr) => addr.to_string(),
             _ => unreachable!("test binds TCP transport"),
         };
+        let (decoded_tx, decoded_rx) = std::sync::mpsc::channel();
 
         let server_handle = thread::spawn({
             let baseline_root = baseline_root.clone();
@@ -8303,35 +8340,12 @@ mod tests {
                 server.perform_handshake(session_id).expect("handshake");
                 let frame = server.recv_message(session_id).expect("recv push frame");
 
-                assert!(frame.len() >= SNAP_NET_PUSH_HEADER_LEN);
-                assert_eq!(&frame[0..4], SNAP_NET_MAGIC);
-                assert_eq!(frame[4], SNAP_KIND_PUSH);
-
-                let auth_len =
-                    u32::from_le_bytes(frame[5..9].try_into().expect("auth len")) as usize;
-                assert_eq!(auth_len, SNAP_NET_AUTH_KEY_LEN);
-                let auth_start = 9;
-                let auth_end = auth_start + auth_len;
-                assert_eq!(&frame[auth_start..auth_end], &expected_auth_key[..]);
-
-                let export_len_offset = auth_end;
-                let export_len = u32::from_le_bytes(
-                    frame[export_len_offset..export_len_offset + 4]
-                        .try_into()
-                        .expect("export len"),
-                ) as usize;
-                let export_start = export_len_offset + 4;
-                let export_end = export_start + export_len;
-                assert_eq!(frame.len(), export_end);
-
-                let decoded = crate::vfssend2_bridge::receive_vfssend2_to_changed_records(
-                    &frame[export_start..export_end],
-                )
-                .expect("decode pushed export");
+                let decoded = decode_snap_push_frame(&frame, &expected_auth_key);
                 assert!(decoded.incremental);
                 assert_eq!(decoded.from_root.as_ref(), Some(&baseline_root));
                 assert!(decoded.total_records > 0);
                 assert!(decoded.payload_bytes > 0);
+                decoded_tx.send(decoded).expect("send decoded push");
 
                 server
                     .send_message(session_id, &snap_net_ack(b"received incremental"))
@@ -8358,6 +8372,11 @@ mod tests {
         assert_eq!(sent["json"]["format"], "vfssend2");
         assert_eq!(sent["json"]["incremental"], true);
         assert!(sent["json"]["bytes"].as_u64().unwrap_or(0) > 0);
+        let pushed = decoded_rx.recv().expect("decoded pushed stream");
+        assert_eq!(sent["json"]["bytes"], pushed.export_len as u64);
+        assert_eq!(sent["json"]["roots"], pushed.roots_len as u64);
+        assert_eq!(sent["json"]["records"], pushed.total_records);
+        assert_eq!(sent["json"]["payload_bytes"], pushed.payload_bytes);
 
         server_handle.join().expect("server thread");
     }
