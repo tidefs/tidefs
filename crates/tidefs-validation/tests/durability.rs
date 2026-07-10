@@ -295,7 +295,7 @@ fn multi_file_16_files_4_subdirs_durability() {
             // Each file gets unique deterministic data via sequenced pattern
             // plus a per-file seed in the first 8 bytes.
             let mut data = Vec::with_capacity(file_size);
-            data.extend_from_slice(&i.to_le_bytes());
+            data.extend_from_slice(&(i as u64).to_le_bytes());
             data.extend(sequenced_test_data(file_size - 8));
             h.write_file(&path, &data)
                 .unwrap_or_else(|e| panic!("write {path}: {e}"));
