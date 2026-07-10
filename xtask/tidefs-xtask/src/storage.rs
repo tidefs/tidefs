@@ -181,13 +181,6 @@ pub fn check_local_object_store_on_disk_format_current_workspace() -> Result<(),
         "80-byte production-integrity trailer",
         "PRODUCTION_INTEGRITY_TRAILER_LEN=80",
     ];
-    // Production-integrity policy doc
-    check_forbidden_markers(
-        &root,
-        "docs/PRODUCTION_INTEGRITY_POLICY.md",
-        stale_patterns,
-        &mut missing,
-    );
     // Root-authentication doc (references production trailer)
     check_forbidden_markers(
         &root,
@@ -237,7 +230,8 @@ pub fn check_production_integrity_policy_current_workspace() -> Result<(), Stora
     let mut missing = Vec::new();
 
     for rel in [
-        "docs/PRODUCTION_INTEGRITY_POLICY.md",
+        "docs/BLAKE3_USAGE_POLICY.md",
+        "docs/ROOT_AUTHENTICATION_OW015.md",
         "crates/tidefs-local-object-store/src/lib.rs",
         "crates/tidefs-local-filesystem/src/lib.rs",
         "apps/tidefs-store-demo/src/main.rs",
@@ -284,15 +278,26 @@ pub fn check_production_integrity_policy_current_workspace() -> Result<(), Stora
     );
     check_source_markers(
         &root,
-        "docs/PRODUCTION_INTEGRITY_POLICY.md",
+        "docs/BLAKE3_USAGE_POLICY.md",
         &[
             "BLAKE3-256",
+            "durable-integrity",
+            "Content Addressing",
+            "Durable Integrity Trailers",
+            "IntegrityTrailerV2",
             "domain separation",
-            "collision policy",
+            "production-integrity trailers",
+        ],
+        &mut missing,
+    );
+    check_source_markers(
+        &root,
+        "docs/ROOT_AUTHENTICATION_OW015.md",
+        &[
+            "VFSRATH1",
+            "keyed BLAKE3-256 authentication code",
+            "external operator secret",
             "authenticated root",
-            "migration plan",
-            "record version 3",
-            "v1/v2 compatibility",
         ],
         &mut missing,
     );
@@ -379,10 +384,10 @@ pub fn check_production_integrity_v3_current_workspace() -> Result<(), StorageCh
         ],
         &mut missing,
     );
-    // Reject stale current-format language in the format authority doc
+    // Reject stale current-format language in the current BLAKE3 authority doc.
     check_forbidden_markers(
         &root,
-        "docs/PRODUCTION_INTEGRITY_POLICY.md",
+        "docs/BLAKE3_USAGE_POLICY.md",
         &["VLOSINT3", "80-byte production-integrity trailer"],
         &mut missing,
     );
@@ -425,7 +430,6 @@ pub fn check_root_authentication_current_workspace() -> Result<(), StorageCheckE
 
     for rel in [
         "docs/ROOT_AUTHENTICATION_OW015.md",
-        "docs/PRODUCTION_INTEGRITY_POLICY.md",
         "crates/tidefs-local-filesystem/src/lib.rs",
         "apps/tidefs-filesystem-demo/src/main.rs",
         "apps/tidefs-posix-filesystem-adapter-daemon/src/main.rs",
