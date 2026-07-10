@@ -3974,7 +3974,10 @@ fn snap_net_payload_len(payload_len: usize) -> Result<u32, String> {
     })
 }
 
-fn build_snap_push_message(export: &[u8], auth_key: &[u8; 32]) -> Result<Vec<u8>, String> {
+fn build_snap_push_message(
+    export: &[u8],
+    auth_key: &[u8; SNAP_NET_AUTH_KEY_LEN],
+) -> Result<Vec<u8>, String> {
     let export_len = snap_net_payload_len(export.len())?;
     let capacity = SNAP_NET_PUSH_HEADER_LEN
         .checked_add(export.len())
@@ -6640,14 +6643,14 @@ mod tests {
     #[test]
     fn build_snap_push_message_encodes_frame_layout() {
         let export = b"vfssend payload";
-        let auth_key = [0x5a; 32];
+        let auth_key = [0x5a; SNAP_NET_AUTH_KEY_LEN];
 
         let frame = build_snap_push_message(export, &auth_key).expect("build frame");
 
         let mut expected = Vec::new();
         expected.extend_from_slice(SNAP_NET_MAGIC);
         expected.push(SNAP_KIND_PUSH);
-        expected.extend_from_slice(&32u32.to_le_bytes());
+        expected.extend_from_slice(&(SNAP_NET_AUTH_KEY_LEN as u32).to_le_bytes());
         expected.extend_from_slice(&auth_key);
         expected.extend_from_slice(&(export.len() as u32).to_le_bytes());
         expected.extend_from_slice(export);
