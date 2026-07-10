@@ -106,7 +106,7 @@ fn committed_repo_files(repo_root: &Path) -> BTreeSet<String> {
 fn is_manifest_path(path: &Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
-        .is_some_and(|name| name.ends_with(".manifest.json"))
+        .is_some_and(|name| name.to_ascii_lowercase().ends_with(".manifest.json"))
 }
 
 fn bytes_contain(bytes: &[u8], needle: &[u8]) -> bool {
@@ -207,6 +207,9 @@ fn runtime_artifact_classifier_is_token_based() {
         "validation/artifacts/crash-oracle/runtime.MANIFEST.JSON"
     )));
     assert!(!is_runtime_artifact_path(Path::new(
+        "validation/artifacts/kernel/runtime/output.Manifest.Json"
+    )));
+    assert!(is_manifest_path(Path::new(
         "validation/artifacts/kernel/runtime/output.Manifest.Json"
     )));
 }
