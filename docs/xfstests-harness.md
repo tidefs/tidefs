@@ -92,6 +92,7 @@ require features outside the current TideFS FUSE adapter boundary:
 | Mmap coherency        | generic/091, 215, 216, 223, 224, 225, 226, 228, 229, 230, 231, 235, 239, 247, 248, 252, 255, 263 |
 | Quota                 | generic/244, 245, 383 |
 | Swap                  | generic/472, 493, 494 |
+| Freeze/thaw           | generic/068, 085, 275 |
 | Sub-second timestamps | generic/258 |
 
 Delivered (no longer excluded): O_DIRECT (#876), POSIX file locks (#491/#791),
@@ -104,6 +105,10 @@ wires `FS_IOC_FIEMAP`, `FS_IOC_FSGETXATTR`, and `TIDEFS_IOC_DEFRAG`; other
 ioctl commands return `EOPNOTSUPP` in
 `apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_vfs_adapter.rs`
 `FuseVfsAdapter::ioctl`.
+
+The freeze/thaw rows are also an unsupported/refused Linux ioctl boundary for
+the FUSE adapter. `FIFREEZE` and `FITHAW` are classified deliberately and
+return `EOPNOTSUPP`; this does not make a mounted-kernel freeze/thaw claim.
 
 The exclude file is passed to xfstests-check via `-E` when `TIDEFS_XFSTESTS_EXCLUDE` is set. Override with:
 
