@@ -50,6 +50,14 @@ is_positive_number() {
   awk -v n="$1" 'BEGIN { exit !(n ~ /^[0-9]+([.][0-9]+)?$/ && n > 0) }'
 }
 
+is_integer() {
+  [ -n "$1" ] || return 1
+  case "$1" in
+    *[!0-9]*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
 json_string() {
   local value="${1-}"
 
@@ -61,6 +69,14 @@ json_string() {
   value="${value//$'\r'/\\r}"
   value="${value//$'\t'/\\t}"
   printf '"%s"' "$value"
+}
+
+qemu_exit_json_value() {
+  if is_integer "$1"; then
+    printf '%s' "$1"
+  else
+    json_string "$1"
+  fi
 }
 
 git_dirty_json_bool() {
@@ -159,10 +175,6 @@ analyze_qemu_log() {
   VERDICT_REASON=complete
   VERDICT_EXIT=0
 
-  [ "$qemu_exit" -eq 0 ] && QEMU_SUCCESS=true
-  if [ "$qemu_exit" -eq 124 ] || [ "$qemu_exit" -eq 137 ]; then
-    QEMU_TIMED_OUT=true
-  fi
   [ ! -s "$log_file" ] && LOG_EMPTY=true
 
   if is_positive_number "$WRITE_DURATION_VAL" &&
@@ -172,6 +184,18 @@ analyze_qemu_log() {
      is_positive_number "$STAT_LAT_VAL" &&
      is_positive_number "$STAT_TOTAL_DURATION_VAL"; then
     REQUIRED_METRICS_PRESENT=true
+  fi
+
+  if ! is_integer "$qemu_exit"; then
+    VERDICT_STATUS=BLOCKED
+    VERDICT_REASON=qemu_exit_invalid
+    VERDICT_EXIT=2
+    return
+  fi
+
+  [ "$qemu_exit" -eq 0 ] && QEMU_SUCCESS=true
+  if [ "$qemu_exit" -eq 124 ] || [ "$qemu_exit" -eq 137 ]; then
+    QEMU_TIMED_OUT=true
   fi
 
   if [ "$qemu_exit" -ne 0 ]; then
@@ -312,6 +336,19 @@ expect_json_string() {
   fi
 }
 
+expect_qemu_exit_json_value() {
+  local name="$1"
+  local input="$2"
+  local expected="$3"
+  local actual
+
+  actual="$(qemu_exit_json_value "$input")"
+  if [ "$actual" != "$expected" ]; then
+    echo "qemu exit json self-test failed for $name: got $actual expected $expected" >&2
+    exit 1
+  fi
+}
+
 self_test_parser() {
   local test_dir
   test_dir="$(mktemp -d)"
@@ -319,6 +356,8 @@ self_test_parser() {
 
   expect_json_string quote-and-backslash 'quote"slash\' '"quote\"slash\\"'
   expect_json_string control-bytes $'line\nnext\tcarriage\rreturn' '"line\nnext\tcarriage\rreturn"'
+  expect_qemu_exit_json_value numeric 124 124
+  expect_qemu_exit_json_value invalid unknown '"unknown"'
 
   : > "$test_dir/empty.log"
   analyze_qemu_log "$test_dir/empty.log" 0
@@ -367,6 +406,22 @@ EOF
   expect_parser_verdict qemu-exit-nonzero BLOCKED qemu_exit_1 2
   expect_parser_counts qemu-exit-nonzero 3 0 0 0
   expect_parser_state qemu-exit-nonzero false false false true
+
+  cat > "$test_dir/qemu-exit-invalid.log" <<'EOF'
+PASS: insmod
+PASS: mount
+PASS: no_daemon
+write_duration_s=0.125
+write_throughput_MBps=10.00
+read_duration_s=0.250
+read_throughput_MBps=20.00
+stat_avg_latency_us=30
+stat_total_duration_s=0.003
+EOF
+  analyze_qemu_log "$test_dir/qemu-exit-invalid.log" unknown
+  expect_parser_verdict qemu-exit-invalid BLOCKED qemu_exit_invalid 2
+  expect_parser_counts qemu-exit-invalid 3 0 0 0
+  expect_parser_state qemu-exit-invalid false false false true
 
   cat > "$test_dir/zero-pass.log" <<'EOF'
 write_duration_s=0.125
@@ -854,7 +909,7 @@ cat > "$RUN_DIR_VALIDATION/validation-manifest.json" << MANIFEST
   "mode": "bootstrap",
   "validation_tier": "Tier 5 mounted Linux 7.0 kernel VFS",
   "qemu_accel": "$QEMU_ACCEL",
-  "qemu_exit": $QEMU_EXIT,
+  "qemu_exit": $(qemu_exit_json_value "$QEMU_EXIT"),
   "qemu_success": $QEMU_SUCCESS,
   "qemu_timed_out": $QEMU_TIMED_OUT,
   "log_empty": $LOG_EMPTY,
