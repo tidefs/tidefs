@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::SystemTime;
 use tidefs_validation::evidence_artifact_manifest::{
-    load_evidence_artifact_manifest_json_path, BlockingIssueRef, EvidenceArtifactManifest,
+    is_runtime_artifact_path, load_evidence_artifact_manifest_json_path, BlockingIssueRef,
+    EvidenceArtifactManifest,
 };
 use tidefs_validation::local_vfs_runtime_crash_artifact::{
     validate_local_vfs_rename_runtime_crash_artifact_path,
@@ -1063,6 +1064,27 @@ fn build_claim_evidence_class_receipt(
                 details: vec![format!(
                     "claim `{}` evidence requirement for runtime-tier class `{class}` must name manifest_path",
                     claim.id
+                )],
+            };
+        }
+        if is_runtime_artifact_path(Path::new(&requirement.path)) {
+            return ClaimEvidenceClassReceipt {
+                class: class.to_string(),
+                status: EvidenceClassStatus::Malformed,
+                artifact_path,
+                validation_tier,
+                blocking_issues,
+                manifest_path: None,
+                content_digest: None,
+                run_id: None,
+                source_ref: None,
+                outcome: None,
+                residual_risk: None,
+                source: None,
+                evidence_scope: None,
+                details: vec![format!(
+                    "claim `{}` evidence requirement runtime artifact path `{}` for class `{class}` requires live-runtime validation_tier and manifest_path",
+                    claim.id, requirement.path
                 )],
             };
         }
@@ -2889,6 +2911,20 @@ fn validate_registered_evidence_artifacts_for_claim(
                 continue;
             }
             if claim.status.is_validated() {
+                if requirement.validation_tier.is_runtime() {
+                    failures.push(format!(
+                        "claim `{}` evidence requirement for runtime-tier class `{class}` must name manifest_path",
+                        claim.id
+                    ));
+                    continue;
+                }
+                if is_runtime_artifact_path(Path::new(&requirement.path)) {
+                    failures.push(format!(
+                        "claim `{}` evidence requirement runtime artifact path `{}` for class `{class}` requires live-runtime validation_tier and manifest_path",
+                        claim.id, requirement.path
+                    ));
+                    continue;
+                }
                 failures.push(format!(
                     "claim `{}` validated evidence requirement for class `{class}` must set manifest_path",
                     claim.id
@@ -4264,6 +4300,47 @@ const UNGUARDED_COMMANDS: &[&str] = &[
             .details
             .iter()
             .any(|detail| detail.contains("runtime-tier") && detail.contains("manifest_path")));
+    }
+
+    #[test]
+    fn validate_claim_rejects_runtime_artifact_path_without_manifest() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut claim = manifest_fixture_claim(
+            "example.manifest.validated.v1",
+            ClaimStatus::Validated,
+            Vec::new(),
+            Vec::new(),
+        );
+        claim.evidence_requirements[0].path =
+            "validation/artifacts/kernel/runtime/output.json".to_string();
+        claim.evidence_requirements[0].validation_tier = ValidationTier::CargoUnit;
+        claim.evidence_requirements[0].manifest_path = None;
+
+        let receipt = build_claim_validation_receipt(temp.path(), SystemTime::UNIX_EPOCH, &claim);
+
+        assert_eq!(receipt.status, ClaimReceiptStatus::Fail);
+        let evidence = receipt
+            .required_evidence
+            .iter()
+            .find(|evidence| evidence.class == "cargo-fixture")
+            .expect("manifest-backed evidence receipt");
+        assert_eq!(evidence.status, EvidenceClassStatus::Malformed);
+        assert_eq!(
+            evidence.artifact_path,
+            "validation/artifacts/kernel/runtime/output.json"
+        );
+        assert!(evidence.details.iter().any(|detail| {
+            detail.contains("runtime artifact path")
+                && detail.contains("live-runtime")
+                && detail.contains("manifest_path")
+        }));
+
+        let failures = validate_claim_record(temp.path(), SystemTime::UNIX_EPOCH, &claim);
+        assert!(failures.iter().any(|failure| {
+            failure.contains("runtime artifact path")
+                && failure.contains("live-runtime")
+                && failure.contains("manifest_path")
+        }));
     }
 
     #[test]
