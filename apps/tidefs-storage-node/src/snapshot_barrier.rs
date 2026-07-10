@@ -185,10 +185,12 @@ pub enum BarrierOutcome {
         /// Peers that did not respond.
         missing: Vec<u64>,
     },
-    /// Committed roots are inconsistent (txg mismatch).
+    /// Committed roots are inconsistent (txg or generation mismatch).
     Inconsistent {
         min_txg: u64,
         max_txg: u64,
+        min_generation: u64,
+        max_generation: u64,
         responses: BTreeMap<u64, BarrierResponse>,
     },
     /// A peer reported an explicit barrier failure.
@@ -230,6 +232,8 @@ pub enum SnapshotBarrierSendError {
         barrier_id: BarrierId,
         min_txg: u64,
         max_txg: u64,
+        min_generation: u64,
+        max_generation: u64,
     },
 }
 
@@ -268,9 +272,11 @@ impl fmt::Display for SnapshotBarrierSendError {
                 barrier_id,
                 min_txg,
                 max_txg,
+                min_generation,
+                max_generation,
             } => write!(
                 f,
-                "barrier {barrier_id} inconsistent committed-root txg range {min_txg}..{max_txg}"
+                "barrier {barrier_id} inconsistent committed-root txg range {min_txg}..{max_txg}, generation range {min_generation}..{max_generation}"
             ),
         }
     }
@@ -300,11 +306,17 @@ pub fn snapshot_barrier_send_report(
             missing,
         }),
         BarrierOutcome::Inconsistent {
-            min_txg, max_txg, ..
+            min_txg,
+            max_txg,
+            min_generation,
+            max_generation,
+            ..
         } => Err(SnapshotBarrierSendError::Inconsistent {
             barrier_id,
             min_txg,
             max_txg,
+            min_generation,
+            max_generation,
         }),
         BarrierOutcome::Failed { peer_id, reason } => Err(SnapshotBarrierSendError::PeerFailed {
             barrier_id,
@@ -462,6 +474,8 @@ impl BarrierCollector {
                 Some(BarrierOutcome::Inconsistent {
                     min_txg,
                     max_txg,
+                    min_generation,
+                    max_generation,
                     responses: self.responses.clone(),
                 })
             }
@@ -1012,10 +1026,16 @@ mod tests {
         c.record_response(make_response(20, 1, 100, 6, 20));
         match c.outcome() {
             Some(BarrierOutcome::Inconsistent {
-                min_txg, max_txg, ..
+                min_txg,
+                max_txg,
+                min_generation,
+                max_generation,
+                ..
             }) => {
                 assert_eq!(min_txg, 100);
                 assert_eq!(max_txg, 100);
+                assert_eq!(min_generation, 5);
+                assert_eq!(max_generation, 6);
             }
             other => panic!("expected Inconsistent, got {other:?}"),
         }
@@ -1565,7 +1585,7 @@ mod tests {
                 BarrierResponse {
                     peer_id: 3,
                     barrier_id: 9,
-                    committed_root_txg: 45,
+                    committed_root_txg: 41,
                     committed_root_generation: 6,
                     object_count: 12,
                     received_at: Instant::now(),
@@ -1577,7 +1597,9 @@ mod tests {
             9,
             BarrierOutcome::Inconsistent {
                 min_txg: 41,
-                max_txg: 45,
+                max_txg: 41,
+                min_generation: 5,
+                max_generation: 6,
                 responses,
             },
         )
@@ -1588,10 +1610,14 @@ mod tests {
             SnapshotBarrierSendError::Inconsistent {
                 barrier_id: 9,
                 min_txg: 41,
-                max_txg: 45,
+                max_txg: 41,
+                min_generation: 5,
+                max_generation: 6,
             }
         );
         assert!(err.to_string().contains("inconsistent"));
+        assert!(err.to_string().contains("txg range 41..41"));
+        assert!(err.to_string().contains("generation range 5..6"));
     }
 
     #[test]
