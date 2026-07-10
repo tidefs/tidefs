@@ -215,14 +215,16 @@ impl WritebackProjection {
     /// been written through to the engine but have not yet passed the
     /// durability barrier).
     pub fn record_writeback_pending(&self, ino: u64, total_bytes: u64) {
-        let _prev = self
+        let prev = self
             .lanes
             .lock()
             .unwrap()
             .insert(ino, WritebackLane::WritebackPending { bytes: total_bytes });
-        self.stats
-            .writeback_pending_transitions
-            .fetch_add(1, Ordering::Relaxed);
+        if !matches!(prev, Some(WritebackLane::WritebackPending { .. })) {
+            self.stats
+                .writeback_pending_transitions
+                .fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Record that `ino` has transitioned to Clean after a successful
@@ -430,6 +432,18 @@ mod tests {
         assert_eq!(
             p.lane(42),
             Some(WritebackLane::WritebackPending { bytes: 4096 })
+        );
+        assert_eq!(p.stats_snapshot().writeback_pending_transitions, 1);
+    }
+
+    #[test]
+    fn writeback_pending_to_pending_counts_only_first() {
+        let p = new_projection();
+        p.record_writeback_pending(42, 4096);
+        p.record_writeback_pending(42, 8192);
+        assert_eq!(
+            p.lane(42),
+            Some(WritebackLane::WritebackPending { bytes: 8192 })
         );
         assert_eq!(p.stats_snapshot().writeback_pending_transitions, 1);
     }
