@@ -180,6 +180,10 @@ impl WritebackProjection {
     /// state has been recorded in the adapter's [`DirtyRanges`] and/or
     /// [`PageCache`].
     pub fn record_dirty(&self, ino: u64, total_dirty_bytes: u64) {
+        if total_dirty_bytes == 0 {
+            return;
+        }
+
         let mut lanes = self.lanes.lock().unwrap();
         let prev = lanes.get(&ino).copied().unwrap_or(WritebackLane::Clean);
         match prev {
@@ -215,11 +219,14 @@ impl WritebackProjection {
     /// been written through to the engine but have not yet passed the
     /// durability barrier).
     pub fn record_writeback_pending(&self, ino: u64, total_bytes: u64) {
-        let prev = self
-            .lanes
-            .lock()
-            .unwrap()
-            .insert(ino, WritebackLane::WritebackPending { bytes: total_bytes });
+        if total_bytes == 0 {
+            return;
+        }
+
+        let mut lanes = self.lanes.lock().unwrap();
+        let prev = lanes.get(&ino).copied();
+        let bytes = prev.map_or(total_bytes, |lane| lane.bytes().max(total_bytes));
+        lanes.insert(ino, WritebackLane::WritebackPending { bytes });
         if !matches!(prev, Some(WritebackLane::WritebackPending { .. })) {
             self.stats
                 .writeback_pending_transitions
@@ -407,6 +414,14 @@ mod tests {
     }
 
     #[test]
+    fn zero_byte_dirty_record_does_not_create_lane() {
+        let p = new_projection();
+        p.record_dirty(42, 0);
+        assert_eq!(p.lane(42), None);
+        assert_eq!(p.stats_snapshot().dirty_transitions, 0);
+    }
+
+    #[test]
     fn record_writeback_pending_transition() {
         let p = new_projection();
         p.record_dirty(42, 4096);
@@ -426,6 +441,38 @@ mod tests {
         let p = new_projection();
         p.record_writeback_pending(42, 4096);
         p.record_writeback_pending(42, 8192);
+        assert_eq!(
+            p.lane(42),
+            Some(WritebackLane::WritebackPending { bytes: 8192 })
+        );
+        assert_eq!(p.stats_snapshot().writeback_pending_transitions, 1);
+    }
+
+    #[test]
+    fn zero_byte_writeback_pending_record_does_not_create_lane() {
+        let p = new_projection();
+        p.record_writeback_pending(42, 0);
+        assert_eq!(p.lane(42), None);
+        assert_eq!(p.stats_snapshot().writeback_pending_transitions, 0);
+    }
+
+    #[test]
+    fn writeback_pending_record_does_not_shrink_pending_bytes() {
+        let p = new_projection();
+        p.record_writeback_pending(42, 8192);
+        p.record_writeback_pending(42, 4096);
+        assert_eq!(
+            p.lane(42),
+            Some(WritebackLane::WritebackPending { bytes: 8192 })
+        );
+        assert_eq!(p.stats_snapshot().writeback_pending_transitions, 1);
+    }
+
+    #[test]
+    fn writeback_pending_record_preserves_larger_dirty_observation() {
+        let p = new_projection();
+        p.record_dirty(42, 8192);
+        p.record_writeback_pending(42, 4096);
         assert_eq!(
             p.lane(42),
             Some(WritebackLane::WritebackPending { bytes: 8192 })
