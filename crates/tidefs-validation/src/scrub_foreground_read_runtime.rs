@@ -172,7 +172,7 @@ pub struct ScrubActivityEvidence {
     pub throttle_count: u64,
     pub throttle_observed: bool,
     pub backoff_millis: u64,
-    pub pending_or_rate_limited_during_read: bool,
+    pub pending_and_rate_limited_during_read: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -560,7 +560,7 @@ fn build_scrub_activity(service_curve: &ServiceCurveEvidence) -> ScrubActivityEv
         throttle_count,
         throttle_observed,
         backoff_millis: SCRUB_BACKOFF_MILLIS,
-        pending_or_rate_limited_during_read: pending_after_read > 0 && throttle_observed,
+        pending_and_rate_limited_during_read: pending_after_read > 0 && throttle_observed,
     }
 }
 
@@ -695,7 +695,7 @@ fn scrub_read_isolation_passed(
 ) -> bool {
     foreground_read.passed
         && scrub_activity.background_scrub_configured
-        && scrub_activity.pending_or_rate_limited_during_read
+        && scrub_activity.pending_and_rate_limited_during_read
         && scrub_activity.scrub_deferred_by_service_curve > 0
         && scrub_activity.throttle_observed
         && service_curve.foreground_read_admitted_by_service_curve
@@ -1161,7 +1161,7 @@ mod tests {
             scrub_activity.max_scrub_queue_depth,
             service_curve.scheduled_max_scrub_queue_depth
         );
-        assert!(scrub_activity.pending_or_rate_limited_during_read);
+        assert!(scrub_activity.pending_and_rate_limited_during_read);
         assert!(scrub_activity.throttle_observed);
     }
 }
