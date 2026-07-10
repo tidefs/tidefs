@@ -3120,6 +3120,8 @@ impl VfsLocalFileSystem {
                 if wants_json {
                     let mut result = json!({
                         "target_addr": target_addr,
+                        "node_id": *node_id,
+                        "server_node_id": *server_node_id,
                         "remote_response": remote_msg,
                         "bytes": stream.encoded.len(),
                         "format": plan.format.label(),
@@ -8232,8 +8234,10 @@ mod tests {
         let engine = VfsLocalFileSystem::new(fs);
         let expected_auth_key = engine.fs.borrow().root_authentication_key.as_bytes32();
         let output = root.path().join("target-ack.vfs");
+        let local_node_id = 7;
+        let server_node_id = 9;
 
-        let mut server = Transport::new(2);
+        let mut server = Transport::new(server_node_id);
         server
             .bind(TransportAddr::Tcp(SocketAddr::new(
                 IpAddr::V4(Ipv4Addr::LOCALHOST),
@@ -8271,12 +8275,16 @@ mod tests {
                 "target_addr": target_addr.clone(),
                 "format": "vfssend2",
                 "incremental": false,
+                "node_id": local_node_id,
+                "server_node_id": server_node_id,
             }),
             true,
         );
 
         assert_eq!(sent["ok"], true, "send response: {sent}");
         assert_eq!(sent["json"]["target_addr"], target_addr);
+        assert_eq!(sent["json"]["node_id"], local_node_id);
+        assert_eq!(sent["json"]["server_node_id"], server_node_id);
         assert_eq!(sent["json"]["remote_response"], "received");
         assert_eq!(sent["json"]["format"], "vfssend2");
         assert_eq!(sent["json"]["incremental"], false);
