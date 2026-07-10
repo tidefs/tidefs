@@ -181,9 +181,9 @@ fn handle_client(
     let mut line = String::new();
     let response = match reader.read_line(&mut line) {
         Ok(0) => live_admin_malformed("empty live-owner request"),
-        Ok(_) => match serde_json::from_str::<LivePoolAdminRequest>(&line) {
+        Ok(_) => match decode_live_pool_admin_request(&line) {
             Ok(request) => dispatch_request(request, manifest, engine, shutdown),
-            Err(err) => live_admin_malformed(format!("decode live-owner request: {err}")),
+            Err(err) => live_admin_typed_error(err),
         },
         Err(err) => live_admin_malformed(format!("read live-owner request: {err}")),
     };
@@ -202,6 +202,28 @@ fn handle_client(
             );
         }
     }
+}
+
+fn decode_live_pool_admin_request(line: &str) -> Result<LivePoolAdminRequest, LivePoolAdminError> {
+    let value: serde_json::Value = serde_json::from_str(line).map_err(|err| {
+        LivePoolAdminError::malformed(format!("decode live-owner request: {err}"))
+    })?;
+
+    if let Some(command) = value
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+        .and_then(parse_wire_command_parts)
+    {
+        LivePoolAdminCommand::from_parts(command.0, &command.1)?;
+    }
+
+    serde_json::from_value::<LivePoolAdminRequest>(value)
+        .map_err(|err| LivePoolAdminError::malformed(format!("decode live-owner request: {err}")))
+}
+
+fn parse_wire_command_parts(command: &str) -> Option<(&str, String)> {
+    let (command, operation) = command.split_once('_')?;
+    Some((command, operation.replace('_', "-")))
 }
 
 fn dispatch_request(
@@ -732,6 +754,41 @@ mod tests {
         assert_eq!(
             value.get("operation").and_then(serde_json::Value::as_str),
             Some("list")
+        );
+    }
+
+    #[test]
+    fn unknown_wire_command_decodes_as_typed_unsupported_command() {
+        let err = decode_live_pool_admin_request(
+            r#"{"version":1,"command":"cluster_promote","pool":"tank","pool_uuid":null,"output":"human","args":{}}"#,
+        )
+        .unwrap_err();
+
+        assert_eq!(err.exit_code, 1);
+        let response = live_admin_typed_error(err);
+        let LivePoolAdminResponseBody::Error {
+            message,
+            machine_json: Some(machine_json),
+        } = response.body
+        else {
+            panic!("unsupported command should carry typed machine JSON");
+        };
+        assert_eq!(
+            message,
+            "unsupported live-owner command tidefsctl cluster promote"
+        );
+        let value: serde_json::Value = serde_json::from_str(&machine_json).unwrap();
+        assert_eq!(
+            value.get("kind").and_then(serde_json::Value::as_str),
+            Some("unsupported_command")
+        );
+        assert_eq!(
+            value.get("command").and_then(serde_json::Value::as_str),
+            Some("cluster")
+        );
+        assert_eq!(
+            value.get("operation").and_then(serde_json::Value::as_str),
+            Some("promote")
         );
     }
 
