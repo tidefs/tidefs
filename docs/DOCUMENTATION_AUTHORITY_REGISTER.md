@@ -568,7 +568,6 @@ surface beyond adding `docs/CLAIMS_GATE_POLICY.md`, which was already scanned.
 | `docs/SPACEMAP_ALLOCATOR_DESIGN.md` | Historical input | Retained only as a provenance pointer while active issue #1842 owns the remaining `xtask/tidefs-xtask/src/storage.rs` citation. Current authority lives in `crates/tidefs-spacemap-allocator/src/lib.rs`, source callers, current capacity/storage-intent authority, `validation/claims.toml`, and the claims gate; this file is not runtime allocator proof, capacity authority, or an OpenZFS comparison surface. |
 | `docs/POLYMORPHIC_DIRECTORY_INDEX_DESIGN.md` | Historical input | Retained only as a provenance pointer while source comments still name this historical path. Current authority lives in `crates/tidefs-types-polymorphic-directory-index-core/src/lib.rs`, source callers, `validation/claims.toml`, and the claims gate; this file is not namespace authority, directory-index completeness proof, performance evidence, production-readiness evidence, or a ZFS ZAP comparison surface. |
 | `docs/POOL_IMPORT_EXPORT_DEVICE_TOPOLOGY_DESIGN.md` | Current spec | Scoped source-backed summary for the current pool-label, pool-scan/import, local import/export, and device-manager code paths. It is not product-readiness evidence for hot spares, evacuation, cluster ownership, online topology conversion, hardware-failure survival, availability, operational safety, or incumbent-comparison claims. |
-| `docs/MEMBERSHIP_SERVICE_DESIGN.md` | Historical input | Imported design-spec for cluster membership service. References Forgejo issue #1209. ZFS/Ceph comparison text is design input only and is not a cluster-membership, distributed-availability, scale, performance, or successor claim. Claims registry has no validated cluster-membership claim. |
 
 ### Remaining Imported Design Surface (TFR-019 / #512)
 
@@ -646,6 +645,17 @@ claims gate. This deletion does not implement distributed membership runtime
 closure, production replication or rebuild, clock-drift runtime validation,
 release readiness, OpenZFS/Ceph parity, or successor/comparator wording.
 
+### Membership-Service Historical Root Deletion (TFR-019 / #1835)
+
+Issue #1835 deleted the imported membership-service root after replacing the
+remaining live references with current membership authority, quorum-set
+identity, storage-intent policy, source-owned membership crates, validation
+claims, and live GitHub issue/PR authority. Its lineage remains in git, issue
+#1835, and its pull request only. This deletion does not implement or validate
+a full cluster-membership service, distributed availability, production
+readiness, release readiness, OpenZFS/Ceph parity, performance,
+successor/comparator wording, or operator-readiness claims.
+
 ## Incumbent Comparison Audit Slice (#931)
 
 This initial #931 slice classifies the following legacy incumbent-comparison
@@ -666,8 +676,8 @@ required by those registry entries:
 - Deleted polymorphic extent-map design lineage: ZFS/Ceph extent-layout tables,
   random-read cost hypotheses, and design-mistake coverage remain non-claim
   historical lessons in git history only.
-- `docs/MEMBERSHIP_SERVICE_DESIGN.md`: ZFS/Ceph cluster-membership comparison
-  is design input only; no cluster-membership claim is validated.
+- Deleted membership-service comparison lineage: ZFS/Ceph cluster-membership
+  comparison text remains non-claim historical input in git history only.
 - The deleted shard/rebake design-family comparison text about ZFS/Ceph
   deferred redundancy and write amplification is design input only.
 - `docs/ONLINE_DEFRAG_BPR_DESIGN.md`: ZFS/Ceph defrag and BPR comparison text

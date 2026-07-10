@@ -9,11 +9,10 @@
 
 Multiple membership and quorum crates exist (`tidefs-membership-epoch`,
 `tidefs-membership-live`, `tidefs-membership-types`, `tidefs-quorum-write`,
-`tidefs-quorum-write-runtime`, `tidefs-witness-set`) and design docs
-(`docs/MEMBERSHIP_SERVICE_DESIGN.md`,
-`docs/MEMBERSHIP_CONFIG_QUORUM_SET_IDENTITY_OW302B.md`), but no single document
-names the authority owner for membership epoch identity, quorum-write dispatch,
-witness-set evidence, and the cluster join/leave lifecycle.
+`tidefs-quorum-write-runtime`, `tidefs-witness-set`) and authority docs
+(`docs/MEMBERSHIP_CONFIG_QUORUM_SET_IDENTITY_OW302B.md`), but no single
+document names the authority owner for membership epoch identity, quorum-write
+dispatch, witness-set evidence, and the cluster join/leave lifecycle.
 
 This record decides the single membership epoch authority owner, the
 quorum-write dispatch model, the node-join and node-drain lifecycle
@@ -23,7 +22,7 @@ owner and maps follow-up implementation issues with expected write sets.
 
 ## Evidence reviewed
 
-- `docs/MEMBERSHIP_SERVICE_DESIGN.md` — membership service design
+- Deleted membership-service root lineage — historical input in git history
 - `docs/MEMBERSHIP_CONFIG_QUORUM_SET_IDENTITY_OW302B.md` — quorum-set
   identity spec
 - `crates/tidefs-membership-epoch/` — source-owned membership, placement, and
