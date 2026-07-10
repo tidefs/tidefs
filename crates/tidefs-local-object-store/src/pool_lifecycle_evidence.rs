@@ -129,6 +129,13 @@ impl PoolLifecycleEvidence {
         owner_authorized: bool,
         reason: impl Into<String>,
     ) -> Self {
+        let reason = reason.into();
+        let reason = if reason.trim().is_empty() {
+            "lifecycle evidence refused".to_string()
+        } else {
+            reason
+        };
+
         Self {
             action,
             outcome: PoolLifecycleOutcome::Refused,
@@ -141,7 +148,7 @@ impl PoolLifecycleEvidence {
             capacity_bytes: context.capacity_bytes,
             topology_generation: context.topology_generation,
             commit_group: context.commit_group,
-            reason: reason.into(),
+            reason,
         }
     }
 
@@ -262,6 +269,19 @@ mod tests {
         assert!(evidence.is_fail_closed());
         assert!(evidence.summary().contains("action=import"));
         assert!(evidence.summary().contains("missing owner token"));
+    }
+
+    #[test]
+    fn refused_evidence_records_non_empty_reason() {
+        let evidence =
+            PoolLifecycleEvidence::refused(PoolLifecycleAction::Import, context(), "   ");
+
+        assert_eq!(evidence.outcome, PoolLifecycleOutcome::Refused);
+        assert_eq!(evidence.reason, "lifecycle evidence refused");
+        assert!(evidence.is_fail_closed());
+        assert!(evidence
+            .summary()
+            .contains("reason=lifecycle evidence refused"));
     }
 
     #[test]
