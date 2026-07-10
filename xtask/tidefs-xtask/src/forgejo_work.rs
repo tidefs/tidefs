@@ -72,28 +72,36 @@ pub fn check_claim_gate_current_workspace() -> Result<(), ForgejoWorkError> {
     let mut violations = Vec::new();
 
     // 1. Detect issue number from cwd.
-    let issue_num = match detect_issue_number_from_path(&cwd, &worktree_root) {
-        Some(num) => num,
-        None => {
-            violations.push(format!(
-                "current directory '{}' is not a tidefs worktree under '{}/'",
-                cwd.display(),
-                worktree_root.display()
-            ));
-            return Err(ForgejoWorkError { violations });
+    let (issue_num, wt_dir) = match detect_issue_number_from_path(&cwd, &worktree_root) {
+        Some(num) => {
+            // 2. Find the matching worktree directory.
+            let wt_dir = match find_worktree_dir(&worktree_root, num) {
+                Some(dir) => dir,
+                None => {
+                    violations.push(format!(
+                        "no worktree directory found for issue #{num} under '{}/'",
+                        worktree_root.display()
+                    ));
+                    return Err(ForgejoWorkError { violations });
+                }
+            };
+            (num, wt_dir)
         }
-    };
-
-    // 2. Find the matching worktree directory.
-    let wt_dir = match find_worktree_dir(&worktree_root, issue_num) {
-        Some(dir) => dir,
-        None => {
-            violations.push(format!(
-                "no worktree directory found for issue #{issue_num} under '{}/'",
-                worktree_root.display()
-            ));
-            return Err(ForgejoWorkError { violations });
-        }
+        None => match current_worktree_issue_authority(&cwd, &worktree_root) {
+            Ok(Some(authority)) => authority,
+            Ok(None) => {
+                violations.push(format!(
+                    "current directory '{}' is not a tidefs worktree under '{}/'",
+                    cwd.display(),
+                    worktree_root.display()
+                ));
+                return Err(ForgejoWorkError { violations });
+            }
+            Err(err) => {
+                violations.push(err);
+                return Err(ForgejoWorkError { violations });
+            }
+        },
     };
 
     // 3. Validate the worktree directory exists and has a valid git branch.
@@ -347,6 +355,24 @@ fn find_worktree_dir(worktree_root: &Path, issue_num: u64) -> Option<PathBuf> {
         })
 }
 
+fn current_worktree_issue_authority(
+    cwd: &Path,
+    worktree_root: &Path,
+) -> Result<Option<(u64, PathBuf)>, String> {
+    let repo_root = match git_toplevel(cwd) {
+        Ok(repo_root) => repo_root,
+        Err(_) => return Ok(None),
+    };
+    if repo_root.strip_prefix(worktree_root).is_err() {
+        return Ok(None);
+    }
+
+    let Some(issue_num) = git_issue_authority(&repo_root)? else {
+        return Ok(None);
+    };
+    Ok(Some((issue_num, repo_root)))
+}
+
 fn list_issue_worktree_dirs(worktree_root: &Path) -> Result<Vec<PathBuf>, String> {
     let entries = fs::read_dir(worktree_root).map_err(|err| {
         format!(
@@ -414,9 +440,14 @@ fn validate_worktree_branch(wt_dir: &Path, issue_num: u64) -> Result<(), String>
     if branch_issue_authority(&branch, issue_num).is_some() {
         return Ok(());
     }
+    if let Some(upstream) = git_upstream_branch(wt_dir)? {
+        if branch_issue_authority(&upstream, issue_num).is_some() {
+            return Ok(());
+        }
+    }
 
     Err(format!(
-        "worktree branch '{}' does not match expected prefix 'codexN/issue-{}-*' or 'dsN/issue-{}-*' in '{}'",
+        "worktree branch '{}' does not match expected prefix 'codexN/issue-{}-*' or 'dsN/issue-{}-*', and no matching upstream was found in '{}'",
         branch,
         issue_num,
         issue_num,
@@ -425,11 +456,33 @@ fn validate_worktree_branch(wt_dir: &Path, issue_num: u64) -> Result<(), String>
 }
 
 fn branch_issue_authority(branch: &str, issue_num: u64) -> Option<WorktreeIssueAuthority> {
-    let (owner, rest) = branch.split_once('/')?;
-    if is_codex_identity_dir(owner) && rest.starts_with(&format!("issue-{issue_num}-")) {
+    if issue_number_from_branch_authority(branch) == Some(issue_num) {
         return Some(WorktreeIssueAuthority::GitHub);
     }
     None
+}
+
+fn git_issue_authority(dir: &Path) -> Result<Option<u64>, String> {
+    let branch = git_branch(dir)
+        .map_err(|err| format!("could not determine branch in '{}': {err}", dir.display()))?;
+    if let Some(issue_num) = issue_number_from_branch_authority(&branch) {
+        return Ok(Some(issue_num));
+    }
+    if let Some(upstream) = git_upstream_branch(dir)? {
+        return Ok(issue_number_from_branch_authority(&upstream));
+    }
+    Ok(None)
+}
+
+fn issue_number_from_branch_authority(branch: &str) -> Option<u64> {
+    let branch = branch.strip_prefix("origin/").unwrap_or(branch);
+    let (owner, rest) = branch.split_once('/')?;
+    if !is_codex_identity_dir(owner) {
+        return None;
+    }
+    let issue_slug = rest.strip_prefix("issue-")?;
+    let (issue_num, _) = issue_slug.split_once('-')?;
+    issue_num.parse::<u64>().ok()
 }
 
 fn is_codex_identity_dir(name: &str) -> bool {
@@ -477,6 +530,22 @@ fn git_branch(dir: &Path) -> Result<String, String> {
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn git_upstream_branch(dir: &Path) -> Result<Option<String>, String> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
+        .current_dir(dir)
+        .output()
+        .map_err(|err| format!("git rev-parse upstream failed: {err}"))?;
+
+    if !output.status.success() {
+        return Ok(None);
+    }
+
+    Ok(Some(
+        String::from_utf8_lossy(&output.stdout).trim().to_string(),
+    ))
 }
 
 fn check_github_issue_open(issue_num: u64) -> Result<bool, String> {
@@ -673,6 +742,38 @@ mod tests {
         );
         assert_eq!(branch_issue_authority("codex0/issue-9-wrong", 8), None);
         assert_eq!(branch_issue_authority("feature/issue-8-wrong", 8), None);
+        assert_eq!(
+            branch_issue_authority("codex1/pr-2059-retire-forgejo-xtask", 2059),
+            None
+        );
+    }
+
+    #[test]
+    fn issue_number_from_branch_authority_accepts_only_issue_identity_branches() {
+        assert_eq!(
+            issue_number_from_branch_authority("origin/ds10/issue-1805-retire-forgejo-xtask"),
+            Some(1805)
+        );
+        assert_eq!(
+            issue_number_from_branch_authority("ds10/issue-1805-retire-forgejo-xtask"),
+            Some(1805)
+        );
+        assert_eq!(
+            issue_number_from_branch_authority("codex1/issue-8-xtask-claim-gate"),
+            Some(8)
+        );
+        assert_eq!(
+            issue_number_from_branch_authority("codex1/pr-2059-retire-forgejo-xtask"),
+            None
+        );
+        assert_eq!(
+            issue_number_from_branch_authority("origin/feature/issue-1805-x"),
+            None
+        );
+        assert_eq!(
+            issue_number_from_branch_authority("codex/issue-1805-retire-forgejo-xtask"),
+            None
+        );
     }
 
     #[test]
