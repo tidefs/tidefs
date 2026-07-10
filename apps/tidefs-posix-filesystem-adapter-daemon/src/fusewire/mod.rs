@@ -1329,6 +1329,12 @@ pub const FS_IOC_FSGETXATTR: u32 = 0x801C_581F;
 /// Linux `FS_IOC_FSSETXATTR` ioctl command value.
 pub const FS_IOC_FSSETXATTR: u32 = 0x401C_5820;
 
+/// Linux `FIFREEZE` ioctl command value.
+pub const FS_IOC_FREEZE: u32 = 0xC004_5877;
+
+/// Linux `FITHAW` ioctl command value.
+pub const FS_IOC_THAW: u32 = 0xC004_5878;
+
 /// Wire size of `struct fsxattr`.
 pub const FSXATTR_WIRE_SIZE: usize = 28;
 

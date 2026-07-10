@@ -85,9 +85,14 @@ generic/472
 generic/493
 generic/494
 
-# --- Freeze (FS_IOC_FREEZE/FS_IOC_THAW not supported on FUSE) ---
+# --- Freeze/thaw (FIFREEZE/FITHAW unsupported/refused on FUSE) ---
+#   generic/068, generic/085, and generic/275 exercise the Linux filesystem
+#   freeze/thaw ioctl boundary. TideFS FUSE deliberately refuses FIFREEZE and
+#   FITHAW as EOPNOTSUPP in FuseVfsAdapter::ioctl; mounted-kernel freeze/thaw
+#   remains a separate issue.
 generic/068
 generic/085
+generic/275
 
 # --- Insert/collapse range (FALLOC_FL_INSERT_RANGE/FALLOC_FL_COLLAPSE_RANGE
 #     not supported; returns EOPNOTSUPP) ---
@@ -140,9 +145,6 @@ generic/300
 # --- Quota (not implemented in TideFS FUSE) ---
 generic/270
 generic/280
-
-# --- Freeze/thaw (FIFREEZE/FITHAW not implemented) ---
-generic/275
 
 # --- ENOSPC (pool capacity tracking exists but no per-filesystem ENOSPC return path) ---
 generic/269
