@@ -118,8 +118,11 @@ pub struct AdmissionStateEvidence {
     pub foreground_read_admitted_by_service_curve: bool,
     pub foreground_read_refused_by_service_curve: bool,
     pub scrub_units_requested: u32,
+    pub scrub_unit_admitted_by_service_curve: bool,
+    pub scrub_unit_refused_by_service_curve: bool,
     pub scrub_units_admitted_by_service_curve: u32,
     pub scrub_units_deferred_by_service_curve: u32,
+    pub scrub_work_deferred_by_service_curve: bool,
     pub max_scrub_queue_depth: u32,
 }
 
@@ -481,8 +484,11 @@ fn build_admission_state(
         foreground_read_refused_by_service_curve: !service_curve
             .foreground_read_admitted_by_service_curve,
         scrub_units_requested: scrub_activity.scrub_units_requested,
+        scrub_unit_admitted_by_service_curve: service_curve.scrub_unit_admitted_by_service_curve,
+        scrub_unit_refused_by_service_curve: !service_curve.scrub_unit_admitted_by_service_curve,
         scrub_units_admitted_by_service_curve: scrub_activity.scrub_admitted_by_service_curve,
         scrub_units_deferred_by_service_curve: scrub_activity.scrub_deferred_by_service_curve,
+        scrub_work_deferred_by_service_curve: scrub_activity.scrub_deferred_by_service_curve > 0,
         max_scrub_queue_depth: scrub_activity.max_scrub_queue_depth,
     }
 }
@@ -940,6 +946,17 @@ mod tests {
                 .admission_state
                 .foreground_read_refused_by_service_curve
         );
+        assert!(
+            evidence
+                .admission_state
+                .scrub_unit_admitted_by_service_curve
+        );
+        assert!(!evidence.admission_state.scrub_unit_refused_by_service_curve);
+        assert!(
+            evidence
+                .admission_state
+                .scrub_work_deferred_by_service_curve
+        );
         assert!(evidence
             .foreground_read
             .failures
@@ -1030,12 +1047,24 @@ mod tests {
             scrub_activity.scrub_units_requested
         );
         assert_eq!(
+            admission_state.scrub_unit_admitted_by_service_curve,
+            service_curve.scrub_unit_admitted_by_service_curve
+        );
+        assert_eq!(
+            admission_state.scrub_unit_refused_by_service_curve,
+            !service_curve.scrub_unit_admitted_by_service_curve
+        );
+        assert_eq!(
             admission_state.scrub_units_admitted_by_service_curve,
             service_curve.scheduled_scrub_admitted
         );
         assert_eq!(
             admission_state.scrub_units_deferred_by_service_curve,
             service_curve.scheduled_scrub_deferred
+        );
+        assert_eq!(
+            admission_state.scrub_work_deferred_by_service_curve,
+            service_curve.scheduled_scrub_deferred > 0
         );
         assert_eq!(
             admission_state.max_scrub_queue_depth,
