@@ -155,10 +155,25 @@ impl PoolLifecycleEvidence {
 
     #[must_use]
     pub fn summary(&self) -> String {
+        let pool_guid = self
+            .pool_guid
+            .map(|guid| {
+                let mut rendered = String::with_capacity(32);
+                for byte in guid {
+                    use std::fmt::Write as _;
+                    let _ = write!(&mut rendered, "{byte:02x}");
+                }
+                rendered
+            })
+            .unwrap_or_else(|| "none".to_string());
+        let pool_name = self.pool_name.as_deref().unwrap_or("none");
+
         format!(
-            "action={} outcome={} devices={}/{} capacity_bytes={} topology_generation={} commit_group={} topology_complete={} owner_authorized={} reason={}",
+            "action={} outcome={} pool_guid={} pool_name={} devices={}/{} capacity_bytes={} topology_generation={} commit_group={} topology_complete={} owner_authorized={} reason={}",
             self.action.stable_id(),
             self.outcome.stable_id(),
+            pool_guid,
+            pool_name,
             self.device_count,
             self.expected_device_count,
             self.capacity_bytes,
@@ -196,6 +211,10 @@ mod tests {
         assert!(evidence.owner_authorized);
         assert!(!evidence.is_fail_closed());
         assert!(evidence.summary().contains("action=import"));
+        assert!(evidence
+            .summary()
+            .contains("pool_guid=44444444444444444444444444444444"));
+        assert!(evidence.summary().contains("pool_name=life"));
     }
 
     #[test]
