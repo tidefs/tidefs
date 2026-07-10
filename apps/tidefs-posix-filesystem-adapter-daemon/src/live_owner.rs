@@ -209,7 +209,8 @@ fn decode_live_pool_admin_request(line: &str) -> Result<LivePoolAdminRequest, Li
         LivePoolAdminError::malformed(format!("decode live-owner request: {err}"))
     })?;
 
-    reject_unsupported_live_pool_admin_version(&value)?;
+    let version = decode_live_pool_admin_version(&value)?;
+    reject_unsupported_live_pool_admin_version(version)?;
 
     if let Some(command) = value
         .get("command")
@@ -223,17 +224,28 @@ fn decode_live_pool_admin_request(line: &str) -> Result<LivePoolAdminRequest, Li
         .map_err(|err| LivePoolAdminError::malformed(format!("decode live-owner request: {err}")))
 }
 
-fn reject_unsupported_live_pool_admin_version(
-    value: &serde_json::Value,
-) -> Result<(), LivePoolAdminError> {
-    if let Some(version) = value
-        .get("version")
-        .and_then(serde_json::Value::as_u64)
+fn decode_live_pool_admin_version(value: &serde_json::Value) -> Result<u16, LivePoolAdminError> {
+    let Some(version) = value.get("version") else {
+        return Err(LivePoolAdminError::malformed(
+            "decode live-owner request: missing version",
+        ));
+    };
+
+    let Some(version) = version
+        .as_u64()
         .and_then(|version| u16::try_from(version).ok())
-    {
-        if version != LIVE_POOL_ADMIN_PROTOCOL_VERSION {
-            return Err(LivePoolAdminError::unsupported_version(version));
-        }
+    else {
+        return Err(LivePoolAdminError::malformed(
+            "decode live-owner request: malformed version",
+        ));
+    };
+
+    Ok(version)
+}
+
+fn reject_unsupported_live_pool_admin_version(version: u16) -> Result<(), LivePoolAdminError> {
+    if version != LIVE_POOL_ADMIN_PROTOCOL_VERSION {
+        return Err(LivePoolAdminError::unsupported_version(version));
     }
 
     Ok(())
@@ -808,6 +820,51 @@ mod tests {
             value.get("operation").and_then(serde_json::Value::as_str),
             Some("promote")
         );
+    }
+
+    #[test]
+    fn malformed_wire_version_decodes_as_typed_malformed() {
+        for (payload, detail) in [
+            (
+                r#"{"command":"pool_status","pool":"tank","pool_uuid":null,"output":"human","args":{}}"#,
+                "missing version",
+            ),
+            (
+                r#"{"version":"1","command":"pool_status","pool":"tank","pool_uuid":null,"output":"human","args":{}}"#,
+                "malformed version",
+            ),
+            (
+                r#"{"version":-1,"command":"pool_status","pool":"tank","pool_uuid":null,"output":"human","args":{}}"#,
+                "malformed version",
+            ),
+            (
+                r#"{"version":1.0,"command":"pool_status","pool":"tank","pool_uuid":null,"output":"human","args":{}}"#,
+                "malformed version",
+            ),
+            (
+                r#"{"version":65536,"command":"pool_status","pool":"tank","pool_uuid":null,"output":"human","args":{}}"#,
+                "malformed version",
+            ),
+        ] {
+            let err = decode_live_pool_admin_request(payload).unwrap_err();
+
+            assert_eq!(err.exit_code, 2);
+            assert_eq!(err.kind, LivePoolAdminErrorKind::Malformed);
+            let response = live_admin_typed_error(err);
+            let LivePoolAdminResponseBody::Error {
+                message,
+                machine_json: Some(machine_json),
+            } = response.body
+            else {
+                panic!("malformed version should carry typed machine JSON");
+            };
+            assert!(message.contains(detail));
+            let value: serde_json::Value = serde_json::from_str(&machine_json).unwrap();
+            assert_eq!(
+                value.get("kind").and_then(serde_json::Value::as_str),
+                Some("malformed")
+            );
+        }
     }
 
     #[test]
