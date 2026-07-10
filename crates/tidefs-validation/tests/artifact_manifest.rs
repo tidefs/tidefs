@@ -152,7 +152,17 @@ fn hex_nibble(byte: u8) -> Option<u8> {
     }
 }
 
+fn starts_with_ascii_case_insensitive(bytes: &[u8], prefix: &[u8]) -> bool {
+    bytes.len() >= prefix.len()
+        && bytes
+            .iter()
+            .zip(prefix)
+            .all(|(actual, expected)| actual.eq_ignore_ascii_case(expected))
+}
+
 fn normalize_json_ascii_path_escapes(bytes: &[u8]) -> Vec<u8> {
+    const JSON_ASCII_ESCAPE_PREFIX: &[u8] = br"\u00";
+
     let mut normalized = Vec::with_capacity(bytes.len());
     let mut offset = 0;
     while offset < bytes.len() {
@@ -160,7 +170,9 @@ fn normalize_json_ascii_path_escapes(bytes: &[u8]) -> Vec<u8> {
         if remaining.starts_with(br"\/") {
             normalized.push(b'/');
             offset += br"\/".len();
-        } else if remaining.len() >= br"\u0000".len() && &remaining[..br"\u00".len()] == br"\u00" {
+        } else if remaining.len() >= br"\u0000".len()
+            && starts_with_ascii_case_insensitive(remaining, JSON_ASCII_ESCAPE_PREFIX)
+        {
             match (
                 hex_nibble(remaining[br"\u00".len()]),
                 hex_nibble(remaining[br"\u00".len() + 1]),
@@ -186,6 +198,10 @@ fn normalize_json_ascii_path_escapes(bytes: &[u8]) -> Vec<u8> {
 fn json_slash_escape_normalization_catches_mixed_scratch_paths() {
     assert_eq!(
         normalize_json_ascii_path_escapes(br"\u002Ftmp/tidefs-validation"),
+        b"/tmp/tidefs-validation"
+    );
+    assert_eq!(
+        normalize_json_ascii_path_escapes(br"\u002ftmp/tidefs-validation"),
         b"/tmp/tidefs-validation"
     );
     assert_eq!(
