@@ -9,8 +9,9 @@
 //!
 //! This crate is the source-owned authority for the segment free-map,
 //! checkpoint bitmap encoding, and space-pressure classification implemented
-//! below. `docs/SPACEMAP_ALLOCATOR_DESIGN.md` is historical provenance until
-//! issue #1842 retargets the xtask fixture that still names it.
+//! below. The module API, constants, and gate markers below are the live
+//! validation surface for this allocator; historical design prose is
+//! provenance only.
 #![forbid(unsafe_code)]
 
 use core::fmt;
