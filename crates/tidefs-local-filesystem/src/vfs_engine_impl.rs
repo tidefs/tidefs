@@ -3487,7 +3487,7 @@ fn live_property_set_from_request(args: &Value) -> Result<PropertySet, String> {
     };
     let values = values
         .as_array()
-        .ok_or_else(|| "dataset create: properties must be a JSON array".to_string())?;
+        .ok_or_else(|| "dataset create: properties must be an array argument".to_string())?;
     let registry = tidefs_dataset_properties::build_registry();
     let mut properties = PropertySet::new();
     let mut seen = BTreeSet::new();
@@ -3526,7 +3526,7 @@ fn live_feature_names_from_request(args: &Value) -> Result<Vec<String>, String> 
     };
     let values = values
         .as_array()
-        .ok_or_else(|| "dataset create: features must be a JSON array".to_string())?;
+        .ok_or_else(|| "dataset create: features must be an array argument".to_string())?;
     let mut features = Vec::with_capacity(values.len());
     let mut seen = BTreeSet::new();
     for value in values {
