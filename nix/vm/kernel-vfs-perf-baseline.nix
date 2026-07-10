@@ -223,9 +223,12 @@ MANIFEST
       fi
       [ ! -s "$log_file" ] && LOG_EMPTY=true
 
-      if is_positive_number "$WRITE_TP_VAL" &&
+      if is_positive_number "$WRITE_DURATION_VAL" &&
+         is_positive_number "$WRITE_TP_VAL" &&
+         is_positive_number "$READ_DURATION_VAL" &&
          is_positive_number "$READ_TP_VAL" &&
-         is_positive_number "$STAT_LAT_VAL"; then
+         is_positive_number "$STAT_LAT_VAL" &&
+         is_positive_number "$STAT_TOTAL_DURATION_VAL"; then
         REQUIRED_METRICS_PRESENT=true
       fi
 
@@ -401,9 +404,12 @@ EOF
 PASS: insmod
 PASS: mount
 PASS: no_daemon
+write_duration_s=0.125
 write_throughput_MBps=10.00
+read_duration_s=0.250
 read_throughput_MBps=20.00
 stat_avg_latency_us=30
+stat_total_duration_s=0.003
 EOF
       analyze_qemu_log "$test_dir/timeout-complete-log.log" 137
       expect_parser_verdict timeout-complete-log BLOCKED qemu_timeout 2
@@ -414,9 +420,12 @@ EOF
 PASS: insmod
 PASS: mount
 PASS: no_daemon
+write_duration_s=0.125
 write_throughput_MBps=10.00
+read_duration_s=0.250
 read_throughput_MBps=20.00
 stat_avg_latency_us=30
+stat_total_duration_s=0.003
 EOF
       analyze_qemu_log "$test_dir/qemu-exit-nonzero.log" 1
       expect_parser_verdict qemu-exit-nonzero BLOCKED qemu_exit_1 2
@@ -424,9 +433,12 @@ EOF
       expect_parser_state qemu-exit-nonzero false false false true
 
       cat > "$test_dir/zero-pass.log" <<'EOF'
+write_duration_s=0.125
 write_throughput_MBps=10.00
+read_duration_s=0.250
 read_throughput_MBps=20.00
 stat_avg_latency_us=30
+stat_total_duration_s=0.003
 EOF
       analyze_qemu_log "$test_dir/zero-pass.log" 0
       expect_parser_verdict zero-pass BLOCKED zero_pass_rows 2
@@ -442,6 +454,20 @@ EOF
       expect_parser_verdict missing-metrics BLOCKED missing_required_metrics 2
       expect_parser_counts missing-metrics 3 0 0 0
       expect_parser_state missing-metrics true false false false
+
+      cat > "$test_dir/missing-duration-metrics.log" <<'EOF'
+PASS: insmod
+PASS: mount
+PASS: no_daemon
+write_throughput_MBps=10.00
+read_throughput_MBps=20.00
+stat_avg_latency_us=30
+EOF
+      analyze_qemu_log "$test_dir/missing-duration-metrics.log" 0
+      expect_parser_verdict missing-duration-metrics BLOCKED missing_required_metrics 2
+      expect_parser_metric_values missing-duration-metrics 10.00 20.00 30
+      expect_parser_counts missing-duration-metrics 3 0 0 0
+      expect_parser_state missing-duration-metrics true false false false
 
       cat > "$test_dir/invalid-metrics.log" <<'EOF'
 PASS: insmod
@@ -475,9 +501,12 @@ EOF
 PASS: insmod
 PASS: mount
 FAIL: stat latency regression
+write_duration_s=0.125
 write_throughput_MBps=10.00
+read_duration_s=0.250
 read_throughput_MBps=20.00
 stat_avg_latency_us=30
+stat_total_duration_s=0.003
 EOF
       analyze_qemu_log "$test_dir/fail-row.log" 0
       expect_parser_verdict fail-row FAIL fail_rows 1
@@ -490,9 +519,12 @@ EOF
   FAIL: stat latency regression
   BLOCKED: missing kernel tracepoint
   SKIP: optional cache warmup unavailable
+  write_duration_s = 0.125
   write_throughput_MBps = 10.00
+  read_duration_s = 0.250
   read_throughput_MBps = 20.00
   stat_avg_latency_us = 30
+  stat_total_duration_s = 0.003
 EOF
       analyze_qemu_log "$test_dir/indented-rows.log" 0
       expect_parser_verdict indented-rows FAIL fail_rows 1
@@ -504,9 +536,12 @@ EOF
 PASS: insmod
 PASS: mount
 BLOCKED: missing kernel tracepoint
+write_duration_s=0.125
 write_throughput_MBps=10.00
+read_duration_s=0.250
 read_throughput_MBps=20.00
 stat_avg_latency_us=30
+stat_total_duration_s=0.003
 EOF
       analyze_qemu_log "$test_dir/blocked-row.log" 0
       expect_parser_verdict blocked-row BLOCKED blocked_rows 2
@@ -535,9 +570,12 @@ EOF
 PASS: insmod
 PASS: mount
 SKIP: optional cache warmup unavailable
+write_duration_s=0.125
 write_throughput_MBps=10.00
+read_duration_s=0.250
 read_throughput_MBps=20.00
 stat_avg_latency_us=30
+stat_total_duration_s=0.003
 EOF
       analyze_qemu_log "$test_dir/skip-row.log" 0
       expect_parser_verdict skip-row PASS complete 0
@@ -549,9 +587,12 @@ EOF
 PASS: insmod
 PASS: mount
 PASS: no_daemon
+write_duration_s=0.125
 write_throughput_MBps=10.00
+read_duration_s=0.250
 read_throughput_MBps=20.00
 stat_avg_us=30
+stat_total_duration_s=0.003
 EOF
       analyze_qemu_log "$test_dir/stat-short-alias.log" 0
       expect_parser_verdict stat-short-alias PASS complete 0
