@@ -225,9 +225,12 @@ fn read_mounted_inline_content_scrub_block(
     pool: Option<&Pool>,
 ) -> Result<MountedContentScrubRead> {
     let key = content_object_key_for_version(inode_id, record.data_version);
-    let encoded = store.get(key)?.ok_or(FileSystemError::CorruptState {
-        reason: "mounted content scrub authority missing inline content object",
-    })?;
+    let encoded = read_mounted_scrub_object_bytes(
+        store,
+        pool,
+        key,
+        "mounted content scrub authority missing inline content object",
+    )?;
     let (checksum_body, expected) = split_inline_checksum(&encoded)?;
     let checksum_evidence = MountedContentChecksumEvidence {
         layer: MountedContentChecksumLayer::InlineContentBody,
@@ -303,9 +306,12 @@ fn read_mounted_chunk_content_scrub_block(
         chunk_ref.data_version,
         chunk_ref.chunk_index,
     );
-    let encoded = store.get(key)?.ok_or(FileSystemError::CorruptState {
-        reason: "mounted content scrub authority missing content chunk object",
-    })?;
+    let encoded = read_mounted_scrub_object_bytes(
+        store,
+        pool,
+        key,
+        "mounted content scrub authority missing content chunk object",
+    )?;
     let checksum_evidence = MountedContentChecksumEvidence {
         layer: MountedContentChecksumLayer::EncodedContentChunk,
         expected: Some(chunk_ref.checksum),
@@ -352,6 +358,27 @@ fn read_mounted_chunk_content_scrub_block(
             nonzero_receipt_generation(chunk_ref.placement_receipt_generation),
         ),
     })
+}
+
+fn read_mounted_scrub_object_bytes(
+    store: &LocalObjectStore,
+    pool: Option<&Pool>,
+    key: ObjectKey,
+    missing_reason: &'static str,
+) -> Result<Vec<u8>> {
+    let Some(pool) = pool else {
+        return store.get(key)?.ok_or(FileSystemError::CorruptState {
+            reason: missing_reason,
+        });
+    };
+
+    match pool.get(DeviceIoClass::Data, key) {
+        Ok(Some(bytes)) => Ok(bytes),
+        Ok(None) => Err(FileSystemError::CorruptState {
+            reason: missing_reason,
+        }),
+        Err(e) => Err(FileSystemError::Store(e)),
+    }
 }
 
 fn nonzero_receipt_generation(generation: u64) -> Option<u64> {
@@ -2708,6 +2735,37 @@ mod tests {
     }
 
     #[test]
+    fn mounted_content_scrub_authority_reads_inline_through_pool_when_available() {
+        let raw_store = temp_store("mounted-inline-pool-empty-raw");
+        let mut pool = temp_pool("mounted-inline-pool-authority");
+        let payload = b"inline pool plaintext".to_vec();
+        let record = test_record(7, 4, payload.len() as u64);
+        let key = content_object_key_for_version(record.inode_id, record.data_version);
+        let encoded = encode_content(&record, &payload);
+        pool.put(DeviceIoClass::Data, key, &encoded)
+            .expect("write inline through pool");
+
+        let read = read_mounted_content_scrub_block(
+            &raw_store,
+            record.inode_id,
+            &record,
+            MountedContentScrubReadTarget::Inline,
+            Some(&pool),
+        )
+        .expect("authority read through pool");
+
+        assert_eq!(read.object_key, Some(key));
+        assert_eq!(read.plaintext_bytes, payload);
+        assert!(read.checksum_evidence.matches_expected());
+        assert_eq!(
+            read.placement_evidence,
+            MountedContentPlacementEvidence::ReceiptMissing {
+                expected_generation: None,
+            }
+        );
+    }
+
+    #[test]
     fn mounted_content_scrub_authority_reads_chunk_plaintext_and_checksum_layer() {
         let mut store = temp_store("mounted-chunk-authority");
         let payload = b"chunk plaintext authority".to_vec();
@@ -2759,6 +2817,53 @@ mod tests {
             }
         );
         assert!(!read.placement_evidence.allows_repair_dispatch());
+    }
+
+    #[test]
+    fn mounted_content_scrub_authority_reads_chunk_through_pool_when_available() {
+        let raw_store = temp_store("mounted-chunk-pool-empty-raw");
+        let mut pool = temp_pool("mounted-chunk-pool-authority");
+        let payload = b"chunk pool plaintext authority".to_vec();
+        let record = test_record(9, 5, payload.len() as u64);
+        let key = content_chunk_object_key_for_version(record.inode_id, record.data_version, 0);
+        let encoded = encode_content_chunk(&record, 0, &payload, &ContentCompressionPolicy::off());
+        let checksum = FastBlockChecksum::compute(&encoded);
+        pool.put(DeviceIoClass::Data, key, &encoded)
+            .expect("write chunk through pool");
+        let chunk_ref = ContentChunkRef {
+            chunk_index: 0,
+            data_version: record.data_version,
+            len: payload.len() as u32,
+            checksum,
+            placement_receipt_generation: 0,
+        };
+
+        let read = read_mounted_content_scrub_block(
+            &raw_store,
+            record.inode_id,
+            &record,
+            MountedContentScrubReadTarget::ContentChunk(&chunk_ref),
+            Some(&pool),
+        )
+        .expect("authority read through pool");
+
+        assert_eq!(read.object_key, Some(key));
+        assert_eq!(read.plaintext_bytes, payload);
+        assert_eq!(
+            read.checksum_evidence,
+            MountedContentChecksumEvidence {
+                layer: MountedContentChecksumLayer::EncodedContentChunk,
+                expected: Some(checksum),
+                actual: checksum,
+                encoded_len: encoded.len() as u64,
+            }
+        );
+        assert_eq!(
+            read.placement_evidence,
+            MountedContentPlacementEvidence::ReceiptMissing {
+                expected_generation: None,
+            }
+        );
     }
 
     #[test]
