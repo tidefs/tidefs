@@ -43561,6 +43561,148 @@ mod tests {
     }
 
     #[test]
+    fn writeback_cached_clean_write_through_helper_preserves_dirty_tracker_remainder() {
+        let mut fixture = adapter_fixture_with_writeback_cache();
+        let ctx = root_ctx();
+        let (inode, _adapter_fh, _engine_fh) = create_adapter_file_handle(
+            &fixture.adapter,
+            &ctx,
+            b"wb-clean-write-through-helper-dirty-remainder.bin",
+            libc::O_RDWR as u32,
+        );
+        let ino = inode.get();
+        let page_size = fixture.adapter.write_page_cache.page_size();
+        let page_size_u64 = u64::try_from(page_size).expect("page size fits u64");
+        let page_size_u32 = u32::try_from(page_size).expect("page size fits u32");
+        let mut expected = vec![0xAA; page_size];
+        fixture
+            .adapter
+            .write_page_cache
+            .insert(ino, 0)
+            .expect("insert resident dirty mirror");
+        {
+            let mut page = fixture
+                .adapter
+                .write_page_cache
+                .lookup(ino, 0)
+                .expect("lookup resident dirty mirror");
+            page.data_mut().copy_from_slice(&expected);
+            page.mark_dirty();
+            assert!(page.is_dirty());
+        }
+        fixture
+            .adapter
+            .dirty_state
+            .lock()
+            .unwrap()
+            .entry(ino)
+            .or_default()
+            .mark_dirty(0, page_size_u32);
+        let shared_tracker = Arc::new(Mutex::new(
+            tidefs_local_filesystem::dirty_page_tracker::DirtyPageTracker::new(),
+        ));
+        shared_tracker
+            .lock()
+            .unwrap()
+            .mark_dirty(inode, 0, page_size_u64);
+        fixture.adapter.writeback_range_tracker = Some(Arc::clone(&shared_tracker));
+        let worker_tracker = fixture
+            .adapter
+            .write_dispatch
+            .lock()
+            .unwrap()
+            .dirty_page_tracker_arc();
+        worker_tracker
+            .lock()
+            .unwrap()
+            .mark_dirty(ino, 0, page_size_u64)
+            .expect("seed worker dirty range");
+        {
+            let mut cache = fixture.adapter.writeback_cache.lock().unwrap();
+            cache.insert(ino);
+            cache.mark_dirty(ino, page_size_u64);
+        }
+
+        let write_offset = 1024_u64;
+        let write_len = 512_u32;
+        let write_len_usize = usize::try_from(write_len).expect("write length fits usize");
+        let write_end = write_offset + u64::from(write_len);
+        let replacement = vec![0xC4; write_len_usize];
+        fixture
+            .adapter
+            .record_clean_write_through_after_write(ino, write_offset, write_len, &replacement)
+            .expect("record clean write-through after write");
+        let write_start = usize::try_from(write_offset).expect("write offset fits usize");
+        expected[write_start..write_start + write_len_usize].copy_from_slice(&replacement);
+
+        assert_eq!(
+            fixture
+                .adapter
+                .dirty_state
+                .lock()
+                .unwrap()
+                .get(&ino)
+                .map(|ranges| ranges.ranges().to_vec()),
+            Some(vec![(0, write_offset), (write_end, page_size_u64)]),
+            "daemon dirty tracker must preserve dirty bytes outside the authoritative range"
+        );
+        let shared_ranges: Vec<(u64, u64)> = shared_tracker
+            .lock()
+            .unwrap()
+            .dirty_ranges(inode)
+            .expect("shared writeback tracker should retain dirty remainders")
+            .iter()
+            .map(|range| (range.offset, range.length))
+            .collect();
+        assert_eq!(
+            shared_ranges,
+            vec![
+                (0, write_offset),
+                (write_end, page_size_u64.saturating_sub(write_end))
+            ],
+            "shared writeback tracker must preserve dirty bytes outside the authoritative range"
+        );
+        assert_eq!(
+            worker_tracker.lock().unwrap().get_dirty_ranges(ino),
+            vec![
+                crate::workers_writeback::DirtyRange::new(ino, 0, write_offset),
+                crate::workers_writeback::DirtyRange::new(ino, write_end, page_size_u64)
+            ],
+            "worker dirty tracker must preserve dirty bytes outside the authoritative range"
+        );
+        {
+            let page = fixture
+                .adapter
+                .write_page_cache
+                .lookup(ino, 0)
+                .expect("resident dirty mirror remains resident");
+            assert_eq!(page.data(), expected.as_slice());
+            assert!(
+                page.is_dirty(),
+                "partial authoritative bytes must not clean dirty bytes outside the range"
+            );
+        }
+        assert!(
+            !fixture
+                .adapter
+                .write_page_cache
+                .dirty_pages_for_inode(ino)
+                .is_empty(),
+            "dirty remainders should keep the page dirty"
+        );
+        assert_eq!(
+            fixture
+                .adapter
+                .writeback_cache
+                .lock()
+                .unwrap()
+                .is_dirty(ino),
+            Some(true),
+            "dirty remainders should keep the inode reclaim cache dirty"
+        );
+    }
+
+    #[test]
     fn writeback_cached_clean_write_through_helper_full_dirty_page_replacement_clears_dirty_mirror()
     {
         let mut fixture = adapter_fixture_with_writeback_cache();
