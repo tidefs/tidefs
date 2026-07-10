@@ -670,18 +670,15 @@ fn send_live_owner_request_at(
         LiveOwnerRequestError::Unavailable(format!("read live-owner response: {err}"))
     })?;
     if line.trim().is_empty() {
-        return Err(LiveOwnerRequestError::Owner {
-            exit_code: 2,
-            message: "empty live-owner response".to_string(),
-            detail: None,
-        });
+        return Err(live_admin_error_to_request_error(
+            LivePoolAdminError::malformed("empty live-owner response"),
+        ));
     }
-    let response: LivePoolAdminResponse =
-        serde_json::from_str(&line).map_err(|err| LiveOwnerRequestError::Owner {
-            exit_code: 2,
-            message: format!("decode live-owner response: {err}"),
-            detail: None,
-        })?;
+    let response: LivePoolAdminResponse = serde_json::from_str(&line).map_err(|err| {
+        live_admin_error_to_request_error(LivePoolAdminError::malformed(format!(
+            "decode live-owner response: {err}"
+        )))
+    })?;
     if response.version != tidefs_vfs_engine::LIVE_POOL_ADMIN_PROTOCOL_VERSION {
         return Err(live_admin_error_to_request_error(
             LivePoolAdminError::unsupported_version(response.version),
@@ -1627,6 +1624,28 @@ mod tests {
         })
     }
 
+    fn spawn_owner_raw_response(
+        listener: UnixListener,
+        response: &'static [u8],
+    ) -> thread::JoinHandle<LivePoolAdminRequest> {
+        thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut line)
+                    .unwrap();
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let request: LivePoolAdminRequest = serde_json::from_str(&line).unwrap();
+                stream.write_all(response).unwrap();
+                return request;
+            }
+            panic!("live-owner test did not receive request");
+        })
+    }
+
     fn device_remove_route() -> LivePoolRoute<'static> {
         LivePoolRoute {
             command: "device",
@@ -1772,6 +1791,90 @@ mod tests {
             }
             LiveOwnerRequestError::Unavailable(message) => {
                 panic!("reachable owner should return typed version refusal, got {message}");
+            }
+        }
+    }
+
+    #[test]
+    fn empty_live_owner_response_preserves_typed_malformed_detail() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("owner.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        write_owner_manifest(dir.path(), &socket_path);
+        let handle = spawn_owner_raw_response(listener, b"\n");
+        let route = LivePoolRoute {
+            command: "pool",
+            operation: "status",
+            pool: "tank",
+            pool_uuid: Some([0x42; 16]),
+            json: true,
+            args: LivePoolAdminArgs::default(),
+        };
+
+        let err = send_live_owner_request_at(dir.path(), &route).unwrap_err();
+        let request = handle.join().unwrap();
+
+        assert_eq!(request.command, LivePoolAdminCommand::PoolStatus);
+        match err {
+            LiveOwnerRequestError::Owner {
+                exit_code,
+                message,
+                detail,
+            } => {
+                assert_eq!(exit_code, 2);
+                assert_eq!(message, "empty live-owner response");
+                assert_eq!(
+                    detail
+                        .as_ref()
+                        .and_then(|value| value.get("kind"))
+                        .and_then(serde_json::Value::as_str),
+                    Some("malformed")
+                );
+            }
+            LiveOwnerRequestError::Unavailable(message) => {
+                panic!("reachable owner should return typed malformed refusal, got {message}");
+            }
+        }
+    }
+
+    #[test]
+    fn undecodable_live_owner_response_preserves_typed_malformed_detail() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("owner.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        write_owner_manifest(dir.path(), &socket_path);
+        let handle = spawn_owner_raw_response(listener, b"not-json\n");
+        let route = LivePoolRoute {
+            command: "pool",
+            operation: "status",
+            pool: "tank",
+            pool_uuid: Some([0x42; 16]),
+            json: true,
+            args: LivePoolAdminArgs::default(),
+        };
+
+        let err = send_live_owner_request_at(dir.path(), &route).unwrap_err();
+        let request = handle.join().unwrap();
+
+        assert_eq!(request.command, LivePoolAdminCommand::PoolStatus);
+        match err {
+            LiveOwnerRequestError::Owner {
+                exit_code,
+                message,
+                detail,
+            } => {
+                assert_eq!(exit_code, 2);
+                assert!(message.starts_with("decode live-owner response:"));
+                assert_eq!(
+                    detail
+                        .as_ref()
+                        .and_then(|value| value.get("kind"))
+                        .and_then(serde_json::Value::as_str),
+                    Some("malformed")
+                );
+            }
+            LiveOwnerRequestError::Unavailable(message) => {
+                panic!("reachable owner should return typed malformed refusal, got {message}");
             }
         }
     }
