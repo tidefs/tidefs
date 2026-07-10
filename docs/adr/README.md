@@ -12,8 +12,6 @@ marked with `Status: Superseded by ADR-NNNN`.
 
 | ADR | Title | Status | Date |
 |-----|-------|--------|------|
-| 0002 | Persistent orphan index | Accepted | 2026-05-05 |
-| 0005 | Crate dependency graph and ownership boundaries | Accepted | 2026-05-05 |
 | 0006 | License compliance with cargo-deny | Accepted | 2026-05-05 |
 | 0007 | Local and clustered POSIX and block runtime modes | Accepted | 2026-06-20 |
 | 0008 | Failed-quorum mutation evidence boundary | Accepted | 2026-06-28 |

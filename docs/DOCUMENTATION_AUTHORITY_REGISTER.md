@@ -296,9 +296,11 @@ stay out of this coordination slice:
 - #1018 owned historical/evidence treatment for retired type-root
   consolidation records; #1720 deleted the remaining standalone plan root, so
   git history and GitHub lineage retain that path.
-- #1019 owns historical/evidence treatment for retired type-root dependency
-  tables in
-  `docs/design/crate-dependency-graph-ownership-boundaries.md`.
+- #1019's retired type-root dependency-table cleanup is superseded for
+  package-authority by #1838: current package roles use
+  `docs/workspace-package-classification.md`, live cargo metadata, and
+  GitHub issue/PR lineage; git history retains the stale ADR/design path
+  lineage.
 - #1021 owns the deleted `docs/FEATURE_MATRIX.md` reference in
   `docs/design/deterministic-cluster-simnet-protocol-correctness-testing.md`.
 - #1635 deleted the former #1022/#1023 design-subdir cleanup/orphan-index
