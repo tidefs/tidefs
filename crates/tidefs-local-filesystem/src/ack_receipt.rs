@@ -710,15 +710,25 @@ impl LocalAckReceipt {
         }
 
         let (evidence_refs, evidence_ref_len) = self.receipt.evidence_refs.as_parts();
-        evidence_refs[..usize::from(evidence_ref_len)]
+        let carried_refs = &evidence_refs[..usize::from(evidence_ref_len)];
+        let carried_count = |expected_ref: StorageIntentEvidenceRef| {
+            carried_refs
+                .iter()
+                .filter(|evidence_ref| **evidence_ref == expected_ref)
+                .count()
+        };
+
+        carried_refs.iter().all(|evidence_ref| {
+            required_local_refs
+                .iter()
+                .any(|expected| expected.evidence_ref == *evidence_ref)
+                || self.refusal.evidence == *evidence_ref
+                || (needs_full_placement && self.placement_ref == *evidence_ref)
+        }) && required_local_refs
             .iter()
-            .all(|evidence_ref| {
-                required_local_refs
-                    .iter()
-                    .any(|expected| expected.evidence_ref == *evidence_ref)
-                    || self.refusal.evidence == *evidence_ref
-                    || (needs_full_placement && self.placement_ref == *evidence_ref)
-            })
+            .all(|expected| carried_count(expected.evidence_ref) == 1)
+            && carried_count(self.refusal.evidence) == 1
+            && (!needs_full_placement || carried_count(self.placement_ref) == 1)
     }
 
     fn local_ack_receipt_generation(self) -> Option<u64> {
@@ -2092,6 +2102,34 @@ mod tests {
         assert!(receipt.receipt.evidence_refs.push(extra).is_ok());
 
         assert!(receipt.is_posix_durable_success());
+        assert!(!receipt.has_requested_ack_floor_evidence());
+        assert!(!receipt.satisfies_requested_ack_floor());
+    }
+
+    #[test]
+    fn requested_floor_receipt_fails_closed_for_duplicate_evidence_ref() {
+        let mut receipt = LocalAckReceipt::durable_intent(
+            2306,
+            LocalAckOperation::SyncWrite,
+            LocalAckReceiptTarget::range(45, 0, 4096),
+            Some(0x1235),
+        );
+        assert!(receipt.satisfies_requested_ack_floor());
+
+        receipt.receipt.evidence_refs = evidence_refs(&[
+            receipt.local_intent_record_ref,
+            receipt.local_intent_record_ref,
+            receipt.flush_fence_ref,
+            receipt.media_capability_ref,
+            receipt.reserve_ref,
+            receipt.dirty_window_ref,
+            receipt.rollout_ref,
+            receipt.tenant_isolation_ref,
+            receipt.refusal.evidence,
+        ]);
+
+        assert!(receipt.is_posix_durable_success());
+        assert!(!receipt.has_exact_requested_ack_floor_evidence_cut(false));
         assert!(!receipt.has_requested_ack_floor_evidence());
         assert!(!receipt.satisfies_requested_ack_floor());
     }
