@@ -684,6 +684,7 @@ impl LocalAckReceipt {
         );
 
         has_local_evidence
+            && self.has_exact_requested_ack_floor_evidence_cut(needs_full_placement)
             && (!needs_full_placement
                 || self.receipt_carries_typed_local_evidence_ref(
                     ExpectedLocalEvidenceRef {
@@ -693,6 +694,31 @@ impl LocalAckReceipt {
                     },
                     generation,
                 ))
+    }
+
+    fn has_exact_requested_ack_floor_evidence_cut(self, needs_full_placement: bool) -> bool {
+        let required_local_refs = self.required_local_evidence_refs();
+        let expected_len = required_local_refs.len() + usize::from(needs_full_placement) + 1;
+
+        if self.receipt.evidence_refs.len() != expected_len
+            || !self
+                .receipt
+                .evidence_refs
+                .contains_ref(self.refusal.evidence)
+        {
+            return false;
+        }
+
+        let (evidence_refs, evidence_ref_len) = self.receipt.evidence_refs.as_parts();
+        evidence_refs[..usize::from(evidence_ref_len)]
+            .iter()
+            .all(|evidence_ref| {
+                required_local_refs
+                    .iter()
+                    .any(|expected| expected.evidence_ref == *evidence_ref)
+                    || self.refusal.evidence == *evidence_ref
+                    || (needs_full_placement && self.placement_ref == *evidence_ref)
+            })
     }
 
     fn local_ack_receipt_generation(self) -> Option<u64> {
@@ -1975,7 +2001,7 @@ mod tests {
             wrong_result_kind.refusal_reason(),
             StorageIntentRefusalReason::None
         );
-        assert!(wrong_result_kind.has_requested_ack_floor_evidence());
+        assert!(!wrong_result_kind.has_requested_ack_floor_evidence());
         assert!(!wrong_result_kind.satisfies_requested_ack_floor());
     }
 
@@ -2007,7 +2033,7 @@ mod tests {
             wrong_result_identity.refusal_reason(),
             StorageIntentRefusalReason::None
         );
-        assert!(wrong_result_identity.has_requested_ack_floor_evidence());
+        assert!(!wrong_result_identity.has_requested_ack_floor_evidence());
         assert!(!wrong_result_identity.satisfies_requested_ack_floor());
     }
 
@@ -2039,9 +2065,35 @@ mod tests {
             StorageIntentRefusalReason::None
         );
         assert_eq!(missing_carried_result.refusal.evidence, carried_result_ref);
-        assert!(missing_carried_result.has_requested_ack_floor_evidence());
+        assert!(!missing_carried_result.has_requested_ack_floor_evidence());
         assert!(!missing_carried_result.has_local_ack_result_projection());
         assert!(!missing_carried_result.satisfies_requested_ack_floor());
+    }
+
+    #[test]
+    fn requested_floor_receipt_fails_closed_for_extra_evidence_ref() {
+        let mut receipt = LocalAckReceipt::durable_intent(
+            2305,
+            LocalAckOperation::SyncWrite,
+            LocalAckReceiptTarget::range(44, 0, 4096),
+            Some(0x1234),
+        );
+        assert!(receipt.satisfies_requested_ack_floor());
+
+        let extra = evidence_ref(
+            StorageIntentEvidenceKind::OperatorExplanationProjection,
+            "operator-extra",
+            2305,
+            receipt.operation,
+            receipt.target,
+            receipt.payload_or_replay_digest,
+        );
+        assert!(extra.is_bound());
+        assert!(receipt.receipt.evidence_refs.push(extra).is_ok());
+
+        assert!(receipt.is_posix_durable_success());
+        assert!(!receipt.has_requested_ack_floor_evidence());
+        assert!(!receipt.satisfies_requested_ack_floor());
     }
 
     #[test]
