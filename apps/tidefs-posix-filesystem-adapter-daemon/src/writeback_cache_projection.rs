@@ -322,30 +322,13 @@ impl WritebackProjection {
         }
     }
 
-    /// Check whether the adapter's per-inode [`DirtyRanges`] have any
-    /// dirty data covering the range `[offset, offset+length)`.
-    ///
-    /// This is used by the FUSE write dispatch to decide whether a
-    /// writeback-cached write has left dirty bytes that must be drained
-    /// before invalidation or truncate.
-    #[must_use]
-    pub fn dirty_ranges_overlap(
-        dirty_state: &Mutex<BTreeMap<u64, DirtyRanges>>,
-        ino: u64,
-        offset: u64,
-        length: u64,
-    ) -> bool {
-        dirty_state
-            .lock()
-            .unwrap()
-            .get(&ino)
-            .is_some_and(|dr| dr.overlaps(offset, length))
-    }
-
     /// Return the total dirty byte count from the adapter's per-inode
     /// [`DirtyRanges`] for `ino`.
     #[must_use]
-    pub fn dirty_ranges_total(dirty_state: &Mutex<BTreeMap<u64, DirtyRanges>>, ino: u64) -> u64 {
+    pub(crate) fn dirty_ranges_total(
+        dirty_state: &Mutex<BTreeMap<u64, DirtyRanges>>,
+        ino: u64,
+    ) -> u64 {
         dirty_state
             .lock()
             .unwrap()
@@ -357,26 +340,28 @@ impl WritebackProjection {
     /// Return the total tracked dirty byte count from the adapter's
     /// [`PageCache`] for `ino`.
     #[must_use]
-    pub fn page_cache_dirty_total(page_cache: Option<&Arc<PageCache>>, ino: u64) -> u64 {
+    pub(crate) fn page_cache_dirty_total(page_cache: Option<&Arc<PageCache>>, ino: u64) -> u64 {
         page_cache
-            .map(|pc| {
-                pc.dirty_pages_for_inode(ino)
-                    .iter()
-                    .map(|offset| pc.page_size() as u64)
-                    .sum()
-            })
+            .map(|pc| pc.dirty_pages_for_inode(ino).len() as u64 * pc.page_size() as u64)
             .unwrap_or(0)
     }
 
     /// Total observable dirty bytes for an inode: sum of DirtyRanges +
     /// PageCache dirty pages.
     #[must_use]
-    pub fn total_observable_dirty_bytes(
+    pub(crate) fn total_observable_dirty_bytes(
         dirty_state: &Mutex<BTreeMap<u64, DirtyRanges>>,
         page_cache: Option<&Arc<PageCache>>,
         ino: u64,
     ) -> u64 {
         Self::dirty_ranges_total(dirty_state, ino) + Self::page_cache_dirty_total(page_cache, ino)
+    }
+
+    /// Return this projection's stored [`PageCache`] dirty byte count for
+    /// `ino`.
+    #[must_use]
+    pub fn page_cache_dirty_bytes(&self, ino: u64) -> u64 {
+        Self::page_cache_dirty_total(self.page_cache.as_ref(), ino)
     }
 
     // ── Mmap coherency accessor ──────────────────────────────────────
@@ -557,6 +542,22 @@ mod tests {
         assert_eq!(p.total_dirty_or_writeback_bytes(), 8192 + 16384);
         p.record_clean(10);
         assert_eq!(p.total_dirty_or_writeback_bytes(), 16384);
+    }
+
+    #[test]
+    fn page_cache_dirty_bytes_uses_stored_page_cache() {
+        let ino = 42;
+        let page_size = 4096;
+        let page_cache = Arc::new(PageCache::new(8, page_size));
+
+        page_cache.insert(ino, 0).expect("insert dirty page");
+        assert!(page_cache.mark_dirty(ino, 0));
+
+        let notifier = Arc::new(Mutex::new(None));
+        let mmap = Arc::new(MmapCoherency::new(notifier));
+        let projection = WritebackProjection::new(Some(Arc::clone(&page_cache)), mmap);
+
+        assert_eq!(projection.page_cache_dirty_bytes(ino), page_size as u64);
     }
 
     #[test]

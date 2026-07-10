@@ -34,6 +34,7 @@ mod workers_ns;
 mod workers_writeback;
 mod workload_observer;
 mod write_dispatch;
+mod writeback_cache_projection;
 
 mod writeback_reclaim;
 mod xattr_integrity;
