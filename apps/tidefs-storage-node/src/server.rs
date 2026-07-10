@@ -90,7 +90,7 @@ use tidefs_types_pool_label_core::PoolRedundancyPolicy as LabelPoolRedundancyPol
 use crate::authority_spine::RuntimeAuthority;
 use crate::protocol::{self, Frame};
 use crate::snapshot_barrier::{
-    allocate_barrier_id, snapshot_barrier_send_report, SnapshotBarrierConfig,
+    allocate_barrier_id, snapshot_barrier_send_report, BarrierOutcome, SnapshotBarrierConfig,
     SnapshotBarrierSendError, SnapshotBarrierSendReport, SnapshotCoordinator,
 };
 
@@ -786,6 +786,17 @@ fn clear_active_snapshot_barrier(ctx: &SessionContext) {
     *ctx.active_barrier.lock().unwrap() = None;
 }
 
+fn active_snapshot_barrier_outcome(
+    ctx: &SessionContext,
+    barrier_id: u64,
+) -> Result<Option<BarrierOutcome>, SnapshotBarrierSendError> {
+    let active = ctx.active_barrier.lock().unwrap();
+    match active.as_ref() {
+        Some(coord) if coord.barrier_id() == barrier_id => Ok(coord.outcome()),
+        _ => Err(SnapshotBarrierSendError::Interrupted { barrier_id }),
+    }
+}
+
 fn run_snapshot_barrier_before_send(
     session_id: tidefs_transport::SessionId,
     ctx: &SessionContext,
@@ -851,10 +862,7 @@ fn run_snapshot_barrier_before_send(
     }
 
     loop {
-        let outcome = {
-            let active = ctx.active_barrier.lock().unwrap();
-            active.as_ref().and_then(SnapshotCoordinator::outcome)
-        };
+        let outcome = active_snapshot_barrier_outcome(ctx, barrier_id)?;
         if let Some(outcome) = outcome {
             clear_active_snapshot_barrier(ctx);
             return snapshot_barrier_send_report(barrier_id, outcome);
@@ -6640,6 +6648,35 @@ mod cluster_pool_handler_tests {
             other => panic!("expected send failure, got {other:?}"),
         }
         assert!(ctx.active_barrier.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn snapshot_barrier_before_send_detects_missing_active_barrier() {
+        let (_dir, store) = frame_local_store();
+        let ctx = frame_test_context(Arc::clone(&store));
+
+        let err = active_snapshot_barrier_outcome(&ctx, 7)
+            .expect_err("missing active coordinator interrupts barrier wait");
+
+        assert_eq!(err, SnapshotBarrierSendError::Interrupted { barrier_id: 7 });
+        assert!(err.to_string().contains("interrupted"));
+    }
+
+    #[test]
+    fn snapshot_barrier_before_send_rejects_changed_active_barrier() {
+        let (_dir, store) = frame_local_store();
+        let ctx = frame_test_context(Arc::clone(&store));
+        *ctx.active_barrier.lock().unwrap() = Some(SnapshotCoordinator::new(
+            8,
+            "replacement".into(),
+            Vec::new(),
+            SnapshotBarrierConfig::default(),
+        ));
+
+        let err = active_snapshot_barrier_outcome(&ctx, 7)
+            .expect_err("different active coordinator interrupts barrier wait");
+
+        assert_eq!(err, SnapshotBarrierSendError::Interrupted { barrier_id: 7 });
     }
 
     #[test]

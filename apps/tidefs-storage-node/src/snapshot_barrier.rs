@@ -218,6 +218,9 @@ pub enum SnapshotBarrierSendError {
         peer_id: u64,
         reason: String,
     },
+    Interrupted {
+        barrier_id: BarrierId,
+    },
     PeerFailed {
         barrier_id: BarrierId,
         peer_id: u64,
@@ -252,6 +255,9 @@ impl fmt::Display for SnapshotBarrierSendError {
                 f,
                 "barrier {barrier_id} send to peer {peer_id} failed: {reason}"
             ),
+            Self::Interrupted { barrier_id } => {
+                write!(f, "barrier {barrier_id} interrupted before completion")
+            }
             Self::PeerFailed {
                 barrier_id,
                 peer_id,
