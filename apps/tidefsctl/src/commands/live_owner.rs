@@ -684,6 +684,7 @@ fn send_live_owner_request_at(
             LivePoolAdminError::unsupported_version(response.version),
         ));
     }
+    validate_live_owner_response_envelope(&response)?;
     match response.body {
         LivePoolAdminResponseBody::BytesHex { bytes_hex, bytes } => {
             let response_json = live_owner_bytes_json(&bytes_hex, bytes);
@@ -783,17 +784,30 @@ fn send_live_owner_request_at(
             message,
             machine_json,
         } => Err(LiveOwnerRequestError::Owner {
-            exit_code: if response.exit_code == 0 {
-                1
-            } else {
-                response.exit_code
-            },
+            exit_code: response.exit_code,
             message,
             detail: machine_json
                 .as_deref()
                 .map(parse_live_owner_machine_json)
                 .transpose()?,
         }),
+    }
+}
+
+fn validate_live_owner_response_envelope(
+    response: &LivePoolAdminResponse,
+) -> Result<(), LiveOwnerRequestError> {
+    let malformed = || {
+        live_admin_error_to_request_error(LivePoolAdminError::malformed(
+            "live-owner response exit code is inconsistent with response body",
+        ))
+    };
+
+    match &response.body {
+        LivePoolAdminResponseBody::Error { .. } if response.exit_code == 0 => Err(malformed()),
+        LivePoolAdminResponseBody::Error { .. } => Ok(()),
+        _ if response.exit_code != 0 => Err(malformed()),
+        _ => Ok(()),
     }
 }
 
@@ -1791,6 +1805,100 @@ mod tests {
             }
             LiveOwnerRequestError::Unavailable(message) => {
                 panic!("reachable owner should return typed version refusal, got {message}");
+            }
+        }
+    }
+
+    #[test]
+    fn nonzero_success_live_owner_response_is_typed_malformed() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("owner.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        write_owner_manifest(dir.path(), &socket_path);
+        let mut response = LivePoolAdminResponse::ok_text("ok");
+        response.exit_code = 1;
+        let handle = spawn_owner_response(listener, response);
+        let route = LivePoolRoute {
+            command: "pool",
+            operation: "status",
+            pool: "tank",
+            pool_uuid: Some([0x42; 16]),
+            json: true,
+            args: LivePoolAdminArgs::default(),
+        };
+
+        let err = send_live_owner_request_at(dir.path(), &route).unwrap_err();
+        let request = handle.join().unwrap();
+
+        assert_eq!(request.command, LivePoolAdminCommand::PoolStatus);
+        match err {
+            LiveOwnerRequestError::Owner {
+                exit_code,
+                message,
+                detail,
+            } => {
+                assert_eq!(exit_code, 2);
+                assert_eq!(
+                    message,
+                    "live-owner response exit code is inconsistent with response body"
+                );
+                assert_eq!(
+                    detail
+                        .as_ref()
+                        .and_then(|value| value.get("kind"))
+                        .and_then(serde_json::Value::as_str),
+                    Some("malformed")
+                );
+            }
+            LiveOwnerRequestError::Unavailable(message) => {
+                panic!("reachable owner should return typed malformed refusal, got {message}");
+            }
+        }
+    }
+
+    #[test]
+    fn zero_exit_error_live_owner_response_is_typed_malformed() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("owner.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        write_owner_manifest(dir.path(), &socket_path);
+        let mut response = LivePoolAdminResponse::error(1, "owner failed");
+        response.exit_code = 0;
+        let handle = spawn_owner_response(listener, response);
+        let route = LivePoolRoute {
+            command: "pool",
+            operation: "status",
+            pool: "tank",
+            pool_uuid: Some([0x42; 16]),
+            json: true,
+            args: LivePoolAdminArgs::default(),
+        };
+
+        let err = send_live_owner_request_at(dir.path(), &route).unwrap_err();
+        let request = handle.join().unwrap();
+
+        assert_eq!(request.command, LivePoolAdminCommand::PoolStatus);
+        match err {
+            LiveOwnerRequestError::Owner {
+                exit_code,
+                message,
+                detail,
+            } => {
+                assert_eq!(exit_code, 2);
+                assert_eq!(
+                    message,
+                    "live-owner response exit code is inconsistent with response body"
+                );
+                assert_eq!(
+                    detail
+                        .as_ref()
+                        .and_then(|value| value.get("kind"))
+                        .and_then(serde_json::Value::as_str),
+                    Some("malformed")
+                );
+            }
+            LiveOwnerRequestError::Unavailable(message) => {
+                panic!("reachable owner should return typed malformed refusal, got {message}");
             }
         }
     }
