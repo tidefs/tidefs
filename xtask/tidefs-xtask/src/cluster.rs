@@ -29,7 +29,7 @@ pub fn check_membership_epoch_model_current_workspace() -> Result<(), ClusterChe
         "crates/tidefs-membership-epoch/Cargo.toml",
         "crates/tidefs-membership-epoch/src/lib.rs",
         "docs/MEMBERSHIP_AUTHORITY.md",
-        "docs/MEMBERSHIP_SERVICE_DESIGN.md",
+        "docs/MEMBERSHIP_CONFIG_QUORUM_SET_IDENTITY_OW302B.md",
         "nix/tidefs-validation.sh",
     ] {
         check_required_file(&root, rel, &mut missing);
@@ -84,12 +84,8 @@ pub fn check_membership_epoch_model_current_workspace() -> Result<(), ClusterChe
     );
     check_source_markers(
         &root,
-        "docs/MEMBERSHIP_SERVICE_DESIGN.md",
-        &[
-            "`crates/tidefs-membership-epoch`",
-            "failure-domain bindings",
-            "split-brain hazard laws",
-        ],
+        "docs/MEMBERSHIP_CONFIG_QUORUM_SET_IDENTITY_OW302B.md",
+        &["quorum-set", "production cluster membership service"],
         &mut missing,
     );
     if missing.is_empty() {
@@ -111,7 +107,6 @@ pub fn check_failure_domain_placement_current_workspace() -> Result<(), ClusterC
     for rel in [
         "crates/tidefs-membership-epoch/src/lib.rs",
         "docs/MEMBERSHIP_AUTHORITY.md",
-        "docs/MEMBERSHIP_SERVICE_DESIGN.md",
         "nix/tidefs-validation.sh",
     ] {
         check_required_file(&root, rel, &mut missing);
@@ -124,6 +119,7 @@ pub fn check_failure_domain_placement_current_workspace() -> Result<(), ClusterC
             "AntiAffinityClass",
             "FailureDomainPlacementPolicy",
             "FailureDomainPlacementPlan",
+            "FAILURE_DOMAIN_PLACEMENT_GATE_OW_303",
             "plan_failure_domain_placement_from_policy",
             "deterministic_failure_domain_policy_ignores_input_order",
             "strict_anti_affinity_holds_duplicate_domain_targets",
@@ -134,11 +130,11 @@ pub fn check_failure_domain_placement_current_workspace() -> Result<(), ClusterC
     );
     check_source_markers(
         &root,
-        "docs/MEMBERSHIP_SERVICE_DESIGN.md",
+        "docs/MEMBERSHIP_AUTHORITY.md",
         &[
-            "failure-domain bindings",
-            "split-brain hazard laws",
-            "networked protocol",
+            "`tidefs-membership-epoch` is the single authority owner",
+            "source-owned membership, placement, and",
+            "failure-domain model",
         ],
         &mut missing,
     );
