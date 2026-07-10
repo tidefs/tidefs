@@ -624,7 +624,7 @@ trap 'if [ $KEEP_TMP -eq 0 ]; then rm -rf "$RUN_DIR"; fi' EXIT
 cp "$BUSYBOX" "$RUN_DIR/bin/busybox"
 chmod +x "$RUN_DIR/bin/busybox"
 for a in sh ls cat echo mount grep insmod rmmod dmesg sleep poweroff reboot \
-  mknod mkdir rmdir dd stat cp mv rm touch find wc head sync cut date time; do
+  mknod mkdir rmdir dd stat cp mv rm touch find wc head sync cut date time awk; do
   ln -sf busybox "$RUN_DIR/bin/$a"
 done
 
