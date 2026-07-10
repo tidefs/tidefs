@@ -466,12 +466,29 @@ impl ExportOrchestrator {
     /// Build source-backed lifecycle evidence for export execution/refusal.
     #[must_use]
     pub fn lifecycle_evidence(&self) -> PoolLifecycleEvidence {
+        let label_capacities = self
+            .device_configs
+            .iter()
+            .enumerate()
+            .map(|(index, config)| {
+                PoolExporter::read_existing_label(&config.path, self.pool_guid, index as u32)
+                    .ok()
+                    .filter(|label| label.device_capacity_bytes > 0)
+                    .map(|label| label.device_capacity_bytes)
+            })
+            .collect::<Option<Vec<_>>>();
+        let capacity_bytes = label_capacities
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .copied()
+            .sum();
         let context = PoolLifecycleContext {
             pool_guid: Some(self.pool_guid),
             pool_name: Some(self.pool_name.clone()),
             device_count: self.device_configs.len(),
             expected_device_count: self.device_guids.len(),
-            capacity_bytes: 0,
+            capacity_bytes,
             topology_generation: 0,
             commit_group: self.final_commit_group,
         };
@@ -654,6 +671,7 @@ mod tests {
     use super::*;
     use crate::device::{DeviceBacking, DeviceClass, DeviceConfig, DeviceKind};
     use crate::pool_label::{seal_label, PoolLabelV1, POOL_LABEL_MAGIC};
+    use crate::pool_lifecycle_evidence::PoolLifecycleOutcome;
 
     #[test]
     fn export_empty_devices_fails() {
@@ -760,8 +778,69 @@ mod tests {
 
     // ── ExportOrchestrator tests ─────────────────────────────────
 
+    fn unique_export_path(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "tidefs-export-{}-{}-{}",
+            label,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    fn write_export_label(
+        path: &Path,
+        pool_guid: [u8; 16],
+        device_guid: [u8; 16],
+        capacity_bytes: u64,
+    ) {
+        let _ = std::fs::remove_dir_all(path);
+        std::fs::create_dir_all(path).unwrap();
+        let label_path = path.join(".tidefs_label");
+        let label = PoolLabelV1 {
+            magic: POOL_LABEL_MAGIC,
+            version: 1,
+            pool_guid,
+            device_guid,
+            pool_name_len: 8,
+            pool_name: {
+                let mut buf = [0u8; 255];
+                buf[..8].copy_from_slice(b"testpool");
+                buf
+            },
+            pool_state: LabelPoolState::Active,
+            commit_group: 10,
+            label_commit_group: 10,
+            device_index: 0,
+            topology_generation: 1,
+            device_count: 1,
+            device_class: LabelDeviceClass::Hdd,
+            device_capacity_bytes: capacity_bytes,
+            system_area_pointer: 0,
+            system_area_size: 0,
+            features_incompat: 0,
+            features_ro_compat: 0,
+            features_compat: 0,
+            device_health: 0,
+            device_read_errors: 0,
+            device_write_errors: 0,
+            device_checksum_errors: 0,
+            redundancy_policy: PoolRedundancyPolicy::default(),
+            checksum: [0u8; 32],
+        };
+        let sealed = seal_label(label).unwrap();
+        let mut buf = [0u8; POOL_LABEL_V1_WIRE_SIZE];
+        encode_label(&sealed, &mut buf).unwrap();
+        std::fs::write(label_path, buf).unwrap();
+    }
+
     fn make_orchestrator() -> ExportOrchestrator {
-        let path = PathBuf::from("/tmp/tidefs-export-evidence");
+        let path = unique_export_path("evidence");
+        let pool_guid = [0xAAu8; 16];
+        let device_guid = [0x01u8; 16];
+        write_export_label(&path, pool_guid, device_guid, 1024 * 1024 * 1024);
         let config = DeviceConfig {
             media_class: Default::default(),
             path: path.clone(),
@@ -772,10 +851,10 @@ mod tests {
             encryption: None,
         };
         ExportOrchestrator::new(
-            [0xAAu8; 16],
+            pool_guid,
             "testpool",
             vec![config],
-            vec![[0x01u8; 16]],
+            vec![device_guid],
             false,
         )
     }
@@ -1181,9 +1260,90 @@ mod tests {
         assert_eq!(evidence.action, PoolLifecycleAction::Export);
         assert_eq!(evidence.device_count, 1);
         assert_eq!(evidence.expected_device_count, 1);
+        assert_eq!(evidence.capacity_bytes, 1024 * 1024 * 1024);
         assert!(evidence.topology_complete);
         assert!(evidence.owner_authorized);
         assert!(!evidence.is_fail_closed());
+    }
+
+    #[test]
+    fn orchestrator_refuses_export_lifecycle_evidence_without_label_capacity() {
+        let path = unique_export_path("missing-label");
+        let config = DeviceConfig {
+            media_class: Default::default(),
+            path: path.clone(),
+            backing: DeviceBacking::DirectoryObjectStoreCompat,
+            class: DeviceClass::Data,
+            kind: DeviceKind::Single { path },
+            compression: None,
+            encryption: None,
+        };
+        let orch = ExportOrchestrator::new(
+            [0xAAu8; 16],
+            "missing-label",
+            vec![config],
+            vec![[0x01u8; 16]],
+            false,
+        );
+
+        let evidence = orch.lifecycle_evidence();
+
+        assert_eq!(evidence.action, PoolLifecycleAction::Export);
+        assert_eq!(evidence.outcome, PoolLifecycleOutcome::Refused);
+        assert_eq!(evidence.capacity_bytes, 0);
+        assert!(!evidence.topology_complete);
+        assert!(evidence.owner_authorized);
+        assert!(evidence.is_fail_closed());
+        assert_eq!(evidence.reason, "topology evidence incomplete");
+    }
+
+    #[test]
+    fn orchestrator_refuses_export_lifecycle_evidence_with_partial_label_capacity() {
+        let pool_guid = [0xAAu8; 16];
+        let device_a = [0x01u8; 16];
+        let device_b = [0x02u8; 16];
+        let path_a = unique_export_path("partial-label-a");
+        let path_b = unique_export_path("partial-label-b");
+        write_export_label(&path_a, pool_guid, device_a, 1024 * 1024 * 1024);
+        let _ = std::fs::remove_dir_all(&path_b);
+        std::fs::create_dir_all(&path_b).unwrap();
+        let config_a = DeviceConfig {
+            media_class: Default::default(),
+            path: path_a.clone(),
+            backing: DeviceBacking::DirectoryObjectStoreCompat,
+            class: DeviceClass::Data,
+            kind: DeviceKind::Single { path: path_a },
+            compression: None,
+            encryption: None,
+        };
+        let config_b = DeviceConfig {
+            media_class: Default::default(),
+            path: path_b.clone(),
+            backing: DeviceBacking::DirectoryObjectStoreCompat,
+            class: DeviceClass::Data,
+            kind: DeviceKind::Single { path: path_b },
+            compression: None,
+            encryption: None,
+        };
+        let orch = ExportOrchestrator::new(
+            pool_guid,
+            "partial-label",
+            vec![config_a, config_b],
+            vec![device_a, device_b],
+            false,
+        );
+
+        let evidence = orch.lifecycle_evidence();
+
+        assert_eq!(evidence.action, PoolLifecycleAction::Export);
+        assert_eq!(evidence.outcome, PoolLifecycleOutcome::Refused);
+        assert_eq!(evidence.device_count, 2);
+        assert_eq!(evidence.expected_device_count, 2);
+        assert_eq!(evidence.capacity_bytes, 0);
+        assert!(!evidence.topology_complete);
+        assert!(evidence.owner_authorized);
+        assert!(evidence.is_fail_closed());
+        assert_eq!(evidence.reason, "topology evidence incomplete");
     }
 
     #[test]

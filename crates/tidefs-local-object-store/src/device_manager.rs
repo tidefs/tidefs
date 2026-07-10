@@ -127,6 +127,7 @@ impl DeviceManager {
         pool_name: impl Into<String>,
         device_count: usize,
         expected_device_count: usize,
+        capacity_bytes: u64,
         topology_generation: u64,
         commit_group: u64,
     ) -> PoolLifecycleEvidence {
@@ -135,7 +136,7 @@ impl DeviceManager {
             pool_name: Some(pool_name.into()),
             device_count,
             expected_device_count,
-            capacity_bytes: 0,
+            capacity_bytes,
             topology_generation,
             commit_group,
         };
@@ -149,7 +150,7 @@ impl DeviceManager {
             _ => PoolLifecycleEvidence::refused_with_authority(
                 PoolLifecycleAction::FailClosed,
                 context,
-                device_count == expected_device_count,
+                device_count == expected_device_count && capacity_bytes > 0,
                 true,
                 "unsupported device topology lifecycle action",
             ),
@@ -808,7 +809,14 @@ mod tests {
             PoolLifecycleAction::ReplaceDevice,
         ] {
             let evidence = DeviceManager::topology_lifecycle_evidence(
-                action, [0x55; 16], "topology", 3, 3, 9, 8,
+                action,
+                [0x55; 16],
+                "topology",
+                3,
+                3,
+                3 * 1024 * 1024 * 1024,
+                9,
+                8,
             );
 
             assert_eq!(evidence.action, action);
@@ -817,7 +825,7 @@ mod tests {
             assert_eq!(evidence.pool_name.as_deref(), Some("topology"));
             assert_eq!(evidence.device_count, 3);
             assert_eq!(evidence.expected_device_count, 3);
-            assert_eq!(evidence.capacity_bytes, 0);
+            assert_eq!(evidence.capacity_bytes, 3 * 1024 * 1024 * 1024);
             assert_eq!(evidence.topology_generation, 9);
             assert_eq!(evidence.commit_group, 8);
             assert!(evidence.topology_complete);
@@ -834,6 +842,7 @@ mod tests {
             "topology",
             1,
             1,
+            1024 * 1024 * 1024,
             9,
             8,
         );
@@ -853,6 +862,7 @@ mod tests {
             "topology",
             4,
             3,
+            4 * 1024 * 1024 * 1024,
             9,
             8,
         );
