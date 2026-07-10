@@ -7496,7 +7496,6 @@ impl FuseVfsAdapter {
         if length == 0 {
             return false;
         }
-        let end = offset.saturating_add(length);
         if self
             .dirty_state
             .lock()
@@ -7515,11 +7514,19 @@ impl FuseVfsAdapter {
                 return true;
             }
         }
+        self.worker_dirty_tracker_overlaps_range(ino, offset, length)
+    }
+
+    fn worker_dirty_tracker_overlaps_range(&self, ino: u64, offset: u64, length: u64) -> bool {
+        if length == 0 {
+            return false;
+        }
+        let offset_end = offset.saturating_add(length);
         let worker_tracker = self.write_dispatch.lock().unwrap().dirty_page_tracker_arc();
         let worker_overlap = worker_tracker
             .lock()
             .unwrap()
-            .overlaps_range(ino, offset, end);
+            .overlaps_range(ino, offset, offset_end);
         worker_overlap
     }
 
@@ -43685,6 +43692,112 @@ mod tests {
                 .is_dirty(ino),
             Some(false),
             "fully reconciled inode reclaim cache should be clean"
+        );
+    }
+
+    #[test]
+    fn writeback_cached_clean_write_through_helper_reconciles_worker_dirty_overlap() {
+        let fixture = adapter_fixture_with_writeback_cache();
+        let ctx = root_ctx();
+        let (inode, _adapter_fh, _engine_fh) = create_adapter_file_handle(
+            &fixture.adapter,
+            &ctx,
+            b"wb-clean-write-through-helper-worker-dirty-overlap.bin",
+            libc::O_RDWR as u32,
+        );
+        let ino = inode.get();
+        let page_size = fixture.adapter.write_page_cache.page_size();
+        let page_size_u64 = u64::try_from(page_size).expect("page size fits u64");
+        let write_len = page_size / 2;
+        let write_len_u32 = u32::try_from(write_len).expect("write length fits u32");
+        let page_offset = page_size_u64;
+        let mut expected = vec![0xAA; page_size];
+        fixture
+            .adapter
+            .write_page_cache
+            .insert(ino, page_offset)
+            .expect("insert resident clean mirror");
+        {
+            let mut page = fixture
+                .adapter
+                .write_page_cache
+                .lookup(ino, page_offset)
+                .expect("lookup resident clean mirror");
+            page.data_mut().copy_from_slice(&expected);
+            assert!(!page.is_dirty());
+        }
+        let worker_tracker = fixture
+            .adapter
+            .write_dispatch
+            .lock()
+            .unwrap()
+            .dirty_page_tracker_arc();
+        worker_tracker
+            .lock()
+            .unwrap()
+            .mark_dirty(ino, page_offset, u64::from(write_len_u32))
+            .expect("seed overlapping worker dirty range");
+        {
+            let mut cache = fixture.adapter.writeback_cache.lock().unwrap();
+            cache.insert(ino);
+            cache.mark_dirty(ino, u64::from(write_len_u32));
+        }
+
+        let replacement = vec![0xC4; write_len];
+        fixture
+            .adapter
+            .record_clean_write_through_after_write(ino, page_offset, write_len_u32, &replacement)
+            .expect("record clean write-through after write");
+        expected[..write_len].copy_from_slice(&replacement);
+
+        assert_eq!(
+            fixture
+                .adapter
+                .dirty_state
+                .lock()
+                .unwrap()
+                .get(&ino)
+                .map(DirtyRanges::ranges),
+            None,
+            "daemon dirty ranges should stay empty"
+        );
+        assert!(
+            worker_tracker
+                .lock()
+                .unwrap()
+                .get_dirty_ranges(ino)
+                .is_empty(),
+            "overlapping worker dirty range should be cleared"
+        );
+        {
+            let page = fixture
+                .adapter
+                .write_page_cache
+                .lookup(ino, page_offset)
+                .expect("resident clean mirror remains resident");
+            assert_eq!(page.data(), expected.as_slice());
+            assert!(
+                !page.is_dirty(),
+                "authoritative clean write-through bytes should keep this page clean"
+            );
+        }
+        assert!(
+            fixture
+                .adapter
+                .write_page_cache
+                .dirty_pages_for_inode(ino)
+                .is_empty(),
+            "clean mirror should not become dirty after worker range reconciliation"
+        );
+        assert_eq!(
+            fixture
+                .adapter
+                .writeback_cache
+                .lock()
+                .unwrap()
+                .is_dirty(ino),
+            Some(false),
+            "fully reconciled worker range should clean the inode reclaim cache"
         );
     }
 
