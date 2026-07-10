@@ -370,14 +370,7 @@ pub fn build_evidence_manifest(
         claim_id: SCRUB_READ_PRIMARY_CLAIM_ID.to_string(),
         evidence_class: SCRUB_READ_EVIDENCE_CLASS.to_string(),
         validation_tier: ValidationTier::MountedUserspace,
-        scope: format!(
-            "row={} supported_claims={} non_claims={} outcome={:?} artifact={}",
-            evidence.row_id,
-            evidence.supported_claims.join(","),
-            evidence.non_claims.join("; "),
-            evidence.outcome,
-            SCRUB_READ_RUNTIME_ARTIFACT
-        ),
+        scope: evidence_manifest_scope(evidence),
         artifact_path: SCRUB_READ_RUNTIME_ARTIFACT.to_string(),
         content_digest: content_digest_for_bytes(artifact_bytes),
         run_id: evidence.run_id.clone(),
@@ -388,6 +381,36 @@ pub fn build_evidence_manifest(
         generated_at: evidence.generated_at.clone(),
         blocking_issues: Vec::<BlockingIssueRef>::new(),
     }
+}
+
+fn evidence_manifest_scope(evidence: &ScrubForegroundReadRuntimeEvidence) -> String {
+    let admission = &evidence.admission_state;
+    format!(
+        concat!(
+            "row={} supported_claims={} non_claims={} outcome={:?} artifact={} ",
+            "claim_status_change={} product_wording_change={} environment_refused={} ",
+            "foreground_read_admitted_by_service_curve={} ",
+            "foreground_read_refused_by_service_curve={} scrub_units_requested={} ",
+            "scrub_units_admitted_by_service_curve={} ",
+            "scrub_units_deferred_by_service_curve={} ",
+            "scrub_work_deferred_by_service_curve={} max_scrub_queue_depth={}"
+        ),
+        evidence.row_id,
+        evidence.supported_claims.join(","),
+        evidence.non_claims.join("; "),
+        evidence.outcome,
+        SCRUB_READ_RUNTIME_ARTIFACT,
+        evidence.claim_status_change,
+        evidence.product_wording_change,
+        admission.environment_refused,
+        admission.foreground_read_admitted_by_service_curve,
+        admission.foreground_read_refused_by_service_curve,
+        admission.scrub_units_requested,
+        admission.scrub_units_admitted_by_service_curve,
+        admission.scrub_units_deferred_by_service_curve,
+        admission.scrub_work_deferred_by_service_curve,
+        admission.max_scrub_queue_depth
+    )
 }
 
 struct BaseEvidenceInput {
@@ -964,6 +987,35 @@ mod tests {
             .any(|failure| failure.contains("statfs_type=0xef53")));
         assert_eq!(evidence.runtime_source.exit_status, 0);
         assert!(evidence.assert_no_product_or_harness_failure().is_ok());
+
+        let manifest = build_evidence_manifest(&evidence, b"scrub evidence");
+        let scope = &manifest.scope;
+        assert!(scope.contains("claim_status_change=false"));
+        assert!(scope.contains("product_wording_change=false"));
+        assert!(scope.contains("environment_refused=true"));
+        assert!(scope.contains("foreground_read_admitted_by_service_curve=true"));
+        assert!(scope.contains("foreground_read_refused_by_service_curve=false"));
+        assert!(scope.contains(&format!(
+            "scrub_units_requested={}",
+            evidence.admission_state.scrub_units_requested
+        )));
+        assert!(scope.contains(&format!(
+            "scrub_units_admitted_by_service_curve={}",
+            evidence
+                .admission_state
+                .scrub_units_admitted_by_service_curve
+        )));
+        assert!(scope.contains(&format!(
+            "scrub_units_deferred_by_service_curve={}",
+            evidence
+                .admission_state
+                .scrub_units_deferred_by_service_curve
+        )));
+        assert!(scope.contains("scrub_work_deferred_by_service_curve=true"));
+        assert!(scope.contains(&format!(
+            "max_scrub_queue_depth={}",
+            evidence.admission_state.max_scrub_queue_depth
+        )));
     }
 
     #[test]
