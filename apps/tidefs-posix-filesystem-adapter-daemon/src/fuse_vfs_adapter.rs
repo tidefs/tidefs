@@ -7001,7 +7001,7 @@ impl FuseVfsAdapter {
         } else {
             let efh = resolved_efh.ok_or(Errno::EBADF)?;
             let mut post_write_attr = None;
-            let write_result = {
+            let (write_result, clean_write_through_pending) = {
                 let e = self.engine.lock().unwrap();
                 // Capacity admission and allocation tracking are handled by the
                 // engine's CapacityAuthority during write dispatch; the adapter
@@ -7012,7 +7012,7 @@ impl FuseVfsAdapter {
                 } else {
                     Self::apply_write_killpriv_before_write(&**e, ctx, ino, &efh, write_flags).err()
                 };
-                if let Some(errno) = metadata_error {
+                let result = if let Some(errno) = metadata_error {
                     Err(errno)
                 } else {
                     match e.write(&efh, effective_offset as u64, data, ctx) {
@@ -7030,15 +7030,10 @@ impl FuseVfsAdapter {
                                         u64::from(written),
                                     );
                                 } else if clean_plain_write_through {
-                                    let written_len =
-                                        usize::try_from(written).map_err(|_| Errno::EIO)?;
-                                    let written_data = data.get(..written_len).ok_or(Errno::EIO)?;
-                                    self.record_clean_write_through_after_write(
-                                        ino,
-                                        effective_offset as u64,
-                                        written,
-                                        written_data,
-                                    )?;
+                                    // Clean write-through mirror refreshes run after the
+                                    // engine mutex is released so FUSE WRITE replies do
+                                    // not hold lower VFS authority while touching adapter
+                                    // caches and dirty trackers.
                                 } else {
                                     self.mark_dirty_after_write(
                                         &**e,
@@ -7094,8 +7089,24 @@ impl FuseVfsAdapter {
                         }
                         Err(errno) => Err(errno),
                     }
-                }
+                };
+                let clean_write_through_pending =
+                    matches!(&result, Ok(written) if *written > 0 && clean_plain_write_through);
+                (result, clean_write_through_pending)
             }; // engine lock dropped here
+
+            if clean_write_through_pending {
+                if let Ok(written) = write_result.as_ref() {
+                    let written_len = usize::try_from(*written).map_err(|_| Errno::EIO)?;
+                    let written_data = data.get(..written_len).ok_or(Errno::EIO)?;
+                    self.record_clean_write_through_after_write(
+                        ino,
+                        effective_offset as u64,
+                        *written,
+                        written_data,
+                    )?;
+                }
+            }
 
             // Direct I/O conflict guard: reconcile stale cached dirty ranges
             // covered by this authoritative direct write, so later writeback
