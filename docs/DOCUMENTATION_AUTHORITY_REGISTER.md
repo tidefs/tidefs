@@ -226,6 +226,17 @@ validate adaptive layout production readiness, import-performance scalability,
 allocator/device lifecycle completeness, availability, release readiness, or
 successor/comparator claims.
 
+## Production Integrity Historical Root Deletion (TFR-019 / #1832)
+
+Issue #1832 deleted the stale `docs/PRODUCTION_INTEGRITY_POLICY.md`
+historical root after its useful current content was already covered by
+source-backed local-object-store constants and tests,
+`docs/BLAKE3_USAGE_POLICY.md`, `docs/ROOT_AUTHENTICATION_OW015.md`,
+`validation/claims.toml`, and `docs/CLAIMS_GATE_POLICY.md`. The deletion does
+not validate production integrity, root-authentication key management, online
+scrub or self-heal, migration, mounted FUSE/kernel behavior, release
+readiness, or successor/comparator claims.
+
 ## Historical Input Fat Deletions (TFR-019 / #1720)
 
 Issue #1720 deleted stale historical roots whose remaining useful content was
