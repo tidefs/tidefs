@@ -1332,8 +1332,8 @@ mod tests {
     #[test]
     #[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
     fn two_independent_harnesses() {
-        let h1 = MountHarness::new_or_fail("two_independent_harnesses h1");
-        let h2 = MountHarness::new_or_fail("two_independent_harnesses h2");
+        let h1 = MountHarness::new_or_fail("two_independent_harnesses");
+        let h2 = MountHarness::new_or_fail("two_independent_harnesses");
 
         // Verify mounts are at different paths.
         assert_ne!(
