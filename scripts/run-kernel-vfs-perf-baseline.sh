@@ -766,10 +766,11 @@ echo "=== TideFS Kernel VFS Throughput Latency Baseline ==="
 echo "kernel=$(uname -r)"
 echo "ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
-PASS=0; FAIL=0; BLOCK=0
+PASS=0; FAIL=0; BLOCK=0; SKIP=0
 pass()   { echo "PASS: $1"; PASS=$((PASS+1)); }
 fail()   { echo "FAIL: $1 -- $2"; FAIL=$((FAIL+1)); }
 blocked(){ echo "BLOCKED: $1 -- $2"; BLOCK=$((BLOCK+1)); }
+skip()   { echo "SKIP: $1 -- $2"; SKIP=$((SKIP+1)); }
 
 MNT=/mnt/tidefs
 
@@ -840,6 +841,10 @@ if [ "$M" -eq 1 ]; then
   echo "stat_avg_latency_us=$avg_us"
   echo "stat_total_duration_s=$stat_duration_s"
   pass stat_latency
+else
+  skip write_data "filesystem not mounted"
+  skip read_data "filesystem not mounted"
+  skip stat_latency "filesystem not mounted"
 fi
 
 echo "--- Phase 5: Dmesg Integrity ---"
@@ -855,7 +860,7 @@ rmmod tidefs_posix_vfs 2>/dev/null && pass rmmod || fail rmmod
 
 echo ""
 echo "=== SUMMARY ==="
-echo "PASS=$PASS FAIL=$FAIL BLOCKED=$BLOCK"
+echo "PASS=$PASS FAIL=$FAIL BLOCKED=$BLOCK SKIP=$SKIP"
 sleep 1
 poweroff -f
 INIT
