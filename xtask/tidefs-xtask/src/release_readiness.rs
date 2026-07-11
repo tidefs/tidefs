@@ -11,6 +11,7 @@ use std::process;
 use tidefs_validation::evidence_artifact_manifest::{
     is_runtime_artifact_path, load_evidence_artifact_manifest_json_path,
 };
+use tidefs_validation::validation_schema::ValidationTier;
 
 const SCHEMA_VERSION: u32 = 1;
 const VERDICT_BOUNDARY: &str = "release-readiness-verdict";
@@ -1236,7 +1237,7 @@ fn evaluate_claim_evidence(
             }
         }
     } else {
-        if is_runtime_validation_tier(&requirement.validation_tier) {
+        if is_live_runtime_validation_tier(&requirement.validation_tier) {
             details.push(format!(
                 "runtime-tier evidence requirement for class `{class}` must name manifest_path"
             ));
@@ -1276,16 +1277,12 @@ fn evaluate_claim_evidence(
     }
 }
 
-fn is_runtime_validation_tier(validation_tier: &str) -> bool {
+fn is_live_runtime_validation_tier(validation_tier: &str) -> bool {
     matches!(
-        validation_tier,
-        "mounted-userspace"
-            | "qemu-guest"
-            | "qemu-module-load"
-            | "mounted-kernel-vfs"
-            | "kernel-block-io"
-            | "full-kernel-no-daemon"
-            | "multi-process-distributed"
+        serde_json::from_value::<ValidationTier>(serde_json::Value::String(
+            validation_tier.to_string()
+        )),
+        Ok(tier) if tier.is_live_runtime()
     )
 }
 
@@ -1806,6 +1803,34 @@ mod tests {
                         .any(|detail| detail.contains("runtime-tier")
                             && detail.contains("manifest_path")))
             ));
+    }
+
+    #[test]
+    fn release_readiness_kbuild_requirement_without_manifest_is_code_only() {
+        let fixture = Fixture::new();
+        fixture.write_rc_index(&fixture.source_ref, &fixture.source_sha, "full");
+        let artifact_path = fixture
+            .temp
+            .path()
+            .join("validation/artifacts/test/claims-gate-review.json");
+        fs::create_dir_all(artifact_path.parent().unwrap()).unwrap();
+        fs::write(&artifact_path, r#"{"decision":"pass"}"#).unwrap();
+        fixture.write_claim_registry_with_requirement("validated", "kbuild", None);
+        fixture.write_non_claim_inputs();
+
+        let artifact = assemble_verdict(&fixture.config());
+
+        assert!(artifact.claim_evidence.iter().any(|claim| {
+            claim.required_evidence.iter().any(|evidence| {
+                evidence.class == "claims-gate-review"
+                    && evidence.validation_tier == "kbuild"
+                    && evidence.outcome == VerdictOutcome::Pass
+                    && evidence
+                        .details
+                        .iter()
+                        .all(|detail| !detail.contains("manifest_path"))
+            })
+        }));
     }
 
     #[test]
