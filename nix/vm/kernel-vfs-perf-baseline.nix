@@ -27,6 +27,7 @@ let
 
     TMPDIR="''${TIDEFS_PERF_TMPDIR:-/tmp/tidefs-kmod-perf-baseline}"
     QEMU_MEM="''${TIDEFS_PERF_QEMU_MEM:-512M}"
+    KVM_FLAG=""
     QEMU_ACCEL="tcg"
     TIMEOUT_SEC="''${TIDEFS_KERNEL_PERF_TIMEOUT:-600}"
     SOURCE_DIR="''${TIDEFS_SOURCE_DIR:-}"
@@ -727,6 +728,14 @@ EOF
     fi
     echo "  Module .ko: $POSIX_VFS_KO"
 
+    if [ -e /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+      KVM_FLAG="-enable-kvm -cpu host"
+      QEMU_ACCEL="kvm"
+      echo "  KVM:       enabled"
+    else
+      echo "  KVM:       not available (software emulation, expect slow boot)"
+    fi
+
     RUN_DIR="$TMPDIR/validation-$$"
     mkdir -p "$RUN_DIR"/{bin,dev,proc,sys,tmp,lib/modules,mnt/tidefs,validation}
     trap 'if [ -z "''${KEEP_TMP:-}" ]; then rm -rf "$RUN_DIR"; fi' EXIT
@@ -935,6 +944,7 @@ INITSCRIPT
       -nographic \
       -m "$QEMU_MEM" \
       -no-reboot \
+      $KVM_FLAG \
       2>&1 | tee "$RUN_DIR/qemu.log"
     QEMU_EXIT="''${PIPESTATUS[0]}"
     set -e
