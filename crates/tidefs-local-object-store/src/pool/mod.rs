@@ -2794,6 +2794,15 @@ impl Pool {
                     reason: "invalid erasure placement receipt availability set",
                 });
             }
+            let role_matches_index = match target.role {
+                PlacementTargetRole::Data => shard_index < config.data_shards,
+                PlacementTargetRole::Parity => shard_index >= config.data_shards,
+            };
+            if !role_matches_index {
+                return Err(StoreError::InvalidOptions {
+                    reason: "invalid erasure placement receipt availability set",
+                });
+            }
             seen_indices[shard_index] = true;
             let Some(idx) = self.resolve_receipt_target(target) else {
                 continue;
@@ -6464,6 +6473,67 @@ mod tests {
         ));
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn erasure_policy_rejects_receipt_role_mismatch() {
+        fn assert_rejects_role_mismatch(
+            root_name: &str,
+            shard_index: u16,
+            role: PlacementTargetRole,
+        ) {
+            let root = temp_dir(root_name);
+            let _ = std::fs::remove_dir_all(&root);
+            let config = multi_data_device_config(&root, 4);
+            let properties = PoolProperties {
+                redundancy_policy: PoolRedundancyPolicy::erasure(2, 1),
+                ..PoolProperties::default()
+            };
+            let mut pool = Pool::create(config, properties, &test_options()).unwrap();
+            set_deterministic_device_guids(&mut pool);
+
+            let key = ObjectKey::from_name(root_name.as_bytes());
+            let payload = b"payload large enough to span both data shards";
+            pool.put(IoClass::Data, key, payload).unwrap();
+
+            let mut receipt = pool
+                .placement_receipt_for_key(IoClass::Data, key)
+                .unwrap()
+                .expect("erasure receipt must persist");
+            let indices: Vec<_> = receipt
+                .targets
+                .iter()
+                .map(|target| pool.resolve_receipt_target(target).unwrap())
+                .collect();
+            receipt
+                .targets
+                .iter_mut()
+                .find(|target| target.shard_index == shard_index)
+                .expect("target shard")
+                .role = role;
+            let err = pool
+                .write_placement_receipt(&indices, &receipt)
+                .unwrap_err();
+            assert!(matches!(
+                err,
+                StoreError::InvalidOptions {
+                    reason: "placement replay receipt does not match local locator authority"
+                }
+            ));
+
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        assert_rejects_role_mismatch(
+            "erasure-receipt-data-index-as-parity",
+            0,
+            PlacementTargetRole::Parity,
+        );
+        assert_rejects_role_mismatch(
+            "erasure-receipt-parity-index-as-data",
+            2,
+            PlacementTargetRole::Data,
+        );
     }
 
     #[test]
