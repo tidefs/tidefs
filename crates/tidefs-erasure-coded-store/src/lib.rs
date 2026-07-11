@@ -37,7 +37,10 @@ use std::{
     sync::Arc,
 };
 use tidefs_durability_layout::FailureDomainV1;
-use tidefs_erasure_coding::{encode, reconstruct, ErasureShard, ShardKind, StripeConfig};
+use tidefs_erasure_coding::{
+    encode as encode_stripe, reconstruct as reconstruct_stripe, ErasureShard, ShardKind,
+    StripeConfig,
+};
 use tidefs_local_object_store::{LocalObjectStore, ObjectKey, StoreOptions};
 use tidefs_placement_planner::placement_plan::{DeviceCandidate, PlacementPlan};
 use tokio::sync::Mutex;
@@ -278,7 +281,7 @@ impl ErasureCodedStore {
                 &[]
             };
 
-            let encoded = encode(&stripe_config, chunk)
+            let encoded = encode_stripe(&stripe_config, chunk)
                 .ok_or_else(|| format!("encode failed for stripe {s}"))?;
 
             for shard in &encoded.shards {
@@ -403,7 +406,7 @@ impl ErasureCodedStore {
                 }
             }
 
-            let recon = reconstruct(&stripe_config, &available, None).ok_or_else(|| {
+            let recon = reconstruct_stripe(&stripe_config, &available, None).ok_or_else(|| {
                 increment_cell(&self.stats.failed_reads);
                 format!(
                     "stripe {s}: insufficient verified shards available ({}/{} needed)",
@@ -414,7 +417,7 @@ impl ErasureCodedStore {
 
             // Queue repairs for missing/corrupt shards to be written back later.
             if degraded {
-                if let Some(encoded) = encode(&stripe_config, &recon.payload) {
+                if let Some(encoded) = encode_stripe(&stripe_config, &recon.payload) {
                     for i in 0..sw {
                         if available[i].is_none() {
                             let shard_key = shard_object_key(key, s, i);
@@ -618,7 +621,7 @@ impl ErasureCodedStore {
                     }
                 }
 
-                if let Some(recon) = reconstruct(&stripe_config, &available, None) {
+                if let Some(recon) = reconstruct_stripe(&stripe_config, &available, None) {
                     for rebuilt in &recon.rebuilt_shards {
                         let target_store =
                             mapped_store_index(&self.shard_to_store, rebuilt.index, sw);
@@ -693,6 +696,55 @@ impl fmt::Display for EcStoreError {
 }
 
 impl std::error::Error for EcStoreError {}
+
+/// Encoded stripe material returned through the EC-store receipt boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReceiptEncodedStripe {
+    /// Data and parity shards ready for placement and receipt publication.
+    pub shards: Vec<ErasureShard>,
+    /// Original payload bytes represented by this stripe before padding.
+    pub original_payload_len: usize,
+}
+
+/// Reconstructed stripe material returned through the EC-store receipt boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReceiptReconstructedStripe {
+    /// Reconstructed payload, including any stripe padding.
+    pub payload: Vec<u8>,
+    /// Missing shards rebuilt during reconstruction for repair evidence.
+    pub rebuilt_shards: Vec<ErasureShard>,
+}
+
+/// Encode one receipt-tracked stripe through the EC-store authority.
+pub fn encode_receipt_stripe(
+    config: &StripeConfig,
+    payload: &[u8],
+) -> Result<ReceiptEncodedStripe, EcStoreError> {
+    let encoded = encode_stripe(config, payload).ok_or_else(|| {
+        EcStoreError::EncodeFailed("erasure encoder rejected receipt stripe payload".to_string())
+    })?;
+    Ok(ReceiptEncodedStripe {
+        shards: encoded.shards,
+        original_payload_len: encoded.original_payload_len,
+    })
+}
+
+/// Reconstruct one receipt-tracked stripe through the EC-store authority.
+pub fn reconstruct_receipt_stripe(
+    config: &StripeConfig,
+    available: &[Option<ErasureShard>],
+) -> Result<ReceiptReconstructedStripe, EcStoreError> {
+    let available_count = available.iter().filter(|shard| shard.is_some()).count();
+    let reconstructed =
+        reconstruct_stripe(config, available, None).ok_or(EcStoreError::InsufficientShards {
+            available: available_count,
+            needed: config.data_shards,
+        })?;
+    Ok(ReceiptReconstructedStripe {
+        payload: reconstructed.payload,
+        rebuilt_shards: reconstructed.rebuilt_shards,
+    })
+}
 
 /// Result of an EC write path execution.
 #[derive(Debug, Clone)]
@@ -1170,8 +1222,8 @@ impl EcWritePath {
                     &[]
                 };
 
-                let encoded = encode(&stripe_config, chunk).ok_or_else(|| {
-                    EcStoreError::EncodeFailed(format!("encode failed for stripe {stripe_idx}"))
+                let encoded = encode_receipt_stripe(&stripe_config, chunk).map_err(|err| {
+                    EcStoreError::EncodeFailed(format!("stripe {stripe_idx}: {err}"))
                 })?;
 
                 for shard in &encoded.shards {
@@ -1329,7 +1381,7 @@ impl EcReadPath {
                     }
                 }
 
-                let recon = reconstruct(&stripe_config, &available, None).ok_or_else(|| {
+                let recon = reconstruct_receipt_stripe(&stripe_config, &available).map_err(|_| {
                     increment_cell(&s.stats.failed_reads);
                     EcStoreError::InsufficientShards {
                         available: available.iter().filter(|s| s.is_some()).count(),
@@ -1472,7 +1524,7 @@ impl EcRepairPath {
                         }
                     }
 
-                    if let Some(recon) = reconstruct(&stripe_config, &available, None) {
+                    if let Ok(recon) = reconstruct_receipt_stripe(&stripe_config, &available) {
                         for rebuilt in &recon.rebuilt_shards {
                             let target_store =
                                 mapped_store_index(&s.shard_to_store, rebuilt.index, sw);
@@ -1547,6 +1599,64 @@ mod tests {
             node_id: None,
             rack_id: None,
             datacenter_id: None,
+        }
+    }
+
+    #[test]
+    fn receipt_stripe_encode_returns_all_shards() {
+        let config = StripeConfig {
+            data_shards: 2,
+            parity_shards: 1,
+            shard_len: 8,
+        };
+
+        let encoded = encode_receipt_stripe(&config, b"hello").unwrap();
+
+        assert_eq!(encoded.shards.len(), 3);
+        assert_eq!(encoded.original_payload_len, 5);
+        assert_eq!(encoded.shards[0].index, 0);
+        assert_eq!(encoded.shards[0].kind, ShardKind::Data);
+        assert_eq!(encoded.shards[2].kind, ShardKind::Parity);
+    }
+
+    #[test]
+    fn receipt_stripe_reconstructs_missing_shard_evidence() {
+        let config = StripeConfig {
+            data_shards: 2,
+            parity_shards: 1,
+            shard_len: 8,
+        };
+        let encoded = encode_receipt_stripe(&config, b"hello").unwrap();
+        let mut available: Vec<_> = encoded.shards.iter().cloned().map(Some).collect();
+        available[1] = None;
+
+        let reconstructed = reconstruct_receipt_stripe(&config, &available).unwrap();
+
+        assert_eq!(&reconstructed.payload[..5], b"hello");
+        assert_eq!(reconstructed.rebuilt_shards.len(), 1);
+        assert_eq!(reconstructed.rebuilt_shards[0].index, 1);
+    }
+
+    #[test]
+    fn receipt_stripe_reconstruct_fails_closed_when_insufficient() {
+        let config = StripeConfig {
+            data_shards: 2,
+            parity_shards: 1,
+            shard_len: 8,
+        };
+        let encoded = encode_receipt_stripe(&config, b"hello").unwrap();
+        let mut available: Vec<_> = encoded.shards.iter().cloned().map(Some).collect();
+        available[0] = None;
+        available[1] = None;
+
+        let err = reconstruct_receipt_stripe(&config, &available).unwrap_err();
+
+        match err {
+            EcStoreError::InsufficientShards { available, needed } => {
+                assert_eq!(available, 1);
+                assert_eq!(needed, 2);
+            }
+            other => panic!("expected InsufficientShards, got {other:?}"),
         }
     }
 
