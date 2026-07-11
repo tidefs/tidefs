@@ -2385,7 +2385,7 @@ fn print_help() {
     println!("  check-local-store        run local object-store source-presence smoke");
     println!("  check-local-store-format validate the local object-store on-disk format spec");
     println!("  check-object-store-format alias for check-local-store-format");
-    println!("  check-production-integrity validate the production integrity policy spec");
+    println!("  check-production-integrity validate production integrity source markers");
     println!("  check-integrity-policy    alias for check-production-integrity");
     println!("  check-production-integrity-v3 validate v3 record integrity markers");
     println!("  check-v3-record-integrity alias for check-production-integrity-v3");
