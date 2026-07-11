@@ -54,7 +54,8 @@ use tidefs_durability_layout::{
     DurabilityLayoutV1, DurabilityPolicy, FailureDomainLevel, FailureDomainV1,
 };
 use tidefs_erasure_coding::{
-    encode_receipt_stripe, reconstruct_receipt_stripe, ErasureShard, ShardKind, StripeConfig,
+    encode_receipt_stripe, reconstruct_receipt_stripe, ErasureShard, ReceiptStripeError, ShardKind,
+    StripeConfig,
 };
 use tidefs_placement_planner::{
     AllocationRequest, DeviceHealthCapacity, HashRingPlacementPlanner, PlacementDecision,
@@ -2806,8 +2807,19 @@ impl Pool {
             });
         }
 
-        let Ok(mut reconstructed) = reconstruct_receipt_stripe(&config, &available) else {
-            return Ok(None);
+        let mut reconstructed = match reconstruct_receipt_stripe(&config, &available) {
+            Ok(reconstructed) => reconstructed,
+            Err(ReceiptStripeError::InsufficientShards { .. }) => return Ok(None),
+            Err(ReceiptStripeError::InvalidAvailableSet { .. }) => {
+                return Err(StoreError::InvalidOptions {
+                    reason: "invalid erasure placement receipt availability set",
+                });
+            }
+            Err(ReceiptStripeError::EncodeRejected) => {
+                return Err(StoreError::InvalidOptions {
+                    reason: "erasure placement receipt reconstruction rejected payload",
+                });
+            }
         };
         reconstructed.payload.truncate(receipt.payload_len as usize);
         if digest32(&reconstructed.payload) != receipt.payload_digest {
