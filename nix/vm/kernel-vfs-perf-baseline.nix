@@ -161,6 +161,14 @@ EOF
       fi
     }
 
+    qemu_accel_value() {
+      if [ -e /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+        echo kvm
+      else
+        echo tcg
+      fi
+    }
+
     write_blocked_manifest() {
       local reason="$1"
       local run_id
@@ -176,7 +184,7 @@ EOF
   "date": $(json_string "$run_id"),
   "mode": "bootstrap",
   "validation_tier": "Tier 5 mounted Linux 7.0 kernel VFS",
-  "qemu_accel": $(json_string "$QEMU_ACCEL"),
+  "qemu_accel": $(json_string "$(qemu_accel_value)"),
   "qemu_exit": null,
   "qemu_success": false,
   "qemu_timed_out": false,
