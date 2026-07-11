@@ -112,10 +112,10 @@ write_blocked_manifest() {
   cat > "$output_dir/validation-manifest.json" << MANIFEST
 {
   "test": "kernel-vfs-perf-baseline",
-  "date": "$run_id",
+  "date": $(json_string "$run_id"),
   "mode": "bootstrap",
   "validation_tier": "Tier 5 mounted Linux 7.0 kernel VFS",
-  "qemu_accel": "$(qemu_accel_value)",
+  "qemu_accel": $(json_string "$(qemu_accel_value)"),
   "qemu_exit": null,
   "qemu_success": false,
   "qemu_timed_out": false,
@@ -929,10 +929,10 @@ echo "  Verdict reason: $VERDICT_REASON"
 cat > "$RUN_DIR_VALIDATION/validation-manifest.json" << MANIFEST
 {
   "test": "kernel-vfs-perf-baseline",
-  "date": "$RUN_ID",
+  "date": $(json_string "$RUN_ID"),
   "mode": "bootstrap",
   "validation_tier": "Tier 5 mounted Linux 7.0 kernel VFS",
-  "qemu_accel": "$QEMU_ACCEL",
+  "qemu_accel": $(json_string "$QEMU_ACCEL"),
   "qemu_exit": $(qemu_exit_json_value "$QEMU_EXIT"),
   "qemu_success": $QEMU_SUCCESS,
   "qemu_timed_out": $QEMU_TIMED_OUT,
