@@ -282,7 +282,7 @@ pub fn print_coordination_health_report(command: &str) -> Result<(), ForgejoWork
 // acquire-claim/claim-issue -- legacy Forgejo command, now unsupported
 // ---------------------------------------------------------------------------
 
-pub fn acquire_claim_command(command: &str, _issue_num: u64) -> Result<bool, String> {
+pub fn acquire_claim_command(command: &str) -> Result<bool, String> {
     Err(retired_forgejo_command_message(
         command,
         "Issue claim is now managed through GitHub issue assignment and the current Codex Nexus \
@@ -653,7 +653,7 @@ mod tests {
             "coordination-health-report",
         );
 
-        let message = acquire_claim_command("acquire-claim", 1805)
+        let message = acquire_claim_command("acquire-claim")
             .expect_err("retired acquire-claim should fail closed");
         for fragment in [
             "acquire-claim",
@@ -669,7 +669,7 @@ mod tests {
             );
         }
 
-        let message = acquire_claim_command("claim-issue", 1805)
+        let message = acquire_claim_command("claim-issue")
             .expect_err("retired claim-issue should fail closed");
         for fragment in [
             "claim-issue",

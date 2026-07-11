@@ -1086,7 +1086,7 @@ fn main() {
             }
         }
         Some(command @ ("acquire-claim" | "claim-issue")) => {
-            if let Err(err) = forgejo_work::acquire_claim_command(command, 0) {
+            if let Err(err) = forgejo_work::acquire_claim_command(command) {
                 eprintln!("{err}");
                 process::exit(1);
             }
