@@ -481,7 +481,10 @@ fn issue_number_from_branch_authority(branch: &str) -> Option<u64> {
         return None;
     }
     let issue_slug = rest.strip_prefix("issue-")?;
-    let (issue_num, _) = issue_slug.split_once('-')?;
+    let (issue_num, slug) = issue_slug.split_once('-')?;
+    if slug.is_empty() {
+        return None;
+    }
     issue_num.parse::<u64>().ok()
 }
 
@@ -764,6 +767,14 @@ mod tests {
         );
         assert_eq!(
             issue_number_from_branch_authority("codex1/pr-2059-retire-forgejo-xtask"),
+            None
+        );
+        assert_eq!(
+            issue_number_from_branch_authority("codex1/issue-1805"),
+            None
+        );
+        assert_eq!(
+            issue_number_from_branch_authority("codex1/issue-1805-"),
             None
         );
         assert_eq!(
