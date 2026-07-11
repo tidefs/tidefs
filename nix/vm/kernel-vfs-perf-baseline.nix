@@ -782,8 +782,12 @@ echo "timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo ""
 
 PASSED=0; FAILED=0; BLOCKED=0; SKIPPED=0
+write_duration_s=0
 write_throughput_mbps=0
+read_duration_s=0
 read_throughput_mbps=0
+stat_total_duration_s=0
+avg_us=0
 pass()   { echo "PASS: $1"; PASSED=$((PASSED + 1)); }
 fail()   { echo "FAIL: $1 -- $2"; FAILED=$((FAILED + 1)); }
 blocked(){ echo "BLOCKED: $1 -- $2"; BLOCKED=$((BLOCKED + 1)); }
@@ -850,7 +854,8 @@ else
             write_throughput_mbps=$(awk "BEGIN {printf \"%.2f\", 1000000000 / $duration_ns}" 2>/dev/null || echo "0")
         fi
     fi
-    echo "  write_duration_s=$duration_s"
+    write_duration_s=$duration_s
+    echo "  write_duration_s=$write_duration_s"
     echo "  write_throughput_MBps=$write_throughput_mbps"
     ws=$(stat -c %s "$MNT/perf_write_test" 2>/dev/null || echo 0)
     [ "$ws" -ge 1048576 ] && pass "phase2_write_data" || fail "phase2_write_data" "file_size=$ws"
@@ -874,7 +879,8 @@ else
             read_throughput_mbps=$(awk "BEGIN {printf \"%.2f\", 1000000000 / $duration_ns}" 2>/dev/null || echo "0")
         fi
     fi
-    echo "  read_duration_s=$duration_s"
+    read_duration_s=$duration_s
+    echo "  read_duration_s=$read_duration_s"
     echo "  read_throughput_MBps=$read_throughput_mbps"
     pass "phase3_read"
 fi
@@ -901,8 +907,9 @@ else
         avg_us=$(awk "BEGIN {printf \"%.2f\", $avg_ns / 1000}" 2>/dev/null || echo "0")
         duration_s=$(awk "BEGIN {printf \"%.3f\", $duration_ns / 1000000000}" 2>/dev/null || echo "0")
     fi
+    stat_total_duration_s=$duration_s
     echo "  stat_avg_latency_us=$avg_us"
-    echo "  stat_total_duration_s=$duration_s"
+    echo "  stat_total_duration_s=$stat_total_duration_s"
     pass "phase4_stat"
 fi
 
@@ -929,9 +936,12 @@ rmmod tidefs_posix_vfs 2>/tmp/rm.err && pass "phase7_rmmod" || fail "phase7_rmmo
 echo ""
 echo "============================================================"
 echo "=== PERFORMANCE BASELINE SUMMARY ==="
+echo "  write_duration_s=$write_duration_s"
 echo "  write_throughput_MBps=$write_throughput_mbps"
+echo "  read_duration_s=$read_duration_s"
 echo "  read_throughput_MBps=$read_throughput_mbps"
 echo "  stat_avg_latency_us=$avg_us"
+echo "  stat_total_duration_s=$stat_total_duration_s"
 echo "  dmesg_BUG=$DB"
 echo "  PASS=$PASSED FAIL=$FAILED BLOCKED=$BLOCKED SKIP=$SKIPPED"
 echo "============================================================"
