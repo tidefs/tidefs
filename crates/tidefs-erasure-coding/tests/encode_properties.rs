@@ -171,3 +171,71 @@ fn encoded_stripe_retains_config() {
     let enc = encode(&c, &sequential_payload(c.data_capacity())).expect("encode");
     assert_eq!(enc.config, c);
 }
+
+// ---------------------------------------------------------------------------
+// Receipt-tracked helpers
+// ---------------------------------------------------------------------------
+
+#[test]
+fn receipt_encode_preserves_shards_and_original_payload_len() {
+    let c = config(3, 2, 8);
+    let payload = b"receipt payload";
+
+    let enc = encode_receipt_stripe(&c, payload).expect("receipt encode");
+
+    assert_eq!(enc.shards.len(), c.stripe_width());
+    assert_eq!(enc.original_payload_len, payload.len());
+    assert_eq!(enc.shards[0].kind, ShardKind::Data);
+    assert_eq!(enc.shards[c.data_shards].kind, ShardKind::Parity);
+}
+
+#[test]
+fn receipt_reconstruct_returns_rebuilt_missing_shard_evidence() {
+    let c = config(2, 1, 8);
+    let payload = b"receipt";
+    let enc = encode_receipt_stripe(&c, payload).expect("receipt encode");
+    let mut available: Vec<_> = enc.shards.iter().cloned().map(Some).collect();
+    available[0] = None;
+
+    let reconstructed = reconstruct_receipt_stripe(&c, &available).expect("receipt reconstruct");
+
+    assert_eq!(&reconstructed.payload[..payload.len()], payload);
+    assert_eq!(reconstructed.rebuilt_shards.len(), 1);
+    assert_eq!(reconstructed.rebuilt_shards[0].index, 0);
+}
+
+#[test]
+fn receipt_reconstruct_fails_closed_when_insufficient_shards() {
+    let c = config(2, 1, 8);
+    let enc = encode_receipt_stripe(&c, b"receipt").expect("receipt encode");
+    let mut available: Vec<_> = enc.shards.iter().cloned().map(Some).collect();
+    available[0] = None;
+    available[2] = None;
+
+    let err = reconstruct_receipt_stripe(&c, &available).unwrap_err();
+
+    assert_eq!(
+        err,
+        ReceiptStripeError::InsufficientShards {
+            available: 1,
+            needed: 2
+        }
+    );
+}
+
+#[test]
+fn receipt_reconstruct_rejects_invalid_available_set_width() {
+    let c = config(2, 1, 8);
+    let enc = encode_receipt_stripe(&c, b"receipt").expect("receipt encode");
+    let available: Vec<_> = enc.shards.iter().take(2).cloned().map(Some).collect();
+
+    let err = reconstruct_receipt_stripe(&c, &available).unwrap_err();
+
+    assert_eq!(
+        err,
+        ReceiptStripeError::InvalidAvailableSet {
+            slots: 2,
+            expected: 3
+        }
+    );
+}

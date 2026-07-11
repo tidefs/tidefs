@@ -293,6 +293,7 @@ pub struct ReceiptReconstructedStripe {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReceiptStripeError {
     EncodeRejected,
+    InvalidAvailableSet { slots: usize, expected: usize },
     InsufficientShards { available: usize, needed: usize },
 }
 
@@ -311,6 +312,13 @@ pub fn reconstruct_receipt_stripe(
     config: &StripeConfig,
     available: &[Option<ErasureShard>],
 ) -> Result<ReceiptReconstructedStripe, ReceiptStripeError> {
+    let expected = config.stripe_width();
+    if available.len() != expected {
+        return Err(ReceiptStripeError::InvalidAvailableSet {
+            slots: available.len(),
+            expected,
+        });
+    }
     let available_count = available.iter().filter(|shard| shard.is_some()).count();
     let reconstructed =
         reconstruct(config, available, None).ok_or(ReceiptStripeError::InsufficientShards {

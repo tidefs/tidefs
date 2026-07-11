@@ -712,6 +712,9 @@ pub fn encode_receipt_stripe(
         ReceiptStripeError::InsufficientShards { available, needed } => {
             EcStoreError::InsufficientShards { available, needed }
         }
+        ReceiptStripeError::InvalidAvailableSet { slots, expected } => EcStoreError::Internal(
+            format!("receipt stripe encode returned invalid available set: {slots} slots, expected {expected}"),
+        ),
     })
 }
 
@@ -724,6 +727,9 @@ pub fn reconstruct_receipt_stripe(
         ReceiptStripeError::InsufficientShards { available, needed } => {
             EcStoreError::InsufficientShards { available, needed }
         }
+        ReceiptStripeError::InvalidAvailableSet { slots, expected } => EcStoreError::DecodeFailed(
+            format!("invalid receipt stripe available set: {slots} slots, expected {expected}"),
+        ),
         ReceiptStripeError::EncodeRejected => EcStoreError::DecodeFailed(
             "erasure decoder rejected receipt stripe payload".to_string(),
         ),
