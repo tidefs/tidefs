@@ -85,7 +85,7 @@ pub fn check_membership_epoch_model_current_workspace() -> Result<(), ClusterChe
     check_source_markers(
         &root,
         "docs/MEMBERSHIP_CONFIG_QUORUM_SET_IDENTITY_OW302B.md",
-        &["quorum-set", "production cluster membership service"],
+        &["quorum set", "production cluster membership service"],
         &mut missing,
     );
     if missing.is_empty() {
