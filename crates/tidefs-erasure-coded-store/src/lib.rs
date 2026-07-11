@@ -38,9 +38,12 @@ use std::{
 };
 use tidefs_durability_layout::FailureDomainV1;
 use tidefs_erasure_coding::{
-    encode as encode_stripe, reconstruct as reconstruct_stripe, ErasureShard, ShardKind,
-    StripeConfig,
+    encode as encode_stripe, encode_receipt_stripe as encode_coding_receipt_stripe,
+    reconstruct as reconstruct_stripe,
+    reconstruct_receipt_stripe as reconstruct_coding_receipt_stripe, ErasureShard,
+    ReceiptStripeError, ShardKind, StripeConfig,
 };
+pub use tidefs_erasure_coding::{ReceiptEncodedStripe, ReceiptReconstructedStripe};
 use tidefs_local_object_store::{LocalObjectStore, ObjectKey, StoreOptions};
 use tidefs_placement_planner::placement_plan::{DeviceCandidate, PlacementPlan};
 use tokio::sync::Mutex;
@@ -697,35 +700,18 @@ impl fmt::Display for EcStoreError {
 
 impl std::error::Error for EcStoreError {}
 
-/// Encoded stripe material returned through the EC-store receipt boundary.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReceiptEncodedStripe {
-    /// Data and parity shards ready for placement and receipt publication.
-    pub shards: Vec<ErasureShard>,
-    /// Original payload bytes represented by this stripe before padding.
-    pub original_payload_len: usize,
-}
-
-/// Reconstructed stripe material returned through the EC-store receipt boundary.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReceiptReconstructedStripe {
-    /// Reconstructed payload, including any stripe padding.
-    pub payload: Vec<u8>,
-    /// Missing shards rebuilt during reconstruction for repair evidence.
-    pub rebuilt_shards: Vec<ErasureShard>,
-}
-
 /// Encode one receipt-tracked stripe through the EC-store authority.
 pub fn encode_receipt_stripe(
     config: &StripeConfig,
     payload: &[u8],
 ) -> Result<ReceiptEncodedStripe, EcStoreError> {
-    let encoded = encode_stripe(config, payload).ok_or_else(|| {
-        EcStoreError::EncodeFailed("erasure encoder rejected receipt stripe payload".to_string())
-    })?;
-    Ok(ReceiptEncodedStripe {
-        shards: encoded.shards,
-        original_payload_len: encoded.original_payload_len,
+    encode_coding_receipt_stripe(config, payload).map_err(|err| match err {
+        ReceiptStripeError::EncodeRejected => EcStoreError::EncodeFailed(
+            "erasure encoder rejected receipt stripe payload".to_string(),
+        ),
+        ReceiptStripeError::InsufficientShards { available, needed } => {
+            EcStoreError::InsufficientShards { available, needed }
+        }
     })
 }
 
@@ -734,15 +720,13 @@ pub fn reconstruct_receipt_stripe(
     config: &StripeConfig,
     available: &[Option<ErasureShard>],
 ) -> Result<ReceiptReconstructedStripe, EcStoreError> {
-    let available_count = available.iter().filter(|shard| shard.is_some()).count();
-    let reconstructed =
-        reconstruct_stripe(config, available, None).ok_or(EcStoreError::InsufficientShards {
-            available: available_count,
-            needed: config.data_shards,
-        })?;
-    Ok(ReceiptReconstructedStripe {
-        payload: reconstructed.payload,
-        rebuilt_shards: reconstructed.rebuilt_shards,
+    reconstruct_coding_receipt_stripe(config, available).map_err(|err| match err {
+        ReceiptStripeError::InsufficientShards { available, needed } => {
+            EcStoreError::InsufficientShards { available, needed }
+        }
+        ReceiptStripeError::EncodeRejected => EcStoreError::DecodeFailed(
+            "erasure decoder rejected receipt stripe payload".to_string(),
+        ),
     })
 }
 

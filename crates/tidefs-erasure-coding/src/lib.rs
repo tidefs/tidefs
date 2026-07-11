@@ -271,6 +271,58 @@ pub struct Reconstruction {
     pub rebuilt_shards: Vec<ErasureShard>,
 }
 
+/// Encoded stripe material for receipt-tracked placement paths.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReceiptEncodedStripe {
+    /// Data and parity shards ready for placement and receipt publication.
+    pub shards: Vec<ErasureShard>,
+    /// Original payload bytes represented by this stripe before padding.
+    pub original_payload_len: usize,
+}
+
+/// Reconstructed stripe material for receipt-tracked read and repair paths.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReceiptReconstructedStripe {
+    /// Reconstructed payload, including any stripe padding.
+    pub payload: Vec<u8>,
+    /// Missing shards rebuilt during reconstruction for repair evidence.
+    pub rebuilt_shards: Vec<ErasureShard>,
+}
+
+/// Receipt-tracked stripe helper failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReceiptStripeError {
+    EncodeRejected,
+    InsufficientShards { available: usize, needed: usize },
+}
+
+pub fn encode_receipt_stripe(
+    config: &StripeConfig,
+    payload: &[u8],
+) -> Result<ReceiptEncodedStripe, ReceiptStripeError> {
+    let encoded = encode(config, payload).ok_or(ReceiptStripeError::EncodeRejected)?;
+    Ok(ReceiptEncodedStripe {
+        shards: encoded.shards,
+        original_payload_len: encoded.original_payload_len,
+    })
+}
+
+pub fn reconstruct_receipt_stripe(
+    config: &StripeConfig,
+    available: &[Option<ErasureShard>],
+) -> Result<ReceiptReconstructedStripe, ReceiptStripeError> {
+    let available_count = available.iter().filter(|shard| shard.is_some()).count();
+    let reconstructed =
+        reconstruct(config, available, None).ok_or(ReceiptStripeError::InsufficientShards {
+            available: available_count,
+            needed: config.data_shards,
+        })?;
+    Ok(ReceiptReconstructedStripe {
+        payload: reconstructed.payload,
+        rebuilt_shards: reconstructed.rebuilt_shards,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Encode
 // ---------------------------------------------------------------------------

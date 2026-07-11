@@ -54,8 +54,7 @@ use tidefs_durability_layout::{
     DurabilityLayoutV1, DurabilityPolicy, FailureDomainLevel, FailureDomainV1,
 };
 use tidefs_erasure_coding::{
-    encode as encode_erasure_stripe, reconstruct as reconstruct_erasure_stripe, ErasureShard,
-    ShardKind, StripeConfig,
+    encode_receipt_stripe, reconstruct_receipt_stripe, ErasureShard, ShardKind, StripeConfig,
 };
 use tidefs_placement_planner::{
     AllocationRequest, DeviceHealthCapacity, HashRingPlacementPlanner, PlacementDecision,
@@ -2410,10 +2409,11 @@ impl Pool {
             parity_shards: parity_shards as usize,
             shard_len,
         };
-        let encoded =
-            encode_erasure_stripe(&stripe_config, payload).ok_or(StoreError::InvalidOptions {
+        let encoded = encode_receipt_stripe(&stripe_config, payload).map_err(|_| {
+            StoreError::InvalidOptions {
                 reason: "erasure encoder rejected pool placement payload",
-            })?;
+            }
+        })?;
         receipt.shard_len = shard_len as u32;
 
         let mut written = Vec::with_capacity(receipt.targets.len());
@@ -2806,7 +2806,7 @@ impl Pool {
             });
         }
 
-        let Some(mut reconstructed) = reconstruct_erasure_stripe(&config, &available, None) else {
+        let Ok(mut reconstructed) = reconstruct_receipt_stripe(&config, &available) else {
             return Ok(None);
         };
         reconstructed.payload.truncate(receipt.payload_len as usize);
