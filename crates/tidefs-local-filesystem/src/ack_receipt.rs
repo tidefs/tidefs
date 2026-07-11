@@ -2135,6 +2135,61 @@ mod tests {
     }
 
     #[test]
+    fn requested_floor_receipt_fails_closed_for_duplicate_result_or_placement_evidence_ref() {
+        let mut duplicate_result = LocalAckReceipt::durable_intent(
+            2307,
+            LocalAckOperation::SyncWrite,
+            LocalAckReceiptTarget::range(46, 0, 4096),
+            Some(0x1236),
+        );
+        assert!(duplicate_result.satisfies_requested_ack_floor());
+
+        duplicate_result.receipt.evidence_refs = evidence_refs(&[
+            duplicate_result.local_intent_record_ref,
+            duplicate_result.refusal.evidence,
+            duplicate_result.flush_fence_ref,
+            duplicate_result.media_capability_ref,
+            duplicate_result.reserve_ref,
+            duplicate_result.dirty_window_ref,
+            duplicate_result.rollout_ref,
+            duplicate_result.tenant_isolation_ref,
+            duplicate_result.refusal.evidence,
+        ]);
+
+        assert!(duplicate_result.is_posix_durable_success());
+        assert!(!duplicate_result.has_exact_requested_ack_floor_evidence_cut(false));
+        assert!(!duplicate_result.has_requested_ack_floor_evidence());
+        assert!(!duplicate_result.satisfies_requested_ack_floor());
+
+        let mut duplicate_placement = LocalAckReceipt::full_local_placement(
+            2308,
+            LocalAckOperation::Syncfs,
+            LocalAckReceiptTarget::FILESYSTEM,
+            None,
+        );
+        duplicate_placement.requested_ack_floor = StorageIntentGuaranteeClass::FullPlacement;
+        assert!(duplicate_placement.satisfies_requested_ack_floor());
+
+        duplicate_placement.receipt.evidence_refs = evidence_refs(&[
+            duplicate_placement.local_intent_record_ref,
+            duplicate_placement.placement_ref,
+            duplicate_placement.flush_fence_ref,
+            duplicate_placement.media_capability_ref,
+            duplicate_placement.placement_ref,
+            duplicate_placement.reserve_ref,
+            duplicate_placement.dirty_window_ref,
+            duplicate_placement.rollout_ref,
+            duplicate_placement.tenant_isolation_ref,
+            duplicate_placement.refusal.evidence,
+        ]);
+
+        assert!(duplicate_placement.is_posix_durable_success());
+        assert!(!duplicate_placement.has_exact_requested_ack_floor_evidence_cut(true));
+        assert!(!duplicate_placement.has_requested_ack_floor_evidence());
+        assert!(!duplicate_placement.satisfies_requested_ack_floor());
+    }
+
+    #[test]
     fn requested_floor_receipt_fails_closed_for_non_none_refusal_reason() {
         let refusal_reason = StorageIntentRefusalReason::DurabilityOrRpoNotMet;
         let mut refused_success = LocalAckReceipt::full_local_placement(
