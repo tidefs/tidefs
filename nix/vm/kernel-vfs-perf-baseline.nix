@@ -53,7 +53,7 @@ Options:
   --help, -h           Show this message
 
 Exit codes:
-  0  Baseline measurements completed
+  0  Baseline measurements or parser self-test completed
   1  One or more failures
   2  Argument or environment error
 EOF

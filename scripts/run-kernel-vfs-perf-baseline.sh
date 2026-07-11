@@ -3,7 +3,7 @@
 # throughput latency baseline without requiring Nix flake integration.
 #
 # Usage:
-#   scripts/run-kernel-vfs-perf-baseline.sh [--keep-tmp] [--timeout SECONDS]
+#   scripts/run-kernel-vfs-perf-baseline.sh [--keep-tmp] [--timeout SECONDS] [--self-test-parser]
 #
 # Boots Linux 7.0 QEMU with kmod-posix-vfs, mounts a TideFS pool in
 # bootstrap mode, and measures sequential read/write throughput and
@@ -620,7 +620,7 @@ EOF
 
 usage() {
   cat <<EOF
-Usage: scripts/run-kernel-vfs-perf-baseline.sh [--keep-tmp] [--timeout SECONDS]
+Usage: scripts/run-kernel-vfs-perf-baseline.sh [--keep-tmp] [--timeout SECONDS] [--self-test-parser]
 
 Boot Linux 7.0 QEMU with kmod-posix-vfs, mount a TideFS pool in bootstrap
 mode, and measure sequential read/write throughput and stat latency.
@@ -634,7 +634,7 @@ Options:
   --help, -h         Show this message
 
 Exit codes:
-  0  Baseline measurements completed
+  0  Baseline measurements or parser self-test completed
   1  One or more failures
   2  Environment or dependency error
 EOF
