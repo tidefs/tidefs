@@ -69,15 +69,19 @@ mod tests {
 
     #[test]
     fn tmpfile_preserves_engine_generation() {
-        let mut attr = MockEngine::file_attr(42, 0);
-        attr.generation = Generation::new(2468);
-        let handle = fh(42, 3);
+        let inode_id = InodeId::new(42);
+        let generation = Generation::new(2468);
+        let mut attr = MockEngine::file_attr(inode_id.get(), 0);
+        attr.generation = generation;
+        let handle = fh(inode_id.get(), 3);
         let mut e = MockEngine::new();
         e.tmpfile_fn = Box::new(move |_, _, _, _| Ok((attr, handle)));
         let (attr, _state) = KmodPosixVfs::new(e)
             .tmpfile(InodeId::new(2), 0o644, 0, &MockEngine::test_ctx())
             .unwrap();
-        assert_eq!(attr.generation, Generation::new(2468));
+        assert_eq!(attr.generation, generation);
+        assert_ne!(attr.generation.as_vfs_generation(), attr.inode_id.get());
+        MockEngine::assert_exportfs_generation_round_trip(&attr);
     }
 
     #[test]

@@ -116,8 +116,10 @@ mod tests {
 
     #[test]
     fn mkdir_preserves_engine_generation() {
-        let mut attr = MockEngine::dir_attr(50);
-        attr.generation = Generation::new(4321);
+        let inode_id = InodeId::new(50);
+        let generation = Generation::new(4321);
+        let mut attr = MockEngine::dir_attr(inode_id.get());
+        attr.generation = generation;
         let mut e = MockEngine::new();
         e.mkdir_fn = Box::new(move |_, _, _, _| Ok(attr));
         let plan = KmodPosixVfs::new(e)
@@ -128,7 +130,12 @@ mod tests {
                 &MockEngine::test_ctx(),
             )
             .unwrap();
-        assert_eq!(plan.attr.generation, Generation::new(4321));
+        assert_eq!(plan.attr.generation, generation);
+        assert_ne!(
+            plan.attr.generation.as_vfs_generation(),
+            plan.attr.inode_id.get()
+        );
+        MockEngine::assert_exportfs_generation_round_trip(&plan.attr);
     }
 
     #[test]

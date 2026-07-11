@@ -293,6 +293,23 @@ impl MockEngine {
             dir_rev: 0,
         }
     }
+    pub fn assert_exportfs_generation_round_trip(attr: &InodeAttr) {
+        let ino = attr.inode_id.get();
+        let generation = attr.generation.as_vfs_generation();
+        let fh = [
+            (ino >> 32) as u32,
+            (ino & 0xffff_ffff) as u32,
+            (generation >> 32) as u32,
+            (generation & 0xffff_ffff) as u32,
+        ];
+
+        let decoded_ino = ((fh[0] as u64) << 32) | fh[1] as u64;
+        let decoded_generation = ((fh[2] as u64) << 32) | fh[3] as u64;
+
+        assert_eq!(decoded_ino, ino);
+        assert_eq!(decoded_generation, generation);
+        assert_ne!(decoded_generation, decoded_ino);
+    }
     pub fn test_ctx() -> RequestCtx {
         RequestCtx {
             uid: 1000,
