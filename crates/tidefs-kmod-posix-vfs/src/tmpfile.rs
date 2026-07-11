@@ -41,7 +41,7 @@ mod tests {
     use super::*;
     use crate::test_util::MockEngine;
     use crate::TideBox as Box;
-    use tidefs_kmod_bridge::kernel_types::{EngineFileHandle, FileHandleId};
+    use tidefs_kmod_bridge::kernel_types::{EngineFileHandle, FileHandleId, Generation};
 
     fn fh(ino: u64, id: u64) -> EngineFileHandle {
         EngineFileHandle {
@@ -65,6 +65,19 @@ mod tests {
             .unwrap();
         assert_eq!(attr.inode_id, InodeId::new(40));
         assert_eq!(state.inode, InodeId::new(40));
+    }
+
+    #[test]
+    fn tmpfile_preserves_engine_generation() {
+        let mut attr = MockEngine::file_attr(42, 0);
+        attr.generation = Generation::new(2468);
+        let handle = fh(42, 3);
+        let mut e = MockEngine::new();
+        e.tmpfile_fn = Box::new(move |_, _, _, _| Ok((attr, handle)));
+        let (attr, _state) = KmodPosixVfs::new(e)
+            .tmpfile(InodeId::new(2), 0o644, 0, &MockEngine::test_ctx())
+            .unwrap();
+        assert_eq!(attr.generation, Generation::new(2468));
     }
 
     #[test]

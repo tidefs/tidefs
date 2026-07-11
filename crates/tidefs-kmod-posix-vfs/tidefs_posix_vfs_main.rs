@@ -9903,8 +9903,14 @@ pub extern "C" fn tidefs_posix_vfs_engine_symlink(
     target_len: u32,
     out_ino: *mut u64,
     out_mode: *mut u32,
+    out_generation: *mut u64,
 ) -> core::ffi::c_int {
-    if name_ptr.is_null() || target_ptr.is_null() || out_ino.is_null() || out_mode.is_null() {
+    if name_ptr.is_null()
+        || target_ptr.is_null()
+        || out_ino.is_null()
+        || out_mode.is_null()
+        || out_generation.is_null()
+    {
         return -(crate::tidefs_kmod_bridge::kernel_types::Errno::EINVAL.0 as core::ffi::c_int);
     }
     if let Err(e) = validate_kernel_name_len(name_len) {
@@ -9931,6 +9937,7 @@ pub extern "C" fn tidefs_posix_vfs_engine_symlink(
         Ok(attr) => unsafe {
             *out_ino = attr.inode_id.get();
             *out_mode = attr.posix.mode;
+            *out_generation = attr.generation.0;
         },
         Err(e) => return -(e.0 as core::ffi::c_int),
     }
@@ -9946,8 +9953,13 @@ pub extern "C" fn tidefs_posix_vfs_engine_mknod(
     rdev: u32,
     out_ino: *mut u64,
     out_mode: *mut u32,
+    out_generation: *mut u64,
 ) -> core::ffi::c_int {
-    if name_ptr.is_null() || out_ino.is_null() || out_mode.is_null() {
+    if name_ptr.is_null()
+        || out_ino.is_null()
+        || out_mode.is_null()
+        || out_generation.is_null()
+    {
         return -(crate::tidefs_kmod_bridge::kernel_types::Errno::EINVAL.0 as core::ffi::c_int);
     }
     if let Err(e) = validate_kernel_name_len(name_len) {
@@ -9968,6 +9980,7 @@ pub extern "C" fn tidefs_posix_vfs_engine_mknod(
         Ok(attr) => unsafe {
             *out_ino = attr.inode_id.get();
             *out_mode = attr.posix.mode;
+            *out_generation = attr.generation.0;
         },
         Err(e) => return -(e.0 as core::ffi::c_int),
     }

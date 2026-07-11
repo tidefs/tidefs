@@ -199,6 +199,23 @@ mod tests {
     }
 
     #[test]
+    fn symlink_preserves_engine_generation() {
+        let mut attr = symlink_attr(91);
+        attr.generation = Generation::new(8642);
+        let mut e = MockEngine::new();
+        e.symlink_fn = Box::new(move |_, _, _, _| Ok(attr));
+        let plan = KmodPosixVfs::new(e)
+            .symlink(
+                InodeId::new(2),
+                b"generated",
+                b"target",
+                &MockEngine::test_ctx(),
+            )
+            .unwrap();
+        assert_eq!(plan.attr.generation, Generation::new(8642));
+    }
+
+    #[test]
     fn symlink_eexist_propagates() {
         let mut e = MockEngine::new();
         e.symlink_fn = Box::new(|_, _, _, _| Err(Errno::EEXIST));
