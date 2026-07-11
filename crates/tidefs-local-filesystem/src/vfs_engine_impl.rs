@@ -3970,10 +3970,13 @@ const SNAP_NET_AUTH_KEY_LEN: usize = 32;
 const SNAP_NET_PUSH_HEADER_LEN: usize = 4 + 1 + 4 + SNAP_NET_AUTH_KEY_LEN + 4;
 const SNAP_NET_RESPONSE_HEADER_LEN: usize = 4 + 1 + 4;
 
+fn snap_net_len_u32(field: &str, len: usize) -> Result<u32, String> {
+    u32::try_from(len)
+        .map_err(|_| format!("snapshot send: {field} is too large for VSNP frame: {len} bytes"))
+}
+
 fn snap_net_payload_len(payload_len: usize) -> Result<u32, String> {
-    u32::try_from(payload_len).map_err(|_| {
-        format!("snapshot send: export payload is too large for VSNP frame: {payload_len} bytes")
-    })
+    snap_net_len_u32("export payload", payload_len)
 }
 
 fn build_snap_push_message(
@@ -6819,7 +6822,9 @@ mod tests {
         let mut ack = Vec::new();
         ack.extend_from_slice(SNAP_NET_MAGIC);
         ack.push(SNAP_KIND_ACK);
-        ack.extend_from_slice(&(message.len() as u32).to_le_bytes());
+        let message_len = snap_net_len_u32("response message", message.len())
+            .expect("test response message fits VSNP frame");
+        ack.extend_from_slice(&message_len.to_le_bytes());
         ack.extend_from_slice(message);
         ack
     }
@@ -6877,7 +6882,9 @@ mod tests {
         let mut error = Vec::new();
         error.extend_from_slice(SNAP_NET_MAGIC);
         error.push(SNAP_KIND_ERROR);
-        error.extend_from_slice(&(message.len() as u32).to_le_bytes());
+        let message_len = snap_net_len_u32("response message", message.len())
+            .expect("test response message fits VSNP frame");
+        error.extend_from_slice(&message_len.to_le_bytes());
         error.extend_from_slice(message);
         error
     }
