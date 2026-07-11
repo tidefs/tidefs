@@ -4691,6 +4691,7 @@ static int tidefs_posix_vfs_set_acl(struct mnt_idmap *idmap,
 	unsigned int out_gid = 0;
 	unsigned long long out_size = 0;
 	unsigned long long out_blocks = 0;
+	struct timespec64 ctime;
 	bool mode_changed = false;
 	void *value = NULL;
 	size_t size = 0;
@@ -4755,15 +4756,19 @@ static int tidefs_posix_vfs_set_acl(struct mnt_idmap *idmap,
 
 sync_mode:
 	if (mode_changed) {
+		ctime = current_time(inode);
 		ret = tidefs_posix_vfs_engine_setattr(
 			inode->i_ino,
-			0x01,  /* FATTR_MODE */
+			0x01 | 0x80,  /* FATTR_MODE | FATTR_CTIME */
 			mode,
-			0, 0, 0, 0, 0, 0,
+			0, 0, 0, 0, 0,
+			tidefs_posix_vfs_timespec64_to_ns(ctime),
 			&out_mode, &out_uid, &out_gid, &out_size, &out_blocks);
 		if (ret)
 			goto out_release_acl;
 		inode->i_mode = out_mode;
+		inode_set_ctime_to_ts(inode, ctime);
+		mark_inode_dirty(inode);
 	}
 
 	forget_cached_acl(inode, type);
