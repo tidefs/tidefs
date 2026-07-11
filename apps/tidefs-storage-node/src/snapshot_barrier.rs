@@ -585,25 +585,27 @@ impl SnapshotCoordinator {
     /// Fan out the barrier request to all peers.
     ///
     /// Calls `send_fn(peer_id, request_bytes)` for every peer in the
-    /// expected set. Returns the number of successful sends. Failed
-    /// sends are logged but do not abort the round — the collector
-    /// will report them as missing on timeout.
+    /// expected set. Returns the number of successful sends. The first
+    /// send failure aborts the round so callers do not continue a
+    /// barrier that never reached an expected peer.
     pub fn fanout<E: std::fmt::Display>(
         &self,
         mut send_fn: impl FnMut(u64, Vec<u8>) -> Result<(), E>,
-    ) -> usize {
+    ) -> Result<usize, CoordinatorError> {
         let request_bytes = self.collector.encode_request();
         let mut sent = 0;
         for &peer_id in &self.collector.expected_peers {
             match send_fn(peer_id, request_bytes.clone()) {
                 Ok(()) => sent += 1,
-                Err(_e) => {
-                    // Send failed; the peer will be counted as missing
-                    // when the barrier times out or the outcome is evaluated.
+                Err(e) => {
+                    return Err(CoordinatorError::SendFailed {
+                        peer_id,
+                        reason: e.to_string(),
+                    });
                 }
             }
         }
-        sent
+        Ok(sent)
     }
 
     /// Record a peer's decoded barrier response.
@@ -1132,21 +1134,30 @@ mod tests {
             sent_to.push(peer_id);
             Ok::<(), &str>(())
         });
-        assert_eq!(count, 3);
+        assert_eq!(count, Ok(3));
         assert_eq!(sent_to, vec![10, 20, 30]);
     }
 
     #[test]
-    fn coordinator_fanout_counts_failures() {
-        let coord = SnapshotCoordinator::new(1, "snap".into(), vec![10, 20], make_config());
-        let count = coord.fanout(|peer_id, _bytes| {
+    fn coordinator_fanout_fails_closed_on_send_failure() {
+        let coord = SnapshotCoordinator::new(1, "snap".into(), vec![10, 20, 30], make_config());
+        let mut attempted = Vec::new();
+        let err = coord.fanout(|peer_id, _bytes| {
+            attempted.push(peer_id);
             if peer_id == 20 {
                 Err("send failed")
             } else {
                 Ok(())
             }
         });
-        assert_eq!(count, 1); // only peer 10 succeeded
+        assert_eq!(
+            err,
+            Err(CoordinatorError::SendFailed {
+                peer_id: 20,
+                reason: "send failed".into(),
+            })
+        );
+        assert_eq!(attempted, vec![10, 20]);
     }
 
     #[test]
