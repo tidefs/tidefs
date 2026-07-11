@@ -689,7 +689,7 @@ fn main() {
             }
         }
         Some("check-production-integrity" | "check-integrity-policy") => {
-            if let Err(err) = storage::check_production_integrity_policy_current_workspace() {
+            if let Err(err) = storage::check_production_integrity_current_workspace() {
                 eprintln!("{err}");
                 process::exit(1);
             }
@@ -1428,7 +1428,7 @@ fn main() {
                 "storage" => run_checks!(
                     storage::check_local_object_store_current_workspace(),
                     storage::check_local_object_store_on_disk_format_current_workspace(),
-                    storage::check_production_integrity_policy_current_workspace(),
+                    storage::check_production_integrity_current_workspace(),
                     storage::check_local_filesystem_current_workspace(),
                     storage::check_no_fsck_recovery_current_workspace(),
                     storage::check_no_production_fsck_failure_model_current_workspace(),
@@ -1642,7 +1642,7 @@ fn run_all_checks() {
     if let Err(e) = storage::check_local_object_store_on_disk_format_current_workspace() {
         errors.push(format!("storage/check-local-store-format: {e}"));
     }
-    if let Err(e) = storage::check_production_integrity_policy_current_workspace() {
+    if let Err(e) = storage::check_production_integrity_current_workspace() {
         errors.push(format!("storage/check-production-integrity: {e}"));
     }
     if let Err(e) = storage::check_local_filesystem_current_workspace() {

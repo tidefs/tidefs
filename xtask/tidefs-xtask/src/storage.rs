@@ -222,9 +222,9 @@ pub fn check_local_object_store_on_disk_format_current_workspace() -> Result<(),
     }
 }
 
-pub fn check_production_integrity_policy_current_workspace() -> Result<(), StorageCheckError> {
+pub fn check_production_integrity_current_workspace() -> Result<(), StorageCheckError> {
     let root = find_workspace_root().ok_or_else(|| StorageCheckError {
-        title: "production integrity policy source check",
+        title: "production integrity source check",
         missing: vec!["could not locate workspace root Cargo.toml".to_string()],
     })?;
     let mut missing = Vec::new();
@@ -321,11 +321,11 @@ pub fn check_production_integrity_policy_current_workspace() -> Result<(), Stora
         &mut missing,
     );
     if missing.is_empty() {
-        println!("production integrity policy ok: algorithms, domain separation, collision policy, authenticated roots, and v3 migration boundaries are implementation-tracked non-release");
+        println!("production integrity ok: algorithms, domain separation, collision policy, authenticated roots, and v3 migration boundaries are implementation-tracked non-release");
         Ok(())
     } else {
         Err(StorageCheckError {
-            title: "production integrity policy source check",
+            title: "production integrity source check",
             missing,
         })
     }
