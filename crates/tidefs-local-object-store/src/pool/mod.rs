@@ -2780,6 +2780,7 @@ impl Pool {
         };
         let width = config.stripe_width();
         let mut available = vec![None; width];
+        let mut seen_indices = vec![false; width];
 
         for target in &receipt.targets {
             let shard_index = target.shard_index as usize;
@@ -2788,6 +2789,12 @@ impl Pool {
                     reason: "invalid erasure placement receipt availability set",
                 });
             }
+            if seen_indices[shard_index] {
+                return Err(StoreError::InvalidOptions {
+                    reason: "invalid erasure placement receipt availability set",
+                });
+            }
+            seen_indices[shard_index] = true;
             let Some(idx) = self.resolve_receipt_target(target) else {
                 continue;
             };
@@ -6407,6 +6414,45 @@ mod tests {
             .map(|target| pool.resolve_receipt_target(target).unwrap())
             .collect();
         receipt.targets[0].shard_index = receipt.targets.len() as u16;
+        let err = pool
+            .write_placement_receipt(&indices, &receipt)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::InvalidOptions {
+                reason: "placement replay receipt does not match local locator authority"
+            }
+        ));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn erasure_policy_rejects_duplicate_receipt_shard() {
+        let root = temp_dir("erasure-receipt-duplicate-shard");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = multi_data_device_config(&root, 4);
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::erasure(2, 1),
+            ..PoolProperties::default()
+        };
+        let mut pool = Pool::create(config, properties, &test_options()).unwrap();
+        set_deterministic_device_guids(&mut pool);
+
+        let key = ObjectKey::from_name(b"erasure-receipt-duplicate-shard");
+        let payload = b"payload large enough to span both data shards";
+        pool.put(IoClass::Data, key, payload).unwrap();
+
+        let mut receipt = pool
+            .placement_receipt_for_key(IoClass::Data, key)
+            .unwrap()
+            .expect("erasure receipt must persist");
+        let indices: Vec<_> = receipt
+            .targets
+            .iter()
+            .map(|target| pool.resolve_receipt_target(target).unwrap())
+            .collect();
+        receipt.targets[1].shard_index = receipt.targets[0].shard_index;
         let err = pool
             .write_placement_receipt(&indices, &receipt)
             .unwrap_err();
