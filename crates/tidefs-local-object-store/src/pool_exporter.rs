@@ -466,7 +466,7 @@ impl ExportOrchestrator {
     /// Build source-backed lifecycle evidence for export execution/refusal.
     #[must_use]
     pub fn lifecycle_evidence(&self) -> PoolLifecycleEvidence {
-        let label_capacities = self
+        let labels = self
             .device_configs
             .iter()
             .enumerate()
@@ -474,33 +474,52 @@ impl ExportOrchestrator {
                 PoolExporter::read_existing_label(&config.path, self.pool_guid, index as u32)
                     .ok()
                     .filter(|label| label.device_capacity_bytes > 0)
-                    .map(|label| label.device_capacity_bytes)
             })
             .collect::<Option<Vec<_>>>();
-        let capacity_bytes = label_capacities
+        let capacity_bytes = labels
             .as_deref()
             .unwrap_or(&[])
             .iter()
-            .copied()
+            .map(|label| label.device_capacity_bytes)
             .sum();
+        let topology_generation = labels
+            .as_deref()
+            .and_then(|labels| labels.first().map(|label| label.topology_generation))
+            .filter(|generation| {
+                *generation > 0
+                    && labels.as_deref().is_some_and(|labels| {
+                        labels
+                            .iter()
+                            .all(|label| label.topology_generation == *generation)
+                    })
+            })
+            .unwrap_or(0);
         let context = PoolLifecycleContext {
             pool_guid: Some(self.pool_guid),
             pool_name: Some(self.pool_name.clone()),
             device_count: self.device_configs.len(),
             expected_device_count: self.device_guids.len(),
             capacity_bytes,
-            topology_generation: 0,
+            topology_generation,
             commit_group: self.final_commit_group,
         };
+        let topology_complete = context.topology_complete() && topology_generation > 0;
 
         if self.active_mounts > 0 && !self.forced {
-            let topology_complete = context.topology_complete();
             PoolLifecycleEvidence::refused_with_authority(
                 PoolLifecycleAction::Export,
                 context,
                 topology_complete,
                 false,
                 format!("{} active mount(s) still own the pool", self.active_mounts),
+            )
+        } else if !topology_complete {
+            PoolLifecycleEvidence::refused_with_authority(
+                PoolLifecycleAction::Export,
+                context,
+                false,
+                true,
+                "topology evidence incomplete",
             )
         } else {
             PoolLifecycleEvidence::executed(PoolLifecycleAction::Export, context)
@@ -794,7 +813,9 @@ mod tests {
         path: &Path,
         pool_guid: [u8; 16],
         device_guid: [u8; 16],
+        device_index: u32,
         capacity_bytes: u64,
+        topology_generation: u64,
     ) {
         let _ = std::fs::remove_dir_all(path);
         std::fs::create_dir_all(path).unwrap();
@@ -813,8 +834,8 @@ mod tests {
             pool_state: LabelPoolState::Active,
             commit_group: 10,
             label_commit_group: 10,
-            device_index: 0,
-            topology_generation: 1,
+            device_index,
+            topology_generation,
             device_count: 1,
             device_class: LabelDeviceClass::Hdd,
             device_capacity_bytes: capacity_bytes,
@@ -840,7 +861,7 @@ mod tests {
         let path = unique_export_path("evidence");
         let pool_guid = [0xAAu8; 16];
         let device_guid = [0x01u8; 16];
-        write_export_label(&path, pool_guid, device_guid, 1024 * 1024 * 1024);
+        write_export_label(&path, pool_guid, device_guid, 0, 1024 * 1024 * 1024, 1);
         let config = DeviceConfig {
             media_class: Default::default(),
             path: path.clone(),
@@ -1261,6 +1282,7 @@ mod tests {
         assert_eq!(evidence.device_count, 1);
         assert_eq!(evidence.expected_device_count, 1);
         assert_eq!(evidence.capacity_bytes, 1024 * 1024 * 1024);
+        assert_eq!(evidence.topology_generation, 1);
         assert!(evidence.topology_complete);
         assert!(evidence.owner_authorized);
         assert!(!evidence.is_fail_closed());
@@ -1304,7 +1326,7 @@ mod tests {
         let device_b = [0x02u8; 16];
         let path_a = unique_export_path("partial-label-a");
         let path_b = unique_export_path("partial-label-b");
-        write_export_label(&path_a, pool_guid, device_a, 1024 * 1024 * 1024);
+        write_export_label(&path_a, pool_guid, device_a, 0, 1024 * 1024 * 1024, 1);
         let _ = std::fs::remove_dir_all(&path_b);
         std::fs::create_dir_all(&path_b).unwrap();
         let config_a = DeviceConfig {
@@ -1340,6 +1362,53 @@ mod tests {
         assert_eq!(evidence.device_count, 2);
         assert_eq!(evidence.expected_device_count, 2);
         assert_eq!(evidence.capacity_bytes, 0);
+        assert!(!evidence.topology_complete);
+        assert!(evidence.owner_authorized);
+        assert!(evidence.is_fail_closed());
+        assert_eq!(evidence.reason, "topology evidence incomplete");
+    }
+
+    #[test]
+    fn orchestrator_refuses_export_lifecycle_evidence_with_mismatched_label_generations() {
+        let pool_guid = [0xAAu8; 16];
+        let device_a = [0x01u8; 16];
+        let device_b = [0x02u8; 16];
+        let path_a = unique_export_path("label-generation-a");
+        let path_b = unique_export_path("label-generation-b");
+        write_export_label(&path_a, pool_guid, device_a, 0, 1024 * 1024 * 1024, 1);
+        write_export_label(&path_b, pool_guid, device_b, 1, 1024 * 1024 * 1024, 2);
+        let config_a = DeviceConfig {
+            media_class: Default::default(),
+            path: path_a.clone(),
+            backing: DeviceBacking::DirectoryObjectStoreCompat,
+            class: DeviceClass::Data,
+            kind: DeviceKind::Single { path: path_a },
+            compression: None,
+            encryption: None,
+        };
+        let config_b = DeviceConfig {
+            media_class: Default::default(),
+            path: path_b.clone(),
+            backing: DeviceBacking::DirectoryObjectStoreCompat,
+            class: DeviceClass::Data,
+            kind: DeviceKind::Single { path: path_b },
+            compression: None,
+            encryption: None,
+        };
+        let orch = ExportOrchestrator::new(
+            pool_guid,
+            "generation-mismatch",
+            vec![config_a, config_b],
+            vec![device_a, device_b],
+            false,
+        );
+
+        let evidence = orch.lifecycle_evidence();
+
+        assert_eq!(evidence.action, PoolLifecycleAction::Export);
+        assert_eq!(evidence.outcome, PoolLifecycleOutcome::Refused);
+        assert_eq!(evidence.capacity_bytes, 2 * 1024 * 1024 * 1024);
+        assert_eq!(evidence.topology_generation, 0);
         assert!(!evidence.topology_complete);
         assert!(evidence.owner_authorized);
         assert!(evidence.is_fail_closed());
