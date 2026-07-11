@@ -334,6 +334,9 @@ fn validate_relative_artifact_path(path: &str, failures: &mut Vec<String>) {
     if path.ends_with('/') || path.ends_with('\\') {
         failures.push("artifact_path must name a file".to_string());
     }
+    if path.split(['/', '\\']).any(|component| component == ".") {
+        failures.push("artifact_path must not contain `.`".to_string());
+    }
 
     let path = Path::new(path);
     if path.is_absolute() {
@@ -598,6 +601,24 @@ mod tests {
                     .iter()
                     .any(|failure| failure == "artifact_path must name a file"),
                 "missing file-name failure for {path}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn artifact_path_rejects_current_directory_components() {
+        for path in [
+            "./validation/artifacts/model.json",
+            "validation/./artifacts/model.json",
+            "validation/artifacts/./model.json",
+        ] {
+            let err =
+                validate_artifact_path_shape(path).expect_err("current-directory path must fail");
+            assert!(
+                err.failures()
+                    .iter()
+                    .any(|failure| failure == "artifact_path must not contain `.`"),
+                "missing current-directory failure for {path}: {err:?}"
             );
         }
     }
