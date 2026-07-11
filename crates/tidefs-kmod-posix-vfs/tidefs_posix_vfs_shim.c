@@ -6520,15 +6520,25 @@ static void tidefs_posix_vfs_put_super(struct super_block *sb)
  * setattr bridge; bootstrap mounts acknowledge immediately.
  */
 static int tidefs_posix_vfs_write_inode(struct inode *inode,
-                                        struct writeback_control *wbc)
+					struct writeback_control *wbc)
 {
-        struct tidefs_posix_vfs_mount *ctx = inode->i_sb->s_fs_info;
+	struct tidefs_posix_vfs_mount *ctx = inode->i_sb->s_fs_info;
+	int ret;
 
-        if (ctx)
-                ctx->write_inode_calls++;
+	(void)wbc;
 
-        /* Explicit metadata persistence is handled by .setattr; acknowledge. */
-        return 0;
+	if (ctx)
+		ctx->write_inode_calls++;
+
+	if (!ctx || !ctx->engine_backed)
+		return 0;
+
+	ret = tidefs_posix_vfs_engine_persist_inode_times(
+		inode, 0x10 | 0x20 | 0x80);
+	if (ret < 0)
+		pr_debug("tidefs_posix_vfs: write_inode persist failed ino=%lu ret=%d\n",
+			 inode->i_ino, ret);
+	return ret;
 }
 
 /*
