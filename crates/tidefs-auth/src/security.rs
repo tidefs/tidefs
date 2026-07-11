@@ -18,6 +18,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
+use std::fmt;
 
 use crate::error::{AdminAccessDenied, RdmaBulkDenied, SecurityError};
 
@@ -155,12 +156,23 @@ pub mod tlv_tag {
 }
 
 /// A HELLO TLV extension carried in the security_tlvs field (§4.2).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HelloTlv {
     /// 16-bit tag identifying the TLV type.
     pub tag: u16,
     /// Variable-length value (length determined by enclosing wire format).
     pub value: Vec<u8>,
+}
+
+impl fmt::Debug for HelloTlv {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HelloTlv")
+            .field("tag", &self.tag)
+            .field("tag_name", &tlv_tag_name(self.tag))
+            .field("value_len", &self.value.len())
+            .field("value", &"<redacted>")
+            .finish()
+    }
 }
 
 impl HelloTlv {
@@ -204,6 +216,17 @@ impl HelloTlv {
     }
 }
 
+fn tlv_tag_name(tag: u16) -> &'static str {
+    match tag {
+        tlv_tag::TLV_AUTH_MODE => "TLV_AUTH_MODE",
+        tlv_tag::TLV_AUTH_MODE_ACK => "TLV_AUTH_MODE_ACK",
+        tlv_tag::TLV_PSK_PROOF => "TLV_PSK_PROOF",
+        tlv_tag::TLV_PSK_PROOF_ACK => "TLV_PSK_PROOF_ACK",
+        tlv_tag::TLV_ERROR => "TLV_ERROR",
+        _ => "unknown",
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 5. PSK HMAC Proof Mechanism
 // ---------------------------------------------------------------------------
@@ -213,9 +236,25 @@ impl HelloTlv {
 /// PSKs are populated from the secret-key-policy storage layer (P9-04).
 /// They are never logged, traced, or serialized in plaintext outside
 /// the sealed-envelope storage.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct PskStore {
     keys: HashMap<String, Vec<u8>>,
+}
+
+impl fmt::Debug for PskStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let key_lengths: BTreeMap<&str, usize> = self
+            .keys
+            .iter()
+            .map(|(identity, key)| (identity.as_str(), key.len()))
+            .collect();
+
+        f.debug_struct("PskStore")
+            .field("key_count", &self.keys.len())
+            .field("key_lengths", &key_lengths)
+            .field("keys", &"<redacted>")
+            .finish()
+    }
 }
 
 impl PskStore {
@@ -826,6 +865,43 @@ mod tests {
 
         // Client verifies ACK
         verify_psk_proof_ack(&server_tlv, &psk, &server_nonce, &client_nonce).unwrap();
+    }
+
+    #[test]
+    fn hello_tlv_debug_redacts_secret_value_bytes() {
+        let tlv = HelloTlv::new(
+            tlv_tag::TLV_PSK_PROOF,
+            vec![17, 34, 51, 68, 85, 102, 119, 136],
+        );
+        let debug = format!("{tlv:?}");
+
+        assert!(debug.contains("HelloTlv"));
+        assert!(debug.contains("TLV_PSK_PROOF"));
+        assert!(debug.contains("value_len: 8"));
+        assert!(debug.contains("<redacted>"));
+        assert!(
+            !debug.contains("17, 34, 51, 68"),
+            "HelloTlv Debug must redact value bytes: {debug}"
+        );
+    }
+
+    #[test]
+    fn psk_store_debug_redacts_secret_key_bytes() {
+        let mut store = PskStore::new();
+        store.insert(
+            "node-7".to_string(),
+            vec![17, 34, 51, 68, 85, 102, 119, 136],
+        );
+        let debug = format!("{store:?}");
+
+        assert!(debug.contains("PskStore"));
+        assert!(debug.contains("node-7"));
+        assert!(debug.contains("key_count: 1"));
+        assert!(debug.contains("<redacted>"));
+        assert!(
+            !debug.contains("17, 34, 51, 68"),
+            "PskStore Debug must redact PSK bytes: {debug}"
+        );
     }
 
     #[test]
