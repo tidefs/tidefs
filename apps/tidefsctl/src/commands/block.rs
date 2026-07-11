@@ -20,7 +20,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use clap::Subcommand;
-use tidefs_local_filesystem::RootAuthenticationKey;
+use tidefs_local_filesystem::{RootAuthenticationKey, ROOT_AUTHENTICATION_ENV_VAR};
 
 /// Subcommands for the `tidefsctl block` group.
 #[derive(Subcommand, Debug)]
@@ -437,8 +437,8 @@ use crate::commands::snapshot::{
     SnapNetMessage,
 };
 
-fn block_root_auth_key() -> RootAuthenticationKey {
-    RootAuthenticationKey::from_environment().unwrap_or_else(|_| RootAuthenticationKey::demo_key())
+fn block_root_auth_key(operation: &str) -> Result<RootAuthenticationKey, String> {
+    super::required_root_authentication_key(operation)
 }
 
 fn handle_block_send(
@@ -479,7 +479,7 @@ fn handle_block_send(
     // Read raw block data from the pool's block-volume storage.
     let block_data = read_pool_block_data(pool_path)?;
     let device_name = "block-volume";
-    let auth_key = block_root_auth_key();
+    let auth_key = block_root_auth_key("block send")?;
     let req = build_block_push_message(&block_data, device_name, &auth_key.as_bytes32());
 
     eprintln!(
@@ -540,7 +540,7 @@ fn handle_block_receive(
         ));
     }
 
-    let auth_key = block_root_auth_key();
+    let auth_key = block_root_auth_key("block receive")?;
     let req = build_block_pull_request("block-volume", &auth_key.as_bytes32());
 
     eprintln!("block receive: pulling from {source_addr}");
@@ -566,6 +566,30 @@ fn handle_block_receive(
         pool_path.display()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::with_root_auth_env;
+
+    #[test]
+    fn block_root_auth_key_rejects_missing_env() {
+        with_root_auth_env(None, || {
+            let err = block_root_auth_key("block send").unwrap_err();
+            assert!(err.contains(ROOT_AUTHENTICATION_ENV_VAR));
+            assert!(err.contains("missing"));
+        });
+    }
+
+    #[test]
+    fn block_root_auth_key_rejects_malformed_env() {
+        with_root_auth_env(Some("not-hex"), || {
+            let err = block_root_auth_key("block send").unwrap_err();
+            assert!(err.contains(ROOT_AUTHENTICATION_ENV_VAR));
+            assert!(err.contains("invalid"));
+        });
+    }
 }
 
 /// Read the raw block data from a TideFS pool's block-volume storage.
@@ -616,7 +640,7 @@ fn write_pool_block_data(pool_path: &Path, data: &[u8]) -> Result<(), String> {
 }
 
 #[cfg(test)]
-mod tests {
+mod block_path_tests {
     use super::*;
 
     #[test]

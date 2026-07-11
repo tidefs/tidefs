@@ -200,8 +200,7 @@ fn handle_mount(
     commands::refuse_runtime_pool_path("mount", "mount", &backing_dir);
 
     let encryption_config = if let Some(ref envelope_path) = encryption_envelope {
-        let root_auth_key = tidefs_local_filesystem::RootAuthenticationKey::from_environment()
-            .unwrap_or_else(|_| tidefs_local_filesystem::RootAuthenticationKey::demo_key());
+        let root_auth_key = commands::root_authentication_key_or_exit("mount");
         match tidefs_posix_filesystem_adapter_daemon::resolve_encryption_key_from_envelope(
             envelope_path,
             &root_auth_key,

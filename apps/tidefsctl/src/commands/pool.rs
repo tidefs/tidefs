@@ -27,7 +27,7 @@ use std::process;
 
 use clap::Parser;
 use tidefs_dataset_properties;
-use tidefs_local_filesystem::{LocalFileSystem, RecoveryPolicy, RootAuthenticationKey};
+use tidefs_local_filesystem::{LocalFileSystem, RecoveryPolicy};
 use tidefs_local_object_store::StoreOptions;
 
 #[derive(Parser, Debug)]
@@ -471,8 +471,7 @@ fn handle_pool_create(
     if encrypt_pool {
         if let Some(ref env_path) = encryption_envelope {
             use tidefs_local_object_store::encrypt::PoolEncryptionKey;
-            let root_auth_key = tidefs_local_filesystem::RootAuthenticationKey::from_environment()
-                .unwrap_or_else(|_| tidefs_local_filesystem::RootAuthenticationKey::demo_key());
+            let root_auth_key = super::root_authentication_key_or_exit("pool create");
             let pool_key =
                 PoolEncryptionKey::from_bytes(encryption_key.as_ref().unwrap().as_bytes())
                     .expect("StoreKey is always valid key length");
@@ -1682,8 +1681,7 @@ fn open_pool_property_filesystem_with_live_args(
 
     let metadata_dir = super::offline_pool::metadata_dir("pool", operation, &config.pool_uuid);
 
-    let root_auth_key = RootAuthenticationKey::from_environment()
-        .unwrap_or_else(|_| RootAuthenticationKey::demo_key());
+    let root_auth_key = super::root_authentication_key_or_exit(&format!("pool {operation}"));
     match LocalFileSystem::open_with_block_devices_and_recovery_policy(
         &metadata_dir,
         devs,

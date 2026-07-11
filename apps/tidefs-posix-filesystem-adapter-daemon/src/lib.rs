@@ -168,6 +168,66 @@ pub fn resolve_encryption_key_from_envelope(
     ))
 }
 
+fn required_root_authentication_key(
+    operation: &str,
+) -> Result<tidefs_local_filesystem::RootAuthenticationKey, String> {
+    tidefs_local_filesystem::RootAuthenticationKey::from_environment().map_err(|err| {
+        format!(
+            "{operation}: root authentication key is required: {err}; set {} to a 64-hex-character key",
+            tidefs_local_filesystem::ROOT_AUTHENTICATION_ENV_VAR
+        )
+    })
+}
+
+#[cfg(test)]
+mod root_authentication_tests {
+    use std::sync::{Mutex, OnceLock};
+
+    use super::*;
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn with_root_auth_env<T>(value: Option<&str>, run: impl FnOnce() -> T) -> T {
+        let _guard = env_lock().lock().unwrap();
+        let env_var = tidefs_local_filesystem::ROOT_AUTHENTICATION_ENV_VAR;
+        let previous = std::env::var_os(env_var);
+        match value {
+            Some(value) => std::env::set_var(env_var, value),
+            None => std::env::remove_var(env_var),
+        }
+
+        let result = run();
+
+        match previous {
+            Some(previous) => std::env::set_var(env_var, previous),
+            None => std::env::remove_var(env_var),
+        }
+
+        result
+    }
+
+    #[test]
+    fn required_root_authentication_key_rejects_missing_env() {
+        with_root_auth_env(None, || {
+            let err = required_root_authentication_key("tidefs adapter mount setup").unwrap_err();
+            assert!(err.contains(tidefs_local_filesystem::ROOT_AUTHENTICATION_ENV_VAR));
+            assert!(err.contains("missing"));
+        });
+    }
+
+    #[test]
+    fn required_root_authentication_key_rejects_malformed_env() {
+        with_root_auth_env(Some("not-hex"), || {
+            let err = required_root_authentication_key("tidefs adapter mount setup").unwrap_err();
+            assert!(err.contains(tidefs_local_filesystem::ROOT_AUTHENTICATION_ENV_VAR));
+            assert!(err.contains("invalid"));
+        });
+    }
+}
+
 /// Configuration for `run_mount`: boots a LocalFileSystem and mounts it via FUSE.
 #[derive(Debug, Clone)]
 pub struct MountConfig {
@@ -387,8 +447,7 @@ pub fn run_mount(config: MountConfig) -> Result<(), String> {
     fs::create_dir_all(&config.mountpoint)
         .map_err(|e| format!("create mountpoint {}: {e}", config.mountpoint.display()))?;
 
-    let root_auth_key = tidefs_local_filesystem::RootAuthenticationKey::from_environment()
-        .unwrap_or_else(|_| tidefs_local_filesystem::RootAuthenticationKey::demo_key());
+    let root_auth_key = required_root_authentication_key("tidefs adapter mount setup")?;
 
     if config.debug {
         if snapshot_export {
