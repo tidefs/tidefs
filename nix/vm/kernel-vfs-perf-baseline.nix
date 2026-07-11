@@ -955,14 +955,15 @@ INITSCRIPT
     echo "PASS: $PASS_COUNT  FAIL: $FAIL_COUNT  BLOCKED: $BLOCKED_COUNT  SKIP: $SKIP_COUNT"
     echo "QEMU success: $QEMU_SUCCESS  Required metrics: $REQUIRED_METRICS_PRESENT  Verdict: $VERDICT_STATUS ($VERDICT_REASON)"
 
-    OUTPUT_DIR="/root/ai/tmp/tidefs-validation/kernel-vfs-perf-baseline/$(date -u +%Y-%m-%dT%H%M%SZ)"
+    RUN_ID="$(date -u +%Y-%m-%dT%H%M%SZ)"
+    OUTPUT_DIR="/root/ai/tmp/tidefs-validation/kernel-vfs-perf-baseline/$RUN_ID"
     mkdir -p "$OUTPUT_DIR"
     cp "$RUN_DIR/qemu.log" "$OUTPUT_DIR/qemu.log"
 
     cat > "$OUTPUT_DIR/validation-manifest.json" << MANIFEST
 {
   "test": "kernel-vfs-perf-baseline",
-  "date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "date": "$RUN_ID",
   "mode": "bootstrap",
   "validation_tier": "Tier 5 mounted Linux 7.0 kernel VFS",
   "qemu_accel": "$QEMU_ACCEL",
