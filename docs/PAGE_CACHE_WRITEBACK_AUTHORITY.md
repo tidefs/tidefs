@@ -87,9 +87,11 @@ Documentation reviewed:
   several mechanisms.
 - `docs/PAGE_CACHE_INVALIDATION_AUTHORITY.md` decides the invalidation trigger
   surface, stale-generation rule, and FUSE/kernel/cluster lease model.
-- `docs/PAGE_CACHE_WRITEBACK_MMAP_INTEGRATION_P5-03.md` and the
-  `page_cache_writeback_mmap_acceptance_cases()` source binding are historical
-  or source-model inputs. They do not claim live mounted mmap/writeback closure.
+- The `page_cache_writeback_mmap_acceptance_cases()` source binding is a
+  source-model input. Current mmap/writeback status lives in this authority
+  document, `docs/PAGE_CACHE_INVALIDATION_AUTHORITY.md`,
+  `validation/claims.toml`, and live GitHub issues; this does not claim live
+  mounted mmap/writeback closure.
 - `validation/claims.toml` and `docs/CLAIM_REGISTRY.md` keep
   `local.vfs.page_cache_writeback_authority.v1` blocked pending mounted
   writeback, mmap coherency, no-hidden-queue, and broader durability evidence.
