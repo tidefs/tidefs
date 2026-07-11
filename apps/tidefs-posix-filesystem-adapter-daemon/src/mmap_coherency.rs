@@ -203,6 +203,15 @@ impl InvalidationSink for MmapInvalidationSink<'_> {
             .fetch_add(1, Ordering::Relaxed);
         let ino_u64 = ino.0;
 
+        let is_actionable = {
+            let regs = self.registrations.lock().unwrap();
+            regs.get(&ino_u64)
+                .is_some_and(|entry| entry.active && generation > entry.generation)
+        };
+        if !is_actionable {
+            return;
+        }
+
         // Dirty/writeback guard: consult the optional dirty_check callback.
         // When the inode has dirty or writeback-pending bytes, skip the
         // invalidation to preserve dirty/writeback pages per the authority
@@ -214,9 +223,16 @@ impl InvalidationSink for MmapInvalidationSink<'_> {
             .as_ref()
             .is_some_and(|check| check(ino_u64));
         if is_dirty {
-            self.stats
-                .dirty_invalidations_preserved
-                .fetch_add(1, Ordering::Relaxed);
+            let is_still_actionable = {
+                let regs = self.registrations.lock().unwrap();
+                regs.get(&ino_u64)
+                    .is_some_and(|entry| entry.active && generation > entry.generation)
+            };
+            if is_still_actionable {
+                self.stats
+                    .dirty_invalidations_preserved
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             return;
         }
 
@@ -317,6 +333,72 @@ mod tests {
         let registration = regs.get(&42).expect("registered inode remains tracked");
         assert!(registration.active);
         assert_eq!(registration.generation, 1);
+    }
+
+    #[test]
+    fn dirty_check_ignores_lower_generation_invalidation() {
+        let c = new_coherency();
+        let calls = Arc::new(AtomicU64::new(0));
+        let check_calls = Arc::clone(&calls);
+        c.register(42, 5);
+        c.set_dirty_check(Some(Box::new(move |ino| {
+            check_calls.fetch_add(1, Ordering::Relaxed);
+            ino == 42
+        })));
+
+        c.enqueue_batch(batch(42, 3));
+        assert_eq!(c.process_tick(10), 1);
+
+        let s = c.stats.snapshot();
+        assert_eq!(s.invalidations_received, 1);
+        assert_eq!(s.dirty_invalidations_preserved, 0);
+        assert_eq!(s.coherency_conflicts, 0);
+        assert_eq!(s.pages_invalidated, 0);
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn dirty_check_ignores_unregistered_inode_invalidation() {
+        let c = new_coherency();
+        let calls = Arc::new(AtomicU64::new(0));
+        let check_calls = Arc::clone(&calls);
+        c.set_dirty_check(Some(Box::new(move |ino| {
+            check_calls.fetch_add(1, Ordering::Relaxed);
+            ino == 99
+        })));
+
+        c.enqueue_batch(batch(99, 1));
+        assert_eq!(c.process_tick(10), 1);
+
+        let s = c.stats.snapshot();
+        assert_eq!(s.invalidations_received, 1);
+        assert_eq!(s.dirty_invalidations_preserved, 0);
+        assert_eq!(s.coherency_conflicts, 0);
+        assert_eq!(s.pages_invalidated, 0);
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn dirty_check_ignores_deregistered_inode_invalidation() {
+        let c = new_coherency();
+        let calls = Arc::new(AtomicU64::new(0));
+        let check_calls = Arc::clone(&calls);
+        c.register(42, 1);
+        c.deregister(42);
+        c.set_dirty_check(Some(Box::new(move |ino| {
+            check_calls.fetch_add(1, Ordering::Relaxed);
+            ino == 42
+        })));
+
+        c.enqueue_batch(batch(42, 2));
+        assert_eq!(c.process_tick(10), 1);
+
+        let s = c.stats.snapshot();
+        assert_eq!(s.invalidations_received, 1);
+        assert_eq!(s.dirty_invalidations_preserved, 0);
+        assert_eq!(s.coherency_conflicts, 0);
+        assert_eq!(s.pages_invalidated, 0);
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
     }
 
     #[test]
