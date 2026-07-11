@@ -503,7 +503,7 @@ impl ExportOrchestrator {
             topology_generation,
             commit_group: self.final_commit_group,
         };
-        let topology_complete = context.topology_complete() && topology_generation > 0;
+        let topology_complete = context.topology_complete();
 
         if self.active_mounts > 0 && !self.forced {
             PoolLifecycleEvidence::refused_with_authority(

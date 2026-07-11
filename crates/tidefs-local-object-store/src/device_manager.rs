@@ -141,6 +141,8 @@ impl DeviceManager {
             commit_group,
         };
 
+        let topology_complete = context.topology_complete();
+
         match action {
             PoolLifecycleAction::AddDevice
             | PoolLifecycleAction::RemoveDevice
@@ -150,7 +152,7 @@ impl DeviceManager {
             _ => PoolLifecycleEvidence::refused_with_authority(
                 PoolLifecycleAction::FailClosed,
                 context,
-                device_count == expected_device_count && capacity_bytes > 0,
+                topology_complete,
                 true,
                 "unsupported device topology lifecycle action",
             ),
@@ -872,6 +874,28 @@ mod tests {
         assert!(evidence.owner_authorized);
         assert!(evidence.is_fail_closed());
         assert!(evidence.reason.contains("unsupported"));
+    }
+
+    #[test]
+    fn topology_lifecycle_evidence_refuses_zero_generation_topology() {
+        let evidence = DeviceManager::topology_lifecycle_evidence(
+            PoolLifecycleAction::AddDevice,
+            [0x58; 16],
+            "topology",
+            3,
+            3,
+            3 * 1024 * 1024 * 1024,
+            0,
+            8,
+        );
+
+        assert_eq!(evidence.action, PoolLifecycleAction::AddDevice);
+        assert_eq!(evidence.outcome, PoolLifecycleOutcome::Refused);
+        assert_eq!(evidence.topology_generation, 0);
+        assert!(!evidence.topology_complete);
+        assert!(evidence.owner_authorized);
+        assert!(evidence.is_fail_closed());
+        assert_eq!(evidence.reason, "topology evidence incomplete");
     }
 
     fn temp_dir(label: &str) -> PathBuf {

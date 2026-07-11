@@ -82,6 +82,7 @@ impl PoolLifecycleContext {
         self.expected_device_count > 0
             && self.device_count == self.expected_device_count
             && self.capacity_bytes > 0
+            && self.topology_generation > 0
     }
 }
 
@@ -286,6 +287,25 @@ mod tests {
         assert_eq!(evidence.device_count, 2);
         assert_eq!(evidence.expected_device_count, 2);
         assert_eq!(evidence.capacity_bytes, 0);
+        assert!(!evidence.topology_complete);
+        assert!(evidence.owner_authorized);
+        assert!(evidence.is_fail_closed());
+        assert_eq!(evidence.reason, "topology evidence incomplete");
+    }
+
+    #[test]
+    fn executed_evidence_refuses_topology_without_generation() {
+        let mut missing_generation = context();
+        missing_generation.topology_generation = 0;
+
+        let evidence =
+            PoolLifecycleEvidence::executed(PoolLifecycleAction::Import, missing_generation);
+
+        assert_eq!(evidence.outcome, PoolLifecycleOutcome::Refused);
+        assert_eq!(evidence.device_count, 2);
+        assert_eq!(evidence.expected_device_count, 2);
+        assert_eq!(evidence.capacity_bytes, 4096);
+        assert_eq!(evidence.topology_generation, 0);
         assert!(!evidence.topology_complete);
         assert!(evidence.owner_authorized);
         assert!(evidence.is_fail_closed());
