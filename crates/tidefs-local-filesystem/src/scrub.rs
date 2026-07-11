@@ -244,6 +244,7 @@ where
                     placement_evidence: placement_evidence_for_content_key(
                         pool,
                         object_key,
+                        inode_id.get(),
                         expected_receipt_generation_for_target(target),
                     ),
                     raw_media_diagnostic: ScrubRawMediaDiagnostic {
@@ -417,7 +418,12 @@ fn manifest_error_scrubbed_block(
                 observed_plaintext_len: None,
             },
             checksum_layer: None,
-            placement_evidence: placement_evidence_for_content_key(pool, Some(key), None),
+            placement_evidence: placement_evidence_for_content_key(
+                pool,
+                Some(key),
+                inode_id.get(),
+                None,
+            ),
             raw_media_diagnostic: ScrubRawMediaDiagnostic {
                 object_key_hex: Some(key.short_hex()),
                 reason: Some(reason),
@@ -437,6 +443,7 @@ fn nonzero_receipt_generation(generation: u64) -> Option<u64> {
 fn placement_evidence_for_content_key(
     pool: Option<&Pool>,
     key: Option<ObjectKey>,
+    subject_id: u64,
     expected_generation: Option<u64>,
 ) -> MountedContentPlacementEvidence {
     let Some(key) = key else {
@@ -456,8 +463,14 @@ fn placement_evidence_for_content_key(
     match pool.placement_receipt_for_key(DeviceIoClass::Data, key) {
         Ok(Some(receipt)) => match expected_generation {
             Some(expected_generation) if receipt.generation == expected_generation => {
-                MountedContentPlacementEvidence::ReceiptVerified {
-                    generation: expected_generation,
+                match receipt.shared_receipt_ref_for_subject(subject_id) {
+                    Ok(placement_receipt_ref) => MountedContentPlacementEvidence::ReceiptVerified {
+                        generation: expected_generation,
+                        placement_receipt_ref,
+                    },
+                    Err(_) => MountedContentPlacementEvidence::ReceiptUnavailable {
+                        expected_generation: Some(expected_generation),
+                    },
                 }
             }
             Some(expected_generation) => MountedContentPlacementEvidence::ReceiptStale {

@@ -19,6 +19,7 @@ use tidefs_scrub::scrub_repair::ScrubRepairLedger;
 use std::collections::BTreeMap;
 
 use tidefs_local_object_store::SuspectEntry;
+use tidefs_replication_model::PlacementReceiptRef;
 use tidefs_scrub::repair_scheduling::{
     RebakeSchedulingBridge, RepairAdmissionInput, RepairBlockKind, RepairCandidateIdentity,
     RepairMountedChecksumEvidence, RepairMountedReceiptEvidenceStatus, RepairMountedScrubEvidence,
@@ -214,14 +215,17 @@ fn convert_violations_to_repair_inputs(report: &ScrubReport) -> Vec<RepairAdmiss
                 commit_group: 0,
                 timestamp_secs: timestamp,
             };
-            let mut input = RepairAdmissionInput::missing_receipt_with_identity(
-                entry,
-                repair_identity_from_scrub_block_id(&v.block_id),
-            );
-            if let Some(evidence) = report
-                .block_evidence
-                .get(&v.block_id)
-                .map(repair_mounted_scrub_evidence_from_scrub_evidence)
+            let identity = repair_identity_from_scrub_block_id(&v.block_id);
+            let scrub_evidence = report.block_evidence.get(&v.block_id);
+            let mut input = if let Some(receipt) = scrub_evidence.and_then(|evidence| {
+                placement_receipt_ref_from_mounted_scrub_evidence(&entry, evidence)
+            }) {
+                RepairAdmissionInput::with_receipt_and_identity(entry, receipt, identity)
+            } else {
+                RepairAdmissionInput::missing_receipt_with_identity(entry, identity)
+            };
+            if let Some(evidence) =
+                scrub_evidence.map(repair_mounted_scrub_evidence_from_scrub_evidence)
             {
                 input = input.with_mounted_scrub_evidence(evidence);
             }
@@ -255,6 +259,35 @@ fn checksum_layer_for_repair_kind(kind: RepairBlockKind) -> ChecksumLayer {
         }
         RepairBlockKind::ContentChunk { .. } => ChecksumLayer::EncodedContentChunk,
     }
+}
+
+fn placement_receipt_ref_from_mounted_scrub_evidence(
+    entry: &SuspectEntry,
+    evidence: &ScrubBlockEvidence,
+) -> Option<PlacementReceiptRef> {
+    let subject = repair_identity_from_scrub_block_id(&evidence.plaintext_identity.block_id);
+    if !subject.matches_suspect_entry(entry) {
+        return None;
+    }
+
+    let MountedContentPlacementEvidence::ReceiptVerified {
+        placement_receipt_ref,
+        ..
+    } = &evidence.placement_evidence
+    else {
+        return None;
+    };
+
+    if placement_receipt_ref.object_id != entry.locator_id
+        || placement_receipt_ref.payload_len != evidence.plaintext_identity.expected_plaintext_len
+        || placement_receipt_ref.payload_digest != entry.expected_hash
+        || placement_receipt_ref.target_count <= 1
+        || !placement_receipt_ref.is_committed_authority()
+    {
+        return None;
+    }
+
+    Some(*placement_receipt_ref)
 }
 
 fn repair_mounted_scrub_evidence_from_scrub_evidence(
@@ -308,7 +341,7 @@ fn repair_receipt_status_from_mounted(
         MountedContentPlacementEvidence::SparseHole => {
             RepairMountedReceiptEvidenceStatus::SparseHole
         }
-        MountedContentPlacementEvidence::ReceiptVerified { generation } => {
+        MountedContentPlacementEvidence::ReceiptVerified { generation, .. } => {
             RepairMountedReceiptEvidenceStatus::ReceiptVerified {
                 generation: *generation,
             }
@@ -713,7 +746,6 @@ mod tests {
         ScrubRawMediaDiagnostic, ScrubReport, ScrubViolation,
     };
     use tidefs_local_object_store::IntegrityDigest64;
-    use tidefs_replication_model::PlacementReceiptRef;
     use tidefs_scrub::repair_scheduling::{RepairBlockKind, RepairCandidateIdentity};
     use tidefs_scrub::{
         ChecksumLayer, ComparisonClassification, CrossReplicaComparisonRecord, ScrubSubject,
@@ -1224,11 +1256,49 @@ mod tests {
         hash
     }
 
+    fn placement_receipt_ref_for_evidence(
+        block_id: &ScrubBlockId,
+        expected: IntegrityDigest64,
+        generation: u64,
+        copies: u8,
+    ) -> PlacementReceiptRef {
+        let mut object_key = [0u8; 32];
+        object_key[..8].copy_from_slice(&block_id.inode_id.to_le_bytes());
+        PlacementReceiptRef::replicated(
+            block_id.inode_id,
+            object_key,
+            Default::default(),
+            generation,
+            copies,
+            4096,
+            digest64_bytes(expected),
+        )
+    }
+
     fn mounted_scrub_block_evidence(
         block_id: ScrubBlockId,
         expected: IntegrityDigest64,
         actual: IntegrityDigest64,
         receipt_generation: u64,
+    ) -> ScrubBlockEvidence {
+        let placement_receipt_ref =
+            placement_receipt_ref_for_evidence(&block_id, expected, receipt_generation, 2);
+        mounted_scrub_block_evidence_with_placement(
+            block_id,
+            expected,
+            actual,
+            MountedContentPlacementEvidence::ReceiptVerified {
+                generation: receipt_generation,
+                placement_receipt_ref,
+            },
+        )
+    }
+
+    fn mounted_scrub_block_evidence_with_placement(
+        block_id: ScrubBlockId,
+        expected: IntegrityDigest64,
+        actual: IntegrityDigest64,
+        placement_evidence: MountedContentPlacementEvidence,
     ) -> ScrubBlockEvidence {
         let checksum_layer = match block_id.kind {
             ScrubBlockKind::InlineContent | ScrubBlockKind::ContentManifest => {
@@ -1248,9 +1318,7 @@ mod tests {
                 actual,
                 encoded_len: 4096,
             }),
-            placement_evidence: MountedContentPlacementEvidence::ReceiptVerified {
-                generation: receipt_generation,
-            },
+            placement_evidence,
             raw_media_diagnostic: ScrubRawMediaDiagnostic {
                 object_key_hex: Some("test-object".to_string()),
                 reason: None,
@@ -1309,6 +1377,11 @@ mod tests {
         let inputs = convert_violations_to_repair_inputs(&report);
 
         assert_eq!(inputs.len(), 1);
+        let receipt = inputs[0].placement_receipt_ref.expect("placement receipt");
+        assert_eq!(receipt.object_id, 101);
+        assert_eq!(receipt.receipt_generation, 9);
+        assert_eq!(receipt.payload_digest, digest64_bytes(expected));
+        assert_eq!(receipt.target_count, 2);
         let evidence = inputs[0]
             .mounted_scrub_evidence
             .expect("mounted scrub evidence");
@@ -1322,6 +1395,287 @@ mod tests {
             evidence.receipt_status,
             RepairMountedReceiptEvidenceStatus::ReceiptVerified { generation: 9 }
         );
+    }
+
+    #[test]
+    fn convert_non_verified_mounted_receipt_evidence_remains_receiptless() {
+        let states = [
+            MountedContentPlacementEvidence::SparseHole,
+            MountedContentPlacementEvidence::ReceiptObservedButUnbound { generation: 7 },
+            MountedContentPlacementEvidence::ReceiptMissing {
+                expected_generation: Some(8),
+            },
+            MountedContentPlacementEvidence::ReceiptStale {
+                expected_generation: 9,
+                observed_generation: 6,
+            },
+            MountedContentPlacementEvidence::ReceiptUnavailable {
+                expected_generation: None,
+            },
+        ];
+
+        for (i, placement_evidence) in states.into_iter().enumerate() {
+            let mut report = ScrubReport::empty();
+            let block_id = ScrubBlockId {
+                inode_id: 120 + i as u64,
+                data_version: 4,
+                kind: ScrubBlockKind::InlineContent,
+            };
+            let expected = IntegrityDigest64(0xABCD + i as u64);
+            let actual = IntegrityDigest64(0x1234 + i as u64);
+            report.block_evidence.insert(
+                block_id.clone(),
+                mounted_scrub_block_evidence_with_placement(
+                    block_id.clone(),
+                    expected,
+                    actual,
+                    placement_evidence.clone(),
+                ),
+            );
+            report.violations.push(ScrubViolation {
+                block_id,
+                key_hex: "78".into(),
+                outcome: ScrubBlockOutcome::Corrupt { expected, actual },
+            });
+
+            let inputs = convert_violations_to_repair_inputs(&report);
+
+            assert_eq!(inputs.len(), 1);
+            assert_eq!(inputs[0].placement_receipt_ref, None);
+            assert_eq!(
+                inputs[0]
+                    .mounted_scrub_evidence
+                    .expect("mounted evidence")
+                    .receipt_status,
+                repair_receipt_status_from_mounted(&placement_evidence)
+            );
+        }
+    }
+
+    #[test]
+    fn convert_single_copy_mounted_receipt_evidence_remains_receiptless() {
+        let mut report = ScrubReport::empty();
+        let block_id = ScrubBlockId {
+            inode_id: 140,
+            data_version: 5,
+            kind: ScrubBlockKind::InlineContent,
+        };
+        let expected = IntegrityDigest64(0xC0FFEE);
+        let actual = IntegrityDigest64(0xBAD);
+        let placement_evidence = MountedContentPlacementEvidence::ReceiptVerified {
+            generation: 12,
+            placement_receipt_ref: placement_receipt_ref_for_evidence(&block_id, expected, 12, 1),
+        };
+        report.block_evidence.insert(
+            block_id.clone(),
+            mounted_scrub_block_evidence_with_placement(
+                block_id.clone(),
+                expected,
+                actual,
+                placement_evidence,
+            ),
+        );
+        report.violations.push(ScrubViolation {
+            block_id,
+            key_hex: "8c".into(),
+            outcome: ScrubBlockOutcome::Corrupt { expected, actual },
+        });
+
+        let inputs = convert_violations_to_repair_inputs(&report);
+
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].placement_receipt_ref, None);
+        assert_eq!(
+            inputs[0]
+                .mounted_scrub_evidence
+                .expect("mounted evidence")
+                .receipt_status,
+            RepairMountedReceiptEvidenceStatus::ReceiptVerified { generation: 12 }
+        );
+    }
+
+    #[test]
+    fn convert_mounted_receipt_ref_mismatches_remain_receiptless() {
+        let block_id = ScrubBlockId {
+            inode_id: 141,
+            data_version: 5,
+            kind: ScrubBlockKind::InlineContent,
+        };
+        let expected = IntegrityDigest64(0xC0FFEE);
+        let actual = IntegrityDigest64(0xBAD);
+        let base_receipt = placement_receipt_ref_for_evidence(&block_id, expected, 14, 2);
+        let mut object_id_mismatch = base_receipt;
+        object_id_mismatch.object_id += 1;
+        let mut payload_len_mismatch = base_receipt;
+        payload_len_mismatch.payload_len += 1;
+        let mut payload_digest_mismatch = base_receipt;
+        payload_digest_mismatch.payload_digest[0] ^= 0xFF;
+        let mut synthetic_generation = base_receipt;
+        synthetic_generation.receipt_generation = 0;
+        let mut policy_width_mismatch = base_receipt;
+        policy_width_mismatch.target_count += 1;
+        let cases = [
+            object_id_mismatch,
+            payload_len_mismatch,
+            payload_digest_mismatch,
+            synthetic_generation,
+            policy_width_mismatch,
+        ];
+
+        for (i, placement_receipt_ref) in cases.into_iter().enumerate() {
+            let mut report = ScrubReport::empty();
+            report.block_evidence.insert(
+                block_id.clone(),
+                mounted_scrub_block_evidence_with_placement(
+                    block_id.clone(),
+                    expected,
+                    actual,
+                    MountedContentPlacementEvidence::ReceiptVerified {
+                        generation: placement_receipt_ref.receipt_generation,
+                        placement_receipt_ref,
+                    },
+                ),
+            );
+            report.violations.push(ScrubViolation {
+                block_id: block_id.clone(),
+                key_hex: format!("8c-{i}"),
+                outcome: ScrubBlockOutcome::Corrupt { expected, actual },
+            });
+
+            let inputs = convert_violations_to_repair_inputs(&report);
+
+            assert_eq!(inputs.len(), 1);
+            assert_eq!(inputs[0].placement_receipt_ref, None);
+            assert_eq!(
+                inputs[0]
+                    .mounted_scrub_evidence
+                    .as_ref()
+                    .expect("mounted evidence")
+                    .receipt_status,
+                RepairMountedReceiptEvidenceStatus::ReceiptVerified {
+                    generation: placement_receipt_ref.receipt_generation
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn convert_mismatched_mounted_subject_receipt_remains_receiptless() {
+        let mut report = ScrubReport::empty();
+        let violation_block_id = ScrubBlockId {
+            inode_id: 142,
+            data_version: 5,
+            kind: ScrubBlockKind::ContentChunk { chunk_index: 7 },
+        };
+        let evidence_block_id = ScrubBlockId {
+            inode_id: 142,
+            data_version: 5,
+            kind: ScrubBlockKind::ContentChunk { chunk_index: 8 },
+        };
+        let expected = IntegrityDigest64(0xC0FFEE);
+        let actual = IntegrityDigest64(0xBAD);
+
+        report.block_evidence.insert(
+            violation_block_id.clone(),
+            mounted_scrub_block_evidence(evidence_block_id, expected, actual, 13),
+        );
+        report.violations.push(ScrubViolation {
+            block_id: violation_block_id,
+            key_hex: "8d".into(),
+            outcome: ScrubBlockOutcome::Corrupt { expected, actual },
+        });
+
+        let inputs = convert_violations_to_repair_inputs(&report);
+
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].placement_receipt_ref, None);
+        assert_eq!(
+            inputs[0]
+                .mounted_scrub_evidence
+                .as_ref()
+                .expect("mounted evidence")
+                .receipt_status,
+            RepairMountedReceiptEvidenceStatus::ReceiptVerified { generation: 13 }
+        );
+    }
+
+    #[test]
+    fn report_backed_mounted_receipt_queues_and_dispatches_repair() {
+        let inode_id = 512;
+        let data_version = 1;
+        let block_id = ScrubBlockId {
+            inode_id,
+            data_version,
+            kind: ScrubBlockKind::InlineContent,
+        };
+        let expected = IntegrityDigest64(0xAA);
+        let actual = IntegrityDigest64(0xBB);
+        let mut report = ScrubReport::empty();
+        report.block_evidence.insert(
+            block_id.clone(),
+            mounted_scrub_block_evidence(block_id.clone(), expected, actual, 1),
+        );
+        report.violations.push(ScrubViolation {
+            block_id,
+            key_hex: "200".into(),
+            outcome: ScrubBlockOutcome::Corrupt { expected, actual },
+        });
+
+        let mut inputs = convert_violations_to_repair_inputs(&report);
+        assert_eq!(inputs.len(), 1);
+        let source_receipt = inputs[0].placement_receipt_ref.expect("source receipt");
+        let comparison =
+            comparison_record_for_entry(&inputs[0].entry, RepairBlockKind::InlineContent);
+        inputs[0] = inputs[0].with_cross_replica_comparison(&comparison);
+
+        let mut state = crate::recovery::initial_state();
+        insert_inode(&mut state, make_file_inode(inode_id, data_version, 4096));
+        let mut store = temp_store();
+        let key = crate::object_keys::content_object_key_for_version(
+            InodeId::new(inode_id),
+            data_version,
+        );
+        let (raw, payload) = encoded_reconstructable_object();
+        store.put(key, &raw).expect("store corrupt EC object");
+
+        let mut bridge = ScrubToRepairBridge::new();
+        let admissions = bridge.ingest_with_evidence(&inputs, 1);
+        assert_eq!(admissions.len(), 1);
+        assert_eq!(bridge.pending_count(), 1);
+
+        let applied =
+            dispatch_repair_from_bridge(&mut bridge, &mut state, &mut store, &mut BTreeMap::new());
+
+        assert_eq!(applied.len(), 1);
+        let crate::repair::RepairOutcome::Reconstructed {
+            ref replacement_receipt,
+            ..
+        } = applied.entries[0].outcome
+        else {
+            panic!(
+                "expected reconstructed receipt outcome, got {:?}",
+                applied.entries[0].outcome
+            );
+        };
+        assert_eq!(
+            replacement_receipt.source_placement_receipt_ref,
+            source_receipt
+        );
+        assert_eq!(
+            replacement_receipt.replacement_receipt_generation(),
+            source_receipt.receipt_generation + 1
+        );
+        assert_eq!(
+            applied.entries[0]
+                .outcome
+                .replacement_receipt_evidence()
+                .expect("replacement evidence")
+                .downstream_evidence(),
+            replacement_receipt.downstream_evidence()
+        );
+        assert_eq!(store.get(key).expect("read key").expect("stored"), payload);
+        assert_eq!(bridge.repaired_count(), 1);
+        assert_eq!(bridge.pending_count(), 0);
     }
 
     #[test]
