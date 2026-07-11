@@ -119,7 +119,7 @@ write_blocked_manifest() {
   "qemu_exit": null,
   "qemu_success": false,
   "qemu_timed_out": false,
-  "log_empty": true,
+  "log_empty": null,
   "required_metrics_present": false,
   "metrics": {
     "write_duration_s": "0",
