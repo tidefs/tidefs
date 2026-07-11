@@ -351,6 +351,7 @@ mod tests {
             assert!(!datasync);
             Ok(())
         });
+        e.txg_commit_barrier_fn = Box::new(|| Ok(()));
         let mut kmod = KmodPosixVfs::new(e);
         kmod.fsync(&fh, false, &MockEngine::test_ctx()).unwrap();
     }
@@ -365,6 +366,7 @@ mod tests {
             assert!(datasync);
             Ok(())
         });
+        e.txg_commit_barrier_fn = Box::new(|| Ok(()));
         let mut kmod = KmodPosixVfs::new(e);
         kmod.fsync(&fh, true, &MockEngine::test_ctx()).unwrap();
     }
@@ -556,6 +558,7 @@ mod tests {
             assert!(!datasync);
             Ok(())
         });
+        e.txg_commit_barrier_fn = Box::new(|| Ok(()));
 
         let mut kmod = KmodPosixVfs::new(e);
         let written = kmod.write(&fh, 0, data, &MockEngine::test_ctx()).unwrap();
@@ -579,6 +582,7 @@ mod tests {
             assert!(!datasync);
             Ok(())
         });
+        e.txg_commit_barrier_fn = Box::new(|| Ok(()));
 
         let mut kmod = KmodPosixVfs::new(e);
         kmod.write(&fh, 0, b"payload", &MockEngine::test_ctx())

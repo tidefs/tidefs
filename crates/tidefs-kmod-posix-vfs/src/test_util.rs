@@ -74,6 +74,7 @@ type FiemapFn = Box<dyn Fn(&EngineFileHandle, &RequestCtx) -> Result<FiemapExten
 type MmapFn = Box<dyn Fn(InodeId, u64, u64, u32, &RequestCtx) -> Result<MmapPolicy, Errno>>;
 type FaultFn =
     Box<dyn Fn(&EngineFileHandle, u64, u32, &RequestCtx) -> Result<VmFaultOutcome, Errno>>;
+type TxgCommitBarrierFn = Box<dyn Fn() -> Result<(), Errno>>;
 
 pub struct MockEngine {
     pub root_ino: InodeId,
@@ -117,6 +118,7 @@ pub struct MockEngine {
     pub fiemap_fn: FiemapFn,
     pub mmap_fn: MmapFn,
     pub fault_fn: Option<FaultFn>,
+    pub txg_commit_barrier_fn: TxgCommitBarrierFn,
 }
 impl core::fmt::Debug for MockEngine {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -240,6 +242,7 @@ impl MockEngine {
             }),
             mmap_fn: Box::new(|_, _, _, _, _| Ok(MmapPolicy::PopulateOnFault)),
             fault_fn: None,
+            txg_commit_barrier_fn: Box::new(|| Err(Errno::ENOSYS)),
         }
     }
     pub fn dir_attr(ino: u64) -> InodeAttr {
@@ -566,6 +569,10 @@ impl VfsEngine for MockEngine {
                 vm_fault_code,
             })
         }
+    }
+
+    fn txg_commit_barrier(&self) -> Result<(), Errno> {
+        (self.txg_commit_barrier_fn)()
     }
 }
 
