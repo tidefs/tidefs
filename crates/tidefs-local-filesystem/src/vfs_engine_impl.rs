@@ -4107,6 +4107,12 @@ fn live_snapshot_send_destination(args: &Value) -> Result<LiveSnapshotSendDestin
                         .to_string(),
                 );
             }
+            if node_id == server_node_id {
+                return Err(
+                    "snapshot send: node_id and server_node_id must be different for target-addr sends"
+                        .to_string(),
+                );
+            }
             Ok(LiveSnapshotSendDestination::TargetAddress {
                 target_addr: target_addr.to_string(),
                 addr,
@@ -8193,6 +8199,46 @@ mod tests {
             );
             assert!(!output.exists());
         }
+    }
+
+    #[test]
+    fn live_snapshot_send_rejects_same_target_node_ids_before_exporting() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = root.path().join("store");
+        let mut fs = LocalFileSystem::open(&store).expect("open fs");
+        fs.create_file("/live.txt", 0o644).expect("create file");
+        fs.write_file("/live.txt", 0, b"live owner snapshot send")
+            .expect("write file");
+        let engine = VfsLocalFileSystem::new(fs);
+        let output = root.path().join("same-node-target.vfs");
+
+        let refused = live_snapshot_admin(
+            &engine,
+            "send",
+            json!({
+                "output": output.display().to_string(),
+                "target_addr": "127.0.0.1:9000",
+                "format": "vfssend2",
+                "incremental": false,
+                "node_id": 7,
+                "server_node_id": 7,
+            }),
+            true,
+        );
+
+        assert_eq!(refused["ok"], false, "target response: {refused}");
+        assert_eq!(refused["exit_code"], 1);
+        assert!(refused["json"].is_null());
+        assert!(refused["text"].is_null());
+        assert!(
+            refused["error"].as_str().is_some_and(|err| {
+                err.contains("node_id")
+                    && err.contains("server_node_id")
+                    && err.contains("different")
+            }),
+            "target response should explain same target node ids: {refused}"
+        );
+        assert!(!output.exists());
     }
 
     #[test]
