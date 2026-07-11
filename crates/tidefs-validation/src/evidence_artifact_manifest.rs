@@ -326,6 +326,9 @@ fn validate_relative_artifact_path(path: &str, failures: &mut Vec<String>) {
     if is_windows_absolute_path(path) {
         failures.push("artifact_path must be relative".to_string());
     }
+    if path.contains('\\') {
+        failures.push("artifact_path must use `/` separators".to_string());
+    }
     if path.contains('$') || path.contains('`') {
         failures.push(
             "artifact_path must not contain shell interpolation or secret expressions".to_string(),
@@ -603,6 +606,19 @@ mod tests {
                 "missing file-name failure for {path}: {err:?}"
             );
         }
+    }
+
+    #[test]
+    fn artifact_path_rejects_backslash_separators() {
+        let path = "validation\\artifacts\\example\\summary.json";
+
+        let err = validate_artifact_path_shape(path).expect_err("backslash path must fail");
+        assert!(
+            err.failures()
+                .iter()
+                .any(|failure| failure == "artifact_path must use `/` separators"),
+            "missing separator failure for {path}: {err:?}"
+        );
     }
 
     #[test]
