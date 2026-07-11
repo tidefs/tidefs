@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 use ed25519_dalek::{Keypair, Signer};
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 use crate::authorization::{ActionClass, AuthorizationDecision};
 use crate::principal::{PrincipalId, ScopeSelector};
@@ -136,7 +137,7 @@ impl std::fmt::Display for AssuranceClass {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct SessionGrantRecord {
     pub grant_id: SessionGrantId,
     pub session_id: u64,
@@ -149,6 +150,26 @@ pub struct SessionGrantRecord {
     pub scope_ceiling: ScopeSelector,
     pub revocation_epoch: u64,
     pub grant_signature: Vec<u8>,
+}
+
+impl fmt::Debug for SessionGrantRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SessionGrantRecord")
+            .field("grant_id", &self.grant_id)
+            .field("session_id", &self.session_id)
+            .field("principal_id", &self.principal_id)
+            .field("token_bytes_len", &self.token_bytes.len())
+            .field("token_bytes", &"<redacted>")
+            .field("issued_at_millis", &self.issued_at_millis)
+            .field("expires_at_millis", &self.expires_at_millis)
+            .field("audience", &self.audience)
+            .field("assurance_class", &self.assurance_class)
+            .field("scope_ceiling", &self.scope_ceiling)
+            .field("revocation_epoch", &self.revocation_epoch)
+            .field("grant_signature_len", &self.grant_signature.len())
+            .field("grant_signature", &"<redacted>")
+            .finish()
+    }
 }
 
 impl SessionGrantRecord {
@@ -430,6 +451,42 @@ mod tests {
     fn session_grant_id_new_roundtrip() {
         let id = SessionGrantId::new(7);
         assert_eq!(id.0, 7);
+    }
+
+    #[test]
+    fn session_grant_record_debug_redacts_secret_bearing_bytes() {
+        let grant = SessionGrantRecord {
+            grant_id: SessionGrantId::new(7),
+            session_id: 42,
+            principal_id: PrincipalId::new(100),
+            token_bytes: [
+                17, 34, 51, 68, 85, 102, 119, 136, 17, 34, 51, 68, 85, 102, 119, 136, 17, 34, 51,
+                68, 85, 102, 119, 136, 17, 34, 51, 68, 85, 102, 119, 136,
+            ],
+            issued_at_millis: 1_000,
+            expires_at_millis: 2_000,
+            audience: vec![1, 2, 3],
+            assurance_class: AssuranceClass::High,
+            scope_ceiling: ScopeSelector::Cluster { cluster_id: 9 },
+            revocation_epoch: 5,
+            grant_signature: vec![170, 187, 204, 221],
+        };
+        let debug = format!("{grant:?}");
+
+        assert!(debug.contains("SessionGrantRecord"));
+        assert!(debug.contains("session_id: 42"));
+        assert!(debug.contains("principal_id: PrincipalId(100)"));
+        assert!(debug.contains("token_bytes_len: 32"));
+        assert!(debug.contains("grant_signature_len: 4"));
+        assert!(debug.contains("<redacted>"));
+        assert!(
+            !debug.contains("17, 34, 51, 68"),
+            "SessionGrantRecord Debug must redact token bytes: {debug}"
+        );
+        assert!(
+            !debug.contains("170, 187, 204, 221"),
+            "SessionGrantRecord Debug must redact signature bytes: {debug}"
+        );
     }
 
     #[test]

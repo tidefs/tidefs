@@ -2,6 +2,7 @@
 use ed25519_dalek::{Keypair, Signature, Signer, Verifier};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 use crate::error::AttestationError;
 use crate::identity::{NodeIdentity, NodeKeyStore};
@@ -11,12 +12,24 @@ use crate::security::HelloTlv;
 // Session token (short-lived, bound to a session)
 // ---------------------------------------------------------------------------
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct SessionToken {
     pub session_id: u64,
     pub token_bytes: [u8; 32],
     pub issued_at_millis: u64,
     pub expires_at_millis: u64,
+}
+
+impl fmt::Debug for SessionToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SessionToken")
+            .field("session_id", &self.session_id)
+            .field("token_bytes_len", &self.token_bytes.len())
+            .field("token_bytes", &"<redacted>")
+            .field("issued_at_millis", &self.issued_at_millis)
+            .field("expires_at_millis", &self.expires_at_millis)
+            .finish()
+    }
 }
 
 impl SessionToken {
@@ -479,4 +492,32 @@ pub fn check_nonce_replay(
     }
     cache.record(*nonce);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_token_debug_redacts_bearer_token_bytes() {
+        let token = SessionToken {
+            session_id: 42,
+            token_bytes: [
+                17, 34, 51, 68, 85, 102, 119, 136, 17, 34, 51, 68, 85, 102, 119, 136, 17, 34, 51,
+                68, 85, 102, 119, 136, 17, 34, 51, 68, 85, 102, 119, 136,
+            ],
+            issued_at_millis: 1_000,
+            expires_at_millis: 2_000,
+        };
+        let debug = format!("{token:?}");
+
+        assert!(debug.contains("SessionToken"));
+        assert!(debug.contains("session_id: 42"));
+        assert!(debug.contains("token_bytes_len: 32"));
+        assert!(debug.contains("<redacted>"));
+        assert!(
+            !debug.contains("17, 34, 51, 68"),
+            "SessionToken Debug must redact token bytes: {debug}"
+        );
+    }
 }
