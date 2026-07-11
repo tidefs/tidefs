@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::time::SystemTime;
 use tidefs_validation::evidence_artifact_manifest::{
@@ -1209,7 +1209,7 @@ fn validate_evidence_manifest_for_requirement(
     let Some(manifest_path) = requirement.manifest_path.as_deref() else {
         return EvidenceManifestReceiptDetails::empty(EvidenceClassStatus::Missing);
     };
-    let rel = match workspace_relative_str_path(claim, "evidence manifest", manifest_path) {
+    let rel = match workspace_relative_manifest_path(claim, manifest_path) {
         Ok(rel) => rel,
         Err(err) => {
             return EvidenceManifestReceiptDetails {
@@ -1854,16 +1854,8 @@ fn validate_claim_registry(registry: &ClaimRegistry) -> Vec<String> {
                 ));
             }
             if let Some(manifest_path) = &requirement.manifest_path {
-                let rel = Path::new(manifest_path);
-                if rel.is_absolute()
-                    || rel
-                        .components()
-                        .any(|component| matches!(component, std::path::Component::ParentDir))
-                {
-                    failures.push(format!(
-                        "claim `{}` evidence requirement manifest_path `{manifest_path}` must be workspace-relative",
-                        claim.id
-                    ));
+                if let Err(err) = workspace_relative_manifest_path(claim, manifest_path) {
+                    failures.push(err);
                 }
             }
         }
@@ -2813,6 +2805,55 @@ fn workspace_relative_str_path(
     {
         return Err(format!(
             "claim `{}` {path_kind} `{path}` must be a workspace-relative path",
+            claim.id
+        ));
+    }
+    Ok(rel.to_path_buf())
+}
+
+fn workspace_relative_manifest_path(claim: &ClaimRecord, path: &str) -> Result<PathBuf, String> {
+    if path.trim().is_empty() {
+        return Err(format!(
+            "claim `{}` evidence requirement manifest_path must not be empty",
+            claim.id
+        ));
+    }
+    if path.contains('\\') {
+        return Err(format!(
+            "claim `{}` evidence requirement manifest_path `{path}` must use `/` separators",
+            claim.id
+        ));
+    }
+    if path.ends_with('/') {
+        return Err(format!(
+            "claim `{}` evidence requirement manifest_path `{path}` must name a manifest file",
+            claim.id
+        ));
+    }
+    if !path.ends_with(".manifest.json") {
+        return Err(format!(
+            "claim `{}` evidence requirement manifest_path `{path}` must end with `.manifest.json`",
+            claim.id
+        ));
+    }
+
+    let rel = Path::new(path);
+    if rel.is_absolute()
+        || rel
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err(format!(
+            "claim `{}` evidence requirement manifest_path `{path}` must be workspace-relative",
+            claim.id
+        ));
+    }
+    if path
+        .split('/')
+        .any(|component| component.is_empty() || component == ".")
+    {
+        return Err(format!(
+            "claim `{}` evidence requirement manifest_path `{path}` must not contain empty or `.` path components",
             claim.id
         ));
     }
@@ -4067,6 +4108,61 @@ const UNGUARDED_COMMANDS: &[&str] = &[
         assert!(summary.contains("run_id: fixture-run-810/1"));
         assert!(summary.contains(&format!("source_ref: {MANIFEST_FIXTURE_SOURCE_REF}")));
         assert!(summary.contains("residual_risk: Fixture proves manifest gate behavior only."));
+    }
+
+    #[test]
+    fn validate_claim_rejects_invalid_manifest_path_shape() {
+        let temp = tempfile::tempdir().expect("tempdir");
+
+        for (manifest_path, expected) in [
+            ("", "must not be empty"),
+            ("evidence/./summary.manifest.json", "`.` path components"),
+            ("evidence\\summary.manifest.json", "must use `/` separators"),
+            ("evidence/summary.json", "must end with `.manifest.json`"),
+            ("evidence/", "must name a manifest file"),
+            (
+                "/tmp/tidefs-validation/summary.manifest.json",
+                "must be workspace-relative",
+            ),
+            (
+                "../evidence/summary.manifest.json",
+                "must be workspace-relative",
+            ),
+        ] {
+            let mut claim = manifest_fixture_claim(
+                "example.manifest.validated.v1",
+                ClaimStatus::Validated,
+                Vec::new(),
+                Vec::new(),
+            );
+            claim.evidence_requirements[0].manifest_path = Some(manifest_path.to_string());
+
+            let receipt =
+                build_claim_validation_receipt(temp.path(), SystemTime::UNIX_EPOCH, &claim);
+            assert_eq!(receipt.status, ClaimReceiptStatus::Fail);
+            let evidence = receipt
+                .required_evidence
+                .iter()
+                .find(|evidence| evidence.class == "cargo-fixture")
+                .expect("manifest-backed evidence receipt");
+            assert_eq!(evidence.status, EvidenceClassStatus::Missing);
+            assert!(
+                evidence
+                    .details
+                    .iter()
+                    .any(|detail| detail.contains("manifest_path") && detail.contains(expected)),
+                "manifest_path `{manifest_path}` receipt details: {:?}",
+                evidence.details
+            );
+
+            let failures = validate_claim_record(temp.path(), SystemTime::UNIX_EPOCH, &claim);
+            assert!(
+                failures
+                    .iter()
+                    .any(|failure| failure.contains("manifest_path") && failure.contains(expected)),
+                "manifest_path `{manifest_path}` validation failures: {failures:?}"
+            );
+        }
     }
 
     #[test]
