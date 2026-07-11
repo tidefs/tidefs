@@ -243,9 +243,9 @@ impl CandidatePool {
             });
         }
 
-        // Mark topology completeness
-        let found_count = self.devices.len() as u32;
-        self.topology_complete = self.device_count > 0 && found_count == self.device_count;
+        // Mark topology completeness from the same source-backed context used
+        // for lifecycle evidence.
+        self.topology_complete = self.lifecycle_context().topology_complete();
 
         // Cluster pool detection: if any device label has the
         // CLUSTER_POOL_INCOMPAT flag and cluster authority has not been
@@ -264,15 +264,7 @@ impl CandidatePool {
     /// Build source-backed lifecycle evidence for scan/import/reopen review.
     #[must_use]
     pub fn lifecycle_evidence(&self, action: PoolLifecycleAction) -> PoolLifecycleEvidence {
-        let context = PoolLifecycleContext {
-            pool_guid: Some(self.pool_guid),
-            pool_name: Some(self.pool_name.clone()),
-            device_count: self.devices.len(),
-            expected_device_count: self.device_count as usize,
-            capacity_bytes: self.devices.iter().map(|d| d.device_size).sum(),
-            topology_generation: self.topology_generation,
-            commit_group: self.recovery_commit_group,
-        };
+        let context = self.lifecycle_context();
         let topology_complete = context.topology_complete();
 
         let owner_authorized = self.cluster_authorized_or_not_clustered();
@@ -306,6 +298,18 @@ impl CandidatePool {
                 owner_authorized,
                 reason,
             )
+        }
+    }
+
+    fn lifecycle_context(&self) -> PoolLifecycleContext {
+        PoolLifecycleContext {
+            pool_guid: Some(self.pool_guid),
+            pool_name: Some(self.pool_name.clone()),
+            device_count: self.devices.len(),
+            expected_device_count: self.device_count as usize,
+            capacity_bytes: self.devices.iter().map(|d| d.device_size).sum(),
+            topology_generation: self.topology_generation,
+            commit_group: self.recovery_commit_group,
         }
     }
 
@@ -841,6 +845,67 @@ mod tests {
         assert!(evidence.owner_authorized);
         assert!(evidence.is_fail_closed());
         assert_eq!(evidence.reason, "topology evidence incomplete");
+    }
+
+    #[test]
+    fn candidate_pool_validation_uses_lifecycle_topology_invariant() {
+        let make_pool = |topology_generation, device_size| {
+            let pool_guid = [0x3E; 16];
+            CandidatePool {
+                pool_guid,
+                pool_name: "incomplete-evidence".into(),
+                pool_state: LabelPoolState::Exported,
+                devices: vec![DeviceCandidate {
+                    path: std::path::PathBuf::from("/dev/tidefs-incomplete-evidence"),
+                    label: PoolLabelV1 {
+                        magic: POOL_LABEL_MAGIC,
+                        version: 1,
+                        pool_guid,
+                        device_guid: [0x3F; 16],
+                        pool_name_len: 0,
+                        pool_name: [0u8; 255],
+                        pool_state: LabelPoolState::Exported,
+                        commit_group: 44,
+                        label_commit_group: 44,
+                        device_index: 0,
+                        topology_generation,
+                        device_count: 1,
+                        device_class: LabelDeviceClass::Hdd,
+                        device_capacity_bytes: device_size,
+                        system_area_pointer: 0,
+                        system_area_size: 0,
+                        features_incompat: 0,
+                        features_ro_compat: 0,
+                        features_compat: 0,
+                        device_health: 0,
+                        device_read_errors: 0,
+                        device_write_errors: 0,
+                        device_checksum_errors: 0,
+                        redundancy_policy: PoolRedundancyPolicy::default(),
+                        checksum: [0; 32],
+                    },
+                    label_copy: 0,
+                    device_size,
+                }],
+                topology_generation,
+                device_count: 1,
+                recovery_commit_group: 44,
+                topology_complete: true,
+                cluster_authorized: false,
+            }
+        };
+
+        for mut pool in [make_pool(0, 4096), make_pool(3, 0)] {
+            assert!(pool.validate().is_ok());
+            assert!(!pool.topology_complete);
+
+            let evidence = pool.lifecycle_evidence(PoolLifecycleAction::Import);
+            assert_eq!(evidence.outcome, PoolLifecycleOutcome::Refused);
+            assert_eq!(evidence.reason, "topology evidence incomplete");
+            assert!(!evidence.topology_complete);
+            assert!(evidence.owner_authorized);
+            assert!(evidence.is_fail_closed());
+        }
     }
 
     #[test]
