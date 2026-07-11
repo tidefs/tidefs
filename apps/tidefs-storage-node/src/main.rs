@@ -68,8 +68,8 @@ fn parse_carrier_policy(s: &str) -> Result<CarrierPolicy, String> {
 }
 
 fn require_explicit_store_paths(store_paths: Vec<PathBuf>) -> Result<Vec<PathBuf>, String> {
-    if store_paths.is_empty() {
-        Err("storage node server requires at least one explicit --store path".to_string())
+    if store_paths.is_empty() || store_paths.iter().any(|path| path.as_os_str().is_empty()) {
+        Err("storage node server requires at least one non-empty explicit --store path".to_string())
     } else {
         Ok(store_paths)
     }
@@ -522,6 +522,13 @@ mod tests {
         let args = parse_server(&["--node-id", "1", "--bind", "127.0.0.1:9000"]);
         let err = require_explicit_store_paths(args.store_paths).expect_err("missing stores fail");
         assert!(err.contains("--store"));
+    }
+
+    #[test]
+    fn server_config_rejects_blank_store_path() {
+        let args = parse_server(&["--node-id", "1", "--bind", "127.0.0.1:9000", "--store", ""]);
+        let err = require_explicit_store_paths(args.store_paths).expect_err("blank stores fail");
+        assert!(err.contains("non-empty"));
     }
 
     #[test]

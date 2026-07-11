@@ -173,9 +173,11 @@ impl TryFrom<JsonStorageNodeConfig> for StorageNodeConfig {
         }
         pool_device_paths.extend(j.pool_devices);
 
-        if j.store_paths.is_empty() {
+        if j.store_paths.is_empty() || j.store_paths.iter().any(|path| path.as_os_str().is_empty())
+        {
             return Err(
-                "storage node config requires at least one explicit store path".to_string(),
+                "storage node config requires at least one non-empty explicit store path"
+                    .to_string(),
             );
         }
 
@@ -430,6 +432,20 @@ mod tests {
         assert!(result.is_err());
         let err = result.err().unwrap();
         assert!(err.contains("store path"));
+    }
+
+    #[test]
+    fn json_config_rejects_blank_store_path() {
+        let json_content = r#"{
+  "node_id": 42,
+  "bind": "127.0.0.1:8000",
+  "store_paths": [""]
+}"#;
+        let (_dir, path) = write_json(json_content);
+        let result = StorageNodeConfig::from_json_file(&path);
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert!(err.contains("non-empty"));
     }
 
     #[test]
