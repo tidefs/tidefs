@@ -2,7 +2,7 @@
 //! tidefs-storage-node: network-accessible replicated object store.
 //!
 //! Usage:
-//!   tidefs-storage-node server --node-id N --bind ADDR [--store PATH...] [--fs-root PATH --root-auth-key HEX]
+//!   tidefs-storage-node server --node-id N --bind ADDR --store PATH [--store PATH...] [--fs-root PATH --root-auth-key HEX]
 //!   tidefs-storage-node client --node-id N --server-node-id S --connect ADDR CMD [ARGS...]
 
 // Signal handling (SIGINT/SIGTERM) requires unsafe libc calls;
@@ -65,6 +65,14 @@ fn parse_member_class(s: &str) -> Result<MemberClass, String> {
 
 fn parse_carrier_policy(s: &str) -> Result<CarrierPolicy, String> {
     s.parse()
+}
+
+fn require_explicit_store_paths(store_paths: Vec<PathBuf>) -> Result<Vec<PathBuf>, String> {
+    if store_paths.is_empty() || store_paths.iter().any(|path| path.as_os_str().is_empty()) {
+        Err("storage node server requires at least one non-empty explicit --store path".to_string())
+    } else {
+        Ok(store_paths)
+    }
 }
 
 // ── CLI definition ──
@@ -319,11 +327,10 @@ fn run_server(args: ServerArgs) -> ! {
             authority.replication_factor(),
         );
 
-        let store_paths = if store_paths.is_empty() {
-            vec![PathBuf::from("/tmp/tidefs-store")]
-        } else {
-            store_paths
-        };
+        let store_paths = require_explicit_store_paths(store_paths).unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::exit(1);
+        });
 
         let root_auth_key = match (fs_root.as_ref(), root_auth_key_hex) {
             (Some(_), Some(hex)) => {
@@ -508,6 +515,20 @@ mod tests {
         assert!(args.pool_devices.is_empty());
         assert!(args.node_identity.is_none());
         assert_eq!(args.replication_factor, 1);
+    }
+
+    #[test]
+    fn server_config_rejects_missing_store_paths() {
+        let args = parse_server(&["--node-id", "1", "--bind", "127.0.0.1:9000"]);
+        let err = require_explicit_store_paths(args.store_paths).expect_err("missing stores fail");
+        assert!(err.contains("--store"));
+    }
+
+    #[test]
+    fn server_config_rejects_blank_store_path() {
+        let args = parse_server(&["--node-id", "1", "--bind", "127.0.0.1:9000", "--store", ""]);
+        let err = require_explicit_store_paths(args.store_paths).expect_err("blank stores fail");
+        assert!(err.contains("non-empty"));
     }
 
     #[test]
@@ -923,7 +944,14 @@ mod tests {
 
     #[test]
     fn config_from_server_args_minimal() {
-        let args = parse_server(&["--node-id", "1", "--bind", "127.0.0.1:9000"]);
+        let args = parse_server(&[
+            "--node-id",
+            "1",
+            "--bind",
+            "127.0.0.1:9000",
+            "--store",
+            "/tmp/tidefs-storage-node-test-cli-minimal",
+        ]);
         let config = StorageNodeConfig {
             bind_addr: args.bind,
             node_id: args.node_id,
@@ -932,11 +960,7 @@ mod tests {
             membership_bind_addr: args.membership_bind,
             membership_peers: args.membership_peers,
             replica_peers: args.replica_peers,
-            store_paths: if args.store_paths.is_empty() {
-                vec![PathBuf::from("/tmp/tidefs-store")]
-            } else {
-                args.store_paths
-            },
+            store_paths: require_explicit_store_paths(args.store_paths).unwrap(),
             fs_root: args.fs_root,
             root_auth_key: None,
             pool_device_paths: args.pool_devices,
@@ -952,7 +976,10 @@ mod tests {
         };
         assert_eq!(config.node_id, 1);
         assert_eq!(config.bind_addr, "127.0.0.1:9000".parse().unwrap());
-        assert_eq!(config.store_paths, vec![PathBuf::from("/tmp/tidefs-store")]);
+        assert_eq!(
+            config.store_paths,
+            vec![PathBuf::from("/tmp/tidefs-storage-node-test-cli-minimal")]
+        );
         assert!(config.pool_device_paths.is_empty());
         assert!(config.node_identity.is_none());
     }
@@ -964,6 +991,8 @@ mod tests {
             "7",
             "--bind",
             "0.0.0.0:9999",
+            "--store",
+            "/tmp/tidefs-storage-node-test-cli-pool",
             "--pool-device",
             "/dev/tidefs/pool0",
             "--node-identity",
@@ -977,11 +1006,7 @@ mod tests {
             membership_bind_addr: args.membership_bind,
             membership_peers: args.membership_peers,
             replica_peers: args.replica_peers,
-            store_paths: if args.store_paths.is_empty() {
-                vec![PathBuf::from("/tmp/tidefs-store")]
-            } else {
-                args.store_paths
-            },
+            store_paths: require_explicit_store_paths(args.store_paths).unwrap(),
             fs_root: args.fs_root,
             root_auth_key: None,
             pool_device_paths: args.pool_devices,
@@ -999,6 +1024,10 @@ mod tests {
         assert_eq!(
             config.pool_device_paths,
             vec![PathBuf::from("/dev/tidefs/pool0")]
+        );
+        assert_eq!(
+            config.store_paths,
+            vec![PathBuf::from("/tmp/tidefs-storage-node-test-cli-pool")]
         );
         assert_eq!(config.node_identity, Some("storage-north-3".into()));
     }

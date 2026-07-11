@@ -173,15 +173,19 @@ impl TryFrom<JsonStorageNodeConfig> for StorageNodeConfig {
         }
         pool_device_paths.extend(j.pool_devices);
 
+        if j.store_paths.is_empty() || j.store_paths.iter().any(|path| path.as_os_str().is_empty())
+        {
+            return Err(
+                "storage node config requires at least one non-empty explicit store path"
+                    .to_string(),
+            );
+        }
+
         Ok(StorageNodeConfig {
             bind_addr: j.bind,
             node_id: j.node_id,
             authority: Some(authority),
-            store_paths: if j.store_paths.is_empty() {
-                vec![PathBuf::from("/tmp/tidefs-store")]
-            } else {
-                j.store_paths
-            },
+            store_paths: j.store_paths,
             pool_device_paths,
             pool_lock_dir: j.pool_lock_dir,
             node_identity: j.node_identity,
@@ -309,7 +313,12 @@ mod tests {
 
     #[test]
     fn parse_invalid_member_class_falls_back_to_none() {
-        let json = r#"{"node_id": 1, "bind": "127.0.0.1:9000", "member_class": "bogus"}"#;
+        let json = r#"{
+  "node_id": 1,
+  "bind": "127.0.0.1:9000",
+  "store_paths": ["/tmp/tidefs-storage-node-test-invalid-member-class"],
+  "member_class": "bogus"
+}"#;
         let jcfg = serde_json::from_str::<JsonStorageNodeConfig>(json).expect("json parse ok");
         let cfg = StorageNodeConfig::try_from(jcfg).expect("config convert");
         assert!(cfg.member_class.is_none());
@@ -320,6 +329,7 @@ mod tests {
         let json = r#"{
   "node_id": 1,
   "bind": "127.0.0.1:9000",
+  "store_paths": ["/tmp/tidefs-storage-node-test-pool-devices"],
   "pool_device": "/dev/tidefs/pool0",
   "pool_devices": ["/dev/tidefs/pool1", "/dev/tidefs/pool2"]
 }"#;
@@ -354,6 +364,7 @@ mod tests {
         let json = r#"{
   "node_id": 42,
   "bind": "127.0.0.1:8000",
+  "store_paths": ["/tmp/tidefs-storage-node-test-carrier-prefer"],
   "carrier_policy": "prefer"
 }"#;
         let cfg = StorageNodeConfig::try_from(
@@ -368,6 +379,7 @@ mod tests {
         let json = r#"{
   "node_id": 42,
   "bind": "127.0.0.1:8000",
+  "store_paths": ["/tmp/tidefs-storage-node-test-carrier-enforce"],
   "rdma": true,
   "carrier_policy": "enforce"
 }"#;
@@ -392,6 +404,48 @@ mod tests {
         assert!(result.is_err());
         let err = result.err().unwrap();
         assert!(err.contains("unknown carrier policy"));
+    }
+
+    #[test]
+    fn json_config_rejects_missing_store_paths() {
+        let json = r#"{
+  "node_id": 42,
+  "bind": "127.0.0.1:8000"
+}"#;
+        let result = StorageNodeConfig::try_from(
+            serde_json::from_str::<JsonStorageNodeConfig>(json).expect("json"),
+        );
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert!(err.contains("store path"));
+    }
+
+    #[test]
+    fn json_config_rejects_empty_store_paths() {
+        let json_content = r#"{
+  "node_id": 42,
+  "bind": "127.0.0.1:8000",
+  "store_paths": []
+}"#;
+        let (_dir, path) = write_json(json_content);
+        let result = StorageNodeConfig::from_json_file(&path);
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert!(err.contains("store path"));
+    }
+
+    #[test]
+    fn json_config_rejects_blank_store_path() {
+        let json_content = r#"{
+  "node_id": 42,
+  "bind": "127.0.0.1:8000",
+  "store_paths": [""]
+}"#;
+        let (_dir, path) = write_json(json_content);
+        let result = StorageNodeConfig::from_json_file(&path);
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert!(err.contains("non-empty"));
     }
 
     #[test]
@@ -423,6 +477,7 @@ mod tests {
         let json_content = r#"{
   "node_id": 11,
   "bind": "127.0.0.1:17777",
+  "store_paths": ["/tmp/tidefs-storage-node-test-live-authority"],
   "member_class": "learner",
   "failure_domain": 4,
   "replication_factor": 3
