@@ -980,6 +980,8 @@ pub mod rename_flags {
     pub const RENAME_NOREPLACE: u32 = 0x01;
     /// Atomically exchange source and destination.
     pub const RENAME_EXCHANGE: u32 = 0x02;
+    /// Create a whiteout at the source after moving it.
+    pub const RENAME_WHITEOUT: u32 = 0x04;
 }
 
 /// Fixed block size used by the sparse-file I/O worker primitive.
