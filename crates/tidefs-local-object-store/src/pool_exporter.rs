@@ -473,7 +473,15 @@ impl ExportOrchestrator {
             .map(|(index, config)| {
                 PoolExporter::read_existing_label(&config.path, self.pool_guid, index as u32)
                     .ok()
-                    .filter(|label| label.device_capacity_bytes > 0)
+                    .filter(|label| {
+                        label.device_capacity_bytes > 0
+                            && label.pool_guid == self.pool_guid
+                            && label.device_index == index as u32
+                            && self
+                                .device_guids
+                                .get(index)
+                                .is_some_and(|device_guid| label.device_guid == *device_guid)
+                    })
             })
             .collect::<Option<Vec<_>>>();
         let capacity_bytes = labels
@@ -902,6 +910,17 @@ mod tests {
             vec![device_guid],
             false,
         )
+    }
+
+    fn assert_export_topology_refused(evidence: &PoolLifecycleEvidence) {
+        assert_eq!(evidence.action, PoolLifecycleAction::Export);
+        assert_eq!(evidence.outcome, PoolLifecycleOutcome::Refused);
+        assert_eq!(evidence.capacity_bytes, 0);
+        assert_eq!(evidence.topology_generation, 0);
+        assert!(!evidence.topology_complete);
+        assert!(evidence.owner_authorized);
+        assert!(evidence.is_fail_closed());
+        assert_eq!(evidence.reason, "topology evidence incomplete");
     }
 
     #[test]
@@ -1390,6 +1409,102 @@ mod tests {
         assert!(evidence.owner_authorized);
         assert!(evidence.is_fail_closed());
         assert_eq!(evidence.reason, "topology evidence incomplete");
+    }
+
+    #[test]
+    fn orchestrator_refuses_export_lifecycle_evidence_with_foreign_label_pool_guid() {
+        let path = unique_export_path("foreign-pool-guid");
+        let pool_guid = [0xAAu8; 16];
+        let device_guid = [0x01u8; 16];
+        write_export_label(&path, [0xBBu8; 16], device_guid, 0, 1024 * 1024 * 1024, 1);
+        let config = DeviceConfig {
+            media_class: Default::default(),
+            path: path.clone(),
+            backing: DeviceBacking::DirectoryObjectStoreCompat,
+            class: DeviceClass::Data,
+            kind: DeviceKind::Single { path },
+            compression: None,
+            encryption: None,
+        };
+        let orch = ExportOrchestrator::new(
+            pool_guid,
+            "foreign-pool",
+            vec![config],
+            vec![device_guid],
+            false,
+        );
+
+        let evidence = orch.lifecycle_evidence();
+
+        assert_export_topology_refused(&evidence);
+    }
+
+    #[test]
+    fn orchestrator_refuses_export_lifecycle_evidence_with_wrong_label_device_index() {
+        let pool_guid = [0xAAu8; 16];
+        let device_a = [0x01u8; 16];
+        let device_b = [0x02u8; 16];
+        let path_a = unique_export_path("wrong-index-a");
+        let path_b = unique_export_path("wrong-index-b");
+        write_export_label(&path_a, pool_guid, device_a, 0, 1024 * 1024 * 1024, 1);
+        write_export_label(&path_b, pool_guid, device_b, 0, 1024 * 1024 * 1024, 1);
+        let config_a = DeviceConfig {
+            media_class: Default::default(),
+            path: path_a.clone(),
+            backing: DeviceBacking::DirectoryObjectStoreCompat,
+            class: DeviceClass::Data,
+            kind: DeviceKind::Single { path: path_a },
+            compression: None,
+            encryption: None,
+        };
+        let config_b = DeviceConfig {
+            media_class: Default::default(),
+            path: path_b.clone(),
+            backing: DeviceBacking::DirectoryObjectStoreCompat,
+            class: DeviceClass::Data,
+            kind: DeviceKind::Single { path: path_b },
+            compression: None,
+            encryption: None,
+        };
+        let orch = ExportOrchestrator::new(
+            pool_guid,
+            "wrong-index",
+            vec![config_a, config_b],
+            vec![device_a, device_b],
+            false,
+        );
+
+        let evidence = orch.lifecycle_evidence();
+
+        assert_export_topology_refused(&evidence);
+    }
+
+    #[test]
+    fn orchestrator_refuses_export_lifecycle_evidence_with_wrong_label_device_guid() {
+        let path = unique_export_path("wrong-device-guid");
+        let pool_guid = [0xAAu8; 16];
+        let device_guid = [0x01u8; 16];
+        write_export_label(&path, pool_guid, [0x02u8; 16], 0, 1024 * 1024 * 1024, 1);
+        let config = DeviceConfig {
+            media_class: Default::default(),
+            path: path.clone(),
+            backing: DeviceBacking::DirectoryObjectStoreCompat,
+            class: DeviceClass::Data,
+            kind: DeviceKind::Single { path },
+            compression: None,
+            encryption: None,
+        };
+        let orch = ExportOrchestrator::new(
+            pool_guid,
+            "wrong-device",
+            vec![config],
+            vec![device_guid],
+            false,
+        );
+
+        let evidence = orch.lifecycle_evidence();
+
+        assert_export_topology_refused(&evidence);
     }
 
     #[test]
