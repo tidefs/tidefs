@@ -75,10 +75,22 @@ generic/252
 generic/255
 generic/263
 
-# --- Quota ---
+# --- Linux quota API/tooling (not TideFS internal quota admission) ---
+#   generic/244 exercises quotactl Q_GETNEXTQUOTA plus user/group quota tools.
+#   generic/383 exercises xfs_quota project-quota setup/reporting. TideFS
+#   internal quota/reserve accounting is separate from Linux quota UAPI/tool
+#   compatibility, so these rows remain excluded until that mounted UAPI is
+#   deliberately implemented or refused.
 generic/244
-generic/245
 generic/383
+
+# --- Directory rename errno evidence pending ---
+#   generic/245 is not a quota row: it verifies rename over a non-empty
+#   directory returns EEXIST or ENOTEMPTY. The FUSE rename mapper currently
+#   maps NamespaceError::AlreadyExists to EEXIST and NamespaceError::NotEmpty
+#   to ENOTEMPTY in fuse_rename.rs, but the mounted row remains excluded until
+#   it is verified end-to-end.
+generic/245
 
 # --- Swap ---
 generic/472
@@ -142,10 +154,28 @@ generic/298
 generic/299
 generic/300
 
-# --- Quota (not implemented in TideFS FUSE) ---
+# --- Quota plus ENOSPC/internal accounting evidence pending ---
+#   generic/270 combines quota-enabled fsstress with ENOSPC writers and quota
+#   usage verification. This is TideFS quota/reserve accounting evidence, not
+#   Linux quota API enumeration alone; capacity-quota-reserve-accounting remains
+#   blocked until mounted evidence covers the combined behavior.
 generic/270
+
+# --- Quota plus freeze/thaw unsupported boundary ---
+#   generic/280 combines quota changes with filesystem freeze/thaw. The FUSE
+#   ioctl boundary refuses FS_IOC_FREEZE and FS_IOC_THAW as EOPNOTSUPP in
+#   fuse_vfs_adapter.rs, and quota behavior under freeze/thaw is unproven.
 generic/280
 
-# --- ENOSPC (pool capacity tracking exists but no per-filesystem ENOSPC return path) ---
+# --- Plain ENOSPC capacity exhaustion evidence pending ---
+#   Mounted statfs/write admission flow through CapacityAuthority and NoSpace
+#   paths in tidefs-local-filesystem, so the old "no per-filesystem ENOSPC
+#   return path" umbrella is stale. generic/269 still needs mounted ENOSPC
+#   stress evidence before removal.
 generic/269
+
+# --- ENOSPC with preallocation semantics evidence pending ---
+#   generic/274 fills the filesystem, then requires writes into already
+#   preallocated space to succeed. Keep it separate from plain exhaustion until
+#   mounted fallocate/preallocation reservation semantics have row evidence.
 generic/274
