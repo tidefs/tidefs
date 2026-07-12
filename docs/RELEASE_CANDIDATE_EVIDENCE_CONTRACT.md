@@ -460,8 +460,8 @@ source, or behavior changes are made by this contract.
    The RC QEMU job artifact name (`release-candidate-qemu-${{ matrix.name }}`)
    uses a matrix variable but the matrix has only one entry, so a reader
    inspecting the artifact list might expect more QEMU targets in the RC.
-   The `docs/CI_ARTIFACT_RETENTION_CONTRACT.md` correctly notes this: "1
-   target: kmod-xfstests-smoke".
+   The live release-candidate workflow matrix keeps this to one target:
+   `kmod-xfstests-smoke`.
 
 3. **Artifact retention asymmetry**: All RC artifacts have 14-day retention
    while standalone lane artifacts have 7-day retention. This is intentional
