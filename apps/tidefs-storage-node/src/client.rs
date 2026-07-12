@@ -36,6 +36,16 @@ pub fn request(
         .perform_handshake(session_id)
         .map_err(|e| format!("handshake failed: {e:?}"))?;
 
+    if request_requires_authenticated_confidentiality(&request)
+        && !transport.session_has_authenticated_confidentiality(session_id)
+    {
+        let _ = transport.close_session(session_id, SessionCloseReason::LocalShutdown);
+        return Err(
+            "receive requires authenticated transport confidentiality before sending root-authentication key"
+                .into(),
+        );
+    }
+
     if let Err(e) = transport.send_message(session_id, &protocol::encode(&request)) {
         let _ = transport.close_session(session_id, SessionCloseReason::LocalShutdown);
         return Err(format!("send failed: {e:?}"));
@@ -54,6 +64,10 @@ pub fn request(
     close_request_session(&mut transport, session_id);
 
     decoded
+}
+
+pub(crate) fn request_requires_authenticated_confidentiality(request: &Frame) -> bool {
+    matches!(request, Frame::Receive { .. })
 }
 
 fn close_request_session(transport: &mut Transport, session_id: tidefs_transport::SessionId) {
@@ -780,6 +794,22 @@ mod tests {
             placement_epoch: Some(7),
             placement_verified_stable: true,
         }
+    }
+
+    #[test]
+    fn receive_request_requires_authenticated_confidentiality() {
+        let receive = Frame::Receive {
+            export: Vec::new(),
+            root_authentication_key: vec![0x11; 32],
+        };
+
+        assert!(request_requires_authenticated_confidentiality(&receive));
+        assert!(!request_requires_authenticated_confidentiality(
+            &Frame::List
+        ));
+        assert!(!request_requires_authenticated_confidentiality(
+            &Frame::Get { key: b"k".to_vec() }
+        ));
     }
 
     #[test]
