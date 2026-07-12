@@ -307,7 +307,38 @@ that belongs in a separate design issue.
 | #1264 | Persist snapshot-deadlist candidates into the object-store receipt-bound reclaim machinery and keep physical reclaim gated by receipts and snapshot extent pins. | `crates/tidefs-local-object-store/src/store.rs`, `crates/tidefs-local-object-store/src/reclaim_queue.rs`, `crates/tidefs-gc-pin-set/src/lib.rs` only if the pin-set API needs a narrow helper | Focused object-store unit tests for queue persistence, receipt gating, pinned denial, corrupt pin evidence, replay, plus `git diff --check`. |
 | #1265 | Wire local `delete_snapshot` and `delete_clone` to call derivation and enqueue only after the state/catalog/lifecycle-pin mutation succeeds. | `crates/tidefs-local-filesystem/src/snapshot.rs` | Focused local-filesystem unit tests for ordinary delete, clone-shared-root delete, clone delete, hold refusal, queued-work persistence where applicable, plus `git diff --check`. |
 | #1259 | Add the receive-side trigger that calls the #1263 derivation API after a received snapshot-deletion delta is applied locally. | `crates/tidefs-local-filesystem/src/send_receive.rs` | Trigger unit tests with a stub or the final API; two-node validation only after the derivation API exists. |
-| #1266 | Decide reclaim drain cadence, queue-size limits, operator reporting, and capacity/accounting integration after the core machinery has evidence. | `docs/design/snapshot-deadlist-reclaim-policy.md` | Documentation/design/source-inspection only for the policy decision; split source work before implementation. |
+| #1266 | Decide reclaim drain cadence, queue-size limits, operator reporting, and capacity/accounting integration after the core machinery has evidence. | `docs/SNAPSHOT_CLONE_DEADLIST_AUTHORITY.md` section 4.9 | Documentation/design/source-inspection only for the policy decision; split source work before implementation. |
+
+### 4.9 Receipt-Bound Reclaim Drain Policy
+
+The local snapshot/deadlist path does not own a separate physical-freeing
+loop. Reclaim moves through the existing receipt-bound reclaim chain:
+
+- `record_reclaim_delta()` feeds the local B+tree reclaim queue, and
+  `tick_background_services()` drains that queue through `Pool::delete()`.
+  The local handoff budget is 1024 entries per background-service tick.
+- `Pool::delete()` feeds object-store reclaim queues. Physical segment freeing
+  remains reserved for receipt-bound dead-object clearance after committed
+  evidence authorizes the object ids.
+- The receipt-bound physical drain is attempted only when local filesystem
+  state is clean/committed and is bounded to 1024 entries per tick. Idle and
+  error backoff are 32 clean ticks; a new local handoff wakes the idle path.
+- The shared reclaim consumer defaults to 1024 queue entries per drain and 64
+  dead segments per free batch before checkpointing.
+
+Space pressure is a capacity/admission classifier, not a separate snapshot
+deadlist drain contract. Current defaults classify warning, sync, and critical
+at 70%, 85%, and 95% used capacity, with a 5% emergency reserve. They do not
+define a separate 256-entry synchronous reclaim drain.
+
+Operator reporting must distinguish queued deadlist/reclaim debt from
+physically freed capacity. Mounted statfs and allocator-visible availability
+must flow through `CapacityAuthority` and committed receipt-bound reclaim
+evidence, not direct trust in in-memory deadlist entries.
+
+This policy does not claim snapshot delete completion, distributed deadlists,
+final capacity/accounting integration, production allocator behavior,
+performance, release readiness, or successor/comparator parity.
 
 ## 5. Send/Receive Stream Format
 
@@ -510,5 +541,5 @@ compute_export_identity, receive_changed_records_into_staging_with_skip.
 - Production recovery time objective (RTO) or recovery point objective (RPO)
   guarantees.
 - Online deadlist scrubbing, segment compaction policy, production allocator
-  scheduling, queue-size tuning, and capacity/accounting integration (tracked
-  by #1266 and related follow-up issues).
+  scheduling, and final capacity/accounting integration beyond the
+  receipt-bound reclaim boundary recorded in section 4.9.
