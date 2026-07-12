@@ -98,7 +98,7 @@ pub(crate) struct ArcStats {
 
 /// An entry in the resident lists (T1 or T2) with cache-lattice header.
 ///
-/// Per P4-02: every cache entry carries a mandatory [`CacheEntryHeader`]
+/// Every cache entry carries a mandatory [`CacheEntryHeader`]
 /// with anchor/fence/budget/dirty/poison fields.
 #[derive(Clone, Debug)]
 struct ArcResident {
@@ -141,7 +141,7 @@ pub(crate) struct HotReadCache {
     evictions_from_t1: u64,
     evictions_from_t2: u64,
 
-    // P4-02 cache lattice counters
+    // Cache-lattice counters
     admission_rejected_budget: u64,
     admission_rejected_reserve: u64,
     admission_rejected_dirty_state: u64,
@@ -366,7 +366,7 @@ impl HotReadCache {
     /// and move its key to the corresponding ghost list.  Returns the
     /// evicted entry's byte count so the caller can adjust resident_bytes.
     ///
-    /// P4-02 eviction law (Design rule §6):
+    /// Cache-lattice eviction law:
     ///   - Dirty entries must drain through writeback, not hard-evict.
     ///   - Hard/pinned reserve-guarded entries are skipped.
     ///   - If the primary list is fully protected, the secondary is tried.
@@ -404,14 +404,14 @@ impl HotReadCache {
         let original_len = list.len();
         for _ in 0..original_len {
             let entry = list.pop()?; // LRU tail
-                                     // P4-02: cannot hard-evict dirty entries — they must drain.
+                                     // Cache-lattice rule: dirty entries must drain before hard eviction.
             if entry.header.dirty_state.is_dirty() {
                 self.admission_rejected_dirty_state =
                     self.admission_rejected_dirty_state.saturating_add(1);
                 list.insert(0, entry); // rotate to MRU
                 continue;
             }
-            // P4-02: cannot evict pinned or hard-reserve entries.
+            // Cache-lattice rule: cannot evict pinned or hard-reserve entries.
             if matches!(
                 entry.header.reserve_guard,
                 ReserveGuardClass::Hard | ReserveGuardClass::Pinned
@@ -485,7 +485,7 @@ impl HotReadCache {
         // Check T2 first (more valuable).
         if let Some(idx) = find_in_residents(&self.t2, &key) {
             let mut entry = self.t2.remove(idx);
-            // P4-02: validate header before serving.
+            // Cache-lattice rule: validate header before serving.
             if !entry.header.is_servable() {
                 self.drop_unservable_entry(entry);
                 return None;
@@ -539,7 +539,7 @@ impl HotReadCache {
         None
     }
 
-    /// Admit (or update) an entry into the cache with a P4-02 cache-lattice
+    /// Admit (or update) an entry into the cache with a cache-lattice
     /// header.  If `bytes` is too large for the byte budget, the admission
     /// is bypassed.  Header invariants are validated before insertion.
     ///
@@ -630,7 +630,7 @@ impl HotReadCache {
         header.exactness_class = 0; // Exact
         header.freshness_class = 0; // ReadYourWrites
 
-        // P4-02 admission check: validate header invariants.
+        // Cache-lattice admission check: validate header invariants.
         if header.validate().is_err() {
             self.admission_bypasses = self.admission_bypasses.saturating_add(1);
             return;
@@ -703,7 +703,7 @@ impl HotReadCache {
 
     // ── Reporting ───────────────────────────────────────────────────────
 
-    /// P4-02 cache lattice report: structured observability per design rule.
+    /// Cache-lattice report: structured observability for cache invariants.
     ///
     /// Reports per-domain, per-class, poison/dirty/reserve breakdown
     #[cfg(test)]
@@ -739,7 +739,7 @@ impl HotReadCache {
     }
 
     /// Public report, compatible with the existing `HotReadCacheReport` API.
-    /// Maps ARC internals onto the report fields, including P4-02 lattice counters.
+    /// Maps ARC internals onto the report fields, including cache-lattice counters.
     pub(crate) fn report(&self) -> HotReadCacheReport {
         HotReadCacheReport {
             spec: HOT_READ_CACHE_SPEC,
@@ -1108,9 +1108,9 @@ mod tests {
         assert_eq!(cache.get(key(1)).as_deref(), Some(b"v2".as_slice()));
     }
 
-    // ── Lattice-aware eviction tests (P4-02 §6) ─────────────────────────
+    // ── Lattice-aware eviction tests ────────────────────────────────────
 
-    /// Entries with dirty state must not be hard-evicted (P4-02 §6).
+    /// Entries with dirty state must not be hard-evicted.
     /// The evictor should skip dirty entries and try the next clean one.
     #[test]
     fn lattice_skips_dirty_entries_during_eviction() {
@@ -1146,7 +1146,7 @@ mod tests {
     }
 
     /// Hard-reserve entries must not be evicted unless under domain-level
-    /// pressure emergency (P4-02 §6).
+    /// pressure emergency.
     #[test]
     fn lattice_skips_hard_reserve_entries_during_eviction() {
         let mut cache = HotReadCache::new(HotReadCachePolicy {

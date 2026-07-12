@@ -16,7 +16,6 @@ It answers the question:
 
 See also:
 - `docs/FUSE_ADAPTER_CONTRACT_ASSUMPTIONS.md`
-- `docs/MEMORY_PRESSURE_RECLAIM_RESERVE_INTERACTION_P4-03.md`
 - `docs/END_TO_END_PRODUCTION_BLUEPRINT.md`
 - `docs/AUTHORITATIVE_DATA_STRUCTURES_ALGORITHMS.md`
 - Deleted historical cluster transport lineage from Forgejo #1210/#1259
@@ -333,7 +332,7 @@ This pass now makes the connection points explicit:
 - page-cache windows live primarily in `memory_domain_3.adapter_serving_hot`
 - dirty epochs / writeback batches live in `memory_domain_2.staging_dirty`
 - page loans / future pinned zero-copy state must account against `memory_domain_7.kernel_pinned_dma`
-- pressure law from `P4-03` may:
+- cache-pressure handling may:
   - throttle new shared dirtying
   - force dirty-epoch sealing
   - compact read windows
@@ -376,6 +375,6 @@ Still completed later, but now on explicit rails:
 
 With this pass settled:
 - posix_filesystem_adapter worker topology (`P5-02`) now has a lawful byte-residency and dirty/writeback partner model
-- cache and pressure law (`P4-02`, `P4-03`) now connect directly to page-cache and mmap behavior
+- cache-lattice and cache-pressure behavior now connect directly to page-cache and mmap behavior
 - the remaining design risk is narrowed from the broad "how do buffered I/O and mmap fit into the runtime?" question to the exact **zero-copy / pinning / page-loan law** (`P4-04`) and the **block_volume_adapter queue topology / flush semantics** (`P6-01`, `P6-02`)
 - the historical cluster mmap coherency extension (Forgejo #1259) has a documented target design; multi-node page-level lease-gated consistency, remote page faulting via BULK plane, cacheline-granularity RDMA transfer, and false-sharing mitigation remain non-claims until runtime and comparator evidence prove them

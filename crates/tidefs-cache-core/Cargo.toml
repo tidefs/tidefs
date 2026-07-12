@@ -10,7 +10,7 @@ homepage.workspace = true
 documentation.workspace = true
 authors.workspace = true
 
-description = "Cache lattice runtime: registry, eviction, invalidation, and cache-lattice view management (P4-02 Phase 2)"
+description = "Cache lattice runtime: registry, eviction, invalidation, and cache-lattice view management"
 
 [features]
 default = []
