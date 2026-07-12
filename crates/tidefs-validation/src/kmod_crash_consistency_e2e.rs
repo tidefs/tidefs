@@ -369,6 +369,29 @@ impl CrashConsistencyValidationReport {
 
 /// Deterministic in-memory mock engine exercising the full intent-log →
 /// txg-commit → committed-root → replay chain for SourceModel validation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReplayRefusal {
+    detail: String,
+}
+
+impl ReplayRefusal {
+    fn malformed_intent(kind: &str, missing: &str, boundary: &str) -> Self {
+        Self {
+            detail: format!(
+                "refusal: malformed {kind} intent missing {missing}; absent evidence boundary: {boundary}"
+            ),
+        }
+    }
+
+    fn missing_write_data(name: &str, expected_len: u32) -> Self {
+        Self {
+            detail: format!(
+                "refusal: missing write replay data for {name} ({expected_len} bytes); absent evidence boundary: intent payload/pre-crash file state"
+            ),
+        }
+    }
+}
+
 struct MockCrashConsistencyEngine {
     files: Mutex<HashMap<String, Vec<u8>>>,
     intent_log: Mutex<Vec<Vec<u8>>>,
@@ -376,6 +399,7 @@ struct MockCrashConsistencyEngine {
     current_txg: Mutex<u64>,
     /// Scratch copy of pre-crash state for replay verification.
     pre_crash_files: Mutex<HashMap<String, Vec<u8>>>,
+    replay_refusal: Mutex<Option<String>>,
 }
 
 impl MockCrashConsistencyEngine {
@@ -386,6 +410,7 @@ impl MockCrashConsistencyEngine {
             committed_root: Mutex::new(None),
             current_txg: Mutex::new(1),
             pre_crash_files: Mutex::new(HashMap::new()),
+            replay_refusal: Mutex::new(None),
         }
     }
 
@@ -412,6 +437,7 @@ impl MockCrashConsistencyEngine {
         workload: CrashConsistencyWorkload,
         crash_point: CrashPoint,
     ) -> CrashConsistencyOutcome {
+        *self.replay_refusal.lock().unwrap() = None;
         match workload {
             CrashConsistencyWorkload::SingleWrite => self.run_single_write(crash_point),
             CrashConsistencyWorkload::WritePlusFsync => self.run_write_plus_fsync(crash_point),
@@ -588,13 +614,29 @@ impl MockCrashConsistencyEngine {
         }
     }
 
+    fn replay_refusal_detail(&self) -> Option<String> {
+        self.replay_refusal.lock().unwrap().clone()
+    }
+
+    fn replay_or_refusal(&self) -> Result<(), CrashConsistencyOutcome> {
+        match self.simulate_crash_and_replay() {
+            Ok(()) => Ok(()),
+            Err(refusal) => {
+                *self.replay_refusal.lock().unwrap() = Some(refusal.detail);
+                Err(CrashConsistencyOutcome::Refusal)
+            }
+        }
+    }
+
     // ── Crash + replay verification helpers ──────────────────────────────
 
     fn verify_crash_pre_intent(&self, fname: &str) -> CrashConsistencyOutcome {
         // Pre-intent crash: no intent recorded, no data written.
         // After crash + replay, file should not exist.
         self.save_pre_crash_state();
-        self.simulate_crash_and_replay();
+        if let Err(outcome) = self.replay_or_refusal() {
+            return outcome;
+        }
         let files = self.files.lock().unwrap();
         if files.contains_key(fname) {
             CrashConsistencyOutcome::Inconsistent
@@ -607,7 +649,9 @@ impl MockCrashConsistencyEngine {
         // Intent recorded but not committed.
         // Replay should apply the intent-recorded mutations.
         self.save_pre_crash_state();
-        self.simulate_crash_and_replay();
+        if let Err(outcome) = self.replay_or_refusal() {
+            return outcome;
+        }
         let files = self.files.lock().unwrap();
         // After replay of write intent, file should exist.
         if files.contains_key(fname) {
@@ -619,7 +663,9 @@ impl MockCrashConsistencyEngine {
 
     fn verify_crash_post_intent_pre_commit_multi(&self, names: &[&str]) -> CrashConsistencyOutcome {
         self.save_pre_crash_state();
-        self.simulate_crash_and_replay();
+        if let Err(outcome) = self.replay_or_refusal() {
+            return outcome;
+        }
         let files = self.files.lock().unwrap();
         for name in names {
             if !files.contains_key(*name) {
@@ -635,7 +681,9 @@ impl MockCrashConsistencyEngine {
         expected_data: &[u8],
     ) -> CrashConsistencyOutcome {
         self.save_pre_crash_state();
-        self.simulate_crash_and_replay();
+        if let Err(outcome) = self.replay_or_refusal() {
+            return outcome;
+        }
         let files = self.files.lock().unwrap();
         match files.get(fname) {
             Some(data) if data.as_slice() == expected_data => CrashConsistencyOutcome::Consistent,
@@ -649,7 +697,9 @@ impl MockCrashConsistencyEngine {
         entries: &[(&str, &[u8])],
     ) -> CrashConsistencyOutcome {
         self.save_pre_crash_state();
-        self.simulate_crash_and_replay();
+        if let Err(outcome) = self.replay_or_refusal() {
+            return outcome;
+        }
         let files = self.files.lock().unwrap();
         for &(name, expected) in entries {
             match files.get(name) {
@@ -662,7 +712,9 @@ impl MockCrashConsistencyEngine {
 
     fn verify_crash_post_root(&self, fname: &str, expected_data: &[u8]) -> CrashConsistencyOutcome {
         self.save_pre_crash_state();
-        self.simulate_crash_and_replay();
+        if let Err(outcome) = self.replay_or_refusal() {
+            return outcome;
+        }
         let files = self.files.lock().unwrap();
         match files.get(fname) {
             Some(data) if data.as_slice() == expected_data => CrashConsistencyOutcome::Consistent,
@@ -673,7 +725,9 @@ impl MockCrashConsistencyEngine {
 
     fn verify_crash_post_root_multi(&self, entries: &[(&str, &[u8])]) -> CrashConsistencyOutcome {
         self.save_pre_crash_state();
-        self.simulate_crash_and_replay();
+        if let Err(outcome) = self.replay_or_refusal() {
+            return outcome;
+        }
         let files = self.files.lock().unwrap();
         for &(name, expected) in entries {
             match files.get(name) {
@@ -686,7 +740,7 @@ impl MockCrashConsistencyEngine {
 
     /// Simulate a crash by replaying the intent log.
     /// After replay, the file state is rebuilt from intent-log entries.
-    fn simulate_crash_and_replay(&self) {
+    fn simulate_crash_and_replay(&self) -> Result<(), ReplayRefusal> {
         // Restore files from pre-crash saved state (committed data survives).
         // Pending intent entries are replayed to recover uncommitted mutations.
         let mut files = self.files.lock().unwrap();
@@ -709,27 +763,46 @@ impl MockCrashConsistencyEngine {
             match disc {
                 1u8 => {
                     if entry.len() < 14 {
-                        continue;
+                        return Err(ReplayRefusal::malformed_intent(
+                            "write",
+                            "header",
+                            "intent payload/pre-crash file state",
+                        ));
                     }
+                    let expected_len =
+                        u32::from_le_bytes([entry[9], entry[10], entry[11], entry[12]]);
                     let name_len = entry[13] as usize;
                     if entry.len() < 14 + name_len {
-                        continue;
+                        return Err(ReplayRefusal::malformed_intent(
+                            "write",
+                            "name",
+                            "intent payload/pre-crash file state",
+                        ));
                     }
                     let name = String::from_utf8_lossy(&entry[14..14 + name_len]).to_string();
-                    // Restore data from pre-crash state or create an empty recovered entry.
                     if let Some(data) = pcf.get(&name) {
                         files.insert(name, data.clone());
+                    } else if expected_len == 0 {
+                        files.insert(name, Vec::new());
                     } else {
-                        files.entry(name).or_default();
+                        return Err(ReplayRefusal::missing_write_data(&name, expected_len));
                     }
                 }
                 4u8 => {
                     if entry.len() < 2 {
-                        continue;
+                        return Err(ReplayRefusal::malformed_intent(
+                            "create",
+                            "header",
+                            "intent record name",
+                        ));
                     }
                     let name_len = entry[1] as usize;
                     if entry.len() < 2 + name_len {
-                        continue;
+                        return Err(ReplayRefusal::malformed_intent(
+                            "create",
+                            "name",
+                            "intent record name",
+                        ));
                     }
                     let name = String::from_utf8_lossy(&entry[2..2 + name_len]).to_string();
                     files.entry(name).or_default();
@@ -737,6 +810,8 @@ impl MockCrashConsistencyEngine {
                 _ => {}
             }
         }
+
+        Ok(())
     }
 }
 
@@ -765,6 +840,7 @@ pub fn build_crash_consistency_validation() -> CrashConsistencyValidationReport 
             let outcome = fresh_engine.run_workload(workload, crash_point);
             let post_digest = fresh_engine.file_state_digest();
 
+            let refusal_detail = fresh_engine.replay_refusal_detail();
             let detail = if outcome.is_pass() {
                 let verdict = if crash_point.expects_durability() {
                     "data durable and consistent after full chain"
@@ -774,12 +850,24 @@ pub fn build_crash_consistency_validation() -> CrashConsistencyValidationReport 
                     "no intent recorded, clean post-crash state"
                 };
                 verdict.to_string()
+            } else if let Some(detail) = refusal_detail.as_ref() {
+                detail.clone()
             } else {
                 format!(
                     "inconsistent: crash_point={} workload={}",
                     crash_point.label(),
                     workload.label()
                 )
+            };
+
+            let cargo_detail = if outcome.is_pass() {
+                format!(
+                    "cargo-test deterministic replay: same as source-model for {}:{}",
+                    workload.label(),
+                    crash_point.label()
+                )
+            } else {
+                detail.clone()
             };
 
             rows.push(CrashConsistencyValidationRow::new(
@@ -800,11 +888,7 @@ pub fn build_crash_consistency_validation() -> CrashConsistencyValidationReport 
                 outcome.clone(),
                 pre_digest,
                 post_digest,
-                format!(
-                    "cargo-test deterministic replay: same as source-model for {}:{}",
-                    workload.label(),
-                    crash_point.label()
-                ),
+                cargo_detail,
             ));
         }
     }
@@ -1064,13 +1148,13 @@ mod tests {
     }
 
     #[test]
-    fn mock_engine_single_write_post_intent_pre_commit_consistent() {
+    fn mock_engine_single_write_post_intent_pre_commit_refuses_missing_replay_data() {
         let eng = MockCrashConsistencyEngine::new();
         let outcome = eng.run_workload(
             CrashConsistencyWorkload::SingleWrite,
             CrashPoint::PostIntentPreCommit,
         );
-        assert_eq!(outcome, CrashConsistencyOutcome::Consistent);
+        assert_eq!(outcome, CrashConsistencyOutcome::Refusal);
     }
 
     #[test]
@@ -1084,13 +1168,13 @@ mod tests {
     }
 
     #[test]
-    fn mock_engine_write_plus_fsync_post_intent_pre_commit_consistent() {
+    fn mock_engine_write_plus_fsync_post_intent_pre_commit_refuses_missing_replay_data() {
         let eng = MockCrashConsistencyEngine::new();
         let outcome = eng.run_workload(
             CrashConsistencyWorkload::WritePlusFsync,
             CrashPoint::PostIntentPreCommit,
         );
-        assert_eq!(outcome, CrashConsistencyOutcome::Consistent);
+        assert_eq!(outcome, CrashConsistencyOutcome::Refusal);
     }
 
     #[test]
@@ -1104,12 +1188,93 @@ mod tests {
     }
 
     #[test]
+    fn mock_engine_missing_write_replay_data_refuses_without_placeholder() {
+        let eng = MockCrashConsistencyEngine::new();
+        eng.record_write_intent("missing.bin", b"payload");
+        eng.save_pre_crash_state();
+
+        let replay = eng.simulate_crash_and_replay();
+
+        let refusal = replay.expect_err("missing replay data must refuse");
+        assert!(refusal.detail.contains("missing write replay data"));
+        assert!(refusal.detail.contains("absent evidence boundary"));
+        assert!(!eng.files.lock().unwrap().contains_key("missing.bin"));
+    }
+
+    #[test]
+    fn mock_engine_malformed_write_intent_refuses() {
+        let eng = MockCrashConsistencyEngine::new();
+        eng.intent_log.lock().unwrap().push(vec![1u8, 0u8]);
+        eng.save_pre_crash_state();
+
+        let refusal = eng
+            .simulate_crash_and_replay()
+            .expect_err("malformed write intent must refuse");
+
+        assert!(refusal.detail.contains("malformed write intent"));
+        assert!(refusal.detail.contains("absent evidence boundary"));
+    }
+
+    #[test]
+    fn mock_engine_malformed_create_intent_refuses() {
+        let eng = MockCrashConsistencyEngine::new();
+        eng.intent_log.lock().unwrap().push(vec![4u8, 8u8, b'n']);
+        eng.save_pre_crash_state();
+
+        let refusal = eng
+            .simulate_crash_and_replay()
+            .expect_err("malformed create intent must refuse");
+
+        assert!(refusal.detail.contains("malformed create intent"));
+        assert!(refusal.detail.contains("absent evidence boundary"));
+    }
+
+    #[test]
+    fn mock_engine_create_intent_replays_empty_file() {
+        let eng = MockCrashConsistencyEngine::new();
+        eng.record_create_intent("empty.bin");
+        eng.save_pre_crash_state();
+
+        eng.simulate_crash_and_replay()
+            .expect("create intent should remain valid replay evidence");
+
+        let files = eng.files.lock().unwrap();
+        assert_eq!(
+            files.get("empty.bin").map(Vec::as_slice),
+            Some([].as_slice())
+        );
+    }
+
+    #[test]
     fn build_validation_produces_rows() {
         let report = build_crash_consistency_validation();
         // 24 SourceModel/CargoUnit rows + 12 QEMU rows + 3 committed-root rows.
         assert_eq!(report.rows.len(), 39);
-        assert!(report.source_model_pass);
-        assert!(report.cargo_unit_pass);
+        assert!(!report.source_model_pass);
+        assert!(!report.cargo_unit_pass);
+    }
+
+    #[test]
+    fn build_validation_marks_missing_write_replay_evidence_as_refusal() {
+        let report = build_crash_consistency_validation();
+        for tier in [
+            CrashConsistencyValidationTier::SourceModel,
+            CrashConsistencyValidationTier::CargoUnit,
+        ] {
+            let row = report
+                .rows
+                .iter()
+                .find(|row| {
+                    row.workload == CrashConsistencyWorkload::SingleWrite
+                        && row.crash_point == CrashPoint::PostIntentPreCommit
+                        && row.tier == tier
+                })
+                .expect("single-write post-intent row should exist");
+
+            assert_eq!(row.outcome, CrashConsistencyOutcome::Refusal);
+            assert!(row.detail.contains("missing write replay data"));
+            assert!(row.detail.contains("absent evidence boundary"));
+        }
     }
 
     #[test]
