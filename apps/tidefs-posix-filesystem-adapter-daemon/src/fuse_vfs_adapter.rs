@@ -26,7 +26,8 @@ use crate::fuse_rename::{EngineRenameRequest, FuseRenameDispatch};
 use crate::fusewire::{
     parse_defrag_input, parse_fiemap_input, DefragIoctlInput, DefragIoctlOutput, FiemapInput,
     FiemapOutput, FsxattrOutput, FuseLockIn, FuseSetlkRequest, FIEMAP_HEADER_SIZE, FS_IOC_FIEMAP,
-    FS_IOC_FREEZE, FS_IOC_FSGETXATTR, FS_IOC_THAW, TIDEFS_IOC_DEFRAG,
+    FICLONE, FICLONERANGE, FIDEDUPERANGE, FS_IOC_FREEZE, FS_IOC_FSGETXATTR, FS_IOC_THAW,
+    TIDEFS_IOC_DEFRAG,
 };
 use crate::handler_prelude::*;
 use crate::lock_dispatch::{DaemonLockDispatch, LockDispatchError};
@@ -1467,6 +1468,7 @@ fn classify_vfs_ioctl_command(cmd: u32) -> Result<VfsIoctlCommand, Errno> {
         FS_IOC_FIEMAP => Ok(VfsIoctlCommand::Fiemap),
         FS_IOC_FSGETXATTR => Ok(VfsIoctlCommand::Fsgetxattr),
         TIDEFS_IOC_DEFRAG => Ok(VfsIoctlCommand::Defrag),
+        FICLONE | FICLONERANGE | FIDEDUPERANGE => Err(Errno::EOPNOTSUPP),
         FS_IOC_FREEZE | FS_IOC_THAW => Err(Errno::EOPNOTSUPP),
         _ => Err(Errno::EOPNOTSUPP),
     }
@@ -22838,6 +22840,15 @@ mod tests {
         );
         assert_eq!(
             classify_vfs_ioctl_command(FS_IOC_THAW),
+            Err(Errno::EOPNOTSUPP)
+        );
+        assert_eq!(classify_vfs_ioctl_command(FICLONE), Err(Errno::EOPNOTSUPP));
+        assert_eq!(
+            classify_vfs_ioctl_command(FICLONERANGE),
+            Err(Errno::EOPNOTSUPP)
+        );
+        assert_eq!(
+            classify_vfs_ioctl_command(FIDEDUPERANGE),
             Err(Errno::EOPNOTSUPP)
         );
         assert_eq!(classify_vfs_ioctl_command(0xFFFF), Err(Errno::EOPNOTSUPP));

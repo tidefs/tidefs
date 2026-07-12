@@ -1329,6 +1329,15 @@ pub const FS_IOC_FSGETXATTR: u32 = 0x801C_581F;
 /// Linux `FS_IOC_FSSETXATTR` ioctl command value.
 pub const FS_IOC_FSSETXATTR: u32 = 0x401C_5820;
 
+/// Linux `FICLONE` ioctl command value.
+pub const FICLONE: u32 = 0x4004_9409;
+
+/// Linux `FICLONERANGE` ioctl command value.
+pub const FICLONERANGE: u32 = 0x4020_940D;
+
+/// Linux `FIDEDUPERANGE` ioctl command value.
+pub const FIDEDUPERANGE: u32 = 0xC018_9436;
+
 /// Linux `FIFREEZE` ioctl command value.
 pub const FS_IOC_FREEZE: u32 = 0xC004_5877;
 

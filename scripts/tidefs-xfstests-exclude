@@ -137,9 +137,11 @@ generic/093
 # --- Additional mmap ---
 generic/080
 
-# --- Reflink (FICLONE/FICLONERANGE not wired through FUSE adapter) ---
-# Tests 288-300 exercise reflink/dedupe/COW clone operations.
-# Storage-layer clone_file_range_via_store exists but has no FUSE dispatch path.
+# --- Reflink/dedupe ioctls (explicitly refused by FUSE adapter) ---
+#   generic/288-300 exercise FICLONE/FICLONERANGE/FIDEDUPERANGE/COW clone
+#   operations. Mounted FUSE ioctl classification returns EOPNOTSUPP for these
+#   commands; local storage reflink/copy primitives exist but are not mounted
+#   ioctl product support.
 generic/288
 generic/289
 generic/290
