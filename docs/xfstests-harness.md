@@ -84,14 +84,16 @@ require features outside the current TideFS FUSE adapter boundary:
 | Feature area          | Tests excluded |
 |-----------------------|---------------|
 | ACLs                  | generic/099, 237, 307, 318, 319, 375, 444 |
-| Capabilities          | generic/694 |
+| Large-file block accounting | generic/694 |
 | Linux fscrypt policy/key ioctls | generic/397, 398, 399, 400, 401 |
 | Immutable/append-only | generic/079 |
 | FS_IOC ioctls         | generic/009 |
 | Kernel-specific       | generic/048, 054, 058, 062 |
 | Mmap coherency        | generic/091, 215, 216, 223, 224, 225, 226, 228, 229, 230, 231, 235, 239, 247, 248, 252, 255, 263 |
 | Quota                 | generic/244, 245, 383 |
-| Swap                  | generic/472, 493, 494 |
+| Swapfile activation mapping | generic/472 |
+| Active-swapfile dedupe/reflink refusal | generic/493 |
+| Active-swapfile truncate/punch refusal | generic/494 |
 | Freeze/thaw           | generic/068, 085, 275 |
 | Sub-second timestamps | generic/258 |
 
