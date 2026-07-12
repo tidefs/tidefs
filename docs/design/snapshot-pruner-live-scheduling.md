@@ -164,10 +164,9 @@ Automated pruning must not introduce a new deadlist or reclaim model.
 
 - #1259 owns receive-side snapshot-deletion trigger wiring.
 - #1265 owns local snapshot-delete deadlist derivation enqueue wiring.
-- Closed #1266 records the reclaim drain cadence, admission limits, operator
-  reporting, and capacity/accounting policy.
-- Open PR #1491 is implementing local-filesystem deadlist enqueue work in
-  `crates/tidefs-local-filesystem/src/snapshot.rs`.
+- Reclaim drain cadence, admission limits, operator reporting, and the
+  capacity/accounting boundary live in
+  `docs/SNAPSHOT_CLONE_DEADLIST_AUTHORITY.md`.
 
 A future scheduler implementation calls the selected snapshot deletion path
 only after the pruner has produced a current delete set. It does not derive
