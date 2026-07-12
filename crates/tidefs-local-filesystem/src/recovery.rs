@@ -106,22 +106,14 @@ pub(crate) fn load_latest_committed_state(
             // a crash but was never promoted to a transaction group commit).
             let since_tx = selection.report.selected_transaction_id.unwrap_or(0);
             if policy.allows_replay() {
-                match IntentLog::load(store) {
-                    Ok(log) => {
-                        check_crash_hook(CrashInjectionPoint::RecoveryBeforeReplay);
-                        if log.replay_is_needed(since_tx) {
-                            let count = replay_uncommitted(&log, &mut state, store, since_tx)?;
-                            check_crash_hook(CrashInjectionPoint::RecoveryAfterReplay);
-                            if count > 0 {
-                                eprintln!(
-                                    "recovery: replayed {count} uncommitted intent log entries after transaction {since_tx}"
-                                );
-                            }
-                        }
-                    }
-                    Err(err) => {
+                let log = IntentLog::load(store)?;
+                check_crash_hook(CrashInjectionPoint::RecoveryBeforeReplay);
+                if log.replay_is_needed(since_tx) {
+                    let count = replay_uncommitted(&log, &mut state, store, since_tx)?;
+                    check_crash_hook(CrashInjectionPoint::RecoveryAfterReplay);
+                    if count > 0 {
                         eprintln!(
-                            "recovery: intent log load failed ({err}); continuing without replay"
+                            "recovery: replayed {count} uncommitted intent log entries after transaction {since_tx}"
                         );
                     }
                 }
