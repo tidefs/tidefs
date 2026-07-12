@@ -919,6 +919,18 @@ documents.
 | `docs/UNRELEASED_AUTHORITY_POLICY.md` | Current policy | Binding guardrail that forbids adding or preserving legacy, backward-compatibility, migration, downgrade, or fallback behavior for unreleased TideFS data by default. Requires released external boundaries (Linux, POSIX, kernel, third-party), shipped wire/format/operator surfaces, or a temporary bridge explicitly tracked by a GitHub issue before compatibility work is permitted. Names pre-release code paths explicitly (current authority, retired pre-release path, historical input, receiptless path) instead of using "legacy." Includes a review checklist for compatibility additions. Classified as current policy consistent with its own "current policy guardrail" maturity label and live enforcement through PR review conventions. |
 | `docs/GITHUB_CI.md` | Current policy | Documents the live GitHub Actions CI surface: secret boundary (GitHub is not a TideFS secret store), self-hosted runner contract, workflow shape (`Rust Fast`, `Clippy`, `Focused Rust`, `Focused Claim Validation`, `Secret Policy`, `QEMU Smoke`, `xfstests`, `RDMA`, `Release Candidate`), path-filtered PR validation, draft-PR CI skip rules, and `TIDEFS_SELF_HOSTED_READY` gating. Live-source inspection of the named workflow YAML files confirms the documented attributes match current behavior. The Release Candidate workflow is a manual-only self-hosted composition that uploads a `release-candidate-evidence-index` artifact without making a product-readiness claim. This document is a binding CI reference that complements the workflow YAML; it is not a product admission or release-readiness verdict. |
 
+### Cargo-Deny ADR Authority (TFR-019 / #1935)
+
+Classified on 2026-07-12 after checking ADR-0006, `docs/GITHUB_CI.md`,
+`.github/workflows/dependency-license.yml`, `docs/LICENSING.md`, `COPYING`, and
+`deny.toml`. This slice keeps the ADR as a narrow dependency-license policy
+decision record; it does not change workflow behavior, license policy, or
+claims-gate coverage.
+
+| Path | State | Classification note |
+|---|---|---|
+| `docs/adr/0006-license-compliance-cargo-deny.md` | Current policy | Binding only as the cargo-deny dependency-license decision record: TideFS uses `cargo deny check licenses` for dependency-license validation, and accepted dependency-license allowlist/rule changes flow through `deny.toml`. `deny.toml` remains the concrete dependency-license allowlist and rule source, while `COPYING` and `docs/LICENSING.md` remain TideFS project-license authority. This ADR is not a supply-chain completeness claim, dependency-advisory remediation policy, release-readiness evidence, production-readiness evidence, or product capability claim. |
+
 ### Retired Cluster Services Closeout Deletions (TFR-019 / #1586)
 
 Issue #1586 deleted the already-classified Forgejo-era cluster-services seal and
