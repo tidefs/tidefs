@@ -2,8 +2,11 @@
 //! Operator truth-view carrier boundary for CLI status surfaces.
 
 use tidefs_types_vfs_core::{
-    TruthViewCutClass, TruthViewExactnessClass, TruthViewFreshnessClass, TruthViewProvenanceClass,
-    TruthViewSourceClass,
+    ControlPlaneRouteClass, ResponseRegistryAnswerKind, TruthViewAudienceClass, TruthViewCutClass,
+    TruthViewDistributedOperatorSignalClass, TruthViewDistributedOperatorStatusClass,
+    TruthViewDistributedOperatorSurfaceRecord, TruthViewExactnessClass, TruthViewFreshnessClass,
+    TruthViewProvenanceClass, TruthViewSourceClass, TruthViewSurfaceClass,
+    TruthViewTruthBundleRecord,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -134,7 +137,58 @@ impl OperatorTruthCarrier {
     }
 
     #[must_use]
+    pub(crate) const fn distributed_status_class(&self) -> TruthViewDistributedOperatorStatusClass {
+        match self.evidence_state {
+            OperatorTruthEvidenceState::LiveWithinBudget => {
+                TruthViewDistributedOperatorStatusClass::Nominal
+            }
+            OperatorTruthEvidenceState::Stale
+            | OperatorTruthEvidenceState::DeterministicNonLive => {
+                TruthViewDistributedOperatorStatusClass::Degraded
+            }
+            OperatorTruthEvidenceState::Refused => TruthViewDistributedOperatorStatusClass::Blocked,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn distributed_surface_record(&self) -> TruthViewDistributedOperatorSurfaceRecord {
+        let signal = TruthViewDistributedOperatorSignalClass::Health;
+        TruthViewDistributedOperatorSurfaceRecord {
+            live_view_class: signal.required_live_view().as_u32(),
+            signal_class: signal.as_u32(),
+            status_class: self.distributed_status_class().as_u32(),
+            source_class: self.source.as_u32(),
+            cut_class: self.cut.as_u32(),
+            provenance_class: self.provenance.as_u32(),
+            exactness_class: self.exactness.as_u32(),
+            freshness_class: self.freshness.as_u32(),
+            ..TruthViewDistributedOperatorSurfaceRecord::default()
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn truth_bundle_record(&self) -> TruthViewTruthBundleRecord {
+        TruthViewTruthBundleRecord {
+            route_class: ControlPlaneRouteClass::TruthSurface.as_u32(),
+            surface_class: TruthViewSurfaceClass::SystemOverview.as_u32(),
+            cut_class: self.cut.as_u32(),
+            source_class: self.source.as_u32(),
+            provenance_class: self.provenance.as_u32(),
+            audience_class: TruthViewAudienceClass::OperatorSummary.as_u32(),
+            answer_kind: if self.refusal.is_some() {
+                ResponseRegistryAnswerKind::Refusal.as_u32()
+            } else {
+                ResponseRegistryAnswerKind::Bundle.as_u32()
+            },
+            ..TruthViewTruthBundleRecord::default()
+        }
+    }
+
+    #[must_use]
     pub(crate) fn json_value(&self) -> serde_json::Value {
+        let distributed_surface_record = self.distributed_surface_record();
+        let truth_bundle_record = self.truth_bundle_record();
+
         serde_json::json!({
             "command": self.command,
             "operation": self.operation,
@@ -152,6 +206,25 @@ impl OperatorTruthCarrier {
             "exactness": self.exactness.as_str(),
             "freshness": self.freshness.as_str(),
             "refusal": self.refusal,
+            "distributed_surface_record": {
+                "live_view": distributed_surface_record.live_view().expect("operator truth live-view class is fixed").as_str(),
+                "signal": distributed_surface_record.signal().expect("operator truth signal class is fixed").as_str(),
+                "status": distributed_surface_record.status().expect("operator truth status class is fixed").as_str(),
+                "source": distributed_surface_record.source().expect("operator truth source class comes from typed carrier").as_str(),
+                "cut": distributed_surface_record.cut().expect("operator truth cut class comes from typed carrier").as_str(),
+                "provenance": distributed_surface_record.provenance().expect("operator truth provenance class comes from typed carrier").as_str(),
+                "exactness": distributed_surface_record.exactness().expect("operator truth exactness class comes from typed carrier").as_str(),
+                "freshness": distributed_surface_record.freshness().expect("operator truth freshness class comes from typed carrier").as_str(),
+            },
+            "truth_bundle_record": {
+                "route": truth_bundle_record.route().expect("operator truth route class is fixed").as_str(),
+                "surface": truth_bundle_record.surface().expect("operator truth surface class is fixed").as_str(),
+                "cut": truth_bundle_record.cut().expect("operator truth cut class comes from typed carrier").as_str(),
+                "source": truth_bundle_record.source().expect("operator truth source class comes from typed carrier").as_str(),
+                "provenance": truth_bundle_record.provenance().expect("operator truth provenance class comes from typed carrier").as_str(),
+                "audience": truth_bundle_record.audience().expect("operator truth audience class is fixed").as_str(),
+                "answer_kind": truth_bundle_record.answer_kind().expect("operator truth answer kind is fixed").as_str(),
+            },
         })
     }
 
@@ -198,6 +271,76 @@ mod tests {
         assert_eq!(carrier.source, TruthViewSourceClass::RuntimeMirror);
         assert_eq!(carrier.freshness, TruthViewFreshnessClass::LiveWithinBudget);
         assert_eq!(carrier.refusal, None);
+    }
+
+    #[test]
+    fn live_carrier_projects_to_typed_truth_view_records() {
+        let carrier = OperatorTruthCarrier::live_route("cluster", "status", "alpha");
+
+        let surface = carrier.distributed_surface_record();
+        assert_eq!(
+            surface.live_view().unwrap(),
+            TruthViewDistributedOperatorSignalClass::Health.required_live_view()
+        );
+        assert_eq!(
+            surface.signal().unwrap(),
+            TruthViewDistributedOperatorSignalClass::Health
+        );
+        assert_eq!(
+            surface.status().unwrap(),
+            TruthViewDistributedOperatorStatusClass::Nominal
+        );
+        assert_eq!(surface.source().unwrap(), carrier.source);
+        assert_eq!(surface.cut().unwrap(), carrier.cut);
+        assert_eq!(surface.provenance().unwrap(), carrier.provenance);
+        assert_eq!(surface.exactness().unwrap(), carrier.exactness);
+        assert_eq!(surface.freshness().unwrap(), carrier.freshness);
+
+        let bundle = carrier.truth_bundle_record();
+        assert_eq!(
+            bundle.route().unwrap(),
+            ControlPlaneRouteClass::TruthSurface
+        );
+        assert_eq!(
+            bundle.surface().unwrap(),
+            TruthViewSurfaceClass::SystemOverview
+        );
+        assert_eq!(bundle.source().unwrap(), carrier.source);
+        assert_eq!(bundle.cut().unwrap(), carrier.cut);
+        assert_eq!(bundle.provenance().unwrap(), carrier.provenance);
+        assert_eq!(
+            bundle.audience().unwrap(),
+            TruthViewAudienceClass::OperatorSummary
+        );
+        assert_eq!(
+            bundle.answer_kind().unwrap(),
+            ResponseRegistryAnswerKind::Bundle
+        );
+    }
+
+    #[test]
+    fn refusal_projects_to_blocked_refusal_records() {
+        let carrier = OperatorTruthCarrier::no_live_refusal("device", "status", "alpha");
+
+        let surface = carrier.distributed_surface_record();
+        assert_eq!(
+            surface.status().unwrap(),
+            TruthViewDistributedOperatorStatusClass::Blocked
+        );
+        assert_eq!(
+            surface.freshness().unwrap(),
+            TruthViewFreshnessClass::Refused
+        );
+
+        let bundle = carrier.truth_bundle_record();
+        assert_eq!(
+            bundle.answer_kind().unwrap(),
+            ResponseRegistryAnswerKind::Refusal
+        );
+        assert_eq!(
+            bundle.source().unwrap(),
+            TruthViewSourceClass::RuntimeMirror
+        );
     }
 
     #[test]
@@ -253,6 +396,14 @@ mod tests {
         assert_eq!(
             deterministic.freshness,
             TruthViewFreshnessClass::DeterministicNonLive
+        );
+        assert_eq!(
+            stale.distributed_surface_record().status().unwrap(),
+            TruthViewDistributedOperatorStatusClass::Degraded
+        );
+        assert_eq!(
+            deterministic.distributed_surface_record().status().unwrap(),
+            TruthViewDistributedOperatorStatusClass::Degraded
         );
     }
 }
