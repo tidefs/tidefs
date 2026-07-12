@@ -773,11 +773,14 @@ fn build_bridged_vfssend2_send_payload(
     bridge_vfssend2_send_stream(stream).map_err(|e| format!("VFSSEND2 transport bridge: {e}"))
 }
 
+const VFSSEND2_FULL_SEND_BARRIER_CLASS: &str = "full";
+const VFSSEND2_INCREMENTAL_SEND_BARRIER_CLASS: &str = "incremental";
+
 fn snapshot_barrier_send_label(barrier_id: u64, key: &[u8]) -> String {
     let class = if key.is_empty() {
-        "full"
+        VFSSEND2_FULL_SEND_BARRIER_CLASS
     } else {
-        "incremental"
+        VFSSEND2_INCREMENTAL_SEND_BARRIER_CLASS
     };
     format!("vfssend2-{class}-send-{barrier_id}")
 }
@@ -6618,6 +6621,18 @@ mod cluster_pool_handler_tests {
         assert_eq!(report.min_txg, 0);
         assert_eq!(report.max_txg, 0);
         assert!(ctx.active_barrier.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn snapshot_barrier_send_label_distinguishes_send_classes() {
+        assert_eq!(
+            snapshot_barrier_send_label(41, &[]),
+            "vfssend2-full-send-41"
+        );
+        assert_eq!(
+            snapshot_barrier_send_label(42, b"previous-root"),
+            "vfssend2-incremental-send-42"
+        );
     }
 
     #[test]
