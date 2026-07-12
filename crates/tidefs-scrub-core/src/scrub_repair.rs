@@ -232,6 +232,8 @@ pub enum ScrubRepairOutcome {
     CrossReplicaDisagreement,
     /// The comparison classification does not authorize writeback.
     UnreconciledComparison { classification: &'static str },
+    /// Unresolved failed-quorum mutation evidence overlaps this repair candidate.
+    UnresolvedFailedQuorumMutation { mutation_id: String },
     /// Reconstruction failed before a candidate writeback was available.
     ReconstructionFailed,
     /// Reconstructed bytes did not match the expected checksum.
@@ -244,6 +246,30 @@ impl ScrubRepairOutcome {
     #[must_use]
     pub const fn is_success(&self) -> bool {
         matches!(self, Self::Clean | Self::Repaired { .. })
+    }
+}
+
+/// Unresolved failed-quorum mutation evidence supplied by the repair caller.
+///
+/// The replicated object store owns the durable mutation ledger. Scrub repair
+/// treats any caller-supplied unresolved row for the candidate as explicit
+/// uncertainty and refuses writeback until an owning reconciler closes it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnresolvedFailedQuorumMutationEvidence {
+    /// Stable mutation identifier from the unresolved-mutation ledger.
+    pub mutation_id: String,
+    /// Object key affected by the unresolved mutation, when known.
+    pub object_key: Option<[u8; 32]>,
+}
+
+impl UnresolvedFailedQuorumMutationEvidence {
+    /// Create unresolved failed-quorum evidence for an optional object key.
+    #[must_use]
+    pub fn new(mutation_id: impl Into<String>, object_key: Option<[u8; 32]>) -> Self {
+        Self {
+            mutation_id: mutation_id.into(),
+            object_key,
+        }
     }
 }
 
@@ -314,6 +340,24 @@ impl<R: BlockReconstructor> ScrubRepairEngine<R> {
         actual_data: &[u8],
         comparison_record: Option<&CrossReplicaComparisonRecord>,
     ) -> ScrubRepairOutcome {
+        self.repair_one_with_comparison_and_failed_quorum_evidence(
+            block_address,
+            expected_hash,
+            actual_data,
+            comparison_record,
+            &[],
+        )
+    }
+
+    /// Run repair for one block using comparison plus unresolved-mutation evidence.
+    pub fn repair_one_with_comparison_and_failed_quorum_evidence(
+        &mut self,
+        block_address: u64,
+        expected_hash: &[u8; 32],
+        actual_data: &[u8],
+        comparison_record: Option<&CrossReplicaComparisonRecord>,
+        unresolved_mutations: &[UnresolvedFailedQuorumMutationEvidence],
+    ) -> ScrubRepairOutcome {
         // 1. Compute actual hash and compare.
         let actual_hash: [u8; 32] = blake3::hash(actual_data).into();
 
@@ -328,6 +372,13 @@ impl<R: BlockReconstructor> ScrubRepairEngine<R> {
         };
         if let Err(outcome) = comparison_permits_writeback(comparison_record) {
             return outcome;
+        }
+        if let Some(evidence) =
+            unresolved_failed_quorum_evidence_for_candidate(comparison_record, unresolved_mutations)
+        {
+            return ScrubRepairOutcome::UnresolvedFailedQuorumMutation {
+                mutation_id: evidence.mutation_id.clone(),
+            };
         }
 
         self.repair_corrupt_block(block_address, expected_hash, actual_hash)
@@ -437,6 +488,18 @@ impl<R: BlockReconstructor> ScrubRepairEngine<R> {
             .map(|(addr, expected, data)| self.repair_one(*addr, expected, data))
             .collect()
     }
+}
+
+fn unresolved_failed_quorum_evidence_for_candidate<'a>(
+    record: &CrossReplicaComparisonRecord,
+    unresolved_mutations: &'a [UnresolvedFailedQuorumMutationEvidence],
+) -> Option<&'a UnresolvedFailedQuorumMutationEvidence> {
+    unresolved_mutations
+        .iter()
+        .find(|evidence| match evidence.object_key {
+            Some(object_key) => object_key == record.object_key,
+            None => true,
+        })
 }
 
 fn comparison_permits_writeback(
