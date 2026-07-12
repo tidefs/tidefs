@@ -35,7 +35,7 @@ use tidefs_posix_filesystem_adapter_daemon::{self, MountAuthority, MountConfig};
     version = env!("CARGO_PKG_VERSION"),
     about = "TideFS operator CLI and development harnesses",
     long_about = commands::classification::root_long_about(),
-    after_help = "Start with `tidefsctl pool --help`, `tidefsctl dataset --help`, `tidefsctl kernel --help`, or `tidefsctl diag --help`. The book source lives under docs/book/.",
+    after_help = "Start with `tidefsctl pool --help`, `tidefsctl dataset --help`, `tidefsctl kernel --help`, or `tidefsctl diag --help`. Command classification is checked by the repo authority docs and claims gate.",
     arg_required_else_help = true,
 )]
 struct Cli {
@@ -676,21 +676,6 @@ mod tests {
         assert!(
             doc.contains(&table),
             "preview UAPI doc must carry the exact command registry/admission table"
-        );
-    }
-
-    #[test]
-    fn book_chapter_declares_command_classification_contract() {
-        let doc_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../docs/book/chapters/10-tidefsctl.adoc");
-        let doc = std::fs::read_to_string(&doc_path).expect("read tidefsctl book chapter");
-        let table = commands::command_surface_authority_table();
-
-        assert!(doc.contains(commands::classification::COMMAND_CLASSIFICATION_DOC_MARKER));
-        assert!(doc.contains(commands::classification::COMMAND_CLASSIFICATION_SOURCE_PATH));
-        assert!(
-            doc.contains(&table),
-            "tidefsctl book chapter must carry the exact command registry/admission table"
         );
     }
 

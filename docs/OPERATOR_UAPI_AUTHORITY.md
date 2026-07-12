@@ -17,9 +17,9 @@ claim release readiness.
   kernel UAPI, and docs can describe different truths. The current notes say
   issue #239 added a `tidefsctl` local-only admission table, issue #243 moved
   FUSE cluster admission to typed mount authority, issue #278 checked the
-  preview UAPI doc, book chapter, operator-authz boundary, and claims gate
-  against the command classification/admission table, and issue #1278 closes
-  the current pre-alpha one-boundary decision after rechecking the #656
+  preview UAPI doc, operator-authz boundary, claims gate, and source command
+  registry against the command classification/admission table, and issue #1278
+  closes the current pre-alpha one-boundary decision after rechecking the #656
   through #662 follow-up map.
 - `docs/REVIEW_TODO_REGISTER.md` TFR-019 records that imported documents are
   not release truth until classified as current policy, current spec,
@@ -76,8 +76,7 @@ claim release readiness.
   storage-node internals, but still says several repair, convergence,
   orchestration, degraded-read, and reclaim publications are separate work.
   This is implementation evidence, not final distributed operator maturity.
-- `xtask/tidefs-xtask/src/claims.rs`, `docs/CLAIMS_GATE_POLICY.md`,
-  `docs/book/chapters/10-tidefsctl.adoc`, and
+- `xtask/tidefs-xtask/src/claims.rs`, `docs/CLAIMS_GATE_POLICY.md`, and
   `docs/security/operator-authz-boundary.md` already consume the command
   classification/admission table and reject unframed claims that cluster
   prototypes or development exercises are final distributed operator UAPI.
@@ -93,7 +92,7 @@ states were:
 | [#657](https://github.com/tidefs/tidefs/issues/657) | Closed 2026-06-21 | Enforced command registry and privileged-admission invariants. |
 | [#658](https://github.com/tidefs/tidefs/issues/658) | Closed 2026-06-21 | Decided claims-gate coverage; this decision artifact remains a non-publishing design record while scanned docs consume the command table. |
 | [#659](https://github.com/tidefs/tidefs/issues/659) | Closed 2026-06-21 | Audited live-owner routing and source-classified refusals. |
-| [#660](https://github.com/tidefs/tidefs/issues/660) | Closed 2026-06-21 | Cross-referenced this decision from the checked preview UAPI, book, and authz docs. |
+| [#660](https://github.com/tidefs/tidefs/issues/660) | Closed 2026-06-21 | Cross-referenced this decision from the checked preview UAPI and authz docs. |
 | [#661](https://github.com/tidefs/tidefs/issues/661) | Closed 2026-06-20 | Classified this decision in the documentation authority register and updated operator/UAPI and TFR-019 notes. |
 | [#662](https://github.com/tidefs/tidefs/issues/662) | Closed 2026-06-21 | Kept cluster pool prototypes and placement/heal exercises separate from public live-owner cluster status. |
 | [#1267](https://github.com/tidefs/tidefs/issues/1267) | Closed 2026-06-24 | Recorded that no runtime-fed operator product surface exists and mapped prerequisite follow-ups before any product carrier can be selected. |
@@ -113,8 +112,7 @@ The current repo evidence matches those live states:
   prototype, `cluster placement/heal exercise` as development diagnostics, and
   `cluster status` as live-owner status that fails closed without live
   evidence.
-- `docs/PREVIEW_UAPI_ABI_BOUNDARY_OW202.md`,
-  `docs/book/chapters/10-tidefsctl.adoc`, and
+- `docs/PREVIEW_UAPI_ABI_BOUNDARY_OW202.md` and
   `docs/security/operator-authz-boundary.md` consume the same checked command
   classification/admission boundary without widening it into a production ABI
   or final distributed operator UAPI.
@@ -140,13 +138,13 @@ Residual work does not reopen that boundary:
 
 `apps/tidefsctl/src/commands/classification.rs` owns command class, routing,
 help visibility, and summary text. `apps/tidefsctl/src/commands/authz.rs` owns
-privileged admission. Docs, book text, support bundles, and claims checks
-consume or check those registries.
+privileged admission. Docs, support bundles, and claims checks consume or check
+those registries.
 
 Strengths:
 
 - Matches current source and tests.
-- Keeps help text, diagnostics, book text, preview UAPI table, and claims-gate
+- Keeps help text, diagnostics, preview UAPI table, and claims-gate
   policy from drifting into separate command lists.
 - Makes command changes visible in code review at the same point where parser
   and handler behavior changes.

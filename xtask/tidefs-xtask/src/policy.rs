@@ -3251,7 +3251,7 @@ license = "MIT"
     #[test]
     fn file_local_provenance_scans_docs_and_harness_inputs() {
         for rel_path in [
-            "docs/book/chapters/00-preface.adoc",
+            "docs/INDEX.md",
             "validation/fio/rand-read.fio",
             "benchmarking/fio/common/global.inc",
             "traces/golden/smoke_churn/pool_trace.jsonl",

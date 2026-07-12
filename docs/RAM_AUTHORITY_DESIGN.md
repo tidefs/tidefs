@@ -27,8 +27,8 @@ memory-speed receipt classes and must stay within that boundary.
 
 Neighbor authorities still own their own records and runtime producers:
 
-- `docs/CACHE_TAXONOMY_INVARIANTS_P4-02.md`: cache entries are evictable under
-  cache law and are not authority.
+- `docs/cache-authority-model.md`: cache entries are evictable under cache law
+  and are not authority unless assigned an explicit authority class.
 - `docs/PAGE_CACHE_WRITEBACK_AUTHORITY.md`: page-cache bytes are mirrors, and
   durable barriers require committed storage, durable replayable intent, or an
   equivalent receipt authority.

@@ -12,10 +12,11 @@ The active entry points are `README.md`, `AGENTS.md`, `docs/INDEX.md`,
 `docs/LICENSING.md`, `docs/REVIEW_TODO_POLICY.md`,
 `docs/REVIEW_TODO_REGISTER.md`, `docs/CLAIMS_GATE_POLICY.md`, and this file.
 
-The active TideFS Book authoring decision is `docs/book/README.adoc`. The
-assembled book source starts at `docs/book/tidefs-book.adoc`; book chapters are
-current only for the narrow subject they state and must not promote imported
-historical design material without this register classifying it.
+Issue #1871 deleted the TideFS Book source because its useful current
+boundaries are already represented by the active entry points, source-owned
+`tidefsctl` command classification, operator UAPI authority, and claims gate.
+Do not recreate a replacement book, manual, or status surface without an
+issue-scoped authority decision.
 
 All other imported documents are review inputs until classified here or in a
 small follow-up commit tied to TFR-019. Documents under `docs/design/`, root
