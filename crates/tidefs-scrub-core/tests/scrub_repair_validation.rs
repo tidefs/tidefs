@@ -19,6 +19,7 @@ use tidefs_scrub::repair_scheduling::{
 };
 use tidefs_scrub::scrub_repair::{
     BlockReconstructor, ScrubRepairEngine, ScrubRepairLedger, ScrubRepairOutcome,
+    UnresolvedFailedQuorumMutationEvidence,
 };
 use tidefs_scrub::{
     ChecksumLayer, ComparisonClassification, CrossReplicaComparisonRecord, ScrubSubject,
@@ -520,6 +521,111 @@ fn stale_comparison_repair_refuses_before_reconstruction() {
         ScrubRepairOutcome::StaleComparisonRecord
     );
     assert_eq!(engine.ledger().repair_count, 0);
+    assert_eq!(engine.ledger().repair_failure_count, 0);
+}
+
+#[test]
+fn failed_quorum_evidence_refuses_before_reconstruction() {
+    let recon = MockReconstructor::new();
+    recon.set_fail_reconstruct(true);
+    let mut engine = ScrubRepairEngine::new(recon);
+    let expected = hash_data(&make_data(256, 0x55));
+    let corrupt = make_data(256, 0x66);
+    let comparison = repair_comparison_record();
+    let evidence = UnresolvedFailedQuorumMutationEvidence::new(
+        "failed-quorum-test-1",
+        Some(comparison.object_key),
+    );
+
+    assert_eq!(
+        engine.repair_one_with_comparison_and_failed_quorum_evidence(
+            1,
+            &expected,
+            &corrupt,
+            Some(&comparison),
+            &[evidence],
+        ),
+        ScrubRepairOutcome::UnresolvedFailedQuorumMutation {
+            mutation_id: "failed-quorum-test-1".to_string()
+        }
+    );
+    assert_eq!(engine.ledger().repair_count, 0);
+    assert_eq!(engine.ledger().repair_failure_count, 0);
+    assert_eq!(engine.ledger().event_count(), 0);
+}
+
+#[test]
+fn unknown_object_failed_quorum_evidence_refuses_conservatively() {
+    let recon = MockReconstructor::new();
+    recon.set_fail_reconstruct(true);
+    let mut engine = ScrubRepairEngine::new(recon);
+    let expected = hash_data(&make_data(256, 0x55));
+    let corrupt = make_data(256, 0x66);
+    let comparison = repair_comparison_record();
+    let evidence = UnresolvedFailedQuorumMutationEvidence::new("failed-quorum-unknown", None);
+
+    assert_eq!(
+        engine.repair_one_with_comparison_and_failed_quorum_evidence(
+            1,
+            &expected,
+            &corrupt,
+            Some(&comparison),
+            &[evidence],
+        ),
+        ScrubRepairOutcome::UnresolvedFailedQuorumMutation {
+            mutation_id: "failed-quorum-unknown".to_string()
+        }
+    );
+    assert_eq!(engine.ledger().repair_count, 0);
+    assert_eq!(engine.ledger().repair_failure_count, 0);
+    assert_eq!(engine.ledger().event_count(), 0);
+}
+
+#[test]
+fn unrelated_failed_quorum_evidence_keeps_comparison_repair_path() {
+    let recon = MockReconstructor::new();
+    let healthy = make_data(256, 0x55);
+    let expected = hash_data(&healthy);
+    recon.set_healthy_block(1, healthy);
+    let mut engine = ScrubRepairEngine::new(recon);
+    let corrupt = make_data(256, 0x66);
+    let comparison = repair_comparison_record();
+    let evidence =
+        UnresolvedFailedQuorumMutationEvidence::new("failed-quorum-other", Some([9; 32]));
+
+    assert!(engine
+        .repair_one_with_comparison_and_failed_quorum_evidence(
+            1,
+            &expected,
+            &corrupt,
+            Some(&comparison),
+            &[evidence],
+        )
+        .is_success());
+    assert_eq!(engine.ledger().repair_count, 1);
+    assert_eq!(engine.ledger().repair_failure_count, 0);
+}
+
+#[test]
+fn empty_failed_quorum_evidence_keeps_comparison_repair_path() {
+    let recon = MockReconstructor::new();
+    let healthy = make_data(256, 0x55);
+    let expected = hash_data(&healthy);
+    recon.set_healthy_block(1, healthy);
+    let mut engine = ScrubRepairEngine::new(recon);
+    let corrupt = make_data(256, 0x66);
+    let comparison = repair_comparison_record();
+
+    assert!(engine
+        .repair_one_with_comparison_and_failed_quorum_evidence(
+            1,
+            &expected,
+            &corrupt,
+            Some(&comparison),
+            &[],
+        )
+        .is_success());
+    assert_eq!(engine.ledger().repair_count, 1);
     assert_eq!(engine.ledger().repair_failure_count, 0);
 }
 
