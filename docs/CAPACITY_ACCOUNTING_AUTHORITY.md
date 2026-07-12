@@ -47,10 +47,10 @@ mirrors.
   `DatasetSpaceCountersV1`, `SpaceDelta`, `PoolPhysicalCountersV1`, space
   domains, and POSIX `statfs` projection inputs.
 - `docs/SNAPSHOT_CLONE_DEADLIST_AUTHORITY.md` and
-  `docs/LOCAL_SNAPSHOTS_OW108.md`: snapshot-pinned bytes are separately
-  observable and must not be double-counted in POSIX `statfs`; snapshot
-  reclaim remains tied to lifecycle pins, deadlists, and placement/rebuild
-  work.
+  `crates/tidefs-local-filesystem/src/snapshot.rs`: snapshot-pinned bytes are
+  separately observable and must not be double-counted in POSIX `statfs`;
+  snapshot reclaim remains tied to lifecycle pins, deadlists, and
+  placement/rebuild work.
 - `crates/tidefs-block-allocator/`: owns physical free-block tracking,
   transactional reservations, quota-table reserve/commit/release bookkeeping,
   commit-epoch fencing, root-reserve block counters, and TRIM/UNMAP dispatch.

@@ -12,7 +12,7 @@ send/receive source.
 
 - `docs/TIMESTAMP_GENERATION_AUTHORITY.md`, especially section 9.4.
 - `docs/UNRELEASED_AUTHORITY_POLICY.md`.
-- `docs/LOCAL_SNAPSHOTS_OW108.md` and `docs/SEND_RECEIVE_OW109.md`.
+- `docs/SNAPSHOT_CLONE_DEADLIST_AUTHORITY.md`.
 - `docs/RECEIVE_STREAM_MERGE_POLICY.md`.
 - `crates/tidefs-local-filesystem/src/encoding.rs`.
 - `crates/tidefs-local-filesystem/src/send_receive.rs`.

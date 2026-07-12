@@ -26,9 +26,9 @@ snapshot browsing support.
 
 ### Original evidence (#699)
 
-- `docs/LOCAL_SNAPSHOTS_OW108.md` — snapshot catalog, rollback, reclamation,
-  lifecycle authority, operator CLI surface, and the open transparent-browsing
-  item.
+- `docs/SNAPSHOT_CLONE_DEADLIST_AUTHORITY.md` and
+  `crates/tidefs-local-filesystem/src/snapshot.rs` — snapshot catalog,
+  rollback, reclamation, and lifecycle authority.
 - `docs/INODE_NAMESPACE_AUTHORITY.md` — dataset-scoped inode authority decision
   for TFR-004, follow-up implementation map (#664-#667), and the explicit
   boundary between durable inode identity and FUSE lookup references.
