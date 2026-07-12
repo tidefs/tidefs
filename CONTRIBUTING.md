@@ -10,7 +10,7 @@ Start with these files before changing behavior or documentation:
 
 1. `README.md`
 2. `AGENTS.md`
-3. `docs/GITHUB_PR_DEVELOPMENT.md`
+3. `CONTRIBUTING.md`
 4. `docs/GITHUB_CI.md`
 5. `docs/CLAIMS_GATE_POLICY.md`
 6. `docs/REVIEW_TODO_POLICY.md`
@@ -119,8 +119,10 @@ or invariant signal over marker, fixture, or test-count churn.
 ## Pull Request Workflow
 
 Start from a GitHub issue with behavior, acceptance criteria, expected write
-set, and validation tier. Use `docs/GITHUB_PR_DEVELOPMENT.md` as the authority
-for branch, worktree, PR, validation, and multi-Codex coordination policy.
+set, and validation tier. Keep PRs small, reviewable, and linked to their
+issue. Use `docs/GITHUB_PR_DEVELOPMENT.md` only as the repo-local boundary
+between public contribution guidance and host-local managed-worker process
+rules.
 
 The normal Codex branch shape is:
 
@@ -137,7 +139,9 @@ The matching worktree shape is:
 On the managed Codex host, publish branches only through
 `/root/ai/bin/git-push-approve` and `/root/ai/bin/git-push-guard`. Push the
 branch before source edits so ownership is visible, then open a draft PR after
-the first scoped commit.
+the first scoped commit. Managed hosts must follow their local process docs
+when present; on this host that authority is
+`/root/ai/docs/projects/tidefs/workflows/github-pr-development.md`.
 
 PR bodies should link the issue, summarize the behavior or doc boundary that
 changed, list validation commands and GitHub Actions run URLs/artifacts, and

@@ -4,7 +4,7 @@ Start here for active project authority:
 
 1. `README.md`
 2. `AGENTS.md`
-3. `docs/GITHUB_PR_DEVELOPMENT.md`
+3. `CONTRIBUTING.md`
 4. `docs/GITHUB_CI.md`
 5. `docs/CLAIMS_GATE_POLICY.md`
 6. `docs/REVIEW_TODO_POLICY.md`
@@ -80,7 +80,7 @@ Current authority families:
   `docs/OPERATOR_PRODUCT_SURFACE_DECISION.md`, `docs/REQUEST_CONTRACT.md`,
   `docs/CONTROL_FORMAT_AND_JSON_POLICY.md`, and
   `docs/TRACE_ORACLE_ARTIFACT_SCHEMA.md`.
-- Validation, CI, and workspace policy: `docs/GITHUB_PR_DEVELOPMENT.md`,
+- Validation, CI, and workspace policy: `CONTRIBUTING.md`,
   `docs/GITHUB_CI.md`, `docs/TEST_SIGNAL_POLICY.md`,
   `docs/XFSTESTS_DISPATCH_CONTRACT.md`,
   `docs/workspace-package-classification.md`, and

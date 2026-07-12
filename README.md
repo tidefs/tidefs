@@ -199,7 +199,7 @@ Use this repo-local reading order before changing behavior or documentation:
 
 1. `README.md` - repository overview and current policy summary
 2. `AGENTS.md` - agent and managed-worker contract
-3. `docs/GITHUB_PR_DEVELOPMENT.md` - GitHub issue, branch, worktree, and PR flow
+3. `CONTRIBUTING.md` - contribution, local build, and PR guidance
 4. `docs/GITHUB_CI.md` - CI workflow, validation lanes, and secret boundary
 5. `docs/CLAIMS_GATE_POLICY.md` - publishing-facing claim guardrails
 6. `docs/REVIEW_TODO_POLICY.md` - durable review-debt policy
