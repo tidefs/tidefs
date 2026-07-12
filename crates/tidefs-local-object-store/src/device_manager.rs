@@ -149,8 +149,8 @@ impl DeviceManager {
             | PoolLifecycleAction::ReplaceDevice => {
                 PoolLifecycleEvidence::executed(action, context)
             }
-            _ => PoolLifecycleEvidence::refused_with_authority(
-                PoolLifecycleAction::FailClosed,
+            _ => PoolLifecycleEvidence::refused_fail_closed_with_authority(
+                action,
                 context,
                 topology_complete,
                 true,
@@ -849,10 +849,13 @@ mod tests {
             8,
         );
 
-        assert_eq!(evidence.action, PoolLifecycleAction::FailClosed);
+        assert_eq!(evidence.action, PoolLifecycleAction::Export);
         assert!(evidence.topology_complete);
         assert!(evidence.owner_authorized);
+        assert!(evidence.fail_closed);
         assert!(evidence.is_fail_closed());
+        assert!(evidence.summary().contains("action=export"));
+        assert!(evidence.summary().contains("fail_closed=true"));
         assert!(evidence.reason.contains("unsupported"));
     }
 
@@ -869,9 +872,10 @@ mod tests {
             8,
         );
 
-        assert_eq!(evidence.action, PoolLifecycleAction::FailClosed);
+        assert_eq!(evidence.action, PoolLifecycleAction::Export);
         assert!(!evidence.topology_complete);
         assert!(evidence.owner_authorized);
+        assert!(evidence.fail_closed);
         assert!(evidence.is_fail_closed());
         assert!(evidence.reason.contains("unsupported"));
     }

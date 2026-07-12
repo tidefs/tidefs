@@ -274,8 +274,8 @@ impl CandidatePool {
         );
 
         if !supported_action {
-            return PoolLifecycleEvidence::refused_with_authority(
-                PoolLifecycleAction::FailClosed,
+            return PoolLifecycleEvidence::refused_fail_closed_with_authority(
+                action,
                 context,
                 topology_complete,
                 owner_authorized,
@@ -1130,7 +1130,7 @@ mod tests {
 
         let evidence = pool.lifecycle_evidence(PoolLifecycleAction::Export);
 
-        assert_eq!(evidence.action, PoolLifecycleAction::FailClosed);
+        assert_eq!(evidence.action, PoolLifecycleAction::Export);
         assert_eq!(evidence.outcome, PoolLifecycleOutcome::Refused);
         assert_eq!(evidence.pool_guid, Some([0x3E; 16]));
         assert_eq!(evidence.pool_name.as_deref(), Some("unsupported"));
@@ -1140,7 +1140,10 @@ mod tests {
         assert_eq!(evidence.commit_group, 48);
         assert!(!evidence.topology_complete);
         assert!(evidence.owner_authorized);
+        assert!(evidence.fail_closed);
         assert!(evidence.is_fail_closed());
+        assert!(evidence.summary().contains("action=export"));
+        assert!(evidence.summary().contains("fail_closed=true"));
         assert!(evidence.reason.contains("unsupported"));
     }
 

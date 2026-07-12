@@ -61,6 +61,7 @@ pub struct PoolLifecycleEvidence {
     pub commit_group: u64,
     pub topology_complete: bool,
     pub owner_authorized: bool,
+    pub fail_closed: bool,
     pub reason: String,
 }
 
@@ -104,6 +105,7 @@ impl PoolLifecycleEvidence {
             outcome: PoolLifecycleOutcome::Executed,
             topology_complete: true,
             owner_authorized: true,
+            fail_closed: false,
             pool_guid: context.pool_guid,
             pool_name: context.pool_name,
             device_count: context.device_count,
@@ -132,6 +134,44 @@ impl PoolLifecycleEvidence {
         owner_authorized: bool,
         reason: impl Into<String>,
     ) -> Self {
+        let fail_closed =
+            action == PoolLifecycleAction::FailClosed || !topology_complete || !owner_authorized;
+        Self::refused_with_fail_closed(
+            action,
+            context,
+            topology_complete,
+            owner_authorized,
+            fail_closed,
+            reason,
+        )
+    }
+
+    #[must_use]
+    pub fn refused_fail_closed_with_authority(
+        action: PoolLifecycleAction,
+        context: PoolLifecycleContext,
+        topology_complete: bool,
+        owner_authorized: bool,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self::refused_with_fail_closed(
+            action,
+            context,
+            topology_complete,
+            owner_authorized,
+            true,
+            reason,
+        )
+    }
+
+    fn refused_with_fail_closed(
+        action: PoolLifecycleAction,
+        context: PoolLifecycleContext,
+        topology_complete: bool,
+        owner_authorized: bool,
+        fail_closed: bool,
+        reason: impl Into<String>,
+    ) -> Self {
         let reason = reason.into();
         let reason = if reason.trim().is_empty() {
             "lifecycle evidence refused".to_string()
@@ -144,6 +184,7 @@ impl PoolLifecycleEvidence {
             outcome: PoolLifecycleOutcome::Refused,
             topology_complete,
             owner_authorized,
+            fail_closed,
             pool_guid: context.pool_guid,
             pool_name: context.pool_name,
             device_count: context.device_count,
@@ -157,10 +198,7 @@ impl PoolLifecycleEvidence {
 
     #[must_use]
     pub fn is_fail_closed(&self) -> bool {
-        self.outcome == PoolLifecycleOutcome::Refused
-            && (self.action == PoolLifecycleAction::FailClosed
-                || !self.topology_complete
-                || !self.owner_authorized)
+        self.outcome == PoolLifecycleOutcome::Refused && self.fail_closed
     }
 
     #[must_use]
@@ -179,7 +217,7 @@ impl PoolLifecycleEvidence {
         let pool_name = self.pool_name.as_deref().unwrap_or("none");
 
         format!(
-            "action={} outcome={} pool_guid={} pool_name={} devices={}/{} capacity_bytes={} topology_generation={} commit_group={} topology_complete={} owner_authorized={} reason={}",
+            "action={} outcome={} pool_guid={} pool_name={} devices={}/{} capacity_bytes={} topology_generation={} commit_group={} topology_complete={} owner_authorized={} fail_closed={} reason={}",
             self.action.stable_id(),
             self.outcome.stable_id(),
             pool_guid,
@@ -191,6 +229,7 @@ impl PoolLifecycleEvidence {
             self.commit_group,
             self.topology_complete,
             self.owner_authorized,
+            self.fail_closed,
             self.reason
         )
     }
@@ -219,6 +258,7 @@ mod tests {
         assert_eq!(evidence.outcome, PoolLifecycleOutcome::Executed);
         assert!(evidence.topology_complete);
         assert!(evidence.owner_authorized);
+        assert!(!evidence.fail_closed);
         assert!(!evidence.is_fail_closed());
         assert!(evidence.summary().contains("action=import"));
         assert!(evidence
@@ -237,6 +277,7 @@ mod tests {
         assert_eq!(evidence.outcome, PoolLifecycleOutcome::Refused);
         assert!(!evidence.topology_complete);
         assert!(evidence.owner_authorized);
+        assert!(evidence.fail_closed);
         assert!(evidence.is_fail_closed());
         assert_eq!(evidence.reason, "topology evidence incomplete");
         assert!(evidence.summary().contains("outcome=refused"));
@@ -253,6 +294,7 @@ mod tests {
         assert_eq!(evidence.outcome, PoolLifecycleOutcome::Refused);
         assert!(!evidence.topology_complete);
         assert!(evidence.owner_authorized);
+        assert!(evidence.fail_closed);
         assert!(evidence.is_fail_closed());
         assert_eq!(evidence.reason, "topology evidence incomplete");
     }
@@ -271,6 +313,7 @@ mod tests {
         assert_eq!(evidence.expected_device_count, 0);
         assert!(!evidence.topology_complete);
         assert!(evidence.owner_authorized);
+        assert!(evidence.fail_closed);
         assert!(evidence.is_fail_closed());
         assert_eq!(evidence.reason, "topology evidence incomplete");
     }
@@ -289,6 +332,7 @@ mod tests {
         assert_eq!(evidence.capacity_bytes, 0);
         assert!(!evidence.topology_complete);
         assert!(evidence.owner_authorized);
+        assert!(evidence.fail_closed);
         assert!(evidence.is_fail_closed());
         assert_eq!(evidence.reason, "topology evidence incomplete");
     }
@@ -308,6 +352,7 @@ mod tests {
         assert_eq!(evidence.topology_generation, 0);
         assert!(!evidence.topology_complete);
         assert!(evidence.owner_authorized);
+        assert!(evidence.fail_closed);
         assert!(evidence.is_fail_closed());
         assert_eq!(evidence.reason, "topology evidence incomplete");
     }
@@ -324,6 +369,7 @@ mod tests {
         assert_eq!(evidence.outcome, PoolLifecycleOutcome::Refused);
         assert!(!evidence.topology_complete);
         assert!(!evidence.owner_authorized);
+        assert!(evidence.fail_closed);
         assert!(evidence.is_fail_closed());
         assert!(evidence.summary().contains("action=import"));
         assert!(evidence.summary().contains("missing owner token"));
@@ -336,10 +382,31 @@ mod tests {
 
         assert_eq!(evidence.outcome, PoolLifecycleOutcome::Refused);
         assert_eq!(evidence.reason, "lifecycle evidence refused");
+        assert!(evidence.fail_closed);
         assert!(evidence.is_fail_closed());
         assert!(evidence
             .summary()
             .contains("reason=lifecycle evidence refused"));
+    }
+
+    #[test]
+    fn refused_fail_closed_evidence_preserves_requested_action() {
+        let evidence = PoolLifecycleEvidence::refused_fail_closed_with_authority(
+            PoolLifecycleAction::Export,
+            context(),
+            true,
+            true,
+            "unsupported lifecycle action",
+        );
+
+        assert_eq!(evidence.action, PoolLifecycleAction::Export);
+        assert_eq!(evidence.outcome, PoolLifecycleOutcome::Refused);
+        assert!(evidence.topology_complete);
+        assert!(evidence.owner_authorized);
+        assert!(evidence.fail_closed);
+        assert!(evidence.is_fail_closed());
+        assert!(evidence.summary().contains("action=export"));
+        assert!(evidence.summary().contains("fail_closed=true"));
     }
 
     #[test]
@@ -355,6 +422,7 @@ mod tests {
         assert_eq!(evidence.outcome, PoolLifecycleOutcome::Refused);
         assert!(evidence.topology_complete);
         assert!(evidence.owner_authorized);
+        assert!(evidence.fail_closed);
         assert!(evidence.is_fail_closed());
         assert!(evidence.summary().contains("action=fail-closed"));
     }
