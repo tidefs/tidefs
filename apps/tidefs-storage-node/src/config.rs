@@ -153,7 +153,11 @@ impl TryFrom<JsonStorageNodeConfig> for StorageNodeConfig {
         let root_auth_key = j
             .root_auth_key_hex
             .as_deref()
-            .and_then(|hex| tidefs_local_filesystem::RootAuthenticationKey::from_hex(hex).ok());
+            .map(|hex| {
+                tidefs_local_filesystem::RootAuthenticationKey::from_hex(hex)
+                    .map_err(|err| format!("invalid root_auth_key_hex: {err}"))
+            })
+            .transpose()?;
         let disclosure = if j.rdma {
             BackendDisclosure::Rdma(j.bind.to_string())
         } else {
@@ -404,6 +408,24 @@ mod tests {
         assert!(result.is_err());
         let err = result.err().unwrap();
         assert!(err.contains("unknown carrier policy"));
+    }
+
+    #[test]
+    fn json_config_rejects_invalid_root_auth_key_hex() {
+        let json = r#"{
+  "node_id": 42,
+  "bind": "127.0.0.1:8000",
+  "store_paths": ["/tmp/tidefs-storage-node-test-root-auth-key"],
+  "fs_root": "/tmp/tidefs-storage-node-test-fs-root",
+  "root_auth_key_hex": "not-a-valid-key"
+}"#;
+        let result = StorageNodeConfig::try_from(
+            serde_json::from_str::<JsonStorageNodeConfig>(json).expect("json"),
+        );
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert!(err.contains("root_auth_key_hex"));
+        assert!(err.contains("root authentication key"));
     }
 
     #[test]
