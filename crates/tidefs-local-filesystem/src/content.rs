@@ -2759,9 +2759,7 @@ mod tests {
         assert!(read.checksum_evidence.matches_expected());
         assert_eq!(
             read.placement_evidence,
-            MountedContentPlacementEvidence::ReceiptMissing {
-                expected_generation: None,
-            }
+            MountedContentPlacementEvidence::ReceiptObservedButUnbound { generation: 1 }
         );
     }
 
@@ -2860,9 +2858,7 @@ mod tests {
         );
         assert_eq!(
             read.placement_evidence,
-            MountedContentPlacementEvidence::ReceiptMissing {
-                expected_generation: None,
-            }
+            MountedContentPlacementEvidence::ReceiptObservedButUnbound { generation: 1 }
         );
     }
 
@@ -3095,6 +3091,18 @@ mod receipt_readback_authority_tests {
     use tidefs_local_object_store::{
         DeviceBacking, DeviceClass, DeviceConfig, DeviceIoClass, DeviceKind, StoreOptions,
     };
+
+    fn temp_store(label: &str) -> LocalObjectStore {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "tidefs-rdbk-auth-raw-{label}-{nanos}-{}",
+            std::process::id()
+        ));
+        LocalObjectStore::open(root).expect("open temp object store")
+    }
 
     fn temp_pool(label: &str) -> Pool {
         let nanos = SystemTime::now()
