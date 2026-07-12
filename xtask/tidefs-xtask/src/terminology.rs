@@ -104,8 +104,7 @@ pub const TERMINOLOGY: &[TerminologyEntry] = &[
     },
 ];
 
-const USER_FACING_TERMINOLOGY_DOCS: &[&str] =
-    &["README.md", "docs/INDEX.md", "docs/HUMAN_TERMINOLOGY.md"];
+const USER_FACING_TERMINOLOGY_DOCS: &[&str] = &["README.md", "docs/INDEX.md"];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HumanApiAliasEntry {
@@ -282,45 +281,46 @@ pub fn check_current_workspace() -> Result<(), TerminologyCheckError> {
     let root = find_workspace_root().ok_or_else(|| TerminologyCheckError {
         missing: vec!["could not locate workspace root Cargo.toml".to_string()],
     })?;
-    let map_path = root.join("docs/HUMAN_TERMINOLOGY.md");
-    let map_text = fs::read_to_string(&map_path).map_err(|err| TerminologyCheckError {
-        missing: vec![format!("read {}: {err}", map_path.display())],
-    })?;
-
     let mut missing = Vec::new();
-    for entry in TERMINOLOGY {
-        if !map_text.contains(entry.stable_locator) {
-            missing.push(format!(
-                "docs/HUMAN_TERMINOLOGY.md does not mention stable internal locator `{}`",
-                entry.stable_locator
-            ));
-        }
-        if !map_text.contains(entry.human_name) {
-            missing.push(format!(
-                "docs/HUMAN_TERMINOLOGY.md does not mention human name `{}`",
-                entry.human_name
-            ));
-        }
-        if !map_text.contains(entry.rust_hint) {
-            missing.push(format!(
-                "docs/HUMAN_TERMINOLOGY.md does not mention rust hint `{}`",
-                entry.rust_hint
-            ));
-        }
-    }
-
+    check_source_owned_terminology_entries(&mut missing);
     check_user_facing_docs(&root, &mut missing);
     check_demo_stdout_labels(&root, &mut missing);
     check_human_api_aliases(&root, &mut missing);
 
     if missing.is_empty() {
         println!(
-            "terminology ok: {} human names mapped; selected docs and demo labels are human-first",
+            "terminology ok: {} source-owned human names mapped; selected docs and demo labels are human-first",
             TERMINOLOGY.len()
         );
         Ok(())
     } else {
         Err(TerminologyCheckError { missing })
+    }
+}
+
+fn check_source_owned_terminology_entries(missing: &mut Vec<String>) {
+    for entry in TERMINOLOGY {
+        if entry.stable_locator.is_empty() {
+            missing.push("source-owned terminology entry has empty stable locator".to_string());
+        }
+        if entry.human_name.is_empty() {
+            missing.push(format!(
+                "source-owned terminology entry `{}` has empty human name",
+                entry.stable_locator
+            ));
+        }
+        if entry.rust_hint.is_empty() {
+            missing.push(format!(
+                "source-owned terminology entry `{}` has empty rust hint",
+                entry.stable_locator
+            ));
+        }
+        if entry.role.is_empty() {
+            missing.push(format!(
+                "source-owned terminology entry `{}` has empty role",
+                entry.stable_locator
+            ));
+        }
     }
 }
 

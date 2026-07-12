@@ -2219,7 +2219,9 @@ fn print_help() {
     );
     println!("  check-code-navigability  validate zero clippy-warning state across all targets");
     println!("  terminology              print human terminology map");
-    println!("  check-terminology        validate required human-terminology docs");
+    println!(
+        "  check-terminology        validate source-owned terminology and human-readable surfaces"
+    );
     println!("  human-api                print human-named Rust API alias map");
     println!("  check-human-api-aliases  validate required human-named Rust API alias modules");
     println!("  check-human-readability  detect naked internal-locator use in selected public docs and demo labels");
