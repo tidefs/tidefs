@@ -106,8 +106,11 @@ generic/068
 generic/085
 generic/275
 
-# --- Insert/collapse range (FALLOC_FL_INSERT_RANGE/FALLOC_FL_COLLAPSE_RANGE
-#     not supported; returns EOPNOTSUPP) ---
+# --- Insert/collapse range xfstests harness prechecks ---
+#   Focused FUSE xfstests run 29188560825 requested generic/060,
+#   generic/061, generic/063, generic/064, and generic/072. The rows were not
+#   runnable: generic/060-064 stopped at xfs_io fiemap prechecks, and
+#   generic/072 stopped at the xfs_io fcollapse precheck.
 generic/060
 generic/061
 generic/063
