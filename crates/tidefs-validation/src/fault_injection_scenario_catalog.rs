@@ -2,7 +2,7 @@
 //! Fault injection scenario catalog.
 //!
 //! Maps required failure scenarios to fault classes, crash injection points,
-//! scripts, historical ticket ids, and release gaps across every TideFS
+//! scripts, current lineage records, and fail-closed gaps across every TideFS
 //! subsystem.
 //!
 //! This is a prerequisite/documentation artifact. It documents what fault
@@ -20,9 +20,8 @@
 //! the thread-local injection mechanism (arm, check, disarm).
 //!
 //! This module defines the *scenario layer*: it binds fault classes and
-//! injection points into named, release-gate-mapped scenarios with concrete
-//! scripts and historical ticket ids so release readiness can be evaluated
-//! systematically.
+//! injection points into named, gate-mapped scenarios with concrete scripts,
+//! current claim/evidence lineage, and explicit fail-closed gap states.
 
 use serde::{Deserialize, Serialize};
 
@@ -47,8 +46,8 @@ pub struct FaultInjectionScenario {
     pub crash_injection_points: Vec<String>,
     /// Release gate(s) this scenario validates.
     pub release_gates: Vec<ReleaseGateRef>,
-    /// Existing historical ticket id(s) that own this scenario.
-    pub tickets: Vec<u64>,
+    /// Current lineage, evidence class, or fail-closed gap state for this scenario.
+    pub lineage: Vec<ScenarioLineageRef>,
     /// Script path(s) that execute this scenario (Nix VM, shell, xtask).
     pub scripts: Vec<String>,
     /// Current coverage status.
@@ -112,6 +111,17 @@ pub struct ReleaseGateRef {
     pub source: String,
 }
 
+/// Current lineage state for a fault injection scenario.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ScenarioLineageRef {
+    /// Current source of ownership or authority for the row.
+    pub owner: String,
+    /// Current evidence class or validation class that can close the row.
+    pub evidence_class: String,
+    /// Bounded state for the row; gaps must remain fail-closed.
+    pub gap_state: String,
+}
+
 /// Coverage status of a fault injection scenario.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -120,8 +130,8 @@ pub enum ScenarioCoverage {
     CargoCovered,
     /// Scenario has a Nix VM / QEMU script but runtime validation not yet recorded.
     ScriptExists,
-    /// Scenario is owned by a historical ticket id.
-    TicketOwned,
+    /// Scenario is tracked through current claim/evidence lineage.
+    LineageTracked,
     /// Scenario has runtime validation output (T3+).
     RuntimeValidation,
     /// No coverage exists; this is a gap.
@@ -232,7 +242,7 @@ impl FaultInjectionScenarioCatalog {
 
         // Summary by subsystem
         out.push_str("## Coverage Summary\n\n");
-        out.push_str("| Subsystem | Total | Cargo | Script | Ticket | Runtime | Gap |\n");
+        out.push_str("| Subsystem | Total | Cargo | Script | Lineage | Runtime | Gap |\n");
         out.push_str("|---|---|---|---|---|---|---|\n");
         for sub in ALL_SUBSYSTEMS {
             let total = self.count_by_subsystem(*sub);
@@ -253,11 +263,11 @@ impl FaultInjectionScenarioCatalog {
                     s.subsystem.contains(sub) && s.coverage == ScenarioCoverage::ScriptExists
                 })
                 .count();
-            let ticket = self
+            let lineage = self
                 .scenarios
                 .iter()
                 .filter(|s| {
-                    s.subsystem.contains(sub) && s.coverage == ScenarioCoverage::TicketOwned
+                    s.subsystem.contains(sub) && s.coverage == ScenarioCoverage::LineageTracked
                 })
                 .count();
             let runtime = self
@@ -273,14 +283,14 @@ impl FaultInjectionScenarioCatalog {
                 .filter(|s| s.subsystem.contains(sub) && s.coverage == ScenarioCoverage::Gap)
                 .count();
             out.push_str(&format!(
-                "| {} | {total} | {cargo} | {script} | {ticket} | {runtime} | {gap} |\n",
+                "| {} | {total} | {cargo} | {script} | {lineage} | {runtime} | {gap} |\n",
                 sub.label()
             ));
         }
 
         // Detailed scenario table
         out.push_str("\n## Scenario Catalog\n\n");
-        out.push_str("| ID | Name | Subsystem | Fault Classes | Injection Points | Release Gates | Tickets | Scripts | Coverage | Tier |\n");
+        out.push_str("| ID | Name | Subsystem | Fault Classes | Injection Points | Release Gates | Lineage | Scripts | Coverage | Tier |\n");
         out.push_str("|---|---|---|---|---|---|---|---|---|---|\n");
         for s in &self.scenarios {
             let subs: Vec<&str> = s.subsystem.iter().map(|x| x.label()).collect();
@@ -288,7 +298,7 @@ impl FaultInjectionScenarioCatalog {
             let coverage_str = match s.coverage {
                 ScenarioCoverage::CargoCovered => "cargo",
                 ScenarioCoverage::ScriptExists => "script",
-                ScenarioCoverage::TicketOwned => "ticket",
+                ScenarioCoverage::LineageTracked => "lineage",
                 ScenarioCoverage::RuntimeValidation => "runtime",
                 ScenarioCoverage::Gap => "**GAP**",
             };
@@ -300,7 +310,7 @@ impl FaultInjectionScenarioCatalog {
                 s.fault_classes.join(", "),
                 s.crash_injection_points.join(", "),
                 gates.join("; "),
-                format_tickets(&s.tickets),
+                format_lineage(&s.lineage),
                 s.scripts.join(", "),
                 coverage_str,
                 s.required_validation_tier.label(),
@@ -329,15 +339,89 @@ impl FaultInjectionScenarioCatalog {
     }
 }
 
-fn format_tickets(tickets: &[u64]) -> String {
-    if tickets.is_empty() {
-        return "-".to_string();
+fn format_lineage(lineage: &[ScenarioLineageRef]) -> String {
+    if lineage.is_empty() {
+        return "none".to_string();
     }
-    tickets
+
+    lineage
         .iter()
-        .map(|t| format!("#{t}"))
+        .map(|entry| {
+            format!(
+                "{} / {} / {}",
+                entry.owner, entry.evidence_class, entry.gap_state
+            )
+        })
         .collect::<Vec<_>>()
-        .join(", ")
+        .join("<br>")
+}
+
+fn claim_lineage(owner: &str, evidence_class: &str) -> Vec<ScenarioLineageRef> {
+    vec![ScenarioLineageRef {
+        owner: owner.into(),
+        evidence_class: evidence_class.into(),
+        gap_state: "claim/evidence-tracked".into(),
+    }]
+}
+
+fn fail_closed_gap_lineage(owner: &str, evidence_class: &str) -> Vec<ScenarioLineageRef> {
+    vec![ScenarioLineageRef {
+        owner: owner.into(),
+        evidence_class: evidence_class.into(),
+        gap_state: "fail-closed-gap".into(),
+    }]
+}
+
+fn release_gate(gate: &str) -> ReleaseGateRef {
+    let source = match gate {
+        "TXG group commit and crash boundary"
+        | "Intent-log crash replay"
+        | "Flush/FUA txg barrier"
+        | "Committed-root selection" => "docs/STORAGE_INTENT_POLICY_AUTHORITY.md",
+
+        "Pool import and recovery" | "Pool import lifecycle" | "Pool remount lifecycle" => {
+            "docs/POOL_IMPORT_EXPORT_DEVICE_TOPOLOGY_DESIGN.md"
+        }
+
+        "FUSE write durability"
+        | "FUSE fsync durability"
+        | "FUSE rename atomicity"
+        | "FUSE unlink atomicity"
+        | "FUSE fallocate and space accounting"
+        | "FUSE writeback-cache correctness"
+        | "FUSE mmap coherence" => "docs/PAGE_CACHE_WRITEBACK_AUTHORITY.md",
+
+        "Kernel crash-loop replay campaign"
+        | "Kernel block crash consistency"
+        | "Kernel memory-pressure reclaim" => "docs/KERNEL_RESIDENCY_AUTHORITY.md",
+
+        "ublk multi-queue teardown" | "ublk inflight I/O drain" | "ublk device lifecycle" => {
+            "docs/REQUEST_CONTRACT.md"
+        }
+
+        "Transport link resilience" | "Transport session establishment" => {
+            "docs/TRANSPORT_CLUSTER_AUTHORITY.md"
+        }
+
+        "Multi-node partition and heal"
+        | "Node restart and rejoin"
+        | "Rebuild from peer replicas"
+        | "Membership lease and fencing" => "docs/MEMBERSHIP_AUTHORITY.md",
+
+        "Pool capacity enforcement" => "docs/CAPACITY_ACCOUNTING_AUTHORITY.md",
+        "RDMA carrier failover" => "docs/GITHUB_CI.md",
+
+        "Repair: automatic mount-time repair_cycle"
+        | "Scrub/repair verification"
+        | "Checksum integrity on read" => "validation/claims.toml",
+
+        _ => "validation/claims.toml",
+    };
+
+    ReleaseGateRef {
+        gate: gate.into(),
+        source: source.into(),
+    }
 }
 
 const ALL_SUBSYSTEMS: &[Subsystem] = &[
@@ -370,11 +454,8 @@ fn build_catalog() -> Vec<FaultInjectionScenario> {
         subsystem: vec![Subsystem::StorageCore],
         fault_classes: vec!["fi.process.crash_subject".into()],
         crash_injection_points: vec!["COMMIT_GROUP_BEFORE_QUIESCE".into()],
-        release_gates: vec![ReleaseGateRef {
-            gate: "TXG group commit and crash boundary".into(),
-            source: "FEATURE_MATRIX.md".into(),
-        }],
-        tickets: vec![6319, 6253],
+        release_gates: vec![release_gate("TXG group commit and crash boundary")],
+        lineage: claim_lineage("validation/claims.toml", "fault-injection scenario evidence"),
         scripts: vec!["crates/tidefs-local-filesystem/tests/crash_injection_tests.rs".into()],
         coverage: ScenarioCoverage::CargoCovered,
         required_validation_tier: ValidationTier::Tier3,
@@ -387,11 +468,8 @@ fn build_catalog() -> Vec<FaultInjectionScenario> {
         subsystem: vec![Subsystem::StorageCore],
         fault_classes: vec!["fi.process.crash_subject".into()],
         crash_injection_points: vec!["COMMIT_GROUP_BEFORE_COMMIT".into()],
-        release_gates: vec![ReleaseGateRef {
-            gate: "TXG group commit and crash boundary".into(),
-            source: "FEATURE_MATRIX.md".into(),
-        }],
-        tickets: vec![6319],
+        release_gates: vec![release_gate("TXG group commit and crash boundary")],
+        lineage: claim_lineage("validation/claims.toml", "fault-injection scenario evidence"),
         scripts: vec!["crates/tidefs-local-filesystem/tests/crash_injection_tests.rs".into()],
         coverage: ScenarioCoverage::CargoCovered,
         required_validation_tier: ValidationTier::Tier3,
@@ -404,11 +482,8 @@ fn build_catalog() -> Vec<FaultInjectionScenario> {
         subsystem: vec![Subsystem::StorageCore],
         fault_classes: vec!["fi.process.crash_subject".into()],
         crash_injection_points: vec!["COMMIT_GROUP_AFTER_APPEND_DATA".into()],
-        release_gates: vec![ReleaseGateRef {
-            gate: "Intent-log crash replay".into(),
-            source: "FEATURE_MATRIX.md".into(),
-        }],
-        tickets: vec![6253, 6254],
+        release_gates: vec![release_gate("Intent-log crash replay")],
+        lineage: claim_lineage("validation/claims.toml", "fault-injection scenario evidence"),
         scripts: vec!["crates/tidefs-local-filesystem/tests/crash_injection_tests.rs".into()],
         coverage: ScenarioCoverage::CargoCovered,
         required_validation_tier: ValidationTier::Tier3,
@@ -421,11 +496,8 @@ fn build_catalog() -> Vec<FaultInjectionScenario> {
         subsystem: vec![Subsystem::StorageCore],
         fault_classes: vec!["fi.process.crash_subject".into()],
         crash_injection_points: vec!["COMMIT_GROUP_BEFORE_COMMIT".into()],
-        release_gates: vec![ReleaseGateRef {
-            gate: "TXG group commit and crash boundary".into(),
-            source: "FEATURE_MATRIX.md".into(),
-        }],
-        tickets: vec![6319],
+        release_gates: vec![release_gate("TXG group commit and crash boundary")],
+        lineage: claim_lineage("validation/claims.toml", "fault-injection scenario evidence"),
         scripts: vec!["crates/tidefs-local-filesystem/tests/crash_injection_tests.rs".into()],
         coverage: ScenarioCoverage::CargoCovered,
         required_validation_tier: ValidationTier::Tier3,
@@ -439,13 +511,10 @@ fn build_catalog() -> Vec<FaultInjectionScenario> {
         subsystem: vec![Subsystem::StorageCore],
         fault_classes: vec!["fi.process.crash_subject".into()],
         crash_injection_points: vec!["RECOVERY_BEFORE_REPLAY".into()],
-        release_gates: vec![ReleaseGateRef {
-            gate: "Pool import and recovery".into(),
-            source: "FEATURE_MATRIX.md".into(),
-        }],
-        tickets: vec![6427],
+        release_gates: vec![release_gate("Pool import and recovery")],
+        lineage: claim_lineage("validation/claims.toml", "fault-injection scenario evidence"),
         scripts: vec![],
-        coverage: ScenarioCoverage::TicketOwned,
+        coverage: ScenarioCoverage::LineageTracked,
         required_validation_tier: ValidationTier::Tier3,
     });
 
@@ -456,13 +525,10 @@ fn build_catalog() -> Vec<FaultInjectionScenario> {
         subsystem: vec![Subsystem::StorageCore],
         fault_classes: vec!["fi.process.crash_subject".into()],
         crash_injection_points: vec!["RECOVERY_BEFORE_ROOT_SELECT".into()],
-        release_gates: vec![ReleaseGateRef {
-            gate: "Pool import and recovery".into(),
-            source: "FEATURE_MATRIX.md".into(),
-        }],
-        tickets: vec![6427],
+        release_gates: vec![release_gate("Pool import and recovery")],
+        lineage: claim_lineage("validation/claims.toml", "fault-injection scenario evidence"),
         scripts: vec![],
-        coverage: ScenarioCoverage::TicketOwned,
+        coverage: ScenarioCoverage::LineageTracked,
         required_validation_tier: ValidationTier::Tier3,
     });
 
@@ -474,13 +540,10 @@ fn build_catalog() -> Vec<FaultInjectionScenario> {
         subsystem: vec![Subsystem::Fuse, Subsystem::StorageCore],
         fault_classes: vec!["fi.process.crash_subject".into()],
         crash_injection_points: vec!["OP_WRITE_BEFORE_EXTENT_UPDATE".into()],
-        release_gates: vec![ReleaseGateRef {
-            gate: "FUSE write durability".into(),
-            source: "FEATURE_MATRIX.md".into(),
-        }],
-        tickets: vec![6427, 6431],
+        release_gates: vec![release_gate("FUSE write durability")],
+        lineage: claim_lineage("validation/claims.toml", "fault-injection scenario evidence"),
         scripts: vec!["nix/vm/fuse-writeback-cache-validation.nix".into()],
-        coverage: ScenarioCoverage::TicketOwned,
+        coverage: ScenarioCoverage::LineageTracked,
         required_validation_tier: ValidationTier::Tier3,
     });
 
@@ -491,13 +554,10 @@ fn build_catalog() -> Vec<FaultInjectionScenario> {
         subsystem: vec![Subsystem::Fuse, Subsystem::StorageCore],
         fault_classes: vec!["fi.process.crash_subject".into()],
         crash_injection_points: vec!["OP_FSYNC_BEFORE_FLUSH".into()],
-        release_gates: vec![ReleaseGateRef {
-            gate: "FUSE fsync durability".into(),
-            source: "FEATURE_MATRIX.md".into(),
-        }],
-        tickets: vec![6427],
+        release_gates: vec![release_gate("FUSE fsync durability")],
+        lineage: claim_lineage("validation/claims.toml", "fault-injection scenario evidence"),
         scripts: vec![],
-        coverage: ScenarioCoverage::TicketOwned,
+        coverage: ScenarioCoverage::LineageTracked,
         required_validation_tier: ValidationTier::Tier3,
     });
 
@@ -509,13 +569,10 @@ fn build_catalog() -> Vec<FaultInjectionScenario> {
         subsystem: vec![Subsystem::Fuse, Subsystem::StorageCore],
         fault_classes: vec!["fi.process.crash_subject".into()],
         crash_injection_points: vec!["OP_RENAME_AFTER_RESOLVE".into()],
-        release_gates: vec![ReleaseGateRef {
-            gate: "FUSE rename atomicity".into(),
-            source: "FEATURE_MATRIX.md".into(),
-        }],
-        tickets: vec![6427],
+        release_gates: vec![release_gate("FUSE rename atomicity")],
+        lineage: claim_lineage("validation/claims.toml", "fault-injection scenario evidence"),
         scripts: vec![],
-        coverage: ScenarioCoverage::TicketOwned,
+        coverage: ScenarioCoverage::LineageTracked,
         required_validation_tier: ValidationTier::Tier3,
     });
 
@@ -526,13 +583,10 @@ fn build_catalog() -> Vec<FaultInjectionScenario> {
         subsystem: vec![Subsystem::Fuse, Subsystem::StorageCore],
         fault_classes: vec!["fi.process.crash_subject".into()],
         crash_injection_points: vec!["OP_UNLINK_BEFORE_NLINK_DECR".into()],
-        release_gates: vec![ReleaseGateRef {
-            gate: "FUSE unlink atomicity".into(),
-            source: "FEATURE_MATRIX.md".into(),
-        }],
-        tickets: vec![6427],
+        release_gates: vec![release_gate("FUSE unlink atomicity")],
+        lineage: claim_lineage("validation/claims.toml", "fault-injection scenario evidence"),
         scripts: vec![],
-        coverage: ScenarioCoverage::TicketOwned,
+        coverage: ScenarioCoverage::LineageTracked,
         required_validation_tier: ValidationTier::Tier3,
     });
 
@@ -543,13 +597,10 @@ fn build_catalog() -> Vec<FaultInjectionScenario> {
         subsystem: vec![Subsystem::Fuse, Subsystem::StorageCore],
         fault_classes: vec!["fi.process.crash_subject".into()],
         crash_injection_points: vec!["OP_UNLINK_AFTER_NLINK_ZERO".into()],
-        release_gates: vec![ReleaseGateRef {
-            gate: "FUSE unlink atomicity".into(),
-            source: "FEATURE_MATRIX.md".into(),
-        }],
-        tickets: vec![6427],
+        release_gates: vec![release_gate("FUSE unlink atomicity")],
+        lineage: claim_lineage("validation/claims.toml", "fault-injection scenario evidence"),
         scripts: vec![],
-        coverage: ScenarioCoverage::TicketOwned,
+        coverage: ScenarioCoverage::LineageTracked,
         required_validation_tier: ValidationTier::Tier3,
     });
 
@@ -561,13 +612,10 @@ fn build_catalog() -> Vec<FaultInjectionScenario> {
         subsystem: vec![Subsystem::Fuse, Subsystem::StorageCore],
         fault_classes: vec!["fi.process.crash_subject".into()],
         crash_injection_points: vec!["OP_ALLOCATE_BEFORE_SPACE_UPDATE".into()],
-        release_gates: vec![ReleaseGateRef {
-            gate: "FUSE fallocate and space accounting".into(),
-            source: "FEATURE_MATRIX.md".into(),
-        }],
-        tickets: vec![6423, 6427],
+        release_gates: vec![release_gate("FUSE fallocate and space accounting")],
+        lineage: claim_lineage("validation/claims.toml", "fault-injection scenario evidence"),
         scripts: vec![],
-        coverage: ScenarioCoverage::TicketOwned,
+        coverage: ScenarioCoverage::LineageTracked,
         required_validation_tier: ValidationTier::Tier3,
     });
 
@@ -582,13 +630,10 @@ fn build_catalog() -> Vec<FaultInjectionScenario> {
             "cm.storage.bitflip.payload".into(),
         ],
         crash_injection_points: vec!["REPAIR_BEFORE_APPLY".into()],
-        release_gates: vec![ReleaseGateRef {
-            gate: "Repair: automatic mount-time repair_cycle".into(),
-            source: "FEATURE_MATRIX.md".into(),
-        }],
-        tickets: vec![6330],
+        release_gates: vec![release_gate("Repair: automatic mount-time repair_cycle")],
+        lineage: claim_lineage("validation/claims.toml", "fault-injection scenario evidence"),
         scripts: vec![],
-        coverage: ScenarioCoverage::TicketOwned,
+        coverage: ScenarioCoverage::LineageTracked,
         required_validation_tier: ValidationTier::Tier3,
     });
 
@@ -599,13 +644,10 @@ fn build_catalog() -> Vec<FaultInjectionScenario> {
         subsystem: vec![Subsystem::Repair, Subsystem::StorageCore],
         fault_classes: vec!["fi.process.crash_subject".into()],
         crash_injection_points: vec!["REPAIR_BEFORE_WRITEBACK".into()],
-        release_gates: vec![ReleaseGateRef {
-            gate: "Repair: automatic mount-time repair_cycle".into(),
-            source: "FEATURE_MATRIX.md".into(),
-        }],
-        tickets: vec![6330],
+        release_gates: vec![release_gate("Repair: automatic mount-time repair_cycle")],
+        lineage: claim_lineage("validation/claims.toml", "fault-injection scenario evidence"),
         scripts: vec![],
-        coverage: ScenarioCoverage::TicketOwned,
+        coverage: ScenarioCoverage::LineageTracked,
         required_validation_tier: ValidationTier::Tier3,
     });
 
@@ -621,9 +663,9 @@ fn build_catalog() -> Vec<FaultInjectionScenario> {
             gate: "Kernel crash-loop replay campaign".into(),
             source: "docs/GITHUB_CI.md".into(),
         }],
-        tickets: vec![6396],
+        lineage: claim_lineage("validation/claims.toml", "fault-injection scenario evidence"),
         scripts: vec![],
-        coverage: ScenarioCoverage::TicketOwned,
+        coverage: ScenarioCoverage::LineageTracked,
         required_validation_tier: ValidationTier::Tier5,
     });
 
@@ -635,16 +677,13 @@ fn build_catalog() -> Vec<FaultInjectionScenario> {
         subsystem: vec![Subsystem::KernelBlock, Subsystem::Ublk],
         fault_classes: vec!["fi.process.crash_subject".into()],
         crash_injection_points: vec![],
-        release_gates: vec![ReleaseGateRef {
-            gate: "Kernel block crash consistency".into(),
-            source: "FEATURE_MATRIX.md".into(),
-        }],
-        tickets: vec![6280],
+        release_gates: vec![release_gate("Kernel block crash consistency")],
+        lineage: claim_lineage("validation/claims.toml", "fault-injection scenario evidence"),
         scripts: vec![
             "nix/vm/kernel-block-fio-powercut-campaign.nix".into(),
             "nix/vm/kernel-block-crash-consistency.nix".into(),
         ],
-        coverage: ScenarioCoverage::TicketOwned,
+        coverage: ScenarioCoverage::LineageTracked,
         required_validation_tier: ValidationTier::Tier5,
     });
 
@@ -656,13 +695,10 @@ fn build_catalog() -> Vec<FaultInjectionScenario> {
         subsystem: vec![Subsystem::KernelBlock, Subsystem::Ublk],
         fault_classes: vec!["fi.process.crash_subject".into()],
         crash_injection_points: vec![],
-        release_gates: vec![ReleaseGateRef {
-            gate: "ublk multi-queue teardown".into(),
-            source: "FEATURE_MATRIX.md".into(),
-        }],
-        tickets: vec![6376],
+        release_gates: vec![release_gate("ublk multi-queue teardown")],
+        lineage: claim_lineage("validation/claims.toml", "fault-injection scenario evidence"),
         scripts: vec![],
-        coverage: ScenarioCoverage::TicketOwned,
+        coverage: ScenarioCoverage::LineageTracked,
         required_validation_tier: ValidationTier::Tier5,
     });
 
@@ -674,11 +710,8 @@ fn build_catalog() -> Vec<FaultInjectionScenario> {
         subsystem: vec![Subsystem::StorageCore],
         fault_classes: vec!["cm.storage.bitflip.checkpoint".into()],
         crash_injection_points: vec![],
-        release_gates: vec![ReleaseGateRef {
-            gate: "Checksum integrity on read".into(),
-            source: "FEATURE_MATRIX.md".into(),
-        }],
-        tickets: vec![],
+        release_gates: vec![release_gate("Checksum integrity on read")],
+        lineage: fail_closed_gap_lineage("validation/claims.toml", "fault-injection gap evidence"),
         scripts: vec![],
         coverage: ScenarioCoverage::Gap,
         required_validation_tier: ValidationTier::Tier3,
@@ -691,11 +724,8 @@ fn build_catalog() -> Vec<FaultInjectionScenario> {
         subsystem: vec![Subsystem::StorageCore],
         fault_classes: vec!["cm.storage.bitflip.metadata".into()],
         crash_injection_points: vec![],
-        release_gates: vec![ReleaseGateRef {
-            gate: "Checksum integrity on read".into(),
-            source: "FEATURE_MATRIX.md".into(),
-        }],
-        tickets: vec![],
+        release_gates: vec![release_gate("Checksum integrity on read")],
+        lineage: fail_closed_gap_lineage("validation/claims.toml", "fault-injection gap evidence"),
         scripts: vec![],
         coverage: ScenarioCoverage::Gap,
         required_validation_tier: ValidationTier::Tier3,
@@ -708,11 +738,8 @@ fn build_catalog() -> Vec<FaultInjectionScenario> {
         subsystem: vec![Subsystem::StorageCore, Subsystem::Fuse],
         fault_classes: vec!["cm.storage.bitflip.payload".into()],
         crash_injection_points: vec![],
-        release_gates: vec![ReleaseGateRef {
-            gate: "Checksum integrity on read".into(),
-            source: "FEATURE_MATRIX.md".into(),
-        }],
-        tickets: vec![],
+        release_gates: vec![release_gate("Checksum integrity on read")],
+        lineage: fail_closed_gap_lineage("validation/claims.toml", "fault-injection gap evidence"),
         scripts: vec![],
         coverage: ScenarioCoverage::Gap,
         required_validation_tier: ValidationTier::Tier3,
@@ -726,11 +753,8 @@ fn build_catalog() -> Vec<FaultInjectionScenario> {
         subsystem: vec![Subsystem::StorageCore],
         fault_classes: vec!["cm.storage.truncate_tail".into()],
         crash_injection_points: vec![],
-        release_gates: vec![ReleaseGateRef {
-            gate: "Intent-log crash replay".into(),
-            source: "FEATURE_MATRIX.md".into(),
-        }],
-        tickets: vec![],
+        release_gates: vec![release_gate("Intent-log crash replay")],
+        lineage: fail_closed_gap_lineage("validation/claims.toml", "fault-injection gap evidence"),
         scripts: vec![],
         coverage: ScenarioCoverage::Gap,
         required_validation_tier: ValidationTier::Tier3,
@@ -743,11 +767,8 @@ fn build_catalog() -> Vec<FaultInjectionScenario> {
         subsystem: vec![Subsystem::StorageCore],
         fault_classes: vec!["cm.storage.partial_header".into()],
         crash_injection_points: vec![],
-        release_gates: vec![ReleaseGateRef {
-            gate: "Intent-log crash replay".into(),
-            source: "FEATURE_MATRIX.md".into(),
-        }],
-        tickets: vec![],
+        release_gates: vec![release_gate("Intent-log crash replay")],
+        lineage: fail_closed_gap_lineage("validation/claims.toml", "fault-injection gap evidence"),
         scripts: vec![],
         coverage: ScenarioCoverage::Gap,
         required_validation_tier: ValidationTier::Tier3,
@@ -760,11 +781,8 @@ fn build_catalog() -> Vec<FaultInjectionScenario> {
         subsystem: vec![Subsystem::StorageCore],
         fault_classes: vec!["cm.storage.flush_omission".into()],
         crash_injection_points: vec![],
-        release_gates: vec![ReleaseGateRef {
-            gate: "Flush/FUA txg barrier".into(),
-            source: "FEATURE_MATRIX.md".into(),
-        }],
-        tickets: vec![],
+        release_gates: vec![release_gate("Flush/FUA txg barrier")],
+        lineage: fail_closed_gap_lineage("validation/claims.toml", "fault-injection gap evidence"),
         scripts: vec![],
         coverage: ScenarioCoverage::Gap,
         required_validation_tier: ValidationTier::Tier3,
@@ -777,11 +795,8 @@ fn build_catalog() -> Vec<FaultInjectionScenario> {
         subsystem: vec![Subsystem::StorageCore, Subsystem::Repair],
         fault_classes: vec!["cm.storage.zeroed_range".into()],
         crash_injection_points: vec![],
-        release_gates: vec![ReleaseGateRef {
-            gate: "Scrub/repair verification".into(),
-            source: "FEATURE_MATRIX.md".into(),
-        }],
-        tickets: vec![],
+        release_gates: vec![release_gate("Scrub/repair verification")],
+        lineage: fail_closed_gap_lineage("validation/claims.toml", "fault-injection gap evidence"),
         scripts: vec![],
         coverage: ScenarioCoverage::Gap,
         required_validation_tier: ValidationTier::Tier3,
@@ -794,11 +809,8 @@ fn build_catalog() -> Vec<FaultInjectionScenario> {
         subsystem: vec![Subsystem::StorageCore],
         fault_classes: vec!["cm.storage.replay_stale_copy".into()],
         crash_injection_points: vec![],
-        release_gates: vec![ReleaseGateRef {
-            gate: "Committed-root selection".into(),
-            source: "FEATURE_MATRIX.md".into(),
-        }],
-        tickets: vec![],
+        release_gates: vec![release_gate("Committed-root selection")],
+        lineage: fail_closed_gap_lineage("validation/claims.toml", "fault-injection gap evidence"),
         scripts: vec![],
         coverage: ScenarioCoverage::Gap,
         required_validation_tier: ValidationTier::Tier3,
@@ -812,13 +824,10 @@ fn build_catalog() -> Vec<FaultInjectionScenario> {
         subsystem: vec![Subsystem::Ublk],
         fault_classes: vec!["fi.process.crash_subject".into()],
         crash_injection_points: vec![],
-        release_gates: vec![ReleaseGateRef {
-            gate: "ublk inflight I/O drain".into(),
-            source: "FEATURE_MATRIX.md".into(),
-        }],
-        tickets: vec![6376],
+        release_gates: vec![release_gate("ublk inflight I/O drain")],
+        lineage: claim_lineage("validation/claims.toml", "fault-injection scenario evidence"),
         scripts: vec![],
-        coverage: ScenarioCoverage::TicketOwned,
+        coverage: ScenarioCoverage::LineageTracked,
         required_validation_tier: ValidationTier::Tier3,
     });
 
@@ -829,13 +838,10 @@ fn build_catalog() -> Vec<FaultInjectionScenario> {
         subsystem: vec![Subsystem::Ublk],
         fault_classes: vec!["fi.process.crash_subject".into()],
         crash_injection_points: vec![],
-        release_gates: vec![ReleaseGateRef {
-            gate: "ublk device lifecycle".into(),
-            source: "FEATURE_MATRIX.md".into(),
-        }],
-        tickets: vec![6374],
+        release_gates: vec![release_gate("ublk device lifecycle")],
+        lineage: claim_lineage("validation/claims.toml", "fault-injection scenario evidence"),
         scripts: vec![],
-        coverage: ScenarioCoverage::TicketOwned,
+        coverage: ScenarioCoverage::LineageTracked,
         required_validation_tier: ValidationTier::Tier3,
     });
 
@@ -847,11 +853,8 @@ fn build_catalog() -> Vec<FaultInjectionScenario> {
         subsystem: vec![Subsystem::PoolLifecycle, Subsystem::StorageCore],
         fault_classes: vec!["fi.process.crash_subject".into()],
         crash_injection_points: vec![],
-        release_gates: vec![ReleaseGateRef {
-            gate: "Pool import lifecycle".into(),
-            source: "FEATURE_MATRIX.md".into(),
-        }],
-        tickets: vec![],
+        release_gates: vec![release_gate("Pool import lifecycle")],
+        lineage: fail_closed_gap_lineage("validation/claims.toml", "fault-injection gap evidence"),
         scripts: vec![],
         coverage: ScenarioCoverage::Gap,
         required_validation_tier: ValidationTier::Tier3,
@@ -864,11 +867,8 @@ fn build_catalog() -> Vec<FaultInjectionScenario> {
         subsystem: vec![Subsystem::PoolLifecycle, Subsystem::StorageCore, Subsystem::Fuse],
         fault_classes: vec!["fi.process.crash_subject".into()],
         crash_injection_points: vec![],
-        release_gates: vec![ReleaseGateRef {
-            gate: "Pool remount lifecycle".into(),
-            source: "FEATURE_MATRIX.md".into(),
-        }],
-        tickets: vec![],
+        release_gates: vec![release_gate("Pool remount lifecycle")],
+        lineage: claim_lineage("validation/claims.toml", "fault-injection scenario evidence"),
         scripts: vec!["nix/vm/pool-remount-lifecycle-validation.nix".into()],
         coverage: ScenarioCoverage::ScriptExists,
         required_validation_tier: ValidationTier::Tier3,
@@ -882,11 +882,8 @@ fn build_catalog() -> Vec<FaultInjectionScenario> {
         subsystem: vec![Subsystem::Transport],
         fault_classes: vec!["fi.transport.pause_link".into()],
         crash_injection_points: vec![],
-        release_gates: vec![ReleaseGateRef {
-            gate: "Transport link resilience".into(),
-            source: "FEATURE_MATRIX.md".into(),
-        }],
-        tickets: vec![],
+        release_gates: vec![release_gate("Transport link resilience")],
+        lineage: fail_closed_gap_lineage("validation/claims.toml", "fault-injection gap evidence"),
         scripts: vec![],
         coverage: ScenarioCoverage::Gap,
         required_validation_tier: ValidationTier::Tier7,
@@ -899,11 +896,8 @@ fn build_catalog() -> Vec<FaultInjectionScenario> {
         subsystem: vec![Subsystem::Transport],
         fault_classes: vec!["fi.transport.drop_next".into()],
         crash_injection_points: vec![],
-        release_gates: vec![ReleaseGateRef {
-            gate: "Transport session establishment".into(),
-            source: "FEATURE_MATRIX.md".into(),
-        }],
-        tickets: vec![],
+        release_gates: vec![release_gate("Transport session establishment")],
+        lineage: fail_closed_gap_lineage("validation/claims.toml", "fault-injection gap evidence"),
         scripts: vec![],
         coverage: ScenarioCoverage::Gap,
         required_validation_tier: ValidationTier::Tier7,
@@ -916,11 +910,8 @@ fn build_catalog() -> Vec<FaultInjectionScenario> {
         subsystem: vec![Subsystem::Transport, Subsystem::Membership, Subsystem::MultiNode],
         fault_classes: vec!["fi.transport.partition_bidir".into()],
         crash_injection_points: vec![],
-        release_gates: vec![ReleaseGateRef {
-            gate: "Multi-node partition and heal".into(),
-            source: "FEATURE_MATRIX.md".into(),
-        }],
-        tickets: vec![],
+        release_gates: vec![release_gate("Multi-node partition and heal")],
+        lineage: fail_closed_gap_lineage("validation/claims.toml", "fault-injection gap evidence"),
         scripts: vec![],
         coverage: ScenarioCoverage::Gap,
         required_validation_tier: ValidationTier::Tier7,
@@ -934,11 +925,8 @@ fn build_catalog() -> Vec<FaultInjectionScenario> {
         subsystem: vec![Subsystem::Membership, Subsystem::StorageCore, Subsystem::MultiNode],
         fault_classes: vec!["fi.process.restart_subject".into()],
         crash_injection_points: vec![],
-        release_gates: vec![ReleaseGateRef {
-            gate: "Node restart and rejoin".into(),
-            source: "FEATURE_MATRIX.md".into(),
-        }],
-        tickets: vec![],
+        release_gates: vec![release_gate("Node restart and rejoin")],
+        lineage: fail_closed_gap_lineage("validation/claims.toml", "fault-injection gap evidence"),
         scripts: vec![],
         coverage: ScenarioCoverage::Gap,
         required_validation_tier: ValidationTier::Tier7,
@@ -951,11 +939,8 @@ fn build_catalog() -> Vec<FaultInjectionScenario> {
         subsystem: vec![Subsystem::Membership, Subsystem::Repair, Subsystem::MultiNode],
         fault_classes: vec!["fi.process.wipe_local_state".into()],
         crash_injection_points: vec![],
-        release_gates: vec![ReleaseGateRef {
-            gate: "Rebuild from peer replicas".into(),
-            source: "FEATURE_MATRIX.md".into(),
-        }],
-        tickets: vec![],
+        release_gates: vec![release_gate("Rebuild from peer replicas")],
+        lineage: fail_closed_gap_lineage("validation/claims.toml", "fault-injection gap evidence"),
         scripts: vec![],
         coverage: ScenarioCoverage::Gap,
         required_validation_tier: ValidationTier::Tier7,
@@ -969,11 +954,8 @@ fn build_catalog() -> Vec<FaultInjectionScenario> {
         subsystem: vec![Subsystem::StorageCore, Subsystem::Fuse],
         fault_classes: vec!["fi.resource.reserve_floor_pressure".into()],
         crash_injection_points: vec![],
-        release_gates: vec![ReleaseGateRef {
-            gate: "Pool capacity enforcement".into(),
-            source: "FEATURE_MATRIX.md".into(),
-        }],
-        tickets: vec![],
+        release_gates: vec![release_gate("Pool capacity enforcement")],
+        lineage: fail_closed_gap_lineage("validation/claims.toml", "fault-injection gap evidence"),
         scripts: vec![],
         coverage: ScenarioCoverage::Gap,
         required_validation_tier: ValidationTier::Tier3,
@@ -986,13 +968,10 @@ fn build_catalog() -> Vec<FaultInjectionScenario> {
         subsystem: vec![Subsystem::KernelVfs, Subsystem::KernelBlock],
         fault_classes: vec!["fi.resource.memory_pressure".into()],
         crash_injection_points: vec![],
-        release_gates: vec![ReleaseGateRef {
-            gate: "Kernel memory-pressure reclaim".into(),
-            source: "FEATURE_MATRIX.md".into(),
-        }],
-        tickets: vec![6394],
+        release_gates: vec![release_gate("Kernel memory-pressure reclaim")],
+        lineage: claim_lineage("validation/claims.toml", "fault-injection scenario evidence"),
         scripts: vec![],
-        coverage: ScenarioCoverage::TicketOwned,
+        coverage: ScenarioCoverage::LineageTracked,
         required_validation_tier: ValidationTier::Tier5,
     });
 
@@ -1004,13 +983,10 @@ fn build_catalog() -> Vec<FaultInjectionScenario> {
         subsystem: vec![Subsystem::Rdma, Subsystem::Transport],
         fault_classes: vec!["fi.transport.pause_link".into()],
         crash_injection_points: vec![],
-        release_gates: vec![ReleaseGateRef {
-            gate: "RDMA carrier failover".into(),
-            source: "FEATURE_MATRIX.md".into(),
-        }],
-        tickets: vec![6502],
+        release_gates: vec![release_gate("RDMA carrier failover")],
+        lineage: claim_lineage("validation/claims.toml", "fault-injection scenario evidence"),
         scripts: vec!["nix/vm/rdma-two-node-validation.nix".into()],
-        coverage: ScenarioCoverage::TicketOwned,
+        coverage: ScenarioCoverage::LineageTracked,
         required_validation_tier: ValidationTier::Tier7,
     });
 
@@ -1025,11 +1001,8 @@ fn build_catalog() -> Vec<FaultInjectionScenario> {
             "fi.time.lease_expiry_race".into(),
         ],
         crash_injection_points: vec![],
-        release_gates: vec![ReleaseGateRef {
-            gate: "Membership lease and fencing".into(),
-            source: "FEATURE_MATRIX.md".into(),
-        }],
-        tickets: vec![],
+        release_gates: vec![release_gate("Membership lease and fencing")],
+        lineage: fail_closed_gap_lineage("validation/claims.toml", "fault-injection gap evidence"),
         scripts: vec![],
         coverage: ScenarioCoverage::Gap,
         required_validation_tier: ValidationTier::Tier7,
@@ -1043,13 +1016,10 @@ fn build_catalog() -> Vec<FaultInjectionScenario> {
         subsystem: vec![Subsystem::Fuse, Subsystem::StorageCore],
         fault_classes: vec!["fi.process.crash_subject".into()],
         crash_injection_points: vec![],
-        release_gates: vec![ReleaseGateRef {
-            gate: "FUSE writeback-cache correctness".into(),
-            source: "FEATURE_MATRIX.md".into(),
-        }],
-        tickets: vec![6371, 6427],
+        release_gates: vec![release_gate("FUSE writeback-cache correctness")],
+        lineage: claim_lineage("validation/claims.toml", "fault-injection scenario evidence"),
         scripts: vec!["nix/vm/fuse-writeback-cache-validation.nix".into()],
-        coverage: ScenarioCoverage::TicketOwned,
+        coverage: ScenarioCoverage::LineageTracked,
         required_validation_tier: ValidationTier::Tier3,
     });
 
@@ -1060,13 +1030,10 @@ fn build_catalog() -> Vec<FaultInjectionScenario> {
         subsystem: vec![Subsystem::Fuse, Subsystem::StorageCore],
         fault_classes: vec!["fi.process.crash_subject".into()],
         crash_injection_points: vec![],
-        release_gates: vec![ReleaseGateRef {
-            gate: "FUSE mmap coherence".into(),
-            source: "FEATURE_MATRIX.md".into(),
-        }],
-        tickets: vec![6426],
+        release_gates: vec![release_gate("FUSE mmap coherence")],
+        lineage: claim_lineage("validation/claims.toml", "fault-injection scenario evidence"),
         scripts: vec![],
-        coverage: ScenarioCoverage::TicketOwned,
+        coverage: ScenarioCoverage::LineageTracked,
         required_validation_tier: ValidationTier::Tier3,
     });
 
@@ -1126,6 +1093,60 @@ mod tests {
     }
 
     #[test]
+    fn every_scenario_has_lineage() {
+        let cat = FaultInjectionScenarioCatalog::canonical();
+        for s in &cat.scenarios {
+            assert!(!s.lineage.is_empty(), "scenario {} has no lineage", s.id);
+            for lineage in &s.lineage {
+                assert!(
+                    !lineage.owner.is_empty(),
+                    "scenario {} has empty lineage owner",
+                    s.id
+                );
+                assert!(
+                    !lineage.evidence_class.is_empty(),
+                    "scenario {} has empty lineage evidence class",
+                    s.id
+                );
+                assert!(
+                    !lineage.gap_state.is_empty(),
+                    "scenario {} has empty lineage gap state",
+                    s.id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn release_gate_sources_do_not_use_deleted_release_docs() {
+        let cat = FaultInjectionScenarioCatalog::canonical();
+        let deleted_feature_matrix = concat!("FEATURE_", "MATRIX.md");
+        let deleted_current_focus = concat!("CURRENT_RELEASE_", "FOCUS.md");
+        for s in &cat.scenarios {
+            for gate in &s.release_gates {
+                assert_ne!(gate.source, deleted_feature_matrix, "scenario {}", s.id);
+                assert_ne!(gate.source, deleted_current_focus, "scenario {}", s.id);
+            }
+        }
+    }
+
+    #[test]
+    fn gap_scenarios_are_fail_closed() {
+        let cat = FaultInjectionScenarioCatalog::canonical();
+        for s in &cat.scenarios {
+            if s.coverage == ScenarioCoverage::Gap {
+                assert!(
+                    s.lineage
+                        .iter()
+                        .any(|lineage| lineage.gap_state.contains("fail-closed")),
+                    "gap scenario {} is missing fail-closed lineage",
+                    s.id
+                );
+            }
+        }
+    }
+
+    #[test]
     fn gaps_count_is_reasonable() {
         let cat = FaultInjectionScenarioCatalog::canonical();
         let gaps = cat.count_by_coverage(ScenarioCoverage::Gap);
@@ -1144,7 +1165,7 @@ mod tests {
         let cat = FaultInjectionScenarioCatalog::canonical();
         let covered = cat.count_by_coverage(ScenarioCoverage::CargoCovered)
             + cat.count_by_coverage(ScenarioCoverage::ScriptExists)
-            + cat.count_by_coverage(ScenarioCoverage::TicketOwned)
+            + cat.count_by_coverage(ScenarioCoverage::LineageTracked)
             + cat.count_by_coverage(ScenarioCoverage::RuntimeValidation);
         assert!(covered > 0, "no covered scenarios; all are gaps");
     }
@@ -1157,6 +1178,24 @@ mod tests {
         assert!(md.contains("Coverage Summary"));
         assert!(md.contains("Scenario Catalog"));
         assert!(md.contains("**GAP**"));
+    }
+
+    #[test]
+    fn markdown_table_omits_stale_ticket_and_release_doc_authority() {
+        let cat = FaultInjectionScenarioCatalog::canonical();
+        let md = cat.to_markdown_table();
+        for stale in [
+            concat!("Tick", "et"),
+            concat!("Tick", "ets"),
+            concat!("#", "6319"),
+            concat!("FEATURE_", "MATRIX.md"),
+            concat!("CURRENT_RELEASE_", "FOCUS.md"),
+        ] {
+            assert!(
+                !md.contains(stale),
+                "markdown table still contains stale authority token {stale}"
+            );
+        }
     }
 
     #[test]
