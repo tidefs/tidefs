@@ -5934,7 +5934,86 @@ pub const fn ram_authority_satisfies_durable_posix_barrier(
     }
 }
 
+/// Evaluate whether a runtime RAM authority record is complete enough to emit.
+#[must_use]
+pub const fn ram_authority_receipt_is_emit_ready(
+    record: RamAuthorityRecord,
+) -> ReceiptPredicateResult {
+    if record.downgrade_refusal as u16 != StorageIntentRefusalReason::None as u16 {
+        return ReceiptPredicateResult::refused(record.downgrade_refusal);
+    }
+    if record.authority_class as u8 == RamAuthorityClass::NonAuthoritativeCache as u8 {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::CacheCannotBeAuthority);
+    }
+    if record.authority_class as u8 == RamAuthorityClass::PmemDurable as u8 {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::MediaRoleNotAllowed);
+    }
+    if record.policy_id.is_zero()
+        || record.policy_revision.0 == 0
+        || !record.has_authority_scope()
+        || bytes16_are_zero(record.earned_receipt.0)
+        || !record.has_loss_boundary()
+        || !record.has_resource_governor_admission()
+    {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::EvidenceNotUsable);
+    }
+    match record.authority_class {
+        RamAuthorityClass::NonAuthoritativeCache => {
+            ReceiptPredicateResult::refused(StorageIntentRefusalReason::CacheCannotBeAuthority)
+        }
+        RamAuthorityClass::RamVolatileLocal => ReceiptPredicateResult::SATISFIED,
+        RamAuthorityClass::RamVolatileReplicated => {
+            if record.has_replicated_volatile_evidence() && record.has_survival_boundary() {
+                ReceiptPredicateResult::SATISFIED
+            } else {
+                ReceiptPredicateResult::refused(StorageIntentRefusalReason::EvidenceNotUsable)
+            }
+        }
+        RamAuthorityClass::RamIntentBacked => {
+            if !record.earned_ack_class_is_durable_intent() || !record.has_durable_intent_evidence()
+            {
+                return ReceiptPredicateResult::refused(
+                    StorageIntentRefusalReason::PersistentMediaRequired,
+                );
+            }
+            if !evidence_ref_has_id(record.ordering_ref)
+                || !record
+                    .survives
+                    .contains(AuthorityEvent::ReplayAfterDurableIntent)
+            {
+                return ReceiptPredicateResult::refused(
+                    StorageIntentRefusalReason::MissingOrderingEvidence,
+                );
+            }
+            ReceiptPredicateResult::SATISFIED
+        }
+        RamAuthorityClass::PmemDurable => {
+            ReceiptPredicateResult::refused(StorageIntentRefusalReason::MediaRoleNotAllowed)
+        }
+    }
+}
+
 impl RamAuthorityRecord {
+    /// Returns true when the record names the governed object range.
+    #[must_use]
+    pub const fn has_authority_scope(self) -> bool {
+        !bytes32_are_zero(self.scope.object_id.0)
+            && self.scope.range_len > 0
+            && self.scope.generation > 0
+    }
+
+    /// Returns true when the record names at least one authority loss boundary.
+    #[must_use]
+    pub const fn has_loss_boundary(self) -> bool {
+        self.lost_if.0 != 0
+    }
+
+    /// Returns true when the record names at least one authority survival boundary.
+    #[must_use]
+    pub const fn has_survival_boundary(self) -> bool {
+        self.survives.0 != 0
+    }
+
     /// Returns true when the record carries resource-governor admission evidence.
     #[must_use]
     pub const fn has_resource_governor_admission(self) -> bool {
@@ -5956,6 +6035,14 @@ impl RamAuthorityRecord {
     #[must_use]
     pub const fn has_durable_intent_evidence(self) -> bool {
         evidence_ref_has_id(self.local_intent_ref) || evidence_ref_has_id(self.quorum_intent_ref)
+    }
+
+    /// Returns true when replicated volatile authority is bound to peer evidence.
+    #[must_use]
+    pub const fn has_replicated_volatile_evidence(self) -> bool {
+        evidence_ref_has_id(self.transport_ref)
+            && evidence_ref_has_id(self.membership_epoch_ref)
+            && evidence_ref_has_id(self.fencing_ref)
     }
 }
 
@@ -24114,6 +24201,149 @@ mod tests {
         assert_eq!(
             ram_record.media_capability_ref.kind,
             StorageIntentEvidenceKind::MediaCapabilityEvidence
+        );
+    }
+
+    fn ram_authority_emit_ready_base() -> RamAuthorityRecord {
+        RamAuthorityRecord {
+            policy_id: StorageIntentPolicyId([9_u8; 16]),
+            policy_revision: StorageIntentPolicyRevision(1),
+            scope: capacity_scope(),
+            earned_receipt: StorageIntentReceiptId([8_u8; 16]),
+            lost_if: AuthorityEventMask::from_event(AuthorityEvent::ProcessCrash),
+            resource_budget_ref: evidence_ref(
+                StorageIntentEvidenceKind::SchedulerAdmissionRecord,
+                5,
+            ),
+            admission_ref: evidence_ref(StorageIntentEvidenceKind::SchedulerAdmissionRecord, 6),
+            capacity_admission_ref: evidence_ref(
+                StorageIntentEvidenceKind::CapacityAdmissionEvidence,
+                7,
+            ),
+            ..RamAuthorityRecord::default()
+        }
+    }
+
+    #[test]
+    fn non_authoritative_cache_receipt_is_not_emit_ready() {
+        let result = ram_authority_receipt_is_emit_ready(ram_authority_emit_ready_base());
+
+        assert!(!result.satisfied);
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::CacheCannotBeAuthority
+        );
+    }
+
+    #[test]
+    fn local_volatile_ram_emit_ready_accepts_complete_record() {
+        let record = RamAuthorityRecord {
+            authority_class: RamAuthorityClass::RamVolatileLocal,
+            ..ram_authority_emit_ready_base()
+        };
+
+        assert!(ram_authority_receipt_is_emit_ready(record).satisfied);
+    }
+
+    #[test]
+    fn ram_authority_emit_ready_preserves_downgrade_refusal() {
+        let record = RamAuthorityRecord {
+            authority_class: RamAuthorityClass::RamVolatileLocal,
+            downgrade_refusal: StorageIntentRefusalReason::MediaRoleNotAllowed,
+            ..ram_authority_emit_ready_base()
+        };
+        let result = ram_authority_receipt_is_emit_ready(record);
+
+        assert!(!result.satisfied);
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::MediaRoleNotAllowed
+        );
+    }
+
+    #[test]
+    fn pmem_durable_receipt_is_not_emit_ready() {
+        let record = RamAuthorityRecord {
+            authority_class: RamAuthorityClass::PmemDurable,
+            pmem_ref: evidence_ref(StorageIntentEvidenceKind::MediaCapabilityEvidence, 8),
+            ..ram_authority_emit_ready_base()
+        };
+        let result = ram_authority_receipt_is_emit_ready(record);
+
+        assert!(!result.satisfied);
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::MediaRoleNotAllowed
+        );
+    }
+
+    #[test]
+    fn replicated_volatile_ram_emit_ready_requires_peer_evidence() {
+        let base = RamAuthorityRecord {
+            authority_class: RamAuthorityClass::RamVolatileReplicated,
+            earned_ack_class: StorageIntentGuaranteeClass::VolatileReplicated,
+            survives: AuthorityEventMask::from_event(AuthorityEvent::PeerLoss),
+            ..ram_authority_emit_ready_base()
+        };
+        let missing_peer_evidence = ram_authority_receipt_is_emit_ready(base);
+
+        assert!(!missing_peer_evidence.satisfied);
+        assert_eq!(
+            missing_peer_evidence.refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+
+        let ready = RamAuthorityRecord {
+            transport_ref: evidence_ref(StorageIntentEvidenceKind::TransportPathEvidence, 10),
+            membership_epoch_ref: evidence_ref(StorageIntentEvidenceKind::MembershipEvidence, 11),
+            fencing_ref: evidence_ref(StorageIntentEvidenceKind::MembershipEvidence, 12),
+            ..base
+        };
+
+        assert!(ram_authority_receipt_is_emit_ready(ready).satisfied);
+        assert_eq!(
+            ram_authority_satisfies_durable_posix_barrier(ready).refusal,
+            StorageIntentRefusalReason::VolatileRamCannotSatisfyDurableIntent
+        );
+    }
+
+    #[test]
+    fn intent_backed_ram_emit_ready_requires_intent_ordering_and_admission() {
+        let base = RamAuthorityRecord {
+            authority_class: RamAuthorityClass::RamIntentBacked,
+            earned_ack_class: StorageIntentGuaranteeClass::LocalIntent,
+            local_intent_ref: evidence_ref(StorageIntentEvidenceKind::LocalIntentRecord, 13),
+            ordering_ref: evidence_ref(StorageIntentEvidenceKind::OrderingEvidence, 14),
+            survives: AuthorityEventMask::from_event(AuthorityEvent::ReplayAfterDurableIntent),
+            ..ram_authority_emit_ready_base()
+        };
+
+        assert!(ram_authority_receipt_is_emit_ready(base).satisfied);
+
+        let no_intent = RamAuthorityRecord {
+            local_intent_ref: StorageIntentEvidenceRef::default(),
+            ..base
+        };
+        let no_ordering = RamAuthorityRecord {
+            ordering_ref: StorageIntentEvidenceRef::default(),
+            ..base
+        };
+        let no_admission = RamAuthorityRecord {
+            admission_ref: StorageIntentEvidenceRef::default(),
+            ..base
+        };
+
+        assert_eq!(
+            ram_authority_receipt_is_emit_ready(no_intent).refusal,
+            StorageIntentRefusalReason::PersistentMediaRequired
+        );
+        assert_eq!(
+            ram_authority_receipt_is_emit_ready(no_ordering).refusal,
+            StorageIntentRefusalReason::MissingOrderingEvidence
+        );
+        assert_eq!(
+            ram_authority_receipt_is_emit_ready(no_admission).refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
         );
     }
 
