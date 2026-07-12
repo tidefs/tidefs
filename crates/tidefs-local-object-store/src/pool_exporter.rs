@@ -482,15 +482,19 @@ impl ExportOrchestrator {
             .iter()
             .map(|label| label.device_capacity_bytes)
             .sum();
+        let expected_label_device_count = u32::try_from(self.device_guids.len()).ok();
         let topology_generation = labels
             .as_deref()
             .and_then(|labels| labels.first().map(|label| label.topology_generation))
             .filter(|generation| {
                 *generation > 0
                     && labels.as_deref().is_some_and(|labels| {
-                        labels
-                            .iter()
-                            .all(|label| label.topology_generation == *generation)
+                        expected_label_device_count.is_some_and(|device_count| {
+                            labels.iter().all(|label| {
+                                label.topology_generation == *generation
+                                    && label.device_count == device_count
+                            })
+                        })
                     })
             })
             .unwrap_or(0);
@@ -817,6 +821,26 @@ mod tests {
         capacity_bytes: u64,
         topology_generation: u64,
     ) {
+        write_export_label_with_device_count(
+            path,
+            pool_guid,
+            device_guid,
+            device_index,
+            capacity_bytes,
+            topology_generation,
+            1,
+        );
+    }
+
+    fn write_export_label_with_device_count(
+        path: &Path,
+        pool_guid: [u8; 16],
+        device_guid: [u8; 16],
+        device_index: u32,
+        capacity_bytes: u64,
+        topology_generation: u64,
+        device_count: u32,
+    ) {
         let _ = std::fs::remove_dir_all(path);
         std::fs::create_dir_all(path).unwrap();
         let label_path = path.join(".tidefs_label");
@@ -836,7 +860,7 @@ mod tests {
             label_commit_group: 10,
             device_index,
             topology_generation,
-            device_count: 1,
+            device_count,
             device_class: LabelDeviceClass::Hdd,
             device_capacity_bytes: capacity_bytes,
             system_area_pointer: 0,
@@ -1362,6 +1386,71 @@ mod tests {
         assert_eq!(evidence.device_count, 2);
         assert_eq!(evidence.expected_device_count, 2);
         assert_eq!(evidence.capacity_bytes, 0);
+        assert!(!evidence.topology_complete);
+        assert!(evidence.owner_authorized);
+        assert!(evidence.is_fail_closed());
+        assert_eq!(evidence.reason, "topology evidence incomplete");
+    }
+
+    #[test]
+    fn orchestrator_refuses_export_lifecycle_evidence_with_label_device_count_drift() {
+        let pool_guid = [0xAAu8; 16];
+        let device_a = [0x01u8; 16];
+        let device_b = [0x02u8; 16];
+        let path_a = unique_export_path("label-count-a");
+        let path_b = unique_export_path("label-count-b");
+        write_export_label_with_device_count(
+            &path_a,
+            pool_guid,
+            device_a,
+            0,
+            1024 * 1024 * 1024,
+            1,
+            2,
+        );
+        write_export_label_with_device_count(
+            &path_b,
+            pool_guid,
+            device_b,
+            1,
+            1024 * 1024 * 1024,
+            1,
+            1,
+        );
+        let config_a = DeviceConfig {
+            media_class: Default::default(),
+            path: path_a.clone(),
+            backing: DeviceBacking::DirectoryObjectStoreCompat,
+            class: DeviceClass::Data,
+            kind: DeviceKind::Single { path: path_a },
+            compression: None,
+            encryption: None,
+        };
+        let config_b = DeviceConfig {
+            media_class: Default::default(),
+            path: path_b.clone(),
+            backing: DeviceBacking::DirectoryObjectStoreCompat,
+            class: DeviceClass::Data,
+            kind: DeviceKind::Single { path: path_b },
+            compression: None,
+            encryption: None,
+        };
+        let orch = ExportOrchestrator::new(
+            pool_guid,
+            "count-drift",
+            vec![config_a, config_b],
+            vec![device_a, device_b],
+            false,
+        );
+
+        let evidence = orch.lifecycle_evidence();
+
+        assert_eq!(evidence.action, PoolLifecycleAction::Export);
+        assert_eq!(evidence.outcome, PoolLifecycleOutcome::Refused);
+        assert_eq!(evidence.device_count, 2);
+        assert_eq!(evidence.expected_device_count, 2);
+        assert_eq!(evidence.capacity_bytes, 2 * 1024 * 1024 * 1024);
+        assert_eq!(evidence.topology_generation, 0);
         assert!(!evidence.topology_complete);
         assert!(evidence.owner_authorized);
         assert!(evidence.is_fail_closed());
