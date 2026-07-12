@@ -66,10 +66,20 @@ is architectural scoping for source owners, not current product admission.
 | POSIX filesystem | In-process mount/session state, local advisory locks, local commit-group and cache coordination. | Membership, lease, lock-service, VFS-RPC, and transport code around mounted clustered ownership. |
 | Block-volume export | Local export admission, flush/exactness receipt code, and ublk adapter control/runtime code. | Membership, lease/authority-domain fencing, placement, reserve, and explicit failover or multi-writer admission code. |
 
-The clustered POSIX lock-forwarding boundary is documented in
-`docs/design/clustered-posix-lock-forwarding-boundary.md`. That document names
-the clustered owner and transport boundary while leaving local FUSE/VFS lock
-dispatch in-process.
+The clustered POSIX LOCK boundary separates local in-process FUSE/VFS lock
+dispatch from clustered forwarding admitted through committed clustered-mount
+authority. Local POSIX uses `LocalFileSystem`, `FuseVfsAdapter::new`, and
+`DaemonLockDispatch`; it must not open cluster LOCK transport or derive lock
+authority from membership services. Clustered POSIX lock forwarding is admitted
+through `ClusteredPosixMountRuntime::open_committed_mount(...)`, which supplies
+a committed `DatasetMountIdentity` and `ClusteredPosixAuthoritySnapshot`.
+`ClusteredPosixLockForwarder::new(...)` owns the identity-bound
+`LockServiceHandle` and `LockServiceTransport`. `DatasetMountIdentity::ZERO`,
+local mount identity, command-line flags, and single-node defaults are not
+clustered LOCK authority. This boundary does not claim clustered POSIX mount
+readiness, distributed lock runtime validation, failover behavior, POSIX
+completeness, production readiness, kernel/no-daemon status, performance, or
+successor/comparator standing.
 
 ## Representative Local Data Path
 

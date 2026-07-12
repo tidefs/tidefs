@@ -75,10 +75,10 @@ pub struct ClusteredPosixAuthoritySnapshot {
 /// Clustered POSIX mounted boundary admitted with committed identity and
 /// current authority evidence.
 ///
-/// This type is the concrete boundary named by the clustered POSIX LOCK
-/// forwarding design. A later lock-forwarding child can consume this runtime
-/// to construct an identity-bound `LockServiceHandle` and LOCK transport, while
-/// local POSIX stays on in-process lock dispatch.
+/// This type is the clustered POSIX LOCK admission boundary. Lock-forwarding
+/// code consumes this runtime to construct an identity-bound
+/// `LockServiceHandle` and LOCK transport, while local POSIX stays on
+/// in-process lock dispatch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ClusteredPosixMountRuntime {
     mount_identity: DatasetMountIdentity,
