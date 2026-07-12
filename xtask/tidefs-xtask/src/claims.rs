@@ -34,7 +34,6 @@ pub const CLAIMS_GATE_SCANNED_DOCS: &[&str] = &[
     "docs/BLAKE3_USAGE_POLICY.md",
     "docs/CLAIM_REGISTRY.md",
     "docs/CLAIMS_GATE_POLICY.md",
-    "docs/GETTING_STARTED.md",
     "docs/INDEX.md",
     "docs/MOUNTED_TRANSFORM_AUTHORITY_RAW_STORE_INVENTORY.md",
     "docs/PREVIEW_USER_MANUAL.md",

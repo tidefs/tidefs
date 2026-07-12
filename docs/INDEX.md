@@ -20,10 +20,9 @@ public product policy or prerequisite reading for ordinary contributors.
 
 Preview orientation:
 
-- `docs/GETTING_STARTED.md` gives a short developer quick start.
 - `docs/PREVIEW_USER_MANUAL.md` gives preview-only mount notes and limitations.
 
-These preview files are not product-admission, POSIX-complete, release, or
+This preview file is not product-admission, POSIX-complete, release, or
 per-operation status authorities.
 
 The remaining documents are design/reference material unless this index and
