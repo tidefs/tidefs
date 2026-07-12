@@ -117,7 +117,10 @@ generic/063
 generic/064
 generic/072
 
-# --- RENAME_WHITEOUT (returns EINVAL) ---
+# --- RENAME_WHITEOUT (Linux/overlayfs-specific; rejected fail-closed) ---
+# TideFS FUSE rename dispatch preserves the rename2 flag and intentionally
+# rejects RENAME_WHITEOUT with EINVAL before mutating the namespace. generic/078
+# stays excluded until end-to-end mounted whiteout semantics exist.
 generic/078
 
 # --- Shutdown/repair (FS_IOC_GOINGDOWN, recovery/repair not applicable on FUSE) ---

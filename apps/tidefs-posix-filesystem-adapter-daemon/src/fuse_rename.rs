@@ -10,6 +10,10 @@
 //! - `RENAME` (flags=0): plain POSIX rename with overwrite semantics
 //! - `RENAME_NOREPLACE`: fail with EEXIST if destination exists
 //! - `RENAME_EXCHANGE`: atomically swap source and destination entries
+//!
+//! `RENAME_WHITEOUT` is a Linux overlayfs-specific mode that TideFS does not
+//! implement for mounted FUSE rename dispatch. It is rejected fail-closed with
+//! `EINVAL` before any namespace mutation.
 
 use std::sync::Arc;
 
@@ -17,7 +21,9 @@ use tidefs_namespace::Namespace;
 use tidefs_types_vfs_core::InodeId;
 use tidefs_vfs_engine::{Errno, RequestCtx, VfsEngine};
 
-use tidefs_types_posix_filesystem_adapter_core::rename_flags::{RENAME_EXCHANGE, RENAME_NOREPLACE};
+use tidefs_types_posix_filesystem_adapter_core::rename_flags::{
+    RENAME_EXCHANGE, RENAME_NOREPLACE, RENAME_WHITEOUT,
+};
 const SUPPORTED_FLAGS: u32 = RENAME_NOREPLACE | RENAME_EXCHANGE;
 
 /// Result of a rename operation.
@@ -151,7 +157,8 @@ impl FuseRenameDispatch {
     }
 
     /// Core engine dispatch with flags: validates the combined flags set,
-    /// rejects conflicting flag combinations, and delegates to the engine.
+    /// rejects unsupported or conflicting flag combinations, and delegates to
+    /// the engine.
     pub fn dispatch_engine_with_flags(&self, request: EngineRenameRequest<'_>) -> RenameResult {
         let EngineRenameRequest {
             engine,
@@ -163,6 +170,9 @@ impl FuseRenameDispatch {
             flags,
         } = request;
 
+        if flags & RENAME_WHITEOUT != 0 {
+            return Err(Errno(libc::EINVAL as u16));
+        }
         if flags & !SUPPORTED_FLAGS != 0 {
             return Err(Errno(libc::EINVAL as u16));
         }
@@ -447,6 +457,33 @@ mod tests {
         });
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().0, libc::EINVAL as u16);
+    }
+
+    #[test]
+    fn rename_whiteout_returns_einval_without_side_effects() {
+        let (_tmp, engine) = test_engine();
+        let ctx = test_ctx();
+        let root = InodeId::new(1);
+        let dispatch = FuseRenameDispatch::new();
+
+        engine
+            .mknod(root, b"file.txt", libc::S_IFREG | 0o644, 0, &ctx)
+            .expect("create file");
+
+        let result = dispatch.dispatch_engine_with_flags(EngineRenameRequest {
+            engine: engine.as_ref(),
+            ctx: &ctx,
+            old_parent: root,
+            old_name: b"file.txt",
+            new_parent: root,
+            new_name: b"other.txt",
+            flags: RENAME_WHITEOUT,
+        });
+
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().0, libc::EINVAL as u16);
+        assert!(engine.lookup(root, b"file.txt", &ctx).is_ok());
+        assert!(engine.lookup(root, b"other.txt", &ctx).is_err());
     }
 
     #[test]

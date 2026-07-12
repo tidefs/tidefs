@@ -11653,6 +11653,7 @@ mod tests {
         LocalStorageAllocatorPolicy, RootAuthenticationKey, MAX_NAME_BYTES,
     };
     use tidefs_local_object_store::StoreOptions;
+    use tidefs_types_posix_filesystem_adapter_core::rename_flags::RENAME_WHITEOUT;
     use tidefs_types_vfs_core::{
         DirHandleId, Generation, InodeFlags, PosixAttrs, FALLOC_FL_COLLAPSE_RANGE,
         FALLOC_FL_INSERT_RANGE, FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE, FALLOC_FL_ZERO_RANGE,
@@ -28300,6 +28301,42 @@ mod tests {
         engine
             .lookup(root, b"unique-dest.txt", &ctx)
             .expect("lookup unique-dest");
+    }
+
+    #[test]
+    fn vfs_adapter_dispatch_rename_public_api_whiteout_refuses_without_side_effects() {
+        let fixture = adapter_fixture();
+        let ctx = root_ctx();
+        let root = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine.get_root_inode(&ctx).expect("root inode")
+        };
+
+        {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .create(root, b"src.txt", 0o644, libc::O_RDWR as u32, &ctx)
+                .expect("create source");
+        }
+
+        let result = fixture.adapter.dispatch_rename(
+            &ctx,
+            root.get(),
+            b"src.txt",
+            root.get(),
+            b"whiteout-dest.txt",
+            RENAME_WHITEOUT,
+        );
+
+        assert_eq!(result, Err(Errno::EINVAL));
+        let engine = fixture.adapter.engine.lock().unwrap();
+        engine
+            .lookup(root, b"src.txt", &ctx)
+            .expect("source must remain after whiteout refusal");
+        assert_eq!(
+            engine.lookup(root, b"whiteout-dest.txt", &ctx),
+            Err(Errno::ENOENT)
+        );
     }
     // ── dispatch_readlink unit tests ─────────────────────────────────
 
