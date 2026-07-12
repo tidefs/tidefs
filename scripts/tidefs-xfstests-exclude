@@ -13,9 +13,19 @@
 #   special-node mknod: generic/184
 
 # --- ACLs ---
-#   ACL evaluation IS wired via tidefs-posix-acl + tidefs-permission check_access()
-#   (fuse_preview.rs:759-796,2029-2048). These exclusions remain until the full ACL
-#   xfstests suite (set/get/inherit/default) is verified passing end-to-end.
+#   Source inspection shows ACL plumbing, not mounted row proof: the FUSE
+#   adapter negotiates POSIX ACL and DONT_MASK support, system.posix_acl_*
+#   validation/storage paths exist, and tidefs-posix-acl/tidefs-permission
+#   cover access ACL evaluation, chmod/mode sync helpers, and default
+#   inheritance planning. These rows stay excluded until focused mounted FUSE
+#   xfstests evidence proves each row.
+#   generic/099: broad ACL semantics: set/get, chmod sync, access checks,
+#     named user/group and mask behavior, removals, recursive/default ACLs.
+#   generic/237: ACL mutation ownership/capability enforcement.
+#   generic/307: setfacl ctime update and persistence after remount.
+#   generic/318: user-namespace ACL id mapping and remount persistence.
+#   generic/319: default ACL inheritance to child directories.
+#   generic/444: SGID inheritance interaction with default ACLs.
 generic/099
 generic/237
 generic/307
