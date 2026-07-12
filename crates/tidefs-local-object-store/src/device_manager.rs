@@ -898,6 +898,28 @@ mod tests {
         assert_eq!(evidence.reason, "topology evidence incomplete");
     }
 
+    #[test]
+    fn topology_lifecycle_evidence_refuses_missing_capacity_topology() {
+        let evidence = DeviceManager::topology_lifecycle_evidence(
+            PoolLifecycleAction::RemoveDevice,
+            [0x59; 16],
+            "topology",
+            3,
+            3,
+            0,
+            9,
+            8,
+        );
+
+        assert_eq!(evidence.action, PoolLifecycleAction::RemoveDevice);
+        assert_eq!(evidence.outcome, PoolLifecycleOutcome::Refused);
+        assert_eq!(evidence.capacity_bytes, 0);
+        assert!(!evidence.topology_complete);
+        assert!(evidence.owner_authorized);
+        assert!(evidence.is_fail_closed());
+        assert_eq!(evidence.reason, "topology evidence incomplete");
+    }
+
     fn temp_dir(label: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
             "tidefs-dm-{}-{}-{}",
