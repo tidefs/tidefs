@@ -12,6 +12,7 @@ pub mod carrier_comparison;
 pub mod concurrent_ops;
 pub mod crash_recovery;
 pub mod evidence_artifact_manifest;
+pub mod failed_quorum_ledger_validation;
 pub mod failure_blocker_triage;
 pub mod fault_injection_scenario_catalog;
 pub mod fio_integrity;
