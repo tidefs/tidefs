@@ -15405,10 +15405,20 @@ mod orphan_index_integration_tests {
 #[cfg(test)]
 mod recovery_integration_tests {
     use super::*;
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::path::{Path, PathBuf};
     use tempfile::TempDir;
+    use tidefs_local_object_store::segment_file_name;
 
     fn test_options() -> StoreOptions {
         StoreOptions::test_fast()
+    }
+
+    fn integrity_test_options() -> StoreOptions {
+        StoreOptions {
+            verify_read_checksums: true,
+            ..StoreOptions::test_fast()
+        }
     }
 
     fn temp_root(label: &str) -> std::path::PathBuf {
@@ -15421,6 +15431,46 @@ mod recovery_integration_tests {
 
     fn cleanup(path: &std::path::Path) {
         let _ = std::fs::remove_dir_all(path);
+    }
+
+    fn segment_path(segments_dir: &Path, segment_id: u64) -> PathBuf {
+        if segments_dir.is_file() || (segments_dir.exists() && !segments_dir.is_dir()) {
+            segments_dir.to_path_buf()
+        } else {
+            segments_dir.join(segment_file_name(segment_id))
+        }
+    }
+
+    fn object_record_path(store: &LocalObjectStore, loc: ObjectLocation) -> PathBuf {
+        segment_path(store.segments_dir(), loc.segment_id)
+    }
+
+    fn corrupt_bytes(path: &Path, offset: u64, len: u64) {
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .expect("open segment for corruption");
+        file.seek(SeekFrom::Start(offset))
+            .expect("seek to corrupt offset");
+        let mut buf = vec![0_u8; len as usize];
+        file.read_exact(&mut buf).expect("read bytes to corrupt");
+        for byte in &mut buf {
+            *byte ^= 0xFF;
+        }
+        file.seek(SeekFrom::Start(offset)).expect("seek back");
+        file.write_all(&buf).expect("write corrupted bytes");
+    }
+
+    fn corrupt_root_slot_payload(store: &LocalObjectStore, slot: u64) {
+        let key = crate::object_keys::root_slot_object_key(slot);
+        let loc = store
+            .version_locations_of(key)
+            .into_iter()
+            .next()
+            .expect("root slot must have at least one version");
+        let path = object_record_path(store, loc);
+        corrupt_bytes(&path, loc.payload_offset, 1);
     }
 
     /// Fresh filesystem open runs CommitGroupRecovery internally without error.
@@ -15514,6 +15564,106 @@ mod recovery_integration_tests {
         assert!(result.is_ok(), "ReadOnly should load state without error");
         let loaded = result.unwrap();
         assert!(loaded.is_some(), "should find committed state");
+    }
+
+    #[test]
+    fn required_replay_error_fails_closed_when_intent_log_is_corrupt() {
+        let tmp = TempDir::new().expect("tempdir");
+        let root = tmp.path().to_path_buf();
+        let auth_key = crate::default_root_authentication_key().expect("auth key");
+
+        {
+            let fs = LocalFileSystem::open_with_options(&root, integrity_test_options())
+                .expect("open filesystem");
+            drop(fs);
+        }
+
+        {
+            let mut pool = LocalFileSystem::default_development_pool(
+                &root,
+                &integrity_test_options(),
+                None,
+                None,
+            )
+            .expect("open development pool");
+            pool.raw_primary_store_mut()
+                .put(crate::object_keys::intent_log_head_object_key(), b"corrupt")
+                .expect("put corrupt intent log head");
+            pool.raw_primary_store_mut().sync_all().expect("sync");
+        }
+
+        let opened = LocalFileSystem::open_with_allocator_policy_and_root_authentication_key(
+            &root,
+            LocalFileSystemOpenConfig {
+                options: integrity_test_options(),
+                allocator_policy: LocalStorageAllocatorPolicy::default(),
+                root_authentication_key: auth_key,
+                encryption: None,
+                compression: None,
+                log_device_device_path: None,
+                recovery_policy: RecoveryPolicy::default(),
+                block_devices: None,
+            },
+        );
+        assert!(matches!(
+            opened,
+            Err(FileSystemError::CorruptState { reason })
+                if reason == "intent log head has wrong size"
+        ));
+    }
+
+    #[test]
+    fn required_recovery_error_fails_closed_when_root_slots_are_corrupt() {
+        let tmp = TempDir::new().expect("tempdir");
+        let root = tmp.path().to_path_buf();
+        let auth_key = crate::default_root_authentication_key().expect("auth key");
+
+        {
+            let fs = LocalFileSystem::open_with_options(&root, integrity_test_options())
+                .expect("open filesystem");
+            drop(fs);
+        }
+
+        {
+            let pool = LocalFileSystem::default_development_pool(
+                &root,
+                &integrity_test_options(),
+                None,
+                None,
+            )
+            .expect("open development pool");
+            let store = pool.raw_primary_store();
+            let mut corrupted = 0;
+            for slot in 0..FILESYSTEM_ROOT_SLOT_COUNT {
+                let key = crate::object_keys::root_slot_object_key(slot);
+                if store.version_locations_of(key).is_empty() {
+                    continue;
+                }
+                corrupt_root_slot_payload(store, slot);
+                corrupted += 1;
+            }
+            assert!(corrupted > 0, "expected at least one populated root slot");
+        }
+
+        let opened = LocalFileSystem::open_with_allocator_policy_and_root_authentication_key(
+            &root,
+            LocalFileSystemOpenConfig {
+                options: integrity_test_options(),
+                allocator_policy: LocalStorageAllocatorPolicy::default(),
+                root_authentication_key: auth_key,
+                encryption: None,
+                compression: None,
+                log_device_device_path: None,
+                recovery_policy: RecoveryPolicy::default(),
+                block_devices: None,
+            },
+        );
+
+        assert!(matches!(
+            opened,
+            Err(FileSystemError::CorruptState { reason })
+                if reason == "root slots exist but no valid committed root could be selected"
+        ));
     }
 
     /// Verify that RecoveryPolicy::ReplayOnly (default) allows intent-log
