@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 #![forbid(unsafe_code)]
 
-//! Cache lattice runtime crate (P4-02 Phase 2).
+//! Cache lattice runtime crate.
 //!
 //! Provides the runtime layer for the tidefs cache lattice:
 //! a generic [`CacheLatticeRegistry`], per-class cache storage with
@@ -295,7 +295,7 @@ impl Default for ArcWeightConfig {
 /// or a path-lookup result).
 #[derive(Clone, Debug)]
 pub struct CacheEntry<V> {
-    /// Canonical header (18 fields per P4-02 §4).
+    /// Canonical cache-lattice header.
     pub header: CacheEntryHeader,
     /// The typed value stored in this cache entry.
     pub value: V,
@@ -1140,7 +1140,7 @@ impl<'a, K: Eq + std::hash::Hash + Clone + fmt::Debug, V> InvalidationPipeline<'
 pub use tidefs_cache_coherency::{CacheInvalidationSubscriber, CoherencyEventBus};
 
 // ---------------------------------------------------------------------------
-// The 10 inviolable cache rules (P4-02 §5)
+// The 10 inviolable cache-lattice rules
 
 // ---------------------------------------------------------------------------
 

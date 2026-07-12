@@ -2,7 +2,7 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
-//! Cache lattice types for Design rule P4-02.
+//! Cache lattice types for source-owned cache invariants.
 //!
 //! Defines the type-level foundation for the tidefs cache lattice:
 //! 8 memory domains, 9 cache classes, 18 mandatory entry-header fields,
@@ -512,7 +512,7 @@ pub enum RebuildCostClass {
 
 /// The common header for every cache entry in the lattice.
 ///
-/// Per P4-02 §4, every cache entry carries these 18 fields regardless of
+/// Every cache entry carries these 18 cache-lattice fields regardless of
 /// class. They provide the anchor/fence/budget/dirty/poison tracking
 /// required by the design rule.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -644,7 +644,7 @@ impl CacheEntryHeader {
         self.poison_state = reason;
     }
 
-    // ── Header invariants (P4-02 §4.2) ──────────────────────────────────
+    // ── Cache-lattice header invariants ─────────────────────────────────
 
     /// Check invariant 1: entries without an anchor vector may not claim
     /// exact or freshness-bounded answers.

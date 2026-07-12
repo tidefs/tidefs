@@ -10,7 +10,7 @@ homepage.workspace = true
 documentation.workspace = true
 authors.workspace = true
 
-description = "Cache lattice types: memory domains, cache classes, entry headers, dirty/poison/writeback state, cache-lattice view types (P4-02)"
+description = "Cache lattice types: memory domains, cache classes, entry headers, dirty/poison/writeback state, cache-lattice view types"
 
 [dependencies]
 blake3 = { version = "1", default-features = false }
