@@ -1,6 +1,6 @@
 # Workspace Package Classification
 
-Updated from current Cargo metadata, on-disk manifest discovery, and harness-consumer audit for issue #1723 on 2026-07-02.
+Updated from current Cargo metadata, on-disk manifest discovery, and harness-consumer audit for issue #1974 on 2026-07-12.
 This document is the package-role authority for TideFS workspace selection and TFR-002/TFR-019 reduction.
 It is enforced by `cargo run -p tidefs-xtask -- check-workspace-policy`.
 
@@ -11,9 +11,9 @@ This is not a production-readiness claim. TideFS remains a pre-alpha filesystem/
 | Counted set | Value |
 | --- | ---: |
 | Workspace packages | 166 |
-| Explicitly excluded package roots | 5 |
-| Discovered package manifests | 171 |
-| Classified package roots | 171 |
+| Explicitly excluded package roots | 4 |
+| Discovered package manifests | 170 |
+| Classified package roots | 170 |
 
 ## TFR-002 Category Mapping
 
@@ -26,7 +26,7 @@ root.
 | TFR-002 category | Current roles | Count | Boundary |
 | --- | --- | ---: | --- |
 | `product` | `product-code`, `adapter-operator` | 144 | Shipped or planned-to-ship libraries, binaries, adapters, kernel surfaces, and operator entrypoints. |
-| `harness` | `policy-tooling`, `proof-harness`, `standalone-fuzz` | 25 | Repo policy tooling, CI/developer support, demos, validation harnesses, model/oracle crates, and excluded fuzz harnesses. |
+| `harness` | `policy-tooling`, `proof-harness`, `standalone-fuzz` | 24 | Repo policy tooling, CI/developer support, demos, validation harnesses, model/oracle crates, and excluded fuzz harnesses. |
 | `third-party` | `vendored-third-party` | 1 | Vendored or forked upstream code carried with separate provenance. |
 | `delete` | `scaffold-transitional`, `archive-delete-candidate` | 0 | No current package root is classified for deletion. Both roles are retired and rejected by `check-workspace-policy`; any future dead-scaffolding candidate must reference TFR-002/TFR-013 evidence and an issue-backed delete/archive plan. |
 
@@ -57,7 +57,7 @@ holding area.
 | `policy-tooling` | 8 |
 | `proof-harness` | 12 |
 | `vendored-third-party` | 1 |
-| `standalone-fuzz` | 5 |
+| `standalone-fuzz` | 4 |
 | `scaffold-transitional` | 0 |
 | `archive-delete-candidate` | 0 |
 
@@ -231,7 +231,6 @@ one-line justification. The table keeps the five machine-checked columns so
 | `crates/tidefs-types-vfs-owned` | `tidefs-types-vfs-owned` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-ublk-abi` | `tidefs-ublk-abi` | `workspace-member` | `adapter-operator` | current adapter/operator surface; capability claims remain behind focused validation. |
 | `crates/tidefs-validation` | `tidefs-validation` | `workspace-member` | `proof-harness` | current runtime validation harness for QEMU Smoke, FUSE, ublk, xfstests, reclaim, scrub, and `EvidenceArtifactManifest` row artifacts; workflow and flake consumers collect evidence without making product-readiness claims. |
-| `crates/tidefs-validation/fuzz` | `tidefs-validation-fuzz` | `workspace-excluded` | `standalone-fuzz` | standalone-checkable fuzz package; keep mirrored in workspace.exclude until restored or made an issue-backed archive/delete candidate. |
 | `crates/tidefs-verification-engine` | `tidefs-verification-engine` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-vfs-engine` | `tidefs-vfs-engine` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-vfs-rpc` | `tidefs-vfs-rpc` | `workspace-member` | `product-code` | planned authority surface for VFS_RPC wire protocol; 14 unit tests cover all 36 method definitions, request/response encode/decode roundtrips, per-peer dedup window, flagged bypass paths, handle encoding, and client-side multiplexing; forbid(unsafe_code); zero reverse dependencies reflect service-surface boundaries, not placeholder status; #1518 selects the first live control/inline forwarding boundary while #1521-#1524 gate live transport, VFS Engine bridge, BULK/RDMA handoff, and validation claims. |
@@ -297,7 +296,6 @@ The root `workspace.exclude` list and the `workspace-excluded` rows above must m
 | `crates/tidefs-binary_schema-core/fuzz` | `tidefs-binary_schema-core-fuzz` | standalone-checkable fuzz package; keep mirrored in workspace.exclude until restored or made an issue-backed archive/delete candidate. |
 | `crates/tidefs-local-filesystem/fuzz` | `tidefs-local-filesystem-fuzz` | standalone-checkable fuzz package; keep mirrored in workspace.exclude until restored or made an issue-backed archive/delete candidate. |
 | `crates/tidefs-local-object-store/fuzz` | `tidefs-local-object-store-fuzz` | standalone-checkable fuzz package; keep mirrored in workspace.exclude until restored or made an issue-backed archive/delete candidate. |
-| `crates/tidefs-validation/fuzz` | `tidefs-validation-fuzz` | standalone-checkable fuzz package; keep mirrored in workspace.exclude until restored or made an issue-backed archive/delete candidate. |
 | `fuzz` | `tidefs-fuzz` | standalone-checkable fuzz package; keep mirrored in workspace.exclude until restored or made an issue-backed archive/delete candidate. |
 
 ## Boundary Rules Enforced By Xtask

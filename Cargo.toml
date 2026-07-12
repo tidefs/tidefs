@@ -175,7 +175,6 @@ exclude = [
   "crates/tidefs-binary_schema-core/fuzz",
   "crates/tidefs-local-filesystem/fuzz",
   "crates/tidefs-local-object-store/fuzz",
-  "crates/tidefs-validation/fuzz",
   "fuzz",
 ]
 

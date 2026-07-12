@@ -275,7 +275,6 @@ const EXCLUDED_FUZZ_MANIFESTS: &[&str] = &[
     "crates/tidefs-binary_schema-core/fuzz/Cargo.toml",
     "crates/tidefs-local-filesystem/fuzz/Cargo.toml",
     "crates/tidefs-local-object-store/fuzz/Cargo.toml",
-    "crates/tidefs-validation/fuzz/Cargo.toml",
 ];
 
 fn check_excluded_fuzz_manifest_licenses(root: &Path, violations: &mut Vec<String>) {

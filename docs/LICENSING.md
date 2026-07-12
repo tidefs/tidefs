@@ -73,7 +73,7 @@ validation.
 
 All other packages reported by root `cargo metadata --no-deps --locked` use
 `GPL-2.0-only WITH Linux-syscall-note` through workspace package metadata.
-The five excluded cargo-fuzz harness manifests are standalone non-published
+The four excluded cargo-fuzz harness manifests are standalone non-published
 packages and now declare the same
 `GPL-2.0-only WITH Linux-syscall-note` license explicitly:
 
@@ -81,7 +81,6 @@ packages and now declare the same
 - `crates/tidefs-binary_schema-core/fuzz/Cargo.toml`
 - `crates/tidefs-local-filesystem/fuzz/Cargo.toml`
 - `crates/tidefs-local-object-store/fuzz/Cargo.toml`
-- `crates/tidefs-validation/fuzz/Cargo.toml`
 
 All tracked non-vendored Rust source files under `apps/`, `crates/`,
 `xtask/`, and `kmod/` likewise carry a first-line
