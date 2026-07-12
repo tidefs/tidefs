@@ -18,12 +18,6 @@ Read `docs/LICENSING.md`, `docs/TEST_SIGNAL_POLICY.md`,
 Managed-worker host docs may impose local process constraints, but they are not
 public product policy or prerequisite reading for ordinary contributors.
 
-Book:
-
-- `docs/book/README.adoc`
-- `docs/book/tidefs-book.adoc`
-- `docs/book/chapters/05-book-plan.adoc`
-
 Preview orientation:
 
 - `docs/GETTING_STARTED.md` gives a short developer quick start.

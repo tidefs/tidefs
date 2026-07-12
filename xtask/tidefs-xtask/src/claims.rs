@@ -133,7 +133,6 @@ const CRATE_INDEX_LIMITATION_MARKERS: &[&str] = &[
 
 const COMMAND_AUTHORITY_TABLE_DOCS: &[&str] = &[
     "docs/PREVIEW_UAPI_ABI_BOUNDARY_OW202.md",
-    "docs/book/chapters/10-tidefsctl.adoc",
     "docs/security/operator-authz-boundary.md",
     "docs/CLAIMS_GATE_POLICY.md",
 ];
