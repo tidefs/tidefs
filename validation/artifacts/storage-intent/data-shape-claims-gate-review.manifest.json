@@ -1,0 +1,16 @@
+{
+  "manifest_version": 2,
+  "claim_id": "storage.intent.data_shape_honesty.v1",
+  "evidence_class": "claims-gate-review",
+  "validation_tier": "source-model",
+  "scope": "claims-gate source review for the data-shape evidence boundary and remaining blocked runtime classes",
+  "artifact_path": "validation/artifacts/storage-intent/data-shape-claims-gate-review.toml",
+  "content_digest": "blake3:de90b8c5a611c9f8d112a2c96ad18ce72c88cf4571b1816c01a8797a2b715078",
+  "run_id": "deterministic-fixture:issue-1981-data-shape-claims-gate-review-v1",
+  "source_ref": "refs/heads/codex1/issue-1981-data-shape-evidence",
+  "outcome": "pass",
+  "residual_risk": "The review keeps storage.intent.data_shape_honesty.v1 blocked until qemu transform-execution and performance/fault evidence validate. It does not widen product, capacity, performance, production, release-readiness, or successor/comparator claims.",
+  "source": "claims-gate",
+  "generated_at": "2026-07-12T19:16:51Z",
+  "blocking_issues": []
+}

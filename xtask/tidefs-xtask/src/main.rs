@@ -1800,8 +1800,22 @@ fn validate_evidence_manifest_path(
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    manifest.verify_artifact_digest(artifact_root)?;
+    match manifest.verify_artifact_digest(artifact_root) {
+        Ok(()) => {}
+        Err(err) if evidence_manifest_error_is_terminal(&err) => return Err(err),
+        Err(manifest_relative_err) => match manifest.verify_artifact_digest(".") {
+            Ok(()) => {}
+            Err(_) => return Err(manifest_relative_err),
+        },
+    }
     Ok(manifest)
+}
+
+fn evidence_manifest_error_is_terminal(err: &EvidenceArtifactManifestError) -> bool {
+    err.failures().iter().any(|failure| {
+        failure.contains("content_digest mismatch")
+            || failure.contains("resolves outside artifact root")
+    })
 }
 
 #[cfg(test)]
@@ -1961,6 +1975,28 @@ error[E0308]: mismatched types
         env::set_current_dir(original_dir).expect("restore current dir");
 
         result.expect("current-dir manifest path validates");
+    }
+
+    #[test]
+    fn validate_evidence_manifest_accepts_repo_relative_artifact_path() {
+        let _guard = CURRENT_DIR_LOCK.lock().expect("current-dir lock");
+        let original_dir = env::current_dir().expect("current dir");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let manifest_dir = temp.path().join("validation/artifacts/storage-intent");
+        fs::create_dir_all(&manifest_dir).expect("create manifest dir");
+        let artifact_bytes = b"repo-relative evidence bytes";
+        fs::write(manifest_dir.join("artifact.json"), artifact_bytes).expect("write artifact");
+        let manifest = evidence_manifest_for(
+            "validation/artifacts/storage-intent/artifact.json",
+            artifact_bytes,
+        );
+        let manifest_path = write_manifest(&manifest_dir, &manifest);
+
+        env::set_current_dir(temp.path()).expect("enter tempdir");
+        let result = validate_evidence_manifest_path(&manifest_path);
+        env::set_current_dir(original_dir).expect("restore current dir");
+
+        result.expect("repo-relative artifact path validates");
     }
 
     #[cfg(unix)]
@@ -2437,7 +2473,7 @@ fn print_help() {
         "  validate-ublk-started-export-admission-artifact <path> validate started uBLK export admission evidence"
     );
     println!("  check-no-hidden-queues  validate queue roots in touched implementation packages");
-    println!("  validate-evidence-manifest <path> validate a claim evidence artifact manifest JSON and verify artifact_path digest under the manifest directory");
+    println!("  validate-evidence-manifest <path> validate a claim evidence artifact manifest JSON and verify artifact_path digest under the manifest directory or current repository root");
     println!("  validate-xfstests-evidence-manifest <path> validate an xfstests evidence manifest JSON against schema");
     println!("  validate-kernel-teardown-runtime-artifact <path> validate a kernel teardown no-work-after artifact JSON against schema");
     println!(

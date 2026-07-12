@@ -1,0 +1,22 @@
+{
+  "manifest_version": 2,
+  "claim_id": "storage.intent.data_shape_honesty.v1",
+  "evidence_class": "storage-intent-data-shape-performance-fault-rows",
+  "validation_tier": "qemu-guest",
+  "scope": "qemu-guest performance and fault row inventory for data-shape honesty; runtime rows not produced in this slice",
+  "artifact_path": "validation/artifacts/storage-intent/data-shape-performance-fault-rows.json",
+  "content_digest": "blake3:b2f71e6aca137bca13d95c3a3a6dbf329c8ae67d1443b952ee6631c3846cdedf",
+  "run_id": "deterministic-fixture:issue-1981-data-shape-performance-fault-rows-v1",
+  "source_ref": "refs/heads/codex1/issue-1981-data-shape-evidence",
+  "outcome": "skip",
+  "residual_risk": "No qemu-guest CPU cost, read amplification, degraded reconstruction, key epoch, illegal dedupe domain, malformed transform frame, or EC/archive under-width rows were produced.",
+  "source": "issue-1981-source-review",
+  "generated_at": "2026-07-12T19:16:51Z",
+  "blocking_issues": [
+    {
+      "repo": "tidefs/tidefs",
+      "number": 1981,
+      "reason": "runtime performance and fault rows remain unproduced"
+    }
+  ]
+}
