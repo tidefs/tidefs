@@ -36,7 +36,6 @@ authority boundaries.
 
 ## Evidence Reviewed
 
-- `docs/ERASURE_CODED_LAYOUT_OW306.md` — current single-parity XOR model spec
 - `docs/POOL_WIDE_REDUNDANCY_PLACEMENT_CONTRACT.md` — current pool-wide
   placement contract, erasure target width, receipt-backed reads, and
   placement tests
@@ -49,14 +48,33 @@ authority boundaries.
   `repair_store()`, `compute_shard_to_store()` consuming `PlacementPlan`
 - `crates/tidefs-erasure-coding/` — GF(2^8) RS engine used by the store
 - `crates/tidefs-replication-model/` — `ErasureCodingProfile`, `RedundancyPolicy::ErasureCoded`,
-  `DurabilityLevel::for_erasure_coded`, and `ErasureLayoutPolicy` for the
-  OW-306 XOR model
+  `DurabilityLevel::for_erasure_coded`, `ErasureLayoutPolicy`,
+  `ErasureLayoutClass::SingleParityXor`,
+  `encode_single_parity_erasure_stripe()`, and
+  `decode_single_parity_erasure_stripe()` for the bounded XOR layout model
 - `docs/workspace-package-classification.md` — classifies
   `tidefs-erasure-coded-store` as a current local EC product component after
   issue #823; broader pool receipt, recovery, scrub, and release claims remain
   outside the row
 - `docs/DOCUMENTATION_AUTHORITY_REGISTER.md` — TFR-019 classification
   framework for doc authority states
+
+## Source-Owned XOR Layout Boundary
+
+The single-parity XOR layout model consumed by this authority is source-owned
+by `crates/tidefs-replication-model`. `ErasureLayoutPolicy` admits a fixed
+data-shard count, one parity shard, and a fixed shard length.
+`encode_single_parity_erasure_stripe()` splits payload bytes into padded data
+shards and derives parity with XOR. `decode_single_parity_erasure_stripe()`
+reconstructs complete payload bytes from available shards, rebuilds one missing
+data shard from parity plus the remaining data shards, rebuilds a missing
+parity shard from data shards, and refuses loss patterns with too many missing
+shards or simultaneous data/parity loss.
+
+This is a model boundary consumed by the EC store authority. It is not a
+production Reed-Solomon implementation, networked erasure-coded placement,
+async data movement, kernel/block-device erasure coding, distributed-storage
+runtime evidence, or a release-readiness claim.
 
 ## Current State Summary
 
@@ -300,7 +318,6 @@ before implementation depends on them:
 
 ## References
 
-- `docs/ERASURE_CODED_LAYOUT_OW306.md` — XOR single-parity layout model
 - `docs/POOL_WIDE_REDUNDANCY_PLACEMENT_CONTRACT.md` — current pool-wide
   placement contract
 - `docs/LOCAL_DISTRIBUTED_RECEIPT_AUTHORITY.md` — receipt authority model
@@ -308,5 +325,6 @@ before implementation depends on them:
 - `crates/tidefs-placement-planner/` — current placement planner
 - `crates/tidefs-erasure-coded-store/` — current EC store runtime
 - `crates/tidefs-erasure-coding/` — RS engine
-- `crates/tidefs-replication-model/` — EC profile, policy, and durability model
+- `crates/tidefs-replication-model/` — EC profile, policy, durability, and
+  bounded XOR layout model
 - GitHub issue #748 — this authority decision
