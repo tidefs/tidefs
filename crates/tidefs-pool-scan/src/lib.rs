@@ -251,6 +251,57 @@ impl std::fmt::Display for DeviceKind {
     }
 }
 
+/// Source-backed discard/UNMAP capability observed during device scan.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DiscardCapability {
+    /// The backing source reports non-zero discard support.
+    Supported,
+    /// The backing source reports no discard support.
+    Unsupported,
+    /// Capability could not be determined from the available source.
+    Unknown,
+    /// Capability probing was refused by the backing source.
+    Refused,
+    /// Discard requests may be accepted but ignored by the backing stack.
+    Ignored,
+    /// Development/test backing has not been verified as a discard-capable device.
+    Unverified,
+}
+
+impl DiscardCapability {
+    /// Whether this state proves discard support.
+    #[must_use]
+    pub const fn is_supported(self) -> bool {
+        matches!(self, Self::Supported)
+    }
+
+    /// Stable diagnostic spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Supported => "supported",
+            Self::Unsupported => "unsupported",
+            Self::Unknown => "unknown",
+            Self::Refused => "refused",
+            Self::Ignored => "ignored",
+            Self::Unverified => "unverified",
+        }
+    }
+}
+
+impl Default for DiscardCapability {
+    fn default() -> Self {
+        Self::Unknown
+    }
+}
+
+impl std::fmt::Display for DiscardCapability {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // DeviceHealth — persistent health state for a device in the pool
 // ---------------------------------------------------------------------------
@@ -339,6 +390,10 @@ pub struct DeviceInfo {
     pub partition_number: Option<u32>,
     /// Parent device kernel name, if this is a partition.
     pub parent_device: Option<String>,
+    /// Byte-addressable backing accepted for pool membership, when known.
+    pub device_backing: Option<PoolDeviceBacking>,
+    /// Source-backed discard capability for this path.
+    pub discard_capability: DiscardCapability,
 }
 
 impl DeviceInfo {
@@ -360,6 +415,8 @@ impl DeviceInfo {
             rotational: None,
             partition_number: None,
             parent_device: None,
+            device_backing: None,
+            discard_capability: DiscardCapability::Unknown,
         }
     }
 }
@@ -377,6 +434,10 @@ pub struct DeviceScanEntry {
     pub size_bytes: u64,
     /// Classified device kind.
     pub kind: DeviceKind,
+    /// Byte-addressable backing accepted for pool membership, when known.
+    pub device_backing: Option<PoolDeviceBacking>,
+    /// Source-backed discard capability for this path.
+    pub discard_capability: DiscardCapability,
     /// Model string, if available.
     pub model: Option<String>,
     /// Serial string, if available.
@@ -470,10 +531,11 @@ impl DeviceScanReport {
 
         for entry in self.devices.values() {
             println!(
-                "  {:<20} {:>10}  {:<8}  {}",
+                "  {:<20} {:>10}  {:<8}  discard={:<11}  {}",
                 entry.device_path.display(),
                 format_size(entry.size_bytes),
                 entry.kind,
+                entry.discard_capability,
                 entry.label_status,
             );
         }
@@ -578,6 +640,8 @@ impl DeviceEnumerator {
             info.model = read_sysfs_string(&entry.path(), "device/model");
             info.serial = read_sysfs_string(&entry.path(), "device/serial");
             info.wwn = read_sysfs_string(&entry.path(), "device/wwid");
+            info.device_backing = Some(PoolDeviceBacking::BlockDevice);
+            info.discard_capability = probe_block_discard_capability(&entry.path());
 
             devices.push(info);
         }
@@ -839,6 +903,8 @@ impl PoolLabelReader {
             device_path: info.device_path.clone(),
             size_bytes: info.size_bytes,
             kind: info.kind,
+            device_backing: info.device_backing,
+            discard_capability: info.discard_capability,
             model: info.model.clone(),
             serial: info.serial.clone(),
             has_tidefs_label: false,
@@ -925,6 +991,7 @@ pub fn scan_devices(
                 // Read size from the device file.
                 if let Ok(meta) = std::fs::metadata(p) {
                     if meta.file_type().is_block_device() {
+                        info.device_backing = Some(PoolDeviceBacking::BlockDevice);
                         // For block devices, we need to read size via ioctl or sysfs.
                         // Fall back to /sys/block/<name>/size.
                         if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
@@ -942,6 +1009,10 @@ pub fn scan_devices(
                     } else {
                         info.size_bytes = meta.len();
                     }
+                }
+                if let Ok(backing) = classify_pool_device_backing(p) {
+                    info.device_backing = Some(backing);
+                    info.discard_capability = discard_capability_for_backing(p, backing);
                 }
                 info
             })
@@ -989,6 +1060,10 @@ pub fn scan_labels(device_paths: &[PathBuf]) -> Result<Vec<DeviceScanEntry>, Sca
         // Read size from the device file or block-device ioctl.
         if let Ok(size) = device_capacity_bytes(p) {
             info.size_bytes = size;
+        }
+        if let Ok(backing) = classify_pool_device_backing(p) {
+            info.device_backing = Some(backing);
+            info.discard_capability = discard_capability_for_backing(p, backing);
         }
         let entry = PoolLabelReader::scan_device(&info);
         if entry.label_status.starts_with("error:") {
@@ -1070,8 +1145,47 @@ fn read_sysfs_u8(dir: &Path, rel_path: &str) -> Option<u8> {
         .and_then(|s| s.trim().parse::<u8>().ok())
 }
 
+fn read_sysfs_u64_capability(dir: &Path, rel_path: &str) -> Result<u64, DiscardCapability> {
+    let path = dir.join(rel_path);
+    let value = fs::read_to_string(&path).map_err(|error| match error.kind() {
+        std::io::ErrorKind::PermissionDenied => DiscardCapability::Refused,
+        _ => DiscardCapability::Unknown,
+    })?;
+    value
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| DiscardCapability::Unknown)
+}
+
+fn probe_block_discard_capability(sysfs_dir: &Path) -> DiscardCapability {
+    match read_sysfs_u64_capability(sysfs_dir, "queue/discard_max_bytes") {
+        Ok(0) => DiscardCapability::Unsupported,
+        Ok(_) => DiscardCapability::Supported,
+        Err(capability) => capability,
+    }
+}
+
+fn sysfs_class_block_dir(path: &Path) -> Option<PathBuf> {
+    let name = path.file_name()?.to_str()?;
+    Some(Path::new("/sys/class/block").join(name))
+}
+
+pub(crate) fn discard_capability_for_backing(
+    path: &Path,
+    backing: PoolDeviceBacking,
+) -> DiscardCapability {
+    match backing {
+        PoolDeviceBacking::RegularFileDev => DiscardCapability::Unverified,
+        PoolDeviceBacking::BlockDevice => sysfs_class_block_dir(path)
+            .as_deref()
+            .map(probe_block_discard_capability)
+            .unwrap_or(DiscardCapability::Unknown),
+    }
+}
+
 /// Byte-addressable backing accepted for TideFS pool-member paths.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum PoolDeviceBacking {
     /// Production block-device backing.
     BlockDevice,
@@ -2696,6 +2810,84 @@ mod tests {
         assert_eq!(info.kernel_name, "sda");
         assert_eq!(info.kind, DeviceKind::Unknown);
         assert_eq!(info.size_bytes, 0);
+        assert_eq!(info.device_backing, None);
+        assert_eq!(info.discard_capability, DiscardCapability::Unknown);
+    }
+
+    #[test]
+    fn discard_capability_only_supported_is_open() {
+        assert!(DiscardCapability::Supported.is_supported());
+        for capability in [
+            DiscardCapability::Unsupported,
+            DiscardCapability::Unknown,
+            DiscardCapability::Refused,
+            DiscardCapability::Ignored,
+            DiscardCapability::Unverified,
+        ] {
+            assert!(!capability.is_supported(), "{capability:?}");
+        }
+    }
+
+    #[test]
+    fn probe_block_discard_capability_reads_sysfs_discard_max_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("queue")).unwrap();
+        let discard_max_bytes = dir.path().join("queue/discard_max_bytes");
+
+        std::fs::write(&discard_max_bytes, b"4096\n").unwrap();
+        assert_eq!(
+            probe_block_discard_capability(dir.path()),
+            DiscardCapability::Supported
+        );
+
+        std::fs::write(&discard_max_bytes, b"0\n").unwrap();
+        assert_eq!(
+            probe_block_discard_capability(dir.path()),
+            DiscardCapability::Unsupported
+        );
+
+        std::fs::write(&discard_max_bytes, b"not-a-number\n").unwrap();
+        assert_eq!(
+            probe_block_discard_capability(dir.path()),
+            DiscardCapability::Unknown
+        );
+    }
+
+    #[test]
+    fn probe_block_discard_capability_missing_sysfs_is_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            probe_block_discard_capability(dir.path()),
+            DiscardCapability::Unknown
+        );
+    }
+
+    #[test]
+    fn regular_file_discard_capability_is_unverified() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("devfile");
+        std::fs::write(&file_path, b"dev").unwrap();
+
+        assert_eq!(
+            discard_capability_for_backing(&file_path, PoolDeviceBacking::RegularFileDev),
+            DiscardCapability::Unverified
+        );
+    }
+
+    #[test]
+    fn scan_labels_reports_regular_file_backing_as_unverified() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("devfile");
+        std::fs::write(&file_path, b"not a label").unwrap();
+
+        let entries = scan_labels(std::slice::from_ref(&file_path)).unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].device_backing,
+            Some(PoolDeviceBacking::RegularFileDev)
+        );
+        assert_eq!(entries[0].discard_capability, DiscardCapability::Unverified);
     }
 
     // -- format_size tests --
@@ -2746,6 +2938,8 @@ mod tests {
             device_path: PathBuf::from(format!("/dev/test/disk{device_index}")),
             size_bytes: 1024 * 1024 * 1024,
             kind: DeviceKind::Hdd,
+            device_backing: None,
+            discard_capability: DiscardCapability::Unknown,
             model: None,
             serial: None,
             has_tidefs_label: true,
@@ -3083,6 +3277,8 @@ mod tests {
             device_path: PathBuf::from("/dev/sda"),
             size_bytes: 0,
             kind: DeviceKind::Hdd,
+            device_backing: None,
+            discard_capability: DiscardCapability::Unknown,
             model: None,
             serial: None,
             has_tidefs_label: false,

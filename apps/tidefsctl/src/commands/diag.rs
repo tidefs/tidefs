@@ -362,6 +362,8 @@ mod tests {
             device_path: PathBuf::from("/redacted/device"),
             size_bytes: 0,
             kind: tidefs_pool_scan::DeviceKind::Unknown,
+            device_backing: None,
+            discard_capability: tidefs_pool_scan::DiscardCapability::Unknown,
             model: None,
             serial: None,
             has_tidefs_label: true,

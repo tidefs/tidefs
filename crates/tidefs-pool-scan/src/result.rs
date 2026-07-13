@@ -11,7 +11,10 @@ use tidefs_types_pool_label_core::{PoolLabelFingerprint, PoolLabelV1, PoolState}
 
 use crate::committed_root::CommittedRoot;
 use crate::segment::SegmentTable;
-use crate::CompletedEvacuation;
+use crate::{
+    classify_pool_device_backing, discard_capability_for_backing, CompletedEvacuation,
+    DiscardCapability, PoolDeviceBacking,
+};
 
 // ---------------------------------------------------------------------------
 // DeviceScanInfo
@@ -26,6 +29,10 @@ pub struct DeviceScanInfo {
     pub device_guid: Option<[u8; 16]>,
     /// Device index within the pool topology.
     pub device_index: Option<u32>,
+    /// Byte-addressable backing accepted for pool membership, when known.
+    pub device_backing: Option<PoolDeviceBacking>,
+    /// Source-backed discard capability for this path.
+    pub discard_capability: DiscardCapability,
     /// Whether the device carries a valid pool label.
     pub label_valid: bool,
     /// Human-readable label status.
@@ -48,6 +55,8 @@ impl DeviceScanInfo {
             device_path,
             device_guid: None,
             device_index: None,
+            device_backing: None,
+            discard_capability: DiscardCapability::Unknown,
             label_valid: false,
             label_status: String::new(),
             label_fingerprint: None,
@@ -70,6 +79,14 @@ impl DeviceScanInfo {
             label.pool_state,
             label.device_index
         );
+    }
+
+    /// Populate path-derived backing and discard capability metadata.
+    pub fn probe_path_capabilities(&mut self) {
+        if let Ok(backing) = classify_pool_device_backing(&self.device_path) {
+            self.device_backing = Some(backing);
+            self.discard_capability = discard_capability_for_backing(&self.device_path, backing);
+        }
     }
 }
 
@@ -284,6 +301,7 @@ impl PoolScanner {
         let all_results = reader.scan_all();
         for (device_path, outcome) in &all_results {
             let mut info = DeviceScanInfo::new(device_path.clone());
+            info.probe_path_capabilities();
             match outcome {
                 crate::label::LabelReadOutcome::Valid(label) => {
                     info.apply_label(label);
@@ -453,6 +471,27 @@ mod tests {
         file.seek(std::io::SeekFrom::Start(POOL_LABEL_V1_EXT_WIRE_SIZE as u64))
             .unwrap();
         file.write_all(&extension[..bytes_to_write]).unwrap();
+    }
+
+    #[test]
+    fn device_scan_info_defaults_to_unknown_discard_capability() {
+        let info = DeviceScanInfo::new(PathBuf::from("/dev/sda"));
+
+        assert_eq!(info.device_backing, None);
+        assert_eq!(info.discard_capability, DiscardCapability::Unknown);
+    }
+
+    #[test]
+    fn device_scan_info_probe_path_capabilities_reports_regular_file_unverified() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("devfile");
+        std::fs::write(&file_path, b"dev").unwrap();
+        let mut info = DeviceScanInfo::new(file_path);
+
+        info.probe_path_capabilities();
+
+        assert_eq!(info.device_backing, Some(PoolDeviceBacking::RegularFileDev));
+        assert_eq!(info.discard_capability, DiscardCapability::Unverified);
     }
 
     // -- PoolScanResult tests --

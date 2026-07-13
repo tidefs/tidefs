@@ -117,6 +117,48 @@ impl DeviceBacking {
     }
 }
 
+/// Source-backed discard/UNMAP capability state.
+///
+/// Only [`DiscardCapability::Supported`] permits callers to treat discard as
+/// available. Every other state is fail-closed and remains visible for
+/// diagnostics instead of collapsing into an optimistic boolean.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DiscardCapability {
+    /// The backing source reports non-zero discard support.
+    Supported,
+    /// The backing source reports no discard support.
+    Unsupported,
+    /// Capability could not be determined from the available source.
+    Unknown,
+    /// Capability probing was refused by the backing source.
+    Refused,
+    /// Discard requests may be accepted but ignored by the backing stack.
+    Ignored,
+    /// Development/test backing has not been verified as a discard-capable device.
+    Unverified,
+}
+
+impl DiscardCapability {
+    /// Whether this state proves discard support.
+    #[must_use]
+    pub const fn is_supported(self) -> bool {
+        matches!(self, Self::Supported)
+    }
+
+    /// Stable diagnostic spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Supported => "supported",
+            Self::Unsupported => "unsupported",
+            Self::Unknown => "unknown",
+            Self::Refused => "refused",
+            Self::Ignored => "ignored",
+            Self::Unverified => "unverified",
+        }
+    }
+}
+
 /// Configuration for a single device.
 #[derive(Clone, Debug)]
 pub struct DeviceConfig {
@@ -448,9 +490,14 @@ pub trait DeviceImpl {
         })
     }
 
+    /// Source-backed discard capability state.
+    fn discard_capability(&self) -> DiscardCapability {
+        DiscardCapability::Unsupported
+    }
+
     /// Whether the backing device supports discard operations.
     fn supports_discard(&self) -> bool {
-        false
+        self.discard_capability().is_supported()
     }
 }
 
@@ -799,8 +846,12 @@ impl DeviceImpl for SingleDevice {
         })
     }
 
+    fn discard_capability(&self) -> DiscardCapability {
+        DiscardCapability::Unsupported
+    }
+
     fn supports_discard(&self) -> bool {
-        false
+        self.discard_capability().is_supported()
     }
 }
 
@@ -1445,8 +1496,12 @@ impl DeviceImpl for MirrorDevice {
             .force_error_for_test(kind, count)
     }
 
-    fn supports_discard(&self) -> bool {
-        self.members.iter().all(|m| m.supports_discard())
+    fn discard_capability(&self) -> DiscardCapability {
+        self.members
+            .iter()
+            .map(DeviceImpl::discard_capability)
+            .find(|capability| !capability.is_supported())
+            .unwrap_or(DiscardCapability::Supported)
     }
 
     fn discard_range(&mut self, offset: u64, len: u64) -> Result<()> {
@@ -1901,7 +1956,15 @@ impl DeviceImpl for ParityRaidDevice {
     }
 
     fn supports_discard(&self) -> bool {
-        self.children.iter().all(|c| c.supports_discard())
+        self.discard_capability().is_supported()
+    }
+
+    fn discard_capability(&self) -> DiscardCapability {
+        self.children
+            .iter()
+            .map(DeviceImpl::discard_capability)
+            .find(|capability| !capability.is_supported())
+            .unwrap_or(DiscardCapability::Supported)
     }
 }
 
@@ -2199,8 +2262,8 @@ impl DeviceImpl for LogDevice {
         &mut self.store
     }
 
-    fn supports_discard(&self) -> bool {
-        false
+    fn discard_capability(&self) -> DiscardCapability {
+        DiscardCapability::Unsupported
     }
 }
 
@@ -2422,8 +2485,8 @@ impl DeviceImpl for CompressedDevice {
         self.inner.force_error_for_test(kind, count)
     }
 
-    fn supports_discard(&self) -> bool {
-        self.inner.supports_discard()
+    fn discard_capability(&self) -> DiscardCapability {
+        self.inner.discard_capability()
     }
 
     /// Transparent discard: forwards to the inner device.
@@ -2557,8 +2620,8 @@ impl DeviceImpl for EncryptedDevice {
         self.inner.force_error_for_test(kind, count)
     }
 
-    fn supports_discard(&self) -> bool {
-        self.inner.supports_discard()
+    fn discard_capability(&self) -> DiscardCapability {
+        self.inner.discard_capability()
     }
 
     /// Transparent discard: forwards to the inner device.
@@ -2964,8 +3027,12 @@ impl DeviceImpl for Device {
         self.inner_mut().discard_range(offset, len)
     }
 
+    fn discard_capability(&self) -> DiscardCapability {
+        self.inner().discard_capability()
+    }
+
     fn supports_discard(&self) -> bool {
-        self.inner().supports_discard()
+        self.discard_capability().is_supported()
     }
 }
 
@@ -4823,7 +4890,24 @@ mod tests {
         let dir = temp_path("discard-supports");
         let _ = std::fs::remove_dir_all(&dir);
         let dev = SingleDevice::open(&dir, test_options()).unwrap();
+        assert_eq!(dev.discard_capability(), DiscardCapability::Unsupported);
         assert!(!dev.supports_discard());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn discard_capability_states_fail_closed_except_supported() {
+        for capability in [
+            DiscardCapability::Unsupported,
+            DiscardCapability::Unknown,
+            DiscardCapability::Refused,
+            DiscardCapability::Ignored,
+            DiscardCapability::Unverified,
+        ] {
+            assert!(!capability.is_supported(), "{capability:?}");
+            assert!(!capability.as_str().is_empty());
+        }
+        assert!(DiscardCapability::Supported.is_supported());
+        assert_eq!(DiscardCapability::Supported.as_str(), "supported");
     }
 }
