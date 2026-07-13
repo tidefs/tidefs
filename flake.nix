@@ -838,10 +838,11 @@ EOF
               import time
               import shutil
 
+              results: list = []
               validation = {
                 "test": "tidefs-xfstests-lock-group",
                 "version": 1,
-                "results": [],
+                "results": results,
                 "passed": 0,
                 "failed": 0,
                 "skipped": 0,
@@ -853,7 +854,7 @@ EOF
                       entry["duration_secs"] = duration_secs
                   if failure_log is not None:
                       entry["failure_log"] = failure_log
-                  validation["results"].append(entry)
+                  results.append(entry)
 
               machine.start()
               machine.wait_for_unit("multi-user.target")
@@ -908,7 +909,7 @@ EOF
               rc, stdout = machine.execute(xfstests_cmd)
               print(f"xfstests-check exit code: {rc}")
               if stdout:
-                  print(f"xfstests-check stdout (last 2KB):")
+                  print("xfstests-check stdout (last 2KB):")
                   print(stdout[-2000:] if len(stdout) > 2000 else stdout)
 
               # Collect daemon log for diagnostics
@@ -998,12 +999,12 @@ EOF
                                  failure_log=flog)
 
               # Compute counts
-              validation["passed"] = sum(1 for r in validation["results"] if r["status"] == "pass")
-              validation["product_failures"] = sum(1 for r in validation["results"] if r["status"] == "product-fail")
-              validation["harness_failures"] = sum(1 for r in validation["results"] if r["status"] == "harness-fail")
-              validation["environment_refusals"] = sum(1 for r in validation["results"] if r["status"] == "environment-refusal")
-              validation["skipped"] = sum(1 for r in validation["results"] if r["status"] == "skip")
-              validation["skipped"] = sum(1 for r in validation["results"] if r["status"] == "skip")
+              validation["passed"] = sum(1 for r in results if r["status"] == "pass")
+              validation["failed"] = sum(1 for r in results if r["status"] == "fail")
+              validation["product_failures"] = sum(1 for r in results if r["status"] == "product-fail")
+              validation["harness_failures"] = sum(1 for r in results if r["status"] == "harness-fail")
+              validation["environment_refusals"] = sum(1 for r in results if r["status"] == "environment-refusal")
+              validation["skipped"] = sum(1 for r in results if r["status"] == "skip")
 
               # Write validation artifact
               machine.succeed("mkdir -p /tmp/tidefs-validation")
