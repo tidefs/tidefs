@@ -1988,6 +1988,45 @@ mod tests {
     }
 
     #[test]
+    fn invalid_live_owner_error_machine_json_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("owner.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        write_owner_manifest(dir.path(), &socket_path);
+        let handle = spawn_owner_response(
+            listener,
+            LivePoolAdminResponse::error_machine_json(1, "owner failed", "not-json"),
+        );
+        let route = LivePoolRoute {
+            command: "pool",
+            operation: "status",
+            pool: "tank",
+            pool_uuid: Some([0x42; 16]),
+            json: true,
+            args: LivePoolAdminArgs::default(),
+        };
+
+        let err = send_live_owner_request_at(dir.path(), &route).unwrap_err();
+        let request = handle.join().unwrap();
+
+        assert_eq!(request.command, LivePoolAdminCommand::PoolStatus);
+        match err {
+            LiveOwnerRequestError::Owner {
+                exit_code,
+                message,
+                detail,
+            } => {
+                assert_eq!(exit_code, 2);
+                assert!(message.starts_with("decode live-owner machine JSON:"));
+                assert!(detail.is_none());
+            }
+            LiveOwnerRequestError::Unavailable(message) => {
+                panic!("reachable owner should fail closed on malformed detail, got {message}");
+            }
+        }
+    }
+
+    #[test]
     fn pool_destroy_live_owner_request_preserves_destroy_boundary_args() {
         let dir = tempfile::tempdir().unwrap();
         let socket_path = dir.path().join("owner.sock");
