@@ -412,6 +412,14 @@ pub enum BackfillError {
     #[error("backfill {0} is not in a state that allows {1}")]
     InvalidState(u64, &'static str),
     #[error(
+        "backfill {backfill_id} has incomplete object progress: {completed_objects}/{total_objects}"
+    )]
+    IncompleteBackfill {
+        backfill_id: u64,
+        completed_objects: u64,
+        total_objects: u64,
+    },
+    #[error(
         "epoch mismatch: backfill epoch {backfill_epoch:?} != current epoch {current_epoch:?}"
     )]
     EpochMismatch {
@@ -723,6 +731,13 @@ impl RebuildBackfillInitiator {
         if session.state != BackfillState::Transferring {
             return Err(BackfillError::InvalidState(backfill_id, "complete"));
         }
+        if !session.is_complete() {
+            return Err(BackfillError::IncompleteBackfill {
+                backfill_id,
+                completed_objects: session.objects_completed,
+                total_objects: session.total_objects,
+            });
+        }
         session.advance(BackfillState::Verifying);
         Ok(())
     }
@@ -734,6 +749,15 @@ impl RebuildBackfillInitiator {
             .ok_or(BackfillError::NotFound(backfill_id))?;
         if session.state != BackfillState::Verifying {
             return Err(BackfillError::InvalidState(backfill_id, "finalize"));
+        }
+        // Verification can only close a session whose transfer progress covers
+        // the planned object count; state movement alone is not completion evidence.
+        if !session.is_complete() {
+            return Err(BackfillError::IncompleteBackfill {
+                backfill_id,
+                completed_objects: session.objects_completed,
+                total_objects: session.total_objects,
+            });
         }
         session.advance(BackfillState::Complete);
         Ok(())
