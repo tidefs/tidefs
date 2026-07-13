@@ -4325,13 +4325,13 @@ const UNGUARDED_COMMANDS: &[&str] = &[
     fn validate_claim_rejects_runtime_deterministic_fixture_for_validated_claim() {
         let temp = tempfile::tempdir().expect("tempdir");
         let artifact_body = "deterministic runtime fixture evidence body";
-        write_artifact(temp.path(), "evidence/summary.txt", artifact_body);
+        write_artifact(temp.path(), "evidence/runtime/summary.txt", artifact_body);
         write_manifest_fixture_with_tier_run_id_and_source_ref(
             temp.path(),
-            "evidence/summary.manifest.json",
+            "evidence/runtime/summary.manifest.json",
             "example.manifest.validated.v1",
             "cargo-fixture",
-            "evidence/summary.txt",
+            "evidence/runtime/summary.txt",
             artifact_body,
             ValidationStatus::Pass,
             Vec::new(),
@@ -4346,6 +4346,9 @@ const UNGUARDED_COMMANDS: &[&str] = &[
             Vec::new(),
         );
         claim.evidence_requirements[0].validation_tier = ValidationTier::MountedUserspace;
+        claim.evidence_requirements[0].path = "evidence/runtime/summary.txt".to_string();
+        claim.evidence_requirements[0].manifest_path =
+            Some("evidence/runtime/summary.manifest.json".to_string());
 
         let receipt = build_claim_validation_receipt(temp.path(), SystemTime::UNIX_EPOCH, &claim);
         assert_eq!(receipt.status, ClaimReceiptStatus::Fail);
