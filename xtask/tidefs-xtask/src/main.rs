@@ -27,7 +27,7 @@ mod terminology;
 mod trace_oracle;
 
 use std::env;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process;
 use std::process::Command;
 use tidefs_types_package_profile_catalog::SURFACES;
@@ -1803,12 +1803,47 @@ fn validate_evidence_manifest_path(
     match manifest.verify_artifact_digest(artifact_root) {
         Ok(()) => {}
         Err(err) if evidence_manifest_error_is_terminal(&err) => return Err(err),
-        Err(manifest_relative_err) => match manifest.verify_artifact_digest(".") {
-            Ok(()) => {}
-            Err(_) => return Err(manifest_relative_err),
-        },
+        Err(manifest_relative_err) => {
+            let Some(workspace_root) = evidence_manifest_workspace_root(path) else {
+                return Err(manifest_relative_err);
+            };
+            match manifest.verify_artifact_digest(workspace_root) {
+                Ok(()) => {}
+                Err(err) if evidence_manifest_error_is_terminal(&err) => return Err(err),
+                Err(_) => return Err(manifest_relative_err),
+            }
+        }
     }
     Ok(manifest)
+}
+
+fn evidence_manifest_workspace_root(path: &Path) -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(parent) = path.parent() {
+        candidates.push(parent.to_path_buf());
+    }
+    candidates.push(env::current_dir().ok()?);
+
+    for candidate in candidates {
+        let candidate = if candidate.is_absolute() {
+            candidate
+        } else {
+            env::current_dir().ok()?.join(candidate)
+        };
+        let Ok(start) = candidate.canonicalize() else {
+            continue;
+        };
+        for ancestor in start.ancestors() {
+            let manifest = ancestor.join("Cargo.toml");
+            if let Ok(text) = std::fs::read_to_string(&manifest) {
+                if text.contains("[workspace]") {
+                    return Some(ancestor.to_path_buf());
+                }
+            }
+        }
+    }
+
+    None
 }
 
 fn evidence_manifest_error_is_terminal(err: &EvidenceArtifactManifestError) -> bool {
@@ -1982,8 +2017,11 @@ error[E0308]: mismatched types
         let _guard = CURRENT_DIR_LOCK.lock().expect("current-dir lock");
         let original_dir = env::current_dir().expect("current dir");
         let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(temp.path().join("Cargo.toml"), "[workspace]\n").expect("write manifest");
         let manifest_dir = temp.path().join("validation/artifacts/storage-intent");
+        let package_dir = temp.path().join("xtask/tidefs-xtask");
         fs::create_dir_all(&manifest_dir).expect("create manifest dir");
+        fs::create_dir_all(&package_dir).expect("create package dir");
         let artifact_bytes = b"repo-relative evidence bytes";
         fs::write(manifest_dir.join("artifact.json"), artifact_bytes).expect("write artifact");
         let manifest = evidence_manifest_for(
@@ -1992,7 +2030,7 @@ error[E0308]: mismatched types
         );
         let manifest_path = write_manifest(&manifest_dir, &manifest);
 
-        env::set_current_dir(temp.path()).expect("enter tempdir");
+        env::set_current_dir(&package_dir).expect("enter package dir");
         let result = validate_evidence_manifest_path(&manifest_path);
         env::set_current_dir(original_dir).expect("restore current dir");
 
