@@ -21,7 +21,7 @@ impl fmt::Display for StorageCheckError {
 
 pub fn check_local_object_store_current_workspace() -> Result<(), StorageCheckError> {
     let root = find_workspace_root().ok_or_else(|| StorageCheckError {
-        title: "local object-store source check",
+        title: "local object-store source-presence smoke check",
         missing: vec!["could not locate workspace root Cargo.toml".to_string()],
     })?;
     let mut missing = Vec::new();
@@ -39,6 +39,8 @@ pub fn check_local_object_store_current_workspace() -> Result<(), StorageCheckEr
     ] {
         check_required_file(&root, rel, &mut missing);
     }
+    // Transitional policy/tooling smoke: keep developer drift signal without
+    // presenting source markers as product, durability, or authority evidence.
     check_source_markers_in_src_dir(
         &root,
         "crates/tidefs-local-object-store",
@@ -97,12 +99,12 @@ pub fn check_local_object_store_current_workspace() -> Result<(), StorageCheckEr
     );
     if missing.is_empty() {
         println!(
-            "local object store source ok: segment files, record headers, commit markers, development integrity checksums, replay, tombstones, tail repair, and source tests present"
+            "local object-store source-presence smoke ok: workspace entries, source files, and marker inventory are present; policy/tooling signal only, not product, durability, or authority evidence"
         );
         Ok(())
     } else {
         Err(StorageCheckError {
-            title: "local object-store source check",
+            title: "local object-store source-presence smoke check",
             missing,
         })
     }
