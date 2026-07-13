@@ -77,6 +77,22 @@ const fn label_health(device_health: u8) -> MediaHealthState {
     }
 }
 
+const fn pmem_flush_fence_authority_ready(facts: LocalMediaCapabilityFacts) -> bool {
+    matches!(facts.media_class, StorageMediaClass::PersistentMemory)
+        && matches!(
+            facts.persistence.domain,
+            MediaPersistenceDomain::PersistentMemory
+        )
+        && facts.identity.stable_device_identity
+        && facts.identity.stable_namespace_identity
+        && facts.identity.pool_member_binding
+        && facts.identity.firmware_capability_generation
+        && matches!(
+            facts.block_io.flush_ordering,
+            MediaFlushOrderingClass::PmemFlushFence
+        )
+}
+
 /// Decoded operational state from a local pool-label sample.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LocalPoolLabelState {
@@ -1316,10 +1332,7 @@ pub const fn produce_local_media_capability(
     ) {
         flags = flags.union(MediaCapabilityFlags::FLUSH_FUA_ORDERING);
     }
-    if matches!(
-        facts.block_io.flush_ordering,
-        MediaFlushOrderingClass::PmemFlushFence
-    ) {
+    if pmem_flush_fence_authority_ready(facts) {
         flags = flags.union(MediaCapabilityFlags::PMEM_FLUSH_FENCE);
     }
     if !matches!(facts.atomicity.atomicity, MediaAtomicityClass::Unknown) {
@@ -2138,6 +2151,55 @@ mod tests {
             result.refusal,
             StorageIntentRefusalReason::PmemFlushFenceMissing
         );
+    }
+
+    fn assert_no_pmem_flush_fence_flag(facts: LocalMediaCapabilityFacts) {
+        let record = produce_local_media_capability(facts);
+
+        assert_eq!(
+            record.flush_ordering,
+            MediaFlushOrderingClass::PmemFlushFence
+        );
+        assert!(record
+            .flags
+            .contains_all(MediaCapabilityFlags::FLUSH_FUA_ORDERING));
+        assert!(!record
+            .flags
+            .contains_all(MediaCapabilityFlags::PMEM_FLUSH_FENCE));
+    }
+
+    #[test]
+    fn pmem_flush_fence_flag_requires_complete_authority_identity() {
+        let mut missing_device_identity = strong_pmem_facts();
+        missing_device_identity.identity.stable_device_identity = false;
+        assert_no_pmem_flush_fence_flag(missing_device_identity);
+
+        let mut missing_namespace_identity = strong_pmem_facts();
+        missing_namespace_identity
+            .identity
+            .stable_namespace_identity = false;
+        assert_no_pmem_flush_fence_flag(missing_namespace_identity);
+
+        let mut missing_pool_binding = strong_pmem_facts();
+        missing_pool_binding.identity.pool_member_binding = false;
+        assert_no_pmem_flush_fence_flag(missing_pool_binding);
+
+        let mut missing_firmware_generation = strong_pmem_facts();
+        missing_firmware_generation
+            .identity
+            .firmware_capability_generation = false;
+        assert_no_pmem_flush_fence_flag(missing_firmware_generation);
+
+        assert_no_pmem_flush_fence_flag(strong_pmem_facts().with_persistence(
+            LocalPersistenceFacts::new(
+                MediaPersistenceDomain::PlpBackedVolatileCache,
+                evidence(24),
+            ),
+        ));
+
+        let mut non_pmem_media_class = strong_pmem_facts();
+        non_pmem_media_class.media_class = StorageMediaClass::NvmeFlash;
+        assert_no_pmem_flush_fence_flag(non_pmem_media_class);
     }
 
     #[test]
