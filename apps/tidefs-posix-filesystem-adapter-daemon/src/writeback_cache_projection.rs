@@ -373,6 +373,16 @@ impl WritebackProjection {
 
     // ── Mmap coherency accessor ──────────────────────────────────────
 
+    /// Install this projection as the dirty/writeback guard for mmap
+    /// invalidation.
+    pub fn install_mmap_dirty_check(self: &Arc<Self>) {
+        let projection = Arc::clone(self);
+        self.mmap_coherency
+            .set_dirty_check(Some(Box::new(move |ino| {
+                !projection.invalidation_allowed(ino)
+            })));
+    }
+
     /// Return a clone of the mmap coherency arc for the adapter.
     #[must_use]
     pub fn mmap_coherency(&self) -> Arc<MmapCoherency> {
@@ -387,6 +397,20 @@ impl WritebackProjection {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tidefs_invalidation_feed::{
+        CommitGroupId, DatasetId, InodeId, InvalidationBatch, InvalidationEvent,
+    };
+
+    fn batch(ino: u64, gen: u64) -> InvalidationBatch {
+        InvalidationBatch::new(
+            DatasetId::new(1),
+            CommitGroupId::new(1),
+            vec![InvalidationEvent::Inode {
+                ino: InodeId::new(ino),
+                generation: gen,
+            }],
+        )
+    }
 
     fn new_projection() -> WritebackProjection {
         let notifier = Arc::new(Mutex::new(None));
@@ -561,6 +585,25 @@ mod tests {
         p.record_dirty(42, 4096);
         p.record_writeback_pending(42, 4096);
         assert!(!p.invalidation_allowed(42));
+        assert_eq!(p.stats_snapshot().invalidation_skips_dirty, 1);
+    }
+
+    #[test]
+    fn installed_mmap_dirty_check_preserves_writeback_pending_invalidation() {
+        let notifier = Arc::new(Mutex::new(None));
+        let mmap = Arc::new(MmapCoherency::new(notifier));
+        let projection = Arc::new(WritebackProjection::new(None, Arc::clone(&mmap)));
+        projection.install_mmap_dirty_check();
+
+        mmap.register(42, 1);
+        projection.record_writeback_pending(42, 4096);
+        mmap.enqueue_batch(batch(42, 2));
+
+        assert_eq!(mmap.process_tick(10), 1);
+        let mmap_stats = mmap.stats.snapshot();
+        assert_eq!(mmap_stats.dirty_invalidations_preserved, 1);
+        assert_eq!(mmap_stats.pages_invalidated, 0);
+        assert_eq!(projection.stats_snapshot().invalidation_skips_dirty, 1);
     }
 
     #[test]
