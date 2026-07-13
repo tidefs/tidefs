@@ -25,9 +25,9 @@ use crate::fuse_read::{EngineReadRequest, FuseReadDispatch};
 use crate::fuse_rename::{EngineRenameRequest, FuseRenameDispatch};
 use crate::fusewire::{
     parse_defrag_input, parse_fiemap_input, DefragIoctlInput, DefragIoctlOutput, FiemapInput,
-    FiemapOutput, FsxattrOutput, FuseLockIn, FuseSetlkRequest, FIEMAP_HEADER_SIZE, FS_IOC_FIEMAP,
-    FICLONE, FICLONERANGE, FIDEDUPERANGE, FS_IOC_FREEZE, FS_IOC_FSGETXATTR, FS_IOC_THAW,
-    TIDEFS_IOC_DEFRAG,
+    FiemapOutput, FsxattrOutput, FuseLockIn, FuseSetlkRequest, FICLONE, FICLONERANGE,
+    FIDEDUPERANGE, FIEMAP_HEADER_SIZE, FS_IOC_FIEMAP, FS_IOC_FREEZE, FS_IOC_FSGETXATTR,
+    FS_IOC_THAW, TIDEFS_IOC_DEFRAG,
 };
 use crate::handler_prelude::*;
 use crate::lock_dispatch::{DaemonLockDispatch, LockDispatchError};
