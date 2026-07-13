@@ -582,6 +582,35 @@ fn unknown_object_failed_quorum_evidence_refuses_conservatively() {
 }
 
 #[test]
+fn failed_quorum_evidence_blocks_local_clean_bypass() {
+    let recon = MockReconstructor::new();
+    let mut engine = ScrubRepairEngine::new(recon);
+    let clean = make_data(256, 0x55);
+    let expected = hash_data(&clean);
+    let comparison = repair_comparison_record();
+    let evidence = UnresolvedFailedQuorumMutationEvidence::new(
+        "failed-quorum-clean-bypass",
+        Some(comparison.object_key),
+    );
+
+    assert_eq!(
+        engine.repair_one_with_comparison_and_failed_quorum_evidence(
+            1,
+            &expected,
+            &clean,
+            Some(&comparison),
+            &[evidence],
+        ),
+        ScrubRepairOutcome::UnresolvedFailedQuorumMutation {
+            mutation_id: "failed-quorum-clean-bypass".to_string()
+        }
+    );
+    assert_eq!(engine.ledger().repair_count, 0);
+    assert_eq!(engine.ledger().repair_failure_count, 0);
+    assert_eq!(engine.ledger().event_count(), 0);
+}
+
+#[test]
 fn unrelated_failed_quorum_evidence_keeps_comparison_repair_path() {
     let recon = MockReconstructor::new();
     let healthy = make_data(256, 0x55);
