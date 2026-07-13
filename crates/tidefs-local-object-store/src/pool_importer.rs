@@ -242,6 +242,16 @@ impl CandidatePool {
                 detail: "duplicate device_index values detected".into(),
             });
         }
+        for (expected, actual) in sorted_indices.iter().copied().enumerate() {
+            if actual != expected as u32 {
+                return Err(ImportError::TopologyInconsistent {
+                    pool_guid: self.pool_guid,
+                    detail: format!(
+                        "device_index sequence has a gap: expected {expected} but found {actual}"
+                    ),
+                });
+            }
+        }
 
         // Mark topology completeness from the same source-backed context used
         // for lifecycle evidence.
@@ -744,6 +754,63 @@ mod tests {
         };
 
         assert!(pool.validate().is_ok());
+    }
+
+    #[test]
+    fn candidate_pool_rejects_gap_in_device_indices() {
+        let pool_guid = [0xABu8; 16];
+        let make_candidate = |index, byte| DeviceCandidate {
+            path: std::path::PathBuf::from(format!("/dev/tidefs-gap-{index}")),
+            label: PoolLabelV1 {
+                magic: POOL_LABEL_MAGIC,
+                version: 1,
+                pool_guid,
+                device_guid: [byte; 16],
+                pool_name_len: 0,
+                pool_name: [0u8; 255],
+                pool_state: LabelPoolState::Exported,
+                commit_group: 100,
+                label_commit_group: 100,
+                device_index: index,
+                topology_generation: 1,
+                device_count: 2,
+                device_class: LabelDeviceClass::Hdd,
+                device_capacity_bytes: 1024 * 1024 * 1024,
+                system_area_pointer: 0,
+                system_area_size: 0,
+                features_incompat: 0,
+                features_ro_compat: 0,
+                features_compat: 0,
+                device_health: 0,
+                device_read_errors: 0,
+                device_write_errors: 0,
+                device_checksum_errors: 0,
+                redundancy_policy: PoolRedundancyPolicy::default(),
+                checksum: [0u8; 32],
+            },
+            label_copy: 0,
+            device_size: 1024 * 1024 * 1024,
+        };
+        let mut pool = CandidatePool {
+            pool_guid,
+            pool_name: "gap".into(),
+            pool_state: LabelPoolState::Exported,
+            devices: vec![make_candidate(1, 0x01), make_candidate(2, 0x02)],
+            topology_generation: 1,
+            device_count: 2,
+            recovery_commit_group: 100,
+            topology_complete: false,
+            cluster_authorized: false,
+        };
+
+        let result = pool.validate();
+
+        match result {
+            Err(ImportError::TopologyInconsistent { detail, .. }) => {
+                assert!(detail.contains("device_index sequence has a gap"));
+            }
+            other => panic!("expected TopologyInconsistent, got {other:?}"),
+        }
     }
 
     #[test]
