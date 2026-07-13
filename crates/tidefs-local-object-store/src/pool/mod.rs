@@ -3013,6 +3013,7 @@ impl Pool {
                 reason: "device not found for safe removal",
             },
         )?;
+        let target_guid = self.device_guid_for_index(target_idx);
 
         // Refuse to remove the last device.
         if self.devices.len() <= 1 {
@@ -3110,6 +3111,30 @@ impl Pool {
                 .put_pool_wide(IoClass::Data, receipt.object_key, &data, &surviving_indices)
                 .is_err()
             {
+                mark_failed(&mut result, receipt.object_key);
+                continue;
+            }
+
+            let committed_receipt =
+                match self.load_placement_receipt(&surviving_indices, receipt.object_key) {
+                    Ok(Some(receipt)) => receipt,
+                    Ok(None) | Err(_) => {
+                        mark_failed(&mut result, receipt.object_key);
+                        continue;
+                    }
+                };
+
+            let committed_evacuation = committed_receipt.payload_digest == digest
+                && committed_receipt.payload_len == len
+                && !committed_receipt.targets.is_empty()
+                && committed_receipt
+                    .targets
+                    .iter()
+                    .all(|target| target.device_guid != target_guid)
+                && self
+                    .ensure_receipt_replay_authority(&committed_receipt)
+                    .is_ok();
+            if !committed_evacuation {
                 mark_failed(&mut result, receipt.object_key);
                 continue;
             }
