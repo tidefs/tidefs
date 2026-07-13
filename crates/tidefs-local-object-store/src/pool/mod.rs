@@ -999,10 +999,16 @@ fn resume_device_removal_if_pending(pool: &mut Pool) {
     if marker_path.exists() {
         if let Ok(encoded) = std::fs::read_to_string(&marker_path) {
             let target_path = PathBuf::from(encoded.trim());
-            if target_path.exists() || pool.devices.iter().any(|d| d.root() == target_path) {
-                let _ = pool.safe_remove_device(&target_path);
+            let target_present =
+                target_path.exists() || pool.devices.iter().any(|d| d.root() == target_path);
+            let completed = if target_present {
+                matches!(pool.safe_remove_device(&target_path), Ok(result) if result.complete)
+            } else {
+                true
+            };
+            if completed {
+                let _ = std::fs::remove_file(&marker_path);
             }
-            let _ = std::fs::remove_file(&marker_path);
         }
     }
 }
@@ -6337,6 +6343,61 @@ mod tests {
         let obj3 = pool2.get(IoClass::Data, key3).unwrap();
         assert!(obj3.is_some(), "key3 not found after resume");
         assert_eq!(obj3.unwrap(), data3);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn safe_remove_device_resume_preserves_marker_after_refusal() {
+        let root = temp_dir("safe-remove-resume-refusal");
+        let _ = std::fs::remove_dir_all(&root);
+        let d1 = root.join("data1");
+        let d2 = root.join("data2");
+        let config = PoolConfig {
+            name: "testpool".into(),
+            root_path: root.to_path_buf(),
+            devices: vec![
+                DeviceConfig {
+                    media_class: Default::default(),
+                    path: d1.clone(),
+                    backing: DeviceBacking::DirectoryObjectStoreCompat,
+                    class: DeviceClass::Data,
+                    kind: DeviceKind::Single { path: d1.clone() },
+                    encryption: None,
+                    compression: None,
+                },
+                DeviceConfig {
+                    media_class: Default::default(),
+                    path: d2.clone(),
+                    backing: DeviceBacking::DirectoryObjectStoreCompat,
+                    class: DeviceClass::Data,
+                    kind: DeviceKind::Single { path: d2.clone() },
+                    encryption: None,
+                    compression: None,
+                },
+            ],
+        };
+
+        let mut pool =
+            Pool::create(config.clone(), PoolProperties::default(), &test_options()).unwrap();
+        let rogue_key = ObjectKey::from_name(b"resume-rogue-unreceipted-object");
+        let rogue_payload = b"resume refusal keeps marker";
+        pool.devices[0].put(rogue_key, rogue_payload).unwrap();
+
+        let marker_path = root.join(DEVICE_REMOVAL_MARKER_FILE);
+        std::fs::write(&marker_path, d1.to_string_lossy().as_bytes()).unwrap();
+
+        drop(pool);
+
+        let pool2 = Pool::open(config, PoolProperties::default(), &test_options()).unwrap();
+
+        assert!(marker_path.exists());
+        assert_eq!(pool2.stats().device_count, 2);
+        assert_eq!(
+            pool2.devices[0].get(rogue_key).unwrap(),
+            Some(rogue_payload.to_vec())
+        );
+        assert_eq!(pool2.devices[1].get(rogue_key).unwrap(), None);
 
         let _ = std::fs::remove_dir_all(&root);
     }
