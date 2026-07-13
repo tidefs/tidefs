@@ -5525,16 +5525,22 @@ fn sync_write_intent_appends_and_commit_clears() {
     let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
     assert!(fs.intent_log.is_empty());
 
-    fs.create_file("/f", 0o644).expect("create");
+    let rec = fs.create_file("/f", 0o644).expect("create");
+    let ino = rec.inode_id;
     fs.write_file("/f", 0, b"payload data").expect("write");
     assert!(
         fs.intent_log.is_empty(),
         "ordinary write_file stays on the buffered dirty path"
     );
+    fs.commit().expect("commit content");
+    assert!(
+        fs.intent_log.is_empty(),
+        "committing normal content does not create intent-log raw state"
+    );
 
     let digest = IntegrityDigest64(0xCAFE1234);
     let reply = fs
-        .sync_write_intent(InodeId::new(2), 0, 12, digest, b"payload data")
+        .sync_write_intent(ino, 0, 12, digest, b"payload data")
         .expect("sync_write_intent");
     assert_eq!(reply, IntentLogReplyState::IntentDurable);
     assert_eq!(fs.intent_log.len(), 1);
@@ -5589,15 +5595,21 @@ fn intent_log_clear_persists_across_clean_shutdown() {
 
     {
         let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
-        fs.create_file("/f", 0o644).expect("create");
+        let rec = fs.create_file("/f", 0o644).expect("create");
+        let ino = rec.inode_id;
         fs.write_file("/f", 0, b"data").expect("write");
         assert!(
             fs.intent_log.is_empty(),
             "ordinary write_file stays on the buffered dirty path"
         );
+        fs.commit().expect("commit content");
+        assert!(
+            fs.intent_log.is_empty(),
+            "committing normal content does not create intent-log raw state"
+        );
 
         let digest = IntegrityDigest64(0xABCD);
-        fs.sync_write_intent(InodeId::new(2), 0, 4, digest, b"data")
+        fs.sync_write_intent(ino, 0, 4, digest, b"data")
             .expect("sync_write_intent");
         assert_eq!(fs.intent_log.len(), 1);
 
@@ -5696,9 +5708,10 @@ fn sync_write_intent_marks_state_dirty() {
 }
 
 #[test]
-fn do_commit_does_not_clear_intent_log_when_state_clean() {
+fn do_commit_replays_and_clears_intent_log_when_state_clean() {
     // Simulates the #863 data-loss scenario: intent log entries exist
-    // but state is clean. do_commit() must NOT clear the intent log.
+    // but state is clean. do_commit() must replay the log into a state
+    // commit before clearing it.
     //
     // Auto-commit is disabled so we control exactly when commits fire.
     let root = temp_root("intent-no-clear-clean");
@@ -5706,14 +5719,17 @@ fn do_commit_does_not_clear_intent_log_when_state_clean() {
     fs.set_auto_commit(false);
 
     // Write some data to dirty the state, then commit to make it clean.
-    fs.create_file("/f", 0o644).expect("create");
-    fs.write_file("/f", 0, b"payload").expect("write");
+    let f_rec = fs.create_file("/f", 0o644).expect("create");
+    fs.write_file("/f", 0, b"olddata").expect("write");
     fs.commit().expect("commit write");
     assert!(fs.intent_log.is_empty());
     assert!(!fs.has_dirty_metadata(), "state must be clean after commit");
 
     // Append an intent log entry directly — no dirty marks from
     // sync_write_intent, simulating a race with a clean commit.
+    fs.intent_log
+        .write_next_data_payload(&mut fs.store, b"payload")
+        .expect("write intent payload");
     let root_anchor = IntentLogRootAnchor {
         transaction_id: fs.state.generation,
         generation: fs.state.generation,
@@ -5724,7 +5740,7 @@ fn do_commit_does_not_clear_intent_log_when_state_clean() {
         .append(
             fs.store.primary_store_mut().raw_store_mut(),
             IntentLogEntryKind::SyncWriteRange {
-                inode_id: InodeId::new(3),
+                inode_id: f_rec.inode_id,
                 offset: 0,
                 length: 7,
                 payload_digest: IntegrityDigest64(0xCAFE),
@@ -5738,15 +5754,13 @@ fn do_commit_does_not_clear_intent_log_when_state_clean() {
     assert_eq!(fs.intent_log.len(), 1);
     assert!(!fs.has_dirty_metadata(), "state must still be clean");
 
-    // do_commit() must NOT clear intent log when state is clean.
-    // This is the key invariant: acknowledged intents survive
-    // until the next state commit.
+    // do_commit() must not drop the intent. It replays the log into the
+    // state commit, then clears the redundant log records.
     fs.commit().expect("commit while clean");
-    assert_eq!(
-        fs.intent_log.len(),
-        1,
-        "intent log must survive a clean commit — #863 fix"
-    );
+    assert!(fs.intent_log.is_empty());
+    assert!(!fs.has_dirty_metadata());
+    let content = fs.read_file("/f").expect("read replayed content");
+    assert_eq!(content, b"payload");
 
     cleanup(&root);
 }
@@ -5760,6 +5774,9 @@ fn do_commit_clears_intent_log_after_state_persist() {
     fs.set_auto_commit(false);
     let f_rec = fs.create_file("/f", 0o644).expect("create");
     fs.write_file("/f", 0, b"committed data").expect("write");
+    fs.commit().expect("commit initial content");
+    assert!(fs.intent_log.is_empty());
+    assert!(!fs.has_dirty_metadata());
 
     let digest = IntegrityDigest64(0xFEED);
     fs.sync_write_intent(f_rec.inode_id, 0, 14, digest, b"committed data")

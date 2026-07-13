@@ -8401,17 +8401,10 @@ impl LocalFileSystem {
                 }
                 // Also remove intent log entries for this inode so the
                 // fsync fast path does not replay pre-truncation writes.
-                let removed_ids = self.intent_log.remove_entries_for_inode(inode_id);
-                for entry_id in &removed_ids {
-                    let _ = self
-                        .store
-                        .raw_primary_store_mut()
-                        .delete(intent_log_entry_object_key(*entry_id));
-                    let _ = self
-                        .store
-                        .raw_primary_store_mut()
-                        .delete(intent_log_data_object_key(*entry_id));
-                }
+                self.intent_log.remove_entries_for_inode_from_store(
+                    inode_id,
+                    self.store.raw_primary_store_mut(),
+                );
             }
         }
         let result = if record.size == size {
@@ -10983,11 +10976,8 @@ impl LocalFileSystem {
             .as_nanos() as u64;
         // Store the write payload durably so that crash replay can
         // recover it even when the content manifest was never committed.
-        self.store.put(
-            DeviceIoClass::Data,
-            crate::object_keys::intent_log_data_object_key(self.intent_log.next_entry_id()),
-            payload,
-        )?;
+        self.intent_log
+            .write_next_data_payload(&mut self.store, payload)?;
 
         let accepted = self.intent_log.append(
             self.store.raw_primary_store_mut(),
