@@ -105,6 +105,68 @@ pub struct VerifiedReceiptCompletionRecord {
     pub repaired_placement_receipt_ref: PlacementReceiptRef,
 }
 
+/// Operator-visible replacement rebuild state carried by runtime evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ReplacementRebuildState {
+    Pending,
+    Resuming,
+    Canceled,
+    Completed,
+    Refused,
+}
+
+/// Whether replacement evidence permits old-device detach.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ReplacementDetachDecision {
+    UnsafeToDetach,
+    SafeToDetach,
+}
+
+impl ReplacementDetachDecision {
+    #[must_use]
+    pub fn is_safe(self) -> bool {
+        matches!(self, Self::SafeToDetach)
+    }
+}
+
+/// Old-device remanence treatment reported with replacement evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReplacementRemanenceTreatment {
+    pub old_device_detach_allowed: bool,
+    pub secure_erase_claimed: bool,
+    pub sanitization_claimed: bool,
+    pub decommissioning_ready_claimed: bool,
+}
+
+impl ReplacementRemanenceTreatment {
+    #[must_use]
+    pub fn from_detach_decision(detach_decision: ReplacementDetachDecision) -> Self {
+        Self {
+            old_device_detach_allowed: detach_decision.is_safe(),
+            secure_erase_claimed: false,
+            sanitization_claimed: false,
+            decommissioning_ready_claimed: false,
+        }
+    }
+}
+
+/// Durable replacement/rebuild evidence snapshot for an old/new member pair.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReplacementRebuildEvidenceRecord {
+    pub old_member: MemberId,
+    pub new_member: MemberId,
+    pub topology_epoch: u64,
+    pub total_subjects: u64,
+    pub subjects_completed: u64,
+    pub subjects_failed: u64,
+    pub verified_receipt_count: u64,
+    pub evidence_stable: bool,
+    pub evidence_replayable_after_reopen: bool,
+    pub state: ReplacementRebuildState,
+    pub detach_decision: ReplacementDetachDecision,
+    pub remanence_treatment: ReplacementRemanenceTreatment,
+}
+
 /// Error returned when a repaired target receipt cannot prove task completion.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReceiptCompletionError {
@@ -477,6 +539,57 @@ impl RebuildCompletion {
             .collect()
     }
 
+    #[must_use]
+    pub fn replacement_rebuild_evidence(
+        &self,
+        old_member: MemberId,
+        new_member: MemberId,
+        admission: &RebuildAdmission,
+        state: ReplacementRebuildState,
+        evidence_stable: bool,
+        evidence_replayable_after_reopen: bool,
+    ) -> ReplacementRebuildEvidenceRecord {
+        let status = self
+            .members
+            .get(&new_member)
+            .cloned()
+            .unwrap_or_else(|| CompletionStatus::new(new_member, 0));
+        let verified_receipt_count = self
+            .completed_verified_receipt_tasks
+            .iter()
+            .filter(|(target_member, _, _, _)| *target_member == new_member)
+            .count() as u64;
+        let verified_receipts_cover_progress = verified_receipt_count >= status.subjects_completed
+            && status.subjects_completed == status.total_subjects;
+        let detach_decision = if state == ReplacementRebuildState::Completed
+            && status.all_succeeded()
+            && verified_receipts_cover_progress
+            && evidence_stable
+            && evidence_replayable_after_reopen
+        {
+            ReplacementDetachDecision::SafeToDetach
+        } else {
+            ReplacementDetachDecision::UnsafeToDetach
+        };
+
+        ReplacementRebuildEvidenceRecord {
+            old_member,
+            new_member,
+            topology_epoch: admission.current_epoch(),
+            total_subjects: status.total_subjects,
+            subjects_completed: status.subjects_completed,
+            subjects_failed: status.subjects_failed,
+            verified_receipt_count,
+            evidence_stable,
+            evidence_replayable_after_reopen,
+            state,
+            detach_decision,
+            remanence_treatment: ReplacementRemanenceTreatment::from_detach_decision(
+                detach_decision,
+            ),
+        }
+    }
+
     pub fn reset(&mut self) {
         self.members.clear();
         self.completed_intent_subjects.clear();
@@ -574,6 +687,19 @@ mod tests {
         assert_eq!(completion.status(member).unwrap().subjects_completed, 0);
         assert_eq!(completion.total_completed_subjects(), 0);
         assert_eq!(completion.drain_events().len(), 0);
+    }
+
+    fn assert_remanence_treatment(
+        evidence: &ReplacementRebuildEvidenceRecord,
+        detach_allowed: bool,
+    ) {
+        assert_eq!(
+            evidence.remanence_treatment.old_device_detach_allowed,
+            detach_allowed
+        );
+        assert!(!evidence.remanence_treatment.secure_erase_claimed);
+        assert!(!evidence.remanence_treatment.sanitization_claimed);
+        assert!(!evidence.remanence_treatment.decommissioning_ready_claimed);
     }
 
     #[test]
@@ -1232,5 +1358,129 @@ mod tests {
             records[0].repaired_placement_receipt_ref.receipt_generation,
             5
         );
+    }
+
+    #[test]
+    fn replacement_rebuild_evidence_records_identity_epoch_and_progress() {
+        let mut completion = RebuildCompletion::new();
+        let mut admission = RebuildAdmission::with_epoch(7);
+        let old_member = MemberId::new(9);
+        let new_member = MemberId::new(10);
+        rebuilding_member(&mut completion, &mut admission, new_member, 2);
+
+        let task = make_erasure_task(42, 10, 1, 4, 2);
+        let mut replacement_receipt = erasure_receipt_ref(42, 1, 4, 2);
+        replacement_receipt.receipt_generation = 5;
+        assert!(completion
+            .record_receipt_verified_task_completion(&task, replacement_receipt, &mut admission,)
+            .expect("replacement receipt should verify")
+            .is_none());
+
+        let evidence = completion.replacement_rebuild_evidence(
+            old_member,
+            new_member,
+            &admission,
+            ReplacementRebuildState::Pending,
+            false,
+            false,
+        );
+
+        assert_eq!(evidence.old_member, old_member);
+        assert_eq!(evidence.new_member, new_member);
+        assert_eq!(evidence.topology_epoch, 7);
+        assert_eq!(evidence.total_subjects, 2);
+        assert_eq!(evidence.subjects_completed, 1);
+        assert_eq!(evidence.subjects_failed, 0);
+        assert_eq!(evidence.verified_receipt_count, 1);
+        assert_eq!(evidence.state, ReplacementRebuildState::Pending);
+        assert_eq!(
+            evidence.detach_decision,
+            ReplacementDetachDecision::UnsafeToDetach
+        );
+        assert_remanence_treatment(&evidence, false);
+    }
+
+    #[test]
+    fn replacement_detach_waits_for_stable_replayable_evidence() {
+        let mut completion = RebuildCompletion::new();
+        let mut admission = RebuildAdmission::with_epoch(7);
+        let old_member = MemberId::new(9);
+        let new_member = MemberId::new(10);
+        rebuilding_member(&mut completion, &mut admission, new_member, 1);
+
+        let task = make_erasure_task(42, 10, 1, 4, 2);
+        let mut replacement_receipt = erasure_receipt_ref(42, 1, 4, 2);
+        replacement_receipt.receipt_generation = 5;
+        completion
+            .record_receipt_verified_task_completion(&task, replacement_receipt, &mut admission)
+            .expect("replacement receipt should verify")
+            .expect("verified receipt completes replacement rebuild");
+
+        for (evidence_stable, evidence_replayable_after_reopen) in [(false, true), (true, false)] {
+            let evidence = completion.replacement_rebuild_evidence(
+                old_member,
+                new_member,
+                &admission,
+                ReplacementRebuildState::Completed,
+                evidence_stable,
+                evidence_replayable_after_reopen,
+            );
+            assert_eq!(
+                evidence.detach_decision,
+                ReplacementDetachDecision::UnsafeToDetach
+            );
+            assert_remanence_treatment(&evidence, false);
+        }
+
+        let evidence = completion.replacement_rebuild_evidence(
+            old_member,
+            new_member,
+            &admission,
+            ReplacementRebuildState::Completed,
+            true,
+            true,
+        );
+
+        assert_eq!(evidence.verified_receipt_count, 1);
+        assert_eq!(
+            evidence.detach_decision,
+            ReplacementDetachDecision::SafeToDetach
+        );
+        assert_remanence_treatment(&evidence, true);
+    }
+
+    #[test]
+    fn replacement_noncompleted_states_keep_detach_unsafe() {
+        let mut completion = RebuildCompletion::new();
+        let mut admission = RebuildAdmission::with_epoch(7);
+        let old_member = MemberId::new(9);
+        let new_member = MemberId::new(10);
+        rebuilding_member(&mut completion, &mut admission, new_member, 1);
+
+        let task = make_erasure_task(42, 10, 1, 4, 2);
+        let mut replacement_receipt = erasure_receipt_ref(42, 1, 4, 2);
+        replacement_receipt.receipt_generation = 5;
+        completion
+            .record_receipt_verified_task_completion(&task, replacement_receipt, &mut admission)
+            .expect("replacement receipt should verify")
+            .expect("verified receipt completes replacement rebuild");
+
+        for state in [
+            ReplacementRebuildState::Pending,
+            ReplacementRebuildState::Resuming,
+            ReplacementRebuildState::Canceled,
+            ReplacementRebuildState::Refused,
+        ] {
+            let evidence = completion.replacement_rebuild_evidence(
+                old_member, new_member, &admission, state, true, true,
+            );
+
+            assert_eq!(evidence.state, state);
+            assert_eq!(
+                evidence.detach_decision,
+                ReplacementDetachDecision::UnsafeToDetach
+            );
+            assert_remanence_treatment(&evidence, false);
+        }
     }
 }
