@@ -18,7 +18,7 @@ use tidefs_pool_scan::{
         build_system_area, SegmentDescriptor, SegmentScanError, SegmentState, SegmentTableReader,
         SEGMENT_TABLE_ENTRY_SIZE, SYSTEM_AREA_HEADER_SIZE,
     },
-    DeviceScanEntry, DeviceScanReport,
+    DeviceScanEntry, DeviceScanReport, DiscardCapability, PoolDeviceBacking,
 };
 
 use tidefs_types_pool_label_core::{
@@ -880,6 +880,8 @@ fn device_scan_entry_construction() {
         device_path: PathBuf::from("/dev/test"),
         size_bytes: 1024 * 1024 * 1024,
         kind: tidefs_pool_scan::DeviceKind::Ssd,
+        device_backing: Some(PoolDeviceBacking::BlockDevice),
+        discard_capability: DiscardCapability::Supported,
         model: Some("Samsung EVO".into()),
         serial: Some("S123456".into()),
         has_tidefs_label: true,
