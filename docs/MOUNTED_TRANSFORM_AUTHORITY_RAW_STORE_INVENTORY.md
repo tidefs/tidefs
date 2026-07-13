@@ -63,7 +63,7 @@ Current `raw_primary_store()` and `raw_primary_store_mut()` matches:
 | Path | Current matches | Inventory note |
 |---|---:|---|
 | `crates/tidefs-local-object-store/src/pool/mod.rs` | 9 | Pool accessors and `PoolStore` escape hatches. This is the lower object-store authority, not a mounted-filesystem proof. |
-| `crates/tidefs-local-filesystem/src/lib.rs` | 69 | Mounted production, recovery, reclaim, capacity, a pool-backed content-inspection diagnostic fallback, and raw drain/test assertions that remain blocked or raw-only as classified below. |
+| `crates/tidefs-local-filesystem/src/lib.rs` | 72 | Mounted production, recovery, reclaim, capacity, a pool-backed content-inspection diagnostic fallback, fail-closed recovery corruption fixtures, and raw drain/test assertions that remain blocked or raw-only as classified below. |
 | `crates/tidefs-local-filesystem/src/crash_recovery.rs` | 1 | `CrashMatrixRawStagingAuthority` owns validation-only raw commit-boundary staging. |
 | `crates/tidefs-local-filesystem/src/journal_cleaner.rs` | 7 | One production key-scan path plus six unit-test assertions. |
 | `crates/tidefs-local-filesystem/src/vfs_engine_impl.rs` | 6 | Live mounted VFS/admin paths plus encryption-feature tests. |
