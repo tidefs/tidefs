@@ -221,7 +221,6 @@ pub fn evaluate_failed_quorum_scenario(
     }
 }
 
-#[must_use]
 pub fn replay_failed_quorum_report(
     scenario: &FailedQuorumScenario,
 ) -> Result<FailedQuorumValidationReport, serde_json::Error> {
