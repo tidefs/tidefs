@@ -390,13 +390,129 @@ pub(crate) fn validate_sender_authority_for_receive(
 pub(crate) fn validate_changed_record_transform_contract(
     contract: ChangedRecordTransformContract,
 ) -> Result<()> {
-    if contract.requires_typed_metadata() {
-        return Err(FileSystemError::Unsupported {
-            operation: "send/receive transform contract",
-            reason: "mounted device transforms require typed transform metadata before changed-record streams can be imported",
-        });
+    changed_record_typed_transform_metadata_for_contract(contract).validate_import()
+}
+
+const CHANGED_RECORD_MOUNTED_TRANSFORM_METADATA_REQUIRED_REASON: &str =
+    "mounted device transforms require typed transform metadata before changed-record streams can be imported";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ChangedRecordTypedTransformMetadata {
+    plaintext_identity: ChangedRecordPlaintextIdentity,
+    transform_frame_identity: ChangedRecordTransformFrameIdentity,
+    checksum_layer: ChangedRecordChecksumLayer,
+    stored_frame_contract: ChangedRecordStoredFrameContract,
+    refusal_state: ChangedRecordTransformRefusalState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ChangedRecordPlaintextIdentity {
+    StoredFrameBytesAreMountedPlaintext,
+    RequiresTypedMountedContentIdentity,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ChangedRecordTransformFrameIdentity {
+    NotApplicableNoDeviceTransforms,
+    MissingTypedCompressionEncryptionFrameIdentity,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ChangedRecordChecksumLayer {
+    StoredFrameBytes,
+    RequiresTypedMountedTransformChecksum,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ChangedRecordStoredFrameContract {
+    StoredFrameNoDeviceTransforms,
+    RawMediaBytesNotMountedContentAuthority,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ChangedRecordTransformRefusalState {
+    ReplayReady,
+    MissingTypedTransformMetadata { reason: &'static str },
+}
+
+fn changed_record_typed_transform_metadata_for_contract(
+    contract: ChangedRecordTransformContract,
+) -> ChangedRecordTypedTransformMetadata {
+    match contract {
+        ChangedRecordTransformContract::StoredFrameNoDeviceTransforms => {
+            ChangedRecordTypedTransformMetadata {
+                plaintext_identity: ChangedRecordPlaintextIdentity::StoredFrameBytesAreMountedPlaintext,
+                transform_frame_identity:
+                    ChangedRecordTransformFrameIdentity::NotApplicableNoDeviceTransforms,
+                checksum_layer: ChangedRecordChecksumLayer::StoredFrameBytes,
+                stored_frame_contract: ChangedRecordStoredFrameContract::StoredFrameNoDeviceTransforms,
+                refusal_state: ChangedRecordTransformRefusalState::ReplayReady,
+            }
+        }
+        ChangedRecordTransformContract::MountedDeviceTransformsRequireTypedMetadata => {
+            ChangedRecordTypedTransformMetadata {
+                plaintext_identity: ChangedRecordPlaintextIdentity::RequiresTypedMountedContentIdentity,
+                transform_frame_identity:
+                    ChangedRecordTransformFrameIdentity::MissingTypedCompressionEncryptionFrameIdentity,
+                checksum_layer: ChangedRecordChecksumLayer::RequiresTypedMountedTransformChecksum,
+                stored_frame_contract:
+                    ChangedRecordStoredFrameContract::RawMediaBytesNotMountedContentAuthority,
+                refusal_state: ChangedRecordTransformRefusalState::MissingTypedTransformMetadata {
+                    reason: CHANGED_RECORD_MOUNTED_TRANSFORM_METADATA_REQUIRED_REASON,
+                },
+            }
+        }
     }
-    Ok(())
+}
+
+impl ChangedRecordTypedTransformMetadata {
+    fn validate_import(self) -> Result<()> {
+        if let ChangedRecordTransformRefusalState::MissingTypedTransformMetadata { reason } =
+            self.refusal_state
+        {
+            return Err(FileSystemError::Unsupported {
+                operation: "send/receive transform contract",
+                reason,
+            });
+        }
+
+        debug_assert_eq!(
+            self,
+            ChangedRecordTypedTransformMetadata {
+                plaintext_identity:
+                    ChangedRecordPlaintextIdentity::StoredFrameBytesAreMountedPlaintext,
+                transform_frame_identity:
+                    ChangedRecordTransformFrameIdentity::NotApplicableNoDeviceTransforms,
+                checksum_layer: ChangedRecordChecksumLayer::StoredFrameBytes,
+                stored_frame_contract:
+                    ChangedRecordStoredFrameContract::StoredFrameNoDeviceTransforms,
+                refusal_state: ChangedRecordTransformRefusalState::ReplayReady,
+            }
+        );
+
+        if self.stored_frame_contract
+            != ChangedRecordStoredFrameContract::StoredFrameNoDeviceTransforms
+        {
+            return Err(FileSystemError::Unsupported {
+                operation: "send/receive transform contract",
+                reason: CHANGED_RECORD_MOUNTED_TRANSFORM_METADATA_REQUIRED_REASON,
+            });
+        }
+
+        if self.plaintext_identity
+            != ChangedRecordPlaintextIdentity::StoredFrameBytesAreMountedPlaintext
+            || self.transform_frame_identity
+                != ChangedRecordTransformFrameIdentity::NotApplicableNoDeviceTransforms
+            || self.checksum_layer != ChangedRecordChecksumLayer::StoredFrameBytes
+        {
+            return Err(FileSystemError::Unsupported {
+                operation: "send/receive transform contract",
+                reason: CHANGED_RECORD_MOUNTED_TRANSFORM_METADATA_REQUIRED_REASON,
+            });
+        }
+
+        Ok(())
+    }
 }
 
 pub(crate) fn validate_changed_record_export(
@@ -2493,6 +2609,65 @@ mod tests {
     }
 
     #[test]
+    fn transform_disabled_changed_record_contract_uses_stored_frame_metadata() {
+        let metadata = changed_record_typed_transform_metadata_for_contract(
+            ChangedRecordTransformContract::StoredFrameNoDeviceTransforms,
+        );
+
+        assert_eq!(
+            metadata,
+            ChangedRecordTypedTransformMetadata {
+                plaintext_identity:
+                    ChangedRecordPlaintextIdentity::StoredFrameBytesAreMountedPlaintext,
+                transform_frame_identity:
+                    ChangedRecordTransformFrameIdentity::NotApplicableNoDeviceTransforms,
+                checksum_layer: ChangedRecordChecksumLayer::StoredFrameBytes,
+                stored_frame_contract:
+                    ChangedRecordStoredFrameContract::StoredFrameNoDeviceTransforms,
+                refusal_state: ChangedRecordTransformRefusalState::ReplayReady,
+            }
+        );
+        validate_changed_record_transform_contract(
+            ChangedRecordTransformContract::StoredFrameNoDeviceTransforms,
+        )
+        .expect("stored-frame/no-device-transform streams remain importable");
+    }
+
+    #[test]
+    fn transform_required_changed_record_contract_records_typed_refusal() {
+        let metadata = changed_record_typed_transform_metadata_for_contract(
+            ChangedRecordTransformContract::MountedDeviceTransformsRequireTypedMetadata,
+        );
+
+        assert_eq!(
+            metadata,
+            ChangedRecordTypedTransformMetadata {
+                plaintext_identity: ChangedRecordPlaintextIdentity::RequiresTypedMountedContentIdentity,
+                transform_frame_identity:
+                    ChangedRecordTransformFrameIdentity::MissingTypedCompressionEncryptionFrameIdentity,
+                checksum_layer: ChangedRecordChecksumLayer::RequiresTypedMountedTransformChecksum,
+                stored_frame_contract:
+                    ChangedRecordStoredFrameContract::RawMediaBytesNotMountedContentAuthority,
+                refusal_state: ChangedRecordTransformRefusalState::MissingTypedTransformMetadata {
+                    reason: CHANGED_RECORD_MOUNTED_TRANSFORM_METADATA_REQUIRED_REASON,
+                },
+            }
+        );
+
+        let err = validate_changed_record_transform_contract(
+            ChangedRecordTransformContract::MountedDeviceTransformsRequireTypedMetadata,
+        )
+        .expect_err("transform-required streams must fail without typed metadata");
+        assert!(matches!(
+            err,
+            FileSystemError::Unsupported {
+                operation: "send/receive transform contract",
+                reason: CHANGED_RECORD_MOUNTED_TRANSFORM_METADATA_REQUIRED_REASON,
+            }
+        ));
+    }
+
+    #[test]
     fn transform_required_changed_record_streams_fail_closed() {
         use crate::types::CommittedRootSummary;
 
@@ -2534,7 +2709,24 @@ mod tests {
             err,
             FileSystemError::Unsupported {
                 operation: "send/receive transform contract",
-                reason: "mounted device transforms require typed transform metadata before changed-record streams can be imported",
+                reason: CHANGED_RECORD_MOUNTED_TRANSFORM_METADATA_REQUIRED_REASON,
+            }
+        ));
+
+        let mut incremental_without_base = export.clone();
+        incremental_without_base.roots = vec![ChangedRecordRoot {
+            source_root: incremental_without_base.current_root.clone(),
+            records: Vec::new(),
+        }];
+        incremental_without_base.incremental = true;
+
+        let err = validate_changed_record_export(&incremental_without_base, true)
+            .expect_err("transform-required stream must fail before incremental base checks");
+        assert!(matches!(
+            err,
+            FileSystemError::Unsupported {
+                operation: "send/receive transform contract",
+                reason: CHANGED_RECORD_MOUNTED_TRANSFORM_METADATA_REQUIRED_REASON,
             }
         ));
     }
