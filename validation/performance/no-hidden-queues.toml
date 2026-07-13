@@ -1,5 +1,18 @@
 schema_version = 1
 
+[scheduler_wide_runtime_evidence]
+claim_id = "scheduler.dirty_debt.no_hidden.v1"
+required_evidence_class = "queue-depth-runtime-artifact"
+artifact_path = "validation/artifacts/performance/queue-depth-runtime.json"
+manifest_path = "validation/artifacts/performance/scheduler-dirty-debt-queue-depth-runtime.manifest.json"
+source_registry_boundary = "source-registry-review-only-does-not-satisfy-queue-depth-runtime-artifact"
+required_scope_fields = [
+  "workload",
+  "topology",
+  "scope",
+  "refusal_boundaries",
+]
+
 [[queue_roots]]
 id = "performance_contract.budgeted_queue"
 package = "tidefs-performance-contract"
