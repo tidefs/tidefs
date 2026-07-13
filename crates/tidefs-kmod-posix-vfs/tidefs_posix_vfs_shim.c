@@ -4728,7 +4728,9 @@ static int tidefs_posix_vfs_set_acl(struct mnt_idmap *idmap,
 			(unsigned int)strlen(xattr_name));
 		if (ret == -ENOSYS)
 			ret = -EOPNOTSUPP;
-		if (ret && !(type == ACL_TYPE_ACCESS && acl && ret == -ENODATA))
+		if (ret == -ENODATA)
+			ret = 0;
+		if (ret)
 			goto out_release_acl;
 		goto sync_mode;
 	}
