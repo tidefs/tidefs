@@ -84,6 +84,19 @@ static inline void fserror_report_shutdown(struct super_block *sb, int flags)
 int tidefs_posix_vfs_register_fs(void);
 void tidefs_posix_vfs_unregister_fs(void);
 
+#define TIDEFS_POSIX_VFS_FATTR_MODE  0x01u
+#define TIDEFS_POSIX_VFS_FATTR_UID   0x02u
+#define TIDEFS_POSIX_VFS_FATTR_GID   0x04u
+#define TIDEFS_POSIX_VFS_FATTR_SIZE  0x08u
+#define TIDEFS_POSIX_VFS_FATTR_ATIME 0x10u
+#define TIDEFS_POSIX_VFS_FATTR_MTIME 0x20u
+#define TIDEFS_POSIX_VFS_FATTR_CTIME 0x80u
+#define TIDEFS_POSIX_VFS_FATTR_TIMES \
+	(TIDEFS_POSIX_VFS_FATTR_ATIME | TIDEFS_POSIX_VFS_FATTR_MTIME | \
+	 TIDEFS_POSIX_VFS_FATTR_CTIME)
+#define TIDEFS_POSIX_VFS_FATTR_MTIME_CTIME \
+	(TIDEFS_POSIX_VFS_FATTR_MTIME | TIDEFS_POSIX_VFS_FATTR_CTIME)
+
 /*
  * Linux 7.0 exposes exclusive filemap invalidation helpers, but not shared
  * wrappers.  The VFS mapping still carries the rwsem that those helpers use.
@@ -1935,9 +1948,12 @@ static int tidefs_posix_vfs_engine_persist_inode_times(struct inode *inode,
 
 	return tidefs_posix_vfs_engine_setattr(
 		inode->i_ino, valid, 0, 0, 0, 0,
-		(valid & 0x10) ? tidefs_posix_vfs_timespec64_to_ns(inode_get_atime(inode)) : 0,
-		(valid & 0x20) ? tidefs_posix_vfs_timespec64_to_ns(inode_get_mtime(inode)) : 0,
-		(valid & 0x80) ? tidefs_posix_vfs_timespec64_to_ns(inode_get_ctime(inode)) : 0,
+		(valid & TIDEFS_POSIX_VFS_FATTR_ATIME) ?
+			tidefs_posix_vfs_timespec64_to_ns(inode_get_atime(inode)) : 0,
+		(valid & TIDEFS_POSIX_VFS_FATTR_MTIME) ?
+			tidefs_posix_vfs_timespec64_to_ns(inode_get_mtime(inode)) : 0,
+		(valid & TIDEFS_POSIX_VFS_FATTR_CTIME) ?
+			tidefs_posix_vfs_timespec64_to_ns(inode_get_ctime(inode)) : 0,
 		&out_mode, &out_uid, &out_gid, &out_size, &out_blocks);
 }
 
@@ -1955,7 +1971,7 @@ static void tidefs_posix_vfs_init_new_inode_times(struct inode *inode)
 {
 	simple_inode_init_ts(inode);
 	tidefs_posix_vfs_persist_inode_times_best_effort(
-		inode, 0x10 | 0x20 | 0x80);
+		inode, TIDEFS_POSIX_VFS_FATTR_TIMES);
 }
 
 static void tidefs_posix_vfs_touch_dirent_parent(struct inode *dir)
@@ -1964,7 +1980,8 @@ static void tidefs_posix_vfs_touch_dirent_parent(struct inode *dir)
 		return;
 	inode_set_mtime_to_ts(dir, inode_set_ctime_current(dir));
 	mark_inode_dirty(dir);
-	tidefs_posix_vfs_persist_inode_times_best_effort(dir, 0x20 | 0x80);
+	tidefs_posix_vfs_persist_inode_times_best_effort(
+		dir, TIDEFS_POSIX_VFS_FATTR_MTIME_CTIME);
 }
 
 static void tidefs_posix_vfs_touch_inode_ctime(struct inode *inode)
@@ -1973,7 +1990,8 @@ static void tidefs_posix_vfs_touch_inode_ctime(struct inode *inode)
 		return;
 	inode_set_ctime_current(inode);
 	mark_inode_dirty(inode);
-	tidefs_posix_vfs_persist_inode_times_best_effort(inode, 0x80);
+	tidefs_posix_vfs_persist_inode_times_best_effort(
+		inode, TIDEFS_POSIX_VFS_FATTR_CTIME);
 }
 
 static void tidefs_posix_vfs_apply_inode_ops(struct inode *inode, umode_t mode,
@@ -3538,7 +3556,7 @@ static int tidefs_posix_vfs_file_release(struct inode *inode, struct file *file)
 			wb_ret = filemap_write_and_wait(inode->i_mapping);
 		if (ofs->times_dirty) {
 			int ts_ret = tidefs_posix_vfs_engine_persist_inode_times(
-				inode, 0x20 | 0x80);
+				inode, TIDEFS_POSIX_VFS_FATTR_MTIME_CTIME);
 
 			if (ts_ret == 0)
 				ofs->times_dirty = false;
@@ -3748,7 +3766,7 @@ static ssize_t tidefs_posix_vfs_file_read_iter(struct kiocb *iocb,
 				new_atime = inode_get_atime(inode);
 				if (!timespec64_equal(&old_atime, &new_atime))
 					tidefs_posix_vfs_persist_inode_times_best_effort(
-						inode, 0x10);
+						inode, TIDEFS_POSIX_VFS_FATTR_ATIME);
 			}
 			return read_ret;
 		}
@@ -3804,7 +3822,7 @@ static ssize_t tidefs_posix_vfs_file_read_iter(struct kiocb *iocb,
 			new_atime = inode_get_atime(inode);
 			if (!timespec64_equal(&old_atime, &new_atime))
 				tidefs_posix_vfs_persist_inode_times_best_effort(
-					inode, 0x10);
+					inode, TIDEFS_POSIX_VFS_FATTR_ATIME);
 		}
 		return total;
 	}
@@ -4228,7 +4246,7 @@ static ssize_t tidefs_posix_vfs_file_direct_engine_write(
 		ofs->times_dirty = true;
 	else
 		tidefs_posix_vfs_persist_inode_times_best_effort(
-			inode, 0x20 | 0x80);
+			inode, TIDEFS_POSIX_VFS_FATTR_MTIME_CTIME);
 
 	ret = tidefs_posix_vfs_flush_invalidate_pagecache_range(
 		inode, (loff_t)(write_pos - written), (size_t)written);
@@ -4360,7 +4378,7 @@ static int tidefs_posix_vfs_file_fsync(struct file *file, loff_t start,
 			return wb_ret;
 		if (ofs && ofs->times_dirty) {
 			wb_ret = tidefs_posix_vfs_engine_persist_inode_times(
-				inode, 0x20 | 0x80);
+				inode, TIDEFS_POSIX_VFS_FATTR_MTIME_CTIME);
 			if (wb_ret < 0)
 				return wb_ret;
 			ofs->times_dirty = false;
@@ -4691,17 +4709,24 @@ static int tidefs_posix_vfs_setattr(struct mnt_idmap *idmap,
 		size_update = (iattr->ia_valid & ATTR_SIZE) != 0;
 
 		/*
-		 * Translate Linux ATTR_* flags to TideFS FATTR_* bitmask.
-		 * FATTR_CTIME is bit 7 (0x80), while Linux ATTR_CTIME is
+		 * Translate Linux ATTR_* flags to the Rust FATTR_* bitmask.
+		 * FATTR_CTIME is bit 7, while Linux ATTR_CTIME is
 		 * bit 6 (0x40).  Other bits are identical.
 		 */
-		if (iattr->ia_valid & ATTR_MODE)  valid |= 0x01;  /* FATTR_MODE  */
-		if (iattr->ia_valid & ATTR_UID)   valid |= 0x02;  /* FATTR_UID   */
-		if (iattr->ia_valid & ATTR_GID)   valid |= 0x04;  /* FATTR_GID   */
-		if (iattr->ia_valid & ATTR_SIZE)  valid |= 0x08;  /* FATTR_SIZE  */
-		if (iattr->ia_valid & ATTR_ATIME) valid |= 0x10;  /* FATTR_ATIME */
-		if (iattr->ia_valid & ATTR_MTIME) valid |= 0x20;  /* FATTR_MTIME */
-		if (iattr->ia_valid & ATTR_CTIME) valid |= 0x80;  /* FATTR_CTIME (bit 7) */
+		if (iattr->ia_valid & ATTR_MODE)
+			valid |= TIDEFS_POSIX_VFS_FATTR_MODE;
+		if (iattr->ia_valid & ATTR_UID)
+			valid |= TIDEFS_POSIX_VFS_FATTR_UID;
+		if (iattr->ia_valid & ATTR_GID)
+			valid |= TIDEFS_POSIX_VFS_FATTR_GID;
+		if (iattr->ia_valid & ATTR_SIZE)
+			valid |= TIDEFS_POSIX_VFS_FATTR_SIZE;
+		if (iattr->ia_valid & ATTR_ATIME)
+			valid |= TIDEFS_POSIX_VFS_FATTR_ATIME;
+		if (iattr->ia_valid & ATTR_MTIME)
+			valid |= TIDEFS_POSIX_VFS_FATTR_MTIME;
+		if (iattr->ia_valid & ATTR_CTIME)
+			valid |= TIDEFS_POSIX_VFS_FATTR_CTIME;
 
 		if (valid == 0)
 			return 0;
@@ -4968,7 +4993,7 @@ static ssize_t tidefs_posix_vfs_file_copy_file_range(struct file *file_in,
 			ofs_out->times_dirty = true;
 		else
 			tidefs_posix_vfs_persist_inode_times_best_effort(
-				inode_out, 0x20 | 0x80);
+				inode_out, TIDEFS_POSIX_VFS_FATTR_MTIME_CTIME);
 		ret = tidefs_posix_vfs_flush_invalidate_pagecache_range(
 			inode_out, pos_out, copied);
 		if (ret)
@@ -5214,7 +5239,7 @@ static int tidefs_posix_vfs_file_mmap(
 
 		if (!timespec64_equal(&old_atime, &new_atime))
 			tidefs_posix_vfs_persist_inode_times_best_effort(
-				inode, 0x10);
+				inode, TIDEFS_POSIX_VFS_FATTR_ATIME);
 	}
 	return ret;
 }
@@ -5910,7 +5935,7 @@ static int tidefs_posix_vfs_write_end(const struct kiocb *iocb,
 		mark_inode_dirty(inode);
 	if (!engine_backed)
 		tidefs_posix_vfs_persist_inode_times_best_effort(
-			inode, 0x20 | 0x80);
+			inode, TIDEFS_POSIX_VFS_FATTR_MTIME_CTIME);
 
 	return copied;
 }
@@ -6053,7 +6078,7 @@ static int tidefs_posix_vfs_writepages(struct address_space *mapping,
 
 	if (wrote_any && !error) {
 		int ts_ret = tidefs_posix_vfs_engine_persist_inode_times(
-			inode, 0x20 | 0x80);
+			inode, TIDEFS_POSIX_VFS_FATTR_MTIME_CTIME);
 		if (ts_ret < 0) {
 			pr_err("tidefs_posix_vfs: writepages persist times failed ino=%lu ret=%d\n",
 			       inode->i_ino, ts_ret);
@@ -6534,7 +6559,7 @@ static int tidefs_posix_vfs_write_inode(struct inode *inode,
 		return 0;
 
 	ret = tidefs_posix_vfs_engine_persist_inode_times(
-		inode, 0x10 | 0x20 | 0x80);
+		inode, TIDEFS_POSIX_VFS_FATTR_TIMES);
 	if (ret < 0)
 		pr_debug("tidefs_posix_vfs: write_inode persist failed ino=%lu ret=%d\n",
 			 inode->i_ino, ret);
