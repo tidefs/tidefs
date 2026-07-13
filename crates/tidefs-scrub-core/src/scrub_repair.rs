@@ -361,6 +361,17 @@ impl<R: BlockReconstructor> ScrubRepairEngine<R> {
         // 1. Compute actual hash and compare.
         let actual_hash: [u8; 32] = blake3::hash(actual_data).into();
 
+        if let Some(comparison_record) = comparison_record {
+            if let Some(evidence) = unresolved_failed_quorum_evidence_for_candidate(
+                comparison_record,
+                unresolved_mutations,
+            ) {
+                return ScrubRepairOutcome::UnresolvedFailedQuorumMutation {
+                    mutation_id: evidence.mutation_id.clone(),
+                };
+            }
+        }
+
         if &actual_hash == expected_hash {
             // Block is clean — no repair needed.
             return ScrubRepairOutcome::Clean;
@@ -372,13 +383,6 @@ impl<R: BlockReconstructor> ScrubRepairEngine<R> {
         };
         if let Err(outcome) = comparison_permits_writeback(comparison_record) {
             return outcome;
-        }
-        if let Some(evidence) =
-            unresolved_failed_quorum_evidence_for_candidate(comparison_record, unresolved_mutations)
-        {
-            return ScrubRepairOutcome::UnresolvedFailedQuorumMutation {
-                mutation_id: evidence.mutation_id.clone(),
-            };
         }
 
         self.repair_corrupt_block(block_address, expected_hash, actual_hash)
