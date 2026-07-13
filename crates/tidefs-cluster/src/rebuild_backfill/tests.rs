@@ -85,6 +85,13 @@ fn make_plan(plan_id: u64, tasks: Vec<ReconstructionTask>) -> RebuildPlan {
     RebuildPlan::new(plan_id, tasks, 0)
 }
 
+fn open_transferring(init: &mut RebuildBackfillInitiator, tasks: Vec<ReconstructionTask>) -> u64 {
+    let id = init.open_backfill(make_plan(100, tasks), eid(1)).unwrap();
+    init.initiate_backfill(id).unwrap();
+    init.start_transferring(id).unwrap();
+    id
+}
+
 fn make_command(
     source: u64,
     target: u64,
@@ -445,6 +452,106 @@ fn initiate_and_transfer_lifecycle() {
 }
 
 #[test]
+fn complete_transfer_rejects_zero_progress() {
+    let mut init = RebuildBackfillInitiator::new(eid(1));
+    let id = open_transferring(&mut init, vec![make_task(1, vec![10], vec![20], 0)]);
+
+    let err = init.complete_transfer(id).unwrap_err();
+    assert_eq!(
+        err,
+        BackfillError::IncompleteBackfill {
+            backfill_id: id,
+            completed_objects: 0,
+            total_objects: 1
+        }
+    );
+    assert_eq!(init.session(id).unwrap().state, BackfillState::Transferring);
+    assert_eq!(init.active_count(), 1);
+    assert_eq!(init.completed_count(), 0);
+    assert_eq!(init.total_pending_objects(), 1);
+}
+
+#[test]
+fn complete_transfer_rejects_partial_progress() {
+    let mut init = RebuildBackfillInitiator::new(eid(1));
+    let id = open_transferring(
+        &mut init,
+        vec![
+            make_task(1, vec![10], vec![20], 0),
+            make_task(2, vec![10], vec![20], 0),
+        ],
+    );
+
+    init.record_progress(id, 1, 4096).unwrap();
+    let err = init.complete_transfer(id).unwrap_err();
+    assert_eq!(
+        err,
+        BackfillError::IncompleteBackfill {
+            backfill_id: id,
+            completed_objects: 1,
+            total_objects: 2
+        }
+    );
+    assert_eq!(init.session(id).unwrap().state, BackfillState::Transferring);
+    assert_eq!(init.active_count(), 1);
+    assert_eq!(init.completed_count(), 0);
+    assert_eq!(init.total_pending_objects(), 1);
+}
+
+#[test]
+fn exact_completion_progress_reaches_complete() {
+    let mut init = RebuildBackfillInitiator::new(eid(1));
+    let id = open_transferring(
+        &mut init,
+        vec![
+            make_task(1, vec![10], vec![20], 0),
+            make_task(2, vec![10], vec![20], 0),
+        ],
+    );
+
+    init.record_progress(id, 2, 8192).unwrap();
+    assert_eq!(init.total_pending_objects(), 0);
+    init.complete_transfer(id).unwrap();
+    assert_eq!(init.session(id).unwrap().state, BackfillState::Verifying);
+    assert_eq!(init.active_count(), 1);
+    assert_eq!(init.completed_count(), 0);
+
+    init.finalize_backfill(id).unwrap();
+    assert_eq!(init.session(id).unwrap().state, BackfillState::Complete);
+    assert_eq!(init.active_count(), 0);
+    assert_eq!(init.completed_count(), 1);
+    assert_eq!(init.total_pending_objects(), 0);
+}
+
+#[test]
+fn finalize_rechecks_completion_progress() {
+    let mut init = RebuildBackfillInitiator::new(eid(1));
+    let id = open_transferring(
+        &mut init,
+        vec![
+            make_task(1, vec![10], vec![20], 0),
+            make_task(2, vec![10], vec![20], 0),
+        ],
+    );
+    init.record_progress(id, 1, 4096).unwrap();
+    init.session_mut(id).unwrap().state = BackfillState::Verifying;
+
+    let err = init.finalize_backfill(id).unwrap_err();
+    assert_eq!(
+        err,
+        BackfillError::IncompleteBackfill {
+            backfill_id: id,
+            completed_objects: 1,
+            total_objects: 2
+        }
+    );
+    assert_eq!(init.session(id).unwrap().state, BackfillState::Verifying);
+    assert_eq!(init.active_count(), 1);
+    assert_eq!(init.completed_count(), 0);
+    assert_eq!(init.total_pending_objects(), 1);
+}
+
+#[test]
 fn abort_from_transferring() {
     let mut init = RebuildBackfillInitiator::new(eid(1));
     let plan = make_plan(100, vec![make_task(1, vec![10], vec![20], 0)]);
@@ -463,6 +570,7 @@ fn cannot_abort_completed() {
     let id = init.open_backfill(plan, eid(1)).unwrap();
     init.initiate_backfill(id).unwrap();
     init.start_transferring(id).unwrap();
+    init.record_progress(id, 1, 4096).unwrap();
     init.complete_transfer(id).unwrap();
     init.finalize_backfill(id).unwrap();
 
@@ -521,6 +629,7 @@ fn epoch_transition_leaves_completed() {
     let id = init.open_backfill(plan, eid(1)).unwrap();
     init.initiate_backfill(id).unwrap();
     init.start_transferring(id).unwrap();
+    init.record_progress(id, 1, 4096).unwrap();
     init.complete_transfer(id).unwrap();
     init.finalize_backfill(id).unwrap();
 
