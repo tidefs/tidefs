@@ -712,6 +712,39 @@ fn handle_pool_import(
 // pool scan
 // ---------------------------------------------------------------------------
 
+fn pool_scan_entry_json(e: &tidefs_pool_scan::DeviceScanEntry) -> serde_json::Value {
+    serde_json::json!({
+        "device_path": e.device_path.to_string_lossy(),
+        "size_bytes": e.size_bytes,
+        "device_backing": e.device_backing.map(|b| b.as_str()),
+        "discard_capability": e.discard_capability.as_str(),
+        "has_tidefs_label": e.has_tidefs_label,
+        "pool_guid": e.pool_guid.map(|g| hex_guid(&g)),
+        "pool_name": e.pool_name,
+        "pool_state": e.pool_state.map(|s| s.to_string()),
+        "device_guid": e.device_guid.map(|g| hex_guid(&g)),
+        "device_index": e.device_index,
+        "device_count": e.device_count,
+        "redundancy_policy": e.redundancy_policy.map(|policy| policy.to_string()),
+        "label_valid": e.label_valid,
+        "label_status": e.label_status,
+        "topology_generation": e.topology_generation,
+        "device_class": e.device_class.map(|c| format!("{:?}", c)),
+        "device_capacity_bytes": e.device_capacity_bytes,
+        "device_health": e.device_health.map(|h| h.to_string()),
+    })
+}
+
+fn pool_scan_capability_lines(entry: &tidefs_pool_scan::DeviceScanEntry) -> [String; 2] {
+    [
+        format!(
+            "device_backing={}",
+            entry.device_backing.map_or("-", |b| b.as_str())
+        ),
+        format!("discard_capability={}", entry.discard_capability.as_str()),
+    ]
+}
+
 fn handle_pool_scan(devices: Vec<PathBuf>, json: bool) {
     let entries = match tidefs_pool_scan::scan_labels(&devices) {
         Ok(e) => e,
@@ -722,29 +755,8 @@ fn handle_pool_scan(devices: Vec<PathBuf>, json: bool) {
     };
 
     if json {
-        let json_entries: Vec<serde_json::Value> = entries
-            .iter()
-            .map(|e| {
-                serde_json::json!({
-                    "device_path": e.device_path.to_string_lossy(),
-                    "size_bytes": e.size_bytes,
-                    "has_tidefs_label": e.has_tidefs_label,
-                    "pool_guid": e.pool_guid.map(|g| hex_guid(&g)),
-                    "pool_name": e.pool_name,
-                    "pool_state": e.pool_state.map(|s| s.to_string()),
-                    "device_guid": e.device_guid.map(|g| hex_guid(&g)),
-                    "device_index": e.device_index,
-                    "device_count": e.device_count,
-                    "redundancy_policy": e.redundancy_policy.map(|policy| policy.to_string()),
-                    "label_valid": e.label_valid,
-                    "label_status": e.label_status,
-                    "topology_generation": e.topology_generation,
-                    "device_class": e.device_class.map(|c| format!("{:?}", c)),
-                    "device_capacity_bytes": e.device_capacity_bytes,
-                    "device_health": e.device_health.map(|h| h.to_string()),
-                })
-            })
-            .collect();
+        let json_entries: Vec<serde_json::Value> =
+            entries.iter().map(pool_scan_entry_json).collect();
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({ "devices": json_entries })).unwrap()
@@ -752,6 +764,9 @@ fn handle_pool_scan(devices: Vec<PathBuf>, json: bool) {
     } else {
         for entry in &entries {
             println!("device: {}", entry.device_path.display());
+            for line in pool_scan_capability_lines(entry) {
+                println!("  {line}");
+            }
             if entry.has_tidefs_label {
                 println!(
                     "  pool_guid={}",
@@ -1944,6 +1959,106 @@ mod tests {
         let bytes = [0u8; 16];
         let hex = hex_guid(&bytes);
         assert_eq!(hex, "00000000-0000-0000-0000-000000000000");
+    }
+
+    fn scan_entry(
+        device_backing: Option<tidefs_pool_scan::PoolDeviceBacking>,
+        discard_capability: tidefs_pool_scan::DiscardCapability,
+    ) -> tidefs_pool_scan::DeviceScanEntry {
+        tidefs_pool_scan::DeviceScanEntry {
+            device_path: PathBuf::from("/dev/test0"),
+            size_bytes: 4096,
+            kind: tidefs_pool_scan::DeviceKind::Unknown,
+            device_backing,
+            discard_capability,
+            model: None,
+            serial: None,
+            has_tidefs_label: false,
+            pool_guid: None,
+            pool_name: None,
+            pool_state: None,
+            device_guid: None,
+            label_valid: false,
+            label_status: "no TideFS label".to_string(),
+            device_index: None,
+            device_count: None,
+            topology_generation: None,
+            device_class: None,
+            device_capacity_bytes: None,
+            device_health: None,
+            device_read_errors: None,
+            device_write_errors: None,
+            device_checksum_errors: None,
+            redundancy_policy: None,
+            completed_evacuations: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn pool_scan_json_reports_backing_and_supported_discard() {
+        let entry = scan_entry(
+            Some(tidefs_pool_scan::PoolDeviceBacking::BlockDevice),
+            tidefs_pool_scan::DiscardCapability::Supported,
+        );
+
+        let json = pool_scan_entry_json(&entry);
+
+        assert_eq!(json["device_backing"], "block-device");
+        assert_eq!(json["discard_capability"], "supported");
+    }
+
+    #[test]
+    fn pool_scan_human_lines_report_regular_file_unverified_discard() {
+        let entry = scan_entry(
+            Some(tidefs_pool_scan::PoolDeviceBacking::RegularFileDev),
+            tidefs_pool_scan::DiscardCapability::Unverified,
+        );
+
+        let lines = pool_scan_capability_lines(&entry);
+
+        assert_eq!(lines[0], "device_backing=regular-file-dev");
+        assert_eq!(lines[1], "discard_capability=unverified");
+    }
+
+    #[test]
+    fn pool_scan_output_reports_unknown_backing_and_discard() {
+        let entry = scan_entry(None, tidefs_pool_scan::DiscardCapability::Unknown);
+
+        let json = pool_scan_entry_json(&entry);
+        let lines = pool_scan_capability_lines(&entry);
+
+        assert!(json["device_backing"].is_null());
+        assert_eq!(json["discard_capability"], "unknown");
+        assert_eq!(lines[0], "device_backing=-");
+        assert_eq!(lines[1], "discard_capability=unknown");
+    }
+
+    #[test]
+    fn pool_scan_output_reports_fail_closed_discard_states() {
+        for (capability, expected) in [
+            (
+                tidefs_pool_scan::DiscardCapability::Unsupported,
+                "unsupported",
+            ),
+            (tidefs_pool_scan::DiscardCapability::Refused, "refused"),
+            (tidefs_pool_scan::DiscardCapability::Ignored, "ignored"),
+            (
+                tidefs_pool_scan::DiscardCapability::Unverified,
+                "unverified",
+            ),
+            (tidefs_pool_scan::DiscardCapability::Unknown, "unknown"),
+        ] {
+            let entry = scan_entry(
+                Some(tidefs_pool_scan::PoolDeviceBacking::BlockDevice),
+                capability,
+            );
+
+            let json = pool_scan_entry_json(&entry);
+            let lines = pool_scan_capability_lines(&entry);
+
+            assert_eq!(json["discard_capability"], expected);
+            assert_eq!(lines[1], format!("discard_capability={expected}"));
+        }
     }
 
     // -- redundancy policy parsing tests (not requiring live devices) --
