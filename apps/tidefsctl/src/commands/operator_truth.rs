@@ -125,11 +125,15 @@ impl OperatorTruthCarrier {
     }
 
     #[must_use]
+    pub(crate) fn status_path(&self) -> String {
+        format!("tidefsctl {} {}", self.command, self.operation)
+    }
+
+    #[must_use]
     pub(crate) fn live_route_attempt_line(&self) -> String {
         format!(
-            "operator truth carrier: attempting live route for tidefsctl {} {} pool '{}' with evidence {} and freshness {}",
-            self.command,
-            self.operation,
+            "operator truth carrier: attempting live route for {} pool '{}' with evidence {} and freshness {}",
+            self.status_path(),
             self.pool_name,
             self.evidence_state.as_str(),
             self.freshness.as_str()
@@ -192,6 +196,7 @@ impl OperatorTruthCarrier {
         serde_json::json!({
             "command": self.command,
             "operation": self.operation,
+            "status_path": self.status_path(),
             "pool_name": self.pool_name,
             "evidence_state": self.evidence_state.as_str(),
             "supported_evidence_states": [
@@ -235,6 +240,7 @@ impl OperatorTruthCarrier {
                 "operator truth carrier: tidefsctl {} {} pool '{}'",
                 self.command, self.operation, self.pool_name
             ),
+            format!("  path:       {}", self.status_path()),
             format!("  evidence:   {}", self.evidence_state.as_str()),
             format!(
                 "  states:     {}, {}, {}, {}",
@@ -271,6 +277,7 @@ mod tests {
         assert_eq!(carrier.source, TruthViewSourceClass::RuntimeMirror);
         assert_eq!(carrier.freshness, TruthViewFreshnessClass::LiveWithinBudget);
         assert_eq!(carrier.refusal, None);
+        assert_eq!(carrier.status_path(), "tidefsctl cluster status");
     }
 
     #[test]
@@ -363,6 +370,9 @@ mod tests {
             .any(|line| line.contains("evidence:   refused")));
         assert!(lines
             .iter()
+            .any(|line| line.contains("path:       tidefsctl device status")));
+        assert!(lines
+            .iter()
             .any(|line| line.contains("fresh.truth_view.refused.f4")));
         assert!(lines.iter().any(|line| line.contains("refusal:")));
         assert!(!lines.join("\n").trim_start().starts_with('{'));
@@ -374,6 +384,7 @@ mod tests {
         let json = carrier.json_value();
 
         assert_eq!(json["evidence_state"], "refused");
+        assert_eq!(json["status_path"], "tidefsctl device status");
         assert_eq!(json["source"], "source.truth_view.runtime_mirror.a2");
         assert_eq!(json["cut"], "cut.truth_view.live_window.c0");
         assert_eq!(json["provenance"], "prov.truth_view.live_mirror.p4");
