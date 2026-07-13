@@ -21,11 +21,12 @@
 #   xfstests evidence proves each row.
 #   generic/099: broad ACL semantics: set/get, chmod sync, access checks,
 #     named user/group and mask behavior, removals, recursive/default ACLs.
-#   generic/237: ACL mutation ownership/capability enforcement.
-#   generic/307: setfacl ctime update and persistence after remount.
-#   generic/318: user-namespace ACL id mapping and remount persistence.
-#   generic/319: default ACL inheritance to child directories.
-#   generic/444: SGID inheritance interaction with default ACLs.
+#   generic/237: mounted ACL mutation credential/capability enforcement.
+#   generic/307: mounted setfacl ctime update plus remount persistence.
+#   generic/318: user-namespace ACL id mapping plus remount persistence; no
+#     mounted idmap proof is recorded here.
+#   generic/319: mkdir/create mounted wiring for inherited default ACL xattrs.
+#   generic/444: mounted create SGID/default ACL interaction.
 generic/099
 generic/237
 generic/307
