@@ -1907,6 +1907,7 @@ impl LocalObjectStore {
         };
         // Restore persisted per-object checksums for read-path verification.
         store.checksums = load_checksums(&store.segments_dir);
+        store.reconcile_loaded_checksums_with_index()?;
         // Restore persisted reclaim-queue entries.
         store.reclaim_queue = load_reclaim_queue_entries(&store);
         // Restore persisted receipt-bound dead-object reclaim entries.
@@ -2105,6 +2106,24 @@ impl LocalObjectStore {
             );
         }
         Ok(Some(store))
+    }
+
+    fn reconcile_loaded_checksums_with_index(&mut self) -> Result<()> {
+        if self.checksums.is_empty() {
+            return Ok(());
+        }
+
+        let checksum_keys: Vec<ObjectKey> = self.checksums.keys().copied().collect();
+        let mut reconciled = BTreeMap::new();
+        for key in checksum_keys {
+            let Some(location) = self.index.get(&key).copied() else {
+                continue;
+            };
+            let payload = self.read_location(location)?;
+            reconciled.insert(key, compaction_read_verify_digest(&payload));
+        }
+        self.checksums = reconciled;
+        Ok(())
     }
 
     #[must_use]
@@ -8385,6 +8404,31 @@ mod checksum_read_verify_tests {
                 .get_checksum_verified(key)
                 .expect("get_checksum_verified after reopen");
             assert_eq!(verified, Some(payload.to_vec()));
+        }
+    }
+
+    #[test]
+    fn unsynced_overwrite_reopen_reconciles_read_verify_checksum() {
+        let dir = tempdir().expect("tempdir");
+        let key = ObjectKey::from_name(b"verify/unsynced-overwrite");
+        let old = b"old durable payload";
+        let new = b"new unsynced payload";
+
+        {
+            let opts = StoreOptions::test_fast();
+            let mut store = LocalObjectStore::open_with_options(dir.path(), opts).expect("open");
+            store.put(key, old).expect("put old");
+            store.sync_all().expect("sync old");
+            store.put(key, new).expect("put new");
+        }
+
+        {
+            let opts = StoreOptions::test_fast();
+            let store = LocalObjectStore::open_with_options(dir.path(), opts).expect("reopen");
+            let verified = store
+                .get_checksum_verified(key)
+                .expect("get_checksum_verified after unsynced overwrite reopen");
+            assert_eq!(verified, Some(new.to_vec()));
         }
     }
 
