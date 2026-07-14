@@ -8,6 +8,7 @@ use std::fmt;
 use tidefs_local_object_store::{
     IntegrityDigest64, ObjectKey, ObjectLocation, StoreRetentionCompactionReport, StoreStats,
 };
+use tidefs_replication_model::PlacementReceiptRef;
 use tidefs_types_vfs_core::{
     Generation, InodeAttr, InodeFlags, InodeId, NodeFacets, NodeKind, PosixAttrs, S_IFBLK, S_IFCHR,
     S_IFIFO, S_IFLNK, S_IFMT, S_IFSOCK,
@@ -95,6 +96,7 @@ pub enum MountedContentPlacementEvidence {
     SparseHole,
     ReceiptVerified {
         generation: u64,
+        placement_receipt_ref: PlacementReceiptRef,
     },
     ReceiptObservedButUnbound {
         generation: u64,

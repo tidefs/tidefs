@@ -244,6 +244,7 @@ where
                     placement_evidence: placement_evidence_for_content_key(
                         pool,
                         object_key,
+                        inode_id.get(),
                         expected_receipt_generation_for_target(target),
                     ),
                     raw_media_diagnostic: ScrubRawMediaDiagnostic {
@@ -417,7 +418,12 @@ fn manifest_error_scrubbed_block(
                 observed_plaintext_len: None,
             },
             checksum_layer: None,
-            placement_evidence: placement_evidence_for_content_key(pool, Some(key), None),
+            placement_evidence: placement_evidence_for_content_key(
+                pool,
+                Some(key),
+                inode_id.get(),
+                None,
+            ),
             raw_media_diagnostic: ScrubRawMediaDiagnostic {
                 object_key_hex: Some(key.short_hex()),
                 reason: Some(reason),
@@ -437,6 +443,7 @@ fn nonzero_receipt_generation(generation: u64) -> Option<u64> {
 fn placement_evidence_for_content_key(
     pool: Option<&Pool>,
     key: Option<ObjectKey>,
+    subject_id: u64,
     expected_generation: Option<u64>,
 ) -> MountedContentPlacementEvidence {
     let Some(key) = key else {
@@ -456,8 +463,14 @@ fn placement_evidence_for_content_key(
     match pool.placement_receipt_for_key(DeviceIoClass::Data, key) {
         Ok(Some(receipt)) => match expected_generation {
             Some(expected_generation) if receipt.generation == expected_generation => {
-                MountedContentPlacementEvidence::ReceiptVerified {
-                    generation: expected_generation,
+                match receipt.shared_receipt_ref_for_subject(subject_id) {
+                    Ok(placement_receipt_ref) => MountedContentPlacementEvidence::ReceiptVerified {
+                        generation: expected_generation,
+                        placement_receipt_ref,
+                    },
+                    Err(_) => MountedContentPlacementEvidence::ReceiptUnavailable {
+                        expected_generation: Some(expected_generation),
+                    },
                 }
             }
             Some(expected_generation) => MountedContentPlacementEvidence::ReceiptStale {
@@ -709,14 +722,10 @@ mod tests {
         fs.create_file("/test.txt", 0o644).expect("create");
         fs.write_file("/test.txt", 0, b"hello world")
             .expect("write");
+        fs.flush_all_write_buffers().expect("flush writes");
 
         let inodes = fs.inode_records();
-        eprintln!("inodes: {inodes:?}");
         let report = scrub_inodes_content(fs.store_ref(), inodes).expect("scrub");
-        eprintln!(
-            "report: blocks_scanned={} blocks_clean={} blocks_corrupt={} violations={:?}",
-            report.blocks_scanned, report.blocks_clean, report.blocks_corrupt, report.violations
-        );
         assert!(report.is_clean());
         assert!(report.blocks_scanned > 0);
         assert_eq!(report.blocks_corrupt, 0);
@@ -730,6 +739,7 @@ mod tests {
         // Write enough data to span multiple chunks (chunk size = 2048)
         let data = vec![0xAB; 5000];
         fs.write_file("/big.bin", 0, &data).expect("write");
+        fs.flush_all_write_buffers().expect("flush writes");
 
         let inodes = fs.inode_records();
         let report = scrub_inodes_content(fs.store_ref(), inodes).expect("scrub");
@@ -767,6 +777,7 @@ mod tests {
         fs.write_file("/a.txt", 0, b"file a").expect("write");
         fs.create_file("/b.txt", 0o644).expect("create");
         fs.write_file("/b.txt", 0, b"file b").expect("write");
+        fs.flush_all_write_buffers().expect("flush writes");
 
         let inodes = fs.inode_records();
         let report = scrub_inodes_content(fs.store_ref(), inodes).expect("scrub");
@@ -794,12 +805,13 @@ mod tests {
     }
 
     #[test]
-    fn scrub_report_records_inline_plaintext_and_checksum_evidence() {
+    fn scrub_report_records_chunk_plaintext_and_checksum_evidence() {
         let (_root, mut fs) = temp_fs();
         let _cleanup = Cleanup(Some(_root));
         fs.create_file("/inline.txt", 0o644).expect("create");
         fs.write_file("/inline.txt", 0, b"inline scrub evidence")
             .expect("write");
+        fs.flush_all_write_buffers().expect("flush writes");
 
         let report = scrub_inodes_content(fs.store_ref(), fs.inode_records()).expect("scrub");
         let evidence = report
@@ -808,28 +820,29 @@ mod tests {
             .find(|entry| {
                 matches!(
                     entry.plaintext_identity.block_id.kind,
-                    ScrubBlockKind::InlineContent
+                    ScrubBlockKind::ContentChunk { .. }
                 )
             })
-            .expect("inline evidence");
+            .expect("chunk evidence");
 
         assert_eq!(evidence.plaintext_identity.expected_plaintext_len, 21);
         assert_eq!(evidence.plaintext_identity.observed_plaintext_len, Some(21));
         assert_eq!(
             evidence.checksum_layer.as_ref().map(|entry| entry.layer),
-            Some(MountedContentChecksumLayer::InlineContentBody)
+            Some(MountedContentChecksumLayer::EncodedContentChunk)
         );
         assert!(evidence
             .checksum_layer
             .as_ref()
             .expect("checksum evidence")
             .matches_expected());
-        assert_eq!(
+        assert!(matches!(
             evidence.placement_evidence,
-            MountedContentPlacementEvidence::ReceiptMissing {
-                expected_generation: None
+            MountedContentPlacementEvidence::ReceiptUnavailable {
+                expected_generation: Some(_)
             }
-        );
+        ));
+        assert!(!evidence.placement_evidence.allows_repair_dispatch());
         assert!(evidence.raw_media_diagnostic.object_key_hex.is_some());
         assert!(evidence.raw_media_diagnostic.reason.is_none());
     }
