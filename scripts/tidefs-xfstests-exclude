@@ -170,10 +170,10 @@ generic/076
 generic/055
 generic/082
 
-# --- Capability/killpriv row (#1934) ---
+# --- Capability/killpriv row (#1931) ---
 #   generic/093 checks clearing security.capability on write with setcap/getcap
 #   while preserving trusted xattrs. Keep it excluded until mounted
-#   capability/killpriv behavior has row-level validation.
+#   capability/killpriv behavior has row-level validation under #1931.
 generic/093
 
 # --- Additional mmap ---
