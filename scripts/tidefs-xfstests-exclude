@@ -61,9 +61,10 @@ generic/048
 #   configuration coverage; it stays in the shutdown/recovery operator gap.
 generic/054
 
-#   generic/058 exercises FALLOC_FL_INSERT_RANGE through xfs_io finsert plus
-#   FIEMAP extent checks. TideFS source has insert-range handling, but this
-#   mounted behavior still needs row validation.
+#   generic/058 exercises standard FALLOC_FL_INSERT_RANGE through xfs_io
+#   finsert plus FIEMAP extent checks. TideFS source has insert-range handling,
+#   but this row shares the insert-range/FIEMAP validation boundary tracked by
+#   #1926 before the exclusion can be removed.
 generic/058
 
 #   generic/062 is a broad xattr namespace row across user/trusted/security
