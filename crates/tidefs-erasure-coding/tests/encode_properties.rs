@@ -172,6 +172,24 @@ fn encoded_stripe_retains_config() {
     assert_eq!(enc.config, c);
 }
 
+fn assert_invalid_receipt_available_set(mut mutate: impl FnMut(&mut Vec<Option<ErasureShard>>)) {
+    let c = config(2, 1, 8);
+    let enc = encode_receipt_stripe(&c, b"receipt").expect("receipt encode");
+    let mut available: Vec<_> = enc.shards.iter().cloned().map(Some).collect();
+    mutate(&mut available);
+
+    let err = reconstruct_receipt_stripe(&c, &available).unwrap_err();
+    let expected = c.stripe_width();
+
+    assert_eq!(
+        err,
+        ReceiptStripeError::InvalidAvailableSet {
+            slots: expected,
+            expected,
+        }
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Receipt-tracked helpers
 // ---------------------------------------------------------------------------
@@ -238,4 +256,20 @@ fn receipt_reconstruct_rejects_invalid_available_set_width() {
             expected: 3
         }
     );
+}
+
+#[test]
+fn receipt_reconstruct_rejects_malformed_available_shard_slots() {
+    assert_invalid_receipt_available_set(|available| {
+        available[0].as_mut().unwrap().index = 1;
+    });
+    assert_invalid_receipt_available_set(|available| {
+        available[0].as_mut().unwrap().kind = ShardKind::Parity;
+    });
+    assert_invalid_receipt_available_set(|available| {
+        available[2].as_mut().unwrap().kind = ShardKind::Data;
+    });
+    assert_invalid_receipt_available_set(|available| {
+        available[1].as_mut().unwrap().bytes.pop();
+    });
 }

@@ -319,6 +319,25 @@ pub fn reconstruct_receipt_stripe(
             expected,
         });
     }
+    for (slot, shard) in available.iter().enumerate() {
+        let Some(shard) = shard else {
+            continue;
+        };
+        let expected_kind = if slot < config.data_shards {
+            ShardKind::Data
+        } else {
+            ShardKind::Parity
+        };
+        if shard.index != slot
+            || shard.kind != expected_kind
+            || shard.bytes.len() != config.shard_len
+        {
+            return Err(ReceiptStripeError::InvalidAvailableSet {
+                slots: available.len(),
+                expected,
+            });
+        }
+    }
     let available_count = available.iter().filter(|shard| shard.is_some()).count();
     let reconstructed =
         reconstruct(config, available, None).ok_or(ReceiptStripeError::InsufficientShards {
