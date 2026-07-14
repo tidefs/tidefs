@@ -555,6 +555,38 @@ fn failed_quorum_evidence_refuses_before_reconstruction() {
 }
 
 #[test]
+fn later_failed_quorum_evidence_refuses_before_reconstruction() {
+    let recon = MockReconstructor::new();
+    recon.set_fail_reconstruct(true);
+    let mut engine = ScrubRepairEngine::new(recon);
+    let expected = hash_data(&make_data(256, 0x55));
+    let corrupt = make_data(256, 0x66);
+    let comparison = repair_comparison_record();
+    let unrelated =
+        UnresolvedFailedQuorumMutationEvidence::new("failed-quorum-other", Some([9; 32]));
+    let overlapping = UnresolvedFailedQuorumMutationEvidence::new(
+        "failed-quorum-later",
+        Some(comparison.object_key),
+    );
+
+    assert_eq!(
+        engine.repair_one_with_comparison_and_failed_quorum_evidence(
+            1,
+            &expected,
+            &corrupt,
+            Some(&comparison),
+            &[unrelated, overlapping],
+        ),
+        ScrubRepairOutcome::UnresolvedFailedQuorumMutation {
+            mutation_id: "failed-quorum-later".to_string()
+        }
+    );
+    assert_eq!(engine.ledger().repair_count, 0);
+    assert_eq!(engine.ledger().repair_failure_count, 0);
+    assert_eq!(engine.ledger().event_count(), 0);
+}
+
+#[test]
 fn unknown_object_failed_quorum_evidence_refuses_conservatively() {
     let recon = MockReconstructor::new();
     recon.set_fail_reconstruct(true);
