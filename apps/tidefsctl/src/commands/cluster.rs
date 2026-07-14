@@ -1669,12 +1669,77 @@ mod tests {
             "cluster", "status", "testpool",
         );
         let lines = carrier.operator_lines();
+        let operator_text = lines.join("\n");
         let json = carrier.json_value();
 
-        assert!(lines
-            .iter()
-            .any(|line| line.contains("evidence:   refused")));
-        assert_eq!(json["freshness"], "fresh.truth_view.refused.f4");
+        for expected in [
+            "path:       tidefsctl cluster status",
+            "evidence:   refused",
+            "states:     live-within-budget, stale, deterministic-non-live, refused",
+            "source:     source.truth_view.runtime_mirror.a2",
+            "cut:        cut.truth_view.live_window.c0",
+            "provenance: prov.truth_view.live_mirror.p4",
+            "exactness:  exact.truth_view.degraded_or_partial.e3",
+            "freshness:  fresh.truth_view.refused.f4",
+            "refusal:    no reachable live owner; cached local metadata is non-authoritative",
+        ] {
+            assert!(
+                operator_text.contains(expected),
+                "operator text should contain {expected:?}; got:\n{operator_text}"
+            );
+        }
+        assert!(
+            !operator_text.trim_start().starts_with('{'),
+            "default cluster status refusal should be operator text, not JSON"
+        );
+
+        assert_eq!(json["command"], "cluster");
+        assert_eq!(json["operation"], "status");
+        assert_eq!(json["pool_name"], "testpool");
+        assert_eq!(json["status_path"], "tidefsctl cluster status");
+        assert_eq!(json["evidence_state"], "refused");
         assert_eq!(json["source"], "source.truth_view.runtime_mirror.a2");
+        assert_eq!(json["cut"], "cut.truth_view.live_window.c0");
+        assert_eq!(json["provenance"], "prov.truth_view.live_mirror.p4");
+        assert_eq!(json["exactness"], "exact.truth_view.degraded_or_partial.e3");
+        assert_eq!(json["freshness"], "fresh.truth_view.refused.f4");
+        assert_eq!(
+            json["refusal"],
+            "no reachable live owner; cached local metadata is non-authoritative"
+        );
+        assert_eq!(
+            json["supported_evidence_states"],
+            serde_json::json!([
+                "live-within-budget",
+                "stale",
+                "deterministic-non-live",
+                "refused"
+            ])
+        );
+
+        let surface = &json["distributed_surface_record"];
+        assert_eq!(surface["live_view"], "view.truth_view.cluster_health.v8");
+        assert_eq!(
+            surface["signal"],
+            "operator.truth_view.distributed.health.o1"
+        );
+        assert_eq!(surface["status"], "status.truth_view.operator.blocked.s4");
+        assert_eq!(surface["source"], json["source"]);
+        assert_eq!(surface["cut"], json["cut"]);
+        assert_eq!(surface["provenance"], json["provenance"]);
+        assert_eq!(surface["exactness"], json["exactness"]);
+        assert_eq!(surface["freshness"], json["freshness"]);
+
+        let bundle = &json["truth_bundle_record"];
+        assert_eq!(bundle["route"], "route.control_plane.truth_surface.r4");
+        assert_eq!(bundle["surface"], "surface.truth_view.system.overview.s0");
+        assert_eq!(bundle["source"], json["source"]);
+        assert_eq!(bundle["cut"], json["cut"]);
+        assert_eq!(bundle["provenance"], json["provenance"]);
+        assert_eq!(
+            bundle["audience"],
+            "audience.truth_view.operator_summary.v1"
+        );
+        assert_eq!(bundle["answer_kind"], "answer.response_registry.refusal.k1");
     }
 }

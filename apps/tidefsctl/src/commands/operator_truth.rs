@@ -18,6 +18,13 @@ pub(crate) enum OperatorTruthEvidenceState {
 }
 
 impl OperatorTruthEvidenceState {
+    const SUPPORTED: [Self; 4] = [
+        Self::LiveWithinBudget,
+        Self::Stale,
+        Self::DeterministicNonLive,
+        Self::Refused,
+    ];
+
     #[must_use]
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
@@ -26,6 +33,11 @@ impl OperatorTruthEvidenceState {
             Self::DeterministicNonLive => "deterministic-non-live",
             Self::Refused => "refused",
         }
+    }
+
+    #[must_use]
+    pub(crate) fn supported_labels() -> [&'static str; 4] {
+        Self::SUPPORTED.map(Self::as_str)
     }
 }
 
@@ -199,12 +211,7 @@ impl OperatorTruthCarrier {
             "status_path": self.status_path(),
             "pool_name": self.pool_name,
             "evidence_state": self.evidence_state.as_str(),
-            "supported_evidence_states": [
-                OperatorTruthEvidenceState::LiveWithinBudget.as_str(),
-                OperatorTruthEvidenceState::Stale.as_str(),
-                OperatorTruthEvidenceState::DeterministicNonLive.as_str(),
-                OperatorTruthEvidenceState::Refused.as_str(),
-            ],
+            "supported_evidence_states": OperatorTruthEvidenceState::supported_labels(),
             "source": self.source.as_str(),
             "cut": self.cut.as_str(),
             "provenance": self.provenance.as_str(),
@@ -243,11 +250,8 @@ impl OperatorTruthCarrier {
             format!("  path:       {}", self.status_path()),
             format!("  evidence:   {}", self.evidence_state.as_str()),
             format!(
-                "  states:     {}, {}, {}, {}",
-                OperatorTruthEvidenceState::LiveWithinBudget.as_str(),
-                OperatorTruthEvidenceState::Stale.as_str(),
-                OperatorTruthEvidenceState::DeterministicNonLive.as_str(),
-                OperatorTruthEvidenceState::Refused.as_str()
+                "  states:     {}",
+                OperatorTruthEvidenceState::supported_labels().join(", ")
             ),
             format!("  source:     {}", self.source.as_str()),
             format!("  cut:        {}", self.cut.as_str()),
