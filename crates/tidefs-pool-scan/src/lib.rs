@@ -1147,14 +1147,18 @@ fn read_sysfs_u8(dir: &Path, rel_path: &str) -> Option<u8> {
 
 fn read_sysfs_u64_capability(dir: &Path, rel_path: &str) -> Result<u64, DiscardCapability> {
     let path = dir.join(rel_path);
-    let value = fs::read_to_string(&path).map_err(|error| match error.kind() {
-        std::io::ErrorKind::PermissionDenied => DiscardCapability::Refused,
-        _ => DiscardCapability::Unknown,
-    })?;
+    let value = fs::read_to_string(&path).map_err(sysfs_discard_read_error_capability)?;
     value
         .trim()
         .parse::<u64>()
         .map_err(|_| DiscardCapability::Unknown)
+}
+
+fn sysfs_discard_read_error_capability(error: std::io::Error) -> DiscardCapability {
+    match error.kind() {
+        std::io::ErrorKind::PermissionDenied => DiscardCapability::Refused,
+        _ => DiscardCapability::Unknown,
+    }
 }
 
 fn probe_block_discard_capability(sysfs_dir: &Path) -> DiscardCapability {
@@ -2858,6 +2862,27 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(
             probe_block_discard_capability(dir.path()),
+            DiscardCapability::Unknown
+        );
+    }
+
+    #[test]
+    fn sysfs_discard_read_errors_fail_closed() {
+        let refused = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            sysfs_discard_read_error_capability(refused),
+            DiscardCapability::Refused
+        );
+
+        let missing = std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert_eq!(
+            sysfs_discard_read_error_capability(missing),
+            DiscardCapability::Unknown
+        );
+
+        let invalid = std::io::Error::from(std::io::ErrorKind::InvalidData);
+        assert_eq!(
+            sysfs_discard_read_error_capability(invalid),
             DiscardCapability::Unknown
         );
     }
