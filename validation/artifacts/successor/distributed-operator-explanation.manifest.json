@@ -1,0 +1,16 @@
+{
+  "manifest_version": 2,
+  "claim_id": "storage.distributed.successor_comparator.v1",
+  "evidence_class": "distributed-storage-operator-explanation-evidence",
+  "validation_tier": "source-model",
+  "scope": "source-model operator explanation boundary for refused distributed successor comparator claims",
+  "artifact_path": "validation/artifacts/successor/distributed-operator-explanation.json",
+  "content_digest": "blake3:8d2248d4fcde63b7f73bba65c0a13a67033ed4631664ece483b35eddee8c1bb9",
+  "run_id": "manual-review:issue-2047-distributed-operator-explanation-v1",
+  "source_ref": "refs/heads/codex3/issue-2047-distributed-successor-evidence",
+  "outcome": "pass",
+  "residual_risk": "This artifact records an operator-visible refusal boundary only. It does not add a runtime operator command, release guidance, distributed validation result, or permission to compare TideFS with OpenZFS, Ceph, DRBD, or clustered-storage systems.",
+  "source": "claims-boundary-review",
+  "generated_at": "2026-07-14T11:45:01Z",
+  "blocking_issues": []
+}

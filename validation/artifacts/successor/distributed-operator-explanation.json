@@ -1,0 +1,28 @@
+{
+  "claim_id": "storage.distributed.successor_comparator.v1",
+  "evidence_class": "distributed-storage-operator-explanation-evidence",
+  "issue": "https://github.com/tidefs/tidefs/issues/2047",
+  "source_ref": "fed743d0e1f6f5df9244b809488fc397cfe44cc4",
+  "assessment": "fail-closed",
+  "operator_explanation": {
+    "current_status": "Blocked evidence record for distributed successor/comparator wording.",
+    "plain_language": "TideFS has no current evidence-backed permission to tell an operator that its distributed behavior is an OpenZFS, Ceph, DRBD, clustered-storage, successor, superior, or comparator-performance equivalent.",
+    "what_is_proven": [
+      "The registered distributed successor evidence paths were reviewed for this claim.",
+      "The current artifact set records the missing distributed proof and keeps the claim blocked."
+    ],
+    "what_is_not_proven": [
+      "Distributed data availability across node, process, network, or device faults.",
+      "Membership, fencing, split-brain exclusion, or ownership transfer for product data.",
+      "TCP, RDMA, loopback, or mixed transport performance and fault behavior.",
+      "Recovery, rebuild, scrub, re-replication, or degraded-visible client behavior.",
+      "Any OpenZFS, Ceph, DRBD, clustered-storage, successor, superiority, or comparator-performance comparison."
+    ],
+    "operator_visible_boundary": "Operator-facing text must continue to present distributed successor/comparator behavior as unproven and blocked until a future claim validation supplies current multi-process distributed evidence for the exact envelope.",
+    "non_comparable_cases": [
+      "Any current benchmark, prototype, or source-model row that does not name topology, membership, transport, media, workload, attribution, fault model, and degraded/recovery state.",
+      "Any comparison against OpenZFS, Ceph, DRBD, or clustered-storage behavior without an evidence-backed incumbent setup and matching TideFS envelope.",
+      "Any release-readiness or product-admission inference from these files alone."
+    ]
+  }
+}

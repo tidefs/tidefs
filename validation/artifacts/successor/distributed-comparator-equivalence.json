@@ -1,0 +1,34 @@
+{
+  "claim_id": "storage.distributed.successor_comparator.v1",
+  "evidence_class": "distributed-storage-comparator-equivalence-evidence",
+  "issue": "https://github.com/tidefs/tidefs/issues/2047",
+  "source_ref": "fed743d0e1f6f5df9244b809488fc397cfe44cc4",
+  "assessment": "fail-closed",
+  "summary": "Current source and registry state do not admit any OpenZFS, Ceph, DRBD, clustered-storage successor, superiority, or comparator-performance claim for distributed TideFS behavior.",
+  "current_comparable_envelope": {
+    "cluster_topology": "No topology is admitted for successor comparison. The current evidence set does not bind a node count, quorum shape, role layout, placement domain, or witness/fencing arrangement to a validated distributed storage behavior.",
+    "membership_assumptions": "No membership assumption is admitted for successor comparison. The current evidence set does not prove live membership convergence, fencing, split-brain exclusion, or membership-change behavior for data ownership.",
+    "network_mode": "No network mode is admitted for successor comparison. TCP, RDMA, loopback, single-host multi-process, and multi-host modes remain non-comparable until the run evidence names the mode and proves the data path under that mode.",
+    "media_assumptions": "No media class is admitted for successor comparison. Local block devices, loop devices, files, NVMe, HDD, mixed media, and remote media remain non-comparable until the evidence names the media and proves ownership, failure, and recovery effects.",
+    "workload_classes": "No distributed workload class is admitted for successor comparison. Metadata, data read/write, sync write, fsync, block export, snapshot, rebuild, scrub, degraded read, recovery, rebalance, and mixed workload claims remain non-comparable.",
+    "measurement_attribution": "No distributed measurement attribution is admitted. Current source-model or prototype rows cannot be attributed to a product-equivalent TideFS distributed storage mode, incumbent system, media class, or transport mode.",
+    "fault_model": "No fault model is admitted for successor comparison. Node loss, process loss, network partition, packet loss, RDMA failure, device loss, media error, stale membership, crash/restart, and partial recovery cases remain unproven.",
+    "recovery_and_degraded_visible_states": "No recovery or degraded-visible state is admitted for successor comparison. The current evidence does not prove client-visible behavior, operator-visible refusal, rebuild, re-replication, scrub, or data availability under degraded operation.",
+    "non_comparable_cases": [
+      "Any OpenZFS, Ceph, DRBD, clustered-storage, distributed-storage, successor, superiority, or comparator-performance wording.",
+      "Any benchmark row that lacks current multi-process distributed evidence tied to the exact topology, transport, media, workload, fault, recovery, and attribution envelope.",
+      "Any source-model, placement, transport, or cluster prototype evidence presented as product-equivalent distributed storage behavior."
+    ]
+  },
+  "minimum_future_evidence_before_comparison": {
+    "cluster_topology": "A future admitting artifact must name node count, roles, quorum/fencing model, placement domains, and whether nodes are single-host processes or distinct hosts.",
+    "membership_assumptions": "A future admitting artifact must name membership source, convergence expectations, failure detector behavior, fencing boundary, and split-brain exclusion evidence.",
+    "network_mode": "A future admitting artifact must name TCP, RDMA, loopback, or mixed transport mode and bind measurements to that mode.",
+    "media_assumptions": "A future admitting artifact must name media type, device ownership, local or remote media placement, and any durability/cache assumptions.",
+    "workload_classes": "A future admitting artifact must name each workload class and avoid carrying one class as proof for another.",
+    "measurement_attribution": "A future admitting artifact must separate TideFS overhead, transport cost, media cost, recovery cost, client cost, and incumbent-system comparison setup.",
+    "fault_model": "A future admitting artifact must name injected and observed faults, expected visible outcomes, and refused cases.",
+    "recovery_and_degraded_visible_states": "A future admitting artifact must name client-visible and operator-visible states during degraded service and recovery.",
+    "non_comparable_cases": "A future admitting artifact must list every out-of-envelope case that remains blocked."
+  }
+}

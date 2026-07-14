@@ -1,0 +1,16 @@
+{
+  "manifest_version": 2,
+  "claim_id": "storage.distributed.successor_comparator.v1",
+  "evidence_class": "distributed-storage-successor-claim-boundary-review",
+  "validation_tier": "source-model",
+  "scope": "source-model boundary review for blocked distributed successor comparator wording and non-claims",
+  "artifact_path": "validation/artifacts/successor/distributed-claim-boundary-review.toml",
+  "content_digest": "blake3:4aef05dbb787b21cd410b947fad268fc4793e5b91f233f402af5e1e88c25ceca",
+  "run_id": "manual-review:issue-2047-distributed-claim-boundary-review-v1",
+  "source_ref": "refs/heads/codex3/issue-2047-distributed-successor-evidence",
+  "outcome": "pass",
+  "residual_risk": "This review fixes the current claim boundary only. It does not change validation/claims.toml, generated claim registry output, release-readiness verdicts, runtime behavior, public APIs, or operator/product wording.",
+  "source": "claims-boundary-review",
+  "generated_at": "2026-07-14T11:45:01Z",
+  "blocking_issues": []
+}
