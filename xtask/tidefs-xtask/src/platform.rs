@@ -30,7 +30,7 @@ pub fn check_current_workspace() -> Result<(), PlatformCheckError> {
         "nix/tidefs-qemu-direct.sh",
         "nix/tidefs-rdma-probe.sh",
         "docs/GITHUB_CI.md",
-        "docs/xfstests-harness.md",
+        "docs/XFSTESTS_DISPATCH_CONTRACT.md",
         "docs/TRANSPORT_CLUSTER_AUTHORITY.md",
     ] {
         check_required_file(&root, rel, &mut missing);
@@ -72,11 +72,13 @@ pub fn check_current_workspace() -> Result<(), PlatformCheckError> {
     );
     check_source_markers(
         &root,
-        "docs/xfstests-harness.md",
+        "docs/XFSTESTS_DISPATCH_CONTRACT.md",
         &[
-            "fuse-xfstests",
-            "outside the Nix build sandbox",
-            "scoreboard.md",
+            "Workflow file",
+            ".github/workflows/xfstests.yml",
+            ".#fuse-xfstests-validation",
+            "kmod-smoke",
+            "k7-vfs",
         ],
         &mut missing,
     );
