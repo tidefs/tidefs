@@ -5908,10 +5908,12 @@ pub const fn ram_authority_satisfies_durable_posix_barrier(
                     StorageIntentRefusalReason::PersistentMediaRequired,
                 );
             }
-            if !evidence_ref_has_id(record.ordering_ref)
-                || !record
-                    .survives
-                    .contains(AuthorityEvent::ReplayAfterDurableIntent)
+            if !evidence_ref_has_kind(
+                record.ordering_ref,
+                StorageIntentEvidenceKind::OrderingEvidence,
+            ) || !record
+                .survives
+                .contains(AuthorityEvent::ReplayAfterDurableIntent)
             {
                 return ReceiptPredicateResult::refused(
                     StorageIntentRefusalReason::MissingOrderingEvidence,
@@ -5976,10 +5978,12 @@ pub const fn ram_authority_receipt_is_emit_ready(
                     StorageIntentRefusalReason::PersistentMediaRequired,
                 );
             }
-            if !evidence_ref_has_id(record.ordering_ref)
-                || !record
-                    .survives
-                    .contains(AuthorityEvent::ReplayAfterDurableIntent)
+            if !evidence_ref_has_kind(
+                record.ordering_ref,
+                StorageIntentEvidenceKind::OrderingEvidence,
+            ) || !record
+                .survives
+                .contains(AuthorityEvent::ReplayAfterDurableIntent)
             {
                 return ReceiptPredicateResult::refused(
                     StorageIntentRefusalReason::MissingOrderingEvidence,
@@ -6017,9 +6021,16 @@ impl RamAuthorityRecord {
     /// Returns true when the record carries resource-governor admission evidence.
     #[must_use]
     pub const fn has_resource_governor_admission(self) -> bool {
-        evidence_ref_has_id(self.resource_budget_ref)
-            && evidence_ref_has_id(self.admission_ref)
-            && evidence_ref_has_id(self.capacity_admission_ref)
+        evidence_ref_has_kind(
+            self.resource_budget_ref,
+            StorageIntentEvidenceKind::SchedulerAdmissionRecord,
+        ) && evidence_ref_has_kind(
+            self.admission_ref,
+            StorageIntentEvidenceKind::SchedulerAdmissionRecord,
+        ) && evidence_ref_has_kind(
+            self.capacity_admission_ref,
+            StorageIntentEvidenceKind::CapacityAdmissionEvidence,
+        )
     }
 
     /// Returns true when the earned ack class is durable intent, not volatile RAM.
@@ -6034,15 +6045,25 @@ impl RamAuthorityRecord {
     /// Returns true when local or quorum durable intent evidence backs the RAM receipt.
     #[must_use]
     pub const fn has_durable_intent_evidence(self) -> bool {
-        evidence_ref_has_id(self.local_intent_ref) || evidence_ref_has_id(self.quorum_intent_ref)
+        evidence_ref_has_kind(
+            self.local_intent_ref,
+            StorageIntentEvidenceKind::LocalIntentRecord,
+        ) || evidence_ref_has_id(self.quorum_intent_ref)
     }
 
     /// Returns true when replicated volatile authority is bound to peer evidence.
     #[must_use]
     pub const fn has_replicated_volatile_evidence(self) -> bool {
-        evidence_ref_has_id(self.transport_ref)
-            && evidence_ref_has_id(self.membership_epoch_ref)
-            && evidence_ref_has_id(self.fencing_ref)
+        evidence_ref_has_kind(
+            self.transport_ref,
+            StorageIntentEvidenceKind::TransportPathEvidence,
+        ) && evidence_ref_has_kind(
+            self.membership_epoch_ref,
+            StorageIntentEvidenceKind::MembershipEvidence,
+        ) && evidence_ref_has_kind(
+            self.fencing_ref,
+            StorageIntentEvidenceKind::MembershipEvidence,
+        )
     }
 }
 
@@ -6762,6 +6783,13 @@ const fn prefetch_candidate_requires_movement_payback(
 const fn evidence_ref_has_id(evidence: StorageIntentEvidenceRef) -> bool {
     evidence.kind as u16 != StorageIntentEvidenceKind::Unknown as u16
         && !bytes32_are_zero(evidence.id.0)
+}
+
+const fn evidence_ref_has_kind(
+    evidence: StorageIntentEvidenceRef,
+    kind: StorageIntentEvidenceKind,
+) -> bool {
+    evidence.kind as u16 == kind as u16 && !bytes32_are_zero(evidence.id.0)
 }
 
 const fn evidence_ref_equal(
@@ -24246,6 +24274,40 @@ mod tests {
     }
 
     #[test]
+    fn ram_authority_emit_ready_rejects_wrong_admission_evidence_kind() {
+        let base = RamAuthorityRecord {
+            authority_class: RamAuthorityClass::RamVolatileLocal,
+            ..ram_authority_emit_ready_base()
+        };
+
+        let wrong_resource_budget = RamAuthorityRecord {
+            resource_budget_ref: evidence_ref(
+                StorageIntentEvidenceKind::CapacityAdmissionEvidence,
+                20,
+            ),
+            ..base
+        };
+        let wrong_admission = RamAuthorityRecord {
+            admission_ref: evidence_ref(StorageIntentEvidenceKind::CapacityAdmissionEvidence, 21),
+            ..base
+        };
+        let wrong_capacity = RamAuthorityRecord {
+            capacity_admission_ref: evidence_ref(
+                StorageIntentEvidenceKind::SchedulerAdmissionRecord,
+                22,
+            ),
+            ..base
+        };
+
+        for record in [wrong_resource_budget, wrong_admission, wrong_capacity] {
+            assert_eq!(
+                ram_authority_receipt_is_emit_ready(record).refusal,
+                StorageIntentRefusalReason::EvidenceNotUsable
+            );
+        }
+    }
+
+    #[test]
     fn ram_authority_emit_ready_preserves_downgrade_refusal() {
         let record = RamAuthorityRecord {
             authority_class: RamAuthorityClass::RamVolatileLocal,
@@ -24305,6 +24367,29 @@ mod tests {
             ram_authority_satisfies_durable_posix_barrier(ready).refusal,
             StorageIntentRefusalReason::VolatileRamCannotSatisfyDurableIntent
         );
+
+        let wrong_transport = RamAuthorityRecord {
+            transport_ref: evidence_ref(StorageIntentEvidenceKind::MembershipEvidence, 23),
+            ..ready
+        };
+        let wrong_membership = RamAuthorityRecord {
+            membership_epoch_ref: evidence_ref(
+                StorageIntentEvidenceKind::TransportPathEvidence,
+                24,
+            ),
+            ..ready
+        };
+        let wrong_fencing = RamAuthorityRecord {
+            fencing_ref: evidence_ref(StorageIntentEvidenceKind::TransportPathEvidence, 25),
+            ..ready
+        };
+
+        for record in [wrong_transport, wrong_membership, wrong_fencing] {
+            assert_eq!(
+                ram_authority_receipt_is_emit_ready(record).refusal,
+                StorageIntentRefusalReason::EvidenceNotUsable
+            );
+        }
     }
 
     #[test]
@@ -24332,6 +24417,25 @@ mod tests {
             admission_ref: StorageIntentEvidenceRef::default(),
             ..base
         };
+        let wrong_intent = RamAuthorityRecord {
+            local_intent_ref: evidence_ref(StorageIntentEvidenceKind::OrderingEvidence, 26),
+            ..base
+        };
+        let wrong_ordering = RamAuthorityRecord {
+            ordering_ref: evidence_ref(StorageIntentEvidenceKind::LocalIntentRecord, 27),
+            ..base
+        };
+        let wrong_admission = RamAuthorityRecord {
+            admission_ref: evidence_ref(StorageIntentEvidenceKind::CapacityAdmissionEvidence, 28),
+            ..base
+        };
+        let wrong_capacity = RamAuthorityRecord {
+            capacity_admission_ref: evidence_ref(
+                StorageIntentEvidenceKind::SchedulerAdmissionRecord,
+                29,
+            ),
+            ..base
+        };
 
         assert_eq!(
             ram_authority_receipt_is_emit_ready(no_intent).refusal,
@@ -24345,6 +24449,20 @@ mod tests {
             ram_authority_receipt_is_emit_ready(no_admission).refusal,
             StorageIntentRefusalReason::EvidenceNotUsable
         );
+        assert_eq!(
+            ram_authority_receipt_is_emit_ready(wrong_intent).refusal,
+            StorageIntentRefusalReason::PersistentMediaRequired
+        );
+        assert_eq!(
+            ram_authority_receipt_is_emit_ready(wrong_ordering).refusal,
+            StorageIntentRefusalReason::MissingOrderingEvidence
+        );
+        for record in [wrong_admission, wrong_capacity] {
+            assert_eq!(
+                ram_authority_receipt_is_emit_ready(record).refusal,
+                StorageIntentRefusalReason::EvidenceNotUsable
+            );
+        }
     }
 
     #[test]
@@ -24412,6 +24530,25 @@ mod tests {
             admission_ref: StorageIntentEvidenceRef::default(),
             ..base
         };
+        let wrong_intent = RamAuthorityRecord {
+            local_intent_ref: evidence_ref(StorageIntentEvidenceKind::OrderingEvidence, 30),
+            ..base
+        };
+        let wrong_ordering = RamAuthorityRecord {
+            ordering_ref: evidence_ref(StorageIntentEvidenceKind::LocalIntentRecord, 31),
+            ..base
+        };
+        let wrong_admission = RamAuthorityRecord {
+            admission_ref: evidence_ref(StorageIntentEvidenceKind::CapacityAdmissionEvidence, 32),
+            ..base
+        };
+        let wrong_capacity = RamAuthorityRecord {
+            capacity_admission_ref: evidence_ref(
+                StorageIntentEvidenceKind::SchedulerAdmissionRecord,
+                33,
+            ),
+            ..base
+        };
 
         assert_eq!(
             ram_authority_satisfies_durable_posix_barrier(volatile_ack).refusal,
@@ -24425,6 +24562,20 @@ mod tests {
             ram_authority_satisfies_durable_posix_barrier(no_admission).refusal,
             StorageIntentRefusalReason::EvidenceNotUsable
         );
+        assert_eq!(
+            ram_authority_satisfies_durable_posix_barrier(wrong_intent).refusal,
+            StorageIntentRefusalReason::PersistentMediaRequired
+        );
+        assert_eq!(
+            ram_authority_satisfies_durable_posix_barrier(wrong_ordering).refusal,
+            StorageIntentRefusalReason::MissingOrderingEvidence
+        );
+        for record in [wrong_admission, wrong_capacity] {
+            assert_eq!(
+                ram_authority_satisfies_durable_posix_barrier(record).refusal,
+                StorageIntentRefusalReason::EvidenceNotUsable
+            );
+        }
     }
 
     #[test]
