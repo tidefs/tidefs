@@ -20,6 +20,13 @@ const REVIEW_RECEIPT_RUNTIME_BOUNDARY: &str =
 const REVIEW_RECEIPT_DECISION: &str = "claims-remain-blocked";
 const QUEUE_ROOT_COVERAGE_KIND: &str = "registered-source-semantics-present";
 const QUEUE_DEPTH_RUNTIME_ARTIFACT: &str = "queue-depth-runtime-artifact";
+const SCHEDULER_DIRTY_DEBT_CLAIM: &str = "scheduler.dirty_debt.no_hidden.v1";
+const SCHEDULER_DIRTY_DEBT_RUNTIME_ARTIFACT_PATH: &str =
+    "validation/artifacts/performance/queue-depth-runtime.json";
+const SCHEDULER_DIRTY_DEBT_RUNTIME_MANIFEST_PATH: &str =
+    "validation/artifacts/performance/scheduler-dirty-debt-queue-depth-runtime.manifest.json";
+const REQUIRED_RUNTIME_SCOPE_FIELDS: &[&str] =
+    &["workload", "topology", "scope", "refusal_boundaries"];
 
 const VALID_WORK_CLASSES: &[&str] = &[
     "foreground-read",
@@ -68,7 +75,18 @@ impl fmt::Display for NoHiddenQueuesError {
 #[derive(Debug, Deserialize)]
 struct QueueRegistry {
     schema_version: u32,
+    scheduler_wide_runtime_evidence: SchedulerWideRuntimeEvidence,
     queue_roots: Vec<QueueRoot>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SchedulerWideRuntimeEvidence {
+    claim_id: String,
+    required_evidence_class: String,
+    artifact_path: String,
+    manifest_path: String,
+    source_registry_boundary: String,
+    required_scope_fields: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -276,6 +294,7 @@ fn validate_registry(root: &Path, registry: &QueueRegistry, failures: &mut Vec<S
             "`{REGISTRY_PATH}` must register at least one queue root"
         ));
     }
+    validate_scheduler_wide_runtime_evidence(&registry.scheduler_wide_runtime_evidence, failures);
 
     let mut ids = BTreeSet::new();
     for queue in &registry.queue_roots {
@@ -283,6 +302,65 @@ fn validate_registry(root: &Path, registry: &QueueRegistry, failures: &mut Vec<S
             failures.push(format!("duplicate queue root id `{}`", queue.id));
         }
         validate_queue_root(root, queue, failures);
+    }
+}
+
+fn validate_scheduler_wide_runtime_evidence(
+    evidence: &SchedulerWideRuntimeEvidence,
+    failures: &mut Vec<String>,
+) {
+    validate_exact_registry_field(
+        "scheduler_wide_runtime_evidence.claim_id",
+        &evidence.claim_id,
+        SCHEDULER_DIRTY_DEBT_CLAIM,
+        failures,
+    );
+    validate_exact_registry_field(
+        "scheduler_wide_runtime_evidence.required_evidence_class",
+        &evidence.required_evidence_class,
+        QUEUE_DEPTH_RUNTIME_ARTIFACT,
+        failures,
+    );
+    validate_exact_registry_field(
+        "scheduler_wide_runtime_evidence.artifact_path",
+        &evidence.artifact_path,
+        SCHEDULER_DIRTY_DEBT_RUNTIME_ARTIFACT_PATH,
+        failures,
+    );
+    validate_exact_registry_field(
+        "scheduler_wide_runtime_evidence.manifest_path",
+        &evidence.manifest_path,
+        SCHEDULER_DIRTY_DEBT_RUNTIME_MANIFEST_PATH,
+        failures,
+    );
+    validate_exact_registry_field(
+        "scheduler_wide_runtime_evidence.source_registry_boundary",
+        &evidence.source_registry_boundary,
+        REVIEW_RECEIPT_RUNTIME_BOUNDARY,
+        failures,
+    );
+    validate_unique_nonempty_registry_list(
+        "scheduler_wide_runtime_evidence.required_scope_fields",
+        &evidence.required_scope_fields,
+        failures,
+    );
+    for required_field in REQUIRED_RUNTIME_SCOPE_FIELDS {
+        if !evidence
+            .required_scope_fields
+            .iter()
+            .any(|field| field == required_field)
+        {
+            failures.push(format!(
+                "`{REGISTRY_PATH}` scheduler_wide_runtime_evidence.required_scope_fields must include `{required_field}`"
+            ));
+        }
+    }
+    for field in &evidence.required_scope_fields {
+        if !REQUIRED_RUNTIME_SCOPE_FIELDS.contains(&field.as_str()) {
+            failures.push(format!(
+                "`{REGISTRY_PATH}` scheduler_wide_runtime_evidence.required_scope_fields contains unknown field `{field}`"
+            ));
+        }
     }
 }
 
@@ -907,6 +985,19 @@ fn validate_exact_field(
     }
 }
 
+fn validate_exact_registry_field(
+    field: &str,
+    actual: &str,
+    expected: &str,
+    failures: &mut Vec<String>,
+) {
+    if actual != expected {
+        failures.push(format!(
+            "`{REGISTRY_PATH}` {field} must be `{expected}`, found `{actual}`"
+        ));
+    }
+}
+
 fn validate_nonempty_field(
     receipt_name: &str,
     field: &str,
@@ -917,6 +1008,30 @@ fn validate_nonempty_field(
         failures.push(format!(
             "receipt `{receipt_name}` {field} must not be empty"
         ));
+    }
+}
+
+fn validate_unique_nonempty_registry_list(
+    field: &str,
+    values: &[String],
+    failures: &mut Vec<String>,
+) {
+    if values.is_empty() {
+        failures.push(format!("`{REGISTRY_PATH}` {field} must not be empty"));
+        return;
+    }
+    let mut seen = BTreeSet::new();
+    for value in values {
+        if value.trim().is_empty() {
+            failures.push(format!(
+                "`{REGISTRY_PATH}` {field} must not contain empty entries"
+            ));
+        }
+        if !seen.insert(value.as_str()) {
+            failures.push(format!(
+                "`{REGISTRY_PATH}` {field} contains duplicate entry `{value}`"
+            ));
+        }
     }
 }
 
@@ -1373,6 +1488,19 @@ edition = "2021"
     }
 
     #[test]
+    fn scheduler_runtime_evidence_rejects_weakened_evidence_class() {
+        let mut evidence = test_scheduler_wide_runtime_evidence();
+        evidence.required_evidence_class = "claims-gate-review".to_string();
+        let mut failures = Vec::new();
+
+        validate_scheduler_wide_runtime_evidence(&evidence, &mut failures);
+
+        assert!(failures.iter().any(|failure| failure.contains(
+            "scheduler_wide_runtime_evidence.required_evidence_class must be `queue-depth-runtime-artifact`"
+        )));
+    }
+
+    #[test]
     fn review_receipt_accepts_registered_source_coverage() {
         let root = test_receipt_workspace();
         let failures = validate_test_receipt(root.path(), &valid_receipt());
@@ -1470,6 +1598,7 @@ edition = "2021"
     fn test_queue_registry() -> QueueRegistry {
         let registry = QueueRegistry {
             schema_version: 1,
+            scheduler_wide_runtime_evidence: test_scheduler_wide_runtime_evidence(),
             queue_roots: vec![QueueRoot {
                 id: "example.queue".to_string(),
                 package: "tidefs-example".to_string(),
@@ -1488,6 +1617,20 @@ edition = "2021"
             }],
         };
         registry
+    }
+
+    fn test_scheduler_wide_runtime_evidence() -> SchedulerWideRuntimeEvidence {
+        SchedulerWideRuntimeEvidence {
+            claim_id: SCHEDULER_DIRTY_DEBT_CLAIM.to_string(),
+            required_evidence_class: QUEUE_DEPTH_RUNTIME_ARTIFACT.to_string(),
+            artifact_path: SCHEDULER_DIRTY_DEBT_RUNTIME_ARTIFACT_PATH.to_string(),
+            manifest_path: SCHEDULER_DIRTY_DEBT_RUNTIME_MANIFEST_PATH.to_string(),
+            source_registry_boundary: REVIEW_RECEIPT_RUNTIME_BOUNDARY.to_string(),
+            required_scope_fields: REQUIRED_RUNTIME_SCOPE_FIELDS
+                .iter()
+                .map(|field| field.to_string())
+                .collect(),
+        }
     }
 
     fn valid_receipt() -> String {

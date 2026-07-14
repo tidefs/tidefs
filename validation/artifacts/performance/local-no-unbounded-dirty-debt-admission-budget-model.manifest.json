@@ -5,7 +5,7 @@
   "validation_tier": "source-model",
   "scope": "source-model queue-root registry for local dirty write admission and budgeted queue accounting; not mounted runtime proof",
   "artifact_path": "validation/performance/no-hidden-queues.toml",
-  "content_digest": "blake3:1d2b157248e32613cde2dc56a85d6a68ae2b51ae67e855fef3db55599ac56b6f",
+  "content_digest": "blake3:0777c4efffc81a3de126822cb8f5541155a9fa9a591f8b99d7b794408341ff9f",
   "run_id": "deterministic-fixture:performance-no-hidden-queues-registry-v1",
   "source_ref": "refs/heads/gpt4/issue-1485-performance-contract-manifests",
   "outcome": "pass",
