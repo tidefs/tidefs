@@ -8451,6 +8451,7 @@ mod tests {
         fs.write_file("/live.txt", 0, b"live owner snapshot send")
             .expect("write file");
         let engine = VfsLocalFileSystem::new(fs);
+        let expected_auth_key = engine.fs.borrow().root_authentication_key.as_bytes32();
         let output = root.path().join("target-error.vfs");
 
         let mut server = Transport::new(2);
@@ -8470,9 +8471,10 @@ mod tests {
             server.perform_handshake(session_id).expect("handshake");
             let frame = server.recv_message(session_id).expect("recv push frame");
 
-            assert!(frame.len() >= SNAP_NET_PUSH_HEADER_LEN);
-            assert_eq!(&frame[0..4], SNAP_NET_MAGIC);
-            assert_eq!(frame[4], SNAP_KIND_PUSH);
+            let decoded = decode_snap_push_frame(&frame, &expected_auth_key);
+            assert!(!decoded.incremental);
+            assert!(decoded.total_records > 0);
+            assert!(decoded.payload_bytes > 0);
 
             server
                 .send_message(session_id, &snap_net_error(b"denied"))
@@ -8511,6 +8513,7 @@ mod tests {
         fs.write_file("/live.txt", 0, b"live owner snapshot send")
             .expect("write file");
         let engine = VfsLocalFileSystem::new(fs);
+        let expected_auth_key = engine.fs.borrow().root_authentication_key.as_bytes32();
         let output = root.path().join("target-malformed-response.vfs");
 
         let mut server = Transport::new(2);
@@ -8530,9 +8533,10 @@ mod tests {
             server.perform_handshake(session_id).expect("handshake");
             let frame = server.recv_message(session_id).expect("recv push frame");
 
-            assert!(frame.len() >= SNAP_NET_PUSH_HEADER_LEN);
-            assert_eq!(&frame[0..4], SNAP_NET_MAGIC);
-            assert_eq!(frame[4], SNAP_KIND_PUSH);
+            let decoded = decode_snap_push_frame(&frame, &expected_auth_key);
+            assert!(!decoded.incremental);
+            assert!(decoded.total_records > 0);
+            assert!(decoded.payload_bytes > 0);
 
             server
                 .send_message(session_id, &snap_net_unknown_empty_response())
