@@ -35,6 +35,7 @@ use tidefs_validation::evidence_artifact_manifest::{
     load_evidence_artifact_manifest_json_path, EvidenceArtifactManifest,
     EvidenceArtifactManifestError,
 };
+use tidefs_validation::validation_status::ValidationStatus;
 // Group check macros: call check functions directly (no re-exec)
 macro_rules! run_checks {
     ($($check:expr),* $(,)?) => {{
@@ -879,14 +880,48 @@ fn main() {
                     process::exit(2);
                 }
             };
-            if let Some(extra) = args.next() {
-                eprintln!(
-                    "validate-evidence-manifest accepts one path, got extra argument `{extra}`"
-                );
-                process::exit(2);
+            let mut required_status = None;
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--require-status" => {
+                        if required_status.is_some() {
+                            eprintln!(
+                                "validate-evidence-manifest accepts --require-status only once"
+                            );
+                            process::exit(2);
+                        }
+                        let Some(value) = args.next() else {
+                            eprintln!(
+                                "validate-evidence-manifest --require-status requires a status"
+                            );
+                            process::exit(2);
+                        };
+                        match parse_required_validation_status(&value) {
+                            Ok(status) => required_status = Some(status),
+                            Err(err) => {
+                                eprintln!("{err}");
+                                process::exit(2);
+                            }
+                        }
+                    }
+                    extra => {
+                        eprintln!(
+                            "validate-evidence-manifest accepts <path> [--require-status <STATUS>], got extra argument `{extra}`"
+                        );
+                        process::exit(2);
+                    }
+                }
             }
             match validate_evidence_manifest_path(&manifest_path) {
                 Ok(manifest) => {
+                    if let Some(required_status) = required_status {
+                        if let Err(err) =
+                            validate_evidence_manifest_required_status(&manifest, required_status)
+                        {
+                            eprintln!("{err}");
+                            process::exit(1);
+                        }
+                    }
                     println!(
                         "evidence manifest validated with artifact digest: claim_id={} evidence_class={} tier={} outcome={} run_id={} source_ref={} source={} scope={}",
                         manifest.claim_id,
@@ -1817,6 +1852,34 @@ fn validate_evidence_manifest_path(
     Ok(manifest)
 }
 
+fn parse_required_validation_status(value: &str) -> Result<ValidationStatus, String> {
+    match value {
+        "PASS" => Ok(ValidationStatus::Pass),
+        "PRODUCT_FAIL" => Ok(ValidationStatus::ProductFail),
+        "HARNESS_FAIL" => Ok(ValidationStatus::HarnessFail),
+        "ENV_REFUSAL" => Ok(ValidationStatus::EnvironmentRefusal),
+        "SKIP" => Ok(ValidationStatus::Skip),
+        _ => Err(format!(
+            "unknown validation status `{value}`; expected one of PASS, PRODUCT_FAIL, HARNESS_FAIL, ENV_REFUSAL, SKIP"
+        )),
+    }
+}
+
+fn validate_evidence_manifest_required_status(
+    manifest: &EvidenceArtifactManifest,
+    required: ValidationStatus,
+) -> Result<(), String> {
+    if manifest.outcome == required {
+        Ok(())
+    } else {
+        Err(format!(
+            "evidence manifest outcome mismatch: expected {}, got {}",
+            required.label(),
+            manifest.outcome.label()
+        ))
+    }
+}
+
 fn evidence_manifest_workspace_root(path: &Path) -> Option<PathBuf> {
     let mut candidates = Vec::new();
     if let Some(parent) = path.parent() {
@@ -1931,6 +1994,60 @@ error[E0308]: mismatched types
                 "--> src/lib.rs:1:1",
                 "stdout detail"
             ]
+        );
+    }
+
+    #[test]
+    fn parse_required_validation_status_accepts_labels() {
+        assert_eq!(
+            parse_required_validation_status("PASS"),
+            Ok(ValidationStatus::Pass)
+        );
+        assert_eq!(
+            parse_required_validation_status("PRODUCT_FAIL"),
+            Ok(ValidationStatus::ProductFail)
+        );
+        assert_eq!(
+            parse_required_validation_status("HARNESS_FAIL"),
+            Ok(ValidationStatus::HarnessFail)
+        );
+        assert_eq!(
+            parse_required_validation_status("ENV_REFUSAL"),
+            Ok(ValidationStatus::EnvironmentRefusal)
+        );
+        assert_eq!(
+            parse_required_validation_status("SKIP"),
+            Ok(ValidationStatus::Skip)
+        );
+    }
+
+    #[test]
+    fn parse_required_validation_status_rejects_unknown_status() {
+        let err = parse_required_validation_status("pass").expect_err("unknown label fails");
+
+        assert!(err.contains("unknown validation status `pass`"));
+        assert!(err.contains("PASS"));
+    }
+
+    #[test]
+    fn validate_evidence_manifest_required_status_accepts_matching_outcome() {
+        let manifest = evidence_manifest_for("artifact.json", b"artifact bytes");
+
+        validate_evidence_manifest_required_status(&manifest, ValidationStatus::Pass)
+            .expect("matching status passes");
+    }
+
+    #[test]
+    fn validate_evidence_manifest_required_status_rejects_mismatch() {
+        let mut manifest = evidence_manifest_for("artifact.json", b"artifact bytes");
+        manifest.outcome = ValidationStatus::Skip;
+
+        let err = validate_evidence_manifest_required_status(&manifest, ValidationStatus::Pass)
+            .expect_err("mismatched status fails");
+
+        assert_eq!(
+            err,
+            "evidence manifest outcome mismatch: expected PASS, got SKIP"
         );
     }
 
@@ -2511,7 +2628,7 @@ fn print_help() {
         "  validate-ublk-started-export-admission-artifact <path> validate started uBLK export admission evidence"
     );
     println!("  check-no-hidden-queues  validate queue roots in touched implementation packages");
-    println!("  validate-evidence-manifest <path> validate a claim evidence artifact manifest JSON and verify artifact_path digest under the manifest directory or current repository root");
+    println!("  validate-evidence-manifest <path> [--require-status <STATUS>] validate a claim evidence artifact manifest JSON and verify artifact_path digest under the manifest directory or current repository root");
     println!("  validate-xfstests-evidence-manifest <path> validate an xfstests evidence manifest JSON against schema");
     println!("  validate-kernel-teardown-runtime-artifact <path> validate a kernel teardown no-work-after artifact JSON against schema");
     println!(
