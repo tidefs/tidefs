@@ -122,7 +122,7 @@ generic/068
 generic/085
 generic/275
 
-# --- Insert/collapse range row validation ---
+# --- Insert/collapse range row validation (#1926) ---
 #   Focused FUSE xfstests run 29188560825 requested generic/060,
 #   generic/061, generic/063, generic/064, and generic/072. The rows were not
 #   runnable: generic/060-064 stopped at xfs_io fiemap prechecks, and
