@@ -2304,80 +2304,102 @@ fn print_help() {
     println!("  check-bg-framework     alias for check-background-service-framework");
     println!("  check-feature-flags      validate dataset feature flags type definitions and canonical registry");
     println!("  check-dataset-feature-flags alias for check-feature-flags");
-    println!("  check-block-volume-adapter-core validate block-volume adapter core markers");
+    println!(
+        "  check-block-volume-adapter-core source-presence signal for block-volume adapter core"
+    );
     println!("  check-block-volume-core alias for check-block-volume-adapter-core");
-    println!("  check-block-volume-queue-admission validate block-volume queue admission markers");
+    println!(
+        "  check-block-volume-queue-admission source-presence signal for block-volume queue admission"
+    );
     println!("  check-block-volume-queue alias for check-block-volume-queue-admission");
-    println!("  check-block-volume-dispatch-execution validate block-volume dispatch markers");
+    println!(
+        "  check-block-volume-dispatch-execution source-presence signal for block-volume dispatch"
+    );
     println!("  check-block-volume-dispatch alias for check-block-volume-dispatch-execution");
-    println!("  check-block-volume-export-lifecycle validate block-volume lifecycle markers");
+    println!(
+        "  check-block-volume-export-lifecycle source-presence signal for block-volume lifecycle"
+    );
     println!("  check-block-volume-lifecycle alias for check-block-volume-export-lifecycle");
-    println!("  check-block-volume-cache-coherency validate block-volume cache coherency markers");
+    println!(
+        "  check-block-volume-cache-coherency source-presence signal for block-volume cache coherency"
+    );
     println!("  check-block-volume-cache alias for check-block-volume-cache-coherency");
-    println!("  check-block-volume-resize-fence validate block-volume resize/fence markers");
+    println!(
+        "  check-block-volume-resize-fence source-presence signal for block-volume resize/fence"
+    );
     println!("  check-block-volume-resize alias for check-block-volume-resize-fence");
-    println!("  check-block-volume-host-preflight validate block-volume host preflight markers");
+    println!(
+        "  check-block-volume-host-preflight source-presence signal for block-volume host preflight"
+    );
     println!("  check-block-volume-host alias for check-block-volume-host-preflight");
-    println!("  check-block-volume-ublk-abi validate block-volume ublk ABI markers");
+    println!("  check-block-volume-ublk-abi source-presence signal for block-volume ublk ABI");
     println!("  check-ublk-abi alias for check-block-volume-ublk-abi");
-    println!("  check-block-volume-file-backing validate block-volume file-backed image markers");
+    println!(
+        "  check-block-volume-file-backing source-presence signal for block-volume file-backed image"
+    );
     println!("  check-block-volume-backing-file alias for check-block-volume-file-backing");
     println!(
-        "  check-block-volume-ublk-control-open validate block-volume ublk control open markers"
+        "  check-block-volume-ublk-control-open source-presence signal for block-volume ublk control open"
     );
     println!(
         "  check-block-volume-ublk-control-runtime alias for check-block-volume-ublk-control-open"
     );
     println!(
-        "  check-block-volume-ublk-control-readonly-probe validate read-only GET_FEATURES markers"
+        "  check-block-volume-ublk-control-readonly-probe source-presence signal for read-only GET_FEATURES"
     );
     println!(
         "  check-block-volume-ublk-control-get-features alias for check-block-volume-ublk-control-readonly-probe"
     );
-    println!("  check-block-volume-ublk-add-dev-boundary validate guarded ADD_DEV markers");
+    println!(
+        "  check-block-volume-ublk-add-dev-boundary source-presence signal for guarded ADD_DEV"
+    );
     println!(
         "  check-block-volume-ublk-add-dev alias for check-block-volume-ublk-add-dev-boundary"
     );
     println!(
-        "  check-block-volume-ublk-del-dev-cleanup-boundary validate guarded DEL_DEV cleanup markers"
+        "  check-block-volume-ublk-del-dev-cleanup-boundary source-presence signal for guarded DEL_DEV cleanup"
     );
     println!(
         "  check-block-volume-ublk-del-dev alias for check-block-volume-ublk-del-dev-cleanup-boundary"
     );
-    println!("  check-block-volume-ublk-set-params-boundary validate guarded SET_PARAMS markers");
+    println!(
+        "  check-block-volume-ublk-set-params-boundary source-presence signal for guarded SET_PARAMS"
+    );
     println!(
         "  check-block-volume-ublk-set-params alias for check-block-volume-ublk-set-params-boundary"
     );
-    println!("  check-block-volume-ublk-start-dev-boundary validate guarded START_DEV markers");
+    println!(
+        "  check-block-volume-ublk-start-dev-boundary source-presence signal for guarded START_DEV"
+    );
     println!(
         "  check-block-volume-ublk-start-dev alias for check-block-volume-ublk-start-dev-boundary"
     );
     println!(
-        "  check-block-volume-ublk-fetch-req-readiness-boundary validate guarded FETCH_REQ readiness markers"
+        "  check-block-volume-ublk-fetch-req-readiness-boundary source-presence signal for guarded FETCH_REQ readiness"
     );
     println!(
         "  check-block-volume-ublk-fetch-req alias for check-block-volume-ublk-fetch-req-readiness-boundary"
     );
     println!(
-        "  check-block-volume-ublk-data-queue-open-boundary validate guarded data-queue open markers"
+        "  check-block-volume-ublk-data-queue-open-boundary source-presence signal for guarded data-queue open"
     );
     println!(
         "  check-block-volume-ublk-data-queue-open alias for check-block-volume-ublk-data-queue-open-boundary"
     );
     println!(
-        "  check-block-volume-ublk-fetch-req-submit-boundary validate guarded FETCH_REQ submission markers"
+        "  check-block-volume-ublk-fetch-req-submit-boundary source-presence signal for guarded FETCH_REQ submission"
     );
     println!(
         "  check-block-volume-ublk-fetch-req-submit alias for check-block-volume-ublk-fetch-req-submit-boundary"
     );
     println!(
-        "  check-block-volume-ublk-commit-fetch-boundary validate guarded COMMIT_AND_FETCH_REQ markers"
+        "  check-block-volume-ublk-commit-fetch-boundary source-presence signal for guarded COMMIT_AND_FETCH_REQ"
     );
     println!(
         "  check-block-volume-ublk-commit-fetch alias for check-block-volume-ublk-commit-fetch-boundary"
     );
     println!(
-        "  check-block-volume-ublk-acceptance-harness validate ublk acceptance harness markers"
+        "  check-block-volume-ublk-acceptance-harness source-presence signal for ublk acceptance harness"
     );
     println!(
         "  check-ublk-acceptance-harness alias for check-block-volume-ublk-acceptance-harness"
