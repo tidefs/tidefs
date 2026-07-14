@@ -658,8 +658,8 @@ pub struct ErasureDecodePlan {
 
 /// Per-dataset redundancy configuration.
 ///
-/// Unlike ZFS (pool-wide PARITY_RAID level) and Ceph (pool-wide replication factor),
-/// tidefs allows heterogeneous redundancy policies within a single pool.
+/// The current model records redundancy policy on each dataset, allowing one
+/// pool to contain datasets with different local redundancy policies.
 ///
 /// Once set at dataset creation, this is immutable. Changing redundancy policy
 /// requires dataset migration (send/receive to a new dataset with the desired
