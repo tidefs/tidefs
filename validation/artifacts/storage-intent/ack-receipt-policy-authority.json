@@ -1,0 +1,183 @@
+{
+  "report_version": 1,
+  "generated_by": "tidefs-storage-intent-source-model::ack-receipt-policy-authority-v1",
+  "evidence_class": "storage-intent-policy-receipt-authority",
+  "validation_tier": "source-model",
+  "evidence_scope": "source-model authority for earned storage-intent acknowledgment receipts, policy predicates, caller-visible result projection, and refusal boundaries",
+  "runtime_boundary": "model evidence only; this does not validate mounted runtime behavior, QEMU crash or fault behavior, fsync or fdatasync barrier semantics, distributed transport execution, successor or comparator wording, production readiness, or release readiness",
+  "related_claim_ids": [
+    "storage.intent.ack_receipt_honesty.v1"
+  ],
+  "reviewed_authorities": [
+    {
+      "path": "docs/STORAGE_INTENT_POLICY_AUTHORITY.md",
+      "role": "normative storage-intent policy and receipt boundary"
+    },
+    {
+      "path": "docs/STORAGE_INTENT_RESULT_REFUSAL_EVIDENCE_DESIGN.md",
+      "role": "caller-visible result, refusal, evidence-cut, retry, and retention proof boundary"
+    },
+    {
+      "path": "docs/LOCAL_DISTRIBUTED_RECEIPT_AUTHORITY.md",
+      "role": "current receipt identity and placement receipt projection boundary"
+    },
+    {
+      "path": "validation/claims.toml",
+      "role": "claim registry and blocked evidence requirement authority"
+    }
+  ],
+  "receipt_authority_laws": [
+    {
+      "id": "success_requires_named_receipt",
+      "statement": "Every successful storage-intent acknowledgment must carry a named guarantee receipt."
+    },
+    {
+      "id": "receipt_must_be_earned",
+      "statement": "A success reply is legal only when earned evidence satisfies the requested policy predicate."
+    },
+    {
+      "id": "policy_precedes_placement",
+      "statement": "Placement, transport, caching, relocation, and rebake choices implement policy; they do not define or weaken the requested acknowledgment floor."
+    },
+    {
+      "id": "volatile_authority_is_visible",
+      "statement": "RAM, cache, remote-memory, or weaker authority can satisfy only an explicit volatile or preview class whose loss boundary and downgrade projection are visible to the caller."
+    },
+    {
+      "id": "unknown_evidence_refuses",
+      "statement": "Missing, stale, contradictory, unauthorized, redacted, compacted, unsupported, or incomplete evidence must project a typed refusal or degraded-visible result, not generic success."
+    },
+    {
+      "id": "posix_stable_floor",
+      "statement": "POSIX sync, FUA, and barrier-style success require a configured stable-storage floor with flush, fence, replay, and persistence evidence for the named scope."
+    }
+  ],
+  "receipt_required_fields": [
+    "scope",
+    "policy_id",
+    "policy_revision",
+    "requested_ack_class",
+    "earned_ack_class",
+    "evidence_query_snapshot",
+    "placement_receipt_refs",
+    "ordering_refs",
+    "membership_refs",
+    "trust_domain_refs",
+    "media_capability_refs",
+    "capacity_reserve_refs",
+    "recovery_refs",
+    "freshness_frontier",
+    "unsafe_or_degraded_visibility",
+    "result_or_refusal_projection",
+    "retention_proof_refs"
+  ],
+  "acknowledgment_class_rules": [
+    {
+      "ack_class": "durable-stable-storage",
+      "required_authority": [
+        "stable media capability",
+        "flush and fence semantics",
+        "ordering and replay cut",
+        "placement receipt or committed root",
+        "retention proof"
+      ],
+      "must_refuse_when": [
+        "the media role is unsupported",
+        "flush or persistence domain evidence is absent",
+        "the earned class is weaker than requested",
+        "proof needed by the caller is redacted or compacted away"
+      ]
+    },
+    {
+      "ack_class": "local-intent-backed",
+      "required_authority": [
+        "local durable intent publication",
+        "replay cut",
+        "freshness frontier",
+        "result projection"
+      ],
+      "must_refuse_when": [
+        "intent publication is not durable",
+        "replay ordering is ambiguous",
+        "fresh evidence is unavailable"
+      ]
+    },
+    {
+      "ack_class": "quorum-intent-backed",
+      "required_authority": [
+        "membership epoch",
+        "quorum threshold",
+        "fencing state",
+        "per-peer receipt evidence",
+        "failure-domain and trust-domain refs"
+      ],
+      "must_refuse_when": [
+        "quorum is absent",
+        "partition state is ambiguous",
+        "membership or fence evidence is stale",
+        "peer receipts do not match the requested policy"
+      ]
+    },
+    {
+      "ack_class": "volatile-visible",
+      "required_authority": [
+        "explicit unsafe or preview policy admission",
+        "named loss boundary",
+        "caller-visible weaker projection",
+        "refusal path for durable requests"
+      ],
+      "must_refuse_when": [
+        "the caller requested durable authority",
+        "the loss boundary is hidden",
+        "the surface would project the answer as durable success"
+      ]
+    }
+  ],
+  "evidence_query_rules": [
+    {
+      "id": "bounded_complete_for_purpose_snapshot",
+      "statement": "Evidence queries used for acknowledgment receipts must be bounded snapshots that are complete for the requested policy purpose."
+    },
+    {
+      "id": "typed_refusal_for_unavailable_evidence",
+      "statement": "When evidence cannot be collected or exposed at the needed cut, the result must name a typed refusal instead of inferring success from partial evidence."
+    },
+    {
+      "id": "no_unbounded_live_scan_authority",
+      "statement": "Unbounded live scans, cache-local guesses, dashboard samples, and mixed-policy bundles are not receipt authority."
+    }
+  ],
+  "result_refusal_rules": [
+    {
+      "refusal_family": "no_quorum",
+      "required_projection": "refused or blocked with membership, quorum, and fencing refs"
+    },
+    {
+      "refusal_family": "stale_evidence",
+      "required_projection": "unknown-evidence or retry-after-fresh-evidence with stale family refs"
+    },
+    {
+      "refusal_family": "unsupported_media",
+      "required_projection": "refused or unsafe-visible with media capability refs and no strengthened receipt"
+    },
+    {
+      "refusal_family": "lower_ack_class",
+      "required_projection": "degraded-visible or refused result naming requested and earned classes"
+    },
+    {
+      "refusal_family": "retention_gap",
+      "required_projection": "blocked or refused with retention and recall proof gap refs"
+    }
+  ],
+  "non_claims": [
+    "This artifact does not validate mounted runtime receipt production.",
+    "This artifact does not validate QEMU crash or fault behavior.",
+    "This artifact does not validate POSIX fsync, fdatasync, FUA, or barrier semantics.",
+    "This artifact does not validate successor, comparator, production, or release-readiness wording."
+  ],
+  "outcome": {
+    "passed": true,
+    "violation_count": 0,
+    "violations": []
+  }
+}

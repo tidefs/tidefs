@@ -1,0 +1,16 @@
+{
+  "manifest_version": 2,
+  "claim_id": "storage.intent.ack_receipt_honesty.v1",
+  "evidence_class": "storage-intent-ordering-membership-media-gates",
+  "validation_tier": "source-model",
+  "scope": "source-model authority gates for storage-intent acknowledgment ordering, membership, media, placement, trust, capacity, recovery, freshness, result, and refusal evidence",
+  "artifact_path": "validation/artifacts/storage-intent/ack-receipt-authority-gates.json",
+  "content_digest": "blake3:1ab9dbca833783fea6bfa393895709d7adeee870ddbe291c004509c96b57d4e3",
+  "run_id": "deterministic-fixture:storage-intent-ack-receipt-authority-gates-v1",
+  "source_ref": "refs/heads/codex3/issue-2222-ack-receipt-authority",
+  "outcome": "pass",
+  "residual_risk": "Source-model evidence only. Mounted runtime receipt production, QEMU crash and fault behavior, POSIX fsync/fdatasync/FUA/barrier semantics, distributed transport execution, successor/comparator wording, production readiness, and release readiness remain non-validated.",
+  "source": "tidefs-storage-intent-source-model::ack-receipt-authority-gates-v1",
+  "generated_at": "2026-07-14T19:55:30Z",
+  "blocking_issues": []
+}
