@@ -2382,9 +2382,7 @@ fn print_help() {
     println!(
         "  check-ublk-acceptance-harness alias for check-block-volume-ublk-acceptance-harness"
     );
-    println!(
-        "  check-local-store        validate the first durable local object-store source slice"
-    );
+    println!("  check-local-store        run local object-store source-presence smoke");
     println!("  check-local-store-format validate the local object-store on-disk format spec");
     println!("  check-object-store-format alias for check-local-store-format");
     println!("  check-production-integrity validate the production integrity policy spec");
