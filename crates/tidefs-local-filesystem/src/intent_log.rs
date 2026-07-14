@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
-use tidefs_local_object_store::{DeviceIoClass, IntegrityDigest64, LocalObjectStore, Pool};
+use tidefs_local_object_store::{IntegrityDigest64, LocalObjectStore, Pool};
 use tidefs_types_vfs_core::{Generation, InodeId, NodeKind};
 
 use crate::constants::*;
@@ -672,12 +672,12 @@ impl IntentLogRawStateAuthority {
         Ok(store.get(intent_log_data_object_key(entry_id))?)
     }
 
-    fn write_data_payload(pool: &mut Pool, entry_id: u64, payload: &[u8]) -> Result<()> {
-        pool.put(
-            DeviceIoClass::Data,
-            intent_log_data_object_key(entry_id),
-            payload,
-        )?;
+    fn write_data_payload(
+        store: &mut LocalObjectStore,
+        entry_id: u64,
+        payload: &[u8],
+    ) -> Result<()> {
+        store.put(intent_log_data_object_key(entry_id), payload)?;
         Ok(())
     }
 
@@ -1182,7 +1182,11 @@ impl IntentLog {
     }
 
     pub(crate) fn write_next_data_payload(&self, pool: &mut Pool, payload: &[u8]) -> Result<()> {
-        IntentLogRawStateAuthority::write_data_payload(pool, self.next_entry_id(), payload)
+        IntentLogRawStateAuthority::write_data_payload(
+            pool.raw_primary_store_mut(),
+            self.next_entry_id(),
+            payload,
+        )
     }
 
     /// Write all batched (unflushed) entries to durable storage.
