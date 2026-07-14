@@ -22,6 +22,26 @@ const SEGMENT_RECLAIM_MATRIX_ROW: SegmentReclaimValidationRow = SegmentReclaimVa
     decommissioning: false,
 };
 
+const POOL_DESTROY_LIVE_OWNER_REFUSAL_MATRIX_ROW: PoolDestroyLiveOwnerRefusalValidationRow =
+    PoolDestroyLiveOwnerRefusalValidationRow {
+        typed_refusal: true,
+        state: "DestroyRefusedLiveOwnerMounted",
+        code: "live-owner-pool-destroy-refused",
+        mounted_dataset_refusal: true,
+        allowed_state: "exported-offline-explicit-devices",
+        shutdown_requested: false,
+        label_superblock_action: "none",
+        product_claim_evidence: false,
+        capacity_free: false,
+        zero_visible: false,
+        discard_acceptance: false,
+        media_privacy: false,
+        cryptographic_erase: false,
+        secure_erase: false,
+        sanitization: false,
+        decommissioning: false,
+    };
+
 #[derive(Clone, Copy)]
 struct SegmentReclaimValidationRow {
     capacity_accounting: bool,
@@ -73,6 +93,82 @@ impl SegmentReclaimValidationRow {
     }
 }
 
+#[derive(Clone, Copy)]
+struct PoolDestroyLiveOwnerRefusalValidationRow {
+    typed_refusal: bool,
+    state: &'static str,
+    code: &'static str,
+    mounted_dataset_refusal: bool,
+    allowed_state: &'static str,
+    shutdown_requested: bool,
+    label_superblock_action: &'static str,
+    product_claim_evidence: bool,
+    capacity_free: bool,
+    zero_visible: bool,
+    discard_acceptance: bool,
+    media_privacy: bool,
+    cryptographic_erase: bool,
+    secure_erase: bool,
+    sanitization: bool,
+    decommissioning: bool,
+}
+
+impl PoolDestroyLiveOwnerRefusalValidationRow {
+    fn unsupported_evidence(self) -> [(&'static str, bool); 8] {
+        [
+            ("capacity free", self.capacity_free),
+            ("zero-visible behavior", self.zero_visible),
+            ("discard acceptance", self.discard_acceptance),
+            ("media privacy", self.media_privacy),
+            ("cryptographic erase", self.cryptographic_erase),
+            ("secure erase", self.secure_erase),
+            ("sanitization", self.sanitization),
+            ("decommissioning readiness", self.decommissioning),
+        ]
+    }
+
+    fn encode(self) -> Vec<u8> {
+        format!(
+            concat!(
+                "row=device-lifecycle.pool-destroy.live-owner-refusal;",
+                "typed_refusal={};",
+                "state={};",
+                "code={};",
+                "mounted_dataset_refusal={};",
+                "allowed_state={};",
+                "shutdown_requested={};",
+                "label_superblock_action={};",
+                "product_claim_evidence={};",
+                "capacity_free={};",
+                "zero_visible={};",
+                "discard_acceptance={};",
+                "media_privacy={};",
+                "cryptographic_erase={};",
+                "secure_erase={};",
+                "sanitization={};",
+                "decommissioning={}"
+            ),
+            self.typed_refusal,
+            self.state,
+            self.code,
+            self.mounted_dataset_refusal,
+            self.allowed_state,
+            self.shutdown_requested,
+            self.label_superblock_action,
+            self.product_claim_evidence,
+            self.capacity_free,
+            self.zero_visible,
+            self.discard_acceptance,
+            self.media_privacy,
+            self.cryptographic_erase,
+            self.secure_erase,
+            self.sanitization,
+            self.decommissioning
+        )
+        .into_bytes()
+    }
+}
+
 /// Run the full reclaim smoke sequence and return the harness.
 #[must_use]
 pub fn run_reclaim_smoke() -> SmokeHarness {
@@ -92,6 +188,30 @@ pub fn run_reclaim_smoke() -> SmokeHarness {
     for (evidence, admitted) in SEGMENT_RECLAIM_MATRIX_ROW.unsupported_evidence() {
         h.assert_ev(
             &format!("segment reclaim smoke does not claim {evidence} evidence"),
+            !admitted,
+        );
+    }
+    record_reclaim_op(
+        &mut h,
+        "validation.matrix.pool_destroy_live_owner_refusal",
+        0,
+        POOL_DESTROY_LIVE_OWNER_REFUSAL_MATRIX_ROW.encode(),
+    );
+    h.assert_ev(
+        "pool destroy live-owner matrix records typed refusal",
+        POOL_DESTROY_LIVE_OWNER_REFUSAL_MATRIX_ROW.typed_refusal,
+    );
+    h.assert_ev(
+        "pool destroy live-owner matrix records mounted dataset refusal",
+        POOL_DESTROY_LIVE_OWNER_REFUSAL_MATRIX_ROW.mounted_dataset_refusal,
+    );
+    h.assert_ev(
+        "pool destroy live-owner matrix is not product claim evidence",
+        !POOL_DESTROY_LIVE_OWNER_REFUSAL_MATRIX_ROW.product_claim_evidence,
+    );
+    for (evidence, admitted) in POOL_DESTROY_LIVE_OWNER_REFUSAL_MATRIX_ROW.unsupported_evidence() {
+        h.assert_ev(
+            &format!("pool destroy live-owner refusal does not claim {evidence} evidence"),
             !admitted,
         );
     }
@@ -299,7 +419,20 @@ fn candidate_ids(candidates: &[ReclaimCandidate]) -> Vec<u64> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
+
+    fn matrix_row_fields(marker: &str) -> BTreeMap<&str, &str> {
+        marker
+            .split(';')
+            .map(|field| {
+                field
+                    .split_once('=')
+                    .unwrap_or_else(|| panic!("matrix row field has key=value shape: {field}"))
+            })
+            .collect()
+    }
 
     #[test]
     fn smoke_reclaim_passes() {
@@ -327,15 +460,64 @@ mod tests {
             _ => None,
         });
         let marker = marker.expect("segment reclaim matrix row is recorded");
+        let fields = matrix_row_fields(marker);
 
-        assert!(marker.contains("row=device-lifecycle.segment-reclaim.capacity-only"));
-        assert!(marker.contains("capacity_accounting=true"));
-        assert!(marker.contains("zero_visible=false"));
-        assert!(marker.contains("discard_acceptance=false"));
-        assert!(marker.contains("media_privacy=false"));
-        assert!(marker.contains("cryptographic_erase=false"));
-        assert!(marker.contains("secure_erase=false"));
-        assert!(marker.contains("sanitization=false"));
-        assert!(marker.contains("decommissioning=false"));
+        assert_eq!(
+            fields.get("row").copied(),
+            Some("device-lifecycle.segment-reclaim.capacity-only")
+        );
+        assert_eq!(fields.get("capacity_accounting").copied(), Some("true"));
+        assert_eq!(fields.get("zero_visible").copied(), Some("false"));
+        assert_eq!(fields.get("discard_acceptance").copied(), Some("false"));
+        assert_eq!(fields.get("media_privacy").copied(), Some("false"));
+        assert_eq!(fields.get("cryptographic_erase").copied(), Some("false"));
+        assert_eq!(fields.get("secure_erase").copied(), Some("false"));
+        assert_eq!(fields.get("sanitization").copied(), Some("false"));
+        assert_eq!(fields.get("decommissioning").copied(), Some("false"));
+    }
+
+    #[test]
+    fn pool_destroy_live_owner_refusal_matrix_row_is_trace_only() {
+        let h = run_reclaim_smoke();
+        let marker = h.trace.iter().find_map(|event| match event {
+            TraceEvent::FsLifecycleOp {
+                op_name, payload, ..
+            } if op_name == "validation.matrix.pool_destroy_live_owner_refusal" => {
+                Some(std::str::from_utf8(payload).expect("matrix row payload is utf-8"))
+            }
+            _ => None,
+        });
+        let marker = marker.expect("pool destroy live-owner refusal matrix row is recorded");
+        let fields = matrix_row_fields(marker);
+
+        assert_eq!(
+            fields.get("row").copied(),
+            Some("device-lifecycle.pool-destroy.live-owner-refusal")
+        );
+        assert_eq!(fields.get("typed_refusal").copied(), Some("true"));
+        assert_eq!(
+            fields.get("state").copied(),
+            Some("DestroyRefusedLiveOwnerMounted")
+        );
+        assert_eq!(
+            fields.get("code").copied(),
+            Some("live-owner-pool-destroy-refused")
+        );
+        assert_eq!(fields.get("mounted_dataset_refusal").copied(), Some("true"));
+        assert_eq!(
+            fields.get("allowed_state").copied(),
+            Some("exported-offline-explicit-devices")
+        );
+        assert_eq!(fields.get("shutdown_requested").copied(), Some("false"));
+        assert_eq!(fields.get("label_superblock_action").copied(), Some("none"));
+        assert_eq!(fields.get("product_claim_evidence").copied(), Some("false"));
+        assert_eq!(fields.get("capacity_free").copied(), Some("false"));
+        assert_eq!(fields.get("zero_visible").copied(), Some("false"));
+        assert_eq!(fields.get("discard_acceptance").copied(), Some("false"));
+        assert_eq!(fields.get("media_privacy").copied(), Some("false"));
+        assert_eq!(fields.get("cryptographic_erase").copied(), Some("false"));
+        assert_eq!(fields.get("secure_erase").copied(), Some("false"));
+        assert_eq!(fields.get("sanitization").copied(), Some("false"));
+        assert_eq!(fields.get("decommissioning").copied(), Some("false"));
     }
 }
