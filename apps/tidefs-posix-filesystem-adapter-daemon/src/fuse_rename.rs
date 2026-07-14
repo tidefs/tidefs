@@ -487,6 +487,48 @@ mod tests {
     }
 
     #[test]
+    fn rename_whiteout_with_noreplace_returns_einval_without_side_effects() {
+        let (_tmp, engine) = test_engine();
+        let ctx = test_ctx();
+        let root = InodeId::new(1);
+        let dispatch = FuseRenameDispatch::new();
+
+        let source_attr = engine
+            .mknod(root, b"file.txt", libc::S_IFREG | 0o644, 0, &ctx)
+            .expect("create source");
+        let target_attr = engine
+            .mknod(root, b"other.txt", libc::S_IFREG | 0o644, 0, &ctx)
+            .expect("create target");
+
+        let result = dispatch.dispatch_engine_with_flags(EngineRenameRequest {
+            engine: engine.as_ref(),
+            ctx: &ctx,
+            old_parent: root,
+            old_name: b"file.txt",
+            new_parent: root,
+            new_name: b"other.txt",
+            flags: RENAME_WHITEOUT | RENAME_NOREPLACE,
+        });
+
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().0, libc::EINVAL as u16);
+        assert_eq!(
+            engine
+                .lookup(root, b"file.txt", &ctx)
+                .expect("source remains")
+                .inode_id,
+            source_attr.inode_id
+        );
+        assert_eq!(
+            engine
+                .lookup(root, b"other.txt", &ctx)
+                .expect("target remains")
+                .inode_id,
+            target_attr.inode_id
+        );
+    }
+
+    #[test]
     fn rename_overwrite_existing_file() {
         let (_tmp, engine) = test_engine();
         let ctx = test_ctx();
