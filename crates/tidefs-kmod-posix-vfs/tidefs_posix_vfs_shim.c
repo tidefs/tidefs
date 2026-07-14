@@ -4766,6 +4766,8 @@ sync_mode:
 			0, 0, 0, 0, 0,
 			tidefs_posix_vfs_timespec64_to_ns(ctime),
 			&out_mode, &out_uid, &out_gid, &out_size, &out_blocks);
+		if (ret == -ENOSYS)
+			ret = -EOPNOTSUPP;
 		if (ret)
 			goto out_release_acl;
 		inode->i_mode = out_mode;
