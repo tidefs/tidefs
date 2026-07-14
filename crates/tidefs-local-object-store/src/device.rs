@@ -1964,6 +1964,10 @@ impl DeviceImpl for ParityRaidDevice {
     }
 
     fn discard_capability(&self) -> DiscardCapability {
+        if self.children.is_empty() {
+            return DiscardCapability::Unknown;
+        }
+
         self.children
             .iter()
             .map(DeviceImpl::discard_capability)
@@ -4174,6 +4178,32 @@ mod tests {
         for p in &paths {
             let _ = std::fs::remove_dir_all(p);
         }
+    }
+
+    #[test]
+    fn parity_raid_empty_no_children_does_not_advertise_discard() {
+        let device = ParityRaidDevice {
+            children: Vec::new(),
+            n_data: 0,
+            n_parity: 1,
+            row_sequence: 0,
+            health_tracker: RefCell::new(DeviceHealthState::new(
+                Duration::from_secs(600),
+                1,
+                3,
+                false,
+            )),
+            status: DeviceStatus {
+                state: DeviceState::Faulted,
+                ..Default::default()
+            },
+            read_ops: Cell::new(0),
+            write_ops: 0,
+            delete_ops: 0,
+        };
+
+        assert_eq!(device.discard_capability(), DiscardCapability::Unknown);
+        assert!(!device.supports_discard());
     }
 
     // ParityRaidDevice — PARITY_RAID2 double-parity
