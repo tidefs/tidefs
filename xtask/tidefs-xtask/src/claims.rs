@@ -1621,6 +1621,18 @@ fn check_committed_validation_artifacts(root: &Path, missing: &mut Vec<String>) 
                     err.failures().join("; ")
                 ));
             }
+            for sidecar_path in implied_evidence_manifest_sidecar_artifact_paths(
+                manifest_path,
+                &committed_artifacts,
+            ) {
+                if sidecar_path != artifact_path
+                    && is_runtime_artifact_path(Path::new(&sidecar_path))
+                {
+                    missing.push(format!(
+                        "{manifest_path} is adjacent to runtime artifact `{sidecar_path}` but points at `{artifact_path}`"
+                    ));
+                }
+            }
             live_runtime_artifacts.insert(artifact_path);
         }
     }
@@ -1665,6 +1677,36 @@ fn is_evidence_manifest_path(path: &Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
         .is_some_and(|name| name.to_ascii_lowercase().ends_with(".manifest.json"))
+}
+
+fn implied_evidence_manifest_sidecar_artifact_paths(
+    manifest_path: &str,
+    committed_artifacts: &BTreeSet<String>,
+) -> Vec<String> {
+    const MANIFEST_SUFFIX: &str = ".manifest.json";
+
+    let lower_path = manifest_path.to_ascii_lowercase();
+    if !lower_path.ends_with(MANIFEST_SUFFIX) {
+        return Vec::new();
+    }
+
+    let stem_len = manifest_path.len() - MANIFEST_SUFFIX.len();
+    let stem = &manifest_path[..stem_len];
+    let extension_prefix = format!("{stem}.");
+    committed_artifacts
+        .iter()
+        .filter(|candidate| {
+            candidate.as_str() == stem
+                || candidate
+                    .strip_prefix(&extension_prefix)
+                    .is_some_and(|extension| {
+                        !extension.is_empty()
+                            && !extension.contains('/')
+                            && !extension.contains('.')
+                    })
+        })
+        .cloned()
+        .collect()
 }
 
 fn is_full_hex_sha(value: &str) -> bool {
@@ -5378,6 +5420,62 @@ non_claims = ["none"]
         check_committed_validation_artifacts(temp.path(), &mut missing);
 
         assert!(missing.is_empty(), "{missing:#?}");
+    }
+
+    #[test]
+    fn committed_validation_artifacts_reject_ambiguous_runtime_sidecar_coverage() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        git(temp.path(), &["init"]);
+        let artifact_path = "validation/artifacts/kernel/runtime-output.json";
+        let sidecar_path = "validation/artifacts/kernel/runtime-output.log";
+        let manifest_path = "validation/artifacts/kernel/runtime-output.manifest.json";
+        let artifact_body = r#"{"status":"promoted"}"#;
+        write_artifact(temp.path(), artifact_path, artifact_body);
+        write_artifact(temp.path(), sidecar_path, "runtime sidecar log");
+        let manifest = EvidenceArtifactManifest {
+            manifest_version: EVIDENCE_ARTIFACT_MANIFEST_VERSION,
+            claim_id: "example.runtime.artifact.v1".to_string(),
+            evidence_class: "runtime-artifact".to_string(),
+            validation_tier: ValidationTier::MountedUserspace,
+            scope: "runtime artifact promotion fixture".to_string(),
+            artifact_path: artifact_path.to_string(),
+            content_digest: content_digest_for_bytes(artifact_body.as_bytes()),
+            run_id: "runtime-promotion-fixture-20260714T040246Z/1".to_string(),
+            source_ref: MANIFEST_FIXTURE_SOURCE_REF.to_string(),
+            outcome: ValidationStatus::Pass,
+            residual_risk: "Fixture validates committed artifact gate behavior only.".to_string(),
+            source: "tidefs-xtask-test".to_string(),
+            generated_at: "2026-07-14T04:02:46Z".to_string(),
+            blocking_issues: Vec::new(),
+        };
+        write_artifact(
+            temp.path(),
+            manifest_path,
+            &manifest
+                .to_json_pretty()
+                .expect("serialize runtime manifest fixture"),
+        );
+        git(
+            temp.path(),
+            &[
+                "add",
+                "validation/artifacts/kernel/runtime-output.json",
+                "validation/artifacts/kernel/runtime-output.log",
+                "validation/artifacts/kernel/runtime-output.manifest.json",
+            ],
+        );
+
+        let mut missing = Vec::new();
+        check_committed_validation_artifacts(temp.path(), &mut missing);
+
+        assert!(
+            missing.iter().any(|failure| {
+                failure.contains("is adjacent to runtime artifact")
+                    && failure.contains(sidecar_path)
+                    && failure.contains(artifact_path)
+            }),
+            "{missing:#?}"
+        );
     }
 
     #[test]
