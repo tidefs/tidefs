@@ -18,6 +18,16 @@ impl fmt::Display for BlockCheckError {
     }
 }
 
+fn source_presence_signal_line(command: &str, scope: &str) -> String {
+    format!(
+        "{command} source-presence policy/tooling signal: {scope}; marker check only, not runtime validation or product proof"
+    )
+}
+
+fn print_source_presence_signal(command: &str, scope: &str) {
+    println!("{}", source_presence_signal_line(command, scope));
+}
+
 pub fn check_block_volume_adapter_core_current_workspace() -> Result<(), BlockCheckError> {
     let root = find_workspace_root().ok_or_else(|| BlockCheckError {
         missing: vec!["could not locate workspace root Cargo.toml".to_string()],
@@ -80,8 +90,9 @@ pub fn check_block_volume_adapter_core_current_workspace() -> Result<(), BlockCh
     );
 
     if missing.is_empty() {
-        println!(
-            "block-volume adapter core ok: read/write exactness, flush barriers, discard intents, bounds refusal, and alignment refusal are implementation-tracked non-release"
+        print_source_presence_signal(
+            "check-block-volume-adapter-core",
+            "adapter core source wiring",
         );
         Ok(())
     } else {
@@ -129,8 +140,9 @@ pub fn check_block_volume_queue_admission_current_workspace() -> Result<(), Bloc
         &mut missing,
     );
     if missing.is_empty() {
-        println!(
-            "block-volume queue admission ok: queue classification, shard binding, backpressure refusal, export-fence refusal, flush epochs, and completion commits are implementation-tracked non-release"
+        print_source_presence_signal(
+            "check-block-volume-queue-admission",
+            "queue admission source wiring",
         );
         Ok(())
     } else {
@@ -168,8 +180,9 @@ pub fn check_block_volume_dispatch_execution_current_workspace() -> Result<(), B
         &mut missing,
     );
     if missing.is_empty() {
-        println!(
-            "block-volume dispatch execution ok: admitted read/write/flush/discard/write-zeroes dispatch, unadmitted refusal, payload-mismatch refusal, and completion release are implementation-tracked non-release"
+        print_source_presence_signal(
+            "check-block-volume-dispatch-execution",
+            "dispatch execution source wiring",
         );
         Ok(())
     } else {
@@ -211,8 +224,9 @@ pub fn check_block_volume_export_lifecycle_current_workspace() -> Result<(), Blo
         &mut missing,
     );
     if missing.is_empty() {
-        println!(
-            "block-volume export lifecycle ok: bootstrap, queue-live admission, quiesce classification, drain-before-fence, resume, and stop gates are implementation-tracked non-release"
+        print_source_presence_signal(
+            "check-block-volume-export-lifecycle",
+            "export lifecycle source wiring",
         );
         Ok(())
     } else {
@@ -259,8 +273,9 @@ pub fn check_block_volume_cache_coherency_current_workspace() -> Result<(), Bloc
         &mut missing,
     );
     if missing.is_empty() {
-        println!(
-            "block-volume cache coherency ok: clean cache windows, dirty epochs, flush/FUA barriers, discard/write-zeroes invalidation, direct-overlap guards, and non-authoritative cache loss are implementation-tracked non-release"
+        print_source_presence_signal(
+            "check-block-volume-cache-coherency",
+            "cache coherency source wiring",
         );
         Ok(())
     } else {
@@ -302,8 +317,9 @@ pub fn check_block_volume_resize_fence_current_workspace() -> Result<(), BlockCh
         &mut missing,
     );
     if missing.is_empty() {
-        println!(
-            "block-volume resize/fence ok: capacity targets, affected tail ranges, grow zero visibility, shrink drain refusal, no-authority refusal, and post-resize geometry publication are implementation-tracked non-release"
+        print_source_presence_signal(
+            "check-block-volume-resize-fence",
+            "resize/fence source wiring",
         );
         Ok(())
     } else {
@@ -379,8 +395,9 @@ pub fn check_block_volume_host_preflight_current_workspace() -> Result<(), Block
         &mut missing,
     );
     if missing.is_empty() {
-        println!(
-            "block-volume host preflight ok: Linux host probe, ublk control-device readiness, explicit attach refusal, non-mutation, and proof hooks are implementation-tracked non-release"
+        print_source_presence_signal(
+            "check-block-volume-host-preflight",
+            "host preflight source wiring",
         );
         Ok(())
     } else {
@@ -460,9 +477,7 @@ pub fn check_block_volume_ublk_abi_current_workspace() -> Result<(), BlockCheckE
         &mut missing,
     );
     if missing.is_empty() {
-        println!(
-            "block-volume ublk ABI ok: Linux command numbers, ioctl encoding, record layouts, feature flags, dry-run control plan, and non-mutation claims are implementation-tracked non-release"
-        );
+        print_source_presence_signal("check-block-volume-ublk-abi", "uBLK ABI source wiring");
         Ok(())
     } else {
         Err(BlockCheckError { missing })
@@ -526,8 +541,9 @@ pub fn check_block_volume_file_backing_current_workspace() -> Result<(), BlockCh
     );
 
     if missing.is_empty() {
-        println!(
-            "block-volume file backing ok: real userspace backing files preserve read/write/flush/discard semantics with explicit no-ublk nonclaims"
+        print_source_presence_signal(
+            "check-block-volume-file-backing",
+            "file backing source wiring",
         );
         Ok(())
     } else {
@@ -608,8 +624,9 @@ pub fn check_block_volume_ublk_control_open_current_workspace() -> Result<(), Bl
     );
 
     if missing.is_empty() {
-        println!(
-            "block-volume ublk control open ok: real control-device admission opens only eligible hosts and records exact no-ioctl/no-block-device nonclaims"
+        print_source_presence_signal(
+            "check-block-volume-ublk-control-open",
+            "uBLK control open source wiring",
         );
         Ok(())
     } else {
@@ -715,8 +732,9 @@ pub fn check_block_volume_ublk_control_readonly_probe_current_workspace(
     );
 
     if missing.is_empty() {
-        println!(
-            "block-volume ublk control read-only probe ok: admitted hosts can submit GET_FEATURES uring_cmd while mutating control commands and block-device creation remain explicitly absent"
+        print_source_presence_signal(
+            "check-block-volume-ublk-control-readonly-probe",
+            "uBLK control read-only probe source wiring",
         );
         Ok(())
     } else {
@@ -814,8 +832,9 @@ pub fn check_block_volume_ublk_add_dev_boundary_current_workspace() -> Result<()
     );
 
     if missing.is_empty() {
-        println!(
-            "block-volume ublk ADD_DEV boundary ok: admitted hosts can reach the real ADD_DEV uring_cmd boundary while SET_PARAMS, START_DEV, data queues, and started block-device export remain absent"
+        print_source_presence_signal(
+            "check-block-volume-ublk-add-dev-boundary",
+            "guarded ADD_DEV source wiring",
         );
         Ok(())
     } else {
@@ -912,8 +931,9 @@ pub fn check_block_volume_ublk_del_dev_cleanup_boundary_current_workspace(
     );
 
     if missing.is_empty() {
-        println!(
-            "block-volume ublk DEL_DEV cleanup boundary ok: admitted hosts can clean up a successful ADD_DEV device pair while SET_PARAMS, START_DEV, data queues, and started block-device export remain absent"
+        print_source_presence_signal(
+            "check-block-volume-ublk-del-dev-cleanup-boundary",
+            "guarded DEL_DEV cleanup source wiring",
         );
         Ok(())
     } else {
@@ -1010,8 +1030,9 @@ pub fn check_block_volume_ublk_set_params_boundary_current_workspace() -> Result
     );
 
     if missing.is_empty() {
-        println!(
-            "block-volume ublk SET_PARAMS boundary ok: admitted hosts can project ublk_params into the real SET_PARAMS uring_cmd boundary with DEL_DEV cleanup while START_DEV, data queues, and started block-device export remain absent"
+        print_source_presence_signal(
+            "check-block-volume-ublk-set-params-boundary",
+            "guarded SET_PARAMS source wiring",
         );
         Ok(())
     } else {
@@ -1103,8 +1124,9 @@ pub fn check_block_volume_ublk_start_dev_boundary_current_workspace() -> Result<
     );
 
     if missing.is_empty() {
-        println!(
-            "block-volume ublk START_DEV boundary ok: the real START_DEV command shape is implementation-tracked non-release and the daemon refuses START_DEV until data queue FETCH_REQ readiness exists, preserving DEL_DEV cleanup and avoiding unsafe control-only starts"
+        print_source_presence_signal(
+            "check-block-volume-ublk-start-dev-boundary",
+            "guarded START_DEV source wiring",
         );
         Ok(())
     } else {
@@ -1194,8 +1216,9 @@ pub fn check_block_volume_ublk_fetch_req_readiness_boundary_current_workspace(
     );
 
     if missing.is_empty() {
-        println!(
-            "block-volume ublk FETCH_REQ readiness boundary ok: the real data-queue FETCH_REQ command shape is implementation-tracked non-release, readiness requires live queue runtime ownership, and START_DEV remains guarded without unsafe data-queue submission"
+        print_source_presence_signal(
+            "check-block-volume-ublk-fetch-req-readiness-boundary",
+            "FETCH_REQ readiness source wiring",
         );
         Ok(())
     } else {
@@ -1276,8 +1299,9 @@ pub fn check_block_volume_ublk_data_queue_open_boundary_current_workspace(
     );
 
     if missing.is_empty() {
-        println!(
-            "block-volume ublk data-queue open boundary ok: concrete ADD_DEV results bind /dev/ublkcN runtime-open admission and FETCH_REQ/START_DEV remain unsubmitted"
+        print_source_presence_signal(
+            "check-block-volume-ublk-data-queue-open-boundary",
+            "data-queue open source wiring",
         );
         Ok(())
     } else {
@@ -1355,8 +1379,9 @@ pub fn check_block_volume_ublk_fetch_req_submit_boundary_current_workspace(
     );
 
     if missing.is_empty() {
-        println!(
-            "block-volume ublk FETCH_REQ submission boundary ok: live /dev/ublkcN runtime ownership gates FETCH_REQ submission and START_DEV remains unsubmitted"
+        print_source_presence_signal(
+            "check-block-volume-ublk-fetch-req-submit-boundary",
+            "FETCH_REQ submission source wiring",
         );
         Ok(())
     } else {
@@ -1432,8 +1457,9 @@ pub fn check_block_volume_ublk_commit_fetch_boundary_current_workspace(
     );
 
     if missing.is_empty() {
-        println!(
-            "block-volume ublk COMMIT_AND_FETCH_REQ boundary ok: live data-queue ownership and fetched request completion gate commit-and-fetch submission while START_DEV remains unsubmitted"
+        print_source_presence_signal(
+            "check-block-volume-ublk-commit-fetch-boundary",
+            "COMMIT_AND_FETCH_REQ source wiring",
         );
         Ok(())
     } else {
@@ -1502,8 +1528,9 @@ pub fn check_block_volume_ublk_acceptance_harness_current_workspace() -> Result<
     );
 
     if missing.is_empty() {
-        println!(
-            "block-volume ublk acceptance harness ok: command wiring, fio verify fields, durability verify fields, acceptance status classification, and report markers are implementation-tracked non-release"
+        print_source_presence_signal(
+            "check-block-volume-ublk-acceptance-harness",
+            "uBLK acceptance harness source wiring",
         );
         Ok(())
     } else {
@@ -1657,7 +1684,10 @@ pub fn check_block_volume_ublk_surface_source_markers_current_workspace(
 
     // Validation script must reference the check-group
     if missing.is_empty() {
-        println!("ublk-surface source markers ok: start_dev, data_queue_io_loop, and block_device_validation are implementation-tracked non-release targeted checks");
+        print_source_presence_signal(
+            "check-block-volume-ublk-surface-source-markers",
+            "uBLK surface source-marker wiring",
+        );
         Ok(())
     } else {
         Err(BlockCheckError { missing })
@@ -1676,6 +1706,23 @@ fn find_workspace_root() -> Option<PathBuf> {
         if !current.pop() {
             return None;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::source_presence_signal_line;
+
+    #[test]
+    fn source_presence_signal_line_is_marker_only_wording() {
+        let line =
+            source_presence_signal_line("check-block-volume-ublk-add-dev-boundary", "ADD_DEV");
+
+        assert!(line.contains("source-presence"));
+        assert!(line.contains("not runtime validation or product proof"));
+        assert!(!line.contains("validated"));
+        assert!(!line.contains("release readiness"));
+        assert!(!line.contains("claim evidence"));
     }
 }
 
