@@ -658,6 +658,7 @@ pub fn check_current_workspace() -> Result<(), ClaimsGateCheckError> {
     }
 
     check_claim_registry_docs(&root, &mut missing);
+    check_committed_validation_artifacts(&root, &mut missing);
     check_command_authority_docs(&root, &mut missing);
 
     check_source_markers(
@@ -1552,6 +1553,118 @@ fn current_git_head(root: &Path) -> Option<String> {
     } else {
         None
     }
+}
+
+fn check_committed_validation_artifacts(root: &Path, missing: &mut Vec<String>) {
+    let paths = match committed_validation_artifact_paths(root) {
+        Ok(paths) => paths,
+        Err(err) => {
+            missing.push(err);
+            return;
+        }
+    };
+
+    let committed_artifacts = paths
+        .iter()
+        .filter(|path| !is_evidence_manifest_path(Path::new(path)))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let committed_runtime_artifacts = committed_artifacts
+        .iter()
+        .filter(|path| is_runtime_artifact_path(Path::new(path)))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+
+    let mut live_runtime_artifacts = BTreeSet::new();
+    let mut artifact_runtime_classes = BTreeMap::<String, BTreeSet<bool>>::new();
+    for manifest_path in paths
+        .iter()
+        .filter(|path| is_evidence_manifest_path(Path::new(path)))
+    {
+        let manifest = match load_evidence_artifact_manifest_json_path(root.join(manifest_path)) {
+            Ok(manifest) => manifest,
+            Err(err) => {
+                missing.push(format!(
+                    "{manifest_path} is malformed or unsupported evidence manifest: {err}"
+                ));
+                continue;
+            }
+        };
+        let artifact_path = manifest.artifact_path.clone();
+        if !is_evidence_manifest_path(Path::new(&artifact_path))
+            && committed_artifacts.contains(&artifact_path)
+        {
+            artifact_runtime_classes
+                .entry(artifact_path.clone())
+                .or_default()
+                .insert(manifest.validation_tier.is_live_runtime());
+        }
+        if manifest.validation_tier.is_live_runtime() {
+            if is_evidence_manifest_path(Path::new(&artifact_path)) {
+                missing.push(format!(
+                    "{manifest_path} is a live-runtime manifest pointing at manifest `{artifact_path}`"
+                ));
+            }
+            if !committed_artifacts.contains(&artifact_path) {
+                missing.push(format!(
+                    "{manifest_path} is a live-runtime manifest pointing at non-committed artifact `{artifact_path}`"
+                ));
+            }
+            if !is_runtime_artifact_path(Path::new(&artifact_path)) {
+                missing.push(format!(
+                    "{manifest_path} is a live-runtime manifest pointing at non-runtime artifact `{artifact_path}`"
+                ));
+            }
+            if let Err(err) = manifest.verify_artifact_digest(root) {
+                missing.push(format!(
+                    "{manifest_path} has invalid live-runtime artifact digest: {}",
+                    err.failures().join("; ")
+                ));
+            }
+            live_runtime_artifacts.insert(artifact_path);
+        }
+    }
+
+    for (artifact_path, runtime_classes) in artifact_runtime_classes {
+        if runtime_classes.contains(&true) && runtime_classes.contains(&false) {
+            missing.push(format!(
+                "{artifact_path} has both live-runtime and non-runtime evidence manifests"
+            ));
+        }
+    }
+
+    for artifact_path in committed_runtime_artifacts {
+        if !live_runtime_artifacts.contains(&artifact_path) {
+            missing.push(format!(
+                "{artifact_path} is unclassified runtime output missing v2 live-runtime evidence manifest"
+            ));
+        }
+    }
+}
+
+fn committed_validation_artifact_paths(root: &Path) -> Result<Vec<String>, String> {
+    let output = Command::new("git")
+        .current_dir(root)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .args(["ls-files", "--", "validation/artifacts"])
+        .output()
+        .map_err(|err| format!("list committed validation artifacts: {err}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "list committed validation artifacts: git ls-files failed: {}",
+            stderr.trim()
+        ));
+    }
+    String::from_utf8(output.stdout)
+        .map(|stdout| stdout.lines().map(str::to_string).collect())
+        .map_err(|err| format!("list committed validation artifacts: {err}"))
+}
+
+fn is_evidence_manifest_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.to_ascii_lowercase().ends_with(".manifest.json"))
 }
 
 fn is_full_hex_sha(value: &str) -> bool {
@@ -3595,6 +3708,7 @@ fn find_workspace_root() -> Option<PathBuf> {
 mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::process::Command;
     use std::time::{Duration, SystemTime};
 
     use tidefs_validation::evidence_artifact_manifest::{
@@ -3605,10 +3719,10 @@ mod tests {
     use tidefs_validation::validation_status::ValidationStatus;
 
     use super::{
-        build_claim_validation_receipt, claims_gate_rules, command_authority_from_sources,
-        line_has_present_tense_overclaim, parse_claim_registry, parse_command_admissions,
-        parse_command_surfaces, render_claim_registry_doc, render_claim_validation_summary,
-        render_command_authority_table, validate_claim_record,
+        build_claim_validation_receipt, check_committed_validation_artifacts, claims_gate_rules,
+        command_authority_from_sources, line_has_present_tense_overclaim, parse_claim_registry,
+        parse_command_admissions, parse_command_surfaces, render_claim_registry_doc,
+        render_claim_validation_summary, render_command_authority_table, validate_claim_record,
         validate_crash_claims_gate_review_artifact_content,
         validate_model_crash_matrix_artifact_content, validate_registered_crash_artifacts,
         validate_runtime_crash_artifact_content, ClaimEvidenceArtifact, ClaimEvidenceRequirement,
@@ -5180,6 +5294,90 @@ non_claims = ["none"]
             fs::create_dir_all(parent).expect("create artifact parent");
         }
         fs::write(path, contents).expect("write artifact");
+    }
+
+    fn git(root: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .current_dir(root)
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .args(args)
+            .status()
+            .expect("run git");
+        assert!(status.success(), "git {:?} failed with {status}", args);
+    }
+
+    #[test]
+    fn committed_validation_artifacts_reject_unclassified_runtime_output() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        git(temp.path(), &["init"]);
+        write_artifact(
+            temp.path(),
+            "validation/artifacts/kernel/runtime-output.json",
+            r#"{"status":"scratch"}"#,
+        );
+        git(
+            temp.path(),
+            &["add", "validation/artifacts/kernel/runtime-output.json"],
+        );
+
+        let mut missing = Vec::new();
+        check_committed_validation_artifacts(temp.path(), &mut missing);
+
+        assert!(
+            missing.iter().any(|failure| failure.contains(
+                "validation/artifacts/kernel/runtime-output.json is unclassified runtime output missing v2 live-runtime evidence manifest"
+            )),
+            "{missing:#?}"
+        );
+    }
+
+    #[test]
+    fn committed_validation_artifacts_accept_runtime_manifest_coverage() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        git(temp.path(), &["init"]);
+        let artifact_path = "validation/artifacts/kernel/runtime-output.json";
+        let manifest_path = "validation/artifacts/kernel/runtime-output.manifest.json";
+        let artifact_body = r#"{"status":"promoted"}"#;
+        write_artifact(temp.path(), artifact_path, artifact_body);
+        let manifest = EvidenceArtifactManifest {
+            manifest_version: EVIDENCE_ARTIFACT_MANIFEST_VERSION,
+            claim_id: "example.runtime.artifact.v1".to_string(),
+            evidence_class: "runtime-artifact".to_string(),
+            validation_tier: ValidationTier::MountedUserspace,
+            scope: "runtime artifact promotion fixture".to_string(),
+            artifact_path: artifact_path.to_string(),
+            content_digest: content_digest_for_bytes(artifact_body.as_bytes()),
+            run_id: "runtime-promotion-fixture-20260714T040246Z/1".to_string(),
+            source_ref: MANIFEST_FIXTURE_SOURCE_REF.to_string(),
+            outcome: ValidationStatus::Pass,
+            residual_risk: "Fixture validates committed artifact gate behavior only.".to_string(),
+            source: "tidefs-xtask-test".to_string(),
+            generated_at: "2026-07-14T04:02:46Z".to_string(),
+            blocking_issues: Vec::new(),
+        };
+        write_artifact(
+            temp.path(),
+            manifest_path,
+            &manifest
+                .to_json_pretty()
+                .expect("serialize runtime manifest fixture"),
+        );
+        git(
+            temp.path(),
+            &["add", "validation/artifacts/kernel/runtime-output.json"],
+        );
+        git(
+            temp.path(),
+            &[
+                "add",
+                "validation/artifacts/kernel/runtime-output.manifest.json",
+            ],
+        );
+
+        let mut missing = Vec::new();
+        check_committed_validation_artifacts(temp.path(), &mut missing);
+
+        assert!(missing.is_empty(), "{missing:#?}");
     }
 
     #[test]
