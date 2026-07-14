@@ -1,0 +1,43 @@
+artifact_version = 1
+claim_id = "storage.local.successor_comparator.v1"
+evidence_class = "local-storage-successor-claim-boundary-review"
+source = "issue-2046-source-review"
+generated_at = "2026-07-14T05:47:53Z"
+source_ref = "d87008b2e8273c5fba6de88c0f49818780f5fac3"
+scope = "source-model review of local successor/comparator claim boundaries"
+decision = "claim-boundary-recorded-with-registry-status-blocked"
+
+reviewed_sources = [
+  "README.md",
+  "docs/CLAIMS_GATE_POLICY.md",
+  "docs/CONTROL_FORMAT_AND_JSON_POLICY.md",
+  "validation/claims.toml",
+]
+
+boundary_findings = [
+  "The claim registry keeps storage.local.successor_comparator.v1 blocked.",
+  "The registered scope covers explicit local-storage successor or comparator-performance wording for OpenZFS, DRBD, ext4/XFS, and local filesystems.",
+  "This artifact set supplies bounded evidence records and manifests only; it does not edit validation/claims.toml or generated docs/CLAIM_REGISTRY.md.",
+  "Local mounted-userspace evidence can inform this claim only when it names device/media assumptions, mount tier, workload, measurement attribution, and fault model.",
+  "Source-model review rows cannot substitute for mounted local performance or fault evidence where the registry asks for mounted-userspace validation."
+]
+
+still_not_comparable = [
+  "External incumbent benchmark results with unmatched hardware, media, workload, durability, and mount tier.",
+  "Clustered or distributed storage behavior.",
+  "Block-volume export behavior.",
+  "Release-candidate, production, OpenZFS/Ceph-class, or broad availability status.",
+  "Closed issue or merged PR lineage without current digest-matched evidence artifacts."
+]
+
+operator_safe_wording = [
+  "TideFS may state that local successor/comparator wording is blocked behind the registered claim.",
+  "TideFS may cite these artifacts as a bounded evidence inventory for issue #2046.",
+  "TideFS must keep publishing-facing local successor, superiority, and comparator-performance text fail-closed until the registry claim and related umbrella boundary validate."
+]
+
+non_claims = [
+  "This review is not a local filesystem performance claim.",
+  "This review is not OpenZFS, DRBD, ext4, or XFS parity evidence.",
+  "This review is not a release-readiness or production-readiness decision."
+]

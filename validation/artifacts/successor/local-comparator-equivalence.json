@@ -1,0 +1,51 @@
+{
+  "artifact_version": 1,
+  "claim_id": "storage.local.successor_comparator.v1",
+  "evidence_class": "local-storage-comparator-equivalence-evidence",
+  "source": "issue-2046-source-review",
+  "generated_at": "2026-07-14T05:47:53Z",
+  "source_ref": "d87008b2e8273c5fba6de88c0f49818780f5fac3",
+  "scope": "bounded local mounted-userspace comparator envelope for storage.local.successor_comparator.v1",
+  "decision": "bounded-envelope-recorded",
+  "local_envelope": {
+    "device_media_assumptions": [
+      "Evidence may describe only explicit local byte-addressable devices admitted to a TideFS pool by current source-controlled flows.",
+      "Evidence must record whether the device is loop-backed, virtual, solid-state, rotational, or otherwise constrained by the runner or harness.",
+      "Evidence must not transfer a result between media classes without a new artifact row that names the media and measurement source."
+    ],
+    "mounted_local_filesystem_mode": [
+      "Comparable rows are limited to a single-node mounted local filesystem path.",
+      "Rows must identify whether execution used FUSE, mounted kernel VFS, or another source-owned local path.",
+      "Rows do not cover local block-volume export unless a separate registered claim names that mode."
+    ],
+    "workload_classes": [
+      "metadata create, rename, unlink, and lookup rows may be compared only when the operation set and durability boundary are named",
+      "read, write, flush, fsync, fdatasync, statfs, xattr, lock, and mmap/writeback rows may be compared only when the mounted tier and completion semantics are named",
+      "failure rows may be compared only when the crash, restart, media, import, or recovery injection point is named"
+    ],
+    "measurement_attribution": [
+      "Each row must attribute observed latency, throughput, correctness, or refusal behavior to a concrete artifact, command, workflow run, or source-model review.",
+      "Harness setup, runner media, mount tier, and current source ref must be part of the row.",
+      "A row label alone is not evidence for the claim."
+    ],
+    "fault_model": [
+      "The local envelope can cover process restart, FUSE daemon exit, local mount teardown, explicit device refusal, source-model recovery review, or runner-scoped media fault injection when the artifact names the injection point.",
+      "The local envelope does not cover multi-node quorum, RDMA, cluster membership, remote replication, geo-RPO, or production availability."
+    ],
+    "non_comparable_cases": [
+      "OpenZFS, DRBD, ext4, XFS, or local filesystem results from external publications are not comparable without matching workload, media, mount tier, durability boundary, and measurement method.",
+      "Distributed storage, clustered storage, block export, release-candidate, and production-readiness claims are outside this artifact.",
+      "Ambition statements, design documents, issue labels, and closed historical issue numbers do not make a local comparator row comparable."
+    ]
+  },
+  "admission_boundary": {
+    "claim_registry_status": "blocked",
+    "may_support_evidence_review": true,
+    "may_admit_successor_or_comparator_winner_wording": false
+  },
+  "residual_risk": [
+    "This artifact defines the envelope only; it does not provide incumbent measurements.",
+    "Mounted-userspace rows still need source-qualified runtime evidence before they can support any local comparator-performance text.",
+    "The registry claim remains blocked and the umbrella storage-intent successor/comparator boundary is outside this artifact."
+  ]
+}

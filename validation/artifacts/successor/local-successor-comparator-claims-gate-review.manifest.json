@@ -1,0 +1,16 @@
+{
+  "manifest_version": 2,
+  "claim_id": "storage.local.successor_comparator.v1",
+  "evidence_class": "claims-gate-review",
+  "validation_tier": "source-model",
+  "scope": "claims-gate review for bounded local successor/comparator evidence artifacts",
+  "artifact_path": "validation/artifacts/successor/local-successor-comparator-claims-gate-review.toml",
+  "content_digest": "blake3:6966b3456a98848f640d55c44c9429d2258d3c6958f91d461b6558d91a9125a9",
+  "run_id": "deterministic-fixture:issue-2046-local-successor-comparator-claims-gate-review-v1",
+  "source_ref": "d87008b2e8273c5fba6de88c0f49818780f5fac3",
+  "outcome": "pass",
+  "residual_risk": "This manifest covers source-model claims-gate review only. It does not provide mounted runtime proof, incumbent comparison measurements, distributed behavior, release-candidate coverage, production readiness, or admission of local successor/comparator wording.",
+  "source": "issue-2046-claims-gate-review",
+  "generated_at": "2026-07-14T05:47:53Z",
+  "blocking_issues": []
+}

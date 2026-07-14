@@ -1,0 +1,16 @@
+{
+  "manifest_version": 2,
+  "claim_id": "storage.local.successor_comparator.v1",
+  "evidence_class": "local-storage-operator-explanation-evidence",
+  "validation_tier": "source-model",
+  "scope": "operator-facing explanation boundary for local successor/comparator evidence",
+  "artifact_path": "validation/artifacts/successor/local-operator-explanation.json",
+  "content_digest": "blake3:8e770668aadf6465ccffc8dc12d2e8f2d11d7403f99af7213c9f1caa786087e4",
+  "run_id": "deterministic-fixture:issue-2046-local-operator-explanation-v1",
+  "source_ref": "d87008b2e8273c5fba6de88c0f49818780f5fac3",
+  "outcome": "pass",
+  "residual_risk": "This manifest covers source-model operator explanation evidence only. It does not provide mounted runtime proof, incumbent comparison measurements, distributed behavior, release-candidate coverage, production readiness, or admission of local successor/comparator wording.",
+  "source": "issue-2046-source-review",
+  "generated_at": "2026-07-14T05:47:53Z",
+  "blocking_issues": []
+}

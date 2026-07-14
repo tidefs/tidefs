@@ -1,0 +1,16 @@
+{
+  "manifest_version": 2,
+  "claim_id": "storage.local.successor_comparator.v1",
+  "evidence_class": "local-storage-successor-claim-boundary-review",
+  "validation_tier": "source-model",
+  "scope": "source-model review of local successor/comparator claim boundaries",
+  "artifact_path": "validation/artifacts/successor/local-claim-boundary-review.toml",
+  "content_digest": "blake3:2b5a710b6f9e18c0859e999406cf2ea3cdb454b00bdece1c9a19b914f341f956",
+  "run_id": "deterministic-fixture:issue-2046-local-claim-boundary-review-v1",
+  "source_ref": "d87008b2e8273c5fba6de88c0f49818780f5fac3",
+  "outcome": "pass",
+  "residual_risk": "This manifest covers source-model claim-boundary review only. It does not provide mounted runtime proof, incumbent comparison measurements, distributed behavior, release-candidate coverage, production readiness, or admission of local successor/comparator wording.",
+  "source": "issue-2046-source-review",
+  "generated_at": "2026-07-14T05:47:53Z",
+  "blocking_issues": []
+}
