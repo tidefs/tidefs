@@ -1,0 +1,16 @@
+{
+  "manifest_version": 2,
+  "claim_id": "storage.local.successor_comparator.v1",
+  "evidence_class": "local-storage-successor-performance-fault-set",
+  "validation_tier": "mounted-userspace",
+  "scope": "bounded mounted-userspace performance and fault evidence inventory for local successor/comparator wording",
+  "artifact_path": "validation/artifacts/successor/local-performance-fault-set.json",
+  "content_digest": "blake3:3967cc2fe4c13e1e47d34ccc940526c2d7fc6e8ceae1f4ddbb2468634597b773",
+  "run_id": "deterministic-fixture:issue-2046-local-performance-fault-set-v1",
+  "source_ref": "d87008b2e8273c5fba6de88c0f49818780f5fac3",
+  "outcome": "pass",
+  "residual_risk": "This manifest covers a fail-closed local performance and fault inventory only. It does not add mounted runtime proof, incumbent comparison measurements, distributed behavior, release-candidate coverage, production readiness, or admission of local successor/comparator wording.",
+  "source": "issue-2046-source-review",
+  "generated_at": "2026-07-14T05:47:53Z",
+  "blocking_issues": []
+}

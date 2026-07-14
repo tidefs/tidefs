@@ -1,0 +1,65 @@
+{
+  "artifact_version": 1,
+  "claim_id": "storage.local.successor_comparator.v1",
+  "evidence_class": "local-storage-successor-performance-fault-set",
+  "source": "issue-2046-source-review",
+  "generated_at": "2026-07-14T05:47:53Z",
+  "source_ref": "d87008b2e8273c5fba6de88c0f49818780f5fac3",
+  "scope": "bounded mounted-userspace performance and fault evidence inventory for local successor/comparator wording",
+  "decision": "fail-closed-inventory-recorded",
+  "rows": [
+    {
+      "row_id": "local-mounted-throughput-latency",
+      "tier": "mounted-userspace",
+      "evidence_status": "not-admitted-for-successor-wording",
+      "required_before_admission": [
+        "current TideFS mounted local run artifact",
+        "matching incumbent run or explicit non-incumbent comparison boundary",
+        "workload, media, mount tier, and durability attribution"
+      ],
+      "refusal_reason": "No current artifact in this issue records matched local mounted performance data for TideFS and an incumbent under the same envelope."
+    },
+    {
+      "row_id": "local-mounted-metadata-operations",
+      "tier": "mounted-userspace",
+      "evidence_status": "not-admitted-for-successor-wording",
+      "required_before_admission": [
+        "operation mix and namespace scale",
+        "mount tier and runner media",
+        "source-qualified correctness and measurement artifact"
+      ],
+      "refusal_reason": "Current source and registry state do not prove local metadata operation parity or performance standing against OpenZFS, DRBD, ext4, XFS, or other local filesystems."
+    },
+    {
+      "row_id": "local-fsync-and-recovery-faults",
+      "tier": "mounted-userspace",
+      "evidence_status": "not-admitted-for-successor-wording",
+      "required_before_admission": [
+        "named crash or restart injection point",
+        "post-recovery truth artifact",
+        "durability boundary and source ref"
+      ],
+      "refusal_reason": "The issue provides a local successor artifact owner but does not add new crash, fsync, restart, or recovery runtime proof."
+    },
+    {
+      "row_id": "local-device-fault-and-refusal",
+      "tier": "mounted-userspace",
+      "evidence_status": "not-admitted-for-successor-wording",
+      "required_before_admission": [
+        "named device/media fault",
+        "operator-visible refusal or recovery result",
+        "bounded comparison target and non-comparable case list"
+      ],
+      "refusal_reason": "Current evidence remains bounded to source review in this issue and does not establish local device fault behavior as an incumbent comparison."
+    }
+  ],
+  "non_claims": [
+    "The row set is an inventory and fail-closed refusal record.",
+    "It does not report TideFS as faster, safer, more available, production-ready, release-ready, or an incumbent-class local filesystem.",
+    "It does not admit distributed, clustered, RDMA, block-volume, or OpenZFS/Ceph-class behavior."
+  ],
+  "residual_risk": [
+    "The rows intentionally leave local successor/comparator performance text unadmitted.",
+    "Future mounted runtime artifacts must update this file or add a successor-specific artifact before publishing-facing wording can consume them."
+  ]
+}

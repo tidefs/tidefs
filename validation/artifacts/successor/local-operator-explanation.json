@@ -1,0 +1,36 @@
+{
+  "artifact_version": 1,
+  "claim_id": "storage.local.successor_comparator.v1",
+  "evidence_class": "local-storage-operator-explanation-evidence",
+  "source": "issue-2046-source-review",
+  "generated_at": "2026-07-14T05:47:53Z",
+  "source_ref": "d87008b2e8273c5fba6de88c0f49818780f5fac3",
+  "scope": "operator-facing explanation boundary for local successor/comparator evidence",
+  "decision": "operator-explanation-recorded-with-claim-blocked",
+  "operator_summary": [
+    "The local successor/comparator claim is registered but blocked.",
+    "These artifacts define what evidence would be needed before TideFS can make local OpenZFS, DRBD, ext4/XFS, or local-filesystem comparator wording.",
+    "Current evidence in this issue does not tell an operator that TideFS is a local filesystem successor, faster option, safer option, or production substitute."
+  ],
+  "operator_safe_statements": [
+    "TideFS is pre-alpha and claim-gated.",
+    "Local mounted filesystem evidence must name source ref, device/media, mount tier, workload, fault model, and measurement method.",
+    "Rows without a matching incumbent envelope remain evidence inventory, not operator guidance."
+  ],
+  "operator_unsafe_statements": [
+    "TideFS is an OpenZFS, DRBD, ext4, XFS, or local-filesystem successor.",
+    "TideFS has proven better local performance than an incumbent filesystem.",
+    "A single local benchmark or source review is enough for production storage guidance.",
+    "Distributed, clustered, RDMA, or block-volume behavior follows from local mounted-userspace evidence."
+  ],
+  "required_future_evidence_before_operator_guidance": [
+    "digest-matched mounted local artifacts for each cited workload",
+    "matched comparison envelope or a clear statement that no incumbent comparison is being made",
+    "claim-boundary review showing the registry status has moved through the normal claims gate",
+    "operator-facing wording review that keeps non-comparable cases visible"
+  ],
+  "residual_risk": [
+    "This explanation is a source-model artifact and does not run a mounted workload.",
+    "It is suitable for keeping operator wording bounded, not for admitting a local performance or reliability claim."
+  ]
+}

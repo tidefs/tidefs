@@ -1,0 +1,16 @@
+{
+  "manifest_version": 2,
+  "claim_id": "storage.local.successor_comparator.v1",
+  "evidence_class": "local-storage-comparator-equivalence-evidence",
+  "validation_tier": "mounted-userspace",
+  "scope": "bounded local mounted-userspace comparator envelope for storage.local.successor_comparator.v1",
+  "artifact_path": "validation/artifacts/successor/local-comparator-equivalence.json",
+  "content_digest": "blake3:da5fc0502ca4a8b5a4cd52523c13be3e64c43504cc0092377755695e2fc2ed9e",
+  "run_id": "deterministic-fixture:issue-2046-local-comparator-equivalence-v1",
+  "source_ref": "d87008b2e8273c5fba6de88c0f49818780f5fac3",
+  "outcome": "pass",
+  "residual_risk": "This manifest covers the bounded comparator envelope artifact only. It does not provide incumbent measurements, mounted runtime performance proof, distributed behavior, release-candidate coverage, production readiness, or admission of local successor/comparator wording.",
+  "source": "issue-2046-source-review",
+  "generated_at": "2026-07-14T05:47:53Z",
+  "blocking_issues": []
+}

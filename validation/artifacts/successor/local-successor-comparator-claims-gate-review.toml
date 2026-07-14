@@ -1,0 +1,39 @@
+artifact_version = 1
+claim_id = "storage.local.successor_comparator.v1"
+evidence_class = "claims-gate-review"
+source = "issue-2046-claims-gate-review"
+generated_at = "2026-07-14T05:47:53Z"
+source_ref = "d87008b2e8273c5fba6de88c0f49818780f5fac3"
+scope = "claims-gate review for bounded local successor/comparator evidence artifacts"
+decision = "evidence-artifacts-recorded-with-claim-still-blocked"
+
+reviewed_artifacts = [
+  "validation/artifacts/successor/local-comparator-equivalence.json",
+  "validation/artifacts/successor/local-performance-fault-set.json",
+  "validation/artifacts/successor/local-claim-boundary-review.toml",
+  "validation/artifacts/successor/local-operator-explanation.json",
+]
+
+reviewed_claim_ids = [
+  "storage.local.successor_comparator.v1",
+]
+
+claims_gate_findings = [
+  "The artifact set matches the evidence classes and paths registered for storage.local.successor_comparator.v1.",
+  "The artifacts preserve the split local successor/comparator boundary from docs/CLAIMS_GATE_POLICY.md.",
+  "The artifacts do not edit validation/claims.toml or generated docs/CLAIM_REGISTRY.md.",
+  "The artifacts record fail-closed performance and fault rows instead of publishing TideFS as a local incumbent comparator winner.",
+  "The operator explanation identifies statements that remain unsafe while the claim is blocked."
+]
+
+residual_risk = [
+  "validate-claim is expected to fail closed while validation/claims.toml keeps storage.local.successor_comparator.v1 blocked.",
+  "This review does not validate distributed, clustered, block-volume, kernel-resident, release-candidate, production, or OpenZFS/Ceph-class behavior.",
+  "Future runtime evidence must use current source refs and digest-matched manifests before it can support publishing-facing local comparator wording."
+]
+
+non_claims = [
+  "This review does not admit local successor/comparator wording.",
+  "This review does not close product-gap umbrella issues.",
+  "This review does not replace claim registry authority."
+]
