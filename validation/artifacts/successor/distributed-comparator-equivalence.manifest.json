@@ -1,0 +1,16 @@
+{
+  "manifest_version": 2,
+  "claim_id": "storage.distributed.successor_comparator.v1",
+  "evidence_class": "distributed-storage-comparator-equivalence-evidence",
+  "validation_tier": "multi-process-distributed",
+  "scope": "fail-closed distributed successor comparator equivalence envelope for topology, membership, network, media, workload, attribution, fault, recovery, degraded-state, and non-comparable cases",
+  "artifact_path": "validation/artifacts/successor/distributed-comparator-equivalence.json",
+  "content_digest": "blake3:80b680b1e381e5382a05dce5ea9aaf64778142f46047d12c7237039c4ddd3e12",
+  "run_id": "manual-review:issue-2047-distributed-comparator-equivalence-v1",
+  "source_ref": "refs/heads/codex3/issue-2047-distributed-successor-evidence",
+  "outcome": "pass",
+  "residual_risk": "This artifact records the current non-comparable envelope only. It does not admit OpenZFS, Ceph, DRBD, clustered-storage successor, superiority, or comparator-performance wording, and it does not prove distributed runtime behavior.",
+  "source": "claims-boundary-review",
+  "generated_at": "2026-07-14T11:45:01Z",
+  "blocking_issues": []
+}

@@ -1,0 +1,48 @@
+claim_id = "storage.distributed.successor_comparator.v1"
+evidence_class = "distributed-storage-successor-claim-boundary-review"
+issue = "https://github.com/tidefs/tidefs/issues/2047"
+source_ref = "fed743d0e1f6f5df9244b809488fc397cfe44cc4"
+assessment = "fail-closed"
+summary = "The distributed successor/comparator claim remains blocked. This review records the boundary without changing runtime behavior, public APIs, validation/claims.toml, generated claim registry output, release-readiness verdicts, or product wording."
+
+[claim_boundary]
+current_registry_status = "blocked"
+allowed_current_effect = "manifest-backed evidence record only"
+forbidden_inference = "OpenZFS, Ceph, DRBD, clustered-storage, distributed-storage successor, superiority, or comparator-performance wording"
+pre_alpha_boundary = "TideFS remains pre-alpha and does not currently fulfill OpenZFS/Ceph-class distributed behavior."
+
+[[unproven_items]]
+item = "cluster topology"
+state = "No current evidence admits a node count, quorum shape, placement domain, role layout, or fencing arrangement for successor comparison."
+
+[[unproven_items]]
+item = "membership and ownership"
+state = "No current evidence proves membership convergence, split-brain exclusion, fencing, data ownership transfer, or live ownership recovery."
+
+[[unproven_items]]
+item = "transport mode"
+state = "No current evidence binds distributed behavior to TCP, RDMA, loopback, or mixed transport modes."
+
+[[unproven_items]]
+item = "media and durability"
+state = "No current evidence binds distributed behavior to a media class, durability mode, cache behavior, or device failure model."
+
+[[unproven_items]]
+item = "workload and measurement attribution"
+state = "No current evidence separates TideFS, transport, media, client, recovery, and incumbent comparison costs for distributed workloads."
+
+[[unproven_items]]
+item = "fault and degraded behavior"
+state = "No current evidence proves node, process, network, device, media, partition, crash, recovery, or degraded-visible behavior."
+
+[[unproven_items]]
+item = "operator explanation"
+state = "No current evidence turns distributed successor/comparator limitations into admitted operator-facing capability wording."
+
+[non_overlap]
+expected_write_set_only = true
+registry_edits = "not changed"
+generated_claim_registry_edits = "not changed"
+runtime_behavior_edits = "not changed"
+public_api_edits = "not changed"
+release_readiness_edits = "not changed"

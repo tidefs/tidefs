@@ -1,0 +1,40 @@
+claim_id = "storage.distributed.successor_comparator.v1"
+evidence_class = "claims-gate-review"
+issue = "https://github.com/tidefs/tidefs/issues/2047"
+source_ref = "fed743d0e1f6f5df9244b809488fc397cfe44cc4"
+assessment = "fail-closed"
+summary = "The claims gate boundary remains blocked for distributed successor/comparator wording. The new artifacts document refusal and residual risk; they do not admit product claims."
+
+[claims_gate]
+registry_status = "blocked"
+manifest_outcome = "pass"
+claim_admission = "blocked"
+reason = "Manifest validation can pass for these evidence records while storage.distributed.successor_comparator.v1 remains blocked by missing distributed runtime, performance/fault, operator, and product-admission proof."
+
+[[gate_checks]]
+check = "claim registry"
+result = "unchanged blocked status"
+detail = "validation/claims.toml remains the authority for storage.distributed.successor_comparator.v1."
+
+[[gate_checks]]
+check = "generated claim registry"
+result = "unchanged"
+detail = "docs/CLAIM_REGISTRY.md is not edited by this evidence slice."
+
+[[gate_checks]]
+check = "runtime and public API"
+result = "unchanged"
+detail = "No runtime behavior, public API, operator command, or product wording is changed."
+
+[[gate_checks]]
+check = "distributed successor wording"
+result = "refused"
+detail = "OpenZFS, Ceph, DRBD, clustered-storage, distributed-storage successor, superiority, and comparator-performance wording remain unavailable."
+
+[[gate_checks]]
+check = "release readiness"
+result = "unchanged"
+detail = "These files do not alter release-readiness verdicts or whole-product admission."
+
+[residual_risk]
+summary = "The artifact set may satisfy manifest presence and digest checks, but the claim remains blocked until current multi-process distributed proof exists for the exact topology, membership, transport, media, workload, fault, recovery, degraded-visible, and operator-explanation envelope."

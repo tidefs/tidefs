@@ -1,0 +1,16 @@
+{
+  "manifest_version": 2,
+  "claim_id": "storage.distributed.successor_comparator.v1",
+  "evidence_class": "claims-gate-review",
+  "validation_tier": "source-model",
+  "scope": "claims-gate review for blocked distributed successor comparator artifact set",
+  "artifact_path": "validation/artifacts/successor/distributed-successor-comparator-claims-gate-review.toml",
+  "content_digest": "blake3:ccb1306ca303c0403c50b4e9e3540cd362d4ce4dbfa323516b3ac0bd0e0d95e6",
+  "run_id": "manual-review:issue-2047-distributed-successor-comparator-claims-gate-review-v1",
+  "source_ref": "refs/heads/codex3/issue-2047-distributed-successor-evidence",
+  "outcome": "pass",
+  "residual_risk": "This claims-gate review records that manifest/schema validation can pass while the distributed successor comparator claim remains blocked. It does not close registry blockers or admit product-facing successor, superiority, or comparator-performance claims.",
+  "source": "claims-gate",
+  "generated_at": "2026-07-14T11:45:01Z",
+  "blocking_issues": []
+}

@@ -1,0 +1,16 @@
+{
+  "manifest_version": 2,
+  "claim_id": "storage.distributed.successor_comparator.v1",
+  "evidence_class": "distributed-storage-successor-performance-fault-set",
+  "validation_tier": "multi-process-distributed",
+  "scope": "fail-closed distributed successor performance and fault-set refusal matrix for missing topology, transport, media, workload, attribution, fault, recovery, and degraded-state proof",
+  "artifact_path": "validation/artifacts/successor/distributed-performance-fault-set.json",
+  "content_digest": "blake3:9c05e4bb3ef8783a2eb68c71595ac0d4a938591a18512858714ba5f49826cbf7",
+  "run_id": "manual-review:issue-2047-distributed-performance-fault-set-v1",
+  "source_ref": "refs/heads/codex3/issue-2047-distributed-successor-evidence",
+  "outcome": "pass",
+  "residual_risk": "This artifact records why current performance and fault rows remain refused for distributed successor comparison. It is not a benchmark result, runtime admission, degraded-operation proof, or product-readiness signal.",
+  "source": "claims-boundary-review",
+  "generated_at": "2026-07-14T11:45:01Z",
+  "blocking_issues": []
+}

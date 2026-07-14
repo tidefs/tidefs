@@ -1,0 +1,53 @@
+{
+  "claim_id": "storage.distributed.successor_comparator.v1",
+  "evidence_class": "distributed-storage-successor-performance-fault-set",
+  "issue": "https://github.com/tidefs/tidefs/issues/2047",
+  "source_ref": "fed743d0e1f6f5df9244b809488fc397cfe44cc4",
+  "assessment": "fail-closed",
+  "summary": "The current evidence set contains no current multi-process distributed performance or fault row that can support successor or comparator-performance wording.",
+  "rows": [
+    {
+      "row_id": "distributed-throughput-latency",
+      "scope": "multi-node or multi-process distributed throughput and latency",
+      "current_evidence": "not present in the registered artifact set",
+      "decision": "refuse",
+      "reason": "No current run binds topology, transport, media, workload, and attribution to a distributed TideFS storage mode."
+    },
+    {
+      "row_id": "distributed-fsync-sync-write",
+      "scope": "distributed sync write, fsync, flush, or durability-latency behavior",
+      "current_evidence": "not present in the registered artifact set",
+      "decision": "refuse",
+      "reason": "No current run proves durability-visible distributed behavior or separates client, transport, quorum, and media cost."
+    },
+    {
+      "row_id": "distributed-degraded-read-write",
+      "scope": "degraded read/write service during node, process, network, or device fault",
+      "current_evidence": "not present in the registered artifact set",
+      "decision": "refuse",
+      "reason": "No current run proves degraded-visible client behavior or operator-visible refusal for a named distributed topology."
+    },
+    {
+      "row_id": "distributed-recovery-rebuild",
+      "scope": "repair, rebuild, re-replication, scrub, and recovery after distributed faults",
+      "current_evidence": "not present in the registered artifact set",
+      "decision": "refuse",
+      "reason": "No current run proves recovery completion, data availability, consistency, or performance under a named fault model."
+    },
+    {
+      "row_id": "distributed-network-rdma-tcp",
+      "scope": "TCP, RDMA, loopback, or mixed transport behavior",
+      "current_evidence": "not present in the registered artifact set",
+      "decision": "refuse",
+      "reason": "No current run ties measurements or fault effects to a named transport mode."
+    },
+    {
+      "row_id": "distributed-incumbent-comparator",
+      "scope": "OpenZFS, Ceph, DRBD, or clustered-storage comparison",
+      "current_evidence": "not present in the registered artifact set",
+      "decision": "refuse",
+      "reason": "No current run provides a comparable incumbent setup, media class, workload class, measurement attribution, and failure envelope."
+    }
+  ],
+  "claim_boundary": "These refusal rows are evidence that the registered artifact was reviewed. They are not product admission, runtime proof, release readiness, or permission to use distributed successor/comparator wording."
+}
