@@ -11,12 +11,90 @@ use tidefs_reclaim::{
     ReclaimScheduler, ReclaimSegment,
 };
 
+const SEGMENT_RECLAIM_MATRIX_ROW: SegmentReclaimValidationRow = SegmentReclaimValidationRow {
+    capacity_accounting: true,
+    zero_visible: false,
+    discard_acceptance: false,
+    media_privacy: false,
+    cryptographic_erase: false,
+    secure_erase: false,
+    sanitization: false,
+    decommissioning: false,
+};
+
+#[derive(Clone, Copy)]
+struct SegmentReclaimValidationRow {
+    capacity_accounting: bool,
+    zero_visible: bool,
+    discard_acceptance: bool,
+    media_privacy: bool,
+    cryptographic_erase: bool,
+    secure_erase: bool,
+    sanitization: bool,
+    decommissioning: bool,
+}
+
+impl SegmentReclaimValidationRow {
+    fn unsupported_evidence(self) -> [(&'static str, bool); 7] {
+        [
+            ("zero-visible behavior", self.zero_visible),
+            ("discard acceptance", self.discard_acceptance),
+            ("media privacy", self.media_privacy),
+            ("cryptographic erase", self.cryptographic_erase),
+            ("secure erase", self.secure_erase),
+            ("sanitization", self.sanitization),
+            ("decommissioning readiness", self.decommissioning),
+        ]
+    }
+
+    fn encode(self) -> Vec<u8> {
+        format!(
+            concat!(
+                "row=device-lifecycle.segment-reclaim.capacity-only;",
+                "capacity_accounting={};",
+                "zero_visible={};",
+                "discard_acceptance={};",
+                "media_privacy={};",
+                "cryptographic_erase={};",
+                "secure_erase={};",
+                "sanitization={};",
+                "decommissioning={}"
+            ),
+            self.capacity_accounting,
+            self.zero_visible,
+            self.discard_acceptance,
+            self.media_privacy,
+            self.cryptographic_erase,
+            self.secure_erase,
+            self.sanitization,
+            self.decommissioning
+        )
+        .into_bytes()
+    }
+}
+
 /// Run the full reclaim smoke sequence and return the harness.
 #[must_use]
 pub fn run_reclaim_smoke() -> SmokeHarness {
     let mut h = SmokeHarness::new();
 
     h.scenario_begin("reclaim/smoke");
+    record_reclaim_op(
+        &mut h,
+        "validation.matrix.segment_reclaim_capacity_only",
+        0,
+        SEGMENT_RECLAIM_MATRIX_ROW.encode(),
+    );
+    h.assert_ev(
+        "segment reclaim smoke admits capacity accounting evidence",
+        SEGMENT_RECLAIM_MATRIX_ROW.capacity_accounting,
+    );
+    for (evidence, admitted) in SEGMENT_RECLAIM_MATRIX_ROW.unsupported_evidence() {
+        h.assert_ev(
+            &format!("segment reclaim smoke does not claim {evidence} evidence"),
+            !admitted,
+        );
+    }
 
     let config = ReclaimConfig {
         waste_threshold: 0.25,
@@ -235,5 +313,29 @@ mod tests {
                 assert!(passed, "assertion failed: {condition}");
             }
         }
+    }
+
+    #[test]
+    fn segment_reclaim_matrix_row_is_capacity_only() {
+        let h = run_reclaim_smoke();
+        let marker = h.trace.iter().find_map(|event| match event {
+            TraceEvent::FsLifecycleOp {
+                op_name, payload, ..
+            } if op_name == "validation.matrix.segment_reclaim_capacity_only" => {
+                Some(std::str::from_utf8(payload).expect("matrix row payload is utf-8"))
+            }
+            _ => None,
+        });
+        let marker = marker.expect("segment reclaim matrix row is recorded");
+
+        assert!(marker.contains("row=device-lifecycle.segment-reclaim.capacity-only"));
+        assert!(marker.contains("capacity_accounting=true"));
+        assert!(marker.contains("zero_visible=false"));
+        assert!(marker.contains("discard_acceptance=false"));
+        assert!(marker.contains("media_privacy=false"));
+        assert!(marker.contains("cryptographic_erase=false"));
+        assert!(marker.contains("secure_erase=false"));
+        assert!(marker.contains("sanitization=false"));
+        assert!(marker.contains("decommissioning=false"));
     }
 }
