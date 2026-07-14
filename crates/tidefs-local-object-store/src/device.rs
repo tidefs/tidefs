@@ -1497,6 +1497,10 @@ impl DeviceImpl for MirrorDevice {
     }
 
     fn discard_capability(&self) -> DiscardCapability {
+        if self.members.is_empty() {
+            return DiscardCapability::Unknown;
+        }
+
         self.members
             .iter()
             .map(DeviceImpl::discard_capability)
@@ -3430,6 +3434,8 @@ mod tests {
     #[test]
     fn mirror_empty_no_children_returns_eio() {
         let device = Device::open_mirror(&[], &test_options()).unwrap();
+        assert_eq!(device.discard_capability(), DiscardCapability::Unknown);
+        assert!(!device.supports_discard());
         let key = ObjectKey::from_name(b"empty-mirror-key");
         let result = device.get(key);
         assert!(result.is_err(), "expected EIO from empty mirror");
