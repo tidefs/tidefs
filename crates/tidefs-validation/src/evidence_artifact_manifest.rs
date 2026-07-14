@@ -117,9 +117,7 @@ impl EvidenceArtifactManifest {
         if self.evidence_class.trim().is_empty() {
             failures.push("evidence_class must not be empty".to_string());
         }
-        if self.scope.trim().is_empty() {
-            failures.push("scope must not be empty".to_string());
-        }
+        validate_required_provenance_text("scope", &self.scope, &mut failures);
         if let Err(error) = validate_artifact_path_shape(&self.artifact_path) {
             failures.extend(error.failures().iter().cloned());
         }
@@ -136,10 +134,10 @@ impl EvidenceArtifactManifest {
                 .push("live-runtime validation_tier requires runtime artifact_path".to_string());
         }
         validate_content_digest(&self.content_digest, &mut failures);
-        validate_required_text("run_id", &self.run_id, &mut failures);
-        validate_required_text("source_ref", &self.source_ref, &mut failures);
-        validate_required_text("residual_risk", &self.residual_risk, &mut failures);
-        validate_required_text("source", &self.source, &mut failures);
+        validate_required_provenance_text("run_id", &self.run_id, &mut failures);
+        validate_required_provenance_text("source_ref", &self.source_ref, &mut failures);
+        validate_required_provenance_text("residual_risk", &self.residual_risk, &mut failures);
+        validate_required_provenance_text("source", &self.source, &mut failures);
         validate_generated_at(&self.generated_at, &mut failures);
         validate_outcome_tier_combination(
             self.outcome,
@@ -373,6 +371,30 @@ fn validate_required_text(field: &str, value: &str, failures: &mut Vec<String>) 
     }
 }
 
+fn validate_required_provenance_text(field: &str, value: &str, failures: &mut Vec<String>) {
+    const PLACEHOLDER_PROVENANCE_VALUES: &[&str] = &[
+        "unknown",
+        "placeholder",
+        "fake",
+        "dummy",
+        "todo",
+        "tbd",
+        "n/a",
+        "none",
+        "unset",
+    ];
+
+    validate_required_text(field, value, failures);
+
+    let normalized = value.trim().to_ascii_lowercase();
+    if PLACEHOLDER_PROVENANCE_VALUES.contains(&normalized.as_str()) {
+        failures.push(format!(
+            "{field} must identify concrete provenance, not placeholder value `{}`",
+            value.trim()
+        ));
+    }
+}
+
 fn validate_generated_at(generated_at: &str, failures: &mut Vec<String>) {
     validate_required_text("generated_at", generated_at, failures);
     if !generated_at.trim().is_empty()
@@ -496,6 +518,36 @@ mod tests {
             .failures()
             .iter()
             .any(|failure| failure.contains("missing field `run_id`")));
+    }
+
+    #[test]
+    fn provenance_fields_reject_placeholder_values() {
+        for (field, placeholder) in [
+            ("scope", "unknown"),
+            ("run_id", "placeholder"),
+            ("source_ref", "fake"),
+            ("residual_risk", "TBD"),
+            ("source", "unset"),
+        ] {
+            let mut manifest = valid_manifest();
+            match field {
+                "scope" => manifest.scope = placeholder.to_string(),
+                "run_id" => manifest.run_id = placeholder.to_string(),
+                "source_ref" => manifest.source_ref = placeholder.to_string(),
+                "residual_risk" => manifest.residual_risk = placeholder.to_string(),
+                "source" => manifest.source = placeholder.to_string(),
+                _ => unreachable!("test only covers provenance fields"),
+            }
+
+            let err = manifest
+                .validate()
+                .expect_err("placeholder provenance must fail");
+            assert!(
+                err.failures().iter().any(|failure| failure.contains(field)
+                    && failure.contains("placeholder value")),
+                "missing placeholder provenance failure for {field}: {err:?}"
+            );
+        }
     }
 
     #[test]
