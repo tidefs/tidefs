@@ -17,9 +17,7 @@ use tidefs_dataset_lifecycle::{
     DatasetCatalog, DatasetFlags, DatasetId, DatasetType, SyncGuarantee,
 };
 use tidefs_dataset_properties::{self, PropertyKey, PropertySet, PropertyValue};
-use tidefs_local_filesystem::{
-    FileSystemStatfs, LocalFileSystem, RecoveryPolicy, RootAuthenticationKey,
-};
+use tidefs_local_filesystem::{FileSystemStatfs, LocalFileSystem, RecoveryPolicy};
 use tidefs_local_object_store::StoreOptions;
 use tidefs_types_dataset_feature_flags_core::{get_feature_class, FeatureClass, FeatureName};
 
@@ -465,8 +463,7 @@ fn open_filesystem_with_live_args(
         let metadata_dir =
             super::offline_pool::metadata_dir("dataset", operation, &config.pool_uuid);
 
-        let root_auth_key = RootAuthenticationKey::from_environment()
-            .unwrap_or_else(|_| RootAuthenticationKey::demo_key());
+        let root_auth_key = super::root_authentication_key_or_exit(&format!("dataset {operation}"));
         return match LocalFileSystem::open_with_block_devices_and_recovery_policy(
             &metadata_dir,
             devs,

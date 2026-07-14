@@ -944,8 +944,8 @@ fn open_filesystem_with_live_args(
         let pool_name = pool.unwrap_or("<unnamed>");
         let metadata_dir = import_devices_metadata_dir(devs, pool_name, operation, live_args);
 
-        let root_auth_key = RootAuthenticationKey::from_environment()
-            .unwrap_or_else(|_| RootAuthenticationKey::demo_key());
+        let root_auth_key =
+            super::root_authentication_key_or_exit(&format!("snapshot {operation}"));
         return match LocalFileSystem::open_with_block_devices_and_recovery_policy(
             &metadata_dir,
             devs,
@@ -1058,7 +1058,7 @@ fn scan_device_pool_config(
 }
 
 fn root_authentication_key() -> RootAuthenticationKey {
-    RootAuthenticationKey::from_environment().unwrap_or_else(|_| RootAuthenticationKey::demo_key())
+    super::root_authentication_key_or_exit("snapshot send")
 }
 
 fn parse_named_snapshot_operands(

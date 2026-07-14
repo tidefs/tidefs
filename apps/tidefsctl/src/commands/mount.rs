@@ -185,8 +185,7 @@ fn resolve_encryption_for_import(
     Option<tidefs_local_object_store::encrypt::EncryptionConfig>,
 ) {
     if let Some(ref path) = envelope_path {
-        let root_auth_key = tidefs_local_filesystem::RootAuthenticationKey::from_environment()
-            .unwrap_or_else(|_| tidefs_local_filesystem::RootAuthenticationKey::demo_key());
+        let root_auth_key = super::root_authentication_key_or_exit("pool mount");
         match tidefs_posix_filesystem_adapter_daemon::resolve_encryption_key_from_envelope(
             path,
             &root_auth_key,
@@ -363,8 +362,7 @@ pub fn handle_mount(args: PoolMountArgs) {
     }
     let encryption_config = if let Some(ref envelope_path) = args.encryption_envelope {
         // Resolve root auth key for envelope unwrapping.
-        let root_auth_key = tidefs_local_filesystem::RootAuthenticationKey::from_environment()
-            .unwrap_or_else(|_| tidefs_local_filesystem::RootAuthenticationKey::demo_key());
+        let root_auth_key = super::root_authentication_key_or_exit("pool mount");
         match tidefs_posix_filesystem_adapter_daemon::resolve_encryption_key_from_envelope(
             envelope_path,
             &root_auth_key,
