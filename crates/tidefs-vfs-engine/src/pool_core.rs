@@ -204,6 +204,11 @@ impl KernelPoolReplayCursor {
             clean_export,
         }
     }
+
+    #[must_use]
+    pub const fn is_stale(&self) -> bool {
+        self.intent_log_tail > self.intent_log_head
+    }
 }
 
 /// Immutable committed-root object/extent/inode import selected for a mount.
@@ -235,6 +240,9 @@ impl KernelPoolImportedRoot {
         if root_ino == 0 || inode_table_root == 0 || extent_map_root == 0 {
             return Err(KernelPoolError::MissingImportedRoot);
         }
+        if replay_cursor.is_stale() {
+            return Err(KernelPoolError::StaleReplayCursor);
+        }
         Ok(Self {
             pool_uuid,
             root_ino,
@@ -262,6 +270,7 @@ pub enum KernelPoolError {
     AlreadyMounted,
     RefcountNotZero,
     MissingImportedRoot,
+    StaleReplayCursor,
 }
 
 impl fmt::Display for KernelPoolError {
@@ -281,6 +290,9 @@ impl fmt::Display for KernelPoolError {
                     f,
                     "pool import is missing committed-root object/extent/inode state"
                 )
+            }
+            Self::StaleReplayCursor => {
+                write!(f, "pool import has stale committed-root replay cursor")
             }
         }
     }
@@ -358,6 +370,9 @@ impl KernelPoolCore {
             || imported_root.extent_map_root == 0
         {
             return Err(KernelPoolError::MissingImportedRoot);
+        }
+        if imported_root.replay_cursor.is_stale() {
+            return Err(KernelPoolError::StaleReplayCursor);
         }
         self.complete_import()?;
         self.imported_root = Some(imported_root);
@@ -705,6 +720,37 @@ mod tests {
             KernelPoolImportedRoot::new([0xABu8; 16], 1, 7, 4096, 0, replay).unwrap_err(),
             KernelPoolError::MissingImportedRoot
         );
+    }
+
+    #[test]
+    fn imported_root_rejects_stale_replay_cursor() {
+        let replay = KernelPoolReplayCursor::new(4, 5, 0, 0, 0, false);
+
+        assert!(replay.is_stale());
+        assert_eq!(
+            KernelPoolImportedRoot::new([0xABu8; 16], 1, 7, 4096, 8192, replay).unwrap_err(),
+            KernelPoolError::StaleReplayCursor
+        );
+    }
+
+    #[test]
+    fn complete_import_with_root_rejects_stale_replay_cursor() {
+        let mut pool = KernelPoolCore::new(sample_config()).expect("new");
+        let root = KernelPoolImportedRoot {
+            pool_uuid: [0xABu8; 16],
+            root_ino: 1,
+            committed_txg: 7,
+            inode_table_root: 4096,
+            extent_map_root: 8192,
+            replay_cursor: KernelPoolReplayCursor::new(4, 5, 0, 0, 0, false),
+        };
+
+        pool.begin_import().expect("begin_import");
+        let err = pool.complete_import_with_root(root).unwrap_err();
+
+        assert_eq!(err, KernelPoolError::StaleReplayCursor);
+        assert_eq!(pool.state(), KernelPoolState::Importing);
+        assert_eq!(pool.imported_root(), None);
     }
 
     #[test]
