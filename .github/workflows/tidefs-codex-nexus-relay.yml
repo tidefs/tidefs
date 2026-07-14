@@ -47,10 +47,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          : "${TIDEFS_CODEX_NEXUS_WEBHOOK_URL:?runner host must provide TIDEFS_CODEX_NEXUS_WEBHOOK_URL}"
-          : "${TIDEFS_CODEX_NEXUS_SECRET_FILE:?runner host must provide TIDEFS_CODEX_NEXUS_SECRET_FILE}"
+          if [[ -z "${TIDEFS_CODEX_NEXUS_WEBHOOK_URL:-}" ]]; then
+            echo "::notice::TIDEFS_CODEX_NEXUS_WEBHOOK_URL is not configured on this runner; skipping Nexus relay wakeup"
+            exit 0
+          fi
+          if [[ -z "${TIDEFS_CODEX_NEXUS_SECRET_FILE:-}" || ! -r "$TIDEFS_CODEX_NEXUS_SECRET_FILE" ]]; then
+            echo "::notice::TIDEFS_CODEX_NEXUS_SECRET_FILE is not readable on this runner; skipping Nexus relay wakeup"
+            exit 0
+          fi
           test -r "$GITHUB_EVENT_PATH"
-          test -r "$TIDEFS_CODEX_NEXUS_SECRET_FILE"
           export PATH="/run/current-system/sw/bin:/usr/bin:/bin:${PATH:-}"
           perl_bin="$(command -v perl)"
 
