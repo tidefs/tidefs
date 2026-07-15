@@ -805,6 +805,20 @@ fn run_snapshot_barrier_before_send(
     ctx: &SessionContext,
     key: &[u8],
 ) -> Result<SnapshotBarrierSendReport, SnapshotBarrierSendError> {
+    run_snapshot_barrier_before_send_with_config(
+        session_id,
+        ctx,
+        key,
+        SnapshotBarrierConfig::default(),
+    )
+}
+
+fn run_snapshot_barrier_before_send_with_config(
+    session_id: tidefs_transport::SessionId,
+    ctx: &SessionContext,
+    key: &[u8],
+    config: SnapshotBarrierConfig,
+) -> Result<SnapshotBarrierSendReport, SnapshotBarrierSendError> {
     let barrier_id = allocate_barrier_id();
     let snapshot_name = snapshot_barrier_send_label(barrier_id, key);
     let peer_sessions = {
@@ -822,12 +836,7 @@ fn run_snapshot_barrier_before_send(
     };
 
     let peer_ids = peer_sessions.keys().copied().collect::<Vec<_>>();
-    let coordinator = SnapshotCoordinator::new(
-        barrier_id,
-        snapshot_name,
-        peer_ids,
-        SnapshotBarrierConfig::default(),
-    );
+    let coordinator = SnapshotCoordinator::new(barrier_id, snapshot_name, peer_ids, config);
 
     let request_bytes = coordinator.request_bytes();
     {
@@ -6663,6 +6672,92 @@ mod cluster_pool_handler_tests {
             other => panic!("expected send failure, got {other:?}"),
         }
         assert!(ctx.active_barrier.lock().unwrap().is_none());
+    }
+
+    fn accept_snapshot_barrier_test_peer(transport: &mut Transport) -> tidefs_transport::SessionId {
+        for _ in 0..200 {
+            match transport.accept_incoming() {
+                Ok(sid) => return sid,
+                Err(TransportError::Generic(ref message))
+                    if message.contains("no pending connections") =>
+                {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(err) => panic!("accept peer for snapshot barrier test: {err}"),
+            }
+        }
+        panic!("timeout accepting snapshot barrier test peer");
+    }
+
+    #[test]
+    fn snapshot_barrier_before_send_clears_active_barrier_on_timeout() {
+        let mut peer_transport = Transport::new(2);
+        let bind_addr = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0);
+        peer_transport
+            .bind(tidefs_transport::TransportAddr::Tcp(bind_addr))
+            .expect("bind peer transport");
+        let bound_addr = peer_transport
+            .bind_addr
+            .clone()
+            .expect("bound peer address");
+        peer_transport.add_node(tidefs_transport::NodeInfo::new(
+            1,
+            vec![bound_addr.clone()],
+            0,
+        ));
+
+        let (peer_ready_tx, peer_ready_rx) = std::sync::mpsc::channel();
+        let (test_done_tx, test_done_rx) = std::sync::mpsc::channel();
+        let peer = thread::spawn(move || {
+            let sid = accept_snapshot_barrier_test_peer(&mut peer_transport);
+            peer_transport
+                .perform_handshake(sid)
+                .expect("peer handshake");
+            peer_ready_tx.send(()).expect("signal peer ready");
+            let _ = test_done_rx.recv_timeout(Duration::from_secs(5));
+            peer_transport
+                .close_session(sid, SessionCloseReason::LocalShutdown)
+                .ok();
+        });
+
+        let mut local_transport = Transport::new(1);
+        local_transport.add_node(tidefs_transport::NodeInfo::new(2, vec![bound_addr], 0));
+        let sid = local_transport.connect(2).expect("connect to peer");
+        local_transport
+            .perform_handshake(sid)
+            .expect("local handshake");
+        peer_ready_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("peer ready");
+
+        let (_dir, store) = frame_local_store();
+        let ctx = frame_test_context(Arc::clone(&store));
+        *ctx.transport.lock().unwrap() = local_transport;
+
+        let err = run_snapshot_barrier_before_send_with_config(
+            tidefs_transport::SessionId::new(99),
+            &ctx,
+            &[],
+            SnapshotBarrierConfig {
+                peer_timeout: Duration::ZERO,
+                ..SnapshotBarrierConfig::default()
+            },
+        )
+        .expect_err("barrier should time out without a peer response");
+
+        match err {
+            SnapshotBarrierSendError::Timeout {
+                responded, missing, ..
+            } => {
+                assert!(responded.is_empty());
+                assert_eq!(missing, vec![2]);
+            }
+            other => panic!("expected timeout, got {other:?}"),
+        }
+        assert!(ctx.active_barrier.lock().unwrap().is_none());
+
+        let _ = test_done_tx.send(());
+        peer.join().expect("peer thread");
     }
 
     #[test]
