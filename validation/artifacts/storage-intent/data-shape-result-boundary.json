@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "claim_id": "storage.intent.data_shape_honesty.v1",
+  "issue": "https://github.com/tidefs/tidefs/issues/1981",
+  "validation_tier": "source-model",
+  "artifact_scope": "source-model proof that transformed bytes do not imply authority, source retirement, degraded-read safety, or successor wording before receipts say so",
+  "reviewed_authorities": [
+    "docs/STORAGE_INTENT_POLICY_AUTHORITY.md",
+    "docs/STORAGE_INTENT_RESULT_REFUSAL_EVIDENCE_DESIGN.md",
+    "docs/CLAIMS_GATE_POLICY.md",
+    "validation/claims.toml"
+  ],
+  "boundaries": [
+    {
+      "boundary": "transformed-bytes-do-not-imply-authority",
+      "proof": "Storage-intent policy authority defines receipts as earned evidence, not labels. A transform frame, digest name, ciphertext, shard, coalesced record, or rebaked layout is only an implementation artifact until a result record names policy, evidence cut, decision, receipt or blocker, response projection, retry law, and retention proof.",
+      "required_to_strengthen": "current manifest-backed runtime evidence and a pass claim status for the exact scope"
+    },
+    {
+      "boundary": "source-retirement-requires-replacement-authority",
+      "proof": "Background layout, cost, wear, availability, coalescing, or rebake work may improve physical shape only after hard legality gates pass and source-retirement rules preserve old authority until replacement authority is published.",
+      "required_to_strengthen": "cutover receipt, old/new byte proof, rollback/refusal record, and source-retirement proof"
+    },
+    {
+      "boundary": "degraded-read-safety-requires-visible-state",
+      "proof": "A caller-visible reply must project an earned receipt, degraded-visible state, or typed refusal. EC/archive shards, cache hits, or transformed media cannot become degraded-read safety without result/refusal evidence naming the degraded state and policy permission.",
+      "required_to_strengthen": "degraded reconstruction or recall runtime rows plus result/refusal projection"
+    },
+    {
+      "boundary": "successor-wording-fail-closed",
+      "proof": "The issue comment for #1981 keeps OpenZFS/Ceph successor and comparator consumption out of this slice. Any future data-shape consumption by successor wording belongs through #2048 after #2046 and #2047 validate or explicitly remain blocked.",
+      "required_to_strengthen": "separate successor/comparator evidence and claims-gate updates outside this issue"
+    }
+  ],
+  "forbidden_inferences": [
+    "compression ratio implies capacity claim",
+    "checksum label implies integrity authority",
+    "matching digest implies legal dedupe authority",
+    "ciphertext implies encryption lifecycle proof",
+    "EC/archive label implies availability or low-latency serving",
+    "coalesced bytes imply source retirement",
+    "rebaked bytes imply degraded-read safety",
+    "source-model rows imply qemu/runtime execution",
+    "data-shape evidence implies OpenZFS/Ceph successor wording"
+  ],
+  "claim_effect": "This source-model boundary review passes only as a fail-closed result/refusal model; it does not validate runtime transform execution or performance/fault rows."
+}

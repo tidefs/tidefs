@@ -1,0 +1,91 @@
+{
+  "schema_version": 1,
+  "claim_id": "storage.intent.data_shape_honesty.v1",
+  "issue": "https://github.com/tidefs/tidefs/issues/1981",
+  "validation_tier": "qemu-guest",
+  "artifact_scope": "required performance and fault rows for data-shape honesty",
+  "outcome": "skip",
+  "skip_reason": "No qemu-guest performance or fault workload was executed in this source-model slice.",
+  "rows": [
+    {
+      "row": "cpu-cost",
+      "families": [
+        "compression",
+        "digest-checksum",
+        "dedupe",
+        "encryption",
+        "ec-archive",
+        "coalescing",
+        "rebake"
+      ],
+      "required_observation": "measure transform CPU cost under the compiled policy and expose overload, throttle, defer, or refusal instead of hidden weaker success",
+      "status": "blocked",
+      "missing_evidence": "no runtime workload, CPU measurement, receipt, or refusal row"
+    },
+    {
+      "row": "read-amplification",
+      "families": [
+        "compression",
+        "dedupe",
+        "ec-archive",
+        "coalescing",
+        "rebake"
+      ],
+      "required_observation": "measure read amplification and return exact, degraded-visible, refreshed, blocked, refused, cache-only, or unknown outcomes through result/refusal evidence",
+      "status": "blocked",
+      "missing_evidence": "no runtime read path or amplification measurement"
+    },
+    {
+      "row": "degraded-reconstruction",
+      "families": [
+        "erasure-coding",
+        "archive-shape"
+      ],
+      "required_observation": "prove degraded reconstruction or recall against the declared width and surface degraded-visible state when policy permits it",
+      "status": "blocked",
+      "missing_evidence": "no degraded EC/archive reconstruction workload"
+    },
+    {
+      "row": "key-epoch",
+      "families": [
+        "encryption"
+      ],
+      "required_observation": "prove correct key epoch binding and typed refusal for stale, wrong, missing, or unauthorized epochs",
+      "status": "blocked",
+      "missing_evidence": "no key-epoch runtime or fault injection row"
+    },
+    {
+      "row": "illegal-dedupe-domain",
+      "families": [
+        "dedupe"
+      ],
+      "required_observation": "attempt dedupe across an illegal or unknown domain and prove typed refusal without sharing authority",
+      "status": "blocked",
+      "missing_evidence": "no illegal-domain runtime row"
+    },
+    {
+      "row": "malformed-transform-frames",
+      "families": [
+        "compression",
+        "digest-checksum",
+        "encryption",
+        "coalescing",
+        "rebake"
+      ],
+      "required_observation": "inject malformed transform frames and prove refusal or recovery without generic success, generic timeout, or hidden weaker acknowledgment",
+      "status": "blocked",
+      "missing_evidence": "no malformed-frame runtime row"
+    },
+    {
+      "row": "ec-archive-under-width",
+      "families": [
+        "erasure-coding",
+        "archive-shape"
+      ],
+      "required_observation": "serve, reconstruct, or recall with too few shards/media and prove under-width refusal or explicit degraded-visible response",
+      "status": "blocked",
+      "missing_evidence": "no EC/archive under-width runtime row"
+    }
+  ],
+  "claim_effect": "The performance/fault evidence class remains blocked until qemu-guest rows record commands, topology, inputs, outputs, receipts, and refusals."
+}

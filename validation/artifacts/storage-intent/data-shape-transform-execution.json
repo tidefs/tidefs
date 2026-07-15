@@ -1,0 +1,70 @@
+{
+  "schema_version": 1,
+  "claim_id": "storage.intent.data_shape_honesty.v1",
+  "issue": "https://github.com/tidefs/tidefs/issues/1981",
+  "validation_tier": "qemu-guest",
+  "artifact_scope": "required transform-execution runtime evidence inventory for data-shape honesty",
+  "outcome": "skip",
+  "skip_reason": "No qemu-guest or mounted runtime transform execution was produced in this source-model slice.",
+  "runtime_execution_produced": false,
+  "not_evidence": [
+    "source-model rows",
+    "policy labels",
+    "transformed byte names",
+    "simulated output",
+    "compression ratio",
+    "rebake intent"
+  ],
+  "required_runtime_rows": [
+    {
+      "row": "compression-transform-execution",
+      "required_command_tier": "qemu-guest",
+      "required_observation": "write source bytes, transform through compiled policy, read/decode, and verify source and transformed digests under the same evidence cut",
+      "status": "blocked",
+      "missing_evidence": "no runtime command, guest log, decoded bytes, or receipt record"
+    },
+    {
+      "row": "digest-checksum-transform-execution",
+      "required_command_tier": "qemu-guest",
+      "required_observation": "verify source/transformed digest binding and mismatch refusal",
+      "status": "blocked",
+      "missing_evidence": "no runtime mismatch or checksum refusal row"
+    },
+    {
+      "row": "dedupe-transform-execution",
+      "required_command_tier": "qemu-guest",
+      "required_observation": "prove dedupe within a legal domain and refuse illegal or unknown domains",
+      "status": "blocked",
+      "missing_evidence": "no mounted or qemu dedupe-domain execution row"
+    },
+    {
+      "row": "encryption-transform-execution",
+      "required_command_tier": "qemu-guest",
+      "required_observation": "bind ciphertext authentication to key epoch and refuse stale or wrong epochs",
+      "status": "blocked",
+      "missing_evidence": "no runtime key-epoch or authenticated-decode row"
+    },
+    {
+      "row": "ec-archive-transform-execution",
+      "required_command_tier": "qemu-guest",
+      "required_observation": "encode/decode or recall through declared width and refuse under-width shapes",
+      "status": "blocked",
+      "missing_evidence": "no runtime EC/archive encode, decode, recall, degraded, or under-width row"
+    },
+    {
+      "row": "coalescing-transform-execution",
+      "required_command_tier": "qemu-guest",
+      "required_observation": "prove source mapping, split/replay, and refusal before source retirement",
+      "status": "blocked",
+      "missing_evidence": "no runtime coalescing receipt or rollback row"
+    },
+    {
+      "row": "rebake-transform-execution",
+      "required_command_tier": "qemu-guest",
+      "required_observation": "prove old/new byte equivalence, cutover receipt, and source-retirement boundary",
+      "status": "blocked",
+      "missing_evidence": "no runtime rebake execution, cutover, or retirement row"
+    }
+  ],
+  "claim_effect": "The transform-execution evidence class remains blocked; this artifact records the exact rows needed without widening product claims."
+}

@@ -1,0 +1,22 @@
+{
+  "manifest_version": 2,
+  "claim_id": "storage.intent.data_shape_honesty.v1",
+  "evidence_class": "storage-intent-transform-execution-evidence",
+  "validation_tier": "qemu-guest",
+  "scope": "qemu-guest transform-execution row inventory for data-shape honesty; runtime execution not produced in this slice",
+  "artifact_path": "validation/artifacts/storage-intent/data-shape-transform-execution.json",
+  "content_digest": "blake3:49fdd52d6ba7b79a2f2bed55c255b9a16d5ac45fd51b9e3dc7d7ef919679a47e",
+  "run_id": "deterministic-fixture:issue-1981-data-shape-transform-execution-v1",
+  "source_ref": "refs/heads/codex1/issue-1981-data-shape-evidence",
+  "outcome": "skip",
+  "residual_risk": "No qemu-guest or mounted runtime transform execution was produced. The evidence class remains blocked for compression, digest/checksum, dedupe, encryption, EC/archive, coalescing, and rebake behavior.",
+  "source": "issue-1981-source-review",
+  "generated_at": "2026-07-12T19:16:51Z",
+  "blocking_issues": [
+    {
+      "repo": "tidefs/tidefs",
+      "number": 1981,
+      "reason": "runtime transform-execution evidence remains unproduced"
+    }
+  ]
+}

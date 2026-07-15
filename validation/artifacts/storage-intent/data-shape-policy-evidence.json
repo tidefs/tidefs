@@ -1,0 +1,192 @@
+{
+  "schema_version": 1,
+  "claim_id": "storage.intent.data_shape_honesty.v1",
+  "issue": "https://github.com/tidefs/tidefs/issues/1981",
+  "validation_tier": "source-model",
+  "artifact_scope": "claim-level data-shape evidence model for compression, digest/checksum, dedupe, encryption, EC/archive, coalescing, and rebake result/refusal boundaries",
+  "reviewed_authorities": [
+    "validation/claims.toml",
+    "docs/STORAGE_INTENT_POLICY_AUTHORITY.md",
+    "docs/STORAGE_INTENT_RESULT_REFUSAL_EVIDENCE_DESIGN.md",
+    "docs/CLAIMS_GATE_POLICY.md",
+    "docs/CONTROL_FORMAT_AND_JSON_POLICY.md"
+  ],
+  "non_overlap": {
+    "excluded_work": [
+      "raw-store transform cleanup",
+      "encryption key lifecycle",
+      "EC authority",
+      "dedupe xfstests",
+      "placement/rebake/reclaim implementation"
+    ],
+    "excluded_claims": [
+      "capacity",
+      "performance",
+      "production readiness",
+      "release readiness",
+      "OpenZFS/Ceph successor or comparator wording"
+    ],
+    "successor_consumption_boundary": "Successor/comparator wording remains fail-closed here; any later consumption belongs through #2048 after #2046 and #2047."
+  },
+  "common_result_record_fields": [
+    "policy_id",
+    "policy_revision",
+    "evidence_cut",
+    "decision",
+    "receipt_or_blocker",
+    "response_projection",
+    "retry_law",
+    "retention_proof",
+    "source_retirement_state",
+    "degraded_visibility_state"
+  ],
+  "families": [
+    {
+      "family": "compression",
+      "policy_inputs_required": [
+        "compiled policy enabling compression for the subject scope",
+        "record-size and transform-frame limits",
+        "media and workload eligibility"
+      ],
+      "evidence_required": [
+        "source bytes digest",
+        "compressed frame digest",
+        "algorithm and parameter identity",
+        "decode verifier result",
+        "receipt binding transformed bytes to the policy revision"
+      ],
+      "receipt_or_refusal_required": "Success must cite the earned receipt; malformed frame, unsupported algorithm, stale policy, or missing verifier must return a typed refusal.",
+      "blocked_without": "current transform execution evidence and decode/runtime rows"
+    },
+    {
+      "family": "digest-checksum",
+      "policy_inputs_required": [
+        "checksum or digest profile",
+        "domain separation",
+        "record identity",
+        "source and transformed byte ranges"
+      ],
+      "evidence_required": [
+        "source digest",
+        "transformed digest",
+        "verification cut",
+        "mismatch refusal row"
+      ],
+      "receipt_or_refusal_required": "A digest label alone is not authority; the result must name the verification cut or refuse stale, missing, or contradictory evidence.",
+      "blocked_without": "runtime rows proving mismatch and malformed-frame behavior"
+    },
+    {
+      "family": "dedupe",
+      "policy_inputs_required": [
+        "dedupe domain",
+        "trust and isolation boundary",
+        "hash profile",
+        "reference ownership"
+      ],
+      "evidence_required": [
+        "candidate digest",
+        "dedupe-domain proof",
+        "collision/byte-compare proof where required",
+        "reference retention proof"
+      ],
+      "receipt_or_refusal_required": "Cross-domain or unknown-domain dedupe must refuse; a matching digest cannot imply shared authority by itself.",
+      "blocked_without": "illegal dedupe domain runtime/fault rows"
+    },
+    {
+      "family": "encryption",
+      "policy_inputs_required": [
+        "encryption policy",
+        "key epoch",
+        "nonce/IV uniqueness domain",
+        "authenticated-data profile"
+      ],
+      "evidence_required": [
+        "ciphertext authentication result",
+        "key epoch binding",
+        "plaintext-retirement state",
+        "rotation/refusal state"
+      ],
+      "receipt_or_refusal_required": "Ciphertext presence does not prove encrypted authority; stale, wrong, or unknown key epochs must project typed refusal or degraded-visible state.",
+      "blocked_without": "key-epoch runtime/fault rows and lifecycle evidence owned outside this issue"
+    },
+    {
+      "family": "erasure-coding",
+      "policy_inputs_required": [
+        "EC profile",
+        "stripe width",
+        "quorum/recovery width",
+        "placement and failure-domain policy"
+      ],
+      "evidence_required": [
+        "shard inventory",
+        "decode/reconstruction proof",
+        "degraded-visible state",
+        "under-width refusal"
+      ],
+      "receipt_or_refusal_required": "Shard bytes or EC labels cannot imply availability; under-width or unsupported media shape must refuse or expose degraded state.",
+      "blocked_without": "degraded reconstruction and under-width runtime rows"
+    },
+    {
+      "family": "archive-shape",
+      "policy_inputs_required": [
+        "archive media policy",
+        "recall policy",
+        "retention and durability floor",
+        "serving-role boundary"
+      ],
+      "evidence_required": [
+        "archive receipt",
+        "retention proof",
+        "recall/refusal evidence",
+        "serving-role limitation"
+      ],
+      "receipt_or_refusal_required": "Archive bytes do not imply low-latency serving or current degraded-read safety without a receipt naming that role.",
+      "blocked_without": "EC/archive under-width and recall/refusal rows"
+    },
+    {
+      "family": "coalescing",
+      "policy_inputs_required": [
+        "coalescing policy",
+        "source record identity",
+        "ordering and split/replay rules",
+        "retention cut"
+      ],
+      "evidence_required": [
+        "source-to-coalesced mapping",
+        "digest coverage",
+        "rollback/split proof",
+        "source retirement proof"
+      ],
+      "receipt_or_refusal_required": "Coalesced layout can improve cost only after legality gates pass; it cannot retire sources until replacement authority is published.",
+      "blocked_without": "transform execution and source-retirement result records"
+    },
+    {
+      "family": "rebake",
+      "policy_inputs_required": [
+        "rebake intent",
+        "replacement policy",
+        "cutover gate",
+        "old-source preservation rule"
+      ],
+      "evidence_required": [
+        "old and new byte digests",
+        "cutover receipt",
+        "rollback/refusal record",
+        "source-retirement proof"
+      ],
+      "receipt_or_refusal_required": "Rebake intent, new layout, or transformed bytes do not imply source retirement, degraded-read safety, or successor wording before receipts say so.",
+      "blocked_without": "action execution, result/refusal, and runtime transform evidence"
+    }
+  ],
+  "claim_boundary": {
+    "passes_here": "This artifact defines the claim-level evidence model and fail-closed boundaries.",
+    "does_not_prove": [
+      "mounted transform execution",
+      "qemu guest transform execution",
+      "performance cost",
+      "fault handling",
+      "capacity improvement",
+      "production readiness"
+    ]
+  }
+}

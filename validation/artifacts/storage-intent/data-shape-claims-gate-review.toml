@@ -1,0 +1,44 @@
+schema_version = 1
+claim_id = "storage.intent.data_shape_honesty.v1"
+issue = "https://github.com/tidefs/tidefs/issues/1981"
+validation_tier = "source-model"
+review_scope = "claims-gate source review for data-shape policy evidence, transform execution, performance/fault rows, and result/refusal boundaries"
+review_outcome = "blocked"
+decision = "The claim remains blocked. Source-model policy and result-boundary artifacts are present in this slice, but qemu-guest transform-execution and performance/fault evidence remains unproduced."
+
+reviewed_artifacts = [
+  "validation/artifacts/storage-intent/data-shape-policy-evidence.json",
+  "validation/artifacts/storage-intent/data-shape-transform-execution.json",
+  "validation/artifacts/storage-intent/data-shape-performance-fault-rows.json",
+  "validation/artifacts/storage-intent/data-shape-result-boundary.json",
+]
+
+reviewed_authorities = [
+  "validation/claims.toml",
+  "docs/CLAIMS_GATE_POLICY.md",
+  "docs/STORAGE_INTENT_POLICY_AUTHORITY.md",
+  "docs/STORAGE_INTENT_RESULT_REFUSAL_EVIDENCE_DESIGN.md",
+  "docs/CONTROL_FORMAT_AND_JSON_POLICY.md",
+]
+
+missing_evidence = [
+  "qemu-guest transform execution for compression, digest/checksum, dedupe, encryption, EC/archive, coalescing, and rebake",
+  "qemu-guest CPU cost rows",
+  "qemu-guest read amplification rows",
+  "qemu-guest degraded reconstruction rows",
+  "qemu-guest key epoch rows",
+  "qemu-guest illegal dedupe domain rows",
+  "qemu-guest malformed transform frame rows",
+  "qemu-guest EC/archive under-width rows",
+]
+
+non_claim_boundaries = [
+  "No raw-store cleanup, encryption lifecycle, EC authority, dedupe xfstests, or placement/rebake/reclaim implementation is absorbed.",
+  "No compression, dedupe, encryption, EC/archive, capacity, performance, production, release-readiness, or OpenZFS/Ceph successor/comparator wording is widened.",
+  "Transformed bytes, labels, simulated output, and source-model rows remain non-authoritative until receipts and runtime evidence validate."
+]
+
+[registry_effect]
+claims_toml_changed = false
+claim_status_after_review = "blocked"
+stronger_wording_allowed = false

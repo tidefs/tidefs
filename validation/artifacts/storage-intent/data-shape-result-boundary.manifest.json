@@ -1,0 +1,16 @@
+{
+  "manifest_version": 2,
+  "claim_id": "storage.intent.data_shape_honesty.v1",
+  "evidence_class": "storage-intent-data-shape-result-boundary",
+  "validation_tier": "source-model",
+  "scope": "source-model result/refusal boundary proving transformed bytes do not imply authority, source retirement, degraded-read safety, or successor wording",
+  "artifact_path": "validation/artifacts/storage-intent/data-shape-result-boundary.json",
+  "content_digest": "blake3:fa92cd450d677c41152b0b2a0a9741e66f686d058655cf36d27912e2c6306860",
+  "run_id": "deterministic-fixture:issue-1981-data-shape-result-boundary-v1",
+  "source_ref": "refs/heads/codex1/issue-1981-data-shape-evidence",
+  "outcome": "pass",
+  "residual_risk": "This boundary review is source-model evidence only. It does not prove qemu transform execution, performance/fault behavior, degraded reconstruction, source retirement execution, or successor/comparator wording.",
+  "source": "issue-1981-source-review",
+  "generated_at": "2026-07-12T19:16:51Z",
+  "blocking_issues": []
+}
