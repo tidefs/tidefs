@@ -4737,8 +4737,8 @@ static int tidefs_posix_vfs_set_acl(struct mnt_idmap *idmap,
 
 	/* Encode the ACL into binary xattr format. */
 	value = posix_acl_to_xattr(&init_user_ns, acl_to_store, &size, GFP_KERNEL);
-	if (IS_ERR(value)) {
-		ret = PTR_ERR(value);
+	if (!value) {
+		ret = -ENOMEM;
 		goto out_release_acl;
 	}
 
