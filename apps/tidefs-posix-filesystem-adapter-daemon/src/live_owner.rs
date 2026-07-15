@@ -458,10 +458,10 @@ fn pool_mount_refused(
     request: &LivePoolAdminRequest,
     manifest: &LiveOwnerManifest,
 ) -> LivePoolAdminResponse {
-    let mountpoint = request_arg_str(&request.args, "mountpoint").unwrap_or("<unspecified>");
-    let dataset = request_arg_str(&request.args, "dataset").unwrap_or("root");
-    let read_only = request_arg_bool(&request.args, "read_only").unwrap_or(false);
-    let relatime = request_arg_bool(&request.args, "relatime").unwrap_or(false);
+    let (mountpoint, dataset, read_only, relatime) = match pool_mount_request_args(&request.args) {
+        Ok(args) => args,
+        Err(err) => return live_admin_typed_error(err),
+    };
     let message = format!(
         "pool mount for already-imported pool '{}' must be performed by the live owner; the current {} owner has no secondary mount implementation for mountpoint '{}' dataset '{}' (read_only={}, relatime={})",
         manifest.pool_name,
@@ -472,6 +472,18 @@ fn pool_mount_refused(
         relatime,
     );
     LivePoolAdminResponse::error(1, message)
+}
+
+fn pool_mount_request_args(
+    args: &LivePoolAdminArgs,
+) -> Result<(&str, &str, bool, bool), LivePoolAdminError> {
+    validate_request_arg_names(args, &["mountpoint", "dataset", "read_only", "relatime"])?;
+    Ok((
+        request_arg_str(args, "mountpoint")?.unwrap_or("<unspecified>"),
+        request_arg_str(args, "dataset")?.unwrap_or("root"),
+        request_arg_bool(args, "read_only")?.unwrap_or(false),
+        request_arg_bool(args, "relatime")?.unwrap_or(false),
+    ))
 }
 
 fn pool_export(
@@ -505,7 +517,10 @@ fn pool_destroy_refused(
     request: &LivePoolAdminRequest,
     manifest: &LiveOwnerManifest,
 ) -> LivePoolAdminResponse {
-    let details = pool_destroy_refusal_details(request, manifest);
+    let details = match pool_destroy_refusal_details(request, manifest) {
+        Ok(details) => details,
+        Err(err) => return live_admin_typed_error(err),
+    };
     let message = pool_destroy_refusal_message(&details, manifest);
     if request.output.wants_json() {
         LivePoolAdminResponse::error_machine_json(
@@ -545,9 +560,10 @@ struct PoolDestroyRefusalDetails {
 fn pool_destroy_refusal_details(
     request: &LivePoolAdminRequest,
     manifest: &LiveOwnerManifest,
-) -> PoolDestroyRefusalDetails {
-    let force = request_arg_bool(&request.args, "force").unwrap_or(false);
-    let zero_superblock = request_arg_bool(&request.args, "zero_superblock").unwrap_or(false);
+) -> Result<PoolDestroyRefusalDetails, LivePoolAdminError> {
+    validate_request_arg_names(&request.args, &["force", "zero_superblock"])?;
+    let force = request_arg_bool(&request.args, "force")?.unwrap_or(false);
+    let zero_superblock = request_arg_bool(&request.args, "zero_superblock")?.unwrap_or(false);
     let safe_path = format!(
         "tidefsctl pool export {}; tidefsctl pool destroy {} --devices <exported-device>...{}",
         manifest.pool_name,
@@ -558,7 +574,7 @@ fn pool_destroy_refusal_details(
             ""
         },
     );
-    PoolDestroyRefusalDetails {
+    Ok(PoolDestroyRefusalDetails {
         force,
         zero_superblock,
         safe_path,
@@ -566,7 +582,7 @@ fn pool_destroy_refusal_details(
         label_superblock_action: "none",
         crash_retry: "no destructive live-owner action has started; retry after the pool is exported/offline",
         claim_boundary: "local-pool-device-lifecycle remains blocked until runtime/device evidence validates live-owner destroy behavior",
-    }
+    })
 }
 
 fn pool_destroy_refusal_json(
@@ -625,17 +641,41 @@ fn pool_destroy_refusal_text(details: &PoolDestroyRefusalDetails, message: &str)
     )
 }
 
-fn request_arg_bool(args: &LivePoolAdminArgs, name: &str) -> Option<bool> {
+fn validate_request_arg_names(
+    args: &LivePoolAdminArgs,
+    allowed: &[&str],
+) -> Result<(), LivePoolAdminError> {
+    if let Some(name) = args.0.keys().find(|name| !allowed.contains(&name.as_str())) {
+        return Err(LivePoolAdminError::malformed(format!(
+            "live-owner request has unsupported argument '{name}'"
+        )));
+    }
+    Ok(())
+}
+
+fn request_arg_bool(
+    args: &LivePoolAdminArgs,
+    name: &str,
+) -> Result<Option<bool>, LivePoolAdminError> {
     match args.0.get(name) {
-        Some(LivePoolAdminArg::Bool(value)) => Some(*value),
-        _ => None,
+        None | Some(LivePoolAdminArg::Null) => Ok(None),
+        Some(LivePoolAdminArg::Bool(value)) => Ok(Some(*value)),
+        Some(_) => Err(LivePoolAdminError::malformed(format!(
+            "live-owner request argument '{name}' must be a boolean"
+        ))),
     }
 }
 
-fn request_arg_str<'a>(args: &'a LivePoolAdminArgs, name: &str) -> Option<&'a str> {
+fn request_arg_str<'a>(
+    args: &'a LivePoolAdminArgs,
+    name: &str,
+) -> Result<Option<&'a str>, LivePoolAdminError> {
     match args.0.get(name) {
-        Some(LivePoolAdminArg::String(value)) => Some(value.as_str()),
-        _ => None,
+        None | Some(LivePoolAdminArg::Null) => Ok(None),
+        Some(LivePoolAdminArg::String(value)) => Ok(Some(value.as_str())),
+        Some(_) => Err(LivePoolAdminError::malformed(format!(
+            "live-owner request argument '{name}' must be a string"
+        ))),
     }
 }
 
@@ -937,6 +977,20 @@ mod tests {
         assert!(error.contains("no secondary mount implementation"));
     }
 
+    #[test]
+    fn pool_mount_malformed_arg_type_fails_closed() {
+        let manifest = manifest();
+        let mut request = LivePoolAdminRequest::new(LivePoolAdminCommand::PoolMount, "tank");
+        request.args.0.insert(
+            "read_only".to_string(),
+            LivePoolAdminArg::String("yes".to_string()),
+        );
+
+        let message = assert_typed_malformed(pool_mount_refused(&request, &manifest));
+
+        assert!(message.contains("argument 'read_only' must be a boolean"));
+    }
+
     fn destroy_request(wants_json: bool) -> LivePoolAdminRequest {
         LivePoolAdminRequest {
             version: LIVE_POOL_ADMIN_PROTOCOL_VERSION,
@@ -1022,6 +1076,20 @@ mod tests {
             .unwrap();
         assert!(error.contains("fail-closed"));
         assert!(!error.contains("not implemented"));
+    }
+
+    #[test]
+    fn pool_destroy_unknown_arg_fails_closed() {
+        let manifest = manifest();
+        let mut request = destroy_request(false);
+        request
+            .args
+            .0
+            .insert("unexpected".to_string(), LivePoolAdminArg::Bool(true));
+
+        let message = assert_typed_malformed(pool_destroy_refused(&request, &manifest));
+
+        assert!(message.contains("unsupported argument 'unexpected'"));
     }
 
     #[test]
