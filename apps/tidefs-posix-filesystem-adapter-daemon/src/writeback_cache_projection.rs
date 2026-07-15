@@ -24,7 +24,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use crate::fuse_vfs_adapter::DirtyRanges;
 use crate::mmap_coherency::MmapCoherency;
@@ -144,9 +144,12 @@ pub struct WritebackProjection {
     lanes: Mutex<BTreeMap<u64, WritebackLane>>,
     /// Reference to the adapter's PageCache for dirty-page mirror tracking.
     page_cache: Option<Arc<PageCache>>,
-    /// Reference to the adapter's mmap coherency for dirty-state-aware
-    /// invalidation guards.
-    mmap_coherency: Arc<MmapCoherency>,
+    /// Non-owning reference to the adapter's mmap coherency for
+    /// dirty-state-aware invalidation guards.
+    ///
+    /// The mmap dirty-check callback retains this projection, so retaining
+    /// the mmap manager here would form a strong reference cycle.
+    mmap_coherency: Weak<MmapCoherency>,
     /// Atomic projection counters.
     pub stats: WritebackProjectionStats,
 }
@@ -158,15 +161,15 @@ impl WritebackProjection {
     /// for dirty-page mirror tracking).  When [`None`], the projection
     /// tracks lane transitions but does not inspect cache-internal state.
     ///
-    /// `mmap_coherency` is the adapter's [`MmapCoherency`] cell; the
-    /// projection uses it to check mmap registration during invalidation
-    /// guards.
+    /// `mmap_coherency` is the adapter's [`MmapCoherency`] cell; the adapter
+    /// remains its owner while the projection keeps a non-owning reference
+    /// for installing invalidation guards.
     #[must_use]
     pub fn new(page_cache: Option<Arc<PageCache>>, mmap_coherency: Arc<MmapCoherency>) -> Self {
         Self {
             lanes: Mutex::new(BTreeMap::new()),
             page_cache,
-            mmap_coherency,
+            mmap_coherency: Arc::downgrade(&mmap_coherency),
             stats: WritebackProjectionStats::new(),
         }
     }
@@ -376,17 +379,19 @@ impl WritebackProjection {
     /// Install this projection as the dirty/writeback guard for mmap
     /// invalidation.
     pub fn install_mmap_dirty_check(self: &Arc<Self>) {
+        let Some(mmap_coherency) = self.mmap_coherency.upgrade() else {
+            return;
+        };
         let projection = Arc::clone(self);
-        self.mmap_coherency
-            .set_dirty_check(Some(Box::new(move |ino| {
-                !projection.invalidation_allowed(ino)
-            })));
+        mmap_coherency.set_dirty_check(Some(Box::new(move |ino| {
+            !projection.invalidation_allowed(ino)
+        })));
     }
 
-    /// Return a clone of the mmap coherency arc for the adapter.
+    /// Return the mmap coherency manager while its adapter owner is alive.
     #[must_use]
-    pub fn mmap_coherency(&self) -> Arc<MmapCoherency> {
-        Arc::clone(&self.mmap_coherency)
+    pub fn mmap_coherency(&self) -> Option<Arc<MmapCoherency>> {
+        self.mmap_coherency.upgrade()
     }
 }
 
@@ -604,6 +609,22 @@ mod tests {
         assert_eq!(mmap_stats.dirty_invalidations_preserved, 1);
         assert_eq!(mmap_stats.pages_invalidated, 0);
         assert_eq!(projection.stats_snapshot().invalidation_skips_dirty, 1);
+    }
+
+    #[test]
+    fn installed_mmap_dirty_check_does_not_form_reference_cycle() {
+        let notifier = Arc::new(Mutex::new(None));
+        let mmap = Arc::new(MmapCoherency::new(notifier));
+        let projection = Arc::new(WritebackProjection::new(None, Arc::clone(&mmap)));
+        let mmap_weak = Arc::downgrade(&mmap);
+        let projection_weak = Arc::downgrade(&projection);
+
+        projection.install_mmap_dirty_check();
+        drop(projection);
+        drop(mmap);
+
+        assert!(mmap_weak.upgrade().is_none());
+        assert!(projection_weak.upgrade().is_none());
     }
 
     #[test]
