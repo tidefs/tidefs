@@ -619,7 +619,6 @@ OpenZFS/Ceph successor status.
 | `docs/STORAGE_INTENT_SERVICE_OBJECTIVE_DESIGN.md` | Current spec | Scoped current spec for GitHub issue #915 service-objective evidence: objective identity, workload and operation scope, latency percentile/tail, throughput/burst/dwell, topology/media/proximity, RPO/RTO, isolation, capacity, cost, wear, decision/action, measurement, comparator, claim, and typed refusal requirements. It is not runtime implementation evidence, a performance-validation artifact, or a superiority claim over OpenZFS, Ceph, DRBD, or any other system. |
 | `docs/STORAGE_INTENT_RESULT_REFUSAL_EVIDENCE_DESIGN.md` | Current spec | Scoped current spec for GitHub issue #920 result/refusal evidence: caller-visible outcome identity, policy/query/decision/receipt refs, degraded-visible state, service-objective/admission/action blockers, response-registry projection, retryability, caller compression, and retention/audit requirements. It is not runtime implementation evidence, a response-registry runtime, a POSIX errno validation artifact, or a product-readiness claim. |
 | `docs/MEMBERSHIP_CONFIG_QUORUM_SET_IDENTITY_OW302B.md` | Current spec | Scoped current spec for deterministic joint quorum-set identity in `crates/tidefs-membership-epoch`. It does not validate a full cluster-membership service. |
-| `docs/ERASURE_CODED_LAYOUT_OW306.md` | Current spec | Scoped current spec for the deterministic single-parity erasure layout model in `crates/tidefs-replication-model`. It is not production erasure-coding placement or rebuild evidence. |
 | `docs/POOL_WIDE_REDUNDANCY_PLACEMENT_CONTRACT.md` | Current spec | Scoped current spec for pool-wide placement contract and property-tested local model behavior. It does not prove distributed availability, rebake, recovery, or operator lifecycle behavior. |
 | `docs/LOCAL_DISTRIBUTED_RECEIPT_AUTHORITY.md` | Current spec | Scoped current spec for the issue #18 placement receipt authority split, including the shared `PlacementReceiptRef` policy-satisfying gate and remaining follow-up issues #674, #675, and #676. It is not a closure claim for distributed availability, rebuild, rebake, reclaim, or runtime validation. |
 | `docs/RAM_AUTHORITY_DESIGN.md` | Current spec | Scoped current spec for the issue #847 RAM authority boundary: `ram-volatile-local`, `ram-volatile-replicated`, `ram-intent-backed`, and `pmem-durable` semantics, receipts, failure behavior, policy-transition rules, resource-governor boundaries, and operator explanation requirements. It is not runtime implementation, PMem platform validation, distributed quorum proof, or POSIX durability evidence. |
@@ -973,4 +972,18 @@ in git, issue #1702, and its pull request only. Current authority remains with
 and live GitHub issues/PRs. This deletion does not promote production
 erasure-coding placement, recovery-loop completion, rebalance performance,
 distributed availability, release readiness, OpenZFS/Ceph parity, or
+successor/comparator wording.
+
+### Erasure Layout OW Note Deletion (TFR-019 / #1914)
+
+Issue #1914 deleted `docs/ERASURE_CODED_LAYOUT_OW306.md` after folding the
+bounded single-parity XOR layout boundary into
+`docs/ERASURE_CODED_STORE_AUTHORITY.md` and retargeting
+`check-erasure-coded-layout` away from the standalone OW note. Its lineage
+remains in git, issue #1914, and its pull request only. Current authority
+remains with `crates/tidefs-replication-model`,
+`docs/ERASURE_CODED_STORE_AUTHORITY.md`, `check-erasure-coded-layout`,
+validation claims, and live GitHub issues/PRs. This deletion does not promote
+production erasure-coding placement, distributed rebuild/runtime,
+kernel/block-device erasure coding, release readiness, OpenZFS/Ceph parity, or
 successor/comparator wording.
