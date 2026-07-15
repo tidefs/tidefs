@@ -2394,7 +2394,7 @@ fn print_help() {
     println!("  check-group cluster       run all cluster checks (7 checks)");
     println!("  check-group block         run all block-volume checks (26 checks)");
     println!("  check-group storage       run all storage checks (36 checks)");
-    println!("  check-group claims        run claims gate + work ownership + kernel closure checks (6 checks)");
+    println!("  check-group claims        run claims gate + work ownership checks (3 checks)");
     println!("  check-group all           run all 80 checks, report all failures");
     println!();
     println!("  --- Individual check commands ---");
@@ -2631,32 +2631,6 @@ fn print_help() {
     );
     println!("  check-claim-gate        validate current worktree has a valid GitHub issue owner");
     println!("  check-worktree-claim    alias for check-claim-gate");
-    println!(
-        "  check-stale-claims      unsupported: the legacy Forgejo claim tracker has been retired"
-    );
-    println!(
-        "  check-stale-forgejo-claims unsupported: the legacy Forgejo claim tracker has been retired"
-    );
-    println!(
-        "  check-duplicate-claims  unsupported: the legacy Forgejo claim tracker has been retired"
-    );
-    println!(
-        "  check-duplicate-forgejo-claims unsupported: the legacy Forgejo claim tracker has been retired"
-    );
-    println!("  auto-release-stale-claims unsupported: the legacy Forgejo claim tracker has been retired");
-    println!(
-        "  auto-release-stale   unsupported: the legacy Forgejo claim tracker has been retired"
-    );
-    println!(
-        "  auto-release         unsupported: the legacy Forgejo claim tracker has been retired"
-    );
-    println!(
-        "  coordination-health      unsupported: the legacy Forgejo claim tracker has been retired"
-    );
-    println!(
-        "  coordination-health-report unsupported: the legacy Forgejo claim tracker has been retired"
-    );
-    println!("  acquire-claim|claim-issue unsupported: the legacy Forgejo claim tracker has been retired");
     println!("  check-abandoned-worktrees detect stale local worktree directories");
     println!("  check-stale-worktrees   alias for check-abandoned-worktrees");
     println!("  check-local-filesystem   validate the local filesystem MVP source slice");
