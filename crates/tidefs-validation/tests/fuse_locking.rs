@@ -91,10 +91,11 @@ fn getlk(fd: &impl AsRawFd, fl: &libc::flock) -> Result<libc::flock, i32> {
 /// pipe.  Once the child has acquired the lock, it writes a single byte
 /// to the pipe.  The parent reads that byte to synchronise.
 ///
-/// SAFETY: calls `libc::fork`.  The child must not panic, allocate, or
+/// # Safety
+///
+/// Calls `libc::fork`. The caller must ensure this helper runs in a
+/// single-threaded test context where the child will not panic, allocate, or
 /// call async-signal-unsafe functions beyond what POSIX allows.
-// SAFETY: fork() is a POSIX system call; safe to call from a single-
-// threaded test environment. The caller must ensure no other threads exist.
 unsafe fn fork_lock_holder(file_path: &Path, bytes_len: u64) -> io::Result<(i32, i32)> {
     // Create a pipe for synchronisation: child writes a byte when the
     // lock is acquired.
