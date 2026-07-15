@@ -29,6 +29,10 @@ const FOREGROUND_READ_NOT_BLOCKED_CLAIM_ID: &str =
     "perf.local.foreground_read_not_blocked_by_scrub.v1";
 const SOURCE_ISSUE: &str = "https://github.com/tidefs/tidefs/issues/1792";
 const SOURCE_LABEL: &str = "qemu-smoke-scrub-foreground-read-runtime";
+const BLOCKING_ISSUE_REPO: &str = "tidefs/tidefs";
+const BLOCKING_ISSUE_NUMBER: u64 = 1792;
+const BLOCKING_ISSUE_REASON: &str =
+    "scrub foreground-read runtime evidence and claims-gate review remain open";
 const BACKGROUND_SCRUB_INTERVAL_SECS: u64 = 1;
 const FOREGROUND_READ_BYTES: usize = 128 * 1024;
 const FOREGROUND_READ_ITERATIONS: u32 = 8;
@@ -379,7 +383,19 @@ pub fn build_evidence_manifest(
         residual_risk: SCRUB_READ_RESIDUAL_RISK.to_string(),
         source: SOURCE_LABEL.to_string(),
         generated_at: evidence.generated_at.clone(),
-        blocking_issues: Vec::<BlockingIssueRef>::new(),
+        blocking_issues: evidence_manifest_blocking_issues(evidence.outcome),
+    }
+}
+
+fn evidence_manifest_blocking_issues(outcome: ValidationStatus) -> Vec<BlockingIssueRef> {
+    if outcome == ValidationStatus::Pass {
+        Vec::new()
+    } else {
+        vec![BlockingIssueRef {
+            repo: Some(BLOCKING_ISSUE_REPO.to_string()),
+            number: BLOCKING_ISSUE_NUMBER,
+            reason: Some(BLOCKING_ISSUE_REASON.to_string()),
+        }]
     }
 }
 
@@ -928,6 +944,11 @@ mod tests {
     use super::*;
 
     #[test]
+    fn pass_manifest_outcome_has_no_blocking_issues() {
+        assert!(evidence_manifest_blocking_issues(ValidationStatus::Pass).is_empty());
+    }
+
+    #[test]
     fn fuse_mount_unavailable_records_environment_refusal() {
         let service_curve = build_service_curve();
         let mount_error =
@@ -1043,6 +1064,17 @@ mod tests {
             "unscheduled_max_scrub_queue_depth={}",
             evidence.service_curve.unscheduled_max_scrub_queue_depth
         )));
+        assert_eq!(manifest.blocking_issues.len(), 1);
+        assert_eq!(
+            manifest.blocking_issues[0].repo.as_deref(),
+            Some(BLOCKING_ISSUE_REPO)
+        );
+        assert_eq!(manifest.blocking_issues[0].number, BLOCKING_ISSUE_NUMBER);
+        assert_eq!(
+            manifest.blocking_issues[0].reason.as_deref(),
+            Some(BLOCKING_ISSUE_REASON)
+        );
+        assert!(manifest.validate().is_ok());
     }
 
     #[test]
