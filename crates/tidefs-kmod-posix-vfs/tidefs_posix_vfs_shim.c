@@ -4757,6 +4757,8 @@ static int tidefs_posix_vfs_set_acl(struct mnt_idmap *idmap,
 		goto out_release_acl;
 
 sync_mode:
+	/* The xattr is authoritative even if the mode update below fails. */
+	forget_cached_acl(inode, type);
 	if (mode_changed) {
 		ctime = current_time(inode);
 		ret = tidefs_posix_vfs_engine_setattr(
@@ -4775,7 +4777,6 @@ sync_mode:
 		mark_inode_dirty(inode);
 	}
 
-	forget_cached_acl(inode, type);
 	ret = 0;
 
 out_release_acl:
