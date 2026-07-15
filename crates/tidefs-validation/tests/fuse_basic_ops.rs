@@ -5,10 +5,13 @@
 //! `fuse_create_unlink_dispatch.rs`, `fuse_create_mutation.rs`, and
 //! `fuse_rename.rs` and validates namespace state after each mutation.
 //!
-//! This test directly satisfies the advancement criteria of the `fuse-basic-ops`
-//! focus slice: *create/mkdir/rmdir/unlink/rename complete successfully via real
-//! FUSE mount* and *namespace mutations survive remount*. Includes write-read
-//! byte-identity verification and a full-cycle remount-verify-empty test.
+//! These are mounted-runtime-gated checks for the `fuse-basic-ops` focus slice:
+//! *create/mkdir/rmdir/unlink/rename complete successfully via real FUSE mount*
+//! and *namespace mutations survive remount*. Ordinary test runs ignore them
+//! unless explicitly requested; when run without the daemon/FUSE substrate, they
+//! fail closed with runtime-refusal receipts rather than reporting mounted
+//! product proof. Includes write-read byte-identity verification and a
+//! full-cycle remount-verify-empty test.
 
 use std::os::unix::fs::MetadataExt;
 use tidefs_validation::mount_harness::MountHarness;
@@ -18,10 +21,9 @@ use tidefs_validation::mount_harness::MountHarness;
 /// Create a regular file at the mount root, then verify it appears in readdir
 /// and that `exists` returns true.
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn create_file_at_root() {
-    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
-        return;
-    };
+    let harness = MountHarness::new_or_fail("create_file_at_root");
     harness
         .create_file("test_create.txt", b"hello create\n")
         .expect("create_file");
@@ -39,10 +41,9 @@ fn create_file_at_root() {
 
 /// Create a file inside a subdirectory, verifying the full path exists.
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn create_file_in_subdir() {
-    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
-        return;
-    };
+    let harness = MountHarness::new_or_fail("create_file_in_subdir");
     harness.mkdir("sub").expect("mkdir sub");
     harness
         .create_file("sub/file_in_sub.txt", b"nested create\n")
@@ -59,10 +60,9 @@ fn create_file_in_subdir() {
 /// Create a directory and verify it appears in readdir and has directory
 /// metadata.
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn mkdir_and_verify() {
-    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
-        return;
-    };
+    let harness = MountHarness::new_or_fail("mkdir_and_verify");
     harness.mkdir("mydir").expect("mkdir mydir");
 
     assert!(harness.exists("mydir"), "mydir must exist after mkdir");
@@ -78,10 +78,9 @@ fn mkdir_and_verify() {
 
 /// Create nested directories and verify the tree.
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn mkdir_nested() {
-    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
-        return;
-    };
+    let harness = MountHarness::new_or_fail("mkdir_nested");
     harness.mkdir_all("a/b/c").expect("mkdir_all a/b/c");
 
     assert!(harness.exists("a"));
@@ -103,10 +102,9 @@ fn mkdir_nested() {
 
 /// Remove a file and verify it disappears from readdir.
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn unlink_file() {
-    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
-        return;
-    };
+    let harness = MountHarness::new_or_fail("unlink_file");
     harness
         .create_file("to_unlink.txt", b"ephemeral\n")
         .expect("create_file");
@@ -129,10 +127,9 @@ fn unlink_file() {
 
 /// Remove an empty directory and verify it disappears.
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn rmdir_empty_dir() {
-    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
-        return;
-    };
+    let harness = MountHarness::new_or_fail("rmdir_empty_dir");
     harness.mkdir("to_rmdir").expect("mkdir to_rmdir");
     assert!(harness.exists("to_rmdir"));
 
@@ -151,10 +148,9 @@ fn rmdir_empty_dir() {
 
 /// Remove a file inside a subdirectory, then remove the subdirectory itself.
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn unlink_then_rmdir() {
-    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
-        return;
-    };
+    let harness = MountHarness::new_or_fail("unlink_then_rmdir");
     harness.mkdir("d").expect("mkdir d");
     harness
         .create_file("d/f.txt", b"inside\n")
@@ -169,10 +165,9 @@ fn unlink_then_rmdir() {
 
 /// Removing a non-empty directory should fail with a POSIX error.
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn rmdir_non_empty_dir_fails() {
-    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
-        return;
-    };
+    let harness = MountHarness::new_or_fail("rmdir_non_empty_dir_fails");
     harness.mkdir("nonempty").expect("mkdir nonempty");
     harness
         .create_file("nonempty/child.txt", b"block rmdir\n")
@@ -192,10 +187,9 @@ fn rmdir_non_empty_dir_fails() {
 /// rmdir → verify.  This exercises all four dispatch paths in one test and
 /// mirrors the advancement criterion 1 sequence.
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn basic_ops_full_cycle() {
-    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
-        return;
-    };
+    let harness = MountHarness::new_or_fail("basic_ops_full_cycle");
 
     // ── Phase 1: mkdir ───────────────────────────────────────────────
     harness.mkdir("basicdir").expect("mkdir basicdir");
@@ -325,14 +319,9 @@ fn basic_ops_full_cycle() {
 /// - create/mkdir/rmdir/unlink/rename succeed via real FUSE mount
 /// - namespace mutations survive remount
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn basic_ops_cycle_with_remount() {
-    let mut harness = match MountHarness::new() {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("SKIP basic_ops_cycle_with_remount: daemon not available -- {e}");
-            return;
-        }
-    };
+    let mut harness = MountHarness::new_or_fail("basic_ops_cycle_with_remount");
 
     // ── Phase 1: mkdir ───────────────────────────────────────────────
     harness.mkdir("cycledir").expect("mkdir cycledir");
@@ -447,10 +436,9 @@ fn basic_ops_cycle_with_remount() {
 /// Verify that file content written during create survives same-session
 /// read after other basic-ops traffic in the same directory.
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn file_content_integrity_through_ops() {
-    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
-        return;
-    };
+    let harness = MountHarness::new_or_fail("file_content_integrity_through_ops");
     harness.mkdir("datadir").expect("mkdir datadir");
 
     let data_a = b"file A: 0123456789abcdef\n".to_vec();
@@ -484,10 +472,9 @@ fn file_content_integrity_through_ops() {
 /// each step.  This exercises the create and unlink dispatch paths repeatedly
 /// within a single session.
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn multi_file_create_unlink_sequence() {
-    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
-        return;
-    };
+    let harness = MountHarness::new_or_fail("multi_file_create_unlink_sequence");
     harness.mkdir("multidir").expect("mkdir multidir");
 
     let names: Vec<String> = (0..8).map(|i| format!("file_{i:02}.txt")).collect();
@@ -558,10 +545,9 @@ fn multi_file_create_unlink_sequence() {
 /// Create a hard link to a regular file and verify both names exist,
 /// point to the same inode, and have nlink >= 2.
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn hard_link_creates_new_name() {
-    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
-        return;
-    };
+    let harness = MountHarness::new_or_fail("hard_link_creates_new_name");
     harness
         .create_file("original.txt", b"to be linked\n")
         .expect("create_file original.txt");
@@ -606,10 +592,9 @@ fn hard_link_creates_new_name() {
 
 /// Hard link preserves byte content: both names read the same data.
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn hard_link_preserves_content() {
-    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
-        return;
-    };
+    let harness = MountHarness::new_or_fail("hard_link_preserves_content");
     let data = b"shared content across hard links\n".to_vec();
     harness
         .create_file("shared.dat", &data)
@@ -631,10 +616,9 @@ fn hard_link_preserves_content() {
 
 /// Hard link from a nonexistent source must fail with ENOENT.
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn hard_link_nonexistent_source_returns_enoent() {
-    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
-        return;
-    };
+    let harness = MountHarness::new_or_fail("hard_link_nonexistent_source_returns_enoent");
 
     let src = harness.mount_path().join("no_such_file");
     let dst = harness.mount_path().join("would_be_link");
@@ -658,10 +642,9 @@ fn hard_link_nonexistent_source_returns_enoent() {
 
 /// Hard link to an existing target name must fail with EEXIST.
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn hard_link_existing_target_returns_eexist() {
-    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
-        return;
-    };
+    let harness = MountHarness::new_or_fail("hard_link_existing_target_returns_eexist");
     harness
         .create_file("source.txt", b"source\n")
         .expect("create_file source.txt");
@@ -694,10 +677,9 @@ fn hard_link_existing_target_returns_eexist() {
 /// Unlink on a file through one of its hard links must not affect the
 /// other link or the underlying data.
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn unlink_one_link_preserves_other() {
-    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
-        return;
-    };
+    let harness = MountHarness::new_or_fail("unlink_one_link_preserves_other");
     let data = b"persistent under hard link\n".to_vec();
     harness
         .create_file("persist.dat", &data)
@@ -736,10 +718,9 @@ fn unlink_one_link_preserves_other() {
 
 /// Attempting to unlink a file that does not exist must return ENOENT.
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn unlink_nonexistent_returns_enoent() {
-    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
-        return;
-    };
+    let harness = MountHarness::new_or_fail("unlink_nonexistent_returns_enoent");
 
     let result = harness.remove_file("no_such_unlink_target");
     assert!(result.is_err(), "unlink nonexistent file must fail");
@@ -754,10 +735,9 @@ fn unlink_nonexistent_returns_enoent() {
 /// Attempting to unlink a directory must return EISDIR (or equivalent
 /// on platforms that differentiate unlink/rmdir).
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn unlink_directory_returns_error() {
-    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
-        return;
-    };
+    let harness = MountHarness::new_or_fail("unlink_directory_returns_error");
     harness.mkdir("a_directory").expect("mkdir a_directory");
 
     let result = harness.remove_file("a_directory");
@@ -776,10 +756,9 @@ fn unlink_directory_returns_error() {
 /// file's own mode. A read-only file in a writable directory can be
 /// unlinked (POSIX semantics).
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn unlink_readonly_file_succeeds_in_writable_dir() {
-    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
-        return;
-    };
+    let harness = MountHarness::new_or_fail("unlink_readonly_file_succeeds_in_writable_dir");
     harness
         .create_file("readonly.txt", b"can unlink me\n")
         .expect("create_file readonly.txt");
@@ -803,10 +782,9 @@ fn unlink_readonly_file_succeeds_in_writable_dir() {
 /// Concurrent unlink of same file from two names is harmless:
 /// second unlink must return ENOENT.
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn double_unlink_returns_enoent() {
-    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
-        return;
-    };
+    let harness = MountHarness::new_or_fail("double_unlink_returns_enoent");
     harness
         .create_file("once.txt", b"unlink me once\n")
         .expect("create_file once.txt");
