@@ -13,7 +13,7 @@ documentation:
 
 1. `README.md`
 2. `AGENTS.md`
-3. `docs/GITHUB_PR_DEVELOPMENT.md`
+3. `CONTRIBUTING.md`
 4. `docs/GITHUB_CI.md`
 5. `docs/CLAIMS_GATE_POLICY.md`
 6. `docs/REVIEW_TODO_POLICY.md`
@@ -65,8 +65,10 @@ for ordinary contributors.
   `docs/UNRELEASED_AUTHORITY_POLICY.md`: choose current authority unless a
   GitHub issue names a real external ABI/protocol or operator-owned data target.
 - Preserve the GPL-2.0-only WITH Linux-syscall-note licensing model.
-- See `docs/GITHUB_PR_DEVELOPMENT.md` for the full issue, worktree, PR,
-  validation, and multi-Codex policy.
+- Use `CONTRIBUTING.md` and `docs/GITHUB_CI.md` for public contribution and
+  validation guidance. Managed hosts must also follow their host-local process
+  docs when present; on this host that includes
+  `/root/ai/docs/projects/tidefs/workflows/github-pr-development.md`.
 
 ## Product Bar
 
