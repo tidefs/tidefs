@@ -270,16 +270,10 @@ fn dispatch_request(
     }
 
     match request.command {
-        LivePoolAdminCommand::PoolStatus => {
-            pool_status(request.output.wants_json(), manifest, engine)
-        }
-        LivePoolAdminCommand::PoolImport => {
-            already_owned("import", manifest, request.output.wants_json())
-        }
+        LivePoolAdminCommand::PoolStatus => pool_status(&request, manifest, engine),
+        LivePoolAdminCommand::PoolImport => already_owned(&request, "import", manifest),
         LivePoolAdminCommand::PoolMount => pool_mount_refused(&request, manifest),
-        LivePoolAdminCommand::PoolExport => {
-            pool_export(request.output.wants_json(), manifest, shutdown)
-        }
+        LivePoolAdminCommand::PoolExport => pool_export(&request, manifest, shutdown),
         LivePoolAdminCommand::PoolDestroy => pool_destroy_refused(&request, manifest),
         LivePoolAdminCommand::PoolGet
         | LivePoolAdminCommand::PoolSet
@@ -361,10 +355,14 @@ fn unsupported_admin_command_response(request: &LivePoolAdminRequest) -> LivePoo
 }
 
 fn pool_status(
-    wants_json: bool,
+    request: &LivePoolAdminRequest,
     manifest: &LiveOwnerManifest,
     engine: &LiveOwnerEngine,
 ) -> LivePoolAdminResponse {
+    if let Err(err) = validate_request_arg_names(&request.args, &[]) {
+        return live_admin_typed_error(err);
+    }
+
     let ctx = RequestCtx {
         uid: 0,
         gid: 0,
@@ -408,7 +406,7 @@ fn pool_status(
         }
     });
 
-    if wants_json {
+    if request.output.wants_json() {
         LivePoolAdminResponse::ok_machine_json(value.to_string())
     } else {
         LivePoolAdminResponse::ok_text(format!(
@@ -429,10 +427,14 @@ fn pool_status(
 }
 
 fn already_owned(
+    request: &LivePoolAdminRequest,
     operation: &str,
     manifest: &LiveOwnerManifest,
-    wants_json: bool,
 ) -> LivePoolAdminResponse {
+    if let Err(err) = validate_pool_import_request_args(&request.args) {
+        return live_admin_typed_error(err);
+    }
+
     let value = json!({
         "pool_name": manifest.pool_name,
         "pool_uuid": manifest.pool_uuid,
@@ -444,7 +446,7 @@ fn already_owned(
         "operation": operation,
         "already_owned": true,
     });
-    if wants_json {
+    if request.output.wants_json() {
         LivePoolAdminResponse::ok_machine_json(value.to_string())
     } else {
         LivePoolAdminResponse::ok_text(format!(
@@ -487,10 +489,14 @@ fn pool_mount_request_args(
 }
 
 fn pool_export(
-    wants_json: bool,
+    request: &LivePoolAdminRequest,
     manifest: &LiveOwnerManifest,
     shutdown: &Arc<AtomicBool>,
 ) -> LivePoolAdminResponse {
+    if let Err(err) = validate_pool_export_request_args(&request.args) {
+        return live_admin_typed_error(err);
+    }
+
     shutdown.store(true, Ordering::Release);
     let value = json!({
         "pool_name": manifest.pool_name,
@@ -503,7 +509,7 @@ fn pool_export(
         "operation": "export",
         "shutdown_requested": true,
     });
-    if wants_json {
+    if request.output.wants_json() {
         LivePoolAdminResponse::ok_machine_json(value.to_string())
     } else {
         LivePoolAdminResponse::ok_text(format!(
@@ -653,6 +659,24 @@ fn validate_request_arg_names(
     Ok(())
 }
 
+fn validate_pool_import_request_args(args: &LivePoolAdminArgs) -> Result<(), LivePoolAdminError> {
+    validate_request_arg_names(
+        args,
+        &["read_only", "lock_dir", "encryption_envelope", "devices"],
+    )?;
+    request_arg_bool(args, "read_only")?;
+    request_arg_str(args, "lock_dir")?;
+    request_arg_str(args, "encryption_envelope")?;
+    request_arg_string_array(args, "devices")?;
+    Ok(())
+}
+
+fn validate_pool_export_request_args(args: &LivePoolAdminArgs) -> Result<(), LivePoolAdminError> {
+    validate_request_arg_names(args, &["force"])?;
+    request_arg_bool(args, "force")?;
+    Ok(())
+}
+
 fn request_arg_bool(
     args: &LivePoolAdminArgs,
     name: &str,
@@ -675,6 +699,25 @@ fn request_arg_str<'a>(
         Some(LivePoolAdminArg::String(value)) => Ok(Some(value.as_str())),
         Some(_) => Err(LivePoolAdminError::malformed(format!(
             "live-owner request argument '{name}' must be a string"
+        ))),
+    }
+}
+
+fn request_arg_string_array(
+    args: &LivePoolAdminArgs,
+    name: &str,
+) -> Result<(), LivePoolAdminError> {
+    match args.0.get(name) {
+        None | Some(LivePoolAdminArg::Null) => Ok(()),
+        Some(LivePoolAdminArg::Array(values))
+            if values
+                .iter()
+                .all(|value| matches!(value, LivePoolAdminArg::String(_))) =>
+        {
+            Ok(())
+        }
+        Some(_) => Err(LivePoolAdminError::malformed(format!(
+            "live-owner request argument '{name}' must be an array of strings"
         ))),
     }
 }
@@ -989,6 +1032,58 @@ mod tests {
         let message = assert_typed_malformed(pool_mount_refused(&request, &manifest));
 
         assert!(message.contains("argument 'read_only' must be a boolean"));
+    }
+
+    #[test]
+    fn pool_import_malformed_args_fail_closed() {
+        let manifest = manifest();
+        let mut request = LivePoolAdminRequest::new(LivePoolAdminCommand::PoolImport, "tank");
+        request.args.0.insert(
+            "devices".to_string(),
+            LivePoolAdminArg::Array(vec![LivePoolAdminArg::Bool(true)]),
+        );
+
+        let message = assert_typed_malformed(already_owned(&request, "import", &manifest));
+
+        assert!(message.contains("argument 'devices' must be an array of strings"));
+    }
+
+    #[test]
+    fn pool_export_malformed_args_fail_before_shutdown() {
+        let manifest = manifest();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let mut valid = LivePoolAdminRequest::new(LivePoolAdminCommand::PoolExport, "tank");
+        valid
+            .args
+            .0
+            .insert("force".to_string(), LivePoolAdminArg::Bool(true));
+
+        let response = pool_export(&valid, &manifest, &shutdown);
+
+        assert_eq!(response.exit_code, 0);
+        assert!(shutdown.load(Ordering::Acquire));
+
+        for (name, value, detail) in [
+            (
+                "force",
+                LivePoolAdminArg::String("yes".to_string()),
+                "argument 'force' must be a boolean",
+            ),
+            (
+                "unexpected",
+                LivePoolAdminArg::Bool(true),
+                "unsupported argument 'unexpected'",
+            ),
+        ] {
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let mut request = LivePoolAdminRequest::new(LivePoolAdminCommand::PoolExport, "tank");
+            request.args.0.insert(name.to_string(), value);
+
+            let message = assert_typed_malformed(pool_export(&request, &manifest, &shutdown));
+
+            assert!(message.contains(detail));
+            assert!(!shutdown.load(Ordering::Acquire));
+        }
     }
 
     fn destroy_request(wants_json: bool) -> LivePoolAdminRequest {
