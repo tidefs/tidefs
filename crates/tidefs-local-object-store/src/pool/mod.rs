@@ -999,9 +999,8 @@ fn resume_device_removal_if_pending(pool: &mut Pool) {
     if marker_path.exists() {
         if let Ok(encoded) = std::fs::read_to_string(&marker_path) {
             let target_path = PathBuf::from(encoded.trim());
-            let target_present =
-                target_path.exists() || pool.devices.iter().any(|d| d.root() == target_path);
-            let completed = if target_present {
+            let target_in_topology = pool.devices.iter().any(|d| d.root() == target_path);
+            let completed = if target_in_topology {
                 matches!(pool.safe_remove_device(&target_path), Ok(result) if result.complete)
             } else {
                 true
@@ -6343,6 +6342,60 @@ mod tests {
         let obj3 = pool2.get(IoClass::Data, key3).unwrap();
         assert!(obj3.is_some(), "key3 not found after resume");
         assert_eq!(obj3.unwrap(), data3);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn safe_remove_device_resume_clears_marker_after_detach() {
+        let root = temp_dir("safe-remove-resume-after-detach");
+        let _ = std::fs::remove_dir_all(&root);
+        let d1 = root.join("data1");
+        let d2 = root.join("data2");
+        let config = PoolConfig {
+            name: "testpool".into(),
+            root_path: root.to_path_buf(),
+            devices: vec![
+                DeviceConfig {
+                    media_class: Default::default(),
+                    path: d1.clone(),
+                    backing: DeviceBacking::DirectoryObjectStoreCompat,
+                    class: DeviceClass::Data,
+                    kind: DeviceKind::Single { path: d1.clone() },
+                    encryption: None,
+                    compression: None,
+                },
+                DeviceConfig {
+                    media_class: Default::default(),
+                    path: d2.clone(),
+                    backing: DeviceBacking::DirectoryObjectStoreCompat,
+                    class: DeviceClass::Data,
+                    kind: DeviceKind::Single { path: d2.clone() },
+                    encryption: None,
+                    compression: None,
+                },
+            ],
+        };
+
+        let mut pool = Pool::create(config, PoolProperties::default(), &test_options()).unwrap();
+        let key = ObjectKey::from_name(b"resume-clears-marker-after-detach");
+        let data = b"completed detach clears stale removal marker".to_vec();
+        pool.put(IoClass::Data, key, &data).unwrap();
+        pool.sync_all().unwrap();
+
+        let result = pool.safe_remove_device(&d1).unwrap();
+        assert!(result.complete);
+        assert_eq!(pool.stats().device_count, 1);
+        assert!(d1.exists());
+
+        let marker_path = root.join(DEVICE_REMOVAL_MARKER_FILE);
+        std::fs::write(&marker_path, d1.to_string_lossy().as_bytes()).unwrap();
+
+        resume_device_removal_if_pending(&mut pool);
+
+        assert!(!marker_path.exists());
+        assert_eq!(pool.stats().device_count, 1);
+        assert_eq!(pool.get(IoClass::Data, key).unwrap(), Some(data));
 
         let _ = std::fs::remove_dir_all(&root);
     }
