@@ -1162,7 +1162,20 @@ fn sysfs_discard_read_error_capability(error: std::io::Error) -> DiscardCapabili
 }
 
 fn probe_block_discard_capability(sysfs_dir: &Path) -> DiscardCapability {
-    match read_sysfs_u64_capability(sysfs_dir, "queue/discard_max_bytes") {
+    let sysfs_dir = sysfs_dir
+        .canonicalize()
+        .unwrap_or_else(|_| sysfs_dir.to_path_buf());
+    // Linux exposes a partition's queue limits on its parent block device.
+    let queue_dir = if sysfs_dir.join("partition").is_file() {
+        sysfs_dir
+            .parent()
+            .unwrap_or(sysfs_dir.as_path())
+            .join("queue")
+    } else {
+        sysfs_dir.join("queue")
+    };
+
+    match read_sysfs_u64_capability(&queue_dir, "discard_max_bytes") {
         Ok(0) => DiscardCapability::Unsupported,
         Ok(_) => DiscardCapability::Supported,
         Err(capability) => capability,
@@ -1170,7 +1183,10 @@ fn probe_block_discard_capability(sysfs_dir: &Path) -> DiscardCapability {
 }
 
 fn sysfs_class_block_dir(path: &Path) -> Option<PathBuf> {
-    let name = path.file_name()?.to_str()?;
+    // Stable /dev/disk and /dev/mapper aliases do not use the kernel name that
+    // identifies their /sys/class/block entry.
+    let resolved = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let name = resolved.file_name()?.to_str()?;
     Some(Path::new("/sys/class/block").join(name))
 }
 
@@ -2854,6 +2870,38 @@ mod tests {
         assert_eq!(
             probe_block_discard_capability(dir.path()),
             DiscardCapability::Unknown
+        );
+    }
+
+    #[test]
+    fn probe_block_discard_capability_reads_parent_queue_for_partition() {
+        let dir = tempfile::tempdir().unwrap();
+        let device_dir = dir.path().join("vdb");
+        let partition_dir = device_dir.join("vdb1");
+        std::fs::create_dir_all(device_dir.join("queue")).unwrap();
+        std::fs::create_dir_all(&partition_dir).unwrap();
+        std::fs::write(partition_dir.join("partition"), b"1\n").unwrap();
+        std::fs::write(device_dir.join("queue/discard_max_bytes"), b"4096\n").unwrap();
+
+        assert_eq!(
+            probe_block_discard_capability(&partition_dir),
+            DiscardCapability::Supported
+        );
+    }
+
+    #[test]
+    fn sysfs_class_block_dir_resolves_stable_device_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let device_path = dir.path().join("vdb1");
+        let by_id_dir = dir.path().join("disk/by-id");
+        let stable_path = by_id_dir.join("tidefs-test-device");
+        std::fs::write(&device_path, b"").unwrap();
+        std::fs::create_dir_all(&by_id_dir).unwrap();
+        std::os::unix::fs::symlink(&device_path, &stable_path).unwrap();
+
+        assert_eq!(
+            sysfs_class_block_dir(&stable_path),
+            Some(PathBuf::from("/sys/class/block/vdb1"))
         );
     }
 
