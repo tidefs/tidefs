@@ -763,8 +763,8 @@ mount -t sysfs sysfs /sys
 mount -t devtmpfs devtmpfs /dev
 
 echo "=== TideFS Kernel VFS Throughput Latency Baseline ==="
-echo "kernel=$(uname -r)"
-echo "ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+echo "kernel_version=$(uname -r)"
+echo "timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 PASS=0; FAIL=0; BLOCK=0; SKIP=0
 pass()   { echo "PASS: $1"; PASS=$((PASS+1)); }
