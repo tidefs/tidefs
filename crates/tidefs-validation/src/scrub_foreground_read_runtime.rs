@@ -383,12 +383,12 @@ pub fn build_evidence_manifest(
         residual_risk: SCRUB_READ_RESIDUAL_RISK.to_string(),
         source: SOURCE_LABEL.to_string(),
         generated_at: evidence.generated_at.clone(),
-        blocking_issues: evidence_manifest_blocking_issues(evidence.outcome),
+        blocking_issues: evidence_manifest_blocking_issues(evidence.passed),
     }
 }
 
-fn evidence_manifest_blocking_issues(outcome: ValidationStatus) -> Vec<BlockingIssueRef> {
-    if outcome == ValidationStatus::Pass {
+fn evidence_manifest_blocking_issues(passed: bool) -> Vec<BlockingIssueRef> {
+    if passed {
         Vec::new()
     } else {
         vec![BlockingIssueRef {
@@ -944,8 +944,51 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pass_manifest_outcome_has_no_blocking_issues() {
-        assert!(evidence_manifest_blocking_issues(ValidationStatus::Pass).is_empty());
+    fn passed_manifest_has_no_blocking_issues() {
+        assert!(evidence_manifest_blocking_issues(true).is_empty());
+    }
+
+    #[test]
+    fn raw_pass_without_effective_read_isolation_keeps_manifest_blocked() {
+        let service_curve = build_service_curve();
+        let environment = RuntimeEnvironmentEvidence {
+            host: "linux x86_64 kernel=test".to_string(),
+            dev_fuse_present: true,
+            daemon_bin: Some("/nix/store/test/bin/tidefs-posix-filesystem-adapter-daemon".into()),
+            environment_refusal: None,
+        };
+
+        let evidence = base_evidence(BaseEvidenceInput {
+            outcome: ValidationStatus::Pass,
+            command: "scrub_foreground_read_validation --row scrub-foreground-read-runtime"
+                .to_string(),
+            generated_at: "2026-06-29T17:30:00Z".to_string(),
+            run_id: "test-run/1".to_string(),
+            source_ref: "test-sha".to_string(),
+            environment,
+            mount: None,
+            foreground_read: ForegroundReadEvidence::not_run_with_failure(
+                service_curve.max_foreground_read_wait_ticks,
+                "foreground read did not run",
+            ),
+            scrub_activity: build_scrub_activity(&service_curve),
+            service_curve,
+        });
+
+        assert_eq!(evidence.outcome, ValidationStatus::Pass);
+        assert!(!evidence.passed);
+
+        let manifest = build_evidence_manifest(&evidence, b"scrub evidence");
+        assert_eq!(manifest.blocking_issues.len(), 1);
+        assert_eq!(
+            manifest.blocking_issues[0].repo.as_deref(),
+            Some(BLOCKING_ISSUE_REPO)
+        );
+        assert_eq!(manifest.blocking_issues[0].number, BLOCKING_ISSUE_NUMBER);
+        assert_eq!(
+            manifest.blocking_issues[0].reason.as_deref(),
+            Some(BLOCKING_ISSUE_REASON)
+        );
     }
 
     #[test]
