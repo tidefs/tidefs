@@ -14,7 +14,8 @@
 //!   5. Delete + fsync parent dir survives SIGKILL (file absent after remount)
 //!   6. Empty mount SIGKILL remount succeeds without corruption
 //!
-//! When mounted-runtime prerequisites are unavailable, tests fail closed with
+//! Mounted-runtime rows are ignored in ordinary Cargo runs and must be run
+//! explicitly. When prerequisites are unavailable, they fail closed with
 //! explicit runtime-refusal receipts.
 
 use std::os::unix::ffi::OsStrExt;
@@ -47,6 +48,7 @@ fn prng_data(seed: u64, len: usize) -> Vec<u8> {
 /// Write a single file, fsync, SIGKILL the daemon, remount, verify the
 /// file content is byte-for-byte identical.
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn crash_recovery_single_file_fsyncd_survives_sigkill() {
     let mut harness =
         MountHarness::new_or_fail("crash_recovery_single_file_fsyncd_survives_sigkill");
@@ -71,6 +73,7 @@ fn crash_recovery_single_file_fsyncd_survives_sigkill() {
 /// Write initial data, fsync, append more data, fsync again, SIGKILL,
 /// remount, verify the full concatenated content survives byte-for-byte.
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn crash_recovery_append_fsync_survives_sigkill() {
     let mut harness = MountHarness::new_or_fail("crash_recovery_append_fsync_survives_sigkill");
 
@@ -109,6 +112,7 @@ fn crash_recovery_append_fsync_survives_sigkill() {
 /// remount, verify byte-for-byte equality.  Block-unaligned writes exercise
 /// partial-page flush and recovery edge cases.
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn crash_recovery_unaligned_write_fsync_survives_sigkill() {
     let mut harness =
         MountHarness::new_or_fail("crash_recovery_unaligned_write_fsync_survives_sigkill");
@@ -142,6 +146,7 @@ fn crash_recovery_unaligned_write_fsync_survives_sigkill() {
 /// Spawn 6 threads, each writing and fsyncing its own file concurrently,
 /// SIGKILL the daemon, remount, verify all 6 files survive with correct data.
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn crash_recovery_concurrent_multithread_fsync_survives_sigkill() {
     let mut harness =
         MountHarness::new_or_fail("crash_recovery_concurrent_multithread_fsync_survives_sigkill");
@@ -201,6 +206,7 @@ fn crash_recovery_concurrent_multithread_fsync_survives_sigkill() {
 /// parent directory to make the deletion durable, SIGKILL the daemon,
 /// remount, and verify the file is absent.
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn crash_recovery_delete_fsync_survives_sigkill() {
     let mut harness = MountHarness::new_or_fail("crash_recovery_delete_fsync_survives_sigkill");
 
@@ -237,6 +243,7 @@ fn crash_recovery_delete_fsync_survives_sigkill() {
 /// The remount must succeed and the mount root must be an accessible
 /// directory with zero files.
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn crash_recovery_empty_mount_sigkill_remount_succeeds() {
     let mut harness =
         MountHarness::new_or_fail("crash_recovery_empty_mount_sigkill_remount_succeeds");
@@ -275,6 +282,7 @@ fn crash_recovery_empty_mount_sigkill_remount_succeeds() {
 /// fsync again, SIGKILL, remount, verify the latest overwritten content
 /// survived — not the intermediate content.
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn crash_recovery_overwrite_fsync_survives_sigkill() {
     let mut harness = MountHarness::new_or_fail("crash_recovery_overwrite_fsync_survives_sigkill");
 
@@ -311,6 +319,7 @@ fn crash_recovery_overwrite_fsync_survives_sigkill() {
 /// SIGKILL the daemon, remount.  Verify A survived and B was lost
 /// (file is either back to A or absent but never corrupt).
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn crash_recovery_no_fsync_data_loss_on_sigkill() {
     let mut harness = MountHarness::new_or_fail("crash_recovery_no_fsync_data_loss_on_sigkill");
 
@@ -381,6 +390,7 @@ fn crash_recovery_no_fsync_data_loss_on_sigkill() {
 /// Exercises segment-rotation recovery: the store must replay whichever
 /// segments were fully written before the crash.
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn crash_recovery_large_file_multi_segment_survives_sigkill() {
     let mut harness =
         MountHarness::new_or_fail("crash_recovery_large_file_multi_segment_survives_sigkill");
@@ -420,6 +430,7 @@ fn crash_recovery_large_file_multi_segment_survives_sigkill() {
 /// each fsync commits a complete record; recovery replays complete
 /// records only.
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn crash_recovery_rapid_fsync_atomicity() {
     let mut harness = MountHarness::new_or_fail("crash_recovery_rapid_fsync_atomicity");
 
@@ -470,6 +481,7 @@ fn crash_recovery_rapid_fsync_atomicity() {
 /// Non-fsynced objects may be absent.  This validates that segment rotation
 /// preserves all committed records and does not leak partial ones.
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn crash_recovery_segment_rotation_atomicity() {
     let mut harness = MountHarness::new_or_fail("crash_recovery_segment_rotation_atomicity");
 
@@ -523,6 +535,7 @@ fn crash_recovery_segment_rotation_atomicity() {
 /// Create an empty file, fsync, SIGKILL the daemon, remount, verify the file
 /// exists, is empty (0 bytes), and has nlink=1.
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn crash_recovery_empty_file_survives_sigkill() {
     let mut harness = MountHarness::new_or_fail("crash_recovery_empty_file_survives_sigkill");
 
@@ -556,6 +569,7 @@ fn crash_recovery_empty_file_survives_sigkill() {
 /// intact.  Smallest possible non-empty file exercises minimum-size flush
 /// and recovery edge cases.
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn crash_recovery_one_byte_file_survives_sigkill() {
     let mut harness = MountHarness::new_or_fail("crash_recovery_one_byte_file_survives_sigkill");
 
@@ -586,6 +600,7 @@ fn crash_recovery_one_byte_file_survives_sigkill() {
 /// Create a file, chmod to 0o600, fsync, SIGKILL, remount, verify that the
 /// permission bits survived the crash.
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn crash_recovery_chmod_survives_sigkill() {
     let mut harness = MountHarness::new_or_fail("crash_recovery_chmod_survives_sigkill");
 
@@ -626,6 +641,7 @@ fn crash_recovery_chmod_survives_sigkill() {
 /// Set explicit atime and mtime via utimensat, fsync, SIGKILL, remount,
 /// verify both timestamps survived the crash byte-for-byte.
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn crash_recovery_utimens_survives_sigkill() {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
@@ -718,6 +734,7 @@ fn crash_recovery_utimens_survives_sigkill() {
 /// Create a file, chown to nobody:nogroup (65534:65534), fsync, SIGKILL,
 /// remount, verify ownership survived.  Fails closed when not root.
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn crash_recovery_chown_survives_sigkill() {
     let mut harness = MountHarness::new_or_fail("crash_recovery_chown_survives_sigkill");
 
@@ -786,6 +803,7 @@ fn crash_recovery_chown_survives_sigkill() {
 /// Create a 3-level directory tree with files at each level, fsync all,
 /// SIGKILL, remount, verify the full namespace and all file contents intact.
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn crash_recovery_directory_tree_survives_sigkill() {
     let mut harness = MountHarness::new_or_fail("crash_recovery_directory_tree_survives_sigkill");
 
@@ -870,6 +888,7 @@ fn crash_recovery_directory_tree_survives_sigkill() {
 /// may have survived due to writeback flush — but they must never be
 /// corrupt (content must match what was written).
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn crash_recovery_multifd_selective_fsync_survives_sigkill() {
     let mut harness =
         MountHarness::new_or_fail("crash_recovery_multifd_selective_fsync_survives_sigkill");
@@ -946,6 +965,7 @@ fn crash_recovery_multifd_selective_fsync_survives_sigkill() {
 /// byte-for-byte content match.  Exercises multi-extent segment write
 /// durability at an intermediate size between the small and large tests.
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn crash_recovery_128kib_survives_sigkill() {
     let mut harness = MountHarness::new_or_fail("crash_recovery_128kib_survives_sigkill");
 
@@ -981,6 +1001,7 @@ fn crash_recovery_128kib_survives_sigkill() {
 /// remount, verify byte-for-byte content match.  Exercises multi-segment
 /// recovery at the largest size requested by the crash-recovery spec.
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn crash_recovery_1mib_survives_sigkill() {
     let mut harness = MountHarness::new_or_fail("crash_recovery_1mib_survives_sigkill");
 
@@ -1021,6 +1042,7 @@ fn crash_recovery_1mib_survives_sigkill() {
 /// pattern cache-line artefacts, and pseudo-random compression/encryption
 /// edge cases.
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn crash_recovery_varied_payloads_survives_sigkill() {
     let mut harness = MountHarness::new_or_fail("crash_recovery_varied_payloads_survives_sigkill");
 
@@ -1083,6 +1105,7 @@ fn crash_recovery_varied_payloads_survives_sigkill() {
 /// remount, and verify the merged content: original prefix + new middle +
 /// original suffix byte-for-byte.
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn crash_recovery_partial_overwrite_survives_sigkill() {
     use std::fs::OpenOptions;
     use std::io::{Seek, SeekFrom, Write};
@@ -1149,6 +1172,7 @@ fn crash_recovery_partial_overwrite_survives_sigkill() {
 /// fsync the unlink is not durably committed and the data must not be
 /// recoverable.
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn crash_recovery_unlinked_without_fsync_not_durable() {
     let mut harness =
         MountHarness::new_or_fail("crash_recovery_unlinked_without_fsync_not_durable");
@@ -1179,6 +1203,7 @@ fn crash_recovery_unlinked_without_fsync_not_durable() {
 /// SIGKILL the daemon, remount.  Verify the first 10 files are intact with
 /// correct content; the 11th must be absent (no partial durable state).
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn crash_recovery_multifile_atomicity_boundary() {
     let mut harness = MountHarness::new_or_fail("crash_recovery_multifile_atomicity_boundary");
 
@@ -1247,6 +1272,7 @@ fn crash_recovery_multifile_atomicity_boundary() {
 /// directory to make the directory entry durable, SIGKILL the daemon,
 /// remount, verify B exists with correct content and A is absent.
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn crash_recovery_rename_survives_sigkill() {
     let mut harness = MountHarness::new_or_fail("crash_recovery_rename_survives_sigkill");
 
