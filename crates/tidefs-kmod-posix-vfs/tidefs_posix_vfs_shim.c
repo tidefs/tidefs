@@ -4690,7 +4690,9 @@ static int tidefs_posix_vfs_set_acl(struct mnt_idmap *idmap,
 	unsigned int out_gid = 0;
 	unsigned long long out_size = 0;
 	unsigned long long out_blocks = 0;
+	unsigned int setattr_valid = TIDEFS_POSIX_VFS_FATTR_CTIME;
 	struct timespec64 ctime;
+	bool xattr_changed = false;
 	bool mode_changed = false;
 	void *value = NULL;
 	size_t size = 0;
@@ -4726,9 +4728,11 @@ static int tidefs_posix_vfs_set_acl(struct mnt_idmap *idmap,
 			ret = -EOPNOTSUPP;
 		if (ret == -ENODATA)
 			ret = 0;
+		else if (!ret)
+			xattr_changed = true;
 		if (ret)
 			return ret;
-		goto sync_mode;
+		goto sync_metadata;
 	}
 
 	/* Encode the ACL into binary xattr format. */
@@ -4749,27 +4753,31 @@ static int tidefs_posix_vfs_set_acl(struct mnt_idmap *idmap,
 		ret = -EOPNOTSUPP;
 	if (ret)
 		return ret;
+	xattr_changed = true;
 
-sync_mode:
-	/* The xattr is authoritative even if the mode update below fails. */
+sync_metadata:
+	/* The xattr is authoritative even if the metadata update below fails. */
 	forget_cached_acl(inode, type);
-	if (mode_changed) {
-		ctime = current_time(inode);
-		ret = tidefs_posix_vfs_engine_setattr(
-			inode->i_ino,
-			0x01 | 0x80,  /* FATTR_MODE | FATTR_CTIME */
-			mode,
-			0, 0, 0, 0, 0,
-			tidefs_posix_vfs_timespec64_to_ns(ctime),
-			&out_mode, &out_uid, &out_gid, &out_size, &out_blocks);
-		if (ret == -ENOSYS)
-			ret = -EOPNOTSUPP;
-		if (ret)
-			return ret;
+	if (!xattr_changed && !mode_changed)
+		return 0;
+	if (mode_changed)
+		setattr_valid |= TIDEFS_POSIX_VFS_FATTR_MODE;
+	ctime = current_time(inode);
+	ret = tidefs_posix_vfs_engine_setattr(
+		inode->i_ino,
+		setattr_valid,
+		mode,
+		0, 0, 0, 0, 0,
+		tidefs_posix_vfs_timespec64_to_ns(ctime),
+		&out_mode, &out_uid, &out_gid, &out_size, &out_blocks);
+	if (ret == -ENOSYS)
+		ret = -EOPNOTSUPP;
+	if (ret)
+		return ret;
+	if (mode_changed)
 		inode->i_mode = out_mode;
-		inode_set_ctime_to_ts(inode, ctime);
-		mark_inode_dirty(inode);
-	}
+	inode_set_ctime_to_ts(inode, ctime);
+	mark_inode_dirty(inode);
 
 	return 0;
 }
