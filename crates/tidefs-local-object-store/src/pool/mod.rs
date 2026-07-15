@@ -6135,6 +6135,54 @@ mod tests {
     }
 
     #[test]
+    fn safe_remove_device_refuses_unverifiable_survivor_receipts() {
+        let root = temp_dir("safe-remove-unverifiable-survivor-receipts");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = multi_data_device_config(&root, 3);
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::replicated(2),
+            ..PoolProperties::default()
+        };
+        let mut pool = Pool::create(config, properties, &test_options()).unwrap();
+        set_deterministic_device_guids(&mut pool);
+
+        let key = ObjectKey::from_name(b"survivor-receipt-corrupt-before-remove");
+        let payload = b"safe removal requires committed survivor receipt authority";
+        pool.put(IoClass::Data, key, payload).unwrap();
+        let receipt = pool
+            .placement_receipt_for_key(IoClass::Data, key)
+            .unwrap()
+            .expect("receipt before removal");
+        let victim_idx = pool.resolve_receipt_target(&receipt.targets[0]).unwrap();
+        let victim_path = pool.devices[victim_idx].root().to_path_buf();
+        let receipt_key = placement_receipt_object_key(key);
+
+        for idx in 0..pool.devices.len() {
+            if idx == victim_idx {
+                continue;
+            }
+
+            let Some(mut raw) = pool.devices[idx].get(receipt_key).unwrap() else {
+                continue;
+            };
+            let last = raw.len() - 1;
+            raw[last] ^= 0x5a;
+            pool.devices[idx]
+                .put(receipt_key, &raw)
+                .expect("replace survivor receipt with bad replay seal");
+        }
+
+        let result = pool.safe_remove_device(&victim_path).unwrap();
+        assert!(!result.complete);
+        assert_eq!(result.objects_failed, 1);
+        assert_eq!(result.failed_keys, vec![key]);
+        assert_eq!(pool.stats().device_count, 3);
+        assert!(root.join(DEVICE_REMOVAL_MARKER_FILE).exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn safe_remove_device_refuses_last_device() {
         let root = temp_dir("safe-remove-last");
         let _ = std::fs::remove_dir_all(&root);
