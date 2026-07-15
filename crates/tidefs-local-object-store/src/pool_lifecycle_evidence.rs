@@ -80,7 +80,12 @@ pub struct PoolLifecycleContext {
 impl PoolLifecycleContext {
     #[must_use]
     pub fn topology_complete(&self) -> bool {
-        self.expected_device_count > 0
+        self.pool_guid.is_some()
+            && self
+                .pool_name
+                .as_deref()
+                .is_some_and(|name| !name.trim().is_empty())
+            && self.expected_device_count > 0
             && self.device_count == self.expected_device_count
             && self.capacity_bytes > 0
             && self.topology_generation > 0
@@ -281,6 +286,38 @@ mod tests {
         assert!(evidence.is_fail_closed());
         assert_eq!(evidence.reason, "topology evidence incomplete");
         assert!(evidence.summary().contains("outcome=refused"));
+    }
+
+    #[test]
+    fn executed_evidence_refuses_topology_without_pool_guid() {
+        let mut missing_guid = context();
+        missing_guid.pool_guid = None;
+
+        let evidence = PoolLifecycleEvidence::executed(PoolLifecycleAction::Import, missing_guid);
+
+        assert_eq!(evidence.outcome, PoolLifecycleOutcome::Refused);
+        assert_eq!(evidence.pool_guid, None);
+        assert!(!evidence.topology_complete);
+        assert!(evidence.owner_authorized);
+        assert!(evidence.fail_closed);
+        assert!(evidence.is_fail_closed());
+        assert_eq!(evidence.reason, "topology evidence incomplete");
+    }
+
+    #[test]
+    fn executed_evidence_refuses_topology_without_pool_name() {
+        let mut missing_name = context();
+        missing_name.pool_name = Some("   ".to_string());
+
+        let evidence = PoolLifecycleEvidence::executed(PoolLifecycleAction::Import, missing_name);
+
+        assert_eq!(evidence.outcome, PoolLifecycleOutcome::Refused);
+        assert_eq!(evidence.pool_name, Some("   ".to_string()));
+        assert!(!evidence.topology_complete);
+        assert!(evidence.owner_authorized);
+        assert!(evidence.fail_closed);
+        assert!(evidence.is_fail_closed());
+        assert_eq!(evidence.reason, "topology evidence incomplete");
     }
 
     #[test]
