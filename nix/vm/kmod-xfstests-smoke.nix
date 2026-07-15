@@ -471,12 +471,16 @@ if [ "$MOUNTED" -eq 1 ]; then
 
     echo ""
     echo "-- smoke: write plus syncfs/lower flush --"
+    configured_pool_flush_ready=0
+    configured_pool_flush_blocker="write failed"
     if printf 'configured pool authority\n' > "$MNT/configured_pool_flush.txt" 2>/tmp/write.err; then
         pass "configured_pool_write"
         if sync -f "$MNT/configured_pool_flush.txt" 2>/tmp/syncfs.err; then
             pass "configured_pool_syncfs"
+            configured_pool_flush_ready=1
         else
             fail "configured_pool_syncfs" "$(head -1 /tmp/syncfs.err)"
+            configured_pool_flush_blocker="syncfs failed"
         fi
     else
         fail "configured_pool_write" "$(head -1 /tmp/write.err)"
@@ -519,8 +523,55 @@ if [ "$MOUNTED" -eq 1 ]; then
     fi
 
     echo ""
+    echo "-- smoke: syncfs data and timestamp survive unmount/remount --"
+    if [ "$configured_pool_flush_ready" -eq 1 ]; then
+        flush_mtime_before=$(stat -c %Y "$MNT/configured_pool_flush.txt" 2>/tmp/remount-stat-before.err || true)
+        if [ -z "$flush_mtime_before" ]; then
+            blocked "configured_pool_sync_remount" "pre-remount mtime unavailable: $(head -1 /tmp/remount-stat-before.err)"
+            blocked "configured_pool_remount_read" "pre-remount stat failed"
+            blocked "configured_pool_remount_mtime" "pre-remount stat failed"
+        elif umount "$MNT" 2>/tmp/remount-umount.err; then
+            MOUNTED=0
+            if mount -t tidefs "$POOL_DEV" "$MNT" 2>/tmp/remount-mount.err; then
+                pass "configured_pool_sync_remount"
+                MOUNTED=1
+
+                remount_content=$(cat "$MNT/configured_pool_flush.txt" 2>/tmp/remount-read.err || true)
+                if [ "$remount_content" = "configured pool authority" ]; then
+                    pass "configured_pool_remount_read"
+                else
+                    fail "configured_pool_remount_read" "expected configured pool authority, got '$remount_content'"
+                fi
+
+                flush_mtime_after=$(stat -c %Y "$MNT/configured_pool_flush.txt" 2>/tmp/remount-stat-after.err || true)
+                if [ -z "$flush_mtime_after" ]; then
+                    fail "configured_pool_remount_mtime" "$(head -1 /tmp/remount-stat-after.err)"
+                elif [ "$flush_mtime_after" = "$flush_mtime_before" ]; then
+                    pass "configured_pool_remount_mtime"
+                else
+                    fail "configured_pool_remount_mtime" "expected $flush_mtime_before, got $flush_mtime_after"
+                fi
+            else
+                fail "configured_pool_sync_remount" "$(head -3 /tmp/remount-mount.err | tr '\n' ' ')"
+                blocked "configured_pool_remount_read" "remount failed"
+                blocked "configured_pool_remount_mtime" "remount failed"
+            fi
+        else
+            fail "configured_pool_sync_remount" "$(head -3 /tmp/remount-umount.err | tr '\n' ' ')"
+            blocked "configured_pool_remount_read" "pre-remount umount failed"
+            blocked "configured_pool_remount_mtime" "pre-remount umount failed"
+        fi
+    else
+        blocked "configured_pool_sync_remount" "$configured_pool_flush_blocker"
+        blocked "configured_pool_remount_read" "$configured_pool_flush_blocker"
+        blocked "configured_pool_remount_mtime" "$configured_pool_flush_blocker"
+    fi
+
+    echo ""
     echo "-- smoke: clean teardown --"
-    if umount "$MNT" 2>/tmp/umount.err; then
+    if [ "$MOUNTED" -ne 1 ]; then
+        blocked "configured_pool_umount" "filesystem not mounted"
+    elif umount "$MNT" 2>/tmp/umount.err; then
         pass "configured_pool_umount"
         MOUNTED=0
     else
@@ -536,6 +587,9 @@ else
     blocked "configured_pool_readdir" "filesystem not mounted"
     blocked "configured_pool_write" "filesystem not mounted"
     blocked "configured_pool_syncfs" "filesystem not mounted"
+    blocked "configured_pool_sync_remount" "filesystem not mounted"
+    blocked "configured_pool_remount_read" "filesystem not mounted"
+    blocked "configured_pool_remount_mtime" "filesystem not mounted"
     blocked "configured_pool_freeze_fs_refused" "filesystem not mounted"
     blocked "configured_pool_remount_fs_refused" "filesystem not mounted"
     blocked "configured_pool_admin_refusal_write" "filesystem not mounted"
