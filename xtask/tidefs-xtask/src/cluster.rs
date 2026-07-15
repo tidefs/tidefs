@@ -273,7 +273,7 @@ pub fn check_erasure_coded_layout_current_workspace() -> Result<(), ClusterCheck
 
     for rel in [
         "crates/tidefs-replication-model/src/lib.rs",
-        "docs/ERASURE_CODED_LAYOUT_OW306.md",
+        "docs/ERASURE_CODED_STORE_AUTHORITY.md",
         "nix/tidefs-validation.sh",
     ] {
         check_required_file(&root, rel, &mut missing);
@@ -299,13 +299,14 @@ pub fn check_erasure_coded_layout_current_workspace() -> Result<(), ClusterCheck
     );
     check_source_markers(
         &root,
-        "docs/ERASURE_CODED_LAYOUT_OW306.md",
+        "docs/ERASURE_CODED_STORE_AUTHORITY.md",
         &[
             "`encode_single_parity_erasure_stripe()`",
             "`decode_single_parity_erasure_stripe()`",
-            "single missing data shard",
-            "missing parity shard",
-            "too many missing shards",
+            "data shard from parity plus the remaining data shards",
+            "parity shard from data shards",
+            "shards or simultaneous data/parity loss",
+            "This is a model boundary consumed by the EC store authority.",
         ],
         &mut missing,
     );
