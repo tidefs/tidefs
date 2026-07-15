@@ -1564,6 +1564,10 @@ fn check_committed_validation_artifacts(root: &Path, missing: &mut Vec<String>) 
         }
     };
 
+    for artifact_path in &paths {
+        check_committed_validation_artifact_has_no_scratch_paths(root, artifact_path, missing);
+    }
+
     let committed_artifacts = paths
         .iter()
         .filter(|path| !is_evidence_manifest_path(Path::new(path)))
@@ -1652,6 +1656,90 @@ fn check_committed_validation_artifacts(root: &Path, missing: &mut Vec<String>) 
             ));
         }
     }
+}
+
+fn check_committed_validation_artifact_has_no_scratch_paths(
+    root: &Path,
+    artifact_path: &str,
+    missing: &mut Vec<String>,
+) {
+    const SCRATCH_PATH_NEEDLES: &[(&[u8], &str)] = &[
+        (b"/tmp/tidefs-validation", "/tmp/tidefs-validation"),
+        (
+            b"/root/ai/tmp/tidefs-validation",
+            "/root/ai/tmp/tidefs-validation",
+        ),
+    ];
+
+    let path = root.join(artifact_path);
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            missing.push(format!("{artifact_path} could not be read: {err}"));
+            return;
+        }
+    };
+    let normalized_bytes = normalize_json_ascii_path_escapes(&bytes);
+    for (needle, display) in SCRATCH_PATH_NEEDLES {
+        if bytes_contain(&normalized_bytes, needle) {
+            missing.push(format!("{artifact_path} embeds scratch path `{display}`"));
+        }
+    }
+}
+
+fn bytes_contain(bytes: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty() && bytes.windows(needle.len()).any(|window| window == needle)
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn starts_with_ascii_case_insensitive(bytes: &[u8], prefix: &[u8]) -> bool {
+    bytes.len() >= prefix.len()
+        && bytes
+            .iter()
+            .zip(prefix)
+            .all(|(actual, expected)| actual.eq_ignore_ascii_case(expected))
+}
+
+fn normalize_json_ascii_path_escapes(bytes: &[u8]) -> Vec<u8> {
+    const JSON_ASCII_ESCAPE_PREFIX: &[u8] = br"\u00";
+
+    let mut normalized = Vec::with_capacity(bytes.len());
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let remaining = &bytes[offset..];
+        if remaining.starts_with(br"\/") {
+            normalized.push(b'/');
+            offset += br"\/".len();
+        } else if remaining.len() >= br"\u0000".len()
+            && starts_with_ascii_case_insensitive(remaining, JSON_ASCII_ESCAPE_PREFIX)
+        {
+            match (
+                hex_nibble(remaining[br"\u00".len()]),
+                hex_nibble(remaining[br"\u00".len() + 1]),
+            ) {
+                (Some(high), Some(low)) => {
+                    normalized.push((high << 4) | low);
+                    offset += br"\u0000".len();
+                }
+                _ => {
+                    normalized.push(bytes[offset]);
+                    offset += 1;
+                }
+            }
+        } else {
+            normalized.push(bytes[offset]);
+            offset += 1;
+        }
+    }
+    normalized
 }
 
 fn committed_validation_artifact_paths(root: &Path) -> Result<Vec<String>, String> {
@@ -5369,6 +5457,32 @@ non_claims = ["none"]
             missing.iter().any(|failure| failure.contains(
                 "validation/artifacts/kernel/runtime-output.json is unclassified runtime output missing v2 live-runtime evidence manifest"
             )),
+            "{missing:#?}"
+        );
+    }
+
+    #[test]
+    fn committed_validation_artifacts_reject_embedded_scratch_path() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        git(temp.path(), &["init"]);
+        write_artifact(
+            temp.path(),
+            "validation/artifacts/kernel/runtime-output.json",
+            r#"{"path":"\/root\u002Fai/tmp\/tidefs-validation/run"}"#,
+        );
+        git(
+            temp.path(),
+            &["add", "validation/artifacts/kernel/runtime-output.json"],
+        );
+
+        let mut missing = Vec::new();
+        check_committed_validation_artifacts(temp.path(), &mut missing);
+
+        assert!(
+            missing.iter().any(|failure| {
+                failure.contains("validation/artifacts/kernel/runtime-output.json")
+                    && failure.contains("embeds scratch path `/root/ai/tmp/tidefs-validation`")
+            }),
             "{missing:#?}"
         );
     }

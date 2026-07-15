@@ -2,8 +2,8 @@
   "schema_version": 1,
   "claim_id": "storage.intent.data_shape_honesty.v1",
   "issue": "https://github.com/tidefs/tidefs/issues/1981",
-  "validation_tier": "qemu-guest",
-  "artifact_scope": "required performance and fault rows for data-shape honesty",
+  "validation_tier": "source-model",
+  "artifact_scope": "source-model inventory of required performance and fault rows for data-shape honesty",
   "outcome": "skip",
   "skip_reason": "No qemu-guest performance or fault workload was executed in this source-model slice.",
   "rows": [
