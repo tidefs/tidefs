@@ -476,6 +476,7 @@ impl ExportOrchestrator {
                     .filter(|label| {
                         label.device_capacity_bytes > 0
                             && label.pool_guid == self.pool_guid
+                            && label.pool_name_str() == self.pool_name
                             && label.device_index == index as u32
                             && self
                                 .device_guids
@@ -1440,6 +1441,34 @@ mod tests {
     }
 
     #[test]
+    fn orchestrator_refuses_export_lifecycle_evidence_with_foreign_label_pool_name() {
+        let path = unique_export_path("foreign-pool-name");
+        let pool_guid = [0xAAu8; 16];
+        let device_guid = [0x01u8; 16];
+        write_export_label(&path, pool_guid, device_guid, 0, 1024 * 1024 * 1024, 1);
+        let config = DeviceConfig {
+            media_class: Default::default(),
+            path: path.clone(),
+            backing: DeviceBacking::DirectoryObjectStoreCompat,
+            class: DeviceClass::Data,
+            kind: DeviceKind::Single { path },
+            compression: None,
+            encryption: None,
+        };
+        let orch = ExportOrchestrator::new(
+            pool_guid,
+            "foreign-pool",
+            vec![config],
+            vec![device_guid],
+            false,
+        );
+
+        let evidence = orch.lifecycle_evidence();
+
+        assert_export_topology_refused(&evidence);
+    }
+
+    #[test]
     fn orchestrator_refuses_export_lifecycle_evidence_with_wrong_label_device_index() {
         let pool_guid = [0xAAu8; 16];
         let device_a = [0x01u8; 16];
@@ -1552,7 +1581,7 @@ mod tests {
         };
         let orch = ExportOrchestrator::new(
             pool_guid,
-            "count-drift",
+            "testpool",
             vec![config_a, config_b],
             vec![device_a, device_b],
             false,
@@ -1601,7 +1630,7 @@ mod tests {
         };
         let orch = ExportOrchestrator::new(
             pool_guid,
-            "generation-mismatch",
+            "testpool",
             vec![config_a, config_b],
             vec![device_a, device_b],
             false,
