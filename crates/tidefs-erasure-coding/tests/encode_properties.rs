@@ -259,6 +259,26 @@ fn receipt_reconstruct_rejects_invalid_available_set_width() {
 }
 
 #[test]
+fn receipt_reconstruct_rejects_invalid_config_before_shard_loss_classification() {
+    let c = config(0, 1, 8);
+    let available = vec![Some(ErasureShard {
+        index: 0,
+        kind: ShardKind::Parity,
+        bytes: vec![0; c.shard_len],
+    })];
+
+    let err = reconstruct_receipt_stripe(&c, &available).unwrap_err();
+
+    assert_eq!(
+        err,
+        ReceiptStripeError::InvalidAvailableSet {
+            slots: available.len(),
+            expected: c.stripe_width()
+        }
+    );
+}
+
+#[test]
 fn receipt_reconstruct_rejects_malformed_available_shard_slots() {
     assert_invalid_receipt_available_set(|available| {
         available[0].as_mut().unwrap().index = 1;

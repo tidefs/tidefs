@@ -313,6 +313,16 @@ pub fn reconstruct_receipt_stripe(
     available: &[Option<ErasureShard>],
 ) -> Result<ReceiptReconstructedStripe, ReceiptStripeError> {
     let expected = config.stripe_width();
+    if config.data_shards == 0
+        || config.parity_shards == 0
+        || config.shard_len == 0
+        || expected > 255
+    {
+        return Err(ReceiptStripeError::InvalidAvailableSet {
+            slots: available.len(),
+            expected,
+        });
+    }
     if available.len() != expected {
         return Err(ReceiptStripeError::InvalidAvailableSet {
             slots: available.len(),
