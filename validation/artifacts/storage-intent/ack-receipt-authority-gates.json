@@ -1,0 +1,225 @@
+{
+  "report_version": 1,
+  "generated_by": "tidefs-storage-intent-source-model::ack-receipt-authority-gates-v1",
+  "evidence_class": "storage-intent-ordering-membership-media-gates",
+  "validation_tier": "source-model",
+  "evidence_scope": "source-model authority gates for storage-intent acknowledgment ordering, membership, media, placement, trust, capacity, recovery, freshness, result, and refusal evidence",
+  "runtime_boundary": "model evidence only; this does not validate mounted runtime behavior, QEMU crash or fault behavior, fsync or fdatasync barrier semantics, distributed transport execution, successor or comparator wording, production readiness, or release readiness",
+  "related_claim_ids": [
+    "storage.intent.ack_receipt_honesty.v1"
+  ],
+  "reviewed_authorities": [
+    {
+      "path": "docs/STORAGE_INTENT_POLICY_AUTHORITY.md",
+      "role": "policy, evidence query, media role, RAM authority, and receipt gate boundary"
+    },
+    {
+      "path": "docs/STORAGE_INTENT_RESULT_REFUSAL_EVIDENCE_DESIGN.md",
+      "role": "caller-visible result and refusal projection boundary"
+    },
+    {
+      "path": "docs/LOCAL_DISTRIBUTED_RECEIPT_AUTHORITY.md",
+      "role": "placement receipt and shared receipt reference boundary"
+    },
+    {
+      "path": "validation/claims.toml",
+      "role": "blocked claim registry and evidence requirement authority"
+    }
+  ],
+  "gate_families": [
+    {
+      "id": "policy_receipt_identity",
+      "must_name": [
+        "scope",
+        "policy id",
+        "policy revision",
+        "requested acknowledgment class",
+        "earned acknowledgment class"
+      ],
+      "refuse_when": [
+        "policy identity is missing",
+        "the earned class is lower than the requested class",
+        "receipt identity cannot be retained or recalled"
+      ]
+    },
+    {
+      "id": "ordering_replay",
+      "must_name": [
+        "ordering cut",
+        "replay cut",
+        "barrier or intent publication state",
+        "committed root or durable intent refs"
+      ],
+      "refuse_when": [
+        "ordering is ambiguous",
+        "replay cannot reconstruct the promised cut",
+        "durable objective evidence is missing"
+      ]
+    },
+    {
+      "id": "membership_quorum_fencing",
+      "must_name": [
+        "membership epoch",
+        "quorum threshold",
+        "fencing state",
+        "partition state",
+        "per-authority receipt refs"
+      ],
+      "refuse_when": [
+        "quorum is absent",
+        "partition or split-brain state is ambiguous",
+        "fence evidence is stale or contradictory"
+      ]
+    },
+    {
+      "id": "media_capability_persistence",
+      "must_name": [
+        "media role",
+        "persistence domain",
+        "flush semantics",
+        "fence semantics",
+        "unsupported or unsafe media projection"
+      ],
+      "refuse_when": [
+        "the medium cannot legally satisfy the requested role",
+        "persistence or flush evidence is unavailable",
+        "RAM, cache, or volatile authority would be hidden as durable success"
+      ]
+    },
+    {
+      "id": "placement_receipt_authority",
+      "must_name": [
+        "placement receipt refs",
+        "receipt epoch",
+        "receipt generation",
+        "redundancy policy",
+        "payload digest",
+        "target count or target set"
+      ],
+      "refuse_when": [
+        "receipt refs are synthetic or unverifiable",
+        "placement generation is stale",
+        "replacement authority has not been published"
+      ]
+    },
+    {
+      "id": "trust_failure_domain",
+      "must_name": [
+        "trust domain refs",
+        "failure-domain refs",
+        "authorization state",
+        "cross-domain serving limits"
+      ],
+      "refuse_when": [
+        "the authority is outside the admitted trust domain",
+        "failure-domain evidence does not satisfy the policy",
+        "authorization evidence is unavailable"
+      ]
+    },
+    {
+      "id": "capacity_reserves",
+      "must_name": [
+        "capacity budget",
+        "protected reserve state",
+        "receipt-retirement reserve state",
+        "repair or evacuation reserve state"
+      ],
+      "refuse_when": [
+        "protected reserves would be spent by optional movement",
+        "receipt retirement cannot preserve old authority",
+        "admission would hide reserve exhaustion"
+      ]
+    },
+    {
+      "id": "recovery_rpo_rto",
+      "must_name": [
+        "recovery evidence",
+        "RPO state",
+        "RTO state",
+        "degraded-visible state",
+        "repair obligation"
+      ],
+      "refuse_when": [
+        "recovery cannot honor the promised receipt",
+        "RPO or RTO evidence is outside the requested objective",
+        "degraded service is not caller-visible"
+      ]
+    },
+    {
+      "id": "freshness",
+      "must_name": [
+        "freshness frontier",
+        "evidence cut",
+        "decision epoch",
+        "staleness reason when present"
+      ],
+      "refuse_when": [
+        "evidence is stale",
+        "the freshness frontier is unknown",
+        "the consumer's proof need exceeds retained evidence"
+      ]
+    },
+    {
+      "id": "result_refusal",
+      "must_name": [
+        "result or refusal class",
+        "caller-visible projection",
+        "retry law",
+        "retention proof",
+        "blocking gate refs"
+      ],
+      "refuse_when": [
+        "the surface cannot project the earned receipt",
+        "the answer would compress a typed refusal into generic success",
+        "retention proof is missing"
+      ]
+    }
+  ],
+  "durable_objective_gate": {
+    "must_have": [
+      "ordering evidence",
+      "replay evidence",
+      "media persistence evidence",
+      "flush and fence evidence",
+      "committed-root or durable-intent publication evidence",
+      "recovery evidence"
+    ],
+    "must_refuse_when": [
+      "any required durable objective evidence family is missing",
+      "the evidence cut is stale",
+      "the requested receipt cannot be retained and recalled"
+    ]
+  },
+  "quorum_partition_fencing_gate": {
+    "must_refuse_stronger_receipts_until": [
+      "current membership epoch is known",
+      "quorum threshold is satisfied",
+      "fencing evidence excludes split-brain authority",
+      "partition state is resolved or projected as degraded-visible"
+    ]
+  },
+  "volatile_authority_gate": {
+    "legal_only_when": [
+      "policy explicitly admits volatile authority",
+      "loss boundary is named",
+      "caller projection is weaker than durable success",
+      "durable requests receive refusal or degraded-visible result"
+    ],
+    "illegal_when": [
+      "RAM, cache, or volatile authority silently satisfies a durable receipt",
+      "the loss boundary is hidden",
+      "caller-visible result omits the weaker earned class"
+    ]
+  },
+  "non_claims": [
+    "This artifact does not validate mounted runtime receipt production.",
+    "This artifact does not validate QEMU crash or fault behavior.",
+    "This artifact does not validate POSIX fsync, fdatasync, FUA, or barrier semantics.",
+    "This artifact does not validate successor, comparator, production, or release-readiness wording."
+  ],
+  "outcome": {
+    "passed": true,
+    "violation_count": 0,
+    "violations": []
+  }
+}
