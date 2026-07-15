@@ -387,7 +387,7 @@ pub const FUSE_MOUNT_SURFACE_VALIDATION_CASES: &[PosixFilesystemAdapterSurfaceVa
         validation_class: PosixFilesystemAdapterSurfaceValidationClass::CapacityAccounting,
         status: PosixFilesystemAdapterValidationStatus::SourceBound,
         current_surface: "statfs reports allocator truth and fallocate mode zero zero-extends through allocator admission",
-        validation_output: "docs/LOCAL_STORAGE_ALLOCATOR_OW102.md and check-local-storage-allocator",
+        validation_output: "docs/CAPACITY_ACCOUNTING_AUTHORITY.md and check-local-storage-allocator",
         parent_gate_boundary: "does not prove production block-volume free-space semantics or unsupported fallocate modes",
         closes_parent_publishing_checklist_item: false,
     },
