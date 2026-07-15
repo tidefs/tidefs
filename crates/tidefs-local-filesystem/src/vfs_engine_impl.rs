@@ -3969,6 +3969,7 @@ const SNAP_KIND_ERROR: u8 = 0;
 const SNAP_NET_AUTH_KEY_LEN: usize = 32;
 const SNAP_NET_PUSH_HEADER_LEN: usize = 4 + 1 + 4 + SNAP_NET_AUTH_KEY_LEN + 4;
 const SNAP_NET_RESPONSE_HEADER_LEN: usize = 4 + 1 + 4;
+const SNAP_NET_RESPONSE_MESSAGE_MAX_LEN: usize = 64 * 1024;
 
 fn snap_net_len_u32(field: &str, len: usize) -> Result<u32, String> {
     u32::try_from(len)
@@ -4009,6 +4010,11 @@ fn parse_snap_net_response(data: &[u8]) -> Result<String, String> {
     }
     let kind = data[4];
     let msg_len = u32::from_le_bytes([data[5], data[6], data[7], data[8]]) as usize;
+    if msg_len > SNAP_NET_RESPONSE_MESSAGE_MAX_LEN {
+        return Err(format!(
+            "snapshot send: remote response message is too large for VSNP frame: {msg_len} bytes (max {SNAP_NET_RESPONSE_MESSAGE_MAX_LEN})"
+        ));
+    }
     let start = SNAP_NET_RESPONSE_HEADER_LEN;
     let frame_len = start
         .checked_add(msg_len)
@@ -6779,6 +6785,23 @@ mod tests {
         assert_eq!(
             parse_snap_net_response(&ack),
             Err("snapshot send: remote response truncated: need 11 bytes, got 10".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_snap_net_response_rejects_oversized_message_len() {
+        let mut ack = Vec::new();
+        ack.extend_from_slice(SNAP_NET_MAGIC);
+        ack.push(SNAP_KIND_ACK);
+        ack.extend_from_slice(&((SNAP_NET_RESPONSE_MESSAGE_MAX_LEN + 1) as u32).to_le_bytes());
+
+        assert_eq!(
+            parse_snap_net_response(&ack),
+            Err(format!(
+                "snapshot send: remote response message is too large for VSNP frame: {} bytes (max {})",
+                SNAP_NET_RESPONSE_MESSAGE_MAX_LEN + 1,
+                SNAP_NET_RESPONSE_MESSAGE_MAX_LEN
+            ))
         );
     }
 
