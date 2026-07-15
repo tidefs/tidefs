@@ -432,7 +432,7 @@ MANIFEST
       test_dir="$(mktemp -d)"
       trap 'rm -rf "$test_dir"' RETURN
 
-      expect_json_string quote-and-backslash 'quote"slash\' '"quote\"slash\\"'
+      expect_json_string quote-and-backslash $'quote"slash\\' '"quote\"slash\\"'
       expect_json_string control-bytes $'line\nnext\tcarriage\rreturn' '"line\nnext\tcarriage\rreturn"'
       expect_qemu_exit_json_value numeric 124 124
       expect_qemu_exit_json_value max 255 255
@@ -952,7 +952,7 @@ INITSCRIPT
     chmod +x "$RUN_DIR/init"
 
     echo "--- Building initramfs ---"
-    (cd "$RUN_DIR" && find . | cpio -o -H newc) | gzip > "$RUN_DIR/initramfs.gz"
+    (cd "$RUN_DIR" && find . | "$CPIO" -o -H newc) | gzip > "$RUN_DIR/initramfs.gz"
 
     echo "--- Booting QEMU ---"
     QEMU_EXIT=0

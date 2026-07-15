@@ -357,7 +357,7 @@ self_test_parser() {
   test_dir="$(mktemp -d)"
   trap 'rm -rf "$test_dir"' RETURN
 
-  expect_json_string quote-and-backslash 'quote"slash\' '"quote\"slash\\"'
+  expect_json_string quote-and-backslash $'quote"slash\\' '"quote\"slash\\"'
   expect_json_string control-bytes $'line\nnext\tcarriage\rreturn' '"line\nnext\tcarriage\rreturn"'
   expect_qemu_exit_json_value numeric 124 124
   expect_qemu_exit_json_value max 255 255
@@ -750,7 +750,7 @@ done
 
 # Copy the kernel module
 cp "$MODULE_KO" "$RUN_DIR/lib/modules/tidefs_posix_vfs.ko"
-echo "  Module .ko: $(ls -sh "$MODULE_KO" | awk '{print $1}')"
+echo "  Module .ko: $(du -h "$MODULE_KO" | awk '{print $1}')"
 
 # ---- Init script -----------------------------------------------------
 
@@ -870,8 +870,8 @@ chmod +x "$RUN_DIR/init"
 # ---- Build initramfs -------------------------------------------------
 
 echo "--- Building initramfs ---"
-(cd "$RUN_DIR" && find . ! -path ./validation/\* | cpio -o -H newc 2>/dev/null) | gzip > "$RUN_DIR/initramfs.gz"
-echo "  Initramfs: $(ls -sh "$RUN_DIR/initramfs.gz" | awk '{print $1}')"
+(cd "$RUN_DIR" && find . ! -path ./validation/\* | "$CPIO" -o -H newc 2>/dev/null) | gzip > "$RUN_DIR/initramfs.gz"
+echo "  Initramfs: $(du -h "$RUN_DIR/initramfs.gz" | awk '{print $1}')"
 
 # ---- Record environment ----------------------------------------------
 
