@@ -7621,6 +7621,7 @@ impl FuseVfsAdapter {
         offset: u64,
         length: u64,
         payload: AuthoritativeRangePayload<'_>,
+        preserve_partial_dirty_pages: bool,
     ) -> Result<(), Errno> {
         if length == 0 {
             return Ok(());
@@ -7650,7 +7651,8 @@ impl FuseVfsAdapter {
                     || (copy_end < page_end
                         && self.dirty_trackers_overlap_range(ino, copy_end, page_end - copy_end));
                 let page_should_remain_dirty = !page_fully_replaced
-                    && (tracked_dirty_outside_authoritative
+                    && ((preserve_partial_dirty_pages && page_was_dirty)
+                        || tracked_dirty_outside_authoritative
                         || (page_was_dirty && !tracked_dirty_in_page));
                 if let Some(mut page) = cache.lookup(ino, poff) {
                     page.data_mut()[dst_start..dst_end].copy_from_slice(&authoritative);
@@ -7677,16 +7679,23 @@ impl FuseVfsAdapter {
             return Ok(());
         }
         if let Some(ref wb_cache) = self.writeback_page_cache {
+            let split_dirty_mirrors = !Arc::ptr_eq(wb_cache, &self.write_page_cache);
             self.reconcile_page_cache_after_authoritative_range(
-                wb_cache, ino, offset, length, payload,
+                wb_cache,
+                ino,
+                offset,
+                length,
+                payload,
+                split_dirty_mirrors,
             )?;
-            if !Arc::ptr_eq(wb_cache, &self.write_page_cache) {
+            if split_dirty_mirrors {
                 self.reconcile_page_cache_after_authoritative_range(
                     &self.write_page_cache,
                     ino,
                     offset,
                     length,
                     payload,
+                    split_dirty_mirrors,
                 )?;
             }
         } else {
@@ -7696,6 +7705,7 @@ impl FuseVfsAdapter {
                 offset,
                 length,
                 payload,
+                false,
             )?;
         }
         self.clear_dirty_trackers_for_authoritative_range(ino, offset, length);
@@ -43845,6 +43855,128 @@ mod tests {
                 .is_dirty(ino),
             Some(false),
             "fully reconciled inode reclaim cache should be clean"
+        );
+    }
+
+    #[test]
+    fn writeback_cached_clean_write_through_helper_reconciles_split_dirty_page_caches() {
+        let mut fixture = adapter_fixture_with_writeback_cache();
+        fixture.adapter.writeback_page_cache = Some(Arc::new(PageCache::new(64, 4096)));
+        let ctx = root_ctx();
+        let (inode, _adapter_fh, _engine_fh) = create_adapter_file_handle(
+            &fixture.adapter,
+            &ctx,
+            b"wb-clean-write-through-helper-split-dirty-page-caches.bin",
+            libc::O_RDWR as u32,
+        );
+        let ino = inode.get();
+        let wb_cache = fixture
+            .adapter
+            .writeback_page_cache
+            .as_ref()
+            .expect("writeback page cache")
+            .clone();
+        let page_size = fixture.adapter.write_page_cache.page_size();
+        let page_size_u64 = u64::try_from(page_size).expect("page size fits u64");
+        let dirty_start = page_size / 4;
+        let dirty_len = page_size / 16;
+        let dirty_offset = u64::try_from(dirty_start).expect("dirty offset fits u64");
+        let dirty_len_u32 = u32::try_from(dirty_len).expect("dirty length fits u32");
+        let replacement = vec![0xC4; dirty_len];
+        let mut expected_wb = vec![0xAA; page_size];
+        let mut expected_write = vec![0xBB; page_size];
+        expected_wb[dirty_start..dirty_start + dirty_len].copy_from_slice(&replacement);
+        expected_write[dirty_start..dirty_start + dirty_len].copy_from_slice(&replacement);
+
+        wb_cache
+            .insert(ino, 0)
+            .expect("insert writeback dirty mirror");
+        {
+            let mut page = wb_cache.lookup(ino, 0).expect("lookup writeback mirror");
+            page.data_mut().fill(0xAA);
+            page.mark_dirty();
+        }
+        fixture
+            .adapter
+            .write_page_cache
+            .insert(ino, 0)
+            .expect("insert write page dirty mirror");
+        {
+            let mut page = fixture
+                .adapter
+                .write_page_cache
+                .lookup(ino, 0)
+                .expect("lookup write page mirror");
+            page.data_mut().fill(0xBB);
+            page.mark_dirty();
+        }
+        {
+            let mut cache = fixture.adapter.writeback_cache.lock().unwrap();
+            cache.insert(ino);
+            cache.mark_dirty(ino, page_size_u64);
+        }
+        let worker_tracker = fixture
+            .adapter
+            .write_dispatch
+            .lock()
+            .unwrap()
+            .dirty_page_tracker_arc();
+        worker_tracker
+            .lock()
+            .unwrap()
+            .mark_dirty(ino, dirty_offset, u64::from(dirty_len_u32))
+            .expect("seed overlapping worker dirty range");
+
+        fixture
+            .adapter
+            .record_clean_write_through_after_write(ino, dirty_offset, dirty_len_u32, &replacement)
+            .expect("record clean write-through after write");
+
+        {
+            let page = wb_cache
+                .lookup(ino, 0)
+                .expect("writeback mirror remains resident");
+            assert_eq!(page.data(), expected_wb.as_slice());
+            assert!(
+                page.is_dirty(),
+                "partial authoritative clean write-through should preserve split writeback dirty page"
+            );
+        }
+        {
+            let page = fixture
+                .adapter
+                .write_page_cache
+                .lookup(ino, 0)
+                .expect("write page mirror remains resident");
+            assert_eq!(page.data(), expected_write.as_slice());
+            assert!(
+                page.is_dirty(),
+                "partial authoritative clean write-through should preserve split write dirty page"
+            );
+        }
+        assert!(!wb_cache.dirty_pages_for_inode(ino).is_empty());
+        assert!(!fixture
+            .adapter
+            .write_page_cache
+            .dirty_pages_for_inode(ino)
+            .is_empty());
+        assert!(
+            worker_tracker
+                .lock()
+                .unwrap()
+                .get_dirty_ranges(ino)
+                .is_empty(),
+            "authoritative subrange should be cleared from the worker dirty tracker"
+        );
+        assert_eq!(
+            fixture
+                .adapter
+                .writeback_cache
+                .lock()
+                .unwrap()
+                .is_dirty(ino),
+            Some(true),
+            "partially reconciled split dirty page caches should keep inode reclaim cache dirty"
         );
     }
 
