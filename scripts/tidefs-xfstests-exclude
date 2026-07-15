@@ -25,7 +25,7 @@
 #   generic/307: mounted setfacl ctime update plus remount persistence.
 #   generic/318: user-namespace ACL id mapping plus remount persistence; no
 #     mounted idmap proof is recorded here.
-#   generic/319: mkdir/create mounted wiring for inherited default ACL xattrs.
+#   generic/319: mounted mkdir inheritance for directory default ACL xattrs.
 #   generic/444: mounted create SGID/default ACL interaction.
 generic/099
 generic/237
