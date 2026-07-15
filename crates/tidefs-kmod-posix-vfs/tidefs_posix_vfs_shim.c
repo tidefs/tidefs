@@ -4702,9 +4702,11 @@ static int tidefs_posix_vfs_set_acl(struct mnt_idmap *idmap,
 
 	if (type == ACL_TYPE_ACCESS)
 		xattr_name = XATTR_NAME_POSIX_ACL_ACCESS;
-	else if (type == ACL_TYPE_DEFAULT)
+	else if (type == ACL_TYPE_DEFAULT) {
+		if (!S_ISDIR(inode->i_mode))
+			return acl ? -EACCES : 0;
 		xattr_name = XATTR_NAME_POSIX_ACL_DEFAULT;
-	else
+	} else
 		return -EINVAL;
 
 	if (type == ACL_TYPE_ACCESS && acl) {
