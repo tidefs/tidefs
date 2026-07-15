@@ -159,6 +159,28 @@ impl DiscardCapability {
     }
 }
 
+fn composite_discard_capability(
+    capabilities: impl IntoIterator<Item = DiscardCapability>,
+) -> DiscardCapability {
+    capabilities
+        .into_iter()
+        .max_by_key(|capability| capability.composite_priority())
+        .unwrap_or(DiscardCapability::Unknown)
+}
+
+impl DiscardCapability {
+    const fn composite_priority(self) -> u8 {
+        match self {
+            Self::Supported => 0,
+            Self::Unsupported => 1,
+            Self::Unverified => 2,
+            Self::Ignored => 3,
+            Self::Unknown => 4,
+            Self::Refused => 5,
+        }
+    }
+}
+
 /// Configuration for a single device.
 #[derive(Clone, Debug)]
 pub struct DeviceConfig {
@@ -1497,15 +1519,7 @@ impl DeviceImpl for MirrorDevice {
     }
 
     fn discard_capability(&self) -> DiscardCapability {
-        if self.members.is_empty() {
-            return DiscardCapability::Unknown;
-        }
-
-        self.members
-            .iter()
-            .map(DeviceImpl::discard_capability)
-            .find(|capability| !capability.is_supported())
-            .unwrap_or(DiscardCapability::Supported)
+        composite_discard_capability(self.members.iter().map(DeviceImpl::discard_capability))
     }
 
     fn discard_range(&mut self, offset: u64, len: u64) -> Result<()> {
@@ -1964,15 +1978,7 @@ impl DeviceImpl for ParityRaidDevice {
     }
 
     fn discard_capability(&self) -> DiscardCapability {
-        if self.children.is_empty() {
-            return DiscardCapability::Unknown;
-        }
-
-        self.children
-            .iter()
-            .map(DeviceImpl::discard_capability)
-            .find(|capability| !capability.is_supported())
-            .unwrap_or(DiscardCapability::Supported)
+        composite_discard_capability(self.children.iter().map(DeviceImpl::discard_capability))
     }
 }
 
@@ -4945,5 +4951,54 @@ mod tests {
         }
         assert!(DiscardCapability::Supported.is_supported());
         assert_eq!(DiscardCapability::Supported.as_str(), "supported");
+    }
+
+    #[test]
+    fn composite_discard_capability_reports_empty_as_unknown() {
+        assert_eq!(composite_discard_capability([]), DiscardCapability::Unknown);
+    }
+
+    #[test]
+    fn composite_discard_capability_reports_supported_only_when_all_supported() {
+        assert_eq!(
+            composite_discard_capability([
+                DiscardCapability::Supported,
+                DiscardCapability::Supported,
+            ]),
+            DiscardCapability::Supported
+        );
+    }
+
+    #[test]
+    fn composite_discard_capability_prioritizes_fail_closed_states() {
+        for capabilities in [
+            [DiscardCapability::Unsupported, DiscardCapability::Refused],
+            [DiscardCapability::Refused, DiscardCapability::Unsupported],
+        ] {
+            assert_eq!(
+                composite_discard_capability(capabilities),
+                DiscardCapability::Refused
+            );
+        }
+
+        for capabilities in [
+            [DiscardCapability::Unverified, DiscardCapability::Unknown],
+            [DiscardCapability::Unknown, DiscardCapability::Unverified],
+        ] {
+            assert_eq!(
+                composite_discard_capability(capabilities),
+                DiscardCapability::Unknown
+            );
+        }
+
+        for capabilities in [
+            [DiscardCapability::Unsupported, DiscardCapability::Ignored],
+            [DiscardCapability::Ignored, DiscardCapability::Unsupported],
+        ] {
+            assert_eq!(
+                composite_discard_capability(capabilities),
+                DiscardCapability::Ignored
+            );
+        }
     }
 }
