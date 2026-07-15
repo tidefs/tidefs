@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
-use tidefs_local_object_store::{IntegrityDigest64, LocalObjectStore};
+use tidefs_local_object_store::{IntegrityDigest64, LocalObjectStore, Pool};
 use tidefs_types_vfs_core::{Generation, InodeId, NodeKind};
 
 use crate::constants::*;
@@ -625,6 +625,77 @@ pub fn fuzz_decode_intent_log_entry(data: &[u8]) {
     let _ = decode_intent_log_entry(data);
 }
 
+struct IntentLogRawStateAuthority;
+
+impl IntentLogRawStateAuthority {
+    fn read_head_entry_id(store: &LocalObjectStore) -> Result<u64> {
+        match store.get(intent_log_head_object_key())? {
+            Some(ref bytes) if bytes.len() == 8 => {
+                Ok(u64::from_le_bytes(bytes[..8].try_into().map_err(|_| {
+                    FileSystemError::CorruptState {
+                        reason: "intent log head is not 8 bytes",
+                    }
+                })?))
+            }
+            Some(_) => Err(FileSystemError::CorruptState {
+                reason: "intent log head has wrong size",
+            }),
+            None => Ok(0),
+        }
+    }
+
+    fn read_entry(store: &LocalObjectStore, entry_id: u64) -> Result<Option<IntentLogEntry>> {
+        store
+            .get(intent_log_entry_object_key(entry_id))?
+            .map(|bytes| decode_intent_log_entry(&bytes))
+            .transpose()
+    }
+
+    fn write_entry(store: &mut LocalObjectStore, entry: &IntentLogEntry) -> Result<()> {
+        let bytes = try_encode_intent_log_entry(entry)?;
+        store.put(intent_log_entry_object_key(entry.entry_id), &bytes)?;
+        Ok(())
+    }
+
+    fn write_head_entry_id(store: &mut LocalObjectStore, next_entry_id: u64) -> Result<()> {
+        let bytes = next_entry_id.to_le_bytes();
+        store.put(intent_log_head_object_key(), &bytes)?;
+        Ok(())
+    }
+
+    fn delete_entry(store: &mut LocalObjectStore, entry_id: u64) -> Result<()> {
+        store.delete(intent_log_entry_object_key(entry_id))?;
+        Ok(())
+    }
+
+    fn read_data_payload(store: &LocalObjectStore, entry_id: u64) -> Result<Option<Vec<u8>>> {
+        Ok(store.get(intent_log_data_object_key(entry_id))?)
+    }
+
+    fn write_data_payload(
+        store: &mut LocalObjectStore,
+        entry_id: u64,
+        payload: &[u8],
+    ) -> Result<()> {
+        store.put(intent_log_data_object_key(entry_id), payload)?;
+        Ok(())
+    }
+
+    fn delete_data_payload(store: &mut LocalObjectStore, entry_id: u64) -> Result<()> {
+        store.delete(intent_log_data_object_key(entry_id))?;
+        Ok(())
+    }
+
+    fn delete_head(store: &mut LocalObjectStore) -> Result<()> {
+        store.delete(intent_log_head_object_key())?;
+        Ok(())
+    }
+
+    fn sync_all(store: &mut LocalObjectStore) -> Result<()> {
+        store.sync_all().map_err(FileSystemError::from)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // IntentLog
 // ---------------------------------------------------------------------------
@@ -956,29 +1027,12 @@ impl IntentLog {
     /// Load the intent log from the object store during mount/recovery
     /// with a custom config.
     pub fn load_with_config(store: &LocalObjectStore, config: IntentLogConfig) -> Result<Self> {
-        let head_bytes = store.get(intent_log_head_object_key())?;
-        let head_entry_id: u64 = match head_bytes {
-            Some(ref bytes) if bytes.len() == 8 => {
-                u64::from_le_bytes(bytes[..8].try_into().map_err(|_| {
-                    FileSystemError::CorruptState {
-                        reason: "intent log head is not 8 bytes",
-                    }
-                })?)
-            }
-            Some(_) => {
-                return Err(FileSystemError::CorruptState {
-                    reason: "intent log head has wrong size",
-                });
-            }
-            None => 0,
-        };
+        let head_entry_id = IntentLogRawStateAuthority::read_head_entry_id(store)?;
 
         let mut entries = Vec::new();
         for entry_id in 0..head_entry_id {
-            let key = intent_log_entry_object_key(entry_id);
-            match store.get(key)? {
-                Some(bytes) => {
-                    let entry = decode_intent_log_entry(&bytes)?;
+            match IntentLogRawStateAuthority::read_entry(store, entry_id)? {
+                Some(entry) => {
                     if entry.entry_id != entry_id {
                         return Err(FileSystemError::CorruptState {
                             reason: "intent log entry id mismatch",
@@ -1127,6 +1181,14 @@ impl IntentLog {
         self.next_entry_id
     }
 
+    pub(crate) fn write_next_data_payload(&self, pool: &mut Pool, payload: &[u8]) -> Result<()> {
+        IntentLogRawStateAuthority::write_data_payload(
+            pool.raw_primary_store_mut(),
+            self.next_entry_id(),
+            payload,
+        )
+    }
+
     /// Write all batched (unflushed) entries to durable storage.
     ///
     /// This writes each queued entry to the store (and LOG_DEVICE if configured),
@@ -1147,18 +1209,14 @@ impl IntentLog {
         // into the object store for the group commit.
         for idx in flush_from..flush_to {
             let entry = &self.entries[idx];
-            let bytes = try_encode_intent_log_entry(entry)?;
-            store.put(intent_log_entry_object_key(entry.entry_id), &bytes)?;
+            IntentLogRawStateAuthority::write_entry(store, entry)?;
         }
 
         // Single head-pointer update for the entire batch
-        store.put(
-            intent_log_head_object_key(),
-            &self.next_entry_id.to_le_bytes(),
-        )?;
+        IntentLogRawStateAuthority::write_head_entry_id(store, self.next_entry_id)?;
 
         // Durable sync — one fsync for the entire batch
-        store.sync_all().map_err(FileSystemError::from)?;
+        IntentLogRawStateAuthority::sync_all(store)?;
 
         // Record the batch fill interval for adaptive tuning.
         let now = Instant::now();
@@ -1298,7 +1356,7 @@ impl IntentLog {
     /// Flush any batched entries and sync to durable storage.
     pub fn flush_and_sync(&mut self, store: &mut LocalObjectStore) -> Result<()> {
         self.flush(store)?;
-        store.sync_all().map_err(FileSystemError::from)
+        IntentLogRawStateAuthority::sync_all(store)
     }
 
     /// Flush batched entries and sync the store.
@@ -1310,10 +1368,10 @@ impl IntentLog {
     /// intended mutations through the normal transaction-root path).
     pub fn clear(&mut self, store: &mut LocalObjectStore) -> Result<()> {
         for entry in &self.entries {
-            store.delete(intent_log_entry_object_key(entry.entry_id))?;
-            store.delete(intent_log_data_object_key(entry.entry_id))?;
+            IntentLogRawStateAuthority::delete_entry(store, entry.entry_id)?;
+            IntentLogRawStateAuthority::delete_data_payload(store, entry.entry_id)?;
         }
-        store.delete(intent_log_head_object_key())?;
+        IntentLogRawStateAuthority::delete_head(store)?;
 
         if let Some(ref mut log_device) = self.log_device {
             log_device.truncate()?;
@@ -1357,6 +1415,20 @@ impl IntentLog {
         }
         removed_ids
     }
+
+    pub(crate) fn remove_entries_for_inode_from_store(
+        &mut self,
+        inode_id: InodeId,
+        store: &mut LocalObjectStore,
+    ) -> Vec<u64> {
+        let removed_ids = self.remove_entries_for_inode(inode_id);
+        for entry_id in &removed_ids {
+            let _ = IntentLogRawStateAuthority::delete_entry(store, *entry_id);
+            let _ = IntentLogRawStateAuthority::delete_data_payload(store, *entry_id);
+        }
+        removed_ids
+    }
+
     /// After crash recovery replay succeeds, call `clear` to remove them.
     #[allow(dead_code)] // INTENT: intent-log types for planned log device fast path and crash recovery
     pub fn pending_entries(&self) -> &[IntentLogEntry] {
@@ -1639,15 +1711,15 @@ pub(crate) fn replay_entry(
             length,
             ..
         } => {
-            let data_key = intent_log_data_object_key(entry.entry_id);
-            let payload = match store.get(data_key)? {
-                Some(bytes) => bytes,
-                None => {
-                    return Err(FileSystemError::CorruptState {
-                        reason: "intent log replay: missing data payload",
-                    });
-                }
-            };
+            let payload =
+                match IntentLogRawStateAuthority::read_data_payload(store, entry.entry_id)? {
+                    Some(bytes) => bytes,
+                    None => {
+                        return Err(FileSystemError::CorruptState {
+                            reason: "intent log replay: missing data payload",
+                        });
+                    }
+                };
 
             let mut record = match state.inodes.get(inode_id) {
                 Some(rec) => rec.clone(),
@@ -2016,15 +2088,15 @@ pub(crate) fn batched_replay_uncommitted(
                 length,
                 ..
             } => {
-                let data_key = intent_log_data_object_key(entry.entry_id);
-                let payload = match store.get(data_key)? {
-                    Some(bytes) => bytes,
-                    None => {
-                        return Err(FileSystemError::CorruptState {
-                            reason: "intent log batched replay: missing data payload",
-                        });
-                    }
-                };
+                let payload =
+                    match IntentLogRawStateAuthority::read_data_payload(store, entry.entry_id)? {
+                        Some(bytes) => bytes,
+                        None => {
+                            return Err(FileSystemError::CorruptState {
+                                reason: "intent log batched replay: missing data payload",
+                            });
+                        }
+                    };
                 batcher.push(*inode_id, *offset, *length, payload);
             }
             // Non-write entries are replayed individually.
@@ -2533,6 +2605,95 @@ mod tests {
             accepted,
             "entry should be accepted when below pressure threshold"
         );
+    }
+
+    fn sync_write_raw_record(entry_id: u64) -> IntentLogEntry {
+        IntentLogEntry {
+            entry_id,
+            entry_kind: IntentLogEntryKind::SyncWriteRange {
+                inode_id: InodeId::new(100 + entry_id),
+                offset: entry_id * 4096,
+                length: 4096,
+                payload_digest: IntegrityDigest64(0xCAFE0000 + entry_id),
+                data_version: 1,
+            },
+            root_anchor: test_root_anchor(),
+            timestamp_ns: test_timestamp(),
+        }
+    }
+
+    #[test]
+    fn load_missing_raw_head_returns_empty_log() {
+        let (store, _dir) = test_store();
+
+        let log = IntentLog::load(&store).expect("load without head");
+
+        assert!(log.is_empty());
+        assert_eq!(log.next_entry_id(), 0);
+        assert_eq!(log.pending_flush_count(), 0);
+    }
+
+    #[test]
+    fn load_corrupt_raw_head_errors() {
+        let (mut store, _dir) = test_store();
+        store
+            .put(intent_log_head_object_key(), b"short")
+            .expect("store corrupt head");
+
+        let result = IntentLog::load(&store);
+
+        assert!(matches!(
+            result,
+            Err(FileSystemError::CorruptState {
+                reason: "intent log head has wrong size"
+            })
+        ));
+    }
+
+    #[test]
+    fn load_missing_entry_below_head_stops_at_gap() {
+        let (mut store, _dir) = test_store();
+        let entry0 = sync_write_raw_record(0);
+        let entry2 = sync_write_raw_record(2);
+        let entry0_bytes = try_encode_intent_log_entry(&entry0).expect("encode entry 0");
+        let entry2_bytes = try_encode_intent_log_entry(&entry2).expect("encode entry 2");
+
+        store
+            .put(intent_log_entry_object_key(0), &entry0_bytes)
+            .expect("store entry 0");
+        store
+            .put(intent_log_entry_object_key(2), &entry2_bytes)
+            .expect("store entry 2");
+        store
+            .put(intent_log_head_object_key(), &3u64.to_le_bytes())
+            .expect("store head");
+
+        let log = IntentLog::load(&store).expect("load with gap");
+
+        assert_eq!(log.len(), 1);
+        assert_eq!(log.next_entry_id(), 1);
+        assert_eq!(log.entries[0].entry_id, 0);
+    }
+
+    #[test]
+    fn load_corrupt_entry_record_errors() {
+        let (mut store, _dir) = test_store();
+        store
+            .put(intent_log_entry_object_key(0), b"not an intent log entry")
+            .expect("store corrupt entry");
+        store
+            .put(intent_log_head_object_key(), &1u64.to_le_bytes())
+            .expect("store head");
+
+        let result = IntentLog::load(&store);
+
+        assert!(matches!(
+            result,
+            Err(FileSystemError::Decode {
+                object: "intent log entry",
+                ..
+            })
+        ));
     }
 
     #[test]
