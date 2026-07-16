@@ -3115,6 +3115,28 @@ impl Pool {
                 reason: "device not found",
             },
         )?;
+        let replacement_log_device = if self
+            .config
+            .devices
+            .iter()
+            .position(|config| config.class == DeviceClass::IntentLog)
+            == Some(idx)
+        {
+            let remaining_configs: Vec<_> = self
+                .config
+                .devices
+                .iter()
+                .enumerate()
+                .filter(|(device_idx, _)| *device_idx != idx)
+                .map(|(_, config)| config.clone())
+                .collect();
+            Some(open_log_device_for_devices(&remaining_configs)?)
+        } else {
+            None
+        };
+        if replacement_log_device.is_some() {
+            self.close_log_device()?;
+        }
         self.devices.remove(idx);
         if idx < self.device_guids.len() {
             self.device_guids.remove(idx);
@@ -3132,6 +3154,9 @@ impl Pool {
         }
         if idx < self.config.devices.len() {
             self.config.devices.remove(idx);
+        }
+        if let Some(log_device) = replacement_log_device {
+            self.log_device = log_device;
         }
         let total_bytes: Vec<u64> = self
             .devices
@@ -8300,14 +8325,23 @@ mod tests {
         assert_eq!(pool.log_device_count(), 1);
         assert!(pool.log_device_healthy());
 
-        // Write via log device
+        // Write via log device.
         let key = ObjectKey::from_name(b"lifecycle-test");
-        pool.put(IoClass::IntentLog, key, b"before-remove").unwrap();
+        pool.log_device_append(b"before-remove").unwrap();
+        let log_path = log_dir.join(LOG_DEVICE_FILENAME);
+        let log_len_before_remove = std::fs::metadata(&log_path).unwrap().len();
 
-        // Remove the log device
-        pool.remove_device(&log_dir).unwrap();
+        // Safe removal must close the dedicated writer before detach.
+        let removal = pool.safe_remove_device(&log_dir).unwrap();
+        assert!(removal.complete);
         assert_eq!(pool.log_device_count(), 0);
         assert!(!pool.log_device_healthy());
+        assert!(!pool.has_log_device());
+        pool.log_device_append(b"after-remove").unwrap();
+        assert_eq!(
+            std::fs::metadata(&log_path).unwrap().len(),
+            log_len_before_remove
+        );
 
         // Writes should still succeed via data fallback
         pool.put(IoClass::IntentLog, key, b"after-remove").unwrap();
