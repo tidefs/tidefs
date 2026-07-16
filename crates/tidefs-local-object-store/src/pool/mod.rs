@@ -3314,6 +3314,14 @@ impl Pool {
         for receipt in placement_receipts.into_values() {
             current_logical_keys.insert(receipt.object_key);
 
+            // Older receipt encodings have no sealed planner replay authority.
+            // They remain readable for in-tree harness data, but cannot prove
+            // which payload and targets are current enough to retire a source.
+            if receipt.planner_replay_receipt.is_none() {
+                mark_failed(&mut result, receipt.object_key);
+                continue;
+            }
+
             // Placement receipts are copied beyond their payload targets. If
             // the retiring device is not a current target and an identical
             // receipt and its payload are readable from a survivor, syncing
@@ -6836,6 +6844,64 @@ mod tests {
             payload_digest,
             removed_device_guid,
         ));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn safe_remove_device_refuses_current_receipt_without_replay_authority() {
+        let root = temp_dir("safe-remove-refuses-replayless-current-receipt");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = multi_data_device_config(&root, 3);
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::replicated(2),
+            ..PoolProperties::default()
+        };
+        let mut pool = Pool::create(config, properties, &test_options()).unwrap();
+        set_deterministic_device_guids(&mut pool);
+
+        let key = ObjectKey::from_name(b"replayless-current-removal-receipt");
+        let payload = b"source retirement requires sealed locator authority";
+        pool.put(IoClass::Data, key, payload).unwrap();
+        let receipt = pool
+            .placement_receipt_for_key(IoClass::Data, key)
+            .unwrap()
+            .expect("placement receipt before removal");
+        let victim_idx = pool.resolve_receipt_target(&receipt.targets[0]).unwrap();
+        let victim_path = pool.devices[victim_idx].root().to_path_buf();
+
+        // Re-encode the current receipt as the replayless V2 format still
+        // accepted for older in-tree harness data. Every receipt copy is V2,
+        // so no sealed locator authority remains for source retirement.
+        let mut replayless = receipt.encode().unwrap();
+        replayless[..PLACEMENT_RECEIPT_MAGIC_V2.len()].copy_from_slice(PLACEMENT_RECEIPT_MAGIC_V2);
+        const V2_FIXED_WIRE_LEN: usize = 106;
+        const RECEIPT_TARGET_WIRE_LEN: usize = 55;
+        let v2_len = V2_FIXED_WIRE_LEN + receipt.targets.len() * RECEIPT_TARGET_WIRE_LEN;
+        replayless.truncate(v2_len);
+        let decoded = PlacementReceipt::decode(&replayless).expect("V2 placement receipt");
+        assert!(decoded.planner_replay_receipt.is_none());
+
+        let receipt_key = placement_receipt_object_key(key);
+        for device in &mut pool.devices {
+            device.put(receipt_key, &replayless).unwrap();
+        }
+
+        let removal = pool.safe_remove_device(&victim_path).unwrap();
+
+        assert!(!removal.complete);
+        assert_eq!(removal.objects_failed, 1);
+        assert_eq!(removal.failed_keys, vec![key]);
+        assert_eq!(pool.stats().device_count, 3);
+        assert!(pool
+            .devices
+            .iter()
+            .any(|device| device.root() == victim_path));
+        assert_eq!(
+            pool.get(IoClass::Data, key).unwrap(),
+            Some(payload.to_vec())
+        );
+        assert!(root.join(DEVICE_REMOVAL_MARKER_FILE).exists());
 
         let _ = std::fs::remove_dir_all(&root);
     }
