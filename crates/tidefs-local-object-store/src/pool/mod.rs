@@ -1001,21 +1001,92 @@ pub struct Pool {
 }
 
 /// File written to pool root during device removal to enable
-/// crash-safe resume on next pool open. Contains the path of the
-/// device being removed.
+/// crash-safe resume on next pool open.
 const DEVICE_REMOVAL_MARKER_FILE: &str = ".tidefs_device_removal_pending";
 const DEVICE_REMOVAL_MARKER_TMP_FILE: &str = ".tidefs_device_removal_pending.tmp";
+const DEVICE_REMOVAL_MARKER_MAGIC_V1: &[u8; 8] = b"TFSDRM1\0";
+const DEVICE_REMOVAL_MARKER_CHECKSUM_LEN: usize = 32;
 
-fn persist_device_removal_marker(pool_root: &Path, target_path: &Path) -> Result<()> {
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DeviceRemovalMarker {
+    target_path: PathBuf,
+    target_guid: [u8; 16],
+}
+
+fn invalid_device_removal_marker() -> StoreError {
+    StoreError::InvalidOptions {
+        reason: "device removal marker is corrupt or unverifiable",
+    }
+}
+
+fn encode_device_removal_marker(target_path: &Path, target_guid: [u8; 16]) -> Result<Vec<u8>> {
+    let path = target_path.as_os_str().as_bytes();
+    if path.is_empty() {
+        return Err(invalid_device_removal_marker());
+    }
+    let path_len = u32::try_from(path.len()).map_err(|_| invalid_device_removal_marker())?;
+    let mut encoded = Vec::with_capacity(
+        DEVICE_REMOVAL_MARKER_MAGIC_V1.len()
+            + target_guid.len()
+            + std::mem::size_of::<u32>()
+            + path.len()
+            + DEVICE_REMOVAL_MARKER_CHECKSUM_LEN,
+    );
+    encoded.extend_from_slice(DEVICE_REMOVAL_MARKER_MAGIC_V1);
+    encoded.extend_from_slice(&target_guid);
+    encoded.extend_from_slice(&path_len.to_le_bytes());
+    encoded.extend_from_slice(path);
+    let checksum = blake3::hash(&encoded);
+    encoded.extend_from_slice(checksum.as_bytes());
+    Ok(encoded)
+}
+
+fn decode_device_removal_marker(encoded: &[u8]) -> Result<DeviceRemovalMarker> {
+    let decoded = (|| -> Option<DeviceRemovalMarker> {
+        let mut cursor = ReceiptCursor::new(encoded);
+        if cursor.take(DEVICE_REMOVAL_MARKER_MAGIC_V1.len())? != DEVICE_REMOVAL_MARKER_MAGIC_V1 {
+            return None;
+        }
+        let target_guid = cursor.array()?;
+        let path_len = u32::from_le_bytes(cursor.array()?) as usize;
+        if path_len == 0 {
+            return None;
+        }
+        let target_path = PathBuf::from(OsString::from_vec(cursor.take(path_len)?.to_vec()));
+        let checksum = cursor.array::<DEVICE_REMOVAL_MARKER_CHECKSUM_LEN>()?;
+        if !cursor.is_finished() {
+            return None;
+        }
+        let checksum_input_len = encoded
+            .len()
+            .checked_sub(DEVICE_REMOVAL_MARKER_CHECKSUM_LEN)?;
+        if blake3::hash(&encoded[..checksum_input_len]).as_bytes() != &checksum {
+            return None;
+        }
+        Some(DeviceRemovalMarker {
+            target_path,
+            target_guid,
+        })
+    })();
+
+    decoded.ok_or_else(invalid_device_removal_marker)
+}
+
+fn persist_device_removal_marker(
+    pool_root: &Path,
+    target_path: &Path,
+    target_guid: [u8; 16],
+) -> Result<()> {
     let marker_path = pool_root.join(DEVICE_REMOVAL_MARKER_FILE);
     let tmp_path = pool_root.join(DEVICE_REMOVAL_MARKER_TMP_FILE);
+    let encoded = encode_device_removal_marker(target_path, target_guid)?;
     let persist_result = (|| -> std::io::Result<()> {
         let mut marker = fs::OpenOptions::new()
             .create(true)
             .truncate(true)
             .write(true)
             .open(&tmp_path)?;
-        marker.write_all(target_path.as_os_str().as_bytes())?;
+        marker.write_all(&encoded)?;
         marker.sync_all()?;
         drop(marker);
 
@@ -1034,27 +1105,26 @@ fn persist_device_removal_marker(pool_root: &Path, target_path: &Path) -> Result
     Ok(())
 }
 
-fn read_device_removal_marker(marker_path: &Path) -> Result<PathBuf> {
+fn read_device_removal_marker(marker_path: &Path) -> Result<DeviceRemovalMarker> {
     let encoded = fs::read(marker_path).map_err(|source| StoreError::Io {
         operation: "read_device_removal_marker",
         path: marker_path.to_path_buf(),
         source,
     })?;
-    if encoded.is_empty() {
-        return Err(StoreError::InvalidOptions {
-            reason: "device removal marker is empty",
-        });
-    }
-    Ok(PathBuf::from(OsString::from_vec(encoded)))
+    decode_device_removal_marker(&encoded)
 }
 
 /// Check for a pending device removal marker and resume evacuation if found.
 fn resume_device_removal_if_pending(pool: &mut Pool) {
     let marker_path = pool.config.root_path.join(DEVICE_REMOVAL_MARKER_FILE);
     if marker_path.exists() {
-        if let Ok(target_path) = read_device_removal_marker(&marker_path) {
-            let target_in_topology = pool.devices.iter().any(|d| d.root() == target_path);
-            let completed = if target_in_topology {
+        if let Ok(marker) = read_device_removal_marker(&marker_path) {
+            let target_path = pool
+                .device_guids
+                .iter()
+                .position(|guid| *guid == marker.target_guid)
+                .map(|idx| pool.devices[idx].root().to_path_buf());
+            let completed = if let Some(target_path) = target_path {
                 matches!(pool.safe_remove_device(&target_path), Ok(result) if result.complete)
             } else {
                 true
@@ -3110,16 +3180,13 @@ impl Pool {
         }
 
         // Write a removal-pending marker so a crash can be resumed on
-        // next pool open. The file contains the path of the device being
-        // removed.
+        // next pool open. Device identity is GUID-bound so path rebinding
+        // cannot make an attached target look already removed.
         let marker_path = self.config.root_path.join(DEVICE_REMOVAL_MARKER_FILE);
         if marker_path.exists() {
-            let pending_path = read_device_removal_marker(&marker_path)?;
-            if pending_path != path
-                && self
-                    .devices
-                    .iter()
-                    .any(|device| device.root() == pending_path)
+            let pending_marker = read_device_removal_marker(&marker_path)?;
+            if pending_marker.target_guid != target_guid
+                && self.device_guids.contains(&pending_marker.target_guid)
             {
                 return Err(StoreError::InvalidOptions {
                     reason: "another device removal is already pending",
@@ -3129,7 +3196,7 @@ impl Pool {
         // Publish the marker atomically and sync both the file and pool root
         // before evacuation starts. A crash during a retry therefore leaves
         // either the previous complete marker or the new complete marker.
-        persist_device_removal_marker(&self.config.root_path, path)?;
+        persist_device_removal_marker(&self.config.root_path, path, target_guid)?;
 
         // This removal path rewrites every receipt-backed object through the
         // data-class fallback. Keep its candidates inside that I/O class: an
@@ -6861,6 +6928,7 @@ mod tests {
         let config = multi_data_device_config(&root, 3);
         let mut pool = Pool::create(config, PoolProperties::default(), &test_options()).unwrap();
         let first_target = pool.devices[0].root().to_path_buf();
+        let first_target_guid = pool.device_guid_for_index(0);
         let second_target = pool.devices[1].root().to_path_buf();
         let rogue_key = ObjectKey::from_name(b"first-removal-must-remain-pending");
         pool.devices[0]
@@ -6879,12 +6947,9 @@ mod tests {
             })
         ));
         assert_eq!(pool.stats().device_count, 3);
-        assert_eq!(
-            std::fs::read_to_string(root.join(DEVICE_REMOVAL_MARKER_FILE))
-                .unwrap()
-                .trim(),
-            first_target.to_string_lossy()
-        );
+        let marker = read_device_removal_marker(&root.join(DEVICE_REMOVAL_MARKER_FILE)).unwrap();
+        assert_eq!(marker.target_path, first_target);
+        assert_eq!(marker.target_guid, first_target_guid);
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -7041,9 +7106,10 @@ mod tests {
         assert!(pool.get(IoClass::Data, key2).unwrap().is_some());
         assert!(pool.get(IoClass::Data, key3).unwrap().is_some());
 
-        // Simulate crash: write the marker file manually.
+        // Simulate crash: publish the marker file manually.
         let marker_path = root.join(DEVICE_REMOVAL_MARKER_FILE);
-        std::fs::write(&marker_path, d1.to_string_lossy().as_bytes()).unwrap();
+        let target_guid = pool.device_guid_for_index(0);
+        persist_device_removal_marker(&root, &d1, target_guid).unwrap();
         assert!(marker_path.exists());
 
         // Drop the pool (simulating crash / process exit).
@@ -7071,6 +7137,36 @@ mod tests {
         let obj3 = pool2.get(IoClass::Data, key3).unwrap();
         assert!(obj3.is_some(), "key3 not found after resume");
         assert_eq!(obj3.unwrap(), data3);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn safe_remove_device_resume_resolves_target_by_guid() {
+        let root = temp_dir("safe-remove-resume-guid");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = multi_data_device_config(&root, 2);
+        let mut pool =
+            Pool::create(config.clone(), PoolProperties::default(), &test_options()).unwrap();
+        let key = ObjectKey::from_name(b"resume-guid-object");
+        let payload = b"resume follows stable device identity";
+        pool.put(IoClass::Data, key, payload).unwrap();
+        pool.sync_all().unwrap();
+
+        let target_guid = pool.device_guid_for_index(0);
+        let stale_target_path = root.join("previous-device-path");
+        persist_device_removal_marker(&root, &stale_target_path, target_guid).unwrap();
+        let marker_path = root.join(DEVICE_REMOVAL_MARKER_FILE);
+
+        drop(pool);
+
+        let reopened = Pool::open(config, PoolProperties::default(), &test_options()).unwrap();
+        assert!(!marker_path.exists());
+        assert_eq!(reopened.stats().device_count, 1);
+        assert_eq!(
+            reopened.get(IoClass::Data, key).unwrap(),
+            Some(payload.to_vec())
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -7112,13 +7208,14 @@ mod tests {
         pool.put(IoClass::Data, key, &data).unwrap();
         pool.sync_all().unwrap();
 
+        let target_guid = pool.device_guid_for_index(0);
         let result = pool.safe_remove_device(&d1).unwrap();
         assert!(result.complete);
         assert_eq!(pool.stats().device_count, 1);
         assert!(d1.exists());
 
         let marker_path = root.join(DEVICE_REMOVAL_MARKER_FILE);
-        std::fs::write(&marker_path, d1.to_string_lossy().as_bytes()).unwrap();
+        persist_device_removal_marker(&root, &d1, target_guid).unwrap();
 
         resume_device_removal_if_pending(&mut pool);
 
@@ -7149,16 +7246,18 @@ mod tests {
         let result = pool.safe_remove_device(&target_path).unwrap();
         assert!(!result.complete);
         let marker_path = root.join(DEVICE_REMOVAL_MARKER_FILE);
+        let marker = read_device_removal_marker(&marker_path).unwrap();
         assert_eq!(
-            std::fs::read(&marker_path).unwrap(),
+            marker.target_path.as_os_str().as_bytes(),
             target_path.as_os_str().as_bytes()
         );
 
         drop(pool);
 
         let reopened = Pool::open(config, PoolProperties::default(), &test_options()).unwrap();
+        let marker = read_device_removal_marker(&marker_path).unwrap();
         assert_eq!(
-            std::fs::read(&marker_path).unwrap(),
+            marker.target_path.as_os_str().as_bytes(),
             target_path.as_os_str().as_bytes()
         );
         assert_eq!(reopened.stats().device_count, 2);
@@ -7168,6 +7267,22 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn device_removal_marker_rejects_corrupt_bytes() {
+        let target_path = PathBuf::from(OsString::from_vec(b"/dev/data-\xff".to_vec()));
+        let target_guid = [0x5a; 16];
+        let mut encoded = encode_device_removal_marker(&target_path, target_guid).unwrap();
+        let checksum_byte = encoded.last_mut().unwrap();
+        *checksum_byte ^= 0x80;
+
+        assert!(matches!(
+            decode_device_removal_marker(&encoded),
+            Err(StoreError::InvalidOptions {
+                reason: "device removal marker is corrupt or unverifiable"
+            })
+        ));
     }
 
     #[test]
@@ -7227,7 +7342,8 @@ mod tests {
         pool.devices[0].put(rogue_key, rogue_payload).unwrap();
 
         let marker_path = root.join(DEVICE_REMOVAL_MARKER_FILE);
-        std::fs::write(&marker_path, d1.to_string_lossy().as_bytes()).unwrap();
+        let target_guid = pool.device_guid_for_index(0);
+        persist_device_removal_marker(&root, &d1, target_guid).unwrap();
         let marker_tmp_path = root.join(DEVICE_REMOVAL_MARKER_TMP_FILE);
         std::fs::write(
             &marker_tmp_path,
@@ -7241,10 +7357,9 @@ mod tests {
 
         assert!(marker_path.exists());
         assert!(!marker_tmp_path.exists());
-        assert_eq!(
-            std::fs::read_to_string(&marker_path).unwrap(),
-            d1.to_string_lossy()
-        );
+        let marker = read_device_removal_marker(&marker_path).unwrap();
+        assert_eq!(marker.target_path, d1);
+        assert_eq!(marker.target_guid, target_guid);
         assert_eq!(pool2.stats().device_count, 2);
         assert_eq!(
             pool2.devices[0].get(rogue_key).unwrap(),
