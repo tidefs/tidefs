@@ -835,6 +835,14 @@ fn run_snapshot_barrier_before_send_with_config(
         peer_sessions
     };
 
+    if peer_sessions.len() > config.max_peers {
+        return Err(SnapshotBarrierSendError::PeerLimitExceeded {
+            barrier_id,
+            peer_count: peer_sessions.len(),
+            max_peers: config.max_peers,
+        });
+    }
+
     let peer_ids = peer_sessions.keys().copied().collect::<Vec<_>>();
     let coordinator = SnapshotCoordinator::new(barrier_id, snapshot_name, peer_ids, config);
 
@@ -6671,6 +6679,51 @@ mod cluster_pool_handler_tests {
             SnapshotBarrierSendError::SendFailed { peer_id, .. } => assert_eq!(peer_id, 2),
             other => panic!("expected send failure, got {other:?}"),
         }
+        assert!(ctx.active_barrier.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn snapshot_barrier_before_send_refuses_peer_count_above_limit() {
+        let (_dir, store) = frame_local_store();
+        let ctx = frame_test_context(Arc::clone(&store));
+        let peer_session_id = tidefs_transport::SessionId::new(2);
+        let peer_session = tidefs_transport::session::Session::new(
+            peer_session_id,
+            1,
+            2,
+            tidefs_transport::TransportAddr::Tcp("127.0.0.1:9002".parse().unwrap()),
+            tidefs_transport::EndpointFamily::LocalEmbed,
+            tidefs_transport::TransportBackendKind::Tcp,
+        );
+        ctx.transport
+            .lock()
+            .unwrap()
+            .sessions
+            .insert(peer_session_id, Arc::new(Mutex::new(peer_session)));
+
+        let err = run_snapshot_barrier_before_send_with_config(
+            tidefs_transport::SessionId::new(1),
+            &ctx,
+            &[],
+            SnapshotBarrierConfig {
+                max_peers: 0,
+                ..SnapshotBarrierConfig::default()
+            },
+        )
+        .expect_err("barrier should refuse a peer set above its configured limit");
+
+        match &err {
+            SnapshotBarrierSendError::PeerLimitExceeded {
+                peer_count,
+                max_peers,
+                ..
+            } => {
+                assert_eq!(*peer_count, 1);
+                assert_eq!(*max_peers, 0);
+            }
+            other => panic!("expected peer-limit refusal, got {other:?}"),
+        }
+        assert!(err.to_string().contains("exceeds configured maximum 0"));
         assert!(ctx.active_barrier.lock().unwrap().is_none());
     }
 

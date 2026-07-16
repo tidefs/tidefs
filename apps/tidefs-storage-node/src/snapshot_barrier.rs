@@ -213,6 +213,11 @@ pub enum SnapshotBarrierSendError {
     AlreadyActive {
         barrier_id: BarrierId,
     },
+    PeerLimitExceeded {
+        barrier_id: BarrierId,
+        peer_count: usize,
+        max_peers: usize,
+    },
     SendFailed {
         barrier_id: BarrierId,
         peer_id: u64,
@@ -246,6 +251,14 @@ impl fmt::Display for SnapshotBarrierSendError {
             Self::AlreadyActive { barrier_id } => write!(
                 f,
                 "barrier {barrier_id} refused because another barrier is already active"
+            ),
+            Self::PeerLimitExceeded {
+                barrier_id,
+                peer_count,
+                max_peers,
+            } => write!(
+                f,
+                "barrier {barrier_id} refused because peer count {peer_count} exceeds configured maximum {max_peers}"
             ),
             Self::SendFailed {
                 barrier_id,
