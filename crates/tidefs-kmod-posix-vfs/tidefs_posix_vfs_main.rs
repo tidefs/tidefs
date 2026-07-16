@@ -368,16 +368,26 @@ impl KernelEngine {
 
     /// Get or create the xattr store for the given inode, returning its index.
 
-    fn get_or_create_xattr_store_idx(&self, ino: u64) -> usize {
+    fn get_or_create_xattr_store_idx(
+        &self,
+        ino: u64,
+    ) -> core::result::Result<usize, crate::tidefs_kmod_bridge::kernel_types::Errno> {
         if let Some(idx) = self.find_xattr_store_idx(ino) {
-            return idx;
+            return Ok(idx);
         }
 
         let mut stores = self.xattr_stores.borrow_mut();
-
+        let idx = stores.len();
+        // KmodVec drops allocation errors, so verify capacity before using idx.
+        stores.reserve(1);
+        if stores.capacity().saturating_sub(idx) < 1 {
+            return Err(crate::tidefs_kmod_bridge::kernel_types::Errno::ENOMEM);
+        }
         stores.push((ino, crate::tidefs_kmod_bridge::kernel_types::KmodVec::new()));
-
-        stores.len() - 1
+        if stores.len() != idx.saturating_add(1) {
+            return Err(crate::tidefs_kmod_bridge::kernel_types::Errno::ENOMEM);
+        }
+        Ok(idx)
     }
 
     fn normalize_advisory_lock(
@@ -6493,7 +6503,7 @@ impl crate::tidefs_kmod_bridge::kernel_types::VfsEngine for KernelEngine {
             return Err(crate::tidefs_kmod_bridge::kernel_types::Errno::EINVAL);
         }
         let ino = inode.get();
-        let idx = self.get_or_create_xattr_store_idx(ino);
+        let idx = self.get_or_create_xattr_store_idx(ino)?;
         let mut stores = self.xattr_stores.borrow_mut();
         let entries = &mut stores[idx].1;
         let exists = entries.iter().any(|(n, _)| **n == *name);
