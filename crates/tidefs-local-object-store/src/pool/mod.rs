@@ -3238,6 +3238,18 @@ impl Pool {
                 reason: "device removal target GUID is missing or ambiguous",
             });
         }
+        let mut unique_device_guids = BTreeSet::new();
+        if self.device_guids.len() != self.devices.len()
+            || !self
+                .device_guids
+                .iter()
+                .copied()
+                .all(|guid| unique_device_guids.insert(guid))
+        {
+            return Err(StoreError::InvalidOptions {
+                reason: "device removal topology GUID table is incomplete or ambiguous",
+            });
+        }
 
         // Refuse to remove the last device.
         if self.devices.len() <= 1 {
@@ -7215,6 +7227,29 @@ mod tests {
             })
         ));
         assert_eq!(pool.stats().device_count, 2);
+        assert!(!root.join(DEVICE_REMOVAL_MARKER_FILE).exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn safe_remove_device_refuses_ambiguous_survivor_guid() {
+        let root = temp_dir("safe-remove-ambiguous-survivor-guid");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = multi_data_device_config(&root, 3);
+        let mut pool = Pool::create(config, PoolProperties::default(), &test_options()).unwrap();
+        let target_path = pool.devices[0].root().to_path_buf();
+        pool.device_guids[2] = pool.device_guids[1];
+
+        let result = pool.safe_remove_device(&target_path);
+
+        assert!(matches!(
+            result,
+            Err(StoreError::InvalidOptions {
+                reason: "device removal topology GUID table is incomplete or ambiguous"
+            })
+        ));
+        assert_eq!(pool.stats().device_count, 3);
         assert!(!root.join(DEVICE_REMOVAL_MARKER_FILE).exists());
 
         let _ = std::fs::remove_dir_all(&root);
