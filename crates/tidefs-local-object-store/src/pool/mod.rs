@@ -3047,6 +3047,12 @@ impl Pool {
         if idx < self.device_layout_stats.len() {
             self.device_layout_stats.remove(idx);
         }
+        if idx < self.device_layouts.len() {
+            self.device_layouts.remove(idx);
+        }
+        if idx < self.config.devices.len() {
+            self.config.devices.remove(idx);
+        }
         let total_bytes: Vec<u64> = self
             .devices
             .iter()
@@ -6411,6 +6417,9 @@ mod tests {
 
         // Pool now has 1 device.
         assert_eq!(pool.stats().device_count, 1);
+        assert_eq!(pool.config.devices.len(), pool.devices.len());
+        assert_eq!(pool.device_layouts.len(), pool.devices.len());
+        assert_eq!(pool.config.devices[0].path, pool.devices[0].root());
         let survivor_commit_count_after = pool.devices[0].store().txg_manager().commit_count();
         assert!(
             survivor_commit_count_after > survivor_commit_count_before,
