@@ -44,7 +44,7 @@ use crate::device_layout::{
 };
 use crate::device_manager::{DeviceManager, SparePolicy};
 use crate::io_scheduler::IoClass as SchedClass;
-use crate::log_device::LogDeviceWriter;
+use crate::log_device::{LogDeviceWriter, LOG_DEVICE_HEADER_SIZE};
 use crate::{
     LocalObjectStore, ObjectKey, ObjectLocation, Result, ScrubStats, StoreError, StoreOptions,
     StoreRetentionCompactionReport, StoreStats, StoredObject,
@@ -3115,13 +3115,28 @@ impl Pool {
                 reason: "device not found",
             },
         )?;
-        let replacement_log_device = if self
+        let removes_active_log_device = self
             .config
             .devices
             .iter()
             .position(|config| config.class == DeviceClass::IntentLog)
-            == Some(idx)
-        {
+            == Some(idx);
+        if removes_active_log_device {
+            let log_path = device_root_path(&self.config.devices[idx]).join(LOG_DEVICE_FILENAME);
+            let log_len = fs::metadata(&log_path)
+                .map_err(|source| StoreError::Io {
+                    operation: "inspect_log_device_before_removal",
+                    path: log_path,
+                    source,
+                })?
+                .len();
+            if log_len > LOG_DEVICE_HEADER_SIZE {
+                return Err(StoreError::InvalidOptions {
+                    reason: "cannot remove active intent-log device with undrained records",
+                });
+            }
+        }
+        let replacement_log_device = if removes_active_log_device {
             let remaining_configs: Vec<_> = self
                 .config
                 .devices
@@ -8461,17 +8476,34 @@ mod tests {
         let log_path = log_dir.join(LOG_DEVICE_FILENAME);
         let log_len_before_remove = std::fs::metadata(&log_path).unwrap().len();
 
-        // Safe removal must close the dedicated writer before detach.
+        // A committed log record is crash-replay authority. Refuse detach
+        // until a higher layer has drained it into committed pool state.
+        let removal = pool.safe_remove_device(&log_dir);
+        assert!(matches!(
+            removal,
+            Err(StoreError::InvalidOptions {
+                reason: "cannot remove active intent-log device with undrained records"
+            })
+        ));
+        assert_eq!(pool.log_device_count(), 1);
+        assert!(pool.has_log_device());
+        assert_eq!(
+            std::fs::metadata(&log_path).unwrap().len(),
+            log_len_before_remove
+        );
+        assert!(root.join(DEVICE_REMOVAL_MARKER_FILE).exists());
+
+        // Simulate the owning commit/replay layer draining the records. Safe
+        // removal may now close the dedicated writer before detach.
+        pool.log_device.as_mut().unwrap().truncate().unwrap();
+        let drained_log_len = std::fs::metadata(&log_path).unwrap().len();
         let removal = pool.safe_remove_device(&log_dir).unwrap();
         assert!(removal.complete);
         assert_eq!(pool.log_device_count(), 0);
         assert!(!pool.log_device_healthy());
         assert!(!pool.has_log_device());
         pool.log_device_append(b"after-remove").unwrap();
-        assert_eq!(
-            std::fs::metadata(&log_path).unwrap().len(),
-            log_len_before_remove
-        );
+        assert_eq!(std::fs::metadata(&log_path).unwrap().len(), drained_log_len);
 
         // Writes should still succeed via data fallback
         pool.put(IoClass::IntentLog, key, b"after-remove").unwrap();
