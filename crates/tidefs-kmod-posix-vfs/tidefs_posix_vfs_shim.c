@@ -338,6 +338,10 @@ int tidefs_posix_vfs_engine_getattr(
 	unsigned long long ino,
 	struct tidefs_posix_vfs_engine_attr_out *out);
 
+int tidefs_posix_vfs_engine_get_parent(
+	unsigned long long child_ino,
+	unsigned long long *out_parent_ino);
+
 int tidefs_posix_vfs_engine_readdir(
 	unsigned long long directory_ino,
 	unsigned int cookie,
@@ -2036,6 +2040,38 @@ static void tidefs_posix_vfs_apply_engine_attr(
 		inode, attr->atime_ns, attr->mtime_ns, attr->ctime_ns);
 }
 
+static struct inode *tidefs_posix_vfs_iget_engine_attr(
+	struct super_block *sb,
+	const struct tidefs_posix_vfs_engine_attr_out *attr)
+{
+	struct inode *inode;
+
+	if (!attr || !attr->ino || !attr->generation)
+		return ERR_PTR(-EIO);
+
+	if (sb->s_root && d_inode(sb->s_root) &&
+	    d_inode(sb->s_root)->i_ino == attr->ino) {
+		inode = igrab(d_inode(sb->s_root));
+		if (!inode)
+			return ERR_PTR(-ESTALE);
+	} else {
+		inode = iget_locked(sb, attr->ino);
+		if (!inode)
+			return ERR_PTR(-ENOMEM);
+		if (inode_state_read_once(inode) & I_NEW) {
+			tidefs_posix_vfs_apply_engine_attr(inode, attr);
+			unlock_new_inode(inode);
+			return inode;
+		}
+	}
+
+	if (inode->i_generation != (u32)attr->generation) {
+		iput(inode);
+		return ERR_PTR(-ESTALE);
+	}
+	return inode;
+}
+
 static int tidefs_posix_vfs_require_live_dir(struct inode *dir)
 {
 	if (!dir)
@@ -2087,10 +2123,9 @@ static struct dentry *tidefs_posix_vfs_lookup(struct inode *dir,
 			if (ea.ino == 0)
 				return tidefs_posix_vfs_add_negative_dentry(dentry);
 
-			inode = new_inode(dir->i_sb);
-			if (!inode)
-				return ERR_PTR(-ENOMEM);
-			tidefs_posix_vfs_apply_engine_attr(inode, &ea);
+			inode = tidefs_posix_vfs_iget_engine_attr(dir->i_sb, &ea);
+			if (IS_ERR(inode))
+				return ERR_CAST(inode);
 			return d_splice_alias(inode, dentry);
 		}
 	}
@@ -6744,6 +6779,32 @@ static int tidefs_posix_vfs_encode_fh(struct inode *inode, __u32 *fh,
 	return 2;
 }
 
+static struct inode *tidefs_posix_vfs_export_iget(struct super_block *sb,
+						   u64 ino)
+{
+	struct tidefs_posix_vfs_mount *ctx = sb->s_fs_info;
+	struct tidefs_posix_vfs_engine_attr_out attr;
+	struct inode *inode;
+	int ret;
+
+	inode = ilookup(sb, ino);
+	if (inode)
+		return inode;
+	if (!ctx || !ctx->engine_backed)
+		return ERR_PTR(-ESTALE);
+
+	memset(&attr, 0, sizeof(attr));
+	ret = tidefs_posix_vfs_engine_getattr(ino, &attr);
+	if (ret == -ENOENT)
+		return ERR_PTR(-ESTALE);
+	if (ret < 0)
+		return ERR_PTR(ret);
+	if (attr.ino != ino)
+		return ERR_PTR(-EIO);
+
+	return tidefs_posix_vfs_iget_engine_attr(sb, &attr);
+}
+
 static struct dentry *tidefs_posix_vfs_fh_to_dentry(struct super_block *sb,
 	struct fid *fid, int fh_len, int fh_type)
 {
@@ -6764,9 +6825,9 @@ static struct dentry *tidefs_posix_vfs_fh_to_dentry(struct super_block *sb,
 		return ERR_PTR(-EINVAL);
 	}
 
-	inode = ilookup(sb, ino);
-	if (!inode)
-		return ERR_PTR(-ESTALE);
+	inode = tidefs_posix_vfs_export_iget(sb, ino);
+	if (IS_ERR(inode))
+		return ERR_CAST(inode);
 
 	if (inode->i_generation != gen) {
 		iput(inode);
@@ -6787,17 +6848,48 @@ static struct dentry *tidefs_posix_vfs_fh_to_parent(struct super_block *sb,
 
 	parent_ino = ((u64)fid->raw[4] << 32) | fid->raw[5];
 
-	inode = ilookup(sb, parent_ino);
-	if (!inode)
-		return ERR_PTR(-ESTALE);
+	inode = tidefs_posix_vfs_export_iget(sb, parent_ino);
+	if (IS_ERR(inode))
+		return ERR_CAST(inode);
 
 	return d_obtain_alias(inode);
+}
+
+static struct dentry *tidefs_posix_vfs_get_parent(struct dentry *child)
+{
+	struct inode *child_inode = d_inode(child);
+	struct tidefs_posix_vfs_mount *ctx;
+	struct inode *parent_inode;
+	u64 parent_ino = 0;
+	int ret;
+
+	if (!child_inode)
+		return ERR_PTR(-ESTALE);
+	ctx = child_inode->i_sb->s_fs_info;
+	if (!ctx || !ctx->engine_backed)
+		return ERR_PTR(-ESTALE);
+
+	ret = tidefs_posix_vfs_engine_get_parent(child_inode->i_ino,
+						 &parent_ino);
+	if (ret == -ENOENT)
+		return ERR_PTR(-ESTALE);
+	if (ret < 0)
+		return ERR_PTR(ret);
+	if (!parent_ino)
+		return ERR_PTR(-EIO);
+
+	parent_inode = tidefs_posix_vfs_export_iget(child_inode->i_sb,
+						       parent_ino);
+	if (IS_ERR(parent_inode))
+		return ERR_CAST(parent_inode);
+	return d_obtain_alias(parent_inode);
 }
 
 static const struct export_operations tidefs_posix_vfs_export_ops = {
 	.encode_fh      = tidefs_posix_vfs_encode_fh,
 	.fh_to_dentry   = tidefs_posix_vfs_fh_to_dentry,
 	.fh_to_parent   = tidefs_posix_vfs_fh_to_parent,
+	.get_parent     = tidefs_posix_vfs_get_parent,
 };
 
 
