@@ -534,6 +534,14 @@ impl ExportOrchestrator {
                 true,
                 "topology evidence incomplete",
             )
+        } else if !self.is_done() {
+            PoolLifecycleEvidence::refused_fail_closed_with_authority(
+                PoolLifecycleAction::Export,
+                context,
+                true,
+                true,
+                format!("export action incomplete at phase {}", self.phase.name()),
+            )
         } else {
             PoolLifecycleEvidence::executed(PoolLifecycleAction::Export, context)
         }
@@ -1317,16 +1325,29 @@ mod tests {
     }
 
     #[test]
-    fn orchestrator_emits_export_lifecycle_evidence() {
-        let orch = make_orchestrator();
+    fn orchestrator_lifecycle_evidence_requires_completed_export() {
+        let mut orch = make_orchestrator();
+
+        let pending = orch.lifecycle_evidence();
+
+        assert_eq!(pending.action, PoolLifecycleAction::Export);
+        assert_eq!(pending.outcome, PoolLifecycleOutcome::Refused);
+        assert!(pending.topology_complete);
+        assert!(pending.owner_authorized);
+        assert!(pending.is_fail_closed());
+        assert_eq!(pending.reason, "export action incomplete at phase idle");
+
+        orch.export_labels_only(10).unwrap();
 
         let evidence = orch.lifecycle_evidence();
 
         assert_eq!(evidence.action, PoolLifecycleAction::Export);
+        assert_eq!(evidence.outcome, PoolLifecycleOutcome::Executed);
         assert_eq!(evidence.device_count, 1);
         assert_eq!(evidence.expected_device_count, 1);
         assert_eq!(evidence.capacity_bytes, 1024 * 1024 * 1024);
         assert_eq!(evidence.topology_generation, 1);
+        assert_eq!(evidence.commit_group, 10);
         assert!(evidence.topology_complete);
         assert!(evidence.owner_authorized);
         assert!(!evidence.is_fail_closed());
