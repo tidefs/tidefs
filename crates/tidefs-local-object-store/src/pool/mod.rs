@@ -1124,12 +1124,12 @@ fn resume_device_removal_if_pending(pool: &mut Pool) {
                 .iter()
                 .position(|guid| *guid == marker.target_guid)
                 .map(|idx| pool.devices[idx].root().to_path_buf());
-            let completed = if let Some(target_path) = target_path {
-                matches!(pool.safe_remove_device(&target_path), Ok(result) if result.complete)
+            if let Some(target_path) = target_path {
+                // A successful retry only removes the target from this Pool
+                // instance. Keep the marker until a later topology load no
+                // longer contains the GUID, proving detach is replay-visible.
+                let _ = pool.safe_remove_device(&target_path);
             } else {
-                true
-            };
-            if completed {
                 let _ = std::fs::remove_file(&marker_path);
             }
         }
@@ -3210,9 +3210,7 @@ impl Pool {
         let marker_path = self.config.root_path.join(DEVICE_REMOVAL_MARKER_FILE);
         if marker_path.exists() {
             let pending_marker = read_device_removal_marker(&marker_path)?;
-            if pending_marker.target_guid != target_guid
-                && self.device_guids.contains(&pending_marker.target_guid)
-            {
+            if pending_marker.target_guid != target_guid {
                 return Err(StoreError::InvalidOptions {
                     reason: "another device removal is already pending",
                 });
@@ -3421,9 +3419,11 @@ impl Pool {
         // All objects evacuated -- remove the device.
         self.remove_device(path)?;
 
-        // Remove the pending-removal marker on success.
-        let marker_path = self.config.root_path.join(DEVICE_REMOVAL_MARKER_FILE);
-        let _ = std::fs::remove_file(&marker_path);
+        // Keep the pending-removal marker until a later topology load no
+        // longer contains the target GUID. The in-memory detach above is not
+        // replay-visible evidence by itself: an older persisted device config
+        // could otherwise reattach the target after a crash with no marker
+        // left to resume removal.
 
         result.complete = true;
         Ok(result)
@@ -6980,6 +6980,39 @@ mod tests {
     }
 
     #[test]
+    fn safe_remove_device_refuses_new_target_until_detach_is_replay_visible() {
+        let root = temp_dir("safe-remove-awaits-replay-visible-detach");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = multi_data_device_config(&root, 3);
+        let mut pool = Pool::create(config, PoolProperties::default(), &test_options()).unwrap();
+        let first_target = pool.devices[0].root().to_path_buf();
+        let first_target_guid = pool.device_guid_for_index(0);
+        let second_target = pool.devices[1].root().to_path_buf();
+
+        let first_result = pool.safe_remove_device(&first_target).unwrap();
+        assert!(first_result.complete);
+        assert_eq!(pool.stats().device_count, 2);
+        assert!(!pool.device_guids.contains(&first_target_guid));
+
+        let marker_path = root.join(DEVICE_REMOVAL_MARKER_FILE);
+        let marker = read_device_removal_marker(&marker_path).unwrap();
+        assert_eq!(marker.target_guid, first_target_guid);
+
+        let second_result = pool.safe_remove_device(&second_target);
+        assert!(matches!(
+            second_result,
+            Err(StoreError::InvalidOptions {
+                reason: "another device removal is already pending"
+            })
+        ));
+        assert_eq!(pool.stats().device_count, 2);
+        let marker = read_device_removal_marker(&marker_path).unwrap();
+        assert_eq!(marker.target_guid, first_target_guid);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn safe_remove_device_three_device_pool_100_objects() {
         let root = temp_dir("safe-remove-3dev");
         let _ = std::fs::remove_dir_all(&root);
@@ -7144,8 +7177,9 @@ mod tests {
         // evacuate objects from d1 to d2, and remove d1.
         let pool2 = Pool::open(config, PoolProperties::default(), &test_options()).unwrap();
 
-        // Marker file should be removed after resume.
-        assert!(!marker_path.exists());
+        // The retry detached d1 only from this Pool instance. Keep the marker
+        // until a later open uses the resulting topology without d1.
+        assert!(marker_path.exists());
 
         // Pool should now have 1 device (d1 was removed).
         assert_eq!(pool2.stats().device_count, 1);
@@ -7162,6 +7196,21 @@ mod tests {
         let obj3 = pool2.get(IoClass::Data, key3).unwrap();
         assert!(obj3.is_some(), "key3 not found after resume");
         assert_eq!(obj3.unwrap(), data3);
+
+        let replay_visible_config = pool2.config.clone();
+        drop(pool2);
+
+        let pool3 = Pool::open(
+            replay_visible_config,
+            PoolProperties::default(),
+            &test_options(),
+        )
+        .unwrap();
+        assert!(!marker_path.exists());
+        assert_eq!(pool3.stats().device_count, 1);
+        assert_eq!(pool3.get(IoClass::Data, key1).unwrap(), Some(data1));
+        assert_eq!(pool3.get(IoClass::Data, key2).unwrap(), Some(data2));
+        assert_eq!(pool3.get(IoClass::Data, key3).unwrap(), Some(data3));
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -7186,6 +7235,21 @@ mod tests {
         drop(pool);
 
         let reopened = Pool::open(config, PoolProperties::default(), &test_options()).unwrap();
+        assert!(marker_path.exists());
+        assert_eq!(reopened.stats().device_count, 1);
+        assert_eq!(
+            reopened.get(IoClass::Data, key).unwrap(),
+            Some(payload.to_vec())
+        );
+
+        let replay_visible_config = reopened.config.clone();
+        drop(reopened);
+        let reopened = Pool::open(
+            replay_visible_config,
+            PoolProperties::default(),
+            &test_options(),
+        )
+        .unwrap();
         assert!(!marker_path.exists());
         assert_eq!(reopened.stats().device_count, 1);
         assert_eq!(
