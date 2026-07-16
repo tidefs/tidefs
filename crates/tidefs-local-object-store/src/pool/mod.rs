@@ -3126,7 +3126,7 @@ impl Pool {
             let log_len = fs::metadata(&log_path)
                 .map_err(|source| StoreError::Io {
                     operation: "inspect_log_device_before_removal",
-                    path: log_path,
+                    path: log_path.clone(),
                     source,
                 })?
                 .len();
@@ -3135,6 +3135,15 @@ impl Pool {
                     reason: "cannot remove active intent-log device with undrained records",
                 });
             }
+            if log_len < LOG_DEVICE_HEADER_SIZE {
+                return Err(StoreError::InvalidOptions {
+                    reason: "cannot remove active intent-log device with truncated header",
+                });
+            }
+            // Header-only is the drained state only when the header still
+            // decodes as a valid log-device record. Re-open it read/write to
+            // reuse the format validation without mutating a non-empty log.
+            drop(LogDeviceWriter::open(&log_path)?);
         }
         let replacement_log_device = if removes_active_log_device {
             let remaining_configs: Vec<_> = self
@@ -8758,8 +8767,45 @@ mod tests {
         assert!(root.join(DEVICE_REMOVAL_MARKER_FILE).exists());
 
         // Simulate the owning commit/replay layer draining the records. Safe
-        // removal may now close the dedicated writer before detach.
+        // removal must still refuse truncated or corrupt drain authority.
         pool.log_device.as_mut().unwrap().truncate().unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&log_path)
+            .unwrap()
+            .set_len(0)
+            .unwrap();
+        let removal = pool.safe_remove_device(&log_dir);
+        assert!(matches!(
+            removal,
+            Err(StoreError::InvalidOptions {
+                reason: "cannot remove active intent-log device with truncated header"
+            })
+        ));
+        assert_eq!(pool.log_device_count(), 1);
+        assert!(pool.has_log_device());
+
+        let mut valid_header = Vec::with_capacity(LOG_DEVICE_HEADER_SIZE as usize);
+        valid_header.extend_from_slice(crate::log_device::LOG_DEVICE_MAGIC);
+        valid_header.extend_from_slice(&crate::log_device::LOG_DEVICE_VERSION.to_le_bytes());
+        valid_header.extend_from_slice(&0u32.to_le_bytes());
+        assert_eq!(valid_header.len(), LOG_DEVICE_HEADER_SIZE as usize);
+        let mut corrupt_header = valid_header.clone();
+        corrupt_header[0] ^= 0xff;
+        std::fs::write(&log_path, &corrupt_header).unwrap();
+        let removal = pool.safe_remove_device(&log_dir);
+        assert!(matches!(
+            removal,
+            Err(StoreError::InvalidOptions {
+                reason: "log_device file has wrong magic"
+            })
+        ));
+        assert_eq!(pool.log_device_count(), 1);
+        assert!(pool.has_log_device());
+
+        // A valid header-only log is drained, so removal may close the
+        // dedicated writer before detach.
+        std::fs::write(&log_path, &valid_header).unwrap();
         let drained_log_len = std::fs::metadata(&log_path).unwrap().len();
         let removal = pool.safe_remove_device(&log_dir).unwrap();
         assert!(removal.complete);
