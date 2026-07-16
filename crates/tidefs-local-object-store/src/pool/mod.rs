@@ -3313,18 +3313,13 @@ impl Pool {
             }
         }
 
-        // Device health controls rewrite eligibility, not receipt authority.
-        // A faulted survivor can still carry a readable newer receipt; hiding
-        // it here could let removal republish stale payload with a newer
-        // generation. Inspect every other data device and fail closed when a
+        // Device class and health control rewrite eligibility, not receipt
+        // authority. A dedicated metadata or cache device, including a
+        // faulted one, can still carry a readable newer receipt; hiding it
+        // here could let removal republish stale payload with a newer
+        // generation. Inspect every other pool device and fail closed when a
         // visible receipt cannot be read or verified.
-        for idx in self
-            .class_map
-            .get(IoClass::Data)
-            .iter()
-            .copied()
-            .filter(|idx| *idx != target_idx)
-        {
+        for idx in (0..self.devices.len()).filter(|idx| *idx != target_idx) {
             for key in self.devices[idx].store().list_keys_including_internal() {
                 if !crate::is_pool_placement_receipt_key(key) {
                     continue;
@@ -6357,6 +6352,90 @@ mod tests {
             pool.get(IoClass::Data, key).unwrap(),
             Some(current_payload.to_vec()),
             "removal must not supersede newer faulted-device authority with stale payload"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn safe_remove_device_uses_newer_receipt_from_metadata_device() {
+        let root = temp_dir("safe-remove-metadata-receipt-authority");
+        let _ = std::fs::remove_dir_all(&root);
+        let metadata_path = root.join("metadata");
+        let mut config = multi_data_device_config(&root, 2);
+        config.devices.insert(
+            0,
+            DeviceConfig {
+                media_class: DeviceMediaClass::Nvme,
+                path: metadata_path.clone(),
+                backing: DeviceBacking::DirectoryObjectStoreCompat,
+                class: DeviceClass::Metadata,
+                kind: DeviceKind::Single {
+                    path: metadata_path,
+                },
+                encryption: None,
+                compression: None,
+            },
+        );
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::replicated(1),
+            ..PoolProperties::default()
+        };
+        let mut pool = Pool::create(config, properties, &test_options()).unwrap();
+        set_deterministic_device_guids(&mut pool);
+
+        let key = ObjectKey::from_name(b"newer-metadata-device-receipt");
+        let stale_payload = b"stale payload on removal target";
+        let current_payload = b"current payload on metadata device";
+        pool.put(IoClass::Data, key, stale_payload).unwrap();
+        let stale_receipt = pool
+            .placement_receipt_for_key(IoClass::Data, key)
+            .unwrap()
+            .expect("initial receipt");
+        let target_idx = pool
+            .resolve_receipt_target(&stale_receipt.targets[0])
+            .unwrap();
+        let target_path = pool.devices[target_idx].root().to_path_buf();
+
+        let metadata_indices = [0];
+        let mut current_receipt = pool
+            .plan_pool_wide_placement(
+                IoClass::Metadata,
+                key,
+                current_payload.len(),
+                &metadata_indices,
+            )
+            .unwrap();
+        current_receipt.generation = pool.allocate_placement_receipt_generation();
+        current_receipt.payload_digest = digest32(current_payload);
+        pool.put_replicated_with_receipt(
+            key,
+            current_payload,
+            &metadata_indices,
+            &mut current_receipt,
+        )
+        .unwrap();
+        assert!(
+            (current_receipt.epoch, current_receipt.generation)
+                > (stale_receipt.epoch, stale_receipt.generation)
+        );
+        assert_eq!(
+            pool.devices[target_idx].get(key).unwrap(),
+            Some(stale_payload.to_vec())
+        );
+        assert_eq!(
+            pool.devices[0].get(key).unwrap(),
+            Some(current_payload.to_vec())
+        );
+
+        let removal = pool.safe_remove_device(&target_path).unwrap();
+        assert!(removal.complete, "{removal:?}");
+        assert_eq!(removal.objects_evacuated, 1);
+        assert_eq!(removal.objects_failed, 0);
+        assert_eq!(
+            pool.get(IoClass::Metadata, key).unwrap(),
+            Some(current_payload.to_vec()),
+            "removal must not supersede newer metadata-device authority with stale payload"
         );
 
         let _ = std::fs::remove_dir_all(&root);
