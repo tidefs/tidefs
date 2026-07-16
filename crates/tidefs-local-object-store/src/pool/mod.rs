@@ -3048,6 +3048,25 @@ impl Pool {
         // next pool open. The file contains the path of the device being
         // removed.
         let marker_path = self.config.root_path.join(DEVICE_REMOVAL_MARKER_FILE);
+        if marker_path.exists() {
+            let encoded =
+                std::fs::read_to_string(&marker_path).map_err(|source| StoreError::Io {
+                    operation: "read_device_removal_marker",
+                    path: marker_path.clone(),
+                    source,
+                })?;
+            let pending_path = PathBuf::from(encoded.trim());
+            if pending_path != path
+                && self
+                    .devices
+                    .iter()
+                    .any(|device| device.root() == pending_path)
+            {
+                return Err(StoreError::InvalidOptions {
+                    reason: "another device removal is already pending",
+                });
+            }
+        }
         if let Err(e) = std::fs::write(&marker_path, path.to_string_lossy().as_bytes()) {
             return Err(StoreError::Io {
                 operation: "write_device_removal_marker",
@@ -6367,6 +6386,41 @@ mod tests {
         ));
         assert_eq!(pool.stats().device_count, 2);
         assert!(root.join(DEVICE_REMOVAL_MARKER_FILE).exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn safe_remove_device_refuses_different_pending_target() {
+        let root = temp_dir("safe-remove-different-pending-target");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = multi_data_device_config(&root, 3);
+        let mut pool = Pool::create(config, PoolProperties::default(), &test_options()).unwrap();
+        let first_target = pool.devices[0].root().to_path_buf();
+        let second_target = pool.devices[1].root().to_path_buf();
+        let rogue_key = ObjectKey::from_name(b"first-removal-must-remain-pending");
+        pool.devices[0]
+            .put(rogue_key, b"unreceipted removal blocker")
+            .unwrap();
+
+        let first_result = pool.safe_remove_device(&first_target).unwrap();
+        assert!(!first_result.complete);
+        assert_eq!(first_result.failed_keys, vec![rogue_key]);
+
+        let second_result = pool.safe_remove_device(&second_target);
+        assert!(matches!(
+            second_result,
+            Err(StoreError::InvalidOptions {
+                reason: "another device removal is already pending"
+            })
+        ));
+        assert_eq!(pool.stats().device_count, 3);
+        assert_eq!(
+            std::fs::read_to_string(root.join(DEVICE_REMOVAL_MARKER_FILE))
+                .unwrap()
+                .trim(),
+            first_target.to_string_lossy()
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
