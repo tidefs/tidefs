@@ -22,6 +22,7 @@ use tidefs_validation::mount_harness::MountHarness;
 /// verify stat fails with ENOENT.
 #[cfg(target_os = "linux")]
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn create_stat_unlink() {
     let harness = MountHarness::new_or_fail("create_stat_unlink");
 
@@ -68,6 +69,7 @@ fn create_stat_unlink() {
 /// single mount session; no remount.
 #[cfg(target_os = "linux")]
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn write_read_verify_small() {
     let harness = MountHarness::new_or_fail("write_read_verify_small");
 
@@ -110,6 +112,7 @@ fn write_read_verify_small() {
 ///  - File total size is 1 MiB + 4 KiB.
 #[cfg(target_os = "linux")]
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn write_read_sparse_hole() {
     let harness = MountHarness::new_or_fail("write_read_sparse_hole");
 
@@ -195,6 +198,7 @@ fn write_read_sparse_hole() {
 /// both complete, read back and verify both regions are intact.
 #[cfg(target_os = "linux")]
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn concurrent_write_no_corruption() {
     let harness = MountHarness::new_or_fail("concurrent_write_no_corruption");
 
