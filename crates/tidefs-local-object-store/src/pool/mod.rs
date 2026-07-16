@@ -1040,6 +1040,11 @@ fn read_device_removal_marker(marker_path: &Path) -> Result<PathBuf> {
         path: marker_path.to_path_buf(),
         source,
     })?;
+    if encoded.is_empty() {
+        return Err(StoreError::InvalidOptions {
+            reason: "device removal marker is empty",
+        });
+    }
     Ok(PathBuf::from(OsString::from_vec(encoded)))
 }
 
@@ -7140,6 +7145,25 @@ mod tests {
             reopened.devices[0].get(rogue_key).unwrap(),
             Some(rogue_payload.to_vec())
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn safe_remove_device_resume_preserves_empty_marker() {
+        let root = temp_dir("safe-remove-resume-empty-marker");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = multi_data_device_config(&root, 2);
+        let pool =
+            Pool::create(config.clone(), PoolProperties::default(), &test_options()).unwrap();
+        let marker_path = root.join(DEVICE_REMOVAL_MARKER_FILE);
+        std::fs::write(&marker_path, b"").unwrap();
+
+        drop(pool);
+
+        let reopened = Pool::open(config, PoolProperties::default(), &test_options()).unwrap();
+        assert_eq!(std::fs::read(&marker_path).unwrap(), b"");
+        assert_eq!(reopened.stats().device_count, 2);
 
         let _ = std::fs::remove_dir_all(&root);
     }
