@@ -358,7 +358,8 @@ authority that the claims gate enforces.
 ## Work-State Boundary
 
 GitHub issue and pull request state is the active work-state authority for
-foreground Codex development. Forgejo helper commands remain available for
-historical/local diagnostics, but stale Forgejo ownership assumptions must not
+foreground Codex development. The legacy Forgejo claim-helper commands are
+retired and fail closed with explicit unsupported messages; they are not an
+active local diagnostics surface. Stale Forgejo ownership assumptions must not
 block `check-claims-gate` from scanning publishing claims in a valid
 GitHub/Codex worktree.

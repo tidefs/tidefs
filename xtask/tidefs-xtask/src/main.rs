@@ -1049,14 +1049,14 @@ fn main() {
                 }
             }
         }
-        Some("check-stale-claims") => {
-            if let Err(err) = forgejo_work::check_stale_claims_current_workspace() {
+        Some(command @ ("check-stale-claims" | "check-stale-forgejo-claims")) => {
+            if let Err(err) = forgejo_work::check_stale_claims_command(command) {
                 eprintln!("{err}");
                 process::exit(1);
             }
         }
-        Some("check-duplicate-claims") => {
-            if let Err(err) = forgejo_work::check_duplicate_claims_current_workspace() {
+        Some(command @ ("check-duplicate-claims" | "check-duplicate-forgejo-claims")) => {
+            if let Err(err) = forgejo_work::check_duplicate_claims_command(command) {
                 eprintln!("{err}");
                 process::exit(1);
             }
@@ -1073,37 +1073,22 @@ fn main() {
                 process::exit(1);
             }
         }
-        Some("auto-release-stale-claims" | "auto-release-stale" | "auto-release") => {
-            if let Err(err) = forgejo_work::auto_release_stale_claims() {
+        Some(command @ ("auto-release-stale-claims" | "auto-release-stale" | "auto-release")) => {
+            if let Err(err) = forgejo_work::auto_release_stale_claims(command) {
                 eprintln!("{err}");
                 process::exit(1);
             }
         }
-        Some("coordination-health" | "coordination-health-report") => {
-            if let Err(err) = forgejo_work::print_coordination_health_report() {
+        Some(command @ ("coordination-health" | "coordination-health-report")) => {
+            if let Err(err) = forgejo_work::print_coordination_health_report(command) {
                 eprintln!("{err}");
                 process::exit(1);
             }
         }
-        Some("acquire-claim" | "claim-issue") => {
-            let issue_num: u64 = match args.next().and_then(|s| s.parse().ok()) {
-                Some(n) => n,
-                None => {
-                    eprintln!("usage: tidefs-xtask acquire-claim <issue-number>");
-                    process::exit(1);
-                }
-            };
-            match forgejo_work::acquire_claim(issue_num) {
-                Ok(true) => {
-                    println!("claimed issue #{issue_num}");
-                }
-                Ok(false) => {
-                    println!("issue #{issue_num} is already claimed");
-                }
-                Err(err) => {
-                    eprintln!("claim failed: {err}");
-                    process::exit(1);
-                }
+        Some(command @ ("acquire-claim" | "claim-issue")) => {
+            if let Err(err) = forgejo_work::acquire_claim_command(command) {
+                eprintln!("{err}");
+                process::exit(1);
             }
         }
         Some("generate-format-golden") => {
@@ -1483,8 +1468,6 @@ fn main() {
                 "claims" => run_checks!(
                     claims::check_current_workspace(),
                     forgejo_work::check_claim_gate_current_workspace(),
-                    forgejo_work::check_stale_claims_current_workspace(),
-                    forgejo_work::check_duplicate_claims_current_workspace(),
                     forgejo_work::check_abandoned_worktrees_current_workspace(),
                 ),
                 "format" => run_checks!(
@@ -1731,18 +1714,13 @@ fn run_all_checks() {
     // claims
     if let Err(e) = claims::check_current_workspace() {
         errors.push(format!("claims/check-claims-gate: {e}"));
-        // legacy claim tracker
-        if let Err(e) = forgejo_work::check_claim_gate_current_workspace() {
-            errors.push(format!("legacy-claim-tracker/check-claim-gate: {e}"));
-        }
-        if let Err(e) = forgejo_work::check_stale_claims_current_workspace() {
-            errors.push(format!("legacy-claim-tracker/check-stale-claims: {e}"));
-        }
-        if let Err(e) = forgejo_work::check_abandoned_worktrees_current_workspace() {
-            errors.push(format!(
-                "legacy-claim-tracker/check-abandoned-worktrees: {e}"
-            ));
-        }
+    }
+    // worktree claim gate and abandoned worktrees check
+    if let Err(e) = forgejo_work::check_claim_gate_current_workspace() {
+        errors.push(format!("worktree/check-claim-gate: {e}"));
+    }
+    if let Err(e) = forgejo_work::check_abandoned_worktrees_current_workspace() {
+        errors.push(format!("worktree/check-abandoned-worktrees: {e}"));
     }
     // kernel closure
     if let Err(e) = kernel_closure::check_current_workspace() {
@@ -2361,12 +2339,7 @@ fn print_summary() {
     println!("release_readiness_verdict_command=release-readiness-verdict");
     println!("claim_validate_command=validate-claim");
     println!("claim_gate_check_command=check-claim-gate");
-    println!("stale_claims_check_command=check-stale-claims");
-    println!("duplicate_claims_check_command=check-duplicate-claims");
     println!("abandoned_worktrees_check_command=check-abandoned-worktrees");
-    println!("auto_release_stale_check_command=auto-release-stale-claims");
-    println!("coordination_health_command=coordination-health");
-    println!("acquire_claim_command=acquire-claim");
     println!("group_check_command=check-group");
     println!("local_filesystem_check_command=check-local-filesystem");
     println!("chunked_file_layout_check_command=check-chunked-file-layout");
@@ -2421,7 +2394,7 @@ fn print_help() {
     println!("  check-group cluster       run all cluster checks (7 checks)");
     println!("  check-group block         run all block-volume checks (26 checks)");
     println!("  check-group storage       run all storage checks (36 checks)");
-    println!("  check-group claims        run claims gate + work ownership + kernel closure checks (6 checks)");
+    println!("  check-group claims        run claims gate + work ownership checks (3 checks)");
     println!("  check-group all           run all 80 checks, report all failures");
     println!();
     println!("  --- Individual check commands ---");
@@ -2656,17 +2629,8 @@ fn print_help() {
     println!(
         "  validate-no-hidden-queues-receipt <path> validate a source/registry queue review receipt"
     );
-    println!("  check-claim-gate        validate current worktree has a valid issue owner");
+    println!("  check-claim-gate        validate current worktree has a valid GitHub issue owner");
     println!("  check-worktree-claim    alias for check-claim-gate");
-    println!(
-        "  check-stale-claims      scan legacy claim tracker state for stale codex:claimed issues"
-    );
-    println!("  check-duplicate-claims  scan legacy claim tracker state for duplicate codex:claimed work keys");
-    println!("  auto-release-stale-claims auto-release stale codex:claimed issues (set TIDEFS_AUTO_RELEASE_STALE=1 to enable)");
-    println!(
-        "  coordination-health      print a coordination health report from legacy tracker issue metrics"
-    );
-    println!("  acquire-claim <N>     atomically claim issue N (adds codex:claimed label with optimistic locking)");
     println!("  check-abandoned-worktrees detect stale local worktree directories");
     println!("  check-stale-worktrees   alias for check-abandoned-worktrees");
     println!("  check-local-filesystem   validate the local filesystem MVP source slice");
