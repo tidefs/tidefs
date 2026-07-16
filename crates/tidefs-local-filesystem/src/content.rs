@@ -325,7 +325,7 @@ fn read_mounted_chunk_content_scrub_block(
     }
 
     let (chunk, resolved_via_dedup) = try_validate_chunk_bytes(
-        store, inode_id, chunk_ref, &encoded,
+        store, pool, inode_id, chunk_ref, &encoded,
     )
     .ok_or(FileSystemError::CorruptState {
         reason: "mounted content scrub authority chunk decode mismatch",
@@ -742,6 +742,7 @@ pub(crate) fn validate_content_manifest(
 /// decode, and check structural fields. Returns decoded chunk or `None`.
 fn try_validate_chunk_bytes(
     store: &LocalObjectStore,
+    pool: Option<&Pool>,
     inode_id: InodeId,
     chunk_ref: &ContentChunkRef,
     raw_bytes: &[u8],
@@ -755,7 +756,10 @@ fn try_validate_chunk_bytes(
     let resolved_vec;
     let (chunk_bytes, resolved_via_dedup) = if is_dedup_redirect(raw_bytes) {
         let canonical_key = decode_dedup_redirect(raw_bytes).ok()?;
-        resolved_vec = store.get(canonical_key).ok()??;
+        resolved_vec = match pool {
+            Some(pool) => pool.get(DeviceIoClass::Data, canonical_key).ok()??,
+            None => store.get(canonical_key).ok()??,
+        };
         (resolved_vec.as_slice(), true)
     } else {
         (raw_bytes, false)
@@ -785,6 +789,7 @@ fn try_validate_chunk_bytes(
 /// redundancy claim.
 fn try_self_heal_chunk(
     store: &LocalObjectStore,
+    pool: Option<&Pool>,
     inode_id: InodeId,
     chunk_ref: &ContentChunkRef,
     key: ObjectKey,
@@ -792,7 +797,7 @@ fn try_self_heal_chunk(
     for location in store.version_locations_of(key).into_iter().rev() {
         let candidate = store.get_at_location(location).ok()?;
         if let Some((chunk, _dedup)) =
-            try_validate_chunk_bytes(store, inode_id, chunk_ref, &candidate)
+            try_validate_chunk_bytes(store, pool, inode_id, chunk_ref, &candidate)
         {
             return Some(chunk);
         }
@@ -826,7 +831,9 @@ pub(crate) fn read_content_chunk_from_store(
     // Validate the chunk bytes. try_validate_chunk_bytes handles dedup
     // redirect resolution internally, including cross-file inode_id
     // validation skip for reflinked chunks (#841).
-    if let Some((chunk, _dedup)) = try_validate_chunk_bytes(store, inode_id, chunk_ref, &bytes) {
+    if let Some((chunk, _dedup)) =
+        try_validate_chunk_bytes(store, pool, inode_id, chunk_ref, &bytes)
+    {
         return Ok(chunk);
     }
 
@@ -834,7 +841,7 @@ pub(crate) fn read_content_chunk_from_store(
     // Because the object store is append-only, older copies of the same
     // chunk key may still exist in segments not yet reclaimed. This is a
     // local recovery fallback, not a replica or media redundancy guarantee.
-    if let Some(chunk) = try_self_heal_chunk(store, inode_id, chunk_ref, key) {
+    if let Some(chunk) = try_self_heal_chunk(store, pool, inode_id, chunk_ref, key) {
         return Ok(chunk);
     }
 
@@ -2860,6 +2867,53 @@ mod tests {
             read.placement_evidence,
             MountedContentPlacementEvidence::ReceiptObservedButUnbound { generation: 1 }
         );
+    }
+
+    #[test]
+    fn mounted_content_scrub_authority_resolves_dedup_canonical_through_pool() {
+        let raw_store = temp_store("mounted-dedup-pool-empty-raw");
+        let mut pool = temp_pool("mounted-dedup-pool-authority");
+        let payload = b"canonical pool plaintext authority".to_vec();
+        let record = test_record(15, 8, payload.len() as u64);
+        let canonical_record = test_record(16, 3, payload.len() as u64);
+        let fingerprint = crate::encoding::compute_content_fingerprint(&payload);
+        let canonical_key = crate::object_keys::content_dedup_object_key(&fingerprint);
+        let canonical_encoded = encode_content_chunk(
+            &canonical_record,
+            0,
+            &payload,
+            &ContentCompressionPolicy::off(),
+        );
+        pool.put(DeviceIoClass::Data, canonical_key, &canonical_encoded)
+            .expect("write canonical chunk through pool");
+
+        let redirect_key =
+            content_chunk_object_key_for_version(record.inode_id, record.data_version, 0);
+        let redirect = crate::encoding::encode_dedup_redirect(canonical_key);
+        let checksum = FastBlockChecksum::compute(&redirect);
+        pool.put(DeviceIoClass::Data, redirect_key, &redirect)
+            .expect("write dedup redirect through pool");
+        let chunk_ref = ContentChunkRef {
+            chunk_index: 0,
+            data_version: record.data_version,
+            len: payload.len() as u32,
+            checksum,
+            placement_receipt_generation: 0,
+        };
+
+        let read = read_mounted_content_scrub_block(
+            &raw_store,
+            record.inode_id,
+            &record,
+            MountedContentScrubReadTarget::ContentChunk(&chunk_ref),
+            Some(&pool),
+        )
+        .expect("dedup canonical read through pool");
+
+        assert_eq!(read.object_key, Some(redirect_key));
+        assert_eq!(read.plaintext_bytes, payload);
+        assert_eq!(read.checksum_evidence.expected, Some(checksum));
+        assert!(read.checksum_evidence.matches_expected());
     }
 
     #[test]
