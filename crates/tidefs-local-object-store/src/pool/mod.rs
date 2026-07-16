@@ -3166,7 +3166,13 @@ impl Pool {
         // until its data, receipt, and commit-group root reach stable storage.
         // Do not require the target device to sync: only the survivor-side
         // evidence must become durable before detach.
-        for idx in self.usable_candidates(&surviving_indices) {
+        let usable_surviving_indices = self.usable_candidates(&surviving_indices);
+        if usable_surviving_indices.is_empty() {
+            return Err(StoreError::InvalidOptions {
+                reason: "safe removal requires at least one usable surviving device",
+            });
+        }
+        for idx in usable_surviving_indices {
             self.devices[idx].sync_all()?;
         }
 
@@ -6281,6 +6287,32 @@ mod tests {
 
         let result = pool.safe_remove_device(&d1);
         assert!(result.is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn safe_remove_device_refuses_without_usable_survivor() {
+        let root = temp_dir("safe-remove-no-usable-survivor");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = multi_data_device_config(&root, 2);
+        let mut pool = Pool::create(config, PoolProperties::default(), &test_options()).unwrap();
+        let target_path = pool.devices[0].root().to_path_buf();
+
+        for _ in 0..3 {
+            pool.devices[1].record_checksum_error();
+        }
+        assert_eq!(pool.devices[1].status().state, DeviceState::Faulted);
+
+        let result = pool.safe_remove_device(&target_path);
+        assert!(matches!(
+            result,
+            Err(StoreError::InvalidOptions {
+                reason: "safe removal requires at least one usable surviving device"
+            })
+        ));
+        assert_eq!(pool.stats().device_count, 2);
+        assert!(root.join(DEVICE_REMOVAL_MARKER_FILE).exists());
+
         let _ = std::fs::remove_dir_all(&root);
     }
 
