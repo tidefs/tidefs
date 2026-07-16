@@ -78,6 +78,7 @@ mod tests {
     fn syncfs_success() {
         let mut e = MockEngine::new();
         e.syncfs_fn = Box::new(|_| Ok(()));
+        e.txg_commit_barrier_fn = Box::new(|| Ok(()));
         let mut kmod = KmodPosixVfs::new(e);
         kmod.syncfs(&MockEngine::test_ctx()).unwrap();
     }

@@ -95,7 +95,7 @@ mod tests {
     use super::*;
     use crate::test_util::MockEngine;
     use crate::TideBox as Box;
-    use tidefs_kmod_bridge::kernel_types::{EngineFileHandle, FileHandleId};
+    use tidefs_kmod_bridge::kernel_types::{EngineFileHandle, FileHandleId, Generation};
 
     fn fh(ino: u64, id: u64) -> EngineFileHandle {
         EngineFileHandle {
@@ -121,6 +121,32 @@ mod tests {
             .unwrap();
         assert_eq!(plan.attr.inode_id, InodeId::new(20));
         assert_eq!(state.inode, InodeId::new(20));
+    }
+
+    #[test]
+    fn create_preserves_engine_generation() {
+        let inode_id = InodeId::new(30);
+        let generation = Generation::new(1234);
+        let mut attr = MockEngine::file_attr(inode_id.get(), 0);
+        attr.generation = generation;
+        let handle = fh(inode_id.get(), 2);
+        let mut e = MockEngine::new();
+        e.create_fn = Box::new(move |_, _, _, _, _| Ok((attr, handle)));
+        let (plan, _state) = KmodPosixVfs::new(e)
+            .create(
+                InodeId::new(2),
+                b"generated",
+                0o644,
+                0,
+                &MockEngine::test_ctx(),
+            )
+            .unwrap();
+        assert_eq!(plan.attr.generation, generation);
+        assert_ne!(
+            plan.attr.generation.as_vfs_generation(),
+            plan.attr.inode_id.get()
+        );
+        MockEngine::assert_exportfs_generation_round_trip(&plan.attr);
     }
 
     #[test]

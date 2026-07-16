@@ -637,6 +637,16 @@ impl KernelEngine {
         None
     }
 
+    /// Find the current namespace parent for a child inode.
+    fn find_parent_inode(&self, child_ino: u64) -> Option<u64> {
+        for entry in self.dir_entries.borrow().iter() {
+            if entry.2 == child_ino {
+                return Some(entry.0);
+            }
+        }
+        None
+    }
+
     /// Look up an inode record by ino.
     fn find_inode(&self, ino: u64) -> Option<usize> {
         for (i, rec) in self.inodes.borrow().iter().enumerate() {
@@ -9168,6 +9178,37 @@ pub extern "C" fn tidefs_posix_vfs_engine_getattr(
     }
 }
 
+/// C-visible bridge: find the current parent of an engine-backed inode.
+#[no_mangle]
+#[cfg(CONFIG_RUST)]
+pub extern "C" fn tidefs_posix_vfs_engine_get_parent(
+    child_ino: u64,
+    out_parent_ino: *mut u64,
+) -> core::ffi::c_int {
+    if out_parent_ino.is_null() {
+        return -22; // EINVAL
+    }
+
+    let result = with_mounted_engine(
+        Err(crate::tidefs_kmod_bridge::kernel_types::Errno::ENODEV),
+        |engine| {
+            engine
+                .find_parent_inode(child_ino)
+                .ok_or(crate::tidefs_kmod_bridge::kernel_types::Errno::ENOENT)
+        },
+    );
+
+    match result {
+        // SAFETY: out_parent_ino was checked non-null above and points to a
+        // C shim-owned output slot.
+        Ok(parent_ino) => unsafe {
+            *out_parent_ino = parent_ino;
+            0
+        },
+        Err(e) => -(e.0 as core::ffi::c_int),
+    }
+}
+
 /// C-visible bridge: engine-backed file write (bootstrap write-path).
 ///
 /// Writes data at the given offset for an engine-backed file,
@@ -9903,8 +9944,14 @@ pub extern "C" fn tidefs_posix_vfs_engine_symlink(
     target_len: u32,
     out_ino: *mut u64,
     out_mode: *mut u32,
+    out_generation: *mut u64,
 ) -> core::ffi::c_int {
-    if name_ptr.is_null() || target_ptr.is_null() || out_ino.is_null() || out_mode.is_null() {
+    if name_ptr.is_null()
+        || target_ptr.is_null()
+        || out_ino.is_null()
+        || out_mode.is_null()
+        || out_generation.is_null()
+    {
         return -(crate::tidefs_kmod_bridge::kernel_types::Errno::EINVAL.0 as core::ffi::c_int);
     }
     if let Err(e) = validate_kernel_name_len(name_len) {
@@ -9931,6 +9978,7 @@ pub extern "C" fn tidefs_posix_vfs_engine_symlink(
         Ok(attr) => unsafe {
             *out_ino = attr.inode_id.get();
             *out_mode = attr.posix.mode;
+            *out_generation = attr.generation.0;
         },
         Err(e) => return -(e.0 as core::ffi::c_int),
     }
@@ -9946,8 +9994,13 @@ pub extern "C" fn tidefs_posix_vfs_engine_mknod(
     rdev: u32,
     out_ino: *mut u64,
     out_mode: *mut u32,
+    out_generation: *mut u64,
 ) -> core::ffi::c_int {
-    if name_ptr.is_null() || out_ino.is_null() || out_mode.is_null() {
+    if name_ptr.is_null()
+        || out_ino.is_null()
+        || out_mode.is_null()
+        || out_generation.is_null()
+    {
         return -(crate::tidefs_kmod_bridge::kernel_types::Errno::EINVAL.0 as core::ffi::c_int);
     }
     if let Err(e) = validate_kernel_name_len(name_len) {
@@ -9968,6 +10021,7 @@ pub extern "C" fn tidefs_posix_vfs_engine_mknod(
         Ok(attr) => unsafe {
             *out_ino = attr.inode_id.get();
             *out_mode = attr.posix.mode;
+            *out_generation = attr.generation.0;
         },
         Err(e) => return -(e.0 as core::ffi::c_int),
     }

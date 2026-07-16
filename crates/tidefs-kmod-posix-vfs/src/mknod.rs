@@ -121,6 +121,27 @@ mod tests {
     }
 
     #[test]
+    fn mknod_preserves_engine_generation() {
+        let parent = InodeId::new(1);
+        let name = b"generated";
+        let mode = S_IFCHR | 0o600;
+        let rdev: u32 = 0x0105;
+        let inode_id = InodeId::new(104);
+        let generation = Generation::new(9753);
+        let mut expected = dev_attr(inode_id.get(), NodeKind::CharDev, rdev);
+        expected.generation = generation;
+        let expected_clone = expected;
+        let mut e = MockEngine::new();
+        e.mknod_fn = Box::new(move |_, _, _, _, _| Ok(expected_clone));
+        let result = KmodPosixVfs::new(e)
+            .mknod(parent, name, mode, rdev, &MockEngine::test_ctx())
+            .unwrap();
+        assert_eq!(result.generation, generation);
+        assert_ne!(result.generation.as_vfs_generation(), result.inode_id.get());
+        MockEngine::assert_exportfs_generation_round_trip(&result);
+    }
+
+    #[test]
     fn mknod_block_device() {
         let parent = InodeId::new(1);
         let name = b"sda";

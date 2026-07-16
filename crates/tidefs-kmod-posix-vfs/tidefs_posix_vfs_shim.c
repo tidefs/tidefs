@@ -338,6 +338,10 @@ int tidefs_posix_vfs_engine_getattr(
 	unsigned long long ino,
 	struct tidefs_posix_vfs_engine_attr_out *out);
 
+int tidefs_posix_vfs_engine_get_parent(
+	unsigned long long child_ino,
+	unsigned long long *out_parent_ino);
+
 int tidefs_posix_vfs_engine_readdir(
 	unsigned long long directory_ino,
 	unsigned int cookie,
@@ -590,13 +594,15 @@ int tidefs_posix_vfs_engine_symlink(
 	unsigned long long parent_ino,
 	const unsigned char *name_buf, unsigned int name_len,
 	const unsigned char *target_buf, unsigned int target_len,
-	unsigned long long *out_ino, unsigned int *out_mode);
+	unsigned long long *out_ino, unsigned int *out_mode,
+	unsigned long long *out_generation);
 
 int tidefs_posix_vfs_engine_mknod(
 	unsigned long long parent_ino,
 	const unsigned char *name_buf, unsigned int name_len,
 	unsigned int mode, unsigned int rdev,
-	unsigned long long *out_ino, unsigned int *out_mode);
+	unsigned long long *out_ino, unsigned int *out_mode,
+	unsigned long long *out_generation);
 int tidefs_posix_vfs_engine_readlink(
 	unsigned long long ino,
 	unsigned char *out_buf, unsigned int out_buf_size,
@@ -2034,6 +2040,38 @@ static void tidefs_posix_vfs_apply_engine_attr(
 		inode, attr->atime_ns, attr->mtime_ns, attr->ctime_ns);
 }
 
+static struct inode *tidefs_posix_vfs_iget_engine_attr(
+	struct super_block *sb,
+	const struct tidefs_posix_vfs_engine_attr_out *attr)
+{
+	struct inode *inode;
+
+	if (!attr || !attr->ino || !attr->generation)
+		return ERR_PTR(-EIO);
+
+	if (sb->s_root && d_inode(sb->s_root) &&
+	    d_inode(sb->s_root)->i_ino == attr->ino) {
+		inode = igrab(d_inode(sb->s_root));
+		if (!inode)
+			return ERR_PTR(-ESTALE);
+	} else {
+		inode = iget_locked(sb, attr->ino);
+		if (!inode)
+			return ERR_PTR(-ENOMEM);
+		if (inode_state_read_once(inode) & I_NEW) {
+			tidefs_posix_vfs_apply_engine_attr(inode, attr);
+			unlock_new_inode(inode);
+			return inode;
+		}
+	}
+
+	if (inode->i_generation != (u32)attr->generation) {
+		iput(inode);
+		return ERR_PTR(-ESTALE);
+	}
+	return inode;
+}
+
 static int tidefs_posix_vfs_require_live_dir(struct inode *dir)
 {
 	if (!dir)
@@ -2085,10 +2123,9 @@ static struct dentry *tidefs_posix_vfs_lookup(struct inode *dir,
 			if (ea.ino == 0)
 				return tidefs_posix_vfs_add_negative_dentry(dentry);
 
-			inode = new_inode(dir->i_sb);
-			if (!inode)
-				return ERR_PTR(-ENOMEM);
-			tidefs_posix_vfs_apply_engine_attr(inode, &ea);
+			inode = tidefs_posix_vfs_iget_engine_attr(dir->i_sb, &ea);
+			if (IS_ERR(inode))
+				return ERR_CAST(inode);
 			return d_splice_alias(inode, dentry);
 		}
 	}
@@ -2200,7 +2237,7 @@ static int tidefs_posix_vfs_create(struct mnt_idmap *idmap,
 		if (ctx && ctx->engine_backed) {
 			u64 out_ino;
 			u32 out_mode;
-			u64 out_generation;
+			u64 out_generation = 0;
 			int ret;
 			int pool_idx;
 
@@ -2216,6 +2253,8 @@ static int tidefs_posix_vfs_create(struct mnt_idmap *idmap,
 				&out_ino, &out_mode, &out_generation);
 			if (ret < 0)
 				return ret;
+			if (!out_generation)
+				return -EIO;
 
 			/* Keep the legacy fixed table as a best-effort mirror only.
 			 * Live lookup/getattr/readdir route through the mounted engine,
@@ -2231,11 +2270,12 @@ static int tidefs_posix_vfs_create(struct mnt_idmap *idmap,
 			if (!inode)
 				return -ENOMEM;
 			inode->i_ino = out_ino;
-			inode->i_generation = out_ino;
+			inode->i_generation = out_generation;
 			inode_init_owner(idmap, inode, dir, out_mode);
 			tidefs_posix_vfs_apply_inode_ops(inode, out_mode, 0);
 			tidefs_posix_vfs_init_new_inode_times(inode);
 			tidefs_posix_vfs_touch_dirent_parent(dir);
+			insert_inode_hash(inode);
 			d_instantiate(dentry, inode);
 
 			pr_debug("tidefs_posix_vfs: create (engine-backed) name='%.*s' ino=%llu\n",
@@ -2298,7 +2338,7 @@ static int tidefs_posix_vfs_tmpfile(struct mnt_idmap *idmap,
 	struct inode *inode;
 	u64 out_ino;
 	u32 out_mode;
-	u64 out_generation;
+	u64 out_generation = 0;
 	int ret, pool_idx;
 
 	pool = tidefs_posix_vfs_pool_core_from_sb(dir->i_sb);
@@ -2314,6 +2354,8 @@ static int tidefs_posix_vfs_tmpfile(struct mnt_idmap *idmap,
 		&out_ino, &out_mode, &out_generation);
 	if (ret < 0)
 		return ret;
+	if (!out_generation)
+		return -EIO;
 
 	pool_idx = tidefs_kernel_pool_mirror_engine_inode(
 		pool, out_ino, dir->i_ino, out_mode, 0, NULL, 0);
@@ -2325,9 +2367,11 @@ static int tidefs_posix_vfs_tmpfile(struct mnt_idmap *idmap,
 	if (!inode)
 		return -ENOMEM;
 	inode->i_ino = out_ino;
+	inode->i_generation = out_generation;
 	inode_init_owner(idmap, inode, dir, out_mode);
 	tidefs_posix_vfs_apply_inode_ops(inode, out_mode, 0);
 	tidefs_posix_vfs_init_new_inode_times(inode);
+	insert_inode_hash(inode);
 	d_tmpfile(file, inode);
 
 	/*
@@ -2365,7 +2409,7 @@ static struct dentry *tidefs_posix_vfs_mkdir(struct mnt_idmap *idmap,
 		if (ctx && ctx->engine_backed) {
 			u64 out_ino;
 			u32 out_mode;
-			u64 out_generation;
+			u64 out_generation = 0;
 			int ret;
 
 			ret = tidefs_posix_vfs_require_live_dir(dir);
@@ -2380,6 +2424,8 @@ static struct dentry *tidefs_posix_vfs_mkdir(struct mnt_idmap *idmap,
 				&out_ino, &out_mode, &out_generation);
 			if (ret < 0)
 				return ERR_PTR(ret);
+			if (!out_generation)
+				return ERR_PTR(-EIO);
 
 			/* Keep the C-level table as a best-effort bring-up mirror.
 			 * The mounted engine is the live namespace authority. */
@@ -2396,13 +2442,14 @@ static struct dentry *tidefs_posix_vfs_mkdir(struct mnt_idmap *idmap,
 			if (!inode)
 				return ERR_PTR(-ENOMEM);
 			inode->i_ino = out_ino;
-			inode->i_generation = out_ino;
+			inode->i_generation = out_generation;
 			inode_init_owner(idmap, inode, dir, out_mode);
 			tidefs_posix_vfs_apply_inode_ops(inode, out_mode, 0);
 			if (dir->i_nlink > 0)
 				inc_nlink(dir);
 			tidefs_posix_vfs_init_new_inode_times(inode);
 			tidefs_posix_vfs_touch_dirent_parent(dir);
+			insert_inode_hash(inode);
 
 			pr_debug("tidefs_posix_vfs: mkdir (engine-backed) name='%.*s' ino=%llu\n",
 				 (unsigned int)dentry->d_name.len, dentry->d_name.name, out_ino);
@@ -2793,6 +2840,7 @@ static int tidefs_posix_vfs_mknod(struct mnt_idmap *idmap,
 	struct inode *inode;
 	unsigned long long out_ino = 0;
 	unsigned int out_mode = 0;
+	unsigned long long out_generation = 0;
 	int ret;
 
 	/* Refuse write operations on read-only mounts. */
@@ -2819,9 +2867,11 @@ static int tidefs_posix_vfs_mknod(struct mnt_idmap *idmap,
 				dentry->d_name.name,
 				dentry->d_name.len,
 				mode, rdev,
-				&out_ino, &out_mode);
+				&out_ino, &out_mode, &out_generation);
 			if (ret < 0)
 				return ret;
+			if (!out_generation)
+				return -EIO;
 
 			/* Best-effort legacy mirror only; the engine owns live lookup. */
 			{
@@ -2837,11 +2887,12 @@ static int tidefs_posix_vfs_mknod(struct mnt_idmap *idmap,
 			if (!inode)
 				return -ENOMEM;
 			inode->i_ino = out_ino;
-			inode->i_generation = out_ino;
+			inode->i_generation = out_generation;
 			inode_init_owner(idmap, inode, dir, out_mode);
 			tidefs_posix_vfs_apply_inode_ops(inode, out_mode, 0);
 			tidefs_posix_vfs_init_new_inode_times(inode);
 			tidefs_posix_vfs_touch_dirent_parent(dir);
+			insert_inode_hash(inode);
 			d_instantiate(dentry, inode);
 
 			pr_debug("tidefs_posix_vfs: mknod (engine-backed) name=%.*s ino=%llu mode=0%o\n",
@@ -2939,6 +2990,7 @@ static int tidefs_posix_vfs_symlink(struct mnt_idmap *idmap,
 	struct tidefs_posix_vfs_kernel_pool_core *pool;
 	unsigned long long out_ino = 0;
 	unsigned int out_mode = 0;
+	unsigned long long out_generation = 0;
 	int ret;
 	size_t target_len = strlen(symname);
 
@@ -2965,9 +3017,11 @@ static int tidefs_posix_vfs_symlink(struct mnt_idmap *idmap,
 				dir->i_ino,
 				dentry->d_name.name, dentry->d_name.len,
 				(const unsigned char *)symname, (unsigned int)target_len,
-				&out_ino, &out_mode);
+				&out_ino, &out_mode, &out_generation);
 			if (ret < 0)
 				return ret;
+			if (!out_generation)
+				return -EIO;
 
 			/* Best-effort legacy mirror only; the engine owns live lookup. */
 			{
@@ -2988,11 +3042,12 @@ static int tidefs_posix_vfs_symlink(struct mnt_idmap *idmap,
 				if (!sym_inode)
 					return -ENOMEM;
 				sym_inode->i_ino = out_ino;
-				sym_inode->i_generation = out_ino;
+				sym_inode->i_generation = out_generation;
 				inode_init_owner(idmap, sym_inode, dir, out_mode);
 				tidefs_posix_vfs_apply_inode_ops(sym_inode, out_mode, target_len);
 				tidefs_posix_vfs_init_new_inode_times(sym_inode);
 				tidefs_posix_vfs_touch_dirent_parent(dir);
+				insert_inode_hash(sym_inode);
 				d_instantiate(dentry, sym_inode);
 			}
 			pr_debug("tidefs_posix_vfs: symlink (engine-backed) name='%.*s' target='%s' ino=%llu\n",
@@ -6724,6 +6779,32 @@ static int tidefs_posix_vfs_encode_fh(struct inode *inode, __u32 *fh,
 	return 2;
 }
 
+static struct inode *tidefs_posix_vfs_export_iget(struct super_block *sb,
+						   u64 ino)
+{
+	struct tidefs_posix_vfs_mount *ctx = sb->s_fs_info;
+	struct tidefs_posix_vfs_engine_attr_out attr;
+	struct inode *inode;
+	int ret;
+
+	inode = ilookup(sb, ino);
+	if (inode)
+		return inode;
+	if (!ctx || !ctx->engine_backed)
+		return ERR_PTR(-ESTALE);
+
+	memset(&attr, 0, sizeof(attr));
+	ret = tidefs_posix_vfs_engine_getattr(ino, &attr);
+	if (ret == -ENOENT)
+		return ERR_PTR(-ESTALE);
+	if (ret < 0)
+		return ERR_PTR(ret);
+	if (attr.ino != ino)
+		return ERR_PTR(-EIO);
+
+	return tidefs_posix_vfs_iget_engine_attr(sb, &attr);
+}
+
 static struct dentry *tidefs_posix_vfs_fh_to_dentry(struct super_block *sb,
 	struct fid *fid, int fh_len, int fh_type)
 {
@@ -6744,9 +6825,9 @@ static struct dentry *tidefs_posix_vfs_fh_to_dentry(struct super_block *sb,
 		return ERR_PTR(-EINVAL);
 	}
 
-	inode = ilookup5(sb, ino, NULL, NULL);
-	if (!inode)
-		return ERR_PTR(-ESTALE);
+	inode = tidefs_posix_vfs_export_iget(sb, ino);
+	if (IS_ERR(inode))
+		return ERR_CAST(inode);
 
 	if (inode->i_generation != gen) {
 		iput(inode);
@@ -6767,17 +6848,48 @@ static struct dentry *tidefs_posix_vfs_fh_to_parent(struct super_block *sb,
 
 	parent_ino = ((u64)fid->raw[4] << 32) | fid->raw[5];
 
-	inode = ilookup5(sb, parent_ino, NULL, NULL);
-	if (!inode)
-		return ERR_PTR(-ESTALE);
+	inode = tidefs_posix_vfs_export_iget(sb, parent_ino);
+	if (IS_ERR(inode))
+		return ERR_CAST(inode);
 
 	return d_obtain_alias(inode);
+}
+
+static struct dentry *tidefs_posix_vfs_get_parent(struct dentry *child)
+{
+	struct inode *child_inode = d_inode(child);
+	struct tidefs_posix_vfs_mount *ctx;
+	struct inode *parent_inode;
+	u64 parent_ino = 0;
+	int ret;
+
+	if (!child_inode)
+		return ERR_PTR(-ESTALE);
+	ctx = child_inode->i_sb->s_fs_info;
+	if (!ctx || !ctx->engine_backed)
+		return ERR_PTR(-ESTALE);
+
+	ret = tidefs_posix_vfs_engine_get_parent(child_inode->i_ino,
+						 &parent_ino);
+	if (ret == -ENOENT)
+		return ERR_PTR(-ESTALE);
+	if (ret < 0)
+		return ERR_PTR(ret);
+	if (!parent_ino)
+		return ERR_PTR(-EIO);
+
+	parent_inode = tidefs_posix_vfs_export_iget(child_inode->i_sb,
+						       parent_ino);
+	if (IS_ERR(parent_inode))
+		return ERR_CAST(parent_inode);
+	return d_obtain_alias(parent_inode);
 }
 
 static const struct export_operations tidefs_posix_vfs_export_ops = {
 	.encode_fh      = tidefs_posix_vfs_encode_fh,
 	.fh_to_dentry   = tidefs_posix_vfs_fh_to_dentry,
 	.fh_to_parent   = tidefs_posix_vfs_fh_to_parent,
+	.get_parent     = tidefs_posix_vfs_get_parent,
 };
 
 

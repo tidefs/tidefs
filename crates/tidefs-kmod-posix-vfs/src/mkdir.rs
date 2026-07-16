@@ -97,6 +97,7 @@ mod tests {
     use super::*;
     use crate::test_util::MockEngine;
     use crate::TideBox as Box;
+    use tidefs_kmod_bridge::kernel_types::Generation;
 
     // -- Basic delegation tests ---
 
@@ -111,6 +112,30 @@ mod tests {
             .unwrap();
         assert_eq!(plan.attr.inode_id, InodeId::new(42));
         assert_eq!(plan.attr.posix.mode, 0o40755);
+    }
+
+    #[test]
+    fn mkdir_preserves_engine_generation() {
+        let inode_id = InodeId::new(50);
+        let generation = Generation::new(4321);
+        let mut attr = MockEngine::dir_attr(inode_id.get());
+        attr.generation = generation;
+        let mut e = MockEngine::new();
+        e.mkdir_fn = Box::new(move |_, _, _, _| Ok(attr));
+        let plan = KmodPosixVfs::new(e)
+            .mkdir(
+                InodeId::new(2),
+                b"generated",
+                0o755,
+                &MockEngine::test_ctx(),
+            )
+            .unwrap();
+        assert_eq!(plan.attr.generation, generation);
+        assert_ne!(
+            plan.attr.generation.as_vfs_generation(),
+            plan.attr.inode_id.get()
+        );
+        MockEngine::assert_exportfs_generation_round_trip(&plan.attr);
     }
 
     #[test]

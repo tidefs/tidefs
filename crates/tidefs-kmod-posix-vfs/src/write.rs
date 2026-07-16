@@ -192,6 +192,7 @@ mod tests {
             assert!(!datasync, "O_SYNC should call full fsync (datasync=false)");
             Ok(())
         });
+        e.txg_commit_barrier_fn = Box::new(|| Ok(()));
 
         let written = KmodPosixVfs::new(e)
             .write(&h, 0, b"hello", &MockEngine::test_ctx())
@@ -216,6 +217,7 @@ mod tests {
             fd.store(datasync, Ordering::SeqCst);
             Ok(())
         });
+        e.txg_commit_barrier_fn = Box::new(|| Ok(()));
 
         KmodPosixVfs::new(e)
             .write(&h, 0, b"abc", &MockEngine::test_ctx())
@@ -289,6 +291,7 @@ mod tests {
 
         e.write_fn = Box::new(|_, _, data, _| Ok(data.len() as u32));
         e.fsync_fn = Box::new(|_, _, _| Ok(()));
+        e.txg_commit_barrier_fn = Box::new(|| Ok(()));
 
         let written = KmodPosixVfs::new(e)
             .write(&h, 0, b"sync-write", &MockEngine::test_ctx())
@@ -313,6 +316,7 @@ mod tests {
             dv.store(datasync, Ordering::SeqCst);
             Ok(())
         });
+        e.txg_commit_barrier_fn = Box::new(|| Ok(()));
 
         KmodPosixVfs::new(e)
             .write(&h, 0, b"test", &MockEngine::test_ctx())
@@ -365,6 +369,7 @@ mod tests {
             dv.store(datasync, Ordering::SeqCst);
             Ok(())
         });
+        e.txg_commit_barrier_fn = Box::new(|| Ok(()));
 
         KmodPosixVfs::new(e)
             .write(&h, 0, b"di+dsy", &MockEngine::test_ctx())
