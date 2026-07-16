@@ -828,8 +828,18 @@ fn dead_object_replacement_receipt_for_object(
     ))
 }
 
-fn receipt_supersedes(candidate: &PlacementReceipt, current: &PlacementReceipt) -> bool {
-    (candidate.epoch, candidate.generation) >= (current.epoch, current.generation)
+fn receipt_supersedes(candidate: &PlacementReceipt, current: &PlacementReceipt) -> Result<bool> {
+    let candidate_version = (candidate.epoch, candidate.generation);
+    let current_version = (current.epoch, current.generation);
+    if candidate_version == current_version {
+        if candidate != current {
+            return Err(StoreError::InvalidOptions {
+                reason: "conflicting placement receipts share epoch and generation",
+            });
+        }
+        return Ok(false);
+    }
+    Ok(candidate_version > current_version)
 }
 
 struct ReceiptCursor<'a> {
@@ -1986,7 +1996,7 @@ impl Pool {
                 }
 
                 let replace = match receipts.get(&receipt.object_key) {
-                    Some(current) => receipt_supersedes(&receipt, current),
+                    Some(current) => receipt_supersedes(&receipt, current)?,
                     None => true,
                 };
                 if replace {
@@ -2029,7 +2039,7 @@ impl Pool {
                 continue;
             }
             let replace = match best.as_ref() {
-                Some(current) => receipt_supersedes(&receipt, current),
+                Some(current) => receipt_supersedes(&receipt, current)?,
                 None => true,
             };
             if replace {
@@ -3131,7 +3141,7 @@ impl Pool {
             // Faulted devices are excluded from the pool-wide receipt scan,
             // so retain target-local authority for evacuation selection.
             let replace = match placement_receipts.get(&receipt.object_key) {
-                Some(current) => receipt_supersedes(&receipt, current),
+                Some(current) => receipt_supersedes(&receipt, current)?,
                 None => true,
             };
             if replace {
@@ -3151,7 +3161,7 @@ impl Pool {
             }
 
             let replace = match placement_receipts.get(&receipt.object_key) {
-                Some(current) => receipt_supersedes(&receipt, current),
+                Some(current) => receipt_supersedes(&receipt, current)?,
                 None => true,
             };
             if replace {
@@ -6052,6 +6062,60 @@ mod tests {
             })
         ));
         assert_eq!(pool.stats().device_count, 4);
+        assert!(root.join(DEVICE_REMOVAL_MARKER_FILE).exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn safe_remove_device_refuses_conflicting_target_and_survivor_receipts() {
+        let root = temp_dir("safe-remove-conflicting-receipts");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = multi_data_device_config(&root, 3);
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::replicated(2),
+            ..PoolProperties::default()
+        };
+        let mut pool = Pool::create(config, properties, &test_options()).unwrap();
+        set_deterministic_device_guids(&mut pool);
+
+        let key = ObjectKey::from_name(b"conflicting-receipts-before-remove");
+        let payload = b"removal must not choose between equal receipt versions";
+        pool.put(IoClass::Data, key, payload).unwrap();
+        let receipt = pool
+            .placement_receipt_for_key(IoClass::Data, key)
+            .unwrap()
+            .expect("receipt before removal");
+        let victim_idx = pool.resolve_receipt_target(&receipt.targets[0]).unwrap();
+        let victim_path = pool.devices[victim_idx].root().to_path_buf();
+        let receipt_key = placement_receipt_object_key(key);
+
+        let mut conflicting = receipt.clone();
+        conflicting.payload_digest = blake3::hash(b"different payload authority").into();
+        let encoded = conflicting.encode().unwrap();
+        for idx in 0..pool.devices.len() {
+            if idx != victim_idx {
+                pool.devices[idx]
+                    .put(receipt_key, &encoded)
+                    .expect("write conflicting survivor receipt");
+            }
+        }
+        for _ in 0..3 {
+            pool.devices[victim_idx].record_checksum_error();
+        }
+        assert_eq!(
+            pool.devices[victim_idx].status().state,
+            DeviceState::Faulted
+        );
+
+        let result = pool.safe_remove_device(&victim_path);
+        assert!(matches!(
+            result,
+            Err(StoreError::InvalidOptions {
+                reason: "conflicting placement receipts share epoch and generation"
+            })
+        ));
+        assert_eq!(pool.stats().device_count, 3);
         assert!(root.join(DEVICE_REMOVAL_MARKER_FILE).exists());
 
         let _ = std::fs::remove_dir_all(&root);
