@@ -3196,14 +3196,20 @@ impl Pool {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::InvalidOptions`] when the target device is not
-    /// found or is the last remaining device in the pool.  Returns
-    /// [`StoreError::Io`] when object read/write/delete fails.
+    /// Returns [`StoreError::InvalidOptions`] when the pool is locked, the
+    /// target device is not found, or it is the last remaining device in the
+    /// pool. Returns [`StoreError::Io`] when object read/write/delete fails.
     pub fn safe_remove_device(
         &mut self,
         path: &Path,
     ) -> Result<crate::device_removal::EvacuationResult> {
         use crate::device_removal::EvacuationResult;
+
+        if self.locked {
+            return Err(StoreError::InvalidOptions {
+                reason: "pool is locked: encryption key required for I/O",
+            });
+        }
 
         let target_idx = self.devices.iter().position(|v| v.root() == path).ok_or(
             StoreError::InvalidOptions {
@@ -9467,6 +9473,43 @@ mod tests {
             msg.contains("encryption key"),
             "get error message must mention encryption key: {msg}"
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn locked_pool_refuses_safe_device_removal() {
+        let root = temp_dir("locked-safe-remove");
+        let _ = std::fs::remove_dir_all(&root);
+        let options = test_options();
+        let encryption =
+            crate::encrypt::EncryptionConfig::new(crate::encrypt::StoreEncryptionKey::generate());
+        let mut config = multi_data_device_config(&root, 2);
+        for device in &mut config.devices {
+            device.encryption = Some(encryption.clone());
+        }
+
+        let pool = Pool::create(config.clone(), PoolProperties::default(), &options).unwrap();
+        pool.export().unwrap();
+        drop(pool);
+
+        let target_path = config.devices[0].path.clone();
+        for device in &mut config.devices {
+            device.encryption = None;
+        }
+        let mut locked_pool = Pool::open(config, PoolProperties::default(), &options).unwrap();
+        assert!(locked_pool.is_locked());
+
+        let err = locked_pool.safe_remove_device(&target_path).unwrap_err();
+
+        assert!(matches!(
+            err,
+            StoreError::InvalidOptions {
+                reason: "pool is locked: encryption key required for I/O"
+            }
+        ));
+        assert_eq!(locked_pool.stats().device_count, 2);
+        assert!(!root.join(DEVICE_REMOVAL_MARKER_FILE).exists());
 
         let _ = std::fs::remove_dir_all(&root);
     }
