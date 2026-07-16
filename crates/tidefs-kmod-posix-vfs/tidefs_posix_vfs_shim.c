@@ -4707,6 +4707,13 @@ static int tidefs_posix_vfs_set_acl(struct mnt_idmap *idmap,
 	else if (type == ACL_TYPE_DEFAULT) {
 		if (!S_ISDIR(inode->i_mode))
 			return acl ? -EACCES : 0;
+		/*
+		 * A stored default ACL is only meaningful when create and mkdir
+		 * inherit it. Refuse raw-only default ACL storage while this mounted
+		 * adapter cannot apply that inheritance contract.
+		 */
+		if (acl)
+			return -EOPNOTSUPP;
 		xattr_name = XATTR_NAME_POSIX_ACL_DEFAULT;
 	} else
 		return -EINVAL;
@@ -4809,6 +4816,7 @@ static int tidefs_posix_vfs_setattr(struct mnt_idmap *idmap,
 		unsigned int out_gid = 0;
 		unsigned long long out_size = 0;
 		unsigned long long out_blocks = 0;
+		bool mode_update;
 		bool size_update;
 		bool invalidate_locked = false;
 		loff_t old_size = 0;
@@ -4818,6 +4826,7 @@ static int tidefs_posix_vfs_setattr(struct mnt_idmap *idmap,
 		if (ret)
 			return ret;
 
+		mode_update = (iattr->ia_valid & ATTR_MODE) != 0;
 		size_update = (iattr->ia_valid & ATTR_SIZE) != 0;
 
 		/*
@@ -4904,7 +4913,8 @@ static int tidefs_posix_vfs_setattr(struct mnt_idmap *idmap,
 		 * set to "now" and any bits we did not clear). */
 		setattr_copy(idmap, inode, iattr);
 		mark_inode_dirty(inode);
-		ret = 0;
+		ret = mode_update ?
+			posix_acl_chmod(idmap, dentry, inode->i_mode) : 0;
 out_invalidate_unlock:
 		if (invalidate_locked)
 			filemap_invalidate_unlock(inode->i_mapping);
