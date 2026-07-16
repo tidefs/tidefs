@@ -43,8 +43,6 @@ pub(crate) trait ContentWriteStore {
 
     fn put(&mut self, key: ObjectKey, payload: &[u8]) -> Result<StoredObject>;
 
-    fn contains_key(&self, key: ObjectKey) -> bool;
-
     fn raw_store(&self) -> &LocalObjectStore;
     fn raw_store_mut(&mut self) -> &mut LocalObjectStore;
 }
@@ -63,9 +61,6 @@ impl<'a> ContentWriteStore for PoolStoreMut<'a> {
     }
     fn put(&mut self, key: ObjectKey, payload: &[u8]) -> Result<StoredObject> {
         Ok(PoolStoreMut::put(self, key, payload)?)
-    }
-    fn contains_key(&self, key: ObjectKey) -> bool {
-        PoolStoreMut::raw_store(self).contains_key(key)
     }
     fn raw_store(&self) -> &LocalObjectStore {
         PoolStoreMut::raw_store(self)
@@ -103,9 +98,6 @@ impl<'a> ContentWriteStore for &'a mut LocalObjectStore {
     fn put(&mut self, key: ObjectKey, payload: &[u8]) -> Result<StoredObject> {
         Ok(LocalObjectStore::put(self, key, payload)?)
     }
-    fn contains_key(&self, key: ObjectKey) -> bool {
-        LocalObjectStore::contains_key(self, key)
-    }
     fn raw_store(&self) -> &LocalObjectStore {
         self
     }
@@ -141,9 +133,6 @@ impl ContentWriteStore for LocalObjectStore {
     }
     fn put(&mut self, key: ObjectKey, payload: &[u8]) -> Result<StoredObject> {
         Ok(LocalObjectStore::put(self, key, payload)?)
-    }
-    fn contains_key(&self, key: ObjectKey) -> bool {
-        LocalObjectStore::contains_key(self, key)
     }
     fn raw_store(&self) -> &LocalObjectStore {
         self
@@ -1105,12 +1094,23 @@ fn encode_chunk_with_dedup<S: ContentWriteStore>(
     let fingerprint = crate::encoding::compute_content_fingerprint(chunk_bytes);
     let hash = fingerprint.as_dedup_hash();
     let canonical_key = crate::object_keys::content_dedup_object_key(&fingerprint);
+    let mut canonical_read_error = None;
     let decision = decide_inline_dedup(
         &hash,
         canonical_key,
         |candidate| dedup_index.lookup_hash(candidate),
-        |candidate| store.contains_key(candidate),
+        |candidate| match store.get(candidate) {
+            Ok(Some(_)) => true,
+            Ok(None) => false,
+            Err(err) => {
+                canonical_read_error = Some(err);
+                false
+            }
+        },
     );
+    if let Some(err) = canonical_read_error {
+        return Err(err);
+    }
 
     match decision {
         InlineDedupDecision::SessionHit { canonical } => {
@@ -2750,10 +2750,6 @@ mod tests {
             <LocalObjectStore as ContentWriteStore>::put(&mut self.raw, key, payload)
         }
 
-        fn contains_key(&self, key: ObjectKey) -> bool {
-            self.routed.contains_key(&key) || self.raw.contains_key(key)
-        }
-
         fn raw_store(&self) -> &LocalObjectStore {
             &self.raw
         }
@@ -2841,6 +2837,56 @@ mod tests {
         assert_eq!(
             crate::dedup_refcount::DedupRefCount::read(&store, &fingerprint)
                 .expect("refcount read should succeed"),
+            2
+        );
+    }
+
+    #[test]
+    fn inline_dedup_canonical_probe_uses_write_store_route() {
+        let payload = vec![0x6b; content_chunk_size() as usize];
+        let record = test_record(3, 1, payload.len() as u64);
+        let fingerprint = crate::encoding::compute_content_fingerprint(&payload);
+        let canonical_key = crate::object_keys::content_dedup_object_key(&fingerprint);
+        let canonical =
+            encode_content_chunk(&record, 0, &payload, &ContentCompressionPolicy::off());
+        let mut routed = BTreeMap::new();
+        routed.insert(canonical_key, canonical);
+        let mut store = RoutedReadStore {
+            raw: temp_store("routed-dedup-probe-empty-raw"),
+            routed,
+        };
+        crate::dedup_refcount::DedupRefCount::init(&mut store.raw, &fingerprint)
+            .expect("seed canonical refcount metadata");
+        let mut dedup_index = DedupIndex::new();
+        let mut quorum_store = None;
+
+        let redirect = encode_chunk_with_dedup(
+            true,
+            &mut store,
+            &record,
+            0,
+            &payload,
+            &mut dedup_index,
+            &mut quorum_store,
+            &ContentCompressionPolicy::off(),
+        )
+        .expect("canonical probe should use the routed read authority");
+
+        assert_eq!(
+            decode_dedup_redirect(&redirect).expect("dedup redirect should decode"),
+            canonical_key
+        );
+        assert!(
+            !store.raw.contains_key(canonical_key),
+            "routed canonical probe must not populate or depend on the raw store"
+        );
+        assert_eq!(
+            dedup_index.lookup_hash(&fingerprint.as_dedup_hash()),
+            Some(canonical_key)
+        );
+        assert_eq!(
+            crate::dedup_refcount::DedupRefCount::read(&store.raw, &fingerprint)
+                .expect("read routed canonical refcount"),
             2
         );
     }
