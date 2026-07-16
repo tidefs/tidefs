@@ -218,6 +218,10 @@ pub enum SnapshotBarrierSendError {
         peer_count: usize,
         max_peers: usize,
     },
+    MembershipPeerUnavailable {
+        barrier_id: BarrierId,
+        peer_ids: Vec<u64>,
+    },
     SendFailed {
         barrier_id: BarrierId,
         peer_id: u64,
@@ -259,6 +263,13 @@ impl fmt::Display for SnapshotBarrierSendError {
             } => write!(
                 f,
                 "barrier {barrier_id} refused because peer count {peer_count} exceeds configured maximum {max_peers}"
+            ),
+            Self::MembershipPeerUnavailable {
+                barrier_id,
+                peer_ids,
+            } => write!(
+                f,
+                "barrier {barrier_id} membership_peer_unavailable: no eligible storage session for active roster peers {peer_ids:?}"
             ),
             Self::SendFailed {
                 barrier_id,

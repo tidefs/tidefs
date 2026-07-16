@@ -785,6 +785,21 @@ fn snapshot_barrier_send_label(barrier_id: u64, key: &[u8]) -> String {
     format!("vfssend2-{class}-send-{barrier_id}")
 }
 
+fn active_snapshot_barrier_peer_ids(ctx: &SessionContext) -> BTreeSet<u64> {
+    let membership = ctx.membership.lock().unwrap();
+    let local_id = membership.my_id;
+    membership
+        .roster
+        .snapshot()
+        .iter()
+        .filter_map(|(member_id, state)| {
+            (*member_id != local_id
+                && *state == tidefs_membership_live::roster::RosterState::Active)
+                .then_some(member_id.0)
+        })
+        .collect()
+}
+
 fn clear_active_snapshot_barrier(ctx: &SessionContext) {
     *ctx.active_barrier.lock().unwrap() = None;
 }
@@ -821,6 +836,16 @@ fn run_snapshot_barrier_before_send_with_config(
 ) -> Result<SnapshotBarrierSendReport, SnapshotBarrierSendError> {
     let barrier_id = allocate_barrier_id();
     let snapshot_name = snapshot_barrier_send_label(barrier_id, key);
+    let expected_peer_ids = active_snapshot_barrier_peer_ids(ctx);
+
+    if expected_peer_ids.len() > config.max_peers {
+        return Err(SnapshotBarrierSendError::PeerLimitExceeded {
+            barrier_id,
+            peer_count: expected_peer_ids.len(),
+            max_peers: config.max_peers,
+        });
+    }
+
     let peer_sessions = {
         let transport = ctx.transport.lock().unwrap();
         let mut peer_sessions = BTreeMap::new();
@@ -829,21 +854,27 @@ fn run_snapshot_barrier_before_send_with_config(
                 continue;
             }
             if let Some(peer_id) = transport.peer_node(*sid) {
-                peer_sessions.entry(peer_id).or_insert(*sid);
+                if expected_peer_ids.contains(&peer_id) {
+                    peer_sessions.entry(peer_id).or_insert(*sid);
+                }
             }
         }
         peer_sessions
     };
 
-    if peer_sessions.len() > config.max_peers {
-        return Err(SnapshotBarrierSendError::PeerLimitExceeded {
+    let missing_peer_ids = expected_peer_ids
+        .iter()
+        .filter(|peer_id| !peer_sessions.contains_key(peer_id))
+        .copied()
+        .collect::<Vec<_>>();
+    if !missing_peer_ids.is_empty() {
+        return Err(SnapshotBarrierSendError::MembershipPeerUnavailable {
             barrier_id,
-            peer_count: peer_sessions.len(),
-            max_peers: config.max_peers,
+            peer_ids: missing_peer_ids,
         });
     }
 
-    let peer_ids = peer_sessions.keys().copied().collect::<Vec<_>>();
+    let peer_ids = expected_peer_ids.into_iter().collect::<Vec<_>>();
     let coordinator = SnapshotCoordinator::new(barrier_id, snapshot_name, peer_ids, config);
 
     let request_bytes = coordinator.request_bytes();
@@ -6539,6 +6570,14 @@ mod cluster_pool_handler_tests {
         (dir, backend)
     }
 
+    fn register_snapshot_barrier_test_peer(ctx: &SessionContext, peer_id: u64) {
+        ctx.membership.lock().unwrap().add_peer(
+            MemberId::new(peer_id),
+            MemberClass::Voter,
+            peer_id,
+        );
+    }
+
     fn full_send_exports(auth_key: RootAuthenticationKey) -> (Vec<u8>, Vec<u8>) {
         let source_dir = tempfile::tempdir().unwrap();
         let mut source = vfs::LocalFileSystem::open_with_root_authentication_key(
@@ -6626,9 +6665,23 @@ mod cluster_pool_handler_tests {
     }
 
     #[test]
-    fn snapshot_barrier_before_send_allows_zero_peer_gate() {
+    fn snapshot_barrier_before_send_ignores_unrostered_client_for_zero_peer_gate() {
         let (_dir, store) = frame_local_store();
         let ctx = frame_test_context(Arc::clone(&store));
+        let client_session_id = tidefs_transport::SessionId::new(2);
+        let client_session = tidefs_transport::session::Session::new(
+            client_session_id,
+            1,
+            2,
+            tidefs_transport::TransportAddr::Tcp("127.0.0.1:9002".parse().unwrap()),
+            tidefs_transport::EndpointFamily::LocalEmbed,
+            tidefs_transport::TransportBackendKind::Tcp,
+        );
+        ctx.transport
+            .lock()
+            .unwrap()
+            .sessions
+            .insert(client_session_id, Arc::new(Mutex::new(client_session)));
 
         let report =
             run_snapshot_barrier_before_send(tidefs_transport::SessionId::new(1), &ctx, &[])
@@ -6637,6 +6690,29 @@ mod cluster_pool_handler_tests {
         assert_eq!(report.peer_count, 0);
         assert_eq!(report.min_txg, 0);
         assert_eq!(report.max_txg, 0);
+        assert!(ctx.active_barrier.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn snapshot_barrier_before_send_refuses_active_roster_peer_without_session() {
+        let (_dir, store) = frame_local_store();
+        let ctx = frame_test_context(Arc::clone(&store));
+        register_snapshot_barrier_test_peer(&ctx, 2);
+
+        let err = run_snapshot_barrier_before_send(tidefs_transport::SessionId::new(1), &ctx, &[])
+            .expect_err("active roster peer without a storage session must refuse send");
+
+        match &err {
+            SnapshotBarrierSendError::MembershipPeerUnavailable {
+                barrier_id,
+                peer_ids,
+            } => {
+                assert!(*barrier_id > 0);
+                assert_eq!(peer_ids, &vec![2]);
+            }
+            other => panic!("expected unavailable membership peer, got {other:?}"),
+        }
+        assert!(err.to_string().contains("membership_peer_unavailable"));
         assert!(ctx.active_barrier.lock().unwrap().is_none());
     }
 
@@ -6656,6 +6732,7 @@ mod cluster_pool_handler_tests {
     fn snapshot_barrier_before_send_clears_active_barrier_on_send_failure() {
         let (_dir, store) = frame_local_store();
         let ctx = frame_test_context(Arc::clone(&store));
+        register_snapshot_barrier_test_peer(&ctx, 2);
         let peer_session_id = tidefs_transport::SessionId::new(2);
         let peer_session = tidefs_transport::session::Session::new(
             peer_session_id,
@@ -6686,6 +6763,7 @@ mod cluster_pool_handler_tests {
     fn snapshot_barrier_before_send_refuses_peer_count_above_limit() {
         let (_dir, store) = frame_local_store();
         let ctx = frame_test_context(Arc::clone(&store));
+        register_snapshot_barrier_test_peer(&ctx, 2);
         let peer_session_id = tidefs_transport::SessionId::new(2);
         let peer_session = tidefs_transport::session::Session::new(
             peer_session_id,
@@ -6785,6 +6863,7 @@ mod cluster_pool_handler_tests {
 
         let (_dir, store) = frame_local_store();
         let ctx = frame_test_context(Arc::clone(&store));
+        register_snapshot_barrier_test_peer(&ctx, 2);
         *ctx.transport.lock().unwrap() = local_transport;
 
         let err = run_snapshot_barrier_before_send_with_config(
