@@ -3265,6 +3265,7 @@ impl Pool {
         let mut rewritten_logical_keys = BTreeSet::new();
         let mut placement_receipts = BTreeMap::new();
         let mut failed_logical_keys = BTreeSet::new();
+        let mut unverifiable_receipt_keys = BTreeSet::new();
 
         let mut mark_failed = |result: &mut EvacuationResult, key: ObjectKey| {
             if failed_logical_keys.insert(key) {
@@ -3312,28 +3313,75 @@ impl Pool {
             }
         }
 
-        for receipt in self.placement_receipts(IoClass::Data)? {
-            internal_placement_keys.insert(placement_receipt_object_key(receipt.object_key));
-            if matches!(receipt.policy, PoolRedundancyPolicy::Erasure { .. }) {
-                for target in &receipt.targets {
-                    internal_placement_keys.insert(placement_shard_object_key(
-                        receipt.object_key,
-                        target.shard_index,
-                    ));
+        // Device health controls rewrite eligibility, not receipt authority.
+        // A faulted survivor can still carry a readable newer receipt; hiding
+        // it here could let removal republish stale payload with a newer
+        // generation. Inspect every other data device and fail closed when a
+        // visible receipt cannot be read or verified.
+        for idx in self
+            .class_map
+            .get(IoClass::Data)
+            .iter()
+            .copied()
+            .filter(|idx| *idx != target_idx)
+        {
+            for key in self.devices[idx].store().list_keys_including_internal() {
+                if !crate::is_pool_placement_receipt_key(key) {
+                    continue;
+                }
+                let Some(raw) = self.devices[idx].get(key)? else {
+                    unverifiable_receipt_keys.insert(key);
+                    continue;
+                };
+                let Some(receipt) = PlacementReceipt::decode(&raw) else {
+                    unverifiable_receipt_keys.insert(key);
+                    continue;
+                };
+                if placement_receipt_object_key(receipt.object_key) != key {
+                    unverifiable_receipt_keys.insert(key);
+                    continue;
+                }
+
+                internal_placement_keys.insert(key);
+                if matches!(receipt.policy, PoolRedundancyPolicy::Erasure { .. }) {
+                    for target in &receipt.targets {
+                        internal_placement_keys.insert(placement_shard_object_key(
+                            receipt.object_key,
+                            target.shard_index,
+                        ));
+                    }
+                }
+
+                let replace = match placement_receipts.get(&receipt.object_key) {
+                    Some(current) => receipt_supersedes(&receipt, current)?,
+                    None => true,
+                };
+                if replace {
+                    placement_receipts.insert(receipt.object_key, receipt);
                 }
             }
+        }
 
-            let replace = match placement_receipts.get(&receipt.object_key) {
-                Some(current) => receipt_supersedes(&receipt, current)?,
-                None => true,
+        let mut unverifiable_logical_keys = BTreeSet::new();
+        for receipt_key in unverifiable_receipt_keys {
+            let Some(receipt) = placement_receipts
+                .values()
+                .find(|receipt| placement_receipt_object_key(receipt.object_key) == receipt_key)
+            else {
+                return Err(StoreError::InvalidOptions {
+                    reason: "placement receipt corrupt or unverifiable",
+                });
             };
-            if replace {
-                placement_receipts.insert(receipt.object_key, receipt);
-            }
+            unverifiable_logical_keys.insert(receipt.object_key);
         }
 
         for receipt in placement_receipts.into_values() {
             current_logical_keys.insert(receipt.object_key);
+
+            if unverifiable_logical_keys.contains(&receipt.object_key) {
+                mark_failed(&mut result, receipt.object_key);
+                continue;
+            }
 
             // Older receipt encodings have no sealed planner replay authority.
             // They remain readable for in-tree harness data, but cannot prove
@@ -6214,6 +6262,102 @@ mod tests {
             .targets
             .iter()
             .all(|target| target.device_guid != victim_guid));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn safe_remove_device_uses_newer_receipt_from_faulted_survivor() {
+        let root = temp_dir("safe-remove-faulted-survivor-receipt");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = multi_data_device_config(&root, 3);
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::replicated(1),
+            ..PoolProperties::default()
+        };
+        let mut pool = Pool::create(config, properties, &test_options()).unwrap();
+        set_deterministic_device_guids(&mut pool);
+
+        let key = ObjectKey::from_name(b"newer-faulted-survivor-receipt");
+        let stale_payload = b"stale payload on removal target";
+        let current_payload = b"current payload on faulted survivor";
+        pool.put(IoClass::Data, key, stale_payload).unwrap();
+        let stale_receipt = pool
+            .placement_receipt_for_key(IoClass::Data, key)
+            .unwrap()
+            .expect("initial receipt");
+        let target_idx = pool
+            .resolve_receipt_target(&stale_receipt.targets[0])
+            .unwrap();
+        let target_path = pool.devices[target_idx].root().to_path_buf();
+        let surviving_indices: Vec<_> = (0..pool.devices.len())
+            .filter(|idx| *idx != target_idx)
+            .collect();
+
+        let mut current_receipt = pool
+            .plan_pool_wide_placement(
+                IoClass::Data,
+                key,
+                current_payload.len(),
+                &surviving_indices,
+            )
+            .unwrap();
+        current_receipt.generation = pool.allocate_placement_receipt_generation();
+        current_receipt.payload_digest = digest32(current_payload);
+        pool.put_replicated_with_receipt(
+            key,
+            current_payload,
+            &surviving_indices,
+            &mut current_receipt,
+        )
+        .unwrap();
+        assert!(
+            (current_receipt.epoch, current_receipt.generation)
+                > (stale_receipt.epoch, stale_receipt.generation)
+        );
+        let current_owner_idx = pool
+            .resolve_receipt_target(&current_receipt.targets[0])
+            .unwrap();
+        assert_ne!(current_owner_idx, target_idx);
+
+        // Leave the newer receipt only on its payload owner, then fault that
+        // device. The other readable copies deliberately expose the stale
+        // receipt that would roll the payload back if health filtered the
+        // removal authority scan.
+        let receipt_key = placement_receipt_object_key(key);
+        let stale_encoded = stale_receipt.encode().unwrap();
+        for idx in 0..pool.devices.len() {
+            if idx != current_owner_idx {
+                pool.devices[idx]
+                    .put(receipt_key, &stale_encoded)
+                    .expect("restore stale receipt copy");
+            }
+        }
+        for _ in 0..3 {
+            pool.devices[current_owner_idx].record_checksum_error();
+        }
+        assert_eq!(
+            pool.devices[current_owner_idx].status().state,
+            DeviceState::Faulted
+        );
+        assert_eq!(
+            pool.devices[target_idx].get(key).unwrap(),
+            Some(stale_payload.to_vec())
+        );
+        assert_eq!(
+            pool.devices[current_owner_idx].get(key).unwrap(),
+            Some(current_payload.to_vec())
+        );
+
+        let removal = pool.safe_remove_device(&target_path).unwrap();
+        assert!(removal.complete, "{removal:?}");
+        assert_eq!(removal.objects_evacuated, 1);
+        assert_eq!(removal.objects_failed, 0);
+        assert_eq!(
+            pool.get(IoClass::Data, key).unwrap(),
+            Some(current_payload.to_vec()),
+            "removal must not supersede newer faulted-device authority with stale payload"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
