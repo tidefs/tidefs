@@ -27,6 +27,8 @@ generic/444
 #   generic/694 verifies that stat(2) i_blocks stays stable for a file larger
 #   than 4 GiB after _test_cycle_mount. Keep excluded until large-file block
 #   accounting and remount persistence are validated end-to-end on TideFS FUSE.
+#   Focused mounted validation and any required accounting fix are tracked by
+#   #2229; this exclusion stays until that row passes.
 generic/694
 
 # --- Linux fscrypt policy/key ioctls (unsupported/refused) ---
