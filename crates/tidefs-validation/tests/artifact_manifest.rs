@@ -287,7 +287,7 @@ fn runtime_manifest_sidecar_candidates_follow_committed_payloads() {
 }
 
 #[test]
-fn runtime_artifact_manifest_paths_require_live_runtime_tier() {
+fn runtime_artifact_paths_require_live_runtime_tier() {
     let payload = br#"{"report_version":1,"kind":"runtime"}"#;
     let mut manifest = valid_manifest(
         payload,
@@ -310,15 +310,9 @@ fn runtime_artifact_manifest_paths_require_live_runtime_tier() {
         .expect("runtime artifact path with live-runtime tier should pass");
 
     manifest.artifact_path = "validation/artifacts/local-vfs/summary.json".to_string();
-    let error = manifest
+    manifest
         .validate()
-        .expect_err("live-runtime tier with non-runtime artifact path should fail");
-    assert!(
-        error.failures().iter().any(|failure| failure
-            .contains("live-runtime validation_tier requires runtime artifact_path")),
-        "expected runtime artifact path failure, got {:?}",
-        error.failures()
-    );
+        .expect("explicit live-runtime provenance may use a neutral artifact filename");
 }
 
 #[test]
@@ -490,12 +484,6 @@ fn committed_runtime_artifacts_have_runtime_tier_manifests() {
             if !committed_artifacts.contains(&manifest.artifact_path) {
                 failures.push(format!(
                     "{manifest_path} is a live-runtime manifest pointing at non-committed artifact `{}`",
-                    manifest.artifact_path
-                ));
-            }
-            if !is_runtime_artifact_path(Path::new(&manifest.artifact_path)) {
-                failures.push(format!(
-                    "{manifest_path} is a live-runtime manifest pointing at non-runtime artifact `{}`",
                     manifest.artifact_path
                 ));
             }

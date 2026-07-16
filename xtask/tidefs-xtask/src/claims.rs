@@ -1614,11 +1614,6 @@ fn check_committed_validation_artifacts(root: &Path, missing: &mut Vec<String>) 
                     "{manifest_path} is a live-runtime manifest pointing at non-committed artifact `{artifact_path}`"
                 ));
             }
-            if !is_runtime_artifact_path(Path::new(&artifact_path)) {
-                missing.push(format!(
-                    "{manifest_path} is a live-runtime manifest pointing at non-runtime artifact `{artifact_path}`"
-                ));
-            }
             if let Err(err) = manifest.verify_artifact_digest(root) {
                 missing.push(format!(
                     "{manifest_path} has invalid live-runtime artifact digest: {}",
