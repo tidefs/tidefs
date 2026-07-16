@@ -23,7 +23,12 @@ generic/318
 generic/319
 generic/444
 
-# --- Capabilities ---
+# --- Large-file block accounting across remount ---
+#   generic/694 verifies that stat(2) i_blocks stays stable for a file larger
+#   than 4 GiB after _test_cycle_mount. Keep excluded until large-file block
+#   accounting and remount persistence are validated end-to-end on TideFS FUSE.
+#   Focused mounted validation and any required accounting fix are tracked by
+#   #2229; this exclusion stays until that row passes.
 generic/694
 
 # --- Linux fscrypt policy/key ioctls (unsupported/refused) ---
@@ -109,9 +114,27 @@ generic/383
 #   it is verified end-to-end.
 generic/245
 
-# --- Swap ---
+# --- Swapfile activation / kernel file mapping ---
+#   generic/472 exercises swapon oddities. TideFS FUSE does not currently
+#   provide a FUSE_BMAP mapping path for kernel swapfile activation; the
+#   FuseVfsAdapter::bmap path returns EOPNOTSUPP through
+#   unsupported_vfs_bmap_errno().
 generic/472
+
+# --- Active swapfile dedupe/reflink refusal ---
+#   generic/493 expects dedupe against an active swapfile to fail with
+#   ETXTBSY. Its xfstests prerequisite first requires working swapfile
+#   activation, and classify_vfs_ioctl_command() also refuses FIDEDUPERANGE
+#   with EOPNOTSUPP. Keep excluded until activation, mounted dedupe, and the
+#   active-swapfile refusal are validated together.
 generic/493
+
+# --- Active swapfile truncate / hole-punch refusal ---
+#   generic/494 expects truncate and hole-punch against an active swapfile to
+#   fail with ETXTBSY. Its xfstests prerequisite first requires working
+#   swapfile activation, which cannot pass while FuseVfsAdapter::bmap returns
+#   EOPNOTSUPP. Keep excluded until activation and both refusal paths are
+#   validated together.
 generic/494
 
 # --- Freeze/thaw (FIFREEZE/FITHAW unsupported/refused on FUSE) ---
