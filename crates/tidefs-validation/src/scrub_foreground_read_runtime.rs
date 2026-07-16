@@ -237,7 +237,6 @@ pub fn run_scrub_foreground_read_runtime(command: String) -> ScrubForegroundRead
     let source_ref = source_ref();
     let run_id = workflow_run_id();
     let service_curve = build_service_curve();
-    let scrub_model = build_scrub_activity(&service_curve);
     let dev_fuse_present = Path::new("/dev/fuse").exists();
     let daemon_bin_result = find_daemon_binary();
     let daemon_bin = daemon_bin_result
@@ -264,7 +263,7 @@ pub fn run_scrub_foreground_read_runtime(command: String) -> ScrubForegroundRead
             foreground_read: ForegroundReadEvidence::not_run(
                 service_curve.max_foreground_read_wait_ticks,
             ),
-            scrub_activity: scrub_model,
+            scrub_activity: scrub_activity_not_run(&service_curve),
             service_curve,
         });
     }
@@ -284,7 +283,7 @@ pub fn run_scrub_foreground_read_runtime(command: String) -> ScrubForegroundRead
                 foreground_read: ForegroundReadEvidence::not_run(
                     service_curve.max_foreground_read_wait_ticks,
                 ),
-                scrub_activity: scrub_model,
+                scrub_activity: scrub_activity_not_run(&service_curve),
                 service_curve,
             });
         }
@@ -309,7 +308,7 @@ pub fn run_scrub_foreground_read_runtime(command: String) -> ScrubForegroundRead
                 foreground_read: ForegroundReadEvidence::not_run(
                     service_curve.max_foreground_read_wait_ticks,
                 ),
-                scrub_activity: scrub_model,
+                scrub_activity: scrub_activity_not_run(&service_curve),
                 service_curve,
             });
         }
@@ -331,7 +330,7 @@ pub fn run_scrub_foreground_read_runtime(command: String) -> ScrubForegroundRead
                     service_curve.max_foreground_read_wait_ticks,
                     error,
                 ),
-                scrub_activity: scrub_model,
+                scrub_activity: scrub_activity_not_run(&service_curve),
                 service_curve,
             });
         }
@@ -344,7 +343,9 @@ pub fn run_scrub_foreground_read_runtime(command: String) -> ScrubForegroundRead
         background_scrub_interval_secs: BACKGROUND_SCRUB_INTERVAL_SECS,
         statfs_type_hex: format!("0x{mount_f_type:x}"),
     };
+    let scrub_activity = ScrubActivityWindow::begin();
     let foreground_read = run_foreground_read(&harness, &service_curve);
+    let scrub_model = scrub_activity.finish(&service_curve, foreground_read.workload_ran);
     let outcome = if scrub_read_isolation_passed(&foreground_read, &scrub_model, &service_curve) {
         ValidationStatus::Pass
     } else {
@@ -541,43 +542,96 @@ fn build_admission_state(
     }
 }
 
-fn build_scrub_activity(service_curve: &ServiceCurveEvidence) -> ScrubActivityEvidence {
-    let scrub_admitted = service_curve.scheduled_scrub_admitted;
-    let scrub_deferred = service_curve.scheduled_scrub_deferred;
-    let mut limiter = DeterministicScrubLimiter::new(SCRUB_LIMIT_BYTES_PER_SEC, SCRUB_LIMIT_IOPS);
-    let first = rate_limit_attempt(&mut limiter, "pre-read-scrub-dispatch");
-    let pending_before_read = if first.accepted {
-        SCRUB_UNITS_REQUESTED.saturating_sub(1)
-    } else {
-        SCRUB_UNITS_REQUESTED
-    };
-    let second = rate_limit_attempt(&mut limiter, "post-read-scrub-retry");
-    let pending_after_read = if second.accepted {
-        pending_before_read.saturating_sub(1)
-    } else {
-        pending_before_read
-    };
-    let throttle_count = limiter.throttled_count();
-    let throttle_observed = throttle_count > 0 || !first.accepted || !second.accepted;
+fn scrub_activity_not_run(service_curve: &ServiceCurveEvidence) -> ScrubActivityEvidence {
     ScrubActivityEvidence {
-        background_scrub_configured: true,
+        background_scrub_configured: false,
         background_scrub_interval_secs: BACKGROUND_SCRUB_INTERVAL_SECS,
         scrub_units_requested: SCRUB_UNITS_REQUESTED,
         scrub_unit_bytes: SCRUB_UNIT_BYTES,
-        pending_units_before_read: pending_before_read,
-        pending_units_after_read: pending_after_read,
+        pending_units_before_read: 0,
+        pending_units_after_read: 0,
         max_scrub_queue_depth: service_curve.scheduled_max_scrub_queue_depth,
-        scrub_admitted_by_service_curve: scrub_admitted,
-        scrub_deferred_by_service_curve: scrub_deferred,
-        rate_limiter_active: limiter.is_active(),
+        scrub_admitted_by_service_curve: service_curve.scheduled_scrub_admitted,
+        scrub_deferred_by_service_curve: service_curve.scheduled_scrub_deferred,
+        rate_limiter_active: false,
         rate_limiter_bytes_per_sec: SCRUB_LIMIT_BYTES_PER_SEC,
         rate_limiter_iops: SCRUB_LIMIT_IOPS,
-        rate_limit_attempts: vec![first, second],
-        throttle_count,
-        throttle_observed,
+        rate_limit_attempts: Vec::new(),
+        throttle_count: 0,
+        throttle_observed: false,
         backoff_millis: SCRUB_BACKOFF_MILLIS,
-        pending_and_rate_limited_during_read: pending_after_read > 0 && throttle_observed,
+        pending_and_rate_limited_during_read: false,
     }
+}
+
+#[derive(Debug)]
+struct ScrubActivityWindow {
+    limiter: DeterministicScrubLimiter,
+    pre_read_attempt: RateLimitAttemptEvidence,
+    pending_before_read: u32,
+}
+
+impl ScrubActivityWindow {
+    fn begin() -> Self {
+        let mut limiter =
+            DeterministicScrubLimiter::new(SCRUB_LIMIT_BYTES_PER_SEC, SCRUB_LIMIT_IOPS);
+        let pre_read_attempt = rate_limit_attempt(&mut limiter, "pre-read-scrub-dispatch");
+        let pending_before_read = if pre_read_attempt.accepted {
+            SCRUB_UNITS_REQUESTED.saturating_sub(1)
+        } else {
+            SCRUB_UNITS_REQUESTED
+        };
+        Self {
+            limiter,
+            pre_read_attempt,
+            pending_before_read,
+        }
+    }
+
+    fn finish(
+        mut self,
+        service_curve: &ServiceCurveEvidence,
+        foreground_read_ran: bool,
+    ) -> ScrubActivityEvidence {
+        let post_read_attempt = rate_limit_attempt(&mut self.limiter, "post-read-scrub-retry");
+        let pending_after_read = if post_read_attempt.accepted {
+            self.pending_before_read.saturating_sub(1)
+        } else {
+            self.pending_before_read
+        };
+        let throttle_count = self.limiter.throttled_count();
+        let throttle_observed =
+            throttle_count > 0 || !self.pre_read_attempt.accepted || !post_read_attempt.accepted;
+        ScrubActivityEvidence {
+            background_scrub_configured: true,
+            background_scrub_interval_secs: BACKGROUND_SCRUB_INTERVAL_SECS,
+            scrub_units_requested: SCRUB_UNITS_REQUESTED,
+            scrub_unit_bytes: SCRUB_UNIT_BYTES,
+            pending_units_before_read: self.pending_before_read,
+            pending_units_after_read: pending_after_read,
+            max_scrub_queue_depth: service_curve.scheduled_max_scrub_queue_depth,
+            scrub_admitted_by_service_curve: service_curve.scheduled_scrub_admitted,
+            scrub_deferred_by_service_curve: service_curve.scheduled_scrub_deferred,
+            rate_limiter_active: self.limiter.is_active(),
+            rate_limiter_bytes_per_sec: SCRUB_LIMIT_BYTES_PER_SEC,
+            rate_limiter_iops: SCRUB_LIMIT_IOPS,
+            rate_limit_attempts: vec![self.pre_read_attempt, post_read_attempt],
+            throttle_count,
+            throttle_observed,
+            backoff_millis: SCRUB_BACKOFF_MILLIS,
+            pending_and_rate_limited_during_read: foreground_read_ran
+                && self.pending_before_read > 0
+                && pending_after_read > 0
+                && throttle_observed,
+        }
+    }
+}
+
+#[cfg(test)]
+fn scrub_activity_for_completed_read(
+    service_curve: &ServiceCurveEvidence,
+) -> ScrubActivityEvidence {
+    ScrubActivityWindow::begin().finish(service_curve, true)
 }
 
 #[derive(Debug)]
@@ -971,12 +1025,13 @@ mod tests {
                 service_curve.max_foreground_read_wait_ticks,
                 "foreground read did not run",
             ),
-            scrub_activity: build_scrub_activity(&service_curve),
+            scrub_activity: ScrubActivityWindow::begin().finish(&service_curve, false),
             service_curve,
         });
 
         assert_eq!(evidence.outcome, ValidationStatus::Pass);
         assert!(!evidence.passed);
+        assert!(!evidence.scrub_activity.pending_and_rate_limited_during_read);
 
         let manifest = build_evidence_manifest(&evidence, b"scrub evidence");
         assert_eq!(manifest.blocking_issues.len(), 1);
@@ -1016,7 +1071,7 @@ mod tests {
                 service_curve.max_foreground_read_wait_ticks,
                 mount_error,
             ),
-            scrub_activity: build_scrub_activity(&service_curve),
+            scrub_activity: scrub_activity_not_run(&service_curve),
             service_curve,
         });
 
@@ -1028,6 +1083,9 @@ mod tests {
             .expect("refusal reason")
             .contains("FUSE mount unavailable"));
         assert!(evidence.admission_state.environment_refused);
+        assert!(!evidence.scrub_activity.background_scrub_configured);
+        assert!(!evidence.scrub_activity.throttle_observed);
+        assert!(!evidence.scrub_activity.pending_and_rate_limited_during_read);
         assert_eq!(
             evidence.admission_state.environment_refusal.as_deref(),
             evidence.environment.environment_refusal.as_deref()
@@ -1178,7 +1236,7 @@ mod tests {
             SCRUB_UNITS_REQUESTED
         );
 
-        let scrub_activity = build_scrub_activity(&service_curve);
+        let scrub_activity = scrub_activity_for_completed_read(&service_curve);
         let environment = RuntimeEnvironmentEvidence {
             host: "linux x86_64 kernel=test".to_string(),
             dev_fuse_present: true,
