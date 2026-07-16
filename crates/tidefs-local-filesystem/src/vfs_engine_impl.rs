@@ -4061,11 +4061,12 @@ fn live_snapshot_send_plan(
         .map_err(|err| format!("snapshot send: invalid pool-id: {err}"))?;
     let dataset_id = live_admin_hex_16_or_default(args, "dataset_id")
         .map_err(|err| format!("snapshot send: invalid dataset-id: {err}"))?;
-    let mode = if args
-        .get("incremental")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
+    let incremental = match args.get("incremental") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(incremental)) => *incremental,
+        Some(_) => return Err("snapshot send: incremental must be a boolean".to_string()),
+    };
+    let mode = if incremental {
         LiveSnapshotSendMode::Incremental {
             from_root: live_snapshot_send_from_root_arg(args, fs)?,
         }
@@ -8074,6 +8075,43 @@ mod tests {
             "malformed response should stay structured for non-ASCII hex: {malformed}"
         );
         assert!(!output.exists());
+    }
+
+    #[test]
+    fn live_snapshot_send_rejects_malformed_incremental_without_full_fallback() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = root.path().join("store");
+        let mut fs = LocalFileSystem::open(&store).expect("open fs");
+        fs.create_file("/live.txt", 0o644).expect("create file");
+        fs.write_file("/live.txt", 0, b"live owner snapshot send")
+            .expect("write file");
+        let engine = VfsLocalFileSystem::new(fs);
+
+        for (name, incremental) in [("string", json!("true")), ("number", json!(1))] {
+            let output = root
+                .path()
+                .join(format!("malformed-incremental-{name}.vfs"));
+            let refused = live_snapshot_admin(
+                &engine,
+                "send",
+                json!({
+                    "output": output.display().to_string(),
+                    "format": "vfssend1",
+                    "incremental": incremental,
+                }),
+                true,
+            );
+
+            assert_eq!(refused["ok"], false, "send response: {refused}");
+            assert_eq!(refused["exit_code"], 1);
+            assert!(refused["json"].is_null());
+            assert!(refused["text"].is_null());
+            assert_eq!(
+                refused["error"],
+                "snapshot send: incremental must be a boolean"
+            );
+            assert!(!output.exists());
+        }
     }
 
     #[test]
