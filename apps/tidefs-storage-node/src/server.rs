@@ -785,6 +785,118 @@ fn snapshot_barrier_send_label(barrier_id: u64, key: &[u8]) -> String {
     format!("vfssend2-{class}-send-{barrier_id}")
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SnapshotBarrierStoreSnapshot {
+    committed_root_txg: u64,
+    committed_root_generation: u64,
+    object_count: u64,
+}
+
+fn sync_snapshot_barrier_store(
+    store: &mut StoreBackend,
+) -> Result<SnapshotBarrierStoreSnapshot, String> {
+    match store {
+        StoreBackend::Local(rs) => {
+            rs.sync_all()?;
+            Ok(SnapshotBarrierStoreSnapshot {
+                committed_root_txg: rs.committed_root_txg(),
+                committed_root_generation: rs.committed_root_generation(),
+                object_count: rs.stats().object_count,
+            })
+        }
+        StoreBackend::TransportBacked(ts) => {
+            ts.sync_all()?;
+            Ok(SnapshotBarrierStoreSnapshot {
+                committed_root_txg: ts.committed_root_txg(),
+                committed_root_generation: ts.committed_root_generation(),
+                object_count: ts.stats().object_count,
+            })
+        }
+        StoreBackend::PoolBacked(pool) => {
+            pool.sync_all().map_err(|err| err.to_string())?;
+            Ok(SnapshotBarrierStoreSnapshot {
+                committed_root_txg: 0,
+                committed_root_generation: 0,
+                object_count: pool.pool_stats().object_count,
+            })
+        }
+    }
+}
+
+fn snapshot_barrier_send_report_with_coordinator_state(
+    barrier_id: u64,
+    coordinator_state: SnapshotBarrierStoreSnapshot,
+    outcome: BarrierOutcome,
+) -> Result<SnapshotBarrierSendReport, SnapshotBarrierSendError> {
+    match outcome {
+        BarrierOutcome::Consistent {
+            min_txg,
+            max_txg,
+            total_objects,
+            responses,
+        } => {
+            let peer_count = responses.len();
+            let (min_txg, max_txg, min_generation, max_generation) = if responses.is_empty() {
+                (
+                    coordinator_state.committed_root_txg,
+                    coordinator_state.committed_root_txg,
+                    coordinator_state.committed_root_generation,
+                    coordinator_state.committed_root_generation,
+                )
+            } else {
+                let min_generation = responses
+                    .values()
+                    .map(|response| response.committed_root_generation)
+                    .min()
+                    .expect("non-empty barrier responses have a minimum generation");
+                let max_generation = responses
+                    .values()
+                    .map(|response| response.committed_root_generation)
+                    .max()
+                    .expect("non-empty barrier responses have a maximum generation");
+                (
+                    min_txg.min(coordinator_state.committed_root_txg),
+                    max_txg.max(coordinator_state.committed_root_txg),
+                    min_generation.min(coordinator_state.committed_root_generation),
+                    max_generation.max(coordinator_state.committed_root_generation),
+                )
+            };
+
+            if min_txg != max_txg || min_generation != max_generation {
+                return Err(SnapshotBarrierSendError::Inconsistent {
+                    barrier_id,
+                    min_txg,
+                    max_txg,
+                    min_generation,
+                    max_generation,
+                });
+            }
+
+            Ok(SnapshotBarrierSendReport {
+                barrier_id,
+                peer_count,
+                min_txg,
+                max_txg,
+                total_objects: total_objects.saturating_add(coordinator_state.object_count),
+            })
+        }
+        BarrierOutcome::Inconsistent {
+            min_txg,
+            max_txg,
+            min_generation,
+            max_generation,
+            ..
+        } => Err(SnapshotBarrierSendError::Inconsistent {
+            barrier_id,
+            min_txg: min_txg.min(coordinator_state.committed_root_txg),
+            max_txg: max_txg.max(coordinator_state.committed_root_txg),
+            min_generation: min_generation.min(coordinator_state.committed_root_generation),
+            max_generation: max_generation.max(coordinator_state.committed_root_generation),
+        }),
+        outcome => snapshot_barrier_send_report(barrier_id, outcome),
+    }
+}
+
 fn active_snapshot_barrier_peer_ids(ctx: &SessionContext) -> BTreeSet<u64> {
     let membership = ctx.membership.lock().unwrap();
     let local_id = membership.my_id;
@@ -874,6 +986,21 @@ fn run_snapshot_barrier_before_send_with_config(
         });
     }
 
+    {
+        let active = ctx.active_barrier.lock().unwrap();
+        if let Some(active) = active.as_ref() {
+            return Err(SnapshotBarrierSendError::AlreadyActive {
+                barrier_id: active.barrier_id(),
+            });
+        }
+    }
+
+    let coordinator_state = {
+        let mut store = ctx.store.lock().unwrap();
+        sync_snapshot_barrier_store(&mut store)
+            .map_err(|reason| SnapshotBarrierSendError::LocalSyncFailed { barrier_id, reason })?
+    };
+
     let peer_ids = expected_peer_ids.into_iter().collect::<Vec<_>>();
     let coordinator = SnapshotCoordinator::new(barrier_id, snapshot_name, peer_ids, config);
 
@@ -886,8 +1013,9 @@ fn run_snapshot_barrier_before_send_with_config(
             });
         }
         if peer_sessions.is_empty() {
-            return snapshot_barrier_send_report(
+            return snapshot_barrier_send_report_with_coordinator_state(
                 barrier_id,
+                coordinator_state,
                 coordinator
                     .outcome()
                     .expect("empty snapshot barrier completes immediately"),
@@ -916,7 +1044,11 @@ fn run_snapshot_barrier_before_send_with_config(
         let outcome = active_snapshot_barrier_outcome(ctx, barrier_id)?;
         if let Some(outcome) = outcome {
             clear_active_snapshot_barrier(ctx);
-            return snapshot_barrier_send_report(barrier_id, outcome);
+            return snapshot_barrier_send_report_with_coordinator_state(
+                barrier_id,
+                coordinator_state,
+                outcome,
+            );
         }
         std::thread::sleep(Duration::from_millis(1));
     }
@@ -5837,43 +5969,19 @@ fn handle_frame_ctx(
         } => {
             let _snap_name = snapshot_name.clone();
             let mut s = store.lock().unwrap();
-            let barrier_result = match &mut *s {
-                StoreBackend::Local(rs) => match rs.sync_all() {
-                    Ok(()) => {
-                        let txg = rs.committed_root_txg();
-                        let gen = rs.committed_root_generation();
-                        let count = rs.stats().object_count;
-                        Ok((txg, gen, count))
-                    }
-                    Err(message) => Err(format!("snapshot barrier sync failed: {message}")),
-                },
-                StoreBackend::TransportBacked(ts) => match ts.sync_all() {
-                    Ok(()) => {
-                        let txg = ts.committed_root_txg();
-                        let gen = ts.committed_root_generation();
-                        let count = ts.stats().object_count;
-                        Ok((txg, gen, count))
-                    }
-                    Err(message) => Err(format!("snapshot barrier sync failed: {message}")),
-                },
-                StoreBackend::PoolBacked(pool) => match pool.sync_all() {
-                    Ok(()) => {
-                        let count = pool.pool_stats().object_count;
-                        Ok((0, 0, count))
-                    }
-                    Err(err) => Err(format!("snapshot barrier sync failed: {err}")),
-                },
-            };
-            let (committed_root_txg, committed_root_generation, object_count) = match barrier_result
-            {
-                Ok(barrier_result) => barrier_result,
-                Err(message) => return Some(Frame::Error { message }),
+            let store_snapshot = match sync_snapshot_barrier_store(&mut s) {
+                Ok(store_snapshot) => store_snapshot,
+                Err(reason) => {
+                    return Some(Frame::Error {
+                        message: format!("snapshot barrier sync failed: {reason}"),
+                    })
+                }
             };
             Some(Frame::SnapshotBarrierResponse {
                 barrier_id: *barrier_id,
-                committed_root_txg,
-                committed_root_generation,
-                object_count,
+                committed_root_txg: store_snapshot.committed_root_txg,
+                committed_root_generation: store_snapshot.committed_root_generation,
+                object_count: store_snapshot.object_count,
             })
         }
         // ── Multi-node scrub fanout ──
@@ -6665,8 +6773,17 @@ mod cluster_pool_handler_tests {
     }
 
     #[test]
-    fn snapshot_barrier_before_send_ignores_unrostered_client_for_zero_peer_gate() {
+    fn snapshot_barrier_before_send_includes_coordinator_for_zero_peer_gate() {
         let (_dir, store) = frame_local_store();
+        {
+            let mut backend = store.lock().unwrap();
+            match &mut *backend {
+                StoreBackend::Local(rs) => rs
+                    .put_local("coordinator-state", b"barrier payload")
+                    .expect("write coordinator state"),
+                _ => panic!("expected local store backend"),
+            }
+        }
         let ctx = frame_test_context(Arc::clone(&store));
         let client_session_id = tidefs_transport::SessionId::new(2);
         let client_session = tidefs_transport::session::Session::new(
@@ -6688,9 +6805,49 @@ mod cluster_pool_handler_tests {
                 .expect("zero-peer barrier completes");
 
         assert_eq!(report.peer_count, 0);
-        assert_eq!(report.min_txg, 0);
-        assert_eq!(report.max_txg, 0);
+        assert_eq!(report.min_txg, report.max_txg);
+        assert!(report.min_txg > 0);
         assert!(ctx.active_barrier.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn snapshot_barrier_before_send_rejects_coordinator_root_mismatch() {
+        let peer_response = crate::snapshot_barrier::BarrierResponse {
+            peer_id: 2,
+            barrier_id: 7,
+            committed_root_txg: 41,
+            committed_root_generation: 5,
+            object_count: 12,
+            received_at: Instant::now(),
+        };
+        let coordinator_state = SnapshotBarrierStoreSnapshot {
+            committed_root_txg: 42,
+            committed_root_generation: 6,
+            object_count: 10,
+        };
+
+        let err = snapshot_barrier_send_report_with_coordinator_state(
+            7,
+            coordinator_state,
+            BarrierOutcome::Consistent {
+                min_txg: 41,
+                max_txg: 41,
+                total_objects: 12,
+                responses: BTreeMap::from([(2, peer_response)]),
+            },
+        )
+        .expect_err("coordinator root must participate in consistency check");
+
+        assert_eq!(
+            err,
+            SnapshotBarrierSendError::Inconsistent {
+                barrier_id: 7,
+                min_txg: 41,
+                max_txg: 42,
+                min_generation: 5,
+                max_generation: 6,
+            }
+        );
     }
 
     #[test]

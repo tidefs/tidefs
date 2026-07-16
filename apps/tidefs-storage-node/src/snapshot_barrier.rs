@@ -201,9 +201,11 @@ pub enum BarrierOutcome {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SnapshotBarrierSendReport {
     pub barrier_id: BarrierId,
+    /// Remote peers that participated; this count excludes the coordinator.
     pub peer_count: usize,
     pub min_txg: u64,
     pub max_txg: u64,
+    /// Objects reported across the coordinator and all remote peers.
     pub total_objects: u64,
 }
 
@@ -212,6 +214,10 @@ pub struct SnapshotBarrierSendReport {
 pub enum SnapshotBarrierSendError {
     AlreadyActive {
         barrier_id: BarrierId,
+    },
+    LocalSyncFailed {
+        barrier_id: BarrierId,
+        reason: String,
     },
     PeerLimitExceeded {
         barrier_id: BarrierId,
@@ -256,6 +262,9 @@ impl fmt::Display for SnapshotBarrierSendError {
                 f,
                 "barrier {barrier_id} refused because another barrier is already active"
             ),
+            Self::LocalSyncFailed { barrier_id, reason } => {
+                write!(f, "barrier {barrier_id} local store sync failed: {reason}")
+            }
             Self::PeerLimitExceeded {
                 barrier_id,
                 peer_count,
