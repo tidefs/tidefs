@@ -3250,6 +3250,19 @@ impl Pool {
                 reason: "device removal topology GUID table is incomplete or ambiguous",
             });
         }
+        // Planner replay records project each GUID to its first 64 bits.
+        // Full-GUID uniqueness alone does not make that locator one-to-one.
+        let mut unique_replay_device_ids = BTreeSet::new();
+        if !self
+            .device_guids
+            .iter()
+            .map(|guid| u64::from_le_bytes(guid[..8].try_into().unwrap()))
+            .all(|device_id| unique_replay_device_ids.insert(device_id))
+        {
+            return Err(StoreError::InvalidOptions {
+                reason: "device removal placement replay IDs are ambiguous",
+            });
+        }
 
         // Refuse to remove the last device.
         if self.devices.len() <= 1 {
@@ -7247,6 +7260,31 @@ mod tests {
             result,
             Err(StoreError::InvalidOptions {
                 reason: "device removal topology GUID table is incomplete or ambiguous"
+            })
+        ));
+        assert_eq!(pool.stats().device_count, 3);
+        assert!(!root.join(DEVICE_REMOVAL_MARKER_FILE).exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn safe_remove_device_refuses_ambiguous_replay_device_id() {
+        let root = temp_dir("safe-remove-ambiguous-replay-device-id");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = multi_data_device_config(&root, 3);
+        let mut pool = Pool::create(config, PoolProperties::default(), &test_options()).unwrap();
+        let target_path = pool.devices[0].root().to_path_buf();
+        pool.device_guids[2] = pool.device_guids[1];
+        pool.device_guids[2][15] ^= 1;
+        assert_ne!(pool.device_guids[2], pool.device_guids[1]);
+
+        let result = pool.safe_remove_device(&target_path);
+
+        assert!(matches!(
+            result,
+            Err(StoreError::InvalidOptions {
+                reason: "device removal placement replay IDs are ambiguous"
             })
         ));
         assert_eq!(pool.stats().device_count, 3);
