@@ -7323,6 +7323,7 @@ static int tidefs_posix_vfs_fill_super_bdev(struct super_block *sb,
 	set_default_d_op(sb, &tidefs_posix_vfs_dentry_ops);
 	sb->s_export_op = &tidefs_posix_vfs_export_ops;
 	sb->s_xattr = tidefs_posix_vfs_xattr_handlers;
+	sb->s_flags |= SB_POSIXACL;
 	sb->s_time_gran = 1;
 
 	ret = tidefs_posix_vfs_activate_engine(ctx);
