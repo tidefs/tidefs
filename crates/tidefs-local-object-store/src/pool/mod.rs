@@ -2779,6 +2779,11 @@ impl Pool {
             shard_len,
         };
         let width = config.stripe_width();
+        if receipt.targets.len() != width {
+            return Err(StoreError::InvalidOptions {
+                reason: "invalid erasure placement receipt availability set",
+            });
+        }
         let mut available = vec![None; width];
         let mut seen_indices = vec![false; width];
 
@@ -6398,7 +6403,7 @@ mod tests {
     }
 
     #[test]
-    fn erasure_policy_rejects_out_of_range_receipt_shard() {
+    fn erasure_policy_rejects_malformed_receipt_target_set() {
         let root = temp_dir("erasure-receipt-out-of-range");
         let _ = std::fs::remove_dir_all(&root);
         let config = multi_data_device_config(&root, 4);
@@ -6418,6 +6423,17 @@ mod tests {
             .unwrap()
             .expect("erasure receipt must persist");
         receipt.planner_replay_receipt = None;
+
+        let mut under_width = receipt.clone();
+        assert!(under_width.targets.pop().is_some());
+        let err = pool.get_erasure_with_receipt(&under_width).unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::InvalidOptions {
+                reason: "invalid erasure placement receipt availability set"
+            }
+        ));
+
         receipt.targets[0].shard_index = receipt.targets.len() as u16;
         let err = pool.get_erasure_with_receipt(&receipt).unwrap_err();
         assert!(matches!(
