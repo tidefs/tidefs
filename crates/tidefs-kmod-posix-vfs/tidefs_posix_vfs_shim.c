@@ -2211,6 +2211,16 @@ static struct dentry *tidefs_posix_vfs_lookup(struct inode *dir,
 	return d_splice_alias(inode, dentry);
 }
 
+/*
+ * SB_POSIXACL defers umask handling to filesystem ACL creation. TideFS
+ * refuses default ACL creation while inheritance is unsupported, so new
+ * inodes use the ordinary umask path.
+ */
+static umode_t tidefs_posix_vfs_apply_create_umask(umode_t mode)
+{
+	return mode & ~current_umask();
+}
+
 static int tidefs_posix_vfs_create(struct mnt_idmap *idmap,
 				   struct inode *dir, struct dentry *dentry,
 				   umode_t mode, bool excl)
@@ -2218,6 +2228,8 @@ static int tidefs_posix_vfs_create(struct mnt_idmap *idmap,
 	struct tidefs_posix_vfs_kernel_pool_core *pool;
 	struct inode *inode;
 	u64 ino;
+
+	mode = tidefs_posix_vfs_apply_create_umask(mode);
 
 	/* Refuse write operations on read-only mounts. */
 	{
@@ -2342,6 +2354,8 @@ static int tidefs_posix_vfs_tmpfile(struct mnt_idmap *idmap,
 	u64 out_generation = 0;
 	int ret, pool_idx;
 
+	mode = tidefs_posix_vfs_apply_create_umask(mode);
+
 	pool = tidefs_posix_vfs_pool_core_from_sb(dir->i_sb);
 	if (IS_ERR(pool))
 		return PTR_ERR(pool);
@@ -2391,6 +2405,8 @@ static struct dentry *tidefs_posix_vfs_mkdir(struct mnt_idmap *idmap,
 	struct tidefs_posix_vfs_kernel_pool_core *pool;
 	struct inode *inode;
 	u64 ino;
+
+	mode = tidefs_posix_vfs_apply_create_umask(mode);
 
 	/* Refuse write operations on read-only mounts. */
 	{
@@ -2843,6 +2859,8 @@ static int tidefs_posix_vfs_mknod(struct mnt_idmap *idmap,
 	unsigned int out_mode = 0;
 	unsigned long long out_generation = 0;
 	int ret;
+
+	mode = tidefs_posix_vfs_apply_create_umask(mode);
 
 	/* Refuse write operations on read-only mounts. */
 	{
