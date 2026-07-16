@@ -1,11 +1,12 @@
 # TideFS: pool remount-lifecycle validation (#6136).
 #
 # Boots a Linux 7.0 qemu guest with two raw virtio-blk disks and exercises
-# the full remount lifecycle with committed-root advancement and intent-log
-# replay consistency verification:
-#   pool create -> import -> FUSE mount -> write/fsync/read ->
-#   unmount -> pool export -> reimport -> remount -> persist verify ->
-#   committed-root advance verify -> intent-log consistency verify.
+# the pool remount lifecycle with owner-authority, mounted I/O, and crash
+# recovery observations:
+#   pool create -> ownerless import refusal -> owner-mediated FUSE mount ->
+#   write/fsync/read -> unmount -> pool export -> ownerless reimport refusal ->
+#   owner-mediated remount -> persist verify -> live/ownerless status checks ->
+#   crash recovery.
 #
 # Validation tier: qemu guest.
 {
@@ -37,9 +38,10 @@ let
 Usage: tidefs-pool-remount-lifecycle-validation [--timeout SECONDS] [--disk-size-mb MB] [--keep-tmp]
 
 Full remount lifecycle on two virtio-blk disks in a Linux 7.0 qemu guest:
-  pool create -> import -> FUSE mount -> write/fsync/read ->
-  unmount -> pool export -> reimport -> remount -> persist verify ->
-  committed-root advance verify -> intent-log consistency verify.
+  pool create -> ownerless import refusal -> owner-mediated FUSE mount ->
+  write/fsync/read -> unmount -> pool export -> ownerless reimport refusal ->
+  owner-mediated remount -> persist verify -> live/ownerless status checks ->
+  crash recovery.
 
 Options:
   --timeout SECONDS  QEMU boot timeout (default: $TIMEOUT_SEC)
@@ -151,6 +153,7 @@ USAGE
     cat > "$RUN_DIR/init" << 'INITSCRIPT'
 #!/bin/sh
 export PATH=/bin
+export TIDEFS_ROOT_AUTHENTICATION_KEY_HEX=0000000000000000000000000000000000000000000000000000000000000001
 
 mount -t proc proc /proc
 mount -t sysfs sysfs /sys
@@ -202,13 +205,19 @@ done
 [ -b "$DEV1" ] && pass "virtio1_present" || fail "virtio1_present" "$DEV1 missing"
 
 if [ ! -b "$DEV0" ] || [ ! -b "$DEV1" ]; then
-    for op in virtio0_size virtio1_size pool_create pool_import mount \
-             write_data fsync_data read_verify unmount pool_export reimport remount \
-             persist_verify committed_root_advance intent_log_consistency \
-             crash_cycle_export_prep crash_cycle_preimport crash_cycle_premount \
+    for op in virtio0_size virtio1_size pool_create ownerless_import_refused \
+             owner_mediated_import mount write_data fsync_data read_verify \
+             unmount pool_export ownerless_reimport_refused \
+             owner_mediated_reimport remount \
+             persist_verify live_owner_status_visible post_remount_write_read \
+             ownerless_active_status_refused \
+             crash_cycle_export_prep crash_cycle_ownerless_preimport_refused \
+             crash_cycle_owner_mediated_preimport crash_cycle_premount \
              crash_cycle_write_committed crash_cycle_write_uncommitted \
              crash_cycle_committed_pre_crash_read crash_cycle_sigkill \
-             crash_cycle_stale_mount_detached crash_cycle_reimport_no_export \
+             crash_cycle_stale_mount_detached \
+             crash_cycle_ownerless_reimport_refused \
+             crash_cycle_owner_mediated_reimport \
              crash_cycle_recovery_remount crash_cycle_committed_survived \
              crash_cycle_unfsynced_bounded; do
         blocked "$op" "virtio block devices missing"
@@ -250,23 +259,21 @@ else
 fi
 
 echo ""
-echo "--- Phase 4: Pool import ---"
+echo "--- Phase 4: Ownerless pool import refusal ---"
 
-IMPORT_OK=0
+IMPORT_READY=0
 if [ "$POOL_CREATED" -eq 1 ]; then
-    IOUT=$(tidefsctl pool import "$DEV0" "$DEV1" --json 2>&1); RC=$?
-    echo "  import exit=$RC"
+    IOUT=$(tidefsctl pool import "$POOL_NAME" --devices "$DEV0" "$DEV1" --json 2>&1); RC=$?
+    echo "  ownerless import exit=$RC"
     echo "  $IOUT"
-    if [ "$RC" -eq 0 ]; then
-        pass "pool_import"
-        IMPORT_OK=1
-        rm -f /run/tidefs/import/* 2>/dev/null || true
-        [ -z "$POOL_UUID" ] && POOL_UUID=$(echo "$IOUT" | grep -o '"pool_uuid"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"\([^"]*\)".*/\1/' || echo "")
+    if [ "$RC" -ne 0 ] && printf '%s\n' "$IOUT" | grep -q '"owner_required"[[:space:]]*:[[:space:]]*true'; then
+        pass "ownerless_import_refused"
+        IMPORT_READY=1
     else
-        fail "pool_import" "$IOUT"
+        fail "ownerless_import_refused" "expected owner_required refusal, exit=$RC output=$IOUT"
     fi
 else
-    blocked "pool_import" "pool not created"
+    blocked "ownerless_import_refused" "pool not created"
 fi
 
 echo ""
@@ -276,7 +283,7 @@ MNT=/mnt/tidefs
 MOUNTED=0
 DAEMON_PID=""
 
-if [ "$FUSE_OK" -eq 1 ] && [ "$IMPORT_OK" -eq 1 ]; then
+if [ "$FUSE_OK" -eq 1 ] && [ "$IMPORT_READY" -eq 1 ]; then
     tidefsctl pool mount "$POOL_NAME" "$MNT" --devices "$DEV0" "$DEV1" > /tmp/mount.log 2>&1 &
     DAEMON_PID=$!
     echo "  daemon PID=$DAEMON_PID"
@@ -286,9 +293,16 @@ if [ "$FUSE_OK" -eq 1 ] && [ "$IMPORT_OK" -eq 1 ]; then
         sleep 1
     done
 
-    [ "$MOUNTED" -eq 1 ] && pass "mount" || fail "mount" "$(tail -20 /tmp/mount.log 2>/dev/null)"
+    if [ "$MOUNTED" -eq 1 ]; then
+        pass "owner_mediated_import"
+        pass "mount"
+    else
+        fail "owner_mediated_import" "$(tail -20 /tmp/mount.log 2>/dev/null)"
+        fail "mount" "$(tail -20 /tmp/mount.log 2>/dev/null)"
+    fi
 else
-    blocked "mount" "FUSE not ready or import not done"
+    blocked "owner_mediated_import" "FUSE not ready or ownerless refusal missing"
+    blocked "mount" "FUSE not ready or ownerless refusal missing"
 fi
 
 echo ""
@@ -319,10 +333,6 @@ echo ""
 echo "--- Phase 7: Unmount ---"
 
 if [ "$MOUNTED" -eq 1 ]; then
-    # Record commit-root epoch before unmount via dump of pool status JSON
-    PRE_EPOCH_INFO="/tmp/pre_unmount_epoch.txt"
-    tidefsctl pool status "$POOL_NAME" --devices "$DEV0" "$DEV1" --json > "$PRE_EPOCH_INFO" 2>/dev/null || true
-
     kill "$DAEMON_PID" 2>/dev/null || true
     DAEMON_EXITED=0
     for _ in $(seq 1 10); do
@@ -366,24 +376,23 @@ else
 fi
 
 echo ""
-echo "--- Phase 9: Reimport ---"
+echo "--- Phase 9: Ownerless reimport refusal ---"
 
-REIMPORT_OK=0
+REIMPORT_READY=0
 if [ "$EXPORT_OK" -ne 1 ]; then
-    blocked "reimport" "pool export failed"
+    blocked "ownerless_reimport_refused" "pool export failed"
 elif command -v tidefsctl >/dev/null 2>&1; then
-    RIOUT=$(tidefsctl pool import "$DEV0" "$DEV1" --json 2>&1); RC=$?
-    echo "  reimport exit=$RC"
+    RIOUT=$(tidefsctl pool import "$POOL_NAME" --devices "$DEV0" "$DEV1" --json 2>&1); RC=$?
+    echo "  ownerless reimport exit=$RC"
     echo "  $RIOUT"
-    if [ "$RC" -eq 0 ]; then
-        pass "reimport"
-        REIMPORT_OK=1
-        rm -f /run/tidefs/import/* 2>/dev/null || true
+    if [ "$RC" -ne 0 ] && printf '%s\n' "$RIOUT" | grep -q '"owner_required"[[:space:]]*:[[:space:]]*true'; then
+        pass "ownerless_reimport_refused"
+        REIMPORT_READY=1
     else
-        fail "reimport" "$RIOUT"
+        fail "ownerless_reimport_refused" "expected owner_required refusal, exit=$RC output=$RIOUT"
     fi
 else
-    blocked "reimport" "tidefsctl missing"
+    blocked "ownerless_reimport_refused" "tidefsctl missing"
 fi
 
 echo ""
@@ -391,7 +400,7 @@ echo "--- Phase 10: Remount ---"
 
 REMOUNTED=0
 RPID=""
-if [ "$REIMPORT_OK" -eq 1 ] && [ "$FUSE_OK" -eq 1 ]; then
+if [ "$REIMPORT_READY" -eq 1 ] && [ "$FUSE_OK" -eq 1 ]; then
     tidefsctl pool mount "$POOL_NAME" "$MNT" --devices "$DEV0" "$DEV1" > /tmp/remount.log 2>&1 &
     RPID=$!
     for _ in $(seq 1 45); do
@@ -400,12 +409,15 @@ if [ "$REIMPORT_OK" -eq 1 ] && [ "$FUSE_OK" -eq 1 ]; then
     done
 
     if [ "$REMOUNTED" -eq 1 ]; then
+        pass "owner_mediated_reimport"
         pass "remount"
     else
+        fail "owner_mediated_reimport" "$(tail -20 /tmp/remount.log 2>/dev/null)"
         fail "remount" "$(tail -20 /tmp/remount.log 2>/dev/null)"
     fi
 else
-    blocked "remount" "reimport/FUSE not ready"
+    blocked "owner_mediated_reimport" "ownerless refusal/FUSE not ready"
+    blocked "remount" "ownerless refusal/FUSE not ready"
 fi
 
 echo ""
@@ -442,59 +454,42 @@ else
 fi
 
 echo ""
-echo "--- Phase 12: Committed-root advancement ---"
+echo "--- Phase 12: Live-owner status visibility ---"
 
 if [ "$REMOUNTED" -eq 1 ]; then
-    # Write new data and fsync to advance the committed root
-    TC2="TideFS-Committed-Root-Advance-$(date +%s 2>/dev/null || echo 0)"
-    TF2="$MNT/committed_root_test.txt"
+    # Write and fsync new data before querying the live owner.
+    TC2="TideFS-Live-Owner-Status-$(date +%s 2>/dev/null || echo 0)"
+    TF2="$MNT/live_owner_status_test.txt"
     echo "$TC2" > "$TF2" 2>/dev/null
     sync -f "$TF2" 2>/dev/null || sync
 
-    # Get pool status JSON and extract committed-root epoch info
     POST_STATUS="/tmp/post_remount_status.json"
-    tidefsctl pool status "$POOL_NAME" --devices "$DEV0" "$DEV1" --json > "$POST_STATUS" 2>/dev/null || true
-
-    # Verify that the committed root exists (pool was imported successfully)
-    # The committed-root advancement is validationd by:
-    #   a) pool import succeeded (root selection worked)
-    #   b) pool reimport succeeded (root selection across unmount boundary)
-    #   c) data persisted across unmount/remount (root state consistent)
-    if [ -s "$POST_STATUS" ]; then
-        # Check for pool state in JSON output as proxy for committed-root presence
-        if grep -q '"state"[[:space:]]*:[[:space:]]*"[^"]*"' "$POST_STATUS" 2>/dev/null; then
-            pass "committed_root_advance"
-        else
-            fail "committed_root_advance" "pool status missing state field"
-        fi
+    if tidefsctl pool status "$POOL_NAME" --devices "$DEV0" "$DEV1" --json > "$POST_STATUS" 2>/tmp/post_remount_status.err \
+       && grep -q '"state"[[:space:]]*:[[:space:]]*"[^"]*"' "$POST_STATUS" 2>/dev/null; then
+        pass "live_owner_status_visible"
     else
-        # Fallback: if pool status command failed, use import success as validation
-        pass "committed_root_advance"
+        fail "live_owner_status_visible" "$(cat /tmp/post_remount_status.err 2>/dev/null)"
     fi
 else
-    blocked "committed_root_advance" "remount failed"
+    blocked "live_owner_status_visible" "remount failed"
 fi
 
 echo ""
-echo "--- Phase 13: Intent-log consistency ---"
+echo "--- Phase 13: Post-remount write/read ---"
 
 if [ "$REMOUNTED" -eq 1 ]; then
-    # Intent-log consistency is verified by:
-    #   a) pool import succeeded (intent-log replay during import)
-    #   b) data persisted across unmount/remount (replay produced consistent state)
-    #   c) new writes after remount succeed (intent-log recording works)
-    TF3="$MNT/intent_log_test.txt"
-    TC3="TideFS-IntentLog-Consistency-$(date +%s 2>/dev/null || echo 0)"
+    TF3="$MNT/post_remount_write_read_test.txt"
+    TC3="TideFS-Post-Remount-Write-Read-$(date +%s 2>/dev/null || echo 0)"
     echo "$TC3" > "$TF3" 2>/dev/null
     sync -f "$TF3" 2>/dev/null || sync
     RC3=$(cat "$TF3" 2>/dev/null || true)
     if [ "$RC3" = "$TC3" ]; then
-        pass "intent_log_consistency"
+        pass "post_remount_write_read"
     else
-        fail "intent_log_consistency" "post-remount write/read failed: expected '$TC3' got '$RC3'"
+        fail "post_remount_write_read" "expected '$TC3' got '$RC3'"
     fi
 else
-    blocked "intent_log_consistency" "remount failed"
+    blocked "post_remount_write_read" "remount failed"
 fi
 
 # Cleanup remount daemon
@@ -506,27 +501,17 @@ fi
 
 
 echo ""
-echo "--- Phase 14: Suspect log persistence validation ---"
-
-# The suspect log is persisted to $store_dir/segments/suspect_log in VSUS format
-# with BLAKE3-256 integrity. Scrub findings are durably written on every tick
-# and survive store close/reopen. This is the REL-STOR-004 operator-visible path.
-# For raw block-device pools, the suspect log lives inside the pool device;
-# for file-backed pools it would be at <store_root>/segments/suspect_log.
+echo "--- Phase 14: Ownerless active-status refusal ---"
 
 if [ "$REMOUNTED" -eq 1 ]; then
-    # Verify pool status after remount as indirect validation of integrity
-    if tidefsctl pool status "$POOL_NAME" --devices "$DEV0" "$DEV1" --json > /tmp/suspect_status.json 2>/dev/null; then
-        if grep -q '"pool_name"' /tmp/suspect_status.json 2>/dev/null; then
-            pass "suspect_log_persistence"
-        else
-            fail "suspect_log_persistence" "pool status after remount failed"
-        fi
+    SOUT=$(tidefsctl pool status "$POOL_NAME" --devices "$DEV0" "$DEV1" --json 2>&1); RC=$?
+    if [ "$RC" -ne 0 ] && printf '%s\n' "$SOUT" | grep -q '"owner_required"[[:space:]]*:[[:space:]]*true'; then
+        pass "ownerless_active_status_refused"
     else
-        pass "suspect_log_persistence"
+        fail "ownerless_active_status_refused" "expected owner_required refusal, exit=$RC output=$SOUT"
     fi
 else
-    blocked "suspect_log_persistence" "remount failed"
+    blocked "ownerless_active_status_refused" "remount failed"
 fi
 
 echo ""
@@ -540,7 +525,7 @@ echo "--- Phase 15: Crash-cycle (SIGKILL without export) ---"
 #   corrupted or partial content is not.
 # - SIGKILL the daemon (simulating crash/power-loss, no clean export)
 # - Detach the dead FUSE mount before starting the recovery mount
-# - Import the pool (exercising committed-root selection + intent replay)
+# - Refuse ownerless import, then import through the new FUSE owner
 # - Remount and verify: committed data survives, unfsynced data is bounded
 
 CRASH_CYCLE_EXPORT_OK=0
@@ -548,22 +533,20 @@ if tidefsctl pool export "$POOL_NAME" --devices "$DEV0" "$DEV1" --force > /tmp/c
     CRASH_CYCLE_EXPORT_OK=1
     pass "crash_cycle_export_prep"
 else
-    pass "crash_cycle_export_prep"
-    CRASH_CYCLE_EXPORT_OK=1
+    fail "crash_cycle_export_prep" "$(cat /tmp/crash_export.log 2>/dev/null)"
 fi
 
 CRASH_CYCLE_IMPORT_OK=0
 if [ "$CRASH_CYCLE_EXPORT_OK" -eq 1 ]; then
-    CIOUT=$(tidefsctl pool import "$DEV0" "$DEV1" --json 2>&1); RC=$?
-    if [ "$RC" -eq 0 ]; then
-        pass "crash_cycle_preimport"
+    CIOUT=$(tidefsctl pool import "$POOL_NAME" --devices "$DEV0" "$DEV1" --json 2>&1); RC=$?
+    if [ "$RC" -ne 0 ] && printf '%s\n' "$CIOUT" | grep -q '"owner_required"[[:space:]]*:[[:space:]]*true'; then
+        pass "crash_cycle_ownerless_preimport_refused"
         CRASH_CYCLE_IMPORT_OK=1
-        rm -f /run/tidefs/import/* 2>/dev/null || true
     else
-        fail "crash_cycle_preimport" "$CIOUT"
+        fail "crash_cycle_ownerless_preimport_refused" "expected owner_required refusal, exit=$RC output=$CIOUT"
     fi
 else
-    blocked "crash_cycle_preimport" "export preparation failed"
+    blocked "crash_cycle_ownerless_preimport_refused" "export preparation failed"
 fi
 
 CRASH_CYCLE_MOUNTED=0
@@ -575,9 +558,16 @@ if [ "$CRASH_CYCLE_IMPORT_OK" -eq 1 ] && [ "$FUSE_OK" -eq 1 ]; then
         mountpoint -q "$MNT" 2>/dev/null && { CRASH_CYCLE_MOUNTED=1; break; }
         sleep 1
     done
-    [ "$CRASH_CYCLE_MOUNTED" -eq 1 ] && pass "crash_cycle_premount" || fail "crash_cycle_premount" "$(tail -20 /tmp/crash_mount.log 2>/dev/null)"
+    if [ "$CRASH_CYCLE_MOUNTED" -eq 1 ]; then
+        pass "crash_cycle_owner_mediated_preimport"
+        pass "crash_cycle_premount"
+    else
+        fail "crash_cycle_owner_mediated_preimport" "$(tail -20 /tmp/crash_mount.log 2>/dev/null)"
+        fail "crash_cycle_premount" "$(tail -20 /tmp/crash_mount.log 2>/dev/null)"
+    fi
 else
-    blocked "crash_cycle_premount" "import/FUSE not ready"
+    blocked "crash_cycle_owner_mediated_preimport" "ownerless refusal/FUSE not ready"
+    blocked "crash_cycle_premount" "ownerless refusal/FUSE not ready"
 fi
 
 # Write committed (fsynced) and uncommitted (not fsynced) data
@@ -632,7 +622,7 @@ if [ -n "$CRASH_PID" ] && kill -0 "$CRASH_PID" 2>/dev/null; then
     wait "$CRASH_PID" 2>/dev/null || true
     pass "crash_cycle_sigkill"
 else
-    pass "crash_cycle_sigkill"
+    blocked "crash_cycle_sigkill" "crash-cycle daemon not running"
 fi
 if [ -n "$CRASH_UNCOMMITTED_HOLDER" ] && kill -0 "$CRASH_UNCOMMITTED_HOLDER" 2>/dev/null; then
     kill -KILL "$CRASH_UNCOMMITTED_HOLDER" 2>/dev/null || true
@@ -641,26 +631,29 @@ fi
 echo "  crash mount daemon log:"
 tail -120 /tmp/crash_mount.log 2>/dev/null || true
 
-if mountpoint -q "$MNT" 2>/dev/null; then
-    if umount -l "$MNT" 2>/tmp/crash_umount.err; then
-        pass "crash_cycle_stale_mount_detached"
+if [ "$CRASH_CYCLE_MOUNTED" -eq 1 ]; then
+    if mountpoint -q "$MNT" 2>/dev/null; then
+        if umount -l "$MNT" 2>/tmp/crash_umount.err; then
+            pass "crash_cycle_stale_mount_detached"
+        else
+            fail "crash_cycle_stale_mount_detached" "$(cat /tmp/crash_umount.err 2>/dev/null)"
+        fi
     else
-        fail "crash_cycle_stale_mount_detached" "$(cat /tmp/crash_umount.err 2>/dev/null)"
+        pass "crash_cycle_stale_mount_detached"
     fi
 else
-    pass "crash_cycle_stale_mount_detached"
+    blocked "crash_cycle_stale_mount_detached" "crash-cycle mount never became active"
 fi
 
-# IMPORT WITHOUT EXPORT: this exercises committed-root selection + intent replay
+# REFUSE OWNERLESS IMPORT WITHOUT EXPORT: recovery mount owns import/replay.
 CRASH_RECOVERY_IMPORT_OK=0
-CROUT=$(tidefsctl pool import "$DEV0" "$DEV1" --json 2>&1); RC=$?
-echo "  crash-recovery import exit=$RC"
-if [ "$RC" -eq 0 ]; then
-    pass "crash_cycle_reimport_no_export"
+CROUT=$(tidefsctl pool import "$POOL_NAME" --devices "$DEV0" "$DEV1" --json 2>&1); RC=$?
+echo "  crash-recovery ownerless import exit=$RC"
+if [ "$RC" -ne 0 ] && printf '%s\n' "$CROUT" | grep -q '"owner_required"[[:space:]]*:[[:space:]]*true'; then
+    pass "crash_cycle_ownerless_reimport_refused"
     CRASH_RECOVERY_IMPORT_OK=1
-    rm -f /run/tidefs/import/* 2>/dev/null || true
 else
-    fail "crash_cycle_reimport_no_export" "$CROUT"
+    fail "crash_cycle_ownerless_reimport_refused" "expected owner_required refusal, exit=$RC output=$CROUT"
 fi
 
 # Remount after crash recovery
@@ -673,9 +666,16 @@ if [ "$CRASH_RECOVERY_IMPORT_OK" -eq 1 ] && [ "$FUSE_OK" -eq 1 ]; then
         mountpoint -q "$MNT" 2>/dev/null && { CRASH_RECOVERY_MOUNTED=1; break; }
         sleep 1
     done
-    [ "$CRASH_RECOVERY_MOUNTED" -eq 1 ] && pass "crash_cycle_recovery_remount" || fail "crash_cycle_recovery_remount" "$(tail -20 /tmp/crash_recovery_mount.log 2>/dev/null)"
+    if [ "$CRASH_RECOVERY_MOUNTED" -eq 1 ]; then
+        pass "crash_cycle_owner_mediated_reimport"
+        pass "crash_cycle_recovery_remount"
+    else
+        fail "crash_cycle_owner_mediated_reimport" "$(tail -20 /tmp/crash_recovery_mount.log 2>/dev/null)"
+        fail "crash_cycle_recovery_remount" "$(tail -20 /tmp/crash_recovery_mount.log 2>/dev/null)"
+    fi
 else
-    blocked "crash_cycle_recovery_remount" "crash-recovery import failed"
+    blocked "crash_cycle_owner_mediated_reimport" "ownerless refusal/FUSE not ready"
+    blocked "crash_cycle_recovery_remount" "ownerless refusal/FUSE not ready"
 fi
 
 # Verify: committed data survived; unfsynced data is absent or exact.
@@ -777,14 +777,17 @@ INITSCRIPT
     for op in \
       fuse_support fuse_device \
       virtio0_present virtio1_present virtio0_size virtio1_size \
-      pool_create pool_import mount write_data fsync_data read_verify \
-      unmount pool_export reimport remount persist_verify \
-      committed_root_advance intent_log_consistency \
-      suspect_log_persistence \
-      crash_cycle_export_prep crash_cycle_preimport crash_cycle_premount \
+      pool_create ownerless_import_refused owner_mediated_import mount \
+      write_data fsync_data read_verify unmount pool_export \
+      ownerless_reimport_refused owner_mediated_reimport remount persist_verify \
+      live_owner_status_visible post_remount_write_read \
+      ownerless_active_status_refused \
+      crash_cycle_export_prep crash_cycle_ownerless_preimport_refused \
+      crash_cycle_owner_mediated_preimport crash_cycle_premount \
       crash_cycle_write_committed crash_cycle_write_uncommitted \
       crash_cycle_committed_pre_crash_read crash_cycle_sigkill \
-      crash_cycle_stale_mount_detached crash_cycle_reimport_no_export \
+      crash_cycle_stale_mount_detached crash_cycle_ownerless_reimport_refused \
+      crash_cycle_owner_mediated_reimport \
       crash_cycle_recovery_remount crash_cycle_committed_survived \
       crash_cycle_unfsynced_bounded \
       sync_done; do

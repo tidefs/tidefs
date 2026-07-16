@@ -19,6 +19,7 @@ on:
           - two-node-carrier-validation
           - fuse-vm-test
           - fuse-inode-metadata-validation
+          - pool-remount-lifecycle-validation
           - qemu-ublk-smoke
           - qemu-ublk-qid-tag-runtime
           - storage-intent-ack-fault-matrix
@@ -80,6 +81,10 @@ jobs:
             name: fuse-inode-metadata-validation
             command: TIDEFS_SOURCE_COMMIT="$(git rev-parse HEAD)" TIDEFS_ROOT_AUTHENTICATION_KEY_HEX=0000000000000000000000000000000000000000000000000000000000000001 nix run .#fuse-inode-metadata-validation -- --timeout 900 --validation-dir /tmp/tidefs-validation/fuse-inode-metadata-validation --keep-tmp
             output_dir: /tmp/tidefs-validation/fuse-inode-metadata-validation
+          - id: pool-remount-lifecycle-validation
+            name: pool-remount-lifecycle-validation
+            command: TIDEFS_VALIDATION_RUNS_DIR=/tmp/tidefs-validation/pool-remount-lifecycle-validation nix run .#pool-remount-lifecycle-validation -- --timeout 900
+            output_dir: /tmp/tidefs-validation/pool-remount-lifecycle-validation
           - id: qemu-ublk-smoke
             name: qemu-ublk-smoke
             command: nix run .#qemu-ublk-smoke -- --timeout 3600

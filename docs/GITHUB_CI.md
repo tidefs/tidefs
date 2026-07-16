@@ -148,7 +148,8 @@ may use non-secret repository variables for scheduling gates, such as
   `target` choice for `kmod-xfstests-smoke`, `kernel-fsync-validation`,
   `kernel-mmap-validation`, `kernel-teardown-validation`,
   `kernel-no-daemon-teardown-validation`, `two-node-carrier-validation`,
-  `fuse-vm-test`, `fuse-inode-metadata-validation`, `qemu-ublk-smoke`,
+  `fuse-vm-test`, `fuse-inode-metadata-validation`,
+  `pool-remount-lifecycle-validation`, `qemu-ublk-smoke`,
   `qemu-ublk-qid-tag-runtime`, `storage-intent-ack-fault-matrix`,
   `receipt-bound-reclaim-runtime`, `scrub-foreground-read-runtime`, and `all`;
   `.github/workflows/qemu-smoke.yml`
@@ -164,6 +165,13 @@ may use non-secret repository variables for scheduling gates, such as
   runtime evidence surfaces. Dedicated workflows with the same flake refs remain
   separate validation lanes when an issue tier requires standalone fsync/mmap
   evidence, serial concurrency, or richer manifests.
+- `Pool remount lifecycle validation` is a manual QEMU Smoke target that boots
+  a Linux 7.0 guest with two virtio-blk devices and exercises pool create,
+  ownerless import refusal, owner-mediated mounted FUSE I/O, export, reimport,
+  remount, and crash recovery. Its uploaded log is bounded runtime evidence for
+  those observed transitions; it does not cover add/remove/replace or
+  device-health transitions and does not change claim-registry status by
+  itself.
 - `Two-node carrier validation` is a manual `QEMU Smoke` target for
   `tidefs-two-node-harness`. It runs `.#two-node-carrier-validation`, boots a
   Linux 7.0 QEMU guest, executes the `qemu`-gated live TCP carrier
