@@ -1236,28 +1236,26 @@ fn evaluate_claim_evidence(
                 };
             }
         }
+    } else if is_live_runtime_validation_tier(&requirement.validation_tier) {
+        details.push(format!(
+            "runtime-tier evidence requirement for class `{class}` must name manifest_path"
+        ));
+        outcome = VerdictOutcome::Malformed;
+    } else if is_runtime_artifact_path(requirement.path.as_str()) {
+        details.push(format!(
+            "runtime artifact path `{}` for class `{class}` requires live-runtime validation_tier and manifest_path",
+            requirement.path
+        ));
+        outcome = VerdictOutcome::Malformed;
     } else {
-        if is_live_runtime_validation_tier(&requirement.validation_tier) {
+        let artifact_path = config.workspace_root.join(&requirement.path);
+        if !artifact_path.exists() {
             details.push(format!(
-                "runtime-tier evidence requirement for class `{class}` must name manifest_path"
+                "artifact path `{}` is missing",
+                artifact_path.display()
             ));
-            outcome = VerdictOutcome::Malformed;
-        } else if is_runtime_artifact_path(requirement.path.as_str()) {
-            details.push(format!(
-                "runtime artifact path `{}` for class `{class}` requires live-runtime validation_tier and manifest_path",
-                requirement.path
-            ));
-            outcome = VerdictOutcome::Malformed;
-        } else {
-            let artifact_path = config.workspace_root.join(&requirement.path);
-            if !artifact_path.exists() {
-                details.push(format!(
-                    "artifact path `{}` is missing",
-                    artifact_path.display()
-                ));
-                if outcome.is_pass() {
-                    outcome = VerdictOutcome::Missing;
-                }
+            if outcome.is_pass() {
+                outcome = VerdictOutcome::Missing;
             }
         }
     }
