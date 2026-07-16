@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
-//! Remount-persistence integration test for the FUSE RW persistence slice.
-//! Tests the advancement criterion: mount(RW) → write → sync → unmount →
-//! remount → read → verify bytes match exactly.  Uses the `MountHarness`
-//! infrastructure to spawn the posix-filesystem-adapter-daemon, perform IO
-//! through the FUSE mount, and remount the same backing store.
-//! This test proves that write data survives a clean unmount/remount cycle
-//! and is the gate for the `fuse-mount-rw-persistence` slice advancement.
+//! Remount-persistence mounted-runtime rows for the FUSE RW persistence slice.
+//! When run explicitly with daemon/FUSE substrate available, these tests
+//! exercise mount(RW) -> write -> sync -> unmount -> remount -> read ->
+//! byte-for-byte verification through `MountHarness`.
+//! Ordinary `cargo test` leaves these rows ignored, and missing mounted
+//! runtime substrate fails closed through the harness instead of producing
+//! product evidence.
 
 use tidefs_validation::mount_harness::MountHarness;
 
@@ -14,29 +14,18 @@ fn sequenced_test_data(len_bytes: usize) -> Vec<u8> {
     (0..len_bytes).map(|i| (i % 256) as u8).collect()
 }
 
-fn new_harness_or_skip(test_name: &str) -> Option<MountHarness> {
-    match MountHarness::new() {
-        Ok(harness) => Some(harness),
-        Err(e) => {
-            eprintln!("SKIP {test_name}: daemon not available -- {e}");
-            None
-        }
-    }
+fn new_harness_or_fail(test_name: &str) -> MountHarness {
+    MountHarness::new_or_fail(test_name)
 }
 
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn remount_persistence_64kib_sequenced() {
     let test_data = sequenced_test_data(64 * 1024);
 
     // ── Session 1: mount, write, fsync, unmount ──────────────────────
 
-    let mut harness = match MountHarness::new() {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("SKIP remount_persistence_64kib_sequenced: daemon not available -- {e}");
-            return;
-        }
-    };
+    let mut harness = new_harness_or_fail("remount_persistence_64kib_sequenced");
     harness
         .create_file("remount_test.bin", &test_data)
         .expect("create_file session 1");
@@ -66,18 +55,13 @@ fn remount_persistence_64kib_sequenced() {
 }
 
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn remount_persistence_multiple_files() {
     let data_a = b"file alpha content\n".to_vec();
     let data_b = b"file beta content\n".to_vec();
     let data_c = (0..4096).map(|i| (i % 256) as u8).collect::<Vec<u8>>();
 
-    let mut harness = match MountHarness::new() {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("SKIP remount_persistence_multiple_files: daemon not available -- {e}");
-            return;
-        }
-    };
+    let mut harness = new_harness_or_fail("remount_persistence_multiple_files");
 
     harness
         .create_file("alpha.txt", &data_a)
@@ -114,17 +98,12 @@ fn remount_persistence_multiple_files() {
 }
 
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn remount_persistence_subdir_files() {
     let data_x = b"nested file x data\n".to_vec();
     let data_y = b"nested file y data\n".to_vec();
 
-    let mut harness = match MountHarness::new() {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("SKIP remount_persistence_subdir_files: daemon not available -- {e}");
-            return;
-        }
-    };
+    let mut harness = new_harness_or_fail("remount_persistence_subdir_files");
 
     harness.mkdir_all("subdir/deep").expect("mkdir subdir/deep");
     harness
@@ -176,20 +155,18 @@ fn remount_persistence_subdir_files() {
 }
 
 // ===========================================================================
-// Same-session write-read smoke tests (issue #3732 advancement criterion 1)
+// Same-session write-read mounted-runtime rows
 // ===========================================================================
 
 /// Write known data through a FUSE mount, then read it back within the same
-/// mount session and verify byte-for-byte equality.  This proves that the
-/// FUSE write dispatch path is functional end-to-end.
+/// mount session and verify byte-for-byte equality.  This exercises the
+/// FUSE write dispatch path end-to-end when the mounted runtime is present.
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn same_session_write_read_roundtrip() {
     let test_data = b"same-session write-then-read roundtrip payload\n";
 
-    let harness = match new_harness_or_skip("same_session_write_read_roundtrip") {
-        Some(harness) => harness,
-        None => return,
-    };
+    let harness = new_harness_or_fail("same_session_write_read_roundtrip");
     harness
         .create_file("ss_wr.bin", test_data)
         .expect("create_file same-session");
@@ -207,15 +184,13 @@ fn same_session_write_read_roundtrip() {
 /// Write a multi-block payload (32 KiB) and read back within the same
 /// session to verify correctness across block boundaries.
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn same_session_write_read_multiblock() {
     let test_data: Vec<u8> = (0..32768u32)
         .map(|i| (i.wrapping_mul(7) % 251) as u8)
         .collect();
 
-    let harness = match new_harness_or_skip("same_session_write_read_multiblock") {
-        Some(harness) => harness,
-        None => return,
-    };
+    let harness = new_harness_or_fail("same_session_write_read_multiblock");
     harness
         .create_file("ss_multiblock.bin", &test_data)
         .expect("create_file multiblock");
@@ -238,13 +213,11 @@ fn same_session_write_read_multiblock() {
 /// Write data, fsync via FUSE (sync_all), then immediately read back within
 /// the same session to confirm flush does not invalidate the read path.
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn same_session_write_fsync_read() {
     let test_data = b"write, fsync, read in same session\n";
 
-    let harness = match new_harness_or_skip("same_session_write_fsync_read") {
-        Some(harness) => harness,
-        None => return,
-    };
+    let harness = new_harness_or_fail("same_session_write_fsync_read");
     harness
         .create_file("ss_fsync.bin", test_data)
         .expect("create_file");
@@ -265,14 +238,12 @@ fn same_session_write_fsync_read() {
 /// Write data, fdatasync via FUSE (sync_data), then read back.
 /// Fdatasync is a data-only sync; read-back must return the written bytes.
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn same_session_write_fdatasync_read() {
     use std::os::unix::io::AsRawFd;
     let test_data = b"write, fdatasync, read in same session\n";
 
-    let harness = match new_harness_or_skip("same_session_write_fdatasync_read") {
-        Some(harness) => harness,
-        None => return,
-    };
+    let harness = new_harness_or_fail("same_session_write_fdatasync_read");
     let rel = "ss_fdatasync.bin";
     harness.create_file(rel, test_data).expect("create_file");
 

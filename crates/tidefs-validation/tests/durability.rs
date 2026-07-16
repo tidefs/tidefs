@@ -11,9 +11,9 @@
 //! 4. Multi-file, multi-directory durability at scale
 //!
 //! Tests use deterministic write patterns so failures are reproducible.
-//! When /dev/fuse is unavailable, tests skip gracefully.
+//! Missing mounted-runtime substrate fails closed with an explicit runtime
+//! refusal instead of returning success.
 
-use std::path::Path;
 use tidefs_validation::mount_harness::MountHarness;
 
 // ── test-data helpers ───────────────────────────────────────────────────────
@@ -49,15 +49,12 @@ struct DurabilityHarness {
 }
 
 impl DurabilityHarness {
-    /// Spawn daemon, mount, wait for readiness.  Returns an error when
-    /// /dev/fuse is unavailable (callers should skip, not fail).
-    fn new() -> std::io::Result<Self> {
-        if !Path::new("/dev/fuse").exists() {
-            return Err(std::io::Error::other(
-                "FUSE /dev/fuse not available — durability tests require FUSE kernel support",
-            ));
+    /// Spawn daemon, mount, and wait for readiness, failing closed when
+    /// mounted-runtime prerequisites are absent.
+    fn new_or_fail(scope: &str) -> Self {
+        Self {
+            harness: MountHarness::new_or_fail(scope),
         }
-        MountHarness::new().map(|h| Self { harness: h })
     }
 
     // ── delegation to MountHarness ──────────────────────────────────────
@@ -137,14 +134,9 @@ impl DurabilityHarness {
 /// This is the foundational durability contract: after fsync + clean
 /// unmount, all data must survive remount.
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn clean_remount_fsync_4kib() {
-    let mut h = match DurabilityHarness::new() {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("SKIP clean_remount_fsync_4kib: {e}");
-            return;
-        }
-    };
+    let mut h = DurabilityHarness::new_or_fail("clean_remount_fsync_4kib");
 
     let data = sequenced_test_data(4096);
     h.write_file("fsync_4kib.bin", &data).expect("write_file");
@@ -164,14 +156,9 @@ fn clean_remount_fsync_4kib() {
 /// verify byte-for-byte match.  fdatasync skips metadata sync but file
 /// content must survive.
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn clean_remount_fdatasync_4kib() {
-    let mut h = match DurabilityHarness::new() {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("SKIP clean_remount_fdatasync_4kib: {e}");
-            return;
-        }
-    };
+    let mut h = DurabilityHarness::new_or_fail("clean_remount_fdatasync_4kib");
 
     let data = prng_test_data(0xBEEF, 4096);
     h.write_file("fdatasync_4kib.bin", &data)
@@ -194,14 +181,9 @@ fn clean_remount_fdatasync_4kib() {
 /// fsync must have flushed data to durable object-store storage before
 /// the daemon was killed, so remount can reconstruct it.
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn crash_remount_fsync_4kib() {
-    let mut h = match DurabilityHarness::new() {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("SKIP crash_remount_fsync_4kib: {e}");
-            return;
-        }
-    };
+    let mut h = DurabilityHarness::new_or_fail("crash_remount_fsync_4kib");
 
     let data = sequenced_test_data(4096);
     h.write_file("crash_fsync.bin", &data).expect("write_file");
@@ -231,14 +213,9 @@ fn crash_remount_fsync_4kib() {
 /// that only fsync'd data survives a power-loss or crash event.
 /// Non-fsynced writes may be lost entirely.
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn crash_remount_no_fsync_data_loss() {
-    let mut h = match DurabilityHarness::new() {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("SKIP crash_remount_no_fsync_data_loss: {e}");
-            return;
-        }
-    };
+    let mut h = DurabilityHarness::new_or_fail("crash_remount_no_fsync_data_loss");
 
     let checkpoint = sequenced_test_data(2048);
     let unsynced = prng_test_data(0xDEAD, 4096);
@@ -300,14 +277,9 @@ fn crash_remount_no_fsync_data_loss() {
 /// Exercises directory durability at scale — no existing test covers more
 /// than 4 files across 2 directories.
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn multi_file_16_files_4_subdirs_durability() {
-    let mut h = match DurabilityHarness::new() {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("SKIP multi_file_16_files_4_subdirs_durability: {e}");
-            return;
-        }
-    };
+    let mut h = DurabilityHarness::new_or_fail("multi_file_16_files_4_subdirs_durability");
 
     let dirs = ["dir_a", "dir_b", "dir_c", "dir_d"];
     let files_per_dir = 4u32;
@@ -323,7 +295,7 @@ fn multi_file_16_files_4_subdirs_durability() {
             // Each file gets unique deterministic data via sequenced pattern
             // plus a per-file seed in the first 8 bytes.
             let mut data = Vec::with_capacity(file_size);
-            data.extend_from_slice(&i.to_le_bytes());
+            data.extend_from_slice(&(i as u64).to_le_bytes());
             data.extend(sequenced_test_data(file_size - 8));
             h.write_file(&path, &data)
                 .unwrap_or_else(|e| panic!("write {path}: {e}"));
@@ -364,19 +336,12 @@ fn multi_file_16_files_4_subdirs_durability() {
 // ── 6. crash-remount multi-file durability ──────────────────────────────────
 
 /// Create 8 files across 2 subdirectories, fsync all, SIGKILL daemon,
-/// remount, verify all 8 survive.  The existing crash tests in
-/// write_durability.rs are #[ignore]; this exercises the crash path
-/// at moderate scale (8 files, 2 dirs) to validate multi-file crash
-/// recovery without the ignore marker.
+/// remount, verify all 8 survive.  This exercises the crash path at
+/// moderate scale (8 files, 2 dirs) to validate multi-file crash recovery.
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn crash_remount_multi_file_8_files_2_subdirs() {
-    let mut h = match DurabilityHarness::new() {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("SKIP crash_remount_multi_file_8_files_2_subdirs: {e}");
-            return;
-        }
-    };
+    let mut h = DurabilityHarness::new_or_fail("crash_remount_multi_file_8_files_2_subdirs");
 
     let dirs = ["crash_top", "crash_sub"];
     let files_per_dir = 4u32;
@@ -434,14 +399,9 @@ fn crash_remount_multi_file_8_files_2_subdirs() {
 /// SIGKILL the daemon, remount, verify the latest (overwritten) content
 /// survived byte-for-byte.
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn crash_remount_overwrite_survives() {
-    let mut h = match DurabilityHarness::new() {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("SKIP crash_remount_overwrite_survives: {e}");
-            return;
-        }
-    };
+    let mut h = DurabilityHarness::new_or_fail("crash_remount_overwrite_survives");
 
     let initial = b"original content that was overwritten\n".to_vec();
     let overwrite = sequenced_test_data(8192);
@@ -472,17 +432,12 @@ fn crash_remount_overwrite_survives() {
 /// Write 8 KiB, truncate to 1 KiB, extend to 4 KiB with zero-fill, fsync,
 /// SIGKILL, remount, verify size=4 KiB and the zero-filled region is intact.
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn crash_remount_truncate_extend_survives() {
     use std::fs::File;
     use std::io::Write;
 
-    let mut h = match DurabilityHarness::new() {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("SKIP crash_remount_truncate_extend_survives: {e}");
-            return;
-        }
-    };
+    let mut h = DurabilityHarness::new_or_fail("crash_remount_truncate_extend_survives");
 
     let full_data = sequenced_test_data(8192); // 8 KiB
     let path = h.harness.mount_path().join("trunc_ext_crash.bin");
@@ -549,16 +504,11 @@ fn crash_remount_truncate_extend_survives() {
 /// Create a file, chmod 0o600, fsync the file, SIGKILL the daemon,
 /// remount, verify mode bits are 0o600 (not the default 0o644).
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn crash_remount_chmod_survives() {
     use std::os::unix::fs::PermissionsExt;
 
-    let mut h = match DurabilityHarness::new() {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("SKIP crash_remount_chmod_survives: {e}");
-            return;
-        }
-    };
+    let mut h = DurabilityHarness::new_or_fail("crash_remount_chmod_survives");
 
     h.write_file("chmod_crash.bin", b"mode test\n")
         .expect("write_file");

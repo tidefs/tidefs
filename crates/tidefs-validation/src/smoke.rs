@@ -156,6 +156,8 @@ pub mod permission;
 
 // ── fuse integration smoke ──────────────────────
 #[cfg(feature = "fuse")]
+pub mod fuse_basic_ops;
+#[cfg(feature = "fuse")]
 pub mod fuse_xattr_acl_locks;
 
 // ── workers-locks smoke ────────────────────────────────────────────────────

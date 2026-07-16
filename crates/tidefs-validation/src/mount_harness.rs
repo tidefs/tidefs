@@ -160,65 +160,38 @@ impl MountHarness {
     /// is initialised with a demo root authentication key so no environment
     /// setup is required.
     pub fn new() -> io::Result<Self> {
-        let daemon_bin = find_daemon_binary()?;
-        let work_dir = tempfile::TempDir::new()
-            .map_err(|e| io::Error::other(format!("create harness work dir: {e}")))?;
-
-        let store_path = work_dir.path().join("store");
-        let mount_path = work_dir.path().join("mnt");
-
-        fs::create_dir_all(&store_path).map_err(|e| {
-            io::Error::other(format!("create store dir {}: {e}", store_path.display()))
-        })?;
-        fs::create_dir_all(&mount_path).map_err(|e| {
-            io::Error::other(format!("create mount dir {}: {e}", mount_path.display()))
-        })?;
-
-        // Demo root authentication key avoids requiring env setup.
-        let root_auth_key_hex = "0000000000000000000000000000000000000000000000000000000000000001";
-
-        let child = Command::new(&daemon_bin)
-            .arg("mount-vfs")
-            .arg("--store")
-            .arg(&store_path)
-            .arg("--mount")
-            .arg(&mount_path)
-            .arg("--root-auth-key-hex")
-            .arg(root_auth_key_hex)
-            .spawn()
-            .map_err(|e| io::Error::other(format!("spawn daemon {}: {e}", daemon_bin.display())))?;
-
-        let daemon_pid = child.id();
-
-        // Wait for the mount point to become ready.  Polling with stat is
-        // more reliable across versions than parsing daemon stderr.
-        wait_for_mount(&mount_path, Duration::from_secs(10)).map_err(|e| {
-            kill_child(daemon_pid);
-            io::Error::other(format!(
-                "mount point {} did not become ready: {e}",
-                mount_path.display()
-            ))
-        })?;
-
-        Ok(Self {
-            work_dir,
-            store_path,
-            mount_path,
-            child,
-            daemon_pid,
-        })
+        Self::builder().build()
     }
 
-    /// Return a mount harness when the daemon is available, or print the
-    /// established daemonless cargo-test skip message and let the caller return.
+    /// Format the mounted-runtime refusal emitted when the daemon, FUSE device,
+    /// or another substrate prerequisite is absent.
+    ///
+    /// This is harness/refusal signal only. Callers that claim mounted product
+    /// behavior should fail closed with [`Self::new_or_fail`] instead of
+    /// returning success after printing the message.
+    pub fn runtime_refusal_message(scope: &str, error: impl std::fmt::Display) -> String {
+        format!(
+            "RUNTIME REFUSAL {scope}: mounted runtime substrate unavailable; \
+             this is harness/refusal signal only, not mounted product proof -- {error}"
+        )
+    }
+
+    /// Return a mount harness when the daemon is available, or print an
+    /// explicit runtime-refusal receipt and let harness-only callers return.
     pub fn new_or_skip(scope: &str) -> Option<Self> {
         match Self::new() {
             Ok(harness) => Some(harness),
             Err(e) => {
-                eprintln!("SKIP {scope}: daemon not available -- {e}");
+                eprintln!("{}", Self::runtime_refusal_message(scope, e));
                 None
             }
         }
+    }
+
+    /// Return a mount harness or fail closed when mounted runtime prerequisites
+    /// are absent.
+    pub fn new_or_fail(scope: &str) -> Self {
+        Self::new().unwrap_or_else(|e| panic!("{}", Self::runtime_refusal_message(scope, e)))
     }
 
     /// Create a [`MountHarnessBuilder`] for customised harness setup.
@@ -1009,16 +982,25 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
+    #[test]
+    fn runtime_refusal_message_marks_harness_signal() {
+        let msg = MountHarness::runtime_refusal_message(
+            "mount_harness helper test",
+            io::Error::other("daemon missing"),
+        );
+
+        assert!(msg.contains("RUNTIME REFUSAL mount_harness helper test"));
+        assert!(msg.contains("mounted runtime substrate unavailable"));
+        assert!(msg.contains("harness/refusal signal only"));
+        assert!(msg.contains("not mounted product proof"));
+        assert!(msg.contains("daemon missing"));
+    }
+
     /// Smoke test: verify the harness can mount and unmount cleanly.
     #[test]
+    #[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
     fn test_mount_unmount_cleanup() {
-        let harness = match MountHarness::new() {
-            Ok(h) => h,
-            Err(e) => {
-                eprintln!("SKIP test_mount_unmount_cleanup: daemon not available -- {e}");
-                return;
-            }
-        };
+        let harness = MountHarness::new_or_fail("test_mount_unmount_cleanup");
         let md = harness.stat(".").expect("stat mount root");
         assert!(md.is_dir(), "mount root must be a directory");
         eprintln!(
@@ -1032,14 +1014,9 @@ mod tests {
 
     /// Basic IO round-trip: create, write, read, verify byte-identical.
     #[test]
+    #[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
     fn test_create_read_write_roundtrip() {
-        let harness = match MountHarness::new() {
-            Ok(h) => h,
-            Err(e) => {
-                eprintln!("SKIP test_mount_unmount_cleanup: daemon not available -- {e}");
-                return;
-            }
-        };
+        let harness = MountHarness::new_or_fail("test_create_read_write_roundtrip");
         let data = b"Hello, TideFS! This is a round-trip test.\n";
         harness.create_file("test.txt", data).expect("create_file");
         let read_back = harness.read_file("test.txt").expect("read_file");
@@ -1048,14 +1025,9 @@ mod tests {
 
     /// Metadata round-trip: chmod then stat, verify mode bits changed.
     #[test]
+    #[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
     fn test_metadata_chmod_roundtrip() {
-        let harness = match MountHarness::new() {
-            Ok(h) => h,
-            Err(e) => {
-                eprintln!("SKIP test_mount_unmount_cleanup: daemon not available -- {e}");
-                return;
-            }
-        };
+        let harness = MountHarness::new_or_fail("test_metadata_chmod_roundtrip");
         harness
             .create_file("meta.txt", b"metadata test")
             .expect("create_file");
@@ -1083,14 +1055,9 @@ mod tests {
 
     /// Directory round-trip: mkdir, create entries, readdir, verify.
     #[test]
+    #[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
     fn test_directory_roundtrip() {
-        let harness = match MountHarness::new() {
-            Ok(h) => h,
-            Err(e) => {
-                eprintln!("SKIP test_mount_unmount_cleanup: daemon not available -- {e}");
-                return;
-            }
-        };
+        let harness = MountHarness::new_or_fail("test_directory_roundtrip");
         harness.mkdir("subdir").expect("mkdir subdir");
         harness
             .create_file("subdir/a.txt", b"alpha")
@@ -1113,16 +1080,11 @@ mod tests {
     /// Persistence: unmount, verify backing store exists, remount,
     /// verify all files and data survive.
     #[test]
+    #[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
     fn test_persistence_roundtrip() {
         let data = b"persistent data that survives remount\n";
 
-        let mut harness = match MountHarness::new() {
-            Ok(h) => h,
-            Err(e) => {
-                eprintln!("SKIP test_persistence_roundtrip: daemon not available -- {e}");
-                return;
-            }
-        };
+        let mut harness = MountHarness::new_or_fail("test_persistence_roundtrip");
         harness
             .create_file("persist.txt", data)
             .expect("create_file session 1");
@@ -1181,17 +1143,12 @@ mod tests {
     /// Concurrent FD: open two fds on the same file, write from one,
     /// read from the other, verify visibility after flush.
     #[test]
+    #[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
     fn test_concurrent_fd_visibility() {
         use std::fs::{File, OpenOptions};
         use std::io::{Read, Seek, SeekFrom, Write};
 
-        let harness = match MountHarness::new() {
-            Ok(h) => h,
-            Err(e) => {
-                eprintln!("SKIP test_mount_unmount_cleanup: daemon not available -- {e}");
-                return;
-            }
-        };
+        let harness = MountHarness::new_or_fail("test_concurrent_fd_visibility");
         let path = harness.mounted("concurrent.txt");
 
         harness
@@ -1220,39 +1177,19 @@ mod tests {
 
     // ── remount persistence ─────────────────────────────────────────
     //
-    // These tests exercise the primary advancement gate for the
-    // `fuse-mount-rw-persistence` strategy slice:
+    // These ignored tests exercise mounted remount persistence when run
+    // explicitly with daemon, FUSE, and read-write mount substrate:
     //
     //   mount(RW) -> write -> sync -> unmount -> remount -> read -> verify
     //
-    // Prerequisites (tracked as separate Forgejo issues):
+    // Missing substrate is an explicit runtime refusal through
+    // `MountHarness::new_or_fail`, not a successful mounted product signal.
+    // Expected failure classes include:
     //
-    //   #3651  mount-vfs subcommand uses MountOption::RW by default
-    //     The daemon must spawn with a read-write FUSE mount.
-    //     The current mount-vfs subcommand already uses RW; if a
-    //     future build regresses to RO, writes will fail with a
-    //     permission-denied or read-only-fs error.
-    //
-    //   #3652  LocalFileSystem::Drop calls do_commit/sync_all
-    //     Without explicit commit on Drop, dirty writeback data
-    //     may not reach the object store before the daemon exits.
-    //     Remount reads will return zeros, stale content, or a
-    //     file-not-found error.
-    //
-    //     On remount the filesystem must reconstruct namespace,
-    //     inode metadata, and extent maps from the object store's
-    //     committed roots.  Without this the remount may not find
-    //     the previously written file at all.
-    //
-    // Expected failure modes (before all prerequisites land):
-    //
-    //   - mount fails: RO mount option (#3651)
-    //   - write succeeds, remount reads zeros or stale data (#3652)
-    //   - test harness fails to find daemon binary (build needed)
-    //
-    // Once all three prerequisites land, test_remount_persistence
-    // must pass 5/5 consecutive runs (matching the strategy
-    // advancement_criteria reliability requirement).
+    //   - daemon, FUSE, or read-write mount setup is unavailable
+    //   - write data reaches the first mount but remount reads zeros, stale
+    //     content, or a missing file because flush/reopen persistence is broken
+    //   - harness construction cannot find the daemon binary or build substrate
 
     /// Build a reproducible test buffer: `count` bytes of seeded
     /// pseudo-random data followed by a 16-byte checksum footer.
@@ -1306,7 +1243,7 @@ mod tests {
         Ok(())
     }
 
-    /// Primary advancement-gate test:
+    /// Manual mounted remount-persistence row:
     ///
     ///   mount(RW) -> write -> sync -> unmount -> remount -> read -> verify
     ///
@@ -1315,18 +1252,13 @@ mod tests {
     /// remounts the same backing store via MountHarness::remount,
     /// reads the file back, and asserts byte-for-byte equality.
     #[test]
+    #[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
     fn test_remount_persistence() {
         let seed: u64 = 0xcafef00d_deadbeef;
         let data_len: usize = 4096;
         let test_data = make_test_buffer(seed, data_len);
 
-        let mut harness = match MountHarness::new() {
-            Ok(h) => h,
-            Err(e) => {
-                eprintln!("SKIP test_remount_persistence: daemon not available -- {e}");
-                return;
-            }
-        };
+        let mut harness = MountHarness::new_or_fail("test_remount_persistence");
         harness
             .create_file("remount_test.bin", &test_data)
             .expect("create_file through FUSE mount");
@@ -1398,21 +1330,10 @@ mod tests {
     /// Verify that two MountHarness instances can coexist on different
     /// store/mount paths without interfering with each other.
     #[test]
+    #[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
     fn two_independent_harnesses() {
-        let h1 = match MountHarness::new() {
-            Ok(h) => h,
-            Err(e) => {
-                eprintln!("SKIP two_independent_harnesses: daemon not available -- {e}");
-                return;
-            }
-        };
-        let h2 = match MountHarness::new() {
-            Ok(h) => h,
-            Err(e) => {
-                eprintln!("SKIP two_independent_harnesses (h2): daemon not available -- {e}");
-                return;
-            }
-        };
+        let h1 = MountHarness::new_or_fail("two_independent_harnesses");
+        let h2 = MountHarness::new_or_fail("two_independent_harnesses");
 
         // Verify mounts are at different paths.
         assert_ne!(
@@ -1450,14 +1371,9 @@ mod tests {
 
     /// Verify that FuseMountFixture type alias works as MountHarness.
     #[test]
+    #[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
     fn fuse_mount_fixture_alias() {
-        let harness: FuseMountFixture = match MountHarness::new() {
-            Ok(h) => h,
-            Err(e) => {
-                eprintln!("SKIP fuse_mount_fixture_alias: daemon not available -- {e}");
-                return;
-            }
-        };
+        let harness: FuseMountFixture = MountHarness::new_or_fail("fuse_mount_fixture_alias");
         assert!(harness.mount_path().exists(), "mount path must exist");
     }
 }

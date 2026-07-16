@@ -3,8 +3,7 @@
 //! through a real FUSE mount, remount persistence, and the full basic-ops cycle.
 //!
 //! Uses `MountHarness` for daemon lifecycle and mountpoint operations.
-//! Gated on `feature = "fuse-basic-ops"` which transitively requires
-//! `local-filesystem`.
+//! Gated on `feature = "fuse"` which includes `local-filesystem`.
 
 #[cfg(test)]
 mod tests {
@@ -14,15 +13,14 @@ mod tests {
     /// Full basic-ops cycle: mkdir → create → write → read → unlink → rmdir
     /// → remount → verify directory is empty.
     ///
-    /// Advancement criteria 1, 3, 5:
+    /// Mounted basic-ops coverage:
     ///   - create/mkdir/rmdir/unlink complete successfully via real FUSE mount
     ///   - namespace mutations survive remount
     ///   - integration test validates the full basic-ops cycle
     #[test]
+    #[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
     fn test_basic_ops_cycle_with_remount() {
-        let Some(mut harness) = MountHarness::new_or_skip(module_path!()) else {
-            return;
-        };
+        let mut harness = MountHarness::new_or_fail("test_basic_ops_cycle_with_remount");
 
         // ── mkdir ───────────────────────────────────────────────────
         harness.mkdir("testdir").expect("mkdir testdir");
@@ -80,13 +78,12 @@ mod tests {
     /// Rename test: mkdir → rename directory → remount →
     /// verify new name exists and old name is gone.
     ///
-    /// Advancement criterion 2:
+    /// Mounted rename coverage:
     ///   - rename completes successfully via real FUSE mount
     #[test]
+    #[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
     fn test_rename_directory_with_remount() {
-        let Some(mut harness) = MountHarness::new_or_skip(module_path!()) else {
-            return;
-        };
+        let mut harness = MountHarness::new_or_fail("test_rename_directory_with_remount");
 
         // ── create source directory ─────────────────────────────────
         harness.mkdir("olddir").expect("mkdir olddir");
@@ -147,10 +144,9 @@ mod tests {
 
     /// Edge case: rmdir on a non-empty directory must fail.
     #[test]
+    #[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
     fn test_rmdir_nonempty_fails() {
-        let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
-            return;
-        };
+        let harness = MountHarness::new_or_fail("test_rmdir_nonempty_fails");
 
         harness.mkdir("dir").expect("mkdir dir");
         harness
@@ -164,10 +160,9 @@ mod tests {
 
     /// Edge case: ENOENT on rmdir of non-existent directory.
     #[test]
+    #[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
     fn test_rmdir_nonexistent_fails() {
-        let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
-            return;
-        };
+        let harness = MountHarness::new_or_fail("test_rmdir_nonexistent_fails");
 
         let full_path = harness.mount_path().join("nonexistent");
         let result = fs::remove_dir(&full_path);

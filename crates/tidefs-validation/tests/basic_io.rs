@@ -5,7 +5,9 @@
 //! and concurrent disjoint-region write integrity.
 //!
 //! These tests exercise the FUSE write dispatch path and byte-level
-//! correctness within a single mount session (no remount).
+//! correctness within a single mount session (no remount). When mounted
+//! runtime prerequisites are absent, they fail closed with explicit
+//! runtime-refusal receipts instead of returning success after skips.
 
 #[cfg(target_os = "linux")]
 use std::fs;
@@ -20,14 +22,9 @@ use tidefs_validation::mount_harness::MountHarness;
 /// verify stat fails with ENOENT.
 #[cfg(target_os = "linux")]
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn create_stat_unlink() {
-    let harness = match MountHarness::new() {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("SKIP create_stat_unlink: daemon not available -- {e}");
-            return;
-        }
-    };
+    let harness = MountHarness::new_or_fail("create_stat_unlink");
 
     let path = harness.mount_path().join("create_stat_unlink_test");
 
@@ -72,14 +69,9 @@ fn create_stat_unlink() {
 /// single mount session; no remount.
 #[cfg(target_os = "linux")]
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn write_read_verify_small() {
-    let harness = match MountHarness::new() {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("SKIP write_read_verify_small: daemon not available -- {e}");
-            return;
-        }
-    };
+    let harness = MountHarness::new_or_fail("write_read_verify_small");
 
     let path = harness.mount_path().join("wr_verify.bin");
     let size: usize = 4096;
@@ -120,14 +112,9 @@ fn write_read_verify_small() {
 ///  - File total size is 1 MiB + 4 KiB.
 #[cfg(target_os = "linux")]
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn write_read_sparse_hole() {
-    let harness = match MountHarness::new() {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("SKIP write_read_sparse_hole: daemon not available -- {e}");
-            return;
-        }
-    };
+    let harness = MountHarness::new_or_fail("write_read_sparse_hole");
 
     let path = harness.mount_path().join("sparse_hole.bin");
     let block_size: usize = 4096;
@@ -211,14 +198,9 @@ fn write_read_sparse_hole() {
 /// both complete, read back and verify both regions are intact.
 #[cfg(target_os = "linux")]
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn concurrent_write_no_corruption() {
-    let harness = match MountHarness::new() {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("SKIP concurrent_write_no_corruption: daemon not available -- {e}");
-            return;
-        }
-    };
+    let harness = MountHarness::new_or_fail("concurrent_write_no_corruption");
 
     let path = harness.mount_path().join("concurrent.bin");
     let block_size: usize = 4096;

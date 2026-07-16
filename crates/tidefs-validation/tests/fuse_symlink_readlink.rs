@@ -46,10 +46,9 @@ fn verify_target(target: &[u8], expected_hash: &[u8; 32]) -> bool {
 // Short/long/unicode targets
 
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn symlink_short_target_roundtrip() {
-    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
-        return;
-    };
+    let harness = MountHarness::new_or_fail("symlink_short_target_roundtrip");
     let target = "/usr/lib";
     let link = "short_link";
     let expected_hash = hash_target(target.as_bytes());
@@ -63,10 +62,9 @@ fn symlink_short_target_roundtrip() {
 }
 
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn symlink_relative_target_roundtrip() {
-    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
-        return;
-    };
+    let harness = MountHarness::new_or_fail("symlink_relative_target_roundtrip");
     let target = "../sibling/file.txt";
     let link = "relative_link";
     let expected_hash = hash_target(target.as_bytes());
@@ -80,10 +78,9 @@ fn symlink_relative_target_roundtrip() {
 }
 
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn symlink_absolute_target_roundtrip() {
-    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
-        return;
-    };
+    let harness = MountHarness::new_or_fail("symlink_absolute_target_roundtrip");
     let target = "/absolute/path/to/somewhere/deep";
     let link = "absolute_link";
     let expected_hash = hash_target(target.as_bytes());
@@ -97,10 +94,9 @@ fn symlink_absolute_target_roundtrip() {
 }
 
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn symlink_unicode_target_roundtrip() {
-    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
-        return;
-    };
+    let harness = MountHarness::new_or_fail("symlink_unicode_target_roundtrip");
     let target = "/mnt/donnees/depot/francais.txt";
     let link = "unicode_link";
     let expected_hash = hash_target(target.as_bytes());
@@ -114,10 +110,9 @@ fn symlink_unicode_target_roundtrip() {
 }
 
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn symlink_target_with_spaces_and_special_chars() {
-    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
-        return;
-    };
+    let harness = MountHarness::new_or_fail("symlink_target_with_spaces_and_special_chars");
     let target = "/path/with spaces/and-dashes_and.mixed!chars";
     let link = "special_link";
     let expected_hash = hash_target(target.as_bytes());
@@ -133,10 +128,9 @@ fn symlink_target_with_spaces_and_special_chars() {
 // PATH_MAX boundary tests
 
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn symlink_target_at_pathmax_boundary() {
-    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
-        return;
-    };
+    let harness = MountHarness::new_or_fail("symlink_target_at_pathmax_boundary");
     let target = vec![b'/'; 4095];
     let target_path = Path::new(std::ffi::OsStr::from_bytes(&target));
     let link = "pathmax_link_4095";
@@ -151,10 +145,9 @@ fn symlink_target_at_pathmax_boundary() {
 }
 
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn symlink_target_one_under_pathmax() {
-    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
-        return;
-    };
+    let harness = MountHarness::new_or_fail("symlink_target_one_under_pathmax");
     let target = vec![b'x'; 4094];
     let target_path = Path::new(std::ffi::OsStr::from_bytes(&target));
     let link = "near_pathmax_link";
@@ -171,10 +164,9 @@ fn symlink_target_one_under_pathmax() {
 // Dangling symlinks
 
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn dangling_symlink_created_and_resolved() {
-    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
-        return;
-    };
+    let harness = MountHarness::new_or_fail("dangling_symlink_created_and_resolved");
     let target = "/nonexistent/path/that/does/not/exist";
     let link = "dangling_link";
     let expected_hash = hash_target(target.as_bytes());
@@ -189,10 +181,9 @@ fn dangling_symlink_created_and_resolved() {
 }
 
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn symlink_to_self() {
-    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
-        return;
-    };
+    let harness = MountHarness::new_or_fail("symlink_to_self");
     let link = "self_link";
 
     harness.symlink("self_link", link).expect("symlink to self");
@@ -209,10 +200,9 @@ fn symlink_to_self() {
 // Symlink chains
 
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn symlink_chain_three_links() {
-    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
-        return;
-    };
+    let harness = MountHarness::new_or_fail("symlink_chain_three_links");
     let leaf_target = "/final/destination";
 
     harness.symlink("chain_b", "chain_a").expect("A->B");
@@ -233,10 +223,9 @@ fn symlink_chain_three_links() {
 }
 
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn symlink_chain_length_five() {
-    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
-        return;
-    };
+    let harness = MountHarness::new_or_fail("symlink_chain_length_five");
     let leaf = "/leaf";
 
     harness.symlink("l2", "l1").expect("1->2");
@@ -269,10 +258,9 @@ fn symlink_chain_length_five() {
 // Overwrite existing symlink
 
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn overwrite_existing_symlink() {
-    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
-        return;
-    };
+    let harness = MountHarness::new_or_fail("overwrite_existing_symlink");
     let first_target = "/first/target";
     let second_target = "/second/target";
     let link = "overwrite_me";
@@ -296,10 +284,9 @@ fn overwrite_existing_symlink() {
 }
 
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn symlink_overwrite_via_unlink_then_create() {
-    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
-        return;
-    };
+    let harness = MountHarness::new_or_fail("symlink_overwrite_via_unlink_then_create");
     let link = "replace_me";
 
     for (i, target) in ["/t1", "/t2", "/t3"].iter().enumerate() {
@@ -321,10 +308,9 @@ fn symlink_overwrite_via_unlink_then_create() {
 // Inode attribute consistency
 
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn symlink_inode_is_symlink_type() {
-    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
-        return;
-    };
+    let harness = MountHarness::new_or_fail("symlink_inode_is_symlink_type");
     let target = "/some/target";
     let link = "type_check_link";
 
@@ -335,10 +321,9 @@ fn symlink_inode_is_symlink_type() {
 }
 
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn symlink_inode_size_equals_target_length() {
-    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
-        return;
-    };
+    let harness = MountHarness::new_or_fail("symlink_inode_size_equals_target_length");
     let target = "/a/target/path/of/known/length";
     let link = "size_check_link";
 
@@ -352,10 +337,9 @@ fn symlink_inode_size_equals_target_length() {
 }
 
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn symlink_inode_mode_defaults_to_0777() {
-    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
-        return;
-    };
+    let harness = MountHarness::new_or_fail("symlink_inode_mode_defaults_to_0777");
     let target = "/target";
     let link = "mode_check_link";
 
@@ -370,10 +354,9 @@ fn symlink_inode_mode_defaults_to_0777() {
 }
 
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn symlink_inode_nlink_is_one() {
-    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
-        return;
-    };
+    let harness = MountHarness::new_or_fail("symlink_inode_nlink_is_one");
     let target = "/target";
     let link = "nlink_check_link";
 
@@ -383,12 +366,11 @@ fn symlink_inode_nlink_is_one() {
 }
 
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn symlink_timestamps_set_on_creation() {
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
-        return;
-    };
+    let harness = MountHarness::new_or_fail("symlink_timestamps_set_on_creation");
     let target = "/timestamped";
     let link = "ts_link";
 
@@ -411,10 +393,9 @@ fn symlink_timestamps_set_on_creation() {
 }
 
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn multiple_symlinks_have_distinct_inodes() {
-    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
-        return;
-    };
+    let harness = MountHarness::new_or_fail("multiple_symlinks_have_distinct_inodes");
     let mut inodes = HashSet::new();
 
     for i in 0..5 {
@@ -432,10 +413,9 @@ fn multiple_symlinks_have_distinct_inodes() {
 // Error-path coverage
 
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn readlink_on_nonexistent_path_returns_enoent() {
-    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
-        return;
-    };
+    let harness = MountHarness::new_or_fail("readlink_on_nonexistent_path_returns_enoent");
     let result = harness.readlink("no_such_symlink");
     assert!(result.is_err(), "readlink on nonexistent must fail");
     let err = result.unwrap_err();
@@ -448,10 +428,9 @@ fn readlink_on_nonexistent_path_returns_enoent() {
 }
 
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn readlink_on_regular_file_returns_einval() {
-    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
-        return;
-    };
+    let harness = MountHarness::new_or_fail("readlink_on_regular_file_returns_einval");
     harness
         .create_file("regular.txt", b"contents\n")
         .expect("create file");
@@ -467,10 +446,9 @@ fn readlink_on_regular_file_returns_einval() {
 }
 
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn readlink_on_directory_returns_einval() {
-    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
-        return;
-    };
+    let harness = MountHarness::new_or_fail("readlink_on_directory_returns_einval");
     harness.mkdir("adir").expect("mkdir");
 
     let result = harness.readlink("adir");
@@ -484,10 +462,10 @@ fn readlink_on_directory_returns_einval() {
 }
 
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn symlink_creation_under_nonexistent_parent_returns_enoent() {
-    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
-        return;
-    };
+    let harness =
+        MountHarness::new_or_fail("symlink_creation_under_nonexistent_parent_returns_enoent");
     let result = harness.symlink("/t", "no_parent/link");
     assert!(
         result.is_err(),
@@ -502,10 +480,10 @@ fn symlink_creation_under_nonexistent_parent_returns_enoent() {
 }
 
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn symlink_creation_where_parent_is_file_returns_enotdir() {
-    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
-        return;
-    };
+    let harness =
+        MountHarness::new_or_fail("symlink_creation_where_parent_is_file_returns_enotdir");
     harness
         .create_file("notadir", b"blocking\n")
         .expect("create file");
@@ -523,10 +501,9 @@ fn symlink_creation_where_parent_is_file_returns_enotdir() {
 // Concurrent symlink create/readlink stress
 
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn concurrent_symlink_create_readlink_stress() {
-    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
-        return;
-    };
+    let harness = MountHarness::new_or_fail("concurrent_symlink_create_readlink_stress");
     let harness = Arc::new(harness);
     let mut handles = Vec::new();
 
@@ -582,10 +559,9 @@ fn blake3_domain_isolation() {
 // Symlink -> readlink -> target integrity with BLAKE3 comprehensive
 
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn comprehensive_target_integrity_matrix() {
-    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
-        return;
-    };
+    let harness = MountHarness::new_or_fail("comprehensive_target_integrity_matrix");
 
     let cases: &[(&str, &str)] = &[
         ("a", "/t"),
@@ -626,10 +602,9 @@ fn comprehensive_target_integrity_matrix() {
 // Symlink name validation through FUSE
 
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn symlink_name_validation_via_fuse() {
-    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
-        return;
-    };
+    let harness = MountHarness::new_or_fail("symlink_name_validation_via_fuse");
 
     harness.symlink("/t", "valid_name").expect("valid name");
     harness
@@ -647,10 +622,9 @@ fn symlink_name_validation_via_fuse() {
 // Symlink readlink cross-validation after mount
 
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn symlink_persists_in_directory_listing() {
-    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
-        return;
-    };
+    let harness = MountHarness::new_or_fail("symlink_persists_in_directory_listing");
 
     let names: &[&str] = &["alink", "blink", "clink"];
     for name in names {
@@ -669,10 +643,9 @@ fn symlink_persists_in_directory_listing() {
 }
 
 #[test]
+#[ignore = "requires mounted TideFS runtime substrate; run explicitly with daemon/FUSE available"]
 fn symlink_size_matches_target_length_varied() {
-    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
-        return;
-    };
+    let harness = MountHarness::new_or_fail("symlink_size_matches_target_length_varied");
 
     let targets: &[&[u8]] = &[
         b"/",
