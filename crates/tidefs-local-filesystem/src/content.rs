@@ -28,10 +28,13 @@ use crate::object_keys::{
 use crate::types::*;
 use crate::{ContentChunkObject, ContentChunkRef, ContentLayout, ContentManifestObject, Result};
 
-/// Trait abstracting content-store writes so that write functions can
-/// accept either a receipt-producing [`PoolStoreMut`] (VFS write path) or
-/// a raw [`LocalObjectStore`] (transaction serialisation path).
+/// Trait abstracting content-store I/O so that mutation functions can accept
+/// either a receipt-producing [`PoolStoreMut`] (VFS write path) or a raw
+/// [`LocalObjectStore`] (transaction serialisation path). Reads through
+/// [`ContentWriteStore::get`] preserve the selected store's transform route.
 pub(crate) trait ContentWriteStore {
+    fn get(&self, key: ObjectKey) -> Result<Option<Vec<u8>>>;
+
     fn put_with_receipt(
         &mut self,
         key: ObjectKey,
@@ -47,6 +50,10 @@ pub(crate) trait ContentWriteStore {
 }
 
 impl<'a> ContentWriteStore for PoolStoreMut<'a> {
+    fn get(&self, key: ObjectKey) -> Result<Option<Vec<u8>>> {
+        Ok(PoolStoreMut::get(self, key)?)
+    }
+
     fn put_with_receipt(
         &mut self,
         key: ObjectKey,
@@ -69,6 +76,10 @@ impl<'a> ContentWriteStore for PoolStoreMut<'a> {
 }
 
 impl<'a> ContentWriteStore for &'a mut LocalObjectStore {
+    fn get(&self, key: ObjectKey) -> Result<Option<Vec<u8>>> {
+        Ok(LocalObjectStore::get(self, key)?)
+    }
+
     fn put_with_receipt(
         &mut self,
         key: ObjectKey,
@@ -104,6 +115,10 @@ impl<'a> ContentWriteStore for &'a mut LocalObjectStore {
 }
 
 impl ContentWriteStore for LocalObjectStore {
+    fn get(&self, key: ObjectKey) -> Result<Option<Vec<u8>>> {
+        Ok(LocalObjectStore::get(self, key)?)
+    }
+
     fn put_with_receipt(
         &mut self,
         key: ObjectKey,
@@ -515,12 +530,54 @@ pub(crate) fn read_content_layout_from_store(
     record: &InodeRecord,
     allow_v0390_fixed_content: bool,
 ) -> Result<ContentLayout> {
-    let bytes = match store.get(content_object_key_for_version(
+    read_content_layout_with_get(
+        |key| Ok(store.get(key)?),
+        inode_id,
+        record,
+        allow_v0390_fixed_content,
+    )
+}
+
+fn read_content_layout_from_write_store<S: ContentWriteStore + ?Sized>(
+    store: &S,
+    inode_id: InodeId,
+    record: &InodeRecord,
+    allow_v0390_fixed_content: bool,
+) -> Result<ContentLayout> {
+    read_content_layout_with_get(
+        |key| store.get(key),
+        inode_id,
+        record,
+        allow_v0390_fixed_content,
+    )
+}
+
+pub(crate) fn read_content_layout_from_pool(
+    pool: &Pool,
+    inode_id: InodeId,
+    record: &InodeRecord,
+    allow_v0390_fixed_content: bool,
+) -> Result<ContentLayout> {
+    read_content_layout_with_get(
+        |key| Ok(pool.get(DeviceIoClass::Data, key)?),
+        inode_id,
+        record,
+        allow_v0390_fixed_content,
+    )
+}
+
+fn read_content_layout_with_get(
+    mut get: impl FnMut(ObjectKey) -> Result<Option<Vec<u8>>>,
+    inode_id: InodeId,
+    record: &InodeRecord,
+    allow_v0390_fixed_content: bool,
+) -> Result<ContentLayout> {
+    let bytes = match get(content_object_key_for_version(
         inode_id,
         record.data_version,
     ))? {
         Some(bytes) => bytes,
-        None if allow_v0390_fixed_content => match store.get(content_object_key(inode_id))? {
+        None if allow_v0390_fixed_content => match get(content_object_key(inode_id))? {
             Some(bytes) => bytes,
             None if record.size == 0 => {
                 return Ok(empty_chunked_layout(inode_id, record.data_version));
@@ -531,42 +588,6 @@ pub(crate) fn read_content_layout_from_store(
                 })
             }
         },
-        None if record.size == 0 => {
-            return Ok(empty_chunked_layout(inode_id, record.data_version));
-        }
-        None => {
-            return Err(FileSystemError::CorruptState {
-                reason: "file-like inode is missing its versioned content object",
-            })
-        }
-    };
-    decode_and_validate_content_layout(inode_id, record, &bytes)
-}
-
-pub(crate) fn read_content_layout_from_pool(
-    pool: &Pool,
-    inode_id: InodeId,
-    record: &InodeRecord,
-    allow_v0390_fixed_content: bool,
-) -> Result<ContentLayout> {
-    let bytes = match pool.get(
-        DeviceIoClass::Data,
-        content_object_key_for_version(inode_id, record.data_version),
-    )? {
-        Some(bytes) => bytes,
-        None if allow_v0390_fixed_content => {
-            match pool.get(DeviceIoClass::Data, content_object_key(inode_id))? {
-                Some(bytes) => bytes,
-                None if record.size == 0 => {
-                    return Ok(empty_chunked_layout(inode_id, record.data_version));
-                }
-                None => {
-                    return Err(FileSystemError::CorruptState {
-                        reason: "file-like inode is missing its content object",
-                    })
-                }
-            }
-        }
         None if record.size == 0 => {
             return Ok(empty_chunked_layout(inode_id, record.data_version));
         }
@@ -747,6 +768,29 @@ fn try_validate_chunk_bytes(
     chunk_ref: &ContentChunkRef,
     raw_bytes: &[u8],
 ) -> Option<(ContentChunkObject, bool)> {
+    try_validate_chunk_bytes_with_get(inode_id, chunk_ref, raw_bytes, |canonical_key| match pool {
+        Some(pool) => pool.get(DeviceIoClass::Data, canonical_key).ok().flatten(),
+        None => store.get(canonical_key).ok().flatten(),
+    })
+}
+
+fn try_validate_chunk_bytes_from_write_store<S: ContentWriteStore + ?Sized>(
+    store: &S,
+    inode_id: InodeId,
+    chunk_ref: &ContentChunkRef,
+    raw_bytes: &[u8],
+) -> Option<(ContentChunkObject, bool)> {
+    try_validate_chunk_bytes_with_get(inode_id, chunk_ref, raw_bytes, |canonical_key| {
+        store.get(canonical_key).ok().flatten()
+    })
+}
+
+fn try_validate_chunk_bytes_with_get(
+    inode_id: InodeId,
+    chunk_ref: &ContentChunkRef,
+    raw_bytes: &[u8],
+    read_canonical: impl FnOnce(ObjectKey) -> Option<Vec<u8>>,
+) -> Option<(ContentChunkObject, bool)> {
     // Checksum the raw stored bytes first. For dedup redirects this is
     // the redirect payload, not the resolved canonical data, matching
     // how checksum is computed in all write paths.
@@ -756,10 +800,7 @@ fn try_validate_chunk_bytes(
     let resolved_vec;
     let (chunk_bytes, resolved_via_dedup) = if is_dedup_redirect(raw_bytes) {
         let canonical_key = decode_dedup_redirect(raw_bytes).ok()?;
-        resolved_vec = match pool {
-            Some(pool) => pool.get(DeviceIoClass::Data, canonical_key).ok()??,
-            None => store.get(canonical_key).ok()??,
-        };
+        resolved_vec = read_canonical(canonical_key)?;
         (resolved_vec.as_slice(), true)
     } else {
         (raw_bytes, false)
@@ -803,6 +844,64 @@ fn try_self_heal_chunk(
         }
     }
     None
+}
+
+fn try_self_heal_chunk_from_write_store<S: ContentWriteStore + ?Sized>(
+    store: &S,
+    inode_id: InodeId,
+    chunk_ref: &ContentChunkRef,
+    key: ObjectKey,
+) -> Option<ContentChunkObject> {
+    for location in store
+        .raw_store()
+        .version_locations_of(key)
+        .into_iter()
+        .rev()
+    {
+        let candidate = store.raw_store().get_at_location(location).ok()?;
+        if let Some((chunk, _dedup)) =
+            try_validate_chunk_bytes_from_write_store(store, inode_id, chunk_ref, &candidate)
+        {
+            return Some(chunk);
+        }
+    }
+    None
+}
+
+fn read_content_chunk_from_write_store<S: ContentWriteStore + ?Sized>(
+    store: &S,
+    inode_id: InodeId,
+    chunk_ref: &ContentChunkRef,
+) -> Result<ContentChunkObject> {
+    if chunk_ref.is_hole() {
+        return Ok(ContentChunkObject {
+            inode_id,
+            data_version: 0,
+            chunk_index: chunk_ref.chunk_index,
+            bytes: vec![0_u8; chunk_ref.len as usize],
+        });
+    }
+
+    let key = content_chunk_object_key_for_version(
+        inode_id,
+        chunk_ref.data_version,
+        chunk_ref.chunk_index,
+    );
+    let bytes = store.get(key)?.ok_or(FileSystemError::CorruptState {
+        reason: "content manifest references a missing chunk object",
+    })?;
+    if let Some((chunk, _dedup)) =
+        try_validate_chunk_bytes_from_write_store(store, inode_id, chunk_ref, &bytes)
+    {
+        return Ok(chunk);
+    }
+    if let Some(chunk) = try_self_heal_chunk_from_write_store(store, inode_id, chunk_ref, key) {
+        return Ok(chunk);
+    }
+
+    Err(FileSystemError::CorruptState {
+        reason: "content chunk checksum mismatch (all historical versions also corrupt)",
+    })
 }
 
 pub(crate) fn read_content_chunk_from_store(
@@ -1182,7 +1281,7 @@ fn write_same_size_sparse_overlay<S: ContentWriteStore>(
 
         let mut chunk_bytes = vec![0_u8; chunk_len];
         copy_old_content_into_chunk(
-            store.raw_store(),
+            store,
             old_layout,
             old_record.size,
             chunk_index,
@@ -1292,7 +1391,7 @@ fn write_same_size_sparse_patch_batch<S: ContentWriteStore>(
 
         let mut chunk_bytes = vec![0_u8; new_len as usize];
         copy_old_content_into_chunk(
-            store.raw_store(),
+            store,
             old_layout,
             old_record.size,
             old_ref.chunk_index,
@@ -1354,7 +1453,7 @@ fn write_same_size_sparse_patch_batch<S: ContentWriteStore>(
 
         let mut chunk_bytes = vec![0_u8; chunk_len];
         copy_old_content_into_chunk(
-            store.raw_store(),
+            store,
             old_layout,
             old_record.size,
             chunk_index,
@@ -1443,8 +1542,7 @@ fn write_sparse_size_change<S: ContentWriteStore>(
             continue;
         }
 
-        let old_chunk =
-            read_content_chunk_from_store(store.raw_store(), new_record.inode_id, old_ref, None)?;
+        let old_chunk = read_content_chunk_from_write_store(store, new_record.inode_id, old_ref)?;
         let mut chunk_bytes = old_chunk.bytes.to_vec();
         chunk_bytes.resize(expected_len as usize, 0);
 
@@ -1540,7 +1638,7 @@ fn write_sparse_size_changing_overlay<S: ContentWriteStore>(
 
         let mut chunk_bytes = vec![0_u8; new_len as usize];
         copy_old_content_into_chunk(
-            store.raw_store(),
+            store,
             old_layout,
             old_record.size,
             old_ref.chunk_index,
@@ -1599,7 +1697,7 @@ fn write_sparse_size_changing_overlay<S: ContentWriteStore>(
 
             let mut chunk_bytes = vec![0_u8; chunk_len];
             copy_old_content_into_chunk(
-                store.raw_store(),
+                store,
                 old_layout,
                 old_record.size,
                 chunk_index,
@@ -1676,7 +1774,7 @@ pub(crate) fn write_chunked_content_with_overlay<S: ContentWriteStore>(
         mut quorum_store,
         compression_policy,
     } = request;
-    let old_layout = read_content_layout_from_store(store.raw_store(), inode_id, old_record, true)?;
+    let old_layout = read_content_layout_from_write_store(store, inode_id, old_record, true)?;
     if allow_holes && overlay_bytes.is_empty() {
         if let ContentLayout::Chunked(ref old_manifest) = old_layout {
             return write_sparse_size_change(
@@ -1766,7 +1864,7 @@ pub(crate) fn write_chunked_content_with_overlay<S: ContentWriteStore>(
         let chunk_len = content_chunk_len(new_record.size, chunk_index)? as usize;
         let mut chunk_bytes = vec![0_u8; chunk_len];
         copy_old_content_into_chunk(
-            store.raw_store(),
+            store,
             &old_layout,
             old_record.size,
             chunk_index,
@@ -1853,7 +1951,7 @@ pub(crate) fn write_chunked_content_with_patch_batch<S: ContentWriteStore>(
         quorum_store,
         compression_policy,
     } = request;
-    let old_layout = read_content_layout_from_store(store.raw_store(), inode_id, old_record, true)?;
+    let old_layout = read_content_layout_from_write_store(store, inode_id, old_record, true)?;
     if allow_holes && old_record.size <= new_record.size {
         if let ContentLayout::Chunked(ref old_manifest) = old_layout {
             return write_same_size_sparse_patch_batch(
@@ -1889,7 +1987,7 @@ pub(crate) fn punch_hole_content<S: ContentWriteStore>(
         mut quorum_store,
         compression_policy,
     } = request;
-    let old_layout = read_content_layout_from_store(store.raw_store(), inode_id, old_record, true)?;
+    let old_layout = read_content_layout_from_write_store(store, inode_id, old_record, true)?;
 
     // Handle inline content: zero the hole range in-place and re-encode.
     if let ContentLayout::Inline(ref content) = old_layout {
@@ -1937,8 +2035,7 @@ pub(crate) fn punch_hole_content<S: ContentWriteStore>(
         } else if !old_ref.is_hole() {
             // Chunk partially overlaps the hole: read the chunk, zero the
             // hole bytes, and write a modified chunk under the new data version.
-            let old_chunk =
-                read_content_chunk_from_store(store.raw_store(), inode_id, old_ref, None)?;
+            let old_chunk = read_content_chunk_from_write_store(store, inode_id, old_ref)?;
             let mut modified = old_chunk.bytes.to_vec();
             let zero_start = hole_offset.saturating_sub(chunk_start);
             let zero_start_idx = usize::try_from(zero_start).unwrap_or(0);
@@ -2026,8 +2123,8 @@ pub(crate) fn retained_content_chunk_ref(
     Ok(Some(old_ref.clone()))
 }
 
-pub(crate) fn copy_old_content_into_chunk(
-    store: &LocalObjectStore,
+pub(crate) fn copy_old_content_into_chunk<S: ContentWriteStore + ?Sized>(
+    store: &S,
     old_layout: &ContentLayout,
     old_size: u64,
     chunk_index: u64,
@@ -2041,7 +2138,7 @@ pub(crate) fn copy_old_content_into_chunk(
     let copy_len = chunk_bytes
         .len()
         .min(usize::try_from(available).unwrap_or(usize::MAX));
-    let old_bytes = read_content_range_from_layout(store, old_layout, chunk_start, copy_len, None)?;
+    let old_bytes = read_content_range_from_write_store(store, old_layout, chunk_start, copy_len)?;
     chunk_bytes[..old_bytes.len()].copy_from_slice(&old_bytes);
     Ok(())
 }
@@ -2170,6 +2267,28 @@ pub(crate) fn read_content_range_from_layout(
     len: usize,
     pool: Option<&Pool>,
 ) -> Result<Vec<u8>> {
+    read_content_range_with(layout, offset, len, |inode_id, chunk_ref| {
+        read_content_chunk_from_store(store, inode_id, chunk_ref, pool)
+    })
+}
+
+fn read_content_range_from_write_store<S: ContentWriteStore + ?Sized>(
+    store: &S,
+    layout: &ContentLayout,
+    offset: u64,
+    len: usize,
+) -> Result<Vec<u8>> {
+    read_content_range_with(layout, offset, len, |inode_id, chunk_ref| {
+        read_content_chunk_from_write_store(store, inode_id, chunk_ref)
+    })
+}
+
+fn read_content_range_with(
+    layout: &ContentLayout,
+    offset: u64,
+    len: usize,
+    mut read_chunk: impl FnMut(InodeId, &ContentChunkRef) -> Result<ContentChunkObject>,
+) -> Result<Vec<u8>> {
     if len == 0 {
         return Ok(Vec::new());
     }
@@ -2223,8 +2342,7 @@ pub(crate) fn read_content_range_from_layout(
                         continue;
                     }
 
-                    let chunk =
-                        read_content_chunk_from_store(store, manifest.inode_id, chunk_ref, pool)?;
+                    let chunk = read_chunk(manifest.inode_id, chunk_ref)?;
                     if in_chunk > chunk.bytes.len() {
                         return Err(FileSystemError::CorruptState {
                             reason: "content range starts beyond chunk length",
@@ -2385,7 +2503,7 @@ pub(crate) fn reflink_chunked_content<S: ContentWriteStore>(
     compression_policy: &ContentCompressionPolicy,
 ) -> Result<()> {
     let source_layout =
-        read_content_layout_from_store(store.raw_store(), source_inode_id, source_record, true)?;
+        read_content_layout_from_write_store(store, source_inode_id, source_record, true)?;
     match source_layout {
         ContentLayout::Inline(content) => {
             // Inline content cannot be shared at the chunk level; write the
@@ -2419,12 +2537,8 @@ pub(crate) fn reflink_chunked_content<S: ContentWriteStore>(
                         ));
                         continue;
                     }
-                    let src_chunk = read_content_chunk_from_store(
-                        store.raw_store(),
-                        source_inode_id,
-                        src_chunk_ref,
-                        None,
-                    )?;
+                    let src_chunk =
+                        read_content_chunk_from_write_store(store, source_inode_id, src_chunk_ref)?;
                     let dest_chunk_key = content_chunk_object_key_for_version(
                         dest_record.inode_id,
                         dest_record.data_version,
@@ -2476,7 +2590,6 @@ pub(crate) fn reflink_chunked_content<S: ContentWriteStore>(
                 );
                 let src_encoded =
                     store
-                        .raw_store()
                         .get(src_chunk_key)?
                         .ok_or(FileSystemError::CorruptState {
                             reason: "reflink: source chunk object missing",
@@ -2486,14 +2599,9 @@ pub(crate) fn reflink_chunked_content<S: ContentWriteStore>(
                     // Source already has a dedup redirect; chain to the same
                     // canonical key and add the fingerprint to the local index.
                     let ck = decode_dedup_redirect(&src_encoded)?;
-                    let canon_bytes =
-                        store
-                            .raw_store()
-                            .get(ck)?
-                            .ok_or(FileSystemError::CorruptState {
-                                reason:
-                                    "reflink: dedup redirect references missing canonical chunk",
-                            })?;
+                    let canon_bytes = store.get(ck)?.ok_or(FileSystemError::CorruptState {
+                        reason: "reflink: dedup redirect references missing canonical chunk",
+                    })?;
                     let chunk = decode_content_chunk(&canon_bytes)?;
                     let fp = crate::encoding::compute_content_fingerprint(&chunk.bytes);
                     // Existing canonical: increment refcount for this new redirect.
@@ -2508,7 +2616,7 @@ pub(crate) fn reflink_chunked_content<S: ContentWriteStore>(
                     let fp = crate::encoding::compute_content_fingerprint(&chunk.bytes);
                     let ck = crate::object_keys::content_dedup_object_key(&fp);
                     // Only store the canonical chunk if it's not already there
-                    let canonical_existed = store.raw_store().get(ck)?.is_some();
+                    let canonical_existed = store.get(ck)?.is_some();
                     if !canonical_existed {
                         store.put(ck, &src_encoded)?;
                         crate::dedup_refcount::DedupRefCount::init(store.raw_store_mut(), &fp)?;
@@ -2615,6 +2723,44 @@ mod tests {
             &StoreOptions::test_fast(),
         )
         .expect("create temp pool")
+    }
+
+    struct RoutedReadStore {
+        raw: LocalObjectStore,
+        routed: BTreeMap<ObjectKey, Vec<u8>>,
+    }
+
+    impl ContentWriteStore for RoutedReadStore {
+        fn get(&self, key: ObjectKey) -> Result<Option<Vec<u8>>> {
+            if let Some(bytes) = self.routed.get(&key) {
+                return Ok(Some(bytes.clone()));
+            }
+            Ok(self.raw.get(key)?)
+        }
+
+        fn put_with_receipt(
+            &mut self,
+            key: ObjectKey,
+            payload: &[u8],
+        ) -> Result<(StoredObject, PlacementReceipt)> {
+            <LocalObjectStore as ContentWriteStore>::put_with_receipt(&mut self.raw, key, payload)
+        }
+
+        fn put(&mut self, key: ObjectKey, payload: &[u8]) -> Result<StoredObject> {
+            <LocalObjectStore as ContentWriteStore>::put(&mut self.raw, key, payload)
+        }
+
+        fn contains_key(&self, key: ObjectKey) -> bool {
+            self.routed.contains_key(&key) || self.raw.contains_key(key)
+        }
+
+        fn raw_store(&self) -> &LocalObjectStore {
+            &self.raw
+        }
+
+        fn raw_store_mut(&mut self) -> &mut LocalObjectStore {
+            &mut self.raw
+        }
     }
 
     fn test_record(inode_id: u64, data_version: u64, size: u64) -> InodeRecord {
@@ -3023,6 +3169,76 @@ mod tests {
             .expect("read tail byte from implicit sparse chunk");
 
         assert_eq!(bytes, vec![0]);
+    }
+
+    #[test]
+    fn sparse_overlay_reads_existing_bytes_through_write_store_route() {
+        let payload = b"old routed sparse content".to_vec();
+        let old_record = test_record(77, 1, payload.len() as u64);
+        let new_record = test_record(77, 2, payload.len() as u64);
+        let encoded =
+            encode_content_chunk(&old_record, 0, &payload, &ContentCompressionPolicy::off());
+        let chunk_ref = ContentChunkRef {
+            chunk_index: 0,
+            data_version: old_record.data_version,
+            len: payload.len() as u32,
+            checksum: checksum64(&encoded),
+            placement_receipt_generation: 0,
+        };
+        let manifest = ContentManifestObject {
+            inode_id: old_record.inode_id,
+            data_version: old_record.data_version,
+            file_size: old_record.size,
+            chunk_size: content_chunk_size(),
+            chunks: vec![chunk_ref],
+        };
+        let old_layout_key =
+            content_object_key_for_version(old_record.inode_id, old_record.data_version);
+        let old_chunk_key =
+            content_chunk_object_key_for_version(old_record.inode_id, old_record.data_version, 0);
+        let mut routed = BTreeMap::new();
+        routed.insert(old_layout_key, encode_content_manifest_sparse(&manifest));
+        routed.insert(old_chunk_key, encoded);
+        let mut store = RoutedReadStore {
+            raw: temp_store("routed-sparse-overlay-empty-raw"),
+            routed,
+        };
+        assert!(store
+            .raw
+            .get(old_layout_key)
+            .expect("check raw old layout")
+            .is_none());
+        assert!(store
+            .raw
+            .get(old_chunk_key)
+            .expect("check raw old chunk")
+            .is_none());
+
+        let overlay_offset = 4_u64;
+        let overlay = b"pool";
+        let mut dedup_index = DedupIndex::new();
+        write_chunked_content_with_overlay(WriteChunkedContentOverlay {
+            dedup_enabled: false,
+            store: &mut store,
+            inode_id: old_record.inode_id,
+            old_record: &old_record,
+            new_record: &new_record,
+            overlay_offset,
+            overlay_bytes: overlay,
+            allow_holes: true,
+            dedup_index: &mut dedup_index,
+            quorum_store: None,
+            compression_policy: &ContentCompressionPolicy::off(),
+        })
+        .expect("rewrite sparse content through routed reads");
+
+        let mut expected = payload;
+        expected[overlay_offset as usize..overlay_offset as usize + overlay.len()]
+            .copy_from_slice(overlay);
+        let rewritten =
+            read_content_from_store(&store.raw, new_record.inode_id, &new_record, false, None)
+                .expect("read rewritten sparse content");
+        assert_eq!(rewritten, expected);
     }
 
     #[test]
