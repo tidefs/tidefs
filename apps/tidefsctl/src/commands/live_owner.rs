@@ -686,10 +686,21 @@ fn send_live_owner_request_at(
     }
     validate_live_owner_response_envelope(&response)?;
     match response.body {
-        LivePoolAdminResponseBody::BytesHex { bytes_hex, bytes } => {
-            let response_json = live_owner_bytes_json(&bytes_hex, bytes);
-            validate_required_owner_evidence(route, &response_json)?;
+        LivePoolAdminResponseBody::BytesHex {
+            bytes_hex,
+            bytes: declared_bytes,
+        } => {
             let bytes = decode_live_owner_hex(&bytes_hex)?;
+            if bytes.len() != declared_bytes {
+                return Err(live_admin_error_to_request_error(
+                    LivePoolAdminError::malformed(format!(
+                        "live-owner byte response length mismatch: declared {declared_bytes}, decoded {}",
+                        bytes.len()
+                    )),
+                ));
+            }
+            let response_json = live_owner_bytes_json(&bytes_hex, declared_bytes);
+            validate_required_owner_evidence(route, &response_json)?;
             if route.json {
                 let out = serde_json::json!({
                     "ok": true,
@@ -1888,6 +1899,52 @@ mod tests {
                 assert_eq!(
                     message,
                     "live-owner response exit code is inconsistent with response body"
+                );
+                assert_eq!(
+                    detail
+                        .as_ref()
+                        .and_then(|value| value.get("kind"))
+                        .and_then(serde_json::Value::as_str),
+                    Some("malformed")
+                );
+            }
+            LiveOwnerRequestError::Unavailable(message) => {
+                panic!("reachable owner should return typed malformed refusal, got {message}");
+            }
+        }
+    }
+
+    #[test]
+    fn live_owner_byte_response_rejects_declared_length_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("owner.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        write_owner_manifest(dir.path(), &socket_path);
+        let response = LivePoolAdminResponse::ok_bytes_hex("00", 2);
+        let handle = spawn_owner_response(listener, response);
+        let route = LivePoolRoute {
+            command: "snapshot",
+            operation: "send",
+            pool: "tank",
+            pool_uuid: Some([0x42; 16]),
+            json: true,
+            args: LivePoolAdminArgs::default(),
+        };
+
+        let err = send_live_owner_request_at(dir.path(), &route).unwrap_err();
+        let request = handle.join().unwrap();
+
+        assert_eq!(request.command, LivePoolAdminCommand::SnapshotSend);
+        match err {
+            LiveOwnerRequestError::Owner {
+                exit_code,
+                message,
+                detail,
+            } => {
+                assert_eq!(exit_code, 2);
+                assert_eq!(
+                    message,
+                    "live-owner byte response length mismatch: declared 2, decoded 1"
                 );
                 assert_eq!(
                     detail
