@@ -2826,11 +2826,18 @@ fn run_smoke_mount(config: SmokeMountConfig) -> Result<(), String> {
         Ok(())
     });
 
+    let lock_file_c = std::ffi::CString::new(lock_file.as_str())
+        .map_err(|e| format!("lock file CString: {e}"))?;
+    let open_lock_file = || {
+        // SAFETY: `lock_file_c` owns a NUL-terminated buffer that remains alive
+        // for every call through this closure. Each nonnegative descriptor
+        // returned by `open` is owned by the calling lock probe.
+        unsafe { libc::open(lock_file_c.as_ptr(), libc::O_RDWR) }
+    };
+
     // POSIX F_SETLK non-blocking write-lock acquire.
     smoke_test!("phase6_posix_setlk_write_acquire", {
-        // SAFETY: Audit note: #1447 tracks converting this Rust `String`
-        // pointer to a NUL-terminated C string before calling `open`.
-        let fd = unsafe { libc::open(lock_file.as_ptr() as *const libc::c_char, libc::O_RDWR) };
+        let fd = open_lock_file();
         if fd < 0 {
             // SAFETY: errno is read immediately after the failing open on this
             // thread.
@@ -2869,9 +2876,7 @@ fn run_smoke_mount(config: SmokeMountConfig) -> Result<(), String> {
     // POSIX F_SETLK write-lock conflict: overlapping write locks from
     // two file descriptors should return EAGAIN/EWOULDBLOCK.
     smoke_test!("phase6_posix_setlk_write_conflict", {
-        // SAFETY: Audit note: #1447 tracks converting this Rust `String`
-        // pointer to a NUL-terminated C string before calling `open`.
-        let fd1 = unsafe { libc::open(lock_file.as_ptr() as *const libc::c_char, libc::O_RDWR) };
+        let fd1 = open_lock_file();
         if fd1 < 0 {
             // SAFETY: errno is read immediately after the failing open on this
             // thread.
@@ -2899,9 +2904,7 @@ fn run_smoke_mount(config: SmokeMountConfig) -> Result<(), String> {
             }
             return Err(format!("first F_SETLK failed: errno={e}"));
         }
-        // SAFETY: Audit note: #1447 tracks converting this Rust `String`
-        // pointer to a NUL-terminated C string before calling `open`.
-        let fd2 = unsafe { libc::open(lock_file.as_ptr() as *const libc::c_char, libc::O_RDWR) };
+        let fd2 = open_lock_file();
         if fd2 < 0 {
             // SAFETY: `fd1` is owned by this probe and is not used after this
             // close on the error path.
@@ -2958,9 +2961,7 @@ fn run_smoke_mount(config: SmokeMountConfig) -> Result<(), String> {
 
     // POSIX F_GETLK query: should return the conflicting lock info.
     smoke_test!("phase6_posix_getlk_query", {
-        // SAFETY: Audit note: #1447 tracks converting this Rust `String`
-        // pointer to a NUL-terminated C string before calling `open`.
-        let fd1 = unsafe { libc::open(lock_file.as_ptr() as *const libc::c_char, libc::O_RDWR) };
+        let fd1 = open_lock_file();
         if fd1 < 0 {
             // SAFETY: errno is read immediately after the failing open on this
             // thread.
@@ -2988,9 +2989,7 @@ fn run_smoke_mount(config: SmokeMountConfig) -> Result<(), String> {
             }
             return Err(format!("write lock acquire failed: errno={e}"));
         }
-        // SAFETY: Audit note: #1447 tracks converting this Rust `String`
-        // pointer to a NUL-terminated C string before calling `open`.
-        let fd2 = unsafe { libc::open(lock_file.as_ptr() as *const libc::c_char, libc::O_RDWR) };
+        let fd2 = open_lock_file();
         if fd2 < 0 {
             // SAFETY: `fd1` is owned by this probe and is not used after this
             // close on the error path.
@@ -3056,9 +3055,7 @@ fn run_smoke_mount(config: SmokeMountConfig) -> Result<(), String> {
 
     // POSIX F_SETLK unlock: release a held lock and verify re-acquire succeeds.
     smoke_test!("phase6_posix_setlk_unlock", {
-        // SAFETY: Audit note: #1447 tracks converting this Rust `String`
-        // pointer to a NUL-terminated C string before calling `open`.
-        let fd = unsafe { libc::open(lock_file.as_ptr() as *const libc::c_char, libc::O_RDWR) };
+        let fd = open_lock_file();
         if fd < 0 {
             // SAFETY: errno is read immediately after the failing open on this
             // thread.
@@ -3123,9 +3120,7 @@ fn run_smoke_mount(config: SmokeMountConfig) -> Result<(), String> {
 
     // BSD flock exclusive acquire.
     smoke_test!("phase6_flock_exclusive_acquire", {
-        // SAFETY: Audit note: #1447 tracks converting this Rust `String`
-        // pointer to a NUL-terminated C string before calling `open`.
-        let fd = unsafe { libc::open(lock_file.as_ptr() as *const libc::c_char, libc::O_RDWR) };
+        let fd = open_lock_file();
         if fd < 0 {
             // SAFETY: errno is read immediately after the failing open on this
             // thread.
@@ -3155,9 +3150,7 @@ fn run_smoke_mount(config: SmokeMountConfig) -> Result<(), String> {
     // BSD flock exclusive conflict: two fds competing for exclusive flock
     // on the same file, second with LOCK_NB should get EWOULDBLOCK.
     smoke_test!("phase6_flock_exclusive_conflict", {
-        // SAFETY: Audit note: #1447 tracks converting this Rust `String`
-        // pointer to a NUL-terminated C string before calling `open`.
-        let fd1 = unsafe { libc::open(lock_file.as_ptr() as *const libc::c_char, libc::O_RDWR) };
+        let fd1 = open_lock_file();
         if fd1 < 0 {
             // SAFETY: errno is read immediately after the failing open on this
             // thread.
@@ -3177,9 +3170,7 @@ fn run_smoke_mount(config: SmokeMountConfig) -> Result<(), String> {
             }
             return Err(format!("first flock LOCK_EX failed: errno={e}"));
         }
-        // SAFETY: Audit note: #1447 tracks converting this Rust `String`
-        // pointer to a NUL-terminated C string before calling `open`.
-        let fd2 = unsafe { libc::open(lock_file.as_ptr() as *const libc::c_char, libc::O_RDWR) };
+        let fd2 = open_lock_file();
         if fd2 < 0 {
             // SAFETY: `fd1` is owned by this probe and is not used after this
             // close on the error path.
@@ -3233,9 +3224,7 @@ fn run_smoke_mount(config: SmokeMountConfig) -> Result<(), String> {
     // OFD lock: two fds from the same process on overlapping byte ranges
     // must conflict (unlike traditional POSIX locks where same-pid replaces).
     smoke_test!("phase6_ofd_lock_two_fds_conflict", {
-        // SAFETY: Audit note: #1447 tracks converting this Rust `String`
-        // pointer to a NUL-terminated C string before calling `open`.
-        let fd1 = unsafe { libc::open(lock_file.as_ptr() as *const libc::c_char, libc::O_RDWR) };
+        let fd1 = open_lock_file();
         if fd1 < 0 {
             // SAFETY: errno is read immediately after the failing open on this
             // thread.
@@ -3265,9 +3254,7 @@ fn run_smoke_mount(config: SmokeMountConfig) -> Result<(), String> {
             }
             return Err(format!("OFD SETLK fd1 failed: errno={e}"));
         }
-        // SAFETY: Audit note: #1447 tracks converting this Rust `String`
-        // pointer to a NUL-terminated C string before calling `open`.
-        let fd2 = unsafe { libc::open(lock_file.as_ptr() as *const libc::c_char, libc::O_RDWR) };
+        let fd2 = open_lock_file();
         if fd2 < 0 {
             // SAFETY: `fd1` is owned by this probe and is not used after this
             // close on the error path.
@@ -3323,9 +3310,7 @@ fn run_smoke_mount(config: SmokeMountConfig) -> Result<(), String> {
 
     // OFD lock query through F_OFD_GETLK.
     smoke_test!("phase6_ofd_lock_getlk_query", {
-        // SAFETY: Audit note: #1447 tracks converting this Rust `String`
-        // pointer to a NUL-terminated C string before calling `open`.
-        let fd1 = unsafe { libc::open(lock_file.as_ptr() as *const libc::c_char, libc::O_RDWR) };
+        let fd1 = open_lock_file();
         if fd1 < 0 {
             // SAFETY: errno is read immediately after the failing open on this
             // thread.
@@ -3357,9 +3342,7 @@ fn run_smoke_mount(config: SmokeMountConfig) -> Result<(), String> {
             }
             return Err(format!("OFD SETLK acquire failed: errno={e}"));
         }
-        // SAFETY: Audit note: #1447 tracks converting this Rust `String`
-        // pointer to a NUL-terminated C string before calling `open`.
-        let fd2 = unsafe { libc::open(lock_file.as_ptr() as *const libc::c_char, libc::O_RDWR) };
+        let fd2 = open_lock_file();
         if fd2 < 0 {
             // SAFETY: `fd1` is owned by this probe and is not used after this
             // close on the error path.
