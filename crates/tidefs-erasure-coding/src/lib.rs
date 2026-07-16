@@ -297,10 +297,21 @@ pub enum ReceiptStripeError {
     InsufficientShards { available: usize, needed: usize },
 }
 
+fn valid_receipt_stripe_width(config: &StripeConfig) -> Option<usize> {
+    if config.data_shards == 0 || config.parity_shards == 0 || config.shard_len == 0 {
+        return None;
+    }
+    config
+        .data_shards
+        .checked_add(config.parity_shards)
+        .filter(|width| *width <= 255)
+}
+
 pub fn encode_receipt_stripe(
     config: &StripeConfig,
     payload: &[u8],
 ) -> Result<ReceiptEncodedStripe, ReceiptStripeError> {
+    valid_receipt_stripe_width(config).ok_or(ReceiptStripeError::EncodeRejected)?;
     let encoded = encode(config, payload).ok_or(ReceiptStripeError::EncodeRejected)?;
     Ok(ReceiptEncodedStripe {
         shards: encoded.shards,
@@ -312,17 +323,12 @@ pub fn reconstruct_receipt_stripe(
     config: &StripeConfig,
     available: &[Option<ErasureShard>],
 ) -> Result<ReceiptReconstructedStripe, ReceiptStripeError> {
-    let expected = config.stripe_width();
-    if config.data_shards == 0
-        || config.parity_shards == 0
-        || config.shard_len == 0
-        || expected > 255
-    {
+    let Some(expected) = valid_receipt_stripe_width(config) else {
         return Err(ReceiptStripeError::InvalidAvailableSet {
             slots: available.len(),
-            expected,
+            expected: config.data_shards.saturating_add(config.parity_shards),
         });
-    }
+    };
     if available.len() != expected {
         return Err(ReceiptStripeError::InvalidAvailableSet {
             slots: available.len(),
