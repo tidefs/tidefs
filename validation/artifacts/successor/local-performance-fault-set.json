@@ -5,7 +5,7 @@
   "source": "issue-2046-source-review",
   "generated_at": "2026-07-14T05:47:53Z",
   "source_ref": "d87008b2e8273c5fba6de88c0f49818780f5fac3",
-  "scope": "bounded mounted-userspace performance and fault evidence inventory for local successor/comparator wording",
+  "scope": "source-model inventory of required mounted-userspace performance and fault evidence for local successor/comparator wording",
   "decision": "fail-closed-inventory-recorded",
   "rows": [
     {

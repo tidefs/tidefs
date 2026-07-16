@@ -941,8 +941,8 @@ required_evidence_classes = [
   "claims-gate-review",
 ]
 evidence_requirements = [
-  { class = "local-storage-comparator-equivalence-evidence", path = "validation/artifacts/successor/local-comparator-equivalence.json", validation_tier = "mounted-userspace", manifest_path = "validation/artifacts/successor/local-comparator-equivalence.manifest.json", blocking_issues = [] },
-  { class = "local-storage-successor-performance-fault-set", path = "validation/artifacts/successor/local-performance-fault-set.json", validation_tier = "mounted-userspace", manifest_path = "validation/artifacts/successor/local-performance-fault-set.manifest.json", blocking_issues = [] },
+  { class = "local-storage-comparator-equivalence-evidence", path = "validation/artifacts/successor/local-comparator-equivalence.json", validation_tier = "source-model", manifest_path = "validation/artifacts/successor/local-comparator-equivalence.manifest.json", blocking_issues = [] },
+  { class = "local-storage-successor-performance-fault-set", path = "validation/artifacts/successor/local-performance-fault-set.json", validation_tier = "source-model", manifest_path = "validation/artifacts/successor/local-performance-fault-set.manifest.json", blocking_issues = [] },
   { class = "local-storage-successor-claim-boundary-review", path = "validation/artifacts/successor/local-claim-boundary-review.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/successor/local-claim-boundary-review.manifest.json", blocking_issues = [] },
   { class = "local-storage-operator-explanation-evidence", path = "validation/artifacts/successor/local-operator-explanation.json", validation_tier = "source-model", manifest_path = "validation/artifacts/successor/local-operator-explanation.manifest.json", blocking_issues = [] },
   { class = "claims-gate-review", path = "validation/artifacts/successor/local-successor-comparator-claims-gate-review.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/successor/local-successor-comparator-claims-gate-review.manifest.json", blocking_issues = [] },
