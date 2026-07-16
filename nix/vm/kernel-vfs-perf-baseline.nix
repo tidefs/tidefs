@@ -27,11 +27,21 @@ let
 
     TMPDIR="''${TIDEFS_PERF_TMPDIR:-/tmp/tidefs-kmod-perf-baseline}"
     QEMU_MEM="''${TIDEFS_PERF_QEMU_MEM:-512M}"
-    TIMEOUT_SEC=600
+    KVM_FLAG=""
+    QEMU_ACCEL="tcg"
+    TIMEOUT_SEC="''${TIDEFS_KERNEL_PERF_TIMEOUT:-600}"
+    SOURCE_DIR="''${TIDEFS_SOURCE_DIR:-}"
+    if [ -z "$SOURCE_DIR" ]; then
+      SOURCE_DIR="''${TIDEFS_REPO_ROOT:-}"
+    fi
+    if [ -z "$SOURCE_DIR" ]; then
+      SOURCE_DIR="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+    fi
+    SOURCE_COMMIT="''${TIDEFS_SOURCE_COMMIT:-}"
 
     usage() {
       cat <<EOF
-Usage: tidefs-kmod-perf-baseline [--keep-tmp]
+Usage: tidefs-kmod-perf-baseline [--keep-tmp] [--timeout SECONDS] [--self-test-parser]
 
 Kernel VFS throughput latency baseline.
 Boots Linux 7.0 QEMU, mounts kmod-posix-vfs in bootstrap mode, runs
@@ -39,23 +49,685 @@ sequential read/write throughput and stat latency measurements.
 
 Options:
   --keep-tmp           Do not remove temp directory on exit
+  --timeout SECONDS    QEMU boot timeout (default: $TIMEOUT_SEC)
+  --self-test-parser   Run parser fixtures without booting QEMU
   --help, -h           Show this message
 
 Exit codes:
-  0  Baseline measurements completed
+  0  Baseline measurements or parser self-test completed
   1  One or more failures
   2  Argument or environment error
 EOF
     }
 
     KEEP_TMP=""
+    SELF_TEST_PARSER=0
     while [[ "$#" -gt 0 ]]; do
       case "$1" in
         --keep-tmp) KEEP_TMP=1; shift ;;
+        --timeout)
+          if [[ "$#" -lt 2 || "$2" == -* ]]; then
+            echo "ERROR: --timeout requires SECONDS" >&2
+            usage >&2
+            exit 2
+          fi
+          TIMEOUT_SEC="$2"
+          shift 2
+          ;;
+        --self-test-parser) SELF_TEST_PARSER=1; shift ;;
         --help|-h) usage; exit 0 ;;
         *) echo "ERROR: unknown option: $1" >&2; usage >&2; exit 2 ;;
       esac
     done
+
+    count_log_prefix() {
+      awk -v prefix="$2" '{
+        line = $0
+        sub(/^[[:space:]]+/, "", line)
+        if (index(line, prefix) == 1) n++
+      } END { print n + 0 }' "$1" 2>/dev/null || echo 0
+    }
+
+    first_log_value() {
+      awk -v key="$2" '{
+        sep = index($0, "=")
+        if (sep == 0) next
+        lhs = substr($0, 1, sep - 1)
+        rhs = substr($0, sep + 1)
+        sub(/^[[:space:]]+/, "", lhs)
+        sub(/[[:space:]]+$/, "", lhs)
+        sub(/^[[:space:]]+/, "", rhs)
+        sub(/[[:space:]]+$/, "", rhs)
+        if (lhs == key) { print rhs; exit }
+      }' "$1" 2>/dev/null || true
+    }
+
+    is_positive_number() {
+      awk -v n="$1" 'BEGIN { exit !(n ~ /^[0-9]+([.][0-9]+)?$/ && n > 0) }'
+    }
+
+    is_qemu_exit_code() {
+      [ -n "$1" ] || return 1
+      case "$1" in
+        *[!0-9]*) return 1 ;;
+      esac
+      case "$1" in
+        0|[1-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5]) return 0 ;;
+        *) return 1 ;;
+      esac
+    }
+
+    if ! is_positive_number "$TIMEOUT_SEC"; then
+      echo "ERROR: --timeout requires a positive numeric SECONDS value" >&2
+      usage >&2
+      exit 2
+    fi
+
+    json_string() {
+      local value="''${1-}"
+
+      value="''${value//\\/\\\\}"
+      value="''${value//\"/\\\"}"
+      value="''${value//$'\b'/\\b}"
+      value="''${value//$'\f'/\\f}"
+      value="''${value//$'\n'/\\n}"
+      value="''${value//$'\r'/\\r}"
+      value="''${value//$'\t'/\\t}"
+      printf '"%s"' "$value"
+    }
+
+    qemu_exit_json_value() {
+      if is_qemu_exit_code "$1"; then
+        printf '%s' "$1"
+      else
+        json_string "$1"
+      fi
+    }
+
+    git_dirty_json_bool() {
+      local source_dir="''${1:-$SOURCE_DIR}"
+      local status
+
+      if ! status=$(git -C "$source_dir" status --porcelain --untracked-files=normal 2>/dev/null); then
+        echo true
+      elif [ -z "$status" ]; then
+        echo false
+      else
+        echo true
+      fi
+    }
+
+    git_commit_value() {
+      if [ -n "$SOURCE_COMMIT" ]; then
+        echo "$SOURCE_COMMIT"
+      else
+        git -C "$SOURCE_DIR" rev-parse HEAD 2>/dev/null || echo unknown
+      fi
+    }
+
+    qemu_accel_value() {
+      if [ -e /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+        echo kvm
+      else
+        echo tcg
+      fi
+    }
+
+    write_blocked_manifest() {
+      local reason="$1"
+      local run_id
+      local output_dir
+
+      run_id="$(date -u +%Y-%m-%dT%H%M%SZ)"
+      output_dir="/root/ai/tmp/tidefs-validation/kernel-vfs-perf-baseline/$run_id"
+      mkdir -p "$output_dir"
+
+      cat > "$output_dir/validation-manifest.json" << MANIFEST
+{
+  "test": "kernel-vfs-perf-baseline",
+  "date": $(json_string "$run_id"),
+  "mode": "bootstrap",
+  "validation_tier": "Tier 5 mounted Linux 7.0 kernel VFS",
+  "qemu_accel": $(json_string "$(qemu_accel_value)"),
+  "qemu_exit": null,
+  "qemu_success": false,
+  "qemu_timed_out": false,
+  "log_empty": null,
+  "required_metrics_present": false,
+  "metrics": {
+    "write_duration_s": "0",
+    "write_throughput_MBps": "0",
+    "read_duration_s": "0",
+    "read_throughput_MBps": "0",
+    "stat_avg_latency_us": "0",
+    "stat_total_duration_s": "0"
+  },
+  "pass": 0,
+  "fail": 0,
+  "blocked": 1,
+  "skip": 0,
+  "commit": $(json_string "$(git_commit_value)"),
+  "worktree_dirty": $(git_dirty_json_bool),
+  "module_source": "configured external module path",
+  "status": "BLOCKED",
+  "result": $(json_string "kernel VFS throughput latency baseline BLOCKED: $reason")
+}
+MANIFEST
+
+      echo "Validation output directory: $output_dir"
+    }
+
+    analyze_qemu_log() {
+      local log_file="$1"
+      local qemu_exit="$2"
+
+      PASS_COUNT=$(count_log_prefix "$log_file" "PASS:")
+      FAIL_COUNT=$(count_log_prefix "$log_file" "FAIL:")
+      BLOCKED_COUNT=$(count_log_prefix "$log_file" "BLOCKED:")
+      SKIP_COUNT=$(count_log_prefix "$log_file" "SKIP:")
+
+      WRITE_DURATION=$(first_log_value "$log_file" "write_duration_s")
+      WRITE_TP=$(first_log_value "$log_file" "write_throughput_MBps")
+      READ_DURATION=$(first_log_value "$log_file" "read_duration_s")
+      READ_TP=$(first_log_value "$log_file" "read_throughput_MBps")
+      STAT_LAT=$(first_log_value "$log_file" "stat_avg_latency_us")
+      if [ -z "$STAT_LAT" ]; then
+        STAT_LAT=$(first_log_value "$log_file" "stat_avg_us")
+      fi
+      STAT_TOTAL_DURATION=$(first_log_value "$log_file" "stat_total_duration_s")
+
+      WRITE_DURATION_VAL="''${WRITE_DURATION:-0}"
+      WRITE_TP_VAL="''${WRITE_TP:-0}"
+      READ_DURATION_VAL="''${READ_DURATION:-0}"
+      READ_TP_VAL="''${READ_TP:-0}"
+      STAT_LAT_VAL="''${STAT_LAT:-0}"
+      STAT_TOTAL_DURATION_VAL="''${STAT_TOTAL_DURATION:-0}"
+
+      QEMU_SUCCESS=false
+      QEMU_TIMED_OUT=false
+      LOG_EMPTY=false
+      REQUIRED_METRICS_PRESENT=false
+      VERDICT_STATUS=PASS
+      VERDICT_REASON=complete
+      VERDICT_EXIT=0
+
+      [ ! -s "$log_file" ] && LOG_EMPTY=true
+
+      if is_positive_number "$WRITE_DURATION_VAL" &&
+         is_positive_number "$WRITE_TP_VAL" &&
+         is_positive_number "$READ_DURATION_VAL" &&
+         is_positive_number "$READ_TP_VAL" &&
+         is_positive_number "$STAT_LAT_VAL" &&
+         is_positive_number "$STAT_TOTAL_DURATION_VAL"; then
+        REQUIRED_METRICS_PRESENT=true
+      fi
+
+      if ! is_qemu_exit_code "$qemu_exit"; then
+        VERDICT_STATUS=BLOCKED
+        VERDICT_REASON=qemu_exit_invalid
+        VERDICT_EXIT=2
+        return
+      fi
+
+      [ "$qemu_exit" -eq 0 ] && QEMU_SUCCESS=true
+      if [ "$qemu_exit" -eq 124 ] || [ "$qemu_exit" -eq 137 ]; then
+        QEMU_TIMED_OUT=true
+      fi
+
+      if [ "$qemu_exit" -ne 0 ]; then
+        VERDICT_STATUS=BLOCKED
+        VERDICT_REASON=qemu_exit_$qemu_exit
+        VERDICT_EXIT=2
+        if [ "$QEMU_TIMED_OUT" = true ]; then
+          VERDICT_REASON=qemu_timeout
+        fi
+      elif [ "$LOG_EMPTY" = true ]; then
+        VERDICT_STATUS=BLOCKED
+        VERDICT_REASON=empty_qemu_log
+        VERDICT_EXIT=2
+      elif [ "$PASS_COUNT" -eq 0 ]; then
+        VERDICT_STATUS=BLOCKED
+        VERDICT_REASON=zero_pass_rows
+        VERDICT_EXIT=2
+      elif [ "$FAIL_COUNT" -gt 0 ]; then
+        VERDICT_STATUS=FAIL
+        VERDICT_REASON=fail_rows
+        VERDICT_EXIT=1
+      elif [ "$BLOCKED_COUNT" -gt 0 ]; then
+        VERDICT_STATUS=BLOCKED
+        VERDICT_REASON=blocked_rows
+        VERDICT_EXIT=2
+      elif [ "$REQUIRED_METRICS_PRESENT" != true ]; then
+        VERDICT_STATUS=BLOCKED
+        VERDICT_REASON=missing_required_metrics
+        VERDICT_EXIT=2
+      fi
+    }
+
+    expect_parser_verdict() {
+      local name="$1"
+      local expected_status="$2"
+      local expected_reason="$3"
+      local expected_exit="$4"
+
+      if [ "$VERDICT_STATUS" != "$expected_status" ] ||
+         [ "$VERDICT_REASON" != "$expected_reason" ] ||
+         [ "$VERDICT_EXIT" -ne "$expected_exit" ]; then
+        echo "parser self-test failed: $name" >&2
+        echo "  expected: $expected_status/$expected_reason/$expected_exit" >&2
+        echo "  actual:   $VERDICT_STATUS/$VERDICT_REASON/$VERDICT_EXIT" >&2
+        exit 1
+      fi
+    }
+
+    expect_parser_metrics() {
+      local name="$1"
+      local expected_write_tp="$2"
+      local expected_read_tp="$3"
+      local expected_stat_lat="$4"
+
+      if [ "$WRITE_TP_VAL" != "$expected_write_tp" ] ||
+         [ "$READ_TP_VAL" != "$expected_read_tp" ] ||
+         [ "$STAT_LAT_VAL" != "$expected_stat_lat" ] ||
+         [ "$REQUIRED_METRICS_PRESENT" != true ]; then
+        echo "parser self-test failed: $name" >&2
+        echo "  expected metrics: write=$expected_write_tp read=$expected_read_tp stat=$expected_stat_lat required=true" >&2
+        echo "  actual metrics:   write=$WRITE_TP_VAL read=$READ_TP_VAL stat=$STAT_LAT_VAL required=$REQUIRED_METRICS_PRESENT" >&2
+        exit 1
+      fi
+    }
+
+    expect_parser_metric_values() {
+      local name="$1"
+      local expected_write_tp="$2"
+      local expected_read_tp="$3"
+      local expected_stat_lat="$4"
+
+      if [ "$WRITE_TP_VAL" != "$expected_write_tp" ] ||
+         [ "$READ_TP_VAL" != "$expected_read_tp" ] ||
+         [ "$STAT_LAT_VAL" != "$expected_stat_lat" ]; then
+        echo "parser self-test failed: $name" >&2
+        echo "  expected metrics: write=$expected_write_tp read=$expected_read_tp stat=$expected_stat_lat" >&2
+        echo "  actual metrics:   write=$WRITE_TP_VAL read=$READ_TP_VAL stat=$STAT_LAT_VAL" >&2
+        exit 1
+      fi
+    }
+
+    expect_parser_durations() {
+      local name="$1"
+      local expected_write_duration="$2"
+      local expected_read_duration="$3"
+      local expected_stat_duration="$4"
+
+      if [ "$WRITE_DURATION_VAL" != "$expected_write_duration" ] ||
+         [ "$READ_DURATION_VAL" != "$expected_read_duration" ] ||
+         [ "$STAT_TOTAL_DURATION_VAL" != "$expected_stat_duration" ]; then
+        echo "parser self-test failed: $name" >&2
+        echo "  expected durations: write=$expected_write_duration read=$expected_read_duration stat=$expected_stat_duration" >&2
+        echo "  actual durations:   write=$WRITE_DURATION_VAL read=$READ_DURATION_VAL stat=$STAT_TOTAL_DURATION_VAL" >&2
+        exit 1
+      fi
+    }
+
+    expect_parser_counts() {
+      local name="$1"
+      local expected_pass="$2"
+      local expected_fail="$3"
+      local expected_blocked="$4"
+      local expected_skip="$5"
+
+      if [ "$PASS_COUNT" -ne "$expected_pass" ] ||
+         [ "$FAIL_COUNT" -ne "$expected_fail" ] ||
+         [ "$BLOCKED_COUNT" -ne "$expected_blocked" ] ||
+         [ "$SKIP_COUNT" -ne "$expected_skip" ]; then
+        echo "parser self-test failed: $name" >&2
+        echo "  expected counts: pass=$expected_pass fail=$expected_fail blocked=$expected_blocked skip=$expected_skip" >&2
+        echo "  actual counts:   pass=$PASS_COUNT fail=$FAIL_COUNT blocked=$BLOCKED_COUNT skip=$SKIP_COUNT" >&2
+        exit 1
+      fi
+    }
+
+    expect_parser_state() {
+      local name="$1"
+      local expected_qemu_success="$2"
+      local expected_qemu_timed_out="$3"
+      local expected_log_empty="$4"
+      local expected_required_metrics="$5"
+
+      if [ "$QEMU_SUCCESS" != "$expected_qemu_success" ] ||
+         [ "$QEMU_TIMED_OUT" != "$expected_qemu_timed_out" ] ||
+         [ "$LOG_EMPTY" != "$expected_log_empty" ] ||
+         [ "$REQUIRED_METRICS_PRESENT" != "$expected_required_metrics" ]; then
+        echo "parser self-test failed: $name" >&2
+        echo "  expected state: qemu_success=$expected_qemu_success timed_out=$expected_qemu_timed_out log_empty=$expected_log_empty required=$expected_required_metrics" >&2
+        echo "  actual state:   qemu_success=$QEMU_SUCCESS timed_out=$QEMU_TIMED_OUT log_empty=$LOG_EMPTY required=$REQUIRED_METRICS_PRESENT" >&2
+        exit 1
+      fi
+    }
+
+    expect_json_string() {
+      local name="$1"
+      local input="$2"
+      local expected="$3"
+      local actual
+
+      actual="$(json_string "$input")"
+      if [ "$actual" != "$expected" ]; then
+        echo "json string self-test failed for $name: got $actual expected $expected" >&2
+        exit 1
+      fi
+    }
+
+    expect_qemu_exit_json_value() {
+      local name="$1"
+      local input="$2"
+      local expected="$3"
+      local actual
+
+      actual="$(qemu_exit_json_value "$input")"
+      if [ "$actual" != "$expected" ]; then
+        echo "qemu exit json self-test failed for $name: got $actual expected $expected" >&2
+        exit 1
+      fi
+    }
+
+    expect_git_dirty_json_bool() {
+      local name="$1"
+      local source_dir="$2"
+      local expected="$3"
+      local actual
+
+      actual="$(git_dirty_json_bool "$source_dir")"
+      if [ "$actual" != "$expected" ]; then
+        echo "git dirty self-test failed for $name: got $actual expected $expected" >&2
+        exit 1
+      fi
+    }
+
+    self_test_parser() {
+      local test_dir
+      test_dir="$(mktemp -d)"
+      trap 'rm -rf "$test_dir"' RETURN
+
+      expect_json_string quote-and-backslash $'quote"slash\\' '"quote\"slash\\"'
+      expect_json_string control-bytes $'line\nnext\tcarriage\rreturn' '"line\nnext\tcarriage\rreturn"'
+      expect_qemu_exit_json_value numeric 124 124
+      expect_qemu_exit_json_value max 255 255
+      expect_qemu_exit_json_value invalid unknown '"unknown"'
+      expect_qemu_exit_json_value invalid-range 256 '"256"'
+      expect_qemu_exit_json_value oversized 999999999999999999999999999999999999999999999999999 '"999999999999999999999999999999999999999999999999999"'
+
+      git() {
+        case "$TIDEFS_TEST_GIT_STATUS" in
+          clean) return 0 ;;
+          dirty) echo "?? untracked"; return 0 ;;
+          error) return 128 ;;
+        esac
+      }
+      TIDEFS_TEST_GIT_STATUS=clean \
+        expect_git_dirty_json_bool clean-worktree "$test_dir" false
+      TIDEFS_TEST_GIT_STATUS=dirty \
+        expect_git_dirty_json_bool untracked-worktree "$test_dir" true
+      TIDEFS_TEST_GIT_STATUS=error \
+        expect_git_dirty_json_bool unreadable-worktree "$test_dir" true
+
+      : > "$test_dir/empty.log"
+      analyze_qemu_log "$test_dir/empty.log" 0
+      expect_parser_verdict empty-log BLOCKED empty_qemu_log 2
+      expect_parser_counts empty-log 0 0 0 0
+      expect_parser_state empty-log true false true false
+
+      cat > "$test_dir/timeout.log" <<'EOF'
+=== TideFS Kernel VFS Throughput Latency Baseline ===
+kernel_version=7.0.0
+--- Phase 0: Module Load ---
+EOF
+      analyze_qemu_log "$test_dir/timeout.log" 124
+      expect_parser_verdict timeout-log BLOCKED qemu_timeout 2
+      expect_parser_counts timeout-log 0 0 0 0
+      expect_parser_state timeout-log false true false false
+
+      cat > "$test_dir/timeout-complete-log.log" <<'EOF'
+PASS: insmod
+PASS: mount
+PASS: no_daemon
+write_duration_s=0.125
+write_throughput_MBps=10.00
+read_duration_s=0.250
+read_throughput_MBps=20.00
+stat_avg_latency_us=30
+stat_total_duration_s=0.003
+EOF
+      analyze_qemu_log "$test_dir/timeout-complete-log.log" 137
+      expect_parser_verdict timeout-complete-log BLOCKED qemu_timeout 2
+      expect_parser_counts timeout-complete-log 3 0 0 0
+      expect_parser_state timeout-complete-log false true false true
+
+      cat > "$test_dir/qemu-exit-nonzero.log" <<'EOF'
+PASS: insmod
+PASS: mount
+PASS: no_daemon
+write_duration_s=0.125
+write_throughput_MBps=10.00
+read_duration_s=0.250
+read_throughput_MBps=20.00
+stat_avg_latency_us=30
+stat_total_duration_s=0.003
+EOF
+      analyze_qemu_log "$test_dir/qemu-exit-nonzero.log" 1
+      expect_parser_verdict qemu-exit-nonzero BLOCKED qemu_exit_1 2
+      expect_parser_counts qemu-exit-nonzero 3 0 0 0
+      expect_parser_state qemu-exit-nonzero false false false true
+
+      cat > "$test_dir/qemu-exit-invalid.log" <<'EOF'
+PASS: insmod
+PASS: mount
+PASS: no_daemon
+write_duration_s=0.125
+write_throughput_MBps=10.00
+read_duration_s=0.250
+read_throughput_MBps=20.00
+stat_avg_latency_us=30
+stat_total_duration_s=0.003
+EOF
+      analyze_qemu_log "$test_dir/qemu-exit-invalid.log" unknown
+      expect_parser_verdict qemu-exit-invalid BLOCKED qemu_exit_invalid 2
+      expect_parser_counts qemu-exit-invalid 3 0 0 0
+      expect_parser_state qemu-exit-invalid false false false true
+
+      analyze_qemu_log "$test_dir/qemu-exit-invalid.log" 256
+      expect_parser_verdict qemu-exit-out-of-range BLOCKED qemu_exit_invalid 2
+      expect_parser_counts qemu-exit-out-of-range 3 0 0 0
+      expect_parser_state qemu-exit-out-of-range false false false true
+
+      analyze_qemu_log "$test_dir/qemu-exit-invalid.log" 999999999999999999999999999999999999999999999999999
+      expect_parser_verdict qemu-exit-oversized BLOCKED qemu_exit_invalid 2
+      expect_parser_counts qemu-exit-oversized 3 0 0 0
+      expect_parser_state qemu-exit-oversized false false false true
+
+      cat > "$test_dir/zero-pass.log" <<'EOF'
+write_duration_s=0.125
+write_throughput_MBps=10.00
+read_duration_s=0.250
+read_throughput_MBps=20.00
+stat_avg_latency_us=30
+stat_total_duration_s=0.003
+EOF
+      analyze_qemu_log "$test_dir/zero-pass.log" 0
+      expect_parser_verdict zero-pass BLOCKED zero_pass_rows 2
+      expect_parser_counts zero-pass 0 0 0 0
+      expect_parser_state zero-pass true false false true
+
+      cat > "$test_dir/missing-metrics.log" <<'EOF'
+PASS: insmod
+PASS: mount
+PASS: no_daemon
+EOF
+      analyze_qemu_log "$test_dir/missing-metrics.log" 0
+      expect_parser_verdict missing-metrics BLOCKED missing_required_metrics 2
+      expect_parser_counts missing-metrics 3 0 0 0
+      expect_parser_state missing-metrics true false false false
+
+      cat > "$test_dir/missing-duration-metrics.log" <<'EOF'
+PASS: insmod
+PASS: mount
+PASS: no_daemon
+write_throughput_MBps=10.00
+read_throughput_MBps=20.00
+stat_avg_latency_us=30
+EOF
+      analyze_qemu_log "$test_dir/missing-duration-metrics.log" 0
+      expect_parser_verdict missing-duration-metrics BLOCKED missing_required_metrics 2
+      expect_parser_metric_values missing-duration-metrics 10.00 20.00 30
+      expect_parser_counts missing-duration-metrics 3 0 0 0
+      expect_parser_state missing-duration-metrics true false false false
+
+      cat > "$test_dir/invalid-metrics.log" <<'EOF'
+PASS: insmod
+PASS: mount
+PASS: no_daemon
+write_duration_s=0.125
+write_throughput_MBps=nan
+read_duration_s=0.250
+read_throughput_MBps=0
+stat_avg_latency_us=-1
+stat_total_duration_s=0.003
+EOF
+      analyze_qemu_log "$test_dir/invalid-metrics.log" 0
+      expect_parser_verdict invalid-metrics BLOCKED missing_required_metrics 2
+      expect_parser_metric_values invalid-metrics nan 0 -1
+      expect_parser_durations invalid-metrics 0.125 0.250 0.003
+      expect_parser_counts invalid-metrics 3 0 0 0
+      expect_parser_state invalid-metrics true false false false
+
+      cat > "$test_dir/value-delimiter-metrics.log" <<'EOF'
+PASS: insmod
+PASS: mount
+PASS: no_daemon
+write_duration_s=0.125
+write_throughput_MBps=10.00=trailing
+read_duration_s=0.250
+read_throughput_MBps=20.00=trailing
+stat_avg_latency_us=30=trailing
+stat_total_duration_s=0.003
+EOF
+      analyze_qemu_log "$test_dir/value-delimiter-metrics.log" 0
+      expect_parser_verdict value-delimiter-metrics BLOCKED missing_required_metrics 2
+      expect_parser_metric_values value-delimiter-metrics 10.00=trailing 20.00=trailing 30=trailing
+      expect_parser_durations value-delimiter-metrics 0.125 0.250 0.003
+      expect_parser_counts value-delimiter-metrics 3 0 0 0
+      expect_parser_state value-delimiter-metrics true false false false
+
+      cat > "$test_dir/fail-row.log" <<'EOF'
+PASS: insmod
+PASS: mount
+FAIL: stat latency regression
+write_duration_s=0.125
+write_throughput_MBps=10.00
+read_duration_s=0.250
+read_throughput_MBps=20.00
+stat_avg_latency_us=30
+stat_total_duration_s=0.003
+EOF
+      analyze_qemu_log "$test_dir/fail-row.log" 0
+      expect_parser_verdict fail-row FAIL fail_rows 1
+      expect_parser_counts fail-row 2 1 0 0
+      expect_parser_state fail-row true false false true
+
+      cat > "$test_dir/indented-rows.log" <<'EOF'
+  PASS: insmod
+  PASS: mount
+  FAIL: stat latency regression
+  BLOCKED: missing kernel tracepoint
+  SKIP: optional cache warmup unavailable
+  write_duration_s = 0.125
+  write_throughput_MBps = 10.00
+  read_duration_s = 0.250
+  read_throughput_MBps = 20.00
+  stat_avg_latency_us = 30
+  stat_total_duration_s = 0.003
+EOF
+      analyze_qemu_log "$test_dir/indented-rows.log" 0
+      expect_parser_verdict indented-rows FAIL fail_rows 1
+      expect_parser_metrics indented-rows 10.00 20.00 30
+      expect_parser_counts indented-rows 2 1 1 1
+      expect_parser_state indented-rows true false false true
+
+      cat > "$test_dir/blocked-row.log" <<'EOF'
+PASS: insmod
+PASS: mount
+BLOCKED: missing kernel tracepoint
+write_duration_s=0.125
+write_throughput_MBps=10.00
+read_duration_s=0.250
+read_throughput_MBps=20.00
+stat_avg_latency_us=30
+stat_total_duration_s=0.003
+EOF
+      analyze_qemu_log "$test_dir/blocked-row.log" 0
+      expect_parser_verdict blocked-row BLOCKED blocked_rows 2
+      expect_parser_counts blocked-row 2 0 1 0
+      expect_parser_state blocked-row true false false true
+
+      cat > "$test_dir/pass.log" <<'EOF'
+PASS: insmod
+PASS: mount
+PASS: no_daemon
+  write_duration_s = 0.125
+  write_throughput_MBps = 10.00
+  read_duration_s = 0.250
+  read_throughput_MBps = 20.00
+  stat_avg_latency_us = 30
+  stat_total_duration_s = 0.003
+EOF
+      analyze_qemu_log "$test_dir/pass.log" 0
+      expect_parser_verdict pass-log PASS complete 0
+      expect_parser_metrics pass-log 10.00 20.00 30
+      expect_parser_durations pass-log 0.125 0.250 0.003
+      expect_parser_counts pass-log 3 0 0 0
+      expect_parser_state pass-log true false false true
+
+      cat > "$test_dir/skip-row.log" <<'EOF'
+PASS: insmod
+PASS: mount
+SKIP: optional cache warmup unavailable
+write_duration_s=0.125
+write_throughput_MBps=10.00
+read_duration_s=0.250
+read_throughput_MBps=20.00
+stat_avg_latency_us=30
+stat_total_duration_s=0.003
+EOF
+      analyze_qemu_log "$test_dir/skip-row.log" 0
+      expect_parser_verdict skip-row PASS complete 0
+      expect_parser_metrics skip-row 10.00 20.00 30
+      expect_parser_counts skip-row 2 0 0 1
+      expect_parser_state skip-row true false false true
+
+      cat > "$test_dir/stat-short-alias.log" <<'EOF'
+PASS: insmod
+PASS: mount
+PASS: no_daemon
+write_duration_s=0.125
+write_throughput_MBps=10.00
+read_duration_s=0.250
+read_throughput_MBps=20.00
+stat_avg_us=30
+stat_total_duration_s=0.003
+EOF
+      analyze_qemu_log "$test_dir/stat-short-alias.log" 0
+      expect_parser_verdict stat-short-alias PASS complete 0
+      expect_parser_metrics stat-short-alias 10.00 20.00 30
+      expect_parser_counts stat-short-alias 3 0 0 0
+      expect_parser_state stat-short-alias true false false true
+
+      echo "parser self-test: ok"
+    }
+
+    if [ "$SELF_TEST_PARSER" -eq 1 ]; then
+      self_test_parser
+      exit 0
+    fi
 
     echo "=== TideFS Kernel VFS Throughput Latency Baseline ==="
     echo "  Kernel:    $KERNEL_IMG"
@@ -63,9 +735,17 @@ EOF
     echo "  Module:    kmod-posix-vfs"
     echo ""
 
-    for dep in "$QEMU_BIN" "$BUSYBOX" "$KERNEL_IMG" "$CPIO"; do
-      if [ ! -f "$dep" ] && [ ! -x "$dep" ]; then
-        echo "ERROR: dependency not found: $dep" >&2
+    for dep in "$QEMU_BIN" "$BUSYBOX" "$CPIO"; do
+      if [ ! -x "$dep" ]; then
+        echo "ERROR: executable dependency not found: $dep" >&2
+        write_blocked_manifest missing_dependency
+        exit 2
+      fi
+    done
+    for dep in "$KERNEL_IMG"; do
+      if [ ! -f "$dep" ]; then
+        echo "ERROR: file dependency not found: $dep" >&2
+        write_blocked_manifest missing_dependency
         exit 2
       fi
     done
@@ -79,9 +759,23 @@ EOF
 
     if [ -z "$POSIX_VFS_KO" ]; then
       echo "BLOCKED: tidefs_posix_vfs.ko not found in MODULE_DIR=$MODULE_DIR"
-      exit 1
+      write_blocked_manifest missing_module
+      exit 2
+    fi
+    if [ ! -f "$POSIX_VFS_KO" ]; then
+      echo "BLOCKED: tidefs_posix_vfs.ko path is not a file: $POSIX_VFS_KO"
+      write_blocked_manifest missing_module
+      exit 2
     fi
     echo "  Module .ko: $POSIX_VFS_KO"
+
+    if [ -e /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+      KVM_FLAG="-enable-kvm -cpu host"
+      QEMU_ACCEL="kvm"
+      echo "  KVM:       enabled"
+    else
+      echo "  KVM:       not available (software emulation, expect slow boot)"
+    fi
 
     RUN_DIR="$TMPDIR/validation-$$"
     mkdir -p "$RUN_DIR"/{bin,dev,proc,sys,tmp,lib/modules,mnt/tidefs,validation}
@@ -119,6 +813,12 @@ echo "timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo ""
 
 PASSED=0; FAILED=0; BLOCKED=0; SKIPPED=0
+write_duration_s=0
+write_throughput_mbps=0
+read_duration_s=0
+read_throughput_mbps=0
+stat_total_duration_s=0
+avg_us=0
 pass()   { echo "PASS: $1"; PASSED=$((PASSED + 1)); }
 fail()   { echo "FAIL: $1 -- $2"; FAILED=$((FAILED + 1)); }
 blocked(){ echo "BLOCKED: $1 -- $2"; BLOCKED=$((BLOCKED + 1)); }
@@ -177,16 +877,17 @@ else
     done
     sync
     end_ns=$(date +%s%N 2>/dev/null || echo 0)
-    duration_s=0; throughput_mbps=0
+    duration_s=0; write_throughput_mbps=0
     if [ "$start_ns" -gt 0 ] && [ "$end_ns" -gt 0 ]; then
         duration_ns=$((end_ns - start_ns))
         duration_s=$(awk "BEGIN {printf \"%.3f\", $duration_ns / 1000000000}" 2>/dev/null || echo "0")
-        if [ "$duration_s" != "0" ] && [ "$(echo "$duration_s > 0" | bc 2>/dev/null || echo 0)" != "0" ]; then
-            throughput_mbps=$(awk "BEGIN {printf \"%.2f\", 1.0 / $duration_s}" 2>/dev/null || echo "0")
+        if [ "$duration_ns" -gt 0 ]; then
+            write_throughput_mbps=$(awk "BEGIN {printf \"%.2f\", 1000000000 / $duration_ns}" 2>/dev/null || echo "0")
         fi
     fi
-    echo "  write_duration_s=$duration_s"
-    echo "  write_throughput_MBps=$throughput_mbps"
+    write_duration_s=$duration_s
+    echo "  write_duration_s=$write_duration_s"
+    echo "  write_throughput_MBps=$write_throughput_mbps"
     ws=$(stat -c %s "$MNT/perf_write_test" 2>/dev/null || echo 0)
     [ "$ws" -ge 1048576 ] && pass "phase2_write_data" || fail "phase2_write_data" "file_size=$ws"
 fi
@@ -201,16 +902,17 @@ else
     start_ns=$(date +%s%N 2>/dev/null || echo 0)
     dd if="$MNT/perf_write_test" of=/dev/null bs=4096 count=256 2>/dev/null
     end_ns=$(date +%s%N 2>/dev/null || echo 0)
-    duration_s=0; throughput_mbps=0
+    duration_s=0; read_throughput_mbps=0
     if [ "$start_ns" -gt 0 ] && [ "$end_ns" -gt 0 ]; then
         duration_ns=$((end_ns - start_ns))
         duration_s=$(awk "BEGIN {printf \"%.3f\", $duration_ns / 1000000000}" 2>/dev/null || echo "0")
-        if [ "$duration_s" != "0" ] && [ "$(echo "$duration_s > 0" | bc 2>/dev/null || echo 0)" != "0" ]; then
-            throughput_mbps=$(awk "BEGIN {printf \"%.2f\", 1.0 / $duration_s}" 2>/dev/null || echo "0")
+        if [ "$duration_ns" -gt 0 ]; then
+            read_throughput_mbps=$(awk "BEGIN {printf \"%.2f\", 1000000000 / $duration_ns}" 2>/dev/null || echo "0")
         fi
     fi
-    echo "  read_duration_s=$duration_s"
-    echo "  read_throughput_MBps=$throughput_mbps"
+    read_duration_s=$duration_s
+    echo "  read_duration_s=$read_duration_s"
+    echo "  read_throughput_MBps=$read_throughput_mbps"
     pass "phase3_read"
 fi
 
@@ -236,8 +938,9 @@ else
         avg_us=$(awk "BEGIN {printf \"%.2f\", $avg_ns / 1000}" 2>/dev/null || echo "0")
         duration_s=$(awk "BEGIN {printf \"%.3f\", $duration_ns / 1000000000}" 2>/dev/null || echo "0")
     fi
+    stat_total_duration_s=$duration_s
     echo "  stat_avg_latency_us=$avg_us"
-    echo "  stat_total_duration_s=$duration_s"
+    echo "  stat_total_duration_s=$stat_total_duration_s"
     pass "phase4_stat"
 fi
 
@@ -264,9 +967,12 @@ rmmod tidefs_posix_vfs 2>/tmp/rm.err && pass "phase7_rmmod" || fail "phase7_rmmo
 echo ""
 echo "============================================================"
 echo "=== PERFORMANCE BASELINE SUMMARY ==="
-echo "  write_throughput_MBps=$throughput_mbps"
-echo "  read_throughput_MBps=$throughput_mbps"
+echo "  write_duration_s=$write_duration_s"
+echo "  write_throughput_MBps=$write_throughput_mbps"
+echo "  read_duration_s=$read_duration_s"
+echo "  read_throughput_MBps=$read_throughput_mbps"
 echo "  stat_avg_latency_us=$avg_us"
+echo "  stat_total_duration_s=$stat_total_duration_s"
 echo "  dmesg_BUG=$DB"
 echo "  PASS=$PASSED FAIL=$FAILED BLOCKED=$BLOCKED SKIP=$SKIPPED"
 echo "============================================================"
@@ -277,9 +983,11 @@ INITSCRIPT
     chmod +x "$RUN_DIR/init"
 
     echo "--- Building initramfs ---"
-    (cd "$RUN_DIR" && find . | cpio -o -H newc) | gzip > "$RUN_DIR/initramfs.gz"
+    (cd "$RUN_DIR" && find . | "$CPIO" -o -H newc) | gzip > "$RUN_DIR/initramfs.gz"
 
     echo "--- Booting QEMU ---"
+    QEMU_EXIT=0
+    set +e
     timeout "$TIMEOUT_SEC" "$QEMU_BIN" \
       -kernel "$KERNEL_IMG" \
       -initrd "$RUN_DIR/initramfs.gz" \
@@ -287,60 +995,56 @@ INITSCRIPT
       -nographic \
       -m "$QEMU_MEM" \
       -no-reboot \
-      2>&1 | tee "$RUN_DIR/qemu.log" || true
+      $KVM_FLAG \
+      2>&1 | tee "$RUN_DIR/qemu.log"
+    QEMU_EXIT="''${PIPESTATUS[0]}"
+    set -e
 
-    echo "--- QEMU exited ---"
-    PASS_COUNT=$(grep -c "^PASS:" "$RUN_DIR/qemu.log" 2>/dev/null || echo 0)
-    FAIL_COUNT=$(grep -c "^FAIL:" "$RUN_DIR/qemu.log" 2>/dev/null || echo 0)
-    BLOCKED_COUNT=$(grep -c "^BLOCKED:" "$RUN_DIR/qemu.log" 2>/dev/null || echo 0)
-    SKIP_COUNT=$(grep -c "^SKIP:" "$RUN_DIR/qemu.log" 2>/dev/null || echo 0)
+    echo "--- QEMU exited with code $QEMU_EXIT ---"
+    analyze_qemu_log "$RUN_DIR/qemu.log" "$QEMU_EXIT"
 
     echo "PASS: $PASS_COUNT  FAIL: $FAIL_COUNT  BLOCKED: $BLOCKED_COUNT  SKIP: $SKIP_COUNT"
+    echo "QEMU success: $QEMU_SUCCESS  Required metrics: $REQUIRED_METRICS_PRESENT  Verdict: $VERDICT_STATUS ($VERDICT_REASON)"
 
-    # Extract throughput/latency values from log
-    WRITE_TP=$(grep "write_throughput_MBps=" "$RUN_DIR/qemu.log" 2>/dev/null | cut -d= -f2 | head -1)
-    READ_TP=$(grep "read_throughput_MBps=" "$RUN_DIR/qemu.log" 2>/dev/null | cut -d= -f2 | head -1)
-    STAT_LAT=$(grep "stat_avg_latency_us=" "$RUN_DIR/qemu.log" 2>/dev/null | cut -d= -f2 | head -1)
-
-    OUTPUT_DIR="/root/ai/tmp/tidefs-validation/kernel-vfs-perf-baseline/$(date -u +%Y-%m-%dT%H%M%SZ)"
+    RUN_ID="$(date -u +%Y-%m-%dT%H%M%SZ)"
+    OUTPUT_DIR="/root/ai/tmp/tidefs-validation/kernel-vfs-perf-baseline/$RUN_ID"
     mkdir -p "$OUTPUT_DIR"
     cp "$RUN_DIR/qemu.log" "$OUTPUT_DIR/qemu.log"
-
-    WRITE_TP_VAL="''${WRITE_TP:-0}"
-    READ_TP_VAL="''${READ_TP:-0}"
-    STAT_LAT_VAL="''${STAT_LAT:-0}"
 
     cat > "$OUTPUT_DIR/validation-manifest.json" << MANIFEST
 {
   "test": "kernel-vfs-perf-baseline",
-  "date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "date": $(json_string "$RUN_ID"),
   "mode": "bootstrap",
   "validation_tier": "Tier 5 mounted Linux 7.0 kernel VFS",
+  "qemu_accel": $(json_string "$QEMU_ACCEL"),
+  "qemu_exit": $(qemu_exit_json_value "$QEMU_EXIT"),
+  "qemu_success": $QEMU_SUCCESS,
+  "qemu_timed_out": $QEMU_TIMED_OUT,
+  "log_empty": $LOG_EMPTY,
+  "required_metrics_present": $REQUIRED_METRICS_PRESENT,
   "metrics": {
-    "write_throughput_MBps": "$WRITE_TP_VAL",
-    "read_throughput_MBps": "$READ_TP_VAL",
-    "stat_avg_latency_us": "$STAT_LAT_VAL"
+    "write_duration_s": $(json_string "$WRITE_DURATION_VAL"),
+    "write_throughput_MBps": $(json_string "$WRITE_TP_VAL"),
+    "read_duration_s": $(json_string "$READ_DURATION_VAL"),
+    "read_throughput_MBps": $(json_string "$READ_TP_VAL"),
+    "stat_avg_latency_us": $(json_string "$STAT_LAT_VAL"),
+    "stat_total_duration_s": $(json_string "$STAT_TOTAL_DURATION_VAL")
   },
   "pass": $PASS_COUNT,
   "fail": $FAIL_COUNT,
   "blocked": $BLOCKED_COUNT,
   "skip": $SKIP_COUNT,
-  "commit": "$(cd /root/tidefs && git rev-parse HEAD 2>/dev/null || echo unknown)",
-  "worktree_dirty": true,
+  "commit": $(json_string "$(git_commit_value)"),
+  "worktree_dirty": $(git_dirty_json_bool),
   "module_source": "configured external module path",
-  "result": "kernel VFS throughput latency baseline: write $WRITE_TP_VAL MB/s, read $READ_TP_VAL MB/s, stat $STAT_LAT_VAL us avg latency"
+  "status": $(json_string "$VERDICT_STATUS"),
+  "result": $(json_string "kernel VFS throughput latency baseline $VERDICT_STATUS: $VERDICT_REASON; write $WRITE_TP_VAL MB/s, read $READ_TP_VAL MB/s, stat $STAT_LAT_VAL us avg latency")
 }
 MANIFEST
 
     echo "Validation output directory: $OUTPUT_DIR"
-
-    if [ "$FAIL_COUNT" -gt 0 ]; then
-      exit 1
-    fi
-    if [ "$BLOCKED_COUNT" -gt 0 ] && [ "$PASS_COUNT" -eq 0 ]; then
-      exit 2
-    fi
-    exit 0
+    exit "$VERDICT_EXIT"
   '';
 in
   kmodPerfScript
