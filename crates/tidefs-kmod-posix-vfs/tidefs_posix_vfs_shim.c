@@ -4617,15 +4617,15 @@ static const struct xattr_handler *tidefs_posix_vfs_xattr_handlers[] = {
 /*
  * POSIX ACL callbacks (REL-KVFS-010).
  *
- * get_acl reads the ACL xattr via the engine and decodes it with the
+ * get_inode_acl reads the ACL xattr via the engine and decodes it with the
  * kernel's posix_acl_from_xattr.  When no ACL is stored (ENODATA),
  * returns NULL so the VFS falls back to mode bits.
  * set_acl stores or removes the ACL xattr via the engine. Access ACL updates
  * use posix_acl_update_mode so the stored ACL and inode mode stay synchronized
  * with Linux filesystem semantics.
  */
-static struct posix_acl *tidefs_posix_vfs_get_acl(struct mnt_idmap *idmap,
-					    struct dentry *dentry, int type)
+static struct posix_acl *tidefs_posix_vfs_get_inode_acl(struct inode *inode,
+						  int type, bool rcu)
 {
 	struct tidefs_posix_vfs_kernel_pool_core *pool;
 	const char *xattr_name;
@@ -4635,7 +4635,10 @@ static struct posix_acl *tidefs_posix_vfs_get_acl(struct mnt_idmap *idmap,
 	unsigned int buf_size = 4096;
 	int ret;
 
-	pool = tidefs_posix_vfs_pool_core_from_sb(d_inode(dentry)->i_sb);
+	if (rcu)
+		return ERR_PTR(-ECHILD);
+
+	pool = tidefs_posix_vfs_pool_core_from_sb(inode->i_sb);
 	if (IS_ERR(pool))
 		return ERR_CAST(pool);
 
@@ -4652,7 +4655,7 @@ static struct posix_acl *tidefs_posix_vfs_get_acl(struct mnt_idmap *idmap,
 
 	/* Read the binary ACL xattr from the engine. */
 	ret = tidefs_posix_vfs_engine_getxattr(
-		d_inode(dentry)->i_ino,
+		inode->i_ino,
 		(const unsigned char *)xattr_name,
 		(unsigned int)strlen(xattr_name),
 		value_buf, buf_size,
@@ -5011,7 +5014,7 @@ static const struct inode_operations tidefs_posix_vfs_file_inode_operations = {
 	.getattr    = tidefs_posix_vfs_getattr,
 	.listxattr  = tidefs_posix_vfs_listxattr,
 	.permission = tidefs_posix_vfs_permission,
-	.get_acl    = tidefs_posix_vfs_get_acl,
+	.get_inode_acl = tidefs_posix_vfs_get_inode_acl,
 	.set_acl    = tidefs_posix_vfs_set_acl,
 	.link       = tidefs_posix_vfs_link,
 	.setattr    = tidefs_posix_vfs_setattr,
@@ -5742,7 +5745,7 @@ static const struct inode_operations tidefs_posix_vfs_dir_inode_operations = {
 	.getattr    = tidefs_posix_vfs_getattr,
 	.listxattr  = tidefs_posix_vfs_listxattr,
 	.permission = tidefs_posix_vfs_permission,
-	.get_acl    = tidefs_posix_vfs_get_acl,
+	.get_inode_acl = tidefs_posix_vfs_get_inode_acl,
 	.set_acl    = tidefs_posix_vfs_set_acl,
 	.lookup     = tidefs_posix_vfs_lookup,
 	.create = tidefs_posix_vfs_create,
