@@ -765,7 +765,6 @@ pub fn check_polymorphic_xattr_current_workspace() -> Result<(), ClusterCheckErr
     for rel in [
         "crates/tidefs-types-polymorphic-xattr-core/Cargo.toml",
         "crates/tidefs-types-polymorphic-xattr-core/src/lib.rs",
-        "docs/POLYMORPHIC_XATTR_STORAGE_DESIGN.md",
     ] {
         check_required_file(&root, rel, &mut missing);
     }
@@ -797,21 +796,6 @@ pub fn check_polymorphic_xattr_current_workspace() -> Result<(), ClusterCheckErr
         &root,
         "crates/tidefs-types-polymorphic-xattr-core/Cargo.toml",
         &["tidefs-types-polymorphic-xattr-core"],
-        &mut missing,
-    );
-
-    check_source_markers(
-        &root,
-        "docs/POLYMORPHIC_XATTR_STORAGE_DESIGN.md",
-        &[
-            "XattrBundleV1",
-            "XattrBtreeRootV1",
-            "XattrStorage",
-            "DatasetXattrPolicy",
-            "Inline -> Tree",
-            "Tree -> Inline",
-            "hysteresis",
-        ],
         &mut missing,
     );
 

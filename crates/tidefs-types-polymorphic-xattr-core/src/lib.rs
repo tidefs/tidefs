@@ -2,26 +2,21 @@
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
 
-//! Authority type definitions for the polymorphic xattr storage.
+//! Portable record and policy types for polymorphic xattr storage.
 //!
-//! Implements the type registry from
-//! [`docs/POLYMORPHIC_XATTR_STORAGE_DESIGN.md`] with two canonical
-//! xattr representations (`XattrBundleV1` inline O(n) and
-//! `XattrBtreeRootV1` external B+tree O(log n)), switching thresholds
-//! with hysteresis, and dataset-level `DatasetXattrPolicy`.
-//!
-//! This crate covers Phase 1 (types + threshold logic + magic validation)
-//! of the design spec. The B+tree implementation and migration engine
-//! are tracked by Review debt TFR-002/TFR-013.
+//! `tidefs-xattr-storage` consumes these types for its in-memory runtime
+//! store, while local-filesystem, FUSE, and kernel paths own persistence and
+//! syscall integration. This crate provides the record vocabulary, threshold
+//! predicates, and magic validation only; its presence does not establish
+//! mounted xattr persistence, POSIX ACL support, kernel equivalence, or
+//! product readiness. Current capability claims remain bounded by the
+//! consuming source paths, `validation/claims.toml`, and live GitHub issues.
 //!
 //! The `alloc` feature gates types that require heap allocation
 //! (`XattrBundleV1`, `XattrInlineEntry`, `XattrBtreeLeafEntry`,
 //! `XattrBtreeInternalEntry`). Fixed-size types (`XattrBtreeRootV1`,
 //! `XattrBtreePageHeader`, `DatasetXattrPolicy`, `XattrStorageKind`,
 //! `LocatorId`) are always available.
-//!
-//! [`docs/POLYMORPHIC_XATTR_STORAGE_DESIGN.md`]:
-//! https://forgejo/forgeadmin/tidefs/docs/POLYMORPHIC_XATTR_STORAGE_DESIGN.md
 
 use core::fmt;
 

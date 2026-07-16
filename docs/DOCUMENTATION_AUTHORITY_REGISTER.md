@@ -657,6 +657,18 @@ a full cluster-membership service, distributed availability, production
 readiness, release readiness, OpenZFS/Ceph parity, performance,
 successor/comparator wording, or operator-readiness claims.
 
+### Polymorphic Xattr Historical Root Deletion (TFR-019 / #1836)
+
+Issue #1836 deleted the imported polymorphic-xattr storage root after
+replacing its remaining live references with source-owned type, runtime,
+local-filesystem, FUSE, and kernel paths, validation claims, and live GitHub
+issue/PR authority. Its lineage remains in git, issue #1836, and its pull
+request only. Issue #1448 separately owns the userspace xattr/statx probe
+safety gap. This deletion does not implement or validate external xattr B-tree
+persistence, mounted xattr or POSIX ACL behavior, kernel/userspace equivalence,
+POSIX completeness, production or release readiness, performance, or
+successor/comparator wording.
+
 ## Incumbent Comparison Audit Slice (#931)
 
 This initial #931 slice classifies the following legacy incumbent-comparison
@@ -727,20 +739,6 @@ This consolidation closes the #931 audit. No live doc contains un-gated
 incumbent-comparison, successor, or product-superiority wording. Any future
 product-facing comparison must route through the matching split
 successor/comparator claim id and comparator evidence.
-
-## Initial Open Queue Resolution (#689)
-
-Classified for TFR-019 / GitHub issue #689 on 2026-06-21 after reviewing the
-register method, repository review history, `validation/claims.toml`, and
-bounded source search for the tempting implementation references. This slice
-does not promote any initial-queue document to current policy or current spec:
-the documents below carry old Forgejo issue-closeout, sealed-design, maturity,
-or production-depth wording whose full source and claims-gate reconciliation is
-larger than this documentation-authority cleanup.
-
-| Path | State | Classification note |
-|---|---|---|
-| `docs/POLYMORPHIC_XATTR_STORAGE_DESIGN.md` | Historical input | Imported Forgejo #1290 xattr storage design with proposed on-media records and ACL integration. Current xattr/ACL behavior and claims coverage were not audited here, so the document remains review material. |
 
 ### Background Service Framework Scheduler Authority (TFR-019 / #1537)
 
