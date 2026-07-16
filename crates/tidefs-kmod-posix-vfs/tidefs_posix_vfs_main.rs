@@ -9478,8 +9478,8 @@ pub extern "C" fn tidefs_posix_vfs_engine_getxattr(
     if name_ptr.is_null() || out_len.is_null() {
         return -(crate::tidefs_kmod_bridge::kernel_types::Errno::EINVAL.0 as core::ffi::c_int);
     }
-    if name_len == 0 || name_len > 256 {
-        return -(crate::tidefs_kmod_bridge::kernel_types::Errno::EINVAL.0 as core::ffi::c_int);
+    if let Err(e) = validate_kernel_name_len(name_len) {
+        return -(e.0 as core::ffi::c_int);
     }
 
     let inode_id = crate::tidefs_kmod_bridge::kernel_types::InodeId::new(ino);
@@ -9604,8 +9604,8 @@ pub extern "C" fn tidefs_posix_vfs_engine_setxattr(
     if name_ptr.is_null() || value_ptr.is_null() {
         return -(crate::tidefs_kmod_bridge::kernel_types::Errno::EINVAL.0 as core::ffi::c_int);
     }
-    if name_len == 0 || name_len > 256 {
-        return -(crate::tidefs_kmod_bridge::kernel_types::Errno::EINVAL.0 as core::ffi::c_int);
+    if let Err(e) = validate_kernel_name_len(name_len) {
+        return -(e.0 as core::ffi::c_int);
     }
 
     let inode_id = crate::tidefs_kmod_bridge::kernel_types::InodeId::new(ino);
@@ -9652,8 +9652,8 @@ pub extern "C" fn tidefs_posix_vfs_engine_removexattr(
     if name_ptr.is_null() {
         return -(crate::tidefs_kmod_bridge::kernel_types::Errno::EINVAL.0 as core::ffi::c_int);
     }
-    if name_len == 0 || name_len > 256 {
-        return -(crate::tidefs_kmod_bridge::kernel_types::Errno::EINVAL.0 as core::ffi::c_int);
+    if let Err(e) = validate_kernel_name_len(name_len) {
+        return -(e.0 as core::ffi::c_int);
     }
 
     let inode_id = crate::tidefs_kmod_bridge::kernel_types::InodeId::new(ino);
