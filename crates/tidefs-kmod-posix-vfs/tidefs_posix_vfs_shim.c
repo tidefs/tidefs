@@ -4827,8 +4827,8 @@ static int tidefs_posix_vfs_set_acl(struct mnt_idmap *idmap,
 	xattr_changed = true;
 
 sync_metadata:
-	/* The xattr is authoritative even if the metadata update below fails. */
-	forget_cached_acl(inode, type);
+	/* Keep the authoritative xattr cached even if metadata sync below fails. */
+	set_cached_acl(inode, type, acl_to_store);
 	if (!xattr_changed && !mode_changed)
 		return 0;
 	if (mode_changed)
