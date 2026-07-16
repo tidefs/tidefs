@@ -1002,6 +1002,35 @@ pub struct Pool {
 /// crash-safe resume on next pool open. Contains the path of the
 /// device being removed.
 const DEVICE_REMOVAL_MARKER_FILE: &str = ".tidefs_device_removal_pending";
+const DEVICE_REMOVAL_MARKER_TMP_FILE: &str = ".tidefs_device_removal_pending.tmp";
+
+fn persist_device_removal_marker(pool_root: &Path, target_path: &Path) -> Result<()> {
+    let marker_path = pool_root.join(DEVICE_REMOVAL_MARKER_FILE);
+    let tmp_path = pool_root.join(DEVICE_REMOVAL_MARKER_TMP_FILE);
+    let persist_result = (|| -> std::io::Result<()> {
+        let mut marker = fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&tmp_path)?;
+        marker.write_all(target_path.to_string_lossy().as_bytes())?;
+        marker.sync_all()?;
+        drop(marker);
+
+        fs::rename(&tmp_path, &marker_path)?;
+        fs::File::open(pool_root)?.sync_all()
+    })();
+
+    if let Err(source) = persist_result {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(StoreError::Io {
+            operation: "persist_device_removal_marker",
+            path: marker_path,
+            source,
+        });
+    }
+    Ok(())
+}
 
 /// Check for a pending device removal marker and resume evacuation if found.
 fn resume_device_removal_if_pending(pool: &mut Pool) {
@@ -3077,13 +3106,10 @@ impl Pool {
                 });
             }
         }
-        if let Err(e) = std::fs::write(&marker_path, path.to_string_lossy().as_bytes()) {
-            return Err(StoreError::Io {
-                operation: "write_device_removal_marker",
-                path: marker_path,
-                source: e,
-            });
-        }
+        // Publish the marker atomically and sync both the file and pool root
+        // before evacuation starts. A crash during a retry therefore leaves
+        // either the previous complete marker or the new complete marker.
+        persist_device_removal_marker(&self.config.root_path, path)?;
 
         // This removal path rewrites every receipt-backed object through the
         // data-class fallback. Keep its candidates inside that I/O class: an
@@ -7045,12 +7071,23 @@ mod tests {
 
         let marker_path = root.join(DEVICE_REMOVAL_MARKER_FILE);
         std::fs::write(&marker_path, d1.to_string_lossy().as_bytes()).unwrap();
+        let marker_tmp_path = root.join(DEVICE_REMOVAL_MARKER_TMP_FILE);
+        std::fs::write(
+            &marker_tmp_path,
+            b"partial marker from interrupted publication",
+        )
+        .unwrap();
 
         drop(pool);
 
         let pool2 = Pool::open(config, PoolProperties::default(), &test_options()).unwrap();
 
         assert!(marker_path.exists());
+        assert!(!marker_tmp_path.exists());
+        assert_eq!(
+            std::fs::read_to_string(&marker_path).unwrap(),
+            d1.to_string_lossy()
+        );
         assert_eq!(pool2.stats().device_count, 2);
         assert_eq!(
             pool2.devices[0].get(rogue_key).unwrap(),
