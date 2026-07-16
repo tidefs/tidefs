@@ -4737,6 +4737,9 @@ static struct posix_acl *tidefs_posix_vfs_get_inode_acl(struct inode *inode,
 	/* Decode using the kernel's built-in POSIX ACL xattr parser. */
 	acl = posix_acl_from_xattr(&init_user_ns, value_buf, out_len);
 	kfree(value_buf);
+	/* posix_acl_chmod() treats EOPNOTSUPP as if no ACL were stored. */
+	if (acl == ERR_PTR(-EOPNOTSUPP))
+		acl = ERR_PTR(-EINVAL);
 	return acl;
 }
 
