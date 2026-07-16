@@ -1012,6 +1012,23 @@ fn resume_device_removal_if_pending(pool: &mut Pool) {
     }
 }
 
+fn placement_receipt_proves_device_evacuation(
+    receipt: &PlacementReceipt,
+    payload_digest: [u8; 32],
+    payload_len: u64,
+    removed_device_guid: [u8; 16],
+) -> bool {
+    receipt.payload_digest == payload_digest
+        && receipt.payload_len == payload_len
+        && receipt.planner_replay_receipt.is_some()
+        && !receipt.targets.is_empty()
+        && receipt
+            .targets
+            .iter()
+            .all(|target| target.device_guid != removed_device_guid)
+        && planner_replay_receipt_matches_receipt(receipt)
+}
+
 fn next_placement_receipt_generation_for_devices(devices: &[Device]) -> u64 {
     let max_generation = devices
         .iter()
@@ -3129,17 +3146,12 @@ impl Pool {
                     }
                 };
 
-            let committed_evacuation = committed_receipt.payload_digest == digest
-                && committed_receipt.payload_len == len
-                && !committed_receipt.targets.is_empty()
-                && committed_receipt
-                    .targets
-                    .iter()
-                    .all(|target| target.device_guid != target_guid)
-                && self
-                    .ensure_receipt_replay_authority(&committed_receipt)
-                    .is_ok();
-            if !committed_evacuation {
+            if !placement_receipt_proves_device_evacuation(
+                &committed_receipt,
+                digest,
+                len,
+                target_guid,
+            ) {
                 mark_failed(&mut result, receipt.object_key);
                 continue;
             }
@@ -6178,6 +6190,56 @@ mod tests {
         assert_eq!(result.failed_keys, vec![key]);
         assert_eq!(pool.stats().device_count, 3);
         assert!(root.join(DEVICE_REMOVAL_MARKER_FILE).exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn safe_remove_device_requires_evacuation_replay_authority() {
+        let root = temp_dir("safe-remove-requires-evacuation-replay-authority");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = multi_data_device_config(&root, 3);
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::replicated(2),
+            ..PoolProperties::default()
+        };
+        let mut pool = Pool::create(config, properties, &test_options()).unwrap();
+        set_deterministic_device_guids(&mut pool);
+
+        let key = ObjectKey::from_name(b"evacuation-replay-authority");
+        let payload = b"evacuation evidence needs a sealed planner replay receipt";
+        pool.put(IoClass::Data, key, payload).unwrap();
+        let mut receipt = pool
+            .placement_receipt_for_key(IoClass::Data, key)
+            .unwrap()
+            .expect("placement receipt");
+        let removed_device_guid = pool
+            .device_guids
+            .iter()
+            .copied()
+            .find(|guid| {
+                receipt
+                    .targets
+                    .iter()
+                    .all(|target| target.device_guid != *guid)
+            })
+            .expect("non-target device");
+        let payload_digest = blake3::hash(payload).into();
+
+        assert!(placement_receipt_proves_device_evacuation(
+            &receipt,
+            payload_digest,
+            payload.len() as u64,
+            removed_device_guid,
+        ));
+
+        receipt.planner_replay_receipt = None;
+        assert!(!placement_receipt_proves_device_evacuation(
+            &receipt,
+            payload_digest,
+            payload.len() as u64,
+            removed_device_guid,
+        ));
 
         let _ = std::fs::remove_dir_all(&root);
     }
