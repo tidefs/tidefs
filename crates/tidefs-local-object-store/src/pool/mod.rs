@@ -3202,14 +3202,12 @@ impl Pool {
             self.devices[idx].sync_all()?;
         }
 
-        // Receipt-backed logical objects were rewritten above; receipt and
-        // shard records are internal placement metadata and are intentionally
-        // skipped here. Any remaining logical key on the target without a
-        // current placement receipt is a removal blocker, not a legacy
-        // hash-routed evacuation candidate.
+        // Receipt-backed logical objects were rewritten above; placement
+        // metadata is skipped only when a readable receipt accounts for it.
+        // An orphaned shard or any remaining logical key on the target is a
+        // removal blocker, not a legacy hash-routed evacuation candidate.
         for key in &keys {
-            if crate::is_pool_placement_scan_internal_key(*key)
-                || internal_placement_keys.contains(key)
+            if internal_placement_keys.contains(key)
                 || rewritten_logical_keys.contains(key)
                 || current_logical_keys.contains(key)
             {
@@ -5980,6 +5978,46 @@ mod tests {
                 reason: "placement receipt corrupt or unverifiable"
             })
         ));
+        assert_eq!(pool.stats().device_count, 4);
+        assert!(root.join(DEVICE_REMOVAL_MARKER_FILE).exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn safe_remove_device_refuses_orphaned_target_erasure_shard() {
+        let root = temp_dir("safe-remove-orphaned-target-erasure-shard");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = multi_data_device_config(&root, 4);
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::erasure(2, 1),
+            ..PoolProperties::default()
+        };
+        let mut pool = Pool::create(config, properties, &test_options()).unwrap();
+        set_deterministic_device_guids(&mut pool);
+
+        let key = ObjectKey::from_name(b"orphaned-erasure-shard-before-remove");
+        let payload = b"removal must not ignore a shard without receipt authority";
+        pool.put(IoClass::Data, key, payload).unwrap();
+        let receipt = pool
+            .placement_receipt_for_key(IoClass::Data, key)
+            .unwrap()
+            .expect("receipt before removal");
+        let victim = &receipt.targets[0];
+        let victim_idx = pool.resolve_receipt_target(victim).unwrap();
+        let victim_path = pool.devices[victim_idx].root().to_path_buf();
+        let shard_key = placement_shard_object_key(key, victim.shard_index);
+        let receipt_key = placement_receipt_object_key(key);
+
+        for device in &mut pool.devices {
+            assert!(device.delete(receipt_key).unwrap());
+        }
+        assert!(pool.devices[victim_idx].get(shard_key).unwrap().is_some());
+
+        let result = pool.safe_remove_device(&victim_path).unwrap();
+        assert!(!result.complete);
+        assert_eq!(result.objects_failed, 1);
+        assert_eq!(result.failed_keys, vec![shard_key]);
         assert_eq!(pool.stats().device_count, 4);
         assert!(root.join(DEVICE_REMOVAL_MARKER_FILE).exists());
 
