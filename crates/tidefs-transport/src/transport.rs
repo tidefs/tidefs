@@ -3438,11 +3438,17 @@ impl Transport {
         }
     }
 
-    fn session_has_ciphers(&self, session_id: SessionId) -> bool {
+    /// Whether the session has authenticated confidentiality for message payloads.
+    #[must_use]
+    pub fn session_has_authenticated_confidentiality(&self, session_id: SessionId) -> bool {
         self.sessions
             .get(&session_id)
-            .and_then(|s| s.lock().ok().map(|s| s.has_ciphers()))
+            .and_then(|s| s.lock().ok().map(|s| s.has_authenticated_confidentiality()))
             .unwrap_or(false)
+    }
+
+    fn session_has_ciphers(&self, session_id: SessionId) -> bool {
+        self.session_has_authenticated_confidentiality(session_id)
     }
 
     fn session_closed_with_reason(
@@ -3608,6 +3614,21 @@ mod tests {
             sid,
             Arc::new(std::sync::Mutex::new(make_ciphered_session(sid, false))),
         );
+    }
+
+    #[test]
+    fn session_confidentiality_introspection_tracks_cipher_state() {
+        let plain_sid = SessionId::new(3005);
+        let ciphered_sid = SessionId::new(3006);
+        let mut transport = Transport::new(2);
+
+        assert!(!transport.session_has_authenticated_confidentiality(plain_sid));
+
+        insert_established_session(&mut transport, plain_sid);
+        assert!(!transport.session_has_authenticated_confidentiality(plain_sid));
+
+        insert_ciphered_responder_session(&mut transport, ciphered_sid);
+        assert!(transport.session_has_authenticated_confidentiality(ciphered_sid));
     }
 
     fn seal_from_ciphered_initiator(sid: SessionId, payload: &[u8]) -> Vec<u8> {

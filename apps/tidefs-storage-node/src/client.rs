@@ -36,6 +36,16 @@ pub fn request(
         .perform_handshake(session_id)
         .map_err(|e| format!("handshake failed: {e:?}"))?;
 
+    if request_requires_authenticated_confidentiality(&request)
+        && !transport.session_has_authenticated_confidentiality(session_id)
+    {
+        let _ = transport.close_session(session_id, SessionCloseReason::LocalShutdown);
+        return Err(
+            "receive requires authenticated transport confidentiality before sending root-authentication key"
+                .into(),
+        );
+    }
+
     if let Err(e) = transport.send_message(session_id, &protocol::encode(&request)) {
         let _ = transport.close_session(session_id, SessionCloseReason::LocalShutdown);
         return Err(format!("send failed: {e:?}"));
@@ -54,6 +64,10 @@ pub fn request(
     close_request_session(&mut transport, session_id);
 
     decoded
+}
+
+pub(crate) fn request_requires_authenticated_confidentiality(request: &Frame) -> bool {
+    matches!(request, Frame::Receive { .. })
 }
 
 fn close_request_session(transport: &mut Transport, session_id: tidefs_transport::SessionId) {
@@ -780,6 +794,95 @@ mod tests {
             placement_epoch: Some(7),
             placement_verified_stable: true,
         }
+    }
+
+    #[test]
+    fn receive_request_requires_authenticated_confidentiality() {
+        let receive = Frame::Receive {
+            export: Vec::new(),
+            root_authentication_key: vec![0x11; 32],
+        };
+
+        assert!(request_requires_authenticated_confidentiality(&receive));
+        assert!(!request_requires_authenticated_confidentiality(
+            &Frame::List
+        ));
+        assert!(!request_requires_authenticated_confidentiality(
+            &Frame::Get { key: b"k".to_vec() }
+        ));
+    }
+
+    #[test]
+    fn receive_request_refuses_before_sending_secret_without_confidentiality() {
+        let mut server = Transport::new(2);
+        server
+            .bind(tidefs_transport::TransportAddr::Tcp(
+                "127.0.0.1:0".parse().unwrap(),
+            ))
+            .expect("server bind");
+        let server_addr = match server.bind_addr.as_ref().expect("server bind addr") {
+            tidefs_transport::TransportAddr::Tcp(addr) => *addr,
+            other => panic!("expected TCP bind address, got {other:?}"),
+        };
+
+        let server_handle = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let session_id = loop {
+                match server.accept_incoming() {
+                    Ok(session_id) => break session_id,
+                    Err(TransportError::Generic(ref msg))
+                        if msg.contains("no pending connections") =>
+                    {
+                        if Instant::now() >= deadline {
+                            panic!("server accept timed out");
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(e) => panic!("server accept failed: {e:?}"),
+                }
+            };
+
+            server
+                .perform_handshake(session_id)
+                .expect("server handshake");
+            server.set_nonblocking(true).expect("server nonblocking");
+
+            let deadline = Instant::now() + Duration::from_millis(250);
+            while Instant::now() < deadline {
+                match server.recv_message(session_id) {
+                    Ok(raw) => return protocol::decode(&raw),
+                    Err(TransportError::WouldBlock(_)) => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => return None,
+                }
+            }
+
+            None
+        });
+
+        let err = request(
+            1,
+            2,
+            server_addr,
+            Frame::Receive {
+                export: b"export".to_vec(),
+                root_authentication_key: vec![0x11; 32],
+            },
+            false,
+        )
+        .expect_err("receive request should be refused before send");
+
+        assert_eq!(
+            err,
+            "receive requires authenticated transport confidentiality before sending root-authentication key"
+        );
+
+        let received = server_handle.join().expect("server thread");
+        assert!(
+            received.is_none(),
+            "server must not receive an application frame before the client refuses: {received:?}"
+        );
     }
 
     #[test]

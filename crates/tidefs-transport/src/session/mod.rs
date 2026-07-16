@@ -444,6 +444,12 @@ impl Session {
         self.outbound_cipher.is_some() && self.inbound_cipher.is_some()
     }
 
+    /// Whether the session has authenticated confidentiality for message payloads.
+    #[must_use]
+    pub fn has_authenticated_confidentiality(&self) -> bool {
+        self.has_ciphers()
+    }
+
     /// Complete the auth handshake integration: apply the 7-step mutual
     /// attestation result to this transport session.
     ///
