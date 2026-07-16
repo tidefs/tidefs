@@ -8,7 +8,10 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process;
-use tidefs_validation::evidence_artifact_manifest::load_evidence_artifact_manifest_json_path;
+use tidefs_validation::evidence_artifact_manifest::{
+    is_runtime_artifact_path, load_evidence_artifact_manifest_json_path,
+};
+use tidefs_validation::validation_schema::ValidationTier;
 
 const SCHEMA_VERSION: u32 = 1;
 const VERDICT_BOUNDARY: &str = "release-readiness-verdict";
@@ -1162,6 +1165,14 @@ fn evaluate_claim_evidence(
                     ));
                     outcome = VerdictOutcome::Malformed;
                 }
+                let manifest_validation_tier = manifest.validation_tier.label();
+                if manifest_validation_tier != requirement.validation_tier {
+                    details.push(format!(
+                        "manifest validation_tier `{manifest_validation_tier}` does not match registry tier `{}`",
+                        requirement.validation_tier
+                    ));
+                    outcome = VerdictOutcome::Malformed;
+                }
                 if manifest.source_ref != config.source_ref {
                     details.push(format!(
                         "manifest source_ref `{}` does not match verdict source `{}`",
@@ -1225,6 +1236,17 @@ fn evaluate_claim_evidence(
                 };
             }
         }
+    } else if is_live_runtime_validation_tier(&requirement.validation_tier) {
+        details.push(format!(
+            "runtime-tier evidence requirement for class `{class}` must name manifest_path"
+        ));
+        outcome = VerdictOutcome::Malformed;
+    } else if is_runtime_artifact_path(requirement.path.as_str()) {
+        details.push(format!(
+            "runtime artifact path `{}` for class `{class}` requires live-runtime validation_tier and manifest_path",
+            requirement.path
+        ));
+        outcome = VerdictOutcome::Malformed;
     } else {
         let artifact_path = config.workspace_root.join(&requirement.path);
         if !artifact_path.exists() {
@@ -1251,6 +1273,15 @@ fn evaluate_claim_evidence(
         residual_risk,
         details,
     }
+}
+
+fn is_live_runtime_validation_tier(validation_tier: &str) -> bool {
+    matches!(
+        serde_json::from_value::<ValidationTier>(serde_json::Value::String(
+            validation_tier.to_string()
+        )),
+        Ok(tier) if tier.is_live_runtime()
+    )
 }
 
 fn evaluate_standing_ci(path: Option<&PathBuf>) -> Vec<CiLaneVerdict> {
@@ -1708,6 +1739,136 @@ mod tests {
     }
 
     #[test]
+    fn release_readiness_manifest_validation_tier_mismatch_fails_closed() {
+        let fixture = Fixture::new();
+        fixture.write_rc_index(&fixture.source_ref, &fixture.source_sha, "full");
+        fixture.write_pass_manifest_with_validation_tier(
+            "storage.intent.successor_comparator.v1",
+            "cargo-unit",
+        );
+        fixture.write_claim_registry("validated");
+        fixture.write_non_claim_inputs();
+
+        let artifact = assemble_verdict(&fixture.config());
+
+        assert_eq!(
+            artifact.product_readiness_verdict,
+            ProductReadinessVerdict::NotReady
+        );
+        assert!(artifact
+            .claim_evidence
+            .iter()
+            .any(
+                |claim| claim.required_evidence.iter().any(|evidence| evidence.class
+                    == "claims-gate-review"
+                    && evidence.outcome == VerdictOutcome::Malformed
+                    && evidence
+                        .details
+                        .iter()
+                        .any(|detail| detail.contains("validation_tier")))
+            ));
+    }
+
+    #[test]
+    fn release_readiness_runtime_requirement_without_manifest_fails_closed() {
+        let fixture = Fixture::new();
+        fixture.write_rc_index(&fixture.source_ref, &fixture.source_sha, "full");
+        let artifact_path = fixture
+            .temp
+            .path()
+            .join("validation/artifacts/test/claims-gate-review.json");
+        fs::create_dir_all(artifact_path.parent().unwrap()).unwrap();
+        fs::write(&artifact_path, r#"{"decision":"pass"}"#).unwrap();
+        fixture.write_claim_registry_with_requirement("validated", "mounted-userspace", None);
+        fixture.write_non_claim_inputs();
+
+        let artifact = assemble_verdict(&fixture.config());
+
+        assert_eq!(
+            artifact.product_readiness_verdict,
+            ProductReadinessVerdict::NotReady
+        );
+        assert!(artifact
+            .claim_evidence
+            .iter()
+            .any(
+                |claim| claim.required_evidence.iter().any(|evidence| evidence.class
+                    == "claims-gate-review"
+                    && evidence.outcome == VerdictOutcome::Malformed
+                    && evidence
+                        .details
+                        .iter()
+                        .any(|detail| detail.contains("runtime-tier")
+                            && detail.contains("manifest_path")))
+            ));
+    }
+
+    #[test]
+    fn release_readiness_kbuild_requirement_without_manifest_is_code_only() {
+        let fixture = Fixture::new();
+        fixture.write_rc_index(&fixture.source_ref, &fixture.source_sha, "full");
+        let artifact_path = fixture
+            .temp
+            .path()
+            .join("validation/artifacts/test/claims-gate-review.json");
+        fs::create_dir_all(artifact_path.parent().unwrap()).unwrap();
+        fs::write(&artifact_path, r#"{"decision":"pass"}"#).unwrap();
+        fixture.write_claim_registry_with_requirement("validated", "kbuild", None);
+        fixture.write_non_claim_inputs();
+
+        let artifact = assemble_verdict(&fixture.config());
+
+        assert!(artifact.claim_evidence.iter().any(|claim| {
+            claim.required_evidence.iter().any(|evidence| {
+                evidence.class == "claims-gate-review"
+                    && evidence.validation_tier == "kbuild"
+                    && evidence.outcome == VerdictOutcome::Pass
+                    && evidence
+                        .details
+                        .iter()
+                        .all(|detail| !detail.contains("manifest_path"))
+            })
+        }));
+    }
+
+    #[test]
+    fn release_readiness_runtime_artifact_path_without_manifest_fails_closed() {
+        let fixture = Fixture::new();
+        fixture.write_rc_index(&fixture.source_ref, &fixture.source_sha, "full");
+        let artifact_path = fixture
+            .temp
+            .path()
+            .join("validation/artifacts/test/claims-gate-review-runtime.json");
+        fs::create_dir_all(artifact_path.parent().unwrap()).unwrap();
+        fs::write(&artifact_path, r#"{"decision":"pass"}"#).unwrap();
+        fixture.write_claim_registry_with_requirement_path(
+            "validated",
+            "source-model",
+            "validation/artifacts/test/claims-gate-review-runtime.json",
+            None,
+        );
+        fixture.write_non_claim_inputs();
+
+        let artifact = assemble_verdict(&fixture.config());
+
+        assert_eq!(
+            artifact.product_readiness_verdict,
+            ProductReadinessVerdict::NotReady
+        );
+        assert!(artifact.claim_evidence.iter().any(|claim| {
+            claim.required_evidence.iter().any(|evidence| {
+                evidence.class == "claims-gate-review"
+                    && evidence.outcome == VerdictOutcome::Malformed
+                    && evidence.details.iter().any(|detail| {
+                        detail.contains("runtime artifact path")
+                            && detail.contains("live-runtime")
+                            && detail.contains("manifest_path")
+                    })
+            })
+        }));
+    }
+
+    #[test]
     fn release_readiness_stale_source_ref_fails_closed() {
         let fixture = Fixture::new();
         fixture.write_rc_index("refs/heads/other", &fixture.source_sha, "full");
@@ -1843,6 +2004,37 @@ mod tests {
         }
 
         fn write_claim_registry(&self, status: &str) {
+            self.write_claim_registry_with_requirement(
+                status,
+                "source-model",
+                Some("validation/artifacts/test/claims-gate-review.manifest.json"),
+            );
+        }
+
+        fn write_claim_registry_with_requirement(
+            &self,
+            status: &str,
+            validation_tier: &str,
+            manifest_path: Option<&str>,
+        ) {
+            self.write_claim_registry_with_requirement_path(
+                status,
+                validation_tier,
+                "validation/artifacts/test/claims-gate-review.json",
+                manifest_path,
+            );
+        }
+
+        fn write_claim_registry_with_requirement_path(
+            &self,
+            status: &str,
+            validation_tier: &str,
+            path: &str,
+            manifest_path: Option<&str>,
+        ) {
+            let manifest_path = manifest_path
+                .map(|manifest_path| format!(r#", manifest_path = "{manifest_path}""#))
+                .unwrap_or_default();
             let registry = format!(
                 r#"
 [[product_admission_gates]]
@@ -1861,7 +2053,7 @@ status = "{status}"
 scope = "fixture claim"
 required_evidence_classes = ["claims-gate-review"]
 evidence_requirements = [
-  {{ class = "claims-gate-review", path = "validation/artifacts/test/claims-gate-review.json", validation_tier = "source-model", manifest_path = "validation/artifacts/test/claims-gate-review.manifest.json", blocking_issues = [] }},
+  {{ class = "claims-gate-review", path = "{path}", validation_tier = "{validation_tier}"{manifest_path}, blocking_issues = [] }},
 ]
 blockers = ["Fixture claim remains blocked #1740"]
 generated_doc = "Fixture wording"
@@ -1872,6 +2064,10 @@ generated_doc = "Fixture wording"
         }
 
         fn write_pass_manifest(&self, claim_id: &str) {
+            self.write_pass_manifest_with_validation_tier(claim_id, "source-model");
+        }
+
+        fn write_pass_manifest_with_validation_tier(&self, claim_id: &str, validation_tier: &str) {
             let artifact_path = self
                 .temp
                 .path()
@@ -1883,7 +2079,7 @@ generated_doc = "Fixture wording"
   "manifest_version": 2,
   "claim_id": "{claim_id}",
   "evidence_class": "claims-gate-review",
-  "validation_tier": "source-model",
+  "validation_tier": "{validation_tier}",
   "scope": "fixture",
   "artifact_path": "validation/artifacts/test/claims-gate-review.json",
   "content_digest": "{digest}",

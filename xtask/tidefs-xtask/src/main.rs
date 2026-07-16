@@ -2067,6 +2067,28 @@ error[E0308]: mismatched types
     }
 
     #[test]
+    fn validate_evidence_manifest_resolves_workspace_relative_artifact() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            temp.path().join("Cargo.toml"),
+            "[workspace]\nmembers = []\n",
+        )
+        .expect("write workspace manifest");
+        let manifest_dir = temp.path().join("validation/artifacts/evidence");
+        fs::create_dir_all(&manifest_dir).expect("create manifest dir");
+        let artifact_bytes = br#"{"workspace":true}"#;
+        fs::write(manifest_dir.join("artifact.json"), artifact_bytes).expect("write artifact");
+        let manifest = evidence_manifest_for(
+            "validation/artifacts/evidence/artifact.json",
+            artifact_bytes,
+        );
+        let manifest_path = write_manifest(&manifest_dir, &manifest);
+
+        validate_evidence_manifest_path(&manifest_path)
+            .expect("workspace-relative artifact passes");
+    }
+
+    #[test]
     fn validate_evidence_manifest_rejects_mismatched_artifact_digest() {
         let temp = tempfile::tempdir().expect("tempdir");
         fs::write(temp.path().join("artifact.json"), b"actual bytes").expect("write artifact");
@@ -2098,7 +2120,7 @@ error[E0308]: mismatched types
     }
 
     #[test]
-    fn validate_evidence_manifest_resolves_artifact_relative_to_manifest_dir() {
+    fn validate_evidence_manifest_falls_back_to_manifest_dir_outside_workspace() {
         let temp = tempfile::tempdir().expect("tempdir");
         let manifest_dir = temp.path().join("evidence");
         fs::create_dir(&manifest_dir).expect("create manifest dir");
@@ -2108,7 +2130,7 @@ error[E0308]: mismatched types
         let manifest = evidence_manifest_for("artifact.json", artifact_bytes);
         let manifest_path = write_manifest(&manifest_dir, &manifest);
 
-        validate_evidence_manifest_path(&manifest_path).expect("manifest-relative artifact passes");
+        validate_evidence_manifest_path(&manifest_path).expect("manifest-dir artifact passes");
     }
 
     #[test]
@@ -2628,7 +2650,7 @@ fn print_help() {
         "  validate-ublk-started-export-admission-artifact <path> validate started uBLK export admission evidence"
     );
     println!("  check-no-hidden-queues  validate queue roots in touched implementation packages");
-    println!("  validate-evidence-manifest <path> [--require-status <STATUS>] validate a claim evidence artifact manifest JSON and verify artifact_path digest under the manifest directory or current repository root");
+    println!("  validate-evidence-manifest <path> [--require-status <STATUS>] validate a claim evidence artifact manifest JSON and verify workspace-relative artifact_path digest");
     println!("  validate-xfstests-evidence-manifest <path> validate an xfstests evidence manifest JSON against schema");
     println!("  validate-kernel-teardown-runtime-artifact <path> validate a kernel teardown no-work-after artifact JSON against schema");
     println!(

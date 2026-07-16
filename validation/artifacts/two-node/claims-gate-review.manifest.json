@@ -5,7 +5,7 @@
   "validation_tier": "source-model",
   "scope": "source inspection review for two-node harness EvidenceArtifactManifest adoption; records that no stable two-node claim id is registered yet and that this artifact is not claim closure",
   "artifact_path": "validation/artifacts/two-node/claims-gate-review.toml",
-  "content_digest": "blake3:0000000000000000000000000000000000000000000000000000000000000000",
+  "content_digest": "blake3:f68eff9914d9257819ea3b0ec8765e5da87070f1928f12ac48cfeba3970103b6",
   "run_id": "deterministic-fixture:issue-1487-two-node-manifest-boundary-review-v1",
   "source_ref": "refs/heads/gpt2/issue-1487-two-node-harness-manifests",
   "outcome": "skip",

@@ -117,15 +117,21 @@ impl EvidenceArtifactManifest {
         if self.evidence_class.trim().is_empty() {
             failures.push("evidence_class must not be empty".to_string());
         }
-        if self.scope.trim().is_empty() {
-            failures.push("scope must not be empty".to_string());
+        validate_required_provenance_text("scope", &self.scope, &mut failures);
+        if let Err(error) = validate_artifact_path_shape(&self.artifact_path) {
+            failures.extend(error.failures().iter().cloned());
         }
-        validate_relative_artifact_path(&self.artifact_path, &mut failures);
+        if is_runtime_artifact_path(Path::new(&self.artifact_path))
+            && !self.validation_tier.is_live_runtime()
+        {
+            failures
+                .push("runtime artifact_path requires live-runtime validation_tier".to_string());
+        }
         validate_content_digest(&self.content_digest, &mut failures);
-        validate_required_text("run_id", &self.run_id, &mut failures);
-        validate_required_text("source_ref", &self.source_ref, &mut failures);
-        validate_required_text("residual_risk", &self.residual_risk, &mut failures);
-        validate_required_text("source", &self.source, &mut failures);
+        validate_required_provenance_text("run_id", &self.run_id, &mut failures);
+        validate_required_provenance_text("source_ref", &self.source_ref, &mut failures);
+        validate_required_provenance_text("residual_risk", &self.residual_risk, &mut failures);
+        validate_required_provenance_text("source", &self.source, &mut failures);
         validate_generated_at(&self.generated_at, &mut failures);
         validate_outcome_tier_combination(
             self.outcome,
@@ -158,9 +164,7 @@ impl EvidenceArtifactManifest {
         &self,
         root: impl AsRef<Path>,
     ) -> Result<PathBuf, EvidenceArtifactManifestError> {
-        let mut failures = Vec::new();
-        validate_relative_artifact_path(&self.artifact_path, &mut failures);
-        EvidenceArtifactManifestError::from_failures(failures)?;
+        validate_artifact_path_shape(&self.artifact_path)?;
         let root = root.as_ref();
         let canonical_root = root.canonicalize().map_err(|error| {
             EvidenceArtifactManifestError::single(format!(
@@ -274,6 +278,32 @@ pub fn content_digest_for_path(
     Ok(content_digest_for_bytes(&bytes))
 }
 
+pub fn validate_artifact_path_shape(path: &str) -> Result<(), EvidenceArtifactManifestError> {
+    let mut failures = Vec::new();
+    validate_relative_artifact_path(path, &mut failures);
+    EvidenceArtifactManifestError::from_failures(failures)
+}
+
+#[must_use]
+pub fn is_runtime_artifact_path(path: impl AsRef<Path>) -> bool {
+    let path = path.as_ref();
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    if file_name.to_ascii_lowercase().ends_with(".manifest.json") {
+        return false;
+    }
+
+    path.components().any(|component| {
+        component.as_os_str().to_str().is_some_and(|component| {
+            component
+                .split(|byte: char| !byte.is_ascii_alphanumeric())
+                .any(|token| token.eq_ignore_ascii_case("runtime"))
+        })
+    })
+}
+
 fn validate_relative_artifact_path(path: &str, failures: &mut Vec<String>) {
     if path.trim().is_empty() {
         failures.push("artifact_path must not be empty".to_string());
@@ -288,10 +318,19 @@ fn validate_relative_artifact_path(path: &str, failures: &mut Vec<String>) {
     if is_windows_absolute_path(path) {
         failures.push("artifact_path must be relative".to_string());
     }
+    if path.contains('\\') {
+        failures.push("artifact_path must use `/` separators".to_string());
+    }
     if path.contains('$') || path.contains('`') {
         failures.push(
             "artifact_path must not contain shell interpolation or secret expressions".to_string(),
         );
+    }
+    if path.ends_with('/') || path.ends_with('\\') {
+        failures.push("artifact_path must name a file".to_string());
+    }
+    if path.split(['/', '\\']).any(|component| component == ".") {
+        failures.push("artifact_path must not contain `.`".to_string());
     }
 
     let path = Path::new(path);
@@ -323,6 +362,30 @@ fn validate_required_text(field: &str, value: &str, failures: &mut Vec<String>) 
     }
     if value.contains("${{ secrets.") || value.contains("secrets.") {
         failures.push(format!("{field} must not contain runner secret references"));
+    }
+}
+
+fn validate_required_provenance_text(field: &str, value: &str, failures: &mut Vec<String>) {
+    const PLACEHOLDER_PROVENANCE_VALUES: &[&str] = &[
+        "unknown",
+        "placeholder",
+        "fake",
+        "dummy",
+        "todo",
+        "tbd",
+        "n/a",
+        "none",
+        "unset",
+    ];
+
+    validate_required_text(field, value, failures);
+
+    let normalized = value.trim().to_ascii_lowercase();
+    if PLACEHOLDER_PROVENANCE_VALUES.contains(&normalized.as_str()) {
+        failures.push(format!(
+            "{field} must identify concrete provenance, not placeholder value `{}`",
+            value.trim()
+        ));
     }
 }
 
@@ -452,6 +515,36 @@ mod tests {
     }
 
     #[test]
+    fn provenance_fields_reject_placeholder_values() {
+        for (field, placeholder) in [
+            ("scope", "unknown"),
+            ("run_id", "placeholder"),
+            ("source_ref", "fake"),
+            ("residual_risk", "TBD"),
+            ("source", "unset"),
+        ] {
+            let mut manifest = valid_manifest();
+            match field {
+                "scope" => manifest.scope = placeholder.to_string(),
+                "run_id" => manifest.run_id = placeholder.to_string(),
+                "source_ref" => manifest.source_ref = placeholder.to_string(),
+                "residual_risk" => manifest.residual_risk = placeholder.to_string(),
+                "source" => manifest.source = placeholder.to_string(),
+                _ => unreachable!("test only covers provenance fields"),
+            }
+
+            let err = manifest
+                .validate()
+                .expect_err("placeholder provenance must fail");
+            assert!(
+                err.failures().iter().any(|failure| failure.contains(field)
+                    && failure.contains("placeholder value")),
+                "missing placeholder provenance failure for {field}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
     fn version_one_manifest_is_retired_pre_standardization_input() {
         let json = r#"{
             "manifest_version": 1,
@@ -541,6 +634,53 @@ mod tests {
                     .iter()
                     .any(|failure| failure.contains("artifact_path")),
                 "missing artifact_path failure for {path}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn artifact_path_rejects_directory_shaped_paths() {
+        for path in [
+            "validation/artifacts/example/",
+            "validation/artifacts/example\\",
+        ] {
+            let err = validate_artifact_path_shape(path).expect_err("directory path must fail");
+            assert!(
+                err.failures()
+                    .iter()
+                    .any(|failure| failure == "artifact_path must name a file"),
+                "missing file-name failure for {path}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn artifact_path_rejects_backslash_separators() {
+        let path = "validation\\artifacts\\example\\summary.json";
+
+        let err = validate_artifact_path_shape(path).expect_err("backslash path must fail");
+        assert!(
+            err.failures()
+                .iter()
+                .any(|failure| failure == "artifact_path must use `/` separators"),
+            "missing separator failure for {path}: {err:?}"
+        );
+    }
+
+    #[test]
+    fn artifact_path_rejects_current_directory_components() {
+        for path in [
+            "./validation/artifacts/model.json",
+            "validation/./artifacts/model.json",
+            "validation/artifacts/./model.json",
+        ] {
+            let err =
+                validate_artifact_path_shape(path).expect_err("current-directory path must fail");
+            assert!(
+                err.failures()
+                    .iter()
+                    .any(|failure| failure == "artifact_path must not contain `.`"),
+                "missing current-directory failure for {path}: {err:?}"
             );
         }
     }

@@ -3,6 +3,18 @@
 This directory is for small, source-controlled validation fixtures such as
 golden binary records, seed inputs, and static compatibility samples.
 
+Committed files under `validation/artifacts/` have two allowed roles:
+
+- source-controlled fixtures, which are deterministic inputs or model outputs
+  kept for replay, compatibility, or schema checks; or
+- promoted evidence, which is runtime or tool output intentionally retained as
+  claim evidence.
+
+Promoted runtime evidence must carry a version-2 evidence artifact manifest
+with explicit provenance, including the producing source, run id, source ref,
+validation tier, outcome, residual risk, workspace-relative artifact path, and
+matching content digest.
+
 Runtime validation output must stay outside the repository, normally under:
 
 ```text
@@ -12,8 +24,14 @@ Runtime validation output must stay outside the repository, normally under:
 Do not create repo-local validation output, output indexes, promotion state, or
 policy surface here. A validation command may record commit, branch, dirty
 state, command, kernel, backend, and result in its external output directory,
-but those files are scratch state unless the operator explicitly requests a
-separate handoff outside this repository.
+but those files are scratch state until explicitly promoted as fixture or
+evidence. Committed artifact payloads and manifests must not embed scratch-only
+paths such as `/tmp/tidefs-validation/...`,
+`/root/ai/tmp/tidefs-validation/...`, or JSON escapes that decode to those
+paths unless a documented fixture exception explains why the literal path is
+the value under test. This includes both `\/` and case-insensitive `\u002f`
+slash escapes, plus ASCII `\u00XX` escapes for scratch-root bytes, because they
+decode to the same scratch paths.
 
 ## Evidence Artifact Manifests
 
@@ -50,6 +68,9 @@ The `artifact_path` must be relative to the repository or validation artifact
 root, and `content_digest` must match the bytes at that path. Use the
 manifest helpers in `tidefs-validation` to serialize, parse, and verify the
 record instead of parsing per-tool output shapes.
+For committed manifests, the referenced payload must also be a committed
+repository file; it may live outside `validation/artifacts/` when the registry
+intentionally names a repo-relative fixture or source-model input.
 
 Version-1 manifests are retired pre-standardization input. They can be read as
 historical review material, but `validate-evidence-manifest` rejects them for

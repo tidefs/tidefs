@@ -1,0 +1,16 @@
+{
+  "manifest_version": 2,
+  "claim_id": "kernel.teardown.no_work_after.v1",
+  "evidence_class": "teardown-race-proof-artifact",
+  "validation_tier": "source-model",
+  "scope": "source-model kernel teardown race proof artifact",
+  "artifact_path": "validation/artifacts/kernel/teardown-race-proof-artifact.json",
+  "content_digest": "blake3:8b7008e3acd561d31f25dc349e15a926798a59d2a6207bc306a1098d1d5a7f55",
+  "run_id": "deterministic-fixture:kernel-teardown-race-proof-artifact-v1",
+  "source_ref": "refs/heads/codex2/issue-1851-validation-artifacts",
+  "outcome": "pass",
+  "residual_risk": "This manifest records bounded source-model teardown race evidence only. Mounted kernel, QEMU, filesystem runtime, and T6 full-kernel/no-daemon teardown and recovery proof remain absent.",
+  "source": "tidefs-kmod-posix-vfs::kernel_env_model",
+  "generated_at": "2026-07-09T02:59:23Z",
+  "blocking_issues": []
+}
