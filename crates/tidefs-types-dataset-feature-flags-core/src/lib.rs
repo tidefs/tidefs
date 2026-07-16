@@ -286,13 +286,13 @@ impl fmt::Display for InvalidFeatureName {
 }
 
 // ---------------------------------------------------------------------------
-// DatasetFeatureFlagsV1 — on-media struct (three B-tree roots)
+// DatasetFeatureFlagsV1 — on-media struct (three logical object-key roots)
 // ---------------------------------------------------------------------------
 
-/// Root pointer to a B-tree stored on media.
+/// Opaque unresolved tree handle retained for deferred-cleanup records.
 ///
-/// This is a placeholder newtype; the actual B-tree root pointer layout
-/// (segment id + offset + generation) is defined in the storage engine layer.
+/// Dataset feature-tree records deliberately do not use this type: their
+/// implemented storage family is addressed by [`FeatureTreeRootKeyV1`].
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
 pub struct BtreeRootPointer(pub u64);
 
@@ -306,29 +306,170 @@ impl BtreeRootPointer {
     }
 }
 
-/// Per-dataset feature flag storage — three B-trees, one per class.
+/// Logical object key for one persisted feature-tree root.
 ///
-/// Rooted in the dataset record's TLV extension area. Each B-tree maps
-/// `FeatureName` (key) to `FeatureFlagValueV1` (value).
+/// All 32 bytes are part of the V1 address. The all-zero value is reserved as
+/// the empty-tree sentinel; every other value is a required object-store key.
+#[derive(Clone, Copy, Default, Eq, PartialEq, Hash)]
+pub struct FeatureTreeRootKeyV1([u8; 32]);
+
+impl FeatureTreeRootKeyV1 {
+    pub const WIRE_SIZE: usize = 32;
+    pub const EMPTY: Self = Self([0_u8; Self::WIRE_SIZE]);
+
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; Self::WIRE_SIZE]) -> Self {
+        Self(bytes)
+    }
+
+    #[must_use]
+    pub const fn new_required(bytes: [u8; Self::WIRE_SIZE]) -> Option<Self> {
+        let root = Self(bytes);
+        if root.is_empty() {
+            None
+        } else {
+            Some(root)
+        }
+    }
+
+    #[must_use]
+    pub const fn as_bytes(self) -> [u8; Self::WIRE_SIZE] {
+        self.0
+    }
+
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        let mut index = 0;
+        while index < Self::WIRE_SIZE {
+            if self.0[index] != 0 {
+                return false;
+            }
+            index += 1;
+        }
+        true
+    }
+
+    #[must_use]
+    pub const fn is_required(self) -> bool {
+        !self.is_empty()
+    }
+
+    #[must_use]
+    pub const fn required(self) -> Option<Self> {
+        if self.is_required() {
+            Some(self)
+        } else {
+            None
+        }
+    }
+
+    #[must_use]
+    pub fn encode(self) -> [u8; Self::WIRE_SIZE] {
+        self.0
+    }
+
+    #[must_use]
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != Self::WIRE_SIZE {
+            return None;
+        }
+        let mut key = [0_u8; Self::WIRE_SIZE];
+        key.copy_from_slice(bytes);
+        Some(Self(key))
+    }
+}
+
+impl fmt::Display for FeatureTreeRootKeyV1 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.is_empty() {
+            return f.write_str("FeatureTreeRootKeyV1(EMPTY)");
+        }
+        f.write_str("FeatureTreeRootKeyV1(")?;
+        for byte in self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        f.write_str(")")
+    }
+}
+
+impl fmt::Debug for FeatureTreeRootKeyV1 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DatasetFeatureFlagsDecodeError {
+    InvalidSize { actual: usize },
+    InvalidMagic,
+    UnsupportedVersion { version: u16 },
+    NonzeroReserved { value: u16 },
+}
+
+impl fmt::Display for DatasetFeatureFlagsDecodeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidSize { actual } => write!(
+                f,
+                "invalid dataset feature-root record size {actual}, expected {}",
+                DatasetFeatureFlagsV1::WIRE_SIZE
+            ),
+            Self::InvalidMagic => f.write_str("invalid dataset feature-root record magic"),
+            Self::UnsupportedVersion { version } => {
+                write!(
+                    f,
+                    "unsupported dataset feature-root record version {version}"
+                )
+            }
+            Self::NonzeroReserved { value } => write!(
+                f,
+                "dataset feature-root record reserved field is nonzero ({value})"
+            ),
+        }
+    }
+}
+
+/// Per-dataset feature flag storage — three logical-keyed trees, one per class.
+///
+/// The encoded record starts with an explicit magic/version header followed by
+/// the exact 32-byte object key for each class. Unknown versions, nonzero
+/// reserved fields, and retired record widths are rejected instead of being
+/// reinterpreted.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
 pub struct DatasetFeatureFlagsV1 {
     /// B-tree root for `compat` features.
-    pub compat_root: BtreeRootPointer,
+    pub compat_root: FeatureTreeRootKeyV1,
     /// B-tree root for `ro_compat` features.
-    pub ro_compat_root: BtreeRootPointer,
+    pub ro_compat_root: FeatureTreeRootKeyV1,
     /// B-tree root for `incompat` features.
-    pub incompat_root: BtreeRootPointer,
+    pub incompat_root: FeatureTreeRootKeyV1,
 }
 
 impl DatasetFeatureFlagsV1 {
-    /// Returns the root pointer for the given class.
+    pub const MAGIC: [u8; 4] = *b"TFFR";
+    pub const FORMAT_VERSION: u16 = 1;
+    const HEADER_SIZE: usize = 8;
+    const VERSION_OFFSET: usize = 4;
+    const RESERVED_OFFSET: usize = 6;
+    const COMPAT_ROOT_OFFSET: usize = Self::HEADER_SIZE;
+    const RO_COMPAT_ROOT_OFFSET: usize = Self::COMPAT_ROOT_OFFSET + FeatureTreeRootKeyV1::WIRE_SIZE;
+    const INCOMPAT_ROOT_OFFSET: usize =
+        Self::RO_COMPAT_ROOT_OFFSET + FeatureTreeRootKeyV1::WIRE_SIZE;
+    pub const WIRE_SIZE: usize = Self::INCOMPAT_ROOT_OFFSET + FeatureTreeRootKeyV1::WIRE_SIZE;
+
+    /// Returns the logical object-key root for the given class.
     #[must_use]
-    pub const fn root_for(&self, class: FeatureClass) -> BtreeRootPointer {
+    pub const fn root_for(&self, class: FeatureClass) -> FeatureTreeRootKeyV1 {
         match class {
             FeatureClass::Compat => self.compat_root,
             FeatureClass::RoCompat => self.ro_compat_root,
             FeatureClass::Incompat => self.incompat_root,
         }
+    }
+
+    #[must_use]
+    pub const fn required_root_for(&self, class: FeatureClass) -> Option<FeatureTreeRootKeyV1> {
+        self.root_for(class).required()
     }
 
     /// Returns `true` if all three B-trees are empty (no features enabled).
@@ -337,6 +478,58 @@ impl DatasetFeatureFlagsV1 {
         self.compat_root.is_empty()
             && self.ro_compat_root.is_empty()
             && self.incompat_root.is_empty()
+    }
+
+    #[must_use]
+    pub fn encode(self) -> [u8; Self::WIRE_SIZE] {
+        let mut bytes = [0_u8; Self::WIRE_SIZE];
+        bytes[..Self::MAGIC.len()].copy_from_slice(&Self::MAGIC);
+        bytes[Self::VERSION_OFFSET..Self::RESERVED_OFFSET]
+            .copy_from_slice(&Self::FORMAT_VERSION.to_le_bytes());
+        bytes[Self::COMPAT_ROOT_OFFSET..Self::RO_COMPAT_ROOT_OFFSET]
+            .copy_from_slice(&self.compat_root.encode());
+        bytes[Self::RO_COMPAT_ROOT_OFFSET..Self::INCOMPAT_ROOT_OFFSET]
+            .copy_from_slice(&self.ro_compat_root.encode());
+        bytes[Self::INCOMPAT_ROOT_OFFSET..Self::WIRE_SIZE]
+            .copy_from_slice(&self.incompat_root.encode());
+        bytes
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, DatasetFeatureFlagsDecodeError> {
+        if bytes.len() != Self::WIRE_SIZE {
+            return Err(DatasetFeatureFlagsDecodeError::InvalidSize {
+                actual: bytes.len(),
+            });
+        }
+        if bytes[..Self::MAGIC.len()] != Self::MAGIC {
+            return Err(DatasetFeatureFlagsDecodeError::InvalidMagic);
+        }
+        let version =
+            u16::from_le_bytes([bytes[Self::VERSION_OFFSET], bytes[Self::VERSION_OFFSET + 1]]);
+        if version != Self::FORMAT_VERSION {
+            return Err(DatasetFeatureFlagsDecodeError::UnsupportedVersion { version });
+        }
+        let reserved = u16::from_le_bytes([
+            bytes[Self::RESERVED_OFFSET],
+            bytes[Self::RESERVED_OFFSET + 1],
+        ]);
+        if reserved != 0 {
+            return Err(DatasetFeatureFlagsDecodeError::NonzeroReserved { value: reserved });
+        }
+        Ok(Self {
+            compat_root: FeatureTreeRootKeyV1::decode(
+                &bytes[Self::COMPAT_ROOT_OFFSET..Self::RO_COMPAT_ROOT_OFFSET],
+            )
+            .expect("fixed feature-root slice"),
+            ro_compat_root: FeatureTreeRootKeyV1::decode(
+                &bytes[Self::RO_COMPAT_ROOT_OFFSET..Self::INCOMPAT_ROOT_OFFSET],
+            )
+            .expect("fixed feature-root slice"),
+            incompat_root: FeatureTreeRootKeyV1::decode(
+                &bytes[Self::INCOMPAT_ROOT_OFFSET..Self::WIRE_SIZE],
+            )
+            .expect("fixed feature-root slice"),
+        })
     }
 }
 
@@ -664,6 +857,11 @@ mod tests {
 
     // -- DatasetFeatureFlagsV1 ----------------------------------------------
 
+    fn feature_root(byte: u8) -> FeatureTreeRootKeyV1 {
+        FeatureTreeRootKeyV1::new_required([byte; FeatureTreeRootKeyV1::WIRE_SIZE])
+            .expect("nonzero feature root")
+    }
+
     #[test]
     fn empty_dataset_flags() {
         let flags = DatasetFeatureFlagsV1::default();
@@ -671,18 +869,110 @@ mod tests {
         assert!(flags.compat_root.is_empty());
         assert!(flags.ro_compat_root.is_empty());
         assert!(flags.incompat_root.is_empty());
+        assert_eq!(
+            flags.required_root_for(FeatureClass::Compat),
+            None,
+            "empty roots are not resolvable object keys"
+        );
+
+        let encoded = flags.encode();
+        assert_eq!(&encoded[..4], &DatasetFeatureFlagsV1::MAGIC);
+        assert_eq!(
+            DatasetFeatureFlagsV1::decode(&encoded),
+            Ok(DatasetFeatureFlagsV1::default())
+        );
     }
 
     #[test]
     fn root_for_returns_correct_root() {
         let flags = DatasetFeatureFlagsV1 {
-            compat_root: BtreeRootPointer(1),
-            ro_compat_root: BtreeRootPointer(2),
-            incompat_root: BtreeRootPointer(3),
+            compat_root: feature_root(1),
+            ro_compat_root: feature_root(2),
+            incompat_root: feature_root(3),
         };
-        assert_eq!(flags.root_for(FeatureClass::Compat), BtreeRootPointer(1));
-        assert_eq!(flags.root_for(FeatureClass::RoCompat), BtreeRootPointer(2));
-        assert_eq!(flags.root_for(FeatureClass::Incompat), BtreeRootPointer(3));
+        assert_eq!(flags.root_for(FeatureClass::Compat), feature_root(1));
+        assert_eq!(flags.root_for(FeatureClass::RoCompat), feature_root(2));
+        assert_eq!(flags.root_for(FeatureClass::Incompat), feature_root(3));
+        assert_eq!(
+            flags.required_root_for(FeatureClass::Compat),
+            Some(feature_root(1))
+        );
+    }
+
+    #[test]
+    fn feature_tree_root_key_preserves_full_object_key() {
+        let mut bytes = [0_u8; FeatureTreeRootKeyV1::WIRE_SIZE];
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            *byte = index as u8 + 1;
+        }
+        let root = FeatureTreeRootKeyV1::new_required(bytes).expect("required root");
+        assert_eq!(root.as_bytes(), bytes);
+        assert_eq!(root.encode(), bytes);
+        assert_eq!(FeatureTreeRootKeyV1::decode(&bytes), Some(root));
+        assert!(FeatureTreeRootKeyV1::decode(&bytes[..31]).is_none());
+        assert_eq!(
+            root.to_string(),
+            "FeatureTreeRootKeyV1(0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20)"
+        );
+        assert_eq!(format!("{root:?}"), root.to_string());
+        assert_eq!(
+            FeatureTreeRootKeyV1::EMPTY.to_string(),
+            "FeatureTreeRootKeyV1(EMPTY)"
+        );
+        assert!(FeatureTreeRootKeyV1::new_required([0_u8; 32]).is_none());
+    }
+
+    #[test]
+    fn dataset_feature_flags_v1_roundtrip_preserves_all_roots() {
+        let flags = DatasetFeatureFlagsV1 {
+            compat_root: feature_root(0x11),
+            ro_compat_root: FeatureTreeRootKeyV1::EMPTY,
+            incompat_root: feature_root(0x33),
+        };
+        let encoded = flags.encode();
+        assert_eq!(encoded.len(), DatasetFeatureFlagsV1::WIRE_SIZE);
+        assert_eq!(&encoded[..4], &DatasetFeatureFlagsV1::MAGIC);
+        assert_eq!(
+            &encoded[DatasetFeatureFlagsV1::VERSION_OFFSET..DatasetFeatureFlagsV1::RESERVED_OFFSET],
+            &DatasetFeatureFlagsV1::FORMAT_VERSION.to_le_bytes()
+        );
+        assert_eq!(
+            &encoded[DatasetFeatureFlagsV1::COMPAT_ROOT_OFFSET
+                ..DatasetFeatureFlagsV1::RO_COMPAT_ROOT_OFFSET],
+            &[0x11; FeatureTreeRootKeyV1::WIRE_SIZE]
+        );
+        assert_eq!(DatasetFeatureFlagsV1::decode(&encoded), Ok(flags));
+    }
+
+    #[test]
+    fn dataset_feature_flags_v1_rejects_noncurrent_records() {
+        assert_eq!(
+            DatasetFeatureFlagsV1::decode(&[0_u8; 24]),
+            Err(DatasetFeatureFlagsDecodeError::InvalidSize { actual: 24 })
+        );
+
+        let mut encoded = DatasetFeatureFlagsV1::default().encode();
+        encoded[0] ^= 0xff;
+        assert_eq!(
+            DatasetFeatureFlagsV1::decode(&encoded),
+            Err(DatasetFeatureFlagsDecodeError::InvalidMagic)
+        );
+
+        let mut encoded = DatasetFeatureFlagsV1::default().encode();
+        encoded[DatasetFeatureFlagsV1::VERSION_OFFSET..DatasetFeatureFlagsV1::RESERVED_OFFSET]
+            .copy_from_slice(&2_u16.to_le_bytes());
+        assert_eq!(
+            DatasetFeatureFlagsV1::decode(&encoded),
+            Err(DatasetFeatureFlagsDecodeError::UnsupportedVersion { version: 2 })
+        );
+
+        let mut encoded = DatasetFeatureFlagsV1::default().encode();
+        encoded[DatasetFeatureFlagsV1::RESERVED_OFFSET..DatasetFeatureFlagsV1::COMPAT_ROOT_OFFSET]
+            .copy_from_slice(&1_u16.to_le_bytes());
+        assert_eq!(
+            DatasetFeatureFlagsV1::decode(&encoded),
+            Err(DatasetFeatureFlagsDecodeError::NonzeroReserved { value: 1 })
+        );
     }
     // -- Feature prerequisites  ---------------------------------------------
 

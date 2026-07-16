@@ -4,9 +4,11 @@
 use core::fmt;
 
 use tidefs_btree::BPlusTree;
-use tidefs_local_object_store::{DeviceIoClass, ObjectKey, Pool, Result as StoreResult};
+use tidefs_local_object_store::{
+    DeviceIoClass, ObjectKey, Pool, Result as StoreResult, StoreError,
+};
 use tidefs_types_dataset_feature_flags_core::{
-    BtreeRootPointer, DatasetFeatureFlagsV1, FeatureClass, FeatureFlagValueV1, FeatureName,
+    DatasetFeatureFlagsV1, FeatureClass, FeatureFlagValueV1, FeatureName, FeatureTreeRootKeyV1,
     CANONICAL_V1_FEATURES,
 };
 use tidefs_types_dataset_lifecycle_core::DatasetOpenResult;
@@ -25,13 +27,24 @@ fn feature_flags_object_key(class: FeatureClass) -> ObjectKey {
     ObjectKey::from_name(&name)
 }
 
-fn root_pointer_from_key(key: &ObjectKey) -> BtreeRootPointer {
-    let bytes = key.as_bytes();
-    let mut val: u64 = 0;
-    for &b in bytes.iter().take(8) {
-        val = (val << 8) | (b as u64);
+fn root_key_from_object_key(key: ObjectKey) -> FeatureTreeRootKeyV1 {
+    FeatureTreeRootKeyV1::new_required(key.as_bytes32())
+        .expect("named feature-tree object keys are nonzero")
+}
+
+fn object_key_from_root(root: FeatureTreeRootKeyV1) -> ObjectKey {
+    ObjectKey::from_bytes32(root.as_bytes())
+}
+
+fn root_key_for_tree(
+    class: FeatureClass,
+    tree: &BPlusTree<FeatureName, FeatureFlagValueV1>,
+) -> FeatureTreeRootKeyV1 {
+    if tree.is_empty() {
+        FeatureTreeRootKeyV1::EMPTY
+    } else {
+        root_key_from_object_key(feature_flags_object_key(class))
     }
-    BtreeRootPointer(val)
 }
 
 fn serialize_feature_tree(tree: &BPlusTree<FeatureName, FeatureFlagValueV1>) -> Vec<u8> {
@@ -108,6 +121,53 @@ impl fmt::Display for FeatureFlagsError {
             }
         }
     }
+}
+
+#[derive(Debug)]
+pub enum FeatureFlagsLoadError {
+    Store(StoreError),
+    MissingTree {
+        class: FeatureClass,
+        root: FeatureTreeRootKeyV1,
+    },
+    InvalidTree {
+        class: FeatureClass,
+        root: FeatureTreeRootKeyV1,
+    },
+}
+
+impl fmt::Display for FeatureFlagsLoadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Store(error) => write!(f, "feature-tree store error: {error}"),
+            Self::MissingTree { class, root } => {
+                write!(f, "missing {class} feature tree at {root}")
+            }
+            Self::InvalidTree { class, root } => {
+                write!(f, "invalid {class} feature tree at {root}")
+            }
+        }
+    }
+}
+
+impl From<StoreError> for FeatureFlagsLoadError {
+    fn from(error: StoreError) -> Self {
+        Self::Store(error)
+    }
+}
+
+fn load_feature_tree(
+    store: &Pool,
+    class: FeatureClass,
+    root: FeatureTreeRootKeyV1,
+) -> Result<BPlusTree<FeatureName, FeatureFlagValueV1>, FeatureFlagsLoadError> {
+    if root.is_empty() {
+        return Ok(BPlusTree::new());
+    }
+    let bytes = store
+        .get(DeviceIoClass::Metadata, object_key_from_root(root))?
+        .ok_or(FeatureFlagsLoadError::MissingTree { class, root })?;
+    deserialize_feature_tree(&bytes).ok_or(FeatureFlagsLoadError::InvalidTree { class, root })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -249,48 +309,30 @@ impl FeatureFlags {
         if !self.compat_tree.is_empty() {
             let bytes = serialize_feature_tree(&self.compat_tree);
             store.put(DeviceIoClass::Metadata, compat_key, &bytes)?;
-            roots.compat_root = root_pointer_from_key(&compat_key);
+            roots.compat_root = root_key_from_object_key(compat_key);
         }
         if !self.ro_compat_tree.is_empty() {
             let bytes = serialize_feature_tree(&self.ro_compat_tree);
             store.put(DeviceIoClass::Metadata, ro_compat_key, &bytes)?;
-            roots.ro_compat_root = root_pointer_from_key(&ro_compat_key);
+            roots.ro_compat_root = root_key_from_object_key(ro_compat_key);
         }
         if !self.incompat_tree.is_empty() {
             let bytes = serialize_feature_tree(&self.incompat_tree);
             store.put(DeviceIoClass::Metadata, incompat_key, &bytes)?;
-            roots.incompat_root = root_pointer_from_key(&incompat_key);
+            roots.incompat_root = root_key_from_object_key(incompat_key);
         }
         Ok(roots)
     }
 
-    pub fn load(store: &Pool, roots: &DatasetFeatureFlagsV1) -> StoreResult<FeatureFlags> {
-        let mut ff = FeatureFlags::new();
-        if !roots.compat_root.is_empty() {
-            let key = feature_flags_object_key(FeatureClass::Compat);
-            if let Some(bytes) = store.get(DeviceIoClass::Metadata, key)? {
-                if let Some(tree) = deserialize_feature_tree(&bytes) {
-                    ff.compat_tree = tree;
-                }
-            }
-        }
-        if !roots.ro_compat_root.is_empty() {
-            let key = feature_flags_object_key(FeatureClass::RoCompat);
-            if let Some(bytes) = store.get(DeviceIoClass::Metadata, key)? {
-                if let Some(tree) = deserialize_feature_tree(&bytes) {
-                    ff.ro_compat_tree = tree;
-                }
-            }
-        }
-        if !roots.incompat_root.is_empty() {
-            let key = feature_flags_object_key(FeatureClass::Incompat);
-            if let Some(bytes) = store.get(DeviceIoClass::Metadata, key)? {
-                if let Some(tree) = deserialize_feature_tree(&bytes) {
-                    ff.incompat_tree = tree;
-                }
-            }
-        }
-        Ok(ff)
+    pub fn load(
+        store: &Pool,
+        roots: &DatasetFeatureFlagsV1,
+    ) -> Result<FeatureFlags, FeatureFlagsLoadError> {
+        Ok(FeatureFlags {
+            compat_tree: load_feature_tree(store, FeatureClass::Compat, roots.compat_root)?,
+            ro_compat_tree: load_feature_tree(store, FeatureClass::RoCompat, roots.ro_compat_root)?,
+            incompat_tree: load_feature_tree(store, FeatureClass::Incompat, roots.incompat_root)?,
+        })
     }
 
     #[must_use]
@@ -514,9 +556,9 @@ impl FeatureFlags {
     #[must_use]
     pub fn to_dataset_flags(&self) -> DatasetFeatureFlagsV1 {
         DatasetFeatureFlagsV1 {
-            compat_root: BtreeRootPointer(if self.compat_tree.is_empty() { 0 } else { 1 }),
-            ro_compat_root: BtreeRootPointer(if self.ro_compat_tree.is_empty() { 0 } else { 1 }),
-            incompat_root: BtreeRootPointer(if self.incompat_tree.is_empty() { 0 } else { 1 }),
+            compat_root: root_key_for_tree(FeatureClass::Compat, &self.compat_tree),
+            ro_compat_root: root_key_for_tree(FeatureClass::RoCompat, &self.ro_compat_tree),
+            incompat_root: root_key_for_tree(FeatureClass::Incompat, &self.incompat_tree),
         }
     }
 
@@ -604,6 +646,13 @@ impl fmt::Display for FeatureFlags {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use tidefs_local_object_store::{
+        DeviceBacking, DeviceClass, DeviceConfig, DeviceKind, DeviceMediaClass, PoolConfig,
+        PoolProperties, StoreOptions,
+    };
     use tidefs_types_dataset_feature_flags_core::{
         FEATURE_CHECKSUM_BLAKE3, FEATURE_COMMIT_GROUP_STATE_MACHINE, FEATURE_COMPRESSION_LZ4,
         FEATURE_COMPRESSION_ZSTD, FEATURE_ENCRYPTION_CHACHA20, FEATURE_POSIX_ACL,
@@ -612,6 +661,38 @@ mod tests {
 
     fn feature(s: &str) -> FeatureName {
         FeatureName::from_str(s).expect("valid feature name")
+    }
+
+    fn test_pool(name: &str) -> (PathBuf, Pool) {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock after epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "tidefs-feature-flags-{name}-{}-{nanos}",
+            std::process::id()
+        ));
+        let device_path = root.join("device");
+        let config = PoolConfig {
+            name: name.to_string(),
+            root_path: root.join("pool"),
+            devices: vec![DeviceConfig {
+                path: device_path.clone(),
+                backing: DeviceBacking::DirectoryObjectStoreCompat,
+                class: DeviceClass::Data,
+                media_class: DeviceMediaClass::Ssd,
+                kind: DeviceKind::Single { path: device_path },
+                compression: None,
+                encryption: None,
+            }],
+        };
+        let pool = Pool::create(
+            config,
+            PoolProperties::default(),
+            &StoreOptions::test_fast(),
+        )
+        .expect("create feature-flags test pool");
+        (root, pool)
     }
 
     #[test]
@@ -635,6 +716,103 @@ mod tests {
         assert_eq!(restored.len(), 2);
         assert!(restored.contains_key(&a));
         assert!(restored.contains_key(&b));
+    }
+
+    #[test]
+    fn persist_returns_full_resolvable_object_key() {
+        let (root, mut pool) = test_pool("persist-root-key");
+        let mut flags = FeatureFlags::new();
+        let name = feature(FEATURE_POSIX_ACL);
+        flags
+            .enable_feature(name.clone(), FeatureClass::Compat)
+            .unwrap();
+
+        let roots = flags.persist(&mut pool).expect("persist feature tree");
+        let expected_key = feature_flags_object_key(FeatureClass::Compat);
+        assert_eq!(roots.compat_root.as_bytes(), expected_key.as_bytes32());
+        assert_eq!(
+            roots.compat_root,
+            root_key_from_object_key(expected_key),
+            "the root must preserve every object-key byte"
+        );
+        let loaded = FeatureFlags::load(&pool, &roots).expect("load persisted feature tree");
+        assert!(loaded.is_enabled(&name));
+
+        drop(pool);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn load_resolves_the_stored_root_instead_of_rederiving_the_class_key() {
+        let (root, mut pool) = test_pool("stored-root-lookup");
+
+        let derived_name = feature(FEATURE_POSIX_ACL);
+        let mut derived_tree = BPlusTree::new();
+        derived_tree.insert(derived_name.clone(), FeatureFlagValueV1::Enabled);
+        pool.put(
+            DeviceIoClass::Metadata,
+            feature_flags_object_key(FeatureClass::Compat),
+            &serialize_feature_tree(&derived_tree),
+        )
+        .unwrap();
+
+        let stored_name = feature(FEATURE_CHECKSUM_BLAKE3);
+        let mut stored_tree = BPlusTree::new();
+        stored_tree.insert(stored_name.clone(), FeatureFlagValueV1::Enabled);
+        let stored_key = ObjectKey::from_name(b"tidefs:test:alternate-feature-tree");
+        pool.put(
+            DeviceIoClass::Metadata,
+            stored_key,
+            &serialize_feature_tree(&stored_tree),
+        )
+        .unwrap();
+
+        let roots = DatasetFeatureFlagsV1 {
+            compat_root: root_key_from_object_key(stored_key),
+            ..DatasetFeatureFlagsV1::default()
+        };
+        let loaded = FeatureFlags::load(&pool, &roots).expect("load stored root key");
+        assert!(loaded.is_enabled(&stored_name));
+        assert!(!loaded.is_enabled(&derived_name));
+
+        drop(pool);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn load_rejects_missing_and_malformed_root_objects() {
+        let (root, mut pool) = test_pool("invalid-root-object");
+        let missing_root = root_key_from_object_key(ObjectKey::from_name(b"missing-feature-tree"));
+        let roots = DatasetFeatureFlagsV1 {
+            compat_root: missing_root,
+            ..DatasetFeatureFlagsV1::default()
+        };
+        assert!(matches!(
+            FeatureFlags::load(&pool, &roots),
+            Err(FeatureFlagsLoadError::MissingTree {
+                class: FeatureClass::Compat,
+                root,
+            }) if root == missing_root
+        ));
+
+        let malformed_key = ObjectKey::from_name(b"malformed-feature-tree");
+        pool.put(DeviceIoClass::Metadata, malformed_key, &[0_u8])
+            .unwrap();
+        let malformed_root = root_key_from_object_key(malformed_key);
+        let roots = DatasetFeatureFlagsV1 {
+            compat_root: malformed_root,
+            ..DatasetFeatureFlagsV1::default()
+        };
+        assert!(matches!(
+            FeatureFlags::load(&pool, &roots),
+            Err(FeatureFlagsLoadError::InvalidTree {
+                class: FeatureClass::Compat,
+                root,
+            }) if root == malformed_root
+        ));
+
+        drop(pool);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

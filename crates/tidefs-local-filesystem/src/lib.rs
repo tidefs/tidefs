@@ -442,6 +442,37 @@ use tidefs_types_vfs_owned::DirEntry as OwnedDirEntry;
 
 pub type Result<T> = std::result::Result<T, FileSystemError>;
 
+fn decode_feature_flags_root_record(
+    bytes: &[u8],
+) -> Result<tidefs_types_dataset_feature_flags_core::DatasetFeatureFlagsV1> {
+    tidefs_types_dataset_feature_flags_core::DatasetFeatureFlagsV1::decode(bytes).map_err(|_| {
+        FileSystemError::Decode {
+            object: "dataset feature flags root record",
+            reason: "invalid or unsupported feature-tree root record",
+        }
+    })
+}
+
+fn map_feature_flags_load_error(
+    error: tidefs_dataset_feature_flags::FeatureFlagsLoadError,
+) -> FileSystemError {
+    match error {
+        tidefs_dataset_feature_flags::FeatureFlagsLoadError::Store(error) => {
+            FileSystemError::Store(error)
+        }
+        tidefs_dataset_feature_flags::FeatureFlagsLoadError::MissingTree { .. } => {
+            FileSystemError::CorruptState {
+                reason: "dataset feature-tree root resolves to a missing object",
+            }
+        }
+        tidefs_dataset_feature_flags::FeatureFlagsLoadError::InvalidTree { .. } => {
+            FileSystemError::CorruptState {
+                reason: "dataset feature-tree root resolves to an invalid object",
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReadServingRuntimeRead {
     pub decision: ReadServingDecisionRecord,
@@ -2326,10 +2357,7 @@ impl LocalFileSystem {
         // Write per-class feature B-trees into the pool store.
         let roots = self.feature_flags.persist(&mut self.store)?;
         // Write the roots pointer object so remount can locate the B-trees.
-        let mut buf = Vec::with_capacity(24);
-        buf.extend_from_slice(&roots.compat_root.0.to_le_bytes());
-        buf.extend_from_slice(&roots.ro_compat_root.0.to_le_bytes());
-        buf.extend_from_slice(&roots.incompat_root.0.to_le_bytes());
+        let buf = roots.encode();
         self.store.put(
             DeviceIoClass::Data,
             crate::object_keys::feature_flags_roots_object_key(),
@@ -3605,32 +3633,18 @@ impl LocalFileSystem {
             );
         }
         // Load persisted feature flags from the object store (Phase 3).
-        // Backward-compatible: datasets without persisted roots load as empty FeatureFlags.
-        if let Ok(Some(bytes)) = fs
+        // A missing record means no features. A present non-current or
+        // unresolved record is corrupt and must not silently disable gates.
+        if let Some(bytes) = fs
             .store
             .primary_store()
-            .get(crate::object_keys::feature_flags_roots_object_key())
+            .get(crate::object_keys::feature_flags_roots_object_key())?
         {
-            if bytes.len() == 24 {
-                use tidefs_types_dataset_feature_flags_core::{
-                    BtreeRootPointer, DatasetFeatureFlagsV1,
-                };
-                let compat = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
-                let ro_compat = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
-                let incompat = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
-                let roots = DatasetFeatureFlagsV1 {
-                    compat_root: BtreeRootPointer(compat),
-                    ro_compat_root: BtreeRootPointer(ro_compat),
-                    incompat_root: BtreeRootPointer(incompat),
-                };
-                if !roots.is_empty() {
-                    match tidefs_dataset_feature_flags::FeatureFlags::load(&fs.store, &roots) {
-                        Ok(loaded) => fs.feature_flags = loaded,
-                        Err(e) => {
-                            eprintln!("warning: failed to load persisted feature flags: {e}")
-                        }
-                    }
-                }
+            let roots = decode_feature_flags_root_record(&bytes)?;
+            if !roots.is_empty() {
+                fs.feature_flags =
+                    tidefs_dataset_feature_flags::FeatureFlags::load(&fs.store, &roots)
+                        .map_err(map_feature_flags_load_error)?;
             }
         }
 
@@ -11893,10 +11907,7 @@ impl LocalFileSystem {
             // feature enable/disable mutations survive crashes.
             match self.feature_flags.persist(&mut self.store) {
                 Ok(roots) => {
-                    let mut buf = Vec::with_capacity(24);
-                    buf.extend_from_slice(&roots.compat_root.0.to_le_bytes());
-                    buf.extend_from_slice(&roots.ro_compat_root.0.to_le_bytes());
-                    buf.extend_from_slice(&roots.incompat_root.0.to_le_bytes());
+                    let buf = roots.encode();
                     if let Err(e) = self.store.put(
                         DeviceIoClass::Data,
                         crate::object_keys::feature_flags_roots_object_key(),
