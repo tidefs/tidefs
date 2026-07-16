@@ -3210,8 +3210,8 @@ impl Pool {
 
             // Placement receipts are copied beyond their payload targets. If
             // the retiring device is not a current target and an identical
-            // receipt is already readable from a survivor, syncing that
-            // survivor is sufficient: rewriting the object would churn
+            // receipt and its payload are readable from a survivor, syncing
+            // that survivor is sufficient: rewriting the object would churn
             // unrelated placement authority and inflate evacuation counts.
             let target_owns_payload = receipt
                 .targets
@@ -3222,7 +3222,13 @@ impl Pool {
                 Ok(Some(survivor_receipt)) if survivor_receipt == receipt
             );
             if !target_owns_payload && survivor_has_current_receipt {
-                continue;
+                match self.get_with_receipt(&receipt)? {
+                    Some(_) => continue,
+                    None => {
+                        mark_failed(&mut result, receipt.object_key);
+                        continue;
+                    }
+                }
             }
 
             let data = match self.get_with_receipt(&receipt)? {
@@ -6501,6 +6507,57 @@ mod tests {
             pool.get(IoClass::Data, unrelated_key).unwrap(),
             Some(unrelated_payload.to_vec())
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn safe_remove_device_refuses_unreadable_survivor_owned_payload() {
+        let root = temp_dir("safe-remove-unreadable-survivor-owned");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = multi_data_device_config(&root, 2);
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::replicated(1),
+            ..PoolProperties::default()
+        };
+        let mut pool = Pool::create(config, properties, &test_options()).unwrap();
+        set_deterministic_device_guids(&mut pool);
+
+        let key = ObjectKey::from_name(b"unreadable-survivor-owned-removal-object");
+        let payload = b"only the retiring device still has readable bytes";
+        pool.put(IoClass::Data, key, payload).unwrap();
+        let receipt = pool
+            .placement_receipt_for_key(IoClass::Data, key)
+            .unwrap()
+            .expect("placement receipt before removal");
+        let owner_idx = pool.resolve_receipt_target(&receipt.targets[0]).unwrap();
+        let victim_idx = (0..pool.devices.len())
+            .find(|idx| *idx != owner_idx)
+            .expect("non-owner removal target");
+        let victim_path = pool.devices[victim_idx].root().to_path_buf();
+
+        // Leave an untracked payload copy on the retiring device, then remove
+        // the receipt-authorized survivor copy. The identical survivor receipt
+        // alone must not let removal detach the only readable bytes.
+        pool.devices[victim_idx].put(key, payload).unwrap();
+        assert!(pool.devices[owner_idx].delete(key).unwrap());
+        assert_eq!(pool.get(IoClass::Data, key).unwrap(), None);
+
+        let removal = pool.safe_remove_device(&victim_path).unwrap();
+
+        assert!(!removal.complete);
+        assert_eq!(removal.objects_failed, 1);
+        assert_eq!(removal.failed_keys, vec![key]);
+        assert_eq!(pool.stats().device_count, 2);
+        assert!(pool
+            .devices
+            .iter()
+            .any(|device| device.root() == victim_path));
+        assert_eq!(
+            pool.devices[victim_idx].get(key).unwrap(),
+            Some(payload.to_vec())
+        );
+        assert!(root.join(DEVICE_REMOVAL_MARKER_FILE).exists());
 
         let _ = std::fs::remove_dir_all(&root);
     }
