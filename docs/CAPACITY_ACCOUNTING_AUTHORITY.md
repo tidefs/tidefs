@@ -45,9 +45,11 @@ mirrors.
   `crates/tidefs-types-space-accounting-core/`: define the current
   source-owned logical admission, physical allocator pressure,
   `DatasetSpaceCountersV1`, `SpaceDelta`, `PoolPhysicalCountersV1`, space
-  domains, and POSIX `statfs` projection inputs. Their
-  `pinned_snapshot_bytes` counter is separately observable but is a subset of
-  `logical_used_bytes`, so POSIX `statfs` must not subtract it again.
+  domains, and POSIX `statfs` projection inputs.
+  `DatasetSpaceCountersV1::total_consumed_bytes()` and
+  `SpaceAccounting::statfs()` derive consumption without adding
+  `pinned_snapshot_bytes`; the counter remains separately observable but is a
+  subset of `logical_used_bytes`, so POSIX `statfs` must not subtract it again.
 - `docs/SNAPSHOT_CLONE_DEADLIST_AUTHORITY.md` and
   `crates/tidefs-local-filesystem/src/snapshot.rs`: snapshot lifecycle and
   reclaim remain tied to lifecycle pins, deadlists, and placement/rebuild
