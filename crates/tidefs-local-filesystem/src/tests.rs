@@ -122,6 +122,56 @@ fn block_device_pool_accepts_regular_file_dev_backing() {
 }
 
 #[test]
+fn feature_tree_object_key_roots_survive_reopen() {
+    use tidefs_types_dataset_feature_flags_core::{FeatureClass, FeatureName, FEATURE_POSIX_ACL};
+
+    let root = temp_root("feature-tree-root-reopen");
+    let name = FeatureName::from_str(FEATURE_POSIX_ACL).expect("canonical feature name");
+    {
+        let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
+        fs.feature_flags_mut()
+            .enable_feature(name.clone(), FeatureClass::Compat)
+            .expect("enable feature");
+        fs.persist_feature_flags().expect("persist feature flags");
+    }
+
+    let reopened = LocalFileSystem::open_with_options(&root, options()).expect("reopen fs");
+    assert!(reopened.feature_flags().is_enabled(&name));
+    drop(reopened);
+    cleanup(&root);
+}
+
+#[test]
+fn mounted_recovery_rejects_retired_feature_root_record_width() {
+    let root = temp_root("retired-feature-root-record");
+    {
+        let fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
+        drop(fs);
+    }
+    {
+        let mut pool = LocalFileSystem::default_development_pool(&root, &options(), None, None)
+            .expect("open development pool");
+        pool.put(
+            DeviceIoClass::Data,
+            feature_flags_roots_object_key(),
+            &[0_u8; 24],
+        )
+        .expect("write retired root record");
+        pool.sync_all().expect("sync retired root record");
+    }
+
+    match LocalFileSystem::open_with_options(&root, options()) {
+        Err(FileSystemError::Decode { object, reason }) => {
+            assert_eq!(object, "dataset feature flags root record");
+            assert_eq!(reason, "invalid or unsupported feature-tree root record");
+        }
+        Err(error) => panic!("unexpected reopen error: {error}"),
+        Ok(_) => panic!("retired feature-root record must fail closed"),
+    }
+    cleanup(&root);
+}
+
+#[test]
 fn default_open_uses_hidden_regular_file_dev_backing() {
     let root = temp_root("default-hidden-file-dev");
     let image = LocalFileSystem::default_development_device_path(&root);
