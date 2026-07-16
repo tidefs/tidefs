@@ -3137,7 +3137,7 @@ impl Pool {
                 continue;
             }
 
-            let committed_receipt =
+            let survivor_receipt =
                 match self.load_placement_receipt(&surviving_indices, receipt.object_key) {
                     Ok(Some(receipt)) => receipt,
                     Ok(None) | Err(_) => {
@@ -3147,7 +3147,7 @@ impl Pool {
                 };
 
             if !placement_receipt_proves_device_evacuation(
-                &committed_receipt,
+                &survivor_receipt,
                 digest,
                 len,
                 target_guid,
@@ -3160,6 +3160,14 @@ impl Pool {
             result.objects_evacuated += 1;
             result.bytes_evacuated += len;
             result.content_digests.insert(receipt.object_key, digest);
+        }
+
+        // A readable survivor receipt is not committed evacuation evidence
+        // until its data, receipt, and commit-group root reach stable storage.
+        // Do not require the target device to sync: only the survivor-side
+        // evidence must become durable before detach.
+        for idx in self.usable_candidates(&surviving_indices) {
+            self.devices[idx].sync_all()?;
         }
 
         // Receipt-backed logical objects were rewritten above; receipt and
@@ -6057,6 +6065,7 @@ mod tests {
         pool.put(IoClass::Data, key2, &data2).unwrap();
         pool.put(IoClass::Data, key3, &data3).unwrap();
         pool.sync_all().unwrap();
+        let survivor_commit_count_before = pool.devices[1].store().txg_manager().commit_count();
 
         // All objects should be readable now.
         assert!(pool.get(IoClass::Data, key1).unwrap().is_some());
@@ -6071,6 +6080,11 @@ mod tests {
 
         // Pool now has 1 device.
         assert_eq!(pool.stats().device_count, 1);
+        let survivor_commit_count_after = pool.devices[0].store().txg_manager().commit_count();
+        assert!(
+            survivor_commit_count_after > survivor_commit_count_before,
+            "safe removal must commit survivor data and receipt before detach"
+        );
 
         // All objects should still be readable.
         assert!(pool.get(IoClass::Data, key1).unwrap().is_some());
