@@ -145,8 +145,12 @@ EOF
     }
 
     git_dirty_json_bool() {
-      if git -C "$SOURCE_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1 &&
-         [ -z "$(git -C "$SOURCE_DIR" status --porcelain --untracked-files=normal 2>/dev/null)" ]; then
+      local source_dir="''${1:-$SOURCE_DIR}"
+      local status
+
+      if ! status=$(git -C "$source_dir" status --porcelain --untracked-files=normal 2>/dev/null); then
+        echo true
+      elif [ -z "$status" ]; then
         echo false
       else
         echo true
@@ -427,6 +431,19 @@ MANIFEST
       fi
     }
 
+    expect_git_dirty_json_bool() {
+      local name="$1"
+      local source_dir="$2"
+      local expected="$3"
+      local actual
+
+      actual="$(git_dirty_json_bool "$source_dir")"
+      if [ "$actual" != "$expected" ]; then
+        echo "git dirty self-test failed for $name: got $actual expected $expected" >&2
+        exit 1
+      fi
+    }
+
     self_test_parser() {
       local test_dir
       test_dir="$(mktemp -d)"
@@ -439,6 +456,20 @@ MANIFEST
       expect_qemu_exit_json_value invalid unknown '"unknown"'
       expect_qemu_exit_json_value invalid-range 256 '"256"'
       expect_qemu_exit_json_value oversized 999999999999999999999999999999999999999999999999999 '"999999999999999999999999999999999999999999999999999"'
+
+      git() {
+        case "$TIDEFS_TEST_GIT_STATUS" in
+          clean) return 0 ;;
+          dirty) echo "?? untracked"; return 0 ;;
+          error) return 128 ;;
+        esac
+      }
+      TIDEFS_TEST_GIT_STATUS=clean \
+        expect_git_dirty_json_bool clean-worktree "$test_dir" false
+      TIDEFS_TEST_GIT_STATUS=dirty \
+        expect_git_dirty_json_bool untracked-worktree "$test_dir" true
+      TIDEFS_TEST_GIT_STATUS=error \
+        expect_git_dirty_json_bool unreadable-worktree "$test_dir" true
 
       : > "$test_dir/empty.log"
       analyze_qemu_log "$test_dir/empty.log" 0
