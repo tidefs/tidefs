@@ -3082,14 +3082,21 @@ impl Pool {
         };
 
         for key in &keys {
-            let Ok(Some(raw)) = self.devices[target_idx].get(*key) else {
+            if !crate::is_pool_placement_receipt_key(*key) {
                 continue;
-            };
-            let Some(receipt) = PlacementReceipt::decode(&raw) else {
-                continue;
-            };
+            }
+            let raw = self.devices[target_idx]
+                .get(*key)?
+                .ok_or(StoreError::InvalidOptions {
+                    reason: "placement receipt corrupt or unverifiable",
+                })?;
+            let receipt = PlacementReceipt::decode(&raw).ok_or(StoreError::InvalidOptions {
+                reason: "placement receipt corrupt or unverifiable",
+            })?;
             if placement_receipt_object_key(receipt.object_key) != *key {
-                continue;
+                return Err(StoreError::InvalidOptions {
+                    reason: "placement receipt corrupt or unverifiable",
+                });
             }
 
             internal_placement_keys.insert(*key);
@@ -5908,6 +5915,54 @@ mod tests {
                 .all(|target| target.device_guid != victim_guid),
             "rewritten receipt must not target the removed device"
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn safe_remove_device_refuses_corrupt_target_erasure_receipt() {
+        let root = temp_dir("safe-remove-corrupt-target-erasure-receipt");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = multi_data_device_config(&root, 4);
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::erasure(2, 1),
+            ..PoolProperties::default()
+        };
+        let mut pool = Pool::create(config, properties, &test_options()).unwrap();
+        set_deterministic_device_guids(&mut pool);
+
+        let key = ObjectKey::from_name(b"corrupt-erasure-receipt-before-remove");
+        let payload = b"removal must not ignore corrupt erasure placement authority";
+        pool.put(IoClass::Data, key, payload).unwrap();
+        let receipt = pool
+            .placement_receipt_for_key(IoClass::Data, key)
+            .unwrap()
+            .expect("receipt before removal");
+        let victim_idx = pool.resolve_receipt_target(&receipt.targets[0]).unwrap();
+        let victim_path = pool.devices[victim_idx].root().to_path_buf();
+        let receipt_key = placement_receipt_object_key(key);
+
+        for device in &mut pool.devices {
+            let mut raw = device
+                .get(receipt_key)
+                .unwrap()
+                .expect("receipt copy before corruption");
+            let last = raw.len() - 1;
+            raw[last] ^= 0x5a;
+            device
+                .put(receipt_key, &raw)
+                .expect("replace receipt with bad replay seal");
+        }
+
+        let result = pool.safe_remove_device(&victim_path);
+        assert!(matches!(
+            result,
+            Err(StoreError::InvalidOptions {
+                reason: "placement receipt corrupt or unverifiable"
+            })
+        ));
+        assert_eq!(pool.stats().device_count, 4);
+        assert!(root.join(DEVICE_REMOVAL_MARKER_FILE).exists());
 
         let _ = std::fs::remove_dir_all(&root);
     }
