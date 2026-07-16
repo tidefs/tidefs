@@ -3854,12 +3854,12 @@ fn live_admin_string_vec(args: &Value, key: &str) -> Result<Vec<String>, String>
 }
 
 fn live_admin_u64_arg_or_default(args: &Value, key: &str, default: u64) -> Result<u64, String> {
-    let Some(value) = args.get(key) else {
-        return Ok(default);
-    };
-    value
-        .as_u64()
-        .ok_or_else(|| format!("live admin argument '{key}' must be an unsigned integer"))
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(default),
+        Some(value) => value
+            .as_u64()
+            .ok_or_else(|| format!("live admin argument '{key}' must be an unsigned integer")),
+    }
 }
 
 fn live_admin_hex_16_or_default(args: &Value, key: &str) -> Result<[u8; 16], String> {
@@ -6672,6 +6672,26 @@ mod tests {
         expected.extend_from_slice(&(export.len() as u32).to_le_bytes());
         expected.extend_from_slice(export);
         assert_eq!(frame, expected);
+    }
+
+    #[test]
+    fn live_snapshot_send_destination_defaults_null_node_ids() {
+        let addr: SocketAddr = "127.0.0.1:9000".parse().expect("target address");
+
+        assert_eq!(
+            live_snapshot_send_destination(&json!({
+                "target_addr": addr.to_string(),
+                "node_id": null,
+                "server_node_id": null,
+            })),
+            Ok(LiveSnapshotSendDestination::TargetAddress {
+                target_addr: addr.to_string(),
+                addr,
+                node_id: 1,
+                server_node_id: 2,
+                output: None,
+            })
+        );
     }
 
     #[test]
