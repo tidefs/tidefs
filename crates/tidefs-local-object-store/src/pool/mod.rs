@@ -1067,13 +1067,14 @@ fn resume_device_removal_if_pending(pool: &mut Pool) {
 }
 
 fn placement_receipt_proves_device_evacuation(
+    pool: &Pool,
     receipt: &PlacementReceipt,
+    expected_payload: &[u8],
     payload_digest: [u8; 32],
-    payload_len: u64,
     removed_device_guid: [u8; 16],
 ) -> bool {
     receipt.payload_digest == payload_digest
-        && receipt.payload_len == payload_len
+        && receipt.payload_len == expected_payload.len() as u64
         && receipt.planner_replay_receipt.is_some()
         && !receipt.targets.is_empty()
         && receipt
@@ -1081,6 +1082,10 @@ fn placement_receipt_proves_device_evacuation(
             .iter()
             .all(|target| target.device_guid != removed_device_guid)
         && planner_replay_receipt_matches_receipt(receipt)
+        && matches!(
+            pool.get_with_receipt(receipt),
+            Ok(Some(payload)) if payload.as_slice() == expected_payload
+        )
 }
 
 fn next_placement_receipt_generation_for_devices(devices: &[Device]) -> u64 {
@@ -3270,9 +3275,10 @@ impl Pool {
                 };
 
             if !placement_receipt_proves_device_evacuation(
+                self,
                 &survivor_receipt,
+                &data,
                 digest,
-                len,
                 target_guid,
             ) {
                 mark_failed(&mut result, receipt.object_key);
@@ -6692,7 +6698,7 @@ mod tests {
         let key = ObjectKey::from_name(b"evacuation-replay-authority");
         let payload = b"evacuation evidence needs a sealed planner replay receipt";
         pool.put(IoClass::Data, key, payload).unwrap();
-        let mut receipt = pool
+        let receipt = pool
             .placement_receipt_for_key(IoClass::Data, key)
             .unwrap()
             .expect("placement receipt");
@@ -6710,17 +6716,32 @@ mod tests {
         let payload_digest = blake3::hash(payload).into();
 
         assert!(placement_receipt_proves_device_evacuation(
+            &pool,
             &receipt,
+            payload,
             payload_digest,
-            payload.len() as u64,
             removed_device_guid,
         ));
 
-        receipt.planner_replay_receipt = None;
+        let mut receipt_without_replay = receipt.clone();
+        receipt_without_replay.planner_replay_receipt = None;
         assert!(!placement_receipt_proves_device_evacuation(
-            &receipt,
+            &pool,
+            &receipt_without_replay,
+            payload,
             payload_digest,
-            payload.len() as u64,
+            removed_device_guid,
+        ));
+
+        for target in &receipt.targets {
+            let idx = pool.resolve_receipt_target(target).unwrap();
+            assert!(pool.devices[idx].delete(key).unwrap());
+        }
+        assert!(!placement_receipt_proves_device_evacuation(
+            &pool,
+            &receipt,
+            payload,
+            payload_digest,
             removed_device_guid,
         ));
 
