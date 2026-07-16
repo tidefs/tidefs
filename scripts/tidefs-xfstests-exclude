@@ -11,6 +11,7 @@
 #   sub-second timestamps (#3184): generic/258 (atimensec/mtimensec/ctimensec confirmed
 #     wired through full FUSE attr path — fuse_vfs_adapter.rs:782-784,839-841)
 #   special-node mknod: generic/184
+#   setfacl ctime/remount persistence (#1933): generic/307
 
 # --- ACLs ---
 #   Source inspection shows ACL plumbing, not mounted row proof: the FUSE
@@ -23,14 +24,12 @@
 #     named user/group and mask behavior, removals, recursive/default ACLs.
 #   generic/237: non-owner setfacl must fail with EPERM; the adapter's ACL
 #     owner guard currently returns EACCES, so the mounted errno is not proven.
-#   generic/307: mounted setfacl ctime update plus remount persistence.
 #   generic/318: user-namespace ACL id mapping plus remount persistence; no
 #     mounted idmap proof is recorded here.
 #   generic/319: mounted mkdir inheritance for directory default ACL xattrs.
 #   generic/444: mounted create SGID/default ACL interaction.
 generic/099
 generic/237
-generic/307
 generic/318
 generic/319
 generic/444
