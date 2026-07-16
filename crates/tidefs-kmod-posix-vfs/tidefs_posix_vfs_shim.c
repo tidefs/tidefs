@@ -4700,7 +4700,7 @@ static struct posix_acl *tidefs_posix_vfs_get_inode_acl(struct inode *inode,
 		(unsigned int)strlen(xattr_name),
 		NULL, 0,
 		&out_len);
-	if (ret == -ENODATA || ret == -ENOSYS)
+	if (ret == -ENODATA)
 		return NULL;  /* no ACL stored: fall back to mode bits */
 	if (ret < 0)
 		return ERR_PTR(ret);
@@ -4721,7 +4721,7 @@ static struct posix_acl *tidefs_posix_vfs_get_inode_acl(struct inode *inode,
 		(unsigned int)strlen(xattr_name),
 		value_buf, buf_size,
 		&out_len);
-	if (ret == -ENODATA || ret == -ENOSYS) {
+	if (ret == -ENODATA) {
 		kfree(value_buf);
 		return NULL;
 	}
