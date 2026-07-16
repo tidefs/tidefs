@@ -6564,19 +6564,28 @@ impl crate::tidefs_kmod_bridge::kernel_types::VfsEngine for KernelEngine {
         crate::tidefs_kmod_bridge::kernel_types::Errno,
     > {
         let ino = inode.get();
-        let mut result = crate::tidefs_kmod_bridge::kernel_types::KmodVec::new();
         if let Some(idx) = self.find_xattr_store_idx(ino) {
             let stores = self.xattr_stores.borrow();
             let entries = &stores[idx].1;
+            let mut required_len = 0usize;
             for (entry_name, _value) in entries.iter() {
-                let name_slice = &*entry_name;
-                for &b in name_slice {
-                    result.push(b);
-                }
+                required_len = required_len
+                    .checked_add(entry_name.len())
+                    .and_then(|len| len.checked_add(1))
+                    .ok_or(crate::tidefs_kmod_bridge::kernel_types::Errno::EOVERFLOW)?;
+            }
+            let mut result =
+                crate::tidefs_kmod_bridge::kernel_types::KmodVec::with_capacity(required_len);
+            for (entry_name, _value) in entries.iter() {
+                result.extend_from_slice(&*entry_name);
                 result.push(0u8);
             }
+            if result.len() != required_len {
+                return Err(crate::tidefs_kmod_bridge::kernel_types::Errno::ENOMEM);
+            }
+            return Ok(result);
         }
-        Ok(result)
+        Ok(crate::tidefs_kmod_bridge::kernel_types::KmodVec::new())
     }
     fn removexattr(
         &self,
