@@ -139,7 +139,7 @@ pub struct ErasureCodedStoreStats {
     pub degraded_reads: Cell<u64>,
     /// Number of reads that served from all data shards (no reconstruction).
     pub clean_reads: Cell<u64>,
-    /// Number of reads that failed (insufficient shards).
+    /// Number of reads that failed during reconstruction.
     pub failed_reads: Cell<u64>,
     /// Number of shard records whose embedded digest was verified.
     pub shards_verified: Cell<u64>,
@@ -1371,12 +1371,9 @@ impl EcReadPath {
                     }
                 }
 
-                let recon = reconstruct_receipt_stripe(&stripe_config, &available).map_err(|_| {
+                let recon = reconstruct_receipt_stripe(&stripe_config, &available).map_err(|err| {
                     increment_cell(&s.stats.failed_reads);
-                    EcStoreError::InsufficientShards {
-                        available: available.iter().filter(|s| s.is_some()).count(),
-                        needed: s.config.data_shards,
-                    }
+                    err
                 })?;
 
                 let stripe_chunk_len = match total_original_len {
@@ -2210,6 +2207,27 @@ mod tests {
             }
             _ => panic!("expected InsufficientShards"),
         }
+
+        cleanup_dirs(&paths);
+    }
+
+    #[tokio::test]
+    async fn async_read_classifies_verified_wrong_length_shard_as_decode_failure() {
+        let paths = make_paths(3, "async-malformed-shard");
+        let mut store =
+            ErasureCodedStore::open(&paths, ErasureCodedStoreConfig::two_plus_one_test()).unwrap();
+        let name = b"malformed-shard";
+        store.put_named(name, b"payload").unwrap();
+
+        let key = ObjectKey::from_name(name);
+        let prefix = object_prefix(key);
+        let shard_key = shard_object_key(key, 0, 0);
+        let malformed = encode_verified_shard(&prefix, 0, 0, &[0; 255]).unwrap();
+        store.stores[0].put(shard_key, &malformed).unwrap();
+
+        let runtime = EcStoreRuntime::new(store);
+        let err = runtime.read_path(name).execute().await.unwrap_err();
+        assert!(matches!(err, EcStoreError::DecodeFailed(_)));
 
         cleanup_dirs(&paths);
     }

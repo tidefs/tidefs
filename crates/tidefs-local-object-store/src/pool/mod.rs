@@ -6417,19 +6417,13 @@ mod tests {
             .placement_receipt_for_key(IoClass::Data, key)
             .unwrap()
             .expect("erasure receipt must persist");
-        let indices: Vec<_> = receipt
-            .targets
-            .iter()
-            .map(|target| pool.resolve_receipt_target(target).unwrap())
-            .collect();
+        receipt.planner_replay_receipt = None;
         receipt.targets[0].shard_index = receipt.targets.len() as u16;
-        let err = pool
-            .write_placement_receipt(&indices, &receipt)
-            .unwrap_err();
+        let err = pool.get_erasure_with_receipt(&receipt).unwrap_err();
         assert!(matches!(
             err,
             StoreError::InvalidOptions {
-                reason: "placement replay receipt does not match local locator authority"
+                reason: "invalid erasure placement receipt availability set"
             }
         ));
 
@@ -6456,19 +6450,13 @@ mod tests {
             .placement_receipt_for_key(IoClass::Data, key)
             .unwrap()
             .expect("erasure receipt must persist");
-        let indices: Vec<_> = receipt
-            .targets
-            .iter()
-            .map(|target| pool.resolve_receipt_target(target).unwrap())
-            .collect();
+        receipt.planner_replay_receipt = None;
         receipt.targets[1].shard_index = receipt.targets[0].shard_index;
-        let err = pool
-            .write_placement_receipt(&indices, &receipt)
-            .unwrap_err();
+        let err = pool.get_erasure_with_receipt(&receipt).unwrap_err();
         assert!(matches!(
             err,
             StoreError::InvalidOptions {
-                reason: "placement replay receipt does not match local locator authority"
+                reason: "invalid erasure placement receipt availability set"
             }
         ));
 
@@ -6500,24 +6488,18 @@ mod tests {
                 .placement_receipt_for_key(IoClass::Data, key)
                 .unwrap()
                 .expect("erasure receipt must persist");
-            let indices: Vec<_> = receipt
-                .targets
-                .iter()
-                .map(|target| pool.resolve_receipt_target(target).unwrap())
-                .collect();
+            receipt.planner_replay_receipt = None;
             receipt
                 .targets
                 .iter_mut()
                 .find(|target| target.shard_index == shard_index)
                 .expect("target shard")
                 .role = role;
-            let err = pool
-                .write_placement_receipt(&indices, &receipt)
-                .unwrap_err();
+            let err = pool.get_erasure_with_receipt(&receipt).unwrap_err();
             assert!(matches!(
                 err,
                 StoreError::InvalidOptions {
-                    reason: "placement replay receipt does not match local locator authority"
+                    reason: "invalid erasure placement receipt availability set"
                 }
             ));
 
