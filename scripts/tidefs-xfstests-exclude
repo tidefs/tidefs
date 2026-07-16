@@ -11,14 +11,25 @@
 #   sub-second timestamps (#3184): generic/258 (atimensec/mtimensec/ctimensec confirmed
 #     wired through full FUSE attr path — fuse_vfs_adapter.rs:782-784,839-841)
 #   special-node mknod: generic/184
+#   setfacl ctime/remount persistence (#1933): generic/307
 
 # --- ACLs ---
-#   ACL evaluation IS wired via tidefs-posix-acl + tidefs-permission check_access()
-#   (fuse_preview.rs:759-796,2029-2048). These exclusions remain until the full ACL
-#   xfstests suite (set/get/inherit/default) is verified passing end-to-end.
+#   Source inspection shows ACL plumbing, not mounted row proof: the FUSE
+#   adapter negotiates POSIX ACL and DONT_MASK support, system.posix_acl_*
+#   validation/storage paths exist, and tidefs-posix-acl/tidefs-permission
+#   cover access ACL evaluation, chmod/mode sync helpers, and default
+#   inheritance planning. These rows stay excluded until focused mounted FUSE
+#   xfstests evidence proves each row.
+#   generic/099: broad ACL semantics: set/get, chmod sync, access checks,
+#     named user/group and mask behavior, removals, recursive/default ACLs.
+#   generic/237: non-owner setfacl must fail with EPERM; the adapter's ACL
+#     owner guard currently returns EACCES, so the mounted errno is not proven.
+#   generic/318: user-namespace ACL id mapping plus remount persistence; no
+#     mounted idmap proof is recorded here.
+#   generic/319: mounted mkdir inheritance for directory default ACL xattrs.
+#   generic/444: mounted create SGID/default ACL interaction.
 generic/099
 generic/237
-generic/307
 generic/318
 generic/319
 generic/444
