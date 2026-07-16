@@ -2213,12 +2213,28 @@ static struct dentry *tidefs_posix_vfs_lookup(struct inode *dir,
 
 /*
  * SB_POSIXACL defers umask handling to filesystem ACL creation. TideFS
- * refuses default ACL creation while inheritance is unsupported, so new
- * inodes use the ordinary umask path.
+ * refuses default ACL creation while inheritance is unsupported. Refuse
+ * child creation when persisted state already contains a default ACL;
+ * otherwise use the ordinary umask path.
  */
-static umode_t tidefs_posix_vfs_apply_create_umask(umode_t mode)
+static int tidefs_posix_vfs_prepare_create_mode(struct inode *dir,
+						 umode_t *mode)
 {
-	return mode & ~current_umask();
+	struct tidefs_posix_vfs_mount *ctx = dir->i_sb->s_fs_info;
+	struct posix_acl *default_acl;
+
+	if (ctx && ctx->engine_backed) {
+		default_acl = get_inode_acl(dir, ACL_TYPE_DEFAULT);
+		if (IS_ERR(default_acl))
+			return PTR_ERR(default_acl);
+		if (default_acl) {
+			posix_acl_release(default_acl);
+			return -EOPNOTSUPP;
+		}
+	}
+
+	*mode &= ~current_umask();
+	return 0;
 }
 
 static int tidefs_posix_vfs_create(struct mnt_idmap *idmap,
@@ -2228,8 +2244,11 @@ static int tidefs_posix_vfs_create(struct mnt_idmap *idmap,
 	struct tidefs_posix_vfs_kernel_pool_core *pool;
 	struct inode *inode;
 	u64 ino;
+	int acl_ret;
 
-	mode = tidefs_posix_vfs_apply_create_umask(mode);
+	acl_ret = tidefs_posix_vfs_prepare_create_mode(dir, &mode);
+	if (acl_ret)
+		return acl_ret;
 
 	/* Refuse write operations on read-only mounts. */
 	{
@@ -2354,7 +2373,9 @@ static int tidefs_posix_vfs_tmpfile(struct mnt_idmap *idmap,
 	u64 out_generation = 0;
 	int ret, pool_idx;
 
-	mode = tidefs_posix_vfs_apply_create_umask(mode);
+	ret = tidefs_posix_vfs_prepare_create_mode(dir, &mode);
+	if (ret)
+		return ret;
 
 	pool = tidefs_posix_vfs_pool_core_from_sb(dir->i_sb);
 	if (IS_ERR(pool))
@@ -2405,8 +2426,11 @@ static struct dentry *tidefs_posix_vfs_mkdir(struct mnt_idmap *idmap,
 	struct tidefs_posix_vfs_kernel_pool_core *pool;
 	struct inode *inode;
 	u64 ino;
+	int acl_ret;
 
-	mode = tidefs_posix_vfs_apply_create_umask(mode);
+	acl_ret = tidefs_posix_vfs_prepare_create_mode(dir, &mode);
+	if (acl_ret)
+		return ERR_PTR(acl_ret);
 
 	/* Refuse write operations on read-only mounts. */
 	{
@@ -2860,7 +2884,9 @@ static int tidefs_posix_vfs_mknod(struct mnt_idmap *idmap,
 	unsigned long long out_generation = 0;
 	int ret;
 
-	mode = tidefs_posix_vfs_apply_create_umask(mode);
+	ret = tidefs_posix_vfs_prepare_create_mode(dir, &mode);
+	if (ret)
+		return ret;
 
 	/* Refuse write operations on read-only mounts. */
 	{
