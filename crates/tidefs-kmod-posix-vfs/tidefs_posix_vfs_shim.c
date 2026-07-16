@@ -4769,8 +4769,8 @@ static int tidefs_posix_vfs_set_acl(struct mnt_idmap *idmap,
 	if (type == ACL_TYPE_ACCESS)
 		xattr_name = XATTR_NAME_POSIX_ACL_ACCESS;
 	else if (type == ACL_TYPE_DEFAULT) {
-		if (!S_ISDIR(inode->i_mode) && acl)
-			return -EACCES;
+		if (!S_ISDIR(inode->i_mode))
+			return acl ? -EACCES : 0;
 		/*
 		 * A stored default ACL is only meaningful when create and mkdir
 		 * inherit it. Refuse raw-only default ACL storage while this mounted
