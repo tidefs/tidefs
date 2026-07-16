@@ -21,7 +21,8 @@
 #   xfstests evidence proves each row.
 #   generic/099: broad ACL semantics: set/get, chmod sync, access checks,
 #     named user/group and mask behavior, removals, recursive/default ACLs.
-#   generic/237: mounted ACL mutation credential/capability enforcement.
+#   generic/237: non-owner setfacl must fail with EPERM; the adapter's ACL
+#     owner guard currently returns EACCES, so the mounted errno is not proven.
 #   generic/307: mounted setfacl ctime update plus remount persistence.
 #   generic/318: user-namespace ACL id mapping plus remount persistence; no
 #     mounted idmap proof is recorded here.
