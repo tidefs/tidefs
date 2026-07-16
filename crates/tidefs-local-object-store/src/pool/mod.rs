@@ -3171,6 +3171,24 @@ impl Pool {
 
         for receipt in placement_receipts.into_values() {
             current_logical_keys.insert(receipt.object_key);
+
+            // Placement receipts are copied beyond their payload targets. If
+            // the retiring device is not a current target and an identical
+            // receipt is already readable from a survivor, syncing that
+            // survivor is sufficient: rewriting the object would churn
+            // unrelated placement authority and inflate evacuation counts.
+            let target_owns_payload = receipt
+                .targets
+                .iter()
+                .any(|target| target.device_guid == target_guid);
+            let survivor_has_current_receipt = matches!(
+                self.load_placement_receipt(&surviving_indices, receipt.object_key),
+                Ok(Some(survivor_receipt)) if survivor_receipt == receipt
+            );
+            if !target_owns_payload && survivor_has_current_receipt {
+                continue;
+            }
+
             let data = match self.get_with_receipt(&receipt)? {
                 Some(data) => data,
                 None => {
@@ -6320,16 +6338,31 @@ mod tests {
         pool.put(IoClass::Data, key2, &data2).unwrap();
         pool.put(IoClass::Data, key3, &data3).unwrap();
         pool.sync_all().unwrap();
-        let survivor_commit_count_before = pool.devices[1].store().txg_manager().commit_count();
+        let key1_receipt = pool
+            .placement_receipt_for_key(IoClass::Data, key1)
+            .unwrap()
+            .expect("key1 receipt before removal");
+        let victim_idx = pool
+            .resolve_receipt_target(&key1_receipt.targets[0])
+            .unwrap();
+        let survivor_idx = (0..pool.devices.len())
+            .find(|idx| *idx != victim_idx)
+            .expect("surviving device");
+        let victim_guid = pool.device_guid_for_index(victim_idx);
+        let victim_path = pool.devices[victim_idx].root().to_path_buf();
+        let survivor_commit_count_before = pool.devices[survivor_idx]
+            .store()
+            .txg_manager()
+            .commit_count();
 
         // All objects should be readable now.
         assert!(pool.get(IoClass::Data, key1).unwrap().is_some());
         assert!(pool.get(IoClass::Data, key2).unwrap().is_some());
         assert!(pool.get(IoClass::Data, key3).unwrap().is_some());
 
-        // Remove device 1. Objects on it are evacuated to device 2.
-        let victim_guid = pool.device_guid_for_index(0);
-        let result = pool.safe_remove_device(&d1).unwrap();
+        // Remove the device that owns key1 so this test exercises an actual
+        // survivor-side rewrite and durability barrier.
+        let result = pool.safe_remove_device(&victim_path).unwrap();
         assert!(result.complete);
         assert_eq!(result.objects_failed, 0);
 
@@ -6358,6 +6391,79 @@ mod tests {
                 "receipt for {key:?} must not target the removed device"
             );
         }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn safe_remove_device_rewrites_only_target_owned_receipts() {
+        let root = temp_dir("safe-remove-target-owned-receipts");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = multi_data_device_config(&root, 3);
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::replicated(1),
+            ..PoolProperties::default()
+        };
+        let mut pool = Pool::create(config, properties, &test_options()).unwrap();
+        set_deterministic_device_guids(&mut pool);
+
+        let victim_key = ObjectKey::from_name(b"target-owned-removal-object");
+        let victim_payload = b"only target-owned data needs evacuation";
+        pool.put(IoClass::Data, victim_key, victim_payload).unwrap();
+        let victim_receipt = pool
+            .placement_receipt_for_key(IoClass::Data, victim_key)
+            .unwrap()
+            .expect("victim receipt before removal");
+        let victim_idx = pool
+            .resolve_receipt_target(&victim_receipt.targets[0])
+            .unwrap();
+        let victim_guid = pool.device_guid_for_index(victim_idx);
+        let victim_path = pool.devices[victim_idx].root().to_path_buf();
+
+        let unrelated_payload = b"survivor-owned placement must stay unchanged";
+        let candidate_indices: Vec<usize> = (0..pool.devices.len()).collect();
+        let unrelated_key = (0u64..1024)
+            .map(|index| ObjectKey::from_name(format!("survivor-owned-{index}")))
+            .find(|key| {
+                pool.plan_pool_wide_placement(
+                    IoClass::Data,
+                    *key,
+                    unrelated_payload.len(),
+                    &candidate_indices,
+                )
+                .unwrap()
+                .targets
+                .iter()
+                .all(|target| target.device_guid != victim_guid)
+            })
+            .expect("key placed away from victim");
+        pool.put(IoClass::Data, unrelated_key, unrelated_payload)
+            .unwrap();
+        let unrelated_receipt_before = pool
+            .placement_receipt_for_key(IoClass::Data, unrelated_key)
+            .unwrap()
+            .expect("unrelated receipt before removal");
+        assert!(unrelated_receipt_before
+            .targets
+            .iter()
+            .all(|target| target.device_guid != victim_guid));
+
+        let removal = pool.safe_remove_device(&victim_path).unwrap();
+        assert!(removal.complete);
+        assert_eq!(removal.objects_evacuated, 1);
+        assert_eq!(removal.bytes_evacuated, victim_payload.len() as u64);
+        assert_eq!(removal.content_digests.len(), 1);
+        assert!(removal.content_digests.contains_key(&victim_key));
+
+        let unrelated_receipt_after = pool
+            .placement_receipt_for_key(IoClass::Data, unrelated_key)
+            .unwrap()
+            .expect("unrelated receipt after removal");
+        assert_eq!(unrelated_receipt_after, unrelated_receipt_before);
+        assert_eq!(
+            pool.get(IoClass::Data, unrelated_key).unwrap(),
+            Some(unrelated_payload.to_vec())
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
