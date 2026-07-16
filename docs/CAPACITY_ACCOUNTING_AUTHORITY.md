@@ -45,12 +45,13 @@ mirrors.
   `crates/tidefs-types-space-accounting-core/`: define the current
   source-owned logical admission, physical allocator pressure,
   `DatasetSpaceCountersV1`, `SpaceDelta`, `PoolPhysicalCountersV1`, space
-  domains, and POSIX `statfs` projection inputs.
+  domains, and POSIX `statfs` projection inputs. Their
+  `pinned_snapshot_bytes` counter is separately observable but is a subset of
+  `logical_used_bytes`, so POSIX `statfs` must not subtract it again.
 - `docs/SNAPSHOT_CLONE_DEADLIST_AUTHORITY.md` and
-  `crates/tidefs-local-filesystem/src/snapshot.rs`: snapshot-pinned bytes are
-  separately observable and must not be double-counted in POSIX `statfs`;
-  snapshot reclaim remains tied to lifecycle pins, deadlists, and
-  placement/rebuild work.
+  `crates/tidefs-local-filesystem/src/snapshot.rs`: snapshot lifecycle and
+  reclaim remain tied to lifecycle pins, deadlists, and placement/rebuild
+  work.
 - `crates/tidefs-block-allocator/`: owns physical free-block tracking,
   transactional reservations, quota-table reserve/commit/release bookkeeping,
   commit-epoch fencing, root-reserve block counters, and TRIM/UNMAP dispatch.
