@@ -4676,7 +4676,7 @@ static struct posix_acl *tidefs_posix_vfs_get_inode_acl(struct inode *inode,
 	unsigned char *value_buf = NULL;
 	struct posix_acl *acl = NULL;
 	unsigned int out_len = 0;
-	unsigned int buf_size = 4096;
+	unsigned int buf_size;
 	int ret;
 
 	if (rcu)
@@ -4693,6 +4693,23 @@ static struct posix_acl *tidefs_posix_vfs_get_inode_acl(struct inode *inode,
 	else
 		return ERR_PTR(-EINVAL);
 
+	/* Size the buffer from the stored xattr instead of imposing a 4K limit. */
+	ret = tidefs_posix_vfs_engine_getxattr(
+		inode->i_ino,
+		(const unsigned char *)xattr_name,
+		(unsigned int)strlen(xattr_name),
+		NULL, 0,
+		&out_len);
+	if (ret == -ENODATA || ret == -ENOSYS)
+		return NULL;  /* no ACL stored: fall back to mode bits */
+	if (ret < 0)
+		return ERR_PTR(ret);
+	if (!out_len)
+		return ERR_PTR(-EINVAL);
+	if (out_len > XATTR_SIZE_MAX)
+		return ERR_PTR(-E2BIG);
+
+	buf_size = out_len;
 	value_buf = kmalloc(buf_size, GFP_KERNEL);
 	if (!value_buf)
 		return ERR_PTR(-ENOMEM);
@@ -4706,15 +4723,15 @@ static struct posix_acl *tidefs_posix_vfs_get_inode_acl(struct inode *inode,
 		&out_len);
 	if (ret == -ENODATA || ret == -ENOSYS) {
 		kfree(value_buf);
-		return NULL;  /* no ACL stored: fall back to mode bits */
+		return NULL;
 	}
 	if (ret < 0) {
 		kfree(value_buf);
 		return ERR_PTR(ret);
 	}
-	if (out_len == 0 || out_len > buf_size) {
+	if (!out_len || out_len > buf_size) {
 		kfree(value_buf);
-		return NULL;
+		return ERR_PTR(-EINVAL);
 	}
 
 	/* Decode using the kernel's built-in POSIX ACL xattr parser. */
