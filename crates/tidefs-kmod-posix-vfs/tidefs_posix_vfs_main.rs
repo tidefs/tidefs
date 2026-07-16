@@ -6470,8 +6470,14 @@ impl crate::tidefs_kmod_bridge::kernel_types::VfsEngine for KernelEngine {
             let entries = &stores[idx].1;
             for (entry_name, value) in entries.iter() {
                 if **entry_name == *name {
-                    let mut result = crate::tidefs_kmod_bridge::kernel_types::KmodVec::new();
+                    let mut result =
+                        crate::tidefs_kmod_bridge::kernel_types::KmodVec::with_capacity(
+                            value.len(),
+                        );
                     result.extend_from_slice(&*value);
+                    if result.len() != value.len() {
+                        return Err(crate::tidefs_kmod_bridge::kernel_types::Errno::ENOMEM);
+                    }
                     return Ok(result);
                 }
             }
