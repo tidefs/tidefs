@@ -2240,6 +2240,7 @@ static int tidefs_posix_vfs_create(struct mnt_idmap *idmap,
 			tidefs_posix_vfs_apply_inode_ops(inode, out_mode, 0);
 			tidefs_posix_vfs_init_new_inode_times(inode);
 			tidefs_posix_vfs_touch_dirent_parent(dir);
+			insert_inode_hash(inode);
 			d_instantiate(dentry, inode);
 
 			pr_debug("tidefs_posix_vfs: create (engine-backed) name='%.*s' ino=%llu\n",
@@ -2335,6 +2336,7 @@ static int tidefs_posix_vfs_tmpfile(struct mnt_idmap *idmap,
 	inode_init_owner(idmap, inode, dir, out_mode);
 	tidefs_posix_vfs_apply_inode_ops(inode, out_mode, 0);
 	tidefs_posix_vfs_init_new_inode_times(inode);
+	insert_inode_hash(inode);
 	d_tmpfile(file, inode);
 
 	/*
@@ -2412,6 +2414,7 @@ static struct dentry *tidefs_posix_vfs_mkdir(struct mnt_idmap *idmap,
 				inc_nlink(dir);
 			tidefs_posix_vfs_init_new_inode_times(inode);
 			tidefs_posix_vfs_touch_dirent_parent(dir);
+			insert_inode_hash(inode);
 
 			pr_debug("tidefs_posix_vfs: mkdir (engine-backed) name='%.*s' ino=%llu\n",
 				 (unsigned int)dentry->d_name.len, dentry->d_name.name, out_ino);
@@ -2854,6 +2857,7 @@ static int tidefs_posix_vfs_mknod(struct mnt_idmap *idmap,
 			tidefs_posix_vfs_apply_inode_ops(inode, out_mode, 0);
 			tidefs_posix_vfs_init_new_inode_times(inode);
 			tidefs_posix_vfs_touch_dirent_parent(dir);
+			insert_inode_hash(inode);
 			d_instantiate(dentry, inode);
 
 			pr_debug("tidefs_posix_vfs: mknod (engine-backed) name=%.*s ino=%llu mode=0%o\n",
@@ -3008,6 +3012,7 @@ static int tidefs_posix_vfs_symlink(struct mnt_idmap *idmap,
 				tidefs_posix_vfs_apply_inode_ops(sym_inode, out_mode, target_len);
 				tidefs_posix_vfs_init_new_inode_times(sym_inode);
 				tidefs_posix_vfs_touch_dirent_parent(dir);
+				insert_inode_hash(sym_inode);
 				d_instantiate(dentry, sym_inode);
 			}
 			pr_debug("tidefs_posix_vfs: symlink (engine-backed) name='%.*s' target='%s' ino=%llu\n",
@@ -6759,7 +6764,7 @@ static struct dentry *tidefs_posix_vfs_fh_to_dentry(struct super_block *sb,
 		return ERR_PTR(-EINVAL);
 	}
 
-	inode = ilookup5(sb, ino, NULL, NULL);
+	inode = ilookup(sb, ino);
 	if (!inode)
 		return ERR_PTR(-ESTALE);
 
@@ -6782,7 +6787,7 @@ static struct dentry *tidefs_posix_vfs_fh_to_parent(struct super_block *sb,
 
 	parent_ino = ((u64)fid->raw[4] << 32) | fid->raw[5];
 
-	inode = ilookup5(sb, parent_ino, NULL, NULL);
+	inode = ilookup(sb, parent_ino);
 	if (!inode)
 		return ERR_PTR(-ESTALE);
 
