@@ -6502,18 +6502,41 @@ impl crate::tidefs_kmod_bridge::kernel_types::VfsEngine for KernelEngine {
             2 if !exists => return Err(crate::tidefs_kmod_bridge::kernel_types::Errno::ENODATA),
             _ => {}
         }
+
+        const SETXATTR_INTENT_FIXED_LEN: usize = 1 + 8 + 1 + 1 + 4;
+        let expected_intent_len = SETXATTR_INTENT_FIXED_LEN + name.len() + value.len();
+        if expected_intent_len > crate::intent_record::MAX_INTENT_ENTRY_SIZE {
+            return Err(crate::tidefs_kmod_bridge::kernel_types::Errno::E2BIG);
+        }
+
+        let mut name_vec =
+            crate::tidefs_kmod_bridge::kernel_types::KmodVec::with_capacity(name.len());
+        name_vec.extend_from_slice(name);
+        let mut value_vec =
+            crate::tidefs_kmod_bridge::kernel_types::KmodVec::with_capacity(value.len());
+        value_vec.extend_from_slice(value);
+        if name_vec.len() != name.len() || value_vec.len() != value.len() {
+            return Err(crate::tidefs_kmod_bridge::kernel_types::Errno::ENOMEM);
+        }
+        if !exists {
+            entries.reserve(1);
+            if entries.capacity().saturating_sub(entries.len()) < 1 {
+                return Err(crate::tidefs_kmod_bridge::kernel_types::Errno::ENOMEM);
+            }
+        }
+
+        let ns_byte = Self::xattr_namespace_byte(name);
+        let entry = crate::intent_record::encode_setxattr_intent(inode, ns_byte, name, value);
+        if entry.as_bytes().len() != expected_intent_len {
+            return Err(crate::tidefs_kmod_bridge::kernel_types::Errno::ENOMEM);
+        }
+        // Record the write-ahead intent before making the xattr visible.
+        self.record_intent_entry(entry.as_bytes())?;
+
         if exists {
             entries.retain(|(n, _)| **n != *name);
         }
-        let mut name_vec = crate::tidefs_kmod_bridge::kernel_types::KmodVec::new();
-        name_vec.extend_from_slice(name);
-        let mut value_vec = crate::tidefs_kmod_bridge::kernel_types::KmodVec::new();
-        value_vec.extend_from_slice(value);
         entries.push((name_vec, value_vec));
-        // Record intent for crash recovery replay.
-        let ns_byte = Self::xattr_namespace_byte(name);
-        let entry = crate::intent_record::encode_setxattr_intent(inode, ns_byte, name, value);
-        self.record_intent_entry(entry.as_bytes())?;
         Ok(())
     }
     fn listxattr(
@@ -6553,13 +6576,17 @@ impl crate::tidefs_kmod_bridge::kernel_types::VfsEngine for KernelEngine {
         if let Some(idx) = self.find_xattr_store_idx(ino) {
             let mut stores = self.xattr_stores.borrow_mut();
             let entries = &mut stores[idx].1;
-            let before = entries.len();
-            entries.retain(|(n, _)| **n != *name);
-            if entries.len() < before {
-                // Record intent for crash recovery replay.
+            if entries.iter().any(|(entry_name, _)| **entry_name == *name) {
+                const REMOVEXATTR_INTENT_FIXED_LEN: usize = 1 + 8 + 1 + 1;
+                let expected_intent_len = REMOVEXATTR_INTENT_FIXED_LEN + name.len();
                 let ns_byte = Self::xattr_namespace_byte(name);
                 let entry = crate::intent_record::encode_removexattr_intent(inode, ns_byte, name);
+                if entry.as_bytes().len() != expected_intent_len {
+                    return Err(crate::tidefs_kmod_bridge::kernel_types::Errno::ENOMEM);
+                }
+                // Record the write-ahead intent before making removal visible.
                 self.record_intent_entry(entry.as_bytes())?;
+                entries.retain(|(entry_name, _)| **entry_name != *name);
                 return Ok(());
             }
         }
