@@ -17,8 +17,10 @@
 pub mod commit_group;
 pub mod transform_pipeline;
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -1013,7 +1015,7 @@ fn persist_device_removal_marker(pool_root: &Path, target_path: &Path) -> Result
             .truncate(true)
             .write(true)
             .open(&tmp_path)?;
-        marker.write_all(target_path.to_string_lossy().as_bytes())?;
+        marker.write_all(target_path.as_os_str().as_bytes())?;
         marker.sync_all()?;
         drop(marker);
 
@@ -1032,12 +1034,20 @@ fn persist_device_removal_marker(pool_root: &Path, target_path: &Path) -> Result
     Ok(())
 }
 
+fn read_device_removal_marker(marker_path: &Path) -> Result<PathBuf> {
+    let encoded = fs::read(marker_path).map_err(|source| StoreError::Io {
+        operation: "read_device_removal_marker",
+        path: marker_path.to_path_buf(),
+        source,
+    })?;
+    Ok(PathBuf::from(OsString::from_vec(encoded)))
+}
+
 /// Check for a pending device removal marker and resume evacuation if found.
 fn resume_device_removal_if_pending(pool: &mut Pool) {
     let marker_path = pool.config.root_path.join(DEVICE_REMOVAL_MARKER_FILE);
     if marker_path.exists() {
-        if let Ok(encoded) = std::fs::read_to_string(&marker_path) {
-            let target_path = PathBuf::from(encoded.trim());
+        if let Ok(target_path) = read_device_removal_marker(&marker_path) {
             let target_in_topology = pool.devices.iter().any(|d| d.root() == target_path);
             let completed = if target_in_topology {
                 matches!(pool.safe_remove_device(&target_path), Ok(result) if result.complete)
@@ -3088,13 +3098,7 @@ impl Pool {
         // removed.
         let marker_path = self.config.root_path.join(DEVICE_REMOVAL_MARKER_FILE);
         if marker_path.exists() {
-            let encoded =
-                std::fs::read_to_string(&marker_path).map_err(|source| StoreError::Io {
-                    operation: "read_device_removal_marker",
-                    path: marker_path.clone(),
-                    source,
-                })?;
-            let pending_path = PathBuf::from(encoded.trim());
+            let pending_path = read_device_removal_marker(&marker_path)?;
             if pending_path != path
                 && self
                     .devices
@@ -4620,6 +4624,7 @@ mod tests {
     use super::*;
     use crate::device::DeviceClass;
     use crate::ObjectKey;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_dir(label: &str) -> PathBuf {
@@ -7028,6 +7033,47 @@ mod tests {
         assert!(!marker_path.exists());
         assert_eq!(pool.stats().device_count, 1);
         assert_eq!(pool.get(IoClass::Data, key).unwrap(), Some(data));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn safe_remove_device_resume_round_trips_target_path_bytes() {
+        let root = temp_dir("safe-remove-resume-exact-target-path");
+        let _ = std::fs::remove_dir_all(&root);
+        let target_path = root.join(OsString::from_vec(b"data-\xff ".to_vec()));
+        let mut config = multi_data_device_config(&root, 2);
+        config.devices[0].path = target_path.clone();
+        config.devices[0].kind = DeviceKind::Single {
+            path: target_path.clone(),
+        };
+
+        let mut pool =
+            Pool::create(config.clone(), PoolProperties::default(), &test_options()).unwrap();
+        let rogue_key = ObjectKey::from_name(b"exact-target-path-removal-blocker");
+        let rogue_payload = b"resume must not lose a byte-exact target path";
+        pool.devices[0].put(rogue_key, rogue_payload).unwrap();
+
+        let result = pool.safe_remove_device(&target_path).unwrap();
+        assert!(!result.complete);
+        let marker_path = root.join(DEVICE_REMOVAL_MARKER_FILE);
+        assert_eq!(
+            std::fs::read(&marker_path).unwrap(),
+            target_path.as_os_str().as_bytes()
+        );
+
+        drop(pool);
+
+        let reopened = Pool::open(config, PoolProperties::default(), &test_options()).unwrap();
+        assert_eq!(
+            std::fs::read(&marker_path).unwrap(),
+            target_path.as_os_str().as_bytes()
+        );
+        assert_eq!(reopened.stats().device_count, 2);
+        assert_eq!(
+            reopened.devices[0].get(rogue_key).unwrap(),
+            Some(rogue_payload.to_vec())
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
