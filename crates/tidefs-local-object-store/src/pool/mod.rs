@@ -3085,8 +3085,14 @@ impl Pool {
             });
         }
 
-        // Compute surviving device indices (all except target).
-        let surviving_indices: Vec<usize> = (0..self.devices.len())
+        // This removal path rewrites every receipt-backed object through the
+        // data-class fallback. Keep its candidates inside that I/O class: an
+        // intent-log or read-cache device is not surviving authority for data.
+        let surviving_indices: Vec<usize> = self
+            .class_map
+            .get(IoClass::Data)
+            .iter()
+            .copied()
             .filter(|&i| i != target_idx)
             .collect();
 
@@ -6666,6 +6672,60 @@ mod tests {
             })
         ));
         assert_eq!(pool.stats().device_count, 2);
+        assert!(root.join(DEVICE_REMOVAL_MARKER_FILE).exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn safe_remove_device_refuses_non_data_survivor_for_data() {
+        let root = temp_dir("safe-remove-non-data-survivor");
+        let _ = std::fs::remove_dir_all(&root);
+        let data_path = root.join("data");
+        let log_path = root.join("log");
+        let config = PoolConfig {
+            name: "testpool".into(),
+            root_path: root.to_path_buf(),
+            devices: vec![
+                DeviceConfig {
+                    media_class: Default::default(),
+                    path: data_path.clone(),
+                    backing: DeviceBacking::DirectoryObjectStoreCompat,
+                    class: DeviceClass::Data,
+                    kind: DeviceKind::Single {
+                        path: data_path.clone(),
+                    },
+                    encryption: None,
+                    compression: None,
+                },
+                DeviceConfig {
+                    media_class: Default::default(),
+                    path: log_path.clone(),
+                    backing: DeviceBacking::DirectoryObjectStoreCompat,
+                    class: DeviceClass::IntentLog,
+                    kind: DeviceKind::Single { path: log_path },
+                    encryption: None,
+                    compression: None,
+                },
+            ],
+        };
+        let mut pool = Pool::create(config, PoolProperties::default(), &test_options()).unwrap();
+        let key = ObjectKey::from_name(b"data-must-not-evacuate-to-log-device");
+        let payload = b"data needs a surviving data-class placement target";
+        pool.put(IoClass::Data, key, payload).unwrap();
+
+        let result = pool.safe_remove_device(&data_path);
+        assert!(matches!(
+            result,
+            Err(StoreError::InvalidOptions {
+                reason: "safe removal requires at least one usable surviving device"
+            })
+        ));
+        assert_eq!(pool.stats().device_count, 2);
+        assert_eq!(
+            pool.get(IoClass::Data, key).unwrap(),
+            Some(payload.to_vec())
+        );
         assert!(root.join(DEVICE_REMOVAL_MARKER_FILE).exists());
 
         let _ = std::fs::remove_dir_all(&root);
