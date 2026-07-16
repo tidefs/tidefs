@@ -3090,7 +3090,7 @@ impl Pool {
         let mut internal_placement_keys = BTreeSet::new();
         let mut current_logical_keys = BTreeSet::new();
         let mut rewritten_logical_keys = BTreeSet::new();
-        let mut placement_receipts = Vec::new();
+        let mut placement_receipts = BTreeMap::new();
         let mut failed_logical_keys = BTreeSet::new();
 
         let mut mark_failed = |result: &mut EvacuationResult, key: ObjectKey| {
@@ -3127,10 +3127,19 @@ impl Pool {
                     ));
                 }
             }
+
+            // Faulted devices are excluded from the pool-wide receipt scan,
+            // so retain target-local authority for evacuation selection.
+            let replace = match placement_receipts.get(&receipt.object_key) {
+                Some(current) => receipt_supersedes(&receipt, current),
+                None => true,
+            };
+            if replace {
+                placement_receipts.insert(receipt.object_key, receipt);
+            }
         }
 
         for receipt in self.placement_receipts(IoClass::Data)? {
-            current_logical_keys.insert(receipt.object_key);
             internal_placement_keys.insert(placement_receipt_object_key(receipt.object_key));
             if matches!(receipt.policy, PoolRedundancyPolicy::Erasure { .. }) {
                 for target in &receipt.targets {
@@ -3141,10 +3150,17 @@ impl Pool {
                 }
             }
 
-            placement_receipts.push(receipt);
+            let replace = match placement_receipts.get(&receipt.object_key) {
+                Some(current) => receipt_supersedes(&receipt, current),
+                None => true,
+            };
+            if replace {
+                placement_receipts.insert(receipt.object_key, receipt);
+            }
         }
 
-        for receipt in placement_receipts {
+        for receipt in placement_receipts.into_values() {
+            current_logical_keys.insert(receipt.object_key);
             let data = match self.get_with_receipt(&receipt)? {
                 Some(data) => data,
                 None => {
@@ -5932,6 +5948,63 @@ mod tests {
                 .all(|target| target.device_guid != victim_guid),
             "rewritten receipt must not target the removed device"
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn safe_remove_device_evacuates_target_only_faulted_erasure_receipt() {
+        let root = temp_dir("safe-remove-target-only-faulted-erasure-receipt");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = multi_data_device_config(&root, 4);
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::erasure(2, 1),
+            ..PoolProperties::default()
+        };
+        let mut pool = Pool::create(config, properties, &test_options()).unwrap();
+        set_deterministic_device_guids(&mut pool);
+
+        let key = ObjectKey::from_name(b"target-only-faulted-erasure-receipt");
+        let payload = b"faulted target receipt must still drive evacuation";
+        pool.put(IoClass::Data, key, payload).unwrap();
+        let receipt = pool
+            .placement_receipt_for_key(IoClass::Data, key)
+            .unwrap()
+            .expect("receipt before removal");
+        let victim_idx = pool.resolve_receipt_target(&receipt.targets[0]).unwrap();
+        let victim_guid = pool.device_guid_for_index(victim_idx);
+        let victim_path = pool.devices[victim_idx].root().to_path_buf();
+        let receipt_key = placement_receipt_object_key(key);
+
+        for idx in 0..pool.devices.len() {
+            if idx != victim_idx {
+                assert!(pool.devices[idx].delete(receipt_key).unwrap());
+            }
+        }
+        for _ in 0..3 {
+            pool.devices[victim_idx].record_checksum_error();
+        }
+        assert_eq!(
+            pool.devices[victim_idx].status().state,
+            DeviceState::Faulted
+        );
+
+        let removal = pool.safe_remove_device(&victim_path).unwrap();
+        assert!(removal.complete);
+        assert_eq!(removal.objects_evacuated, 1);
+        assert_eq!(removal.objects_failed, 0);
+        assert_eq!(
+            pool.get(IoClass::Data, key).unwrap(),
+            Some(payload.to_vec())
+        );
+        let survivor_receipt = pool
+            .placement_receipt_for_key(IoClass::Data, key)
+            .unwrap()
+            .expect("survivor receipt after removal");
+        assert!(survivor_receipt
+            .targets
+            .iter()
+            .all(|target| target.device_guid != victim_guid));
 
         let _ = std::fs::remove_dir_all(&root);
     }
