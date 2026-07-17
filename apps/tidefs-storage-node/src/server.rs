@@ -775,6 +775,8 @@ fn build_bridged_vfssend2_send_payload(
 
 const VFSSEND2_FULL_SEND_BARRIER_CLASS: &str = "full";
 const VFSSEND2_INCREMENTAL_SEND_BARRIER_CLASS: &str = "incremental";
+const SNAPSHOT_BARRIER_SYNC_ERROR_PREFIX: &str = "snapshot barrier ";
+const SNAPSHOT_BARRIER_SYNC_ERROR_SEPARATOR: &str = " sync failed: ";
 
 fn snapshot_barrier_send_label(barrier_id: u64, key: &[u8]) -> String {
     let class = if key.is_empty() {
@@ -783,6 +785,19 @@ fn snapshot_barrier_send_label(barrier_id: u64, key: &[u8]) -> String {
         VFSSEND2_INCREMENTAL_SEND_BARRIER_CLASS
     };
     format!("vfssend2-{class}-send-{barrier_id}")
+}
+
+fn snapshot_barrier_sync_error(barrier_id: u64, reason: &str) -> String {
+    format!(
+        "{SNAPSHOT_BARRIER_SYNC_ERROR_PREFIX}{barrier_id}{SNAPSHOT_BARRIER_SYNC_ERROR_SEPARATOR}{reason}"
+    )
+}
+
+fn parse_snapshot_barrier_sync_error(message: &str) -> Option<(u64, &str)> {
+    let (barrier_id, reason) = message
+        .strip_prefix(SNAPSHOT_BARRIER_SYNC_ERROR_PREFIX)?
+        .split_once(SNAPSHOT_BARRIER_SYNC_ERROR_SEPARATOR)?;
+    Some((barrier_id.parse().ok()?, reason))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1117,6 +1132,9 @@ fn record_snapshot_barrier_error(
     message: &str,
     ctx: &SessionContext,
 ) -> bool {
+    let Some((barrier_id, reason)) = parse_snapshot_barrier_sync_error(message) else {
+        return false;
+    };
     let Some(peer_id) = ctx.transport.lock().unwrap().peer_node(session_id) else {
         return false;
     };
@@ -1125,8 +1143,11 @@ fn record_snapshot_barrier_error(
     let Some(coord) = active.as_mut() else {
         return false;
     };
+    if coord.barrier_id() != barrier_id {
+        return false;
+    }
 
-    coord.record_failure(peer_id, message.to_string())
+    coord.record_failure(peer_id, reason.to_string())
 }
 
 fn advance_tracker_after_peer_replica_read_map(
@@ -5987,7 +6008,7 @@ fn handle_frame_ctx(
                 Ok(store_snapshot) => store_snapshot,
                 Err(reason) => {
                     return Some(Frame::Error {
-                        message: format!("snapshot barrier sync failed: {reason}"),
+                        message: snapshot_barrier_sync_error(*barrier_id, &reason),
                     })
                 }
             };
@@ -7183,7 +7204,7 @@ mod cluster_pool_handler_tests {
     }
 
     #[test]
-    fn snapshot_barrier_error_records_mapped_session() {
+    fn snapshot_barrier_error_records_only_matching_barrier() {
         let (_dir, store) = frame_local_store();
         let ctx = frame_test_context(Arc::clone(&store));
         let peer_session_id = tidefs_transport::SessionId::new(2);
@@ -7207,9 +7228,22 @@ mod cluster_pool_handler_tests {
             SnapshotBarrierConfig::default(),
         ));
 
+        assert!(!record_snapshot_barrier_error(
+            peer_session_id,
+            "unrelated request failed",
+            &ctx
+        ));
+        assert!(!record_snapshot_barrier_error(
+            peer_session_id,
+            &snapshot_barrier_sync_error(6, "stale sync failure"),
+            &ctx
+        ));
+
+        let message = snapshot_barrier_sync_error(7, "sync failed");
+        assert_eq!(message, "snapshot barrier 7 sync failed: sync failed");
         assert!(record_snapshot_barrier_error(
             peer_session_id,
-            "sync failed",
+            &message,
             &ctx
         ));
 
@@ -7239,7 +7273,7 @@ mod cluster_pool_handler_tests {
 
         assert!(!record_snapshot_barrier_error(
             tidefs_transport::SessionId::new(44),
-            "sync failed",
+            &snapshot_barrier_sync_error(7, "sync failed"),
             &ctx
         ));
 
