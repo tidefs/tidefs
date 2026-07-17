@@ -82,6 +82,9 @@ use tokio::net::TcpStream;
 
 use crate::channel::{ChannelId, SharedChannelTable};
 use crate::connection::ConnectionHandle;
+use crate::control_service_dispatch::{
+    register_control_service_dispatch, ControlServiceDispatch, ControlServiceReplySink,
+};
 use crate::data_service_dispatch::{
     register_data_service_dispatch, DataServiceDispatch, DataServiceReplySink,
 };
@@ -253,6 +256,23 @@ impl ConnectionReceiver {
     ) -> Self {
         self.session_id = Some(session_id);
         register_data_service_dispatch(&self.dispatch, dispatch, reply_sink);
+        self
+    }
+
+    /// Bind CONTROL service-id dispatch to this receive loop's control path.
+    ///
+    /// The caller supplies the already-authenticated session id from connection
+    /// establishment. Reply frames are emitted through `reply_sink`; the receive
+    /// loop itself does not choose an outbound transport.
+    #[must_use]
+    pub fn with_control_service_dispatch(
+        mut self,
+        session_id: SessionId,
+        dispatch: ControlServiceDispatch,
+        reply_sink: Arc<dyn ControlServiceReplySink>,
+    ) -> Self {
+        self.session_id = Some(session_id);
+        register_control_service_dispatch(&self.dispatch, dispatch, reply_sink);
         self
     }
 
@@ -872,6 +892,14 @@ pub fn io_error_to_transport_kind(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control_service_dispatch::{
+        ControlServiceDispatchError, ControlServiceDispatchOutcome, ControlServiceFrame,
+        ControlServiceHandler, CONTROL_SERVICE_MESSAGE_FAMILY,
+    };
+    use crate::data_service_dispatch::{
+        DataServiceDispatchError, DataServiceDispatchOutcome, DataServiceFrame, DataServiceHandler,
+        DATA_SERVICE_MESSAGE_FAMILY,
+    };
     use crate::dispatch::MessageDispatch;
     use crate::envelope::MessageFamily;
     use crate::recv_batch::{RecvBatchConfig, RecvBatchDecoder};
@@ -1215,6 +1243,123 @@ mod tests {
                 .push((msg.family, msg.payload, msg.channel_id));
             Ok(())
         }
+    }
+
+    #[derive(Default)]
+    struct RecordingControlServiceHandler {
+        seen: Mutex<Vec<(SessionId, ControlServiceFrame)>>,
+    }
+
+    impl ControlServiceHandler for RecordingControlServiceHandler {
+        fn handle_control_service_frame(
+            &self,
+            session_id: SessionId,
+            frame: ControlServiceFrame,
+        ) -> Result<ControlServiceDispatchOutcome, ControlServiceDispatchError> {
+            self.seen.lock().unwrap().push((session_id, frame));
+            Ok(ControlServiceDispatchOutcome::Consumed)
+        }
+    }
+
+    struct ConsumedControlReplySink;
+
+    impl ControlServiceReplySink for ConsumedControlReplySink {
+        fn send_control_service_reply(
+            &self,
+            _session_id: SessionId,
+            _frame: ControlServiceFrame,
+        ) -> Result<(), ControlServiceDispatchError> {
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingDataServiceHandler {
+        seen: Mutex<Vec<(SessionId, DataServiceFrame)>>,
+    }
+
+    impl DataServiceHandler for RecordingDataServiceHandler {
+        fn handle_data_service_frame(
+            &self,
+            session_id: SessionId,
+            frame: DataServiceFrame,
+        ) -> Result<DataServiceDispatchOutcome, DataServiceDispatchError> {
+            self.seen.lock().unwrap().push((session_id, frame));
+            Ok(DataServiceDispatchOutcome::Consumed)
+        }
+    }
+
+    struct ConsumedDataReplySink;
+
+    impl DataServiceReplySink for ConsumedDataReplySink {
+        fn send_data_service_reply(
+            &self,
+            _session_id: SessionId,
+            _frame: DataServiceFrame,
+        ) -> Result<(), DataServiceDispatchError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn recv_loop_control_service_dispatch_shares_session_with_data_service() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        let session_id = SessionId::new(42);
+        let control_frame = ControlServiceFrame::new(0x06, 0x01, b"rpc".to_vec());
+        let data_frame = DataServiceFrame::new(0x07, 0x02, b"bulk".to_vec());
+        let control_payload = control_frame.encode().expect("encode control frame");
+        let data_payload = data_frame.encode().expect("encode data frame");
+
+        let sender = tokio::spawn(async move {
+            let mut stream = tokio::net::TcpStream::connect(server_addr).await.unwrap();
+            let control = build_frame(
+                CONTROL_SERVICE_MESSAGE_FAMILY,
+                ChannelId::new(0),
+                &control_payload,
+            );
+            let data = build_frame(
+                DATA_SERVICE_MESSAGE_FAMILY,
+                ChannelId::new(0),
+                &data_payload,
+            );
+            stream.write_all(&control).await.unwrap();
+            stream.write_all(&data).await.unwrap();
+            stream.shutdown().await.unwrap();
+        });
+
+        let (server_stream, _) = listener.accept().await.unwrap();
+        let message_dispatch = Arc::new(MessageDispatch::new());
+        let control_dispatch = ControlServiceDispatch::new();
+        let control_handler = Arc::new(RecordingControlServiceHandler::default());
+        control_dispatch.register(0x06, control_handler.clone());
+        let data_dispatch = DataServiceDispatch::new();
+        let data_handler = Arc::new(RecordingDataServiceHandler::default());
+        data_dispatch.register(0x07, data_handler.clone());
+
+        let mut receiver = ConnectionReceiver::new(
+            server_stream,
+            message_dispatch,
+            ReceiveLoopConfig::default(),
+        )
+        .with_data_service_dispatch(session_id, data_dispatch, Arc::new(ConsumedDataReplySink))
+        .with_control_service_dispatch(
+            session_id,
+            control_dispatch,
+            Arc::new(ConsumedControlReplySink),
+        );
+
+        receiver.recv_loop().await.expect("clean receive EOF");
+        sender.await.unwrap();
+
+        assert_eq!(
+            control_handler.seen.lock().unwrap().as_slice(),
+            &[(session_id, control_frame)]
+        );
+        assert_eq!(
+            data_handler.seen.lock().unwrap().as_slice(),
+            &[(session_id, data_frame)]
+        );
     }
 
     #[tokio::test]

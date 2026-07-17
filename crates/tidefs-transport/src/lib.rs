@@ -473,8 +473,9 @@ pub use connection_init::{
     HandshakeResponder, HANDSHAKE_PROTOCOL_VERSION,
 };
 pub use control_service_dispatch::{
-    ControlServiceDispatch, ControlServiceDispatchError, ControlServiceDispatchOutcome,
-    ControlServiceFrame, ControlServiceHandler, CONTROL_SERVICE_ENDPOINT_FAMILY,
+    register_control_service_dispatch, ControlServiceDispatch, ControlServiceDispatchError,
+    ControlServiceDispatchOutcome, ControlServiceFrame, ControlServiceHandler,
+    ControlServiceMessageHandler, ControlServiceReplySink, CONTROL_SERVICE_ENDPOINT_FAMILY,
     CONTROL_SERVICE_FRAME_HEADER_LEN, CONTROL_SERVICE_LANE, CONTROL_SERVICE_MESSAGE_FAMILY,
 };
 pub use correlation_frame::{
