@@ -1866,6 +1866,7 @@ pub const LIVE_POOL_ADMIN_PROTOCOL_VERSION: u16 = 1;
 
 /// Versioned request accepted by a live pool owner.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LivePoolAdminRequest {
     pub version: u16,
     pub command: LivePoolAdminCommand,
@@ -2044,6 +2045,7 @@ pub enum LivePoolAdminArg {
 
 /// Typed live-owner response.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LivePoolAdminResponse {
     pub version: u16,
     pub exit_code: i32,

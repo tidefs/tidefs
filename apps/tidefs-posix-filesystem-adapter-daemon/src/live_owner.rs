@@ -906,6 +906,18 @@ mod tests {
     }
 
     #[test]
+    fn unknown_request_envelope_field_decodes_as_typed_malformed() {
+        let err = decode_live_pool_admin_request(
+            r#"{"version":1,"command":"pool_status","pool":"tank","pool_uuid":null,"output":"human","args":{},"unexpected":true}"#,
+        )
+        .unwrap_err();
+
+        assert_eq!(err.exit_code, 2);
+        assert_eq!(err.kind, LivePoolAdminErrorKind::Malformed);
+        assert!(err.message.contains("unknown field `unexpected`"));
+    }
+
+    #[test]
     fn malformed_wire_version_decodes_as_typed_malformed() {
         for (payload, detail) in [
             (
