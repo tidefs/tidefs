@@ -47,18 +47,6 @@ pub enum DeviceCommand {
             value_parser = crate::commands::reject_directory_pool_media_value
         )]
         surviving_dirs: Vec<PathBuf>,
-
-        /// Replication factor for failure-domain separation (default: 2).
-        #[arg(long, default_value = "2")]
-        replication_factor: u8,
-
-        /// Failure domain level: device, node, rack, or datacenter.
-        #[arg(long, default_value = "device")]
-        failure_domain: String,
-
-        /// Force removal even if evacuation partially fails.
-        #[arg(long)]
-        force: bool,
     },
 
     /// Query live device status with source classification.
@@ -104,9 +92,6 @@ pub fn handle_device(cmd: DeviceCommand) {
             device_path,
             backing_dir,
             surviving_dirs,
-            replication_factor,
-            failure_domain,
-            force,
         } => {
             let _guard = super::authz::require_local_only("device remove");
             if let Err(e) = handle_remove(
@@ -114,9 +99,6 @@ pub fn handle_device(cmd: DeviceCommand) {
                 &device_path,
                 backing_dir.as_ref(),
                 &surviving_dirs,
-                replication_factor,
-                &failure_domain,
-                force,
             ) {
                 eprintln!("tidefsctl device remove: {e}");
                 std::process::exit(1);
@@ -158,17 +140,14 @@ fn handle_remove(
     device_path: &PathBuf,
     backing_dir: Option<&PathBuf>,
     surviving_dirs: &[PathBuf],
-    _replication_factor: u8,
-    _failure_domain: &str,
-    _force: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let online_refusal = online_device_removal_refusal(pool_name, device_path);
+
     if let Some(backing_dir) = backing_dir {
         return Err(format!(
             "offline device removal through --backing-dir {} is retired; \
-             use `tidefsctl device remove {pool_name} {}` against a reachable \
-             live owner so placement/refcount authority drives evacuation",
+             {online_refusal}",
             backing_dir.display(),
-            device_path.display()
         )
         .into());
     }
@@ -176,17 +155,20 @@ fn handle_remove(
     if let Some(surviving_dir) = surviving_dirs.first() {
         return Err(format!(
             "offline device removal through --surviving-dirs {} is retired; \
-             use a reachable live owner for pool '{pool_name}'",
+             {online_refusal}",
             surviving_dir.display()
         )
         .into());
     }
 
-    Err(format!(
+    Err(online_refusal.into())
+}
+
+fn online_device_removal_refusal(pool_name: &str, device_path: &PathBuf) -> String {
+    format!(
         "online device removal for pool '{pool_name}' device '{}' is refused before contacting a live owner: the mounted removal path cannot yet publish a replayable committed evacuation receipt together with durable topology/label updates. No device state was changed. This refusal is a detach-durability boundary; it does not establish secure erase or media-remanence guarantees.",
         device_path.display()
     )
-    .into())
 }
 
 /// Query live device status through the live owner, or fail closed
@@ -221,15 +203,7 @@ mod tests {
 
     #[test]
     fn removal_refuses_before_incomplete_live_owner_mutation() {
-        let result = handle_remove(
-            "testpool",
-            &PathBuf::from("/dev/disk0"),
-            None,
-            &[],
-            2,
-            "device",
-            false,
-        );
+        let result = handle_remove("testpool", &PathBuf::from("/dev/disk0"), None, &[]);
 
         assert!(
             result.is_err(),
@@ -256,9 +230,6 @@ mod tests {
             &PathBuf::from("/dev/disk0"),
             Some(&target_dir),
             &[],
-            2,
-            "device",
-            false,
         );
 
         assert!(result.is_err(), "offline target store must fail closed");
@@ -272,8 +243,9 @@ mod tests {
             "unexpected error: {msg}"
         );
         assert!(
-            msg.contains("placement/refcount authority"),
-            "unexpected error: {msg}"
+            msg.contains("refused before contacting a live owner")
+                && msg.contains("No device state was changed"),
+            "retired mode must report the shared no-mutation boundary: {msg}"
         );
     }
 
@@ -287,9 +259,6 @@ mod tests {
             &PathBuf::from("/dev/disk0"),
             None,
             std::slice::from_ref(&surviving_dir),
-            2,
-            "device",
-            false,
         );
 
         assert!(result.is_err(), "offline survivor store must fail closed");
@@ -301,6 +270,11 @@ mod tests {
         assert!(
             msg.contains("offline device removal through --surviving-dirs"),
             "unexpected error: {msg}"
+        );
+        assert!(
+            msg.contains("refused before contacting a live owner")
+                && msg.contains("No device state was changed"),
+            "retired mode must report the shared no-mutation boundary: {msg}"
         );
     }
 

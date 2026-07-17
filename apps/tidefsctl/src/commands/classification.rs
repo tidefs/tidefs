@@ -465,7 +465,7 @@ pub(crate) const COMMAND_SURFACES: &[CommandSurface] = &[
         path: "device remove",
         class: CommandClass::PublicOperator,
         routing: RoutingSemantics::LiveOwner,
-        summary: "route device evacuation/removal through live placement and refcount authority",
+        summary: "require live-owner authority but refuse dispatch until evacuation receipts and topology/label updates are durable",
     },
     CommandSurface {
         path: "device status",
