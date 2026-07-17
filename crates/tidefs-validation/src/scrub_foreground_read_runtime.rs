@@ -48,7 +48,7 @@ const DAEMON_SCRUB_OBSERVATION_TIMEOUT_SECS: u64 = 15;
 const FOREGROUND_READ_ARRIVAL_TICK: u64 = 1;
 const MAX_FOREGROUND_READ_WAIT_TICKS: u64 = 1;
 
-pub const SCRUB_READ_RESIDUAL_RISK: &str = "This row records a mounted FUSE foreground-read correctness workload bracketed by typed observations from the same daemon's scheduled scrub service. A pass requires admitted scrub records, work pending before and after the read, and a scheduler-budget throttle. The foreground wait bound still comes from the typed service-curve oracle rather than an environment-independent wall-clock SLO. This row is not production performance readiness, broad scrub/repair correctness, kernel/uBLK/RDMA validation, crash recovery, release-candidate status, or a claim-status/product-wording change.";
+pub const SCRUB_READ_RESIDUAL_RISK: &str = "This row records a mounted FUSE foreground-read correctness workload bracketed by typed observations from the same daemon's scheduled scrub service. The durable scrub targets are seeded into the production-option object store before mount, so they are fixture input rather than mounted write or fsync evidence. A pass requires admitted scrub records, work pending before and after the read, and a scheduler-budget throttle. The foreground wait bound still comes from the typed service-curve oracle rather than an environment-independent wall-clock SLO. This row is not production performance readiness, mounted write/fsync durability, broad scrub/repair correctness, kernel/uBLK/RDMA validation, crash recovery, release-candidate status, or a claim-status/product-wording change.";
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ScrubForegroundReadRuntimeEvidence {
@@ -312,6 +312,7 @@ pub fn run_scrub_foreground_read_runtime(command: String) -> ScrubForegroundRead
         .daemon_bin(daemon_path)
         .extra_args(&["--background-scrub-interval", "1"])
         .scrub_runtime_observation()
+        .pre_mount_setup(seed_scrub_backlog)
         .build();
     let harness = match harness {
         Ok(harness) => harness,
@@ -374,7 +375,7 @@ pub fn run_scrub_foreground_read_runtime(command: String) -> ScrubForegroundRead
         None => Some("mounted scrub runtime observation path is unavailable".to_string()),
     };
     let mounted_fixture_error =
-        scrub_service_ready_error.or_else(|| prepare_mounted_fixture(&harness).err());
+        scrub_service_ready_error.or_else(|| prepare_mounted_foreground_read(&harness).err());
     let pre_read_daemon_observation = if mounted_fixture_error.is_none() {
         scrub_runtime_observation_path.and_then(|path| {
             match wait_for_pending_scrub_runtime_observation(
@@ -1187,29 +1188,30 @@ fn run_foreground_read(
     }
 }
 
-fn prepare_mounted_fixture(harness: &MountHarness) -> Result<(), String> {
+fn seed_scrub_backlog(store_root: &Path) -> std::io::Result<()> {
+    let mut store = tidefs_local_object_store::LocalObjectStore::open(store_root)
+        .map_err(|error| std::io::Error::other(format!("open scrub seed store: {error}")))?;
     let mut scrub_payload = deterministic_payload(SCRUB_UNIT_BYTES as usize);
     for unit in 0..SCRUB_UNITS_REQUESTED {
         scrub_payload[0] = unit as u8;
-        harness
-            .create_file(format!("scrub-backlog/{unit:02}.bin"), &scrub_payload)
-            .map_err(|error| format!("create mounted scrub backlog unit {unit}: {error}"))?;
+        store
+            .put_named(format!("scrub-read-backlog-{unit:02}"), &scrub_payload)
+            .map_err(|error| {
+                std::io::Error::other(format!("write scrub backlog unit {unit}: {error}"))
+            })?;
     }
+    store
+        .sync_all()
+        .map_err(|error| std::io::Error::other(format!("sync scrub seed store: {error}")))
+}
 
-    let foreground_path = "protected-foreground-read.bin";
+fn prepare_mounted_foreground_read(harness: &MountHarness) -> Result<(), String> {
     harness
         .create_file(
-            foreground_path,
+            "protected-foreground-read.bin",
             &deterministic_payload(FOREGROUND_READ_BYTES),
         )
-        .map_err(|error| format!("create mounted foreground-read file: {error}"))?;
-
-    // FUSE_FLUSH on close is not a durability barrier. Publish the fixture
-    // before waiting for object-store scrub observations so the scheduler
-    // sees the records created above rather than only pre-fixture state.
-    harness
-        .fsync_file(foreground_path)
-        .map_err(|error| format!("fsync mounted scrub/read fixture: {error}"))
+        .map_err(|error| format!("create mounted foreground-read file: {error}"))
 }
 
 impl ForegroundReadEvidence {

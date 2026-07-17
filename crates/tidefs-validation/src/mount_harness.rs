@@ -47,6 +47,7 @@ pub struct MountHarnessBuilder {
     daemon_bin: Option<PathBuf>,
     extra_args: Vec<String>,
     scrub_runtime_observation: bool,
+    pre_mount_setup: Option<Box<dyn FnOnce(&Path) -> io::Result<()>>>,
 }
 
 impl MountHarnessBuilder {
@@ -55,6 +56,7 @@ impl MountHarnessBuilder {
             daemon_bin: None,
             extra_args: Vec::new(),
             scrub_runtime_observation: false,
+            pre_mount_setup: None,
         }
     }
 
@@ -82,6 +84,18 @@ impl MountHarnessBuilder {
         self
     }
 
+    /// Run validation-only backing-store setup before the daemon starts.
+    ///
+    /// Setup that bypasses the mounted boundary is harness input and must not
+    /// be cited as mounted filesystem behavior.
+    pub fn pre_mount_setup(
+        mut self,
+        setup: impl FnOnce(&Path) -> io::Result<()> + 'static,
+    ) -> Self {
+        self.pre_mount_setup = Some(Box::new(setup));
+        self
+    }
+
     /// Enable per-object compression on the backing store by passing
     /// `--compress-algo` to the daemon.
     ///
@@ -103,7 +117,7 @@ impl MountHarnessBuilder {
         self
     }
 
-    pub fn build(self) -> io::Result<MountHarness> {
+    pub fn build(mut self) -> io::Result<MountHarness> {
         let daemon_bin = match self.daemon_bin {
             Some(ref p) => p.clone(),
             None => find_daemon_binary()?,
@@ -121,6 +135,9 @@ impl MountHarnessBuilder {
         fs::create_dir_all(&mount_path).map_err(|e| {
             io::Error::other(format!("create mount dir {}: {e}", mount_path.display()))
         })?;
+        if let Some(setup) = self.pre_mount_setup.take() {
+            setup(&store_path)?;
+        }
 
         // Demo root authentication key avoids requiring env setup.
         let root_auth_key_hex = "0000000000000000000000000000000000000000000000000000000000000001";
