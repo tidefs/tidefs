@@ -97,9 +97,10 @@ impl ScrubForegroundReadRuntimeEvidence {
                 "scrub foreground-read runtime row found product failure: {:?}",
                 self.foreground_read.failures
             )),
-            ValidationStatus::HarnessFail => {
-                Err("scrub foreground-read runtime row reported a harness failure".to_string())
-            }
+            ValidationStatus::HarnessFail => Err(
+                "scrub foreground-read runtime harness did not record mounted-userspace scrub activity"
+                    .to_string(),
+            ),
             ValidationStatus::Skip => {
                 Err("scrub foreground-read runtime row unexpectedly skipped".to_string())
             }
@@ -347,11 +348,7 @@ pub fn run_scrub_foreground_read_runtime(command: String) -> ScrubForegroundRead
     let scrub_activity = ScrubActivityWindow::begin();
     let foreground_read = run_foreground_read(&harness, &service_curve);
     let scrub_model = scrub_activity.finish(&service_curve, foreground_read.workload_ran);
-    let outcome = if scrub_read_isolation_passed(&foreground_read, &scrub_model, &service_curve) {
-        ValidationStatus::Pass
-    } else {
-        ValidationStatus::ProductFail
-    };
+    let outcome = classify_runtime_outcome(&foreground_read, &scrub_model, &service_curve);
 
     base_evidence(BaseEvidenceInput {
         outcome,
@@ -780,6 +777,20 @@ fn scrub_read_isolation_passed(
         && !service_curve.unscheduled_foreground_read_within_bound
 }
 
+fn classify_runtime_outcome(
+    foreground_read: &ForegroundReadEvidence,
+    scrub_activity: &ScrubActivityEvidence,
+    service_curve: &ServiceCurveEvidence,
+) -> ValidationStatus {
+    if !foreground_read.passed {
+        ValidationStatus::ProductFail
+    } else if scrub_read_isolation_passed(foreground_read, scrub_activity, service_curve) {
+        ValidationStatus::Pass
+    } else {
+        ValidationStatus::HarnessFail
+    }
+}
+
 fn run_foreground_read(
     harness: &MountHarness,
     service_curve: &ServiceCurveEvidence,
@@ -1077,6 +1088,34 @@ mod tests {
         assert_eq!(
             manifest.blocking_issues[0].reason.as_deref(),
             Some(BLOCKING_ISSUE_REASON)
+        );
+    }
+
+    #[test]
+    fn runtime_outcome_separates_missing_scrub_evidence_from_bad_reads() {
+        let service_curve = build_service_curve();
+        let foreground_read = completed_foreground_read(&service_curve);
+        let mut scrub_activity = scrub_activity_for_completed_read(&service_curve);
+
+        assert_eq!(
+            classify_runtime_outcome(&foreground_read, &scrub_activity, &service_curve),
+            ValidationStatus::HarnessFail
+        );
+
+        scrub_activity.observation_tier = ValidationTier::MountedUserspace;
+        assert_eq!(
+            classify_runtime_outcome(&foreground_read, &scrub_activity, &service_curve),
+            ValidationStatus::Pass
+        );
+
+        let mut failed_read = foreground_read;
+        failed_read
+            .failures
+            .push("mounted read returned wrong data".into());
+        failed_read.passed = false;
+        assert_eq!(
+            classify_runtime_outcome(&failed_read, &scrub_activity, &service_curve),
+            ValidationStatus::ProductFail
         );
     }
 
