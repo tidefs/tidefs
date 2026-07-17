@@ -40,6 +40,8 @@ pub mod receipt_bound_reclaim_runtime;
 pub mod runtime_artifact_source;
 pub mod scrub_foreground_read_runtime;
 pub mod smoke;
+#[cfg(feature = "ack-receipt-fault-matrix")]
+pub mod storage_intent_ack_fault_matrix;
 pub mod support_bundle;
 pub mod trace;
 pub mod two_node_harness_fuse_integrity;

@@ -176,6 +176,24 @@
             ];
           };
 
+          tidefsStorageIntentAckFaultRuntime = import ./nix/packages/tidefs.nix {
+            inherit (pkgs) lib pkg-config;
+            inherit (pkgs) fuse3 rdma-core;
+            rustPlatform = rustPlatform;
+            src = tidefsWorkspaceSrc;
+            cargoLock = {
+              lockFile = ./Cargo.lock;
+            };
+            cargoBuildFlags = [
+              "-p" "tidefs-validation"
+              "--features" "ack-receipt-fault-matrix"
+              "--bin" "storage-intent-ack-fault-matrix-validation"
+            ];
+            workspaceBins = [
+              "storage-intent-ack-fault-matrix-validation"
+            ];
+          };
+
           tidefsUblkRuntime = import ./nix/packages/tidefs.nix {
             inherit (pkgs) lib pkg-config;
             inherit (pkgs) fuse3 rdma-core;
@@ -2869,6 +2887,11 @@ EOF
             linuxKernel_7_0 = linuxKernel_7_0;
             tidefsPackage = tidefsTwoNodeCarrierRuntime;
           }).twoNodeCarrierValidation;
+          storageIntentAckFaultMatrix = (import ./nix/vm/storage-intent-ack-fault-matrix.nix {
+            inherit pkgs;
+            linuxKernel_7_0 = linuxKernel_7_0;
+            tidefsPackage = tidefsStorageIntentAckFaultRuntime;
+          }).storageIntentAckFaultMatrix;
           kernelNoDaemonValidation = import ./nix/vm/kernel-no-daemon-validation.nix {
             inherit pkgs;
             linuxKernel_7_0 = linuxKernel_7_0;
@@ -3516,6 +3539,18 @@ EOF
             self.packages.${system}.twoNodeCarrierValidation
           ] ''
             exec ${self.packages.${system}.twoNodeCarrierValidation}/bin/tidefs-two-node-carrier-validation "$@"
+          '';
+          storage-intent-ack-fault-matrix = script "tidefs-storage-intent-ack-fault-matrix" [
+            pkgs.bash
+            pkgs.coreutils
+            pkgs.busybox
+            pkgs.cpio
+            pkgs.gzip
+            pkgs.git
+            pkgs.qemu
+            self.packages.${system}.storageIntentAckFaultMatrix
+          ] ''
+            exec ${self.packages.${system}.storageIntentAckFaultMatrix}/bin/tidefs-storage-intent-ack-fault-matrix "$@"
           '';
           qemu-ublk-ext4-smoke = qemuSourceApp "tidefs-qemu-ublk-ext4-smoke";
           qemu-ublk-crash-consistency = qemuSourceApp "tidefs-qemu-ublk-crash-consistency";
