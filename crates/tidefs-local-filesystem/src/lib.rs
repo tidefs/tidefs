@@ -1737,6 +1737,69 @@ const MOUNTED_RECOVERY_TRANSFORM_ORDERING: &str =
     "plaintext identity -> compression frame -> encryption frame -> checksum -> raw media bytes";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MountedNamespaceIntentTransformMode {
+    MetadataRawOnlyNoDeviceTransforms,
+}
+
+/// Mounted authority for replayable namespace-create intent metadata.
+///
+/// A namespace-create intent contains directory-entry and inode metadata, not
+/// mounted file payload bytes. Mounted open already rejects configured device
+/// transforms, so this authority may append and sync that metadata through the
+/// intent log's raw-state authority without implying mounted compression or
+/// encryption support.
+pub(crate) struct MountedNamespaceIntentRawStateAuthority<'a> {
+    intent_log: &'a mut IntentLog,
+    store: &'a mut Pool,
+    transform_mode: MountedNamespaceIntentTransformMode,
+}
+
+impl<'a> MountedNamespaceIntentRawStateAuthority<'a> {
+    fn raw_metadata_only(intent_log: &'a mut IntentLog, store: &'a mut Pool) -> Self {
+        let authority = Self {
+            intent_log,
+            store,
+            transform_mode: MountedNamespaceIntentTransformMode::MetadataRawOnlyNoDeviceTransforms,
+        };
+        debug_assert_eq!(
+            authority.transform_mode(),
+            MountedNamespaceIntentTransformMode::MetadataRawOnlyNoDeviceTransforms
+        );
+        debug_assert_eq!(
+            authority.transform_ordering_boundary(),
+            MOUNTED_RECOVERY_TRANSFORM_ORDERING
+        );
+        authority
+    }
+
+    fn transform_mode(&self) -> MountedNamespaceIntentTransformMode {
+        self.transform_mode
+    }
+
+    fn transform_ordering_boundary(&self) -> &'static str {
+        MOUNTED_RECOVERY_TRANSFORM_ORDERING
+    }
+
+    fn append_create_and_sync(
+        &mut self,
+        intent: NamespaceCreateIntentRecord,
+        root_anchor: IntentLogRootAnchor,
+        timestamp_ns: u64,
+    ) -> Result<bool> {
+        let accepted = self.intent_log.append(
+            self.store.raw_primary_store_mut(),
+            IntentLogEntryKind::NamespaceCreateIntent(intent),
+            root_anchor,
+            timestamp_ns,
+        )?;
+        if accepted {
+            self.intent_log.sync(self.store.raw_primary_store_mut())?;
+        }
+        Ok(accepted)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum MountedCommittedRootRepairTransformMode {
     MetadataRawOnlyNoDeviceTransforms,
 }
@@ -11272,13 +11335,16 @@ impl LocalFileSystem {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos() as u64;
-        let accepted = self.intent_log.append(
-            self.store.raw_primary_store_mut(),
-            IntentLogEntryKind::NamespaceCreateIntent(NamespaceCreateIntentRecord {
+        let accepted = MountedNamespaceIntentRawStateAuthority::raw_metadata_only(
+            &mut self.intent_log,
+            &mut self.store,
+        )
+        .append_create_and_sync(
+            NamespaceCreateIntentRecord {
                 parent_inode_id,
                 entry,
                 inode: inode.clone(),
-            }),
+            },
             root_anchor,
             timestamp_ns,
         )?;
@@ -11287,7 +11353,6 @@ impl LocalFileSystem {
             return Ok(IntentLogReplyState::Refused);
         }
 
-        self.intent_log.sync(self.store.raw_primary_store_mut())?;
         Ok(IntentLogReplyState::IntentDurable)
     }
 
@@ -15878,6 +15943,24 @@ mod recovery_integration_tests {
         let _ = std::fs::remove_dir_all(path);
     }
 
+    fn namespace_create_fixture(
+        fs: &mut LocalFileSystem,
+        name: &str,
+    ) -> (NamespaceEntry, InodeRecord) {
+        let path = format!("/{name}");
+        let inode = fs
+            .create_file(&path, DEFAULT_FILE_PERMISSIONS)
+            .expect("create namespace intent fixture");
+        let entry = fs
+            .state
+            .directories
+            .get(&ROOT_INODE_ID)
+            .and_then(|directory| directory.get(name.as_bytes()))
+            .cloned()
+            .expect("namespace intent fixture entry");
+        (entry, inode)
+    }
+
     fn segment_path(segments_dir: &Path, segment_id: u64) -> PathBuf {
         if segments_dir.is_file() || (segments_dir.exists() && !segments_dir.is_dir()) {
             segments_dir.to_path_buf()
@@ -15983,6 +16066,74 @@ mod recovery_integration_tests {
         assert_eq!(result.highest_committed_commit_group.0, 0);
         assert_eq!(result.next_commit_group_id.0, 1);
         assert!(result.torn_commit_groups.is_empty());
+    }
+
+    #[test]
+    fn mounted_namespace_intent_raw_state_authority_flushes_metadata_only_create() {
+        let tmp = TempDir::new().expect("tempdir");
+        let mut fs = LocalFileSystem::open_with_options(tmp.path(), StoreOptions::durable())
+            .expect("open filesystem");
+        fs.set_auto_commit(false);
+        let (entry, inode) = namespace_create_fixture(&mut fs, "raw-authority");
+        assert!(fs.intent_log.is_empty());
+
+        {
+            let authority = MountedNamespaceIntentRawStateAuthority::raw_metadata_only(
+                &mut fs.intent_log,
+                &mut fs.store,
+            );
+            assert_eq!(
+                authority.transform_mode(),
+                MountedNamespaceIntentTransformMode::MetadataRawOnlyNoDeviceTransforms
+            );
+            assert_eq!(
+                authority.transform_ordering_boundary(),
+                MOUNTED_RECOVERY_TRANSFORM_ORDERING
+            );
+        }
+
+        let reply = fs
+            .namespace_create_intent(ROOT_INODE_ID, entry.clone(), &inode)
+            .expect("append namespace create intent");
+        assert_eq!(reply, IntentLogReplyState::IntentDurable);
+        assert_eq!(fs.intent_log.pending_flush_count(), 0);
+        let entries = fs.intent_log.pending_entries();
+        assert_eq!(entries.len(), 1);
+        match &entries[0].entry_kind {
+            IntentLogEntryKind::NamespaceCreateIntent(intent) => {
+                assert_eq!(intent.parent_inode_id, ROOT_INODE_ID);
+                assert_eq!(intent.entry, entry);
+                assert_eq!(intent.inode, inode);
+                assert!(!entries[0].entry_kind.references_data_inode(inode.inode_id));
+            }
+            other => panic!("unexpected raw metadata intent: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mounted_namespace_intent_raw_state_authority_preserves_pressure_refusal() {
+        let tmp = TempDir::new().expect("tempdir");
+        let mut fs = LocalFileSystem::open_with_options(tmp.path(), StoreOptions::durable())
+            .expect("open filesystem");
+        fs.set_auto_commit(false);
+        let (entry, inode) = namespace_create_fixture(&mut fs, "raw-pressure");
+        fs.intent_log = IntentLog::with_config(IntentLogConfig {
+            pressure_depth_threshold: 0,
+            ..IntentLogConfig::default()
+        });
+
+        let reply = fs
+            .namespace_create_intent(ROOT_INODE_ID, entry, &inode)
+            .expect("append pressure fallback");
+        assert_eq!(reply, IntentLogReplyState::Refused);
+        assert_eq!(fs.intent_log.pending_flush_count(), 0);
+        assert!(matches!(
+            fs.intent_log.pending_entries(),
+            [IntentLogEntry {
+                entry_kind: IntentLogEntryKind::PressureFallback,
+                ..
+            }]
+        ));
     }
 
     // ── RecoveryPolicy integration tests ──────────────────────────────────
