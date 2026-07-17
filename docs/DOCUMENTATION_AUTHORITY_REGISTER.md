@@ -611,7 +611,6 @@ OpenZFS/Ceph successor status.
 | `docs/FUSE_ADAPTER_CONTRACT_ASSUMPTIONS.md` | Current policy | Binding only as the adapter-boundary guardrail that prevents runtime FUSE handlers from bypassing the TideFS request/VfsEngine path into storage mutation authority. It does not close xfstests rows or broader POSIX/FUSE completeness. |
 | `docs/FUSE_LSEEK_PC004B.md` | Current spec | Scoped current spec for the non-release dense-file preview `lseek` behavior described in the file. It does not claim sparse-file fidelity or parent POSIX-complete FUSE closure. |
 | `docs/design/clustered-posix-lock-forwarding-boundary.md` | Current spec | Scoped current spec for the clustered POSIX mounted LOCK forwarding boundary decided by GitHub issue #626. It names the future mounted owner for `LockServiceHandle` construction and follow-up issue split, but it is not implementation evidence that clustered POSIX mounts exist today. |
-| `docs/PAGE_CACHE_WRITEBACK_MMAP_INTEGRATION_P5-03.md` | Historical input | Imported page-cache, writeback, and mmap design target. It is not current proof of writeback, mmap coherency, direct-I/O, or no-daemon behavior. |
 
 **Operator, placement, and distributed-runtime docs**
 
