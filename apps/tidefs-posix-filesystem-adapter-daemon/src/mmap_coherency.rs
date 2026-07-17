@@ -15,8 +15,8 @@
 //! mmap'd. When a remote-write invalidation for this inode arrives
 //! with a higher generation, the kernel page cache is invalidated.
 
-use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tidefs_invalidation_feed::{
@@ -75,7 +75,8 @@ struct MmapRegistration {
 /// The callback receives an inode number and returns `true` when the inode
 /// has dirty or writeback-pending bytes.  When set, the invalidation sink
 /// consults this callback before sending `FUSE_NOTIFY_INVAL_INODE` so that
-/// dirty/writeback pages are preserved (authority contract:
+/// dirty/writeback pages are preserved and the invalidation is retried later
+/// (authority contract:
 /// "Dirty and writeback pages must not be silently invalidated").
 pub type DirtyStateCheck = Box<dyn Fn(u64) -> bool + Send + Sync>;
 
@@ -87,17 +88,23 @@ pub type DirtyStateCheck = Box<dyn Fn(u64) -> bool + Send + Sync>;
 /// [`MmapCoherency::set_dirty_check`]),
 /// the invalidation sink consults it before sending
 /// `FUSE_NOTIFY_INVAL_INODE`.  Inodes with dirty or writeback-pending
-/// bytes are preserved; their page-cache entries are not invalidated, per
-/// the authority contract in
+/// bytes are preserved; their page-cache entries are not invalidated until a
+/// later coherency tick observes them clean, per the authority contract in
 /// `docs/PAGE_CACHE_WRITEBACK_AUTHORITY.md`.
 pub struct MmapCoherency {
     registrations: Mutex<BTreeMap<u64, MmapRegistration>>,
     processor: Mutex<FollowerInvalidationProcessor>,
+    /// Latest per-inode invalidation generation retained while dirty or
+    /// writeback-pending bytes prevent immediate kernel-cache invalidation.
+    deferred_invalidations: Mutex<VecDeque<(u64, u64)>>,
+    /// Alternates the single available slot when a one-event tick has both a
+    /// feed event and a deferred retry waiting.
+    retry_deferred_next: AtomicBool,
     notifier: Arc<Mutex<Option<fuser::Notifier>>>,
     /// Optional callback to check whether an inode has dirty or
     /// writeback-pending bytes.  When set and the callback returns
-    /// `true`, mmap invalidation for that inode is skipped or deferred
-    /// until the dirty state is resolved.
+    /// `true`, mmap invalidation for that inode is deferred until the dirty
+    /// state is resolved.
     dirty_check: Mutex<Option<DirtyStateCheck>>,
     pub stats: MmapCoherencyStats,
 }
@@ -107,6 +114,8 @@ impl MmapCoherency {
         Self {
             registrations: Mutex::new(BTreeMap::new()),
             processor: Mutex::new(FollowerInvalidationProcessor::new()),
+            deferred_invalidations: Mutex::new(VecDeque::new()),
+            retry_deferred_next: AtomicBool::new(false),
             notifier,
             dirty_check: Mutex::new(None),
             stats: MmapCoherencyStats::new(),
@@ -117,7 +126,8 @@ impl MmapCoherency {
     ///
     /// When set, the invalidation sink calls this callback before sending
     /// `FUSE_NOTIFY_INVAL_INODE`.  If the callback returns `true` (inode
-    /// has dirty or writeback-pending bytes), the invalidation is skipped.
+    /// has dirty or writeback-pending bytes), the invalidation is retained for
+    /// a later coherency tick.
     pub fn set_dirty_check(&self, check: Option<DirtyStateCheck>) {
         *self.dirty_check.lock().unwrap() = check;
     }
@@ -169,20 +179,49 @@ impl MmapCoherency {
     }
 
     pub fn process_tick(&self, event_budget: usize) -> usize {
+        if event_budget == 0 {
+            return 0;
+        }
+
+        let mut processor = self.processor.lock().unwrap();
+        let deferred_pending = self.deferred_invalidations.lock().unwrap().len();
+        let feed_pending = processor.pending_event_count();
+        let (deferred_budget, feed_budget) = match (deferred_pending, feed_pending) {
+            (0, _) => (0, event_budget),
+            (_, 0) => (event_budget, 0),
+            _ if event_budget == 1 => {
+                if self.retry_deferred_next.fetch_xor(true, Ordering::Relaxed) {
+                    (1, 0)
+                } else {
+                    (0, 1)
+                }
+            }
+            _ => {
+                let deferred_budget = event_budget / 2;
+                (deferred_budget, event_budget - deferred_budget)
+            }
+        };
         let mut sink = MmapInvalidationSink {
             registrations: &self.registrations,
             notifier: &self.notifier,
             dirty_check: &self.dirty_check,
+            deferred_invalidations: &self.deferred_invalidations,
             stats: &self.stats,
         };
-        self.processor
-            .lock()
-            .unwrap()
-            .process_tick(&mut sink, event_budget)
+        let retried = sink.retry_deferred(deferred_budget);
+        retried + processor.process_tick(&mut sink, feed_budget)
     }
 
     pub fn pending_event_count(&self) -> usize {
-        self.processor.lock().unwrap().pending_event_count()
+        let feed_pending = self.processor.lock().unwrap().pending_event_count();
+        feed_pending + self.deferred_invalidation_count()
+    }
+
+    /// Number of newer inode invalidations waiting for dirty/writeback state
+    /// to become clean.
+    #[must_use]
+    pub fn deferred_invalidation_count(&self) -> usize {
+        self.deferred_invalidations.lock().unwrap().len()
     }
 }
 
@@ -191,17 +230,34 @@ struct MmapInvalidationSink<'a> {
     notifier: &'a Arc<Mutex<Option<fuser::Notifier>>>,
     /// Reference to the optional dirty-state check callback owned by
     /// [`MmapCoherency`].  When the callback is set and returns `true`,
-    /// invalidation for dirty/writeback inodes is skipped.
+    /// invalidation for dirty/writeback inodes is deferred.
     dirty_check: &'a Mutex<Option<DirtyStateCheck>>,
+    /// Latest deferred generation for each inode whose dirty/writeback state
+    /// currently prevents invalidation.
+    deferred_invalidations: &'a Mutex<VecDeque<(u64, u64)>>,
     stats: &'a MmapCoherencyStats,
 }
 
-impl InvalidationSink for MmapInvalidationSink<'_> {
-    fn invalidate_inode(&mut self, ino: InodeId, generation: u64) {
-        self.stats
-            .invalidations_received
-            .fetch_add(1, Ordering::Relaxed);
-        let ino_u64 = ino.0;
+impl MmapInvalidationSink<'_> {
+    fn retry_deferred(&mut self, event_budget: usize) -> usize {
+        let mut attempted = 0;
+        while attempted < event_budget {
+            let Some((ino, generation)) = self.deferred_invalidations.lock().unwrap().pop_front()
+            else {
+                break;
+            };
+            self.invalidate_inode_inner(ino, generation, false);
+            attempted += 1;
+        }
+        attempted
+    }
+
+    fn invalidate_inode_inner(&mut self, ino_u64: u64, generation: u64, newly_received: bool) {
+        if newly_received {
+            self.stats
+                .invalidations_received
+                .fetch_add(1, Ordering::Relaxed);
+        }
 
         let is_actionable = {
             let regs = self.registrations.lock().unwrap();
@@ -212,10 +268,6 @@ impl InvalidationSink for MmapInvalidationSink<'_> {
             return;
         }
 
-        // Dirty/writeback guard: consult the optional dirty_check callback.
-        // When the inode has dirty or writeback-pending bytes, skip the
-        // invalidation to preserve dirty/writeback pages per the authority
-        // contract in docs/PAGE_CACHE_WRITEBACK_AUTHORITY.md.
         let is_dirty = self
             .dirty_check
             .lock()
@@ -229,9 +281,21 @@ impl InvalidationSink for MmapInvalidationSink<'_> {
                     .is_some_and(|entry| entry.active && generation > entry.generation)
             };
             if is_still_actionable {
-                self.stats
-                    .dirty_invalidations_preserved
-                    .fetch_add(1, Ordering::Relaxed);
+                let mut deferred = self.deferred_invalidations.lock().unwrap();
+                if let Some((_, queued_generation)) = deferred
+                    .iter_mut()
+                    .find(|(queued_ino, _)| *queued_ino == ino_u64)
+                {
+                    *queued_generation = (*queued_generation).max(generation);
+                } else {
+                    deferred.push_back((ino_u64, generation));
+                }
+                if newly_received {
+                    self.stats
+                        .dirty_invalidations_preserved
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                return;
             }
             return;
         }
@@ -257,6 +321,12 @@ impl InvalidationSink for MmapInvalidationSink<'_> {
                 }
             }
         }
+    }
+}
+
+impl InvalidationSink for MmapInvalidationSink<'_> {
+    fn invalidate_inode(&mut self, ino: InodeId, generation: u64) {
+        self.invalidate_inode_inner(ino.0, generation, true);
     }
 
     fn invalidate_entry(&mut self, _parent: InodeId, _name: &[u8]) {}
@@ -315,24 +385,42 @@ mod tests {
     }
 
     #[test]
-    fn dirty_check_preserves_dirty_inode_invalidation_state() {
+    fn dirty_check_coalesces_and_retries_after_inode_is_clean() {
         let c = new_coherency();
+        let dirty = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let dirty_check = Arc::clone(&dirty);
         c.register(42, 1);
-        c.set_dirty_check(Some(Box::new(|ino| ino == 42)));
+        c.set_dirty_check(Some(Box::new(move |ino| {
+            ino == 42 && dirty_check.load(Ordering::Relaxed)
+        })));
 
         c.enqueue_batch(batch(42, 2));
+        c.enqueue_batch(batch(42, 4));
+        assert_eq!(c.process_tick(10), 2);
+
+        let s = c.stats.snapshot();
+        assert_eq!(s.invalidations_received, 2);
+        assert_eq!(s.dirty_invalidations_preserved, 2);
+        assert_eq!(s.coherency_conflicts, 0);
+        assert_eq!(s.pages_invalidated, 0);
+        assert_eq!(c.deferred_invalidation_count(), 1);
+        assert_eq!(c.pending_event_count(), 1);
+
+        dirty.store(false, Ordering::Relaxed);
         assert_eq!(c.process_tick(10), 1);
 
         let s = c.stats.snapshot();
-        assert_eq!(s.invalidations_received, 1);
-        assert_eq!(s.dirty_invalidations_preserved, 1);
-        assert_eq!(s.coherency_conflicts, 0);
-        assert_eq!(s.pages_invalidated, 0);
+        assert_eq!(s.invalidations_received, 2);
+        assert_eq!(s.dirty_invalidations_preserved, 2);
+        assert_eq!(s.coherency_conflicts, 1);
+        assert_eq!(s.pages_invalidated, 1);
+        assert_eq!(c.deferred_invalidation_count(), 0);
+        assert_eq!(c.pending_event_count(), 0);
 
         let regs = c.registrations.lock().unwrap();
         let registration = regs.get(&42).expect("registered inode remains tracked");
         assert!(registration.active);
-        assert_eq!(registration.generation, 1);
+        assert_eq!(registration.generation, 4);
     }
 
     #[test]

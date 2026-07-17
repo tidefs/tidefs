@@ -594,7 +594,7 @@ mod tests {
     }
 
     #[test]
-    fn installed_mmap_dirty_check_preserves_writeback_pending_invalidation() {
+    fn installed_mmap_dirty_check_defers_invalidation_until_clean() {
         let notifier = Arc::new(Mutex::new(None));
         let mmap = Arc::new(MmapCoherency::new(notifier));
         let projection = Arc::new(WritebackProjection::new(None, Arc::clone(&mmap)));
@@ -609,6 +609,14 @@ mod tests {
         assert_eq!(mmap_stats.dirty_invalidations_preserved, 1);
         assert_eq!(mmap_stats.pages_invalidated, 0);
         assert_eq!(projection.stats_snapshot().invalidation_skips_dirty, 1);
+        assert_eq!(mmap.deferred_invalidation_count(), 1);
+
+        projection.record_clean(42);
+        assert_eq!(mmap.process_tick(10), 1);
+        let mmap_stats = mmap.stats.snapshot();
+        assert_eq!(mmap_stats.dirty_invalidations_preserved, 1);
+        assert_eq!(mmap_stats.pages_invalidated, 1);
+        assert_eq!(mmap.deferred_invalidation_count(), 0);
     }
 
     #[test]
