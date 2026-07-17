@@ -3498,8 +3498,7 @@ pub fn check_scrub_tool_current_workspace() -> Result<(), StorageCheckError> {
     }
 }
 
-/// Validate that the spacemap/allocator crate exists, is a workspace member,
-/// and contains all required spec markers (phases 1-3 of #1189).
+/// Validate the source-owned spacemap allocator API and invariants.
 pub fn check_spacemap_allocator_current_workspace() -> Result<(), StorageCheckError> {
     let root = find_workspace_root().ok_or_else(|| StorageCheckError {
         title: "spacemap allocator source check",
@@ -3510,7 +3509,6 @@ pub fn check_spacemap_allocator_current_workspace() -> Result<(), StorageCheckEr
     for rel in [
         "crates/tidefs-spacemap-allocator/Cargo.toml",
         "crates/tidefs-spacemap-allocator/src/lib.rs",
-        "docs/SPACEMAP_ALLOCATOR_DESIGN.md",
     ] {
         check_required_file(&root, rel, &mut missing);
     }
@@ -3519,8 +3517,6 @@ pub fn check_spacemap_allocator_current_workspace() -> Result<(), StorageCheckEr
         &root,
         "crates/tidefs-spacemap-allocator",
         &[
-            "SPACEMAP_ALLOCATOR_SPEC",
-            "tidefs-xtask check-spacemap-allocator",
             "SegmentFreeMap",
             "alloc_after",
             "add_free",
@@ -3545,6 +3541,9 @@ pub fn check_spacemap_allocator_current_workspace() -> Result<(), StorageCheckEr
             "free_count",
             "is_under_pressure",
             "MULTI_DEVICE_ALLOCATOR_COORDINATION",
+            "DEFAULT_SEGMENT_GROUP_SEGMENTS",
+            "SpacePressure",
+            "size_class_for",
         ],
         &mut missing,
     );
