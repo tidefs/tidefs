@@ -4,8 +4,8 @@
 
 //! Authority type definitions for deferred cleanup work queues.
 //!
-//! Implements Phase 1 of the deferred cleanup design from
-//! [`docs/design/deferred-cleanup-work-queues.md`] with three core types:
+//! Defines the deferred cleanup work item records used by background
+//! reclamation with three core types:
 //!
 //! - [`WorkItemKind`] — discriminant enum: UnlinkFree, TruncateFree,
 //!   RmdirFree, RenameOverwrite, SnapDelete, PunchHoleFree
@@ -17,27 +17,6 @@
 //! Byte decoding in this crate is format validation only.  A successfully
 //! decoded work item is syntactically valid v1 input; it is not proof that a
 //! cleanup queue replay, cleanup job, or reclaim operation has run correctly.
-//!
-//! ## Design principle
-//!
-//! POSIX unlink, truncate, and rmdir on large files create a fundamental
-//! tension: the caller expects O(1) syscall latency, but the filesystem
-//! must eventually reclaim potentially millions of extents.  This crate
-//! defines the bounded-size work item (128 bytes) that decouples
-//! synchronous syscall metadata work from unbounded background iteration.
-//!
-//! ## Comparison to ZFS / Ceph
-//!
-//! - **ZFS**: `zfs_rmdir` and `zfs_znode_delete` perform a synchronous
-//!   `dmu_free_long_range` that blocks the caller for O(extents) time.
-//!   On a 10 TiB file with 128 KiB recordsize, `rm` can hang for minutes.
-//!   TideFS enqueues a 128-byte `CleanupWorkItemV1` in O(1) and returns.
-//! - **Ceph**: CephFS MDS blocks during unlink of large files similarly.
-//!   There is no deferred work-queue abstraction; space accounting and
-//!   reclamation are coupled directly to the metadata operation.
-//!
-//! [`docs/design/deferred-cleanup-work-queues.md`]:
-//!     https://forgejo/forgeadmin/tidefs/docs/design/deferred-cleanup-work-queues.md
 
 use core::fmt;
 
@@ -45,7 +24,7 @@ extern crate alloc;
 
 pub use tidefs_types_dataset_feature_flags_core::BtreeRootPointer;
 
-// Design spec reference.
+// Stable identifier for the v1 cleanup work-item format.
 pub const DEFERRED_CLEANUP_SPEC: &str = "tidefs-deferred-cleanup-v1-design-1619";
 
 // ---------------------------------------------------------------------------
