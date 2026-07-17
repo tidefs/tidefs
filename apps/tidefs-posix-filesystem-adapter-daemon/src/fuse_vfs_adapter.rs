@@ -8132,138 +8132,185 @@ impl FuseVfsAdapter {
         // Serialize that completion with the same-inode write and mirror
         // reconciliation that created those projections.
         let _write_cache_reconciliation_guard = self.write_cache_reconciliation.lock(ino);
-        // Phase 1: Writeback dirty pages through the local-filesystem
-        // dispatch layer via PageCacheDirtyFlush.  This bridges the adapter
-        // daemon's PageCache mirror into the DirtyFlush contract while
-        // TFR-008 remains the broader writeback authority.
-        {
-            let engine = self.engine.lock().unwrap();
-            let bridge = crate::fuse_flush_fsync::PageCacheDirtyFlush::new(
-                self.writeback_page_cache.as_ref(),
-                &**engine,
-                efh,
-                ctx,
-            );
-            tidefs_local_filesystem::fuse_fsync::dispatch_namespace_fsync(
-                &bridge,
-                efh.inode_id,
-                datasync,
-            )?;
+        let tracked_ranges = if let Some(ref tracker) = self.writeback_range_tracker {
+            let mut tracker = tracker.lock().unwrap();
+            let selected = tracker
+                .collect_dirty_ranges()
+                .into_iter()
+                .find_map(|(inode, ranges)| (inode == efh.inode_id).then_some(ranges))
+                .unwrap_or_default();
+            for range in &selected {
+                let _ = tracker.start_writeback_range(efh.inode_id, range.offset, range.length);
+            }
+            selected
+        } else {
+            Vec::new()
+        };
+
+        let sync_result = (|| {
+            // Phase 1: Writeback dirty pages through the local-filesystem
+            // dispatch layer via PageCacheDirtyFlush.  This bridges the adapter
+            // daemon's PageCache mirror into the DirtyFlush contract while
+            // TFR-008 remains the broader writeback authority.
+            {
+                let engine = self.engine.lock().unwrap();
+                let bridge = crate::fuse_flush_fsync::PageCacheDirtyFlush::new(
+                    self.writeback_page_cache.as_ref(),
+                    &**engine,
+                    efh,
+                    ctx,
+                );
+                tidefs_local_filesystem::fuse_fsync::dispatch_namespace_fsync(
+                    &bridge,
+                    efh.inode_id,
+                    datasync,
+                )?;
+            }
+
+            // Phase 2: Block-volume dirty-range writes (when configured).
+            {
+                let mut bv_guard = self.block_volume.lock().unwrap();
+                if let Some(bv) = bv_guard.as_mut() {
+                    let snapshot = {
+                        let ds = self.dirty_state.lock().unwrap();
+                        ds.get(&ino).map(|dr| dr.ranges().to_vec())
+                    };
+                    if let Some(ranges) = snapshot {
+                        let e = self.engine.lock().unwrap();
+                        for &(start, end) in &ranges {
+                            let len = u32::try_from(end - start).map_err(|_| Errno::EFBIG)?;
+                            let data = e.read(efh, start, len, ctx)?;
+                            // Resolve extent map for this range and write each
+                            // data chunk to the block volume at its physical offset.
+                            let entries = e.lookup_extents(efh.inode_id, start, len as u64);
+                            if entries.is_empty() {
+                                // No extent allocation yet — fall back to logical
+                                // offset write (the extent will be allocated later).
+                                bv.write_bytes(start, &data)?;
+                            } else {
+                                for entry in entries {
+                                    if entry.is_data() {
+                                        let clip_start = entry.logical_offset.max(start);
+                                        let clip_end = entry.end_offset().min(end);
+                                        let clip_len = (clip_end - clip_start) as usize;
+                                        if clip_len == 0 {
+                                            continue;
+                                        }
+                                        let data_offset = (clip_start - start) as usize;
+                                        let chunk = &data[data_offset..data_offset + clip_len];
+                                        let phys_off =
+                                            clip_start - entry.logical_offset + entry.locator_id.0;
+                                        bv.write_bytes(phys_off, chunk)?;
+                                    }
+                                    // Holes and UNWRITTEN extents are not written
+                                    // to the block volume; they stay as engine-resident.
+                                }
+                            }
+                        }
+                        drop(e);
+                        let mut ds = self.dirty_state.lock().unwrap();
+                        if let Some(dr) = ds.get_mut(&ino) {
+                            dr.clear_all();
+                            ds.remove(&ino);
+                        }
+                    }
+                }
+            } // Phase 2b: fdatasync durability barrier.
+              // After the writeback drain, issue a lightweight fdatasync(2)
+              // on the backing file descriptor to converge dirty pages with
+              // durable storage before the full engine fsync.  This is a no-op
+              // when the inode has no dirty content (already flushed above).
+            {
+                let engine = self.engine.lock().unwrap();
+                let bridge = crate::fuse_flush_fsync::PageCacheDirtyFlush::new(
+                    self.writeback_page_cache.as_ref(),
+                    &**engine,
+                    efh,
+                    ctx,
+                );
+                tidefs_local_filesystem::fuse_fsync::map_cache_error(
+                    bridge.fdatasync_inode(efh.inode_id, datasync),
+                )?;
+            } // Phase 3: Engine fsync for metadata persistence.
+              // Record storage-sync latency separately from dispatch/protocol overhead.
+            {
+                // Use try_lock with bounded retry to avoid blocking indefinitely
+                // on the engine lock when a background thread (commit_group,
+                // background-scrub) holds it.  FUSE kernel will return EIO if the
+                // request handler stalls too long.  Returning EINTR tells the
+                // kernel to retry (via FUSE_INTERRUPT path).
+                const MAX_RETRIES: u32 = 10;
+                const RETRY_SLEEP_US: u64 = 10_000; // 10ms per retry, 100ms total
+                let mut engine_guard = None;
+                for _attempt in 0..MAX_RETRIES {
+                    match self.engine.try_lock() {
+                        Ok(guard) => {
+                            engine_guard = Some(guard);
+                            break;
+                        }
+                        Err(std::sync::TryLockError::WouldBlock) => {
+                            std::thread::sleep(std::time::Duration::from_micros(RETRY_SLEEP_US));
+                        }
+                        Err(std::sync::TryLockError::Poisoned(_)) => {
+                            return Err(Errno::EINTR);
+                        }
+                    }
+                }
+                let e = engine_guard.ok_or(Errno::EINTR)?;
+                let _storage_timer = crate::observability::LatencyTimer::new(
+                    &crate::observability::HIST_FSYNC_STORAGE,
+                );
+                let fs_res = e.fsync(efh, datasync, ctx);
+                fs_res?;
+            }
+
+            // Phase 4: Commit_group durability barrier.
+            // Wait for the transaction group containing this inode's dirty
+            // data to be committed and durable. When no sync gate is
+            // configured, this is a no-op (the engine's sync path already
+            // provides durability).
+            self.commit_current_txg_barrier("fsync")?;
+            self.sync_namespace_attrs_from_engine(ctx, ino, Some(efh));
+            self.fsync_handler.handle_fsync(ino, datasync)
+        })();
+
+        let mut tracker_completion_failed = false;
+        if let Some(ref tracker) = self.writeback_range_tracker {
+            let mut tracker = tracker.lock().unwrap();
+            match &sync_result {
+                Ok(()) => {
+                    for range in &tracked_ranges {
+                        if tracker.complete_writeback_success(
+                            efh.inode_id,
+                            range.offset,
+                            range.length,
+                        ) == 0
+                        {
+                            tracker_completion_failed = true;
+                        }
+                    }
+                }
+                Err(errno) => {
+                    let op = if datasync { "fdatasync" } else { "fsync" };
+                    for range in &tracked_ranges {
+                        tracker.record_writeback_error(
+                            efh.inode_id,
+                            range.offset,
+                            range.length,
+                            format!("adapter {op} barrier failed: {errno:?}"),
+                        );
+                    }
+                }
+            }
         }
+        sync_result?;
+        if tracker_completion_failed {
+            return Err(Errno::EIO);
+        }
+
         self.writeback_cache.lock().unwrap().mark_clean(ino);
         self.write_page_cache.clear_dirty_for_inode(ino);
         self.writeback_cache_stats.lock().unwrap().record_flush();
-
-        // Drain the DirtyPageTracker for this inode after writeback so
-        // the background flush service (#4657) sees a clean inode.
-        if let Some(ref tracker) = self.writeback_range_tracker {
-            tracker.lock().unwrap().flush_inode(InodeId::new(ino));
-        }
-
-        // Phase 2: Block-volume dirty-range writes (when configured).
-        {
-            let mut bv_guard = self.block_volume.lock().unwrap();
-            if let Some(bv) = bv_guard.as_mut() {
-                let snapshot = {
-                    let ds = self.dirty_state.lock().unwrap();
-                    ds.get(&ino).map(|dr| dr.ranges().to_vec())
-                };
-                if let Some(ranges) = snapshot {
-                    let e = self.engine.lock().unwrap();
-                    for &(start, end) in &ranges {
-                        let len = u32::try_from(end - start).map_err(|_| Errno::EFBIG)?;
-                        let data = e.read(efh, start, len, ctx)?;
-                        // Resolve extent map for this range and write each
-                        // data chunk to the block volume at its physical offset.
-                        let entries = e.lookup_extents(efh.inode_id, start, len as u64);
-                        if entries.is_empty() {
-                            // No extent allocation yet — fall back to logical
-                            // offset write (the extent will be allocated later).
-                            bv.write_bytes(start, &data)?;
-                        } else {
-                            for entry in entries {
-                                if entry.is_data() {
-                                    let clip_start = entry.logical_offset.max(start);
-                                    let clip_end = entry.end_offset().min(end);
-                                    let clip_len = (clip_end - clip_start) as usize;
-                                    if clip_len == 0 {
-                                        continue;
-                                    }
-                                    let data_offset = (clip_start - start) as usize;
-                                    let chunk = &data[data_offset..data_offset + clip_len];
-                                    let phys_off =
-                                        clip_start - entry.logical_offset + entry.locator_id.0;
-                                    bv.write_bytes(phys_off, chunk)?;
-                                }
-                                // Holes and UNWRITTEN extents are not written
-                                // to the block volume; they stay as engine-resident.
-                            }
-                        }
-                    }
-                    drop(e);
-                    let mut ds = self.dirty_state.lock().unwrap();
-                    if let Some(dr) = ds.get_mut(&ino) {
-                        dr.clear_all();
-                        ds.remove(&ino);
-                    }
-                }
-            }
-        } // Phase 2b: fdatasync durability barrier.
-          // After the writeback drain, issue a lightweight fdatasync(2)
-          // on the backing file descriptor to converge dirty pages with
-          // durable storage before the full engine fsync.  This is a no-op
-          // when the inode has no dirty content (already flushed above).
-        {
-            let engine = self.engine.lock().unwrap();
-            let bridge = crate::fuse_flush_fsync::PageCacheDirtyFlush::new(
-                self.writeback_page_cache.as_ref(),
-                &**engine,
-                efh,
-                ctx,
-            );
-            tidefs_local_filesystem::fuse_fsync::map_cache_error(
-                bridge.fdatasync_inode(efh.inode_id, datasync),
-            )?;
-        } // Phase 3: Engine fsync for metadata persistence.
-          // Record storage-sync latency separately from dispatch/protocol overhead.
-        {
-            // Use try_lock with bounded retry to avoid blocking indefinitely
-            // on the engine lock when a background thread (commit_group,
-            // background-scrub) holds it.  FUSE kernel will return EIO if the
-            // request handler stalls too long.  Returning EINTR tells the
-            // kernel to retry (via FUSE_INTERRUPT path).
-            const MAX_RETRIES: u32 = 10;
-            const RETRY_SLEEP_US: u64 = 10_000; // 10ms per retry, 100ms total
-            let mut engine_guard = None;
-            for _attempt in 0..MAX_RETRIES {
-                match self.engine.try_lock() {
-                    Ok(guard) => {
-                        engine_guard = Some(guard);
-                        break;
-                    }
-                    Err(std::sync::TryLockError::WouldBlock) => {
-                        std::thread::sleep(std::time::Duration::from_micros(RETRY_SLEEP_US));
-                    }
-                    Err(std::sync::TryLockError::Poisoned(_)) => {
-                        return Err(Errno::EINTR);
-                    }
-                }
-            }
-            let e = engine_guard.ok_or(Errno::EINTR)?;
-            let _storage_timer =
-                crate::observability::LatencyTimer::new(&crate::observability::HIST_FSYNC_STORAGE);
-            let fs_res = e.fsync(efh, datasync, ctx);
-            fs_res?;
-        }
-
-        // Phase 4: Commit_group durability barrier.
-        // Wait for the transaction group containing this inode's dirty
-        // data to be committed and durable. When no sync gate is
-        // configured, this is a no-op (the engine's sync path already
-        // provides durability).
-        self.commit_current_txg_barrier("fsync")?;
-        self.sync_namespace_attrs_from_engine(ctx, ino, Some(efh));
-        self.fsync_handler.handle_fsync(ino, datasync)?;
         Ok(())
     }
 
@@ -26523,7 +26570,11 @@ mod tests {
     fn vfs_adapter_dispatch_fsync_bv_error_returns_eio() {
         // When the block-volume write fails during dispatch_fsync, the error
         // must be propagated as EIO and dirty pages must be retained.
-        let f = adapter_fixture();
+        let mut f = adapter_fixture();
+        let tracker = Arc::new(Mutex::new(
+            tidefs_local_filesystem::dirty_page_tracker::DirtyPageTracker::new(),
+        ));
+        f.adapter.writeback_range_tracker = Some(Arc::clone(&tracker));
         let c = root_ctx();
         let td = b"eio flush";
         let (ino, fh, _) =
@@ -26531,6 +26582,7 @@ mod tests {
         f.adapter
             .dispatch_write(&c, ino.get(), fh, 0, td, 0)
             .unwrap();
+        tracker.lock().unwrap().mark_dirty(ino, 0, td.len() as u64);
         let (m, _log) = MockBV::new();
         f.adapter
             .block_volume
@@ -26548,6 +26600,19 @@ mod tests {
             .get(&ino.get())
             .unwrap()
             .contains(0, td.len() as u32));
+        let tracker = tracker.lock().unwrap();
+        let ranges = tracker
+            .dirty_ranges(ino)
+            .expect("failed fsync range remains tracked");
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(
+            ranges[0].lifecycle_state(),
+            tidefs_local_filesystem::dirty_page_tracker::DirtyLifecycleState::ErrorPoisoned
+        );
+        assert!(
+            ranges[0].writeback_error().is_some(),
+            "failed fsync must retain a writeback error"
+        );
     }
     #[test]
     fn vfs_adapter_dispatch_fsync_idempotent_repeated_calls() {
