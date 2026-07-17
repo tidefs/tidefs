@@ -1,0 +1,16 @@
+{
+  "manifest_version": 2,
+  "claim_id": "storage.intent.successor_comparator.v1",
+  "evidence_class": "storage-intent-operator-explanation-evidence",
+  "validation_tier": "source-model",
+  "scope": "source-model operator explanation of blocked split claims, residual limitations, refusal states, degraded visibility, and non-comparable envelopes",
+  "artifact_path": "validation/artifacts/storage-intent/successor-operator-explanation.json",
+  "content_digest": "blake3:f4e352d847185faa0b15daa3c99ebf255c9bcd73f0ae39416c0cb005b8329c47",
+  "run_id": "deterministic-fixture:issue-2048-successor-operator-explanation-v1",
+  "source_ref": "836a17e96e37011c19a1cd68995ac1b92a75e4bd",
+  "outcome": "pass",
+  "residual_risk": "This machine-oriented explanation artifact is not a runtime operator surface or product proof. Live output would still need current authorized evidence and cannot admit successor or comparator wording while the claims remain blocked.",
+  "source": "issue-2048-source-review",
+  "generated_at": "2026-07-17T14:02:32Z",
+  "blocking_issues": []
+}

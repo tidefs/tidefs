@@ -1,0 +1,16 @@
+{
+  "manifest_version": 2,
+  "claim_id": "storage.intent.successor_comparator.v1",
+  "evidence_class": "claims-gate-review",
+  "validation_tier": "source-model",
+  "scope": "claims-gate review for the fail-closed storage-intent successor comparator umbrella evidence set",
+  "artifact_path": "validation/artifacts/storage-intent/successor-comparator-claims-gate-review.toml",
+  "content_digest": "blake3:082953978ea977282ce172af801461eab43d55b6199ab47fcf9352cde83f6442",
+  "run_id": "deterministic-fixture:issue-2048-successor-comparator-claims-gate-review-v1",
+  "source_ref": "836a17e96e37011c19a1cd68995ac1b92a75e4bd",
+  "outcome": "pass",
+  "residual_risk": "Manifest presence and claims-gate review do not change blocked registry status, validate either split claim, or admit product, release, production, durability, availability, performance, or successor wording.",
+  "source": "issue-2048-claims-gate-review",
+  "generated_at": "2026-07-17T14:02:32Z",
+  "blocking_issues": []
+}

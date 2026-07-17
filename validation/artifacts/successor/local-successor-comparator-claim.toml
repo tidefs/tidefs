@@ -1,0 +1,85 @@
+artifact_version = 1
+claim_id = "storage.intent.successor_comparator.v1"
+evidence_class = "local-storage-successor-comparator-claim"
+issue = "https://github.com/tidefs/tidefs/issues/2048"
+generated_at = "2026-07-17T14:02:32Z"
+source_ref = "836a17e96e37011c19a1cd68995ac1b92a75e4bd"
+reviewed_source_commit = "836a17e96e37011c19a1cd68995ac1b92a75e4bd"
+assessment = "fail-closed"
+summary = "The local split evidence set is present, but storage.local.successor_comparator.v1 remains blocked; the umbrella therefore refuses local successor, superiority, and comparator-performance admission."
+residual_risk = [
+  "The referenced evidence is source-model boundary evidence, not matched incumbent measurement or mounted runtime comparator proof.",
+  "A present split evidence set does not override the split claim's blocked registry status.",
+  "This artifact cannot admit distributed, release-ready, production-ready, or broad storage-intent successor wording.",
+]
+
+[split_claim]
+claim_id = "storage.local.successor_comparator.v1"
+registry_status = "blocked"
+validation_status = "BLOCKED"
+required_evidence_status = "all five registered classes PRESENT"
+validation_command = "tidefs-xtask validate-claim storage.local.successor_comparator.v1"
+product_facing_admission = "refused"
+reason = "The split claim registry status is blocked even though its registered source-model evidence manifests are present and pass schema and digest checks."
+
+[[split_evidence]]
+evidence_class = "local-storage-comparator-equivalence-evidence"
+artifact_path = "validation/artifacts/successor/local-comparator-equivalence.json"
+manifest_path = "validation/artifacts/successor/local-comparator-equivalence.manifest.json"
+content_digest = "blake3:ed3db628384e5a199958dc861384beaf947e727f7c112537cf29b864fd8770a5"
+run_id = "deterministic-fixture:issue-2046-local-comparator-equivalence-v1"
+source_ref = "d87008b2e8273c5fba6de88c0f49818780f5fac3"
+validation_tier = "source-model"
+outcome = "pass"
+receipt_status = "PRESENT"
+
+[[split_evidence]]
+evidence_class = "local-storage-successor-performance-fault-set"
+artifact_path = "validation/artifacts/successor/local-performance-fault-set.json"
+manifest_path = "validation/artifacts/successor/local-performance-fault-set.manifest.json"
+content_digest = "blake3:863a18d59bf804f1a41bf82c9db2d66bfa98fff13f93d2edd7117d896ada59a3"
+run_id = "deterministic-fixture:issue-2046-local-performance-fault-set-v1"
+source_ref = "d87008b2e8273c5fba6de88c0f49818780f5fac3"
+validation_tier = "source-model"
+outcome = "pass"
+receipt_status = "PRESENT"
+
+[[split_evidence]]
+evidence_class = "local-storage-successor-claim-boundary-review"
+artifact_path = "validation/artifacts/successor/local-claim-boundary-review.toml"
+manifest_path = "validation/artifacts/successor/local-claim-boundary-review.manifest.json"
+content_digest = "blake3:2b5a710b6f9e18c0859e999406cf2ea3cdb454b00bdece1c9a19b914f341f956"
+run_id = "deterministic-fixture:issue-2046-local-claim-boundary-review-v1"
+source_ref = "d87008b2e8273c5fba6de88c0f49818780f5fac3"
+validation_tier = "source-model"
+outcome = "pass"
+receipt_status = "PRESENT"
+
+[[split_evidence]]
+evidence_class = "local-storage-operator-explanation-evidence"
+artifact_path = "validation/artifacts/successor/local-operator-explanation.json"
+manifest_path = "validation/artifacts/successor/local-operator-explanation.manifest.json"
+content_digest = "blake3:8e770668aadf6465ccffc8dc12d2e8f2d11d7403f99af7213c9f1caa786087e4"
+run_id = "deterministic-fixture:issue-2046-local-operator-explanation-v1"
+source_ref = "d87008b2e8273c5fba6de88c0f49818780f5fac3"
+validation_tier = "source-model"
+outcome = "pass"
+receipt_status = "PRESENT"
+
+[[split_evidence]]
+evidence_class = "claims-gate-review"
+artifact_path = "validation/artifacts/successor/local-successor-comparator-claims-gate-review.toml"
+manifest_path = "validation/artifacts/successor/local-successor-comparator-claims-gate-review.manifest.json"
+content_digest = "blake3:6966b3456a98848f640d55c44c9429d2258d3c6958f91d461b6558d91a9125a9"
+run_id = "deterministic-fixture:issue-2046-local-successor-comparator-claims-gate-review-v1"
+source_ref = "d87008b2e8273c5fba6de88c0f49818780f5fac3"
+validation_tier = "source-model"
+outcome = "pass"
+receipt_status = "PRESENT"
+
+[umbrella_boundary]
+split_truth_preserved = true
+umbrella_substitution_allowed = false
+successor_wording_allowed = false
+comparator_winner_wording_allowed = false
+admission_condition = "A future review must validate the local split claim itself and the distributed split claim itself before the umbrella can support product-facing wording."

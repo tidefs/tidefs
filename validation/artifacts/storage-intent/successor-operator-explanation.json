@@ -1,0 +1,88 @@
+{
+  "artifact_version": 1,
+  "claim_id": "storage.intent.successor_comparator.v1",
+  "evidence_class": "storage-intent-operator-explanation-evidence",
+  "issue": "https://github.com/tidefs/tidefs/issues/2048",
+  "generated_at": "2026-07-17T14:02:32Z",
+  "source_ref": "836a17e96e37011c19a1cd68995ac1b92a75e4bd",
+  "reviewed_source_commit": "836a17e96e37011c19a1cd68995ac1b92a75e4bd",
+  "assessment": "fail-closed",
+  "operator_explanation": {
+    "current_status": "Blocked umbrella evidence record for storage-intent successor or comparator wording.",
+    "plain_language": "TideFS does not currently have evidence-backed permission to describe itself as an OpenZFS, Ceph, DRBD, local-filesystem, clustered-storage, successor, superior, or comparator-performance winner.",
+    "split_claims": [
+      {
+        "claim_id": "storage.local.successor_comparator.v1",
+        "required_evidence": "present",
+        "claim_status": "BLOCKED",
+        "operator_effect": "Local successor and comparator wording remains refused."
+      },
+      {
+        "claim_id": "storage.distributed.successor_comparator.v1",
+        "required_evidence": "present",
+        "claim_status": "BLOCKED",
+        "operator_effect": "Distributed successor and comparator wording remains refused."
+      }
+    ],
+    "what_is_proven": [
+      "The current registered local and distributed split evidence manifests are present and digest-matched.",
+      "The storage-intent policy, placement, media, cost, scheduler, satisfaction, data-shape, layout, decision-frontier, result/refusal, preflight, rollout, tenant-isolation, temporal, and evidence-query boundaries have a source-model claim review.",
+      "The umbrella refusal can be rendered without substituting umbrella prose for blocked split claims."
+    ],
+    "residual_limitations": [
+      "No matched incumbent measurement set establishes equivalent workloads, operations, media, topology, queueing, durability floors, costs, or failure envelopes.",
+      "No artifact here proves mounted local comparator behavior, multi-process distributed comparator behavior, production availability, release readiness, broad durability, geo/RPO, or OpenZFS/Ceph-class fulfillment.",
+      "Source-model manifest success means the evidence record is well formed; it does not mean the registered claim is admitted.",
+      "TideFS remains pre-alpha, and product-facing status stays behind current claim registry admission."
+    ],
+    "refusal_states": [
+      {
+        "state": "unknown-evidence",
+        "operator_meaning": "The evidence cut is incomplete, stale, contradictory, unavailable, redacted beyond use, or compacted beyond the proof need; no comparator conclusion is legal."
+      },
+      {
+        "state": "deferred-or-blocked",
+        "operator_meaning": "Admission, rollout, capacity, repair, source retirement, or another hard gate prevents a claim conclusion; retry conditions must remain explicit."
+      },
+      {
+        "state": "refused",
+        "operator_meaning": "The requested comparison has no legal result for its policy, workload, topology, media, fault, or caller scope."
+      },
+      {
+        "state": "unsafe-visible",
+        "operator_meaning": "An explicitly weaker or volatile mode may be visible, but it cannot strengthen a receipt or support durability, availability, successor, or comparator wording."
+      },
+      {
+        "state": "delivery-conflict",
+        "operator_meaning": "Conflicting request or delivery evidence prevents a stable answer and cannot be compressed into success."
+      }
+    ],
+    "degraded_visible_behavior": {
+      "required_visibility": [
+        "earned receipt or source receipt set",
+        "missing, stale, corrupt, or lagging targets",
+        "repair, rebuild, catch-up, or source-retirement obligations",
+        "RPO, RTO, freshness, membership, fencing, and quorum limits",
+        "whether bytes or acknowledgment completion remain legal"
+      ],
+      "claim_boundary": "A degraded-visible result is an operator truth surface for the exact scope, not permission to claim equivalence, superiority, availability, or successor status."
+    },
+    "non_comparable_envelopes": [
+      "Local mounted and distributed or clustered modes cannot substitute for each other.",
+      "FUSE, mounted-kernel VFS, block export, cache, volatile RAM, PMem, local devices, remote media, TCP, and RDMA results remain separate envelopes.",
+      "Workload, operation mix, queue depth, concurrency, durability floor, media, topology, tenant isolation, cost, wear, fault injection, recovery, and measurement attribution must match before comparison.",
+      "Average throughput, single-row latency, warm-cache hits, media labels, row names, issue closure, and source-model passes are not comparator admission.",
+      "Release-candidate, production-readiness, durability, availability, geo/RPO, and OpenZFS/Ceph-class conclusions are outside this artifact."
+    ],
+    "safe_current_wording": "The storage-intent successor/comparator umbrella claim is blocked; its local and distributed split claims are also blocked, so no product-facing successor or comparator conclusion is available.",
+    "unsafe_current_wording": [
+      "TideFS is an OpenZFS, Ceph, DRBD, ext4/XFS, local-filesystem, or clustered-storage successor or replacement.",
+      "TideFS is superior, equivalent, faster, safer, more available, or more cost-effective than an incumbent outside a validated exact envelope.",
+      "A source-model pass, benchmark label, prototype row, or absence of refusal proves product admission."
+    ]
+  },
+  "residual_risk": [
+    "This JSON file is a machine-oriented evidence artifact, not a new runtime operator command or default operator format.",
+    "Future operator output must revalidate live policy, evidence-cut freshness, split claim status, degraded state, and authorization before rendering an answer."
+  ]
+}

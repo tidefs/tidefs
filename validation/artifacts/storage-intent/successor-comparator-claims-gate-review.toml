@@ -1,0 +1,82 @@
+artifact_version = 1
+claim_id = "storage.intent.successor_comparator.v1"
+evidence_class = "claims-gate-review"
+issue = "https://github.com/tidefs/tidefs/issues/2048"
+generated_at = "2026-07-17T14:02:32Z"
+source_ref = "836a17e96e37011c19a1cd68995ac1b92a75e4bd"
+reviewed_source_commit = "836a17e96e37011c19a1cd68995ac1b92a75e4bd"
+assessment = "fail-closed"
+summary = "The umbrella evidence set can satisfy manifest presence and digest validation while storage.intent.successor_comparator.v1 remains blocked; no product-facing successor or comparator wording is admitted."
+reviewed_artifacts = [
+  "validation/artifacts/successor/local-successor-comparator-claim.toml",
+  "validation/artifacts/successor/distributed-successor-comparator-claim.toml",
+  "validation/artifacts/storage-intent/successor-claim-boundary-review.toml",
+  "validation/artifacts/storage-intent/successor-operator-explanation.json",
+]
+reviewed_claim_ids = [
+  "storage.local.successor_comparator.v1",
+  "storage.distributed.successor_comparator.v1",
+  "storage.intent.successor_comparator.v1",
+]
+residual_risk = [
+  "Both split claims remain BLOCKED despite present source-model evidence requirements.",
+  "The umbrella registry status remains blocked and this artifact does not change it.",
+  "No matched mounted-local or multi-process-distributed comparator run is present.",
+  "No product-admission, release-readiness, production-readiness, durability, availability, geo/RPO, or performance-superiority conclusion follows from this review.",
+]
+non_claims = [
+  "No claim registry or generated claim document is changed.",
+  "No runtime behavior, public API, operator command, or product wording is changed.",
+  "No local, distributed, or umbrella successor/comparator claim is admitted.",
+]
+
+[claims_gate]
+registry_status = "blocked"
+manifest_outcome = "pass"
+claim_admission = "blocked"
+local_split_status = "BLOCKED"
+distributed_split_status = "BLOCKED"
+umbrella_substitution_allowed = false
+reason = "A pass outcome validates these bounded source-model evidence records only. The split claims and umbrella claim remain blocked by registry authority."
+
+[[gate_checks]]
+check = "split local claim"
+result = "BLOCKED with all five registered evidence classes PRESENT"
+detail = "The umbrella consumes the concrete local manifest paths and digests but refuses to reinterpret blocked local truth."
+
+[[gate_checks]]
+check = "split distributed claim"
+result = "BLOCKED with all five registered evidence classes PRESENT"
+detail = "The umbrella consumes the concrete distributed manifest paths and digests but refuses to reinterpret blocked distributed truth."
+
+[[gate_checks]]
+check = "storage-intent boundary map"
+result = "source-model review present"
+detail = "All fifteen boundary names required by issue #2048 are mapped to current policy or source authority and remain hard gates."
+
+[[gate_checks]]
+check = "operator explanation"
+result = "fail-closed explanation present"
+detail = "Residual limitations, refusal states, degraded-visible behavior, and non-comparable envelopes are explicit."
+
+[[gate_checks]]
+check = "claim registry and generated output"
+result = "unchanged"
+detail = "validation/claims.toml and docs/CLAIM_REGISTRY.md remain authoritative and are outside this write set."
+
+[[gate_checks]]
+check = "runtime, API, and product wording"
+result = "unchanged"
+detail = "The artifact slice adds no runtime behavior, public API, operator command, release verdict, or stronger wording."
+
+[[validation_commands]]
+command = "tidefs-xtask validate-evidence-manifest <manifest-path>"
+expected = "pass for each of the five issue-owned v2 manifests with matching artifact digest"
+
+[[validation_commands]]
+command = "tidefs-xtask validate-claim storage.intent.successor_comparator.v1"
+expected = "BLOCKED with all five umbrella evidence classes PRESENT"
+
+[[validation_commands]]
+command = "tidefs-xtask check-claims-gate"
+expected = "pass while publishing-facing successor/comparator wording remains fail-closed"
