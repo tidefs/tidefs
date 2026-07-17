@@ -8057,10 +8057,11 @@ impl FuseVfsAdapter {
         let flush_result = {
             let engine = self.engine.lock().unwrap();
             let bridge = crate::fuse_flush_fsync::PageCacheDirtyFlush::new(
-                self.writeback_page_cache.as_ref(),
-                &**engine,
-                &efh,
-                ctx,
+                // The bridge clears its optional mirror as soon as the lower
+                // flush succeeds. A fallback-handle release can still fail
+                // below, so defer every clean projection until the complete
+                // caller-visible flush succeeds.
+                None, &**engine, &efh, ctx,
             );
             tidefs_local_filesystem::fuse_fsync::dispatch_namespace_fsync(
                 &bridge,
@@ -8088,6 +8089,9 @@ impl FuseVfsAdapter {
             .clear_until_boundary(ino, worker_dirty_boundary);
         self.sync_namespace_attrs_from_engine(ctx, ino, None);
         self.writeback_cache.lock().unwrap().mark_clean(ino);
+        if let Some(ref writeback_page_cache) = self.writeback_page_cache {
+            writeback_page_cache.clear_dirty_for_inode(ino);
+        }
         self.write_page_cache.clear_dirty_for_inode(ino);
         self.writeback_cache_stats.lock().unwrap().record_flush();
         drop(write_cache_reconciliation_guard);
@@ -43726,6 +43730,50 @@ mod tests {
             .expect("flush through ordered reconciliation gate");
 
         assert_eq!(observed_flushes.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn dispatch_flush_fallback_release_error_retains_dirty_projections() {
+        let ctx = root_ctx();
+        let writeback_range_tracker = Arc::new(Mutex::new(
+            tidefs_local_filesystem::dirty_page_tracker::DirtyPageTracker::new(),
+        ));
+        let writeback_page_cache = Arc::new(PageCache::new(8, 4096));
+        let engine = AclMockEngine::new()
+            .with_root(1)
+            .with_attr(0, 0, 0o666)
+            .with_no_acl()
+            .with_open_ok()
+            .with_flush_ok();
+        let mut adapter = FuseVfsAdapter::new(Box::new(engine))
+            .expect("create adapter")
+            .with_writeback_cache_enabled()
+            .with_writeback_page_cache(Arc::clone(&writeback_page_cache))
+            .with_writeback_range_tracker(Arc::clone(&writeback_range_tracker));
+        let ino = 1;
+        let length = 4096;
+        for cache in [&writeback_page_cache, &adapter.write_page_cache] {
+            cache.insert(ino, 0).expect("insert dirty mirror");
+            cache.mark_dirty(ino, 0);
+        }
+        writeback_range_tracker
+            .lock()
+            .unwrap()
+            .mark_dirty(InodeId::new(ino), 0, length);
+        let worker_dirty_tracker = seed_worker_dirty_range(&adapter, ino, 0, length);
+
+        assert_eq!(
+            adapter.dispatch_flush(&ctx, ino, 999_999, 0),
+            Err(Errno::ENOSYS)
+        );
+
+        assert!(writeback_page_cache.has_dirty_pages_for_inode(ino));
+        assert!(adapter.write_page_cache.has_dirty_pages_for_inode(ino));
+        assert!(writeback_range_tracker
+            .lock()
+            .unwrap()
+            .is_dirty(InodeId::new(ino)));
+        assert!(worker_dirty_tracker.lock().unwrap().has_dirty_ranges(ino));
     }
 
     #[test]
