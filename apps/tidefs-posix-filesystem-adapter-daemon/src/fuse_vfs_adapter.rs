@@ -7498,6 +7498,16 @@ impl FuseVfsAdapter {
         }
     }
 
+    fn record_writeback_projection_pending(&self, ino: u64) {
+        let total_dirty = WritebackProjection::total_observable_dirty_bytes(
+            &self.dirty_state,
+            self.writeback_page_cache.as_ref(),
+            ino,
+        );
+        self.writeback_projection
+            .record_writeback_pending(ino, total_dirty);
+    }
+
     fn clear_dirty_trackers_for_authoritative_range(&self, ino: u64, offset: u64, length: u64) {
         let mut ds = self.dirty_state.lock().unwrap();
         if let Some(dr) = ds.get_mut(&ino) {
@@ -7812,6 +7822,8 @@ impl FuseVfsAdapter {
             Err(errno) => return Err(errno),
         };
 
+        self.record_writeback_projection_pending(ino);
+
         // Delegate writeback and engine.flush() through the
         // local-filesystem dispatch layer via PageCacheDirtyFlush.  This
         // bridges the adapter daemon's PageCache mirror into the DirtyFlush
@@ -7908,6 +7920,7 @@ impl FuseVfsAdapter {
         if self.read_only {
             return Err(Errno::EROFS);
         }
+        self.record_writeback_projection_pending(ino);
         // Phase 1: Writeback dirty pages through the local-filesystem
         // dispatch layer via PageCacheDirtyFlush.  This bridges the adapter
         // daemon's PageCache mirror into the DirtyFlush contract while
@@ -32649,7 +32662,7 @@ mod tests {
     }
 
     #[test]
-    fn writeback_projection_keeps_flush_dirty_until_fsync() {
+    fn writeback_projection_keeps_flush_pending_until_fsync() {
         let (mut fixture, _bv) =
             adapter_fixture_with_attached_mock_block_volume(adapter_fixture_with_writeback_cache());
         let ctx = root_ctx();
@@ -32679,16 +32692,20 @@ mod tests {
             .adapter
             .dispatch_flush(&ctx, ino, adapter_fh, 0)
             .expect("flush dispatch");
-        assert!(projection.is_dirty(ino));
+        assert!(projection.is_writeback_pending(ino));
         assert!(!projection.invalidation_allowed(ino));
-        assert_eq!(projection.stats_snapshot().clean_transitions, 0);
+        let stats = projection.stats_snapshot();
+        assert_eq!(stats.writeback_pending_transitions, 1);
+        assert_eq!(stats.clean_transitions, 0);
 
         fixture
             .adapter
             .dispatch_fsync(&ctx, ino, adapter_fh)
             .expect("fsync dispatch");
         assert!(!projection.is_dirty_or_writeback(ino));
-        assert_eq!(projection.stats_snapshot().clean_transitions, 1);
+        let stats = projection.stats_snapshot();
+        assert_eq!(stats.writeback_pending_transitions, 1);
+        assert_eq!(stats.clean_transitions, 1);
     }
 
     #[test]

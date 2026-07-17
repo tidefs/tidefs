@@ -46,8 +46,9 @@ pub enum WritebackLane {
     Clean,
     /// Bytes are dirty: buffered but not yet selected for writeback.
     Dirty { bytes: u64 },
-    /// Bytes are writeback-pending: selected and written through, waiting for
-    /// the durability barrier (fsync, commit_group, storage-commit).
+    /// Bytes are writeback-pending: selected for writeback and waiting for
+    /// writeback completion or the durability barrier (fsync, commit_group,
+    /// storage-commit).
     WritebackPending { bytes: u64 },
 }
 
