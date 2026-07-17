@@ -6,6 +6,7 @@
 
 use crate::smoke::SmokeHarness;
 use crate::trace::TraceEvent;
+use tidefs_local_object_store::device::DiscardCapability;
 use tidefs_reclaim::{
     plan_reclaim_completion, ReclaimCandidate, ReclaimCompletionOutcome, ReclaimConfig,
     ReclaimScheduler, ReclaimSegment,
@@ -31,6 +32,27 @@ const POOL_DESTROY_LIVE_OWNER_REFUSAL_MATRIX_ROW: PoolDestroyLiveOwnerRefusalVal
         allowed_state: "exported-offline-explicit-devices",
         shutdown_requested: false,
         label_superblock_action: "none",
+        product_claim_evidence: false,
+        capacity_free: false,
+        zero_visible: false,
+        discard_acceptance: false,
+        media_privacy: false,
+        cryptographic_erase: false,
+        secure_erase: false,
+        sanitization: false,
+        decommissioning: false,
+    };
+
+const DISCARD_CAPABILITY_MATRIX_ROW: DiscardCapabilityValidationRow =
+    DiscardCapabilityValidationRow {
+        block_device_probe_source: "linux-sysfs.queue.discard_max_bytes",
+        regular_file_development_state: DiscardCapability::Unverified.as_str(),
+        supported_admitted: DiscardCapability::Supported.is_supported(),
+        unsupported_admitted: DiscardCapability::Unsupported.is_supported(),
+        unknown_admitted: DiscardCapability::Unknown.is_supported(),
+        refused_admitted: DiscardCapability::Refused.is_supported(),
+        ignored_admitted: DiscardCapability::Ignored.is_supported(),
+        unverified_admitted: DiscardCapability::Unverified.is_supported(),
         product_claim_evidence: false,
         capacity_free: false,
         zero_visible: false,
@@ -169,6 +191,95 @@ impl PoolDestroyLiveOwnerRefusalValidationRow {
     }
 }
 
+#[derive(Clone, Copy)]
+struct DiscardCapabilityValidationRow {
+    block_device_probe_source: &'static str,
+    regular_file_development_state: &'static str,
+    supported_admitted: bool,
+    unsupported_admitted: bool,
+    unknown_admitted: bool,
+    refused_admitted: bool,
+    ignored_admitted: bool,
+    unverified_admitted: bool,
+    product_claim_evidence: bool,
+    capacity_free: bool,
+    zero_visible: bool,
+    discard_acceptance: bool,
+    media_privacy: bool,
+    cryptographic_erase: bool,
+    secure_erase: bool,
+    sanitization: bool,
+    decommissioning: bool,
+}
+
+impl DiscardCapabilityValidationRow {
+    fn fail_closed_states(self) -> [(&'static str, bool); 5] {
+        [
+            ("unsupported", self.unsupported_admitted),
+            ("unknown", self.unknown_admitted),
+            ("refused", self.refused_admitted),
+            ("ignored", self.ignored_admitted),
+            ("unverified", self.unverified_admitted),
+        ]
+    }
+
+    fn unsupported_evidence(self) -> [(&'static str, bool); 8] {
+        [
+            ("capacity free", self.capacity_free),
+            ("zero-visible behavior", self.zero_visible),
+            ("discard acceptance", self.discard_acceptance),
+            ("media privacy", self.media_privacy),
+            ("cryptographic erase", self.cryptographic_erase),
+            ("secure erase", self.secure_erase),
+            ("sanitization", self.sanitization),
+            ("decommissioning readiness", self.decommissioning),
+        ]
+    }
+
+    fn encode(self) -> Vec<u8> {
+        format!(
+            concat!(
+                "row=device-lifecycle.discard-capability.fail-closed;",
+                "block_device_probe_source={};",
+                "regular_file_development_state={};",
+                "supported_admitted={};",
+                "unsupported_admitted={};",
+                "unknown_admitted={};",
+                "refused_admitted={};",
+                "ignored_admitted={};",
+                "unverified_admitted={};",
+                "product_claim_evidence={};",
+                "capacity_free={};",
+                "zero_visible={};",
+                "discard_acceptance={};",
+                "media_privacy={};",
+                "cryptographic_erase={};",
+                "secure_erase={};",
+                "sanitization={};",
+                "decommissioning={}"
+            ),
+            self.block_device_probe_source,
+            self.regular_file_development_state,
+            self.supported_admitted,
+            self.unsupported_admitted,
+            self.unknown_admitted,
+            self.refused_admitted,
+            self.ignored_admitted,
+            self.unverified_admitted,
+            self.product_claim_evidence,
+            self.capacity_free,
+            self.zero_visible,
+            self.discard_acceptance,
+            self.media_privacy,
+            self.cryptographic_erase,
+            self.secure_erase,
+            self.sanitization,
+            self.decommissioning
+        )
+        .into_bytes()
+    }
+}
+
 /// Run the full reclaim smoke sequence and return the harness.
 #[must_use]
 pub fn run_reclaim_smoke() -> SmokeHarness {
@@ -212,6 +323,42 @@ pub fn run_reclaim_smoke() -> SmokeHarness {
     for (evidence, admitted) in POOL_DESTROY_LIVE_OWNER_REFUSAL_MATRIX_ROW.unsupported_evidence() {
         h.assert_ev(
             &format!("pool destroy live-owner refusal does not claim {evidence} evidence"),
+            !admitted,
+        );
+    }
+    record_reclaim_op(
+        &mut h,
+        "validation.matrix.discard_capability_fail_closed",
+        0,
+        DISCARD_CAPABILITY_MATRIX_ROW.encode(),
+    );
+    h.assert_eq_ev(
+        "discard capability matrix records the Linux block-device probe source",
+        DISCARD_CAPABILITY_MATRIX_ROW.block_device_probe_source,
+        "linux-sysfs.queue.discard_max_bytes",
+    );
+    h.assert_eq_ev(
+        "discard capability matrix keeps regular-file development media unverified",
+        DISCARD_CAPABILITY_MATRIX_ROW.regular_file_development_state,
+        "unverified",
+    );
+    h.assert_ev(
+        "discard capability matrix admits the source-backed supported state",
+        DISCARD_CAPABILITY_MATRIX_ROW.supported_admitted,
+    );
+    for (state, admitted) in DISCARD_CAPABILITY_MATRIX_ROW.fail_closed_states() {
+        h.assert_ev(
+            &format!("discard capability matrix keeps {state} fail-closed"),
+            !admitted,
+        );
+    }
+    h.assert_ev(
+        "discard capability matrix is not product claim evidence",
+        !DISCARD_CAPABILITY_MATRIX_ROW.product_claim_evidence,
+    );
+    for (evidence, admitted) in DISCARD_CAPABILITY_MATRIX_ROW.unsupported_evidence() {
+        h.assert_ev(
+            &format!("discard capability reporting does not claim {evidence} evidence"),
             !admitted,
         );
     }
@@ -519,5 +666,52 @@ mod tests {
         assert_eq!(fields.get("secure_erase").copied(), Some("false"));
         assert_eq!(fields.get("sanitization").copied(), Some("false"));
         assert_eq!(fields.get("decommissioning").copied(), Some("false"));
+    }
+
+    #[test]
+    fn discard_capability_matrix_row_is_fail_closed_nonclaim() {
+        let h = run_reclaim_smoke();
+        let marker = h.trace.iter().find_map(|event| match event {
+            TraceEvent::FsLifecycleOp {
+                op_name, payload, ..
+            } if op_name == "validation.matrix.discard_capability_fail_closed" => {
+                Some(std::str::from_utf8(payload).expect("matrix row payload is utf-8"))
+            }
+            _ => None,
+        });
+        let marker = marker.expect("discard capability matrix row is recorded");
+        let fields = matrix_row_fields(marker);
+
+        assert_eq!(
+            fields.get("row").copied(),
+            Some("device-lifecycle.discard-capability.fail-closed")
+        );
+        assert_eq!(
+            fields.get("block_device_probe_source").copied(),
+            Some("linux-sysfs.queue.discard_max_bytes")
+        );
+        assert_eq!(
+            fields.get("regular_file_development_state").copied(),
+            Some("unverified")
+        );
+        assert_eq!(fields.get("supported_admitted").copied(), Some("true"));
+        for field in [
+            "unsupported_admitted",
+            "unknown_admitted",
+            "refused_admitted",
+            "ignored_admitted",
+            "unverified_admitted",
+            "product_claim_evidence",
+            "capacity_free",
+            "zero_visible",
+            "discard_acceptance",
+            "media_privacy",
+            "cryptographic_erase",
+            "secure_erase",
+            "sanitization",
+            "decommissioning",
+        ] {
+            assert_eq!(fields.get(field).copied(), Some("false"), "{field}");
+        }
     }
 }
