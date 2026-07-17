@@ -1158,12 +1158,20 @@ fn prepare_mounted_fixture(harness: &MountHarness) -> Result<(), String> {
             .map_err(|error| format!("create mounted scrub backlog unit {unit}: {error}"))?;
     }
 
+    let foreground_path = "protected-foreground-read.bin";
     harness
         .create_file(
-            "protected-foreground-read.bin",
+            foreground_path,
             &deterministic_payload(FOREGROUND_READ_BYTES),
         )
-        .map_err(|error| format!("create mounted foreground-read file: {error}"))
+        .map_err(|error| format!("create mounted foreground-read file: {error}"))?;
+
+    // FUSE_FLUSH on close is not a durability barrier. Publish the fixture
+    // before waiting for object-store scrub observations so the scheduler
+    // sees the records created above rather than only pre-fixture state.
+    harness
+        .fsync_file(foreground_path)
+        .map_err(|error| format!("fsync mounted scrub/read fixture: {error}"))
 }
 
 impl ForegroundReadEvidence {
