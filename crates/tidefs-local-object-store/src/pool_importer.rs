@@ -231,6 +231,21 @@ impl CandidatePool {
             }
         }
 
+        // A device GUID identifies one pool member across export/import
+        // cycles. Distinct indices sharing a GUID leave membership authority
+        // ambiguous even when the index sequence itself is complete.
+        let mut device_guids = std::collections::BTreeSet::new();
+        if self
+            .devices
+            .iter()
+            .any(|device| !device_guids.insert(device.label.device_guid))
+        {
+            return Err(ImportError::TopologyInconsistent {
+                pool_guid: self.pool_guid,
+                detail: "duplicate device GUID values detected".into(),
+            });
+        }
+
         // Check for duplicate device indices
         let indices: Vec<u32> = self.devices.iter().map(|d| d.label.device_index).collect();
         let mut sorted_indices = indices.clone();
@@ -808,6 +823,51 @@ mod tests {
         match result {
             Err(ImportError::TopologyInconsistent { detail, .. }) => {
                 assert!(detail.contains("device_index sequence has a gap"));
+            }
+            other => panic!("expected TopologyInconsistent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn candidate_pool_rejects_duplicate_device_guids() {
+        let pool_guid = [0xAC; 16];
+        let device_guid = [0x01; 16];
+        let make_candidate = |index, path: &str| {
+            let mut label = PoolLabelV1::new(pool_guid, device_guid, "duplicate-guid");
+            label.pool_state = LabelPoolState::Exported;
+            label.commit_group = 100;
+            label.label_commit_group = 100;
+            label.device_index = index;
+            label.topology_generation = 1;
+            label.device_count = 2;
+            label.device_capacity_bytes = 1024 * 1024 * 1024;
+            DeviceCandidate {
+                path: PathBuf::from(path),
+                label,
+                label_copy: 0,
+                device_size: 1024 * 1024 * 1024,
+            }
+        };
+        let mut pool = CandidatePool {
+            pool_guid,
+            pool_name: "duplicate-guid".into(),
+            pool_state: LabelPoolState::Exported,
+            devices: vec![
+                make_candidate(0, "/dev/tidefs-duplicate-guid-a"),
+                make_candidate(1, "/dev/tidefs-duplicate-guid-b"),
+            ],
+            topology_generation: 1,
+            device_count: 2,
+            recovery_commit_group: 100,
+            topology_complete: false,
+            cluster_authorized: false,
+        };
+
+        let result = pool.validate();
+
+        match result {
+            Err(ImportError::TopologyInconsistent { detail, .. }) => {
+                assert!(detail.contains("duplicate device GUID"));
             }
             other => panic!("expected TopologyInconsistent, got {other:?}"),
         }
