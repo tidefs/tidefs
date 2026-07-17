@@ -177,6 +177,8 @@ impl PoolLifecycleEvidence {
         fail_closed: bool,
         reason: impl Into<String>,
     ) -> Self {
+        let topology_complete = topology_complete && context.topology_complete();
+        let fail_closed = fail_closed || !topology_complete || !owner_authorized;
         let reason = reason.into();
         let reason = if reason.trim().is_empty() {
             "lifecycle evidence refused".to_string()
@@ -426,6 +428,27 @@ mod tests {
         assert!(evidence.is_fail_closed());
         assert!(evidence.summary().contains("action=import"));
         assert!(evidence.summary().contains("missing owner token"));
+    }
+
+    #[test]
+    fn refused_evidence_cannot_overstate_incomplete_context() {
+        let mut incomplete = context();
+        incomplete.capacity_bytes = 0;
+
+        let evidence = PoolLifecycleEvidence::refused_with_authority(
+            PoolLifecycleAction::Export,
+            incomplete,
+            true,
+            true,
+            "export not completed",
+        );
+
+        assert_eq!(evidence.outcome, PoolLifecycleOutcome::Refused);
+        assert_eq!(evidence.capacity_bytes, 0);
+        assert!(!evidence.topology_complete);
+        assert!(evidence.owner_authorized);
+        assert!(evidence.fail_closed);
+        assert!(evidence.is_fail_closed());
     }
 
     #[test]
