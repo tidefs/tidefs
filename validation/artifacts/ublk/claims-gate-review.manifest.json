@@ -1,0 +1,16 @@
+{
+  "manifest_version": 2,
+  "claim_id": "ublk.started_export.live_service_loop.v1",
+  "evidence_class": "claims-gate-review",
+  "validation_tier": "source-model",
+  "scope": "Issue 614 source review of the uBLK model and bounded QEMU runtime evidence boundary",
+  "artifact_path": "validation/artifacts/ublk/claims-gate-review.toml",
+  "content_digest": "blake3:8fa87081e049605c0a033111d55b120441ac92161fcf1cc703b69595d9323346",
+  "run_id": "manual-review:issue-614-ublk-model-runtime-boundary-v1",
+  "source_ref": "209a4796c0663f791050f6ac8fba09cd83a70f13",
+  "outcome": "pass",
+  "residual_risk": "This promoted source review does not prove fio, mkfs, mount, online resize, crash durability, multi-queue scaling, or production block-device readiness.",
+  "source": "TideFS claims-gate source review",
+  "generated_at": "2026-06-20T23:35:01+02:00",
+  "blocking_issues": []
+}

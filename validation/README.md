@@ -10,6 +10,14 @@ Committed files under `validation/artifacts/` have two allowed roles:
 - promoted evidence, which is runtime or tool output intentionally retained as
   claim evidence.
 
+Every committed artifact payload must be named by at least one version-2
+evidence artifact manifest. The manifest `run_id` classifies the payload role:
+`deterministic-fixture:` identifies a source-controlled fixture, while any
+other concrete run id identifies promoted evidence. All manifests naming one
+payload must agree on that role. The manifests themselves are inventory
+metadata, not artifact payloads; do not add a separate artifact index or
+promotion-state file.
+
 Promoted runtime evidence must carry a version-2 evidence artifact manifest
 with explicit provenance, including the producing source, run id, source ref,
 validation tier, outcome, residual risk, workspace-relative artifact path, and

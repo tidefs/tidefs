@@ -1581,6 +1581,7 @@ fn check_committed_validation_artifacts(root: &Path, missing: &mut Vec<String>) 
 
     let mut live_runtime_artifacts = BTreeSet::new();
     let mut artifact_runtime_classes = BTreeMap::<String, BTreeSet<bool>>::new();
+    let mut artifact_roles = BTreeMap::<String, BTreeSet<&'static str>>::new();
     for manifest_path in paths
         .iter()
         .filter(|path| is_evidence_manifest_path(Path::new(path)))
@@ -1595,29 +1596,47 @@ fn check_committed_validation_artifacts(root: &Path, missing: &mut Vec<String>) 
             }
         };
         let artifact_path = manifest.artifact_path.clone();
-        if !is_evidence_manifest_path(Path::new(&artifact_path))
-            && committed_artifacts.contains(&artifact_path)
-        {
+        let artifact_is_manifest = is_evidence_manifest_path(Path::new(&artifact_path));
+        let artifact_is_tracked = git_path_is_tracked(root, &artifact_path);
+        if artifact_is_manifest {
+            missing.push(format!(
+                "{manifest_path} points at evidence manifest `{artifact_path}` instead of an artifact payload"
+            ));
+        }
+        if !artifact_is_tracked {
+            missing.push(format!(
+                "{manifest_path} points at non-committed artifact `{artifact_path}`"
+            ));
+        } else if !artifact_is_manifest {
+            if let Err(err) = manifest.verify_artifact_digest(root) {
+                missing.push(format!(
+                    "{manifest_path} has invalid committed artifact digest: {}",
+                    err.failures().join("; ")
+                ));
+            }
+        }
+        if !artifact_is_manifest && committed_artifacts.contains(&artifact_path) {
+            let role = if manifest
+                .run_id
+                .starts_with(DETERMINISTIC_FIXTURE_RUN_ID_PREFIX)
+            {
+                "fixture"
+            } else {
+                "promoted evidence"
+            };
+            artifact_roles
+                .entry(artifact_path.clone())
+                .or_default()
+                .insert(role);
             artifact_runtime_classes
                 .entry(artifact_path.clone())
                 .or_default()
                 .insert(manifest.validation_tier.is_live_runtime());
         }
         if manifest.validation_tier.is_live_runtime() {
-            if is_evidence_manifest_path(Path::new(&artifact_path)) {
-                missing.push(format!(
-                    "{manifest_path} is a live-runtime manifest pointing at manifest `{artifact_path}`"
-                ));
-            }
             if !committed_artifacts.contains(&artifact_path) {
                 missing.push(format!(
-                    "{manifest_path} is a live-runtime manifest pointing at non-committed artifact `{artifact_path}`"
-                ));
-            }
-            if let Err(err) = manifest.verify_artifact_digest(root) {
-                missing.push(format!(
-                    "{manifest_path} has invalid live-runtime artifact digest: {}",
-                    err.failures().join("; ")
+                    "{manifest_path} is a live-runtime manifest pointing outside committed validation artifacts at `{artifact_path}`"
                 ));
             }
             for sidecar_path in implied_evidence_manifest_sidecar_artifact_paths(
@@ -1633,6 +1652,22 @@ fn check_committed_validation_artifacts(root: &Path, missing: &mut Vec<String>) 
                 }
             }
             live_runtime_artifacts.insert(artifact_path);
+        }
+    }
+
+    for (artifact_path, roles) in &artifact_roles {
+        if roles.len() > 1 {
+            missing.push(format!(
+                "{artifact_path} has both fixture and promoted-evidence manifests"
+            ));
+        }
+    }
+
+    for artifact_path in &committed_artifacts {
+        if !artifact_roles.contains_key(artifact_path) {
+            missing.push(format!(
+                "{artifact_path} is an unclassified committed artifact missing a v2 evidence manifest"
+            ));
         }
     }
 
@@ -1871,13 +1906,18 @@ fn committed_evidence_tree_is_current(root: &Path, artifact_rel: &Path) -> bool 
         && git_path_tracked_and_clean(root, artifact_rel)
 }
 
-fn git_path_tracked_and_clean(root: &Path, rel: &str) -> bool {
+fn git_path_is_tracked(root: &Path, rel: &str) -> bool {
     let tracked = Command::new("git")
         .current_dir(root)
         .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_LITERAL_PATHSPECS", "1")
         .args(["ls-files", "--error-unmatch", "--", rel])
         .output();
-    if !matches!(tracked, Ok(output) if output.status.success()) {
+    matches!(tracked, Ok(output) if output.status.success())
+}
+
+fn git_path_tracked_and_clean(root: &Path, rel: &str) -> bool {
+    if !git_path_is_tracked(root, rel) {
         return false;
     }
 
@@ -5452,6 +5492,158 @@ non_claims = ["none"]
             missing.iter().any(|failure| failure.contains(
                 "validation/artifacts/kernel/runtime-output.json is unclassified runtime output missing v2 live-runtime evidence manifest"
             )),
+            "{missing:#?}"
+        );
+    }
+
+    #[test]
+    fn committed_validation_artifacts_reject_unclassified_neutral_output() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        git(temp.path(), &["init"]);
+        write_artifact(
+            temp.path(),
+            "validation/artifacts/kernel/model-output.json",
+            r#"{"status":"source-model"}"#,
+        );
+        git(
+            temp.path(),
+            &["add", "validation/artifacts/kernel/model-output.json"],
+        );
+
+        let mut missing = Vec::new();
+        check_committed_validation_artifacts(temp.path(), &mut missing);
+
+        assert!(
+            missing.iter().any(|failure| failure.contains(
+                "validation/artifacts/kernel/model-output.json is an unclassified committed artifact missing a v2 evidence manifest"
+            )),
+            "{missing:#?}"
+        );
+    }
+
+    #[test]
+    fn committed_validation_artifacts_reject_mixed_inventory_roles() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        git(temp.path(), &["init"]);
+        let artifact_path = "validation/artifacts/kernel/source-review.toml";
+        let artifact_body = "decision = \"reviewed\"\n";
+        write_artifact(temp.path(), artifact_path, artifact_body);
+
+        for (manifest_path, run_id) in [
+            (
+                "validation/artifacts/kernel/source-review.fixture.manifest.json",
+                "deterministic-fixture:source-review-v1",
+            ),
+            (
+                "validation/artifacts/kernel/source-review.promoted.manifest.json",
+                "manual-review:source-review-v1",
+            ),
+        ] {
+            let manifest = EvidenceArtifactManifest {
+                manifest_version: EVIDENCE_ARTIFACT_MANIFEST_VERSION,
+                claim_id: "example.source.review.v1".to_string(),
+                evidence_class: "source-review".to_string(),
+                validation_tier: ValidationTier::SourceModel,
+                scope: "committed artifact inventory role fixture".to_string(),
+                artifact_path: artifact_path.to_string(),
+                content_digest: content_digest_for_bytes(artifact_body.as_bytes()),
+                run_id: run_id.to_string(),
+                source_ref: MANIFEST_FIXTURE_SOURCE_REF.to_string(),
+                outcome: ValidationStatus::Pass,
+                residual_risk: "Fixture validates committed artifact role enforcement only."
+                    .to_string(),
+                source: "tidefs-xtask-test".to_string(),
+                generated_at: "2026-07-17T12:00:00Z".to_string(),
+                blocking_issues: Vec::new(),
+            };
+            write_artifact(
+                temp.path(),
+                manifest_path,
+                &manifest
+                    .to_json_pretty()
+                    .expect("serialize inventory manifest fixture"),
+            );
+        }
+        git(
+            temp.path(),
+            &[
+                "add",
+                artifact_path,
+                "validation/artifacts/kernel/source-review.fixture.manifest.json",
+                "validation/artifacts/kernel/source-review.promoted.manifest.json",
+            ],
+        );
+
+        let mut missing = Vec::new();
+        check_committed_validation_artifacts(temp.path(), &mut missing);
+
+        assert!(
+            missing.iter().any(|failure| failure.contains(
+                "validation/artifacts/kernel/source-review.toml has both fixture and promoted-evidence manifests"
+            )),
+            "{missing:#?}"
+        );
+    }
+
+    #[test]
+    fn committed_validation_artifacts_reject_uncommitted_manifest_target() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        git(temp.path(), &["init"]);
+        let artifact_path = "test-support/missing-source-model.json";
+        let manifest_path = "validation/artifacts/kernel/source-model.manifest.json";
+        write_manifest_fixture(
+            temp.path(),
+            manifest_path,
+            "example.source.model.v1",
+            "source-model",
+            artifact_path,
+            r#"{"status":"reviewed"}"#,
+            ValidationStatus::Pass,
+            Vec::new(),
+        );
+        git(temp.path(), &["add", manifest_path]);
+
+        let mut missing = Vec::new();
+        check_committed_validation_artifacts(temp.path(), &mut missing);
+
+        assert!(
+            missing.iter().any(|failure| failure.contains(
+                "validation/artifacts/kernel/source-model.manifest.json points at non-committed artifact `test-support/missing-source-model.json`"
+            )),
+            "{missing:#?}"
+        );
+    }
+
+    #[test]
+    fn committed_validation_artifacts_verify_external_manifest_target_digest() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        git(temp.path(), &["init"]);
+        let artifact_path = "test-support/source-model.json";
+        let manifest_path = "validation/artifacts/kernel/source-model.manifest.json";
+        let original_body = r#"{"status":"reviewed"}"#;
+        write_artifact(temp.path(), artifact_path, original_body);
+        write_manifest_fixture(
+            temp.path(),
+            manifest_path,
+            "example.source.model.v1",
+            "source-model",
+            artifact_path,
+            original_body,
+            ValidationStatus::Pass,
+            Vec::new(),
+        );
+        write_artifact(temp.path(), artifact_path, r#"{"status":"changed"}"#);
+        git(temp.path(), &["add", artifact_path, manifest_path]);
+
+        let mut missing = Vec::new();
+        check_committed_validation_artifacts(temp.path(), &mut missing);
+
+        assert!(
+            missing.iter().any(|failure| {
+                failure.contains("validation/artifacts/kernel/source-model.manifest.json")
+                    && failure.contains("invalid committed artifact digest")
+                    && failure.contains("content_digest mismatch")
+            }),
             "{missing:#?}"
         );
     }

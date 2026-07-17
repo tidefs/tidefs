@@ -1,0 +1,16 @@
+{
+  "manifest_version": 2,
+  "claim_id": "scheduler.dirty_debt.no_hidden.v1",
+  "evidence_class": "no-hidden-queues-review-receipt",
+  "validation_tier": "source-model",
+  "scope": "Issue 532 source and registry review receipt for registered queue roots",
+  "artifact_path": "validation/artifacts/performance/no-hidden-queues-review-receipt.toml",
+  "content_digest": "blake3:bd543233842151e3e544e0f409d43b68a66e4519eb6fc04c0d9f14761016ba22",
+  "run_id": "manual-review:issue-532-no-hidden-queues-receipt-v1",
+  "source_ref": "0f99c9ecb695d55a954fb7844b433b6e2b98b5fb",
+  "outcome": "pass",
+  "residual_risk": "This promoted source-review receipt does not satisfy mounted queue-depth evidence or validate scheduler, distributed transport, or RDMA behavior.",
+  "source": "tidefs-xtask check-no-hidden-queues source review",
+  "generated_at": "2026-07-03T16:19:39+02:00",
+  "blocking_issues": []
+}
