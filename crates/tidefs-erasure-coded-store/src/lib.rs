@@ -38,7 +38,7 @@ use std::{
 };
 use tidefs_durability_layout::FailureDomainV1;
 use tidefs_erasure_coding::{
-    encode as encode_stripe, encode_receipt_stripe as encode_coding_receipt_stripe,
+    encode_receipt_stripe as encode_coding_receipt_stripe, receipt_stripe_width,
     reconstruct_receipt_stripe as reconstruct_coding_receipt_stripe, ErasureShard,
     ReceiptStripeError, ShardKind, StripeConfig,
 };
@@ -197,10 +197,21 @@ impl ErasureCodedStore {
     ///
     /// # Errors
     ///
-    /// Returns an error if any store fails to open, if paths is empty,
-    /// or if the path count does not match the store count.
+    /// Returns an error if the receipt stripe configuration is invalid, any
+    /// store fails to open, paths is empty, or the path count does not match
+    /// the store count.
     pub fn open(paths: &[PathBuf], config: ErasureCodedStoreConfig) -> Result<Self, String> {
-        let expected = config.store_count();
+        let stripe_config = StripeConfig {
+            data_shards: config.data_shards,
+            parity_shards: config.parity_shards,
+            shard_len: config.shard_len,
+        };
+        let expected = receipt_stripe_width(&stripe_config).ok_or_else(|| {
+            format!(
+                "invalid erasure-coded store stripe configuration: {} data + {} parity, shard length {}",
+                config.data_shards, config.parity_shards, config.shard_len,
+            )
+        })?;
         if paths.is_empty() {
             return Err("erasure-coded store requires at least 1 path".into());
         }
@@ -283,8 +294,8 @@ impl ErasureCodedStore {
                 &[]
             };
 
-            let encoded = encode_stripe(&stripe_config, chunk)
-                .ok_or_else(|| format!("encode failed for stripe {s}"))?;
+            let encoded = encode_receipt_stripe(&stripe_config, chunk)
+                .map_err(|err| format!("stripe {s}: {err}"))?;
 
             for shard in &encoded.shards {
                 let shard_key = shard_object_key(key, s, shard.index);
@@ -2023,6 +2034,28 @@ mod tests {
         let cfg = ErasureCodedStoreConfig::two_plus_one_test();
         let result = ErasureCodedStore::open(&[], cfg);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn receipt_invalid_stripe_configs_rejected_before_open() {
+        let paths = make_paths(1, "invalid-stripe-config");
+
+        for (data_shards, parity_shards) in [(0, 1), (1, 0)] {
+            let result = ErasureCodedStore::open(
+                &paths,
+                ErasureCodedStoreConfig {
+                    data_shards,
+                    parity_shards,
+                    shard_len: 8,
+                    store_options: StoreOptions::test_fast(),
+                    failure_domain: None,
+                    device_candidates: None,
+                },
+            );
+            assert!(result.is_err());
+        }
+
+        cleanup_dirs(&paths);
     }
 
     // --- 4+2 survives 2 losses ---

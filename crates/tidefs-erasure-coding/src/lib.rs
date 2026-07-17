@@ -297,7 +297,12 @@ pub enum ReceiptStripeError {
     InsufficientShards { available: usize, needed: usize },
 }
 
-fn valid_receipt_stripe_width(config: &StripeConfig) -> Option<usize> {
+/// Return the validated width for a receipt-tracked stripe configuration.
+///
+/// Receipt paths require at least one data and parity shard, non-zero shard
+/// length, a representable data capacity, and a width supported by GF(2^8).
+#[must_use]
+pub fn receipt_stripe_width(config: &StripeConfig) -> Option<usize> {
     if config.data_shards == 0 || config.parity_shards == 0 || config.shard_len == 0 {
         return None;
     }
@@ -312,7 +317,7 @@ pub fn encode_receipt_stripe(
     config: &StripeConfig,
     payload: &[u8],
 ) -> Result<ReceiptEncodedStripe, ReceiptStripeError> {
-    valid_receipt_stripe_width(config).ok_or(ReceiptStripeError::EncodeRejected)?;
+    receipt_stripe_width(config).ok_or(ReceiptStripeError::EncodeRejected)?;
     let encoded = encode(config, payload).ok_or(ReceiptStripeError::EncodeRejected)?;
     Ok(ReceiptEncodedStripe {
         shards: encoded.shards,
@@ -324,7 +329,7 @@ pub fn reconstruct_receipt_stripe(
     config: &StripeConfig,
     available: &[Option<ErasureShard>],
 ) -> Result<ReceiptReconstructedStripe, ReceiptStripeError> {
-    let Some(expected) = valid_receipt_stripe_width(config) else {
+    let Some(expected) = receipt_stripe_width(config) else {
         return Err(ReceiptStripeError::InvalidAvailableSet {
             slots: available.len(),
             expected: config.data_shards.saturating_add(config.parity_shards),
