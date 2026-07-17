@@ -8335,37 +8335,82 @@ impl FuseVfsAdapter {
         let _write_cache_reconciliation_guard = self.write_cache_reconciliation.lock(ino);
         let e = self.engine.lock().unwrap();
         let handle = self.resolve_dir_handle(ino, fh, ctx, &**e)?;
+        let tracked_ranges = if let Some(ref tracker) = self.writeback_range_tracker {
+            let mut tracker = tracker.lock().unwrap();
+            let selected = tracker
+                .collect_dirty_ranges()
+                .into_iter()
+                .find_map(|(inode, ranges)| (inode == handle.dh.inode_id).then_some(ranges))
+                .unwrap_or_default();
+            for range in &selected {
+                let _ =
+                    tracker.start_writeback_range(handle.dh.inode_id, range.offset, range.length);
+            }
+            selected
+        } else {
+            Vec::new()
+        };
 
-        // Flush dirty page-cache pages for the directory inode through the
-        // PageCacheDirtyFlush bridge. Construct a synthetic EngineFileHandle
-        // since the bridge requires one.
-        let synthetic_fh = EngineFileHandle::new(
-            handle.dh.inode_id,
-            0, // O_RDONLY
-            FileHandleId::new(0),
-            0,
-        );
-        let bridge = crate::fuse_flush_fsync::PageCacheDirtyFlush::new(
-            self.writeback_page_cache.as_ref(),
-            &**e,
-            &synthetic_fh,
-            ctx,
-        );
-        let _ = tidefs_local_filesystem::fuse_fsync::dispatch_namespace_fsync(
-            &bridge,
-            handle.dh.inode_id,
-            datasync,
-        );
+        let sync_result = (|| {
+            // Flush dirty page-cache pages for the directory inode through the
+            // PageCacheDirtyFlush bridge. Construct a synthetic EngineFileHandle
+            // since the bridge requires one.
+            let synthetic_fh = EngineFileHandle::new(
+                handle.dh.inode_id,
+                0, // O_RDONLY
+                FileHandleId::new(0),
+                0,
+            );
+            let bridge = crate::fuse_flush_fsync::PageCacheDirtyFlush::new(
+                self.writeback_page_cache.as_ref(),
+                &**e,
+                &synthetic_fh,
+                ctx,
+            );
+            tidefs_local_filesystem::fuse_fsync::dispatch_namespace_fsync(
+                &bridge,
+                handle.dh.inode_id,
+                datasync,
+            )?;
 
-        // Persist directory metadata through the engine.
-        let result = e.fsyncdir(&handle.dh, datasync, ctx);
+            // Persist directory metadata through the engine.
+            e.fsyncdir(&handle.dh, datasync, ctx)
+        })();
+        drop(e);
 
-        // Drain the DirtyPageTracker for this directory inode after
-        // writeback so the background flush service sees a clean inode.
+        let mut tracker_completion_failed = false;
         if let Some(ref tracker) = self.writeback_range_tracker {
-            tracker.lock().unwrap().flush_inode(handle.dh.inode_id);
+            let mut tracker = tracker.lock().unwrap();
+            match &sync_result {
+                Ok(()) => {
+                    for range in &tracked_ranges {
+                        if tracker.complete_writeback_success(
+                            handle.dh.inode_id,
+                            range.offset,
+                            range.length,
+                        ) == 0
+                        {
+                            tracker_completion_failed = true;
+                        }
+                    }
+                }
+                Err(errno) => {
+                    for range in &tracked_ranges {
+                        tracker.record_writeback_error(
+                            handle.dh.inode_id,
+                            range.offset,
+                            range.length,
+                            format!("adapter fsyncdir barrier failed: {errno:?}"),
+                        );
+                    }
+                }
+            }
         }
-        result
+        sync_result?;
+        if tracker_completion_failed {
+            return Err(Errno::EIO);
+        }
+        Ok(())
     }
 
     /// Dispatch a filesystem-wide syncfs operation.
@@ -39061,6 +39106,7 @@ mod tests {
         flush_result: Result<(), Errno>,
         flush_observer: Option<Arc<dyn Fn() + Send + Sync>>,
         syncfs_result: Result<(), Errno>,
+        fsyncdir_result: Result<(), Errno>,
         create_result: Result<(InodeAttr, EngineFileHandle), Errno>,
         mkdir_result: Result<InodeAttr, Errno>,
     }
@@ -39079,6 +39125,7 @@ mod tests {
                 flush_result: Err(Errno::ENOSYS),
                 flush_observer: None,
                 syncfs_result: Err(Errno::ENOSYS),
+                fsyncdir_result: Err(Errno::ENOSYS),
                 create_result: Err(Errno::ENOSYS),
                 mkdir_result: Err(Errno::ENOSYS),
             }
@@ -39190,6 +39237,11 @@ mod tests {
 
         fn with_syncfs_error(mut self, errno: Errno) -> Self {
             self.syncfs_result = Err(errno);
+            self
+        }
+
+        fn with_fsyncdir_error(mut self, errno: Errno) -> Self {
+            self.fsyncdir_result = Err(errno);
             self
         }
 
@@ -39421,7 +39473,7 @@ mod tests {
             datasync: bool,
             ctx: &RequestCtx,
         ) -> Result<(), Errno> {
-            Err(Errno::ENOSYS)
+            self.fsyncdir_result
         }
         fn getlk(
             &self,
@@ -41976,6 +42028,56 @@ mod tests {
             .adapter
             .dispatch_releasedir(dh.dh_id.get())
             .expect("releasedir");
+    }
+
+    #[test]
+    fn dispatch_fsyncdir_failures_retain_writeback_error() {
+        for (failure_stage, engine) in [
+            (
+                "page-cache flush",
+                AclMockEngine::new()
+                    .with_root(1)
+                    .with_flush_error(Errno::EIO),
+            ),
+            (
+                "engine fsyncdir",
+                AclMockEngine::new()
+                    .with_root(1)
+                    .with_flush_ok()
+                    .with_fsyncdir_error(Errno::EIO),
+            ),
+        ] {
+            let tracker = Arc::new(Mutex::new(
+                tidefs_local_filesystem::dirty_page_tracker::DirtyPageTracker::new(),
+            ));
+            let mut adapter = make_adapter(engine);
+            adapter.writeback_range_tracker = Some(Arc::clone(&tracker));
+            let inode = InodeId::new(41);
+            let dh = EngineDirHandle::new(inode, DirHandleId::new(7));
+            adapter.dir_handles.lock().unwrap().insert(dh);
+            tracker.lock().unwrap().mark_dirty(inode, 1024, 2048);
+
+            assert_eq!(
+                adapter.dispatch_fsyncdir(&root_ctx(), inode.get(), dh.dh_id.get(), false),
+                Err(Errno::EIO),
+                "{failure_stage} must fail the caller-visible barrier"
+            );
+
+            let tracker = tracker.lock().unwrap();
+            let ranges = tracker
+                .dirty_ranges(inode)
+                .unwrap_or_else(|| panic!("{failure_stage} must retain the dirty range"));
+            assert_eq!(ranges.len(), 1);
+            assert_eq!(
+                ranges[0].lifecycle_state(),
+                tidefs_local_filesystem::dirty_page_tracker::DirtyLifecycleState::ErrorPoisoned,
+                "{failure_stage} must poison the failed range"
+            );
+            assert!(
+                ranges[0].writeback_error().is_some(),
+                "{failure_stage} must retain a writeback error"
+            );
+        }
     }
 
     #[test]
