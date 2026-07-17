@@ -162,6 +162,7 @@ pub struct ForegroundReadEvidence {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ScrubActivityEvidence {
     pub observation_tier: ValidationTier,
+    pub daemon_runtime: Option<DaemonScrubRuntimeObservation>,
     pub background_scrub_configured: bool,
     pub background_scrub_interval_secs: u64,
     pub scrub_units_requested: u32,
@@ -179,6 +180,14 @@ pub struct ScrubActivityEvidence {
     pub throttle_observed: bool,
     pub backoff_millis: u64,
     pub pending_and_rate_limited_during_read: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonScrubRuntimeObservation {
+    pub admitted_units: u32,
+    pub pending_units_before_read: u32,
+    pub pending_units_after_read: u32,
+    pub throttle_count: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -401,11 +410,15 @@ fn evidence_manifest_blocking_issues(passed: bool) -> Vec<BlockingIssueRef> {
 fn evidence_manifest_scope(evidence: &ScrubForegroundReadRuntimeEvidence) -> String {
     let admission = &evidence.admission_state;
     let service_curve = &evidence.service_curve;
+    let daemon_runtime = evidence.scrub_activity.daemon_runtime.as_ref();
     format!(
         concat!(
             "row={} supported_claims={} non_claims={} outcome={:?} artifact={} ",
             "claim_status_change={} product_wording_change={} environment_refused={} ",
             "scrub_activity_observation_tier={} ",
+            "daemon_scrub_runtime_observed={} daemon_scrub_admitted_units={} ",
+            "daemon_scrub_pending_units_before_read={} ",
+            "daemon_scrub_pending_units_after_read={} daemon_scrub_throttle_count={} ",
             "foreground_read_admitted_by_service_curve={} ",
             "foreground_read_refused_by_service_curve={} scrub_units_requested={} ",
             "scrub_units_admitted_by_service_curve={} ",
@@ -425,6 +438,11 @@ fn evidence_manifest_scope(evidence: &ScrubForegroundReadRuntimeEvidence) -> Str
         evidence.product_wording_change,
         admission.environment_refused,
         evidence.scrub_activity.observation_tier.label(),
+        daemon_runtime.is_some(),
+        daemon_runtime.map_or(0, |observation| observation.admitted_units),
+        daemon_runtime.map_or(0, |observation| observation.pending_units_before_read),
+        daemon_runtime.map_or(0, |observation| observation.pending_units_after_read),
+        daemon_runtime.map_or(0, |observation| observation.throttle_count),
         admission.foreground_read_admitted_by_service_curve,
         admission.foreground_read_refused_by_service_curve,
         admission.scrub_units_requested,
@@ -545,6 +563,7 @@ fn build_admission_state(
 fn scrub_activity_not_run(service_curve: &ServiceCurveEvidence) -> ScrubActivityEvidence {
     ScrubActivityEvidence {
         observation_tier: ValidationTier::SourceModel,
+        daemon_runtime: None,
         background_scrub_configured: false,
         background_scrub_interval_secs: BACKGROUND_SCRUB_INTERVAL_SECS,
         scrub_units_requested: SCRUB_UNITS_REQUESTED,
@@ -605,6 +624,7 @@ impl ScrubActivityWindow {
             throttle_count > 0 || !self.pre_read_attempt.accepted || !post_read_attempt.accepted;
         ScrubActivityEvidence {
             observation_tier: ValidationTier::HarnessOnly,
+            daemon_runtime: None,
             background_scrub_configured: true,
             background_scrub_interval_secs: BACKGROUND_SCRUB_INTERVAL_SECS,
             scrub_units_requested: SCRUB_UNITS_REQUESTED,
@@ -765,8 +785,19 @@ fn scrub_read_isolation_passed(
     scrub_activity: &ScrubActivityEvidence,
     service_curve: &ServiceCurveEvidence,
 ) -> bool {
+    let daemon_runtime_observed =
+        scrub_activity
+            .daemon_runtime
+            .as_ref()
+            .is_some_and(|observation| {
+                observation.admitted_units > 0
+                    && observation.pending_units_before_read > 0
+                    && observation.pending_units_after_read > 0
+                    && observation.throttle_count > 0
+            });
     foreground_read.passed
         && scrub_activity.observation_tier == ValidationTier::MountedUserspace
+        && daemon_runtime_observed
         && scrub_activity.background_scrub_configured
         && scrub_activity.pending_and_rate_limited_during_read
         && scrub_activity.scrub_deferred_by_service_curve > 0
@@ -1092,7 +1123,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_outcome_separates_missing_scrub_evidence_from_bad_reads() {
+    fn runtime_outcome_requires_daemon_observations_not_tier_label() {
         let service_curve = build_service_curve();
         let foreground_read = completed_foreground_read(&service_curve);
         let mut scrub_activity = scrub_activity_for_completed_read(&service_curve);
@@ -1103,6 +1134,17 @@ mod tests {
         );
 
         scrub_activity.observation_tier = ValidationTier::MountedUserspace;
+        assert_eq!(
+            classify_runtime_outcome(&foreground_read, &scrub_activity, &service_curve),
+            ValidationStatus::HarnessFail
+        );
+
+        scrub_activity.daemon_runtime = Some(DaemonScrubRuntimeObservation {
+            admitted_units: 1,
+            pending_units_before_read: 4,
+            pending_units_after_read: 3,
+            throttle_count: 1,
+        });
         assert_eq!(
             classify_runtime_outcome(&foreground_read, &scrub_activity, &service_curve),
             ValidationStatus::Pass
