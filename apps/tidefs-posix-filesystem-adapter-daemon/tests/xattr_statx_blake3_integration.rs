@@ -376,9 +376,10 @@ fn xattr_blake3_digest_deterministic_across_remount() {
 
         let pc = path_c(&file_path);
 
-        // SAFETY: Audit note: #1448 tracks converting split listxattr name
-        // slices to NUL-terminated C strings before getxattr. The list/value
-        // buffers here are allocated to the kernel-reported sizes.
+        // SAFETY: `pc` and each owned xattr-name C string remain live across the
+        // matching size and value syscalls. The list buffer and each
+        // zero-initialized value buffer are writable for their lengths and read
+        // only through the kernel-reported byte counts.
         unsafe {
             // Read all xattrs and compute a simple deterministic digest
             let size = libc::listxattr(pc.as_ptr(), std::ptr::null_mut(), 0);
@@ -402,12 +403,8 @@ fn xattr_blake3_digest_deterministic_across_remount() {
                 if name_bytes.is_empty() {
                     continue;
                 }
-                let val_size = libc::getxattr(
-                    pc.as_ptr(),
-                    name_bytes.as_ptr() as *const libc::c_char,
-                    std::ptr::null_mut(),
-                    0,
-                );
+                let name = CString::new(name_bytes).expect("xattr name contains NUL");
+                let val_size = libc::getxattr(pc.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0);
                 assert!(
                     val_size >= 0,
                     "getxattr size query should succeed for {name_bytes:?}"
@@ -415,7 +412,7 @@ fn xattr_blake3_digest_deterministic_across_remount() {
                 let mut val_buf = vec![0u8; val_size as usize];
                 let vn = libc::getxattr(
                     pc.as_ptr(),
-                    name_bytes.as_ptr() as *const libc::c_char,
+                    name.as_ptr(),
                     val_buf.as_mut_ptr() as *mut libc::c_void,
                     val_buf.len(),
                 );
@@ -448,9 +445,10 @@ fn xattr_blake3_digest_deterministic_across_remount() {
 
         let pc = path_c(&file_path);
 
-        // SAFETY: Audit note: #1448 tracks converting split listxattr name
-        // slices to NUL-terminated C strings before getxattr. The list/value
-        // buffers here are allocated to the kernel-reported sizes.
+        // SAFETY: `pc` and each owned xattr-name C string remain live across the
+        // matching size and value syscalls. The list buffer and each
+        // zero-initialized value buffer are writable for their lengths and read
+        // only through the kernel-reported byte counts.
         unsafe {
             let size = libc::listxattr(pc.as_ptr(), std::ptr::null_mut(), 0);
             assert!(size >= 0);
@@ -467,17 +465,13 @@ fn xattr_blake3_digest_deterministic_across_remount() {
                 if name_bytes.is_empty() {
                     continue;
                 }
-                let val_size = libc::getxattr(
-                    pc.as_ptr(),
-                    name_bytes.as_ptr() as *const libc::c_char,
-                    std::ptr::null_mut(),
-                    0,
-                );
+                let name = CString::new(name_bytes).expect("xattr name contains NUL");
+                let val_size = libc::getxattr(pc.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0);
                 assert!(val_size >= 0);
                 let mut val_buf = vec![0u8; val_size as usize];
                 let vn = libc::getxattr(
                     pc.as_ptr(),
-                    name_bytes.as_ptr() as *const libc::c_char,
+                    name.as_ptr(),
                     val_buf.as_mut_ptr() as *mut libc::c_void,
                     val_buf.len(),
                 );
