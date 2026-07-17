@@ -8147,6 +8147,9 @@ impl FuseVfsAdapter {
             Vec::new()
         };
 
+        // Block-volume copying is not the final fsync durability boundary.
+        // Retire its dirty projection only after every later stage succeeds.
+        let mut block_volume_dirty_state_flushed = false;
         let sync_result = (|| {
             // Phase 1: Writeback dirty pages through the local-filesystem
             // dispatch layer via PageCacheDirtyFlush.  This bridges the adapter
@@ -8208,11 +8211,7 @@ impl FuseVfsAdapter {
                             }
                         }
                         drop(e);
-                        let mut ds = self.dirty_state.lock().unwrap();
-                        if let Some(dr) = ds.get_mut(&ino) {
-                            dr.clear_all();
-                            ds.remove(&ino);
-                        }
+                        block_volume_dirty_state_flushed = true;
                     }
                 }
             } // Phase 2b: fdatasync durability barrier.
@@ -8306,6 +8305,14 @@ impl FuseVfsAdapter {
         sync_result?;
         if tracker_completion_failed {
             return Err(Errno::EIO);
+        }
+
+        if block_volume_dirty_state_flushed {
+            let mut ds = self.dirty_state.lock().unwrap();
+            if let Some(dr) = ds.get_mut(&ino) {
+                dr.clear_all();
+                ds.remove(&ino);
+            }
         }
 
         self.writeback_cache.lock().unwrap().mark_clean(ino);
@@ -26695,6 +26702,74 @@ mod tests {
             "failed fsync must retain a writeback error"
         );
     }
+
+    #[test]
+    fn vfs_adapter_dispatch_fsync_txg_error_retains_dirty_projections() {
+        let mut f = adapter_fixture();
+        let tracker = Arc::new(Mutex::new(
+            tidefs_local_filesystem::dirty_page_tracker::DirtyPageTracker::new(),
+        ));
+        f.adapter.writeback_range_tracker = Some(Arc::clone(&tracker));
+        let writeback_page_cache = Arc::new(PageCache::new(8, 4096));
+        f.adapter.writeback_page_cache = Some(Arc::clone(&writeback_page_cache));
+        let invalid_store_root = f.root.join("txg-store-root-file");
+        std::fs::write(&invalid_store_root, b"not a directory").expect("create invalid TXG root");
+        f.adapter
+            .txg_cycle_cell()
+            .set_store_root(invalid_store_root);
+
+        let ctx = root_ctx();
+        let payload = b"late fsync failure";
+        let (ino, fh, _) = create_adapter_file_handle(
+            &f.adapter,
+            &ctx,
+            b"late-fsync-failure.bin",
+            libc::O_RDWR as u32,
+        );
+        f.adapter
+            .dispatch_write(&ctx, ino.get(), fh, 0, payload, 0)
+            .expect("dispatch write");
+        tracker
+            .lock()
+            .unwrap()
+            .mark_dirty(ino, 0, payload.len() as u64);
+        let (block_volume, writes) = MockBV::new();
+        f.adapter
+            .block_volume
+            .lock()
+            .unwrap()
+            .replace(Box::new(block_volume));
+
+        assert_eq!(
+            f.adapter.dispatch_fsync(&ctx, ino.get(), fh),
+            Err(Errno::EIO)
+        );
+        assert_eq!(writes.lock().unwrap()[0].1, payload);
+        assert!(f
+            .adapter
+            .dirty_state
+            .lock()
+            .unwrap()
+            .get(&ino.get())
+            .is_some_and(|ranges| ranges.contains(0, payload.len() as u32)));
+        assert!(writeback_page_cache.has_dirty_pages_for_inode(ino.get()));
+        assert!(f
+            .adapter
+            .write_page_cache
+            .has_dirty_pages_for_inode(ino.get()));
+
+        let tracker = tracker.lock().unwrap();
+        let ranges = tracker
+            .dirty_ranges(ino)
+            .expect("late fsync failure must retain the dirty range");
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(
+            ranges[0].lifecycle_state(),
+            tidefs_local_filesystem::dirty_page_tracker::DirtyLifecycleState::ErrorPoisoned
+        );
+        assert!(ranges[0].writeback_error().is_some());
+    }
+
     #[test]
     fn vfs_adapter_dispatch_fsync_idempotent_repeated_calls() {
         // Write data through dispatch_write (dirtying pages), fsync to flush,
