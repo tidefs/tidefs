@@ -4095,7 +4095,16 @@ fn live_snapshot_send_plan(
 }
 
 fn live_snapshot_send_destination(args: &Value) -> Result<LiveSnapshotSendDestination, String> {
-    let output = live_admin_optional_arg(args, "output").map(std::path::PathBuf::from);
+    let output = match args.get("output") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(output)) if output.is_empty() => {
+            return Err("snapshot send: output must be a non-empty string".to_string());
+        }
+        Some(Value::String(output)) => Some(std::path::PathBuf::from(output)),
+        Some(_) => {
+            return Err("snapshot send: output must be a non-empty string".to_string());
+        }
+    };
     let target_addr = match args.get("target_addr") {
         None | Some(Value::Null) => None,
         Some(Value::String(target_addr)) if target_addr.is_empty() => {
@@ -8249,6 +8258,40 @@ mod tests {
                 "snapshot send: target-addr must be a non-empty string"
             );
             assert!(!output.exists());
+        }
+    }
+
+    #[test]
+    fn live_snapshot_send_rejects_malformed_output_without_remote_fallback() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = root.path().join("store");
+        let mut fs = LocalFileSystem::open(&store).expect("open fs");
+        fs.create_file("/live.txt", 0o644).expect("create file");
+        fs.write_file("/live.txt", 0, b"live owner snapshot send")
+            .expect("write file");
+        let engine = VfsLocalFileSystem::new(fs);
+
+        for malformed in [json!(""), json!(false), json!(["send.vfs"])] {
+            let refused = live_snapshot_admin(
+                &engine,
+                "send",
+                json!({
+                    "output": malformed,
+                    "target_addr": "127.0.0.1:0",
+                    "format": "vfssend2",
+                    "incremental": false,
+                }),
+                true,
+            );
+
+            assert_eq!(refused["ok"], false, "target response: {refused}");
+            assert_eq!(refused["exit_code"], 1);
+            assert!(refused["json"].is_null());
+            assert!(refused["text"].is_null());
+            assert_eq!(
+                refused["error"],
+                "snapshot send: output must be a non-empty string"
+            );
         }
     }
 
