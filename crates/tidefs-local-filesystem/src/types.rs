@@ -1504,10 +1504,78 @@ pub enum ChangedRecordTransformContract {
     /// whose device-level transforms are disabled. Checksums cover the stored
     /// frame bytes carried by each changed record.
     StoredFrameNoDeviceTransforms,
-    /// Mounted device transforms are required, but this changed-record stream
-    /// does not carry typed transform metadata for replay. Receivers must fail
-    /// closed until a typed metadata format exists.
+    /// Mounted device transforms are required. The stream carries a typed
+    /// refusal tuple, but not the persisted per-frame metadata needed for
+    /// replay. Receivers must fail closed until that replay metadata exists.
     MountedDeviceTransformsRequireTypedMetadata,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ChangedRecordTypedTransformMetadata {
+    pub(crate) plaintext_identity: ChangedRecordPlaintextIdentity,
+    pub(crate) transform_frame_identity: ChangedRecordTransformFrameIdentity,
+    pub(crate) checksum_layer: ChangedRecordChecksumLayer,
+    pub(crate) stored_frame_contract: ChangedRecordStoredFrameContract,
+    pub(crate) refusal_state: ChangedRecordTransformRefusalState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ChangedRecordPlaintextIdentity {
+    StoredFrameBytesAreMountedPlaintext,
+    RequiresTypedMountedContentIdentity,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ChangedRecordTransformFrameIdentity {
+    NotApplicableNoDeviceTransforms,
+    MissingTypedCompressionEncryptionFrameIdentity,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ChangedRecordChecksumLayer {
+    StoredFrameBytes,
+    RequiresTypedMountedTransformChecksum,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ChangedRecordStoredFrameContract {
+    StoredFrameNoDeviceTransforms,
+    RawMediaBytesNotMountedContentAuthority,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ChangedRecordTransformRefusalState {
+    ReplayReady,
+    MissingTypedTransformMetadata,
+}
+
+impl ChangedRecordTypedTransformMetadata {
+    pub(crate) const fn for_contract(contract: ChangedRecordTransformContract) -> Self {
+        match contract {
+            ChangedRecordTransformContract::StoredFrameNoDeviceTransforms => Self {
+                plaintext_identity:
+                    ChangedRecordPlaintextIdentity::StoredFrameBytesAreMountedPlaintext,
+                transform_frame_identity:
+                    ChangedRecordTransformFrameIdentity::NotApplicableNoDeviceTransforms,
+                checksum_layer: ChangedRecordChecksumLayer::StoredFrameBytes,
+                stored_frame_contract:
+                    ChangedRecordStoredFrameContract::StoredFrameNoDeviceTransforms,
+                refusal_state: ChangedRecordTransformRefusalState::ReplayReady,
+            },
+            ChangedRecordTransformContract::MountedDeviceTransformsRequireTypedMetadata => Self {
+                plaintext_identity:
+                    ChangedRecordPlaintextIdentity::RequiresTypedMountedContentIdentity,
+                transform_frame_identity:
+                    ChangedRecordTransformFrameIdentity::MissingTypedCompressionEncryptionFrameIdentity,
+                checksum_layer:
+                    ChangedRecordChecksumLayer::RequiresTypedMountedTransformChecksum,
+                stored_frame_contract:
+                    ChangedRecordStoredFrameContract::RawMediaBytesNotMountedContentAuthority,
+                refusal_state:
+                    ChangedRecordTransformRefusalState::MissingTypedTransformMetadata,
+            },
+        }
+    }
 }
 
 impl ChangedRecordTransformContract {

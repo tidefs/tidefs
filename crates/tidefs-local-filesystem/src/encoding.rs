@@ -600,7 +600,12 @@ pub(crate) fn encode_changed_record_export(export: &ChangedRecordExport) -> Vec<
         push_u64(&mut out, epoch);
     }
     push_u16(&mut out, export.transform_contract.as_u16());
-    push_u16(&mut out, 0); // reserved transform-contract field
+    push_u16(
+        &mut out,
+        encode_changed_record_typed_transform_metadata(
+            ChangedRecordTypedTransformMetadata::for_contract(export.transform_contract),
+        ),
+    );
     push_u64(&mut out, export.roots.len() as u64);
     for root in &export.roots {
         encode_committed_root_summary(&mut out, &root.source_root);
@@ -647,10 +652,11 @@ pub(crate) fn decode_changed_record_export(bytes: &[u8]) -> Result<ChangedRecord
         });
     }
     let transform_contract = ChangedRecordTransformContract::try_from(decoder.read_u16()?)?;
-    if decoder.read_u16()? != 0 {
+    let transform_metadata = decode_changed_record_typed_transform_metadata(decoder.read_u16()?)?;
+    if transform_metadata != ChangedRecordTypedTransformMetadata::for_contract(transform_contract) {
         return Err(FileSystemError::Decode {
             object: "local filesystem send/receive stream",
-            reason: "reserved transform-contract field is non-zero",
+            reason: "typed transform metadata does not match transform contract",
         });
     }
     let root_count = decoder.read_count()?;
@@ -731,6 +737,88 @@ fn changed_record_stream_version(incremental: bool, has_placement_epoch: bool) -
 }
 
 const CHANGED_RECORD_STREAM_HAS_TRANSFORM_CONTRACT: u16 = 0x0001;
+
+// The existing transform-contract metadata word carries five independent
+// typed decisions. Zero remains the no-device-transform representation, so
+// transform-disabled stream bytes keep their current shape.
+const CHANGED_RECORD_PLAINTEXT_IDENTITY_REQUIRED: u16 = 1 << 0;
+const CHANGED_RECORD_TRANSFORM_FRAME_IDENTITY_REQUIRED: u16 = 1 << 1;
+const CHANGED_RECORD_TRANSFORM_CHECKSUM_REQUIRED: u16 = 1 << 2;
+const CHANGED_RECORD_RAW_MEDIA_NOT_CONTENT_AUTHORITY: u16 = 1 << 3;
+const CHANGED_RECORD_TRANSFORM_REFUSAL: u16 = 1 << 4;
+const CHANGED_RECORD_TYPED_TRANSFORM_METADATA_MASK: u16 = CHANGED_RECORD_PLAINTEXT_IDENTITY_REQUIRED
+    | CHANGED_RECORD_TRANSFORM_FRAME_IDENTITY_REQUIRED
+    | CHANGED_RECORD_TRANSFORM_CHECKSUM_REQUIRED
+    | CHANGED_RECORD_RAW_MEDIA_NOT_CONTENT_AUTHORITY
+    | CHANGED_RECORD_TRANSFORM_REFUSAL;
+
+fn encode_changed_record_typed_transform_metadata(
+    metadata: ChangedRecordTypedTransformMetadata,
+) -> u16 {
+    let mut bits = 0_u16;
+    if metadata.plaintext_identity
+        == ChangedRecordPlaintextIdentity::RequiresTypedMountedContentIdentity
+    {
+        bits |= CHANGED_RECORD_PLAINTEXT_IDENTITY_REQUIRED;
+    }
+    if metadata.transform_frame_identity
+        == ChangedRecordTransformFrameIdentity::MissingTypedCompressionEncryptionFrameIdentity
+    {
+        bits |= CHANGED_RECORD_TRANSFORM_FRAME_IDENTITY_REQUIRED;
+    }
+    if metadata.checksum_layer == ChangedRecordChecksumLayer::RequiresTypedMountedTransformChecksum
+    {
+        bits |= CHANGED_RECORD_TRANSFORM_CHECKSUM_REQUIRED;
+    }
+    if metadata.stored_frame_contract
+        == ChangedRecordStoredFrameContract::RawMediaBytesNotMountedContentAuthority
+    {
+        bits |= CHANGED_RECORD_RAW_MEDIA_NOT_CONTENT_AUTHORITY;
+    }
+    if metadata.refusal_state == ChangedRecordTransformRefusalState::MissingTypedTransformMetadata {
+        bits |= CHANGED_RECORD_TRANSFORM_REFUSAL;
+    }
+    bits
+}
+
+fn decode_changed_record_typed_transform_metadata(
+    bits: u16,
+) -> Result<ChangedRecordTypedTransformMetadata> {
+    if bits & !CHANGED_RECORD_TYPED_TRANSFORM_METADATA_MASK != 0 {
+        return Err(FileSystemError::Decode {
+            object: "local filesystem send/receive stream",
+            reason: "reserved typed transform metadata bits are set",
+        });
+    }
+
+    Ok(ChangedRecordTypedTransformMetadata {
+        plaintext_identity: if bits & CHANGED_RECORD_PLAINTEXT_IDENTITY_REQUIRED != 0 {
+            ChangedRecordPlaintextIdentity::RequiresTypedMountedContentIdentity
+        } else {
+            ChangedRecordPlaintextIdentity::StoredFrameBytesAreMountedPlaintext
+        },
+        transform_frame_identity: if bits & CHANGED_RECORD_TRANSFORM_FRAME_IDENTITY_REQUIRED != 0 {
+            ChangedRecordTransformFrameIdentity::MissingTypedCompressionEncryptionFrameIdentity
+        } else {
+            ChangedRecordTransformFrameIdentity::NotApplicableNoDeviceTransforms
+        },
+        checksum_layer: if bits & CHANGED_RECORD_TRANSFORM_CHECKSUM_REQUIRED != 0 {
+            ChangedRecordChecksumLayer::RequiresTypedMountedTransformChecksum
+        } else {
+            ChangedRecordChecksumLayer::StoredFrameBytes
+        },
+        stored_frame_contract: if bits & CHANGED_RECORD_RAW_MEDIA_NOT_CONTENT_AUTHORITY != 0 {
+            ChangedRecordStoredFrameContract::RawMediaBytesNotMountedContentAuthority
+        } else {
+            ChangedRecordStoredFrameContract::StoredFrameNoDeviceTransforms
+        },
+        refusal_state: if bits & CHANGED_RECORD_TRANSFORM_REFUSAL != 0 {
+            ChangedRecordTransformRefusalState::MissingTypedTransformMetadata
+        } else {
+            ChangedRecordTransformRefusalState::ReplayReady
+        },
+    })
+}
 
 fn decode_changed_record_stream_version(
     stream_version: u16,
@@ -1990,6 +2078,26 @@ mod tests {
         )
     }
 
+    fn changed_record_transform_metadata_bits_offset(encoded: &[u8]) -> usize {
+        let mut decoder = Decoder::new("local filesystem send/receive stream", encoded);
+        decoder
+            .expect_magic(SEND_RECEIVE_STREAM_MAGIC_BYTES)
+            .expect("stream magic");
+        let envelope =
+            decode_changed_record_stream_version(decoder.read_u16().expect("stream version"))
+                .expect("supported stream version");
+        let _flags = decoder.read_u16().expect("stream flags");
+        decode_committed_root_summary(&mut decoder).expect("current root");
+        if envelope.incremental {
+            decode_committed_root_summary(&mut decoder).expect("from root");
+        }
+        if envelope.has_placement_epoch {
+            decoder.read_u64().expect("placement epoch");
+        }
+        decoder.read_u16().expect("transform contract");
+        decoder.offset
+    }
+
     #[test]
     fn inline_xattr_inode_roundtrips_current_bundle_encoding() {
         let mut xattrs = BTreeMap::new();
@@ -2092,6 +2200,47 @@ mod tests {
             FileSystemError::Decode {
                 object: "local filesystem send/receive stream",
                 reason: "stream is missing transform contract",
+            }
+        ));
+    }
+
+    #[test]
+    fn changed_record_typed_transform_metadata_roundtrips_each_contract() {
+        for (contract, expected_bits) in [
+            (
+                ChangedRecordTransformContract::StoredFrameNoDeviceTransforms,
+                0,
+            ),
+            (
+                ChangedRecordTransformContract::MountedDeviceTransformsRequireTypedMetadata,
+                CHANGED_RECORD_TYPED_TRANSFORM_METADATA_MASK,
+            ),
+        ] {
+            let expected = ChangedRecordTypedTransformMetadata::for_contract(contract);
+            let bits = encode_changed_record_typed_transform_metadata(expected);
+            assert_eq!(bits, expected_bits);
+            let decoded = decode_changed_record_typed_transform_metadata(bits)
+                .expect("decode typed transform metadata");
+            assert_eq!(decoded, expected);
+        }
+    }
+
+    #[test]
+    fn changed_record_decode_rejects_transform_metadata_contract_mismatch() {
+        let mut export = changed_record_export(None, None, Vec::new());
+        export.transform_contract =
+            ChangedRecordTransformContract::MountedDeviceTransformsRequireTypedMetadata;
+        let mut encoded = encode_changed_record_export(&export);
+        let metadata_offset = changed_record_transform_metadata_bits_offset(&encoded);
+        encoded[metadata_offset..metadata_offset + 2].copy_from_slice(&0_u16.to_le_bytes());
+
+        let err = decode_changed_record_export(&encoded)
+            .expect_err("transform metadata must match its contract");
+        assert!(matches!(
+            err,
+            FileSystemError::Decode {
+                object: "local filesystem send/receive stream",
+                reason: "typed transform metadata does not match transform contract",
             }
         ));
     }
