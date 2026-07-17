@@ -7485,6 +7485,19 @@ impl FuseVfsAdapter {
         }
     }
 
+    fn refresh_writeback_projection(&self, ino: u64) {
+        let total_dirty = WritebackProjection::total_observable_dirty_bytes(
+            &self.dirty_state,
+            self.writeback_page_cache.as_ref(),
+            ino,
+        );
+        if total_dirty == 0 {
+            self.writeback_projection.record_clean(ino);
+        } else {
+            self.writeback_projection.record_dirty(ino, total_dirty);
+        }
+    }
+
     fn clear_dirty_trackers_for_authoritative_range(&self, ino: u64, offset: u64, length: u64) {
         let mut ds = self.dirty_state.lock().unwrap();
         if let Some(dr) = ds.get_mut(&ino) {
@@ -7830,15 +7843,16 @@ impl FuseVfsAdapter {
         self.write_page_cache.clear_dirty_for_inode(ino);
         self.writeback_cache_stats.lock().unwrap().record_flush();
 
-        // Record the clean transition in the runtime projection so the
-        // dirty-to-clean lifecycle is observable for claim-gate validation.
-        self.writeback_projection.record_clean(ino);
-
         // Drain the DirtyPageTracker for this inode after writeback so
         // the background flush service (#4657) sees a clean inode.
         if let Some(ref tracker) = self.writeback_range_tracker {
             tracker.lock().unwrap().flush_inode(InodeId::new(ino));
         }
+
+        // FUSE flush may leave adapter dirty ranges for the stronger fsync
+        // boundary. Keep those bytes visible instead of publishing a false
+        // clean transition that would permit mmap invalidation.
+        self.refresh_writeback_projection(ino);
 
         // Release POSIX locks owned by this lock_owner after flush
         // completes.  Per FUSE protocol, close() releases locks; flush()
@@ -8026,6 +8040,7 @@ impl FuseVfsAdapter {
         self.commit_current_txg_barrier("fsync")?;
         self.sync_namespace_attrs_from_engine(ctx, ino, Some(efh));
         self.fsync_handler.handle_fsync(ino, datasync)?;
+        self.refresh_writeback_projection(ino);
         Ok(())
     }
 
@@ -32549,12 +32564,13 @@ mod tests {
         }
     }
 
-    fn adapter_fixture_with_mock_block_volume() -> (
+    fn adapter_fixture_with_attached_mock_block_volume(
+        fixture: AdapterFixture,
+    ) -> (
         AdapterFixture,
         std::sync::Arc<std::sync::Mutex<MockBlockVolume>>,
     ) {
         use std::sync::{Arc, Mutex};
-        let fixture = adapter_fixture();
         let bv = Arc::new(Mutex::new(MockBlockVolume::new()));
         {
             let mut bv_guard = fixture.adapter.block_volume.lock().unwrap();
@@ -32563,6 +32579,13 @@ mod tests {
             }));
         }
         (fixture, bv)
+    }
+
+    fn adapter_fixture_with_mock_block_volume() -> (
+        AdapterFixture,
+        std::sync::Arc<std::sync::Mutex<MockBlockVolume>>,
+    ) {
+        adapter_fixture_with_attached_mock_block_volume(adapter_fixture())
     }
 
     #[test]
@@ -32623,6 +32646,49 @@ mod tests {
                 .expect("read after fsync");
             assert_eq!(readback, b"to be flushed");
         }
+    }
+
+    #[test]
+    fn writeback_projection_keeps_flush_dirty_until_fsync() {
+        let (mut fixture, _bv) =
+            adapter_fixture_with_attached_mock_block_volume(adapter_fixture_with_writeback_cache());
+        let ctx = root_ctx();
+        let (inode, adapter_fh, _) = create_adapter_file_handle(
+            &fixture.adapter,
+            &ctx,
+            b"projection-flush.txt",
+            libc::O_RDWR as u32,
+        );
+        let ino = inode.get();
+        let projection = Arc::clone(&fixture.adapter.writeback_projection);
+
+        fixture
+            .adapter
+            .dispatch_write(
+                &ctx,
+                ino,
+                adapter_fh,
+                0,
+                b"dirty projection",
+                FUSE_WRITE_CACHE,
+            )
+            .expect("write dispatch");
+        assert!(projection.is_dirty(ino));
+
+        fixture
+            .adapter
+            .dispatch_flush(&ctx, ino, adapter_fh, 0)
+            .expect("flush dispatch");
+        assert!(projection.is_dirty(ino));
+        assert!(!projection.invalidation_allowed(ino));
+        assert_eq!(projection.stats_snapshot().clean_transitions, 0);
+
+        fixture
+            .adapter
+            .dispatch_fsync(&ctx, ino, adapter_fh)
+            .expect("fsync dispatch");
+        assert!(!projection.is_dirty_or_writeback(ino));
+        assert_eq!(projection.stats_snapshot().clean_transitions, 1);
     }
 
     #[test]
