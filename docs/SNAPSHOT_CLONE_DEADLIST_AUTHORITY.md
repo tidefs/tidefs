@@ -96,8 +96,8 @@ Source: `crates/tidefs-local-filesystem/src/snapshot.rs` create_clone.
 ### 2.2 Delete
 
 `delete_clone(name)` removes the clone entry but leaves the origin unaffected.
-Unlike ZFS, TideFS clones are independent snapshot entries; deleting a clone
-does not require promoting it or its origin.
+The current local snapshot-table path records clones as separate entries.
+Deleting a clone removes that entry without modifying the origin entry.
 
 Source: `crates/tidefs-local-filesystem/src/snapshot.rs` delete_clone.
 

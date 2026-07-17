@@ -563,9 +563,9 @@ impl LocalFileSystem {
 
     /// Delete a clone. This also removes the underlying snapshot data.
     ///
-    /// Unlike ZFS (where deleting an origin snapshot that has clones requires
-    /// promotion), TideFS clones are independent snapshot entries. Deleting a
-    /// clone only removes the clone entry — the origin is unaffected.
+    /// Clone records are separate entries in the current local snapshot table.
+    /// This path removes the named clone entry without modifying its origin
+    /// entry.
     pub(crate) fn delete_clone_without_deadlist(
         &mut self,
         name: impl AsRef<str>,
