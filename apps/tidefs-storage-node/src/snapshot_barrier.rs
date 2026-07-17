@@ -174,6 +174,7 @@ pub enum BarrierOutcome {
         /// The maximum committed-root txg across all peers.
         max_txg: u64,
         /// Total object count across all peers.
+        /// Saturates at [`u64::MAX`] when peer reports cannot be summed exactly.
         total_objects: u64,
         /// Per-peer responses.
         responses: BTreeMap<u64, BarrierResponse>,
@@ -206,6 +207,7 @@ pub struct SnapshotBarrierSendReport {
     pub min_txg: u64,
     pub max_txg: u64,
     /// Objects reported across the coordinator and all remote peers.
+    /// Saturates at [`u64::MAX`] when node reports cannot be summed exactly.
     pub total_objects: u64,
 }
 
@@ -497,7 +499,9 @@ impl BarrierCollector {
                 .map(|r| r.committed_root_generation)
                 .max()
                 .unwrap_or(0);
-            let total_objects: u64 = self.responses.values().map(|r| r.object_count).sum();
+            let total_objects = self.responses.values().fold(0u64, |total, response| {
+                total.saturating_add(response.object_count)
+            });
 
             // Consistency check: all peers must report the same
             // committed-root txg and generation. Any spread indicates a
@@ -1295,6 +1299,29 @@ mod tests {
                 assert_eq!(min_txg, 100);
                 assert_eq!(max_txg, 100);
                 assert_eq!(total_objects, 30);
+            }
+            other => panic!("expected Consistent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn coordinator_saturates_peer_object_count_total() {
+        let mut coord = SnapshotCoordinator::new(1, "snap".into(), vec![10, 20], make_config());
+        for (peer_id, object_count) in [(10, u64::MAX), (20, 1)] {
+            assert!(coord.record_response(
+                peer_id,
+                &Frame::SnapshotBarrierResponse {
+                    barrier_id: 1,
+                    committed_root_txg: 100,
+                    committed_root_generation: 5,
+                    object_count,
+                },
+            ));
+        }
+
+        match coord.outcome() {
+            Some(BarrierOutcome::Consistent { total_objects, .. }) => {
+                assert_eq!(total_objects, u64::MAX);
             }
             other => panic!("expected Consistent, got {other:?}"),
         }
