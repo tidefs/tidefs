@@ -3225,6 +3225,28 @@ impl Pool {
                 reason: "device not found for safe removal",
             },
         )?;
+        let topology_len = self.devices.len();
+        let mut unique_device_roots = BTreeSet::new();
+        if self.config.devices.len() != topology_len
+            || self.classes.len() != topology_len
+            || self.media_classes.len() != topology_len
+            || self.device_layout_stats.len() != topology_len
+            || self.device_layouts.len() != topology_len
+            || !self
+                .devices
+                .iter()
+                .all(|device| unique_device_roots.insert(device.root().to_path_buf()))
+            || self.config.devices.iter().enumerate().any(|(idx, config)| {
+                config.path.as_path() != self.devices[idx].root()
+                    || device_root_path(config) != self.devices[idx].root()
+                    || config.class != self.classes[idx]
+                    || config.media_class != self.media_classes[idx]
+            })
+        {
+            return Err(StoreError::InvalidOptions {
+                reason: "device removal topology tables are incomplete or misaligned",
+            });
+        }
         let target_guid = self.device_guid_for_index(target_idx);
         let mut matching_guid_indices = self
             .device_guids
@@ -7240,6 +7262,41 @@ mod tests {
             })
         ));
         assert_eq!(pool.stats().device_count, 2);
+        assert!(!root.join(DEVICE_REMOVAL_MARKER_FILE).exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn safe_remove_device_refuses_misaligned_topology_tables() {
+        let root = temp_dir("safe-remove-misaligned-topology-tables");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = multi_data_device_config(&root, 2);
+        let mut pool = Pool::create(config, PoolProperties::default(), &test_options()).unwrap();
+        let target_path = pool.devices[0].root().to_path_buf();
+        let device_roots_before: Vec<_> = pool
+            .devices
+            .iter()
+            .map(|device| device.root().to_path_buf())
+            .collect();
+        pool.config.devices.swap(0, 1);
+
+        let result = pool.safe_remove_device(&target_path);
+
+        assert!(matches!(
+            result,
+            Err(StoreError::InvalidOptions {
+                reason: "device removal topology tables are incomplete or misaligned"
+            })
+        ));
+        assert_eq!(pool.stats().device_count, 2);
+        assert_eq!(
+            pool.devices
+                .iter()
+                .map(|device| device.root().to_path_buf())
+                .collect::<Vec<_>>(),
+            device_roots_before
+        );
         assert!(!root.join(DEVICE_REMOVAL_MARKER_FILE).exists());
 
         let _ = std::fs::remove_dir_all(&root);
