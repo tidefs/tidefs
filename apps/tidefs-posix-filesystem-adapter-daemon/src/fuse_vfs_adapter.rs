@@ -7140,11 +7140,10 @@ impl FuseVfsAdapter {
                     }
                 }
             }
-            drop(write_cache_reconciliation_guard);
-
             if let Some(attr) = post_write_attr {
                 self.sync_namespace_attrs_after_engine_write(ino, &attr);
             }
+            drop(write_cache_reconciliation_guard);
 
             // O_SYNC / O_DSYNC durability: when the file descriptor was opened
             // with O_SYNC or O_DSYNC, each write must be durable before the
