@@ -1059,6 +1059,10 @@ fn require_snapshot_barrier_before_send(
     ctx: &SessionContext,
     key: &[u8],
 ) -> Result<(), String> {
+    if !key.is_empty() && key.len() != 24 {
+        return Err(format!("send key must be 0 or 24 bytes, got {}", key.len()));
+    }
+
     match run_snapshot_barrier_before_send(session_id, ctx, key) {
         Ok(report) => {
             eprintln!(
@@ -7281,6 +7285,46 @@ mod cluster_pool_handler_tests {
                 assert!(message.contains("barrier 123"));
             }
             other => panic!("expected barrier error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn malformed_send_keys_are_rejected_before_snapshot_barrier() {
+        let (_dir, store) = frame_local_store();
+        let mut ctx = frame_test_context(Arc::clone(&store));
+        let fs_dir = tempfile::tempdir().unwrap();
+        ctx.config.fs_root = Some(fs_dir.path().join("fs"));
+        ctx.config.root_auth_key = Some(RootAuthenticationKey::demo_key());
+        *ctx.active_barrier.lock().unwrap() = Some(SnapshotCoordinator::new(
+            123,
+            "active".into(),
+            Vec::new(),
+            SnapshotBarrierConfig::default(),
+        ));
+
+        for frame in [
+            Frame::Send { key: vec![1] },
+            Frame::SendChunked { key: vec![1] },
+        ] {
+            let response =
+                handle_frame_ctx(tidefs_transport::SessionId::new(1), &frame, &store, &ctx)
+                    .expect("malformed send returns an error");
+
+            match response {
+                Frame::Error { message } => {
+                    assert_eq!(message, "send key must be 0 or 24 bytes, got 1");
+                }
+                other => panic!("expected malformed-key error, got {other:?}"),
+            }
+
+            let active = ctx.active_barrier.lock().unwrap();
+            assert_eq!(
+                active
+                    .as_ref()
+                    .expect("malformed request must not clear the active barrier")
+                    .barrier_id(),
+                123
+            );
         }
     }
 
