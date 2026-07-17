@@ -876,7 +876,10 @@ fn decode_verified_shard(
     }
     let payload_len = usize::try_from(payload_len)
         .map_err(|_| ShardIntegrityError::LengthOverflow("shard payload"))?;
-    if record.len() != SHARD_RECORD_HEADER_LEN + payload_len {
+    let record_len = SHARD_RECORD_HEADER_LEN
+        .checked_add(payload_len)
+        .ok_or(ShardIntegrityError::LengthOverflow("shard record"))?;
+    if record.len() != record_len {
         return Err(ShardIntegrityError::TruncatedRecord);
     }
     let mut expected = [0u8; 32];
@@ -1644,6 +1647,17 @@ mod tests {
             }
             other => panic!("expected InsufficientShards, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn shard_decoder_rejects_overflowing_record_length() {
+        let object_prefix = [1; 16];
+        let mut record = encode_verified_shard(&object_prefix, 0, 0, b"payload").unwrap();
+        record[20..28].copy_from_slice(&(usize::MAX as u64).to_le_bytes());
+
+        let err = decode_verified_shard(&object_prefix, 0, 0, &record).unwrap_err();
+
+        assert_eq!(err, ShardIntegrityError::LengthOverflow("shard record"));
     }
 
     // --- 2+1 basic put/get ---
