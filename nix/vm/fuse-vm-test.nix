@@ -25,6 +25,8 @@ pkgs.writeShellScriptBin "tidefs-fuse-vm-test-runner" ''
   TIDEFS_STORE_DEMO="${tidefsPackage}/bin/tidefs-store-demo"
   FUSE_DAEMON="${tidefsPackage}/bin/tidefs-posix-filesystem-adapter-daemon"
   SCRUB_VALIDATION="${scrubValidationPackage}/bin/scrub_foreground_read_validation"
+  BASE64="${pkgs.coreutils}/bin/base64"
+  B3SUM="${pkgs.b3sum}/bin/b3sum"
   JQ="${pkgs.jq}/bin/jq"
 
   TMPDIR="''${TIDEFS_FUSE_VM_TEST_TMPDIR:-/tmp/tidefs-fuse-vm-test}"
@@ -108,7 +110,7 @@ EOF
     fi
   done
   if [ "$SCRUB_FOREGROUND_READ" -eq 1 ]; then
-    for dep in "$SCRUB_VALIDATION" "$JQ"; do
+    for dep in "$SCRUB_VALIDATION" "$BASE64" "$B3SUM" "$JQ"; do
       if [ ! -f "$dep" ] && [ ! -x "$dep" ]; then
         echo "ERROR: dependency not found: $dep" >&2
         exit 2
@@ -306,14 +308,12 @@ if [ "$SCRUB_FOREGROUND_READ" -eq 1 ]; then
 
     if [ -s "$SCRUB_RUNTIME_DIR/scrub-read-runtime.json" ]; then
         echo "TIDEFS_SCRUB_RUNTIME_ARTIFACT_BEGIN"
-        cat "$SCRUB_RUNTIME_DIR/scrub-read-runtime.json"
-        echo
+        /bin/busybox base64 "$SCRUB_RUNTIME_DIR/scrub-read-runtime.json"
         echo "TIDEFS_SCRUB_RUNTIME_ARTIFACT_END"
     fi
     if [ -s "$SCRUB_RUNTIME_DIR/evidence-manifest.json" ]; then
         echo "TIDEFS_SCRUB_EVIDENCE_MANIFEST_BEGIN"
-        cat "$SCRUB_RUNTIME_DIR/evidence-manifest.json"
-        echo
+        /bin/busybox base64 "$SCRUB_RUNTIME_DIR/evidence-manifest.json"
         echo "TIDEFS_SCRUB_EVIDENCE_MANIFEST_END"
     fi
     echo "scrub_runtime_exit_status=$SCRUB_RUNTIME_RC"
@@ -455,11 +455,11 @@ INITSCRIPT
     extract_between \
       "TIDEFS_SCRUB_RUNTIME_ARTIFACT_BEGIN" \
       "TIDEFS_SCRUB_RUNTIME_ARTIFACT_END" \
-      > "$scrub_artifact" || true
+      | "$BASE64" --decode > "$scrub_artifact" || true
     extract_between \
       "TIDEFS_SCRUB_EVIDENCE_MANIFEST_BEGIN" \
       "TIDEFS_SCRUB_EVIDENCE_MANIFEST_END" \
-      > "$scrub_manifest" || true
+      | "$BASE64" --decode > "$scrub_manifest" || true
   fi
 
   PASSC=$(count_serial_lines '^PASS:')
@@ -475,9 +475,14 @@ INITSCRIPT
       || ! "$JQ" -e 'type == "object"' "$scrub_manifest" >/dev/null; then
       FAILC=$((FAILC + 1))
     else
+      declared_digest=$("$JQ" -r '.content_digest // empty' "$scrub_manifest")
+      actual_digest="blake3:$("$B3SUM" "$scrub_artifact" | awk '{print $1}')"
       scrub_outcome=$("$JQ" -r '.outcome // empty' "$scrub_artifact")
       manifest_outcome=$("$JQ" -r '.outcome // empty' "$scrub_manifest")
-      if [ "$scrub_outcome" != "$manifest_outcome" ]; then
+      if [ -z "$declared_digest" ] || [ "$declared_digest" != "$actual_digest" ]; then
+        echo "FAIL: scrub_runtime_artifact_digest -- declared=$declared_digest actual=$actual_digest" >&2
+        FAILC=$((FAILC + 1))
+      elif [ "$scrub_outcome" != "$manifest_outcome" ]; then
         FAILC=$((FAILC + 1))
       else
         case "$scrub_outcome" in
