@@ -8427,6 +8427,20 @@ impl FuseVfsAdapter {
         // syncfs is the mount-wide barrier, so take every bounded stripe in
         // stable order before clearing any inode's dirty projections.
         let _write_cache_reconciliation_guards = self.write_cache_reconciliation.lock_all();
+        let mut page_cache_dirty_inodes: HashSet<u64> = self
+            .write_page_cache
+            .dirty_pages()
+            .into_iter()
+            .map(|key| key.inode)
+            .collect();
+        if let Some(ref writeback_page_cache) = self.writeback_page_cache {
+            page_cache_dirty_inodes.extend(
+                writeback_page_cache
+                    .dirty_pages()
+                    .into_iter()
+                    .map(|key| key.inode),
+            );
+        }
         let tracked_ranges = if let Some(ref tracker) = self.writeback_range_tracker {
             let mut tracker = tracker.lock().unwrap();
             let selected = tracker.collect_dirty_ranges();
@@ -8443,21 +8457,9 @@ impl FuseVfsAdapter {
         let sync_result = (|| {
             let e = self.engine.lock().unwrap();
 
-            // Phase 1: drain all dirty page-cache pages across all inodes
-            // through the PageCacheDirtyFlush::flush_all() bridge.
-            let synthetic_fh = EngineFileHandle::new(
-                InodeId::new(0),
-                0, // O_RDONLY — flush_all uses engine.write, handle unused for permission check
-                FileHandleId::new(0),
-                0,
-            );
-            let bridge = crate::fuse_flush_fsync::PageCacheDirtyFlush::new(
-                self.writeback_page_cache.as_ref(),
-                &**e,
-                &synthetic_fh,
-                ctx,
-            );
-            tidefs_local_filesystem::fuse_fsync::map_cache_error(bridge.flush_all())?;
+            // Adapter page-cache entries mirror writes that already reached the
+            // engine. Keep those mirrors dirty until the engine, TXG, and final
+            // sync barriers have all succeeded below.
 
             // Phase 2: filesystem-wide durability barrier through the engine.
             e.syncfs(ctx)?;
@@ -8505,6 +8507,13 @@ impl FuseVfsAdapter {
         sync_result?;
         if tracker_completion_failed {
             return Err(Errno::EIO);
+        }
+        for ino in page_cache_dirty_inodes {
+            if let Some(ref writeback_page_cache) = self.writeback_page_cache {
+                writeback_page_cache.clear_dirty_for_inode(ino);
+            }
+            self.write_page_cache.clear_dirty_for_inode(ino);
+            self.reconcile_writeback_inode_cache_after_authoritative_range(ino);
         }
 
         self.writeback_cache_stats.lock().unwrap().record_flush();
@@ -42082,8 +42091,10 @@ mod tests {
 
     #[test]
     fn dispatch_syncfs_drains_all_writeback_range_tracker_inodes() {
-        let (fixture, tracker) = adapter_fixture_with_writeback_tracker();
+        let (mut fixture, tracker) = adapter_fixture_with_writeback_tracker();
         let ctx = root_ctx();
+        let writeback_page_cache = Arc::new(PageCache::new(8, 4096));
+        fixture.adapter.writeback_page_cache = Some(Arc::clone(&writeback_page_cache));
 
         // Create two files and write dirty data to both.
         let (ino_a, fh_a, _efh_a) = create_adapter_file_handle(
@@ -42117,6 +42128,18 @@ mod tests {
             .lock()
             .unwrap()
             .mark_dirty(ino_b, 0, b"BBBB".len() as u64);
+        for inode in [ino_a, ino_b] {
+            let _ = writeback_page_cache
+                .insert(inode.get(), 0)
+                .expect("insert writeback mirror");
+            writeback_page_cache.mark_dirty(inode.get(), 0);
+            let _ = fixture
+                .adapter
+                .write_page_cache
+                .insert(inode.get(), 0)
+                .expect("insert adapter write mirror");
+            fixture.adapter.write_page_cache.mark_dirty(inode.get(), 0);
+        }
         assert!(tracker.lock().unwrap().is_dirty(ino_a));
         assert!(tracker.lock().unwrap().is_dirty(ino_b));
 
@@ -42125,6 +42148,13 @@ mod tests {
 
         assert!(!tracker.lock().unwrap().is_dirty(ino_a));
         assert!(!tracker.lock().unwrap().is_dirty(ino_b));
+        for inode in [ino_a, ino_b] {
+            assert!(!writeback_page_cache.has_dirty_pages_for_inode(inode.get()));
+            assert!(!fixture
+                .adapter
+                .write_page_cache
+                .has_dirty_pages_for_inode(inode.get()));
+        }
     }
 
     #[test]
@@ -42140,8 +42170,23 @@ mod tests {
         adapter.writeback_range_tracker = Some(Arc::clone(&tracker));
         let inode = InodeId::new(41);
         tracker.lock().unwrap().mark_dirty(inode, 1024, 2048);
+        let writeback_page_cache = Arc::new(PageCache::new(8, 4096));
+        let _ = writeback_page_cache
+            .insert(inode.get(), 0)
+            .expect("insert writeback mirror");
+        writeback_page_cache.mark_dirty(inode.get(), 0);
+        adapter.writeback_page_cache = Some(Arc::clone(&writeback_page_cache));
+        let _ = adapter
+            .write_page_cache
+            .insert(inode.get(), 0)
+            .expect("insert adapter write mirror");
+        adapter.write_page_cache.mark_dirty(inode.get(), 0);
 
         assert_eq!(adapter.dispatch_syncfs(&root_ctx()), Err(Errno::EIO));
+        assert!(writeback_page_cache.has_dirty_pages_for_inode(inode.get()));
+        assert!(adapter
+            .write_page_cache
+            .has_dirty_pages_for_inode(inode.get()));
 
         let tracker = tracker.lock().unwrap();
         let ranges = tracker
