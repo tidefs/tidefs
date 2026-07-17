@@ -3756,8 +3756,10 @@ impl KernelEngine {
     const ENGINE_INTENT_BUFFER_MAX_ENTRIES: usize = 256;
     const ENGINE_INTENT_BUFFER_MAX_BYTES: usize = 256 * 1024;
     const ENGINE_NAMESPACE_SNAPSHOT_MAGIC: [u8; 4] = *b"VNS1";
-    const ENGINE_NAMESPACE_SNAPSHOT_VERSION: u32 = 3;
-    const ENGINE_NAMESPACE_SNAPSHOT_HEADER_BYTES: usize = 72;
+    const ENGINE_NAMESPACE_SNAPSHOT_VERSION: u32 = 4;
+    const ENGINE_NAMESPACE_SNAPSHOT_HEADER_BYTES: usize =
+        crate::replay_integration::NAMESPACE_SNAPSHOT_HASH_END
+            + crate::replay_integration::NAMESPACE_SNAPSHOT_ROOT_WIRE_SIZE;
     const ENGINE_NAMESPACE_INODE_RECORD_BYTES: usize = 80;
     const ENGINE_NAMESPACE_DIRENT_RECORD_BYTES: usize = 24;
     const ENGINE_NAMESPACE_SECTION_LIVE_DATA: u8 = 1;
@@ -3890,6 +3892,28 @@ impl KernelEngine {
             .saturating_mul(1_000_000_000)
     }
 
+    fn namespace_snapshot_root(
+        &self,
+    ) -> core::result::Result<
+        crate::replay_integration::NamespaceSnapshotRoot,
+        crate::tidefs_kmod_bridge::kernel_types::Errno,
+    > {
+        let imported = self
+            .pool_core
+            .as_ref()
+            .and_then(|pool| pool.imported_root())
+            .ok_or(crate::tidefs_kmod_bridge::kernel_types::Errno::EIO)?;
+        Ok(crate::replay_integration::NamespaceSnapshotRoot::new(
+            imported.pool_uuid,
+            imported.committed_txg,
+            imported.root_ino,
+            imported.inode_table_root,
+            imported.extent_map_root,
+            imported.replay_cursor.intent_log_head,
+            self.intent_log_tail.get(),
+        ))
+    }
+
     fn persist_namespace_snapshot(
         &self,
     ) -> core::result::Result<(), crate::tidefs_kmod_bridge::kernel_types::Errno> {
@@ -3912,6 +3936,7 @@ impl KernelEngine {
             self.ensure_root_inode(io.root_ino, ss);
         }
         self.normalize_all_live_extents()?;
+        let snapshot_root = self.namespace_snapshot_root()?;
 
         let byte_offset = io
             .data_area_offset
@@ -4079,9 +4104,6 @@ impl KernelEngine {
             .map_err(|_| crate::tidefs_kmod_bridge::kernel_types::Errno::EOVERFLOW)?;
         let next_ino = self.next_ino.get().max(max_ino.saturating_add(1)).max(2);
         let next_cookie = self.next_dir_cookie.get().max(1);
-        let payload_hash: [u8; 32] =
-            crate::blake3::hash(&image[Self::ENGINE_NAMESPACE_SNAPSHOT_HEADER_BYTES..]).into();
-
         image[0..4].copy_from_slice(&Self::ENGINE_NAMESPACE_SNAPSHOT_MAGIC);
         image[4..8].copy_from_slice(&Self::ENGINE_NAMESPACE_SNAPSHOT_VERSION.to_le_bytes());
         image[8..12].copy_from_slice(&inode_count.to_le_bytes());
@@ -4090,7 +4112,17 @@ impl KernelEngine {
         image[24..28].copy_from_slice(&next_cookie.to_le_bytes());
         image[28..32].copy_from_slice(&0u32.to_le_bytes());
         image[32..40].copy_from_slice(&payload_len.to_le_bytes());
-        image[40..72].copy_from_slice(&payload_hash);
+        snapshot_root
+            .encode(
+                &mut image[crate::replay_integration::NAMESPACE_SNAPSHOT_HASH_END
+                    ..Self::ENGINE_NAMESPACE_SNAPSHOT_HEADER_BYTES],
+            )
+            .map_err(|_| crate::tidefs_kmod_bridge::kernel_types::Errno::EINVAL)?;
+        let snapshot_hash = crate::replay_integration::namespace_snapshot_digest(&image)
+            .map_err(|_| crate::tidefs_kmod_bridge::kernel_types::Errno::EINVAL)?;
+        image[crate::replay_integration::NAMESPACE_SNAPSHOT_HASH_OFFSET
+            ..crate::replay_integration::NAMESPACE_SNAPSHOT_HASH_END]
+            .copy_from_slice(&snapshot_hash);
 
         let write_len = u32::try_from(image.len())
             .map_err(|_| crate::tidefs_kmod_bridge::kernel_types::Errno::EOVERFLOW)?;
@@ -4162,7 +4194,12 @@ impl KernelEngine {
 
         let mut header_cursor = 4usize;
         let version = Self::read_snapshot_u32(&header, &mut header_cursor)?;
-        if version == 0 || version > Self::ENGINE_NAMESPACE_SNAPSHOT_VERSION {
+        if version != Self::ENGINE_NAMESPACE_SNAPSHOT_VERSION {
+            kernel::pr_err!(
+                "tidefs_posix_vfs: refusing namespace snapshot version={} expected={}\n",
+                version,
+                Self::ENGINE_NAMESPACE_SNAPSHOT_VERSION,
+            );
             return Err(crate::tidefs_kmod_bridge::kernel_types::Errno::EINVAL);
         }
         let inode_count = Self::read_snapshot_u32(&header, &mut header_cursor)?;
@@ -4179,8 +4216,37 @@ impl KernelEngine {
             return Err(crate::tidefs_kmod_bridge::kernel_types::Errno::EINVAL);
         }
 
+        let stored_root = crate::replay_integration::NamespaceSnapshotRoot::decode(
+            &header[crate::replay_integration::NAMESPACE_SNAPSHOT_HASH_END
+                ..Self::ENGINE_NAMESPACE_SNAPSHOT_HEADER_BYTES],
+        )
+        .map_err(|_| crate::tidefs_kmod_bridge::kernel_types::Errno::EINVAL)?;
+        let expected_root = self.namespace_snapshot_root()?;
+        if stored_root != expected_root {
+            kernel::pr_err!(
+                "tidefs_posix_vfs: refusing stale namespace snapshot pool_match={} selected txg={} root={} inode_root={} extent_root={} intent={}..{} stored txg={} root={} inode_root={} extent_root={} intent={}..{}\n",
+                u8::from(expected_root.pool_uuid == stored_root.pool_uuid),
+                expected_root.committed_txg,
+                expected_root.root_ino,
+                expected_root.inode_table_root,
+                expected_root.extent_map_root,
+                expected_root.intent_log_head,
+                expected_root.intent_log_tail,
+                stored_root.committed_txg,
+                stored_root.root_ino,
+                stored_root.inode_table_root,
+                stored_root.extent_map_root,
+                stored_root.intent_log_head,
+                stored_root.intent_log_tail,
+            );
+            return Err(crate::tidefs_kmod_bridge::kernel_types::Errno::EIO);
+        }
+
         let mut expected_hash = [0u8; 32];
-        expected_hash.copy_from_slice(&header[40..72]);
+        expected_hash.copy_from_slice(
+            &header[crate::replay_integration::NAMESPACE_SNAPSHOT_HASH_OFFSET
+                ..crate::replay_integration::NAMESPACE_SNAPSHOT_HASH_END],
+        );
         let mut image =
             crate::tidefs_kmod_bridge::kernel_types::KmodVec::from_elem(0u8, payload_len);
         if image.len() != payload_len {
@@ -4202,9 +4268,16 @@ impl KernelEngine {
         if &image[0..4] != &Self::ENGINE_NAMESPACE_SNAPSHOT_MAGIC {
             return Ok(false);
         }
-        let actual_hash: [u8; 32] =
-            crate::blake3::hash(&image[Self::ENGINE_NAMESPACE_SNAPSHOT_HEADER_BYTES..payload_len])
-                .into();
+        if image[..Self::ENGINE_NAMESPACE_SNAPSHOT_HEADER_BYTES]
+            != header[..Self::ENGINE_NAMESPACE_SNAPSHOT_HEADER_BYTES]
+        {
+            kernel::pr_err!(
+                "tidefs_posix_vfs: namespace snapshot header changed during import\n"
+            );
+            return Err(crate::tidefs_kmod_bridge::kernel_types::Errno::EIO);
+        }
+        let actual_hash = crate::replay_integration::namespace_snapshot_digest(&image)
+            .map_err(|_| crate::tidefs_kmod_bridge::kernel_types::Errno::EINVAL)?;
         if actual_hash != expected_hash {
             kernel::pr_err!("tidefs_posix_vfs: engine namespace snapshot checksum mismatch\n");
             return Err(crate::tidefs_kmod_bridge::kernel_types::Errno::EIO);

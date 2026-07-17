@@ -31,6 +31,107 @@ const VRBT_HEADER_SIZE: usize = 56;
 pub const VRBT_WIRE_SIZE: usize = 88;
 const VRBT_HASH_OFFSET: usize = 56;
 
+// ── Namespace snapshot committed-root binding ────────────────────────
+
+/// Bytes used to bind a replayed namespace snapshot to one committed root.
+pub const NAMESPACE_SNAPSHOT_ROOT_WIRE_SIZE: usize = 80;
+
+/// Offset of the stored VNS1 digest within the namespace snapshot header.
+pub const NAMESPACE_SNAPSHOT_HASH_OFFSET: usize = 40;
+
+/// End of the stored VNS1 digest within the namespace snapshot header.
+pub const NAMESPACE_SNAPSHOT_HASH_END: usize = 72;
+
+/// Committed-root identity carried by a persisted kernel namespace snapshot.
+///
+/// The namespace snapshot is stored outside the VRBT block.  Carrying this
+/// identity makes import prove that the snapshot belongs to the selected pool,
+/// transaction group, object roots, and replay cursor before exposing it to
+/// mounted lookup/getattr/readdir/read paths.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NamespaceSnapshotRoot {
+    pub pool_uuid: [u8; 32],
+    pub committed_txg: u64,
+    pub root_ino: u64,
+    pub inode_table_root: u64,
+    pub extent_map_root: u64,
+    pub intent_log_head: u64,
+    pub intent_log_tail: u64,
+}
+
+impl NamespaceSnapshotRoot {
+    #[allow(clippy::too_many_arguments)]
+    pub const fn new(
+        pool_uuid: [u8; 32],
+        committed_txg: u64,
+        root_ino: u64,
+        inode_table_root: u64,
+        extent_map_root: u64,
+        intent_log_head: u64,
+        intent_log_tail: u64,
+    ) -> Self {
+        Self {
+            pool_uuid,
+            committed_txg,
+            root_ino,
+            inode_table_root,
+            extent_map_root,
+            intent_log_head,
+            intent_log_tail,
+        }
+    }
+
+    pub fn encode(self, out: &mut [u8]) -> Result<(), NamespaceSnapshotError> {
+        if out.len() < NAMESPACE_SNAPSHOT_ROOT_WIRE_SIZE {
+            return Err(NamespaceSnapshotError::BufferTooSmall);
+        }
+        out[0..32].copy_from_slice(&self.pool_uuid);
+        out[32..40].copy_from_slice(&self.committed_txg.to_le_bytes());
+        out[40..48].copy_from_slice(&self.root_ino.to_le_bytes());
+        out[48..56].copy_from_slice(&self.inode_table_root.to_le_bytes());
+        out[56..64].copy_from_slice(&self.extent_map_root.to_le_bytes());
+        out[64..72].copy_from_slice(&self.intent_log_head.to_le_bytes());
+        out[72..80].copy_from_slice(&self.intent_log_tail.to_le_bytes());
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, NamespaceSnapshotError> {
+        if bytes.len() < NAMESPACE_SNAPSHOT_ROOT_WIRE_SIZE {
+            return Err(NamespaceSnapshotError::BufferTooSmall);
+        }
+        let mut pool_uuid = [0u8; 32];
+        pool_uuid.copy_from_slice(&bytes[0..32]);
+        Ok(Self {
+            pool_uuid,
+            committed_txg: u64::from_le_bytes(bytes[32..40].try_into().unwrap()),
+            root_ino: u64::from_le_bytes(bytes[40..48].try_into().unwrap()),
+            inode_table_root: u64::from_le_bytes(bytes[48..56].try_into().unwrap()),
+            extent_map_root: u64::from_le_bytes(bytes[56..64].try_into().unwrap()),
+            intent_log_head: u64::from_le_bytes(bytes[64..72].try_into().unwrap()),
+            intent_log_tail: u64::from_le_bytes(bytes[72..80].try_into().unwrap()),
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NamespaceSnapshotError {
+    BufferTooSmall,
+}
+
+/// Hash a VNS1 namespace snapshot while excluding its stored digest slot.
+///
+/// Version 4 hashes both sides of the digest field, so counts, selected-root
+/// identity, replay cursor, and payload all remain integrity protected.
+pub fn namespace_snapshot_digest(image: &[u8]) -> Result<[u8; 32], NamespaceSnapshotError> {
+    if image.len() < NAMESPACE_SNAPSHOT_HASH_END {
+        return Err(NamespaceSnapshotError::BufferTooSmall);
+    }
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&image[..NAMESPACE_SNAPSHOT_HASH_OFFSET]);
+    hasher.update(&image[NAMESPACE_SNAPSHOT_HASH_END..]);
+    Ok(hasher.finalize().into())
+}
+
 // ── VrbtRoot ───────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -567,6 +668,61 @@ mod tests {
             decode_vrbt(&vrbt).unwrap_err(),
             VrbtError::HashMismatch
         ));
+    }
+
+    fn sample_namespace_snapshot_root() -> NamespaceSnapshotRoot {
+        NamespaceSnapshotRoot::new([0xAB; 32], 42, 1, 4096, 8192, 128, 512)
+    }
+
+    #[test]
+    fn namespace_snapshot_root_roundtrip() {
+        let expected = sample_namespace_snapshot_root();
+        let mut bytes = [0u8; NAMESPACE_SNAPSHOT_ROOT_WIRE_SIZE];
+
+        expected.encode(&mut bytes).unwrap();
+
+        assert_eq!(NamespaceSnapshotRoot::decode(&bytes).unwrap(), expected);
+    }
+
+    #[test]
+    fn namespace_snapshot_root_short_buffer_fails_closed() {
+        let expected = sample_namespace_snapshot_root();
+        let mut bytes = [0u8; NAMESPACE_SNAPSHOT_ROOT_WIRE_SIZE - 1];
+
+        assert_eq!(
+            expected.encode(&mut bytes).unwrap_err(),
+            NamespaceSnapshotError::BufferTooSmall
+        );
+        assert_eq!(
+            NamespaceSnapshotRoot::decode(&bytes).unwrap_err(),
+            NamespaceSnapshotError::BufferTooSmall
+        );
+    }
+
+    #[test]
+    fn namespace_snapshot_digest_covers_root_and_payload() {
+        let mut image = alloc::vec![0u8; 160];
+        sample_namespace_snapshot_root()
+            .encode(&mut image[NAMESPACE_SNAPSHOT_HASH_END..])
+            .unwrap();
+        image[152..].copy_from_slice(b"payload!");
+        let original = namespace_snapshot_digest(&image).unwrap();
+
+        image[NAMESPACE_SNAPSHOT_HASH_END] ^= 1;
+        assert_ne!(namespace_snapshot_digest(&image).unwrap(), original);
+        image[NAMESPACE_SNAPSHOT_HASH_END] ^= 1;
+        image[159] ^= 1;
+        assert_ne!(namespace_snapshot_digest(&image).unwrap(), original);
+    }
+
+    #[test]
+    fn namespace_snapshot_digest_excludes_stored_digest() {
+        let mut image = [0u8; 160];
+        let original = namespace_snapshot_digest(&image).unwrap();
+
+        image[NAMESPACE_SNAPSHOT_HASH_OFFSET] ^= 1;
+
+        assert_eq!(namespace_snapshot_digest(&image).unwrap(), original);
     }
 
     #[test]
