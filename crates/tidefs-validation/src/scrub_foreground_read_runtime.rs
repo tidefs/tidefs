@@ -46,7 +46,7 @@ const MOUNT_READY_TIMEOUT_SECS: u64 = 10;
 const FOREGROUND_READ_ARRIVAL_TICK: u64 = 1;
 const MAX_FOREGROUND_READ_WAIT_TICKS: u64 = 1;
 
-pub const SCRUB_READ_RESIDUAL_RISK: &str = "This row records a mounted FUSE foreground-read correctness workload while scrub work is configured and represented by bounded scrub queue/rate-limiter facts. It can support the runtime-scrub-read-artifact evidence class for the named claims, but it is not production performance readiness, broad scrub/repair correctness, kernel/uBLK/RDMA validation, crash recovery, release-candidate status, or a claim-status/product-wording change.";
+pub const SCRUB_READ_RESIDUAL_RISK: &str = "This row records a mounted FUSE foreground-read correctness workload while scrub work is configured. Its current pending and throttle facts come from a harness-only deterministic model, not live daemon scrub state, so they cannot make the row pass. A pass still requires mounted-userspace daemon observation. This row is not production performance readiness, broad scrub/repair correctness, kernel/uBLK/RDMA validation, crash recovery, release-candidate status, or a claim-status/product-wording change.";
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ScrubForegroundReadRuntimeEvidence {
@@ -160,6 +160,7 @@ pub struct ForegroundReadEvidence {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ScrubActivityEvidence {
+    pub observation_tier: ValidationTier,
     pub background_scrub_configured: bool,
     pub background_scrub_interval_secs: u64,
     pub scrub_units_requested: u32,
@@ -407,6 +408,7 @@ fn evidence_manifest_scope(evidence: &ScrubForegroundReadRuntimeEvidence) -> Str
         concat!(
             "row={} supported_claims={} non_claims={} outcome={:?} artifact={} ",
             "claim_status_change={} product_wording_change={} environment_refused={} ",
+            "scrub_activity_observation_tier={} ",
             "foreground_read_admitted_by_service_curve={} ",
             "foreground_read_refused_by_service_curve={} scrub_units_requested={} ",
             "scrub_units_admitted_by_service_curve={} ",
@@ -425,6 +427,7 @@ fn evidence_manifest_scope(evidence: &ScrubForegroundReadRuntimeEvidence) -> Str
         evidence.claim_status_change,
         evidence.product_wording_change,
         admission.environment_refused,
+        evidence.scrub_activity.observation_tier.label(),
         admission.foreground_read_admitted_by_service_curve,
         admission.foreground_read_refused_by_service_curve,
         admission.scrub_units_requested,
@@ -544,6 +547,7 @@ fn build_admission_state(
 
 fn scrub_activity_not_run(service_curve: &ServiceCurveEvidence) -> ScrubActivityEvidence {
     ScrubActivityEvidence {
+        observation_tier: ValidationTier::SourceModel,
         background_scrub_configured: false,
         background_scrub_interval_secs: BACKGROUND_SCRUB_INTERVAL_SECS,
         scrub_units_requested: SCRUB_UNITS_REQUESTED,
@@ -603,6 +607,7 @@ impl ScrubActivityWindow {
         let throttle_observed =
             throttle_count > 0 || !self.pre_read_attempt.accepted || !post_read_attempt.accepted;
         ScrubActivityEvidence {
+            observation_tier: ValidationTier::HarnessOnly,
             background_scrub_configured: true,
             background_scrub_interval_secs: BACKGROUND_SCRUB_INTERVAL_SECS,
             scrub_units_requested: SCRUB_UNITS_REQUESTED,
@@ -764,6 +769,7 @@ fn scrub_read_isolation_passed(
     service_curve: &ServiceCurveEvidence,
 ) -> bool {
     foreground_read.passed
+        && scrub_activity.observation_tier == ValidationTier::MountedUserspace
         && scrub_activity.background_scrub_configured
         && scrub_activity.pending_and_rate_limited_during_read
         && scrub_activity.scrub_deferred_by_service_curve > 0
@@ -997,13 +1003,35 @@ fn command_output(program: &str, args: &[&str]) -> Option<String> {
 mod tests {
     use super::*;
 
+    fn completed_foreground_read(service_curve: &ServiceCurveEvidence) -> ForegroundReadEvidence {
+        let payload = deterministic_payload(FOREGROUND_READ_BYTES);
+        let digest = digest_hex(&payload);
+        ForegroundReadEvidence {
+            workload_ran: true,
+            path: "protected-foreground-read.bin".to_string(),
+            bytes_written: payload.len(),
+            read_iterations: FOREGROUND_READ_ITERATIONS,
+            read_successes: FOREGROUND_READ_ITERATIONS,
+            correctness_checks: FOREGROUND_READ_ITERATIONS,
+            expected_digest: digest.clone(),
+            last_read_digest: Some(digest),
+            max_read_latency_micros: 1,
+            avg_read_latency_micros: 1,
+            service_curve_wait_bound_ticks: service_curve.max_foreground_read_wait_ticks,
+            service_curve_within_budget: true,
+            latency_budget_basis: latency_budget_basis(),
+            failures: Vec::new(),
+            passed: true,
+        }
+    }
+
     #[test]
     fn passed_manifest_has_no_blocking_issues() {
         assert!(evidence_manifest_blocking_issues(true).is_empty());
     }
 
     #[test]
-    fn raw_pass_without_effective_read_isolation_keeps_manifest_blocked() {
+    fn raw_pass_with_harness_only_scrub_state_keeps_manifest_blocked() {
         let service_curve = build_service_curve();
         let environment = RuntimeEnvironmentEvidence {
             host: "linux x86_64 kernel=test".to_string(),
@@ -1021,19 +1049,25 @@ mod tests {
             source_ref: "test-sha".to_string(),
             environment,
             mount: None,
-            foreground_read: ForegroundReadEvidence::not_run_with_failure(
-                service_curve.max_foreground_read_wait_ticks,
-                "foreground read did not run",
-            ),
-            scrub_activity: ScrubActivityWindow::begin().finish(&service_curve, false),
+            foreground_read: completed_foreground_read(&service_curve),
+            scrub_activity: scrub_activity_for_completed_read(&service_curve),
             service_curve,
         });
 
         assert_eq!(evidence.outcome, ValidationStatus::Pass);
+        assert!(evidence.foreground_read.passed);
+        assert_eq!(
+            evidence.scrub_activity.observation_tier,
+            ValidationTier::HarnessOnly
+        );
+        assert!(evidence.scrub_activity.pending_and_rate_limited_during_read);
         assert!(!evidence.passed);
-        assert!(!evidence.scrub_activity.pending_and_rate_limited_during_read);
+        assert!(evidence.assert_no_product_or_harness_failure().is_err());
 
         let manifest = build_evidence_manifest(&evidence, b"scrub evidence");
+        assert!(manifest
+            .scope
+            .contains("scrub_activity_observation_tier=harness-only"));
         assert_eq!(manifest.blocking_issues.len(), 1);
         assert_eq!(
             manifest.blocking_issues[0].repo.as_deref(),
@@ -1124,6 +1158,7 @@ mod tests {
         assert!(scope.contains("claim_status_change=false"));
         assert!(scope.contains("product_wording_change=false"));
         assert!(scope.contains("environment_refused=true"));
+        assert!(scope.contains("scrub_activity_observation_tier=source-model"));
         assert!(scope.contains("foreground_read_admitted_by_service_curve=true"));
         assert!(scope.contains("foreground_read_refused_by_service_curve=false"));
         assert!(scope.contains(&format!(
@@ -1237,6 +1272,7 @@ mod tests {
         );
 
         let scrub_activity = scrub_activity_for_completed_read(&service_curve);
+        assert_eq!(scrub_activity.observation_tier, ValidationTier::HarnessOnly);
         let environment = RuntimeEnvironmentEvidence {
             host: "linux x86_64 kernel=test".to_string(),
             dev_fuse_present: true,
@@ -1296,5 +1332,10 @@ mod tests {
         );
         assert!(scrub_activity.pending_and_rate_limited_during_read);
         assert!(scrub_activity.throttle_observed);
+        assert!(!scrub_read_isolation_passed(
+            &completed_foreground_read(&service_curve),
+            &scrub_activity,
+            &service_curve,
+        ));
     }
 }
