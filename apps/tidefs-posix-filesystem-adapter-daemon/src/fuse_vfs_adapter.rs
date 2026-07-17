@@ -39,7 +39,9 @@ use crate::workers_meta::{
     handle_lookup, posix_attrs_to_fuse_attr, AttrStore, FuseAttr, FuseAttrOut, InodeTable,
     LookupConfig, LookupErrorKind, LookupOutcome, MetaError, MetaReplySink, StatfsFields,
 };
-use crate::workers_writeback::WritebackCacheStats;
+use crate::workers_writeback::{
+    DirtyPageTracker as WorkerDirtyPageTracker, FsyncBoundaryToken, WritebackCacheStats,
+};
 use crate::workload_observer::WorkloadObserver;
 use crate::write_dispatch::DaemonWriteDispatch;
 use crate::writeback_reclaim::WritebackInodeCache;
@@ -7609,6 +7611,17 @@ impl FuseVfsAdapter {
         tracker.lock().unwrap().clear_range(ino, offset, length);
     }
 
+    /// Seal the current worker dirty-range boundary for a caller-visible
+    /// barrier. Callers clear the returned boundary only after the complete
+    /// barrier succeeds; failures leave it retained for retry.
+    fn take_worker_dirty_boundary(
+        &self,
+    ) -> (Arc<Mutex<WorkerDirtyPageTracker>>, FsyncBoundaryToken) {
+        let tracker = self.write_dispatch.lock().unwrap().dirty_page_tracker_arc();
+        let boundary = tracker.lock().unwrap().take_boundary();
+        (tracker, boundary)
+    }
+
     fn dirty_trackers_overlap_range(&self, ino: u64, offset: u64, length: u64) -> bool {
         if length == 0 {
             return false;
@@ -8035,6 +8048,7 @@ impl FuseVfsAdapter {
         // with writes for this inode. Otherwise a write can start after the
         // engine flush and have its newly dirty mirror cleared below.
         let write_cache_reconciliation_guard = self.write_cache_reconciliation.lock(ino);
+        let (worker_dirty_tracker, worker_dirty_boundary) = self.take_worker_dirty_boundary();
 
         // Delegate writeback and engine.flush() through the
         // local-filesystem dispatch layer via PageCacheDirtyFlush.  This
@@ -8062,16 +8076,20 @@ impl FuseVfsAdapter {
         };
         flush_result?;
         release_result?;
+
+        // Retire both dirty-range projections before publishing clean cache
+        // state for this inode.
+        if let Some(ref tracker) = self.writeback_range_tracker {
+            tracker.lock().unwrap().flush_inode(InodeId::new(ino));
+        }
+        worker_dirty_tracker
+            .lock()
+            .unwrap()
+            .clear_until_boundary(ino, worker_dirty_boundary);
         self.sync_namespace_attrs_from_engine(ctx, ino, None);
         self.writeback_cache.lock().unwrap().mark_clean(ino);
         self.write_page_cache.clear_dirty_for_inode(ino);
         self.writeback_cache_stats.lock().unwrap().record_flush();
-
-        // Drain the DirtyPageTracker for this inode after writeback so
-        // the background flush service (#4657) sees a clean inode.
-        if let Some(ref tracker) = self.writeback_range_tracker {
-            tracker.lock().unwrap().flush_inode(InodeId::new(ino));
-        }
         drop(write_cache_reconciliation_guard);
 
         // Release POSIX locks owned by this lock_owner after flush
@@ -8132,6 +8150,7 @@ impl FuseVfsAdapter {
         // Serialize that completion with the same-inode write and mirror
         // reconciliation that created those projections.
         let _write_cache_reconciliation_guard = self.write_cache_reconciliation.lock(ino);
+        let (worker_dirty_tracker, worker_dirty_boundary) = self.take_worker_dirty_boundary();
         let tracked_ranges = if let Some(ref tracker) = self.writeback_range_tracker {
             let mut tracker = tracker.lock().unwrap();
             let selected = tracker
@@ -8306,6 +8325,10 @@ impl FuseVfsAdapter {
         if tracker_completion_failed {
             return Err(Errno::EIO);
         }
+        worker_dirty_tracker
+            .lock()
+            .unwrap()
+            .clear_until_boundary(ino, worker_dirty_boundary);
 
         if block_volume_dirty_state_flushed {
             let mut ds = self.dirty_state.lock().unwrap();
@@ -8343,6 +8366,7 @@ impl FuseVfsAdapter {
         datasync: bool,
     ) -> Result<(), Errno> {
         let _write_cache_reconciliation_guard = self.write_cache_reconciliation.lock(ino);
+        let (worker_dirty_tracker, worker_dirty_boundary) = self.take_worker_dirty_boundary();
         let e = self.engine.lock().unwrap();
         let handle = self.resolve_dir_handle(ino, fh, ctx, &**e)?;
         let tracked_ranges = if let Some(ref tracker) = self.writeback_range_tracker {
@@ -8402,6 +8426,10 @@ impl FuseVfsAdapter {
             return Err(Errno::EIO);
         }
         let directory_ino = handle.dh.inode_id.get();
+        worker_dirty_tracker
+            .lock()
+            .unwrap()
+            .clear_until_boundary(directory_ino, worker_dirty_boundary);
         if let Some(ref writeback_page_cache) = self.writeback_page_cache {
             writeback_page_cache.clear_dirty_for_inode(directory_ino);
         }
@@ -8423,6 +8451,7 @@ impl FuseVfsAdapter {
         // syncfs is the mount-wide barrier, so take every bounded stripe in
         // stable order before clearing any inode's dirty projections.
         let _write_cache_reconciliation_guards = self.write_cache_reconciliation.lock_all();
+        let (worker_dirty_tracker, worker_dirty_boundary) = self.take_worker_dirty_boundary();
         let mut page_cache_dirty_inodes: HashSet<u64> = self
             .write_page_cache
             .dirty_pages()
@@ -8504,6 +8533,10 @@ impl FuseVfsAdapter {
         if tracker_completion_failed {
             return Err(Errno::EIO);
         }
+        worker_dirty_tracker
+            .lock()
+            .unwrap()
+            .clear_all_until_boundary(worker_dirty_boundary);
         for ino in page_cache_dirty_inodes {
             if let Some(ref writeback_page_cache) = self.writeback_page_cache {
                 writeback_page_cache.clear_dirty_for_inode(ino);
@@ -26715,6 +26748,8 @@ mod tests {
         f.adapter
             .dispatch_write(&ctx, ino.get(), fh, 0, payload, 0)
             .expect("dispatch write");
+        let worker_tracker =
+            seed_worker_dirty_range(&f.adapter, ino.get(), 0, payload.len() as u64);
         tracker
             .lock()
             .unwrap()
@@ -26743,6 +26778,7 @@ mod tests {
             .adapter
             .write_page_cache
             .has_dirty_pages_for_inode(ino.get()));
+        assert!(worker_tracker.lock().unwrap().has_dirty_ranges(ino.get()));
 
         let tracker = tracker.lock().unwrap();
         let ranges = tracker
@@ -41807,6 +41843,25 @@ mod tests {
         (fixture, tracker)
     }
 
+    fn seed_worker_dirty_range(
+        adapter: &FuseVfsAdapter,
+        ino: u64,
+        offset: u64,
+        length: u64,
+    ) -> Arc<Mutex<WorkerDirtyPageTracker>> {
+        let tracker = adapter
+            .write_dispatch
+            .lock()
+            .unwrap()
+            .dirty_page_tracker_arc();
+        tracker
+            .lock()
+            .unwrap()
+            .mark_dirty(ino, offset, length)
+            .expect("seed worker dirty range");
+        tracker
+    }
+
     #[test]
     fn dispatch_flush_drains_writeback_range_tracker() {
         let (mut fixture, tracker) = adapter_fixture_with_writeback_tracker();
@@ -41831,10 +41886,13 @@ mod tests {
             .lock()
             .unwrap()
             .mark_dirty(inode, 0, b"hello world".len() as u64);
+        let worker_tracker =
+            seed_worker_dirty_range(&fixture.adapter, ino, 0, b"hello world".len() as u64);
         assert!(
             tracker.lock().unwrap().is_dirty(inode),
             "tracker should be dirty before flush"
         );
+        assert!(worker_tracker.lock().unwrap().has_dirty_ranges(ino));
 
         // Flush the file handle.
         fixture
@@ -41847,6 +41905,7 @@ mod tests {
             !tracker.lock().unwrap().is_dirty(inode),
             "tracker should be clean after flush"
         );
+        assert!(!worker_tracker.lock().unwrap().has_dirty_ranges(ino));
     }
 
     #[test]
@@ -41872,7 +41931,10 @@ mod tests {
             .lock()
             .unwrap()
             .mark_dirty(inode, 0, b"fsync data".len() as u64);
+        let worker_tracker =
+            seed_worker_dirty_range(&fixture.adapter, ino, 0, b"fsync data".len() as u64);
         assert!(tracker.lock().unwrap().is_dirty(inode));
+        assert!(worker_tracker.lock().unwrap().has_dirty_ranges(ino));
 
         fixture
             .adapter
@@ -41880,6 +41942,7 @@ mod tests {
             .expect("fsync");
 
         assert!(!tracker.lock().unwrap().is_dirty(inode));
+        assert!(!worker_tracker.lock().unwrap().has_dirty_ranges(ino));
     }
 
     #[test]
@@ -42111,6 +42174,7 @@ mod tests {
         {
             tracker.lock().unwrap().mark_dirty(root, 0, 4096);
         }
+        let worker_tracker = seed_worker_dirty_range(&fixture.adapter, root.get(), 0, 4096);
         let _ = writeback_page_cache
             .insert(root.get(), 0)
             .expect("insert directory writeback mirror");
@@ -42132,6 +42196,7 @@ mod tests {
         );
 
         assert!(!tracker.lock().unwrap().is_dirty(root));
+        assert!(!worker_tracker.lock().unwrap().has_dirty_ranges(root.get()));
         assert!(!writeback_page_cache.has_dirty_pages_for_inode(root.get()));
         assert!(!fixture
             .adapter
@@ -42159,6 +42224,7 @@ mod tests {
         let dh = EngineDirHandle::new(inode, DirHandleId::new(7));
         adapter.dir_handles.lock().unwrap().insert(dh);
         tracker.lock().unwrap().mark_dirty(inode, 1024, 2048);
+        let worker_tracker = seed_worker_dirty_range(&adapter, inode.get(), 1024, 2048);
         let writeback_page_cache = Arc::new(PageCache::new(8, 4096));
         let _ = writeback_page_cache
             .insert(inode.get(), 0)
@@ -42179,6 +42245,7 @@ mod tests {
         assert!(adapter
             .write_page_cache
             .has_dirty_pages_for_inode(inode.get()));
+        assert!(worker_tracker.lock().unwrap().has_dirty_ranges(inode.get()));
 
         let tracker = tracker.lock().unwrap();
         let ranges = tracker
@@ -42231,6 +42298,14 @@ mod tests {
             .lock()
             .unwrap()
             .mark_dirty(ino_b, 0, b"BBBB".len() as u64);
+        let worker_tracker =
+            seed_worker_dirty_range(&fixture.adapter, ino_a.get(), 0, b"AAAA".len() as u64);
+        {
+            let mut worker_tracker = worker_tracker.lock().unwrap();
+            worker_tracker
+                .mark_dirty(ino_b.get(), 0, b"BBBB".len() as u64)
+                .expect("seed worker range B");
+        }
         for inode in [ino_a, ino_b] {
             let _ = writeback_page_cache
                 .insert(inode.get(), 0)
@@ -42251,6 +42326,8 @@ mod tests {
 
         assert!(!tracker.lock().unwrap().is_dirty(ino_a));
         assert!(!tracker.lock().unwrap().is_dirty(ino_b));
+        assert!(!worker_tracker.lock().unwrap().has_dirty_ranges(ino_a.get()));
+        assert!(!worker_tracker.lock().unwrap().has_dirty_ranges(ino_b.get()));
         for inode in [ino_a, ino_b] {
             assert!(!writeback_page_cache.has_dirty_pages_for_inode(inode.get()));
             assert!(!fixture
@@ -42273,6 +42350,7 @@ mod tests {
         adapter.writeback_range_tracker = Some(Arc::clone(&tracker));
         let inode = InodeId::new(41);
         tracker.lock().unwrap().mark_dirty(inode, 1024, 2048);
+        let worker_tracker = seed_worker_dirty_range(&adapter, inode.get(), 1024, 2048);
         let writeback_page_cache = Arc::new(PageCache::new(8, 4096));
         let _ = writeback_page_cache
             .insert(inode.get(), 0)
@@ -42290,6 +42368,7 @@ mod tests {
         assert!(adapter
             .write_page_cache
             .has_dirty_pages_for_inode(inode.get()));
+        assert!(worker_tracker.lock().unwrap().has_dirty_ranges(inode.get()));
 
         let tracker = tracker.lock().unwrap();
         let ranges = tracker
