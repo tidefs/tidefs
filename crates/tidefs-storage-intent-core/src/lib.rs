@@ -5238,6 +5238,16 @@ pub enum AuthorityEvent {
     NetworkPartition = 5,
     FencingAmbiguity = 6,
     ReplayAfterDurableIntent = 7,
+    /// The persistent-memory device or namespace is no longer usable.
+    PmemMediaFailure = 8,
+    /// The sampled platform persistence domain no longer matches the receipt.
+    PmemPersistenceDomainMismatch = 9,
+    /// Byte or metadata cache lines did not reach the persistence domain.
+    PmemIncompleteFlush = 10,
+    /// An uncorrectable persistent-memory error invalidated the bytes.
+    PmemUncorrectableMediaError = 11,
+    /// The durable metadata locator needed to recover the bytes was lost.
+    PmemMetadataLoss = 12,
 }
 
 /// Set of failure/recovery events for authority explanation.
@@ -5247,6 +5257,19 @@ pub struct AuthorityEventMask(pub u32);
 
 impl AuthorityEventMask {
     pub const EMPTY: Self = Self(0);
+
+    /// Loss events every emitted persistent-memory receipt must name.
+    pub const PMEM_DURABLE_LOSS_BOUNDARY: Self = Self::from_event(AuthorityEvent::PmemMediaFailure)
+        .with(AuthorityEvent::PmemPersistenceDomainMismatch)
+        .with(AuthorityEvent::PmemIncompleteFlush)
+        .with(AuthorityEvent::PmemUncorrectableMediaError)
+        .with(AuthorityEvent::PmemMetadataLoss);
+
+    /// Restart and power-loss events complete PMem evidence must survive.
+    pub const PMEM_DURABLE_SURVIVAL_BOUNDARY: Self = Self::from_event(AuthorityEvent::ProcessCrash)
+        .with(AuthorityEvent::DaemonRestart)
+        .with(AuthorityEvent::HostCrash)
+        .with(AuthorityEvent::PowerLoss);
 
     /// Construct a one-event mask.
     #[must_use]
@@ -5264,6 +5287,12 @@ impl AuthorityEventMask {
     #[must_use]
     pub const fn contains(self, event: AuthorityEvent) -> bool {
         (self.0 & (1_u32 << event as u8)) != 0
+    }
+
+    /// Returns true if this mask contains every event in `required`.
+    #[must_use]
+    pub const fn contains_all(self, required: Self) -> bool {
+        (self.0 & required.0) == required.0
     }
 }
 
@@ -5838,7 +5867,12 @@ pub struct RamAuthorityRecord {
     pub quorum_intent_ref: StorageIntentEvidenceRef,
     pub ordering_ref: StorageIntentEvidenceRef,
     pub placement_ref: StorageIntentEvidenceRef,
+    /// Persisted PMem byte-range and flush/fence authority evidence.
     pub pmem_ref: StorageIntentEvidenceRef,
+    /// Persisted metadata locator for the PMem range and generation.
+    pub pmem_metadata_ref: StorageIntentEvidenceRef,
+    /// Recovery scan result for the PMem range and generation.
+    pub pmem_recovery_ref: StorageIntentEvidenceRef,
     pub transport_ref: StorageIntentEvidenceRef,
     pub membership_epoch_ref: StorageIntentEvidenceRef,
     pub fencing_ref: StorageIntentEvidenceRef,
@@ -5869,6 +5903,8 @@ impl Default for RamAuthorityRecord {
             ordering_ref: StorageIntentEvidenceRef::default(),
             placement_ref: StorageIntentEvidenceRef::default(),
             pmem_ref: StorageIntentEvidenceRef::default(),
+            pmem_metadata_ref: StorageIntentEvidenceRef::default(),
+            pmem_recovery_ref: StorageIntentEvidenceRef::default(),
             transport_ref: StorageIntentEvidenceRef::default(),
             membership_epoch_ref: StorageIntentEvidenceRef::default(),
             fencing_ref: StorageIntentEvidenceRef::default(),
@@ -5926,17 +5962,11 @@ pub const fn ram_authority_satisfies_durable_posix_barrier(
             }
             ReceiptPredicateResult::SATISFIED
         }
-        RamAuthorityClass::PmemDurable => {
-            if evidence_ref_has_id(record.pmem_ref) {
-                ReceiptPredicateResult::SATISFIED
-            } else {
-                ReceiptPredicateResult::refused(StorageIntentRefusalReason::PmemFlushFenceMissing)
-            }
-        }
+        RamAuthorityClass::PmemDurable => ram_authority_receipt_is_emit_ready(record),
     }
 }
 
-/// Evaluate whether a runtime RAM authority record is complete enough to emit.
+/// Evaluate whether a runtime RAM or PMem authority record is complete enough to emit.
 #[must_use]
 pub const fn ram_authority_receipt_is_emit_ready(
     record: RamAuthorityRecord,
@@ -5946,9 +5976,6 @@ pub const fn ram_authority_receipt_is_emit_ready(
     }
     if record.authority_class as u8 == RamAuthorityClass::NonAuthoritativeCache as u8 {
         return ReceiptPredicateResult::refused(StorageIntentRefusalReason::CacheCannotBeAuthority);
-    }
-    if record.authority_class as u8 == RamAuthorityClass::PmemDurable as u8 {
-        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::MediaRoleNotAllowed);
     }
     if record.policy_id.is_zero()
         || record.policy_revision.0 == 0
@@ -5992,7 +6019,12 @@ pub const fn ram_authority_receipt_is_emit_ready(
             ReceiptPredicateResult::SATISFIED
         }
         RamAuthorityClass::PmemDurable => {
-            ReceiptPredicateResult::refused(StorageIntentRefusalReason::MediaRoleNotAllowed)
+            let refusal = record.pmem_emit_refusal();
+            if refusal as u16 == StorageIntentRefusalReason::None as u16 {
+                ReceiptPredicateResult::SATISFIED
+            } else {
+                ReceiptPredicateResult::refused(refusal)
+            }
         }
     }
 }
@@ -6040,6 +6072,69 @@ impl RamAuthorityRecord {
             self.earned_ack_class,
             StorageIntentGuaranteeClass::LocalIntent | StorageIntentGuaranteeClass::QuorumIntent
         )
+    }
+
+    /// Returns true when the PMem receipt names a local durable role.
+    #[must_use]
+    pub const fn earned_ack_class_is_pmem_durable(self) -> bool {
+        matches!(
+            self.earned_ack_class,
+            StorageIntentGuaranteeClass::LocalIntent | StorageIntentGuaranteeClass::FullPlacement
+        )
+    }
+
+    /// Return the first fail-closed reason blocking PMem receipt emission.
+    #[must_use]
+    pub const fn pmem_emit_refusal(self) -> StorageIntentRefusalReason {
+        if !self.earned_ack_class_is_pmem_durable() {
+            return StorageIntentRefusalReason::MediaRoleNotAllowed;
+        }
+        if !evidence_ref_has_kind(
+            self.media_capability_ref,
+            StorageIntentEvidenceKind::MediaCapabilityEvidence,
+        ) {
+            return StorageIntentRefusalReason::MissingMediaCapabilityEvidence;
+        }
+        if !evidence_ref_has_kind(
+            self.pmem_ref,
+            StorageIntentEvidenceKind::RamAuthorityEvidence,
+        ) || self.pmem_ref.generation != self.scope.generation
+        {
+            return StorageIntentRefusalReason::PmemFlushFenceMissing;
+        }
+        if !evidence_ref_has_kind(
+            self.ordering_ref,
+            StorageIntentEvidenceKind::OrderingEvidence,
+        ) {
+            return StorageIntentRefusalReason::MissingOrderingEvidence;
+        }
+        if self.ordering_ref.generation != self.scope.generation {
+            return StorageIntentRefusalReason::WrongOrderingRange;
+        }
+        if !evidence_ref_has_kind(
+            self.pmem_metadata_ref,
+            StorageIntentEvidenceKind::MetadataNamespaceEvidence,
+        ) || self.pmem_metadata_ref.generation != self.scope.generation
+        {
+            return StorageIntentRefusalReason::IncompleteMetadataDelta;
+        }
+        if !evidence_ref_has_kind(
+            self.pmem_recovery_ref,
+            StorageIntentEvidenceKind::LifecycleGenerationEvidence,
+        ) || self.pmem_recovery_ref.generation != self.scope.generation
+        {
+            return StorageIntentRefusalReason::StaleLifecycleEvidence;
+        }
+        if !self
+            .lost_if
+            .contains_all(AuthorityEventMask::PMEM_DURABLE_LOSS_BOUNDARY)
+            || !self
+                .survives
+                .contains_all(AuthorityEventMask::PMEM_DURABLE_SURVIVAL_BOUNDARY)
+        {
+            return StorageIntentRefusalReason::EvidenceNotUsable;
+        }
+        StorageIntentRefusalReason::None
     }
 
     /// Returns true when local or quorum durable intent evidence backs the RAM receipt.
@@ -10255,6 +10350,11 @@ impl_u8_canonical!(AuthorityEvent, {
     NetworkPartition = 5 => "network-partition",
     FencingAmbiguity = 6 => "fencing-ambiguity",
     ReplayAfterDurableIntent = 7 => "replay-after-durable-intent",
+    PmemMediaFailure = 8 => "pmem-media-failure",
+    PmemPersistenceDomainMismatch = 9 => "pmem-persistence-domain-mismatch",
+    PmemIncompleteFlush = 10 => "pmem-incomplete-flush",
+    PmemUncorrectableMediaError = 11 => "pmem-uncorrectable-media-error",
+    PmemMetadataLoss = 12 => "pmem-metadata-loss",
 });
 
 impl_u8_canonical!(WorkloadShape, {
@@ -24252,6 +24352,38 @@ mod tests {
         }
     }
 
+    fn pmem_generation_ref(kind: StorageIntentEvidenceKind, byte: u8) -> StorageIntentEvidenceRef {
+        StorageIntentEvidenceRef {
+            generation: capacity_scope().generation,
+            ..evidence_ref(kind, byte)
+        }
+    }
+
+    fn pmem_durable_emit_ready_base() -> RamAuthorityRecord {
+        RamAuthorityRecord {
+            authority_class: RamAuthorityClass::PmemDurable,
+            requested_guarantee: StorageIntentGuaranteeClass::LocalIntent,
+            earned_ack_class: StorageIntentGuaranteeClass::LocalIntent,
+            lost_if: AuthorityEventMask::PMEM_DURABLE_LOSS_BOUNDARY,
+            survives: AuthorityEventMask::PMEM_DURABLE_SURVIVAL_BOUNDARY,
+            ordering_ref: pmem_generation_ref(StorageIntentEvidenceKind::OrderingEvidence, 21),
+            pmem_ref: pmem_generation_ref(StorageIntentEvidenceKind::RamAuthorityEvidence, 22),
+            pmem_metadata_ref: pmem_generation_ref(
+                StorageIntentEvidenceKind::MetadataNamespaceEvidence,
+                23,
+            ),
+            pmem_recovery_ref: pmem_generation_ref(
+                StorageIntentEvidenceKind::LifecycleGenerationEvidence,
+                24,
+            ),
+            media_capability_ref: evidence_ref(
+                StorageIntentEvidenceKind::MediaCapabilityEvidence,
+                25,
+            ),
+            ..ram_authority_emit_ready_base()
+        }
+    }
+
     #[test]
     fn non_authoritative_cache_receipt_is_not_emit_ready() {
         let result = ram_authority_receipt_is_emit_ready(ram_authority_emit_ready_base());
@@ -24324,19 +24456,107 @@ mod tests {
     }
 
     #[test]
-    fn pmem_durable_receipt_is_not_emit_ready() {
-        let record = RamAuthorityRecord {
-            authority_class: RamAuthorityClass::PmemDurable,
-            pmem_ref: evidence_ref(StorageIntentEvidenceKind::MediaCapabilityEvidence, 8),
-            ..ram_authority_emit_ready_base()
-        };
-        let result = ram_authority_receipt_is_emit_ready(record);
+    fn pmem_durable_receipt_requires_complete_same_generation_evidence() {
+        let ready = pmem_durable_emit_ready_base();
 
-        assert!(!result.satisfied);
-        assert_eq!(
-            result.refusal,
-            StorageIntentRefusalReason::MediaRoleNotAllowed
-        );
+        assert!(ram_authority_receipt_is_emit_ready(ready).satisfied);
+        assert!(ram_authority_satisfies_durable_posix_barrier(ready).satisfied);
+
+        let missing_media_capability = RamAuthorityRecord {
+            media_capability_ref: StorageIntentEvidenceRef::default(),
+            ..ready
+        };
+        let wrong_pmem_kind = RamAuthorityRecord {
+            pmem_ref: pmem_generation_ref(StorageIntentEvidenceKind::MediaCapabilityEvidence, 26),
+            ..ready
+        };
+        let stale_pmem_generation = RamAuthorityRecord {
+            pmem_ref: evidence_ref(StorageIntentEvidenceKind::RamAuthorityEvidence, 27),
+            ..ready
+        };
+        let wrong_ordering_kind = RamAuthorityRecord {
+            ordering_ref: pmem_generation_ref(
+                StorageIntentEvidenceKind::MetadataNamespaceEvidence,
+                28,
+            ),
+            ..ready
+        };
+        let stale_ordering_generation = RamAuthorityRecord {
+            ordering_ref: evidence_ref(StorageIntentEvidenceKind::OrderingEvidence, 29),
+            ..ready
+        };
+        let wrong_metadata_kind = RamAuthorityRecord {
+            pmem_metadata_ref: pmem_generation_ref(StorageIntentEvidenceKind::OrderingEvidence, 30),
+            ..ready
+        };
+        let wrong_recovery_kind = RamAuthorityRecord {
+            pmem_recovery_ref: pmem_generation_ref(
+                StorageIntentEvidenceKind::RecoveryDegradationEvidence,
+                31,
+            ),
+            ..ready
+        };
+        let incomplete_loss_boundary = RamAuthorityRecord {
+            lost_if: AuthorityEventMask::from_event(AuthorityEvent::PmemMediaFailure),
+            ..ready
+        };
+        let incomplete_survival_boundary = RamAuthorityRecord {
+            survives: AuthorityEventMask::from_event(AuthorityEvent::PowerLoss),
+            ..ready
+        };
+        let volatile_ack = RamAuthorityRecord {
+            earned_ack_class: StorageIntentGuaranteeClass::VolatileLocal,
+            ..ready
+        };
+
+        for (record, refusal) in [
+            (
+                missing_media_capability,
+                StorageIntentRefusalReason::MissingMediaCapabilityEvidence,
+            ),
+            (
+                wrong_pmem_kind,
+                StorageIntentRefusalReason::PmemFlushFenceMissing,
+            ),
+            (
+                stale_pmem_generation,
+                StorageIntentRefusalReason::PmemFlushFenceMissing,
+            ),
+            (
+                wrong_ordering_kind,
+                StorageIntentRefusalReason::MissingOrderingEvidence,
+            ),
+            (
+                stale_ordering_generation,
+                StorageIntentRefusalReason::WrongOrderingRange,
+            ),
+            (
+                wrong_metadata_kind,
+                StorageIntentRefusalReason::IncompleteMetadataDelta,
+            ),
+            (
+                wrong_recovery_kind,
+                StorageIntentRefusalReason::StaleLifecycleEvidence,
+            ),
+            (
+                incomplete_loss_boundary,
+                StorageIntentRefusalReason::EvidenceNotUsable,
+            ),
+            (
+                incomplete_survival_boundary,
+                StorageIntentRefusalReason::EvidenceNotUsable,
+            ),
+            (
+                volatile_ack,
+                StorageIntentRefusalReason::MediaRoleNotAllowed,
+            ),
+        ] {
+            assert_eq!(ram_authority_receipt_is_emit_ready(record).refusal, refusal);
+            assert_eq!(
+                ram_authority_satisfies_durable_posix_barrier(record).refusal,
+                refusal
+            );
+        }
     }
 
     #[test]
