@@ -464,11 +464,12 @@ if [ "$REMOUNTED" -eq 1 ]; then
     sync -f "$TF2" 2>/dev/null || sync
 
     POST_STATUS="/tmp/post_remount_status.json"
-    if tidefsctl pool status "$POOL_NAME" --devices "$DEV0" "$DEV1" --json > "$POST_STATUS" 2>/tmp/post_remount_status.err \
-       && grep -q '"state"[[:space:]]*:[[:space:]]*"[^"]*"' "$POST_STATUS" 2>/dev/null; then
+    if tidefsctl pool status "$POOL_NAME" --json > "$POST_STATUS" 2>/tmp/post_remount_status.err \
+       && grep -q '"state"[[:space:]]*:[[:space:]]*"Active"' "$POST_STATUS" 2>/dev/null \
+       && grep -q '"owner_kind"[[:space:]]*:' "$POST_STATUS" 2>/dev/null; then
         pass "live_owner_status_visible"
     else
-        fail "live_owner_status_visible" "$(cat /tmp/post_remount_status.err 2>/dev/null)"
+        fail "live_owner_status_visible" "stdout=$(cat "$POST_STATUS" 2>/dev/null) stderr=$(cat /tmp/post_remount_status.err 2>/dev/null)"
     fi
 else
     blocked "live_owner_status_visible" "remount failed"
@@ -492,14 +493,6 @@ else
     blocked "post_remount_write_read" "remount failed"
 fi
 
-# Cleanup remount daemon
-if [ -n "$RPID" ]; then
-    kill "$RPID" 2>/dev/null || true
-    sleep 1
-    umount "$MNT" 2>/dev/null || true
-fi
-
-
 echo ""
 echo "--- Phase 14: Ownerless active-status refusal ---"
 
@@ -512,6 +505,15 @@ if [ "$REMOUNTED" -eq 1 ]; then
     fi
 else
     blocked "ownerless_active_status_refused" "remount failed"
+fi
+
+# Keep the remount owner alive through both status checks above. The
+# explicit-device check only exercises the active-owner refusal while that
+# owner interface is still reachable.
+if [ -n "$RPID" ]; then
+    kill "$RPID" 2>/dev/null || true
+    sleep 1
+    umount "$MNT" 2>/dev/null || true
 fi
 
 echo ""
