@@ -1859,10 +1859,11 @@ impl VfsLocalFileSystem {
         pool: &str,
         args: &LivePoolAdminArgs,
     ) -> LivePoolAdminResponse {
-        let workload =
-            live_admin_typed_optional_arg(args, "workload").unwrap_or("fuse-smoke-mount-quick");
-        let mount_adapter = live_admin_typed_optional_arg(args, "mount_adapter").unwrap_or("fuse");
-        let artifact_path = live_admin_typed_optional_arg(args, "artifact_path");
+        let (workload, mount_adapter, artifact_path) =
+            match live_performance_admission_snapshot_args(args) {
+                Ok(args) => args,
+                Err(err) => return live_admin_typed_error(err),
+            };
         let mut fs = self.fs.borrow_mut();
         let config = fs.admission_config();
         let snapshot = fs.take_admission_snapshot().as_evidence_record();
@@ -3448,14 +3449,39 @@ fn live_admin_optional_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
         .filter(|value| !value.is_empty())
 }
 
-fn live_admin_typed_optional_arg<'a>(args: &'a LivePoolAdminArgs, key: &str) -> Option<&'a str> {
-    args.0
-        .get(key)
-        .and_then(|value| match value {
-            LivePoolAdminArg::String(value) => Some(value.as_str()),
-            _ => None,
-        })
-        .filter(|value| !value.is_empty())
+fn live_performance_admission_snapshot_args(
+    args: &LivePoolAdminArgs,
+) -> Result<(&str, &str, Option<&str>), LivePoolAdminError> {
+    const ALLOWED: &[&str] = &["workload", "mount_adapter", "artifact_path"];
+    if let Some(name) = args.0.keys().find(|name| !ALLOWED.contains(&name.as_str())) {
+        return Err(LivePoolAdminError::malformed(format!(
+            "live-owner request has unsupported argument '{name}'"
+        )));
+    }
+
+    Ok((
+        live_admin_typed_optional_string_arg(args, "workload")?
+            .filter(|value| !value.is_empty())
+            .unwrap_or("fuse-smoke-mount-quick"),
+        live_admin_typed_optional_string_arg(args, "mount_adapter")?
+            .filter(|value| !value.is_empty())
+            .unwrap_or("fuse"),
+        live_admin_typed_optional_string_arg(args, "artifact_path")?
+            .filter(|value| !value.is_empty()),
+    ))
+}
+
+fn live_admin_typed_optional_string_arg<'a>(
+    args: &'a LivePoolAdminArgs,
+    key: &str,
+) -> Result<Option<&'a str>, LivePoolAdminError> {
+    match args.0.get(key) {
+        None | Some(LivePoolAdminArg::Null) => Ok(None),
+        Some(LivePoolAdminArg::String(value)) => Ok(Some(value.as_str())),
+        Some(_) => Err(LivePoolAdminError::malformed(format!(
+            "live-owner request argument '{key}' must be a string"
+        ))),
+    }
 }
 
 fn live_dataset_type_arg(args: &Value) -> Result<DatasetType, String> {
@@ -7085,6 +7111,41 @@ mod tests {
         assert_eq!(value["json"]["kind"], "unsupported_command");
         assert_eq!(value["json"]["command"], "pool");
         assert_eq!(value["json"]["operation"], "status");
+    }
+
+    #[test]
+    fn live_performance_admission_snapshot_rejects_malformed_args() {
+        let (engine, _td) = temp_fs();
+
+        for (name, value, detail) in [
+            (
+                "workload",
+                LivePoolAdminArg::Bool(true),
+                "argument 'workload' must be a string",
+            ),
+            (
+                "unexpected",
+                LivePoolAdminArg::String("ignored".to_string()),
+                "unsupported argument 'unexpected'",
+            ),
+        ] {
+            let mut request = LivePoolAdminRequest::new(
+                LivePoolAdminCommand::PerformanceAdmissionSnapshot,
+                "tank",
+            );
+            request.args.0.insert(name.to_string(), value);
+            let response = engine
+                .handle_live_pool_admin_request(&request)
+                .expect("dispatch live admin request");
+            let response = live_admin_response_to_assertion_json(response);
+
+            assert_eq!(response["ok"], false);
+            assert_eq!(response["exit_code"], 2);
+            assert_eq!(response["json"]["kind"], "malformed");
+            assert!(response["error"]
+                .as_str()
+                .is_some_and(|message| message.contains(detail)));
+        }
     }
 
     #[test]
