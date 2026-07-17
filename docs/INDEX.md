@@ -64,20 +64,35 @@ product-admission decision on their own.
 
 Current authority families:
 
-- Kernel and mounted data authority: `docs/KERNEL_RESIDENCY_AUTHORITY.md`,
-  `docs/MOUNTED_TRANSFORM_AUTHORITY_RAW_STORE_INVENTORY.md`,
-  `docs/TIMESTAMP_GENERATION_AUTHORITY.md`, and
-  `docs/INODE_NAMESPACE_AUTHORITY.md`.
+- Namespace, version, and transform boundaries:
+  `docs/INODE_NAMESPACE_AUTHORITY.md`,
+  `docs/TIMESTAMP_GENERATION_AUTHORITY.md`,
+  `docs/CONTENT_OBJECT_VERSION_AUTHORITY.md`,
+  `docs/SEND_RECEIVE_VERSION_AUTHORITY.md`,
+  `docs/TRANSFORM_PIPELINE_AUTHORITY.md`, and
+  `docs/MOUNTED_TRANSFORM_AUTHORITY_RAW_STORE_INVENTORY.md`.
+- Capacity, cache, and durability: `docs/CAPACITY_ACCOUNTING_AUTHORITY.md`,
+  `docs/PAGE_CACHE_WRITEBACK_AUTHORITY.md`, and
+  `docs/PAGE_CACHE_INVALIDATION_AUTHORITY.md`.
+- Storage lifecycle and maintenance:
+  `docs/POOL_IMPORT_EXPORT_DEVICE_TOPOLOGY_DESIGN.md`,
+  `docs/DEVICE_LIFECYCLE_REMANENCE_AUTHORITY.md`,
+  `docs/SNAPSHOT_CLONE_DEADLIST_AUTHORITY.md`,
+  `docs/SCRUB_IDENTITY_AUTHORITY.md`, and
+  `docs/BACKGROUND_SERVICE_FRAMEWORK_DESIGN.md`.
+- Kernel and mounted-path boundaries: `docs/KERNEL_RESIDENCY_AUTHORITY.md`,
+  `docs/KERNEL_RESIDENT_POOL_ENGINE_ARCHITECTURE.md`, and
+  `docs/FUSE_ADAPTER_CONTRACT_ASSUMPTIONS.md`.
+- Transport and distributed records: `docs/TRANSPORT_CLUSTER_AUTHORITY.md`,
+  `docs/CROSS_REPLICA_SCRUB_COMPARISON_DESIGN.md`, and
+  `docs/LOCAL_DISTRIBUTED_RECEIPT_AUTHORITY.md`.
 - Storage intent and receipts: `docs/STORAGE_INTENT_POLICY_AUTHORITY.md`,
   `docs/STORAGE_INTENT_SERVICE_OBJECTIVE_DESIGN.md`,
-  `docs/STORAGE_INTENT_RESULT_REFUSAL_EVIDENCE_DESIGN.md`, and
-  `docs/LOCAL_DISTRIBUTED_RECEIPT_AUTHORITY.md`.
-- Focused source-backed subsystem summaries:
-  `docs/BACKGROUND_SERVICE_FRAMEWORK_DESIGN.md`,
-  `docs/POOL_IMPORT_EXPORT_DEVICE_TOPOLOGY_DESIGN.md`, and
-  `docs/SCRUB_IDENTITY_AUTHORITY.md`.
-- Operator and API surfaces: `docs/OPERATOR_UAPI_AUTHORITY.md`,
+  and `docs/STORAGE_INTENT_RESULT_REFUSAL_EVIDENCE_DESIGN.md`.
+- Operator, block, and API surfaces: `docs/OPERATOR_UAPI_AUTHORITY.md`,
   `docs/OPERATOR_PRODUCT_SURFACE_DECISION.md`, `docs/REQUEST_CONTRACT.md`,
+  `docs/PREVIEW_UAPI_ABI_BOUNDARY_OW202.md`,
+  `docs/BLOCK_VOLUME_UBLK_STARTED_EXPORT_ADMISSION_BOUNDARY_ISSUE_341.md`,
   `docs/CONTROL_FORMAT_AND_JSON_POLICY.md`, and
   `docs/TRACE_ORACLE_ARTIFACT_SCHEMA.md`.
 - Validation, CI, and workspace policy: `CONTRIBUTING.md`,
