@@ -429,8 +429,7 @@ mod tests {
     }
 
     fn new_projection() -> WritebackProjection {
-        let notifier = Arc::new(Mutex::new(None));
-        let mmap = Arc::new(MmapCoherency::new(notifier));
+        let mmap = Arc::new(MmapCoherency::new_for_test(|_| Ok(())));
         WritebackProjection::new(None, mmap)
     }
 
@@ -606,8 +605,7 @@ mod tests {
 
     #[test]
     fn installed_mmap_dirty_check_defers_invalidation_until_clean() {
-        let notifier = Arc::new(Mutex::new(None));
-        let mmap = Arc::new(MmapCoherency::new(notifier));
+        let mmap = Arc::new(MmapCoherency::new_for_test(|_| Ok(())));
         let projection = Arc::new(WritebackProjection::new(None, Arc::clone(&mmap)));
         projection.install_mmap_dirty_check();
 
@@ -632,8 +630,7 @@ mod tests {
 
     #[test]
     fn installed_mmap_dirty_check_does_not_form_reference_cycle() {
-        let notifier = Arc::new(Mutex::new(None));
-        let mmap = Arc::new(MmapCoherency::new(notifier));
+        let mmap = Arc::new(MmapCoherency::new_for_test(|_| Ok(())));
         let projection = Arc::new(WritebackProjection::new(None, Arc::clone(&mmap)));
         let mmap_weak = Arc::downgrade(&mmap);
         let projection_weak = Arc::downgrade(&projection);
@@ -692,8 +689,7 @@ mod tests {
         page_cache.insert(ino, 0).expect("insert dirty page");
         assert!(page_cache.mark_dirty(ino, 0));
 
-        let notifier = Arc::new(Mutex::new(None));
-        let mmap = Arc::new(MmapCoherency::new(notifier));
+        let mmap = Arc::new(MmapCoherency::new_for_test(|_| Ok(())));
         let projection = WritebackProjection::new(Some(Arc::clone(&page_cache)), mmap);
 
         assert_eq!(projection.page_cache_dirty_bytes(ino), page_size as u64);

@@ -16,6 +16,7 @@
 //! with a higher generation, the kernel page cache is invalidated.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -30,6 +31,7 @@ pub struct MmapCoherencyStats {
     pub mmap_deregistrations: AtomicU64,
     pub invalidations_received: AtomicU64,
     pub dirty_invalidations_preserved: AtomicU64,
+    pub notification_failures: AtomicU64,
     pub pages_invalidated: AtomicU64,
     pub coherency_conflicts: AtomicU64,
 }
@@ -47,6 +49,7 @@ impl MmapCoherencyStats {
             dirty_invalidations_preserved: self
                 .dirty_invalidations_preserved
                 .load(Ordering::Relaxed),
+            notification_failures: self.notification_failures.load(Ordering::Relaxed),
             pages_invalidated: self.pages_invalidated.load(Ordering::Relaxed),
             coherency_conflicts: self.coherency_conflicts.load(Ordering::Relaxed),
         }
@@ -60,6 +63,7 @@ pub struct MmapCoherencyStatsSnapshot {
     pub mmap_deregistrations: u64,
     pub invalidations_received: u64,
     pub dirty_invalidations_preserved: u64,
+    pub notification_failures: u64,
     pub pages_invalidated: u64,
     pub coherency_conflicts: u64,
 }
@@ -80,6 +84,8 @@ struct MmapRegistration {
 /// "Dirty and writeback pages must not be silently invalidated").
 pub type DirtyStateCheck = Box<dyn Fn(u64) -> bool + Send + Sync>;
 
+type InodeInvalidator = Box<dyn Fn(u64) -> io::Result<()> + Send + Sync>;
+
 /// Mmap cluster coherency manager.
 ///
 /// # Dirty/writeback preservation
@@ -95,12 +101,13 @@ pub struct MmapCoherency {
     registrations: Mutex<BTreeMap<u64, MmapRegistration>>,
     processor: Mutex<FollowerInvalidationProcessor>,
     /// Latest per-inode invalidation generation retained while dirty or
-    /// writeback-pending bytes prevent immediate kernel-cache invalidation.
+    /// writeback-pending bytes prevent immediate kernel-cache invalidation, or
+    /// while the kernel notification cannot be confirmed.
     deferred_invalidations: Mutex<VecDeque<(u64, u64)>>,
     /// Alternates the single available slot when a one-event tick has both a
     /// feed event and a deferred retry waiting.
     retry_deferred_next: AtomicBool,
-    notifier: Arc<Mutex<Option<fuser::Notifier>>>,
+    invalidate_inode: InodeInvalidator,
     /// Optional callback to check whether an inode has dirty or
     /// writeback-pending bytes.  When set and the callback returns
     /// `true`, mmap invalidation for that inode is deferred until the dirty
@@ -111,15 +118,34 @@ pub struct MmapCoherency {
 
 impl MmapCoherency {
     pub fn new(notifier: Arc<Mutex<Option<fuser::Notifier>>>) -> Self {
+        Self::with_invalidator(Box::new(move |ino| {
+            let guard = notifier
+                .lock()
+                .map_err(|_| io::Error::other("FUSE notifier lock poisoned"))?;
+            let notifier = guard.as_ref().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::WouldBlock, "FUSE notifier is not installed")
+            })?;
+            notifier.inval_inode(ino, 0, -1)
+        }))
+    }
+
+    fn with_invalidator(invalidate_inode: InodeInvalidator) -> Self {
         Self {
             registrations: Mutex::new(BTreeMap::new()),
             processor: Mutex::new(FollowerInvalidationProcessor::new()),
             deferred_invalidations: Mutex::new(VecDeque::new()),
             retry_deferred_next: AtomicBool::new(false),
-            notifier,
+            invalidate_inode,
             dirty_check: Mutex::new(None),
             stats: MmapCoherencyStats::new(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test(
+        invalidate_inode: impl Fn(u64) -> io::Result<()> + Send + Sync + 'static,
+    ) -> Self {
+        Self::with_invalidator(Box::new(invalidate_inode))
     }
 
     /// Install a dirty-state check callback.
@@ -210,7 +236,7 @@ impl MmapCoherency {
         };
         let mut sink = MmapInvalidationSink {
             registrations: &self.registrations,
-            notifier: &self.notifier,
+            invalidate_inode: &self.invalidate_inode,
             dirty_check: &self.dirty_check,
             deferred_invalidations: &self.deferred_invalidations,
             stats: &self.stats,
@@ -225,7 +251,7 @@ impl MmapCoherency {
     }
 
     /// Number of newer inode invalidations waiting for dirty/writeback state
-    /// to become clean.
+    /// to become clean or for a kernel notification retry.
     #[must_use]
     pub fn deferred_invalidation_count(&self) -> usize {
         self.deferred_invalidations.lock().unwrap().len()
@@ -234,7 +260,7 @@ impl MmapCoherency {
 
 struct MmapInvalidationSink<'a> {
     registrations: &'a Mutex<BTreeMap<u64, MmapRegistration>>,
-    notifier: &'a Arc<Mutex<Option<fuser::Notifier>>>,
+    invalidate_inode: &'a InodeInvalidator,
     /// Reference to the optional dirty-state check callback owned by
     /// [`MmapCoherency`].  When the callback is set and returns `true`,
     /// invalidation for dirty/writeback inodes is deferred.
@@ -246,6 +272,18 @@ struct MmapInvalidationSink<'a> {
 }
 
 impl MmapInvalidationSink<'_> {
+    fn defer_invalidation(&self, ino: u64, generation: u64) {
+        let mut deferred = self.deferred_invalidations.lock().unwrap();
+        if let Some((_, queued_generation)) = deferred
+            .iter_mut()
+            .find(|(queued_ino, _)| *queued_ino == ino)
+        {
+            *queued_generation = (*queued_generation).max(generation);
+        } else {
+            deferred.push_back((ino, generation));
+        }
+    }
+
     fn retry_deferred(&mut self, event_budget: usize) -> usize {
         let attempt_budget = event_budget.min(self.deferred_invalidations.lock().unwrap().len());
         let mut attempted = 0;
@@ -289,21 +327,28 @@ impl MmapInvalidationSink<'_> {
                     .is_some_and(|entry| entry.active && generation > entry.generation)
             };
             if is_still_actionable {
-                let mut deferred = self.deferred_invalidations.lock().unwrap();
-                if let Some((_, queued_generation)) = deferred
-                    .iter_mut()
-                    .find(|(queued_ino, _)| *queued_ino == ino_u64)
-                {
-                    *queued_generation = (*queued_generation).max(generation);
-                } else {
-                    deferred.push_back((ino_u64, generation));
-                }
+                self.defer_invalidation(ino_u64, generation);
                 if newly_received {
                     self.stats
                         .dirty_invalidations_preserved
                         .fetch_add(1, Ordering::Relaxed);
                 }
                 return;
+            }
+            return;
+        }
+
+        if (self.invalidate_inode)(ino_u64).is_err() {
+            self.stats
+                .notification_failures
+                .fetch_add(1, Ordering::Relaxed);
+            let is_still_actionable = {
+                let regs = self.registrations.lock().unwrap();
+                regs.get(&ino_u64)
+                    .is_some_and(|entry| entry.active && generation > entry.generation)
+            };
+            if is_still_actionable {
+                self.defer_invalidation(ino_u64, generation);
             }
             return;
         }
@@ -323,11 +368,6 @@ impl MmapInvalidationSink<'_> {
                 .coherency_conflicts
                 .fetch_add(1, Ordering::Relaxed);
             self.stats.pages_invalidated.fetch_add(1, Ordering::Relaxed);
-            if let Ok(guard) = self.notifier.lock() {
-                if let Some(ref n) = *guard {
-                    let _ = n.inval_inode(ino_u64, 0, -1);
-                }
-            }
         }
     }
 }
@@ -360,7 +400,7 @@ mod tests {
     }
 
     fn new_coherency() -> MmapCoherency {
-        MmapCoherency::new(Arc::new(Mutex::new(None)))
+        MmapCoherency::new_for_test(|_| Ok(()))
     }
 
     #[test]
@@ -469,6 +509,44 @@ mod tests {
         assert_eq!(c.process_tick(16), 1);
         assert_eq!(calls.load(Ordering::Relaxed), 2);
         assert_eq!(c.deferred_invalidation_count(), 1);
+    }
+
+    #[test]
+    fn notification_failure_retains_generation_for_retry() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let fail = Arc::new(AtomicBool::new(true));
+        let check_calls = Arc::clone(&calls);
+        let should_fail = Arc::clone(&fail);
+        let c = MmapCoherency::new_for_test(move |_| {
+            check_calls.fetch_add(1, Ordering::Relaxed);
+            if should_fail.load(Ordering::Relaxed) {
+                Err(io::Error::other("injected notification failure"))
+            } else {
+                Ok(())
+            }
+        });
+        c.register(42, 1);
+        c.enqueue_batch(batch(42, 2));
+
+        assert_eq!(c.process_tick(10), 1);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(c.deferred_invalidation_count(), 1);
+        let s = c.stats.snapshot();
+        assert_eq!(s.invalidations_received, 1);
+        assert_eq!(s.notification_failures, 1);
+        assert_eq!(s.coherency_conflicts, 0);
+        assert_eq!(s.pages_invalidated, 0);
+        assert_eq!(c.registrations.lock().unwrap()[&42].generation, 1);
+
+        fail.store(false, Ordering::Relaxed);
+        assert_eq!(c.process_tick(10), 1);
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert_eq!(c.deferred_invalidation_count(), 0);
+        let s = c.stats.snapshot();
+        assert_eq!(s.notification_failures, 1);
+        assert_eq!(s.coherency_conflicts, 1);
+        assert_eq!(s.pages_invalidated, 1);
+        assert_eq!(c.registrations.lock().unwrap()[&42].generation, 2);
     }
 
     #[test]
