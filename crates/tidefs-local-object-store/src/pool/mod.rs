@@ -330,7 +330,7 @@ impl ReplacementDetachDecision {
 /// Remanence treatment surfaced with replacement status.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReplacementRemanenceTreatment {
-    pub old_device_retained_for_replay: bool,
+    pub old_device_detach_allowed: bool,
     pub media_privacy_claimed: bool,
     pub secure_erase_claimed: bool,
     pub sanitization_claimed: bool,
@@ -340,7 +340,7 @@ pub struct ReplacementRemanenceTreatment {
 impl ReplacementRemanenceTreatment {
     pub fn from_detach_decision(detach_decision: ReplacementDetachDecision) -> Self {
         Self {
-            old_device_retained_for_replay: !detach_decision.is_safe(),
+            old_device_detach_allowed: detach_decision.is_safe(),
             media_privacy_claimed: false,
             secure_erase_claimed: false,
             sanitization_claimed: false,
@@ -3794,20 +3794,11 @@ impl Pool {
         ));
         let new_member = MemberId::new(self.device_id_for_index(replacement.device_index));
 
-        let (state, total_subjects, subjects_completed, subjects_failed) = match &replacement.state
-        {
-            ReplacementState::InProgress {
-                bytes_copied,
-                total_bytes,
-            } => (
-                ReplacementRebuildStatusState::Pending,
-                *total_bytes,
-                (*bytes_copied).min(*total_bytes),
-                0,
-            ),
-            ReplacementState::CopyComplete => (ReplacementRebuildStatusState::Completed, 0, 0, 0),
-            ReplacementState::Cancelled => (ReplacementRebuildStatusState::Canceled, 0, 0, 0),
-            ReplacementState::Failed { .. } => (ReplacementRebuildStatusState::Refused, 0, 0, 1),
+        let state = match &replacement.state {
+            ReplacementState::InProgress { .. } => ReplacementRebuildStatusState::Pending,
+            ReplacementState::CopyComplete => ReplacementRebuildStatusState::Completed,
+            ReplacementState::Cancelled => ReplacementRebuildStatusState::Canceled,
+            ReplacementState::Failed { .. } => ReplacementRebuildStatusState::Refused,
         };
 
         let detach_decision = ReplacementDetachDecision::UnsafeToDetach;
@@ -3815,9 +3806,11 @@ impl Pool {
             old_member,
             new_member,
             topology_epoch: self.placement_epoch(),
-            total_subjects,
-            subjects_completed,
-            subjects_failed,
+            // Byte-copy state and terminal errors are not receipt-backed
+            // rebuild-subject evidence.
+            total_subjects: 0,
+            subjects_completed: 0,
+            subjects_failed: 0,
             verified_receipt_count: 0,
             evidence_stable: false,
             evidence_replayable_after_reopen: false,
@@ -8239,7 +8232,7 @@ mod tests {
         assert_eq!(evidence.verified_receipt_count, 0);
         assert!(!evidence.evidence_stable);
         assert!(!evidence.evidence_replayable_after_reopen);
-        assert!(evidence.remanence_treatment.old_device_retained_for_replay);
+        assert!(!evidence.remanence_treatment.old_device_detach_allowed);
         assert!(!evidence.remanence_treatment.media_privacy_claimed);
         assert!(!evidence.remanence_treatment.secure_erase_claimed);
         assert!(!evidence.remanence_treatment.sanitization_claimed);
@@ -8370,8 +8363,8 @@ mod tests {
             .expect("replacement evidence status");
         assert_replacement_evidence_fail_closed(&evidence, old_member, new_member, topology_epoch);
         assert_eq!(evidence.state, ReplacementRebuildStatusState::Pending);
-        assert_eq!(evidence.total_subjects, 10);
-        assert_eq!(evidence.subjects_completed, 10);
+        assert_eq!(evidence.total_subjects, 0);
+        assert_eq!(evidence.subjects_completed, 0);
         assert_eq!(evidence.subjects_failed, 0);
 
         let _ = std::fs::remove_dir_all(&root);
@@ -8428,7 +8421,7 @@ mod tests {
         assert_eq!(evidence.state, ReplacementRebuildStatusState::Refused);
         assert_eq!(evidence.total_subjects, 0);
         assert_eq!(evidence.subjects_completed, 0);
-        assert_eq!(evidence.subjects_failed, 1);
+        assert_eq!(evidence.subjects_failed, 0);
 
         let _ = std::fs::remove_dir_all(&root);
     }
