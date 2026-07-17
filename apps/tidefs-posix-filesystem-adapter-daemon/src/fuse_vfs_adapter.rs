@@ -3079,12 +3079,8 @@ impl FuseVfsAdapter {
 
         // Install the dirty-state check callback so mmap-coherency
         // invalidation preserves dirty/writeback pages ahead of the
-        // durability barrier.
-        {
-            let proj = Arc::clone(&writeback_projection);
-            mmap_coherency
-                .set_dirty_check(Some(Box::new(move |ino| proj.is_dirty_or_writeback(ino))));
-        }
+        // durability barrier and records each decision in the projection.
+        writeback_projection.install_mmap_dirty_check();
 
         let timestamp_policy = TimestampPolicy::default();
         let base_dentry_policy = DentryPolicy::default();
