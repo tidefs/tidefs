@@ -129,6 +129,25 @@ impl PoolExporter {
         _pool_name: &str,
         commit_group: u64,
     ) -> std::result::Result<(), ExportError> {
+        Self::export_pool_with_writer(
+            device_configs,
+            pool_guid,
+            device_guids,
+            commit_group,
+            Self::write_labels_to_device,
+        )
+    }
+
+    fn export_pool_with_writer<F>(
+        device_configs: &[DeviceConfig],
+        pool_guid: [u8; 16],
+        device_guids: &[[u8; 16]],
+        commit_group: u64,
+        mut write_labels: F,
+    ) -> std::result::Result<(), ExportError>
+    where
+        F: FnMut(&Path, &PoolLabelV1) -> std::result::Result<(), ExportError>,
+    {
         // Operator authorization boundary: pool export requires local execution.
         let _guard = LocalOnlyGuard::new("pool export")?;
         if device_configs.is_empty() {
@@ -136,7 +155,7 @@ impl PoolExporter {
         }
 
         let label_commit_group = commit_group + 1;
-        let mut written: Vec<PathBuf> = Vec::new();
+        let mut written: Vec<(PathBuf, PoolLabelV1)> = Vec::new();
 
         for (i, device_config) in device_configs.iter().enumerate() {
             let _device_guid = if i < device_guids.len() {
@@ -149,6 +168,7 @@ impl PoolExporter {
 
             // Read existing label to preserve fields we don't change.
             let existing = Self::read_existing_label(&device_config.path, pool_guid, i as u32)?;
+            let rollback_label = existing.clone();
 
             let label = PoolLabelV1 {
                 pool_state: LabelPoolState::Exported,
@@ -160,16 +180,17 @@ impl PoolExporter {
                 ..existing
             };
 
-            let result = Self::write_labels_to_device(&device_config.path, &label);
+            let result = write_labels(&device_config.path, &label);
 
             match result {
                 Ok(()) => {
-                    written.push(device_config.path.clone());
+                    written.push((device_config.path.clone(), rollback_label));
                 }
                 Err(e) => {
                     // Rollback: restore ACTIVE state on all written devices.
-                    for path in &written {
-                        let _ = Self::rollback_device_label(path, &existing);
+                    for (path, original_label) in &written {
+                        let _ =
+                            Self::rollback_device_label(path, original_label, &mut write_labels);
                     }
                     return Err(ExportError::LabelWriteFailed {
                         device_path: device_config.path.clone(),
@@ -277,13 +298,17 @@ impl PoolExporter {
     }
 
     /// Rollback: write ACTIVE state back to a device label.
-    fn rollback_device_label(
+    fn rollback_device_label<F>(
         device_path: &Path,
         original_label: &PoolLabelV1,
-    ) -> std::result::Result<(), ExportError> {
+        write_labels: &mut F,
+    ) -> std::result::Result<(), ExportError>
+    where
+        F: FnMut(&Path, &PoolLabelV1) -> std::result::Result<(), ExportError>,
+    {
         let mut active = original_label.clone();
         active.pool_state = LabelPoolState::Active;
-        Self::write_labels_to_device(device_path, &active)
+        write_labels(device_path, &active)
     }
 
     /// Write raw bytes at a given offset within a file.
@@ -830,6 +855,18 @@ mod tests {
         ))
     }
 
+    fn export_device_config(path: PathBuf) -> DeviceConfig {
+        DeviceConfig {
+            media_class: Default::default(),
+            path: path.clone(),
+            backing: DeviceBacking::DirectoryObjectStoreCompat,
+            class: DeviceClass::Data,
+            kind: DeviceKind::Single { path },
+            compression: None,
+            encryption: None,
+        }
+    }
+
     fn write_export_label(
         path: &Path,
         pool_guid: [u8; 16],
@@ -896,6 +933,73 @@ mod tests {
         let mut buf = [0u8; POOL_LABEL_V1_WIRE_SIZE];
         encode_label(&sealed, &mut buf).unwrap();
         std::fs::write(label_path, buf).unwrap();
+    }
+
+    #[test]
+    fn export_failure_restores_each_device_original_label() {
+        let first_path = unique_export_path("rollback-first");
+        let failed_path = unique_export_path("rollback-failed");
+        let pool_guid = [0x91; 16];
+        let device_guids = [[0x11; 16], [0x22; 16]];
+        let first_capacity = 1024_u64 * 1024 * 1024;
+        let failed_capacity = 2_u64 * 1024 * 1024 * 1024;
+
+        write_export_label_with_device_count(
+            &first_path,
+            pool_guid,
+            device_guids[0],
+            0,
+            first_capacity,
+            7,
+            2,
+        );
+        write_export_label_with_device_count(
+            &failed_path,
+            pool_guid,
+            device_guids[1],
+            1,
+            failed_capacity,
+            7,
+            2,
+        );
+
+        let configs = [
+            export_device_config(first_path.clone()),
+            export_device_config(failed_path.clone()),
+        ];
+        let injected_failure_path = failed_path.clone();
+        let result = PoolExporter::export_pool_with_writer(
+            &configs,
+            pool_guid,
+            &device_guids,
+            12,
+            move |path, label| {
+                if path == injected_failure_path.as_path()
+                    && label.pool_state == LabelPoolState::Exported
+                {
+                    Err(ExportError::IoError("injected label write failure".into()))
+                } else {
+                    PoolExporter::write_labels_to_device(path, label)
+                }
+            },
+        );
+
+        assert!(matches!(result, Err(ExportError::LabelWriteFailed { .. })));
+
+        let first = PoolExporter::read_existing_label(&first_path, pool_guid, 0).unwrap();
+        assert_eq!(first.pool_state, LabelPoolState::Active);
+        assert_eq!(first.device_guid, device_guids[0]);
+        assert_eq!(first.device_index, 0);
+        assert_eq!(first.device_capacity_bytes, first_capacity);
+
+        let failed = PoolExporter::read_existing_label(&failed_path, pool_guid, 1).unwrap();
+        assert_eq!(failed.pool_state, LabelPoolState::Active);
+        assert_eq!(failed.device_guid, device_guids[1]);
+        assert_eq!(failed.device_index, 1);
+        assert_eq!(failed.device_capacity_bytes, failed_capacity);
+
+        let _ = std::fs::remove_dir_all(first_path);
+        let _ = std::fs::remove_dir_all(failed_path);
     }
 
     fn make_orchestrator() -> ExportOrchestrator {
