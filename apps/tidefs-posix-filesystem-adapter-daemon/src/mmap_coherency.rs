@@ -138,7 +138,11 @@ impl MmapCoherency {
             generation: 0,
             active: false,
         });
-        entry.generation = generation;
+        if entry.active {
+            entry.generation = entry.generation.max(generation);
+        } else {
+            entry.generation = generation;
+        }
         entry.active = true;
         drop(regs);
         self.stats
@@ -384,6 +388,25 @@ mod tests {
         assert_eq!(n, 1);
         let s = c.stats.snapshot();
         assert_eq!(s.invalidations_received, 1);
+        assert_eq!(s.coherency_conflicts, 1);
+        assert_eq!(s.pages_invalidated, 1);
+    }
+
+    #[test]
+    fn reregister_active_inode_preserves_newer_generation() {
+        let c = new_coherency();
+        c.register(42, 1);
+        c.enqueue_batch(batch(42, 4));
+        assert_eq!(c.process_tick(10), 1);
+
+        // A second open registers the same active inode with generation zero.
+        // It must not make an older invalidation actionable again.
+        c.register(42, 0);
+        c.enqueue_batch(batch(42, 3));
+        assert_eq!(c.process_tick(10), 1);
+
+        let s = c.stats.snapshot();
+        assert_eq!(s.invalidations_received, 2);
         assert_eq!(s.coherency_conflicts, 1);
         assert_eq!(s.pages_invalidated, 1);
     }
