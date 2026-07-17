@@ -596,37 +596,48 @@ pub fn check_checksum_architecture_current_workspace() -> Result<(), ClusterChec
     let mut missing = Vec::new();
 
     for rel in [
-        "docs/CHECKSUM_ARCHITECTURE_DESIGN.md",
-        "docs/design/end-to-end-checksum-architecture-g3-pillar.md",
+        "crates/tidefs-local-object-store/Cargo.toml",
+        "crates/tidefs-local-object-store/src/constants.rs",
+        "crates/tidefs-local-object-store/src/store.rs",
+        "docs/BLAKE3_USAGE_POLICY.md",
     ] {
         check_required_file(&root, rel, &mut missing);
     }
 
     check_source_markers(
         &root,
-        "docs/CHECKSUM_ARCHITECTURE_DESIGN.md",
+        "crates/tidefs-local-object-store/src/constants.rs",
         &[
-            "CHECKSUM_ARCHITECTURE_SPEC",
-            "IntegrityTrailerV2",
-            "BLAKE3-256",
-            "domain_separation",
-            "SuspectLog",
-            "SegmentIntegrityFooter",
+            "pub const CHECKSUM_ARCHITECTURE_SPEC",
+            "CRC32C record-header sanity",
+            "BLAKE3-256 payload integrity",
+            "domain-separated per-record-type contexts",
         ],
         &mut missing,
     );
 
     check_source_markers(
         &root,
-        "docs/design/end-to-end-checksum-architecture-g3-pillar.md",
+        "crates/tidefs-local-object-store/src/store.rs",
         &[
-            "CHECKSUM_ARCHITECTURE_SPEC",
-            "IntegrityTrailerV2",
-            "BLAKE3-256",
-            "domain_separation",
-            "SuspectLog",
-            "SegmentIntegrityFooter",
-            "#1559",
+            "pub struct IntegrityTrailerV2",
+            "pub fn encode_integrity_trailer_v2",
+            "pub fn decode_integrity_trailer_v2",
+            "fn verify_integrity_trailer_v2",
+            "pub struct SegmentIntegrityFooter",
+            "pub fn verify_segment_chain",
+            "pub struct SuspectLog",
+        ],
+        &mut missing,
+    );
+
+    check_source_markers(
+        &root,
+        "docs/BLAKE3_USAGE_POLICY.md",
+        &[
+            "Maturity: **current policy**",
+            "Durable Integrity Trailers",
+            "It is not a production-readiness",
         ],
         &mut missing,
     );
@@ -647,7 +658,6 @@ pub fn check_feature_flags_current_workspace() -> Result<(), ClusterCheckError> 
     for rel in [
         "crates/tidefs-types-dataset-feature-flags-core/Cargo.toml",
         "crates/tidefs-types-dataset-feature-flags-core/src/lib.rs",
-        "docs/DATASET_FEATURE_FLAGS_DESIGN.md",
     ] {
         check_required_file(&root, rel, &mut missing);
     }
@@ -666,6 +676,11 @@ pub fn check_feature_flags_current_workspace() -> Result<(), ClusterCheckError> 
             "FEATURE_CHECKSUM_BLAKE3",
             "InvalidFeatureName",
             "canonical_feature!",
+            "Compat = 0",
+            "RoCompat = 1",
+            "Incompat = 2",
+            "forces_read_only",
+            "refuses_mount",
         ],
         &mut missing,
     );
@@ -674,19 +689,6 @@ pub fn check_feature_flags_current_workspace() -> Result<(), ClusterCheckError> 
         &root,
         "crates/tidefs-types-dataset-feature-flags-core/Cargo.toml",
         &["tidefs-types-dataset-feature-flags-core"],
-        &mut missing,
-    );
-
-    check_source_markers(
-        &root,
-        "docs/DATASET_FEATURE_FLAGS_DESIGN.md",
-        &[
-            "Dataset Feature Flags Architecture Design",
-            "Feature Name",
-            "compat",
-            "ro_compat",
-            "incompat",
-        ],
         &mut missing,
     );
 
