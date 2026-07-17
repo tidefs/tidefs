@@ -254,7 +254,8 @@ impl ErasureCodedStore {
     /// stores. Shards are keyed as `{object_key}_stripe_{s}_shard_{i}`.
     pub fn put_named(&mut self, name: impl AsRef<[u8]>, payload: &[u8]) -> Result<(), String> {
         // Flush any pending shard repairs from degraded reads before writing.
-        self.flush_repairs();
+        self.flush_repairs()
+            .map_err(|err| format!("pending degraded-read repair blocks write: {err}"))?;
         let key = ObjectKey::from_name(&name);
         let cap = self.config.data_capacity();
         let sw = self.config.store_count();
@@ -523,25 +524,48 @@ impl ErasureCodedStore {
 
     /// Write back any pending shard repairs queued during degraded reads.
     ///
-    /// Returns the number of shards successfully repaired.
-    pub fn flush_repairs(&mut self) -> usize {
+    /// Returns the number of shards successfully repaired. Failed writebacks
+    /// remain queued and return an explicit incomplete-repair error so callers
+    /// cannot mistake a partial flush for repair success.
+    pub fn flush_repairs(&mut self) -> Result<usize, EcStoreError> {
         let pending: Vec<PendingEcRepair> = std::mem::take(&mut *self.repair_queue.borrow_mut());
         let mut repaired = 0usize;
-        for p in &pending {
-            match self.stores[p.store_index].put(p.shard_key, &p.shard_record) {
+        let mut failed = Vec::new();
+        let mut first_failure = None;
+
+        for p in pending {
+            let result = match self.stores.get_mut(p.store_index) {
+                Some(store) => store
+                    .put(p.shard_key, &p.shard_record)
+                    .map(|_| ())
+                    .map_err(|err| err.to_string()),
+                None => Err("repair target store index is out of range".to_string()),
+            };
+            match result {
                 Ok(_) => {
                     repaired += 1;
                     increment_cell(&self.stats.repairs);
                 }
-                Err(e) => {
-                    eprintln!(
-                        "ec repair: failed to write shard to store {}: {e}",
-                        p.store_index
-                    );
+                Err(reason) => {
+                    first_failure.get_or_insert((p.store_index, reason));
+                    failed.push(p);
                 }
             }
         }
-        repaired
+
+        if failed.is_empty() {
+            return Ok(repaired);
+        }
+
+        let pending = failed.len();
+        self.repair_queue.borrow_mut().extend(failed);
+        let (failed_store_index, reason) = first_failure.expect("failed repair has a reason");
+        Err(EcStoreError::RepairFlushIncomplete {
+            repaired,
+            pending,
+            failed_store_index,
+            reason,
+        })
     }
 
     /// Repair a specific store by reconstructing its shards from surviving
@@ -654,7 +678,7 @@ impl ErasureCodedStore {
 
 // ── Async EC store runtime types ──────────────────────────────────────
 
-/// Error type for async EC store operations.
+/// Error type for receipt-aware EC store operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EcStoreError {
     /// Encoding failed.
@@ -667,6 +691,17 @@ pub enum EcStoreError {
     InsufficientShards { available: usize, needed: usize },
     /// Repair operation failed.
     RepairFailed { store_index: usize, reason: String },
+    /// A degraded-read repair flush left shards pending.
+    RepairFlushIncomplete {
+        /// Shards repaired before the flush encountered failures.
+        repaired: usize,
+        /// Shards retained in the repair queue for a later retry.
+        pending: usize,
+        /// Store index for the first failed writeback.
+        failed_store_index: usize,
+        /// Error reported by the first failed writeback.
+        reason: String,
+    },
     /// Internal store error.
     Internal(String),
 }
@@ -691,6 +726,15 @@ impl fmt::Display for EcStoreError {
             } => {
                 write!(f, "repair of store {store_index} failed: {reason}")
             }
+            Self::RepairFlushIncomplete {
+                repaired,
+                pending,
+                failed_store_index,
+                reason,
+            } => write!(
+                f,
+                "repair flush incomplete: {repaired} repaired, {pending} pending; store {failed_store_index}: {reason}"
+            ),
             Self::Internal(msg) => write!(f, "internal error: {msg}"),
         }
     }
@@ -1924,6 +1968,49 @@ mod tests {
     }
 
     #[test]
+    fn degraded_read_repair_flush_failure_is_explicit_and_retriable() {
+        let paths = make_paths(3, "repair-flush-failure");
+        let mut store =
+            ErasureCodedStore::open(&paths, ErasureCodedStoreConfig::two_plus_one_test()).unwrap();
+        let name = b"degraded-read";
+        let payload = b"repair writeback must not disappear".to_vec();
+        let key = ObjectKey::from_name(name);
+        let shard_key = shard_object_key(key, 0, 0);
+
+        store.put_named(name, &payload).unwrap();
+        store.stores[0].delete(shard_key).unwrap();
+        assert_eq!(store.get_named(name).unwrap(), Some(payload));
+
+        store.stores[0].enable_fault_injection(tidefs_local_object_store::FaultInjectionConfig {
+            write_failure_probability: 1.0,
+            ..tidefs_local_object_store::FaultInjectionConfig::off()
+        });
+        let err = store.flush_repairs().unwrap_err();
+        assert!(matches!(
+            err,
+            EcStoreError::RepairFlushIncomplete {
+                repaired: 0,
+                pending: 1,
+                failed_store_index: 0,
+                ref reason,
+            } if reason.contains("fault injection: write failure")
+        ));
+        assert!(store.stores[0].get(shard_key).unwrap().is_none());
+
+        let blocked = store
+            .put_named("blocked-write", b"must not pass pending repair")
+            .unwrap_err();
+        assert!(blocked.contains("pending degraded-read repair blocks write"));
+        assert_eq!(store.get_named("blocked-write").unwrap(), None);
+
+        store.stores[0].disable_fault_injection();
+        assert_eq!(store.flush_repairs().unwrap(), 1);
+        assert!(store.stores[0].get(shard_key).unwrap().is_some());
+
+        cleanup_dirs(&paths);
+    }
+
+    #[test]
     fn placement_mapping_routes_sync_read_repair_and_delete() {
         let paths = make_paths(3, "placed");
         let cfg = ErasureCodedStoreConfig {
@@ -1970,7 +2057,7 @@ mod tests {
         assert_eq!(store.get_named(name).unwrap(), Some(payload.clone()));
         assert!(store.stats().degraded_reads.get() >= 1);
 
-        let flushed = store.flush_repairs();
+        let flushed = store.flush_repairs().unwrap();
         assert!(flushed >= 1);
         assert!(store.stores[2]
             .get(shard_object_key(key, 0, 0))
