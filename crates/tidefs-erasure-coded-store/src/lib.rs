@@ -37,7 +37,12 @@ use std::{
     sync::Arc,
 };
 use tidefs_durability_layout::FailureDomainV1;
-use tidefs_erasure_coding::{encode, reconstruct, ErasureShard, ShardKind, StripeConfig};
+use tidefs_erasure_coding::{
+    encode_receipt_stripe as encode_coding_receipt_stripe, receipt_stripe_width,
+    reconstruct_receipt_stripe as reconstruct_coding_receipt_stripe, ErasureShard,
+    ReceiptStripeError, ShardKind, StripeConfig,
+};
+pub use tidefs_erasure_coding::{ReceiptEncodedStripe, ReceiptReconstructedStripe};
 use tidefs_local_object_store::{LocalObjectStore, ObjectKey, StoreOptions};
 use tidefs_placement_planner::placement_plan::{DeviceCandidate, PlacementPlan};
 use tokio::sync::Mutex;
@@ -133,7 +138,7 @@ pub struct ErasureCodedStoreStats {
     pub degraded_reads: Cell<u64>,
     /// Number of reads that served from all data shards (no reconstruction).
     pub clean_reads: Cell<u64>,
-    /// Number of reads that failed (insufficient shards).
+    /// Number of reads that failed during reconstruction.
     pub failed_reads: Cell<u64>,
     /// Number of shard records whose embedded digest was verified.
     pub shards_verified: Cell<u64>,
@@ -192,10 +197,21 @@ impl ErasureCodedStore {
     ///
     /// # Errors
     ///
-    /// Returns an error if any store fails to open, if paths is empty,
-    /// or if the path count does not match the store count.
+    /// Returns an error if the receipt stripe configuration is invalid, any
+    /// store fails to open, paths is empty, or the path count does not match
+    /// the store count.
     pub fn open(paths: &[PathBuf], config: ErasureCodedStoreConfig) -> Result<Self, String> {
-        let expected = config.store_count();
+        let stripe_config = StripeConfig {
+            data_shards: config.data_shards,
+            parity_shards: config.parity_shards,
+            shard_len: config.shard_len,
+        };
+        let expected = receipt_stripe_width(&stripe_config).ok_or_else(|| {
+            format!(
+                "invalid erasure-coded store stripe configuration: {} data + {} parity, shard length {}",
+                config.data_shards, config.parity_shards, config.shard_len,
+            )
+        })?;
         if paths.is_empty() {
             return Err("erasure-coded store requires at least 1 path".into());
         }
@@ -278,8 +294,8 @@ impl ErasureCodedStore {
                 &[]
             };
 
-            let encoded = encode(&stripe_config, chunk)
-                .ok_or_else(|| format!("encode failed for stripe {s}"))?;
+            let encoded = encode_receipt_stripe(&stripe_config, chunk)
+                .map_err(|err| format!("stripe {s}: {err}"))?;
 
             for shard in &encoded.shards {
                 let shard_key = shard_object_key(key, s, shard.index);
@@ -403,35 +419,24 @@ impl ErasureCodedStore {
                 }
             }
 
-            let recon = reconstruct(&stripe_config, &available, None).ok_or_else(|| {
+            let recon = reconstruct_receipt_stripe(&stripe_config, &available).map_err(|err| {
                 increment_cell(&self.stats.failed_reads);
-                format!(
-                    "stripe {s}: insufficient verified shards available ({}/{} needed)",
-                    available.iter().filter(|s| s.is_some()).count(),
-                    self.config.data_shards,
-                )
+                format!("stripe {s} reconstruction failed: {err}")
             })?;
 
             // Queue repairs for missing/corrupt shards to be written back later.
             if degraded {
-                if let Some(encoded) = encode(&stripe_config, &recon.payload) {
-                    for i in 0..sw {
-                        if available[i].is_none() {
-                            let shard_key = shard_object_key(key, s, i);
-                            let store_index = mapped_store_index(&self.shard_to_store, i, sw);
-                            if let Ok(shard_record) = encode_verified_shard(
-                                &object_prefix,
-                                s,
-                                i,
-                                &encoded.shards[i].bytes,
-                            ) {
-                                self.repair_queue.borrow_mut().push(PendingEcRepair {
-                                    store_index,
-                                    shard_key,
-                                    shard_record,
-                                });
-                            }
-                        }
+                for rebuilt in &recon.rebuilt_shards {
+                    let shard_key = shard_object_key(key, s, rebuilt.index);
+                    let store_index = mapped_store_index(&self.shard_to_store, rebuilt.index, sw);
+                    if let Ok(shard_record) =
+                        encode_verified_shard(&object_prefix, s, rebuilt.index, &rebuilt.bytes)
+                    {
+                        self.repair_queue.borrow_mut().push(PendingEcRepair {
+                            store_index,
+                            shard_key,
+                            shard_record,
+                        });
                     }
                 }
             }
@@ -618,21 +623,20 @@ impl ErasureCodedStore {
                     }
                 }
 
-                if let Some(recon) = reconstruct(&stripe_config, &available, None) {
-                    for rebuilt in &recon.rebuilt_shards {
-                        let target_store =
-                            mapped_store_index(&self.shard_to_store, rebuilt.index, sw);
-                        if target_store == store_index {
-                            let sk = shard_key_from_prefix(prefix, s, rebuilt.index);
-                            let shard_record =
-                                encode_verified_shard(prefix, s, rebuilt.index, &rebuilt.bytes)?;
-                            self.stores[target_store]
-                                .put(sk, &shard_record)
-                                .map_err(|e| {
-                                    format!("repair write failed for shard {}: {e}", rebuilt.index,)
-                                })?;
-                            repaired += 1;
-                        }
+                let recon = reconstruct_receipt_stripe(&stripe_config, &available)
+                    .map_err(|err| format!("stripe {s} reconstruction failed: {err}"))?;
+                for rebuilt in &recon.rebuilt_shards {
+                    let target_store = mapped_store_index(&self.shard_to_store, rebuilt.index, sw);
+                    if target_store == store_index {
+                        let sk = shard_key_from_prefix(prefix, s, rebuilt.index);
+                        let shard_record =
+                            encode_verified_shard(prefix, s, rebuilt.index, &rebuilt.bytes)?;
+                        self.stores[target_store]
+                            .put(sk, &shard_record)
+                            .map_err(|e| {
+                                format!("repair write failed for shard {}: {e}", rebuilt.index,)
+                            })?;
+                        repaired += 1;
                     }
                 }
             }
@@ -693,6 +697,42 @@ impl fmt::Display for EcStoreError {
 }
 
 impl std::error::Error for EcStoreError {}
+
+/// Encode one receipt-tracked stripe through the EC-store authority.
+pub fn encode_receipt_stripe(
+    config: &StripeConfig,
+    payload: &[u8],
+) -> Result<ReceiptEncodedStripe, EcStoreError> {
+    encode_coding_receipt_stripe(config, payload).map_err(|err| match err {
+        ReceiptStripeError::EncodeRejected => EcStoreError::EncodeFailed(
+            "erasure encoder rejected receipt stripe payload".to_string(),
+        ),
+        ReceiptStripeError::InsufficientShards { available, needed } => {
+            EcStoreError::InsufficientShards { available, needed }
+        }
+        ReceiptStripeError::InvalidAvailableSet { slots, expected } => EcStoreError::Internal(
+            format!("receipt stripe encode returned invalid available set: {slots} slots, expected {expected}"),
+        ),
+    })
+}
+
+/// Reconstruct one receipt-tracked stripe through the EC-store authority.
+pub fn reconstruct_receipt_stripe(
+    config: &StripeConfig,
+    available: &[Option<ErasureShard>],
+) -> Result<ReceiptReconstructedStripe, EcStoreError> {
+    reconstruct_coding_receipt_stripe(config, available).map_err(|err| match err {
+        ReceiptStripeError::InsufficientShards { available, needed } => {
+            EcStoreError::InsufficientShards { available, needed }
+        }
+        ReceiptStripeError::InvalidAvailableSet { slots, expected } => EcStoreError::DecodeFailed(
+            format!("invalid receipt stripe available set: {slots} slots, expected {expected}"),
+        ),
+        ReceiptStripeError::EncodeRejected => EcStoreError::DecodeFailed(
+            "erasure decoder rejected receipt stripe payload".to_string(),
+        ),
+    })
+}
 
 /// Result of an EC write path execution.
 #[derive(Debug, Clone)]
@@ -836,7 +876,10 @@ fn decode_verified_shard(
     }
     let payload_len = usize::try_from(payload_len)
         .map_err(|_| ShardIntegrityError::LengthOverflow("shard payload"))?;
-    if record.len() != SHARD_RECORD_HEADER_LEN + payload_len {
+    let record_len = SHARD_RECORD_HEADER_LEN
+        .checked_add(payload_len)
+        .ok_or(ShardIntegrityError::LengthOverflow("shard record"))?;
+    if record.len() != record_len {
         return Err(ShardIntegrityError::TruncatedRecord);
     }
     let mut expected = [0u8; 32];
@@ -1170,8 +1213,8 @@ impl EcWritePath {
                     &[]
                 };
 
-                let encoded = encode(&stripe_config, chunk).ok_or_else(|| {
-                    EcStoreError::EncodeFailed(format!("encode failed for stripe {stripe_idx}"))
+                let encoded = encode_receipt_stripe(&stripe_config, chunk).map_err(|err| {
+                    EcStoreError::EncodeFailed(format!("stripe {stripe_idx}: {err}"))
                 })?;
 
                 for shard in &encoded.shards {
@@ -1329,13 +1372,8 @@ impl EcReadPath {
                     }
                 }
 
-                let recon = reconstruct(&stripe_config, &available, None).ok_or_else(|| {
-                    increment_cell(&s.stats.failed_reads);
-                    EcStoreError::InsufficientShards {
-                        available: available.iter().filter(|s| s.is_some()).count(),
-                        needed: s.config.data_shards,
-                    }
-                })?;
+                let recon = reconstruct_receipt_stripe(&stripe_config, &available)
+                    .inspect_err(|_| increment_cell(&s.stats.failed_reads))?;
 
                 let stripe_chunk_len = match total_original_len {
                     Some(_len) if stripe_idx + 1 < num_stripes => cap,
@@ -1472,36 +1510,37 @@ impl EcRepairPath {
                         }
                     }
 
-                    if let Some(recon) = reconstruct(&stripe_config, &available, None) {
-                        for rebuilt in &recon.rebuilt_shards {
-                            let target_store =
-                                mapped_store_index(&s.shard_to_store, rebuilt.index, sw);
-                            if target_store == store_index {
-                                let sk = shard_key_from_prefix(
-                                    prefix,
-                                    stripe_idx,
-                                    rebuilt.index,
-                                );
-                                let shard_record = encode_verified_shard(
-                                    prefix,
-                                    stripe_idx,
-                                    rebuilt.index,
-                                    &rebuilt.bytes,
-                                )
-                                .map_err(EcStoreError::Internal)?;
-                                s.stores[target_store]
-                                    .put(sk, &shard_record)
-                                    .map_err(|e| {
-                                        EcStoreError::RepairFailed {
-                                            store_index,
-                                            reason: format!(
-                                                "repair write failed for shard {}: {e}",
-                                                rebuilt.index,
-                                            ),
-                                        }
-                                    })?;
-                                repaired += 1;
-                            }
+                    let recon = reconstruct_receipt_stripe(&stripe_config, &available).map_err(
+                        |err| EcStoreError::RepairFailed {
+                            store_index,
+                            reason: format!(
+                                "stripe {stripe_idx} reconstruction failed: {err}"
+                            ),
+                        },
+                    )?;
+                    for rebuilt in &recon.rebuilt_shards {
+                        let target_store =
+                            mapped_store_index(&s.shard_to_store, rebuilt.index, sw);
+                        if target_store == store_index {
+                            let sk =
+                                shard_key_from_prefix(prefix, stripe_idx, rebuilt.index);
+                            let shard_record = encode_verified_shard(
+                                prefix,
+                                stripe_idx,
+                                rebuilt.index,
+                                &rebuilt.bytes,
+                            )
+                            .map_err(EcStoreError::Internal)?;
+                            s.stores[target_store]
+                                .put(sk, &shard_record)
+                                .map_err(|e| EcStoreError::RepairFailed {
+                                    store_index,
+                                    reason: format!(
+                                        "repair write failed for shard {}: {e}",
+                                        rebuilt.index,
+                                    ),
+                                })?;
+                            repaired += 1;
                         }
                     }
                 }
@@ -1550,6 +1589,75 @@ mod tests {
         }
     }
 
+    #[test]
+    fn receipt_stripe_encode_returns_all_shards() {
+        let config = StripeConfig {
+            data_shards: 2,
+            parity_shards: 1,
+            shard_len: 8,
+        };
+
+        let encoded = encode_receipt_stripe(&config, b"hello").unwrap();
+
+        assert_eq!(encoded.shards.len(), 3);
+        assert_eq!(encoded.original_payload_len, 5);
+        assert_eq!(encoded.shards[0].index, 0);
+        assert_eq!(encoded.shards[0].kind, ShardKind::Data);
+        assert_eq!(encoded.shards[2].kind, ShardKind::Parity);
+    }
+
+    #[test]
+    fn receipt_stripe_reconstructs_missing_shard_evidence() {
+        let config = StripeConfig {
+            data_shards: 2,
+            parity_shards: 1,
+            shard_len: 8,
+        };
+        let encoded = encode_receipt_stripe(&config, b"hello").unwrap();
+        let mut available: Vec<_> = encoded.shards.iter().cloned().map(Some).collect();
+        available[1] = None;
+
+        let reconstructed = reconstruct_receipt_stripe(&config, &available).unwrap();
+
+        assert_eq!(&reconstructed.payload[..5], b"hello");
+        assert_eq!(reconstructed.rebuilt_shards.len(), 1);
+        assert_eq!(reconstructed.rebuilt_shards[0].index, 1);
+    }
+
+    #[test]
+    fn receipt_stripe_reconstruct_fails_closed_when_insufficient() {
+        let config = StripeConfig {
+            data_shards: 2,
+            parity_shards: 1,
+            shard_len: 8,
+        };
+        let encoded = encode_receipt_stripe(&config, b"hello").unwrap();
+        let mut available: Vec<_> = encoded.shards.iter().cloned().map(Some).collect();
+        available[0] = None;
+        available[1] = None;
+
+        let err = reconstruct_receipt_stripe(&config, &available).unwrap_err();
+
+        match err {
+            EcStoreError::InsufficientShards { available, needed } => {
+                assert_eq!(available, 1);
+                assert_eq!(needed, 2);
+            }
+            other => panic!("expected InsufficientShards, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shard_decoder_rejects_overflowing_record_length() {
+        let object_prefix = [1; 16];
+        let mut record = encode_verified_shard(&object_prefix, 0, 0, b"payload").unwrap();
+        record[20..28].copy_from_slice(&(usize::MAX as u64).to_le_bytes());
+
+        let err = decode_verified_shard(&object_prefix, 0, 0, &record).unwrap_err();
+
+        assert_eq!(err, ShardIntegrityError::LengthOverflow("shard record"));
+    }
+
     // --- 2+1 basic put/get ---
 
     #[test]
@@ -1562,6 +1670,30 @@ mod tests {
 
         let data = store.get_named("hello").unwrap();
         assert_eq!(data, Some(b"world".to_vec()));
+
+        cleanup_dirs(&paths);
+    }
+
+    #[test]
+    fn sync_read_rejects_verified_wrong_length_shard() {
+        let paths = make_paths(3, "sync-malformed-shard");
+        let mut store =
+            ErasureCodedStore::open(&paths, ErasureCodedStoreConfig::two_plus_one_test()).unwrap();
+        let name = b"malformed-shard";
+        store.put_named(name, b"payload").unwrap();
+
+        let key = ObjectKey::from_name(name);
+        let prefix = object_prefix(key);
+        let shard_key = shard_object_key(key, 0, 0);
+        let malformed = encode_verified_shard(&prefix, 0, 0, &[0; 255]).unwrap();
+        store.stores[0].put(shard_key, &malformed).unwrap();
+
+        let err = store.get_named(name).unwrap_err();
+        assert!(
+            err.contains("invalid receipt stripe available set"),
+            "{err}"
+        );
+        assert_eq!(store.stats().failed_reads.get(), 1);
 
         cleanup_dirs(&paths);
     }
@@ -1773,6 +1905,25 @@ mod tests {
     }
 
     #[test]
+    fn repair_refuses_unrecoverable_stripe() {
+        let paths = make_paths(3, "repair-unrecoverable");
+        let mut store =
+            ErasureCodedStore::open(&paths, ErasureCodedStoreConfig::two_plus_one_test()).unwrap();
+        store.put_named("r", b"repair-must-fail").unwrap();
+
+        for store_index in 0..2 {
+            for key in store.stores[store_index].list_keys() {
+                store.stores[store_index].delete(key).unwrap();
+            }
+        }
+
+        let err = store.repair_store(0).unwrap_err();
+        assert!(err.contains("insufficient shards"), "{err}");
+
+        cleanup_dirs(&paths);
+    }
+
+    #[test]
     fn placement_mapping_routes_sync_read_repair_and_delete() {
         let paths = make_paths(3, "placed");
         let cfg = ErasureCodedStoreConfig {
@@ -1895,6 +2046,28 @@ mod tests {
         let cfg = ErasureCodedStoreConfig::two_plus_one_test();
         let result = ErasureCodedStore::open(&[], cfg);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn receipt_invalid_stripe_configs_rejected_before_open() {
+        let paths = make_paths(1, "invalid-stripe-config");
+
+        for (data_shards, parity_shards) in [(0, 1), (1, 0)] {
+            let result = ErasureCodedStore::open(
+                &paths,
+                ErasureCodedStoreConfig {
+                    data_shards,
+                    parity_shards,
+                    shard_len: 8,
+                    store_options: StoreOptions::test_fast(),
+                    failure_domain: None,
+                    device_candidates: None,
+                },
+            );
+            assert!(result.is_err());
+        }
+
+        cleanup_dirs(&paths);
     }
 
     // --- 4+2 survives 2 losses ---
@@ -2115,6 +2288,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn async_read_classifies_verified_wrong_length_shard_as_decode_failure() {
+        let paths = make_paths(3, "async-malformed-shard");
+        let mut store =
+            ErasureCodedStore::open(&paths, ErasureCodedStoreConfig::two_plus_one_test()).unwrap();
+        let name = b"malformed-shard";
+        store.put_named(name, b"payload").unwrap();
+
+        let key = ObjectKey::from_name(name);
+        let prefix = object_prefix(key);
+        let shard_key = shard_object_key(key, 0, 0);
+        let malformed = encode_verified_shard(&prefix, 0, 0, &[0; 255]).unwrap();
+        store.stores[0].put(shard_key, &malformed).unwrap();
+
+        let runtime = EcStoreRuntime::new(store);
+        let err = runtime.read_path(name).execute().await.unwrap_err();
+        assert!(matches!(err, EcStoreError::DecodeFailed(_)));
+
+        cleanup_dirs(&paths);
+    }
+
+    #[tokio::test]
     async fn async_repair_reconstructs_shard() {
         let paths = make_paths(3, "asyncrepair");
         let mut store =
@@ -2138,6 +2332,32 @@ mod tests {
         let read = rp.execute().await.unwrap().unwrap();
         assert_eq!(read.payload, b"repair-me-async");
         assert!(!read.degraded);
+
+        cleanup_dirs(&paths);
+    }
+
+    #[tokio::test]
+    async fn async_repair_refuses_unrecoverable_stripe() {
+        let paths = make_paths(3, "async-repair-unrecoverable");
+        let mut store =
+            ErasureCodedStore::open(&paths, ErasureCodedStoreConfig::two_plus_one_test()).unwrap();
+        store.put_named("r", b"repair-must-fail").unwrap();
+
+        for store_index in 0..2 {
+            for key in store.stores[store_index].list_keys() {
+                store.stores[store_index].delete(key).unwrap();
+            }
+        }
+
+        let runtime = EcStoreRuntime::new(store);
+        let err = runtime.repair_path(0).execute().await.unwrap_err();
+        assert!(matches!(
+            err,
+            EcStoreError::RepairFailed {
+                store_index: 0,
+                ref reason,
+            } if reason.contains("insufficient shards")
+        ));
 
         cleanup_dirs(&paths);
     }

@@ -54,8 +54,8 @@ use tidefs_durability_layout::{
     DurabilityLayoutV1, DurabilityPolicy, FailureDomainLevel, FailureDomainV1,
 };
 use tidefs_erasure_coding::{
-    encode as encode_erasure_stripe, reconstruct as reconstruct_erasure_stripe, ErasureShard,
-    ShardKind, StripeConfig,
+    encode_receipt_stripe, reconstruct_receipt_stripe, ErasureShard, ReceiptStripeError, ShardKind,
+    StripeConfig,
 };
 use tidefs_placement_planner::{
     AllocationRequest, DeviceHealthCapacity, HashRingPlacementPlanner, PlacementDecision,
@@ -2410,10 +2410,11 @@ impl Pool {
             parity_shards: parity_shards as usize,
             shard_len,
         };
-        let encoded =
-            encode_erasure_stripe(&stripe_config, payload).ok_or(StoreError::InvalidOptions {
+        let encoded = encode_receipt_stripe(&stripe_config, payload).map_err(|_| {
+            StoreError::InvalidOptions {
                 reason: "erasure encoder rejected pool placement payload",
-            })?;
+            }
+        })?;
         receipt.shard_len = shard_len as u32;
 
         let mut written = Vec::with_capacity(receipt.targets.len());
@@ -2778,13 +2779,36 @@ impl Pool {
             shard_len,
         };
         let width = config.stripe_width();
+        if receipt.targets.len() != width {
+            return Err(StoreError::InvalidOptions {
+                reason: "invalid erasure placement receipt availability set",
+            });
+        }
         let mut available = vec![None; width];
+        let mut seen_indices = vec![false; width];
 
         for target in &receipt.targets {
             let shard_index = target.shard_index as usize;
             if shard_index >= width {
-                continue;
+                return Err(StoreError::InvalidOptions {
+                    reason: "invalid erasure placement receipt availability set",
+                });
             }
+            if seen_indices[shard_index] {
+                return Err(StoreError::InvalidOptions {
+                    reason: "invalid erasure placement receipt availability set",
+                });
+            }
+            let role_matches_index = match target.role {
+                PlacementTargetRole::Data => shard_index < config.data_shards,
+                PlacementTargetRole::Parity => shard_index >= config.data_shards,
+            };
+            if !role_matches_index {
+                return Err(StoreError::InvalidOptions {
+                    reason: "invalid erasure placement receipt availability set",
+                });
+            }
+            seen_indices[shard_index] = true;
             let Some(idx) = self.resolve_receipt_target(target) else {
                 continue;
             };
@@ -2806,8 +2830,19 @@ impl Pool {
             });
         }
 
-        let Some(mut reconstructed) = reconstruct_erasure_stripe(&config, &available, None) else {
-            return Ok(None);
+        let mut reconstructed = match reconstruct_receipt_stripe(&config, &available) {
+            Ok(reconstructed) => reconstructed,
+            Err(ReceiptStripeError::InsufficientShards { .. }) => return Ok(None),
+            Err(ReceiptStripeError::InvalidAvailableSet { .. }) => {
+                return Err(StoreError::InvalidOptions {
+                    reason: "invalid erasure placement receipt availability set",
+                });
+            }
+            Err(ReceiptStripeError::EncodeRejected) => {
+                return Err(StoreError::InvalidOptions {
+                    reason: "erasure placement receipt reconstruction rejected payload",
+                });
+            }
         };
         reconstructed.payload.truncate(receipt.payload_len as usize);
         if digest32(&reconstructed.payload) != receipt.payload_digest {
@@ -6365,6 +6400,138 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn erasure_policy_rejects_malformed_receipt_target_set() {
+        let root = temp_dir("erasure-receipt-out-of-range");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = multi_data_device_config(&root, 4);
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::erasure(2, 1),
+            ..PoolProperties::default()
+        };
+        let mut pool = Pool::create(config, properties, &test_options()).unwrap();
+        set_deterministic_device_guids(&mut pool);
+
+        let key = ObjectKey::from_name(b"erasure-receipt-out-of-range");
+        let payload = b"payload large enough to span both data shards";
+        pool.put(IoClass::Data, key, payload).unwrap();
+
+        let mut receipt = pool
+            .placement_receipt_for_key(IoClass::Data, key)
+            .unwrap()
+            .expect("erasure receipt must persist");
+        receipt.planner_replay_receipt = None;
+
+        let mut under_width = receipt.clone();
+        assert!(under_width.targets.pop().is_some());
+        let err = pool.get_erasure_with_receipt(&under_width).unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::InvalidOptions {
+                reason: "invalid erasure placement receipt availability set"
+            }
+        ));
+
+        receipt.targets[0].shard_index = receipt.targets.len() as u16;
+        let err = pool.get_erasure_with_receipt(&receipt).unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::InvalidOptions {
+                reason: "invalid erasure placement receipt availability set"
+            }
+        ));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn erasure_policy_rejects_duplicate_receipt_shard() {
+        let root = temp_dir("erasure-receipt-duplicate-shard");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = multi_data_device_config(&root, 4);
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::erasure(2, 1),
+            ..PoolProperties::default()
+        };
+        let mut pool = Pool::create(config, properties, &test_options()).unwrap();
+        set_deterministic_device_guids(&mut pool);
+
+        let key = ObjectKey::from_name(b"erasure-receipt-duplicate-shard");
+        let payload = b"payload large enough to span both data shards";
+        pool.put(IoClass::Data, key, payload).unwrap();
+
+        let mut receipt = pool
+            .placement_receipt_for_key(IoClass::Data, key)
+            .unwrap()
+            .expect("erasure receipt must persist");
+        receipt.planner_replay_receipt = None;
+        receipt.targets[1].shard_index = receipt.targets[0].shard_index;
+        let err = pool.get_erasure_with_receipt(&receipt).unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::InvalidOptions {
+                reason: "invalid erasure placement receipt availability set"
+            }
+        ));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn erasure_policy_rejects_receipt_role_mismatch() {
+        fn assert_rejects_role_mismatch(
+            root_name: &str,
+            shard_index: u16,
+            role: PlacementTargetRole,
+        ) {
+            let root = temp_dir(root_name);
+            let _ = std::fs::remove_dir_all(&root);
+            let config = multi_data_device_config(&root, 4);
+            let properties = PoolProperties {
+                redundancy_policy: PoolRedundancyPolicy::erasure(2, 1),
+                ..PoolProperties::default()
+            };
+            let mut pool = Pool::create(config, properties, &test_options()).unwrap();
+            set_deterministic_device_guids(&mut pool);
+
+            let key = ObjectKey::from_name(root_name.as_bytes());
+            let payload = b"payload large enough to span both data shards";
+            pool.put(IoClass::Data, key, payload).unwrap();
+
+            let mut receipt = pool
+                .placement_receipt_for_key(IoClass::Data, key)
+                .unwrap()
+                .expect("erasure receipt must persist");
+            receipt.planner_replay_receipt = None;
+            receipt
+                .targets
+                .iter_mut()
+                .find(|target| target.shard_index == shard_index)
+                .expect("target shard")
+                .role = role;
+            let err = pool.get_erasure_with_receipt(&receipt).unwrap_err();
+            assert!(matches!(
+                err,
+                StoreError::InvalidOptions {
+                    reason: "invalid erasure placement receipt availability set"
+                }
+            ));
+
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        assert_rejects_role_mismatch(
+            "erasure-receipt-data-index-as-parity",
+            0,
+            PlacementTargetRole::Parity,
+        );
+        assert_rejects_role_mismatch(
+            "erasure-receipt-parity-index-as-data",
+            2,
+            PlacementTargetRole::Data,
+        );
     }
 
     #[test]

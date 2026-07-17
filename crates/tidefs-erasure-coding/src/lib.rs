@@ -271,6 +271,107 @@ pub struct Reconstruction {
     pub rebuilt_shards: Vec<ErasureShard>,
 }
 
+/// Encoded stripe material for receipt-tracked placement paths.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReceiptEncodedStripe {
+    /// Data and parity shards ready for placement and receipt publication.
+    pub shards: Vec<ErasureShard>,
+    /// Original payload bytes represented by this stripe before padding.
+    pub original_payload_len: usize,
+}
+
+/// Reconstructed stripe material for receipt-tracked read and repair paths.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReceiptReconstructedStripe {
+    /// Reconstructed payload, including any stripe padding.
+    pub payload: Vec<u8>,
+    /// Missing shards rebuilt during reconstruction for repair evidence.
+    pub rebuilt_shards: Vec<ErasureShard>,
+}
+
+/// Receipt-tracked stripe helper failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReceiptStripeError {
+    EncodeRejected,
+    InvalidAvailableSet { slots: usize, expected: usize },
+    InsufficientShards { available: usize, needed: usize },
+}
+
+/// Return the validated width for a receipt-tracked stripe configuration.
+///
+/// Receipt paths require at least one data and parity shard, non-zero shard
+/// length, a representable data capacity, and a width supported by GF(2^8).
+#[must_use]
+pub fn receipt_stripe_width(config: &StripeConfig) -> Option<usize> {
+    if config.data_shards == 0 || config.parity_shards == 0 || config.shard_len == 0 {
+        return None;
+    }
+    config.data_shards.checked_mul(config.shard_len)?;
+    config
+        .data_shards
+        .checked_add(config.parity_shards)
+        .filter(|width| *width <= 255)
+}
+
+pub fn encode_receipt_stripe(
+    config: &StripeConfig,
+    payload: &[u8],
+) -> Result<ReceiptEncodedStripe, ReceiptStripeError> {
+    receipt_stripe_width(config).ok_or(ReceiptStripeError::EncodeRejected)?;
+    let encoded = encode(config, payload).ok_or(ReceiptStripeError::EncodeRejected)?;
+    Ok(ReceiptEncodedStripe {
+        shards: encoded.shards,
+        original_payload_len: encoded.original_payload_len,
+    })
+}
+
+pub fn reconstruct_receipt_stripe(
+    config: &StripeConfig,
+    available: &[Option<ErasureShard>],
+) -> Result<ReceiptReconstructedStripe, ReceiptStripeError> {
+    let Some(expected) = receipt_stripe_width(config) else {
+        return Err(ReceiptStripeError::InvalidAvailableSet {
+            slots: available.len(),
+            expected: config.data_shards.saturating_add(config.parity_shards),
+        });
+    };
+    if available.len() != expected {
+        return Err(ReceiptStripeError::InvalidAvailableSet {
+            slots: available.len(),
+            expected,
+        });
+    }
+    for (slot, shard) in available.iter().enumerate() {
+        let Some(shard) = shard else {
+            continue;
+        };
+        let expected_kind = if slot < config.data_shards {
+            ShardKind::Data
+        } else {
+            ShardKind::Parity
+        };
+        if shard.index != slot
+            || shard.kind != expected_kind
+            || shard.bytes.len() != config.shard_len
+        {
+            return Err(ReceiptStripeError::InvalidAvailableSet {
+                slots: available.len(),
+                expected,
+            });
+        }
+    }
+    let available_count = available.iter().filter(|shard| shard.is_some()).count();
+    let reconstructed =
+        reconstruct(config, available, None).ok_or(ReceiptStripeError::InsufficientShards {
+            available: available_count,
+            needed: config.data_shards,
+        })?;
+    Ok(ReceiptReconstructedStripe {
+        payload: reconstructed.payload,
+        rebuilt_shards: reconstructed.rebuilt_shards,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Encode
 // ---------------------------------------------------------------------------
