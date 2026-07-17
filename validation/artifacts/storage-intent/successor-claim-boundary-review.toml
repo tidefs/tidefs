@@ -1,0 +1,145 @@
+artifact_version = 1
+claim_id = "storage.intent.successor_comparator.v1"
+evidence_class = "storage-intent-successor-claim-boundary-review"
+issue = "https://github.com/tidefs/tidefs/issues/2048"
+generated_at = "2026-07-17T14:02:32Z"
+source_ref = "836a17e96e37011c19a1cd68995ac1b92a75e4bd"
+reviewed_source_commit = "836a17e96e37011c19a1cd68995ac1b92a75e4bd"
+assessment = "fail-closed"
+summary = "Storage-intent successor wording must consume every named hard boundary below plus independently validated local and distributed split claims; current source-model evidence records the refusal boundary only."
+required_boundary_names = [
+  "policy",
+  "placement",
+  "media",
+  "cost",
+  "scheduler",
+  "satisfaction",
+  "data-shape",
+  "layout",
+  "decision-frontier",
+  "result/refusal",
+  "preflight",
+  "rollout",
+  "tenant-isolation",
+  "temporal",
+  "evidence-query",
+]
+residual_risk = [
+  "This mapping is source-model review, not runtime evidence that any boundary is satisfied for a comparator envelope.",
+  "The split local and distributed claims remain blocked and cannot be replaced by umbrella prose.",
+  "No matched incumbent workload, topology, media, cost, fault, recovery, or attribution evidence is supplied here.",
+]
+non_claims = [
+  "No OpenZFS, Ceph, DRBD, ext4/XFS, local-filesystem, or clustered-storage successor claim is admitted.",
+  "No performance, availability, durability, geo/RPO, release-readiness, or production-readiness claim is admitted.",
+  "No runtime behavior, public API, claim registry status, generated claim document, or product wording changes.",
+]
+
+[[split_inputs]]
+claim_id = "storage.local.successor_comparator.v1"
+artifact_path = "validation/artifacts/successor/local-successor-comparator-claim.toml"
+current_status = "BLOCKED"
+required_effect = "refuse umbrella admission"
+
+[[split_inputs]]
+claim_id = "storage.distributed.successor_comparator.v1"
+artifact_path = "validation/artifacts/successor/distributed-successor-comparator-claim.toml"
+current_status = "BLOCKED"
+required_effect = "refuse umbrella admission"
+
+[[consumed_boundaries]]
+boundary = "policy"
+authority = "docs/STORAGE_INTENT_POLICY_AUTHORITY.md#policy-contract"
+consumed_evidence = "Policy identity and revision, requested acknowledgment and recovery floor, workload and service-objective scope, source provenance, overrides, and downgrade authorization."
+claim_effect = "A stale, mixed, missing, or weaker policy revision refuses comparison."
+
+[[consumed_boundaries]]
+boundary = "placement"
+authority = "docs/STORAGE_INTENT_POLICY_AUTHORITY.md#receipt-honesty"
+consumed_evidence = "Placement width, proximity, failure-domain, membership, quorum, locator, recovery, and earned placement receipt evidence for the exact compared mode."
+claim_effect = "A placement label or prototype without an earned receipt is non-comparable."
+
+[[consumed_boundaries]]
+boundary = "media"
+authority = "docs/STORAGE_INTENT_POLICY_AUTHORITY.md#media-role-legality"
+consumed_evidence = "Legal media role, capability generation, flush and fence semantics, health, durability, cache behavior, wear, and recovery limits."
+claim_effect = "A device type, speed label, or locality does not make a comparator envelope legal."
+
+[[consumed_boundaries]]
+boundary = "cost"
+authority = "docs/STORAGE_INTENT_SERVICE_OBJECTIVE_DESIGN.md#evidence-record-shape"
+consumed_evidence = "Capacity, reserve, write amplification, flash wear, movement debt, egress, power, operator cost, payback, and protected-budget evidence."
+claim_effect = "Unknown or out-of-envelope cost and wear evidence refuses cost-effectiveness or superiority wording."
+
+[[consumed_boundaries]]
+boundary = "scheduler"
+authority = "docs/STORAGE_INTENT_SERVICE_OBJECTIVE_DESIGN.md#first-model-projection-contract"
+consumed_evidence = "Lane, queue, admission, burst, dwell, backpressure, budget, starvation, noisy-neighbor, and protected-tail evidence."
+claim_effect = "Throughput cannot hide queueing, starvation, or protected-tail harm."
+
+[[consumed_boundaries]]
+boundary = "satisfaction"
+authority = "crates/tidefs-storage-intent-satisfaction/src/lib.rs"
+consumed_evidence = "Coherent satisfied, converging, degraded-visible, cache-only, unknown, blocked, refused, or unsafe-visible state for the compared policy and evidence cut."
+claim_effect = "Consumers may not reconstruct satisfaction from isolated subsystem facts."
+
+[[consumed_boundaries]]
+boundary = "data-shape"
+authority = "docs/STORAGE_INTENT_POLICY_AUTHORITY.md#policy-contract"
+consumed_evidence = "Record size, compression, checksum, encryption boundary, dedup scope, erasure shape, coalescing, rebake, transform, and digest evidence."
+claim_effect = "A result for one data shape cannot be generalized to another."
+
+[[consumed_boundaries]]
+boundary = "layout"
+authority = "docs/STORAGE_INTENT_POLICY_AUTHORITY.md#decision-frontier-and-accountability"
+consumed_evidence = "Allocation geometry, fragmentation, zones, erase blocks, free runs, reclaim, lifecycle, locality, amplification, and source-retirement constraints."
+claim_effect = "Layout scores are considered only after legality gates pass."
+
+[[consumed_boundaries]]
+boundary = "decision-frontier"
+authority = "docs/STORAGE_INTENT_POLICY_AUTHORITY.md#decision-frontier-and-accountability"
+consumed_evidence = "Bounded candidate set, hard gates, typed unknowns, score vector with units, tie-breaker, counterfactual, evidence snapshot, and measurement attribution."
+claim_effect = "Illegal or unknown candidates may be recorded but cannot become comparator wins."
+
+[[consumed_boundaries]]
+boundary = "result/refusal"
+authority = "docs/STORAGE_INTENT_RESULT_REFUSAL_EVIDENCE_DESIGN.md#record-shape"
+consumed_evidence = "Canonical result identity, earned receipt or blocker, degraded visibility, retry law, caller projection, response cut, and retention proof."
+claim_effect = "Missing evidence, no quorum, degraded state, or objective failure cannot collapse into generic success."
+
+[[consumed_boundaries]]
+boundary = "preflight"
+authority = "docs/STORAGE_INTENT_POLICY_AUTHORITY.md#decision-frontier-and-accountability"
+consumed_evidence = "Preflight or simulated mode, complete hard-gate inputs, no-cutover proof, reserve and admission refs, and typed defer or refusal."
+claim_effect = "Preflight and simulation guide work but are not live authority, receipts, or claim evidence."
+
+[[consumed_boundaries]]
+boundary = "rollout"
+authority = "docs/STORAGE_INTENT_POLICY_AUTHORITY.md#policy-contract"
+consumed_evidence = "Draft, staged, active, converging, rollback, superseded, mixed-revision, unsafe-mode, publication, and downgrade-authorization state."
+claim_effect = "Mixed or stale rollout state is visible and refuses unqualified comparison."
+
+[[consumed_boundaries]]
+boundary = "tenant-isolation"
+authority = "docs/STORAGE_INTENT_SERVICE_OBJECTIVE_DESIGN.md#evidence-record-shape"
+consumed_evidence = "Tenant and budget owner, fair share, borrow and debt, reserve exemptions, starvation, noisy-neighbor harm, throttle, and protected p99 evidence."
+claim_effect = "One tenant's performance cannot be reported as a win when another tenant pays hidden harm."
+
+[[consumed_boundaries]]
+boundary = "temporal"
+authority = "docs/STORAGE_INTENT_POLICY_AUTHORITY.md#native-records"
+consumed_evidence = "Generation, epoch, producer watermark, freshness and invalidation frontiers, observation windows, retention, replay, and audit anchors."
+claim_effect = "Evidence outside the compared temporal cut is stale or non-comparable."
+
+[[consumed_boundaries]]
+boundary = "evidence-query"
+authority = "docs/STORAGE_INTENT_POLICY_AUTHORITY.md#evidence-queries-and-consistent-cuts"
+consumed_evidence = "Complete-for-purpose bounded snapshot across receipt, ordering, membership, trust, capacity, recovery, rollout, isolation, workload, temporal, media, decision, action, measurement, retention, data-shape, layout, lifecycle, transport, validation, and claim families."
+claim_effect = "Unbounded scans, cache-local guesses, dashboard samples, redacted gaps, or mixed-policy bundles refuse claim admission."
+
+[admission]
+all_named_boundaries_mapped = true
+all_named_boundaries_currently_proven_for_comparison = false
+local_split_validated = false
+distributed_split_validated = false
+umbrella_product_facing_admission = "refused"

@@ -1,0 +1,85 @@
+artifact_version = 1
+claim_id = "storage.intent.successor_comparator.v1"
+evidence_class = "distributed-storage-successor-comparator-claim"
+issue = "https://github.com/tidefs/tidefs/issues/2048"
+generated_at = "2026-07-17T14:02:32Z"
+source_ref = "836a17e96e37011c19a1cd68995ac1b92a75e4bd"
+reviewed_source_commit = "836a17e96e37011c19a1cd68995ac1b92a75e4bd"
+assessment = "fail-closed"
+summary = "The distributed split evidence set is present, but storage.distributed.successor_comparator.v1 remains blocked; the umbrella therefore refuses distributed successor, superiority, and comparator-performance admission."
+residual_risk = [
+  "The referenced evidence is source-model boundary evidence, not matched incumbent measurement or multi-process distributed comparator proof.",
+  "A present split evidence set does not override the split claim's blocked registry status.",
+  "This artifact cannot admit local, release-ready, production-ready, or broad storage-intent successor wording.",
+]
+
+[split_claim]
+claim_id = "storage.distributed.successor_comparator.v1"
+registry_status = "blocked"
+validation_status = "BLOCKED"
+required_evidence_status = "all five registered classes PRESENT"
+validation_command = "tidefs-xtask validate-claim storage.distributed.successor_comparator.v1"
+product_facing_admission = "refused"
+reason = "The split claim registry status is blocked even though its registered source-model evidence manifests are present and pass schema and digest checks."
+
+[[split_evidence]]
+evidence_class = "distributed-storage-comparator-equivalence-evidence"
+artifact_path = "validation/artifacts/successor/distributed-comparator-equivalence.json"
+manifest_path = "validation/artifacts/successor/distributed-comparator-equivalence.manifest.json"
+content_digest = "blake3:80b680b1e381e5382a05dce5ea9aaf64778142f46047d12c7237039c4ddd3e12"
+run_id = "manual-review:issue-2047-distributed-comparator-equivalence-v1"
+source_ref = "refs/heads/codex3/issue-2047-distributed-successor-evidence"
+validation_tier = "source-model"
+outcome = "pass"
+receipt_status = "PRESENT"
+
+[[split_evidence]]
+evidence_class = "distributed-storage-successor-performance-fault-set"
+artifact_path = "validation/artifacts/successor/distributed-performance-fault-set.json"
+manifest_path = "validation/artifacts/successor/distributed-performance-fault-set.manifest.json"
+content_digest = "blake3:9c05e4bb3ef8783a2eb68c71595ac0d4a938591a18512858714ba5f49826cbf7"
+run_id = "manual-review:issue-2047-distributed-performance-fault-set-v1"
+source_ref = "refs/heads/codex3/issue-2047-distributed-successor-evidence"
+validation_tier = "source-model"
+outcome = "pass"
+receipt_status = "PRESENT"
+
+[[split_evidence]]
+evidence_class = "distributed-storage-successor-claim-boundary-review"
+artifact_path = "validation/artifacts/successor/distributed-claim-boundary-review.toml"
+manifest_path = "validation/artifacts/successor/distributed-claim-boundary-review.manifest.json"
+content_digest = "blake3:4aef05dbb787b21cd410b947fad268fc4793e5b91f233f402af5e1e88c25ceca"
+run_id = "manual-review:issue-2047-distributed-claim-boundary-review-v1"
+source_ref = "refs/heads/codex3/issue-2047-distributed-successor-evidence"
+validation_tier = "source-model"
+outcome = "pass"
+receipt_status = "PRESENT"
+
+[[split_evidence]]
+evidence_class = "distributed-storage-operator-explanation-evidence"
+artifact_path = "validation/artifacts/successor/distributed-operator-explanation.json"
+manifest_path = "validation/artifacts/successor/distributed-operator-explanation.manifest.json"
+content_digest = "blake3:8d2248d4fcde63b7f73bba65c0a13a67033ed4631664ece483b35eddee8c1bb9"
+run_id = "manual-review:issue-2047-distributed-operator-explanation-v1"
+source_ref = "refs/heads/codex3/issue-2047-distributed-successor-evidence"
+validation_tier = "source-model"
+outcome = "pass"
+receipt_status = "PRESENT"
+
+[[split_evidence]]
+evidence_class = "claims-gate-review"
+artifact_path = "validation/artifacts/successor/distributed-successor-comparator-claims-gate-review.toml"
+manifest_path = "validation/artifacts/successor/distributed-successor-comparator-claims-gate-review.manifest.json"
+content_digest = "blake3:ccb1306ca303c0403c50b4e9e3540cd362d4ce4dbfa323516b3ac0bd0e0d95e6"
+run_id = "manual-review:issue-2047-distributed-successor-comparator-claims-gate-review-v1"
+source_ref = "refs/heads/codex3/issue-2047-distributed-successor-evidence"
+validation_tier = "source-model"
+outcome = "pass"
+receipt_status = "PRESENT"
+
+[umbrella_boundary]
+split_truth_preserved = true
+umbrella_substitution_allowed = false
+successor_wording_allowed = false
+comparator_winner_wording_allowed = false
+admission_condition = "A future review must validate the distributed split claim itself and the local split claim itself before the umbrella can support product-facing wording."

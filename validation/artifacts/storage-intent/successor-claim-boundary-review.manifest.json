@@ -1,0 +1,16 @@
+{
+  "manifest_version": 2,
+  "claim_id": "storage.intent.successor_comparator.v1",
+  "evidence_class": "storage-intent-successor-claim-boundary-review",
+  "validation_tier": "source-model",
+  "scope": "source-model map of the fifteen storage-intent hard boundaries consumed by any successor or comparator wording",
+  "artifact_path": "validation/artifacts/storage-intent/successor-claim-boundary-review.toml",
+  "content_digest": "blake3:b261f685957e6df2e6b726d1f3ec37e19e945afa10a0de0349cfe1d11eede115",
+  "run_id": "deterministic-fixture:issue-2048-successor-claim-boundary-review-v1",
+  "source_ref": "836a17e96e37011c19a1cd68995ac1b92a75e4bd",
+  "outcome": "pass",
+  "residual_risk": "This map is source-model boundary evidence only. It does not prove that any boundary is satisfied for a matched comparator envelope, validate either split claim, or admit product-facing successor wording.",
+  "source": "issue-2048-source-review",
+  "generated_at": "2026-07-17T14:02:32Z",
+  "blocking_issues": []
+}

@@ -1,0 +1,16 @@
+{
+  "manifest_version": 2,
+  "claim_id": "storage.intent.successor_comparator.v1",
+  "evidence_class": "distributed-storage-successor-comparator-claim",
+  "validation_tier": "source-model",
+  "scope": "source-model fail-closed receipt for the blocked distributed successor comparator split claim and its concrete evidence manifests",
+  "artifact_path": "validation/artifacts/successor/distributed-successor-comparator-claim.toml",
+  "content_digest": "blake3:40a4020325fe57ac25e9d6a46aafcd60b4ac7de27c08df3a4724c53c7dc3a950",
+  "run_id": "deterministic-fixture:issue-2048-distributed-successor-comparator-claim-v1",
+  "source_ref": "836a17e96e37011c19a1cd68995ac1b92a75e4bd",
+  "outcome": "pass",
+  "residual_risk": "This receipt proves only that the distributed split evidence set and blocked result were reviewed. It does not validate the distributed split claim or admit multi-process, incumbent-comparison, successor, production, or release wording.",
+  "source": "issue-2048-source-review",
+  "generated_at": "2026-07-17T14:02:32Z",
+  "blocking_issues": []
+}
