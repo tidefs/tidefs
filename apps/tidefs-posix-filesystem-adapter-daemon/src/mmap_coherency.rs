@@ -240,8 +240,9 @@ struct MmapInvalidationSink<'a> {
 
 impl MmapInvalidationSink<'_> {
     fn retry_deferred(&mut self, event_budget: usize) -> usize {
+        let attempt_budget = event_budget.min(self.deferred_invalidations.lock().unwrap().len());
         let mut attempted = 0;
-        while attempted < event_budget {
+        while attempted < attempt_budget {
             let Some((ino, generation)) = self.deferred_invalidations.lock().unwrap().pop_front()
             else {
                 break;
@@ -421,6 +422,27 @@ mod tests {
         let registration = regs.get(&42).expect("registered inode remains tracked");
         assert!(registration.active);
         assert_eq!(registration.generation, 4);
+    }
+
+    #[test]
+    fn dirty_deferred_invalidation_is_retried_once_per_tick() {
+        let c = new_coherency();
+        let calls = Arc::new(AtomicU64::new(0));
+        let check_calls = Arc::clone(&calls);
+        c.register(42, 1);
+        c.set_dirty_check(Some(Box::new(move |ino| {
+            check_calls.fetch_add(1, Ordering::Relaxed);
+            ino == 42
+        })));
+
+        c.enqueue_batch(batch(42, 2));
+        assert_eq!(c.process_tick(16), 1);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(c.deferred_invalidation_count(), 1);
+
+        assert_eq!(c.process_tick(16), 1);
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert_eq!(c.deferred_invalidation_count(), 1);
     }
 
     #[test]
