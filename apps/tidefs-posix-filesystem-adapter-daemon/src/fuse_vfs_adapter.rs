@@ -8372,7 +8372,10 @@ impl FuseVfsAdapter {
                 0,
             );
             let bridge = crate::fuse_flush_fsync::PageCacheDirtyFlush::new(
-                self.writeback_page_cache.as_ref(),
+                // The bridge clears its optional mirror as soon as the lower
+                // flush succeeds. Keep both directory mirrors dirty until the
+                // final fsyncdir barrier and tracker completion succeed.
+                None,
                 &**e,
                 &synthetic_fh,
                 ctx,
@@ -8420,6 +8423,11 @@ impl FuseVfsAdapter {
         if tracker_completion_failed {
             return Err(Errno::EIO);
         }
+        let directory_ino = handle.dh.inode_id.get();
+        if let Some(ref writeback_page_cache) = self.writeback_page_cache {
+            writeback_page_cache.clear_dirty_for_inode(directory_ino);
+        }
+        self.write_page_cache.clear_dirty_for_inode(directory_ino);
         Ok(())
     }
 
@@ -42107,6 +42115,8 @@ mod tests {
     fn dispatch_fsyncdir_drains_writeback_range_tracker() {
         let (mut fixture, tracker) = adapter_fixture_with_writeback_tracker();
         let ctx = root_ctx();
+        let writeback_page_cache = Arc::new(PageCache::new(8, 4096));
+        fixture.adapter.writeback_page_cache = Some(Arc::clone(&writeback_page_cache));
 
         // Open the root directory for fsyncdir.
         let root = {
@@ -42123,6 +42133,16 @@ mod tests {
         {
             tracker.lock().unwrap().mark_dirty(root, 0, 4096);
         }
+        let _ = writeback_page_cache
+            .insert(root.get(), 0)
+            .expect("insert directory writeback mirror");
+        writeback_page_cache.mark_dirty(root.get(), 0);
+        let _ = fixture
+            .adapter
+            .write_page_cache
+            .insert(root.get(), 0)
+            .expect("insert directory adapter mirror");
+        fixture.adapter.write_page_cache.mark_dirty(root.get(), 0);
         assert!(tracker.lock().unwrap().is_dirty(root));
 
         // Run fsyncdir — must drain the tracker for the directory inode.
@@ -42134,6 +42154,11 @@ mod tests {
         );
 
         assert!(!tracker.lock().unwrap().is_dirty(root));
+        assert!(!writeback_page_cache.has_dirty_pages_for_inode(root.get()));
+        assert!(!fixture
+            .adapter
+            .write_page_cache
+            .has_dirty_pages_for_inode(root.get()));
 
         fixture
             .adapter
@@ -42167,11 +42192,32 @@ mod tests {
             let dh = EngineDirHandle::new(inode, DirHandleId::new(7));
             adapter.dir_handles.lock().unwrap().insert(dh);
             tracker.lock().unwrap().mark_dirty(inode, 1024, 2048);
+            let writeback_page_cache = Arc::new(PageCache::new(8, 4096));
+            let _ = writeback_page_cache
+                .insert(inode.get(), 0)
+                .expect("insert directory writeback mirror");
+            writeback_page_cache.mark_dirty(inode.get(), 0);
+            adapter.writeback_page_cache = Some(Arc::clone(&writeback_page_cache));
+            let _ = adapter
+                .write_page_cache
+                .insert(inode.get(), 0)
+                .expect("insert directory adapter mirror");
+            adapter.write_page_cache.mark_dirty(inode.get(), 0);
 
             assert_eq!(
                 adapter.dispatch_fsyncdir(&root_ctx(), inode.get(), dh.dh_id.get(), false),
                 Err(Errno::EIO),
                 "{failure_stage} must fail the caller-visible barrier"
+            );
+            assert!(
+                writeback_page_cache.has_dirty_pages_for_inode(inode.get()),
+                "{failure_stage} must retain the writeback mirror"
+            );
+            assert!(
+                adapter
+                    .write_page_cache
+                    .has_dirty_pages_for_inode(inode.get()),
+                "{failure_stage} must retain the adapter write mirror"
             );
 
             let tracker = tracker.lock().unwrap();
