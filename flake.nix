@@ -3498,6 +3498,7 @@ EOF
             pkgs.rdma-core
             pkgs.bash
             pkgs.coreutils
+            pkgs.util-linux
             self.packages.${system}.tidefsFuseRuntime
           ] ''
             # Nix store helpers cannot retain setuid, so use the runner's
@@ -3519,6 +3520,15 @@ EOF
               ln -s "$host_fusermount" "$fuse_helper_dir/fusermount3"
               ln -s "$host_fusermount" "$fuse_helper_dir/fusermount"
               export PATH="$fuse_helper_dir:$PATH"
+            fi
+            # When no helper is installed, retry the row with mount authority
+            # confined to an unprivileged user and mount namespace.
+            if [ -z "$host_fusermount" ] \
+              && [ "$(id -u)" -ne 0 ] \
+              && [ -z "''${TIDEFS_FUSE_USERNS:-}" ] \
+              && unshare --user --map-root-user true 2>/dev/null; then
+              export TIDEFS_FUSE_USERNS=1
+              exec unshare --user --map-root-user --mount --fork --mount-proc "$0" "$@"
             fi
             export PKG_CONFIG_PATH="${pkgs.fuse3.dev}/lib/pkgconfig:${pkgs.rdma-core.dev}/lib/pkgconfig''${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
             export LIBRARY_PATH="${pkgs.rdma-core}/lib''${LIBRARY_PATH:+:$LIBRARY_PATH}"
