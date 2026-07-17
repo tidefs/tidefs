@@ -3863,9 +3863,12 @@ fn live_admin_u64_arg_or_default(args: &Value, key: &str, default: u64) -> Resul
 }
 
 fn live_admin_hex_16_or_default(args: &Value, key: &str) -> Result<[u8; 16], String> {
-    match live_admin_optional_arg(args, key) {
-        Some(value) => live_admin_hex_to_16(value),
-        None => Ok([0; 16]),
+    match args.get(key) {
+        None | Some(Value::Null) => Ok([0; 16]),
+        Some(Value::String(value)) if !value.is_empty() => live_admin_hex_to_16(value),
+        Some(_) => Err(format!(
+            "live admin argument '{key}' must be a non-empty string"
+        )),
     }
 }
 
@@ -8811,6 +8814,48 @@ mod tests {
             assert_eq!(
                 refused["error"],
                 "snapshot send: format must be a non-empty string"
+            );
+            assert!(!output.exists());
+        }
+    }
+
+    #[test]
+    fn live_snapshot_send_rejects_malformed_vfssend2_ids_without_zero_fallback() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = root.path().join("store");
+        let mut fs = LocalFileSystem::open(&store).expect("open fs");
+        fs.create_file("/live.txt", 0o644).expect("create file");
+        fs.write_file("/live.txt", 0, b"live owner snapshot send")
+            .expect("write file");
+        let engine = VfsLocalFileSystem::new(fs);
+
+        for (field, label, shape, value) in [
+            ("pool_id", "pool-id", "empty", json!("")),
+            ("pool_id", "pool-id", "non-string", json!(false)),
+            ("dataset_id", "dataset-id", "empty", json!("")),
+            ("dataset_id", "dataset-id", "non-string", json!(false)),
+        ] {
+            let output = root.path().join(format!("malformed-{field}-{shape}.vfs"));
+            let mut args = json!({
+                "output": output.display().to_string(),
+                "format": "vfssend2",
+                "incremental": false,
+            });
+            args.as_object_mut()
+                .expect("snapshot send args object")
+                .insert(field.to_string(), value);
+
+            let refused = live_snapshot_admin(&engine, "send", args, true);
+
+            assert_eq!(refused["ok"], false, "send response: {refused}");
+            assert_eq!(refused["exit_code"], 1);
+            assert!(refused["json"].is_null());
+            assert!(refused["text"].is_null());
+            assert_eq!(
+                refused["error"],
+                format!(
+                    "snapshot send: invalid {label}: live admin argument '{field}' must be a non-empty string"
+                )
             );
             assert!(!output.exists());
         }
