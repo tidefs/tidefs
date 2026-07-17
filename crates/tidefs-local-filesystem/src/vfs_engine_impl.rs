@@ -4160,11 +4160,20 @@ fn live_snapshot_send_destination(args: &Value) -> Result<LiveSnapshotSendDestin
                 output,
             })
         }
-        None => output
-            .map(LiveSnapshotSendDestination::Output)
-            .ok_or_else(|| {
-                "snapshot send: --output or --target-addr is required for live pools".to_string()
-            }),
+        None => {
+            if let Some(key) = ["node_id", "server_node_id"]
+                .into_iter()
+                .find(|key| !matches!(args.get(*key), None | Some(Value::Null)))
+            {
+                return Err(format!("snapshot send: {key} requires target-addr"));
+            }
+            output
+                .map(LiveSnapshotSendDestination::Output)
+                .ok_or_else(|| {
+                    "snapshot send: --output or --target-addr is required for live pools"
+                        .to_string()
+                })
+        }
     }
 }
 
@@ -8375,6 +8384,42 @@ mod tests {
                     .as_str()
                     .is_some_and(|err| { err.contains(key) && err.contains("unsigned integer") }),
                 "target response should explain malformed {key}: {refused}"
+            );
+            assert!(!output.exists());
+        }
+    }
+
+    #[test]
+    fn live_snapshot_send_rejects_target_node_ids_without_local_fallback() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = root.path().join("store");
+        let mut fs = LocalFileSystem::open(&store).expect("open fs");
+        fs.create_file("/live.txt", 0o644).expect("create file");
+        fs.write_file("/live.txt", 0, b"live owner snapshot send")
+            .expect("write file");
+        let engine = VfsLocalFileSystem::new(fs);
+
+        for key in ["node_id", "server_node_id"] {
+            let output = root.path().join(format!("{key}-without-target.vfs"));
+            let mut args = json!({
+                "output": output.display().to_string(),
+                "target_addr": null,
+                "format": "vfssend2",
+                "incremental": false,
+            });
+            args.as_object_mut()
+                .expect("snapshot send args object")
+                .insert(key.to_string(), Value::Number(7.into()));
+
+            let refused = live_snapshot_admin(&engine, "send", args, true);
+
+            assert_eq!(refused["ok"], false, "send response: {refused}");
+            assert_eq!(refused["exit_code"], 1);
+            assert!(refused["json"].is_null());
+            assert!(refused["text"].is_null());
+            assert_eq!(
+                refused["error"],
+                format!("snapshot send: {key} requires target-addr")
             );
             assert!(!output.exists());
         }
