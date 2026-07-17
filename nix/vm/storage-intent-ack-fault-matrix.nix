@@ -300,7 +300,7 @@ INITSCRIPT
       awk '
         /TIDEFS_ACK_FAULT_MATRIX_REPORT_BEGIN/ { in_json = 1; next }
         /TIDEFS_ACK_FAULT_MATRIX_REPORT_END/ { in_json = 0; next }
-        in_json { print }
+        in_json { sub(/\r$/, ""); print }
       ' "$log" > "$ARTIFACT_JSON"
       if [ ! -s "$ARTIFACT_JSON" ]; then
         echo "HARNESS FAIL: no acknowledgment fault report was extracted" >&2
