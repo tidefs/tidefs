@@ -2982,6 +2982,11 @@ pub struct FuseVfsAdapter {
     readahead_state: Mutex<Option<(u64, u64, u32)>>,
     /// Page-cache for write-path dirty tracking and writeback coordination.
     pub(crate) write_page_cache: Arc<PageCache>,
+    /// Extends lower engine-write ordering through adapter cache and dirty-range
+    /// reconciliation. Without this gate, a later engine write can complete
+    /// before an earlier request patches its mirrors, allowing stale bytes to
+    /// win after the engine mutex is released.
+    write_cache_reconciliation: Arc<Mutex<()>>,
     write_dispatch: Mutex<DaemonWriteDispatch<256>>,
     /// Short-lived getattr result cache: (FuseAttrOut, expiry). Invalidation
     /// on setattr or write to the same inode.
@@ -3114,6 +3119,7 @@ impl FuseVfsAdapter {
             writeback_page_cache: None,
             readahead_state: Mutex::new(None),
             write_page_cache: Arc::new(PageCache::new(1024, 4096)),
+            write_cache_reconciliation: Arc::new(Mutex::new(())),
             write_dispatch: Mutex::new(DaemonWriteDispatch::new()),
             getattr_cache: Mutex::new(HashMap::new()),
             path_lookup_cache: Mutex::new(PathLookupCache::new(
@@ -6738,6 +6744,12 @@ impl FuseVfsAdapter {
         let clean_plain_write_through = self.writeback_cache_enabled
             && !posix_direct_io
             && self.block_volume.lock().unwrap().is_none();
+        // The engine mutex orders lower writes, but clean write-through mirror
+        // refreshes intentionally run after that mutex is released. Extend the
+        // same request order through cache/tracker reconciliation so a later
+        // write cannot publish first and then be overwritten by stale mirror
+        // work from an earlier request.
+        let write_cache_reconciliation_guard = self.write_cache_reconciliation.lock().unwrap();
 
         // FUSE_WRITE_CACHE is still write-through to the engine.  The
         // asynchronous writeback authority is not complete enough to
@@ -6896,7 +6908,8 @@ impl FuseVfsAdapter {
                     release_fallback(&mut fallback_to_release);
                     return Err(Errno::EIO);
                 };
-                if let Err(errno) = self.record_clean_write_through_after_write(
+                if let Err(errno) = self.record_clean_write_through_after_ordered_write(
+                    &write_cache_reconciliation_guard,
                     ino,
                     effective_offset as u64,
                     written,
@@ -6976,6 +6989,7 @@ impl FuseVfsAdapter {
                     return Err(errno);
                 }
             }
+            drop(write_cache_reconciliation_guard);
             // O_SYNC / O_DSYNC durability (A11/A16 sync-edge gap):
             // when the file descriptor was opened with O_SYNC or O_DSYNC,
             // flush dirty data through the engine and commit to storage
@@ -7099,7 +7113,8 @@ impl FuseVfsAdapter {
                 if let Ok(written) = write_result.as_ref() {
                     let written_len = usize::try_from(*written).map_err(|_| Errno::EIO)?;
                     let written_data = data.get(..written_len).ok_or(Errno::EIO)?;
-                    self.record_clean_write_through_after_write(
+                    self.record_clean_write_through_after_ordered_write(
+                        &write_cache_reconciliation_guard,
                         ino,
                         effective_offset as u64,
                         *written,
@@ -7125,6 +7140,7 @@ impl FuseVfsAdapter {
                     }
                 }
             }
+            drop(write_cache_reconciliation_guard);
 
             if let Some(attr) = post_write_attr {
                 self.sync_namespace_attrs_after_engine_write(ino, &attr);
@@ -7464,6 +7480,19 @@ impl FuseVfsAdapter {
         Ok(())
     }
 
+    /// Finish a clean write-through while retaining the ordering gate acquired
+    /// before the corresponding lower engine write.
+    fn record_clean_write_through_after_ordered_write(
+        &self,
+        _write_cache_reconciliation_guard: &std::sync::MutexGuard<'_, ()>,
+        ino: u64,
+        offset: u64,
+        written: u32,
+        written_data: &[u8],
+    ) -> Result<(), Errno> {
+        self.record_clean_write_through_after_write(ino, offset, written, written_data)
+    }
+
     fn update_clean_write_through_page_cache(
         &self,
         cache: &PageCache,
@@ -7474,7 +7503,47 @@ impl FuseVfsAdapter {
         if data.is_empty() {
             return;
         }
-        let _ = cache.patch_resident_clean_range(ino, offset, data);
+        let page_size = cache.page_size() as u64;
+        if page_size == 0 {
+            return;
+        }
+        let Ok(data_len) = u64::try_from(data.len()) else {
+            return;
+        };
+        let Some(end) = offset.checked_add(data_len) else {
+            return;
+        };
+        let mut page_offset = (offset / page_size) * page_size;
+        while page_offset < end {
+            let copy_start = offset.max(page_offset);
+            let copy_end = end.min(page_offset.saturating_add(page_size));
+            if copy_start < copy_end {
+                let Ok(src_start) = usize::try_from(copy_start - offset) else {
+                    return;
+                };
+                let Ok(dst_start) = usize::try_from(copy_start - page_offset) else {
+                    return;
+                };
+                let Ok(copy_len) = usize::try_from(copy_end - copy_start) else {
+                    return;
+                };
+                if let Some(mut page) = cache.lookup(ino, page_offset) {
+                    // The caller checked for dirty overlap before arriving
+                    // here, but another owner can dirty the page between that
+                    // check and this lookup. Never turn that newer ownership
+                    // clean or overwrite its bytes.
+                    if !page.is_dirty()
+                        && !page.is_writeback()
+                        && copy_len <= data.len().saturating_sub(src_start)
+                        && copy_len <= page.data().len().saturating_sub(dst_start)
+                    {
+                        page.data_mut()[dst_start..dst_start + copy_len]
+                            .copy_from_slice(&data[src_start..src_start + copy_len]);
+                    }
+                }
+            }
+            page_offset = page_offset.saturating_add(page_size);
+        }
     }
 
     fn reconcile_write_through_dirty_range_without_block_volume(
@@ -38827,6 +38896,7 @@ mod tests {
         acl_xattr: Result<Vec<u8>, Errno>,
         open_result: Result<EngineFileHandle, Errno>,
         write_result: Result<u32, Errno>,
+        write_observer: Option<Arc<dyn Fn() + Send + Sync>>,
         flush_result: Result<(), Errno>,
         create_result: Result<(InodeAttr, EngineFileHandle), Errno>,
         mkdir_result: Result<InodeAttr, Errno>,
@@ -38841,6 +38911,7 @@ mod tests {
                 acl_xattr: Err(Errno::ENOSYS),
                 open_result: Err(Errno::ENOSYS),
                 write_result: Err(Errno::ENOSYS),
+                write_observer: None,
                 flush_result: Err(Errno::ENOSYS),
                 create_result: Err(Errno::ENOSYS),
                 mkdir_result: Err(Errno::ENOSYS),
@@ -38923,6 +38994,11 @@ mod tests {
 
         fn with_write_ok(mut self, written: u32) -> Self {
             self.write_result = Ok(written);
+            self
+        }
+
+        fn with_write_observer(mut self, observer: Arc<dyn Fn() + Send + Sync>) -> Self {
+            self.write_observer = Some(observer);
             self
         }
 
@@ -39095,6 +39171,9 @@ mod tests {
             data: &[u8],
             ctx: &RequestCtx,
         ) -> Result<u32, Errno> {
+            if let Some(observer) = self.write_observer.as_ref() {
+                observer();
+            }
             self.write_result
         }
         fn flush(&self, fh: &EngineFileHandle, ctx: &RequestCtx) -> Result<(), Errno> {
@@ -43002,6 +43081,79 @@ mod tests {
 
         assert!(!adapter.is_writeback_cache_enabled());
         assert!(adapter.writeback_page_cache.is_none());
+    }
+
+    #[test]
+    fn write_dispatch_holds_cache_reconciliation_gate_during_engine_write() {
+        let gate = Arc::new(Mutex::new(()));
+        let observed_writes = Arc::new(AtomicU64::new(0));
+        let observed_writes_from_engine = Arc::clone(&observed_writes);
+        let gate_from_engine = Arc::clone(&gate);
+        let engine = AclMockEngine::new()
+            .with_root(1)
+            .with_attr(0, 0, 0o666)
+            .with_no_acl()
+            .with_open_ok()
+            .with_write_ok(4)
+            .with_write_observer(Arc::new(move || {
+                assert!(matches!(
+                    gate_from_engine.try_lock(),
+                    Err(std::sync::TryLockError::WouldBlock)
+                ));
+                observed_writes_from_engine.fetch_add(1, Ordering::Relaxed);
+            }));
+        let mut adapter = FuseVfsAdapter::new(Box::new(engine))
+            .expect("create adapter")
+            .with_writeback_cache_enabled();
+        adapter.write_cache_reconciliation = Arc::clone(&gate);
+        let ctx = root_ctx();
+        let open = adapter
+            .dispatch_open_entry(&ctx, 1, libc::O_RDWR as u32)
+            .expect("open writable file");
+
+        let written = adapter
+            .dispatch_write(&ctx, 1, open.adapter_fh, 0, b"gate", FUSE_WRITE_CACHE)
+            .expect("write through ordered reconciliation gate");
+
+        assert_eq!(written, 4);
+        assert_eq!(observed_writes.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn clean_write_through_patch_preserves_new_dirty_owner() {
+        let fixture = adapter_fixture_with_writeback_cache();
+        let ino = 91;
+        let page_size = fixture.adapter.write_page_cache.page_size();
+        let original = vec![0x37; page_size];
+        fixture
+            .adapter
+            .write_page_cache
+            .insert(ino, 0)
+            .expect("insert resident page");
+        {
+            let mut page = fixture
+                .adapter
+                .write_page_cache
+                .lookup(ino, 0)
+                .expect("lookup resident page");
+            page.data_mut().copy_from_slice(&original);
+            page.mark_dirty();
+        }
+
+        fixture.adapter.update_clean_write_through_page_cache(
+            &fixture.adapter.write_page_cache,
+            ino,
+            1024,
+            &[0xA6; 512],
+        );
+
+        let page = fixture
+            .adapter
+            .write_page_cache
+            .lookup(ino, 0)
+            .expect("dirty page remains resident");
+        assert_eq!(page.data(), original.as_slice());
+        assert!(page.is_dirty(), "newer dirty ownership must remain intact");
     }
 
     #[test]
