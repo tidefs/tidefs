@@ -119,15 +119,6 @@ pub(crate) fn route_with_format_and_args(
     })
 }
 
-pub(crate) fn route_if_owner_exists_with_args(
-    command: &str,
-    operation: &str,
-    pool: &str,
-    args: LivePoolAdminArgs,
-) {
-    route_if_owner_exists_with_format_and_args(command, operation, pool, false, args);
-}
-
 pub(crate) fn route_if_owner_exists_with_format_and_args(
     command: &str,
     operation: &str,

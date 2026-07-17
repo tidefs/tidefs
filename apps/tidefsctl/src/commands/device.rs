@@ -4,26 +4,26 @@
 //!
 //! ## Media authority
 //!
-//! Imported pools route to the live owner before this module opens any store.
-//! Product-facing device lifecycle commands operate on byte-addressable pool
-//! devices. Retired directory object-store evacuation/rebuild arguments fail
-//! closed instead of acting as operator pool media.
+//! Device status routes to the live owner before this module opens any store.
+//! Device removal currently fails closed before live-owner dispatch because the
+//! mounted path cannot yet publish evacuation evidence together with durable,
+//! replayable topology-label updates. Retired directory object-store
+//! evacuation/rebuild arguments also fail closed instead of acting as operator
+//! pool media.
 
 use std::path::PathBuf;
 use std::process;
 
 use clap::Subcommand;
-use tidefs_device_removal::admission::DEVICE_REMOVAL_AUTHORITY_KIND;
-use tidefs_vfs_engine::{LivePoolAdminArg, LivePoolAdminArgs};
 
 /// Device management subcommands.
 #[derive(Subcommand, Debug)]
 pub enum DeviceCommand {
     /// Remove a device from a pool.
     ///
-    /// Imported pools route to the live owner.
+    /// Refused until the live owner can publish durable detach evidence.
     Remove {
-        /// Pool name. If the pool is imported, the request is routed to its live owner.
+        /// Pool whose live-owner detach authority is required.
         pool_name: String,
 
         /// Path to the block device to remove.
@@ -158,12 +158,10 @@ fn handle_remove(
     device_path: &PathBuf,
     backing_dir: Option<&PathBuf>,
     surviving_dirs: &[PathBuf],
-    replication_factor: u8,
-    failure_domain: &str,
-    force: bool,
+    _replication_factor: u8,
+    _failure_domain: &str,
+    _force: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let live_args = device_remove_live_args(device_path, replication_factor, failure_domain, force);
-
     if let Some(backing_dir) = backing_dir {
         return Err(format!(
             "offline device removal through --backing-dir {} is retired; \
@@ -184,39 +182,11 @@ fn handle_remove(
         .into());
     }
 
-    super::live_owner::route_if_owner_exists_with_args("device", "remove", pool_name, live_args);
     Err(format!(
-        "pool-name device removal for '{pool_name}' requires a reachable live owner to provide committed evacuation receipt authority for device '{}'; route through the kernel UAPI or userspace daemon owner. Directory-backed offline device removal is retired.",
+        "online device removal for pool '{pool_name}' device '{}' is refused before contacting a live owner: the mounted removal path cannot yet publish a replayable committed evacuation receipt together with durable topology/label updates. No device state was changed. This refusal is a detach-durability boundary; it does not establish secure erase or media-remanence guarantees.",
         device_path.display()
     )
     .into())
-}
-
-fn device_remove_live_args(
-    device_path: &PathBuf,
-    replication_factor: u8,
-    failure_domain: &str,
-    force: bool,
-) -> LivePoolAdminArgs {
-    super::live_owner::live_admin_args([
-        (
-            "device_path",
-            LivePoolAdminArg::String(device_path.to_string_lossy().into_owned()),
-        ),
-        (
-            "replication_factor",
-            LivePoolAdminArg::U64(replication_factor.into()),
-        ),
-        (
-            "failure_domain",
-            LivePoolAdminArg::String(failure_domain.to_string()),
-        ),
-        ("force", LivePoolAdminArg::Bool(force)),
-        (
-            "required_authority",
-            LivePoolAdminArg::String(DEVICE_REMOVAL_AUTHORITY_KIND.to_string()),
-        ),
-    ])
 }
 
 /// Query live device status through the live owner, or fail closed
@@ -250,7 +220,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn removal_without_offline_backing_dir_requires_live_owner() {
+    fn removal_refuses_before_incomplete_live_owner_mutation() {
         let result = handle_remove(
             "testpool",
             &PathBuf::from("/dev/disk0"),
@@ -263,13 +233,16 @@ mod tests {
 
         assert!(
             result.is_err(),
-            "pool-name-only removal should require a live owner"
+            "online removal must fail closed until detach evidence is durable"
         );
         let msg = result.unwrap_err().to_string();
         assert!(
-            msg.contains("requires a reachable live owner")
-                && msg.contains("committed evacuation receipt authority"),
-            "expected live-owner refusal, got {msg}"
+            msg.contains("refused before contacting a live owner")
+                && msg.contains("replayable committed evacuation receipt")
+                && msg.contains("durable topology/label updates")
+                && msg.contains("No device state was changed")
+                && msg.contains("does not establish secure erase or media-remanence guarantees"),
+            "expected durable-detach refusal, got {msg}"
         );
     }
 
@@ -405,40 +378,5 @@ mod tests {
             .any(|line| line.contains("evidence:   refused")));
         assert_eq!(json["freshness"], "fresh.truth_view.refused.f4");
         assert_eq!(json["source"], "source.truth_view.runtime_mirror.a2");
-    }
-
-    #[test]
-    fn device_remove_fails_closed_for_pool_name_only() {
-        // device remove with only a pool name must require a live owner.
-        // The routing is validated through the handler and live_owner tests.
-        let result = handle_remove(
-            "testpool",
-            &PathBuf::from("/dev/disk0"),
-            None,
-            &[],
-            2,
-            "device",
-            false,
-        );
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("requires a reachable live owner"));
-        assert!(msg.contains("committed evacuation receipt authority"));
-    }
-
-    #[test]
-    fn device_remove_live_args_request_receipt_authority() {
-        let args = device_remove_live_args(&PathBuf::from("/dev/disk0"), 2, "device", false);
-
-        assert_eq!(
-            args.0.get("required_authority"),
-            Some(&LivePoolAdminArg::String(
-                DEVICE_REMOVAL_AUTHORITY_KIND.to_string()
-            ))
-        );
-        assert_eq!(
-            args.0.get("device_path"),
-            Some(&LivePoolAdminArg::String("/dev/disk0".to_string()))
-        );
     }
 }
