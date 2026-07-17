@@ -182,6 +182,16 @@ impl PoolExporter {
             });
         }
 
+        let mut unique_device_guids = std::collections::BTreeSet::new();
+        for (index, device_guid) in device_guids.iter().copied().enumerate() {
+            if !unique_device_guids.insert(device_guid) {
+                return Err(ExportError::LabelValidationFailed {
+                    device_path: device_configs[index].path.clone(),
+                    reason: "duplicate device GUID values in export topology".to_string(),
+                });
+            }
+        }
+
         let label_commit_group = commit_group + 1;
         let expected_device_count = u32::try_from(device_configs.len()).map_err(|_| {
             ExportError::LabelValidationFailed {
@@ -1070,6 +1080,76 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(first_path);
         let _ = std::fs::remove_dir_all(missing_path);
+    }
+
+    #[test]
+    fn export_preflight_refuses_duplicate_device_guids_without_mutation() {
+        let first_path = unique_export_path("duplicate-guid-first");
+        let second_path = unique_export_path("duplicate-guid-second");
+        let pool_guid = [0x43; 16];
+        let device_guid = [0x19; 16];
+        write_export_label_with_device_count(
+            &first_path,
+            pool_guid,
+            device_guid,
+            0,
+            1024 * 1024 * 1024,
+            1,
+            2,
+        );
+        write_export_label_with_device_count(
+            &second_path,
+            pool_guid,
+            device_guid,
+            1,
+            1024 * 1024 * 1024,
+            1,
+            2,
+        );
+        let configs = [
+            export_device_config(first_path.clone()),
+            export_device_config(second_path.clone()),
+        ];
+        let mut writes = 0;
+
+        let result = PoolExporter::export_pool_with_writer(
+            &configs,
+            pool_guid,
+            &[device_guid, device_guid],
+            "testpool",
+            12,
+            |_, _| {
+                writes += 1;
+                Ok(())
+            },
+        );
+
+        match result {
+            Err(ExportError::LabelValidationFailed {
+                device_path,
+                reason,
+            }) => {
+                assert_eq!(device_path, second_path);
+                assert!(reason.contains("duplicate device GUID"));
+            }
+            other => panic!("expected LabelValidationFailed, got {other:?}"),
+        }
+        assert_eq!(writes, 0);
+        assert_eq!(
+            PoolExporter::read_existing_label(&first_path)
+                .unwrap()
+                .pool_state,
+            LabelPoolState::Active
+        );
+        assert_eq!(
+            PoolExporter::read_existing_label(&second_path)
+                .unwrap()
+                .pool_state,
+            LabelPoolState::Active
+        );
+
+        let _ = std::fs::remove_dir_all(first_path);
+        let _ = std::fs::remove_dir_all(second_path);
     }
 
     #[test]
