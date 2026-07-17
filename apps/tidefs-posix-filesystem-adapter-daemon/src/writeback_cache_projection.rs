@@ -297,7 +297,11 @@ impl WritebackProjection {
     /// all tracked inodes.
     #[must_use]
     pub fn total_dirty_or_writeback_bytes(&self) -> u64 {
-        self.lanes.lock().unwrap().values().map(|l| l.bytes()).sum()
+        self.lanes
+            .lock()
+            .unwrap()
+            .values()
+            .fold(0_u64, |total, lane| total.saturating_add(lane.bytes()))
     }
 
     /// Return a snapshot of the observable projection stats.
@@ -343,7 +347,11 @@ impl WritebackProjection {
             .lock()
             .unwrap()
             .get(&ino)
-            .map(|dr| dr.ranges().iter().map(|&(start, end)| end - start).sum())
+            .map(|dr| {
+                dr.ranges().iter().fold(0_u64, |total, &(start, end)| {
+                    total.saturating_add(end.saturating_sub(start))
+                })
+            })
             .unwrap_or(0)
     }
 
@@ -352,7 +360,9 @@ impl WritebackProjection {
     #[must_use]
     pub(crate) fn page_cache_dirty_total(page_cache: Option<&Arc<PageCache>>, ino: u64) -> u64 {
         page_cache
-            .map(|pc| pc.dirty_pages_for_inode(ino).len() as u64 * pc.page_size() as u64)
+            .map(|pc| {
+                (pc.dirty_pages_for_inode(ino).len() as u64).saturating_mul(pc.page_size() as u64)
+            })
             .unwrap_or(0)
     }
 
@@ -364,7 +374,8 @@ impl WritebackProjection {
         page_cache: Option<&Arc<PageCache>>,
         ino: u64,
     ) -> u64 {
-        Self::dirty_ranges_total(dirty_state, ino) + Self::page_cache_dirty_total(page_cache, ino)
+        Self::dirty_ranges_total(dirty_state, ino)
+            .saturating_add(Self::page_cache_dirty_total(page_cache, ino))
     }
 
     /// Return this projection's stored [`PageCache`] dirty byte count for
@@ -661,6 +672,15 @@ mod tests {
         assert_eq!(p.total_dirty_or_writeback_bytes(), 8192 + 16384);
         p.record_clean(10);
         assert_eq!(p.total_dirty_or_writeback_bytes(), 16384);
+    }
+
+    #[test]
+    fn total_dirty_or_writeback_bytes_saturates() {
+        let p = new_projection();
+        p.record_dirty(10, u64::MAX);
+        p.record_writeback_pending(20, 1);
+
+        assert_eq!(p.total_dirty_or_writeback_bytes(), u64::MAX);
     }
 
     #[test]
