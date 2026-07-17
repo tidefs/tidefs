@@ -194,6 +194,23 @@
             ];
           };
 
+          tidefsScrubForegroundReadValidation = import ./nix/packages/tidefs.nix {
+            inherit (pkgs) lib pkg-config;
+            inherit (pkgs) fuse3 rdma-core;
+            rustPlatform = rustPlatform;
+            src = tidefsWorkspaceSrc;
+            cargoLock = {
+              lockFile = ./Cargo.lock;
+            };
+            cargoBuildFlags = [
+              "-p" "tidefs-validation"
+              "--bin" "scrub_foreground_read_validation"
+            ];
+            workspaceBins = [
+              "scrub_foreground_read_validation"
+            ];
+          };
+
           tidefsUblkRuntime = import ./nix/packages/tidefs.nix {
             inherit (pkgs) lib pkg-config;
             inherit (pkgs) fuse3 rdma-core;
@@ -449,6 +466,7 @@
             inherit pkgs;
             linuxKernel_7_0 = linuxKernel_7_0;
             tidefsPackage = default;
+            scrubValidationPackage = tidefsScrubForegroundReadValidation;
           };
 
           tidefsFuseFioBenchmark = pkgs.runCommand "tidefs-fuse-fio-benchmark-deprecated" { } ''
@@ -3491,50 +3509,41 @@ EOF
           '';
           qemu-smoke = qemuSourceApp "tidefs-qemu-smoke";
           scrub-foreground-read-runtime = script "tidefs-scrub-foreground-read-runtime" [
-            rustToolchain
-            pkgs.stdenv.cc
-            pkgs.pkg-config
-            pkgs.fuse3
-            pkgs.rdma-core
             pkgs.bash
             pkgs.coreutils
-            pkgs.util-linux
-            self.packages.${system}.tidefsFuseRuntime
           ] ''
-            # Nix store helpers cannot retain setuid, so use the runner's
-            # privileged FUSE helper when one is explicitly installed.
-            host_fusermount=""
-            for candidate in \
-              /run/wrappers/bin/fusermount3 \
-              /run/wrappers/bin/fusermount \
-              /usr/bin/fusermount3 \
-              /usr/bin/fusermount; do
-              if [ -x "$candidate" ] && [ -u "$candidate" ]; then
-                host_fusermount="$candidate"
-                break
-              fi
+            row="scrub-foreground-read-runtime"
+            output_dir="."
+            while [ "$#" -gt 0 ]; do
+              case "$1" in
+                --row)
+                  [ "$#" -ge 2 ] || { echo "--row requires a value" >&2; exit 2; }
+                  row="$2"
+                  shift 2
+                  ;;
+                --output-dir)
+                  [ "$#" -ge 2 ] || { echo "--output-dir requires a value" >&2; exit 2; }
+                  output_dir="$2"
+                  shift 2
+                  ;;
+                --help|-h)
+                  echo "usage: tidefs-scrub-foreground-read-runtime --row scrub-foreground-read-runtime --output-dir DIR"
+                  exit 0
+                  ;;
+                *)
+                  echo "unknown argument: $1" >&2
+                  exit 2
+                  ;;
+              esac
             done
-            if [ -n "$host_fusermount" ]; then
-              fuse_helper_dir="$(mktemp -d)"
-              trap 'rm -rf "$fuse_helper_dir"' EXIT
-              ln -s "$host_fusermount" "$fuse_helper_dir/fusermount3"
-              ln -s "$host_fusermount" "$fuse_helper_dir/fusermount"
-              export PATH="$fuse_helper_dir:$PATH"
+            if [ "$row" != "scrub-foreground-read-runtime" ]; then
+              echo "unsupported row: $row" >&2
+              exit 2
             fi
-            # When no helper is installed, retry the row with mount authority
-            # confined to an unprivileged user and mount namespace.
-            if [ -z "$host_fusermount" ] \
-              && [ "$(id -u)" -ne 0 ] \
-              && [ -z "''${TIDEFS_FUSE_USERNS:-}" ] \
-              && unshare --user --map-root-user true 2>/dev/null; then
-              export TIDEFS_FUSE_USERNS=1
-              exec unshare --user --map-root-user --mount --fork --mount-proc "$0" "$@"
-            fi
-            export PKG_CONFIG_PATH="${pkgs.fuse3.dev}/lib/pkgconfig:${pkgs.rdma-core.dev}/lib/pkgconfig''${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
-            export LIBRARY_PATH="${pkgs.rdma-core}/lib''${LIBRARY_PATH:+:$LIBRARY_PATH}"
-            export LD_LIBRARY_PATH="${pkgs.lib.makeLibraryPath [ pkgs.fuse3 pkgs.rdma-core ]}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-            export TIDEFS_DAEMON_BIN="${self.packages.${system}.tidefsFuseRuntime}/bin/tidefs-posix-filesystem-adapter-daemon"
-            exec cargo run --locked -p tidefs-validation --bin scrub_foreground_read_validation -- "$@"
+            exec ${pkgs.bash}/bin/bash ${./.}/scripts/tidefs-fuse-vm-test \
+              --timeout 900 \
+              --scrub-foreground-read \
+              --validation-dir "$output_dir"
           '';
           fuse-vm-test = qemuSourceApp "tidefs-fuse-vm-test";
           fuse-fio-benchmark = qemuSourceApp "run-fuse-qemu-fio-baseline.sh";
