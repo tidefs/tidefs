@@ -1143,7 +1143,14 @@ fn resume_device_removal_if_pending(pool: &mut Pool) {
                 // instance. Keep the marker until a later topology load no
                 // longer contains the GUID, proving detach is replay-visible.
                 let _ = pool.safe_remove_device(&target_path);
-            } else {
+            } else if pool
+                .devices
+                .iter()
+                .all(|device| device.root() != marker.target_path.as_path())
+            {
+                // GUID absence is not detach evidence while the recorded path
+                // remains attached under a different identity. Preserve the
+                // marker so path rebinding cannot skip recovery.
                 let _ = std::fs::remove_file(&marker_path);
             }
         }
@@ -7833,6 +7840,29 @@ mod tests {
             .devices
             .iter()
             .any(|device| device.root() == target_path));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn safe_remove_device_resume_preserves_marker_for_rebound_target_path() {
+        let root = temp_dir("safe-remove-resume-rebound-target-path");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = multi_data_device_config(&root, 2);
+        let mut pool = Pool::create(config, PoolProperties::default(), &test_options()).unwrap();
+        set_deterministic_device_guids(&mut pool);
+        let target_path = pool.devices[1].root().to_path_buf();
+        let target_guid = pool.device_guid_for_index(1);
+        let marker_path = root.join(DEVICE_REMOVAL_MARKER_FILE);
+        persist_device_removal_marker(&root, &target_path, target_guid).unwrap();
+
+        pool.device_guids[1] = deterministic_device_guid(2);
+        resume_device_removal_if_pending(&mut pool);
+
+        let marker = read_device_removal_marker(&marker_path).unwrap();
+        assert_eq!(marker.target_path, target_path);
+        assert_eq!(marker.target_guid, target_guid);
+        assert_eq!(pool.stats().device_count, 2);
 
         let _ = std::fs::remove_dir_all(&root);
     }
