@@ -6654,6 +6654,12 @@ impl FuseVfsAdapter {
             }
             false => return Err(Errno::EBADF),
         }
+        // Extend lower engine-write order across append-offset and attribute
+        // resolution as well as post-write cache/tracker reconciliation. If
+        // append requests resolve EOF before taking this gate, they can select
+        // the same offset and later overwrite each other despite serialized
+        // lower writes.
+        let write_cache_reconciliation_guard = self.write_cache_reconciliation.lock().unwrap();
         // O_APPEND: atomically resolve current file size for append-only
         // writes. POSIX requires all writes to an O_APPEND file descriptor
         // to land at end-of-file regardless of any prior lseek or concurrent
@@ -6744,12 +6750,6 @@ impl FuseVfsAdapter {
         let clean_plain_write_through = self.writeback_cache_enabled
             && !posix_direct_io
             && self.block_volume.lock().unwrap().is_none();
-        // The engine mutex orders lower writes, but clean write-through mirror
-        // refreshes intentionally run after that mutex is released. Extend the
-        // same request order through cache/tracker reconciliation so a later
-        // write cannot publish first and then be overwritten by stale mirror
-        // work from an earlier request.
-        let write_cache_reconciliation_guard = self.write_cache_reconciliation.lock().unwrap();
 
         // FUSE_WRITE_CACHE is still write-through to the engine.  The
         // asynchronous writeback authority is not complete enough to
@@ -38891,6 +38891,7 @@ mod tests {
     struct AclMockEngine {
         root_inode: Result<InodeId, Errno>,
         attr: Result<InodeAttr, Errno>,
+        getattr_observer: Option<Arc<dyn Fn() + Send + Sync>>,
         lookup_result: Result<InodeAttr, Errno>,
         acl_xattr: Result<Vec<u8>, Errno>,
         open_result: Result<EngineFileHandle, Errno>,
@@ -38906,6 +38907,7 @@ mod tests {
             Self {
                 root_inode: Err(Errno::ENOSYS),
                 attr: Err(Errno::ENOSYS),
+                getattr_observer: None,
                 lookup_result: Err(Errno::ENOSYS),
                 acl_xattr: Err(Errno::ENOSYS),
                 open_result: Err(Errno::ENOSYS),
@@ -38954,6 +38956,11 @@ mod tests {
 
         fn with_getattr_result(mut self, result: Result<InodeAttr, Errno>) -> Self {
             self.attr = result;
+            self
+        }
+
+        fn with_getattr_observer(mut self, observer: Arc<dyn Fn() + Send + Sync>) -> Self {
+            self.getattr_observer = Some(observer);
             self
         }
 
@@ -39056,6 +39063,9 @@ mod tests {
             handle: Option<&EngineFileHandle>,
             ctx: &RequestCtx,
         ) -> Result<InodeAttr, Errno> {
+            if let Some(observer) = self.getattr_observer.as_ref() {
+                observer();
+            }
             self.attr
         }
         fn setattr(
@@ -43083,14 +43093,25 @@ mod tests {
     }
 
     #[test]
-    fn write_dispatch_holds_cache_reconciliation_gate_during_engine_write() {
+    fn write_dispatch_holds_cache_reconciliation_gate_from_append_resolution_through_engine_write()
+    {
         let gate = Arc::new(Mutex::new(()));
+        let observed_getattrs = Arc::new(AtomicU64::new(0));
         let observed_writes = Arc::new(AtomicU64::new(0));
+        let observed_getattrs_from_engine = Arc::clone(&observed_getattrs);
         let observed_writes_from_engine = Arc::clone(&observed_writes);
+        let gate_from_getattr = Arc::clone(&gate);
         let gate_from_engine = Arc::clone(&gate);
         let engine = AclMockEngine::new()
             .with_root(1)
             .with_attr(0, 0, 0o666)
+            .with_getattr_observer(Arc::new(move || {
+                assert!(matches!(
+                    gate_from_getattr.try_lock(),
+                    Err(std::sync::TryLockError::WouldBlock)
+                ));
+                observed_getattrs_from_engine.fetch_add(1, Ordering::Relaxed);
+            }))
             .with_no_acl()
             .with_open_ok()
             .with_write_ok(4)
@@ -43106,15 +43127,23 @@ mod tests {
             .with_writeback_cache_enabled();
         adapter.write_cache_reconciliation = Arc::clone(&gate);
         let ctx = root_ctx();
-        let open = adapter
-            .dispatch_open_entry(&ctx, 1, libc::O_RDWR as u32)
-            .expect("open writable file");
 
         let written = adapter
-            .dispatch_write(&ctx, 1, open.adapter_fh, 0, b"gate", FUSE_WRITE_CACHE)
+            .dispatch_write_with_request_flags(
+                &ctx,
+                1,
+                999_999,
+                0,
+                b"gate",
+                WriteDispatchFlags {
+                    write: FUSE_WRITE_CACHE,
+                    request_open: libc::O_WRONLY as u32 | libc::O_APPEND as u32,
+                },
+            )
             .expect("write through ordered reconciliation gate");
 
         assert_eq!(written, 4);
+        assert!(observed_getattrs.load(Ordering::Relaxed) >= 1);
         assert_eq!(observed_writes.load(Ordering::Relaxed), 1);
     }
 
@@ -43256,13 +43285,15 @@ mod tests {
                 .is_empty(),
             "write-through cache writes must not leave dirty page mirrors"
         );
-        let page = fixture
-            .adapter
-            .write_page_cache
-            .lookup(ino, 0)
-            .expect("dirty mirror remains resident");
-        assert_eq!(page.data(), payload.as_slice());
-        assert!(!page.is_dirty());
+        {
+            let page = fixture
+                .adapter
+                .write_page_cache
+                .lookup(ino, 0)
+                .expect("dirty mirror remains resident");
+            assert_eq!(page.data(), payload.as_slice());
+            assert!(!page.is_dirty());
+        }
 
         assert_eq!(
             fixture
