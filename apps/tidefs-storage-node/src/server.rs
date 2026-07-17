@@ -905,9 +905,19 @@ fn active_snapshot_barrier_peer_ids(ctx: &SessionContext) -> BTreeSet<u64> {
         .snapshot()
         .iter()
         .filter_map(|(member_id, state)| {
-            (*member_id != local_id
-                && *state == tidefs_membership_live::roster::RosterState::Active)
-                .then_some(member_id.0)
+            if *member_id == local_id
+                || *state != tidefs_membership_live::roster::RosterState::Active
+            {
+                return None;
+            }
+
+            match membership.detector.get_peer(*member_id) {
+                Some(peer) if !peer.can_hold_data() => None,
+                // Missing participant-role evidence stays fail-closed: keep
+                // the active member in the barrier set so the send cannot
+                // silently proceed without it.
+                _ => Some(member_id.0),
+            }
         })
         .collect()
 }
@@ -6682,12 +6692,19 @@ mod cluster_pool_handler_tests {
         (dir, backend)
     }
 
+    fn register_snapshot_barrier_test_peer_with_class(
+        ctx: &SessionContext,
+        peer_id: u64,
+        member_class: MemberClass,
+    ) {
+        ctx.membership
+            .lock()
+            .unwrap()
+            .add_peer(MemberId::new(peer_id), member_class, peer_id);
+    }
+
     fn register_snapshot_barrier_test_peer(ctx: &SessionContext, peer_id: u64) {
-        ctx.membership.lock().unwrap().add_peer(
-            MemberId::new(peer_id),
-            MemberClass::Voter,
-            peer_id,
-        );
+        register_snapshot_barrier_test_peer_with_class(ctx, peer_id, MemberClass::Voter);
     }
 
     fn full_send_exports(auth_key: RootAuthenticationKey) -> (Vec<u8>, Vec<u8>) {
@@ -6855,13 +6872,22 @@ mod cluster_pool_handler_tests {
     }
 
     #[test]
-    fn snapshot_barrier_before_send_refuses_active_roster_peer_without_session() {
+    fn snapshot_barrier_before_send_requires_data_bearing_roster_peers() {
         let (_dir, store) = frame_local_store();
         let ctx = frame_test_context(Arc::clone(&store));
-        register_snapshot_barrier_test_peer(&ctx, 2);
+        for (peer_id, member_class) in [
+            (2, MemberClass::Voter),
+            (3, MemberClass::Learner),
+            (4, MemberClass::DataOnly),
+            (5, MemberClass::WitnessOnly),
+            (6, MemberClass::ShadowOnly),
+            (7, MemberClass::Quarantined),
+        ] {
+            register_snapshot_barrier_test_peer_with_class(&ctx, peer_id, member_class);
+        }
 
         let err = run_snapshot_barrier_before_send(tidefs_transport::SessionId::new(1), &ctx, &[])
-            .expect_err("active roster peer without a storage session must refuse send");
+            .expect_err("data-bearing roster peers without storage sessions must refuse send");
 
         match &err {
             SnapshotBarrierSendError::MembershipPeerUnavailable {
@@ -6869,7 +6895,7 @@ mod cluster_pool_handler_tests {
                 peer_ids,
             } => {
                 assert!(*barrier_id > 0);
-                assert_eq!(peer_ids, &vec![2]);
+                assert_eq!(peer_ids, &vec![2, 3, 4]);
             }
             other => panic!("expected unavailable membership peer, got {other:?}"),
         }
