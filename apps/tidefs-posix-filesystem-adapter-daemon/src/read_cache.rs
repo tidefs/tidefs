@@ -15,8 +15,8 @@ use std::collections::{HashMap, VecDeque};
 
 /// Default byte limit for the FUSE read cache (64 MiB).
 ///
-/// This matches the ZFS ARC principle of a hard byte limit rather than an
-/// entry-count limit.  Per #857: without a byte limit, 256 cached files each
+/// The byte limit bounds total cached data independently of the entry-count
+/// limit.  Per #857: without a byte limit, 256 cached files each
 /// at 100 MB can consume 25 GB of RSS, risking OOM.
 pub const DEFAULT_READ_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
 
