@@ -8361,34 +8361,12 @@ impl FuseVfsAdapter {
             Vec::new()
         };
 
-        let sync_result = (|| {
-            // Flush dirty page-cache pages for the directory inode through the
-            // PageCacheDirtyFlush bridge. Construct a synthetic EngineFileHandle
-            // since the bridge requires one.
-            let synthetic_fh = EngineFileHandle::new(
-                handle.dh.inode_id,
-                0, // O_RDONLY
-                FileHandleId::new(0),
-                0,
-            );
-            let bridge = crate::fuse_flush_fsync::PageCacheDirtyFlush::new(
-                // The bridge clears its optional mirror as soon as the lower
-                // flush succeeds. Keep both directory mirrors dirty until the
-                // final fsyncdir barrier and tracker completion succeed.
-                None,
-                &**e,
-                &synthetic_fh,
-                ctx,
-            );
-            tidefs_local_filesystem::fuse_fsync::dispatch_namespace_fsync(
-                &bridge,
-                handle.dh.inode_id,
-                datasync,
-            )?;
-
-            // Persist directory metadata through the engine.
-            e.fsyncdir(&handle.dh, datasync, ctx)
-        })();
+        // Directory handles have their own engine barrier. The file-oriented
+        // PageCacheDirtyFlush bridge requires a real EngineFileHandle, and a
+        // fabricated directory file handle is rejected by the lower engine.
+        // Adapter page caches are write-through mirrors, so keep them dirty
+        // until the directory barrier and tracker completion succeed below.
+        let sync_result = e.fsyncdir(&handle.dh, datasync, ctx);
         drop(e);
 
         let mut tracker_completion_failed = false;
@@ -42168,73 +42146,50 @@ mod tests {
 
     #[test]
     fn dispatch_fsyncdir_failures_retain_writeback_error() {
-        for (failure_stage, engine) in [
-            (
-                "page-cache flush",
-                AclMockEngine::new()
-                    .with_root(1)
-                    .with_flush_error(Errno::EIO),
-            ),
-            (
-                "engine fsyncdir",
-                AclMockEngine::new()
-                    .with_root(1)
-                    .with_flush_ok()
-                    .with_fsyncdir_error(Errno::EIO),
-            ),
-        ] {
-            let tracker = Arc::new(Mutex::new(
-                tidefs_local_filesystem::dirty_page_tracker::DirtyPageTracker::new(),
-            ));
-            let mut adapter = make_adapter(engine);
-            adapter.writeback_range_tracker = Some(Arc::clone(&tracker));
-            let inode = InodeId::new(41);
-            let dh = EngineDirHandle::new(inode, DirHandleId::new(7));
-            adapter.dir_handles.lock().unwrap().insert(dh);
-            tracker.lock().unwrap().mark_dirty(inode, 1024, 2048);
-            let writeback_page_cache = Arc::new(PageCache::new(8, 4096));
-            let _ = writeback_page_cache
-                .insert(inode.get(), 0)
-                .expect("insert directory writeback mirror");
-            writeback_page_cache.mark_dirty(inode.get(), 0);
-            adapter.writeback_page_cache = Some(Arc::clone(&writeback_page_cache));
-            let _ = adapter
-                .write_page_cache
-                .insert(inode.get(), 0)
-                .expect("insert directory adapter mirror");
-            adapter.write_page_cache.mark_dirty(inode.get(), 0);
+        let tracker = Arc::new(Mutex::new(
+            tidefs_local_filesystem::dirty_page_tracker::DirtyPageTracker::new(),
+        ));
+        let mut adapter = make_adapter(
+            AclMockEngine::new()
+                .with_root(1)
+                .with_fsyncdir_error(Errno::EIO),
+        );
+        adapter.writeback_range_tracker = Some(Arc::clone(&tracker));
+        let inode = InodeId::new(41);
+        let dh = EngineDirHandle::new(inode, DirHandleId::new(7));
+        adapter.dir_handles.lock().unwrap().insert(dh);
+        tracker.lock().unwrap().mark_dirty(inode, 1024, 2048);
+        let writeback_page_cache = Arc::new(PageCache::new(8, 4096));
+        let _ = writeback_page_cache
+            .insert(inode.get(), 0)
+            .expect("insert directory writeback mirror");
+        writeback_page_cache.mark_dirty(inode.get(), 0);
+        adapter.writeback_page_cache = Some(Arc::clone(&writeback_page_cache));
+        let _ = adapter
+            .write_page_cache
+            .insert(inode.get(), 0)
+            .expect("insert directory adapter mirror");
+        adapter.write_page_cache.mark_dirty(inode.get(), 0);
 
-            assert_eq!(
-                adapter.dispatch_fsyncdir(&root_ctx(), inode.get(), dh.dh_id.get(), false),
-                Err(Errno::EIO),
-                "{failure_stage} must fail the caller-visible barrier"
-            );
-            assert!(
-                writeback_page_cache.has_dirty_pages_for_inode(inode.get()),
-                "{failure_stage} must retain the writeback mirror"
-            );
-            assert!(
-                adapter
-                    .write_page_cache
-                    .has_dirty_pages_for_inode(inode.get()),
-                "{failure_stage} must retain the adapter write mirror"
-            );
+        assert_eq!(
+            adapter.dispatch_fsyncdir(&root_ctx(), inode.get(), dh.dh_id.get(), false),
+            Err(Errno::EIO)
+        );
+        assert!(writeback_page_cache.has_dirty_pages_for_inode(inode.get()));
+        assert!(adapter
+            .write_page_cache
+            .has_dirty_pages_for_inode(inode.get()));
 
-            let tracker = tracker.lock().unwrap();
-            let ranges = tracker
-                .dirty_ranges(inode)
-                .unwrap_or_else(|| panic!("{failure_stage} must retain the dirty range"));
-            assert_eq!(ranges.len(), 1);
-            assert_eq!(
-                ranges[0].lifecycle_state(),
-                tidefs_local_filesystem::dirty_page_tracker::DirtyLifecycleState::ErrorPoisoned,
-                "{failure_stage} must poison the failed range"
-            );
-            assert!(
-                ranges[0].writeback_error().is_some(),
-                "{failure_stage} must retain a writeback error"
-            );
-        }
+        let tracker = tracker.lock().unwrap();
+        let ranges = tracker
+            .dirty_ranges(inode)
+            .expect("failed fsyncdir must retain the dirty range");
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(
+            ranges[0].lifecycle_state(),
+            tidefs_local_filesystem::dirty_page_tracker::DirtyLifecycleState::ErrorPoisoned
+        );
+        assert!(ranges[0].writeback_error().is_some());
     }
 
     #[test]
