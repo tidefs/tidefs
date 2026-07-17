@@ -237,7 +237,14 @@ impl PoolExporter {
                     written.push((device_path, rollback_label));
                 }
                 Err(e) => {
-                    // Rollback: restore ACTIVE state on all written devices.
+                    // The failed write may have changed one or both label
+                    // copies before reporting an error. Restore that device
+                    // as well as every earlier device.
+                    let _ = Self::rollback_device_label(
+                        &device_path,
+                        &rollback_label,
+                        &mut write_labels,
+                    );
                     for (path, original_label) in &written {
                         let _ =
                             Self::rollback_device_label(path, original_label, &mut write_labels);
@@ -1159,6 +1166,9 @@ mod tests {
                 if path == injected_failure_path.as_path()
                     && label.pool_state == LabelPoolState::Exported
                 {
+                    // Model an error reported after media was mutated, such
+                    // as a sync failure after one or both copies were written.
+                    PoolExporter::write_labels_to_device(path, label)?;
                     Err(ExportError::IoError("injected label write failure".into()))
                 } else {
                     PoolExporter::write_labels_to_device(path, label)
