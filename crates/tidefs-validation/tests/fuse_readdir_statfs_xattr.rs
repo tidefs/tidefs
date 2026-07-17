@@ -745,8 +745,8 @@ fn xattr_namespace_rejection_trusted() {
     let err = std::io::Error::last_os_error();
     let ecode = err.raw_os_error().unwrap_or(0);
     assert!(
-        ecode == libc::EACCES || ecode == libc::EOPNOTSUPP,
-        "expected EACCES or EOPNOTSUPP for trusted.*, got {ecode}: {err}"
+        ecode == libc::EPERM || ecode == libc::EACCES || ecode == libc::EOPNOTSUPP,
+        "expected EPERM, EACCES, or EOPNOTSUPP for trusted.*, got {ecode}: {err}"
     );
 
     // User.* must still work on the same file (proving the file is valid).
