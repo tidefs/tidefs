@@ -3077,6 +3077,28 @@ impl VfsLocalFileSystem {
                     );
                 }
 
+                match transport.peer_node(session_id) {
+                    Some(peer_node_id) if peer_node_id == *server_node_id => {}
+                    Some(peer_node_id) => {
+                        let _ = transport.close_session(session_id, SessionCloseReason::AuthFailed);
+                        return live_admin_error(
+                            1,
+                            format!(
+                                "snapshot send: handshake with {target_addr} identified node {peer_node_id}, expected server_node_id {server_node_id}"
+                            ),
+                        );
+                    }
+                    None => {
+                        let _ = transport.close_session(session_id, SessionCloseReason::AuthFailed);
+                        return live_admin_error(
+                            1,
+                            format!(
+                                "snapshot send: handshake with {target_addr} did not identify a non-zero peer node, expected server_node_id {server_node_id}"
+                            ),
+                        );
+                    }
+                }
+
                 if let Err(err) = transport.send_message(session_id, &request) {
                     let _ = transport.close_session(session_id, SessionCloseReason::LocalShutdown);
                     return live_admin_error(
@@ -8501,6 +8523,77 @@ mod tests {
             "target response should explain same target node ids: {refused}"
         );
         assert!(!output.exists());
+    }
+
+    #[test]
+    fn live_snapshot_send_rejects_mismatched_handshake_peer_before_push() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = root.path().join("store");
+        let mut fs = LocalFileSystem::open(&store).expect("open fs");
+        fs.create_file("/live.txt", 0o644).expect("create file");
+        fs.write_file("/live.txt", 0, b"live owner snapshot send")
+            .expect("write file");
+        let engine = VfsLocalFileSystem::new(fs);
+        let output = root.path().join("mismatched-handshake-peer.vfs");
+        let local_node_id = 7;
+        let expected_server_node_id = 9;
+        let actual_server_node_id = 10;
+
+        let mut server = Transport::new(actual_server_node_id);
+        server
+            .bind(TransportAddr::Tcp(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                0,
+            )))
+            .expect("bind");
+        let target_addr = match server.bind_addr.as_ref().expect("bind_addr") {
+            TransportAddr::Tcp(addr) => addr.to_string(),
+            _ => unreachable!("test binds TCP transport"),
+        };
+        let (push_tx, push_rx) = std::sync::mpsc::channel();
+
+        let server_handle = thread::spawn(move || {
+            let session_id = accept_snapshot_transport_session(&mut server);
+            server.perform_handshake(session_id).expect("handshake");
+            push_tx
+                .send(server.recv_message(session_id).is_ok())
+                .expect("report whether a push arrived");
+            let _ = server.close_session(session_id, SessionCloseReason::LocalShutdown);
+        });
+
+        let refused = live_snapshot_admin(
+            &engine,
+            "send",
+            json!({
+                "output": output.display().to_string(),
+                "target_addr": target_addr.clone(),
+                "format": "vfssend2",
+                "incremental": false,
+                "node_id": local_node_id,
+                "server_node_id": expected_server_node_id,
+            }),
+            true,
+        );
+
+        assert_eq!(refused["ok"], false, "target response: {refused}");
+        assert_eq!(refused["exit_code"], 1);
+        assert!(refused["json"].is_null());
+        assert!(refused["text"].is_null());
+        assert_eq!(
+            refused["error"],
+            format!(
+                "snapshot send: handshake with {target_addr} identified node {actual_server_node_id}, expected server_node_id {expected_server_node_id}"
+            )
+        );
+        assert!(!output.exists());
+        assert_eq!(
+            push_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("server should observe the closed mismatched session"),
+            false,
+            "mismatched peer must not receive the snapshot push"
+        );
+        server_handle.join().expect("server thread");
     }
 
     #[test]
