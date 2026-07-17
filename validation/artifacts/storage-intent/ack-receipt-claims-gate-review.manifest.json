@@ -1,0 +1,16 @@
+{
+  "manifest_version": 2,
+  "claim_id": "storage.intent.ack_receipt_honesty.v1",
+  "evidence_class": "claims-gate-review",
+  "validation_tier": "source-model",
+  "scope": "claims-gate source review of the acknowledgment receipt honesty evidence boundary and remaining mounted-userspace gap",
+  "artifact_path": "validation/artifacts/storage-intent/ack-receipt-claims-gate-review.toml",
+  "content_digest": "blake3:20bc9eacd4784621777e84f5fbd4200cf43c6503e94540025891769bbf77b10c",
+  "run_id": "deterministic-fixture:issue-2225-ack-receipt-claims-gate-review-v1",
+  "source_ref": "refs/heads/codex2/issue-2225-ack-receipt-claims-review",
+  "outcome": "pass",
+  "residual_risk": "The review keeps storage.intent.ack_receipt_honesty.v1 blocked until the mounted-userspace write, fsync, fdatasync, O_DSYNC, mmap sync, namespace, and fsyncdir receipt/refusal artifact validates. It does not widen successor, comparator, product, production, release-readiness, or broader durability claims.",
+  "source": "claims-gate",
+  "generated_at": "2026-07-17T10:32:55Z",
+  "blocking_issues": []
+}
