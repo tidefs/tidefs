@@ -8335,40 +8335,85 @@ impl FuseVfsAdapter {
         // syncfs is the mount-wide barrier, so take every bounded stripe in
         // stable order before clearing any inode's dirty projections.
         let _write_cache_reconciliation_guards = self.write_cache_reconciliation.lock_all();
-        let e = self.engine.lock().unwrap();
+        let tracked_ranges = if let Some(ref tracker) = self.writeback_range_tracker {
+            let mut tracker = tracker.lock().unwrap();
+            let selected = tracker.collect_dirty_ranges();
+            for (inode, ranges) in &selected {
+                for range in ranges {
+                    let _ = tracker.start_writeback_range(*inode, range.offset, range.length);
+                }
+            }
+            selected
+        } else {
+            Vec::new()
+        };
 
-        // Phase 1: drain all dirty page-cache pages across all inodes
-        // through the PageCacheDirtyFlush::flush_all() bridge.
-        let synthetic_fh = EngineFileHandle::new(
-            InodeId::new(0),
-            0, // O_RDONLY — flush_all uses engine.write, handle unused for permission check
-            FileHandleId::new(0),
-            0,
-        );
-        let bridge = crate::fuse_flush_fsync::PageCacheDirtyFlush::new(
-            self.writeback_page_cache.as_ref(),
-            &**e,
-            &synthetic_fh,
-            ctx,
-        );
-        tidefs_local_filesystem::fuse_fsync::map_cache_error(bridge.flush_all())?;
+        let sync_result = (|| {
+            let e = self.engine.lock().unwrap();
 
-        // Phase 2: filesystem-wide durability barrier through the engine.
-        e.syncfs(ctx)?;
-        drop(e);
+            // Phase 1: drain all dirty page-cache pages across all inodes
+            // through the PageCacheDirtyFlush::flush_all() bridge.
+            let synthetic_fh = EngineFileHandle::new(
+                InodeId::new(0),
+                0, // O_RDONLY — flush_all uses engine.write, handle unused for permission check
+                FileHandleId::new(0),
+                0,
+            );
+            let bridge = crate::fuse_flush_fsync::PageCacheDirtyFlush::new(
+                self.writeback_page_cache.as_ref(),
+                &**e,
+                &synthetic_fh,
+                ctx,
+            );
+            tidefs_local_filesystem::fuse_fsync::map_cache_error(bridge.flush_all())?;
 
-        self.commit_current_txg_barrier("syncfs")?;
+            // Phase 2: filesystem-wide durability barrier through the engine.
+            e.syncfs(ctx)?;
+            drop(e);
 
-        // Drain all inodes from the writeback range tracker after
-        // filesystem-wide flush so the background flush service (#4657)
-        // sees a clean slate.
+            self.commit_current_txg_barrier("syncfs")?;
+
+            // Phase 3: Commit_group durability barrier.
+            // Wait for all pending transaction groups to be committed.
+            self.fsync_handler.handle_syncfs()
+        })();
+
+        let mut tracker_completion_failed = false;
         if let Some(ref tracker) = self.writeback_range_tracker {
-            let _ = tracker.lock().unwrap().collect_dirty_ranges();
+            let mut tracker = tracker.lock().unwrap();
+            match &sync_result {
+                Ok(()) => {
+                    for (inode, ranges) in &tracked_ranges {
+                        for range in ranges {
+                            if tracker.complete_writeback_success(
+                                *inode,
+                                range.offset,
+                                range.length,
+                            ) == 0
+                            {
+                                tracker_completion_failed = true;
+                            }
+                        }
+                    }
+                }
+                Err(errno) => {
+                    for (inode, ranges) in &tracked_ranges {
+                        for range in ranges {
+                            tracker.record_writeback_error(
+                                *inode,
+                                range.offset,
+                                range.length,
+                                format!("adapter syncfs barrier failed: {errno:?}"),
+                            );
+                        }
+                    }
+                }
+            }
         }
-
-        // Phase 3: Commit_group durability barrier.
-        // Wait for all pending transaction groups to be committed.
-        self.fsync_handler.handle_syncfs()?;
+        sync_result?;
+        if tracker_completion_failed {
+            return Err(Errno::EIO);
+        }
 
         self.writeback_cache_stats.lock().unwrap().record_flush();
         crate::observability::HIST_SYNCFS.record(_start.elapsed());
@@ -38950,6 +38995,7 @@ mod tests {
         write_observer: Option<Arc<dyn Fn() + Send + Sync>>,
         flush_result: Result<(), Errno>,
         flush_observer: Option<Arc<dyn Fn() + Send + Sync>>,
+        syncfs_result: Result<(), Errno>,
         create_result: Result<(InodeAttr, EngineFileHandle), Errno>,
         mkdir_result: Result<InodeAttr, Errno>,
     }
@@ -38967,6 +39013,7 @@ mod tests {
                 write_observer: None,
                 flush_result: Err(Errno::ENOSYS),
                 flush_observer: None,
+                syncfs_result: Err(Errno::ENOSYS),
                 create_result: Err(Errno::ENOSYS),
                 mkdir_result: Err(Errno::ENOSYS),
             }
@@ -39073,6 +39120,11 @@ mod tests {
 
         fn with_flush_observer(mut self, observer: Arc<dyn Fn() + Send + Sync>) -> Self {
             self.flush_observer = Some(observer);
+            self
+        }
+
+        fn with_syncfs_error(mut self, errno: Errno) -> Self {
+            self.syncfs_result = Err(errno);
             self
         }
 
@@ -39261,6 +39313,9 @@ mod tests {
             ctx: &RequestCtx,
         ) -> Result<(), Errno> {
             Err(Errno::ENOSYS)
+        }
+        fn syncfs(&self, _ctx: &RequestCtx) -> Result<(), Errno> {
+            self.syncfs_result
         }
         fn fallocate(
             &self,
@@ -41903,6 +41958,37 @@ mod tests {
 
         assert!(!tracker.lock().unwrap().is_dirty(ino_a));
         assert!(!tracker.lock().unwrap().is_dirty(ino_b));
+    }
+
+    #[test]
+    fn dispatch_syncfs_failure_retains_writeback_error() {
+        let tracker = Arc::new(Mutex::new(
+            tidefs_local_filesystem::dirty_page_tracker::DirtyPageTracker::new(),
+        ));
+        let mut adapter = make_adapter(
+            AclMockEngine::new()
+                .with_root(1)
+                .with_syncfs_error(Errno::EIO),
+        );
+        adapter.writeback_range_tracker = Some(Arc::clone(&tracker));
+        let inode = InodeId::new(41);
+        tracker.lock().unwrap().mark_dirty(inode, 1024, 2048);
+
+        assert_eq!(adapter.dispatch_syncfs(&root_ctx()), Err(Errno::EIO));
+
+        let tracker = tracker.lock().unwrap();
+        let ranges = tracker
+            .dirty_ranges(inode)
+            .expect("failed syncfs range remains tracked");
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(
+            ranges[0].lifecycle_state(),
+            tidefs_local_filesystem::dirty_page_tracker::DirtyLifecycleState::ErrorPoisoned
+        );
+        assert!(
+            ranges[0].writeback_error().is_some(),
+            "failed syncfs must retain a writeback error"
+        );
     }
 
     #[test]
