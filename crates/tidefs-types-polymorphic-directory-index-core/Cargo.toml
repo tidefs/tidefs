@@ -11,10 +11,10 @@ documentation.workspace = true
 authors.workspace = true
 
 description = """
-Authority type definitions for the polymorphic directory index with two
-canonical representations (DirMicroListV1 inline O(n) vs DirBtreeRootV1
-external B+tree O(log n)), switching thresholds with hysteresis, tagged
-64-bit readdir cookies, and dataset-level DirPolicy. no_std / forbid(unsafe_code).
+Shared runtime types for the polymorphic directory index with an inline list,
+explicitly runtime-only B+tree metadata, switching thresholds with hysteresis,
+tagged 64-bit readdir cookies, and dataset-level DirPolicy. no_std /
+forbid(unsafe_code).
 """
 
 [features]

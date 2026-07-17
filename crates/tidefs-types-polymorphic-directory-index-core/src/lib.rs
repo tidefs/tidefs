@@ -2,27 +2,20 @@
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
 
-//! Authority type definitions for the polymorphic directory index.
+//! Shared runtime type definitions for the polymorphic directory index.
 //!
-//! Implements the type registry from
-//! [`docs/POLYMORPHIC_DIRECTORY_INDEX_DESIGN.md`] with two canonical
-//! directory representations (`DirMicroListV1` inline O(n) and
-//! `DirBtreeRootV1` external B+tree O(log n)), switching thresholds
-//! with hysteresis, tagged 64-bit readdir cookies, and dataset-level
-//! `DatasetDirPolicy`.
+//! The runtime has two representations: `DirMicroListV1` for an inline
+//! O(n) list and `DirBtreeRuntimeState` for O(log n) tree metadata. The
+//! B-tree state carries an explicit [`DirBtreePageAuthority::RuntimeOnly`]
+//! boundary: it is not an on-media root and contains no page locator.
+//! `tidefs-dir-index` separately owns persistent page keys and codecs.
 //!
-//! This crate covers Phase 1 (types + cookie encoding + threshold logic)
-//! of the design spec. The B+tree implementation and migration engine
-//! are tracked by Review debt TFR-002/TFR-013.
+//! This crate also owns switching thresholds with hysteresis, tagged 64-bit
+//! readdir cookies, and dataset-level `DatasetDirPolicy`.
 //!
 //! The `alloc` feature gates types that require heap allocation
-//! (`DirMicroListV1`, `DirMicroEntry`, `DirBtreeLeafEntry`,
-//! `DirBtreeInternalEntry`). Fixed-size types (`DirBtreeRootV1`,
-//! `DirCookie`, `DatasetDirPolicy`, `DirStorageKind`, `LocatorId`)
-//! are always available.
-//!
-//! [`docs/POLYMORPHIC_DIRECTORY_INDEX_DESIGN.md`]:
-//! https://forgejo/forgeadmin/tidefs/docs/POLYMORPHIC_DIRECTORY_INDEX_DESIGN.md
+//! (`DirMicroListV1`, `DirMicroEntry`, `DirBtreeLeafEntry`). Runtime metadata
+//! and fixed-size policy/cookie types are always available.
 
 use core::fmt;
 
@@ -30,29 +23,46 @@ use core::fmt;
 extern crate alloc;
 
 // ---------------------------------------------------------------------------
-// LocatorId — placeholder for the storage engine's object pointer
+// Runtime-only B-tree page authority
 // ---------------------------------------------------------------------------
 
-/// On-media locator for an independently-stored object (e.g. a B-tree page).
+/// Authority carried by the in-memory B-tree metadata.
 ///
-/// This is a placeholder newtype; the actual layout is defined in the
-/// storage engine layer (#1285).
+/// Persistent directory pages are addressed by the key derivation in
+/// `tidefs-dir-index`; this type deliberately has no numeric or byte-addressed
+/// locator representation.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
-pub struct LocatorId(pub u64);
+pub enum DirBtreePageAuthority {
+    /// The tree exists only in runtime state and has no durable page root.
+    #[default]
+    RuntimeOnly,
+}
 
-impl LocatorId {
-    /// Sentinel value for an unset/null locator.
-    pub const EMPTY: LocatorId = LocatorId(0);
-
+impl DirBtreePageAuthority {
+    /// Returns whether this authority can identify a durable page root.
     #[must_use]
-    pub const fn is_empty(self) -> bool {
-        self.0 == 0
+    pub const fn is_durable(self) -> bool {
+        false
     }
 }
 
-impl fmt::Display for LocatorId {
+impl fmt::Display for DirBtreePageAuthority {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "LocatorId({})", self.0)
+        f.write_str("runtime-only")
+    }
+}
+
+/// Refusal returned when runtime-only B-tree metadata is used as a durable
+/// page root.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DurableDirRootError {
+    /// No persistent page root is represented by the runtime metadata.
+    RuntimeOnlyPageAuthority,
+}
+
+impl fmt::Display for DurableDirRootError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("directory B-tree page authority is runtime-only")
     }
 }
 
@@ -68,7 +78,7 @@ pub struct DirStorageKind(pub u8);
 impl DirStorageKind {
     /// Directory uses `DirMicroListV1` (inline flat list).
     pub const MICRO_LIST: DirStorageKind = DirStorageKind(0);
-    /// Directory uses `DirBtreeRootV1` (external B+tree).
+    /// Directory uses runtime B+tree metadata.
     pub const BTREE: DirStorageKind = DirStorageKind(1);
 
     /// Decode from a wire byte.
@@ -111,22 +121,18 @@ impl fmt::Display for DirStorageKind {
 }
 
 // ---------------------------------------------------------------------------
-// DirBtreeRootV1 — external B+tree directory root (O(log n))
+// DirBtreeRuntimeState — in-memory B+tree metadata (O(log n))
 // ---------------------------------------------------------------------------
 
-/// Magic bytes for `DirBtreeRootV1`.
-pub const DIR_BTREE_ROOT_MAGIC: &[u8; 4] = b"DIRB";
 /// Magic bytes for `DirBtreePageHeader`.
 pub const DIR_BTREE_PAGE_MAGIC: &[u8; 4] = b"DIRP";
 
-/// B+tree root stored as the directory inode's content payload when
-/// `dir_storage_kind == 1`.
+/// Metadata for the in-memory B+tree representation.
 ///
-/// Total fixed size: 4 + 8 + 8 + 8 + 8 + 8 + 1 + 1 + 6 = 60 bytes.
+/// This state is not encoded as a directory-page root. Persistent directory
+/// page identity remains owned by `tidefs-dir-index` page-key derivation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub struct DirBtreeRootV1 {
-    /// Magic: `b"DIRB"`.
-    pub magic: [u8; 4],
+pub struct DirBtreeRuntimeState {
     /// Owning directory inode id.
     pub directory_inode_id: u64,
     /// Monotonic version for invalidation.
@@ -135,47 +141,39 @@ pub struct DirBtreeRootV1 {
     pub entry_count: u64,
     /// Sum of all entry name lengths (for threshold checks).
     pub total_name_bytes: u64,
-    /// Points to the B+tree root page in the locator table.
-    pub root_page_locator: LocatorId,
+    /// Explicit boundary preventing this metadata from acting as a durable
+    /// page root.
+    page_authority: DirBtreePageAuthority,
     /// Depth: 0 = single leaf, 1+ = internal levels.
     pub depth: u8,
     /// Bit 0: has_subdirs; bits 1-7: reserved.
     pub flags: u8,
-    /// Reserved for alignment / future use.
-    pub reserved: [u8; 6],
 }
 
-impl DirBtreeRootV1 {
-    /// Total fixed size in bytes (= 60).
-    pub const FIXED_SIZE: usize = 60;
-
-    /// Create a new root with the given parameters.
+impl DirBtreeRuntimeState {
+    /// Create runtime-only B-tree metadata for a directory.
     #[must_use]
-    pub const fn new(
-        directory_inode_id: u64,
-        directory_version: u64,
-        root_page_locator: LocatorId,
-    ) -> Self {
-        DirBtreeRootV1 {
-            magic: *DIR_BTREE_ROOT_MAGIC,
+    pub const fn new(directory_inode_id: u64, directory_version: u64) -> Self {
+        DirBtreeRuntimeState {
             directory_inode_id,
             directory_version,
             entry_count: 0,
             total_name_bytes: 0,
-            root_page_locator,
+            page_authority: DirBtreePageAuthority::RuntimeOnly,
             depth: 0,
             flags: 0,
-            reserved: [0u8; 6],
         }
     }
 
-    /// Returns `true` if the magic bytes are valid.
+    /// Return the explicit page-authority boundary.
     #[must_use]
-    pub const fn is_valid_magic(&self) -> bool {
-        self.magic[0] == b'D'
-            && self.magic[1] == b'I'
-            && self.magic[2] == b'R'
-            && self.magic[3] == b'B'
+    pub const fn page_authority(&self) -> DirBtreePageAuthority {
+        self.page_authority
+    }
+
+    /// Refuse use of runtime metadata as a durable directory-page root.
+    pub const fn validate_durable_root(&self) -> Result<(), DurableDirRootError> {
+        Err(DurableDirRootError::RuntimeOnlyPageAuthority)
     }
 
     /// Returns `true` if the `has_subdirs` flag is set.
@@ -383,46 +381,14 @@ impl DirBtreeLeafEntry {
     }
 }
 
-/// Entry in a B+tree internal page, defining a key range separator.
-///
-/// The `separator_hash` is the maximum hash in the child subtree. The
-/// preceding child pointer (implicit in page layout) leads to entries
-/// with hashes <= `separator_hash`.
-///
-/// Fixed overhead: 8 + 2 + name_len + 8 = 26 bytes + name_len.
-#[cfg(any(test, feature = "alloc"))]
-#[derive(Clone, Debug, Eq, PartialEq, Hash)]
-pub struct DirBtreeInternalEntry {
-    /// Maximum BLAKE3-64 hash in the child subtree.
-    pub separator_hash: u64,
-    /// Length of the separator name in bytes.
-    pub separator_name_len: u16,
-    /// Separator name for collision disambiguation.
-    pub separator_name: alloc::vec::Vec<u8>,
-    /// Locator of the child B+tree page.
-    pub child_page_locator: LocatorId,
-}
-
-#[cfg(any(test, feature = "alloc"))]
-impl DirBtreeInternalEntry {
-    /// Fixed per-entry overhead in bytes (= 26).
-    pub const FIXED_OVERHEAD: usize = 26;
-
-    /// Total on-wire size of this entry.
-    #[must_use]
-    pub fn wire_size(&self) -> usize {
-        Self::FIXED_OVERHEAD + self.separator_name.len()
-    }
-}
-
 /// Canonical tagged union of directory representations.
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub enum DirStorage {
     /// Inline micro-list (n <= ~50).
     #[cfg(any(test, feature = "alloc"))]
     MicroList(DirMicroListV1),
-    /// External B+tree (any size, O(log n)).
-    BTree(DirBtreeRootV1),
+    /// Runtime B+tree metadata (any size, O(log n)).
+    BTree(DirBtreeRuntimeState),
 }
 
 impl DirStorage {
@@ -687,12 +653,13 @@ mod tests {
         assert_eq!(DirStorageKind::BTREE.to_string(), "BTree");
     }
 
-    // -- LocatorId ----------------------------------------------------------
+    // -- Runtime-only page authority ---------------------------------------
 
     #[test]
-    fn locator_id_empty() {
-        assert!(LocatorId::EMPTY.is_empty());
-        assert!(!LocatorId(42).is_empty());
+    fn btree_page_authority_is_explicitly_not_durable() {
+        let authority = DirBtreePageAuthority::RuntimeOnly;
+        assert!(!authority.is_durable());
+        assert_eq!(authority.to_string(), "runtime-only");
     }
 
     // -- DirMicroListV1 / DirMicroEntry ------------------------------------
@@ -755,40 +722,32 @@ mod tests {
         assert_eq!(list.compute_total_name_bytes(), 12);
     }
 
-    // -- DirBtreeRootV1 -----------------------------------------------------
+    // -- DirBtreeRuntimeState ----------------------------------------------
 
     #[test]
-    fn btree_root_fixed_size() {
-        assert_eq!(DirBtreeRootV1::FIXED_SIZE, 60);
-    }
-
-    #[test]
-    fn btree_root_valid_magic() {
-        let root = DirBtreeRootV1::new(1, 0, LocatorId(42));
-        assert!(root.is_valid_magic());
-    }
-
-    #[test]
-    fn btree_root_invalid_magic() {
-        let mut root = DirBtreeRootV1::new(1, 0, LocatorId(42));
-        root.magic[0] = b'X';
-        assert!(!root.is_valid_magic());
-    }
-
-    #[test]
-    fn btree_root_defaults() {
-        let root = DirBtreeRootV1::new(7, 3, LocatorId(100));
+    fn btree_runtime_state_defaults() {
+        let root = DirBtreeRuntimeState::new(7, 3);
         assert_eq!(root.directory_inode_id, 7);
         assert_eq!(root.directory_version, 3);
         assert_eq!(root.entry_count, 0);
         assert_eq!(root.total_name_bytes, 0);
         assert_eq!(root.depth, 0);
         assert_eq!(root.flags, 0);
+        assert_eq!(root.page_authority(), DirBtreePageAuthority::RuntimeOnly);
     }
 
     #[test]
-    fn btree_root_has_subdirs() {
-        let mut root = DirBtreeRootV1::new(1, 0, LocatorId(42));
+    fn btree_runtime_state_refuses_durable_root() {
+        let root = DirBtreeRuntimeState::new(1, 0);
+        assert_eq!(
+            root.validate_durable_root(),
+            Err(DurableDirRootError::RuntimeOnlyPageAuthority)
+        );
+    }
+
+    #[test]
+    fn btree_runtime_state_has_subdirs() {
+        let mut root = DirBtreeRuntimeState::new(1, 0);
         assert!(!root.has_subdirs());
         root.flags |= 0x01;
         assert!(root.has_subdirs());
@@ -861,19 +820,6 @@ mod tests {
         assert_eq!(entry.wire_size(), 32 + 6);
     }
 
-    // -- DirBtreeInternalEntry ---------------------------------------------
-
-    #[test]
-    fn internal_entry_wire_size() {
-        let entry = DirBtreeInternalEntry {
-            separator_hash: 0xABCD,
-            separator_name_len: 4,
-            separator_name: b"test".to_vec(),
-            child_page_locator: LocatorId(42),
-        };
-        assert_eq!(entry.wire_size(), 26 + 4);
-    }
-
     // -- DirStorage ---------------------------------------------------------
 
     #[test]
@@ -895,17 +841,10 @@ mod tests {
 
     #[test]
     fn dir_storage_kind_btree() {
-        let root = DirBtreeRootV1 {
-            magic: *DIR_BTREE_ROOT_MAGIC,
-            directory_inode_id: 5,
-            directory_version: 2,
-            entry_count: 500,
-            total_name_bytes: 4000,
-            root_page_locator: LocatorId(10),
-            depth: 2,
-            flags: 0,
-            reserved: [0u8; 6],
-        };
+        let mut root = DirBtreeRuntimeState::new(5, 2);
+        root.entry_count = 500;
+        root.total_name_bytes = 4000;
+        root.depth = 2;
         let storage = DirStorage::BTree(root);
         assert_eq!(storage.kind(), DirStorageKind::BTREE);
         assert_eq!(storage.entry_count(), 500);
@@ -1112,11 +1051,6 @@ mod tests {
     }
 
     // -- Magic constants ----------------------------------------------------
-
-    #[test]
-    fn dir_btree_root_magic_is_dirb() {
-        assert_eq!(DIR_BTREE_ROOT_MAGIC, b"DIRB");
-    }
 
     #[test]
     fn dir_btree_page_magic_is_dirp() {
