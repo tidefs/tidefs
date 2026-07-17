@@ -29,7 +29,8 @@ scoreboard, coverage-gap diagnostics, charter rendering, and receipt-demo
 diagnostics.
 
 Current entry-point commands live in `docs/GETTING_STARTED.md`; CI lane and
-artifact authority lives in `docs/GITHUB_CI.md`; xfstests scoreboard details
-live in `docs/xfstests-harness.md`. Validation scope and required GitHub
-Actions lanes belong in the issue or pull request that changes the adapter
-behavior.
+artifact authority lives in `docs/GITHUB_CI.md`; xfstests dispatch and artifact
+details live in `docs/XFSTESTS_DISPATCH_CONTRACT.md`. Local scoreboard behavior
+remains source-owned by the adapter and validation crates. Validation scope and
+required GitHub Actions lanes belong in the issue or pull request that changes
+the adapter behavior.
