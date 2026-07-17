@@ -330,7 +330,7 @@ fn read_mounted_chunk_content_scrub_block(
 
     let (chunk, resolved_via_dedup) = try_validate_chunk_bytes(
         store, pool, inode_id, chunk_ref, &encoded,
-    )
+    )?
     .ok_or(FileSystemError::CorruptState {
         reason: "mounted content scrub authority chunk decode mismatch",
     })?;
@@ -749,17 +749,18 @@ pub(crate) fn validate_content_manifest(
 }
 
 /// Validate raw chunk bytes: resolve dedup redirect, verify checksum,
-/// decode, and check structural fields. Returns decoded chunk or `None`.
+/// decode, and check structural fields. Returns decoded chunk or `None` while
+/// preserving storage-route read failures.
 fn try_validate_chunk_bytes(
     store: &LocalObjectStore,
     pool: Option<&Pool>,
     inode_id: InodeId,
     chunk_ref: &ContentChunkRef,
     raw_bytes: &[u8],
-) -> Option<(ContentChunkObject, bool)> {
+) -> Result<Option<(ContentChunkObject, bool)>> {
     try_validate_chunk_bytes_with_get(inode_id, chunk_ref, raw_bytes, |canonical_key| match pool {
-        Some(pool) => pool.get(DeviceIoClass::Data, canonical_key).ok().flatten(),
-        None => store.get(canonical_key).ok().flatten(),
+        Some(pool) => Ok(pool.get(DeviceIoClass::Data, canonical_key)?),
+        None => Ok(store.get(canonical_key)?),
     })
 }
 
@@ -768,9 +769,9 @@ fn try_validate_chunk_bytes_from_write_store<S: ContentWriteStore + ?Sized>(
     inode_id: InodeId,
     chunk_ref: &ContentChunkRef,
     raw_bytes: &[u8],
-) -> Option<(ContentChunkObject, bool)> {
+) -> Result<Option<(ContentChunkObject, bool)>> {
     try_validate_chunk_bytes_with_get(inode_id, chunk_ref, raw_bytes, |canonical_key| {
-        store.get(canonical_key).ok().flatten()
+        store.get(canonical_key)
     })
 }
 
@@ -778,23 +779,30 @@ fn try_validate_chunk_bytes_with_get(
     inode_id: InodeId,
     chunk_ref: &ContentChunkRef,
     raw_bytes: &[u8],
-    read_canonical: impl FnOnce(ObjectKey) -> Option<Vec<u8>>,
-) -> Option<(ContentChunkObject, bool)> {
+    read_canonical: impl FnOnce(ObjectKey) -> Result<Option<Vec<u8>>>,
+) -> Result<Option<(ContentChunkObject, bool)>> {
     // Checksum the raw stored bytes first. For dedup redirects this is
     // the redirect payload, not the resolved canonical data, matching
     // how checksum is computed in all write paths.
     if checksum64(raw_bytes) != chunk_ref.checksum {
-        return None;
+        return Ok(None);
     }
     let resolved_vec;
     let (chunk_bytes, resolved_via_dedup) = if is_dedup_redirect(raw_bytes) {
-        let canonical_key = decode_dedup_redirect(raw_bytes).ok()?;
-        resolved_vec = read_canonical(canonical_key)?;
+        let Ok(canonical_key) = decode_dedup_redirect(raw_bytes) else {
+            return Ok(None);
+        };
+        let Some(canonical) = read_canonical(canonical_key)? else {
+            return Ok(None);
+        };
+        resolved_vec = canonical;
         (resolved_vec.as_slice(), true)
     } else {
         (raw_bytes, false)
     };
-    let chunk = decode_content_chunk(chunk_bytes).ok()?;
+    let Ok(chunk) = decode_content_chunk(chunk_bytes) else {
+        return Ok(None);
+    };
     // For dedup-resolved chunks, skip inode_id, data_version, and
     // chunk_index checks: the canonical data may have been written by
     // a different inode, with a different data version, and at a
@@ -805,9 +813,9 @@ fn try_validate_chunk_bytes_with_get(
             || chunk.chunk_index != chunk_ref.chunk_index))
         || chunk.bytes.len() != chunk_ref.len as usize
     {
-        return None;
+        return Ok(None);
     }
-    Some((chunk, resolved_via_dedup))
+    Ok(Some((chunk, resolved_via_dedup)))
 }
 
 /// Local historical-version fallback for a corrupt chunk.
@@ -823,16 +831,16 @@ fn try_self_heal_chunk(
     inode_id: InodeId,
     chunk_ref: &ContentChunkRef,
     key: ObjectKey,
-) -> Option<ContentChunkObject> {
+) -> Result<Option<ContentChunkObject>> {
     for location in store.version_locations_of(key).into_iter().rev() {
-        let candidate = store.get_at_location(location).ok()?;
+        let candidate = store.get_at_location(location)?;
         if let Some((chunk, _dedup)) =
-            try_validate_chunk_bytes(store, pool, inode_id, chunk_ref, &candidate)
+            try_validate_chunk_bytes(store, pool, inode_id, chunk_ref, &candidate)?
         {
-            return Some(chunk);
+            return Ok(Some(chunk));
         }
     }
-    None
+    Ok(None)
 }
 
 fn try_self_heal_chunk_from_write_store<S: ContentWriteStore + ?Sized>(
@@ -840,21 +848,21 @@ fn try_self_heal_chunk_from_write_store<S: ContentWriteStore + ?Sized>(
     inode_id: InodeId,
     chunk_ref: &ContentChunkRef,
     key: ObjectKey,
-) -> Option<ContentChunkObject> {
+) -> Result<Option<ContentChunkObject>> {
     for location in store
         .raw_store()
         .version_locations_of(key)
         .into_iter()
         .rev()
     {
-        let candidate = store.raw_store().get_at_location(location).ok()?;
+        let candidate = store.raw_store().get_at_location(location)?;
         if let Some((chunk, _dedup)) =
-            try_validate_chunk_bytes_from_write_store(store, inode_id, chunk_ref, &candidate)
+            try_validate_chunk_bytes_from_write_store(store, inode_id, chunk_ref, &candidate)?
         {
-            return Some(chunk);
+            return Ok(Some(chunk));
         }
     }
-    None
+    Ok(None)
 }
 
 fn read_content_chunk_from_write_store<S: ContentWriteStore + ?Sized>(
@@ -880,11 +888,11 @@ fn read_content_chunk_from_write_store<S: ContentWriteStore + ?Sized>(
         reason: "content manifest references a missing chunk object",
     })?;
     if let Some((chunk, _dedup)) =
-        try_validate_chunk_bytes_from_write_store(store, inode_id, chunk_ref, &bytes)
+        try_validate_chunk_bytes_from_write_store(store, inode_id, chunk_ref, &bytes)?
     {
         return Ok(chunk);
     }
-    if let Some(chunk) = try_self_heal_chunk_from_write_store(store, inode_id, chunk_ref, key) {
+    if let Some(chunk) = try_self_heal_chunk_from_write_store(store, inode_id, chunk_ref, key)? {
         return Ok(chunk);
     }
 
@@ -920,7 +928,7 @@ pub(crate) fn read_content_chunk_from_store(
     // redirect resolution internally, including cross-file inode_id
     // validation skip for reflinked chunks (#841).
     if let Some((chunk, _dedup)) =
-        try_validate_chunk_bytes(store, pool, inode_id, chunk_ref, &bytes)
+        try_validate_chunk_bytes(store, pool, inode_id, chunk_ref, &bytes)?
     {
         return Ok(chunk);
     }
@@ -929,7 +937,7 @@ pub(crate) fn read_content_chunk_from_store(
     // Because the object store is append-only, older copies of the same
     // chunk key may still exist in segments not yet reclaimed. This is a
     // local recovery fallback, not a replica or media redundancy guarantee.
-    if let Some(chunk) = try_self_heal_chunk(store, pool, inode_id, chunk_ref, key) {
+    if let Some(chunk) = try_self_heal_chunk(store, pool, inode_id, chunk_ref, key)? {
         return Ok(chunk);
     }
 
@@ -2728,10 +2736,16 @@ mod tests {
     struct RoutedReadStore {
         raw: LocalObjectStore,
         routed: BTreeMap<ObjectKey, Vec<u8>>,
+        read_error_key: Option<ObjectKey>,
     }
 
     impl ContentWriteStore for RoutedReadStore {
         fn get(&self, key: ObjectKey) -> Result<Option<Vec<u8>>> {
+            if self.read_error_key == Some(key) {
+                return Err(FileSystemError::CorruptState {
+                    reason: "routed canonical read failure",
+                });
+            }
             if let Some(bytes) = self.routed.get(&key) {
                 return Ok(Some(bytes.clone()));
             }
@@ -2854,6 +2868,7 @@ mod tests {
         let mut store = RoutedReadStore {
             raw: temp_store("routed-dedup-probe-empty-raw"),
             routed,
+            read_error_key: None,
         };
         crate::dedup_refcount::DedupRefCount::init(&mut store.raw, &fingerprint)
             .expect("seed canonical refcount metadata");
@@ -2889,6 +2904,42 @@ mod tests {
                 .expect("read routed canonical refcount"),
             2
         );
+    }
+
+    #[test]
+    fn dedup_canonical_read_errors_propagate_through_write_store() {
+        let payload = b"dedup canonical read failure".to_vec();
+        let record = test_record(4, 2, payload.len() as u64);
+        let fingerprint = crate::encoding::compute_content_fingerprint(&payload);
+        let canonical_key = crate::object_keys::content_dedup_object_key(&fingerprint);
+        let redirect = crate::encoding::encode_dedup_redirect(canonical_key);
+        let redirect_key =
+            content_chunk_object_key_for_version(record.inode_id, record.data_version, 0);
+        let mut raw = temp_store("routed-dedup-read-error");
+        raw.put(redirect_key, &redirect)
+            .expect("write per-inode dedup redirect");
+        let store = RoutedReadStore {
+            raw,
+            routed: BTreeMap::new(),
+            read_error_key: Some(canonical_key),
+        };
+        let chunk_ref = ContentChunkRef {
+            chunk_index: 0,
+            data_version: record.data_version,
+            len: payload.len() as u32,
+            checksum: checksum64(&redirect),
+            placement_receipt_generation: 0,
+        };
+
+        let err = read_content_chunk_from_write_store(&store, record.inode_id, &chunk_ref)
+            .expect_err("canonical route failure must not become content corruption");
+
+        assert!(matches!(
+            err,
+            FileSystemError::CorruptState {
+                reason: "routed canonical read failure"
+            }
+        ));
     }
 
     #[test]
@@ -3248,6 +3299,7 @@ mod tests {
         let mut store = RoutedReadStore {
             raw: temp_store("routed-sparse-overlay-empty-raw"),
             routed,
+            read_error_key: None,
         };
         assert!(store
             .raw
