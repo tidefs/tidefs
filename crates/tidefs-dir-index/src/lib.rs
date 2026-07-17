@@ -16,6 +16,10 @@
 //! `tidefs-local-object-store` for binary page persistence. The `in-memory-dir-index`
 //! feature provides the original no-dependencies stub for namespaces that
 //! do not need persistence.
+//!
+//! [`DirStorage::BTree`] carries runtime metadata only. Persistent page
+//! identity is owned by `format::dir_page_key`, not by a numeric root
+//! locator in the shared type crate.
 
 extern crate alloc;
 
@@ -42,7 +46,7 @@ pub use tidefs_types_polymorphic_directory_index_core::{
     DatasetDirPolicy, DirCookie, DirMicroEntry, DirStorage, DirStorageKind,
 };
 use tidefs_types_polymorphic_directory_index_core::{
-    DirBtreeLeafEntry, DirBtreeRootV1, DirMicroListV1, LocatorId, DIR_BTREE_ROOT_MAGIC,
+    DirBtreeLeafEntry, DirBtreeRuntimeState, DirMicroListV1,
 };
 
 /// Directory entry stored in a [`DirIndex`].
@@ -847,17 +851,11 @@ impl DirIndex {
             }
             name_tree.insert(e.name.clone(), leaf);
         }
-        let root = DirBtreeRootV1 {
-            magic: *DIR_BTREE_ROOT_MAGIC,
-            directory_inode_id: self.directory_inode_id,
-            directory_version: self.directory_version,
-            entry_count: cnt,
-            total_name_bytes: nbytes,
-            root_page_locator: LocatorId(1),
-            depth: tree.depth(),
-            flags: list.flags & 0x01,
-            reserved: [0u8; 6],
-        };
+        let mut root = DirBtreeRuntimeState::new(self.directory_inode_id, self.directory_version);
+        root.entry_count = cnt;
+        root.total_name_bytes = nbytes;
+        root.depth = tree.depth();
+        root.flags = list.flags & 0x01;
         self.storage = DirStorage::BTree(root);
         self.btree = Some(tree);
         self.name_btree = Some(name_tree);
