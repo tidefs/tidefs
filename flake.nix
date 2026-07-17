@@ -3500,6 +3500,26 @@ EOF
             pkgs.coreutils
             self.packages.${system}.tidefsFuseRuntime
           ] ''
+            # Nix store helpers cannot retain setuid, so use the runner's
+            # privileged FUSE helper when one is explicitly installed.
+            host_fusermount=""
+            for candidate in \
+              /run/wrappers/bin/fusermount3 \
+              /run/wrappers/bin/fusermount \
+              /usr/bin/fusermount3 \
+              /usr/bin/fusermount; do
+              if [ -x "$candidate" ] && [ -u "$candidate" ]; then
+                host_fusermount="$candidate"
+                break
+              fi
+            done
+            if [ -n "$host_fusermount" ]; then
+              fuse_helper_dir="$(mktemp -d)"
+              trap 'rm -rf "$fuse_helper_dir"' EXIT
+              ln -s "$host_fusermount" "$fuse_helper_dir/fusermount3"
+              ln -s "$host_fusermount" "$fuse_helper_dir/fusermount"
+              export PATH="$fuse_helper_dir:$PATH"
+            fi
             export PKG_CONFIG_PATH="${pkgs.fuse3.dev}/lib/pkgconfig:${pkgs.rdma-core.dev}/lib/pkgconfig''${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
             export LIBRARY_PATH="${pkgs.rdma-core}/lib''${LIBRARY_PATH:+:$LIBRARY_PATH}"
             export LD_LIBRARY_PATH="${pkgs.lib.makeLibraryPath [ pkgs.fuse3 pkgs.rdma-core ]}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
