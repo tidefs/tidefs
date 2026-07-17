@@ -547,7 +547,7 @@ impl ErasureCodedStore {
                     increment_cell(&self.stats.repairs);
                 }
                 Err(reason) => {
-                    first_failure.get_or_insert_with(|| (p.store_index, reason));
+                    first_failure.get_or_insert((p.store_index, reason));
                     failed.push(p);
                 }
             }
