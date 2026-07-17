@@ -1,0 +1,157 @@
+{
+  "schema_version": 1,
+  "claim_id": "storage.intent.ack_receipt_honesty.v1",
+  "evidence_class": "storage-intent-ack-fault-matrix",
+  "validation_tier": "qemu-guest",
+  "source": "qemu-smoke-storage-intent-ack-fault-matrix-v1",
+  "source_ref": "45af538c0b49bc3be61a191f21e342feeb119402",
+  "run_id": "29570719618/1",
+  "generated_at": "2026-07-17T09:39:08Z",
+  "qemu": {
+    "guest_detected": true,
+    "kernel_release": "7.0.0",
+    "boot_phases": [
+      "kill-before-ack",
+      "crash-after-ack",
+      "verify"
+    ],
+    "crash_injection": "host-sigkill-owned-qemu-process",
+    "fault_media": "raw-virtio-blk",
+    "fault_media_cache_mode": "cache-none"
+  },
+  "rows": [
+    {
+      "row_id": "kill-before-ack",
+      "fault_class": "guest-crash-before-ack-publication",
+      "injected_or_observed_condition": "The first QEMU boot durably wrote only a pre-ack record; the host then sent SIGKILL to that owned QEMU process.",
+      "policy_revision": 1,
+      "expected_legal_outcomes": [
+        "no-success-receipt",
+        "typed-refusal-or-unknown"
+      ],
+      "forbidden_outcomes": [
+        "durable-success-without-ack-publication"
+      ],
+      "receipt_result_refs": [
+        "pre-ack-sequence:1"
+      ],
+      "recovery_refs": [
+        "virtio-blk-slot:0"
+      ],
+      "operator_visibility": "fail-closed:no-ack-receipt",
+      "artifact_retention": "exact-source-controlled-promotion-candidate",
+      "observed_outcome": "Recovered the prepared record with a zero receipt id and did not accept it as an acknowledgment.",
+      "status": "pass"
+    },
+    {
+      "row_id": "crash-after-ack",
+      "fault_class": "guest-crash-after-durable-ack-publication",
+      "injected_or_observed_condition": "The second QEMU boot synced an earned local-intent record, published the ack marker, and was then killed by the host.",
+      "policy_revision": 1,
+      "expected_legal_outcomes": [
+        "recover-exact-earned-receipt",
+        "refuse-corrupt-receipt"
+      ],
+      "forbidden_outcomes": [
+        "silent-downgrade",
+        "accept-corrupt-receipt"
+      ],
+      "receipt_result_refs": [
+        "receipt-id:dba020cdb6336cfdfafe8653302a06f5"
+      ],
+      "recovery_refs": [
+        "virtio-blk-slot:4096",
+        "record-blake3"
+      ],
+      "operator_visibility": "recovered:local-intent-or-refuse",
+      "artifact_retention": "exact-source-controlled-promotion-candidate",
+      "observed_outcome": "Recovered the exact earned local-intent receipt after the crash and rejected an in-memory corrupt copy.",
+      "status": "pass"
+    },
+    {
+      "row_id": "stale-media",
+      "fault_class": "stale-media-capability-evidence",
+      "injected_or_observed_condition": "The final QEMU boot changed the media-capability generation outside the receipt evidence cut.",
+      "policy_revision": 1,
+      "expected_legal_outcomes": [
+        "typed-refusal",
+        "unknown-evidence"
+      ],
+      "forbidden_outcomes": [
+        "durable-success-from-stale-media"
+      ],
+      "receipt_result_refs": [
+        "stale-media-evidence:77d3eae8bf1e5c7a1fc2479622426d6dedc994bcad5a8d240174cfc37daf7370",
+        "refusal-evidence:78c0a8b1dd7efb4ea513d80191b73871ad9366973528092d6cd98c6e1f558be6"
+      ],
+      "recovery_refs": [
+        "local-ack-exact-evidence-cut"
+      ],
+      "operator_visibility": "stale-media-capability-evidence",
+      "artifact_retention": "exact-source-controlled-promotion-candidate",
+      "observed_outcome": "The stale evidence cut was rejected and projected as a typed stale-media refusal.",
+      "status": "pass"
+    },
+    {
+      "row_id": "under-quorum",
+      "fault_class": "receipt-gate-under-quorum",
+      "injected_or_observed_condition": "The final QEMU boot evaluated a quorum-intent request with only volatile-replicated evidence.",
+      "policy_revision": 1,
+      "expected_legal_outcomes": [
+        "typed-refusal"
+      ],
+      "forbidden_outcomes": [
+        "quorum-success-from-under-quorum-evidence"
+      ],
+      "receipt_result_refs": [
+        "attempted-receipt:ab17f25994cdb3592b241ee9b3141d27",
+        "refusal-evidence:123f07dcd41b5275864afcef30014e9044f30b5f3484b66b0f7777ffcc665b4c"
+      ],
+      "recovery_refs": [
+        "guarantee-capability-predicate"
+      ],
+      "operator_visibility": "under-quorum",
+      "artifact_retention": "exact-source-controlled-promotion-candidate",
+      "observed_outcome": "The quorum-intent request was refused; volatile replicated evidence was not upgraded into quorum durability.",
+      "status": "pass"
+    },
+    {
+      "row_id": "hidden-durable-to-volatile-downgrade",
+      "fault_class": "attempted-hidden-ack-floor-weakening",
+      "injected_or_observed_condition": "The final QEMU boot changed an otherwise success-shaped local-intent receipt to volatile RAM while leaving the outer success disposition intact.",
+      "policy_revision": 1,
+      "expected_legal_outcomes": [
+        "typed-refusal",
+        "unsafe-visible-only-with-explicit-policy"
+      ],
+      "forbidden_outcomes": [
+        "durable-success-from-volatile-evidence"
+      ],
+      "receipt_result_refs": [
+        "downgraded-receipt:45f49dcf12f3e7b324027a286239633c",
+        "refusal-evidence:52cf03499f397636cd41ba23bcac4c9df8ec93e9e1e108ead3159f3fb3287d11"
+      ],
+      "recovery_refs": [
+        "local-ack-shape-consistency",
+        "guarantee-capability-predicate"
+      ],
+      "operator_visibility": "receipt-would-weaken",
+      "artifact_retention": "exact-source-controlled-promotion-candidate",
+      "observed_outcome": "The inner receipt checks rejected the volatile downgrade despite the retained success disposition, and the explicit projection was a typed refusal.",
+      "status": "pass"
+    }
+  ],
+  "summary": {
+    "passed": 5,
+    "product_failed": 0,
+    "harness_failed": 0,
+    "environment_refused": 0,
+    "skipped": 0,
+    "status": "pass"
+  },
+  "residual_risk": [
+    "This QEMU row exercises raw virtio-blk persistence and receipt evaluation; it does not exercise mounted write, fsync, fdatasync, O_DSYNC, mmap, namespace, or fsyncdir runtime.",
+    "The under-quorum row injects the typed receipt-gate condition inside the guest; it is not multi-process distributed quorum execution.",
+    "The acknowledgment honesty claim remains blocked until mounted-runtime and claims-gate-review evidence also exists; this artifact does not strengthen successor, comparator, release, or product wording."
+  ]
+}
