@@ -2045,6 +2045,52 @@ mod tests {
     }
 
     #[test]
+    fn unknown_live_owner_response_field_preserves_typed_malformed_detail() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("owner.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        write_owner_manifest(dir.path(), &socket_path);
+        let handle = spawn_owner_raw_response(
+            listener,
+            b"{\"version\":1,\"exit_code\":0,\"body\":{\"kind\":\"text\",\"value\":\"ok\"},\"unexpected\":true}\n",
+        );
+        let route = LivePoolRoute {
+            command: "pool",
+            operation: "status",
+            pool: "tank",
+            pool_uuid: Some([0x42; 16]),
+            json: true,
+            args: LivePoolAdminArgs::default(),
+        };
+
+        let err = send_live_owner_request_at(dir.path(), &route).unwrap_err();
+        let request = handle.join().unwrap();
+
+        assert_eq!(request.command, LivePoolAdminCommand::PoolStatus);
+        match err {
+            LiveOwnerRequestError::Owner {
+                exit_code,
+                message,
+                detail,
+            } => {
+                assert_eq!(exit_code, 2);
+                assert!(message.starts_with("decode live-owner response:"));
+                assert!(message.contains("unknown field `unexpected`"));
+                assert_eq!(
+                    detail
+                        .as_ref()
+                        .and_then(|value| value.get("kind"))
+                        .and_then(serde_json::Value::as_str),
+                    Some("malformed")
+                );
+            }
+            LiveOwnerRequestError::Unavailable(message) => {
+                panic!("reachable owner should return typed malformed refusal, got {message}");
+            }
+        }
+    }
+
+    #[test]
     fn invalid_live_owner_error_machine_json_fails_closed() {
         let dir = tempfile::tempdir().unwrap();
         let socket_path = dir.path().join("owner.sock");
