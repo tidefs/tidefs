@@ -3825,7 +3825,7 @@ pub fn check_poolstore_compression_current_workspace() -> Result<(), StorageChec
 
 const MOUNTED_TRANSFORM_RAW_STORE_COUNTS: &[(&str, usize)] = &[
     ("crates/tidefs-local-object-store/src/pool/mod.rs", 9),
-    ("crates/tidefs-local-filesystem/src/lib.rs", 71),
+    ("crates/tidefs-local-filesystem/src/lib.rs", 68),
     ("crates/tidefs-local-filesystem/src/intent_log.rs", 1),
     ("crates/tidefs-local-filesystem/src/crash_recovery.rs", 1),
     ("crates/tidefs-local-filesystem/src/journal_cleaner.rs", 7),
@@ -3875,7 +3875,8 @@ pub fn check_mounted_transform_authority_current_workspace() -> Result<(), Stora
             "MetadataRawOnlyNoDeviceTransforms",
             "Mounted local-filesystem device-level compression and encryption are blocked",
             "must fail closed while any production `blocked` row remains",
-            "`crates/tidefs-local-filesystem/src/lib.rs` | 71",
+            "`crates/tidefs-local-object-store/src/pool/mod.rs` | 9",
+            "`crates/tidefs-local-filesystem/src/lib.rs` | 68",
             "`crates/tidefs-local-filesystem/src/intent_log.rs` | 1",
             "`crates/tidefs-local-filesystem/src/crash_recovery.rs` | 1",
             "`crates/tidefs-local-filesystem/src/journal_cleaner.rs` | 7",
