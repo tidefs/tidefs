@@ -494,7 +494,7 @@ required_evidence_classes = [
   "claims-gate-review",
 ]
 evidence_requirements = [
-  { class = "scrub-read-isolation-model", path = "validation/artifacts/performance/scrub-read-isolation-model.toml", validation_tier = "source-model", blocking_issues = [] },
+  { class = "scrub-read-isolation-model", path = "validation/artifacts/performance/scrub-read-isolation-model.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/performance/scrub-read-isolation-model.scrub-foreground-read-protected.manifest.json", blocking_issues = [] },
   { class = "runtime-scrub-read-artifact", path = "validation/artifacts/performance/scrub-read-runtime.json", validation_tier = "mounted-userspace", blocking_issues = [] },
   { class = "claims-gate-review", path = "validation/artifacts/performance/claims-gate-review.toml", validation_tier = "source-model", blocking_issues = [] },
 ]
@@ -543,7 +543,7 @@ required_evidence_classes = [
   "claims-gate-review",
 ]
 evidence_requirements = [
-  { class = "scrub-read-isolation-model", path = "validation/artifacts/performance/scrub-read-isolation-model.toml", validation_tier = "source-model", blocking_issues = [] },
+  { class = "scrub-read-isolation-model", path = "validation/artifacts/performance/scrub-read-isolation-model.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/performance/scrub-read-isolation-model.foreground-read-not-blocked.manifest.json", blocking_issues = [] },
   { class = "runtime-scrub-read-artifact", path = "validation/artifacts/performance/scrub-read-runtime.json", validation_tier = "mounted-userspace", blocking_issues = [] },
   { class = "claims-gate-review", path = "validation/artifacts/performance/claims-gate-review.toml", validation_tier = "source-model", blocking_issues = [] },
 ]

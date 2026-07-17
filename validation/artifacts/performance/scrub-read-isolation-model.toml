@@ -34,7 +34,7 @@ runtime_row_paths = [
 
 boundary_review = [
   "The runtime row records mounted FUSE foreground-read correctness while scrub work is configured.",
-  "Durable scrub targets are seeded with production options before mount; this fixture input is not mounted write or fsync evidence.",
+  "Scrub targets are seeded with production options and a data-only barrier before mount; this fixture input does not publish a committed root and is not mounted write or fsync evidence.",
   "Mounted scrub is registered as a bounded background service and emits admitted cycle, record, byte, pending, and scheduler-budget throttle observations from the daemon that owns the mount.",
   "Only same-daemon observations from the same pending scrub tick before and after the foreground read can promote the row from harness-only to mounted-userspace evidence.",
   "The runtime row consumes the typed ServiceCurve defaults and deterministic foreground-read/scrub oracle instead of mirroring queue and wait constants locally.",

@@ -48,7 +48,7 @@ const DAEMON_SCRUB_OBSERVATION_TIMEOUT_SECS: u64 = 15;
 const FOREGROUND_READ_ARRIVAL_TICK: u64 = 1;
 const MAX_FOREGROUND_READ_WAIT_TICKS: u64 = 1;
 
-pub const SCRUB_READ_RESIDUAL_RISK: &str = "This row records a mounted FUSE foreground-read correctness workload bracketed by typed observations from the same daemon's scheduled scrub service. The durable scrub targets are seeded into the production-option object store before mount, so they are fixture input rather than mounted write or fsync evidence. A pass requires admitted scrub records, work pending before and after the read, and a scheduler-budget throttle. The foreground wait bound still comes from the typed service-curve oracle rather than an environment-independent wall-clock SLO. This row is not production performance readiness, mounted write/fsync durability, broad scrub/repair correctness, kernel/uBLK/RDMA validation, crash recovery, release-candidate status, or a claim-status/product-wording change.";
+pub const SCRUB_READ_RESIDUAL_RISK: &str = "This row records a mounted FUSE foreground-read correctness workload bracketed by typed observations from the same daemon's scheduled scrub service. The scrub targets are seeded into the production-option object store with a data-only barrier before mount, so they are fixture input rather than mounted write, fsync, or committed-root evidence. A pass requires admitted scrub records, work pending before and after the read, and a scheduler-budget throttle. The foreground wait bound still comes from the typed service-curve oracle rather than an environment-independent wall-clock SLO. This row is not production performance readiness, mounted write/fsync durability, broad scrub/repair correctness, kernel/uBLK/RDMA validation, crash recovery, release-candidate status, or a claim-status/product-wording change.";
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ScrubForegroundReadRuntimeEvidence {
@@ -1201,9 +1201,13 @@ fn seed_scrub_backlog(store_root: &Path) -> std::io::Result<()> {
                 std::io::Error::other(format!("write scrub backlog unit {unit}: {error}"))
             })?;
     }
+    // The raw seed records are validation input, not a local-filesystem
+    // transaction. Make their segment bytes visible to the later scrub store
+    // without publishing a committed root for an unrelated object-store-only
+    // transaction.
     store
-        .sync_all()
-        .map_err(|error| std::io::Error::other(format!("sync scrub seed store: {error}")))
+        .sync_data()
+        .map_err(|error| std::io::Error::other(format!("sync scrub seed data: {error}")))
 }
 
 #[cfg(not(feature = "scrub-runtime"))]
@@ -1381,6 +1385,29 @@ mod tests {
     #[test]
     fn passed_manifest_has_no_blocking_issues() {
         assert!(evidence_manifest_blocking_issues(true).is_empty());
+    }
+
+    #[cfg(feature = "scrub-runtime")]
+    #[test]
+    fn scrub_seed_is_visible_without_publishing_committed_root() {
+        let temp = tempfile::TempDir::new().expect("create scrub seed tempdir");
+        seed_scrub_backlog(temp.path()).expect("seed scrub backlog");
+
+        let mut options = tidefs_local_object_store::StoreOptions::default();
+        options.background_scrub_interval_secs = 1;
+        let mut store = tidefs_local_object_store::LocalObjectStore::open_read_only_with_options(
+            temp.path(),
+            options,
+        )
+        .expect("open seeded store")
+        .expect("seeded store exists");
+
+        assert_eq!(store.committed_root_u64(), None);
+        let report = store
+            .run_background_scrub_with_budget(1, SCRUB_UNIT_BYTES)
+            .expect("scrub one seeded record");
+        assert_eq!(report.records_verified, 1);
+        assert!(store.background_scrub_pending());
     }
 
     #[test]
