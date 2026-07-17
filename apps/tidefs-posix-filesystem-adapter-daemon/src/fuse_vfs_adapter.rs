@@ -8155,10 +8155,10 @@ impl FuseVfsAdapter {
             {
                 let engine = self.engine.lock().unwrap();
                 let bridge = crate::fuse_flush_fsync::PageCacheDirtyFlush::new(
-                    self.writeback_page_cache.as_ref(),
-                    &**engine,
-                    efh,
-                    ctx,
+                    // The bridge clears its optional mirror as soon as the
+                    // lower flush succeeds. Keep both adapter mirrors dirty
+                    // until every later fsync barrier stage succeeds.
+                    None, &**engine, efh, ctx,
                 );
                 tidefs_local_filesystem::fuse_fsync::dispatch_namespace_fsync(
                     &bridge,
@@ -8309,6 +8309,9 @@ impl FuseVfsAdapter {
         }
 
         self.writeback_cache.lock().unwrap().mark_clean(ino);
+        if let Some(ref writeback_page_cache) = self.writeback_page_cache {
+            writeback_page_cache.clear_dirty_for_inode(ino);
+        }
         self.write_page_cache.clear_dirty_for_inode(ino);
         self.writeback_cache_stats.lock().unwrap().record_flush();
         Ok(())
@@ -26595,7 +26598,9 @@ mod tests {
         // Write data through dispatch_write (dirtying pages), then call
         // dispatch_fsync (full sync) which must trigger the writeback path and
         // flush dirty data through the block-volume target.
-        let f = adapter_fixture();
+        let mut f = adapter_fixture();
+        let writeback_page_cache = Arc::new(PageCache::new(8, 4096));
+        f.adapter.writeback_page_cache = Some(Arc::clone(&writeback_page_cache));
         let c = root_ctx();
         let td = b"fsync wb";
         let (ino, fh, _) =
@@ -26603,6 +26608,11 @@ mod tests {
         f.adapter
             .dispatch_write(&c, ino.get(), fh, 0, td, 0)
             .unwrap();
+        assert!(writeback_page_cache.has_dirty_pages_for_inode(ino.get()));
+        assert!(f
+            .adapter
+            .write_page_cache
+            .has_dirty_pages_for_inode(ino.get()));
         let (m, log) = MockBV::new();
         f.adapter.block_volume.lock().unwrap().replace(Box::new(m));
         f.adapter
@@ -26616,6 +26626,11 @@ mod tests {
             .unwrap()
             .get(&ino.get())
             .is_none_or(|dr| dr.is_empty()));
+        assert!(!writeback_page_cache.has_dirty_pages_for_inode(ino.get()));
+        assert!(!f
+            .adapter
+            .write_page_cache
+            .has_dirty_pages_for_inode(ino.get()));
         // Data must have been written to the block-volume target.
         assert_eq!(log.lock().unwrap()[0].1, td);
     }
@@ -26629,6 +26644,8 @@ mod tests {
             tidefs_local_filesystem::dirty_page_tracker::DirtyPageTracker::new(),
         ));
         f.adapter.writeback_range_tracker = Some(Arc::clone(&tracker));
+        let writeback_page_cache = Arc::new(PageCache::new(8, 4096));
+        f.adapter.writeback_page_cache = Some(Arc::clone(&writeback_page_cache));
         let c = root_ctx();
         let td = b"eio flush";
         let (ino, fh, _) =
@@ -26636,6 +26653,11 @@ mod tests {
         f.adapter
             .dispatch_write(&c, ino.get(), fh, 0, td, 0)
             .unwrap();
+        assert!(writeback_page_cache.has_dirty_pages_for_inode(ino.get()));
+        assert!(f
+            .adapter
+            .write_page_cache
+            .has_dirty_pages_for_inode(ino.get()));
         tracker.lock().unwrap().mark_dirty(ino, 0, td.len() as u64);
         let (m, _log) = MockBV::new();
         f.adapter
@@ -26654,6 +26676,11 @@ mod tests {
             .get(&ino.get())
             .unwrap()
             .contains(0, td.len() as u32));
+        assert!(writeback_page_cache.has_dirty_pages_for_inode(ino.get()));
+        assert!(f
+            .adapter
+            .write_page_cache
+            .has_dirty_pages_for_inode(ino.get()));
         let tracker = tracker.lock().unwrap();
         let ranges = tracker
             .dirty_ranges(ino)
