@@ -1,0 +1,104 @@
+schema_version = 1
+claim_id = "storage.intent.ack_receipt_honesty.v1"
+issue = "https://github.com/tidefs/tidefs/issues/2225"
+reviewed_at = "2026-07-17T10:32:55Z"
+reviewed_tree = "402fd7eff975bb862ab1e67f51eaae491b8facf0"
+validation_tier = "source-model"
+review_scope = "claims-gate review of acknowledgment receipt policy, mounted runtime, ordering and membership and media gates, QEMU fault evidence, and this review receipt"
+review_outcome = "blocked"
+decision = "The claim remains blocked. Policy and receipt authority, ordering and membership and media gates, and the QEMU fault matrix are current, schema-valid where applicable, digest-matched, and pass-outcome; the required mounted-userspace acknowledgment receipt runtime artifact and manifest are missing."
+
+required_evidence_classes = [
+  "storage-intent-policy-receipt-authority",
+  "storage-intent-ack-receipt-runtime",
+  "storage-intent-ordering-membership-media-gates",
+  "storage-intent-ack-fault-matrix",
+  "claims-gate-review",
+]
+
+missing_evidence = [
+  "Issue #2223 must produce validation/artifacts/storage-intent/ack-receipt-runtime.json and its version-2 manifest from the mounted-userspace write, fsync, fdatasync, O_DSYNC, mmap sync, namespace, and fsyncdir receipt and refusal rows.",
+]
+
+non_claim_boundaries = [
+  "The source-model rows do not substitute for mounted-userspace receipt production.",
+  "The QEMU raw-media fault matrix does not prove mounted write, fsync, fdatasync, O_DSYNC, mmap, namespace, fsyncdir, or multi-process distributed quorum behavior.",
+  "No storage-intent successor, comparator, product, production, release-readiness, or broader durability wording is strengthened.",
+]
+
+[[evidence_checks]]
+class = "storage-intent-policy-receipt-authority"
+artifact_path = "validation/artifacts/storage-intent/ack-receipt-policy-authority.json"
+manifest_path = "validation/artifacts/storage-intent/ack-receipt-policy-authority.manifest.json"
+artifact_status = "present"
+artifact_schema = "json-report-v1"
+manifest_schema = "v2-pass"
+digest_status = "match"
+outcome_status = "pass"
+currentness_status = "current-in-reviewed-tree"
+content_digest = "blake3:47820a7d823643f29b009de4164da94e6c2f5ed72c984812a7ec0e028796fcf3"
+run_id = "deterministic-fixture:storage-intent-ack-receipt-policy-authority-v1"
+source_ref = "refs/heads/codex3/issue-2222-ack-receipt-authority"
+notes = "validate-claim reports PRESENT/PASS with no blocking issues; the JSON report records report_version 1 and outcome.passed=true."
+
+[[evidence_checks]]
+class = "storage-intent-ack-receipt-runtime"
+artifact_path = "validation/artifacts/storage-intent/ack-receipt-runtime.json"
+manifest_path = "validation/artifacts/storage-intent/ack-receipt-runtime.manifest.json"
+artifact_status = "missing"
+artifact_schema = "not-available"
+manifest_schema = "missing"
+digest_status = "missing"
+outcome_status = "missing"
+currentness_status = "missing"
+blocking_owner = "https://github.com/tidefs/tidefs/issues/2223"
+notes = "validate-claim reports MISSING because the registered version-2 manifest does not exist; no mounted runtime class can be inferred from source-model or QEMU fault evidence."
+
+[[evidence_checks]]
+class = "storage-intent-ordering-membership-media-gates"
+artifact_path = "validation/artifacts/storage-intent/ack-receipt-authority-gates.json"
+manifest_path = "validation/artifacts/storage-intent/ack-receipt-authority-gates.manifest.json"
+artifact_status = "present"
+artifact_schema = "json-report-v1"
+manifest_schema = "v2-pass"
+digest_status = "match"
+outcome_status = "pass"
+currentness_status = "current-in-reviewed-tree"
+content_digest = "blake3:1ab9dbca833783fea6bfa393895709d7adeee870ddbe291c004509c96b57d4e3"
+run_id = "deterministic-fixture:storage-intent-ack-receipt-authority-gates-v1"
+source_ref = "refs/heads/codex3/issue-2222-ack-receipt-authority"
+notes = "validate-claim reports PRESENT/PASS with no blocking issues; the JSON report records report_version 1 and outcome.passed=true."
+
+[[evidence_checks]]
+class = "storage-intent-ack-fault-matrix"
+artifact_path = "validation/artifacts/storage-intent/ack-receipt-fault-matrix.json"
+manifest_path = "validation/artifacts/storage-intent/ack-receipt-fault-matrix.manifest.json"
+artifact_status = "present"
+artifact_schema = "json-report-v1"
+manifest_schema = "v2-pass"
+digest_status = "match"
+outcome_status = "pass"
+currentness_status = "current-in-reviewed-tree"
+content_digest = "blake3:0f5d11a683637ef00682eed2a2a1ca8cf231e1fd40cd65d9a2871022c8019ec3"
+run_id = "29570719618/1"
+source_ref = "45af538c0b49bc3be61a191f21e342feeb119402"
+notes = "validate-claim reports PRESENT/PASS with no blocking issues; the JSON report records report_version 1, five pass rows, and zero product or harness failures."
+
+[[evidence_checks]]
+class = "claims-gate-review"
+artifact_path = "validation/artifacts/storage-intent/ack-receipt-claims-gate-review.toml"
+manifest_path = "validation/artifacts/storage-intent/ack-receipt-claims-gate-review.manifest.json"
+artifact_status = "present"
+artifact_schema = "toml-review-v1"
+manifest_schema = "v2-pass"
+digest_status = "bound-by-companion-manifest"
+outcome_status = "pass"
+currentness_status = "current-on-review-branch"
+run_id = "deterministic-fixture:issue-2225-ack-receipt-claims-gate-review-v1"
+source_ref = "refs/heads/codex2/issue-2225-ack-receipt-claims-review"
+notes = "The review receipt passes because it accurately audits every registered class; review_outcome remains blocked because mounted-userspace evidence is missing."
+
+[registry_effect]
+claims_toml_changed = false
+claim_status_after_review = "blocked"
+stronger_wording_allowed = false
