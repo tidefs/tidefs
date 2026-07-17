@@ -1130,13 +1130,47 @@ mod tests {
     // -- Device CLI parse tests -------------------------------------------
 
     #[test]
-    fn cli_parse_device_remove_imported_pool_shape() {
+    fn cli_parse_device_remove_keeps_only_pool_and_device_inputs() {
         use clap::Parser;
         let args = Cli::try_parse_from(["tidefsctl", "device", "remove", "mypool", "/dev/sdc"]);
         assert!(
             args.is_ok(),
             "device remove for imported pool should parse without offline store arguments"
         );
+
+        for args in [
+            vec![
+                "tidefsctl",
+                "device",
+                "remove",
+                "mypool",
+                "/dev/sdc",
+                "--replication-factor",
+                "3",
+            ],
+            vec![
+                "tidefsctl",
+                "device",
+                "remove",
+                "mypool",
+                "/dev/sdc",
+                "--failure-domain",
+                "rack",
+            ],
+            vec![
+                "tidefsctl",
+                "device",
+                "remove",
+                "mypool",
+                "/dev/sdc",
+                "--force",
+            ],
+        ] {
+            assert!(
+                Cli::try_parse_from(args).is_err(),
+                "refused removal must not retain ignored policy inputs"
+            );
+        }
     }
 
     #[test]

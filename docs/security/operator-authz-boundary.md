@@ -75,7 +75,7 @@ product-grade.
 | `snapshot rollback` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | roll back through the live owner or explicit offline devices |
 | `snapshot send` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | export snapshot streams through owner authority or explicit offline devices |
 | `snapshot receive` | `public-operator` | `live-owner` | `local-only` | `visible` | receive snapshot streams through the live owner; offline receive is unsupported |
-| `device remove` | `public-operator` | `live-owner` | `local-only` | `visible` | route device evacuation/removal through live placement and refcount authority |
+| `device remove` | `public-operator` | `live-owner` | `local-only` | `visible` | require live-owner authority but refuse dispatch until evacuation receipts and topology/label updates are durable |
 | `device status` | `public-operator` | `live-owner` | `unguarded` | `visible` | query live device status through the live owner; fail closed when no live owner is reachable |
 | `defrag` | `public-operator` | `no-live-pool-state` | `local-only` | `visible` | request online extent-map defragmentation for a path |
 | `block attach` | `public-operator` | `live-owner` | `local-only` | `visible` | attach an imported pool as a ublk block device through owner authority |
