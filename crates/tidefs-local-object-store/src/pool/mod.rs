@@ -1119,11 +1119,25 @@ fn resume_device_removal_if_pending(pool: &mut Pool) {
     let marker_path = pool.config.root_path.join(DEVICE_REMOVAL_MARKER_FILE);
     if marker_path.exists() {
         if let Ok(marker) = read_device_removal_marker(&marker_path) {
+            let mut unique_device_guids = BTreeSet::new();
+            if pool.device_guids.len() != pool.devices.len()
+                || !pool
+                    .device_guids
+                    .iter()
+                    .copied()
+                    .all(|guid| unique_device_guids.insert(guid))
+            {
+                // GUID absence proves replay-visible detach only when the
+                // loaded device table is complete and unambiguous. Preserve
+                // the marker when topology identity cannot be trusted.
+                return;
+            }
             let target_path = pool
                 .device_guids
                 .iter()
                 .position(|guid| *guid == marker.target_guid)
-                .map(|idx| pool.devices[idx].root().to_path_buf());
+                .and_then(|idx| pool.devices.get(idx))
+                .map(|device| device.root().to_path_buf());
             if let Some(target_path) = target_path {
                 // A successful retry only removes the target from this Pool
                 // instance. Keep the marker until a later topology load no
@@ -7795,6 +7809,30 @@ mod tests {
         assert!(!marker_path.exists());
         assert_eq!(pool.stats().device_count, 1);
         assert_eq!(pool.get(IoClass::Data, key).unwrap(), Some(data));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn safe_remove_device_resume_preserves_marker_for_incomplete_guid_table() {
+        let root = temp_dir("safe-remove-resume-incomplete-guid-table");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = multi_data_device_config(&root, 2);
+        let mut pool = Pool::create(config, PoolProperties::default(), &test_options()).unwrap();
+        let target_path = pool.devices[1].root().to_path_buf();
+        let target_guid = pool.device_guid_for_index(1);
+        let marker_path = root.join(DEVICE_REMOVAL_MARKER_FILE);
+        persist_device_removal_marker(&root, &target_path, target_guid).unwrap();
+
+        pool.device_guids.pop();
+        resume_device_removal_if_pending(&mut pool);
+
+        assert!(marker_path.exists());
+        assert_eq!(pool.stats().device_count, 2);
+        assert!(pool
+            .devices
+            .iter()
+            .any(|device| device.root() == target_path));
 
         let _ = std::fs::remove_dir_all(&root);
     }
