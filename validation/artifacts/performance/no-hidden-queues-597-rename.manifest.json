@@ -1,0 +1,16 @@
+{
+  "manifest_version": 2,
+  "claim_id": "local.vfs.rename_atomic_crash.v1",
+  "evidence_class": "no-hidden-queues-review-receipt",
+  "validation_tier": "source-model",
+  "scope": "Issue 597 source and registry review of rename namespace and orphan-index queue roots",
+  "artifact_path": "validation/artifacts/performance/no-hidden-queues-597-rename.toml",
+  "content_digest": "blake3:58f70c101339b6b84e4f93eda87a00551e9187bdb5e19c56ef60dd7b7040a1b3",
+  "run_id": "manual-review:issue-597-no-hidden-queues-rename-v1",
+  "source_ref": "0f99c9ecb695d55a954fb7844b433b6e2b98b5fb",
+  "outcome": "pass",
+  "residual_risk": "This promoted source-review receipt does not satisfy queue-depth runtime evidence or prove active rename and orphan-index runtime admission.",
+  "source": "tidefs-xtask check-no-hidden-queues source review",
+  "generated_at": "2026-07-03T16:19:39+02:00",
+  "blocking_issues": []
+}

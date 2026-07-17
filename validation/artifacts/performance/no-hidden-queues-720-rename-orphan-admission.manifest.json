@@ -1,0 +1,16 @@
+{
+  "manifest_version": 2,
+  "claim_id": "local.vfs.rename_atomic_crash.v1",
+  "evidence_class": "no-hidden-queues-review-receipt",
+  "validation_tier": "source-model",
+  "scope": "Issue 720 source and registry review of active rename and orphan-index metadata admission",
+  "artifact_path": "validation/artifacts/performance/no-hidden-queues-720-rename-orphan-admission.toml",
+  "content_digest": "blake3:81f7d517264920e29a540a9912ab9cc3dec438c593c665a84befbf8b47ee5bd3",
+  "run_id": "manual-review:issue-720-rename-orphan-admission-v1",
+  "source_ref": "0f99c9ecb695d55a954fb7844b433b6e2b98b5fb",
+  "outcome": "pass",
+  "residual_risk": "This promoted source-review receipt does not satisfy queue-depth runtime evidence or prove mount-time recovery and background reclamation admission.",
+  "source": "tidefs-xtask check-no-hidden-queues source review",
+  "generated_at": "2026-07-03T16:19:39+02:00",
+  "blocking_issues": []
+}

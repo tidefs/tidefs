@@ -1581,6 +1581,7 @@ fn check_committed_validation_artifacts(root: &Path, missing: &mut Vec<String>) 
 
     let mut live_runtime_artifacts = BTreeSet::new();
     let mut artifact_runtime_classes = BTreeMap::<String, BTreeSet<bool>>::new();
+    let mut artifact_roles = BTreeMap::<String, BTreeSet<&'static str>>::new();
     for manifest_path in paths
         .iter()
         .filter(|path| is_evidence_manifest_path(Path::new(path)))
@@ -1598,10 +1599,28 @@ fn check_committed_validation_artifacts(root: &Path, missing: &mut Vec<String>) 
         if !is_evidence_manifest_path(Path::new(&artifact_path))
             && committed_artifacts.contains(&artifact_path)
         {
+            let role = if manifest
+                .run_id
+                .starts_with(DETERMINISTIC_FIXTURE_RUN_ID_PREFIX)
+            {
+                "fixture"
+            } else {
+                "promoted evidence"
+            };
+            artifact_roles
+                .entry(artifact_path.clone())
+                .or_default()
+                .insert(role);
             artifact_runtime_classes
                 .entry(artifact_path.clone())
                 .or_default()
                 .insert(manifest.validation_tier.is_live_runtime());
+            if let Err(err) = manifest.verify_artifact_digest(root) {
+                missing.push(format!(
+                    "{manifest_path} has invalid committed artifact digest: {}",
+                    err.failures().join("; ")
+                ));
+            }
         }
         if manifest.validation_tier.is_live_runtime() {
             if is_evidence_manifest_path(Path::new(&artifact_path)) {
@@ -1612,12 +1631,6 @@ fn check_committed_validation_artifacts(root: &Path, missing: &mut Vec<String>) 
             if !committed_artifacts.contains(&artifact_path) {
                 missing.push(format!(
                     "{manifest_path} is a live-runtime manifest pointing at non-committed artifact `{artifact_path}`"
-                ));
-            }
-            if let Err(err) = manifest.verify_artifact_digest(root) {
-                missing.push(format!(
-                    "{manifest_path} has invalid live-runtime artifact digest: {}",
-                    err.failures().join("; ")
                 ));
             }
             for sidecar_path in implied_evidence_manifest_sidecar_artifact_paths(
@@ -1633,6 +1646,22 @@ fn check_committed_validation_artifacts(root: &Path, missing: &mut Vec<String>) 
                 }
             }
             live_runtime_artifacts.insert(artifact_path);
+        }
+    }
+
+    for (artifact_path, roles) in &artifact_roles {
+        if roles.len() > 1 {
+            missing.push(format!(
+                "{artifact_path} has both fixture and promoted-evidence manifests"
+            ));
+        }
+    }
+
+    for artifact_path in &committed_artifacts {
+        if !artifact_roles.contains_key(artifact_path) {
+            missing.push(format!(
+                "{artifact_path} is an unclassified committed artifact missing a v2 evidence manifest"
+            ));
         }
     }
 
@@ -5451,6 +5480,95 @@ non_claims = ["none"]
         assert!(
             missing.iter().any(|failure| failure.contains(
                 "validation/artifacts/kernel/runtime-output.json is unclassified runtime output missing v2 live-runtime evidence manifest"
+            )),
+            "{missing:#?}"
+        );
+    }
+
+    #[test]
+    fn committed_validation_artifacts_reject_unclassified_neutral_output() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        git(temp.path(), &["init"]);
+        write_artifact(
+            temp.path(),
+            "validation/artifacts/kernel/model-output.json",
+            r#"{"status":"source-model"}"#,
+        );
+        git(
+            temp.path(),
+            &["add", "validation/artifacts/kernel/model-output.json"],
+        );
+
+        let mut missing = Vec::new();
+        check_committed_validation_artifacts(temp.path(), &mut missing);
+
+        assert!(
+            missing.iter().any(|failure| failure.contains(
+                "validation/artifacts/kernel/model-output.json is an unclassified committed artifact missing a v2 evidence manifest"
+            )),
+            "{missing:#?}"
+        );
+    }
+
+    #[test]
+    fn committed_validation_artifacts_reject_mixed_inventory_roles() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        git(temp.path(), &["init"]);
+        let artifact_path = "validation/artifacts/kernel/source-review.toml";
+        let artifact_body = "decision = \"reviewed\"\n";
+        write_artifact(temp.path(), artifact_path, artifact_body);
+
+        for (manifest_path, run_id) in [
+            (
+                "validation/artifacts/kernel/source-review.fixture.manifest.json",
+                "deterministic-fixture:source-review-v1",
+            ),
+            (
+                "validation/artifacts/kernel/source-review.promoted.manifest.json",
+                "manual-review:source-review-v1",
+            ),
+        ] {
+            let manifest = EvidenceArtifactManifest {
+                manifest_version: EVIDENCE_ARTIFACT_MANIFEST_VERSION,
+                claim_id: "example.source.review.v1".to_string(),
+                evidence_class: "source-review".to_string(),
+                validation_tier: ValidationTier::SourceModel,
+                scope: "committed artifact inventory role fixture".to_string(),
+                artifact_path: artifact_path.to_string(),
+                content_digest: content_digest_for_bytes(artifact_body.as_bytes()),
+                run_id: run_id.to_string(),
+                source_ref: MANIFEST_FIXTURE_SOURCE_REF.to_string(),
+                outcome: ValidationStatus::Pass,
+                residual_risk: "Fixture validates committed artifact role enforcement only."
+                    .to_string(),
+                source: "tidefs-xtask-test".to_string(),
+                generated_at: "2026-07-17T12:00:00Z".to_string(),
+                blocking_issues: Vec::new(),
+            };
+            write_artifact(
+                temp.path(),
+                manifest_path,
+                &manifest
+                    .to_json_pretty()
+                    .expect("serialize inventory manifest fixture"),
+            );
+        }
+        git(
+            temp.path(),
+            &[
+                "add",
+                artifact_path,
+                "validation/artifacts/kernel/source-review.fixture.manifest.json",
+                "validation/artifacts/kernel/source-review.promoted.manifest.json",
+            ],
+        );
+
+        let mut missing = Vec::new();
+        check_committed_validation_artifacts(temp.path(), &mut missing);
+
+        assert!(
+            missing.iter().any(|failure| failure.contains(
+                "validation/artifacts/kernel/source-review.toml has both fixture and promoted-evidence manifests"
             )),
             "{missing:#?}"
         );
