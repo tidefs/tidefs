@@ -210,7 +210,7 @@ if [ ! -b "$DEV0" ] || [ ! -b "$DEV1" ]; then
              unmount pool_export ownerless_reimport_refused \
              owner_mediated_reimport remount \
              persist_verify live_owner_status_visible post_remount_write_read \
-             ownerless_active_status_refused \
+             explicit_device_status_live_owner \
              crash_cycle_export_prep crash_cycle_ownerless_preimport_refused \
              crash_cycle_owner_mediated_preimport crash_cycle_premount \
              crash_cycle_write_committed crash_cycle_write_uncommitted \
@@ -494,22 +494,24 @@ else
 fi
 
 echo ""
-echo "--- Phase 14: Ownerless active-status refusal ---"
+echo "--- Phase 14: Explicit-device status uses live owner ---"
 
 if [ "$REMOUNTED" -eq 1 ]; then
     SOUT=$(tidefsctl pool status "$POOL_NAME" --devices "$DEV0" "$DEV1" --json 2>&1); RC=$?
-    if [ "$RC" -ne 0 ] && printf '%s\n' "$SOUT" | grep -q '"owner_required"[[:space:]]*:[[:space:]]*true'; then
-        pass "ownerless_active_status_refused"
+    if [ "$RC" -eq 0 ] \
+       && printf '%s\n' "$SOUT" | grep -q '"state"[[:space:]]*:[[:space:]]*"Active"' \
+       && printf '%s\n' "$SOUT" | grep -q '"owner_kind"[[:space:]]*:'; then
+        pass "explicit_device_status_live_owner"
     else
-        fail "ownerless_active_status_refused" "expected owner_required refusal, exit=$RC output=$SOUT"
+        fail "explicit_device_status_live_owner" "expected live-owner status, exit=$RC output=$SOUT"
     fi
 else
-    blocked "ownerless_active_status_refused" "remount failed"
+    blocked "explicit_device_status_live_owner" "remount failed"
 fi
 
 # Keep the remount owner alive through both status checks above. The
-# explicit-device check only exercises the active-owner refusal while that
-# owner interface is still reachable.
+# explicit-device check only proves live-owner routing while that owner
+# interface is still reachable.
 if [ -n "$RPID" ]; then
     kill "$RPID" 2>/dev/null || true
     sleep 1
@@ -783,7 +785,7 @@ INITSCRIPT
       write_data fsync_data read_verify unmount pool_export \
       ownerless_reimport_refused owner_mediated_reimport remount persist_verify \
       live_owner_status_visible post_remount_write_read \
-      ownerless_active_status_refused \
+      explicit_device_status_live_owner \
       crash_cycle_export_prep crash_cycle_ownerless_preimport_refused \
       crash_cycle_owner_mediated_preimport crash_cycle_premount \
       crash_cycle_write_committed crash_cycle_write_uncommitted \
