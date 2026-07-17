@@ -80,7 +80,7 @@ pub struct PoolLifecycleContext {
 impl PoolLifecycleContext {
     #[must_use]
     pub fn topology_complete(&self) -> bool {
-        self.pool_guid.is_some()
+        self.pool_guid.is_some_and(|guid| guid != [0u8; 16])
             && self
                 .pool_name
                 .as_deref()
@@ -297,6 +297,22 @@ mod tests {
 
         assert_eq!(evidence.outcome, PoolLifecycleOutcome::Refused);
         assert_eq!(evidence.pool_guid, None);
+        assert!(!evidence.topology_complete);
+        assert!(evidence.owner_authorized);
+        assert!(evidence.fail_closed);
+        assert!(evidence.is_fail_closed());
+        assert_eq!(evidence.reason, "topology evidence incomplete");
+    }
+
+    #[test]
+    fn executed_evidence_refuses_topology_with_nil_pool_guid() {
+        let mut nil_guid = context();
+        nil_guid.pool_guid = Some([0u8; 16]);
+
+        let evidence = PoolLifecycleEvidence::executed(PoolLifecycleAction::Import, nil_guid);
+
+        assert_eq!(evidence.outcome, PoolLifecycleOutcome::Refused);
+        assert_eq!(evidence.pool_guid, Some([0u8; 16]));
         assert!(!evidence.topology_complete);
         assert!(evidence.owner_authorized);
         assert!(evidence.fail_closed);
