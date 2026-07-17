@@ -4093,6 +4093,14 @@ fn live_snapshot_send_plan(
         .map_err(|err| format!("snapshot send: invalid pool-id: {err}"))?;
     let dataset_id = live_admin_hex_16_or_default(args, "dataset_id")
         .map_err(|err| format!("snapshot send: invalid dataset-id: {err}"))?;
+    if format == LiveSnapshotSendFormat::Vfssend1 {
+        if let Some(key) = ["pool_id", "dataset_id"]
+            .into_iter()
+            .find(|key| !matches!(args.get(*key), None | Some(Value::Null)))
+        {
+            return Err(format!("snapshot send: {key} requires format 'vfssend2'"));
+        }
+    }
     let incremental = match args.get("incremental") {
         None | Some(Value::Null) => false,
         Some(Value::Bool(incremental)) => *incremental,
@@ -9031,6 +9039,41 @@ mod tests {
                 format!(
                     "snapshot send: invalid {label}: live admin argument '{field}' must be a non-empty string"
                 )
+            );
+            assert!(!output.exists());
+        }
+    }
+
+    #[test]
+    fn live_snapshot_send_rejects_vfssend2_ids_on_vfssend1_without_output() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = root.path().join("store");
+        let mut fs = LocalFileSystem::open(&store).expect("open fs");
+        fs.create_file("/live.txt", 0o644).expect("create file");
+        fs.write_file("/live.txt", 0, b"live owner snapshot send")
+            .expect("write file");
+        let engine = VfsLocalFileSystem::new(fs);
+
+        for field in ["pool_id", "dataset_id"] {
+            let output = root.path().join(format!("vfssend1-{field}.vfs"));
+            let mut args = json!({
+                "output": output.display().to_string(),
+                "format": "vfssend1",
+                "incremental": false,
+            });
+            args.as_object_mut()
+                .expect("snapshot send args object")
+                .insert(field.to_string(), json!("11".repeat(16)));
+
+            let refused = live_snapshot_admin(&engine, "send", args, true);
+
+            assert_eq!(refused["ok"], false, "send response: {refused}");
+            assert_eq!(refused["exit_code"], 1);
+            assert!(refused["json"].is_null());
+            assert!(refused["text"].is_null());
+            assert_eq!(
+                refused["error"],
+                format!("snapshot send: {field} requires format 'vfssend2'")
             );
             assert!(!output.exists());
         }
