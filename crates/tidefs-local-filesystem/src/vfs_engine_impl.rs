@@ -3897,7 +3897,14 @@ enum LiveSnapshotSendFormat {
 
 impl LiveSnapshotSendFormat {
     fn parse(args: &Value) -> Result<Self, String> {
-        match live_admin_optional_arg(args, "format").unwrap_or("vfssend1") {
+        let format = match args.get("format") {
+            None | Some(Value::Null) => "vfssend1",
+            Some(Value::String(format)) if !format.is_empty() => format,
+            Some(_) => {
+                return Err("snapshot send: format must be a non-empty string".to_string());
+            }
+        };
+        match format {
             "vfssend1" => Ok(Self::Vfssend1),
             "vfssend2" => Ok(Self::Vfssend2),
             other => Err(format!("snapshot send: unknown stream format '{other}'")),
@@ -8772,6 +8779,41 @@ mod tests {
             "format response should name rejected format: {refused}"
         );
         assert!(!output.exists());
+    }
+
+    #[test]
+    fn live_snapshot_send_rejects_malformed_format_without_default_fallback() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = root.path().join("store");
+        let mut fs = LocalFileSystem::open(&store).expect("open fs");
+        fs.create_file("/live.txt", 0o644).expect("create file");
+        fs.write_file("/live.txt", 0, b"live owner snapshot send")
+            .expect("write file");
+        let engine = VfsLocalFileSystem::new(fs);
+
+        for (name, format) in [("empty", json!("")), ("non-string", json!(2))] {
+            let output = root.path().join(format!("malformed-format-{name}.vfs"));
+            let refused = live_snapshot_admin(
+                &engine,
+                "send",
+                json!({
+                    "output": output.display().to_string(),
+                    "format": format,
+                    "incremental": false,
+                }),
+                true,
+            );
+
+            assert_eq!(refused["ok"], false, "format response: {refused}");
+            assert_eq!(refused["exit_code"], 1);
+            assert!(refused["json"].is_null());
+            assert!(refused["text"].is_null());
+            assert_eq!(
+                refused["error"],
+                "snapshot send: format must be a non-empty string"
+            );
+            assert!(!output.exists());
+        }
     }
 
     #[test]
