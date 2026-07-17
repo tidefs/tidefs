@@ -6089,6 +6089,9 @@ impl RamAuthorityRecord {
         if !self.earned_ack_class_is_pmem_durable() {
             return StorageIntentRefusalReason::MediaRoleNotAllowed;
         }
+        if !ack_receipt_satisfies_requested_floor(self.requested_guarantee, self.earned_ack_class) {
+            return StorageIntentRefusalReason::GuaranteeFloorNotMet;
+        }
         if !evidence_ref_has_kind(
             self.media_capability_ref,
             StorageIntentEvidenceKind::MediaCapabilityEvidence,
@@ -24456,7 +24459,7 @@ mod tests {
     }
 
     #[test]
-    fn pmem_durable_receipt_requires_complete_same_generation_evidence() {
+    fn pmem_durable_receipt_requires_complete_evidence_and_requested_floor() {
         let ready = pmem_durable_emit_ready_base();
 
         assert!(ram_authority_receipt_is_emit_ready(ready).satisfied);
@@ -24508,6 +24511,10 @@ mod tests {
             earned_ack_class: StorageIntentGuaranteeClass::VolatileLocal,
             ..ready
         };
+        let unmet_requested_floor = RamAuthorityRecord {
+            requested_guarantee: StorageIntentGuaranteeClass::FullPlacement,
+            ..ready
+        };
 
         for (record, refusal) in [
             (
@@ -24549,6 +24556,10 @@ mod tests {
             (
                 volatile_ack,
                 StorageIntentRefusalReason::MediaRoleNotAllowed,
+            ),
+            (
+                unmet_requested_floor,
+                StorageIntentRefusalReason::GuaranteeFloorNotMet,
             ),
         ] {
             assert_eq!(ram_authority_receipt_is_emit_ready(record).refusal, refusal);
