@@ -3,7 +3,7 @@ evidence_class = "scrub-read-isolation-model"
 source = "tidefs-performance-contract"
 scope = "local-mounted-foreground-read-service-while-scrub-work-is-pending"
 issue = 1792
-reviewed_at = "2026-07-10"
+reviewed_at = "2026-07-17"
 
 reviewed_claim_ids = [
   "scrub.foreground_read.protected.v1",
@@ -13,13 +13,14 @@ reviewed_claim_ids = [
 validation_tier = "source-model"
 runtime_artifact = "validation/artifacts/performance/scrub-read-runtime.json"
 runtime_artifact_source = "QEMU Smoke target=scrub-foreground-read-runtime"
-runtime_evidence_status = "bounded-qemu-scrub-foreground-read-runtime-row-present-runtime-artifact-required-claims-remain-blocked"
+runtime_evidence_status = "scheduled-mounted-scrub-row-present-current-runtime-artifact-required-claims-remain-blocked"
 decision = "claims-remain-blocked-until-runtime-artifact-and-claims-gate-review"
 
 typed_contracts = [
   "tidefs-performance-contract::ServiceCurve::FOREGROUND_READ_DEFAULT",
   "tidefs-performance-contract::ServiceCurve::SCRUB_BOUNDED_DEFAULT",
   "tidefs-performance-contract::ScrubRuntimeObservation",
+  "tidefs-background-scheduler::BackgroundService",
   "tidefs-performance-contract::oracle::with_scheduling_and_admission",
   "tidefs-performance-contract::oracle::without_scheduling_or_admission",
 ]
@@ -27,11 +28,14 @@ typed_contracts = [
 runtime_row_paths = [
   "crates/tidefs-validation/src/scrub_foreground_read_runtime.rs",
   "crates/tidefs-validation/src/bin/scrub_foreground_read_validation.rs",
+  "apps/tidefs-posix-filesystem-adapter-daemon/src/main.rs",
+  "crates/tidefs-local-object-store/src/store.rs",
 ]
 
 boundary_review = [
   "The runtime row records mounted FUSE foreground-read correctness while scrub work is configured.",
-  "The row can ingest mounted-daemon cycle, record, and byte counts, but pending and rate-limited scrub facts still come from a harness-only deterministic model and cannot make the row pass.",
+  "Mounted scrub is registered as a bounded background service and emits admitted cycle, record, byte, pending, and scheduler-budget throttle observations from the daemon that owns the mount.",
+  "Only same-daemon observations from the same pending scrub tick before and after the foreground read can promote the row from harness-only to mounted-userspace evidence.",
   "The runtime row consumes the typed ServiceCurve defaults and deterministic foreground-read/scrub oracle instead of mirroring queue and wait constants locally.",
   "The scheduled oracle must keep foreground-read wait within the configured bound while the unscheduled counterexample exceeds that bound.",
   "The runtime evidence must record scrub admission/refusal state, deferred scrub units, throttling, read correctness, residual risk, and no claim-status/product-wording change.",

@@ -49,13 +49,16 @@ use crate::runtime::{
     PosixFilesystemAdapterDemoVisibleAnswerRecord,
     FIRST_PUBLICATION_PIPELINE_RESPONSE_REGISTRY_TO_POSIX_FILESYSTEM_ADAPTER_WAKE_CHAIN,
 };
-use tidefs_background_scheduler::{BackgroundScheduler, ServiceBudget};
+use tidefs_background_scheduler::{
+    BackgroundScheduler, BackgroundService, ServiceBudget, ServiceError, ServicePriority,
+    TickReport,
+};
 use tidefs_intent_log::IntentLogBuffer;
 use tidefs_local_filesystem::{
     LocalFileSystemOpenConfig, LocalStorageAllocatorPolicy, RootAuthenticationKey,
     ROOT_AUTHENTICATION_ENV_VAR,
 };
-use tidefs_performance_contract::ScrubRuntimeObservation;
+use tidefs_performance_contract::{ScrubRuntimeObservation, ServiceCurve};
 #[cfg(feature = "receipt-demo")]
 use tidefs_schema_codec_posix_filesystem_adapter::CanonicalFixedWidth;
 #[cfg(feature = "receipt-demo")]
@@ -80,6 +83,137 @@ const MOUNT_VFS_WRITE_BUFFER_FLUSH_THRESHOLD_BYTES: usize = 64 * 1024 * 1024;
 const MOUNT_VFS_MAX_UNCOMMITTED_MUTATIONS: u64 = 64 * 1024;
 const MOUNT_VFS_TXG_COMMIT_INTERVAL_SECS: u64 = 30;
 const MOUNT_VFS_DEFAULT_BACKGROUND_SCRUB_INTERVAL_SECS: u64 = 0;
+
+struct MountedBackgroundScrubService {
+    store: tidefs_local_object_store::LocalObjectStore,
+    observation: ScrubRuntimeObservation,
+    observation_artifact: Option<PathBuf>,
+    next_tick_not_before: std::time::Instant,
+}
+
+impl MountedBackgroundScrubService {
+    const NAME: &'static str = "mounted-segment-scrub";
+
+    fn open(
+        root: &Path,
+        options: tidefs_local_object_store::StoreOptions,
+        observation_artifact: Option<PathBuf>,
+    ) -> Result<Self, String> {
+        let store = tidefs_local_object_store::LocalObjectStore::open_with_options(root, options)
+            .map_err(|error| format!("open scheduled scrub store: {error}"))?;
+        let service = Self {
+            store,
+            observation: ScrubRuntimeObservation::new(std::process::id()),
+            observation_artifact,
+            next_tick_not_before: std::time::Instant::now(),
+        };
+        service.publish_observation()?;
+        Ok(service)
+    }
+
+    fn publish_observation(&self) -> Result<(), String> {
+        if let Some(path) = self.observation_artifact.as_deref() {
+            write_scrub_runtime_observation(path, &self.observation)?;
+        }
+        Ok(())
+    }
+
+    fn bounded_limit(scheduler_limit: u64, curve_limit: u64) -> u64 {
+        if scheduler_limit == 0 {
+            curve_limit
+        } else {
+            scheduler_limit.min(curve_limit)
+        }
+    }
+}
+
+impl BackgroundService for MountedBackgroundScrubService {
+    fn name(&self) -> &'static str {
+        Self::NAME
+    }
+
+    fn priority(&self) -> ServicePriority {
+        ServicePriority::Critical
+    }
+
+    fn tick(&mut self, budget: &ServiceBudget) -> Result<TickReport, ServiceError> {
+        let curve = ServiceCurve::SCRUB_BOUNDED_DEFAULT;
+        let max_records = Self::bounded_limit(budget.max_items, u64::from(curve.max_ops_per_tick));
+        let max_bytes = Self::bounded_limit(budget.max_bytes, curve.max_bytes_per_tick);
+        let report = self
+            .store
+            .run_background_scrub_with_budget(max_records, max_bytes)
+            .map_err(|error| {
+                eprintln!("background-scrub: scheduled tick failed: {error}");
+                ServiceError::Internal {
+                    service: Self::NAME,
+                    message: "object-store scrub tick failed",
+                }
+            })?;
+
+        if report.records_verified > max_records {
+            return Err(ServiceError::BudgetExceeded {
+                service: Self::NAME,
+                limit: max_records,
+                actual: report.records_verified,
+            });
+        }
+        if report.bytes_scanned > max_bytes {
+            return Err(ServiceError::BudgetExceeded {
+                service: Self::NAME,
+                limit: max_bytes,
+                actual: report.bytes_scanned,
+            });
+        }
+
+        if self.store.background_scrub_pending() && budget.max_ms > 0 {
+            self.next_tick_not_before =
+                std::time::Instant::now() + std::time::Duration::from_millis(budget.max_ms);
+        }
+
+        let work_observed =
+            report.segments_scanned > 0 || report.records_verified > 0 || report.bytes_scanned > 0;
+        let work_pending = self.store.background_scrub_pending();
+        if work_observed {
+            self.observation.record_admitted_cycle(
+                report.records_verified,
+                report.bytes_scanned,
+                work_pending,
+            );
+            if work_pending {
+                self.observation.record_budget_throttle();
+            }
+            if let Err(error) = self.publish_observation() {
+                eprintln!("background-scrub: failed to write runtime observation: {error}");
+            }
+        }
+
+        if report.segments_scanned > 0 || report.records_verified > 0 {
+            tracing::info!(
+                target: "tidefs.scrub",
+                segments = report.segments_scanned,
+                records = report.records_verified,
+                bytes = report.bytes_scanned,
+                completed = report.completed,
+                work_pending,
+                "scheduled segment scrub tick completed",
+            );
+        }
+
+        Ok(TickReport {
+            processed: report.records_verified,
+            skipped: 0,
+            errors: 0,
+            items_consumed: report.records_verified,
+            bytes_consumed: report.bytes_scanned,
+            has_more: work_pending,
+        })
+    }
+
+    fn has_work(&self) -> bool {
+        self.store.should_scrub() && std::time::Instant::now() >= self.next_tick_not_before
+    }
+}
 
 /// RAII guard that removes a PID file on drop (clean shutdown).
 /// On SIGKILL the guard never runs, leaving the PID file as validation.
@@ -605,6 +739,38 @@ fn mount_vfs(config: MountVfsConfig) -> Result<(), String> {
     // UID/GID translation in the current FUSE adapter boundary.
     tidefs_posix_filesystem_adapter_daemon::check_idmapped_mount(&config.mountpoint)?;
 
+    // Register mounted scrub with the same bounded scheduler that drives the
+    // daemon's other idle-period maintenance. The service clamps each tick to
+    // the typed scrub service curve and retains its cursor between ticks.
+    if scrub_interval > 0 {
+        let scrub_options = StoreOptions {
+            background_scrub_interval_secs: scrub_interval,
+            reclaim_enabled: config.enable_reclaim,
+            ..StoreOptions::default()
+        };
+        let observation_required = scrub_runtime_observation_artifact.is_some();
+        match MountedBackgroundScrubService::open(
+            &scrub_store_root,
+            scrub_options,
+            scrub_runtime_observation_artifact,
+        ) {
+            Ok(service) => {
+                let mut scheduler = bg_scheduler.lock().unwrap();
+                let scheduler = scheduler
+                    .as_mut()
+                    .ok_or("background scrub requires the mounted background scheduler")?;
+                scheduler.register(Box::new(service));
+                eprintln!("background-scrub: scheduled (interval={scrub_interval}s)");
+            }
+            Err(error) if observation_required => {
+                return Err(format!("background-scrub: {error}"));
+            }
+            Err(error) => {
+                eprintln!("background-scrub: disabled after setup failure: {error}");
+            }
+        }
+    }
+
     // ── Clean shutdown via SIGINT/SIGTERM ─────────────────────────
     let shutdown_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let shutdown_for_sig = std::sync::Arc::clone(&shutdown_flag);
@@ -648,92 +814,9 @@ fn mount_vfs(config: MountVfsConfig) -> Result<(), String> {
         })
     });
 
-    // -- Background segment scrub thread ---------------------------
-    // Spawn a dedicated thread that holds a long-lived LocalObjectStore
-    // and periodically runs the segment-level BLAKE3 integrity scrub.
-    // The scrub store stays open to preserve the cursor and last-scrub
-    // timestamp across cycles.  The store's internal gating (interval
-    // check) decides whether a scrub cycle actually runs on each poll.
-    let scrub_shutdown = Arc::clone(&shutdown_flag);
-    let scrub_handle = if scrub_interval > 0 {
-        let scrub_options = StoreOptions {
-            background_scrub_interval_secs: scrub_interval,
-            reclaim_enabled: config.enable_reclaim,
-            ..StoreOptions::default()
-        };
-        let root = scrub_store_root.clone();
-        Some(std::thread::spawn(move || {
-            let mut runtime_observation = ScrubRuntimeObservation::new(std::process::id());
-            if let Some(path) = scrub_runtime_observation_artifact.as_deref() {
-                if let Err(error) = write_scrub_runtime_observation(path, &runtime_observation) {
-                    eprintln!("background-scrub: failed to write runtime observation: {error}");
-                }
-            }
-            let mut scrub_store =
-                match tidefs_local_object_store::LocalObjectStore::open_with_options(
-                    &root,
-                    scrub_options,
-                ) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        eprintln!("background-scrub: failed to open scrub store: {e}");
-                        return;
-                    }
-                };
-            eprintln!("background-scrub: started (interval={scrub_interval}s)");
-            loop {
-                if scrub_shutdown.load(std::sync::atomic::Ordering::Relaxed) {
-                    break;
-                }
-                // Poll every 10s; the store's internal interval gating
-                // decides whether a scrub cycle actually runs.
-                std::thread::sleep(std::time::Duration::from_secs(10));
-                match scrub_store.run_background_scrub() {
-                    Ok(report) => {
-                        let cycle_admitted = report.completed
-                            || report.segments_scanned > 0
-                            || report.records_verified > 0
-                            || report.bytes_scanned > 0;
-                        if cycle_admitted {
-                            runtime_observation.record_admitted_cycle(
-                                report.records_verified,
-                                report.bytes_scanned,
-                                !report.completed,
-                            );
-                            if let Some(path) = scrub_runtime_observation_artifact.as_deref() {
-                                if let Err(error) =
-                                    write_scrub_runtime_observation(path, &runtime_observation)
-                                {
-                                    eprintln!(
-                                        "background-scrub: failed to write runtime observation: {error}"
-                                    );
-                                }
-                            }
-                        }
-                        if report.segments_scanned > 0 || report.records_verified > 0 {
-                            tracing::info!(
-                                target: "tidefs.scrub",
-                                segments = report.segments_scanned,
-                                records = report.records_verified,
-                                bytes = report.bytes_scanned,
-                                completed = report.completed,
-                                "segment scrub cycle completed",
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!(target: "tidefs.scrub", error = %e, "segment scrub cycle failed");
-                    }
-                }
-            }
-            eprintln!("background-scrub: stopped");
-        }))
-    } else {
-        None
-    };
-
     // Wait until a shutdown signal arrives, running background scheduler
-    // cycles during FUSE idle periods. Uses tick_if_idle() to avoid
+    // cycles, including mounted scrub, during FUSE idle periods. Uses
+    // tick_if_idle() to avoid
     // starting work when the demand-preemption signal is asserted.
     // Each cycle is bounded by the MAINTENANCE_TICK budget (50ms max)
     // to avoid starving the FUSE dispatch thread.
@@ -834,10 +917,9 @@ fn mount_vfs(config: MountVfsConfig) -> Result<(), String> {
         let _ = handle.join();
     }
 
-    // Wait for the background scrub thread to finish.
-    if let Some(handle) = scrub_handle {
-        let _ = handle.join();
-    }
+    // Drop scheduled maintenance stores before unmount and the final
+    // namespace flush open the backing store again.
+    *bg_scheduler.lock().unwrap() = None;
 
     // Unmount and join the FUSE background session.  The session's Drop
     // triggers adapter.destroy() which flushes writeback data via shutdown().

@@ -2597,6 +2597,49 @@ fn should_scrub_zero_interval_disables() {
     cleanup(&root);
 }
 
+#[test]
+fn bounded_background_scrub_preserves_pending_cursor() {
+    let root = temp_root("bounded-background-scrub");
+    let mut opts = options();
+    opts.background_scrub_interval_secs = 1;
+
+    {
+        let mut store = LocalObjectStore::open_with_options(&root, opts.clone()).expect("open");
+        for index in 0..4 {
+            store
+                .put_named(format!("bounded-scrub-{index}"), &[index; 256])
+                .expect("write scrub fixture");
+        }
+        store.flush_segment().expect("flush scrub fixture");
+    }
+
+    let mut store = LocalObjectStore::open_read_only_with_options(&root, opts)
+        .expect("open read-only")
+        .expect("scrub fixture exists");
+    let first = store
+        .run_background_scrub_with_budget(1, 1024 * 1024)
+        .expect("bounded scrub tick");
+
+    assert_eq!(first.records_verified, 1);
+    assert!(!first.completed);
+    assert!(store.background_scrub_pending());
+
+    let mut completed = false;
+    for _ in 0..64 {
+        let report = store
+            .run_background_scrub_with_budget(1, 1024 * 1024)
+            .expect("resume bounded scrub");
+        if report.completed {
+            completed = true;
+            break;
+        }
+    }
+    assert!(completed, "bounded scrub must eventually complete");
+    assert!(!store.background_scrub_pending());
+
+    cleanup(&root);
+}
+
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------

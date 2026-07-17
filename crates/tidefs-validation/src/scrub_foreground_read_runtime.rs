@@ -48,7 +48,7 @@ const DAEMON_SCRUB_OBSERVATION_TIMEOUT_SECS: u64 = 15;
 const FOREGROUND_READ_ARRIVAL_TICK: u64 = 1;
 const MAX_FOREGROUND_READ_WAIT_TICKS: u64 = 1;
 
-pub const SCRUB_READ_RESIDUAL_RISK: &str = "This row records a mounted FUSE foreground-read correctness workload while scrub work is configured. It can ingest typed cycle, record, and byte counts from the mounted daemon, but its current pending and throttle facts still come from a harness-only deterministic model and cannot make the row pass. A pass requires daemon-observed work pending before and after the read plus daemon-observed throttling. This row is not production performance readiness, broad scrub/repair correctness, kernel/uBLK/RDMA validation, crash recovery, release-candidate status, or a claim-status/product-wording change.";
+pub const SCRUB_READ_RESIDUAL_RISK: &str = "This row records a mounted FUSE foreground-read correctness workload bracketed by typed observations from the same daemon's scheduled scrub service. A pass requires admitted scrub records, work pending before and after the read, and a scheduler-budget throttle. The foreground wait bound still comes from the typed service-curve oracle rather than an environment-independent wall-clock SLO. This row is not production performance readiness, broad scrub/repair correctness, kernel/uBLK/RDMA validation, crash recovery, release-candidate status, or a claim-status/product-wording change.";
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ScrubForegroundReadRuntimeEvidence {
@@ -188,11 +188,13 @@ pub struct ScrubActivityEvidence {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonScrubRuntimeObservation {
     pub daemon_pid: u32,
+    pub cycles_admitted_before_read: Option<u64>,
     pub cycles_admitted: u64,
     pub records_verified: u64,
     pub bytes_scanned: u64,
     pub work_pending_before_read: Option<bool>,
     pub work_pending_after_read: Option<bool>,
+    pub throttle_count_before_read: Option<u64>,
     pub throttle_count: u64,
 }
 
@@ -362,23 +364,37 @@ pub fn run_scrub_foreground_read_runtime(command: String) -> ScrubForegroundRead
         statfs_type_hex: format!("0x{mount_f_type:x}"),
     };
     let scrub_runtime_observation_path = harness.scrub_runtime_observation_path();
-    let pre_read_daemon_observation = scrub_runtime_observation_path
-        .and_then(|path| read_scrub_runtime_observation(path).ok())
-        .filter(|observation| observation.cycles_admitted > 0);
+    let foreground_fixture_error = prepare_foreground_read(&harness).err();
+    let pre_read_daemon_observation = if foreground_fixture_error.is_none() {
+        scrub_runtime_observation_path.and_then(|path| {
+            match wait_for_pending_scrub_runtime_observation(
+                path,
+                1,
+                1,
+                Duration::from_secs(DAEMON_SCRUB_OBSERVATION_TIMEOUT_SECS),
+            ) {
+                Ok(observation) => Some(observation),
+                Err(error) => {
+                    eprintln!("pre-read daemon scrub observation unavailable: {error}");
+                    None
+                }
+            }
+        })
+    } else {
+        None
+    };
     let scrub_activity = ScrubActivityWindow::begin();
-    let foreground_read = run_foreground_read(&harness, &service_curve);
+    let foreground_read = run_foreground_read(
+        &harness,
+        &service_curve,
+        foreground_fixture_error.as_deref(),
+    );
     let post_read_daemon_observation = scrub_runtime_observation_path.and_then(|path| {
-        let previous_cycles = pre_read_daemon_observation
-            .as_ref()
-            .map_or(0, |observation| observation.cycles_admitted);
-        match wait_for_scrub_runtime_observation(
-            path,
-            previous_cycles,
-            Duration::from_secs(DAEMON_SCRUB_OBSERVATION_TIMEOUT_SECS),
-        ) {
+        let before_read = pre_read_daemon_observation.as_ref()?;
+        match read_post_read_scrub_runtime_observation(path, before_read) {
             Ok(observation) => Some(observation),
             Err(error) => {
-                eprintln!("daemon scrub runtime observation unavailable: {error}");
+                eprintln!("post-read daemon scrub observation unavailable: {error}");
                 None
             }
         }
@@ -391,6 +407,9 @@ pub fn run_scrub_foreground_read_runtime(command: String) -> ScrubForegroundRead
             && daemon_scrub_observation_has_isolation_window(&daemon_runtime)
         {
             scrub_model.observation_tier = ValidationTier::MountedUserspace;
+            scrub_model.throttle_count = daemon_runtime.throttle_count;
+            scrub_model.throttle_observed = true;
+            scrub_model.pending_and_rate_limited_during_read = true;
         }
         scrub_model.daemon_runtime = Some(daemon_runtime);
     }
@@ -433,20 +452,26 @@ fn read_scrub_runtime_observation(path: &Path) -> Result<ScrubRuntimeObservation
     Ok(observation)
 }
 
-fn wait_for_scrub_runtime_observation(
+fn wait_for_pending_scrub_runtime_observation(
     path: &Path,
-    previous_cycles: u64,
+    minimum_cycles: u64,
+    minimum_throttle_count: u64,
     timeout: Duration,
 ) -> Result<ScrubRuntimeObservation, String> {
     let start = Instant::now();
     loop {
         let last_observation = match read_scrub_runtime_observation(path) {
-            Ok(observation) if observation.cycles_admitted > previous_cycles => {
+            Ok(observation)
+                if observation.cycles_admitted >= minimum_cycles
+                    && observation.work_pending
+                    && observation.throttle_count >= minimum_throttle_count =>
+            {
                 return Ok(observation);
             }
             Ok(observation) => format!(
-                "cycles_admitted={} (need > {previous_cycles})",
-                observation.cycles_admitted
+                "cycles_admitted={} work_pending={} throttle_count={} \
+                 (need cycles >= {minimum_cycles}, pending, throttle >= {minimum_throttle_count})",
+                observation.cycles_admitted, observation.work_pending, observation.throttle_count,
             ),
             Err(error) => error,
         };
@@ -461,20 +486,61 @@ fn wait_for_scrub_runtime_observation(
     }
 }
 
+fn read_post_read_scrub_runtime_observation(
+    path: &Path,
+    before_read: &ScrubRuntimeObservation,
+) -> Result<ScrubRuntimeObservation, String> {
+    let after_read = read_scrub_runtime_observation(path)?;
+    if after_read.daemon_pid != before_read.daemon_pid {
+        return Err(format!(
+            "{} changed daemon pid across the read: before={} after={}",
+            path.display(),
+            before_read.daemon_pid,
+            after_read.daemon_pid,
+        ));
+    }
+    if after_read.cycles_admitted != before_read.cycles_admitted {
+        return Err(format!(
+            "{} changed scrub tick across the read: before={} after={}",
+            path.display(),
+            before_read.cycles_admitted,
+            after_read.cycles_admitted,
+        ));
+    }
+    if !after_read.work_pending {
+        return Err(format!(
+            "{} no longer reported scrub work pending after the read",
+            path.display(),
+        ));
+    }
+    if after_read.throttle_count < before_read.throttle_count {
+        return Err(format!(
+            "{} regressed scrub throttle count across the read: before={} after={}",
+            path.display(),
+            before_read.throttle_count,
+            after_read.throttle_count,
+        ));
+    }
+    Ok(after_read)
+}
+
 fn daemon_runtime_observation(
     before_read: Option<&ScrubRuntimeObservation>,
     after_read: &ScrubRuntimeObservation,
 ) -> DaemonScrubRuntimeObservation {
-    let work_pending_before_read = before_read
-        .filter(|observation| observation.daemon_pid == after_read.daemon_pid)
-        .map(|observation| observation.work_pending);
+    let matching_before = before_read.filter(|observation| {
+        observation.daemon_pid == after_read.daemon_pid
+            && observation.cycles_admitted == after_read.cycles_admitted
+    });
     DaemonScrubRuntimeObservation {
         daemon_pid: after_read.daemon_pid,
+        cycles_admitted_before_read: matching_before.map(|observation| observation.cycles_admitted),
         cycles_admitted: after_read.cycles_admitted,
         records_verified: after_read.records_verified,
         bytes_scanned: after_read.bytes_scanned,
-        work_pending_before_read,
+        work_pending_before_read: matching_before.map(|observation| observation.work_pending),
         work_pending_after_read: Some(after_read.work_pending),
+        throttle_count_before_read: matching_before.map(|observation| observation.throttle_count),
         throttle_count: after_read.throttle_count,
     }
 }
@@ -483,10 +549,13 @@ fn daemon_scrub_observation_has_isolation_window(
     observation: &DaemonScrubRuntimeObservation,
 ) -> bool {
     observation.cycles_admitted > 0
+        && observation.cycles_admitted_before_read == Some(observation.cycles_admitted)
         && observation.records_verified > 0
         && observation.work_pending_before_read == Some(true)
         && observation.work_pending_after_read == Some(true)
-        && observation.throttle_count > 0
+        && observation
+            .throttle_count_before_read
+            .is_some_and(|before| before > 0 && observation.throttle_count >= before)
 }
 
 pub fn build_evidence_manifest(
@@ -536,12 +605,14 @@ fn evidence_manifest_scope(evidence: &ScrubForegroundReadRuntimeEvidence) -> Str
             "row={} supported_claims={} non_claims={} outcome={:?} artifact={} ",
             "claim_status_change={} product_wording_change={} environment_refused={} ",
             "scrub_activity_observation_tier={} ",
-            "daemon_scrub_runtime_observed={} daemon_scrub_cycles_admitted={} ",
+            "daemon_scrub_runtime_observed={} ",
+            "daemon_scrub_cycles_admitted_before_read={} daemon_scrub_cycles_admitted={} ",
             "daemon_scrub_records_verified={} daemon_scrub_bytes_scanned={} ",
             "mounted_daemon_pid={} daemon_scrub_observation_pid={} ",
             "daemon_scrub_pid_matches_mount={} ",
             "daemon_scrub_work_pending_before_read={} ",
-            "daemon_scrub_work_pending_after_read={} daemon_scrub_throttle_count={} ",
+            "daemon_scrub_work_pending_after_read={} ",
+            "daemon_scrub_throttle_count_before_read={} daemon_scrub_throttle_count={} ",
             "foreground_read_admitted_by_service_curve={} ",
             "foreground_read_refused_by_service_curve={} scrub_units_requested={} ",
             "scrub_units_admitted_by_service_curve={} ",
@@ -562,6 +633,12 @@ fn evidence_manifest_scope(evidence: &ScrubForegroundReadRuntimeEvidence) -> Str
         admission.environment_refused,
         evidence.scrub_activity.observation_tier.label(),
         daemon_runtime.is_some(),
+        daemon_runtime.map_or_else(
+            || "none".to_string(),
+            |observation| observation
+                .cycles_admitted_before_read
+                .map_or_else(|| "none".to_string(), |cycles| cycles.to_string())
+        ),
         daemon_runtime.map_or(0, |observation| observation.cycles_admitted),
         daemon_runtime.map_or(0, |observation| observation.records_verified),
         daemon_runtime.map_or(0, |observation| observation.bytes_scanned),
@@ -573,6 +650,12 @@ fn evidence_manifest_scope(evidence: &ScrubForegroundReadRuntimeEvidence) -> Str
         daemon_scrub_pid_matches_mount,
         observed_bool(daemon_runtime.and_then(|observation| observation.work_pending_before_read)),
         observed_bool(daemon_runtime.and_then(|observation| observation.work_pending_after_read)),
+        daemon_runtime.map_or_else(
+            || "none".to_string(),
+            |observation| observation
+                .throttle_count_before_read
+                .map_or_else(|| "none".to_string(), |count| count.to_string())
+        ),
         daemon_runtime.map_or(0, |observation| observation.throttle_count),
         admission.foreground_read_admitted_by_service_curve,
         admission.foreground_read_refused_by_service_curve,
@@ -982,13 +1065,14 @@ fn classify_runtime_outcome(
 fn run_foreground_read(
     harness: &MountHarness,
     service_curve: &ServiceCurveEvidence,
+    preparation_error: Option<&str>,
 ) -> ForegroundReadEvidence {
     let path = "protected-foreground-read.bin";
     let payload = deterministic_payload(FOREGROUND_READ_BYTES);
     let expected_digest = digest_hex(&payload);
     let mut failures = Vec::new();
-    if let Err(error) = harness.create_file(path, &payload) {
-        failures.push(format!("create mounted foreground-read file: {error}"));
+    if let Some(error) = preparation_error {
+        failures.push(error.to_string());
         return ForegroundReadEvidence {
             workload_ran: false,
             path: path.to_string(),
@@ -1066,6 +1150,15 @@ fn run_foreground_read(
         failures,
         passed,
     }
+}
+
+fn prepare_foreground_read(harness: &MountHarness) -> Result<(), String> {
+    harness
+        .create_file(
+            "protected-foreground-read.bin",
+            &deterministic_payload(FOREGROUND_READ_BYTES),
+        )
+        .map_err(|error| format!("create mounted foreground-read file: {error}"))
 }
 
 impl ForegroundReadEvidence {
@@ -1300,12 +1393,35 @@ mod tests {
         let observation = daemon_runtime_observation(None, &decoded);
 
         assert_eq!(observation.daemon_pid, 4242);
+        assert_eq!(observation.cycles_admitted_before_read, None);
         assert_eq!(observation.cycles_admitted, 1);
         assert_eq!(observation.records_verified, 3);
         assert_eq!(observation.bytes_scanned, 4096);
         assert_eq!(observation.work_pending_before_read, None);
         assert_eq!(observation.work_pending_after_read, Some(false));
+        assert_eq!(observation.throttle_count_before_read, None);
         assert!(!daemon_scrub_observation_has_isolation_window(&observation));
+    }
+
+    #[test]
+    fn post_read_observation_rejects_a_different_scrub_tick() {
+        let temp = tempfile::TempDir::new().expect("create observation tempdir");
+        let path = temp.path().join("scrub-runtime-observation.json");
+        let mut before = ScrubRuntimeObservation::new(4242);
+        before.record_admitted_cycle(1, 4096, true);
+        before.record_budget_throttle();
+        let mut after = before;
+        after.record_admitted_cycle(1, 4096, true);
+        after.record_budget_throttle();
+        fs::write(
+            &path,
+            serde_json::to_vec(&after).expect("encode scrub observation"),
+        )
+        .expect("write scrub observation");
+
+        let error = read_post_read_scrub_runtime_observation(&path, &before)
+            .expect_err("a different scrub tick cannot bracket the read");
+        assert!(error.contains("changed scrub tick across the read"));
     }
 
     #[test]
@@ -1339,11 +1455,13 @@ mod tests {
 
         scrub_activity.daemon_runtime = Some(DaemonScrubRuntimeObservation {
             daemon_pid: MOUNTED_DAEMON_PID + 1,
+            cycles_admitted_before_read: Some(1),
             cycles_admitted: 1,
             records_verified: 4,
             bytes_scanned: 64 * 1024,
             work_pending_before_read: Some(true),
             work_pending_after_read: Some(true),
+            throttle_count_before_read: Some(1),
             throttle_count: 1,
         });
         assert_eq!(

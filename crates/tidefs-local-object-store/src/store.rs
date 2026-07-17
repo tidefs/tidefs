@@ -2464,6 +2464,12 @@ impl LocalObjectStore {
             && self.last_scrub.elapsed().as_secs() >= self.options.background_scrub_interval_secs
     }
 
+    /// Whether an incremental background scrub stopped with work remaining.
+    #[must_use]
+    pub fn background_scrub_pending(&self) -> bool {
+        !self.scrub_cursor.is_initial()
+    }
+
     /// Perform a full scrub of the mirror store: iterate every key in
     /// the primary index, compare against the mirror, and repair any
     /// divergence (missing keys, digest mismatches). Returns scrub
@@ -4474,22 +4480,38 @@ impl LocalObjectStore {
     ///
     /// Returns the [`ScrubReport`] summarising findings.
     pub fn run_background_scrub(&mut self) -> Result<ScrubReport> {
-        // Read-only scrub: runs the integrity scan and reports findings
-        // without persisting scrub_cursor or suspect_log to disk.
-        let interval = self.options.background_scrub_interval_secs;
-        if interval == 0 {
-            return Ok(ScrubReport::default());
-        }
-        let elapsed = self.last_scrub.elapsed().as_secs();
-        // In read-only mode each call is a fresh scan (no persistent state).
-        // In read-write mode respect the configured interval.
-        if !self.read_only && elapsed < interval {
+        self.run_background_scrub_with_budget(0, 0)
+    }
+
+    /// Run one interval-gated scrub pass within record and byte budgets.
+    ///
+    /// A zero budget remains unbounded, matching
+    /// [`SegmentIntegrityScrubber::scrub_incremental`]. The cursor is retained
+    /// when the pass reaches either bound so a scheduler can expose truthful
+    /// pending work and resume it on a later tick.
+    pub fn run_background_scrub_with_budget(
+        &mut self,
+        max_records: u64,
+        max_bytes: u64,
+    ) -> Result<ScrubReport> {
+        // Read-only scrub reports findings without persisting scrub_cursor or
+        // suspect_log. Read-write stores respect the configured interval.
+        if !self.should_scrub() {
             return Ok(ScrubReport::default());
         }
         let scrubber = SegmentIntegrityScrubber::new(&self.segments_dir);
-        let report =
-            scrubber.scrub_incremental(&mut self.scrub_cursor, 0, 0, &mut self.suspect_log)?;
-        self.last_scrub = std::time::Instant::now();
+        let report = scrubber.scrub_incremental(
+            &mut self.scrub_cursor,
+            max_records,
+            max_bytes,
+            &mut self.suspect_log,
+        )?;
+        // The configured interval separates complete scrub passes, not the
+        // bounded ticks within one pass. Keep the pass eligible while its
+        // cursor is pending so the scheduler can resume it promptly.
+        if report.completed {
+            self.last_scrub = std::time::Instant::now();
+        }
         if !self.read_only {
             write_scrub_cursor(&self.segments_dir, &self.scrub_cursor)?;
             write_suspect_log(&self.segments_dir, &self.suspect_log)?;

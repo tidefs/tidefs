@@ -1332,6 +1332,11 @@ impl ScrubRuntimeObservation {
         self.bytes_scanned = self.bytes_scanned.saturating_add(bytes_scanned);
         self.work_pending = work_pending;
     }
+
+    /// Record one scheduler budget throttle while admitted scrub work remains.
+    pub fn record_budget_throttle(&mut self) {
+        self.throttle_count = self.throttle_count.saturating_add(1);
+    }
 }
 
 /// Deterministic foreground-read/scrub oracle.
@@ -2101,6 +2106,7 @@ mod tests {
         assert_eq!(observation.cycles_admitted, 0);
 
         observation.record_admitted_cycle(3, 4096, true);
+        observation.record_budget_throttle();
         observation.record_admitted_cycle(2, 2048, false);
 
         assert_eq!(observation.daemon_pid, 4242);
@@ -2108,6 +2114,6 @@ mod tests {
         assert_eq!(observation.records_verified, 5);
         assert_eq!(observation.bytes_scanned, 6144);
         assert!(!observation.work_pending);
-        assert_eq!(observation.throttle_count, 0);
+        assert_eq!(observation.throttle_count, 1);
     }
 }
