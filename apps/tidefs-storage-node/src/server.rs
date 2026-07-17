@@ -912,10 +912,16 @@ fn snapshot_barrier_send_report_with_coordinator_state(
     }
 }
 
-fn active_snapshot_barrier_peer_ids(ctx: &SessionContext) -> BTreeSet<u64> {
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SnapshotBarrierMembershipCut {
+    epoch: u64,
+    peer_ids: BTreeSet<u64>,
+}
+
+fn snapshot_barrier_membership_cut(ctx: &SessionContext) -> SnapshotBarrierMembershipCut {
     let membership = ctx.membership.lock().unwrap();
     let local_id = membership.my_id;
-    membership
+    let peer_ids = membership
         .roster
         .snapshot()
         .iter()
@@ -934,7 +940,47 @@ fn active_snapshot_barrier_peer_ids(ctx: &SessionContext) -> BTreeSet<u64> {
                 _ => Some(member_id.0),
             }
         })
-        .collect()
+        .collect();
+
+    SnapshotBarrierMembershipCut {
+        epoch: membership.current_epoch().0,
+        peer_ids,
+    }
+}
+
+fn ensure_snapshot_barrier_membership_current(
+    barrier_id: u64,
+    expected: &SnapshotBarrierMembershipCut,
+    ctx: &SessionContext,
+) -> Result<(), SnapshotBarrierSendError> {
+    let observed = snapshot_barrier_membership_cut(ctx);
+    if observed == *expected {
+        return Ok(());
+    }
+
+    Err(SnapshotBarrierSendError::SenderAuthorityStale {
+        barrier_id,
+        expected_epoch: expected.epoch,
+        observed_epoch: observed.epoch,
+        expected_peer_ids: expected.peer_ids.iter().copied().collect(),
+        observed_peer_ids: observed.peer_ids.iter().copied().collect(),
+    })
+}
+
+fn finalize_snapshot_barrier_before_send(
+    barrier_id: u64,
+    coordinator_state: SnapshotBarrierStoreSnapshot,
+    outcome: BarrierOutcome,
+    membership_cut: &SnapshotBarrierMembershipCut,
+    ctx: &SessionContext,
+) -> Result<SnapshotBarrierSendReport, SnapshotBarrierSendError> {
+    let report = snapshot_barrier_send_report_with_coordinator_state(
+        barrier_id,
+        coordinator_state,
+        outcome,
+    )?;
+    ensure_snapshot_barrier_membership_current(barrier_id, membership_cut, ctx)?;
+    Ok(report)
 }
 
 fn clear_active_snapshot_barrier(ctx: &SessionContext) {
@@ -973,7 +1019,8 @@ fn run_snapshot_barrier_before_send_with_config(
 ) -> Result<SnapshotBarrierSendReport, SnapshotBarrierSendError> {
     let barrier_id = allocate_barrier_id();
     let snapshot_name = snapshot_barrier_send_label(barrier_id, key);
-    let expected_peer_ids = active_snapshot_barrier_peer_ids(ctx);
+    let membership_cut = snapshot_barrier_membership_cut(ctx);
+    let expected_peer_ids = &membership_cut.peer_ids;
 
     if expected_peer_ids.len() > config.max_peers {
         return Err(SnapshotBarrierSendError::PeerLimitExceeded {
@@ -1028,7 +1075,7 @@ fn run_snapshot_barrier_before_send_with_config(
             .map_err(|reason| SnapshotBarrierSendError::LocalSyncFailed { barrier_id, reason })?
     };
 
-    let peer_ids = expected_peer_ids.into_iter().collect::<Vec<_>>();
+    let peer_ids = expected_peer_ids.iter().copied().collect::<Vec<_>>();
     let coordinator = SnapshotCoordinator::new(barrier_id, snapshot_name, peer_ids, config);
 
     let request_bytes = coordinator.request_bytes();
@@ -1040,12 +1087,16 @@ fn run_snapshot_barrier_before_send_with_config(
             });
         }
         if peer_sessions.is_empty() {
-            return snapshot_barrier_send_report_with_coordinator_state(
+            let outcome = coordinator
+                .outcome()
+                .expect("empty snapshot barrier completes immediately");
+            drop(active);
+            return finalize_snapshot_barrier_before_send(
                 barrier_id,
                 coordinator_state,
-                coordinator
-                    .outcome()
-                    .expect("empty snapshot barrier completes immediately"),
+                outcome,
+                &membership_cut,
+                ctx,
             );
         }
         *active = Some(coordinator);
@@ -1071,10 +1122,12 @@ fn run_snapshot_barrier_before_send_with_config(
         let outcome = active_snapshot_barrier_outcome(ctx, barrier_id)?;
         if let Some(outcome) = outcome {
             clear_active_snapshot_barrier(ctx);
-            return snapshot_barrier_send_report_with_coordinator_state(
+            return finalize_snapshot_barrier_before_send(
                 barrier_id,
                 coordinator_state,
                 outcome,
+                &membership_cut,
+                ctx,
             );
         }
         std::thread::sleep(Duration::from_millis(1));
@@ -6924,6 +6977,44 @@ mod cluster_pool_handler_tests {
         }
         assert!(err.to_string().contains("membership_peer_unavailable"));
         assert!(ctx.active_barrier.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn snapshot_barrier_before_send_rejects_stale_membership_cut() {
+        let (_dir, store) = frame_local_store();
+        let ctx = frame_test_context(Arc::clone(&store));
+        let membership_cut = snapshot_barrier_membership_cut(&ctx);
+        register_snapshot_barrier_test_peer(&ctx, 2);
+
+        let err = finalize_snapshot_barrier_before_send(
+            7,
+            SnapshotBarrierStoreSnapshot {
+                committed_root_txg: 0,
+                committed_root_generation: 0,
+                object_count: 0,
+            },
+            BarrierOutcome::Consistent {
+                min_txg: 0,
+                max_txg: 0,
+                total_objects: 0,
+                responses: BTreeMap::new(),
+            },
+            &membership_cut,
+            &ctx,
+        )
+        .expect_err("changed membership cut must invalidate a successful barrier");
+
+        assert_eq!(
+            err,
+            SnapshotBarrierSendError::SenderAuthorityStale {
+                barrier_id: 7,
+                expected_epoch: membership_cut.epoch,
+                observed_epoch: membership_cut.epoch,
+                expected_peer_ids: Vec::new(),
+                observed_peer_ids: vec![2],
+            }
+        );
+        assert!(err.to_string().contains("sender_authority_stale"));
     }
 
     #[test]

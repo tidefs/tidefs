@@ -230,6 +230,13 @@ pub enum SnapshotBarrierSendError {
         barrier_id: BarrierId,
         peer_ids: Vec<u64>,
     },
+    SenderAuthorityStale {
+        barrier_id: BarrierId,
+        expected_epoch: u64,
+        observed_epoch: u64,
+        expected_peer_ids: Vec<u64>,
+        observed_peer_ids: Vec<u64>,
+    },
     SendFailed {
         barrier_id: BarrierId,
         peer_id: u64,
@@ -281,6 +288,16 @@ impl fmt::Display for SnapshotBarrierSendError {
             } => write!(
                 f,
                 "barrier {barrier_id} membership_peer_unavailable: no eligible storage session for active roster peers {peer_ids:?}"
+            ),
+            Self::SenderAuthorityStale {
+                barrier_id,
+                expected_epoch,
+                observed_epoch,
+                expected_peer_ids,
+                observed_peer_ids,
+            } => write!(
+                f,
+                "barrier {barrier_id} sender_authority_stale: membership cut changed from epoch {expected_epoch} peers {expected_peer_ids:?} to epoch {observed_epoch} peers {observed_peer_ids:?}"
             ),
             Self::SendFailed {
                 barrier_id,
