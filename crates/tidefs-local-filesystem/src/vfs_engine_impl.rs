@@ -3130,7 +3130,7 @@ impl VfsLocalFileSystem {
             }
         };
         let fs_stats = fs.stats();
-        let suspect_stats = fs.object_store().suspect_log().stats();
+        let suspect_stats = fs.suspect_log_stats();
         let intent_log_pending = fs.intent_log_pending();
         let pass = verifier.passed()
             && !verifier.production_fsck_required
@@ -11030,31 +11030,16 @@ mod tests {
         assert_eq!(copied, data_len as u32);
         let fs = engine.fs.borrow();
         let dest_record = fs.inode(dest_create.inode_id).unwrap();
-        let layout = read_content_layout_from_store(
-            fs.object_store(),
-            dest_create.inode_id,
-            &dest_record,
-            true,
-        )
-        .unwrap();
-        let ContentLayout::Chunked(manifest) = layout else {
-            panic!("whole-file copy should publish chunked destination content");
-        };
-        let materialized_chunks = manifest
-            .chunks
-            .iter()
-            .filter(|chunk| !chunk.is_hole())
-            .count();
+        let receipt_generations = fs
+            .chunked_content_receipt_generations_for_test(dest_create.inode_id, &dest_record)
+            .unwrap()
+            .expect("whole-file copy should publish chunked destination content");
         assert!(
-            materialized_chunks > 0,
+            !receipt_generations.is_empty(),
             "whole-file copy should materialize destination chunks"
         );
         assert!(
-            manifest
-                .chunks
-                .iter()
-                .filter(|chunk| !chunk.is_hole())
-                .all(|chunk| chunk.placement_receipt_generation > 0),
+            receipt_generations.iter().all(|generation| *generation > 0),
             "whole-file copy chunks must carry durable pool receipt generations"
         );
     }

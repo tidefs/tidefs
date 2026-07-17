@@ -534,7 +534,7 @@ fn run_safe_reclamation_demo(
         fs.write_file("/data.bin", 0, &expected)?;
     }
     fs.sync_all()?;
-    let before = fs.object_store().stats();
+    let before = fs.stats().object_store;
     let report = fs.safe_reclaim_unprotected_objects()?;
     println!("safe_reclamation.root={}", root.display());
     println!(

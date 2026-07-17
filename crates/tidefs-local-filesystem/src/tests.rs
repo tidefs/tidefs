@@ -3708,17 +3708,13 @@ fn root_sync_failure_keeps_live_state_and_avoids_transaction_id_reuse() {
     let uncertain_generation = committed_generation.saturating_add(1);
     assert_eq!(fs.stats().filesystem_generation, uncertain_generation);
     assert!(fs.lookup("/uncertain.txt").is_ok());
-    assert!(fs
-        .object_store()
-        .contains_key(transaction_superblock_object_key(uncertain_generation)));
+    assert!(fs.transaction_superblock_exists_for_test(uncertain_generation));
 
     fs.create_file("/after.txt", 0o644)
         .expect("next mutation should not reuse the uncertain transaction id");
     let after_generation = uncertain_generation.saturating_add(1);
     assert_eq!(fs.stats().filesystem_generation, after_generation);
-    assert!(fs
-        .object_store()
-        .contains_key(transaction_superblock_object_key(after_generation)));
+    assert!(fs.transaction_superblock_exists_for_test(after_generation));
 
     fs.sync_all().expect("sync reconciled state");
     let reopened = LocalFileSystem::open_with_options(&root, options()).expect("reopen fs");
@@ -4719,10 +4715,10 @@ fn retention_plan_protects_committed_roots_without_mutation_or_fsck() {
     fs.write_file("/docs/readme.txt", 0, b"retention plan bytes")
         .expect("write readme");
     fs.sync_all().expect("sync fs");
-    let before = fs.object_store().stats();
+    let before = fs.stats().object_store;
 
     let plan = fs.safe_root_retention_plan().expect("safe retention plan");
-    let after = fs.object_store().stats();
+    let after = fs.stats().object_store;
 
     assert_eq!(before.live_objects, after.live_objects);
     assert_eq!(before.next_sequence, after.next_sequence);
@@ -4845,7 +4841,7 @@ fn safe_reclamation_preserves_retained_roots_and_reopens() {
             .expect("write generation");
     }
     fs.sync_all().expect("sync before reclamation");
-    let before_stats = fs.object_store().stats();
+    let before_stats = fs.stats().object_store;
     let before_plan = fs.safe_root_retention_plan().expect("safe retention plan");
     assert!(before_plan.retention_policy_satisfied());
     assert!(!before_plan.reclaimable_live_object_keys.is_empty());
@@ -9176,15 +9172,14 @@ fn mounted_dataset_spacebook_counters_use_mounted_dataset_id() {
     fs.sync_all().expect("sync fs");
 
     let mounted_usage = fs
-        .store_ref()
-        .get_dataset_usage(mounted_dataset_id)
+        .dataset_space_usage(mounted_dataset_id)
         .expect("mounted dataset usage must be persisted");
     assert!(
         mounted_usage.bytes_used > 0,
         "mounted dataset must receive committed logical usage"
     );
     assert!(
-        fs.store_ref().get_dataset_usage(ROOT_DATASET_ID).is_none(),
+        fs.dataset_space_usage(ROOT_DATASET_ID).is_none(),
         "mounted writes must not be charged to the hard-coded root dataset"
     );
 
@@ -9610,7 +9605,8 @@ fn extent_map_persist_roundtrip_via_object_store() {
     let mut serialized = Vec::new();
     emap.serialize(&mut serialized).unwrap();
 
-    let opts = StoreOptions::test_fast();
+    let mut opts = StoreOptions::test_fast();
+    opts.max_segment_bytes = 8192;
     let key = ObjectKey::from_name("extent-map-roundtrip-test-key");
     {
         let mut store =
