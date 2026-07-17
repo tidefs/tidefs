@@ -1596,9 +1596,26 @@ fn check_committed_validation_artifacts(root: &Path, missing: &mut Vec<String>) 
             }
         };
         let artifact_path = manifest.artifact_path.clone();
-        if !is_evidence_manifest_path(Path::new(&artifact_path))
-            && committed_artifacts.contains(&artifact_path)
-        {
+        let artifact_is_manifest = is_evidence_manifest_path(Path::new(&artifact_path));
+        let artifact_is_tracked = git_path_is_tracked(root, &artifact_path);
+        if artifact_is_manifest {
+            missing.push(format!(
+                "{manifest_path} points at evidence manifest `{artifact_path}` instead of an artifact payload"
+            ));
+        }
+        if !artifact_is_tracked {
+            missing.push(format!(
+                "{manifest_path} points at non-committed artifact `{artifact_path}`"
+            ));
+        } else if !artifact_is_manifest {
+            if let Err(err) = manifest.verify_artifact_digest(root) {
+                missing.push(format!(
+                    "{manifest_path} has invalid committed artifact digest: {}",
+                    err.failures().join("; ")
+                ));
+            }
+        }
+        if !artifact_is_manifest && committed_artifacts.contains(&artifact_path) {
             let is_fixture = manifest
                 .run_id
                 .starts_with(DETERMINISTIC_FIXTURE_RUN_ID_PREFIX);
@@ -1621,22 +1638,11 @@ fn check_committed_validation_artifacts(root: &Path, missing: &mut Vec<String>) 
                     manifest.run_id, manifest.validation_tier
                 ));
             }
-            if let Err(err) = manifest.verify_artifact_digest(root) {
-                missing.push(format!(
-                    "{manifest_path} has invalid committed artifact digest: {}",
-                    err.failures().join("; ")
-                ));
-            }
         }
         if manifest.validation_tier.is_live_runtime() {
-            if is_evidence_manifest_path(Path::new(&artifact_path)) {
-                missing.push(format!(
-                    "{manifest_path} is a live-runtime manifest pointing at manifest `{artifact_path}`"
-                ));
-            }
             if !committed_artifacts.contains(&artifact_path) {
                 missing.push(format!(
-                    "{manifest_path} is a live-runtime manifest pointing at non-committed artifact `{artifact_path}`"
+                    "{manifest_path} is a live-runtime manifest pointing outside committed validation artifacts at `{artifact_path}`"
                 ));
             }
             for sidecar_path in implied_evidence_manifest_sidecar_artifact_paths(
@@ -1906,13 +1912,18 @@ fn committed_evidence_tree_is_current(root: &Path, artifact_rel: &Path) -> bool 
         && git_path_tracked_and_clean(root, artifact_rel)
 }
 
-fn git_path_tracked_and_clean(root: &Path, rel: &str) -> bool {
+fn git_path_is_tracked(root: &Path, rel: &str) -> bool {
     let tracked = Command::new("git")
         .current_dir(root)
         .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_LITERAL_PATHSPECS", "1")
         .args(["ls-files", "--error-unmatch", "--", rel])
         .output();
-    if !matches!(tracked, Ok(output) if output.status.success()) {
+    matches!(tracked, Ok(output) if output.status.success())
+}
+
+fn git_path_tracked_and_clean(root: &Path, rel: &str) -> bool {
+    if !git_path_is_tracked(root, rel) {
         return false;
     }
 
@@ -5610,6 +5621,69 @@ non_claims = ["none"]
             missing.iter().any(|failure| failure.contains(
                 "uses deterministic fixture run_id `deterministic-fixture:runtime-output-v1` for runtime-tier `mounted-userspace` committed artifact `validation/artifacts/kernel/runtime-output.json`"
             )),
+            "{missing:#?}"
+        );
+    }
+
+    #[test]
+    fn committed_validation_artifacts_reject_uncommitted_manifest_target() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        git(temp.path(), &["init"]);
+        let artifact_path = "test-support/missing-source-model.json";
+        let manifest_path = "validation/artifacts/kernel/source-model.manifest.json";
+        write_manifest_fixture(
+            temp.path(),
+            manifest_path,
+            "example.source.model.v1",
+            "source-model",
+            artifact_path,
+            r#"{"status":"reviewed"}"#,
+            ValidationStatus::Pass,
+            Vec::new(),
+        );
+        git(temp.path(), &["add", manifest_path]);
+
+        let mut missing = Vec::new();
+        check_committed_validation_artifacts(temp.path(), &mut missing);
+
+        assert!(
+            missing.iter().any(|failure| failure.contains(
+                "validation/artifacts/kernel/source-model.manifest.json points at non-committed artifact `test-support/missing-source-model.json`"
+            )),
+            "{missing:#?}"
+        );
+    }
+
+    #[test]
+    fn committed_validation_artifacts_verify_external_manifest_target_digest() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        git(temp.path(), &["init"]);
+        let artifact_path = "test-support/source-model.json";
+        let manifest_path = "validation/artifacts/kernel/source-model.manifest.json";
+        let original_body = r#"{"status":"reviewed"}"#;
+        write_artifact(temp.path(), artifact_path, original_body);
+        write_manifest_fixture(
+            temp.path(),
+            manifest_path,
+            "example.source.model.v1",
+            "source-model",
+            artifact_path,
+            original_body,
+            ValidationStatus::Pass,
+            Vec::new(),
+        );
+        write_artifact(temp.path(), artifact_path, r#"{"status":"changed"}"#);
+        git(temp.path(), &["add", artifact_path, manifest_path]);
+
+        let mut missing = Vec::new();
+        check_committed_validation_artifacts(temp.path(), &mut missing);
+
+        assert!(
+            missing.iter().any(|failure| {
+                failure.contains("validation/artifacts/kernel/source-model.manifest.json")
+                    && failure.contains("invalid committed artifact digest")
+                    && failure.contains("content_digest mismatch")
+            }),
             "{missing:#?}"
         );
     }
