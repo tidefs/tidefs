@@ -1188,6 +1188,7 @@ fn run_foreground_read(
     }
 }
 
+#[cfg(feature = "scrub-runtime")]
 fn seed_scrub_backlog(store_root: &Path) -> std::io::Result<()> {
     let mut store = tidefs_local_object_store::LocalObjectStore::open(store_root)
         .map_err(|error| std::io::Error::other(format!("open scrub seed store: {error}")))?;
@@ -1203,6 +1204,13 @@ fn seed_scrub_backlog(store_root: &Path) -> std::io::Result<()> {
     store
         .sync_all()
         .map_err(|error| std::io::Error::other(format!("sync scrub seed store: {error}")))
+}
+
+#[cfg(not(feature = "scrub-runtime"))]
+fn seed_scrub_backlog(_store_root: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::other(
+        "scrub runtime validation requires the scrub-runtime feature",
+    ))
 }
 
 fn prepare_mounted_foreground_read(harness: &MountHarness) -> Result<(), String> {

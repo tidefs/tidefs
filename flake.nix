@@ -204,6 +204,7 @@
             };
             cargoBuildFlags = [
               "-p" "tidefs-validation"
+              "--features" "scrub-runtime"
               "--bin" "scrub_foreground_read_validation"
             ];
             workspaceBins = [

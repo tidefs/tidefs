@@ -24,6 +24,7 @@ required-features = ["receipt-bound-physical-reclaim"]
 [[bin]]
 name = "scrub_foreground_read_validation"
 path = "src/bin/scrub_foreground_read_validation.rs"
+required-features = ["scrub-runtime"]
 
 [[bin]]
 name = "storage-intent-ack-fault-matrix-validation"
@@ -73,12 +74,15 @@ ack-receipt-fault-matrix = [
     "dep:tidefs-storage-intent-core",
 ]
 
+# Mounted scrub/read runtime fixture and object-store seed authority.
+scrub-runtime = ["dep:tidefs-local-object-store"]
+
 # Full FUSE userspace POSIX validation: VfsEngine, all POSIX adapter workers,
 # and every storage backend needed by the FUSE data path.
 fuse = [
     "dep:tidefs-posix-filesystem-adapter-daemon",
     "storage-core",
-    "dep:tidefs-local-object-store",
+    "scrub-runtime",
     "dep:tidefs-encryption",
     "dep:tidefs-space-accounting",
     "dep:tidefs-types-space-accounting-core",
@@ -113,6 +117,7 @@ full = [
     "cluster-placement-heal",
     "receipt-bound-physical-reclaim",
     "ack-receipt-fault-matrix",
+    "scrub-runtime",
 ]
 
 [dependencies]
