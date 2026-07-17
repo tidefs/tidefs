@@ -624,21 +624,20 @@ impl ErasureCodedStore {
                     }
                 }
 
-                if let Some(recon) = reconstruct_stripe(&stripe_config, &available, None) {
-                    for rebuilt in &recon.rebuilt_shards {
-                        let target_store =
-                            mapped_store_index(&self.shard_to_store, rebuilt.index, sw);
-                        if target_store == store_index {
-                            let sk = shard_key_from_prefix(prefix, s, rebuilt.index);
-                            let shard_record =
-                                encode_verified_shard(prefix, s, rebuilt.index, &rebuilt.bytes)?;
-                            self.stores[target_store]
-                                .put(sk, &shard_record)
-                                .map_err(|e| {
-                                    format!("repair write failed for shard {}: {e}", rebuilt.index,)
-                                })?;
-                            repaired += 1;
-                        }
+                let recon = reconstruct_receipt_stripe(&stripe_config, &available)
+                    .map_err(|err| format!("stripe {s} reconstruction failed: {err}"))?;
+                for rebuilt in &recon.rebuilt_shards {
+                    let target_store = mapped_store_index(&self.shard_to_store, rebuilt.index, sw);
+                    if target_store == store_index {
+                        let sk = shard_key_from_prefix(prefix, s, rebuilt.index);
+                        let shard_record =
+                            encode_verified_shard(prefix, s, rebuilt.index, &rebuilt.bytes)?;
+                        self.stores[target_store]
+                            .put(sk, &shard_record)
+                            .map_err(|e| {
+                                format!("repair write failed for shard {}: {e}", rebuilt.index,)
+                            })?;
+                        repaired += 1;
                     }
                 }
             }
@@ -1511,36 +1510,37 @@ impl EcRepairPath {
                         }
                     }
 
-                    if let Ok(recon) = reconstruct_receipt_stripe(&stripe_config, &available) {
-                        for rebuilt in &recon.rebuilt_shards {
-                            let target_store =
-                                mapped_store_index(&s.shard_to_store, rebuilt.index, sw);
-                            if target_store == store_index {
-                                let sk = shard_key_from_prefix(
-                                    prefix,
-                                    stripe_idx,
-                                    rebuilt.index,
-                                );
-                                let shard_record = encode_verified_shard(
-                                    prefix,
-                                    stripe_idx,
-                                    rebuilt.index,
-                                    &rebuilt.bytes,
-                                )
-                                .map_err(EcStoreError::Internal)?;
-                                s.stores[target_store]
-                                    .put(sk, &shard_record)
-                                    .map_err(|e| {
-                                        EcStoreError::RepairFailed {
-                                            store_index,
-                                            reason: format!(
-                                                "repair write failed for shard {}: {e}",
-                                                rebuilt.index,
-                                            ),
-                                        }
-                                    })?;
-                                repaired += 1;
-                            }
+                    let recon = reconstruct_receipt_stripe(&stripe_config, &available).map_err(
+                        |err| EcStoreError::RepairFailed {
+                            store_index,
+                            reason: format!(
+                                "stripe {stripe_idx} reconstruction failed: {err}"
+                            ),
+                        },
+                    )?;
+                    for rebuilt in &recon.rebuilt_shards {
+                        let target_store =
+                            mapped_store_index(&s.shard_to_store, rebuilt.index, sw);
+                        if target_store == store_index {
+                            let sk =
+                                shard_key_from_prefix(prefix, stripe_idx, rebuilt.index);
+                            let shard_record = encode_verified_shard(
+                                prefix,
+                                stripe_idx,
+                                rebuilt.index,
+                                &rebuilt.bytes,
+                            )
+                            .map_err(EcStoreError::Internal)?;
+                            s.stores[target_store]
+                                .put(sk, &shard_record)
+                                .map_err(|e| EcStoreError::RepairFailed {
+                                    store_index,
+                                    reason: format!(
+                                        "repair write failed for shard {}: {e}",
+                                        rebuilt.index,
+                                    ),
+                                })?;
+                            repaired += 1;
                         }
                     }
                 }
@@ -1865,6 +1865,25 @@ mod tests {
         // Read should now be clean
         let data = store.get_named("r").unwrap();
         assert_eq!(data, Some(b"repair-me".to_vec()));
+
+        cleanup_dirs(&paths);
+    }
+
+    #[test]
+    fn repair_refuses_unrecoverable_stripe() {
+        let paths = make_paths(3, "repair-unrecoverable");
+        let mut store =
+            ErasureCodedStore::open(&paths, ErasureCodedStoreConfig::two_plus_one_test()).unwrap();
+        store.put_named("r", b"repair-must-fail").unwrap();
+
+        for store_index in 0..2 {
+            for key in store.stores[store_index].list_keys() {
+                store.stores[store_index].delete(key).unwrap();
+            }
+        }
+
+        let err = store.repair_store(0).unwrap_err();
+        assert!(err.contains("insufficient shards"), "{err}");
 
         cleanup_dirs(&paths);
     }
@@ -2256,6 +2275,32 @@ mod tests {
         let read = rp.execute().await.unwrap().unwrap();
         assert_eq!(read.payload, b"repair-me-async");
         assert!(!read.degraded);
+
+        cleanup_dirs(&paths);
+    }
+
+    #[tokio::test]
+    async fn async_repair_refuses_unrecoverable_stripe() {
+        let paths = make_paths(3, "async-repair-unrecoverable");
+        let mut store =
+            ErasureCodedStore::open(&paths, ErasureCodedStoreConfig::two_plus_one_test()).unwrap();
+        store.put_named("r", b"repair-must-fail").unwrap();
+
+        for store_index in 0..2 {
+            for key in store.stores[store_index].list_keys() {
+                store.stores[store_index].delete(key).unwrap();
+            }
+        }
+
+        let runtime = EcStoreRuntime::new(store);
+        let err = runtime.repair_path(0).execute().await.unwrap_err();
+        assert!(matches!(
+            err,
+            EcStoreError::RepairFailed {
+                store_index: 0,
+                ref reason,
+            } if reason.contains("insufficient shards")
+        ));
 
         cleanup_dirs(&paths);
     }
