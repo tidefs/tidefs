@@ -986,14 +986,16 @@ fn run_snapshot_barrier_before_send_with_config(
     let peer_sessions = {
         let transport = ctx.transport.lock().unwrap();
         let mut peer_sessions = BTreeMap::new();
-        for sid in transport.all_stats().sessions.keys() {
+        for (sid, session) in &transport.sessions {
             if *sid == session_id {
                 continue;
             }
-            if let Some(peer_id) = transport.peer_node(*sid) {
-                if expected_peer_ids.contains(&peer_id) {
-                    peer_sessions.entry(peer_id).or_insert(*sid);
-                }
+
+            let Ok(session) = session.lock() else {
+                continue;
+            };
+            if session.is_established() && expected_peer_ids.contains(&session.peer_node) {
+                peer_sessions.entry(session.peer_node).or_insert(*sid);
             }
         }
         peer_sessions
@@ -6942,7 +6944,7 @@ mod cluster_pool_handler_tests {
         let ctx = frame_test_context(Arc::clone(&store));
         register_snapshot_barrier_test_peer(&ctx, 2);
         let peer_session_id = tidefs_transport::SessionId::new(2);
-        let peer_session = tidefs_transport::session::Session::new(
+        let mut peer_session = tidefs_transport::session::Session::new(
             peer_session_id,
             1,
             2,
@@ -6950,6 +6952,9 @@ mod cluster_pool_handler_tests {
             tidefs_transport::EndpointFamily::LocalEmbed,
             tidefs_transport::TransportBackendKind::Tcp,
         );
+        peer_session.state = tidefs_transport::session::SessionState::Established {
+            since: tidefs_transport::HlcTimestamp::new(0, 0),
+        };
 
         ctx.transport
             .lock()
@@ -7029,7 +7034,7 @@ mod cluster_pool_handler_tests {
     }
 
     #[test]
-    fn snapshot_barrier_before_send_clears_active_barrier_on_timeout() {
+    fn snapshot_barrier_before_send_skips_closed_duplicate_before_timeout() {
         let mut peer_transport = Transport::new(2);
         let bind_addr = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0);
         peer_transport
@@ -7068,6 +7073,25 @@ mod cluster_pool_handler_tests {
         peer_ready_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("peer ready");
+
+        // Closed sessions remain in the transport table until maintenance.
+        // A lower-id stale duplicate must not hide the live peer session.
+        let stale_sid = tidefs_transport::SessionId::new(0);
+        assert_ne!(sid, stale_sid);
+        let mut stale_session = tidefs_transport::session::Session::new(
+            stale_sid,
+            1,
+            2,
+            tidefs_transport::TransportAddr::Tcp("127.0.0.1:9002".parse().unwrap()),
+            tidefs_transport::EndpointFamily::LocalEmbed,
+            tidefs_transport::TransportBackendKind::Tcp,
+        );
+        stale_session.state = tidefs_transport::session::SessionState::Closed {
+            reason: SessionCloseReason::LocalShutdown,
+        };
+        local_transport
+            .sessions
+            .insert(stale_sid, Arc::new(Mutex::new(stale_session)));
 
         let (_dir, store) = frame_local_store();
         let ctx = frame_test_context(Arc::clone(&store));
