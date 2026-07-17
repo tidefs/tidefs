@@ -1735,6 +1735,58 @@ impl<'a> MountedCommittedRootRepairAuthority<'a> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MountedMetadataFallbackTransformMode {
+    /// Inode and directory metadata records are raw-only; device-level
+    /// transforms are not applied and the fail-closed guard remains.
+    RawMetadataOnlyNoDeviceTransforms,
+}
+
+/// Authority for mounted inode/directory metadata fallback reads.
+///
+/// When a mounted inode or directory metadata record is not in the in-memory
+/// cache, this authority recovers it from the raw primary store. Its
+/// `transform_mode` records that these reads are raw-only metadata in the
+/// current fail-closed transform mode. Device-level compression/encryption
+/// claims remain blocked while this path is used for mounted reads.
+///
+/// This authority is deliberately narrower than [`MountedOpenRecoveryAuthority`]:
+/// it only handles the fallback read path for inode and directory records that
+/// have not been loaded into the in-memory state, and it does not own pool
+/// creation, committed-root selection, or log replay.
+pub(crate) struct MountedMetadataFallbackAuthority<'a> {
+    store: &'a LocalObjectStore,
+    transform_mode: MountedMetadataFallbackTransformMode,
+}
+
+impl<'a> MountedMetadataFallbackAuthority<'a> {
+    pub(crate) fn raw_metadata_only(store: &'a LocalObjectStore) -> Self {
+        Self {
+            store,
+            transform_mode: MountedMetadataFallbackTransformMode::RawMetadataOnlyNoDeviceTransforms,
+        }
+    }
+
+    pub(crate) fn transform_mode(&self) -> MountedMetadataFallbackTransformMode {
+        self.transform_mode
+    }
+
+    /// Fail closed until TFR-006 moves mounted content and recovery paths
+    /// past the raw-store inventory and a production metadata authority
+    /// can route inode/directory reads through the ordered transform
+    /// contract.
+    pub(crate) fn read_inode_bytes(&self, inode_id: InodeId) -> Result<Option<Vec<u8>>> {
+        Ok(self.store.get(inode_object_key(inode_id))?)
+    }
+
+    /// Fail closed until TFR-006 moves mounted content and recovery paths
+    /// past the raw-store inventory and a production metadata authority
+    /// can route directory reads through the ordered transform contract.
+    pub(crate) fn read_directory_bytes(&self, inode_id: InodeId) -> Result<Option<Vec<u8>>> {
+        Ok(self.store.get(directory_object_key(inode_id))?)
+    }
+}
+
 pub(crate) struct MountedOpenRecoveryAuthority<'a> {
     store: &'a mut Pool,
     root_authentication_key: RootAuthenticationKey,
@@ -3831,6 +3883,20 @@ impl LocalFileSystem {
     #[allow(dead_code)] // INTENT: kept for planned architecture; callers in test modules or pending wiring into FUSE dispatch
     pub(crate) fn inode_records(&self) -> &BTreeMap<InodeId, InodeRecord> {
         &self.state.inodes
+    }
+
+    /// Return a metadata fallback authority for mounted inode/directory reads.
+    ///
+    /// When an inode or directory record is not in the in-memory cache, this
+    /// authority provides a raw-store handle whose
+    /// [`MountedMetadataFallbackTransformMode`] records that these reads are
+    /// raw-only metadata in the current fail-closed transform mode. Device-level
+    /// compression/encryption claims remain blocked while this path is used for
+    /// mounted metadata reads.
+    pub(crate) fn mounted_metadata_fallback_authority(
+        &self,
+    ) -> MountedMetadataFallbackAuthority<'_> {
+        MountedMetadataFallbackAuthority::raw_metadata_only(self.store.raw_primary_store())
     }
 
     pub fn recovery_audit(&mut self) -> Result<RecoveryAuditReport> {
@@ -7423,14 +7489,16 @@ impl LocalFileSystem {
                 reason: "inode id is missing from the inode table",
             });
         }
-        let key = inode_object_key(inode_id);
-        let bytes =
-            self.store
-                .raw_primary_store()
-                .get(key)?
-                .ok_or(FileSystemError::CorruptState {
-                    reason: "known inode id references a missing inode object in store",
-                })?;
+        let fallback = self.mounted_metadata_fallback_authority();
+        debug_assert_eq!(
+            fallback.transform_mode(),
+            MountedMetadataFallbackTransformMode::RawMetadataOnlyNoDeviceTransforms,
+        );
+        let bytes = fallback
+            .read_inode_bytes(inode_id)?
+            .ok_or(FileSystemError::CorruptState {
+                reason: "known inode id references a missing inode object in store",
+            })?;
         let record = decode_inode(&bytes)?;
         if record.inode_id != inode_id {
             return Err(FileSystemError::CorruptState {
@@ -12850,14 +12918,16 @@ impl LocalFileSystem {
                 reason: "inode id is missing from the inode table",
             });
         }
-        let key = inode_object_key(inode_id);
-        let bytes =
-            self.store
-                .raw_primary_store()
-                .get(key)?
-                .ok_or(FileSystemError::CorruptState {
-                    reason: "known inode id references a missing inode object in store",
-                })?;
+        let fallback = self.mounted_metadata_fallback_authority();
+        debug_assert_eq!(
+            fallback.transform_mode(),
+            MountedMetadataFallbackTransformMode::RawMetadataOnlyNoDeviceTransforms,
+        );
+        let bytes = fallback
+            .read_inode_bytes(inode_id)?
+            .ok_or(FileSystemError::CorruptState {
+                reason: "known inode id references a missing inode object in store",
+            })?;
         let inode = decode_inode(&bytes)?;
         if inode.inode_id != inode_id {
             return Err(FileSystemError::CorruptState {
@@ -12935,14 +13005,16 @@ impl LocalFileSystem {
                 reason: "inode id is missing from the inode table",
             });
         }
-        let key = inode_object_key(inode_id);
-        let bytes =
-            self.store
-                .raw_primary_store()
-                .get(key)?
-                .ok_or(FileSystemError::CorruptState {
-                    reason: "known inode id references a missing inode object in store",
-                })?;
+        let fallback = self.mounted_metadata_fallback_authority();
+        debug_assert_eq!(
+            fallback.transform_mode(),
+            MountedMetadataFallbackTransformMode::RawMetadataOnlyNoDeviceTransforms,
+        );
+        let bytes = fallback
+            .read_inode_bytes(inode_id)?
+            .ok_or(FileSystemError::CorruptState {
+                reason: "known inode id references a missing inode object in store",
+            })?;
         let inode = decode_inode(&bytes)?;
         if inode.inode_id != inode_id {
             return Err(FileSystemError::CorruptState {
@@ -12950,12 +13022,12 @@ impl LocalFileSystem {
             });
         }
         if inode.carries_child_namespace() {
-            let dir_key = directory_object_key(inode_id);
-            let dir_bytes = self.store.raw_primary_store().get(dir_key)?.ok_or(
-                FileSystemError::CorruptState {
-                    reason: "directory inode is missing its directory object in store",
-                },
-            )?;
+            let dir_bytes =
+                fallback
+                    .read_directory_bytes(inode_id)?
+                    .ok_or(FileSystemError::CorruptState {
+                        reason: "directory inode is missing its directory object in store",
+                    })?;
             let directory = decode_directory(&dir_bytes)?;
             Arc::make_mut(&mut self.state.directories).insert(inode_id, directory);
         }
@@ -15399,6 +15471,252 @@ mod orphan_index_integration_tests {
         assert!(fs2.orphan_index.lock().unwrap().is_empty());
         drop(fs2);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── MountedMetadataFallbackAuthority focused tests ────────────────────
+    // Verify that lazy inode/directory recovery reads route through the
+    // MountedMetadataFallbackAuthority and preserve existing error semantics.
+
+    #[test]
+    fn mounted_metadata_fallback_inode_record_only_loads_after_reopen() {
+        let (root, mut fs) = make_test_fs("mmfb_inode_ro_reopen").expect("open");
+        let record = fs.create_file("/testfile", 0o644).expect("create_file");
+        let inode_id = record.inode_id;
+        seed_metadata_fallback_records(&mut fs, inode_id);
+        drop(fs);
+
+        let mut fs2 = LocalFileSystem::open(&root).expect("reopen");
+        evict_inode_for_metadata_fallback(&mut fs2, inode_id);
+        assert!(!fs2.state.inodes.contains_key(&inode_id));
+        let record = fs2.inode_record_only(inode_id).expect("inode_record_only");
+        assert_eq!(record.inode_id, inode_id);
+        drop(fs2);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn mounted_metadata_fallback_committed_inode_record_loads_after_reopen() {
+        let (root, mut fs) = make_test_fs("mmfb_committed_reopen").expect("open");
+        let record = fs.create_file("/testfile", 0o644).expect("create_file");
+        let inode_id = record.inode_id;
+        seed_metadata_fallback_records(&mut fs, inode_id);
+        drop(fs);
+
+        let mut fs2 = LocalFileSystem::open(&root).expect("reopen");
+        evict_inode_for_metadata_fallback(&mut fs2, inode_id);
+        assert!(!fs2.state.inodes.contains_key(&inode_id));
+        let record = fs2
+            .committed_inode_record(inode_id)
+            .expect("committed_inode_record");
+        assert_eq!(record.inode_id, inode_id);
+        drop(fs2);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn mounted_metadata_fallback_ensure_inode_loaded_after_reopen() {
+        let (root, mut fs) = make_test_fs("mmfb_ensure_reopen").expect("open");
+        let record = fs.create_dir("/testdir", 0o755).expect("create_dir");
+        let inode_id = record.inode_id;
+        seed_metadata_fallback_records(&mut fs, inode_id);
+        drop(fs);
+
+        let mut fs2 = LocalFileSystem::open(&root).expect("reopen");
+        evict_inode_for_metadata_fallback(&mut fs2, inode_id);
+        assert!(!fs2.state.inodes.contains_key(&inode_id));
+        assert!(!fs2.state.directories.contains_key(&inode_id));
+        fs2.ensure_inode_loaded_for_write(inode_id)
+            .expect("ensure_inode_loaded_for_write");
+        assert!(fs2.state.inodes.contains_key(&inode_id));
+        assert!(fs2.state.directories.contains_key(&inode_id));
+        drop(fs2);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn mounted_metadata_fallback_inode_record_only_rejects_unknown_inode_id() {
+        let (_root, fs) = make_test_fs("mmfb_unknown_id").expect("open");
+        let bad_id = InodeId(999_999);
+        let err = fs.inode_record_only(bad_id).unwrap_err();
+        match err {
+            FileSystemError::CorruptState { reason } => {
+                assert!(
+                    reason.contains("missing from the inode table"),
+                    "expected inode-table error, got: {reason}"
+                );
+            }
+            other => panic!("expected CorruptState, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mounted_metadata_fallback_committed_inode_record_rejects_unknown_inode_id() {
+        let (_root, fs) = make_test_fs("mmfb_committed_unknown").expect("open");
+        let bad_id = InodeId(999_999);
+        let err = fs.committed_inode_record(bad_id).unwrap_err();
+        match err {
+            FileSystemError::CorruptState { reason } => {
+                assert!(reason.contains("missing from the inode table"));
+            }
+            other => panic!("expected CorruptState, got {other:?}"),
+        }
+    }
+
+    fn evict_inode_for_metadata_fallback(fs: &mut LocalFileSystem, inode_id: InodeId) {
+        Arc::make_mut(&mut fs.state.inodes).remove(&inode_id);
+        Arc::make_mut(&mut fs.state.directories).remove(&inode_id);
+        fs.inode_cache.borrow_mut().invalidate(inode_id);
+    }
+
+    fn seed_metadata_fallback_records(fs: &mut LocalFileSystem, inode_id: InodeId) {
+        // Current committed recovery uses transaction-scoped metadata and
+        // eagerly reconstructs in-memory state. Seed the standalone keys
+        // explicitly so these invariant tests exercise only the fallback
+        // read boundary.
+        let inode = fs
+            .state
+            .inodes
+            .get(&inode_id)
+            .expect("fallback fixture inode exists")
+            .clone();
+        let inode_bytes = try_encode_inode(&inode).expect("encode fallback fixture inode");
+        let directory_bytes = fs
+            .state
+            .directories
+            .get(&inode_id)
+            .map(|directory| encode_directory(&inode, directory));
+        {
+            let mut store = fs.store.primary_store_mut();
+            let raw_store = store.raw_store_mut();
+            raw_store
+                .put(inode_object_key(inode_id), &inode_bytes)
+                .expect("write fallback fixture inode");
+            if let Some(bytes) = directory_bytes {
+                raw_store
+                    .put(directory_object_key(inode_id), &bytes)
+                    .expect("write fallback fixture directory");
+            }
+        }
+        fs.store.sync_all().expect("sync fallback fixture metadata");
+    }
+
+    #[test]
+    fn mounted_metadata_fallback_preserves_missing_record_errors() {
+        let (inode_root, mut inode_fs) =
+            make_test_fs("mmfb_missing_inode").expect("open missing-inode fixture");
+        let inode_id = inode_fs
+            .create_file("/testfile", 0o644)
+            .expect("create_file")
+            .inode_id;
+        inode_fs.do_commit().expect("commit inode fixture");
+        seed_metadata_fallback_records(&mut inode_fs, inode_id);
+        assert!(inode_fs
+            .store
+            .primary_store_mut()
+            .raw_store_mut()
+            .delete(inode_object_key(inode_id))
+            .expect("delete inode object"));
+        evict_inode_for_metadata_fallback(&mut inode_fs, inode_id);
+        assert!(matches!(
+            inode_fs.inode_record_only(inode_id),
+            Err(FileSystemError::CorruptState { reason })
+                if reason == "known inode id references a missing inode object in store"
+        ));
+        drop(inode_fs);
+        let _ = std::fs::remove_dir_all(&inode_root);
+
+        let (directory_root, mut directory_fs) =
+            make_test_fs("mmfb_missing_directory").expect("open missing-directory fixture");
+        let directory_id = directory_fs
+            .create_dir("/testdir", 0o755)
+            .expect("create_dir")
+            .inode_id;
+        directory_fs.do_commit().expect("commit directory fixture");
+        seed_metadata_fallback_records(&mut directory_fs, directory_id);
+        assert!(directory_fs
+            .store
+            .primary_store_mut()
+            .raw_store_mut()
+            .delete(directory_object_key(directory_id))
+            .expect("delete directory object"));
+        evict_inode_for_metadata_fallback(&mut directory_fs, directory_id);
+        assert!(matches!(
+            directory_fs.ensure_inode_loaded_for_write(directory_id),
+            Err(FileSystemError::CorruptState { reason })
+                if reason == "directory inode is missing its directory object in store"
+        ));
+        drop(directory_fs);
+        let _ = std::fs::remove_dir_all(&directory_root);
+    }
+
+    #[test]
+    fn mounted_metadata_fallback_preserves_corrupt_record_errors() {
+        let (inode_root, mut inode_fs) =
+            make_test_fs("mmfb_corrupt_inode").expect("open corrupt-inode fixture");
+        let inode = inode_fs
+            .create_file("/testfile", 0o644)
+            .expect("create_file");
+        let inode_id = inode.inode_id;
+        inode_fs.do_commit().expect("commit inode fixture");
+        seed_metadata_fallback_records(&mut inode_fs, inode_id);
+        inode_fs
+            .store
+            .primary_store_mut()
+            .raw_store_mut()
+            .put(inode_object_key(inode_id), b"not-an-inode")
+            .expect("replace inode object with malformed bytes");
+        evict_inode_for_metadata_fallback(&mut inode_fs, inode_id);
+        assert!(matches!(
+            inode_fs.committed_inode_record(inode_id),
+            Err(FileSystemError::Decode {
+                object: "local filesystem inode",
+                ..
+            })
+        ));
+
+        let mut mismatched_inode = inode;
+        mismatched_inode.inode_id = InodeId::new(inode_id.get() + 1);
+        inode_fs
+            .store
+            .primary_store_mut()
+            .raw_store_mut()
+            .put(
+                inode_object_key(inode_id),
+                &try_encode_inode(&mismatched_inode).expect("encode mismatched inode"),
+            )
+            .expect("replace inode object with mismatched id");
+        assert!(matches!(
+            inode_fs.inode_record_only(inode_id),
+            Err(FileSystemError::CorruptState { reason })
+                if reason == "inode object id does not match requested id"
+        ));
+        drop(inode_fs);
+        let _ = std::fs::remove_dir_all(&inode_root);
+
+        let (directory_root, mut directory_fs) =
+            make_test_fs("mmfb_corrupt_directory").expect("open corrupt-directory fixture");
+        let directory_id = directory_fs
+            .create_dir("/testdir", 0o755)
+            .expect("create_dir")
+            .inode_id;
+        directory_fs.do_commit().expect("commit directory fixture");
+        seed_metadata_fallback_records(&mut directory_fs, directory_id);
+        directory_fs
+            .store
+            .primary_store_mut()
+            .raw_store_mut()
+            .put(directory_object_key(directory_id), b"not-a-directory")
+            .expect("replace directory object with malformed bytes");
+        evict_inode_for_metadata_fallback(&mut directory_fs, directory_id);
+        assert!(matches!(
+            directory_fs.ensure_inode_loaded_for_write(directory_id),
+            Err(FileSystemError::Decode {
+                object: "local filesystem directory",
+                ..
+            })
+        ));
+        drop(directory_fs);
+        let _ = std::fs::remove_dir_all(&directory_root);
     }
 }
 
