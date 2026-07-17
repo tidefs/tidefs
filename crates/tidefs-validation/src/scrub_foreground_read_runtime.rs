@@ -364,7 +364,17 @@ pub fn run_scrub_foreground_read_runtime(command: String) -> ScrubForegroundRead
         statfs_type_hex: format!("0x{mount_f_type:x}"),
     };
     let scrub_runtime_observation_path = harness.scrub_runtime_observation_path();
-    let mounted_fixture_error = prepare_mounted_fixture(&harness).err();
+    let scrub_service_ready_error = match scrub_runtime_observation_path {
+        Some(path) => wait_for_initial_scrub_runtime_observation(
+            path,
+            mount.daemon_pid,
+            Duration::from_secs(DAEMON_SCRUB_OBSERVATION_TIMEOUT_SECS),
+        )
+        .err(),
+        None => Some("mounted scrub runtime observation path is unavailable".to_string()),
+    };
+    let mounted_fixture_error =
+        scrub_service_ready_error.or_else(|| prepare_mounted_fixture(&harness).err());
     let pre_read_daemon_observation = if mounted_fixture_error.is_none() {
         scrub_runtime_observation_path.and_then(|path| {
             match wait_for_pending_scrub_runtime_observation(
@@ -447,6 +457,34 @@ fn read_scrub_runtime_observation(path: &Path) -> Result<ScrubRuntimeObservation
         return Err(format!("{} has invalid zero daemon pid", path.display()));
     }
     Ok(observation)
+}
+
+fn wait_for_initial_scrub_runtime_observation(
+    path: &Path,
+    expected_daemon_pid: u32,
+    timeout: Duration,
+) -> Result<ScrubRuntimeObservation, String> {
+    let start = Instant::now();
+    loop {
+        let last_observation = match read_scrub_runtime_observation(path) {
+            Ok(observation) if observation.daemon_pid == expected_daemon_pid => {
+                return Ok(observation);
+            }
+            Ok(observation) => format!(
+                "daemon_pid={} (expected mounted daemon pid {expected_daemon_pid})",
+                observation.daemon_pid,
+            ),
+            Err(error) => error,
+        };
+        if start.elapsed() >= timeout {
+            return Err(format!(
+                "timed out after {}s waiting for initial observation from mounted daemon at {}: {last_observation}",
+                timeout.as_secs(),
+                path.display()
+            ));
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
 }
 
 fn wait_for_pending_scrub_runtime_observation(
@@ -1414,6 +1452,26 @@ mod tests {
         assert_eq!(observation.work_pending_after_read, Some(false));
         assert_eq!(observation.throttle_count_before_read, None);
         assert!(!daemon_scrub_observation_has_isolation_window(&observation));
+    }
+
+    #[test]
+    fn initial_scrub_observation_must_come_from_mounted_daemon() {
+        let temp = tempfile::TempDir::new().expect("create observation tempdir");
+        let path = temp.path().join("scrub-runtime-observation.json");
+        let source = ScrubRuntimeObservation::new(4242);
+        fs::write(
+            &path,
+            serde_json::to_vec(&source).expect("encode scrub observation"),
+        )
+        .expect("write scrub observation");
+
+        let observation = wait_for_initial_scrub_runtime_observation(&path, 4242, Duration::ZERO)
+            .expect("matching mounted daemon observation");
+        assert_eq!(observation.daemon_pid, 4242);
+
+        let error = wait_for_initial_scrub_runtime_observation(&path, 4343, Duration::ZERO)
+            .expect_err("sibling daemon observation must not establish readiness");
+        assert!(error.contains("expected mounted daemon pid 4343"));
     }
 
     #[test]
