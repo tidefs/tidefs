@@ -26,7 +26,7 @@ use std::time::Duration;
 
 use rand;
 
-use tidefs_membership_epoch::EpochId;
+use tidefs_membership_epoch::{EpochId, MemberId};
 use tidefs_replication_model::{PlacementReceiptRef, ReceiptRedundancyPolicy};
 use tidefs_types_pool_label_core::{
     self as pool_label, features, DeviceClass as LabelDeviceClass, PoolLabelV1, PoolState,
@@ -303,6 +303,67 @@ pub struct DeviceReplacement {
     pub state: ReplacementState,
     /// Index of the device in the pool's device list during replacement.
     pub device_index: usize,
+}
+
+/// Local replacement/rebuild status projected from pool replacement state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReplacementRebuildStatusState {
+    Pending,
+    Completed,
+    Canceled,
+    Refused,
+}
+
+/// Whether current replacement evidence permits detaching the old device.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReplacementDetachDecision {
+    SafeToDetach,
+    UnsafeToDetach,
+}
+
+impl ReplacementDetachDecision {
+    pub fn is_safe(self) -> bool {
+        matches!(self, Self::SafeToDetach)
+    }
+}
+
+/// Remanence treatment surfaced with replacement status.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReplacementRemanenceTreatment {
+    pub old_device_detach_allowed: bool,
+    pub media_privacy_claimed: bool,
+    pub secure_erase_claimed: bool,
+    pub sanitization_claimed: bool,
+    pub decommissioning_claimed: bool,
+}
+
+impl ReplacementRemanenceTreatment {
+    pub fn from_detach_decision(detach_decision: ReplacementDetachDecision) -> Self {
+        Self {
+            old_device_detach_allowed: detach_decision.is_safe(),
+            media_privacy_claimed: false,
+            secure_erase_claimed: false,
+            sanitization_claimed: false,
+            decommissioning_claimed: false,
+        }
+    }
+}
+
+/// Fail-closed replacement/rebuild evidence status for local pool state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReplacementRebuildEvidenceStatus {
+    pub old_member: MemberId,
+    pub new_member: MemberId,
+    pub topology_epoch: u64,
+    pub total_subjects: u64,
+    pub subjects_completed: u64,
+    pub subjects_failed: u64,
+    pub verified_receipt_count: u64,
+    pub evidence_stable: bool,
+    pub evidence_replayable_after_reopen: bool,
+    pub state: ReplacementRebuildStatusState,
+    pub detach_decision: ReplacementDetachDecision,
+    pub remanence_treatment: ReplacementRemanenceTreatment,
 }
 
 impl DeviceReplacement {
@@ -3720,6 +3781,45 @@ impl Pool {
     /// recently completed.
     pub fn replacement_status(&self) -> Option<&DeviceReplacement> {
         self.replacement.as_ref()
+    }
+
+    /// Current local replacement/rebuild evidence projection.
+    ///
+    /// This is intentionally fail-closed until replacement evidence is durable
+    /// and replayable after reopen.
+    pub fn replacement_rebuild_evidence_status(&self) -> Option<ReplacementRebuildEvidenceStatus> {
+        let replacement = self.replacement.as_ref()?;
+        let old_member = MemberId::new(u64::from_le_bytes(
+            replacement.old_device_guid[..8].try_into().unwrap(),
+        ));
+        let new_member = MemberId::new(self.device_id_for_index(replacement.device_index));
+
+        let state = match &replacement.state {
+            ReplacementState::InProgress { .. } => ReplacementRebuildStatusState::Pending,
+            ReplacementState::CopyComplete => ReplacementRebuildStatusState::Completed,
+            ReplacementState::Cancelled => ReplacementRebuildStatusState::Canceled,
+            ReplacementState::Failed { .. } => ReplacementRebuildStatusState::Refused,
+        };
+
+        let detach_decision = ReplacementDetachDecision::UnsafeToDetach;
+        Some(ReplacementRebuildEvidenceStatus {
+            old_member,
+            new_member,
+            topology_epoch: self.placement_epoch(),
+            // Byte-copy state and terminal errors are not receipt-backed
+            // rebuild-subject evidence.
+            total_subjects: 0,
+            subjects_completed: 0,
+            subjects_failed: 0,
+            verified_receipt_count: 0,
+            evidence_stable: false,
+            evidence_replayable_after_reopen: false,
+            state,
+            detach_decision,
+            remanence_treatment: ReplacementRemanenceTreatment::from_detach_decision(
+                detach_decision,
+            ),
+        })
     }
 
     /// Cancel an in-progress device replacement.
@@ -8071,6 +8171,74 @@ mod tests {
     // Device replacement
     // ------------------------------------------------------------------
 
+    fn replacement_evidence_test_pool(
+        name: &str,
+    ) -> (PathBuf, PathBuf, Pool, MemberId, MemberId, u64) {
+        let root = temp_dir(name);
+        let _ = std::fs::remove_dir_all(&root);
+        let d1 = root.join("data1");
+        let d2 = root.join("data2");
+        let config = PoolConfig {
+            name: "testpool".into(),
+            root_path: root.to_path_buf(),
+            devices: vec![DeviceConfig {
+                media_class: Default::default(),
+                path: d1.clone(),
+                backing: DeviceBacking::DirectoryObjectStoreCompat,
+                class: DeviceClass::Data,
+                kind: DeviceKind::Single { path: d1.clone() },
+                encryption: None,
+                compression: None,
+            }],
+        };
+        let mut pool = Pool::create(config, PoolProperties::default(), &test_options()).unwrap();
+        let old_device_guid = pool.device_guid_for_index(0);
+        let old_member =
+            MemberId::new(u64::from_le_bytes(old_device_guid[..8].try_into().unwrap()));
+
+        pool.replace_device(
+            &d1,
+            DeviceConfig {
+                media_class: Default::default(),
+                path: d2.clone(),
+                backing: DeviceBacking::DirectoryObjectStoreCompat,
+                class: DeviceClass::Data,
+                kind: DeviceKind::Single { path: d2 },
+                encryption: None,
+                compression: None,
+            },
+            &test_options(),
+        )
+        .unwrap();
+
+        let new_member = MemberId::new(pool.device_id_for_index(0));
+        let topology_epoch = pool.placement_epoch();
+        (root, d1, pool, old_member, new_member, topology_epoch)
+    }
+
+    fn assert_replacement_evidence_fail_closed(
+        evidence: &ReplacementRebuildEvidenceStatus,
+        old_member: MemberId,
+        new_member: MemberId,
+        topology_epoch: u64,
+    ) {
+        assert_eq!(evidence.old_member, old_member);
+        assert_eq!(evidence.new_member, new_member);
+        assert_eq!(evidence.topology_epoch, topology_epoch);
+        assert_eq!(
+            evidence.detach_decision,
+            ReplacementDetachDecision::UnsafeToDetach
+        );
+        assert_eq!(evidence.verified_receipt_count, 0);
+        assert!(!evidence.evidence_stable);
+        assert!(!evidence.evidence_replayable_after_reopen);
+        assert!(!evidence.remanence_treatment.old_device_detach_allowed);
+        assert!(!evidence.remanence_treatment.media_privacy_claimed);
+        assert!(!evidence.remanence_treatment.secure_erase_claimed);
+        assert!(!evidence.remanence_treatment.sanitization_claimed);
+        assert!(!evidence.remanence_treatment.decommissioning_claimed);
+    }
+
     #[test]
     fn replace_device_swaps_and_tracks_state() {
         let root = temp_dir("replace-swap");
@@ -8177,6 +8345,83 @@ mod tests {
             &test_options(),
         );
         assert!(result.is_err());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn replacement_rebuild_evidence_status_projects_in_progress_fail_closed() {
+        let (root, _old_path, mut pool, old_member, new_member, topology_epoch) =
+            replacement_evidence_test_pool("replace-evidence-pending");
+        pool.replacement.as_mut().unwrap().state = ReplacementState::InProgress {
+            bytes_copied: 15,
+            total_bytes: 10,
+        };
+
+        let evidence = pool
+            .replacement_rebuild_evidence_status()
+            .expect("replacement evidence status");
+        assert_replacement_evidence_fail_closed(&evidence, old_member, new_member, topology_epoch);
+        assert_eq!(evidence.state, ReplacementRebuildStatusState::Pending);
+        assert_eq!(evidence.total_subjects, 0);
+        assert_eq!(evidence.subjects_completed, 0);
+        assert_eq!(evidence.subjects_failed, 0);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn replacement_rebuild_evidence_status_projects_completed_fail_closed() {
+        let (root, _old_path, mut pool, old_member, new_member, topology_epoch) =
+            replacement_evidence_test_pool("replace-evidence-completed");
+        pool.replacement.as_mut().unwrap().state = ReplacementState::CopyComplete;
+
+        let evidence = pool
+            .replacement_rebuild_evidence_status()
+            .expect("replacement evidence status");
+        assert_replacement_evidence_fail_closed(&evidence, old_member, new_member, topology_epoch);
+        assert_eq!(evidence.state, ReplacementRebuildStatusState::Completed);
+        assert_eq!(evidence.total_subjects, 0);
+        assert_eq!(evidence.subjects_completed, 0);
+        assert_eq!(evidence.subjects_failed, 0);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn replacement_rebuild_evidence_status_projects_cancelled_fail_closed() {
+        let (root, _old_path, mut pool, old_member, new_member, topology_epoch) =
+            replacement_evidence_test_pool("replace-evidence-cancelled");
+        pool.replacement.as_mut().unwrap().state = ReplacementState::Cancelled;
+
+        let evidence = pool
+            .replacement_rebuild_evidence_status()
+            .expect("replacement evidence status");
+        assert_replacement_evidence_fail_closed(&evidence, old_member, new_member, topology_epoch);
+        assert_eq!(evidence.state, ReplacementRebuildStatusState::Canceled);
+        assert_eq!(evidence.total_subjects, 0);
+        assert_eq!(evidence.subjects_completed, 0);
+        assert_eq!(evidence.subjects_failed, 0);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn replacement_rebuild_evidence_status_projects_failed_fail_closed() {
+        let (root, _old_path, mut pool, old_member, new_member, topology_epoch) =
+            replacement_evidence_test_pool("replace-evidence-failed");
+        pool.replacement.as_mut().unwrap().state = ReplacementState::Failed {
+            reason: "copy failed".into(),
+        };
+
+        let evidence = pool
+            .replacement_rebuild_evidence_status()
+            .expect("replacement evidence status");
+        assert_replacement_evidence_fail_closed(&evidence, old_member, new_member, topology_epoch);
+        assert_eq!(evidence.state, ReplacementRebuildStatusState::Refused);
+        assert_eq!(evidence.total_subjects, 0);
+        assert_eq!(evidence.subjects_completed, 0);
+        assert_eq!(evidence.subjects_failed, 0);
 
         let _ = std::fs::remove_dir_all(&root);
     }
