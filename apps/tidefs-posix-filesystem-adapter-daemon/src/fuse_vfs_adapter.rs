@@ -7606,6 +7606,7 @@ impl FuseVfsAdapter {
             )?;
         }
         self.reconcile_writeback_inode_cache_after_authoritative_range(ino);
+        self.refresh_writeback_projection(ino);
         Ok(())
     }
 
@@ -41773,6 +41774,14 @@ mod tests {
             cache.insert(ino);
             cache.mark_dirty(ino, 8192);
         }
+        let projection = Arc::clone(&fixture.adapter.writeback_projection);
+        let projected_dirty = WritebackProjection::total_observable_dirty_bytes(
+            &fixture.adapter.dirty_state,
+            fixture.adapter.writeback_page_cache.as_ref(),
+            ino,
+        );
+        projection.record_dirty(ino, projected_dirty);
+        assert!(projection.is_dirty(ino));
 
         fixture
             .adapter
@@ -41826,6 +41835,11 @@ mod tests {
             Some(true),
             "inode writeback cache should not remain dirty"
         );
+        assert!(
+            !projection.is_dirty_or_writeback(ino),
+            "authoritative full-range reconciliation must clear the runtime projection"
+        );
+        assert_eq!(projection.stats_snapshot().clean_transitions, 1);
     }
 
     #[test]
