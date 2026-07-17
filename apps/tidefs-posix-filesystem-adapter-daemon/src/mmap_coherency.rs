@@ -197,8 +197,11 @@ impl MmapCoherency {
                 }
             }
             _ => {
-                let deferred_budget = event_budget / 2;
-                (deferred_budget, event_budget - deferred_budget)
+                let mut deferred_budget = (event_budget / 2).min(deferred_pending);
+                let feed_budget = (event_budget - deferred_budget).min(feed_pending);
+                deferred_budget += (event_budget - deferred_budget - feed_budget)
+                    .min(deferred_pending - deferred_budget);
+                (deferred_budget, feed_budget)
             }
         };
         let mut sink = MmapInvalidationSink {
@@ -443,6 +446,27 @@ mod tests {
         assert_eq!(c.process_tick(16), 1);
         assert_eq!(calls.load(Ordering::Relaxed), 2);
         assert_eq!(c.deferred_invalidation_count(), 1);
+    }
+
+    #[test]
+    fn small_deferred_queue_does_not_waste_feed_budget() {
+        let c = new_coherency();
+        c.register(42, 1);
+        c.set_dirty_check(Some(Box::new(|ino| ino == 42)));
+
+        c.enqueue_batch(batch(42, 2));
+        assert_eq!(c.process_tick(1), 1);
+        assert_eq!(c.deferred_invalidation_count(), 1);
+
+        for ino in 100..103 {
+            c.register(ino, 0);
+            c.enqueue_batch(batch(ino, 1));
+        }
+
+        assert_eq!(c.process_tick(4), 4);
+        assert_eq!(c.pending_event_count(), 1);
+        assert_eq!(c.deferred_invalidation_count(), 1);
+        assert_eq!(c.stats.snapshot().pages_invalidated, 3);
     }
 
     #[test]
