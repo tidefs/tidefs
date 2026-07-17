@@ -364,8 +364,8 @@ pub fn run_scrub_foreground_read_runtime(command: String) -> ScrubForegroundRead
         statfs_type_hex: format!("0x{mount_f_type:x}"),
     };
     let scrub_runtime_observation_path = harness.scrub_runtime_observation_path();
-    let foreground_fixture_error = prepare_foreground_read(&harness).err();
-    let pre_read_daemon_observation = if foreground_fixture_error.is_none() {
+    let mounted_fixture_error = prepare_mounted_fixture(&harness).err();
+    let pre_read_daemon_observation = if mounted_fixture_error.is_none() {
         scrub_runtime_observation_path.and_then(|path| {
             match wait_for_pending_scrub_runtime_observation(
                 path,
@@ -384,11 +384,8 @@ pub fn run_scrub_foreground_read_runtime(command: String) -> ScrubForegroundRead
         None
     };
     let scrub_activity = ScrubActivityWindow::begin();
-    let foreground_read = run_foreground_read(
-        &harness,
-        &service_curve,
-        foreground_fixture_error.as_deref(),
-    );
+    let foreground_read =
+        run_foreground_read(&harness, &service_curve, mounted_fixture_error.as_deref());
     let post_read_daemon_observation = scrub_runtime_observation_path.and_then(|path| {
         let before_read = pre_read_daemon_observation.as_ref()?;
         match read_post_read_scrub_runtime_observation(path, before_read) {
@@ -1152,7 +1149,15 @@ fn run_foreground_read(
     }
 }
 
-fn prepare_foreground_read(harness: &MountHarness) -> Result<(), String> {
+fn prepare_mounted_fixture(harness: &MountHarness) -> Result<(), String> {
+    let mut scrub_payload = deterministic_payload(SCRUB_UNIT_BYTES as usize);
+    for unit in 0..SCRUB_UNITS_REQUESTED {
+        scrub_payload[0] = unit as u8;
+        harness
+            .create_file(format!("scrub-backlog/{unit:02}.bin"), &scrub_payload)
+            .map_err(|error| format!("create mounted scrub backlog unit {unit}: {error}"))?;
+    }
+
     harness
         .create_file(
             "protected-foreground-read.bin",
