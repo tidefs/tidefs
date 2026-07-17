@@ -4076,6 +4076,9 @@ fn live_snapshot_send_plan(
         Some(Value::Bool(incremental)) => *incremental,
         Some(_) => return Err("snapshot send: incremental must be a boolean".to_string()),
     };
+    if !incremental && !matches!(args.get("from_root"), None | Some(Value::Null)) {
+        return Err("snapshot send: --from-root requires incremental live-owner send".to_string());
+    }
     let mode = if incremental {
         LiveSnapshotSendMode::Incremental {
             from_root: live_snapshot_send_from_root_arg(args, fs)?,
@@ -8131,6 +8134,40 @@ mod tests {
             );
             assert!(!output.exists());
         }
+    }
+
+    #[test]
+    fn live_snapshot_send_rejects_from_root_without_incremental() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = root.path().join("store");
+        let mut fs = LocalFileSystem::open(&store).expect("open fs");
+        fs.create_file("/live.txt", 0o644).expect("create file");
+        fs.write_file("/live.txt", 0, b"live owner snapshot send")
+            .expect("write file");
+        let engine = VfsLocalFileSystem::new(fs);
+        let output = root.path().join("from-root-without-incremental.vfs");
+
+        let refused = live_snapshot_admin(
+            &engine,
+            "send",
+            json!({
+                "output": output.display().to_string(),
+                "format": "vfssend1",
+                "incremental": false,
+                "from_root": "000000000000000000000000000000000000000000000000",
+            }),
+            true,
+        );
+
+        assert_eq!(refused["ok"], false, "send response: {refused}");
+        assert_eq!(refused["exit_code"], 1);
+        assert!(refused["json"].is_null());
+        assert!(refused["text"].is_null());
+        assert_eq!(
+            refused["error"],
+            "snapshot send: --from-root requires incremental live-owner send"
+        );
+        assert!(!output.exists());
     }
 
     #[test]
