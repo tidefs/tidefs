@@ -1372,10 +1372,8 @@ impl EcReadPath {
                     }
                 }
 
-                let recon = reconstruct_receipt_stripe(&stripe_config, &available).map_err(|err| {
-                    increment_cell(&s.stats.failed_reads);
-                    err
-                })?;
+                let recon = reconstruct_receipt_stripe(&stripe_config, &available)
+                    .inspect_err(|_| increment_cell(&s.stats.failed_reads))?;
 
                 let stripe_chunk_len = match total_original_len {
                     Some(_len) if stripe_idx + 1 < num_stripes => cap,
