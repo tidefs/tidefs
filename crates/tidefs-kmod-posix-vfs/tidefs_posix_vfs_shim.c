@@ -2212,10 +2212,9 @@ static struct dentry *tidefs_posix_vfs_lookup(struct inode *dir,
 }
 
 /*
- * SB_POSIXACL defers umask handling to filesystem ACL creation. TideFS
- * refuses default ACL creation while inheritance is unsupported. Refuse
- * child creation when persisted state already contains a default ACL;
- * otherwise use the ordinary umask path.
+ * mknod and tmpfile do not yet install inherited ACL xattrs. Keep those
+ * callers fail-closed below a directory with a default ACL; otherwise apply
+ * the ordinary umask that SB_POSIXACL delegates to the filesystem.
  */
 static int tidefs_posix_vfs_prepare_create_mode(struct inode *dir,
 						 umode_t *mode)
@@ -2237,18 +2236,115 @@ static int tidefs_posix_vfs_prepare_create_mode(struct inode *dir,
 	return 0;
 }
 
+struct tidefs_posix_vfs_create_acl {
+	struct posix_acl *default_acl;
+	struct posix_acl *access_acl;
+};
+
+static void tidefs_posix_vfs_release_create_acl(
+	struct tidefs_posix_vfs_create_acl *create_acl)
+{
+	if (create_acl->default_acl)
+		posix_acl_release(create_acl->default_acl);
+	if (create_acl->access_acl)
+		posix_acl_release(create_acl->access_acl);
+	create_acl->default_acl = NULL;
+	create_acl->access_acl = NULL;
+}
+
+/*
+ * Ask the kernel ACL core to derive the child ACLs and effective mode. The
+ * VFS still passes mkdir without S_IFDIR, so use an explicit type while
+ * planning and preserve the type bits originally supplied by the caller.
+ */
+static int tidefs_posix_vfs_prepare_create_acl(
+	struct inode *dir, umode_t *mode, umode_t inode_type,
+	struct tidefs_posix_vfs_create_acl *create_acl)
+{
+	umode_t original_type = *mode & S_IFMT;
+	umode_t acl_mode = (*mode & ~S_IFMT) | inode_type;
+	int ret;
+
+	create_acl->default_acl = NULL;
+	create_acl->access_acl = NULL;
+	ret = posix_acl_create(dir, &acl_mode, &create_acl->default_acl,
+			       &create_acl->access_acl);
+	if (ret)
+		return ret;
+
+	*mode = (acl_mode & ~S_IFMT) | original_type;
+	return 0;
+}
+
+static int tidefs_posix_vfs_store_new_inode_acl(struct inode *inode,
+						 struct posix_acl *acl,
+						 int type)
+{
+	const char *xattr_name;
+	void *value;
+	size_t size = 0;
+	int ret;
+
+	if (type == ACL_TYPE_ACCESS)
+		xattr_name = XATTR_NAME_POSIX_ACL_ACCESS;
+	else if (type == ACL_TYPE_DEFAULT)
+		xattr_name = XATTR_NAME_POSIX_ACL_DEFAULT;
+	else
+		return -EINVAL;
+
+	if (!acl) {
+		set_cached_acl(inode, type, NULL);
+		return 0;
+	}
+
+	value = posix_acl_to_xattr(&init_user_ns, acl, &size, GFP_KERNEL);
+	if (!value)
+		return -ENOMEM;
+	ret = tidefs_posix_vfs_engine_setxattr(
+		inode->i_ino,
+		(const unsigned char *)xattr_name,
+		(unsigned int)strlen(xattr_name),
+		(const unsigned char *)value,
+		(unsigned int)size,
+		XATTR_CREATE);
+	kfree(value);
+	if (ret == -ENOSYS)
+		ret = -EOPNOTSUPP;
+	if (ret)
+		return ret;
+
+	set_cached_acl(inode, type, acl);
+	return 0;
+}
+
+static int tidefs_posix_vfs_init_new_inode_acl(
+	struct inode *inode, struct tidefs_posix_vfs_create_acl *create_acl)
+{
+	int ret;
+
+	ret = tidefs_posix_vfs_store_new_inode_acl(
+		inode, create_acl->default_acl, ACL_TYPE_DEFAULT);
+	if (ret)
+		return ret;
+	return tidefs_posix_vfs_store_new_inode_acl(
+		inode, create_acl->access_acl, ACL_TYPE_ACCESS);
+}
+
 static int tidefs_posix_vfs_create(struct mnt_idmap *idmap,
 				   struct inode *dir, struct dentry *dentry,
 				   umode_t mode, bool excl)
 {
 	struct tidefs_posix_vfs_kernel_pool_core *pool;
+	struct tidefs_posix_vfs_mount *ctx = dir->i_sb->s_fs_info;
 	struct inode *inode;
 	u64 ino;
 	int acl_ret;
 
-	acl_ret = tidefs_posix_vfs_prepare_create_mode(dir, &mode);
-	if (acl_ret)
-		return acl_ret;
+	if (!ctx || !ctx->engine_backed) {
+		acl_ret = tidefs_posix_vfs_prepare_create_mode(dir, &mode);
+		if (acl_ret)
+			return acl_ret;
+	}
 
 	/* Refuse write operations on read-only mounts. */
 	{
@@ -2265,16 +2361,21 @@ static int tidefs_posix_vfs_create(struct mnt_idmap *idmap,
 
 	/* Engine-backed path: delegate to the Rust KernelEngine. */
 	{
-		struct tidefs_posix_vfs_mount *ctx = dir->i_sb->s_fs_info;
 		if (ctx && ctx->engine_backed) {
+			struct tidefs_posix_vfs_create_acl create_acl;
 			u64 out_ino;
 			u32 out_mode;
 			u64 out_generation = 0;
 			int ret;
+			int rollback_ret;
 			int pool_idx;
 
 			ret = tidefs_posix_vfs_require_live_dir(dir);
 			if (ret < 0)
+				return ret;
+			ret = tidefs_posix_vfs_prepare_create_acl(
+				dir, &mode, S_IFREG, &create_acl);
+			if (ret)
 				return ret;
 
 			ret = tidefs_posix_vfs_engine_create(
@@ -2284,9 +2385,26 @@ static int tidefs_posix_vfs_create(struct mnt_idmap *idmap,
 				mode, excl ? 1 : 0,
 				&out_ino, &out_mode, &out_generation);
 			if (ret < 0)
-				return ret;
-			if (!out_generation)
-				return -EIO;
+				goto out_release_acl;
+			if (!out_generation) {
+				ret = -EIO;
+				goto rollback_engine_create;
+			}
+
+			inode = new_inode(dir->i_sb);
+			if (!inode) {
+				ret = -ENOMEM;
+				goto rollback_engine_create;
+			}
+			inode->i_ino = out_ino;
+			inode->i_generation = out_generation;
+			inode_init_owner(idmap, inode, dir, out_mode);
+			tidefs_posix_vfs_apply_inode_ops(inode, out_mode, 0);
+			ret = tidefs_posix_vfs_init_new_inode_acl(inode, &create_acl);
+			if (ret) {
+				iput(inode);
+				goto rollback_engine_create;
+			}
 
 			/* Keep the legacy fixed table as a best-effort mirror only.
 			 * Live lookup/getattr/readdir route through the mounted engine,
@@ -2298,21 +2416,28 @@ static int tidefs_posix_vfs_create(struct mnt_idmap *idmap,
 				pr_debug("tidefs_posix_vfs: create skipped full C mirror for ino=%llu\n",
 					 out_ino);
 
-			inode = new_inode(dir->i_sb);
-			if (!inode)
-				return -ENOMEM;
-			inode->i_ino = out_ino;
-			inode->i_generation = out_generation;
-			inode_init_owner(idmap, inode, dir, out_mode);
-			tidefs_posix_vfs_apply_inode_ops(inode, out_mode, 0);
 			tidefs_posix_vfs_init_new_inode_times(inode);
 			tidefs_posix_vfs_touch_dirent_parent(dir);
 			insert_inode_hash(inode);
 			d_instantiate(dentry, inode);
+			tidefs_posix_vfs_release_create_acl(&create_acl);
 
 			pr_debug("tidefs_posix_vfs: create (engine-backed) name='%.*s' ino=%llu\n",
 				 (unsigned int)dentry->d_name.len, dentry->d_name.name, out_ino);
 			return 0;
+
+rollback_engine_create:
+			rollback_ret = tidefs_posix_vfs_engine_unlink(
+				dir->i_ino, dentry->d_name.name,
+				dentry->d_name.len);
+			if (rollback_ret < 0) {
+				pr_err("tidefs_posix_vfs: create initialization rollback failed ino=%llu ret=%d\n",
+				       out_ino, rollback_ret);
+				ret = -EIO;
+			}
+out_release_acl:
+			tidefs_posix_vfs_release_create_acl(&create_acl);
+			return ret;
 		}
 	}
 	(void)excl;
@@ -2424,13 +2549,16 @@ static struct dentry *tidefs_posix_vfs_mkdir(struct mnt_idmap *idmap,
 				    umode_t mode)
 {
 	struct tidefs_posix_vfs_kernel_pool_core *pool;
+	struct tidefs_posix_vfs_mount *ctx = dir->i_sb->s_fs_info;
 	struct inode *inode;
 	u64 ino;
 	int acl_ret;
 
-	acl_ret = tidefs_posix_vfs_prepare_create_mode(dir, &mode);
-	if (acl_ret)
-		return ERR_PTR(acl_ret);
+	if (!ctx || !ctx->engine_backed) {
+		acl_ret = tidefs_posix_vfs_prepare_create_mode(dir, &mode);
+		if (acl_ret)
+			return ERR_PTR(acl_ret);
+	}
 
 	/* Refuse write operations on read-only mounts. */
 	{
@@ -2446,15 +2574,20 @@ static struct dentry *tidefs_posix_vfs_mkdir(struct mnt_idmap *idmap,
 
 	/* Engine-backed path: delegate to the Rust KernelEngine. */
 	{
-		struct tidefs_posix_vfs_mount *ctx = dir->i_sb->s_fs_info;
 		if (ctx && ctx->engine_backed) {
+			struct tidefs_posix_vfs_create_acl create_acl;
 			u64 out_ino;
 			u32 out_mode;
 			u64 out_generation = 0;
 			int ret;
+			int rollback_ret;
 
 			ret = tidefs_posix_vfs_require_live_dir(dir);
 			if (ret < 0)
+				return ERR_PTR(ret);
+			ret = tidefs_posix_vfs_prepare_create_acl(
+				dir, &mode, S_IFDIR, &create_acl);
+			if (ret)
 				return ERR_PTR(ret);
 
 			ret = tidefs_posix_vfs_engine_mkdir(
@@ -2464,9 +2597,26 @@ static struct dentry *tidefs_posix_vfs_mkdir(struct mnt_idmap *idmap,
 				mode,
 				&out_ino, &out_mode, &out_generation);
 			if (ret < 0)
-				return ERR_PTR(ret);
-			if (!out_generation)
-				return ERR_PTR(-EIO);
+				goto out_release_acl;
+			if (!out_generation) {
+				ret = -EIO;
+				goto rollback_engine_mkdir;
+			}
+
+			inode = new_inode(dir->i_sb);
+			if (!inode) {
+				ret = -ENOMEM;
+				goto rollback_engine_mkdir;
+			}
+			inode->i_ino = out_ino;
+			inode->i_generation = out_generation;
+			inode_init_owner(idmap, inode, dir, out_mode);
+			tidefs_posix_vfs_apply_inode_ops(inode, out_mode, 0);
+			ret = tidefs_posix_vfs_init_new_inode_acl(inode, &create_acl);
+			if (ret) {
+				iput(inode);
+				goto rollback_engine_mkdir;
+			}
 
 			/* Keep the C-level table as a best-effort bring-up mirror.
 			 * The mounted engine is the live namespace authority. */
@@ -2479,23 +2629,30 @@ static struct dentry *tidefs_posix_vfs_mkdir(struct mnt_idmap *idmap,
 						 out_ino);
 			}
 
-			inode = new_inode(dir->i_sb);
-			if (!inode)
-				return ERR_PTR(-ENOMEM);
-			inode->i_ino = out_ino;
-			inode->i_generation = out_generation;
-			inode_init_owner(idmap, inode, dir, out_mode);
-			tidefs_posix_vfs_apply_inode_ops(inode, out_mode, 0);
 			if (dir->i_nlink > 0)
 				inc_nlink(dir);
 			tidefs_posix_vfs_init_new_inode_times(inode);
 			tidefs_posix_vfs_touch_dirent_parent(dir);
 			insert_inode_hash(inode);
+			tidefs_posix_vfs_release_create_acl(&create_acl);
 
 			pr_debug("tidefs_posix_vfs: mkdir (engine-backed) name='%.*s' ino=%llu\n",
 				 (unsigned int)dentry->d_name.len, dentry->d_name.name, out_ino);
 			d_instantiate(dentry, inode);
 			return NULL;
+
+rollback_engine_mkdir:
+			rollback_ret = tidefs_posix_vfs_engine_rmdir(
+				dir->i_ino, dentry->d_name.name,
+				dentry->d_name.len);
+			if (rollback_ret < 0) {
+				pr_err("tidefs_posix_vfs: mkdir initialization rollback failed ino=%llu ret=%d\n",
+				       out_ino, rollback_ret);
+				ret = -EIO;
+			}
+out_release_acl:
+			tidefs_posix_vfs_release_create_acl(&create_acl);
+			return ERR_PTR(ret);
 		}
 	}
 
@@ -4774,13 +4931,6 @@ static int tidefs_posix_vfs_set_acl(struct mnt_idmap *idmap,
 	else if (type == ACL_TYPE_DEFAULT) {
 		if (!S_ISDIR(inode->i_mode))
 			return acl ? -EACCES : 0;
-		/*
-		 * A stored default ACL is only meaningful when create and mkdir
-		 * inherit it. Refuse raw-only default ACL storage while this mounted
-		 * adapter cannot apply that inheritance contract.
-		 */
-		if (acl)
-			return -EOPNOTSUPP;
 		xattr_name = XATTR_NAME_POSIX_ACL_DEFAULT;
 	} else
 		return -EINVAL;
