@@ -39,7 +39,6 @@ use std::{
 use tidefs_durability_layout::FailureDomainV1;
 use tidefs_erasure_coding::{
     encode as encode_stripe, encode_receipt_stripe as encode_coding_receipt_stripe,
-    reconstruct as reconstruct_stripe,
     reconstruct_receipt_stripe as reconstruct_coding_receipt_stripe, ErasureShard,
     ReceiptStripeError, ShardKind, StripeConfig,
 };
@@ -409,35 +408,24 @@ impl ErasureCodedStore {
                 }
             }
 
-            let recon = reconstruct_stripe(&stripe_config, &available, None).ok_or_else(|| {
+            let recon = reconstruct_receipt_stripe(&stripe_config, &available).map_err(|err| {
                 increment_cell(&self.stats.failed_reads);
-                format!(
-                    "stripe {s}: insufficient verified shards available ({}/{} needed)",
-                    available.iter().filter(|s| s.is_some()).count(),
-                    self.config.data_shards,
-                )
+                format!("stripe {s} reconstruction failed: {err}")
             })?;
 
             // Queue repairs for missing/corrupt shards to be written back later.
             if degraded {
-                if let Some(encoded) = encode_stripe(&stripe_config, &recon.payload) {
-                    for i in 0..sw {
-                        if available[i].is_none() {
-                            let shard_key = shard_object_key(key, s, i);
-                            let store_index = mapped_store_index(&self.shard_to_store, i, sw);
-                            if let Ok(shard_record) = encode_verified_shard(
-                                &object_prefix,
-                                s,
-                                i,
-                                &encoded.shards[i].bytes,
-                            ) {
-                                self.repair_queue.borrow_mut().push(PendingEcRepair {
-                                    store_index,
-                                    shard_key,
-                                    shard_record,
-                                });
-                            }
-                        }
+                for rebuilt in &recon.rebuilt_shards {
+                    let shard_key = shard_object_key(key, s, rebuilt.index);
+                    let store_index = mapped_store_index(&self.shard_to_store, rebuilt.index, sw);
+                    if let Ok(shard_record) =
+                        encode_verified_shard(&object_prefix, s, rebuilt.index, &rebuilt.bytes)
+                    {
+                        self.repair_queue.borrow_mut().push(PendingEcRepair {
+                            store_index,
+                            shard_key,
+                            shard_record,
+                        });
                     }
                 }
             }
@@ -1659,6 +1647,30 @@ mod tests {
 
         let data = store.get_named("hello").unwrap();
         assert_eq!(data, Some(b"world".to_vec()));
+
+        cleanup_dirs(&paths);
+    }
+
+    #[test]
+    fn sync_read_rejects_verified_wrong_length_shard() {
+        let paths = make_paths(3, "sync-malformed-shard");
+        let mut store =
+            ErasureCodedStore::open(&paths, ErasureCodedStoreConfig::two_plus_one_test()).unwrap();
+        let name = b"malformed-shard";
+        store.put_named(name, b"payload").unwrap();
+
+        let key = ObjectKey::from_name(name);
+        let prefix = object_prefix(key);
+        let shard_key = shard_object_key(key, 0, 0);
+        let malformed = encode_verified_shard(&prefix, 0, 0, &[0; 255]).unwrap();
+        store.stores[0].put(shard_key, &malformed).unwrap();
+
+        let err = store.get_named(name).unwrap_err();
+        assert!(
+            err.contains("invalid receipt stripe available set"),
+            "{err}"
+        );
+        assert_eq!(store.stats().failed_reads.get(), 1);
 
         cleanup_dirs(&paths);
     }
