@@ -2895,6 +2895,38 @@ fn strongest_backpressure(
 
 const MAX_PRUNE_CANDIDATES_PER_TICK: usize = 128;
 
+const WRITE_CACHE_RECONCILIATION_STRIPES: usize = 256;
+
+/// Extends lower write ordering through adapter reconciliation for the same
+/// inode without serializing unrelated inode cache projections.
+struct WriteCacheReconciliationGates {
+    stripes: [Mutex<()>; WRITE_CACHE_RECONCILIATION_STRIPES],
+}
+
+impl Default for WriteCacheReconciliationGates {
+    fn default() -> Self {
+        Self {
+            stripes: std::array::from_fn(|_| Mutex::new(())),
+        }
+    }
+}
+
+impl WriteCacheReconciliationGates {
+    fn stripe(&self, ino: u64) -> &Mutex<()> {
+        let index = (ino % WRITE_CACHE_RECONCILIATION_STRIPES as u64) as usize;
+        &self.stripes[index]
+    }
+
+    fn lock(&self, ino: u64) -> std::sync::MutexGuard<'_, ()> {
+        self.stripe(ino).lock().unwrap()
+    }
+
+    #[cfg(test)]
+    fn try_lock(&self, ino: u64) -> std::sync::TryLockResult<std::sync::MutexGuard<'_, ()>> {
+        self.stripe(ino).try_lock()
+    }
+}
+
 pub type FusePruneUnavailableReason = crate::observability::FusePruneNotificationUnavailableReason;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2983,10 +3015,9 @@ pub struct FuseVfsAdapter {
     /// Page-cache for write-path dirty tracking and writeback coordination.
     pub(crate) write_page_cache: Arc<PageCache>,
     /// Extends lower engine-write ordering through adapter cache and dirty-range
-    /// reconciliation. Without this gate, a later engine write can complete
-    /// before an earlier request patches its mirrors, allowing stale bytes to
-    /// win after the engine mutex is released.
-    write_cache_reconciliation: Arc<Mutex<()>>,
+    /// reconciliation for the same inode. Stripe collisions only reduce
+    /// concurrency; unrelated stripes do not share a global cache gate.
+    write_cache_reconciliation: Arc<WriteCacheReconciliationGates>,
     write_dispatch: Mutex<DaemonWriteDispatch<256>>,
     /// Short-lived getattr result cache: (FuseAttrOut, expiry). Invalidation
     /// on setattr or write to the same inode.
@@ -3119,7 +3150,7 @@ impl FuseVfsAdapter {
             writeback_page_cache: None,
             readahead_state: Mutex::new(None),
             write_page_cache: Arc::new(PageCache::new(1024, 4096)),
-            write_cache_reconciliation: Arc::new(Mutex::new(())),
+            write_cache_reconciliation: Arc::new(WriteCacheReconciliationGates::default()),
             write_dispatch: Mutex::new(DaemonWriteDispatch::new()),
             getattr_cache: Mutex::new(HashMap::new()),
             path_lookup_cache: Mutex::new(PathLookupCache::new(
@@ -6659,7 +6690,7 @@ impl FuseVfsAdapter {
         // append requests resolve EOF before taking this gate, they can select
         // the same offset and later overwrite each other despite serialized
         // lower writes.
-        let write_cache_reconciliation_guard = self.write_cache_reconciliation.lock().unwrap();
+        let write_cache_reconciliation_guard = self.write_cache_reconciliation.lock(ino);
         // O_APPEND: atomically resolve current file size for append-only
         // writes. POSIX requires all writes to an O_APPEND file descriptor
         // to land at end-of-file regardless of any prior lseek or concurrent
@@ -43093,23 +43124,23 @@ mod tests {
     }
 
     #[test]
-    fn write_dispatch_holds_cache_reconciliation_gate_from_append_resolution_through_engine_write()
-    {
-        let gate = Arc::new(Mutex::new(()));
+    fn write_dispatch_scopes_cache_reconciliation_gate_to_append_inode() {
+        let gates = Arc::new(WriteCacheReconciliationGates::default());
         let observed_getattrs = Arc::new(AtomicU64::new(0));
         let observed_writes = Arc::new(AtomicU64::new(0));
         let observed_getattrs_from_engine = Arc::clone(&observed_getattrs);
         let observed_writes_from_engine = Arc::clone(&observed_writes);
-        let gate_from_getattr = Arc::clone(&gate);
-        let gate_from_engine = Arc::clone(&gate);
+        let gates_from_getattr = Arc::clone(&gates);
+        let gates_from_engine = Arc::clone(&gates);
         let engine = AclMockEngine::new()
             .with_root(1)
             .with_attr(0, 0, 0o666)
             .with_getattr_observer(Arc::new(move || {
                 assert!(matches!(
-                    gate_from_getattr.try_lock(),
+                    gates_from_getattr.try_lock(1),
                     Err(std::sync::TryLockError::WouldBlock)
                 ));
+                assert!(gates_from_getattr.try_lock(2).is_ok());
                 observed_getattrs_from_engine.fetch_add(1, Ordering::Relaxed);
             }))
             .with_no_acl()
@@ -43117,15 +43148,16 @@ mod tests {
             .with_write_ok(4)
             .with_write_observer(Arc::new(move || {
                 assert!(matches!(
-                    gate_from_engine.try_lock(),
+                    gates_from_engine.try_lock(1),
                     Err(std::sync::TryLockError::WouldBlock)
                 ));
+                assert!(gates_from_engine.try_lock(2).is_ok());
                 observed_writes_from_engine.fetch_add(1, Ordering::Relaxed);
             }));
         let mut adapter = FuseVfsAdapter::new(Box::new(engine))
             .expect("create adapter")
             .with_writeback_cache_enabled();
-        adapter.write_cache_reconciliation = Arc::clone(&gate);
+        adapter.write_cache_reconciliation = Arc::clone(&gates);
         let ctx = root_ctx();
 
         let written = adapter
