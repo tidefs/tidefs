@@ -5715,8 +5715,7 @@ fn multiple_intent_entries_replay_on_mount() {
 
 // ── Intent log dirty-commit invariants (#863) ───────────────────────────────
 //
-// Regression tests for the P4-02 Cache Taxonomy §5 invariant:
-// acknowledged intent log entries must survive until a state commit.
+// Acknowledged intent log entries must survive until a state commit.
 // sync_write_intent must mark state dirty; do_commit must not clear
 // the intent log without persisting state first.
 
