@@ -2149,6 +2149,16 @@ impl LivePoolAdminError {
         }
     }
 
+    pub fn unsupported_response_version(version: u16) -> Self {
+        Self {
+            exit_code: 2,
+            kind: LivePoolAdminErrorKind::UnsupportedVersion { version },
+            message: alloc::format!(
+                "unsupported live-owner response version {version}; expected {LIVE_POOL_ADMIN_PROTOCOL_VERSION}"
+            ),
+        }
+    }
+
     pub fn unsupported_command(command: &str, operation: &str) -> Self {
         Self {
             exit_code: 1,

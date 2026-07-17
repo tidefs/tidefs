@@ -674,16 +674,8 @@ fn send_live_owner_request_at(
             LivePoolAdminError::malformed("empty live-owner response"),
         ));
     }
-    let response: LivePoolAdminResponse = serde_json::from_str(&line).map_err(|err| {
-        live_admin_error_to_request_error(LivePoolAdminError::malformed(format!(
-            "decode live-owner response: {err}"
-        )))
-    })?;
-    if response.version != tidefs_vfs_engine::LIVE_POOL_ADMIN_PROTOCOL_VERSION {
-        return Err(live_admin_error_to_request_error(
-            LivePoolAdminError::unsupported_version(response.version),
-        ));
-    }
+    let response =
+        decode_live_pool_admin_response(&line).map_err(live_admin_error_to_request_error)?;
     validate_live_owner_response_envelope(&response)?;
     match response.body {
         LivePoolAdminResponseBody::BytesHex {
@@ -803,6 +795,41 @@ fn send_live_owner_request_at(
                 .transpose()?,
         }),
     }
+}
+
+fn decode_live_pool_admin_response(
+    line: &str,
+) -> Result<LivePoolAdminResponse, LivePoolAdminError> {
+    let value: serde_json::Value = serde_json::from_str(line).map_err(|err| {
+        LivePoolAdminError::malformed(format!("decode live-owner response: {err}"))
+    })?;
+    let version = decode_live_pool_admin_response_version(&value)?;
+    if version != tidefs_vfs_engine::LIVE_POOL_ADMIN_PROTOCOL_VERSION {
+        return Err(LivePoolAdminError::unsupported_response_version(version));
+    }
+
+    serde_json::from_value(value)
+        .map_err(|err| LivePoolAdminError::malformed(format!("decode live-owner response: {err}")))
+}
+
+fn decode_live_pool_admin_response_version(
+    value: &serde_json::Value,
+) -> Result<u16, LivePoolAdminError> {
+    let Some(version) = value.get("version") else {
+        return Err(LivePoolAdminError::malformed(
+            "decode live-owner response: missing version",
+        ));
+    };
+    let Some(version) = version
+        .as_u64()
+        .and_then(|version| u16::try_from(version).ok())
+    else {
+        return Err(LivePoolAdminError::malformed(
+            "decode live-owner response: malformed version",
+        ));
+    };
+
+    Ok(version)
 }
 
 fn validate_live_owner_response_envelope(
@@ -1767,14 +1794,15 @@ mod tests {
     }
 
     #[test]
-    fn live_owner_response_version_refusal_preserves_typed_detail() {
+    fn unsupported_live_owner_response_version_precedes_future_shape() {
         let dir = tempfile::tempdir().unwrap();
         let socket_path = dir.path().join("owner.sock");
         let listener = UnixListener::bind(&socket_path).unwrap();
         write_owner_manifest(dir.path(), &socket_path);
-        let mut response = LivePoolAdminResponse::ok_text("unused");
-        response.version = 42;
-        let handle = spawn_owner_response(listener, response);
+        let handle = spawn_owner_raw_response(
+            listener,
+            b"{\"version\":42,\"exit_code\":\"future\",\"body\":{\"kind\":\"future\"},\"unexpected\":true}\n",
+        );
         let route = LivePoolRoute {
             command: "pool",
             operation: "status",
@@ -1797,7 +1825,7 @@ mod tests {
                 assert_eq!(exit_code, 2);
                 assert_eq!(
                     message,
-                    "unsupported live-owner request version 42; expected 1"
+                    "unsupported live-owner response version 42; expected 1"
                 );
                 assert_eq!(
                     detail
