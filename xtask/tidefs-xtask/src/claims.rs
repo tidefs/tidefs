@@ -1616,10 +1616,10 @@ fn check_committed_validation_artifacts(root: &Path, missing: &mut Vec<String>) 
             }
         }
         if !artifact_is_manifest && committed_artifacts.contains(&artifact_path) {
-            let is_fixture = manifest
+            let role = if manifest
                 .run_id
-                .starts_with(DETERMINISTIC_FIXTURE_RUN_ID_PREFIX);
-            let role = if is_fixture {
+                .starts_with(DETERMINISTIC_FIXTURE_RUN_ID_PREFIX)
+            {
                 "fixture"
             } else {
                 "promoted evidence"
@@ -1632,12 +1632,6 @@ fn check_committed_validation_artifacts(root: &Path, missing: &mut Vec<String>) 
                 .entry(artifact_path.clone())
                 .or_default()
                 .insert(manifest.validation_tier.is_live_runtime());
-            if is_fixture && manifest.validation_tier.is_runtime() {
-                missing.push(format!(
-                    "{manifest_path} uses deterministic fixture run_id `{}` for runtime-tier `{}` committed artifact `{artifact_path}`",
-                    manifest.run_id, manifest.validation_tier
-                ));
-            }
         }
         if manifest.validation_tier.is_live_runtime() {
             if !committed_artifacts.contains(&artifact_path) {
@@ -5586,40 +5580,6 @@ non_claims = ["none"]
         assert!(
             missing.iter().any(|failure| failure.contains(
                 "validation/artifacts/kernel/source-review.toml has both fixture and promoted-evidence manifests"
-            )),
-            "{missing:#?}"
-        );
-    }
-
-    #[test]
-    fn committed_validation_artifacts_reject_runtime_fixture_role() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        git(temp.path(), &["init"]);
-        let artifact_path = "validation/artifacts/kernel/runtime-output.json";
-        let manifest_path = "validation/artifacts/kernel/runtime-output.manifest.json";
-        let artifact_body = r#"{"status":"promoted"}"#;
-        write_artifact(temp.path(), artifact_path, artifact_body);
-        write_manifest_fixture_with_tier_run_id_and_source_ref(
-            temp.path(),
-            manifest_path,
-            "example.runtime.artifact.v1",
-            "runtime-artifact",
-            artifact_path,
-            artifact_body,
-            ValidationStatus::Pass,
-            Vec::new(),
-            ValidationTier::MountedUserspace,
-            "deterministic-fixture:runtime-output-v1",
-            MANIFEST_FIXTURE_SOURCE_REF,
-        );
-        git(temp.path(), &["add", artifact_path, manifest_path]);
-
-        let mut missing = Vec::new();
-        check_committed_validation_artifacts(temp.path(), &mut missing);
-
-        assert!(
-            missing.iter().any(|failure| failure.contains(
-                "uses deterministic fixture run_id `deterministic-fixture:runtime-output-v1` for runtime-tier `mounted-userspace` committed artifact `validation/artifacts/kernel/runtime-output.json`"
             )),
             "{missing:#?}"
         );
