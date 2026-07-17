@@ -15,8 +15,8 @@ use crate::device::DeviceConfig;
 use crate::intent_log::record::IntentLogRecord;
 use crate::intent_log::sync_write::IntentLog;
 use crate::pool_label::{
-    decode_label, encode_label, seal_label, LabelDeviceClass, LabelPoolState, PoolLabelV1,
-    PoolRedundancyPolicy, POOL_LABEL_SIZE, POOL_LABEL_V1_WIRE_SIZE,
+    decode_label, encode_label, seal_label, LabelPoolState, PoolLabelV1, POOL_LABEL_SIZE,
+    POOL_LABEL_V1_WIRE_SIZE,
 };
 use crate::pool_lifecycle_evidence::{
     PoolLifecycleAction, PoolLifecycleContext, PoolLifecycleEvidence,
@@ -35,6 +35,11 @@ pub enum ExportError {
     PoolNotActive,
     /// Failed to write a label: export aborted, rollback attempted.
     LabelWriteFailed {
+        device_path: PathBuf,
+        reason: String,
+    },
+    /// Existing label evidence cannot authorize an export mutation.
+    LabelValidationFailed {
         device_path: PathBuf,
         reason: String,
     },
@@ -66,6 +71,17 @@ impl std::fmt::Display for ExportError {
                 write!(
                     f,
                     "label write failed for {}: {}",
+                    device_path.display(),
+                    reason
+                )
+            }
+            Self::LabelValidationFailed {
+                device_path,
+                reason,
+            } => {
+                write!(
+                    f,
+                    "label validation failed for {}: {}",
                     device_path.display(),
                     reason
                 )
@@ -126,13 +142,14 @@ impl PoolExporter {
         device_configs: &[DeviceConfig],
         pool_guid: [u8; 16],
         device_guids: &[[u8; 16]],
-        _pool_name: &str,
+        pool_name: &str,
         commit_group: u64,
     ) -> std::result::Result<(), ExportError> {
         Self::export_pool_with_writer(
             device_configs,
             pool_guid,
             device_guids,
+            pool_name,
             commit_group,
             Self::write_labels_to_device,
         )
@@ -142,6 +159,7 @@ impl PoolExporter {
         device_configs: &[DeviceConfig],
         pool_guid: [u8; 16],
         device_guids: &[[u8; 16]],
+        pool_name: &str,
         commit_group: u64,
         mut write_labels: F,
     ) -> std::result::Result<(), ExportError>
@@ -153,21 +171,53 @@ impl PoolExporter {
         if device_configs.is_empty() {
             return Err(ExportError::PoolNotActive);
         }
+        if device_guids.len() != device_configs.len() {
+            return Err(ExportError::LabelValidationFailed {
+                device_path: device_configs[0].path.clone(),
+                reason: format!(
+                    "device GUID count {} does not match device count {}",
+                    device_guids.len(),
+                    device_configs.len()
+                ),
+            });
+        }
 
         let label_commit_group = commit_group + 1;
+        let expected_device_count = u32::try_from(device_configs.len()).map_err(|_| {
+            ExportError::LabelValidationFailed {
+                device_path: device_configs[0].path.clone(),
+                reason: "device count exceeds pool-label representation".to_string(),
+            }
+        })?;
+        let mut expected_topology_generation = None;
+        let mut existing_labels = Vec::with_capacity(device_configs.len());
+
+        // Read and validate the complete topology before mutating any label.
+        // A later missing, corrupt, or foreign label must not leave earlier
+        // devices transitioned to EXPORTED.
+        for (index, (device_config, device_guid)) in device_configs
+            .iter()
+            .zip(device_guids.iter().copied())
+            .enumerate()
+        {
+            let existing = Self::read_existing_label(&device_config.path)?;
+            Self::validate_export_label(
+                &device_config.path,
+                &existing,
+                pool_guid,
+                device_guid,
+                pool_name,
+                index as u32,
+                expected_device_count,
+                expected_topology_generation,
+            )?;
+            expected_topology_generation = Some(existing.topology_generation);
+            existing_labels.push((device_config.path.clone(), existing));
+        }
+
         let mut written: Vec<(PathBuf, PoolLabelV1)> = Vec::new();
 
-        for (i, device_config) in device_configs.iter().enumerate() {
-            let _device_guid = if i < device_guids.len() {
-                device_guids[i]
-            } else {
-                let mut dg = pool_guid;
-                dg[0] ^= i as u8;
-                dg
-            };
-
-            // Read existing label to preserve fields we don't change.
-            let existing = Self::read_existing_label(&device_config.path, pool_guid, i as u32)?;
+        for (device_path, existing) in existing_labels {
             let rollback_label = existing.clone();
 
             let label = PoolLabelV1 {
@@ -180,11 +230,11 @@ impl PoolExporter {
                 ..existing
             };
 
-            let result = write_labels(&device_config.path, &label);
+            let result = write_labels(&device_path, &label);
 
             match result {
                 Ok(()) => {
-                    written.push((device_config.path.clone(), rollback_label));
+                    written.push((device_path, rollback_label));
                 }
                 Err(e) => {
                     // Rollback: restore ACTIVE state on all written devices.
@@ -193,7 +243,7 @@ impl PoolExporter {
                             Self::rollback_device_label(path, original_label, &mut write_labels);
                     }
                     return Err(ExportError::LabelWriteFailed {
-                        device_path: device_config.path.clone(),
+                        device_path,
                         reason: format!("{e:?}"),
                     });
                 }
@@ -204,12 +254,8 @@ impl PoolExporter {
         Ok(())
     }
 
-    /// Read the current label from a device, or return an empty label template.
-    fn read_existing_label(
-        device_path: &Path,
-        pool_guid: [u8; 16],
-        device_index: u32,
-    ) -> std::result::Result<PoolLabelV1, ExportError> {
+    /// Read the current label from a device.
+    fn read_existing_label(device_path: &Path) -> std::result::Result<PoolLabelV1, ExportError> {
         let _metadata = fs::metadata(device_path)
             .map_err(|e| ExportError::IoError(format!("stat {}: {e}", device_path.display())))?;
 
@@ -219,35 +265,12 @@ impl PoolExporter {
             device_path.to_path_buf()
         };
 
-        // Try to read label from the label file/file.
+        // An absent label cannot authorize an export transition. In
+        // particular, do not synthesize an ACTIVE label from caller input.
         if !label_path.exists() {
-            // Return a default template.
-            return Ok(PoolLabelV1 {
-                magic: crate::pool_label::POOL_LABEL_MAGIC,
-                version: 1,
-                pool_guid,
-                device_guid: [0u8; 16],
-                pool_name_len: 0,
-                pool_name: [0u8; 255],
-                pool_state: LabelPoolState::Active,
-                commit_group: 0,
-                label_commit_group: 0,
-                device_index,
-                topology_generation: 0,
-                device_count: 0,
-                device_class: LabelDeviceClass::Hdd,
-                device_capacity_bytes: 0,
-                system_area_pointer: 0,
-                system_area_size: 0,
-                features_incompat: 0,
-                features_ro_compat: 0,
-                features_compat: 0,
-                device_health: 0,
-                device_read_errors: 0,
-                device_write_errors: 0,
-                device_checksum_errors: 0,
-                redundancy_policy: PoolRedundancyPolicy::default(),
-                checksum: [0u8; 32],
+            return Err(ExportError::LabelValidationFailed {
+                device_path: device_path.to_path_buf(),
+                reason: "pool label is missing".to_string(),
             });
         }
 
@@ -261,10 +284,73 @@ impl PoolExporter {
         file.read_exact(&mut buf)
             .map_err(|e| ExportError::IoError(format!("read {}: {e}", label_path.display())))?;
 
-        decode_label(&buf).map_err(|e| ExportError::LabelWriteFailed {
+        decode_label(&buf).map_err(|e| ExportError::LabelValidationFailed {
             device_path: device_path.to_path_buf(),
             reason: format!("decode: {e:?}"),
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn validate_export_label(
+        device_path: &Path,
+        label: &PoolLabelV1,
+        pool_guid: [u8; 16],
+        device_guid: [u8; 16],
+        pool_name: &str,
+        device_index: u32,
+        device_count: u32,
+        topology_generation: Option<u64>,
+    ) -> std::result::Result<(), ExportError> {
+        let invalid = |reason: String| ExportError::LabelValidationFailed {
+            device_path: device_path.to_path_buf(),
+            reason,
+        };
+
+        if label.pool_state != LabelPoolState::Active {
+            return Err(invalid(format!(
+                "expected ACTIVE pool state, found {}",
+                label.pool_state
+            )));
+        }
+        if pool_guid == [0u8; 16] || label.pool_guid != pool_guid {
+            return Err(invalid(
+                "pool GUID does not match export authority".to_string(),
+            ));
+        }
+        if device_guid == [0u8; 16] || label.device_guid != device_guid {
+            return Err(invalid(
+                "device GUID does not match export topology".to_string(),
+            ));
+        }
+        if pool_name.trim().is_empty() || label.pool_name_str() != pool_name {
+            return Err(invalid(
+                "pool name does not match export authority".to_string(),
+            ));
+        }
+        if label.device_index != device_index {
+            return Err(invalid(format!(
+                "device index {} does not match expected {device_index}",
+                label.device_index
+            )));
+        }
+        if label.device_count != device_count {
+            return Err(invalid(format!(
+                "label device count {} does not match expected {device_count}",
+                label.device_count
+            )));
+        }
+        if label.device_capacity_bytes == 0 {
+            return Err(invalid("device capacity evidence is missing".to_string()));
+        }
+        if label.topology_generation == 0
+            || topology_generation.is_some_and(|expected| expected != label.topology_generation)
+        {
+            return Err(invalid(
+                "topology generation evidence is missing or inconsistent".to_string(),
+            ));
+        }
+
+        Ok(())
     }
 
     /// Write both label copies (offset 0 and offset POOL_LABEL_SIZE) to a device.
@@ -496,7 +582,7 @@ impl ExportOrchestrator {
             .iter()
             .enumerate()
             .map(|(index, config)| {
-                PoolExporter::read_existing_label(&config.path, self.pool_guid, index as u32)
+                PoolExporter::read_existing_label(&config.path)
                     .ok()
                     .filter(|label| {
                         label.device_capacity_bytes > 0
@@ -735,7 +821,9 @@ impl ExportOrchestrator {
 mod tests {
     use super::*;
     use crate::device::{DeviceBacking, DeviceClass, DeviceConfig, DeviceKind};
-    use crate::pool_label::{seal_label, PoolLabelV1, POOL_LABEL_MAGIC};
+    use crate::pool_label::{
+        seal_label, LabelDeviceClass, PoolLabelV1, PoolRedundancyPolicy, POOL_LABEL_MAGIC,
+    };
     use crate::pool_lifecycle_evidence::PoolLifecycleOutcome;
 
     #[test]
@@ -936,6 +1024,99 @@ mod tests {
     }
 
     #[test]
+    fn export_preflight_refuses_missing_label_without_mutating_peers() {
+        let first_path = unique_export_path("preflight-first");
+        let missing_path = unique_export_path("preflight-missing");
+        let pool_guid = [0x90; 16];
+        let device_guids = [[0x10; 16], [0x20; 16]];
+
+        write_export_label_with_device_count(
+            &first_path,
+            pool_guid,
+            device_guids[0],
+            0,
+            1024 * 1024 * 1024,
+            7,
+            2,
+        );
+        std::fs::create_dir_all(&missing_path).unwrap();
+
+        let configs = [
+            export_device_config(first_path.clone()),
+            export_device_config(missing_path.clone()),
+        ];
+        let result = PoolExporter::export_pool(&configs, pool_guid, &device_guids, "testpool", 12);
+
+        match result {
+            Err(ExportError::LabelValidationFailed {
+                device_path,
+                reason,
+            }) => {
+                assert_eq!(device_path, missing_path);
+                assert!(reason.contains("missing"));
+            }
+            other => panic!("expected missing-label refusal, got {other:?}"),
+        }
+        let first = PoolExporter::read_existing_label(&first_path).unwrap();
+        assert_eq!(first.pool_state, LabelPoolState::Active);
+        assert!(!missing_path.join(".tidefs_label").exists());
+
+        let _ = std::fs::remove_dir_all(first_path);
+        let _ = std::fs::remove_dir_all(missing_path);
+    }
+
+    #[test]
+    fn export_preflight_refuses_foreign_label_without_mutating_peers() {
+        let first_path = unique_export_path("preflight-authorized");
+        let foreign_path = unique_export_path("preflight-foreign");
+        let pool_guid = [0x91; 16];
+        let device_guids = [[0x11; 16], [0x22; 16]];
+
+        write_export_label_with_device_count(
+            &first_path,
+            pool_guid,
+            device_guids[0],
+            0,
+            1024 * 1024 * 1024,
+            7,
+            2,
+        );
+        write_export_label_with_device_count(
+            &foreign_path,
+            [0x92; 16],
+            device_guids[1],
+            1,
+            1024 * 1024 * 1024,
+            7,
+            2,
+        );
+
+        let configs = [
+            export_device_config(first_path.clone()),
+            export_device_config(foreign_path.clone()),
+        ];
+        let result = PoolExporter::export_pool(&configs, pool_guid, &device_guids, "testpool", 12);
+
+        match result {
+            Err(ExportError::LabelValidationFailed {
+                device_path,
+                reason,
+            }) => {
+                assert_eq!(device_path, foreign_path);
+                assert!(reason.contains("pool GUID"));
+            }
+            other => panic!("expected foreign-label refusal, got {other:?}"),
+        }
+        let first = PoolExporter::read_existing_label(&first_path).unwrap();
+        let foreign = PoolExporter::read_existing_label(&foreign_path).unwrap();
+        assert_eq!(first.pool_state, LabelPoolState::Active);
+        assert_eq!(foreign.pool_state, LabelPoolState::Active);
+
+        let _ = std::fs::remove_dir_all(first_path);
+        let _ = std::fs::remove_dir_all(foreign_path);
+    }
+
+    #[test]
     fn export_failure_restores_each_device_original_label() {
         let first_path = unique_export_path("rollback-first");
         let failed_path = unique_export_path("rollback-failed");
@@ -972,6 +1153,7 @@ mod tests {
             &configs,
             pool_guid,
             &device_guids,
+            "testpool",
             12,
             move |path, label| {
                 if path == injected_failure_path.as_path()
@@ -986,13 +1168,13 @@ mod tests {
 
         assert!(matches!(result, Err(ExportError::LabelWriteFailed { .. })));
 
-        let first = PoolExporter::read_existing_label(&first_path, pool_guid, 0).unwrap();
+        let first = PoolExporter::read_existing_label(&first_path).unwrap();
         assert_eq!(first.pool_state, LabelPoolState::Active);
         assert_eq!(first.device_guid, device_guids[0]);
         assert_eq!(first.device_index, 0);
         assert_eq!(first.device_capacity_bytes, first_capacity);
 
-        let failed = PoolExporter::read_existing_label(&failed_path, pool_guid, 1).unwrap();
+        let failed = PoolExporter::read_existing_label(&failed_path).unwrap();
         assert_eq!(failed.pool_state, LabelPoolState::Active);
         assert_eq!(failed.device_guid, device_guids[1]);
         assert_eq!(failed.device_index, 1);
@@ -1898,6 +2080,7 @@ mod tests {
             label.topology_generation = 1;
             label.device_count = 1;
             label.device_index = 0;
+            label.device_capacity_bytes = 1024 * 1024 * 1024;
             let sealed = seal_label(label).unwrap();
             let mut buf = [0u8; POOL_LABEL_V1_WIRE_SIZE];
             encode_label(&sealed, &mut buf).unwrap();
