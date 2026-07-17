@@ -2921,6 +2921,13 @@ impl WriteCacheReconciliationGates {
         self.stripe(ino).lock().unwrap()
     }
 
+    fn lock_all(&self) -> Vec<std::sync::MutexGuard<'_, ()>> {
+        self.stripes
+            .iter()
+            .map(|stripe| stripe.lock().unwrap())
+            .collect()
+    }
+
     #[cfg(test)]
     fn try_lock(&self, ino: u64) -> std::sync::TryLockResult<std::sync::MutexGuard<'_, ()>> {
         self.stripe(ino).try_lock()
@@ -8024,6 +8031,10 @@ impl FuseVfsAdapter {
             }
             Err(errno) => return Err(errno),
         };
+        // Keep the lower flush and every dirty-projection cleanup ordered
+        // with writes for this inode. Otherwise a write can start after the
+        // engine flush and have its newly dirty mirror cleared below.
+        let write_cache_reconciliation_guard = self.write_cache_reconciliation.lock(ino);
 
         // Delegate writeback and engine.flush() through the
         // local-filesystem dispatch layer via PageCacheDirtyFlush.  This
@@ -8061,6 +8072,7 @@ impl FuseVfsAdapter {
         if let Some(ref tracker) = self.writeback_range_tracker {
             tracker.lock().unwrap().flush_inode(InodeId::new(ino));
         }
+        drop(write_cache_reconciliation_guard);
 
         // Release POSIX locks owned by this lock_owner after flush
         // completes.  Per FUSE protocol, close() releases locks; flush()
@@ -8116,6 +8128,10 @@ impl FuseVfsAdapter {
         if self.read_only {
             return Err(Errno::EROFS);
         }
+        // A file barrier may clear dirty page-cache and tracker projections.
+        // Serialize that completion with the same-inode write and mirror
+        // reconciliation that created those projections.
+        let _write_cache_reconciliation_guard = self.write_cache_reconciliation.lock(ino);
         // Phase 1: Writeback dirty pages through the local-filesystem
         // dispatch layer via PageCacheDirtyFlush.  This bridges the adapter
         // daemon's PageCache mirror into the DirtyFlush contract while
@@ -8269,6 +8285,7 @@ impl FuseVfsAdapter {
         fh: u64,
         datasync: bool,
     ) -> Result<(), Errno> {
+        let _write_cache_reconciliation_guard = self.write_cache_reconciliation.lock(ino);
         let e = self.engine.lock().unwrap();
         let handle = self.resolve_dir_handle(ino, fh, ctx, &**e)?;
 
@@ -8315,6 +8332,9 @@ impl FuseVfsAdapter {
     /// and does not require a file handle.
     pub fn dispatch_syncfs(&self, ctx: &RequestCtx) -> Result<(), Errno> {
         let _start = std::time::Instant::now();
+        // syncfs is the mount-wide barrier, so take every bounded stripe in
+        // stable order before clearing any inode's dirty projections.
+        let _write_cache_reconciliation_guards = self.write_cache_reconciliation.lock_all();
         let e = self.engine.lock().unwrap();
 
         // Phase 1: drain all dirty page-cache pages across all inodes
@@ -38929,6 +38949,7 @@ mod tests {
         write_result: Result<u32, Errno>,
         write_observer: Option<Arc<dyn Fn() + Send + Sync>>,
         flush_result: Result<(), Errno>,
+        flush_observer: Option<Arc<dyn Fn() + Send + Sync>>,
         create_result: Result<(InodeAttr, EngineFileHandle), Errno>,
         mkdir_result: Result<InodeAttr, Errno>,
     }
@@ -38945,6 +38966,7 @@ mod tests {
                 write_result: Err(Errno::ENOSYS),
                 write_observer: None,
                 flush_result: Err(Errno::ENOSYS),
+                flush_observer: None,
                 create_result: Err(Errno::ENOSYS),
                 mkdir_result: Err(Errno::ENOSYS),
             }
@@ -39041,6 +39063,16 @@ mod tests {
 
         fn with_flush_error(mut self, errno: Errno) -> Self {
             self.flush_result = Err(errno);
+            self
+        }
+
+        fn with_flush_ok(mut self) -> Self {
+            self.flush_result = Ok(());
+            self
+        }
+
+        fn with_flush_observer(mut self, observer: Arc<dyn Fn() + Send + Sync>) -> Self {
+            self.flush_observer = Some(observer);
             self
         }
 
@@ -39217,6 +39249,9 @@ mod tests {
             self.write_result
         }
         fn flush(&self, fh: &EngineFileHandle, ctx: &RequestCtx) -> Result<(), Errno> {
+            if let Some(observer) = self.flush_observer.as_ref() {
+                observer();
+            }
             self.flush_result
         }
         fn fsync(
@@ -43177,6 +43212,40 @@ mod tests {
         assert_eq!(written, 4);
         assert!(observed_getattrs.load(Ordering::Relaxed) >= 1);
         assert_eq!(observed_writes.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn flush_dispatch_holds_cache_reconciliation_gate_for_inode() {
+        let gates = Arc::new(WriteCacheReconciliationGates::default());
+        let observed_flushes = Arc::new(AtomicU64::new(0));
+        let observed_flushes_from_engine = Arc::clone(&observed_flushes);
+        let gates_from_engine = Arc::clone(&gates);
+        let engine = AclMockEngine::new()
+            .with_root(1)
+            .with_attr(0, 0, 0o666)
+            .with_no_acl()
+            .with_open_ok()
+            .with_flush_ok()
+            .with_flush_observer(Arc::new(move || {
+                assert!(matches!(
+                    gates_from_engine.try_lock(1),
+                    Err(std::sync::TryLockError::WouldBlock)
+                ));
+                assert!(gates_from_engine.try_lock(2).is_ok());
+                observed_flushes_from_engine.fetch_add(1, Ordering::Relaxed);
+            }));
+        let mut adapter = FuseVfsAdapter::new(Box::new(engine)).expect("create adapter");
+        adapter.write_cache_reconciliation = Arc::clone(&gates);
+        let ctx = root_ctx();
+        let open = adapter
+            .dispatch_open_entry(&ctx, 1, libc::O_RDWR as u32)
+            .expect("open writable file");
+
+        adapter
+            .dispatch_flush(&ctx, 1, open.adapter_fh, 0)
+            .expect("flush through ordered reconciliation gate");
+
+        assert_eq!(observed_flushes.load(Ordering::Relaxed), 1);
     }
 
     #[test]
