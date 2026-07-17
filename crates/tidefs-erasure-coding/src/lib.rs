@@ -301,6 +301,7 @@ fn valid_receipt_stripe_width(config: &StripeConfig) -> Option<usize> {
     if config.data_shards == 0 || config.parity_shards == 0 || config.shard_len == 0 {
         return None;
     }
+    config.data_shards.checked_mul(config.shard_len)?;
     config
         .data_shards
         .checked_add(config.parity_shards)

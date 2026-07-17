@@ -266,6 +266,7 @@ fn receipt_helpers_reject_invalid_configs_before_coding() {
         config(1, 1, 0),
         config(255, 1, 8),
         config(usize::MAX, 1, 8),
+        config(2, 1, usize::MAX),
     ] {
         assert_eq!(
             encode_receipt_stripe(&c, b"receipt").unwrap_err(),
