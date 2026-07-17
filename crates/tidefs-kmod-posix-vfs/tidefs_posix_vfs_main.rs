@@ -368,16 +368,26 @@ impl KernelEngine {
 
     /// Get or create the xattr store for the given inode, returning its index.
 
-    fn get_or_create_xattr_store_idx(&self, ino: u64) -> usize {
+    fn get_or_create_xattr_store_idx(
+        &self,
+        ino: u64,
+    ) -> core::result::Result<usize, crate::tidefs_kmod_bridge::kernel_types::Errno> {
         if let Some(idx) = self.find_xattr_store_idx(ino) {
-            return idx;
+            return Ok(idx);
         }
 
         let mut stores = self.xattr_stores.borrow_mut();
-
+        let idx = stores.len();
+        // KmodVec drops allocation errors, so verify capacity before using idx.
+        stores.reserve(1);
+        if stores.capacity().saturating_sub(idx) < 1 {
+            return Err(crate::tidefs_kmod_bridge::kernel_types::Errno::ENOMEM);
+        }
         stores.push((ino, crate::tidefs_kmod_bridge::kernel_types::KmodVec::new()));
-
-        stores.len() - 1
+        if stores.len() != idx.saturating_add(1) {
+            return Err(crate::tidefs_kmod_bridge::kernel_types::Errno::ENOMEM);
+        }
+        Ok(idx)
     }
 
     fn normalize_advisory_lock(
@@ -6460,8 +6470,14 @@ impl crate::tidefs_kmod_bridge::kernel_types::VfsEngine for KernelEngine {
             let entries = &stores[idx].1;
             for (entry_name, value) in entries.iter() {
                 if **entry_name == *name {
-                    let mut result = crate::tidefs_kmod_bridge::kernel_types::KmodVec::new();
+                    let mut result =
+                        crate::tidefs_kmod_bridge::kernel_types::KmodVec::with_capacity(
+                            value.len(),
+                        );
                     result.extend_from_slice(&*value);
+                    if result.len() != value.len() {
+                        return Err(crate::tidefs_kmod_bridge::kernel_types::Errno::ENOMEM);
+                    }
                     return Ok(result);
                 }
             }
@@ -6493,7 +6509,7 @@ impl crate::tidefs_kmod_bridge::kernel_types::VfsEngine for KernelEngine {
             return Err(crate::tidefs_kmod_bridge::kernel_types::Errno::EINVAL);
         }
         let ino = inode.get();
-        let idx = self.get_or_create_xattr_store_idx(ino);
+        let idx = self.get_or_create_xattr_store_idx(ino)?;
         let mut stores = self.xattr_stores.borrow_mut();
         let entries = &mut stores[idx].1;
         let exists = entries.iter().any(|(n, _)| **n == *name);
@@ -6502,18 +6518,41 @@ impl crate::tidefs_kmod_bridge::kernel_types::VfsEngine for KernelEngine {
             2 if !exists => return Err(crate::tidefs_kmod_bridge::kernel_types::Errno::ENODATA),
             _ => {}
         }
+
+        const SETXATTR_INTENT_FIXED_LEN: usize = 1 + 8 + 1 + 1 + 4;
+        let expected_intent_len = SETXATTR_INTENT_FIXED_LEN + name.len() + value.len();
+        if expected_intent_len > crate::intent_record::MAX_INTENT_ENTRY_SIZE {
+            return Err(crate::tidefs_kmod_bridge::kernel_types::Errno::E2BIG);
+        }
+
+        let mut name_vec =
+            crate::tidefs_kmod_bridge::kernel_types::KmodVec::with_capacity(name.len());
+        name_vec.extend_from_slice(name);
+        let mut value_vec =
+            crate::tidefs_kmod_bridge::kernel_types::KmodVec::with_capacity(value.len());
+        value_vec.extend_from_slice(value);
+        if name_vec.len() != name.len() || value_vec.len() != value.len() {
+            return Err(crate::tidefs_kmod_bridge::kernel_types::Errno::ENOMEM);
+        }
+        if !exists {
+            entries.reserve(1);
+            if entries.capacity().saturating_sub(entries.len()) < 1 {
+                return Err(crate::tidefs_kmod_bridge::kernel_types::Errno::ENOMEM);
+            }
+        }
+
+        let ns_byte = Self::xattr_namespace_byte(name);
+        let entry = crate::intent_record::encode_setxattr_intent(inode, ns_byte, name, value);
+        if entry.as_bytes().len() != expected_intent_len {
+            return Err(crate::tidefs_kmod_bridge::kernel_types::Errno::ENOMEM);
+        }
+        // Record the write-ahead intent before making the xattr visible.
+        self.record_intent_entry(entry.as_bytes())?;
+
         if exists {
             entries.retain(|(n, _)| **n != *name);
         }
-        let mut name_vec = crate::tidefs_kmod_bridge::kernel_types::KmodVec::new();
-        name_vec.extend_from_slice(name);
-        let mut value_vec = crate::tidefs_kmod_bridge::kernel_types::KmodVec::new();
-        value_vec.extend_from_slice(value);
         entries.push((name_vec, value_vec));
-        // Record intent for crash recovery replay.
-        let ns_byte = Self::xattr_namespace_byte(name);
-        let entry = crate::intent_record::encode_setxattr_intent(inode, ns_byte, name, value);
-        self.record_intent_entry(entry.as_bytes())?;
         Ok(())
     }
     fn listxattr(
@@ -6525,19 +6564,28 @@ impl crate::tidefs_kmod_bridge::kernel_types::VfsEngine for KernelEngine {
         crate::tidefs_kmod_bridge::kernel_types::Errno,
     > {
         let ino = inode.get();
-        let mut result = crate::tidefs_kmod_bridge::kernel_types::KmodVec::new();
         if let Some(idx) = self.find_xattr_store_idx(ino) {
             let stores = self.xattr_stores.borrow();
             let entries = &stores[idx].1;
+            let mut required_len = 0usize;
             for (entry_name, _value) in entries.iter() {
-                let name_slice = &*entry_name;
-                for &b in name_slice {
-                    result.push(b);
-                }
+                required_len = required_len
+                    .checked_add(entry_name.len())
+                    .and_then(|len| len.checked_add(1))
+                    .ok_or(crate::tidefs_kmod_bridge::kernel_types::Errno::EOVERFLOW)?;
+            }
+            let mut result =
+                crate::tidefs_kmod_bridge::kernel_types::KmodVec::with_capacity(required_len);
+            for (entry_name, _value) in entries.iter() {
+                result.extend_from_slice(&*entry_name);
                 result.push(0u8);
             }
+            if result.len() != required_len {
+                return Err(crate::tidefs_kmod_bridge::kernel_types::Errno::ENOMEM);
+            }
+            return Ok(result);
         }
-        Ok(result)
+        Ok(crate::tidefs_kmod_bridge::kernel_types::KmodVec::new())
     }
     fn removexattr(
         &self,
@@ -6553,13 +6601,17 @@ impl crate::tidefs_kmod_bridge::kernel_types::VfsEngine for KernelEngine {
         if let Some(idx) = self.find_xattr_store_idx(ino) {
             let mut stores = self.xattr_stores.borrow_mut();
             let entries = &mut stores[idx].1;
-            let before = entries.len();
-            entries.retain(|(n, _)| **n != *name);
-            if entries.len() < before {
-                // Record intent for crash recovery replay.
+            if entries.iter().any(|(entry_name, _)| **entry_name == *name) {
+                const REMOVEXATTR_INTENT_FIXED_LEN: usize = 1 + 8 + 1 + 1;
+                let expected_intent_len = REMOVEXATTR_INTENT_FIXED_LEN + name.len();
                 let ns_byte = Self::xattr_namespace_byte(name);
                 let entry = crate::intent_record::encode_removexattr_intent(inode, ns_byte, name);
+                if entry.as_bytes().len() != expected_intent_len {
+                    return Err(crate::tidefs_kmod_bridge::kernel_types::Errno::ENOMEM);
+                }
+                // Record the write-ahead intent before making removal visible.
                 self.record_intent_entry(entry.as_bytes())?;
+                entries.retain(|(entry_name, _)| **entry_name != *name);
                 return Ok(());
             }
         }
@@ -9426,8 +9478,8 @@ pub extern "C" fn tidefs_posix_vfs_engine_getxattr(
     if name_ptr.is_null() || out_len.is_null() {
         return -(crate::tidefs_kmod_bridge::kernel_types::Errno::EINVAL.0 as core::ffi::c_int);
     }
-    if name_len == 0 || name_len > 256 {
-        return -(crate::tidefs_kmod_bridge::kernel_types::Errno::EINVAL.0 as core::ffi::c_int);
+    if let Err(e) = validate_kernel_name_len(name_len) {
+        return -(e.0 as core::ffi::c_int);
     }
 
     let inode_id = crate::tidefs_kmod_bridge::kernel_types::InodeId::new(ino);
@@ -9552,8 +9604,8 @@ pub extern "C" fn tidefs_posix_vfs_engine_setxattr(
     if name_ptr.is_null() || value_ptr.is_null() {
         return -(crate::tidefs_kmod_bridge::kernel_types::Errno::EINVAL.0 as core::ffi::c_int);
     }
-    if name_len == 0 || name_len > 256 {
-        return -(crate::tidefs_kmod_bridge::kernel_types::Errno::EINVAL.0 as core::ffi::c_int);
+    if let Err(e) = validate_kernel_name_len(name_len) {
+        return -(e.0 as core::ffi::c_int);
     }
 
     let inode_id = crate::tidefs_kmod_bridge::kernel_types::InodeId::new(ino);
@@ -9600,8 +9652,8 @@ pub extern "C" fn tidefs_posix_vfs_engine_removexattr(
     if name_ptr.is_null() {
         return -(crate::tidefs_kmod_bridge::kernel_types::Errno::EINVAL.0 as core::ffi::c_int);
     }
-    if name_len == 0 || name_len > 256 {
-        return -(crate::tidefs_kmod_bridge::kernel_types::Errno::EINVAL.0 as core::ffi::c_int);
+    if let Err(e) = validate_kernel_name_len(name_len) {
+        return -(e.0 as core::ffi::c_int);
     }
 
     let inode_id = crate::tidefs_kmod_bridge::kernel_types::InodeId::new(ino);

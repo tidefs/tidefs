@@ -43,6 +43,7 @@
 #include <linux/refcount.h>
 #include <linux/uaccess.h>
 #include <linux/xattr.h>
+#include <linux/posix_acl.h>
 #include <linux/posix_acl_xattr.h>
 #include <linux/exportfs.h>
 #include <linux/splice.h>
@@ -2210,6 +2211,32 @@ static struct dentry *tidefs_posix_vfs_lookup(struct inode *dir,
 	return d_splice_alias(inode, dentry);
 }
 
+/*
+ * SB_POSIXACL defers umask handling to filesystem ACL creation. TideFS
+ * refuses default ACL creation while inheritance is unsupported. Refuse
+ * child creation when persisted state already contains a default ACL;
+ * otherwise use the ordinary umask path.
+ */
+static int tidefs_posix_vfs_prepare_create_mode(struct inode *dir,
+						 umode_t *mode)
+{
+	struct tidefs_posix_vfs_mount *ctx = dir->i_sb->s_fs_info;
+	struct posix_acl *default_acl;
+
+	if (ctx && ctx->engine_backed) {
+		default_acl = get_inode_acl(dir, ACL_TYPE_DEFAULT);
+		if (IS_ERR(default_acl))
+			return PTR_ERR(default_acl);
+		if (default_acl) {
+			posix_acl_release(default_acl);
+			return -EOPNOTSUPP;
+		}
+	}
+
+	*mode &= ~current_umask();
+	return 0;
+}
+
 static int tidefs_posix_vfs_create(struct mnt_idmap *idmap,
 				   struct inode *dir, struct dentry *dentry,
 				   umode_t mode, bool excl)
@@ -2217,6 +2244,11 @@ static int tidefs_posix_vfs_create(struct mnt_idmap *idmap,
 	struct tidefs_posix_vfs_kernel_pool_core *pool;
 	struct inode *inode;
 	u64 ino;
+	int acl_ret;
+
+	acl_ret = tidefs_posix_vfs_prepare_create_mode(dir, &mode);
+	if (acl_ret)
+		return acl_ret;
 
 	/* Refuse write operations on read-only mounts. */
 	{
@@ -2341,6 +2373,10 @@ static int tidefs_posix_vfs_tmpfile(struct mnt_idmap *idmap,
 	u64 out_generation = 0;
 	int ret, pool_idx;
 
+	ret = tidefs_posix_vfs_prepare_create_mode(dir, &mode);
+	if (ret)
+		return ret;
+
 	pool = tidefs_posix_vfs_pool_core_from_sb(dir->i_sb);
 	if (IS_ERR(pool))
 		return PTR_ERR(pool);
@@ -2390,6 +2426,11 @@ static struct dentry *tidefs_posix_vfs_mkdir(struct mnt_idmap *idmap,
 	struct tidefs_posix_vfs_kernel_pool_core *pool;
 	struct inode *inode;
 	u64 ino;
+	int acl_ret;
+
+	acl_ret = tidefs_posix_vfs_prepare_create_mode(dir, &mode);
+	if (acl_ret)
+		return ERR_PTR(acl_ret);
 
 	/* Refuse write operations on read-only mounts. */
 	{
@@ -2842,6 +2883,10 @@ static int tidefs_posix_vfs_mknod(struct mnt_idmap *idmap,
 	unsigned int out_mode = 0;
 	unsigned long long out_generation = 0;
 	int ret;
+
+	ret = tidefs_posix_vfs_prepare_create_mode(dir, &mode);
+	if (ret)
+		return ret;
 
 	/* Refuse write operations on read-only mounts. */
 	{
@@ -4616,24 +4661,28 @@ static const struct xattr_handler *tidefs_posix_vfs_xattr_handlers[] = {
 /*
  * POSIX ACL callbacks (REL-KVFS-010).
  *
- * get_acl reads the ACL xattr via the engine and decodes it with the
+ * get_inode_acl reads the ACL xattr via the engine and decodes it with the
  * kernel's posix_acl_from_xattr.  When no ACL is stored (ENODATA),
  * returns NULL so the VFS falls back to mode bits.
- * set_acl encodes via posix_acl_to_xattr and stores via engine setxattr
- * (returns EOPNOTSUPP until kernel xattr persistence is wired via #6270).
+ * set_acl stores or removes the ACL xattr via the engine. Access ACL updates
+ * use posix_acl_update_mode so the stored ACL and inode mode stay synchronized
+ * with Linux filesystem semantics.
  */
-static struct posix_acl *tidefs_posix_vfs_get_acl(struct mnt_idmap *idmap,
-					    struct dentry *dentry, int type)
+static struct posix_acl *tidefs_posix_vfs_get_inode_acl(struct inode *inode,
+						  int type, bool rcu)
 {
 	struct tidefs_posix_vfs_kernel_pool_core *pool;
 	const char *xattr_name;
 	unsigned char *value_buf = NULL;
 	struct posix_acl *acl = NULL;
 	unsigned int out_len = 0;
-	unsigned int buf_size = 4096;
+	unsigned int buf_size;
 	int ret;
 
-	pool = tidefs_posix_vfs_pool_core_from_sb(d_inode(dentry)->i_sb);
+	if (rcu)
+		return ERR_PTR(-ECHILD);
+
+	pool = tidefs_posix_vfs_pool_core_from_sb(inode->i_sb);
 	if (IS_ERR(pool))
 		return ERR_CAST(pool);
 
@@ -4644,33 +4693,53 @@ static struct posix_acl *tidefs_posix_vfs_get_acl(struct mnt_idmap *idmap,
 	else
 		return ERR_PTR(-EINVAL);
 
+	/* Size the buffer from the stored xattr instead of imposing a 4K limit. */
+	ret = tidefs_posix_vfs_engine_getxattr(
+		inode->i_ino,
+		(const unsigned char *)xattr_name,
+		(unsigned int)strlen(xattr_name),
+		NULL, 0,
+		&out_len);
+	if (ret == -ENODATA)
+		return NULL;  /* no ACL stored: fall back to mode bits */
+	if (ret < 0)
+		return ERR_PTR(ret);
+	if (!out_len)
+		return ERR_PTR(-EINVAL);
+	if (out_len > XATTR_SIZE_MAX)
+		return ERR_PTR(-E2BIG);
+
+	buf_size = out_len;
 	value_buf = kmalloc(buf_size, GFP_KERNEL);
 	if (!value_buf)
 		return ERR_PTR(-ENOMEM);
 
 	/* Read the binary ACL xattr from the engine. */
 	ret = tidefs_posix_vfs_engine_getxattr(
-		d_inode(dentry)->i_ino,
+		inode->i_ino,
 		(const unsigned char *)xattr_name,
 		(unsigned int)strlen(xattr_name),
 		value_buf, buf_size,
 		&out_len);
-	if (ret == -ENODATA || ret == -ENOSYS) {
+	if (ret == -ENODATA) {
 		kfree(value_buf);
-		return NULL;  /* no ACL stored: fall back to mode bits */
+		return NULL;
 	}
 	if (ret < 0) {
 		kfree(value_buf);
 		return ERR_PTR(ret);
 	}
-	if (out_len == 0 || out_len > buf_size) {
+	if (!out_len || out_len > buf_size) {
 		kfree(value_buf);
-		return NULL;
+		return ERR_PTR(-EINVAL);
 	}
 
 	/* Decode using the kernel's built-in POSIX ACL xattr parser. */
 	acl = posix_acl_from_xattr(&init_user_ns, value_buf, out_len);
 	kfree(value_buf);
+	/* posix_acl_chmod() treats EOPNOTSUPP as if no ACL were stored. */
+	if (acl == ERR_PTR(-EOPNOTSUPP))
+		acl = ERR_PTR(-EINVAL);
 	return acl;
 }
 
@@ -4678,42 +4747,76 @@ static int tidefs_posix_vfs_set_acl(struct mnt_idmap *idmap,
 				     struct dentry *dentry,
 				     struct posix_acl *acl, int type)
 {
+	struct inode *inode = d_inode(dentry);
 	struct tidefs_posix_vfs_kernel_pool_core *pool;
+	struct posix_acl *acl_to_store = acl;
 	const char *xattr_name;
+	umode_t mode = inode->i_mode;
+	unsigned int out_mode = 0;
+	unsigned int out_uid = 0;
+	unsigned int out_gid = 0;
+	unsigned long long out_size = 0;
+	unsigned long long out_blocks = 0;
+	unsigned int setattr_valid = TIDEFS_POSIX_VFS_FATTR_CTIME;
+	struct timespec64 ctime;
+	bool xattr_changed = false;
+	bool mode_changed = false;
 	void *value = NULL;
 	size_t size = 0;
 	int ret;
 
-	pool = tidefs_posix_vfs_pool_core_from_sb(d_inode(dentry)->i_sb);
+	pool = tidefs_posix_vfs_pool_core_from_sb(inode->i_sb);
 	if (IS_ERR(pool))
 		return PTR_ERR(pool);
 
 	if (type == ACL_TYPE_ACCESS)
 		xattr_name = XATTR_NAME_POSIX_ACL_ACCESS;
-	else if (type == ACL_TYPE_DEFAULT)
+	else if (type == ACL_TYPE_DEFAULT) {
+		if (!S_ISDIR(inode->i_mode))
+			return acl ? -EACCES : 0;
+		/*
+		 * A stored default ACL is only meaningful when create and mkdir
+		 * inherit it. Refuse raw-only default ACL storage while this mounted
+		 * adapter cannot apply that inheritance contract.
+		 */
+		if (acl)
+			return -EOPNOTSUPP;
 		xattr_name = XATTR_NAME_POSIX_ACL_DEFAULT;
-	else
+	} else
 		return -EINVAL;
 
-	if (!acl) {
+	if (type == ACL_TYPE_ACCESS && acl) {
+		ret = posix_acl_update_mode(idmap, inode, &mode, &acl_to_store);
+		if (ret)
+			return ret;
+		mode_changed = mode != inode->i_mode;
+	}
+
+	if (!acl_to_store) {
 		/* Remove the ACL xattr. */
 		ret = tidefs_posix_vfs_engine_removexattr(
-			d_inode(dentry)->i_ino,
+			inode->i_ino,
 			(const unsigned char *)xattr_name,
 			(unsigned int)strlen(xattr_name));
 		if (ret == -ENOSYS)
-			return -EOPNOTSUPP;
-		return ret;
+			ret = -EOPNOTSUPP;
+		if (ret == -ENODATA)
+			ret = 0;
+		else if (!ret)
+			xattr_changed = true;
+		if (ret)
+			return ret;
+		goto sync_metadata;
 	}
 
 	/* Encode the ACL into binary xattr format. */
-	value = posix_acl_to_xattr(&init_user_ns, acl, &size, GFP_KERNEL);
-	if (IS_ERR(value))
-		return PTR_ERR(value);
+	value = posix_acl_to_xattr(&init_user_ns, acl_to_store, &size, GFP_KERNEL);
+	if (!value)
+		return -ENOMEM;
 
 	/* Store via the engine. */
 	ret = tidefs_posix_vfs_engine_setxattr(
-		d_inode(dentry)->i_ino,
+		inode->i_ino,
 		(const unsigned char *)xattr_name,
 		(unsigned int)strlen(xattr_name),
 		(const unsigned char *)value,
@@ -4721,8 +4824,36 @@ static int tidefs_posix_vfs_set_acl(struct mnt_idmap *idmap,
 		0);
 	kfree(value);
 	if (ret == -ENOSYS)
-		return -EOPNOTSUPP;
-	return ret;
+		ret = -EOPNOTSUPP;
+	if (ret)
+		return ret;
+	xattr_changed = true;
+
+sync_metadata:
+	/* Keep the authoritative xattr cached even if metadata sync below fails. */
+	set_cached_acl(inode, type, acl_to_store);
+	if (!xattr_changed && !mode_changed)
+		return 0;
+	if (mode_changed)
+		setattr_valid |= TIDEFS_POSIX_VFS_FATTR_MODE;
+	ctime = current_time(inode);
+	ret = tidefs_posix_vfs_engine_setattr(
+		inode->i_ino,
+		setattr_valid,
+		mode,
+		0, 0, 0, 0, 0,
+		tidefs_posix_vfs_timespec64_to_ns(ctime),
+		&out_mode, &out_uid, &out_gid, &out_size, &out_blocks);
+	if (ret == -ENOSYS)
+		ret = -EOPNOTSUPP;
+	if (ret)
+		return ret;
+	if (mode_changed)
+		inode->i_mode = out_mode;
+	inode_set_ctime_to_ts(inode, ctime);
+	mark_inode_dirty(inode);
+
+	return 0;
 }
 
 
@@ -4752,6 +4883,7 @@ static int tidefs_posix_vfs_setattr(struct mnt_idmap *idmap,
 		unsigned int out_gid = 0;
 		unsigned long long out_size = 0;
 		unsigned long long out_blocks = 0;
+		bool mode_update;
 		bool size_update;
 		bool invalidate_locked = false;
 		loff_t old_size = 0;
@@ -4761,6 +4893,7 @@ static int tidefs_posix_vfs_setattr(struct mnt_idmap *idmap,
 		if (ret)
 			return ret;
 
+		mode_update = (iattr->ia_valid & ATTR_MODE) != 0;
 		size_update = (iattr->ia_valid & ATTR_SIZE) != 0;
 
 		/*
@@ -4847,7 +4980,8 @@ static int tidefs_posix_vfs_setattr(struct mnt_idmap *idmap,
 		 * set to "now" and any bits we did not clear). */
 		setattr_copy(idmap, inode, iattr);
 		mark_inode_dirty(inode);
-		ret = 0;
+		ret = mode_update ?
+			posix_acl_chmod(idmap, dentry, inode->i_mode) : 0;
 out_invalidate_unlock:
 		if (invalidate_locked)
 			filemap_invalidate_unlock(inode->i_mapping);
@@ -4944,7 +5078,7 @@ static const struct inode_operations tidefs_posix_vfs_file_inode_operations = {
 	.getattr    = tidefs_posix_vfs_getattr,
 	.listxattr  = tidefs_posix_vfs_listxattr,
 	.permission = tidefs_posix_vfs_permission,
-	.get_acl    = tidefs_posix_vfs_get_acl,
+	.get_inode_acl = tidefs_posix_vfs_get_inode_acl,
 	.set_acl    = tidefs_posix_vfs_set_acl,
 	.link       = tidefs_posix_vfs_link,
 	.setattr    = tidefs_posix_vfs_setattr,
@@ -5675,7 +5809,7 @@ static const struct inode_operations tidefs_posix_vfs_dir_inode_operations = {
 	.getattr    = tidefs_posix_vfs_getattr,
 	.listxattr  = tidefs_posix_vfs_listxattr,
 	.permission = tidefs_posix_vfs_permission,
-	.get_acl    = tidefs_posix_vfs_get_acl,
+	.get_inode_acl = tidefs_posix_vfs_get_inode_acl,
 	.set_acl    = tidefs_posix_vfs_set_acl,
 	.lookup     = tidefs_posix_vfs_lookup,
 	.create = tidefs_posix_vfs_create,
@@ -7266,6 +7400,7 @@ static int tidefs_posix_vfs_fill_super_bdev(struct super_block *sb,
 	set_default_d_op(sb, &tidefs_posix_vfs_dentry_ops);
 	sb->s_export_op = &tidefs_posix_vfs_export_ops;
 	sb->s_xattr = tidefs_posix_vfs_xattr_handlers;
+	sb->s_flags |= SB_POSIXACL;
 	sb->s_time_gran = 1;
 
 	ret = tidefs_posix_vfs_activate_engine(ctx);
