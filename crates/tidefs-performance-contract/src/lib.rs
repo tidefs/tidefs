@@ -1288,6 +1288,52 @@ pub enum QueueAdmissionError<T> {
     },
 }
 
+/// Typed daemon observation for one mounted background-scrub source.
+///
+/// This record is evidence transport, not a product status or control
+/// protocol. A cycle is admitted only after the object-store scrub reports
+/// that a real scan ran; interval-gated polling attempts are not counted.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct ScrubRuntimeObservation {
+    pub schema_version: u8,
+    pub daemon_pid: u32,
+    pub cycles_admitted: u64,
+    pub records_verified: u64,
+    pub bytes_scanned: u64,
+    pub work_pending: bool,
+    pub throttle_count: u64,
+}
+
+impl ScrubRuntimeObservation {
+    pub const SCHEMA_VERSION: u8 = 1;
+
+    #[must_use]
+    pub const fn new(daemon_pid: u32) -> Self {
+        Self {
+            schema_version: Self::SCHEMA_VERSION,
+            daemon_pid,
+            cycles_admitted: 0,
+            records_verified: 0,
+            bytes_scanned: 0,
+            work_pending: false,
+            throttle_count: 0,
+        }
+    }
+
+    pub fn record_admitted_cycle(
+        &mut self,
+        records_verified: u64,
+        bytes_scanned: u64,
+        work_pending: bool,
+    ) {
+        self.cycles_admitted = self.cycles_admitted.saturating_add(1);
+        self.records_verified = self.records_verified.saturating_add(records_verified);
+        self.bytes_scanned = self.bytes_scanned.saturating_add(bytes_scanned);
+        self.work_pending = work_pending;
+    }
+}
+
 /// Deterministic foreground-read/scrub oracle.
 #[cfg(feature = "alloc")]
 pub mod oracle {
@@ -2046,5 +2092,22 @@ mod tests {
             outcome.scrub_deferred,
             config.scrub_units - ServiceCurve::SCRUB_BOUNDED_DEFAULT.queue_slots
         );
+    }
+
+    #[test]
+    fn scrub_runtime_observation_counts_only_admitted_cycles() {
+        let mut observation = ScrubRuntimeObservation::new(4242);
+        assert_eq!(observation.schema_version, 1);
+        assert_eq!(observation.cycles_admitted, 0);
+
+        observation.record_admitted_cycle(3, 4096, true);
+        observation.record_admitted_cycle(2, 2048, false);
+
+        assert_eq!(observation.daemon_pid, 4242);
+        assert_eq!(observation.cycles_admitted, 2);
+        assert_eq!(observation.records_verified, 5);
+        assert_eq!(observation.bytes_scanned, 6144);
+        assert!(!observation.work_pending);
+        assert_eq!(observation.throttle_count, 0);
     }
 }

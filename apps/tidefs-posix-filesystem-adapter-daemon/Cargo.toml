@@ -35,6 +35,7 @@ tidefs-permission = { workspace = true }
 tidefs-lock-service = { workspace = true }
 tidefs-posix-semantics = { workspace = true }
 tidefs-background-scheduler = { workspace = true }
+tidefs-performance-contract = { workspace = true, features = ["serde"] }
 tidefs-block-allocator = { workspace = true }
 tidefs-block-volume-adapter-core = { workspace = true }
 tidefs-local-object-store = { workspace = true }

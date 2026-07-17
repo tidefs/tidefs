@@ -36,6 +36,8 @@ pub struct MountHarness {
     child: Child,
     /// PID of the daemon process (cached before possible reap).
     daemon_pid: u32,
+    /// Validation-only typed scrub observation emitted by the mounted daemon.
+    scrub_runtime_observation_path: Option<PathBuf>,
 }
 
 // ── builder ────────────────────────────────────────────────────────
@@ -44,6 +46,7 @@ pub struct MountHarness {
 pub struct MountHarnessBuilder {
     daemon_bin: Option<PathBuf>,
     extra_args: Vec<String>,
+    scrub_runtime_observation: bool,
 }
 
 impl MountHarnessBuilder {
@@ -51,6 +54,7 @@ impl MountHarnessBuilder {
         Self {
             daemon_bin: None,
             extra_args: Vec::new(),
+            scrub_runtime_observation: false,
         }
     }
 
@@ -68,6 +72,13 @@ impl MountHarnessBuilder {
     /// Use this to pass FUSE mount options such as `-o allow_other`.
     pub fn extra_args(mut self, args: &[&str]) -> Self {
         self.extra_args = args.iter().map(|s| s.to_string()).collect();
+        self
+    }
+
+    /// Ask the daemon to emit the validation-only typed scrub observation
+    /// owned by issue #1792 into this harness's temporary directory.
+    pub fn scrub_runtime_observation(mut self) -> Self {
+        self.scrub_runtime_observation = true;
         self
     }
 
@@ -126,6 +137,12 @@ impl MountHarnessBuilder {
         for arg in &self.extra_args {
             cmd.arg(arg);
         }
+        let scrub_runtime_observation_path = self
+            .scrub_runtime_observation
+            .then(|| work_dir.path().join("scrub-runtime-observation.json"));
+        if let Some(path) = scrub_runtime_observation_path.as_deref() {
+            cmd.arg("--scrub-runtime-observation-artifact").arg(path);
+        }
 
         let mut child = cmd
             .spawn()
@@ -149,6 +166,7 @@ impl MountHarnessBuilder {
             mount_path,
             child,
             daemon_pid,
+            scrub_runtime_observation_path,
         })
     }
 }
@@ -219,6 +237,11 @@ impl MountHarness {
     /// PID of the daemon process.
     pub fn daemon_pid(&self) -> u32 {
         self.daemon_pid
+    }
+
+    /// Typed scrub observation path when requested through the builder.
+    pub fn scrub_runtime_observation_path(&self) -> Option<&Path> {
+        self.scrub_runtime_observation_path.as_deref()
     }
 
     // ── helpers ────────────────────────────────────────────────────

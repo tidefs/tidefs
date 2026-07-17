@@ -55,6 +55,7 @@ use tidefs_local_filesystem::{
     LocalFileSystemOpenConfig, LocalStorageAllocatorPolicy, RootAuthenticationKey,
     ROOT_AUTHENTICATION_ENV_VAR,
 };
+use tidefs_performance_contract::ScrubRuntimeObservation;
 #[cfg(feature = "receipt-demo")]
 use tidefs_schema_codec_posix_filesystem_adapter::CanonicalFixedWidth;
 #[cfg(feature = "receipt-demo")]
@@ -226,6 +227,19 @@ fn mount_vfs(config: MountVfsConfig) -> Result<(), String> {
     if snapshot_export && config.queue_depth_artifact.is_some() {
         return Err("--queue-depth-artifact is not supported for snapshot export mounts".into());
     }
+    if snapshot_export && config.scrub_runtime_observation_artifact.is_some() {
+        return Err(
+            "--scrub-runtime-observation-artifact is not supported for snapshot export mounts"
+                .into(),
+        );
+    }
+    if effective_mode.background_scrub_interval_secs == 0
+        && config.scrub_runtime_observation_artifact.is_some()
+    {
+        return Err(
+            "--scrub-runtime-observation-artifact requires --background-scrub-interval > 0".into(),
+        );
+    }
     use std::fs;
     use std::sync::{
         atomic::{AtomicBool, Ordering},
@@ -318,6 +332,7 @@ fn mount_vfs(config: MountVfsConfig) -> Result<(), String> {
     };
     let scrub_interval = effective_mode.background_scrub_interval_secs;
     let scrub_store_root = config.store_root.clone();
+    let scrub_runtime_observation_artifact = config.scrub_runtime_observation_artifact.clone();
 
     let open_config = LocalFileSystemOpenConfig {
         options: store_options,
@@ -648,6 +663,12 @@ fn mount_vfs(config: MountVfsConfig) -> Result<(), String> {
         };
         let root = scrub_store_root.clone();
         Some(std::thread::spawn(move || {
+            let mut runtime_observation = ScrubRuntimeObservation::new(std::process::id());
+            if let Some(path) = scrub_runtime_observation_artifact.as_deref() {
+                if let Err(error) = write_scrub_runtime_observation(path, &runtime_observation) {
+                    eprintln!("background-scrub: failed to write runtime observation: {error}");
+                }
+            }
             let mut scrub_store =
                 match tidefs_local_object_store::LocalObjectStore::open_with_options(
                     &root,
@@ -669,6 +690,26 @@ fn mount_vfs(config: MountVfsConfig) -> Result<(), String> {
                 std::thread::sleep(std::time::Duration::from_secs(10));
                 match scrub_store.run_background_scrub() {
                     Ok(report) => {
+                        let cycle_admitted = report.completed
+                            || report.segments_scanned > 0
+                            || report.records_verified > 0
+                            || report.bytes_scanned > 0;
+                        if cycle_admitted {
+                            runtime_observation.record_admitted_cycle(
+                                report.records_verified,
+                                report.bytes_scanned,
+                                !report.completed,
+                            );
+                            if let Some(path) = scrub_runtime_observation_artifact.as_deref() {
+                                if let Err(error) =
+                                    write_scrub_runtime_observation(path, &runtime_observation)
+                                {
+                                    eprintln!(
+                                        "background-scrub: failed to write runtime observation: {error}"
+                                    );
+                                }
+                            }
+                        }
                         if report.segments_scanned > 0 || report.records_verified > 0 {
                             tracing::info!(
                                 target: "tidefs.scrub",
@@ -826,6 +867,39 @@ fn mount_vfs(config: MountVfsConfig) -> Result<(), String> {
             .write_to_path(&msp_for_sig)
             .map_err(|e| format!("write clean mount-state: {e}"))?;
     }
+    Ok(())
+}
+
+fn write_scrub_runtime_observation(
+    path: &Path,
+    observation: &ScrubRuntimeObservation,
+) -> Result<(), String> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "create scrub runtime observation dir {}: {error}",
+                parent.display()
+            )
+        })?;
+    }
+    let bytes = serde_json::to_vec_pretty(observation)
+        .map_err(|error| format!("encode scrub runtime observation: {error}"))?;
+    let temp_path = path.with_extension(format!("tmp-{}", observation.daemon_pid));
+    std::fs::write(&temp_path, bytes).map_err(|error| {
+        format!(
+            "write scrub runtime observation temp file {}: {error}",
+            temp_path.display()
+        )
+    })?;
+    std::fs::rename(&temp_path, path).map_err(|error| {
+        format!(
+            "publish scrub runtime observation {}: {error}",
+            path.display()
+        )
+    })?;
     Ok(())
 }
 
@@ -991,6 +1065,9 @@ pub struct MountVfsConfig {
     pub fault_inject_corruption: Option<f64>,
     /// Optional JSON artifact path for mounted queue-depth evidence.
     pub queue_depth_artifact: Option<PathBuf>,
+    /// Optional validation-only JSON path for typed daemon scrub observations.
+    /// Issue #1792 owns graduation or removal of this evidence surface.
+    pub scrub_runtime_observation_artifact: Option<PathBuf>,
 }
 
 fn parse_mount_vfs_config(args: Vec<String>) -> Result<MountVfsConfig, String> {
@@ -1015,6 +1092,7 @@ fn parse_mount_vfs_config(args: Vec<String>) -> Result<MountVfsConfig, String> {
     let mut enable_repair_writeback = false;
     let mut fault_inject_corruption: Option<f64> = None;
     let mut queue_depth_artifact = None;
+    let mut scrub_runtime_observation_artifact = None;
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -1198,6 +1276,18 @@ fn parse_mount_vfs_config(args: Vec<String>) -> Result<MountVfsConfig, String> {
                     .expect("prefix checked");
                 queue_depth_artifact = Some(PathBuf::from(value));
             }
+            "--scrub-runtime-observation-artifact" => {
+                let val = iter
+                    .next()
+                    .ok_or("--scrub-runtime-observation-artifact requires a path argument")?;
+                scrub_runtime_observation_artifact = Some(PathBuf::from(val));
+            }
+            _ if arg.starts_with("--scrub-runtime-observation-artifact=") => {
+                let value = arg
+                    .strip_prefix("--scrub-runtime-observation-artifact=")
+                    .expect("prefix checked");
+                scrub_runtime_observation_artifact = Some(PathBuf::from(value));
+            }
             other => return Err(format!("unknown mount-vfs argument `{other}`")),
         }
     }
@@ -1230,6 +1320,7 @@ fn parse_mount_vfs_config(args: Vec<String>) -> Result<MountVfsConfig, String> {
         snapshot_name,
         fault_inject_corruption,
         queue_depth_artifact,
+        scrub_runtime_observation_artifact,
     })
 }
 
@@ -4170,10 +4261,13 @@ fn run_scrub_repair_smoke() -> Result<(), String> {
 
 fn print_help() {
     println!("tidefs-posix-filesystem-adapter-daemon");
-    println!("  mount-vfs --store <path> --mount <path> [--fs-name <name>] [--root-auth-key-hex <64 hex>] [--read-only] [--snapshot <name>] [--sync] [--writeback-cache] [--no-writeback-cache] [--content-capacity-bytes <bytes>] [--writeback-cache-timeout <seconds>] [--drain-timeout-secs <seconds>] [--background-scrub-interval <seconds>] [--queue-depth-artifact <path>]");
+    println!("  mount-vfs --store <path> --mount <path> [--fs-name <name>] [--root-auth-key-hex <64 hex>] [--read-only] [--snapshot <name>] [--sync] [--writeback-cache] [--no-writeback-cache] [--content-capacity-bytes <bytes>] [--writeback-cache-timeout <seconds>] [--drain-timeout-secs <seconds>] [--background-scrub-interval <seconds>] [--queue-depth-artifact <path>] [--scrub-runtime-observation-artifact <path>]");
     println!("    root auth key fallback env: {ROOT_AUTHENTICATION_ENV_VAR}");
     println!(
         "    --background-scrub-interval  seconds between scrub cycles (0 disables, default 0)"
+    );
+    println!(
+        "    --scrub-runtime-observation-artifact  validation-only typed scrub observation JSON (#1792)"
     );
     println!("    --writeback-cache            enable FUSE writeback-cache (opt-in, default: off)");
     println!(
@@ -4403,6 +4497,22 @@ mod tests {
         let config = parse_mount_vfs_config(args).expect("parse mount config");
 
         assert_eq!(config.background_scrub_interval_secs, 300);
+    }
+
+    #[test]
+    fn mount_vfs_config_accepts_scrub_runtime_observation_artifact() {
+        let mut args = required_mount_args();
+        args.push("--background-scrub-interval".to_string());
+        args.push("1".to_string());
+        args.push("--scrub-runtime-observation-artifact".to_string());
+        args.push("/tmp/tidefs-scrub-observation.json".to_string());
+
+        let config = parse_mount_vfs_config(args).expect("parse mount config");
+
+        assert_eq!(
+            config.scrub_runtime_observation_artifact.as_deref(),
+            Some(Path::new("/tmp/tidefs-scrub-observation.json"))
+        );
     }
 
     #[test]
