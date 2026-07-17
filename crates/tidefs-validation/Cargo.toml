@@ -25,6 +25,11 @@ required-features = ["receipt-bound-physical-reclaim"]
 name = "scrub_foreground_read_validation"
 path = "src/bin/scrub_foreground_read_validation.rs"
 
+[[bin]]
+name = "storage-intent-ack-fault-matrix-validation"
+path = "src/bin/storage_intent_ack_fault_matrix_validation.rs"
+required-features = ["ack-receipt-fault-matrix"]
+
 [features]
 default = []
 
@@ -60,6 +65,12 @@ cluster-placement-heal = ["dep:tidefs-cluster"]
 receipt-bound-physical-reclaim = [
     "dep:tidefs-reclaim",
     "dep:tidefs-segment-cleaner",
+]
+
+# QEMU raw-media and receipt-gate fault validation for acknowledgment honesty.
+ack-receipt-fault-matrix = [
+    "dep:tidefs-local-filesystem",
+    "dep:tidefs-storage-intent-core",
 ]
 
 # Full FUSE userspace POSIX validation: VfsEngine, all POSIX adapter workers,
@@ -101,6 +112,7 @@ full = [
     "transport",
     "cluster-placement-heal",
     "receipt-bound-physical-reclaim",
+    "ack-receipt-fault-matrix",
 ]
 
 [dependencies]
@@ -127,6 +139,7 @@ tidefs-types-space-accounting-core = { workspace = true, optional = true }
 tidefs-frame = { workspace = true, optional = true }
 tidefs-object-io = { workspace = true, optional = true }
 tidefs-local-filesystem = { workspace = true, optional = true }
+tidefs-storage-intent-core = { workspace = true, optional = true }
 tidefs-intent-log = { workspace = true, optional = true }
 tidefs-reclaim = { workspace = true, optional = true }
 tidefs-reclaim-queue-core = { workspace = true }

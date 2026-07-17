@@ -1,0 +1,16 @@
+{
+  "manifest_version": 2,
+  "claim_id": "storage.intent.ack_receipt_honesty.v1",
+  "evidence_class": "storage-intent-ack-fault-matrix",
+  "validation_tier": "qemu-guest",
+  "scope": "Linux 7.0 QEMU three-boot raw-media acknowledgment fault matrix covering kill-before-ack, crash-after-ack, stale media, under-quorum refusal, and hidden durable-to-volatile downgrade detection; fault-only scope, not mounted or distributed runtime; run=29570719618/1 ref=45af538c0b49bc3be61a191f21e342feeb119402 kernel=7.0.0",
+  "artifact_path": "validation/artifacts/storage-intent/ack-receipt-fault-matrix.json",
+  "content_digest": "blake3:0f5d11a683637ef00682eed2a2a1ca8cf231e1fd40cd65d9a2871022c8019ec3",
+  "run_id": "29570719618/1",
+  "source_ref": "45af538c0b49bc3be61a191f21e342feeb119402",
+  "outcome": "pass",
+  "residual_risk": "This QEMU row exercises raw virtio-blk persistence and receipt evaluation; it does not exercise mounted write, fsync, fdatasync, O_DSYNC, mmap, namespace, or fsyncdir runtime. The under-quorum row injects the typed receipt-gate condition inside the guest; it is not multi-process distributed quorum execution. The acknowledgment honesty claim remains blocked until mounted-runtime and claims-gate-review evidence also exists; this artifact does not strengthen successor, comparator, release, or product wording.",
+  "source": "qemu-smoke-storage-intent-ack-fault-matrix-v1",
+  "generated_at": "2026-07-17T09:39:08Z",
+  "blocking_issues": []
+}

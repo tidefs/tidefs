@@ -21,6 +21,7 @@ on:
           - fuse-inode-metadata-validation
           - qemu-ublk-smoke
           - qemu-ublk-qid-tag-runtime
+          - storage-intent-ack-fault-matrix
           - receipt-bound-reclaim-runtime
           - scrub-foreground-read-runtime
           - all
@@ -87,6 +88,15 @@ jobs:
             name: qemu-ublk-qid-tag-runtime
             command: nix run .#qemu-ublk-qid-tag-runtime -- --timeout 3600 --validation-dir /tmp/tidefs-validation/ublk-qid-tag-runtime
             output_dir: /tmp/tidefs-validation/ublk-qid-tag-runtime
+          - id: storage-intent-ack-fault-matrix
+            name: storage-intent-ack-fault-matrix
+            command: >-
+              TIDEFS_ACK_FAULT_RUN_ID="${{ github.run_id }}/${{ github.run_attempt }}"
+              TIDEFS_ACK_FAULT_SOURCE_REF="${{ github.sha }}"
+              nix run .#storage-intent-ack-fault-matrix --
+              --timeout 600
+              --validation-dir /tmp/tidefs-validation/storage-intent-ack-fault-matrix
+            output_dir: /tmp/tidefs-validation/storage-intent-ack-fault-matrix
           - id: receipt-bound-reclaim-runtime
             name: receipt-bound-reclaim-runtime
             command: nix develop .#ci --command cargo run --locked -p tidefs-validation --features receipt-bound-physical-reclaim --bin receipt-bound-reclaim-validation -- --row receipt-bound-obsolete-location-trim --output-dir /tmp/tidefs-validation/receipt-bound-reclaim-runtime

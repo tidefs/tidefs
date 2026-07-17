@@ -149,8 +149,9 @@ may use non-secret repository variables for scheduling gates, such as
   `kernel-mmap-validation`, `kernel-teardown-validation`,
   `kernel-no-daemon-teardown-validation`, `two-node-carrier-validation`,
   `fuse-vm-test`, `fuse-inode-metadata-validation`, `qemu-ublk-smoke`,
-  `qemu-ublk-qid-tag-runtime`, `receipt-bound-reclaim-runtime`,
-  `scrub-foreground-read-runtime`, and `all`; `.github/workflows/qemu-smoke.yml`
+  `qemu-ublk-qid-tag-runtime`, `storage-intent-ack-fault-matrix`,
+  `receipt-bound-reclaim-runtime`, `scrub-foreground-read-runtime`, and `all`;
+  `.github/workflows/qemu-smoke.yml`
   remains the exact source for matrix commands, output directories, artifact
   upload names, and retention. Except for the standing `master` smoke target,
   non-default targets and `all` are manual validation tiers; dispatch them only
@@ -169,6 +170,17 @@ may use non-secret repository variables for scheduling gates, such as
   state-transfer scenario, and uploads `carrier-report.json`, `qemu.log`,
   `summary.json`, and environment metadata under
   `two-node-carrier-validation`.
+- `Storage-intent acknowledgment fault matrix` is a manual `QEMU Smoke`
+  target for the fault-only portion of
+  `storage.intent.ack_receipt_honesty.v1`. It boots Linux 7.0 three times
+  against one raw virtio-blk image, sends `SIGKILL` only to the exact QEMU
+  processes started by the harness before and after acknowledgment
+  publication, then verifies kill-before-ack, crash-after-ack, stale-media,
+  under-quorum, and hidden durable-to-volatile downgrade rows. It emits the
+  promotable fault-matrix JSON plus a version-2 evidence manifest. The
+  under-quorum row is a receipt-gate injection, not multi-process distributed
+  quorum execution; the target is not mounted-runtime evidence and does not
+  validate product, release, successor, or comparator wording.
 - `Geo RPO WAN TCP` is a manual self-hosted workflow for the bounded
   `storage.intent.geo_async_rpo.v1` runtime row. It runs
   `tidefs-geo-rpo-wan-tcp-validation` from `tidefs-two-node-harness`, starts
