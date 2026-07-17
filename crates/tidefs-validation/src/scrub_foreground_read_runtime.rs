@@ -82,6 +82,7 @@ impl ScrubForegroundReadRuntimeEvidence {
                         &self.foreground_read,
                         &self.scrub_activity,
                         &self.service_curve,
+                        self.mount.as_ref().map(|mount| mount.daemon_pid),
                     )
                 {
                     Ok(())
@@ -184,6 +185,7 @@ pub struct ScrubActivityEvidence {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonScrubRuntimeObservation {
+    pub daemon_pid: u32,
     pub admitted_units: u32,
     pub pending_units_before_read: u32,
     pub pending_units_after_read: u32,
@@ -357,7 +359,12 @@ pub fn run_scrub_foreground_read_runtime(command: String) -> ScrubForegroundRead
     let scrub_activity = ScrubActivityWindow::begin();
     let foreground_read = run_foreground_read(&harness, &service_curve);
     let scrub_model = scrub_activity.finish(&service_curve, foreground_read.workload_ran);
-    let outcome = classify_runtime_outcome(&foreground_read, &scrub_model, &service_curve);
+    let outcome = classify_runtime_outcome(
+        &foreground_read,
+        &scrub_model,
+        &service_curve,
+        Some(mount.daemon_pid),
+    );
 
     base_evidence(BaseEvidenceInput {
         outcome,
@@ -411,12 +418,18 @@ fn evidence_manifest_scope(evidence: &ScrubForegroundReadRuntimeEvidence) -> Str
     let admission = &evidence.admission_state;
     let service_curve = &evidence.service_curve;
     let daemon_runtime = evidence.scrub_activity.daemon_runtime.as_ref();
+    let mounted_daemon_pid = evidence.mount.as_ref().map(|mount| mount.daemon_pid);
+    let daemon_scrub_pid_matches_mount = daemon_runtime.is_some_and(|observation| {
+        daemon_scrub_observation_matches_mount(observation, mounted_daemon_pid)
+    });
     format!(
         concat!(
             "row={} supported_claims={} non_claims={} outcome={:?} artifact={} ",
             "claim_status_change={} product_wording_change={} environment_refused={} ",
             "scrub_activity_observation_tier={} ",
             "daemon_scrub_runtime_observed={} daemon_scrub_admitted_units={} ",
+            "mounted_daemon_pid={} daemon_scrub_observation_pid={} ",
+            "daemon_scrub_pid_matches_mount={} ",
             "daemon_scrub_pending_units_before_read={} ",
             "daemon_scrub_pending_units_after_read={} daemon_scrub_throttle_count={} ",
             "foreground_read_admitted_by_service_curve={} ",
@@ -440,6 +453,12 @@ fn evidence_manifest_scope(evidence: &ScrubForegroundReadRuntimeEvidence) -> Str
         evidence.scrub_activity.observation_tier.label(),
         daemon_runtime.is_some(),
         daemon_runtime.map_or(0, |observation| observation.admitted_units),
+        mounted_daemon_pid.map_or_else(|| "none".to_string(), |pid| pid.to_string()),
+        daemon_runtime.map_or_else(
+            || "none".to_string(),
+            |observation| observation.daemon_pid.to_string()
+        ),
+        daemon_scrub_pid_matches_mount,
         daemon_runtime.map_or(0, |observation| observation.pending_units_before_read),
         daemon_runtime.map_or(0, |observation| observation.pending_units_after_read),
         daemon_runtime.map_or(0, |observation| observation.throttle_count),
@@ -484,8 +503,14 @@ fn base_evidence(input: BaseEvidenceInput) -> ScrubForegroundReadRuntimeEvidence
         service_curve,
     } = input;
     let workload_ran = foreground_read.workload_ran;
+    let mounted_daemon_pid = mount.as_ref().map(|mount| mount.daemon_pid);
     let passed = outcome == ValidationStatus::Pass
-        && scrub_read_isolation_passed(&foreground_read, &scrub_activity, &service_curve);
+        && scrub_read_isolation_passed(
+            &foreground_read,
+            &scrub_activity,
+            &service_curve,
+            mounted_daemon_pid,
+        );
     let admission_state = build_admission_state(&environment, &scrub_activity, &service_curve);
     ScrubForegroundReadRuntimeEvidence {
         manifest_version: 1,
@@ -784,13 +809,15 @@ fn scrub_read_isolation_passed(
     foreground_read: &ForegroundReadEvidence,
     scrub_activity: &ScrubActivityEvidence,
     service_curve: &ServiceCurveEvidence,
+    mounted_daemon_pid: Option<u32>,
 ) -> bool {
     let daemon_runtime_observed =
         scrub_activity
             .daemon_runtime
             .as_ref()
             .is_some_and(|observation| {
-                observation.admitted_units > 0
+                daemon_scrub_observation_matches_mount(observation, mounted_daemon_pid)
+                    && observation.admitted_units > 0
                     && observation.pending_units_before_read > 0
                     && observation.pending_units_after_read > 0
                     && observation.throttle_count > 0
@@ -808,14 +835,27 @@ fn scrub_read_isolation_passed(
         && !service_curve.unscheduled_foreground_read_within_bound
 }
 
+fn daemon_scrub_observation_matches_mount(
+    observation: &DaemonScrubRuntimeObservation,
+    mounted_daemon_pid: Option<u32>,
+) -> bool {
+    mounted_daemon_pid == Some(observation.daemon_pid)
+}
+
 fn classify_runtime_outcome(
     foreground_read: &ForegroundReadEvidence,
     scrub_activity: &ScrubActivityEvidence,
     service_curve: &ServiceCurveEvidence,
+    mounted_daemon_pid: Option<u32>,
 ) -> ValidationStatus {
     if !foreground_read.passed {
         ValidationStatus::ProductFail
-    } else if scrub_read_isolation_passed(foreground_read, scrub_activity, service_curve) {
+    } else if scrub_read_isolation_passed(
+        foreground_read,
+        scrub_activity,
+        service_curve,
+        mounted_daemon_pid,
+    ) {
         ValidationStatus::Pass
     } else {
         ValidationStatus::HarnessFail
@@ -1110,6 +1150,11 @@ mod tests {
         assert!(manifest
             .scope
             .contains("scrub_activity_observation_tier=harness-only"));
+        assert!(manifest.scope.contains("mounted_daemon_pid=none"));
+        assert!(manifest.scope.contains("daemon_scrub_observation_pid=none"));
+        assert!(manifest
+            .scope
+            .contains("daemon_scrub_pid_matches_mount=false"));
         assert_eq!(manifest.blocking_issues.len(), 1);
         assert_eq!(
             manifest.blocking_issues[0].repo.as_deref(),
@@ -1123,32 +1168,101 @@ mod tests {
     }
 
     #[test]
-    fn runtime_outcome_requires_daemon_observations_not_tier_label() {
+    fn runtime_outcome_requires_observations_from_mounted_daemon() {
+        const MOUNTED_DAEMON_PID: u32 = 4242;
+
         let service_curve = build_service_curve();
         let foreground_read = completed_foreground_read(&service_curve);
         let mut scrub_activity = scrub_activity_for_completed_read(&service_curve);
 
         assert_eq!(
-            classify_runtime_outcome(&foreground_read, &scrub_activity, &service_curve),
+            classify_runtime_outcome(
+                &foreground_read,
+                &scrub_activity,
+                &service_curve,
+                Some(MOUNTED_DAEMON_PID),
+            ),
             ValidationStatus::HarnessFail
         );
 
         scrub_activity.observation_tier = ValidationTier::MountedUserspace;
         assert_eq!(
-            classify_runtime_outcome(&foreground_read, &scrub_activity, &service_curve),
+            classify_runtime_outcome(
+                &foreground_read,
+                &scrub_activity,
+                &service_curve,
+                Some(MOUNTED_DAEMON_PID),
+            ),
             ValidationStatus::HarnessFail
         );
 
         scrub_activity.daemon_runtime = Some(DaemonScrubRuntimeObservation {
+            daemon_pid: MOUNTED_DAEMON_PID + 1,
             admitted_units: 1,
             pending_units_before_read: 4,
             pending_units_after_read: 3,
             throttle_count: 1,
         });
         assert_eq!(
-            classify_runtime_outcome(&foreground_read, &scrub_activity, &service_curve),
+            classify_runtime_outcome(
+                &foreground_read,
+                &scrub_activity,
+                &service_curve,
+                Some(MOUNTED_DAEMON_PID),
+            ),
+            ValidationStatus::HarnessFail
+        );
+
+        scrub_activity
+            .daemon_runtime
+            .as_mut()
+            .expect("daemon runtime observation")
+            .daemon_pid = MOUNTED_DAEMON_PID;
+        assert_eq!(
+            classify_runtime_outcome(
+                &foreground_read,
+                &scrub_activity,
+                &service_curve,
+                Some(MOUNTED_DAEMON_PID),
+            ),
             ValidationStatus::Pass
         );
+
+        let evidence = base_evidence(BaseEvidenceInput {
+            outcome: ValidationStatus::Pass,
+            command: "scrub_foreground_read_validation --row scrub-foreground-read-runtime"
+                .to_string(),
+            generated_at: "2026-07-17T03:45:11Z".to_string(),
+            run_id: "test-run/1".to_string(),
+            source_ref: "test-sha".to_string(),
+            environment: RuntimeEnvironmentEvidence {
+                host: "linux x86_64 kernel=test".to_string(),
+                dev_fuse_present: true,
+                daemon_bin: Some(
+                    "/nix/store/test/bin/tidefs-posix-filesystem-adapter-daemon".into(),
+                ),
+                environment_refusal: None,
+            },
+            mount: Some(MountRuntimeEvidence {
+                daemon_pid: MOUNTED_DAEMON_PID,
+                mount_path: "/tmp/tidefs/mnt".to_string(),
+                store_path: "/tmp/tidefs/store".to_string(),
+                background_scrub_interval_secs: BACKGROUND_SCRUB_INTERVAL_SECS,
+                statfs_type_hex: format!("0x{FUSE_SUPER_MAGIC:x}"),
+            }),
+            foreground_read: foreground_read.clone(),
+            scrub_activity: scrub_activity.clone(),
+            service_curve: service_curve.clone(),
+        });
+        assert!(evidence.passed);
+        assert!(evidence.assert_no_product_or_harness_failure().is_ok());
+        let manifest = build_evidence_manifest(&evidence, b"scrub evidence");
+        assert!(manifest
+            .scope
+            .contains("mounted_daemon_pid=4242 daemon_scrub_observation_pid=4242"));
+        assert!(manifest
+            .scope
+            .contains("daemon_scrub_pid_matches_mount=true"));
 
         let mut failed_read = foreground_read;
         failed_read
@@ -1156,7 +1270,12 @@ mod tests {
             .push("mounted read returned wrong data".into());
         failed_read.passed = false;
         assert_eq!(
-            classify_runtime_outcome(&failed_read, &scrub_activity, &service_curve),
+            classify_runtime_outcome(
+                &failed_read,
+                &scrub_activity,
+                &service_curve,
+                Some(MOUNTED_DAEMON_PID),
+            ),
             ValidationStatus::ProductFail
         );
     }
@@ -1417,6 +1536,7 @@ mod tests {
             &completed_foreground_read(&service_curve),
             &scrub_activity,
             &service_curve,
+            None,
         ));
     }
 }
