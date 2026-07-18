@@ -3108,6 +3108,11 @@ impl VfsLocalFileSystem {
                     );
                 }
 
+                if let Err(err) = snap_net_validate_sender_authority(&stream.encoded) {
+                    let _ = transport.close_session(session_id, SessionCloseReason::LocalShutdown);
+                    return live_admin_error(1, err);
+                }
+
                 let auth_key = self.fs.borrow().root_authentication_key.as_bytes32();
                 let request = match build_snap_push_message(&stream.encoded, &auth_key) {
                     Ok(request) => request,
@@ -4126,6 +4131,24 @@ fn parse_snap_net_response(data: &[u8]) -> Result<String, String> {
             "snapshot send: unknown remote response kind {other}: {message}"
         )),
     }
+}
+
+fn snap_net_validate_sender_authority(encoded: &[u8]) -> Result<(), String> {
+    let (header, _) = tidefs_send_stream::SendStreamHeader::decode(encoded)
+        .map_err(|err| format!("snapshot send: target VFSSEND2 sender-authority header: {err}"))?;
+    let Some(authority) = header.sender_authority.distributed() else {
+        return Err(
+            "snapshot send: target-address send requires source-authorized VFSSEND2 sender authority; export is local-only"
+                .to_string(),
+        );
+    };
+    if authority.sender_pool_uuid != header.source_pool_id {
+        return Err(
+            "snapshot send: target VFSSEND2 sender authority does not match the stream source pool"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 fn live_snapshot_send_plan(
@@ -6989,6 +7012,46 @@ mod tests {
         assert!(parse_snap_net_response(&ack).is_err_and(
             |err| err.starts_with("snapshot send: remote response message is not UTF-8:")
         ));
+    }
+
+    #[test]
+    fn snap_net_sender_authority_requires_matching_distributed_header() {
+        let source_pool_id = [0x11; 16];
+        let header =
+            tidefs_send_stream::SendStreamHeader::new(source_pool_id, [0x22; 16], [0x33; 16]);
+        let local_only = header.encode().expect("encode local-only header");
+        assert_eq!(
+            snap_net_validate_sender_authority(&local_only),
+            Err(
+                "snapshot send: target-address send requires source-authorized VFSSEND2 sender authority; export is local-only"
+                    .to_string()
+            )
+        );
+
+        let mismatched = header
+            .clone()
+            .with_sender_authority(
+                tidefs_send_stream::SenderAuthority::new([0x44; 16], 7, 11)
+                    .expect("mismatched sender authority"),
+            )
+            .encode()
+            .expect("encode mismatched header");
+        assert_eq!(
+            snap_net_validate_sender_authority(&mismatched),
+            Err(
+                "snapshot send: target VFSSEND2 sender authority does not match the stream source pool"
+                    .to_string()
+            )
+        );
+
+        let distributed = header
+            .with_sender_authority(
+                tidefs_send_stream::SenderAuthority::new(source_pool_id, 7, 11)
+                    .expect("matching sender authority"),
+            )
+            .encode()
+            .expect("encode distributed header");
+        assert_eq!(snap_net_validate_sender_authority(&distributed), Ok(()));
     }
 
     #[test]
