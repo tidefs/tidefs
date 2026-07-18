@@ -443,15 +443,7 @@ impl DeviceManager {
             source: std::io::Error::other(format!("{e:?}")),
         })?;
 
-        let label_path = if request.device_config.path.is_dir() {
-            request.device_config.path.join(".tidefs_label")
-        } else {
-            request.device_config.path.clone()
-        };
-
-        // Write both copies.
-        Self::write_label_bytes(&label_path, &buf, 0)?;
-        Self::write_label_bytes(&label_path, &buf, POOL_LABEL_SIZE as u64)?;
+        Self::write_label_copies(request.device_config, &buf, capacity)?;
 
         Ok(())
     }
@@ -521,14 +513,7 @@ impl DeviceManager {
                 source: std::io::Error::other(format!("{e:?}")),
             })?;
 
-            let label_path = if config.path.is_dir() {
-                config.path.join(".tidefs_label")
-            } else {
-                config.path.clone()
-            };
-
-            Self::write_label_bytes(&label_path, &buf, 0)?;
-            Self::write_label_bytes(&label_path, &buf, POOL_LABEL_SIZE as u64)?;
+            Self::write_label_copies(config, &buf, capacity)?;
         }
 
         Ok(())
@@ -599,14 +584,7 @@ impl DeviceManager {
                 source: std::io::Error::other(format!("{e:?}")),
             })?;
 
-            let label_path = if config.path.is_dir() {
-                config.path.join(".tidefs_label")
-            } else {
-                config.path.clone()
-            };
-
-            Self::write_label_bytes(&label_path, &buf, 0)?;
-            Self::write_label_bytes(&label_path, &buf, POOL_LABEL_SIZE as u64)?;
+            Self::write_label_copies(config, &buf, capacity)?;
         }
 
         Ok(())
@@ -742,6 +720,42 @@ impl DeviceManager {
         })?;
 
         Ok(())
+    }
+
+    /// Write the primary and canonical backup copies of a device label.
+    fn write_label_copies(
+        config: &DeviceConfig,
+        data: &[u8; POOL_LABEL_V1_WIRE_SIZE],
+        capacity: u64,
+    ) -> Result<()> {
+        let label_path = if config.path.is_dir() {
+            config.path.join(".tidefs_label")
+        } else {
+            config.path.clone()
+        };
+        let backup_offset = Self::backup_label_offset(config, capacity)?;
+
+        Self::write_label_bytes(&label_path, data, 0)?;
+        Self::write_label_bytes(&label_path, data, backup_offset)
+    }
+
+    fn backup_label_offset(config: &DeviceConfig, capacity: u64) -> Result<u64> {
+        if config.backing == DeviceBacking::DirectoryObjectStoreCompat {
+            return Ok(POOL_LABEL_SIZE as u64);
+        }
+
+        let label_area_bytes = POOL_LABEL_SIZE as u64;
+        capacity
+            .checked_sub(label_area_bytes)
+            .filter(|offset| *offset >= label_area_bytes)
+            .ok_or_else(|| StoreError::Io {
+                operation: "dm_label_backup_offset",
+                path: config.path.clone(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("device capacity {capacity} cannot hold two pool label areas"),
+                ),
+            })
     }
 
     fn map_device_class(class: DeviceDeviceClass) -> LabelDeviceClass {
@@ -953,6 +967,30 @@ mod tests {
         }
     }
 
+    fn make_byte_device_config(path: &Path) -> DeviceConfig {
+        DeviceConfig {
+            media_class: Default::default(),
+            path: path.to_path_buf(),
+            backing: DeviceBacking::RegularFileDev,
+            class: DeviceClass::Data,
+            kind: DeviceKind::Block {
+                path: path.to_path_buf(),
+            },
+            compression: None,
+            encryption: None,
+        }
+    }
+
+    fn read_label_at(path: &Path, offset: u64) -> PoolLabelV1 {
+        use std::io::Read;
+
+        let mut file = fs::File::open(path).unwrap();
+        file.seek(SeekFrom::Start(offset)).unwrap();
+        let mut buf = [0u8; POOL_LABEL_V1_WIRE_SIZE];
+        file.read_exact(&mut buf).unwrap();
+        decode_label(&buf).unwrap()
+    }
+
     #[test]
     fn add_device_writes_labels() {
         let dir1 = temp_dir("dm-add-1");
@@ -1036,6 +1074,70 @@ mod tests {
 
         let _ = fs::remove_dir_all(&dir1);
         let _ = fs::remove_dir_all(&dir2);
+    }
+
+    #[test]
+    fn add_device_updates_canonical_tail_labels_on_byte_devices() {
+        let root = temp_dir("dm-add-byte-tail");
+        let existing_path = root.join("existing.img");
+        let new_path = root.join("new.img");
+        let capacity = 4 * POOL_LABEL_SIZE as u64;
+        let tail_offset = capacity - POOL_LABEL_SIZE as u64;
+
+        for path in [&existing_path, &new_path] {
+            let file = fs::File::create(path).unwrap();
+            file.set_len(capacity).unwrap();
+        }
+
+        let existing_config = make_byte_device_config(&existing_path);
+        let new_config = make_byte_device_config(&new_path);
+        let pool_guid = [0x31u8; 16];
+        let existing_guid = [0x32u8; 16];
+        let new_guid = [0x33u8; 16];
+
+        DeviceManager::write_single_device_label(LabelWriteRequest {
+            device_config: &existing_config,
+            pool_guid,
+            device_guid: existing_guid,
+            pool_name: "byte-tail",
+            pool_state: crate::pool_label::LabelPoolState::Active,
+            commit_group: 1,
+            label_commit_group: 1,
+            device_index: 0,
+            topology_generation: 1,
+            device_count: 1,
+        })
+        .unwrap();
+
+        DeviceManager::add_device(
+            std::slice::from_ref(&existing_config),
+            &new_config,
+            pool_guid,
+            &[existing_guid],
+            new_guid,
+            "byte-tail",
+            7,
+        )
+        .unwrap();
+
+        for (path, device_guid, device_index) in
+            [(&existing_path, existing_guid, 0), (&new_path, new_guid, 1)]
+        {
+            let head = read_label_at(path, 0);
+            let tail = read_label_at(path, tail_offset);
+
+            for label in [head, tail] {
+                assert_eq!(label.pool_guid, pool_guid);
+                assert_eq!(label.device_guid, device_guid);
+                assert_eq!(label.device_index, device_index);
+                assert_eq!(label.device_count, 2);
+                assert_eq!(label.topology_generation, 8);
+                assert_eq!(label.device_capacity_bytes, capacity);
+            }
+            assert_eq!(fs::metadata(path).unwrap().len(), capacity);
+        }
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
