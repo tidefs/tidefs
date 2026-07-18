@@ -8088,11 +8088,14 @@ impl FuseVfsAdapter {
             .unwrap()
             .clear_until_boundary(ino, worker_dirty_boundary);
         self.sync_namespace_attrs_from_engine(ctx, ino, None);
-        self.writeback_cache.lock().unwrap().mark_clean(ino);
         if let Some(ref writeback_page_cache) = self.writeback_page_cache {
             writeback_page_cache.clear_dirty_for_inode(ino);
         }
         self.write_page_cache.clear_dirty_for_inode(ino);
+        // Flush does not retire adapter dirty_state; fsync owns the
+        // block-volume copy and durability boundary. Publish the inode-level
+        // reclaim projection clean only when no other dirty owner remains.
+        self.reconcile_writeback_inode_cache_after_authoritative_range(ino);
         self.writeback_cache_stats.lock().unwrap().record_flush();
         drop(write_cache_reconciliation_guard);
 
@@ -20161,6 +20164,16 @@ mod tests {
                 "dirty_state persists after dispatch_flush (fsync clears it)"
             );
         }
+        assert_eq!(
+            fixture
+                .adapter
+                .writeback_cache
+                .lock()
+                .unwrap()
+                .is_dirty(inode.get()),
+            Some(true),
+            "flush must not publish the inode reclaim projection clean while dirty_state remains"
+        );
 
         // Handle must still be resolvable after flush.
         assert!(fixture
