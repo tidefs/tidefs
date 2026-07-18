@@ -7,8 +7,8 @@ usage() {
 Usage:
   tidefs-scheduler-dirty-debt-runtime --output-dir DIR [OPTIONS]
   tidefs-scheduler-dirty-debt-runtime --input-artifact FILE \
-    --input-summary FILE --output-dir DIR --run-id ID --source-ref SHA \
-    --generated-at TIMESTAMP
+    --input-summary FILE --input-manifest FILE --output-dir DIR \
+    --run-id ID --source-ref SHA --generated-at TIMESTAMP
 
 Run the existing Linux 7.0 FUSE QEMU smoke row and promote its raw local
 queue-depth snapshot into the scheduler dirty-debt evidence shape. The
@@ -18,13 +18,15 @@ that keep scheduler.dirty_debt.no_hidden.v1 blocked.
 
 By default this command launches scripts/tidefs-fuse-vm-test. The input mode
 promotes files downloaded from a completed QEMU Smoke fuse-vm-test run without
-launching another VM; explicit run provenance is mandatory in that mode.
+launching another VM; a digest-matched version-2 runtime manifest must bind
+the promoted input to its run provenance.
 
 Options:
   --output-dir DIR       Write queue-depth-runtime.json and its manifest here
   --timeout SECONDS      QEMU timeout in run mode (default: 900)
   --input-artifact FILE  Existing raw queue-depth-runtime.json from QEMU Smoke
   --input-summary FILE   Matching fuse-vm-test.json from the same QEMU run
+  --input-manifest FILE  Version-2 manifest that names and digests the input
   --run-id ID            Concrete run id (default: GitHub run or local QEMU id)
   --source-ref SHA       Exact 40-hex source commit (default: checkout HEAD)
   --generated-at TIME    UTC RFC3339 timestamp (default: current UTC time)
@@ -38,12 +40,28 @@ fail() {
   exit 2
 }
 
+content_digest_for_file() {
+  local file="$1"
+  local digest_hex
+
+  if command -v b3sum >/dev/null 2>&1; then
+    digest_hex="$(b3sum "$file" | awk '{print $1}')"
+  else
+    digest_hex="$(
+      nix shell --inputs-from "$repo" nixpkgs#b3sum \
+        --command b3sum "$file" | awk '{print $1}'
+    )"
+  fi
+  printf 'blake3:%s\n' "$digest_hex"
+}
+
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo="${TIDEFS_REPO:-$(cd -- "$script_dir/.." && pwd)}"
 output_dir=""
 timeout_seconds=900
 input_artifact=""
 input_summary=""
+input_manifest=""
 run_id="${TIDEFS_DIRTY_DEBT_RUN_ID:-}"
 source_ref="${TIDEFS_DIRTY_DEBT_SOURCE_REF:-}"
 generated_at="${TIDEFS_DIRTY_DEBT_GENERATED_AT:-}"
@@ -69,6 +87,11 @@ while [[ $# -gt 0 ]]; do
     --input-summary)
       [[ $# -ge 2 ]] || fail "--input-summary requires an argument"
       input_summary="$2"
+      shift 2
+      ;;
+    --input-manifest)
+      [[ $# -ge 2 ]] || fail "--input-manifest requires an argument"
+      input_manifest="$2"
       shift 2
       ;;
     --run-id)
@@ -108,10 +131,10 @@ if ! command -v b3sum >/dev/null 2>&1 && ! command -v nix >/dev/null 2>&1; then
 fi
 
 input_mode=0
-if [[ -n "$input_artifact" || -n "$input_summary" ]]; then
+if [[ -n "$input_artifact" || -n "$input_summary" || -n "$input_manifest" ]]; then
   input_mode=1
-  [[ -n "$input_artifact" && -n "$input_summary" ]] \
-    || fail "--input-artifact and --input-summary must be used together"
+  [[ -n "$input_artifact" && -n "$input_summary" && -n "$input_manifest" ]] \
+    || fail "--input-artifact, --input-summary, and --input-manifest must be used together"
   [[ -n "$run_id" && -n "$source_ref" && -n "$generated_at" ]] \
     || fail "input mode requires --run-id, --source-ref, and --generated-at"
 fi
@@ -119,15 +142,19 @@ fi
 if [[ -z "$generated_at" ]]; then
   generated_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 fi
-if [[ -z "$source_ref" ]]; then
-  source_ref="${GITHUB_SHA:-$(git -C "$repo" rev-parse HEAD)}"
-fi
 if [[ -z "$run_id" ]]; then
   if [[ -n "${GITHUB_RUN_ID:-}" ]]; then
     run_id="github-actions:${GITHUB_RUN_ID}/${GITHUB_RUN_ATTEMPT:-1}"
   else
     run_id="local-qemu:${generated_at}"
   fi
+fi
+if [[ "$input_mode" -eq 0 ]]; then
+  checkout_source_ref="$(git -C "$repo" rev-parse HEAD)"
+  if [[ -n "$source_ref" && "$source_ref" != "$checkout_source_ref" ]]; then
+    fail "--source-ref must match the run-mode checkout HEAD"
+  fi
+  source_ref="$checkout_source_ref"
 fi
 
 [[ "$source_ref" =~ ^[0-9a-f]{40}$ ]] \
@@ -170,6 +197,9 @@ fi
 
 [[ -s "$input_artifact" ]] || fail "queue-depth input is missing or empty: $input_artifact"
 [[ -s "$input_summary" ]] || fail "QEMU summary is missing or empty: $input_summary"
+if [[ "$input_mode" -eq 1 ]]; then
+  [[ -s "$input_manifest" ]] || fail "QEMU input manifest is missing or empty: $input_manifest"
+fi
 
 jq -e '
   .test == "tidefs-fuse-vm-test"
@@ -245,6 +275,51 @@ jq -e '
   and (.no_hidden_queue_gate.registered_queue_roots | index("local_fs.write_admission") != null)
 ' "$input_artifact" >/dev/null \
   || fail "queue-depth input is not a passing fuse-smoke-mount-quick runtime snapshot"
+
+if [[ "$input_mode" -eq 1 ]]; then
+  input_content_digest="$(content_digest_for_file "$input_artifact")"
+  jq -e \
+    --arg content_digest "$input_content_digest" \
+    --arg source_ref "$source_ref" \
+    --arg run_id "$run_id" \
+    --arg generated_at "$generated_at" '
+      (keys | sort) == [
+        "artifact_path",
+        "blocking_issues",
+        "claim_id",
+        "content_digest",
+        "evidence_class",
+        "generated_at",
+        "manifest_version",
+        "outcome",
+        "residual_risk",
+        "run_id",
+        "scope",
+        "source",
+        "source_ref",
+        "validation_tier"
+      ]
+      and .manifest_version == 2
+      and .claim_id == "perf.local.no_unbounded_dirty_debt.v1"
+      and .evidence_class == "queue-depth-runtime-artifact"
+      and .validation_tier == "mounted-userspace"
+      and .artifact_path == "validation/artifacts/performance/queue-depth-runtime.json"
+      and (.content_digest | type == "string" and test("^blake3:[0-9a-f]{64}$"))
+      and .content_digest == $content_digest
+      and (.run_id | type == "string" and length > 0)
+      and .run_id == $run_id
+      and (.source_ref | type == "string" and test("^[0-9a-f]{40}$"))
+      and .source_ref == $source_ref
+      and .outcome == "pass"
+      and (.scope | type == "string" and length > 0)
+      and (.residual_risk | type == "string" and length > 0)
+      and .source == "qemu-smoke-fuse-vm-test"
+      and (.generated_at | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))
+      and .generated_at == $generated_at
+      and .blocking_issues == []
+    ' "$input_manifest" >/dev/null \
+    || fail "QEMU input manifest does not bind this artifact to the requested passing runtime provenance"
+fi
 
 mkdir -p -- "$output_dir"
 artifact_path="$output_dir/queue-depth-runtime.json"
@@ -383,15 +458,7 @@ jq --sort-keys \
   }
 ' "$input_artifact" > "$artifact_tmp"
 
-if command -v b3sum >/dev/null 2>&1; then
-  digest_hex="$(b3sum "$artifact_tmp" | awk '{print $1}')"
-else
-  digest_hex="$(
-    nix shell --inputs-from "$repo" nixpkgs#b3sum \
-      --command b3sum "$artifact_tmp" | awk '{print $1}'
-  )"
-fi
-content_digest="blake3:$digest_hex"
+content_digest="$(content_digest_for_file "$artifact_tmp")"
 jq -n --sort-keys \
   --arg content_digest "$content_digest" \
   --arg source_ref "$source_ref" \
