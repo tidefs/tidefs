@@ -542,7 +542,7 @@ pub fn check_local_snapshots_current_workspace() -> Result<(), StorageCheckError
     let mut missing = Vec::new();
 
     for rel in [
-        "docs/LOCAL_SNAPSHOTS_OW108.md",
+        "docs/SNAPSHOT_CLONE_DEADLIST_AUTHORITY.md",
         "crates/tidefs-local-filesystem/src/lib.rs",
         "apps/tidefs-filesystem-demo/src/main.rs",
         "nix/tidefs-validation.sh",
@@ -583,13 +583,13 @@ pub fn check_local_snapshots_current_workspace() -> Result<(), StorageCheckError
     );
     check_source_markers(
         &root,
-        "docs/LOCAL_SNAPSHOTS_OW108.md",
+        "docs/SNAPSHOT_CLONE_DEADLIST_AUTHORITY.md",
         &[
-            "authenticated committed-root",
-            "rollback publishes a new authenticated root",
-            "safe reclamation protects snapshot roots",
-            "Allocator reservation counts snapshot roots",
-            "tidefs-xtask check-local-snapshots",
+            "`SnapshotRecord`",
+            "`SnapshotKind::Snapshot`",
+            "lifecycle GC pin set",
+            "`ensure_snapshot_authority_consistent`",
+            "Single-node local-filesystem snapshot",
         ],
         &mut missing,
     );
@@ -630,7 +630,7 @@ pub fn check_send_receive_current_workspace() -> Result<(), StorageCheckError> {
     let mut missing = Vec::new();
 
     for rel in [
-        "docs/SEND_RECEIVE_OW109.md",
+        "docs/SEND_RECEIVE_VERSION_AUTHORITY.md",
         "crates/tidefs-local-filesystem/src/lib.rs",
         "apps/tidefs-filesystem-demo/src/main.rs",
         "nix/tidefs-validation.sh",
@@ -669,13 +669,13 @@ pub fn check_send_receive_current_workspace() -> Result<(), StorageCheckError> {
     );
     check_source_markers(
         &root,
-        "docs/SEND_RECEIVE_OW109.md",
+        "docs/SEND_RECEIVE_VERSION_AUTHORITY.md",
         &[
-            "VFSSEND1",
-            "changed-record stream",
-            "destination root-authentication key",
-            "snapshot rollback still works after receive",
-            "tidefs-xtask check-send-receive",
+            "`VFSSEND1`",
+            "changed-record send/receive streams",
+            "stage objects before publish",
+            "destination root-authentication",
+            "rewrite imported snapshot catalog root references",
         ],
         &mut missing,
     );
@@ -1005,7 +1005,7 @@ pub fn check_local_storage_allocator_current_workspace() -> Result<(), StorageCh
     })?;
     let mut missing = Vec::new();
     for rel in [
-        "docs/LOCAL_STORAGE_ALLOCATOR_OW102.md",
+        "docs/CAPACITY_ACCOUNTING_AUTHORITY.md",
         "crates/tidefs-local-filesystem/src/lib.rs",
         "apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_vfs_adapter.rs",
         "apps/tidefs-filesystem-demo/src/main.rs",
@@ -1028,7 +1028,8 @@ pub fn check_local_storage_allocator_current_workspace() -> Result<(), StorageCh
             "fallocate_file",
             "ensure_content_capacity_with_planned_inode",
             "protected_committed_content_entries",
-            "allocator_counts_protected_chunk_refs_before_reuse",
+            "allocator_does_not_charge_unpinned_fallback_roots_against_live_capacity",
+            "allocator_counts_snapshot_roots_hidden_behind_newer_slots",
             "allocator_rejects_inode_exhaustion_without_mutation",
             "fallocate_extends_through_allocator_and_reports_statfs",
         ],
@@ -1040,10 +1041,10 @@ pub fn check_local_storage_allocator_current_workspace() -> Result<(), StorageCh
         &[
             "ReplyStatfs",
             "reply.statfs",
-            "fallocate_inode_from_handle",
-            "FileSystemError::NoSpace",
-            "ENOSPC",
-            "preview_fuse_model_reports_statfs_and_fallocate_mode_zero",
+            "dispatch_fallocate_file",
+            "CapacityAuthority",
+            "libc::ENOSPC",
+            "vfs_adapter_dispatch_fallocate_mode_zero_readback_zeros",
         ],
         &mut missing,
     );
@@ -1060,14 +1061,14 @@ pub fn check_local_storage_allocator_current_workspace() -> Result<(), StorageCh
     );
     check_source_markers(
         &root,
-        "docs/LOCAL_STORAGE_ALLOCATOR_OW102.md",
+        "docs/CAPACITY_ACCOUNTING_AUTHORITY.md",
         &[
-            "space-management/ENOSPC",
-            "ENOSPC",
-            "statfs",
-            "fallocate",
-            "protected committed roots",
-            "tidefs-xtask check-local-storage-allocator",
+            "`CapacityAuthority`",
+            "write/admission ENOSPC decisions",
+            "POSIX/FUSE `statfs`",
+            "`fallocate_file`",
+            "Physical placement remains a separate lower-layer authority",
+            "TFR-007 remains open",
         ],
         &mut missing,
     );
@@ -3023,7 +3024,7 @@ pub fn check_safe_local_reclamation_current_workspace() -> Result<(), StorageChe
     })?;
     let mut missing = Vec::new();
     for rel in [
-        "docs/SAFE_LOCAL_RECLAMATION_OW103.md",
+        "docs/LOCAL_DISTRIBUTED_RECEIPT_AUTHORITY.md",
         "crates/tidefs-local-object-store/src/lib.rs",
         "crates/tidefs-local-filesystem/src/lib.rs",
         "apps/tidefs-filesystem-demo/src/main.rs",
@@ -3075,13 +3076,13 @@ pub fn check_safe_local_reclamation_current_workspace() -> Result<(), StorageChe
     );
     check_source_markers(
         &root,
-        "docs/SAFE_LOCAL_RECLAMATION_OW103.md",
+        "docs/LOCAL_DISTRIBUTED_RECEIPT_AUTHORITY.md",
         &[
-            "retention debt",
-            "protected root-slot locations",
-            "tombstone",
-            "segment retirement",
-            "tidefs-xtask check-safe-local-reclamation",
+            "receipt-bound drains",
+            "Receipt-bound dead-object drains",
+            "replacement receipt generation is stable",
+            "reclaim drain gating on durable receipt evidence",
+            "This document is not a closure claim",
         ],
         &mut missing,
     );
