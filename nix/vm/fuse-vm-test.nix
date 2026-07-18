@@ -479,8 +479,16 @@ INITSCRIPT
       actual_digest="blake3:$("$B3SUM" "$scrub_artifact" | awk '{print $1}')"
       scrub_outcome=$("$JQ" -r '.outcome // empty' "$scrub_artifact")
       manifest_outcome=$("$JQ" -r '.outcome // empty' "$scrub_manifest")
+      scrub_source_ref=$("$JQ" -r '.source_ref // empty' "$scrub_artifact")
+      manifest_source_ref=$("$JQ" -r '.source_ref // empty' "$scrub_manifest")
+      expected_source_ref="''${GITHUB_SHA:-unknown}"
       if [ -z "$declared_digest" ] || [ "$declared_digest" != "$actual_digest" ]; then
         echo "FAIL: scrub_runtime_artifact_digest -- declared=$declared_digest actual=$actual_digest" >&2
+        FAILC=$((FAILC + 1))
+      elif [ -z "$scrub_source_ref" ] \
+        || [ "$scrub_source_ref" != "$manifest_source_ref" ] \
+        || [ "$scrub_source_ref" != "$expected_source_ref" ]; then
+        echo "FAIL: scrub_runtime_source_ref -- artifact=$scrub_source_ref manifest=$manifest_source_ref expected=$expected_source_ref" >&2
         FAILC=$((FAILC + 1))
       elif [ "$scrub_outcome" != "$manifest_outcome" ]; then
         FAILC=$((FAILC + 1))

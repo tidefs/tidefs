@@ -12,10 +12,16 @@ use crate::evidence_artifact_manifest::{
     content_digest_for_bytes, BlockingIssueRef, EvidenceArtifactManifest,
     EVIDENCE_ARTIFACT_MANIFEST_VERSION,
 };
-use crate::mount_harness::{find_daemon_binary, MountHarness};
+#[cfg(feature = "scrub-runtime")]
+use crate::mount_harness::MOUNT_HARNESS_ROOT_AUTH_KEY_HEX;
+use crate::mount_harness::{find_daemon_binary, is_pre_mount_setup_failure, MountHarness};
 use crate::runtime_artifact_source::RuntimeArtifactSource;
 use crate::validation_schema::ValidationTier;
 use crate::validation_status::ValidationStatus;
+#[cfg(feature = "scrub-runtime")]
+use tidefs_local_filesystem::{LocalFileSystem, RootAuthenticationKey};
+#[cfg(feature = "scrub-runtime")]
+use tidefs_local_object_store::{LocalObjectStore, StoreOptions};
 use tidefs_performance_contract::oracle::{
     with_scheduling_and_admission, without_scheduling_or_admission, OracleConfig,
 };
@@ -47,8 +53,9 @@ const MOUNT_READY_TIMEOUT_SECS: u64 = 10;
 const DAEMON_SCRUB_OBSERVATION_TIMEOUT_SECS: u64 = 15;
 const FOREGROUND_READ_ARRIVAL_TICK: u64 = 1;
 const MAX_FOREGROUND_READ_WAIT_TICKS: u64 = 1;
+const FOREGROUND_READ_PATH: &str = "protected-foreground-read.bin";
 
-pub const SCRUB_READ_RESIDUAL_RISK: &str = "This row records a mounted FUSE foreground-read correctness workload bracketed by typed observations from the same daemon's scheduled scrub service. The scrub targets are seeded into the production-option object store with a data-only barrier before mount, so they are fixture input rather than mounted write, fsync, or committed-root evidence. A pass requires admitted scrub records, work pending before and after the read, and a scheduler-budget throttle. The foreground wait bound still comes from the typed service-curve oracle rather than an environment-independent wall-clock SLO. This row is not production performance readiness, mounted write/fsync durability, broad scrub/repair correctness, kernel/uBLK/RDMA validation, crash recovery, release-candidate status, or a claim-status/product-wording change.";
+pub const SCRUB_READ_RESIDUAL_RISK: &str = "This row records a mounted FUSE foreground-read correctness workload bracketed by typed observations from the same daemon's scheduled scrub service. The protected file is committed through direct local-filesystem fixture setup before mount, and the scrub targets are then seeded into the production-option object store with a data-only barrier. Both are fixture input; neither setup path is cited as mounted write, fsync, or durability evidence. A pass requires admitted scrub records, work pending before and after the read, and a scheduler-budget throttle. The foreground wait bound still comes from the typed service-curve oracle rather than an environment-independent wall-clock SLO. This row is not production performance readiness, mounted write/fsync durability, broad scrub/repair correctness, kernel/uBLK/RDMA validation, crash recovery, release-candidate status, or a claim-status/product-wording change.";
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ScrubForegroundReadRuntimeEvidence {
@@ -251,6 +258,34 @@ pub struct ServiceCurveEvidence {
     pub unscheduled_max_scrub_queue_depth: u32,
 }
 
+struct MountHarnessBuildFailure {
+    outcome: ValidationStatus,
+    environment_refusal: Option<String>,
+    foreground_read: ForegroundReadEvidence,
+}
+
+fn mount_harness_build_failure(
+    error: &std::io::Error,
+    service_curve_wait_bound_ticks: u64,
+) -> MountHarnessBuildFailure {
+    if is_pre_mount_setup_failure(error) {
+        MountHarnessBuildFailure {
+            outcome: ValidationStatus::HarnessFail,
+            environment_refusal: None,
+            foreground_read: ForegroundReadEvidence::not_run_with_failure(
+                service_curve_wait_bound_ticks,
+                error.to_string(),
+            ),
+        }
+    } else {
+        MountHarnessBuildFailure {
+            outcome: ValidationStatus::EnvironmentRefusal,
+            environment_refusal: Some(format!("mount harness refused: {error}")),
+            foreground_read: ForegroundReadEvidence::not_run(service_curve_wait_bound_ticks),
+        }
+    }
+}
+
 pub fn run_scrub_foreground_read_runtime(command: String) -> ScrubForegroundReadRuntimeEvidence {
     let generated_at = generated_at();
     let source_ref = source_ref();
@@ -312,23 +347,23 @@ pub fn run_scrub_foreground_read_runtime(command: String) -> ScrubForegroundRead
         .daemon_bin(daemon_path)
         .extra_args(&["--background-scrub-interval", "1"])
         .scrub_runtime_observation()
-        .pre_mount_setup(seed_scrub_backlog)
+        .pre_mount_setup(seed_foreground_read_and_scrub_backlog)
         .build();
     let harness = match harness {
         Ok(harness) => harness,
         Err(error) => {
-            environment.environment_refusal = Some(format!("mount harness refused: {error}"));
+            let failure =
+                mount_harness_build_failure(&error, service_curve.max_foreground_read_wait_ticks);
+            environment.environment_refusal = failure.environment_refusal;
             return base_evidence(BaseEvidenceInput {
-                outcome: ValidationStatus::EnvironmentRefusal,
+                outcome: failure.outcome,
                 command,
                 generated_at,
                 run_id,
                 source_ref,
                 environment,
                 mount: None,
-                foreground_read: ForegroundReadEvidence::not_run(
-                    service_curve.max_foreground_read_wait_ticks,
-                ),
+                foreground_read: failure.foreground_read,
                 scrub_activity: scrub_activity_not_run(&service_curve),
                 service_curve,
             });
@@ -374,8 +409,7 @@ pub fn run_scrub_foreground_read_runtime(command: String) -> ScrubForegroundRead
         .err(),
         None => Some("mounted scrub runtime observation path is unavailable".to_string()),
     };
-    let mounted_fixture_error =
-        scrub_service_ready_error.or_else(|| prepare_mounted_foreground_read(&harness).err());
+    let mounted_fixture_error = scrub_service_ready_error;
     let pre_read_daemon_observation = if mounted_fixture_error.is_none() {
         scrub_runtime_observation_path.and_then(|path| {
             match wait_for_pending_scrub_runtime_observation(
@@ -1103,7 +1137,7 @@ fn run_foreground_read(
     service_curve: &ServiceCurveEvidence,
     preparation_error: Option<&str>,
 ) -> ForegroundReadEvidence {
-    let path = "protected-foreground-read.bin";
+    let path = FOREGROUND_READ_PATH;
     let payload = deterministic_payload(FOREGROUND_READ_BYTES);
     let expected_digest = digest_hex(&payload);
     let mut failures = Vec::new();
@@ -1172,7 +1206,7 @@ fn run_foreground_read(
     ForegroundReadEvidence {
         workload_ran: true,
         path: path.to_string(),
-        bytes_written: payload.len(),
+        bytes_written: 0,
         read_iterations: FOREGROUND_READ_ITERATIONS,
         read_successes,
         correctness_checks,
@@ -1189,8 +1223,50 @@ fn run_foreground_read(
 }
 
 #[cfg(feature = "scrub-runtime")]
+fn seed_foreground_read_and_scrub_backlog(store_root: &Path) -> std::io::Result<()> {
+    let root_authentication_key = RootAuthenticationKey::from_hex(MOUNT_HARNESS_ROOT_AUTH_KEY_HEX)
+        .map_err(|error| {
+            std::io::Error::other(format!(
+                "parse mount harness root authentication key: {error}"
+            ))
+        })?;
+    let mut filesystem = LocalFileSystem::open_with_root_authentication_key(
+        store_root,
+        StoreOptions::default(),
+        root_authentication_key,
+    )
+    .map_err(|error| {
+        std::io::Error::other(format!("open foreground-read seed filesystem: {error}"))
+    })?;
+    let filesystem_path = format!("/{FOREGROUND_READ_PATH}");
+
+    // The mounted workload measures reads under scheduled scrub. Publish its
+    // input before mount so create/write replay and mounted durability are not
+    // accidental prerequisites or evidence for this row.
+    filesystem
+        .create_file(&filesystem_path, 0o600)
+        .map_err(|error| std::io::Error::other(format!("create foreground-read seed: {error}")))?;
+    filesystem.sync_all().map_err(|error| {
+        std::io::Error::other(format!("sync foreground-read namespace: {error}"))
+    })?;
+    filesystem
+        .write_file(
+            &filesystem_path,
+            0,
+            &deterministic_payload(FOREGROUND_READ_BYTES),
+        )
+        .map_err(|error| std::io::Error::other(format!("write foreground-read seed: {error}")))?;
+    filesystem
+        .sync_all()
+        .map_err(|error| std::io::Error::other(format!("sync foreground-read payload: {error}")))?;
+    drop(filesystem);
+
+    seed_scrub_backlog(store_root)
+}
+
+#[cfg(feature = "scrub-runtime")]
 fn seed_scrub_backlog(store_root: &Path) -> std::io::Result<()> {
-    let mut store = tidefs_local_object_store::LocalObjectStore::open(store_root)
+    let mut store = LocalObjectStore::open(store_root)
         .map_err(|error| std::io::Error::other(format!("open scrub seed store: {error}")))?;
     let mut scrub_payload = deterministic_payload(SCRUB_UNIT_BYTES as usize);
     for unit in 0..SCRUB_UNITS_REQUESTED {
@@ -1211,19 +1287,10 @@ fn seed_scrub_backlog(store_root: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(not(feature = "scrub-runtime"))]
-fn seed_scrub_backlog(_store_root: &Path) -> std::io::Result<()> {
+fn seed_foreground_read_and_scrub_backlog(_store_root: &Path) -> std::io::Result<()> {
     Err(std::io::Error::other(
         "scrub runtime validation requires the scrub-runtime feature",
     ))
-}
-
-fn prepare_mounted_foreground_read(harness: &MountHarness) -> Result<(), String> {
-    harness
-        .create_file(
-            "protected-foreground-read.bin",
-            &deterministic_payload(FOREGROUND_READ_BYTES),
-        )
-        .map_err(|error| format!("create mounted foreground-read file: {error}"))
 }
 
 impl ForegroundReadEvidence {
@@ -1241,7 +1308,7 @@ impl ForegroundReadEvidence {
     fn not_run_with_failures(service_curve_wait_bound_ticks: u64, failures: Vec<String>) -> Self {
         Self {
             workload_ran: false,
-            path: "protected-foreground-read.bin".to_string(),
+            path: FOREGROUND_READ_PATH.to_string(),
             bytes_written: 0,
             read_iterations: FOREGROUND_READ_ITERATIONS,
             read_successes: 0,
@@ -1360,13 +1427,44 @@ fn command_output(program: &str, args: &[&str]) -> Option<String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn pre_mount_setup_failure_blocks_as_harness_failure() {
+        let error = match MountHarness::builder()
+            .daemon_bin("/daemon-is-not-reached-after-fixture-failure")
+            .pre_mount_setup(|_| Err(std::io::Error::other("fixture setup regression")))
+            .build()
+        {
+            Err(error) => error,
+            Ok(_) => panic!("pre-mount setup failure must stop harness construction"),
+        };
+
+        assert!(is_pre_mount_setup_failure(&error));
+        let failure = mount_harness_build_failure(&error, MAX_FOREGROUND_READ_WAIT_TICKS);
+        assert_eq!(failure.outcome, ValidationStatus::HarnessFail);
+        assert_eq!(failure.environment_refusal, None);
+        assert!(!failure.foreground_read.workload_ran);
+        assert!(!failure.foreground_read.passed);
+        assert_eq!(failure.foreground_read.failures.len(), 1);
+        assert!(failure.foreground_read.failures[0]
+            .contains("pre-mount setup failed: fixture setup regression"));
+
+        let substrate_error = std::io::Error::other("daemon spawn unavailable");
+        let refusal = mount_harness_build_failure(&substrate_error, MAX_FOREGROUND_READ_WAIT_TICKS);
+        assert_eq!(refusal.outcome, ValidationStatus::EnvironmentRefusal);
+        assert_eq!(
+            refusal.environment_refusal.as_deref(),
+            Some("mount harness refused: daemon spawn unavailable")
+        );
+        assert!(refusal.foreground_read.failures.is_empty());
+    }
+
     fn completed_foreground_read(service_curve: &ServiceCurveEvidence) -> ForegroundReadEvidence {
         let payload = deterministic_payload(FOREGROUND_READ_BYTES);
         let digest = digest_hex(&payload);
         ForegroundReadEvidence {
             workload_ran: true,
             path: "protected-foreground-read.bin".to_string(),
-            bytes_written: payload.len(),
+            bytes_written: 0,
             read_iterations: FOREGROUND_READ_ITERATIONS,
             read_successes: FOREGROUND_READ_ITERATIONS,
             correctness_checks: FOREGROUND_READ_ITERATIONS,
@@ -1393,14 +1491,11 @@ mod tests {
         let temp = tempfile::TempDir::new().expect("create scrub seed tempdir");
         seed_scrub_backlog(temp.path()).expect("seed scrub backlog");
 
-        let mut options = tidefs_local_object_store::StoreOptions::default();
+        let mut options = StoreOptions::default();
         options.background_scrub_interval_secs = 1;
-        let mut store = tidefs_local_object_store::LocalObjectStore::open_read_only_with_options(
-            temp.path(),
-            options,
-        )
-        .expect("open seeded store")
-        .expect("seeded store exists");
+        let mut store = LocalObjectStore::open_read_only_with_options(temp.path(), options)
+            .expect("open seeded store")
+            .expect("seeded store exists");
 
         assert_eq!(store.committed_root_u64(), None);
         let report = store
@@ -1538,6 +1633,7 @@ mod tests {
 
         let service_curve = build_service_curve();
         let foreground_read = completed_foreground_read(&service_curve);
+        assert_eq!(foreground_read.bytes_written, 0);
         let mut scrub_activity = scrub_activity_for_completed_read(&service_curve);
 
         assert_eq!(

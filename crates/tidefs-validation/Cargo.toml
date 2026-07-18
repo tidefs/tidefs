@@ -74,8 +74,11 @@ ack-receipt-fault-matrix = [
     "dep:tidefs-storage-intent-core",
 ]
 
-# Mounted scrub/read runtime fixture and object-store seed authority.
-scrub-runtime = ["dep:tidefs-local-object-store"]
+# Mounted scrub/read runtime fixture and local/object-store seed authority.
+scrub-runtime = [
+    "dep:tidefs-local-filesystem",
+    "dep:tidefs-local-object-store",
+]
 
 # Full FUSE userspace POSIX validation: VfsEngine, all POSIX adapter workers,
 # and every storage backend needed by the FUSE data path.

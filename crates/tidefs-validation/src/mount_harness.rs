@@ -22,6 +22,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const FUSE_SUPER_MAGIC: libc::c_long = 0x6573_5546;
+pub(crate) const MOUNT_HARNESS_ROOT_AUTH_KEY_HEX: &str =
+    "0000000000000000000000000000000000000000000000000000000000000001";
 
 /// Manages a FUSE-mounted TideFS instance backed by a local filesystem store.
 pub struct MountHarness {
@@ -48,6 +50,28 @@ pub struct MountHarnessBuilder {
     extra_args: Vec<String>,
     scrub_runtime_observation: bool,
     pre_mount_setup: Option<Box<dyn FnOnce(&Path) -> io::Result<()>>>,
+}
+
+#[derive(Debug)]
+struct PreMountSetupError(io::Error);
+
+impl std::fmt::Display for PreMountSetupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "pre-mount setup failed: {}", self.0)
+    }
+}
+
+impl std::error::Error for PreMountSetupError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+pub(crate) fn is_pre_mount_setup_failure(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<PreMountSetupError>())
+        .is_some()
 }
 
 impl MountHarnessBuilder {
@@ -136,12 +160,13 @@ impl MountHarnessBuilder {
             io::Error::other(format!("create mount dir {}: {e}", mount_path.display()))
         })?;
         if let Some(setup) = self.pre_mount_setup.take() {
-            setup(&store_path)?;
+            setup(&store_path).map_err(|error| {
+                let kind = error.kind();
+                io::Error::new(kind, PreMountSetupError(error))
+            })?;
         }
 
-        // Demo root authentication key avoids requiring env setup.
-        let root_auth_key_hex = "0000000000000000000000000000000000000000000000000000000000000001";
-
+        // Validation root authentication key avoids requiring env setup.
         let mut cmd = Command::new(&daemon_bin);
         cmd.arg("mount-vfs")
             .arg("--store")
@@ -149,7 +174,7 @@ impl MountHarnessBuilder {
             .arg("--mount")
             .arg(&mount_path)
             .arg("--root-auth-key-hex")
-            .arg(root_auth_key_hex);
+            .arg(MOUNT_HARNESS_ROOT_AUTH_KEY_HEX);
 
         for arg in &self.extra_args {
             cmd.arg(arg);
