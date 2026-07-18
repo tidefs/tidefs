@@ -992,8 +992,25 @@ fn finalize_snapshot_barrier_before_send(
     Ok(report)
 }
 
-fn clear_active_snapshot_barrier(ctx: &SessionContext) {
-    *ctx.active_barrier.lock().unwrap() = None;
+fn clear_active_snapshot_barrier(ctx: &SessionContext, barrier_id: u64) {
+    let mut active = ctx.active_barrier.lock().unwrap();
+    if active.as_ref().map(SnapshotCoordinator::barrier_id) == Some(barrier_id) {
+        *active = None;
+    }
+}
+
+fn abort_snapshot_barrier_if_membership_stale(
+    barrier_id: u64,
+    expected: &SnapshotBarrierMembershipCut,
+    ctx: &SessionContext,
+) -> Result<(), SnapshotBarrierSendError> {
+    match ensure_snapshot_barrier_membership_current(barrier_id, expected, ctx) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            clear_active_snapshot_barrier(ctx, barrier_id);
+            Err(err)
+        }
+    }
 }
 
 fn active_snapshot_barrier_outcome(
@@ -1118,7 +1135,7 @@ fn run_snapshot_barrier_before_send_with_config(
             MessagePriority::Control,
         );
         if let Err(err) = send_result {
-            clear_active_snapshot_barrier(ctx);
+            clear_active_snapshot_barrier(ctx, barrier_id);
             return Err(SnapshotBarrierSendError::SendFailed {
                 barrier_id,
                 peer_id,
@@ -1128,9 +1145,10 @@ fn run_snapshot_barrier_before_send_with_config(
     }
 
     loop {
+        abort_snapshot_barrier_if_membership_stale(barrier_id, &membership_cut, ctx)?;
         let outcome = active_snapshot_barrier_outcome(ctx, barrier_id)?;
         if let Some(outcome) = outcome {
-            clear_active_snapshot_barrier(ctx);
+            clear_active_snapshot_barrier(ctx, barrier_id);
             return finalize_snapshot_barrier_before_send(
                 barrier_id,
                 coordinator_state,
@@ -7065,6 +7083,36 @@ mod cluster_pool_handler_tests {
             }
         );
         assert!(err.to_string().contains("sender_authority_stale"));
+    }
+
+    #[test]
+    fn snapshot_barrier_wait_aborts_stale_membership_cut() {
+        let (_dir, store) = frame_local_store();
+        let ctx = frame_test_context(Arc::clone(&store));
+        register_snapshot_barrier_test_peer(&ctx, 2);
+        let membership_cut = snapshot_barrier_membership_cut(&ctx);
+        *ctx.active_barrier.lock().unwrap() = Some(SnapshotCoordinator::new(
+            7,
+            "active".into(),
+            vec![2],
+            SnapshotBarrierConfig::default(),
+        ));
+        register_snapshot_barrier_test_peer(&ctx, 3);
+
+        let err = abort_snapshot_barrier_if_membership_stale(7, &membership_cut, &ctx)
+            .expect_err("membership change must abort an in-flight barrier");
+
+        assert_eq!(
+            err,
+            SnapshotBarrierSendError::SenderAuthorityStale {
+                barrier_id: 7,
+                expected_epoch: membership_cut.epoch,
+                observed_epoch: membership_cut.epoch,
+                expected_peer_ids: vec![2],
+                observed_peer_ids: vec![2, 3],
+            }
+        );
+        assert!(ctx.active_barrier.lock().unwrap().is_none());
     }
 
     #[test]
