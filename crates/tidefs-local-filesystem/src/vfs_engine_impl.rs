@@ -6331,12 +6331,18 @@ impl VfsEngineStatFs for VfsLocalFileSystem {
     }
 
     fn snapshot_catalog_generation(&self) -> Option<Generation> {
-        let fs = self.fs.borrow();
-        if fs.list_snapshots().is_empty() {
-            None
-        } else {
-            Some(Generation::new(fs.generation()))
-        }
+        self.fs.borrow().snapshot_catalog_generation()
+    }
+
+    fn snapshot_catalog_lookup(
+        &self,
+        name: &[u8],
+    ) -> std::result::Result<(InodeId, Generation), Errno> {
+        self.fs
+            .borrow()
+            .snapshot_catalog_lookup(name)
+            .map_err(|err| map_errno(&err))?
+            .ok_or(Errno::ENOENT)
     }
 }
 

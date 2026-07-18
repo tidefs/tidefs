@@ -23,6 +23,7 @@ use crate::types::SnapshotSummary;
 use crate::LocalFileSystem;
 use crate::Result;
 use crate::ROOT_INODE_ID;
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use tidefs_dataset_lifecycle::{
     BlockPointer, DatasetCatalog, DatasetFlags, DatasetId, DatasetType, SyncGuarantee,
@@ -30,6 +31,7 @@ use tidefs_dataset_lifecycle::{
 };
 use tidefs_local_object_store::SnapshotDeadObjectCandidate;
 use tidefs_send_stream::{Id128 as Vfssend2Id128, SnapshotMutation, SnapshotMutationKind};
+use tidefs_types_vfs_core::{Generation, InodeId, SNAPSHOT_NAMESPACE_ROOT_INODE_ID};
 
 // ---------------------------------------------------------------------------
 // Public summary types
@@ -155,6 +157,27 @@ pub struct SnapshotRetentionReport {
 
 pub(crate) fn snapshot_record_retains_data(record: &SnapshotRecord) -> bool {
     matches!(record.kind, SnapshotKind::Snapshot | SnapshotKind::Clone)
+}
+
+fn snapshot_record_is_browsable(record: &SnapshotRecord) -> bool {
+    record.kind == SnapshotKind::Snapshot
+}
+
+const SNAPSHOT_CATALOG_SYNTHETIC_INODE_BASE: u64 = 1 << 63;
+
+fn snapshot_catalog_synthetic_inode_id(name: &[u8]) -> InodeId {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"tidefs.snapshot-catalog-inode.v1\0root@");
+    hasher.update(name);
+    let digest = hasher.finalize();
+    let mut raw = [0u8; 8];
+    raw.copy_from_slice(&digest.as_bytes()[..8]);
+    let mut inode = SNAPSHOT_CATALOG_SYNTHETIC_INODE_BASE
+        | (u64::from_le_bytes(raw) & (SNAPSHOT_CATALOG_SYNTHETIC_INODE_BASE - 1));
+    if inode == SNAPSHOT_NAMESPACE_ROOT_INODE_ID.get() {
+        inode -= 1;
+    }
+    InodeId::new(inode)
 }
 
 pub(crate) fn snapshot_record_display_name(record: &SnapshotRecord) -> String {
@@ -295,6 +318,48 @@ pub(crate) fn remove_snapshot_record_catalog_entry(
 // ---------------------------------------------------------------------------
 
 impl LocalFileSystem {
+    pub(crate) fn snapshot_catalog_generation(&self) -> Option<Generation> {
+        self.state
+            .snapshots
+            .values()
+            .any(snapshot_record_is_browsable)
+            .then(|| Generation::new(self.state.generation))
+    }
+
+    pub(crate) fn snapshot_catalog_lookup(
+        &self,
+        name: &[u8],
+    ) -> Result<Option<(InodeId, Generation)>> {
+        let Some(generation) = self.snapshot_catalog_generation() else {
+            return Ok(None);
+        };
+
+        let mut seen_inodes = BTreeSet::new();
+        let mut found = None;
+        for record in self
+            .state
+            .snapshots
+            .values()
+            .filter(|record| snapshot_record_is_browsable(record))
+        {
+            let inode_id = snapshot_catalog_synthetic_inode_id(&record.name);
+            if self.state.inodes.contains_key(&inode_id) {
+                return Err(FileSystemError::CorruptState {
+                    reason: "snapshot catalog synthetic inode collides with a live inode",
+                });
+            }
+            if !seen_inodes.insert(inode_id) {
+                return Err(FileSystemError::CorruptState {
+                    reason: "snapshot catalog synthetic inode collision",
+                });
+            }
+            if record.name.as_slice() == name {
+                found = Some((inode_id, generation));
+            }
+        }
+        Ok(found)
+    }
+
     pub(crate) fn ensure_snapshot_authority_consistent(&self) -> Result<()> {
         let mut expected_catalog_names = Vec::new();
         let mut expected_roots = Vec::<(TraversalRoot, u32)>::new();
@@ -1437,6 +1502,95 @@ mod tests {
             ),
             other => panic!("expected snapshot authority corrupt state, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn snapshot_catalog_lookup_is_stable_and_generation_guarded() {
+        let dir = temp_dir();
+        let mut fs = new_fs(&dir);
+
+        assert_eq!(fs.snapshot_catalog_generation(), None);
+        assert!(fs
+            .snapshot_catalog_lookup(b"missing")
+            .expect("lookup missing snapshot")
+            .is_none());
+
+        fs.create_snapshot("stable")
+            .expect("create stable snapshot");
+        let first = fs
+            .snapshot_catalog_lookup(b"stable")
+            .expect("lookup stable snapshot")
+            .expect("stable snapshot entry");
+        assert_eq!(
+            first,
+            fs.snapshot_catalog_lookup(b"stable")
+                .expect("repeat stable snapshot lookup")
+                .expect("repeat stable snapshot entry")
+        );
+        assert_ne!(first.0, SNAPSHOT_NAMESPACE_ROOT_INODE_ID);
+        assert_ne!(first.0.get() & SNAPSHOT_CATALOG_SYNTHETIC_INODE_BASE, 0);
+
+        fs.create_snapshot("second")
+            .expect("create second snapshot");
+        let after_catalog_change = fs
+            .snapshot_catalog_lookup(b"stable")
+            .expect("lookup stable snapshot after catalog change")
+            .expect("stable snapshot after catalog change");
+        let second = fs
+            .snapshot_catalog_lookup(b"second")
+            .expect("lookup second snapshot")
+            .expect("second snapshot entry");
+        assert_eq!(after_catalog_change.0, first.0);
+        assert_ne!(after_catalog_change.1, first.1);
+        assert_ne!(second.0, first.0);
+        assert_eq!(second.1, after_catalog_change.1);
+
+        fs.delete_snapshot("stable")
+            .expect("delete stable snapshot");
+        assert!(fs
+            .snapshot_catalog_lookup(b"stable")
+            .expect("lookup deleted snapshot")
+            .is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn snapshot_catalog_lookup_exposes_only_regular_snapshots() {
+        let dir = temp_dir();
+        let mut fs = new_fs(&dir);
+
+        fs.create_snapshot("origin")
+            .expect("create origin snapshot");
+        fs.create_clone("fork", "origin").expect("create clone");
+        fs.create_bookmark("anchor", "origin")
+            .expect("create bookmark");
+        assert!(fs
+            .snapshot_catalog_lookup(b"origin")
+            .expect("lookup origin snapshot")
+            .is_some());
+        assert!(fs
+            .snapshot_catalog_lookup(b"fork")
+            .expect("lookup clone")
+            .is_none());
+        assert!(fs
+            .snapshot_catalog_lookup(b"anchor")
+            .expect("lookup bookmark")
+            .is_none());
+
+        fs.delete_snapshot("origin")
+            .expect("delete origin snapshot");
+        assert_eq!(fs.snapshot_catalog_generation(), None);
+        assert!(fs
+            .snapshot_catalog_lookup(b"fork")
+            .expect("lookup clone without snapshots")
+            .is_none());
+        assert!(fs
+            .snapshot_catalog_lookup(b"anchor")
+            .expect("lookup bookmark without snapshots")
+            .is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
