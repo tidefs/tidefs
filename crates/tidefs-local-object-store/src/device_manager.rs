@@ -218,6 +218,7 @@ impl DeviceManager {
             existing_device_configs,
             device_guids,
             pool_guid,
+            old_device_count,
             TopologyIndexValidation::Exact,
         )?;
 
@@ -287,6 +288,7 @@ impl DeviceManager {
             remaining_device_configs,
             device_guids,
             pool_guid,
+            new_device_count + 1,
             TopologyIndexValidation::ReindexSurvivors,
         )?;
 
@@ -339,6 +341,7 @@ impl DeviceManager {
             request.existing_device_configs,
             request.device_guids,
             request.pool_guid,
+            device_count,
             TopologyIndexValidation::Exact,
         )?;
 
@@ -417,6 +420,7 @@ impl DeviceManager {
             request.existing_device_configs,
             request.device_guids,
             request.pool_guid,
+            device_count,
             TopologyIndexValidation::Exact,
         )?;
 
@@ -913,6 +917,7 @@ impl DeviceManager {
         device_configs: &[DeviceConfig],
         device_guids: &[[u8; 16]],
         pool_guid: [u8; 16],
+        expected_device_count: u32,
         index_validation: TopologyIndexValidation,
     ) -> Result<TopologyLabelAuthority> {
         let mut expected = None;
@@ -931,6 +936,19 @@ impl DeviceManager {
                         std::io::ErrorKind::InvalidData,
                         format!(
                             "pool label device GUID does not match caller topology at index {index}"
+                        ),
+                    ),
+                });
+            }
+            if record.label.device_count != expected_device_count {
+                return Err(StoreError::Io {
+                    operation: "topology_label_authority",
+                    path: config.path.clone(),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "pool label device count {} does not match expected topology count {expected_device_count}",
+                            record.label.device_count
                         ),
                     ),
                 });
@@ -1671,6 +1689,63 @@ mod tests {
                 assert!(source
                     .to_string()
                     .contains("pool label device index 1 does not match caller topology index 0"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        assert_eq!(fs::read(&label_path).unwrap(), label_before);
+        assert!(!new_dir.join(".tidefs_label").exists());
+
+        let _ = fs::remove_dir_all(&existing_dir);
+        let _ = fs::remove_dir_all(&new_dir);
+    }
+
+    #[test]
+    fn add_device_refuses_mismatched_label_device_count_before_writing_new_device() {
+        let existing_dir = temp_dir("dm-add-count-mismatch-existing");
+        let new_dir = temp_dir("dm-add-count-mismatch-new");
+        let existing_config = make_device_config(&existing_dir);
+        let new_config = make_device_config(&new_dir);
+        let pool_guid = [0x34; 16];
+        let existing_guid = [0x35; 16];
+
+        DeviceManager::write_single_device_label(LabelWriteRequest {
+            device_config: &existing_config,
+            pool_guid,
+            device_guid: existing_guid,
+            pool_name: "count-mismatch",
+            pool_state: crate::pool_label::LabelPoolState::Active,
+            commit_group: 1,
+            label_commit_group: 1,
+            device_index: 0,
+            topology_generation: 1,
+            device_count: 2,
+            redundancy_policy: PoolRedundancyPolicy::default(),
+            device_layout_policy: None,
+        })
+        .unwrap();
+        let label_path = existing_dir.join(".tidefs_label");
+        let label_before = fs::read(&label_path).unwrap();
+
+        let error = DeviceManager::add_device(
+            std::slice::from_ref(&existing_config),
+            &new_config,
+            pool_guid,
+            &[existing_guid],
+            [0x36; 16],
+            "count-mismatch",
+            1,
+        )
+        .expect_err("caller topology must not replace the persisted device count");
+
+        match error {
+            StoreError::Io {
+                operation, source, ..
+            } => {
+                assert_eq!(operation, "topology_label_authority");
+                assert_eq!(source.kind(), std::io::ErrorKind::InvalidData);
+                assert!(source.to_string().contains(
+                    "pool label device count 2 does not match expected topology count 1"
+                ));
             }
             other => panic!("unexpected error: {other:?}"),
         }
