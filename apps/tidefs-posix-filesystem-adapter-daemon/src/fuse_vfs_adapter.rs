@@ -8506,7 +8506,75 @@ impl FuseVfsAdapter {
         };
         dirty_projection_inodes.extend(tracked_ranges.iter().map(|(inode, _)| inode.get()));
 
+        // A block-volume target reads clean ranges directly from its own
+        // storage. Snapshot its dirty adapter ranges before the mount-wide
+        // barrier so syncfs can copy them there before publishing any clean
+        // projection. The stripe set above prevents a new FUSE write from
+        // changing this snapshot while the barrier is in progress.
+        let block_volume_dirty_ranges: BTreeMap<u64, Vec<(u64, u64)>> = self
+            .dirty_state
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(&ino, ranges)| (ino, ranges.ranges().to_vec()))
+            .collect();
+        dirty_projection_inodes.extend(block_volume_dirty_ranges.keys().copied());
+
+        let mut block_volume_dirty_state_flushed = false;
         let sync_result = (|| {
+            // A successful syncfs must include the optional block-volume
+            // carrier. Otherwise the in-memory dirty-state fallback hides
+            // stale block-volume bytes until the adapter restarts.
+            {
+                let mut block_volume = self.block_volume.lock().unwrap();
+                if let Some(block_volume) = block_volume.as_mut() {
+                    let engine = self.engine.lock().unwrap();
+                    for (&ino, ranges) in &block_volume_dirty_ranges {
+                        let handle = engine.open(InodeId::new(ino), libc::O_RDONLY as u32, ctx)?;
+                        let copy_result = (|| {
+                            for &(start, end) in ranges {
+                                let length = end.saturating_sub(start);
+                                let length_u32 = u32::try_from(length).map_err(|_| Errno::EFBIG)?;
+                                let data = engine.read(&handle, start, length_u32, ctx)?;
+                                if data.len() != length as usize {
+                                    return Err(Errno::EIO);
+                                }
+                                let extents = engine.lookup_extents(handle.inode_id, start, length);
+                                if extents.is_empty() {
+                                    block_volume.write_bytes(start, &data)?;
+                                    continue;
+                                }
+                                for extent in extents {
+                                    if !extent.is_data() {
+                                        continue;
+                                    }
+                                    let clip_start = extent.logical_offset.max(start);
+                                    let clip_end = extent.end_offset().min(end);
+                                    let clip_length = (clip_end - clip_start) as usize;
+                                    if clip_length == 0 {
+                                        continue;
+                                    }
+                                    let data_offset = (clip_start - start) as usize;
+                                    let data_end =
+                                        data_offset.checked_add(clip_length).ok_or(Errno::EIO)?;
+                                    let chunk =
+                                        data.get(data_offset..data_end).ok_or(Errno::EIO)?;
+                                    let physical_offset = clip_start
+                                        .saturating_sub(extent.logical_offset)
+                                        .saturating_add(extent.locator_id.0);
+                                    block_volume.write_bytes(physical_offset, chunk)?;
+                                }
+                            }
+                            Ok(())
+                        })();
+                        let release_result = engine.release(&handle);
+                        copy_result?;
+                        release_result?;
+                    }
+                    block_volume_dirty_state_flushed = true;
+                }
+            }
+
             let e = self.engine.lock().unwrap();
 
             // Adapter page-cache entries mirror writes that already reached the
@@ -8564,6 +8632,22 @@ impl FuseVfsAdapter {
             .lock()
             .unwrap()
             .clear_all_until_boundary(worker_dirty_boundary);
+        if block_volume_dirty_state_flushed {
+            let mut dirty_state = self.dirty_state.lock().unwrap();
+            for (&ino, ranges) in &block_volume_dirty_ranges {
+                let remove_inode = if let Some(dirty_ranges) = dirty_state.get_mut(&ino) {
+                    for &(start, end) in ranges {
+                        dirty_ranges.clear_range(start, end.saturating_sub(start));
+                    }
+                    dirty_ranges.is_empty()
+                } else {
+                    false
+                };
+                if remove_inode {
+                    dirty_state.remove(&ino);
+                }
+            }
+        }
         for ino in dirty_projection_inodes {
             if let Some(ref writeback_page_cache) = self.writeback_page_cache {
                 writeback_page_cache.clear_dirty_for_inode(ino);
@@ -33398,6 +33482,48 @@ mod tests {
                 .expect("read after fsync");
             assert_eq!(readback, b"to be flushed");
         }
+    }
+
+    #[test]
+    fn syncfs_with_block_volume_flushes_and_clears_dirty_state() {
+        let (fixture, bv) = adapter_fixture_with_mock_block_volume();
+        let ctx = root_ctx();
+        let (inode, adapter_fh, _engine_fh) = create_adapter_file_handle(
+            &fixture.adapter,
+            &ctx,
+            b"syncfs-block-volume.txt",
+            libc::O_RDWR as u32,
+        );
+        fixture
+            .adapter
+            .dispatch_write(&ctx, inode.get(), adapter_fh, 0, b"syncfs data", 0)
+            .expect("write dispatch");
+
+        fixture
+            .adapter
+            .dispatch_syncfs(&ctx)
+            .expect("syncfs dispatch");
+
+        assert_eq!(bv.lock().unwrap().stored(0, 11), b"syncfs data");
+        assert!(
+            !fixture
+                .adapter
+                .dirty_state
+                .lock()
+                .unwrap()
+                .contains_key(&inode.get()),
+            "successful syncfs must retire block-volume dirty state"
+        );
+        assert_eq!(
+            fixture
+                .adapter
+                .writeback_cache
+                .lock()
+                .unwrap()
+                .is_dirty(inode.get()),
+            Some(false),
+            "successful syncfs must publish the reclaim projection clean after block-volume drain"
+        );
     }
 
     #[test]
