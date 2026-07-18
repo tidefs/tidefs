@@ -729,30 +729,42 @@ fn parse_send_base_root(
         .ok_or_else(|| format!("from_root not found: tid={tid} gen={gen} csum={csum:#016x}"))
 }
 
-/// Reject invalid local send requests before coordinating peers.
-/// Stream construction revalidates the source after the barrier passes.
+fn selected_vfssend2_send_root(
+    fs_root: &Path,
+    auth_key: RootAuthenticationKey,
+) -> Result<vfs::CommittedRootSummary, String> {
+    let audit = vfs::audit_recovery_with_root_authentication_key(
+        fs_root,
+        StoreOptions::default(),
+        auth_key,
+    )
+    .map_err(|e| format!("audit: {e}"))?;
+    if !audit.mountable_without_operator_repair() {
+        return Err(format!(
+            "send source recovery: {}",
+            audit.outcome.human_name()
+        ));
+    }
+    audit
+        .selected_root
+        .ok_or_else(|| format!("send source recovery: {}", audit.outcome.human_name()))
+}
+
+/// Reject invalid local send requests before coordinating peers and retain the
+/// authenticated target root that the barrier is authorizing.
 fn validate_vfssend2_send_request(
     fs_root: &Path,
     auth_key: RootAuthenticationKey,
     key: &[u8],
-) -> Result<(), String> {
-    if key.is_empty() {
-        let audit = vfs::audit_recovery_with_root_authentication_key(
-            fs_root,
-            StoreOptions::default(),
-            auth_key,
-        )
-        .map_err(|e| format!("audit: {e}"))?;
-        if audit.selected_root.is_none() || !audit.mountable_without_operator_repair() {
-            return Err(format!(
-                "send source recovery: {}",
-                audit.outcome.human_name()
-            ));
-        }
-        return Ok(());
+) -> Result<vfs::CommittedRootSummary, String> {
+    if !key.is_empty() && key.len() != 24 {
+        return Err(format!("send key must be 0 or 24 bytes, got {}", key.len()));
     }
-
-    parse_send_base_root(fs_root, auth_key, key).map(|_| ())
+    let target_root = selected_vfssend2_send_root(fs_root, auth_key)?;
+    if !key.is_empty() {
+        parse_send_base_root(fs_root, auth_key, key)?;
+    }
+    Ok(target_root)
 }
 
 fn build_vfssend2_send_stream(
@@ -797,6 +809,63 @@ fn build_bridged_vfssend2_send_payload(
 ) -> Result<Vec<u8>, String> {
     let stream = build_vfssend2_send_stream(fs, fs_root, auth_key, config, key)?;
     bridge_vfssend2_send_stream(stream).map_err(|e| format!("VFSSEND2 transport bridge: {e}"))
+}
+
+fn vfssend2_send_root_identity_matches(
+    expected: &vfs::CommittedRootSummary,
+    observed: &vfs::CommittedRootSummary,
+) -> bool {
+    observed.transaction_id == expected.transaction_id
+        && observed.generation == expected.generation
+        && observed.next_inode_id == expected.next_inode_id
+        && observed.inode_count == expected.inode_count
+        && observed.superblock_checksum == expected.superblock_checksum
+        && observed.has_transaction_manifest
+        && expected.has_transaction_manifest
+        && observed.manifest_checksum == expected.manifest_checksum
+        && observed.manifest_entry_count == expected.manifest_entry_count
+        && observed.has_root_authentication
+        && expected.has_root_authentication
+        && observed.root_authentication_policy_epoch == expected.root_authentication_policy_epoch
+        && observed.root_authentication_algorithm_suite_id
+            == expected.root_authentication_algorithm_suite_id
+        && observed.superblock_digest == expected.superblock_digest
+        && observed.manifest_digest == expected.manifest_digest
+        && observed.root_authentication_code == expected.root_authentication_code
+}
+
+fn ensure_vfssend2_send_root_unchanged(
+    fs_root: &Path,
+    auth_key: RootAuthenticationKey,
+    expected: &vfs::CommittedRootSummary,
+) -> Result<(), String> {
+    let observed = selected_vfssend2_send_root(fs_root, auth_key)?;
+    if vfssend2_send_root_identity_matches(expected, &observed) {
+        return Ok(());
+    }
+
+    Err(format!(
+        "VFSSEND2 send source changed after snapshot barrier: expected tid={} gen={} csum={:#016x}, observed tid={} gen={} csum={:#016x}",
+        expected.transaction_id,
+        expected.generation,
+        expected.superblock_checksum.0,
+        observed.transaction_id,
+        observed.generation,
+        observed.superblock_checksum.0,
+    ))
+}
+
+fn build_snapshot_barrier_bound_vfssend2_send_payload(
+    fs: &mut vfs::LocalFileSystem,
+    fs_root: &Path,
+    auth_key: RootAuthenticationKey,
+    config: &StorageNodeConfig,
+    key: &[u8],
+    expected_root: &vfs::CommittedRootSummary,
+) -> Result<Vec<u8>, String> {
+    let payload = build_bridged_vfssend2_send_payload(fs, fs_root, auth_key, config, key)?;
+    ensure_vfssend2_send_root_unchanged(fs_root, auth_key, expected_root)?;
+    Ok(payload)
 }
 
 const VFSSEND2_FULL_SEND_BARRIER_CLASS: &str = "full";
@@ -1254,8 +1323,8 @@ fn require_snapshot_barrier_before_send(
     fs_root: &Path,
     auth_key: RootAuthenticationKey,
     key: &[u8],
-) -> Result<(), String> {
-    validate_vfssend2_send_request(fs_root, auth_key, key)?;
+) -> Result<vfs::CommittedRootSummary, String> {
+    let target_root = validate_vfssend2_send_request(fs_root, auth_key, key)?;
 
     match run_snapshot_barrier_before_send(session_id, ctx, key) {
         Ok(report) => {
@@ -1267,7 +1336,7 @@ fn require_snapshot_barrier_before_send(
                 report.max_txg,
                 report.total_objects,
             );
-            Ok(())
+            Ok(target_root)
         }
         Err(err) => {
             let message = err.to_string();
@@ -6131,11 +6200,12 @@ fn handle_frame_ctx(
         Frame::Send { key } => {
             let fs_root = ctx.config.fs_root.as_ref()?;
             let auth_key = ctx.config.root_auth_key?;
-            if let Err(message) =
-                require_snapshot_barrier_before_send(session_id, ctx, fs_root, auth_key, key)
-            {
-                return Some(Frame::Error { message });
-            }
+            let expected_root =
+                match require_snapshot_barrier_before_send(session_id, ctx, fs_root, auth_key, key)
+                {
+                    Ok(expected_root) => expected_root,
+                    Err(message) => return Some(Frame::Error { message }),
+                };
             let mut fs = match vfs::LocalFileSystem::open_with_root_authentication_key(
                 fs_root,
                 StoreOptions::default(),
@@ -6148,8 +6218,14 @@ fn handle_frame_ctx(
                     })
                 }
             };
-            match build_bridged_vfssend2_send_payload(&mut fs, fs_root, auth_key, &ctx.config, key)
-            {
+            match build_snapshot_barrier_bound_vfssend2_send_payload(
+                &mut fs,
+                fs_root,
+                auth_key,
+                &ctx.config,
+                key,
+                &expected_root,
+            ) {
                 Ok(export) => Some(Frame::SendResponse { export }),
                 Err(message) => Some(Frame::Error { message }),
             }
@@ -6317,11 +6393,12 @@ fn handle_frame_ctx(
         Frame::SendChunked { key } => {
             let fs_root = ctx.config.fs_root.as_ref()?;
             let auth_key = ctx.config.root_auth_key?;
-            if let Err(message) =
-                require_snapshot_barrier_before_send(session_id, ctx, fs_root, auth_key, key)
-            {
-                return Some(Frame::Error { message });
-            }
+            let expected_root =
+                match require_snapshot_barrier_before_send(session_id, ctx, fs_root, auth_key, key)
+                {
+                    Ok(expected_root) => expected_root,
+                    Err(message) => return Some(Frame::Error { message }),
+                };
             let mut fs = match vfs::LocalFileSystem::open_with_root_authentication_key(
                 fs_root,
                 StoreOptions::default(),
@@ -6334,12 +6411,13 @@ fn handle_frame_ctx(
                     })
                 }
             };
-            let export = match build_bridged_vfssend2_send_payload(
+            let export = match build_snapshot_barrier_bound_vfssend2_send_payload(
                 &mut fs,
                 fs_root,
                 auth_key,
                 &ctx.config,
                 key,
+                &expected_root,
             ) {
                 Ok(export) => export,
                 Err(message) => return Some(Frame::Error { message }),
@@ -7975,6 +8053,38 @@ mod cluster_pool_handler_tests {
                 123
             );
         }
+    }
+
+    #[test]
+    fn vfssend2_send_root_must_match_pre_barrier_selection() {
+        let fs_dir = tempfile::tempdir().unwrap();
+        let fs_root = fs_dir.path().join("fs");
+        let auth_key = RootAuthenticationKey::demo_key();
+        create_committed_send_source(&fs_root, auth_key);
+
+        let expected = validate_vfssend2_send_request(&fs_root, auth_key, &[])
+            .expect("select authenticated send root before barrier");
+        ensure_vfssend2_send_root_unchanged(&fs_root, auth_key, &expected)
+            .expect("unchanged selected root remains eligible");
+
+        let mut fs = vfs::LocalFileSystem::open_with_root_authentication_key(
+            &fs_root,
+            StoreOptions::default(),
+            auth_key,
+        )
+        .unwrap();
+        fs.create_file("/after-barrier", 0o644).unwrap();
+        fs.sync_all().unwrap();
+        drop(fs);
+
+        let err = ensure_vfssend2_send_root_unchanged(&fs_root, auth_key, &expected)
+            .expect_err("a newly committed root must invalidate the completed barrier");
+        assert!(
+            err.contains("VFSSEND2 send source changed after snapshot barrier"),
+            "{err}"
+        );
+        assert!(err.contains("expected tid="), "{err}");
+        assert!(err.contains("observed tid="), "{err}");
     }
 
     #[test]
