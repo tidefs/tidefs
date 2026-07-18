@@ -1,12 +1,66 @@
 {
-  "schema_version": 1,
+  "report_version": 2,
   "claim_id": "storage.intent.data_shape_honesty.v1",
   "issue": "https://github.com/tidefs/tidefs/issues/1981",
-  "validation_tier": "source-model",
-  "artifact_scope": "source-model inventory of required performance and fault rows for data-shape honesty",
+  "run_id": "29644583929/1",
+  "source_ref": "fb1490f5bfe2e662e180f11f54bc03bebb5a7f48",
+  "generated_at": "2026-07-18T12:36:23Z",
+  "validation_tier": "qemu-guest",
+  "command": "storage-intent-data-shape-runtime-validation",
+  "artifact_scope": "QEMU-guest partial data-shape fault observations plus explicitly blocked performance and unexecuted family rows",
   "outcome": "skip",
-  "skip_reason": "No qemu-guest performance or fault workload was executed in this source-model slice.",
+  "runtime_execution_produced": true,
+  "runtime_source": {
+    "carrier": "linux-7.0-qemu-guest/fuse-vm-test",
+    "kernel_release": "7.0.0",
+    "command": "storage-intent-data-shape-runtime-validation",
+    "code_paths": [
+      "tidefs-compression encode/decode helpers",
+      "tidefs-checksum-tree ObjectDigest",
+      "tidefs-encryption extent AEAD helpers",
+      "tidefs-erasure-coding receipt stripe helpers"
+    ]
+  },
   "rows": [
+    {
+      "row": "guest-transform-elapsed-diagnostics",
+      "families": [
+        "compression",
+        "encryption",
+        "erasure-coding"
+      ],
+      "status": "pass",
+      "operation": "capture per-helper guest elapsed nanoseconds during actual execution",
+      "observation": {
+        "source_rows": [
+          {
+            "guest_elapsed_ns": 1253481,
+            "row": "compression-zstd-helper-roundtrip"
+          },
+          {
+            "guest_elapsed_ns": 109395,
+            "row": "compression-lz4-helper-roundtrip"
+          },
+          {
+            "guest_elapsed_ns": null,
+            "row": "stored-frame-digest-mismatch-refusal"
+          },
+          {
+            "guest_elapsed_ns": null,
+            "row": "malformed-compression-frame-refusal"
+          },
+          {
+            "guest_elapsed_ns": 1490865,
+            "row": "encryption-aead-helper-roundtrip-refusal"
+          },
+          {
+            "guest_elapsed_ns": 27161,
+            "row": "ec-helper-degraded-reconstruction-under-width-refusal"
+          }
+        ]
+      },
+      "exact_boundary": "Diagnostic elapsed observations only; they are not process CPU cost, a stable benchmark, an SLO, or comparator evidence."
+    },
     {
       "row": "cpu-cost",
       "families": [
@@ -18,9 +72,12 @@
         "coalescing",
         "rebake"
       ],
-      "required_observation": "measure transform CPU cost under the compiled policy and expose overload, throttle, defer, or refusal instead of hidden weaker success",
-      "status": "blocked",
-      "missing_evidence": "no runtime workload, CPU measurement, receipt, or refusal row"
+      "status": "skip",
+      "operation": "measure process CPU cost under compiled policy with overload or refusal projection",
+      "observation": {
+        "missing_evidence": "only single-run guest elapsed diagnostics were captured; process CPU attribution, workload matrix, and refusal budgets remain missing"
+      },
+      "exact_boundary": "No performance or CPU-efficiency claim is permitted."
     },
     {
       "row": "read-amplification",
@@ -31,61 +88,175 @@
         "coalescing",
         "rebake"
       ],
-      "required_observation": "measure read amplification and return exact, degraded-visible, refreshed, blocked, refused, cache-only, or unknown outcomes through result/refusal evidence",
-      "status": "blocked",
-      "missing_evidence": "no runtime read path or amplification measurement"
+      "status": "skip",
+      "operation": "measure reads through the selected runtime path and caller-visible outcome",
+      "observation": {
+        "missing_evidence": "no mounted or storage-owner read-amplification workload was executed"
+      },
+      "exact_boundary": "Helper round trips do not measure mounted read amplification."
     },
     {
-      "row": "degraded-reconstruction",
+      "row": "ec-helper-degraded-reconstruction",
       "families": [
-        "erasure-coding",
+        "erasure-coding"
+      ],
+      "status": "pass",
+      "operation": "reconstruct one missing local EC helper shard",
+      "observation": {
+        "degraded_available_shards": 2,
+        "guest_elapsed_ns": 27161,
+        "profile": "local-helper-2-plus-1",
+        "rebuilt_shard_indexes": [
+          0
+        ],
+        "reconstructed_digest": "blake3:4799f4217157d73881d6ce590ce9f2f0dac083486eb1017d86650a0c95199ebc",
+        "source_digest": "blake3:4799f4217157d73881d6ce590ce9f2f0dac083486eb1017d86650a0c95199ebc",
+        "source_len": 96,
+        "stripe_width": 3,
+        "under_width_available": 1,
+        "under_width_needed": 2,
+        "under_width_refused": true
+      },
+      "exact_boundary": "Local helper-only row; archive recall, pool receipts, distributed recovery, and degraded-read product visibility remain blocked."
+    },
+    {
+      "row": "archive-degraded-reconstruction",
+      "families": [
         "archive-shape"
       ],
-      "required_observation": "prove degraded reconstruction or recall against the declared width and surface degraded-visible state when policy permits it",
-      "status": "blocked",
-      "missing_evidence": "no degraded EC/archive reconstruction workload"
+      "status": "skip",
+      "operation": "recall or reconstruct archive media with degraded-visible result projection",
+      "observation": {
+        "missing_evidence": "no archive media or recall path was executed"
+      },
+      "exact_boundary": "The EC helper row cannot substitute for archive evidence."
+    },
+    {
+      "row": "encryption-wrong-key-tamper-refusal",
+      "families": [
+        "encryption"
+      ],
+      "status": "pass",
+      "operation": "reject a wrong in-memory helper key and tampered ciphertext",
+      "observation": {
+        "algorithm": "chacha20-poly1305-helper",
+        "decoded_digest": "blake3:23f54976d3054645db833986d8029ba60ade918703cfd560e3158fb687d034e4",
+        "guest_elapsed_ns": 1490865,
+        "key_material_serialized": false,
+        "round_trip_exact": true,
+        "source_digest": "blake3:23f54976d3054645db833986d8029ba60ade918703cfd560e3158fb687d034e4",
+        "source_len": 65536,
+        "stored_frame_digest": "blake3:989182aa2e6bdbc011708f0db710f4b0a7dbbd841c88f42482e345d9418fa358",
+        "stored_frame_len": 65564,
+        "tampered_ciphertext_refused": true,
+        "wrong_key_refused": true
+      },
+      "exact_boundary": "Wrong-key helper refusal is not key-epoch lifecycle, mounted encryption, cryptographic erase, or media-remanence proof."
     },
     {
       "row": "key-epoch",
       "families": [
         "encryption"
       ],
-      "required_observation": "prove correct key epoch binding and typed refusal for stale, wrong, missing, or unauthorized epochs",
-      "status": "blocked",
-      "missing_evidence": "no key-epoch runtime or fault injection row"
+      "status": "skip",
+      "operation": "bind active key epoch and refuse stale, retired, missing, or unauthorized epochs",
+      "observation": {
+        "missing_evidence": "no persisted key epoch or lifecycle state was exercised"
+      },
+      "exact_boundary": "Issue #1823 lifecycle authority remains outside this slice."
     },
     {
       "row": "illegal-dedupe-domain",
       "families": [
         "dedupe"
       ],
-      "required_observation": "attempt dedupe across an illegal or unknown domain and prove typed refusal without sharing authority",
-      "status": "blocked",
-      "missing_evidence": "no illegal-domain runtime row"
+      "status": "skip",
+      "operation": "attempt cross-domain dedupe and preserve typed refusal",
+      "observation": {
+        "missing_evidence": "no runtime dedupe domain was exercised"
+      },
+      "exact_boundary": "Mounted dedupe and xfstests ownership remains outside this slice."
     },
     {
-      "row": "malformed-transform-frames",
+      "row": "malformed-compression-frame",
       "families": [
         "compression",
-        "digest-checksum",
-        "encryption",
+        "digest-checksum"
+      ],
+      "status": "pass",
+      "operation": "reject unknown-algorithm and truncated compression helper frames",
+      "observation": {
+        "generic_success_forbidden": true,
+        "short_frame_refusal": "frame-too-short-len-3",
+        "unknown_algorithm_refusal": "unknown-algorithm-0xff"
+      },
+      "exact_boundary": "This row covers compression helper frames only; encryption, coalescing, rebake, and mounted recovery frame faults remain incomplete."
+    },
+    {
+      "row": "ec-helper-under-width",
+      "families": [
+        "erasure-coding"
+      ],
+      "status": "pass",
+      "operation": "refuse one-of-three local EC helper input for a 2+1 profile",
+      "observation": {
+        "degraded_available_shards": 2,
+        "guest_elapsed_ns": 27161,
+        "profile": "local-helper-2-plus-1",
+        "rebuilt_shard_indexes": [
+          0
+        ],
+        "reconstructed_digest": "blake3:4799f4217157d73881d6ce590ce9f2f0dac083486eb1017d86650a0c95199ebc",
+        "source_digest": "blake3:4799f4217157d73881d6ce590ce9f2f0dac083486eb1017d86650a0c95199ebc",
+        "source_len": 96,
+        "stripe_width": 3,
+        "under_width_available": 1,
+        "under_width_needed": 2,
+        "under_width_refused": true
+      },
+      "exact_boundary": "Local helper refusal only; archive media and distributed placement widths remain unexecuted."
+    },
+    {
+      "row": "archive-under-width",
+      "families": [
+        "archive-shape"
+      ],
+      "status": "skip",
+      "operation": "refuse under-width archive media or expose allowed degraded state",
+      "observation": {
+        "missing_evidence": "no archive media, recall, or serving role was executed"
+      },
+      "exact_boundary": "EC helper under-width refusal cannot substitute for archive evidence."
+    },
+    {
+      "row": "coalescing-rebake-faults",
+      "families": [
         "coalescing",
         "rebake"
       ],
-      "required_observation": "inject malformed transform frames and prove refusal or recovery without generic success, generic timeout, or hidden weaker acknowledgment",
-      "status": "blocked",
-      "missing_evidence": "no malformed-frame runtime row"
-    },
-    {
-      "row": "ec-archive-under-width",
-      "families": [
-        "erasure-coding",
-        "archive-shape"
-      ],
-      "required_observation": "serve, reconstruct, or recall with too few shards/media and prove under-width refusal or explicit degraded-visible response",
-      "status": "blocked",
-      "missing_evidence": "no EC/archive under-width runtime row"
+      "status": "skip",
+      "operation": "inject split/replay, rollback, cutover, and source-retirement faults",
+      "observation": {
+        "missing_evidence": "no coalescing or rebake executor was exercised"
+      },
+      "exact_boundary": "Source-retirement and replacement-authority claims remain blocked."
     }
   ],
-  "claim_effect": "The performance/fault evidence class remains blocked until qemu-guest rows record commands, topology, inputs, outputs, receipts, and refusals."
+  "summary": {
+    "status": "skip",
+    "passed": 5,
+    "product_failed": 0,
+    "skipped": 7
+  },
+  "non_claims": [
+    "not a stable CPU or read-amplification benchmark",
+    "not a service objective or comparator row",
+    "not mounted, archive, distributed, production, or release evidence"
+  ],
+  "claim_effect": "Malformed compression, wrong-key/tamper, and local EC under-width helper faults were executed, but CPU, read-amplification, key-epoch, dedupe-domain, archive, coalescing, and rebake rows keep this evidence class and claim blocked.",
+  "residual_risk": [
+    "Elapsed guest timings are diagnostic observations without a stable CPU, workload, topology, or comparator baseline and are not a performance claim.",
+    "Read amplification, key epochs, illegal dedupe domains, archive recall, coalescing, rebake, and cross-family malformed-frame coverage remain unexecuted.",
+    "Local EC helper reconstruction and under-width refusal do not prove pool placement, distributed recovery, archive serving, degraded-read product safety, or availability."
+  ]
 }

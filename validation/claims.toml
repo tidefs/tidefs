@@ -834,8 +834,8 @@ required_evidence_classes = [
 ]
 evidence_requirements = [
   { class = "storage-intent-data-shape-policy-evidence", path = "validation/artifacts/storage-intent/data-shape-policy-evidence.json", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/data-shape-policy-evidence.manifest.json", blocking_issues = [] },
-  { class = "storage-intent-transform-execution-evidence", path = "validation/artifacts/storage-intent/data-shape-transform-execution.json", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/data-shape-transform-execution.manifest.json", blocking_issues = [] },
-  { class = "storage-intent-data-shape-performance-fault-rows", path = "validation/artifacts/storage-intent/data-shape-performance-fault-rows.json", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/data-shape-performance-fault-rows.manifest.json", blocking_issues = [] },
+  { class = "storage-intent-transform-execution-evidence", path = "validation/artifacts/storage-intent/data-shape-transform-execution.json", validation_tier = "qemu-guest", manifest_path = "validation/artifacts/storage-intent/data-shape-transform-execution.manifest.json", blocking_issues = [] },
+  { class = "storage-intent-data-shape-performance-fault-rows", path = "validation/artifacts/storage-intent/data-shape-performance-fault-rows.json", validation_tier = "qemu-guest", manifest_path = "validation/artifacts/storage-intent/data-shape-performance-fault-rows.manifest.json", blocking_issues = [] },
   { class = "storage-intent-data-shape-result-boundary", path = "validation/artifacts/storage-intent/data-shape-result-boundary.json", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/data-shape-result-boundary.manifest.json", blocking_issues = [] },
   { class = "claims-gate-review", path = "validation/artifacts/storage-intent/data-shape-claims-gate-review.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/data-shape-claims-gate-review.manifest.json", blocking_issues = [] },
 ]

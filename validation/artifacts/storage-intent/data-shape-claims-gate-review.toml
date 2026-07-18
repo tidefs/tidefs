@@ -2,9 +2,9 @@ schema_version = 1
 claim_id = "storage.intent.data_shape_honesty.v1"
 issue = "https://github.com/tidefs/tidefs/issues/1981"
 validation_tier = "source-model"
-review_scope = "claims-gate source review for data-shape policy evidence, transform execution, performance/fault rows, and result/refusal boundaries"
+review_scope = "claims-gate review for source-model policy/result boundaries and partial qemu-guest helper execution and fault evidence"
 review_outcome = "blocked"
-decision = "The claim remains blocked. Source-model policy and result-boundary artifacts are present in this slice, but qemu-guest transform-execution and performance/fault evidence remains unproduced."
+decision = "The claim remains blocked. QEMU-guest helper execution now covers Zstd/LZ4 round trips, stored-frame digest mismatch, malformed compression frames, AEAD wrong-key/tamper refusal, and local EC reconstruction/under-width refusal. Mounted compiled-policy receipts, the skipped data-shape families, performance rows, lifecycle authority, and completed outer carrier validation remain missing; run 29644583929 timed out later in smoke-mount after both artifacts were captured and digest/provenance validated."
 
 reviewed_artifacts = [
   "validation/artifacts/storage-intent/data-shape-policy-evidence.json",
@@ -22,23 +22,32 @@ reviewed_authorities = [
 ]
 
 missing_evidence = [
-  "qemu-guest transform execution for compression, digest/checksum, dedupe, encryption, EC/archive, coalescing, and rebake",
-  "qemu-guest CPU cost rows",
-  "qemu-guest read amplification rows",
-  "qemu-guest degraded reconstruction rows",
-  "qemu-guest key epoch rows",
-  "qemu-guest illegal dedupe domain rows",
-  "qemu-guest malformed transform frame rows",
-  "qemu-guest EC/archive under-width rows",
+  "compiled-policy and mounted transform execution with receipts for compression, digest/checksum, encryption, and EC authority",
+  "qemu-guest dedupe-domain transform execution and illegal-domain refusal",
+  "qemu-guest archive recall, degraded reconstruction, and under-width behavior",
+  "qemu-guest coalescing and rebake execution, rollback, cutover, and source-retirement boundaries",
+  "stable CPU-cost and read-amplification rows with workload, topology, and refusal budgets",
+  "persisted encryption key-epoch lifecycle rows",
+  "cross-family malformed transform-frame coverage beyond compression helpers",
+  "completed outer fuse-vm-test carrier after helper evidence capture; run 29644583929 timed out later during smoke-mount",
 ]
 
 non_claim_boundaries = [
   "No raw-store cleanup, encryption lifecycle, EC authority, dedupe xfstests, or placement/rebake/reclaim implementation is absorbed.",
   "No compression, dedupe, encryption, EC/archive, capacity, performance, production, release-readiness, or OpenZFS/Ceph successor/comparator wording is widened.",
-  "Transformed bytes, labels, simulated output, and source-model rows remain non-authoritative until receipts and runtime evidence validate."
+  "Passing QEMU helper rows do not authorize mounted transforms, compiled-policy satisfaction, source retirement, degraded-read safety, lifecycle behavior, or performance wording."
 ]
 
+[runtime_evidence]
+run_id = "29644583929/1"
+source_ref = "fb1490f5bfe2e662e180f11f54bc03bebb5a7f48"
+workflow_url = "https://github.com/tidefs/tidefs/actions/runs/29644583929"
+transform_summary = "6 pass, 0 product-fail, 4 skip"
+performance_fault_summary = "5 pass, 0 product-fail, 7 skip"
+artifact_validation = "both manifests matched artifact BLAKE3 digests, source SHA, run id, qemu-guest tier, expected SKIP outcome, runtime_execution_produced=true, and blocker #1981"
+outer_carrier_outcome = "fuse-vm-test timed out after 900 seconds during the later smoke-mount phase; helper evidence capture and host validation completed first"
+
 [registry_effect]
-claims_toml_changed = false
+claims_toml_changed = true
 claim_status_after_review = "blocked"
 stronger_wording_allowed = false

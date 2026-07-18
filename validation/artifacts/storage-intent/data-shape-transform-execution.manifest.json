@@ -2,21 +2,21 @@
   "manifest_version": 2,
   "claim_id": "storage.intent.data_shape_honesty.v1",
   "evidence_class": "storage-intent-transform-execution-evidence",
-  "validation_tier": "source-model",
-  "scope": "source-model transform-execution row inventory for data-shape honesty; runtime execution not produced in this slice",
+  "validation_tier": "qemu-guest",
+  "scope": "QEMU-guest helper transform execution and exact refusal rows for a bounded subset of storage-intent data-shape families; outcome=SKIP pass=6 product_fail=0 skip=4",
   "artifact_path": "validation/artifacts/storage-intent/data-shape-transform-execution.json",
-  "content_digest": "blake3:981ecbacf2bf56327a0ddfbbbde2ec588a9914b6546ff88527a377afd7585564",
-  "run_id": "deterministic-fixture:issue-1981-data-shape-transform-execution-v1",
-  "source_ref": "refs/heads/codex1/issue-1981-data-shape-evidence",
+  "content_digest": "blake3:72165c2fab6e51be19e7fb38830c868822e81f0a209b2c4adc8dfa33a72c39af",
+  "run_id": "29644583929/1",
+  "source_ref": "fb1490f5bfe2e662e180f11f54bc03bebb5a7f48",
   "outcome": "skip",
-  "residual_risk": "No qemu-guest or mounted runtime transform execution was produced. The evidence class remains blocked for compression, digest/checksum, dedupe, encryption, EC/archive, coalescing, and rebake behavior.",
-  "source": "issue-1981-source-review",
-  "generated_at": "2026-07-12T19:16:51Z",
+  "residual_risk": "The passing rows execute helper/library code in one QEMU guest; they do not prove mounted transform dispatch, raw-store conformance, compiled-policy receipt satisfaction, recovery, or source retirement. Dedupe-domain execution, key-epoch lifecycle proof, archive recall, coalescing, and rebake remain unexecuted, so the transform-execution evidence class and claim remain blocked. The rows do not widen compression, checksum, encryption, EC/archive, capacity, performance, production, release-readiness, or successor/comparator wording.",
+  "source": "qemu-fuse-vm-data-shape-helper-runtime-v1",
+  "generated_at": "2026-07-18T12:36:23Z",
   "blocking_issues": [
     {
       "repo": "tidefs/tidefs",
       "number": 1981,
-      "reason": "runtime transform-execution evidence remains unproduced"
+      "reason": "data-shape runtime evidence remains partial and the registered claim stays blocked"
     }
   ]
 }
