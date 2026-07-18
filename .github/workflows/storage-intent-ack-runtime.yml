@@ -13,7 +13,7 @@ concurrency:
 jobs:
   mounted-receipts:
     name: mounted acknowledgment receipts
-    runs-on: [self-hosted, linux, x64, tidefs, nix]
+    runs-on: [self-hosted, linux, x64, tidefs, nix, kvm, xfstests]
     timeout-minutes: 60
     env:
       CARGO_HOME: /var/tmp/tidefs-ci/cargo-home
@@ -26,7 +26,12 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Host preflight
-        run: test -c /dev/fuse
+        run: |
+          if test -c /dev/fuse; then
+            echo "/dev/fuse is available"
+          else
+            echo "::warning::/dev/fuse is unavailable; the harness will emit environment-refusal evidence"
+          fi
 
       - name: Prepare runtime output
         run: |

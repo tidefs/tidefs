@@ -101,6 +101,12 @@ struct RuntimeSummary {
     skipped: usize,
 }
 
+#[derive(Debug)]
+enum HarnessStartError {
+    EnvironmentRefusal { errno: Option<i32>, reason: String },
+    HarnessFail(String),
+}
+
 struct MountedReceiptHarness {
     _root: tempfile::TempDir,
     mountpoint: PathBuf,
@@ -109,19 +115,27 @@ struct MountedReceiptHarness {
 }
 
 impl MountedReceiptHarness {
-    fn new() -> Result<Self, String> {
+    fn new() -> Result<Self, HarnessStartError> {
         if !Path::new("/dev/fuse").exists() {
-            return Err("/dev/fuse is not available".to_string());
+            return Err(HarnessStartError::EnvironmentRefusal {
+                errno: None,
+                reason: "/dev/fuse is not available".to_string(),
+            });
         }
 
         let root = tempfile::Builder::new()
             .prefix("tidefs-ack-receipt-runtime-")
             .tempdir()
-            .map_err(|error| format!("create harness root: {error}"))?;
+            .map_err(|error| {
+                HarnessStartError::HarnessFail(format!("create harness root: {error}"))
+            })?;
         let store = root.path().join("store");
         let mountpoint = root.path().join("mnt");
-        fs::create_dir_all(&store).map_err(|error| format!("create store: {error}"))?;
-        fs::create_dir_all(&mountpoint).map_err(|error| format!("create mountpoint: {error}"))?;
+        fs::create_dir_all(&store)
+            .map_err(|error| HarnessStartError::HarnessFail(format!("create store: {error}")))?;
+        fs::create_dir_all(&mountpoint).map_err(|error| {
+            HarnessStartError::HarnessFail(format!("create mountpoint: {error}"))
+        })?;
 
         let (sender, receipts) = mpsc::sync_channel(RECEIPT_CHANNEL_CAPACITY);
         let mut filesystem = LocalFileSystem::open_with_root_authentication_key(
@@ -129,13 +143,16 @@ impl MountedReceiptHarness {
             StoreOptions::default(),
             RootAuthenticationKey::demo_key(),
         )
-        .map_err(|error| format!("open local filesystem: {error}"))?;
+        .map_err(|error| {
+            HarnessStartError::HarnessFail(format!("open local filesystem: {error}"))
+        })?;
         filesystem.set_auto_commit(false);
         filesystem.set_local_ack_receipt_diagnostic_sink(sender);
 
         let engine = VfsLocalFileSystem::new(filesystem);
-        let adapter = FuseVfsAdapter::new(Box::new(engine))
-            .map_err(|error| format!("create FUSE adapter: {error:?}"))?;
+        let adapter = FuseVfsAdapter::new(Box::new(engine)).map_err(|error| {
+            HarnessStartError::HarnessFail(format!("create FUSE adapter: {error:?}"))
+        })?;
         let options = [
             fuser::MountOption::FSName("tidefs-ack-receipt-runtime".to_string()),
             fuser::MountOption::Subtype("tidefs".to_string()),
@@ -143,8 +160,20 @@ impl MountedReceiptHarness {
             fuser::MountOption::NoDev,
             fuser::MountOption::NoSuid,
         ];
-        let session = fuser::spawn_mount2(adapter, &mountpoint, &options)
-            .map_err(|error| format!("mount FUSE adapter: {error}"))?;
+        let session = match fuser::spawn_mount2(adapter, &mountpoint, &options) {
+            Ok(session) => session,
+            Err(error) if is_mount_environment_refusal(&error) => {
+                return Err(HarnessStartError::EnvironmentRefusal {
+                    errno: error.raw_os_error(),
+                    reason: format!("FUSE mount was refused by the host: {error}"),
+                });
+            }
+            Err(error) => {
+                return Err(HarnessStartError::HarnessFail(format!(
+                    "mount FUSE adapter: {error}"
+                )));
+            }
+        };
 
         let mut ready = false;
         for _ in 0..50 {
@@ -156,7 +185,9 @@ impl MountedReceiptHarness {
         }
         if !ready {
             drop(session);
-            return Err("mounted FUSE path did not become ready".to_string());
+            return Err(HarnessStartError::HarnessFail(
+                "mounted FUSE path did not become ready".to_string(),
+            ));
         }
 
         Ok(Self {
@@ -294,6 +325,89 @@ fn is_explicit_unsupported_refusal(error: &io::Error) -> bool {
     )
 }
 
+fn is_mount_environment_refusal(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied | io::ErrorKind::Unsupported
+    ) || matches!(
+        error.raw_os_error(),
+        Some(libc::EACCES | libc::ENODEV | libc::ENOSYS | libc::EPERM)
+    )
+}
+
+fn environment_refusal_row(
+    row_id: &'static str,
+    syscall: &'static str,
+    expected_operation: LocalAckOperation,
+    errno: Option<i32>,
+    reason: &str,
+) -> RuntimeRow {
+    RuntimeRow {
+        row_id,
+        syscall,
+        expected_receipt_operation: expected_operation.as_str(),
+        syscall_result: "environment-refused".to_string(),
+        errno,
+        observed_receipts: Vec::new(),
+        outcome: ValidationStatus::EnvironmentRefusal,
+        reason: format!("mounted row was not exercised: {reason}"),
+    }
+}
+
+fn environment_refusal_rows(errno: Option<i32>, reason: &str) -> Vec<RuntimeRow> {
+    vec![
+        environment_refusal_row(
+            "sync-write-receipt",
+            "write(O_SYNC)",
+            LocalAckOperation::SyncWrite,
+            errno,
+            reason,
+        ),
+        environment_refusal_row(
+            "fsync-receipt",
+            "fsync",
+            LocalAckOperation::Fsync,
+            errno,
+            reason,
+        ),
+        environment_refusal_row(
+            "fdatasync-receipt",
+            "fdatasync",
+            LocalAckOperation::Fdatasync,
+            errno,
+            reason,
+        ),
+        environment_refusal_row(
+            "odsync-receipt",
+            "write(O_DSYNC)",
+            LocalAckOperation::Odsync,
+            errno,
+            reason,
+        ),
+        environment_refusal_row(
+            "shared-mmap-msync-receipt-or-refusal",
+            "mmap(MAP_SHARED)+msync(MS_SYNC)",
+            LocalAckOperation::SharedMmapMsync,
+            errno,
+            reason,
+        ),
+        environment_refusal_row(
+            "namespace-receipt",
+            "create+rename+fsync(parent)",
+            LocalAckOperation::FsyncDirectory,
+            errno,
+            reason,
+        ),
+        environment_refusal_row(
+            "fsyncdir-receipt",
+            "fsyncdir",
+            LocalAckOperation::FsyncDirectory,
+            errno,
+            reason,
+        ),
+    ]
+}
+
 fn receipt_observation(receipt: LocalAckReceipt) -> ReceiptObservation {
     ReceiptObservation {
         operation: receipt.operation.as_str(),
@@ -415,6 +529,71 @@ fn shared_mmap_msync(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+fn run_mounted_rows(harness: &MountedReceiptHarness) -> Vec<RuntimeRow> {
+    vec![
+        harness.record_row(
+            "sync-write-receipt",
+            "write(O_SYNC)",
+            LocalAckOperation::SyncWrite,
+            false,
+            || write_payload(&harness.path("sync-write.bin"), libc::O_SYNC, b"sync write"),
+        ),
+        harness.record_row(
+            "fsync-receipt",
+            "fsync",
+            LocalAckOperation::Fsync,
+            false,
+            || fsync_file(&harness.path("fsync.bin"), false),
+        ),
+        harness.record_row(
+            "fdatasync-receipt",
+            "fdatasync",
+            LocalAckOperation::Fdatasync,
+            false,
+            || fsync_file(&harness.path("fdatasync.bin"), true),
+        ),
+        harness.record_row(
+            "odsync-receipt",
+            "write(O_DSYNC)",
+            LocalAckOperation::Odsync,
+            false,
+            || write_payload(&harness.path("odsync.bin"), libc::O_DSYNC, b"odsync write"),
+        ),
+        harness.record_row(
+            "shared-mmap-msync-receipt-or-refusal",
+            "mmap(MAP_SHARED)+msync(MS_SYNC)",
+            LocalAckOperation::SharedMmapMsync,
+            true,
+            || shared_mmap_msync(&harness.path("mmap.bin")),
+        ),
+        harness.record_row(
+            "namespace-receipt",
+            "create+rename+fsync(parent)",
+            LocalAckOperation::FsyncDirectory,
+            false,
+            || {
+                let source = harness.path("namespace-source");
+                let target = harness.path("namespace-target");
+                File::create(&source)?.write_all(b"namespace payload")?;
+                fs::rename(source, target)?;
+                sync_directory(&harness.mountpoint)
+            },
+        ),
+        harness.record_row(
+            "fsyncdir-receipt",
+            "fsyncdir",
+            LocalAckOperation::FsyncDirectory,
+            false,
+            || {
+                let directory = harness.path("synced-directory");
+                fs::create_dir(&directory)?;
+                File::create(directory.join("child"))?.write_all(b"fsyncdir payload")?;
+                sync_directory(&directory)
+            },
+        ),
+    ]
+}
+
 fn runtime_summary(rows: &[RuntimeRow]) -> RuntimeSummary {
     let count = |status| rows.iter().filter(|row| row.outcome == status).count();
     let product_failed = count(ValidationStatus::ProductFail);
@@ -476,8 +655,11 @@ fn write_report_and_manifest(output_dir: &Path, report: &RuntimeReport) -> Resul
         evidence_class: EVIDENCE_CLASS.to_string(),
         validation_tier: ValidationTier::MountedUserspace,
         scope: format!(
-            "live FUSE mounted acknowledgment receipt and refusal rows for write, fsync, fdatasync, O_DSYNC, shared mmap MS_SYNC, namespace mutation, and fsyncdir; outcome={} pass={} product_fail={}",
-            report.summary.status.label(), report.summary.passed, report.summary.product_failed
+            "live FUSE mounted acknowledgment receipt and refusal rows for write, fsync, fdatasync, O_DSYNC, shared mmap MS_SYNC, namespace mutation, and fsyncdir; outcome={} pass={} product_fail={} environment_refusal={}",
+            report.summary.status.label(),
+            report.summary.passed,
+            report.summary.product_failed,
+            report.summary.environment_refused,
         ),
         artifact_path: ARTIFACT_PATH.to_string(),
         content_digest: content_digest_for_bytes(&report_bytes),
@@ -504,77 +686,38 @@ fn write_report_and_manifest(output_dir: &Path, report: &RuntimeReport) -> Resul
 #[test]
 #[ignore = "manual mounted evidence producer; use Storage Intent Ack Runtime workflow"]
 fn produce_mounted_ack_receipt_runtime_evidence() {
-    if !Path::new("/dev/fuse").exists() {
-        eprintln!("ENVIRONMENT REFUSAL: /dev/fuse is not available");
-        return;
-    }
     let output_dir = env::var_os(OUTPUT_DIR_ENV).map(PathBuf::from);
-
-    let harness = MountedReceiptHarness::new().expect("create mounted receipt harness");
-    let mut rows = Vec::new();
-    rows.push(harness.record_row(
-        "sync-write-receipt",
-        "write(O_SYNC)",
-        LocalAckOperation::SyncWrite,
-        false,
-        || write_payload(&harness.path("sync-write.bin"), libc::O_SYNC, b"sync write"),
-    ));
-    rows.push(harness.record_row(
-        "fsync-receipt",
-        "fsync",
-        LocalAckOperation::Fsync,
-        false,
-        || fsync_file(&harness.path("fsync.bin"), false),
-    ));
-    rows.push(harness.record_row(
-        "fdatasync-receipt",
-        "fdatasync",
-        LocalAckOperation::Fdatasync,
-        false,
-        || fsync_file(&harness.path("fdatasync.bin"), true),
-    ));
-    rows.push(harness.record_row(
-        "odsync-receipt",
-        "write(O_DSYNC)",
-        LocalAckOperation::Odsync,
-        false,
-        || write_payload(&harness.path("odsync.bin"), libc::O_DSYNC, b"odsync write"),
-    ));
-    rows.push(harness.record_row(
-        "shared-mmap-msync-receipt-or-refusal",
-        "mmap(MAP_SHARED)+msync(MS_SYNC)",
-        LocalAckOperation::SharedMmapMsync,
-        true,
-        || shared_mmap_msync(&harness.path("mmap.bin")),
-    ));
-    rows.push(harness.record_row(
-        "namespace-receipt",
-        "create+rename+fsync(parent)",
-        LocalAckOperation::FsyncDirectory,
-        false,
-        || {
-            let source = harness.path("namespace-source");
-            let target = harness.path("namespace-target");
-            File::create(&source)?.write_all(b"namespace payload")?;
-            fs::rename(source, target)?;
-            sync_directory(&harness.mountpoint)
-        },
-    ));
-    rows.push(harness.record_row(
-        "fsyncdir-receipt",
-        "fsyncdir",
-        LocalAckOperation::FsyncDirectory,
-        false,
-        || {
-            let directory = harness.path("synced-directory");
-            fs::create_dir(&directory)?;
-            File::create(directory.join("child"))?.write_all(b"fsyncdir payload")?;
-            sync_directory(&directory)
-        },
-    ));
+    let (rows, backend_kind, environment_refusal) = match MountedReceiptHarness::new() {
+        Ok(harness) => (
+            run_mounted_rows(&harness),
+            "live-fuse-local-object-store",
+            None,
+        ),
+        Err(HarnessStartError::EnvironmentRefusal { errno, reason }) => {
+            eprintln!("ENVIRONMENT REFUSAL: {reason}");
+            (
+                environment_refusal_rows(errno, &reason),
+                "fuse-mount-environment-refused",
+                Some(reason),
+            )
+        }
+        Err(HarnessStartError::HarnessFail(reason)) => {
+            panic!("create mounted receipt harness: {reason}")
+        }
+    };
 
     assert_eq!(rows.len(), 7, "every issue #2223 mounted row is classified");
     let summary = runtime_summary(&rows);
+    let mut residual_risk = vec![
+        "This evidence is bounded to one live local FUSE mount and the exact operations recorded; it is not crash, power-loss, stale-media, distributed-quorum, kernel-VFS, successor, production, or release evidence.".to_string(),
+        "A product-fail outcome keeps the claim blocked and identifies mounted operations that returned success without the exact earned receipt; workflow success means evidence capture succeeded, not that every product row passed.".to_string(),
+        "The receipt channel is best-effort diagnostic output after the authoritative ledger records a receipt; missing diagnostic copies cannot weaken or strengthen an acknowledgment.".to_string(),
+    ];
+    if let Some(reason) = environment_refusal {
+        residual_risk.push(format!(
+            "The host refused the mounted workload ({reason}); no row is product evidence and the claim remains blocked."
+        ));
+    }
     let report = RuntimeReport {
         report_version: 1,
         claim_id: CLAIM_ID,
@@ -593,9 +736,9 @@ fn produce_mounted_ack_receipt_runtime_evidence() {
             "1970-01-01T00:00:00Z".to_string(),
         ),
         validation_tier: ValidationTier::MountedUserspace,
-        command: "cargo test -p tidefs-posix-filesystem-adapter-daemon --test ack_receipt_runtime_evidence --locked -- --nocapture".to_string(),
+        command: "cargo test --locked -p tidefs-posix-filesystem-adapter-daemon --test ack_receipt_runtime_evidence -- --ignored --nocapture".to_string(),
         backend: RuntimeBackend {
-            kind: "live-fuse-local-object-store",
+            kind: backend_kind,
             kernel_release: fs::read_to_string("/proc/sys/kernel/osrelease")
                 .unwrap_or_else(|_| "unknown".to_string())
                 .trim()
@@ -605,11 +748,7 @@ fn produce_mounted_ack_receipt_runtime_evidence() {
         },
         rows,
         summary,
-        residual_risk: vec![
-            "This evidence is bounded to one live local FUSE mount and the exact operations recorded; it is not crash, power-loss, stale-media, distributed-quorum, kernel-VFS, successor, production, or release evidence.".to_string(),
-            "A product-fail outcome keeps the claim blocked and identifies mounted operations that returned success without the exact earned receipt; workflow success means evidence capture succeeded, not that every product row passed.".to_string(),
-            "The receipt channel is best-effort diagnostic output after the authoritative ledger records a receipt; missing diagnostic copies cannot weaken or strengthen an acknowledgment.".to_string(),
-        ],
+        residual_risk,
     };
 
     if let Some(output_dir) = output_dir {
@@ -617,10 +756,11 @@ fn produce_mounted_ack_receipt_runtime_evidence() {
             .expect("write mounted receipt report and manifest");
     }
     eprintln!(
-        "mounted ack receipt evidence: outcome={} passed={} product_failed={} artifact={} manifest={} output_enabled={}",
+        "mounted ack receipt evidence: outcome={} passed={} product_failed={} environment_refused={} artifact={} manifest={} output_enabled={}",
         report.summary.status.label(),
         report.summary.passed,
         report.summary.product_failed,
+        report.summary.environment_refused,
         ARTIFACT_PATH,
         MANIFEST_PATH,
         env::var_os(OUTPUT_DIR_ENV).is_some(),
