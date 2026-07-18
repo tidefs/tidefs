@@ -3108,7 +3108,11 @@ impl VfsLocalFileSystem {
                     );
                 }
 
-                if let Err(err) = snap_net_validate_sender_authority(&stream.encoded) {
+                // SenderAuthority validates stream identity, not the authority
+                // to export the live pool. Keep target sends fail-closed until
+                // the live owner supplies an explicit source-authorization
+                // input, before borrowing the root-authentication key.
+                if let Err(err) = snap_net_require_source_authorization(&stream.encoded) {
                     let _ = transport.close_session(session_id, SessionCloseReason::LocalShutdown);
                     return live_admin_error(1, err);
                 }
@@ -4168,12 +4172,12 @@ fn parse_snap_net_response(data: &[u8]) -> Result<String, String> {
     }
 }
 
-fn snap_net_validate_sender_authority(encoded: &[u8]) -> Result<(), String> {
+fn snap_net_require_source_authorization(encoded: &[u8]) -> Result<(), String> {
     let (header, _) = tidefs_send_stream::SendStreamHeader::decode(encoded)
         .map_err(|err| format!("snapshot send: target VFSSEND2 sender-authority header: {err}"))?;
     let Some(authority) = header.sender_authority.distributed() else {
         return Err(
-            "snapshot send: target-address send requires source-authorized VFSSEND2 sender authority; export is local-only"
+            "snapshot send: target-address send requires distributed VFSSEND2 sender identity; export is local-only"
                 .to_string(),
         );
     };
@@ -4183,7 +4187,10 @@ fn snap_net_validate_sender_authority(encoded: &[u8]) -> Result<(), String> {
                 .to_string(),
         );
     }
-    Ok(())
+    Err(
+        "snapshot send: target-address send requires an explicit source-authorization input; VFSSEND2 SenderAuthority is identity evidence only"
+            .to_string(),
+    )
 }
 
 fn snap_net_require_membership_send_gate(
@@ -7140,15 +7147,15 @@ mod tests {
     }
 
     #[test]
-    fn snap_net_sender_authority_requires_matching_distributed_header() {
+    fn snap_net_target_requires_explicit_source_authorization() {
         let source_pool_id = [0x11; 16];
         let header =
             tidefs_send_stream::SendStreamHeader::new(source_pool_id, [0x22; 16], [0x33; 16]);
         let local_only = header.encode().expect("encode local-only header");
         assert_eq!(
-            snap_net_validate_sender_authority(&local_only),
+            snap_net_require_source_authorization(&local_only),
             Err(
-                "snapshot send: target-address send requires source-authorized VFSSEND2 sender authority; export is local-only"
+                "snapshot send: target-address send requires distributed VFSSEND2 sender identity; export is local-only"
                     .to_string()
             )
         );
@@ -7162,7 +7169,7 @@ mod tests {
             .encode()
             .expect("encode mismatched header");
         assert_eq!(
-            snap_net_validate_sender_authority(&mismatched),
+            snap_net_require_source_authorization(&mismatched),
             Err(
                 "snapshot send: target VFSSEND2 sender authority does not match the stream source pool"
                     .to_string()
@@ -7176,7 +7183,13 @@ mod tests {
             )
             .encode()
             .expect("encode distributed header");
-        assert_eq!(snap_net_validate_sender_authority(&distributed), Ok(()));
+        assert_eq!(
+            snap_net_require_source_authorization(&distributed),
+            Err(
+                "snapshot send: target-address send requires an explicit source-authorization input; VFSSEND2 SenderAuthority is identity evidence only"
+                    .to_string()
+            )
+        );
     }
 
     #[derive(Debug)]
