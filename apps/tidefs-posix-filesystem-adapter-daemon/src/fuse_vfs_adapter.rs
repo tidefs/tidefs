@@ -9078,10 +9078,10 @@ impl FuseVfsAdapter {
         lock_owner: Option<u64>,
         flush: bool,
     ) -> Result<(), Errno> {
-        // A release can flush dirty bytes, retire the shared range tracker,
-        // and discard the inode reclaim projection. Order that complete
-        // cleanup with writes so a concurrent write cannot install a new
-        // dirty owner between the final predicate and cache invalidation.
+        // A release can flush dirty bytes and discard the inode reclaim
+        // projection. Order that complete cleanup with writes so a concurrent
+        // write cannot install a new dirty owner between the final predicate
+        // and cache invalidation.
         let _write_cache_reconciliation_guard = self.write_cache_reconciliation.lock(ino);
         // If the kernel requested flush-on-close and the inode has
         // dirty pages tracked by the adapter writeback layer,
@@ -9109,13 +9109,10 @@ impl FuseVfsAdapter {
                 }
                 Err(errno) => return Err(errno),
             };
-            let is_dirty = {
-                let ds = self.dirty_state.lock().unwrap();
-                ds.get(&ino).map(|dr| !dr.is_empty()).unwrap_or(false)
-            };
+            let has_dirty_owners = self.inode_has_dirty_owners(ino);
             let direct_flush = (efh.open_flags & libc::O_DIRECT as u32) != 0
                 || (flags & libc::O_DIRECT as u32) != 0;
-            if is_dirty || direct_flush {
+            if has_dirty_owners || direct_flush {
                 let e = self.engine.lock().unwrap();
                 // Ignore flush errors during release; the kernel already
                 // decided to close the file. Engine-level errors are logged
@@ -9181,11 +9178,7 @@ impl FuseVfsAdapter {
             self.mmap_coherency.deregister(ino);
         }
         if is_last_close || (!removed_registered_handle && self.writeback_cache_enabled) {
-            let is_dirty = {
-                let ds = self.dirty_state.lock().unwrap();
-                ds.get(&ino).map(|dr| !dr.is_empty()).unwrap_or(false)
-            };
-            if is_dirty {
+            if self.inode_has_dirty_owners(ino) {
                 let e = self.engine.lock().unwrap();
                 let flush_ctx = RequestCtx {
                     uid: 0,
@@ -43914,11 +43907,14 @@ mod tests {
     }
 
     #[test]
-    fn release_dispatch_holds_cache_reconciliation_gate_for_inode() {
+    fn release_dispatch_flushes_shared_tracker_under_reconciliation_gate() {
         let gates = Arc::new(WriteCacheReconciliationGates::default());
         let observed_flushes = Arc::new(AtomicU64::new(0));
         let observed_flushes_from_engine = Arc::clone(&observed_flushes);
         let gates_from_engine = Arc::clone(&gates);
+        let shared_tracker = Arc::new(Mutex::new(
+            tidefs_local_filesystem::dirty_page_tracker::DirtyPageTracker::new(),
+        ));
         let engine = AclMockEngine::new()
             .with_root(1)
             .with_attr(0, 0, 0o666)
@@ -43935,21 +43931,20 @@ mod tests {
             }));
         let mut adapter = FuseVfsAdapter::new(Box::new(engine))
             .expect("create adapter")
-            .with_writeback_cache_enabled();
+            .with_writeback_cache_enabled()
+            .with_writeback_range_tracker(Arc::clone(&shared_tracker));
         adapter.write_cache_reconciliation = Arc::clone(&gates);
-        adapter
-            .dirty_state
+        shared_tracker
             .lock()
             .unwrap()
-            .entry(1)
-            .or_default()
-            .mark_dirty(0, 4);
+            .mark_dirty(InodeId::new(1), 0, 4);
 
         adapter
             .dispatch_release(1, 999_999, libc::O_RDWR as u32, None, false)
             .expect("release through ordered reconciliation gate");
 
         assert_eq!(observed_flushes.load(Ordering::Relaxed), 1);
+        assert!(shared_tracker.lock().unwrap().is_dirty(InodeId::new(1)));
     }
 
     #[test]
