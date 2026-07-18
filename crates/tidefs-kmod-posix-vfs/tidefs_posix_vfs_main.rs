@@ -2817,37 +2817,9 @@ impl KernelEngine {
                 self.inode_table_root.set(inode_table_root);
                 self.extent_map_root.set(vrbt.extent_map_root);
             } else {
-                // VRBT not yet committed (fresh pool, first mount before
-                // txg commit): check if the inode exists in the local
-                // in-memory table populated by namespace sync.  If it does,
-                // return a default record so callers in the read/write
-                // path get extent_map_root=0 and use write_buffer or
-                // return empty, instead of propagating EIO.
-                if self.find_inode(ino).is_some() {
-                    return Ok(crate::replay_integration::VinoRecord {
-                        extent_map_root: 0,
-                        object_store_locator: 0,
-                        mode: 0,
-                        uid: 0,
-                        gid: 0,
-                        size: 0,
-                        blocks: 0,
-                        atime_secs: 0,
-                        atime_nanos: 0,
-                        mtime_secs: 0,
-                        mtime_nanos: 0,
-                        ctime_secs: 0,
-                        ctime_nanos: 0,
-                        nlink: 0,
-                        generation: 0,
-                        kind: 0,
-                        btime_secs: 0,
-                        btime_nanos: 0,
-                        flags: 0,
-                    });
-                }
                 kernel::pr_err!(
-                    "tidefs_posix_vfs: read_inode_record: VRBT decode failed and inode {} not in local table\n", ino
+                    "tidefs_posix_vfs: read_inode_record: committed-root VRBT decode failed ino={}\n",
+                    ino
                 );
                 return Err(crate::tidefs_kmod_bridge::kernel_types::Errno::EIO);
             }
@@ -2886,29 +2858,16 @@ impl KernelEngine {
         if read_len_usize > entry_buf.len() {
             return Err(crate::tidefs_kmod_bridge::kernel_types::Errno::ENOENT);
         }
-        match crate::replay_integration::read_vino_inode(&entry_buf[sector_off..], 1) {
-            Some(rec) => Ok(rec),
-            None => Ok(crate::replay_integration::VinoRecord {
-                extent_map_root: 0,
-                object_store_locator: 0,
-                mode: 0,
-                uid: 0,
-                gid: 0,
-                size: 0,
-                blocks: 0,
-                atime_secs: 0,
-                atime_nanos: 0,
-                mtime_secs: 0,
-                mtime_nanos: 0,
-                ctime_secs: 0,
-                ctime_nanos: 0,
-                nlink: 0,
-                generation: 0,
-                kind: 0,
-                btime_secs: 0,
-                btime_nanos: 0,
-                flags: 0,
-            }),
+        match crate::replay_integration::decode_vino_record(&entry_buf[sector_off..]) {
+            Ok(rec) => Ok(rec),
+            Err(error) => {
+                kernel::pr_err!(
+                    "tidefs_posix_vfs: read_inode_record: VINO decode failed ino={} error={:?}\n",
+                    ino,
+                    error
+                );
+                Err(crate::tidefs_kmod_bridge::kernel_types::Errno::EIO)
+            }
         }
     }
 
@@ -4917,11 +4876,18 @@ impl crate::tidefs_kmod_bridge::kernel_types::VfsEngine for KernelEngine {
             return Err(crate::tidefs_kmod_bridge::kernel_types::Errno::EIO);
         }
 
-        // Parse the inode record from the sector buffer.
-        // read_vino_inode indexes by (ino-1)*100 into the buffer, so pass 1
-        // since the buffer slice is already positioned at the target entry.
-        let record = crate::replay_integration::read_vino_inode(&entry_buf[sector_off..], 1)
-            .ok_or(crate::tidefs_kmod_bridge::kernel_types::Errno::ENOENT)?;
+        // Parse the current-format inode record from the sector buffer.
+        let record = match crate::replay_integration::decode_vino_record(&entry_buf[sector_off..]) {
+            Ok(record) => record,
+            Err(error) => {
+                kernel::pr_err!(
+                    "tidefs_posix_vfs: getattr: VINO decode failed ino={} error={:?}\n",
+                    ino,
+                    error
+                );
+                return Err(crate::tidefs_kmod_bridge::kernel_types::Errno::EIO);
+            }
+        };
 
         // Convert VinoRecord to InodeAttr.
         let kind = match record.kind {
@@ -5836,13 +5802,7 @@ impl crate::tidefs_kmod_bridge::kernel_types::VfsEngine for KernelEngine {
         // table).  read_inode_record calls decode_vrbt which uses BLAKE3
         // hash; the write_buffer guard above avoids this path for fresh
         // inodes that have not yet been committed.
-        let record = match self.read_inode_record(ino, &io_ctx, read_fn, ss) {
-            Ok(rec) => rec,
-            Err(_) => {
-                let empty = crate::tidefs_kmod_bridge::kernel_types::KmodVec::new();
-                return Ok(empty);
-            }
-        };
+        let record = self.read_inode_record(ino, &io_ctx, read_fn, ss)?;
         if record.extent_map_root == 0 {
             let empty = crate::tidefs_kmod_bridge::kernel_types::KmodVec::new();
             return Ok(empty);
@@ -8138,14 +8098,15 @@ pub extern "C" fn tidefs_posix_vfs_engine_replay_getattr(
     // SAFETY: pointer and length are validated above by the C shim.
     let ino_table_slice =
         unsafe { core::slice::from_raw_parts(inode_table_buf, ino_table_len as usize) };
-    let record = match crate::replay_integration::read_vino_inode(ino_table_slice, ino) {
-        Some(r) => r,
-        None => {
-            kernel::pr_debug!(
-                "tidefs_posix_vfs: replay getattr: ino={} not in buffer or bad magic\n",
-                ino
+    let record = match crate::replay_integration::decode_vino_inode(ino_table_slice, ino) {
+        Ok(record) => record,
+        Err(error) => {
+            kernel::pr_err!(
+                "tidefs_posix_vfs: replay getattr: VINO decode failed ino={} error={:?}\n",
+                ino,
+                error
             );
-            return -2; // ENOENT
+            return -5; // EIO
         }
     };
 
