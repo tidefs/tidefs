@@ -16,13 +16,13 @@ use crate::intent_log::record::IntentLogRecord;
 use crate::intent_log::sync_write::IntentLog;
 use crate::pool_label::{
     decode_label, encode_label, seal_label, LabelPoolState, PoolLabelV1, POOL_LABEL_SIZE,
-    POOL_LABEL_V1_WIRE_SIZE,
 };
 use crate::pool_lifecycle_evidence::{
     PoolLifecycleAction, PoolLifecycleContext, PoolLifecycleEvidence,
 };
 use crate::txg_manager::CommitGroupManager;
 use tidefs_auth::local_only::LocalOnlyGuard;
+use tidefs_types_pool_label_core::POOL_LABEL_V1_EXT_WIRE_SIZE;
 
 // ---------------------------------------------------------------------------
 // ExportError — export-specific errors
@@ -296,7 +296,9 @@ impl PoolExporter {
             .open(&label_path)
             .map_err(|e| ExportError::IoError(format!("open {}: {e}", label_path.display())))?;
 
-        let mut buf = [0u8; POOL_LABEL_V1_WIRE_SIZE];
+        // PoolLabelWriter emits the extended record. Reading only the base
+        // prefix would reject valid health/redundancy labels as truncated.
+        let mut buf = [0u8; POOL_LABEL_V1_EXT_WIRE_SIZE];
         use std::io::Read;
         file.read_exact(&mut buf)
             .map_err(|e| ExportError::IoError(format!("read {}: {e}", label_path.display())))?;
@@ -380,7 +382,9 @@ impl PoolExporter {
             reason: format!("seal: {e:?}"),
         })?;
 
-        let mut buf = [0u8; POOL_LABEL_V1_WIRE_SIZE];
+        // Export changes pool state, not the device-health or redundancy
+        // authority carried by the extended label.
+        let mut buf = [0u8; POOL_LABEL_V1_EXT_WIRE_SIZE];
         encode_label(&sealed, &mut buf).map_err(|e| ExportError::LabelWriteFailed {
             device_path: device_path.to_path_buf(),
             reason: format!("encode: {e:?}"),
@@ -442,7 +446,7 @@ impl PoolExporter {
     /// Write raw bytes at a given offset within a file.
     fn write_at_offset(
         path: &Path,
-        data: &[u8; POOL_LABEL_V1_WIRE_SIZE],
+        data: &[u8; POOL_LABEL_V1_EXT_WIRE_SIZE],
         offset: u64,
     ) -> std::result::Result<(), ExportError> {
         let mut file = fs::OpenOptions::new()
@@ -929,7 +933,7 @@ mod tests {
                 checksum: [0u8; 32],
             };
             let sealed = seal_label(label).unwrap();
-            let mut buf = [0u8; POOL_LABEL_V1_WIRE_SIZE];
+            let mut buf = [0u8; POOL_LABEL_V1_EXT_WIRE_SIZE];
             encode_label(&sealed, &mut buf).unwrap();
             std::fs::write(&label_path, buf).unwrap();
         }
@@ -1002,13 +1006,13 @@ mod tests {
 
         let mut file = std::fs::File::open(path).unwrap();
         file.seek(SeekFrom::Start(offset)).unwrap();
-        let mut buf = [0u8; POOL_LABEL_V1_WIRE_SIZE];
+        let mut buf = [0u8; POOL_LABEL_V1_EXT_WIRE_SIZE];
         file.read_exact(&mut buf).unwrap();
         decode_label(&buf).unwrap()
     }
 
     #[test]
-    fn export_updates_canonical_tail_label_on_byte_device() {
+    fn export_preserves_extended_evidence_at_canonical_label_copies() {
         let path = unique_export_path("canonical-tail-label");
         let _ = std::fs::remove_file(&path);
         let capacity_bytes = 4 * POOL_LABEL_SIZE as u64;
@@ -1031,8 +1035,13 @@ mod tests {
         label.label_commit_group = 10;
         label.topology_generation = 7;
         label.device_capacity_bytes = capacity_bytes;
+        label.device_health = 1;
+        label.device_read_errors = 17;
+        label.device_write_errors = 19;
+        label.device_checksum_errors = 23;
+        label.redundancy_policy = PoolRedundancyPolicy::replicated(2);
         let sealed = seal_label(label).unwrap();
-        let mut buf = [0u8; POOL_LABEL_V1_WIRE_SIZE];
+        let mut buf = [0u8; POOL_LABEL_V1_EXT_WIRE_SIZE];
         encode_label(&sealed, &mut buf).unwrap();
         PoolExporter::write_at_offset(&path, &buf, 0).unwrap();
         PoolExporter::write_at_offset(&path, &buf, tail_offset).unwrap();
@@ -1051,9 +1060,15 @@ mod tests {
 
         let head = read_label_at(&path, 0);
         let tail = read_label_at(&path, tail_offset);
-        assert_eq!(head.pool_state, LabelPoolState::Exported);
-        assert_eq!(tail.pool_state, LabelPoolState::Exported);
-        assert_eq!(tail.commit_group, 12);
+        for label in [head, tail] {
+            assert_eq!(label.pool_state, LabelPoolState::Exported);
+            assert_eq!(label.commit_group, 12);
+            assert_eq!(label.device_health, 1);
+            assert_eq!(label.device_read_errors, 17);
+            assert_eq!(label.device_write_errors, 19);
+            assert_eq!(label.device_checksum_errors, 23);
+            assert_eq!(label.redundancy_policy, PoolRedundancyPolicy::replicated(2));
+        }
 
         let _ = std::fs::remove_file(path);
     }
@@ -1121,7 +1136,7 @@ mod tests {
             checksum: [0u8; 32],
         };
         let sealed = seal_label(label).unwrap();
-        let mut buf = [0u8; POOL_LABEL_V1_WIRE_SIZE];
+        let mut buf = [0u8; POOL_LABEL_V1_EXT_WIRE_SIZE];
         encode_label(&sealed, &mut buf).unwrap();
         std::fs::write(label_path, buf).unwrap();
     }
@@ -1460,7 +1475,7 @@ mod tests {
                 checksum: [0u8; 32],
             };
             let sealed = seal_label(label).unwrap();
-            let mut buf = [0u8; POOL_LABEL_V1_WIRE_SIZE];
+            let mut buf = [0u8; POOL_LABEL_V1_EXT_WIRE_SIZE];
             encode_label(&sealed, &mut buf).unwrap();
             std::fs::write(&label_path, buf).unwrap();
         }
@@ -1542,7 +1557,7 @@ mod tests {
                 checksum: [0u8; 32],
             };
             let sealed = seal_label(label).unwrap();
-            let mut buf = [0u8; POOL_LABEL_V1_WIRE_SIZE];
+            let mut buf = [0u8; POOL_LABEL_V1_EXT_WIRE_SIZE];
             encode_label(&sealed, &mut buf).unwrap();
             std::fs::write(&label_path, buf).unwrap();
         }
@@ -1626,7 +1641,7 @@ mod tests {
                 checksum: [0u8; 32],
             };
             let sealed = seal_label(label).unwrap();
-            let mut buf = [0u8; POOL_LABEL_V1_WIRE_SIZE];
+            let mut buf = [0u8; POOL_LABEL_V1_EXT_WIRE_SIZE];
             encode_label(&sealed, &mut buf).unwrap();
             std::fs::write(&label_path, buf).unwrap();
         }
@@ -1704,7 +1719,7 @@ mod tests {
                 checksum: [0u8; 32],
             };
             let sealed = seal_label(label).unwrap();
-            let mut buf = [0u8; POOL_LABEL_V1_WIRE_SIZE];
+            let mut buf = [0u8; POOL_LABEL_V1_EXT_WIRE_SIZE];
             encode_label(&sealed, &mut buf).unwrap();
             std::fs::write(&label_path, buf).unwrap();
         }
@@ -2210,7 +2225,7 @@ mod tests {
             label.device_count = 1;
             label.device_index = 0;
             let sealed = seal_label(label).unwrap();
-            let mut buf = [0u8; POOL_LABEL_V1_WIRE_SIZE];
+            let mut buf = [0u8; POOL_LABEL_V1_EXT_WIRE_SIZE];
             encode_label(&sealed, &mut buf).unwrap();
             std::fs::write(&lp, buf).unwrap();
         }
@@ -2258,7 +2273,7 @@ mod tests {
             label.device_index = 0;
             label.device_capacity_bytes = 1024 * 1024 * 1024;
             let sealed = seal_label(label).unwrap();
-            let mut buf = [0u8; POOL_LABEL_V1_WIRE_SIZE];
+            let mut buf = [0u8; POOL_LABEL_V1_EXT_WIRE_SIZE];
             encode_label(&sealed, &mut buf).unwrap();
             std::fs::write(&lp, buf).unwrap();
         }
