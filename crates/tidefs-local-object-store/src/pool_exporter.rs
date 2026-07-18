@@ -370,7 +370,7 @@ impl PoolExporter {
         Ok(())
     }
 
-    /// Write both label copies (offset 0 and offset POOL_LABEL_SIZE) to a device.
+    /// Write both label copies to a device.
     fn write_labels_to_device(
         device_path: &Path,
         label: &PoolLabelV1,
@@ -391,13 +391,38 @@ impl PoolExporter {
         } else {
             device_path.to_path_buf()
         };
+        let backup_offset = Self::backup_label_offset(device_path, label)?;
 
         // Write Label 0
         Self::write_at_offset(&label_path, &buf, 0)?;
-        // Write Label 1
-        Self::write_at_offset(&label_path, &buf, POOL_LABEL_SIZE as u64)?;
+        // Write Label 1 at the canonical backup location used by pool
+        // creation and scanning. Directory compatibility keeps its compact
+        // two-area label file; byte devices place the backup at the tail.
+        Self::write_at_offset(&label_path, &buf, backup_offset)?;
 
         Ok(())
+    }
+
+    fn backup_label_offset(
+        device_path: &Path,
+        label: &PoolLabelV1,
+    ) -> std::result::Result<u64, ExportError> {
+        if device_path.is_dir() {
+            return Ok(POOL_LABEL_SIZE as u64);
+        }
+
+        let label_area_bytes = POOL_LABEL_SIZE as u64;
+        label
+            .device_capacity_bytes
+            .checked_sub(label_area_bytes)
+            .filter(|offset| *offset >= label_area_bytes)
+            .ok_or_else(|| ExportError::LabelValidationFailed {
+                device_path: device_path.to_path_buf(),
+                reason: format!(
+                    "device capacity {} cannot hold two pool label areas",
+                    label.device_capacity_bytes
+                ),
+            })
     }
 
     /// Rollback: write ACTIVE state back to a device label.
@@ -970,6 +995,67 @@ mod tests {
             compression: None,
             encryption: None,
         }
+    }
+
+    fn read_label_at(path: &Path, offset: u64) -> PoolLabelV1 {
+        use std::io::{Read as _, Seek as _};
+
+        let mut file = std::fs::File::open(path).unwrap();
+        file.seek(SeekFrom::Start(offset)).unwrap();
+        let mut buf = [0u8; POOL_LABEL_V1_WIRE_SIZE];
+        file.read_exact(&mut buf).unwrap();
+        decode_label(&buf).unwrap()
+    }
+
+    #[test]
+    fn export_updates_canonical_tail_label_on_byte_device() {
+        let path = unique_export_path("canonical-tail-label");
+        let _ = std::fs::remove_file(&path);
+        let capacity_bytes = 4 * POOL_LABEL_SIZE as u64;
+        let tail_offset = capacity_bytes - POOL_LABEL_SIZE as u64;
+        let pool_guid = [0x8A; 16];
+        let device_guid = [0x8B; 16];
+
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        file.set_len(capacity_bytes).unwrap();
+        drop(file);
+
+        let mut label = PoolLabelV1::new(pool_guid, device_guid, "testpool");
+        label.commit_group = 10;
+        label.label_commit_group = 10;
+        label.topology_generation = 7;
+        label.device_capacity_bytes = capacity_bytes;
+        let sealed = seal_label(label).unwrap();
+        let mut buf = [0u8; POOL_LABEL_V1_WIRE_SIZE];
+        encode_label(&sealed, &mut buf).unwrap();
+        PoolExporter::write_at_offset(&path, &buf, 0).unwrap();
+        PoolExporter::write_at_offset(&path, &buf, tail_offset).unwrap();
+
+        let config = DeviceConfig {
+            media_class: Default::default(),
+            path: path.clone(),
+            backing: DeviceBacking::RegularFileDev,
+            class: DeviceClass::Data,
+            kind: DeviceKind::Single { path: path.clone() },
+            compression: None,
+            encryption: None,
+        };
+
+        PoolExporter::export_pool(&[config], pool_guid, &[device_guid], "testpool", 12).unwrap();
+
+        let head = read_label_at(&path, 0);
+        let tail = read_label_at(&path, tail_offset);
+        assert_eq!(head.pool_state, LabelPoolState::Exported);
+        assert_eq!(tail.pool_state, LabelPoolState::Exported);
+        assert_eq!(tail.commit_group, 12);
+
+        let _ = std::fs::remove_file(path);
     }
 
     fn write_export_label(
