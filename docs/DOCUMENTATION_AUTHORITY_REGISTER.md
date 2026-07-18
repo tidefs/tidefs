@@ -567,7 +567,6 @@ surface beyond adding `docs/CLAIMS_GATE_POLICY.md`, which was already scanned.
 | `docs/DEBUGGING_WORKFLOWS.md` | Deleted | Deleted by #1779 after #1725 merged and #1722 closed. Current repository build entry points live in `README.md`; CI lane and artifact authority lives in `docs/GITHUB_CI.md`; xfstests dispatch and artifact details live in `docs/XFSTESTS_DISPATCH_CONTRACT.md`; source-owned command help and scoreboard behavior remain in the relevant binaries and validation code. |
 | `docs/DATASET_FEATURE_FLAGS_DESIGN.md` | Historical input | Retained only as a provenance pointer while active issue #1842 owns the remaining `xtask/tidefs-xtask/src/cluster.rs` citations and source comments still consume the feature-flag type vocabulary. Current authority lives in `crates/tidefs-types-dataset-feature-flags-core/src/lib.rs`, source callers, `validation/claims.toml`, and the claims gate; this file is not a public compatibility promise or mounted feature-negotiation claim. |
 | `docs/SPACEMAP_ALLOCATOR_DESIGN.md` | Historical input | Retained only as a provenance pointer while active issue #1842 owns the remaining `xtask/tidefs-xtask/src/storage.rs` citation. Current authority lives in `crates/tidefs-spacemap-allocator/src/lib.rs`, source callers, current capacity/storage-intent authority, `validation/claims.toml`, and the claims gate; this file is not runtime allocator proof, capacity authority, or an OpenZFS comparison surface. |
-| `docs/POLYMORPHIC_DIRECTORY_INDEX_DESIGN.md` | Historical input | Retained only as a provenance pointer while source comments still name this historical path. Current authority lives in `crates/tidefs-types-polymorphic-directory-index-core/src/lib.rs`, source callers, `validation/claims.toml`, and the claims gate; this file is not namespace authority, directory-index completeness proof, performance evidence, production-readiness evidence, or a ZFS ZAP comparison surface. |
 | `docs/POOL_IMPORT_EXPORT_DEVICE_TOPOLOGY_DESIGN.md` | Current spec | Scoped source-backed summary for the current pool-label, pool-scan/import, local import/export, and device-manager code paths. It is not product-readiness evidence for hot spares, evacuation, cluster ownership, online topology conversion, hardware-failure survival, availability, operational safety, or incumbent-comparison claims. |
 
 ### Remaining Imported Design Surface (TFR-019 / #512)
@@ -667,6 +666,18 @@ persistence, mounted xattr or POSIX ACL behavior, kernel/userspace equivalence,
 POSIX completeness, production or release readiness, performance, or
 successor/comparator wording.
 
+### Polymorphic Directory Index Historical Root Deletion (TFR-019 / #1800)
+
+Issue #1800 deleted the imported polymorphic-directory-index root after no
+live source or xtask reference still required it. Current behavior remains
+source-owned by `crates/tidefs-types-polymorphic-directory-index-core/`,
+`crates/tidefs-dir-index/`, and their callers. Its lineage remains in git,
+issue #1800, and its pull request only. This deletion does not implement or
+validate directory-index completeness, lookup or readdir semantics,
+representation migration, crash consistency, namespace or POSIX completeness,
+performance, production or release readiness, or OpenZFS/ZAP parity and
+successor/comparator wording.
+
 ## Incumbent Comparison Audit Slice (#931)
 
 This initial #931 slice classifies the following legacy incumbent-comparison
@@ -682,8 +693,9 @@ required by those registry entries:
 - Deleted orphan-index comparison lineage: ZFS/ext4/CephFS orphan-index table
   and former "key advantages" list are non-claim design lessons in git history
   only.
-- `docs/POLYMORPHIC_DIRECTORY_INDEX_DESIGN.md`: ZFS ZAP comparison and former
-  "improvements over ZFS" list are non-claim design lessons.
+- Deleted polymorphic directory-index comparison lineage: ZFS ZAP comparison
+  and former "improvements over ZFS" list are non-claim design lessons in git
+  history only.
 - Deleted polymorphic extent-map design lineage: ZFS/Ceph extent-layout tables,
   random-read cost hypotheses, and design-mistake coverage remain non-claim
   historical lessons in git history only.
