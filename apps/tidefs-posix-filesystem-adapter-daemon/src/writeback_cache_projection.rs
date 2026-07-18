@@ -230,11 +230,13 @@ impl WritebackProjection {
     /// Record that `ino` has been selected for writeback (dirty bytes have
     /// been written through to the engine but have not yet passed the
     /// durability barrier).
+    ///
+    /// A zero `total_bytes` observation is a no-op only for an untracked
+    /// inode.  If the projection already holds a conservative dirty byte
+    /// count, that count remains the writeback batch size.  This keeps the
+    /// provisional dirty publication visible when the backing mirrors are
+    /// momentarily empty at selection time.
     pub fn record_writeback_pending(&self, ino: u64, total_bytes: u64) {
-        if total_bytes == 0 {
-            return;
-        }
-
         let dirty_transition_gate = self
             .mmap_coherency
             .upgrade()
@@ -244,6 +246,9 @@ impl WritebackProjection {
             .map(|gate| gate.lock().unwrap());
         let mut lanes = self.lanes.lock().unwrap();
         let prev = lanes.get(&ino).copied();
+        if total_bytes == 0 && prev.is_none() {
+            return;
+        }
         let bytes = prev.map_or(total_bytes, |lane| lane.bytes().max(total_bytes));
         lanes.insert(ino, WritebackLane::WritebackPending { bytes });
         if !matches!(prev, Some(WritebackLane::WritebackPending { .. })) {
@@ -509,6 +514,20 @@ mod tests {
         p.record_writeback_pending(42, 0);
         assert_eq!(p.lane(42), None);
         assert_eq!(p.stats_snapshot().writeback_pending_transitions, 0);
+    }
+
+    #[test]
+    fn zero_byte_writeback_pending_preserves_existing_dirty_observation() {
+        let p = new_projection();
+        p.record_dirty(42, 4096);
+
+        p.record_writeback_pending(42, 0);
+
+        assert_eq!(
+            p.lane(42),
+            Some(WritebackLane::WritebackPending { bytes: 4096 })
+        );
+        assert_eq!(p.stats_snapshot().writeback_pending_transitions, 1);
     }
 
     #[test]
