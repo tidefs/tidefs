@@ -798,6 +798,46 @@ let
                                failure_class="MountFailure")
                 break
 
+            if test_name == "tidefs/mknod-acl-inheritance":
+                run_script = textwrap.dedent("""
+                  set -euo pipefail
+                  parent=/mnt/tidefs/.tidefs-mknod-acl-inheritance
+                  trap 'rm -rf "$parent"' EXIT
+                  rm -rf "$parent"
+                  mkdir "$parent"
+                  setfacl -m 'd:u::rwx,d:u:12345:rw-,d:g::r--,d:m::rw-,d:o::---' "$parent"
+                  (umask 077; mknod "$parent/pipe" p)
+                  test -p "$parent/pipe"
+                  mode="$(stat -c %a "$parent/pipe")"
+                  acl="$(getfacl -cpn "$parent/pipe")"
+                  printf 'type=fifo mode=%s\\n%s\\n' "$mode" "$acl"
+                  test "$mode" = 660
+                  for expected in \\
+                    'user::rw-' \\
+                    'user:12345:rw-' \\
+                    'group::r--' \\
+                    'mask::rw-' \\
+                    'other::---'; do
+                    printf '%s\\n' "$acl" | grep -Fqx -- "$expected"
+                  done
+                  if printf '%s\\n' "$acl" | grep -q '^default:'; then
+                    exit 1
+                  fi
+                """)
+                set_active_xfstest(test_name, case_name, "mounted-product-check")
+                start = time.time()
+                rc, output = shell(run_script, timeout=per_test_timeout)
+                duration = time.time() - start
+                if rc == 0:
+                    record(test_name, "pass", output.strip(),
+                           duration_secs=round(duration, 3))
+                else:
+                    record(test_name, "product-fail", output.strip(),
+                           failure_class=classify_failure(output, rc),
+                           duration_secs=round(duration, 3))
+                clear_active_xfstest(test_name)
+                continue
+
             case_dir = f"/tmp/xfstests-runs/{case_name}"
             quoted_test = shlex.quote(test_name)
             run_script = textwrap.dedent(f"""
