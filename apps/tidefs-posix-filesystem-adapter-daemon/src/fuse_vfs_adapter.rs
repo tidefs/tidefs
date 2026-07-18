@@ -7708,8 +7708,12 @@ impl FuseVfsAdapter {
         self.write_page_cache.has_dirty_pages_for_inode(ino)
     }
 
+    fn inode_has_dirty_owners(&self, ino: u64) -> bool {
+        self.inode_has_dirty_trackers(ino) || self.inode_has_dirty_page_cache_mirrors(ino)
+    }
+
     fn reconcile_writeback_inode_cache_after_authoritative_range(&self, ino: u64) {
-        if !self.inode_has_dirty_trackers(ino) && !self.inode_has_dirty_page_cache_mirrors(ino) {
+        if !self.inode_has_dirty_owners(ino) {
             self.writeback_cache.lock().unwrap().mark_clean(ino);
         }
     }
@@ -9254,7 +9258,7 @@ impl FuseVfsAdapter {
         if let Some(ref tracker) = self.writeback_range_tracker {
             tracker.lock().unwrap().flush_inode(InodeId::new(ino));
         }
-        if !self.inode_has_dirty_trackers(ino) && !self.inode_has_dirty_page_cache_mirrors(ino) {
+        if !self.inode_has_dirty_owners(ino) {
             self.writeback_cache.lock().unwrap().invalidate(ino);
         }
 
@@ -42085,7 +42089,24 @@ mod tests {
             .lock()
             .unwrap()
             .mark_dirty(inode, 0, b"release data".len() as u64);
+        let worker_tracker =
+            seed_worker_dirty_range(&fixture.adapter, ino, 0, b"release data".len() as u64);
+        {
+            let mut cache = fixture.adapter.writeback_cache.lock().unwrap();
+            cache.insert(ino);
+            cache.mark_dirty(ino, b"release data".len() as u64);
+        }
         assert!(tracker.lock().unwrap().is_dirty(inode));
+        assert!(worker_tracker.lock().unwrap().has_dirty_ranges(ino));
+        assert_eq!(
+            fixture
+                .adapter
+                .writeback_cache
+                .lock()
+                .unwrap()
+                .is_dirty(ino),
+            Some(true)
+        );
 
         // Release with flush=true (kernel-requested flush-on-close).
         fixture
@@ -42094,13 +42115,7 @@ mod tests {
             .expect("release");
 
         assert!(!tracker.lock().unwrap().is_dirty(inode));
-        assert!(fixture
-            .adapter
-            .dirty_state
-            .lock()
-            .unwrap()
-            .get(&ino)
-            .is_some_and(|ranges| ranges.contains(0, b"release data".len() as u32)));
+        assert!(worker_tracker.lock().unwrap().has_dirty_ranges(ino));
         assert_eq!(
             fixture
                 .adapter
