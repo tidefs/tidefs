@@ -14,6 +14,6 @@ pub use tidefs_types_pool_label_core::{
     features, seal_label, seal_label_with_device_layout, verify_label_checksum,
     DeviceClass as LabelDeviceClass, DeviceLayoutV1Bytes, LabelError, PoolLabelV1,
     PoolRedundancyPolicy, PoolState as LabelPoolState, POOL_LABEL_MAGIC, POOL_LABEL_SIZE,
-    POOL_LABEL_V1_EXT_WIRE_SIZE, POOL_LABEL_V1_WIRE_SIZE,
+    POOL_LABEL_V1_EXT_WIRE_SIZE, POOL_LABEL_V1_HEALTH_WIRE_SIZE, POOL_LABEL_V1_WIRE_SIZE,
     POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE, POOL_NAME_MAX,
 };

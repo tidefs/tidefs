@@ -8,21 +8,38 @@
 //! are transitioned to EXPORTED or none are. No partial/split state is possible.
 
 use std::fs;
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crate::device::DeviceConfig;
+use crate::device_layout::decode_device_layout_v1;
 use crate::intent_log::record::IntentLogRecord;
 use crate::intent_log::sync_write::IntentLog;
 use crate::pool_label::{
-    decode_label, encode_label, seal_label, LabelPoolState, PoolLabelV1, POOL_LABEL_SIZE,
+    decode_device_layout_v1_bytes, decode_label, encode_label, encode_label_with_device_layout,
+    features, seal_label, seal_label_with_device_layout, DeviceLayoutV1Bytes, LabelPoolState,
+    PoolLabelV1, POOL_LABEL_SIZE, POOL_LABEL_V1_EXT_WIRE_SIZE, POOL_LABEL_V1_HEALTH_WIRE_SIZE,
+    POOL_LABEL_V1_WIRE_SIZE, POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE,
 };
 use crate::pool_lifecycle_evidence::{
     PoolLifecycleAction, PoolLifecycleContext, PoolLifecycleEvidence,
 };
 use crate::txg_manager::CommitGroupManager;
 use tidefs_auth::local_only::LocalOnlyGuard;
-use tidefs_types_pool_label_core::POOL_LABEL_V1_EXT_WIRE_SIZE;
+
+struct ExportLabelRecord {
+    label: PoolLabelV1,
+    device_layout_v1: Option<DeviceLayoutV1Bytes>,
+    wire_size: usize,
+}
+
+impl std::ops::Deref for ExportLabelRecord {
+    type Target = PoolLabelV1;
+
+    fn deref(&self) -> &Self::Target {
+        &self.label
+    }
+}
 
 // ---------------------------------------------------------------------------
 // ExportError — export-specific errors
@@ -164,7 +181,12 @@ impl PoolExporter {
         mut write_labels: F,
     ) -> std::result::Result<(), ExportError>
     where
-        F: FnMut(&Path, &PoolLabelV1) -> std::result::Result<(), ExportError>,
+        F: FnMut(
+            &Path,
+            &PoolLabelV1,
+            Option<&DeviceLayoutV1Bytes>,
+            usize,
+        ) -> std::result::Result<(), ExportError>,
     {
         // Operator authorization boundary: pool export requires local execution.
         let _guard = LocalOnlyGuard::new("pool export")?;
@@ -213,7 +235,7 @@ impl PoolExporter {
             let existing = Self::read_existing_label(&device_config.path)?;
             Self::validate_export_label(
                 &device_config.path,
-                &existing,
+                &existing.label,
                 pool_guid,
                 device_guid,
                 pool_name,
@@ -221,43 +243,36 @@ impl PoolExporter {
                 expected_device_count,
                 expected_topology_generation,
             )?;
-            expected_topology_generation = Some(existing.topology_generation);
+            expected_topology_generation = Some(existing.label.topology_generation);
             existing_labels.push((device_config.path.clone(), existing));
         }
 
-        let mut written: Vec<(PathBuf, PoolLabelV1)> = Vec::new();
+        let mut written: Vec<(PathBuf, ExportLabelRecord)> = Vec::new();
 
         for (device_path, existing) in existing_labels {
-            let rollback_label = existing.clone();
+            let mut label = existing.label.clone();
+            label.pool_state = LabelPoolState::Exported;
+            label.commit_group = commit_group;
+            label.label_commit_group = label_commit_group;
 
-            let label = PoolLabelV1 {
-                pool_state: LabelPoolState::Exported,
-                commit_group,
-                label_commit_group,
-                features_incompat: existing.features_incompat,
-                features_ro_compat: existing.features_ro_compat,
-                features_compat: existing.features_compat,
-                ..existing
-            };
-
-            let result = write_labels(&device_path, &label);
+            let result = write_labels(
+                &device_path,
+                &label,
+                existing.device_layout_v1.as_ref(),
+                existing.wire_size,
+            );
 
             match result {
                 Ok(()) => {
-                    written.push((device_path, rollback_label));
+                    written.push((device_path, existing));
                 }
                 Err(e) => {
                     // The failed write may have changed one or both label
                     // copies before reporting an error. Restore that device
                     // as well as every earlier device.
-                    let _ = Self::rollback_device_label(
-                        &device_path,
-                        &rollback_label,
-                        &mut write_labels,
-                    );
-                    for (path, original_label) in &written {
-                        let _ =
-                            Self::rollback_device_label(path, original_label, &mut write_labels);
+                    let _ = Self::rollback_device_label(&device_path, &existing, &mut write_labels);
+                    for (path, original) in &written {
+                        let _ = Self::rollback_device_label(path, original, &mut write_labels);
                     }
                     return Err(ExportError::LabelWriteFailed {
                         device_path,
@@ -272,7 +287,9 @@ impl PoolExporter {
     }
 
     /// Read the current label from a device.
-    fn read_existing_label(device_path: &Path) -> std::result::Result<PoolLabelV1, ExportError> {
+    fn read_existing_label(
+        device_path: &Path,
+    ) -> std::result::Result<ExportLabelRecord, ExportError> {
         let _metadata = fs::metadata(device_path)
             .map_err(|e| ExportError::IoError(format!("stat {}: {e}", device_path.display())))?;
 
@@ -296,16 +313,44 @@ impl PoolExporter {
             .open(&label_path)
             .map_err(|e| ExportError::IoError(format!("open {}: {e}", label_path.display())))?;
 
-        // PoolLabelWriter emits the extended record. Reading only the base
-        // prefix would reject valid health/redundancy labels as truncated.
-        let mut buf = [0u8; POOL_LABEL_V1_EXT_WIRE_SIZE];
-        use std::io::Read;
-        file.read_exact(&mut buf)
+        let mut buf = [0u8; POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE];
+        file.read_exact(&mut buf[..POOL_LABEL_V1_WIRE_SIZE])
+            .map_err(|e| ExportError::IoError(format!("read {}: {e}", label_path.display())))?;
+        let features_compat = u64::from_le_bytes(buf[371..379].try_into().unwrap());
+        let wire_size = if features_compat & features::DEVICE_LAYOUT_V1 != 0 {
+            POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE
+        } else if features_compat & features::POOL_REDUNDANCY_POLICY != 0 {
+            POOL_LABEL_V1_EXT_WIRE_SIZE
+        } else if features_compat & features::DEVICE_HEALTH_STATE != 0 {
+            POOL_LABEL_V1_HEALTH_WIRE_SIZE
+        } else {
+            POOL_LABEL_V1_WIRE_SIZE
+        };
+        file.read_exact(&mut buf[POOL_LABEL_V1_WIRE_SIZE..wire_size])
             .map_err(|e| ExportError::IoError(format!("read {}: {e}", label_path.display())))?;
 
-        decode_label(&buf).map_err(|e| ExportError::LabelValidationFailed {
-            device_path: device_path.to_path_buf(),
-            reason: format!("decode: {e:?}"),
+        let label =
+            decode_label(&buf[..wire_size]).map_err(|e| ExportError::LabelValidationFailed {
+                device_path: device_path.to_path_buf(),
+                reason: format!("decode: {e:?}"),
+            })?;
+        let device_layout_v1 = decode_device_layout_v1_bytes(&buf[..wire_size]).map_err(|e| {
+            ExportError::LabelValidationFailed {
+                device_path: device_path.to_path_buf(),
+                reason: format!("decode DeviceLayoutV1 extent: {e:?}"),
+            }
+        })?;
+        if let Some(layout) = device_layout_v1.as_ref() {
+            decode_device_layout_v1(layout).map_err(|e| ExportError::LabelValidationFailed {
+                device_path: device_path.to_path_buf(),
+                reason: format!("decode DeviceLayoutV1: {e:?}"),
+            })?;
+        }
+
+        Ok(ExportLabelRecord {
+            label,
+            device_layout_v1,
+            wire_size,
         })
     }
 
@@ -376,16 +421,45 @@ impl PoolExporter {
     fn write_labels_to_device(
         device_path: &Path,
         label: &PoolLabelV1,
+        device_layout_v1: Option<&DeviceLayoutV1Bytes>,
+        wire_size: usize,
     ) -> std::result::Result<(), ExportError> {
-        let sealed = seal_label(label.clone()).map_err(|e| ExportError::LabelWriteFailed {
+        let expected_wire_size = if device_layout_v1.is_some() {
+            POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE
+        } else if label.features_compat & features::POOL_REDUNDANCY_POLICY != 0 {
+            POOL_LABEL_V1_EXT_WIRE_SIZE
+        } else if label.features_compat & features::DEVICE_HEALTH_STATE != 0 {
+            POOL_LABEL_V1_HEALTH_WIRE_SIZE
+        } else {
+            POOL_LABEL_V1_WIRE_SIZE
+        };
+        if wire_size != expected_wire_size {
+            return Err(ExportError::LabelValidationFailed {
+                device_path: device_path.to_path_buf(),
+                reason: format!(
+                    "label extent {wire_size} does not match expected {expected_wire_size}"
+                ),
+            });
+        }
+
+        let sealed = match device_layout_v1 {
+            Some(layout) => seal_label_with_device_layout(label.clone(), Some(layout)),
+            None => seal_label(label.clone()),
+        }
+        .map_err(|e| ExportError::LabelWriteFailed {
             device_path: device_path.to_path_buf(),
             reason: format!("seal: {e:?}"),
         })?;
 
-        // Export changes pool state, not the device-health or redundancy
-        // authority carried by the extended label.
-        let mut buf = [0u8; POOL_LABEL_V1_EXT_WIRE_SIZE];
-        encode_label(&sealed, &mut buf).map_err(|e| ExportError::LabelWriteFailed {
+        // Export changes pool state, not the label extent or its evidence.
+        let mut buf = [0u8; POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE];
+        match device_layout_v1 {
+            Some(layout) => {
+                encode_label_with_device_layout(&sealed, Some(layout), &mut buf[..wire_size])
+            }
+            None => encode_label(&sealed, &mut buf[..wire_size]),
+        }
+        .map_err(|e| ExportError::LabelWriteFailed {
             device_path: device_path.to_path_buf(),
             reason: format!("encode: {e:?}"),
         })?;
@@ -398,11 +472,11 @@ impl PoolExporter {
         let backup_offset = Self::backup_label_offset(device_path, label)?;
 
         // Write Label 0
-        Self::write_at_offset(&label_path, &buf, 0)?;
+        Self::write_at_offset(&label_path, &buf[..wire_size], 0)?;
         // Write Label 1 at the canonical backup location used by pool
         // creation and scanning. Directory compatibility keeps its compact
         // two-area label file; byte devices place the backup at the tail.
-        Self::write_at_offset(&label_path, &buf, backup_offset)?;
+        Self::write_at_offset(&label_path, &buf[..wire_size], backup_offset)?;
 
         Ok(())
     }
@@ -432,21 +506,31 @@ impl PoolExporter {
     /// Rollback: write ACTIVE state back to a device label.
     fn rollback_device_label<F>(
         device_path: &Path,
-        original_label: &PoolLabelV1,
+        original: &ExportLabelRecord,
         write_labels: &mut F,
     ) -> std::result::Result<(), ExportError>
     where
-        F: FnMut(&Path, &PoolLabelV1) -> std::result::Result<(), ExportError>,
+        F: FnMut(
+            &Path,
+            &PoolLabelV1,
+            Option<&DeviceLayoutV1Bytes>,
+            usize,
+        ) -> std::result::Result<(), ExportError>,
     {
-        let mut active = original_label.clone();
+        let mut active = original.label.clone();
         active.pool_state = LabelPoolState::Active;
-        write_labels(device_path, &active)
+        write_labels(
+            device_path,
+            &active,
+            original.device_layout_v1.as_ref(),
+            original.wire_size,
+        )
     }
 
     /// Write raw bytes at a given offset within a file.
     fn write_at_offset(
         path: &Path,
-        data: &[u8; POOL_LABEL_V1_EXT_WIRE_SIZE],
+        data: &[u8],
         offset: u64,
     ) -> std::result::Result<(), ExportError> {
         let mut file = fs::OpenOptions::new()
@@ -1073,6 +1157,77 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    #[test]
+    fn export_preserves_device_layout_sidecar() {
+        use crate::device_layout::{
+            encode_device_layout_v1, DeviceLayoutPolicy, DEVICE_LAYOUT_V1_WIRE_SIZE,
+        };
+
+        let path = unique_export_path("device-layout-sidecar");
+        let _ = std::fs::remove_file(&path);
+        let capacity_bytes = 4 * POOL_LABEL_SIZE as u64;
+        let tail_offset = capacity_bytes - POOL_LABEL_SIZE as u64;
+        let pool_guid = [0x8C; 16];
+        let device_guid = [0x8D; 16];
+
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        file.set_len(capacity_bytes).unwrap();
+        drop(file);
+
+        let layout = DeviceLayoutPolicy::Slice0Small
+            .compute(capacity_bytes)
+            .unwrap();
+        let mut layout_bytes = [0u8; DEVICE_LAYOUT_V1_WIRE_SIZE];
+        encode_device_layout_v1(&layout, &mut layout_bytes);
+
+        let mut label = PoolLabelV1::new(pool_guid, device_guid, "testpool");
+        label.commit_group = 10;
+        label.label_commit_group = 10;
+        label.topology_generation = 7;
+        label.device_capacity_bytes = capacity_bytes;
+        label.system_area_pointer = layout.system_area_offset;
+        label.system_area_size = layout.system_area_len;
+        let sealed = seal_label_with_device_layout(label, Some(&layout_bytes)).unwrap();
+        let mut buf = [0u8; POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE];
+        encode_label_with_device_layout(&sealed, Some(&layout_bytes), &mut buf).unwrap();
+        PoolExporter::write_at_offset(&path, &buf, 0).unwrap();
+        PoolExporter::write_at_offset(&path, &buf, tail_offset).unwrap();
+
+        let config = DeviceConfig {
+            media_class: Default::default(),
+            path: path.clone(),
+            backing: DeviceBacking::RegularFileDev,
+            class: DeviceClass::Data,
+            kind: DeviceKind::Single { path: path.clone() },
+            compression: None,
+            encryption: None,
+        };
+        PoolExporter::export_pool(&[config], pool_guid, &[device_guid], "testpool", 12).unwrap();
+
+        for offset in [0, tail_offset] {
+            let mut file = std::fs::File::open(&path).unwrap();
+            file.seek(SeekFrom::Start(offset)).unwrap();
+            let mut exported = [0u8; POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE];
+            file.read_exact(&mut exported).unwrap();
+            assert_eq!(
+                decode_label(&exported).unwrap().pool_state,
+                LabelPoolState::Exported
+            );
+            assert_eq!(
+                decode_device_layout_v1_bytes(&exported).unwrap(),
+                Some(layout_bytes)
+            );
+        }
+
+        let _ = std::fs::remove_file(path);
+    }
+
     fn write_export_label(
         path: &Path,
         pool_guid: [u8; 16],
@@ -1219,7 +1374,7 @@ mod tests {
             &[device_guid, device_guid],
             "testpool",
             12,
-            |_, _| {
+            |_, _, _, _| {
                 writes += 1;
                 Ok(())
             },
@@ -1343,16 +1498,16 @@ mod tests {
             &device_guids,
             "testpool",
             12,
-            move |path, label| {
+            move |path, label, device_layout_v1, wire_size| {
                 if path == injected_failure_path.as_path()
                     && label.pool_state == LabelPoolState::Exported
                 {
                     // Model an error reported after media was mutated, such
                     // as a sync failure after one or both copies were written.
-                    PoolExporter::write_labels_to_device(path, label)?;
+                    PoolExporter::write_labels_to_device(path, label, device_layout_v1, wire_size)?;
                     Err(ExportError::IoError("injected label write failure".into()))
                 } else {
-                    PoolExporter::write_labels_to_device(path, label)
+                    PoolExporter::write_labels_to_device(path, label, device_layout_v1, wire_size)
                 }
             },
         );
