@@ -6943,17 +6943,6 @@ impl FuseVfsAdapter {
             if written > 0 {
                 self.mark_relatime_read_atime_pending_after_write(ino);
             }
-            // Record the write in the runtime projection so the dirty
-            // lifecycle is observable for claim-gate validation
-            // (no hidden writeback queues).
-            if written > 0 {
-                let total_dirty = WritebackProjection::total_observable_dirty_bytes(
-                    &self.dirty_state,
-                    self.writeback_page_cache.as_ref(),
-                    ino,
-                );
-                self.writeback_projection.record_dirty(ino, total_dirty);
-            }
             Ok(written)
         } else {
             let efh = resolved_efh.ok_or(Errno::EBADF)?;
@@ -7171,6 +7160,13 @@ impl FuseVfsAdapter {
         write_flags: u32,
         kernel_page_cache_invalidation: KernelPageCacheInvalidation,
     ) {
+        // Publish the dirty guard before any dirty queue or cache mirror.
+        // The mmap invalidation worker runs independently, so delaying this
+        // transition until the outer write dispatch returns would leave a
+        // window where newly dirty bytes could still appear clean.
+        self.writeback_projection
+            .record_dirty(ino, u64::from(written));
+
         // Submit dirty extent to the writeback scheduler for
         // later flush/fsync writeback.
         let outcome = PosixFilesystemAdapterWriteStagingOutcome {
@@ -7291,6 +7287,10 @@ impl FuseVfsAdapter {
             .lock()
             .unwrap()
             .accept_write(ino, offset, &data[..written as usize]);
+
+        // Refresh the provisional guard with the complete observable total
+        // after every dirty mirror has been populated.
+        self.refresh_writeback_projection(ino);
     }
 
     fn record_clean_write_through_after_write(
@@ -42856,6 +42856,26 @@ mod tests {
                 .dirty_pages_for_inode(ino)
                 .is_empty(),
             "dirty writeback-cache writes still dirty the adapter page mirror"
+        );
+        assert!(
+            fixture.adapter.writeback_projection.is_dirty(ino),
+            "the mmap guard must observe the dirty transition before write dispatch continues"
+        );
+        assert_eq!(
+            fixture
+                .adapter
+                .writeback_projection
+                .stats_snapshot()
+                .dirty_transitions,
+            1,
+            "one accepted dirty write must publish one clean-to-dirty transition"
+        );
+        assert!(
+            !fixture
+                .adapter
+                .writeback_projection
+                .invalidation_allowed(ino),
+            "mmap invalidation must remain fenced while the new dirty mirrors exist"
         );
     }
 
