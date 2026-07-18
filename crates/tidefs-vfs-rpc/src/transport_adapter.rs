@@ -613,6 +613,41 @@ impl VfsRpcTransportAdapter {
         Ok(record)
     }
 
+    /// Retire every BULK admission bound to a lost authenticated session.
+    ///
+    /// Ordinary non-BULK request correlations remain owned by their existing
+    /// retry/timeout path. A correlated READ response admission is removed
+    /// here because its DATA transfer cannot complete after this connection is
+    /// gone.
+    pub fn retire_bulk_connection(
+        &mut self,
+        session_id: SessionId,
+    ) -> Vec<VfsRpcBulkAdmissionRecord> {
+        let connection_id = connection_id_for_session(session_id);
+        let keys = self
+            .pending_bulk
+            .keys()
+            .filter(|key| key.connection_id == connection_id)
+            .copied()
+            .collect::<Vec<_>>();
+        let mut retired = Vec::with_capacity(keys.len());
+        for key in keys {
+            let pending = self
+                .pending_bulk
+                .remove(&key)
+                .expect("lost-connection BULK admission remains until retirement");
+            let record = pending.as_record(key.connection_id, key.token);
+            if record.direction == VfsRpcFrameDirection::Response {
+                self.pending.remove(&PendingTransportKey {
+                    peer: record.peer,
+                    op_id: record.op_id,
+                });
+            }
+            retired.push(record);
+        }
+        retired
+    }
+
     fn envelope_for(
         &self,
         session_id: SessionId,

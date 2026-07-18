@@ -111,6 +111,13 @@ impl BulkDataServiceHandler {
         )
     }
 
+    /// Reclaim every active transfer owned by a lost authenticated
+    /// connection.
+    #[must_use]
+    pub fn connection_lost(&self, connection_id: ConnectionId) -> Vec<AbortedBulkTransfer> {
+        self.service.lock().unwrap().connection_lost(connection_id)
+    }
+
     #[must_use]
     pub fn active_transfer_count(&self, connection_id: ConnectionId) -> usize {
         self.service

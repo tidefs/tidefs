@@ -601,7 +601,7 @@ pub use outbound_send::{
 pub use receive_loop::{
     build_frame, family_id_to_message_family, message_family_to_family_id, ConnectionReceiver,
     DrainVelocityTracker, ReceiveLoopConfig, ReceiveLoopDiagnostics, ReceiveLoopError,
-    SpawnedReceiver, DEFAULT_READ_BUF_SIZE, TRANSPORT_FAMILY_ID_BASE,
+    ReceiveLoopExitHook, SpawnedReceiver, DEFAULT_READ_BUF_SIZE, TRANSPORT_FAMILY_ID_BASE,
 };
 pub use recv_batch::{RecvBatchConfig, RecvBatchDecoder, RecvBatchDiagnostics};
 pub use send_completion::{

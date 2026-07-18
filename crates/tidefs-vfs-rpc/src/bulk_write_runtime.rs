@@ -206,12 +206,17 @@ where
         session_id: SessionId,
         data_reply_sink: Arc<dyn DataServiceReplySink>,
     ) -> ConnectionReceiver {
+        let runtime = self.clone();
         receiver
             .with_data_service_dispatch(session_id, self.data_dispatch(), data_reply_sink)
             .with_control_service_dispatch(
                 session_id,
                 self.control_dispatch(),
                 self.control_reply_sink.clone(),
+            )
+            .with_exit_hook(
+                session_id,
+                Arc::new(move |session_id| runtime.connection_lost(session_id)),
             )
     }
 
@@ -229,6 +234,23 @@ where
         self.bulk
             .handle_tcp_chunk(connection_id, chunk)
             .map_err(Into::into)
+    }
+
+    /// Reclaim all BULK and pending-WRITE state when the authenticated
+    /// connection can no longer deliver a terminal frame.
+    ///
+    /// No VFS_RPC reply is attempted because the connection has already
+    /// exited. The adapter and runtime records are removed in the same teardown
+    /// path as BULK transfer retirement so a reconnect must use fresh transfer
+    /// state.
+    pub fn connection_lost(&self, session_id: SessionId) {
+        let connection_id = session_id.0;
+        let mut state = self.state.lock().unwrap();
+        let _aborted = self.bulk.connection_lost(connection_id);
+        state.adapter.retire_bulk_connection(session_id);
+        state
+            .pending_writes
+            .retain(|key, _| key.connection_id != connection_id);
     }
 
     /// Dispatch one already-demultiplexed VFS_RPC CONTROL frame at `now`.
@@ -1109,6 +1131,35 @@ mod tests {
         assert!(runtime
             .handle_control_service_frame_at(Instant::now(), SESSION_ID, control_request(&request))
             .is_err());
+    }
+
+    #[test]
+    fn connection_loss_reclaims_admitted_and_orphan_transfers() {
+        let (runtime, target, sink) = runtime(Duration::from_secs(1));
+        let handle = create_handle(&runtime);
+        let data_dispatch = runtime.data_dispatch();
+        let admitted = accept_write_transfer(&data_dispatch, 2, 26, 3);
+        let _request = admitted_write(&runtime, handle, admitted, 3, Instant::now());
+        let orphan = accept_write_transfer(&data_dispatch, 77, 27, 5);
+        grant_and_write(&runtime, &data_dispatch, 26, admitted, b"abc");
+        grant_and_write(&runtime, &data_dispatch, 27, orphan, b"abcde");
+
+        assert_eq!(runtime.pending_write_count(), 1);
+        assert_eq!(runtime.bulk.active_transfer_count(SESSION_ID.0), 2);
+        assert_eq!(runtime.bulk.pinned_bytes(SESSION_ID.0), 8);
+        assert_eq!(runtime.state.lock().unwrap().adapter.pending_bulk_len(), 1);
+
+        runtime.connection_lost(SESSION_ID);
+
+        assert_eq!(runtime.pending_write_count(), 0);
+        assert_eq!(runtime.bulk.active_transfer_count(SESSION_ID.0), 0);
+        assert_eq!(runtime.bulk.pinned_bytes(SESSION_ID.0), 0);
+        assert_eq!(runtime.state.lock().unwrap().adapter.pending_bulk_len(), 0);
+        assert!(target.writes().is_empty());
+        assert!(sink.replies().is_empty());
+
+        runtime.connection_lost(SESSION_ID);
+        assert_eq!(runtime.pending_write_count(), 0);
     }
 
     #[test]

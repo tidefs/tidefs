@@ -147,6 +147,14 @@ pub struct ReceiveLoopConfig {
     pub read_buf_size: usize,
 }
 
+/// Synchronous cleanup hook invoked when an authenticated receive loop exits.
+///
+/// The hook runs on clean EOF, an unrecoverable receive error, or task
+/// cancellation. It must not block: its purpose is to retire connection-local
+/// protocol state before the receiver and its authenticated session binding are
+/// dropped.
+pub type ReceiveLoopExitHook = Arc<dyn Fn(SessionId) + Send + Sync>;
+
 impl Default for ReceiveLoopConfig {
     fn default() -> Self {
         Self {
@@ -194,6 +202,9 @@ pub struct ConnectionReceiver {
     credit_tracker: Option<Arc<SenderCreditTracker>>,
     /// Channel to queue credit-refresh frames for outbound transmission.
     credit_refresh_tx: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
+    /// Connection-local protocol cleanup invoked after the receive loop starts
+    /// and then exits.
+    exit_hooks: Vec<ReceiveLoopExitHook>,
 }
 
 impl ConnectionReceiver {
@@ -226,6 +237,7 @@ impl ConnectionReceiver {
             receive_flow_controller: None,
             credit_tracker: None,
             credit_refresh_tx: None,
+            exit_hooks: Vec::new(),
         }
     }
     /// Attach an idle tracker for recording inbound activity.
@@ -273,6 +285,18 @@ impl ConnectionReceiver {
     ) -> Self {
         self.session_id = Some(session_id);
         register_control_service_dispatch(&self.dispatch, dispatch, reply_sink);
+        self
+    }
+
+    /// Attach cleanup for connection-local state owned by service handlers.
+    ///
+    /// `session_id` is the authenticated session established for this
+    /// connection. The hook is moved into the running receive loop so it also
+    /// executes when a spawned loop is cancelled.
+    #[must_use]
+    pub fn with_exit_hook(mut self, session_id: SessionId, hook: ReceiveLoopExitHook) -> Self {
+        self.session_id = Some(session_id);
+        self.exit_hooks.push(hook);
         self
     }
 
@@ -381,6 +405,7 @@ impl ConnectionReceiver {
     ///
     /// Returns [`ReceiveLoopError::Io`] if a non-EOF socket error occurs.
     pub async fn recv_loop(&mut self) -> Result<(), ReceiveLoopError> {
+        let _exit_guard = self.take_exit_guard();
         let mut buf = vec![0u8; self.config.read_buf_size];
 
         loop {
@@ -455,7 +480,11 @@ impl ConnectionReceiver {
     /// TCP EOF or an unrecoverable I/O error.
     #[must_use]
     pub fn spawn(mut self) -> SpawnedReceiver {
+        // Capture the guard in the task future before its first poll so an
+        // immediate cancellation still runs connection-local cleanup.
+        let exit_guard = self.take_exit_guard();
         let handle = tokio::spawn(async move {
+            let _exit_guard = exit_guard;
             if let Err(e) = self.recv_loop().await {
                 tracing::warn!(
                     error = %e,
@@ -466,6 +495,13 @@ impl ConnectionReceiver {
             self.stream
         });
         SpawnedReceiver { handle }
+    }
+
+    fn take_exit_guard(&mut self) -> ReceiveLoopExitGuard {
+        ReceiveLoopExitGuard {
+            session_id: self.session_id,
+            hooks: std::mem::take(&mut self.exit_hooks),
+        }
     }
 
     // ----------------------------------------------------------------
@@ -695,6 +731,21 @@ impl ConnectionReceiver {
         if let Some(ref t) = self.telemetry {
             for _ in 0..msg_count {
                 t.record_message_received();
+            }
+        }
+    }
+}
+
+struct ReceiveLoopExitGuard {
+    session_id: Option<SessionId>,
+    hooks: Vec<ReceiveLoopExitHook>,
+}
+
+impl Drop for ReceiveLoopExitGuard {
+    fn drop(&mut self) {
+        if let Some(session_id) = self.session_id {
+            for hook in std::mem::take(&mut self.hooks) {
+                hook(session_id);
             }
         }
     }
@@ -1306,6 +1357,8 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let server_addr = listener.local_addr().unwrap();
         let session_id = SessionId::new(42);
+        let exited_sessions = Arc::new(Mutex::new(Vec::new()));
+        let exit_log = exited_sessions.clone();
         let control_frame = ControlServiceFrame::new(0x06, 0x01, b"rpc".to_vec());
         let data_frame = DataServiceFrame::new(0x07, 0x02, b"bulk".to_vec());
         let control_payload = control_frame.encode().expect("encode control frame");
@@ -1347,6 +1400,10 @@ mod tests {
             session_id,
             control_dispatch,
             Arc::new(ConsumedControlReplySink),
+        )
+        .with_exit_hook(
+            session_id,
+            Arc::new(move |session_id| exit_log.lock().unwrap().push(session_id)),
         );
 
         receiver.recv_loop().await.expect("clean receive EOF");
@@ -1360,6 +1417,7 @@ mod tests {
             data_handler.seen.lock().unwrap().as_slice(),
             &[(session_id, data_frame)]
         );
+        assert_eq!(exited_sessions.lock().unwrap().as_slice(), &[session_id]);
     }
 
     #[tokio::test]
@@ -1462,6 +1520,33 @@ mod tests {
         assert!(result.is_ok());
 
         sender.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn spawned_receiver_abort_runs_exit_hook() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        let client =
+            tokio::spawn(async move { tokio::net::TcpStream::connect(server_addr).await.unwrap() });
+        let (server_stream, _) = listener.accept().await.unwrap();
+        let _client_stream = client.await.unwrap();
+        let session_id = SessionId::new(43);
+        let exited_sessions = Arc::new(Mutex::new(Vec::new()));
+        let exit_log = exited_sessions.clone();
+        let receiver = ConnectionReceiver::new(
+            server_stream,
+            Arc::new(MessageDispatch::new()),
+            ReceiveLoopConfig::default(),
+        )
+        .with_exit_hook(
+            session_id,
+            Arc::new(move |session_id| exit_log.lock().unwrap().push(session_id)),
+        );
+
+        let spawned = receiver.spawn();
+        spawned.abort();
+        assert!(spawned.handle.await.unwrap_err().is_cancelled());
+        assert_eq!(exited_sessions.lock().unwrap().as_slice(), &[session_id]);
     }
 
     #[tokio::test]
