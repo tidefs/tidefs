@@ -203,7 +203,7 @@ fi
 
 jq -e '
   .test == "tidefs-fuse-vm-test"
-  and .version == 3
+  and .version == 4
   and .tier == "outside-sandbox-qemu-guest"
   and .kernel_package == "linuxKernel_7_0"
   and (.kernel_version | type == "string" and test("^7\\.0([.-]|$)"))
