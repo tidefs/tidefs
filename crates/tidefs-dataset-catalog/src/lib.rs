@@ -21,11 +21,10 @@
 //! first component. Paths are UTF-8 strings, 1..4096 bytes, no `\0`, no
 //! consecutive `/` separators, no trailing `/`.
 //!
-//! ## Anti-pattern avoided
+//! ## Rename behavior
 //!
-//! ZFS mistake #19 — rename requires unmount. TideFS separates dataset
-//! identity (stable UUID) from mount semantics so `rename_dataset` is a
-//! single catalog mutation with no unmount, no open-handle disruption.
+//! [`DatasetCatalog::rename`] updates the path mapping while preserving the
+//! stable [`DatasetId`] values of the renamed dataset and its descendants.
 //!
 //! # Authority
 //!
