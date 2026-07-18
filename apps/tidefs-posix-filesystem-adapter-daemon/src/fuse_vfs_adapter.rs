@@ -9248,14 +9248,15 @@ impl FuseVfsAdapter {
             let ctx = Self::system_request_ctx();
             self.finish_successful_writeback_read_handle_atime(ino, open_flags, &ctx);
         }
-        self.writeback_cache.lock().unwrap().mark_clean(ino);
-
-        // Drain the DirtyPageTracker for this inode after writeback so
-        // the background flush service (#4657) sees a clean inode.
+        // Retire the shared range-tracker projection after the release path.
+        // Adapter dirty_state, worker ranges, and page-cache mirrors remain
+        // independent dirty owners until their stronger barrier completes.
         if let Some(ref tracker) = self.writeback_range_tracker {
             tracker.lock().unwrap().flush_inode(InodeId::new(ino));
         }
-        self.writeback_cache.lock().unwrap().invalidate(ino);
+        if !self.inode_has_dirty_trackers(ino) && !self.inode_has_dirty_page_cache_mirrors(ino) {
+            self.writeback_cache.lock().unwrap().invalidate(ino);
+        }
 
         // Release POSIX locks owned by this lock_owner on close.
         // Per FUSE protocol, close() releases locks; release() is
@@ -42062,7 +42063,7 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_release_drains_writeback_range_tracker_on_last_close() {
+    fn dispatch_release_drains_shared_tracker_but_retains_dirty_reclaim_projection() {
         let (mut fixture, tracker) = adapter_fixture_with_writeback_tracker();
         let ctx = root_ctx();
 
@@ -42093,6 +42094,23 @@ mod tests {
             .expect("release");
 
         assert!(!tracker.lock().unwrap().is_dirty(inode));
+        assert!(fixture
+            .adapter
+            .dirty_state
+            .lock()
+            .unwrap()
+            .get(&ino)
+            .is_some_and(|ranges| ranges.contains(0, b"release data".len() as u32)));
+        assert_eq!(
+            fixture
+                .adapter
+                .writeback_cache
+                .lock()
+                .unwrap()
+                .is_dirty(ino),
+            Some(true),
+            "release must not discard the reclaim projection while dirty owners remain"
+        );
     }
 
     #[test]
