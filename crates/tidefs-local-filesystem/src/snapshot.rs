@@ -159,6 +159,10 @@ pub(crate) fn snapshot_record_retains_data(record: &SnapshotRecord) -> bool {
     matches!(record.kind, SnapshotKind::Snapshot | SnapshotKind::Clone)
 }
 
+fn snapshot_record_is_browsable(record: &SnapshotRecord) -> bool {
+    record.kind == SnapshotKind::Snapshot
+}
+
 const SNAPSHOT_CATALOG_SYNTHETIC_INODE_BASE: u64 = 1 << 63;
 
 fn snapshot_catalog_synthetic_inode_id(name: &[u8]) -> InodeId {
@@ -318,7 +322,7 @@ impl LocalFileSystem {
         self.state
             .snapshots
             .values()
-            .any(snapshot_record_retains_data)
+            .any(snapshot_record_is_browsable)
             .then(|| Generation::new(self.state.generation))
     }
 
@@ -336,7 +340,7 @@ impl LocalFileSystem {
             .state
             .snapshots
             .values()
-            .filter(|record| snapshot_record_retains_data(record))
+            .filter(|record| snapshot_record_is_browsable(record))
         {
             let inode_id = snapshot_catalog_synthetic_inode_id(&record.name);
             if self.state.inodes.contains_key(&inode_id) {
@@ -1552,18 +1556,23 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_catalog_lookup_excludes_non_retaining_bookmarks() {
+    fn snapshot_catalog_lookup_exposes_only_regular_snapshots() {
         let dir = temp_dir();
         let mut fs = new_fs(&dir);
 
         fs.create_snapshot("origin")
             .expect("create origin snapshot");
+        fs.create_clone("fork", "origin").expect("create clone");
         fs.create_bookmark("anchor", "origin")
             .expect("create bookmark");
         assert!(fs
             .snapshot_catalog_lookup(b"origin")
             .expect("lookup origin snapshot")
             .is_some());
+        assert!(fs
+            .snapshot_catalog_lookup(b"fork")
+            .expect("lookup clone")
+            .is_none());
         assert!(fs
             .snapshot_catalog_lookup(b"anchor")
             .expect("lookup bookmark")
@@ -1572,6 +1581,10 @@ mod tests {
         fs.delete_snapshot("origin")
             .expect("delete origin snapshot");
         assert_eq!(fs.snapshot_catalog_generation(), None);
+        assert!(fs
+            .snapshot_catalog_lookup(b"fork")
+            .expect("lookup clone without snapshots")
+            .is_none());
         assert!(fs
             .snapshot_catalog_lookup(b"anchor")
             .expect("lookup bookmark without snapshots")
