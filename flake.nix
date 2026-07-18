@@ -212,6 +212,24 @@
             ];
           };
 
+          tidefsStorageIntentDataShapeRuntime = import ./nix/packages/tidefs.nix {
+            inherit (pkgs) lib pkg-config;
+            inherit (pkgs) fuse3 rdma-core;
+            rustPlatform = rustPlatform;
+            src = tidefsWorkspaceSrc;
+            cargoLock = {
+              lockFile = ./Cargo.lock;
+            };
+            cargoBuildFlags = [
+              "-p" "tidefs-validation"
+              "--features" "fuse"
+              "--bin" "storage-intent-data-shape-runtime-validation"
+            ];
+            workspaceBins = [
+              "storage-intent-data-shape-runtime-validation"
+            ];
+          };
+
           tidefsScrubForegroundReadValidation = import ./nix/packages/tidefs.nix {
             inherit (pkgs) lib pkg-config;
             inherit (pkgs) fuse3 rdma-core;
@@ -486,6 +504,7 @@
             linuxKernel_7_0 = linuxKernel_7_0;
             tidefsPackage = default;
             ackValidationPackage = tidefsStorageIntentAckRuntime;
+            dataShapeValidationPackage = tidefsStorageIntentDataShapeRuntime;
             scrubValidationPackage = tidefsScrubForegroundReadValidation;
           };
 

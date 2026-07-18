@@ -36,6 +36,11 @@ name = "storage-intent-ack-runtime-validation"
 path = "src/bin/storage_intent_ack_runtime_validation.rs"
 required-features = ["fuse"]
 
+[[bin]]
+name = "storage-intent-data-shape-runtime-validation"
+path = "src/bin/storage_intent_data_shape_runtime_validation.rs"
+required-features = ["fuse"]
+
 [features]
 default = []
 
@@ -93,6 +98,7 @@ fuse = [
     "storage-core",
     "scrub-runtime",
     "dep:tidefs-encryption",
+    "dep:tidefs-erasure-coding",
     "dep:tidefs-space-accounting",
     "dep:tidefs-types-space-accounting-core",
     "dep:tidefs-compression",
@@ -148,6 +154,7 @@ tidefs-extent-map = { workspace = true, optional = true }
 tidefs-types-extent-map-core = { workspace = true, optional = true }
 tidefs-local-object-store = { workspace = true, optional = true }
 tidefs-encryption = { workspace = true, optional = true }
+tidefs-erasure-coding = { workspace = true, optional = true }
 tidefs-compression = { workspace = true, optional = true }
 tidefs-space-accounting = { workspace = true, optional = true }
 tidefs-types-space-accounting-core = { workspace = true, optional = true }

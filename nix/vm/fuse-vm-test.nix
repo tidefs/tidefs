@@ -8,6 +8,7 @@
   linuxKernel_7_0,
   tidefsPackage,
   ackValidationPackage,
+  dataShapeValidationPackage,
   scrubValidationPackage,
 }:
 
@@ -26,6 +27,7 @@ pkgs.writeShellScriptBin "tidefs-fuse-vm-test-runner" ''
   TIDEFS_STORE_DEMO="${tidefsPackage}/bin/tidefs-store-demo"
   FUSE_DAEMON="${tidefsPackage}/bin/tidefs-posix-filesystem-adapter-daemon"
   ACK_VALIDATION="${ackValidationPackage}/bin/storage-intent-ack-runtime-validation"
+  DATA_SHAPE_VALIDATION="${dataShapeValidationPackage}/bin/storage-intent-data-shape-runtime-validation"
   SCRUB_VALIDATION="${scrubValidationPackage}/bin/scrub_foreground_read_validation"
   BASE64="${pkgs.coreutils}/bin/base64"
   B3SUM="${pkgs.b3sum}/bin/b3sum"
@@ -44,9 +46,10 @@ pkgs.writeShellScriptBin "tidefs-fuse-vm-test-runner" ''
 Usage: tidefs-fuse-vm-test-runner [OPTIONS]
 
 Build a tiny Linux 7.0 initrd from Nix-built artifacts and launch QEMU outside
-the Nix sandbox. The guest runs the legacy tidefsFuseVmTest validation sequence:
-kernel check, /dev/fuse check, tidefs-xtask summary, tidefs-store-demo, and
-smoke-mount with queue-depth artifact capture. The scrub option instead runs
+the Nix sandbox. The guest runs the tidefsFuseVmTest validation sequence:
+kernel check, /dev/fuse check, focused data-shape helper execution,
+tidefs-xtask summary, tidefs-store-demo, and smoke-mount with queue-depth
+artifact capture. The scrub option instead runs
 the mounted scrub/read isolation binary and returns its typed evidence files.
 The acknowledgment option runs the focused receipt producer on the same live
 FUSE guest without adding crash or fault coverage.
@@ -140,6 +143,14 @@ EOF
       fi
     done
   fi
+  if [ "$ACK_RECEIPT_RUNTIME" -eq 0 ] && [ "$SCRUB_FOREGROUND_READ" -eq 0 ]; then
+    for dep in "$DATA_SHAPE_VALIDATION" "$BASE64" "$B3SUM" "$JQ"; do
+      if [ ! -f "$dep" ] && [ ! -x "$dep" ]; then
+        echo "ERROR: dependency not found: $dep" >&2
+        exit 2
+      fi
+    done
+  fi
 
   echo "=== TideFS FUSE VM Test ==="
   echo "  Kernel:          $KERNEL_IMG"
@@ -153,6 +164,9 @@ EOF
   fi
   if [ "$SCRUB_FOREGROUND_READ" -eq 1 ]; then
     echo "  Scrub validator: $SCRUB_VALIDATION"
+  fi
+  if [ "$ACK_RECEIPT_RUNTIME" -eq 0 ] && [ "$SCRUB_FOREGROUND_READ" -eq 0 ]; then
+    echo "  Data-shape validator: $DATA_SHAPE_VALIDATION"
   fi
   echo "  Validation dir:  $VALIDATION_DIR"
   echo "  Queue artifact:  $QUEUE_DEPTH_ARTIFACT"
@@ -244,6 +258,10 @@ EOF
   if [ "$SCRUB_FOREGROUND_READ" -eq 1 ]; then
     copy_binary "$SCRUB_VALIDATION" "$RUN_DIR/bin/scrub_foreground_read_validation"
     copy_runtime_deps "$SCRUB_VALIDATION"
+  fi
+  if [ "$ACK_RECEIPT_RUNTIME" -eq 0 ] && [ "$SCRUB_FOREGROUND_READ" -eq 0 ]; then
+    copy_binary "$DATA_SHAPE_VALIDATION" "$RUN_DIR/bin/storage-intent-data-shape-runtime-validation"
+    copy_runtime_deps "$DATA_SHAPE_VALIDATION"
   fi
 
   FUSE_KO=""
@@ -381,6 +399,47 @@ if [ "$SCRUB_FOREGROUND_READ" -eq 1 ]; then
     fi
     echo "scrub_runtime_exit_status=$SCRUB_RUNTIME_RC"
     finish
+fi
+
+if [ "$ACK_RECEIPT_RUNTIME" -eq 0 ] && [ "$SCRUB_FOREGROUND_READ" -eq 0 ]; then
+    DATA_SHAPE_RUNTIME_DIR=/tmp/tidefs-validation/storage-intent-data-shape-runtime
+    mkdir -p "$DATA_SHAPE_RUNTIME_DIR"
+    TIDEFS_DATA_SHAPE_RUNTIME_OUTPUT_DIR="$DATA_SHAPE_RUNTIME_DIR" \
+      TIDEFS_DATA_SHAPE_RUNTIME_RUN_ID="$GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT" \
+      TIDEFS_DATA_SHAPE_RUNTIME_SOURCE_REF="$GITHUB_SHA" \
+      TIDEFS_DATA_SHAPE_RUNTIME_GENERATED_AT="$TIDEFS_GENERATED_AT" \
+      TIDEFS_DATA_SHAPE_RUNTIME_CARRIER="linux-7.0-qemu-guest/fuse-vm-test" \
+      timeout 180 storage-intent-data-shape-runtime-validation \
+      >/tmp/data-shape-runtime-output.txt 2>&1
+    DATA_SHAPE_RUNTIME_RC=$?
+    cat /tmp/data-shape-runtime-output.txt
+
+    if [ "$DATA_SHAPE_RUNTIME_RC" -eq 0 ]; then
+        pass "data_shape_runtime_process"
+    else
+        fail "data_shape_runtime_process" "exit status $DATA_SHAPE_RUNTIME_RC"
+    fi
+    if [ -s "$DATA_SHAPE_RUNTIME_DIR/data-shape-transform-execution.json" ]; then
+        echo "TIDEFS_DATA_SHAPE_TRANSFORM_ARTIFACT_BEGIN"
+        /bin/busybox base64 "$DATA_SHAPE_RUNTIME_DIR/data-shape-transform-execution.json"
+        echo "TIDEFS_DATA_SHAPE_TRANSFORM_ARTIFACT_END"
+    fi
+    if [ -s "$DATA_SHAPE_RUNTIME_DIR/data-shape-transform-execution.manifest.json" ]; then
+        echo "TIDEFS_DATA_SHAPE_TRANSFORM_MANIFEST_BEGIN"
+        /bin/busybox base64 "$DATA_SHAPE_RUNTIME_DIR/data-shape-transform-execution.manifest.json"
+        echo "TIDEFS_DATA_SHAPE_TRANSFORM_MANIFEST_END"
+    fi
+    if [ -s "$DATA_SHAPE_RUNTIME_DIR/data-shape-performance-fault-rows.json" ]; then
+        echo "TIDEFS_DATA_SHAPE_PERFORMANCE_ARTIFACT_BEGIN"
+        /bin/busybox base64 "$DATA_SHAPE_RUNTIME_DIR/data-shape-performance-fault-rows.json"
+        echo "TIDEFS_DATA_SHAPE_PERFORMANCE_ARTIFACT_END"
+    fi
+    if [ -s "$DATA_SHAPE_RUNTIME_DIR/data-shape-performance-fault-rows.manifest.json" ]; then
+        echo "TIDEFS_DATA_SHAPE_PERFORMANCE_MANIFEST_BEGIN"
+        /bin/busybox base64 "$DATA_SHAPE_RUNTIME_DIR/data-shape-performance-fault-rows.manifest.json"
+        echo "TIDEFS_DATA_SHAPE_PERFORMANCE_MANIFEST_END"
+    fi
+    echo "data_shape_runtime_exit_status=$DATA_SHAPE_RUNTIME_RC"
 fi
 
 if tidefs-xtask summary >/tmp/xtask-summary.out 2>&1; then
@@ -539,6 +598,29 @@ INITSCRIPT
       | "$BASE64" --decode > "$scrub_manifest" || true
   fi
 
+  data_shape_transform_artifact="$VALIDATION_DIR/data-shape-transform-execution.json"
+  data_shape_transform_manifest="$VALIDATION_DIR/data-shape-transform-execution.manifest.json"
+  data_shape_performance_artifact="$VALIDATION_DIR/data-shape-performance-fault-rows.json"
+  data_shape_performance_manifest="$VALIDATION_DIR/data-shape-performance-fault-rows.manifest.json"
+  if [ "$ACK_RECEIPT_RUNTIME" -eq 0 ] && [ "$SCRUB_FOREGROUND_READ" -eq 0 ]; then
+    extract_between \
+      "TIDEFS_DATA_SHAPE_TRANSFORM_ARTIFACT_BEGIN" \
+      "TIDEFS_DATA_SHAPE_TRANSFORM_ARTIFACT_END" \
+      | "$BASE64" --decode > "$data_shape_transform_artifact" || true
+    extract_between \
+      "TIDEFS_DATA_SHAPE_TRANSFORM_MANIFEST_BEGIN" \
+      "TIDEFS_DATA_SHAPE_TRANSFORM_MANIFEST_END" \
+      | "$BASE64" --decode > "$data_shape_transform_manifest" || true
+    extract_between \
+      "TIDEFS_DATA_SHAPE_PERFORMANCE_ARTIFACT_BEGIN" \
+      "TIDEFS_DATA_SHAPE_PERFORMANCE_ARTIFACT_END" \
+      | "$BASE64" --decode > "$data_shape_performance_artifact" || true
+    extract_between \
+      "TIDEFS_DATA_SHAPE_PERFORMANCE_MANIFEST_BEGIN" \
+      "TIDEFS_DATA_SHAPE_PERFORMANCE_MANIFEST_END" \
+      | "$BASE64" --decode > "$data_shape_performance_manifest" || true
+  fi
+
   PASSC=$(count_serial_lines '^PASS:')
   FAILC=$(count_serial_lines '^FAIL:')
   REFUSALC=$(count_serial_lines '^REFUSAL:')
@@ -634,6 +716,96 @@ INITSCRIPT
       fi
     fi
   fi
+  validate_data_shape_pair() {
+    local label="$1"
+    local artifact="$2"
+    local manifest="$3"
+    local expected_artifact_path="$4"
+    local declared_digest actual_digest artifact_outcome manifest_outcome
+    local artifact_source_ref manifest_source_ref artifact_run_id manifest_run_id
+    local artifact_tier manifest_tier expected_source_ref expected_run_id
+
+    if [ ! -s "$artifact" ] || [ ! -s "$manifest" ]; then
+      echo "FAIL: data_shape_$label artifact capture -- evidence payload or manifest is missing" >&2
+      FAILC=$((FAILC + 1))
+      return
+    fi
+    if ! "$JQ" -e 'type == "object"' "$artifact" >/dev/null \
+      || ! "$JQ" -e 'type == "object"' "$manifest" >/dev/null; then
+      echo "FAIL: data_shape_$label artifact capture -- evidence payload or manifest is not a JSON object" >&2
+      FAILC=$((FAILC + 1))
+      return
+    fi
+
+    declared_digest=$("$JQ" -r '.content_digest // empty' "$manifest")
+    actual_digest="blake3:$("$B3SUM" "$artifact" | awk '{print $1}')"
+    artifact_outcome=$("$JQ" -r '.outcome // empty' "$artifact")
+    manifest_outcome=$("$JQ" -r '.outcome // empty' "$manifest")
+    artifact_source_ref=$("$JQ" -r '.source_ref // empty' "$artifact")
+    manifest_source_ref=$("$JQ" -r '.source_ref // empty' "$manifest")
+    artifact_run_id=$("$JQ" -r '.run_id // empty' "$artifact")
+    manifest_run_id=$("$JQ" -r '.run_id // empty' "$manifest")
+    artifact_tier=$("$JQ" -r '.validation_tier // empty' "$artifact")
+    manifest_tier=$("$JQ" -r '.validation_tier // empty' "$manifest")
+    expected_source_ref="''${GITHUB_SHA:-unknown}"
+    expected_run_id="''${GITHUB_RUN_ID:-local}/''${GITHUB_RUN_ATTEMPT:-1}"
+
+    if [ -z "$declared_digest" ] || [ "$declared_digest" != "$actual_digest" ]; then
+      echo "FAIL: data_shape_$label artifact digest -- declared=$declared_digest actual=$actual_digest" >&2
+      FAILC=$((FAILC + 1))
+    elif [ -z "$artifact_source_ref" ] \
+      || [ "$artifact_source_ref" != "$manifest_source_ref" ] \
+      || [ "$artifact_source_ref" != "$expected_source_ref" ]; then
+      echo "FAIL: data_shape_$label source ref -- artifact=$artifact_source_ref manifest=$manifest_source_ref expected=$expected_source_ref" >&2
+      FAILC=$((FAILC + 1))
+    elif [ -z "$artifact_run_id" ] \
+      || [ "$artifact_run_id" != "$manifest_run_id" ] \
+      || [ "$artifact_run_id" != "$expected_run_id" ]; then
+      echo "FAIL: data_shape_$label run id -- artifact=$artifact_run_id manifest=$manifest_run_id expected=$expected_run_id" >&2
+      FAILC=$((FAILC + 1))
+    elif [ "$artifact_tier" != "qemu-guest" ] || [ "$manifest_tier" != "qemu-guest" ]; then
+      echo "FAIL: data_shape_$label tier -- artifact=$artifact_tier manifest=$manifest_tier expected=qemu-guest" >&2
+      FAILC=$((FAILC + 1))
+    elif [ "$artifact_outcome" != "skip" ] || [ "$manifest_outcome" != "skip" ]; then
+      echo "FAIL: data_shape_$label outcome -- artifact=$artifact_outcome manifest=$manifest_outcome expected=skip" >&2
+      FAILC=$((FAILC + 1))
+    elif ! "$JQ" -e \
+      '.claim_id == "storage.intent.data_shape_honesty.v1"
+       and .runtime_execution_produced == true
+       and .summary.status == "skip"
+       and .summary.passed > 0
+       and .summary.product_failed == 0
+       and .summary.skipped > 0' \
+      "$artifact" >/dev/null; then
+      echo "FAIL: data_shape_$label runtime boundary -- expected passing execution plus explicit skipped rows without product failure" >&2
+      FAILC=$((FAILC + 1))
+    elif ! "$JQ" -e \
+      --arg artifact_path "$expected_artifact_path" \
+      '.manifest_version == 2
+       and .claim_id == "storage.intent.data_shape_honesty.v1"
+       and .artifact_path == $artifact_path
+       and (.blocking_issues | any(.repo == "tidefs/tidefs" and .number == 1981))' \
+      "$manifest" >/dev/null; then
+      echo "FAIL: data_shape_$label manifest boundary -- expected registered path and blocker #1981" >&2
+      FAILC=$((FAILC + 1))
+    else
+      echo "DATA SHAPE RUNTIME: captured digest-matched $label evidence with partial outcome=skip"
+      PASSC=$((PASSC + 1))
+    fi
+  }
+
+  if [ "$ACK_RECEIPT_RUNTIME" -eq 0 ] && [ "$SCRUB_FOREGROUND_READ" -eq 0 ]; then
+    validate_data_shape_pair \
+      transform \
+      "$data_shape_transform_artifact" \
+      "$data_shape_transform_manifest" \
+      "validation/artifacts/storage-intent/data-shape-transform-execution.json"
+    validate_data_shape_pair \
+      performance_fault \
+      "$data_shape_performance_artifact" \
+      "$data_shape_performance_manifest" \
+      "validation/artifacts/storage-intent/data-shape-performance-fault-rows.json"
+  fi
   KERNEL_VERSION=$(awk '
     { sub(/\r$/, "") }
     /^kernel_version=/ { sub(/^kernel_version=/, ""); print; exit }
@@ -641,11 +813,19 @@ INITSCRIPT
   [ -n "$KERNEL_VERSION" ] || KERNEL_VERSION="unknown"
   QUEUE_PRESENT=false
   [ -s "$queue_tmp" ] && QUEUE_PRESENT=true
+  DATA_SHAPE_TRANSFORM_PRESENT=false
+  DATA_SHAPE_PERFORMANCE_PRESENT=false
+  if [ "$ACK_RECEIPT_RUNTIME" -eq 0 ] && [ "$SCRUB_FOREGROUND_READ" -eq 0 ]; then
+    [ -s "$data_shape_transform_artifact" ] && [ -s "$data_shape_transform_manifest" ] \
+      && DATA_SHAPE_TRANSFORM_PRESENT=true
+    [ -s "$data_shape_performance_artifact" ] && [ -s "$data_shape_performance_manifest" ] \
+      && DATA_SHAPE_PERFORMANCE_PRESENT=true
+  fi
 
   cat > "$VALIDATION_DIR/fuse-vm-test.json" <<JSON
 {
   "test": "tidefs-fuse-vm-test",
-  "version": 3,
+  "version": 4,
   "tier": "outside-sandbox-qemu-guest",
   "kernel_version": "$KERNEL_VERSION",
   "kernel_package": "linuxKernel_7_0",
@@ -655,7 +835,11 @@ INITSCRIPT
   "product_failures": $FAILC,
   "environment_refusals": $REFUSALC,
   "queue_depth_artifact": "$QUEUE_DEPTH_ARTIFACT",
-  "queue_depth_artifact_present": $QUEUE_PRESENT
+  "queue_depth_artifact_present": $QUEUE_PRESENT,
+  "data_shape_transform_artifact": "$data_shape_transform_artifact",
+  "data_shape_transform_artifact_present": $DATA_SHAPE_TRANSFORM_PRESENT,
+  "data_shape_performance_fault_artifact": "$data_shape_performance_artifact",
+  "data_shape_performance_fault_artifact_present": $DATA_SHAPE_PERFORMANCE_PRESENT
 }
 JSON
 
@@ -666,6 +850,12 @@ JSON
   echo "Validation JSON: $VALIDATION_DIR/fuse-vm-test.json"
   if [ "$QUEUE_PRESENT" = true ]; then
     echo "Queue-depth artifact: $QUEUE_DEPTH_ARTIFACT"
+  fi
+  if [ "$DATA_SHAPE_TRANSFORM_PRESENT" = true ]; then
+    echo "Data-shape transform artifact: $data_shape_transform_artifact"
+  fi
+  if [ "$DATA_SHAPE_PERFORMANCE_PRESENT" = true ]; then
+    echo "Data-shape performance/fault artifact: $data_shape_performance_artifact"
   fi
 
   if [ "$QEMU_STATUS" -eq 124 ]; then
