@@ -571,11 +571,11 @@ fn exit_owner_error(
         if let Some(pool_uuid) = route.pool_uuid {
             out["pool_uuid"] = serde_json::Value::String(hex_uuid(&pool_uuid));
         }
-        annotate_live_owner_status_refusal_json(&route, &mut out);
+        annotate_live_owner_status_refusal_json(&route, detail, &mut out);
         println!("{}", serde_json::to_string_pretty(&out).unwrap());
         process::exit(if exit_code == 0 { 1 } else { exit_code });
     }
-    for line in live_owner_status_refusal_human_lines(&route) {
+    for line in live_owner_status_refusal_human_lines(&route, detail) {
         eprintln!("{line}");
     }
     eprintln!(
@@ -961,11 +961,19 @@ fn live_owner_status_truth_carrier(
 
 fn live_owner_status_refusal_carrier(
     route: &LivePoolRoute<'_>,
+    detail: Option<&serde_json::Value>,
 ) -> Option<super::operator_truth::OperatorTruthCarrier> {
     let command = match (route.command, route.operation) {
         ("device", "status") => "device",
         _ => return None,
     };
+    let detail = detail?.as_object()?;
+    if detail.get("kind").and_then(serde_json::Value::as_str) != Some("unsupported_command")
+        || detail.get("command").and_then(serde_json::Value::as_str) != Some(command)
+        || detail.get("operation").and_then(serde_json::Value::as_str) != Some("status")
+    {
+        return None;
+    }
     Some(
         super::operator_truth::OperatorTruthCarrier::live_owner_refusal(
             command, "status", route.pool,
@@ -975,9 +983,10 @@ fn live_owner_status_refusal_carrier(
 
 fn annotate_live_owner_status_refusal_json(
     route: &LivePoolRoute<'_>,
+    detail: Option<&serde_json::Value>,
     value: &mut serde_json::Value,
 ) {
-    let Some(carrier) = live_owner_status_refusal_carrier(route) else {
+    let Some(carrier) = live_owner_status_refusal_carrier(route, detail) else {
         return;
     };
     let source = super::classification::StatusSource::LiveOwner.label();
@@ -999,8 +1008,11 @@ fn annotate_live_owner_status_refusal_json(
     object.insert("operator_truth".to_string(), carrier.json_value());
 }
 
-fn live_owner_status_refusal_human_lines(route: &LivePoolRoute<'_>) -> Vec<String> {
-    let Some(carrier) = live_owner_status_refusal_carrier(route) else {
+fn live_owner_status_refusal_human_lines(
+    route: &LivePoolRoute<'_>,
+    detail: Option<&serde_json::Value>,
+) -> Vec<String> {
+    let Some(carrier) = live_owner_status_refusal_carrier(route, detail) else {
         return Vec::new();
     };
     let mut lines = carrier.operator_lines();
@@ -2461,7 +2473,7 @@ mod tests {
             &detail,
         );
 
-        annotate_live_owner_status_refusal_json(&route, &mut value);
+        annotate_live_owner_status_refusal_json(&route, Some(&detail), &mut value);
 
         assert_eq!(value["kind"], "unsupported_command");
         assert_eq!(value["source_classification"], "source:live-owner");
@@ -2487,8 +2499,13 @@ mod tests {
             json: false,
             args: LivePoolAdminArgs::default(),
         };
+        let detail = serde_json::json!({
+            "kind": "unsupported_command",
+            "command": "device",
+            "operation": "status",
+        });
 
-        let lines = live_owner_status_refusal_human_lines(&route);
+        let lines = live_owner_status_refusal_human_lines(&route, Some(&detail));
         let output = lines.join("\n");
 
         assert!(output.contains("path:       tidefsctl device status"));
@@ -2496,6 +2513,63 @@ mod tests {
         assert!(output.contains("no status facts were accepted"));
         assert!(output.contains("source_classification: source:live-owner"));
         assert!(!output.trim_start().starts_with('{'));
+    }
+
+    #[test]
+    fn device_status_refusal_carrier_rejects_nonmatching_owner_errors() {
+        let route = LivePoolRoute {
+            command: "device",
+            operation: "status",
+            pool: "tank",
+            pool_uuid: None,
+            json: true,
+            args: LivePoolAdminArgs::default(),
+        };
+
+        for (name, detail) in [
+            ("missing", None),
+            ("malformed", Some(serde_json::json!({"kind": "malformed"}))),
+            (
+                "unsupported-version",
+                Some(serde_json::json!({
+                    "kind": "unsupported_version",
+                    "version": 42,
+                })),
+            ),
+            (
+                "wrong-command",
+                Some(serde_json::json!({
+                    "kind": "unsupported_command",
+                    "command": "cluster",
+                    "operation": "status",
+                })),
+            ),
+            (
+                "wrong-operation",
+                Some(serde_json::json!({
+                    "kind": "unsupported_command",
+                    "command": "device",
+                    "operation": "remove",
+                })),
+            ),
+        ] {
+            let mut value = serde_json::json!({"ok": false});
+
+            annotate_live_owner_status_refusal_json(&route, detail.as_ref(), &mut value);
+
+            assert!(
+                value.get("owner_response").is_none(),
+                "{name} owner error must not be classified as a status refusal"
+            );
+            assert!(
+                value.get("operator_truth").is_none(),
+                "{name} owner error must not carry operator truth"
+            );
+            assert!(
+                live_owner_status_refusal_human_lines(&route, detail.as_ref()).is_empty(),
+                "{name} owner error must not render refusal carrier lines"
+            );
+        }
     }
 
     #[test]
