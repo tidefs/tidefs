@@ -1,7 +1,16 @@
-name: Storage Intent Ack Runtime
+name: Storage Intent Runtime
 
 on:
   workflow_dispatch:
+    inputs:
+      target:
+        description: Storage-intent runtime target to run
+        required: false
+        default: ack-receipt
+        type: choice
+        options:
+          - ack-receipt
+          - data-shape
 
 permissions:
   contents: read
@@ -13,6 +22,7 @@ concurrency:
 jobs:
   mounted-receipts:
     name: mounted acknowledgment receipts
+    if: ${{ inputs.target == 'ack-receipt' }}
     runs-on: [self-hosted, linux, x64, tidefs, nix, kvm]
     timeout-minutes: 60
     env:
@@ -75,6 +85,95 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: storage-intent-ack-runtime
+          path: |
+            ${{ env.OUTPUT_DIR }}/**
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Clean cargo target
+        if: always()
+        run: rm -rf "$CARGO_TARGET_DIR"
+
+  data-shape:
+    name: data-shape helper evidence
+    if: ${{ inputs.target == 'data-shape' }}
+    runs-on: [self-hosted, linux, x64, tidefs, nix, kvm]
+    timeout-minutes: 60
+    env:
+      CARGO_HOME: /var/tmp/tidefs-ci/cargo-home
+      CARGO_INCREMENTAL: 0
+      CARGO_TARGET_DIR: /var/tmp/tidefs-ci/cargo-target/${{ github.run_id }}-${{ github.run_attempt }}-data-shape-runtime
+      OUTPUT_DIR: /tmp/tidefs-validation/storage-intent-data-shape-runtime/${{ github.run_id }}-${{ github.run_attempt }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Host preflight
+        run: |
+          if test -c /dev/kvm; then
+            echo "/dev/kvm is available for the Linux 7.0 helper guest"
+          else
+            echo "::error::/dev/kvm is unavailable; the QEMU guest carrier cannot run"
+            exit 1
+          fi
+
+      - name: Prepare runtime output
+        run: |
+          rm -rf "$OUTPUT_DIR" "$CARGO_TARGET_DIR"
+          mkdir -p "$OUTPUT_DIR" "$CARGO_HOME" "$CARGO_TARGET_DIR"
+
+      - name: Capture data-shape helper evidence
+        run: |
+          TIDEFS_GENERATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          export TIDEFS_GENERATED_AT
+          nix run .#storage-intent-data-shape-runtime -- \
+            --timeout 900 \
+            --validation-dir "$OUTPUT_DIR"
+
+      - name: Validate evidence and blocked claim
+        run: |
+          artifact_dir=validation/artifacts/storage-intent
+          for name in \
+            data-shape-transform-execution.json \
+            data-shape-transform-execution.manifest.json \
+            data-shape-performance-fault-rows.json \
+            data-shape-performance-fault-rows.manifest.json
+          do
+            cp "$OUTPUT_DIR/$name" "$artifact_dir/$name"
+          done
+
+          nix develop .#ci --command cargo run --locked -p tidefs-xtask -- \
+            validate-evidence-manifest \
+            "$artifact_dir/data-shape-transform-execution.manifest.json"
+          nix develop .#ci --command cargo run --locked -p tidefs-xtask -- \
+            validate-evidence-manifest \
+            "$artifact_dir/data-shape-performance-fault-rows.manifest.json"
+          nix develop .#ci --command cargo run --locked -p tidefs-xtask -- \
+            validate-claim storage.intent.data_shape_honesty.v1
+
+          jq -r '
+            "## Data-shape QEMU helper evidence\n\n" +
+            "- Transform outcome: `" + .summary.status + "`\n" +
+            "- Transform passed rows: " + (.summary.passed | tostring) + "\n" +
+            "- Transform product-failed rows: " + (.summary.product_failed | tostring) + "\n" +
+            "- Transform skipped rows: " + (.summary.skipped | tostring) + "\n" +
+            "- Carrier: `" + .runtime_source.carrier + "`\n" +
+            "- Kernel: `" + .runtime_source.kernel_release + "`\n" +
+            "- Source ref: `" + .source_ref + "`\n"
+          ' "$OUTPUT_DIR/data-shape-transform-execution.json" >> "$GITHUB_STEP_SUMMARY"
+          jq -r '
+            "- Performance/fault outcome: `" + .summary.status + "`\n" +
+            "- Performance/fault passed rows: " + (.summary.passed | tostring) + "\n" +
+            "- Performance/fault product-failed rows: " + (.summary.product_failed | tostring) + "\n" +
+            "- Performance/fault skipped rows: " + (.summary.skipped | tostring) + "\n"
+          ' "$OUTPUT_DIR/data-shape-performance-fault-rows.json" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload data-shape helper evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: storage-intent-data-shape-runtime
           path: |
             ${{ env.OUTPUT_DIR }}/**
           if-no-files-found: error
