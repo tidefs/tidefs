@@ -200,6 +200,8 @@ impl DeviceManager {
         pool_name: &str,
         commit_group: u64,
     ) -> Result<()> {
+        Self::validate_device_guid_cardinality(existing_device_configs, device_guids)?;
+
         let old_device_count = existing_device_configs.len() as u32;
         let new_device_count = old_device_count + 1;
         let new_topology_gen = commit_group.wrapping_add(1);
@@ -255,6 +257,8 @@ impl DeviceManager {
         pool_name: &str,
         commit_group: u64,
     ) -> Result<()> {
+        Self::validate_device_guid_cardinality(remaining_device_configs, device_guids)?;
+
         if remaining_device_configs.is_empty() {
             // All devices removed; nothing to label.
             return Ok(());
@@ -287,6 +291,11 @@ impl DeviceManager {
     ///
     /// The caller is responsible for data evacuation/copy from old → new.
     pub fn replace_device(request: DeviceReplacementRequest<'_>) -> Result<()> {
+        Self::validate_device_guid_cardinality(
+            request.existing_device_configs,
+            request.device_guids,
+        )?;
+
         if request.replace_index >= request.existing_device_configs.len() {
             let _ = request.rebuild_priority; // deferred: wire-up rebuild scheduler
             return Err(StoreError::Io {
@@ -345,6 +354,11 @@ impl DeviceManager {
     /// the faulted device to the spare before calling this function, or for
     /// scheduling a rebuild after spare activation.
     pub fn activate_spare(request: SpareActivationRequest<'_>) -> Result<()> {
+        Self::validate_device_guid_cardinality(
+            request.existing_device_configs,
+            request.device_guids,
+        )?;
+
         // Validate spare policy.
         match request.policy {
             SparePolicy::Manual => {
@@ -419,6 +433,33 @@ impl DeviceManager {
 
     // Internal helpers
     // -------------------------------------------------------------------
+
+    /// Refuse incomplete caller-supplied membership authority before any
+    /// topology label is mutated.
+    fn validate_device_guid_cardinality(
+        device_configs: &[DeviceConfig],
+        device_guids: &[[u8; 16]],
+    ) -> Result<()> {
+        if device_guids.len() == device_configs.len() {
+            return Ok(());
+        }
+
+        Err(StoreError::Io {
+            operation: "device_manager_validate_device_guids",
+            path: device_configs.first().map_or_else(
+                || PathBuf::from("<pool-topology>"),
+                |config| config.path.clone(),
+            ),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "device GUID count {} does not match device count {}",
+                    device_guids.len(),
+                    device_configs.len()
+                ),
+            ),
+        })
+    }
 
     /// Write a label to a single device.
     fn write_single_device_label(request: LabelWriteRequest<'_>) -> Result<()> {
@@ -535,15 +576,12 @@ impl DeviceManager {
     /// Update labels on all existing devices with new topology_generation
     /// and device_count, preserving per-device fields.
     fn update_existing_labels(request: ExistingLabelUpdate<'_>) -> Result<()> {
-        for (i, config) in request.device_configs.iter().enumerate() {
-            let device_guid = if i < request.device_guids.len() {
-                request.device_guids[i]
-            } else {
-                let mut dg = request.pool_guid;
-                dg[0] ^= i as u8;
-                dg
-            };
-
+        for (i, (config, device_guid)) in request
+            .device_configs
+            .iter()
+            .zip(request.device_guids.iter().copied())
+            .enumerate()
+        {
             // Read existing label to get capacity and class.
             let existing = Self::read_device_label(&config.path, request.pool_guid)?;
             let existing_label = existing.label;
@@ -602,15 +640,12 @@ impl DeviceManager {
     /// Update labels on remaining devices with reindexed device_index values
     /// after a device removal.
     fn update_existing_labels_with_reindex(request: ExistingLabelUpdate<'_>) -> Result<()> {
-        for (i, config) in request.device_configs.iter().enumerate() {
-            let device_guid = if i < request.device_guids.len() {
-                request.device_guids[i]
-            } else {
-                let mut dg = request.pool_guid;
-                dg[0] ^= i as u8;
-                dg
-            };
-
+        for (i, (config, device_guid)) in request
+            .device_configs
+            .iter()
+            .zip(request.device_guids.iter().copied())
+            .enumerate()
+        {
             // Read existing label to get capacity and class.
             let existing = Self::read_device_label(&config.path, request.pool_guid)?;
             let existing_label = existing.label;
@@ -1241,6 +1276,59 @@ mod tests {
         );
 
         assert!(result.is_err());
+        assert!(!new_dir.join(".tidefs_label").exists());
+
+        let _ = fs::remove_dir_all(&existing_dir);
+        let _ = fs::remove_dir_all(&new_dir);
+    }
+
+    #[test]
+    fn add_device_refuses_guid_count_mismatch_before_writing_new_device() {
+        let existing_dir = temp_dir("dm-add-guid-count-existing");
+        let new_dir = temp_dir("dm-add-guid-count-new");
+        let existing_config = make_device_config(&existing_dir);
+        let new_config = make_device_config(&new_dir);
+        let pool_guid = [0x24; 16];
+
+        DeviceManager::write_single_device_label(LabelWriteRequest {
+            device_config: &existing_config,
+            pool_guid,
+            device_guid: [0x26; 16],
+            pool_name: "missing-guid",
+            pool_state: crate::pool_label::LabelPoolState::Active,
+            commit_group: 1,
+            label_commit_group: 1,
+            device_index: 0,
+            topology_generation: 1,
+            device_count: 1,
+            redundancy_policy: PoolRedundancyPolicy::default(),
+            device_layout_policy: None,
+        })
+        .unwrap();
+
+        let error = DeviceManager::add_device(
+            std::slice::from_ref(&existing_config),
+            &new_config,
+            pool_guid,
+            &[],
+            [0x25; 16],
+            "missing-guid",
+            1,
+        )
+        .expect_err("incomplete GUID authority must be refused");
+
+        match error {
+            StoreError::Io {
+                operation, source, ..
+            } => {
+                assert_eq!(operation, "device_manager_validate_device_guids");
+                assert_eq!(source.kind(), std::io::ErrorKind::InvalidInput);
+                assert!(source
+                    .to_string()
+                    .contains("device GUID count 0 does not match device count 1"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
         assert!(!new_dir.join(".tidefs_label").exists());
 
         let _ = fs::remove_dir_all(&existing_dir);
