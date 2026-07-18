@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
-//! Mounted acknowledgment-receipt evidence for issue #2223.
+//! Mounted acknowledgment-receipt evidence producer for issue #2223.
 
 use std::env;
 use std::fs::{self, File, OpenOptions};
@@ -56,9 +56,11 @@ struct RuntimeReport {
 #[derive(Debug, Serialize)]
 struct RuntimeBackend {
     kind: &'static str,
+    carrier: String,
     kernel_release: String,
     mount_options: Vec<&'static str>,
     receipt_source: &'static str,
+    fault_injection: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -683,10 +685,10 @@ fn write_report_and_manifest(output_dir: &Path, report: &RuntimeReport) -> Resul
     Ok(())
 }
 
-#[test]
-#[ignore = "manual mounted evidence producer; use Storage Intent Ack Runtime workflow"]
-fn produce_mounted_ack_receipt_runtime_evidence() {
-    let output_dir = env::var_os(OUTPUT_DIR_ENV).map(PathBuf::from);
+fn main() {
+    let output_dir = env::var_os(OUTPUT_DIR_ENV)
+        .map(PathBuf::from)
+        .expect("TIDEFS_ACK_RECEIPT_RUNTIME_OUTPUT_DIR must name the evidence output directory");
     let (rows, backend_kind, environment_refusal) = match MountedReceiptHarness::new() {
         Ok(harness) => (
             run_mounted_rows(&harness),
@@ -736,25 +738,28 @@ fn produce_mounted_ack_receipt_runtime_evidence() {
             "1970-01-01T00:00:00Z".to_string(),
         ),
         validation_tier: ValidationTier::MountedUserspace,
-        command: "cargo test --locked -p tidefs-posix-filesystem-adapter-daemon --test ack_receipt_runtime_evidence -- --ignored --nocapture".to_string(),
+        command: "storage-intent-ack-runtime-validation".to_string(),
         backend: RuntimeBackend {
             kind: backend_kind,
+            carrier: provenance(
+                "TIDEFS_ACK_RECEIPT_RUNTIME_CARRIER",
+                "direct-host".to_string(),
+            ),
             kernel_release: fs::read_to_string("/proc/sys/kernel/osrelease")
                 .unwrap_or_else(|_| "unknown".to_string())
                 .trim()
                 .to_string(),
             mount_options: vec!["rw", "nodev", "nosuid", "subtype=tidefs"],
             receipt_source: "bounded LocalAckReceiptLedger diagnostic copies",
+            fault_injection: "none",
         },
         rows,
         summary,
         residual_risk,
     };
 
-    if let Some(output_dir) = output_dir {
-        write_report_and_manifest(&output_dir, &report)
-            .expect("write mounted receipt report and manifest");
-    }
+    write_report_and_manifest(&output_dir, &report)
+        .expect("write mounted receipt report and manifest");
     eprintln!(
         "mounted ack receipt evidence: outcome={} passed={} product_failed={} environment_refused={} artifact={} manifest={} output_enabled={}",
         report.summary.status.label(),
@@ -763,6 +768,6 @@ fn produce_mounted_ack_receipt_runtime_evidence() {
         report.summary.environment_refused,
         ARTIFACT_PATH,
         MANIFEST_PATH,
-        env::var_os(OUTPUT_DIR_ENV).is_some(),
+        true,
     );
 }

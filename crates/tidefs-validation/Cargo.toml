@@ -31,6 +31,11 @@ name = "storage-intent-ack-fault-matrix-validation"
 path = "src/bin/storage_intent_ack_fault_matrix_validation.rs"
 required-features = ["ack-receipt-fault-matrix"]
 
+[[bin]]
+name = "storage-intent-ack-runtime-validation"
+path = "src/bin/storage_intent_ack_runtime_validation.rs"
+required-features = ["fuse"]
+
 [features]
 default = []
 
@@ -83,6 +88,7 @@ scrub-runtime = [
 # Full FUSE userspace POSIX validation: VfsEngine, all POSIX adapter workers,
 # and every storage backend needed by the FUSE data path.
 fuse = [
+    "dep:fuser",
     "dep:tidefs-posix-filesystem-adapter-daemon",
     "storage-core",
     "scrub-runtime",
@@ -124,6 +130,7 @@ full = [
 ]
 
 [dependencies]
+fuser = { version = "0.14.0", features = ["abi-7-30", "abi-7-32"], optional = true }
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 blake3 = "=1.5.5"

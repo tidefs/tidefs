@@ -1,0 +1,22 @@
+{
+  "manifest_version": 2,
+  "claim_id": "storage.intent.ack_receipt_honesty.v1",
+  "evidence_class": "storage-intent-ack-receipt-runtime",
+  "validation_tier": "mounted-userspace",
+  "scope": "live FUSE mounted acknowledgment receipt and refusal rows for write, fsync, fdatasync, O_DSYNC, shared mmap MS_SYNC, namespace mutation, and fsyncdir; outcome=PRODUCT_FAIL pass=2 product_fail=5 environment_refusal=0",
+  "artifact_path": "validation/artifacts/storage-intent/ack-receipt-runtime.json",
+  "content_digest": "blake3:aa85867609735b88fa892b679c3a6c42aedd27006ebc42b0946f02c71dfa1ceb",
+  "run_id": "29630398064/1",
+  "source_ref": "85596c69f61e5165571300ee5bec639818f68f6d",
+  "outcome": "product-fail",
+  "residual_risk": "This evidence is bounded to one live local FUSE mount and the exact operations recorded; it is not crash, power-loss, stale-media, distributed-quorum, kernel-VFS, successor, production, or release evidence. A product-fail outcome keeps the claim blocked and identifies mounted operations that returned success without the exact earned receipt; workflow success means evidence capture succeeded, not that every product row passed. The receipt channel is best-effort diagnostic output after the authoritative ledger records a receipt; missing diagnostic copies cannot weaken or strengthen an acknowledgment.",
+  "source": "mounted-fuse-ack-receipt-runtime-v1",
+  "generated_at": "2026-07-18T04:20:49Z",
+  "blocking_issues": [
+    {
+      "repo": "tidefs/tidefs",
+      "number": 2223,
+      "reason": "mounted acknowledgment runtime rows have not all earned their exact receipt or explicit refusal"
+    }
+  ]
+}
