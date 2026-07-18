@@ -177,25 +177,17 @@ impl WritebackProjection {
 
     // ── Lane transitions ──────────────────────────────────────────────
 
-    /// Record that `ino` has dirty bytes (total dirty byte count across all
-    /// tracked ranges).
-    ///
-    /// The write path first calls this before publishing any dirty mirror, so
-    /// mmap invalidation cannot pass a clean check and then invalidate newly
-    /// dirty bytes. It calls this again after populating [`DirtyRanges`] and
-    /// [`PageCache`] to refresh the conservative total.
-    pub fn record_dirty(&self, ino: u64, total_dirty_bytes: u64) {
+    fn dirty_transition_gate(&self, ino: u64) -> Option<Arc<Mutex<()>>> {
+        self.mmap_coherency
+            .upgrade()
+            .map(|mmap| mmap.dirty_transition_gate(ino))
+    }
+
+    fn record_dirty_after_gate(&self, ino: u64, total_dirty_bytes: u64) {
         if total_dirty_bytes == 0 {
             return;
         }
 
-        let dirty_transition_gate = self
-            .mmap_coherency
-            .upgrade()
-            .map(|mmap| mmap.dirty_transition_gate(ino));
-        let _dirty_transition_guard = dirty_transition_gate
-            .as_deref()
-            .map(|gate| gate.lock().unwrap());
         let mut lanes = self.lanes.lock().unwrap();
         let prev = lanes.get(&ino).copied().unwrap_or(WritebackLane::Clean);
         match prev {
@@ -227,6 +219,32 @@ impl WritebackProjection {
         }
     }
 
+    fn record_clean_after_gate(&self, ino: u64) {
+        let prev = self.lanes.lock().unwrap().remove(&ino);
+        if prev.is_some_and(|p| p.is_dirty_or_writeback()) {
+            self.stats.clean_transitions.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Record that `ino` has dirty bytes (total dirty byte count across all
+    /// tracked ranges).
+    ///
+    /// The write path first calls this before publishing any dirty mirror, so
+    /// mmap invalidation cannot pass a clean check and then invalidate newly
+    /// dirty bytes. It calls this again after populating [`DirtyRanges`] and
+    /// [`PageCache`] to refresh the conservative total.
+    pub fn record_dirty(&self, ino: u64, total_dirty_bytes: u64) {
+        if total_dirty_bytes == 0 {
+            return;
+        }
+
+        let dirty_transition_gate = self.dirty_transition_gate(ino);
+        let _dirty_transition_guard = dirty_transition_gate
+            .as_deref()
+            .map(|gate| gate.lock().unwrap());
+        self.record_dirty_after_gate(ino, total_dirty_bytes);
+    }
+
     /// Record that `ino` has been selected for writeback (dirty bytes have
     /// been written through to the engine but have not yet passed the
     /// durability barrier).
@@ -237,10 +255,7 @@ impl WritebackProjection {
     /// provisional dirty publication visible when the backing mirrors are
     /// momentarily empty at selection time.
     pub fn record_writeback_pending(&self, ino: u64, total_bytes: u64) {
-        let dirty_transition_gate = self
-            .mmap_coherency
-            .upgrade()
-            .map(|mmap| mmap.dirty_transition_gate(ino));
+        let dirty_transition_gate = self.dirty_transition_gate(ino);
         let _dirty_transition_guard = dirty_transition_gate
             .as_deref()
             .map(|gate| gate.lock().unwrap());
@@ -261,9 +276,34 @@ impl WritebackProjection {
     /// Record that `ino` has transitioned to Clean after a successful
     /// fsync, flush, commit-group, or storage-commit barrier.
     pub fn record_clean(&self, ino: u64) {
-        let prev = self.lanes.lock().unwrap().remove(&ino);
-        if prev.is_some_and(|p| p.is_dirty_or_writeback()) {
-            self.stats.clean_transitions.fetch_add(1, Ordering::Relaxed);
+        let dirty_transition_gate = self.dirty_transition_gate(ino);
+        let _dirty_transition_guard = dirty_transition_gate
+            .as_deref()
+            .map(|gate| gate.lock().unwrap());
+        self.record_clean_after_gate(ino);
+    }
+
+    /// Refresh the projected lane from the adapter's current dirty mirrors.
+    ///
+    /// The observation and resulting lane publication share the per-inode
+    /// dirty-transition gate. A concurrent accepted write therefore publishes
+    /// after a zero-byte observation becomes Clean instead of being erased by
+    /// that older observation. The observer must not call another projection
+    /// transition for this inode while the gate is held.
+    pub(crate) fn refresh_dirty_observation(
+        &self,
+        ino: u64,
+        observe_total_dirty_bytes: impl FnOnce() -> u64,
+    ) {
+        let dirty_transition_gate = self.dirty_transition_gate(ino);
+        let _dirty_transition_guard = dirty_transition_gate
+            .as_deref()
+            .map(|gate| gate.lock().unwrap());
+        let total_dirty_bytes = observe_total_dirty_bytes();
+        if total_dirty_bytes == 0 {
+            self.record_clean_after_gate(ino);
+        } else {
+            self.record_dirty_after_gate(ino, total_dirty_bytes);
         }
     }
 
@@ -722,6 +762,69 @@ mod tests {
 
         assert!(projection.is_dirty(42));
         assert_eq!(mmap.stats.snapshot().pages_invalidated, 1);
+    }
+
+    #[test]
+    fn clean_refresh_cannot_erase_concurrent_dirty_publication() {
+        let mmap = Arc::new(MmapCoherency::new_for_test(|_| Ok(())));
+        let projection = Arc::new(WritebackProjection::new(None, Arc::clone(&mmap)));
+        projection.record_writeback_pending(42, 4096);
+
+        let (observation_started_tx, observation_started_rx) = std::sync::mpsc::channel();
+        let (release_observation_tx, release_observation_rx) = std::sync::mpsc::channel();
+        let projection_refresh = Arc::clone(&projection);
+        let refresh = std::thread::spawn(move || {
+            projection_refresh.refresh_dirty_observation(42, || {
+                observation_started_tx
+                    .send(())
+                    .expect("announce zero-byte observation");
+                release_observation_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("release zero-byte observation");
+                0
+            });
+        });
+        observation_started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("zero-byte observation started");
+
+        let (dirty_started_tx, dirty_started_rx) = std::sync::mpsc::channel();
+        let (dirty_done_tx, dirty_done_rx) = std::sync::mpsc::channel();
+        let projection_dirty = Arc::clone(&projection);
+        let dirty = std::thread::spawn(move || {
+            dirty_started_tx
+                .send(())
+                .expect("announce dirty publication");
+            projection_dirty.record_dirty(42, 8192);
+            dirty_done_tx.send(()).expect("complete dirty publication");
+        });
+        dirty_started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("dirty publication started");
+        assert!(
+            matches!(
+                dirty_done_rx.recv_timeout(std::time::Duration::from_millis(250)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "dirty publication must wait until the clean observation is published"
+        );
+
+        release_observation_tx
+            .send(())
+            .expect("release zero-byte observation");
+        refresh.join().expect("join observation worker");
+        dirty_done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("dirty publication completed after clean observation");
+        dirty.join().expect("join dirty worker");
+
+        assert_eq!(
+            projection.lane(42),
+            Some(WritebackLane::Dirty { bytes: 8192 })
+        );
+        let stats = projection.stats_snapshot();
+        assert_eq!(stats.clean_transitions, 1);
+        assert_eq!(stats.dirty_transitions, 1);
     }
 
     #[test]

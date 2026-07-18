@@ -7488,16 +7488,14 @@ impl FuseVfsAdapter {
     }
 
     fn refresh_writeback_projection(&self, ino: u64) {
-        let total_dirty = WritebackProjection::total_observable_dirty_bytes(
-            &self.dirty_state,
-            self.writeback_page_cache.as_ref(),
-            ino,
-        );
-        if total_dirty == 0 {
-            self.writeback_projection.record_clean(ino);
-        } else {
-            self.writeback_projection.record_dirty(ino, total_dirty);
-        }
+        let projection = Arc::clone(&self.writeback_projection);
+        projection.refresh_dirty_observation(ino, || {
+            WritebackProjection::total_observable_dirty_bytes(
+                &self.dirty_state,
+                self.writeback_page_cache.as_ref(),
+                ino,
+            )
+        });
     }
 
     fn record_writeback_projection_pending(&self, ino: u64) {
