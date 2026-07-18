@@ -224,23 +224,39 @@ pub struct VinoRecord {
 
 const VINO_MAGIC: [u8; 4] = *b"VINO";
 const VINO_RECORD_BYTES: usize = 116;
+const VINO_FORMAT_VERSION: u8 = 1;
 
-/// Parse a 116-byte VINO-format inode record from `buf`.
+/// Errors returned while decoding a committed-root VINO record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VinoRecordError {
+    BufferTooSmall,
+    BadMagic,
+    UnsupportedVersion(u8),
+    InvalidKind(u8),
+    InvalidInode,
+}
+
+/// Decode one current-format VINO record.
 ///
-/// Returns `None` if the buffer is too short, magic doesn't match,
-/// or the kind byte is invalid (not 0/1/2).
-pub fn parse_vino_record(buf: &[u8]) -> Option<VinoRecord> {
+/// Committed-root import accepts only the current VINO format. Older or
+/// unknown pre-release formats must be rejected rather than interpreted as
+/// a compatible inode record.
+pub fn decode_vino_record(buf: &[u8]) -> Result<VinoRecord, VinoRecordError> {
     if buf.len() < VINO_RECORD_BYTES {
-        return None;
+        return Err(VinoRecordError::BufferTooSmall);
     }
     if buf[0..4] != VINO_MAGIC {
-        return None;
+        return Err(VinoRecordError::BadMagic);
     }
     let kind = buf[80];
     if kind > 2 {
-        return None; // invalid kind
+        return Err(VinoRecordError::InvalidKind(kind));
     }
-    // Format version at offset 81 is informational; accept any.
+    let version = buf[81];
+    if version != VINO_FORMAT_VERSION {
+        return Err(VinoRecordError::UnsupportedVersion(version));
+    }
+
     let mode = u32::from_le_bytes(buf[4..8].try_into().unwrap());
     let uid = u32::from_le_bytes(buf[8..12].try_into().unwrap());
     let gid = u32::from_le_bytes(buf[12..16].try_into().unwrap());
@@ -260,7 +276,7 @@ pub fn parse_vino_record(buf: &[u8]) -> Option<VinoRecord> {
     let btime_nanos = u32::from_le_bytes(buf[108..112].try_into().unwrap());
     let flags = u32::from_le_bytes(buf[112..116].try_into().unwrap());
 
-    Some(VinoRecord {
+    Ok(VinoRecord {
         mode,
         uid,
         gid,
@@ -283,6 +299,32 @@ pub fn parse_vino_record(buf: &[u8]) -> Option<VinoRecord> {
     })
 }
 
+/// Parse a 116-byte VINO-format inode record from `buf`.
+///
+/// Returns `None` if the buffer is too short, magic doesn't match,
+/// the record version is not current, or the kind byte is invalid (not 0/1/2).
+pub fn parse_vino_record(buf: &[u8]) -> Option<VinoRecord> {
+    decode_vino_record(buf).ok()
+}
+
+/// Decode one VINO record selected by its one-based inode number.
+pub fn decode_vino_inode(inode_table_buf: &[u8], ino: u64) -> Result<VinoRecord, VinoRecordError> {
+    if ino == 0 {
+        return Err(VinoRecordError::InvalidInode);
+    }
+    let idx = (ino - 1) as usize;
+    let start = idx
+        .checked_mul(VINO_RECORD_BYTES)
+        .ok_or(VinoRecordError::BufferTooSmall)?;
+    let end = start
+        .checked_add(VINO_RECORD_BYTES)
+        .ok_or(VinoRecordError::BufferTooSmall)?;
+    if end > inode_table_buf.len() {
+        return Err(VinoRecordError::BufferTooSmall);
+    }
+    decode_vino_record(&inode_table_buf[start..end])
+}
+
 /// Locate a VINO record within an inode-table buffer.
 ///
 /// `inode_table_buf` contains the raw inode table region (starting at
@@ -290,16 +332,7 @@ pub fn parse_vino_record(buf: &[u8]) -> Option<VinoRecord> {
 /// if the inode's 116-byte slot fits within the buffer and contains
 /// valid VINO magic.
 pub fn read_vino_inode(inode_table_buf: &[u8], ino: u64) -> Option<VinoRecord> {
-    if ino == 0 {
-        return None;
-    }
-    let idx = (ino - 1) as usize;
-    let start = idx.checked_mul(VINO_RECORD_BYTES)?;
-    let end = start.checked_add(VINO_RECORD_BYTES)?;
-    if end > inode_table_buf.len() {
-        return None; // inode slot outside buffer
-    }
-    parse_vino_record(&inode_table_buf[start..end])
+    decode_vino_inode(inode_table_buf, ino).ok()
 }
 
 // ── Inline DirPage directory lookup (cargo + Kbuild) ─────────────────
@@ -798,6 +831,27 @@ mod tests {
         buf[80] = 5; // invalid kind
         buf[81] = 1;
         assert!(parse_vino_record(&buf).is_none());
+    }
+
+    #[test]
+    fn decode_vino_record_rejects_unknown_format_version() {
+        let mut buf = [0u8; VINO_RECORD_BYTES];
+        buf[0..4].copy_from_slice(b"VINO");
+        buf[80] = 1; // Directory
+        buf[81] = 2;
+
+        assert!(matches!(
+            decode_vino_record(&buf),
+            Err(VinoRecordError::UnsupportedVersion(2))
+        ));
+    }
+
+    #[test]
+    fn decode_vino_inode_rejects_zero_inode() {
+        assert!(matches!(
+            decode_vino_inode(&[0u8; VINO_RECORD_BYTES], 0),
+            Err(VinoRecordError::InvalidInode)
+        ));
     }
 
     #[test]
