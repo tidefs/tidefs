@@ -942,18 +942,33 @@ fn is_status_route(route: &LivePoolRoute<'_>) -> bool {
     route.operation == "status" && matches!(route.command, "cluster" | "device")
 }
 
+fn live_owner_status_truth_carrier(
+    route: &LivePoolRoute<'_>,
+) -> Option<super::operator_truth::OperatorTruthCarrier> {
+    let command = match (route.command, route.operation) {
+        ("cluster", "status") => "cluster",
+        ("device", "status") => "device",
+        _ => return None,
+    };
+    Some(super::operator_truth::OperatorTruthCarrier::live_route(
+        command, "status", route.pool,
+    ))
+}
+
 fn annotate_live_owner_status_json(route: &LivePoolRoute<'_>, value: &mut serde_json::Value) {
-    if !is_status_route(route) {
+    let Some(carrier) = live_owner_status_truth_carrier(route) else {
         return;
-    }
+    };
 
     let source = super::classification::StatusSource::LiveOwner.label();
+    let operator_truth = carrier.json_value();
     match value {
         serde_json::Value::Object(map) => {
             map.entry("source_classification")
                 .or_insert_with(|| serde_json::Value::String(source.to_string()));
             map.entry("source:status")
                 .or_insert_with(|| serde_json::Value::String(source.to_string()));
+            map.insert("operator_truth".to_string(), operator_truth);
         }
         _ => {
             let original = std::mem::take(value);
@@ -961,6 +976,7 @@ fn annotate_live_owner_status_json(route: &LivePoolRoute<'_>, value: &mut serde_
                 "ok": true,
                 "source_classification": source,
                 "source:status": source,
+                "operator_truth": operator_truth,
                 "value": original,
             });
         }
@@ -968,7 +984,7 @@ fn annotate_live_owner_status_json(route: &LivePoolRoute<'_>, value: &mut serde_
 }
 
 fn live_owner_status_text_json(route: &LivePoolRoute<'_>, text: &str) -> serde_json::Value {
-    if is_status_route(route) {
+    if let Some(carrier) = live_owner_status_truth_carrier(route) {
         let source = super::classification::StatusSource::LiveOwner.label();
         serde_json::json!({
             "ok": true,
@@ -977,6 +993,7 @@ fn live_owner_status_text_json(route: &LivePoolRoute<'_>, text: &str) -> serde_j
             "pool_name": route.pool,
             "source_classification": source,
             "source:status": source,
+            "operator_truth": carrier.json_value(),
             "text": text,
         })
     } else {
@@ -991,13 +1008,7 @@ fn live_owner_machine_json_human_lines(
     route: &LivePoolRoute<'_>,
     value: &serde_json::Value,
 ) -> Vec<String> {
-    let mut lines = Vec::new();
-    if is_status_route(route) {
-        lines.push(format!(
-            "source_classification: {}",
-            super::classification::StatusSource::LiveOwner.label()
-        ));
-    }
+    let mut lines = live_owner_status_human_lines(route);
 
     if let Some(object) = value.as_object() {
         for key in ["text", "message", "error"] {
@@ -1019,6 +1030,19 @@ fn live_owner_machine_json_human_lines(
     lines.push(format!(
         "tidefsctl {} {}: live owner returned machine JSON; rerun with --json for details",
         route.command, route.operation
+    ));
+    lines
+}
+
+fn live_owner_status_human_lines(route: &LivePoolRoute<'_>) -> Vec<String> {
+    let Some(carrier) = live_owner_status_truth_carrier(route) else {
+        return Vec::new();
+    };
+
+    let mut lines = carrier.operator_lines();
+    lines.push(format!(
+        "source_classification: {}",
+        super::classification::StatusSource::LiveOwner.label()
     ));
     lines
 }
@@ -1050,11 +1074,8 @@ fn decode_live_owner_hex(value: &str) -> Result<Vec<u8>, LiveOwnerRequestError> 
 }
 
 fn print_live_owner_status_classification(route: &LivePoolRoute<'_>) {
-    if is_status_route(route) {
-        println!(
-            "source_classification: {}",
-            super::classification::StatusSource::LiveOwner.label()
-        );
+    for line in live_owner_status_human_lines(route) {
+        println!("{line}");
     }
 }
 
@@ -2383,6 +2404,63 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some(super::super::classification::StatusSource::LiveOwner.label())
         );
+        let operator_truth = &value["operator_truth"];
+        assert_eq!(operator_truth["status_path"], "tidefsctl device status");
+        assert_eq!(operator_truth["pool_name"], "tank");
+        assert_eq!(operator_truth["evidence_state"], "live-within-budget");
+        assert_eq!(
+            operator_truth["source"],
+            "source.truth_view.runtime_mirror.a2"
+        );
+        assert_eq!(operator_truth["cut"], "cut.truth_view.live_window.c0");
+        assert_eq!(
+            operator_truth["provenance"],
+            "prov.truth_view.live_mirror.p4"
+        );
+        assert_eq!(
+            operator_truth["exactness"],
+            "exact.truth_view.source_bound_projection.e1"
+        );
+        assert_eq!(
+            operator_truth["freshness"],
+            "fresh.truth_view.live_within_budget.f0"
+        );
+        assert_eq!(
+            operator_truth["distributed_surface_record"]["status"],
+            "status.truth_view.operator.nominal.s0"
+        );
+        assert_eq!(
+            operator_truth["truth_bundle_record"]["answer_kind"],
+            "answer.response_registry.bundle.k0"
+        );
+    }
+
+    #[test]
+    fn live_owner_status_text_json_carries_typed_operator_truth() {
+        let route = LivePoolRoute {
+            command: "cluster",
+            operation: "status",
+            pool: "tank",
+            pool_uuid: None,
+            json: true,
+            args: LivePoolAdminArgs::default(),
+        };
+
+        let value = live_owner_status_text_json(&route, "healthy");
+
+        assert_eq!(value["text"], "healthy");
+        assert_eq!(
+            value["operator_truth"]["status_path"],
+            "tidefsctl cluster status"
+        );
+        assert_eq!(
+            value["operator_truth"]["evidence_state"],
+            "live-within-budget"
+        );
+        assert_eq!(
+            value["operator_truth"]["distributed_surface_record"]["live_view"],
+            "view.truth_view.cluster_health.v8"
+        );
     }
 
     #[test]
@@ -2401,17 +2479,23 @@ mod tests {
         });
 
         let lines = live_owner_machine_json_human_lines(&route, &value);
+        let output = lines.join("\n");
         let expected_source = format!(
             "source_classification: {}",
             super::super::classification::StatusSource::LiveOwner.label()
         );
 
-        assert_eq!(
-            lines.first().map(String::as_str),
-            Some(expected_source.as_str())
-        );
+        assert!(output.contains("path:       tidefsctl device status"));
+        assert!(output.contains("evidence:   live-within-budget"));
+        assert!(output.contains("source:     source.truth_view.runtime_mirror.a2"));
+        assert!(output.contains("cut:        cut.truth_view.live_window.c0"));
+        assert!(output.contains("provenance: prov.truth_view.live_mirror.p4"));
+        assert!(output.contains("exactness:  exact.truth_view.source_bound_projection.e1"));
+        assert!(output.contains("freshness:  fresh.truth_view.live_within_budget.f0"));
+        assert!(lines.iter().any(|line| line == &expected_source));
         assert!(lines.iter().any(|line| line == "live status"));
         assert!(lines.iter().any(|line| line == "ready"));
+        assert!(!output.trim_start().starts_with('{'));
     }
 
     #[test]
