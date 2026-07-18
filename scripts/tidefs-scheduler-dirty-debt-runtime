@@ -484,8 +484,9 @@ jq -s --sort-keys \
     queue_observations: [
       {
         queue_root: "performance_contract.budgeted_queue",
-        status: "observed-through-local-write-admission",
-        work_classes: ["foreground-write", "metadata-mutation"]
+        status: "registered-source-boundary-not-runtime-observed",
+        registered_work_classes: ["foreground-write", "metadata-mutation"],
+        reason: "the mounted producer exports LocalWriteAdmission counters, not a live BudgetedQueue depth"
       },
       {
         queue_root: "local_fs.write_admission",
