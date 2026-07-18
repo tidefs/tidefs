@@ -13,6 +13,7 @@ Runner options passed through to the built runner include:
   --validation-dir DIR
   --queue-depth-artifact PATH
   --ack-receipt-runtime
+  --data-shape-runtime
   --scrub-foreground-read
   --keep-tmp
 

@@ -3584,6 +3584,14 @@ EOF
               --scrub-foreground-read \
               --validation-dir "$output_dir"
           '';
+          storage-intent-data-shape-runtime = script "tidefs-storage-intent-data-shape-runtime" [
+            pkgs.bash
+            pkgs.coreutils
+          ] ''
+            exec ${pkgs.bash}/bin/bash ${./.}/scripts/tidefs-fuse-vm-test \
+              --data-shape-runtime \
+              "$@"
+          '';
           fuse-vm-test = qemuSourceApp "tidefs-fuse-vm-test";
           fuse-fio-benchmark = qemuSourceApp "run-fuse-qemu-fio-baseline.sh";
           qemu-ublk-smoke = script "tidefs-qemu-ublk-smoke" [
