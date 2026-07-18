@@ -9083,6 +9083,7 @@ impl FuseVfsAdapter {
         // write cannot install a new dirty owner between the final predicate
         // and cache invalidation.
         let _write_cache_reconciliation_guard = self.write_cache_reconciliation.lock(ino);
+        let mut release_flush_succeeded = false;
         // If the kernel requested flush-on-close and the inode has
         // dirty pages tracked by the adapter writeback layer,
         // trigger writeback before releasing the handle.
@@ -9117,16 +9118,18 @@ impl FuseVfsAdapter {
                 // Ignore flush errors during release; the kernel already
                 // decided to close the file. Engine-level errors are logged
                 // by the engine implementation.
-                let _ = e.flush(
-                    &efh,
-                    &RequestCtx {
-                        uid: 0,
-                        gid: 0,
-                        pid: 0,
-                        umask: 0,
-                        groups: vec![0],
-                    },
-                );
+                release_flush_succeeded = e
+                    .flush(
+                        &efh,
+                        &RequestCtx {
+                            uid: 0,
+                            gid: 0,
+                            pid: 0,
+                            umask: 0,
+                            groups: vec![0],
+                        },
+                    )
+                    .is_ok();
             }
             if let Some(fallback) = fallback_to_release.take() {
                 let e = self.engine.lock().unwrap();
@@ -9178,7 +9181,12 @@ impl FuseVfsAdapter {
             self.mmap_coherency.deregister(ino);
         }
         if is_last_close || (!removed_registered_handle && self.writeback_cache_enabled) {
-            if self.inode_has_dirty_owners(ino) {
+            // A successful requested release flush already covered the same
+            // handle and dirty-owner snapshot while this inode stripe was
+            // held. Retained dirty ownership must survive the best-effort
+            // close, but it does not require an identical second lower flush.
+            // Retry here only when the requested flush failed or did not run.
+            if !release_flush_succeeded && self.inode_has_dirty_owners(ino) {
                 let e = self.engine.lock().unwrap();
                 let flush_ctx = RequestCtx {
                     uid: 0,
@@ -43944,6 +43952,17 @@ mod tests {
             .expect("release through ordered reconciliation gate");
 
         assert_eq!(observed_flushes.load(Ordering::Relaxed), 1);
+        assert!(shared_tracker.lock().unwrap().is_dirty(InodeId::new(1)));
+
+        adapter
+            .dispatch_release(1, 999_998, libc::O_RDWR as u32, None, true)
+            .expect("requested release flush through ordered reconciliation gate");
+
+        assert_eq!(
+            observed_flushes.load(Ordering::Relaxed),
+            2,
+            "a successful requested flush must not be repeated by last-close cleanup"
+        );
         assert!(shared_tracker.lock().unwrap().is_dirty(InodeId::new(1)));
     }
 
