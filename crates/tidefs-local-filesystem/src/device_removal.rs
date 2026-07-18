@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! # Device Removal Authority Map
 //!
-//! This module anchors device removal in a committed root on the target
+//! This module provides local helpers that anchor device removal in a committed root on the target
 //! [`LocalObjectStore`].  When a device is removed from a TideFS pool, the
 //! removal must be anchored so that crash recovery can detect the change
 //! and prevent the pool from being imported in an inconsistent state.
@@ -17,11 +17,11 @@
 //! |-------|----------|-----------------|--------------------|-----------|
 //! | 1. Config Import | [`import_pool_config_from_store`] | Sealed labels in `LocalObjectStore` at `tidefs-pool-label-{idx}` keys | pool UUID, pool name, device GUIDs, device indices, device count, topology generation, feature flags, pool state, device health | Device paths: labels carry `device_index` but not real block-device paths; the importer synthesises `/dev/disk{idx}` |
 //! | 2. Target & Survivor Derivation | `PoolConfig::find_leaf` / `all_leaf_paths` | Imported `PoolConfig` | Which devices exist, their GUIDs, their indices, the pool-wide or legacy compatibility topology, health, and capacity | Device paths in the tree are the synthetic paths from stage 1, not real block devices |
-//! | 3. Object Enumeration | CLI: target-store key listing → `ObjectPlacement` rows | `LocalObjectStore::list_keys` (all data keys filtered from label/record keys) | None (see nonclaim boundaries) | Every data key in the target store is marked resident on the target device; no canonical locator/placement/refcount authority is consulted |
+//! | 3. Object Enumeration | Local caller or fixture → `ObjectPlacement` rows | Caller-provided local data | None (see nonclaim boundaries) | Every supplied data key is treated as resident on the target device; no canonical locator/placement/refcount authority is consulted |
 //! | 4. Evacuation Plan | `DeviceRemovalPlanner::plan_removal` | Imported topology + synthetic placements + replication intent | topology generation, device GUIDs, device count | Round-robin target assignment per object; failure-domain validation uses synthetic PlacementEntry device/node/rack IDs |
 //! | 5. Post-Removal Config | `build_post_removal_pool_config` → `PoolConfig::remove_device` | Imported pre-config, mutated in place | pool UUID, pool name, feature flags, device GUIDs, topology generation (bumped), device count (decremented), remaining device tree | Device paths remain synthetic |
 //! | 6. Label Persistence | [`persist_updated_labels`] | Post-removal `PoolConfig` via `to_labels()` → seal → encode | All label fields: pool UUID, device GUIDs, device count, topology generation, health, feature flags | Device path in label is unused during import (labels are keyed by device_index) |
-//! | 7. Removal Anchor | [`anchor_device_removal`] | [`DeviceRemovalRecord`] from plan + result, optional updated labels | Record fields: device GUID, device index, device count before/after, topology generation, evacuation counts | `removed_device` path is the CLI-provided target path (not label-authoritative) |
+//! | 7. Removal Anchor | [`anchor_device_removal`] | Validated plan/result plus required post-removal config | Record fields: device GUID, device index, device count before/after, topology generation, evacuation counts, sealed local labels | `removed_device` is caller-provided (not label-authoritative) |
 //!
 //! ## Known Nonclaim Boundaries
 //!
@@ -34,26 +34,24 @@
 //!   operations within the store but does not authoritatively tie the
 //!   logical device identity to a real kernel block-device node.
 //!
-//! * **Synthetic object placement.**  The CLI (and any caller that enumerates
-//!   data keys from the target `LocalObjectStore`) marks every discovered
-//!   object as resident on the target device.  There is no canonical
+//! * **Synthetic object placement.**  A local caller or fixture that supplies
+//!   `ObjectPlacement` rows marks every listed object as resident on the target
+//!   device.  There is no canonical
 //!   locator, placement map, or refcount source backing this claim.
 //!   Production device removal requires authoritative placement/refcount
 //!   validation; the current path is a best-effort evacuation and must not
 //!   be presented as pool-authoritative relocation.
 //!
-//! * **Operator-provided surviving directories.**  `--surviving-dirs` is
-//!   operator input, not derived from pool labels.  The pool config tells
-//!   you *which* devices exist; the operator tells you *where* their backing
-//!   stores live on the filesystem.  This separation means that a
-//!   misconfigured `--surviving-dirs` can direct evacuation data to the
-//!   wrong store without the pool detecting it.
+//! * **Retired directory inputs.**  `tidefsctl device remove --backing-dir`
+//!   and `--surviving-dirs` refuse before contacting a live owner, so they do
+//!   not reach this helper. Directory paths supplied to a local caller remain
+//!   test/compatibility input, not pool-media authority.
 //!
 //! * **Raw block-device label writing is not wired.**  [`PoolLabelWriter`]
 //!   (`tidefs-pool-scan`) can write sealed labels to real block devices at
 //!   the import-visible label locations (offset 0 and end-of-device).  The
-//!   current CLI removal path does **not** call [`write_updated_labels_to_devices`]
-//!   or pass a [`PoolLabelWriter`] to [`anchor_device_removal`].  Labels are
+//!   no public `tidefsctl device remove` path calls [`write_updated_labels_to_devices`]
+//!   or passes a [`PoolLabelWriter`] to [`anchor_device_removal`]. Labels are
 //!   persisted only as named objects in the `LocalObjectStore`.  A pool
 //!   import that scans raw block-device labels will not see the post-removal
 //!   topology unless the caller separately writes those labels to devices.
@@ -956,8 +954,8 @@ pub fn import_pool_config_from_store(
 ///
 /// # Errors
 ///
-/// Returns [`DeviceRemovalAnchorError`] on serialization, write, or sync
-/// failure.
+/// Returns [`DeviceRemovalAnchorError`] when local evidence is incomplete or
+/// when serialization, writing, or sync fails.
 pub fn anchor_device_removal(
     store: &mut tidefs_local_object_store::LocalObjectStore,
     plan: &DeviceRemovalPlan,
