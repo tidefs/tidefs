@@ -8345,7 +8345,10 @@ impl FuseVfsAdapter {
             }
         }
 
-        self.writeback_cache.lock().unwrap().mark_clean(ino);
+        // A successful fsync can leave adapter dirty_state intact when no
+        // block-volume target consumed it. Keep the inode-level reclaim
+        // projection aligned with every remaining dirty owner.
+        self.reconcile_writeback_inode_cache_after_authoritative_range(ino);
         if let Some(ref writeback_page_cache) = self.writeback_page_cache {
             writeback_page_cache.clear_dirty_for_inode(ino);
         }
@@ -18450,6 +18453,46 @@ mod tests {
             .expect("dispatch_read");
 
         assert_eq!(read_back, payload);
+    }
+
+    #[test]
+    fn vfs_adapter_dispatch_fsync_retains_reclaim_projection_with_dirty_state() {
+        let fixture = adapter_fixture();
+        let ctx = root_ctx();
+        let payload = b"fsync projection payload";
+        let (inode, adapter_fh, _engine_fh) = create_adapter_file_handle(
+            &fixture.adapter,
+            &ctx,
+            b"fsync-projection.bin",
+            libc::O_RDWR as u32,
+        );
+
+        fixture
+            .adapter
+            .dispatch_write(&ctx, inode.get(), adapter_fh, 0, payload, 0)
+            .expect("dispatch_write");
+        fixture
+            .adapter
+            .dispatch_fsync(&ctx, inode.get(), adapter_fh)
+            .expect("dispatch_fsync");
+
+        assert!(fixture
+            .adapter
+            .dirty_state
+            .lock()
+            .unwrap()
+            .get(&inode.get())
+            .is_some_and(|ranges| ranges.contains(0, payload.len() as u32)));
+        assert_eq!(
+            fixture
+                .adapter
+                .writeback_cache
+                .lock()
+                .unwrap()
+                .is_dirty(inode.get()),
+            Some(true),
+            "fsync must not publish the reclaim projection clean while dirty_state remains"
+        );
     }
 
     #[test]
