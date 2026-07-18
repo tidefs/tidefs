@@ -125,6 +125,14 @@ EOF
   GITHUB_SHA="''${GITHUB_SHA:-unknown}"
   VERIFIED_SOURCE_REF="''${TIDEFS_FUSE_VM_TEST_VERIFIED_SOURCE_REF:-}"
   TIDEFS_GENERATED_AT="''${TIDEFS_GENERATED_AT:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
+  PRODUCER_RUN_ID=""
+  if [[ "$GITHUB_RUN_ID" =~ ^[1-9][0-9]*$ ]] \
+    && [[ "$GITHUB_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]; then
+    PRODUCER_RUN_ID="github-actions:$GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT"
+  elif [[ "$GITHUB_RUN_ID" == "local" || "$GITHUB_RUN_ID" == "local-qemu" ]] \
+    && [[ "$GITHUB_RUN_ATTEMPT" == "1" ]]; then
+    PRODUCER_RUN_ID="local-qemu:$TIDEFS_GENERATED_AT"
+  fi
 
   if [ ! -e /dev/kvm ]; then
     echo "ENVIRONMENT REFUSAL: /dev/kvm not available" >&2
@@ -866,13 +874,12 @@ JSON
     && [ "$QUEUE_PRESENT" = true ]; then
     if [[ "$VERIFIED_SOURCE_REF" =~ ^[0-9a-f]{40}$ ]] \
       && [ "$GITHUB_SHA" = "$VERIFIED_SOURCE_REF" ] \
-      && [[ "$TIDEFS_GENERATED_AT" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]; then
-      if [[ "$GITHUB_RUN_ID" =~ ^[0-9]+$ ]] \
-        && [[ "$GITHUB_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]; then
-        queue_run_id="github-actions:$GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT"
-      else
-        queue_run_id="local-qemu:$TIDEFS_GENERATED_AT"
-      fi
+      && [[ "$TIDEFS_GENERATED_AT" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] \
+      && [ -n "$PRODUCER_RUN_ID" ] \
+      && "$JQ" -n -e --arg generated_at "$TIDEFS_GENERATED_AT" \
+        '$generated_at | fromdateiso8601 | strftime("%Y-%m-%dT%H:%M:%SZ") == $generated_at' \
+        >/dev/null 2>&1; then
+      queue_run_id="$PRODUCER_RUN_ID"
       queue_content_digest="blake3:$($B3SUM "$QUEUE_DEPTH_ARTIFACT" | awk '{print $1}')"
       summary_content_digest="blake3:$($B3SUM "$VALIDATION_DIR/fuse-vm-test.json" | awk '{print $1}')"
       queue_manifest_tmp="$queue_manifest.tmp.$$"
@@ -922,7 +929,7 @@ JSON
       mv -- "$summary_manifest_tmp" "$summary_manifest"
       mv -- "$queue_manifest_tmp" "$queue_manifest"
     else
-      echo "Queue-depth manifest withheld: verified source SHA, requested source SHA, or generated timestamp is not promotable" >&2
+      echo "Queue-depth manifest withheld: source SHA, producer run identity, or generated timestamp is not promotable" >&2
     fi
   fi
 

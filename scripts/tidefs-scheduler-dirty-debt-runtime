@@ -166,11 +166,17 @@ if [[ "$input_mode" -eq 0 ]]; then
     fail "--source-ref must match the run-mode checkout HEAD"
   fi
   source_ref="$checkout_source_ref"
-  if [[ "${GITHUB_RUN_ID:-}" =~ ^[0-9]+$ ]] \
-    && [[ "${GITHUB_RUN_ATTEMPT:-1}" =~ ^[1-9][0-9]*$ ]]; then
-    expected_run_id="github-actions:${GITHUB_RUN_ID}/${GITHUB_RUN_ATTEMPT:-1}"
-  else
+  github_run_id="${GITHUB_RUN_ID:-}"
+  github_run_attempt="${GITHUB_RUN_ATTEMPT:-1}"
+  if [[ "$github_run_id" =~ ^[1-9][0-9]*$ ]] \
+    && [[ "$github_run_attempt" =~ ^[1-9][0-9]*$ ]]; then
+    expected_run_id="github-actions:$github_run_id/$github_run_attempt"
+  elif [[ -z "$github_run_id" || "$github_run_id" == "local" \
+    || "$github_run_id" == "local-qemu" ]] \
+    && [[ "$github_run_attempt" == "1" ]]; then
     expected_run_id="local-qemu:${generated_at}"
+  else
+    fail "run mode requires a positive GitHub run/attempt pair or an explicit local producer"
   fi
   if [[ -n "$run_id" && "$run_id" != "$expected_run_id" ]]; then
     fail "--run-id must match the run-mode producer id $expected_run_id"
@@ -182,7 +188,12 @@ fi
   || fail "--source-ref must be an exact lowercase 40-hex commit"
 [[ "$generated_at" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] \
   || fail "--generated-at must use UTC RFC3339 form YYYY-MM-DDTHH:MM:SSZ"
-if [[ ! "$run_id" =~ ^github-actions:[0-9]+/[1-9][0-9]*$ ]] \
+if ! jq -n -e --arg generated_at "$generated_at" \
+  '$generated_at | fromdateiso8601 | strftime("%Y-%m-%dT%H:%M:%SZ") == $generated_at' \
+  >/dev/null 2>&1; then
+  fail "--generated-at must be a valid UTC calendar timestamp"
+fi
+if [[ ! "$run_id" =~ ^github-actions:[1-9][0-9]*/[1-9][0-9]*$ ]] \
   && [[ ! "$run_id" =~ ^local-qemu:[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]; then
   fail "--run-id must identify a GitHub Actions or local QEMU producer"
 fi
