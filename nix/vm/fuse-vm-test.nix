@@ -120,16 +120,19 @@ EOF
     QUEUE_DEPTH_ARTIFACT="$VALIDATION_DIR/performance/queue-depth-runtime.json"
   fi
 
+  GITHUB_ACTIONS="''${GITHUB_ACTIONS:-false}"
   GITHUB_RUN_ID="''${GITHUB_RUN_ID:-local}"
   GITHUB_RUN_ATTEMPT="''${GITHUB_RUN_ATTEMPT:-1}"
   GITHUB_SHA="''${GITHUB_SHA:-unknown}"
   VERIFIED_SOURCE_REF="''${TIDEFS_FUSE_VM_TEST_VERIFIED_SOURCE_REF:-}"
   TIDEFS_GENERATED_AT="''${TIDEFS_GENERATED_AT:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
   PRODUCER_RUN_ID=""
-  if [[ "$GITHUB_RUN_ID" =~ ^[1-9][0-9]*$ ]] \
+  if [[ "$GITHUB_ACTIONS" == "true" ]] \
+    && [[ "$GITHUB_RUN_ID" =~ ^[1-9][0-9]*$ ]] \
     && [[ "$GITHUB_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]; then
     PRODUCER_RUN_ID="github-actions:$GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT"
-  elif [[ "$GITHUB_RUN_ID" == "local" || "$GITHUB_RUN_ID" == "local-qemu" ]] \
+  elif [[ "$GITHUB_ACTIONS" == "false" ]] \
+    && [[ "$GITHUB_RUN_ID" == "local" || "$GITHUB_RUN_ID" == "local-qemu" ]] \
     && [[ "$GITHUB_RUN_ATTEMPT" == "1" ]]; then
     PRODUCER_RUN_ID="local-qemu:$TIDEFS_GENERATED_AT"
   fi

@@ -166,17 +166,20 @@ if [[ "$input_mode" -eq 0 ]]; then
     fail "--source-ref must match the run-mode checkout HEAD"
   fi
   source_ref="$checkout_source_ref"
+  github_actions="${GITHUB_ACTIONS:-false}"
   github_run_id="${GITHUB_RUN_ID:-}"
   github_run_attempt="${GITHUB_RUN_ATTEMPT:-1}"
-  if [[ "$github_run_id" =~ ^[1-9][0-9]*$ ]] \
+  if [[ "$github_actions" == "true" ]] \
+    && [[ "$github_run_id" =~ ^[1-9][0-9]*$ ]] \
     && [[ "$github_run_attempt" =~ ^[1-9][0-9]*$ ]]; then
     expected_run_id="github-actions:$github_run_id/$github_run_attempt"
-  elif [[ -z "$github_run_id" || "$github_run_id" == "local" \
+  elif [[ "$github_actions" == "false" ]] \
+    && [[ -z "$github_run_id" || "$github_run_id" == "local" \
     || "$github_run_id" == "local-qemu" ]] \
     && [[ "$github_run_attempt" == "1" ]]; then
     expected_run_id="local-qemu:${generated_at}"
   else
-    fail "run mode requires a positive GitHub run/attempt pair or an explicit local producer"
+    fail "run mode requires a consistent GitHub Actions context or an explicit local producer"
   fi
   if [[ -n "$run_id" && "$run_id" != "$expected_run_id" ]]; then
     fail "--run-id must match the run-mode producer id $expected_run_id"
