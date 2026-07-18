@@ -41,6 +41,7 @@ use tidefs_membership_live::connection_acceptance::ConnectionAcceptor;
 use tidefs_membership_live::peer_eviction::EvictionAction;
 use tidefs_membership_live::peer_join::PeerJoinHandshake;
 use tidefs_membership_live::reconnect_handshake::PeerReconnectOutcome;
+use tidefs_membership_live::roster::RosterState;
 use tidefs_membership_live::session_binding::SessionBindingTable;
 use tidefs_membership_live::{
     recv_membership_msg, send_membership_msg, FailureDetector, MembershipConfig, MembershipRuntime,
@@ -1059,16 +1060,14 @@ fn snapshot_barrier_membership_cut(ctx: &SessionContext) -> SnapshotBarrierMembe
         .snapshot()
         .iter()
         .filter_map(|(member_id, state)| {
-            if *member_id == local_id
-                || *state != tidefs_membership_live::roster::RosterState::Active
-            {
+            if *member_id == local_id || matches!(*state, RosterState::Failed | RosterState::Left) {
                 return None;
             }
 
             match membership.detector.get_peer(*member_id) {
                 Some(peer) if !peer.can_hold_data() => None,
                 // Missing participant-role evidence stays fail-closed: keep
-                // the active member in the barrier set so the send cannot
+                // the current member in the barrier set so the send cannot
                 // silently proceed without it.
                 _ => Some(member_id.0),
             }
@@ -7406,6 +7405,30 @@ mod cluster_pool_handler_tests {
             other => panic!("expected unavailable membership peer, got {other:?}"),
         }
         assert!(err.to_string().contains("membership_peer_unavailable"));
+        assert!(ctx.active_barrier.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn snapshot_barrier_before_send_requires_suspected_data_bearing_peer() {
+        let (_dir, store) = frame_local_store();
+        let ctx = frame_test_context(Arc::clone(&store));
+        register_snapshot_barrier_test_peer(&ctx, 2);
+        ctx.membership
+            .lock()
+            .unwrap()
+            .roster
+            .transition_state(MemberId::new(2), RosterState::Suspected)
+            .expect("active peer becomes suspected");
+
+        let err = run_snapshot_barrier_before_send(tidefs_transport::SessionId::new(1), &ctx, &[])
+            .expect_err("suspected epoch member without a session must refuse send");
+
+        match &err {
+            SnapshotBarrierSendError::MembershipPeerUnavailable { peer_ids, .. } => {
+                assert_eq!(peer_ids, &vec![2]);
+            }
+            other => panic!("expected unavailable suspected peer, got {other:?}"),
+        }
         assert!(ctx.active_barrier.lock().unwrap().is_none());
     }
 
