@@ -6,6 +6,10 @@
 
 use crate::smoke::SmokeHarness;
 use crate::trace::TraceEvent;
+use tidefs_encryption::secret_handle::{
+    assess_cryptographic_erase_boundary, CryptographicEraseEvidence, CryptographicEraseRefusal,
+    MountedPoolKeyAccessState,
+};
 use tidefs_local_object_store::device::DiscardCapability;
 use tidefs_reclaim::{
     plan_reclaim_completion, ReclaimCandidate, ReclaimCompletionOutcome, ReclaimConfig,
@@ -280,6 +284,44 @@ impl DiscardCapabilityValidationRow {
     }
 }
 
+#[derive(Clone, Copy)]
+struct CryptographicEraseKeyLifecycleRefusalValidationRow {
+    active_full_proof_refused: bool,
+    refusal: &'static str,
+    secure_erase: bool,
+}
+
+impl CryptographicEraseKeyLifecycleRefusalValidationRow {
+    fn source_backed() -> Self {
+        let assessment = assess_cryptographic_erase_boundary(
+            MountedPoolKeyAccessState::Active,
+            CryptographicEraseEvidence::encrypted_with_full_proof(),
+        );
+
+        Self {
+            active_full_proof_refused: assessment.refusal
+                == Some(CryptographicEraseRefusal::KeyLifecycleNotDestroyedOrRevoked),
+            refusal: assessment
+                .refusal
+                .map_or("none", |refusal| refusal.as_str()),
+            secure_erase: assessment.can_present_as_secure_erase(),
+        }
+    }
+
+    fn encode(self) -> Vec<u8> {
+        format!(
+            concat!(
+                "row=device-lifecycle.cryptographic-erase.active-key-refusal;",
+                "active_full_proof_refused={};",
+                "refusal={};",
+                "secure_erase={}",
+            ),
+            self.active_full_proof_refused, self.refusal, self.secure_erase,
+        )
+        .into_bytes()
+    }
+}
+
 /// Run the full reclaim smoke sequence and return the harness.
 #[must_use]
 pub fn run_reclaim_smoke() -> SmokeHarness {
@@ -362,6 +404,27 @@ pub fn run_reclaim_smoke() -> SmokeHarness {
             !admitted,
         );
     }
+    let cryptographic_erase_row =
+        CryptographicEraseKeyLifecycleRefusalValidationRow::source_backed();
+    record_reclaim_op(
+        &mut h,
+        "validation.matrix.cryptographic_erase_key_lifecycle_refusal",
+        0,
+        cryptographic_erase_row.encode(),
+    );
+    h.assert_ev(
+        "cryptographic erase matrix refuses an active key even with full source evidence",
+        cryptographic_erase_row.active_full_proof_refused,
+    );
+    h.assert_eq_ev(
+        "cryptographic erase matrix records the key-lifecycle refusal",
+        cryptographic_erase_row.refusal,
+        CryptographicEraseRefusal::KeyLifecycleNotDestroyedOrRevoked.as_str(),
+    );
+    h.assert_ev(
+        "cryptographic erase matrix does not admit secure erase",
+        !cryptographic_erase_row.secure_erase,
+    );
 
     let config = ReclaimConfig {
         waste_threshold: 0.25,
@@ -713,5 +776,34 @@ mod tests {
         ] {
             assert_eq!(fields.get(field).copied(), Some("false"), "{field}");
         }
+    }
+
+    #[test]
+    fn cryptographic_erase_key_lifecycle_refusal_matrix_row_is_fail_closed() {
+        let h = run_reclaim_smoke();
+        let marker = h.trace.iter().find_map(|event| match event {
+            TraceEvent::FsLifecycleOp {
+                op_name, payload, ..
+            } if op_name == "validation.matrix.cryptographic_erase_key_lifecycle_refusal" => {
+                Some(std::str::from_utf8(payload).expect("matrix row payload is utf-8"))
+            }
+            _ => None,
+        });
+        let marker = marker.expect("cryptographic erase matrix row is recorded");
+        let fields = matrix_row_fields(marker);
+
+        assert_eq!(
+            fields.get("row").copied(),
+            Some("device-lifecycle.cryptographic-erase.active-key-refusal")
+        );
+        assert_eq!(
+            fields.get("active_full_proof_refused").copied(),
+            Some("true")
+        );
+        assert_eq!(
+            fields.get("refusal").copied(),
+            Some("key lifecycle is not destroyed or revoked")
+        );
+        assert_eq!(fields.get("secure_erase").copied(), Some("false"));
     }
 }
