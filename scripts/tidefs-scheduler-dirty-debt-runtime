@@ -26,7 +26,7 @@ Options:
   --timeout SECONDS      QEMU timeout in run mode (default: 900)
   --input-artifact FILE  Existing raw queue-depth-runtime.json from QEMU Smoke
   --input-summary FILE   Matching fuse-vm-test.json from the same QEMU run
-  --input-manifest FILE  Version-2 manifest that names and digests the input
+  --input-manifest FILE  Matching queue-depth-runtime.manifest.json that names and digests the input
   --run-id ID            Concrete run id (default: GitHub run or local QEMU id)
   --source-ref SHA       Exact 40-hex source commit (default: checkout HEAD)
   --generated-at TIME    UTC RFC3339 timestamp (default: current UTC time)

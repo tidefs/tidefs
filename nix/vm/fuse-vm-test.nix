@@ -120,19 +120,24 @@ EOF
     QUEUE_DEPTH_ARTIFACT="$VALIDATION_DIR/performance/queue-depth-runtime.json"
   fi
 
+  GITHUB_RUN_ID="''${GITHUB_RUN_ID:-local}"
+  GITHUB_RUN_ATTEMPT="''${GITHUB_RUN_ATTEMPT:-1}"
+  GITHUB_SHA="''${GITHUB_SHA:-unknown}"
+  TIDEFS_GENERATED_AT="''${TIDEFS_GENERATED_AT:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
+
   if [ ! -e /dev/kvm ]; then
     echo "ENVIRONMENT REFUSAL: /dev/kvm not available" >&2
     exit 2
   fi
 
-  for dep in "$QEMU_BIN" "$BUSYBOX" "$CPIO" "$XZ_BIN" "$KERNEL_IMG" "$TIDEFS_XTASK" "$TIDEFS_STORE_DEMO" "$FUSE_DAEMON"; do
+  for dep in "$QEMU_BIN" "$BUSYBOX" "$CPIO" "$XZ_BIN" "$KERNEL_IMG" "$TIDEFS_XTASK" "$TIDEFS_STORE_DEMO" "$FUSE_DAEMON" "$B3SUM" "$JQ"; do
     if [ ! -f "$dep" ] && [ ! -x "$dep" ]; then
       echo "ERROR: dependency not found: $dep" >&2
       exit 2
     fi
   done
   if [ "$SCRUB_FOREGROUND_READ" -eq 1 ]; then
-    for dep in "$SCRUB_VALIDATION" "$BASE64" "$B3SUM" "$JQ"; do
+    for dep in "$SCRUB_VALIDATION" "$BASE64"; do
       if [ ! -f "$dep" ] && [ ! -x "$dep" ]; then
         echo "ERROR: dependency not found: $dep" >&2
         exit 2
@@ -140,7 +145,7 @@ EOF
     done
   fi
   if [ "$ACK_RECEIPT_RUNTIME" -eq 1 ]; then
-    for dep in "$ACK_VALIDATION" "$BASE64" "$B3SUM" "$JQ"; do
+    for dep in "$ACK_VALIDATION" "$BASE64"; do
       if [ ! -f "$dep" ] && [ ! -x "$dep" ]; then
         echo "ERROR: dependency not found: $dep" >&2
         exit 2
@@ -850,6 +855,49 @@ INITSCRIPT
 }
 JSON
 
+  queue_manifest="$VALIDATION_DIR/queue-depth-runtime.manifest.json"
+  if [ "$QEMU_STATUS" -eq 0 ] \
+    && [ "$DONEC" -ge 1 ] \
+    && [ "$REFUSALC" -eq 0 ] \
+    && [ "$FAILC" -eq 0 ] \
+    && [ "$QUEUE_PRESENT" = true ]; then
+    if [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]] \
+      && [[ "$TIDEFS_GENERATED_AT" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]; then
+      if [[ "$GITHUB_RUN_ID" =~ ^[0-9]+$ ]] \
+        && [[ "$GITHUB_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]; then
+        queue_run_id="github-actions:$GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT"
+      else
+        queue_run_id="local-qemu:$TIDEFS_GENERATED_AT"
+      fi
+      queue_content_digest="blake3:$($B3SUM "$QUEUE_DEPTH_ARTIFACT" | awk '{print $1}')"
+      queue_manifest_tmp="$queue_manifest.tmp.$$"
+      "$JQ" -n --sort-keys \
+        --arg content_digest "$queue_content_digest" \
+        --arg run_id "$queue_run_id" \
+        --arg source_ref "$GITHUB_SHA" \
+        --arg generated_at "$TIDEFS_GENERATED_AT" \
+        '{
+          manifest_version: 2,
+          claim_id: "perf.local.no_unbounded_dirty_debt.v1",
+          evidence_class: "queue-depth-runtime-artifact",
+          validation_tier: "mounted-userspace",
+          scope: "Linux 7.0 QEMU mounted FUSE smoke-mount quick workload",
+          artifact_path: "validation/artifacts/performance/queue-depth-runtime.json",
+          content_digest: $content_digest,
+          run_id: $run_id,
+          source_ref: $source_ref,
+          outcome: "pass",
+          residual_risk: "The row measures bounded local dirty-write admission only; it does not prove scheduler-wide queue coverage.",
+          source: "qemu-smoke-fuse-vm-test",
+          generated_at: $generated_at,
+          blocking_issues: []
+        }' > "$queue_manifest_tmp"
+      mv -- "$queue_manifest_tmp" "$queue_manifest"
+    else
+      echo "Queue-depth manifest withheld: source SHA or generated timestamp is not promotable" >&2
+    fi
+  fi
+
   echo "=== TideFS FUSE VM Test Results ==="
   grep -E '^(PASS|FAIL|REFUSAL):' "$VAL_LOG" 2>/dev/null || true
   echo "Validation: $PASSC passed, $FAILC failed, $REFUSALC refused"
@@ -857,6 +905,9 @@ JSON
   echo "Validation JSON: $VALIDATION_DIR/fuse-vm-test.json"
   if [ "$QUEUE_PRESENT" = true ]; then
     echo "Queue-depth artifact: $QUEUE_DEPTH_ARTIFACT"
+  fi
+  if [ -s "$queue_manifest" ]; then
+    echo "Queue-depth manifest: $queue_manifest"
   fi
   if [ "$DATA_SHAPE_TRANSFORM_PRESENT" = true ]; then
     echo "Data-shape transform artifact: $data_shape_transform_artifact"
