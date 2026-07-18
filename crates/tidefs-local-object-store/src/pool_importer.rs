@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 
 use crate::pool_label::{
     decode_label, LabelPoolState, PoolLabelV1, POOL_LABEL_SIZE, POOL_LABEL_V1_WIRE_SIZE,
+    POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE,
 };
 use crate::pool_lifecycle_evidence::{
     PoolLifecycleAction, PoolLifecycleContext, PoolLifecycleEvidence,
@@ -379,8 +380,6 @@ impl PoolImporter {
 
     /// Read a single device candidate. Returns `None` if no valid label found.
     fn read_candidate(device_path: &Path) -> Result<Option<DeviceCandidate>, ImportError> {
-        use std::io::Read;
-
         if !device_path.exists() {
             return Ok(None);
         }
@@ -407,16 +406,13 @@ impl PoolImporter {
                 source: e,
             })?;
 
-        let mut buf = [0u8; POOL_LABEL_V1_WIRE_SIZE];
+        let mut buf = [0u8; POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE];
 
         // Try label copy 0 at offset 0
-        file.read_exact(&mut buf).map_err(|e| ImportError::Io {
-            operation: "scan_read_label0",
-            path: label_path.clone(),
-            source: e,
-        })?;
+        let label0_len =
+            Self::read_label_header(&mut file, &mut buf, "scan_read_label0", &label_path)?;
 
-        match decode_label(&buf) {
+        match decode_label(&buf[..label0_len]) {
             Ok(label) => {
                 return Ok(Some(DeviceCandidate {
                     path: device_path.to_path_buf(),
@@ -445,12 +441,13 @@ impl PoolImporter {
                             path: label_path.clone(),
                             source: e,
                         })?;
-                    file2.read_exact(&mut buf).map_err(|e| ImportError::Io {
-                        operation: "scan_read_label1",
-                        path: label_path.clone(),
-                        source: e,
-                    })?;
-                    match decode_label(&buf) {
+                    let label1_len = Self::read_label_header(
+                        &mut file2,
+                        &mut buf,
+                        "scan_read_label1",
+                        &label_path,
+                    )?;
+                    match decode_label(&buf[..label1_len]) {
                         Ok(label) => {
                             return Ok(Some(DeviceCandidate {
                                 path: device_path.to_path_buf(),
@@ -466,6 +463,41 @@ impl PoolImporter {
         }
 
         Ok(None)
+    }
+
+    /// Read every current label extension while still accepting a base-only record.
+    fn read_label_header(
+        file: &mut std::fs::File,
+        buf: &mut [u8; POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE],
+        operation: &'static str,
+        path: &Path,
+    ) -> Result<usize, ImportError> {
+        use std::io::Read;
+
+        file.read_exact(&mut buf[..POOL_LABEL_V1_WIRE_SIZE])
+            .map_err(|e| ImportError::Io {
+                operation,
+                path: path.to_path_buf(),
+                source: e,
+            })?;
+
+        let mut len = POOL_LABEL_V1_WIRE_SIZE;
+        while len < buf.len() {
+            match file.read(&mut buf[len..]) {
+                Ok(0) => break,
+                Ok(read) => len += read,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(source) => {
+                    return Err(ImportError::Io {
+                        operation,
+                        path: path.to_path_buf(),
+                        source,
+                    });
+                }
+            }
+        }
+
+        Ok(len)
     }
 
     /// Group candidates by pool_guid and build `CandidatePool` instances.
@@ -674,7 +706,10 @@ impl PoolImporter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pool_label::{LabelDeviceClass, PoolRedundancyPolicy, POOL_LABEL_MAGIC};
+    use crate::pool_label::{
+        encode_label, LabelDeviceClass, PoolRedundancyPolicy, POOL_LABEL_MAGIC,
+        POOL_LABEL_V1_EXT_WIRE_SIZE,
+    };
     use crate::pool_lifecycle_evidence::PoolLifecycleOutcome;
 
     #[test]
@@ -684,6 +719,41 @@ mod tests {
         };
         let msg = err.to_string();
         assert!(msg.contains("no devices found"), "got: {msg}");
+    }
+
+    #[test]
+    fn scan_candidates_reads_extended_label_evidence() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let device_path = dir.path().join("device.img");
+        let mut label = PoolLabelV1::new([0xA1; 16], [0xB2; 16], "extended-evidence");
+        label.pool_state = LabelPoolState::Exported;
+        label.commit_group = 19;
+        label.label_commit_group = 19;
+        label.topology_generation = 7;
+        label.device_count = 1;
+        label.device_capacity_bytes = 1024 * 1024;
+        label.device_health = 1;
+        label.device_read_errors = 2;
+        label.device_write_errors = 3;
+        label.device_checksum_errors = 5;
+        label.redundancy_policy = PoolRedundancyPolicy::replicated(2);
+
+        let mut encoded = [0u8; POOL_LABEL_V1_EXT_WIRE_SIZE];
+        encode_label(&label, &mut encoded).expect("encode extended label");
+        std::fs::write(&device_path, encoded).expect("write extended label");
+
+        let pools = PoolImporter::scan_candidates(&[device_path]).expect("scan extended label");
+
+        assert_eq!(pools.len(), 1);
+        let decoded = &pools[0].devices[0].label;
+        assert_eq!(decoded.device_health, 1);
+        assert_eq!(decoded.device_read_errors, 2);
+        assert_eq!(decoded.device_write_errors, 3);
+        assert_eq!(decoded.device_checksum_errors, 5);
+        assert_eq!(
+            decoded.redundancy_policy,
+            PoolRedundancyPolicy::replicated(2)
+        );
     }
 
     #[test]
