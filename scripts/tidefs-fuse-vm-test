@@ -88,6 +88,16 @@ done
 
 verified_source_ref=""
 source_checkout=""
+source_snapshot=""
+build_script="$script_dir/tidefs-nix-qemu-build"
+cleanup_source_snapshot() {
+  if [[ -n "$source_snapshot" ]]; then
+    rm -rf -- "$source_snapshot"
+    source_snapshot=""
+  fi
+}
+trap cleanup_source_snapshot EXIT
+
 if git -C "$repo" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   source_checkout="$repo"
 elif [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
@@ -110,17 +120,29 @@ if [[ -n "$source_checkout" ]]; then
   fi
   GITHUB_SHA="$checkout_source_ref"
   verified_source_ref="$checkout_source_ref"
-  repo="$source_checkout"
+  command -v tar >/dev/null 2>&1 \
+    || { echo "tidefs-fuse-vm-test: tar is required to snapshot the verified source" >&2; exit 2; }
+  # Freeze the Nix input at the verified commit before the long build and VM run.
+  source_snapshot="$(mktemp -d "${TMPDIR:-/tmp}/tidefs-fuse-vm-source.XXXXXX")"
+  git -C "$source_checkout" archive --format=tar "$checkout_source_ref" \
+    | tar -x -C "$source_snapshot"
+  [[ -f "$source_snapshot/flake.nix" ]] \
+    || { echo "tidefs-fuse-vm-test: verified source snapshot is not a TideFS flake" >&2; exit 2; }
+  repo="$source_snapshot"
+  build_script="$source_snapshot/scripts/tidefs-nix-qemu-build"
 fi
 export GITHUB_SHA
 export TIDEFS_FUSE_VM_TEST_VERIFIED_SOURCE_REF="$verified_source_ref"
 
-bash "$script_dir/tidefs-nix-qemu-build" \
+bash "$build_script" \
   --target tidefsFuseVmTest \
   --name tidefs-fuse-vm-test \
   --repo "$repo" \
   --system "$system" \
   "${build_args[@]}"
+
+cleanup_source_snapshot
+trap - EXIT
 
 runner="$root_dir/tidefs-fuse-vm-test/bin/tidefs-fuse-vm-test-runner"
 if [[ ! -x "$runner" ]]; then

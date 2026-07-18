@@ -857,6 +857,8 @@ INITSCRIPT
 JSON
 
   queue_manifest="$VALIDATION_DIR/queue-depth-runtime.manifest.json"
+  summary_manifest="$VALIDATION_DIR/fuse-vm-test.manifest.json"
+  rm -f -- "$queue_manifest" "$summary_manifest"
   if [ "$QEMU_STATUS" -eq 0 ] \
     && [ "$DONEC" -ge 1 ] \
     && [ "$REFUSALC" -eq 0 ] \
@@ -872,7 +874,9 @@ JSON
         queue_run_id="local-qemu:$TIDEFS_GENERATED_AT"
       fi
       queue_content_digest="blake3:$($B3SUM "$QUEUE_DEPTH_ARTIFACT" | awk '{print $1}')"
+      summary_content_digest="blake3:$($B3SUM "$VALIDATION_DIR/fuse-vm-test.json" | awk '{print $1}')"
       queue_manifest_tmp="$queue_manifest.tmp.$$"
+      summary_manifest_tmp="$summary_manifest.tmp.$$"
       "$JQ" -n --sort-keys \
         --arg content_digest "$queue_content_digest" \
         --arg run_id "$queue_run_id" \
@@ -894,6 +898,28 @@ JSON
           generated_at: $generated_at,
           blocking_issues: []
         }' > "$queue_manifest_tmp"
+      "$JQ" -n --sort-keys \
+        --arg content_digest "$summary_content_digest" \
+        --arg run_id "$queue_run_id" \
+        --arg source_ref "$VERIFIED_SOURCE_REF" \
+        --arg generated_at "$TIDEFS_GENERATED_AT" \
+        '{
+          manifest_version: 2,
+          claim_id: "perf.local.no_unbounded_dirty_debt.v1",
+          evidence_class: "qemu-row-summary",
+          validation_tier: "mounted-userspace",
+          scope: "Linux 7.0 QEMU mounted FUSE smoke-mount quick row summary",
+          artifact_path: "fuse-vm-test.json",
+          content_digest: $content_digest,
+          run_id: $run_id,
+          source_ref: $source_ref,
+          outcome: "pass",
+          residual_risk: "This summary records only the bounded local FUSE row used by the queue-depth collector; it does not prove scheduler-wide queue coverage.",
+          source: "qemu-smoke-fuse-vm-test",
+          generated_at: $generated_at,
+          blocking_issues: []
+        }' > "$summary_manifest_tmp"
+      mv -- "$summary_manifest_tmp" "$summary_manifest"
       mv -- "$queue_manifest_tmp" "$queue_manifest"
     else
       echo "Queue-depth manifest withheld: verified source SHA, requested source SHA, or generated timestamp is not promotable" >&2
@@ -910,6 +936,9 @@ JSON
   fi
   if [ -s "$queue_manifest" ]; then
     echo "Queue-depth manifest: $queue_manifest"
+  fi
+  if [ -s "$summary_manifest" ]; then
+    echo "FUSE summary manifest: $summary_manifest"
   fi
   if [ "$DATA_SHAPE_TRANSFORM_PRESENT" = true ]; then
     echo "Data-shape transform artifact: $data_shape_transform_artifact"

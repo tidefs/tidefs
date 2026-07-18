@@ -7,7 +7,8 @@ usage() {
 Usage:
   tidefs-scheduler-dirty-debt-runtime --output-dir DIR [OPTIONS]
   tidefs-scheduler-dirty-debt-runtime --input-artifact FILE \
-    --input-summary FILE --input-manifest FILE --output-dir DIR \
+    --input-summary FILE --input-manifest FILE \
+    --input-summary-manifest FILE --output-dir DIR \
     --run-id ID --source-ref SHA --generated-at TIMESTAMP
 
 Run the existing Linux 7.0 FUSE QEMU smoke row and promote its raw local
@@ -18,8 +19,8 @@ that keep scheduler.dirty_debt.no_hidden.v1 blocked.
 
 By default this command launches scripts/tidefs-fuse-vm-test. The input mode
 promotes files downloaded from a completed QEMU Smoke fuse-vm-test run without
-launching another VM; a digest-matched version-2 runtime manifest must bind
-the promoted input to its run provenance.
+launching another VM; digest-matched version-2 manifests must bind both the
+runtime artifact and row summary to their run provenance.
 
 Options:
   --output-dir DIR       Write queue-depth-runtime.json and its claim manifests here
@@ -27,6 +28,8 @@ Options:
   --input-artifact FILE  Existing raw queue-depth-runtime.json from QEMU Smoke
   --input-summary FILE   Matching fuse-vm-test.json from the same QEMU run
   --input-manifest FILE  Matching queue-depth-runtime.manifest.json that names and digests the input
+  --input-summary-manifest FILE
+                         Matching fuse-vm-test.manifest.json that names and digests the summary
   --run-id ID            Concrete run id (default: GitHub run or local QEMU id)
   --source-ref SHA       Exact 40-hex source commit (default: checkout HEAD)
   --generated-at TIME    UTC RFC3339 timestamp (default: current UTC time)
@@ -62,6 +65,7 @@ timeout_seconds=900
 input_artifact=""
 input_summary=""
 input_manifest=""
+input_summary_manifest=""
 run_id="${TIDEFS_DIRTY_DEBT_RUN_ID:-}"
 source_ref="${TIDEFS_DIRTY_DEBT_SOURCE_REF:-}"
 generated_at="${TIDEFS_DIRTY_DEBT_GENERATED_AT:-}"
@@ -81,17 +85,26 @@ while [[ $# -gt 0 ]]; do
       ;;
     --input-artifact)
       [[ $# -ge 2 ]] || fail "--input-artifact requires an argument"
+      [[ -n "$2" ]] || fail "--input-artifact requires a nonempty argument"
       input_artifact="$2"
       shift 2
       ;;
     --input-summary)
       [[ $# -ge 2 ]] || fail "--input-summary requires an argument"
+      [[ -n "$2" ]] || fail "--input-summary requires a nonempty argument"
       input_summary="$2"
       shift 2
       ;;
     --input-manifest)
       [[ $# -ge 2 ]] || fail "--input-manifest requires an argument"
+      [[ -n "$2" ]] || fail "--input-manifest requires a nonempty argument"
       input_manifest="$2"
+      shift 2
+      ;;
+    --input-summary-manifest)
+      [[ $# -ge 2 ]] || fail "--input-summary-manifest requires an argument"
+      [[ -n "$2" ]] || fail "--input-summary-manifest requires a nonempty argument"
+      input_summary_manifest="$2"
       shift 2
       ;;
     --run-id)
@@ -131,10 +144,12 @@ if ! command -v b3sum >/dev/null 2>&1 && ! command -v nix >/dev/null 2>&1; then
 fi
 
 input_mode=0
-if [[ -n "$input_artifact" || -n "$input_summary" || -n "$input_manifest" ]]; then
+if [[ -n "$input_artifact" || -n "$input_summary" || -n "$input_manifest" \
+  || -n "$input_summary_manifest" ]]; then
   input_mode=1
-  [[ -n "$input_artifact" && -n "$input_summary" && -n "$input_manifest" ]] \
-    || fail "--input-artifact, --input-summary, and --input-manifest must be used together"
+  [[ -n "$input_artifact" && -n "$input_summary" && -n "$input_manifest" \
+    && -n "$input_summary_manifest" ]] \
+    || fail "--input-artifact, --input-summary, --input-manifest, and --input-summary-manifest must be used together"
   [[ -n "$run_id" && -n "$source_ref" && -n "$generated_at" ]] \
     || fail "input mode requires --run-id, --source-ref, and --generated-at"
 fi
@@ -167,13 +182,16 @@ fi
   || fail "--source-ref must be an exact lowercase 40-hex commit"
 [[ "$generated_at" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] \
   || fail "--generated-at must use UTC RFC3339 form YYYY-MM-DDTHH:MM:SSZ"
-case "${run_id,,}" in
-  ""|unknown|none|unset|tbd|n/a)
-    fail "--run-id must identify concrete runtime provenance"
-    ;;
-esac
+if [[ ! "$run_id" =~ ^github-actions:[0-9]+/[1-9][0-9]*$ ]] \
+  && [[ ! "$run_id" =~ ^local-qemu:[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]; then
+  fail "--run-id must identify a GitHub Actions or local QEMU producer"
+fi
+if [[ "$run_id" == local-qemu:* && "$run_id" != "local-qemu:$generated_at" ]]; then
+  fail "local QEMU run id must match --generated-at"
+fi
 
 owned_runtime_dir=""
+input_snapshot_dir=""
 artifact_tmp=""
 manifest_tmp=""
 local_manifest_tmp=""
@@ -181,6 +199,7 @@ cleanup() {
   [[ -z "$artifact_tmp" ]] || rm -f -- "$artifact_tmp"
   [[ -z "$manifest_tmp" ]] || rm -f -- "$manifest_tmp"
   [[ -z "$local_manifest_tmp" ]] || rm -f -- "$local_manifest_tmp"
+  [[ -z "$input_snapshot_dir" ]] || rm -rf -- "$input_snapshot_dir"
   if [[ -n "$owned_runtime_dir" && "$keep_runtime_output" -eq 0 ]]; then
     rm -rf -- "$owned_runtime_dir"
   elif [[ -n "$owned_runtime_dir" ]]; then
@@ -194,6 +213,7 @@ if [[ "$input_mode" -eq 0 ]]; then
   input_artifact="$owned_runtime_dir/performance/queue-depth-runtime.json"
   input_summary="$owned_runtime_dir/fuse-vm-test.json"
   input_manifest="$owned_runtime_dir/queue-depth-runtime.manifest.json"
+  input_summary_manifest="$owned_runtime_dir/fuse-vm-test.manifest.json"
   GITHUB_SHA="$source_ref" \
     GITHUB_RUN_ID="${GITHUB_RUN_ID:-local-qemu}" \
     GITHUB_RUN_ATTEMPT="${GITHUB_RUN_ATTEMPT:-1}" \
@@ -207,89 +227,150 @@ fi
 [[ -s "$input_artifact" ]] || fail "queue-depth input is missing or empty: $input_artifact"
 [[ -s "$input_summary" ]] || fail "QEMU summary is missing or empty: $input_summary"
 [[ -s "$input_manifest" ]] || fail "QEMU input manifest is missing or empty: $input_manifest"
+[[ -s "$input_summary_manifest" ]] \
+  || fail "QEMU summary manifest is missing or empty: $input_summary_manifest"
 
-jq -e '
-  .test == "tidefs-fuse-vm-test"
-  and .version == 4
-  and .tier == "outside-sandbox-qemu-guest"
-  and .kernel_package == "linuxKernel_7_0"
-  and (.kernel_version | type == "string" and test("^7\\.0([.-]|$)"))
-  and .qemu_status == 0
-  and (.done_marker_seen | type == "number" and floor == . and . >= 1)
-  and (.passed | type == "number" and floor == . and . > 0)
-  and .product_failures == 0
-  and .environment_refusals == 0
-  and .queue_depth_artifact_present == true
+input_snapshot_dir="$(mktemp -d "${TMPDIR:-/tmp}/tidefs-dirty-debt-input.XXXXXX")"
+cp -- "$input_artifact" "$input_snapshot_dir/queue-depth-runtime.json"
+cp -- "$input_summary" "$input_snapshot_dir/fuse-vm-test.json"
+cp -- "$input_manifest" "$input_snapshot_dir/queue-depth-runtime.manifest.json"
+cp -- "$input_summary_manifest" "$input_snapshot_dir/fuse-vm-test.manifest.json"
+input_artifact="$input_snapshot_dir/queue-depth-runtime.json"
+input_summary="$input_snapshot_dir/fuse-vm-test.json"
+input_manifest="$input_snapshot_dir/queue-depth-runtime.manifest.json"
+input_summary_manifest="$input_snapshot_dir/fuse-vm-test.manifest.json"
+
+input_content_digest="$(content_digest_for_file "$input_artifact")"
+input_summary_digest="$(content_digest_for_file "$input_summary")"
+
+jq -s -e '
+  length == 1
+  and (.[0] |
+    .test == "tidefs-fuse-vm-test"
+    and .version == 4
+    and .tier == "outside-sandbox-qemu-guest"
+    and .kernel_package == "linuxKernel_7_0"
+    and (.kernel_version | type == "string" and test("^7\\.0([.-]|$)"))
+    and .qemu_status == 0
+    and (.done_marker_seen | type == "number" and floor == . and . >= 1)
+    and (.passed | type == "number" and floor == . and . > 0)
+    and .product_failures == 0
+    and .environment_refusals == 0
+    and .queue_depth_artifact_present == true
+  )
 ' "$input_summary" >/dev/null \
   || fail "QEMU summary does not describe a passing Linux 7.0 fuse-vm-test row"
 
-jq -e '
-  .schema_version == 1
-  and .evidence_class == "queue-depth-runtime-artifact"
-  and .source == "tidefs-posix-filesystem-adapter-daemon smoke-mount"
-  and .claim_ids == ["perf.local.no_unbounded_dirty_debt.v1"]
-  and .workload == "fuse-smoke-mount-quick"
-  and .mount_adapter == "fuse"
-  and .pool == "root"
-  and ([
-    .admission.current_dirty_bytes,
-    .admission.current_dirty_ops,
-    .admission.current_outstanding_permits,
-    .admission.current_tick,
-    .admission.peak_dirty_bytes,
-    .admission.peak_dirty_ops,
-    .admission.peak_outstanding_permits
-  ] | all(type == "number" and floor == . and . >= 0))
-  and ([
-    .hard_caps.dirty_age_ticks,
-    .hard_caps.dirty_bytes,
-    .hard_caps.dirty_ops,
-    .hard_caps.permits,
-    .effective_caps.dirty_age_ticks,
-    .effective_caps.dirty_bytes,
-    .effective_caps.dirty_ops,
-    .effective_caps.permits
-  ] | all(type == "number" and floor == . and . > 0))
-  and ([
-    .invariant_checks.current_dirty_bytes_within_effective_cap,
-    .invariant_checks.current_dirty_ops_within_effective_cap,
-    .invariant_checks.current_outstanding_permits_within_hard_cap,
-    .invariant_checks.peak_dirty_bytes_within_effective_cap,
-    .invariant_checks.peak_dirty_ops_within_effective_cap,
-    .invariant_checks.peak_outstanding_permits_within_hard_cap
-  ] | all(. == true))
-  and .admission.peak_dirty_bytes >= .admission.current_dirty_bytes
-  and .admission.peak_dirty_ops >= .admission.current_dirty_ops
-  and .admission.peak_outstanding_permits >= .admission.current_outstanding_permits
-  and .admission.peak_dirty_bytes <= .effective_caps.dirty_bytes
-  and .admission.peak_dirty_ops <= .effective_caps.dirty_ops
-  and .admission.peak_outstanding_permits <= .hard_caps.permits
-  and .effective_caps.dirty_age_ticks <= .hard_caps.dirty_age_ticks
-  and .effective_caps.dirty_bytes <= .hard_caps.dirty_bytes
-  and .effective_caps.dirty_ops <= .hard_caps.dirty_ops
-  and .effective_caps.permits <= .hard_caps.permits
-  and .determinism.workload == "fixed smoke-mount quick workload"
-  and (.determinism.admission_state | type == "string" and length > 0)
-  and ([
-    .determinism.tolerance.peak_dirty_bytes,
-    .determinism.tolerance.peak_dirty_ops,
-    .determinism.tolerance.peak_outstanding_permits
-  ] | all(type == "number" and floor == . and . >= 0))
-  and .no_hidden_queue_gate.registry_path == "validation/performance/no-hidden-queues.toml"
-  and .no_hidden_queue_gate.command == "cargo run -p tidefs-xtask -- check-no-hidden-queues"
-  and (.no_hidden_queue_gate.registered_queue_roots | type == "array")
-  and (.no_hidden_queue_gate.registered_queue_roots | index("performance_contract.budgeted_queue") != null)
-  and (.no_hidden_queue_gate.registered_queue_roots | index("local_fs.write_admission") != null)
+jq -s -e \
+  --arg content_digest "$input_summary_digest" \
+  --arg source_ref "$source_ref" \
+  --arg run_id "$run_id" \
+  --arg generated_at "$generated_at" '
+      length == 1
+      and (.[0] | (keys | sort) == [
+        "artifact_path",
+        "blocking_issues",
+        "claim_id",
+        "content_digest",
+        "evidence_class",
+        "generated_at",
+        "manifest_version",
+        "outcome",
+        "residual_risk",
+        "run_id",
+        "scope",
+        "source",
+        "source_ref",
+        "validation_tier"
+      ]
+      and .manifest_version == 2
+      and .claim_id == "perf.local.no_unbounded_dirty_debt.v1"
+      and .evidence_class == "qemu-row-summary"
+      and .validation_tier == "mounted-userspace"
+      and .scope == "Linux 7.0 QEMU mounted FUSE smoke-mount quick row summary"
+      and .artifact_path == "fuse-vm-test.json"
+      and (.content_digest | type == "string" and test("^blake3:[0-9a-f]{64}$"))
+      and .content_digest == $content_digest
+      and .run_id == $run_id
+      and .source_ref == $source_ref
+      and .outcome == "pass"
+      and (.residual_risk | type == "string" and length > 0)
+      and .source == "qemu-smoke-fuse-vm-test"
+      and .generated_at == $generated_at
+      and .blocking_issues == [])
+  ' "$input_summary_manifest" >/dev/null \
+  || fail "QEMU summary manifest does not bind this passing summary to the requested runtime provenance"
+
+jq -s -e '
+  length == 1
+  and (.[0] |
+    .schema_version == 1
+    and .evidence_class == "queue-depth-runtime-artifact"
+    and .source == "tidefs-posix-filesystem-adapter-daemon smoke-mount"
+    and .claim_ids == ["perf.local.no_unbounded_dirty_debt.v1"]
+    and .workload == "fuse-smoke-mount-quick"
+    and .mount_adapter == "fuse"
+    and .pool == "root"
+    and ([
+      .admission.current_dirty_bytes,
+      .admission.current_dirty_ops,
+      .admission.current_outstanding_permits,
+      .admission.current_tick,
+      .admission.peak_dirty_bytes,
+      .admission.peak_dirty_ops,
+      .admission.peak_outstanding_permits
+    ] | all(type == "number" and floor == . and . >= 0))
+    and ([
+      .hard_caps.dirty_age_ticks,
+      .hard_caps.dirty_bytes,
+      .hard_caps.dirty_ops,
+      .hard_caps.permits,
+      .effective_caps.dirty_age_ticks,
+      .effective_caps.dirty_bytes,
+      .effective_caps.dirty_ops,
+      .effective_caps.permits
+    ] | all(type == "number" and floor == . and . > 0))
+    and ([
+      .invariant_checks.current_dirty_bytes_within_effective_cap,
+      .invariant_checks.current_dirty_ops_within_effective_cap,
+      .invariant_checks.current_outstanding_permits_within_hard_cap,
+      .invariant_checks.peak_dirty_bytes_within_effective_cap,
+      .invariant_checks.peak_dirty_ops_within_effective_cap,
+      .invariant_checks.peak_outstanding_permits_within_hard_cap
+    ] | all(. == true))
+    and .admission.peak_dirty_bytes >= .admission.current_dirty_bytes
+    and .admission.peak_dirty_ops >= .admission.current_dirty_ops
+    and .admission.peak_outstanding_permits >= .admission.current_outstanding_permits
+    and .admission.peak_dirty_bytes <= .effective_caps.dirty_bytes
+    and .admission.peak_dirty_ops <= .effective_caps.dirty_ops
+    and .admission.peak_outstanding_permits <= .hard_caps.permits
+    and .effective_caps.dirty_age_ticks <= .hard_caps.dirty_age_ticks
+    and .effective_caps.dirty_bytes <= .hard_caps.dirty_bytes
+    and .effective_caps.dirty_ops <= .hard_caps.dirty_ops
+    and .effective_caps.permits <= .hard_caps.permits
+    and .determinism.workload == "fixed smoke-mount quick workload"
+    and (.determinism.admission_state | type == "string" and length > 0)
+    and ([
+      .determinism.tolerance.peak_dirty_bytes,
+      .determinism.tolerance.peak_dirty_ops,
+      .determinism.tolerance.peak_outstanding_permits
+    ] | all(type == "number" and floor == . and . >= 0))
+    and .no_hidden_queue_gate.registry_path == "validation/performance/no-hidden-queues.toml"
+    and .no_hidden_queue_gate.command == "cargo run -p tidefs-xtask -- check-no-hidden-queues"
+    and (.no_hidden_queue_gate.registered_queue_roots | type == "array")
+    and (.no_hidden_queue_gate.registered_queue_roots | index("performance_contract.budgeted_queue") != null)
+    and (.no_hidden_queue_gate.registered_queue_roots | index("local_fs.write_admission") != null)
+  )
 ' "$input_artifact" >/dev/null \
   || fail "queue-depth input is not a passing fuse-smoke-mount-quick runtime snapshot"
 
-input_content_digest="$(content_digest_for_file "$input_artifact")"
-jq -e \
+jq -s -e \
   --arg content_digest "$input_content_digest" \
   --arg source_ref "$source_ref" \
   --arg run_id "$run_id" \
   --arg generated_at "$generated_at" '
-      (keys | sort) == [
+      length == 1
+      and (.[0] | (keys | sort) == [
         "artifact_path",
         "blocking_issues",
         "claim_id",
@@ -322,7 +403,7 @@ jq -e \
       and .source == "qemu-smoke-fuse-vm-test"
       and (.generated_at | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))
       and .generated_at == $generated_at
-      and .blocking_issues == []
+      and .blocking_issues == [])
   ' "$input_manifest" >/dev/null \
   || fail "QEMU input manifest does not bind this artifact to the requested passing runtime provenance"
 
@@ -334,12 +415,12 @@ artifact_tmp="$artifact_path.tmp.$$"
 manifest_tmp="$manifest_path.tmp.$$"
 local_manifest_tmp="$local_manifest_path.tmp.$$"
 
-jq --sort-keys \
+jq -s --sort-keys \
   --arg source_ref "$source_ref" \
   --arg run_id "$run_id" \
   --arg generated_at "$generated_at" \
   --slurpfile summary "$input_summary" '
-  {
+  .[0] | {
     schema_version: 2,
     evidence_class: "queue-depth-runtime-artifact",
     artifact_path: "validation/artifacts/performance/queue-depth-runtime.json",
@@ -510,9 +591,11 @@ write_output_manifest \
   "Linux 7.0 QEMU mounted FUSE quick workload with aggregate local admission measurements" \
   "The row refreshes bounded aggregate local admission evidence only. The artifact explicitly keeps perf.local.no_unbounded_dirty_debt.v1 blocked and does not establish scheduler-wide, crash-recovery, fsync, mmap/writeback, kernel, RDMA, distributed, production, or release behavior."
 
-mv -- "$artifact_tmp" "$artifact_path"
 mv -- "$manifest_tmp" "$manifest_path"
 mv -- "$local_manifest_tmp" "$local_manifest_path"
+# Publish the payload last so an interrupted update cannot verify against
+# manifests from a different generation.
+mv -- "$artifact_tmp" "$artifact_path"
 artifact_tmp=""
 manifest_tmp=""
 local_manifest_tmp=""
