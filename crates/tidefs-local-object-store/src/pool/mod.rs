@@ -551,6 +551,36 @@ pub struct PlacementReceipt {
     pub planner_replay_receipt: Option<PlacementReplayReceipt>,
 }
 
+/// Receipt publication state for a mutable erasure-coded read.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ErasureReadRepairStatus {
+    /// Every receipt target supplied a verified shard, so no repair was needed.
+    NotRequired,
+    /// Missing or corrupt shards were reconstructed and a replacement receipt
+    /// was persisted for the whole-object rewrite.
+    ReplacementPublished {
+        /// Receipt shard slots reconstructed by the shared EC helper.
+        rebuilt_shard_indices: Vec<u16>,
+    },
+}
+
+/// Payload and authoritative receipt returned by a mutable erasure-coded read.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ErasureReadWithReceipt {
+    /// Reconstructed logical payload.
+    pub payload: Vec<u8>,
+    /// Current placement authority after the read. This is the original
+    /// receipt for a clean read and the replacement receipt after repair.
+    pub receipt: PlacementReceipt,
+    /// Whether this read published replacement placement evidence.
+    pub repair_status: ErasureReadRepairStatus,
+}
+
+struct ReconstructedErasureRead {
+    payload: Vec<u8>,
+    rebuilt_shard_indices: Vec<u16>,
+}
+
 const PLACEMENT_RECEIPT_MAGIC_V1: &[u8; 8] = b"TFSPRC1\0";
 const PLACEMENT_RECEIPT_MAGIC_V2: &[u8; 8] = b"TFSPRC2\0";
 const PLACEMENT_RECEIPT_MAGIC_V3: &[u8; 8] = b"TFSPRC3\0";
@@ -2983,6 +3013,68 @@ impl Pool {
         self.put_with_receipt(class, key, repaired_payload)
     }
 
+    /// Read an erasure-coded object and publish replacement receipt evidence
+    /// when reconstruction was required.
+    ///
+    /// Unlike [`Pool::get`], this mutable entry point consumes the rebuilt
+    /// shard evidence returned by the shared receipt-aware EC helper. A
+    /// degraded read is rewritten through [`Pool::repair_with_receipt`], and
+    /// repair success is reported only after the replacement receipt has been
+    /// persisted. The ordinary read path remains available when callers do not
+    /// own mutable pool authority.
+    pub fn get_erasure_with_repair_receipt(
+        &mut self,
+        class: IoClass,
+        key: ObjectKey,
+    ) -> Result<Option<ErasureReadWithReceipt>> {
+        if self.locked {
+            return Err(StoreError::InvalidOptions {
+                reason: "pool is locked: encryption key required for I/O",
+            });
+        }
+        let indices: Vec<usize> = self.class_map.get(class).to_vec();
+        if indices.is_empty() {
+            return Err(StoreError::InvalidOptions {
+                reason: "pool has no devices for this I/O class",
+            });
+        }
+        let receipt =
+            self.load_placement_receipt(&indices, key)?
+                .ok_or(StoreError::InvalidOptions {
+                    reason: "erasure read repair requires a placement receipt",
+                })?;
+        if !matches!(receipt.policy, PoolRedundancyPolicy::Erasure { .. }) {
+            return Err(StoreError::InvalidOptions {
+                reason: "erasure read repair requires an erasure placement receipt",
+            });
+        }
+
+        let Some(read) = self.reconstruct_erasure_with_receipt(&receipt)? else {
+            return Ok(None);
+        };
+        if read.rebuilt_shard_indices.is_empty() {
+            return Ok(Some(ErasureReadWithReceipt {
+                payload: read.payload,
+                receipt,
+                repair_status: ErasureReadRepairStatus::NotRequired,
+            }));
+        }
+
+        let ReconstructedErasureRead {
+            payload,
+            rebuilt_shard_indices,
+        } = read;
+        let (_, replacement_receipt) =
+            self.repair_with_receipt(class, key, &payload, RepairSource::ErasureReconstruction)?;
+        Ok(Some(ErasureReadWithReceipt {
+            payload,
+            receipt: replacement_receipt,
+            repair_status: ErasureReadRepairStatus::ReplacementPublished {
+                rebuilt_shard_indices,
+            },
+        }))
+    }
+
     /// Retrieve an object from its persisted placement receipt when present.
     pub fn get(&self, class: IoClass, key: ObjectKey) -> Result<Option<Vec<u8>>> {
         if self.locked {
@@ -3042,6 +3134,15 @@ impl Pool {
     }
 
     fn get_erasure_with_receipt(&self, receipt: &PlacementReceipt) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .reconstruct_erasure_with_receipt(receipt)?
+            .map(|read| read.payload))
+    }
+
+    fn reconstruct_erasure_with_receipt(
+        &self,
+        receipt: &PlacementReceipt,
+    ) -> Result<Option<ReconstructedErasureRead>> {
         self.ensure_receipt_replay_authority(receipt)?;
         let PoolRedundancyPolicy::Erasure {
             data_shards,
@@ -3134,7 +3235,19 @@ impl Pool {
         if digest32(&reconstructed.payload) != receipt.payload_digest {
             return Ok(None);
         }
-        Ok(Some(reconstructed.payload))
+        let rebuilt_shard_indices = reconstructed
+            .rebuilt_shards
+            .iter()
+            .map(|shard| {
+                u16::try_from(shard.index).map_err(|_| StoreError::InvalidOptions {
+                    reason: "reconstructed erasure shard index exceeds u16",
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Some(ReconstructedErasureRead {
+            payload: reconstructed.payload,
+            rebuilt_shard_indices,
+        }))
     }
 
     /// Delete an object from every device that can hold this I/O class.
@@ -6840,6 +6953,75 @@ mod tests {
             Some(payload.to_vec()),
             "receipt-backed erasure read should reconstruct from surviving shards"
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn erasure_repairing_read_publishes_replacement_receipt() {
+        let root = temp_dir("erasure-repairing-read-receipt");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = multi_data_device_config(&root, 4);
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::erasure(2, 1),
+            ..PoolProperties::default()
+        };
+        let mut pool = Pool::create(config, properties, &test_options()).unwrap();
+        set_deterministic_device_guids(&mut pool);
+
+        let key = ObjectKey::from_name(b"erasure-repairing-read-receipt");
+        let payload = b"degraded read repair must publish replacement placement evidence";
+        let (_, original_receipt) = pool
+            .put_with_receipt(IoClass::Data, key, payload)
+            .expect("initial erasure write");
+
+        let clean_read = pool
+            .get_erasure_with_repair_receipt(IoClass::Data, key)
+            .expect("clean receipt-aware read")
+            .expect("clean erasure payload");
+        assert_eq!(clean_read.payload, payload);
+        assert_eq!(clean_read.receipt, original_receipt);
+        assert_eq!(
+            clean_read.repair_status,
+            ErasureReadRepairStatus::NotRequired
+        );
+
+        let victim = original_receipt.targets[0].clone();
+        let victim_idx = pool.resolve_receipt_target(&victim).unwrap();
+        let victim_key = placement_shard_object_key(key, victim.shard_index);
+        assert!(pool.devices[victim_idx].delete(victim_key).unwrap());
+
+        let repaired_read = pool
+            .get_erasure_with_repair_receipt(IoClass::Data, key)
+            .expect("degraded receipt-aware read")
+            .expect("reconstructed erasure payload");
+        assert_eq!(repaired_read.payload, payload);
+        assert!(repaired_read.receipt.generation > original_receipt.generation);
+        assert_eq!(
+            repaired_read.receipt.policy,
+            PoolRedundancyPolicy::erasure(2, 1)
+        );
+        assert_eq!(
+            repaired_read.repair_status,
+            ErasureReadRepairStatus::ReplacementPublished {
+                rebuilt_shard_indices: vec![victim.shard_index],
+            }
+        );
+        assert_eq!(
+            pool.placement_receipt_for_key(IoClass::Data, key)
+                .unwrap()
+                .expect("replacement receipt must be current"),
+            repaired_read.receipt
+        );
+        for target in &repaired_read.receipt.targets {
+            let idx = pool.resolve_receipt_target(target).unwrap();
+            let shard_key = placement_shard_object_key(key, target.shard_index);
+            let shard = pool.devices[idx]
+                .get(shard_key)
+                .unwrap()
+                .expect("replacement receipt target must exist");
+            assert_eq!(digest32(&shard), target.stored_digest);
+        }
 
         let _ = std::fs::remove_dir_all(&root);
     }
