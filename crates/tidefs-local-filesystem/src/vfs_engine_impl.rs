@@ -3117,7 +3117,8 @@ impl VfsLocalFileSystem {
                 // membership. Transport permits sends without a gate only for
                 // single-node/test use, so a distinct live target must not
                 // build a secret-bearing frame without membership admission.
-                if let Err(err) = snap_net_require_membership_send_gate(&transport) {
+                if let Err(err) = snap_net_require_membership_send_gate(&transport, *server_node_id)
+                {
                     let _ = transport.close_session(session_id, SessionCloseReason::LocalShutdown);
                     return live_admin_error(1, err);
                 }
@@ -4185,14 +4186,22 @@ fn snap_net_validate_sender_authority(encoded: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-fn snap_net_require_membership_send_gate(transport: &Transport) -> Result<(), String> {
-    if transport.send_gate.is_some() {
-        return Ok(());
+fn snap_net_require_membership_send_gate(
+    transport: &Transport,
+    peer_id: u64,
+) -> Result<(), String> {
+    let Some(gate) = transport.send_gate.as_ref() else {
+        return Err(
+            "snapshot send: target-address send requires a membership-provided transport SendGate for committed-roster admission"
+                .to_string(),
+        );
+    };
+    if !gate.can_send_to(peer_id) {
+        return Err(format!(
+            "snapshot send: target-address send peer {peer_id} is not admitted by the current membership SendGate"
+        ));
     }
-    Err(
-        "snapshot send: target-address send requires a membership-provided transport SendGate for committed-roster admission"
-            .to_string(),
-    )
+    Ok(())
 }
 
 fn live_snapshot_send_plan(
@@ -7171,11 +7180,13 @@ mod tests {
     }
 
     #[derive(Debug)]
-    struct SnapshotSendAllowGate;
+    struct SnapshotSendGate {
+        allow: bool,
+    }
 
-    impl tidefs_transport::SendGate for SnapshotSendAllowGate {
+    impl tidefs_transport::SendGate for SnapshotSendGate {
         fn can_send_to(&self, _peer_id: u64) -> bool {
-            true
+            self.allow
         }
     }
 
@@ -7183,15 +7194,24 @@ mod tests {
     fn snap_net_target_requires_membership_send_gate() {
         let mut transport = Transport::new(7);
         assert_eq!(
-            snap_net_require_membership_send_gate(&transport),
+            snap_net_require_membership_send_gate(&transport, 9),
             Err(
                 "snapshot send: target-address send requires a membership-provided transport SendGate for committed-roster admission"
                     .to_string()
             )
         );
 
-        transport.set_send_gate(Some(Arc::new(SnapshotSendAllowGate)));
-        assert_eq!(snap_net_require_membership_send_gate(&transport), Ok(()));
+        transport.set_send_gate(Some(Arc::new(SnapshotSendGate { allow: false })));
+        assert_eq!(
+            snap_net_require_membership_send_gate(&transport, 9),
+            Err(
+                "snapshot send: target-address send peer 9 is not admitted by the current membership SendGate"
+                    .to_string()
+            )
+        );
+
+        transport.set_send_gate(Some(Arc::new(SnapshotSendGate { allow: true })));
+        assert_eq!(snap_net_require_membership_send_gate(&transport, 9), Ok(()));
     }
 
     #[test]
