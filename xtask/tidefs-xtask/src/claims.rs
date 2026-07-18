@@ -37,7 +37,6 @@ pub const CLAIMS_GATE_SCANNED_DOCS: &[&str] = &[
     "docs/CLAIMS_GATE_POLICY.md",
     "docs/INDEX.md",
     "docs/MOUNTED_TRANSFORM_AUTHORITY_RAW_STORE_INVENTORY.md",
-    "docs/PREVIEW_USER_MANUAL.md",
     "docs/PREVIEW_UAPI_ABI_BOUNDARY_OW202.md",
     "docs/REVIEW_TODO_REGISTER.md",
     "docs/UNRELEASED_AUTHORITY_POLICY.md",
@@ -768,17 +767,6 @@ pub fn check_current_workspace() -> Result<(), ClaimsGateCheckError> {
         ],
         &mut missing,
     );
-    check_source_markers(
-        &root,
-        "docs/PREVIEW_USER_MANUAL.md",
-        &[
-            "does not currently fulfill",
-            "not production-ready",
-            "check-claims-gate",
-        ],
-        &mut missing,
-    );
-
     scan_public_claim_surfaces(&root, &mut missing);
 
     if missing.is_empty() {

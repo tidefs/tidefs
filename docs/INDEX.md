@@ -18,13 +18,6 @@ Read `docs/LICENSING.md`, `docs/TEST_SIGNAL_POLICY.md`,
 Managed-worker host docs may impose local process constraints, but they are not
 public product policy or prerequisite reading for ordinary contributors.
 
-Preview orientation:
-
-- `docs/PREVIEW_USER_MANUAL.md` gives preview-only mount notes and limitations.
-
-This preview file is not product-admission, POSIX-complete, release, or
-per-operation status authorities.
-
 The remaining documents are design/reference material unless this index and
 `docs/DOCUMENTATION_AUTHORITY_REGISTER.md` classify a narrower current scope.
 Imported design files, issue-era implementation plans, old status matrices,
