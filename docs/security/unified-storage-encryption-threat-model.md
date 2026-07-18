@@ -29,9 +29,9 @@ owning issue/PR instead.
 - Digest placement and storage integrity: `docs/BLAKE3_USAGE_POLICY.md`,
   object-store integrity trailers, committed-root integrity code, and the
   current storage authority docs that consume those records.
-- Unsafe-code provenance: `docs/UNSAFE_AUDIT.md`,
-  `docs/security/kernel-unsafe-boundary-inventory.md`, issue #1077, and the
-  focused unsafe-audit follow-ups such as #1158 and #1909.
+- Unsafe-code provenance: source-local `SAFETY:` and `# Safety` documentation
+  in non-vendored code, root and crate lint policy, and
+  `docs/security/kernel-unsafe-boundary-inventory.md`.
 - Supply-chain and CI security boundaries: `docs/GITHUB_CI.md`,
   `deny.toml`, lockfiles, dependency workflows, and workflow YAML.
 
@@ -55,9 +55,9 @@ owning issue/PR instead.
   admission table and the source-owned authorization/audit pipeline prove a
   specific remote path. PR #1982 owns the current remote authorization slice
   and does not make every CLI/API handler remote-capable by itself.
-- The unsafe inventories document provenance and review status only. They do
-  not validate product-wide kernel safety, release readiness, FFI correctness,
-  or hardening by themselves.
+- Source-local unsafe contracts and lint policy record provenance and review
+  boundaries only. They do not validate product-wide kernel safety, release
+  readiness, FFI correctness, or hardening by themselves.
 - Supply-chain controls, pinned lockfiles, dependency CI, and advisory checks
   are build/review boundaries. They are not a statement that all dependencies,
   artifacts, or deployment paths are secure.
