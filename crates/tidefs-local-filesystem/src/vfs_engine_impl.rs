@@ -3113,6 +3113,15 @@ impl VfsLocalFileSystem {
                     return live_admin_error(1, err);
                 }
 
+                // Caller-supplied node IDs do not establish committed roster
+                // membership. Transport permits sends without a gate only for
+                // single-node/test use, so a distinct live target must not
+                // build a secret-bearing frame without membership admission.
+                if let Err(err) = snap_net_require_membership_send_gate(&transport) {
+                    let _ = transport.close_session(session_id, SessionCloseReason::LocalShutdown);
+                    return live_admin_error(1, err);
+                }
+
                 // The handshake may lower the transport MTU. Recheck the
                 // complete frame before key access because transport
                 // fragmentation has a hard fragment-count ceiling.
@@ -4174,6 +4183,16 @@ fn snap_net_validate_sender_authority(encoded: &[u8]) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+fn snap_net_require_membership_send_gate(transport: &Transport) -> Result<(), String> {
+    if transport.send_gate.is_some() {
+        return Ok(());
+    }
+    Err(
+        "snapshot send: target-address send requires a membership-provided transport SendGate for committed-roster admission"
+            .to_string(),
+    )
 }
 
 fn live_snapshot_send_plan(
@@ -7149,6 +7168,30 @@ mod tests {
             .encode()
             .expect("encode distributed header");
         assert_eq!(snap_net_validate_sender_authority(&distributed), Ok(()));
+    }
+
+    #[derive(Debug)]
+    struct SnapshotSendAllowGate;
+
+    impl tidefs_transport::SendGate for SnapshotSendAllowGate {
+        fn can_send_to(&self, _peer_id: u64) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn snap_net_target_requires_membership_send_gate() {
+        let mut transport = Transport::new(7);
+        assert_eq!(
+            snap_net_require_membership_send_gate(&transport),
+            Err(
+                "snapshot send: target-address send requires a membership-provided transport SendGate for committed-roster admission"
+                    .to_string()
+            )
+        );
+
+        transport.set_send_gate(Some(Arc::new(SnapshotSendAllowGate)));
+        assert_eq!(snap_net_require_membership_send_gate(&transport), Ok(()));
     }
 
     #[test]
