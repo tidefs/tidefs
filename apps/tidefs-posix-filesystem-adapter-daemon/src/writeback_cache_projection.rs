@@ -180,14 +180,22 @@ impl WritebackProjection {
     /// Record that `ino` has dirty bytes (total dirty byte count across all
     /// tracked ranges).
     ///
-    /// This is called after a buffered write has been processed and dirty
-    /// state has been recorded in the adapter's [`DirtyRanges`] and/or
-    /// [`PageCache`].
+    /// The write path first calls this before publishing any dirty mirror, so
+    /// mmap invalidation cannot pass a clean check and then invalidate newly
+    /// dirty bytes. It calls this again after populating [`DirtyRanges`] and
+    /// [`PageCache`] to refresh the conservative total.
     pub fn record_dirty(&self, ino: u64, total_dirty_bytes: u64) {
         if total_dirty_bytes == 0 {
             return;
         }
 
+        let dirty_transition_gate = self
+            .mmap_coherency
+            .upgrade()
+            .map(|mmap| mmap.dirty_transition_gate(ino));
+        let _dirty_transition_guard = dirty_transition_gate
+            .as_deref()
+            .map(|gate| gate.lock().unwrap());
         let mut lanes = self.lanes.lock().unwrap();
         let prev = lanes.get(&ino).copied().unwrap_or(WritebackLane::Clean);
         match prev {
@@ -227,6 +235,13 @@ impl WritebackProjection {
             return;
         }
 
+        let dirty_transition_gate = self
+            .mmap_coherency
+            .upgrade()
+            .map(|mmap| mmap.dirty_transition_gate(ino));
+        let _dirty_transition_guard = dirty_transition_gate
+            .as_deref()
+            .map(|gate| gate.lock().unwrap());
         let mut lanes = self.lanes.lock().unwrap();
         let prev = lanes.get(&ino).copied();
         let bytes = prev.map_or(total_bytes, |lane| lane.bytes().max(total_bytes));
@@ -627,6 +642,67 @@ mod tests {
         assert_eq!(mmap_stats.dirty_invalidations_preserved, 1);
         assert_eq!(mmap_stats.pages_invalidated, 1);
         assert_eq!(mmap.deferred_invalidation_count(), 0);
+    }
+
+    #[test]
+    fn dirty_transition_waits_for_in_flight_clean_invalidation() {
+        let (notify_started_tx, notify_started_rx) = std::sync::mpsc::channel();
+        let (release_notify_tx, release_notify_rx) = std::sync::mpsc::channel();
+        let release_notify_rx = Mutex::new(release_notify_rx);
+        let mmap = Arc::new(MmapCoherency::new_for_test(move |_| {
+            notify_started_tx
+                .send(())
+                .expect("announce kernel invalidation");
+            release_notify_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("release kernel invalidation");
+            Ok(())
+        }));
+        let projection = Arc::new(WritebackProjection::new(None, Arc::clone(&mmap)));
+        projection.install_mmap_dirty_check();
+        mmap.register(42, 1);
+        mmap.enqueue_batch(batch(42, 2));
+
+        let mmap_worker = Arc::clone(&mmap);
+        let invalidation = std::thread::spawn(move || mmap_worker.process_tick(1));
+        notify_started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("kernel invalidation reached notifier");
+
+        let (dirty_started_tx, dirty_started_rx) = std::sync::mpsc::channel();
+        let (dirty_done_tx, dirty_done_rx) = std::sync::mpsc::channel();
+        let projection_worker = Arc::clone(&projection);
+        let dirty_transition = std::thread::spawn(move || {
+            dirty_started_tx
+                .send(())
+                .expect("announce dirty transition");
+            projection_worker.record_dirty(42, 4096);
+            dirty_done_tx.send(()).expect("complete dirty transition");
+        });
+        dirty_started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("dirty transition worker started");
+        assert!(
+            matches!(
+                dirty_done_rx.recv_timeout(std::time::Duration::from_millis(250)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "dirty publication must not overtake an in-flight clean invalidation"
+        );
+
+        release_notify_tx
+            .send(())
+            .expect("release kernel invalidation");
+        assert_eq!(invalidation.join().expect("join invalidation worker"), 1);
+        dirty_done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("dirty transition completed after invalidation");
+        dirty_transition.join().expect("join dirty worker");
+
+        assert!(projection.is_dirty(42));
+        assert_eq!(mmap.stats.snapshot().pages_invalidated, 1);
     }
 
     #[test]

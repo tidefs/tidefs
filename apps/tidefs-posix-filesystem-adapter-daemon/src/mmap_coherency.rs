@@ -100,6 +100,9 @@ type InodeInvalidator = Box<dyn Fn(u64) -> io::Result<()> + Send + Sync>;
 pub struct MmapCoherency {
     registrations: Mutex<BTreeMap<u64, MmapRegistration>>,
     processor: Mutex<FollowerInvalidationProcessor>,
+    /// Per-inode gates that serialize a clean-state decision and kernel
+    /// invalidation with the first dirty or writeback-pending publication.
+    dirty_transition_gates: Mutex<BTreeMap<u64, Arc<Mutex<()>>>>,
     /// Latest per-inode invalidation generation retained while dirty or
     /// writeback-pending bytes prevent immediate kernel-cache invalidation,
     /// while a known registration is inactive, or while the kernel
@@ -134,6 +137,7 @@ impl MmapCoherency {
         Self {
             registrations: Mutex::new(BTreeMap::new()),
             processor: Mutex::new(FollowerInvalidationProcessor::new()),
+            dirty_transition_gates: Mutex::new(BTreeMap::new()),
             deferred_invalidations: Mutex::new(VecDeque::new()),
             retry_deferred_next: AtomicBool::new(false),
             invalidate_inode,
@@ -157,6 +161,22 @@ impl MmapCoherency {
     /// a later coherency tick.
     pub fn set_dirty_check(&self, check: Option<DirtyStateCheck>) {
         *self.dirty_check.lock().unwrap() = check;
+    }
+
+    /// Return the shared serialization gate for one inode's invalidation and
+    /// first dirty/writeback publication.
+    pub(crate) fn dirty_transition_gate(&self, ino: u64) -> Arc<Mutex<()>> {
+        Self::gate_for_inode(&self.dirty_transition_gates, ino)
+    }
+
+    fn gate_for_inode(gates: &Mutex<BTreeMap<u64, Arc<Mutex<()>>>>, ino: u64) -> Arc<Mutex<()>> {
+        Arc::clone(
+            gates
+                .lock()
+                .unwrap()
+                .entry(ino)
+                .or_insert_with(|| Arc::new(Mutex::new(()))),
+        )
     }
 
     pub fn register(&self, ino: u64, generation: u64) {
@@ -252,6 +272,7 @@ impl MmapCoherency {
             registrations: &self.registrations,
             invalidate_inode: &self.invalidate_inode,
             dirty_check: &self.dirty_check,
+            dirty_transition_gates: &self.dirty_transition_gates,
             deferred_invalidations: &self.deferred_invalidations,
             stats: &self.stats,
         };
@@ -280,6 +301,9 @@ struct MmapInvalidationSink<'a> {
     /// [`MmapCoherency`].  When the callback is set and returns `true`,
     /// invalidation for dirty/writeback inodes is deferred.
     dirty_check: &'a Mutex<Option<DirtyStateCheck>>,
+    /// Supplies the per-inode gate held from the dirty-state decision through
+    /// the kernel notification, closing the decision-to-notify race.
+    dirty_transition_gates: &'a Mutex<BTreeMap<u64, Arc<Mutex<()>>>>,
     /// Latest deferred generation for each inode whose dirty/writeback state
     /// currently prevents invalidation.
     deferred_invalidations: &'a Mutex<VecDeque<(u64, u64)>>,
@@ -348,6 +372,9 @@ impl MmapInvalidationSink<'_> {
             return;
         }
 
+        let dirty_transition_gate =
+            MmapCoherency::gate_for_inode(self.dirty_transition_gates, ino_u64);
+        let _dirty_transition_guard = dirty_transition_gate.lock().unwrap();
         let is_dirty = self
             .dirty_check
             .lock()
