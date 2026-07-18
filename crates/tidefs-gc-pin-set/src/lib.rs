@@ -13,12 +13,12 @@
 //! ## Pin model
 //!
 //! Pins are keyed by the full [`TraversalRoot`] identity (root type +
-//! block pointer). Multiple services may pin the same exact root
+//! provider-owned logical root identity). Multiple services may pin the same exact root
 //! concurrently via reference counting; the root remains GC-protected
 //! until all pins on that specific root are released.
 //!
 //! Distinct snapshot roots (same [`TraversalRootType::SnapshotCatalog`]
-//! but different block pointers) occupy separate slots and do not
+//! but different logical root identities) occupy separate slots and do not
 //! collapse.  Deleting one snapshot unpins only that snapshot's root,
 //! leaving other snapshots' object graphs protected.
 //!
@@ -165,8 +165,8 @@ impl fmt::Display for GcPinValidation {
 /// # Identity-based pinning
 ///
 /// Pins are keyed by the full [`TraversalRoot`] identity: root type AND
-/// block pointer. Two snapshots with the same [`TraversalRootType`] but
-/// different block pointers occupy separate slots. Deleting one snapshot
+/// logical root identity. Two snapshots with the same [`TraversalRootType`]
+/// but different logical root identities occupy separate slots. Deleting one snapshot
 /// releases only that snapshot's pin, leaving other snapshots protected.
 ///
 /// # Reference-counted pinning
@@ -272,7 +272,7 @@ impl<const N: usize> GcPinSet<N> {
             .take(self.count)
             .find_map(|s| {
                 s.as_ref()
-                    .filter(|slot| slot.root == root)
+                    .filter(|slot| slot.root.same_identity(root))
                     .map(|slot| slot.pin_count)
             })
             .unwrap_or(0)
@@ -303,7 +303,7 @@ impl<const N: usize> GcPinSet<N> {
         // Check for existing slot with same full root identity.
         for i in 0..self.count {
             if let Some(ref mut slot) = self.slots[i] {
-                if slot.root == root {
+                if slot.root.same_identity(root) {
                     slot.pin_count = slot.pin_count.saturating_add(1);
                     return Ok(());
                 }
@@ -328,7 +328,7 @@ impl<const N: usize> GcPinSet<N> {
     pub fn unpin(&mut self, root: TraversalRoot) -> Result<(), GcPinError> {
         let pos = self.slots[..self.count]
             .iter()
-            .position(|s| s.as_ref().is_some_and(|slot| slot.root == root));
+            .position(|s| s.as_ref().is_some_and(|slot| slot.root.same_identity(root)));
 
         match pos {
             Some(idx) => {
@@ -397,7 +397,7 @@ impl<const N: usize> GcPinSet<N> {
     pub fn force_unpin(&mut self, root: TraversalRoot) -> Result<(), GcPinError> {
         let pos = self.slots[..self.count]
             .iter()
-            .position(|s| s.as_ref().is_some_and(|slot| slot.root == root));
+            .position(|s| s.as_ref().is_some_and(|slot| slot.root.same_identity(root)));
 
         match pos {
             Some(idx) => {
@@ -446,7 +446,7 @@ impl<const N: usize> GcPinSet<N> {
     pub fn is_pinned(&self, root: TraversalRoot) -> bool {
         self.slots.iter().take(self.count).any(|s| {
             s.as_ref()
-                .is_some_and(|slot| slot.root == root && slot.pin_count > 0)
+                .is_some_and(|slot| slot.root.same_identity(root) && slot.pin_count > 0)
         })
     }
 
@@ -492,7 +492,7 @@ impl<const N: usize> GcPinSet<N> {
 
         for i in 0..self.count {
             if let Some(ref slot) = self.slots[i] {
-                let found = reachable.contains(&slot.root);
+                let found = reachable.iter().any(|root| slot.root.same_identity(*root));
                 if found {
                     reachable_from_pins += 1;
                 } else {
@@ -502,11 +502,10 @@ impl<const N: usize> GcPinSet<N> {
         }
 
         for reachable_root in reachable {
-            let is_pinned = self
-                .slots
-                .iter()
-                .take(self.count)
-                .any(|s| s.as_ref().is_some_and(|slot| slot.root == *reachable_root));
+            let is_pinned = self.slots.iter().take(self.count).any(|s| {
+                s.as_ref()
+                    .is_some_and(|slot| slot.root.same_identity(*reachable_root))
+            });
             if !is_pinned {
                 leaked += 1;
             }
@@ -718,10 +717,14 @@ impl SnapshotExtentPinSet {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tidefs_types_dataset_lifecycle_core::BlockPointer;
+    use tidefs_types_dataset_lifecycle_core::LifecycleRootIdentityV1;
 
-    fn make_root(root_type: TraversalRootType, bp: u64) -> TraversalRoot {
-        TraversalRoot::new(root_type, BlockPointer(bp), 100)
+    fn make_root(root_type: TraversalRootType, handle: u64) -> TraversalRoot {
+        TraversalRoot::new(
+            root_type,
+            LifecycleRootIdentityV1::new(handle, 1).unwrap(),
+            100,
+        )
     }
 
     fn make_all_roots() -> [TraversalRoot; 6] {
@@ -779,19 +782,55 @@ mod tests {
     }
 
     #[test]
-    fn pin_same_type_different_block_pointer_uses_separate_slots() {
+    fn pin_estimate_change_does_not_create_a_new_identity() {
+        let mut set = GcPinSet::<6>::new();
+        let root = make_root(TraversalRootType::InodeTable, 10);
+        let updated_estimate = TraversalRoot::new(root.root_type, root.root_identity, 10_000);
+
+        set.pin(root).unwrap();
+        set.pin(updated_estimate).unwrap();
+
+        assert_eq!(set.count(), 1);
+        assert_eq!(set.pin_count(root), 2);
+        assert_eq!(set.pin_count(updated_estimate), 2);
+    }
+
+    #[test]
+    fn pin_same_type_different_logical_roots_uses_separate_slots() {
         let mut set = GcPinSet::<6>::new();
         let r1 = make_root(TraversalRootType::SnapshotCatalog, 100);
         let r2 = make_root(TraversalRootType::SnapshotCatalog, 200);
         set.pin(r1).unwrap();
         set.pin(r2).unwrap();
-        // Two distinct slots — not collapsed because block pointers differ.
+        // Two distinct slots — not collapsed because logical roots differ.
         assert_eq!(set.count(), 2);
         assert_eq!(set.total_pins(), 2);
         assert_eq!(set.pin_count(r1), 1);
         assert_eq!(set.pin_count(r2), 1);
         assert_eq!(set.pin_count_by_type(TraversalRootType::SnapshotCatalog), 2);
         assert_eq!(set.count_by_type(TraversalRootType::SnapshotCatalog), 2);
+    }
+
+    #[test]
+    fn pin_same_handle_different_generations_uses_separate_slots() {
+        let mut set = GcPinSet::<6>::new();
+        let r1 = TraversalRoot::new(
+            TraversalRootType::SnapshotCatalog,
+            LifecycleRootIdentityV1::new(100, 1).unwrap(),
+            100,
+        );
+        let r2 = TraversalRoot::new(
+            TraversalRootType::SnapshotCatalog,
+            LifecycleRootIdentityV1::new(100, 2).unwrap(),
+            100,
+        );
+
+        set.pin(r1).unwrap();
+        set.pin(r2).unwrap();
+
+        assert_eq!(set.count(), 2);
+        assert_eq!(set.pin_count(r1), 1);
+        assert_eq!(set.pin_count(r2), 1);
     }
 
     #[test]
@@ -1100,7 +1139,7 @@ mod tests {
 
     #[test]
     fn gc_validation_identity_match() {
-        // Two snapshots with same type, different block pointers.
+        // Two snapshots with the same type and different logical roots.
         // If the reachable set has one, the other should be unreachable.
         let mut set = GcPinSet::<6>::new();
         let s1 = make_root(TraversalRootType::SnapshotCatalog, 100);

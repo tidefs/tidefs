@@ -5,9 +5,13 @@
 
 use tidefs_dataset_lifecycle::{DatasetLifecycle, LifecycleError, SyncGuarantee};
 use tidefs_types_dataset_lifecycle_core::{
-    BlockPointer, DatasetOpenResult, DatasetStateV1, DestroyFlags, PoisonState, TraversalRoot,
-    TraversalRootType,
+    DatasetOpenResult, DatasetStateV1, DestroyFlags, LifecycleRootIdentityV1, PoisonState,
+    TraversalRoot, TraversalRootType,
 };
+
+fn root_identity(handle: u64) -> LifecycleRootIdentityV1 {
+    LifecycleRootIdentityV1::new(handle, 1).unwrap()
+}
 
 // ---------------------------------------------------------------------------
 // Construction — new()
@@ -519,14 +523,13 @@ fn destroy_flags_all_combinations() {
 
 #[test]
 fn traversal_root_new_valid() {
-    let root = TraversalRoot::new(TraversalRootType::InodeTable, BlockPointer(42), 100);
-    assert!(root.is_valid());
+    let root = TraversalRoot::new(TraversalRootType::InodeTable, root_identity(42), 100);
+    assert_eq!(root.root_identity, root_identity(42));
 }
 
 #[test]
-fn traversal_root_new_null_pointer_is_invalid() {
-    let root = TraversalRoot::new(TraversalRootType::ExtentMap, BlockPointer(0), 100);
-    assert!(!root.is_valid());
+fn traversal_root_identity_rejects_missing_handle() {
+    assert_eq!(LifecycleRootIdentityV1::new(0, 1), None);
 }
 
 #[test]

@@ -5,12 +5,16 @@
 
 use tidefs_dataset_lifecycle::{DatasetLifecycle, LifecycleError};
 use tidefs_types_dataset_lifecycle_core::{
-    BlockPointer, DatasetOpenResult, DatasetStateV1, DestroyFlags, PoisonState, TraversalRoot,
-    TraversalRootType,
+    DatasetOpenResult, DatasetStateV1, DestroyFlags, LifecycleRootIdentityV1, PoisonState,
+    TraversalRoot, TraversalRootType,
 };
 
+fn root_identity(handle: u64) -> LifecycleRootIdentityV1 {
+    LifecycleRootIdentityV1::new(handle, 1).unwrap()
+}
+
 fn root() -> TraversalRoot {
-    TraversalRoot::new(TraversalRootType::InodeTable, BlockPointer(100), 500)
+    TraversalRoot::new(TraversalRootType::InodeTable, root_identity(100), 500)
 }
 
 // ---------------------------------------------------------------------------
@@ -272,7 +276,7 @@ fn init_destroy_job_exceeds_max_roots_returns_none() {
         .map(|i| {
             TraversalRoot::new(
                 TraversalRootType::InodeTable,
-                BlockPointer((100 + i) as u64),
+                root_identity((100 + i) as u64),
                 100,
             )
         })
@@ -293,7 +297,7 @@ fn init_destroy_job_exactly_max_roots_succeeds() {
         .map(|i| {
             TraversalRoot::new(
                 TraversalRootType::InodeTable,
-                BlockPointer((100 + i) as u64),
+                root_identity((100 + i) as u64),
                 100,
             )
         })
@@ -329,7 +333,7 @@ fn update_destroy_progress_beyond_total_marks_complete() {
     let mut lc = DatasetLifecycle::new();
     let roots = [TraversalRoot::new(
         TraversalRootType::InodeTable,
-        BlockPointer(100),
+        root_identity(100),
         100,
     )];
     lc.transition_to_destroying(DestroyFlags::NONE, &roots)
@@ -663,19 +667,18 @@ fn lifecycle_error_debug_non_empty() {
 }
 
 // ---------------------------------------------------------------------------
-// TraversalRoot null pointer edge cases
+// TraversalRoot missing logical-root edge cases
 // ---------------------------------------------------------------------------
 
 #[test]
-fn traversal_root_null_pointer_rejected() {
-    let root = TraversalRoot::new(TraversalRootType::InodeTable, BlockPointer(0), 100);
-    assert!(!root.is_valid());
+fn traversal_root_missing_logical_handle_rejected() {
+    assert_eq!(LifecycleRootIdentityV1::new(0, 1), None);
 }
 
 #[test]
-fn traversal_root_non_null_pointer_accepted() {
-    let root = TraversalRoot::new(TraversalRootType::ExtentMap, BlockPointer(1), 100);
-    assert!(root.is_valid());
+fn traversal_root_nonzero_logical_handle_accepted() {
+    let root = TraversalRoot::new(TraversalRootType::ExtentMap, root_identity(1), 100);
+    assert_eq!(root.root_identity, root_identity(1));
 }
 
 // ---------------------------------------------------------------------------

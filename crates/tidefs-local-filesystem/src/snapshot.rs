@@ -26,7 +26,7 @@ use crate::ROOT_INODE_ID;
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use tidefs_dataset_lifecycle::{
-    BlockPointer, DatasetCatalog, DatasetFlags, DatasetId, DatasetType, SyncGuarantee,
+    DatasetCatalog, DatasetFlags, DatasetId, DatasetType, LifecycleRootIdentityV1, SyncGuarantee,
     TraversalRoot, TraversalRootType,
 };
 use tidefs_local_object_store::SnapshotDeadObjectCandidate;
@@ -219,12 +219,24 @@ pub(crate) fn snapshot_record_catalog_flags(record: &SnapshotRecord) -> DatasetF
     }
 }
 
-pub(crate) fn snapshot_record_traversal_root(record: &SnapshotRecord) -> TraversalRoot {
-    TraversalRoot::new(
+pub(crate) fn lifecycle_traversal_root(
+    logical_root_handle: u64,
+    generation: u64,
+) -> Result<TraversalRoot> {
+    let root_identity = LifecycleRootIdentityV1::new(logical_root_handle, generation).ok_or(
+        FileSystemError::CorruptState {
+            reason: "snapshot committed root has a zero transaction id",
+        },
+    )?;
+    Ok(TraversalRoot::new(
         TraversalRootType::SnapshotCatalog,
-        BlockPointer(record.root.transaction_id),
-        record.root.generation,
-    )
+        root_identity,
+        0,
+    ))
+}
+
+pub(crate) fn snapshot_record_traversal_root(record: &SnapshotRecord) -> Result<TraversalRoot> {
+    lifecycle_traversal_root(record.root.transaction_id, record.root.generation)
 }
 
 pub(crate) fn snapshot_catalog_entry_matches(
@@ -376,10 +388,10 @@ impl LocalFileSystem {
             }
 
             expected_catalog_names.push(snapshot_record_catalog_name(record));
-            let root = snapshot_record_traversal_root(record);
+            let root = snapshot_record_traversal_root(record)?;
             if let Some((_existing, count)) = expected_roots
                 .iter_mut()
-                .find(|(existing_root, _count)| *existing_root == root)
+                .find(|(existing_root, _count)| existing_root.same_identity(root))
             {
                 *count = count.saturating_add(1);
             } else {
@@ -445,7 +457,7 @@ impl LocalFileSystem {
         if self
             .lifecycle
             .gc_pin_set()
-            .pin_count(snapshot_record_traversal_root(record))
+            .pin_count(snapshot_record_traversal_root(record)?)
             == 0
         {
             return Err(FileSystemError::CorruptState {
@@ -460,17 +472,18 @@ impl LocalFileSystem {
             return Ok(());
         }
         self.lifecycle
-            .pin_root(snapshot_record_traversal_root(record))
+            .pin_root(snapshot_record_traversal_root(record)?)
             .map_err(|_| FileSystemError::CorruptState {
                 reason: "snapshot authority lifecycle pin set is full",
             })
     }
 
-    fn unpin_snapshot_record_root(&mut self, record: &SnapshotRecord) {
+    fn unpin_snapshot_record_root(&mut self, record: &SnapshotRecord) -> Result<()> {
         if snapshot_record_retains_data(record) {
             self.lifecycle
-                .unpin_root(snapshot_record_traversal_root(record));
+                .unpin_root(snapshot_record_traversal_root(record)?);
         }
+        Ok(())
     }
 
     fn reconcile_snapshot_record_catalog_entry(&mut self, record: &SnapshotRecord) -> Result<()> {
@@ -496,7 +509,7 @@ impl LocalFileSystem {
         }
 
         let snapshot_id = snapshot_record_display_name(record);
-        let released_traversal_root = snapshot_record_traversal_root(record);
+        let released_traversal_root = snapshot_record_traversal_root(record)?;
         if self
             .lifecycle
             .gc_pin_set()
@@ -508,7 +521,7 @@ impl LocalFileSystem {
 
         let deletion_generation = self.state.generation;
         let dataset_uuid = self.mounted_dataset_id();
-        let released = DeadlistReleasedRoot::snapshot_or_clone(record.root.clone());
+        let released = DeadlistReleasedRoot::snapshot_or_clone(record.root.clone())?;
         let report =
             self.derive_released_root_deadlist_candidates_against_local_live_roots(released)?;
 
@@ -668,7 +681,7 @@ impl LocalFileSystem {
         self.mark_inode_metadata_dirty(ROOT_INODE_ID);
         self.mark_dir_dirty(ROOT_INODE_ID);
         let summary = self.commit_mutation(record.summary())?;
-        self.unpin_snapshot_record_root(&record);
+        self.unpin_snapshot_record_root(&record)?;
         self.remove_snapshot_record_catalog_entry(&record)?;
         Ok((summary, record))
     }
@@ -1430,8 +1443,9 @@ mod tests {
     fn snapshot_root(summary: &SnapshotSummary) -> TraversalRoot {
         TraversalRoot::new(
             TraversalRootType::SnapshotCatalog,
-            BlockPointer(summary.source_transaction_id),
-            summary.source_generation,
+            LifecycleRootIdentityV1::new(summary.source_transaction_id, summary.source_generation)
+                .unwrap(),
+            0,
         )
     }
 

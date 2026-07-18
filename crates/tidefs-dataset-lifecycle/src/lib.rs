@@ -32,7 +32,7 @@ use tidefs_types_dataset_lifecycle_core::{
 };
 
 pub use tidefs_types_dataset_lifecycle_core::{
-    BlockPointer, PoisonReason, PoisonState, TraversalRoot, TraversalRootType,
+    LifecycleRootIdentityV1, PoisonReason, PoisonState, TraversalRoot, TraversalRootType,
 };
 
 pub use tidefs_dataset_catalog::{
@@ -73,8 +73,7 @@ pub struct SnapshotAnchorCreate {
     pub clone_dataset_id: DatasetId,
     pub origin_dataset_id: DatasetId,
     pub snapshot_name: alloc::string::String,
-    pub committed_root_txg: u64,
-    pub root_handle: u64,
+    pub root_identity: LifecycleRootIdentityV1,
     pub creation_commit_group: u64,
     pub created_at_secs: u64,
 }
@@ -825,8 +824,7 @@ impl DatasetLifecycle {
             clone_dataset_id,
             origin_dataset_id,
             snapshot_name,
-            committed_root_txg,
-            root_handle,
+            root_identity,
             creation_commit_group,
             created_at_secs,
         } = request;
@@ -844,8 +842,8 @@ impl DatasetLifecycle {
         let anchor = self.derived_catalog.create_snapshot_anchor(
             clone_dataset_id,
             snapshot_name,
-            committed_root_txg,
-            root_handle,
+            root_identity.generation(),
+            root_identity.logical_root_handle(),
             creation_commit_group,
             created_at_secs,
         );
@@ -853,7 +851,7 @@ impl DatasetLifecycle {
         // Pin the snapshot catalog root for GC safety
         let root = tidefs_types_dataset_lifecycle_core::TraversalRoot::new(
             tidefs_types_dataset_lifecycle_core::TraversalRootType::SnapshotCatalog,
-            tidefs_types_dataset_lifecycle_core::BlockPointer(0),
+            root_identity,
             0,
         );
         if let Err(e) = self.gc_pin_set.pin(root) {
@@ -887,11 +885,12 @@ impl DatasetLifecycle {
         &mut self,
         clone_dataset_id: DatasetId,
         origin_dataset_id: DatasetId,
+        root_identity: LifecycleRootIdentityV1,
         creation_commit_group: u64,
     ) -> Result<(), tidefs_gc_pin_set::GcPinError> {
         let root = tidefs_types_dataset_lifecycle_core::TraversalRoot::new(
             tidefs_types_dataset_lifecycle_core::TraversalRootType::SnapshotCatalog,
-            tidefs_types_dataset_lifecycle_core::BlockPointer(0),
+            root_identity,
             0,
         );
         self.gc_pin_set.pin(root)?;
@@ -1890,7 +1889,13 @@ mod tests {
     }
 
     use tidefs_derived_catalog::SnapshotId;
-    use tidefs_types_dataset_lifecycle_core::{BlockPointer, TraversalRoot, TraversalRootType};
+    use tidefs_types_dataset_lifecycle_core::{
+        LifecycleRootIdentityV1, TraversalRoot, TraversalRootType,
+    };
+
+    fn root_identity(handle: u64) -> LifecycleRootIdentityV1 {
+        LifecycleRootIdentityV1::new(handle, 1).unwrap()
+    }
 
     // ── Construction ──────────────────────────────────────────────
 
@@ -2381,9 +2386,9 @@ mod tests {
     fn pin_roots_for_destroy_registers_all() {
         let mut lc = DatasetLifecycle::new();
         let roots = [
-            TraversalRoot::new(TraversalRootType::InodeTable, BlockPointer(100), 500),
-            TraversalRoot::new(TraversalRootType::ExtentMap, BlockPointer(200), 300),
-            TraversalRoot::new(TraversalRootType::DirectoryIndex, BlockPointer(300), 200),
+            TraversalRoot::new(TraversalRootType::InodeTable, root_identity(100), 500),
+            TraversalRoot::new(TraversalRootType::ExtentMap, root_identity(200), 300),
+            TraversalRoot::new(TraversalRootType::DirectoryIndex, root_identity(300), 200),
         ];
         lc.transition_to_destroying(DestroyFlags::NONE, &roots)
             .unwrap();
@@ -2404,8 +2409,8 @@ mod tests {
     fn unpin_root_removes_one() {
         let mut lc = DatasetLifecycle::new();
         let roots = [
-            TraversalRoot::new(TraversalRootType::InodeTable, BlockPointer(100), 500),
-            TraversalRoot::new(TraversalRootType::ExtentMap, BlockPointer(200), 300),
+            TraversalRoot::new(TraversalRootType::InodeTable, root_identity(100), 500),
+            TraversalRoot::new(TraversalRootType::ExtentMap, root_identity(200), 300),
         ];
         lc.transition_to_destroying(DestroyFlags::NONE, &roots)
             .unwrap();
@@ -2423,12 +2428,11 @@ mod tests {
     #[cfg(feature = "alloc")]
     #[test]
     fn tombstone_clears_pin_set() {
-        use tidefs_types_dataset_lifecycle_core::BlockPointer as BP;
         use tidefs_types_dataset_lifecycle_core::TraversalRoot as TR;
         use tidefs_types_dataset_lifecycle_core::TraversalRootType as TRT;
 
         let mut lc = DatasetLifecycle::new();
-        let roots = [TR::new(TRT::InodeTable, BP(100), 500)];
+        let roots = [TR::new(TRT::InodeTable, root_identity(100), 500)];
         lc.transition_to_destroying(DestroyFlags::NONE, &roots)
             .unwrap();
         assert_eq!(lc.gc_pin_set().count(), 1);
@@ -2442,12 +2446,11 @@ mod tests {
     #[cfg(feature = "alloc")]
     #[test]
     fn abort_clears_pin_set() {
-        use tidefs_types_dataset_lifecycle_core::BlockPointer as BP;
         use tidefs_types_dataset_lifecycle_core::TraversalRoot as TR;
         use tidefs_types_dataset_lifecycle_core::TraversalRootType as TRT;
 
         let mut lc = DatasetLifecycle::new();
-        let roots = [TR::new(TRT::InodeTable, BP(100), 500)];
+        let roots = [TR::new(TRT::InodeTable, root_identity(100), 500)];
         lc.transition_to_destroying(DestroyFlags::NONE, &roots)
             .unwrap();
         assert_eq!(lc.gc_pin_set().count(), 1);
@@ -2461,8 +2464,8 @@ mod tests {
     #[test]
     fn repin_from_job_restores_roots() {
         let roots = [
-            TraversalRoot::new(TraversalRootType::InodeTable, BlockPointer(100), 500),
-            TraversalRoot::new(TraversalRootType::ExtentMap, BlockPointer(200), 300),
+            TraversalRoot::new(TraversalRootType::InodeTable, root_identity(100), 500),
+            TraversalRoot::new(TraversalRootType::ExtentMap, root_identity(200), 300),
         ];
         let job = DestroyJobRecordV1::new(1, 1000, DestroyFlags::NONE, &roots, 800).unwrap();
 
@@ -2480,12 +2483,11 @@ mod tests {
     #[cfg(feature = "alloc")]
     #[test]
     fn recover_tombstone_clears_pin_set() {
-        use tidefs_types_dataset_lifecycle_core::BlockPointer as BP;
         use tidefs_types_dataset_lifecycle_core::TraversalRoot as TR;
         use tidefs_types_dataset_lifecycle_core::TraversalRootType as TRT;
 
         let mut lc = DatasetLifecycle::new();
-        let roots = [TR::new(TRT::InodeTable, BP(100), 500)];
+        let roots = [TR::new(TRT::InodeTable, root_identity(100), 500)];
         lc.transition_to_destroying(DestroyFlags::NONE, &roots)
             .unwrap();
         lc.escalate_poison();
@@ -2502,7 +2504,7 @@ mod tests {
         let mut lc = DatasetLifecycle::new();
         let roots = [TraversalRoot::new(
             TraversalRootType::InodeTable,
-            BlockPointer(100),
+            root_identity(100),
             500,
         )];
         lc.transition_to_destroying(DestroyFlags::NONE, &roots)
@@ -2535,7 +2537,7 @@ mod tests {
         let mut lc = DatasetLifecycle::new();
         let roots = [TraversalRoot::new(
             TraversalRootType::InodeTable,
-            BlockPointer(100),
+            root_identity(100),
             500,
         )];
         lc.transition_to_destroying(DestroyFlags::NONE, &roots)
@@ -2548,8 +2550,8 @@ mod tests {
     fn roots_remaining_counts_pinned_roots() {
         let mut lc = DatasetLifecycle::new();
         let roots = [
-            TraversalRoot::new(TraversalRootType::InodeTable, BlockPointer(100), 500),
-            TraversalRoot::new(TraversalRootType::ExtentMap, BlockPointer(200), 300),
+            TraversalRoot::new(TraversalRootType::InodeTable, root_identity(100), 500),
+            TraversalRoot::new(TraversalRootType::ExtentMap, root_identity(200), 300),
         ];
         lc.transition_to_destroying(DestroyFlags::NONE, &roots)
             .unwrap();
@@ -2562,7 +2564,7 @@ mod tests {
         let mut lc = DatasetLifecycle::new();
         let roots = [TraversalRoot::new(
             TraversalRootType::InodeTable,
-            BlockPointer(100),
+            root_identity(100),
             500,
         )];
         lc.transition_to_destroying(DestroyFlags::NONE, &roots)
@@ -2606,8 +2608,8 @@ mod tests {
     #[test]
     fn init_destroy_job_tracks_state() {
         let roots = [
-            TraversalRoot::new(TraversalRootType::InodeTable, BlockPointer(100), 500),
-            TraversalRoot::new(TraversalRootType::ExtentMap, BlockPointer(200), 300),
+            TraversalRoot::new(TraversalRootType::InodeTable, root_identity(100), 500),
+            TraversalRoot::new(TraversalRootType::ExtentMap, root_identity(200), 300),
         ];
         let mut lc = DatasetLifecycle::new();
         lc.transition_to_destroying(DestroyFlags::NONE, &[])
@@ -2627,7 +2629,7 @@ mod tests {
     fn init_destroy_job_refuses_when_not_destroying() {
         let roots = [TraversalRoot::new(
             TraversalRootType::InodeTable,
-            BlockPointer(100),
+            root_identity(100),
             500,
         )];
         let mut lc = DatasetLifecycle::new(); // Active state
@@ -2639,7 +2641,7 @@ mod tests {
     fn update_destroy_progress_tracks_reclamation() {
         let roots = [TraversalRoot::new(
             TraversalRootType::InodeTable,
-            BlockPointer(100),
+            root_identity(100),
             1000,
         )];
         let mut lc = DatasetLifecycle::new();
@@ -2672,7 +2674,7 @@ mod tests {
     fn destroy_job_none_after_abort() {
         let roots = [TraversalRoot::new(
             TraversalRootType::InodeTable,
-            BlockPointer(100),
+            root_identity(100),
             500,
         )];
         let mut lc = DatasetLifecycle::new();
@@ -2690,7 +2692,7 @@ mod tests {
     fn destroy_job_completed_after_tombstone() {
         let roots = [TraversalRoot::new(
             TraversalRootType::InodeTable,
-            BlockPointer(100),
+            root_identity(100),
             1000,
         )];
         let mut lc = DatasetLifecycle::new();
@@ -2712,7 +2714,7 @@ mod tests {
     fn display_includes_destroy_job() {
         let roots = [TraversalRoot::new(
             TraversalRootType::InodeTable,
-            BlockPointer(100),
+            root_identity(100),
             500,
         )];
         let mut lc = DatasetLifecycle::new();
@@ -2751,7 +2753,7 @@ mod tests {
         let mut lc = DatasetLifecycle::new();
         let roots = [TraversalRoot::new(
             TraversalRootType::InodeTable,
-            BlockPointer(100),
+            root_identity(100),
             500,
         )];
         lc.transition_to_destroying(DestroyFlags::NONE, &roots)
@@ -2774,7 +2776,7 @@ mod tests {
         let mut lc = DatasetLifecycle::new();
         let roots = [TraversalRoot::new(
             TraversalRootType::InodeTable,
-            BlockPointer(100),
+            root_identity(100),
             500,
         )];
         lc.transition_to_destroying(DestroyFlags::NONE, &roots)
@@ -2814,7 +2816,7 @@ mod tests {
         let mut lc = DatasetLifecycle::new();
         let roots = [TraversalRoot::new(
             TraversalRootType::InodeTable,
-            BlockPointer(100),
+            root_identity(100),
             500,
         )];
         lc.transition_to_destroying(DestroyFlags::NONE, &roots)
@@ -2853,7 +2855,7 @@ mod tests {
         let mut lc = DatasetLifecycle::new();
         let roots = [TraversalRoot::new(
             TraversalRootType::InodeTable,
-            BlockPointer(100),
+            root_identity(100),
             500,
         )];
         lc.transition_to_destroying(DestroyFlags::NONE, &roots)
@@ -2870,7 +2872,7 @@ mod tests {
         let mut lc = DatasetLifecycle::new();
         let roots = [TraversalRoot::new(
             TraversalRootType::InodeTable,
-            BlockPointer(100),
+            root_identity(100),
             500,
         )];
         lc.transition_to_destroying(DestroyFlags::NONE, &roots)
@@ -2889,7 +2891,7 @@ mod tests {
     #[test]
     fn pin_root_adds_to_pin_set() {
         let mut lc = DatasetLifecycle::new();
-        let root = TraversalRoot::new(TraversalRootType::SnapshotCatalog, BlockPointer(42), 100);
+        let root = TraversalRoot::new(TraversalRootType::SnapshotCatalog, root_identity(42), 100);
         assert!(lc.gc_pin_set().is_empty());
         lc.pin_root(root).unwrap();
         assert_eq!(lc.gc_pin_set().count(), 1);
@@ -2901,10 +2903,10 @@ mod tests {
     #[test]
     fn distinct_snapshot_roots_get_separate_slots() {
         let mut lc = DatasetLifecycle::new();
-        let r1 = TraversalRoot::new(TraversalRootType::SnapshotCatalog, BlockPointer(10), 50);
-        let r2 = TraversalRoot::new(TraversalRootType::SnapshotCatalog, BlockPointer(20), 100);
+        let r1 = TraversalRoot::new(TraversalRootType::SnapshotCatalog, root_identity(10), 50);
+        let r2 = TraversalRoot::new(TraversalRootType::SnapshotCatalog, root_identity(20), 100);
         lc.pin_root(r1).unwrap();
-        // With identity-based pinning, different block pointers → separate slots.
+        // Different logical committed roots occupy separate pin slots.
         lc.pin_root(r2).unwrap();
         // Two distinct slots, one pin each.
         assert_eq!(lc.gc_pin_set().count(), 2);
@@ -2921,7 +2923,7 @@ mod tests {
     #[test]
     fn pin_root_then_unpin_via_destroy_snapshot() {
         let mut lc = DatasetLifecycle::new();
-        let root = TraversalRoot::new(TraversalRootType::SnapshotCatalog, BlockPointer(99), 200);
+        let root = TraversalRoot::new(TraversalRootType::SnapshotCatalog, root_identity(99), 200);
         lc.pin_root(root).unwrap();
         assert_eq!(lc.gc_pin_set().count(), 1);
 
@@ -2933,8 +2935,9 @@ mod tests {
     #[test]
     fn pin_root_multiple_types() {
         let mut lc = DatasetLifecycle::new();
-        let snap_root = TraversalRoot::new(TraversalRootType::SnapshotCatalog, BlockPointer(1), 10);
-        let inode_root = TraversalRoot::new(TraversalRootType::InodeTable, BlockPointer(2), 20);
+        let snap_root =
+            TraversalRoot::new(TraversalRootType::SnapshotCatalog, root_identity(1), 10);
+        let inode_root = TraversalRoot::new(TraversalRootType::InodeTable, root_identity(2), 20);
         lc.pin_root(snap_root).unwrap();
         lc.pin_root(inode_root).unwrap();
         assert_eq!(lc.gc_pin_set().count(), 2);
@@ -2953,7 +2956,7 @@ mod tests {
         let mut lc = DatasetLifecycle::new();
         let roots = [TraversalRoot::new(
             TraversalRootType::SnapshotCatalog,
-            BlockPointer(42),
+            root_identity(42),
             1000,
         )];
         lc.transition_to_destroying(DestroyFlags::NONE, &roots)
@@ -2989,9 +2992,9 @@ mod tests {
     fn destroy_snapshot_does_not_affect_other_pinned_roots() {
         let mut lc = DatasetLifecycle::new();
         let roots = [
-            TraversalRoot::new(TraversalRootType::InodeTable, BlockPointer(10), 500),
-            TraversalRoot::new(TraversalRootType::SnapshotCatalog, BlockPointer(20), 300),
-            TraversalRoot::new(TraversalRootType::ExtentMap, BlockPointer(30), 400),
+            TraversalRoot::new(TraversalRootType::InodeTable, root_identity(10), 500),
+            TraversalRoot::new(TraversalRootType::SnapshotCatalog, root_identity(20), 300),
+            TraversalRoot::new(TraversalRootType::ExtentMap, root_identity(30), 400),
         ];
         lc.transition_to_destroying(DestroyFlags::NONE, &roots)
             .unwrap();
@@ -3019,7 +3022,8 @@ mod tests {
         let mut lc = DatasetLifecycle::new();
         assert!(lc.gc_pin_set().is_empty());
 
-        lc.create_snapshot(did(1), did(2), 100).unwrap();
+        lc.create_snapshot(did(1), did(2), root_identity(100), 100)
+            .unwrap();
 
         assert!(lc
             .gc_pin_set()
@@ -3033,13 +3037,16 @@ mod tests {
     fn create_multiple_snapshots_increments_pin_count() {
         let mut lc = DatasetLifecycle::new();
 
-        lc.create_snapshot(did(10), did(20), 100).unwrap();
-        lc.create_snapshot(did(11), did(21), 101).unwrap();
-        lc.create_snapshot(did(12), did(22), 102).unwrap();
+        lc.create_snapshot(did(10), did(20), root_identity(100), 100)
+            .unwrap();
+        lc.create_snapshot(did(11), did(21), root_identity(101), 101)
+            .unwrap();
+        lc.create_snapshot(did(12), did(22), root_identity(102), 102)
+            .unwrap();
 
-        // Each create_snapshot pins the same root type (SnapshotCatalog)
-        // so the count is 1 (one root type) but total_pins = 3
-        assert_eq!(lc.gc_pin_set().count(), 1);
+        // Each snapshot has its own logical root identity even though all
+        // three use the SnapshotCatalog traversal family.
+        assert_eq!(lc.gc_pin_set().count(), 3);
         assert_eq!(lc.gc_pin_set().total_pins(), 3);
         assert_eq!(
             lc.gc_pin_set()
@@ -3053,7 +3060,8 @@ mod tests {
     fn create_then_destroy_snapshot_balances_pins() {
         let mut lc = DatasetLifecycle::new();
 
-        lc.create_snapshot(did(30), did(40), 200).unwrap();
+        lc.create_snapshot(did(30), did(40), root_identity(200), 200)
+            .unwrap();
         assert_eq!(lc.gc_pin_set().total_pins(), 1);
 
         lc.destroy_snapshot_by_type(&did(30)).unwrap();
@@ -3065,8 +3073,10 @@ mod tests {
     fn create_snapshot_idempotent_pin() {
         let mut lc = DatasetLifecycle::new();
 
-        lc.create_snapshot(did(50), did(60), 300).unwrap();
-        lc.create_snapshot(did(50), did(60), 300).unwrap();
+        lc.create_snapshot(did(50), did(60), root_identity(300), 300)
+            .unwrap();
+        lc.create_snapshot(did(50), did(60), root_identity(300), 300)
+            .unwrap();
 
         assert_eq!(lc.gc_pin_set().total_pins(), 2);
         // destroy_snapshot uses force_unpin which removes the root
@@ -3081,7 +3091,7 @@ mod tests {
     #[test]
     fn pin_root_for_service_adds_pin() {
         let mut lc = DatasetLifecycle::new();
-        let root = TraversalRoot::new(TraversalRootType::InodeTable, BlockPointer(42), 100);
+        let root = TraversalRoot::new(TraversalRootType::InodeTable, root_identity(42), 100);
         let pin = lc
             .pin_root_for_service(root, BackgroundService::Scrub)
             .unwrap();
@@ -3103,8 +3113,8 @@ mod tests {
     #[test]
     fn multi_service_pin_same_root_refcounts() {
         let mut lc = DatasetLifecycle::new();
-        let root = TraversalRoot::new(TraversalRootType::SnapshotCatalog, BlockPointer(10), 50);
-        // Two services pin the same exact root (same type + same block pointer)
+        let root = TraversalRoot::new(TraversalRootType::SnapshotCatalog, root_identity(10), 50);
+        // Two services pin the same exact logical committed root.
         let pin1 = lc
             .pin_root_for_service(root, BackgroundService::Cleanup)
             .unwrap();
@@ -3131,7 +3141,7 @@ mod tests {
     #[test]
     fn gc_skips_pinned_root_via_is_pinned() {
         let mut lc = DatasetLifecycle::new();
-        let root = TraversalRoot::new(TraversalRootType::ExtentMap, BlockPointer(300), 1000);
+        let root = TraversalRoot::new(TraversalRootType::ExtentMap, root_identity(300), 1000);
         let pin = lc
             .pin_root_for_service(root, BackgroundService::Destroy)
             .unwrap();
@@ -3156,7 +3166,7 @@ mod tests {
     #[test]
     fn stats_reports_active_pins() {
         let mut lc = DatasetLifecycle::new();
-        let root = TraversalRoot::new(TraversalRootType::InodeTable, BlockPointer(42), 100);
+        let root = TraversalRoot::new(TraversalRootType::InodeTable, root_identity(42), 100);
         let _pin = lc
             .pin_root_for_service(root, BackgroundService::Cleanup)
             .unwrap();
@@ -3176,8 +3186,8 @@ mod tests {
     #[test]
     fn stats_reflects_multi_pin() {
         let mut lc = DatasetLifecycle::new();
-        let r1 = TraversalRoot::new(TraversalRootType::InodeTable, BlockPointer(1), 10);
-        let r2 = TraversalRoot::new(TraversalRootType::ExtentMap, BlockPointer(2), 20);
+        let r1 = TraversalRoot::new(TraversalRootType::InodeTable, root_identity(1), 10);
+        let r2 = TraversalRoot::new(TraversalRootType::ExtentMap, root_identity(2), 20);
         let _pin1 = lc
             .pin_root_for_service(r1, BackgroundService::Cleanup)
             .unwrap();
@@ -3231,7 +3241,7 @@ mod tests {
     #[test]
     fn pinned_root_debug_includes_service() {
         let mut lc = DatasetLifecycle::new();
-        let root = TraversalRoot::new(TraversalRootType::InodeTable, BlockPointer(1), 10);
+        let root = TraversalRoot::new(TraversalRootType::InodeTable, root_identity(1), 10);
         let pin = lc
             .pin_root_for_service(root, BackgroundService::Destroy)
             .unwrap();
@@ -3457,7 +3467,8 @@ mod tests {
         let clone_id = did(10);
         let origin_id = did(20);
 
-        lc.create_snapshot(clone_id, origin_id, 100).unwrap();
+        lc.create_snapshot(clone_id, origin_id, root_identity(100), 100)
+            .unwrap();
 
         let cat = lc.derived_catalog();
         assert_eq!(cat.len(), 1);
@@ -3478,7 +3489,8 @@ mod tests {
         let mut lc = DatasetLifecycle::new();
         let clone_id = did(30);
 
-        lc.create_snapshot(clone_id, did(40), 200).unwrap();
+        lc.create_snapshot(clone_id, did(40), root_identity(200), 200)
+            .unwrap();
         assert_eq!(lc.derived_catalog().len(), 1);
 
         lc.destroy_snapshot_by_type(&clone_id).unwrap();
@@ -3493,8 +3505,10 @@ mod tests {
         let clone_a = did(10);
         let clone_b = did(20);
 
-        lc.create_snapshot(clone_a, did(100), 100).unwrap();
-        lc.create_snapshot(clone_b, did(200), 200).unwrap();
+        lc.create_snapshot(clone_a, did(100), root_identity(100), 100)
+            .unwrap();
+        lc.create_snapshot(clone_b, did(200), root_identity(200), 200)
+            .unwrap();
         assert_eq!(lc.derived_catalog().len(), 2);
 
         lc.destroy_snapshot_by_type(&clone_a).unwrap();
@@ -3507,9 +3521,12 @@ mod tests {
     #[test]
     fn encode_decode_roundtrip_preserves_catalog() {
         let mut lc = DatasetLifecycle::new();
-        lc.create_snapshot(did(1), did(10), 100).unwrap();
-        lc.create_snapshot(did(2), did(20), 200).unwrap();
-        lc.create_snapshot(did(3), did(10), 300).unwrap();
+        lc.create_snapshot(did(1), did(10), root_identity(100), 100)
+            .unwrap();
+        lc.create_snapshot(did(2), did(20), root_identity(200), 200)
+            .unwrap();
+        lc.create_snapshot(did(3), did(10), root_identity(300), 300)
+            .unwrap();
 
         let encoded = lc.encode();
         let decoded = DatasetLifecycle::decode(&encoded).unwrap();
@@ -3545,13 +3562,15 @@ mod tests {
         let clone_id = did(50);
 
         // First creation: clone of origin A
-        lc.create_snapshot(clone_id, did(100), 100).unwrap();
+        lc.create_snapshot(clone_id, did(100), root_identity(100), 100)
+            .unwrap();
         assert_eq!(lc.derived_catalog().len(), 1);
         let snap100 = SnapshotId::from(did(100));
         assert!(lc.derived_catalog().has_clones(&snap100));
 
         // Second creation: same clone but different origin B
-        lc.create_snapshot(clone_id, did(200), 200).unwrap();
+        lc.create_snapshot(clone_id, did(200), root_identity(200), 200)
+            .unwrap();
         assert_eq!(lc.derived_catalog().len(), 1); // still 1 entry (replaced)
 
         // Origin A should no longer have this clone
@@ -3569,7 +3588,8 @@ mod tests {
     #[test]
     fn derived_catalog_mut_allows_direct_manipulation() {
         let mut lc = DatasetLifecycle::new();
-        lc.create_snapshot(did(1), did(10), 100).unwrap();
+        lc.create_snapshot(did(1), did(10), root_identity(100), 100)
+            .unwrap();
 
         // Direct manipulation through mutable accessor
         lc.derived_catalog_mut().clear();
@@ -3653,8 +3673,7 @@ mod tests {
             clone_dataset_id,
             origin_dataset_id,
             snapshot_name: snapshot_name.into(),
-            committed_root_txg,
-            root_handle,
+            root_identity: LifecycleRootIdentityV1::new(root_handle, committed_root_txg).unwrap(),
             creation_commit_group,
             created_at_secs,
         }
@@ -3706,6 +3725,7 @@ mod tests {
     #[test]
     fn create_snapshot_with_anchor_pins_gc_root() {
         let mut lc = DatasetLifecycle::new();
+        let root_identity = LifecycleRootIdentityV1::new(1, 10).unwrap();
 
         lc.create_snapshot_with_anchor(snapshot_anchor_create(
             did(1),
@@ -3718,8 +3738,8 @@ mod tests {
         ))
         .unwrap();
 
-        // GC pin set should have the snapshot catalog root pinned
-        assert!(lc.gc_pin_set().total_pins() >= 1);
+        let root = TraversalRoot::new(TraversalRootType::SnapshotCatalog, root_identity, 0);
+        assert_eq!(lc.gc_pin_set().pin_count(root), 1);
     }
 
     #[test]
@@ -3750,7 +3770,7 @@ mod tests {
         for i in 0..6u8 {
             let root = TraversalRoot::new(
                 TraversalRootType::from_u8(i + 1).unwrap(),
-                BlockPointer(u64::from(i) + 1),
+                root_identity(u64::from(i) + 1),
                 1,
             );
             let _ = lc.pin_root_for_service(root, BackgroundService::Scrub);

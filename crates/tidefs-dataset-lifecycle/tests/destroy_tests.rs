@@ -5,12 +5,16 @@
 
 use tidefs_dataset_lifecycle::{DatasetLifecycle, LifecycleError};
 use tidefs_types_dataset_lifecycle_core::{
-    BlockPointer, DatasetStateV1, DestroyFlags, PoisonState, ReapEligibility,
+    DatasetStateV1, DestroyFlags, LifecycleRootIdentityV1, PoisonState, ReapEligibility,
     TombstoneReaperPolicy, TraversalRoot, TraversalRootType,
 };
 
+fn root_identity(handle: u64) -> LifecycleRootIdentityV1 {
+    LifecycleRootIdentityV1::new(handle, 1).unwrap()
+}
+
 fn make_root() -> TraversalRoot {
-    TraversalRoot::new(TraversalRootType::InodeTable, BlockPointer(100), 500)
+    TraversalRoot::new(TraversalRootType::InodeTable, root_identity(100), 500)
 }
 
 fn make_roots(n: usize) -> Vec<TraversalRoot> {
@@ -26,7 +30,7 @@ fn make_roots(n: usize) -> Vec<TraversalRoot> {
         .iter()
         .take(n)
         .enumerate()
-        .map(|(i, &t)| TraversalRoot::new(t, BlockPointer((100 + i * 100) as u64), 500))
+        .map(|(i, &t)| TraversalRoot::new(t, root_identity((100 + i * 100) as u64), 500))
         .collect()
 }
 
@@ -337,7 +341,7 @@ fn update_destroy_progress_partial() {
     let mut lc = DatasetLifecycle::new();
     let roots = [TraversalRoot::new(
         TraversalRootType::InodeTable,
-        BlockPointer(100),
+        root_identity(100),
         1000,
     )];
     lc.transition_to_destroying(DestroyFlags::NONE, &roots)
@@ -354,7 +358,7 @@ fn update_destroy_progress_complete() {
     let mut lc = DatasetLifecycle::new();
     let roots = [TraversalRoot::new(
         TraversalRootType::InodeTable,
-        BlockPointer(100),
+        root_identity(100),
         1000,
     )];
     lc.transition_to_destroying(DestroyFlags::NONE, &roots)
@@ -372,7 +376,7 @@ fn update_destroy_progress_over_tracks_last_values() {
     let mut lc = DatasetLifecycle::new();
     let roots = [TraversalRoot::new(
         TraversalRootType::InodeTable,
-        BlockPointer(100),
+        root_identity(100),
         1000,
     )];
     lc.transition_to_destroying(DestroyFlags::NONE, &roots)
@@ -392,7 +396,7 @@ fn destroy_progress_ppm_zero_for_empty_objects_total() {
     let mut lc = DatasetLifecycle::new();
     let roots = [TraversalRoot::new(
         TraversalRootType::InodeTable,
-        BlockPointer(100),
+        root_identity(100),
         0,
     )];
     lc.transition_to_destroying(DestroyFlags::NONE, &roots)
@@ -547,7 +551,7 @@ fn full_lifecycle_with_destroy_job_tracking() {
     let mut lc = DatasetLifecycle::new();
     let roots = [TraversalRoot::new(
         TraversalRootType::InodeTable,
-        BlockPointer(100),
+        root_identity(100),
         1000,
     )];
 

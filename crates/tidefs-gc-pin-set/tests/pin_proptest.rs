@@ -5,7 +5,9 @@
 
 use proptest::prelude::*;
 use tidefs_gc_pin_set::{GcPinError, GcPinSet};
-use tidefs_types_dataset_lifecycle_core::{BlockPointer, TraversalRoot, TraversalRootType};
+use tidefs_types_dataset_lifecycle_core::{
+    LifecycleRootIdentityV1, TraversalRoot, TraversalRootType,
+};
 
 const ALL_TYPES: [TraversalRootType; 6] = [
     TraversalRootType::InodeTable,
@@ -16,8 +18,13 @@ const ALL_TYPES: [TraversalRootType; 6] = [
     TraversalRootType::FeatureFlags,
 ];
 
-fn make_root(rt: TraversalRootType, bp: u64) -> TraversalRoot {
-    TraversalRoot::new(rt, BlockPointer(bp), (bp % 1000) + 1)
+fn make_root(rt: TraversalRootType, handle: u64) -> TraversalRoot {
+    let required_handle = handle.checked_add(1).expect("test root handle overflow");
+    TraversalRoot::new(
+        rt,
+        LifecycleRootIdentityV1::new(required_handle, 1).unwrap(),
+        (handle % 1000) + 1,
+    )
 }
 
 fn root_type_strategy() -> impl Strategy<Value = TraversalRootType> {
@@ -31,7 +38,7 @@ enum Op {
 }
 
 fn op_strategy(capacity: usize) -> impl Strategy<Value = Vec<Op>> {
-    let op = (root_type_strategy(), 0..100u64).prop_flat_map(move |(rt, bp)| {
+    let op = (root_type_strategy(), 1..100u64).prop_flat_map(move |(rt, bp)| {
         prop_oneof![
             (Just(rt), Just(bp)).prop_map(|(rt, bp)| Op::Pin { rt, bp }),
             (Just(rt), Just(bp)).prop_map(|(rt, bp)| Op::Unpin { rt, bp }),
