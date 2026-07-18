@@ -164,11 +164,11 @@ impl MmapCoherency {
             generation: 0,
             active: false,
         });
-        if entry.active {
-            entry.generation = entry.generation.max(generation);
-        } else {
-            entry.generation = generation;
-        }
+        // Close/reopen must not move the invalidation fence backward.  A
+        // deferred event may still be waiting for this registration to become
+        // active again, and a lower reopen hint must not make older cache state
+        // current in the meantime.
+        entry.generation = entry.generation.max(generation);
         entry.active = true;
         drop(regs);
         self.stats
@@ -305,11 +305,22 @@ impl MmapInvalidationSink<'_> {
                 .fetch_add(1, Ordering::Relaxed);
         }
 
-        let is_actionable = {
+        let (is_actionable, retain_until_active) = {
             let regs = self.registrations.lock().unwrap();
-            regs.get(&ino_u64)
-                .is_some_and(|entry| entry.active && generation > entry.generation)
+            match regs.get(&ino_u64) {
+                Some(entry) if generation > entry.generation && entry.active => (true, false),
+                Some(entry)
+                    if generation > entry.generation && !entry.active && !newly_received =>
+                {
+                    (false, true)
+                }
+                _ => (false, false),
+            }
         };
+        if retain_until_active {
+            self.defer_invalidation(ino_u64, generation);
+            return;
+        }
         if !is_actionable {
             return;
         }
@@ -324,7 +335,7 @@ impl MmapInvalidationSink<'_> {
             let is_still_actionable = {
                 let regs = self.registrations.lock().unwrap();
                 regs.get(&ino_u64)
-                    .is_some_and(|entry| entry.active && generation > entry.generation)
+                    .is_some_and(|entry| generation > entry.generation)
             };
             if is_still_actionable {
                 self.defer_invalidation(ino_u64, generation);
@@ -345,7 +356,7 @@ impl MmapInvalidationSink<'_> {
             let is_still_actionable = {
                 let regs = self.registrations.lock().unwrap();
                 regs.get(&ino_u64)
-                    .is_some_and(|entry| entry.active && generation > entry.generation)
+                    .is_some_and(|entry| generation > entry.generation)
             };
             if is_still_actionable {
                 self.defer_invalidation(ino_u64, generation);
@@ -356,7 +367,7 @@ impl MmapInvalidationSink<'_> {
         let should_invalidate = {
             let mut regs = self.registrations.lock().unwrap();
             match regs.get_mut(&ino_u64) {
-                Some(ref mut entry) if entry.active && generation > entry.generation => {
+                Some(ref mut entry) if generation > entry.generation => {
                     entry.generation = generation;
                     true
                 }
@@ -509,6 +520,46 @@ mod tests {
         assert_eq!(c.process_tick(16), 1);
         assert_eq!(calls.load(Ordering::Relaxed), 2);
         assert_eq!(c.deferred_invalidation_count(), 1);
+    }
+
+    #[test]
+    fn deferred_invalidation_survives_deregister_and_reopen() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let notify_calls = Arc::clone(&calls);
+        let dirty = Arc::new(AtomicBool::new(true));
+        let dirty_check = Arc::clone(&dirty);
+        let c = MmapCoherency::new_for_test(move |_| {
+            notify_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        });
+        c.register(42, 1);
+        c.set_dirty_check(Some(Box::new(move |ino| {
+            ino == 42 && dirty_check.load(Ordering::Relaxed)
+        })));
+
+        c.enqueue_batch(batch(42, 2));
+        assert_eq!(c.process_tick(10), 1);
+        assert_eq!(c.deferred_invalidation_count(), 1);
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+
+        c.deregister(42);
+        dirty.store(false, Ordering::Relaxed);
+        assert_eq!(c.process_tick(10), 1);
+        assert_eq!(c.deferred_invalidation_count(), 1);
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+
+        c.register(42, 0);
+        assert_eq!(c.registrations.lock().unwrap()[&42].generation, 1);
+        assert_eq!(c.process_tick(10), 1);
+        assert_eq!(c.deferred_invalidation_count(), 0);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(c.registrations.lock().unwrap()[&42].generation, 2);
+
+        let s = c.stats.snapshot();
+        assert_eq!(s.invalidations_received, 1);
+        assert_eq!(s.dirty_invalidations_preserved, 1);
+        assert_eq!(s.coherency_conflicts, 1);
+        assert_eq!(s.pages_invalidated, 1);
     }
 
     #[test]
