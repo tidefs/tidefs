@@ -42,6 +42,8 @@ pub mod scrub_foreground_read_runtime;
 pub mod smoke;
 #[cfg(feature = "ack-receipt-fault-matrix")]
 pub mod storage_intent_ack_fault_matrix;
+#[cfg(feature = "fuse")]
+pub mod storage_intent_data_shape_runtime;
 pub mod support_bundle;
 pub mod trace;
 pub mod two_node_harness_fuse_integrity;
