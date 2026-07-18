@@ -7,6 +7,7 @@
   pkgs,
   linuxKernel_7_0,
   tidefsPackage,
+  ackValidationPackage,
   scrubValidationPackage,
 }:
 
@@ -24,6 +25,7 @@ pkgs.writeShellScriptBin "tidefs-fuse-vm-test-runner" ''
   TIDEFS_XTASK="${tidefsPackage}/bin/tidefs-xtask"
   TIDEFS_STORE_DEMO="${tidefsPackage}/bin/tidefs-store-demo"
   FUSE_DAEMON="${tidefsPackage}/bin/tidefs-posix-filesystem-adapter-daemon"
+  ACK_VALIDATION="${ackValidationPackage}/bin/storage-intent-ack-runtime-validation"
   SCRUB_VALIDATION="${scrubValidationPackage}/bin/scrub_foreground_read_validation"
   BASE64="${pkgs.coreutils}/bin/base64"
   B3SUM="${pkgs.b3sum}/bin/b3sum"
@@ -33,6 +35,7 @@ pkgs.writeShellScriptBin "tidefs-fuse-vm-test-runner" ''
   TIMEOUT_SEC="''${TIDEFS_FUSE_VM_TEST_TIMEOUT:-900}"
   VALIDATION_DIR="''${TIDEFS_FUSE_VM_TEST_VALIDATION_DIR:-/tmp/tidefs-validation/fuse-vm-test}"
   QUEUE_DEPTH_ARTIFACT="''${TIDEFS_FUSE_VM_TEST_QUEUE_DEPTH_ARTIFACT:-}"
+  ACK_RECEIPT_RUNTIME=0
   SCRUB_FOREGROUND_READ=0
   KEEP_TMP=0
 
@@ -45,11 +48,14 @@ the Nix sandbox. The guest runs the legacy tidefsFuseVmTest validation sequence:
 kernel check, /dev/fuse check, tidefs-xtask summary, tidefs-store-demo, and
 smoke-mount with queue-depth artifact capture. The scrub option instead runs
 the mounted scrub/read isolation binary and returns its typed evidence files.
+The acknowledgment option runs the focused receipt producer on the same live
+FUSE guest without adding crash or fault coverage.
 
 Options:
   --timeout SECONDS              QEMU runtime timeout (default: 900)
   --validation-dir DIR           Host directory for qemu-boot.log and summary
   --queue-depth-artifact PATH    Host artifact path for queue-depth JSON
+  --ack-receipt-runtime          Run the mounted acknowledgment receipt rows
   --scrub-foreground-read        Run the mounted scrub/read isolation row
   --keep-tmp                     Keep generated initrd/run directory
   --help, -h                     Show this help
@@ -74,6 +80,10 @@ EOF
         QUEUE_DEPTH_ARTIFACT="''${1#--queue-depth-artifact=}"
         shift
         ;;
+      --ack-receipt-runtime)
+        ACK_RECEIPT_RUNTIME=1
+        shift
+        ;;
       --scrub-foreground-read)
         SCRUB_FOREGROUND_READ=1
         shift
@@ -93,6 +103,11 @@ EOF
         ;;
     esac
   done
+
+  if [ "$ACK_RECEIPT_RUNTIME" -eq 1 ] && [ "$SCRUB_FOREGROUND_READ" -eq 1 ]; then
+    echo "ERROR: --ack-receipt-runtime and --scrub-foreground-read are mutually exclusive" >&2
+    exit 2
+  fi
 
   if [ -z "$QUEUE_DEPTH_ARTIFACT" ]; then
     QUEUE_DEPTH_ARTIFACT="$VALIDATION_DIR/performance/queue-depth-runtime.json"
@@ -117,6 +132,14 @@ EOF
       fi
     done
   fi
+  if [ "$ACK_RECEIPT_RUNTIME" -eq 1 ]; then
+    for dep in "$ACK_VALIDATION" "$BASE64" "$B3SUM" "$JQ"; do
+      if [ ! -f "$dep" ] && [ ! -x "$dep" ]; then
+        echo "ERROR: dependency not found: $dep" >&2
+        exit 2
+      fi
+    done
+  fi
 
   echo "=== TideFS FUSE VM Test ==="
   echo "  Kernel:          $KERNEL_IMG"
@@ -125,6 +148,9 @@ EOF
   echo "  TideFS xtask:    $TIDEFS_XTASK"
   echo "  TideFS demo:     $TIDEFS_STORE_DEMO"
   echo "  TideFS daemon:   $FUSE_DAEMON"
+  if [ "$ACK_RECEIPT_RUNTIME" -eq 1 ]; then
+    echo "  Ack validator:   $ACK_VALIDATION"
+  fi
   if [ "$SCRUB_FOREGROUND_READ" -eq 1 ]; then
     echo "  Scrub validator: $SCRUB_VALIDATION"
   fi
@@ -211,6 +237,10 @@ EOF
   copy_binary "$TIDEFS_STORE_DEMO" "$RUN_DIR/bin/tidefs-store-demo"
   copy_binary "$FUSE_DAEMON" "$RUN_DIR/bin/tidefs-posix-filesystem-adapter-daemon"
   copy_runtime_deps "$BUSYBOX" "$TIDEFS_XTASK" "$TIDEFS_STORE_DEMO" "$FUSE_DAEMON"
+  if [ "$ACK_RECEIPT_RUNTIME" -eq 1 ]; then
+    copy_binary "$ACK_VALIDATION" "$RUN_DIR/bin/storage-intent-ack-runtime-validation"
+    copy_runtime_deps "$ACK_VALIDATION"
+  fi
   if [ "$SCRUB_FOREGROUND_READ" -eq 1 ]; then
     copy_binary "$SCRUB_VALIDATION" "$RUN_DIR/bin/scrub_foreground_read_validation"
     copy_runtime_deps "$SCRUB_VALIDATION"
@@ -242,6 +272,7 @@ EOF
 #!/bin/sh
 export PATH=/bin
 export LD_LIBRARY_PATH=/usr/lib:/lib:/lib64
+ACK_RECEIPT_RUNTIME=__ACK_RECEIPT_RUNTIME__
 SCRUB_FOREGROUND_READ=__SCRUB_FOREGROUND_READ__
 GITHUB_RUN_ID="__GITHUB_RUN_ID__"
 GITHUB_RUN_ATTEMPT="__GITHUB_RUN_ATTEMPT__"
@@ -292,6 +323,38 @@ if [ -e /dev/fuse ]; then
     pass "fuse_device"
 else
     refuse "fuse_device" "/dev/fuse is not available"
+    finish
+fi
+
+if [ "$ACK_RECEIPT_RUNTIME" -eq 1 ]; then
+    ACK_RUNTIME_DIR=/tmp/tidefs-validation/storage-intent-ack-runtime
+    mkdir -p "$ACK_RUNTIME_DIR"
+    TIDEFS_ACK_RECEIPT_RUNTIME_OUTPUT_DIR="$ACK_RUNTIME_DIR" \
+      TIDEFS_ACK_RECEIPT_RUNTIME_RUN_ID="$GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT" \
+      TIDEFS_ACK_RECEIPT_RUNTIME_SOURCE_REF="$GITHUB_SHA" \
+      TIDEFS_ACK_RECEIPT_RUNTIME_GENERATED_AT="$TIDEFS_GENERATED_AT" \
+      TIDEFS_ACK_RECEIPT_RUNTIME_CARRIER="linux-7.0-qemu-guest" \
+      timeout 180 storage-intent-ack-runtime-validation \
+      >/tmp/ack-receipt-runtime-output.txt 2>&1
+    ACK_RUNTIME_RC=$?
+    cat /tmp/ack-receipt-runtime-output.txt
+
+    if [ "$ACK_RUNTIME_RC" -eq 0 ]; then
+        pass "ack_receipt_runtime_process"
+    else
+        fail "ack_receipt_runtime_process" "exit status $ACK_RUNTIME_RC"
+    fi
+    if [ -s "$ACK_RUNTIME_DIR/ack-receipt-runtime.json" ]; then
+        echo "TIDEFS_ACK_RUNTIME_ARTIFACT_BEGIN"
+        /bin/busybox base64 "$ACK_RUNTIME_DIR/ack-receipt-runtime.json"
+        echo "TIDEFS_ACK_RUNTIME_ARTIFACT_END"
+    fi
+    if [ -s "$ACK_RUNTIME_DIR/ack-receipt-runtime.manifest.json" ]; then
+        echo "TIDEFS_ACK_RUNTIME_MANIFEST_BEGIN"
+        /bin/busybox base64 "$ACK_RUNTIME_DIR/ack-receipt-runtime.manifest.json"
+        echo "TIDEFS_ACK_RUNTIME_MANIFEST_END"
+    fi
+    echo "ack_receipt_runtime_exit_status=$ACK_RUNTIME_RC"
     finish
 fi
 
@@ -392,6 +455,7 @@ INITSCRIPT
 
   escaped_queue_path="$(printf '%s' "$QUEUE_DEPTH_ARTIFACT" | sed 's/[&|\\]/\\&/g')"
   sed -i "s|__QUEUE_DEPTH_ARTIFACT__|$escaped_queue_path|g" "$RUN_DIR/init"
+  sed -i "s|__ACK_RECEIPT_RUNTIME__|$ACK_RECEIPT_RUNTIME|g" "$RUN_DIR/init"
   sed -i "s|__SCRUB_FOREGROUND_READ__|$SCRUB_FOREGROUND_READ|g" "$RUN_DIR/init"
   sed -i "s|__GITHUB_RUN_ID__|''${GITHUB_RUN_ID:-local}|g" "$RUN_DIR/init"
   sed -i "s|__GITHUB_RUN_ATTEMPT__|''${GITHUB_RUN_ATTEMPT:-1}|g" "$RUN_DIR/init"
@@ -449,6 +513,19 @@ INITSCRIPT
     cp "$queue_tmp" "$QUEUE_DEPTH_ARTIFACT"
   fi
 
+  ack_artifact="$VALIDATION_DIR/ack-receipt-runtime.json"
+  ack_manifest="$VALIDATION_DIR/ack-receipt-runtime.manifest.json"
+  if [ "$ACK_RECEIPT_RUNTIME" -eq 1 ]; then
+    extract_between \
+      "TIDEFS_ACK_RUNTIME_ARTIFACT_BEGIN" \
+      "TIDEFS_ACK_RUNTIME_ARTIFACT_END" \
+      | "$BASE64" --decode > "$ack_artifact" || true
+    extract_between \
+      "TIDEFS_ACK_RUNTIME_MANIFEST_BEGIN" \
+      "TIDEFS_ACK_RUNTIME_MANIFEST_END" \
+      | "$BASE64" --decode > "$ack_manifest" || true
+  fi
+
   scrub_artifact="$VALIDATION_DIR/scrub-read-runtime.json"
   scrub_manifest="$VALIDATION_DIR/evidence-manifest.json"
   if [ "$SCRUB_FOREGROUND_READ" -eq 1 ]; then
@@ -466,6 +543,47 @@ INITSCRIPT
   FAILC=$(count_serial_lines '^FAIL:')
   REFUSALC=$(count_serial_lines '^REFUSAL:')
   DONEC=$(count_serial_lines '^TIDEFS_FUSE_VM_TEST_DONE$')
+  if [ "$ACK_RECEIPT_RUNTIME" -eq 1 ]; then
+    if [ ! -s "$ack_artifact" ] || [ ! -s "$ack_manifest" ]; then
+      echo "FAIL: ack_runtime_artifact_capture -- evidence payload or manifest is missing" >&2
+      FAILC=$((FAILC + 1))
+    elif ! "$JQ" -e 'type == "object"' "$ack_artifact" >/dev/null \
+      || ! "$JQ" -e 'type == "object"' "$ack_manifest" >/dev/null; then
+      echo "FAIL: ack_runtime_artifact_capture -- evidence payload or manifest is not a JSON object" >&2
+      FAILC=$((FAILC + 1))
+    else
+      declared_digest=$("$JQ" -r '.content_digest // empty' "$ack_manifest")
+      actual_digest="blake3:$("$B3SUM" "$ack_artifact" | awk '{print $1}')"
+      artifact_outcome=$("$JQ" -r '.summary.status // empty' "$ack_artifact")
+      manifest_outcome=$("$JQ" -r '.outcome // empty' "$ack_manifest")
+      artifact_source_ref=$("$JQ" -r '.source_ref // empty' "$ack_artifact")
+      manifest_source_ref=$("$JQ" -r '.source_ref // empty' "$ack_manifest")
+      artifact_run_id=$("$JQ" -r '.run_id // empty' "$ack_artifact")
+      manifest_run_id=$("$JQ" -r '.run_id // empty' "$ack_manifest")
+      expected_source_ref="''${GITHUB_SHA:-unknown}"
+      expected_run_id="''${GITHUB_RUN_ID:-local}/''${GITHUB_RUN_ATTEMPT:-1}"
+      if [ -z "$declared_digest" ] || [ "$declared_digest" != "$actual_digest" ]; then
+        echo "FAIL: ack_runtime_artifact_digest -- declared=$declared_digest actual=$actual_digest" >&2
+        FAILC=$((FAILC + 1))
+      elif [ -z "$artifact_source_ref" ] \
+        || [ "$artifact_source_ref" != "$manifest_source_ref" ] \
+        || [ "$artifact_source_ref" != "$expected_source_ref" ]; then
+        echo "FAIL: ack_runtime_source_ref -- artifact=$artifact_source_ref manifest=$manifest_source_ref expected=$expected_source_ref" >&2
+        FAILC=$((FAILC + 1))
+      elif [ -z "$artifact_run_id" ] \
+        || [ "$artifact_run_id" != "$manifest_run_id" ] \
+        || [ "$artifact_run_id" != "$expected_run_id" ]; then
+        echo "FAIL: ack_runtime_run_id -- artifact=$artifact_run_id manifest=$manifest_run_id expected=$expected_run_id" >&2
+        FAILC=$((FAILC + 1))
+      elif [ -z "$artifact_outcome" ] || [ "$artifact_outcome" != "$manifest_outcome" ]; then
+        echo "FAIL: ack_runtime_outcome -- artifact=$artifact_outcome manifest=$manifest_outcome" >&2
+        FAILC=$((FAILC + 1))
+      else
+        echo "ACK RUNTIME: captured digest-matched mounted evidence with outcome=$artifact_outcome"
+        PASSC=$((PASSC + 1))
+      fi
+    fi
+  fi
   if [ "$SCRUB_FOREGROUND_READ" -eq 1 ]; then
     if [ ! -s "$scrub_artifact" ] || [ ! -s "$scrub_manifest" ]; then
       if [ "$REFUSALC" -eq 0 ]; then
