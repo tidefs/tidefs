@@ -2,6 +2,7 @@
 //! Focused mounted-userspace foreground-read evidence while scrub work is pending.
 
 use serde::{Deserialize, Serialize};
+use std::fs;
 use std::path::Path;
 use std::process::Command;
 use std::thread;
@@ -11,10 +12,20 @@ use crate::evidence_artifact_manifest::{
     content_digest_for_bytes, BlockingIssueRef, EvidenceArtifactManifest,
     EVIDENCE_ARTIFACT_MANIFEST_VERSION,
 };
-use crate::mount_harness::{find_daemon_binary, MountHarness};
+#[cfg(feature = "scrub-runtime")]
+use crate::mount_harness::MOUNT_HARNESS_ROOT_AUTH_KEY_HEX;
+use crate::mount_harness::{find_daemon_binary, is_pre_mount_setup_failure, MountHarness};
 use crate::runtime_artifact_source::RuntimeArtifactSource;
 use crate::validation_schema::ValidationTier;
 use crate::validation_status::ValidationStatus;
+#[cfg(feature = "scrub-runtime")]
+use tidefs_local_filesystem::{LocalFileSystem, RootAuthenticationKey};
+#[cfg(feature = "scrub-runtime")]
+use tidefs_local_object_store::{LocalObjectStore, StoreOptions};
+use tidefs_performance_contract::oracle::{
+    with_scheduling_and_admission, without_scheduling_or_admission, OracleConfig,
+};
+use tidefs_performance_contract::{ScrubRuntimeObservation, ServiceCurve};
 
 pub const SCRUB_FOREGROUND_READ_ROW_ID: &str = "scrub-foreground-read-runtime";
 pub const SCRUB_READ_RUNTIME_ARTIFACT: &str = "scrub-read-runtime.json";
@@ -23,8 +34,12 @@ pub const SCRUB_READ_PRIMARY_CLAIM_ID: &str = "scrub.foreground_read.protected.v
 
 const FOREGROUND_READ_NOT_BLOCKED_CLAIM_ID: &str =
     "perf.local.foreground_read_not_blocked_by_scrub.v1";
-const SOURCE_ISSUE: &str = "https://github.com/tidefs/tidefs/issues/1527";
+const SOURCE_ISSUE: &str = "https://github.com/tidefs/tidefs/issues/1792";
 const SOURCE_LABEL: &str = "qemu-smoke-scrub-foreground-read-runtime";
+const BLOCKING_ISSUE_REPO: &str = "tidefs/tidefs";
+const BLOCKING_ISSUE_NUMBER: u64 = 1792;
+const BLOCKING_ISSUE_REASON: &str =
+    "scrub foreground-read runtime evidence and claims-gate review remain open";
 const BACKGROUND_SCRUB_INTERVAL_SECS: u64 = 1;
 const FOREGROUND_READ_BYTES: usize = 128 * 1024;
 const FOREGROUND_READ_ITERATIONS: u32 = 8;
@@ -35,22 +50,12 @@ const SCRUB_LIMIT_IOPS: u64 = 1;
 const SCRUB_BACKOFF_MILLIS: u64 = 25;
 const FUSE_SUPER_MAGIC: libc::c_long = 0x6573_5546;
 const MOUNT_READY_TIMEOUT_SECS: u64 = 10;
-// Mirrors the reviewed performance-contract service curves for this row
-// without making tidefs-validation's default Clippy target pull that stack in.
-const FOREGROUND_READ_WORK_CLASS: &str = "foreground-read";
-const FOREGROUND_READ_DOMAIN: &str = "foreground-io";
-const FOREGROUND_READ_MAX_OPS_PER_TICK: u32 = 1;
-const FOREGROUND_READ_MAX_BYTES_PER_TICK: u64 = 128 * 1024;
-const FOREGROUND_READ_QUEUE_SLOTS: u32 = 64;
-const SCRUB_WORK_CLASS: &str = "scrub";
-const SCRUB_DOMAIN: &str = "background-io";
-const SCRUB_MAX_OPS_PER_TICK: u32 = 1;
-const SCRUB_MAX_BYTES_PER_TICK: u64 = 1024 * 1024;
-const SCRUB_QUEUE_SLOTS: u32 = 4;
+const DAEMON_SCRUB_OBSERVATION_TIMEOUT_SECS: u64 = 15;
 const FOREGROUND_READ_ARRIVAL_TICK: u64 = 1;
 const MAX_FOREGROUND_READ_WAIT_TICKS: u64 = 1;
+const FOREGROUND_READ_PATH: &str = "protected-foreground-read.bin";
 
-pub const SCRUB_READ_RESIDUAL_RISK: &str = "This row records a mounted FUSE foreground-read correctness workload while scrub work is configured and represented by bounded scrub queue/rate-limiter facts. It can support the runtime-scrub-read-artifact evidence class for the named claims, but it is not production performance readiness, broad scrub/repair correctness, kernel/uBLK/RDMA validation, crash recovery, release-candidate status, or a claim-status/product-wording change.";
+pub const SCRUB_READ_RESIDUAL_RISK: &str = "This row records a mounted FUSE foreground-read correctness workload bracketed by typed observations from the same daemon's scheduled scrub service. The protected file is committed through direct local-filesystem fixture setup before mount, and the scrub targets are then seeded into the production-option object store with a data-only barrier. Both are fixture input; neither setup path is cited as mounted write, fsync, or durability evidence. A pass requires admitted scrub records, work pending before and after the read, and a scheduler-budget throttle. The foreground wait bound still comes from the typed service-curve oracle rather than an environment-independent wall-clock SLO. This row is not production performance readiness, mounted write/fsync durability, broad scrub/repair correctness, kernel/uBLK/RDMA validation, crash recovery, release-candidate status, or a claim-status/product-wording change.";
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ScrubForegroundReadRuntimeEvidence {
@@ -73,20 +78,39 @@ pub struct ScrubForegroundReadRuntimeEvidence {
     pub foreground_read: ForegroundReadEvidence,
     pub scrub_activity: ScrubActivityEvidence,
     pub service_curve: ServiceCurveEvidence,
+    pub admission_state: AdmissionStateEvidence,
     pub passed: bool,
 }
 
 impl ScrubForegroundReadRuntimeEvidence {
     pub fn assert_no_product_or_harness_failure(&self) -> Result<(), String> {
         match self.outcome {
-            ValidationStatus::Pass | ValidationStatus::EnvironmentRefusal => Ok(()),
+            ValidationStatus::Pass => {
+                if self.passed
+                    && scrub_read_isolation_passed(
+                        &self.foreground_read,
+                        &self.scrub_activity,
+                        &self.service_curve,
+                        self.mount.as_ref().map(|mount| mount.daemon_pid),
+                    )
+                {
+                    Ok(())
+                } else {
+                    Err(
+                        "scrub foreground-read runtime row reported pass without complete read-isolation evidence"
+                            .to_string(),
+                    )
+                }
+            }
+            ValidationStatus::EnvironmentRefusal => Ok(()),
             ValidationStatus::ProductFail => Err(format!(
                 "scrub foreground-read runtime row found product failure: {:?}",
                 self.foreground_read.failures
             )),
-            ValidationStatus::HarnessFail => {
-                Err("scrub foreground-read runtime row reported a harness failure".to_string())
-            }
+            ValidationStatus::HarnessFail => Err(
+                "scrub foreground-read runtime harness did not record mounted-userspace scrub activity"
+                    .to_string(),
+            ),
             ValidationStatus::Skip => {
                 Err("scrub foreground-read runtime row unexpectedly skipped".to_string())
             }
@@ -100,6 +124,21 @@ pub struct RuntimeEnvironmentEvidence {
     pub dev_fuse_present: bool,
     pub daemon_bin: Option<String>,
     pub environment_refusal: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdmissionStateEvidence {
+    pub environment_refusal: Option<String>,
+    pub environment_refused: bool,
+    pub foreground_read_admitted_by_service_curve: bool,
+    pub foreground_read_refused_by_service_curve: bool,
+    pub scrub_units_requested: u32,
+    pub scrub_unit_admitted_by_service_curve: bool,
+    pub scrub_unit_refused_by_service_curve: bool,
+    pub scrub_units_admitted_by_service_curve: u32,
+    pub scrub_units_deferred_by_service_curve: u32,
+    pub scrub_work_deferred_by_service_curve: bool,
+    pub max_scrub_queue_depth: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -132,6 +171,8 @@ pub struct ForegroundReadEvidence {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ScrubActivityEvidence {
+    pub observation_tier: ValidationTier,
+    pub daemon_runtime: Option<DaemonScrubRuntimeObservation>,
     pub background_scrub_configured: bool,
     pub background_scrub_interval_secs: u64,
     pub scrub_units_requested: u32,
@@ -148,7 +189,20 @@ pub struct ScrubActivityEvidence {
     pub throttle_count: u64,
     pub throttle_observed: bool,
     pub backoff_millis: u64,
-    pub pending_or_rate_limited_during_read: bool,
+    pub pending_and_rate_limited_during_read: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonScrubRuntimeObservation {
+    pub daemon_pid: u32,
+    pub cycles_admitted_before_read: Option<u64>,
+    pub cycles_admitted: u64,
+    pub records_verified: u64,
+    pub bytes_scanned: u64,
+    pub work_pending_before_read: Option<bool>,
+    pub work_pending_after_read: Option<bool>,
+    pub throttle_count_before_read: Option<u64>,
+    pub throttle_count: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -162,30 +216,80 @@ pub struct RateLimitAttemptEvidence {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OracleConfigEvidence {
+    pub source_contract: String,
+    pub scrub_units: u32,
+    pub read_arrival_tick: u64,
+    pub max_foreground_read_wait_ticks: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServiceCurveEvidence {
+    pub source_contract: String,
+    pub scheduled_oracle: String,
+    pub unscheduled_counterexample: String,
+    pub oracle_config: OracleConfigEvidence,
     pub foreground_read_work_class: String,
     pub foreground_read_domain: String,
     pub foreground_max_ops_per_tick: u32,
     pub foreground_max_bytes_per_tick: u64,
     pub foreground_queue_slots: u32,
+    pub foreground_read_admitted_by_service_curve: bool,
     pub scrub_work_class: String,
     pub scrub_domain: String,
     pub scrub_max_ops_per_tick: u32,
     pub scrub_max_bytes_per_tick: u64,
     pub scrub_queue_slots: u32,
+    pub scrub_unit_admitted_by_service_curve: bool,
     pub scrub_units_requested: u32,
     pub foreground_read_arrival_tick: u64,
     pub foreground_read_completed_tick: u64,
     pub foreground_read_wait_ticks: u64,
     pub max_foreground_read_wait_ticks: u64,
     pub foreground_read_within_bound: bool,
+    pub scheduled_scrub_admitted: u32,
+    pub scheduled_scrub_deferred: u32,
+    pub scheduled_max_scrub_queue_depth: u32,
+    pub unscheduled_foreground_read_completed_tick: u64,
+    pub unscheduled_foreground_read_wait_ticks: u64,
+    pub unscheduled_foreground_read_within_bound: bool,
+    pub unscheduled_scrub_admitted: u32,
+    pub unscheduled_scrub_deferred: u32,
+    pub unscheduled_max_scrub_queue_depth: u32,
+}
+
+struct MountHarnessBuildFailure {
+    outcome: ValidationStatus,
+    environment_refusal: Option<String>,
+    foreground_read: ForegroundReadEvidence,
+}
+
+fn mount_harness_build_failure(
+    error: &std::io::Error,
+    service_curve_wait_bound_ticks: u64,
+) -> MountHarnessBuildFailure {
+    if is_pre_mount_setup_failure(error) {
+        MountHarnessBuildFailure {
+            outcome: ValidationStatus::HarnessFail,
+            environment_refusal: None,
+            foreground_read: ForegroundReadEvidence::not_run_with_failure(
+                service_curve_wait_bound_ticks,
+                error.to_string(),
+            ),
+        }
+    } else {
+        MountHarnessBuildFailure {
+            outcome: ValidationStatus::EnvironmentRefusal,
+            environment_refusal: Some(format!("mount harness refused: {error}")),
+            foreground_read: ForegroundReadEvidence::not_run(service_curve_wait_bound_ticks),
+        }
+    }
 }
 
 pub fn run_scrub_foreground_read_runtime(command: String) -> ScrubForegroundReadRuntimeEvidence {
     let generated_at = generated_at();
     let source_ref = source_ref();
     let run_id = workflow_run_id();
-    let scrub_model = build_scrub_activity();
     let service_curve = build_service_curve();
     let dev_fuse_present = Path::new("/dev/fuse").exists();
     let daemon_bin_result = find_daemon_binary();
@@ -213,7 +317,7 @@ pub fn run_scrub_foreground_read_runtime(command: String) -> ScrubForegroundRead
             foreground_read: ForegroundReadEvidence::not_run(
                 service_curve.max_foreground_read_wait_ticks,
             ),
-            scrub_activity: scrub_model,
+            scrub_activity: scrub_activity_not_run(&service_curve),
             service_curve,
         });
     }
@@ -233,7 +337,7 @@ pub fn run_scrub_foreground_read_runtime(command: String) -> ScrubForegroundRead
                 foreground_read: ForegroundReadEvidence::not_run(
                     service_curve.max_foreground_read_wait_ticks,
                 ),
-                scrub_activity: scrub_model,
+                scrub_activity: scrub_activity_not_run(&service_curve),
                 service_curve,
             });
         }
@@ -242,23 +346,25 @@ pub fn run_scrub_foreground_read_runtime(command: String) -> ScrubForegroundRead
     let harness = MountHarness::builder()
         .daemon_bin(daemon_path)
         .extra_args(&["--background-scrub-interval", "1"])
+        .scrub_runtime_observation()
+        .pre_mount_setup(seed_foreground_read_and_scrub_backlog)
         .build();
     let harness = match harness {
         Ok(harness) => harness,
         Err(error) => {
-            environment.environment_refusal = Some(format!("mount harness refused: {error}"));
+            let failure =
+                mount_harness_build_failure(&error, service_curve.max_foreground_read_wait_ticks);
+            environment.environment_refusal = failure.environment_refusal;
             return base_evidence(BaseEvidenceInput {
-                outcome: ValidationStatus::EnvironmentRefusal,
+                outcome: failure.outcome,
                 command,
                 generated_at,
                 run_id,
                 source_ref,
                 environment,
                 mount: None,
-                foreground_read: ForegroundReadEvidence::not_run(
-                    service_curve.max_foreground_read_wait_ticks,
-                ),
-                scrub_activity: scrub_model,
+                foreground_read: failure.foreground_read,
+                scrub_activity: scrub_activity_not_run(&service_curve),
                 service_curve,
             });
         }
@@ -280,7 +386,7 @@ pub fn run_scrub_foreground_read_runtime(command: String) -> ScrubForegroundRead
                     service_curve.max_foreground_read_wait_ticks,
                     error,
                 ),
-                scrub_activity: scrub_model,
+                scrub_activity: scrub_activity_not_run(&service_curve),
                 service_curve,
             });
         }
@@ -293,15 +399,68 @@ pub fn run_scrub_foreground_read_runtime(command: String) -> ScrubForegroundRead
         background_scrub_interval_secs: BACKGROUND_SCRUB_INTERVAL_SECS,
         statfs_type_hex: format!("0x{mount_f_type:x}"),
     };
-    let foreground_read = run_foreground_read(&harness, &service_curve);
-    let outcome = if foreground_read.passed
-        && scrub_model.pending_or_rate_limited_during_read
-        && service_curve.foreground_read_within_bound
-    {
-        ValidationStatus::Pass
-    } else {
-        ValidationStatus::ProductFail
+    let scrub_runtime_observation_path = harness.scrub_runtime_observation_path();
+    let scrub_service_ready_error = match scrub_runtime_observation_path {
+        Some(path) => wait_for_initial_scrub_runtime_observation(
+            path,
+            mount.daemon_pid,
+            Duration::from_secs(DAEMON_SCRUB_OBSERVATION_TIMEOUT_SECS),
+        )
+        .err(),
+        None => Some("mounted scrub runtime observation path is unavailable".to_string()),
     };
+    let mounted_fixture_error = scrub_service_ready_error;
+    let pre_read_daemon_observation = if mounted_fixture_error.is_none() {
+        scrub_runtime_observation_path.and_then(|path| {
+            match wait_for_pending_scrub_runtime_observation(
+                path,
+                1,
+                1,
+                Duration::from_secs(DAEMON_SCRUB_OBSERVATION_TIMEOUT_SECS),
+            ) {
+                Ok(observation) => Some(observation),
+                Err(error) => {
+                    eprintln!("pre-read daemon scrub observation unavailable: {error}");
+                    None
+                }
+            }
+        })
+    } else {
+        None
+    };
+    let scrub_activity = ScrubActivityWindow::begin();
+    let foreground_read =
+        run_foreground_read(&harness, &service_curve, mounted_fixture_error.as_deref());
+    let post_read_daemon_observation = scrub_runtime_observation_path.and_then(|path| {
+        let before_read = pre_read_daemon_observation.as_ref()?;
+        match read_post_read_scrub_runtime_observation(path, before_read) {
+            Ok(observation) => Some(observation),
+            Err(error) => {
+                eprintln!("post-read daemon scrub observation unavailable: {error}");
+                None
+            }
+        }
+    });
+    let mut scrub_model = scrub_activity.finish(&service_curve, foreground_read.workload_ran);
+    if let Some(post_read) = post_read_daemon_observation.as_ref() {
+        let daemon_runtime =
+            daemon_runtime_observation(pre_read_daemon_observation.as_ref(), post_read);
+        if daemon_scrub_observation_matches_mount(&daemon_runtime, Some(mount.daemon_pid))
+            && daemon_scrub_observation_has_isolation_window(&daemon_runtime)
+        {
+            scrub_model.observation_tier = ValidationTier::MountedUserspace;
+            scrub_model.throttle_count = daemon_runtime.throttle_count;
+            scrub_model.throttle_observed = true;
+            scrub_model.pending_and_rate_limited_during_read = true;
+        }
+        scrub_model.daemon_runtime = Some(daemon_runtime);
+    }
+    let outcome = classify_runtime_outcome(
+        &foreground_read,
+        &scrub_model,
+        &service_curve,
+        Some(mount.daemon_pid),
+    );
 
     base_evidence(BaseEvidenceInput {
         outcome,
@@ -317,6 +476,158 @@ pub fn run_scrub_foreground_read_runtime(command: String) -> ScrubForegroundRead
     })
 }
 
+fn read_scrub_runtime_observation(path: &Path) -> Result<ScrubRuntimeObservation, String> {
+    let bytes = fs::read(path).map_err(|error| format!("read {}: {error}", path.display()))?;
+    let observation: ScrubRuntimeObservation = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("decode {}: {error}", path.display()))?;
+    if observation.schema_version != ScrubRuntimeObservation::SCHEMA_VERSION {
+        return Err(format!(
+            "{} has scrub runtime observation schema {}, expected {}",
+            path.display(),
+            observation.schema_version,
+            ScrubRuntimeObservation::SCHEMA_VERSION
+        ));
+    }
+    if observation.daemon_pid == 0 {
+        return Err(format!("{} has invalid zero daemon pid", path.display()));
+    }
+    Ok(observation)
+}
+
+fn wait_for_initial_scrub_runtime_observation(
+    path: &Path,
+    expected_daemon_pid: u32,
+    timeout: Duration,
+) -> Result<ScrubRuntimeObservation, String> {
+    let start = Instant::now();
+    loop {
+        let last_observation = match read_scrub_runtime_observation(path) {
+            Ok(observation) if observation.daemon_pid == expected_daemon_pid => {
+                return Ok(observation);
+            }
+            Ok(observation) => format!(
+                "daemon_pid={} (expected mounted daemon pid {expected_daemon_pid})",
+                observation.daemon_pid,
+            ),
+            Err(error) => error,
+        };
+        if start.elapsed() >= timeout {
+            return Err(format!(
+                "timed out after {}s waiting for initial observation from mounted daemon at {}: {last_observation}",
+                timeout.as_secs(),
+                path.display()
+            ));
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn wait_for_pending_scrub_runtime_observation(
+    path: &Path,
+    minimum_cycles: u64,
+    minimum_throttle_count: u64,
+    timeout: Duration,
+) -> Result<ScrubRuntimeObservation, String> {
+    let start = Instant::now();
+    loop {
+        let last_observation = match read_scrub_runtime_observation(path) {
+            Ok(observation)
+                if observation.cycles_admitted >= minimum_cycles
+                    && observation.work_pending
+                    && observation.throttle_count >= minimum_throttle_count =>
+            {
+                return Ok(observation);
+            }
+            Ok(observation) => format!(
+                "cycles_admitted={} work_pending={} throttle_count={} \
+                 (need cycles >= {minimum_cycles}, pending, throttle >= {minimum_throttle_count})",
+                observation.cycles_admitted, observation.work_pending, observation.throttle_count,
+            ),
+            Err(error) => error,
+        };
+        if start.elapsed() >= timeout {
+            return Err(format!(
+                "timed out after {}s waiting for {}: {last_observation}",
+                timeout.as_secs(),
+                path.display()
+            ));
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn read_post_read_scrub_runtime_observation(
+    path: &Path,
+    before_read: &ScrubRuntimeObservation,
+) -> Result<ScrubRuntimeObservation, String> {
+    let after_read = read_scrub_runtime_observation(path)?;
+    if after_read.daemon_pid != before_read.daemon_pid {
+        return Err(format!(
+            "{} changed daemon pid across the read: before={} after={}",
+            path.display(),
+            before_read.daemon_pid,
+            after_read.daemon_pid,
+        ));
+    }
+    if after_read.cycles_admitted != before_read.cycles_admitted {
+        return Err(format!(
+            "{} changed scrub tick across the read: before={} after={}",
+            path.display(),
+            before_read.cycles_admitted,
+            after_read.cycles_admitted,
+        ));
+    }
+    if !after_read.work_pending {
+        return Err(format!(
+            "{} no longer reported scrub work pending after the read",
+            path.display(),
+        ));
+    }
+    if after_read.throttle_count < before_read.throttle_count {
+        return Err(format!(
+            "{} regressed scrub throttle count across the read: before={} after={}",
+            path.display(),
+            before_read.throttle_count,
+            after_read.throttle_count,
+        ));
+    }
+    Ok(after_read)
+}
+
+fn daemon_runtime_observation(
+    before_read: Option<&ScrubRuntimeObservation>,
+    after_read: &ScrubRuntimeObservation,
+) -> DaemonScrubRuntimeObservation {
+    let matching_before = before_read.filter(|observation| {
+        observation.daemon_pid == after_read.daemon_pid
+            && observation.cycles_admitted == after_read.cycles_admitted
+    });
+    DaemonScrubRuntimeObservation {
+        daemon_pid: after_read.daemon_pid,
+        cycles_admitted_before_read: matching_before.map(|observation| observation.cycles_admitted),
+        cycles_admitted: after_read.cycles_admitted,
+        records_verified: after_read.records_verified,
+        bytes_scanned: after_read.bytes_scanned,
+        work_pending_before_read: matching_before.map(|observation| observation.work_pending),
+        work_pending_after_read: Some(after_read.work_pending),
+        throttle_count_before_read: matching_before.map(|observation| observation.throttle_count),
+        throttle_count: after_read.throttle_count,
+    }
+}
+
+fn daemon_scrub_observation_has_isolation_window(
+    observation: &DaemonScrubRuntimeObservation,
+) -> bool {
+    observation.cycles_admitted > 0
+        && observation.cycles_admitted_before_read == Some(observation.cycles_admitted)
+        && observation.records_verified > 0
+        && observation.work_pending_before_read == Some(true)
+        && observation.work_pending_after_read == Some(true)
+        && observation
+            .throttle_count_before_read
+            .is_some_and(|before| before > 0 && observation.throttle_count >= before)
+}
+
 pub fn build_evidence_manifest(
     evidence: &ScrubForegroundReadRuntimeEvidence,
     artifact_bytes: &[u8],
@@ -326,14 +637,7 @@ pub fn build_evidence_manifest(
         claim_id: SCRUB_READ_PRIMARY_CLAIM_ID.to_string(),
         evidence_class: SCRUB_READ_EVIDENCE_CLASS.to_string(),
         validation_tier: ValidationTier::MountedUserspace,
-        scope: format!(
-            "row={} supported_claims={} non_claims={} outcome={:?} artifact={}",
-            evidence.row_id,
-            evidence.supported_claims.join(","),
-            evidence.non_claims.join("; "),
-            evidence.outcome,
-            SCRUB_READ_RUNTIME_ARTIFACT
-        ),
+        scope: evidence_manifest_scope(evidence),
         artifact_path: SCRUB_READ_RUNTIME_ARTIFACT.to_string(),
         content_digest: content_digest_for_bytes(artifact_bytes),
         run_id: evidence.run_id.clone(),
@@ -342,7 +646,106 @@ pub fn build_evidence_manifest(
         residual_risk: SCRUB_READ_RESIDUAL_RISK.to_string(),
         source: SOURCE_LABEL.to_string(),
         generated_at: evidence.generated_at.clone(),
-        blocking_issues: Vec::<BlockingIssueRef>::new(),
+        blocking_issues: evidence_manifest_blocking_issues(evidence.passed),
+    }
+}
+
+fn evidence_manifest_blocking_issues(passed: bool) -> Vec<BlockingIssueRef> {
+    if passed {
+        Vec::new()
+    } else {
+        vec![BlockingIssueRef {
+            repo: Some(BLOCKING_ISSUE_REPO.to_string()),
+            number: BLOCKING_ISSUE_NUMBER,
+            reason: Some(BLOCKING_ISSUE_REASON.to_string()),
+        }]
+    }
+}
+
+fn evidence_manifest_scope(evidence: &ScrubForegroundReadRuntimeEvidence) -> String {
+    let admission = &evidence.admission_state;
+    let service_curve = &evidence.service_curve;
+    let daemon_runtime = evidence.scrub_activity.daemon_runtime.as_ref();
+    let mounted_daemon_pid = evidence.mount.as_ref().map(|mount| mount.daemon_pid);
+    let daemon_scrub_pid_matches_mount = daemon_runtime.is_some_and(|observation| {
+        daemon_scrub_observation_matches_mount(observation, mounted_daemon_pid)
+    });
+    format!(
+        concat!(
+            "row={} supported_claims={} non_claims={} outcome={:?} artifact={} ",
+            "claim_status_change={} product_wording_change={} environment_refused={} ",
+            "scrub_activity_observation_tier={} ",
+            "daemon_scrub_runtime_observed={} ",
+            "daemon_scrub_cycles_admitted_before_read={} daemon_scrub_cycles_admitted={} ",
+            "daemon_scrub_records_verified={} daemon_scrub_bytes_scanned={} ",
+            "mounted_daemon_pid={} daemon_scrub_observation_pid={} ",
+            "daemon_scrub_pid_matches_mount={} ",
+            "daemon_scrub_work_pending_before_read={} ",
+            "daemon_scrub_work_pending_after_read={} ",
+            "daemon_scrub_throttle_count_before_read={} daemon_scrub_throttle_count={} ",
+            "foreground_read_admitted_by_service_curve={} ",
+            "foreground_read_refused_by_service_curve={} scrub_units_requested={} ",
+            "scrub_units_admitted_by_service_curve={} ",
+            "scrub_units_deferred_by_service_curve={} ",
+            "scrub_work_deferred_by_service_curve={} max_scrub_queue_depth={} ",
+            "foreground_read_within_bound={} ",
+            "unscheduled_foreground_read_within_bound={} ",
+            "scheduled_max_scrub_queue_depth={} ",
+            "unscheduled_max_scrub_queue_depth={}"
+        ),
+        evidence.row_id,
+        evidence.supported_claims.join(","),
+        evidence.non_claims.join("; "),
+        evidence.outcome,
+        SCRUB_READ_RUNTIME_ARTIFACT,
+        evidence.claim_status_change,
+        evidence.product_wording_change,
+        admission.environment_refused,
+        evidence.scrub_activity.observation_tier.label(),
+        daemon_runtime.is_some(),
+        daemon_runtime.map_or_else(
+            || "none".to_string(),
+            |observation| observation
+                .cycles_admitted_before_read
+                .map_or_else(|| "none".to_string(), |cycles| cycles.to_string())
+        ),
+        daemon_runtime.map_or(0, |observation| observation.cycles_admitted),
+        daemon_runtime.map_or(0, |observation| observation.records_verified),
+        daemon_runtime.map_or(0, |observation| observation.bytes_scanned),
+        mounted_daemon_pid.map_or_else(|| "none".to_string(), |pid| pid.to_string()),
+        daemon_runtime.map_or_else(
+            || "none".to_string(),
+            |observation| observation.daemon_pid.to_string()
+        ),
+        daemon_scrub_pid_matches_mount,
+        observed_bool(daemon_runtime.and_then(|observation| observation.work_pending_before_read)),
+        observed_bool(daemon_runtime.and_then(|observation| observation.work_pending_after_read)),
+        daemon_runtime.map_or_else(
+            || "none".to_string(),
+            |observation| observation
+                .throttle_count_before_read
+                .map_or_else(|| "none".to_string(), |count| count.to_string())
+        ),
+        daemon_runtime.map_or(0, |observation| observation.throttle_count),
+        admission.foreground_read_admitted_by_service_curve,
+        admission.foreground_read_refused_by_service_curve,
+        admission.scrub_units_requested,
+        admission.scrub_units_admitted_by_service_curve,
+        admission.scrub_units_deferred_by_service_curve,
+        admission.scrub_work_deferred_by_service_curve,
+        admission.max_scrub_queue_depth,
+        service_curve.foreground_read_within_bound,
+        service_curve.unscheduled_foreground_read_within_bound,
+        service_curve.scheduled_max_scrub_queue_depth,
+        service_curve.unscheduled_max_scrub_queue_depth
+    )
+}
+
+fn observed_bool(value: Option<bool>) -> &'static str {
+    match value {
+        Some(true) => "true",
+        Some(false) => "false",
+        None => "unknown",
     }
 }
 
@@ -373,10 +776,15 @@ fn base_evidence(input: BaseEvidenceInput) -> ScrubForegroundReadRuntimeEvidence
         service_curve,
     } = input;
     let workload_ran = foreground_read.workload_ran;
+    let mounted_daemon_pid = mount.as_ref().map(|mount| mount.daemon_pid);
     let passed = outcome == ValidationStatus::Pass
-        && foreground_read.passed
-        && scrub_activity.pending_or_rate_limited_during_read
-        && service_curve.foreground_read_within_bound;
+        && scrub_read_isolation_passed(
+            &foreground_read,
+            &scrub_activity,
+            &service_curve,
+            mounted_daemon_pid,
+        );
+    let admission_state = build_admission_state(&environment, &scrub_activity, &service_curve);
     ScrubForegroundReadRuntimeEvidence {
         manifest_version: 1,
         row_id: SCRUB_FOREGROUND_READ_ROW_ID.to_string(),
@@ -423,47 +831,127 @@ fn base_evidence(input: BaseEvidenceInput) -> ScrubForegroundReadRuntimeEvidence
         foreground_read,
         scrub_activity,
         service_curve,
+        admission_state,
         passed,
     }
 }
 
-fn build_scrub_activity() -> ScrubActivityEvidence {
-    let scrub_admitted = SCRUB_UNITS_REQUESTED.min(SCRUB_QUEUE_SLOTS);
-    let scrub_deferred = SCRUB_UNITS_REQUESTED.saturating_sub(scrub_admitted);
-    let mut limiter = DeterministicScrubLimiter::new(SCRUB_LIMIT_BYTES_PER_SEC, SCRUB_LIMIT_IOPS);
-    let first = rate_limit_attempt(&mut limiter, "pre-read-scrub-dispatch");
-    let pending_before_read = if first.accepted {
-        SCRUB_UNITS_REQUESTED.saturating_sub(1)
-    } else {
-        SCRUB_UNITS_REQUESTED
-    };
-    let second = rate_limit_attempt(&mut limiter, "post-read-scrub-retry");
-    let pending_after_read = if second.accepted {
-        pending_before_read.saturating_sub(1)
-    } else {
-        pending_before_read
-    };
-    let throttle_count = limiter.throttled_count();
-    let throttle_observed = throttle_count > 0 || !first.accepted || !second.accepted;
+fn build_admission_state(
+    environment: &RuntimeEnvironmentEvidence,
+    scrub_activity: &ScrubActivityEvidence,
+    service_curve: &ServiceCurveEvidence,
+) -> AdmissionStateEvidence {
+    AdmissionStateEvidence {
+        environment_refusal: environment.environment_refusal.clone(),
+        environment_refused: environment.environment_refusal.is_some(),
+        foreground_read_admitted_by_service_curve: service_curve
+            .foreground_read_admitted_by_service_curve,
+        foreground_read_refused_by_service_curve: !service_curve
+            .foreground_read_admitted_by_service_curve,
+        scrub_units_requested: scrub_activity.scrub_units_requested,
+        scrub_unit_admitted_by_service_curve: service_curve.scrub_unit_admitted_by_service_curve,
+        scrub_unit_refused_by_service_curve: !service_curve.scrub_unit_admitted_by_service_curve,
+        scrub_units_admitted_by_service_curve: scrub_activity.scrub_admitted_by_service_curve,
+        scrub_units_deferred_by_service_curve: scrub_activity.scrub_deferred_by_service_curve,
+        scrub_work_deferred_by_service_curve: scrub_activity.scrub_deferred_by_service_curve > 0,
+        max_scrub_queue_depth: scrub_activity.max_scrub_queue_depth,
+    }
+}
+
+fn scrub_activity_not_run(service_curve: &ServiceCurveEvidence) -> ScrubActivityEvidence {
     ScrubActivityEvidence {
-        background_scrub_configured: true,
+        observation_tier: ValidationTier::SourceModel,
+        daemon_runtime: None,
+        background_scrub_configured: false,
         background_scrub_interval_secs: BACKGROUND_SCRUB_INTERVAL_SECS,
         scrub_units_requested: SCRUB_UNITS_REQUESTED,
         scrub_unit_bytes: SCRUB_UNIT_BYTES,
-        pending_units_before_read: pending_before_read,
-        pending_units_after_read: pending_after_read,
-        max_scrub_queue_depth: scrub_admitted,
-        scrub_admitted_by_service_curve: scrub_admitted,
-        scrub_deferred_by_service_curve: scrub_deferred,
-        rate_limiter_active: limiter.is_active(),
+        pending_units_before_read: 0,
+        pending_units_after_read: 0,
+        max_scrub_queue_depth: service_curve.scheduled_max_scrub_queue_depth,
+        scrub_admitted_by_service_curve: service_curve.scheduled_scrub_admitted,
+        scrub_deferred_by_service_curve: service_curve.scheduled_scrub_deferred,
+        rate_limiter_active: false,
         rate_limiter_bytes_per_sec: SCRUB_LIMIT_BYTES_PER_SEC,
         rate_limiter_iops: SCRUB_LIMIT_IOPS,
-        rate_limit_attempts: vec![first, second],
-        throttle_count,
-        throttle_observed,
+        rate_limit_attempts: Vec::new(),
+        throttle_count: 0,
+        throttle_observed: false,
         backoff_millis: SCRUB_BACKOFF_MILLIS,
-        pending_or_rate_limited_during_read: pending_after_read > 0 && throttle_observed,
+        pending_and_rate_limited_during_read: false,
     }
+}
+
+#[derive(Debug)]
+struct ScrubActivityWindow {
+    limiter: DeterministicScrubLimiter,
+    pre_read_attempt: RateLimitAttemptEvidence,
+    pending_before_read: u32,
+}
+
+impl ScrubActivityWindow {
+    fn begin() -> Self {
+        let mut limiter =
+            DeterministicScrubLimiter::new(SCRUB_LIMIT_BYTES_PER_SEC, SCRUB_LIMIT_IOPS);
+        let pre_read_attempt = rate_limit_attempt(&mut limiter, "pre-read-scrub-dispatch");
+        let pending_before_read = if pre_read_attempt.accepted {
+            SCRUB_UNITS_REQUESTED.saturating_sub(1)
+        } else {
+            SCRUB_UNITS_REQUESTED
+        };
+        Self {
+            limiter,
+            pre_read_attempt,
+            pending_before_read,
+        }
+    }
+
+    fn finish(
+        mut self,
+        service_curve: &ServiceCurveEvidence,
+        foreground_read_ran: bool,
+    ) -> ScrubActivityEvidence {
+        let post_read_attempt = rate_limit_attempt(&mut self.limiter, "post-read-scrub-retry");
+        let pending_after_read = if post_read_attempt.accepted {
+            self.pending_before_read.saturating_sub(1)
+        } else {
+            self.pending_before_read
+        };
+        let throttle_count = self.limiter.throttled_count();
+        let throttle_observed =
+            throttle_count > 0 || !self.pre_read_attempt.accepted || !post_read_attempt.accepted;
+        ScrubActivityEvidence {
+            observation_tier: ValidationTier::HarnessOnly,
+            daemon_runtime: None,
+            background_scrub_configured: true,
+            background_scrub_interval_secs: BACKGROUND_SCRUB_INTERVAL_SECS,
+            scrub_units_requested: SCRUB_UNITS_REQUESTED,
+            scrub_unit_bytes: SCRUB_UNIT_BYTES,
+            pending_units_before_read: self.pending_before_read,
+            pending_units_after_read: pending_after_read,
+            max_scrub_queue_depth: service_curve.scheduled_max_scrub_queue_depth,
+            scrub_admitted_by_service_curve: service_curve.scheduled_scrub_admitted,
+            scrub_deferred_by_service_curve: service_curve.scheduled_scrub_deferred,
+            rate_limiter_active: self.limiter.is_active(),
+            rate_limiter_bytes_per_sec: SCRUB_LIMIT_BYTES_PER_SEC,
+            rate_limiter_iops: SCRUB_LIMIT_IOPS,
+            rate_limit_attempts: vec![self.pre_read_attempt, post_read_attempt],
+            throttle_count,
+            throttle_observed,
+            backoff_millis: SCRUB_BACKOFF_MILLIS,
+            pending_and_rate_limited_during_read: foreground_read_ran
+                && self.pending_before_read > 0
+                && pending_after_read > 0
+                && throttle_observed,
+        }
+    }
+}
+
+#[cfg(test)]
+fn scrub_activity_for_completed_read(
+    service_curve: &ServiceCurveEvidence,
+) -> ScrubActivityEvidence {
+    ScrubActivityWindow::begin().finish(service_curve, true)
 }
 
 #[derive(Debug)]
@@ -529,39 +1017,132 @@ fn rate_limit_attempt(
 }
 
 fn build_service_curve() -> ServiceCurveEvidence {
-    let foreground_read_completed_tick = FOREGROUND_READ_ARRIVAL_TICK;
-    let foreground_read_wait_ticks =
-        foreground_read_completed_tick.saturating_sub(FOREGROUND_READ_ARRIVAL_TICK);
+    let config = scrub_read_oracle_config();
+    let foreground = ServiceCurve::FOREGROUND_READ_DEFAULT;
+    let scrub = ServiceCurve::SCRUB_BOUNDED_DEFAULT;
+    let scheduled = with_scheduling_and_admission(config, foreground, scrub);
+    let unscheduled = without_scheduling_or_admission(config);
     ServiceCurveEvidence {
-        foreground_read_work_class: FOREGROUND_READ_WORK_CLASS.to_string(),
-        foreground_read_domain: FOREGROUND_READ_DOMAIN.to_string(),
-        foreground_max_ops_per_tick: FOREGROUND_READ_MAX_OPS_PER_TICK,
-        foreground_max_bytes_per_tick: FOREGROUND_READ_MAX_BYTES_PER_TICK,
-        foreground_queue_slots: FOREGROUND_READ_QUEUE_SLOTS,
-        scrub_work_class: SCRUB_WORK_CLASS.to_string(),
-        scrub_domain: SCRUB_DOMAIN.to_string(),
-        scrub_max_ops_per_tick: SCRUB_MAX_OPS_PER_TICK,
-        scrub_max_bytes_per_tick: SCRUB_MAX_BYTES_PER_TICK,
-        scrub_queue_slots: SCRUB_QUEUE_SLOTS,
-        scrub_units_requested: SCRUB_UNITS_REQUESTED,
-        foreground_read_arrival_tick: FOREGROUND_READ_ARRIVAL_TICK,
-        foreground_read_completed_tick,
-        foreground_read_wait_ticks,
+        source_contract: "tidefs-performance-contract::ServiceCurve".to_string(),
+        scheduled_oracle: "tidefs-performance-contract::oracle::with_scheduling_and_admission"
+            .to_string(),
+        unscheduled_counterexample:
+            "tidefs-performance-contract::oracle::without_scheduling_or_admission".to_string(),
+        oracle_config: OracleConfigEvidence {
+            source_contract: "tidefs-performance-contract::oracle::OracleConfig".to_string(),
+            scrub_units: config.scrub_units,
+            read_arrival_tick: config.read_arrival_tick,
+            max_foreground_read_wait_ticks: config.max_foreground_read_wait_ticks,
+        },
+        foreground_read_work_class: foreground.work_class.as_str().to_string(),
+        foreground_read_domain: foreground.primary_domain.as_str().to_string(),
+        foreground_max_ops_per_tick: foreground.max_ops_per_tick,
+        foreground_max_bytes_per_tick: foreground.max_bytes_per_tick,
+        foreground_queue_slots: foreground.queue_slots,
+        foreground_read_admitted_by_service_curve: foreground.admits(
+            foreground.work_class,
+            1,
+            FOREGROUND_READ_BYTES as u64,
+        ),
+        scrub_work_class: scrub.work_class.as_str().to_string(),
+        scrub_domain: scrub.primary_domain.as_str().to_string(),
+        scrub_max_ops_per_tick: scrub.max_ops_per_tick,
+        scrub_max_bytes_per_tick: scrub.max_bytes_per_tick,
+        scrub_queue_slots: scrub.queue_slots,
+        scrub_unit_admitted_by_service_curve: scrub.admits(scrub.work_class, 1, SCRUB_UNIT_BYTES),
+        scrub_units_requested: config.scrub_units,
+        foreground_read_arrival_tick: config.read_arrival_tick,
+        foreground_read_completed_tick: scheduled.foreground_read_completed_tick,
+        foreground_read_wait_ticks: scheduled.foreground_read_wait_ticks,
+        max_foreground_read_wait_ticks: config.max_foreground_read_wait_ticks,
+        foreground_read_within_bound: scheduled
+            .foreground_read_within_bound(config.max_foreground_read_wait_ticks),
+        scheduled_scrub_admitted: scheduled.scrub_admitted,
+        scheduled_scrub_deferred: scheduled.scrub_deferred,
+        scheduled_max_scrub_queue_depth: scheduled.max_scrub_queue_depth,
+        unscheduled_foreground_read_completed_tick: unscheduled.foreground_read_completed_tick,
+        unscheduled_foreground_read_wait_ticks: unscheduled.foreground_read_wait_ticks,
+        unscheduled_foreground_read_within_bound: unscheduled
+            .foreground_read_within_bound(config.max_foreground_read_wait_ticks),
+        unscheduled_scrub_admitted: unscheduled.scrub_admitted,
+        unscheduled_scrub_deferred: unscheduled.scrub_deferred,
+        unscheduled_max_scrub_queue_depth: unscheduled.max_scrub_queue_depth,
+    }
+}
+
+fn scrub_read_oracle_config() -> OracleConfig {
+    OracleConfig {
+        scrub_units: SCRUB_UNITS_REQUESTED,
+        read_arrival_tick: FOREGROUND_READ_ARRIVAL_TICK,
         max_foreground_read_wait_ticks: MAX_FOREGROUND_READ_WAIT_TICKS,
-        foreground_read_within_bound: foreground_read_wait_ticks <= MAX_FOREGROUND_READ_WAIT_TICKS,
+    }
+}
+
+fn scrub_read_isolation_passed(
+    foreground_read: &ForegroundReadEvidence,
+    scrub_activity: &ScrubActivityEvidence,
+    service_curve: &ServiceCurveEvidence,
+    mounted_daemon_pid: Option<u32>,
+) -> bool {
+    let daemon_runtime_observed =
+        scrub_activity
+            .daemon_runtime
+            .as_ref()
+            .is_some_and(|observation| {
+                daemon_scrub_observation_matches_mount(observation, mounted_daemon_pid)
+                    && daemon_scrub_observation_has_isolation_window(observation)
+            });
+    foreground_read.passed
+        && scrub_activity.observation_tier == ValidationTier::MountedUserspace
+        && daemon_runtime_observed
+        && scrub_activity.background_scrub_configured
+        && scrub_activity.pending_and_rate_limited_during_read
+        && scrub_activity.scrub_deferred_by_service_curve > 0
+        && scrub_activity.throttle_observed
+        && service_curve.foreground_read_admitted_by_service_curve
+        && service_curve.scrub_unit_admitted_by_service_curve
+        && service_curve.foreground_read_within_bound
+        && !service_curve.unscheduled_foreground_read_within_bound
+}
+
+fn daemon_scrub_observation_matches_mount(
+    observation: &DaemonScrubRuntimeObservation,
+    mounted_daemon_pid: Option<u32>,
+) -> bool {
+    mounted_daemon_pid == Some(observation.daemon_pid)
+}
+
+fn classify_runtime_outcome(
+    foreground_read: &ForegroundReadEvidence,
+    scrub_activity: &ScrubActivityEvidence,
+    service_curve: &ServiceCurveEvidence,
+    mounted_daemon_pid: Option<u32>,
+) -> ValidationStatus {
+    if !foreground_read.passed {
+        ValidationStatus::ProductFail
+    } else if scrub_read_isolation_passed(
+        foreground_read,
+        scrub_activity,
+        service_curve,
+        mounted_daemon_pid,
+    ) {
+        ValidationStatus::Pass
+    } else {
+        ValidationStatus::HarnessFail
     }
 }
 
 fn run_foreground_read(
     harness: &MountHarness,
     service_curve: &ServiceCurveEvidence,
+    preparation_error: Option<&str>,
 ) -> ForegroundReadEvidence {
-    let path = "protected-foreground-read.bin";
+    let path = FOREGROUND_READ_PATH;
     let payload = deterministic_payload(FOREGROUND_READ_BYTES);
     let expected_digest = digest_hex(&payload);
     let mut failures = Vec::new();
-    if let Err(error) = harness.create_file(path, &payload) {
-        failures.push(format!("create mounted foreground-read file: {error}"));
+    if let Some(error) = preparation_error {
+        failures.push(error.to_string());
         return ForegroundReadEvidence {
             workload_ran: false,
             path: path.to_string(),
@@ -625,7 +1206,7 @@ fn run_foreground_read(
     ForegroundReadEvidence {
         workload_ran: true,
         path: path.to_string(),
-        bytes_written: payload.len(),
+        bytes_written: 0,
         read_iterations: FOREGROUND_READ_ITERATIONS,
         read_successes,
         correctness_checks,
@@ -639,6 +1220,77 @@ fn run_foreground_read(
         failures,
         passed,
     }
+}
+
+#[cfg(feature = "scrub-runtime")]
+fn seed_foreground_read_and_scrub_backlog(store_root: &Path) -> std::io::Result<()> {
+    let root_authentication_key = RootAuthenticationKey::from_hex(MOUNT_HARNESS_ROOT_AUTH_KEY_HEX)
+        .map_err(|error| {
+            std::io::Error::other(format!(
+                "parse mount harness root authentication key: {error}"
+            ))
+        })?;
+    let mut filesystem = LocalFileSystem::open_with_root_authentication_key(
+        store_root,
+        StoreOptions::default(),
+        root_authentication_key,
+    )
+    .map_err(|error| {
+        std::io::Error::other(format!("open foreground-read seed filesystem: {error}"))
+    })?;
+    let filesystem_path = format!("/{FOREGROUND_READ_PATH}");
+
+    // The mounted workload measures reads under scheduled scrub. Publish its
+    // input before mount so create/write replay and mounted durability are not
+    // accidental prerequisites or evidence for this row.
+    filesystem
+        .create_file(&filesystem_path, 0o600)
+        .map_err(|error| std::io::Error::other(format!("create foreground-read seed: {error}")))?;
+    filesystem.sync_all().map_err(|error| {
+        std::io::Error::other(format!("sync foreground-read namespace: {error}"))
+    })?;
+    filesystem
+        .write_file(
+            &filesystem_path,
+            0,
+            &deterministic_payload(FOREGROUND_READ_BYTES),
+        )
+        .map_err(|error| std::io::Error::other(format!("write foreground-read seed: {error}")))?;
+    filesystem
+        .sync_all()
+        .map_err(|error| std::io::Error::other(format!("sync foreground-read payload: {error}")))?;
+    drop(filesystem);
+
+    seed_scrub_backlog(store_root)
+}
+
+#[cfg(feature = "scrub-runtime")]
+fn seed_scrub_backlog(store_root: &Path) -> std::io::Result<()> {
+    let mut store = LocalObjectStore::open(store_root)
+        .map_err(|error| std::io::Error::other(format!("open scrub seed store: {error}")))?;
+    let mut scrub_payload = deterministic_payload(SCRUB_UNIT_BYTES as usize);
+    for unit in 0..SCRUB_UNITS_REQUESTED {
+        scrub_payload[0] = unit as u8;
+        store
+            .put_named(format!("scrub-read-backlog-{unit:02}"), &scrub_payload)
+            .map_err(|error| {
+                std::io::Error::other(format!("write scrub backlog unit {unit}: {error}"))
+            })?;
+    }
+    // The raw seed records are validation input, not a local-filesystem
+    // transaction. Make their segment bytes visible to the later scrub store
+    // without publishing a committed root for an unrelated object-store-only
+    // transaction.
+    store
+        .sync_data()
+        .map_err(|error| std::io::Error::other(format!("sync scrub seed data: {error}")))
+}
+
+#[cfg(not(feature = "scrub-runtime"))]
+fn seed_foreground_read_and_scrub_backlog(_store_root: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::other(
+        "scrub runtime validation requires the scrub-runtime feature",
+    ))
 }
 
 impl ForegroundReadEvidence {
@@ -656,7 +1308,7 @@ impl ForegroundReadEvidence {
     fn not_run_with_failures(service_curve_wait_bound_ticks: u64, failures: Vec<String>) -> Self {
         Self {
             workload_ran: false,
-            path: "protected-foreground-read.bin".to_string(),
+            path: FOREGROUND_READ_PATH.to_string(),
             bytes_written: 0,
             read_iterations: FOREGROUND_READ_ITERATIONS,
             read_successes: 0,
@@ -776,6 +1428,324 @@ mod tests {
     use super::*;
 
     #[test]
+    fn pre_mount_setup_failure_blocks_as_harness_failure() {
+        let error = match MountHarness::builder()
+            .daemon_bin("/daemon-is-not-reached-after-fixture-failure")
+            .pre_mount_setup(|_| Err(std::io::Error::other("fixture setup regression")))
+            .build()
+        {
+            Err(error) => error,
+            Ok(_) => panic!("pre-mount setup failure must stop harness construction"),
+        };
+
+        assert!(is_pre_mount_setup_failure(&error));
+        let failure = mount_harness_build_failure(&error, MAX_FOREGROUND_READ_WAIT_TICKS);
+        assert_eq!(failure.outcome, ValidationStatus::HarnessFail);
+        assert_eq!(failure.environment_refusal, None);
+        assert!(!failure.foreground_read.workload_ran);
+        assert!(!failure.foreground_read.passed);
+        assert_eq!(failure.foreground_read.failures.len(), 1);
+        assert!(failure.foreground_read.failures[0]
+            .contains("pre-mount setup failed: fixture setup regression"));
+
+        let substrate_error = std::io::Error::other("daemon spawn unavailable");
+        let refusal = mount_harness_build_failure(&substrate_error, MAX_FOREGROUND_READ_WAIT_TICKS);
+        assert_eq!(refusal.outcome, ValidationStatus::EnvironmentRefusal);
+        assert_eq!(
+            refusal.environment_refusal.as_deref(),
+            Some("mount harness refused: daemon spawn unavailable")
+        );
+        assert!(refusal.foreground_read.failures.is_empty());
+    }
+
+    fn completed_foreground_read(service_curve: &ServiceCurveEvidence) -> ForegroundReadEvidence {
+        let payload = deterministic_payload(FOREGROUND_READ_BYTES);
+        let digest = digest_hex(&payload);
+        ForegroundReadEvidence {
+            workload_ran: true,
+            path: "protected-foreground-read.bin".to_string(),
+            bytes_written: 0,
+            read_iterations: FOREGROUND_READ_ITERATIONS,
+            read_successes: FOREGROUND_READ_ITERATIONS,
+            correctness_checks: FOREGROUND_READ_ITERATIONS,
+            expected_digest: digest.clone(),
+            last_read_digest: Some(digest),
+            max_read_latency_micros: 1,
+            avg_read_latency_micros: 1,
+            service_curve_wait_bound_ticks: service_curve.max_foreground_read_wait_ticks,
+            service_curve_within_budget: true,
+            latency_budget_basis: latency_budget_basis(),
+            failures: Vec::new(),
+            passed: true,
+        }
+    }
+
+    #[test]
+    fn passed_manifest_has_no_blocking_issues() {
+        assert!(evidence_manifest_blocking_issues(true).is_empty());
+    }
+
+    #[cfg(feature = "scrub-runtime")]
+    #[test]
+    fn scrub_seed_is_visible_without_publishing_committed_root() {
+        let temp = tempfile::TempDir::new().expect("create scrub seed tempdir");
+        seed_scrub_backlog(temp.path()).expect("seed scrub backlog");
+
+        let mut options = StoreOptions::default();
+        options.background_scrub_interval_secs = 1;
+        let mut store = LocalObjectStore::open_read_only_with_options(temp.path(), options)
+            .expect("open seeded store")
+            .expect("seeded store exists");
+
+        assert_eq!(store.committed_root_u64(), None);
+        let report = store
+            .run_background_scrub_with_budget(1, SCRUB_UNIT_BYTES)
+            .expect("scrub one seeded record");
+        assert_eq!(report.records_verified, 1);
+        assert!(store.background_scrub_pending());
+    }
+
+    #[test]
+    fn raw_pass_with_harness_only_scrub_state_keeps_manifest_blocked() {
+        let service_curve = build_service_curve();
+        let environment = RuntimeEnvironmentEvidence {
+            host: "linux x86_64 kernel=test".to_string(),
+            dev_fuse_present: true,
+            daemon_bin: Some("/nix/store/test/bin/tidefs-posix-filesystem-adapter-daemon".into()),
+            environment_refusal: None,
+        };
+
+        let evidence = base_evidence(BaseEvidenceInput {
+            outcome: ValidationStatus::Pass,
+            command: "scrub_foreground_read_validation --row scrub-foreground-read-runtime"
+                .to_string(),
+            generated_at: "2026-06-29T17:30:00Z".to_string(),
+            run_id: "test-run/1".to_string(),
+            source_ref: "test-sha".to_string(),
+            environment,
+            mount: None,
+            foreground_read: completed_foreground_read(&service_curve),
+            scrub_activity: scrub_activity_for_completed_read(&service_curve),
+            service_curve,
+        });
+
+        assert_eq!(evidence.outcome, ValidationStatus::Pass);
+        assert!(evidence.foreground_read.passed);
+        assert_eq!(
+            evidence.scrub_activity.observation_tier,
+            ValidationTier::HarnessOnly
+        );
+        assert!(evidence.scrub_activity.pending_and_rate_limited_during_read);
+        assert!(!evidence.passed);
+        assert!(evidence.assert_no_product_or_harness_failure().is_err());
+
+        let manifest = build_evidence_manifest(&evidence, b"scrub evidence");
+        assert!(manifest
+            .scope
+            .contains("scrub_activity_observation_tier=harness-only"));
+        assert!(manifest.scope.contains("mounted_daemon_pid=none"));
+        assert!(manifest.scope.contains("daemon_scrub_observation_pid=none"));
+        assert!(manifest
+            .scope
+            .contains("daemon_scrub_pid_matches_mount=false"));
+        assert_eq!(manifest.blocking_issues.len(), 1);
+        assert_eq!(
+            manifest.blocking_issues[0].repo.as_deref(),
+            Some(BLOCKING_ISSUE_REPO)
+        );
+        assert_eq!(manifest.blocking_issues[0].number, BLOCKING_ISSUE_NUMBER);
+        assert_eq!(
+            manifest.blocking_issues[0].reason.as_deref(),
+            Some(BLOCKING_ISSUE_REASON)
+        );
+    }
+
+    #[test]
+    fn daemon_runtime_observation_keeps_unbracketed_cycle_non_passing() {
+        let temp = tempfile::TempDir::new().expect("create observation tempdir");
+        let path = temp.path().join("scrub-runtime-observation.json");
+        let mut source = ScrubRuntimeObservation::new(4242);
+        source.record_admitted_cycle(3, 4096, false);
+        fs::write(
+            &path,
+            serde_json::to_vec(&source).expect("encode scrub observation"),
+        )
+        .expect("write scrub observation");
+
+        let decoded = read_scrub_runtime_observation(&path).expect("decode scrub observation");
+        let observation = daemon_runtime_observation(None, &decoded);
+
+        assert_eq!(observation.daemon_pid, 4242);
+        assert_eq!(observation.cycles_admitted_before_read, None);
+        assert_eq!(observation.cycles_admitted, 1);
+        assert_eq!(observation.records_verified, 3);
+        assert_eq!(observation.bytes_scanned, 4096);
+        assert_eq!(observation.work_pending_before_read, None);
+        assert_eq!(observation.work_pending_after_read, Some(false));
+        assert_eq!(observation.throttle_count_before_read, None);
+        assert!(!daemon_scrub_observation_has_isolation_window(&observation));
+    }
+
+    #[test]
+    fn initial_scrub_observation_must_come_from_mounted_daemon() {
+        let temp = tempfile::TempDir::new().expect("create observation tempdir");
+        let path = temp.path().join("scrub-runtime-observation.json");
+        let source = ScrubRuntimeObservation::new(4242);
+        fs::write(
+            &path,
+            serde_json::to_vec(&source).expect("encode scrub observation"),
+        )
+        .expect("write scrub observation");
+
+        let observation = wait_for_initial_scrub_runtime_observation(&path, 4242, Duration::ZERO)
+            .expect("matching mounted daemon observation");
+        assert_eq!(observation.daemon_pid, 4242);
+
+        let error = wait_for_initial_scrub_runtime_observation(&path, 4343, Duration::ZERO)
+            .expect_err("sibling daemon observation must not establish readiness");
+        assert!(error.contains("expected mounted daemon pid 4343"));
+    }
+
+    #[test]
+    fn post_read_observation_rejects_a_different_scrub_tick() {
+        let temp = tempfile::TempDir::new().expect("create observation tempdir");
+        let path = temp.path().join("scrub-runtime-observation.json");
+        let mut before = ScrubRuntimeObservation::new(4242);
+        before.record_admitted_cycle(1, 4096, true);
+        before.record_budget_throttle();
+        let mut after = before;
+        after.record_admitted_cycle(1, 4096, true);
+        after.record_budget_throttle();
+        fs::write(
+            &path,
+            serde_json::to_vec(&after).expect("encode scrub observation"),
+        )
+        .expect("write scrub observation");
+
+        let error = read_post_read_scrub_runtime_observation(&path, &before)
+            .expect_err("a different scrub tick cannot bracket the read");
+        assert!(error.contains("changed scrub tick across the read"));
+    }
+
+    #[test]
+    fn runtime_outcome_requires_observations_from_mounted_daemon() {
+        const MOUNTED_DAEMON_PID: u32 = 4242;
+
+        let service_curve = build_service_curve();
+        let foreground_read = completed_foreground_read(&service_curve);
+        assert_eq!(foreground_read.bytes_written, 0);
+        let mut scrub_activity = scrub_activity_for_completed_read(&service_curve);
+
+        assert_eq!(
+            classify_runtime_outcome(
+                &foreground_read,
+                &scrub_activity,
+                &service_curve,
+                Some(MOUNTED_DAEMON_PID),
+            ),
+            ValidationStatus::HarnessFail
+        );
+
+        scrub_activity.observation_tier = ValidationTier::MountedUserspace;
+        assert_eq!(
+            classify_runtime_outcome(
+                &foreground_read,
+                &scrub_activity,
+                &service_curve,
+                Some(MOUNTED_DAEMON_PID),
+            ),
+            ValidationStatus::HarnessFail
+        );
+
+        scrub_activity.daemon_runtime = Some(DaemonScrubRuntimeObservation {
+            daemon_pid: MOUNTED_DAEMON_PID + 1,
+            cycles_admitted_before_read: Some(1),
+            cycles_admitted: 1,
+            records_verified: 4,
+            bytes_scanned: 64 * 1024,
+            work_pending_before_read: Some(true),
+            work_pending_after_read: Some(true),
+            throttle_count_before_read: Some(1),
+            throttle_count: 1,
+        });
+        assert_eq!(
+            classify_runtime_outcome(
+                &foreground_read,
+                &scrub_activity,
+                &service_curve,
+                Some(MOUNTED_DAEMON_PID),
+            ),
+            ValidationStatus::HarnessFail
+        );
+
+        scrub_activity
+            .daemon_runtime
+            .as_mut()
+            .expect("daemon runtime observation")
+            .daemon_pid = MOUNTED_DAEMON_PID;
+        assert_eq!(
+            classify_runtime_outcome(
+                &foreground_read,
+                &scrub_activity,
+                &service_curve,
+                Some(MOUNTED_DAEMON_PID),
+            ),
+            ValidationStatus::Pass
+        );
+
+        let evidence = base_evidence(BaseEvidenceInput {
+            outcome: ValidationStatus::Pass,
+            command: "scrub_foreground_read_validation --row scrub-foreground-read-runtime"
+                .to_string(),
+            generated_at: "2026-07-17T03:45:11Z".to_string(),
+            run_id: "test-run/1".to_string(),
+            source_ref: "test-sha".to_string(),
+            environment: RuntimeEnvironmentEvidence {
+                host: "linux x86_64 kernel=test".to_string(),
+                dev_fuse_present: true,
+                daemon_bin: Some(
+                    "/nix/store/test/bin/tidefs-posix-filesystem-adapter-daemon".into(),
+                ),
+                environment_refusal: None,
+            },
+            mount: Some(MountRuntimeEvidence {
+                daemon_pid: MOUNTED_DAEMON_PID,
+                mount_path: "/tmp/tidefs/mnt".to_string(),
+                store_path: "/tmp/tidefs/store".to_string(),
+                background_scrub_interval_secs: BACKGROUND_SCRUB_INTERVAL_SECS,
+                statfs_type_hex: format!("0x{FUSE_SUPER_MAGIC:x}"),
+            }),
+            foreground_read: foreground_read.clone(),
+            scrub_activity: scrub_activity.clone(),
+            service_curve: service_curve.clone(),
+        });
+        assert!(evidence.passed);
+        assert!(evidence.assert_no_product_or_harness_failure().is_ok());
+        let manifest = build_evidence_manifest(&evidence, b"scrub evidence");
+        assert!(manifest
+            .scope
+            .contains("mounted_daemon_pid=4242 daemon_scrub_observation_pid=4242"));
+        assert!(manifest
+            .scope
+            .contains("daemon_scrub_pid_matches_mount=true"));
+
+        let mut failed_read = foreground_read;
+        failed_read
+            .failures
+            .push("mounted read returned wrong data".into());
+        failed_read.passed = false;
+        assert_eq!(
+            classify_runtime_outcome(
+                &failed_read,
+                &scrub_activity,
+                &service_curve,
+                Some(MOUNTED_DAEMON_PID),
+            ),
+            ValidationStatus::ProductFail
+        );
+    }
+
+    #[test]
     fn fuse_mount_unavailable_records_environment_refusal() {
         let service_curve = build_service_curve();
         let mount_error =
@@ -800,7 +1770,7 @@ mod tests {
                 service_curve.max_foreground_read_wait_ticks,
                 mount_error,
             ),
-            scrub_activity: build_scrub_activity(),
+            scrub_activity: scrub_activity_not_run(&service_curve),
             service_curve,
         });
 
@@ -811,6 +1781,35 @@ mod tests {
             .as_deref()
             .expect("refusal reason")
             .contains("FUSE mount unavailable"));
+        assert!(evidence.admission_state.environment_refused);
+        assert!(!evidence.scrub_activity.background_scrub_configured);
+        assert!(!evidence.scrub_activity.throttle_observed);
+        assert!(!evidence.scrub_activity.pending_and_rate_limited_during_read);
+        assert_eq!(
+            evidence.admission_state.environment_refusal.as_deref(),
+            evidence.environment.environment_refusal.as_deref()
+        );
+        assert!(
+            evidence
+                .admission_state
+                .foreground_read_admitted_by_service_curve
+        );
+        assert!(
+            !evidence
+                .admission_state
+                .foreground_read_refused_by_service_curve
+        );
+        assert!(
+            evidence
+                .admission_state
+                .scrub_unit_admitted_by_service_curve
+        );
+        assert!(!evidence.admission_state.scrub_unit_refused_by_service_curve);
+        assert!(
+            evidence
+                .admission_state
+                .scrub_work_deferred_by_service_curve
+        );
         assert!(evidence
             .foreground_read
             .failures
@@ -818,5 +1817,191 @@ mod tests {
             .any(|failure| failure.contains("statfs_type=0xef53")));
         assert_eq!(evidence.runtime_source.exit_status, 0);
         assert!(evidence.assert_no_product_or_harness_failure().is_ok());
+
+        let manifest = build_evidence_manifest(&evidence, b"scrub evidence");
+        let scope = &manifest.scope;
+        assert!(scope.contains("claim_status_change=false"));
+        assert!(scope.contains("product_wording_change=false"));
+        assert!(scope.contains("environment_refused=true"));
+        assert!(scope.contains("scrub_activity_observation_tier=source-model"));
+        assert!(scope.contains("foreground_read_admitted_by_service_curve=true"));
+        assert!(scope.contains("foreground_read_refused_by_service_curve=false"));
+        assert!(scope.contains(&format!(
+            "scrub_units_requested={}",
+            evidence.admission_state.scrub_units_requested
+        )));
+        assert!(scope.contains(&format!(
+            "scrub_units_admitted_by_service_curve={}",
+            evidence
+                .admission_state
+                .scrub_units_admitted_by_service_curve
+        )));
+        assert!(scope.contains(&format!(
+            "scrub_units_deferred_by_service_curve={}",
+            evidence
+                .admission_state
+                .scrub_units_deferred_by_service_curve
+        )));
+        assert!(scope.contains("scrub_work_deferred_by_service_curve=true"));
+        assert!(scope.contains(&format!(
+            "max_scrub_queue_depth={}",
+            evidence.admission_state.max_scrub_queue_depth
+        )));
+        assert!(scope.contains(&format!(
+            "foreground_read_within_bound={}",
+            evidence.service_curve.foreground_read_within_bound
+        )));
+        assert!(scope.contains(&format!(
+            "unscheduled_foreground_read_within_bound={}",
+            evidence
+                .service_curve
+                .unscheduled_foreground_read_within_bound
+        )));
+        assert!(scope.contains(&format!(
+            "scheduled_max_scrub_queue_depth={}",
+            evidence.service_curve.scheduled_max_scrub_queue_depth
+        )));
+        assert!(scope.contains(&format!(
+            "unscheduled_max_scrub_queue_depth={}",
+            evidence.service_curve.unscheduled_max_scrub_queue_depth
+        )));
+        assert_eq!(manifest.blocking_issues.len(), 1);
+        assert_eq!(
+            manifest.blocking_issues[0].repo.as_deref(),
+            Some(BLOCKING_ISSUE_REPO)
+        );
+        assert_eq!(manifest.blocking_issues[0].number, BLOCKING_ISSUE_NUMBER);
+        assert_eq!(
+            manifest.blocking_issues[0].reason.as_deref(),
+            Some(BLOCKING_ISSUE_REASON)
+        );
+        assert!(manifest.validate().is_ok());
+    }
+
+    #[test]
+    fn service_curve_evidence_uses_typed_contract_oracle() {
+        let service_curve = build_service_curve();
+        let config = scrub_read_oracle_config();
+
+        assert_eq!(
+            service_curve.foreground_read_work_class,
+            ServiceCurve::FOREGROUND_READ_DEFAULT.work_class.as_str()
+        );
+        assert_eq!(
+            service_curve.scrub_queue_slots,
+            ServiceCurve::SCRUB_BOUNDED_DEFAULT.queue_slots
+        );
+        assert_eq!(
+            service_curve.oracle_config.source_contract,
+            "tidefs-performance-contract::oracle::OracleConfig"
+        );
+        assert_eq!(service_curve.oracle_config.scrub_units, config.scrub_units);
+        assert_eq!(
+            service_curve.oracle_config.read_arrival_tick,
+            config.read_arrival_tick
+        );
+        assert_eq!(
+            service_curve.oracle_config.max_foreground_read_wait_ticks,
+            config.max_foreground_read_wait_ticks
+        );
+        assert_eq!(config.scrub_units, SCRUB_UNITS_REQUESTED);
+        assert_eq!(config.read_arrival_tick, FOREGROUND_READ_ARRIVAL_TICK);
+        assert_eq!(
+            config.max_foreground_read_wait_ticks,
+            MAX_FOREGROUND_READ_WAIT_TICKS
+        );
+        assert!(service_curve.foreground_read_admitted_by_service_curve);
+        assert!(service_curve.scrub_unit_admitted_by_service_curve);
+        assert!(service_curve.foreground_read_within_bound);
+        assert!(!service_curve.unscheduled_foreground_read_within_bound);
+        assert_eq!(
+            service_curve.scheduled_scrub_admitted,
+            ServiceCurve::SCRUB_BOUNDED_DEFAULT.queue_slots
+        );
+        assert_eq!(
+            service_curve.scheduled_scrub_deferred,
+            SCRUB_UNITS_REQUESTED - ServiceCurve::SCRUB_BOUNDED_DEFAULT.queue_slots
+        );
+        assert_eq!(
+            service_curve.scheduled_max_scrub_queue_depth,
+            ServiceCurve::SCRUB_BOUNDED_DEFAULT.queue_slots
+        );
+        assert_eq!(
+            service_curve.unscheduled_scrub_admitted,
+            SCRUB_UNITS_REQUESTED
+        );
+        assert_eq!(service_curve.unscheduled_scrub_deferred, 0);
+        assert_eq!(
+            service_curve.unscheduled_max_scrub_queue_depth,
+            SCRUB_UNITS_REQUESTED
+        );
+
+        let scrub_activity = scrub_activity_for_completed_read(&service_curve);
+        assert_eq!(scrub_activity.observation_tier, ValidationTier::HarnessOnly);
+        let environment = RuntimeEnvironmentEvidence {
+            host: "linux x86_64 kernel=test".to_string(),
+            dev_fuse_present: true,
+            daemon_bin: Some("/nix/store/test/bin/tidefs-posix-filesystem-adapter-daemon".into()),
+            environment_refusal: None,
+        };
+        let admission_state = build_admission_state(&environment, &scrub_activity, &service_curve);
+        assert_eq!(admission_state.environment_refusal, None);
+        assert!(!admission_state.environment_refused);
+        assert_eq!(
+            admission_state.foreground_read_admitted_by_service_curve,
+            service_curve.foreground_read_admitted_by_service_curve
+        );
+        assert_eq!(
+            admission_state.foreground_read_refused_by_service_curve,
+            !service_curve.foreground_read_admitted_by_service_curve
+        );
+        assert_eq!(
+            admission_state.scrub_units_requested,
+            scrub_activity.scrub_units_requested
+        );
+        assert_eq!(
+            admission_state.scrub_unit_admitted_by_service_curve,
+            service_curve.scrub_unit_admitted_by_service_curve
+        );
+        assert_eq!(
+            admission_state.scrub_unit_refused_by_service_curve,
+            !service_curve.scrub_unit_admitted_by_service_curve
+        );
+        assert_eq!(
+            admission_state.scrub_units_admitted_by_service_curve,
+            service_curve.scheduled_scrub_admitted
+        );
+        assert_eq!(
+            admission_state.scrub_units_deferred_by_service_curve,
+            service_curve.scheduled_scrub_deferred
+        );
+        assert_eq!(
+            admission_state.scrub_work_deferred_by_service_curve,
+            service_curve.scheduled_scrub_deferred > 0
+        );
+        assert_eq!(
+            admission_state.max_scrub_queue_depth,
+            service_curve.scheduled_max_scrub_queue_depth
+        );
+        assert_eq!(
+            scrub_activity.scrub_deferred_by_service_curve,
+            service_curve.scheduled_scrub_deferred
+        );
+        assert_eq!(
+            scrub_activity.scrub_admitted_by_service_curve,
+            service_curve.scheduled_scrub_admitted
+        );
+        assert_eq!(
+            scrub_activity.max_scrub_queue_depth,
+            service_curve.scheduled_max_scrub_queue_depth
+        );
+        assert!(scrub_activity.pending_and_rate_limited_during_read);
+        assert!(scrub_activity.throttle_observed);
+        assert!(!scrub_read_isolation_passed(
+            &completed_foreground_read(&service_curve),
+            &scrub_activity,
+            &service_curve,
+            None,
+        ));
     }
 }

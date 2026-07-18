@@ -1,0 +1,16 @@
+{
+  "manifest_version": 2,
+  "claim_id": "scrub.foreground_read.protected.v1",
+  "evidence_class": "scrub-read-isolation-model",
+  "validation_tier": "source-model",
+  "scope": "typed foreground-read and bounded-scrub service curves plus deterministic scheduled and unscheduled oracle comparison; source-model only, not mounted scrub/read runtime proof",
+  "artifact_path": "validation/artifacts/performance/scrub-read-isolation-model.toml",
+  "content_digest": "blake3:eef13bbff0d96247547af8f74cd19b13c70839d9b695242fc9f01855e3dc18ce",
+  "run_id": "deterministic-fixture:scrub-read-isolation-model-v1",
+  "source_ref": "refs/heads/gpt4/issue-1792-scrub-read-isolation",
+  "outcome": "pass",
+  "residual_risk": "This fixture proves only the typed source-model scheduling boundary. The separate current-head QEMU artifact is required for mounted foreground-read correctness and same-daemon scrub pending/throttle observations, and neither artifact promotes broad scrub, repair, rebuild, production, or successor claims.",
+  "source": "tidefs-performance-contract",
+  "generated_at": "2026-07-17T22:02:47Z",
+  "blocking_issues": []
+}

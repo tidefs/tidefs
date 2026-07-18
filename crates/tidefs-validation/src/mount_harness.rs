@@ -21,6 +21,10 @@ use std::process::{Child, Command};
 use std::thread;
 use std::time::{Duration, Instant};
 
+const FUSE_SUPER_MAGIC: libc::c_long = 0x6573_5546;
+pub(crate) const MOUNT_HARNESS_ROOT_AUTH_KEY_HEX: &str =
+    "0000000000000000000000000000000000000000000000000000000000000001";
+
 /// Manages a FUSE-mounted TideFS instance backed by a local filesystem store.
 pub struct MountHarness {
     /// Temporary root directory (parent of both store and mount).
@@ -34,6 +38,8 @@ pub struct MountHarness {
     child: Child,
     /// PID of the daemon process (cached before possible reap).
     daemon_pid: u32,
+    /// Validation-only typed scrub observation emitted by the mounted daemon.
+    scrub_runtime_observation_path: Option<PathBuf>,
 }
 
 // ── builder ────────────────────────────────────────────────────────
@@ -42,6 +48,30 @@ pub struct MountHarness {
 pub struct MountHarnessBuilder {
     daemon_bin: Option<PathBuf>,
     extra_args: Vec<String>,
+    scrub_runtime_observation: bool,
+    pre_mount_setup: Option<Box<dyn FnOnce(&Path) -> io::Result<()>>>,
+}
+
+#[derive(Debug)]
+struct PreMountSetupError(io::Error);
+
+impl std::fmt::Display for PreMountSetupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "pre-mount setup failed: {}", self.0)
+    }
+}
+
+impl std::error::Error for PreMountSetupError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+pub(crate) fn is_pre_mount_setup_failure(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<PreMountSetupError>())
+        .is_some()
 }
 
 impl MountHarnessBuilder {
@@ -49,6 +79,8 @@ impl MountHarnessBuilder {
         Self {
             daemon_bin: None,
             extra_args: Vec::new(),
+            scrub_runtime_observation: false,
+            pre_mount_setup: None,
         }
     }
 
@@ -66,6 +98,25 @@ impl MountHarnessBuilder {
     /// Use this to pass FUSE mount options such as `-o allow_other`.
     pub fn extra_args(mut self, args: &[&str]) -> Self {
         self.extra_args = args.iter().map(|s| s.to_string()).collect();
+        self
+    }
+
+    /// Ask the daemon to emit the validation-only typed scrub observation
+    /// owned by issue #1792 into this harness's temporary directory.
+    pub fn scrub_runtime_observation(mut self) -> Self {
+        self.scrub_runtime_observation = true;
+        self
+    }
+
+    /// Run validation-only backing-store setup before the daemon starts.
+    ///
+    /// Setup that bypasses the mounted boundary is harness input and must not
+    /// be cited as mounted filesystem behavior.
+    pub fn pre_mount_setup(
+        mut self,
+        setup: impl FnOnce(&Path) -> io::Result<()> + 'static,
+    ) -> Self {
+        self.pre_mount_setup = Some(Box::new(setup));
         self
     }
 
@@ -90,7 +141,7 @@ impl MountHarnessBuilder {
         self
     }
 
-    pub fn build(self) -> io::Result<MountHarness> {
+    pub fn build(mut self) -> io::Result<MountHarness> {
         let daemon_bin = match self.daemon_bin {
             Some(ref p) => p.clone(),
             None => find_daemon_binary()?,
@@ -108,10 +159,14 @@ impl MountHarnessBuilder {
         fs::create_dir_all(&mount_path).map_err(|e| {
             io::Error::other(format!("create mount dir {}: {e}", mount_path.display()))
         })?;
+        if let Some(setup) = self.pre_mount_setup.take() {
+            setup(&store_path).map_err(|error| {
+                let kind = error.kind();
+                io::Error::new(kind, PreMountSetupError(error))
+            })?;
+        }
 
-        // Demo root authentication key avoids requiring env setup.
-        let root_auth_key_hex = "0000000000000000000000000000000000000000000000000000000000000001";
-
+        // Validation root authentication key avoids requiring env setup.
         let mut cmd = Command::new(&daemon_bin);
         cmd.arg("mount-vfs")
             .arg("--store")
@@ -119,20 +174,28 @@ impl MountHarnessBuilder {
             .arg("--mount")
             .arg(&mount_path)
             .arg("--root-auth-key-hex")
-            .arg(root_auth_key_hex);
+            .arg(MOUNT_HARNESS_ROOT_AUTH_KEY_HEX);
 
         for arg in &self.extra_args {
             cmd.arg(arg);
         }
+        let scrub_runtime_observation_path = self
+            .scrub_runtime_observation
+            .then(|| work_dir.path().join("scrub-runtime-observation.json"));
+        if let Some(path) = scrub_runtime_observation_path.as_deref() {
+            cmd.arg("--scrub-runtime-observation-artifact").arg(path);
+        }
 
-        let child = cmd
+        let mut child = cmd
             .spawn()
             .map_err(|e| io::Error::other(format!("spawn daemon {}: {e}", daemon_bin.display())))?;
 
         let daemon_pid = child.id();
 
-        wait_for_mount(&mount_path, Duration::from_secs(10)).map_err(|e| {
-            kill_child(daemon_pid);
+        wait_for_mount(&mut child, &mount_path, Duration::from_secs(10)).map_err(|e| {
+            if matches!(child.try_wait(), Ok(None)) {
+                kill_child(daemon_pid);
+            }
             io::Error::other(format!(
                 "mount point {} did not become ready: {e}",
                 mount_path.display()
@@ -145,6 +208,7 @@ impl MountHarnessBuilder {
             mount_path,
             child,
             daemon_pid,
+            scrub_runtime_observation_path,
         })
     }
 }
@@ -154,7 +218,7 @@ pub type FuseMountFixture = MountHarness;
 
 impl MountHarness {
     /// Spawn the daemon binary, create a temp backing store, mount at a temp
-    /// mount point, and block until the mount point responds to `stat`.
+    /// mount point, and block until the mount point is an active FUSE mount.
     ///
     /// Uses the binary location from `find_daemon_binary`.  The backing store
     /// is initialised with a demo root authentication key so no environment
@@ -215,6 +279,11 @@ impl MountHarness {
     /// PID of the daemon process.
     pub fn daemon_pid(&self) -> u32 {
         self.daemon_pid
+    }
+
+    /// Typed scrub observation path when requested through the builder.
+    pub fn scrub_runtime_observation_path(&self) -> Option<&Path> {
+        self.scrub_runtime_observation_path.as_deref()
     }
 
     // ── helpers ────────────────────────────────────────────────────
@@ -663,18 +732,7 @@ impl MountHarness {
     /// inspect fields such as `f_bsize`, `f_blocks`, `f_bfree`,
     /// `f_namelen`, and `f_type`.
     pub fn statfs(&self) -> io::Result<libc::statfs> {
-        let path_c = CString::new(self.mount_path.as_os_str().as_bytes())
-            .map_err(|e| io::Error::other(format!("mount path with nul: {e}")))?;
-        // SAFETY: libc::statfs is a C struct of integers; zero is a valid
-        // bit pattern. The struct is filled by statfs below.
-        let mut buf: libc::statfs = unsafe { std::mem::zeroed() };
-        // SAFETY: statfs is a C FFI call; path_c is a valid CString; buf
-        // is a valid pointer to a statfs struct on the stack.
-        let rc = unsafe { libc::statfs(path_c.as_ptr(), &mut buf) };
-        if rc != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(buf)
+        statfs_for_path(&self.mount_path)
     }
 
     // ── lifetime ───────────────────────────────────────────────────
@@ -774,7 +832,7 @@ impl MountHarness {
 
         self.daemon_pid = child.id();
         self.child = child;
-        wait_for_mount(&self.mount_path, Duration::from_secs(10))?;
+        wait_for_mount(&mut self.child, &self.mount_path, Duration::from_secs(10))?;
         Ok(())
     }
 
@@ -845,7 +903,7 @@ impl MountHarness {
 
         self.daemon_pid = child.id();
         self.child = child;
-        wait_for_mount(&self.mount_path, Duration::from_secs(10))?;
+        wait_for_mount(&mut self.child, &self.mount_path, Duration::from_secs(10))?;
         Ok(())
     }
 
@@ -876,7 +934,7 @@ impl MountHarness {
 
         self.daemon_pid = child.id();
         self.child = child;
-        wait_for_mount(&self.mount_path, Duration::from_secs(10))?;
+        wait_for_mount(&mut self.child, &self.mount_path, Duration::from_secs(10))?;
         Ok(())
     }
 }
@@ -890,18 +948,51 @@ impl Drop for MountHarness {
 
 // ── internal helpers ────────────────────────────────────────────────
 
-/// Poll `mount_path` with `stat` every 100 ms until success or `timeout`.
-fn wait_for_mount(mount_path: &Path, timeout: Duration) -> io::Result<()> {
+/// Poll until `mount_path` is a live FUSE mount or the daemon exits.
+fn wait_for_mount(child: &mut Child, mount_path: &Path, timeout: Duration) -> io::Result<()> {
     let start = Instant::now();
     loop {
-        match fs::metadata(mount_path) {
-            Ok(_) => return Ok(()),
-            Err(_) if start.elapsed() < timeout => {
-                thread::sleep(Duration::from_millis(100));
-            }
-            Err(e) => return Err(e),
+        let (mounted, observation) = match statfs_type(mount_path) {
+            Ok(f_type) => (
+                f_type == FUSE_SUPER_MAGIC,
+                format!("statfs_type=0x{f_type:x}"),
+            ),
+            Err(error) => (false, format!("statfs_error={error}")),
+        };
+        if let Some(status) = child.try_wait()? {
+            return Err(io::Error::other(format!(
+                "daemon exited before FUSE mount became ready: {status}; {observation}"
+            )));
         }
+        if mounted {
+            return Ok(());
+        }
+        if start.elapsed() >= timeout {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("FUSE mount did not become ready before timeout; {observation}"),
+            ));
+        }
+        thread::sleep(Duration::from_millis(100));
     }
+}
+
+fn statfs_type(path: &Path) -> io::Result<libc::c_long> {
+    Ok(statfs_for_path(path)?.f_type)
+}
+
+fn statfs_for_path(path: &Path) -> io::Result<libc::statfs> {
+    let path_c = CString::new(path.as_os_str().as_bytes())
+        .map_err(|error| io::Error::other(format!("mount path with nul: {error}")))?;
+    // SAFETY: libc::statfs is a C struct of integers; zero is a valid
+    // bit pattern. The struct is filled by statfs below.
+    let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: statfs is a C FFI call; path_c is a valid CString and stat
+    // points to writable stack storage for the result.
+    if unsafe { libc::statfs(path_c.as_ptr(), &mut stat) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(stat)
 }
 
 /// Send SIGTERM to a process by pid.
@@ -994,6 +1085,24 @@ mod tests {
         assert!(msg.contains("harness/refusal signal only"));
         assert!(msg.contains("not mounted product proof"));
         assert!(msg.contains("daemon missing"));
+    }
+
+    #[test]
+    fn wait_for_mount_reports_daemon_exit_on_plain_directory() {
+        let work_dir = tempfile::TempDir::new().expect("create test work dir");
+        let mount_path = work_dir.path().join("mnt");
+        fs::create_dir(&mount_path).expect("create plain mount directory");
+        let mut child = Command::new("sh")
+            .args(["-c", "exit 17"])
+            .spawn()
+            .expect("spawn short-lived daemon stand-in");
+
+        let error = wait_for_mount(&mut child, &mount_path, Duration::from_secs(1))
+            .expect_err("plain directory must not count as a FUSE mount");
+        let message = error.to_string();
+        assert!(message.contains("daemon exited before FUSE mount became ready"));
+        assert!(message.contains("exit status: 17"));
+        assert!(message.contains("statfs_type=0x"));
     }
 
     /// Smoke test: verify the harness can mount and unmount cleanly.
@@ -1106,7 +1215,7 @@ mod tests {
         let daemon_bin = find_daemon_binary().expect("find daemon binary");
         let root_auth_key_hex = "0000000000000000000000000000000000000000000000000000000000000001";
 
-        let child2 = Command::new(&daemon_bin)
+        let mut child2 = Command::new(&daemon_bin)
             .arg("mount-vfs")
             .arg("--store")
             .arg(&store_path)
@@ -1118,7 +1227,8 @@ mod tests {
             .expect("spawn daemon session 2");
 
         let daemon_pid2 = child2.id();
-        wait_for_mount(&mount_path, Duration::from_secs(10)).expect("mount point ready session 2");
+        wait_for_mount(&mut child2, &mount_path, Duration::from_secs(10))
+            .expect("mount point ready session 2");
 
         let read_back =
             fs::read(mount_path.join("persist.txt")).expect("read persist.txt session 2");
