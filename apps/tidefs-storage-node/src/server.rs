@@ -4523,6 +4523,16 @@ impl StorageNode {
     }
 }
 
+/// Keep the response half of a snapshot barrier in the control queue too.
+/// This includes sync failures returned as [`Frame::Error`].
+fn frame_response_priority(request: &Frame) -> MessagePriority {
+    if matches!(request, Frame::SnapshotBarrier { .. }) {
+        MessagePriority::Control
+    } else {
+        MessagePriority::Data
+    }
+}
+
 /// Handle all messages on an established session until the client
 /// disconnects or sends Bye. Runs on a dedicated thread spawned by
 /// [`StorageNode::serve_one`].
@@ -4584,6 +4594,7 @@ fn serve_session(session_id: tidefs_transport::SessionId, ctx: SessionContext) {
 
             let store = Arc::clone(&ctx.store);
             let response = handle_frame_ctx(session_id, &frame, &store, &ctx);
+            let response_priority = frame_response_priority(&frame);
 
             if let Some(resp) = response {
                 if matches!(resp, Frame::Bye) {
@@ -4595,7 +4606,7 @@ fn serve_session(session_id: tidefs_transport::SessionId, ctx: SessionContext) {
                     return;
                 }
                 let mut t = ctx.transport.lock().unwrap();
-                t.send_message(session_id, &protocol::encode(&resp))
+                t.send_priority(session_id, &protocol::encode(&resp), response_priority)
                     .map_err(|e| {
                         eprintln!("[storage-node] session {session_id}: send error: {e:?}");
                     })
@@ -7065,6 +7076,21 @@ mod cluster_pool_handler_tests {
         assert_eq!(
             snapshot_barrier_send_label(42, b"previous-root"),
             "vfssend2-incremental-send-42"
+        );
+    }
+
+    #[test]
+    fn snapshot_barrier_replies_use_control_priority() {
+        assert_eq!(
+            frame_response_priority(&Frame::SnapshotBarrier {
+                barrier_id: 41,
+                snapshot_name: "send-cut".into(),
+            }),
+            MessagePriority::Control
+        );
+        assert_eq!(
+            frame_response_priority(&Frame::Send { key: Vec::new() }),
+            MessagePriority::Data
         );
     }
 
