@@ -457,25 +457,38 @@ impl BulkService {
         total_transferred: u64,
         checksum32: u32,
     ) -> Result<CompletedBulkTransfer, BulkError> {
+        self.done_with_terminal(connection_id, token, total_transferred, checksum32)
+            .map_err(|(error, _)| error)
+    }
+
+    /// Verify DONE while preserving a terminal record when validation retires
+    /// and discards an active transfer.
+    pub(crate) fn done_with_terminal(
+        &mut self,
+        connection_id: ConnectionId,
+        token: BulkToken,
+        total_transferred: u64,
+        checksum32: u32,
+    ) -> Result<CompletedBulkTransfer, (BulkError, Option<AbortedBulkTransfer>)> {
         let connection = self
             .connections
             .get_mut(&connection_id)
-            .ok_or(BulkError::UnknownToken)?;
+            .ok_or((BulkError::UnknownToken, None))?;
         let stream_id = *connection
             .token_index
             .get(&token)
-            .ok_or(BulkError::UnknownToken)?;
+            .ok_or((BulkError::UnknownToken, None))?;
 
         match connection
             .transfers
             .get(&stream_id)
-            .ok_or(BulkError::UnknownToken)?
+            .ok_or((BulkError::UnknownToken, None))?
             .validate_done(total_transferred, checksum32)
         {
             Ok(()) => {
                 let transfer = connection
                     .remove_transfer(stream_id)
-                    .ok_or(BulkError::UnknownToken)?;
+                    .ok_or((BulkError::UnknownToken, None))?;
                 Ok(CompletedBulkTransfer {
                     connection_id,
                     stream_id,
@@ -485,8 +498,19 @@ impl BulkService {
                 })
             }
             Err(err) => {
-                connection.remove_transfer(stream_id);
-                Err(err)
+                let transfer = connection
+                    .remove_transfer(stream_id)
+                    .expect("failed DONE transfer remains until terminal retirement");
+                Err((
+                    err,
+                    Some(AbortedBulkTransfer {
+                        connection_id,
+                        stream_id,
+                        token,
+                        metadata: transfer.offer.metadata,
+                        reason: BulkAbortReason::ProtocolError,
+                    }),
+                ))
             }
         }
     }

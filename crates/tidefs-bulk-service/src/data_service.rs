@@ -192,20 +192,28 @@ impl BulkDataServiceHandler {
         connection_id: ConnectionId,
         frame: BulkDoneFrame,
     ) -> Result<DataServiceDispatchOutcome, DataServiceDispatchError> {
-        let completed = {
+        let terminal = {
             let mut service = self.service.lock().unwrap();
             ensure_stream_token(&service, connection_id, frame.stream_id, frame.token)?;
-            service
-                .done(
-                    connection_id,
-                    frame.token,
-                    frame.total_transferred,
-                    frame.checksum32,
-                )
-                .map_err(reject_bulk)?
+            service.done_with_terminal(
+                connection_id,
+                frame.token,
+                frame.total_transferred,
+                frame.checksum32,
+            )
         };
-        self.completed.lock().unwrap().push(completed);
-        Ok(DataServiceDispatchOutcome::Consumed)
+        match terminal {
+            Ok(completed) => {
+                self.completed.lock().unwrap().push(completed);
+                Ok(DataServiceDispatchOutcome::Consumed)
+            }
+            Err((error, aborted)) => {
+                if let Some(aborted) = aborted {
+                    self.aborted.lock().unwrap().push(aborted);
+                }
+                Err(reject_bulk(error))
+            }
+        }
     }
 
     fn handle_abort(

@@ -371,13 +371,24 @@ where
     }
 
     fn process_terminal_events(&self) -> Result<(), VfsRpcBulkWriteRuntimeError> {
+        let mut first_error = None;
         for completed in self.bulk.drain_completed() {
-            self.complete_write(vfs_write_completion(completed)?)?;
+            let result = vfs_write_completion(completed)
+                .and_then(|completion| self.complete_write(completion));
+            if let Err(error) = result {
+                first_error.get_or_insert(error);
+            }
         }
         for aborted in self.bulk.drain_aborted() {
-            self.abort_write(vfs_write_abort(aborted)?)?;
+            let result = vfs_write_abort(aborted).and_then(|abort| self.abort_write(abort));
+            if let Err(error) = result {
+                first_error.get_or_insert(error);
+            }
         }
-        Ok(())
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     fn complete_write(
@@ -494,9 +505,13 @@ where
         session_id: SessionId,
         frame: DataServiceFrame,
     ) -> Result<DataServiceDispatchOutcome, DataServiceDispatchError> {
-        let outcome = self.bulk.handle_data_service_frame(session_id, frame)?;
-        self.process_terminal_events().map_err(data_runtime_error)?;
-        Ok(outcome)
+        let outcome = self.bulk.handle_data_service_frame(session_id, frame);
+        let terminal = self.process_terminal_events().map_err(data_runtime_error);
+        match (outcome, terminal) {
+            (Ok(outcome), Ok(())) => Ok(outcome),
+            (Err(error), Ok(())) => Err(error),
+            (_, Err(error)) => Err(error),
+        }
     }
 }
 
@@ -1056,6 +1071,82 @@ mod tests {
 
         assert_eq!(runtime.pending_write_count(), 0);
         assert_eq!(target.writes(), vec![b"abc".to_vec()]);
+        assert_eq!(sink.replies().len(), 1);
+    }
+
+    #[test]
+    fn bad_done_checksum_retires_write_and_returns_canceled() {
+        let (runtime, target, sink) = runtime(Duration::from_secs(1));
+        let handle = create_handle(&runtime);
+        let data_dispatch = runtime.data_dispatch();
+        let token = accept_write_transfer(&data_dispatch, 2, 16, 3);
+        let request = admitted_write(&runtime, handle, token, 3, Instant::now());
+        grant_and_write(&runtime, &data_dispatch, 16, token, b"abc");
+
+        assert!(dispatch_data(
+            &data_dispatch,
+            BulkFrame::Done(BulkDoneFrame {
+                stream_id: 16,
+                token,
+                total_transferred: 3,
+                checksum32: 0,
+            }),
+        )
+        .is_err());
+
+        assert!(target.writes().is_empty());
+        assert_eq!(runtime.pending_write_count(), 0);
+        assert_eq!(runtime.bulk.active_transfer_count(SESSION_ID.0), 0);
+        assert_eq!(
+            runtime
+                .expire_write_timeouts(Instant::now() + Duration::from_secs(2))
+                .expect("retired transfer has no timeout work"),
+            0
+        );
+        let replies = sink.replies();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(
+            response(replies[0].1.clone()).header.errno,
+            Errno::ECANCELED
+        );
+        assert!(runtime
+            .handle_control_service_frame_at(Instant::now(), SESSION_ID, control_request(&request))
+            .is_err());
+    }
+
+    #[test]
+    fn terminal_error_does_not_drop_later_matching_completion() {
+        let (runtime, target, sink) = runtime(Duration::from_secs(1));
+        let handle = create_handle(&runtime);
+        let data_dispatch = runtime.data_dispatch();
+        let orphan = accept_write_transfer(&data_dispatch, 77, 17, 3);
+        let admitted = accept_write_transfer(&data_dispatch, 2, 18, 3);
+        admitted_write(&runtime, handle, admitted, 3, Instant::now());
+        grant_and_write(&runtime, &data_dispatch, 17, orphan, b"bad");
+        grant_and_write(&runtime, &data_dispatch, 18, admitted, b"abc");
+
+        for (stream_id, token, checksum32) in
+            [(17, orphan, 0x3c48_33b6), (18, admitted, 0x364b_3fb7)]
+        {
+            runtime
+                .bulk
+                .handle_data_service_frame(
+                    SESSION_ID,
+                    BulkFrame::Done(BulkDoneFrame {
+                        stream_id,
+                        token,
+                        total_transferred: 3,
+                        checksum32,
+                    })
+                    .to_data_service_frame()
+                    .expect("done frame"),
+                )
+                .expect("queue completion");
+        }
+
+        assert!(runtime.process_terminal_events().is_err());
+        assert_eq!(target.writes(), vec![b"abc".to_vec()]);
+        assert_eq!(runtime.pending_write_count(), 0);
         assert_eq!(sink.replies().len(), 1);
     }
 }
