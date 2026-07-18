@@ -32,7 +32,8 @@ provide a Rust `submit_bio` operation for `kernel::block::mq::Operations`.
 Bio fields, bio segment walking, and page mapping still cross unsafe C binding
 boundaries in the Kbuild entrypoint because the supported Rust-for-Linux
 baseline does not expose safe Rust wrappers for all of those kernel APIs. Keep
-changes to that code close to the local safety comments and the unsafe audit.
+changes to that code close to the local safety comments and scoped unsafe-code
+lint allowances.
 
 ## Backend Selection
 
