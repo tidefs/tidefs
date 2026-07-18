@@ -1,0 +1,83 @@
+name: Storage Intent Ack Runtime
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  mounted-receipts:
+    name: mounted acknowledgment receipts
+    runs-on: [self-hosted, linux, x64, tidefs, nix, kvm, xfstests]
+    timeout-minutes: 60
+    env:
+      CARGO_HOME: /var/tmp/tidefs-ci/cargo-home
+      CARGO_INCREMENTAL: 0
+      CARGO_TARGET_DIR: /var/tmp/tidefs-ci/cargo-target/${{ github.run_id }}-${{ github.run_attempt }}-ack-runtime
+      OUTPUT_DIR: /tmp/tidefs-validation/storage-intent-ack-runtime/${{ github.run_id }}-${{ github.run_attempt }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Host preflight
+        run: |
+          if test -c /dev/fuse; then
+            echo "/dev/fuse is available"
+          else
+            echo "::warning::/dev/fuse is unavailable; the harness will emit environment-refusal evidence"
+          fi
+
+      - name: Prepare runtime output
+        run: |
+          rm -rf "$OUTPUT_DIR" "$CARGO_TARGET_DIR"
+          mkdir -p "$OUTPUT_DIR" "$CARGO_HOME" "$CARGO_TARGET_DIR"
+
+      - name: Capture mounted receipt evidence
+        env:
+          TIDEFS_ACK_RECEIPT_RUNTIME_OUTPUT_DIR: ${{ env.OUTPUT_DIR }}
+          TIDEFS_ACK_RECEIPT_RUNTIME_RUN_ID: ${{ github.run_id }}/${{ github.run_attempt }}
+          TIDEFS_ACK_RECEIPT_RUNTIME_SOURCE_REF: ${{ github.sha }}
+        run: |
+          TIDEFS_ACK_RECEIPT_RUNTIME_GENERATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          export TIDEFS_ACK_RECEIPT_RUNTIME_GENERATED_AT
+          nix develop .#ci --command cargo test --locked \
+            -p tidefs-posix-filesystem-adapter-daemon \
+            --test ack_receipt_runtime_evidence -- --ignored --nocapture
+
+      - name: Validate evidence manifest
+        run: |
+          mkdir -p validation/artifacts/storage-intent
+          cp "$OUTPUT_DIR/ack-receipt-runtime.json" \
+            validation/artifacts/storage-intent/ack-receipt-runtime.json
+          cp "$OUTPUT_DIR/ack-receipt-runtime.manifest.json" \
+            validation/artifacts/storage-intent/ack-receipt-runtime.manifest.json
+          nix develop .#ci --command cargo run --locked -p tidefs-xtask -- \
+            validate-evidence-manifest \
+            validation/artifacts/storage-intent/ack-receipt-runtime.manifest.json
+          jq -r '
+            "## Mounted acknowledgment receipt evidence\n\n" +
+            "- Outcome: `" + .summary.status + "`\n" +
+            "- Passed rows: " + (.summary.passed | tostring) + "\n" +
+            "- Product-failed rows: " + (.summary.product_failed | tostring) + "\n" +
+            "- Source ref: `" + .source_ref + "`\n"
+          ' "$OUTPUT_DIR/ack-receipt-runtime.json" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload mounted receipt evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: storage-intent-ack-runtime
+          path: |
+            ${{ env.OUTPUT_DIR }}/**
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Clean cargo target
+        if: always()
+        run: rm -rf "$CARGO_TARGET_DIR"
