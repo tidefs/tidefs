@@ -5,12 +5,12 @@
   "validation_tier": "source-model",
   "scope": "claims-gate review for partial QEMU-guest data-shape helper evidence, source-model authority boundaries, and remaining blocked runtime classes",
   "artifact_path": "validation/artifacts/storage-intent/data-shape-claims-gate-review.toml",
-  "content_digest": "blake3:f9b09a4d9304c0edd342ae15c2ed8ecbe3fb306d0699e506f518a30c586835c8",
-  "run_id": "deterministic-fixture:issue-1981-data-shape-claims-gate-review-v2",
-  "source_ref": "fb1490f5bfe2e662e180f11f54bc03bebb5a7f48",
+  "content_digest": "blake3:ff8183dcdb96c9690474f203d91a1f015a961d35eb1550a23bafc8ad13ecc9f3",
+  "run_id": "deterministic-fixture:issue-1981-data-shape-claims-gate-review-v3",
+  "source_ref": "f45e387728d4a166814b4d453c3a233ce3397d4f",
   "outcome": "pass",
-  "residual_risk": "The review keeps storage.intent.data_shape_honesty.v1 blocked. QEMU helper rows cover only a bounded subset, and run 29644583929 timed out later during smoke-mount after artifact capture; mounted compiled-policy receipts, skipped families, lifecycle, performance, production, release-readiness, and successor/comparator claims remain blocked.",
+  "residual_risk": "The review keeps storage.intent.data_shape_honesty.v1 blocked. Dedicated QEMU run 29649529763 completed cleanly, but helper rows cover only a bounded subset; mounted compiled-policy receipts, skipped families, lifecycle, stable performance, production, release-readiness, and successor/comparator claims remain blocked.",
   "source": "claims-gate",
-  "generated_at": "2026-07-18T13:12:47Z",
+  "generated_at": "2026-07-18T15:28:22Z",
   "blocking_issues": []
 }
