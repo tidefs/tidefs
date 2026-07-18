@@ -11,6 +11,7 @@
 //! - Removing a device: updates topology labels after evacuation completes.
 //! - Replacing a device: add new → copy/rebuild → remove old.
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::FileTypeExt;
@@ -200,7 +201,8 @@ impl DeviceManager {
         pool_name: &str,
         commit_group: u64,
     ) -> Result<()> {
-        Self::validate_device_guid_cardinality(existing_device_configs, device_guids)?;
+        Self::validate_device_guid_authority(existing_device_configs, device_guids)?;
+        Self::validate_incoming_device_guid(new_device_config, device_guids, new_device_guid)?;
 
         let old_device_count = existing_device_configs.len() as u32;
         let new_device_count = old_device_count + 1;
@@ -258,7 +260,7 @@ impl DeviceManager {
         pool_name: &str,
         commit_group: u64,
     ) -> Result<()> {
-        Self::validate_device_guid_cardinality(remaining_device_configs, device_guids)?;
+        Self::validate_device_guid_authority(remaining_device_configs, device_guids)?;
 
         if remaining_device_configs.is_empty() {
             // All devices removed; nothing to label.
@@ -292,7 +294,7 @@ impl DeviceManager {
     ///
     /// The caller is responsible for data evacuation/copy from old → new.
     pub fn replace_device(request: DeviceReplacementRequest<'_>) -> Result<()> {
-        Self::validate_device_guid_cardinality(
+        Self::validate_device_guid_authority(
             request.existing_device_configs,
             request.device_guids,
         )?;
@@ -308,6 +310,12 @@ impl DeviceManager {
                 ),
             });
         }
+
+        Self::validate_incoming_device_guid(
+            request.new_device_config,
+            request.device_guids,
+            request.new_device_guid,
+        )?;
 
         let device_count = request.existing_device_configs.len() as u32;
         let new_topology_gen = request.commit_group.wrapping_add(1);
@@ -358,7 +366,7 @@ impl DeviceManager {
     /// the faulted device to the spare before calling this function, or for
     /// scheduling a rebuild after spare activation.
     pub fn activate_spare(request: SpareActivationRequest<'_>) -> Result<()> {
-        Self::validate_device_guid_cardinality(
+        Self::validate_device_guid_authority(
             request.existing_device_configs,
             request.device_guids,
         )?;
@@ -379,6 +387,12 @@ impl DeviceManager {
         // Find the faulted device's index in the pool.
         let faulted_index =
             Self::find_device_index_by_guid(request.device_guids, &request.faulted_device_guid)?;
+
+        Self::validate_incoming_device_guid(
+            request.spare_device_config,
+            request.device_guids,
+            request.spare_device_guid,
+        )?;
 
         let device_count = request.existing_device_configs.len() as u32;
         let new_topology_gen = request.commit_group.wrapping_add(1);
@@ -443,27 +457,65 @@ impl DeviceManager {
 
     /// Refuse incomplete caller-supplied membership authority before any
     /// topology label is mutated.
-    fn validate_device_guid_cardinality(
+    fn validate_device_guid_authority(
         device_configs: &[DeviceConfig],
         device_guids: &[[u8; 16]],
     ) -> Result<()> {
-        if device_guids.len() == device_configs.len() {
-            return Ok(());
+        if device_guids.len() != device_configs.len() {
+            return Err(StoreError::Io {
+                operation: "device_manager_validate_device_guids",
+                path: device_configs.first().map_or_else(
+                    || PathBuf::from("<pool-topology>"),
+                    |config| config.path.clone(),
+                ),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "device GUID count {} does not match device count {}",
+                        device_guids.len(),
+                        device_configs.len()
+                    ),
+                ),
+            });
         }
+
+        let mut unique = BTreeSet::new();
+        if let Some((index, _)) = device_guids
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(_, guid)| !unique.insert(*guid))
+        {
+            return Err(StoreError::Io {
+                operation: "device_manager_validate_device_guids",
+                path: device_configs[index].path.clone(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("duplicate device GUID at topology index {index}"),
+                ),
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Refuse an incoming member identity that is already assigned to the
+    /// current topology before writing its first label.
+    fn validate_incoming_device_guid(
+        incoming_config: &DeviceConfig,
+        device_guids: &[[u8; 16]],
+        incoming_guid: [u8; 16],
+    ) -> Result<()> {
+        let Some(index) = device_guids.iter().position(|guid| *guid == incoming_guid) else {
+            return Ok(());
+        };
 
         Err(StoreError::Io {
             operation: "device_manager_validate_device_guids",
-            path: device_configs.first().map_or_else(
-                || PathBuf::from("<pool-topology>"),
-                |config| config.path.clone(),
-            ),
+            path: incoming_config.path.clone(),
             source: std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                format!(
-                    "device GUID count {} does not match device count {}",
-                    device_guids.len(),
-                    device_configs.len()
-                ),
+                format!("incoming device GUID duplicates topology index {index}"),
             ),
         })
     }
@@ -1353,6 +1405,113 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
+        assert!(!new_dir.join(".tidefs_label").exists());
+
+        let _ = fs::remove_dir_all(&existing_dir);
+        let _ = fs::remove_dir_all(&new_dir);
+    }
+
+    #[test]
+    fn add_device_refuses_duplicate_topology_guids_before_reading_labels() {
+        let existing_dir1 = temp_dir("dm-add-duplicate-guid-existing-1");
+        let existing_dir2 = temp_dir("dm-add-duplicate-guid-existing-2");
+        let new_dir = temp_dir("dm-add-duplicate-guid-new");
+        let existing_config1 = make_device_config(&existing_dir1);
+        let existing_config2 = make_device_config(&existing_dir2);
+        let new_config = make_device_config(&new_dir);
+        let label_path1 = existing_dir1.join(".tidefs_label");
+        let label_path2 = existing_dir2.join(".tidefs_label");
+        fs::write(&label_path1, b"first-label-must-not-change").unwrap();
+        fs::write(&label_path2, b"second-label-must-not-change").unwrap();
+        let label_before1 = fs::read(&label_path1).unwrap();
+        let label_before2 = fs::read(&label_path2).unwrap();
+
+        let error = DeviceManager::add_device(
+            &[existing_config1, existing_config2],
+            &new_config,
+            [0x2Bu8; 16],
+            &[[0x2Cu8; 16], [0x2Cu8; 16]],
+            [0x2Du8; 16],
+            "duplicate-guid",
+            1,
+        )
+        .expect_err("duplicate topology identity must be refused");
+
+        match error {
+            StoreError::Io {
+                operation, source, ..
+            } => {
+                assert_eq!(operation, "device_manager_validate_device_guids");
+                assert_eq!(source.kind(), std::io::ErrorKind::InvalidInput);
+                assert!(source
+                    .to_string()
+                    .contains("duplicate device GUID at topology index 1"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        assert_eq!(fs::read(&label_path1).unwrap(), label_before1);
+        assert_eq!(fs::read(&label_path2).unwrap(), label_before2);
+        assert!(!new_dir.join(".tidefs_label").exists());
+
+        let _ = fs::remove_dir_all(&existing_dir1);
+        let _ = fs::remove_dir_all(&existing_dir2);
+        let _ = fs::remove_dir_all(&new_dir);
+    }
+
+    #[test]
+    fn add_device_refuses_reused_incoming_guid_before_writing_new_device() {
+        let existing_dir = temp_dir("dm-add-reused-guid-existing");
+        let new_dir = temp_dir("dm-add-reused-guid-new");
+        let existing_config = make_device_config(&existing_dir);
+        let new_config = make_device_config(&new_dir);
+        let pool_guid = [0x2Eu8; 16];
+        let existing_guid = [0x2Fu8; 16];
+
+        DeviceManager::write_single_device_label(LabelWriteRequest {
+            device_config: &existing_config,
+            pool_guid,
+            device_guid: existing_guid,
+            pool_name: "reused-guid",
+            pool_state: crate::pool_label::LabelPoolState::Active,
+            commit_group: 1,
+            label_commit_group: 1,
+            device_index: 0,
+            topology_generation: 1,
+            device_count: 1,
+            redundancy_policy: PoolRedundancyPolicy::default(),
+            device_layout_policy: None,
+        })
+        .unwrap();
+        let label_path = existing_dir.join(".tidefs_label");
+        let label_before = fs::read(&label_path).unwrap();
+
+        let error = DeviceManager::add_device(
+            std::slice::from_ref(&existing_config),
+            &new_config,
+            pool_guid,
+            &[existing_guid],
+            existing_guid,
+            "reused-guid",
+            1,
+        )
+        .expect_err("an incoming member must have a unique GUID");
+
+        match error {
+            StoreError::Io {
+                operation,
+                path,
+                source,
+            } => {
+                assert_eq!(operation, "device_manager_validate_device_guids");
+                assert_eq!(path, new_config.path);
+                assert_eq!(source.kind(), std::io::ErrorKind::InvalidInput);
+                assert!(source
+                    .to_string()
+                    .contains("incoming device GUID duplicates topology index 0"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        assert_eq!(fs::read(&label_path).unwrap(), label_before);
         assert!(!new_dir.join(".tidefs_label").exists());
 
         let _ = fs::remove_dir_all(&existing_dir);
