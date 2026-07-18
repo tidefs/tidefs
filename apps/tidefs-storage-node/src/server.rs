@@ -1216,19 +1216,6 @@ fn run_snapshot_barrier_before_send_with_config(
                 barrier_id: active.barrier_id(),
             });
         }
-        if peer_sessions.is_empty() {
-            let outcome = coordinator
-                .outcome()
-                .expect("empty snapshot barrier completes immediately");
-            drop(active);
-            return finalize_snapshot_barrier_before_send(
-                barrier_id,
-                coordinator_state,
-                outcome,
-                &membership_cut,
-                ctx,
-            );
-        }
         *active = Some(coordinator);
     }
 
@@ -7161,6 +7148,64 @@ mod cluster_pool_handler_tests {
                 assert!(max_generation > min_generation);
             }
             other => panic!("expected coordinator root inconsistency, got {other:?}"),
+        }
+        assert!(ctx.active_barrier.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn snapshot_barrier_before_send_rejects_zero_peer_coordinator_advance() {
+        let (_dir, store) = frame_local_store();
+        let ctx = frame_test_context(Arc::clone(&store));
+        let coordinator_state = {
+            let mut backend = store.lock().unwrap();
+            sync_snapshot_barrier_store(&mut backend).expect("capture coordinator root")
+        };
+        let membership_cut = snapshot_barrier_membership_cut(&ctx);
+        *ctx.active_barrier.lock().unwrap() = Some(SnapshotCoordinator::new(
+            8,
+            "zero-peer".into(),
+            Vec::new(),
+            SnapshotBarrierConfig::default(),
+        ));
+
+        {
+            let mut backend = store.lock().unwrap();
+            match &mut *backend {
+                StoreBackend::Local(rs) => rs
+                    .put_local("late-zero-peer-write", b"advanced root")
+                    .expect("write before zero-peer barrier completion"),
+                _ => panic!("expected local store backend"),
+            }
+        }
+
+        let err = finish_active_snapshot_barrier_before_send(
+            8,
+            coordinator_state,
+            BarrierOutcome::Consistent {
+                min_txg: 0,
+                max_txg: 0,
+                total_objects: 0,
+                responses: BTreeMap::new(),
+            },
+            &membership_cut,
+            &ctx,
+        )
+        .expect_err("zero-peer coordinator root advance must invalidate the barrier");
+
+        match err {
+            SnapshotBarrierSendError::Inconsistent {
+                min_txg,
+                max_txg,
+                min_generation,
+                max_generation,
+                ..
+            } => {
+                assert_eq!(min_txg, coordinator_state.committed_root_txg);
+                assert!(max_txg > min_txg);
+                assert_eq!(min_generation, coordinator_state.committed_root_generation);
+                assert!(max_generation > min_generation);
+            }
+            other => panic!("expected zero-peer coordinator inconsistency, got {other:?}"),
         }
         assert!(ctx.active_barrier.lock().unwrap().is_none());
     }
