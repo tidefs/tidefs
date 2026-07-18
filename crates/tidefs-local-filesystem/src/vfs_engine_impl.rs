@@ -4278,9 +4278,14 @@ fn live_snapshot_send_destination(args: &Value) -> Result<LiveSnapshotSendDestin
     };
     match target_addr {
         Some(target_addr) => {
-            let addr = target_addr.parse().map_err(|err| {
+            let addr: SocketAddr = target_addr.parse().map_err(|err| {
                 format!("snapshot send: invalid target-addr '{target_addr}': {err}")
             })?;
+            if addr.port() == 0 {
+                return Err(format!(
+                    "snapshot send: invalid target-addr '{target_addr}': port must be non-zero"
+                ));
+            }
             let node_id = live_admin_required_u64_arg(args, "node_id")?;
             let server_node_id = live_admin_required_u64_arg(args, "server_node_id")?;
             if node_id == 0 {
@@ -6910,6 +6915,21 @@ mod tests {
     }
 
     #[test]
+    fn live_snapshot_send_destination_rejects_zero_target_port() {
+        assert_eq!(
+            live_snapshot_send_destination(&json!({
+                "target_addr": "127.0.0.1:0",
+                "node_id": 1,
+                "server_node_id": 2,
+            })),
+            Err(
+                "snapshot send: invalid target-addr '127.0.0.1:0': port must be non-zero"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
     fn parse_snap_net_response_names_empty_ack() {
         let mut ack = Vec::new();
         ack.extend_from_slice(SNAP_NET_MAGIC);
@@ -8555,7 +8575,7 @@ mod tests {
                 "send",
                 json!({
                     "output": malformed,
-                    "target_addr": "127.0.0.1:0",
+                    "target_addr": "127.0.0.1:9000",
                     "format": "vfssend2",
                     "incremental": false,
                 }),
@@ -8750,7 +8770,7 @@ mod tests {
             let output = root.path().join(format!("pool-{shape}-target.vfs"));
             let mut args = json!({
                 "output": output.display().to_string(),
-                "target_addr": "127.0.0.1:0",
+                "target_addr": "127.0.0.1:9000",
                 "node_id": 7,
                 "server_node_id": 9,
                 "format": "vfssend2",
@@ -8912,7 +8932,7 @@ mod tests {
             "send",
             json!({
                 "output": output.display().to_string(),
-                "target_addr": "127.0.0.1:0",
+                "target_addr": "127.0.0.1:9000",
                 "node_id": 7,
                 "server_node_id": 9,
                 "format": "vfssend2",
