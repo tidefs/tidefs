@@ -9257,12 +9257,10 @@ impl FuseVfsAdapter {
             let ctx = Self::system_request_ctx();
             self.finish_successful_writeback_read_handle_atime(ino, open_flags, &ctx);
         }
-        // Retire the shared range-tracker projection after the release path.
-        // Adapter dirty_state, worker ranges, and page-cache mirrors remain
-        // independent dirty owners until their stronger barrier completes.
-        if let Some(ref tracker) = self.writeback_range_tracker {
-            tracker.lock().unwrap().flush_inode(InodeId::new(ino));
-        }
+        // The shared range tracker owns dirty byte ranges until the lower
+        // filesystem completes its authoritative persistence path. Release
+        // may be a partial close, and its best-effort flush errors are not
+        // caller-visible, so it cannot retire those ranges here.
         if !self.inode_has_dirty_owners(ino) {
             self.writeback_cache.lock().unwrap().invalidate(ino);
         }
@@ -42072,24 +42070,27 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_release_drains_shared_tracker_but_retains_dirty_reclaim_projection() {
+    fn dispatch_release_preserves_shared_tracker_on_partial_close() {
         let (mut fixture, tracker) = adapter_fixture_with_writeback_tracker();
         let ctx = root_ctx();
 
-        let (inode, adapter_fh, _efh) = create_adapter_file_handle(
+        let (inode, closing_fh, _efh) = create_adapter_file_handle(
             &fixture.adapter,
             &ctx,
-            b"release-drain.txt",
+            b"release-preserve.txt",
             libc::O_RDWR as u32,
         );
         let ino = inode.get();
+        let (writer_fh, _writer_efh) =
+            open_adapter_file_handle(&fixture.adapter, &ctx, inode, libc::O_RDWR as u32);
 
         fixture
             .adapter
-            .dispatch_write(&ctx, ino, adapter_fh, 0, b"release data", 0)
+            .dispatch_write(&ctx, ino, writer_fh, 0, b"release data", 0)
             .expect("write");
 
-        // Artificially mark the inode dirty so drain-on-release is verifiable.
+        // Model an authoritative dirty range that belongs to the still-open
+        // writer, independently of the adapter's other dirty projections.
         tracker
             .lock()
             .unwrap()
@@ -42113,13 +42114,17 @@ mod tests {
             Some(true)
         );
 
-        // Release with flush=true (kernel-requested flush-on-close).
+        // Closing the other handle is neither the last close nor a requested
+        // flush, so it cannot retire the writer's authoritative dirty range.
         fixture
             .adapter
-            .dispatch_release(ino, adapter_fh, libc::O_RDWR as u32, Some(0), true)
-            .expect("release");
+            .dispatch_release(ino, closing_fh, libc::O_RDWR as u32, Some(0), false)
+            .expect("partial release");
 
-        assert!(!tracker.lock().unwrap().is_dirty(inode));
+        assert!(
+            tracker.lock().unwrap().is_dirty(inode),
+            "partial release must preserve authoritative dirty byte ranges"
+        );
         assert!(worker_tracker.lock().unwrap().has_dirty_ranges(ino));
         assert_eq!(
             fixture
