@@ -23,9 +23,8 @@
 //!
 //! ## Rename behavior
 //!
-//! The catalog keeps dataset identity (a stable UUID) separate from mount
-//! semantics, so `rename_dataset` is a single catalog mutation that does not
-//! require an unmount or disrupt open handles.
+//! [`DatasetCatalog::rename`] updates the path mapping while preserving the
+//! stable [`DatasetId`] values of the renamed dataset and its descendants.
 //!
 //! # Authority
 //!
