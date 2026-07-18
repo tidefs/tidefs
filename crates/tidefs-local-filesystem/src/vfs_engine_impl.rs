@@ -3899,9 +3899,11 @@ fn live_admin_string_vec(args: &Value, key: &str) -> Result<Vec<String>, String>
     }
 }
 
-fn live_admin_u64_arg_or_default(args: &Value, key: &str, default: u64) -> Result<u64, String> {
+fn live_admin_required_u64_arg(args: &Value, key: &str) -> Result<u64, String> {
     match args.get(key) {
-        None | Some(Value::Null) => Ok(default),
+        None | Some(Value::Null) => Err(format!(
+            "live admin argument '{key}' is required for target-addr sends"
+        )),
         Some(value) => value
             .as_u64()
             .ok_or_else(|| format!("live admin argument '{key}' must be an unsigned integer")),
@@ -4250,8 +4252,8 @@ fn live_snapshot_send_destination(args: &Value) -> Result<LiveSnapshotSendDestin
             let addr = target_addr.parse().map_err(|err| {
                 format!("snapshot send: invalid target-addr '{target_addr}': {err}")
             })?;
-            let node_id = live_admin_u64_arg_or_default(args, "node_id", 1)?;
-            let server_node_id = live_admin_u64_arg_or_default(args, "server_node_id", 2)?;
+            let node_id = live_admin_required_u64_arg(args, "node_id")?;
+            let server_node_id = live_admin_required_u64_arg(args, "server_node_id")?;
             if node_id == 0 {
                 return Err(
                     "snapshot send: node_id must be non-zero for target-addr sends".to_string(),
@@ -6834,23 +6836,48 @@ mod tests {
     }
 
     #[test]
-    fn live_snapshot_send_destination_defaults_null_node_ids() {
+    fn live_snapshot_send_destination_requires_target_node_ids() {
         let addr: SocketAddr = "127.0.0.1:9000".parse().expect("target address");
 
-        assert_eq!(
-            live_snapshot_send_destination(&json!({
-                "target_addr": addr.to_string(),
-                "node_id": null,
-                "server_node_id": null,
-            })),
-            Ok(LiveSnapshotSendDestination::TargetAddress {
-                target_addr: addr.to_string(),
-                addr,
-                node_id: 1,
-                server_node_id: 2,
-                output: None,
-            })
-        );
+        for (key, args) in [
+            (
+                "node_id",
+                json!({
+                    "target_addr": addr.to_string(),
+                    "server_node_id": 2,
+                }),
+            ),
+            (
+                "node_id",
+                json!({
+                    "target_addr": addr.to_string(),
+                    "node_id": null,
+                    "server_node_id": 2,
+                }),
+            ),
+            (
+                "server_node_id",
+                json!({
+                    "target_addr": addr.to_string(),
+                    "node_id": 1,
+                }),
+            ),
+            (
+                "server_node_id",
+                json!({
+                    "target_addr": addr.to_string(),
+                    "node_id": 1,
+                    "server_node_id": null,
+                }),
+            ),
+        ] {
+            assert_eq!(
+                live_snapshot_send_destination(&args),
+                Err(format!(
+                    "live admin argument '{key}' is required for target-addr sends"
+                ))
+            );
+        }
     }
 
     #[test]
@@ -8359,6 +8386,8 @@ mod tests {
             json!({
                 "output": output.display().to_string(),
                 "target_addr": "127.0.0.1:9000",
+                "node_id": 7,
+                "server_node_id": 9,
                 "format": "vfssend1",
                 "incremental": false,
             }),
@@ -8499,6 +8528,8 @@ mod tests {
             let mut args = json!({
                 "output": output.display().to_string(),
                 "target_addr": "127.0.0.1:9000",
+                "node_id": 7,
+                "server_node_id": 9,
                 "format": "vfssend2",
                 "incremental": false,
             });
@@ -8573,6 +8604,8 @@ mod tests {
             let mut args = json!({
                 "output": output.display().to_string(),
                 "target_addr": "127.0.0.1:9000",
+                "node_id": 7,
+                "server_node_id": 9,
                 "format": "vfssend2",
                 "incremental": false,
             });
@@ -8724,6 +8757,8 @@ mod tests {
             json!({
                 "output": output.display().to_string(),
                 "target_addr": "127.0.0.1:9000",
+                "node_id": 7,
+                "server_node_id": 9,
                 "format": "vfssend2",
                 "incremental": false,
             }),
@@ -8763,6 +8798,8 @@ mod tests {
             json!({
                 "output": output.display().to_string(),
                 "target_addr": "127.0.0.1:0",
+                "node_id": 7,
+                "server_node_id": 9,
                 "format": "vfssend2",
                 "incremental": false,
             }),
