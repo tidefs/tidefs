@@ -58,7 +58,6 @@ while [[ $# -gt 0 ]]; do
     --root-dir)
       [[ $# -ge 2 ]] || { echo "--root-dir requires an argument" >&2; exit 2; }
       root_dir="$2"
-      build_args+=("$1" "$2")
       shift 2
       ;;
     --build-timeout)
@@ -89,6 +88,7 @@ done
 verified_source_ref=""
 source_checkout=""
 source_snapshot=""
+run_root_dir=""
 build_script="$script_dir/tidefs-nix-qemu-build"
 cleanup_source_snapshot() {
   if [[ -n "$source_snapshot" ]]; then
@@ -96,7 +96,14 @@ cleanup_source_snapshot() {
     source_snapshot=""
   fi
 }
-trap cleanup_source_snapshot EXIT
+cleanup_launcher() {
+  cleanup_source_snapshot
+  if [[ -n "$run_root_dir" ]]; then
+    rm -rf -- "$run_root_dir"
+    run_root_dir=""
+  fi
+}
+trap cleanup_launcher EXIT
 
 if git -C "$repo" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   source_checkout="$repo"
@@ -133,21 +140,31 @@ if [[ -n "$source_checkout" ]]; then
 fi
 export GITHUB_SHA
 export TIDEFS_FUSE_VM_TEST_VERIFIED_SOURCE_REF="$verified_source_ref"
+# Keep this launch's closure rooted independently until its runner exits.
+mkdir -p "$root_dir"
+run_root_dir="$(mktemp -d "$root_dir/.tidefs-fuse-vm-run.XXXXXX")"
 
 bash "$build_script" \
   --target tidefsFuseVmTest \
   --name tidefs-fuse-vm-test \
   --repo "$repo" \
   --system "$system" \
+  --root-dir "$run_root_dir" \
   "${build_args[@]}"
 
 cleanup_source_snapshot
-trap - EXIT
 
-runner="$root_dir/tidefs-fuse-vm-test/bin/tidefs-fuse-vm-test-runner"
+runner="$run_root_dir/tidefs-fuse-vm-test/bin/tidefs-fuse-vm-test-runner"
 if [[ ! -x "$runner" ]]; then
   echo "tidefs-fuse-vm-test: built runner not found: $runner" >&2
   exit 2
 fi
 
-exec "$runner" "${runner_args[@]}"
+if "$runner" "${runner_args[@]}"; then
+  runner_status=0
+else
+  runner_status=$?
+fi
+cleanup_launcher
+trap - EXIT
+exit "$runner_status"
