@@ -316,7 +316,7 @@ where
         &self,
         now: Instant,
     ) -> Result<usize, VfsRpcBulkWriteRuntimeError> {
-        self.process_terminal_events()?;
+        let terminal_error = self.process_terminal_events().err();
         let expired = {
             let state = self.state.lock().unwrap();
             let timeout = state.adapter.config().request_timeout;
@@ -367,7 +367,10 @@ where
             };
             self.send_control_reply(key.connection_id, control_response_frame(&response)?)?;
         }
-        Ok(expired.len())
+        match terminal_error {
+            Some(error) => Err(error),
+            None => Ok(expired.len()),
+        }
     }
 
     fn process_terminal_events(&self) -> Result<(), VfsRpcBulkWriteRuntimeError> {
@@ -1148,5 +1151,45 @@ mod tests {
         assert_eq!(target.writes(), vec![b"abc".to_vec()]);
         assert_eq!(runtime.pending_write_count(), 0);
         assert_eq!(sink.replies().len(), 1);
+    }
+
+    #[test]
+    fn terminal_error_does_not_block_expired_write_retirement() {
+        let (runtime, target, sink) = runtime(Duration::from_millis(10));
+        let handle = create_handle(&runtime);
+        let data_dispatch = runtime.data_dispatch();
+        let orphan = accept_write_transfer(&data_dispatch, 77, 19, 3);
+        let admitted = accept_write_transfer(&data_dispatch, 2, 20, 3);
+        let now = Instant::now();
+        admitted_write(&runtime, handle, admitted, 3, now);
+        grant_and_write(&runtime, &data_dispatch, 19, orphan, b"bad");
+
+        runtime
+            .bulk
+            .handle_data_service_frame(
+                SESSION_ID,
+                BulkFrame::Done(BulkDoneFrame {
+                    stream_id: 19,
+                    token: orphan,
+                    total_transferred: 3,
+                    checksum32: 0x3c48_33b6,
+                })
+                .to_data_service_frame()
+                .expect("done frame"),
+            )
+            .expect("queue orphan completion");
+
+        assert!(runtime
+            .expire_write_timeouts(now + Duration::from_millis(10))
+            .is_err());
+        assert!(target.writes().is_empty());
+        assert_eq!(runtime.pending_write_count(), 0);
+        assert_eq!(runtime.bulk.active_transfer_count(SESSION_ID.0), 0);
+        let replies = sink.replies();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(
+            response(replies[0].1.clone()).header.errno,
+            Errno::ETIMEDOUT
+        );
     }
 }
