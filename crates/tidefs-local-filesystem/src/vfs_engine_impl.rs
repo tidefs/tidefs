@@ -3049,6 +3049,10 @@ impl VfsLocalFileSystem {
                 server_node_id,
                 output,
             } => {
+                if let Err(err) = snap_net_payload_len(stream.encoded.len()) {
+                    return live_admin_error(1, err);
+                }
+
                 let mut transport = Transport::new(*node_id);
                 transport.add_node(NodeInfo::new(
                     *server_node_id,
@@ -3107,7 +3111,11 @@ impl VfsLocalFileSystem {
                 let auth_key = self.fs.borrow().root_authentication_key.as_bytes32();
                 let request = match build_snap_push_message(&stream.encoded, &auth_key) {
                     Ok(request) => request,
-                    Err(err) => return live_admin_error(1, err),
+                    Err(err) => {
+                        let _ =
+                            transport.close_session(session_id, SessionCloseReason::LocalShutdown);
+                        return live_admin_error(1, err);
+                    }
                 };
 
                 if let Err(err) = transport.send_message(session_id, &request) {
@@ -8613,6 +8621,48 @@ mod tests {
                 .as_str()
                 .is_some_and(|err| { err.contains("127.0.0.1:9000") }),
             "target response should reference the target address: {refused}"
+        );
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn live_snapshot_send_rejects_oversized_target_before_connecting() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = root.path().join("store");
+        let mut fs = LocalFileSystem::open(&store).expect("open fs");
+        fs.create_file("/oversized.bin", 0o644)
+            .expect("create oversized file");
+        let max_payload_len =
+            snap_net_transport_payload_max_len().expect("transport payload limit");
+        let contents = vec![0x5a; max_payload_len + 1];
+        fs.write_file("/oversized.bin", 0, &contents)
+            .expect("write oversized file");
+        let engine = VfsLocalFileSystem::new(fs);
+        let output = root.path().join("oversized-target.vfs");
+
+        let refused = live_snapshot_admin(
+            &engine,
+            "send",
+            json!({
+                "output": output.display().to_string(),
+                "target_addr": "127.0.0.1:0",
+                "format": "vfssend2",
+                "incremental": false,
+            }),
+            true,
+        );
+
+        assert_eq!(refused["ok"], false, "target response: {refused}");
+        assert_eq!(refused["exit_code"], 1);
+        assert!(refused["json"].is_null());
+        assert!(refused["text"].is_null());
+        assert!(
+            refused["error"].as_str().is_some_and(|err| {
+                err.starts_with(
+                    "snapshot send: export payload is too large for tidefs-transport message admission:"
+                ) && err.ends_with(&format!("(max {max_payload_len})"))
+            }),
+            "oversized export should fail admission before target connection: {refused}"
         );
         assert!(!output.exists());
     }
