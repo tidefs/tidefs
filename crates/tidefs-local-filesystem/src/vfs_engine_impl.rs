@@ -4286,6 +4286,11 @@ fn live_snapshot_send_destination(args: &Value) -> Result<LiveSnapshotSendDestin
                     "snapshot send: invalid target-addr '{target_addr}': port must be non-zero"
                 ));
             }
+            if addr.ip().is_unspecified() {
+                return Err(format!(
+                    "snapshot send: invalid target-addr '{target_addr}': IP address must not be unspecified"
+                ));
+            }
             let node_id = live_admin_required_u64_arg(args, "node_id")?;
             let server_node_id = live_admin_required_u64_arg(args, "server_node_id")?;
             if node_id == 0 {
@@ -6927,6 +6932,22 @@ mod tests {
                     .to_string()
             )
         );
+    }
+
+    #[test]
+    fn live_snapshot_send_destination_rejects_unspecified_targets() {
+        for target_addr in ["0.0.0.0:9000", "[::]:9000"] {
+            assert_eq!(
+                live_snapshot_send_destination(&json!({
+                    "target_addr": target_addr,
+                    "node_id": 1,
+                    "server_node_id": 2,
+                })),
+                Err(format!(
+                    "snapshot send: invalid target-addr '{target_addr}': IP address must not be unspecified"
+                ))
+            );
+        }
     }
 
     #[test]
