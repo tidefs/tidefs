@@ -916,6 +916,19 @@ impl DeviceManager {
                     ),
                 });
             }
+            if record.label.device_index as usize != index {
+                return Err(StoreError::Io {
+                    operation: "topology_label_authority",
+                    path: config.path.clone(),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "pool label device index {} does not match caller topology index {index}",
+                            record.label.device_index
+                        ),
+                    ),
+                });
+            }
             let authority = TopologyLabelAuthority {
                 redundancy_policy: record.label.redundancy_policy,
                 device_layout_policy: record.device_layout_policy,
@@ -1565,6 +1578,63 @@ mod tests {
                 assert!(source
                     .to_string()
                     .contains("device GUID does not match caller topology at index 0"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        assert_eq!(fs::read(&label_path).unwrap(), label_before);
+        assert!(!new_dir.join(".tidefs_label").exists());
+
+        let _ = fs::remove_dir_all(&existing_dir);
+        let _ = fs::remove_dir_all(&new_dir);
+    }
+
+    #[test]
+    fn add_device_refuses_mismatched_label_index_before_writing_new_device() {
+        let existing_dir = temp_dir("dm-add-index-mismatch-existing");
+        let new_dir = temp_dir("dm-add-index-mismatch-new");
+        let existing_config = make_device_config(&existing_dir);
+        let new_config = make_device_config(&new_dir);
+        let pool_guid = [0x31; 16];
+        let existing_guid = [0x32; 16];
+
+        DeviceManager::write_single_device_label(LabelWriteRequest {
+            device_config: &existing_config,
+            pool_guid,
+            device_guid: existing_guid,
+            pool_name: "index-mismatch",
+            pool_state: crate::pool_label::LabelPoolState::Active,
+            commit_group: 1,
+            label_commit_group: 1,
+            device_index: 1,
+            topology_generation: 1,
+            device_count: 1,
+            redundancy_policy: PoolRedundancyPolicy::default(),
+            device_layout_policy: None,
+        })
+        .unwrap();
+        let label_path = existing_dir.join(".tidefs_label");
+        let label_before = fs::read(&label_path).unwrap();
+
+        let error = DeviceManager::add_device(
+            std::slice::from_ref(&existing_config),
+            &new_config,
+            pool_guid,
+            &[existing_guid],
+            [0x33; 16],
+            "index-mismatch",
+            1,
+        )
+        .expect_err("caller topology must not replace the persisted device index");
+
+        match error {
+            StoreError::Io {
+                operation, source, ..
+            } => {
+                assert_eq!(operation, "topology_label_authority");
+                assert_eq!(source.kind(), std::io::ErrorKind::InvalidData);
+                assert!(source
+                    .to_string()
+                    .contains("pool label device index 1 does not match caller topology index 0"));
             }
             other => panic!("unexpected error: {other:?}"),
         }
