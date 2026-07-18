@@ -827,13 +827,8 @@ fn sync_snapshot_barrier_store(
                 object_count: ts.stats().object_count,
             })
         }
-        StoreBackend::PoolBacked(pool) => {
-            pool.sync_all().map_err(|err| err.to_string())?;
-            Ok(SnapshotBarrierStoreSnapshot {
-                committed_root_txg: 0,
-                committed_root_generation: 0,
-                object_count: pool.pool_stats().object_count,
-            })
+        StoreBackend::PoolBacked(_) => {
+            Err("pool-backed snapshot barrier cannot report committed-root txg/generation".into())
         }
     }
 }
@@ -6945,6 +6940,32 @@ mod cluster_pool_handler_tests {
                 max_generation: 6,
             }
         );
+    }
+
+    #[test]
+    fn snapshot_barrier_before_send_refuses_pool_without_root_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let (imported, lock_dir, _devices) = imported_regular_file_pool(
+            &dir,
+            &["dev0.img", "dev1.img"],
+            RedundancyPolicy::replicated(2),
+        );
+        let store = Arc::new(Mutex::new(StoreBackend::PoolBacked(Box::new(
+            open_imported_pool_backend(&imported, &lock_dir).unwrap(),
+        ))));
+        let ctx = frame_test_context(Arc::clone(&store));
+
+        let err = run_snapshot_barrier_before_send(tidefs_transport::SessionId::new(1), &ctx, &[])
+            .expect_err("pool-backed send must refuse missing committed-root identity");
+
+        match &err {
+            SnapshotBarrierSendError::LocalSyncFailed { reason, .. } => assert_eq!(
+                reason,
+                "pool-backed snapshot barrier cannot report committed-root txg/generation"
+            ),
+            other => panic!("expected pool root-identity refusal, got {other:?}"),
+        }
+        assert!(ctx.active_barrier.lock().unwrap().is_none());
     }
 
     #[test]
