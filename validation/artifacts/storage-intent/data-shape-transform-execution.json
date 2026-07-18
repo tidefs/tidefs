@@ -1,70 +1,211 @@
 {
-  "schema_version": 1,
+  "report_version": 2,
   "claim_id": "storage.intent.data_shape_honesty.v1",
   "issue": "https://github.com/tidefs/tidefs/issues/1981",
-  "validation_tier": "source-model",
-  "artifact_scope": "source-model inventory of required transform-execution runtime evidence for data-shape honesty",
+  "run_id": "29644583929/1",
+  "source_ref": "fb1490f5bfe2e662e180f11f54bc03bebb5a7f48",
+  "generated_at": "2026-07-18T12:36:23Z",
+  "validation_tier": "qemu-guest",
+  "command": "storage-intent-data-shape-runtime-validation",
+  "artifact_scope": "QEMU-guest helper transform execution and exact refusal rows for a bounded subset of storage-intent data-shape families",
   "outcome": "skip",
-  "skip_reason": "No qemu-guest or mounted runtime transform execution was produced in this source-model slice.",
-  "runtime_execution_produced": false,
-  "not_evidence": [
-    "source-model rows",
-    "policy labels",
-    "transformed byte names",
-    "simulated output",
-    "compression ratio",
-    "rebake intent"
-  ],
-  "required_runtime_rows": [
+  "runtime_execution_produced": true,
+  "runtime_source": {
+    "carrier": "linux-7.0-qemu-guest/fuse-vm-test",
+    "kernel_release": "7.0.0",
+    "command": "storage-intent-data-shape-runtime-validation",
+    "code_paths": [
+      "tidefs-compression encode/decode helpers",
+      "tidefs-checksum-tree ObjectDigest",
+      "tidefs-encryption extent AEAD helpers",
+      "tidefs-erasure-coding receipt stripe helpers"
+    ]
+  },
+  "rows": [
     {
-      "row": "compression-transform-execution",
-      "required_command_tier": "qemu-guest",
-      "required_observation": "write source bytes, transform through compiled policy, read/decode, and verify source and transformed digests under the same evidence cut",
-      "status": "blocked",
-      "missing_evidence": "no runtime command, guest log, decoded bytes, or receipt record"
+      "row": "compression-zstd-helper-roundtrip",
+      "families": [
+        "compression"
+      ],
+      "status": "pass",
+      "operation": "encode and decode one deterministic Zstd helper frame",
+      "observation": {
+        "decoded_digest": "blake3:23f54976d3054645db833986d8029ba60ade918703cfd560e3158fb687d034e4",
+        "guest_elapsed_ns": 1253481,
+        "observed_algorithm": "zstd",
+        "requested_algorithm": "zstd",
+        "round_trip_exact": true,
+        "source_digest": "blake3:23f54976d3054645db833986d8029ba60ade918703cfd560e3158fb687d034e4",
+        "source_len": 65536,
+        "stored_frame_digest": "blake3:0cffe5796963780b492f09d3e661e63a06958edaf4e0a5797ca72224dbc77ea2",
+        "stored_frame_len": 59
+      },
+      "exact_boundary": "Helper/library execution only; no mounted policy, receipt, raw-store, recovery, or source-retirement authority."
     },
     {
-      "row": "digest-checksum-transform-execution",
-      "required_command_tier": "qemu-guest",
-      "required_observation": "verify source/transformed digest binding and mismatch refusal",
-      "status": "blocked",
-      "missing_evidence": "no runtime mismatch or checksum refusal row"
+      "row": "compression-lz4-helper-roundtrip",
+      "families": [
+        "compression"
+      ],
+      "status": "pass",
+      "operation": "encode and decode one deterministic LZ4 helper frame",
+      "observation": {
+        "decoded_digest": "blake3:23f54976d3054645db833986d8029ba60ade918703cfd560e3158fb687d034e4",
+        "guest_elapsed_ns": 109395,
+        "observed_algorithm": "lz4",
+        "requested_algorithm": "lz4",
+        "round_trip_exact": true,
+        "source_digest": "blake3:23f54976d3054645db833986d8029ba60ade918703cfd560e3158fb687d034e4",
+        "source_len": 65536,
+        "stored_frame_digest": "blake3:67fdd3eea3a56341d4e106503db351dd71abbcf3e55a79b02581cb55685a53b5",
+        "stored_frame_len": 312
+      },
+      "exact_boundary": "Helper/library execution only; no mounted policy, receipt, raw-store, recovery, or source-retirement authority."
     },
     {
-      "row": "dedupe-transform-execution",
-      "required_command_tier": "qemu-guest",
-      "required_observation": "prove dedupe within a legal domain and refuse illegal or unknown domains",
-      "status": "blocked",
-      "missing_evidence": "no mounted or qemu dedupe-domain execution row"
+      "row": "stored-frame-digest-mismatch-refusal",
+      "families": [
+        "digest-checksum",
+        "compression"
+      ],
+      "status": "pass",
+      "operation": "bind ObjectDigest to exact stored helper-frame bytes and reject one-byte mutation",
+      "observation": {
+        "domain": "object-content",
+        "original_verified": true,
+        "stored_frame_digest": "b88bb1dea0011c6d603061577289ade2f78e9c00c37bdf3c9dd054cfc4d0770d",
+        "tampered_frame_digest": "blake3:170454e578b32ac1655a95e0b85411f940eec3b32ee56510aad236ba12fa41e2",
+        "tampered_refused": true
+      },
+      "exact_boundary": "Domain-separated helper digest evidence only; no end-to-end mounted integrity, scrub, repair, or durable-media claim."
     },
     {
-      "row": "encryption-transform-execution",
-      "required_command_tier": "qemu-guest",
-      "required_observation": "bind ciphertext authentication to key epoch and refuse stale or wrong epochs",
-      "status": "blocked",
-      "missing_evidence": "no runtime key-epoch or authenticated-decode row"
+      "row": "malformed-compression-frame-refusal",
+      "families": [
+        "compression",
+        "digest-checksum"
+      ],
+      "status": "pass",
+      "operation": "submit unknown-algorithm and truncated compression frames",
+      "observation": {
+        "generic_success_forbidden": true,
+        "short_frame_refusal": "frame-too-short-len-3",
+        "unknown_algorithm_refusal": "unknown-algorithm-0xff"
+      },
+      "exact_boundary": "Typed compression helper refusal only; other transform-frame families remain unexecuted."
     },
     {
-      "row": "ec-archive-transform-execution",
-      "required_command_tier": "qemu-guest",
-      "required_observation": "encode/decode or recall through declared width and refuse under-width shapes",
-      "status": "blocked",
-      "missing_evidence": "no runtime EC/archive encode, decode, recall, degraded, or under-width row"
+      "row": "encryption-aead-helper-roundtrip-refusal",
+      "families": [
+        "encryption"
+      ],
+      "status": "pass",
+      "operation": "encrypt/decrypt one extent helper frame and reject wrong-key and tampered ciphertext",
+      "observation": {
+        "algorithm": "chacha20-poly1305-helper",
+        "decoded_digest": "blake3:23f54976d3054645db833986d8029ba60ade918703cfd560e3158fb687d034e4",
+        "guest_elapsed_ns": 1490865,
+        "key_material_serialized": false,
+        "round_trip_exact": true,
+        "source_digest": "blake3:23f54976d3054645db833986d8029ba60ade918703cfd560e3158fb687d034e4",
+        "source_len": 65536,
+        "stored_frame_digest": "blake3:989182aa2e6bdbc011708f0db710f4b0a7dbbd841c88f42482e345d9418fa358",
+        "stored_frame_len": 65564,
+        "tampered_ciphertext_refused": true,
+        "wrong_key_refused": true
+      },
+      "exact_boundary": "AEAD helper execution only; no key-epoch lifecycle, mounted dispatch, media reachability, cryptographic erase, or source-retirement proof."
+    },
+    {
+      "row": "ec-helper-degraded-reconstruction-under-width-refusal",
+      "families": [
+        "erasure-coding"
+      ],
+      "status": "pass",
+      "operation": "encode local 2+1 receipt stripe, reconstruct one missing shard, and refuse one-of-three under-width input",
+      "observation": {
+        "degraded_available_shards": 2,
+        "guest_elapsed_ns": 27161,
+        "profile": "local-helper-2-plus-1",
+        "rebuilt_shard_indexes": [
+          0
+        ],
+        "reconstructed_digest": "blake3:4799f4217157d73881d6ce590ce9f2f0dac083486eb1017d86650a0c95199ebc",
+        "source_digest": "blake3:4799f4217157d73881d6ce590ce9f2f0dac083486eb1017d86650a0c95199ebc",
+        "source_len": 96,
+        "stripe_width": 3,
+        "under_width_available": 1,
+        "under_width_needed": 2,
+        "under_width_refused": true
+      },
+      "exact_boundary": "Local EC helper execution only; no pool placement, distributed recovery, archive recall, availability, or degraded-read product claim."
+    },
+    {
+      "row": "dedupe-domain-transform-execution",
+      "families": [
+        "dedupe"
+      ],
+      "status": "skip",
+      "operation": "deduplicate inside a legal domain and refuse illegal or unknown domains",
+      "observation": {
+        "missing_evidence": "no runtime dedupe domain and reference-ownership path was executed"
+      },
+      "exact_boundary": "Dedupe work remains owned outside this helper-validation slice."
+    },
+    {
+      "row": "archive-recall-transform-execution",
+      "families": [
+        "archive-shape"
+      ],
+      "status": "skip",
+      "operation": "recall through declared archive media width and serving-role policy",
+      "observation": {
+        "missing_evidence": "no archive media, retention, recall, or serving-role path was executed"
+      },
+      "exact_boundary": "Local EC helper execution does not imply archive support."
     },
     {
       "row": "coalescing-transform-execution",
-      "required_command_tier": "qemu-guest",
-      "required_observation": "prove source mapping, split/replay, and refusal before source retirement",
-      "status": "blocked",
-      "missing_evidence": "no runtime coalescing receipt or rollback row"
+      "families": [
+        "coalescing"
+      ],
+      "status": "skip",
+      "operation": "coalesce records with split/replay and source mapping",
+      "observation": {
+        "missing_evidence": "no runtime coalescing implementation or receipt path was executed"
+      },
+      "exact_boundary": "Coalescing and source retirement remain blocked."
     },
     {
       "row": "rebake-transform-execution",
-      "required_command_tier": "qemu-guest",
-      "required_observation": "prove old/new byte equivalence, cutover receipt, and source-retirement boundary",
-      "status": "blocked",
-      "missing_evidence": "no runtime rebake execution, cutover, or retirement row"
+      "families": [
+        "rebake"
+      ],
+      "status": "skip",
+      "operation": "rebake old bytes into replacement authority with cutover and rollback receipts",
+      "observation": {
+        "missing_evidence": "no rebake executor, cutover receipt, rollback, or source-retirement path was executed"
+      },
+      "exact_boundary": "Placement, rebake, reclaim, and source-retirement work remains outside this slice."
     }
   ],
-  "claim_effect": "The transform-execution evidence class remains blocked; this artifact records the exact rows needed without widening product claims."
+  "summary": {
+    "status": "skip",
+    "passed": 6,
+    "product_failed": 0,
+    "skipped": 4
+  },
+  "non_claims": [
+    "not mounted transform authority",
+    "not compiled-policy or receipt satisfaction",
+    "not encryption key-lifecycle or cryptographic-erase proof",
+    "not EC placement, archive, distributed recovery, or availability proof",
+    "not dedupe, coalescing, rebake, reclaim, or source-retirement execution"
+  ],
+  "claim_effect": "Actual helper execution now exists for compression, stored-frame digest rejection, AEAD refusal, and local EC reconstruction/refusal, but the registered evidence class and claim remain blocked on the skipped rows and end-to-end authority boundaries.",
+  "residual_risk": [
+    "The passing rows execute helper/library code in one QEMU guest; they do not prove mounted transform dispatch, raw-store conformance, compiled-policy receipt satisfaction, recovery, or source retirement.",
+    "Dedupe-domain execution, key-epoch lifecycle proof, archive recall, coalescing, and rebake remain unexecuted, so the transform-execution evidence class and claim remain blocked.",
+    "The rows do not widen compression, checksum, encryption, EC/archive, capacity, performance, production, release-readiness, or successor/comparator wording."
+  ]
 }

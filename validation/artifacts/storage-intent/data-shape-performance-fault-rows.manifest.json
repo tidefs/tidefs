@@ -2,21 +2,21 @@
   "manifest_version": 2,
   "claim_id": "storage.intent.data_shape_honesty.v1",
   "evidence_class": "storage-intent-data-shape-performance-fault-rows",
-  "validation_tier": "source-model",
-  "scope": "source-model performance and fault row inventory for data-shape honesty; runtime rows not produced in this slice",
+  "validation_tier": "qemu-guest",
+  "scope": "QEMU-guest partial data-shape fault observations plus explicitly blocked performance and unexecuted family rows; outcome=SKIP pass=5 product_fail=0 skip=7",
   "artifact_path": "validation/artifacts/storage-intent/data-shape-performance-fault-rows.json",
-  "content_digest": "blake3:a1ab3a94073f517f6bf2dbd8ed4b8ebf2c04825f3d9317bee93c110251ce01e9",
-  "run_id": "deterministic-fixture:issue-1981-data-shape-performance-fault-rows-v1",
-  "source_ref": "refs/heads/codex1/issue-1981-data-shape-evidence",
+  "content_digest": "blake3:d98946114203e096479d3de5306d6e5f5ce02e0f26f6b264bb218197d06fce62",
+  "run_id": "29644583929/1",
+  "source_ref": "fb1490f5bfe2e662e180f11f54bc03bebb5a7f48",
   "outcome": "skip",
-  "residual_risk": "No qemu-guest CPU cost, read amplification, degraded reconstruction, key epoch, illegal dedupe domain, malformed transform frame, or EC/archive under-width rows were produced.",
-  "source": "issue-1981-source-review",
-  "generated_at": "2026-07-12T19:16:51Z",
+  "residual_risk": "Elapsed guest timings are diagnostic observations without a stable CPU, workload, topology, or comparator baseline and are not a performance claim. Read amplification, key epochs, illegal dedupe domains, archive recall, coalescing, rebake, and cross-family malformed-frame coverage remain unexecuted. Local EC helper reconstruction and under-width refusal do not prove pool placement, distributed recovery, archive serving, degraded-read product safety, or availability.",
+  "source": "qemu-fuse-vm-data-shape-helper-runtime-v1",
+  "generated_at": "2026-07-18T12:36:23Z",
   "blocking_issues": [
     {
       "repo": "tidefs/tidefs",
       "number": 1981,
-      "reason": "runtime performance and fault rows remain unproduced"
+      "reason": "data-shape runtime evidence remains partial and the registered claim stays blocked"
     }
   ]
 }
