@@ -23,7 +23,7 @@ pub mod protocol;
 pub mod sender;
 pub mod vfs_rpc_handoff;
 
-pub use data_service::BulkDataServiceHandler;
+pub use data_service::{BulkDataServiceHandler, BulkDataServiceTerminal};
 pub use protocol::{
     BulkAbortFrame, BulkAcceptFrame, BulkCreditGrantFrame, BulkCreditRequestFrame,
     BulkCreditResult, BulkDoneFrame, BulkFrame, BulkFrameKind, BulkMethod, BulkOfferFrame,

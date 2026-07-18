@@ -28,6 +28,13 @@ pub struct BulkDataServiceHandler {
     aborted: Mutex<Vec<AbortedBulkTransfer>>,
 }
 
+/// Terminal record produced while handling one DATA service frame.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BulkDataServiceTerminal {
+    Completed(CompletedBulkTransfer),
+    Aborted(AbortedBulkTransfer),
+}
+
 impl BulkDataServiceHandler {
     #[must_use]
     pub fn new(service: BulkService) -> Self {
@@ -126,6 +133,49 @@ impl BulkDataServiceHandler {
     pub fn drain_aborted(&self) -> Vec<AbortedBulkTransfer> {
         std::mem::take(&mut *self.aborted.lock().unwrap())
     }
+
+    /// Handle one DATA frame and return its terminal record to the same caller.
+    ///
+    /// This frame-scoped path lets a runtime preserve DONE/ABORT ownership
+    /// under concurrent dispatch instead of publishing the record through the
+    /// handler-global drain queues.
+    pub fn handle_data_service_frame_with_terminal(
+        &self,
+        session_id: SessionId,
+        frame: DataServiceFrame,
+    ) -> (
+        Result<DataServiceDispatchOutcome, DataServiceDispatchError>,
+        Option<BulkDataServiceTerminal>,
+    ) {
+        let connection_id = session_id.0;
+        let frame = match BulkFrame::from_data_service_frame(frame) {
+            Ok(frame) => frame,
+            Err(error) => return (Err(reject_protocol(error)), None),
+        };
+        match frame {
+            BulkFrame::Offer(frame) => (self.handle_offer(connection_id, frame), None),
+            BulkFrame::CreditRequest(frame) => (self.handle_credit(connection_id, frame), None),
+            BulkFrame::Done(frame) => self.handle_done_with_terminal(connection_id, frame),
+            BulkFrame::Abort(frame) => self.handle_abort_with_terminal(connection_id, frame),
+            BulkFrame::Accept(_) | BulkFrame::CreditGrant(_) => (
+                Err(reject_reason(
+                    "BULK response frames require a sender-side coordinator",
+                )),
+                None,
+            ),
+        }
+    }
+
+    fn record_terminal(&self, terminal: BulkDataServiceTerminal) {
+        match terminal {
+            BulkDataServiceTerminal::Completed(completed) => {
+                self.completed.lock().unwrap().push(completed);
+            }
+            BulkDataServiceTerminal::Aborted(aborted) => {
+                self.aborted.lock().unwrap().push(aborted);
+            }
+        }
+    }
 }
 
 impl DataServiceHandler for BulkDataServiceHandler {
@@ -134,16 +184,11 @@ impl DataServiceHandler for BulkDataServiceHandler {
         session_id: SessionId,
         frame: DataServiceFrame,
     ) -> Result<DataServiceDispatchOutcome, DataServiceDispatchError> {
-        let connection_id = session_id.0;
-        match BulkFrame::from_data_service_frame(frame).map_err(reject_protocol)? {
-            BulkFrame::Offer(frame) => self.handle_offer(connection_id, frame),
-            BulkFrame::CreditRequest(frame) => self.handle_credit(connection_id, frame),
-            BulkFrame::Done(frame) => self.handle_done(connection_id, frame),
-            BulkFrame::Abort(frame) => self.handle_abort(connection_id, frame),
-            BulkFrame::Accept(_) | BulkFrame::CreditGrant(_) => Err(reject_reason(
-                "BULK response frames require a sender-side coordinator",
-            )),
+        let (outcome, terminal) = self.handle_data_service_frame_with_terminal(session_id, frame);
+        if let Some(terminal) = terminal {
+            self.record_terminal(terminal);
         }
+        outcome
     }
 }
 
@@ -187,14 +232,21 @@ impl BulkDataServiceHandler {
         reply(BulkFrame::CreditGrant(grant))
     }
 
-    fn handle_done(
+    fn handle_done_with_terminal(
         &self,
         connection_id: ConnectionId,
         frame: BulkDoneFrame,
-    ) -> Result<DataServiceDispatchOutcome, DataServiceDispatchError> {
+    ) -> (
+        Result<DataServiceDispatchOutcome, DataServiceDispatchError>,
+        Option<BulkDataServiceTerminal>,
+    ) {
         let terminal = {
             let mut service = self.service.lock().unwrap();
-            ensure_stream_token(&service, connection_id, frame.stream_id, frame.token)?;
+            if let Err(error) =
+                ensure_stream_token(&service, connection_id, frame.stream_id, frame.token)
+            {
+                return (Err(error), None);
+            }
             service.done_with_terminal(
                 connection_id,
                 frame.token,
@@ -203,33 +255,41 @@ impl BulkDataServiceHandler {
             )
         };
         match terminal {
-            Ok(completed) => {
-                self.completed.lock().unwrap().push(completed);
-                Ok(DataServiceDispatchOutcome::Consumed)
-            }
-            Err((error, aborted)) => {
-                if let Some(aborted) = aborted {
-                    self.aborted.lock().unwrap().push(aborted);
-                }
-                Err(reject_bulk(error))
-            }
+            Ok(completed) => (
+                Ok(DataServiceDispatchOutcome::Consumed),
+                Some(BulkDataServiceTerminal::Completed(completed)),
+            ),
+            Err((error, aborted)) => (
+                Err(reject_bulk(error)),
+                aborted.map(BulkDataServiceTerminal::Aborted),
+            ),
         }
     }
 
-    fn handle_abort(
+    fn handle_abort_with_terminal(
         &self,
         connection_id: ConnectionId,
         frame: BulkAbortFrame,
-    ) -> Result<DataServiceDispatchOutcome, DataServiceDispatchError> {
+    ) -> (
+        Result<DataServiceDispatchOutcome, DataServiceDispatchError>,
+        Option<BulkDataServiceTerminal>,
+    ) {
         let aborted = {
             let mut service = self.service.lock().unwrap();
-            ensure_stream_token(&service, connection_id, frame.stream_id, frame.token)?;
-            service
-                .abort(connection_id, frame.token, frame.reason)
-                .map_err(reject_bulk)?
+            if let Err(error) =
+                ensure_stream_token(&service, connection_id, frame.stream_id, frame.token)
+            {
+                return (Err(error), None);
+            }
+            match service.abort(connection_id, frame.token, frame.reason) {
+                Ok(aborted) => aborted,
+                Err(error) => return (Err(reject_bulk(error)), None),
+            }
         };
-        self.aborted.lock().unwrap().push(aborted);
-        Ok(DataServiceDispatchOutcome::Consumed)
+        (
+            Ok(DataServiceDispatchOutcome::Consumed),
+            Some(BulkDataServiceTerminal::Aborted(aborted)),
+        )
     }
 }
 

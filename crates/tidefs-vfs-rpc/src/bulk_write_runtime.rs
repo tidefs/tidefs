@@ -14,10 +14,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use tidefs_bulk_service::{
-    AbortedBulkTransfer, BulkAbortReason, BulkDataServiceHandler, BulkError, BulkMetadata,
-    BulkTcpChunkFrame, BulkToken, BulkTransferDirection, CompletedBulkTransfer, ConnectionId,
-    StreamId, VfsRpcBulkAbort, VfsRpcBulkCompletion, VfsRpcBulkHandoff, VfsRpcBulkHandoffError,
-    VfsRpcBulkMethod, BULK_SERVICE_ID,
+    AbortedBulkTransfer, BulkAbortReason, BulkDataServiceHandler, BulkDataServiceTerminal,
+    BulkError, BulkMetadata, BulkTcpChunkFrame, BulkToken, BulkTransferDirection,
+    CompletedBulkTransfer, ConnectionId, StreamId, VfsRpcBulkAbort, VfsRpcBulkCompletion,
+    VfsRpcBulkHandoff, VfsRpcBulkHandoffError, VfsRpcBulkMethod, BULK_SERVICE_ID,
 };
 use tidefs_transport::{
     ConnectionReceiver, ControlServiceDispatch, ControlServiceDispatchError,
@@ -148,8 +148,8 @@ impl From<VfsRpcError> for VfsRpcBulkWriteRuntimeError {
 /// target.
 ///
 /// The supplied [`BulkDataServiceHandler`] is dedicated to this runtime's
-/// service `0x07` binding. The runtime drains its terminal queues so a DONE or
-/// ABORT is consumed by the VFS_RPC request that admitted the descriptor.
+/// service `0x07` binding. Each DATA dispatch returns its terminal record
+/// directly so a concurrent frame cannot consume another frame's DONE/ABORT.
 pub struct VfsRpcBulkWriteRuntime<T> {
     state: Mutex<VfsRpcBulkWriteRuntimeState>,
     bridge: Mutex<VfsEngineBridge>,
@@ -391,14 +391,13 @@ where
     fn process_terminal_events(&self) -> Result<(), VfsRpcBulkWriteRuntimeError> {
         let mut first_error = None;
         for completed in self.bulk.drain_completed() {
-            let result = vfs_write_completion(completed)
-                .and_then(|completion| self.complete_write(completion));
+            let result = self.process_terminal_event(BulkDataServiceTerminal::Completed(completed));
             if let Err(error) = result {
                 first_error.get_or_insert(error);
             }
         }
         for aborted in self.bulk.drain_aborted() {
-            let result = vfs_write_abort(aborted).and_then(|abort| self.abort_write(abort));
+            let result = self.process_terminal_event(BulkDataServiceTerminal::Aborted(aborted));
             if let Err(error) = result {
                 first_error.get_or_insert(error);
             }
@@ -406,6 +405,19 @@ where
         match first_error {
             Some(error) => Err(error),
             None => Ok(()),
+        }
+    }
+
+    fn process_terminal_event(
+        &self,
+        terminal: BulkDataServiceTerminal,
+    ) -> Result<(), VfsRpcBulkWriteRuntimeError> {
+        match terminal {
+            BulkDataServiceTerminal::Completed(completed) => vfs_write_completion(completed)
+                .and_then(|completion| self.complete_write(completion)),
+            BulkDataServiceTerminal::Aborted(aborted) => {
+                vfs_write_abort(aborted).and_then(|abort| self.abort_write(abort))
+            }
         }
     }
 
@@ -523,11 +535,16 @@ where
         session_id: SessionId,
         frame: DataServiceFrame,
     ) -> Result<DataServiceDispatchOutcome, DataServiceDispatchError> {
-        let outcome = self.bulk.handle_data_service_frame(session_id, frame);
-        let terminal = self.process_terminal_events().map_err(data_runtime_error);
+        let (outcome, terminal) = self
+            .bulk
+            .handle_data_service_frame_with_terminal(session_id, frame);
+        let terminal = terminal
+            .map(|terminal| self.process_terminal_event(terminal))
+            .transpose()
+            .map_err(data_runtime_error);
         match (outcome, terminal) {
-            (Ok(outcome), Ok(())) => Ok(outcome),
-            (Err(error), Ok(())) => Err(error),
+            (Ok(outcome), Ok(_)) => Ok(outcome),
+            (Err(error), Ok(_)) => Err(error),
             (_, Err(error)) => Err(error),
         }
     }
@@ -1234,6 +1251,39 @@ mod tests {
         assert_eq!(target.writes(), vec![b"abc".to_vec()]);
         assert_eq!(runtime.pending_write_count(), 0);
         assert_eq!(sink.replies().len(), 1);
+    }
+
+    #[test]
+    fn frame_scoped_dispatch_does_not_drain_another_calls_terminal() {
+        let (runtime, target, sink) = runtime(Duration::from_secs(1));
+        let data_dispatch = runtime.data_dispatch();
+        let orphan = accept_write_transfer(&data_dispatch, 77, 24, 3);
+        grant_and_write(&runtime, &data_dispatch, 24, orphan, b"bad");
+
+        // Model another receive call after it publishes a terminal record but
+        // before the old runtime path could drain the handler-global queue.
+        runtime
+            .bulk
+            .handle_data_service_frame(
+                SESSION_ID,
+                BulkFrame::Done(BulkDoneFrame {
+                    stream_id: 24,
+                    token: orphan,
+                    total_transferred: 3,
+                    checksum32: 0x3c48_33b6,
+                })
+                .to_data_service_frame()
+                .expect("done frame"),
+            )
+            .expect("queue orphan completion");
+
+        let _unrelated = accept_write_transfer(&data_dispatch, 78, 25, 3);
+
+        assert!(target.writes().is_empty());
+        assert!(sink.replies().is_empty());
+        let queued = runtime.bulk.drain_completed();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].token, orphan);
     }
 
     #[test]
