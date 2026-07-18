@@ -3049,12 +3049,6 @@ impl VfsLocalFileSystem {
                 server_node_id,
                 output,
             } => {
-                let auth_key = self.fs.borrow().root_authentication_key.as_bytes32();
-                let request = match build_snap_push_message(&stream.encoded, &auth_key) {
-                    Ok(request) => request,
-                    Err(err) => return live_admin_error(1, err),
-                };
-
                 let mut transport = Transport::new(*node_id);
                 transport.add_node(NodeInfo::new(
                     *server_node_id,
@@ -3101,6 +3095,20 @@ impl VfsLocalFileSystem {
                         );
                     }
                 }
+
+                if !transport.session_has_authenticated_confidentiality(session_id) {
+                    let _ = transport.close_session(session_id, SessionCloseReason::AuthFailed);
+                    return live_admin_error(
+                        1,
+                        "snapshot send: target-address send requires authenticated transport confidentiality before sending root-authentication key",
+                    );
+                }
+
+                let auth_key = self.fs.borrow().root_authentication_key.as_bytes32();
+                let request = match build_snap_push_message(&stream.encoded, &auth_key) {
+                    Ok(request) => request,
+                    Err(err) => return live_admin_error(1, err),
+                };
 
                 if let Err(err) = transport.send_message(session_id, &request) {
                     let _ = transport.close_session(session_id, SessionCloseReason::LocalShutdown);
@@ -6988,85 +6996,6 @@ mod tests {
         );
     }
 
-    fn snap_net_ack(message: &[u8]) -> Vec<u8> {
-        let mut ack = Vec::new();
-        ack.extend_from_slice(SNAP_NET_MAGIC);
-        ack.push(SNAP_KIND_ACK);
-        let message_len = snap_net_len_u32("response message", message.len())
-            .expect("test response message fits VSNP frame");
-        ack.extend_from_slice(&message_len.to_le_bytes());
-        ack.extend_from_slice(message);
-        ack
-    }
-
-    #[derive(Clone, Debug, Eq, PartialEq)]
-    struct DecodedSnapPush {
-        export_len: usize,
-        incremental: bool,
-        roots_len: usize,
-        total_records: u64,
-        payload_bytes: u64,
-        from_root: Option<CommittedRootSummary>,
-    }
-
-    fn decode_snap_push_frame(
-        frame: &[u8],
-        expected_auth_key: &[u8; SNAP_NET_AUTH_KEY_LEN],
-    ) -> DecodedSnapPush {
-        assert!(frame.len() >= SNAP_NET_PUSH_HEADER_LEN);
-        assert_eq!(&frame[0..4], SNAP_NET_MAGIC);
-        assert_eq!(frame[4], SNAP_KIND_PUSH);
-
-        let auth_len = u32::from_le_bytes(frame[5..9].try_into().expect("auth len")) as usize;
-        assert_eq!(auth_len, SNAP_NET_AUTH_KEY_LEN);
-        let auth_start = 9;
-        let auth_end = auth_start + auth_len;
-        assert_eq!(&frame[auth_start..auth_end], &expected_auth_key[..]);
-
-        let export_len_offset = auth_end;
-        let export_len = u32::from_le_bytes(
-            frame[export_len_offset..export_len_offset + 4]
-                .try_into()
-                .expect("export len"),
-        ) as usize;
-        let export_start = export_len_offset + 4;
-        let export_end = export_start + export_len;
-        assert_eq!(frame.len(), export_end);
-
-        let decoded = crate::vfssend2_bridge::receive_vfssend2_to_changed_records(
-            &frame[export_start..export_end],
-        )
-        .expect("decode pushed export");
-
-        DecodedSnapPush {
-            export_len,
-            incremental: decoded.incremental,
-            roots_len: decoded.roots.len(),
-            total_records: decoded.total_records,
-            payload_bytes: decoded.payload_bytes,
-            from_root: decoded.from_root,
-        }
-    }
-
-    fn snap_net_error(message: &[u8]) -> Vec<u8> {
-        let mut error = Vec::new();
-        error.extend_from_slice(SNAP_NET_MAGIC);
-        error.push(SNAP_KIND_ERROR);
-        let message_len = snap_net_len_u32("response message", message.len())
-            .expect("test response message fits VSNP frame");
-        error.extend_from_slice(&message_len.to_le_bytes());
-        error.extend_from_slice(message);
-        error
-    }
-
-    fn snap_net_unknown_empty_response() -> Vec<u8> {
-        let mut response = Vec::new();
-        response.extend_from_slice(SNAP_NET_MAGIC);
-        response.push(9);
-        response.extend_from_slice(&0u32.to_le_bytes());
-        response
-    }
-
     fn accept_snapshot_transport_session(server: &mut Transport) -> SessionId {
         for _ in 0..200 {
             match server.accept_incoming() {
@@ -8689,7 +8618,7 @@ mod tests {
     }
 
     #[test]
-    fn live_snapshot_send_snap_net_target_address_receives_ack() {
+    fn live_snapshot_send_rejects_plaintext_target_before_sending_secret() {
         let root = tempfile::tempdir().expect("tempdir");
         let store = root.path().join("store");
         let mut fs = LocalFileSystem::open(&store).expect("open fs");
@@ -8697,8 +8626,7 @@ mod tests {
         fs.write_file("/live.txt", 0, b"live owner snapshot send")
             .expect("write file");
         let engine = VfsLocalFileSystem::new(fs);
-        let expected_auth_key = engine.fs.borrow().root_authentication_key.as_bytes32();
-        let output = root.path().join("target-ack.vfs");
+        let output = root.path().join("plaintext-target.vfs");
         let local_node_id = 7;
         let server_node_id = 9;
 
@@ -8713,26 +8641,18 @@ mod tests {
             TransportAddr::Tcp(addr) => addr.to_string(),
             _ => unreachable!("test binds TCP transport"),
         };
-        let (decoded_tx, decoded_rx) = std::sync::mpsc::channel();
+        let (push_tx, push_rx) = std::sync::mpsc::channel();
 
         let server_handle = thread::spawn(move || {
             let session_id = accept_snapshot_transport_session(&mut server);
             server.perform_handshake(session_id).expect("handshake");
-            let frame = server.recv_message(session_id).expect("recv push frame");
-
-            let decoded = decode_snap_push_frame(&frame, &expected_auth_key);
-            assert!(!decoded.incremental);
-            assert!(decoded.total_records > 0);
-            assert!(decoded.payload_bytes > 0);
-            decoded_tx.send(decoded).expect("send decoded push");
-
-            server
-                .send_message(session_id, &snap_net_ack(b"received"))
-                .expect("send ack");
+            push_tx
+                .send(server.recv_message(session_id).is_ok())
+                .expect("report whether a push arrived");
             let _ = server.close_session(session_id, SessionCloseReason::LocalShutdown);
         });
 
-        let sent = live_snapshot_admin(
+        let refused = live_snapshot_admin(
             &engine,
             "send",
             json!({
@@ -8746,238 +8666,22 @@ mod tests {
             true,
         );
 
-        assert_eq!(sent["ok"], true, "send response: {sent}");
-        assert_eq!(sent["json"]["target_addr"], target_addr);
-        assert_eq!(sent["json"]["node_id"], local_node_id);
-        assert_eq!(sent["json"]["server_node_id"], server_node_id);
-        assert_eq!(sent["json"]["remote_response"], "received");
-        assert_eq!(sent["json"]["format"], "vfssend2");
-        assert_eq!(sent["json"]["incremental"], false);
-        assert!(sent["json"]["bytes"].as_u64().unwrap_or(0) > 0);
-        let pushed = decoded_rx.recv().expect("decoded pushed stream");
-        assert_eq!(sent["json"]["bytes"], pushed.export_len as u64);
-        assert_eq!(sent["json"]["roots"], pushed.roots_len as u64);
-        assert_eq!(sent["json"]["records"], pushed.total_records);
-        assert_eq!(sent["json"]["payload_bytes"], pushed.payload_bytes);
-
-        let encoded = std::fs::read(&output).expect("read acked output");
-        let decoded = crate::vfssend2_bridge::receive_vfssend2_to_changed_records(&encoded)
-            .expect("decode acked output");
-        assert!(!decoded.incremental);
-        assert_eq!(decoded.roots.len(), pushed.roots_len);
-        assert_eq!(decoded.total_records, pushed.total_records);
-        assert_eq!(decoded.payload_bytes, pushed.payload_bytes);
-        assert!(decoded.total_records > 0);
-        assert!(decoded.payload_bytes > 0);
-
-        server_handle.join().expect("server thread");
-    }
-
-    #[test]
-    fn live_snapshot_send_snap_net_target_address_incremental_receives_ack() {
-        let root = tempfile::tempdir().expect("tempdir");
-        let store = root.path().join("store");
-        let mut fs = LocalFileSystem::open(&store).expect("open fs");
-        fs.create_file("/base.txt", 0o644).expect("create base");
-        fs.write_file("/base.txt", 0, b"base bytes")
-            .expect("write base");
-        fs.sync_all().expect("sync baseline");
-        let baseline = fs.create_snapshot("baseline").expect("snapshot baseline");
-        let baseline_root = baseline.source_root;
-        fs.set_auto_commit(false);
-        fs.replace_file("/base.txt", b"updated base bytes")
-            .expect("replace base");
-        fs.create_file("/delta.txt", 0o644).expect("create delta");
-        fs.write_file("/delta.txt", 0, b"incremental live bytes")
-            .expect("write delta");
-        let engine = VfsLocalFileSystem::new(fs);
-        let expected_auth_key = engine.fs.borrow().root_authentication_key.as_bytes32();
-
-        let mut server = Transport::new(2);
-        server
-            .bind(TransportAddr::Tcp(SocketAddr::new(
-                IpAddr::V4(Ipv4Addr::LOCALHOST),
-                0,
-            )))
-            .expect("bind");
-        let target_addr = match server.bind_addr.as_ref().expect("bind_addr") {
-            TransportAddr::Tcp(addr) => addr.to_string(),
-            _ => unreachable!("test binds TCP transport"),
-        };
-        let (decoded_tx, decoded_rx) = std::sync::mpsc::channel();
-
-        let server_handle = thread::spawn({
-            let baseline_root = baseline_root.clone();
-            move || {
-                let session_id = accept_snapshot_transport_session(&mut server);
-                server.perform_handshake(session_id).expect("handshake");
-                let frame = server.recv_message(session_id).expect("recv push frame");
-
-                let decoded = decode_snap_push_frame(&frame, &expected_auth_key);
-                assert!(decoded.incremental);
-                assert_eq!(decoded.from_root.as_ref(), Some(&baseline_root));
-                assert!(decoded.total_records > 0);
-                assert!(decoded.payload_bytes > 0);
-                decoded_tx.send(decoded).expect("send decoded push");
-
-                server
-                    .send_message(session_id, &snap_net_ack(b"received incremental"))
-                    .expect("send ack");
-                let _ = server.close_session(session_id, SessionCloseReason::LocalShutdown);
-            }
-        });
-
-        let sent = live_snapshot_admin(
-            &engine,
-            "send",
-            json!({
-                "target_addr": target_addr.clone(),
-                "format": "vfssend2",
-                "incremental": true,
-                "from_root": live_from_root_hex(&baseline_root),
-            }),
-            true,
-        );
-
-        assert_eq!(sent["ok"], true, "incremental target send response: {sent}");
-        assert_eq!(sent["json"]["target_addr"], target_addr);
-        assert_eq!(sent["json"]["remote_response"], "received incremental");
-        assert_eq!(sent["json"]["format"], "vfssend2");
-        assert_eq!(sent["json"]["incremental"], true);
-        assert!(sent["json"]["bytes"].as_u64().unwrap_or(0) > 0);
-        let pushed = decoded_rx.recv().expect("decoded pushed stream");
-        assert_eq!(sent["json"]["bytes"], pushed.export_len as u64);
-        assert_eq!(sent["json"]["roots"], pushed.roots_len as u64);
-        assert_eq!(sent["json"]["records"], pushed.total_records);
-        assert_eq!(sent["json"]["payload_bytes"], pushed.payload_bytes);
-
-        server_handle.join().expect("server thread");
-    }
-
-    #[test]
-    fn live_snapshot_send_snap_net_target_address_surfaces_remote_error_without_output() {
-        let root = tempfile::tempdir().expect("tempdir");
-        let store = root.path().join("store");
-        let mut fs = LocalFileSystem::open(&store).expect("open fs");
-        fs.create_file("/live.txt", 0o644).expect("create file");
-        fs.write_file("/live.txt", 0, b"live owner snapshot send")
-            .expect("write file");
-        let engine = VfsLocalFileSystem::new(fs);
-        let expected_auth_key = engine.fs.borrow().root_authentication_key.as_bytes32();
-        let output = root.path().join("target-error.vfs");
-
-        let mut server = Transport::new(2);
-        server
-            .bind(TransportAddr::Tcp(SocketAddr::new(
-                IpAddr::V4(Ipv4Addr::LOCALHOST),
-                0,
-            )))
-            .expect("bind");
-        let target_addr = match server.bind_addr.as_ref().expect("bind_addr") {
-            TransportAddr::Tcp(addr) => addr.to_string(),
-            _ => unreachable!("test binds TCP transport"),
-        };
-
-        let server_handle = thread::spawn(move || {
-            let session_id = accept_snapshot_transport_session(&mut server);
-            server.perform_handshake(session_id).expect("handshake");
-            let frame = server.recv_message(session_id).expect("recv push frame");
-
-            let decoded = decode_snap_push_frame(&frame, &expected_auth_key);
-            assert!(!decoded.incremental);
-            assert!(decoded.total_records > 0);
-            assert!(decoded.payload_bytes > 0);
-
-            server
-                .send_message(session_id, &snap_net_error(b"denied"))
-                .expect("send remote error");
-            let _ = server.close_session(session_id, SessionCloseReason::LocalShutdown);
-        });
-
-        let refused = live_snapshot_admin(
-            &engine,
-            "send",
-            json!({
-                "output": output.display().to_string(),
-                "target_addr": target_addr,
-                "format": "vfssend2",
-                "incremental": false,
-            }),
-            true,
-        );
-
-        assert_eq!(refused["ok"], false, "send response: {refused}");
-        assert_eq!(refused["exit_code"], 1);
-        assert!(refused["json"].is_null());
-        assert!(refused["text"].is_null());
-        assert_eq!(refused["error"], "snapshot send: remote error: denied");
-        assert!(!output.exists());
-
-        server_handle.join().expect("server thread");
-    }
-
-    #[test]
-    fn live_snapshot_send_snap_net_target_address_rejects_malformed_ack_without_output() {
-        let root = tempfile::tempdir().expect("tempdir");
-        let store = root.path().join("store");
-        let mut fs = LocalFileSystem::open(&store).expect("open fs");
-        fs.create_file("/live.txt", 0o644).expect("create file");
-        fs.write_file("/live.txt", 0, b"live owner snapshot send")
-            .expect("write file");
-        let engine = VfsLocalFileSystem::new(fs);
-        let expected_auth_key = engine.fs.borrow().root_authentication_key.as_bytes32();
-        let output = root.path().join("target-malformed-response.vfs");
-
-        let mut server = Transport::new(2);
-        server
-            .bind(TransportAddr::Tcp(SocketAddr::new(
-                IpAddr::V4(Ipv4Addr::LOCALHOST),
-                0,
-            )))
-            .expect("bind");
-        let target_addr = match server.bind_addr.as_ref().expect("bind_addr") {
-            TransportAddr::Tcp(addr) => addr.to_string(),
-            _ => unreachable!("test binds TCP transport"),
-        };
-
-        let server_handle = thread::spawn(move || {
-            let session_id = accept_snapshot_transport_session(&mut server);
-            server.perform_handshake(session_id).expect("handshake");
-            let frame = server.recv_message(session_id).expect("recv push frame");
-
-            let decoded = decode_snap_push_frame(&frame, &expected_auth_key);
-            assert!(!decoded.incremental);
-            assert!(decoded.total_records > 0);
-            assert!(decoded.payload_bytes > 0);
-
-            server
-                .send_message(session_id, &snap_net_unknown_empty_response())
-                .expect("send malformed response");
-            let _ = server.close_session(session_id, SessionCloseReason::LocalShutdown);
-        });
-
-        let refused = live_snapshot_admin(
-            &engine,
-            "send",
-            json!({
-                "output": output.display().to_string(),
-                "target_addr": target_addr,
-                "format": "vfssend2",
-                "incremental": false,
-            }),
-            true,
-        );
-
         assert_eq!(refused["ok"], false, "send response: {refused}");
         assert_eq!(refused["exit_code"], 1);
         assert!(refused["json"].is_null());
         assert!(refused["text"].is_null());
         assert_eq!(
             refused["error"],
-            "snapshot send: unknown remote response kind 9 without message"
+            "snapshot send: target-address send requires authenticated transport confidentiality before sending root-authentication key"
         );
         assert!(!output.exists());
-
+        assert_eq!(
+            push_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("server should observe the closed plaintext session"),
+            false,
+            "plaintext peer must not receive the root-authentication key or snapshot stream"
+        );
         server_handle.join().expect("server thread");
     }
 
