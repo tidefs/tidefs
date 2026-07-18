@@ -17,9 +17,15 @@ use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 
 use crate::device::{DeviceBacking, DeviceClass as DeviceDeviceClass, DeviceConfig};
+use crate::device_layout::{
+    decode_device_layout_v1, encode_device_layout_v1, DeviceLayoutPolicy,
+    DeviceLayoutPolicyDiscriminant, DeviceLayoutV1,
+};
 use crate::pool_label::{
-    decode_label, encode_label, features, seal_label, LabelDeviceClass, PoolLabelV1,
-    PoolRedundancyPolicy, POOL_LABEL_SIZE, POOL_LABEL_V1_EXT_WIRE_SIZE, POOL_LABEL_V1_WIRE_SIZE,
+    decode_device_layout_v1_bytes, decode_label, encode_label, encode_label_with_device_layout,
+    features, seal_label, seal_label_with_device_layout, DeviceLayoutV1Bytes, LabelDeviceClass,
+    PoolLabelV1, PoolRedundancyPolicy, POOL_LABEL_SIZE, POOL_LABEL_V1_EXT_WIRE_SIZE,
+    POOL_LABEL_V1_WIRE_SIZE, POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE,
 };
 use crate::pool_lifecycle_evidence::{
     PoolLifecycleAction, PoolLifecycleContext, PoolLifecycleEvidence,
@@ -99,6 +105,7 @@ struct LabelWriteRequest<'a> {
     topology_generation: u64,
     device_count: u32,
     redundancy_policy: PoolRedundancyPolicy,
+    device_layout_policy: Option<DeviceLayoutPolicy>,
 }
 
 struct ExistingLabelUpdate<'a> {
@@ -110,6 +117,18 @@ struct ExistingLabelUpdate<'a> {
     label_commit_group: u64,
     new_topology_gen: u64,
     new_device_count: u32,
+}
+
+struct DeviceLabelRecord {
+    label: PoolLabelV1,
+    device_layout_v1: Option<DeviceLayoutV1Bytes>,
+    device_layout_policy: Option<DeviceLayoutPolicy>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TopologyLabelAuthority {
+    redundancy_policy: PoolRedundancyPolicy,
+    device_layout_policy: Option<DeviceLayoutPolicy>,
 }
 
 // DeviceManager
@@ -185,8 +204,7 @@ impl DeviceManager {
         let new_device_count = old_device_count + 1;
         let new_topology_gen = commit_group.wrapping_add(1);
         let label_commit_group = commit_group;
-        let redundancy_policy =
-            Self::topology_redundancy_policy(existing_device_configs, pool_guid)?;
+        let authority = Self::topology_label_authority(existing_device_configs, pool_guid)?;
 
         // 1. Write label to the new device.
         Self::write_single_device_label(LabelWriteRequest {
@@ -200,7 +218,8 @@ impl DeviceManager {
             device_index: old_device_count, // device_index = old count (0-based)
             topology_generation: new_topology_gen,
             device_count: new_device_count,
-            redundancy_policy,
+            redundancy_policy: authority.redundancy_policy,
+            device_layout_policy: authority.device_layout_policy,
         })?;
 
         // 2. Update labels on all existing devices with new topology_generation
@@ -245,6 +264,10 @@ impl DeviceManager {
         let new_topology_gen = commit_group.wrapping_add(1);
         let label_commit_group = commit_group;
 
+        // Validate every surviving label before mutating the first copy. This
+        // also proves that any DeviceLayoutV1 records use one pool-wide policy.
+        let _ = Self::topology_label_authority(remaining_device_configs, pool_guid)?;
+
         Self::update_existing_labels_with_reindex(ExistingLabelUpdate {
             device_configs: remaining_device_configs,
             pool_guid,
@@ -279,8 +302,8 @@ impl DeviceManager {
         let device_count = request.existing_device_configs.len() as u32;
         let new_topology_gen = request.commit_group.wrapping_add(1);
         let label_commit_group = request.commit_group;
-        let redundancy_policy =
-            Self::topology_redundancy_policy(request.existing_device_configs, request.pool_guid)?;
+        let authority =
+            Self::topology_label_authority(request.existing_device_configs, request.pool_guid)?;
 
         // Write label to new device at the same index.
         Self::write_single_device_label(LabelWriteRequest {
@@ -294,7 +317,8 @@ impl DeviceManager {
             device_index: request.replace_index as u32,
             topology_generation: new_topology_gen,
             device_count,
-            redundancy_policy,
+            redundancy_policy: authority.redundancy_policy,
+            device_layout_policy: authority.device_layout_policy,
         })?;
 
         // Update labels on all existing devices (including the one being replaced).
@@ -341,8 +365,8 @@ impl DeviceManager {
         let device_count = request.existing_device_configs.len() as u32;
         let new_topology_gen = request.commit_group.wrapping_add(1);
         let label_commit_group = request.commit_group;
-        let redundancy_policy =
-            Self::topology_redundancy_policy(request.existing_device_configs, request.pool_guid)?;
+        let authority =
+            Self::topology_label_authority(request.existing_device_configs, request.pool_guid)?;
 
         // Write the spare's label at the faulted device's index.
         Self::write_single_device_label(LabelWriteRequest {
@@ -356,7 +380,8 @@ impl DeviceManager {
             device_index: faulted_index as u32,
             topology_generation: new_topology_gen,
             device_count,
-            redundancy_policy,
+            redundancy_policy: authority.redundancy_policy,
+            device_layout_policy: authority.device_layout_policy,
         })?;
 
         // Update all existing device labels with the new topology_generation.
@@ -399,6 +424,24 @@ impl DeviceManager {
     fn write_single_device_label(request: LabelWriteRequest<'_>) -> Result<()> {
         let class = Self::map_device_class(request.device_config.class);
         let capacity = Self::get_device_capacity(request.device_config)?;
+        let device_layout = request
+            .device_layout_policy
+            .map(|policy| {
+                policy.compute(capacity).map_err(|error| StoreError::Io {
+                    operation: "device_manager_layout_compute",
+                    path: request.device_config.path.clone(),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("invalid DeviceLayoutV1 policy: {error:?}"),
+                    ),
+                })
+            })
+            .transpose()?;
+        let device_layout_v1 = device_layout.map(|layout| {
+            let mut bytes = [0u8; crate::device_layout::DEVICE_LAYOUT_V1_WIRE_SIZE];
+            encode_device_layout_v1(&layout, &mut bytes);
+            bytes
+        });
 
         let label = PoolLabelV1 {
             magic: crate::pool_label::POOL_LABEL_MAGIC,
@@ -421,8 +464,8 @@ impl DeviceManager {
             device_count: request.device_count,
             device_class: class,
             device_capacity_bytes: capacity,
-            system_area_pointer: 0,
-            system_area_size: 0,
+            system_area_pointer: device_layout.map_or(0, |layout| layout.system_area_offset),
+            system_area_size: device_layout.map_or(0, |layout| layout.system_area_len),
             features_incompat: {
                 let mut flags = features::POOL_LABEL_V1;
                 if request.device_config.encryption.is_some() {
@@ -440,22 +483,53 @@ impl DeviceManager {
             checksum: [0u8; 32],
         };
 
-        let sealed = seal_label(label).map_err(|e| StoreError::Io {
-            operation: "device_manager_seal",
-            path: request.device_config.path.clone(),
-            source: std::io::Error::other(format!("{e:?}")),
-        })?;
+        let (buf, len) = Self::encode_topology_label(
+            label,
+            device_layout_v1.as_ref(),
+            &request.device_config.path,
+            "device_manager_seal",
+            "device_manager_encode",
+        )?;
 
-        let mut buf = [0u8; POOL_LABEL_V1_EXT_WIRE_SIZE];
-        encode_label(&sealed, &mut buf).map_err(|e| StoreError::Io {
-            operation: "device_manager_encode",
-            path: request.device_config.path.clone(),
-            source: std::io::Error::other(format!("{e:?}")),
-        })?;
-
-        Self::write_label_copies(request.device_config, &buf, capacity)?;
+        Self::write_label_copies(request.device_config, &buf[..len], capacity)?;
 
         Ok(())
+    }
+
+    fn encode_topology_label(
+        label: PoolLabelV1,
+        device_layout_v1: Option<&DeviceLayoutV1Bytes>,
+        path: &Path,
+        seal_operation: &'static str,
+        encode_operation: &'static str,
+    ) -> Result<([u8; POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE], usize)> {
+        let sealed = match device_layout_v1 {
+            Some(layout) => seal_label_with_device_layout(label, Some(layout)),
+            None => seal_label(label),
+        }
+        .map_err(|error| StoreError::Io {
+            operation: seal_operation,
+            path: path.to_path_buf(),
+            source: std::io::Error::other(format!("{error:?}")),
+        })?;
+
+        let mut buf = [0u8; POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE];
+        let len = if device_layout_v1.is_some() {
+            POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE
+        } else {
+            POOL_LABEL_V1_EXT_WIRE_SIZE
+        };
+        match device_layout_v1 {
+            Some(layout) => encode_label_with_device_layout(&sealed, Some(layout), &mut buf[..len]),
+            None => encode_label(&sealed, &mut buf[..len]),
+        }
+        .map_err(|error| StoreError::Io {
+            operation: encode_operation,
+            path: path.to_path_buf(),
+            source: std::io::Error::other(format!("{error:?}")),
+        })?;
+
+        Ok((buf, len))
     }
 
     /// Update labels on all existing devices with new topology_generation
@@ -472,9 +546,10 @@ impl DeviceManager {
 
             // Read existing label to get capacity and class.
             let existing = Self::read_device_label(&config.path, request.pool_guid)?;
+            let existing_label = existing.label;
 
-            let class = existing.device_class;
-            let capacity = existing.device_capacity_bytes;
+            let class = existing_label.device_class;
+            let capacity = existing_label.device_capacity_bytes;
 
             let label = PoolLabelV1 {
                 magic: crate::pool_label::POOL_LABEL_MAGIC,
@@ -497,33 +572,28 @@ impl DeviceManager {
                 device_count: request.new_device_count,
                 device_class: class,
                 device_capacity_bytes: capacity,
-                system_area_pointer: existing.system_area_pointer,
-                system_area_size: existing.system_area_size,
-                features_incompat: existing.features_incompat,
-                features_ro_compat: existing.features_ro_compat,
-                features_compat: existing.features_compat,
-                device_health: existing.device_health,
-                device_read_errors: existing.device_read_errors,
-                device_write_errors: existing.device_write_errors,
-                device_checksum_errors: existing.device_checksum_errors,
-                redundancy_policy: existing.redundancy_policy,
+                system_area_pointer: existing_label.system_area_pointer,
+                system_area_size: existing_label.system_area_size,
+                features_incompat: existing_label.features_incompat,
+                features_ro_compat: existing_label.features_ro_compat,
+                features_compat: existing_label.features_compat,
+                device_health: existing_label.device_health,
+                device_read_errors: existing_label.device_read_errors,
+                device_write_errors: existing_label.device_write_errors,
+                device_checksum_errors: existing_label.device_checksum_errors,
+                redundancy_policy: existing_label.redundancy_policy,
                 checksum: [0u8; 32],
             };
 
-            let sealed = seal_label(label).map_err(|e| StoreError::Io {
-                operation: "update_label_seal",
-                path: config.path.clone(),
-                source: std::io::Error::other(format!("{e:?}")),
-            })?;
+            let (buf, len) = Self::encode_topology_label(
+                label,
+                existing.device_layout_v1.as_ref(),
+                &config.path,
+                "update_label_seal",
+                "update_label_encode",
+            )?;
 
-            let mut buf = [0u8; POOL_LABEL_V1_EXT_WIRE_SIZE];
-            encode_label(&sealed, &mut buf).map_err(|e| StoreError::Io {
-                operation: "update_label_encode",
-                path: config.path.clone(),
-                source: std::io::Error::other(format!("{e:?}")),
-            })?;
-
-            Self::write_label_copies(config, &buf, capacity)?;
+            Self::write_label_copies(config, &buf[..len], capacity)?;
         }
 
         Ok(())
@@ -543,9 +613,10 @@ impl DeviceManager {
 
             // Read existing label to get capacity and class.
             let existing = Self::read_device_label(&config.path, request.pool_guid)?;
+            let existing_label = existing.label;
 
-            let class = existing.device_class;
-            let capacity = existing.device_capacity_bytes;
+            let class = existing_label.device_class;
+            let capacity = existing_label.device_capacity_bytes;
 
             let label = PoolLabelV1 {
                 magic: crate::pool_label::POOL_LABEL_MAGIC,
@@ -568,40 +639,35 @@ impl DeviceManager {
                 device_count: request.new_device_count,
                 device_class: class,
                 device_capacity_bytes: capacity,
-                system_area_pointer: existing.system_area_pointer,
-                system_area_size: existing.system_area_size,
-                features_incompat: existing.features_incompat,
-                features_ro_compat: existing.features_ro_compat,
-                features_compat: existing.features_compat,
-                device_health: existing.device_health,
-                device_read_errors: existing.device_read_errors,
-                device_write_errors: existing.device_write_errors,
-                device_checksum_errors: existing.device_checksum_errors,
-                redundancy_policy: existing.redundancy_policy,
+                system_area_pointer: existing_label.system_area_pointer,
+                system_area_size: existing_label.system_area_size,
+                features_incompat: existing_label.features_incompat,
+                features_ro_compat: existing_label.features_ro_compat,
+                features_compat: existing_label.features_compat,
+                device_health: existing_label.device_health,
+                device_read_errors: existing_label.device_read_errors,
+                device_write_errors: existing_label.device_write_errors,
+                device_checksum_errors: existing_label.device_checksum_errors,
+                redundancy_policy: existing_label.redundancy_policy,
                 checksum: [0u8; 32],
             };
 
-            let sealed = seal_label(label).map_err(|e| StoreError::Io {
-                operation: "reindex_label_seal",
-                path: config.path.clone(),
-                source: std::io::Error::other(format!("{e:?}")),
-            })?;
+            let (buf, len) = Self::encode_topology_label(
+                label,
+                existing.device_layout_v1.as_ref(),
+                &config.path,
+                "reindex_label_seal",
+                "reindex_label_encode",
+            )?;
 
-            let mut buf = [0u8; POOL_LABEL_V1_EXT_WIRE_SIZE];
-            encode_label(&sealed, &mut buf).map_err(|e| StoreError::Io {
-                operation: "reindex_label_encode",
-                path: config.path.clone(),
-                source: std::io::Error::other(format!("{e:?}")),
-            })?;
-
-            Self::write_label_copies(config, &buf, capacity)?;
+            Self::write_label_copies(config, &buf[..len], capacity)?;
         }
 
         Ok(())
     }
 
     /// Read a device label from the label file.
-    fn read_device_label(device_path: &Path, pool_guid: [u8; 16]) -> Result<PoolLabelV1> {
+    fn read_device_label(device_path: &Path, pool_guid: [u8; 16]) -> Result<DeviceLabelRecord> {
         let label_path = if device_path.is_dir() {
             device_path.join(".tidefs_label")
         } else {
@@ -616,7 +682,7 @@ impl DeviceManager {
                 path: label_path.clone(),
                 source: e,
             })?;
-        let mut buf = [0u8; POOL_LABEL_V1_EXT_WIRE_SIZE];
+        let mut buf = [0u8; POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE];
         file.read_exact(&mut buf[..POOL_LABEL_V1_WIRE_SIZE])
             .map_err(|e| StoreError::Io {
                 operation: "read_device_label",
@@ -639,43 +705,130 @@ impl DeviceManager {
             }
         }
 
-        match decode_label(&buf[..len]) {
-            Ok(label) if label.pool_guid == pool_guid => Ok(label),
-            Ok(_) => Err(StoreError::Io {
+        let label = match decode_label(&buf[..len]) {
+            Ok(label) if label.pool_guid == pool_guid => label,
+            Ok(_) => {
+                return Err(StoreError::Io {
+                    operation: "decode_device_label",
+                    path: label_path,
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "pool label belongs to a different pool",
+                    ),
+                });
+            }
+            Err(error) => {
+                return Err(StoreError::Io {
+                    operation: "decode_device_label",
+                    path: label_path,
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("invalid pool label: {error:?}"),
+                    ),
+                });
+            }
+        };
+        let device_layout_v1 =
+            decode_device_layout_v1_bytes(&buf[..len]).map_err(|error| StoreError::Io {
                 operation: "decode_device_label",
-                path: label_path,
+                path: label_path.clone(),
                 source: std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    "pool label belongs to a different pool",
+                    format!("invalid DeviceLayoutV1 label extent: {error:?}"),
                 ),
-            }),
-            Err(error) => Err(StoreError::Io {
-                operation: "decode_device_label",
-                path: label_path,
+            })?;
+        let device_layout_policy = device_layout_v1
+            .as_ref()
+            .map(|layout| Self::validate_device_layout_record(layout, &label_path))
+            .transpose()?;
+
+        Ok(DeviceLabelRecord {
+            label,
+            device_layout_v1,
+            device_layout_policy,
+        })
+    }
+
+    fn validate_device_layout_record(
+        bytes: &DeviceLayoutV1Bytes,
+        path: &Path,
+    ) -> Result<DeviceLayoutPolicy> {
+        let layout = decode_device_layout_v1(bytes).map_err(|error| StoreError::Io {
+            operation: "decode_device_layout",
+            path: path.to_path_buf(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid DeviceLayoutV1 record: {error:?}"),
+            ),
+        })?;
+        let policy = Self::device_layout_policy(layout);
+        let expected =
+            policy
+                .compute(layout.device_size_bytes)
+                .map_err(|error| StoreError::Io {
+                    operation: "validate_device_layout",
+                    path: path.to_path_buf(),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("invalid DeviceLayoutV1 policy: {error:?}"),
+                    ),
+                })?;
+        if expected != layout {
+            return Err(StoreError::Io {
+                operation: "validate_device_layout",
+                path: path.to_path_buf(),
                 source: std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    format!("invalid pool label: {error:?}"),
+                    "DeviceLayoutV1 does not match its recorded policy",
                 ),
-            }),
+            });
+        }
+        Ok(policy)
+    }
+
+    fn device_layout_policy(layout: DeviceLayoutV1) -> DeviceLayoutPolicy {
+        match layout.policy {
+            DeviceLayoutPolicyDiscriminant::Slice0Small => DeviceLayoutPolicy::Slice0Small,
+            DeviceLayoutPolicyDiscriminant::Auto => DeviceLayoutPolicy::Auto,
+            DeviceLayoutPolicyDiscriminant::Custom => DeviceLayoutPolicy::Custom {
+                data_segment_size: layout.data_segment_size,
+                metadata_segment_size: layout.metadata_segment_size,
+                journal_segment_size: layout.poolmap_segment_size,
+            },
         }
     }
 
-    fn topology_redundancy_policy(
+    fn topology_label_authority(
         device_configs: &[DeviceConfig],
         pool_guid: [u8; 16],
-    ) -> Result<PoolRedundancyPolicy> {
-        let Some(config) = device_configs.first() else {
-            return Ok(PoolRedundancyPolicy::default());
-        };
-        Ok(Self::read_device_label(&config.path, pool_guid)?.redundancy_policy)
+    ) -> Result<TopologyLabelAuthority> {
+        let mut expected = None;
+        for config in device_configs {
+            let record = Self::read_device_label(&config.path, pool_guid)?;
+            let authority = TopologyLabelAuthority {
+                redundancy_policy: record.label.redundancy_policy,
+                device_layout_policy: record.device_layout_policy,
+            };
+            if expected.is_some_and(|current| current != authority) {
+                return Err(StoreError::Io {
+                    operation: "topology_label_authority",
+                    path: config.path.clone(),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "pool labels disagree on redundancy or device-layout policy",
+                    ),
+                });
+            }
+            expected = Some(authority);
+        }
+        Ok(expected.unwrap_or(TopologyLabelAuthority {
+            redundancy_policy: PoolRedundancyPolicy::default(),
+            device_layout_policy: None,
+        }))
     }
 
     /// Write label bytes at a given offset.
-    fn write_label_bytes(
-        path: &Path,
-        data: &[u8; POOL_LABEL_V1_EXT_WIRE_SIZE],
-        offset: u64,
-    ) -> Result<()> {
+    fn write_label_bytes(path: &Path, data: &[u8], offset: u64) -> Result<()> {
         let mut file = fs::OpenOptions::new()
             .write(true)
             .truncate(false)
@@ -710,11 +863,7 @@ impl DeviceManager {
     }
 
     /// Write the primary and canonical backup copies of a device label.
-    fn write_label_copies(
-        config: &DeviceConfig,
-        data: &[u8; POOL_LABEL_V1_EXT_WIRE_SIZE],
-        capacity: u64,
-    ) -> Result<()> {
+    fn write_label_copies(config: &DeviceConfig, data: &[u8], capacity: u64) -> Result<()> {
         let label_path = if config.path.is_dir() {
             config.path.join(".tidefs_label")
         } else {
@@ -976,6 +1125,19 @@ mod tests {
         decode_label(&buf).unwrap()
     }
 
+    fn read_label_with_layout_at(path: &Path, offset: u64) -> (PoolLabelV1, DeviceLayoutV1) {
+        let mut file = fs::File::open(path).unwrap();
+        file.seek(SeekFrom::Start(offset)).unwrap();
+        let mut buf = [0u8; POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE];
+        file.read_exact(&mut buf).unwrap();
+        let label = decode_label(&buf).unwrap();
+        let layout_bytes = decode_device_layout_v1_bytes(&buf)
+            .unwrap()
+            .expect("DeviceLayoutV1 sidecar");
+        let layout = decode_device_layout_v1(&layout_bytes).unwrap();
+        (label, layout)
+    }
+
     #[test]
     fn add_device_writes_labels() {
         let dir1 = temp_dir("dm-add-1");
@@ -1116,6 +1278,7 @@ mod tests {
             topology_generation: 1,
             device_count: 1,
             redundancy_policy: PoolRedundancyPolicy::replicated(2),
+            device_layout_policy: None,
         })
         .unwrap();
 
@@ -1162,6 +1325,77 @@ mod tests {
                 }
             }
             assert_eq!(fs::metadata(path).unwrap().len(), capacity);
+        }
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn add_device_preserves_and_derives_layout_evidence() {
+        let root = temp_dir("dm-add-layout-evidence");
+        let existing_path = root.join("existing.img");
+        let new_path = root.join("new.img");
+        let existing_capacity = 4 * POOL_LABEL_SIZE as u64;
+        let new_capacity = 8 * POOL_LABEL_SIZE as u64;
+
+        for (path, capacity) in [
+            (&existing_path, existing_capacity),
+            (&new_path, new_capacity),
+        ] {
+            let file = fs::File::create(path).unwrap();
+            file.set_len(capacity).unwrap();
+        }
+
+        let existing_config = make_byte_device_config(&existing_path);
+        let new_config = make_byte_device_config(&new_path);
+        let pool_guid = [0x41u8; 16];
+        let existing_guid = [0x42u8; 16];
+        let new_guid = [0x43u8; 16];
+
+        DeviceManager::write_single_device_label(LabelWriteRequest {
+            device_config: &existing_config,
+            pool_guid,
+            device_guid: existing_guid,
+            pool_name: "layout-evidence",
+            pool_state: crate::pool_label::LabelPoolState::Active,
+            commit_group: 1,
+            label_commit_group: 1,
+            device_index: 0,
+            topology_generation: 1,
+            device_count: 1,
+            redundancy_policy: PoolRedundancyPolicy::replicated(2),
+            device_layout_policy: Some(DeviceLayoutPolicy::Slice0Small),
+        })
+        .unwrap();
+
+        DeviceManager::add_device(
+            std::slice::from_ref(&existing_config),
+            &new_config,
+            pool_guid,
+            &[existing_guid],
+            new_guid,
+            "layout-evidence",
+            7,
+        )
+        .unwrap();
+
+        for (path, capacity, device_guid, device_index) in [
+            (&existing_path, existing_capacity, existing_guid, 0),
+            (&new_path, new_capacity, new_guid, 1),
+        ] {
+            for offset in [0, capacity - POOL_LABEL_SIZE as u64] {
+                let (label, layout) = read_label_with_layout_at(path, offset);
+                assert_eq!(label.pool_guid, pool_guid);
+                assert_eq!(label.device_guid, device_guid);
+                assert_eq!(label.device_index, device_index);
+                assert_eq!(label.device_count, 2);
+                assert_eq!(label.topology_generation, 8);
+                assert_eq!(label.device_capacity_bytes, capacity);
+                assert_eq!(label.system_area_pointer, layout.system_area_offset);
+                assert_eq!(label.system_area_size, layout.system_area_len);
+                assert_eq!(layout.policy, DeviceLayoutPolicyDiscriminant::Slice0Small);
+                assert_eq!(layout.device_size_bytes, capacity);
+            }
         }
 
         let _ = fs::remove_dir_all(&root);
