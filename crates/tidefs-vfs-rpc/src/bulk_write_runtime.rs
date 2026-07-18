@@ -53,7 +53,6 @@ struct PendingWrite {
 
 struct VfsRpcBulkWriteRuntimeState {
     adapter: VfsRpcTransportAdapter,
-    bridge: VfsEngineBridge,
     pending_writes: BTreeMap<PendingWriteKey, PendingWrite>,
 }
 
@@ -153,6 +152,7 @@ impl From<VfsRpcError> for VfsRpcBulkWriteRuntimeError {
 /// ABORT is consumed by the VFS_RPC request that admitted the descriptor.
 pub struct VfsRpcBulkWriteRuntime<T> {
     state: Mutex<VfsRpcBulkWriteRuntimeState>,
+    bridge: Mutex<VfsEngineBridge>,
     target: T,
     bulk: Arc<BulkDataServiceHandler>,
     control_reply_sink: Arc<dyn ControlServiceReplySink>,
@@ -173,9 +173,9 @@ where
         Self {
             state: Mutex::new(VfsRpcBulkWriteRuntimeState {
                 adapter,
-                bridge,
                 pending_writes: BTreeMap::new(),
             }),
+            bridge: Mutex::new(bridge),
             target,
             bulk,
             control_reply_sink,
@@ -301,7 +301,12 @@ where
                     }
                 }
 
-                let response = state.bridge.dispatch(peer, &request, &self.target)?;
+                drop(state);
+                let response =
+                    self.bridge
+                        .lock()
+                        .unwrap()
+                        .dispatch(peer, &request, &self.target)?;
                 Ok(ControlServiceDispatchOutcome::Reply(
                     control_response_frame(&response)?,
                 ))
@@ -408,7 +413,7 @@ where
         &self,
         completion: VfsRpcBulkCompletion,
     ) -> Result<(), VfsRpcBulkWriteRuntimeError> {
-        let (session_id, response) = {
+        let (session_id, peer, request) = {
             let mut state = self.state.lock().unwrap();
             let record = state.adapter.complete_bulk_handoff(&completion)?;
             ensure_write_upload(
@@ -436,14 +441,14 @@ where
                     token: key.token,
                 });
             }
-            let response = state.bridge.dispatch_done_verified_write(
-                record.peer,
-                &pending.request,
-                completion,
-                &self.target,
-            )?;
-            (record.session_id, response)
+            (record.session_id, record.peer, pending.request)
         };
+        let response = self.bridge.lock().unwrap().dispatch_done_verified_write(
+            peer,
+            &request,
+            completion,
+            &self.target,
+        )?;
         self.send_control_reply(session_id.0, control_response_frame(&response)?)
     }
 
@@ -666,14 +671,21 @@ mod tests {
     const PEER: PeerId = PeerId(9);
     const SESSION_ID: SessionId = SessionId::new(33);
 
+    type WriteProbe = Arc<dyn Fn() + Send + Sync>;
+
     #[derive(Clone, Default)]
     struct RecordingDispatch {
         writes: Arc<Mutex<Vec<Vec<u8>>>>,
+        write_probe: Arc<Mutex<Option<WriteProbe>>>,
     }
 
     impl RecordingDispatch {
         fn writes(&self) -> Vec<Vec<u8>> {
             self.writes.lock().unwrap().clone()
+        }
+
+        fn set_write_probe(&self, probe: impl Fn() + Send + Sync + 'static) {
+            *self.write_probe.lock().unwrap() = Some(Arc::new(probe));
         }
 
         fn attr() -> InodeAttr {
@@ -717,6 +729,10 @@ mod tests {
                     }))
                 }
                 VfsOperation::Write(request) => {
+                    let probe = self.write_probe.lock().unwrap().clone();
+                    if let Some(probe) = probe {
+                        probe();
+                    }
                     self.writes.lock().unwrap().push(request.data.clone());
                     Ok(VfsResponse::Write(engine_op::WriteResponse {
                         written: request.data.len() as u32,
@@ -1009,6 +1025,39 @@ mod tests {
             response(replies[0].1.clone()).payload,
             VfsRpcResponsePayload::BytesWritten(3)
         );
+    }
+
+    #[test]
+    fn bulk_write_dispatch_does_not_hold_runtime_state_lock() {
+        let (runtime, target, _) = runtime(Duration::from_secs(1));
+        let handle = create_handle(&runtime);
+        let data_dispatch = runtime.data_dispatch();
+        let token = accept_write_transfer(&data_dispatch, 2, 23, 3);
+        admitted_write(&runtime, handle, token, 3, Instant::now());
+        grant_and_write(&runtime, &data_dispatch, 23, token, b"abc");
+
+        let runtime_ref = Arc::downgrade(&runtime);
+        target.set_write_probe(move || {
+            let runtime = runtime_ref.upgrade().expect("runtime remains live");
+            assert!(
+                runtime.state.try_lock().is_ok(),
+                "VFS dispatch must not hold adapter and pending-write state"
+            );
+        });
+
+        dispatch_data(
+            &data_dispatch,
+            BulkFrame::Done(BulkDoneFrame {
+                stream_id: 23,
+                token,
+                total_transferred: 3,
+                checksum32: 0x364b_3fb7,
+            }),
+        )
+        .expect("done");
+
+        assert_eq!(target.writes(), vec![b"abc".to_vec()]);
+        assert_eq!(runtime.pending_write_count(), 0);
     }
 
     #[test]
