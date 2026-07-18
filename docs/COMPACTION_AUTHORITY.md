@@ -25,7 +25,6 @@ reclaim, checksum-tree, extent-map, or object-store runtime behavior.
 - `docs/SNAPSHOT_CLONE_DEADLIST_AUTHORITY.md`: implementation-gated
   snapshot/clone/deadlist boundary.
 - `crates/tidefs-spacemap-allocator/`: source-owned allocator surface.
-  `docs/SPACEMAP_ALLOCATOR_DESIGN.md` remains historical provenance only.
 - `docs/workspace-package-classification.md`: `tidefs-compaction` and
   `tidefs-data-cleaner` are planned authority surfaces requiring follow-up.
 
