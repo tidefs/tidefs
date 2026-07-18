@@ -224,16 +224,148 @@ impl TraversalRootType {
     }
 }
 
-/// Logical block pointer -- placeholder newtype for the storage engine.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
-pub struct BlockPointer(pub u64);
+/// Logical identity of a committed root used by dataset lifecycle pins.
+///
+/// The handle is resolved by the subsystem that supplied the committed root;
+/// it is not a segment id, byte offset, or other physical placement address.
+/// A zero handle is reserved for "no root" and cannot be represented by this
+/// type. The generation distinguishes successive publications that reuse the
+/// same provider-owned logical handle.
+#[derive(Clone, Copy, Eq, PartialEq, Hash)]
+pub struct LifecycleRootIdentityV1 {
+    logical_root_handle: u64,
+    generation: u64,
+}
 
-impl BlockPointer {
-    pub const NULL: Self = BlockPointer(0);
+impl LifecycleRootIdentityV1 {
+    pub const MAGIC: [u8; 4] = *b"DLRI";
+    pub const FORMAT_VERSION: u16 = 1;
+    pub const WIRE_SIZE: usize = 24;
+
+    const VERSION_OFFSET: usize = 4;
+    const RESERVED_OFFSET: usize = 6;
+    const LOGICAL_ROOT_HANDLE_OFFSET: usize = 8;
+    const GENERATION_OFFSET: usize = 16;
+
+    /// Construct a required logical root identity.
+    ///
+    /// Returns `None` for the reserved zero/absent handle.
+    #[must_use]
+    pub const fn new(logical_root_handle: u64, generation: u64) -> Option<Self> {
+        if logical_root_handle == 0 {
+            None
+        } else {
+            Some(Self {
+                logical_root_handle,
+                generation,
+            })
+        }
+    }
 
     #[must_use]
-    pub const fn is_null(self) -> bool {
-        self.0 == 0
+    pub const fn logical_root_handle(self) -> u64 {
+        self.logical_root_handle
+    }
+
+    #[must_use]
+    pub const fn generation(self) -> u64 {
+        self.generation
+    }
+
+    #[must_use]
+    pub fn encode(self) -> [u8; Self::WIRE_SIZE] {
+        let mut bytes = [0_u8; Self::WIRE_SIZE];
+        bytes[..Self::MAGIC.len()].copy_from_slice(&Self::MAGIC);
+        bytes[Self::VERSION_OFFSET..Self::RESERVED_OFFSET]
+            .copy_from_slice(&Self::FORMAT_VERSION.to_le_bytes());
+        bytes[Self::LOGICAL_ROOT_HANDLE_OFFSET..Self::GENERATION_OFFSET]
+            .copy_from_slice(&self.logical_root_handle.to_le_bytes());
+        bytes[Self::GENERATION_OFFSET..Self::WIRE_SIZE]
+            .copy_from_slice(&self.generation.to_le_bytes());
+        bytes
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, LifecycleRootIdentityDecodeError> {
+        if bytes.len() != Self::WIRE_SIZE {
+            return Err(LifecycleRootIdentityDecodeError::InvalidSize {
+                actual: bytes.len(),
+            });
+        }
+        if bytes[..Self::MAGIC.len()] != Self::MAGIC {
+            return Err(LifecycleRootIdentityDecodeError::InvalidMagic);
+        }
+        let version =
+            u16::from_le_bytes([bytes[Self::VERSION_OFFSET], bytes[Self::VERSION_OFFSET + 1]]);
+        if version != Self::FORMAT_VERSION {
+            return Err(LifecycleRootIdentityDecodeError::UnsupportedVersion { version });
+        }
+        let reserved = u16::from_le_bytes([
+            bytes[Self::RESERVED_OFFSET],
+            bytes[Self::RESERVED_OFFSET + 1],
+        ]);
+        if reserved != 0 {
+            return Err(LifecycleRootIdentityDecodeError::NonzeroReserved { value: reserved });
+        }
+        let logical_root_handle = u64::from_le_bytes(
+            bytes[Self::LOGICAL_ROOT_HANDLE_OFFSET..Self::GENERATION_OFFSET]
+                .try_into()
+                .expect("lifecycle root handle has fixed width"),
+        );
+        let generation = u64::from_le_bytes(
+            bytes[Self::GENERATION_OFFSET..Self::WIRE_SIZE]
+                .try_into()
+                .expect("lifecycle root generation has fixed width"),
+        );
+        Self::new(logical_root_handle, generation)
+            .ok_or(LifecycleRootIdentityDecodeError::MissingLogicalRoot)
+    }
+}
+
+impl fmt::Display for LifecycleRootIdentityV1 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "logical-root(handle={}, generation={})",
+            self.logical_root_handle, self.generation
+        )
+    }
+}
+
+impl fmt::Debug for LifecycleRootIdentityV1 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LifecycleRootIdentityDecodeError {
+    InvalidSize { actual: usize },
+    InvalidMagic,
+    UnsupportedVersion { version: u16 },
+    NonzeroReserved { value: u16 },
+    MissingLogicalRoot,
+}
+
+impl fmt::Display for LifecycleRootIdentityDecodeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidSize { actual } => write!(
+                f,
+                "invalid lifecycle root identity size {actual}, expected {}",
+                LifecycleRootIdentityV1::WIRE_SIZE
+            ),
+            Self::InvalidMagic => f.write_str("invalid lifecycle root identity magic"),
+            Self::UnsupportedVersion { version } => {
+                write!(f, "unsupported lifecycle root identity version {version}")
+            }
+            Self::NonzeroReserved { value } => write!(
+                f,
+                "lifecycle root identity reserved field is nonzero ({value})"
+            ),
+            Self::MissingLogicalRoot => {
+                f.write_str("lifecycle root identity has a zero logical root handle")
+            }
+        }
     }
 }
 
@@ -241,7 +373,7 @@ impl BlockPointer {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TraversalRoot {
     pub root_type: TraversalRootType,
-    pub block_pointer: BlockPointer,
+    pub root_identity: LifecycleRootIdentityV1,
     pub estimated_objects: u64,
 }
 
@@ -249,19 +381,23 @@ impl TraversalRoot {
     #[must_use]
     pub const fn new(
         root_type: TraversalRootType,
-        block_pointer: BlockPointer,
+        root_identity: LifecycleRootIdentityV1,
         estimated_objects: u64,
     ) -> Self {
         TraversalRoot {
             root_type,
-            block_pointer,
+            root_identity,
             estimated_objects,
         }
     }
 
+    /// Compare the durable root identity without treating an object-count
+    /// estimate as part of that identity.
     #[must_use]
-    pub const fn is_valid(self) -> bool {
-        !self.block_pointer.is_null()
+    pub const fn same_identity(self, other: Self) -> bool {
+        self.root_type.to_u8() == other.root_type.to_u8()
+            && self.root_identity.logical_root_handle == other.root_identity.logical_root_handle
+            && self.root_identity.generation == other.root_identity.generation
     }
 }
 
@@ -1250,6 +1386,10 @@ mod tests {
 
     // -- TraversalRoot --
 
+    fn root_identity(handle: u64) -> LifecycleRootIdentityV1 {
+        LifecycleRootIdentityV1::new(handle, 7).unwrap()
+    }
+
     #[test]
     fn traversal_root_type_roundtrip() {
         for t in [
@@ -1274,24 +1414,80 @@ mod tests {
     }
 
     #[test]
-    fn block_pointer_null() {
-        assert!(BlockPointer::NULL.is_null());
-        assert!(!BlockPointer(42).is_null());
+    fn lifecycle_root_identity_requires_nonzero_handle() {
+        assert_eq!(LifecycleRootIdentityV1::new(0, 7), None);
+        assert_eq!(
+            LifecycleRootIdentityV1::new(42, 7)
+                .unwrap()
+                .logical_root_handle(),
+            42
+        );
+    }
+
+    #[test]
+    fn lifecycle_root_identity_roundtrip_and_display() {
+        let identity = LifecycleRootIdentityV1::new(42, 7).unwrap();
+        assert_eq!(identity.generation(), 7);
+        assert_eq!(
+            LifecycleRootIdentityV1::decode(&identity.encode()),
+            Ok(identity)
+        );
+        assert_eq!(
+            identity.to_string(),
+            "logical-root(handle=42, generation=7)"
+        );
+        assert_eq!(format!("{identity:?}"), identity.to_string());
+    }
+
+    #[test]
+    fn lifecycle_root_identity_decode_fails_closed() {
+        let identity = LifecycleRootIdentityV1::new(42, 7).unwrap();
+
+        assert_eq!(
+            LifecycleRootIdentityV1::decode(&identity.encode()[..23]),
+            Err(LifecycleRootIdentityDecodeError::InvalidSize { actual: 23 })
+        );
+
+        let mut invalid_magic = identity.encode();
+        invalid_magic[0] ^= 0xff;
+        assert_eq!(
+            LifecycleRootIdentityV1::decode(&invalid_magic),
+            Err(LifecycleRootIdentityDecodeError::InvalidMagic)
+        );
+
+        let mut unsupported_version = identity.encode();
+        unsupported_version[4..6].copy_from_slice(&2_u16.to_le_bytes());
+        assert_eq!(
+            LifecycleRootIdentityV1::decode(&unsupported_version),
+            Err(LifecycleRootIdentityDecodeError::UnsupportedVersion { version: 2 })
+        );
+
+        let mut nonzero_reserved = identity.encode();
+        nonzero_reserved[6..8].copy_from_slice(&1_u16.to_le_bytes());
+        assert_eq!(
+            LifecycleRootIdentityV1::decode(&nonzero_reserved),
+            Err(LifecycleRootIdentityDecodeError::NonzeroReserved { value: 1 })
+        );
+
+        let mut missing_root = identity.encode();
+        missing_root[8..16].fill(0);
+        assert_eq!(
+            LifecycleRootIdentityV1::decode(&missing_root),
+            Err(LifecycleRootIdentityDecodeError::MissingLogicalRoot)
+        );
     }
 
     #[test]
     fn traversal_root_create() {
-        let root = TraversalRoot::new(TraversalRootType::InodeTable, BlockPointer(100), 5000);
+        let root = TraversalRoot::new(TraversalRootType::InodeTable, root_identity(100), 5000);
         assert_eq!(root.root_type, TraversalRootType::InodeTable);
-        assert_eq!(root.block_pointer, BlockPointer(100));
+        assert_eq!(root.root_identity, root_identity(100));
         assert_eq!(root.estimated_objects, 5000);
-        assert!(root.is_valid());
-    }
-
-    #[test]
-    fn traversal_root_null_not_valid() {
-        let root = TraversalRoot::new(TraversalRootType::ExtentMap, BlockPointer::NULL, 0);
-        assert!(!root.is_valid());
+        assert!(root.same_identity(TraversalRoot::new(
+            TraversalRootType::InodeTable,
+            root_identity(100),
+            1,
+        )));
     }
 
     // -- DestroyJobRecordV1 --
@@ -1299,8 +1495,8 @@ mod tests {
     #[test]
     fn destroy_job_record_new() {
         let roots = [
-            TraversalRoot::new(TraversalRootType::InodeTable, BlockPointer(1), 100),
-            TraversalRoot::new(TraversalRootType::ExtentMap, BlockPointer(2), 50),
+            TraversalRoot::new(TraversalRootType::InodeTable, root_identity(1), 100),
+            TraversalRoot::new(TraversalRootType::ExtentMap, root_identity(2), 50),
         ];
         let job =
             DestroyJobRecordV1::new(42, 1000, DestroyFlags::FORCE_UNMOUNT, &roots, 150).unwrap();
@@ -1319,7 +1515,7 @@ mod tests {
     #[test]
     fn destroy_job_record_too_many_roots() {
         let roots: [TraversalRoot; 7] =
-            [TraversalRoot::new(TraversalRootType::InodeTable, BlockPointer(1), 10); 7];
+            [TraversalRoot::new(TraversalRootType::InodeTable, root_identity(1), 10); 7];
         let job = DestroyJobRecordV1::new(1, 1, DestroyFlags::NONE, &roots, 70);
         assert!(job.is_none());
     }
@@ -1327,8 +1523,8 @@ mod tests {
     #[test]
     fn destroy_job_record_valid_roots() {
         let roots = [
-            TraversalRoot::new(TraversalRootType::InodeTable, BlockPointer(1), 10),
-            TraversalRoot::new(TraversalRootType::ExtentMap, BlockPointer(2), 20),
+            TraversalRoot::new(TraversalRootType::InodeTable, root_identity(1), 10),
+            TraversalRoot::new(TraversalRootType::ExtentMap, root_identity(2), 20),
         ];
         let job = DestroyJobRecordV1::new(1, 1, DestroyFlags::NONE, &roots, 30).unwrap();
         let valid = job.valid_roots();

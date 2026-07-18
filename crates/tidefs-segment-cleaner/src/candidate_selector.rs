@@ -513,7 +513,7 @@ mod tests {
         let mut pin_set = GcPinSet::<6>::new();
         let root = TraversalRoot::new(
             tidefs_types_dataset_lifecycle_core::TraversalRootType::InodeTable,
-            tidefs_types_dataset_lifecycle_core::BlockPointer(42),
+            tidefs_types_dataset_lifecycle_core::LifecycleRootIdentityV1::new(42, 1).unwrap(),
             100,
         );
         pin_set.pin(root).unwrap();

@@ -6,7 +6,7 @@
 
 use std::collections::BTreeSet;
 
-use tidefs_dataset_lifecycle::{BlockPointer, TraversalRoot, TraversalRootType};
+use tidefs_dataset_lifecycle::TraversalRoot;
 use tidefs_local_object_store::ObjectKey;
 use tidefs_types_reclaim_queue_core::ObjectKey as ReclaimObjectKey;
 
@@ -23,13 +23,12 @@ pub struct DeadlistReleasedRoot {
 }
 
 impl DeadlistReleasedRoot {
-    #[must_use]
-    pub fn snapshot_or_clone(root: CommittedRootSummary) -> Self {
-        let traversal_root = snapshot_traversal_root_for_summary(&root);
-        Self {
+    pub fn snapshot_or_clone(root: CommittedRootSummary) -> Result<Self> {
+        let traversal_root = snapshot_traversal_root_for_summary(&root)?;
+        Ok(Self {
             root,
             traversal_root,
-        }
+        })
     }
 }
 
@@ -214,16 +213,18 @@ impl LocalFileSystem {
         )];
 
         for pinned_root in self.lifecycle.gc_pin_set().pinned_roots() {
-            let matching_roots: Vec<_> = self
+            let mut matching_roots = Vec::new();
+            for record in self
                 .state
                 .snapshots
                 .values()
                 .filter(|record| crate::snapshot::snapshot_record_retains_data(record))
-                .filter(|record| {
-                    crate::snapshot::snapshot_record_traversal_root(record) == *pinned_root
-                })
-                .map(|record| record.root.clone())
-                .collect();
+            {
+                let root = crate::snapshot::snapshot_record_traversal_root(record)?;
+                if root.same_identity(*pinned_root) {
+                    matching_roots.push(record.root.clone());
+                }
+            }
             if matching_roots.is_empty() {
                 return Err(FileSystemError::CorruptState {
                     reason: "deadlist derivation found a lifecycle pin without a snapshot root",
@@ -238,17 +239,17 @@ impl LocalFileSystem {
     }
 }
 
-#[must_use]
-pub fn snapshot_traversal_root_for_summary(summary: &CommittedRootSummary) -> TraversalRoot {
-    TraversalRoot::new(
-        TraversalRootType::SnapshotCatalog,
-        BlockPointer(summary.transaction_id),
-        summary.generation,
-    )
+pub fn snapshot_traversal_root_for_summary(
+    summary: &CommittedRootSummary,
+) -> Result<TraversalRoot> {
+    crate::snapshot::lifecycle_traversal_root(summary.transaction_id, summary.generation)
 }
 
 fn validate_released_root(released: &DeadlistReleasedRoot) -> Result<()> {
-    if released.traversal_root != snapshot_traversal_root_for_summary(&released.root) {
+    if !released
+        .traversal_root
+        .same_identity(snapshot_traversal_root_for_summary(&released.root)?)
+    {
         return Err(FileSystemError::CorruptState {
             reason: "released deadlist root does not match its traversal root",
         });
@@ -259,7 +260,8 @@ fn validate_released_root(released: &DeadlistReleasedRoot) -> Result<()> {
 fn validate_live_roots(live_roots: &[DeadlistLiveRoot]) -> Result<()> {
     for live_root in live_roots {
         if let DeadlistLiveRootSource::LifecyclePin { traversal_root } = live_root.source {
-            if traversal_root != snapshot_traversal_root_for_summary(&live_root.root) {
+            if !traversal_root.same_identity(snapshot_traversal_root_for_summary(&live_root.root)?)
+            {
                 return Err(FileSystemError::CorruptState {
                     reason: "deadlist live lifecycle root does not match its traversal root",
                 });
@@ -323,7 +325,7 @@ mod tests {
         let released = summary(10, 7);
         let current = summary(20, 8);
         let input = DeadlistDerivationInput::new(
-            DeadlistReleasedRoot::snapshot_or_clone(released.clone()),
+            DeadlistReleasedRoot::snapshot_or_clone(released.clone()).unwrap(),
             vec![DeadlistLiveRoot::current_committed(current.clone())],
         );
         let roots = BTreeMap::from([
@@ -339,12 +341,29 @@ mod tests {
     }
 
     #[test]
+    fn zero_transaction_id_is_not_a_lifecycle_root() {
+        let root = summary(0, 7);
+        assert!(matches!(
+            snapshot_traversal_root_for_summary(&root),
+            Err(FileSystemError::CorruptState {
+                reason: "snapshot committed root has a zero transaction id"
+            })
+        ));
+        assert!(matches!(
+            DeadlistReleasedRoot::snapshot_or_clone(root),
+            Err(FileSystemError::CorruptState {
+                reason: "snapshot committed root has a zero transaction id"
+            })
+        ));
+    }
+
+    #[test]
     fn root_still_pinned_by_clone_returns_no_candidates() {
         let released = summary(10, 7);
         let shared_clone = released.clone();
-        let traversal_root = snapshot_traversal_root_for_summary(&shared_clone);
+        let traversal_root = snapshot_traversal_root_for_summary(&shared_clone).unwrap();
         let input = DeadlistDerivationInput::new(
-            DeadlistReleasedRoot::snapshot_or_clone(released.clone()),
+            DeadlistReleasedRoot::snapshot_or_clone(released.clone()).unwrap(),
             vec![DeadlistLiveRoot::lifecycle_pin(
                 shared_clone.clone(),
                 traversal_root,
@@ -365,12 +384,12 @@ mod tests {
         let current = summary(20, 8);
         let pinned = summary(30, 6);
         let input = DeadlistDerivationInput::new(
-            DeadlistReleasedRoot::snapshot_or_clone(released.clone()),
+            DeadlistReleasedRoot::snapshot_or_clone(released.clone()).unwrap(),
             vec![
                 DeadlistLiveRoot::current_committed(current.clone()),
                 DeadlistLiveRoot::lifecycle_pin(
                     pinned.clone(),
-                    snapshot_traversal_root_for_summary(&pinned),
+                    snapshot_traversal_root_for_summary(&pinned).unwrap(),
                 ),
             ],
         );

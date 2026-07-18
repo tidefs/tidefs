@@ -3545,7 +3545,7 @@ impl LocalFileSystem {
                 continue;
             }
             lifecycle
-                .pin_root(snapshot::snapshot_record_traversal_root(record))
+                .pin_root(snapshot::snapshot_record_traversal_root(record)?)
                 .map_err(|_| FileSystemError::CorruptState {
                     reason: "snapshot authority lifecycle pin set is full during reopen",
                 })?;
@@ -5835,6 +5835,8 @@ impl LocalFileSystem {
         }
         self.sync_all()?;
         let source_root = self.selected_current_root_summary()?;
+        let traversal_root =
+            snapshot::lifecycle_traversal_root(source_root.transaction_id, source_root.generation)?;
         self.begin_mutation(); // was: let previous_state = self.state.clone()
         let created_at_generation = self.bump_generation();
         let record = SnapshotRecord {
@@ -5852,7 +5854,7 @@ impl LocalFileSystem {
         self.mark_dir_dirty(ROOT_INODE_ID);
         let result = self.commit_mutation(summary)?;
         self.lifecycle
-            .pin_root(snapshot::snapshot_record_traversal_root(&record))
+            .pin_root(traversal_root)
             .map_err(|_| FileSystemError::CorruptState {
                 reason: "snapshot authority lifecycle pin set is full",
             })?;
@@ -5894,7 +5896,7 @@ impl LocalFileSystem {
         self.mark_dir_dirty(ROOT_INODE_ID);
         let summary = self.commit_mutation(record.summary())?;
         self.lifecycle
-            .unpin_root(snapshot::snapshot_record_traversal_root(&record));
+            .unpin_root(snapshot::snapshot_record_traversal_root(&record)?);
         if snapshot::remove_snapshot_record_catalog_entry(&mut self.dataset_catalog, &record)? {
             self.persist_dataset_catalog()?;
         }
