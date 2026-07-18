@@ -793,20 +793,30 @@ impl LocalAckReceipt {
         self.refusal.reason
     }
 
-    /// Reject RAM-authority labels that lack the dedicated authority record gate.
-    const fn legacy_ram_authority_emission_refusal(self) -> StorageIntentRefusalReason {
-        if !matches!(
+    /// Reject memory-authority claims that lack the dedicated authority record gate.
+    const fn unbacked_memory_authority_emission_refusal(self) -> StorageIntentRefusalReason {
+        if matches!(
             self.receipt.media_role,
             StorageMediaRole::RamVolatileAuthority | StorageMediaRole::RamIntentBackedAuthority
         ) {
-            return StorageIntentRefusalReason::None;
+            return if matches!(self.receipt.read_source, ReadServingSourceClass::Cache) {
+                StorageIntentRefusalReason::CacheCannotBeAuthority
+            } else {
+                StorageIntentRefusalReason::EvidenceNotUsable
+            };
         }
 
-        if matches!(self.receipt.read_source, ReadServingSourceClass::Cache) {
-            StorageIntentRefusalReason::CacheCannotBeAuthority
-        } else {
-            StorageIntentRefusalReason::EvidenceNotUsable
+        if matches!(
+            self.receipt.media_class,
+            StorageMediaClass::PersistentMemory
+        ) && matches!(
+            self.receipt.ack_class,
+            StorageIntentGuaranteeClass::LocalIntent | StorageIntentGuaranteeClass::FullPlacement
+        ) {
+            return StorageIntentRefusalReason::PmemFlushFenceMissing;
         }
+
+        StorageIntentRefusalReason::None
     }
 }
 
@@ -920,11 +930,12 @@ impl LocalAckReceiptLedger {
 
     /// Append a receipt, keeping only the bounded latest window.
     ///
-    /// The legacy local-ack envelope does not carry a `RamAuthorityRecord`, so
-    /// it must not emit either RAM-authority role. A future RAM owner must use
-    /// the dedicated core emission gate before reaching this ledger.
+    /// The current local-ack envelope does not carry a `RamAuthorityRecord`, so
+    /// it must not emit a RAM-authority role or a durable PMem receipt. A future
+    /// memory-authority owner must use the dedicated core emission gate before
+    /// reaching this ledger.
     pub fn record(&mut self, receipt: LocalAckReceipt) -> ReceiptPredicateResult {
-        let refusal = receipt.legacy_ram_authority_emission_refusal();
+        let refusal = receipt.unbacked_memory_authority_emission_refusal();
         if refusal != StorageIntentRefusalReason::None {
             return ReceiptPredicateResult::refused(refusal);
         }
@@ -2506,6 +2517,57 @@ mod tests {
         );
 
         assert_eq!(ledger.snapshot(), vec![cache_receipt]);
+    }
+
+    #[test]
+    fn ledger_rejects_unbacked_pmem_authority_receipts() {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let mut ledger = LocalAckReceiptLedger::new();
+        ledger.set_diagnostic_sink(sender);
+
+        let mut local_intent = LocalAckReceipt::durable_intent(
+            ledger.next_sequence(),
+            LocalAckOperation::Fsync,
+            LocalAckReceiptTarget::range(7, 0, 4096),
+            None,
+        );
+        local_intent.receipt.media_class = StorageMediaClass::PersistentMemory;
+        local_intent.receipt.media_role = StorageMediaRole::RamCache;
+        let local_intent_result = ledger.record(local_intent);
+        assert_eq!(
+            local_intent_result.refusal,
+            StorageIntentRefusalReason::PmemFlushFenceMissing
+        );
+
+        let mut full_placement = LocalAckReceipt::full_local_placement(
+            ledger.next_sequence(),
+            LocalAckOperation::Fdatasync,
+            LocalAckReceiptTarget::range(7, 4096, 4096),
+            None,
+        );
+        full_placement.receipt.media_class = StorageMediaClass::PersistentMemory;
+        let full_placement_result = ledger.record(full_placement);
+        assert_eq!(
+            full_placement_result.refusal,
+            StorageIntentRefusalReason::PmemFlushFenceMissing
+        );
+
+        let mut cache_receipt = LocalAckReceipt::unsafe_volatile(
+            ledger.next_sequence(),
+            LocalAckOperation::Odsync,
+            LocalAckReceiptTarget::range(7, 0, 4096),
+            None,
+            StorageIntentRefusalReason::UnsafeVolatileWriteCache,
+        );
+        cache_receipt.receipt.media_class = StorageMediaClass::PersistentMemory;
+        assert!(ledger.record(cache_receipt).satisfied);
+
+        assert_eq!(ledger.snapshot(), vec![cache_receipt]);
+        assert_eq!(receiver.try_recv(), Ok(cache_receipt));
+        assert_eq!(
+            receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        );
     }
 
     #[test]
