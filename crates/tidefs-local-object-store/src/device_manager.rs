@@ -132,6 +132,12 @@ struct TopologyLabelAuthority {
     device_layout_policy: Option<DeviceLayoutPolicy>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TopologyIndexValidation {
+    Exact,
+    ReindexSurvivors,
+}
+
 // DeviceManager
 // ---------------------------------------------------------------------------
 
@@ -208,8 +214,12 @@ impl DeviceManager {
         let new_device_count = old_device_count + 1;
         let new_topology_gen = commit_group.wrapping_add(1);
         let label_commit_group = commit_group;
-        let authority =
-            Self::topology_label_authority(existing_device_configs, device_guids, pool_guid)?;
+        let authority = Self::topology_label_authority(
+            existing_device_configs,
+            device_guids,
+            pool_guid,
+            TopologyIndexValidation::Exact,
+        )?;
 
         // 1. Write label to the new device.
         Self::write_single_device_label(LabelWriteRequest {
@@ -273,7 +283,12 @@ impl DeviceManager {
 
         // Validate every surviving label before mutating the first copy. This
         // also proves that any DeviceLayoutV1 records use one pool-wide policy.
-        let _ = Self::topology_label_authority(remaining_device_configs, device_guids, pool_guid)?;
+        let _ = Self::topology_label_authority(
+            remaining_device_configs,
+            device_guids,
+            pool_guid,
+            TopologyIndexValidation::ReindexSurvivors,
+        )?;
 
         Self::update_existing_labels_with_reindex(ExistingLabelUpdate {
             device_configs: remaining_device_configs,
@@ -324,6 +339,7 @@ impl DeviceManager {
             request.existing_device_configs,
             request.device_guids,
             request.pool_guid,
+            TopologyIndexValidation::Exact,
         )?;
 
         // Write label to new device at the same index.
@@ -401,6 +417,7 @@ impl DeviceManager {
             request.existing_device_configs,
             request.device_guids,
             request.pool_guid,
+            TopologyIndexValidation::Exact,
         )?;
 
         // Write the spare's label at the faulted device's index.
@@ -896,8 +913,10 @@ impl DeviceManager {
         device_configs: &[DeviceConfig],
         device_guids: &[[u8; 16]],
         pool_guid: [u8; 16],
+        index_validation: TopologyIndexValidation,
     ) -> Result<TopologyLabelAuthority> {
         let mut expected = None;
+        let mut previous_device_index = None;
         for (index, (config, device_guid)) in device_configs
             .iter()
             .zip(device_guids.iter().copied())
@@ -916,19 +935,36 @@ impl DeviceManager {
                     ),
                 });
             }
-            if record.label.device_index as usize != index {
-                return Err(StoreError::Io {
-                    operation: "topology_label_authority",
-                    path: config.path.clone(),
-                    source: std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!(
-                            "pool label device index {} does not match caller topology index {index}",
-                            record.label.device_index
+            match index_validation {
+                TopologyIndexValidation::Exact if record.label.device_index as usize != index => {
+                    return Err(StoreError::Io {
+                        operation: "topology_label_authority",
+                        path: config.path.clone(),
+                        source: std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "pool label device index {} does not match caller topology index {index}",
+                                record.label.device_index
+                            ),
                         ),
-                    ),
-                });
+                    });
+                }
+                TopologyIndexValidation::ReindexSurvivors
+                    if previous_device_index
+                        .is_some_and(|previous| record.label.device_index <= previous) =>
+                {
+                    return Err(StoreError::Io {
+                        operation: "topology_label_authority",
+                        path: config.path.clone(),
+                        source: std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "surviving pool labels do not preserve topology index order",
+                        ),
+                    });
+                }
+                _ => {}
             }
+            previous_device_index = Some(record.label.device_index);
             let authority = TopologyLabelAuthority {
                 redundancy_policy: record.label.redundancy_policy,
                 device_layout_policy: record.device_layout_policy,
@@ -1873,6 +1909,59 @@ mod tests {
 
         let _ = fs::remove_dir_all(&dir1);
         let _ = fs::remove_dir_all(&dir2);
+    }
+
+    #[test]
+    fn remove_device_reindexes_survivors_after_middle_device() {
+        let dir1 = temp_dir("dm-rm-middle-1");
+        let dir3 = temp_dir("dm-rm-middle-3");
+        let config1 = make_device_config(&dir1);
+        let config3 = make_device_config(&dir3);
+        let pool_guid = [0x06u8; 16];
+        let device_guids = [[0xA1u8; 16], [0xA2u8; 16], [0xA3u8; 16]];
+
+        for (config, device_guid, device_index) in [
+            (&config1, device_guids[0], 0),
+            (&config3, device_guids[2], 2),
+        ] {
+            DeviceManager::write_single_device_label(LabelWriteRequest {
+                device_config: config,
+                pool_guid,
+                device_guid,
+                pool_name: "remove-middle",
+                pool_state: crate::pool_label::LabelPoolState::Active,
+                commit_group: 5,
+                label_commit_group: 5,
+                device_index,
+                topology_generation: 1,
+                device_count: 3,
+                redundancy_policy: PoolRedundancyPolicy::replicated(2),
+                device_layout_policy: None,
+            })
+            .unwrap();
+        }
+
+        DeviceManager::remove_device(
+            &[config1, config3],
+            pool_guid,
+            &[device_guids[0], device_guids[2]],
+            "remove-middle",
+            5,
+        )
+        .expect("surviving labels must be reindexed after a middle-device removal");
+
+        for (dir, device_guid, device_index) in
+            [(&dir1, device_guids[0], 0), (&dir3, device_guids[2], 1)]
+        {
+            let label = decode_label(&fs::read(dir.join(".tidefs_label")).unwrap()).unwrap();
+            assert_eq!(label.device_guid, device_guid);
+            assert_eq!(label.device_index, device_index);
+            assert_eq!(label.device_count, 2);
+            assert_eq!(label.topology_generation, 6);
+        }
+
+        let _ = fs::remove_dir_all(&dir1);
+        let _ = fs::remove_dir_all(&dir3);
     }
 
     #[test]
