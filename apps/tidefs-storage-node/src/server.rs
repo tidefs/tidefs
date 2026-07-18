@@ -729,14 +729,26 @@ fn parse_send_base_root(
         .ok_or_else(|| format!("from_root not found: tid={tid} gen={gen} csum={csum:#016x}"))
 }
 
-/// Reject invalid incremental requests before coordinating peers.
-/// Stream construction revalidates the base root after the barrier passes.
-fn validate_vfssend2_send_key(
+/// Reject invalid local send requests before coordinating peers.
+/// Stream construction revalidates the source after the barrier passes.
+fn validate_vfssend2_send_request(
     fs_root: &Path,
     auth_key: RootAuthenticationKey,
     key: &[u8],
 ) -> Result<(), String> {
     if key.is_empty() {
+        let audit = vfs::audit_recovery_with_root_authentication_key(
+            fs_root,
+            StoreOptions::default(),
+            auth_key,
+        )
+        .map_err(|e| format!("audit: {e}"))?;
+        if !audit.mountable_without_operator_repair() {
+            return Err(format!(
+                "send source recovery: {}",
+                audit.outcome.human_name()
+            ));
+        }
         return Ok(());
     }
 
@@ -1168,7 +1180,7 @@ fn require_snapshot_barrier_before_send(
     auth_key: RootAuthenticationKey,
     key: &[u8],
 ) -> Result<(), String> {
-    validate_vfssend2_send_key(fs_root, auth_key, key)?;
+    validate_vfssend2_send_request(fs_root, auth_key, key)?;
 
     match run_snapshot_barrier_before_send(session_id, ctx, key) {
         Ok(report) => {
@@ -7610,6 +7622,61 @@ mod cluster_pool_handler_tests {
                 active
                     .as_ref()
                     .expect("malformed request must not clear the active barrier")
+                    .barrier_id(),
+                123
+            );
+        }
+    }
+
+    #[test]
+    fn unauthenticated_full_send_sources_are_rejected_before_snapshot_barrier() {
+        let (_dir, store) = frame_local_store();
+        let mut ctx = frame_test_context(Arc::clone(&store));
+        let fs_dir = tempfile::tempdir().unwrap();
+        let fs_root = fs_dir.path().join("fs");
+        let source_key = RootAuthenticationKey::from_bytes32([0x11; 32]);
+        let wrong_key = RootAuthenticationKey::from_bytes32([0x22; 32]);
+        let mut fs = vfs::LocalFileSystem::open_with_root_authentication_key(
+            &fs_root,
+            StoreOptions::default(),
+            source_key,
+        )
+        .unwrap();
+        fs.create_file("/authenticated", 0o644).unwrap();
+        fs.sync_all().unwrap();
+        drop(fs);
+        ctx.config.fs_root = Some(fs_root);
+        ctx.config.root_auth_key = Some(wrong_key);
+        *ctx.active_barrier.lock().unwrap() = Some(SnapshotCoordinator::new(
+            123,
+            "active".into(),
+            Vec::new(),
+            SnapshotBarrierConfig::default(),
+        ));
+
+        for frame in [
+            Frame::Send { key: vec![] },
+            Frame::SendChunked { key: vec![] },
+        ] {
+            let response =
+                handle_frame_ctx(tidefs_transport::SessionId::new(1), &frame, &store, &ctx)
+                    .expect("unauthenticated full send returns an error");
+
+            match response {
+                Frame::Error { message } => {
+                    assert_eq!(
+                        message,
+                        "send source recovery: explicit integrity/media error"
+                    );
+                }
+                other => panic!("expected unauthenticated-source error, got {other:?}"),
+            }
+
+            let active = ctx.active_barrier.lock().unwrap();
+            assert_eq!(
+                active
+                    .as_ref()
+                    .expect("invalid request must not clear the active barrier")
                     .barrier_id(),
                 123
             );
