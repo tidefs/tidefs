@@ -173,12 +173,13 @@ fi
 
 jq -e '
   .test == "tidefs-fuse-vm-test"
-  and .version >= 3
+  and .version == 3
   and .tier == "outside-sandbox-qemu-guest"
-  and (.kernel_version | type == "string" and startswith("7."))
+  and .kernel_package == "linuxKernel_7_0"
+  and (.kernel_version | type == "string" and test("^7\\.0([.-]|$)"))
   and .qemu_status == 0
-  and .done_marker_seen >= 1
-  and .passed > 0
+  and (.done_marker_seen | type == "number" and floor == . and . >= 1)
+  and (.passed | type == "number" and floor == . and . > 0)
   and .product_failures == 0
   and .environment_refusals == 0
   and .queue_depth_artifact_present == true
@@ -188,13 +189,60 @@ jq -e '
 jq -e '
   .schema_version == 1
   and .evidence_class == "queue-depth-runtime-artifact"
+  and .source == "tidefs-posix-filesystem-adapter-daemon smoke-mount"
+  and .claim_ids == ["perf.local.no_unbounded_dirty_debt.v1"]
   and .workload == "fuse-smoke-mount-quick"
   and .mount_adapter == "fuse"
-  and (.admission | type == "object")
-  and (.hard_caps | type == "object")
-  and (.effective_caps | type == "object")
-  and (.invariant_checks | type == "object")
-  and ([.invariant_checks[]] | all(. == true))
+  and .pool == "root"
+  and ([
+    .admission.current_dirty_bytes,
+    .admission.current_dirty_ops,
+    .admission.current_outstanding_permits,
+    .admission.current_tick,
+    .admission.peak_dirty_bytes,
+    .admission.peak_dirty_ops,
+    .admission.peak_outstanding_permits
+  ] | all(type == "number" and floor == . and . >= 0))
+  and ([
+    .hard_caps.dirty_age_ticks,
+    .hard_caps.dirty_bytes,
+    .hard_caps.dirty_ops,
+    .hard_caps.permits,
+    .effective_caps.dirty_age_ticks,
+    .effective_caps.dirty_bytes,
+    .effective_caps.dirty_ops,
+    .effective_caps.permits
+  ] | all(type == "number" and floor == . and . > 0))
+  and ([
+    .invariant_checks.current_dirty_bytes_within_effective_cap,
+    .invariant_checks.current_dirty_ops_within_effective_cap,
+    .invariant_checks.current_outstanding_permits_within_hard_cap,
+    .invariant_checks.peak_dirty_bytes_within_effective_cap,
+    .invariant_checks.peak_dirty_ops_within_effective_cap,
+    .invariant_checks.peak_outstanding_permits_within_hard_cap
+  ] | all(. == true))
+  and .admission.peak_dirty_bytes >= .admission.current_dirty_bytes
+  and .admission.peak_dirty_ops >= .admission.current_dirty_ops
+  and .admission.peak_outstanding_permits >= .admission.current_outstanding_permits
+  and .admission.peak_dirty_bytes <= .effective_caps.dirty_bytes
+  and .admission.peak_dirty_ops <= .effective_caps.dirty_ops
+  and .admission.peak_outstanding_permits <= .hard_caps.permits
+  and .effective_caps.dirty_age_ticks <= .hard_caps.dirty_age_ticks
+  and .effective_caps.dirty_bytes <= .hard_caps.dirty_bytes
+  and .effective_caps.dirty_ops <= .hard_caps.dirty_ops
+  and .effective_caps.permits <= .hard_caps.permits
+  and .determinism.workload == "fixed smoke-mount quick workload"
+  and (.determinism.admission_state | type == "string" and length > 0)
+  and ([
+    .determinism.tolerance.peak_dirty_bytes,
+    .determinism.tolerance.peak_dirty_ops,
+    .determinism.tolerance.peak_outstanding_permits
+  ] | all(type == "number" and floor == . and . >= 0))
+  and .no_hidden_queue_gate.registry_path == "validation/performance/no-hidden-queues.toml"
+  and .no_hidden_queue_gate.command == "cargo run -p tidefs-xtask -- check-no-hidden-queues"
+  and (.no_hidden_queue_gate.registered_queue_roots | type == "array")
+  and (.no_hidden_queue_gate.registered_queue_roots | index("performance_contract.budgeted_queue") != null)
+  and (.no_hidden_queue_gate.registered_queue_roots | index("local_fs.write_admission") != null)
 ' "$input_artifact" >/dev/null \
   || fail "queue-depth input is not a passing fuse-smoke-mount-quick runtime snapshot"
 
