@@ -123,6 +123,7 @@ EOF
   GITHUB_RUN_ID="''${GITHUB_RUN_ID:-local}"
   GITHUB_RUN_ATTEMPT="''${GITHUB_RUN_ATTEMPT:-1}"
   GITHUB_SHA="''${GITHUB_SHA:-unknown}"
+  VERIFIED_SOURCE_REF="''${TIDEFS_FUSE_VM_TEST_VERIFIED_SOURCE_REF:-}"
   TIDEFS_GENERATED_AT="''${TIDEFS_GENERATED_AT:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
 
   if [ ! -e /dev/kvm ]; then
@@ -861,7 +862,8 @@ JSON
     && [ "$REFUSALC" -eq 0 ] \
     && [ "$FAILC" -eq 0 ] \
     && [ "$QUEUE_PRESENT" = true ]; then
-    if [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]] \
+    if [[ "$VERIFIED_SOURCE_REF" =~ ^[0-9a-f]{40}$ ]] \
+      && [ "$GITHUB_SHA" = "$VERIFIED_SOURCE_REF" ] \
       && [[ "$TIDEFS_GENERATED_AT" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]; then
       if [[ "$GITHUB_RUN_ID" =~ ^[0-9]+$ ]] \
         && [[ "$GITHUB_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]; then
@@ -874,7 +876,7 @@ JSON
       "$JQ" -n --sort-keys \
         --arg content_digest "$queue_content_digest" \
         --arg run_id "$queue_run_id" \
-        --arg source_ref "$GITHUB_SHA" \
+        --arg source_ref "$VERIFIED_SOURCE_REF" \
         --arg generated_at "$TIDEFS_GENERATED_AT" \
         '{
           manifest_version: 2,
@@ -894,7 +896,7 @@ JSON
         }' > "$queue_manifest_tmp"
       mv -- "$queue_manifest_tmp" "$queue_manifest"
     else
-      echo "Queue-depth manifest withheld: source SHA or generated timestamp is not promotable" >&2
+      echo "Queue-depth manifest withheld: verified source SHA, requested source SHA, or generated timestamp is not promotable" >&2
     fi
   fi
 

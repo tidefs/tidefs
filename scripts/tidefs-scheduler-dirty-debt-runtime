@@ -22,7 +22,7 @@ launching another VM; a digest-matched version-2 runtime manifest must bind
 the promoted input to its run provenance.
 
 Options:
-  --output-dir DIR       Write queue-depth-runtime.json and its manifest here
+  --output-dir DIR       Write queue-depth-runtime.json and its claim manifests here
   --timeout SECONDS      QEMU timeout in run mode (default: 900)
   --input-artifact FILE  Existing raw queue-depth-runtime.json from QEMU Smoke
   --input-summary FILE   Matching fuse-vm-test.json from the same QEMU run
@@ -142,19 +142,25 @@ fi
 if [[ -z "$generated_at" ]]; then
   generated_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 fi
-if [[ -z "$run_id" ]]; then
-  if [[ -n "${GITHUB_RUN_ID:-}" ]]; then
-    run_id="github-actions:${GITHUB_RUN_ID}/${GITHUB_RUN_ATTEMPT:-1}"
-  else
-    run_id="local-qemu:${generated_at}"
-  fi
-fi
 if [[ "$input_mode" -eq 0 ]]; then
+  if [[ -n "$(git -C "$repo" status --porcelain --untracked-files=no)" ]]; then
+    fail "run mode requires a checkout without staged or unstaged tracked changes"
+  fi
   checkout_source_ref="$(git -C "$repo" rev-parse HEAD)"
   if [[ -n "$source_ref" && "$source_ref" != "$checkout_source_ref" ]]; then
     fail "--source-ref must match the run-mode checkout HEAD"
   fi
   source_ref="$checkout_source_ref"
+  if [[ "${GITHUB_RUN_ID:-}" =~ ^[0-9]+$ ]] \
+    && [[ "${GITHUB_RUN_ATTEMPT:-1}" =~ ^[1-9][0-9]*$ ]]; then
+    expected_run_id="github-actions:${GITHUB_RUN_ID}/${GITHUB_RUN_ATTEMPT:-1}"
+  else
+    expected_run_id="local-qemu:${generated_at}"
+  fi
+  if [[ -n "$run_id" && "$run_id" != "$expected_run_id" ]]; then
+    fail "--run-id must match the run-mode producer id $expected_run_id"
+  fi
+  run_id="$expected_run_id"
 fi
 
 [[ "$source_ref" =~ ^[0-9a-f]{40}$ ]] \
@@ -170,9 +176,11 @@ esac
 owned_runtime_dir=""
 artifact_tmp=""
 manifest_tmp=""
+local_manifest_tmp=""
 cleanup() {
   [[ -z "$artifact_tmp" ]] || rm -f -- "$artifact_tmp"
   [[ -z "$manifest_tmp" ]] || rm -f -- "$manifest_tmp"
+  [[ -z "$local_manifest_tmp" ]] || rm -f -- "$local_manifest_tmp"
   if [[ -n "$owned_runtime_dir" && "$keep_runtime_output" -eq 0 ]]; then
     rm -rf -- "$owned_runtime_dir"
   elif [[ -n "$owned_runtime_dir" ]]; then
@@ -185,6 +193,7 @@ if [[ "$input_mode" -eq 0 ]]; then
   owned_runtime_dir="$(mktemp -d "${TMPDIR:-/tmp}/tidefs-dirty-debt-runtime.XXXXXX")"
   input_artifact="$owned_runtime_dir/performance/queue-depth-runtime.json"
   input_summary="$owned_runtime_dir/fuse-vm-test.json"
+  input_manifest="$owned_runtime_dir/queue-depth-runtime.manifest.json"
   GITHUB_SHA="$source_ref" \
     GITHUB_RUN_ID="${GITHUB_RUN_ID:-local-qemu}" \
     GITHUB_RUN_ATTEMPT="${GITHUB_RUN_ATTEMPT:-1}" \
@@ -197,9 +206,7 @@ fi
 
 [[ -s "$input_artifact" ]] || fail "queue-depth input is missing or empty: $input_artifact"
 [[ -s "$input_summary" ]] || fail "QEMU summary is missing or empty: $input_summary"
-if [[ "$input_mode" -eq 1 ]]; then
-  [[ -s "$input_manifest" ]] || fail "QEMU input manifest is missing or empty: $input_manifest"
-fi
+[[ -s "$input_manifest" ]] || fail "QEMU input manifest is missing or empty: $input_manifest"
 
 jq -e '
   .test == "tidefs-fuse-vm-test"
@@ -276,13 +283,12 @@ jq -e '
 ' "$input_artifact" >/dev/null \
   || fail "queue-depth input is not a passing fuse-smoke-mount-quick runtime snapshot"
 
-if [[ "$input_mode" -eq 1 ]]; then
-  input_content_digest="$(content_digest_for_file "$input_artifact")"
-  jq -e \
-    --arg content_digest "$input_content_digest" \
-    --arg source_ref "$source_ref" \
-    --arg run_id "$run_id" \
-    --arg generated_at "$generated_at" '
+input_content_digest="$(content_digest_for_file "$input_artifact")"
+jq -e \
+  --arg content_digest "$input_content_digest" \
+  --arg source_ref "$source_ref" \
+  --arg run_id "$run_id" \
+  --arg generated_at "$generated_at" '
       (keys | sort) == [
         "artifact_path",
         "blocking_issues",
@@ -317,15 +323,16 @@ if [[ "$input_mode" -eq 1 ]]; then
       and (.generated_at | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))
       and .generated_at == $generated_at
       and .blocking_issues == []
-    ' "$input_manifest" >/dev/null \
-    || fail "QEMU input manifest does not bind this artifact to the requested passing runtime provenance"
-fi
+  ' "$input_manifest" >/dev/null \
+  || fail "QEMU input manifest does not bind this artifact to the requested passing runtime provenance"
 
 mkdir -p -- "$output_dir"
 artifact_path="$output_dir/queue-depth-runtime.json"
 manifest_path="$output_dir/scheduler-dirty-debt-queue-depth-runtime.manifest.json"
+local_manifest_path="$output_dir/local-no-unbounded-dirty-debt-queue-depth-runtime.manifest.json"
 artifact_tmp="$artifact_path.tmp.$$"
 manifest_tmp="$manifest_path.tmp.$$"
+local_manifest_tmp="$local_manifest_path.tmp.$$"
 
 jq --sort-keys \
   --arg source_ref "$source_ref" \
@@ -459,35 +466,59 @@ jq --sort-keys \
 ' "$input_artifact" > "$artifact_tmp"
 
 content_digest="$(content_digest_for_file "$artifact_tmp")"
-jq -n --sort-keys \
-  --arg content_digest "$content_digest" \
-  --arg source_ref "$source_ref" \
-  --arg run_id "$run_id" \
-  --arg generated_at "$generated_at" '
+write_output_manifest() {
+  local destination="$1"
+  local claim_id="$2"
+  local scope="$3"
+  local residual_risk="$4"
+
+  jq -n --sort-keys \
+    --arg claim_id "$claim_id" \
+    --arg scope "$scope" \
+    --arg residual_risk "$residual_risk" \
+    --arg content_digest "$content_digest" \
+    --arg source_ref "$source_ref" \
+    --arg run_id "$run_id" \
+    --arg generated_at "$generated_at" '
   {
     manifest_version: 2,
-    claim_id: "scheduler.dirty_debt.no_hidden.v1",
+    claim_id: $claim_id,
     evidence_class: "queue-depth-runtime-artifact",
     validation_tier: "mounted-userspace",
-    scope: "Linux 7.0 QEMU mounted FUSE quick workload with aggregate local admission measurements and explicit scheduler-wide refusal boundaries",
+    scope: $scope,
     artifact_path: "validation/artifacts/performance/queue-depth-runtime.json",
     content_digest: $content_digest,
     run_id: $run_id,
     source_ref: $source_ref,
     outcome: "pass",
-    residual_risk: "The row measures bounded aggregate local admission only. Independent writeback, page-cache, reclaim, scrub/repair, rename/orphan-index, transport/distributed, and background-scheduler queue-depth coverage remains absent, so scheduler.dirty_debt.no_hidden.v1 stays blocked.",
+    residual_risk: $residual_risk,
     source: "scripts/tidefs-scheduler-dirty-debt-runtime via qemu-smoke-fuse-vm-test",
     generated_at: $generated_at,
     blocking_issues: []
   }
-' > "$manifest_tmp"
+  ' > "$destination"
+}
+
+write_output_manifest \
+  "$manifest_tmp" \
+  "scheduler.dirty_debt.no_hidden.v1" \
+  "Linux 7.0 QEMU mounted FUSE quick workload with aggregate local admission measurements and explicit scheduler-wide refusal boundaries" \
+  "The row measures bounded aggregate local admission only. Independent writeback, page-cache, reclaim, scrub/repair, rename/orphan-index, transport/distributed, and background-scheduler queue-depth coverage remains absent, so scheduler.dirty_debt.no_hidden.v1 stays blocked."
+write_output_manifest \
+  "$local_manifest_tmp" \
+  "perf.local.no_unbounded_dirty_debt.v1" \
+  "Linux 7.0 QEMU mounted FUSE quick workload with aggregate local admission measurements" \
+  "The row refreshes bounded aggregate local admission evidence only. The artifact explicitly keeps perf.local.no_unbounded_dirty_debt.v1 blocked and does not establish scheduler-wide, crash-recovery, fsync, mmap/writeback, kernel, RDMA, distributed, production, or release behavior."
 
 mv -- "$artifact_tmp" "$artifact_path"
 mv -- "$manifest_tmp" "$manifest_path"
+mv -- "$local_manifest_tmp" "$local_manifest_path"
 artifact_tmp=""
 manifest_tmp=""
+local_manifest_tmp=""
 
 echo "artifact=$artifact_path"
 echo "manifest=$manifest_path"
+echo "local_manifest=$local_manifest_path"
 echo "source_ref=$source_ref"
 echo "run_id=$run_id"

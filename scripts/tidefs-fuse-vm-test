@@ -86,6 +86,35 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+verified_source_ref=""
+source_checkout=""
+if git -C "$repo" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  source_checkout="$repo"
+elif [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
+  source_checkout="${GITHUB_WORKSPACE:-}"
+  if [[ -z "$source_checkout" ]] \
+    || ! git -C "$source_checkout" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    echo "tidefs-fuse-vm-test: GitHub Actions checkout is unavailable for source verification" >&2
+    exit 2
+  fi
+fi
+if [[ -n "$source_checkout" ]]; then
+  if [[ -n "$(git -C "$source_checkout" status --porcelain --untracked-files=no)" ]]; then
+    echo "tidefs-fuse-vm-test: promotable runs require a checkout without staged or unstaged tracked changes" >&2
+    exit 2
+  fi
+  checkout_source_ref="$(git -C "$source_checkout" rev-parse HEAD)"
+  if [[ -n "${GITHUB_SHA:-}" && "$GITHUB_SHA" != "$checkout_source_ref" ]]; then
+    echo "tidefs-fuse-vm-test: GITHUB_SHA must match checkout HEAD" >&2
+    exit 2
+  fi
+  GITHUB_SHA="$checkout_source_ref"
+  verified_source_ref="$checkout_source_ref"
+  repo="$source_checkout"
+fi
+export GITHUB_SHA
+export TIDEFS_FUSE_VM_TEST_VERIFIED_SOURCE_REF="$verified_source_ref"
+
 bash "$script_dir/tidefs-nix-qemu-build" \
   --target tidefsFuseVmTest \
   --name tidefs-fuse-vm-test \
