@@ -209,13 +209,26 @@ impl MmapCoherency {
         self.processor.lock().unwrap().enqueue_batch(batch);
     }
 
+    fn retryable_deferred_invalidation_count(&self) -> usize {
+        let registrations = self.registrations.lock().unwrap();
+        self.deferred_invalidations
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(ino, _)| registrations.get(ino).is_some_and(|entry| entry.active))
+            .count()
+    }
+
     pub fn process_tick(&self, event_budget: usize) -> usize {
         if event_budget == 0 {
             return 0;
         }
 
         let mut processor = self.processor.lock().unwrap();
-        let deferred_pending = self.deferred_invalidations.lock().unwrap().len();
+        // A retained invalidation for a closed inode cannot make progress
+        // until register() reactivates that inode. Keep it pending, but do
+        // not let it consume retry budget or displace new feed events.
+        let deferred_pending = self.retryable_deferred_invalidation_count();
         let feed_pending = processor.pending_event_count();
         let (deferred_budget, feed_budget) = match (deferred_pending, feed_pending) {
             (0, _) => (0, event_budget),
@@ -287,13 +300,25 @@ impl MmapInvalidationSink<'_> {
     }
 
     fn retry_deferred(&mut self, event_budget: usize) -> usize {
-        let attempt_budget = event_budget.min(self.deferred_invalidations.lock().unwrap().len());
+        let scan_budget = self.deferred_invalidations.lock().unwrap().len();
         let mut attempted = 0;
-        while attempted < attempt_budget {
+        let mut scanned = 0;
+        while attempted < event_budget && scanned < scan_budget {
             let Some((ino, generation)) = self.deferred_invalidations.lock().unwrap().pop_front()
             else {
                 break;
             };
+            scanned += 1;
+            let is_active = self
+                .registrations
+                .lock()
+                .unwrap()
+                .get(&ino)
+                .is_some_and(|entry| entry.active);
+            if !is_active {
+                self.defer_invalidation(ino, generation);
+                continue;
+            }
             self.invalidate_inode_inner(ino, generation, false);
             attempted += 1;
         }
@@ -542,7 +567,7 @@ mod tests {
 
         c.deregister(42);
         dirty.store(false, Ordering::Relaxed);
-        assert_eq!(c.process_tick(10), 1);
+        assert_eq!(c.process_tick(10), 0);
         assert_eq!(c.deferred_invalidation_count(), 1);
         assert_eq!(calls.load(Ordering::Relaxed), 0);
 
@@ -558,6 +583,26 @@ mod tests {
         assert_eq!(s.dirty_invalidations_preserved, 1);
         assert_eq!(s.coherency_conflicts, 1);
         assert_eq!(s.pages_invalidated, 1);
+    }
+
+    #[test]
+    fn inactive_deferred_invalidation_does_not_consume_feed_budget() {
+        let c = new_coherency();
+        c.register(42, 1);
+        c.deregister(42);
+        c.enqueue_batch(batch(42, 2));
+        assert_eq!(c.process_tick(1), 1);
+        assert_eq!(c.deferred_invalidation_count(), 1);
+
+        for ino in 100..102 {
+            c.register(ino, 0);
+            c.enqueue_batch(batch(ino, 1));
+        }
+
+        assert_eq!(c.process_tick(2), 2);
+        assert_eq!(c.stats.snapshot().pages_invalidated, 2);
+        assert_eq!(c.deferred_invalidation_count(), 1);
+        assert_eq!(c.pending_event_count(), 1);
     }
 
     #[test]
