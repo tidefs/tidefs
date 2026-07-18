@@ -2703,7 +2703,7 @@ pub fn check_xfstests_harness_current_workspace() -> Result<(), StorageCheckErro
         "scripts/tidefs-xfstests-mount",
         "scripts/tidefs-xfstests-runner",
         "scripts/tidefs-xfstests-exclude",
-        "docs/xfstests-harness.md",
+        "docs/XFSTESTS_DISPATCH_CONTRACT.md",
         "nix/tidefs-posix-scoreboard.sh",
         "flake.nix",
     ] {
@@ -2758,15 +2758,13 @@ pub fn check_xfstests_harness_current_workspace() -> Result<(), StorageCheckErro
     );
     check_source_markers(
         &root,
-        "docs/xfstests-harness.md",
+        "docs/XFSTESTS_DISPATCH_CONTRACT.md",
         &[
-            "xfstests harness",
-            "nix run .#xfstests-runner",
-            "TIDEFS_XFSTESTS_STORE_ROOT",
-            "tidefs-preview",
-            "tidefs-xfstests-mount",
-            "tidefs-xfstests-exclude",
-            "Baseline",
+            "Workflow file",
+            ".github/workflows/xfstests.yml",
+            ".#fuse-xfstests-validation",
+            "kmod-smoke",
+            "k7-vfs",
         ],
         &mut missing,
     );
