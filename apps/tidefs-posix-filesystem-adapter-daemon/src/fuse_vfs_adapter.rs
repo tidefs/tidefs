@@ -8345,14 +8345,15 @@ impl FuseVfsAdapter {
             }
         }
 
-        // A successful fsync can leave adapter dirty_state intact when no
-        // block-volume target consumed it. Keep the inode-level reclaim
-        // projection aligned with every remaining dirty owner.
-        self.reconcile_writeback_inode_cache_after_authoritative_range(ino);
         if let Some(ref writeback_page_cache) = self.writeback_page_cache {
             writeback_page_cache.clear_dirty_for_inode(ino);
         }
         self.write_page_cache.clear_dirty_for_inode(ino);
+        // A successful fsync can leave adapter dirty_state intact when no
+        // block-volume target consumed it. Reconcile only after retiring the
+        // page-cache mirrors so a fully drained inode can become reclaimable,
+        // while any remaining dirty owner keeps the projection dirty.
+        self.reconcile_writeback_inode_cache_after_authoritative_range(ino);
         self.writeback_cache_stats.lock().unwrap().record_flush();
         Ok(())
     }
@@ -33359,6 +33360,16 @@ mod tests {
             let ds = fixture.adapter.dirty_state.lock().unwrap();
             assert!(!ds.contains_key(&inode.get()));
         }
+        assert_eq!(
+            fixture
+                .adapter
+                .writeback_cache
+                .lock()
+                .unwrap()
+                .is_dirty(inode.get()),
+            Some(false),
+            "fsync must publish the reclaim projection clean after every dirty owner drains"
+        );
         {
             let engine = fixture.adapter.engine.lock().unwrap();
             let readback = engine
