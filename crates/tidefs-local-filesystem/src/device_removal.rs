@@ -61,8 +61,8 @@
 //! * **Durable-survivor-sync ordering is caller responsibility.**
 //!   [`anchor_device_removal`] syncs the target store after writing the
 //!   removal record.  The caller must sync surviving stores **before**
-//!   calling this function.  The current CLI path respects this order, but
-//!   the guard is a code convention, not a type-state or commit_group fence.
+//!   calling this function.  No public CLI path currently reaches this helper,
+//!   so this is not an operator-facing durability guarantee.
 //!
 //! * **No canonical emptiness verification.**  After evacuation, the code
 //!   trusts `objects_failed == 0` to mean the source device is empty.
@@ -95,21 +95,13 @@
 //! * The canonical placement/refcount table for objects on this device
 //! * The committed-root pointer (that lives in the system area, not the label)
 //!
-//! ## Integration with tidefsctl
+//! ## Live-owner boundary
 //!
-//! The `tidefsctl device remove` subcommand
-//! (`apps/tidefsctl/src/commands/device.rs`) is the primary operator-facing
-//! consumer of this module.  It follows the seven-stage authority path
-//! described above and adds:
-//!
-//! * Pre-evacuation data loading into an in-memory map
-//! * Surviving-store sync before anchoring (correct ordering)
-//! * Label persistence to every surviving store
-//! * Import-from-survivors-only verification after removal
-//!
-//! The CLI owns the operator-provided `--surviving-dirs` to backing-store
-//! mapping and the evacuation read/write closures.  This module provides
-//! the anchor, label, and import primitives that the CLI composes.
+//! `tidefsctl device remove` currently refuses before live-owner dispatch.
+//! It does not call this module's synthetic planner, label writer, or anchor.
+//! These helpers retain local durable-codec and topology invariants, but they
+//! cannot establish pool-authoritative placement/refcount or receipt evidence.
+//! A successful local anchor is therefore not product online-removal proof.
 
 use std::path::{Path, PathBuf};
 
@@ -174,7 +166,10 @@ impl DeviceRemovalRecord {
             bytes_evacuated: result.bytes_evacuated,
             objects_failed: result.objects_failed,
             topology_generation: result.topology_generation,
-            removal_complete: result.objects_failed == 0 && result.committed_root_anchored,
+            // The caller's `committed_root_anchored` bit is the executor's
+            // summary, not durable evidence. `anchor_device_removal` sets
+            // this only after it validates the completed local input set.
+            removal_complete: false,
         }
     }
 
@@ -935,17 +930,19 @@ pub fn import_pool_config_from_store(
     }))
 }
 
-/// Anchor a device removal in a committed root on the target store.
+/// Anchor a completed local device-removal record on the target store.
 ///
-/// Writes the removal record as a named object. When `updated_pool_config` is
-/// provided, also persists sealed-and-checksummed [`PoolLabelV1`] labels for
-/// every surviving device under `tidefs-pool-label-<index>` keys. A final
-/// [`LocalObjectStore::sync`] commits all writes in a single commit_group, producing a
-/// new committed root.
+/// Writes the removal record as a named object and persists
+/// sealed-and-checksummed [`PoolLabelV1`] labels for every surviving device
+/// under `tidefs-pool-label-<index>` keys. A final [`LocalObjectStore::sync`]
+/// commits all writes in a single commit_group, producing a new committed
+/// root.
 ///
 /// The caller must sync surviving stores **before** calling this function so
 /// that evacuation data is durable before the removal anchor is written.
-/// If the caller's sync here fails, the removal record is not committed.
+/// The anchor rejects an incomplete or mismatched plan/result/config set
+/// before writing records or labels. If its sync fails, the completed local
+/// record is not committed.
 ///
 /// The caller is responsible for calling [`PoolConfig::remove_device`] on the
 /// config before passing it here so that `device_count`, `topology_generation`,
@@ -953,7 +950,9 @@ pub fn import_pool_config_from_store(
 ///
 /// # Returns
 ///
-/// `Ok(())` if the record (and optionally labels) were written and synced.
+/// `Ok(())` if the record and post-removal labels were written and synced.
+/// This only proves the checked local-store invariant; it does not make this
+/// helper a live-owner, placement/refcount, or media-remanence authority.
 ///
 /// # Errors
 ///
@@ -967,7 +966,17 @@ pub fn anchor_device_removal(
     label_writer: Option<&tidefs_pool_scan::PoolLabelWriter>,
     device_sizes: Option<&std::collections::BTreeMap<u32, u64>>,
 ) -> Result<(), DeviceRemovalAnchorError> {
-    let record = DeviceRemovalRecord::from_plan_and_result(plan, result);
+    let config = updated_pool_config.ok_or_else(|| {
+        DeviceRemovalAnchorError::IncompleteEvidence(
+            "post-removal pool configuration is required before anchoring".into(),
+        )
+    })?;
+    validate_completed_anchor_inputs(plan, result, config)?;
+
+    let mut record = DeviceRemovalRecord::from_plan_and_result(plan, result);
+    // A completed record is derived from the verified inputs and the sync
+    // below, not from a caller-supplied executor summary bit.
+    record.removal_complete = true;
 
     let payload = record.encode_durable()?;
 
@@ -981,14 +990,7 @@ pub fn anchor_device_removal(
     // so pool import discovers the post-removal topology.
     if let Some(writer) = label_writer {
         writer
-            .write_pool_labels(
-                updated_pool_config.ok_or_else(|| {
-                    DeviceRemovalAnchorError::StoreWrite(
-                        "label_writer provided without updated_pool_config".into(),
-                    )
-                })?,
-                device_sizes,
-            )
+            .write_pool_labels(config, device_sizes)
             .map_err(|e| {
                 DeviceRemovalAnchorError::StoreWrite(format!(
                     "write updated labels to surviving devices: {e}"
@@ -996,13 +998,151 @@ pub fn anchor_device_removal(
             })?;
     }
 
-    if let Some(config) = updated_pool_config {
-        persist_updated_labels(store, config)?;
-    }
+    persist_updated_labels(store, config)?;
 
     store
         .sync()
         .map_err(|e| DeviceRemovalAnchorError::StoreSync(e.to_string()))?;
+
+    Ok(())
+}
+
+/// Check that a local removal anchor cannot publish post-removal topology from
+/// an incomplete or mismatched evacuation result.
+///
+/// This is a compact local invariant only. It does not validate canonical
+/// placement/refcount or receipt authority, which remains with the live owner.
+fn validate_completed_anchor_inputs(
+    plan: &DeviceRemovalPlan,
+    result: &DeviceRemovalResult,
+    config: &PoolConfig,
+) -> Result<(), DeviceRemovalAnchorError> {
+    if !plan.plan_validated {
+        return Err(DeviceRemovalAnchorError::IncompleteEvidence(
+            "evacuation plan did not pass topology validation".into(),
+        ));
+    }
+
+    let planned_objects = u64::try_from(plan.objects_to_evacuate.len()).map_err(|_| {
+        DeviceRemovalAnchorError::IncompleteEvidence(
+            "evacuation plan object count does not fit durable counters".into(),
+        )
+    })?;
+    if plan.object_count != planned_objects {
+        return Err(DeviceRemovalAnchorError::IncompleteEvidence(format!(
+            "evacuation plan reports {} objects but contains {planned_objects}",
+            plan.object_count
+        )));
+    }
+
+    let planned_bytes = plan
+        .objects_to_evacuate
+        .iter()
+        .try_fold(0u64, |total, entry| total.checked_add(entry.size_bytes))
+        .ok_or_else(|| {
+            DeviceRemovalAnchorError::IncompleteEvidence(
+                "evacuation plan byte count overflows durable counters".into(),
+            )
+        })?;
+    if plan.total_evacuation_bytes != planned_bytes {
+        return Err(DeviceRemovalAnchorError::IncompleteEvidence(format!(
+            "evacuation plan reports {} bytes but entries total {planned_bytes}",
+            plan.total_evacuation_bytes
+        )));
+    }
+
+    let expected_empty = plan.objects_to_evacuate.is_empty();
+    if matches!(
+        (plan.evacuation_outcome, expected_empty),
+        (tidefs_pool_scan::EvacuationPlanOutcome::EmptySuccess, false)
+            | (
+                tidefs_pool_scan::EvacuationPlanOutcome::ObjectsEnumerated,
+                true
+            )
+    ) {
+        return Err(DeviceRemovalAnchorError::IncompleteEvidence(
+            "evacuation plan outcome does not match its object set".into(),
+        ));
+    }
+    if plan
+        .objects_to_evacuate
+        .iter()
+        .any(|entry| entry.source_device != plan.target_device)
+    {
+        return Err(DeviceRemovalAnchorError::IncompleteEvidence(
+            "evacuation plan contains an object from another source device".into(),
+        ));
+    }
+
+    if result.removed_device != plan.target_device {
+        return Err(DeviceRemovalAnchorError::IncompleteEvidence(
+            "evacuation result target does not match the plan".into(),
+        ));
+    }
+    if result.surviving_devices != plan.surviving_devices {
+        return Err(DeviceRemovalAnchorError::IncompleteEvidence(
+            "evacuation result survivors do not match the plan".into(),
+        ));
+    }
+    if result.topology_generation != plan.topology_generation {
+        return Err(DeviceRemovalAnchorError::IncompleteEvidence(
+            "evacuation result topology generation does not match the plan".into(),
+        ));
+    }
+    if result.objects_failed != 0 {
+        return Err(DeviceRemovalAnchorError::IncompleteEvidence(format!(
+            "evacuation result reports {} failed objects",
+            result.objects_failed
+        )));
+    }
+    if result.objects_evacuated != planned_objects {
+        return Err(DeviceRemovalAnchorError::IncompleteEvidence(format!(
+            "evacuation result reports {} evacuated objects, expected {planned_objects}",
+            result.objects_evacuated
+        )));
+    }
+    if result.bytes_evacuated != planned_bytes {
+        return Err(DeviceRemovalAnchorError::IncompleteEvidence(format!(
+            "evacuation result reports {} evacuated bytes, expected {planned_bytes}",
+            result.bytes_evacuated
+        )));
+    }
+
+    let config_paths: std::collections::BTreeSet<_> =
+        config.device_tree.all_leaf_paths().into_iter().collect();
+    let plan_paths: std::collections::BTreeSet<_> =
+        plan.surviving_devices.iter().cloned().collect();
+    if config_paths != plan_paths {
+        return Err(DeviceRemovalAnchorError::IncompleteEvidence(
+            "post-removal topology does not match planned surviving devices".into(),
+        ));
+    }
+    let expected_device_count = usize::try_from(plan.device_count_after).map_err(|_| {
+        DeviceRemovalAnchorError::IncompleteEvidence(
+            "post-removal device count does not fit local topology".into(),
+        )
+    })?;
+    if config.device_count != plan.device_count_after || config_paths.len() != expected_device_count
+    {
+        return Err(DeviceRemovalAnchorError::IncompleteEvidence(
+            "post-removal device count does not match the plan".into(),
+        ));
+    }
+    if config.topology_generation != plan.topology_generation {
+        return Err(DeviceRemovalAnchorError::IncompleteEvidence(
+            "post-removal topology generation does not match the plan".into(),
+        ));
+    }
+    if config.device_tree.find_leaf(&plan.target_device).is_some()
+        || config
+            .device_tree
+            .find_leaf_by_guid(&plan.target_device_guid)
+            .is_some()
+    {
+        return Err(DeviceRemovalAnchorError::IncompleteEvidence(
+            "post-removal topology still contains the target device".into(),
+        ));
+    }
 
     Ok(())
 }
@@ -1058,6 +1198,11 @@ pub fn write_updated_labels_to_devices(
 /// Errors that can occur during device removal anchoring.
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum DeviceRemovalAnchorError {
+    /// The supplied local plan, result, or topology cannot support a completed
+    /// anchor. This is not canonical placement/refcount evidence.
+    #[error("device removal anchor refuses incomplete local evidence: {0}")]
+    IncompleteEvidence(String),
+
     /// Failed to encode or decode a durable removal/progress record.
     #[error("failed to encode or decode device removal record: {0}")]
     Serialize(String),
@@ -1174,7 +1319,7 @@ mod tests {
                 std::path::PathBuf::from("/dev/disk2"),
             ],
             topology_generation: 2,
-            committed_root_anchored: true,
+            committed_root_anchored: false,
         };
 
         anchor_device_removal(&mut store, &plan, &result, Some(&config), None, None).unwrap();
@@ -1213,10 +1358,36 @@ mod tests {
         // No label for the removed device (index 1).
         let removed_key = ObjectKey::from_name(format!("{POOL_LABEL_KEY_PREFIX}1"));
         assert!(store.get(removed_key).unwrap().is_none());
+
+        // A caller-controlled executor summary cannot turn a mismatched
+        // evacuation result into a completed record or label update.
+        let rejection_dir = tempfile::tempdir().unwrap();
+        let mut rejection_store =
+            tidefs_local_object_store::LocalObjectStore::open(rejection_dir.path()).unwrap();
+        let mut mismatched_result = result.clone();
+        mismatched_result.objects_evacuated = 1;
+        mismatched_result.committed_root_anchored = true;
+
+        let err = anchor_device_removal(
+            &mut rejection_store,
+            &plan,
+            &mismatched_result,
+            Some(&config),
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("evacuated objects"),
+            "unexpected error: {err}"
+        );
+        assert!(rejection_store.get(record_key).unwrap().is_none());
+        let survivor_label = ObjectKey::from_name(format!("{POOL_LABEL_KEY_PREFIX}0"));
+        assert!(rejection_store.get(survivor_label).unwrap().is_none());
     }
 
     #[test]
-    fn anchor_without_config_skips_labels() {
+    fn anchor_requires_post_removal_config() {
         let dir = tempfile::tempdir().unwrap();
         let mut store = tidefs_local_object_store::LocalObjectStore::open(dir.path()).unwrap();
 
@@ -1237,7 +1408,7 @@ mod tests {
                 tidefs_replication_model::FailureDomain::Device,
             )
             .unwrap(),
-            plan_validated: false,
+            plan_validated: true,
         };
         let result = DeviceRemovalResult {
             objects_evacuated: 0,
@@ -1249,11 +1420,15 @@ mod tests {
             committed_root_anchored: false,
         };
 
-        // Pass None for config — should still succeed without labels.
-        anchor_device_removal(&mut store, &plan, &result, None, None, None).unwrap();
+        let err = anchor_device_removal(&mut store, &plan, &result, None, None, None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("post-removal pool configuration is required"),
+            "unexpected error: {err}"
+        );
 
         let record_key = ObjectKey::from_name(DEVICE_REMOVAL_RECORD_KEY);
-        assert!(store.get(record_key).unwrap().is_some());
+        assert!(store.get(record_key).unwrap().is_none());
     }
 
     #[test]

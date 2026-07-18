@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
-//! End-to-end device removal integration test: 3-device mirror pool,
-//! data evacuation, label update, and BLAKE3 integrity verification.
+//! Local removal-record fixture: 3-directory mirror topology, synthetic data
+//! evacuation, label update, and BLAKE3 integrity verification.
 //!
-//! Exercises the full removal pipeline:
+//! Exercises the local record helper pipeline:
 //!   DeviceRemovalPlanner → DeviceRemovalExecutor → PoolConfig::remove_device
 //!   → anchor_device_removal with PoolLabelV1 persistence.
+//! It does not exercise a mounted live owner, canonical placement/refcount
+//! evidence, raw device labels, or supported online device removal.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -36,7 +38,7 @@ fn make_leaf_device(path: PathBuf, index: u32, guid: u8) -> DeviceType {
 }
 
 #[test]
-fn three_device_mirror_remove_middle_device_with_blake3_verification() {
+fn local_removal_record_fixture_checks_label_and_payload_encoding() {
     let dir = tempfile::tempdir().unwrap();
 
     // Create three separate backing stores.
@@ -210,7 +212,7 @@ fn three_device_mirror_remove_middle_device_with_blake3_verification() {
         removed_device: disk1_path.clone(),
         surviving_devices: vec![disk0_path.clone(), disk2_path.clone()],
         topology_generation: pool_config.topology_generation,
-        committed_root_anchored: true,
+        committed_root_anchored: false,
     };
 
     // Write the anchor into one of the surviving stores.
