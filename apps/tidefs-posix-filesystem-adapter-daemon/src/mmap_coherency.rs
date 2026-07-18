@@ -94,6 +94,27 @@ struct DirtyTransitionGateRegistry {
     operations_since_sweep: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeferredInvalidation {
+    Inode {
+        ino: u64,
+        generation: u64,
+    },
+    /// The feed's range event has no generation field.  Retain it separately
+    /// so retrying it cannot advance or poison the inode-generation fence.
+    UnversionedInode {
+        ino: u64,
+    },
+}
+
+impl DeferredInvalidation {
+    const fn ino(self) -> u64 {
+        match self {
+            Self::Inode { ino, .. } | Self::UnversionedInode { ino } => ino,
+        }
+    }
+}
+
 /// Mmap cluster coherency manager.
 ///
 /// # Dirty/writeback preservation
@@ -113,11 +134,11 @@ pub struct MmapCoherency {
     /// Weak entries are swept periodically so closed/inactive inodes do not
     /// leave permanent synchronization state behind.
     dirty_transition_gates: Mutex<DirtyTransitionGateRegistry>,
-    /// Latest per-inode invalidation generation retained while dirty or
-    /// writeback-pending bytes prevent immediate kernel-cache invalidation,
-    /// while a known registration is inactive, or while the kernel
-    /// notification cannot be confirmed.
-    deferred_invalidations: Mutex<VecDeque<(u64, u64)>>,
+    /// Versioned inode invalidations and unversioned range invalidations
+    /// retained while dirty or writeback-pending bytes prevent immediate
+    /// kernel-cache invalidation, while a known registration is inactive, or
+    /// while the kernel notification cannot be confirmed.
+    deferred_invalidations: Mutex<VecDeque<DeferredInvalidation>>,
     /// Alternates the single available slot when a one-event tick has both a
     /// feed event and a deferred retry waiting.
     retry_deferred_next: AtomicBool,
@@ -252,7 +273,11 @@ impl MmapCoherency {
             .lock()
             .unwrap()
             .iter()
-            .filter(|(ino, _)| registrations.get(ino).is_some_and(|entry| entry.active))
+            .filter(|invalidation| {
+                registrations
+                    .get(&invalidation.ino())
+                    .is_some_and(|entry| entry.active)
+            })
             .count()
     }
 
@@ -302,9 +327,9 @@ impl MmapCoherency {
         feed_pending + self.deferred_invalidation_count()
     }
 
-    /// Number of newer inode invalidations waiting for dirty/writeback state
-    /// to become clean, a known registration to become active, or a kernel
-    /// notification retry.
+    /// Number of inode or range invalidations waiting for dirty/writeback
+    /// state to become clean, a known registration to become active, or a
+    /// kernel notification retry.
     #[must_use]
     pub fn deferred_invalidation_count(&self) -> usize {
         self.deferred_invalidations.lock().unwrap().len()
@@ -321,22 +346,42 @@ struct MmapInvalidationSink<'a> {
     /// Supplies the per-inode gate held from the dirty-state decision through
     /// the kernel notification, closing the decision-to-notify race.
     dirty_transition_gates: &'a Mutex<DirtyTransitionGateRegistry>,
-    /// Latest deferred generation for each inode whose dirty/writeback state
-    /// currently prevents invalidation.
-    deferred_invalidations: &'a Mutex<VecDeque<(u64, u64)>>,
+    /// Deferred versioned inode and unversioned range invalidations whose
+    /// dirty/writeback state currently prevents invalidation.
+    deferred_invalidations: &'a Mutex<VecDeque<DeferredInvalidation>>,
     stats: &'a MmapCoherencyStats,
 }
 
 impl MmapInvalidationSink<'_> {
     fn defer_invalidation(&self, ino: u64, generation: u64) {
         let mut deferred = self.deferred_invalidations.lock().unwrap();
-        if let Some((_, queued_generation)) = deferred
-            .iter_mut()
-            .find(|(queued_ino, _)| *queued_ino == ino)
+        if let Some(queued_generation) =
+            deferred
+                .iter_mut()
+                .find_map(|invalidation| match invalidation {
+                    DeferredInvalidation::Inode {
+                        ino: queued_ino,
+                        generation,
+                    } if *queued_ino == ino => Some(generation),
+                    _ => None,
+                })
         {
             *queued_generation = (*queued_generation).max(generation);
         } else {
-            deferred.push_back((ino, generation));
+            deferred.push_back(DeferredInvalidation::Inode { ino, generation });
+        }
+    }
+
+    fn defer_unversioned_inode_invalidation(&self, ino: u64) {
+        let mut deferred = self.deferred_invalidations.lock().unwrap();
+        if !deferred.iter().any(|invalidation| {
+            matches!(
+                invalidation,
+                DeferredInvalidation::UnversionedInode { ino: queued_ino }
+                    if *queued_ino == ino
+            )
+        }) {
+            deferred.push_back(DeferredInvalidation::UnversionedInode { ino });
         }
     }
 
@@ -345,11 +390,11 @@ impl MmapInvalidationSink<'_> {
         let mut attempted = 0;
         let mut scanned = 0;
         while attempted < event_budget && scanned < scan_budget {
-            let Some((ino, generation)) = self.deferred_invalidations.lock().unwrap().pop_front()
-            else {
+            let Some(invalidation) = self.deferred_invalidations.lock().unwrap().pop_front() else {
                 break;
             };
             scanned += 1;
+            let ino = invalidation.ino();
             let is_active = self
                 .registrations
                 .lock()
@@ -357,10 +402,24 @@ impl MmapInvalidationSink<'_> {
                 .get(&ino)
                 .is_some_and(|entry| entry.active);
             if !is_active {
-                self.defer_invalidation(ino, generation);
+                match invalidation {
+                    DeferredInvalidation::Inode { ino, generation } => {
+                        self.defer_invalidation(ino, generation);
+                    }
+                    DeferredInvalidation::UnversionedInode { ino } => {
+                        self.defer_unversioned_inode_invalidation(ino);
+                    }
+                }
                 continue;
             }
-            self.invalidate_inode_inner(ino, generation, false);
+            match invalidation {
+                DeferredInvalidation::Inode { ino, generation } => {
+                    self.invalidate_inode_inner(ino, generation, false);
+                }
+                DeferredInvalidation::UnversionedInode { ino } => {
+                    self.invalidate_unversioned_inode_inner(ino, false);
+                }
+            }
             attempted += 1;
         }
         attempted
@@ -448,6 +507,69 @@ impl MmapInvalidationSink<'_> {
             self.stats.pages_invalidated.fetch_add(1, Ordering::Relaxed);
         }
     }
+
+    fn invalidate_unversioned_inode_inner(&mut self, ino_u64: u64, newly_received: bool) {
+        if newly_received {
+            self.stats
+                .invalidations_received
+                .fetch_add(1, Ordering::Relaxed);
+        }
+
+        let (is_actionable, retain_until_active) = {
+            let regs = self.registrations.lock().unwrap();
+            match regs.get(&ino_u64) {
+                Some(entry) if entry.active => (true, false),
+                Some(_) => (false, true),
+                None => (false, false),
+            }
+        };
+        if retain_until_active {
+            self.defer_unversioned_inode_invalidation(ino_u64);
+            return;
+        }
+        if !is_actionable {
+            return;
+        }
+
+        let dirty_transition_gate =
+            MmapCoherency::gate_for_inode(self.dirty_transition_gates, ino_u64);
+        let _dirty_transition_guard = dirty_transition_gate.lock().unwrap();
+        let is_dirty = self
+            .dirty_check
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|check| check(ino_u64));
+        if is_dirty {
+            if self.registrations.lock().unwrap().contains_key(&ino_u64) {
+                self.defer_unversioned_inode_invalidation(ino_u64);
+                if newly_received {
+                    self.stats
+                        .dirty_invalidations_preserved
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            return;
+        }
+
+        // Range events carry no generation in the invalidation-feed contract.
+        // Conservatively invalidate the whole inode, but do not invent a
+        // generation or advance the versioned inode fence.
+        if (self.invalidate_inode)(ino_u64).is_err() {
+            self.stats
+                .notification_failures
+                .fetch_add(1, Ordering::Relaxed);
+            if self.registrations.lock().unwrap().contains_key(&ino_u64) {
+                self.defer_unversioned_inode_invalidation(ino_u64);
+            }
+            return;
+        }
+
+        self.stats
+            .coherency_conflicts
+            .fetch_add(1, Ordering::Relaxed);
+        self.stats.pages_invalidated.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 impl InvalidationSink for MmapInvalidationSink<'_> {
@@ -458,7 +580,9 @@ impl InvalidationSink for MmapInvalidationSink<'_> {
     fn invalidate_entry(&mut self, _parent: InodeId, _name: &[u8]) {}
     fn invalidate_directory(&mut self, _ino: InodeId) {}
     fn invalidate_dataset(&mut self, _dataset: DatasetId) {}
-    fn invalidate_range(&mut self, _ino: InodeId, _offset: u64, _length: u64) {}
+    fn invalidate_range(&mut self, ino: InodeId, _offset: u64, _length: u64) {
+        self.invalidate_unversioned_inode_inner(ino.0, true);
+    }
 }
 
 #[cfg(test)]
@@ -473,6 +597,18 @@ mod tests {
             vec![InvalidationEvent::Inode {
                 ino: InodeId::new(ino),
                 generation: gen,
+            }],
+        )
+    }
+
+    fn range_batch(ino: u64, offset: u64, length: u64) -> InvalidationBatch {
+        InvalidationBatch::new(
+            DatasetId::new(1),
+            CommitGroupId::new(1),
+            vec![InvalidationEvent::Range {
+                ino: InodeId::new(ino),
+                offset,
+                length,
             }],
         )
     }
@@ -508,6 +644,71 @@ mod tests {
         assert_eq!(s.invalidations_received, 1);
         assert_eq!(s.coherency_conflicts, 1);
         assert_eq!(s.pages_invalidated, 1);
+    }
+
+    #[test]
+    fn range_invalidation_uses_inode_notification_without_advancing_generation() {
+        let invalidated = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&invalidated);
+        let c = MmapCoherency::new_for_test(move |ino| {
+            observed.lock().unwrap().push(ino);
+            Ok(())
+        });
+        c.register(42, 1);
+
+        c.enqueue_batch(range_batch(42, 4096, 8192));
+        assert_eq!(c.process_tick(10), 1);
+        assert_eq!(*invalidated.lock().unwrap(), vec![42]);
+        assert_eq!(
+            c.registrations
+                .lock()
+                .unwrap()
+                .get(&42)
+                .expect("registered inode")
+                .generation,
+            1,
+            "an unversioned range event must not fabricate an inode generation"
+        );
+
+        c.enqueue_batch(batch(42, 2));
+        assert_eq!(c.process_tick(10), 1);
+        assert_eq!(*invalidated.lock().unwrap(), vec![42, 42]);
+        let stats = c.stats.snapshot();
+        assert_eq!(stats.invalidations_received, 2);
+        assert_eq!(stats.coherency_conflicts, 2);
+        assert_eq!(stats.pages_invalidated, 2);
+    }
+
+    #[test]
+    fn dirty_range_invalidation_is_retried_after_inode_is_clean() {
+        let invalidated = Arc::new(AtomicU64::new(0));
+        let observed = Arc::clone(&invalidated);
+        let c = MmapCoherency::new_for_test(move |_| {
+            observed.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        });
+        let dirty = Arc::new(AtomicBool::new(true));
+        let dirty_check = Arc::clone(&dirty);
+        c.set_dirty_check(Some(Box::new(move |ino| {
+            ino == 42 && dirty_check.load(Ordering::Relaxed)
+        })));
+        c.register(42, 1);
+
+        c.enqueue_batch(range_batch(42, 4096, 8192));
+        assert_eq!(c.process_tick(10), 1);
+        assert_eq!(invalidated.load(Ordering::Relaxed), 0);
+        assert_eq!(c.deferred_invalidation_count(), 1);
+        let stats = c.stats.snapshot();
+        assert_eq!(stats.invalidations_received, 1);
+        assert_eq!(stats.dirty_invalidations_preserved, 1);
+
+        dirty.store(false, Ordering::Relaxed);
+        assert_eq!(c.process_tick(10), 1);
+        assert_eq!(invalidated.load(Ordering::Relaxed), 1);
+        assert_eq!(c.deferred_invalidation_count(), 0);
+        let stats = c.stats.snapshot();
+        assert_eq!(stats.coherency_conflicts, 1);
+        assert_eq!(stats.pages_invalidated, 1);
     }
 
     #[test]
