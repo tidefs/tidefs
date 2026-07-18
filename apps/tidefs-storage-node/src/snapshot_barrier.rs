@@ -757,14 +757,13 @@ pub trait BarrierStore {
 
 /// Per-server state for snapshot barrier rounds.
 ///
-/// Tracks a monotonic generation counter and the last barrier id
-/// processed. The generation counter serves as the `committed_root_generation`
-/// in barrier responses until the store backend exposes real txg/generation
-/// values.
+/// Tracks a monotonic processed-round counter and the last barrier id. The
+/// store backend remains authoritative for committed-root txg and generation
+/// values reported to the coordinator.
 ///
 /// Thread-safe: uses atomic operations for the counter.
 pub struct BarrierState {
-    /// Monotonic counter incremented on each barrier round.
+    /// Monotonic counter incremented on each successfully processed round.
     generation: AtomicU64,
     /// Last barrier id processed (for idempotency).
     last_barrier_id: AtomicU64,
@@ -817,8 +816,8 @@ impl Default for BarrierState {
 /// Syncs the store, captures stats, and returns a
 /// `Frame::SnapshotBarrierResponse` with real committed-root values.
 ///
-/// The `barrier_state` provides the generation counter; `store` provides
-/// the object count and committed-root txg.
+/// The `barrier_state` tracks successfully processed rounds; `store` provides
+/// the object count and committed-root identity.
 pub fn process_barrier_request(
     barrier_id: u64,
     store: &mut dyn BarrierStore,
@@ -826,15 +825,17 @@ pub fn process_barrier_request(
 ) -> Result<Frame, String> {
     // Sync before capturing stats so the response reflects durable state.
     store.sync_all()?;
-    let generation = barrier_state.next_generation();
+    let committed_root_txg = store.committed_root_txg();
+    let committed_root_generation = store.committed_root_generation();
+    let object_count = store.object_count();
+    barrier_state.next_generation();
     barrier_state.set_last_barrier_id(barrier_id);
-    let txg = store.committed_root_txg();
 
     Ok(Frame::SnapshotBarrierResponse {
         barrier_id,
-        committed_root_txg: txg,
-        committed_root_generation: generation,
-        object_count: store.object_count(),
+        committed_root_txg,
+        committed_root_generation,
+        object_count,
     })
 }
 
@@ -1525,7 +1526,7 @@ mod tests {
             } => {
                 assert_eq!(barrier_id, 7);
                 assert_eq!(committed_root_txg, 42);
-                assert_eq!(committed_root_generation, 1);
+                assert_eq!(committed_root_generation, 5);
                 assert_eq!(object_count, 100);
             }
             other => panic!("expected SnapshotBarrierResponse, got {other:?}"),
@@ -1545,15 +1546,18 @@ mod tests {
     }
 
     #[test]
-    fn process_barrier_request_uses_store_txg() {
-        let mut store = MockStore::new(50, 999, 0);
+    fn process_barrier_request_uses_store_root_identity() {
+        let mut store = MockStore::new(50, 999, 17);
         let state = BarrierState::new();
         let response = process_barrier_request(1, &mut store, &state).expect("barrier response");
         match response {
             Frame::SnapshotBarrierResponse {
-                committed_root_txg, ..
+                committed_root_txg,
+                committed_root_generation,
+                ..
             } => {
                 assert_eq!(committed_root_txg, 999);
+                assert_eq!(committed_root_generation, 17);
             }
             other => panic!("unexpected: {other:?}"),
         }
@@ -1573,7 +1577,7 @@ mod tests {
             } => {
                 assert_eq!(barrier_id, 0);
                 assert_eq!(committed_root_txg, 0);
-                assert_eq!(committed_root_generation, 1);
+                assert_eq!(committed_root_generation, 0);
                 assert_eq!(object_count, 10);
             }
             other => panic!("unexpected: {other:?}"),
