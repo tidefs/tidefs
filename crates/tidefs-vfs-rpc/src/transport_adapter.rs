@@ -18,8 +18,8 @@ use tidefs_bulk_service::{
 use tidefs_transport::{
     ConnectionBounds, ControlServiceFrame, EndpointFamily, LaneClass, MessageFamily, SessionHealth,
     SessionId, TransportCohortId, TransportEnvelope, TransportError, TransportSessionSet,
-    VisibilityClass, CONTROL_SERVICE_ENDPOINT_FAMILY, CONTROL_SERVICE_LANE,
-    CONTROL_SERVICE_MESSAGE_FAMILY,
+    VisibilityClass, CONTROL_SERVICE_ENDPOINT_FAMILY, CONTROL_SERVICE_FRAME_HEADER_LEN,
+    CONTROL_SERVICE_LANE, CONTROL_SERVICE_MESSAGE_FAMILY,
 };
 use tidefs_types_vfs_core::Errno;
 
@@ -462,6 +462,13 @@ impl VfsRpcTransportAdapter {
         service_frame: ControlServiceFrame,
         bulk_service: &BulkService,
     ) -> Result<VfsRpcInboundFrame, VfsRpcTransportAdapterError> {
+        let payload_len = CONTROL_SERVICE_FRAME_HEADER_LEN
+            .checked_add(service_frame.body.len())
+            .ok_or(VfsRpcTransportAdapterError::FrameTooLarge {
+                actual: usize::MAX,
+                max: self.config.max_frame_bytes,
+            })?;
+        self.check_frame_size(payload_len, 0)?;
         let peer = self.peer_for_session(session_id)?;
         let rpc_frame = VfsRpcTransportFrame {
             service_id: service_frame.service_id,
@@ -612,13 +619,7 @@ impl VfsRpcTransportAdapter {
         context: VfsRpcEnvelopeContext,
         payload_len: usize,
     ) -> Result<TransportEnvelope, VfsRpcTransportAdapterError> {
-        let wire_size = TransportEnvelope::wire_size(payload_len, 0);
-        if wire_size > self.config.max_frame_bytes {
-            return Err(VfsRpcTransportAdapterError::FrameTooLarge {
-                actual: wire_size,
-                max: self.config.max_frame_bytes,
-            });
-        }
+        self.check_frame_size(payload_len, 0)?;
         Ok(TransportEnvelope::new(
             session_id,
             context.cohort_id,
@@ -646,7 +647,15 @@ impl VfsRpcTransportAdapter {
                 found: envelope.lane_class,
             });
         }
-        let wire_size = TransportEnvelope::wire_size(payload_len, envelope.anchor_refs.len());
+        self.check_frame_size(payload_len, envelope.anchor_refs.len())
+    }
+
+    fn check_frame_size(
+        &self,
+        payload_len: usize,
+        anchor_count: usize,
+    ) -> Result<(), VfsRpcTransportAdapterError> {
+        let wire_size = TransportEnvelope::wire_size(payload_len, anchor_count);
         if wire_size > self.config.max_frame_bytes {
             return Err(VfsRpcTransportAdapterError::FrameTooLarge {
                 actual: wire_size,
@@ -2133,6 +2142,65 @@ mod tests {
 
         assert_eq!(err.errno(), Errno::EMSGSIZE);
         assert_eq!(adapter.pending_len(), 0);
+    }
+
+    #[test]
+    fn demultiplexed_control_frame_enforces_adapter_size_limit() {
+        let peer = PeerId(9);
+        let session_id = SessionId::new(33);
+        let request = sample_request();
+        let rpc_frame = VfsRpcTransportFrame::from_request(&request).expect("request frame");
+        let control_frame =
+            ControlServiceFrame::new(rpc_frame.service_id, rpc_frame.message_type, rpc_frame.body);
+        let wire_size = TransportEnvelope::wire_size(
+            CONTROL_SERVICE_FRAME_HEADER_LEN + control_frame.body.len(),
+            0,
+        );
+        let bulk = bulk_service();
+
+        let mut undersized = VfsRpcTransportAdapter::new(
+            VfsRpcTransportAdapterConfig {
+                max_frame_bytes: wire_size - 1,
+                ..VfsRpcTransportAdapterConfig::default()
+            },
+            healthy_sessions(peer, session_id),
+        );
+        assert_eq!(
+            undersized
+                .unwrap_control_service_frame_with_bulk(
+                    Instant::now(),
+                    session_id,
+                    control_frame.clone(),
+                    &bulk,
+                )
+                .expect_err("oversized demultiplexed frame rejected"),
+            VfsRpcTransportAdapterError::FrameTooLarge {
+                actual: wire_size,
+                max: wire_size - 1,
+            }
+        );
+
+        let mut exact = VfsRpcTransportAdapter::new(
+            VfsRpcTransportAdapterConfig {
+                max_frame_bytes: wire_size,
+                ..VfsRpcTransportAdapterConfig::default()
+            },
+            healthy_sessions(peer, session_id),
+        );
+        match exact
+            .unwrap_control_service_frame_with_bulk(
+                Instant::now(),
+                session_id,
+                control_frame,
+                &bulk,
+            )
+            .expect("exact-boundary demultiplexed frame accepted")
+        {
+            VfsRpcInboundFrame::Request {
+                request: actual, ..
+            } => assert_eq!(actual, request),
+            other => panic!("unexpected inbound frame: {other:?}"),
+        }
     }
 
     #[test]
