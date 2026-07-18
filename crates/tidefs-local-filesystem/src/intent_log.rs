@@ -1567,6 +1567,25 @@ fn validate_namespace_create_intent(intent: &NamespaceCreateIntentRecord) -> Res
     }
 }
 
+fn namespace_create_inode_identity_matches(existing: &InodeRecord, recorded: &InodeRecord) -> bool {
+    existing.inode_id == recorded.inode_id
+        && existing.generation == recorded.generation
+        && existing.facets == recorded.facets
+        && existing.kind() == recorded.kind()
+        && existing.rdev == recorded.rdev
+}
+
+fn namespace_create_entry_identity_matches(
+    existing: &NamespaceEntry,
+    recorded: &NamespaceEntry,
+) -> bool {
+    existing.name == recorded.name
+        && existing.inode_id == recorded.inode_id
+        && existing.generation == recorded.generation
+        && existing.facets == recorded.facets
+        && existing.kind() == recorded.kind()
+}
+
 fn replay_namespace_create_intent(
     intent: &NamespaceCreateIntentRecord,
     state: &mut crate::FileSystemState,
@@ -1588,32 +1607,47 @@ fn replay_namespace_create_intent(
             .ok_or(FileSystemError::CorruptState {
                 reason: "intent log replay: namespace create parent directory not found",
             })?;
-    if let Some(existing) = state.inodes.get(&intent.inode.inode_id) {
-        if existing != &intent.inode {
-            return Err(FileSystemError::CorruptState {
-                reason: "intent log replay: namespace create inode conflicts with state",
-            });
+    let inode_already_present = match state.inodes.get(&intent.inode.inode_id) {
+        Some(existing) => {
+            if !namespace_create_inode_identity_matches(existing, &intent.inode) {
+                return Err(FileSystemError::CorruptState {
+                    reason: "intent log replay: namespace create inode conflicts with state",
+                });
+            }
+            true
         }
-    }
-    match parent_dir.get(&intent.entry.name) {
-        Some(existing) if existing == &intent.entry => {}
+        None => false,
+    };
+    let entry_already_present = match parent_dir.get(&intent.entry.name) {
+        Some(existing) if existing == &intent.entry => true,
+        Some(existing)
+            if inode_already_present
+                && namespace_create_entry_identity_matches(existing, &intent.entry) =>
+        {
+            true
+        }
         Some(_) => {
             return Err(FileSystemError::CorruptState {
                 reason: "intent log replay: namespace create directory entry conflict",
             });
         }
-        None => {}
-    }
+        None => false,
+    };
 
-    if !state.inodes.contains_key(&intent.inode.inode_id) {
+    if !inode_already_present {
         Arc::make_mut(&mut state.inodes).insert(intent.inode.inode_id, intent.inode.clone());
     }
 
-    let parent_dir = Arc::make_mut(&mut state.directories)
-        .get_mut(&intent.parent_inode_id)
-        .expect("namespace create parent directory was validated before replay mutation");
-    if !parent_dir.contains_key(&intent.entry.name) {
-        parent_dir.insert(intent.entry.name.clone(), intent.entry.clone());
+    // The creation snapshot may be folded into live state after later writes,
+    // setattr, rename, or unlink have advanced the inode or its binding. Once
+    // the same inode identity is present, preserve that newer state instead of
+    // overwriting it or resurrecting the creation-time name. Recovery of a
+    // missing create still takes the inode-absent branch above.
+    if !inode_already_present && !entry_already_present {
+        Arc::make_mut(&mut state.directories)
+            .get_mut(&intent.parent_inode_id)
+            .expect("namespace create parent directory was validated before replay mutation")
+            .insert(intent.entry.name.clone(), intent.entry.clone());
     }
 
     state.observe_explicit_inode_id(intent.inode.inode_id);
@@ -3759,18 +3793,13 @@ mod tests {
     }
 
     #[test]
-    fn replay_namespace_create_intent_is_idempotent() {
+    fn replay_namespace_create_intent_is_idempotent_after_live_evolution() {
         let (mut store, _dir) = test_store();
         let mut state = minimal_state();
-        let inode = special_inode(
-            InodeId::new(250),
-            NodeKind::CharDev,
-            S_IFCHR | 0o600,
-            0x0105,
-        );
+        let inode = special_inode(InodeId::new(250), NodeKind::File, S_IFREG | 0o644, 0);
         let intent = NamespaceCreateIntentRecord {
             parent_inode_id: ROOT_INODE_ID,
-            entry: namespace_entry("tty", &inode),
+            entry: namespace_entry("file", &inode),
             inode,
         };
         let entry = IntentLogEntry {
@@ -3781,11 +3810,49 @@ mod tests {
         };
 
         replay_entry(&entry, &mut state, &mut store).expect("first replay");
-        replay_entry(&entry, &mut state, &mut store).expect("second replay");
 
+        let inode_id = InodeId::new(250);
+        let mut evolved = state.inodes.get(&inode_id).expect("inode").clone();
+        evolved.mode = S_IFREG | 0o600;
+        evolved.uid = 1000;
+        evolved.size = 4096;
+        evolved.data_version = 7;
+        evolved.metadata_version = 8;
+        evolved.subtree_rev = 2;
+        Arc::make_mut(&mut state.inodes).insert(inode_id, evolved.clone());
+
+        replay_entry(&entry, &mut state, &mut store).expect("replay after write and setattr");
+        assert_eq!(state.inodes.get(&inode_id), Some(&evolved));
+
+        let root_dir = Arc::make_mut(&mut state.directories)
+            .get_mut(&ROOT_INODE_ID)
+            .expect("root dir");
+        let mut renamed = root_dir.remove(b"file".as_slice()).expect("created entry");
+        renamed.name = b"renamed".to_vec();
+        root_dir.insert(renamed.name.clone(), renamed);
+
+        replay_entry(&entry, &mut state, &mut store).expect("replay after rename");
         let root_dir = state.directories.get(&ROOT_INODE_ID).expect("root dir");
-        assert_eq!(root_dir.get(b"tty".as_slice()).unwrap().inode_id.get(), 250);
-        assert_eq!(state.inodes.get(&InodeId::new(250)).unwrap().rdev, 0x0105);
+        assert!(!root_dir.contains_key(b"file".as_slice()));
+        assert_eq!(
+            root_dir
+                .get(b"renamed".as_slice())
+                .expect("renamed entry")
+                .inode_id,
+            inode_id
+        );
+        assert_eq!(state.inodes.get(&inode_id), Some(&evolved));
+
+        Arc::make_mut(&mut state.inodes)
+            .get_mut(&inode_id)
+            .expect("inode")
+            .generation = Generation::new(999);
+        assert!(matches!(
+            replay_entry(&entry, &mut state, &mut store),
+            Err(FileSystemError::CorruptState {
+                reason: "intent log replay: namespace create inode conflicts with state"
+            })
+        ));
     }
 
     #[test]
