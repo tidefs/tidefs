@@ -9078,6 +9078,11 @@ impl FuseVfsAdapter {
         lock_owner: Option<u64>,
         flush: bool,
     ) -> Result<(), Errno> {
+        // A release can flush dirty bytes, retire the shared range tracker,
+        // and discard the inode reclaim projection. Order that complete
+        // cleanup with writes so a concurrent write cannot install a new
+        // dirty owner between the final predicate and cache invalidation.
+        let _write_cache_reconciliation_guard = self.write_cache_reconciliation.lock(ino);
         // If the kernel requested flush-on-close and the inode has
         // dirty pages tracked by the adapter writeback layer,
         // trigger writeback before releasing the handle.
@@ -43899,6 +43904,45 @@ mod tests {
         adapter
             .dispatch_flush(&ctx, 1, open.adapter_fh, 0)
             .expect("flush through ordered reconciliation gate");
+
+        assert_eq!(observed_flushes.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn release_dispatch_holds_cache_reconciliation_gate_for_inode() {
+        let gates = Arc::new(WriteCacheReconciliationGates::default());
+        let observed_flushes = Arc::new(AtomicU64::new(0));
+        let observed_flushes_from_engine = Arc::clone(&observed_flushes);
+        let gates_from_engine = Arc::clone(&gates);
+        let engine = AclMockEngine::new()
+            .with_root(1)
+            .with_attr(0, 0, 0o666)
+            .with_no_acl()
+            .with_open_ok()
+            .with_flush_ok()
+            .with_flush_observer(Arc::new(move || {
+                assert!(matches!(
+                    gates_from_engine.try_lock(1),
+                    Err(std::sync::TryLockError::WouldBlock)
+                ));
+                assert!(gates_from_engine.try_lock(2).is_ok());
+                observed_flushes_from_engine.fetch_add(1, Ordering::Relaxed);
+            }));
+        let mut adapter = FuseVfsAdapter::new(Box::new(engine))
+            .expect("create adapter")
+            .with_writeback_cache_enabled();
+        adapter.write_cache_reconciliation = Arc::clone(&gates);
+        adapter
+            .dirty_state
+            .lock()
+            .unwrap()
+            .entry(1)
+            .or_default()
+            .mark_dirty(0, 4);
+
+        adapter
+            .dispatch_release(1, 999_999, libc::O_RDWR as u32, None, false)
+            .expect("release through ordered reconciliation gate");
 
         assert_eq!(observed_flushes.load(Ordering::Relaxed), 1);
     }
