@@ -63,8 +63,8 @@ use crate::{CopyFileRangeIntent, LocalFileSystem};
 
 use tidefs_inode_table::{Ino, InodeTable};
 use tidefs_transport::{
-    fragment_overhead, NodeInfo, SessionCloseReason, Transport, TransportAddr, DEFAULT_MTU,
-    MAX_FRAGMENTS_PER_MESSAGE,
+    fragment_overhead, send_buffer::DEFAULT_SEND_BUFFER_MEMORY, NodeInfo, SessionCloseReason,
+    Transport, TransportAddr, DEFAULT_MTU, MAX_FRAGMENTS_PER_MESSAGE,
 };
 
 #[cfg(test)]
@@ -4016,21 +4016,27 @@ fn snap_net_payload_len(payload_len: usize) -> Result<u32, String> {
     let max_payload_len = snap_net_transport_payload_max_len()?;
     if payload_len > max_payload_len {
         return Err(format!(
-            "snapshot send: export payload is too large for tidefs-transport fragmentation: {payload_len} bytes (max {max_payload_len})"
+            "snapshot send: export payload is too large for tidefs-transport message admission: {payload_len} bytes (max {max_payload_len})"
         ));
     }
     Ok(encoded_len)
 }
 
 fn snap_net_transport_payload_max_len() -> Result<usize, String> {
-    // Transport::new uses DEFAULT_MTU, and its fragmenter asserts above the
-    // fragment-count ceiling. Reserve the VSNP header before send_message.
-    DEFAULT_MTU
+    // Transport::new uses DEFAULT_MTU, while each fresh Session admits one
+    // message through DEFAULT_SEND_BUFFER_MEMORY before fragmentation. Bound
+    // the complete VSNP frame by the smaller limit, then reserve its header.
+    let fragment_message_max_len = DEFAULT_MTU
         .checked_sub(fragment_overhead())
         .and_then(|fragment_payload_len| {
             fragment_payload_len.checked_mul(MAX_FRAGMENTS_PER_MESSAGE as usize)
         })
-        .and_then(|message_len| message_len.checked_sub(SNAP_NET_PUSH_HEADER_LEN))
+        .ok_or_else(|| "snapshot send: VSNP transport payload limit overflow".to_string())?;
+    let send_buffer_message_max_len = usize::try_from(DEFAULT_SEND_BUFFER_MEMORY)
+        .map_err(|_| "snapshot send: VSNP send-buffer limit overflow".to_string())?;
+    fragment_message_max_len
+        .min(send_buffer_message_max_len)
+        .checked_sub(SNAP_NET_PUSH_HEADER_LEN)
         .ok_or_else(|| "snapshot send: VSNP transport payload limit overflow".to_string())
 }
 
@@ -6962,9 +6968,13 @@ mod tests {
     }
 
     #[test]
-    fn snap_net_payload_len_rejects_transport_fragment_overflow() {
+    fn snap_net_payload_len_rejects_transport_message_admission_overflow() {
         let max_payload_len =
             snap_net_transport_payload_max_len().expect("transport payload limit");
+        assert_eq!(
+            max_payload_len + SNAP_NET_PUSH_HEADER_LEN,
+            usize::try_from(DEFAULT_SEND_BUFFER_MEMORY).expect("default send-buffer limit")
+        );
         let encoded_max = u32::try_from(max_payload_len).expect("transport limit fits u32");
 
         assert_eq!(snap_net_payload_len(max_payload_len), Ok(encoded_max));
@@ -6973,7 +6983,7 @@ mod tests {
         assert_eq!(
             snap_net_payload_len(oversized),
             Err(format!(
-                "snapshot send: export payload is too large for tidefs-transport fragmentation: {oversized} bytes (max {max_payload_len})"
+                "snapshot send: export payload is too large for tidefs-transport message admission: {oversized} bytes (max {max_payload_len})"
             ))
         );
     }
