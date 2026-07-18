@@ -900,6 +900,11 @@ fn finalize_snapshot_barrier_bound_vfssend2_send_payload(
 
 const VFSSEND2_FULL_SEND_BARRIER_CLASS: &str = "full";
 const VFSSEND2_INCREMENTAL_SEND_BARRIER_CLASS: &str = "incremental";
+// SNP request and response frames currently share a tag and are decoded by
+// payload length. A 23-byte request name would collide with the 32-byte
+// response payload, so keep storage-node generated names longer than that
+// ambiguous shape.
+const VFSSEND2_SNAPSHOT_BARRIER_LABEL_PREFIX: &str = "vfssend2-snapshot";
 const SNAPSHOT_BARRIER_SYNC_ERROR_PREFIX: &str = "snapshot barrier ";
 const SNAPSHOT_BARRIER_SYNC_ERROR_SEPARATOR: &str = " sync failed: ";
 
@@ -909,7 +914,7 @@ fn snapshot_barrier_send_label(barrier_id: u64, key: &[u8]) -> String {
     } else {
         VFSSEND2_INCREMENTAL_SEND_BARRIER_CLASS
     };
-    format!("vfssend2-{class}-send-{barrier_id}")
+    format!("{VFSSEND2_SNAPSHOT_BARRIER_LABEL_PREFIX}-{class}-send-{barrier_id}")
 }
 
 fn snapshot_barrier_sync_error(barrier_id: u64, reason: &str) -> String {
@@ -7501,15 +7506,29 @@ mod cluster_pool_handler_tests {
     }
 
     #[test]
-    fn snapshot_barrier_send_label_distinguishes_send_classes() {
+    fn snapshot_barrier_send_labels_roundtrip_as_requests() {
         assert_eq!(
             snapshot_barrier_send_label(41, &[]),
-            "vfssend2-full-send-41"
+            "vfssend2-snapshot-full-send-41"
         );
         assert_eq!(
             snapshot_barrier_send_label(42, b"previous-root"),
-            "vfssend2-incremental-send-42"
+            "vfssend2-snapshot-incremental-send-42"
         );
+
+        for barrier_id in [999, 1000, 9999, 10_000, u64::MAX] {
+            for key in [&[][..], &b"previous-root"[..]] {
+                let request = Frame::SnapshotBarrier {
+                    barrier_id,
+                    snapshot_name: snapshot_barrier_send_label(barrier_id, key),
+                };
+                assert_eq!(
+                    protocol::decode(&protocol::encode(&request)),
+                    Some(request),
+                    "generated barrier {barrier_id} must remain a request"
+                );
+            }
+        }
     }
 
     #[test]
