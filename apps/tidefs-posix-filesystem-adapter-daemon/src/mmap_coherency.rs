@@ -101,8 +101,9 @@ pub struct MmapCoherency {
     registrations: Mutex<BTreeMap<u64, MmapRegistration>>,
     processor: Mutex<FollowerInvalidationProcessor>,
     /// Latest per-inode invalidation generation retained while dirty or
-    /// writeback-pending bytes prevent immediate kernel-cache invalidation, or
-    /// while the kernel notification cannot be confirmed.
+    /// writeback-pending bytes prevent immediate kernel-cache invalidation,
+    /// while a known registration is inactive, or while the kernel
+    /// notification cannot be confirmed.
     deferred_invalidations: Mutex<VecDeque<(u64, u64)>>,
     /// Alternates the single available slot when a one-event tick has both a
     /// feed event and a deferred retry waiting.
@@ -251,7 +252,8 @@ impl MmapCoherency {
     }
 
     /// Number of newer inode invalidations waiting for dirty/writeback state
-    /// to become clean or for a kernel notification retry.
+    /// to become clean, a known registration to become active, or a kernel
+    /// notification retry.
     #[must_use]
     pub fn deferred_invalidation_count(&self) -> usize {
         self.deferred_invalidations.lock().unwrap().len()
@@ -309,11 +311,7 @@ impl MmapInvalidationSink<'_> {
             let regs = self.registrations.lock().unwrap();
             match regs.get(&ino_u64) {
                 Some(entry) if generation > entry.generation && entry.active => (true, false),
-                Some(entry)
-                    if generation > entry.generation && !entry.active && !newly_received =>
-                {
-                    (false, true)
-                }
+                Some(entry) if generation > entry.generation && !entry.active => (false, true),
                 _ => (false, false),
             }
         };
@@ -665,26 +663,48 @@ mod tests {
     }
 
     #[test]
-    fn dirty_check_ignores_deregistered_inode_invalidation() {
-        let c = new_coherency();
-        let calls = Arc::new(AtomicU64::new(0));
-        let check_calls = Arc::clone(&calls);
+    fn newer_invalidation_received_while_inactive_survives_reopen() {
+        let notify_calls = Arc::new(AtomicU64::new(0));
+        let notify_count = Arc::clone(&notify_calls);
+        let dirty_check_calls = Arc::new(AtomicU64::new(0));
+        let dirty_check_count = Arc::clone(&dirty_check_calls);
+        let c = MmapCoherency::new_for_test(move |_| {
+            notify_count.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        });
         c.register(42, 1);
         c.deregister(42);
         c.set_dirty_check(Some(Box::new(move |ino| {
-            check_calls.fetch_add(1, Ordering::Relaxed);
-            ino == 42
+            dirty_check_count.fetch_add(1, Ordering::Relaxed);
+            assert_eq!(ino, 42);
+            false
         })));
 
         c.enqueue_batch(batch(42, 2));
         assert_eq!(c.process_tick(10), 1);
+        assert_eq!(c.deferred_invalidation_count(), 1);
+        assert_eq!(notify_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(dirty_check_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(c.registrations.lock().unwrap()[&42].generation, 1);
 
         let s = c.stats.snapshot();
         assert_eq!(s.invalidations_received, 1);
         assert_eq!(s.dirty_invalidations_preserved, 0);
         assert_eq!(s.coherency_conflicts, 0);
         assert_eq!(s.pages_invalidated, 0);
-        assert_eq!(calls.load(Ordering::Relaxed), 0);
+
+        c.register(42, 0);
+        assert_eq!(c.process_tick(10), 1);
+        assert_eq!(c.deferred_invalidation_count(), 0);
+        assert_eq!(notify_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(dirty_check_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(c.registrations.lock().unwrap()[&42].generation, 2);
+
+        let s = c.stats.snapshot();
+        assert_eq!(s.invalidations_received, 1);
+        assert_eq!(s.dirty_invalidations_preserved, 0);
+        assert_eq!(s.coherency_conflicts, 1);
+        assert_eq!(s.pages_invalidated, 1);
     }
 
     #[test]
@@ -701,17 +721,6 @@ mod tests {
     fn unregistered_inode_ignored() {
         let c = new_coherency();
         c.enqueue_batch(batch(99, 1));
-        c.process_tick(10);
-        let s = c.stats.snapshot();
-        assert_eq!(s.coherency_conflicts, 0);
-    }
-
-    #[test]
-    fn deregistered_inode_ignored() {
-        let c = new_coherency();
-        c.register(42, 1);
-        c.deregister(42);
-        c.enqueue_batch(batch(42, 2));
         c.process_tick(10);
         let s = c.stats.snapshot();
         assert_eq!(s.coherency_conflicts, 0);
