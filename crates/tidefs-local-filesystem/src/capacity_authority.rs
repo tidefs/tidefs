@@ -429,7 +429,11 @@ impl CapacityAuthority {
         if requested_bytes == 0 {
             return Ok(());
         }
-        let held_bytes = self.transient_held_bytes();
+        // This caller-neutral admission path uses the same unprivileged
+        // availability boundary reported by available_bytes() and statfs.
+        let held_bytes = self
+            .transient_held_bytes()
+            .saturating_add(self.root_reserve_bytes());
         let needed_bytes = requested_bytes.saturating_add(held_bytes);
         let accounting = self
             .committed_accounting
@@ -884,6 +888,14 @@ mod tests {
         let _h = a.reserve(15 * 1024 * 1024).expect("reserve 15");
         assert!(a.check_enospc(5 * 1024 * 1024).is_ok());
         assert_eq!(a.check_enospc(6 * 1024 * 1024).unwrap_err(), Errno(ENOSPC));
+    }
+
+    #[test]
+    fn check_enospc_respects_root_reserve() {
+        let a = authority_with_reserve(1, 0, 1);
+        let available = (1024 * 1024) - 4096;
+        assert!(a.check_enospc(available).is_ok());
+        assert_eq!(a.check_enospc(available + 1), Err(Errno(ENOSPC)));
     }
 
     #[test]
