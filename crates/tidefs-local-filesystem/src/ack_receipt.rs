@@ -13,11 +13,12 @@ use tidefs_local_object_store::pool::PlacementReceipt;
 use tidefs_storage_intent_core::{
     evaluate_receipt_against_policy, DurabilityReceiptState, DurabilityRequirement,
     DurabilityState, FailureDomainMask, ProximityClass, ReadServingSourceClass,
-    StorageIntentActionClass, StorageIntentEvidenceId, StorageIntentEvidenceKind,
-    StorageIntentEvidenceRef, StorageIntentEvidenceRefs, StorageIntentGuaranteeClass,
-    StorageIntentPolicy, StorageIntentPolicyId, StorageIntentPolicyRevision, StorageIntentReceipt,
-    StorageIntentReceiptId, StorageIntentRefusal, StorageIntentRefusalReason, StorageMediaClass,
-    StorageMediaRole, TrustEvidenceState,
+    ReceiptPredicateResult, StorageIntentActionClass, StorageIntentEvidenceId,
+    StorageIntentEvidenceKind, StorageIntentEvidenceRef, StorageIntentEvidenceRefs,
+    StorageIntentGuaranteeClass, StorageIntentPolicy, StorageIntentPolicyId,
+    StorageIntentPolicyRevision, StorageIntentReceipt, StorageIntentReceiptId,
+    StorageIntentRefusal, StorageIntentRefusalReason, StorageMediaClass, StorageMediaRole,
+    TrustEvidenceState,
 };
 
 /// Local filesystem receipt surface version for issue #842.
@@ -419,7 +420,7 @@ impl LocalAckReceipt {
                 lag_known: false,
             },
             trust: TrustEvidenceState::EMPTY,
-            media_role: StorageMediaRole::RamVolatileAuthority,
+            media_role: StorageMediaRole::RamCache,
             media_class: StorageMediaClass::SystemRam,
             read_source: ReadServingSourceClass::Cache,
             action_class: StorageIntentActionClass::NewWriteShaping,
@@ -791,6 +792,22 @@ impl LocalAckReceipt {
     pub const fn refusal_reason(self) -> StorageIntentRefusalReason {
         self.refusal.reason
     }
+
+    /// Reject RAM-authority labels that lack the dedicated authority record gate.
+    const fn legacy_ram_authority_emission_refusal(self) -> StorageIntentRefusalReason {
+        if !matches!(
+            self.receipt.media_role,
+            StorageMediaRole::RamVolatileAuthority | StorageMediaRole::RamIntentBackedAuthority
+        ) {
+            return StorageIntentRefusalReason::None;
+        }
+
+        if matches!(self.receipt.read_source, ReadServingSourceClass::Cache) {
+            StorageIntentRefusalReason::CacheCannotBeAuthority
+        } else {
+            StorageIntentRefusalReason::EvidenceNotUsable
+        }
+    }
 }
 
 const fn local_ack_class_has_evidence_surface(ack_class: StorageIntentGuaranteeClass) -> bool {
@@ -902,7 +919,16 @@ impl LocalAckReceiptLedger {
     }
 
     /// Append a receipt, keeping only the bounded latest window.
-    pub fn record(&mut self, receipt: LocalAckReceipt) {
+    ///
+    /// The legacy local-ack envelope does not carry a `RamAuthorityRecord`, so
+    /// it must not emit either RAM-authority role. A future RAM owner must use
+    /// the dedicated core emission gate before reaching this ledger.
+    pub fn record(&mut self, receipt: LocalAckReceipt) -> ReceiptPredicateResult {
+        let refusal = receipt.legacy_ram_authority_emission_refusal();
+        if refusal != StorageIntentRefusalReason::None {
+            return ReceiptPredicateResult::refused(refusal);
+        }
+
         self.receipts.push(receipt);
         if self.receipts.len() > LOCAL_ACK_RECEIPT_LEDGER_LIMIT {
             self.receipts.remove(0);
@@ -910,6 +936,7 @@ impl LocalAckReceiptLedger {
         if let Some(sink) = &self.diagnostic_sink {
             let _ = sink.try_send(receipt);
         }
+        ReceiptPredicateResult::SATISFIED
     }
 
     /// Latest recorded receipt.
@@ -1359,6 +1386,9 @@ mod tests {
             receipt.receipt.ack_class,
             StorageIntentGuaranteeClass::VolatileLocal
         );
+        assert_eq!(receipt.receipt.media_role, StorageMediaRole::RamCache);
+        assert!(receipt.receipt.media_role.is_cache_only());
+        assert_eq!(receipt.receipt.read_source, ReadServingSourceClass::Cache);
         let result = evaluate_receipt_against_policy(
             local_ack_policy(StorageIntentGuaranteeClass::LocalIntent),
             receipt.receipt,
@@ -2432,18 +2462,50 @@ mod tests {
             LocalAckReceiptTarget::inode(1),
             None,
         );
-        ledger.record(first);
+        assert!(ledger.record(first).satisfied);
         let second = LocalAckReceipt::full_local_placement(
             ledger.next_sequence(),
             LocalAckOperation::Fsync,
             LocalAckReceiptTarget::inode(1),
             None,
         );
-        ledger.record(second);
+        assert!(ledger.record(second).satisfied);
 
         assert_eq!(ledger.len(), 2);
         assert_eq!(ledger.latest(), Some(second));
         assert_eq!(ledger.snapshot(), vec![first, second]);
+    }
+
+    #[test]
+    fn ledger_rejects_unbacked_ram_authority_labels() {
+        let mut ledger = LocalAckReceiptLedger::new();
+        let cache_receipt = LocalAckReceipt::unsafe_volatile(
+            ledger.next_sequence(),
+            LocalAckOperation::Odsync,
+            LocalAckReceiptTarget::range(5, 0, 4096),
+            None,
+            StorageIntentRefusalReason::UnsafeVolatileWriteCache,
+        );
+        assert!(ledger.record(cache_receipt).satisfied);
+
+        let mut volatile_authority = cache_receipt;
+        volatile_authority.receipt.media_role = StorageMediaRole::RamVolatileAuthority;
+        let volatile_result = ledger.record(volatile_authority);
+        assert_eq!(
+            volatile_result.refusal,
+            StorageIntentRefusalReason::CacheCannotBeAuthority
+        );
+
+        let mut intent_backed_authority = cache_receipt;
+        intent_backed_authority.receipt.media_role = StorageMediaRole::RamIntentBackedAuthority;
+        intent_backed_authority.receipt.read_source = ReadServingSourceClass::RamAuthority;
+        let intent_result = ledger.record(intent_backed_authority);
+        assert_eq!(
+            intent_result.refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+
+        assert_eq!(ledger.snapshot(), vec![cache_receipt]);
     }
 
     #[test]
@@ -2458,7 +2520,7 @@ mod tests {
             None,
         );
 
-        ledger.record(receipt);
+        assert!(ledger.record(receipt).satisfied);
 
         assert_eq!(receiver.try_recv(), Ok(receipt));
         assert_eq!(ledger.latest(), Some(receipt));
