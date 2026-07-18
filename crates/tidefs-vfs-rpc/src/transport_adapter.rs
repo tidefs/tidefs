@@ -438,9 +438,31 @@ impl VfsRpcTransportAdapter {
         bulk_service: &BulkService,
     ) -> Result<VfsRpcInboundFrame, VfsRpcTransportAdapterError> {
         self.check_envelope(envelope, payload.len())?;
-        let peer = self.peer_for_session(envelope.session_id)?;
         let service_frame = ControlServiceFrame::decode(payload)
             .map_err(VfsRpcTransportAdapterError::ControlService)?;
+        self.unwrap_control_service_frame_with_bulk(
+            now,
+            envelope.session_id,
+            service_frame,
+            bulk_service,
+        )
+    }
+
+    /// Decode an already-demultiplexed CONTROL service frame and admit active
+    /// BULK descriptors against its authenticated session.
+    ///
+    /// CONTROL service handlers receive the session identity and decoded
+    /// service frame from transport dispatch, not a full envelope. This entry
+    /// point preserves the same VFS_RPC/BULK admission rules for that runtime
+    /// path without reconstructing synthetic envelope state.
+    pub fn unwrap_control_service_frame_with_bulk(
+        &mut self,
+        now: Instant,
+        session_id: SessionId,
+        service_frame: ControlServiceFrame,
+        bulk_service: &BulkService,
+    ) -> Result<VfsRpcInboundFrame, VfsRpcTransportAdapterError> {
+        let peer = self.peer_for_session(session_id)?;
         let rpc_frame = VfsRpcTransportFrame {
             service_id: service_frame.service_id,
             message_type: service_frame.message_type,
@@ -451,28 +473,23 @@ impl VfsRpcTransportAdapter {
             VfsRpcMessageKind::Request => {
                 let request = rpc_frame.decode_request()?;
                 check_request_peer(peer, &request)?;
-                self.admit_request_bulk(peer, envelope.session_id, &request, bulk_service)?;
+                self.admit_request_bulk(peer, session_id, &request, bulk_service)?;
                 Ok(VfsRpcInboundFrame::Request {
                     peer,
-                    session_id: envelope.session_id,
+                    session_id,
                     request,
                 })
             }
             VfsRpcMessageKind::Response => {
                 let response = rpc_frame.decode_response()?;
-                let has_bulk = self.admit_response_bulk(
-                    peer,
-                    envelope.session_id,
-                    &response,
-                    bulk_service,
-                    true,
-                )?;
+                let has_bulk =
+                    self.admit_response_bulk(peer, session_id, &response, bulk_service, true)?;
                 if !has_bulk {
-                    self.complete_response(now, peer, envelope.session_id, &response)?;
+                    self.complete_response(now, peer, session_id, &response)?;
                 }
                 Ok(VfsRpcInboundFrame::Response {
                     peer,
-                    session_id: envelope.session_id,
+                    session_id,
                     response,
                 })
             }

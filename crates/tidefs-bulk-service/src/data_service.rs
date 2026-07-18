@@ -17,7 +17,8 @@ use crate::{
     AbortedBulkTransfer, BulkAbortFrame, BulkAcceptFrame, BulkCreditGrantFrame,
     BulkCreditRequestFrame, BulkCreditResult, BulkDoneFrame, BulkError, BulkFrame,
     BulkProtocolError, BulkService, BulkTcpChunkFrame, BulkToken, CompletedBulkTransfer,
-    ConnectionId, StreamId, BULK_SERVICE_ID,
+    ConnectionId, StreamId, VfsRpcBulkAbort, VfsRpcBulkHandoff, VfsRpcBulkHandoffError,
+    BULK_SERVICE_ID,
 };
 
 /// BULK service-id handler suitable for registration in `DataServiceDispatch`.
@@ -35,6 +36,16 @@ impl BulkDataServiceHandler {
             completed: Mutex::new(Vec::new()),
             aborted: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Run a read-only operation against the same BULK state that receives
+    /// DATA service frames.
+    ///
+    /// This keeps same-session descriptor admission tied to the authenticated
+    /// receiver state without exposing mutable BULK state to the caller.
+    pub fn with_service<R>(&self, operation: impl FnOnce(&BulkService) -> R) -> R {
+        let service = self.service.lock().unwrap();
+        operation(&service)
     }
 
     /// Write an already-granted TCP_STREAM chunk into BULK reassembly state.
@@ -67,6 +78,29 @@ impl BulkDataServiceHandler {
             chunk.chunk_seq,
             chunk.offset,
             &chunk.payload,
+        )
+    }
+
+    /// Retire an active VFS_RPC handoff from a runtime timeout path.
+    ///
+    /// DATA-frame ABORT handling records its terminal event in
+    /// [`Self::drain_aborted`]. This direct path is for a caller that owns the
+    /// timeout and must reclaim the same active transfer before it reports the
+    /// VFS_RPC timeout.
+    pub fn abort_vfs_rpc_handoff(
+        &self,
+        connection_id: ConnectionId,
+        token: BulkToken,
+        op_id: crate::OpId,
+        handoff: VfsRpcBulkHandoff,
+        reason: crate::BulkAbortReason,
+    ) -> Result<VfsRpcBulkAbort, VfsRpcBulkHandoffError> {
+        self.service.lock().unwrap().abort_vfs_rpc_handoff(
+            connection_id,
+            token,
+            op_id,
+            handoff,
+            reason,
         )
     }
 

@@ -19,6 +19,7 @@ use tidefs_types_vfs_core::{
     InodeAttr, InodeFlags, InodeId, NodeKind, PosixAttrs, RenameFlags, SetAttr, StatFs,
 };
 
+pub mod bulk_write_runtime;
 pub mod transport_adapter;
 pub mod vfs_engine_bridge;
 
