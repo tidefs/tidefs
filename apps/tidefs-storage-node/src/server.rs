@@ -743,7 +743,7 @@ fn validate_vfssend2_send_request(
             auth_key,
         )
         .map_err(|e| format!("audit: {e}"))?;
-        if !audit.mountable_without_operator_repair() {
+        if audit.selected_root.is_none() || !audit.mountable_without_operator_repair() {
             return Err(format!(
                 "send source recovery: {}",
                 audit.outcome.human_name()
@@ -6822,6 +6822,17 @@ mod cluster_pool_handler_tests {
         (dir, backend)
     }
 
+    fn create_committed_send_source(fs_root: &Path, auth_key: RootAuthenticationKey) {
+        let mut fs = vfs::LocalFileSystem::open_with_root_authentication_key(
+            fs_root,
+            StoreOptions::default(),
+            auth_key,
+        )
+        .unwrap();
+        fs.create_file("/barrier-source", 0o644).unwrap();
+        fs.sync_all().unwrap();
+    }
+
     fn register_snapshot_barrier_test_peer_with_class(
         ctx: &SessionContext,
         peer_id: u64,
@@ -7529,8 +7540,11 @@ mod cluster_pool_handler_tests {
         let (_dir, store) = frame_local_store();
         let mut ctx = frame_test_context(Arc::clone(&store));
         let fs_dir = tempfile::tempdir().unwrap();
-        ctx.config.fs_root = Some(fs_dir.path().join("fs"));
-        ctx.config.root_auth_key = Some(RootAuthenticationKey::demo_key());
+        let fs_root = fs_dir.path().join("fs");
+        let auth_key = RootAuthenticationKey::demo_key();
+        create_committed_send_source(&fs_root, auth_key);
+        ctx.config.fs_root = Some(fs_root);
+        ctx.config.root_auth_key = Some(auth_key);
         *ctx.active_barrier.lock().unwrap() = Some(SnapshotCoordinator::new(
             99,
             "active".into(),
@@ -7561,8 +7575,11 @@ mod cluster_pool_handler_tests {
         let (_dir, store) = frame_local_store();
         let mut ctx = frame_test_context(Arc::clone(&store));
         let fs_dir = tempfile::tempdir().unwrap();
-        ctx.config.fs_root = Some(fs_dir.path().join("fs"));
-        ctx.config.root_auth_key = Some(RootAuthenticationKey::demo_key());
+        let fs_root = fs_dir.path().join("fs");
+        let auth_key = RootAuthenticationKey::demo_key();
+        create_committed_send_source(&fs_root, auth_key);
+        ctx.config.fs_root = Some(fs_root);
+        ctx.config.root_auth_key = Some(auth_key);
         *ctx.active_barrier.lock().unwrap() = Some(SnapshotCoordinator::new(
             123,
             "active".into(),
@@ -7670,6 +7687,49 @@ mod cluster_pool_handler_tests {
                     );
                 }
                 other => panic!("expected unauthenticated-source error, got {other:?}"),
+            }
+
+            let active = ctx.active_barrier.lock().unwrap();
+            assert_eq!(
+                active
+                    .as_ref()
+                    .expect("invalid request must not clear the active barrier")
+                    .barrier_id(),
+                123
+            );
+        }
+    }
+
+    #[test]
+    fn empty_full_send_sources_are_rejected_before_snapshot_barrier() {
+        let (_dir, store) = frame_local_store();
+        let mut ctx = frame_test_context(Arc::clone(&store));
+        let fs_dir = tempfile::tempdir().unwrap();
+        ctx.config.fs_root = Some(fs_dir.path().join("empty-fs"));
+        ctx.config.root_auth_key = Some(RootAuthenticationKey::demo_key());
+        *ctx.active_barrier.lock().unwrap() = Some(SnapshotCoordinator::new(
+            123,
+            "active".into(),
+            Vec::new(),
+            SnapshotBarrierConfig::default(),
+        ));
+
+        for frame in [
+            Frame::Send { key: vec![] },
+            Frame::SendChunked { key: vec![] },
+        ] {
+            let response =
+                handle_frame_ctx(tidefs_transport::SessionId::new(1), &frame, &store, &ctx)
+                    .expect("empty full send returns an error");
+
+            match response {
+                Frame::Error { message } => {
+                    assert_eq!(
+                        message,
+                        "send source recovery: empty store with no root-slot commits"
+                    );
+                }
+                other => panic!("expected empty-source error, got {other:?}"),
             }
 
             let active = ctx.active_barrier.lock().unwrap();
