@@ -4230,14 +4230,20 @@ fn live_snapshot_send_plan(
     };
     let destination = live_snapshot_send_destination(args)?;
     if matches!(
-        destination,
+        &destination,
         LiveSnapshotSendDestination::TargetAddress { .. }
-    ) && format != LiveSnapshotSendFormat::Vfssend2
-    {
-        return Err(format!(
-            "snapshot send: target-addr sends require format 'vfssend2' for storage-node VSNP import; got '{}'",
-            format.label()
-        ));
+    ) {
+        if format != LiveSnapshotSendFormat::Vfssend2 {
+            return Err(format!(
+                "snapshot send: target-addr sends require format 'vfssend2' for storage-node VSNP import; got '{}'",
+                format.label()
+            ));
+        }
+        if pool_id == [0; 16] {
+            return Err(
+                "snapshot send: pool_id must be non-zero for target-addr sends".to_string(),
+            );
+        }
     }
 
     Ok(LiveSnapshotSendPlan {
@@ -8724,6 +8730,59 @@ mod tests {
     }
 
     #[test]
+    fn live_snapshot_send_requires_nonzero_source_pool_for_target() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = root.path().join("store");
+        let mut fs = LocalFileSystem::open(&store).expect("open fs");
+        fs.create_file("/live.txt", 0o644).expect("create file");
+        fs.write_file("/live.txt", 0, b"live owner snapshot send")
+            .expect("write file");
+        let engine = VfsLocalFileSystem::new(fs);
+
+        for (shape, value) in [
+            ("missing", None),
+            ("null", Some(Value::Null)),
+            (
+                "zero",
+                Some(Value::String("00000000000000000000000000000000".into())),
+            ),
+        ] {
+            let output = root.path().join(format!("pool-{shape}-target.vfs"));
+            let mut args = json!({
+                "output": output.display().to_string(),
+                "target_addr": "127.0.0.1:0",
+                "node_id": 7,
+                "server_node_id": 9,
+                "format": "vfssend2",
+                "incremental": false,
+                "pool_id": "11111111111111111111111111111111",
+                "dataset_id": "22222222222222222222222222222222",
+            });
+            let args_object = args.as_object_mut().expect("snapshot send args object");
+            match value {
+                Some(value) => {
+                    args_object.insert("pool_id".to_string(), value);
+                }
+                None => {
+                    args_object.remove("pool_id");
+                }
+            }
+
+            let refused = live_snapshot_admin(&engine, "send", args, true);
+
+            assert_eq!(refused["ok"], false, "target response: {refused}");
+            assert_eq!(refused["exit_code"], 1);
+            assert!(refused["json"].is_null());
+            assert!(refused["text"].is_null());
+            assert_eq!(
+                refused["error"],
+                "snapshot send: pool_id must be non-zero for target-addr sends"
+            );
+            assert!(!output.exists());
+        }
+    }
+
+    #[test]
     fn live_snapshot_send_rejects_mismatched_handshake_peer_before_push() {
         let root = tempfile::tempdir().expect("tempdir");
         let store = root.path().join("store");
@@ -8769,6 +8828,7 @@ mod tests {
                 "incremental": false,
                 "node_id": local_node_id,
                 "server_node_id": expected_server_node_id,
+                "pool_id": "11111111111111111111111111111111",
             }),
             true,
         );
@@ -8815,6 +8875,7 @@ mod tests {
                 "server_node_id": 9,
                 "format": "vfssend2",
                 "incremental": false,
+                "pool_id": "11111111111111111111111111111111",
             }),
             true,
         );
@@ -8856,6 +8917,7 @@ mod tests {
                 "server_node_id": 9,
                 "format": "vfssend2",
                 "incremental": false,
+                "pool_id": "11111111111111111111111111111111",
             }),
             true,
         );
@@ -8920,6 +8982,7 @@ mod tests {
                 "incremental": false,
                 "node_id": local_node_id,
                 "server_node_id": server_node_id,
+                "pool_id": "11111111111111111111111111111111",
             }),
             true,
         );
