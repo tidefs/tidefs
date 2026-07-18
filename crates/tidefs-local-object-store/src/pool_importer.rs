@@ -204,7 +204,7 @@ impl CandidatePool {
     ///
     /// Checks:
     /// - All devices share the same pool_guid.
-    /// - Pool state is importable (Active or Exported).
+    /// - Pool state agrees across devices and is importable (Active or Exported).
     /// - device_count is consistent across devices.
     /// - All devices match the selected topology_generation.
     /// - Devices are sorted by device_index with no gaps.
@@ -219,6 +219,17 @@ impl CandidatePool {
 
         // Check device count consistency
         for d in &self.devices {
+            if d.label.pool_state != self.pool_state {
+                return Err(ImportError::TopologyInconsistent {
+                    pool_guid: self.pool_guid,
+                    detail: format!(
+                        "device {} reports pool_state={} but pool expects {}",
+                        d.path.display(),
+                        d.label.pool_state,
+                        self.pool_state
+                    ),
+                });
+            }
             if d.label.device_count != self.device_count {
                 return Err(ImportError::TopologyInconsistent {
                     pool_guid: self.pool_guid,
@@ -527,14 +538,13 @@ impl PoolImporter {
             // Sort by device_index
             devices.sort_by_key(|d| d.label.device_index);
 
-            // Determine pool state: use the first device's state, preferring Exported
-            let mut pool_state = LabelPoolState::Active;
-            for d in &devices {
-                if d.label.pool_state == LabelPoolState::Exported {
-                    pool_state = LabelPoolState::Exported;
-                    break;
-                }
-            }
+            // Use the first member as an agreement reference. Validation
+            // below refuses any state disagreement instead of choosing a
+            // state from a mixed topology.
+            let pool_state = devices
+                .first()
+                .map(|device| device.label.pool_state)
+                .unwrap_or(LabelPoolState::Active);
 
             // Determine pool name from first device with a non-empty name
             let pool_name = devices
@@ -995,6 +1005,39 @@ mod tests {
             Err(ImportError::TopologyInconsistent { detail, .. }) => {
                 assert!(detail.contains("topology_generation=7"));
                 assert!(detail.contains("pool expects 8"));
+            }
+            other => panic!("expected TopologyInconsistent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn candidate_pool_rejects_mixed_pool_states() {
+        let pool_guid = [0xAE; 16];
+        let make_candidate = |index, state, byte| {
+            let mut label = PoolLabelV1::new(pool_guid, [byte; 16], "state-drift");
+            label.pool_state = state;
+            label.commit_group = 100;
+            label.label_commit_group = 100;
+            label.device_index = index;
+            label.topology_generation = 8;
+            label.device_count = 2;
+            label.device_capacity_bytes = 1024 * 1024 * 1024;
+            DeviceCandidate {
+                path: PathBuf::from(format!("/dev/tidefs-state-{index}")),
+                label,
+                label_copy: 0,
+                device_size: 1024 * 1024 * 1024,
+            }
+        };
+        let result = PoolImporter::group_by_pool_guid(&[
+            make_candidate(0, LabelPoolState::Active, 0x01),
+            make_candidate(1, LabelPoolState::Exported, 0x02),
+        ]);
+
+        match result {
+            Err(ImportError::TopologyInconsistent { detail, .. }) => {
+                assert!(detail.contains("pool_state"));
+                assert!(detail.contains("pool expects"));
             }
             other => panic!("expected TopologyInconsistent, got {other:?}"),
         }
