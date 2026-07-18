@@ -3839,7 +3839,6 @@ pub fn check_mounted_transform_authority_current_workspace() -> Result<(), Stora
     for rel in [
         "docs/MOUNTED_TRANSFORM_AUTHORITY_RAW_STORE_INVENTORY.md",
         "docs/CLAIMS_GATE_POLICY.md",
-        "docs/PREVIEW_USER_MANUAL.md",
         "crates/tidefs-compression/src/lib.rs",
         "crates/tidefs-encryption/src/lib.rs",
         "crates/tidefs-dedup/src/lib.rs",

@@ -47,11 +47,6 @@ surface, widen publishing claims, or preselect a runtime carrier.
   operator maturity evidence, and does not wire runtime-fed remote policy
   authority. Issue #1278 later closed the current pre-alpha command-boundary
   follow-up map without selecting a runtime-fed product carrier.
-- `docs/PREVIEW_USER_MANUAL.md`: Bounds the FUSE mount to
-  development-preview orientation and routes status back to the review
-  register, claim gate, generated claim registry, CI validation, and live
-  GitHub issue or pull-request evidence. It does not describe an operator
-  dashboard or runtime-fed product surface.
 - `docs/REVIEW_TODO_REGISTER.md`: the operator/UAPI closeout notes are closed
   for the current pre-alpha command boundary. TFR-017 (Transport/cluster
   authority) remains open and still blocks runtime-fed distributed product
