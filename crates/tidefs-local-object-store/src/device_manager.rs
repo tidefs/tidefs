@@ -921,6 +921,7 @@ impl DeviceManager {
         index_validation: TopologyIndexValidation,
     ) -> Result<TopologyLabelAuthority> {
         let mut expected = None;
+        let mut expected_topology_generation = None;
         let mut previous_device_index = None;
         for (index, (config, device_guid)) in device_configs
             .iter()
@@ -996,6 +997,19 @@ impl DeviceManager {
                 _ => {}
             }
             previous_device_index = Some(record.label.device_index);
+            if expected_topology_generation
+                .is_some_and(|generation| generation != record.label.topology_generation)
+            {
+                return Err(StoreError::Io {
+                    operation: "topology_label_authority",
+                    path: config.path.clone(),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "pool labels disagree on topology generation",
+                    ),
+                });
+            }
+            expected_topology_generation = Some(record.label.topology_generation);
             let authority = TopologyLabelAuthority {
                 redundancy_policy: record.label.redundancy_policy,
                 device_layout_policy: record.device_layout_policy,
@@ -1714,6 +1728,80 @@ mod tests {
             let _ = fs::remove_dir_all(&existing_dir);
             let _ = fs::remove_dir_all(&new_dir);
         }
+    }
+
+    #[test]
+    fn add_device_refuses_mismatched_topology_generations_before_writing_new_device() {
+        let existing_dir1 = temp_dir("dm-add-generation-mismatch-existing-1");
+        let existing_dir2 = temp_dir("dm-add-generation-mismatch-existing-2");
+        let new_dir = temp_dir("dm-add-generation-mismatch-new");
+        let existing_configs = [
+            make_device_config(&existing_dir1),
+            make_device_config(&existing_dir2),
+        ];
+        let new_config = make_device_config(&new_dir);
+        let pool_guid = [0x3Au8; 16];
+        let device_guids = [[0x3Bu8; 16], [0x3Cu8; 16]];
+
+        for (index, ((config, device_guid), topology_generation)) in existing_configs
+            .iter()
+            .zip(device_guids)
+            .zip([7, 8])
+            .enumerate()
+        {
+            DeviceManager::write_single_device_label(LabelWriteRequest {
+                device_config: config,
+                pool_guid,
+                device_guid,
+                pool_name: "generation-mismatch",
+                pool_state: crate::pool_label::LabelPoolState::Active,
+                commit_group: 8,
+                label_commit_group: 8,
+                device_index: index as u32,
+                topology_generation,
+                device_count: 2,
+                redundancy_policy: PoolRedundancyPolicy::default(),
+                device_layout_policy: None,
+            })
+            .unwrap();
+        }
+        let label_paths = [
+            existing_dir1.join(".tidefs_label"),
+            existing_dir2.join(".tidefs_label"),
+        ];
+        let labels_before = label_paths.each_ref().map(|path| fs::read(path).unwrap());
+
+        let error = DeviceManager::add_device(
+            &existing_configs,
+            &new_config,
+            pool_guid,
+            &device_guids,
+            [0x3D; 16],
+            "generation-mismatch",
+            8,
+        )
+        .expect_err("mixed topology generations must not be rewritten");
+
+        match error {
+            StoreError::Io {
+                operation, source, ..
+            } => {
+                assert_eq!(operation, "topology_label_authority");
+                assert_eq!(source.kind(), std::io::ErrorKind::InvalidData);
+                assert!(source
+                    .to_string()
+                    .contains("pool labels disagree on topology generation"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        for (path, before) in label_paths.iter().zip(labels_before) {
+            assert_eq!(fs::read(path).unwrap(), before);
+        }
+        assert!(!new_dir.join(".tidefs_label").exists());
+
+        let _ = fs::remove_dir_all(&existing_dir1);
+        let _ = fs::remove_dir_all(&existing_dir2);
+        let _ = fs::remove_dir_all(&new_dir);
     }
 
     #[test]
