@@ -8445,6 +8445,7 @@ impl FuseVfsAdapter {
             writeback_page_cache.clear_dirty_for_inode(directory_ino);
         }
         self.write_page_cache.clear_dirty_for_inode(directory_ino);
+        self.reconcile_writeback_inode_cache_after_authoritative_range(directory_ino);
         Ok(())
     }
 
@@ -42256,7 +42257,21 @@ mod tests {
             .insert(root.get(), 0)
             .expect("insert directory adapter mirror");
         fixture.adapter.write_page_cache.mark_dirty(root.get(), 0);
+        {
+            let mut cache = fixture.adapter.writeback_cache.lock().unwrap();
+            cache.insert(root.get());
+            cache.mark_dirty(root.get(), 4096);
+        }
         assert!(tracker.lock().unwrap().is_dirty(root));
+        assert_eq!(
+            fixture
+                .adapter
+                .writeback_cache
+                .lock()
+                .unwrap()
+                .is_dirty(root.get()),
+            Some(true)
+        );
 
         // Run fsyncdir — must drain the tracker for the directory inode.
         assert_eq!(
@@ -42273,6 +42288,16 @@ mod tests {
             .adapter
             .write_page_cache
             .has_dirty_pages_for_inode(root.get()));
+        assert_eq!(
+            fixture
+                .adapter
+                .writeback_cache
+                .lock()
+                .unwrap()
+                .is_dirty(root.get()),
+            Some(false),
+            "fsyncdir must publish the reclaim projection clean after every dirty owner drains"
+        );
 
         fixture
             .adapter
