@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
-//! Local removal-record fixture: 3-directory mirror topology, synthetic data
+//! Local removal-record fixture: three-directory local topology, synthetic data
 //! evacuation, label update, and BLAKE3 integrity verification.
 //!
 //! Exercises the local record helper pipeline:
@@ -85,7 +85,7 @@ fn local_removal_record_fixture_checks_label_and_payload_encoding() {
     drop(store1);
     drop(store2);
 
-    // Build pool configuration: 3-device mirror.
+    // Build a three-directory local topology.
     let disk0_path: PathBuf = disk0_dir.clone();
     let disk1_path: PathBuf = disk1_dir.clone();
     let disk2_path: PathBuf = disk2_dir.clone();
@@ -119,7 +119,9 @@ fn local_removal_record_fixture_checks_label_and_payload_encoding() {
         .map(|(id, data, _digest)| ObjectPlacement::new(*id, disk1_path.clone(), data.len() as u64))
         .collect();
 
-    let intent = ReplicationIntent::new_mirror(2, FailureDomain::Device).unwrap();
+    // The fixture copies each local object once, matching the configured
+    // one-copy policy rather than claiming two-target mirror evacuation.
+    let intent = ReplicationIntent::new_mirror(1, FailureDomain::Device).unwrap();
 
     // Phase 1: Plan evacuation.
     let plan = DeviceRemovalPlanner::plan_removal(
@@ -315,7 +317,7 @@ fn local_removal_record_fixture_checks_label_and_payload_encoding() {
 }
 
 #[test]
-fn removal_with_zero_objects_on_target_device() {
+fn removal_with_no_objects_on_target_is_an_empty_plan() {
     let dir = tempfile::tempdir().unwrap();
 
     let disk0_dir = dir.path().join("disk0");
@@ -364,19 +366,21 @@ fn removal_with_zero_objects_on_target_device() {
 
     // No objects on disk1 to evacuate.
     let object_placements: Vec<ObjectPlacement> = vec![];
-    let intent = ReplicationIntent::new_mirror(2, FailureDomain::Device).unwrap();
+    let intent = ReplicationIntent::new_mirror(1, FailureDomain::Device).unwrap();
 
-    let result = DeviceRemovalPlanner::plan_removal(
+    let plan = DeviceRemovalPlanner::plan_removal(
         &pool_config.device_tree,
         &disk1_path,
         &object_placements,
         intent,
         1,
-    );
+    )
+    .expect("an empty target should produce a valid local plan");
 
-    assert!(
-        matches!(result, Err(DeviceRemovalError::NoObjectsOnDevice)),
-        "expected NoObjectsOnDevice, got {result:?}"
+    assert!(plan.is_empty());
+    assert_eq!(
+        plan.evacuation_outcome,
+        tidefs_pool_scan::EvacuationPlanOutcome::EmptySuccess
     );
 }
 

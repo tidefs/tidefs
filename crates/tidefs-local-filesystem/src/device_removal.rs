@@ -1108,20 +1108,27 @@ fn validate_completed_anchor_inputs(
         )));
     }
 
-    let config_paths: std::collections::BTreeSet<_> =
-        config.device_tree.all_leaf_paths().into_iter().collect();
-    let plan_paths: std::collections::BTreeSet<_> =
-        plan.surviving_devices.iter().cloned().collect();
-    if config_paths != plan_paths {
-        return Err(DeviceRemovalAnchorError::IncompleteEvidence(
-            "post-removal topology does not match planned surviving devices".into(),
-        ));
-    }
     let expected_device_count = usize::try_from(plan.device_count_after).map_err(|_| {
         DeviceRemovalAnchorError::IncompleteEvidence(
             "post-removal device count does not fit local topology".into(),
         )
     })?;
+    let plan_paths: std::collections::BTreeSet<_> =
+        plan.surviving_devices.iter().cloned().collect();
+    if plan.surviving_devices.len() != expected_device_count
+        || plan_paths.len() != expected_device_count
+    {
+        return Err(DeviceRemovalAnchorError::IncompleteEvidence(
+            "planned survivor list does not match the post-removal device count".into(),
+        ));
+    }
+    let config_paths: std::collections::BTreeSet<_> =
+        config.device_tree.all_leaf_paths().into_iter().collect();
+    if config_paths != plan_paths {
+        return Err(DeviceRemovalAnchorError::IncompleteEvidence(
+            "post-removal topology does not match planned surviving devices".into(),
+        ));
+    }
     if config.device_count != plan.device_count_after || config_paths.len() != expected_device_count
     {
         return Err(DeviceRemovalAnchorError::IncompleteEvidence(
@@ -1384,6 +1391,35 @@ mod tests {
         assert!(rejection_store.get(record_key).unwrap().is_none());
         let survivor_label = ObjectKey::from_name(format!("{POOL_LABEL_KEY_PREFIX}0"));
         assert!(rejection_store.get(survivor_label).unwrap().is_none());
+
+        // Set comparison alone would hide a duplicated survivor and publish a
+        // malformed local record. The anchor requires exactly one entry for
+        // each post-removal device.
+        let duplicate_dir = tempfile::tempdir().unwrap();
+        let mut duplicate_store =
+            tidefs_local_object_store::LocalObjectStore::open(duplicate_dir.path()).unwrap();
+        let mut duplicate_plan = plan.clone();
+        duplicate_plan
+            .surviving_devices
+            .push(std::path::PathBuf::from("/dev/disk0"));
+        let mut duplicate_result = result.clone();
+        duplicate_result.surviving_devices = duplicate_plan.surviving_devices.clone();
+
+        let err = anchor_device_removal(
+            &mut duplicate_store,
+            &duplicate_plan,
+            &duplicate_result,
+            Some(&config),
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("survivor list"),
+            "unexpected error: {err}"
+        );
+        assert!(duplicate_store.get(record_key).unwrap().is_none());
+        assert!(duplicate_store.get(survivor_label).unwrap().is_none());
     }
 
     #[test]
