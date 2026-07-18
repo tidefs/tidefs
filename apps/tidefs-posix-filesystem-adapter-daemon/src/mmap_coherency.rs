@@ -18,7 +18,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use tidefs_invalidation_feed::{
     DatasetId, FollowerInvalidationProcessor, InodeId, InvalidationBatch, InvalidationSink,
@@ -86,6 +86,14 @@ pub type DirtyStateCheck = Box<dyn Fn(u64) -> bool + Send + Sync>;
 
 type InodeInvalidator = Box<dyn Fn(u64) -> io::Result<()> + Send + Sync>;
 
+const DIRTY_TRANSITION_GATE_SWEEP_INTERVAL: usize = 256;
+
+#[derive(Default)]
+struct DirtyTransitionGateRegistry {
+    gates: BTreeMap<u64, Weak<Mutex<()>>>,
+    operations_since_sweep: usize,
+}
+
 /// Mmap cluster coherency manager.
 ///
 /// # Dirty/writeback preservation
@@ -102,7 +110,9 @@ pub struct MmapCoherency {
     processor: Mutex<FollowerInvalidationProcessor>,
     /// Per-inode gates that serialize a clean-state decision and kernel
     /// invalidation with the first dirty or writeback-pending publication.
-    dirty_transition_gates: Mutex<BTreeMap<u64, Arc<Mutex<()>>>>,
+    /// Weak entries are swept periodically so closed/inactive inodes do not
+    /// leave permanent synchronization state behind.
+    dirty_transition_gates: Mutex<DirtyTransitionGateRegistry>,
     /// Latest per-inode invalidation generation retained while dirty or
     /// writeback-pending bytes prevent immediate kernel-cache invalidation,
     /// while a known registration is inactive, or while the kernel
@@ -137,7 +147,7 @@ impl MmapCoherency {
         Self {
             registrations: Mutex::new(BTreeMap::new()),
             processor: Mutex::new(FollowerInvalidationProcessor::new()),
-            dirty_transition_gates: Mutex::new(BTreeMap::new()),
+            dirty_transition_gates: Mutex::new(DirtyTransitionGateRegistry::default()),
             deferred_invalidations: Mutex::new(VecDeque::new()),
             retry_deferred_next: AtomicBool::new(false),
             invalidate_inode,
@@ -169,14 +179,21 @@ impl MmapCoherency {
         Self::gate_for_inode(&self.dirty_transition_gates, ino)
     }
 
-    fn gate_for_inode(gates: &Mutex<BTreeMap<u64, Arc<Mutex<()>>>>, ino: u64) -> Arc<Mutex<()>> {
-        Arc::clone(
-            gates
-                .lock()
-                .unwrap()
-                .entry(ino)
-                .or_insert_with(|| Arc::new(Mutex::new(()))),
-        )
+    fn gate_for_inode(registry: &Mutex<DirtyTransitionGateRegistry>, ino: u64) -> Arc<Mutex<()>> {
+        let mut registry = registry.lock().unwrap();
+        registry.operations_since_sweep += 1;
+        if registry.operations_since_sweep >= DIRTY_TRANSITION_GATE_SWEEP_INTERVAL {
+            registry.gates.retain(|_, gate| gate.upgrade().is_some());
+            registry.operations_since_sweep = 0;
+        }
+
+        if let Some(gate) = registry.gates.get(&ino).and_then(Weak::upgrade) {
+            return gate;
+        }
+
+        let gate = Arc::new(Mutex::new(()));
+        registry.gates.insert(ino, Arc::downgrade(&gate));
+        gate
     }
 
     pub fn register(&self, ino: u64, generation: u64) {
@@ -303,7 +320,7 @@ struct MmapInvalidationSink<'a> {
     dirty_check: &'a Mutex<Option<DirtyStateCheck>>,
     /// Supplies the per-inode gate held from the dirty-state decision through
     /// the kernel notification, closing the decision-to-notify race.
-    dirty_transition_gates: &'a Mutex<BTreeMap<u64, Arc<Mutex<()>>>>,
+    dirty_transition_gates: &'a Mutex<DirtyTransitionGateRegistry>,
     /// Latest deferred generation for each inode whose dirty/writeback state
     /// currently prevents invalidation.
     deferred_invalidations: &'a Mutex<VecDeque<(u64, u64)>>,
@@ -510,6 +527,19 @@ mod tests {
         assert_eq!(s.invalidations_received, 2);
         assert_eq!(s.coherency_conflicts, 1);
         assert_eq!(s.pages_invalidated, 1);
+    }
+
+    #[test]
+    fn dirty_transition_gates_release_inactive_inodes_without_losing_live_gate() {
+        let c = new_coherency();
+        for ino in 0..(DIRTY_TRANSITION_GATE_SWEEP_INTERVAL as u64 - 1) {
+            drop(c.dirty_transition_gate(ino));
+        }
+
+        let live = c.dirty_transition_gate(u64::MAX);
+        let same = c.dirty_transition_gate(u64::MAX);
+        assert!(Arc::ptr_eq(&live, &same));
+        assert_eq!(c.dirty_transition_gates.lock().unwrap().gates.len(), 1);
     }
 
     #[test]
