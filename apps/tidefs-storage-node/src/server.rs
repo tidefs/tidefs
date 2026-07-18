@@ -1004,6 +1004,30 @@ fn finalize_snapshot_barrier_before_send(
     Ok(report)
 }
 
+fn ensure_snapshot_barrier_coordinator_stable(
+    barrier_id: u64,
+    expected: SnapshotBarrierStoreSnapshot,
+    observed: SnapshotBarrierStoreSnapshot,
+) -> Result<(), SnapshotBarrierSendError> {
+    if observed.committed_root_txg == expected.committed_root_txg
+        && observed.committed_root_generation == expected.committed_root_generation
+    {
+        return Ok(());
+    }
+
+    Err(SnapshotBarrierSendError::Inconsistent {
+        barrier_id,
+        min_txg: expected.committed_root_txg.min(observed.committed_root_txg),
+        max_txg: expected.committed_root_txg.max(observed.committed_root_txg),
+        min_generation: expected
+            .committed_root_generation
+            .min(observed.committed_root_generation),
+        max_generation: expected
+            .committed_root_generation
+            .max(observed.committed_root_generation),
+    })
+}
+
 fn clear_active_snapshot_barrier(ctx: &SessionContext, barrier_id: u64) {
     let mut active = ctx.active_barrier.lock().unwrap();
     if active.as_ref().map(SnapshotCoordinator::barrier_id) == Some(barrier_id) {
@@ -1034,6 +1058,42 @@ fn active_snapshot_barrier_outcome(
         Some(coord) if coord.barrier_id() == barrier_id => Ok(coord.outcome()),
         _ => Err(SnapshotBarrierSendError::Interrupted { barrier_id }),
     }
+}
+
+fn finish_active_snapshot_barrier_before_send(
+    barrier_id: u64,
+    coordinator_state: SnapshotBarrierStoreSnapshot,
+    outcome: BarrierOutcome,
+    membership_cut: &SnapshotBarrierMembershipCut,
+    ctx: &SessionContext,
+) -> Result<SnapshotBarrierSendReport, SnapshotBarrierSendError> {
+    // A peer-complete round still has to prove that the coordinator did not
+    // commit a different root while it waited. Keep the round active through
+    // the final sync and membership check so another send cannot replace it.
+    let coordinator_stability = if matches!(&outcome, BarrierOutcome::Consistent { .. }) {
+        let observed = {
+            let mut store = ctx.store.lock().unwrap();
+            sync_snapshot_barrier_store(&mut store)
+                .map_err(|reason| SnapshotBarrierSendError::LocalSyncFailed { barrier_id, reason })
+        };
+        observed.and_then(|observed| {
+            ensure_snapshot_barrier_coordinator_stable(barrier_id, coordinator_state, observed)
+        })
+    } else {
+        Ok(())
+    };
+
+    let result = coordinator_stability.and_then(|()| {
+        finalize_snapshot_barrier_before_send(
+            barrier_id,
+            coordinator_state,
+            outcome,
+            membership_cut,
+            ctx,
+        )
+    });
+    clear_active_snapshot_barrier(ctx, barrier_id);
+    result
 }
 
 /// Fan out a barrier through transport-owned session admission.
@@ -1189,8 +1249,7 @@ fn run_snapshot_barrier_before_send_with_config(
         abort_snapshot_barrier_if_membership_stale(barrier_id, &membership_cut, ctx)?;
         let outcome = active_snapshot_barrier_outcome(ctx, barrier_id)?;
         if let Some(outcome) = outcome {
-            clear_active_snapshot_barrier(ctx, barrier_id);
-            return finalize_snapshot_barrier_before_send(
+            return finish_active_snapshot_barrier_before_send(
                 barrier_id,
                 coordinator_state,
                 outcome,
@@ -7036,6 +7095,74 @@ mod cluster_pool_handler_tests {
                 max_generation: 6,
             }
         );
+    }
+
+    #[test]
+    fn snapshot_barrier_before_send_rejects_coordinator_advance_during_peer_wait() {
+        let (_dir, store) = frame_local_store();
+        let ctx = frame_test_context(Arc::clone(&store));
+        let coordinator_state = {
+            let mut backend = store.lock().unwrap();
+            sync_snapshot_barrier_store(&mut backend).expect("capture coordinator root")
+        };
+        let membership_cut = snapshot_barrier_membership_cut(&ctx);
+        *ctx.active_barrier.lock().unwrap() = Some(SnapshotCoordinator::new(
+            7,
+            "active".into(),
+            vec![2],
+            SnapshotBarrierConfig::default(),
+        ));
+
+        {
+            let mut backend = store.lock().unwrap();
+            match &mut *backend {
+                StoreBackend::Local(rs) => rs
+                    .put_local("late-coordinator-write", b"advanced root")
+                    .expect("write while peer barrier is in flight"),
+                _ => panic!("expected local store backend"),
+            }
+        }
+
+        let err = finish_active_snapshot_barrier_before_send(
+            7,
+            coordinator_state,
+            BarrierOutcome::Consistent {
+                min_txg: coordinator_state.committed_root_txg,
+                max_txg: coordinator_state.committed_root_txg,
+                total_objects: 0,
+                responses: BTreeMap::from([(
+                    2,
+                    crate::snapshot_barrier::BarrierResponse {
+                        peer_id: 2,
+                        barrier_id: 7,
+                        committed_root_txg: coordinator_state.committed_root_txg,
+                        committed_root_generation: coordinator_state.committed_root_generation,
+                        object_count: 0,
+                        received_at: Instant::now(),
+                    },
+                )]),
+            },
+            &membership_cut,
+            &ctx,
+        )
+        .expect_err("coordinator root advance must invalidate the barrier");
+
+        match err {
+            SnapshotBarrierSendError::Inconsistent {
+                min_txg,
+                max_txg,
+                min_generation,
+                max_generation,
+                ..
+            } => {
+                assert_eq!(min_txg, coordinator_state.committed_root_txg);
+                assert!(max_txg > min_txg);
+                assert_eq!(min_generation, coordinator_state.committed_root_generation);
+                assert!(max_generation > min_generation);
+            }
+            other => panic!("expected coordinator root inconsistency, got {other:?}"),
+        }
+        assert!(ctx.active_barrier.lock().unwrap().is_none());
     }
 
     #[test]
