@@ -8522,6 +8522,14 @@ impl FuseVfsAdapter {
 
         let mut block_volume_dirty_state_flushed = false;
         let sync_result = (|| {
+            {
+                let e = self.engine.lock().unwrap();
+
+                // Materialize all engine content and extent state before
+                // resolving physical block-volume locations below.
+                e.syncfs(ctx)?;
+            }
+
             // A successful syncfs must include the optional block-volume
             // carrier. Otherwise the in-memory dirty-state fallback hides
             // stale block-volume bytes until the adapter restarts.
@@ -8574,16 +8582,6 @@ impl FuseVfsAdapter {
                     block_volume_dirty_state_flushed = true;
                 }
             }
-
-            let e = self.engine.lock().unwrap();
-
-            // Adapter page-cache entries mirror writes that already reached the
-            // engine. Keep those mirrors dirty until the engine, TXG, and final
-            // sync barriers have all succeeded below.
-
-            // Phase 2: filesystem-wide durability barrier through the engine.
-            e.syncfs(ctx)?;
-            drop(e);
 
             self.commit_current_txg_barrier("syncfs")?;
 
