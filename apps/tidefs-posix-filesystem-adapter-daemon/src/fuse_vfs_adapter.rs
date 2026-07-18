@@ -5354,6 +5354,19 @@ impl FuseVfsAdapter {
         self.dispatch_access_check(ctx, ino, mask)
     }
 
+    fn project_snapshot_catalog_directory(
+        mut template: InodeAttr,
+        inode_id: InodeId,
+        generation: Generation,
+    ) -> Result<InodeAttr, Errno> {
+        if template.kind != NodeKind::Dir {
+            return Err(Errno::ENOTDIR);
+        }
+        template.inode_id = inode_id;
+        template.generation = generation;
+        Ok(template)
+    }
+
     /// Resolve a directory entry by name within a parent directory.
     ///
     /// This is the core lookup dispatch: given a parent inode and child name,
@@ -5370,6 +5383,30 @@ impl FuseVfsAdapter {
         name: &[u8],
     ) -> Result<InodeAttr, Errno> {
         let _timer = crate::observability::LatencyTimer::new(&crate::observability::HIST_METADATA);
+
+        // Snapshot catalog lookups must bypass the ordinary positive and
+        // negative caches: catalog generation changes make cached synthetic
+        // identities stale, and deletion must become ENOENT immediately.
+        if parent == SNAPSHOT_NAMESPACE_ROOT_INODE_ID.get() {
+            let e = self.engine.lock().unwrap();
+            let (inode_id, generation) = e.snapshot_catalog_lookup(name)?;
+            let root = e.get_root_inode(ctx)?;
+            let template = e.getattr(root, None, ctx)?;
+            return Self::project_snapshot_catalog_directory(template, inode_id, generation);
+        }
+
+        if name == b".snapshot" {
+            let e = self.engine.lock().unwrap();
+            if let Some(generation) = e.snapshot_catalog_generation() {
+                let template = e.getattr(InodeId::new(parent), None, ctx)?;
+                return Self::project_snapshot_catalog_directory(
+                    template,
+                    SNAPSHOT_NAMESPACE_ROOT_INODE_ID,
+                    generation,
+                );
+            }
+        }
+
         // Check daemon-side negative cache before hitting the engine.
         let now_ns = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -30506,6 +30543,64 @@ mod tests {
             .adapter
             .dispatch_lookup(&ctx, root.get(), b"nonexistent_file");
         assert_eq!(result, Err(Errno::ENOENT));
+    }
+
+    #[test]
+    fn vfs_adapter_dispatch_lookup_routes_snapshot_catalog() {
+        let fixture = adapter_fixture_with_snapshot();
+        let ctx = root_ctx();
+        let root = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine.get_root_inode(&ctx).expect("root inode")
+        };
+
+        let catalog = fixture
+            .adapter
+            .dispatch_lookup(&ctx, root.get(), b".snapshot")
+            .expect("lookup snapshot catalog directory");
+        assert_eq!(catalog.inode_id, SNAPSHOT_NAMESPACE_ROOT_INODE_ID);
+        assert_eq!(catalog.kind, NodeKind::Dir);
+
+        let snapshot = fixture
+            .adapter
+            .dispatch_lookup(&ctx, SNAPSHOT_NAMESPACE_ROOT_INODE_ID.get(), b"snap0")
+            .expect("lookup snapshot catalog entry");
+        assert_eq!(snapshot.kind, NodeKind::Dir);
+        assert_ne!(snapshot.inode_id, SNAPSHOT_NAMESPACE_ROOT_INODE_ID);
+        assert_ne!(snapshot.inode_id.get() & (1 << 63), 0);
+        assert_eq!(snapshot.generation, catalog.generation);
+        assert_eq!(
+            fixture
+                .adapter
+                .dispatch_lookup(&ctx, SNAPSHOT_NAMESPACE_ROOT_INODE_ID.get(), b"snap0",)
+                .expect("repeat snapshot catalog lookup"),
+            snapshot
+        );
+        assert_eq!(
+            fixture.adapter.dispatch_lookup(
+                &ctx,
+                SNAPSHOT_NAMESPACE_ROOT_INODE_ID.get(),
+                b"missing",
+            ),
+            Err(Errno::ENOENT)
+        );
+    }
+
+    #[test]
+    fn vfs_adapter_dispatch_lookup_omits_snapshot_catalog_when_empty() {
+        let fixture = adapter_fixture();
+        let ctx = root_ctx();
+        let root = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine.get_root_inode(&ctx).expect("root inode")
+        };
+
+        assert_eq!(
+            fixture
+                .adapter
+                .dispatch_lookup(&ctx, root.get(), b".snapshot"),
+            Err(Errno::ENOENT)
+        );
     }
 
     #[test]

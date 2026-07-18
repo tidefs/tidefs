@@ -1859,6 +1859,15 @@ pub trait VfsEngineStatFs: VfsEngine {
     fn snapshot_catalog_generation(&self) -> Option<Generation> {
         None
     }
+
+    /// Resolve a visible snapshot catalog name to its synthetic inode identity.
+    ///
+    /// The returned generation is the catalog generation that guards the
+    /// synthetic identity. Engines without a browsable snapshot catalog keep
+    /// the default fail-closed lookup behavior.
+    fn snapshot_catalog_lookup(&self, _name: &[u8]) -> Result<(InodeId, Generation), Errno> {
+        Err(Errno::ENOENT)
+    }
 }
 
 /// Current live-owner admin/control request version.
