@@ -206,7 +206,8 @@ impl DeviceManager {
         let new_device_count = old_device_count + 1;
         let new_topology_gen = commit_group.wrapping_add(1);
         let label_commit_group = commit_group;
-        let authority = Self::topology_label_authority(existing_device_configs, pool_guid)?;
+        let authority =
+            Self::topology_label_authority(existing_device_configs, device_guids, pool_guid)?;
 
         // 1. Write label to the new device.
         Self::write_single_device_label(LabelWriteRequest {
@@ -270,7 +271,7 @@ impl DeviceManager {
 
         // Validate every surviving label before mutating the first copy. This
         // also proves that any DeviceLayoutV1 records use one pool-wide policy.
-        let _ = Self::topology_label_authority(remaining_device_configs, pool_guid)?;
+        let _ = Self::topology_label_authority(remaining_device_configs, device_guids, pool_guid)?;
 
         Self::update_existing_labels_with_reindex(ExistingLabelUpdate {
             device_configs: remaining_device_configs,
@@ -311,8 +312,11 @@ impl DeviceManager {
         let device_count = request.existing_device_configs.len() as u32;
         let new_topology_gen = request.commit_group.wrapping_add(1);
         let label_commit_group = request.commit_group;
-        let authority =
-            Self::topology_label_authority(request.existing_device_configs, request.pool_guid)?;
+        let authority = Self::topology_label_authority(
+            request.existing_device_configs,
+            request.device_guids,
+            request.pool_guid,
+        )?;
 
         // Write label to new device at the same index.
         Self::write_single_device_label(LabelWriteRequest {
@@ -379,8 +383,11 @@ impl DeviceManager {
         let device_count = request.existing_device_configs.len() as u32;
         let new_topology_gen = request.commit_group.wrapping_add(1);
         let label_commit_group = request.commit_group;
-        let authority =
-            Self::topology_label_authority(request.existing_device_configs, request.pool_guid)?;
+        let authority = Self::topology_label_authority(
+            request.existing_device_configs,
+            request.device_guids,
+            request.pool_guid,
+        )?;
 
         // Write the spare's label at the faulted device's index.
         Self::write_single_device_label(LabelWriteRequest {
@@ -835,11 +842,28 @@ impl DeviceManager {
 
     fn topology_label_authority(
         device_configs: &[DeviceConfig],
+        device_guids: &[[u8; 16]],
         pool_guid: [u8; 16],
     ) -> Result<TopologyLabelAuthority> {
         let mut expected = None;
-        for config in device_configs {
+        for (index, (config, device_guid)) in device_configs
+            .iter()
+            .zip(device_guids.iter().copied())
+            .enumerate()
+        {
             let record = Self::read_device_label(&config.path, pool_guid)?;
+            if record.label.device_guid != device_guid {
+                return Err(StoreError::Io {
+                    operation: "topology_label_authority",
+                    path: config.path.clone(),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "pool label device GUID does not match caller topology at index {index}"
+                        ),
+                    ),
+                });
+            }
             let authority = TopologyLabelAuthority {
                 redundancy_policy: record.label.redundancy_policy,
                 device_layout_policy: record.device_layout_policy,
@@ -1329,6 +1353,63 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
+        assert!(!new_dir.join(".tidefs_label").exists());
+
+        let _ = fs::remove_dir_all(&existing_dir);
+        let _ = fs::remove_dir_all(&new_dir);
+    }
+
+    #[test]
+    fn add_device_refuses_mismatched_label_guid_before_writing_new_device() {
+        let existing_dir = temp_dir("dm-add-guid-mismatch-existing");
+        let new_dir = temp_dir("dm-add-guid-mismatch-new");
+        let existing_config = make_device_config(&existing_dir);
+        let new_config = make_device_config(&new_dir);
+        let pool_guid = [0x27; 16];
+        let label_guid = [0x28; 16];
+
+        DeviceManager::write_single_device_label(LabelWriteRequest {
+            device_config: &existing_config,
+            pool_guid,
+            device_guid: label_guid,
+            pool_name: "guid-mismatch",
+            pool_state: crate::pool_label::LabelPoolState::Active,
+            commit_group: 1,
+            label_commit_group: 1,
+            device_index: 0,
+            topology_generation: 1,
+            device_count: 1,
+            redundancy_policy: PoolRedundancyPolicy::default(),
+            device_layout_policy: None,
+        })
+        .unwrap();
+        let label_path = existing_dir.join(".tidefs_label");
+        let label_before = fs::read(&label_path).unwrap();
+
+        let error = DeviceManager::add_device(
+            std::slice::from_ref(&existing_config),
+            &new_config,
+            pool_guid,
+            &[[0x29; 16]],
+            [0x2A; 16],
+            "guid-mismatch",
+            1,
+        )
+        .expect_err("caller topology must not replace label identity");
+
+        match error {
+            StoreError::Io {
+                operation, source, ..
+            } => {
+                assert_eq!(operation, "topology_label_authority");
+                assert_eq!(source.kind(), std::io::ErrorKind::InvalidData);
+                assert!(source
+                    .to_string()
+                    .contains("device GUID does not match caller topology at index 0"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        assert_eq!(fs::read(&label_path).unwrap(), label_before);
         assert!(!new_dir.join(".tidefs_label").exists());
 
         let _ = fs::remove_dir_all(&existing_dir);
