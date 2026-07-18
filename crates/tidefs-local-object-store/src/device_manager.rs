@@ -928,6 +928,19 @@ impl DeviceManager {
             .enumerate()
         {
             let record = Self::read_device_label(&config.path, pool_guid)?;
+            if record.label.pool_state != crate::pool_label::LabelPoolState::Active {
+                return Err(StoreError::Io {
+                    operation: "topology_label_authority",
+                    path: config.path.clone(),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "expected ACTIVE pool state, found {}",
+                            record.label.pool_state
+                        ),
+                    ),
+                });
+            }
             if record.label.device_guid != device_guid {
                 return Err(StoreError::Io {
                     operation: "topology_label_authority",
@@ -1640,6 +1653,67 @@ mod tests {
 
         let _ = fs::remove_dir_all(&existing_dir);
         let _ = fs::remove_dir_all(&new_dir);
+    }
+
+    #[test]
+    fn add_device_refuses_non_active_label_before_writing_new_device() {
+        for (suffix, pool_state) in [
+            ("exported", crate::pool_label::LabelPoolState::Exported),
+            ("destroyed", crate::pool_label::LabelPoolState::Destroyed),
+        ] {
+            let existing_dir = temp_dir(&format!("dm-add-{suffix}-existing"));
+            let new_dir = temp_dir(&format!("dm-add-{suffix}-new"));
+            let existing_config = make_device_config(&existing_dir);
+            let new_config = make_device_config(&new_dir);
+            let pool_guid = [0x37; 16];
+            let existing_guid = [0x38; 16];
+            let pool_name = format!("non-active-{suffix}");
+
+            DeviceManager::write_single_device_label(LabelWriteRequest {
+                device_config: &existing_config,
+                pool_guid,
+                device_guid: existing_guid,
+                pool_name: &pool_name,
+                pool_state,
+                commit_group: 1,
+                label_commit_group: 1,
+                device_index: 0,
+                topology_generation: 1,
+                device_count: 1,
+                redundancy_policy: PoolRedundancyPolicy::default(),
+                device_layout_policy: None,
+            })
+            .unwrap();
+            let label_path = existing_dir.join(".tidefs_label");
+            let label_before = fs::read(&label_path).unwrap();
+
+            let error = DeviceManager::add_device(
+                std::slice::from_ref(&existing_config),
+                &new_config,
+                pool_guid,
+                &[existing_guid],
+                [0x39; 16],
+                &pool_name,
+                1,
+            )
+            .expect_err("non-active pool labels must not be reactivated by topology changes");
+
+            match error {
+                StoreError::Io {
+                    operation, source, ..
+                } => {
+                    assert_eq!(operation, "topology_label_authority");
+                    assert_eq!(source.kind(), std::io::ErrorKind::InvalidData);
+                    assert!(source.to_string().contains("expected ACTIVE pool state"));
+                }
+                other => panic!("unexpected error: {other:?}"),
+            }
+            assert_eq!(fs::read(&label_path).unwrap(), label_before);
+            assert!(!new_dir.join(".tidefs_label").exists());
+
+            let _ = fs::remove_dir_all(&existing_dir);
+            let _ = fs::remove_dir_all(&new_dir);
+        }
     }
 
     #[test]
