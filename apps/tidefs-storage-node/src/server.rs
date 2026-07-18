@@ -882,6 +882,12 @@ fn finalize_snapshot_barrier_bound_vfssend2_send_payload(
     ctx: &SessionContext,
 ) -> Result<Vec<u8>, String> {
     ensure_vfssend2_send_root_unchanged(fs_root, auth_key, &authorization.target_root)?;
+    ensure_snapshot_barrier_coordinator_current(
+        authorization.barrier_id,
+        authorization.coordinator_state,
+        ctx,
+    )
+    .map_err(|err| format!("snapshot barrier before VFSSEND2 send: {err}"))?;
     ensure_snapshot_barrier_membership_current(
         authorization.barrier_id,
         &authorization.membership_cut,
@@ -1034,12 +1040,14 @@ struct SnapshotBarrierMembershipCut {
 #[derive(Debug)]
 struct CompletedSnapshotBarrier {
     report: SnapshotBarrierSendReport,
+    coordinator_state: SnapshotBarrierStoreSnapshot,
     membership_cut: SnapshotBarrierMembershipCut,
 }
 
 struct SnapshotBarrierSendAuthorization {
     target_root: vfs::CommittedRootSummary,
     barrier_id: u64,
+    coordinator_state: SnapshotBarrierStoreSnapshot,
     membership_cut: SnapshotBarrierMembershipCut,
 }
 
@@ -1132,6 +1140,19 @@ fn ensure_snapshot_barrier_coordinator_stable(
     })
 }
 
+fn ensure_snapshot_barrier_coordinator_current(
+    barrier_id: u64,
+    expected: SnapshotBarrierStoreSnapshot,
+    ctx: &SessionContext,
+) -> Result<(), SnapshotBarrierSendError> {
+    let observed = {
+        let mut store = ctx.store.lock().unwrap();
+        sync_snapshot_barrier_store(&mut store)
+            .map_err(|reason| SnapshotBarrierSendError::LocalSyncFailed { barrier_id, reason })?
+    };
+    ensure_snapshot_barrier_coordinator_stable(barrier_id, expected, observed)
+}
+
 fn clear_active_snapshot_barrier(ctx: &SessionContext, barrier_id: u64) {
     let mut active = ctx.active_barrier.lock().unwrap();
     if active.as_ref().map(SnapshotCoordinator::barrier_id) == Some(barrier_id) {
@@ -1175,14 +1196,7 @@ fn finish_active_snapshot_barrier_before_send(
     // commit a different root while it waited. Keep the round active through
     // the final sync and membership check so another send cannot replace it.
     let coordinator_stability = if matches!(&outcome, BarrierOutcome::Consistent { .. }) {
-        let observed = {
-            let mut store = ctx.store.lock().unwrap();
-            sync_snapshot_barrier_store(&mut store)
-                .map_err(|reason| SnapshotBarrierSendError::LocalSyncFailed { barrier_id, reason })
-        };
-        observed.and_then(|observed| {
-            ensure_snapshot_barrier_coordinator_stable(barrier_id, coordinator_state, observed)
-        })
+        ensure_snapshot_barrier_coordinator_current(barrier_id, coordinator_state, ctx)
     } else {
         Ok(())
     };
@@ -1349,6 +1363,7 @@ fn run_snapshot_barrier_before_send_with_config(
             )?;
             return Ok(CompletedSnapshotBarrier {
                 report,
+                coordinator_state,
                 membership_cut,
             });
         }
@@ -1379,6 +1394,7 @@ fn require_snapshot_barrier_before_send(
             Ok(SnapshotBarrierSendAuthorization {
                 target_root,
                 barrier_id: report.barrier_id,
+                coordinator_state: completed.coordinator_state,
                 membership_cut: completed.membership_cut,
             })
         }
@@ -8146,6 +8162,11 @@ mod cluster_pool_handler_tests {
             target_root: validate_vfssend2_send_request(&fs_root, auth_key, &[])
                 .expect("select authenticated send root before barrier"),
             barrier_id: 7,
+            coordinator_state: {
+                let mut backend = store.lock().unwrap();
+                sync_snapshot_barrier_store(&mut backend)
+                    .expect("capture barriered coordinator root")
+            },
             membership_cut: snapshot_barrier_membership_cut(&ctx),
         };
 
@@ -8162,6 +8183,52 @@ mod cluster_pool_handler_tests {
         .expect_err("post-barrier membership drift must refuse the send payload");
 
         assert!(err.contains("sender_authority_stale"), "{err}");
+        assert!(!err.contains("expected tid="), "{err}");
+    }
+
+    #[test]
+    fn vfssend2_send_coordinator_root_must_match_completed_barrier() {
+        let (_dir, store) = frame_local_store();
+        let ctx = frame_test_context(Arc::clone(&store));
+        let fs_dir = tempfile::tempdir().unwrap();
+        let fs_root = fs_dir.path().join("fs");
+        let auth_key = RootAuthenticationKey::demo_key();
+        create_committed_send_source(&fs_root, auth_key);
+        let authorization = SnapshotBarrierSendAuthorization {
+            target_root: validate_vfssend2_send_request(&fs_root, auth_key, &[])
+                .expect("select authenticated send root before barrier"),
+            barrier_id: 7,
+            coordinator_state: {
+                let mut backend = store.lock().unwrap();
+                sync_snapshot_barrier_store(&mut backend)
+                    .expect("capture barriered coordinator root")
+            },
+            membership_cut: snapshot_barrier_membership_cut(&ctx),
+        };
+
+        // Model a coordinator-store commit after the barrier passed but
+        // before payload construction returned to the requesting session.
+        {
+            let mut backend = store.lock().unwrap();
+            match &mut *backend {
+                StoreBackend::Local(rs) => rs
+                    .put_local("post-barrier-coordinator-write", b"advanced root")
+                    .expect("advance coordinator root after barrier"),
+                _ => panic!("expected local store backend"),
+            }
+        }
+
+        let err = finalize_snapshot_barrier_bound_vfssend2_send_payload(
+            vec![1, 2, 3],
+            &fs_root,
+            auth_key,
+            &authorization,
+            &ctx,
+        )
+        .expect_err("post-barrier coordinator drift must refuse the send payload");
+
+        assert!(err.contains("inconsistent committed-root txg"), "{err}");
+        assert!(!err.contains("sender_authority_stale"), "{err}");
         assert!(!err.contains("expected tid="), "{err}");
     }
 
