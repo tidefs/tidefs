@@ -3113,6 +3113,16 @@ impl VfsLocalFileSystem {
                     return live_admin_error(1, err);
                 }
 
+                // The handshake may lower the transport MTU. Recheck the
+                // complete frame before key access because transport
+                // fragmentation has a hard fragment-count ceiling.
+                let negotiated_mtu = transport.mtu;
+                if let Err(err) = snap_net_payload_len_for_mtu(stream.encoded.len(), negotiated_mtu)
+                {
+                    let _ = transport.close_session(session_id, SessionCloseReason::LocalShutdown);
+                    return live_admin_error(1, format!("{err}; negotiated MTU {negotiated_mtu}"));
+                }
+
                 let auth_key = self.fs.borrow().root_authentication_key.as_bytes32();
                 let request = match build_snap_push_message(&stream.encoded, &auth_key) {
                     Ok(request) => request,
@@ -4035,8 +4045,12 @@ fn snap_net_len_u32(field: &str, len: usize) -> Result<u32, String> {
 }
 
 fn snap_net_payload_len(payload_len: usize) -> Result<u32, String> {
+    snap_net_payload_len_for_mtu(payload_len, DEFAULT_MTU)
+}
+
+fn snap_net_payload_len_for_mtu(payload_len: usize, mtu: usize) -> Result<u32, String> {
     let encoded_len = snap_net_len_u32("export payload", payload_len)?;
-    let max_payload_len = snap_net_transport_payload_max_len()?;
+    let max_payload_len = snap_net_transport_payload_max_len_for_mtu(mtu)?;
     if payload_len > max_payload_len {
         return Err(format!(
             "snapshot send: export payload is too large for tidefs-transport message admission: {payload_len} bytes (max {max_payload_len})"
@@ -4046,13 +4060,22 @@ fn snap_net_payload_len(payload_len: usize) -> Result<u32, String> {
 }
 
 fn snap_net_transport_payload_max_len() -> Result<usize, String> {
+    snap_net_transport_payload_max_len_for_mtu(DEFAULT_MTU)
+}
+
+fn snap_net_transport_payload_max_len_for_mtu(mtu: usize) -> Result<usize, String> {
     // Transport::new uses DEFAULT_MTU, while each fresh Session admits one
-    // message through DEFAULT_SEND_BUFFER_MEMORY before fragmentation. Bound
-    // the complete VSNP frame by the smaller limit, then reserve its header.
-    let fragment_message_max_len = DEFAULT_MTU
+    // message through DEFAULT_SEND_BUFFER_MEMORY before fragmentation. A
+    // handshake can negotiate a smaller MTU, and this path requires a
+    // ciphered session. Reserve one complete fragment for the cipher wire
+    // transform without duplicating its private byte-level framing here.
+    let admitted_fragments = MAX_FRAGMENTS_PER_MESSAGE
+        .checked_sub(1)
+        .ok_or_else(|| "snapshot send: VSNP transport fragment limit overflow".to_string())?;
+    let fragment_message_max_len = mtu
         .checked_sub(fragment_overhead())
         .and_then(|fragment_payload_len| {
-            fragment_payload_len.checked_mul(MAX_FRAGMENTS_PER_MESSAGE as usize)
+            fragment_payload_len.checked_mul(admitted_fragments as usize)
         })
         .ok_or_else(|| "snapshot send: VSNP transport payload limit overflow".to_string())?;
     let send_buffer_message_max_len = usize::try_from(DEFAULT_SEND_BUFFER_MEMORY)
@@ -7108,6 +7131,37 @@ mod tests {
         let oversized = max_payload_len.checked_add(1).expect("oversized length");
         assert_eq!(
             snap_net_payload_len(oversized),
+            Err(format!(
+                "snapshot send: export payload is too large for tidefs-transport message admission: {oversized} bytes (max {max_payload_len})"
+            ))
+        );
+    }
+
+    #[test]
+    fn snap_net_payload_len_honors_negotiated_mtu() {
+        let negotiated_mtu = 512;
+        let max_payload_len = snap_net_transport_payload_max_len_for_mtu(negotiated_mtu)
+            .expect("negotiated transport payload limit");
+        let admitted_fragments =
+            usize::try_from(MAX_FRAGMENTS_PER_MESSAGE - 1).expect("fragment limit fits usize");
+        assert_eq!(
+            max_payload_len + SNAP_NET_PUSH_HEADER_LEN,
+            (negotiated_mtu - fragment_overhead()) * admitted_fragments
+        );
+        assert!(
+            max_payload_len
+                < snap_net_transport_payload_max_len().expect("default transport payload limit")
+        );
+
+        let encoded_max = u32::try_from(max_payload_len).expect("transport limit fits u32");
+        assert_eq!(
+            snap_net_payload_len_for_mtu(max_payload_len, negotiated_mtu),
+            Ok(encoded_max)
+        );
+
+        let oversized = max_payload_len.checked_add(1).expect("oversized length");
+        assert_eq!(
+            snap_net_payload_len_for_mtu(oversized, negotiated_mtu),
             Err(format!(
                 "snapshot send: export payload is too large for tidefs-transport message admission: {oversized} bytes (max {max_payload_len})"
             ))
