@@ -4250,6 +4250,16 @@ impl Pool {
             self.device_layout_stats[idx] =
                 DeviceLayoutStats::with_segment_size(new_config.media_class.default_segment_size());
         }
+        let replacement_capacity = self.devices[idx].store().capacity_bytes();
+        self.device_layouts[idx] = self
+            .properties
+            .layout_policy
+            .compute(replacement_capacity)
+            .unwrap_or_else(|_| {
+                DeviceLayoutPolicy::Slice0Small
+                    .compute(replacement_capacity)
+                    .expect("Slice0Small must succeed for non-zero device")
+            });
         let total_bytes: Vec<u64> = self
             .devices
             .iter()
@@ -4270,6 +4280,12 @@ impl Pool {
         self.placement_epoch = replacement_evidence.topology_epoch;
         self.health = compute_health(&self.devices);
         self.record_health_transitions();
+
+        // The durable marker must precede this topology update. Persist the
+        // replacement labels now rather than waiting for a later data write,
+        // so a reopen against the new topology can resume from the marker.
+        // Pending evidence still does not authorize old-device detach.
+        self.persist_active_labels_if_needed()?;
 
         Ok(())
     }
@@ -4391,8 +4407,14 @@ impl Pool {
                 });
             }
             evidence.state = ReplacementRebuildStatusState::Canceled;
+            evidence.topology_epoch = self.placement_epoch.saturating_add(1).max(1);
             persist_device_replacement_evidence(&self.config.root_path, &evidence)?;
+            let canceled_topology_epoch = evidence.topology_epoch;
             self.replacement_evidence = Some(evidence);
+
+            // Commit the restored old topology only after cancellation is durable.
+            self.placement_epoch = canceled_topology_epoch;
+            self.persist_active_labels_if_needed()?;
             return Ok(());
         }
 
@@ -4453,6 +4475,18 @@ impl Pool {
                         replacement.old_config.media_class.default_segment_size(),
                     );
             }
+            let restored_capacity = self.devices[replacement.device_index]
+                .store()
+                .capacity_bytes();
+            self.device_layouts[replacement.device_index] = self
+                .properties
+                .layout_policy
+                .compute(restored_capacity)
+                .unwrap_or_else(|_| {
+                    DeviceLayoutPolicy::Slice0Small
+                        .compute(restored_capacity)
+                        .expect("Slice0Small must succeed for non-zero device")
+                });
             let total_bytes: Vec<u64> = self
                 .devices
                 .iter()
@@ -4468,6 +4502,11 @@ impl Pool {
         self.placement_epoch = evidence.topology_epoch;
         self.health = compute_health(&self.devices);
         self.record_health_transitions();
+
+        // The canceled evidence is durable before this label update restores
+        // the old topology. Cancellation still leaves old-device detach
+        // unsafe until a later replacement has stable rebuild evidence.
+        self.persist_active_labels_if_needed()?;
         Ok(())
     }
 
@@ -9302,6 +9341,89 @@ mod tests {
     }
 
     #[test]
+    fn replacement_evidence_reopens_new_topology_from_persisted_labels() {
+        let root = temp_dir("replace-evidence-reopen-new-topology");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let old_path = root.join("pool0.img");
+        let new_path = root.join("pool1.img");
+        for (path, size) in [(&old_path, 2 * 1024 * 1024), (&new_path, 4 * 1024 * 1024)] {
+            let file = std::fs::File::create(path).unwrap();
+            file.set_len(size).unwrap();
+        }
+        let mut config = PoolConfig {
+            name: "testpool".into(),
+            root_path: root.join("metadata"),
+            devices: vec![DeviceConfig {
+                media_class: Default::default(),
+                path: old_path.clone(),
+                backing: DeviceBacking::RegularFileDev,
+                class: DeviceClass::Data,
+                kind: DeviceKind::Block {
+                    path: old_path.clone(),
+                },
+                encryption: None,
+                compression: None,
+            }],
+        };
+        let replacement_config = DeviceConfig {
+            media_class: Default::default(),
+            path: new_path.clone(),
+            backing: DeviceBacking::RegularFileDev,
+            class: DeviceClass::Data,
+            kind: DeviceKind::Block {
+                path: new_path.clone(),
+            },
+            encryption: None,
+            compression: None,
+        };
+        let mut pool =
+            Pool::create(config.clone(), PoolProperties::default(), &test_options()).unwrap();
+
+        pool.replace_device(&old_path, replacement_config.clone(), &test_options())
+            .unwrap();
+        let before_reopen = pool
+            .replacement_rebuild_evidence_status()
+            .expect("replacement evidence before reopen");
+
+        let mut label_bytes = vec![0u8; pool_label::POOL_LABEL_SIZE];
+        let mut label_file = std::fs::File::open(&new_path).unwrap();
+        label_file.read_exact(&mut label_bytes).unwrap();
+        let label = pool_label::decode_label(&label_bytes).expect("replacement label");
+        let layout_bytes = pool_label::decode_device_layout_v1_bytes(&label_bytes)
+            .unwrap()
+            .expect("replacement label layout");
+        let layout = decode_device_layout_v1(&layout_bytes).expect("replacement device layout");
+        assert_eq!(label.pool_guid, pool.pool_guid());
+        assert_eq!(label.device_guid, pool.device_guid_for_index(0));
+        assert_eq!(label.topology_generation, before_reopen.topology_epoch);
+        assert_eq!(label.pool_state, PoolState::Active);
+        assert_eq!(
+            layout.device_size_bytes,
+            pool.devices[0].store().capacity_bytes()
+        );
+
+        config.devices[0] = replacement_config;
+        drop(pool);
+
+        let reopened = Pool::open(config, PoolProperties::default(), &test_options()).unwrap();
+        let replayed = reopened
+            .replacement_rebuild_evidence_status()
+            .expect("replacement evidence after new-topology reopen");
+        assert_eq!(replayed.state, ReplacementRebuildStatusState::Resuming);
+        assert_eq!(replayed.old_member, before_reopen.old_member);
+        assert_eq!(replayed.new_member, before_reopen.new_member);
+        assert_eq!(replayed.topology_epoch, before_reopen.topology_epoch);
+        assert!(replayed.evidence_replayable_after_reopen);
+        assert_eq!(
+            replayed.detach_decision,
+            ReplacementDetachDecision::UnsafeToDetach
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn replayed_replacement_cancel_persists_terminal_evidence() {
         let (root, old_path, config, replacement_config, mut pool) =
             replacement_replay_test_pool("replace-evidence-reopen-cancel");
@@ -9326,6 +9448,7 @@ mod tests {
             canceled.detach_decision,
             ReplacementDetachDecision::UnsafeToDetach
         );
+        assert_eq!(reopened.placement_epoch(), canceled.topology_epoch);
         drop(reopened);
 
         let reopened = Pool::open(config, PoolProperties::default(), &test_options()).unwrap();
@@ -9334,6 +9457,7 @@ mod tests {
             .expect("replayed canceled replacement evidence");
         assert_eq!(canceled.state, ReplacementRebuildStatusState::Canceled);
         assert!(canceled.evidence_replayable_after_reopen);
+        assert_eq!(reopened.placement_epoch(), canceled.topology_epoch);
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -9485,9 +9609,9 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let d1 = root.join("pool0.img");
         let d2 = root.join("pool1.img");
-        for path in [&d1, &d2] {
+        for (path, size) in [(&d1, 2 * 1024 * 1024), (&d2, 4 * 1024 * 1024)] {
             let file = std::fs::File::create(path).unwrap();
-            file.set_len(2 * 1024 * 1024).unwrap();
+            file.set_len(size).unwrap();
         }
         let config = PoolConfig {
             name: "testpool".into(),
@@ -9535,6 +9659,16 @@ mod tests {
             pool.config.devices[0].kind,
             DeviceKind::Block { .. }
         ));
+        assert_eq!(
+            pool.device_layouts[0].device_size_bytes,
+            pool.devices[0].store().capacity_bytes()
+        );
+        let mut label_bytes = vec![0u8; pool_label::POOL_LABEL_SIZE];
+        let mut label_file = std::fs::File::open(&d1).unwrap();
+        label_file.read_exact(&mut label_bytes).unwrap();
+        let label = pool_label::decode_label(&label_bytes).unwrap();
+        assert_eq!(label.device_guid, pool.device_guid_for_index(0));
+        assert_eq!(label.topology_generation, pool.placement_epoch());
         let val = pool.get(IoClass::Data, key).unwrap();
         assert_eq!(val, Some(b"before".to_vec()));
 
