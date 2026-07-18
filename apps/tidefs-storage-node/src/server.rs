@@ -79,11 +79,11 @@ use tidefs_send_stream::{
 use tidefs_transport::carrier_selection::CarrierPolicy;
 use tidefs_transport::connection_registry::ConnectionRegistry;
 use tidefs_transport::{
-    build_read_responses, send_replication_msg, send_segment_fetch_response, MessagePriority,
-    ObjectTransferMessage, PlacementMap as TransportPlacementMap, PlacementMapRefusalReason,
-    PlacementVersionTracker, ReplicationMessage, SegmentFetchRequest, SegmentFetchResponse,
-    SessionCloseReason, SyncEntry, Transport, TransportError, MAX_CHUNK_PAYLOAD,
-    SEGMENT_FETCH_REQUEST_MAGIC,
+    build_read_responses, send_replication_msg, send_segment_fetch_response, BroadcastConfig,
+    BroadcastFailureMode, MessagePriority, ObjectTransferMessage,
+    PlacementMap as TransportPlacementMap, PlacementMapRefusalReason, PlacementVersionTracker,
+    ReplicationMessage, SegmentFetchRequest, SegmentFetchResponse, SessionCloseReason, SyncEntry,
+    Transport, TransportError, MAX_CHUNK_PAYLOAD, SEGMENT_FETCH_REQUEST_MAGIC,
 };
 use tidefs_types_pool_label_core::PoolRedundancyPolicy as LabelPoolRedundancyPolicy;
 
@@ -1036,6 +1036,38 @@ fn active_snapshot_barrier_outcome(
     }
 }
 
+/// Fan out a barrier through transport-owned session admission.
+///
+/// The peer-to-session map can become stale while the coordinator syncs its
+/// local store. `broadcast_send` rechecks that each selected session is still
+/// established immediately before sending instead of turning a closed session
+/// into a full barrier timeout.
+fn send_snapshot_barrier_requests(
+    transport: &mut Transport,
+    peer_sessions: &BTreeMap<u64, tidefs_transport::SessionId>,
+    request_bytes: &[u8],
+) -> Result<(), (u64, String)> {
+    let target_sessions = peer_sessions.values().copied().collect::<Vec<_>>();
+    let results = transport.broadcast_send(
+        &target_sessions,
+        request_bytes,
+        MessagePriority::Control,
+        &BroadcastConfig {
+            failure_mode: BroadcastFailureMode::FailFast,
+            ..BroadcastConfig::default()
+        },
+    );
+
+    let Some((failed_session, error)) = results.failed().into_iter().next() else {
+        return Ok(());
+    };
+    let peer_id = peer_sessions
+        .iter()
+        .find_map(|(&peer_id, &session_id)| (session_id == failed_session).then_some(peer_id))
+        .expect("barrier broadcast failures belong to selected peer sessions");
+    Err((peer_id, error.to_string()))
+}
+
 fn run_snapshot_barrier_before_send(
     session_id: tidefs_transport::SessionId,
     ctx: &SessionContext,
@@ -1140,20 +1172,17 @@ fn run_snapshot_barrier_before_send_with_config(
         *active = Some(coordinator);
     }
 
-    for (&peer_id, &peer_session) in &peer_sessions {
-        let send_result = ctx.transport.lock().unwrap().send_priority(
-            peer_session,
-            &request_bytes,
-            MessagePriority::Control,
-        );
-        if let Err(err) = send_result {
-            clear_active_snapshot_barrier(ctx, barrier_id);
-            return Err(SnapshotBarrierSendError::SendFailed {
-                barrier_id,
-                peer_id,
-                reason: err.to_string(),
-            });
-        }
+    let send_result = {
+        let mut transport = ctx.transport.lock().unwrap();
+        send_snapshot_barrier_requests(&mut transport, &peer_sessions, &request_bytes)
+    };
+    if let Err((peer_id, reason)) = send_result {
+        clear_active_snapshot_barrier(ctx, barrier_id);
+        return Err(SnapshotBarrierSendError::SendFailed {
+            barrier_id,
+            peer_id,
+            reason,
+        });
     }
 
     loop {
@@ -4326,21 +4355,18 @@ impl StorageNode {
         }
 
         // Fan out after the coordinator is visible so fast responses are not lost.
-        for (&peer_id, &session_id) in &peer_sessions {
-            let send_result = self.transport.lock().unwrap().send_priority(
-                session_id,
-                &request_bytes,
-                MessagePriority::Control,
+        let send_result = {
+            let mut transport = self.transport.lock().unwrap();
+            send_snapshot_barrier_requests(&mut transport, &peer_sessions, &request_bytes)
+        };
+        if let Err((peer_id, reason)) = send_result {
+            *self.active_barrier.lock().unwrap() = None;
+            eprintln!(
+                "[storage-node] barrier {barrier_id}: send to peer {peer_id} failed: {reason}"
             );
-            if let Err(e) = send_result {
-                *self.active_barrier.lock().unwrap() = None;
-                eprintln!(
-                    "[storage-node] barrier {barrier_id}: send to peer {peer_id} failed: {e:?}"
-                );
-                return Err(format!(
-                    "barrier {barrier_id} send to peer {peer_id} failed: {e}"
-                ));
-            }
+            return Err(format!(
+                "barrier {barrier_id} send to peer {peer_id} failed: {reason}"
+            ));
         }
 
         eprintln!(
@@ -7163,6 +7189,42 @@ mod cluster_pool_handler_tests {
             frame_response_priority(&Frame::Send { key: Vec::new() }),
             MessagePriority::Data
         );
+    }
+
+    #[test]
+    fn snapshot_barrier_fanout_rejects_session_closed_after_selection() {
+        let mut transport = Transport::new(1);
+        let peer_session_id = tidefs_transport::SessionId::new(2);
+        let peer_session = Arc::new(Mutex::new(tidefs_transport::session::Session::new(
+            peer_session_id,
+            1,
+            2,
+            tidefs_transport::TransportAddr::Tcp("127.0.0.1:9002".parse().unwrap()),
+            tidefs_transport::EndpointFamily::LocalEmbed,
+            tidefs_transport::TransportBackendKind::Tcp,
+        )));
+        peer_session.lock().unwrap().state = tidefs_transport::session::SessionState::Established {
+            since: tidefs_transport::HlcTimestamp::new(0, 0),
+        };
+        transport
+            .sessions
+            .insert(peer_session_id, Arc::clone(&peer_session));
+
+        // Model the local-sync window: fanout retains the selected binding,
+        // but the transport session closes before the request is sent.
+        let peer_sessions = BTreeMap::from([(2, peer_session_id)]);
+        peer_session.lock().unwrap().state = tidefs_transport::session::SessionState::Closed {
+            reason: SessionCloseReason::TransportError,
+        };
+
+        let request = protocol::encode(&Frame::SnapshotBarrier {
+            barrier_id: 7,
+            snapshot_name: "send-cut".into(),
+        });
+        let err = send_snapshot_barrier_requests(&mut transport, &peer_sessions, &request)
+            .expect_err("closed selected session must fail fanout immediately");
+
+        assert_eq!(err, (2, "session not established".into()));
     }
 
     #[test]
