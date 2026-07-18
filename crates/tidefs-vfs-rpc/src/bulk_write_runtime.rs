@@ -316,7 +316,7 @@ where
         &self,
         now: Instant,
     ) -> Result<usize, VfsRpcBulkWriteRuntimeError> {
-        let terminal_error = self.process_terminal_events().err();
+        let mut first_error = self.process_terminal_events().err();
         let expired = {
             let state = self.state.lock().unwrap();
             let timeout = state.adapter.config().request_timeout;
@@ -331,46 +331,56 @@ where
         };
 
         for (key, pending) in &expired {
-            let abort = self.bulk.abort_vfs_rpc_handoff(
-                key.connection_id,
-                key.token,
-                pending.request.header.op_id.0,
-                VfsRpcBulkHandoff::WriteUpload,
-                BulkAbortReason::Timeout,
-            )?;
-            let response = {
-                let mut state = self.state.lock().unwrap();
-                let record = state.adapter.abort_bulk_handoff(&abort)?;
-                ensure_write_upload(
-                    record.connection_id,
-                    record.token,
-                    record.direction,
-                    record.handoff,
-                )?;
-                let removed = state.pending_writes.remove(key).ok_or(
-                    VfsRpcBulkWriteRuntimeError::MissingPendingWrite {
-                        connection_id: key.connection_id,
-                        token: key.token,
-                    },
-                )?;
-                if removed.stream_id != abort.stream_id || removed.request != pending.request {
-                    return Err(VfsRpcBulkWriteRuntimeError::ConflictingPendingWrite {
-                        connection_id: key.connection_id,
-                        token: key.token,
-                    });
-                }
-                VfsRpcResponse::error(
-                    removed.request.header.op_id,
-                    removed.request.header.method,
-                    Errno::ETIMEDOUT,
-                )?
-            };
-            self.send_control_reply(key.connection_id, control_response_frame(&response)?)?;
+            if let Err(error) = self.expire_write_timeout(*key, pending) {
+                first_error.get_or_insert(error);
+            }
         }
-        match terminal_error {
+        match first_error {
             Some(error) => Err(error),
             None => Ok(expired.len()),
         }
+    }
+
+    fn expire_write_timeout(
+        &self,
+        key: PendingWriteKey,
+        pending: &PendingWrite,
+    ) -> Result<(), VfsRpcBulkWriteRuntimeError> {
+        let abort = self.bulk.abort_vfs_rpc_handoff(
+            key.connection_id,
+            key.token,
+            pending.request.header.op_id.0,
+            VfsRpcBulkHandoff::WriteUpload,
+            BulkAbortReason::Timeout,
+        )?;
+        let response = {
+            let mut state = self.state.lock().unwrap();
+            let record = state.adapter.abort_bulk_handoff(&abort)?;
+            ensure_write_upload(
+                record.connection_id,
+                record.token,
+                record.direction,
+                record.handoff,
+            )?;
+            let removed = state.pending_writes.remove(&key).ok_or(
+                VfsRpcBulkWriteRuntimeError::MissingPendingWrite {
+                    connection_id: key.connection_id,
+                    token: key.token,
+                },
+            )?;
+            if removed.stream_id != abort.stream_id || removed.request != pending.request {
+                return Err(VfsRpcBulkWriteRuntimeError::ConflictingPendingWrite {
+                    connection_id: key.connection_id,
+                    token: key.token,
+                });
+            }
+            VfsRpcResponse::error(
+                removed.request.header.op_id,
+                removed.request.header.method,
+                Errno::ETIMEDOUT,
+            )?
+        };
+        self.send_control_reply(key.connection_id, control_response_frame(&response)?)
     }
 
     fn process_terminal_events(&self) -> Result<(), VfsRpcBulkWriteRuntimeError> {
@@ -720,11 +730,16 @@ mod tests {
     #[derive(Default)]
     struct RecordingControlReplySink {
         replies: Mutex<Vec<(SessionId, ControlServiceFrame)>>,
+        failures_remaining: Mutex<usize>,
     }
 
     impl RecordingControlReplySink {
         fn replies(&self) -> Vec<(SessionId, ControlServiceFrame)> {
             self.replies.lock().unwrap().clone()
+        }
+
+        fn fail_next_replies(&self, count: usize) {
+            *self.failures_remaining.lock().unwrap() = count;
         }
     }
 
@@ -734,6 +749,14 @@ mod tests {
             session_id: SessionId,
             frame: ControlServiceFrame,
         ) -> Result<(), ControlServiceDispatchError> {
+            let mut failures_remaining = self.failures_remaining.lock().unwrap();
+            if *failures_remaining > 0 {
+                *failures_remaining -= 1;
+                return Err(ControlServiceDispatchError::ReplyRejected {
+                    reason: "injected reply failure".to_string(),
+                });
+            }
+            drop(failures_remaining);
             self.replies.lock().unwrap().push((session_id, frame));
             Ok(())
         }
@@ -878,8 +901,19 @@ mod tests {
         len: u64,
         now: Instant,
     ) -> VfsRpcRequest {
+        admitted_write_for_op(runtime, handle, token, len, 2, now)
+    }
+
+    fn admitted_write_for_op(
+        runtime: &Arc<VfsRpcBulkWriteRuntime<RecordingDispatch>>,
+        handle: crate::VfsRpcHandle,
+        token: BulkToken,
+        len: u64,
+        op_id: u64,
+        now: Instant,
+    ) -> VfsRpcRequest {
         let request = VfsRpcRequest::new(
-            OpId(2),
+            OpId(op_id),
             3,
             5,
             REQ_FLAG_BULK_PENDING,
@@ -1191,5 +1225,27 @@ mod tests {
             response(replies[0].1.clone()).header.errno,
             Errno::ETIMEDOUT
         );
+    }
+
+    #[test]
+    fn timeout_reply_error_does_not_block_later_retirement() {
+        let (runtime, target, sink) = runtime(Duration::from_millis(10));
+        let handle = create_handle(&runtime);
+        let data_dispatch = runtime.data_dispatch();
+        let first = accept_write_transfer(&data_dispatch, 2, 21, 3);
+        let second = accept_write_transfer(&data_dispatch, 3, 22, 3);
+        let now = Instant::now();
+        admitted_write_for_op(&runtime, handle.clone(), first, 3, 2, now);
+        admitted_write_for_op(&runtime, handle, second, 3, 3, now);
+        sink.fail_next_replies(1);
+
+        assert!(runtime
+            .expire_write_timeouts(now + Duration::from_millis(10))
+            .is_err());
+        assert!(target.writes().is_empty());
+        assert_eq!(runtime.pending_write_count(), 0);
+        assert_eq!(runtime.bulk.active_transfer_count(SESSION_ID.0), 0);
+        assert_eq!(runtime.state.lock().unwrap().adapter.pending_bulk_len(), 0);
+        assert_eq!(sink.replies().len(), 1);
     }
 }
