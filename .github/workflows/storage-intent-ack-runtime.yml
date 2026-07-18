@@ -19,7 +19,7 @@ jobs:
       CARGO_HOME: /var/tmp/tidefs-ci/cargo-home
       CARGO_INCREMENTAL: 0
       CARGO_TARGET_DIR: /var/tmp/tidefs-ci/cargo-target/${{ github.run_id }}-${{ github.run_attempt }}-ack-runtime
-      OUTPUT_DIR: /tmp/tidefs-validation/storage-intent-ack-runtime
+      OUTPUT_DIR: /tmp/tidefs-validation/storage-intent-ack-runtime/${{ github.run_id }}-${{ github.run_attempt }}
 
     steps:
       - name: Checkout
