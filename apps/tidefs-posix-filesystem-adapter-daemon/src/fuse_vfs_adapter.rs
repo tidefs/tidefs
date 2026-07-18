@@ -4771,6 +4771,7 @@ impl FuseVfsAdapter {
         };
         self.file_handles.lock().unwrap().inc_open_ref(ino);
         self.remember_writeback_inode(ino);
+        self.mmap_coherency.register(ino, 0);
         Ok(VfsCreateDispatch {
             attr,
             adapter_fh,
@@ -6190,6 +6191,7 @@ impl FuseVfsAdapter {
                     .unwrap()
                     .inc_open_ref(attr.inode_id.get());
                 self.remember_writeback_inode(attr.inode_id.get());
+                self.mmap_coherency.register(attr.inode_id.get(), 0);
                 Ok(VfsCreateDispatch {
                     attr,
                     adapter_fh,
@@ -9690,6 +9692,7 @@ impl FuseVfsAdapter {
         ));
         self.file_handles.lock().unwrap().inc_open_ref(ino);
         self.remember_writeback_inode(ino);
+        self.mmap_coherency.register(ino, 0);
         Ok(VfsOpenDispatch {
             adapter_fh,
             open_flags: fuse_flags,
@@ -20747,6 +20750,7 @@ mod tests {
             .expect("create dispatch");
         let inode = created.attr.inode_id.get();
 
+        assert!(fixture.adapter.mmap_coherency.is_registered(inode));
         assert_eq!(
             fixture
                 .adapter
@@ -20771,6 +20775,7 @@ mod tests {
                 .open_ref_count(inode),
             0
         );
+        assert!(!fixture.adapter.mmap_coherency.is_registered(inode));
     }
 
     #[test]
