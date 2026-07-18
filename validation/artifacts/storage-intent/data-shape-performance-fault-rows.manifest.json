@@ -5,13 +5,13 @@
   "validation_tier": "qemu-guest",
   "scope": "QEMU-guest partial data-shape fault observations plus explicitly blocked performance and unexecuted family rows; outcome=SKIP pass=5 product_fail=0 skip=7",
   "artifact_path": "validation/artifacts/storage-intent/data-shape-performance-fault-rows.json",
-  "content_digest": "blake3:d98946114203e096479d3de5306d6e5f5ce02e0f26f6b264bb218197d06fce62",
-  "run_id": "29644583929/1",
-  "source_ref": "fb1490f5bfe2e662e180f11f54bc03bebb5a7f48",
+  "content_digest": "blake3:1b9f1c46172b1572458b37feb8860d8f74cdb5e593bdb0cea228c7a611907ca9",
+  "run_id": "29649529763/1",
+  "source_ref": "f45e387728d4a166814b4d453c3a233ce3397d4f",
   "outcome": "skip",
   "residual_risk": "Elapsed guest timings are diagnostic observations without a stable CPU, workload, topology, or comparator baseline and are not a performance claim. Read amplification, key epochs, illegal dedupe domains, archive recall, coalescing, rebake, and cross-family malformed-frame coverage remain unexecuted. Local EC helper reconstruction and under-width refusal do not prove pool placement, distributed recovery, archive serving, degraded-read product safety, or availability.",
   "source": "qemu-fuse-vm-data-shape-helper-runtime-v1",
-  "generated_at": "2026-07-18T12:36:23Z",
+  "generated_at": "2026-07-18T15:12:41Z",
   "blocking_issues": [
     {
       "repo": "tidefs/tidefs",

@@ -4,7 +4,7 @@ issue = "https://github.com/tidefs/tidefs/issues/1981"
 validation_tier = "source-model"
 review_scope = "claims-gate review for source-model policy/result boundaries and partial qemu-guest helper execution and fault evidence"
 review_outcome = "blocked"
-decision = "The claim remains blocked. QEMU-guest helper execution now covers Zstd/LZ4 round trips, stored-frame digest mismatch, malformed compression frames, AEAD wrong-key/tamper refusal, and local EC reconstruction/under-width refusal. Mounted compiled-policy receipts, the skipped data-shape families, performance rows, lifecycle authority, and completed outer carrier validation remain missing; run 29644583929 timed out later in smoke-mount after both artifacts were captured and digest/provenance validated."
+decision = "The claim remains blocked. QEMU-guest helper execution now covers Zstd/LZ4 round trips, stored-frame digest mismatch, malformed compression frames, AEAD wrong-key/tamper refusal, and local EC reconstruction/under-width refusal. Dedicated run 29649529763 completed the isolated Linux 7.0 carrier and validated both artifacts, while mounted compiled-policy receipts, the skipped data-shape families, stable performance rows, and lifecycle authority remain missing."
 
 reviewed_artifacts = [
   "validation/artifacts/storage-intent/data-shape-policy-evidence.json",
@@ -29,7 +29,6 @@ missing_evidence = [
   "stable CPU-cost and read-amplification rows with workload, topology, and refusal budgets",
   "persisted encryption key-epoch lifecycle rows",
   "cross-family malformed transform-frame coverage beyond compression helpers",
-  "completed outer fuse-vm-test carrier after helper evidence capture; run 29644583929 timed out later during smoke-mount",
 ]
 
 non_claim_boundaries = [
@@ -39,13 +38,13 @@ non_claim_boundaries = [
 ]
 
 [runtime_evidence]
-run_id = "29644583929/1"
-source_ref = "fb1490f5bfe2e662e180f11f54bc03bebb5a7f48"
-workflow_url = "https://github.com/tidefs/tidefs/actions/runs/29644583929"
+run_id = "29649529763/1"
+source_ref = "f45e387728d4a166814b4d453c3a233ce3397d4f"
+workflow_url = "https://github.com/tidefs/tidefs/actions/runs/29649529763"
 transform_summary = "6 pass, 0 product-fail, 4 skip"
 performance_fault_summary = "5 pass, 0 product-fail, 7 skip"
 artifact_validation = "both manifests matched artifact BLAKE3 digests, source SHA, run id, qemu-guest tier, expected SKIP outcome, runtime_execution_produced=true, and blocker #1981"
-outer_carrier_outcome = "fuse-vm-test timed out after 900 seconds during the later smoke-mount phase; helper evidence capture and host validation completed first"
+outer_carrier_outcome = "dedicated data-shape mode completed with qemu_status=0, one completion marker, 5 harness passes, 0 product failures, and 0 environment refusals"
 
 [registry_effect]
 claims_toml_changed = true

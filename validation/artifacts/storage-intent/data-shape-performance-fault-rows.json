@@ -2,9 +2,9 @@
   "report_version": 2,
   "claim_id": "storage.intent.data_shape_honesty.v1",
   "issue": "https://github.com/tidefs/tidefs/issues/1981",
-  "run_id": "29644583929/1",
-  "source_ref": "fb1490f5bfe2e662e180f11f54bc03bebb5a7f48",
-  "generated_at": "2026-07-18T12:36:23Z",
+  "run_id": "29649529763/1",
+  "source_ref": "f45e387728d4a166814b4d453c3a233ce3397d4f",
+  "generated_at": "2026-07-18T15:12:41Z",
   "validation_tier": "qemu-guest",
   "command": "storage-intent-data-shape-runtime-validation",
   "artifact_scope": "QEMU-guest partial data-shape fault observations plus explicitly blocked performance and unexecuted family rows",
@@ -34,11 +34,11 @@
       "observation": {
         "source_rows": [
           {
-            "guest_elapsed_ns": 1253481,
+            "guest_elapsed_ns": 1434620,
             "row": "compression-zstd-helper-roundtrip"
           },
           {
-            "guest_elapsed_ns": 109395,
+            "guest_elapsed_ns": 118111,
             "row": "compression-lz4-helper-roundtrip"
           },
           {
@@ -50,11 +50,11 @@
             "row": "malformed-compression-frame-refusal"
           },
           {
-            "guest_elapsed_ns": 1490865,
+            "guest_elapsed_ns": 1147942,
             "row": "encryption-aead-helper-roundtrip-refusal"
           },
           {
-            "guest_elapsed_ns": 27161,
+            "guest_elapsed_ns": 16241,
             "row": "ec-helper-degraded-reconstruction-under-width-refusal"
           }
         ]
@@ -104,7 +104,7 @@
       "operation": "reconstruct one missing local EC helper shard",
       "observation": {
         "degraded_available_shards": 2,
-        "guest_elapsed_ns": 27161,
+        "guest_elapsed_ns": 16241,
         "profile": "local-helper-2-plus-1",
         "rebuilt_shard_indexes": [
           0
@@ -141,7 +141,7 @@
       "observation": {
         "algorithm": "chacha20-poly1305-helper",
         "decoded_digest": "blake3:23f54976d3054645db833986d8029ba60ade918703cfd560e3158fb687d034e4",
-        "guest_elapsed_ns": 1490865,
+        "guest_elapsed_ns": 1147942,
         "key_material_serialized": false,
         "round_trip_exact": true,
         "source_digest": "blake3:23f54976d3054645db833986d8029ba60ade918703cfd560e3158fb687d034e4",
@@ -201,7 +201,7 @@
       "operation": "refuse one-of-three local EC helper input for a 2+1 profile",
       "observation": {
         "degraded_available_shards": 2,
-        "guest_elapsed_ns": 27161,
+        "guest_elapsed_ns": 16241,
         "profile": "local-helper-2-plus-1",
         "rebuilt_shard_indexes": [
           0
