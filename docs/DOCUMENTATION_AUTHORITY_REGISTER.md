@@ -566,7 +566,6 @@ surface beyond adding `docs/CLAIMS_GATE_POLICY.md`, which was already scanned.
 | `docs/FUSE_BINDING_STRATEGY_AND_FEATURE_MATRIX_P1-05.md` | Historical input | Imported production-design FUSE binding strategy describing the `fuser`-based binding, capability negotiation, and feature matrix. Useful reference, but full per-capability source alignment verification is too large for this slice. |
 | `docs/DEBUGGING_WORKFLOWS.md` | Deleted | Deleted by #1779 after #1725 merged and #1722 closed. Current repository build entry points live in `README.md`; CI lane and artifact authority lives in `docs/GITHUB_CI.md`; xfstests dispatch and artifact details live in `docs/XFSTESTS_DISPATCH_CONTRACT.md`; source-owned command help and scoreboard behavior remain in the relevant binaries and validation code. |
 | `docs/DATASET_FEATURE_FLAGS_DESIGN.md` | Historical input | Retained only as a provenance pointer while active issue #1842 owns the remaining `xtask/tidefs-xtask/src/cluster.rs` citations and source comments still consume the feature-flag type vocabulary. Current authority lives in `crates/tidefs-types-dataset-feature-flags-core/src/lib.rs`, source callers, `validation/claims.toml`, and the claims gate; this file is not a public compatibility promise or mounted feature-negotiation claim. |
-| `docs/SPACEMAP_ALLOCATOR_DESIGN.md` | Historical input | Retained only as a provenance pointer while active issue #1842 owns the remaining `xtask/tidefs-xtask/src/storage.rs` citation. Current authority lives in `crates/tidefs-spacemap-allocator/src/lib.rs`, source callers, current capacity/storage-intent authority, `validation/claims.toml`, and the claims gate; this file is not runtime allocator proof, capacity authority, or an OpenZFS comparison surface. |
 | `docs/POOL_IMPORT_EXPORT_DEVICE_TOPOLOGY_DESIGN.md` | Current spec | Scoped source-backed summary for the current pool-label, pool-scan/import, local import/export, and device-manager code paths. It is not product-readiness evidence for hot spares, evacuation, cluster ownership, online topology conversion, hardware-failure survival, availability, operational safety, or incumbent-comparison claims. |
 
 ### Remaining Imported Design Surface (TFR-019 / #512)
@@ -676,6 +675,18 @@ validate directory-index completeness, lookup or readdir semantics,
 representation migration, crash consistency, namespace or POSIX completeness,
 performance, production or release readiness, or OpenZFS/ZAP parity and
 successor/comparator wording.
+
+### Spacemap Allocator Historical Root Deletion (TFR-019 / #1800)
+
+Issue #1800 deleted the imported spacemap-allocator root after issue #1842
+removed its last xtask fixture dependency and no live source reference still
+required it. Current behavior remains source-owned by
+`crates/tidefs-spacemap-allocator/` and its callers. Current capacity and
+storage-intent boundaries remain in their focused authority docs. The deleted
+root's lineage remains in git, issue #1800, and its pull request only. This
+deletion does not implement or validate allocator completeness, fragmentation
+behavior, space accounting, mounted capacity semantics, crash recovery,
+performance, production or release readiness, or OpenZFS/Ceph-class behavior.
 
 ## Incumbent Comparison Audit Slice (#931)
 
