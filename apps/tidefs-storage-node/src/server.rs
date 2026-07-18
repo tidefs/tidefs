@@ -861,10 +861,33 @@ fn build_snapshot_barrier_bound_vfssend2_send_payload(
     auth_key: RootAuthenticationKey,
     config: &StorageNodeConfig,
     key: &[u8],
-    expected_root: &vfs::CommittedRootSummary,
+    authorization: &SnapshotBarrierSendAuthorization,
+    ctx: &SessionContext,
 ) -> Result<Vec<u8>, String> {
     let payload = build_bridged_vfssend2_send_payload(fs, fs_root, auth_key, config, key)?;
-    ensure_vfssend2_send_root_unchanged(fs_root, auth_key, expected_root)?;
+    finalize_snapshot_barrier_bound_vfssend2_send_payload(
+        payload,
+        fs_root,
+        auth_key,
+        authorization,
+        ctx,
+    )
+}
+
+fn finalize_snapshot_barrier_bound_vfssend2_send_payload(
+    payload: Vec<u8>,
+    fs_root: &Path,
+    auth_key: RootAuthenticationKey,
+    authorization: &SnapshotBarrierSendAuthorization,
+    ctx: &SessionContext,
+) -> Result<Vec<u8>, String> {
+    ensure_vfssend2_send_root_unchanged(fs_root, auth_key, &authorization.target_root)?;
+    ensure_snapshot_barrier_membership_current(
+        authorization.barrier_id,
+        &authorization.membership_cut,
+        ctx,
+    )
+    .map_err(|err| format!("snapshot barrier before VFSSEND2 send: {err}"))?;
     Ok(payload)
 }
 
@@ -1006,6 +1029,18 @@ fn snapshot_barrier_send_report_with_coordinator_state(
 struct SnapshotBarrierMembershipCut {
     epoch: u64,
     peer_ids: BTreeSet<u64>,
+}
+
+#[derive(Debug)]
+struct CompletedSnapshotBarrier {
+    report: SnapshotBarrierSendReport,
+    membership_cut: SnapshotBarrierMembershipCut,
+}
+
+struct SnapshotBarrierSendAuthorization {
+    target_root: vfs::CommittedRootSummary,
+    barrier_id: u64,
+    membership_cut: SnapshotBarrierMembershipCut,
 }
 
 fn snapshot_barrier_membership_cut(ctx: &SessionContext) -> SnapshotBarrierMembershipCut {
@@ -1201,7 +1236,7 @@ fn run_snapshot_barrier_before_send(
     session_id: tidefs_transport::SessionId,
     ctx: &SessionContext,
     key: &[u8],
-) -> Result<SnapshotBarrierSendReport, SnapshotBarrierSendError> {
+) -> Result<CompletedSnapshotBarrier, SnapshotBarrierSendError> {
     run_snapshot_barrier_before_send_with_config(
         session_id,
         ctx,
@@ -1215,7 +1250,7 @@ fn run_snapshot_barrier_before_send_with_config(
     ctx: &SessionContext,
     key: &[u8],
     config: SnapshotBarrierConfig,
-) -> Result<SnapshotBarrierSendReport, SnapshotBarrierSendError> {
+) -> Result<CompletedSnapshotBarrier, SnapshotBarrierSendError> {
     let barrier_id = allocate_barrier_id();
     let snapshot_name = snapshot_barrier_send_label(barrier_id, key);
     let membership_cut = snapshot_barrier_membership_cut(ctx);
@@ -1305,13 +1340,17 @@ fn run_snapshot_barrier_before_send_with_config(
         abort_snapshot_barrier_if_membership_stale(barrier_id, &membership_cut, ctx)?;
         let outcome = active_snapshot_barrier_outcome(ctx, barrier_id)?;
         if let Some(outcome) = outcome {
-            return finish_active_snapshot_barrier_before_send(
+            let report = finish_active_snapshot_barrier_before_send(
                 barrier_id,
                 coordinator_state,
                 outcome,
                 &membership_cut,
                 ctx,
-            );
+            )?;
+            return Ok(CompletedSnapshotBarrier {
+                report,
+                membership_cut,
+            });
         }
         std::thread::sleep(Duration::from_millis(1));
     }
@@ -1323,11 +1362,12 @@ fn require_snapshot_barrier_before_send(
     fs_root: &Path,
     auth_key: RootAuthenticationKey,
     key: &[u8],
-) -> Result<vfs::CommittedRootSummary, String> {
+) -> Result<SnapshotBarrierSendAuthorization, String> {
     let target_root = validate_vfssend2_send_request(fs_root, auth_key, key)?;
 
     match run_snapshot_barrier_before_send(session_id, ctx, key) {
-        Ok(report) => {
+        Ok(completed) => {
+            let report = &completed.report;
             eprintln!(
                 "[storage-node] session {session_id}: snapshot barrier {} passed before VFSSEND2 send peers={} txg_range={}..{} objects={}",
                 report.barrier_id,
@@ -1336,7 +1376,11 @@ fn require_snapshot_barrier_before_send(
                 report.max_txg,
                 report.total_objects,
             );
-            Ok(target_root)
+            Ok(SnapshotBarrierSendAuthorization {
+                target_root,
+                barrier_id: report.barrier_id,
+                membership_cut: completed.membership_cut,
+            })
         }
         Err(err) => {
             let message = err.to_string();
@@ -6200,10 +6244,10 @@ fn handle_frame_ctx(
         Frame::Send { key } => {
             let fs_root = ctx.config.fs_root.as_ref()?;
             let auth_key = ctx.config.root_auth_key?;
-            let expected_root =
+            let authorization =
                 match require_snapshot_barrier_before_send(session_id, ctx, fs_root, auth_key, key)
                 {
-                    Ok(expected_root) => expected_root,
+                    Ok(authorization) => authorization,
                     Err(message) => return Some(Frame::Error { message }),
                 };
             let mut fs = match vfs::LocalFileSystem::open_with_root_authentication_key(
@@ -6224,7 +6268,8 @@ fn handle_frame_ctx(
                 auth_key,
                 &ctx.config,
                 key,
-                &expected_root,
+                &authorization,
+                ctx,
             ) {
                 Ok(export) => Some(Frame::SendResponse { export }),
                 Err(message) => Some(Frame::Error { message }),
@@ -6393,10 +6438,10 @@ fn handle_frame_ctx(
         Frame::SendChunked { key } => {
             let fs_root = ctx.config.fs_root.as_ref()?;
             let auth_key = ctx.config.root_auth_key?;
-            let expected_root =
+            let authorization =
                 match require_snapshot_barrier_before_send(session_id, ctx, fs_root, auth_key, key)
                 {
-                    Ok(expected_root) => expected_root,
+                    Ok(authorization) => authorization,
                     Err(message) => return Some(Frame::Error { message }),
                 };
             let mut fs = match vfs::LocalFileSystem::open_with_root_authentication_key(
@@ -6417,7 +6462,8 @@ fn handle_frame_ctx(
                 auth_key,
                 &ctx.config,
                 key,
-                &expected_root,
+                &authorization,
+                ctx,
             ) {
                 Ok(export) => export,
                 Err(message) => return Some(Frame::Error { message }),
@@ -7112,10 +7158,11 @@ mod cluster_pool_handler_tests {
             .sessions
             .insert(client_session_id, Arc::new(Mutex::new(client_session)));
 
-        let report =
+        let completed =
             run_snapshot_barrier_before_send(tidefs_transport::SessionId::new(1), &ctx, &[])
                 .expect("zero-peer barrier completes");
 
+        let report = completed.report;
         assert_eq!(report.peer_count, 0);
         assert_eq!(report.min_txg, report.max_txg);
         assert!(report.min_txg > 0);
@@ -8085,6 +8132,37 @@ mod cluster_pool_handler_tests {
         );
         assert!(err.contains("expected tid="), "{err}");
         assert!(err.contains("observed tid="), "{err}");
+    }
+
+    #[test]
+    fn vfssend2_send_membership_must_match_completed_barrier() {
+        let (_dir, store) = frame_local_store();
+        let ctx = frame_test_context(Arc::clone(&store));
+        let fs_dir = tempfile::tempdir().unwrap();
+        let fs_root = fs_dir.path().join("fs");
+        let auth_key = RootAuthenticationKey::demo_key();
+        create_committed_send_source(&fs_root, auth_key);
+        let authorization = SnapshotBarrierSendAuthorization {
+            target_root: validate_vfssend2_send_request(&fs_root, auth_key, &[])
+                .expect("select authenticated send root before barrier"),
+            barrier_id: 7,
+            membership_cut: snapshot_barrier_membership_cut(&ctx),
+        };
+
+        // Model a roster change after the barrier passed but before payload
+        // construction returned to the requesting session.
+        register_snapshot_barrier_test_peer(&ctx, 2);
+        let err = finalize_snapshot_barrier_bound_vfssend2_send_payload(
+            vec![1, 2, 3],
+            &fs_root,
+            auth_key,
+            &authorization,
+            &ctx,
+        )
+        .expect_err("post-barrier membership drift must refuse the send payload");
+
+        assert!(err.contains("sender_authority_stale"), "{err}");
+        assert!(!err.contains("expected tid="), "{err}");
     }
 
     #[test]
