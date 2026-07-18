@@ -7,7 +7,7 @@ use crate::encoding::*;
 use crate::error::FileSystemError;
 use crate::object_keys::*;
 use crate::records::NamespaceCreateIntentRecord;
-use crate::types::InodeRecord;
+use crate::types::{InodeRecord, NamespaceEntry};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
