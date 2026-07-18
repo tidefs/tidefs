@@ -1,0 +1,378 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage:
+  tidefs-scheduler-dirty-debt-runtime --output-dir DIR [OPTIONS]
+  tidefs-scheduler-dirty-debt-runtime --input-artifact FILE \
+    --input-summary FILE --output-dir DIR --run-id ID --source-ref SHA \
+    --generated-at TIMESTAMP
+
+Run the existing Linux 7.0 FUSE QEMU smoke row and promote its raw local
+queue-depth snapshot into the scheduler dirty-debt evidence shape. The
+promoted artifact records the exact mounted workload and topology, the
+queue data that was observed, and the scheduler-wide refusal boundaries
+that keep scheduler.dirty_debt.no_hidden.v1 blocked.
+
+By default this command launches scripts/tidefs-fuse-vm-test. The input mode
+promotes files downloaded from a completed QEMU Smoke fuse-vm-test run without
+launching another VM; explicit run provenance is mandatory in that mode.
+
+Options:
+  --output-dir DIR       Write queue-depth-runtime.json and its manifest here
+  --timeout SECONDS      QEMU timeout in run mode (default: 900)
+  --input-artifact FILE  Existing raw queue-depth-runtime.json from QEMU Smoke
+  --input-summary FILE   Matching fuse-vm-test.json from the same QEMU run
+  --run-id ID            Concrete run id (default: GitHub run or local QEMU id)
+  --source-ref SHA       Exact 40-hex source commit (default: checkout HEAD)
+  --generated-at TIME    UTC RFC3339 timestamp (default: current UTC time)
+  --keep-runtime-output  Keep the owned temporary QEMU output in run mode
+  --help, -h             Show this help
+EOF
+}
+
+fail() {
+  echo "tidefs-scheduler-dirty-debt-runtime: $*" >&2
+  exit 2
+}
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+repo="${TIDEFS_REPO:-$(cd -- "$script_dir/.." && pwd)}"
+output_dir=""
+timeout_seconds=900
+input_artifact=""
+input_summary=""
+run_id="${TIDEFS_DIRTY_DEBT_RUN_ID:-}"
+source_ref="${TIDEFS_DIRTY_DEBT_SOURCE_REF:-}"
+generated_at="${TIDEFS_DIRTY_DEBT_GENERATED_AT:-}"
+keep_runtime_output=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --output-dir)
+      [[ $# -ge 2 ]] || fail "--output-dir requires an argument"
+      output_dir="$2"
+      shift 2
+      ;;
+    --timeout)
+      [[ $# -ge 2 ]] || fail "--timeout requires an argument"
+      timeout_seconds="$2"
+      shift 2
+      ;;
+    --input-artifact)
+      [[ $# -ge 2 ]] || fail "--input-artifact requires an argument"
+      input_artifact="$2"
+      shift 2
+      ;;
+    --input-summary)
+      [[ $# -ge 2 ]] || fail "--input-summary requires an argument"
+      input_summary="$2"
+      shift 2
+      ;;
+    --run-id)
+      [[ $# -ge 2 ]] || fail "--run-id requires an argument"
+      run_id="$2"
+      shift 2
+      ;;
+    --source-ref)
+      [[ $# -ge 2 ]] || fail "--source-ref requires an argument"
+      source_ref="$2"
+      shift 2
+      ;;
+    --generated-at)
+      [[ $# -ge 2 ]] || fail "--generated-at requires an argument"
+      generated_at="$2"
+      shift 2
+      ;;
+    --keep-runtime-output)
+      keep_runtime_output=1
+      shift
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    *)
+      fail "unknown argument: $1"
+      ;;
+  esac
+done
+
+[[ -n "$output_dir" ]] || fail "--output-dir is required"
+[[ "$timeout_seconds" =~ ^[1-9][0-9]*$ ]] || fail "--timeout must be a positive integer"
+command -v jq >/dev/null 2>&1 || fail "jq is required"
+if ! command -v b3sum >/dev/null 2>&1 && ! command -v nix >/dev/null 2>&1; then
+  fail "b3sum or Nix is required"
+fi
+
+input_mode=0
+if [[ -n "$input_artifact" || -n "$input_summary" ]]; then
+  input_mode=1
+  [[ -n "$input_artifact" && -n "$input_summary" ]] \
+    || fail "--input-artifact and --input-summary must be used together"
+  [[ -n "$run_id" && -n "$source_ref" && -n "$generated_at" ]] \
+    || fail "input mode requires --run-id, --source-ref, and --generated-at"
+fi
+
+if [[ -z "$generated_at" ]]; then
+  generated_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+fi
+if [[ -z "$source_ref" ]]; then
+  source_ref="${GITHUB_SHA:-$(git -C "$repo" rev-parse HEAD)}"
+fi
+if [[ -z "$run_id" ]]; then
+  if [[ -n "${GITHUB_RUN_ID:-}" ]]; then
+    run_id="github-actions:${GITHUB_RUN_ID}/${GITHUB_RUN_ATTEMPT:-1}"
+  else
+    run_id="local-qemu:${generated_at}"
+  fi
+fi
+
+[[ "$source_ref" =~ ^[0-9a-f]{40}$ ]] \
+  || fail "--source-ref must be an exact lowercase 40-hex commit"
+[[ "$generated_at" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] \
+  || fail "--generated-at must use UTC RFC3339 form YYYY-MM-DDTHH:MM:SSZ"
+case "${run_id,,}" in
+  ""|unknown|none|unset|tbd|n/a)
+    fail "--run-id must identify concrete runtime provenance"
+    ;;
+esac
+
+owned_runtime_dir=""
+artifact_tmp=""
+manifest_tmp=""
+cleanup() {
+  [[ -z "$artifact_tmp" ]] || rm -f -- "$artifact_tmp"
+  [[ -z "$manifest_tmp" ]] || rm -f -- "$manifest_tmp"
+  if [[ -n "$owned_runtime_dir" && "$keep_runtime_output" -eq 0 ]]; then
+    rm -rf -- "$owned_runtime_dir"
+  elif [[ -n "$owned_runtime_dir" ]]; then
+    echo "runtime_output=$owned_runtime_dir"
+  fi
+}
+trap cleanup EXIT
+
+if [[ "$input_mode" -eq 0 ]]; then
+  owned_runtime_dir="$(mktemp -d "${TMPDIR:-/tmp}/tidefs-dirty-debt-runtime.XXXXXX")"
+  input_artifact="$owned_runtime_dir/performance/queue-depth-runtime.json"
+  input_summary="$owned_runtime_dir/fuse-vm-test.json"
+  GITHUB_SHA="$source_ref" \
+    GITHUB_RUN_ID="${GITHUB_RUN_ID:-local-qemu}" \
+    GITHUB_RUN_ATTEMPT="${GITHUB_RUN_ATTEMPT:-1}" \
+    TIDEFS_GENERATED_AT="$generated_at" \
+    "$script_dir/tidefs-fuse-vm-test" \
+      --timeout "$timeout_seconds" \
+      --validation-dir "$owned_runtime_dir" \
+      --queue-depth-artifact "$input_artifact"
+fi
+
+[[ -s "$input_artifact" ]] || fail "queue-depth input is missing or empty: $input_artifact"
+[[ -s "$input_summary" ]] || fail "QEMU summary is missing or empty: $input_summary"
+
+jq -e '
+  .test == "tidefs-fuse-vm-test"
+  and .version >= 3
+  and .tier == "outside-sandbox-qemu-guest"
+  and (.kernel_version | type == "string" and startswith("7."))
+  and .qemu_status == 0
+  and .done_marker_seen >= 1
+  and .passed > 0
+  and .product_failures == 0
+  and .environment_refusals == 0
+  and .queue_depth_artifact_present == true
+' "$input_summary" >/dev/null \
+  || fail "QEMU summary does not describe a passing Linux 7.0 fuse-vm-test row"
+
+jq -e '
+  .schema_version == 1
+  and .evidence_class == "queue-depth-runtime-artifact"
+  and .workload == "fuse-smoke-mount-quick"
+  and .mount_adapter == "fuse"
+  and (.admission | type == "object")
+  and (.hard_caps | type == "object")
+  and (.effective_caps | type == "object")
+  and (.invariant_checks | type == "object")
+  and ([.invariant_checks[]] | all(. == true))
+' "$input_artifact" >/dev/null \
+  || fail "queue-depth input is not a passing fuse-smoke-mount-quick runtime snapshot"
+
+mkdir -p -- "$output_dir"
+artifact_path="$output_dir/queue-depth-runtime.json"
+manifest_path="$output_dir/scheduler-dirty-debt-queue-depth-runtime.manifest.json"
+artifact_tmp="$artifact_path.tmp.$$"
+manifest_tmp="$manifest_path.tmp.$$"
+
+jq --sort-keys \
+  --arg source_ref "$source_ref" \
+  --arg run_id "$run_id" \
+  --arg generated_at "$generated_at" \
+  --slurpfile summary "$input_summary" '
+  {
+    schema_version: 2,
+    evidence_class: "queue-depth-runtime-artifact",
+    artifact_path: "validation/artifacts/performance/queue-depth-runtime.json",
+    artifact_outcome: "partial-coverage",
+    claim_ids: [
+      "scheduler.dirty_debt.no_hidden.v1",
+      "perf.local.no_unbounded_dirty_debt.v1"
+    ],
+    scheduler_claim_status: "blocked",
+    source: "qemu-smoke-fuse-vm-test",
+    source_ref: $source_ref,
+    run_id: $run_id,
+    generated_at: $generated_at,
+    workload: .workload,
+    workload_detail: {
+      profile: "quick",
+      command: "scripts/tidefs-scheduler-dirty-debt-runtime --output-dir <artifact-dir>",
+      operations: [
+        "mounted root stat",
+        "file create, write, read, and append",
+        "directory create and readdir",
+        "symlink create and readlink",
+        "file unlink and directory removal",
+        "file rename"
+      ]
+    },
+    topology: {
+      node_count: 1,
+      mounted_filesystem_count: 1,
+      mount_adapter: .mount_adapter,
+      pool: .pool,
+      kernel_version: $summary[0].kernel_version,
+      runtime_tier: $summary[0].tier,
+      transport: "none",
+      distributed_peer_count: 0,
+      background_scrub: "disabled"
+    },
+    scope: {
+      result: "bounded-local-admission-observed",
+      measured: [
+        "aggregate local dirty-write and metadata admission usage",
+        "hard and effective admission caps",
+        "mounted quick-workload admission invariants"
+      ],
+      scheduler_wide_result: "refused-incomplete"
+    },
+    queue_observations: [
+      {
+        queue_root: "performance_contract.budgeted_queue",
+        status: "observed-through-local-write-admission",
+        work_classes: ["foreground-write", "metadata-mutation"]
+      },
+      {
+        queue_root: "local_fs.write_admission",
+        status: "measured-aggregate",
+        work_classes: ["foreground-write", "metadata-mutation"],
+        admission: .admission,
+        hard_caps: .hard_caps,
+        effective_caps: .effective_caps,
+        invariant_checks: .invariant_checks
+      }
+    ],
+    refusal_boundaries: [
+      {
+        area: "writeback",
+        status: "not-independently-observed",
+        reason: "the row does not emit separate write-buffer, dirty-set, or dirty-page-tracker depth peaks"
+      },
+      {
+        area: "page-cache",
+        status: "not-independently-observed",
+        reason: "the row does not emit page-cache LRU depth or dirty-page eligibility counters"
+      },
+      {
+        area: "reclaim",
+        status: "not-independently-observed",
+        reason: "the row does not emit local or durable reclaim queue depth or drain counters"
+      },
+      {
+        area: "scrub-repair",
+        status: "not-exercised",
+        reason: "background scrub is disabled in the quick mounted topology"
+      },
+      {
+        area: "rename-orphan-index",
+        status: "exercised-without-attributed-depth",
+        reason: "rename and unlink run through the mount, but the aggregate admission snapshot cannot attribute queue depth to orphan-index work"
+      },
+      {
+        area: "transport-distributed",
+        status: "out-of-topology",
+        reason: "the single-node local mount has no peer or transport queue"
+      },
+      {
+        area: "background-scheduler",
+        status: "not-independently-observed",
+        reason: "the row does not emit registered-service depths, cycle counts, or per-service processed work"
+      },
+      {
+        area: "compaction-defrag-cleaner",
+        status: "not-exercised",
+        reason: "the quick workload does not schedule or instrument these maintenance queues"
+      }
+    ],
+    admission: .admission,
+    hard_caps: .hard_caps,
+    effective_caps: .effective_caps,
+    invariant_checks: .invariant_checks,
+    determinism: .determinism,
+    no_hidden_queue_gate: .no_hidden_queue_gate,
+    qemu_row: {
+      passed: $summary[0].passed,
+      done_marker_seen: $summary[0].done_marker_seen,
+      product_failures: $summary[0].product_failures,
+      environment_refusals: $summary[0].environment_refusals
+    },
+    non_claims: [
+      "does not prove scheduler-wide foreground and background dirty-debt coverage",
+      "does not validate crash recovery, fsync durability, or mmap/writeback coherency",
+      "does not validate kernel, RDMA, distributed, production, release, or successor/comparator behavior",
+      "does not move scheduler.dirty_debt.no_hidden.v1 or perf.local.no_unbounded_dirty_debt.v1 out of blocked status"
+    ]
+  }
+' "$input_artifact" > "$artifact_tmp"
+
+if command -v b3sum >/dev/null 2>&1; then
+  digest_hex="$(b3sum "$artifact_tmp" | awk '{print $1}')"
+else
+  digest_hex="$(
+    nix shell --inputs-from "$repo" nixpkgs#b3sum \
+      --command b3sum "$artifact_tmp" | awk '{print $1}'
+  )"
+fi
+content_digest="blake3:$digest_hex"
+jq -n --sort-keys \
+  --arg content_digest "$content_digest" \
+  --arg source_ref "$source_ref" \
+  --arg run_id "$run_id" \
+  --arg generated_at "$generated_at" '
+  {
+    manifest_version: 2,
+    claim_id: "scheduler.dirty_debt.no_hidden.v1",
+    evidence_class: "queue-depth-runtime-artifact",
+    validation_tier: "mounted-userspace",
+    scope: "Linux 7.0 QEMU mounted FUSE quick workload with aggregate local admission measurements and explicit scheduler-wide refusal boundaries",
+    artifact_path: "validation/artifacts/performance/queue-depth-runtime.json",
+    content_digest: $content_digest,
+    run_id: $run_id,
+    source_ref: $source_ref,
+    outcome: "pass",
+    residual_risk: "The row measures bounded aggregate local admission only. Independent writeback, page-cache, reclaim, scrub/repair, rename/orphan-index, transport/distributed, and background-scheduler queue-depth coverage remains absent, so scheduler.dirty_debt.no_hidden.v1 stays blocked.",
+    source: "scripts/tidefs-scheduler-dirty-debt-runtime via qemu-smoke-fuse-vm-test",
+    generated_at: $generated_at,
+    blocking_issues: []
+  }
+' > "$manifest_tmp"
+
+mv -- "$artifact_tmp" "$artifact_path"
+mv -- "$manifest_tmp" "$manifest_path"
+artifact_tmp=""
+manifest_tmp=""
+
+echo "artifact=$artifact_path"
+echo "manifest=$manifest_path"
+echo "source_ref=$source_ref"
+echo "run_id=$run_id"
