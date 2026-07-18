@@ -729,6 +729,20 @@ fn parse_send_base_root(
         .ok_or_else(|| format!("from_root not found: tid={tid} gen={gen} csum={csum:#016x}"))
 }
 
+/// Reject invalid incremental requests before coordinating peers.
+/// Stream construction revalidates the base root after the barrier passes.
+fn validate_vfssend2_send_key(
+    fs_root: &Path,
+    auth_key: RootAuthenticationKey,
+    key: &[u8],
+) -> Result<(), String> {
+    if key.is_empty() {
+        return Ok(());
+    }
+
+    parse_send_base_root(fs_root, auth_key, key).map(|_| ())
+}
+
 fn build_vfssend2_send_stream(
     fs: &mut vfs::LocalFileSystem,
     fs_root: &Path,
@@ -1132,11 +1146,11 @@ fn run_snapshot_barrier_before_send_with_config(
 fn require_snapshot_barrier_before_send(
     session_id: tidefs_transport::SessionId,
     ctx: &SessionContext,
+    fs_root: &Path,
+    auth_key: RootAuthenticationKey,
     key: &[u8],
 ) -> Result<(), String> {
-    if !key.is_empty() && key.len() != 24 {
-        return Err(format!("send key must be 0 or 24 bytes, got {}", key.len()));
-    }
+    validate_vfssend2_send_key(fs_root, auth_key, key)?;
 
     match run_snapshot_barrier_before_send(session_id, ctx, key) {
         Ok(report) => {
@@ -6004,7 +6018,9 @@ fn handle_frame_ctx(
         Frame::Send { key } => {
             let fs_root = ctx.config.fs_root.as_ref()?;
             let auth_key = ctx.config.root_auth_key?;
-            if let Err(message) = require_snapshot_barrier_before_send(session_id, ctx, key) {
+            if let Err(message) =
+                require_snapshot_barrier_before_send(session_id, ctx, fs_root, auth_key, key)
+            {
                 return Some(Frame::Error { message });
             }
             let mut fs = match vfs::LocalFileSystem::open_with_root_authentication_key(
@@ -6188,7 +6204,9 @@ fn handle_frame_ctx(
         Frame::SendChunked { key } => {
             let fs_root = ctx.config.fs_root.as_ref()?;
             let auth_key = ctx.config.root_auth_key?;
-            if let Err(message) = require_snapshot_barrier_before_send(session_id, ctx, key) {
+            if let Err(message) =
+                require_snapshot_barrier_before_send(session_id, ctx, fs_root, auth_key, key)
+            {
                 return Some(Frame::Error { message });
             }
             let mut fs = match vfs::LocalFileSystem::open_with_root_authentication_key(
@@ -7518,6 +7536,57 @@ mod cluster_pool_handler_tests {
                 active
                     .as_ref()
                     .expect("malformed request must not clear the active barrier")
+                    .barrier_id(),
+                123
+            );
+        }
+    }
+
+    #[test]
+    fn missing_incremental_roots_are_rejected_before_snapshot_barrier() {
+        let (_dir, store) = frame_local_store();
+        let mut ctx = frame_test_context(Arc::clone(&store));
+        let fs_dir = tempfile::tempdir().unwrap();
+        let fs_root = fs_dir.path().join("fs");
+        let auth_key = RootAuthenticationKey::demo_key();
+        let mut fs = vfs::LocalFileSystem::open_with_root_authentication_key(
+            &fs_root,
+            StoreOptions::default(),
+            auth_key,
+        )
+        .unwrap();
+        fs.sync_all().unwrap();
+        drop(fs);
+        ctx.config.fs_root = Some(fs_root);
+        ctx.config.root_auth_key = Some(auth_key);
+        *ctx.active_barrier.lock().unwrap() = Some(SnapshotCoordinator::new(
+            123,
+            "active".into(),
+            Vec::new(),
+            SnapshotBarrierConfig::default(),
+        ));
+
+        for frame in [
+            Frame::Send { key: vec![0; 24] },
+            Frame::SendChunked { key: vec![0; 24] },
+        ] {
+            let response =
+                handle_frame_ctx(tidefs_transport::SessionId::new(1), &frame, &store, &ctx)
+                    .expect("unknown incremental root returns an error");
+
+            match response {
+                Frame::Error { message } => {
+                    assert!(message.contains("from_root not found"), "{message}");
+                    assert!(!message.contains("snapshot barrier"), "{message}");
+                }
+                other => panic!("expected missing-root error, got {other:?}"),
+            }
+
+            let active = ctx.active_barrier.lock().unwrap();
+            assert_eq!(
+                active
+                    .as_ref()
+                    .expect("invalid request must not clear the active barrier")
                     .barrier_id(),
                 123
             );
