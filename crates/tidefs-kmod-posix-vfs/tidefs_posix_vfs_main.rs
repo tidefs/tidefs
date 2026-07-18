@@ -5713,19 +5713,18 @@ impl crate::tidefs_kmod_bridge::kernel_types::VfsEngine for KernelEngine {
                 let io_ctx = pool_core.committed_root_io_ctx();
                 if let Some(read_fn) = io_ctx.read_sectors_fn {
                     let ss = io_ctx.sector_size as u64;
-                    // Attempt to read the inode record; if it exists,
-                    // the inode is valid and can be opened.
-                    if self.read_inode_record(ino, &io_ctx, read_fn, ss).is_ok() {
-                        self.track_open(ino)?;
-                        return Ok(
-                            crate::tidefs_kmod_bridge::kernel_types::EngineFileHandle::new(
-                                inode,
-                                flags,
-                                crate::tidefs_kmod_bridge::kernel_types::FileHandleId::new(ino),
-                                0,
-                            ),
-                        );
-                    }
+                    // Only a successfully imported inode can be opened. Preserve
+                    // committed-root read and decode errors for the VFS caller.
+                    self.read_inode_record(ino, &io_ctx, read_fn, ss)?;
+                    self.track_open(ino)?;
+                    return Ok(
+                        crate::tidefs_kmod_bridge::kernel_types::EngineFileHandle::new(
+                            inode,
+                            flags,
+                            crate::tidefs_kmod_bridge::kernel_types::FileHandleId::new(ino),
+                            0,
+                        ),
+                    );
                 }
             }
         }
@@ -9050,26 +9049,35 @@ pub extern "C" fn tidefs_posix_vfs_engine_open(
 
     let result = with_mounted_engine(
         Err(crate::tidefs_kmod_bridge::kernel_types::Errno::ENODEV),
-        |engine| engine.open(inode, flags, &ctx),
+        |engine| crate::open_release::bridge_open(engine, inode, flags, &ctx),
     );
 
     match result {
         // SAFETY: out was checked non-null above and points to C shim-owned
         // file-handle output storage for this open callback.
-        Ok(fh) => unsafe {
-            (*out).ok = 1;
-            (*out).fh_ino = fh.inode_id.get();
-            (*out).fh_id = fh.fh_id.0;
-        },
+        Ok(session) => {
+            unsafe {
+                (*out).ok = 1;
+                (*out).fh_ino = session.handle.inode_id.get();
+                (*out).fh_id = session.handle.fh_id.0;
+            }
+            0
+        }
         // SAFETY: out was checked non-null above and points to C shim-owned
         // file-handle output storage for this open callback.
-        Err(_e) => unsafe {
-            (*out).ok = 0;
-            (*out).fh_ino = 0;
-            (*out).fh_id = 0;
-        },
+        Err(e) => {
+            unsafe {
+                (*out).ok = 0;
+                (*out).fh_ino = 0;
+                (*out).fh_id = 0;
+            }
+            if e == crate::tidefs_kmod_bridge::kernel_types::Errno::ENOENT {
+                0
+            } else {
+                -(e.0 as core::ffi::c_int)
+            }
+        }
     }
-    0
 }
 
 /// C-visible bridge: engine-backed file release.
