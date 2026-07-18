@@ -206,7 +206,7 @@ impl CandidatePool {
     /// - All devices share the same pool_guid.
     /// - Pool state is importable (Active or Exported).
     /// - device_count is consistent across devices.
-    /// - topology_generation is consistent (majority selection).
+    /// - All devices match the selected topology_generation.
     /// - Devices are sorted by device_index with no gaps.
     pub fn validate(&mut self) -> Result<(), ImportError> {
         // Check pool state
@@ -227,6 +227,17 @@ impl CandidatePool {
                         d.path.display(),
                         d.label.device_count,
                         self.device_count
+                    ),
+                });
+            }
+            if d.label.topology_generation != self.topology_generation {
+                return Err(ImportError::TopologyInconsistent {
+                    pool_guid: self.pool_guid,
+                    detail: format!(
+                        "device {} reports topology_generation={} but pool expects {}",
+                        d.path.display(),
+                        d.label.topology_generation,
+                        self.topology_generation
                     ),
                 });
             }
@@ -938,6 +949,52 @@ mod tests {
         match result {
             Err(ImportError::TopologyInconsistent { detail, .. }) => {
                 assert!(detail.contains("duplicate device GUID"));
+            }
+            other => panic!("expected TopologyInconsistent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn candidate_pool_rejects_minority_topology_generation() {
+        let pool_guid = [0xAD; 16];
+        let make_candidate = |index, generation, byte| {
+            let mut label = PoolLabelV1::new(pool_guid, [byte; 16], "generation-drift");
+            label.pool_state = LabelPoolState::Exported;
+            label.commit_group = 100;
+            label.label_commit_group = 100;
+            label.device_index = index;
+            label.topology_generation = generation;
+            label.device_count = 3;
+            label.device_capacity_bytes = 1024 * 1024 * 1024;
+            DeviceCandidate {
+                path: PathBuf::from(format!("/dev/tidefs-generation-{index}")),
+                label,
+                label_copy: 0,
+                device_size: 1024 * 1024 * 1024,
+            }
+        };
+        let mut pool = CandidatePool {
+            pool_guid,
+            pool_name: "generation-drift".into(),
+            pool_state: LabelPoolState::Exported,
+            devices: vec![
+                make_candidate(0, 8, 0x01),
+                make_candidate(1, 8, 0x02),
+                make_candidate(2, 7, 0x03),
+            ],
+            topology_generation: 8,
+            device_count: 3,
+            recovery_commit_group: 100,
+            topology_complete: false,
+            cluster_authorized: false,
+        };
+
+        let result = pool.validate();
+
+        match result {
+            Err(ImportError::TopologyInconsistent { detail, .. }) => {
+                assert!(detail.contains("topology_generation=7"));
+                assert!(detail.contains("pool expects 8"));
             }
             other => panic!("expected TopologyInconsistent, got {other:?}"),
         }
