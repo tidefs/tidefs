@@ -7,6 +7,8 @@
 //! records without claiming transport, distributed quorum, operator UAPI, or
 //! broad crash-validation closure.
 
+use std::sync::mpsc::SyncSender;
+
 use tidefs_local_object_store::pool::PlacementReceipt;
 use tidefs_storage_intent_core::{
     evaluate_receipt_against_policy, DurabilityReceiptState, DurabilityRequirement,
@@ -869,6 +871,7 @@ impl ReadReceiptEvidence {
 pub struct LocalAckReceiptLedger {
     receipts: Vec<LocalAckReceipt>,
     next_sequence: u64,
+    diagnostic_sink: Option<SyncSender<LocalAckReceipt>>,
 }
 
 impl LocalAckReceiptLedger {
@@ -878,7 +881,17 @@ impl LocalAckReceiptLedger {
         Self {
             receipts: Vec::new(),
             next_sequence: 1,
+            diagnostic_sink: None,
         }
+    }
+
+    /// Attach a bounded, best-effort sink for validation diagnostics.
+    ///
+    /// The ledger remains receipt authority. A full or disconnected channel
+    /// drops only the diagnostic copy and cannot change operation success,
+    /// durability, or the bounded in-memory receipt window.
+    pub fn set_diagnostic_sink(&mut self, sink: SyncSender<LocalAckReceipt>) {
+        self.diagnostic_sink = Some(sink);
     }
 
     /// Reserve the next monotonic local sequence.
@@ -893,6 +906,9 @@ impl LocalAckReceiptLedger {
         self.receipts.push(receipt);
         if self.receipts.len() > LOCAL_ACK_RECEIPT_LEDGER_LIMIT {
             self.receipts.remove(0);
+        }
+        if let Some(sink) = &self.diagnostic_sink {
+            let _ = sink.try_send(receipt);
         }
     }
 
@@ -2428,5 +2444,23 @@ mod tests {
         assert_eq!(ledger.len(), 2);
         assert_eq!(ledger.latest(), Some(second));
         assert_eq!(ledger.snapshot(), vec![first, second]);
+    }
+
+    #[test]
+    fn ledger_diagnostic_sink_observes_receipts_without_owning_authority() {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let mut ledger = LocalAckReceiptLedger::new();
+        ledger.set_diagnostic_sink(sender);
+        let receipt = LocalAckReceipt::full_local_placement(
+            ledger.next_sequence(),
+            LocalAckOperation::Fsync,
+            LocalAckReceiptTarget::inode(7),
+            None,
+        );
+
+        ledger.record(receipt);
+
+        assert_eq!(receiver.try_recv(), Ok(receipt));
+        assert_eq!(ledger.latest(), Some(receipt));
     }
 }

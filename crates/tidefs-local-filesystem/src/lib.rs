@@ -11439,6 +11439,17 @@ impl LocalFileSystem {
         self.ack_receipts.snapshot()
     }
 
+    /// Attach a bounded, best-effort sink for mounted validation diagnostics.
+    ///
+    /// The sink receives copies of subsequently recorded receipts. It is not
+    /// a durable receipt ledger, operator interface, or acknowledgment gate.
+    pub fn set_local_ack_receipt_diagnostic_sink(
+        &mut self,
+        sink: std::sync::mpsc::SyncSender<LocalAckReceipt>,
+    ) {
+        self.ack_receipts.set_diagnostic_sink(sink);
+    }
+
     /// Record an O_DSYNC data-range receipt after its durable local intent is synced.
     #[must_use]
     pub fn record_odsync_data_range_ack_receipt(
