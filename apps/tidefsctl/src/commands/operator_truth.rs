@@ -97,6 +97,26 @@ impl OperatorTruthCarrier {
     }
 
     #[must_use]
+    pub(crate) fn live_owner_refusal(
+        command: &'static str,
+        operation: &'static str,
+        pool_name: &str,
+    ) -> Self {
+        Self {
+            command,
+            operation,
+            pool_name: pool_name.to_string(),
+            evidence_state: OperatorTruthEvidenceState::Refused,
+            source: TruthViewSourceClass::RuntimeMirror,
+            cut: TruthViewCutClass::LiveWindow,
+            provenance: TruthViewProvenanceClass::LiveMirror,
+            exactness: TruthViewExactnessClass::DegradedOrPartial,
+            freshness: TruthViewFreshnessClass::Refused,
+            refusal: Some("live-owner status response was refused; no status facts were accepted"),
+        }
+    }
+
+    #[must_use]
     pub(crate) fn stale_non_live(
         command: &'static str,
         operation: &'static str,
@@ -352,6 +372,23 @@ mod tests {
             bundle.source().unwrap(),
             TruthViewSourceClass::RuntimeMirror
         );
+    }
+
+    #[test]
+    fn reachable_owner_refusal_stays_blocked_and_source_bound() {
+        let carrier = OperatorTruthCarrier::live_owner_refusal("device", "status", "alpha");
+
+        assert_eq!(carrier.evidence_state, OperatorTruthEvidenceState::Refused);
+        assert_eq!(carrier.source, TruthViewSourceClass::RuntimeMirror);
+        assert_eq!(carrier.cut, TruthViewCutClass::LiveWindow);
+        assert_eq!(carrier.freshness, TruthViewFreshnessClass::Refused);
+        assert_eq!(
+            carrier.distributed_surface_record().status().unwrap(),
+            TruthViewDistributedOperatorStatusClass::Blocked
+        );
+        assert!(carrier
+            .refusal
+            .is_some_and(|reason| reason.contains("no status facts were accepted")));
     }
 
     #[test]

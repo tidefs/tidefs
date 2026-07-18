@@ -571,8 +571,12 @@ fn exit_owner_error(
         if let Some(pool_uuid) = route.pool_uuid {
             out["pool_uuid"] = serde_json::Value::String(hex_uuid(&pool_uuid));
         }
+        annotate_live_owner_status_refusal_json(&route, &mut out);
         println!("{}", serde_json::to_string_pretty(&out).unwrap());
         process::exit(if exit_code == 0 { 1 } else { exit_code });
+    }
+    for line in live_owner_status_refusal_human_lines(&route) {
+        eprintln!("{line}");
     }
     eprintln!(
         "tidefsctl {command} {operation}: live owner for imported pool '{pool}' refused request: {message}"
@@ -953,6 +957,58 @@ fn live_owner_status_truth_carrier(
     Some(super::operator_truth::OperatorTruthCarrier::live_route(
         command, "status", route.pool,
     ))
+}
+
+fn live_owner_status_refusal_carrier(
+    route: &LivePoolRoute<'_>,
+) -> Option<super::operator_truth::OperatorTruthCarrier> {
+    let command = match (route.command, route.operation) {
+        ("device", "status") => "device",
+        _ => return None,
+    };
+    Some(
+        super::operator_truth::OperatorTruthCarrier::live_owner_refusal(
+            command, "status", route.pool,
+        ),
+    )
+}
+
+fn annotate_live_owner_status_refusal_json(
+    route: &LivePoolRoute<'_>,
+    value: &mut serde_json::Value,
+) {
+    let Some(carrier) = live_owner_status_refusal_carrier(route) else {
+        return;
+    };
+    let source = super::classification::StatusSource::LiveOwner.label();
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    object.insert(
+        "source_classification".to_string(),
+        serde_json::Value::String(source.to_string()),
+    );
+    object.insert(
+        "source:status".to_string(),
+        serde_json::Value::String(source.to_string()),
+    );
+    object.insert(
+        "owner_response".to_string(),
+        serde_json::Value::String("refused".to_string()),
+    );
+    object.insert("operator_truth".to_string(), carrier.json_value());
+}
+
+fn live_owner_status_refusal_human_lines(route: &LivePoolRoute<'_>) -> Vec<String> {
+    let Some(carrier) = live_owner_status_refusal_carrier(route) else {
+        return Vec::new();
+    };
+    let mut lines = carrier.operator_lines();
+    lines.push(format!(
+        "source_classification: {}",
+        super::classification::StatusSource::LiveOwner.label()
+    ));
+    lines
 }
 
 fn annotate_live_owner_status_json(route: &LivePoolRoute<'_>, value: &mut serde_json::Value) {
@@ -2382,6 +2438,113 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some(super::super::classification::StatusSource::UnsupportedLocalMode.label())
         );
+    }
+
+    #[test]
+    fn reachable_owner_status_refusal_carries_operator_truth_json() {
+        let route = LivePoolRoute {
+            command: "device",
+            operation: "status",
+            pool: "tank",
+            pool_uuid: None,
+            json: true,
+            args: LivePoolAdminArgs::default(),
+        };
+        let detail = serde_json::json!({
+            "kind": "unsupported_command",
+            "command": "device",
+            "operation": "status",
+        });
+        let mut value = live_owner_error_detail_json(
+            &route,
+            "unsupported live-owner command tidefsctl device status",
+            &detail,
+        );
+
+        annotate_live_owner_status_refusal_json(&route, &mut value);
+
+        assert_eq!(value["kind"], "unsupported_command");
+        assert_eq!(value["source_classification"], "source:live-owner");
+        assert_eq!(value["owner_response"], "refused");
+        assert_eq!(value["operator_truth"]["evidence_state"], "refused");
+        assert_eq!(
+            value["operator_truth"]["freshness"],
+            "fresh.truth_view.refused.f4"
+        );
+        assert_eq!(
+            value["operator_truth"]["truth_bundle_record"]["answer_kind"],
+            "answer.response_registry.refusal.k1"
+        );
+    }
+
+    #[test]
+    fn reachable_owner_status_refusal_is_operator_readable() {
+        let route = LivePoolRoute {
+            command: "device",
+            operation: "status",
+            pool: "tank",
+            pool_uuid: None,
+            json: false,
+            args: LivePoolAdminArgs::default(),
+        };
+
+        let lines = live_owner_status_refusal_human_lines(&route);
+        let output = lines.join("\n");
+
+        assert!(output.contains("path:       tidefsctl device status"));
+        assert!(output.contains("evidence:   refused"));
+        assert!(output.contains("no status facts were accepted"));
+        assert!(output.contains("source_classification: source:live-owner"));
+        assert!(!output.trim_start().starts_with('{'));
+    }
+
+    #[test]
+    fn device_status_reaches_owner_and_preserves_typed_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("owner.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        write_owner_manifest(dir.path(), &socket_path);
+        let owner_error = LivePoolAdminError::unsupported_command("device", "status");
+        let machine_json = serde_json::to_string(&owner_error.kind).unwrap();
+        let handle = spawn_owner_response(
+            listener,
+            LivePoolAdminResponse::error_machine_json(
+                owner_error.exit_code,
+                owner_error.message,
+                machine_json,
+            ),
+        );
+        let route = LivePoolRoute {
+            command: "device",
+            operation: "status",
+            pool: "tank",
+            pool_uuid: Some([0x42; 16]),
+            json: true,
+            args: LivePoolAdminArgs::default(),
+        };
+
+        let err = send_live_owner_request_at(dir.path(), &route).unwrap_err();
+        let request = handle.join().unwrap();
+
+        assert_eq!(request.command, LivePoolAdminCommand::DeviceStatus);
+        assert_eq!(request.output, LivePoolAdminOutput::MachineJson);
+        match err {
+            LiveOwnerRequestError::Owner {
+                exit_code,
+                message,
+                detail: Some(detail),
+            } => {
+                assert_eq!(exit_code, 1);
+                assert_eq!(
+                    message,
+                    "unsupported live-owner command tidefsctl device status"
+                );
+                assert_eq!(detail["kind"], "unsupported_command");
+                assert_eq!(detail["command"], "device");
+                assert_eq!(detail["operation"], "status");
+            }
+            other => panic!("expected typed live-owner refusal, got {other:?}"),
+        }
     }
 
     #[test]

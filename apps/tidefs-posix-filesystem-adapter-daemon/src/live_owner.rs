@@ -297,6 +297,7 @@ fn dispatch_request(
         | LivePoolAdminCommand::SnapshotExtract
         | LivePoolAdminCommand::SnapshotSend
         | LivePoolAdminCommand::PerformanceAdmissionSnapshot
+        | LivePoolAdminCommand::DeviceStatus
         | LivePoolAdminCommand::DeviceRemove
         | LivePoolAdminCommand::BlockAttach
         | LivePoolAdminCommand::BlockSend
@@ -903,6 +904,42 @@ mod tests {
             value.get("operation").and_then(serde_json::Value::as_str),
             Some("promote")
         );
+    }
+
+    #[test]
+    fn device_status_wire_command_decodes_to_typed_route() {
+        let request = decode_live_pool_admin_request(
+            r#"{"version":1,"command":"device_status","pool":"tank","pool_uuid":null,"output":"machine_json","args":{}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(request.command, LivePoolAdminCommand::DeviceStatus);
+        assert_eq!(request.output, LivePoolAdminOutput::MachineJson);
+        assert_eq!(request.pool, "tank");
+    }
+
+    #[test]
+    fn device_status_without_engine_source_returns_typed_refusal() {
+        let request = LivePoolAdminRequest::new(LivePoolAdminCommand::DeviceStatus, "tank");
+
+        let response = unsupported_admin_command_response(&request);
+
+        assert_eq!(response.exit_code, 1);
+        let LivePoolAdminResponseBody::Error {
+            message,
+            machine_json: Some(machine_json),
+        } = response.body
+        else {
+            panic!("device status refusal should carry typed machine detail");
+        };
+        assert_eq!(
+            message,
+            "unsupported live-owner command tidefsctl device status"
+        );
+        let value: serde_json::Value = serde_json::from_str(&machine_json).unwrap();
+        assert_eq!(value["kind"], "unsupported_command");
+        assert_eq!(value["command"], "device");
+        assert_eq!(value["operation"], "status");
     }
 
     #[test]
