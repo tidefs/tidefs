@@ -4132,6 +4132,26 @@ fn live_snapshot_send_plan(
     args: &Value,
     fs: &mut LocalFileSystem,
 ) -> Result<LiveSnapshotSendPlan, String> {
+    const ALLOWED_ARGS: &[&str] = &[
+        "output",
+        "target_addr",
+        "node_id",
+        "server_node_id",
+        "format",
+        "incremental",
+        "from_root",
+        "pool_id",
+        "dataset_id",
+    ];
+    if let Some(key) = args.as_object().and_then(|args| {
+        args.keys()
+            .find(|key| !ALLOWED_ARGS.contains(&key.as_str()))
+    }) {
+        return Err(format!(
+            "snapshot send: unsupported live admin argument '{key}'"
+        ));
+    }
+
     let format = LiveSnapshotSendFormat::parse(args)?;
     let pool_id = live_admin_hex_16_or_default(args, "pool_id")
         .map_err(|err| format!("snapshot send: invalid pool-id: {err}"))?;
@@ -8223,6 +8243,40 @@ mod tests {
             refused["error"],
             "snapshot send: --output or --target-addr is required for live pools"
         );
+    }
+
+    #[test]
+    fn live_snapshot_send_rejects_unknown_args_without_local_fallback() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = root.path().join("store");
+        let mut fs = LocalFileSystem::open(&store).expect("open fs");
+        fs.create_file("/live.txt", 0o644).expect("create file");
+        fs.write_file("/live.txt", 0, b"live owner snapshot send")
+            .expect("write file");
+        let engine = VfsLocalFileSystem::new(fs);
+        let output = root.path().join("misspelled-target.vfs");
+
+        let refused = live_snapshot_admin(
+            &engine,
+            "send",
+            json!({
+                "output": output.display().to_string(),
+                "target_adrr": "127.0.0.1:9000",
+                "format": "vfssend2",
+                "incremental": false,
+            }),
+            true,
+        );
+
+        assert_eq!(refused["ok"], false, "send response: {refused}");
+        assert_eq!(refused["exit_code"], 1);
+        assert!(refused["json"].is_null());
+        assert!(refused["text"].is_null());
+        assert_eq!(
+            refused["error"],
+            "snapshot send: unsupported live admin argument 'target_adrr'"
+        );
+        assert!(!output.exists());
     }
 
     #[test]
