@@ -1,0 +1,177 @@
+{
+  "report_version": 1,
+  "claim_id": "storage.intent.ack_receipt_honesty.v1",
+  "issue": "https://github.com/tidefs/tidefs/issues/2223",
+  "parent_issue": "https://github.com/tidefs/tidefs/issues/1794",
+  "run_id": "29630398064/1",
+  "source_ref": "85596c69f61e5165571300ee5bec639818f68f6d",
+  "generated_at": "2026-07-18T04:20:49Z",
+  "validation_tier": "mounted-userspace",
+  "command": "storage-intent-ack-runtime-validation",
+  "backend": {
+    "kind": "live-fuse-local-object-store",
+    "carrier": "linux-7.0-qemu-guest",
+    "kernel_release": "7.0.0",
+    "mount_options": [
+      "rw",
+      "nodev",
+      "nosuid",
+      "subtype=tidefs"
+    ],
+    "receipt_source": "bounded LocalAckReceiptLedger diagnostic copies",
+    "fault_injection": "none"
+  },
+  "rows": [
+    {
+      "row_id": "sync-write-receipt",
+      "syscall": "write(O_SYNC)",
+      "expected_receipt_operation": "sync-write",
+      "syscall_result": "error",
+      "errno": 5,
+      "observed_receipts": [
+        {
+          "operation": "fdatasync",
+          "requested_ack_floor": "local-intent",
+          "earned_ack_class": "full-placement",
+          "disposition": "durable-posix",
+          "convergence": "satisfied",
+          "durability_state": "FullPlacement",
+          "target_inode": 2,
+          "target_offset": 0,
+          "target_length": 0,
+          "target_has_range": false,
+          "evidence_ref_count": 10,
+          "refusal_reason": "None",
+          "posix_durable_success": true,
+          "satisfies_requested_ack_floor": true
+        }
+      ],
+      "outcome": "product-fail",
+      "reason": "mounted syscall did not produce an accepted receipt or refusal: Input/output error (os error 5)"
+    },
+    {
+      "row_id": "fsync-receipt",
+      "syscall": "fsync",
+      "expected_receipt_operation": "fsync",
+      "syscall_result": "error",
+      "errno": 5,
+      "observed_receipts": [
+        {
+          "operation": "fdatasync",
+          "requested_ack_floor": "local-intent",
+          "earned_ack_class": "full-placement",
+          "disposition": "durable-posix",
+          "convergence": "satisfied",
+          "durability_state": "FullPlacement",
+          "target_inode": 3,
+          "target_offset": 0,
+          "target_length": 0,
+          "target_has_range": false,
+          "evidence_ref_count": 10,
+          "refusal_reason": "None",
+          "posix_durable_success": true,
+          "satisfies_requested_ack_floor": true
+        }
+      ],
+      "outcome": "product-fail",
+      "reason": "mounted syscall did not produce an accepted receipt or refusal: Input/output error (os error 5)"
+    },
+    {
+      "row_id": "fdatasync-receipt",
+      "syscall": "fdatasync",
+      "expected_receipt_operation": "fdatasync",
+      "syscall_result": "success",
+      "errno": null,
+      "observed_receipts": [
+        {
+          "operation": "fdatasync",
+          "requested_ack_floor": "local-intent",
+          "earned_ack_class": "full-placement",
+          "disposition": "durable-posix",
+          "convergence": "satisfied",
+          "durability_state": "FullPlacement",
+          "target_inode": 4,
+          "target_offset": 0,
+          "target_length": 0,
+          "target_has_range": false,
+          "evidence_ref_count": 10,
+          "refusal_reason": "None",
+          "posix_durable_success": true,
+          "satisfies_requested_ack_floor": true
+        }
+      ],
+      "outcome": "pass",
+      "reason": "mounted syscall returned success with an earned fdatasync receipt"
+    },
+    {
+      "row_id": "odsync-receipt",
+      "syscall": "write(O_DSYNC)",
+      "expected_receipt_operation": "odsync",
+      "syscall_result": "success",
+      "errno": null,
+      "observed_receipts": [
+        {
+          "operation": "fdatasync",
+          "requested_ack_floor": "local-intent",
+          "earned_ack_class": "full-placement",
+          "disposition": "durable-posix",
+          "convergence": "satisfied",
+          "durability_state": "FullPlacement",
+          "target_inode": 5,
+          "target_offset": 0,
+          "target_length": 0,
+          "target_has_range": false,
+          "evidence_ref_count": 10,
+          "refusal_reason": "None",
+          "posix_durable_success": true,
+          "satisfies_requested_ack_floor": true
+        }
+      ],
+      "outcome": "product-fail",
+      "reason": "mounted syscall returned success without an earned odsync receipt"
+    },
+    {
+      "row_id": "shared-mmap-msync-receipt-or-refusal",
+      "syscall": "mmap(MAP_SHARED)+msync(MS_SYNC)",
+      "expected_receipt_operation": "shared-mmap-msync",
+      "syscall_result": "refused",
+      "errno": 22,
+      "observed_receipts": [],
+      "outcome": "pass",
+      "reason": "unsupported mounted operation failed closed: Invalid argument (os error 22)"
+    },
+    {
+      "row_id": "namespace-receipt",
+      "syscall": "create+rename+fsync(parent)",
+      "expected_receipt_operation": "fsync-directory",
+      "syscall_result": "error",
+      "errno": 5,
+      "observed_receipts": [],
+      "outcome": "product-fail",
+      "reason": "mounted syscall did not produce an accepted receipt or refusal: Input/output error (os error 5)"
+    },
+    {
+      "row_id": "fsyncdir-receipt",
+      "syscall": "fsyncdir",
+      "expected_receipt_operation": "fsync-directory",
+      "syscall_result": "error",
+      "errno": 5,
+      "observed_receipts": [],
+      "outcome": "product-fail",
+      "reason": "mounted syscall did not produce an accepted receipt or refusal: Input/output error (os error 5)"
+    }
+  ],
+  "summary": {
+    "status": "product-fail",
+    "passed": 2,
+    "product_failed": 5,
+    "harness_failed": 0,
+    "environment_refused": 0,
+    "skipped": 0
+  },
+  "residual_risk": [
+    "This evidence is bounded to one live local FUSE mount and the exact operations recorded; it is not crash, power-loss, stale-media, distributed-quorum, kernel-VFS, successor, production, or release evidence.",
+    "A product-fail outcome keeps the claim blocked and identifies mounted operations that returned success without the exact earned receipt; workflow success means evidence capture succeeded, not that every product row passed.",
+    "The receipt channel is best-effort diagnostic output after the authoritative ledger records a receipt; missing diagnostic copies cannot weaken or strengthen an acknowledgment."
+  ]
+}
