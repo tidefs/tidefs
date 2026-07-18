@@ -8464,14 +8464,24 @@ impl FuseVfsAdapter {
         // stable order before clearing any inode's dirty projections.
         let _write_cache_reconciliation_guards = self.write_cache_reconciliation.lock_all();
         let (worker_dirty_tracker, worker_dirty_boundary) = self.take_worker_dirty_boundary();
-        let mut page_cache_dirty_inodes: HashSet<u64> = self
-            .write_page_cache
-            .dirty_pages()
+        // Reconcile every inode whose owner can retire below. A page-cache-only
+        // set misses tracker-only owners and leaves their reclaim projection
+        // falsely dirty after a successful mount-wide barrier.
+        let mut dirty_projection_inodes: HashSet<u64> = worker_dirty_tracker
+            .lock()
+            .unwrap()
+            .all_dirty_ranges()
             .into_iter()
-            .map(|key| key.inode)
+            .map(|(ino, _, _)| ino)
             .collect();
+        dirty_projection_inodes.extend(
+            self.write_page_cache
+                .dirty_pages()
+                .into_iter()
+                .map(|key| key.inode),
+        );
         if let Some(ref writeback_page_cache) = self.writeback_page_cache {
-            page_cache_dirty_inodes.extend(
+            dirty_projection_inodes.extend(
                 writeback_page_cache
                     .dirty_pages()
                     .into_iter()
@@ -8490,6 +8500,7 @@ impl FuseVfsAdapter {
         } else {
             Vec::new()
         };
+        dirty_projection_inodes.extend(tracked_ranges.iter().map(|(inode, _)| inode.get()));
 
         let sync_result = (|| {
             let e = self.engine.lock().unwrap();
@@ -8549,7 +8560,7 @@ impl FuseVfsAdapter {
             .lock()
             .unwrap()
             .clear_all_until_boundary(worker_dirty_boundary);
-        for ino in page_cache_dirty_inodes {
+        for ino in dirty_projection_inodes {
             if let Some(ref writeback_page_cache) = self.writeback_page_cache {
                 writeback_page_cache.clear_dirty_for_inode(ino);
             }
@@ -42356,7 +42367,7 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_syncfs_drains_all_writeback_range_tracker_inodes() {
+    fn dispatch_syncfs_drains_all_dirty_projection_inodes() {
         let (mut fixture, tracker) = adapter_fixture_with_writeback_tracker();
         let ctx = root_ctx();
         let writeback_page_cache = Arc::new(PageCache::new(8, 4096));
@@ -42402,6 +42413,18 @@ mod tests {
                 .mark_dirty(ino_b.get(), 0, b"BBBB".len() as u64)
                 .expect("seed worker range B");
         }
+        let worker_only_inode = 900_001;
+        {
+            let mut worker_tracker = worker_tracker.lock().unwrap();
+            worker_tracker
+                .mark_dirty(worker_only_inode, 0, 4096)
+                .expect("seed worker-only dirty range");
+        }
+        {
+            let mut cache = fixture.adapter.writeback_cache.lock().unwrap();
+            cache.insert(worker_only_inode);
+            cache.mark_dirty(worker_only_inode, 4096);
+        }
         for inode in [ino_a, ino_b] {
             let _ = writeback_page_cache
                 .insert(inode.get(), 0)
@@ -42416,6 +42439,15 @@ mod tests {
         }
         assert!(tracker.lock().unwrap().is_dirty(ino_a));
         assert!(tracker.lock().unwrap().is_dirty(ino_b));
+        assert_eq!(
+            fixture
+                .adapter
+                .writeback_cache
+                .lock()
+                .unwrap()
+                .is_dirty(worker_only_inode),
+            Some(true)
+        );
 
         // Run syncfs — must drain ALL inodes from the tracker.
         fixture.adapter.dispatch_syncfs(&ctx).expect("syncfs");
@@ -42424,6 +42456,10 @@ mod tests {
         assert!(!tracker.lock().unwrap().is_dirty(ino_b));
         assert!(!worker_tracker.lock().unwrap().has_dirty_ranges(ino_a.get()));
         assert!(!worker_tracker.lock().unwrap().has_dirty_ranges(ino_b.get()));
+        assert!(!worker_tracker
+            .lock()
+            .unwrap()
+            .has_dirty_ranges(worker_only_inode));
         for inode in [ino_a, ino_b] {
             assert!(!writeback_page_cache.has_dirty_pages_for_inode(inode.get()));
             assert!(!fixture
@@ -42431,6 +42467,16 @@ mod tests {
                 .write_page_cache
                 .has_dirty_pages_for_inode(inode.get()));
         }
+        assert_eq!(
+            fixture
+                .adapter
+                .writeback_cache
+                .lock()
+                .unwrap()
+                .is_dirty(worker_only_inode),
+            Some(false),
+            "syncfs must publish the reclaim projection clean after a worker-only owner drains"
+        );
     }
 
     #[test]
