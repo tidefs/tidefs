@@ -4407,8 +4407,14 @@ impl Pool {
                 });
             }
             evidence.state = ReplacementRebuildStatusState::Canceled;
+            evidence.topology_epoch = self.placement_epoch.saturating_add(1).max(1);
             persist_device_replacement_evidence(&self.config.root_path, &evidence)?;
+            let canceled_topology_epoch = evidence.topology_epoch;
             self.replacement_evidence = Some(evidence);
+
+            // Commit the restored old topology only after cancellation is durable.
+            self.placement_epoch = canceled_topology_epoch;
+            self.persist_active_labels_if_needed()?;
             return Ok(());
         }
 
@@ -9442,6 +9448,7 @@ mod tests {
             canceled.detach_decision,
             ReplacementDetachDecision::UnsafeToDetach
         );
+        assert_eq!(reopened.placement_epoch(), canceled.topology_epoch);
         drop(reopened);
 
         let reopened = Pool::open(config, PoolProperties::default(), &test_options()).unwrap();
@@ -9450,6 +9457,7 @@ mod tests {
             .expect("replayed canceled replacement evidence");
         assert_eq!(canceled.state, ReplacementRebuildStatusState::Canceled);
         assert!(canceled.evidence_replayable_after_reopen);
+        assert_eq!(reopened.placement_epoch(), canceled.topology_epoch);
 
         let _ = std::fs::remove_dir_all(&root);
     }
