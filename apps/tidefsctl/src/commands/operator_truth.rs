@@ -41,11 +41,28 @@ impl OperatorTruthEvidenceState {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OperatorTruthScope {
+    LocalPool,
+    Distributed,
+}
+
+impl OperatorTruthScope {
+    #[must_use]
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::LocalPool => "local-pool",
+            Self::Distributed => "distributed",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct OperatorTruthCarrier {
     pub(crate) command: &'static str,
     pub(crate) operation: &'static str,
     pub(crate) pool_name: String,
+    pub(crate) scope: OperatorTruthScope,
     pub(crate) evidence_state: OperatorTruthEvidenceState,
     pub(crate) source: TruthViewSourceClass,
     pub(crate) cut: TruthViewCutClass,
@@ -66,6 +83,26 @@ impl OperatorTruthCarrier {
             command,
             operation,
             pool_name: pool_name.to_string(),
+            scope: OperatorTruthScope::Distributed,
+            evidence_state: OperatorTruthEvidenceState::LiveWithinBudget,
+            source: TruthViewSourceClass::RuntimeMirror,
+            cut: TruthViewCutClass::LiveWindow,
+            provenance: TruthViewProvenanceClass::LiveMirror,
+            exactness: TruthViewExactnessClass::SourceBoundProjection,
+            freshness: TruthViewFreshnessClass::LiveWithinBudget,
+            refusal: None,
+        }
+    }
+
+    /// Bind the reachable live-owner `pool status` projection without
+    /// promoting pool-local facts into a distributed operator surface.
+    #[must_use]
+    pub(crate) fn live_pool_route(pool_name: &str) -> Self {
+        Self {
+            command: "pool",
+            operation: "status",
+            pool_name: pool_name.to_string(),
+            scope: OperatorTruthScope::LocalPool,
             evidence_state: OperatorTruthEvidenceState::LiveWithinBudget,
             source: TruthViewSourceClass::RuntimeMirror,
             cut: TruthViewCutClass::LiveWindow,
@@ -86,6 +123,7 @@ impl OperatorTruthCarrier {
             command,
             operation,
             pool_name: pool_name.to_string(),
+            scope: OperatorTruthScope::Distributed,
             evidence_state: OperatorTruthEvidenceState::Refused,
             source: TruthViewSourceClass::RuntimeMirror,
             cut: TruthViewCutClass::LiveWindow,
@@ -106,6 +144,7 @@ impl OperatorTruthCarrier {
             command,
             operation,
             pool_name: pool_name.to_string(),
+            scope: OperatorTruthScope::Distributed,
             evidence_state: OperatorTruthEvidenceState::Refused,
             source: TruthViewSourceClass::RuntimeMirror,
             cut: TruthViewCutClass::LiveWindow,
@@ -126,6 +165,7 @@ impl OperatorTruthCarrier {
             command,
             operation,
             pool_name: pool_name.to_string(),
+            scope: OperatorTruthScope::Distributed,
             evidence_state: OperatorTruthEvidenceState::Stale,
             source: TruthViewSourceClass::RunbookState,
             cut: TruthViewCutClass::ArchiveRecall,
@@ -146,6 +186,7 @@ impl OperatorTruthCarrier {
             command,
             operation,
             pool_name: pool_name.to_string(),
+            scope: OperatorTruthScope::Distributed,
             evidence_state: OperatorTruthEvidenceState::DeterministicNonLive,
             source: TruthViewSourceClass::SemanticTrace,
             cut: TruthViewCutClass::TraceReplay,
@@ -187,9 +228,14 @@ impl OperatorTruthCarrier {
     }
 
     #[must_use]
-    pub(crate) fn distributed_surface_record(&self) -> TruthViewDistributedOperatorSurfaceRecord {
+    pub(crate) fn distributed_surface_record(
+        &self,
+    ) -> Option<TruthViewDistributedOperatorSurfaceRecord> {
+        if self.scope != OperatorTruthScope::Distributed {
+            return None;
+        }
         let signal = TruthViewDistributedOperatorSignalClass::Health;
-        TruthViewDistributedOperatorSurfaceRecord {
+        Some(TruthViewDistributedOperatorSurfaceRecord {
             live_view_class: signal.required_live_view().as_u32(),
             signal_class: signal.as_u32(),
             status_class: self.distributed_status_class().as_u32(),
@@ -199,7 +245,7 @@ impl OperatorTruthCarrier {
             exactness_class: self.exactness.as_u32(),
             freshness_class: self.freshness.as_u32(),
             ..TruthViewDistributedOperatorSurfaceRecord::default()
-        }
+        })
     }
 
     #[must_use]
@@ -222,14 +268,14 @@ impl OperatorTruthCarrier {
 
     #[must_use]
     pub(crate) fn json_value(&self) -> serde_json::Value {
-        let distributed_surface_record = self.distributed_surface_record();
         let truth_bundle_record = self.truth_bundle_record();
 
-        serde_json::json!({
+        let mut value = serde_json::json!({
             "command": self.command,
             "operation": self.operation,
             "status_path": self.status_path(),
             "pool_name": self.pool_name,
+            "scope": self.scope.as_str(),
             "evidence_state": self.evidence_state.as_str(),
             "supported_evidence_states": OperatorTruthEvidenceState::supported_labels(),
             "source": self.source.as_str(),
@@ -238,16 +284,6 @@ impl OperatorTruthCarrier {
             "exactness": self.exactness.as_str(),
             "freshness": self.freshness.as_str(),
             "refusal": self.refusal,
-            "distributed_surface_record": {
-                "live_view": distributed_surface_record.live_view().expect("operator truth live-view class is fixed").as_str(),
-                "signal": distributed_surface_record.signal().expect("operator truth signal class is fixed").as_str(),
-                "status": distributed_surface_record.status().expect("operator truth status class is fixed").as_str(),
-                "source": distributed_surface_record.source().expect("operator truth source class comes from typed carrier").as_str(),
-                "cut": distributed_surface_record.cut().expect("operator truth cut class comes from typed carrier").as_str(),
-                "provenance": distributed_surface_record.provenance().expect("operator truth provenance class comes from typed carrier").as_str(),
-                "exactness": distributed_surface_record.exactness().expect("operator truth exactness class comes from typed carrier").as_str(),
-                "freshness": distributed_surface_record.freshness().expect("operator truth freshness class comes from typed carrier").as_str(),
-            },
             "truth_bundle_record": {
                 "route": truth_bundle_record.route().expect("operator truth route class is fixed").as_str(),
                 "surface": truth_bundle_record.surface().expect("operator truth surface class is fixed").as_str(),
@@ -257,7 +293,22 @@ impl OperatorTruthCarrier {
                 "audience": truth_bundle_record.audience().expect("operator truth audience class is fixed").as_str(),
                 "answer_kind": truth_bundle_record.answer_kind().expect("operator truth answer kind is fixed").as_str(),
             },
-        })
+        });
+
+        if let Some(distributed_surface_record) = self.distributed_surface_record() {
+            value["distributed_surface_record"] = serde_json::json!({
+                "live_view": distributed_surface_record.live_view().expect("operator truth live-view class is fixed").as_str(),
+                "signal": distributed_surface_record.signal().expect("operator truth signal class is fixed").as_str(),
+                "status": distributed_surface_record.status().expect("operator truth status class is fixed").as_str(),
+                "source": distributed_surface_record.source().expect("operator truth source class comes from typed carrier").as_str(),
+                "cut": distributed_surface_record.cut().expect("operator truth cut class comes from typed carrier").as_str(),
+                "provenance": distributed_surface_record.provenance().expect("operator truth provenance class comes from typed carrier").as_str(),
+                "exactness": distributed_surface_record.exactness().expect("operator truth exactness class comes from typed carrier").as_str(),
+                "freshness": distributed_surface_record.freshness().expect("operator truth freshness class comes from typed carrier").as_str(),
+            });
+        }
+
+        value
     }
 
     #[must_use]
@@ -268,6 +319,7 @@ impl OperatorTruthCarrier {
                 self.command, self.operation, self.pool_name
             ),
             format!("  path:       {}", self.status_path()),
+            format!("  scope:      {}", self.scope.as_str()),
             format!("  evidence:   {}", self.evidence_state.as_str()),
             format!(
                 "  states:     {}",
@@ -308,7 +360,9 @@ mod tests {
     fn live_carrier_projects_to_typed_truth_view_records() {
         let carrier = OperatorTruthCarrier::live_route("cluster", "status", "alpha");
 
-        let surface = carrier.distributed_surface_record();
+        let surface = carrier
+            .distributed_surface_record()
+            .expect("distributed carrier has a distributed surface record");
         assert_eq!(
             surface.live_view().unwrap(),
             TruthViewDistributedOperatorSignalClass::Health.required_live_view()
@@ -353,7 +407,9 @@ mod tests {
     fn refusal_projects_to_blocked_refusal_records() {
         let carrier = OperatorTruthCarrier::no_live_refusal("device", "status", "alpha");
 
-        let surface = carrier.distributed_surface_record();
+        let surface = carrier
+            .distributed_surface_record()
+            .expect("distributed refusal has a distributed surface record");
         assert_eq!(
             surface.status().unwrap(),
             TruthViewDistributedOperatorStatusClass::Blocked
@@ -383,7 +439,11 @@ mod tests {
         assert_eq!(carrier.cut, TruthViewCutClass::LiveWindow);
         assert_eq!(carrier.freshness, TruthViewFreshnessClass::Refused);
         assert_eq!(
-            carrier.distributed_surface_record().status().unwrap(),
+            carrier
+                .distributed_surface_record()
+                .expect("distributed refusal has a distributed surface record")
+                .status()
+                .unwrap(),
             TruthViewDistributedOperatorStatusClass::Blocked
         );
         assert!(carrier
@@ -434,6 +494,30 @@ mod tests {
     }
 
     #[test]
+    fn live_pool_carrier_stays_local_and_uses_generic_truth_bundle() {
+        let carrier = OperatorTruthCarrier::live_pool_route("alpha");
+        let json = carrier.json_value();
+
+        assert_eq!(carrier.scope, OperatorTruthScope::LocalPool);
+        assert_eq!(carrier.status_path(), "tidefsctl pool status");
+        assert_eq!(carrier.source, TruthViewSourceClass::RuntimeMirror);
+        assert_eq!(carrier.cut, TruthViewCutClass::LiveWindow);
+        assert_eq!(carrier.provenance, TruthViewProvenanceClass::LiveMirror);
+        assert_eq!(
+            carrier.exactness,
+            TruthViewExactnessClass::SourceBoundProjection
+        );
+        assert_eq!(carrier.freshness, TruthViewFreshnessClass::LiveWithinBudget);
+        assert!(carrier.distributed_surface_record().is_none());
+        assert_eq!(json["scope"], "local-pool");
+        assert!(json.get("distributed_surface_record").is_none());
+        assert_eq!(
+            json["truth_bundle_record"]["answer_kind"],
+            "answer.response_registry.bundle.k0"
+        );
+    }
+
+    #[test]
     fn carrier_boundary_names_stale_and_deterministic_non_live() {
         let stale = OperatorTruthCarrier::stale_non_live("cluster", "status", "alpha");
         let deterministic =
@@ -450,11 +534,19 @@ mod tests {
             TruthViewFreshnessClass::DeterministicNonLive
         );
         assert_eq!(
-            stale.distributed_surface_record().status().unwrap(),
+            stale
+                .distributed_surface_record()
+                .expect("distributed stale carrier has a surface record")
+                .status()
+                .unwrap(),
             TruthViewDistributedOperatorStatusClass::Degraded
         );
         assert_eq!(
-            deterministic.distributed_surface_record().status().unwrap(),
+            deterministic
+                .distributed_surface_record()
+                .expect("distributed deterministic carrier has a surface record")
+                .status()
+                .unwrap(),
             TruthViewDistributedOperatorStatusClass::Degraded
         );
     }
