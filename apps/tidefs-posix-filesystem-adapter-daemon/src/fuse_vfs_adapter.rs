@@ -6443,7 +6443,7 @@ impl FuseVfsAdapter {
             let is_dirty = {
                 let ds = self.dirty_state.lock().unwrap();
                 ds.get(&ino)
-                    .map(|dr| dr.contains(plan.offset, plan.size))
+                    .map(|dr| dr.overlaps(plan.offset, u64::from(plan.size)))
                     .unwrap_or(false)
             };
 
@@ -33729,6 +33729,50 @@ mod tests {
         // (the dirty range bypasses it).
         let bv_data = bv.lock().unwrap().stored(0, payload.len() as u64);
         assert!(bv_data.is_empty() || bv_data.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn block_volume_partial_dirty_overlap_falls_back_to_engine_read() {
+        let (fixture, bv) = adapter_fixture_with_mock_block_volume();
+        let ctx = root_ctx();
+        let (inode, adapter_fh, _engine_fh) = create_adapter_file_handle(
+            &fixture.adapter,
+            &ctx,
+            b"partial-dirty-bv.bin",
+            libc::O_RDWR as u32,
+        );
+        let baseline = b"0123456789";
+        fixture
+            .adapter
+            .dispatch_write(&ctx, inode.get(), adapter_fh, 0, baseline, 0)
+            .expect("baseline write");
+        fixture
+            .adapter
+            .dispatch_fsync(&ctx, inode.get(), adapter_fh)
+            .expect("baseline fsync");
+
+        fixture
+            .adapter
+            .dispatch_write(&ctx, inode.get(), adapter_fh, 4, b"XYZ", 0)
+            .expect("partial overwrite");
+        assert_eq!(
+            bv.lock().unwrap().stored(0, baseline.len() as u64),
+            baseline,
+            "dirty overwrite must still be absent from the clean block-volume mirror"
+        );
+
+        let readback = fixture
+            .adapter
+            .dispatch_read(
+                &ctx,
+                inode.get(),
+                adapter_fh,
+                0,
+                baseline.len() as u32,
+                None,
+            )
+            .expect("partially dirty read");
+        assert_eq!(readback, b"0123XYZ789");
     }
 
     /// After a writeback flush through the block-volume adapter, a
