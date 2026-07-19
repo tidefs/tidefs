@@ -4328,7 +4328,7 @@ fn live_snapshot_send_destination(args: &Value) -> Result<LiveSnapshotSendDestin
                     "snapshot send: invalid target-addr '{target_addr}': port must be non-zero"
                 ));
             }
-            if addr.ip().is_unspecified() {
+            if addr.ip().to_canonical().is_unspecified() {
                 return Err(format!(
                     "snapshot send: invalid target-addr '{target_addr}': IP address must not be unspecified"
                 ));
@@ -6978,7 +6978,7 @@ mod tests {
 
     #[test]
     fn live_snapshot_send_destination_rejects_unspecified_targets() {
-        for target_addr in ["0.0.0.0:9000", "[::]:9000"] {
+        for target_addr in ["0.0.0.0:9000", "[::]:9000", "[::ffff:0.0.0.0]:9000"] {
             assert_eq!(
                 live_snapshot_send_destination(&json!({
                     "target_addr": target_addr,
