@@ -4120,15 +4120,17 @@ fn build_snap_push_message(
 }
 
 fn is_snap_net_response_control(character: char) -> bool {
-    // char::is_control covers Unicode General Category Cc. Also reject the
-    // Bidirectional_Control format characters that can visually reorder
-    // peer-supplied text after it is surfaced to the operator or logs.
+    // char::is_control covers Unicode General Category Cc. Also reject line
+    // separators and the Bidirectional_Control format characters that can
+    // split or visually reorder peer-supplied operator and log text.
     character.is_control()
         || matches!(
             character,
             '\u{061c}'
                 | '\u{200e}'
                 | '\u{200f}'
+                | '\u{2028}'
+                | '\u{2029}'
                 | '\u{202a}'..='\u{202e}'
                 | '\u{2066}'..='\u{2069}'
         )
@@ -7178,6 +7180,8 @@ mod tests {
             (&b"\x1b[31m"[..], "U+001B"),
             ("\u{061c}".as_bytes(), "U+061C"),
             ("\u{200e}".as_bytes(), "U+200E"),
+            ("\u{2028}".as_bytes(), "U+2028"),
+            ("\u{2029}".as_bytes(), "U+2029"),
             ("\u{202e}".as_bytes(), "U+202E"),
             ("\u{2066}".as_bytes(), "U+2066"),
         ] {
