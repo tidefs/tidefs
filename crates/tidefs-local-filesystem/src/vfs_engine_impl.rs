@@ -4154,8 +4154,14 @@ fn parse_snap_net_response(data: &[u8]) -> Result<String, String> {
         ));
     }
     let message = std::str::from_utf8(&data[start..frame_len])
-        .map_err(|err| format!("snapshot send: remote response message is not UTF-8: {err}"))?
-        .to_string();
+        .map_err(|err| format!("snapshot send: remote response message is not UTF-8: {err}"))?;
+    if let Some(control) = message.chars().find(|character| character.is_control()) {
+        return Err(format!(
+            "snapshot send: remote response message contains control character U+{:04X}",
+            u32::from(control)
+        ));
+    }
+    let message = message.to_string();
     match kind {
         SNAP_KIND_ACK if message.is_empty() => Ok("ack".to_string()),
         SNAP_KIND_ACK => Ok(message),
@@ -7144,6 +7150,24 @@ mod tests {
         assert!(parse_snap_net_response(&ack).is_err_and(
             |err| err.starts_with("snapshot send: remote response message is not UTF-8:")
         ));
+    }
+
+    #[test]
+    fn parse_snap_net_response_rejects_control_characters() {
+        for (message, codepoint) in [(&b"ok\n"[..], "U+000A"), (&b"\x1b[31m"[..], "U+001B")] {
+            let mut ack = Vec::new();
+            ack.extend_from_slice(SNAP_NET_MAGIC);
+            ack.push(SNAP_KIND_ACK);
+            ack.extend_from_slice(&(message.len() as u32).to_le_bytes());
+            ack.extend_from_slice(message);
+
+            assert_eq!(
+                parse_snap_net_response(&ack),
+                Err(format!(
+                    "snapshot send: remote response message contains control character {codepoint}"
+                ))
+            );
+        }
     }
 
     #[test]
