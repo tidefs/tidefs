@@ -1,27 +1,20 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
-//! Cluster-aware dataset catalog authority gated by lease/fence ownership.
+//! Cluster dataset-catalog wrapper gated by lease/fence ownership.
 //!
-//! Wraps the canonical [`tidefs_dataset_catalog::DatasetCatalog`] from
-//! `tidefs-dataset-catalog` and enforces cluster serialization: mutations
-//! require the active write fence, ensuring only the current lease holder
-//! can modify the catalog. This eliminates the split-brain risk where two
-//! nodes could concurrently create/destroy/rename datasets and produce
-//! divergent catalog states.
+//! Wraps [`tidefs_dataset_catalog::DatasetCatalog`] and gates catalog
+//! mutations on the active write fence.
 //!
 //! ## Authority
 //!
-//! This module is **not** a second catalog authority. It delegates all
-//! catalog lookups and mutations to the canonical
-//! [`tidefs_dataset_catalog::DatasetCatalog`] (issue #5952). The only
-//! additions are lease-gating and cluster-state replication.
+//! This module is **not** a second catalog authority. It delegates catalog
+//! lookups and mutations to [`tidefs_dataset_catalog::DatasetCatalog`] and
+//! adds lease-gate state plus catalog-delta preparation and application.
 //!
 //! ## Replication model
 //!
-//! Catalog state is encoded as a blob and included in committed epoch
-//! transitions. Each node applies committed catalog mutations in epoch
-//! order, converging to one authoritative catalog state. After failover
-//! or restart, the catalog is recovered from the committed root and
-//! replayed intent log, same as all other pool metadata.
+//! The wrapper's contained catalog and its encode/decode helpers are local
+//! mechanisms for callers. They are not evidence of clustered dataset
+//! readiness, failover, complete fencing, recovery, or product admission.
 //!
 //! ## Integration
 //!
@@ -100,7 +93,7 @@ pub struct DatasetCreateRequest {
 ///
 /// The lease holder prepares a [`CatalogDelta`] that describes the desired
 /// catalog mutation. The delta is serialized and included in a cluster
-/// epoch proposal via [`MembershipMessage::ProposalSubmission`].
+/// epoch proposal via `MembershipMessage::ProposalSubmission`.
 /// Peers validate and ack the delta; upon commit, all nodes apply it
 /// via [`ClusterDatasetCatalog::apply_delta`].
 ///
@@ -211,7 +204,7 @@ impl ClusterDatasetCatalog {
     ///
     /// Validates the mutation against the lease gate and catalog rules,
     /// but does NOT apply it. The returned delta is intended for cluster
-    /// proposal; apply with [`apply_delta`] once committed.
+    /// proposal; apply with [`Self::apply_delta`] once committed.
     pub fn prepare_create_delta(
         &self,
         fence: &WriteFence,
@@ -382,7 +375,7 @@ impl ClusterDatasetCatalog {
 /// ```
 #[derive(Clone, Debug)]
 pub struct ClusterDatasetCatalog {
-    /// The canonical dataset catalog (single authority per #5952).
+    /// The dataset catalog wrapped by this cluster gate.
     catalog: DatasetCatalog,
     /// Whether this node currently holds the write lease.
     is_lease_holder: bool,
@@ -578,7 +571,7 @@ impl ClusterDatasetCatalog {
     /// Create a new dataset in the catalog.
     ///
     /// Requires lease-holder authority. The `fence` must match the active
-    /// write fence recorded from the most recent [`on_lease_acquired`].
+    /// write fence recorded from the most recent [`Self::on_lease_acquired`].
     pub fn create(
         &mut self,
         fence: &WriteFence,
@@ -695,9 +688,8 @@ impl Default for ClusterDatasetCatalog {
 ///
 /// # Authority
 ///
-/// This is **not** a second catalog authority. It binds the canonical
-/// [`ClusterDatasetCatalog`] (wrapping [`DatasetCatalog`] per #5952)
-/// to a pool identity for cluster-committed state management.
+/// This is **not** a second catalog authority. It binds a
+/// [`ClusterDatasetCatalog`] that wraps [`DatasetCatalog`] to a pool identity.
 #[derive(Clone, Debug)]
 pub struct ClusterPoolCatalog {
     /// Pool name (e.g. "tank").

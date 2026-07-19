@@ -1575,10 +1575,9 @@ pub struct LocalFileSystem {
     /// Tracks where the effective compression policy was resolved from.
     compression_policy_source: CompressionPolicySource,
     lifecycle: DatasetLifecycle,
-    /// Durable pool-wide dataset catalog: canonical B+tree mapping hierarchical
-    /// dataset paths to stable [`DatasetId`] values. Loaded from pool store on
-    /// mount; saved after mutation. This is the single canonical dataset catalog
-    /// authority for the mounted filesystem (issue #5952).
+    /// Pool-store-backed dataset catalog mapping hierarchical paths to stable
+    /// [`DatasetId`] values. Mounted open decodes it from the pool store; live
+    /// catalog mutations persist encoded bytes and sync that store.
     dataset_catalog: DatasetCatalog,
     /// Durable pool-level property set. Loaded from pool store on mount;
     /// saved after mutation.

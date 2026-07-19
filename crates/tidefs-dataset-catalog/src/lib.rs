@@ -28,27 +28,18 @@
 //!
 //! # Authority
 //!
-//! This crate is the **intended canonical dataset catalog authority** for
-//! TideFS. The B+tree catalog maps hierarchical paths to stable
-//! [`DatasetId`] values, supports online rename without unmount, and
-//! provides [`mount_lookup`] for mount/import path resolution.
+//! This crate defines the B+tree catalog structure for hierarchical paths,
+//! stable [`DatasetId`] values, online rename, and `mount_lookup` path
+//! resolution.
 //!
-//! **Current gap**: The catalog is an in-memory data structure with
-//! [`encode`] / [`decode`] methods but **does not yet persist through
-//! the mounted pool's object store**. Pool-level persistence wiring (issue
-//! #5952) is required before this catalog becomes the live product path for
-//! `tidefsctl dataset`, mount/import lookup, and local-filesystem
-//! dataset/snapshot lifecycle management.
+//! The mounted local filesystem decodes catalog bytes from the pool store
+//! during open. Its catalog mutation paths persist this crate's encoded bytes
+//! through that store and call its sync operation. The pool-store wiring lives
+//! in the local-filesystem crate; this crate supplies the catalog structure
+//! and its `encode` and `decode` operations.
 //!
-//! Until that wiring is complete, the mounted snapshot authority lives in
-//! `tidefs_local_filesystem::state.snapshots`, and the
-//! `tidefs_control_plane_runtime::dataset_api` module is pre-production
-//! scaffolding with a side-store format that is **not** pool-wide catalog
-//! persistence.
-//!
-//! Do **not** close mounted/operator dataset gates with in-memory crate
-//! tests alone. Mounted validation must involve the pool-level
-//! persistence path.
+//! Catalog unit tests exercise the data structure. They do not independently
+//! establish behavior through the mounted local-filesystem pool-store wiring.
 
 use blake3::Hasher;
 use core::fmt;
@@ -685,7 +676,7 @@ impl DatasetCatalog {
 
     /// Resolve a mount path to the dataset ID.
     ///
-    /// Alias for [`lookup`] that signals mount-path resolution intent.
+    /// Alias for `lookup` that signals mount-path resolution intent.
     /// File handles reference the returned `DatasetId`, which survives
     /// renames unchanged.
     pub fn mount_lookup(&self, path: &str) -> Result<DatasetId, CatalogError> {
@@ -701,7 +692,7 @@ impl DatasetCatalog {
     /// the part after is the snapshot name. The snapshot must exist as
     /// a catalog entry registered with the full `@` path.
     ///
-    /// When no `@` is present, delegates to [`mount_lookup`] for
+    /// When no `@` is present, delegates to `mount_lookup` for
     /// standard dataset resolution.
     pub fn snapshot_lookup(&self, path: &str) -> Result<DatasetId, CatalogError> {
         if let Some((_base, _snap_name)) = path.rsplit_once('@') {
@@ -1137,7 +1128,7 @@ impl DatasetCatalog {
     /// Only [`DatasetType::Snapshot`] and clones ([`DatasetFlags::CLONE`])
     /// may have a lineage parent. Sets the entry's `lineage_parent_id`
     /// field without validating the lineage graph; validation happens at
-    /// [`publish_root`] time.
+    /// `publish_root` time.
     pub fn set_lineage_parent(
         &mut self,
         path: &str,
@@ -1286,7 +1277,7 @@ impl DatasetCatalog {
     ///
     /// Returns `(path, parent, DatasetType, creation_txg, DatasetFlags, LifecycleState)`
     /// if found. This is an O(n) scan and should be used sparingly; the
-    /// primary access path is [`lookup`] by path.
+    /// primary access path is `lookup` by path.
     pub fn get_by_id(
         &self,
         id: &DatasetId,
@@ -1803,7 +1794,7 @@ impl Default for DatasetCatalog {
 /// Merge dataset property overrides with inherited defaults.
 ///
 /// Each property is a key-value pair separated by `=`, one per line
-/// (same format as the `properties` blob stored in [`CatalogEntry`]).
+/// (same format as the `properties` blob stored in `CatalogEntry`).
 /// Override values take precedence over inherited defaults. Lines in
 /// the output are sorted by key.
 ///
