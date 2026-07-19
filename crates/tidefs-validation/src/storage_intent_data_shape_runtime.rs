@@ -426,11 +426,12 @@ fn ec_malformed_shard_set_refusal() -> Result<Value, String> {
     expect_invalid_available_set(&config, &wrong_role, "slot/role mismatch")?;
 
     let mut wrong_length = available;
+    let truncated_shard_len = config.shard_len - 1;
     wrong_length[0]
         .as_mut()
         .expect("encoded shard must be present")
         .bytes
-        .pop();
+        .truncate(truncated_shard_len);
     expect_invalid_available_set(&config, &wrong_length, "truncated shard")?;
 
     Ok(json!({
@@ -440,7 +441,7 @@ fn ec_malformed_shard_set_refusal() -> Result<Value, String> {
         "wrong_width_refused": true,
         "wrong_index_refused": true,
         "wrong_role_refused": true,
-        "truncated_shard_len": config.shard_len - 1,
+        "truncated_shard_len": truncated_shard_len,
         "truncated_shard_refused": true,
         "typed_refusal": "invalid-available-set",
         "generic_success_forbidden": true,
