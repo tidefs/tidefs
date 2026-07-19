@@ -14,7 +14,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tidefs_transport::{bulk_deadline_default, BULK_CHUNK_SIZE_DEFAULT, MAX_INFLIGHT_BULK_TOKENS};
 
@@ -306,6 +306,10 @@ impl BulkService {
 
     /// Process an OFFER and reserve a connection-scoped token slot on accept.
     pub fn offer(&mut self, offer: BulkOffer) -> BulkAccept {
+        self.offer_at(Instant::now(), offer)
+    }
+
+    fn offer_at(&mut self, now: Instant, offer: BulkOffer) -> BulkAccept {
         if offer.mode != BulkMode::TcpStream {
             return self.accept_reject(offer.stream_id, BulkAcceptResult::ModeUnsupported);
         }
@@ -345,7 +349,7 @@ impl BulkService {
         );
         let total_len = offer.total_len;
         let connection = self.connections.entry(offer.connection_id).or_default();
-        let transfer = TransferState::new(offer, token);
+        let transfer = TransferState::new(now, offer, token);
         connection.token_index.insert(token, transfer.stream_id);
         connection.transfers.insert(transfer.stream_id, transfer);
 
@@ -359,6 +363,45 @@ impl BulkService {
                 .min(total_len.min(u64::from(u32::MAX)) as u32),
             retry_after: None,
         }
+    }
+
+    /// Retire transfers whose configured absolute BULK deadline has elapsed.
+    ///
+    /// This bounds accepted OFFER lifetime even when the sender never follows
+    /// with a matching higher-layer request, CREDIT, DONE, or ABORT.
+    pub fn expire_timed_out(&mut self, now: Instant) -> Vec<AbortedBulkTransfer> {
+        let deadline = self.config.bulk_deadline;
+        let expired = self
+            .connections
+            .iter()
+            .flat_map(|(&connection_id, connection)| {
+                connection
+                    .transfers
+                    .iter()
+                    .filter_map(move |(&stream_id, transfer)| {
+                        (now.saturating_duration_since(transfer.accepted_at) >= deadline)
+                            .then_some((connection_id, stream_id))
+                    })
+            })
+            .collect::<Vec<_>>();
+
+        let mut aborted = Vec::with_capacity(expired.len());
+        for (connection_id, stream_id) in expired {
+            let Some(connection) = self.connections.get_mut(&connection_id) else {
+                continue;
+            };
+            let Some(transfer) = connection.remove_transfer(stream_id) else {
+                continue;
+            };
+            aborted.push(AbortedBulkTransfer {
+                connection_id,
+                stream_id,
+                token: transfer.token,
+                metadata: transfer.offer.metadata,
+                reason: BulkAbortReason::Timeout,
+            });
+        }
+        aborted
     }
 
     /// Request credit for the next TCP_STREAM chunk.
@@ -630,6 +673,7 @@ struct TransferState {
     offer: BulkOffer,
     token: BulkToken,
     stream_id: StreamId,
+    accepted_at: Instant,
     next_credit_seq: u32,
     next_offset: u64,
     pinned_bytes: u64,
@@ -640,16 +684,16 @@ struct TransferState {
 }
 
 impl TransferState {
-    fn new(offer: BulkOffer, token: BulkToken) -> Self {
-        let total_len = offer.total_len as usize;
+    fn new(accepted_at: Instant, offer: BulkOffer, token: BulkToken) -> Self {
         Self {
             stream_id: offer.stream_id,
             offer,
             token,
+            accepted_at,
             next_credit_seq: 0,
             next_offset: 0,
             pinned_bytes: 0,
-            buffer: vec![0; total_len],
+            buffer: Vec::new(),
             grants: BTreeMap::new(),
             received_chunks: BTreeSet::new(),
             received_bytes: 0,
@@ -689,6 +733,8 @@ impl TransferState {
                 actual: end,
             });
         }
+        let end_index = usize::try_from(end).map_err(|_| BulkError::TransferOverflow)?;
+        self.buffer.resize(end_index, 0);
         let grant = BulkCreditGrant {
             stream_id: self.stream_id,
             token,
@@ -918,6 +964,19 @@ mod tests {
     }
 
     #[test]
+    fn offer_defers_reassembly_allocation_until_credit() {
+        let mut service = service();
+        let token = service.offer(offer(7, 11, 11)).token.unwrap();
+
+        assert!(service.connections[&7].transfers[&11].buffer.is_empty());
+
+        service.credit(7, token, 0, 8).unwrap();
+        assert_eq!(service.connections[&7].transfers[&11].buffer.len(), 8);
+        service.credit(7, token, 1, 3).unwrap();
+        assert_eq!(service.connections[&7].transfers[&11].buffer.len(), 11);
+    }
+
+    #[test]
     fn rejects_rdma_modes_without_evidence_or_byte_mover() {
         let mut service = service();
         let accept = service.offer(BulkOffer {
@@ -949,6 +1008,36 @@ mod tests {
             service.offer(offer(7, 2, 1)).result,
             BulkAcceptResult::NoCredits
         );
+    }
+
+    #[test]
+    fn deadline_retires_orphaned_offers_and_reclaims_credit() {
+        let start = Instant::now();
+        let deadline = Duration::from_millis(10);
+        let mut service = BulkService::new(BulkServiceConfig {
+            max_inflight_tokens: 2,
+            max_pinned_bytes: 64,
+            max_transfer_len: 64,
+            max_chunk: 8,
+            bulk_deadline: deadline,
+            ..BulkServiceConfig::default()
+        });
+        let token = service.offer_at(start, offer(7, 1, 8)).token.unwrap();
+        service.offer_at(start, offer(7, 2, 8));
+        service.credit(7, token, 0, 8).unwrap();
+
+        assert!(service
+            .expire_timed_out(start + deadline - Duration::from_nanos(1))
+            .is_empty());
+        let aborted = service.expire_timed_out(start + deadline);
+
+        assert_eq!(aborted.len(), 2);
+        assert!(aborted
+            .iter()
+            .all(|transfer| transfer.reason == BulkAbortReason::Timeout));
+        assert_eq!(service.active_transfer_count(7), 0);
+        assert_eq!(service.pinned_bytes(7), 0);
+        assert_eq!(service.credit(7, token, 1, 8), Err(BulkError::UnknownToken));
     }
 
     #[test]

@@ -421,13 +421,33 @@ where
         Ok(())
     }
 
-    /// Retire locally timed-out incoming BULK WRITE requests and report their
-    /// VFS_RPC failures after reclaiming the active BULK token.
+    /// Retire locally timed-out incoming BULK transfers and report admitted
+    /// WRITE failures after reclaiming their active BULK tokens.
+    ///
+    /// Accepted OFFERs that never receive a matching VFS_RPC CONTROL request
+    /// are reclaimed at the BULK deadline without attempting a CONTROL reply.
     pub fn expire_write_timeouts(
         &self,
         now: Instant,
     ) -> Result<usize, VfsRpcBulkWriteRuntimeError> {
         let mut first_error = self.process_terminal_events().err();
+        let mut bulk_write_timeouts = 0usize;
+        for aborted in self.bulk.expire_timed_out(now) {
+            let key = PendingWriteKey {
+                connection_id: aborted.connection_id,
+                token: aborted.token,
+            };
+            let has_pending_write = self.state.lock().unwrap().pending_writes.contains_key(&key);
+            if !has_pending_write {
+                continue;
+            }
+            bulk_write_timeouts = bulk_write_timeouts.saturating_add(1);
+            if let Err(error) =
+                self.process_terminal_event(BulkDataServiceTerminal::Aborted(aborted))
+            {
+                first_error.get_or_insert(error);
+            }
+        }
         let expired = {
             let state = self.state.lock().unwrap();
             let timeout = state.adapter.config().request_timeout;
@@ -448,7 +468,7 @@ where
         }
         match first_error {
             Some(error) => Err(error),
-            None => Ok(expired.len()),
+            None => Ok(bulk_write_timeouts.saturating_add(expired.len())),
         }
     }
 
@@ -639,10 +659,15 @@ where
                     token: key.token,
                 });
             }
+            let errno = if abort.reason == BulkAbortReason::Timeout {
+                Errno::ETIMEDOUT
+            } else {
+                Errno::ECANCELED
+            };
             let response = VfsRpcResponse::error(
                 pending.request.header.op_id,
                 pending.request.header.method,
-                Errno::ECANCELED,
+                errno,
             )?;
             (record.session_id, response)
         };
@@ -951,6 +976,17 @@ mod tests {
         RecordingDispatch,
         Arc<RecordingControlReplySink>,
     ) {
+        runtime_with_bulk_deadline(request_timeout, BulkServiceConfig::default().bulk_deadline)
+    }
+
+    fn runtime_with_bulk_deadline(
+        request_timeout: Duration,
+        bulk_deadline: Duration,
+    ) -> (
+        Arc<VfsRpcBulkWriteRuntime<RecordingDispatch>>,
+        RecordingDispatch,
+        Arc<RecordingControlReplySink>,
+    ) {
         let mut sessions = TransportSessionSet::new();
         sessions.add_binding(PEER.0, SESSION_ID);
         sessions.mark_healthy(SESSION_ID);
@@ -968,6 +1004,7 @@ mod tests {
                 max_transfer_len: 64,
                 max_pinned_bytes: 64,
                 max_chunk: 8,
+                bulk_deadline,
                 ..BulkServiceConfig::default()
             },
         )));
@@ -1461,6 +1498,38 @@ mod tests {
 
         runtime.connection_lost(SESSION_ID);
         assert_eq!(runtime.pending_write_count(), 0);
+    }
+
+    #[test]
+    fn bulk_deadline_reclaims_admitted_and_orphan_transfers() {
+        let (runtime, target, sink) =
+            runtime_with_bulk_deadline(Duration::from_secs(1), Duration::ZERO);
+        let handle = create_handle(&runtime);
+        let data_dispatch = runtime.data_dispatch();
+        let admitted = accept_write_transfer(&data_dispatch, 2, 28, 3);
+        admitted_write(&runtime, handle, admitted, 3, Instant::now());
+        accept_write_transfer(&data_dispatch, 77, 29, 5);
+
+        assert_eq!(runtime.pending_write_count(), 1);
+        assert_eq!(runtime.bulk.active_transfer_count(SESSION_ID.0), 2);
+        assert_eq!(
+            runtime
+                .expire_write_timeouts(Instant::now())
+                .expect("bulk deadline"),
+            1
+        );
+
+        assert_eq!(runtime.pending_write_count(), 0);
+        assert_eq!(runtime.bulk.active_transfer_count(SESSION_ID.0), 0);
+        assert_eq!(runtime.bulk.pinned_bytes(SESSION_ID.0), 0);
+        assert_eq!(runtime.state.lock().unwrap().adapter.pending_bulk_len(), 0);
+        assert!(target.writes().is_empty());
+        let replies = sink.replies();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(
+            response(replies[0].1.clone()).header.errno,
+            Errno::ETIMEDOUT
+        );
     }
 
     #[test]

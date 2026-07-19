@@ -7,6 +7,7 @@
 //! acceptance or RDMA carriers live by itself.
 
 use std::sync::Mutex;
+use std::time::Instant;
 
 use tidefs_transport::{
     DataServiceDispatchError, DataServiceDispatchOutcome, DataServiceFrame, DataServiceHandler,
@@ -83,6 +84,15 @@ impl BulkDataServiceHandler {
     #[must_use]
     pub fn connection_lost(&self, connection_id: ConnectionId) -> Vec<AbortedBulkTransfer> {
         self.service.lock().unwrap().connection_lost(connection_id)
+    }
+
+    /// Retire transfers whose absolute BULK deadline elapsed.
+    ///
+    /// The returned records stay frame-local to the polling caller, matching
+    /// the terminal ownership used by [`Self::handle_data_service_frame_with_terminal`].
+    #[must_use]
+    pub fn expire_timed_out(&self, now: Instant) -> Vec<AbortedBulkTransfer> {
+        self.service.lock().unwrap().expire_timed_out(now)
     }
 
     #[must_use]
