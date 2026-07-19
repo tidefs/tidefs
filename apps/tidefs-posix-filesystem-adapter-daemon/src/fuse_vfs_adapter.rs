@@ -8220,9 +8220,61 @@ impl FuseVfsAdapter {
             Vec::new()
         };
 
+        // Snapshot every dirty owner that this inode barrier can retire. A
+        // block-volume target serves clean ranges from its own carrier, so
+        // copying only primary dirty_state would let fsync clear a shared,
+        // worker, or page-cache-only owner and expose stale carrier bytes.
+        let worker_dirty_ranges = worker_dirty_tracker
+            .lock()
+            .unwrap()
+            .get_dirty_ranges_with_boundary(ino)
+            .into_iter()
+            .filter_map(|(range, boundary)| (boundary <= worker_dirty_boundary).then_some(range))
+            .collect::<Vec<_>>();
+        let write_page_cache_dirty_pages = self
+            .write_page_cache
+            .dirty_pages()
+            .into_iter()
+            .filter(|key| key.inode == ino)
+            .collect::<Vec<_>>();
+        let write_page_cache_page_size = self.write_page_cache.page_size() as u64;
+        let writeback_page_cache_dirty_pages = self.writeback_page_cache.as_ref().map(|cache| {
+            (
+                cache.page_size() as u64,
+                cache
+                    .dirty_pages()
+                    .into_iter()
+                    .filter(|key| key.inode == ino)
+                    .collect::<Vec<_>>(),
+            )
+        });
+        let block_volume_dirty_state_ranges = self
+            .dirty_state
+            .lock()
+            .unwrap()
+            .get(&ino)
+            .cloned()
+            .unwrap_or_default();
+        let mut block_volume_copy_ranges = block_volume_dirty_state_ranges.clone();
+        for range in &worker_dirty_ranges {
+            block_volume_copy_ranges.mark_dirty_u64(range.offset_start, range.byte_len());
+        }
+        for range in &tracked_ranges {
+            block_volume_copy_ranges.mark_dirty_u64(range.offset, range.length);
+        }
+        for key in &write_page_cache_dirty_pages {
+            block_volume_copy_ranges.mark_dirty_u64(key.offset, write_page_cache_page_size);
+        }
+        if let Some((page_size, dirty_pages)) = &writeback_page_cache_dirty_pages {
+            for key in dirty_pages {
+                block_volume_copy_ranges.mark_dirty_u64(key.offset, *page_size);
+            }
+        }
+
         // Block-volume copying is not the final fsync durability boundary.
-        // Retire its dirty projection only after every later stage succeeds.
-        let mut block_volume_dirty_state_flushed = false;
+        // Retire its primary dirty projection only after every later stage
+        // succeeds.
+        let mut block_volume_copy_completed = false;
         let sync_result = (|| {
             // Phase 1: Writeback dirty pages through the local-filesystem
             // dispatch layer via PageCacheDirtyFlush.  This bridges the adapter
@@ -8247,45 +8299,53 @@ impl FuseVfsAdapter {
             {
                 let mut bv_guard = self.block_volume.lock().unwrap();
                 if let Some(bv) = bv_guard.as_mut() {
-                    let snapshot = {
-                        let ds = self.dirty_state.lock().unwrap();
-                        ds.get(&ino).map(|dr| dr.ranges().to_vec())
-                    };
-                    if let Some(ranges) = snapshot {
-                        let e = self.engine.lock().unwrap();
-                        for &(start, end) in &ranges {
-                            let len = u32::try_from(end - start).map_err(|_| Errno::EFBIG)?;
-                            let data = e.read(efh, start, len, ctx)?;
-                            // Resolve extent map for this range and write each
-                            // data chunk to the block volume at its physical offset.
-                            let entries = e.lookup_extents(efh.inode_id, start, len as u64);
-                            if entries.is_empty() {
-                                // No extent allocation yet — fall back to logical
-                                // offset write (the extent will be allocated later).
-                                bv.write_bytes(start, &data)?;
-                            } else {
-                                for entry in entries {
-                                    if entry.is_data() {
-                                        let clip_start = entry.logical_offset.max(start);
-                                        let clip_end = entry.end_offset().min(end);
-                                        let clip_len = (clip_end - clip_start) as usize;
-                                        if clip_len == 0 {
-                                            continue;
-                                        }
-                                        let data_offset = (clip_start - start) as usize;
-                                        let chunk = &data[data_offset..data_offset + clip_len];
-                                        let phys_off =
-                                            clip_start - entry.logical_offset + entry.locator_id.0;
-                                        bv.write_bytes(phys_off, chunk)?;
+                    let e = self.engine.lock().unwrap();
+                    let file_size = e.getattr(efh.inode_id, Some(efh), ctx)?.posix.size;
+                    for &(start, dirty_end) in block_volume_copy_ranges.ranges() {
+                        // Page-cache mirrors own complete pages, including a
+                        // tail beyond EOF. Copy only file-visible bytes.
+                        let end = dirty_end.min(file_size);
+                        if start >= end {
+                            continue;
+                        }
+                        let length = end.saturating_sub(start);
+                        let len = u32::try_from(length).map_err(|_| Errno::EFBIG)?;
+                        let data = e.read(efh, start, len, ctx)?;
+                        if data.len() != length as usize {
+                            return Err(Errno::EIO);
+                        }
+                        // Resolve extent map for this range and write each
+                        // data chunk to the block volume at its physical offset.
+                        let entries = e.lookup_extents(efh.inode_id, start, length);
+                        if entries.is_empty() {
+                            // No extent allocation yet — fall back to logical
+                            // offset write (the extent will be allocated later).
+                            bv.write_bytes(start, &data)?;
+                        } else {
+                            for entry in entries {
+                                if entry.is_data() {
+                                    let clip_start = entry.logical_offset.max(start);
+                                    let clip_end = entry.end_offset().min(end);
+                                    let clip_len = (clip_end - clip_start) as usize;
+                                    if clip_len == 0 {
+                                        continue;
                                     }
-                                    // Holes and UNWRITTEN extents are not written
-                                    // to the block volume; they stay as engine-resident.
+                                    let data_offset = (clip_start - start) as usize;
+                                    let data_end =
+                                        data_offset.checked_add(clip_len).ok_or(Errno::EIO)?;
+                                    let chunk =
+                                        data.get(data_offset..data_end).ok_or(Errno::EIO)?;
+                                    let phys_off =
+                                        clip_start - entry.logical_offset + entry.locator_id.0;
+                                    bv.write_bytes(phys_off, chunk)?;
                                 }
+                                // Holes and UNWRITTEN extents are not written
+                                // to the block volume; they stay as engine-resident.
                             }
                         }
-                        drop(e);
-                        block_volume_dirty_state_flushed = true;
                     }
+                    drop(e);
+                    block_volume_copy_completed = true;
                 }
             } // Phase 2b: fdatasync durability barrier.
               // After the writeback drain, issue a lightweight fdatasync(2)
@@ -8384,11 +8444,15 @@ impl FuseVfsAdapter {
             .unwrap()
             .clear_until_boundary(ino, worker_dirty_boundary);
 
-        if block_volume_dirty_state_flushed {
+        if block_volume_copy_completed {
             let mut ds = self.dirty_state.lock().unwrap();
             if let Some(dr) = ds.get_mut(&ino) {
-                dr.clear_all();
-                ds.remove(&ino);
+                for &(start, end) in block_volume_dirty_state_ranges.ranges() {
+                    dr.clear_range(start, end.saturating_sub(start));
+                }
+                if dr.is_empty() {
+                    ds.remove(&ino);
+                }
             }
         }
 
@@ -33672,8 +33736,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn syncfs_copies_non_primary_dirty_owners_to_block_volume() {
+    fn assert_barrier_copies_non_primary_dirty_owners_to_block_volume(barrier: &str) {
         for owner in ["shared", "worker", "write-page", "writeback-page"] {
             let (mut fixture, block_volume, shared_tracker) =
                 adapter_fixture_with_shared_tracker_and_mock_block_volume();
@@ -33683,7 +33746,7 @@ mod tests {
             let (inode, adapter_fh, engine_fh) = create_adapter_file_handle(
                 &fixture.adapter,
                 &ctx,
-                format!("syncfs-{owner}-owner.bin").as_bytes(),
+                format!("{barrier}-{owner}-owner.bin").as_bytes(),
                 libc::O_RDWR as u32,
             );
             let stale = b"stale bytes";
@@ -33762,18 +33825,25 @@ mod tests {
             assert_eq!(
                 block_volume.lock().unwrap().stored(0, current.len() as u64),
                 stale,
-                "{owner} owner must still protect stale carrier bytes before syncfs"
+                "{owner} owner must still protect stale carrier bytes before {barrier}"
             );
 
-            fixture
-                .adapter
-                .dispatch_syncfs(&ctx)
-                .expect("syncfs non-primary owner");
+            match barrier {
+                "fsync" => fixture
+                    .adapter
+                    .dispatch_fsync(&ctx, inode.get(), adapter_fh)
+                    .expect("fsync non-primary owner"),
+                "syncfs" => fixture
+                    .adapter
+                    .dispatch_syncfs(&ctx)
+                    .expect("syncfs non-primary owner"),
+                _ => unreachable!(),
+            }
 
             assert_eq!(
                 block_volume.lock().unwrap().stored(0, current.len() as u64),
                 current,
-                "syncfs must copy bytes protected only by the {owner} owner"
+                "{barrier} must copy bytes protected only by the {owner} owner"
             );
             fixture.adapter.invalidate_read_cache_entry(inode.get());
             fixture
@@ -33785,7 +33855,7 @@ mod tests {
                     .dispatch_read(&ctx, inode.get(), adapter_fh, 0, current.len() as u32, None,)
                     .expect("read refreshed block-volume bytes"),
                 current,
-                "the {owner} owner must not expose stale carrier bytes after syncfs"
+                "the {owner} owner must not expose stale carrier bytes after {barrier}"
             );
             assert!(!shared_tracker.lock().unwrap().is_dirty(inode));
             assert!(!worker_tracker.lock().unwrap().has_dirty_ranges(inode.get()));
@@ -33795,6 +33865,16 @@ mod tests {
                 .has_dirty_pages_for_inode(inode.get()));
             assert!(!writeback_page_cache.has_dirty_pages_for_inode(inode.get()));
         }
+    }
+
+    #[test]
+    fn fsync_copies_non_primary_dirty_owners_to_block_volume() {
+        assert_barrier_copies_non_primary_dirty_owners_to_block_volume("fsync");
+    }
+
+    #[test]
+    fn syncfs_copies_non_primary_dirty_owners_to_block_volume() {
+        assert_barrier_copies_non_primary_dirty_owners_to_block_volume("syncfs");
     }
 
     #[test]
