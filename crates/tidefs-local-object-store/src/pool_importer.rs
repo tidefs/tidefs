@@ -206,6 +206,7 @@ impl CandidatePool {
     /// - All devices share the same pool_guid.
     /// - Pool state agrees across devices and is importable (Active or Exported).
     /// - device_count is consistent across devices.
+    /// - The discovered member count exactly matches device_count.
     /// - All devices match the selected topology_generation.
     /// - Devices are sorted by device_index with no gaps.
     pub fn validate(&mut self) -> Result<(), ImportError> {
@@ -252,6 +253,17 @@ impl CandidatePool {
                     ),
                 });
             }
+        }
+
+        if self.devices.len() != self.device_count as usize {
+            return Err(ImportError::TopologyInconsistent {
+                pool_guid: self.pool_guid,
+                detail: format!(
+                    "found {} devices but pool labels expect {}",
+                    self.devices.len(),
+                    self.device_count
+                ),
+            });
         }
 
         // A device GUID identifies one pool member across export/import
@@ -1267,8 +1279,8 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_candidate_pool_emits_fail_closed_evidence() {
-        let pool = CandidatePool {
+    fn incomplete_candidate_pool_is_rejected_and_emits_fail_closed_evidence() {
+        let mut pool = CandidatePool {
             pool_guid: [0x35; 16],
             pool_name: "missing".into(),
             pool_state: LabelPoolState::Exported,
@@ -1280,6 +1292,18 @@ mod tests {
             cluster_authorized: false,
         };
 
+        let error = pool
+            .validate()
+            .expect_err("incomplete import topology must be rejected");
+        match error {
+            ImportError::TopologyInconsistent { pool_guid, detail } => {
+                assert_eq!(pool_guid, [0x35; 16]);
+                assert!(detail.contains("found 0 devices"));
+                assert!(detail.contains("expect 2"));
+            }
+            other => panic!("expected topology inconsistency, got {other:?}"),
+        }
+
         let evidence = pool.lifecycle_evidence(PoolLifecycleAction::Scan);
 
         assert_eq!(evidence.action, PoolLifecycleAction::Scan);
@@ -1288,7 +1312,7 @@ mod tests {
     }
 
     #[test]
-    fn surplus_candidate_pool_emits_fail_closed_evidence() {
+    fn surplus_candidate_pool_is_rejected_and_emits_fail_closed_evidence() {
         let pool_guid = [0x3A; 16];
         let make_candidate = |index, byte| DeviceCandidate {
             path: std::path::PathBuf::from(format!("/dev/tidefs-surplus-{index}")),
@@ -1338,8 +1362,20 @@ mod tests {
             cluster_authorized: false,
         };
 
-        assert!(pool.validate().is_ok());
-        assert!(!pool.topology_complete);
+        let error = pool
+            .validate()
+            .expect_err("surplus import topology must be rejected");
+        match error {
+            ImportError::TopologyInconsistent {
+                pool_guid: error_pool_guid,
+                detail,
+            } => {
+                assert_eq!(error_pool_guid, pool_guid);
+                assert!(detail.contains("found 3 devices"));
+                assert!(detail.contains("expect 2"));
+            }
+            other => panic!("expected topology inconsistency, got {other:?}"),
+        }
 
         let evidence = pool.lifecycle_evidence(PoolLifecycleAction::Import);
 
