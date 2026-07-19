@@ -4119,6 +4119,21 @@ fn build_snap_push_message(
     Ok(msg)
 }
 
+fn is_snap_net_response_control(character: char) -> bool {
+    // char::is_control covers Unicode General Category Cc. Also reject the
+    // Bidirectional_Control format characters that can visually reorder
+    // peer-supplied text after it is surfaced to the operator or logs.
+    character.is_control()
+        || matches!(
+            character,
+            '\u{061c}'
+                | '\u{200e}'
+                | '\u{200f}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2066}'..='\u{2069}'
+        )
+}
+
 fn parse_snap_net_response(data: &[u8]) -> Result<String, String> {
     if data.len() < SNAP_NET_RESPONSE_HEADER_LEN {
         return Err("snapshot send: remote response too short for VSNP header".into());
@@ -4156,7 +4171,10 @@ fn parse_snap_net_response(data: &[u8]) -> Result<String, String> {
     }
     let message = std::str::from_utf8(&data[start..frame_len])
         .map_err(|err| format!("snapshot send: remote response message is not UTF-8: {err}"))?;
-    if let Some(control) = message.chars().find(|character| character.is_control()) {
+    if let Some(control) = message
+        .chars()
+        .find(|character| is_snap_net_response_control(*character))
+    {
         return Err(format!(
             "snapshot send: remote response message contains control character U+{:04X}",
             u32::from(control)
@@ -7155,7 +7173,14 @@ mod tests {
 
     #[test]
     fn parse_snap_net_response_rejects_control_characters() {
-        for (message, codepoint) in [(&b"ok\n"[..], "U+000A"), (&b"\x1b[31m"[..], "U+001B")] {
+        for (message, codepoint) in [
+            (&b"ok\n"[..], "U+000A"),
+            (&b"\x1b[31m"[..], "U+001B"),
+            ("\u{061c}".as_bytes(), "U+061C"),
+            ("\u{200e}".as_bytes(), "U+200E"),
+            ("\u{202e}".as_bytes(), "U+202E"),
+            ("\u{2066}".as_bytes(), "U+2066"),
+        ] {
             let mut ack = Vec::new();
             ack.extend_from_slice(SNAP_NET_MAGIC);
             ack.push(SNAP_KIND_ACK);
