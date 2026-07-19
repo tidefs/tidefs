@@ -560,7 +560,7 @@ impl PoolCreator {
             label.pool_state = PoolState::Exported;
             label.device_index = handle.device_index;
             label.device_count = device_count;
-            label.topology_generation = 0;
+            label.topology_generation = 1;
             label.commit_group = INITIAL_TXG;
             label.label_commit_group = INITIAL_TXG;
             label.device_capacity_bytes = handle.capacity_bytes;
@@ -897,6 +897,7 @@ mod tests {
         assert_eq!(label0.pool_name_str(), "roundtrip");
         assert_eq!(label0.pool_state, PoolState::Exported);
         assert_eq!(label0.device_count, 1);
+        assert_eq!(label0.topology_generation, 1);
         assert_eq!(label0.commit_group, INITIAL_TXG);
         assert_eq!(label0.label_commit_group, INITIAL_TXG);
         assert_eq!(label0.system_area_pointer, INITIAL_SYSTEM_AREA_OFFSET);

@@ -268,18 +268,18 @@ echo "  $SCAN_OUT"
 if [ "$RC" -eq 0 ] \
    && printf '%s\n' "$SCAN_OUT" | grep -q '"schema"[[:space:]]*:[[:space:]]*"tidefs.pool-lifecycle-evidence.v1"' \
    && printf '%s\n' "$SCAN_OUT" | grep -q '"action"[[:space:]]*:[[:space:]]*"scan"' \
-   && printf '%s\n' "$SCAN_OUT" | grep -q '"outcome"[[:space:]]*:[[:space:]]*"refused"' \
+   && printf '%s\n' "$SCAN_OUT" | grep -q '"outcome"[[:space:]]*:[[:space:]]*"executed"' \
    && printf '%s\n' "$SCAN_OUT" | grep -q '"expected_device_count"[[:space:]]*:[[:space:]]*2' \
    && printf '%s\n' "$SCAN_OUT" | grep -q '"capacity_bytes"[[:space:]]*:[[:space:]]*268435456' \
-   && printf '%s\n' "$SCAN_OUT" | grep -q '"topology_generation"[[:space:]]*:[[:space:]]*0' \
-   && printf '%s\n' "$SCAN_OUT" | grep -q '"topology_complete"[[:space:]]*:[[:space:]]*false' \
+   && printf '%s\n' "$SCAN_OUT" | grep -q '"topology_generation"[[:space:]]*:[[:space:]]*1' \
+   && printf '%s\n' "$SCAN_OUT" | grep -q '"topology_complete"[[:space:]]*:[[:space:]]*true' \
    && printf '%s\n' "$SCAN_OUT" | grep -q '"owner_authorized"[[:space:]]*:[[:space:]]*true' \
-   && printf '%s\n' "$SCAN_OUT" | grep -q '"fail_closed"[[:space:]]*:[[:space:]]*true' \
-   && printf '%s\n' "$SCAN_OUT" | grep -q '"reason"[[:space:]]*:[[:space:]]*"topology evidence incomplete"' \
+   && printf '%s\n' "$SCAN_OUT" | grep -q '"fail_closed"[[:space:]]*:[[:space:]]*false' \
+   && printf '%s\n' "$SCAN_OUT" | grep -q '"reason"[[:space:]]*:[[:space:]]*"action executed with complete owner/topology evidence"' \
    && printf '%s\n' "$SCAN_OUT" | grep -q '"lifecycle_evidence_error"[[:space:]]*:[[:space:]]*null'; then
     pass "pool_lifecycle_scan_evidence"
 else
-    fail "pool_lifecycle_scan_evidence" "expected fail-closed initial-generation scan evidence, exit=$RC output=$SCAN_OUT"
+    fail "pool_lifecycle_scan_evidence" "expected executed initial-generation scan evidence, exit=$RC output=$SCAN_OUT"
 fi
 
 echo ""
