@@ -8172,6 +8172,20 @@ impl FuseVfsAdapter {
         self.dispatch_fsync_file_handle(ctx, ino, &efh, datasync)
     }
 
+    fn complete_shared_writeback_range_after_barrier(
+        tracker: &mut tidefs_local_filesystem::dirty_page_tracker::DirtyPageTracker,
+        inode: InodeId,
+        offset: u64,
+        length: u64,
+    ) -> bool {
+        // Production gives the adapter and local filesystem the same tracker.
+        // The lower flush can therefore complete the sealed range before the
+        // adapter publishes its later barrier stages. Completion is successful
+        // only when no dirty, pending, or poisoned ownership remains.
+        tracker.complete_writeback_success(inode, offset, length);
+        !tracker.overlaps_range(inode, offset, length)
+    }
+
     fn dispatch_fsync_file_handle(
         &self,
         ctx: &RequestCtx,
@@ -8335,12 +8349,12 @@ impl FuseVfsAdapter {
             match &sync_result {
                 Ok(()) => {
                     for range in &tracked_ranges {
-                        if tracker.complete_writeback_success(
+                        if !Self::complete_shared_writeback_range_after_barrier(
+                            &mut tracker,
                             efh.inode_id,
                             range.offset,
                             range.length,
-                        ) == 0
-                        {
+                        ) {
                             tracker_completion_failed = true;
                         }
                     }
@@ -8440,12 +8454,12 @@ impl FuseVfsAdapter {
             match &sync_result {
                 Ok(()) => {
                     for range in &tracked_ranges {
-                        if tracker.complete_writeback_success(
+                        if !Self::complete_shared_writeback_range_after_barrier(
+                            &mut tracker,
                             handle.dh.inode_id,
                             range.offset,
                             range.length,
-                        ) == 0
-                        {
+                        ) {
                             tracker_completion_failed = true;
                         }
                     }
@@ -8623,12 +8637,12 @@ impl FuseVfsAdapter {
                 Ok(()) => {
                     for (inode, ranges) in &tracked_ranges {
                         for range in ranges {
-                            if tracker.complete_writeback_success(
+                            if !Self::complete_shared_writeback_range_after_barrier(
+                                &mut tracker,
                                 *inode,
                                 range.offset,
                                 range.length,
-                            ) == 0
-                            {
+                            ) {
                                 tracker_completion_failed = true;
                             }
                         }
@@ -33452,6 +33466,46 @@ mod tests {
         (fixture, bv)
     }
 
+    fn adapter_fixture_with_shared_tracker_and_mock_block_volume() -> (
+        AdapterFixture,
+        Arc<Mutex<MockBlockVolume>>,
+        Arc<Mutex<tidefs_local_filesystem::dirty_page_tracker::DirtyPageTracker>>,
+    ) {
+        let temp_id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "tidefs-vfs-adapter-shared-wb-{}-{temp_id}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("create temp root");
+        let mut local_fs = LocalFileSystem::open_with_root_authentication_key(
+            &root,
+            StoreOptions::default(),
+            RootAuthenticationKey::demo_key(),
+        )
+        .expect("open local filesystem");
+        local_fs.set_write_buffer_flush_threshold_bytes(64 * 1024 * 1024);
+        local_fs.set_auto_commit(false);
+        local_fs.set_commit_group_throughput_profile();
+        local_fs.set_max_uncommitted_mutations(64 * 1024);
+        let tracker = Arc::clone(local_fs.writeback_range_tracker());
+        let engine = VfsLocalFileSystem::new(local_fs);
+        let adapter = FuseVfsAdapter::new(Box::new(engine))
+            .expect("create adapter")
+            .with_writeback_cache_enabled()
+            .with_writeback_range_tracker(Arc::clone(&tracker));
+        let fixture = AdapterFixture { adapter, root };
+        let block_volume = Arc::new(Mutex::new(MockBlockVolume::new()));
+        fixture
+            .adapter
+            .block_volume
+            .lock()
+            .unwrap()
+            .replace(Box::new(SharedMockBlockVolume {
+                inner: Arc::clone(&block_volume),
+            }));
+        (fixture, block_volume, tracker)
+    }
+
     #[test]
     fn writeback_flush_marks_dirty_state_after_write() {
         let fixture = adapter_fixture();
@@ -33475,7 +33529,7 @@ mod tests {
 
     #[test]
     fn writeback_flush_with_block_volume_flushes_and_clears_dirty_state() {
-        let (fixture, bv) = adapter_fixture_with_mock_block_volume();
+        let (fixture, bv, tracker) = adapter_fixture_with_shared_tracker_and_mock_block_volume();
         let ctx = root_ctx();
         let (inode, adapter_fh, engine_fh) = create_adapter_file_handle(
             &fixture.adapter,
@@ -33483,18 +33537,27 @@ mod tests {
             b"writeback-flush.txt",
             libc::O_RDWR as u32,
         );
+        bv.lock()
+            .unwrap()
+            .write_bytes(0, b"stale carrier")
+            .expect("seed stale block-volume bytes");
         fixture
             .adapter
             .dispatch_write(&ctx, inode.get(), adapter_fh, 0, b"to be flushed", 0)
             .expect("write dispatch");
-        {
-            let bv_guard = bv.lock().unwrap();
-            assert!(bv_guard.store.is_empty());
-        }
+        assert!(
+            tracker.lock().unwrap().is_dirty(inode),
+            "production-shared tracker must own the buffered range before fsync"
+        );
+        assert_eq!(bv.lock().unwrap().stored(0, 13), b"stale carrier");
         fixture
             .adapter
             .dispatch_fsync(&ctx, inode.get(), adapter_fh)
             .expect("fsync dispatch");
+        assert!(
+            !tracker.lock().unwrap().is_dirty(inode),
+            "lower and adapter completion must leave the shared tracker clean"
+        );
         {
             let bv_guard = bv.lock().unwrap();
             assert_eq!(bv_guard.stored(0, 13), b"to be flushed");
@@ -33524,7 +33587,7 @@ mod tests {
 
     #[test]
     fn syncfs_with_block_volume_flushes_and_clears_dirty_state() {
-        let (fixture, bv) = adapter_fixture_with_mock_block_volume();
+        let (fixture, bv, tracker) = adapter_fixture_with_shared_tracker_and_mock_block_volume();
         let ctx = root_ctx();
         let (inode, adapter_fh, _engine_fh) = create_adapter_file_handle(
             &fixture.adapter,
@@ -33532,16 +33595,29 @@ mod tests {
             b"syncfs-block-volume.txt",
             libc::O_RDWR as u32,
         );
+        bv.lock()
+            .unwrap()
+            .write_bytes(0, b"stale bytes")
+            .expect("seed stale block-volume bytes");
         fixture
             .adapter
             .dispatch_write(&ctx, inode.get(), adapter_fh, 0, b"syncfs data", 0)
             .expect("write dispatch");
+        assert!(
+            tracker.lock().unwrap().is_dirty(inode),
+            "production-shared tracker must own the buffered range before syncfs"
+        );
+        assert_eq!(bv.lock().unwrap().stored(0, 11), b"stale bytes");
 
         fixture
             .adapter
             .dispatch_syncfs(&ctx)
             .expect("syncfs dispatch");
 
+        assert!(
+            !tracker.lock().unwrap().is_dirty(inode),
+            "lower and adapter completion must leave the shared tracker clean"
+        );
         assert_eq!(bv.lock().unwrap().stored(0, 11), b"syncfs data");
         assert!(
             !fixture
