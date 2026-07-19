@@ -15,12 +15,158 @@
 //! write-path queue or buffer that carries dirty debt must route through
 //! its permits.
 
-use std::time::Instant;
+use std::{collections::BTreeMap, time::Instant};
 
 use tidefs_performance_contract::{
     AdmissionCharge, AdmissionError, AdmissionPermit, DynamicAdmissionTuning, WriteAdmissionConfig,
     WriteAdmissionState, WriteAdmissionUsage,
 };
+use tidefs_storage_intent_core::{
+    StorageIntentEvidenceId, StorageIntentEvidenceKind, StorageIntentEvidenceRef,
+};
+
+/// Version of the local dirty-write admission evidence family.
+pub const LOCAL_DIRTY_WRITE_ADMISSION_EVIDENCE_VERSION: u16 = 1;
+
+const LOCAL_DIRTY_WRITE_ADMISSION_EVIDENCE_SPEC: &str =
+    "tidefs.local-dirty-write-admission-evidence.v1";
+
+/// Runtime evidence for one accepted, still-active dirty-write permit.
+///
+/// The record is created only after the performance-contract admission state
+/// accepts the charge. Callers must present an active permit with the recorded
+/// id and charge to retrieve it; releasing the permit removes the record from
+/// this admission owner.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LocalDirtyWriteAdmissionEvidence {
+    permit_id: u64,
+    charge: AdmissionCharge,
+    config_at_admission: WriteAdmissionConfig,
+    usage_after_admission: WriteAdmissionUsage,
+    resource_budget_ref: StorageIntentEvidenceRef,
+    admission_ref: StorageIntentEvidenceRef,
+}
+
+impl LocalDirtyWriteAdmissionEvidence {
+    fn from_accepted_permit(
+        permit: &AdmissionPermit,
+        config_at_admission: WriteAdmissionConfig,
+        usage_after_admission: WriteAdmissionUsage,
+    ) -> Self {
+        let permit_id = permit.id();
+        let charge = permit.charge();
+        Self {
+            permit_id,
+            charge,
+            config_at_admission,
+            usage_after_admission,
+            resource_budget_ref: local_admission_evidence_ref(
+                "resource-budget",
+                permit_id,
+                charge,
+                config_at_admission,
+                usage_after_admission,
+            ),
+            admission_ref: local_admission_evidence_ref(
+                "accepted-permit",
+                permit_id,
+                charge,
+                config_at_admission,
+                usage_after_admission,
+            ),
+        }
+    }
+
+    /// Return the accepted permit id bound into this record.
+    #[must_use]
+    pub const fn permit_id(self) -> u64 {
+        self.permit_id
+    }
+
+    /// Return the accepted charge bound into this record.
+    #[must_use]
+    pub const fn charge(self) -> AdmissionCharge {
+        self.charge
+    }
+
+    /// Return the effective hard and soft caps observed at admission.
+    #[must_use]
+    pub const fn config_at_admission(self) -> WriteAdmissionConfig {
+        self.config_at_admission
+    }
+
+    /// Return the bounded admission usage observed after accepting the permit.
+    #[must_use]
+    pub const fn usage_after_admission(self) -> WriteAdmissionUsage {
+        self.usage_after_admission
+    }
+
+    /// Return the scheduler record naming the admitted resource budget.
+    #[must_use]
+    pub const fn resource_budget_ref(self) -> StorageIntentEvidenceRef {
+        self.resource_budget_ref
+    }
+
+    /// Return the scheduler record naming the accepted permit decision.
+    #[must_use]
+    pub const fn admission_ref(self) -> StorageIntentEvidenceRef {
+        self.admission_ref
+    }
+
+    /// Return true only when both the active permit id and charge match.
+    #[must_use]
+    pub fn matches_permit(&self, permit: &AdmissionPermit) -> bool {
+        self.permit_id == permit.id() && self.charge == permit.charge()
+    }
+}
+
+fn local_admission_evidence_ref(
+    label: &str,
+    permit_id: u64,
+    charge: AdmissionCharge,
+    config: WriteAdmissionConfig,
+    usage: WriteAdmissionUsage,
+) -> StorageIntentEvidenceRef {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(LOCAL_DIRTY_WRITE_ADMISSION_EVIDENCE_SPEC.as_bytes());
+    hasher.update(&[0]);
+    hasher.update(label.as_bytes());
+    hasher.update(&[0]);
+    hasher.update(&permit_id.to_le_bytes());
+    hasher.update(charge.work_class.as_str().as_bytes());
+    hasher.update(&[0]);
+    hasher.update(charge.primary_domain.as_str().as_bytes());
+    hasher.update(&[0]);
+    hasher.update(&charge.dirty_bytes.to_le_bytes());
+    hasher.update(&charge.dirty_ops.to_le_bytes());
+    hasher.update(&charge.admitted_tick.to_le_bytes());
+    hasher.update(&config.hard_max_dirty_bytes.to_le_bytes());
+    hasher.update(&config.hard_max_dirty_ops.to_le_bytes());
+    hasher.update(&config.hard_max_dirty_age_ticks.to_le_bytes());
+    hasher.update(&config.hard_max_permits.to_le_bytes());
+    hasher.update(&config.soft_max_dirty_bytes.to_le_bytes());
+    hasher.update(&config.soft_max_dirty_ops.to_le_bytes());
+    hasher.update(&config.soft_max_dirty_age_ticks.to_le_bytes());
+    hasher.update(&usage.dirty_bytes.to_le_bytes());
+    hasher.update(&usage.dirty_ops.to_le_bytes());
+    hasher.update(&usage.outstanding_permits.to_le_bytes());
+    match usage.oldest_dirty_tick {
+        Some(tick) => {
+            hasher.update(&[1]);
+            hasher.update(&tick.to_le_bytes());
+        }
+        None => {
+            hasher.update(&[0]);
+            hasher.update(&0_u64.to_le_bytes());
+        }
+    }
+    StorageIntentEvidenceRef::new(
+        StorageIntentEvidenceKind::SchedulerAdmissionRecord,
+        StorageIntentEvidenceId(*hasher.finalize().as_bytes()),
+        permit_id,
+        LOCAL_DIRTY_WRITE_ADMISSION_EVIDENCE_VERSION,
+    )
+}
 
 /// Hard admission caps for a mounted local filesystem.
 ///
@@ -58,6 +204,9 @@ impl Default for LocalAdmissionCaps {
 #[derive(Debug)]
 pub struct LocalWriteAdmission {
     state: WriteAdmissionState,
+    /// Evidence for accepted dirty-write permits that have not been released.
+    /// This map is bounded by `WriteAdmissionConfig::hard_max_permits`.
+    active_dirty_write_evidence: BTreeMap<u64, LocalDirtyWriteAdmissionEvidence>,
     /// Tick counter incremented by the commit-group or writeback daemon.
     current_tick: u64,
     /// Bounded snapshot of the peak dirty-byte usage observed since the
@@ -79,6 +228,7 @@ impl LocalWriteAdmission {
         );
         Self {
             state: WriteAdmissionState::new(config),
+            active_dirty_write_evidence: BTreeMap::new(),
             current_tick: 0,
             peak_dirty_bytes: 0,
             peak_dirty_ops: 0,
@@ -110,7 +260,27 @@ impl LocalWriteAdmission {
         let charge = AdmissionCharge::dirty_write(dirty_bytes, dirty_ops, self.current_tick);
         let permit = self.state.try_admit(charge)?;
         self.update_peaks();
+        let evidence = LocalDirtyWriteAdmissionEvidence::from_accepted_permit(
+            &permit,
+            self.state.config(),
+            self.state.usage(),
+        );
+        let replaced = self
+            .active_dirty_write_evidence
+            .insert(permit.id(), evidence);
+        debug_assert!(replaced.is_none(), "active admission permit ids are unique");
         Ok(permit)
+    }
+
+    /// Return admission evidence only for the exact still-active dirty permit.
+    #[must_use]
+    pub fn active_dirty_write_evidence(
+        &self,
+        permit: &AdmissionPermit,
+    ) -> Option<&LocalDirtyWriteAdmissionEvidence> {
+        self.active_dirty_write_evidence
+            .get(&permit.id())
+            .filter(|evidence| evidence.matches_permit(permit))
     }
 
     /// Try to admit a metadata-mutation charge for rename, link, unlink,
@@ -133,7 +303,10 @@ impl LocalWriteAdmission {
     /// Call this after the dirty work represented by the permit has
     /// been persisted (e.g., after a successful commit_group SYNC).
     pub fn release(&mut self, permit: AdmissionPermit) -> Result<AdmissionCharge, AdmissionError> {
-        self.state.release(permit)
+        let permit_id = permit.id();
+        let charge = self.state.release(permit)?;
+        self.active_dirty_write_evidence.remove(&permit_id);
+        Ok(charge)
     }
 
     /// Apply dynamic tuning while preserving hard caps.
@@ -253,6 +426,131 @@ mod tests {
         let usage = admission.usage();
         assert_eq!(usage.dirty_bytes, 0);
         assert_eq!(usage.dirty_ops, 0);
+    }
+
+    #[test]
+    fn accepted_dirty_permit_exposes_bound_scheduler_evidence() {
+        let mut admission = LocalWriteAdmission::new(LocalAdmissionCaps::default());
+        admission.advance_tick();
+        let permit = admission
+            .try_admit_dirty_write(4096, 2)
+            .expect("should admit dirty write");
+        let evidence = *admission
+            .active_dirty_write_evidence(&permit)
+            .expect("accepted permit should expose evidence");
+
+        assert!(evidence.matches_permit(&permit));
+        assert_eq!(evidence.permit_id(), permit.id());
+        assert_eq!(evidence.charge(), permit.charge());
+        assert_eq!(evidence.config_at_admission(), admission.config());
+        assert_eq!(evidence.usage_after_admission(), admission.usage());
+        assert_eq!(
+            evidence.resource_budget_ref().kind,
+            StorageIntentEvidenceKind::SchedulerAdmissionRecord
+        );
+        assert_eq!(
+            evidence.admission_ref().kind,
+            StorageIntentEvidenceKind::SchedulerAdmissionRecord
+        );
+        assert!(evidence.resource_budget_ref().is_bound());
+        assert!(evidence.admission_ref().is_bound());
+        assert_ne!(evidence.resource_budget_ref(), evidence.admission_ref());
+        assert_eq!(evidence.resource_budget_ref().generation, permit.id());
+        assert_eq!(
+            evidence.resource_budget_ref().version,
+            LOCAL_DIRTY_WRITE_ADMISSION_EVIDENCE_VERSION
+        );
+
+        admission.release(permit).expect("should release permit");
+    }
+
+    #[test]
+    fn dirty_permits_cannot_reuse_each_others_evidence() {
+        let mut admission = LocalWriteAdmission::new(LocalAdmissionCaps::default());
+        let first = admission
+            .try_admit_dirty_write(4096, 1)
+            .expect("should admit first write");
+        let second = admission
+            .try_admit_dirty_write(8192, 2)
+            .expect("should admit second write");
+        let first_evidence = *admission
+            .active_dirty_write_evidence(&first)
+            .expect("first permit should expose evidence");
+        let second_evidence = *admission
+            .active_dirty_write_evidence(&second)
+            .expect("second permit should expose evidence");
+
+        assert!(!first_evidence.matches_permit(&second));
+        assert!(!second_evidence.matches_permit(&first));
+        assert_ne!(
+            first_evidence.resource_budget_ref(),
+            second_evidence.resource_budget_ref()
+        );
+        assert_ne!(
+            first_evidence.admission_ref(),
+            second_evidence.admission_ref()
+        );
+
+        admission
+            .release(first)
+            .expect("should release first permit");
+        admission
+            .release(second)
+            .expect("should release second permit");
+    }
+
+    #[test]
+    fn permit_cap_rejection_creates_no_additional_evidence() {
+        let caps = LocalAdmissionCaps {
+            hard_max_permits: 1,
+            ..Default::default()
+        };
+        let mut admission = LocalWriteAdmission::new(caps);
+        let accepted = admission
+            .try_admit_dirty_write(4096, 1)
+            .expect("should admit first permit");
+        assert_eq!(admission.active_dirty_write_evidence.len(), 1);
+
+        let error = admission
+            .try_admit_dirty_write(4096, 1)
+            .expect_err("should reject second permit");
+        assert!(matches!(error, AdmissionError::PermitHardCap { .. }));
+        assert_eq!(admission.active_dirty_write_evidence.len(), 1);
+
+        admission
+            .release(accepted)
+            .expect("should release accepted permit");
+    }
+
+    #[test]
+    fn released_dirty_permit_no_longer_has_active_evidence() {
+        let mut admission = LocalWriteAdmission::new(LocalAdmissionCaps::default());
+        let permit = admission
+            .try_admit_dirty_write(4096, 1)
+            .expect("should admit dirty write");
+        let permit_id = permit.id();
+        assert!(admission
+            .active_dirty_write_evidence
+            .contains_key(&permit_id));
+
+        admission.release(permit).expect("should release permit");
+
+        assert!(!admission
+            .active_dirty_write_evidence
+            .contains_key(&permit_id));
+    }
+
+    #[test]
+    fn metadata_permit_does_not_expose_dirty_write_evidence() {
+        let mut admission = LocalWriteAdmission::new(LocalAdmissionCaps::default());
+        let permit = admission
+            .try_admit_metadata_mutation()
+            .expect("should admit metadata mutation");
+
+        assert!(admission.active_dirty_write_evidence(&permit).is_none());
+        assert!(admission.active_dirty_write_evidence.is_empty());
+
+        admission.release(permit).expect("should release permit");
     }
 
     #[test]
