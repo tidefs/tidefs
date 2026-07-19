@@ -5602,14 +5602,13 @@ fn sync_write_intent_appends_and_commit_clears() {
 fn sync_write_intent_replays_on_reopen() {
     let root = temp_root("intent-log-replay");
 
-    // Phase 1: write data via normal path, record intent, drop without commit
+    // Phase 1: commit the inode, then leave only the sync-write intent as
+    // crash-recovery state for its payload.
     {
         let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
         let rec = fs.create_file("/f", 0o644).expect("create");
         let ino = rec.inode_id;
         fs.commit().expect("commit inode");
-        // Write data through normal path but don't commit — intent log preserves it
-        fs.write_file("/f", 0, b"sync data").expect("write");
 
         let digest = IntegrityDigest64(0xBEEF);
         let reply = fs
@@ -5617,7 +5616,9 @@ fn sync_write_intent_replays_on_reopen() {
             .expect("sync_write_intent");
         assert_eq!(reply, IntentLogReplyState::IntentDurable);
         assert_eq!(fs.intent_log.len(), 1);
-        // Drop without commit — simulates crash
+        // A normal Drop is best-effort and commits dirty state. Skip it to
+        // model abrupt loss after the intent log has been synced.
+        std::mem::forget(fs);
     }
 
     // Phase 2: reopen — intent log replays on mount and should be empty

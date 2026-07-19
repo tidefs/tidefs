@@ -1827,6 +1827,72 @@ impl<'a> MountedMetadataIntentRawStateAuthority<'a> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MountedSyncWriteIntentTransformMode {
+    RawOnlyNoDeviceTransforms,
+}
+
+/// Mounted authority for replayable sync-write intent payloads and records.
+///
+/// Sync-write entries carry mounted file bytes, so they are not raw-only
+/// metadata. The mounted open path currently rejects configured device
+/// transforms, which leaves this authority in the explicit raw-only mode. It
+/// preserves the replay payload, append, and sync ordering without implying
+/// mounted device-level compression or encryption support.
+pub(crate) struct MountedSyncWriteIntentRawStateAuthority<'a> {
+    intent_log: &'a mut IntentLog,
+    store: &'a mut Pool,
+    transform_mode: MountedSyncWriteIntentTransformMode,
+}
+
+impl<'a> MountedSyncWriteIntentRawStateAuthority<'a> {
+    fn transform_aware_raw_only(intent_log: &'a mut IntentLog, store: &'a mut Pool) -> Self {
+        let authority = Self {
+            intent_log,
+            store,
+            transform_mode: MountedSyncWriteIntentTransformMode::RawOnlyNoDeviceTransforms,
+        };
+        debug_assert_eq!(
+            authority.transform_mode(),
+            MountedSyncWriteIntentTransformMode::RawOnlyNoDeviceTransforms
+        );
+        debug_assert_eq!(
+            authority.transform_ordering_boundary(),
+            MOUNTED_RECOVERY_TRANSFORM_ORDERING
+        );
+        authority
+    }
+
+    fn transform_mode(&self) -> MountedSyncWriteIntentTransformMode {
+        self.transform_mode
+    }
+
+    fn transform_ordering_boundary(&self) -> &'static str {
+        MOUNTED_RECOVERY_TRANSFORM_ORDERING
+    }
+
+    fn write_payload_append_and_sync(
+        &mut self,
+        payload: &[u8],
+        entry_kind: IntentLogEntryKind,
+        root_anchor: IntentLogRootAnchor,
+        timestamp_ns: u64,
+    ) -> Result<bool> {
+        self.intent_log
+            .write_next_data_payload(self.store, payload)?;
+        let accepted = self.intent_log.append(
+            self.store.raw_primary_store_mut(),
+            entry_kind,
+            root_anchor,
+            timestamp_ns,
+        )?;
+        if accepted {
+            self.intent_log.sync(self.store.raw_primary_store_mut())?;
+        }
+        Ok(accepted)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum MountedCommittedRootRepairTransformMode {
     MetadataRawOnlyNoDeviceTransforms,
 }
@@ -11293,13 +11359,12 @@ impl LocalFileSystem {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos() as u64;
-        // Store the write payload durably so that crash replay can
-        // recover it even when the content manifest was never committed.
-        self.intent_log
-            .write_next_data_payload(&mut self.store, payload)?;
-
-        let accepted = self.intent_log.append(
-            self.store.raw_primary_store_mut(),
+        let accepted = MountedSyncWriteIntentRawStateAuthority::transform_aware_raw_only(
+            &mut self.intent_log,
+            &mut self.store,
+        )
+        .write_payload_append_and_sync(
+            payload,
             IntentLogEntryKind::SyncWriteRange {
                 inode_id,
                 offset,
@@ -11322,8 +11387,6 @@ impl LocalFileSystem {
             );
             return Ok(IntentLogReplyState::Refused);
         }
-
-        self.intent_log.sync(self.store.raw_primary_store_mut())?;
 
         // Advance the inode record so do_commit() persists the
         // updated metadata alongside the intent log entries,
