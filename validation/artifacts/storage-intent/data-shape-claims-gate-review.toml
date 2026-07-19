@@ -4,7 +4,7 @@ issue = "https://github.com/tidefs/tidefs/issues/1981"
 validation_tier = "source-model"
 review_scope = "claims-gate review for source-model policy/result boundaries and partial qemu-guest helper execution and fault evidence, including typed malformed local EC shard-set refusals"
 review_outcome = "blocked"
-decision = "The claim remains blocked. QEMU-guest helper execution now covers Zstd/LZ4 round trips, stored-frame digest mismatch, malformed compression frames, AEAD wrong-key/tamper refusal, local EC reconstruction/under-width refusal, and typed refusal of wrong-width, wrong-index, wrong-role, and truncated local EC shard sets. Dedicated run 29680287893 completed the isolated Linux 7.0 carrier and validated both artifacts, while mounted compiled-policy receipts, the skipped data-shape families, stable performance rows, and lifecycle authority remain missing."
+decision = "The claim remains blocked. QEMU-guest helper execution now covers Zstd/LZ4 round trips, stored-frame digest mismatch, malformed compression frames, AEAD wrong-key/tamper refusal, local EC reconstruction/under-width refusal, and typed refusal of wrong-width, wrong-index, wrong-role, and truncated local EC shard sets. Dedicated run 29681279209 completed the isolated Linux 7.0 carrier and validated both artifacts, while mounted compiled-policy receipts, the skipped data-shape families, stable performance rows, and lifecycle authority remain missing."
 
 reviewed_artifacts = [
   "validation/artifacts/storage-intent/data-shape-policy-evidence.json",
@@ -38,9 +38,9 @@ non_claim_boundaries = [
 ]
 
 [runtime_evidence]
-run_id = "29680287893/1"
-source_ref = "b8f2560a0b11b982a3dc5cbdd3355957aa78ec68"
-workflow_url = "https://github.com/tidefs/tidefs/actions/runs/29680287893"
+run_id = "29681279209/1"
+source_ref = "7c9f5dc5b2227b54bdcd4c428b6326715cb2dfe7"
+workflow_url = "https://github.com/tidefs/tidefs/actions/runs/29681279209"
 transform_summary = "7 pass, 0 product-fail, 4 skip"
 performance_fault_summary = "6 pass, 0 product-fail, 7 skip"
 artifact_validation = "both manifests matched artifact BLAKE3 digests, source SHA, run id, qemu-guest tier, expected SKIP outcome, runtime_execution_produced=true, and blocker #1981"

@@ -5,13 +5,13 @@
   "validation_tier": "qemu-guest",
   "scope": "QEMU-guest helper transform execution and exact refusal rows for a bounded subset of storage-intent data-shape families; outcome=SKIP pass=7 product_fail=0 skip=4",
   "artifact_path": "validation/artifacts/storage-intent/data-shape-transform-execution.json",
-  "content_digest": "blake3:d57f6f5c2f36d59795bbeea1f899a0ee726a3635c1adfab87636f562cc383a54",
-  "run_id": "29680287893/1",
-  "source_ref": "b8f2560a0b11b982a3dc5cbdd3355957aa78ec68",
+  "content_digest": "blake3:ccdbb79bf8c824379d4897fe839a75359cc630e1e256e61c4b226df14b86843c",
+  "run_id": "29681279209/1",
+  "source_ref": "7c9f5dc5b2227b54bdcd4c428b6326715cb2dfe7",
   "outcome": "skip",
   "residual_risk": "The passing rows execute helper/library code in one QEMU guest; they do not prove mounted transform dispatch, raw-store conformance, compiled-policy receipt satisfaction, recovery, or source retirement. Dedupe-domain execution, key-epoch lifecycle proof, archive recall, coalescing, and rebake remain unexecuted, so the transform-execution evidence class and claim remain blocked. The rows do not widen compression, checksum, encryption, EC/archive, capacity, performance, production, release-readiness, or successor/comparator wording.",
   "source": "qemu-fuse-vm-data-shape-helper-runtime-v1",
-  "generated_at": "2026-07-19T08:42:59Z",
+  "generated_at": "2026-07-19T09:16:24Z",
   "blocking_issues": [
     {
       "repo": "tidefs/tidefs",
