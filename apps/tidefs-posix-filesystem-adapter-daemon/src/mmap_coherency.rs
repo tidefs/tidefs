@@ -219,6 +219,7 @@ impl MmapCoherency {
 
     pub fn register(&self, ino: u64, generation: u64) {
         let mut regs = self.registrations.lock().unwrap();
+        let reactivating = regs.get(&ino).is_some_and(|entry| !entry.active);
         let entry = regs.entry(ino).or_insert(MmapRegistration {
             generation: 0,
             active: false,
@@ -230,9 +231,60 @@ impl MmapCoherency {
         entry.generation = entry.generation.max(generation);
         entry.active = true;
         drop(regs);
+        if reactivating {
+            // Serialize with process_tick() so a retained invalidation cannot
+            // be removed from the deferred queue concurrently and complete
+            // only after register() has exposed the inode as active again.
+            let _processor_guard = self.processor.lock().unwrap();
+            self.retry_deferred_for_inode(ino);
+        }
         self.stats
             .mmap_registrations
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Retry invalidations already retained for an inode that just became
+    /// active again.
+    ///
+    /// Versioned and unversioned events are each coalesced per inode, so this
+    /// drains at most two entries. Dirty state or notification failure may put
+    /// either entry back for the ordinary bounded retry loop.
+    fn retry_deferred_for_inode(&self, ino: u64) {
+        let pending = {
+            let mut deferred = self.deferred_invalidations.lock().unwrap();
+            let scan_budget = deferred.len();
+            let mut pending = Vec::with_capacity(2);
+            for _ in 0..scan_budget {
+                let Some(invalidation) = deferred.pop_front() else {
+                    break;
+                };
+                if invalidation.ino() == ino {
+                    pending.push(invalidation);
+                } else {
+                    deferred.push_back(invalidation);
+                }
+            }
+            pending
+        };
+
+        let mut sink = MmapInvalidationSink {
+            registrations: &self.registrations,
+            invalidate_inode: &self.invalidate_inode,
+            dirty_check: &self.dirty_check,
+            dirty_transition_gates: &self.dirty_transition_gates,
+            deferred_invalidations: &self.deferred_invalidations,
+            stats: &self.stats,
+        };
+        for invalidation in pending {
+            match invalidation {
+                DeferredInvalidation::Inode { ino, generation } => {
+                    sink.invalidate_inode_inner(ino, generation, false);
+                }
+                DeferredInvalidation::UnversionedInode { ino } => {
+                    sink.invalidate_unversioned_inode_inner(ino, false);
+                }
+            }
+        }
     }
 
     pub fn deregister(&self, ino: u64) {
@@ -804,7 +856,7 @@ mod tests {
     }
 
     #[test]
-    fn deferred_invalidation_survives_deregister_and_reopen() {
+    fn reopen_retries_deferred_invalidation_before_returning() {
         let calls = Arc::new(AtomicU64::new(0));
         let notify_calls = Arc::clone(&calls);
         let dirty = Arc::new(AtomicBool::new(true));
@@ -830,11 +882,10 @@ mod tests {
         assert_eq!(calls.load(Ordering::Relaxed), 0);
 
         c.register(42, 0);
-        assert_eq!(c.registrations.lock().unwrap()[&42].generation, 1);
-        assert_eq!(c.process_tick(10), 1);
         assert_eq!(c.deferred_invalidation_count(), 0);
         assert_eq!(calls.load(Ordering::Relaxed), 1);
         assert_eq!(c.registrations.lock().unwrap()[&42].generation, 2);
+        assert_eq!(c.process_tick(10), 0);
 
         let s = c.stats.snapshot();
         assert_eq!(s.invalidations_received, 1);
@@ -966,7 +1017,7 @@ mod tests {
     }
 
     #[test]
-    fn newer_invalidation_received_while_inactive_survives_reopen() {
+    fn newer_invalidation_received_while_inactive_is_applied_on_reopen() {
         let notify_calls = Arc::new(AtomicU64::new(0));
         let notify_count = Arc::clone(&notify_calls);
         let dirty_check_calls = Arc::new(AtomicU64::new(0));
@@ -997,11 +1048,11 @@ mod tests {
         assert_eq!(s.pages_invalidated, 0);
 
         c.register(42, 0);
-        assert_eq!(c.process_tick(10), 1);
         assert_eq!(c.deferred_invalidation_count(), 0);
         assert_eq!(notify_calls.load(Ordering::Relaxed), 1);
         assert_eq!(dirty_check_calls.load(Ordering::Relaxed), 1);
         assert_eq!(c.registrations.lock().unwrap()[&42].generation, 2);
+        assert_eq!(c.process_tick(10), 0);
 
         let s = c.stats.snapshot();
         assert_eq!(s.invalidations_received, 1);
