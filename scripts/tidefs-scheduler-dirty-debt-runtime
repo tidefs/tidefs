@@ -334,6 +334,9 @@ jq -s -e '
       .admission.peak_dirty_ops,
       .admission.peak_outstanding_permits
     ] | all(type == "number" and floor == . and . >= 0))
+    and .admission.peak_dirty_bytes > 0
+    and .admission.peak_dirty_ops > 0
+    and .admission.peak_outstanding_permits > 0
     and ([
       .hard_caps.dirty_age_ticks,
       .hard_caps.dirty_bytes,
