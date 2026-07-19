@@ -1118,18 +1118,51 @@ fn evaluate_lane_local_manifests(index: &ReleaseCandidateIndex) -> Vec<LaneLocal
     }
 
     for &(lane_id, evidence_class) in REQUIRED_LANE_LOCAL_MANIFESTS {
-        let manifest = index
-            .lanes
+        let mut lanes = index.lanes.iter().filter(|lane| lane.id == lane_id);
+        match (lanes.next(), lanes.next()) {
+            (None, _) => verdicts.push(missing_lane_local_manifest(
+                "lane",
+                Some(lane_id),
+                evidence_class,
+            )),
+            (Some(lane), None) => verdicts.push(evaluate_lane_local_manifest(
+                "lane",
+                Some(lane_id),
+                evidence_class,
+                lane.lane_local_manifest.as_ref(),
+                lane_id == "nix",
+            )),
+            (Some(_), Some(_)) => verdicts.push(malformed_lane_local_manifest(
+                "lane",
+                Some(lane_id),
+                evidence_class,
+                None,
+                format!("release-candidate index lane `{lane_id}` is declared more than once"),
+            )),
+        }
+    }
+
+    for lane in &index.lanes {
+        if !REQUIRED_LANE_LOCAL_MANIFESTS
             .iter()
-            .find(|lane| lane.id == lane_id)
-            .and_then(|lane| lane.lane_local_manifest.as_ref());
-        verdicts.push(evaluate_lane_local_manifest(
-            "lane",
-            Some(lane_id),
-            evidence_class,
-            manifest,
-            lane_id == "nix",
-        ));
+            .any(|(expected_lane_id, _)| lane.id == *expected_lane_id)
+        {
+            verdicts.push(malformed_lane_local_manifest(
+                "lane",
+                Some(&lane.id),
+                lane.lane_local_manifest
+                    .as_ref()
+                    .and_then(|manifest| manifest.evidence_class.as_deref())
+                    .unwrap_or("<missing evidence class>"),
+                lane.lane_local_manifest
+                    .as_ref()
+                    .and_then(|manifest| manifest.status.clone()),
+                format!(
+                    "release-candidate index has unknown lane `{}` with a lane-local manifest boundary",
+                    lane.id
+                ),
+            ));
+        }
     }
 
     verdicts
@@ -2055,6 +2088,61 @@ mod tests {
                     .details
                     .iter()
                     .any(|detail| detail.contains("only the Nix lane"))));
+    }
+
+    #[test]
+    fn release_readiness_duplicate_lane_manifest_fails_closed() {
+        let fixture = Fixture::new();
+        fixture.write_rc_index(&fixture.source_ref, &fixture.source_sha, "full");
+        fixture.update_rc_index(|index| {
+            let duplicate = index["lanes"][0].clone();
+            index["lanes"].as_array_mut().unwrap().push(duplicate);
+        });
+
+        let artifact = assemble_verdict(&fixture.config());
+
+        assert_eq!(
+            artifact.release_candidate_index.outcome,
+            VerdictOutcome::Malformed
+        );
+        assert!(artifact
+            .release_candidate_index
+            .lane_local_manifests
+            .iter()
+            .any(|manifest| manifest.lane_id.as_deref() == Some("rust-smoke")
+                && manifest.evidence_class == "Focused Rust lane-local evidence manifest"
+                && manifest.outcome == VerdictOutcome::Malformed
+                && manifest
+                    .details
+                    .iter()
+                    .any(|detail| detail.contains("declared more than once"))));
+    }
+
+    #[test]
+    fn release_readiness_unknown_lane_manifest_fails_closed() {
+        let fixture = Fixture::new();
+        fixture.write_rc_index(&fixture.source_ref, &fixture.source_sha, "full");
+        fixture.update_rc_index(|index| {
+            index["lanes"][0]["id"] = serde_json::Value::String("unexpected".to_string());
+        });
+
+        let artifact = assemble_verdict(&fixture.config());
+
+        assert_eq!(
+            artifact.release_candidate_index.outcome,
+            VerdictOutcome::Malformed
+        );
+        assert!(artifact
+            .release_candidate_index
+            .lane_local_manifests
+            .iter()
+            .any(|manifest| manifest.lane_id.as_deref() == Some("unexpected")
+                && manifest.evidence_class == "Focused Rust lane-local evidence manifest"
+                && manifest.outcome == VerdictOutcome::Malformed
+                && manifest
+                    .details
+                    .iter()
+                    .any(|detail| detail.contains("unknown lane"))));
     }
 
     #[test]
