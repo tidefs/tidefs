@@ -9,18 +9,15 @@
 //! 3. **Merkle frontier comparison**: efficient delta detection for large
 //!    objects (hash-list frontier comparison)
 //!
-//! # Why not merkle tree?
+//! # Digest sources
 //!
-//! ZFS uses per-block checksums (fletcher4/sha256) stored in block pointers.
-//! Ceph uses per-object CRC32C with deep-scrub. Both are per-object.
-//!
-//! TideFS's comparator uses **three-source comparison**:
+//! The comparator evaluates three digest sources for a subject:
 //! - Primary's digest (from transfer receipt chain)
 //! - Replica's digest (from verification receipt chain)
 //! - Witness digest (from witness set, if available)
 //!
-//! This provides stronger guarantees than single-source comparison:
-//! if primary and replica disagree, the witness breaks the tie.
+//! When primary and replica digests disagree, an available witness digest
+//! distinguishes an agreeing primary or replica from `WitnessDisagreement`.
 
 use serde::{Deserialize, Serialize};
 
