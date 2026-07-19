@@ -2824,13 +2824,23 @@ impl KernelEngine {
                 return Err(crate::tidefs_kmod_bridge::kernel_types::Errno::EIO);
             }
         }
-        const VINO_RECORD_BYTES: u64 = 116;
-        let entry_offset =
-            inode_table_root.saturating_add((ino - 1).saturating_mul(VINO_RECORD_BYTES));
+        let vino_offset = crate::replay_integration::vino_record_offset(ino)
+            .map_err(|_| crate::tidefs_kmod_bridge::kernel_types::Errno::EIO)?;
+        let entry_offset = inode_table_root
+            .checked_add(vino_offset)
+            .ok_or(crate::tidefs_kmod_bridge::kernel_types::Errno::EIO)?;
+        let record_len = crate::replay_integration::VINO_RECORD_BYTES;
+        let entry_end = entry_offset
+            .checked_add(record_len as u64)
+            .ok_or(crate::tidefs_kmod_bridge::kernel_types::Errno::EIO)?;
+        if entry_end > io_ctx.device_capacity_bytes {
+            return Err(crate::tidefs_kmod_bridge::kernel_types::Errno::EIO);
+        }
         let entry_sector = entry_offset / ss;
         let sector_off = (entry_offset % ss) as usize;
-        let record_len = VINO_RECORD_BYTES as usize;
-        let read_len_usize = sector_off.saturating_add(record_len);
+        let read_len_usize = sector_off
+            .checked_add(record_len)
+            .ok_or(crate::tidefs_kmod_bridge::kernel_types::Errno::EIO)?;
         let read_len = u32::try_from(read_len_usize)
             .map_err(|_| crate::tidefs_kmod_bridge::kernel_types::Errno::EOVERFLOW)?;
         // Allocate a sector-sized buffer from the kernel heap to avoid
@@ -4860,17 +4870,33 @@ impl crate::tidefs_kmod_bridge::kernel_types::VfsEngine for KernelEngine {
         if ino == 0 {
             return Err(crate::tidefs_kmod_bridge::kernel_types::Errno::ENOENT);
         }
-        let ss = io_ctx.sector_size as u64;
-        const VINO_RECORD_BYTES: u64 = 116;
-        let entry_offset =
-            inode_table_root.saturating_add((ino - 1).saturating_mul(VINO_RECORD_BYTES));
+        let ss = Self::valid_sector_size(io_ctx.sector_size)? as u64;
+        let vino_offset = crate::replay_integration::vino_record_offset(ino)
+            .map_err(|_| crate::tidefs_kmod_bridge::kernel_types::Errno::EIO)?;
+        let entry_offset = inode_table_root
+            .checked_add(vino_offset)
+            .ok_or(crate::tidefs_kmod_bridge::kernel_types::Errno::EIO)?;
+        let record_len = crate::replay_integration::VINO_RECORD_BYTES;
+        let entry_end = entry_offset
+            .checked_add(record_len as u64)
+            .ok_or(crate::tidefs_kmod_bridge::kernel_types::Errno::EIO)?;
+        if entry_end > io_ctx.device_capacity_bytes {
+            return Err(crate::tidefs_kmod_bridge::kernel_types::Errno::EIO);
+        }
         // Read a full sector to cover the 100-byte entry.
         let entry_sector = entry_offset / ss;
         let sector_off = (entry_offset % ss) as usize;
-        let read_len = (sector_off + 116usize).min(ss as usize).max(116) as u32;
-        // Buffer sized for max sector size; read_len may be up to ss (4096).
-        let mut entry_buf = [0u8; 4096]; // Up to one sector
-                                         // SAFETY: read_fn is the C shim's block read callback.
+        // Buffer sized for max supported sector size.
+        let mut entry_buf = [0u8; 4096];
+        let read_len_usize = sector_off
+            .checked_add(record_len)
+            .ok_or(crate::tidefs_kmod_bridge::kernel_types::Errno::EIO)?;
+        if read_len_usize > entry_buf.len() {
+            return Err(crate::tidefs_kmod_bridge::kernel_types::Errno::EIO);
+        }
+        let read_len = u32::try_from(read_len_usize)
+            .map_err(|_| crate::tidefs_kmod_bridge::kernel_types::Errno::EIO)?;
+        // SAFETY: read_fn is the C shim's block read callback.
         let ret = unsafe { read_fn(entry_sector, entry_buf.as_mut_ptr(), read_len) };
         if ret < 0 {
             return Err(crate::tidefs_kmod_bridge::kernel_types::Errno::EIO);

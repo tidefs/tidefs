@@ -223,7 +223,7 @@ pub struct VinoRecord {
 }
 
 const VINO_MAGIC: [u8; 4] = *b"VINO";
-const VINO_RECORD_BYTES: usize = 116;
+pub const VINO_RECORD_BYTES: usize = 116;
 const VINO_FORMAT_VERSION: u8 = 1;
 
 /// Errors returned while decoding a committed-root VINO record.
@@ -234,6 +234,7 @@ pub enum VinoRecordError {
     UnsupportedVersion(u8),
     InvalidKind(u8),
     InvalidInode,
+    RecordOffsetOverflow,
 }
 
 /// Decode one current-format VINO record.
@@ -307,18 +308,21 @@ pub fn parse_vino_record(buf: &[u8]) -> Option<VinoRecord> {
     decode_vino_record(buf).ok()
 }
 
+/// Return the byte offset of a one-based VINO inode slot.
+pub fn vino_record_offset(ino: u64) -> Result<u64, VinoRecordError> {
+    let index = ino.checked_sub(1).ok_or(VinoRecordError::InvalidInode)?;
+    index
+        .checked_mul(VINO_RECORD_BYTES as u64)
+        .ok_or(VinoRecordError::RecordOffsetOverflow)
+}
+
 /// Decode one VINO record selected by its one-based inode number.
 pub fn decode_vino_inode(inode_table_buf: &[u8], ino: u64) -> Result<VinoRecord, VinoRecordError> {
-    if ino == 0 {
-        return Err(VinoRecordError::InvalidInode);
-    }
-    let idx = (ino - 1) as usize;
-    let start = idx
-        .checked_mul(VINO_RECORD_BYTES)
-        .ok_or(VinoRecordError::BufferTooSmall)?;
+    let start = usize::try_from(vino_record_offset(ino)?)
+        .map_err(|_| VinoRecordError::RecordOffsetOverflow)?;
     let end = start
         .checked_add(VINO_RECORD_BYTES)
-        .ok_or(VinoRecordError::BufferTooSmall)?;
+        .ok_or(VinoRecordError::RecordOffsetOverflow)?;
     if end > inode_table_buf.len() {
         return Err(VinoRecordError::BufferTooSmall);
     }
@@ -851,6 +855,20 @@ mod tests {
         assert!(matches!(
             decode_vino_inode(&[0u8; VINO_RECORD_BYTES], 0),
             Err(VinoRecordError::InvalidInode)
+        ));
+    }
+
+    #[test]
+    fn vino_record_offset_rejects_unrepresentable_inode() {
+        assert_eq!(vino_record_offset(1), Ok(0));
+        assert_eq!(vino_record_offset(2), Ok(VINO_RECORD_BYTES as u64));
+        assert!(matches!(
+            vino_record_offset(u64::MAX),
+            Err(VinoRecordError::RecordOffsetOverflow)
+        ));
+        assert!(matches!(
+            decode_vino_inode(&[0u8; VINO_RECORD_BYTES], u64::MAX),
+            Err(VinoRecordError::RecordOffsetOverflow)
         ));
     }
 
