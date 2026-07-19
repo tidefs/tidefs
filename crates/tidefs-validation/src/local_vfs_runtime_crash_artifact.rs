@@ -7,14 +7,19 @@ use std::fmt;
 use std::fs;
 use std::path::Path;
 
+use crate::validation_status::ValidationStatus;
+
 pub const LOCAL_VFS_WRITE_FSYNC_RUNTIME_CRASH_EVIDENCE_CLASS: &str = "runtime-crash-oracle";
 pub const LOCAL_VFS_WRITE_FSYNC_RUNTIME_CRASH_CLAIM_ID: &str = "local.vfs.write_fsync_crash.v1";
 pub const LOCAL_VFS_RENAME_RUNTIME_CRASH_EVIDENCE_CLASS: &str = "runtime-namespace-crash-artifact";
 pub const LOCAL_VFS_RENAME_RUNTIME_CRASH_CLAIM_ID: &str = "local.vfs.rename_atomic_crash.v1";
-const LOCAL_VFS_WRITE_FSYNC_RUNTIME_SCENARIO: &str = "local-vfs-write-fsync-read-crash-recover";
 const LOCAL_VFS_RENAME_RUNTIME_SCENARIO: &str = "local-vfs-rename-fsync-read-crash-recover";
+const MOUNTED_FUSE_WRITE_FSYNC_RUNTIME_SCENARIO: &str =
+    "mounted-fuse-write-fsync-read-crash-recover";
 const LOCAL_VFS_RUNTIME_PATH: &str = "local-vfs";
-const OP_FSYNC_BEFORE_FLUSH: &str = "OpFsyncBeforeFlush";
+const MOUNTED_FUSE_RUNTIME_PATH: &str = "mounted-fuse";
+const MOUNT_HARNESS_BACKEND: &str = "MountHarness";
+const MOUNTED_FUSE_CRASH_TEST: &str = "mounted_write_fsync_read_crash_recover";
 const PROCESS_EXIT_AFTER_READ: &str = "ProcessExitAfterRead";
 const POWER_LOSS_CRASH_MODE: &str = "PowerLoss";
 const POWER_LOSS_EXIT_CODE: i32 = 99;
@@ -60,17 +65,25 @@ struct LocalVfsRuntimeCrashArtifact {
     evidence_scope: String,
     scenario: String,
     runtime_path: String,
-    crash_injection_point: String,
-    crash_mode: String,
-    hook_hit_count: u64,
-    child_exit_code: i32,
-    completed_fsync: CompletedFsyncObservation,
-    interrupted_fsync: InterruptedFsyncObservation,
-    recovery: RecoveryObservation,
+    run_id: String,
+    source_ref: String,
+    command: String,
+    backend: String,
+    output_location: String,
+    observed_outcome: ValidationStatus,
+    #[serde(default)]
+    completed_fsync: Option<CompletedFsyncObservation>,
+    #[serde(default)]
+    crash: Option<MountedFuseCrashObservation>,
+    #[serde(default)]
+    recovery: Option<RecoveryObservation>,
+    #[serde(default)]
     dependencies: Vec<RuntimeDependency>,
     non_claims: Vec<NonClaimBoundary>,
-    validation_hint: String,
+    #[serde(default)]
     events: Vec<RuntimeCrashEvent>,
+    #[serde(default)]
+    refusal: Option<RuntimeRefusal>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -119,14 +132,18 @@ struct CompletedFsyncObservation {
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct InterruptedFsyncObservation {
-    path: String,
-    payload_label: String,
-    content_digest: String,
-    fsync_attempted: bool,
-    fsync_completed: bool,
-    hook_hit: bool,
-    crash_triggered: bool,
+struct MountedFuseCrashObservation {
+    signal: String,
+    remount_succeeded: bool,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeRefusal {
+    environment_primitive: String,
+    reason: String,
+    observed_free_bytes: u64,
+    required_free_bytes: u64,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -244,9 +261,16 @@ fn validate_local_vfs_runtime_crash_artifact(
 ) -> Result<LocalVfsRuntimeCrashArtifactSummary, LocalVfsRuntimeCrashArtifactError> {
     let mut failures = Vec::new();
     validate_static_fields(&artifact, &mut failures);
-    validate_runtime_observations(&artifact, &mut failures);
-    validate_events(&artifact.events, &mut failures);
-    validate_dependencies(&artifact.dependencies, &mut failures);
+    match artifact.observed_outcome {
+        ValidationStatus::Pass => {
+            validate_mounted_fuse_runtime_observations(&artifact, &mut failures)
+        }
+        ValidationStatus::EnvironmentRefusal => validate_runtime_refusal(&artifact, &mut failures),
+        other => failures.push(format!(
+            "observed_outcome must be `pass` or `environment-refusal`, found `{}`",
+            other.label()
+        )),
+    }
     validate_non_claims(
         &artifact.non_claims,
         LOCAL_VFS_WRITE_FSYNC_RUNTIME_CRASH_CLAIM_ID,
@@ -265,7 +289,11 @@ fn validate_local_vfs_runtime_crash_artifact(
         Ok(LocalVfsRuntimeCrashArtifactSummary {
             event_count: artifact.events.len(),
             dependency_count: artifact.dependencies.len(),
-            recovered_digest: artifact.recovery.recovered_content_digest,
+            recovered_digest: artifact
+                .recovery
+                .as_ref()
+                .map(|recovery| recovery.recovered_content_digest.clone())
+                .unwrap_or_else(|| "environment-refusal".to_string()),
         })
     } else {
         Err(LocalVfsRuntimeCrashArtifactError { failures })
@@ -306,9 +334,9 @@ fn validate_local_vfs_rename_runtime_crash_artifact(
 }
 
 fn validate_static_fields(artifact: &LocalVfsRuntimeCrashArtifact, failures: &mut Vec<String>) {
-    if artifact.report_version != 1 {
+    if artifact.report_version != 2 {
         failures.push(format!(
-            "report_version must be 1, found {}",
+            "report_version must be 2, found {}",
             artifact.report_version
         ));
     }
@@ -331,7 +359,7 @@ fn validate_static_fields(artifact: &LocalVfsRuntimeCrashArtifact, failures: &mu
         ));
     }
     let scope = artifact.evidence_scope.to_ascii_lowercase();
-    for required in ["local", "vfs", "runtime", "write", "fsync", "crash"] {
+    for required in ["mounted", "fuse", "runtime", "write", "fsync", "crash"] {
         if !scope.contains(required) {
             failures.push(format!("evidence_scope must mention `{required}`"));
         }
@@ -339,41 +367,64 @@ fn validate_static_fields(artifact: &LocalVfsRuntimeCrashArtifact, failures: &mu
     if scope.contains("model-only") {
         failures.push("evidence_scope must not be model-only".to_string());
     }
-    if artifact.scenario != LOCAL_VFS_WRITE_FSYNC_RUNTIME_SCENARIO {
+    if artifact.scenario != MOUNTED_FUSE_WRITE_FSYNC_RUNTIME_SCENARIO {
         failures.push(format!(
-            "scenario must be `{LOCAL_VFS_WRITE_FSYNC_RUNTIME_SCENARIO}`, found `{}`",
+            "scenario must be `{MOUNTED_FUSE_WRITE_FSYNC_RUNTIME_SCENARIO}`, found `{}`",
             artifact.scenario
         ));
     }
-    if artifact.runtime_path != LOCAL_VFS_RUNTIME_PATH {
+    if artifact.runtime_path != MOUNTED_FUSE_RUNTIME_PATH {
         failures.push(format!(
-            "runtime_path must be `{LOCAL_VFS_RUNTIME_PATH}`, found `{}`",
+            "runtime_path must be `{MOUNTED_FUSE_RUNTIME_PATH}`, found `{}`",
             artifact.runtime_path
         ));
     }
-    if artifact.crash_injection_point != OP_FSYNC_BEFORE_FLUSH {
+    if artifact.run_id.trim().is_empty()
+        || artifact.run_id.to_ascii_lowercase().contains("fixture")
+        || artifact.run_id.to_ascii_lowercase().contains("placeholder")
+    {
         failures.push(format!(
-            "crash_injection_point must be `{OP_FSYNC_BEFORE_FLUSH}`, found `{}`",
-            artifact.crash_injection_point
+            "run_id must identify a non-fixture mounted runtime attempt, found `{}`",
+            artifact.run_id
         ));
     }
-    if artifact.crash_mode != POWER_LOSS_CRASH_MODE {
+    if artifact.source_ref.len() != 40
+        || !artifact
+            .source_ref
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        failures.push("source_ref must record the 40-hex source commit".to_string());
+    }
+    if !artifact.command.contains("cargo test")
+        || !artifact.command.contains(MOUNTED_FUSE_CRASH_TEST)
+        || !artifact.command.contains("--ignored")
+    {
         failures.push(format!(
-            "crash_mode must be `{POWER_LOSS_CRASH_MODE}`, found `{}`",
-            artifact.crash_mode
+            "command must record the explicit Cargo invocation for `{MOUNTED_FUSE_CRASH_TEST}`"
         ));
     }
-    if artifact.hook_hit_count == 0 {
-        failures.push("hook_hit_count must be nonzero".to_string());
-    }
-    if artifact.child_exit_code != POWER_LOSS_EXIT_CODE {
+    if artifact.backend != MOUNT_HARNESS_BACKEND {
         failures.push(format!(
-            "child_exit_code must be {POWER_LOSS_EXIT_CODE} for PowerLoss crash mode, found {}",
-            artifact.child_exit_code
+            "backend must be `{MOUNT_HARNESS_BACKEND}`, found `{}`",
+            artifact.backend
         ));
     }
-    if artifact.validation_hint.trim().is_empty() {
-        failures.push("validation_hint must not be empty".to_string());
+    if artifact.output_location.trim().is_empty() {
+        failures.push("output_location must not be empty".to_string());
+    }
+    if [
+        artifact.generated_by.as_str(),
+        artifact.command.as_str(),
+        artifact.backend.as_str(),
+    ]
+    .iter()
+    .any(|value| value.to_ascii_lowercase().contains("localfilesystem"))
+    {
+        failures.push(
+            "mounted runtime provenance must not name LocalFileSystem fixture execution"
+                .to_string(),
+        );
     }
 }
 
@@ -449,56 +500,83 @@ fn validate_rename_static_fields(
     }
 }
 
-fn validate_runtime_observations(
+fn validate_mounted_fuse_runtime_observations(
     artifact: &LocalVfsRuntimeCrashArtifact,
     failures: &mut Vec<String>,
 ) {
-    if artifact.completed_fsync.path != artifact.recovery.path
-        || artifact.interrupted_fsync.path != artifact.recovery.path
-    {
-        failures.push(
-            "completed_fsync, interrupted_fsync, and recovery must name the same path".to_string(),
-        );
+    let Some(completed_fsync) = artifact.completed_fsync.as_ref() else {
+        failures.push("pass artifact must include completed_fsync".to_string());
+        return;
+    };
+    let Some(crash) = artifact.crash.as_ref() else {
+        failures.push("pass artifact must include crash".to_string());
+        return;
+    };
+    let Some(recovery) = artifact.recovery.as_ref() else {
+        failures.push("pass artifact must include recovery".to_string());
+        return;
+    };
+
+    if artifact.refusal.is_some() {
+        failures.push("pass artifact must not include a refusal record".to_string());
     }
-    if !artifact.completed_fsync.fsync_completed {
+    if completed_fsync.path != recovery.path {
+        failures.push("completed_fsync and recovery must name the same path".to_string());
+    }
+    if !completed_fsync.fsync_completed {
         failures.push("completed_fsync.fsync_completed must be true".to_string());
     }
-    if !artifact.completed_fsync.read_back_before_crash {
+    if !completed_fsync.read_back_before_crash {
         failures.push("completed_fsync.read_back_before_crash must be true".to_string());
     }
-    if !artifact.interrupted_fsync.fsync_attempted {
-        failures.push("interrupted_fsync.fsync_attempted must be true".to_string());
+    if crash.signal != "SIGKILL" || !crash.remount_succeeded {
+        failures.push("crash must record SIGKILL followed by a successful remount".to_string());
     }
-    if artifact.interrupted_fsync.fsync_completed {
-        failures.push("interrupted_fsync.fsync_completed must be false".to_string());
-    }
-    if !artifact.interrupted_fsync.hook_hit || !artifact.interrupted_fsync.crash_triggered {
-        failures
-            .push("interrupted_fsync must record the fsync hook hit and crash trigger".to_string());
-    }
-    if !artifact.recovery.reopen_succeeded || !artifact.recovery.read_after_recovery_succeeded {
+    if !recovery.reopen_succeeded || !recovery.read_after_recovery_succeeded {
         failures.push("recovery must reopen and read the target path successfully".to_string());
     }
-    if artifact.recovery.recovered_content_digest != artifact.completed_fsync.content_digest {
+    if recovery.recovered_content_digest != completed_fsync.content_digest {
         failures.push("recovery digest must match the last completed fsync digest".to_string());
     }
-    if artifact.interrupted_fsync.content_digest == artifact.completed_fsync.content_digest {
-        failures.push(
-            "interrupted fsync payload digest must differ from the completed fsync digest"
-                .to_string(),
-        );
-    }
-    if artifact.completed_fsync.payload_label.trim().is_empty()
-        || artifact.interrupted_fsync.payload_label.trim().is_empty()
-        || artifact.completed_fsync.content_digest.trim().is_empty()
-        || artifact.interrupted_fsync.content_digest.trim().is_empty()
-        || artifact.recovery.recovered_content_digest.trim().is_empty()
+    if completed_fsync.payload_label.trim().is_empty()
+        || completed_fsync.content_digest.trim().is_empty()
+        || recovery.recovered_content_digest.trim().is_empty()
     {
         failures.push("payload labels and digests must not be empty".to_string());
     }
-    if artifact.recovery.classification != "last-completed-fsync-survived" {
+    if recovery.classification != "last-completed-fsync-survived" {
         failures
             .push("recovery.classification must be `last-completed-fsync-survived`".to_string());
+    }
+    validate_events(&artifact.events, failures);
+    validate_dependencies(&artifact.dependencies, failures);
+}
+
+fn validate_runtime_refusal(artifact: &LocalVfsRuntimeCrashArtifact, failures: &mut Vec<String>) {
+    let Some(refusal) = artifact.refusal.as_ref() else {
+        failures.push("environment-refusal artifact must include refusal".to_string());
+        return;
+    };
+
+    if artifact.completed_fsync.is_some()
+        || artifact.crash.is_some()
+        || artifact.recovery.is_some()
+        || !artifact.events.is_empty()
+        || !artifact.dependencies.is_empty()
+    {
+        failures.push(
+            "environment-refusal must not include unobserved pass-only runtime fields".to_string(),
+        );
+    }
+    if refusal.environment_primitive.trim().is_empty() || refusal.reason.trim().is_empty() {
+        failures.push("refusal must name the environment primitive and reason".to_string());
+    }
+    if refusal.required_free_bytes == 0
+        || refusal.observed_free_bytes >= refusal.required_free_bytes
+    {
+        failures.push(
+            "refusal must show observed free space below the required free-space floor".to_string(),
+        );
     }
 }
 
@@ -590,6 +668,7 @@ fn validate_events(events: &[RuntimeCrashEvent], failures: &mut Vec<String>) {
     }
 
     for required in [
+        "mount",
         "write",
         "fsync",
         "read",
@@ -600,6 +679,20 @@ fn validate_events(events: &[RuntimeCrashEvent], failures: &mut Vec<String>) {
         if !operations.contains(required) {
             failures.push(format!("events must include `{required}` operation"));
         }
+    }
+    if !events
+        .iter()
+        .any(|event| event.source == MOUNT_HARNESS_BACKEND)
+    {
+        failures.push("events must include MountHarness provenance".to_string());
+    }
+    if events.iter().any(|event| {
+        event
+            .source
+            .to_ascii_lowercase()
+            .contains("localfilesystem")
+    }) {
+        failures.push("events must not cite LocalFileSystem fixture execution".to_string());
     }
 }
 
@@ -763,38 +856,32 @@ mod tests {
     use super::*;
 
     const VALID: &str = r#"{
-      "report_version": 1,
-      "generated_by": "unit-test",
+      "report_version": 2,
+      "generated_by": "apps/tidefs-posix-filesystem-adapter-daemon/tests/crash_recovery_ops.rs::mounted_write_fsync_read_crash_recover",
       "claim_ids": ["local.vfs.write_fsync_crash.v1"],
       "evidence_class": "runtime-crash-oracle",
-      "evidence_scope": "local VFS runtime write/fsync/read crash/recover",
-      "scenario": "local-vfs-write-fsync-read-crash-recover",
-      "runtime_path": "local-vfs",
-      "crash_injection_point": "OpFsyncBeforeFlush",
-      "crash_mode": "PowerLoss",
-      "hook_hit_count": 1,
-      "child_exit_code": 99,
+      "evidence_scope": "bounded mounted FUSE runtime write/fsync/read crash/recover path",
+      "scenario": "mounted-fuse-write-fsync-read-crash-recover",
+      "runtime_path": "mounted-fuse",
+      "run_id": "unit-mounted-fuse-2315",
+      "source_ref": "0123456789abcdef0123456789abcdef01234567",
+      "command": "cargo test -p tidefs-posix-filesystem-adapter-daemon --test crash_recovery_ops mounted_write_fsync_read_crash_recover -- --ignored --exact --nocapture",
+      "backend": "MountHarness",
+      "output_location": "/tmp/mounted-fuse-runtime.log",
+      "observed_outcome": "pass",
       "completed_fsync": {
         "path": "/oracle.txt",
         "payload_label": "v1",
-        "content_digest": "sha256:v1",
+        "content_digest": "blake3:v1",
         "fsync_completed": true,
         "read_back_before_crash": true
       },
-      "interrupted_fsync": {
-        "path": "/oracle.txt",
-        "payload_label": "v2",
-        "content_digest": "sha256:v2",
-        "fsync_attempted": true,
-        "fsync_completed": false,
-        "hook_hit": true,
-        "crash_triggered": true
-      },
+      "crash": {"signal": "SIGKILL", "remount_succeeded": true},
       "recovery": {
         "reopen_succeeded": true,
         "read_after_recovery_succeeded": true,
         "path": "/oracle.txt",
-        "recovered_content_digest": "sha256:v1",
+        "recovered_content_digest": "blake3:v1",
         "classification": "last-completed-fsync-survived"
       },
       "dependencies": [
@@ -807,16 +894,16 @@ mod tests {
           "category": "production-crash-safety",
           "claim_id": "local.vfs.write_fsync_crash.v1",
           "evidence_class": "runtime-crash-oracle",
-          "evidence_scope": "local VFS runtime write/fsync/read crash/recover",
+          "evidence_scope": "bounded mounted FUSE runtime write/fsync/read crash/recover path",
           "excluded_product_claim": "production crash safety",
-          "remaining_risk": "storage-wide crash-safety coverage remains outside this local VFS hook artifact",
+          "remaining_risk": "storage-wide crash-safety coverage remains outside this bounded mounted FUSE artifact",
           "blocking_issue": 493
         },
         {
           "category": "model-crash-matrix",
           "claim_id": "local.vfs.write_fsync_crash.v1",
           "evidence_class": "runtime-crash-oracle",
-          "evidence_scope": "local VFS runtime write/fsync/read crash/recover",
+          "evidence_scope": "bounded mounted FUSE runtime write/fsync/read crash/recover path",
           "excluded_product_claim": "model crash matrix replacement",
           "remaining_risk": "model crash matrix validation remains separate from this runtime artifact",
           "blocking_issue": null
@@ -825,31 +912,89 @@ mod tests {
           "category": "queue-depth-no-hidden-queue",
           "claim_id": "local.vfs.write_fsync_crash.v1",
           "evidence_class": "runtime-crash-oracle",
-          "evidence_scope": "local VFS runtime write/fsync/read crash/recover",
+          "evidence_scope": "bounded mounted FUSE runtime write/fsync/read crash/recover path",
           "excluded_product_claim": "queue-depth and no-hidden-queue admission coverage",
-          "remaining_risk": "runtime queue-depth evidence remains required for no-hidden-queue admission",
+          "remaining_risk": "runtime queue-depth evidence remains required before no-hidden-queue admission coverage can strengthen",
           "blocking_issue": null
         },
         {
           "category": "interrupted-fsync-durability",
           "claim_id": "local.vfs.write_fsync_crash.v1",
           "evidence_class": "runtime-crash-oracle",
-          "evidence_scope": "local VFS runtime write/fsync/read crash/recover",
+          "evidence_scope": "bounded mounted FUSE runtime write/fsync/read crash/recover path",
           "excluded_product_claim": "interrupted fsync payload durability",
-          "remaining_risk": "the interrupted fsync exits before completion and does not prove the interrupted payload is durable",
+          "remaining_risk": "this row covers only a completed fsync before SIGKILL, not interruption during fsync",
           "blocking_issue": null
         }
       ],
-      "validation_hint": "cargo test -p tidefs-local-filesystem",
       "events": [
-        {"sequence": 1, "operation": "write", "path": "/oracle.txt", "result": "ok", "source": "test"},
-        {"sequence": 2, "operation": "fsync", "path": "/oracle.txt", "result": "ok", "source": "test"},
-        {"sequence": 3, "operation": "read", "path": "/oracle.txt", "result": "ok", "source": "test"},
-        {"sequence": 4, "operation": "write", "path": "/oracle.txt", "result": "ok", "source": "child"},
-        {"sequence": 5, "operation": "fsync", "path": "/oracle.txt", "result": "interrupted", "source": "child"},
-        {"sequence": 6, "operation": "crash", "path": null, "result": "exit-99", "source": "hook"},
-        {"sequence": 7, "operation": "recover", "path": null, "result": "ok", "source": "open"},
-        {"sequence": 8, "operation": "read_recovered", "path": "/oracle.txt", "result": "ok", "source": "test"}
+        {"sequence": 1, "operation": "mount", "path": null, "result": "FUSE mount ready", "source": "MountHarness"},
+        {"sequence": 2, "operation": "write", "path": "/oracle.txt", "result": "payload written through mounted path", "source": "MountHarness"},
+        {"sequence": 3, "operation": "fsync", "path": "/oracle.txt", "result": "fsync completed", "source": "MountHarness"},
+        {"sequence": 4, "operation": "read", "path": "/oracle.txt", "result": "payload read before crash", "source": "MountHarness"},
+        {"sequence": 5, "operation": "crash", "path": null, "result": "daemon SIGKILL", "source": "MountHarness"},
+        {"sequence": 6, "operation": "recover", "path": null, "result": "fresh daemon remounted the same store", "source": "MountHarness"},
+        {"sequence": 7, "operation": "read_recovered", "path": "/oracle.txt", "result": "fsynced payload recovered", "source": "MountHarness"}
+      ]
+    }"#;
+
+    const VALID_ENVIRONMENT_REFUSAL: &str = r#"{
+      "report_version": 2,
+      "generated_by": "apps/tidefs-posix-filesystem-adapter-daemon/tests/crash_recovery_ops.rs::mounted_write_fsync_read_crash_recover",
+      "claim_ids": ["local.vfs.write_fsync_crash.v1"],
+      "evidence_class": "runtime-crash-oracle",
+      "evidence_scope": "bounded mounted FUSE runtime write/fsync/read crash/recover path",
+      "scenario": "mounted-fuse-write-fsync-read-crash-recover",
+      "runtime_path": "mounted-fuse",
+      "run_id": "unit-mounted-fuse-refusal-2315",
+      "source_ref": "0123456789abcdef0123456789abcdef01234567",
+      "command": "cargo test -p tidefs-posix-filesystem-adapter-daemon --test crash_recovery_ops mounted_write_fsync_read_crash_recover -- --ignored --exact --nocapture",
+      "backend": "MountHarness",
+      "output_location": "/tmp/mounted-fuse-runtime-refusal.log",
+      "observed_outcome": "environment-refusal",
+      "refusal": {
+        "environment_primitive": "root disk headroom",
+        "reason": "the host cannot safely allocate the mounted runtime build closure",
+        "observed_free_bytes": 10,
+        "required_free_bytes": 50
+      },
+      "non_claims": [
+        {
+          "category": "production-crash-safety",
+          "claim_id": "local.vfs.write_fsync_crash.v1",
+          "evidence_class": "runtime-crash-oracle",
+          "evidence_scope": "bounded mounted FUSE runtime write/fsync/read crash/recover path",
+          "excluded_product_claim": "production crash safety",
+          "remaining_risk": "the mounted runtime row was unavailable",
+          "blocking_issue": 2315
+        },
+        {
+          "category": "model-crash-matrix",
+          "claim_id": "local.vfs.write_fsync_crash.v1",
+          "evidence_class": "runtime-crash-oracle",
+          "evidence_scope": "bounded mounted FUSE runtime write/fsync/read crash/recover path",
+          "excluded_product_claim": "model crash matrix replacement",
+          "remaining_risk": "model evidence remains separate",
+          "blocking_issue": null
+        },
+        {
+          "category": "queue-depth-no-hidden-queue",
+          "claim_id": "local.vfs.write_fsync_crash.v1",
+          "evidence_class": "runtime-crash-oracle",
+          "evidence_scope": "bounded mounted FUSE runtime write/fsync/read crash/recover path",
+          "excluded_product_claim": "queue-depth and no-hidden-queue admission coverage",
+          "remaining_risk": "runtime queue-depth evidence remains required",
+          "blocking_issue": null
+        },
+        {
+          "category": "interrupted-fsync-durability",
+          "claim_id": "local.vfs.write_fsync_crash.v1",
+          "evidence_class": "runtime-crash-oracle",
+          "evidence_scope": "bounded mounted FUSE runtime write/fsync/read crash/recover path",
+          "excluded_product_claim": "interrupted fsync payload durability",
+          "remaining_risk": "the mounted row did not execute",
+          "blocking_issue": null
+        }
       ]
     }"#;
 
@@ -947,9 +1092,19 @@ mod tests {
     fn validates_runtime_crash_artifact() {
         let summary = validate_local_vfs_runtime_crash_artifact_json(VALID).expect("valid");
 
-        assert_eq!(summary.event_count, 8);
+        assert_eq!(summary.event_count, 7);
         assert_eq!(summary.dependency_count, 3);
-        assert_eq!(summary.recovered_digest, "sha256:v1");
+        assert_eq!(summary.recovered_digest, "blake3:v1");
+    }
+
+    #[test]
+    fn validates_mounted_runtime_environment_refusal() {
+        let summary = validate_local_vfs_runtime_crash_artifact_json(VALID_ENVIRONMENT_REFUSAL)
+            .expect("valid environment refusal");
+
+        assert_eq!(summary.event_count, 0);
+        assert_eq!(summary.dependency_count, 0);
+        assert_eq!(summary.recovered_digest, "environment-refusal");
     }
 
     #[test]
@@ -965,7 +1120,7 @@ mod tests {
     #[test]
     fn rejects_model_only_runtime_artifact() {
         let bad = VALID.replace(
-            "local VFS runtime write/fsync/read crash/recover",
+            "bounded mounted FUSE runtime write/fsync/read crash/recover path",
             "model-only crash matrix",
         );
         let err = validate_local_vfs_runtime_crash_artifact_json(&bad).expect_err("invalid");

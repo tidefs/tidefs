@@ -428,12 +428,12 @@ evidence_requirements = [
   { class = "claims-gate-review", path = "validation/artifacts/crash-oracle/claims-gate-review.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/crash-oracle/claims-gate-review.local-vfs-write-fsync.manifest.json", blocking_issues = [] },
 ]
 blockers = [
-  "The recorded local VFS write/fsync runtime manifest is a deterministic fixture from a stale issue branch, not current-source mounted runtime evidence.",
+  "The current-source mounted FUSE write/fsync runtime row recorded an environment refusal for insufficient worker disk headroom, not a passing runtime outcome.",
 ]
-generated_doc = "Blocked local VFS write/fsync crash claim. TideFS has model evidence and a bounded local runtime fixture for the write -> fsync -> read -> crash/recover path, but current-source mounted runtime evidence must replace the deterministic fixture before product wording may validate this scope."
+generated_doc = "Blocked local VFS write/fsync crash claim. TideFS has model evidence and a current-source mounted FUSE row for the write -> fsync -> read -> crash/recover path, but that row is an environment refusal rather than a pass; a passing current-source mounted runtime artifact remains required before product wording may validate this scope."
 evidence_artifacts = [
   { class = "model-crash-matrix", path = "validation/artifacts/crash-oracle/model-crash-matrices.json", source = "tidefs-crash-oracle", scope = "model-only" },
-  { class = "runtime-crash-oracle", path = "validation/artifacts/crash-oracle/local-vfs-write-fsync-runtime-crash.json", source = "tidefs-local-filesystem", scope = "local-vfs-runtime-write-fsync-crash" },
+  { class = "runtime-crash-oracle", path = "validation/artifacts/crash-oracle/local-vfs-write-fsync-runtime-crash.json", source = "tidefs-posix-filesystem-adapter-daemon", scope = "mounted-fuse-runtime-write-fsync-crash" },
   { class = "claims-gate-review", path = "validation/artifacts/crash-oracle/claims-gate-review.toml", source = "claims-gate", scope = "model-runtime-boundary-review" },
 ]
 

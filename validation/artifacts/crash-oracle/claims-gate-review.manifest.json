@@ -5,18 +5,18 @@
   "validation_tier": "source-model",
   "scope": "model-runtime-boundary-review for storage.write_fsync.crash_safety.v1",
   "artifact_path": "validation/artifacts/crash-oracle/claims-gate-review.toml",
-  "content_digest": "blake3:b4c90e28953dc901d24020eb4310ef713b9ef91cd5f428d80d8fff4428321cbd",
-  "run_id": "deterministic-fixture:crash-oracle-claims-gate-review-v1",
-  "source_ref": "refs/heads/gpt3/issue-1484-crash-oracle-manifests",
+  "content_digest": "blake3:de96a43fa3d961d76fc4adc46849fe59fb0f4947710dfd5e3b1d6f25f0b1a645",
+  "run_id": "codex1-issue-2315-claims-gate-review-20260720T0045Z",
+  "source_ref": "a6eea2e301c47f08196e0d22adf013558c23fa73",
   "outcome": "skip",
-  "residual_risk": "This review records claim-boundary policy only. It does not create runtime evidence or close the registry blockers for broader storage crash-safety claims.",
+  "residual_risk": "This source-model review records the current mounted FUSE environment refusal and keeps broader storage crash-safety claims fail-closed.",
   "source": "claims-gate",
-  "generated_at": "2026-06-28T18:27:07Z",
+  "generated_at": "2026-07-20T00:45:00Z",
   "blocking_issues": [
     {
       "repo": "tidefs/tidefs",
-      "number": 329,
-      "reason": "claims-gate review records the model/runtime boundary without closing broader storage crash-safety blockers"
+      "number": 2315,
+      "reason": "the current-source mounted FUSE runtime row has no pass outcome"
     }
   ]
 }

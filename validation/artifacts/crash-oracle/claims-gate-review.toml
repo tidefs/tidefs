@@ -17,18 +17,18 @@ reviewed_claim_ids = [
 ]
 
 missing_runtime_evidence_classes = []
-runtime_evidence_status = "local-write-and-rename-runtime-present-scope-boundaries-blocked"
-decision = "write-fsync-validated-rename-planned-blocked-fail-closed"
+runtime_evidence_status = "local-write-mounted-runtime-present-as-environment-refusal-rename-runtime-present-scope-boundaries-blocked"
+decision = "write-fsync-environment-refusal-rename-planned-blocked-fail-closed"
 
 boundary_review = [
   "The registered model-crash-matrix artifact is model-only evidence from tidefs-crash-oracle and does not satisfy runtime crash evidence classes.",
-  "The local VFS write/fsync runtime-crash-oracle artifact records OpFsyncBeforeFlush runtime evidence and satisfies local.vfs.write_fsync_crash.v1 only within the local VFS hook path.",
+  "The local VFS write/fsync runtime-crash-oracle artifact now records a current-source mounted FUSE environment refusal: its explicit MountHarness command did not reach the runtime row because host disk headroom was below the worker safety floor. It does not satisfy local.vfs.write_fsync_crash.v1.",
   "The local VFS rename runtime-namespace-crash-artifact records the rename -> fsync -> read -> process-exit/recover -> read boundary and satisfies runtime evidence only for the bounded local VFS rename scope.",
-  "The storage-wide write/fsync, namespace rename, and local rename crash claims remain planned or blocked and fail-closed until their registered runtime evidence, model evidence, dependency evidence, no-hidden-queue evidence, and claims-gate review are all fresh for the claimed scope.",
+  "The storage-wide write/fsync, namespace rename, and local rename crash claims remain planned or blocked and fail-closed until their registered runtime evidence has a pass outcome, and their model evidence, dependency evidence, no-hidden-queue evidence, and claims-gate review are all fresh for the claimed scope.",
 ]
 
 non_claims = [
-  "This review does not validate local runtime crash injection beyond the bounded OpFsyncBeforeFlush write artifact and ProcessExitAfterRead rename artifact.",
+  "This review does not validate local runtime crash injection beyond the refused mounted FUSE write row and the bounded ProcessExitAfterRead rename artifact.",
   "This review does not validate the interrupted fsync payload as durable.",
   "This review does not validate rename directory-entry, link/unlink, or orphan-index no-hidden-queue evidence.",
   "This review does not validate production crash safety.",

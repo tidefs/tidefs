@@ -3,14 +3,20 @@
   "claim_id": "local.vfs.write_fsync_crash.v1",
   "evidence_class": "runtime-crash-oracle",
   "validation_tier": "mounted-userspace",
-  "scope": "bounded local VFS write -> fsync -> read -> crash/recover runtime path",
+  "scope": "bounded mounted FUSE write -> fsync -> read -> SIGKILL/remount -> read path",
   "artifact_path": "validation/artifacts/crash-oracle/local-vfs-write-fsync-runtime-crash.json",
-  "content_digest": "blake3:2d7a21fed21d896e2bbdf39da16242b5570b127e28f9e45214ddceb006b90223",
-  "run_id": "deterministic-fixture:crash-oracle-local-vfs-write-fsync-runtime-v1",
-  "source_ref": "refs/heads/gpt3/issue-1484-crash-oracle-manifests",
-  "outcome": "pass",
-  "residual_risk": "The runtime artifact proves only the bounded local VFS OpFsyncBeforeFlush path. It does not prove storage-wide, kernel, distributed, mmap/writeback, xfstests, RDMA, or production crash safety.",
-  "source": "tidefs-local-filesystem",
-  "generated_at": "2026-06-28T18:27:07Z",
-  "blocking_issues": []
+  "content_digest": "blake3:d6830cf5b1d6733d5b21cab1fc22baba3ec2a614ff182b6c8f825ddc87286be8",
+  "run_id": "codex1-issue-2315-mounted-fuse-20260720T0045Z",
+  "source_ref": "a6eea2e301c47f08196e0d22adf013558c23fa73",
+  "outcome": "environment-refusal",
+  "residual_risk": "The mounted runtime command did not complete because host disk headroom was below the managed-worker safety floor. The claim remains blocked and no product durability result was observed.",
+  "source": "tidefs-posix-filesystem-adapter-daemon",
+  "generated_at": "2026-07-20T00:45:00Z",
+  "blocking_issues": [
+    {
+      "repo": "tidefs/tidefs",
+      "number": 2315,
+      "reason": "the focused mounted FUSE runtime row remains unavailable until safe build headroom is restored"
+    }
+  ]
 }
