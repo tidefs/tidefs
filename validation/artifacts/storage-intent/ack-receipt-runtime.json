@@ -3,9 +3,9 @@
   "claim_id": "storage.intent.ack_receipt_honesty.v1",
   "issue": "https://github.com/tidefs/tidefs/issues/2223",
   "parent_issue": "https://github.com/tidefs/tidefs/issues/1794",
-  "run_id": "29630398064/1",
-  "source_ref": "85596c69f61e5165571300ee5bec639818f68f6d",
-  "generated_at": "2026-07-18T04:20:49Z",
+  "run_id": "29666546112/1",
+  "source_ref": "16f39e777859e52beb858dd3e82c4f6383541d3d",
+  "generated_at": "2026-07-19T00:11:51Z",
   "validation_tier": "mounted-userspace",
   "command": "storage-intent-ack-runtime-validation",
   "backend": {
@@ -26,8 +26,8 @@
       "row_id": "sync-write-receipt",
       "syscall": "write(O_SYNC)",
       "expected_receipt_operation": "sync-write",
-      "syscall_result": "error",
-      "errno": 5,
+      "syscall_result": "success",
+      "errno": null,
       "observed_receipts": [
         {
           "operation": "fdatasync",
@@ -44,17 +44,65 @@
           "refusal_reason": "None",
           "posix_durable_success": true,
           "satisfies_requested_ack_floor": true
+        },
+        {
+          "operation": "fsync",
+          "requested_ack_floor": "local-intent",
+          "earned_ack_class": "full-placement",
+          "disposition": "durable-posix",
+          "convergence": "satisfied",
+          "durability_state": "FullPlacement",
+          "target_inode": 2,
+          "target_offset": 0,
+          "target_length": 0,
+          "target_has_range": false,
+          "evidence_ref_count": 10,
+          "refusal_reason": "None",
+          "posix_durable_success": true,
+          "satisfies_requested_ack_floor": true
+        },
+        {
+          "operation": "fdatasync",
+          "requested_ack_floor": "local-intent",
+          "earned_ack_class": "full-placement",
+          "disposition": "durable-posix",
+          "convergence": "satisfied",
+          "durability_state": "FullPlacement",
+          "target_inode": 2,
+          "target_offset": 0,
+          "target_length": 0,
+          "target_has_range": false,
+          "evidence_ref_count": 10,
+          "refusal_reason": "None",
+          "posix_durable_success": true,
+          "satisfies_requested_ack_floor": true
+        },
+        {
+          "operation": "fsync",
+          "requested_ack_floor": "local-intent",
+          "earned_ack_class": "full-placement",
+          "disposition": "durable-posix",
+          "convergence": "satisfied",
+          "durability_state": "FullPlacement",
+          "target_inode": 2,
+          "target_offset": 0,
+          "target_length": 0,
+          "target_has_range": false,
+          "evidence_ref_count": 10,
+          "refusal_reason": "None",
+          "posix_durable_success": true,
+          "satisfies_requested_ack_floor": true
         }
       ],
       "outcome": "product-fail",
-      "reason": "mounted syscall did not produce an accepted receipt or refusal: Input/output error (os error 5)"
+      "reason": "mounted syscall returned success without an earned sync-write receipt"
     },
     {
       "row_id": "fsync-receipt",
       "syscall": "fsync",
       "expected_receipt_operation": "fsync",
-      "syscall_result": "error",
-      "errno": 5,
+      "syscall_result": "success",
+      "errno": null,
       "observed_receipts": [
         {
           "operation": "fdatasync",
@@ -71,10 +119,26 @@
           "refusal_reason": "None",
           "posix_durable_success": true,
           "satisfies_requested_ack_floor": true
+        },
+        {
+          "operation": "fsync",
+          "requested_ack_floor": "local-intent",
+          "earned_ack_class": "full-placement",
+          "disposition": "durable-posix",
+          "convergence": "satisfied",
+          "durability_state": "FullPlacement",
+          "target_inode": 3,
+          "target_offset": 0,
+          "target_length": 0,
+          "target_has_range": false,
+          "evidence_ref_count": 10,
+          "refusal_reason": "None",
+          "posix_durable_success": true,
+          "satisfies_requested_ack_floor": true
         }
       ],
-      "outcome": "product-fail",
-      "reason": "mounted syscall did not produce an accepted receipt or refusal: Input/output error (os error 5)"
+      "outcome": "pass",
+      "reason": "mounted syscall returned success with an earned fsync receipt"
     },
     {
       "row_id": "fdatasync-receipt",
@@ -144,27 +208,61 @@
       "row_id": "namespace-receipt",
       "syscall": "create+rename+fsync(parent)",
       "expected_receipt_operation": "fsync-directory",
-      "syscall_result": "error",
-      "errno": 5,
-      "observed_receipts": [],
-      "outcome": "product-fail",
-      "reason": "mounted syscall did not produce an accepted receipt or refusal: Input/output error (os error 5)"
+      "syscall_result": "success",
+      "errno": null,
+      "observed_receipts": [
+        {
+          "operation": "fsync-directory",
+          "requested_ack_floor": "local-intent",
+          "earned_ack_class": "full-placement",
+          "disposition": "durable-posix",
+          "convergence": "satisfied",
+          "durability_state": "FullPlacement",
+          "target_inode": 1,
+          "target_offset": 0,
+          "target_length": 0,
+          "target_has_range": false,
+          "evidence_ref_count": 10,
+          "refusal_reason": "None",
+          "posix_durable_success": true,
+          "satisfies_requested_ack_floor": true
+        }
+      ],
+      "outcome": "pass",
+      "reason": "mounted syscall returned success with an earned fsync-directory receipt"
     },
     {
       "row_id": "fsyncdir-receipt",
       "syscall": "fsyncdir",
       "expected_receipt_operation": "fsync-directory",
-      "syscall_result": "error",
-      "errno": 5,
-      "observed_receipts": [],
-      "outcome": "product-fail",
-      "reason": "mounted syscall did not produce an accepted receipt or refusal: Input/output error (os error 5)"
+      "syscall_result": "success",
+      "errno": null,
+      "observed_receipts": [
+        {
+          "operation": "fsync-directory",
+          "requested_ack_floor": "local-intent",
+          "earned_ack_class": "full-placement",
+          "disposition": "durable-posix",
+          "convergence": "satisfied",
+          "durability_state": "FullPlacement",
+          "target_inode": 8,
+          "target_offset": 0,
+          "target_length": 0,
+          "target_has_range": false,
+          "evidence_ref_count": 10,
+          "refusal_reason": "None",
+          "posix_durable_success": true,
+          "satisfies_requested_ack_floor": true
+        }
+      ],
+      "outcome": "pass",
+      "reason": "mounted syscall returned success with an earned fsync-directory receipt"
     }
   ],
   "summary": {
     "status": "product-fail",
-    "passed": 2,
-    "product_failed": 5,
+    "passed": 5,
+    "product_failed": 2,
     "harness_failed": 0,
     "environment_refused": 0,
     "skipped": 0
