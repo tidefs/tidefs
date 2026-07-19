@@ -310,8 +310,9 @@ impl CryptographicEraseKeyLifecycleRefusalValidationRow {
 
         Self {
             validation_tier: "cargo-unit",
-            active_full_proof_refused: assessment.refusal
-                == Some(CryptographicEraseRefusal::KeyLifecycleNotDestroyedOrRevoked),
+            active_full_proof_refused: !assessment.eligible_for_claim_review()
+                && assessment.refusal
+                    == Some(CryptographicEraseRefusal::KeyLifecycleNotDestroyedOrRevoked),
             refusal: assessment
                 .refusal
                 .map_or("none", |refusal| refusal.as_str()),
