@@ -429,11 +429,12 @@ impl BulkService {
         transfer.write_tcp_chunk(token, chunk_seq, offset, payload)
     }
 
-    /// Write a granted TCP_STREAM chunk identified by its stream header.
+    /// Write a granted TCP_STREAM chunk identified by its stream and token.
     pub fn write_tcp_chunk_for_stream(
         &mut self,
         connection_id: ConnectionId,
         stream_id: StreamId,
+        token: BulkToken,
         chunk_seq: u32,
         offset: u64,
         payload: &[u8],
@@ -442,11 +443,14 @@ impl BulkService {
             .connections
             .get_mut(&connection_id)
             .ok_or(BulkError::UnknownToken)?;
+        if connection.token_index.get(&token) != Some(&stream_id) {
+            return Err(BulkError::UnknownToken);
+        }
         let transfer = connection
             .transfers
             .get_mut(&stream_id)
             .ok_or(BulkError::UnknownToken)?;
-        transfer.write_tcp_chunk(transfer.token, chunk_seq, offset, payload)
+        transfer.write_tcp_chunk(token, chunk_seq, offset, payload)
     }
 
     /// Verify DONE and retire the token. Failed transfers are discarded.

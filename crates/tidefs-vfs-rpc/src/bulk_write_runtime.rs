@@ -1022,8 +1022,14 @@ mod tests {
         runtime
             .handle_tcp_chunk(
                 SESSION_ID.0,
-                BulkTcpChunkFrame::new(stream_id, grant.chunk_seq, grant.offset, bytes.to_vec())
-                    .expect("chunk"),
+                BulkTcpChunkFrame::new(
+                    stream_id,
+                    token,
+                    grant.chunk_seq,
+                    grant.offset,
+                    bytes.to_vec(),
+                )
+                .expect("chunk"),
             )
             .expect("chunk write");
     }

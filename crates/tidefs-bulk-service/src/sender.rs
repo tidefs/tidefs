@@ -223,6 +223,7 @@ impl BulkSenderCoordinator {
 
             let chunk = BulkTcpChunkFrame::new(
                 stream_id,
+                token,
                 pending.chunk_seq,
                 pending.offset,
                 transfer.payload[start..end].to_vec(),
@@ -550,6 +551,7 @@ mod tests {
             .expect("grant");
         match first {
             BulkSenderCreditOutcome::SendChunk { chunk, done } => {
+                assert_eq!(chunk.token, token(0x11));
                 assert_eq!(chunk.payload, b"hello wo");
                 assert!(done.is_none());
             }
@@ -580,6 +582,7 @@ mod tests {
             .expect("grant");
         match final_step {
             BulkSenderCreditOutcome::SendChunk { chunk, done } => {
+                assert_eq!(chunk.token, token(0x11));
                 assert_eq!(chunk.payload, b"rld");
                 assert_eq!(
                     done,

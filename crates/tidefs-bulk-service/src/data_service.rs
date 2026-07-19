@@ -73,7 +73,7 @@ impl BulkDataServiceHandler {
         )
     }
 
-    /// Write a decoded TCP_STREAM chunk into BULK reassembly state.
+    /// Write a decoded, token-bound TCP_STREAM chunk into BULK reassembly state.
     pub fn handle_tcp_chunk(
         &self,
         connection_id: ConnectionId,
@@ -82,6 +82,7 @@ impl BulkDataServiceHandler {
         self.service.lock().unwrap().write_tcp_chunk_for_stream(
             connection_id,
             chunk.stream_id,
+            chunk.token,
             chunk.chunk_seq,
             chunk.offset,
             &chunk.payload,
@@ -425,8 +426,9 @@ mod tests {
 
         assert_eq!(handler.active_transfer_count(session_id.0), 1);
         assert_eq!(handler.pinned_bytes(session_id.0), 5);
-        let chunk = BulkTcpChunkFrame::new(11, grant.chunk_seq, grant.offset, b"hello".to_vec())
-            .expect("chunk");
+        let chunk =
+            BulkTcpChunkFrame::new(11, token, grant.chunk_seq, grant.offset, b"hello".to_vec())
+                .expect("chunk");
         let chunk =
             BulkTcpChunkFrame::decode(&chunk.encode().expect("chunk wire")).expect("chunk decode");
         handler
@@ -510,6 +512,103 @@ mod tests {
         assert_eq!(aborted[0].stream_id, 13);
         assert_eq!(aborted[0].reason, BulkAbortReason::Timeout);
         assert_eq!(handler.active_transfer_count(session_id.0), 0);
+    }
+
+    #[test]
+    fn delayed_chunk_cannot_cross_reused_stream_token() {
+        let handler = BulkDataServiceHandler::new(service());
+        let session_id = SessionId::new(9);
+        let old_token = match handle_reply(&handler, session_id, offer_frame(14, 3)) {
+            BulkFrame::Accept(frame) => frame.token.expect("old token"),
+            other => panic!("unexpected reply: {other:?}"),
+        };
+        let old_grant = match handle_reply(
+            &handler,
+            session_id,
+            BulkFrame::CreditRequest(BulkCreditRequestFrame {
+                stream_id: 14,
+                token: old_token,
+                chunk_seq: 0,
+                len: 3,
+            }),
+        ) {
+            BulkFrame::CreditGrant(frame) => frame,
+            other => panic!("unexpected reply: {other:?}"),
+        };
+        let delayed = BulkTcpChunkFrame::new(
+            14,
+            old_token,
+            old_grant.chunk_seq,
+            old_grant.offset,
+            b"old".to_vec(),
+        )
+        .expect("old chunk");
+        let delayed = BulkTcpChunkFrame::decode(&delayed.encode().expect("old chunk wire"))
+            .expect("decode old chunk");
+
+        let abort = BulkFrame::Abort(BulkAbortFrame {
+            stream_id: 14,
+            token: old_token,
+            reason: BulkAbortReason::SenderCancel,
+        })
+        .to_data_service_frame()
+        .expect("abort");
+        handler
+            .handle_data_service_frame(session_id, abort)
+            .expect("abort old attempt");
+
+        let new_token = match handle_reply(&handler, session_id, offer_frame(14, 3)) {
+            BulkFrame::Accept(frame) => frame.token.expect("new token"),
+            other => panic!("unexpected reply: {other:?}"),
+        };
+        assert_ne!(new_token, old_token);
+        let new_grant = match handle_reply(
+            &handler,
+            session_id,
+            BulkFrame::CreditRequest(BulkCreditRequestFrame {
+                stream_id: 14,
+                token: new_token,
+                chunk_seq: 0,
+                len: 3,
+            }),
+        ) {
+            BulkFrame::CreditGrant(frame) => frame,
+            other => panic!("unexpected reply: {other:?}"),
+        };
+
+        assert_eq!(
+            handler.handle_tcp_chunk(session_id.0, delayed),
+            Err(BulkError::UnknownToken)
+        );
+        handler
+            .handle_tcp_chunk(
+                session_id.0,
+                BulkTcpChunkFrame::new(
+                    14,
+                    new_token,
+                    new_grant.chunk_seq,
+                    new_grant.offset,
+                    b"new".to_vec(),
+                )
+                .expect("new chunk"),
+            )
+            .expect("current attempt chunk");
+
+        let done = BulkFrame::Done(BulkDoneFrame {
+            stream_id: 14,
+            token: new_token,
+            total_transferred: 3,
+            checksum32: crc32c::crc32c(b"new"),
+        })
+        .to_data_service_frame()
+        .expect("done");
+        handler
+            .handle_data_service_frame(session_id, done)
+            .expect("complete current attempt");
+        let completed = handler.drain_completed();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].token, new_token);
+        assert_eq!(completed[0].bytes, b"new");
     }
 
     #[test]
