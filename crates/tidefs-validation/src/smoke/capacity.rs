@@ -13,6 +13,10 @@ use crate::smoke::SmokeHarness;
 use crate::trace::{deserialize_trace, serialize_trace, TraceEvent};
 use tidefs_local_filesystem::capacity_authority::{CapacityAuthority, CapacityStatfs};
 use tidefs_posix_filesystem_adapter_daemon::capacity::StatfsReply;
+use tidefs_space_accounting::SpaceAccounting;
+use tidefs_types_space_accounting_core::{
+    DatasetSpaceCountersV1, PoolPhysicalCountersV1, SpaceDelta, SpaceDomainId,
+};
 use tidefs_types_vfs_core::Errno;
 
 /// Run the full capacity smoke sequence and return the harness.
@@ -208,14 +212,59 @@ fn smoke_allocation_accounting(h: &mut SmokeHarness) {
 }
 
 fn smoke_record_free_accounting(h: &mut SmokeHarness) {
-    let ca = CapacityAuthority::new(4096 * 64, 4096 * 16, 4096, 0);
+    let total_bytes = 4096 * 64;
+    let initial_used_bytes = 4096 * 16;
+    let freed_bytes = 4096 * 8;
+    let initial_pool = PoolPhysicalCountersV1::mounted_authority_from_capacity(
+        total_bytes,
+        initial_used_bytes,
+        4096,
+    );
+    let mut accounting = SpaceAccounting::new(
+        DatasetSpaceCountersV1 {
+            logical_used_bytes: initial_used_bytes,
+            quota_bytes: total_bytes,
+            ..DatasetSpaceCountersV1::default()
+        },
+        SpaceDomainId::NONE,
+    );
+    accounting.update_pool_counters(initial_pool);
+    let ca = CapacityAuthority::from_committed_accounting(total_bytes, &accounting, 4096, 0);
     record_capacity_op(h, "capacity.record_free", 0, b"free 8 of 16 blocks");
 
-    ca.record_free(4096 * 8);
+    accounting.accumulate_delta(SpaceDelta::new_free(freed_bytes));
+    ca.record_free(freed_bytes);
     h.assert_eq_ev("record_free decreases used", ca.used_bytes(), 4096 * 8);
-    h.assert_eq_ev("record_free increases free", ca.free_bytes(), 4096 * 56);
     h.assert_eq_ev(
-        "record_free increases avail",
+        "record_free keeps committed free before commit",
+        ca.free_bytes(),
+        4096 * 48,
+    );
+    h.assert_eq_ev(
+        "record_free keeps committed avail before commit",
+        ca.available_bytes(),
+        4096 * 48,
+    );
+
+    record_capacity_op(
+        h,
+        "capacity.record_free.commit",
+        0,
+        b"commit 8-block free delta",
+    );
+    let committed_used_bytes = initial_used_bytes - freed_bytes;
+    let committed_pool = PoolPhysicalCountersV1::mounted_authority_from_capacity(
+        total_bytes,
+        committed_used_bytes,
+        4096,
+    );
+    accounting
+        .commit_pending(committed_pool)
+        .expect("free delta should commit");
+    ca.refresh_committed_accounting_after_commit(&accounting, committed_pool);
+    h.assert_eq_ev("committed free increases free", ca.free_bytes(), 4096 * 56);
+    h.assert_eq_ev(
+        "committed free increases avail",
         ca.available_bytes(),
         4096 * 56,
     );
@@ -368,6 +417,49 @@ fn smoke_setters_and_mutation(h: &mut SmokeHarness) {
         "set_root_reserve preserves free",
         ca.free_bytes(),
         4096 * 120,
+    );
+
+    let accounting = SpaceAccounting::new(
+        DatasetSpaceCountersV1 {
+            logical_used_bytes: 4096 * 8,
+            quota_bytes: 4096 * 48,
+            ..DatasetSpaceCountersV1::default()
+        },
+        SpaceDomainId::NONE,
+    );
+    let quoted = CapacityAuthority::from_committed_accounting(4096 * 64, &accounting, 4096, 0);
+    record_capacity_op(
+        h,
+        "capacity.set_total_bytes.quoted",
+        0,
+        b"64->128 blocks with 48-block dataset quota",
+    );
+    quoted.set_total_bytes(4096 * 128);
+    let quoted_statfs = quoted.derive_statfs(1000, 900, 255);
+    h.assert_eq_ev(
+        "pool resize updates quoted physical total",
+        quoted.total_bytes(),
+        4096 * 128,
+    );
+    h.assert_eq_ev(
+        "pool resize preserves dataset quota total",
+        quoted_statfs.total_blocks,
+        48,
+    );
+    h.assert_eq_ev(
+        "pool resize preserves dataset quota free",
+        quoted_statfs.free_blocks,
+        40,
+    );
+    h.assert_eq_ev(
+        "dataset quota boundary remains admissible",
+        quoted.check_enospc(4096 * 40),
+        Ok(()),
+    );
+    h.assert_eq_ev(
+        "pool resize preserves dataset quota admission",
+        quoted.check_enospc(4096 * 40 + 1),
+        Err(Errno::ENOSPC),
     );
 }
 

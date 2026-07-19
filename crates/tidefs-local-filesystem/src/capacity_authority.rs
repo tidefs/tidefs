@@ -250,7 +250,9 @@ impl CapacityAuthority {
     fn accounting_from_geometry(total_bytes: u64, used_bytes: u64) -> SpaceAccounting {
         let counters = DatasetSpaceCountersV1 {
             logical_used_bytes: used_bytes.min(total_bytes),
-            quota_bytes: total_bytes,
+            // Pool geometry is the physical ceiling, not an implicit dataset
+            // quota. Keep geometry-only authorities unquoted so pool resize
+            // can change their capacity without rewriting quota policy.
             ..DatasetSpaceCountersV1::default()
         };
         let mut accounting = SpaceAccounting::new(counters, SpaceDomainId::NONE);
