@@ -8,7 +8,7 @@ use crate::smoke::SmokeHarness;
 use crate::trace::TraceEvent;
 use tidefs_encryption::secret_handle::{
     assess_cryptographic_erase_boundary, CryptographicEraseEvidence, CryptographicEraseRefusal,
-    MountedPoolKeyAccessState,
+    MountedPoolKeyAccessState, CRYPTOGRAPHIC_ERASE_NON_CLAIM,
 };
 use tidefs_local_object_store::device::DiscardCapability;
 use tidefs_reclaim::{
@@ -286,9 +286,19 @@ impl DiscardCapabilityValidationRow {
 
 #[derive(Clone, Copy)]
 struct CryptographicEraseKeyLifecycleRefusalValidationRow {
+    validation_tier: &'static str,
     active_full_proof_refused: bool,
     refusal: &'static str,
+    non_claim: &'static str,
+    product_claim_evidence: bool,
+    capacity_free: bool,
+    zero_visible: bool,
+    discard_acceptance: bool,
+    media_privacy: bool,
+    cryptographic_erase: bool,
     secure_erase: bool,
+    sanitization: bool,
+    decommissioning: bool,
 }
 
 impl CryptographicEraseKeyLifecycleRefusalValidationRow {
@@ -299,24 +309,69 @@ impl CryptographicEraseKeyLifecycleRefusalValidationRow {
         );
 
         Self {
+            validation_tier: "cargo-unit",
             active_full_proof_refused: assessment.refusal
                 == Some(CryptographicEraseRefusal::KeyLifecycleNotDestroyedOrRevoked),
             refusal: assessment
                 .refusal
                 .map_or("none", |refusal| refusal.as_str()),
+            non_claim: assessment.non_claim,
+            product_claim_evidence: false,
+            capacity_free: false,
+            zero_visible: false,
+            discard_acceptance: false,
+            media_privacy: false,
+            cryptographic_erase: false,
             secure_erase: assessment.can_present_as_secure_erase(),
+            sanitization: false,
+            decommissioning: false,
         }
+    }
+
+    fn unsupported_evidence(self) -> [(&'static str, bool); 8] {
+        [
+            ("capacity free", self.capacity_free),
+            ("zero-visible behavior", self.zero_visible),
+            ("discard acceptance", self.discard_acceptance),
+            ("media privacy", self.media_privacy),
+            ("cryptographic erase", self.cryptographic_erase),
+            ("secure erase", self.secure_erase),
+            ("sanitization", self.sanitization),
+            ("decommissioning readiness", self.decommissioning),
+        ]
     }
 
     fn encode(self) -> Vec<u8> {
         format!(
             concat!(
                 "row=device-lifecycle.cryptographic-erase.active-key-refusal;",
+                "validation_tier={};",
                 "active_full_proof_refused={};",
                 "refusal={};",
-                "secure_erase={}",
+                "non_claim={};",
+                "product_claim_evidence={};",
+                "capacity_free={};",
+                "zero_visible={};",
+                "discard_acceptance={};",
+                "media_privacy={};",
+                "cryptographic_erase={};",
+                "secure_erase={};",
+                "sanitization={};",
+                "decommissioning={}",
             ),
-            self.active_full_proof_refused, self.refusal, self.secure_erase,
+            self.validation_tier,
+            self.active_full_proof_refused,
+            self.refusal,
+            self.non_claim,
+            self.product_claim_evidence,
+            self.capacity_free,
+            self.zero_visible,
+            self.discard_acceptance,
+            self.media_privacy,
+            self.cryptographic_erase,
+            self.secure_erase,
+            self.sanitization,
+            self.decommissioning,
         )
         .into_bytes()
     }
@@ -421,10 +476,26 @@ pub fn run_reclaim_smoke() -> SmokeHarness {
         cryptographic_erase_row.refusal,
         CryptographicEraseRefusal::KeyLifecycleNotDestroyedOrRevoked.as_str(),
     );
-    h.assert_ev(
-        "cryptographic erase matrix does not admit secure erase",
-        !cryptographic_erase_row.secure_erase,
+    h.assert_eq_ev(
+        "cryptographic erase matrix records its cargo-unit validation tier",
+        cryptographic_erase_row.validation_tier,
+        "cargo-unit",
     );
+    h.assert_eq_ev(
+        "cryptographic erase matrix preserves the source non-claim",
+        cryptographic_erase_row.non_claim,
+        CRYPTOGRAPHIC_ERASE_NON_CLAIM,
+    );
+    h.assert_ev(
+        "cryptographic erase matrix is not product claim evidence",
+        !cryptographic_erase_row.product_claim_evidence,
+    );
+    for (evidence, admitted) in cryptographic_erase_row.unsupported_evidence() {
+        h.assert_ev(
+            &format!("cryptographic erase active-key refusal does not claim {evidence} evidence"),
+            !admitted,
+        );
+    }
 
     let config = ReclaimConfig {
         waste_threshold: 0.25,
@@ -796,6 +867,7 @@ mod tests {
             fields.get("row").copied(),
             Some("device-lifecycle.cryptographic-erase.active-key-refusal")
         );
+        assert_eq!(fields.get("validation_tier").copied(), Some("cargo-unit"));
         assert_eq!(
             fields.get("active_full_proof_refused").copied(),
             Some("true")
@@ -804,6 +876,22 @@ mod tests {
             fields.get("refusal").copied(),
             Some("key lifecycle is not destroyed or revoked")
         );
-        assert_eq!(fields.get("secure_erase").copied(), Some("false"));
+        assert_eq!(
+            fields.get("non_claim").copied(),
+            Some(CRYPTOGRAPHIC_ERASE_NON_CLAIM)
+        );
+        for field in [
+            "product_claim_evidence",
+            "capacity_free",
+            "zero_visible",
+            "discard_acceptance",
+            "media_privacy",
+            "cryptographic_erase",
+            "secure_erase",
+            "sanitization",
+            "decommissioning",
+        ] {
+            assert_eq!(fields.get(field).copied(), Some("false"), "{field}");
+        }
     }
 }
