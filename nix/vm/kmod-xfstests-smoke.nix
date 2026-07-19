@@ -454,6 +454,30 @@ if [ "$MOUNTED" -eq 1 ]; then
     rm -f "$MNT/g005_link" 2>/dev/null || true
 
     echo ""
+    echo "-- smoke: symlink target errno --"
+    # BusyBox reports the errno returned by the mounted symlink callback.
+    if LC_ALL=C ln -s "" "$MNT/g005_empty_target" 2>/tmp/t5c.err; then
+        fail "configured_pool_symlink_empty_target_enoent" "empty target unexpectedly succeeded"
+        rm -f "$MNT/g005_empty_target" 2>/dev/null || true
+    elif grep -Fq "No such file or directory" /tmp/t5c.err; then
+        pass "configured_pool_symlink_empty_target_enoent"
+    else
+        fail "configured_pool_symlink_empty_target_enoent" "expected ENOENT: $(head -1 /tmp/t5c.err)"
+    fi
+
+    overlong_target="$(awk 'BEGIN { for (i = 0; i < 4097; i++) printf "x" }')"
+    if [ "''${#overlong_target}" -ne 4097 ]; then
+        fail "configured_pool_symlink_overlong_target_enametoolong" "could not construct a 4097-byte target"
+    elif LC_ALL=C ln -s "$overlong_target" "$MNT/g005_overlong_target" 2>/tmp/t5d.err; then
+        fail "configured_pool_symlink_overlong_target_enametoolong" "overlong target unexpectedly succeeded"
+        rm -f "$MNT/g005_overlong_target" 2>/dev/null || true
+    elif grep -Fq "File name too long" /tmp/t5d.err; then
+        pass "configured_pool_symlink_overlong_target_enametoolong"
+    else
+        fail "configured_pool_symlink_overlong_target_enametoolong" "expected ENAMETOOLONG: $(head -1 /tmp/t5d.err)"
+    fi
+
+    echo ""
     echo "-- smoke: readdir --"
     mkdir "$MNT/g006_dir" 2>/tmp/t6a.err || true
     if [ -d "$MNT/g006_dir" ]; then
@@ -584,6 +608,8 @@ else
     blocked "configured_pool_statfs_capacity" "filesystem not mounted"
     blocked "configured_pool_mkdir" "filesystem not mounted"
     blocked "configured_pool_symlink_create" "filesystem not mounted"
+    blocked "configured_pool_symlink_empty_target_enoent" "filesystem not mounted"
+    blocked "configured_pool_symlink_overlong_target_enametoolong" "filesystem not mounted"
     blocked "configured_pool_readdir" "filesystem not mounted"
     blocked "configured_pool_write" "filesystem not mounted"
     blocked "configured_pool_syncfs" "filesystem not mounted"

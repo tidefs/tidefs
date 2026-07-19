@@ -10051,9 +10051,8 @@ pub extern "C" fn tidefs_posix_vfs_engine_symlink(
     if let Err(e) = validate_kernel_name_len(name_len) {
         return -(e.0 as core::ffi::c_int);
     }
-    if target_len == 0 || target_len > 4096 {
-        return -(crate::tidefs_kmod_bridge::kernel_types::Errno::ENAMETOOLONG.0
-            as core::ffi::c_int);
+    if let Err(e) = crate::symlink::validate_symlink_target_len(target_len as usize) {
+        return -(e.0 as core::ffi::c_int);
     }
     let parent = crate::tidefs_kmod_bridge::kernel_types::InodeId::new(parent_ino);
     // SAFETY: name_ptr/name_len and target_ptr/target_len are kernel VFS

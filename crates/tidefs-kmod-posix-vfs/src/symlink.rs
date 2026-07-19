@@ -90,6 +90,20 @@ fn validate_symlink_name(name: &[u8]) -> Result<(), Errno> {
     Ok(())
 }
 
+/// Select the errno for a symlink target length.
+///
+/// Returns Err(Errno::ENOENT) when the target is empty and
+/// Err(Errno::ENAMETOOLONG) when it exceeds MAX_TARGET_BYTES.
+pub(crate) fn validate_symlink_target_len(target_len: usize) -> Result<(), Errno> {
+    if target_len == 0 {
+        return Err(Errno::ENOENT);
+    }
+    if target_len > MAX_TARGET_BYTES {
+        return Err(Errno::ENAMETOOLONG);
+    }
+    Ok(())
+}
+
 /// Validate a symlink target path.
 ///
 /// Returns Err(Errno::ENOENT) when the target is empty.
@@ -99,13 +113,7 @@ fn validate_symlink_name(name: &[u8]) -> Result<(), Errno> {
 ///
 /// Returns Ok(()) on success.
 fn validate_symlink_target(target: &[u8]) -> Result<(), Errno> {
-    if target.is_empty() {
-        return Err(Errno::ENOENT);
-    }
-    if target.len() > MAX_TARGET_BYTES {
-        return Err(Errno::ENAMETOOLONG);
-    }
-    Ok(())
+    validate_symlink_target_len(target.len())
 }
 
 impl<E: VfsEngine> KmodPosixVfs<E> {
@@ -448,6 +456,15 @@ mod tests {
                 .symlink(InodeId::new(2), b"link", b"", &MockEngine::test_ctx())
                 .unwrap_err(),
             Errno::ENOENT,
+        );
+    }
+
+    #[test]
+    fn symlink_target_length_keeps_empty_and_overlong_errnos_distinct() {
+        assert_eq!(validate_symlink_target_len(0), Err(Errno::ENOENT));
+        assert_eq!(
+            validate_symlink_target_len(MAX_TARGET_BYTES + 1),
+            Err(Errno::ENAMETOOLONG),
         );
     }
 
