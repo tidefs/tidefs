@@ -28,9 +28,9 @@ use std::process;
 use clap::Parser;
 use tidefs_dataset_properties;
 use tidefs_local_filesystem::{LocalFileSystem, RecoveryPolicy};
-use tidefs_local_object_store::pool_importer::PoolImporter;
+use tidefs_local_object_store::pool_importer::{ImportError, PoolImporter};
 use tidefs_local_object_store::pool_lifecycle_evidence::{
-    PoolLifecycleAction, PoolLifecycleEvidence,
+    PoolLifecycleAction, PoolLifecycleContext, PoolLifecycleEvidence,
 };
 use tidefs_local_object_store::StoreOptions;
 use tidefs_vfs_engine::{LivePoolAdminArg, LivePoolAdminArgs};
@@ -773,6 +773,36 @@ fn pool_lifecycle_evidence_json(evidence: &PoolLifecycleEvidence) -> serde_json:
     })
 }
 
+fn pool_scan_error_lifecycle_evidence(error: &ImportError) -> PoolLifecycleEvidence {
+    let pool_guid = match error {
+        ImportError::TopologyInconsistent { pool_guid, .. }
+        | ImportError::PoolNotImportable { pool_guid, .. }
+        | ImportError::ClusterPoolRequired { pool_guid } => Some(*pool_guid),
+        ImportError::LeaseTokenPoolMismatch {
+            import_pool_guid, ..
+        } => Some(*import_pool_guid),
+        ImportError::NoDevicesFound { .. }
+        | ImportError::CorruptLabel { .. }
+        | ImportError::Io { .. }
+        | ImportError::NotLocal { .. }
+        | ImportError::LeaseTokenInvalid { .. } => None,
+    };
+
+    PoolLifecycleEvidence::refused(
+        PoolLifecycleAction::Scan,
+        PoolLifecycleContext {
+            pool_guid,
+            pool_name: None,
+            device_count: 0,
+            expected_device_count: 0,
+            capacity_bytes: 0,
+            topology_generation: 0,
+            commit_group: 0,
+        },
+        error.to_string(),
+    )
+}
+
 fn pool_scan_lifecycle_evidence_json(
     devices: &[PathBuf],
 ) -> (Vec<serde_json::Value>, Option<String>) {
@@ -788,7 +818,15 @@ fn pool_scan_lifecycle_evidence_json(
                 .collect(),
             None,
         ),
-        Err(error) => (Vec::new(), Some(error.to_string())),
+        Err(error) => {
+            let error_message = error.to_string();
+            (
+                vec![pool_lifecycle_evidence_json(
+                    &pool_scan_error_lifecycle_evidence(&error),
+                )],
+                Some(error_message),
+            )
+        }
     }
 }
 
@@ -1984,6 +2022,9 @@ fn handle_pool_list_props(pool: &str, devices: Option<&[PathBuf]>, family: Optio
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tidefs_local_object_store::pool_label::{
+        encode_label, LabelPoolState, PoolLabelV1, POOL_LABEL_V1_EXT_WIRE_SIZE,
+    };
 
     // -- CreateError classification tests --
 
@@ -2123,6 +2164,48 @@ mod tests {
         assert_eq!(json["owner_authorized"], true);
         assert_eq!(json["fail_closed"], true);
         assert_eq!(json["reason"], "topology evidence incomplete");
+    }
+
+    #[test]
+    fn pool_scan_error_emits_structured_fail_closed_lifecycle_evidence() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pool_guid = [0x55; 16];
+        let mut devices = Vec::new();
+
+        for (index, generation, guid_byte) in [(0, 7, 0x61), (1, 8, 0x62)] {
+            let path = dir.path().join(format!("device-{index}.img"));
+            let mut label = PoolLabelV1::new(pool_guid, [guid_byte; 16], "scan-refusal");
+            label.pool_state = LabelPoolState::Exported;
+            label.device_index = index;
+            label.device_count = 2;
+            label.topology_generation = generation;
+            label.device_capacity_bytes = 4096;
+
+            let mut encoded = [0u8; POOL_LABEL_V1_EXT_WIRE_SIZE];
+            encode_label(&label, &mut encoded).expect("encode pool label");
+            std::fs::write(&path, encoded).expect("write pool label");
+            devices.push(path);
+        }
+
+        let (evidence, error) = pool_scan_lifecycle_evidence_json(&devices);
+        let json = evidence.first().expect("structured refusal evidence");
+
+        assert_eq!(evidence.len(), 1);
+        assert!(error
+            .as_deref()
+            .expect("scan refusal error")
+            .contains("topology_generation"));
+        assert_eq!(json["schema"], "tidefs.pool-lifecycle-evidence.v1");
+        assert_eq!(json["action"], "scan");
+        assert_eq!(json["outcome"], "refused");
+        assert_eq!(json["pool_guid"], "55555555-5555-5555-5555-555555555555");
+        assert_eq!(json["topology_complete"], false);
+        assert_eq!(json["owner_authorized"], false);
+        assert_eq!(json["fail_closed"], true);
+        assert!(json["reason"]
+            .as_str()
+            .expect("string reason")
+            .contains("topology_generation"));
     }
 
     #[test]
