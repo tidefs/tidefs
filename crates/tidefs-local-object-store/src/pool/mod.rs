@@ -1123,6 +1123,63 @@ struct DeviceReplacementEvidenceMarker {
     state: ReplacementRebuildStatusState,
 }
 
+/// Discover the current logical subjects whose authoritative placement receipt
+/// still names the device being replaced. The resulting count is only a
+/// durable progress baseline: replacement remains incomplete until later work
+/// records verified replacement receipts for every discovered subject.
+fn discover_replacement_rebuild_subject_count(
+    pool: &Pool,
+    old_device_guid: [u8; 16],
+) -> Result<u64> {
+    let mut receipts = BTreeMap::new();
+
+    for device in &pool.devices {
+        for receipt_key in device.store().list_keys_including_internal() {
+            if !crate::is_pool_placement_receipt_key(receipt_key) {
+                continue;
+            }
+
+            let raw = device.get(receipt_key)?.ok_or(StoreError::InvalidOptions {
+                reason: "replacement subject discovery found an unreadable placement receipt",
+            })?;
+            let receipt = PlacementReceipt::decode(&raw).ok_or(StoreError::InvalidOptions {
+                reason: "replacement subject discovery found a corrupt placement receipt",
+            })?;
+            if placement_receipt_object_key(receipt.object_key) != receipt_key
+                || receipt.planner_replay_receipt.is_none()
+                || !planner_replay_receipt_matches_receipt(&receipt)
+            {
+                return Err(StoreError::InvalidOptions {
+                    reason: "replacement subject discovery requires verified placement receipt authority",
+                });
+            }
+
+            let replace = match receipts.get(&receipt.object_key) {
+                Some(current) => receipt_supersedes(&receipt, current)?,
+                None => true,
+            };
+            if replace {
+                receipts.insert(receipt.object_key, receipt);
+            }
+        }
+    }
+
+    u64::try_from(
+        receipts
+            .values()
+            .filter(|receipt| {
+                receipt
+                    .targets
+                    .iter()
+                    .any(|target| target.device_guid == old_device_guid)
+            })
+            .count(),
+    )
+    .map_err(|_| StoreError::InvalidOptions {
+        reason: "replacement subject count exceeds durable evidence format",
+    })
+}
+
 impl DeviceReplacementEvidenceMarker {
     fn covers_state(&self, state: ReplacementRebuildStatusState) -> bool {
         self.state == state
@@ -4144,81 +4201,83 @@ impl Pool {
             .as_ref()
             .filter(|evidence| evidence.state.is_active())
             .cloned();
-        let (idx, old_config, old_device_guid, replacement_evidence) =
-            if let Some(mut evidence) = replayed_evidence {
-                if old_path != evidence.old_path
-                    || new_config.path != evidence.new_path
-                    || self
-                        .devices
-                        .get(evidence.device_index)
-                        .map(|device| device.root())
-                        != Some(old_path)
-                    || self.device_guids.get(evidence.device_index).copied()
-                        != Some(evidence.old_device_guid)
-                    || evidence.topology_epoch != self.placement_epoch.saturating_add(1).max(1)
-                {
-                    return Err(StoreError::InvalidOptions {
-                        reason: "device replacement resume does not match durable evidence",
-                    });
-                }
-                let old_config = self
-                    .config
+        let (idx, old_config, old_device_guid, replacement_evidence) = if let Some(mut evidence) =
+            replayed_evidence
+        {
+            if old_path != evidence.old_path
+                || new_config.path != evidence.new_path
+                || self
                     .devices
                     .get(evidence.device_index)
-                    .cloned()
-                    .ok_or(StoreError::InvalidOptions {
-                        reason: "device replacement resume is missing old device configuration",
-                    })?;
-                evidence.state = ReplacementRebuildStatusState::Pending;
-                (
-                    evidence.device_index,
-                    old_config,
-                    evidence.old_device_guid,
-                    evidence,
-                )
-            } else {
-                // Find the device to replace.
-                let idx = self
+                    .map(|device| device.root())
+                    != Some(old_path)
+                || self.device_guids.get(evidence.device_index).copied()
+                    != Some(evidence.old_device_guid)
+                || evidence.topology_epoch != self.placement_epoch.saturating_add(1).max(1)
+            {
+                return Err(StoreError::InvalidOptions {
+                    reason: "device replacement resume does not match durable evidence",
+                });
+            }
+            let old_config = self
+                .config
+                .devices
+                .get(evidence.device_index)
+                .cloned()
+                .ok_or(StoreError::InvalidOptions {
+                    reason: "device replacement resume is missing old device configuration",
+                })?;
+            evidence.state = ReplacementRebuildStatusState::Pending;
+            (
+                evidence.device_index,
+                old_config,
+                evidence.old_device_guid,
+                evidence,
+            )
+        } else {
+            // Find the device to replace.
+            let idx = self
+                .devices
+                .iter()
+                .position(|v| v.root() == old_path)
+                .ok_or(StoreError::InvalidOptions {
+                    reason: "device to replace not found in pool",
+                })?;
+            let old_config =
+                self.config
                     .devices
-                    .iter()
-                    .position(|v| v.root() == old_path)
-                    .ok_or(StoreError::InvalidOptions {
-                        reason: "device to replace not found in pool",
-                    })?;
-                let old_config =
-                    self.config
-                        .devices
-                        .get(idx)
-                        .cloned()
-                        .unwrap_or_else(|| DeviceConfig {
+                    .get(idx)
+                    .cloned()
+                    .unwrap_or_else(|| DeviceConfig {
+                        path: old_path.to_path_buf(),
+                        backing: DeviceBacking::DirectoryObjectStoreCompat,
+                        media_class: self.media_classes.get(idx).copied().unwrap_or_default(),
+                        class: self.classes[idx],
+                        kind: DeviceKind::Single {
                             path: old_path.to_path_buf(),
-                            backing: DeviceBacking::DirectoryObjectStoreCompat,
-                            media_class: self.media_classes.get(idx).copied().unwrap_or_default(),
-                            class: self.classes[idx],
-                            kind: DeviceKind::Single {
-                                path: old_path.to_path_buf(),
-                            },
-                            encryption: None,
-                            compression: None,
-                        });
-                let old_device_guid = self.device_guid_for_index(idx);
-                let evidence = DeviceReplacementEvidenceMarker {
-                    pool_guid: self.pool_guid,
-                    old_device_guid,
-                    new_device_guid: rand::random(),
-                    topology_epoch: self.placement_epoch.saturating_add(1).max(1),
-                    device_index: idx,
-                    old_path: old_path.to_path_buf(),
-                    new_path: new_config.path.clone(),
-                    total_subjects: 0,
-                    subjects_completed: 0,
-                    subjects_failed: 0,
-                    verified_receipt_count: 0,
-                    evidence_stable: false,
-                    state: ReplacementRebuildStatusState::Pending,
-                };
-                (idx, old_config, old_device_guid, evidence)
+                        },
+                        encryption: None,
+                        compression: None,
+                    });
+            let old_device_guid = self.device_guid_for_index(idx);
+            let total_subjects = discover_replacement_rebuild_subject_count(self, old_device_guid)?;
+            let evidence = DeviceReplacementEvidenceMarker {
+                pool_guid: self.pool_guid,
+                old_device_guid,
+                new_device_guid: rand::random(),
+                topology_epoch: self.placement_epoch.saturating_add(1).max(1),
+                device_index: idx,
+                old_path: old_path.to_path_buf(),
+                new_path: new_config.path.clone(),
+                total_subjects,
+                subjects_completed: 0,
+                subjects_failed: 0,
+                verified_receipt_count: 0,
+                evidence_stable: false,
+                state: ReplacementRebuildStatusState::Pending,
             };
+            (idx, old_config, old_device_guid, evidence)
+        };
 
         // Open the replacement device.
         let new_device =
@@ -9212,6 +9271,87 @@ mod tests {
             &test_options(),
         );
         assert!(result.is_err());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn replacement_evidence_discovers_old_device_receipt_subjects() {
+        let root = temp_dir("replace-evidence-receipt-subjects");
+        let _ = std::fs::remove_dir_all(&root);
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::replicated(1),
+            ..PoolProperties::default()
+        };
+        let config = multi_data_device_config(&root, 2);
+        let mut pool = Pool::create(config.clone(), properties, &test_options()).unwrap();
+        set_deterministic_device_guids(&mut pool);
+
+        let old_index = 0;
+        let old_path = pool.devices[old_index].root().to_path_buf();
+        let old_device_guid = pool.device_guid_for_index(old_index);
+        let payload = b"replacement receipt subject";
+        let candidates = vec![0, 1];
+        let keys: Vec<_> = (0u64..1024)
+            .map(|index| ObjectKey::from_name(format!("replacement-subject-{index}")))
+            .filter(|key| {
+                pool.plan_pool_wide_placement(IoClass::Data, *key, payload.len(), &candidates)
+                    .unwrap()
+                    .targets
+                    .iter()
+                    .any(|target| target.device_guid == old_device_guid)
+            })
+            .take(2)
+            .collect();
+        assert_eq!(keys.len(), 2, "test pool must find old-device subjects");
+        for key in keys {
+            pool.put(IoClass::Data, key, payload).unwrap();
+        }
+
+        let replacement_path = root.join("replacement-data");
+        pool.replace_device(
+            &old_path,
+            DeviceConfig {
+                media_class: Default::default(),
+                path: replacement_path.clone(),
+                backing: DeviceBacking::DirectoryObjectStoreCompat,
+                class: DeviceClass::Data,
+                kind: DeviceKind::Single {
+                    path: replacement_path,
+                },
+                encryption: None,
+                compression: None,
+            },
+            &test_options(),
+        )
+        .unwrap();
+
+        let evidence = pool
+            .replacement_rebuild_evidence_status()
+            .expect("replacement evidence status");
+        assert_eq!(evidence.total_subjects, 2);
+        assert_eq!(evidence.subjects_completed, 0);
+        assert_eq!(evidence.verified_receipt_count, 0);
+        assert!(!evidence.evidence_stable);
+        assert_eq!(
+            evidence.detach_decision,
+            ReplacementDetachDecision::UnsafeToDetach
+        );
+        drop(pool);
+
+        let reopened = Pool::open(config, PoolProperties::default(), &test_options()).unwrap();
+        let replayed = reopened
+            .replacement_rebuild_evidence_status()
+            .expect("reopened replacement evidence status");
+        assert_eq!(replayed.state, ReplacementRebuildStatusState::Resuming);
+        assert_eq!(replayed.total_subjects, 2);
+        assert_eq!(replayed.subjects_completed, 0);
+        assert_eq!(replayed.verified_receipt_count, 0);
+        assert!(!replayed.evidence_stable);
+        assert_eq!(
+            replayed.detach_decision,
+            ReplacementDetachDecision::UnsafeToDetach
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
