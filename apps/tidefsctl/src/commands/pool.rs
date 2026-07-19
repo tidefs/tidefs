@@ -332,7 +332,11 @@ pub fn handle_pool(cmd: PoolCommand) {
             devices,
             json,
         } => handle_pool_status(pool_name, devices, json),
-        PoolCommand::Scan { devices, json } => handle_pool_scan(devices, json),
+        PoolCommand::Scan { devices, json } => {
+            if !handle_pool_scan(devices, json) {
+                process::exit(1);
+            }
+        }
         PoolCommand::List => handle_removed_pool_list(),
         PoolCommand::Export {
             pool_name,
@@ -840,7 +844,7 @@ fn pool_scan_capability_lines(entry: &tidefs_pool_scan::DeviceScanEntry) -> [Str
     ]
 }
 
-fn handle_pool_scan(devices: Vec<PathBuf>, json: bool) {
+fn handle_pool_scan(devices: Vec<PathBuf>, json: bool) -> bool {
     let entries = match tidefs_pool_scan::scan_labels(&devices) {
         Ok(e) => e,
         Err(err) => {
@@ -864,9 +868,7 @@ fn handle_pool_scan(devices: Vec<PathBuf>, json: bool) {
             }))
             .unwrap()
         );
-        if lifecycle_scan_refused {
-            process::exit(1);
-        }
+        !lifecycle_scan_refused
     } else {
         for entry in &entries {
             println!("device: {}", entry.device_path.display());
@@ -920,6 +922,7 @@ fn handle_pool_scan(devices: Vec<PathBuf>, json: bool) {
             entries.len(),
             entries.iter().filter(|e| e.has_tidefs_label).count()
         );
+        true
     }
 }
 
@@ -2026,6 +2029,9 @@ fn handle_pool_list_props(pool: &str, devices: Option<&[PathBuf]>, family: Optio
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tidefs_local_object_store::pool_label::{
+        encode_label, LabelPoolState, PoolLabelV1, POOL_LABEL_V1_EXT_WIRE_SIZE,
+    };
 
     // -- CreateError classification tests --
 
@@ -2165,6 +2171,49 @@ mod tests {
         assert_eq!(json["owner_authorized"], true);
         assert_eq!(json["fail_closed"], true);
         assert_eq!(json["reason"], "topology evidence incomplete");
+    }
+
+    #[test]
+    fn pool_scan_error_emits_structured_evidence_and_reports_failure() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pool_guid = [0x55; 16];
+        let mut devices = Vec::new();
+
+        for (index, generation, guid_byte) in [(0, 7, 0x61), (1, 8, 0x62)] {
+            let path = dir.path().join(format!("device-{index}.img"));
+            let mut label = PoolLabelV1::new(pool_guid, [guid_byte; 16], "scan-refusal");
+            label.pool_state = LabelPoolState::Exported;
+            label.device_index = index;
+            label.device_count = 2;
+            label.topology_generation = generation;
+            label.device_capacity_bytes = 4096;
+
+            let mut encoded = [0u8; POOL_LABEL_V1_EXT_WIRE_SIZE];
+            encode_label(&label, &mut encoded).expect("encode pool label");
+            std::fs::write(&path, encoded).expect("write pool label");
+            devices.push(path);
+        }
+
+        let (evidence, error) = pool_scan_lifecycle_evidence_json(&devices);
+        let json = evidence.first().expect("structured refusal evidence");
+
+        assert_eq!(evidence.len(), 1);
+        assert!(error
+            .as_deref()
+            .expect("scan refusal error")
+            .contains("topology_generation"));
+        assert_eq!(json["schema"], "tidefs.pool-lifecycle-evidence.v1");
+        assert_eq!(json["action"], "scan");
+        assert_eq!(json["outcome"], "refused");
+        assert_eq!(json["pool_guid"], "55555555-5555-5555-5555-555555555555");
+        assert_eq!(json["topology_complete"], false);
+        assert_eq!(json["owner_authorized"], false);
+        assert_eq!(json["fail_closed"], true);
+        assert!(json["reason"]
+            .as_str()
+            .expect("string reason")
+            .contains("topology_generation"));
+        assert!(!handle_pool_scan(devices, true));
     }
 
     #[test]
