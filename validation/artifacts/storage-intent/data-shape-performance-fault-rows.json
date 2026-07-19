@@ -2,9 +2,9 @@
   "report_version": 2,
   "claim_id": "storage.intent.data_shape_honesty.v1",
   "issue": "https://github.com/tidefs/tidefs/issues/1981",
-  "run_id": "29649529763/1",
-  "source_ref": "f45e387728d4a166814b4d453c3a233ce3397d4f",
-  "generated_at": "2026-07-18T15:12:41Z",
+  "run_id": "29680287893/1",
+  "source_ref": "b8f2560a0b11b982a3dc5cbdd3355957aa78ec68",
+  "generated_at": "2026-07-19T08:42:59Z",
   "validation_tier": "qemu-guest",
   "command": "storage-intent-data-shape-runtime-validation",
   "artifact_scope": "QEMU-guest partial data-shape fault observations plus explicitly blocked performance and unexecuted family rows",
@@ -34,11 +34,11 @@
       "observation": {
         "source_rows": [
           {
-            "guest_elapsed_ns": 1434620,
+            "guest_elapsed_ns": 3338659,
             "row": "compression-zstd-helper-roundtrip"
           },
           {
-            "guest_elapsed_ns": 118111,
+            "guest_elapsed_ns": 115216,
             "row": "compression-lz4-helper-roundtrip"
           },
           {
@@ -50,12 +50,16 @@
             "row": "malformed-compression-frame-refusal"
           },
           {
-            "guest_elapsed_ns": 1147942,
+            "guest_elapsed_ns": 1392401,
             "row": "encryption-aead-helper-roundtrip-refusal"
           },
           {
-            "guest_elapsed_ns": 16241,
+            "guest_elapsed_ns": 22472,
             "row": "ec-helper-degraded-reconstruction-under-width-refusal"
+          },
+          {
+            "guest_elapsed_ns": null,
+            "row": "ec-helper-malformed-shard-set-refusal"
           }
         ]
       },
@@ -104,7 +108,7 @@
       "operation": "reconstruct one missing local EC helper shard",
       "observation": {
         "degraded_available_shards": 2,
-        "guest_elapsed_ns": 16241,
+        "guest_elapsed_ns": 22472,
         "profile": "local-helper-2-plus-1",
         "rebuilt_shard_indexes": [
           0
@@ -141,7 +145,7 @@
       "observation": {
         "algorithm": "chacha20-poly1305-helper",
         "decoded_digest": "blake3:23f54976d3054645db833986d8029ba60ade918703cfd560e3158fb687d034e4",
-        "guest_elapsed_ns": 1147942,
+        "guest_elapsed_ns": 1392401,
         "key_material_serialized": false,
         "round_trip_exact": true,
         "source_digest": "blake3:23f54976d3054645db833986d8029ba60ade918703cfd560e3158fb687d034e4",
@@ -193,6 +197,27 @@
       "exact_boundary": "This row covers compression helper frames only; encryption, coalescing, rebake, and mounted recovery frame faults remain incomplete."
     },
     {
+      "row": "malformed-ec-shard-set",
+      "families": [
+        "erasure-coding"
+      ],
+      "status": "pass",
+      "operation": "reject wrong-width, wrong-index, wrong-role, and truncated local EC helper shard sets",
+      "observation": {
+        "expected_width": 3,
+        "generic_success_forbidden": true,
+        "profile": "local-helper-2-plus-1",
+        "truncated_shard_len": 63,
+        "truncated_shard_refused": true,
+        "typed_refusal": "invalid-available-set",
+        "wrong_index_refused": true,
+        "wrong_role_refused": true,
+        "wrong_width_refused": true,
+        "wrong_width_slots": 2
+      },
+      "exact_boundary": "Typed local helper refusal only; no EC placement, repair, archive, distributed recovery, or degraded-read product authority."
+    },
+    {
       "row": "ec-helper-under-width",
       "families": [
         "erasure-coding"
@@ -201,7 +226,7 @@
       "operation": "refuse one-of-three local EC helper input for a 2+1 profile",
       "observation": {
         "degraded_available_shards": 2,
-        "guest_elapsed_ns": 16241,
+        "guest_elapsed_ns": 22472,
         "profile": "local-helper-2-plus-1",
         "rebuilt_shard_indexes": [
           0
@@ -244,7 +269,7 @@
   ],
   "summary": {
     "status": "skip",
-    "passed": 5,
+    "passed": 6,
     "product_failed": 0,
     "skipped": 7
   },
@@ -253,10 +278,10 @@
     "not a service objective or comparator row",
     "not mounted, archive, distributed, production, or release evidence"
   ],
-  "claim_effect": "Malformed compression, wrong-key/tamper, and local EC under-width helper faults were executed, but CPU, read-amplification, key-epoch, dedupe-domain, archive, coalescing, and rebake rows keep this evidence class and claim blocked.",
+  "claim_effect": "Malformed compression and local EC shard-set refusals, wrong-key/tamper, and local EC under-width helper faults were executed, but CPU, read-amplification, key-epoch, dedupe-domain, archive, coalescing, and rebake rows keep this evidence class and claim blocked.",
   "residual_risk": [
     "Elapsed guest timings are diagnostic observations without a stable CPU, workload, topology, or comparator baseline and are not a performance claim.",
-    "Read amplification, key epochs, illegal dedupe domains, archive recall, coalescing, rebake, and cross-family malformed-frame coverage remain unexecuted.",
+    "Read amplification, key epochs, illegal dedupe domains, archive recall, coalescing, and rebake remain unexecuted; malformed-frame coverage is limited to compression frames and local EC shard sets.",
     "Local EC helper reconstruction and under-width refusal do not prove pool placement, distributed recovery, archive serving, degraded-read product safety, or availability."
   ]
 }
