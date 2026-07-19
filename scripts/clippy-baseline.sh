@@ -232,7 +232,7 @@ run_clippy_for_crate() {
 }
 
 result_object() {
-    local crate="$1" status="$2" warnings="$3" baseline="$4" exit_code="$5" stderr_excerpt="$6" diagnostic_excerpt="$7" current_diagnostic_identities="$8"
+    local crate="$1" status="$2" warnings="$3" baseline="$4" exit_code="$5" stderr_excerpt="$6" diagnostic_excerpt="$7" current_diagnostic_identities_file="$8"
 
     local baseline_json
     if [[ "$baseline" == "null" ]]; then
@@ -249,7 +249,7 @@ result_object() {
         --argjson exit_code "$exit_code" \
         --arg stderr_excerpt "$stderr_excerpt" \
         --arg diagnostic_excerpt "$diagnostic_excerpt" \
-        --argjson current_diagnostic_identities "$current_diagnostic_identities" \
+        --slurpfile current_diagnostic_identities "$current_diagnostic_identities_file" \
         '{
           crate: $crate,
           status: $status,
@@ -258,7 +258,7 @@ result_object() {
           cargo_exit_code: $exit_code,
           stderr_excerpt: $stderr_excerpt,
           diagnostic_excerpt: $diagnostic_excerpt,
-          current_diagnostic_identities: $current_diagnostic_identities
+          current_diagnostic_identities: $current_diagnostic_identities[0]
         }'
 }
 
@@ -414,7 +414,7 @@ main() {
 
         echo "clippy-baseline: running cargo clippy for $crate"
 
-        local out_json err_log rc warnings baseline status stderr_excerpt diagnostic_excerpt current_diagnostic_identities
+        local out_json err_log rc warnings baseline status stderr_excerpt diagnostic_excerpt current_diagnostic_identities_file
         out_json="$tmpdir/$crate.stdout.json"
         err_log="$tmpdir/$crate.stderr.log"
 
@@ -455,8 +455,9 @@ main() {
 
         stderr_excerpt="$(tail -n "${CLIPPY_BASELINE_ERROR_LINES:-80}" "$err_log" 2>/dev/null || true)"
         diagnostic_excerpt="$(diagnostic_json_excerpt "$out_json" "$status")"
-        current_diagnostic_identities="$(diagnostic_json_identities "$out_json" "$status" "$ws_root")"
-        result_object "$crate" "$status" "$warnings" "$baseline" "$rc" "$stderr_excerpt" "$diagnostic_excerpt" "$current_diagnostic_identities" > "$result_dir/$crate.json"
+        current_diagnostic_identities_file="$tmpdir/$crate.current-diagnostic-identities.json"
+        diagnostic_json_identities "$out_json" "$status" "$ws_root" > "$current_diagnostic_identities_file"
+        result_object "$crate" "$status" "$warnings" "$baseline" "$rc" "$stderr_excerpt" "$diagnostic_excerpt" "$current_diagnostic_identities_file" > "$result_dir/$crate.json"
 
         if [[ "$status" != "pass" ]]; then
             failures=$((failures + 1))
