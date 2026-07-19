@@ -7919,6 +7919,16 @@ impl FuseVfsAdapter {
     // byte offsets (via LocatorId.0); UNWRITTEN extents and holes are
     // returned as zero-fill ranges.
 
+    fn block_volume_extent_has_payload(
+        extent: &tidefs_types_extent_map_core::ExtentMapEntryV2,
+    ) -> bool {
+        // Pending-data extents already contain readable bytes at a real
+        // locator; only their checksum and birth commit group remain to be
+        // finalized. Treating them as holes can expose zeroes after a barrier
+        // clears the dirty projections that protected the carrier.
+        extent.is_data() || extent.is_pending_data()
+    }
+
     /// Resolve a read request (logical `offset`, `size`) into a sequence of
     /// [`ResolvedBlockExtent`] entries that exactly cover the file-visible
     /// portion of the requested range.
@@ -7978,7 +7988,7 @@ impl FuseVfsAdapter {
                 cursor = clip_end;
                 continue;
             }
-            if entry.is_data() {
+            if Self::block_volume_extent_has_payload(&entry) {
                 let phys_off = clip_start - entry.logical_offset + entry.locator_id.0;
                 result.push(ResolvedBlockExtent::Data {
                     physical_offset: phys_off,
@@ -8041,7 +8051,7 @@ impl FuseVfsAdapter {
                 cursor = clip_end;
                 continue;
             }
-            if entry.is_data() {
+            if Self::block_volume_extent_has_payload(&entry) {
                 let phys_off = clip_start - entry.logical_offset + entry.locator_id.0;
                 result.push(ResolvedBlockExtent::Data {
                     physical_offset: phys_off,
@@ -8351,7 +8361,7 @@ impl FuseVfsAdapter {
                                 continue;
                             }
                             found_extent = true;
-                            if entry.is_data() {
+                            if Self::block_volume_extent_has_payload(&entry) {
                                 let clip_len = (clip_end - clip_start) as usize;
                                 let data_offset = (clip_start - start) as usize;
                                 let data_end =
@@ -8724,7 +8734,7 @@ impl FuseVfsAdapter {
                                         continue;
                                     }
                                     found_extent = true;
-                                    if !extent.is_data() {
+                                    if !Self::block_volume_extent_has_payload(&extent) {
                                         continue;
                                     }
                                     let clip_length = (clip_end - clip_start) as usize;
@@ -33815,6 +33825,52 @@ mod tests {
             Some(false),
             "successful syncfs must publish the reclaim projection clean after block-volume drain"
         );
+    }
+
+    #[test]
+    fn block_volume_pending_extent_resolves_as_payload() {
+        let (fixture, _block_volume) = adapter_fixture_with_mock_block_volume();
+        let ctx = root_ctx();
+        let (inode, adapter_fh, engine_fh) = create_adapter_file_handle(
+            &fixture.adapter,
+            &ctx,
+            b"pending-extent.bin",
+            libc::O_RDWR as u32,
+        );
+        let payload = b"pending extent payload";
+        fixture
+            .adapter
+            .dispatch_write(&ctx, inode.get(), adapter_fh, 0, payload, 0)
+            .expect("write pending extent payload");
+
+        let pending_extent = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            let extents = engine.lookup_extents(inode, 0, payload.len() as u64);
+            assert_eq!(extents.len(), 1, "fixture needs one pending extent");
+            extents.into_iter().next().unwrap()
+        };
+        assert!(
+            pending_extent.is_pending_data(),
+            "a newly allocated extent must exercise pending-data classification"
+        );
+
+        let resolved = fixture
+            .adapter
+            .resolve_read_extents(inode.get(), 0, payload.len() as u32, &engine_fh, &ctx)
+            .expect("resolve pending extent");
+        assert_eq!(resolved.len(), 1);
+        match resolved[0] {
+            ResolvedBlockExtent::Data {
+                physical_offset,
+                length,
+            } => {
+                assert_eq!(physical_offset, pending_extent.locator_id.0);
+                assert_eq!(length, payload.len());
+            }
+            ResolvedBlockExtent::Hole { .. } => {
+                panic!("pending-data bytes must not resolve as a hole")
+            }
+        }
     }
 
     #[test]
