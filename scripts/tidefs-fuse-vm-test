@@ -89,6 +89,12 @@ verified_source_ref=""
 source_checkout=""
 source_snapshot=""
 run_root_dir=""
+active_pid=""
+active_pgid=""
+active_group=0
+caught_signal=""
+caught_signal_status=""
+signal_escalation_pid=""
 build_script="$script_dir/tidefs-nix-qemu-build"
 cleanup_source_snapshot() {
   if [[ -n "$source_snapshot" ]]; then
@@ -102,6 +108,109 @@ cleanup_launcher() {
     rm -rf -- "$run_root_dir"
     run_root_dir=""
   fi
+}
+arm_signal_escalation() {
+  local pgid
+
+  [[ "$active_group" -eq 1 && -n "$caught_signal" ]] || return 0
+  [[ -z "$signal_escalation_pid" ]] || return 0
+  pgid="$active_pgid"
+  (
+    sleep 2
+    if kill -0 -- "-$pgid" 2>/dev/null; then
+      kill -KILL -- "-$pgid" 2>/dev/null || true
+    fi
+  ) &
+  signal_escalation_pid=$!
+}
+cancel_signal_escalation() {
+  [[ -n "$signal_escalation_pid" ]] || return 0
+  kill -TERM "$signal_escalation_pid" 2>/dev/null || true
+  wait "$signal_escalation_pid" 2>/dev/null || true
+  signal_escalation_pid=""
+}
+forward_active_group() {
+  local signal="$1"
+  local status="$2"
+
+  if [[ -z "$caught_signal_status" ]]; then
+    caught_signal="$signal"
+    caught_signal_status="$status"
+  fi
+  if [[ "$active_group" -eq 1 ]]; then
+    kill -s "$signal" -- "-$active_pgid" 2>/dev/null || true
+    arm_signal_escalation
+  fi
+}
+run_owned_group() {
+  local status=0
+  local group_ready=0
+  local attempt
+
+  [[ -z "$caught_signal_status" ]] || return "$caught_signal_status"
+  active_pid=""
+  active_pgid=""
+  active_group=0
+
+  # Job control gives the build or runner and all of its children one owned
+  # process group without making asynchronous children inherit ignored INT.
+  set -m
+  "$@" &
+  active_pid=$!
+  active_pgid=$active_pid
+  set +m
+
+  # Close the short process-group creation race before treating it as signalable.
+  for ((attempt = 0; attempt < 100; attempt++)); do
+    if kill -0 -- "-$active_pgid" 2>/dev/null; then
+      active_group=1
+      group_ready=1
+      break
+    fi
+    kill -0 "$active_pid" 2>/dev/null || break
+    sleep 0.01 || true
+  done
+  if [[ "$group_ready" -eq 1 && -n "$caught_signal" ]]; then
+    kill -s "$caught_signal" -- "-$active_pgid" 2>/dev/null || true
+    arm_signal_escalation
+  fi
+
+  # A trapped signal interrupts wait. Repeat until the exact child is reaped.
+  while true; do
+    if wait "$active_pid"; then
+      status=0
+    else
+      status=$?
+    fi
+    kill -0 "$active_pid" 2>/dev/null || break
+  done
+
+  # A group leader may exit before one of its owned descendants.
+  if kill -0 -- "-$active_pgid" 2>/dev/null; then
+    active_group=1
+    if [[ -n "$caught_signal" ]]; then
+      kill -s "$caught_signal" -- "-$active_pgid" 2>/dev/null || true
+    fi
+  fi
+  while kill -0 -- "-$active_pgid" 2>/dev/null; do
+    sleep 0.05 || true
+  done
+  active_group=0
+  cancel_signal_escalation
+
+  active_pid=""
+  active_pgid=""
+  [[ -z "$caught_signal_status" ]] || return "$caught_signal_status"
+  return "$status"
+}
+finish_launcher() {
+  local status="$1"
+
+  trap - HUP INT TERM
+  [[ -z "$caught_signal_status" ]] || status="$caught_signal_status"
+  cleanup_launcher
+  trap - EXIT
+  exit "$status"
 }
 trap cleanup_launcher EXIT
 
@@ -143,14 +252,23 @@ export TIDEFS_FUSE_VM_TEST_VERIFIED_SOURCE_REF="$verified_source_ref"
 # Keep this launch's closure rooted independently until its runner exits.
 mkdir -p "$root_dir"
 run_root_dir="$(mktemp -d "$root_dir/.tidefs-fuse-vm-run.XXXXXX")"
+trap 'forward_active_group HUP 129' HUP
+trap 'forward_active_group INT 130' INT
+trap 'forward_active_group TERM 143' TERM
 
-bash "$build_script" \
-  --target tidefsFuseVmTest \
-  --name tidefs-fuse-vm-test \
-  --repo "$repo" \
-  --system "$system" \
-  --root-dir "$run_root_dir" \
-  "${build_args[@]}"
+if run_owned_group \
+  bash "$build_script" \
+    --target tidefsFuseVmTest \
+    --name tidefs-fuse-vm-test \
+    --repo "$repo" \
+    --system "$system" \
+    --root-dir "$run_root_dir" \
+    "${build_args[@]}"; then
+  build_status=0
+else
+  build_status=$?
+fi
+[[ "$build_status" -eq 0 ]] || finish_launcher "$build_status"
 
 cleanup_source_snapshot
 
@@ -160,11 +278,9 @@ if [[ ! -x "$runner" ]]; then
   exit 2
 fi
 
-if "$runner" "${runner_args[@]}"; then
+if run_owned_group "$runner" "${runner_args[@]}"; then
   runner_status=0
 else
   runner_status=$?
 fi
-cleanup_launcher
-trap - EXIT
-exit "$runner_status"
+finish_launcher "$runner_status"
