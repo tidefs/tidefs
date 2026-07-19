@@ -154,8 +154,10 @@ run_owned_group() {
 
   # Job control gives the build or runner and all of its children one owned
   # process group without making asynchronous children inherit ignored INT.
+  # These automated jobs do not consume input; detach stdin so an interactive
+  # caller cannot leave their background process group stopped on SIGTTIN.
   set -m
-  "$@" &
+  "$@" </dev/null &
   active_pid=$!
   active_pgid=$active_pid
   set +m
