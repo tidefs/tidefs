@@ -27,6 +27,10 @@ use crate::pool_lifecycle_evidence::{
 use crate::txg_manager::CommitGroupManager;
 use tidefs_auth::local_only::LocalOnlyGuard;
 
+fn next_label_commit_group(commit_group: u64) -> u64 {
+    tidefs_commit_group::CommitGroupId(commit_group).next().0
+}
+
 struct ExportLabelRecord {
     label: PoolLabelV1,
     device_layout_v1: Option<DeviceLayoutV1Bytes>,
@@ -214,7 +218,7 @@ impl PoolExporter {
             }
         }
 
-        let label_commit_group = commit_group + 1;
+        let label_commit_group = next_label_commit_group(commit_group);
         let expected_device_count = u32::try_from(device_configs.len()).map_err(|_| {
             ExportError::LabelValidationFailed {
                 device_path: device_configs[0].path.clone(),
@@ -748,18 +752,14 @@ impl ExportOrchestrator {
                     })
             })
             .unwrap_or(0);
-        let persisted_cutover =
-            self.final_commit_group
-                .checked_add(1)
-                .is_some_and(|expected_label_commit_group| {
-                    labels.as_deref().is_some_and(|labels| {
-                        labels.iter().all(|label| {
-                            label.pool_state == LabelPoolState::Exported
-                                && label.commit_group == self.final_commit_group
-                                && label.label_commit_group == expected_label_commit_group
-                        })
-                    })
-                });
+        let expected_label_commit_group = next_label_commit_group(self.final_commit_group);
+        let persisted_cutover = labels.as_deref().is_some_and(|labels| {
+            labels.iter().all(|label| {
+                label.pool_state == LabelPoolState::Exported
+                    && label.commit_group == self.final_commit_group
+                    && label.label_commit_group == expected_label_commit_group
+            })
+        });
         let context = PoolLifecycleContext {
             pool_guid: Some(self.pool_guid),
             pool_name: Some(self.pool_name.clone()),
@@ -2003,6 +2003,25 @@ mod tests {
         assert!(evidence.topology_complete);
         assert!(evidence.owner_authorized);
         assert!(!evidence.is_fail_closed());
+    }
+
+    #[test]
+    fn orchestrator_export_saturates_label_commit_group() {
+        let mut orch = make_orchestrator();
+        orch.export_labels_only(u64::MAX).unwrap();
+
+        let path = orch.device_configs[0].path.clone();
+        let exported = PoolExporter::read_existing_label(&path).unwrap();
+        assert_eq!(exported.pool_state, LabelPoolState::Exported);
+        assert_eq!(exported.commit_group, u64::MAX);
+        assert_eq!(exported.label_commit_group, u64::MAX);
+
+        let evidence = orch.lifecycle_evidence();
+        assert_eq!(evidence.outcome, PoolLifecycleOutcome::Executed);
+        assert_eq!(evidence.commit_group, u64::MAX);
+        assert!(!evidence.is_fail_closed());
+
+        let _ = std::fs::remove_dir_all(path);
     }
 
     #[test]
