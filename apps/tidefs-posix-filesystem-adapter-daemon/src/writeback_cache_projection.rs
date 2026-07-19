@@ -183,7 +183,12 @@ impl WritebackProjection {
             .map(|mmap| mmap.dirty_transition_gate(ino))
     }
 
-    fn record_dirty_after_gate(&self, ino: u64, total_dirty_bytes: u64) {
+    fn record_dirty_after_gate(
+        &self,
+        ino: u64,
+        total_dirty_bytes: u64,
+        preserve_larger_observation: bool,
+    ) {
         if total_dirty_bytes == 0 {
             return;
         }
@@ -200,13 +205,13 @@ impl WritebackProjection {
                 );
                 self.stats.dirty_transitions.fetch_add(1, Ordering::Relaxed);
             }
-            WritebackLane::Dirty { .. } => {
-                lanes.insert(
-                    ino,
-                    WritebackLane::Dirty {
-                        bytes: total_dirty_bytes,
-                    },
-                );
+            WritebackLane::Dirty { bytes } => {
+                let bytes = if preserve_larger_observation {
+                    bytes.max(total_dirty_bytes)
+                } else {
+                    total_dirty_bytes
+                };
+                lanes.insert(ino, WritebackLane::Dirty { bytes });
             }
             WritebackLane::WritebackPending { bytes } => {
                 lanes.insert(
@@ -231,8 +236,10 @@ impl WritebackProjection {
     ///
     /// The write path first calls this before publishing any dirty mirror, so
     /// mmap invalidation cannot pass a clean check and then invalidate newly
-    /// dirty bytes. It calls this again after populating [`DirtyRanges`] and
-    /// [`PageCache`] to refresh the conservative total.
+    /// dirty bytes. This provisional observation may contain only the current
+    /// write length, so it preserves any larger total already visible for the
+    /// inode. [`Self::refresh_dirty_observation`] publishes the complete
+    /// backing-mirror total after those mirrors are populated.
     pub fn record_dirty(&self, ino: u64, total_dirty_bytes: u64) {
         if total_dirty_bytes == 0 {
             return;
@@ -242,7 +249,7 @@ impl WritebackProjection {
         let _dirty_transition_guard = dirty_transition_gate
             .as_deref()
             .map(|gate| gate.lock().unwrap());
-        self.record_dirty_after_gate(ino, total_dirty_bytes);
+        self.record_dirty_after_gate(ino, total_dirty_bytes, true);
     }
 
     /// Record that `ino` has been selected for writeback (dirty bytes have
@@ -303,7 +310,7 @@ impl WritebackProjection {
         if total_dirty_bytes == 0 {
             self.record_clean_after_gate(ino);
         } else {
-            self.record_dirty_after_gate(ino, total_dirty_bytes);
+            self.record_dirty_after_gate(ino, total_dirty_bytes, false);
         }
     }
 
@@ -628,6 +635,23 @@ mod tests {
         let p = new_projection();
         p.record_dirty(42, 4096);
         p.record_dirty(42, 8192); // more bytes, but same inode already dirty
+        assert_eq!(p.stats_snapshot().dirty_transitions, 1);
+    }
+
+    #[test]
+    fn provisional_dirty_record_preserves_larger_observation_until_refresh() {
+        let p = new_projection();
+        p.record_dirty(42, 8192);
+
+        // The pre-mirror guard for a later, smaller write must not hide bytes
+        // that were already visible in the projection.
+        p.record_dirty(42, 4096);
+        assert_eq!(p.lane(42), Some(WritebackLane::Dirty { bytes: 8192 }));
+
+        // Once the backing mirrors have been observed, their complete total
+        // may legitimately shrink the projected byte count.
+        p.refresh_dirty_observation(42, || 4096);
+        assert_eq!(p.lane(42), Some(WritebackLane::Dirty { bytes: 4096 }));
         assert_eq!(p.stats_snapshot().dirty_transitions, 1);
     }
 
