@@ -13,6 +13,7 @@
 #   special-node mknod: generic/184
 #   setfacl ctime/remount persistence (#1933): generic/307
 #   default ACL mkdir inheritance (#1933): generic/319
+#   setgid/default ACL mkdir inheritance (#1933): generic/444
 
 # --- ACLs ---
 #   Source inspection shows ACL plumbing, not mounted row proof: the FUSE
@@ -27,11 +28,9 @@
 #     owner guard currently returns EACCES, so the mounted errno is not proven.
 #   generic/318: user-namespace ACL id mapping plus remount persistence; no
 #     mounted idmap proof is recorded here.
-#   generic/444: mounted create SGID/default ACL interaction.
 generic/099
 generic/237
 generic/318
-generic/444
 
 # --- Large-file block accounting across remount ---
 #   generic/694 verifies that stat(2) i_blocks stays stable for a file larger
