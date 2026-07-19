@@ -2,9 +2,11 @@
 
 > TFR-010 investigation outcome: live-behavior snapshot. This document is a
 > design/planning authority, not a production-readiness claim. The deadlist
-> integration decision is recorded in section 4; implementation remains open
-> under the follow-up issue map in section 4.8. Distributed snapshot shipping
-> is recorded separately in `docs/design/distributed-snapshot-shipping.md`.
+> integration decision and its bounded local implementation are recorded in
+> section 4. Distributed snapshot shipping is recorded separately in
+> `docs/design/distributed-snapshot-shipping.md`. The local implementation does
+> not unblock the `snapshot-clone-send-receive-reclaim` product-admission gate
+> or make a distributed, capacity, source-retirement, or production claim.
 
 ## 1. Snapshot Lifecycle
 
@@ -148,10 +150,18 @@ Source: `crates/tidefs-local-filesystem/src/snapshot.rs` create_bookmark, delete
 
 ### 4.1 Current implementation baseline
 
-TideFS still has **no wired local snapshot deadlist derivation path**. Snapshot
-and clone deletion remove the `SnapshotRecord`, release the lifecycle GC pin,
-and remove the catalog entry, but they do not walk the released root or enqueue
-reclaim work for objects that became snapshot-only garbage.
+TideFS has a wired local snapshot deadlist path. After the snapshot or clone
+lifecycle mutation commits its state-map, catalog, and lifecycle-pin changes,
+`enqueue_released_snapshot_deadlist` derives candidates for the released root
+against the current root and remaining lifecycle pins, then persists candidates
+through the receipt-bound queue. A shared root with a remaining lifecycle pin
+does not enqueue candidates. The local VFSSEND2 snapshot-deletion path uses the
+same post-mutation operation; it reports a derivation failure as deferred work
+without undoing the received deletion.
+
+This is bounded local lifecycle and queue behavior. It does not establish
+physical reclaim, distributed snapshot shipping, source retirement, capacity
+correctness, or product admission.
 
 The object store already has lower-level reclaim machinery that the deadlist
 model must use instead of bypassing:
@@ -212,8 +222,8 @@ Deadlist derivation must preserve that refcounted root authority:
 
 ### 4.4 Persistence and lifecycle
 
-Deadlist work must be durable. The initial implementation should use the
-object-store named objects that already exist for reclaim state:
+Deadlist work is durable. The wired local path uses the object-store named
+objects that already exist for reclaim state:
 
 - `tidefs-dead-object-reclaim-queue`: pending or receipt-bearing dead-object
   candidates derived from released roots.
@@ -246,11 +256,11 @@ current root, lifecycle pins, or snapshot extent pins, so transmitted deadlist
 entries would couple two independent GC authorities.
 
 Incremental receives that create or update roots do not populate or clear
-deadlists by themselves. Future received snapshot-deletion deltas trigger the
-same local derivation path after the receiver applies the deletion to its own
-snapshot/catalog/lifecycle-pin authority. The receive trigger boundary is
-tracked by #1259; it must call the derivation API selected here rather than
-defining a separate distributed deadlist model.
+deadlists by themselves. Received VFSSEND2 snapshot-deletion mutations apply
+the local lifecycle deletion first, then call the same local derivation and
+queue path. A derivation failure is returned as
+`SnapshotMutationApplyReport::DeletedWithDeferredDeadlist`, rather than
+undoing the applied deletion or defining a second distributed deadlist model.
 
 ### 4.6 Alternatives considered
 
@@ -278,8 +288,11 @@ that belongs in a separate design issue.
 - `docs/SNAPSHOT_CLONE_DEADLIST_AUTHORITY.md` as created by closed #1246.
 - Closed #1246 body and acceptance criteria.
 - `docs/REVIEW_TODO_REGISTER.md` TFR-010 notes.
+- `crates/tidefs-local-filesystem/src/deadlist.rs` released-root derivation and
+  local live-root enumeration.
 - `crates/tidefs-local-filesystem/src/snapshot.rs` snapshot/clone lifecycle,
-  hold/release, catalog reconciliation, and lifecycle pin management.
+  hold/release, catalog reconciliation, lifecycle pin management, local queue
+  handoff, and received VFSSEND2 deletion handling.
 - `crates/tidefs-local-filesystem/src/records.rs` `SnapshotRecord` and
   `SnapshotKind`.
 - `crates/tidefs-dataset-lifecycle/src/lib.rs` and
@@ -299,15 +312,15 @@ that belongs in a separate design issue.
 - `docs/design/distributed-snapshot-shipping.md` VFSSEND2 distributed
   shipping decision and #1259 receive-trigger follow-up.
 
-### 4.8 Follow-up implementation issue map
+### 4.8 Landed local implementation map
 
-| Issue | Responsibility | Expected write set | Validation tier |
+| Issue | Landed scope | Current source boundary |
 | --- | --- | --- | --- |
-| #1263 | Add the released-root derivation API that walks the released root, subtracts the current root and pinned lifecycle roots, and returns dead-object candidates without enqueueing or freeing. | `crates/tidefs-local-filesystem/src/deadlist.rs`, `crates/tidefs-local-filesystem/src/lib.rs` | Focused derivation unit tests plus `git diff --check`. |
-| #1264 | Persist snapshot-deadlist candidates into the object-store receipt-bound reclaim machinery and keep physical reclaim gated by receipts and snapshot extent pins. | `crates/tidefs-local-object-store/src/store.rs`, `crates/tidefs-local-object-store/src/reclaim_queue.rs`, `crates/tidefs-gc-pin-set/src/lib.rs` only if the pin-set API needs a narrow helper | Focused object-store unit tests for queue persistence, receipt gating, pinned denial, corrupt pin evidence, replay, plus `git diff --check`. |
-| #1265 | Wire local `delete_snapshot` and `delete_clone` to call derivation and enqueue only after the state/catalog/lifecycle-pin mutation succeeds. | `crates/tidefs-local-filesystem/src/snapshot.rs` | Focused local-filesystem unit tests for ordinary delete, clone-shared-root delete, clone delete, hold refusal, queued-work persistence where applicable, plus `git diff --check`. |
-| #1259 | Add the receive-side trigger that calls the #1263 derivation API after a received snapshot-deletion delta is applied locally. | `crates/tidefs-local-filesystem/src/send_receive.rs` | Trigger unit tests with a stub or the final API; two-node validation only after the derivation API exists. |
-| #1266 | Decide reclaim drain cadence, queue-size limits, operator reporting, and capacity/accounting integration after the core machinery has evidence. | `docs/SNAPSHOT_CLONE_DEADLIST_AUTHORITY.md` section 4.9 | Documentation/design/source-inspection only for the policy decision; split source work before implementation. |
+| #1263 | Released-root candidate derivation that subtracts the current root and lifecycle-pinned roots. | `crates/tidefs-local-filesystem/src/deadlist.rs` derives candidates only; it does not enqueue, drain, or free them. |
+| #1264 | Receipt-bound persistence and drain gating for snapshot-deadlist candidates. | `crates/tidefs-local-object-store/src/store.rs` keeps queued candidates held until receipt, stable-generation, and snapshot-extent-pin gates permit reclaim. |
+| #1265 | Local snapshot and clone deletion handoff after lifecycle mutation. | `crates/tidefs-local-filesystem/src/snapshot.rs` calls `enqueue_released_snapshot_deadlist` after deletion and preserves the shared-root guard. |
+| #1259 | Received snapshot-deletion handoff to the same local path. | `apply_vfssend2_snapshot_mutation` in `crates/tidefs-local-filesystem/src/snapshot.rs` applies the lifecycle deletion, then records a deferred deadlist failure without rolling it back. |
+| #1266 | Receipt-bound drain policy, reporting, and capacity boundary. | Section 4.9 records the bounded policy; it does not claim final capacity/accounting or product admission. |
 
 ### 4.9 Receipt-Bound Reclaim Drain Policy
 
@@ -499,7 +512,7 @@ compute_export_identity, receive_changed_records_into_staging_with_skip.
    The receiver must validate the spec, version, and per-record checksums
    before persisting any object.
 
-5. **Deadlist invariant (design decided, not implemented)**: After a
+5. **Deadlist invariant (implemented local path)**: After a
    snapshot or clone is deleted and its lifecycle pin is released, objects
    reachable only through that released root must be persisted as
    receipt-bound dead-object candidates. No object may appear on the deadlist
@@ -512,8 +525,8 @@ compute_export_identity, receive_changed_records_into_staging_with_skip.
 - Any new snapshot or clone lifecycle operation must go through the three-part
   authority (state map, catalog, lifecycle pins) and call
   `ensure_snapshot_authority_consistent` before mutating.
-- Any deadlist implementation must follow the section 4 decision: entries are
-  derived from released roots after subtracting the current root and pinned
+- Changes to the deadlist path must preserve the section 4 decision: entries
+  are derived from released roots after subtracting the current root and pinned
   lifecycle roots, persisted through the receipt-bound dead-object reclaim
   path, and consumed only after snapshot extent pins and reclaim receipts allow
   physical free. Consumption must respect clone shared-root semantics.
@@ -530,8 +543,9 @@ compute_export_identity, receive_changed_records_into_staging_with_skip.
 - Single-node local-filesystem send/receive stream format, export, and import.
 - Cross-subsystem contracts between snapshot state, catalog, lifecycle pins,
   and object store.
-- Deadlist integration decision: released-root derivation feeding the
-  receipt-bound dead-object reclaim pipeline.
+- Local deadlist integration: released-root derivation feeding the
+  receipt-bound dead-object reclaim pipeline, with product-admission evidence
+  still blocked separately.
 
 ### 8.2 Out of scope
 
