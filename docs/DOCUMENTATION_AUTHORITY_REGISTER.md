@@ -1,37 +1,29 @@
 # Documentation Authority Register
 
-Date: 2026-06-30
-
-This register is the TFR-019 queue for documents that still need authority
-classification. It is deliberately narrow: it does not make the listed
-documents current policy, and it does not close any storage behavior claim.
+This register is a specialized reference for classifying surviving documents.
+It is not ordinary baseline reading, product authority, project status, or a
+definition-of-done checklist. `README.md` is the sole product-shape authority;
+load it only for a documentation-classification task or an actual publication,
+release-candidate, support, or comparison review.
 
 ## Authority Rule
 
-The active entry points are `README.md`, `AGENTS.md`, `docs/INDEX.md`,
-`docs/LICENSING.md`, `docs/REVIEW_TODO_POLICY.md`,
-`docs/REVIEW_TODO_REGISTER.md`, `docs/CLAIMS_GATE_POLICY.md`, and this file.
-
-Issue #1871 deleted the TideFS Book source because its useful current
-boundaries are already represented by the active entry points, source-owned
-`tidefsctl` command classification, operator UAPI authority, and claims gate.
-Do not recreate a replacement book, manual, or status surface without an
-issue-scoped authority decision.
-
-All other imported documents are review inputs until classified here or in a
-small follow-up commit tied to TFR-019. Documents under `docs/design/`, root
-documents ending in `_DESIGN.md`, issue-era implementation plans, old status
-matrices, coordination packets, closeout snapshots, and Forgejo-era milestone
-updates are historical input by default even when their text says
-`Maturity:`, `Status: sealed`, `canonical`, `single authoritative`, phase
-complete, implemented, or current. That wording is imported context, not
-current authority.
+Imported documents are review inputs unless a focused, source-backed
+classification below gives them a narrow current scope. Documents under
+`docs/design/`, root documents ending in `_DESIGN.md`, issue-era
+implementation plans, old status matrices, coordination packets, closeout
+snapshots, and Forgejo-era milestone updates are historical input by default
+even when their text says `Maturity:`, `Status: sealed`, `canonical`, `single
+authoritative`, phase complete, implemented, or current. That wording is
+imported context, not current authority.
 
 A document becomes current policy or current spec only through source-backed
-classification that names the narrow scope being promoted. Product-facing,
-successor, comparator, release-readiness, durability, safety, performance,
-availability, or production wording still requires the claims gate and current
-validation evidence for that exact scope.
+classification that names the narrow scope being promoted. Current source and
+the smallest relevant carrier or invariant test establish current behavior.
+For an actual publication, tag, release candidate, or externally consumed
+support or comparison statement, use `docs/CLAIMS_GATE_POLICY.md` and evidence
+for that exact statement. Those publication guardrails do not establish
+behavior or complete ordinary development work.
 
 ## Classification States
 
@@ -56,19 +48,16 @@ extra authority states: each document still uses exactly one state above.
 
 ## Review Method
 
-Classify documents in focused commits. Do not mix doc classification with
-runtime implementation except for narrow claim-gate coverage updates required
-by the classification itself.
-
-Before promoting a document to current policy or current spec, check the live
-source behavior, `validation/claims.toml`, and the claims gate. If that review is
-too large for the current slice, leave the document as historical input and
-record the blocker in `docs/REVIEW_TODO_REGISTER.md`.
+Classify documents in focused commits and do not mix classification with
+runtime implementation. Verify a proposed current-policy or current-spec scope
+against current source and repository policy; where it asserts behavior, use
+the smallest relevant carrier or invariant test. If the scope cannot be
+established, leave the document as historical input; do not create or extend a
+gate-review history.
 
 Consolidation work must collapse duplicate truth surfaces instead of creating
-new status files. Keep generated outputs generated, especially
-`docs/CLAIM_REGISTRY.md` from `validation/claims.toml`. Treat broad design docs,
-old status matrices, coordination packets, closeout snapshots, and issue-era
+new status files or generated authority. Treat broad design docs, old status
+matrices, coordination packets, closeout snapshots, and issue-era
 implementation plans as historical input or delete candidates until a focused
 issue classifies their exact scope. Delete after useful current content has
 moved or the file is obsolete scaffold/closeout material; keep deleted-path
@@ -91,56 +80,6 @@ register ledger.
 
 ## Classified Authority Slices
 
-### Retired Coordination Snapshot Deletions (TFR-019 / #1586)
-
-Issue #1586 deleted the already-classified Forgejo-era coordination health,
-status-update, and roadmap snapshot files that had been covered by #1164,
-#1165, #1174, #1232, #1233, #1234, #1236, and #1238. Their historical
-classification evidence remains in git history and the closed issues; this
-register intentionally does not keep live per-file rows for deleted documents.
-Current coordination authority remains GitHub issue and pull-request state plus
-the active repo documentation entry points.
-
-### Duplicate Design Family Deletions (TFR-019 / #1590)
-
-Issue #1590 deleted the obvious stale worklog/status documents and duplicate
-Forgejo-era design-family files for background service scheduling,
-scrub/repair/resilver, shard/rebake, pool import/export, and incremental-job
-wire-up. The deleted files were historical lineage, phase-tracking, or
-sealed/canonical-design variants whose useful current content either moved into
-existing source-backed authority paths or remains available in git history.
-
-The surviving source-backed surfaces are:
-
-- `docs/BACKGROUND_SERVICE_FRAMEWORK_DESIGN.md` for the current scheduler/job
-  contract summary.
-- `docs/POOL_IMPORT_EXPORT_DEVICE_TOPOLOGY_DESIGN.md` for the current
-  pool-label, scan/import, local import/export, and device-manager summary.
-- `docs/SCRUB_IDENTITY_AUTHORITY.md`,
-  `docs/LOCAL_DISTRIBUTED_RECEIPT_AUTHORITY.md`, and
-  `docs/POOL_WIDE_REDUNDANCY_PLACEMENT_CONTRACT.md` for narrow current
-  scrub/receipt/placement authority.
-
-This register intentionally does not keep a live row for every deleted
-duplicate. Git history and GitHub issue/PR history retain the path lineage.
-
-### Second-Wave Historical Design Deletions (TFR-019 / #1595)
-
-Issue #1595 deleted a second wave of historical design inputs whose live-looking
-status, phase-complete, canonical, sealed, or implementation-plan wording could
-be mistaken for current authority. The deleted set covered duplicate or stale
-cluster transport, trace-oracle, extent/locator, generation-staleness,
-semantic-op, cursor, metadata-parallelism, membership, directory-stream,
-prefetch/readahead, locator, and record-shaping designs, plus the old
-ZFS/Ceph mistake coverage matrix. Their useful current boundaries are either
-already represented by surviving source-backed authority docs, issue state,
-validation policy, or the split successor/comparator claim ids in
-`validation/claims.toml`.
-
-This register intentionally records the deletion as a family-level authority
-cleanup instead of keeping live rows for every removed path. Git history, issue
-#1595, and its pull request retain the deleted-path lineage.
-
 ### Live-Looking Authority Marker Classifications (TFR-019 / #1595)
 
 Issue #1595 also hardened the doc-authority drift guard for unclassified
@@ -154,77 +93,6 @@ release, successor, comparator, production, or parity claims.
 |---|---|---|
 | `docs/cache-authority-model.md` | Current spec | Binding only for the cache authority class vocabulary and cache-layer ownership table consumed by current cache, local-filesystem, and FUSE adapter source comments. It is not an end-to-end page-cache/writeback/mmap durability proof, kernel page-cache completion claim, performance claim, or production readiness evidence. |
 | `docs/SNAPSHOT_NAMESPACE_BROWSING.md` | Current spec | Binding only as the issue #768 snapshot browsing namespace decision and follow-up map: transparent read-only browsing is the chosen design target and mutation/refusal boundary. It is not runtime validation, ZFS parity evidence, snapshot lifecycle proof, or release-readiness evidence. |
-
-### Stale Marker Classifications (TFR-019 / #1590)
-
-Issue #1590 also classified surviving Markdown files that still carried
-Forgejo-era URLs or live-looking imported status markers. Issue #1720 later
-deleted the last standalone historical rows from this section; git history,
-issue #1590, and issue #1720 retain their lineage.
-
-### Three-Contract Historical Root Deletion (TFR-019 / #1692)
-
-Issue #1692 deleted the stale three-contract architecture root instead of
-preserving it as another live historical Markdown authority surface. Current
-on-media, VFS, trace, claim, and product-shape authority remains with
-source-backed focused docs, `validation/claims.toml`, the generated claim
-registry, the claims gate, and live GitHub issues/PRs. This deletion does not
-validate multi-implementation equivalence, trace parity, format lifecycle
-completion, release readiness, comparator parity, or OpenZFS/Ceph-successor
-claims.
-
-### Historical ADR Root Deletion (TFR-019 / #1689)
-
-Issue #1689 deleted the stale checksum and commit-ordering ADR roots instead of
-keeping them as live historical Markdown. Current checksum and BLAKE3 authority
-remains with source-backed policy/spec inputs, `validation/claims.toml`, the
-generated claim registry, and the claims gate. Current transaction and commit
-behavior remains with source, tests, live issues, validation claims, and the
-claims gate. This deletion does not validate checksum architecture completion,
-commit-group crash consistency, pool-layer production readiness, release
-readiness, comparator parity, or OpenZFS/Ceph successor/comparator wording.
-
-### Historical Kbuild Toolchain Note Deletion (TFR-019 / #1685)
-
-Issue #1685 deleted the standalone historical Linux 7.0 Kbuild toolchain
-preparation note. Current Kbuild toolchain behavior remains in
-`nix/vm/k7-kbuild-toolchain.nix`, `flake.nix`, and
-`scripts/k7-kbuild-toolchain-prepare.sh`; current workflow policy remains in
-`docs/KERNEL_MODULE_DEVELOPMENT_WORKFLOW_P7-05.md`. The deleted note is git,
-issue, and PR lineage only, not Kbuild, QEMU, kernel runtime, release, or
-OpenZFS/Ceph-successor evidence.
-
-### Empty Module Owners Scaffold Retirement (TFR-019 / #1619)
-
-Issue #1619 deleted the empty `MODULE_OWNERS_INVARIANTS_PC002` scaffold and
-retired its xtask aliases because the document had no owner-path rows to
-verify. Module ownership, subsystem invariants, release readiness, production
-readiness, and OpenZFS/Ceph-class wording remain blocked until a future
-source-backed issue introduces real owner-path data, validation evidence, and
-claim-gate coverage for an exact scope.
-
-### Nextgen Verification Root Retirements (TFR-021 / #1656, #1660)
-
-Issue #1656 deleted the old issue #281 nextgen verification roadmap as a
-superseded live roadmap root. This cleanup collapses
-`docs/NEXTGEN_VERIFICATION_PERFORMANCE_OFFLOAD_PLAN.md` itself from an
-integrated program roadmap into a bounded historical pointer and current
-authority index. Current TFR-021 authority lives in `docs/CLAIMS_GATE_POLICY.md`,
-`validation/claims.toml`, generated `docs/CLAIM_REGISTRY.md`, evidence manifest
-schemas/source, focused subsystem docs, CI docs, and live GitHub issues/PRs for
-the exact slice. The deleted #281 roadmap and the retired nextgen follow-up map
-remain lineage in git, issue, and PR history only; they are not current planning
-authority and must not be cited as product-readiness, release, successor,
-crash-safety, performance-isolation, kernel, distributed, RDMA, or offload
-evidence.
-
-Issue #1660 deleted the standalone issue #751 evidence-chain authority root for
-the same reason: its useful evidence-chain decision is carried by
-`validation/claims.toml`, `docs/CLAIMS_GATE_POLICY.md`, generated
-`docs/CLAIM_REGISTRY.md`, and the source-backed `EvidenceArtifactManifest`
-tooling. The deleted path remains lineage in git, issue, and PR history only.
-It is not a separate current authority and must not be cited as claim closure,
-product proof, or release-readiness evidence.
 
 ### Request Contract Authority (TFR-019 / #1136)
 
@@ -254,15 +122,6 @@ source behavior, `validation/claims.toml`, and `xtask check-claims-gate`.
 |---|---|---|
 | `docs/BLAKE3_USAGE_POLICY.md` | Current policy | Binding only as a BLAKE3 placement and review policy. It is not implementation-status evidence and does not validate production end-to-end checksum, scrub self-heal, erasure-coded integrity, or tamper-proof root claims. Because this is promoted to current policy, it is scanned by the claims gate. |
 | `docs/CHECKSUM_ARCHITECTURE_DESIGN.md` | Historical input | Deferred in #1720 because active issue #1722 owns the remaining `xtask/tidefs-xtask/src/cluster.rs` citations. `docs/BLAKE3_USAGE_POLICY.md` is the current BLAKE3 placement policy; this imported G3 design target is not production checksum, repair, erasure, committed-root integrity, or release authority. |
-
-### Storage Design Duplicate Root Deletions (TFR-019 / #1635)
-
-Issue #1635 deleted duplicate `docs/design/` roots for checksum architecture,
-dataset lifecycle, commit-group/TXG ordering, deferred cleanup queues, and the
-persistent orphan index. The surviving historical inputs are the root design
-docs and historical ADRs already classified in this register. Git history and
-GitHub issue/PR history retain the deleted-path lineage; this register does not
-keep live per-file rows for those deleted duplicates.
 
 ### Kernel And Preview UAPI Authority
 
@@ -352,16 +211,6 @@ xfstests coverage, distributed behavior, or runtime crash claims.
 
 **Block-volume adapter and ublk source-boundary docs**
 
-Issue #1637 deleted the OW-301 block-volume receipt/spec roots and the older
-projection charter as duplicate live Markdown authority surfaces. The useful
-current boundary is folded into the surviving started-export admission artifact
-doc below, source code, generated claim registry, validation artifacts, git
-history, and PR/issue lineage. This consolidation does not validate qid/tag
-completion as a product claim, unblock the block-device product boundary, or
-claim fio breadth, mkfs/mount acceptance, online resize, crash durability,
-kernel block readiness, release readiness, production readiness, or
-OpenZFS/Ceph successor status.
-
 | Path | State | Classification note |
 |---|---|---|
 | `docs/BLOCK_VOLUME_UBLK_STARTED_EXPORT_ADMISSION_BOUNDARY_ISSUE_341.md` | Current spec | Scoped current spec for the started-export admission artifact and fail-closed verification path. It does not close broader block-volume runtime validation. |
@@ -385,145 +234,14 @@ OpenZFS/Ceph successor status.
 | `docs/LOCAL_DISTRIBUTED_RECEIPT_AUTHORITY.md` | Current spec | Scoped current spec for the issue #18 placement receipt authority split, including the shared `PlacementReceiptRef` policy-satisfying gate and remaining follow-up issues #674, #675, and #676. It is not a closure claim for distributed availability, rebuild, rebake, reclaim, or runtime validation. |
 | `docs/RAM_AUTHORITY_DESIGN.md` | Current spec | Scoped current spec for the issue #847 RAM authority boundary: `ram-volatile-local`, `ram-volatile-replicated`, `ram-intent-backed`, and `pmem-durable` semantics, receipts, failure behavior, policy-transition rules, resource-governor boundaries, and operator explanation requirements. It is not runtime implementation, PMem platform validation, distributed quorum proof, or POSIX durability evidence. |
 
-Issue #1715 deleted the imported authn/authz/override/audit and
-upgrade/failover/cutover operator-runbook production-depth roots instead of
-preserving them as live historical surfaces. Current operator security
-authority remains with source-owned `crates/tidefs-auth/`,
-`docs/security/operator-authz-boundary.md`, `docs/OPERATOR_UAPI_AUTHORITY.md`,
-and `docs/OPERATOR_PRODUCT_SURFACE_DECISION.md`. This deletion does not
-implement production remote operator authorization, a production runbook engine,
-release readiness, OpenZFS/Ceph parity, distributed failover readiness, kernel
-residency, or successor/comparator wording.
-
-Issue #1717 deletes the imported membership/placement, replication/rebuild/
-relocation, and timing/drift production-depth roots instead of preserving them
-as live historical surfaces. Current authority remains with source-owned
-membership, receipt, replication, rebuild, relocation, and clock-timing crates,
-plus `docs/MEMBERSHIP_AUTHORITY.md`,
-`docs/LOCAL_DISTRIBUTED_RECEIPT_AUTHORITY.md`,
-`docs/OPERATOR_PRODUCT_SURFACE_DECISION.md`, `validation/claims.toml`, and the
-claims gate. This deletion does not implement distributed membership runtime
-closure, production replication or rebuild, clock-drift runtime validation,
-release readiness, OpenZFS/Ceph parity, or successor/comparator wording.
-
-### Membership-Service Historical Root Deletion (TFR-019 / #1835)
-
-Issue #1835 deleted the imported membership-service root after replacing the
-remaining live references with current membership authority, quorum-set
-identity, storage-intent policy, source-owned membership crates, validation
-claims, and live GitHub issue/PR authority. Its lineage remains in git, issue
-#1835, and its pull request only. This deletion does not implement or validate
-a full cluster-membership service, distributed availability, production
-readiness, release readiness, OpenZFS/Ceph parity, performance,
-successor/comparator wording, or operator-readiness claims.
-
-### Polymorphic Xattr Historical Root Deletion (TFR-019 / #1836)
-
-Issue #1836 deleted the imported polymorphic-xattr storage root after
-replacing its remaining live references with source-owned type, runtime,
-local-filesystem, FUSE, and kernel paths, validation claims, and live GitHub
-issue/PR authority. Its lineage remains in git, issue #1836, and its pull
-request only. Issue #1448 separately owns the userspace xattr/statx probe
-safety gap. This deletion does not implement or validate external xattr B-tree
-persistence, mounted xattr or POSIX ACL behavior, kernel/userspace equivalence,
-POSIX completeness, production or release readiness, performance, or
-successor/comparator wording.
-
-### Polymorphic Directory Index Historical Root Deletion (TFR-019 / #1800)
-
-Issue #1800 deleted the imported polymorphic-directory-index root after no
-live source or xtask reference still required it. Current behavior remains
-source-owned by `crates/tidefs-types-polymorphic-directory-index-core/`,
-`crates/tidefs-dir-index/`, and their callers. Its lineage remains in git,
-issue #1800, and its pull request only. This deletion does not implement or
-validate directory-index completeness, lookup or readdir semantics,
-representation migration, crash consistency, namespace or POSIX completeness,
-performance, production or release readiness, or OpenZFS/ZAP parity and
-successor/comparator wording.
-
-### Spacemap Allocator Historical Root Deletion (TFR-019 / #1800)
-
-Issue #1800 deleted the imported spacemap-allocator root after issue #1842
-removed its last xtask fixture dependency and no live source reference still
-required it. Current behavior remains source-owned by
-`crates/tidefs-spacemap-allocator/` and its callers. Current capacity and
-storage-intent boundaries remain in their focused authority docs. The deleted
-root's lineage remains in git, issue #1800, and its pull request only. This
-deletion does not implement or validate allocator completeness, fragmentation
-behavior, space accounting, mounted capacity semantics, crash recovery,
-performance, production or release readiness, or OpenZFS/Ceph-class behavior.
-
 ## Incumbent Comparison Audit Slice (#931)
 
-This initial #931 slice classifies the following legacy incumbent-comparison
-sections as historical design lessons or fail-closed review blockers, not
-current TideFS product evidence. None of these documents may be cited for a
-current OpenZFS, ZFS, Ceph, DRBD, ext4/XFS, performance-superiority,
-cost-effectiveness, flash-wear, RAM, WAN, durability, or successor claim
-unless the cited statement is re-expressed through
-`storage.local.successor_comparator.v1` or
-`storage.distributed.successor_comparator.v1` and the comparator evidence
-required by those registry entries:
-
-- Deleted orphan-index comparison lineage: ZFS/ext4/CephFS orphan-index table
-  and former "key advantages" list are non-claim design lessons in git history
-  only.
-- Deleted polymorphic directory-index comparison lineage: ZFS ZAP comparison
-  and former "improvements over ZFS" list are non-claim design lessons in git
-  history only.
-- Deleted polymorphic extent-map design lineage: ZFS/Ceph extent-layout tables,
-  random-read cost hypotheses, and design-mistake coverage remain non-claim
-  historical lessons in git history only.
-- Deleted membership-service comparison lineage: ZFS/Ceph cluster-membership
-  comparison text remains non-claim historical input in git history only.
-- The deleted shard/rebake design-family comparison text about ZFS/Ceph
-  deferred redundancy and write amplification is design input only.
-- `docs/ONLINE_DEFRAG_BPR_DESIGN.md`: ZFS/Ceph defrag and BPR comparison text
-  is target mechanism input, not evidence of implemented online defrag; its
-  BPR mechanism is subordinate to #848 storage-intent relocation gates, #844/#856
-  cost and wear evidence, #845 prediction/payback evidence, and #904 media
-  capability evidence.
-- Retired review surfaces: incumbent references are fail-closed review blockers
-  only.
-
-### ADR-Backed Historical Root Deletions (TFR-019 / #1675)
-
-Issue #1675 deleted the ADR-backed commit-group and orphan-index historical
-root docs whose useful target-history context was already preserved by ADRs and
-source code. The surviving ADRs remain historical input only; live behavior,
-current authority, and product claims still come from source-backed authority
-docs, `validation/claims.toml`, generated claim output, and GitHub issue/PR
-state.
-
-Non-overlapping child slices completed the cluster-by-cluster audit and added
-Incumbent Comparison Boundary sections to the following file groups. Each
-grouped file is classified as historical/design input only for its comparison
-text; no product-facing successor, superiority, or parity wording exists in
-any of these files without the matching split successor/comparator claim id and
-its comparator evidence.
-
-Child slices (all merged):
-- #933 / PR #955: background jobs, deferred cleanup, reclaim, orphan-index,
-  and universal-cursor comparison wording.
-- #934 / PR #956: dataset lifecycle, snapshot, send/receive, pool import/export,
-  device topology, rename, reflink/copy-offload, and operator lifecycle
-  comparison wording.
-- #935 / PR #946: cache, mmap, RAM authority, sync intent, latency/throughput,
-  QoS, and access-pattern comparison wording.
-- #936 / PR #937: integrity, checksum, transform, scrub/repair, erasure-coding,
-  SOTA, and coverage-matrix comparison wording.
-- #965: online defrag BPR subordinate to storage-intent relocation gates.
-
-Consolidation closure (issue #1802):
-- `docs/ARCHITECTURE.md`: ZFS/CephFS comparison body text was deleted from the
-  live architecture map. Incumbent comparison lineage remains available through
-  git, issues, PRs, claim registry data, and validation evidence instead of a
-  live review section in this document.
-
-This consolidation closes the #931 audit. No live doc contains un-gated
-incumbent-comparison, successor, or product-superiority wording. Any future
-product-facing comparison must route through the matching split
-successor/comparator claim id and comparator evidence.
+Incumbent-comparison material is historical input, not TideFS product evidence.
+Current source and focused carrier tests establish behavior. Only an actual
+publication, tag, release candidate, or externally consumed comparison
+statement uses the matching `storage.local.successor_comparator.v1` or
+`storage.distributed.successor_comparator.v1` claim and comparator evidence.
+That publication guardrail does not complete ordinary development work.
 
 ### Background Service Framework Scheduler Authority (TFR-019 / #1537)
 
@@ -550,116 +268,9 @@ feature-gated `multi_threaded.rs` scheduler types. That contract is current
 source behavior, not a promotion of the imported design documents to current
 spec.
 
-The checked claims surface does not validate broader runtime or product wording.
-`validation/claims.toml` and generated `docs/CLAIM_REGISTRY.md` still keep
-`scheduler.dirty_debt.no_hidden.v1` blocked, scrub foreground-read protection
-planned, and storage-intent successor/comparator wording blocked. This slice
-therefore does not claim production scheduler readiness, no-hidden-queue
-closure, FUSE-loop integration, lower latency, stronger crash recovery, operator
-visibility, release readiness, or superiority over OpenZFS, Ceph, DRBD, or local
-filesystems. Forgejo issue closeout, `Maturity:` status, phase-completion,
-implementation-status, multi-threaded-runtime, and product-comparison wording in
-the files below remain historical lineage only.
-
-Future promotion beyond the source API must be split by non-overlapping write
-sets: scheduler API/reference wording belongs to the scheduler crate or a new
-focused scheduler-authority doc; FUSE-loop integration belongs to the POSIX/FUSE
-runtime paths; no-hidden-queue and foreground-read claims belong to
-`validation/claims.toml` plus validation artifacts; multi-threaded runtime
-claims belong to `crates/tidefs-background-scheduler/src/multi_threaded.rs` plus
-focused runtime evidence; product-comparison claims remain under the #875
-claim/comparator evidence path.
-
 | Path | State | Classification note |
 |---|---|---|
 | `docs/BACKGROUND_SERVICE_FRAMEWORK_DESIGN.md` | Current spec | Scoped source-backed summary for the current background scheduler and incremental-job contract in `crates/tidefs-background-scheduler`, `crates/tidefs-incremental-job-core`, and `crates/tidefs-types-incremental-job-core`. It is not release-readiness evidence or proof that every maintenance subsystem is wired into mounted runtime behavior. |
-
-### Unreferenced Historical Input Deletions (TFR-019 / #1673)
-
-Issue #1673 deleted `docs/troubleshooting-build.md` and
-`docs/design/derived-views-first-class-architectural-pillar.md` after bounded
-search found no live source, validation, or current-authority references
-outside this register. Their lineage remains in git, issue #1673, and the pull
-request. This deletion does not create build/troubleshooting authority,
-derived-view implementation evidence, release-readiness evidence, or product
-claims.
-
-### Format Lifecycle Historical Root Deletions (TFR-019 / #1705)
-
-Issue #1705 deleted the imported unified format-lifecycle and deterministic
-crash-injection design roots instead of preserving them as live historical
-surfaces. Their design-spec/status wording came from old Forgejo-era planning,
-depended on absent or undefined imported issue paths, and did not match a
-current source-backed product authority surface. Their lineage remains in git,
-issue #1705, and its pull request only.
-
-Current format and crash evidence remains with the relevant source crates,
-validation artifacts, claim registry, release-readiness contract, trace/crash
-oracle authority surfaces, and live GitHub issues/PRs. This deletion does not
-promote production format lifecycle, complete crash-injection coverage, runtime
-crash-safety claims, release readiness, OpenZFS/Ceph parity, or
-successor/comparator wording.
-
-### Kernel Boundary Production Root Deletions (TFR-019 / #1707)
-
-Issue #1707 deleted the imported Linux-baseline, std/no_std environment,
-UAPI/FFI schema, Rust-for-Linux trait, kernel rollout, and kernel
-locking/RCU/workqueue production-depth roots instead of preserving them as
-live historical surfaces. Those roots were already classified as historical
-input, depended on deleted blueprint-era law documents, and competed with the
-current source-backed kernel and preview-UAPI authority surfaces.
-
-Current kernel and preview-UAPI authority remains with the scoped kernel
-residency decision, kernel-resident pool-engine architecture, Linux workflow
-policy, preview UAPI boundary, operator UAPI authority, kmod READMEs/source,
-validation claims, claims-gate policy, and live GitHub issues/PRs. This
-deletion does not promote production kernel residency, full-kernel/no-daemon
-readiness, production UAPI/ABI freeze, kernel block or POSIX parity, release
-readiness, OpenZFS/Ceph parity, or successor/comparator wording.
-
-### P3 Policy And Receipt Root Deletions (TFR-019 / #1709)
-
-Issue #1709 deleted the imported policy-authority runtime-surface and
-receipt/response runtime-emission production-depth roots instead of preserving
-them as live historical surfaces. Those roots were already classified as
-historical input, used source-of-truth wording wider than current source-backed
-implementation, and competed with the scoped storage-intent, receipt,
-result/refusal, operator, and claims-gate authority surfaces.
-
-Current authority remains with `docs/STORAGE_INTENT_POLICY_AUTHORITY.md`,
-`docs/LOCAL_DISTRIBUTED_RECEIPT_AUTHORITY.md`,
-`docs/STORAGE_INTENT_RESULT_REFUSAL_EVIDENCE_DESIGN.md`,
-`docs/OPERATOR_PRODUCT_SURFACE_DECISION.md`,
-`docs/OPERATOR_UAPI_AUTHORITY.md`, `docs/CLAIMS_GATE_POLICY.md`,
-`validation/claims.toml`, generated `docs/CLAIM_REGISTRY.md`, source behavior,
-and live GitHub issues/PRs. This deletion does not promote a complete
-kernel-hosted policy authority service, runtime-fed operator product surface,
-response-registry runtime, receipt runtime closure, release readiness,
-OpenZFS/Ceph parity, or successor/comparator wording.
-
-### Performance And Fault Root Deletions (TFR-019 / #1712)
-
-Issue #1712 deleted the imported performance-budget/SLO/regression-gate
-and fault-injection/chaos/corruption production-depth roots instead of
-preserving them as live historical surfaces. The performance root was already
-classified as historical input, and the fault root still called itself
-source-of-truth even though current proof lives in source, validation
-artifacts, release evidence, and claims policy.
-
-Current performance-gate authority remains with
-`crates/tidefs-validation/src/performance_gate/`, `xtask` command behavior,
-`docs/RELEASE_CANDIDATE_EVIDENCE_CONTRACT.md`,
-`docs/RELEASE_READINESS_VERDICT_CONTRACT.md`, `docs/GITHUB_CI.md`,
-`docs/CLAIMS_GATE_POLICY.md`, `validation/claims.toml`, generated
-`docs/CLAIM_REGISTRY.md`, and live validation artifacts. Current typed
-fault-catalog and fault-scenario authority remains with
-`crates/tidefs-local-object-store/src/fault_catalog.rs`,
-`crates/tidefs-local-object-store/src/fault_injection.rs`,
-`crates/tidefs-validation/src/fault_injection_scenario_catalog.rs`, release
-evidence, claims policy, and live GitHub issues/PRs. This deletion does not
-validate release readiness, production fault campaigns, performance budget
-completeness, full POSIX/block/kernel readiness, OpenZFS/Ceph parity, or
-successor/comparator wording.
 
 ### Release Readiness Verdict Contract (#1279)
 
@@ -714,61 +325,3 @@ claims-gate coverage.
 | Path | State | Classification note |
 |---|---|---|
 | `docs/adr/0006-license-compliance-cargo-deny.md` | Current policy | Binding only as the cargo-deny dependency-license decision record: TideFS uses `cargo deny check licenses` for dependency-license validation, and accepted dependency-license allowlist/rule changes flow through `deny.toml`. `deny.toml` remains the concrete dependency-license allowlist and rule source, while `COPYING` and `docs/LICENSING.md` remain TideFS project-license authority. This ADR is not a supply-chain completeness claim, dependency-advisory remediation policy, release-readiness evidence, production-readiness evidence, or product capability claim. |
-
-### Retired Cluster Services Closeout Deletions (TFR-019 / #1586)
-
-Issue #1586 deleted the already-classified Forgejo-era cluster-services seal and
-completion closeout notes covered by #1153 and #1293. The source and claim
-boundary findings remain unchanged: TFR-017 still blocks broad multi-node or
-production cluster claims, and the deleted closeout notes are not current
-policy, current spec, implementation status, release-readiness evidence, or
-product authority.
-
-### Forgejo-Era Cluster Design Root Consolidation (TFR-019 / #1638)
-
-Issue #1638 removed the unreferenced imported cluster/admin, snapshot,
-mmap-coherency, and metadata-resilience roots:
-`docs/design/admin-service-wire-protocol.md`,
-`docs/design/cluster-admin-proxy-model.md`,
-`docs/design/cluster-wide-atomic-snapshot-coordination.md`,
-`docs/design/mmap-cluster-coherency.md`, and
-`docs/design/metadata-redundancy-fallback.md`. Their lineage remains in git,
-issue #1638, and its pull request only.
-
-Issue #1699 later removed the remaining source- or doc-referenced
-Forgejo-era cluster design roots from this family after moving the narrow
-comment lineage into source-owned comments and current authority references.
-Their lineage remains in git, issue #1699, and the pull request only. Current
-transport, membership, operator-authz, clustered-lock boundary, source,
-validation-claim, generated-claim, and live GitHub issue/PR authority remains
-unchanged. This deletion does not promote distributed mode, clustered POSIX,
-RDMA, mmap coherency, metadata redundancy, release readiness, production
-readiness, OpenZFS/Ceph parity, or successor/comparator wording.
-
-### Erasure Placement Historical Root Deletion (TFR-019 / #1702)
-
-Issue #1702 deleted the imported erasure-placement design roots after replacing
-the remaining live references with current pool-wide placement, placement
-receipt, and source-backed EC-store authority references. Their lineage remains
-in git, issue #1702, and its pull request only. Current authority remains with
-`docs/POOL_WIDE_REDUNDANCY_PLACEMENT_CONTRACT.md`,
-`docs/LOCAL_DISTRIBUTED_RECEIPT_AUTHORITY.md`,
-`docs/ERASURE_CODED_STORE_AUTHORITY.md`, source behavior, validation claims,
-and live GitHub issues/PRs. This deletion does not promote production
-erasure-coding placement, recovery-loop completion, rebalance performance,
-distributed availability, release readiness, OpenZFS/Ceph parity, or
-successor/comparator wording.
-
-### Erasure Layout OW Note Deletion (TFR-019 / #1914)
-
-Issue #1914 deleted `docs/ERASURE_CODED_LAYOUT_OW306.md` after folding the
-bounded single-parity XOR layout boundary into
-`docs/ERASURE_CODED_STORE_AUTHORITY.md` and retargeting
-`check-erasure-coded-layout` away from the standalone OW note. Its lineage
-remains in git, issue #1914, and its pull request only. Current authority
-remains with `crates/tidefs-replication-model`,
-`docs/ERASURE_CODED_STORE_AUTHORITY.md`, `check-erasure-coded-layout`,
-validation claims, and live GitHub issues/PRs. This deletion does not promote
-production erasure-coding placement, distributed rebuild/runtime,
-kernel/block-device erasure coding, release readiness, OpenZFS/Ceph parity, or
-successor/comparator wording.
