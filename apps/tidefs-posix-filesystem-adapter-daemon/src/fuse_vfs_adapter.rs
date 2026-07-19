@@ -8222,7 +8222,7 @@ impl FuseVfsAdapter {
 
         // Block-volume copying is not the final fsync durability boundary.
         // Retire its dirty projection only after every later stage succeeds.
-        let mut block_volume_copy_completed = false;
+        let mut block_volume_dirty_state_flushed = false;
         let sync_result = (|| {
             // Phase 1: Writeback dirty pages through the local-filesystem
             // dispatch layer via PageCacheDirtyFlush.  This bridges the adapter
@@ -8581,7 +8581,7 @@ impl FuseVfsAdapter {
         }
         dirty_projection_inodes.extend(block_volume_copy_ranges.keys().copied());
 
-        let mut block_volume_dirty_state_flushed = false;
+        let mut block_volume_copy_completed = false;
         let sync_result = (|| {
             {
                 let e = self.engine.lock().unwrap();
