@@ -569,7 +569,9 @@ mod tests {
     use crate::job_executor::JobExecutor;
     use std::collections::HashMap;
     use tidefs_cleanup_job_core::{CleanupContext, CleanupError, CleanupPhase, JobOutcome};
-    use tidefs_types_deferred_cleanup_core::{BtreeRootPointer, CleanupWorkItemV1, WorkItemKind};
+    use tidefs_types_deferred_cleanup_core::{
+        CleanupWorkItemV1, UnresolvedExtentMapRoot, WorkItemKind,
+    };
 
     // ── Mock executor for engine tests ───────────────────────────────
 
@@ -653,7 +655,7 @@ mod tests {
     }
 
     fn make_item(inode: u64, kind: WorkItemKind, bytes: u64) -> CleanupWorkItemV1 {
-        CleanupWorkItemV1::new(inode, kind, 1, BtreeRootPointer::EMPTY, bytes)
+        CleanupWorkItemV1::new(inode, kind, 1, UnresolvedExtentMapRoot::EMPTY, bytes)
     }
 
     // ── Engine lifecycle ─────────────────────────────────────────────

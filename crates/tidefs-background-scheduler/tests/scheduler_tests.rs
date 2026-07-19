@@ -1303,7 +1303,9 @@ mod durable_dispatch_tests {
     use tidefs_background_scheduler::BackgroundScheduler;
     use tidefs_cleanup_job_core::CleanupJob;
     use tidefs_incremental_job_core::{DispatchStore, DispatchStoreError, InMemoryDispatchStore};
-    use tidefs_types_deferred_cleanup_core::{BtreeRootPointer, CleanupWorkItemV1, WorkItemKind};
+    use tidefs_types_deferred_cleanup_core::{
+        CleanupWorkItemV1, UnresolvedExtentMapRoot, WorkItemKind,
+    };
     use tidefs_types_incremental_job_core::{
         DispatchRecord, DispatchRecordId, DispatchState, JobId, JobKind, SchedulerEpoch,
     };
@@ -1811,7 +1813,7 @@ mod durable_dispatch_tests {
             99,
             WorkItemKind::UnlinkFree,
             1,
-            BtreeRootPointer::EMPTY,
+            UnresolvedExtentMapRoot::EMPTY,
             4096,
         );
         let job = CleanupJob::new(vec![item]).with_job_id(JobId(44));

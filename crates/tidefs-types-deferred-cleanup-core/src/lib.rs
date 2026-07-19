@@ -5,12 +5,14 @@
 //! Authority type definitions for deferred cleanup work queues.
 //!
 //! Defines the deferred cleanup work item records used by background
-//! reclamation with three core types:
+//! reclamation with four core types:
 //!
 //! - [`WorkItemKind`] — discriminant enum: UnlinkFree, TruncateFree,
 //!   RmdirFree, RenameOverwrite, SnapDelete, PunchHoleFree
 //! - [`CleanupWorkItemV1`] — fixed-size 128-byte on-media record
 //!   persisting a deferred cleanup operation for background reclamation
+//! - [`UnresolvedExtentMapRoot`] — non-authoritative V1 record lane whose
+//!   numeric value has no storage resolver
 //! - [`WorkItemFlags`] — bitfield wrapper for the flags byte: is_complete
 //!   and reserved bits
 //!
@@ -21,8 +23,6 @@
 use core::fmt;
 
 extern crate alloc;
-
-pub use tidefs_types_dataset_feature_flags_core::BtreeRootPointer;
 
 // Stable identifier for the v1 cleanup work-item format.
 pub const DEFERRED_CLEANUP_SPEC: &str = "tidefs-deferred-cleanup-v1-design-1619";
@@ -47,6 +47,60 @@ pub const WORK_ITEM_VERSION: u8 = 1;
 
 /// Size of the opaque cursor field for resumable extent-map iteration.
 pub const CURSOR_SIZE: usize = 64;
+
+// ---------------------------------------------------------------------------
+// UnresolvedExtentMapRoot
+// ---------------------------------------------------------------------------
+
+/// Unresolved extent-map root value carried by a V1 cleanup work item.
+///
+/// The work-item format reserves one big-endian u64 for this lane. Zero is the
+/// empty sentinel; nonzero values are preserved as uninterpreted record data.
+/// Current source has no resolver from this value to an object, segment,
+/// offset, generation, or epoch, so this type deliberately exposes only
+/// explicit record encode/decode accessors and cannot be used as a generic
+/// storage pointer.
+#[derive(Clone, Copy, Default, Eq, PartialEq, Hash)]
+pub struct UnresolvedExtentMapRoot(u64);
+
+impl UnresolvedExtentMapRoot {
+    /// Empty/unrecorded V1 lane value.
+    pub const EMPTY: Self = Self(0);
+
+    /// Decode the uninterpreted u64 stored in the V1 record lane.
+    #[must_use]
+    pub const fn from_record_value(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Encode this unresolved value back into the V1 record lane.
+    #[must_use]
+    pub const fn record_value(self) -> u64 {
+        self.0
+    }
+
+    /// Return true when the V1 lane contains the empty sentinel.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+}
+
+impl fmt::Display for UnresolvedExtentMapRoot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.is_empty() {
+            f.write_str("UnresolvedExtentMapRoot(EMPTY)")
+        } else {
+            write!(f, "UnresolvedExtentMapRoot(record_value={:#018x})", self.0)
+        }
+    }
+}
+
+impl fmt::Debug for UnresolvedExtentMapRoot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // WorkItemKind
@@ -248,7 +302,7 @@ pub enum CleanupWorkItemDecodeError {
     InvalidMagic { actual: [u8; 8] },
     /// The kind byte does not name a known [`WorkItemKind`].
     UnknownKind { raw: u8 },
-    /// The padding reserved next to the root pointer is non-zero.
+    /// The padding reserved next to the unresolved root lane is non-zero.
     NonZeroRootReserved { bytes: [u8; 8] },
     /// The reserved flag bits are non-zero.
     NonZeroFlagReservedBits { raw: u8 },
@@ -307,7 +361,7 @@ impl fmt::Display for CleanupWorkItemDecodeError {
 /// [8..16)   inode_id: u64 BE
 /// [16]      kind: WorkItemKind as u8
 /// [17..25)  created_commit_group: u64 BE
-/// [25..33)  extent_map_root: BtreeRootPointer.0 u64 BE
+/// [25..33)  extent_map_root: unresolved record value u64 BE
 /// [33..41)  root reserved: [u8; 8]
 /// [41..105) cursor: [u8; 64] — opaque cursor state
 /// [105..113) bytes_to_free_estimate: u64 BE
@@ -332,10 +386,11 @@ pub struct CleanupWorkItemV1 {
     /// CommitGroup in which this work item was enqueued.
     pub created_commit_group: u64,
 
-    /// Snapshot of the extent-map root pointer at enqueue time.
-    /// The background job walks this frozen root; the live extent map
-    /// is updated independently by the synchronous phase.
-    pub extent_map_root: BtreeRootPointer,
+    /// Unresolved extent-map root record lane captured at enqueue time.
+    ///
+    /// This value is not a durable tree locator. Current cleanup execution
+    /// does not resolve or walk it.
+    pub extent_map_root: UnresolvedExtentMapRoot,
 
     /// Opaque cursor state for resumable extent-map iteration.
     /// Zero-filled when the work item is first enqueued; updated by
@@ -367,7 +422,7 @@ impl CleanupWorkItemV1 {
         inode_id: u64,
         kind: WorkItemKind,
         created_commit_group: u64,
-        extent_map_root: BtreeRootPointer,
+        extent_map_root: UnresolvedExtentMapRoot,
         bytes_to_free_estimate: u64,
     ) -> Self {
         Self {
@@ -425,7 +480,7 @@ impl CleanupWorkItemV1 {
         bytes[8..16].copy_from_slice(&self.inode_id.to_be_bytes());
         bytes[16] = u8::from(self.kind);
         bytes[17..25].copy_from_slice(&self.created_commit_group.to_be_bytes());
-        bytes[25..33].copy_from_slice(&self.extent_map_root.0.to_be_bytes());
+        bytes[25..33].copy_from_slice(&self.extent_map_root.record_value().to_be_bytes());
         bytes[41..105].copy_from_slice(&self.cursor);
         bytes[105..113].copy_from_slice(&self.bytes_to_free_estimate.to_be_bytes());
         bytes[113..121].copy_from_slice(&self.extents_processed.to_be_bytes());
@@ -499,7 +554,7 @@ impl CleanupWorkItemV1 {
             inode_id: read_u64_be(bytes, 8),
             kind,
             created_commit_group: read_u64_be(bytes, 17),
-            extent_map_root: BtreeRootPointer(read_u64_be(bytes, 25)),
+            extent_map_root: UnresolvedExtentMapRoot::from_record_value(read_u64_be(bytes, 25)),
             cursor,
             bytes_to_free_estimate: read_u64_be(bytes, 105),
             extents_processed: read_u64_be(bytes, 113),
@@ -529,7 +584,7 @@ impl Default for CleanupWorkItemV1 {
             inode_id: 0,
             kind: WorkItemKind::default(),
             created_commit_group: 0,
-            extent_map_root: BtreeRootPointer::EMPTY,
+            extent_map_root: UnresolvedExtentMapRoot::EMPTY,
             cursor: [0u8; CURSOR_SIZE],
             bytes_to_free_estimate: 0,
             extents_processed: 0,
@@ -543,10 +598,11 @@ impl fmt::Display for CleanupWorkItemV1 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "CleanupWorkItem(inode={} kind={} commit_group={} estimate={} processed={} {})",
+            "CleanupWorkItem(inode={} kind={} commit_group={} root={} estimate={} processed={} {})",
             self.inode_id,
             self.kind,
             self.created_commit_group,
+            self.extent_map_root,
             self.bytes_to_free_estimate,
             self.extents_processed,
             self.flags
@@ -680,17 +736,40 @@ mod tests {
         }
     }
 
+    // ── UnresolvedExtentMapRoot ───────────────────────────────────────
+
+    #[test]
+    fn unresolved_extent_map_root_exposes_only_record_semantics() {
+        let empty = UnresolvedExtentMapRoot::EMPTY;
+        assert!(empty.is_empty());
+        assert_eq!(empty.record_value(), 0);
+        assert_eq!(format!("{empty}"), "UnresolvedExtentMapRoot(EMPTY)");
+        assert_eq!(format!("{empty:?}"), "UnresolvedExtentMapRoot(EMPTY)");
+
+        let root = UnresolvedExtentMapRoot::from_record_value(0x0123_4567_89ab_cdef);
+        assert!(!root.is_empty());
+        assert_eq!(root.record_value(), 0x0123_4567_89ab_cdef);
+        assert_eq!(
+            format!("{root}"),
+            "UnresolvedExtentMapRoot(record_value=0x0123456789abcdef)"
+        );
+        assert_eq!(
+            format!("{root:?}"),
+            "UnresolvedExtentMapRoot(record_value=0x0123456789abcdef)"
+        );
+    }
+
     // ── CleanupWorkItemV1 ─────────────────────────────────────────────
 
     #[test]
     fn cleanup_work_item_new() {
-        let root = BtreeRootPointer(42);
+        let root = UnresolvedExtentMapRoot::from_record_value(42);
         let item = CleanupWorkItemV1::new(100, WorkItemKind::UnlinkFree, 10, root, 4096);
         assert_eq!(item.magic, WORK_ITEM_MAGIC);
         assert_eq!(item.inode_id, 100);
         assert_eq!(item.kind, WorkItemKind::UnlinkFree);
         assert_eq!(item.created_commit_group, 10);
-        assert_eq!(item.extent_map_root, BtreeRootPointer(42));
+        assert_eq!(item.extent_map_root, root);
         assert_eq!(item.bytes_to_free_estimate, 4096);
         assert_eq!(item.extents_processed, 0);
         assert!(!item.is_complete());
@@ -707,7 +786,8 @@ mod tests {
             WorkItemKind::SnapDelete,
             WorkItemKind::PunchHoleFree,
         ] {
-            let mut item = CleanupWorkItemV1::new(100, kind, 10, BtreeRootPointer(42), 4096);
+            let root = UnresolvedExtentMapRoot::from_record_value(42);
+            let mut item = CleanupWorkItemV1::new(100, kind, 10, root, 4096);
             item.cursor[0] = u8::from(kind);
             item.cursor[63] = 0xA5;
             item.extents_processed = 3;
@@ -716,6 +796,8 @@ mod tests {
             let bytes = item.to_bytes();
             let decoded = CleanupWorkItemV1::from_bytes(&bytes).unwrap();
 
+            assert_eq!(&bytes[25..33], &42_u64.to_be_bytes());
+            assert_eq!(decoded.extent_map_root, root);
             assert_eq!(decoded, item);
             assert_eq!(decoded.to_bytes(), bytes);
         }
@@ -817,8 +899,13 @@ mod tests {
 
     #[test]
     fn cleanup_work_item_validate_magic() {
-        let mut item =
-            CleanupWorkItemV1::new(1, WorkItemKind::TruncateFree, 2, BtreeRootPointer::EMPTY, 0);
+        let mut item = CleanupWorkItemV1::new(
+            1,
+            WorkItemKind::TruncateFree,
+            2,
+            UnresolvedExtentMapRoot::EMPTY,
+            0,
+        );
         assert!(item.validate_magic());
 
         // Corrupt magic
@@ -832,7 +919,7 @@ mod tests {
             1,
             WorkItemKind::TruncateFree,
             1,
-            BtreeRootPointer::EMPTY,
+            UnresolvedExtentMapRoot::EMPTY,
             100,
         );
         assert!(!item.is_complete());
@@ -857,8 +944,13 @@ mod tests {
 
     #[test]
     fn cleanup_work_item_validate_new_rejects_partial() {
-        let mut item =
-            CleanupWorkItemV1::new(1, WorkItemKind::UnlinkFree, 1, BtreeRootPointer::EMPTY, 0);
+        let mut item = CleanupWorkItemV1::new(
+            1,
+            WorkItemKind::UnlinkFree,
+            1,
+            UnresolvedExtentMapRoot::EMPTY,
+            0,
+        );
         assert!(item.validate_new());
 
         // Non-zero extents_processed fails validate_new
@@ -878,7 +970,7 @@ mod tests {
         assert_eq!(item.inode_id, 0);
         assert_eq!(item.kind, WorkItemKind::UnlinkFree);
         assert_eq!(item.created_commit_group, 0);
-        assert_eq!(item.extent_map_root, BtreeRootPointer::EMPTY);
+        assert_eq!(item.extent_map_root, UnresolvedExtentMapRoot::EMPTY);
         assert_eq!(item.cursor, [0u8; CURSOR_SIZE]);
         assert_eq!(item.bytes_to_free_estimate, 0);
         assert_eq!(item.extents_processed, 0);
@@ -892,7 +984,7 @@ mod tests {
             42,
             WorkItemKind::TruncateFree,
             5,
-            BtreeRootPointer::EMPTY,
+            UnresolvedExtentMapRoot::EMPTY,
             8192,
         );
         let s = format!("{item}");
@@ -900,6 +992,7 @@ mod tests {
         assert!(s.contains("inode=42"));
         assert!(s.contains("truncate_free"));
         assert!(s.contains("commit_group=5"));
+        assert!(s.contains("root=UnresolvedExtentMapRoot(EMPTY)"));
         assert!(s.contains("estimate=8192"));
     }
 
@@ -937,7 +1030,7 @@ mod tests {
             u64::MAX,
             WorkItemKind::PunchHoleFree,
             u64::MAX,
-            BtreeRootPointer(u64::MAX),
+            UnresolvedExtentMapRoot::from_record_value(u64::MAX),
             u64::MAX,
         );
         assert!(item.validate_magic());
@@ -964,7 +1057,7 @@ mod tests {
             WorkItemKind::SnapDelete,
             WorkItemKind::PunchHoleFree,
         ] {
-            let item = CleanupWorkItemV1::new(1, kind, 1, BtreeRootPointer::EMPTY, 0);
+            let item = CleanupWorkItemV1::new(1, kind, 1, UnresolvedExtentMapRoot::EMPTY, 0);
             assert_eq!(item.kind, kind);
             assert!(item.validate_new());
         }

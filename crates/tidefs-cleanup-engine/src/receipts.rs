@@ -399,10 +399,10 @@ fn is_generic_reason(reason: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tidefs_types_deferred_cleanup_core::BtreeRootPointer;
+    use tidefs_types_deferred_cleanup_core::UnresolvedExtentMapRoot;
 
     fn item(kind: WorkItemKind, generation: u64) -> CleanupWorkItemV1 {
-        CleanupWorkItemV1::new(42, kind, generation, BtreeRootPointer::EMPTY, 4096)
+        CleanupWorkItemV1::new(42, kind, generation, UnresolvedExtentMapRoot::EMPTY, 4096)
     }
 
     fn receipt(decision: CleanupReplayDecision) -> CleanupReplayDecisionReceipt {

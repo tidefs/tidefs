@@ -16,8 +16,7 @@ use std::fmt;
 
 use tidefs_btree::BPlusTree;
 use tidefs_commit_group::CommitGroupStore;
-use tidefs_types_dataset_feature_flags_core::BtreeRootPointer;
-use tidefs_types_deferred_cleanup_core::CleanupWorkItemV1;
+use tidefs_types_deferred_cleanup_core::{CleanupWorkItemV1, UnresolvedExtentMapRoot};
 pub mod ledger;
 
 // ---------------------------------------------------------------------------
@@ -759,7 +758,7 @@ fn deserialize_page(bytes: &[u8]) -> Result<Vec<(u64, CleanupWorkItemV1)>, Strin
 /// [8..16)   inode_id u64 BE
 /// [16]      kind u8
 /// [17..25)  created_commit_group u64 BE
-/// [25..33)  extent_map_root u64 BE (BtreeRootPointer.0)
+/// [25..33)  extent_map_root unresolved record value u64 BE
 /// [33..41)  reserved/padding (u64 zero)
 /// [41..105) cursor [u8; 64]
 /// [105..113) bytes_to_free_estimate u64 BE
@@ -773,7 +772,7 @@ fn serialize_work_item(item: &CleanupWorkItemV1) -> [u8; 128] {
     buf[8..16].copy_from_slice(&item.inode_id.to_be_bytes());
     buf[16] = item.kind as u8;
     buf[17..25].copy_from_slice(&item.created_commit_group.to_be_bytes());
-    buf[25..33].copy_from_slice(&item.extent_map_root.0.to_be_bytes());
+    buf[25..33].copy_from_slice(&item.extent_map_root.record_value().to_be_bytes());
     // bytes 33..41: reserved (zero)
     buf[41..105].copy_from_slice(&item.cursor);
     buf[105..113].copy_from_slice(&item.bytes_to_free_estimate.to_be_bytes());
@@ -829,7 +828,7 @@ fn deserialize_work_item(bytes: &[u8]) -> Result<CleanupWorkItemV1, String> {
         inode_id,
         kind,
         created_commit_group,
-        extent_map_root: BtreeRootPointer(root_ptr),
+        extent_map_root: UnresolvedExtentMapRoot::from_record_value(root_ptr),
         cursor,
         bytes_to_free_estimate,
         extents_processed,
@@ -1436,7 +1435,7 @@ pub fn make_segment_cleanup_item(segment_id: u64, commit_group: u64) -> CleanupW
         segment_id,
         tidefs_types_deferred_cleanup_core::WorkItemKind::TruncateFree,
         commit_group,
-        BtreeRootPointer::EMPTY,
+        UnresolvedExtentMapRoot::EMPTY,
         0, // bytes_to_free_estimate: filled by caller if needed
     )
 }
@@ -1473,7 +1472,13 @@ mod tests {
     }
 
     fn make_work_item(inode_id: u64, kind: WorkItemKind, commit_group: u64) -> CleanupWorkItemV1 {
-        CleanupWorkItemV1::new(inode_id, kind, commit_group, BtreeRootPointer::EMPTY, 0)
+        CleanupWorkItemV1::new(
+            inode_id,
+            kind,
+            commit_group,
+            UnresolvedExtentMapRoot::EMPTY,
+            0,
+        )
     }
 
     fn cleanup_page(store: &MemCommitGroupStore) -> &[u8] {
@@ -1895,9 +1900,9 @@ mod tests {
     }
 
     #[test]
-    fn roundtrip_preserves_btree_root_pointer() {
+    fn roundtrip_preserves_unresolved_extent_map_record_value() {
         let mut item = make_work_item(1, WorkItemKind::UnlinkFree, 1);
-        item.extent_map_root = BtreeRootPointer(0xDEAD_BEEF_CAFE_BABE);
+        item.extent_map_root = UnresolvedExtentMapRoot::from_record_value(0xDEAD_BEEF_CAFE_BABE);
 
         let mut q = CleanupQueue::new();
         q.enqueue(item);
@@ -1907,7 +1912,7 @@ mod tests {
         let q2 = CleanupQueue::open(&store).expect("open");
         assert_eq!(
             q2.entries()[0].1.extent_map_root,
-            BtreeRootPointer(0xDEAD_BEEF_CAFE_BABE)
+            UnresolvedExtentMapRoot::from_record_value(0xDEAD_BEEF_CAFE_BABE)
         );
     }
 
@@ -2115,7 +2120,7 @@ mod tests {
             0xCAFE,
             WorkItemKind::PunchHoleFree,
             99,
-            BtreeRootPointer(0xBEEF),
+            UnresolvedExtentMapRoot::from_record_value(0xBEEF),
             8192,
         );
         item.cursor[10] = 0x42;
@@ -2128,7 +2133,10 @@ mod tests {
         assert_eq!(restored.inode_id, 0xCAFE);
         assert_eq!(restored.kind, WorkItemKind::PunchHoleFree);
         assert_eq!(restored.created_commit_group, 99);
-        assert_eq!(restored.extent_map_root, BtreeRootPointer(0xBEEF));
+        assert_eq!(
+            restored.extent_map_root,
+            UnresolvedExtentMapRoot::from_record_value(0xBEEF)
+        );
         assert_eq!(restored.cursor, item.cursor);
         assert_eq!(restored.bytes_to_free_estimate, 8192);
         assert_eq!(restored.extents_processed, 7);
