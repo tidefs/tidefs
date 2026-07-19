@@ -9,6 +9,7 @@
 //! candidate devices, grouping them by pool_guid, validating topology
 //! consistency, and selecting the recovery transaction group.
 
+use std::io::{Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use crate::pool_label::{
@@ -424,13 +425,6 @@ impl PoolImporter {
             device_path.to_path_buf()
         };
 
-        let metadata = std::fs::metadata(&label_path).map_err(|e| ImportError::Io {
-            operation: "scan_metadata",
-            path: label_path.clone(),
-            source: e,
-        })?;
-        let device_size = metadata.len();
-
         let mut file = std::fs::OpenOptions::new()
             .read(true)
             .open(&label_path)
@@ -439,6 +433,20 @@ impl PoolImporter {
                 path: label_path.clone(),
                 source: e,
             })?;
+
+        // Linux block-special inode metadata can report a zero length. The
+        // opened byte device's seekable end is the capacity authority used to
+        // locate its tail label and populate lifecycle capacity evidence.
+        let device_size = file.seek(SeekFrom::End(0)).map_err(|e| ImportError::Io {
+            operation: "scan_device_size",
+            path: label_path.clone(),
+            source: e,
+        })?;
+        file.seek(SeekFrom::Start(0)).map_err(|e| ImportError::Io {
+            operation: "scan_seek_label0",
+            path: label_path.clone(),
+            source: e,
+        })?;
 
         let mut buf = [0u8; POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE];
 
@@ -467,9 +475,8 @@ impl PoolImporter {
                             path: label_path.clone(),
                             source: e,
                         })?;
-                    use std::io::Seek;
                     file2
-                        .seek(std::io::SeekFrom::Start(offset))
+                        .seek(SeekFrom::Start(offset))
                         .map_err(|e| ImportError::Io {
                             operation: "scan_seek_label1",
                             path: label_path.clone(),
@@ -786,6 +793,48 @@ mod tests {
         assert_eq!(
             decoded.redundancy_policy,
             PoolRedundancyPolicy::replicated(2)
+        );
+    }
+
+    #[test]
+    fn scan_candidates_reads_tail_label_at_seek_reported_capacity() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let device_path = dir.path().join("device.img");
+        let device_size = 2 * POOL_LABEL_SIZE as u64;
+        let mut label = PoolLabelV1::new([0xC3; 16], [0xD4; 16], "tail-evidence");
+        label.pool_state = LabelPoolState::Exported;
+        label.topology_generation = 9;
+        label.device_capacity_bytes = device_size;
+
+        let mut encoded = [0u8; POOL_LABEL_V1_EXT_WIRE_SIZE];
+        encode_label(&label, &mut encoded).expect("encode tail label");
+
+        let mut device = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&device_path)
+            .expect("open device image");
+        device.set_len(device_size).expect("size device image");
+        device
+            .seek(SeekFrom::Start(device_size - POOL_LABEL_SIZE as u64))
+            .expect("seek tail label");
+        device.write_all(&encoded).expect("write tail label");
+        drop(device);
+
+        let pools = PoolImporter::scan_candidates(&[device_path]).expect("scan tail label");
+
+        assert_eq!(pools.len(), 1);
+        assert_eq!(pools[0].devices[0].label_copy, 1);
+        assert_eq!(pools[0].devices[0].device_size, device_size);
+        assert_eq!(
+            pools[0]
+                .lifecycle_evidence(PoolLifecycleAction::Import)
+                .capacity_bytes,
+            device_size
         );
     }
 
