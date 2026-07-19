@@ -61,6 +61,55 @@ fn mount_or_skip() -> Option<MountHarness> {
     }
 }
 
+// ── mounted write/fsync crash evidence ───────────────────────────────────
+
+/// Exercise the bounded mounted FUSE durability row used by issue #2315.
+///
+/// The row writes through a live daemon, completes `fsync`, reads the mounted
+/// path, SIGKILLs that daemon, remounts the same store, and verifies the last
+/// completed fsync payload. It intentionally fails closed when the mounted
+/// runtime substrate is unavailable; callers collecting claim evidence must
+/// record that refusal instead of treating a skipped local fixture as runtime
+/// proof.
+#[test]
+#[ignore = "requires an explicit mounted FUSE runtime row"]
+fn mounted_write_fsync_read_crash_recover() {
+    let mut harness = MountHarness::new_or_fail("mounted_write_fsync_read_crash_recover");
+    let path = "issue-2315-fsync-crash.bin";
+    let payload = patterned_bytes(2_315, 4_096);
+    let payload_digest = blake3_hex(&payload);
+    let daemon_pid = harness.daemon_pid();
+
+    harness
+        .create_file(path, &payload)
+        .expect("write mounted crash-evidence payload");
+    harness.fsync_file(path).expect("fsync mounted payload");
+
+    let read_before_crash = harness
+        .read_file(path)
+        .expect("read mounted payload before crash");
+    assert_eq!(
+        read_before_crash, payload,
+        "mounted read before crash must return the fsynced payload"
+    );
+
+    harness
+        .crash_and_remount()
+        .expect("SIGKILL daemon and remount the same backing store");
+
+    let recovered = harness
+        .read_file(path)
+        .expect("read mounted payload after crash recovery");
+    assert_eq!(
+        recovered, payload,
+        "recovered mounted payload must match the last completed fsync"
+    );
+
+    eprintln!(
+        "mounted fsync crash evidence: backend=MountHarness daemon_pid={daemon_pid} path=/{path} content_digest=blake3:{payload_digest} outcome=pass"
+    );
+}
+
 // ── test 1: operation-mix crash-recovery ──────────────────────────────────
 //
 // Sequence: create+write files, mkdir, symlink, hardlink, rename,
