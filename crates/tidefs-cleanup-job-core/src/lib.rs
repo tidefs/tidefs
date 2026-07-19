@@ -2020,10 +2020,10 @@ impl DeferredCleanupJob for BtreeCleanupDeferredJob {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tidefs_types_deferred_cleanup_core::{BtreeRootPointer, WorkItemKind};
+    use tidefs_types_deferred_cleanup_core::{UnresolvedExtentMapRoot, WorkItemKind};
 
     fn make_item(inode_id: u64, kind: WorkItemKind, bytes: u64) -> CleanupWorkItemV1 {
-        CleanupWorkItemV1::new(inode_id, kind, 1, BtreeRootPointer::EMPTY, bytes)
+        CleanupWorkItemV1::new(inode_id, kind, 1, UnresolvedExtentMapRoot::EMPTY, bytes)
     }
 
     fn make_items(count: u64) -> Vec<CleanupWorkItemV1> {
@@ -2050,7 +2050,7 @@ mod tests {
         let receipt = CleanupJobReceipt::completed(
             JobId(7),
             CleanupWorkItemId(99),
-            "processed frozen extent map root",
+            "processed cleanup work item",
             2,
             CleanupReceiptValidationTier::CargoUnit,
         )
@@ -2062,7 +2062,7 @@ mod tests {
         let json = receipt.to_json_string().unwrap();
         assert_eq!(
             json,
-            r#"{"job_id":7,"work_item_id":99,"state":"completed","reason":"processed frozen extent map root","attempt_generation":2,"validation_tier":"cargo-unit","artifact_digest":{"algorithm":"blake3","hex":"0123456789abcdef"}}"#
+            r#"{"job_id":7,"work_item_id":99,"state":"completed","reason":"processed cleanup work item","attempt_generation":2,"validation_tier":"cargo-unit","artifact_digest":{"algorithm":"blake3","hex":"0123456789abcdef"}}"#
         );
 
         let decoded = CleanupJobReceipt::from_json_slice(json.as_bytes()).unwrap();

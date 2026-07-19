@@ -402,7 +402,7 @@ where
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use tidefs_types_deferred_cleanup_core::BtreeRootPointer;
+    use tidefs_types_deferred_cleanup_core::UnresolvedExtentMapRoot;
 
     // ── Mock implementations ─────────────────────────────────────────
 
@@ -527,7 +527,7 @@ mod tests {
     }
 
     fn make_item(inode: u64, kind: WorkItemKind, bytes: u64) -> CleanupWorkItemV1 {
-        CleanupWorkItemV1::new(inode, kind, 1, BtreeRootPointer::EMPTY, bytes)
+        CleanupWorkItemV1::new(inode, kind, 1, UnresolvedExtentMapRoot::EMPTY, bytes)
     }
 
     fn make_item_with_cursor(
@@ -537,7 +537,8 @@ mod tests {
         parent_inode: u64,
         name: &str,
     ) -> CleanupWorkItemV1 {
-        let mut item = CleanupWorkItemV1::new(inode, kind, 1, BtreeRootPointer::EMPTY, bytes);
+        let mut item =
+            CleanupWorkItemV1::new(inode, kind, 1, UnresolvedExtentMapRoot::EMPTY, bytes);
         let mut cursor = [0u8; 64];
         cursor[0..8].copy_from_slice(&parent_inode.to_le_bytes());
         let name_bytes = name.as_bytes();

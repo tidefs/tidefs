@@ -7,7 +7,9 @@ use tidefs_background_scheduler::{
     BackgroundScheduler, BackgroundService, IncrementalJobAdapter, ServiceBudget, ServicePriority,
 };
 use tidefs_cleanup_job_core::CleanupJob;
-use tidefs_types_deferred_cleanup_core::{BtreeRootPointer, CleanupWorkItemV1, WorkItemKind};
+use tidefs_types_deferred_cleanup_core::{
+    CleanupWorkItemV1, UnresolvedExtentMapRoot, WorkItemKind,
+};
 use tidefs_types_incremental_job_core::{
     Checkpoint, IncrementalJob, JobError, JobId, JobKind, JobProgress, StepResult, WorkBudget,
 };
@@ -15,7 +17,7 @@ use tidefs_types_incremental_job_core::{
 // ── Helpers ───────────────────────────────────────────────────────────
 
 fn make_item(inode_id: u64, kind: WorkItemKind, bytes: u64) -> CleanupWorkItemV1 {
-    CleanupWorkItemV1::new(inode_id, kind, 1, BtreeRootPointer::EMPTY, bytes)
+    CleanupWorkItemV1::new(inode_id, kind, 1, UnresolvedExtentMapRoot::EMPTY, bytes)
 }
 
 fn make_items(count: u64) -> Vec<CleanupWorkItemV1> {
