@@ -573,7 +573,7 @@ pub struct BudgetDomain {
     pub domain_name: String,
     /// Total capacity in bytes.
     pub total_capacity_bytes: u64,
-    /// Quota ceiling (hard limit, like ZFS quota). None = no hard limit.
+    /// Optional ceiling applied when computing available product bytes.
     pub quota_ceiling_bytes: Option<u64>,
     /// Claim ledger for this domain.
     pub claim_ledger: ClaimLedger,
