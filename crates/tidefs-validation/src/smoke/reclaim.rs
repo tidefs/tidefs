@@ -287,6 +287,7 @@ impl DiscardCapabilityValidationRow {
 #[derive(Clone, Copy)]
 struct CryptographicEraseKeyLifecycleRefusalValidationRow {
     validation_tier: &'static str,
+    active_full_proof_inputs: bool,
     active_full_proof_refused: bool,
     refusal: &'static str,
     non_claim: &'static str,
@@ -303,14 +304,17 @@ struct CryptographicEraseKeyLifecycleRefusalValidationRow {
 
 impl CryptographicEraseKeyLifecycleRefusalValidationRow {
     fn source_backed() -> Self {
-        let assessment = assess_cryptographic_erase_boundary(
-            MountedPoolKeyAccessState::Active,
-            CryptographicEraseEvidence::encrypted_with_full_proof(),
-        );
+        let key_state = MountedPoolKeyAccessState::Active;
+        let evidence = CryptographicEraseEvidence::encrypted_with_full_proof();
+        let active_full_proof_inputs = key_state == MountedPoolKeyAccessState::Active
+            && evidence == CryptographicEraseEvidence::encrypted_with_full_proof();
+        let assessment = assess_cryptographic_erase_boundary(key_state, evidence);
 
         Self {
             validation_tier: "cargo-unit",
-            active_full_proof_refused: !assessment.eligible_for_claim_review()
+            active_full_proof_inputs,
+            active_full_proof_refused: active_full_proof_inputs
+                && !assessment.eligible_for_claim_review()
                 && assessment.refusal
                     == Some(CryptographicEraseRefusal::KeyLifecycleNotDestroyedOrRevoked),
             refusal: assessment
@@ -347,6 +351,7 @@ impl CryptographicEraseKeyLifecycleRefusalValidationRow {
             concat!(
                 "row=device-lifecycle.cryptographic-erase.active-key-refusal;",
                 "validation_tier={};",
+                "active_full_proof_inputs={};",
                 "active_full_proof_refused={};",
                 "refusal={};",
                 "non_claim={};",
@@ -361,6 +366,7 @@ impl CryptographicEraseKeyLifecycleRefusalValidationRow {
                 "decommissioning={}",
             ),
             self.validation_tier,
+            self.active_full_proof_inputs,
             self.active_full_proof_refused,
             self.refusal,
             self.non_claim,
@@ -467,6 +473,10 @@ pub fn run_reclaim_smoke() -> SmokeHarness {
         "validation.matrix.cryptographic_erase_key_lifecycle_refusal",
         0,
         cryptographic_erase_row.encode(),
+    );
+    h.assert_ev(
+        "cryptographic erase matrix records exact active/full-proof source inputs",
+        cryptographic_erase_row.active_full_proof_inputs,
     );
     h.assert_ev(
         "cryptographic erase matrix refuses an active key even with full source evidence",
@@ -869,6 +879,10 @@ mod tests {
             Some("device-lifecycle.cryptographic-erase.active-key-refusal")
         );
         assert_eq!(fields.get("validation_tier").copied(), Some("cargo-unit"));
+        assert_eq!(
+            fields.get("active_full_proof_inputs").copied(),
+            Some("true")
+        );
         assert_eq!(
             fields.get("active_full_proof_refused").copied(),
             Some("true")
