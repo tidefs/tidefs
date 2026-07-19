@@ -7939,6 +7939,12 @@ impl FuseVfsAdapter {
         if size == 0 {
             return Ok(Vec::new());
         }
+        // Clipped extent entries retain the extent's base locator but not its
+        // original logical start. A nonzero query therefore cannot calculate
+        // the carrier offset safely and must use the engine read path.
+        if offset != 0 {
+            return Ok(Vec::new());
+        }
         let requested_end = offset.saturating_add(size as u64);
         let (end, entries) = {
             let e = self.engine.lock().unwrap();
@@ -34174,6 +34180,12 @@ mod tests {
             )
             .expect("read across EOF");
         assert_eq!(crossing_eof, &payload[payload.len() - 2..]);
+
+        let oversized_from_start = fixture
+            .adapter
+            .dispatch_read(&ctx, inode.get(), adapter_fh, 0, 16, None)
+            .expect("oversized block-volume read from start");
+        assert_eq!(oversized_from_start, payload);
     }
 
     /// When the requested range overlaps dirty (unflushed) state, the
