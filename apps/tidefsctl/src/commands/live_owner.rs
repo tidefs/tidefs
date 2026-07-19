@@ -968,6 +968,7 @@ fn live_owner_status_refusal_carrier(
     detail: Option<&serde_json::Value>,
 ) -> Option<super::operator_truth::OperatorTruthCarrier> {
     let command = match (route.command, route.operation) {
+        ("pool", "status") => "pool",
         ("device", "status") => "device",
         _ => return None,
     };
@@ -2517,6 +2518,106 @@ mod tests {
         assert!(output.contains("no status facts were accepted"));
         assert!(output.contains("source_classification: source:live-owner"));
         assert!(!output.trim_start().starts_with('{'));
+    }
+
+    #[test]
+    fn live_pool_status_reaches_owner_and_classifies_typed_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("owner.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        write_owner_manifest(dir.path(), &socket_path);
+        let owner_error = LivePoolAdminError::unsupported_command("pool", "status");
+        let machine_json = serde_json::to_string(&owner_error.kind).unwrap();
+        let handle = spawn_owner_response(
+            listener,
+            LivePoolAdminResponse::error_machine_json(
+                owner_error.exit_code,
+                owner_error.message,
+                machine_json,
+            ),
+        );
+        let route = LivePoolRoute {
+            command: "pool",
+            operation: "status",
+            pool: "tank",
+            pool_uuid: Some([0x42; 16]),
+            json: true,
+            args: LivePoolAdminArgs::default(),
+        };
+
+        let err = send_live_owner_request_at(dir.path(), &route).unwrap_err();
+        let request = handle.join().unwrap();
+
+        assert_eq!(request.command, LivePoolAdminCommand::PoolStatus);
+        assert_eq!(request.output, LivePoolAdminOutput::MachineJson);
+        let (message, detail) = match err {
+            LiveOwnerRequestError::Owner {
+                exit_code,
+                message,
+                detail: Some(detail),
+            } => {
+                assert_eq!(exit_code, 1);
+                assert_eq!(detail["kind"], "unsupported_command");
+                assert_eq!(detail["command"], "pool");
+                assert_eq!(detail["operation"], "status");
+                (message, detail)
+            }
+            other => panic!("expected typed live-owner refusal, got {other:?}"),
+        };
+
+        let mut value = live_owner_error_detail_json(&route, &message, &detail);
+
+        annotate_live_owner_status_refusal_json(&route, Some(&detail), &mut value);
+
+        assert_eq!(value["source_classification"], "source:live-owner");
+        assert_eq!(value["owner_response"], "refused");
+        assert_eq!(value["operator_truth"]["scope"], "local-pool");
+        assert_eq!(value["operator_truth"]["evidence_state"], "refused");
+        assert!(value["operator_truth"]
+            .get("distributed_surface_record")
+            .is_none());
+
+        let output = live_owner_status_refusal_human_lines(&route, Some(&detail)).join("\n");
+        assert!(output.contains("path:       tidefsctl pool status"));
+        assert!(output.contains("scope:      local-pool"));
+        assert!(output.contains("evidence:   refused"));
+        assert!(output.contains("no pool status facts were accepted"));
+        assert!(!output.trim_start().starts_with('{'));
+    }
+
+    #[test]
+    fn pool_status_refusal_carrier_requires_exact_owner_detail() {
+        let route = LivePoolRoute {
+            command: "pool",
+            operation: "status",
+            pool: "tank",
+            pool_uuid: None,
+            json: true,
+            args: LivePoolAdminArgs::default(),
+        };
+
+        for detail in [
+            None,
+            Some(serde_json::json!({"kind": "malformed"})),
+            Some(serde_json::json!({
+                "kind": "unsupported_command",
+                "command": "device",
+                "operation": "status",
+            })),
+            Some(serde_json::json!({
+                "kind": "unsupported_command",
+                "command": "pool",
+                "operation": "remove",
+            })),
+        ] {
+            let mut value = serde_json::json!({"ok": false});
+
+            annotate_live_owner_status_refusal_json(&route, detail.as_ref(), &mut value);
+
+            assert!(value.get("owner_response").is_none());
+            assert!(value.get("operator_truth").is_none());
+            assert!(live_owner_status_refusal_human_lines(&route, detail.as_ref()).is_empty());
+        }
     }
 
     #[test]

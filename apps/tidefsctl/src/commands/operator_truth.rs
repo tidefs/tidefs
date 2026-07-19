@@ -140,60 +140,28 @@ impl OperatorTruthCarrier {
         operation: &'static str,
         pool_name: &str,
     ) -> Self {
+        let (scope, refusal) = match (command, operation) {
+            ("pool", "status") => (
+                OperatorTruthScope::LocalPool,
+                "live-owner status response was refused; no pool status facts were accepted",
+            ),
+            _ => (
+                OperatorTruthScope::Distributed,
+                "live-owner status response was refused; no status facts were accepted",
+            ),
+        };
         Self {
             command,
             operation,
             pool_name: pool_name.to_string(),
-            scope: OperatorTruthScope::Distributed,
+            scope,
             evidence_state: OperatorTruthEvidenceState::Refused,
             source: TruthViewSourceClass::RuntimeMirror,
             cut: TruthViewCutClass::LiveWindow,
             provenance: TruthViewProvenanceClass::LiveMirror,
             exactness: TruthViewExactnessClass::DegradedOrPartial,
             freshness: TruthViewFreshnessClass::Refused,
-            refusal: Some("live-owner status response was refused; no status facts were accepted"),
-        }
-    }
-
-    #[must_use]
-    pub(crate) fn stale_non_live(
-        command: &'static str,
-        operation: &'static str,
-        pool_name: &str,
-    ) -> Self {
-        Self {
-            command,
-            operation,
-            pool_name: pool_name.to_string(),
-            scope: OperatorTruthScope::Distributed,
-            evidence_state: OperatorTruthEvidenceState::Stale,
-            source: TruthViewSourceClass::RunbookState,
-            cut: TruthViewCutClass::ArchiveRecall,
-            provenance: TruthViewProvenanceClass::ManifestRecall,
-            exactness: TruthViewExactnessClass::DegradedOrPartial,
-            freshness: TruthViewFreshnessClass::Stale,
-            refusal: Some("status evidence is stale and is not live operator truth"),
-        }
-    }
-
-    #[must_use]
-    pub(crate) fn deterministic_non_live(
-        command: &'static str,
-        operation: &'static str,
-        pool_name: &str,
-    ) -> Self {
-        Self {
-            command,
-            operation,
-            pool_name: pool_name.to_string(),
-            scope: OperatorTruthScope::Distributed,
-            evidence_state: OperatorTruthEvidenceState::DeterministicNonLive,
-            source: TruthViewSourceClass::SemanticTrace,
-            cut: TruthViewCutClass::TraceReplay,
-            provenance: TruthViewProvenanceClass::SemanticTrace,
-            exactness: TruthViewExactnessClass::SourceBoundProjection,
-            freshness: TruthViewFreshnessClass::DeterministicNonLive,
-            refusal: Some("deterministic replay/demo evidence is not live operator truth"),
+            refusal: Some(refusal),
         }
     }
 
@@ -514,40 +482,6 @@ mod tests {
         assert_eq!(
             json["truth_bundle_record"]["answer_kind"],
             "answer.response_registry.bundle.k0"
-        );
-    }
-
-    #[test]
-    fn carrier_boundary_names_stale_and_deterministic_non_live() {
-        let stale = OperatorTruthCarrier::stale_non_live("cluster", "status", "alpha");
-        let deterministic =
-            OperatorTruthCarrier::deterministic_non_live("cluster", "status", "alpha");
-
-        assert_eq!(stale.evidence_state, OperatorTruthEvidenceState::Stale);
-        assert_eq!(stale.freshness, TruthViewFreshnessClass::Stale);
-        assert_eq!(
-            deterministic.evidence_state,
-            OperatorTruthEvidenceState::DeterministicNonLive
-        );
-        assert_eq!(
-            deterministic.freshness,
-            TruthViewFreshnessClass::DeterministicNonLive
-        );
-        assert_eq!(
-            stale
-                .distributed_surface_record()
-                .expect("distributed stale carrier has a surface record")
-                .status()
-                .unwrap(),
-            TruthViewDistributedOperatorStatusClass::Degraded
-        );
-        assert_eq!(
-            deterministic
-                .distributed_surface_record()
-                .expect("distributed deterministic carrier has a surface record")
-                .status()
-                .unwrap(),
-            TruthViewDistributedOperatorStatusClass::Degraded
         );
     }
 }
