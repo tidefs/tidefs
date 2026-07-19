@@ -6459,8 +6459,10 @@ impl FuseVfsAdapter {
                                 length,
                             } => {
                                 match bv.read_bytes(*physical_offset, *length as u64) {
-                                    Ok(chunk) => buf.extend_from_slice(&chunk),
-                                    Err(_) => {
+                                    Ok(chunk) if chunk.len() == *length => {
+                                        buf.extend_from_slice(&chunk);
+                                    }
+                                    Ok(_) | Err(_) => {
                                         // Block-volume read failed; fall back to engine.
                                         drop(bv_guard);
                                         let e = self.engine.lock().unwrap();
@@ -6990,6 +6992,8 @@ impl FuseVfsAdapter {
                     .lock()
                     .unwrap()
                     .record_write_buf(written);
+            }
+            if written > 0 && !sparse_zero_noop && (is_writeback_cached || posix_direct_io) {
                 let Ok(written_len) = usize::try_from(written) else {
                     release_fallback(&mut fallback_to_release);
                     return Err(Errno::EIO);
@@ -7014,6 +7018,11 @@ impl FuseVfsAdapter {
                         release_fallback(&mut fallback_to_release);
                         return Err(errno);
                     }
+                    self.record_block_volume_dirty_after_direct_write(
+                        ino,
+                        effective_offset as u64,
+                        written,
+                    );
                 } else if let Err(errno) = self
                     .reconcile_write_through_dirty_range_without_block_volume(
                         ino,
@@ -7174,6 +7183,11 @@ impl FuseVfsAdapter {
                             u64::from(written),
                             AuthoritativeRangePayload::Bytes(written_data),
                         )?;
+                        self.record_block_volume_dirty_after_direct_write(
+                            ino,
+                            effective_offset as u64,
+                            written,
+                        );
                     }
                 }
             }
@@ -7208,6 +7222,21 @@ impl FuseVfsAdapter {
     /// handle must not observe stale cached data.
     fn invalidate_caches_after_direct_write(&self, ino: u64, offset: u64, length: u64) {
         self.invalidate_caches_after_engine_data_mutation(ino, offset, length);
+    }
+
+    fn record_block_volume_dirty_after_direct_write(&self, ino: u64, offset: u64, written: u32) {
+        if written == 0 || self.block_volume.lock().unwrap().is_none() {
+            return;
+        }
+        self.dirty_state
+            .lock()
+            .unwrap()
+            .entry(ino)
+            .or_default()
+            .mark_dirty(offset, written);
+        let mut writeback_cache = self.writeback_cache.lock().unwrap();
+        writeback_cache.insert(ino);
+        writeback_cache.mark_dirty(ino, u64::from(written));
     }
 
     /// Fence daemon read-side caches after an engine mutation changes visible
@@ -33393,6 +33422,20 @@ mod tests {
         }
     }
 
+    struct MisSizedReadBlockVolume {
+        data: Vec<u8>,
+    }
+
+    impl BlockVolumeWriteTarget for MisSizedReadBlockVolume {
+        fn write_bytes(&mut self, _offset: u64, _data: &[u8]) -> Result<(), Errno> {
+            Ok(())
+        }
+
+        fn read_bytes(&self, _offset: u64, _len: u64) -> Result<Vec<u8>, Errno> {
+            Ok(self.data.clone())
+        }
+    }
+
     fn adapter_fixture_with_mock_block_volume() -> (
         AdapterFixture,
         std::sync::Arc<std::sync::Mutex<MockBlockVolume>>,
@@ -33854,6 +33897,194 @@ mod tests {
                 readback, b"0123XYZ789",
                 "every dirty owner must bypass stale block-volume bytes"
             );
+        }
+    }
+
+    #[test]
+    fn block_volume_mis_sized_read_falls_back_to_engine() {
+        let baseline = b"engine data";
+        for carrier_data in [
+            baseline[..baseline.len() - 1].to_vec(),
+            vec![0; baseline.len() + 1],
+        ] {
+            let fixture = adapter_fixture();
+            let ctx = root_ctx();
+            let (inode, adapter_fh, _engine_fh) = create_adapter_file_handle(
+                &fixture.adapter,
+                &ctx,
+                b"mis-sized-block-read.bin",
+                libc::O_RDWR as u32,
+            );
+            fixture
+                .adapter
+                .dispatch_write(&ctx, inode.get(), adapter_fh, 0, baseline, 0)
+                .expect("engine write");
+            fixture
+                .adapter
+                .block_volume
+                .lock()
+                .unwrap()
+                .replace(Box::new(MisSizedReadBlockVolume { data: carrier_data }));
+
+            let readback = fixture
+                .adapter
+                .dispatch_read(
+                    &ctx,
+                    inode.get(),
+                    adapter_fh,
+                    0,
+                    baseline.len() as u32,
+                    None,
+                )
+                .expect("fallback read");
+            assert_eq!(readback, baseline);
+        }
+    }
+
+    #[test]
+    fn block_volume_direct_write_stays_dirty_until_fsync() {
+        for use_fallback_handle in [false, true] {
+            let (mut fixture, block_volume) = adapter_fixture_with_mock_block_volume();
+            fixture.adapter.writeback_cache_enabled = use_fallback_handle;
+            let ctx = root_ctx();
+            let (inode, buffered_fh, _engine_fh) = create_adapter_file_handle(
+                &fixture.adapter,
+                &ctx,
+                b"direct-write-block-volume.bin",
+                libc::O_RDWR as u32,
+            );
+            let baseline = vec![0x11; DIRECT_IO_ALIGNMENT as usize];
+            fixture
+                .adapter
+                .dispatch_write(&ctx, inode.get(), buffered_fh, 0, &baseline, 0)
+                .expect("baseline write");
+            fixture
+                .adapter
+                .dispatch_fsync(&ctx, inode.get(), buffered_fh)
+                .expect("baseline fsync");
+
+            let replacement = vec![0xAA; DIRECT_IO_ALIGNMENT as usize];
+            if use_fallback_handle {
+                let read_only = fixture
+                    .adapter
+                    .dispatch_open_entry(&ctx, inode.get(), libc::O_RDONLY as u32)
+                    .expect("open read-only handle");
+                fixture
+                    .adapter
+                    .dispatch_write_with_request_flags(
+                        &ctx,
+                        inode.get(),
+                        read_only.adapter_fh,
+                        0,
+                        &replacement,
+                        WriteDispatchFlags {
+                            write: 0,
+                            request_open: libc::O_WRONLY as u32 | libc::O_DIRECT as u32,
+                        },
+                    )
+                    .expect("fallback direct overwrite");
+            } else {
+                let direct_open = fixture
+                    .adapter
+                    .dispatch_open_entry(
+                        &ctx,
+                        inode.get(),
+                        libc::O_RDWR as u32 | libc::O_DIRECT as u32,
+                    )
+                    .expect("open direct writer");
+                fixture
+                    .adapter
+                    .dispatch_write(
+                        &ctx,
+                        inode.get(),
+                        direct_open.adapter_fh,
+                        0,
+                        &replacement,
+                        0,
+                    )
+                    .expect("direct overwrite");
+            }
+            assert!(
+                fixture
+                    .adapter
+                    .dirty_state
+                    .lock()
+                    .unwrap()
+                    .get(&inode.get())
+                    .is_some_and(|ranges| ranges.overlaps(0, replacement.len() as u64)),
+                "direct write must keep the stale block-volume range dirty"
+            );
+            assert_eq!(
+                fixture
+                    .adapter
+                    .writeback_cache
+                    .lock()
+                    .unwrap()
+                    .is_dirty(inode.get()),
+                Some(true),
+                "direct write must protect the inode reclaim projection"
+            );
+            assert_eq!(
+                block_volume
+                    .lock()
+                    .unwrap()
+                    .stored(0, baseline.len() as u64),
+                baseline,
+                "direct write must not silently refresh the block-volume mirror"
+            );
+
+            let readback = fixture
+                .adapter
+                .dispatch_read(
+                    &ctx,
+                    inode.get(),
+                    buffered_fh,
+                    0,
+                    replacement.len() as u32,
+                    None,
+                )
+                .expect("buffered read after direct write");
+            assert_eq!(readback, replacement);
+
+            fixture
+                .adapter
+                .dispatch_fsync(&ctx, inode.get(), buffered_fh)
+                .expect("direct-write fsync");
+            assert!(
+                !fixture
+                    .adapter
+                    .dirty_state
+                    .lock()
+                    .unwrap()
+                    .contains_key(&inode.get()),
+                "fsync must retire the block-volume dirty range"
+            );
+            assert_eq!(
+                fixture
+                    .adapter
+                    .writeback_cache
+                    .lock()
+                    .unwrap()
+                    .is_dirty(inode.get()),
+                Some(false),
+                "fsync must release the inode reclaim projection"
+            );
+            fixture.adapter.invalidate_read_cache_entry(inode.get());
+            fixture
+                .adapter
+                .invalidate_fuse_read_cache_inode(inode.get());
+            let clean_readback = fixture
+                .adapter
+                .dispatch_read(
+                    &ctx,
+                    inode.get(),
+                    buffered_fh,
+                    0,
+                    replacement.len() as u32,
+                    None,
+                )
+                .expect("clean block-volume read after fsync");
+            assert_eq!(clean_readback, replacement);
         }
     }
 
