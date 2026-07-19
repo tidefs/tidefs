@@ -2561,11 +2561,14 @@ impl DirtyRanges {
         &self.ranges
     }
     pub(crate) fn mark_dirty(&mut self, offset: u64, length: u32) {
+        self.mark_dirty_u64(offset, u64::from(length));
+    }
+    fn mark_dirty_u64(&mut self, offset: u64, length: u64) {
         if length == 0 {
             return;
         }
         let ns = offset;
-        let ne = offset.saturating_add(length as u64);
+        let ne = offset.saturating_add(length);
         let mut ms = ns;
         let mut me = ne;
         let mut fi = self.ranges.len();
@@ -8219,7 +8222,7 @@ impl FuseVfsAdapter {
 
         // Block-volume copying is not the final fsync durability boundary.
         // Retire its dirty projection only after every later stage succeeds.
-        let mut block_volume_dirty_state_flushed = false;
+        let mut block_volume_copy_completed = false;
         let sync_result = (|| {
             // Phase 1: Writeback dirty pages through the local-filesystem
             // dispatch layer via PageCacheDirtyFlush.  This bridges the adapter
@@ -8508,29 +8511,24 @@ impl FuseVfsAdapter {
         // stable order before clearing any inode's dirty projections.
         let _write_cache_reconciliation_guards = self.write_cache_reconciliation.lock_all();
         let (worker_dirty_tracker, worker_dirty_boundary) = self.take_worker_dirty_boundary();
+        let worker_dirty_ranges = worker_dirty_tracker.lock().unwrap().all_dirty_ranges();
+        let write_page_cache_dirty_pages = self.write_page_cache.dirty_pages();
+        let write_page_cache_page_size = self.write_page_cache.page_size() as u64;
+        let writeback_page_cache_dirty_pages = self
+            .writeback_page_cache
+            .as_ref()
+            .map(|cache| (cache.page_size() as u64, cache.dirty_pages()));
         // Reconcile every inode whose owner can retire below. A page-cache-only
         // set misses tracker-only owners and leaves their reclaim projection
         // falsely dirty after a successful mount-wide barrier.
-        let mut dirty_projection_inodes: HashSet<u64> = worker_dirty_tracker
-            .lock()
-            .unwrap()
-            .all_dirty_ranges()
-            .into_iter()
+        let mut dirty_projection_inodes: HashSet<u64> = worker_dirty_ranges
+            .iter()
             .map(|(ino, _, _)| ino)
+            .copied()
             .collect();
-        dirty_projection_inodes.extend(
-            self.write_page_cache
-                .dirty_pages()
-                .into_iter()
-                .map(|key| key.inode),
-        );
-        if let Some(ref writeback_page_cache) = self.writeback_page_cache {
-            dirty_projection_inodes.extend(
-                writeback_page_cache
-                    .dirty_pages()
-                    .into_iter()
-                    .map(|key| key.inode),
-            );
+        dirty_projection_inodes.extend(write_page_cache_dirty_pages.iter().map(|key| key.inode));
+        if let Some((_, dirty_pages)) = &writeback_page_cache_dirty_pages {
+            dirty_projection_inodes.extend(dirty_pages.iter().map(|key| key.inode));
         }
         let tracked_ranges = if let Some(ref tracker) = self.writeback_range_tracker {
             let mut tracker = tracker.lock().unwrap();
@@ -8547,18 +8545,41 @@ impl FuseVfsAdapter {
         dirty_projection_inodes.extend(tracked_ranges.iter().map(|(inode, _)| inode.get()));
 
         // A block-volume target reads clean ranges directly from its own
-        // storage. Snapshot its dirty adapter ranges before the mount-wide
-        // barrier so syncfs can copy them there before publishing any clean
-        // projection. The stripe set above prevents a new FUSE write from
-        // changing this snapshot while the barrier is in progress.
-        let block_volume_dirty_ranges: BTreeMap<u64, Vec<(u64, u64)>> = self
-            .dirty_state
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(&ino, ranges)| (ino, ranges.ranges().to_vec()))
-            .collect();
-        dirty_projection_inodes.extend(block_volume_dirty_ranges.keys().copied());
+        // storage. Snapshot the union of every dirty projection before the
+        // mount-wide barrier so syncfs cannot clear a non-primary owner and
+        // expose stale carrier bytes. The stripe set above prevents a new
+        // FUSE write from changing this snapshot while the barrier is active.
+        let block_volume_dirty_state_ranges = self.dirty_state.lock().unwrap().clone();
+        let mut block_volume_copy_ranges = block_volume_dirty_state_ranges.clone();
+        for &(ino, start, end) in &worker_dirty_ranges {
+            block_volume_copy_ranges
+                .entry(ino)
+                .or_default()
+                .mark_dirty_u64(start, end.saturating_sub(start));
+        }
+        for key in &write_page_cache_dirty_pages {
+            block_volume_copy_ranges
+                .entry(key.inode)
+                .or_default()
+                .mark_dirty_u64(key.offset, write_page_cache_page_size);
+        }
+        if let Some((page_size, dirty_pages)) = &writeback_page_cache_dirty_pages {
+            for key in dirty_pages {
+                block_volume_copy_ranges
+                    .entry(key.inode)
+                    .or_default()
+                    .mark_dirty_u64(key.offset, *page_size);
+            }
+        }
+        for (inode, ranges) in &tracked_ranges {
+            for range in ranges {
+                block_volume_copy_ranges
+                    .entry(inode.get())
+                    .or_default()
+                    .mark_dirty_u64(range.offset, range.length);
+            }
+        }
+        dirty_projection_inodes.extend(block_volume_copy_ranges.keys().copied());
 
         let mut block_volume_dirty_state_flushed = false;
         let sync_result = (|| {
@@ -8577,10 +8598,21 @@ impl FuseVfsAdapter {
                 let mut block_volume = self.block_volume.lock().unwrap();
                 if let Some(block_volume) = block_volume.as_mut() {
                     let engine = self.engine.lock().unwrap();
-                    for (&ino, ranges) in &block_volume_dirty_ranges {
+                    for (&ino, ranges) in &block_volume_copy_ranges {
+                        let attr = engine.getattr(InodeId::new(ino), None, ctx)?;
+                        // Range trackers also cover directory/metadata barriers;
+                        // the block-volume carrier mirrors regular-file bytes only.
+                        if attr.kind != NodeKind::File {
+                            continue;
+                        }
                         let handle = engine.open(InodeId::new(ino), libc::O_RDONLY as u32, ctx)?;
                         let copy_result = (|| {
-                            for &(start, end) in ranges {
+                            let file_size = attr.posix.size;
+                            for &(start, dirty_end) in ranges.ranges() {
+                                let end = dirty_end.min(file_size);
+                                if start >= end {
+                                    continue;
+                                }
                                 let length = end.saturating_sub(start);
                                 let length_u32 = u32::try_from(length).map_err(|_| Errno::EFBIG)?;
                                 let data = engine.read(&handle, start, length_u32, ctx)?;
@@ -8619,7 +8651,7 @@ impl FuseVfsAdapter {
                         copy_result?;
                         release_result?;
                     }
-                    block_volume_dirty_state_flushed = true;
+                    block_volume_copy_completed = true;
                 }
             }
 
@@ -8670,11 +8702,11 @@ impl FuseVfsAdapter {
             .lock()
             .unwrap()
             .clear_all_until_boundary(worker_dirty_boundary);
-        if block_volume_dirty_state_flushed {
+        if block_volume_copy_completed {
             let mut dirty_state = self.dirty_state.lock().unwrap();
-            for (&ino, ranges) in &block_volume_dirty_ranges {
+            for (&ino, ranges) in &block_volume_dirty_state_ranges {
                 let remove_inode = if let Some(dirty_ranges) = dirty_state.get_mut(&ino) {
-                    for &(start, end) in ranges {
+                    for &(start, end) in ranges.ranges() {
                         dirty_ranges.clear_range(start, end.saturating_sub(start));
                     }
                     dirty_ranges.is_empty()
@@ -33638,6 +33670,131 @@ mod tests {
             Some(false),
             "successful syncfs must publish the reclaim projection clean after block-volume drain"
         );
+    }
+
+    #[test]
+    fn syncfs_copies_non_primary_dirty_owners_to_block_volume() {
+        for owner in ["shared", "worker", "write-page", "writeback-page"] {
+            let (mut fixture, block_volume, shared_tracker) =
+                adapter_fixture_with_shared_tracker_and_mock_block_volume();
+            let writeback_page_cache = Arc::new(PageCache::new(8, 4096));
+            fixture.adapter.writeback_page_cache = Some(Arc::clone(&writeback_page_cache));
+            let ctx = root_ctx();
+            let (inode, adapter_fh, engine_fh) = create_adapter_file_handle(
+                &fixture.adapter,
+                &ctx,
+                format!("syncfs-{owner}-owner.bin").as_bytes(),
+                libc::O_RDWR as u32,
+            );
+            let stale = b"stale bytes";
+            let current = b"fresh bytes";
+            block_volume
+                .lock()
+                .unwrap()
+                .write_bytes(0, stale)
+                .expect("seed stale block-volume bytes");
+            {
+                let engine = fixture.adapter.engine.lock().unwrap();
+                assert_eq!(
+                    engine
+                        .write(&engine_fh, 0, current, &ctx)
+                        .expect("write lower current bytes"),
+                    current.len() as u32
+                );
+            }
+
+            // Normalize the projections, then leave exactly one non-primary
+            // owner protecting the current bytes from stale carrier reads.
+            fixture
+                .adapter
+                .dirty_state
+                .lock()
+                .unwrap()
+                .remove(&inode.get());
+            shared_tracker
+                .lock()
+                .unwrap()
+                .clear_range(inode, 0, current.len() as u64);
+            let worker_tracker = fixture
+                .adapter
+                .write_dispatch
+                .lock()
+                .unwrap()
+                .dirty_page_tracker_arc();
+            worker_tracker
+                .lock()
+                .unwrap()
+                .clear_range(inode.get(), 0, current.len() as u64);
+            fixture
+                .adapter
+                .write_page_cache
+                .clear_dirty_for_inode(inode.get());
+            writeback_page_cache.clear_dirty_for_inode(inode.get());
+
+            match owner {
+                "shared" => {
+                    shared_tracker
+                        .lock()
+                        .unwrap()
+                        .mark_dirty(inode, 0, current.len() as u64)
+                }
+                "worker" => worker_tracker
+                    .lock()
+                    .unwrap()
+                    .mark_dirty(inode.get(), 0, current.len() as u64)
+                    .expect("seed worker dirty owner"),
+                "write-page" => {
+                    fixture
+                        .adapter
+                        .write_page_cache
+                        .insert(inode.get(), 0)
+                        .expect("insert dirty page-cache mirror");
+                    assert!(fixture.adapter.write_page_cache.mark_dirty(inode.get(), 0));
+                }
+                "writeback-page" => {
+                    writeback_page_cache
+                        .insert(inode.get(), 0)
+                        .expect("insert dirty writeback page mirror");
+                    assert!(writeback_page_cache.mark_dirty(inode.get(), 0));
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                block_volume.lock().unwrap().stored(0, current.len() as u64),
+                stale,
+                "{owner} owner must still protect stale carrier bytes before syncfs"
+            );
+
+            fixture
+                .adapter
+                .dispatch_syncfs(&ctx)
+                .expect("syncfs non-primary owner");
+
+            assert_eq!(
+                block_volume.lock().unwrap().stored(0, current.len() as u64),
+                current,
+                "syncfs must copy bytes protected only by the {owner} owner"
+            );
+            fixture.adapter.invalidate_read_cache_entry(inode.get());
+            fixture
+                .adapter
+                .invalidate_fuse_read_cache_inode(inode.get());
+            assert_eq!(
+                fixture
+                    .adapter
+                    .dispatch_read(&ctx, inode.get(), adapter_fh, 0, current.len() as u32, None,)
+                    .expect("read refreshed block-volume bytes"),
+                current,
+                "the {owner} owner must not expose stale carrier bytes after syncfs"
+            );
+            assert!(!shared_tracker.lock().unwrap().is_dirty(inode));
+            assert!(!worker_tracker.lock().unwrap().has_dirty_ranges(inode.get()));
+            assert!(!fixture
+                .adapter
+                .write_page_cache
+                .has_dirty_pages_for_inode(inode.get()));
+            assert!(!writeback_page_cache.has_dirty_pages_for_inode(inode.get()));
+        }
     }
 
     #[test]
