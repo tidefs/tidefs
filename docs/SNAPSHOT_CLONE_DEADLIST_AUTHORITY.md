@@ -160,8 +160,8 @@ same post-mutation operation; it reports a derivation failure as deferred work
 without undoing the received deletion.
 
 This is bounded local lifecycle and queue behavior. It does not establish
-physical reclaim, distributed snapshot shipping, source retirement, capacity
-correctness, or product admission.
+end-to-end physical-reclaim validation, distributed snapshot shipping, source
+retirement, capacity correctness, or product admission.
 
 The object store already has lower-level reclaim machinery that the deadlist
 model must use instead of bypassing:
