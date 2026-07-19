@@ -211,8 +211,7 @@ impl UblkCompletionTrace {
             slot.current_generation_token
         };
         self.push_event(
-            qid,
-            tag,
+            (qid, tag),
             generation_token,
             UblkCompletionOperationKind::Fetch,
             "fetch_submitted",
@@ -242,8 +241,7 @@ impl UblkCompletionTrace {
             ("fetch_cqe_error", "fetch_req_cqe")
         };
         self.push_event(
-            qid,
-            tag,
+            (qid, tag),
             generation_token,
             UblkCompletionOperationKind::Fetch,
             state,
@@ -263,8 +261,7 @@ impl UblkCompletionTrace {
             return;
         };
         self.push_event(
-            qid,
-            tag,
+            (qid, tag),
             pending.generation_token,
             pending.operation_kind,
             "completion_cqe",
@@ -301,8 +298,7 @@ impl UblkCompletionTrace {
             "fetch_req_cqe"
         };
         self.push_event(
-            qid,
-            tag,
+            (qid, tag),
             generation_token,
             operation_kind,
             state,
@@ -331,8 +327,7 @@ impl UblkCompletionTrace {
         });
         self.completed_requests = self.completed_requests.saturating_add(1);
         self.push_event(
-            qid,
-            tag,
+            (qid, tag),
             generation_token,
             operation_kind,
             "completion_submitted",
@@ -355,8 +350,7 @@ impl UblkCompletionTrace {
             .in_flight_operation_kind
             .unwrap_or(UblkCompletionOperationKind::Unknown(0));
         self.push_event(
-            qid,
-            tag,
+            (qid, tag),
             generation_token,
             operation_kind,
             "completion_submit_failed",
@@ -392,8 +386,7 @@ impl UblkCompletionTrace {
             }
             if let Some((generation_token, operation_kind)) = request_release {
                 self.push_event(
-                    qid,
-                    tag,
+                    (qid, tag),
                     generation_token,
                     operation_kind,
                     "request_released",
@@ -402,8 +395,7 @@ impl UblkCompletionTrace {
                 );
             }
             self.push_event(
-                qid,
-                tag,
+                (qid, tag),
                 queue_generation_token,
                 UblkCompletionOperationKind::Release,
                 "queue_released",
@@ -425,14 +417,14 @@ impl UblkCompletionTrace {
 
     fn push_event(
         &mut self,
-        qid: u16,
-        tag: u16,
+        qid_tag: (u16, u16),
         generation_token: u64,
         operation_kind: UblkCompletionOperationKind,
         lifecycle_state: &'static str,
         terminal_result: Option<i32>,
         source: &'static str,
     ) {
+        let (qid, tag) = qid_tag;
         self.events.push(UblkCompletionTraceEvent {
             sequence: self.next_sequence,
             qid,
@@ -452,12 +444,11 @@ impl UblkCompletionTrace {
         out.push_str("  \"report_version\": 1,\n");
         out.push_str("  \"generated_by\": \"tidefs-block-volume-adapter-daemon\",\n");
         out.push_str("  \"claim_ids\": [\n");
-        let _ = writeln!(out, "    \"{}\"", UBLK_COMPLETION_ARTIFACT_CLAIM_ID);
+        let _ = writeln!(out, "    \"{UBLK_COMPLETION_ARTIFACT_CLAIM_ID}\"");
         out.push_str("  ],\n");
         let _ = writeln!(
             out,
-            "  \"evidence_class\": \"{}\",",
-            UBLK_COMPLETION_ARTIFACT_EVIDENCE_CLASS
+            "  \"evidence_class\": \"{UBLK_COMPLETION_ARTIFACT_EVIDENCE_CLASS}\","
         );
         out.push_str("  \"evidence_scope\": \"bounded runtime uBLK daemon qid/tag completion lifecycle trace\",\n");
         let _ = writeln!(out, "  \"scenario\": \"{}\",", self.scenario);
@@ -468,7 +459,7 @@ impl UblkCompletionTrace {
             } else {
                 ","
             };
-            let _ = writeln!(out, "    \"{}\"{}", non_claim, comma);
+            let _ = writeln!(out, "    \"{non_claim}\"{comma}");
         }
         out.push_str("  ],\n");
         let _ = writeln!(out, "  \"nr_hw_queues\": {},", self.nr_hw_queues);
@@ -501,7 +492,7 @@ impl UblkCompletionTrace {
             );
             match event.terminal_result {
                 Some(result) => {
-                    let _ = writeln!(out, "      \"terminal_result\": {},", result);
+                    let _ = writeln!(out, "      \"terminal_result\": {result},");
                 }
                 None => out.push_str("      \"terminal_result\": null,\n"),
             }
