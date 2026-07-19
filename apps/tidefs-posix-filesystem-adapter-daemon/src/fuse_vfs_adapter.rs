@@ -6413,19 +6413,22 @@ impl FuseVfsAdapter {
             }
         }
 
-        // Resolve logical offset to block-aligned ranges through the
-        // block-volume extent map.  When the block-volume target is
-        // populated, try reading from it first; fall back to the VFS
-        // engine for dirty ranges or when the block-volume target does
-        // not service the range.
-        let extents = self.resolve_read_extents(ino, plan.offset, plan.size, fh)?;
-
         let mut has_block_volume = false;
         if !writeback_write_only_cache_fill {
             if let Ok(bv_guard) = self.block_volume.lock() {
                 has_block_volume = bv_guard.is_some();
             }
         }
+
+        // Resolve logical offset to block-aligned ranges only when a
+        // block-volume target can serve them.  The resolver clips the range
+        // to file-visible EOF when handle attributes are available, so a
+        // clean carrier read cannot manufacture zero bytes past EOF.
+        let extents = if has_block_volume {
+            self.resolve_read_extents(ino, plan.offset, plan.size, &resolved_engine_fh, ctx)?
+        } else {
+            Vec::new()
+        };
 
         let mut fallback_read_to_release = None;
         let engine_fh = if writeback_write_only_cache_fill {
@@ -7917,26 +7920,41 @@ impl FuseVfsAdapter {
     // returned as zero-fill ranges.
 
     /// Resolve a read request (logical `offset`, `size`) into a sequence of
-    /// [`ResolvedBlockExtent`] entries that exactly cover the requested range.
+    /// [`ResolvedBlockExtent`] entries that exactly cover the file-visible
+    /// portion of the requested range.
     ///
     /// Consult the engine's extent map.  DATA extents encode the physical
     /// offset in their locator; holes and UNWRITTEN extents become
     /// [`ResolvedBlockExtent::Hole`].  Gaps between entries are filled as
-    /// holes so the returned sequence always covers `[offset, offset+size)`.
+    /// holes, but reserved extents and synthetic trailing holes are clipped to
+    /// the current file size when the engine can provide handle attributes.
     fn resolve_read_extents(
         &self,
         ino: u64,
         offset: u64,
         size: u32,
-        _fh: u64,
+        fh: &EngineFileHandle,
+        ctx: &RequestCtx,
     ) -> Result<Vec<ResolvedBlockExtent>, Errno> {
         if size == 0 {
             return Ok(Vec::new());
         }
-        let end = offset.saturating_add(size as u64);
-        let entries = {
+        let requested_end = offset.saturating_add(size as u64);
+        let (end, entries) = {
             let e = self.engine.lock().unwrap();
-            e.lookup_extents(InodeId::new(ino), offset, size as u64)
+            // Attribute lookup can be unavailable for a still-live unlinked
+            // handle. Preserve the existing extent-only path in that case;
+            // ordinary linked handles use the authoritative visible size.
+            let end = e
+                .getattr(InodeId::new(ino), Some(fh), ctx)
+                .ok()
+                .map(|attr| requested_end.min(attr.posix.size))
+                .unwrap_or(requested_end);
+            if offset >= end {
+                return Ok(Vec::new());
+            }
+            let entries = e.lookup_extents(InodeId::new(ino), offset, end - offset);
+            (end, entries)
         };
 
         let mut result = Vec::new();
@@ -34089,6 +34107,73 @@ mod tests {
             .dispatch_read(&ctx, inode.get(), adapter_fh, 0, payload.len() as u32, None)
             .expect("clean read");
         assert_eq!(readback, payload);
+    }
+
+    #[test]
+    fn block_volume_clean_read_respects_eof() {
+        let (fixture, _bv) = adapter_fixture_with_mock_block_volume();
+        let ctx = root_ctx();
+        let (inode, adapter_fh, _engine_fh) = create_adapter_file_handle(
+            &fixture.adapter,
+            &ctx,
+            b"clean-bv-eof.bin",
+            libc::O_RDWR as u32,
+        );
+        let payload = b"short file";
+        fixture
+            .adapter
+            .dispatch_write(&ctx, inode.get(), adapter_fh, 0, payload, 0)
+            .expect("write");
+        fixture
+            .adapter
+            .dispatch_fsync(&ctx, inode.get(), adapter_fh)
+            .expect("fsync");
+
+        let at_eof = fixture
+            .adapter
+            .dispatch_read(
+                &ctx,
+                inode.get(),
+                adapter_fh,
+                payload.len() as i64,
+                16,
+                None,
+            )
+            .expect("read at EOF");
+        assert!(at_eof.is_empty(), "a read at EOF must return no bytes");
+
+        fixture
+            .adapter
+            .dispatch_fallocate_file(
+                &ctx,
+                inode.get(),
+                adapter_fh,
+                FALLOC_FL_KEEP_SIZE,
+                4096,
+                4096,
+            )
+            .expect("reserve extent beyond EOF");
+        let reserved_beyond_eof = fixture
+            .adapter
+            .dispatch_read(&ctx, inode.get(), adapter_fh, 4096, 16, None)
+            .expect("read reserved extent beyond EOF");
+        assert!(
+            reserved_beyond_eof.is_empty(),
+            "an unwritten reservation must not extend visible EOF"
+        );
+
+        let crossing_eof = fixture
+            .adapter
+            .dispatch_read(
+                &ctx,
+                inode.get(),
+                adapter_fh,
+                (payload.len() - 2) as i64,
+                16,
+                None,
+            )
+            .expect("read across EOF");
+        assert_eq!(crossing_eof, &payload[payload.len() - 2..]);
     }
 
     /// When the requested range overlaps dirty (unflushed) state, the
