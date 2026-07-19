@@ -308,11 +308,17 @@ pub enum StorageIntentEvidenceKind {
     RamAuthorityEvidence = 34,
     /// Lifecycle, generation, retained-root, and reclaim-frontier evidence.
     LifecycleGenerationEvidence = 35,
+    /// PMem byte-range write-back and flush/fence evidence.
+    PmemByteFlushFenceEvidence = 36,
+    /// PMem metadata locator persistence evidence.
+    PmemMetadataLocatorEvidence = 37,
+    /// PMem recovery scan classification for one range and generation.
+    PmemRecoveryGenerationEvidence = 38,
 }
 
 impl StorageIntentEvidenceKind {
     /// Number of defined evidence kinds.
-    pub const COUNT: usize = 36;
+    pub const COUNT: usize = 39;
 
     /// Stable diagnostic spelling.
     #[must_use]
@@ -354,6 +360,9 @@ impl StorageIntentEvidenceKind {
             Self::ClaimGateEvidence => "claim-gate-evidence",
             Self::RamAuthorityEvidence => "ram-authority-evidence",
             Self::LifecycleGenerationEvidence => "lifecycle-generation-evidence",
+            Self::PmemByteFlushFenceEvidence => "pmem-byte-flush-fence-evidence",
+            Self::PmemMetadataLocatorEvidence => "pmem-metadata-locator-evidence",
+            Self::PmemRecoveryGenerationEvidence => "pmem-recovery-generation-evidence",
         }
     }
 
@@ -403,6 +412,9 @@ impl StorageIntentEvidenceKind {
             33 => Some(Self::ClaimGateEvidence),
             34 => Some(Self::RamAuthorityEvidence),
             35 => Some(Self::LifecycleGenerationEvidence),
+            36 => Some(Self::PmemByteFlushFenceEvidence),
+            37 => Some(Self::PmemMetadataLocatorEvidence),
+            38 => Some(Self::PmemRecoveryGenerationEvidence),
             _ => None,
         }
     }
@@ -6100,7 +6112,7 @@ impl RamAuthorityRecord {
         }
         if !evidence_ref_has_kind(
             self.pmem_ref,
-            StorageIntentEvidenceKind::RamAuthorityEvidence,
+            StorageIntentEvidenceKind::PmemByteFlushFenceEvidence,
         ) || self.pmem_ref.generation != self.scope.generation
         {
             return StorageIntentRefusalReason::PmemFlushFenceMissing;
@@ -6116,14 +6128,14 @@ impl RamAuthorityRecord {
         }
         if !evidence_ref_has_kind(
             self.pmem_metadata_ref,
-            StorageIntentEvidenceKind::MetadataNamespaceEvidence,
+            StorageIntentEvidenceKind::PmemMetadataLocatorEvidence,
         ) || self.pmem_metadata_ref.generation != self.scope.generation
         {
             return StorageIntentRefusalReason::IncompleteMetadataDelta;
         }
         if !evidence_ref_has_kind(
             self.pmem_recovery_ref,
-            StorageIntentEvidenceKind::LifecycleGenerationEvidence,
+            StorageIntentEvidenceKind::PmemRecoveryGenerationEvidence,
         ) || self.pmem_recovery_ref.generation != self.scope.generation
         {
             return StorageIntentRefusalReason::StaleLifecycleEvidence;
@@ -24373,13 +24385,16 @@ mod tests {
             lost_if: AuthorityEventMask::PMEM_DURABLE_LOSS_BOUNDARY,
             survives: AuthorityEventMask::PMEM_DURABLE_SURVIVAL_BOUNDARY,
             ordering_ref: pmem_generation_ref(StorageIntentEvidenceKind::OrderingEvidence, 21),
-            pmem_ref: pmem_generation_ref(StorageIntentEvidenceKind::RamAuthorityEvidence, 22),
+            pmem_ref: pmem_generation_ref(
+                StorageIntentEvidenceKind::PmemByteFlushFenceEvidence,
+                22,
+            ),
             pmem_metadata_ref: pmem_generation_ref(
-                StorageIntentEvidenceKind::MetadataNamespaceEvidence,
+                StorageIntentEvidenceKind::PmemMetadataLocatorEvidence,
                 23,
             ),
             pmem_recovery_ref: pmem_generation_ref(
-                StorageIntentEvidenceKind::LifecycleGenerationEvidence,
+                StorageIntentEvidenceKind::PmemRecoveryGenerationEvidence,
                 24,
             ),
             media_capability_ref: evidence_ref(
@@ -24462,7 +24477,7 @@ mod tests {
     }
 
     #[test]
-    fn pmem_durable_receipt_requires_complete_evidence_and_requested_floor() {
+    fn pmem_durable_receipt_requires_typed_evidence_and_requested_floor() {
         let ready = pmem_durable_emit_ready_base();
 
         assert!(ram_authority_receipt_is_emit_ready(ready).satisfied);
@@ -24472,12 +24487,12 @@ mod tests {
             media_capability_ref: StorageIntentEvidenceRef::default(),
             ..ready
         };
-        let wrong_pmem_kind = RamAuthorityRecord {
-            pmem_ref: pmem_generation_ref(StorageIntentEvidenceKind::MediaCapabilityEvidence, 26),
+        let generic_pmem_authority = RamAuthorityRecord {
+            pmem_ref: pmem_generation_ref(StorageIntentEvidenceKind::RamAuthorityEvidence, 26),
             ..ready
         };
         let stale_pmem_generation = RamAuthorityRecord {
-            pmem_ref: evidence_ref(StorageIntentEvidenceKind::RamAuthorityEvidence, 27),
+            pmem_ref: evidence_ref(StorageIntentEvidenceKind::PmemByteFlushFenceEvidence, 27),
             ..ready
         };
         let wrong_ordering_kind = RamAuthorityRecord {
@@ -24491,13 +24506,16 @@ mod tests {
             ordering_ref: evidence_ref(StorageIntentEvidenceKind::OrderingEvidence, 29),
             ..ready
         };
-        let wrong_metadata_kind = RamAuthorityRecord {
-            pmem_metadata_ref: pmem_generation_ref(StorageIntentEvidenceKind::OrderingEvidence, 30),
+        let generic_pmem_metadata = RamAuthorityRecord {
+            pmem_metadata_ref: pmem_generation_ref(
+                StorageIntentEvidenceKind::MetadataNamespaceEvidence,
+                30,
+            ),
             ..ready
         };
-        let wrong_recovery_kind = RamAuthorityRecord {
+        let generic_pmem_recovery = RamAuthorityRecord {
             pmem_recovery_ref: pmem_generation_ref(
-                StorageIntentEvidenceKind::RecoveryDegradationEvidence,
+                StorageIntentEvidenceKind::LifecycleGenerationEvidence,
                 31,
             ),
             ..ready
@@ -24525,7 +24543,7 @@ mod tests {
                 StorageIntentRefusalReason::MissingMediaCapabilityEvidence,
             ),
             (
-                wrong_pmem_kind,
+                generic_pmem_authority,
                 StorageIntentRefusalReason::PmemFlushFenceMissing,
             ),
             (
@@ -24541,11 +24559,11 @@ mod tests {
                 StorageIntentRefusalReason::WrongOrderingRange,
             ),
             (
-                wrong_metadata_kind,
+                generic_pmem_metadata,
                 StorageIntentRefusalReason::IncompleteMetadataDelta,
             ),
             (
-                wrong_recovery_kind,
+                generic_pmem_recovery,
                 StorageIntentRefusalReason::StaleLifecycleEvidence,
             ),
             (
