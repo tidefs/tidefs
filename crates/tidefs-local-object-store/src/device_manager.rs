@@ -33,6 +33,10 @@ use crate::pool_lifecycle_evidence::{
 };
 use crate::{Result, StoreError};
 
+fn next_topology_generation(commit_group: u64) -> u64 {
+    tidefs_commit_group::CommitGroupId(commit_group).next().0
+}
+
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
@@ -212,7 +216,7 @@ impl DeviceManager {
 
         let old_device_count = existing_device_configs.len() as u32;
         let new_device_count = old_device_count + 1;
-        let new_topology_gen = commit_group.wrapping_add(1);
+        let new_topology_gen = next_topology_generation(commit_group);
         let label_commit_group = commit_group;
         let authority = Self::topology_label_authority(
             existing_device_configs,
@@ -279,7 +283,7 @@ impl DeviceManager {
         }
 
         let new_device_count = remaining_device_configs.len() as u32;
-        let new_topology_gen = commit_group.wrapping_add(1);
+        let new_topology_gen = next_topology_generation(commit_group);
         let label_commit_group = commit_group;
 
         // Validate every surviving label before mutating the first copy. This
@@ -335,7 +339,7 @@ impl DeviceManager {
         )?;
 
         let device_count = request.existing_device_configs.len() as u32;
-        let new_topology_gen = request.commit_group.wrapping_add(1);
+        let new_topology_gen = next_topology_generation(request.commit_group);
         let label_commit_group = request.commit_group;
         let authority = Self::topology_label_authority(
             request.existing_device_configs,
@@ -414,7 +418,7 @@ impl DeviceManager {
         )?;
 
         let device_count = request.existing_device_configs.len() as u32;
-        let new_topology_gen = request.commit_group.wrapping_add(1);
+        let new_topology_gen = next_topology_generation(request.commit_group);
         let label_commit_group = request.commit_group;
         let authority = Self::topology_label_authority(
             request.existing_device_configs,
@@ -1426,6 +1430,54 @@ mod tests {
 
         let _ = fs::remove_dir_all(&dir1);
         let _ = fs::remove_dir_all(&dir2);
+    }
+
+    #[test]
+    fn add_device_saturates_topology_generation_at_max_commit_group() {
+        let existing_dir = temp_dir("dm-add-max-existing");
+        let new_dir = temp_dir("dm-add-max-new");
+        let existing_config = make_device_config(&existing_dir);
+        let new_config = make_device_config(&new_dir);
+        let pool_guid = [0x61; 16];
+        let existing_guid = [0x62; 16];
+        let new_guid = [0x63; 16];
+
+        DeviceManager::write_single_device_label(LabelWriteRequest {
+            device_config: &existing_config,
+            pool_guid,
+            device_guid: existing_guid,
+            pool_name: "max-generation",
+            pool_state: crate::pool_label::LabelPoolState::Active,
+            commit_group: u64::MAX - 1,
+            label_commit_group: u64::MAX - 1,
+            device_index: 0,
+            topology_generation: u64::MAX - 1,
+            device_count: 1,
+            redundancy_policy: PoolRedundancyPolicy::default(),
+            device_layout_policy: None,
+        })
+        .unwrap();
+
+        DeviceManager::add_device(
+            std::slice::from_ref(&existing_config),
+            &new_config,
+            pool_guid,
+            &[existing_guid],
+            new_guid,
+            "max-generation",
+            u64::MAX,
+        )
+        .unwrap();
+
+        for dir in [&existing_dir, &new_dir] {
+            let label = decode_label(&fs::read(dir.join(".tidefs_label")).unwrap()).unwrap();
+            assert_eq!(label.commit_group, u64::MAX);
+            assert_eq!(label.label_commit_group, u64::MAX);
+            assert_eq!(label.topology_generation, u64::MAX);
+        }
+
+        let _ = fs::remove_dir_all(&existing_dir);
+        let _ = fs::remove_dir_all(&new_dir);
     }
 
     #[test]
