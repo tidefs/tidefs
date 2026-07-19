@@ -2181,7 +2181,6 @@ dependencies = [
  "tidefs-commit_group",
  "tidefs-intent-log",
  "tidefs-reclaim-queue-core",
- "tidefs-types-dataset-feature-flags-core",
  "tidefs-types-deferred-cleanup-core",
 ]
 
@@ -3769,7 +3768,6 @@ name = "tidefs-types-deferred-cleanup-core"
 version = "0.421.0"
 dependencies = [
  "serde",
- "tidefs-types-dataset-feature-flags-core",
 ]
 
 [[package]]
