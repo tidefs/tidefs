@@ -34,7 +34,7 @@ use crate::transport_adapter::{
 };
 use crate::vfs_engine_bridge::VfsEngineBridge;
 use crate::{
-    InlineOrBulk, VfsRpcError, VfsRpcRequest, VfsRpcRequestPayload, VfsRpcResponse,
+    InlineOrBulk, OpId, PeerId, VfsRpcError, VfsRpcRequest, VfsRpcRequestPayload, VfsRpcResponse,
     VfsRpcTransportFrame, REQ_FLAG_BULK_PENDING, VFS_RPC_SERVICE_ID,
 };
 
@@ -46,14 +46,22 @@ struct PendingWriteKey {
 
 #[derive(Clone, Debug)]
 struct PendingWrite {
+    peer: PeerId,
     request: VfsRpcRequest,
     stream_id: StreamId,
     admitted_at: Instant,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ActiveWriteState {
+    Pending(PendingWriteKey),
+    Dispatching { connection_id: ConnectionId },
+}
+
 struct VfsRpcBulkWriteRuntimeState {
     adapter: VfsRpcTransportAdapter,
     pending_writes: BTreeMap<PendingWriteKey, PendingWrite>,
+    active_write_ops: BTreeMap<(PeerId, OpId), ActiveWriteState>,
 }
 
 /// Errors from the write-upload runtime orchestration.
@@ -174,6 +182,7 @@ where
             state: Mutex::new(VfsRpcBulkWriteRuntimeState {
                 adapter,
                 pending_writes: BTreeMap::new(),
+                active_write_ops: BTreeMap::new(),
             }),
             bridge: Mutex::new(bridge),
             target,
@@ -237,9 +246,20 @@ where
         let mut state = self.state.lock().unwrap();
         let _aborted = self.bulk.connection_lost(connection_id);
         state.adapter.retire_bulk_connection(session_id);
-        state
+        let pending = state
             .pending_writes
-            .retain(|key, _| key.connection_id != connection_id);
+            .iter()
+            .filter_map(|(key, pending)| {
+                (key.connection_id == connection_id)
+                    .then_some((*key, (pending.peer, pending.request.header.op_id)))
+            })
+            .collect::<Vec<_>>();
+        for (key, op_key) in pending {
+            state.pending_writes.remove(&key);
+            if state.active_write_ops.get(&op_key) == Some(&ActiveWriteState::Pending(key)) {
+                state.active_write_ops.remove(&op_key);
+            }
+        }
     }
 
     /// Dispatch one already-demultiplexed VFS_RPC CONTROL frame at `now`.
@@ -280,12 +300,45 @@ where
                 session_id,
                 request,
             } => {
-                if let Some(token) = write_bulk_token(&request) {
-                    let key = PendingWriteKey {
-                        connection_id: session_id.0,
-                        token,
-                    };
+                let write_key = write_bulk_token(&request).map(|token| PendingWriteKey {
+                    connection_id: session_id.0,
+                    token,
+                });
+                let op_key = (peer, request.header.op_id);
+                if let Some(active) = state.active_write_ops.get(&op_key).copied() {
+                    if let (ActiveWriteState::Pending(existing_key), Some(key)) =
+                        (active, write_key)
+                    {
+                        if key == existing_key
+                            && state
+                                .pending_writes
+                                .get(&key)
+                                .is_some_and(|pending| pending.request == request)
+                        {
+                            return Ok(ControlServiceDispatchOutcome::Consumed);
+                        }
+                    }
+
+                    let candidate = write_key.filter(|key| {
+                        !matches!(active, ActiveWriteState::Pending(existing) if existing == *key)
+                    });
+                    drop(state);
+                    if let Some(key) = candidate {
+                        self.retire_conflicting_write_admission(peer, session_id, key, &request)?;
+                    }
+                    let response = VfsRpcResponse::error(
+                        request.header.op_id,
+                        request.header.method,
+                        Errno::EALREADY,
+                    )?;
+                    return Ok(ControlServiceDispatchOutcome::Reply(
+                        control_response_frame(&response)?,
+                    ));
+                }
+
+                if let Some(key) = write_key {
                     let pending = PendingWrite {
+                        peer,
                         request: request.clone(),
                         stream_id: stream_id.ok_or(
                             VfsRpcBulkWriteRuntimeError::MissingActiveTransfer {
@@ -307,6 +360,9 @@ where
                         }
                         None => {
                             state.pending_writes.insert(key, pending);
+                            state
+                                .active_write_ops
+                                .insert(op_key, ActiveWriteState::Pending(key));
                             return Ok(ControlServiceDispatchOutcome::Consumed);
                         }
                     }
@@ -324,6 +380,45 @@ where
             }
             VfsRpcInboundFrame::Response { .. } => Ok(ControlServiceDispatchOutcome::Consumed),
         }
+    }
+
+    fn retire_conflicting_write_admission(
+        &self,
+        peer: PeerId,
+        session_id: SessionId,
+        key: PendingWriteKey,
+        request: &VfsRpcRequest,
+    ) -> Result<(), VfsRpcBulkWriteRuntimeError> {
+        let abort = self.bulk.abort_vfs_rpc_handoff(
+            key.connection_id,
+            key.token,
+            request.header.op_id.0,
+            VfsRpcBulkHandoff::WriteUpload,
+            BulkAbortReason::ProtocolError,
+        )?;
+        let record = self
+            .state
+            .lock()
+            .unwrap()
+            .adapter
+            .abort_bulk_handoff(&abort)?;
+        ensure_write_upload(
+            record.connection_id,
+            record.token,
+            record.direction,
+            record.handoff,
+        )?;
+        if record.peer != peer
+            || record.session_id != session_id
+            || record.op_id != request.header.op_id
+            || record.method != request.header.method
+        {
+            return Err(VfsRpcBulkWriteRuntimeError::ConflictingPendingWrite {
+                connection_id: key.connection_id,
+                token: key.token,
+            });
+        }
+        Ok(())
     }
 
     /// Retire locally timed-out incoming BULK WRITE requests and report their
@@ -384,7 +479,13 @@ where
                     token: key.token,
                 },
             )?;
-            if removed.stream_id != abort.stream_id || removed.request != pending.request {
+            let op_key = (removed.peer, removed.request.header.op_id);
+            let active = state.active_write_ops.remove(&op_key);
+            if removed.peer != record.peer
+                || removed.stream_id != abort.stream_id
+                || removed.request != pending.request
+                || active != Some(ActiveWriteState::Pending(key))
+            {
                 return Err(VfsRpcBulkWriteRuntimeError::ConflictingPendingWrite {
                     connection_id: key.connection_id,
                     token: key.token,
@@ -436,7 +537,7 @@ where
         &self,
         completion: VfsRpcBulkCompletion,
     ) -> Result<(), VfsRpcBulkWriteRuntimeError> {
-        let (session_id, peer, request) = {
+        let (session_id, peer, op_key, key, request) = {
             let mut state = self.state.lock().unwrap();
             let record = state.adapter.complete_bulk_handoff(&completion)?;
             ensure_write_upload(
@@ -455,23 +556,54 @@ where
                     token: key.token,
                 },
             )?;
-            if pending.stream_id != completion.stream_id
+            let op_key = (pending.peer, pending.request.header.op_id);
+            let active = state.active_write_ops.remove(&op_key);
+            if pending.peer != record.peer
+                || pending.stream_id != completion.stream_id
                 || pending.request.header.op_id != record.op_id
                 || completion.op_id != record.op_id.0
+                || active != Some(ActiveWriteState::Pending(key))
             {
                 return Err(VfsRpcBulkWriteRuntimeError::ConflictingPendingWrite {
                     connection_id: key.connection_id,
                     token: key.token,
                 });
             }
-            (record.session_id, record.peer, pending.request)
+            state.active_write_ops.insert(
+                op_key,
+                ActiveWriteState::Dispatching {
+                    connection_id: record.connection_id,
+                },
+            );
+            (record.session_id, record.peer, op_key, key, pending.request)
         };
         let response = self.bridge.lock().unwrap().dispatch_done_verified_write(
             peer,
             &request,
             completion,
             &self.target,
-        )?;
+        );
+        {
+            let mut state = self.state.lock().unwrap();
+            match state.active_write_ops.remove(&op_key) {
+                Some(ActiveWriteState::Dispatching { connection_id })
+                    if connection_id == session_id.0 => {}
+                Some(active) => {
+                    state.active_write_ops.insert(op_key, active);
+                    return Err(VfsRpcBulkWriteRuntimeError::ConflictingPendingWrite {
+                        connection_id: key.connection_id,
+                        token: key.token,
+                    });
+                }
+                None => {
+                    return Err(VfsRpcBulkWriteRuntimeError::ConflictingPendingWrite {
+                        connection_id: key.connection_id,
+                        token: key.token,
+                    });
+                }
+            }
+        }
+        let response = response?;
         self.send_control_reply(session_id.0, control_response_frame(&response)?)
     }
 
@@ -495,7 +627,12 @@ where
                     token: key.token,
                 },
             )?;
-            if pending.stream_id != abort.stream_id || pending.request.header.op_id != record.op_id
+            let op_key = (pending.peer, pending.request.header.op_id);
+            let active = state.active_write_ops.remove(&op_key);
+            if pending.peer != record.peer
+                || pending.stream_id != abort.stream_id
+                || pending.request.header.op_id != record.op_id
+                || active != Some(ActiveWriteState::Pending(key))
             {
                 return Err(VfsRpcBulkWriteRuntimeError::ConflictingPendingWrite {
                     connection_id: key.connection_id,
@@ -676,7 +813,8 @@ fn data_runtime_error(error: VfsRpcBulkWriteRuntimeError) -> DataServiceDispatch
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use std::sync::{Barrier, Mutex};
+    use std::thread;
     use std::time::Duration;
 
     use tidefs_bulk_service::{
@@ -956,19 +1094,7 @@ mod tests {
         op_id: u64,
         now: Instant,
     ) -> VfsRpcRequest {
-        let request = VfsRpcRequest::new(
-            OpId(op_id),
-            3,
-            5,
-            REQ_FLAG_BULK_PENDING,
-            VfsRpcRequestPayload::Write {
-                handle,
-                offset: 0,
-                data: InlineOrBulk::Bulk { token, len },
-            },
-            Some(credentials()),
-        )
-        .expect("write request");
+        let request = bulk_write_request(handle, token, len, op_id, 0);
         assert_eq!(
             runtime
                 .handle_control_service_frame_at(now, SESSION_ID, control_request(&request))
@@ -976,6 +1102,28 @@ mod tests {
             ControlServiceDispatchOutcome::Consumed
         );
         request
+    }
+
+    fn bulk_write_request(
+        handle: crate::VfsRpcHandle,
+        token: BulkToken,
+        len: u64,
+        op_id: u64,
+        offset: u64,
+    ) -> VfsRpcRequest {
+        VfsRpcRequest::new(
+            OpId(op_id),
+            3,
+            5,
+            REQ_FLAG_BULK_PENDING,
+            VfsRpcRequestPayload::Write {
+                handle,
+                offset,
+                data: InlineOrBulk::Bulk { token, len },
+            },
+            Some(credentials()),
+        )
+        .expect("write request")
     }
 
     fn grant_and_write(
@@ -1062,6 +1210,161 @@ mod tests {
             response(replies[0].1.clone()).payload,
             VfsRpcResponsePayload::BytesWritten(3)
         );
+    }
+
+    #[test]
+    fn duplicate_active_write_op_retires_only_the_new_bulk_token() {
+        let (runtime, target, sink) = runtime(Duration::from_secs(1));
+        let handle = create_handle(&runtime);
+        let data_dispatch = runtime.data_dispatch();
+        let first = accept_write_transfer(&data_dispatch, 2, 28, 3);
+        let second = accept_write_transfer(&data_dispatch, 2, 29, 3);
+        admitted_write(&runtime, handle.clone(), first, 3, Instant::now());
+        grant_and_write(&data_dispatch, 29, second, b"xyz");
+
+        let conflicting = bulk_write_request(handle, second, 3, 2, 1);
+        let outcome = runtime
+            .handle_control_service_frame_at(
+                Instant::now(),
+                SESSION_ID,
+                control_request(&conflicting),
+            )
+            .expect("duplicate op reply");
+        let reply = match outcome {
+            ControlServiceDispatchOutcome::Reply(frame) => response(frame),
+            ControlServiceDispatchOutcome::Consumed => panic!("duplicate op must be refused"),
+        };
+
+        assert_eq!(reply.header.errno, Errno::EALREADY);
+        assert_eq!(runtime.pending_write_count(), 1);
+        assert_eq!(runtime.bulk.active_transfer_count(SESSION_ID.0), 1);
+        assert_eq!(runtime.bulk.pinned_bytes(SESSION_ID.0), 0);
+        assert_eq!(runtime.state.lock().unwrap().adapter.pending_bulk_len(), 1);
+        assert!(target.writes().is_empty());
+
+        grant_and_write(&data_dispatch, 28, first, b"abc");
+        dispatch_data(
+            &data_dispatch,
+            BulkFrame::Done(BulkDoneFrame {
+                stream_id: 28,
+                token: first,
+                total_transferred: 3,
+                checksum32: 0x364b_3fb7,
+            }),
+        )
+        .expect("first done");
+
+        assert_eq!(target.writes(), vec![b"abc".to_vec()]);
+        assert_eq!(runtime.pending_write_count(), 0);
+        assert_eq!(sink.replies().len(), 1);
+    }
+
+    #[test]
+    fn inline_request_cannot_prime_dedup_for_pending_bulk_write() {
+        let (runtime, target, sink) = runtime(Duration::from_secs(1));
+        let handle = create_handle(&runtime);
+        let data_dispatch = runtime.data_dispatch();
+        let token = accept_write_transfer(&data_dispatch, 2, 30, 3);
+        admitted_write(&runtime, handle.clone(), token, 3, Instant::now());
+
+        let inline = VfsRpcRequest::new(
+            OpId(2),
+            3,
+            5,
+            0,
+            VfsRpcRequestPayload::Write {
+                handle,
+                offset: 1,
+                data: InlineOrBulk::Inline(b"xyz".to_vec()),
+            },
+            Some(credentials()),
+        )
+        .expect("inline collision");
+        let outcome = runtime
+            .handle_control_service_frame_at(Instant::now(), SESSION_ID, control_request(&inline))
+            .expect("inline collision reply");
+        let reply = match outcome {
+            ControlServiceDispatchOutcome::Reply(frame) => response(frame),
+            ControlServiceDispatchOutcome::Consumed => panic!("inline collision must be refused"),
+        };
+
+        assert_eq!(reply.header.errno, Errno::EALREADY);
+        assert!(target.writes().is_empty());
+        assert_eq!(runtime.pending_write_count(), 1);
+
+        grant_and_write(&data_dispatch, 30, token, b"abc");
+        dispatch_data(
+            &data_dispatch,
+            BulkFrame::Done(BulkDoneFrame {
+                stream_id: 30,
+                token,
+                total_transferred: 3,
+                checksum32: 0x364b_3fb7,
+            }),
+        )
+        .expect("bulk done");
+
+        assert_eq!(target.writes(), vec![b"abc".to_vec()]);
+        assert_eq!(sink.replies().len(), 1);
+    }
+
+    #[test]
+    fn write_op_stays_reserved_until_done_dispatch_finishes() {
+        let (runtime, target, sink) = runtime(Duration::from_secs(1));
+        let handle = create_handle(&runtime);
+        let retry_handle = handle.clone();
+        let data_dispatch = runtime.data_dispatch();
+        let token = accept_write_transfer(&data_dispatch, 2, 31, 3);
+        admitted_write(&runtime, handle, token, 3, Instant::now());
+        grant_and_write(&data_dispatch, 31, token, b"abc");
+
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let entered_probe = entered.clone();
+        let release_probe = release.clone();
+        target.set_write_probe(move || {
+            entered_probe.wait();
+            release_probe.wait();
+        });
+
+        let done = BulkFrame::Done(BulkDoneFrame {
+            stream_id: 31,
+            token,
+            total_transferred: 3,
+            checksum32: 0x364b_3fb7,
+        })
+        .to_data_service_frame()
+        .expect("done frame");
+        let runtime_for_done = runtime.clone();
+        let done_thread =
+            thread::spawn(move || runtime_for_done.handle_data_service_frame(SESSION_ID, done));
+        entered.wait();
+
+        let retry = accept_write_transfer(&data_dispatch, 2, 32, 3);
+        let retry_request = bulk_write_request(retry_handle, retry, 3, 2, 0);
+        let retry_outcome = runtime.handle_control_service_frame_at(
+            Instant::now(),
+            SESSION_ID,
+            control_request(&retry_request),
+        );
+        let active_transfers = runtime.bulk.active_transfer_count(SESSION_ID.0);
+        let adapter_pending = runtime.state.lock().unwrap().adapter.pending_bulk_len();
+
+        release.wait();
+        let done_outcome = done_thread.join().expect("done thread").expect("done");
+        let retry_outcome = retry_outcome.expect("retry collision reply");
+        let retry_reply = match retry_outcome {
+            ControlServiceDispatchOutcome::Reply(frame) => response(frame),
+            ControlServiceDispatchOutcome::Consumed => panic!("dispatching op must stay reserved"),
+        };
+
+        assert_eq!(retry_reply.header.errno, Errno::EALREADY);
+        assert_eq!(active_transfers, 0);
+        assert_eq!(adapter_pending, 0);
+        assert_eq!(done_outcome, DataServiceDispatchOutcome::Consumed);
+        assert_eq!(target.writes(), vec![b"abc".to_vec()]);
+        assert_eq!(sink.replies().len(), 1);
+        assert!(runtime.state.lock().unwrap().active_write_ops.is_empty());
     }
 
     #[test]
