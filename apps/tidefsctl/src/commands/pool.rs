@@ -28,6 +28,10 @@ use std::process;
 use clap::Parser;
 use tidefs_dataset_properties;
 use tidefs_local_filesystem::{LocalFileSystem, RecoveryPolicy};
+use tidefs_local_object_store::pool_importer::PoolImporter;
+use tidefs_local_object_store::pool_lifecycle_evidence::{
+    PoolLifecycleAction, PoolLifecycleEvidence,
+};
 use tidefs_local_object_store::StoreOptions;
 use tidefs_vfs_engine::{LivePoolAdminArg, LivePoolAdminArgs};
 
@@ -749,6 +753,45 @@ fn pool_scan_entry_json(e: &tidefs_pool_scan::DeviceScanEntry) -> serde_json::Va
     })
 }
 
+fn pool_lifecycle_evidence_json(evidence: &PoolLifecycleEvidence) -> serde_json::Value {
+    serde_json::json!({
+        "schema": "tidefs.pool-lifecycle-evidence.v1",
+        "source": "tidefs-local-object-store-pool-importer",
+        "action": evidence.action.stable_id(),
+        "outcome": evidence.outcome.stable_id(),
+        "pool_guid": evidence.pool_guid.map(|guid| hex_guid(&guid)),
+        "pool_name": evidence.pool_name.as_deref(),
+        "device_count": evidence.device_count,
+        "expected_device_count": evidence.expected_device_count,
+        "capacity_bytes": evidence.capacity_bytes,
+        "topology_generation": evidence.topology_generation,
+        "commit_group": evidence.commit_group,
+        "topology_complete": evidence.topology_complete,
+        "owner_authorized": evidence.owner_authorized,
+        "fail_closed": evidence.fail_closed,
+        "reason": evidence.reason.as_str(),
+    })
+}
+
+fn pool_scan_lifecycle_evidence_json(
+    devices: &[PathBuf],
+) -> (Vec<serde_json::Value>, Option<String>) {
+    match PoolImporter::scan_candidates(devices) {
+        Ok(pools) => (
+            pools
+                .iter()
+                .map(|pool| {
+                    pool_lifecycle_evidence_json(
+                        &pool.lifecycle_evidence(PoolLifecycleAction::Scan),
+                    )
+                })
+                .collect(),
+            None,
+        ),
+        Err(error) => (Vec::new(), Some(error.to_string())),
+    }
+}
+
 fn pool_scan_capability_lines(entry: &tidefs_pool_scan::DeviceScanEntry) -> [String; 2] {
     [
         format!(
@@ -771,9 +814,16 @@ fn handle_pool_scan(devices: Vec<PathBuf>, json: bool) {
     if json {
         let json_entries: Vec<serde_json::Value> =
             entries.iter().map(pool_scan_entry_json).collect();
+        let (lifecycle_evidence, lifecycle_evidence_error) =
+            pool_scan_lifecycle_evidence_json(&devices);
         println!(
             "{}",
-            serde_json::to_string_pretty(&serde_json::json!({ "devices": json_entries })).unwrap()
+            serde_json::to_string_pretty(&serde_json::json!({
+                "devices": json_entries,
+                "lifecycle_evidence": lifecycle_evidence,
+                "lifecycle_evidence_error": lifecycle_evidence_error,
+            }))
+            .unwrap()
         );
     } else {
         for entry in &entries {
@@ -2039,6 +2089,40 @@ mod tests {
 
         assert_eq!(json["device_backing"], "block-device");
         assert_eq!(json["discard_capability"], "supported");
+    }
+
+    #[test]
+    fn pool_scan_lifecycle_json_preserves_fail_closed_initial_generation() {
+        let evidence = PoolLifecycleEvidence::executed(
+            PoolLifecycleAction::Scan,
+            tidefs_local_object_store::pool_lifecycle_evidence::PoolLifecycleContext {
+                pool_guid: Some([0x44; 16]),
+                pool_name: Some("scan-pool".to_string()),
+                device_count: 2,
+                expected_device_count: 2,
+                capacity_bytes: 8192,
+                topology_generation: 0,
+                commit_group: 11,
+            },
+        );
+
+        let json = pool_lifecycle_evidence_json(&evidence);
+
+        assert_eq!(json["schema"], "tidefs.pool-lifecycle-evidence.v1");
+        assert_eq!(json["source"], "tidefs-local-object-store-pool-importer");
+        assert_eq!(json["action"], "scan");
+        assert_eq!(json["outcome"], "refused");
+        assert_eq!(json["pool_guid"], "44444444-4444-4444-4444-444444444444");
+        assert_eq!(json["pool_name"], "scan-pool");
+        assert_eq!(json["device_count"], 2);
+        assert_eq!(json["expected_device_count"], 2);
+        assert_eq!(json["capacity_bytes"], 8192);
+        assert_eq!(json["topology_generation"], 0);
+        assert_eq!(json["commit_group"], 11);
+        assert_eq!(json["topology_complete"], false);
+        assert_eq!(json["owner_authorized"], true);
+        assert_eq!(json["fail_closed"], true);
+        assert_eq!(json["reason"], "topology evidence incomplete");
     }
 
     #[test]

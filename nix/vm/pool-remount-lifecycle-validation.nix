@@ -206,6 +206,7 @@ done
 
 if [ ! -b "$DEV0" ] || [ ! -b "$DEV1" ]; then
     for op in virtio0_size virtio1_size pool_create ownerless_import_refused \
+             pool_lifecycle_scan_evidence \
              owner_mediated_import mount write_data fsync_data read_verify \
              unmount pool_export ownerless_reimport_refused \
              owner_mediated_reimport remount \
@@ -256,6 +257,29 @@ if command -v tidefsctl >/dev/null 2>&1; then
     fi
 else
     blocked "pool_create" "tidefsctl not found"
+fi
+
+echo ""
+echo "--- Phase 3a: Pool lifecycle scan evidence ---"
+
+SCAN_OUT=$(tidefsctl pool scan --devices "$DEV0" "$DEV1" --json 2>&1); RC=$?
+echo "  scan evidence exit=$RC"
+echo "  $SCAN_OUT"
+if [ "$RC" -eq 0 ] \
+   && printf '%s\n' "$SCAN_OUT" | grep -q '"schema"[[:space:]]*:[[:space:]]*"tidefs.pool-lifecycle-evidence.v1"' \
+   && printf '%s\n' "$SCAN_OUT" | grep -q '"action"[[:space:]]*:[[:space:]]*"scan"' \
+   && printf '%s\n' "$SCAN_OUT" | grep -q '"outcome"[[:space:]]*:[[:space:]]*"refused"' \
+   && printf '%s\n' "$SCAN_OUT" | grep -q '"expected_device_count"[[:space:]]*:[[:space:]]*2' \
+   && printf '%s\n' "$SCAN_OUT" | grep -q '"capacity_bytes"[[:space:]]*:[[:space:]]*268435456' \
+   && printf '%s\n' "$SCAN_OUT" | grep -q '"topology_generation"[[:space:]]*:[[:space:]]*0' \
+   && printf '%s\n' "$SCAN_OUT" | grep -q '"topology_complete"[[:space:]]*:[[:space:]]*false' \
+   && printf '%s\n' "$SCAN_OUT" | grep -q '"owner_authorized"[[:space:]]*:[[:space:]]*true' \
+   && printf '%s\n' "$SCAN_OUT" | grep -q '"fail_closed"[[:space:]]*:[[:space:]]*true' \
+   && printf '%s\n' "$SCAN_OUT" | grep -q '"reason"[[:space:]]*:[[:space:]]*"topology evidence incomplete"' \
+   && printf '%s\n' "$SCAN_OUT" | grep -q '"lifecycle_evidence_error"[[:space:]]*:[[:space:]]*null'; then
+    pass "pool_lifecycle_scan_evidence"
+else
+    fail "pool_lifecycle_scan_evidence" "expected fail-closed initial-generation scan evidence, exit=$RC output=$SCAN_OUT"
 fi
 
 echo ""
@@ -781,7 +805,8 @@ INITSCRIPT
     for op in \
       fuse_support fuse_device \
       virtio0_present virtio1_present virtio0_size virtio1_size \
-      pool_create ownerless_import_refused owner_mediated_import mount \
+      pool_create pool_lifecycle_scan_evidence \
+      ownerless_import_refused owner_mediated_import mount \
       write_data fsync_data read_verify unmount pool_export \
       ownerless_reimport_refused owner_mediated_reimport remount persist_verify \
       live_owner_status_visible post_remount_write_read \
