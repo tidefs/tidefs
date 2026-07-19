@@ -800,6 +800,11 @@ pub struct EcReadResult {
     pub fallbacks_used: usize,
     /// Whether the read required reconstruction (degraded).
     pub degraded: bool,
+    /// Number of reconstructed shards queued for local writeback.
+    ///
+    /// Call [`EcStoreRuntime::flush_repairs`] to persist those repaired shard
+    /// bytes before reporting the local repair as complete.
+    pub repairs_queued: usize,
 }
 
 // ── Shard integrity envelope helpers ──────────────────────────────────
@@ -1192,6 +1197,21 @@ impl EcStoreRuntime {
         }
     }
 
+    /// Write back shards reconstructed by earlier async degraded reads.
+    ///
+    /// Failed writebacks remain queued and return
+    /// [`EcStoreError::RepairFlushIncomplete`], matching the synchronous EC
+    /// store repair contract.
+    pub async fn flush_repairs(&self) -> Result<usize, EcStoreError> {
+        let store = Arc::clone(&self.store);
+        tokio::task::spawn_blocking(move || {
+            let mut store = store.blocking_lock();
+            store.flush_repairs()
+        })
+        .await
+        .map_err(|err| EcStoreError::Internal(format!("spawn_blocking join error: {err}")))?
+    }
+
     /// Access the underlying store reference count (for testing).
     #[must_use]
     pub fn ref_count(&self) -> usize {
@@ -1220,6 +1240,7 @@ impl EcWritePath {
 
         tokio::task::spawn_blocking(move || {
             let mut s = store.blocking_lock();
+            s.flush_repairs()?;
             let cap = s.config.data_capacity();
             let sw = s.config.store_count();
             let original_len = payload.len();
@@ -1363,6 +1384,7 @@ impl EcReadPath {
             let mut degraded = false;
             let mut shards_read: usize = 0;
             let mut fallbacks_used: usize = 0;
+            let mut repairs_queued: usize = 0;
 
             for stripe_idx in 0..num_stripes {
                 let mut available: Vec<Option<ErasureShard>> = Vec::with_capacity(sw);
@@ -1419,6 +1441,25 @@ impl EcReadPath {
                 let recon = reconstruct_receipt_stripe(&stripe_config, &available)
                     .inspect_err(|_| increment_cell(&s.stats.failed_reads))?;
 
+                for rebuilt in &recon.rebuilt_shards {
+                    let shard_key = shard_object_key(key, stripe_idx, rebuilt.index);
+                    let store_index =
+                        mapped_store_index(&s.shard_to_store, rebuilt.index, sw);
+                    let shard_record = encode_verified_shard(
+                        &object_prefix,
+                        stripe_idx,
+                        rebuilt.index,
+                        &rebuilt.bytes,
+                    )
+                    .map_err(EcStoreError::Internal)?;
+                    s.repair_queue.borrow_mut().push(PendingEcRepair {
+                        store_index,
+                        shard_key,
+                        shard_record,
+                    });
+                    repairs_queued += 1;
+                }
+
                 let stripe_chunk_len = match total_original_len {
                     Some(_len) if stripe_idx + 1 < num_stripes => cap,
                     Some(len) => len.saturating_sub(stripe_idx * cap),
@@ -1443,6 +1484,7 @@ impl EcReadPath {
                 shards_read,
                 fallbacks_used,
                 degraded,
+                repairs_queued,
             }))
         })
         .await
@@ -2258,6 +2300,7 @@ mod tests {
         assert_eq!(read.payload, payload);
         assert!(!read.degraded);
         assert!(read.fallbacks_used == 0);
+        assert_eq!(read.repairs_queued, 0);
 
         cleanup_dirs(&paths);
     }
@@ -2293,6 +2336,19 @@ mod tests {
         assert_eq!(read.payload, payload);
         assert!(read.degraded);
         assert!(read.fallbacks_used >= 1);
+        assert!(read.repairs_queued >= 1);
+
+        let queued = read.repairs_queued;
+        assert_eq!(runtime.flush_repairs().await.unwrap(), queued);
+        let repaired_read = runtime
+            .read_path("resilient")
+            .execute()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(repaired_read.payload, payload);
+        assert!(!repaired_read.degraded);
+        assert_eq!(repaired_read.repairs_queued, 0);
 
         cleanup_dirs(&paths);
     }
@@ -2329,6 +2385,19 @@ mod tests {
         let read = rp.execute().await.unwrap().unwrap();
         assert_eq!(read.payload, payload);
         assert!(read.degraded);
+        assert!(read.repairs_queued >= 2);
+
+        let queued = read.repairs_queued;
+        assert_eq!(runtime.flush_repairs().await.unwrap(), queued);
+        let repaired_read = runtime
+            .read_path("resilient2")
+            .execute()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(repaired_read.payload, payload);
+        assert!(!repaired_read.degraded);
+        assert_eq!(repaired_read.repairs_queued, 0);
 
         cleanup_dirs(&paths);
     }
@@ -2391,6 +2460,74 @@ mod tests {
         let runtime = EcStoreRuntime::new(store);
         let err = runtime.read_path(name).execute().await.unwrap_err();
         assert!(matches!(err, EcStoreError::DecodeFailed(_)));
+
+        cleanup_dirs(&paths);
+    }
+
+    #[tokio::test]
+    async fn async_degraded_read_repair_flush_failure_is_explicit_and_retriable() {
+        let paths = make_paths(3, "async-repair-flush-failure");
+        let mut store =
+            ErasureCodedStore::open(&paths, ErasureCodedStoreConfig::two_plus_one_test()).unwrap();
+        let name = b"async-degraded-read";
+        let payload = b"async repair writeback must not disappear".to_vec();
+        let key = ObjectKey::from_name(name);
+        let shard_key = shard_object_key(key, 0, 0);
+
+        store.put_named(name, &payload).unwrap();
+        store.stores[0].delete(shard_key).unwrap();
+        store.stores[0].enable_fault_injection(tidefs_local_object_store::FaultInjectionConfig {
+            write_failure_probability: 1.0,
+            ..tidefs_local_object_store::FaultInjectionConfig::off()
+        });
+
+        let runtime = EcStoreRuntime::new(store);
+        let read = runtime.read_path(name).execute().await.unwrap().unwrap();
+        assert_eq!(read.payload, payload);
+        assert!(read.degraded);
+        assert_eq!(read.repairs_queued, 1);
+
+        let err = runtime.flush_repairs().await.unwrap_err();
+        assert!(matches!(
+            err,
+            EcStoreError::RepairFlushIncomplete {
+                repaired: 0,
+                pending: 1,
+                failed_store_index: 0,
+                ref reason,
+            } if reason.contains("fault injection: write failure")
+        ));
+
+        let blocked = runtime
+            .write_path("blocked-write", b"must not pass pending repair".to_vec())
+            .execute()
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            blocked,
+            EcStoreError::RepairFlushIncomplete {
+                repaired: 0,
+                pending: 1,
+                failed_store_index: 0,
+                ..
+            }
+        ));
+        assert!(runtime
+            .read_path("blocked-write")
+            .execute()
+            .await
+            .unwrap()
+            .is_none());
+
+        {
+            let mut store = runtime.store.lock().await;
+            store.stores[0].disable_fault_injection();
+        }
+        assert_eq!(runtime.flush_repairs().await.unwrap(), 1);
+        let repaired_read = runtime.read_path(name).execute().await.unwrap().unwrap();
+        assert_eq!(repaired_read.payload, payload);
+        assert!(!repaired_read.degraded);
+        assert_eq!(repaired_read.repairs_queued, 0);
 
         cleanup_dirs(&paths);
     }
