@@ -123,6 +123,17 @@ pub struct WritebackProjectionStatsSnapshot {
     pub invalidation_allowed_clean: u64,
 }
 
+/// One adapter write whose provisional Dirty guard is visible while the
+/// write path publishes its backing dirty mirrors.
+///
+/// The token is intentionally non-cloneable. Completing it tells the
+/// projection that the write path's final mirror observation can replace the
+/// provisional guard without exposing a transient Clean lane.
+#[must_use]
+pub(crate) struct DirtyPublication {
+    ino: u64,
+}
+
 // ---------------------------------------------------------------------------
 // WritebackProjection — single observable dirty/writeback view
 // ---------------------------------------------------------------------------
@@ -143,6 +154,9 @@ pub struct WritebackProjectionStatsSnapshot {
 pub struct WritebackProjection {
     /// Per-inode observable lane: Clean, Dirty, or WritebackPending.
     lanes: Mutex<BTreeMap<u64, WritebackLane>>,
+    /// Number of accepted writes per inode that published a provisional Dirty
+    /// guard but have not yet published their complete backing-mirror view.
+    in_flight_dirty_publications: Mutex<BTreeMap<u64, u64>>,
     /// Reference to the adapter's PageCache for dirty-page mirror tracking.
     page_cache: Option<Arc<PageCache>>,
     /// Non-owning reference to the adapter's mmap coherency for
@@ -169,6 +183,7 @@ impl WritebackProjection {
     pub fn new(page_cache: Option<Arc<PageCache>>, mmap_coherency: Arc<MmapCoherency>) -> Self {
         Self {
             lanes: Mutex::new(BTreeMap::new()),
+            in_flight_dirty_publications: Mutex::new(BTreeMap::new()),
             page_cache,
             mmap_coherency: Arc::downgrade(&mmap_coherency),
             stats: WritebackProjectionStats::new(),
@@ -231,6 +246,25 @@ impl WritebackProjection {
         }
     }
 
+    fn has_in_flight_dirty_publication(&self, ino: u64) -> bool {
+        self.in_flight_dirty_publications
+            .lock()
+            .unwrap()
+            .get(&ino)
+            .is_some_and(|count| *count != 0)
+    }
+
+    fn refresh_dirty_observation_after_gate(&self, ino: u64, total_dirty_bytes: u64) {
+        let publication_in_flight = self.has_in_flight_dirty_publication(ino);
+        if total_dirty_bytes == 0 {
+            if !publication_in_flight {
+                self.record_clean_after_gate(ino);
+            }
+        } else {
+            self.record_dirty_after_gate(ino, total_dirty_bytes, publication_in_flight);
+        }
+    }
+
     /// Record that `ino` has dirty bytes (total dirty byte count across all
     /// tracked ranges).
     ///
@@ -250,6 +284,53 @@ impl WritebackProjection {
             .as_deref()
             .map(|gate| gate.lock().unwrap());
         self.record_dirty_after_gate(ino, total_dirty_bytes, true);
+    }
+
+    /// Publish a provisional Dirty guard before the adapter exposes any dirty
+    /// queue or cache mirror for an accepted write.
+    ///
+    /// A concurrent barrier may observe the mirrors before this write has
+    /// filled them. The returned token keeps that zero-byte observation from
+    /// erasing the provisional guard. The adapter must pass the token to
+    /// [`Self::finish_dirty_publication`] after all mirrors are visible.
+    pub(crate) fn begin_dirty_publication(
+        &self,
+        ino: u64,
+        provisional_dirty_bytes: u64,
+    ) -> DirtyPublication {
+        let dirty_transition_gate = self.dirty_transition_gate(ino);
+        let _dirty_transition_guard = dirty_transition_gate
+            .as_deref()
+            .map(|gate| gate.lock().unwrap());
+        let mut publications = self.in_flight_dirty_publications.lock().unwrap();
+        let count = publications.entry(ino).or_default();
+        *count = count.saturating_add(1);
+        drop(publications);
+        self.record_dirty_after_gate(ino, provisional_dirty_bytes, true);
+        DirtyPublication { ino }
+    }
+
+    /// Replace one provisional write guard with the complete dirty-mirror
+    /// observation published by that write path.
+    pub(crate) fn finish_dirty_publication(
+        &self,
+        publication: DirtyPublication,
+        observe_total_dirty_bytes: impl FnOnce() -> u64,
+    ) {
+        let dirty_transition_gate = self.dirty_transition_gate(publication.ino);
+        let _dirty_transition_guard = dirty_transition_gate
+            .as_deref()
+            .map(|gate| gate.lock().unwrap());
+        let total_dirty_bytes = observe_total_dirty_bytes();
+        let mut publications = self.in_flight_dirty_publications.lock().unwrap();
+        if let Some(count) = publications.get_mut(&publication.ino) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                publications.remove(&publication.ino);
+            }
+        }
+        drop(publications);
+        self.refresh_dirty_observation_after_gate(publication.ino, total_dirty_bytes);
     }
 
     /// Record that `ino` has been selected for writeback (dirty bytes have
@@ -287,7 +368,9 @@ impl WritebackProjection {
         let _dirty_transition_guard = dirty_transition_gate
             .as_deref()
             .map(|gate| gate.lock().unwrap());
-        self.record_clean_after_gate(ino);
+        if !self.has_in_flight_dirty_publication(ino) {
+            self.record_clean_after_gate(ino);
+        }
     }
 
     /// Refresh the projected lane from the adapter's current dirty mirrors.
@@ -307,16 +390,18 @@ impl WritebackProjection {
             .as_deref()
             .map(|gate| gate.lock().unwrap());
         let total_dirty_bytes = observe_total_dirty_bytes();
-        if total_dirty_bytes == 0 {
-            self.record_clean_after_gate(ino);
-        } else {
-            self.record_dirty_after_gate(ino, total_dirty_bytes, false);
-        }
+        self.refresh_dirty_observation_after_gate(ino, total_dirty_bytes);
     }
 
     /// Remove all tracking for `ino` (e.g., on last-close or forget).
     pub fn remove(&self, ino: u64) {
-        self.lanes.lock().unwrap().remove(&ino);
+        let dirty_transition_gate = self.dirty_transition_gate(ino);
+        let _dirty_transition_guard = dirty_transition_gate
+            .as_deref()
+            .map(|gate| gate.lock().unwrap());
+        if !self.has_in_flight_dirty_publication(ino) {
+            self.lanes.lock().unwrap().remove(&ino);
+        }
     }
 
     // ── Query methods ─────────────────────────────────────────────────
@@ -653,6 +738,28 @@ mod tests {
         p.refresh_dirty_observation(42, || 4096);
         assert_eq!(p.lane(42), Some(WritebackLane::Dirty { bytes: 4096 }));
         assert_eq!(p.stats_snapshot().dirty_transitions, 1);
+    }
+
+    #[test]
+    fn zero_byte_refresh_preserves_in_flight_dirty_publication() {
+        let p = new_projection();
+        let publication = p.begin_dirty_publication(42, 4096);
+
+        // A barrier can observe the old empty mirrors after the write has
+        // published its guard but before it has filled every backing mirror.
+        p.refresh_dirty_observation(42, || 0);
+        assert_eq!(p.lane(42), Some(WritebackLane::Dirty { bytes: 4096 }));
+        assert_eq!(p.stats_snapshot().clean_transitions, 0);
+        assert!(!p.invalidation_allowed(42));
+
+        p.finish_dirty_publication(publication, || 8192);
+        assert_eq!(p.lane(42), Some(WritebackLane::Dirty { bytes: 8192 }));
+        assert_eq!(p.stats_snapshot().dirty_transitions, 1);
+
+        p.refresh_dirty_observation(42, || 0);
+        assert_eq!(p.lane(42), None);
+        assert_eq!(p.stats_snapshot().clean_transitions, 1);
+        assert!(p.invalidation_allowed(42));
     }
 
     #[test]

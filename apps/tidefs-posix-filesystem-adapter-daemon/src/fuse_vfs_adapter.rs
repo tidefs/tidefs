@@ -7166,8 +7166,9 @@ impl FuseVfsAdapter {
         // The mmap invalidation worker runs independently, so delaying this
         // transition until the outer write dispatch returns would leave a
         // window where newly dirty bytes could still appear clean.
-        self.writeback_projection
-            .record_dirty(ino, u64::from(written));
+        let dirty_publication = self
+            .writeback_projection
+            .begin_dirty_publication(ino, u64::from(written));
 
         // Submit dirty extent to the writeback scheduler for
         // later flush/fsync writeback.
@@ -7290,9 +7291,17 @@ impl FuseVfsAdapter {
             .unwrap()
             .accept_write(ino, offset, &data[..written as usize]);
 
-        // Refresh the provisional guard with the complete observable total
-        // after every dirty mirror has been populated.
-        self.refresh_writeback_projection(ino);
+        // Replace the provisional guard with the complete observable total
+        // after every dirty mirror has been populated. A concurrent clean
+        // refresh cannot erase the guard while this publication is in flight.
+        let projection = Arc::clone(&self.writeback_projection);
+        projection.finish_dirty_publication(dirty_publication, || {
+            WritebackProjection::total_observable_dirty_bytes(
+                &self.dirty_state,
+                self.writeback_page_cache.as_ref(),
+                ino,
+            )
+        });
     }
 
     fn record_clean_write_through_after_write(
