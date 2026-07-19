@@ -77,6 +77,14 @@ let
     GENERIC_013_TIMEOUT_SEC="''${TIDEFS_FUSE_XFSTESTS_GENERIC_013_TIMEOUT:-900}"
     QEMU_MEMORY_MB="''${TIDEFS_FUSE_XFSTESTS_QEMU_MEMORY_MB:-2048}"
     STORE_IMAGE_MB="''${TIDEFS_FUSE_XFSTESTS_STORE_IMAGE_MB:-8192}"
+    DEFAULT_CONTENT_CAPACITY_BYTES=2147483648
+    GENERIC_694_CONTENT_CAPACITY_BYTES=5368709120
+    GENERIC_694_MIN_STORE_IMAGE_MB=6144
+    CONTENT_CAPACITY_BYTES="''${TIDEFS_FUSE_XFSTESTS_CONTENT_CAPACITY_BYTES:-$DEFAULT_CONTENT_CAPACITY_BYTES}"
+    CONTENT_CAPACITY_EXPLICIT=0
+    if [ -n "''${TIDEFS_FUSE_XFSTESTS_CONTENT_CAPACITY_BYTES+x}" ]; then
+      CONTENT_CAPACITY_EXPLICIT=1
+    fi
     CRASHDUMP_MODE="''${TIDEFS_FUSE_XFSTESTS_CRASHDUMP:-0}"
     PANIC_ON_WARN_MODE="''${TIDEFS_FUSE_XFSTESTS_PANIC_ON_WARN:-0}"
     CRASH_BIN="''${TIDEFS_FUSE_XFSTESTS_CRASH_BIN:-/usr/bin/crash}"
@@ -103,6 +111,9 @@ Options:
 Environment:
   TIDEFS_FUSE_XFSTESTS_QEMU_MEMORY_MB  Guest RAM in MiB (default: $QEMU_MEMORY_MB)
   TIDEFS_FUSE_XFSTESTS_STORE_IMAGE_MB  Guest /store disk image in MiB (default: $STORE_IMAGE_MB)
+  TIDEFS_FUSE_XFSTESTS_CONTENT_CAPACITY_BYTES
+                                      Mounted TideFS content capacity in bytes
+                                      (default: 2 GiB; generic/694: 5 GiB)
   TIDEFS_FUSE_XFSTESTS_PANIC_ON_WARN   Set guest panic-on-warning/lockup knobs (0/1)
   TIDEFS_FUSE_XFSTESTS_CRASHDUMP       Dump guest memory through QMP on panic/timeout (0/1)
   TIDEFS_FUSE_XFSTESTS_GENERIC_013_TIMEOUT
@@ -201,6 +212,34 @@ EOF
       fi
     fi
 
+    generic_694_requested=0
+    for requested_test in $TEST_LIST; do
+      case "$requested_test" in
+        generic/694)
+          generic_694_requested=1
+          ;;
+      esac
+    done
+    if [ "$generic_694_requested" -eq 1 ] && [ "$CONTENT_CAPACITY_EXPLICIT" -eq 0 ]; then
+      CONTENT_CAPACITY_BYTES="$GENERIC_694_CONTENT_CAPACITY_BYTES"
+    fi
+
+    case "$CONTENT_CAPACITY_BYTES" in
+      ""|*[!0-9]*)
+        echo "invalid TIDEFS_FUSE_XFSTESTS_CONTENT_CAPACITY_BYTES: $CONTENT_CAPACITY_BYTES" >&2
+        exit 2
+        ;;
+    esac
+    if [ "$CONTENT_CAPACITY_BYTES" -le 0 ]; then
+      echo "TIDEFS_FUSE_XFSTESTS_CONTENT_CAPACITY_BYTES must be > 0" >&2
+      exit 2
+    fi
+    if [ "$generic_694_requested" -eq 1 ] \
+       && [ "$CONTENT_CAPACITY_BYTES" -lt "$GENERIC_694_CONTENT_CAPACITY_BYTES" ]; then
+      echo "generic/694 requires at least $GENERIC_694_CONTENT_CAPACITY_BYTES content-capacity bytes" >&2
+      exit 2
+    fi
+
     case "$QEMU_MEMORY_MB" in
       ""|*[!0-9]*)
         echo "invalid TIDEFS_FUSE_XFSTESTS_QEMU_MEMORY_MB: $QEMU_MEMORY_MB" >&2
@@ -219,6 +258,11 @@ EOF
     esac
     if [ "$STORE_IMAGE_MB" -le 0 ]; then
       echo "TIDEFS_FUSE_XFSTESTS_STORE_IMAGE_MB must be > 0" >&2
+      exit 2
+    fi
+    if [ "$generic_694_requested" -eq 1 ] \
+       && [ "$STORE_IMAGE_MB" -lt "$GENERIC_694_MIN_STORE_IMAGE_MB" ]; then
+      echo "generic/694 requires at least $GENERIC_694_MIN_STORE_IMAGE_MB MiB of backing-store image" >&2
       exit 2
     fi
 
@@ -257,6 +301,7 @@ if false; then
     echo "  Row timeout: ''${PER_TEST_TIMEOUT_SEC}s (generic/013: ''${GENERIC_013_TIMEOUT_SEC}s)"
     echo "  Memory:    $QEMU_MEMORY_MB MiB"
     echo "  Store img: $STORE_IMAGE_MB MiB"
+    echo "  Content:   $CONTENT_CAPACITY_BYTES bytes"
     echo "  Panic warn:$PANIC_ON_WARN_MODE"
     echo "  Crashdump: $CRASHDUMP_MODE"
     echo "  vmlinux:   $KERNEL_VMLINUX"
@@ -438,7 +483,7 @@ daemon_opts="relatime,dev,allow_other"
 daemon_read_only=""
 daemon_coherency="writeback"
 daemon_writeback_cache="1"
-daemon_content_capacity_bytes="2147483648"
+daemon_content_capacity_bytes="__TIDEFS_FUSE_XFSTESTS_CONTENT_CAPACITY_BYTES__"
 daemon_slow_request_diagnostics="''${TIDEFS_FUSE_SLOW_REQUEST_DIAGNOSTICS:-1}"
 daemon_slow_request_ms="''${TIDEFS_FUSE_SLOW_REQUEST_MS:-1000}"
 daemon_slow_request_report_ms="''${TIDEFS_FUSE_SLOW_REQUEST_REPORT_MS:-5000}"
@@ -1761,6 +1806,7 @@ INITSCRIPT
     sed -i "s|__XFSTESTS_FOCUSED_TESTS__|$FOCUSED_TESTS|g" "$RUN_DIR/init"
     sed -i "s|__XFSTESTS_PER_TEST_TIMEOUT__|$PER_TEST_TIMEOUT_SEC|g" "$RUN_DIR/init"
     sed -i "s|__XFSTESTS_GENERIC_013_TIMEOUT__|$GENERIC_013_TIMEOUT_SEC|g" "$RUN_DIR/init"
+    sed -i "s|__TIDEFS_FUSE_XFSTESTS_CONTENT_CAPACITY_BYTES__|$CONTENT_CAPACITY_BYTES|g" "$RUN_DIR/init"
     sed -i "s|__PANIC_ON_WARN_MODE__|$PANIC_ON_WARN_MODE|g" "$RUN_DIR/init"
 
     chmod +x "$RUN_DIR/init"
@@ -2019,6 +2065,7 @@ CRASHCMDS
   "accel_mode": "$ACCEL_MODE",
   "qemu_memory_mb": $QEMU_MEMORY_MB,
   "store_image_mb": $STORE_IMAGE_MB,
+  "content_capacity_bytes": $CONTENT_CAPACITY_BYTES,
   "summary": {
     "passed": $PASSC,
     "failed": $FAILC,
@@ -2149,6 +2196,7 @@ SUMMARYEOF
   "log": "$OUT_DIR/qemu-boot.log",
   "qemu_memory_mb": $QEMU_MEMORY_MB,
   "store_image_mb": $STORE_IMAGE_MB,
+  "content_capacity_bytes": $CONTENT_CAPACITY_BYTES,
   "validation": [
     {
       "command": "nix run .#fuse-xfstests-validation -- --tests \"$TEST_LIST\" --output $JSON_OUT",

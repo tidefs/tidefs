@@ -52,6 +52,31 @@ fourth (`all`) dispatches every matrix job.
 - **Evidence scope**: `focused` when `tests` input is non-empty, otherwise
   `broad`.
 
+### Focused large-file profile: `generic/694`
+
+`generic/694` creates a 4 GiB regular file and checks that its `st_blocks`
+value is unchanged after the test filesystem remounts. It is a focused FUSE
+row, not part of the default smoke tranche.
+
+The FUSE runner keeps the ordinary mounted-row content capacity at 2 GiB. When
+`generic/694` is selected, it configures 5 GiB of TideFS content capacity and
+requires at least a 6 GiB backing-store image. The runner's default 8 GiB
+image meets that requirement. An explicit lower content-capacity or
+backing-image setting fails before QEMU starts rather than running the row
+against an undersized filesystem.
+
+The focused dispatch may state both selected values explicitly:
+
+```sh
+TIDEFS_FUSE_XFSTESTS_CONTENT_CAPACITY_BYTES=5368709120 \\
+TIDEFS_FUSE_XFSTESTS_STORE_IMAGE_MB=8192 \\
+nix run .#fuse-xfstests-validation -- --tests "generic/694" \\
+  --output "$ARTIFACT_ROOT/validation.json"
+```
+
+The resulting `validation.json` and validation manifest record the resolved
+content capacity and backing-image size alongside the focused row result.
+
 ### Target: `kmod-smoke`
 
 - **Validation command**:
