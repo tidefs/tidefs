@@ -16,6 +16,21 @@ use tidefs_validation::validation_schema::ValidationTier;
 const SCHEMA_VERSION: u32 = 1;
 const VERDICT_BOUNDARY: &str = "release-readiness-verdict";
 
+const REQUIRED_TOP_LEVEL_LANE_LOCAL_MANIFESTS: &[&str] = &[
+    "xfstests lane-local evidence manifest",
+    "Kernel fsync lane-local evidence manifest",
+    "Focused Rust lane-local evidence manifest",
+    "RDMA lane-local evidence manifest",
+];
+
+const REQUIRED_LANE_LOCAL_MANIFESTS: &[(&str, &str)] = &[
+    ("rust-smoke", "Focused Rust lane-local evidence manifest"),
+    ("nix", "Nix release-candidate job result"),
+    ("qemu", "Kernel fsync lane-local evidence manifest"),
+    ("xfstests", "xfstests lane-local evidence manifest"),
+    ("rdma", "RDMA lane-local evidence manifest"),
+];
+
 const REQUIRED_EVIDENCE_FAMILIES: &[RequiredEvidenceFamilySpec] = &[
     RequiredEvidenceFamilySpec {
         id: "release-candidate-evidence-index",
@@ -397,6 +412,7 @@ struct ReleaseCandidateVerdict {
     #[serde(skip_serializing_if = "Option::is_none")]
     product_readiness_boundary: Option<String>,
     lanes: Vec<CiLaneVerdict>,
+    lane_local_manifests: Vec<LaneLocalManifestVerdict>,
     details: Vec<String>,
 }
 
@@ -410,6 +426,18 @@ struct CiLaneVerdict {
     status: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     job_name: Option<String>,
+    details: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct LaneLocalManifestVerdict {
+    scope: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lane_id: Option<String>,
+    evidence_class: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<String>,
+    outcome: VerdictOutcome,
     details: Vec<String>,
 }
 
@@ -534,6 +562,8 @@ struct ReleaseCandidateIndex {
     profile: String,
     #[serde(default)]
     claim_boundary: ReleaseCandidateClaimBoundary,
+    #[serde(default)]
+    lane_local_manifest_boundaries: Option<Vec<ReleaseCandidateLaneLocalManifest>>,
     lanes: Vec<ReleaseCandidateLane>,
 }
 
@@ -569,6 +599,18 @@ struct ReleaseCandidateLane {
     #[serde(default)]
     github_needs_result: Option<String>,
     status: String,
+    #[serde(default)]
+    lane_local_manifest: Option<ReleaseCandidateLaneLocalManifest>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReleaseCandidateLaneLocalManifest {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    current_owner_issue: Option<u64>,
+    #[serde(default)]
+    evidence_class: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -833,6 +875,7 @@ fn evaluate_release_candidate_index(
             source_sha: None,
             product_readiness_boundary: None,
             lanes: Vec::new(),
+            lane_local_manifests: Vec::new(),
             details: input.details.clone(),
         };
     }
@@ -850,6 +893,7 @@ fn evaluate_release_candidate_index(
                 source_sha: None,
                 product_readiness_boundary: None,
                 lanes: Vec::new(),
+                lane_local_manifests: Vec::new(),
                 details: vec![format!("cannot read release-candidate index: {err}")],
             };
         }
@@ -867,6 +911,7 @@ fn evaluate_release_candidate_index(
                 source_sha: None,
                 product_readiness_boundary: None,
                 lanes: Vec::new(),
+                lane_local_manifests: Vec::new(),
                 details: vec![format!("release-candidate index schema mismatch: {err}")],
             };
         }
@@ -952,12 +997,21 @@ fn evaluate_release_candidate_index(
             }
         })
         .collect::<Vec<_>>();
+    let lane_local_manifests = evaluate_lane_local_manifests(&index);
 
     if lanes.is_empty() {
         details.push("release-candidate index has no lane results".to_string());
     }
     if lanes.iter().any(|lane| !lane.outcome.is_pass()) {
         details.push("one or more release-candidate lanes are not complete pass evidence".into());
+    }
+    if lane_local_manifests
+        .iter()
+        .any(|manifest| !manifest.outcome.is_pass())
+    {
+        details.push(
+            "one or more required lane-local manifests are not complete pass evidence".into(),
+        );
     }
 
     let outcome = if details.iter().any(|detail| {
@@ -969,6 +1023,9 @@ fn evaluate_release_candidate_index(
     } else if lanes
         .iter()
         .any(|lane| lane.outcome == VerdictOutcome::Malformed)
+        || lane_local_manifests
+            .iter()
+            .any(|manifest| manifest.outcome == VerdictOutcome::Malformed)
     {
         VerdictOutcome::Malformed
     } else if lanes
@@ -979,6 +1036,9 @@ fn evaluate_release_candidate_index(
     } else if lanes
         .iter()
         .any(|lane| lane.outcome == VerdictOutcome::Missing)
+        || lane_local_manifests
+            .iter()
+            .any(|manifest| manifest.outcome == VerdictOutcome::Missing)
     {
         VerdictOutcome::Missing
     } else if details.is_empty() {
@@ -997,7 +1057,180 @@ fn evaluate_release_candidate_index(
         source_sha: Some(index.source.sha),
         product_readiness_boundary: index.claim_boundary.product_readiness,
         lanes,
+        lane_local_manifests,
         details,
+    }
+}
+
+fn evaluate_lane_local_manifests(index: &ReleaseCandidateIndex) -> Vec<LaneLocalManifestVerdict> {
+    let mut verdicts = Vec::new();
+
+    for evidence_class in REQUIRED_TOP_LEVEL_LANE_LOCAL_MANIFESTS {
+        let mut boundaries = index
+            .lane_local_manifest_boundaries
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .filter(|boundary| boundary.evidence_class.as_deref() == Some(*evidence_class));
+        match (boundaries.next(), boundaries.next()) {
+            (None, _) => verdicts.push(missing_lane_local_manifest(
+                "top-level boundary",
+                None,
+                evidence_class,
+            )),
+            (Some(boundary), None) => verdicts.push(evaluate_lane_local_manifest(
+                "top-level boundary",
+                None,
+                evidence_class,
+                Some(boundary),
+                false,
+            )),
+            (Some(_), Some(_)) => verdicts.push(malformed_lane_local_manifest(
+                "top-level boundary",
+                None,
+                evidence_class,
+                None,
+                format!(
+                    "top-level lane-local manifest boundary `{evidence_class}` is declared more than once"
+                ),
+            )),
+        }
+    }
+
+    if let Some(boundaries) = index.lane_local_manifest_boundaries.as_deref() {
+        for boundary in boundaries.iter().filter(|boundary| {
+            !REQUIRED_TOP_LEVEL_LANE_LOCAL_MANIFESTS
+                .iter()
+                .any(|expected| boundary.evidence_class.as_deref() == Some(*expected))
+        }) {
+            verdicts.push(malformed_lane_local_manifest(
+                "top-level boundary",
+                None,
+                boundary
+                    .evidence_class
+                    .as_deref()
+                    .unwrap_or("<missing evidence class>"),
+                boundary.status.clone(),
+                "top-level lane-local manifest boundary has an unknown or missing evidence class"
+                    .to_string(),
+            ));
+        }
+    }
+
+    for &(lane_id, evidence_class) in REQUIRED_LANE_LOCAL_MANIFESTS {
+        let manifest = index
+            .lanes
+            .iter()
+            .find(|lane| lane.id == lane_id)
+            .and_then(|lane| lane.lane_local_manifest.as_ref());
+        verdicts.push(evaluate_lane_local_manifest(
+            "lane",
+            Some(lane_id),
+            evidence_class,
+            manifest,
+            lane_id == "nix",
+        ));
+    }
+
+    verdicts
+}
+
+fn evaluate_lane_local_manifest(
+    scope: &str,
+    lane_id: Option<&str>,
+    expected_evidence_class: &str,
+    manifest: Option<&ReleaseCandidateLaneLocalManifest>,
+    allows_not_applicable: bool,
+) -> LaneLocalManifestVerdict {
+    let Some(manifest) = manifest else {
+        return missing_lane_local_manifest(scope, lane_id, expected_evidence_class);
+    };
+
+    let mut details = Vec::new();
+    let mut outcome = match manifest.status.as_deref() {
+        Some("absent") => {
+            details.push("lane-local manifest is explicitly absent".to_string());
+            VerdictOutcome::Missing
+        }
+        Some("not_applicable") if allows_not_applicable => VerdictOutcome::Pass,
+        Some("not_applicable") => {
+            details.push(
+                "only the Nix lane may declare a lane-local manifest not_applicable".to_string(),
+            );
+            VerdictOutcome::Malformed
+        }
+        Some(status) => {
+            details.push(format!(
+                "lane-local manifest status `{status}` is not accepted by the release-candidate evidence contract"
+            ));
+            VerdictOutcome::Malformed
+        }
+        None => {
+            details.push("lane-local manifest status is missing".to_string());
+            VerdictOutcome::Malformed
+        }
+    };
+
+    if manifest.evidence_class.as_deref() != Some(expected_evidence_class) {
+        details.push(format!(
+            "lane-local manifest evidence class must be `{expected_evidence_class}`"
+        ));
+        outcome = VerdictOutcome::Malformed;
+    }
+    if let Some(owner_issue) = manifest.current_owner_issue {
+        details.push(format!(
+            "lane-local manifest current_owner_issue must remain null, got #{owner_issue}"
+        ));
+        outcome = VerdictOutcome::Malformed;
+    }
+
+    LaneLocalManifestVerdict {
+        scope: scope.to_string(),
+        lane_id: lane_id.map(str::to_string),
+        evidence_class: manifest
+            .evidence_class
+            .clone()
+            .unwrap_or_else(|| expected_evidence_class.to_string()),
+        status: manifest.status.clone(),
+        outcome,
+        details,
+    }
+}
+
+fn missing_lane_local_manifest(
+    scope: &str,
+    lane_id: Option<&str>,
+    evidence_class: &str,
+) -> LaneLocalManifestVerdict {
+    let subject = lane_id
+        .map(|lane_id| format!("lane `{lane_id}`"))
+        .unwrap_or_else(|| "top-level boundary".to_string());
+    LaneLocalManifestVerdict {
+        scope: scope.to_string(),
+        lane_id: lane_id.map(str::to_string),
+        evidence_class: evidence_class.to_string(),
+        status: None,
+        outcome: VerdictOutcome::Missing,
+        details: vec![format!(
+            "{subject} lane-local manifest `{evidence_class}` is missing"
+        )],
+    }
+}
+
+fn malformed_lane_local_manifest(
+    scope: &str,
+    lane_id: Option<&str>,
+    evidence_class: &str,
+    status: Option<String>,
+    detail: String,
+) -> LaneLocalManifestVerdict {
+    LaneLocalManifestVerdict {
+        scope: scope.to_string(),
+        lane_id: lane_id.map(str::to_string),
+        evidence_class: evidence_class.to_string(),
+        status,
+        outcome: VerdictOutcome::Malformed,
+        details: vec![detail],
     }
 }
 
@@ -1515,6 +1748,24 @@ fn collect_release_candidate_gaps(rc: &ReleaseCandidateVerdict, open_gaps: &mut 
             });
         }
     }
+    for manifest in &rc.lane_local_manifests {
+        if !manifest.outcome.is_pass() {
+            let subject = manifest
+                .lane_id
+                .as_deref()
+                .map(|lane_id| format!("lane `{lane_id}`"))
+                .unwrap_or_else(|| "top-level boundary".to_string());
+            open_gaps.push(OpenGap {
+                family: "release-candidate-evidence-index".to_string(),
+                outcome: manifest.outcome,
+                detail: format!(
+                    "{subject} lane-local manifest `{}` is not pass evidence: {}",
+                    manifest.evidence_class,
+                    manifest.details.join("; ")
+                ),
+            });
+        }
+    }
 }
 
 fn collect_gate_gaps(gates: &[ProductAdmissionGateVerdict], open_gaps: &mut Vec<OpenGap>) {
@@ -1709,6 +1960,118 @@ mod tests {
                     .details
                     .iter()
                     .any(|detail| detail.contains("github_needs_result=success"))));
+    }
+
+    #[test]
+    fn release_readiness_absent_lane_manifests_fail_closed() {
+        let fixture = Fixture::new();
+        fixture.write_rc_index(&fixture.source_ref, &fixture.source_sha, "full");
+        fixture.write_claim_registry("validated");
+        fixture.write_non_claim_inputs();
+
+        let artifact = assemble_verdict(&fixture.config());
+
+        assert_eq!(
+            artifact.release_candidate_index.outcome,
+            VerdictOutcome::Missing
+        );
+        assert!(artifact
+            .release_candidate_index
+            .lane_local_manifests
+            .iter()
+            .any(|manifest| manifest.lane_id.as_deref() == Some("rust-smoke")
+                && manifest.evidence_class == "Focused Rust lane-local evidence manifest"
+                && manifest.outcome == VerdictOutcome::Missing
+                && manifest
+                    .details
+                    .iter()
+                    .any(|detail| detail.contains("explicitly absent"))));
+        assert!(artifact.open_gaps.iter().any(|gap| {
+            gap.family == "release-candidate-evidence-index"
+                && gap.detail.contains("lane `rust-smoke`")
+                && gap
+                    .detail
+                    .contains("Focused Rust lane-local evidence manifest")
+        }));
+        assert_eq!(
+            artifact.product_readiness_verdict,
+            ProductReadinessVerdict::NotReady
+        );
+    }
+
+    #[test]
+    fn release_readiness_missing_lane_manifest_boundary_fails_closed() {
+        let fixture = Fixture::new();
+        fixture.write_rc_index(&fixture.source_ref, &fixture.source_sha, "full");
+        fixture.update_rc_index(|index| {
+            index
+                .as_object_mut()
+                .unwrap()
+                .remove("lane_local_manifest_boundaries");
+        });
+
+        let artifact = assemble_verdict(&fixture.config());
+
+        assert_eq!(
+            artifact.release_candidate_index.outcome,
+            VerdictOutcome::Missing
+        );
+        assert!(artifact
+            .release_candidate_index
+            .lane_local_manifests
+            .iter()
+            .any(|manifest| manifest.scope == "top-level boundary"
+                && manifest.evidence_class == "xfstests lane-local evidence manifest"
+                && manifest.outcome == VerdictOutcome::Missing
+                && manifest
+                    .details
+                    .iter()
+                    .any(|detail| detail.contains("is missing"))));
+    }
+
+    #[test]
+    fn release_readiness_malformed_lane_manifest_boundary_fails_closed() {
+        let fixture = Fixture::new();
+        fixture.write_rc_index(&fixture.source_ref, &fixture.source_sha, "full");
+        fixture.update_rc_index(|index| {
+            index["lanes"][0]["lane_local_manifest"]["status"] =
+                serde_json::Value::String("not_applicable".to_string());
+        });
+
+        let artifact = assemble_verdict(&fixture.config());
+
+        assert_eq!(
+            artifact.release_candidate_index.outcome,
+            VerdictOutcome::Malformed
+        );
+        assert!(artifact
+            .release_candidate_index
+            .lane_local_manifests
+            .iter()
+            .any(|manifest| manifest.lane_id.as_deref() == Some("rust-smoke")
+                && manifest.evidence_class == "Focused Rust lane-local evidence manifest"
+                && manifest.outcome == VerdictOutcome::Malformed
+                && manifest
+                    .details
+                    .iter()
+                    .any(|detail| detail.contains("only the Nix lane"))));
+    }
+
+    #[test]
+    fn release_readiness_accepts_nix_not_applicable_manifest() {
+        let fixture = Fixture::new();
+        fixture.write_rc_index(&fixture.source_ref, &fixture.source_sha, "full");
+
+        let artifact = assemble_verdict(&fixture.config());
+
+        assert!(artifact
+            .release_candidate_index
+            .lane_local_manifests
+            .iter()
+            .any(|manifest| manifest.lane_id.as_deref() == Some("nix")
+                && manifest.evidence_class == "Nix release-candidate job result"
+                && manifest.status.as_deref() == Some("not_applicable")
+                && manifest.outcome == VerdictOutcome::Pass));
     }
 
     #[test]
@@ -1991,16 +2354,32 @@ mod tests {
     "product_readiness": "not_claimed",
     "lane_local_manifests_synthesized": false
   }},
+  "lane_local_manifest_boundaries": [
+    {{"status":"absent","current_owner_issue":null,"evidence_class":"xfstests lane-local evidence manifest"}},
+    {{"status":"absent","current_owner_issue":null,"evidence_class":"Kernel fsync lane-local evidence manifest"}},
+    {{"status":"absent","current_owner_issue":null,"evidence_class":"Focused Rust lane-local evidence manifest"}},
+    {{"status":"absent","current_owner_issue":null,"evidence_class":"RDMA lane-local evidence manifest"}}
+  ],
   "lanes": [
-    {{"id":"rust-smoke","job_name":"Rust smoke","github_needs_result":"{rust_needs_result}","status":"run"}},
-    {{"id":"nix","job_name":"Nix","github_needs_result":"success","status":"run"}},
-    {{"id":"qemu","job_name":"QEMU","github_needs_result":"success","status":"run"}},
-    {{"id":"xfstests","job_name":"xfstests",{skipped}}},
-    {{"id":"rdma","job_name":"RDMA",{skipped}}}
+    {{"id":"rust-smoke","job_name":"Rust smoke","github_needs_result":"{rust_needs_result}","status":"run","lane_local_manifest":{{"status":"absent","current_owner_issue":null,"evidence_class":"Focused Rust lane-local evidence manifest"}}}},
+    {{"id":"nix","job_name":"Nix","github_needs_result":"success","status":"run","lane_local_manifest":{{"status":"not_applicable","current_owner_issue":null,"evidence_class":"Nix release-candidate job result"}}}},
+    {{"id":"qemu","job_name":"QEMU","github_needs_result":"success","status":"run","lane_local_manifest":{{"status":"absent","current_owner_issue":null,"evidence_class":"Kernel fsync lane-local evidence manifest"}}}},
+    {{"id":"xfstests","job_name":"xfstests",{skipped},"lane_local_manifest":{{"status":"absent","current_owner_issue":null,"evidence_class":"xfstests lane-local evidence manifest"}}}},
+    {{"id":"rdma","job_name":"RDMA",{skipped},"lane_local_manifest":{{"status":"absent","current_owner_issue":null,"evidence_class":"RDMA lane-local evidence manifest"}}}}
   ]
 }}"#
             );
             fs::write(path, json).unwrap();
+        }
+
+        fn update_rc_index(&self, update: impl FnOnce(&mut serde_json::Value)) {
+            let path = self
+                .temp
+                .path()
+                .join("release-candidate-evidence-index/index.json");
+            let mut index = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            update(&mut index);
+            fs::write(path, serde_json::to_string(&index).unwrap()).unwrap();
         }
 
         fn write_claim_registry(&self, status: &str) {
