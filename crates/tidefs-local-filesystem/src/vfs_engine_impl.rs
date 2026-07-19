@@ -4073,6 +4073,7 @@ fn snap_net_payload_len_for_mtu(payload_len: usize, mtu: usize) -> Result<u32, S
     Ok(encoded_len)
 }
 
+#[cfg(test)]
 fn snap_net_transport_payload_max_len() -> Result<usize, String> {
     snap_net_transport_payload_max_len_for_mtu(DEFAULT_MTU)
 }
