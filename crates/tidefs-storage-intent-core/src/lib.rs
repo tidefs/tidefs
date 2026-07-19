@@ -8745,6 +8745,8 @@ pub enum ReadServingSourceClass {
     SnapshotGeneration = 6,
     GeoAsyncLag = 7,
     ArchiveRestore = 8,
+    /// Persistent-memory authority with its own durability evidence.
+    PmemAuthority = 9,
 }
 
 /// Freshness evidence for a selected read source.
@@ -10777,6 +10779,7 @@ impl_u8_canonical!(ReadServingSourceClass, {
     SnapshotGeneration = 6 => "snapshot-generation",
     GeoAsyncLag = 7 => "geo-async-lag",
     ArchiveRestore = 8 => "archive-restore",
+    PmemAuthority = 9 => "pmem-authority",
 });
 
 impl_u8_canonical!(TransformRefusalClass, {

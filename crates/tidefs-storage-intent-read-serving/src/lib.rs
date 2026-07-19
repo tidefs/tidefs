@@ -624,9 +624,9 @@ pub const fn read_source_core_class(
         StorageIntentReadSourceClass::CacheOnlyServingTrial => {
             CoreReadServingSourceClass::ServingTrial
         }
-        StorageIntentReadSourceClass::AuthoritativeRam
-        | StorageIntentReadSourceClass::AuthoritativePmem => {
-            CoreReadServingSourceClass::RamAuthority
+        StorageIntentReadSourceClass::AuthoritativeRam => CoreReadServingSourceClass::RamAuthority,
+        StorageIntentReadSourceClass::AuthoritativePmem => {
+            CoreReadServingSourceClass::PmemAuthority
         }
         StorageIntentReadSourceClass::LocalPlacementReceipt => {
             CoreReadServingSourceClass::PlacementReceipt
@@ -2697,6 +2697,30 @@ mod tests {
         assert!(refused
             .rejected_reasons
             .intersects(ReadServingRejectionMask::PMEM_MISSING_MEDIA_CAPABILITY));
+    }
+
+    #[test]
+    fn ram_and_pmem_keep_distinct_core_source_projection() {
+        let ram = decide(
+            policy(ReadFreshnessProfile::LatestLocal),
+            candidate(StorageIntentReadSourceClass::AuthoritativeRam),
+        );
+        let pmem = decide(
+            policy(ReadFreshnessProfile::LatestLocal),
+            candidate(StorageIntentReadSourceClass::AuthoritativePmem),
+        );
+
+        assert_eq!(ram.core_source, CoreReadServingSourceClass::RamAuthority);
+        assert_eq!(
+            ram.freshness.source,
+            CoreReadServingSourceClass::RamAuthority
+        );
+        assert_eq!(pmem.core_source, CoreReadServingSourceClass::PmemAuthority);
+        assert_eq!(
+            pmem.freshness.source,
+            CoreReadServingSourceClass::PmemAuthority
+        );
+        assert_eq!(pmem.core_source.as_str(), "pmem-authority");
     }
 
     #[test]
