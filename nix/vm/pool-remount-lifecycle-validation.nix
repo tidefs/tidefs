@@ -174,11 +174,11 @@ blocked(){ echo "BLOCKED: $1 -- $2"; BLOCKED=$((BLOCKED + 1)); }
 echo "--- Phase 0: Kernel support ---"
 
 if grep -qw fuse /proc/filesystems 2>/dev/null; then
-    pass "fuse_builtin"
+    echo "fuse_provider=builtin"
     pass "fuse_support"
 elif [ -f /lib/modules/fuse.ko ]; then
     if insmod /lib/modules/fuse.ko 2>/tmp/fuse-insmod.err; then
-        pass "fuse_module"
+        echo "fuse_provider=module"
         pass "fuse_support"
     else
         fail "fuse_support" "$(cat /tmp/fuse-insmod.err 2>/dev/null)"
