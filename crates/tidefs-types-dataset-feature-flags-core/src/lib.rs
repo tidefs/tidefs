@@ -2,16 +2,13 @@
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
 
-//! Authority type definitions for per-dataset feature flags.
+//! Authority types and persisted record encoding for per-dataset feature flags.
 //!
-//! Implements the three-class compatibility model (compat/ro_compat/incompat)
-//! from [`docs/DATASET_FEATURE_FLAGS_DESIGN.md`] with a reverse-DNS feature
-//! name registry and canonical V1 feature constants.
-//!
-//! This crate covers Phase 1 (types + registry) of the design spec. Phase 2
-//! (feature gate runtime) and Phase 3 (B-tree storage) are tracked separately.
-//!
-//! [`docs/DATASET_FEATURE_FLAGS_DESIGN.md`]: https://forgejo/forgeadmin/tidefs/docs/DATASET_FEATURE_FLAGS_DESIGN.md
+//! This crate owns the `compat`, `ro_compat`, and `incompat` classes, the
+//! reverse-DNS feature-name registry, canonical V1 class assignments, and the
+//! fixed-width feature-tree root record. Runtime callers own mount admission
+//! and feature-tree resolution; these types do not by themselves establish a
+//! public on-disk compatibility or mounted-feature support promise.
 
 use core::fmt;
 use core::str::FromStr;
@@ -611,8 +608,7 @@ pub const CANONICAL_V1_FEATURES: &[&str] = &[
 
 /// Maps each canonical feature name to its required [`FeatureClass`].
 ///
-/// Determined by the design rules in
-/// [`docs/DATASET_FEATURE_FLAGS_DESIGN.md`]:
+/// The source-owned assignments use these bounds:
 ///
 /// - `Incompat`: new on-disk record layout or changes how existing records
 ///   must be interpreted (e.g. extent_map_v2, encryption).
