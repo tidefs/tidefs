@@ -55,40 +55,6 @@ impl BulkDataServiceHandler {
         operation(&service)
     }
 
-    /// Write an already-granted TCP_STREAM chunk into BULK reassembly state.
-    pub fn write_tcp_chunk(
-        &self,
-        connection_id: ConnectionId,
-        token: BulkToken,
-        chunk_seq: u32,
-        offset: u64,
-        payload: &[u8],
-    ) -> Result<(), BulkError> {
-        self.service.lock().unwrap().write_tcp_chunk(
-            connection_id,
-            token,
-            chunk_seq,
-            offset,
-            payload,
-        )
-    }
-
-    /// Write a decoded, token-bound TCP_STREAM chunk into BULK reassembly state.
-    pub fn handle_tcp_chunk(
-        &self,
-        connection_id: ConnectionId,
-        chunk: BulkTcpChunkFrame,
-    ) -> Result<(), BulkError> {
-        self.service.lock().unwrap().write_tcp_chunk_for_stream(
-            connection_id,
-            chunk.stream_id,
-            chunk.token,
-            chunk.chunk_seq,
-            chunk.offset,
-            &chunk.payload,
-        )
-    }
-
     /// Retire an active VFS_RPC handoff from a runtime timeout path.
     ///
     /// DATA-frame ABORT handling records its terminal event in
@@ -163,6 +129,7 @@ impl BulkDataServiceHandler {
         match frame {
             BulkFrame::Offer(frame) => (self.handle_offer(connection_id, frame), None),
             BulkFrame::CreditRequest(frame) => (self.handle_credit(connection_id, frame), None),
+            BulkFrame::TcpChunk(frame) => (self.handle_tcp_chunk(connection_id, frame), None),
             BulkFrame::Done(frame) => self.handle_done_with_terminal(connection_id, frame),
             BulkFrame::Abort(frame) => self.handle_abort_with_terminal(connection_id, frame),
             BulkFrame::Accept(_) | BulkFrame::CreditGrant(_) => (
@@ -238,6 +205,26 @@ impl BulkDataServiceHandler {
             },
         };
         reply(BulkFrame::CreditGrant(grant))
+    }
+
+    fn handle_tcp_chunk(
+        &self,
+        connection_id: ConnectionId,
+        chunk: BulkTcpChunkFrame,
+    ) -> Result<DataServiceDispatchOutcome, DataServiceDispatchError> {
+        self.service
+            .lock()
+            .unwrap()
+            .write_tcp_chunk_for_stream(
+                connection_id,
+                chunk.stream_id,
+                chunk.token,
+                chunk.chunk_seq,
+                chunk.offset,
+                &chunk.payload,
+            )
+            .map_err(reject_bulk)?;
+        Ok(DataServiceDispatchOutcome::Consumed)
     }
 
     fn handle_done_with_terminal(
@@ -431,9 +418,17 @@ mod tests {
                 .expect("chunk");
         let chunk =
             BulkTcpChunkFrame::decode(&chunk.encode().expect("chunk wire")).expect("chunk decode");
-        handler
-            .handle_tcp_chunk(session_id.0, chunk)
-            .expect("chunk");
+        assert_eq!(
+            handler
+                .handle_data_service_frame(
+                    session_id,
+                    BulkFrame::TcpChunk(chunk)
+                        .to_data_service_frame()
+                        .expect("chunk frame"),
+                )
+                .expect("chunk"),
+            DataServiceDispatchOutcome::Consumed
+        );
 
         let done = BulkFrame::Done(BulkDoneFrame {
             stream_id: 11,
@@ -456,6 +451,49 @@ mod tests {
         assert_eq!(completed[0].stream_id, 11);
         assert_eq!(completed[0].bytes, b"hello");
         assert_eq!(handler.active_transfer_count(session_id.0), 0);
+    }
+
+    #[test]
+    fn tcp_chunk_uses_authenticated_session() {
+        let handler = BulkDataServiceHandler::new(service());
+        let session_id = SessionId::new(7);
+        let other_session = SessionId::new(8);
+        let token = match handle_reply(&handler, session_id, offer_frame(12, 5)) {
+            BulkFrame::Accept(frame) => frame.token.expect("token"),
+            other => panic!("unexpected reply: {other:?}"),
+        };
+        let grant = match handle_reply(
+            &handler,
+            session_id,
+            BulkFrame::CreditRequest(BulkCreditRequestFrame {
+                stream_id: 12,
+                token,
+                chunk_seq: 0,
+                len: 5,
+            }),
+        ) {
+            BulkFrame::CreditGrant(frame) => frame,
+            other => panic!("unexpected reply: {other:?}"),
+        };
+        let chunk = BulkFrame::TcpChunk(
+            BulkTcpChunkFrame::new(12, token, grant.chunk_seq, grant.offset, b"hello".to_vec())
+                .expect("chunk"),
+        )
+        .to_data_service_frame()
+        .expect("chunk frame");
+
+        assert_eq!(
+            handler.handle_data_service_frame(other_session, chunk.clone()),
+            Err(reject_bulk(BulkError::UnknownToken))
+        );
+        assert_eq!(handler.active_transfer_count(session_id.0), 1);
+        assert_eq!(handler.active_transfer_count(other_session.0), 0);
+        assert_eq!(
+            handler
+                .handle_data_service_frame(session_id, chunk)
+                .expect("authenticated chunk"),
+            DataServiceDispatchOutcome::Consumed
+        );
     }
 
     #[test]
@@ -577,22 +615,34 @@ mod tests {
         };
 
         assert_eq!(
-            handler.handle_tcp_chunk(session_id.0, delayed),
-            Err(BulkError::UnknownToken)
+            handler.handle_data_service_frame(
+                session_id,
+                BulkFrame::TcpChunk(delayed)
+                    .to_data_service_frame()
+                    .expect("delayed chunk frame"),
+            ),
+            Err(reject_bulk(BulkError::UnknownToken))
         );
-        handler
-            .handle_tcp_chunk(
-                session_id.0,
-                BulkTcpChunkFrame::new(
-                    14,
-                    new_token,
-                    new_grant.chunk_seq,
-                    new_grant.offset,
-                    b"new".to_vec(),
+        assert_eq!(
+            handler
+                .handle_data_service_frame(
+                    session_id,
+                    BulkFrame::TcpChunk(
+                        BulkTcpChunkFrame::new(
+                            14,
+                            new_token,
+                            new_grant.chunk_seq,
+                            new_grant.offset,
+                            b"new".to_vec(),
+                        )
+                        .expect("new chunk"),
+                    )
+                    .to_data_service_frame()
+                    .expect("new chunk frame"),
                 )
-                .expect("new chunk"),
-            )
-            .expect("current attempt chunk");
+                .expect("current attempt chunk"),
+            DataServiceDispatchOutcome::Consumed
+        );
 
         let done = BulkFrame::Done(BulkDoneFrame {
             stream_id: 14,

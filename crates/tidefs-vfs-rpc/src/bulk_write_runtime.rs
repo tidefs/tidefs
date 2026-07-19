@@ -15,9 +15,9 @@ use std::time::Instant;
 
 use tidefs_bulk_service::{
     AbortedBulkTransfer, BulkAbortReason, BulkDataServiceHandler, BulkDataServiceTerminal,
-    BulkError, BulkMetadata, BulkTcpChunkFrame, BulkToken, BulkTransferDirection,
-    CompletedBulkTransfer, ConnectionId, StreamId, VfsRpcBulkAbort, VfsRpcBulkCompletion,
-    VfsRpcBulkHandoff, VfsRpcBulkHandoffError, VfsRpcBulkMethod, BULK_SERVICE_ID,
+    BulkError, BulkMetadata, BulkToken, BulkTransferDirection, CompletedBulkTransfer, ConnectionId,
+    StreamId, VfsRpcBulkAbort, VfsRpcBulkCompletion, VfsRpcBulkHandoff, VfsRpcBulkHandoffError,
+    VfsRpcBulkMethod, BULK_SERVICE_ID,
 };
 use tidefs_transport::{
     ConnectionReceiver, ControlServiceDispatch, ControlServiceDispatchError,
@@ -223,17 +223,6 @@ where
     #[must_use]
     pub fn pending_write_count(&self) -> usize {
         self.state.lock().unwrap().pending_writes.len()
-    }
-
-    /// Write one already-decoded TCP_STREAM chunk to the runtime's BULK state.
-    pub fn handle_tcp_chunk(
-        &self,
-        connection_id: ConnectionId,
-        chunk: BulkTcpChunkFrame,
-    ) -> Result<(), VfsRpcBulkWriteRuntimeError> {
-        self.bulk
-            .handle_tcp_chunk(connection_id, chunk)
-            .map_err(Into::into)
     }
 
     /// Reclaim all BULK and pending-WRITE state when the authenticated
@@ -692,7 +681,7 @@ mod tests {
 
     use tidefs_bulk_service::{
         BulkAcceptResult, BulkCreditRequestFrame, BulkCreditResult, BulkDoneFrame, BulkFrame,
-        BulkMode, BulkOfferFrame, BulkPriority, BulkService, BulkServiceConfig,
+        BulkMode, BulkOfferFrame, BulkPriority, BulkService, BulkServiceConfig, BulkTcpChunkFrame,
     };
     use tidefs_transport::{ControlServiceReplySink, TransportSessionSet};
     use tidefs_types_vfs_core::{
@@ -990,7 +979,6 @@ mod tests {
     }
 
     fn grant_and_write(
-        runtime: &Arc<VfsRpcBulkWriteRuntime<RecordingDispatch>>,
         dispatch: &DataServiceDispatch,
         stream_id: StreamId,
         token: BulkToken,
@@ -1019,19 +1007,23 @@ mod tests {
             }
             other => panic!("unexpected credit reply: {other:?}"),
         };
-        runtime
-            .handle_tcp_chunk(
-                SESSION_ID.0,
-                BulkTcpChunkFrame::new(
-                    stream_id,
-                    token,
-                    grant.chunk_seq,
-                    grant.offset,
-                    bytes.to_vec(),
-                )
-                .expect("chunk"),
+        assert_eq!(
+            dispatch_data(
+                dispatch,
+                BulkFrame::TcpChunk(
+                    BulkTcpChunkFrame::new(
+                        stream_id,
+                        token,
+                        grant.chunk_seq,
+                        grant.offset,
+                        bytes.to_vec(),
+                    )
+                    .expect("chunk"),
+                ),
             )
-            .expect("chunk write");
+            .expect("chunk write"),
+            DataServiceDispatchOutcome::Consumed
+        );
     }
 
     #[test]
@@ -1044,7 +1036,7 @@ mod tests {
 
         assert!(target.writes().is_empty());
         assert_eq!(runtime.pending_write_count(), 1);
-        grant_and_write(&runtime, &data_dispatch, 11, token, b"abc");
+        grant_and_write(&data_dispatch, 11, token, b"abc");
         assert!(target.writes().is_empty());
 
         assert_eq!(
@@ -1079,7 +1071,7 @@ mod tests {
         let data_dispatch = runtime.data_dispatch();
         let token = accept_write_transfer(&data_dispatch, 2, 23, 3);
         admitted_write(&runtime, handle, token, 3, Instant::now());
-        grant_and_write(&runtime, &data_dispatch, 23, token, b"abc");
+        grant_and_write(&data_dispatch, 23, token, b"abc");
 
         let runtime_ref = Arc::downgrade(&runtime);
         target.set_write_probe(move || {
@@ -1147,8 +1139,8 @@ mod tests {
         let admitted = accept_write_transfer(&data_dispatch, 2, 26, 3);
         let _request = admitted_write(&runtime, handle, admitted, 3, Instant::now());
         let orphan = accept_write_transfer(&data_dispatch, 77, 27, 5);
-        grant_and_write(&runtime, &data_dispatch, 26, admitted, b"abc");
-        grant_and_write(&runtime, &data_dispatch, 27, orphan, b"abcde");
+        grant_and_write(&data_dispatch, 26, admitted, b"abc");
+        grant_and_write(&data_dispatch, 27, orphan, b"abcde");
 
         assert_eq!(runtime.pending_write_count(), 1);
         assert_eq!(runtime.bulk.active_transfer_count(SESSION_ID.0), 2);
@@ -1203,7 +1195,7 @@ mod tests {
         let data_dispatch = runtime.data_dispatch();
         let token = accept_write_transfer(&data_dispatch, 2, 14, 3);
         admitted_write(&runtime, handle, token, 3, Instant::now());
-        grant_and_write(&runtime, &data_dispatch, 14, token, b"abc");
+        grant_and_write(&data_dispatch, 14, token, b"abc");
 
         assert!(dispatch_data(
             &data_dispatch,
@@ -1241,7 +1233,7 @@ mod tests {
         let data_dispatch = runtime.data_dispatch();
         let token = accept_write_transfer(&data_dispatch, 2, 16, 3);
         let request = admitted_write(&runtime, handle, token, 3, Instant::now());
-        grant_and_write(&runtime, &data_dispatch, 16, token, b"abc");
+        grant_and_write(&data_dispatch, 16, token, b"abc");
 
         assert!(dispatch_data(
             &data_dispatch,
@@ -1282,8 +1274,8 @@ mod tests {
         let orphan = accept_write_transfer(&data_dispatch, 77, 17, 3);
         let admitted = accept_write_transfer(&data_dispatch, 2, 18, 3);
         admitted_write(&runtime, handle, admitted, 3, Instant::now());
-        grant_and_write(&runtime, &data_dispatch, 17, orphan, b"bad");
-        grant_and_write(&runtime, &data_dispatch, 18, admitted, b"abc");
+        grant_and_write(&data_dispatch, 17, orphan, b"bad");
+        grant_and_write(&data_dispatch, 18, admitted, b"abc");
 
         for (stream_id, token, checksum32) in
             [(17, orphan, 0x3c48_33b6), (18, admitted, 0x364b_3fb7)]
@@ -1315,7 +1307,7 @@ mod tests {
         let (runtime, target, sink) = runtime(Duration::from_secs(1));
         let data_dispatch = runtime.data_dispatch();
         let orphan = accept_write_transfer(&data_dispatch, 77, 24, 3);
-        grant_and_write(&runtime, &data_dispatch, 24, orphan, b"bad");
+        grant_and_write(&data_dispatch, 24, orphan, b"bad");
 
         // Model another receive call after it publishes a terminal record but
         // before the old runtime path could drain the handler-global queue.
@@ -1352,7 +1344,7 @@ mod tests {
         let admitted = accept_write_transfer(&data_dispatch, 2, 20, 3);
         let now = Instant::now();
         admitted_write(&runtime, handle, admitted, 3, now);
-        grant_and_write(&runtime, &data_dispatch, 19, orphan, b"bad");
+        grant_and_write(&data_dispatch, 19, orphan, b"bad");
 
         runtime
             .bulk

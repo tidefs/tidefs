@@ -2,9 +2,11 @@
 //! Sender-side TCP_STREAM coordination for BULK `service_id = 0x07`.
 //!
 //! This module consumes receiver ACCEPT/CREDIT_GRANT responses and emits the
-//! next CREDIT, raw TCP chunk, DONE, or ABORT item that a transport binding can
-//! put on the already-authenticated connection. It does not register a transport
-//! receive loop, change VFS_RPC descriptor policy, or enable RDMA.
+//! next ordered CREDIT, TCP chunk, DONE, or ABORT service frames that a
+//! transport binding can put on the already-authenticated connection. TCP
+//! chunks are carried as [`BulkFrame::TcpChunk`] on DATA service `0x07`. This
+//! module does not register a transport receive loop, change VFS_RPC descriptor
+//! policy, or enable RDMA.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -246,7 +248,10 @@ impl BulkSenderCoordinator {
         if final_chunk {
             self.transfers.remove(&stream_id);
         }
-        Ok(BulkSenderCreditOutcome::SendChunk { chunk, done })
+        let mut frames = Vec::with_capacity(if done.is_some() { 2 } else { 1 });
+        frames.push(BulkFrame::TcpChunk(chunk));
+        frames.extend(done);
+        Ok(BulkSenderCreditOutcome::SendFrames { frames })
     }
 
     pub fn abort(
@@ -295,9 +300,10 @@ pub enum BulkSenderResponse {
 /// Work item produced from a CREDIT_GRANT response.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BulkSenderCreditOutcome {
-    SendChunk {
-        chunk: BulkTcpChunkFrame,
-        done: Option<BulkFrame>,
+    /// Ordered DATA service frames; a final DONE, when present, follows its
+    /// TCP chunk.
+    SendFrames {
+        frames: Vec<BulkFrame>,
     },
     Wait,
 }
@@ -491,6 +497,7 @@ fn frame_name(frame: &BulkFrame) -> &'static str {
         BulkFrame::Accept(_) => "ACCEPT",
         BulkFrame::CreditRequest(_) => "CREDIT",
         BulkFrame::CreditGrant(_) => "CREDIT_GRANT",
+        BulkFrame::TcpChunk(_) => "TCP_CHUNK",
         BulkFrame::Done(_) => "DONE",
         BulkFrame::Abort(_) => "ABORT",
     }
@@ -502,6 +509,11 @@ mod tests {
 
     fn token(byte: u8) -> BulkToken {
         [byte; 32]
+    }
+
+    fn carrier_roundtrip(frame: BulkFrame) -> BulkFrame {
+        let wire = frame.encode_for_transport().expect("carrier wire");
+        BulkFrame::decode_from_transport(&wire).expect("carrier decode")
     }
 
     #[test]
@@ -550,10 +562,15 @@ mod tests {
             })
             .expect("grant");
         match first {
-            BulkSenderCreditOutcome::SendChunk { chunk, done } => {
+            BulkSenderCreditOutcome::SendFrames { frames } => {
+                let mut frames = frames.into_iter().map(carrier_roundtrip);
+                let chunk = match frames.next().expect("chunk frame") {
+                    BulkFrame::TcpChunk(chunk) => chunk,
+                    other => panic!("unexpected frame: {other:?}"),
+                };
                 assert_eq!(chunk.token, token(0x11));
                 assert_eq!(chunk.payload, b"hello wo");
-                assert!(done.is_none());
+                assert!(frames.next().is_none());
             }
             BulkSenderCreditOutcome::Wait => panic!("unexpected wait"),
         }
@@ -581,11 +598,16 @@ mod tests {
             })
             .expect("grant");
         match final_step {
-            BulkSenderCreditOutcome::SendChunk { chunk, done } => {
+            BulkSenderCreditOutcome::SendFrames { frames } => {
+                let mut frames = frames.into_iter().map(carrier_roundtrip);
+                let chunk = match frames.next().expect("chunk frame") {
+                    BulkFrame::TcpChunk(chunk) => chunk,
+                    other => panic!("unexpected frame: {other:?}"),
+                };
                 assert_eq!(chunk.token, token(0x11));
                 assert_eq!(chunk.payload, b"rld");
                 assert_eq!(
-                    done,
+                    frames.next(),
                     Some(BulkFrame::Done(BulkDoneFrame {
                         stream_id: 11,
                         token: token(0x11),
@@ -593,6 +615,7 @@ mod tests {
                         checksum32: crc32c::crc32c(b"hello world"),
                     }))
                 );
+                assert!(frames.next().is_none());
             }
             BulkSenderCreditOutcome::Wait => panic!("unexpected wait"),
         }

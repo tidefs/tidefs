@@ -63,6 +63,7 @@ pub enum BulkMethod {
     Credit = 0x02,
     Done = 0x03,
     Abort = 0x04,
+    TcpChunk = 0x05,
 }
 
 impl BulkMethod {
@@ -78,6 +79,7 @@ impl BulkMethod {
             0x02 => Ok(Self::Credit),
             0x03 => Ok(Self::Done),
             0x04 => Ok(Self::Abort),
+            0x05 => Ok(Self::TcpChunk),
             other => Err(BulkProtocolError::UnknownMethod(other)),
         }
     }
@@ -296,6 +298,7 @@ pub enum BulkFrame {
     Accept(BulkAcceptFrame),
     CreditRequest(BulkCreditRequestFrame),
     CreditGrant(BulkCreditGrantFrame),
+    TcpChunk(BulkTcpChunkFrame),
     Done(BulkDoneFrame),
     Abort(BulkAbortFrame),
 }
@@ -322,6 +325,11 @@ impl BulkFrame {
                 BulkFrameKind::Response,
                 BulkMethod::Credit,
                 encode_credit_grant_body(frame),
+            ),
+            Self::TcpChunk(frame) => (
+                BulkFrameKind::Request,
+                BulkMethod::TcpChunk,
+                frame.encode()?,
             ),
             Self::Done(frame) => (
                 BulkFrameKind::Request,
@@ -363,6 +371,9 @@ impl BulkFrame {
             )),
             (BulkFrameKind::Response, BulkMethod::Credit) => {
                 Ok(Self::CreditGrant(decode_credit_grant_body(&frame.body)?))
+            }
+            (BulkFrameKind::Request, BulkMethod::TcpChunk) => {
+                Ok(Self::TcpChunk(BulkTcpChunkFrame::decode(&frame.body)?))
             }
             (BulkFrameKind::Request, BulkMethod::Done) => {
                 Ok(Self::Done(decode_done_body(&frame.body)?))
@@ -811,7 +822,7 @@ mod tests {
     }
 
     #[test]
-    fn accept_credit_done_and_abort_frames_roundtrip() {
+    fn accept_credit_chunk_done_and_abort_frames_roundtrip() {
         let frames = [
             BulkFrame::Accept(BulkAcceptFrame {
                 stream_id: 11,
@@ -833,6 +844,10 @@ mod tests {
                 offset: 2048,
                 rdma: None,
             }),
+            BulkFrame::TcpChunk(
+                BulkTcpChunkFrame::new(11, token(0x11), 2, 2048, b"chunk payload".to_vec())
+                    .expect("chunk"),
+            ),
             BulkFrame::Done(BulkDoneFrame {
                 stream_id: 11,
                 token: token(0x11),
