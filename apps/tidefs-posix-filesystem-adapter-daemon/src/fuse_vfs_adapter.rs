@@ -8310,7 +8310,7 @@ impl FuseVfsAdapter {
                         }
                         let length = end.saturating_sub(start);
                         let len = u32::try_from(length).map_err(|_| Errno::EFBIG)?;
-                        let data = e.read(efh, start, len, ctx)?;
+                        let data = e.read_for_cache_fill(efh, start, len, ctx)?;
                         if data.len() != length as usize {
                             return Err(Errno::EIO);
                         }
@@ -8679,7 +8679,8 @@ impl FuseVfsAdapter {
                                 }
                                 let length = end.saturating_sub(start);
                                 let length_u32 = u32::try_from(length).map_err(|_| Errno::EFBIG)?;
-                                let data = engine.read(&handle, start, length_u32, ctx)?;
+                                let data =
+                                    engine.read_for_cache_fill(&handle, start, length_u32, ctx)?;
                                 if data.len() != length as usize {
                                     return Err(Errno::EIO);
                                 }
@@ -33584,11 +33585,14 @@ mod tests {
         local_fs.set_commit_group_throughput_profile();
         local_fs.set_max_uncommitted_mutations(64 * 1024);
         let tracker = Arc::clone(local_fs.writeback_range_tracker());
-        let engine = VfsLocalFileSystem::new(local_fs);
-        let adapter = FuseVfsAdapter::new(Box::new(engine))
+        let mut engine = VfsLocalFileSystem::new(local_fs);
+        engine
+            .set_timestamp_policy(tidefs_inode_attributes::timestamp::TimestampPolicy::Strictatime);
+        let mut adapter = FuseVfsAdapter::new(Box::new(engine))
             .expect("create adapter")
             .with_writeback_cache_enabled()
             .with_writeback_range_tracker(Arc::clone(&tracker));
+        adapter.timestamp_policy = TimestampPolicy::StrictAtime;
         let fixture = AdapterFixture { adapter, root };
         let block_volume = Arc::new(Mutex::new(MockBlockVolume::new()));
         fixture
@@ -33641,6 +33645,15 @@ mod tests {
             .adapter
             .dispatch_write(&ctx, inode.get(), adapter_fh, 0, b"to be flushed", 0)
             .expect("write dispatch");
+        let atime_before = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .getattr(inode, Some(&engine_fh), &ctx)
+                .expect("getattr before fsync")
+                .posix
+                .atime_ns
+        };
+        std::thread::sleep(Duration::from_millis(2));
         assert!(
             tracker.lock().unwrap().is_dirty(inode),
             "production-shared tracker must own the buffered range before fsync"
@@ -33650,6 +33663,18 @@ mod tests {
             .adapter
             .dispatch_fsync(&ctx, inode.get(), adapter_fh)
             .expect("fsync dispatch");
+        let atime_after = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .getattr(inode, Some(&engine_fh), &ctx)
+                .expect("getattr after fsync")
+                .posix
+                .atime_ns
+        };
+        assert_eq!(
+            atime_after, atime_before,
+            "block-volume fsync carrier reads must not record POSIX read access"
+        );
         assert!(
             !tracker.lock().unwrap().is_dirty(inode),
             "lower and adapter completion must leave the shared tracker clean"
@@ -33685,7 +33710,7 @@ mod tests {
     fn syncfs_with_block_volume_flushes_and_clears_dirty_state() {
         let (fixture, bv, tracker) = adapter_fixture_with_shared_tracker_and_mock_block_volume();
         let ctx = root_ctx();
-        let (inode, adapter_fh, _engine_fh) = create_adapter_file_handle(
+        let (inode, adapter_fh, engine_fh) = create_adapter_file_handle(
             &fixture.adapter,
             &ctx,
             b"syncfs-block-volume.txt",
@@ -33699,6 +33724,15 @@ mod tests {
             .adapter
             .dispatch_write(&ctx, inode.get(), adapter_fh, 0, b"syncfs data", 0)
             .expect("write dispatch");
+        let atime_before = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .getattr(inode, Some(&engine_fh), &ctx)
+                .expect("getattr before syncfs")
+                .posix
+                .atime_ns
+        };
+        std::thread::sleep(Duration::from_millis(2));
         assert!(
             tracker.lock().unwrap().is_dirty(inode),
             "production-shared tracker must own the buffered range before syncfs"
@@ -33709,6 +33743,18 @@ mod tests {
             .adapter
             .dispatch_syncfs(&ctx)
             .expect("syncfs dispatch");
+        let atime_after = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .getattr(inode, Some(&engine_fh), &ctx)
+                .expect("getattr after syncfs")
+                .posix
+                .atime_ns
+        };
+        assert_eq!(
+            atime_after, atime_before,
+            "block-volume syncfs carrier reads must not record POSIX read access"
+        );
 
         assert!(
             !tracker.lock().unwrap().is_dirty(inode),
