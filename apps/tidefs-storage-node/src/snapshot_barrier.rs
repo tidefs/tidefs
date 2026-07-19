@@ -214,6 +214,11 @@ pub struct SnapshotBarrierSendReport {
 /// Pre-send barrier failure that must abort VFSSEND2 transfer.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SnapshotBarrierSendError {
+    /// The live replicated store cannot prove which authenticated filesystem
+    /// root or replica sessions its barrier state represents.
+    FilesystemStoreBindingUnavailable {
+        barrier_id: BarrierId,
+    },
     AlreadyActive {
         barrier_id: BarrierId,
     },
@@ -267,6 +272,10 @@ pub enum SnapshotBarrierSendError {
 impl fmt::Display for SnapshotBarrierSendError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::FilesystemStoreBindingUnavailable { barrier_id } => write!(
+                f,
+                "barrier {barrier_id} refused because the transport-backed store is not bound to the authenticated filesystem root and replica-session authority"
+            ),
             Self::AlreadyActive { barrier_id } => write!(
                 f,
                 "barrier {barrier_id} refused because another barrier is already active"

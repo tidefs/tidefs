@@ -1274,6 +1274,19 @@ fn run_snapshot_barrier_before_send_with_config(
     let membership_cut = snapshot_barrier_membership_cut(ctx);
     let expected_peer_ids = &membership_cut.peer_ids;
 
+    // The live replicated store owns a distinct set of replica Control/Data/
+    // Shadow sessions and does not expose a durable binding to `fs_root`.
+    // Its txg-manager commit count therefore cannot attest the authenticated
+    // root selected for VFSSEND2, nor can this daemon's generic transport
+    // sessions identify the replicas holding that root. Refuse before any
+    // fanout until the store provides that binding.
+    if matches!(
+        &*ctx.store.lock().unwrap(),
+        StoreBackend::TransportBacked(_)
+    ) {
+        return Err(SnapshotBarrierSendError::FilesystemStoreBindingUnavailable { barrier_id });
+    }
+
     if expected_peer_ids.len() > config.max_peers {
         return Err(SnapshotBarrierSendError::PeerLimitExceeded {
             barrier_id,
@@ -8019,6 +8032,47 @@ mod cluster_pool_handler_tests {
                 assert!(message.contains("barrier 123"));
             }
             other => panic!("expected barrier error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vfssend2_sends_refuse_unbound_transport_backed_store() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let transport_store = TransportReplicatedStore::open(
+            store_dir.path(),
+            1,
+            TransportReplicatedStoreConfig::default(),
+        )
+        .unwrap();
+        let store = Arc::new(Mutex::new(StoreBackend::TransportBacked(Box::new(
+            transport_store,
+        ))));
+        let mut ctx = frame_test_context(Arc::clone(&store));
+        let fs_dir = tempfile::tempdir().unwrap();
+        let fs_root = fs_dir.path().join("fs");
+        let auth_key = RootAuthenticationKey::demo_key();
+        create_committed_send_source(&fs_root, auth_key);
+        ctx.config.fs_root = Some(fs_root);
+        ctx.config.root_auth_key = Some(auth_key);
+
+        for frame in [
+            Frame::Send { key: Vec::new() },
+            Frame::SendChunked { key: Vec::new() },
+        ] {
+            let response =
+                handle_frame_ctx(tidefs_transport::SessionId::new(1), &frame, &store, &ctx)
+                    .expect("unbound transport-backed send returns an error");
+
+            match response {
+                Frame::Error { message } => {
+                    assert!(
+                        message.contains("transport-backed store is not bound"),
+                        "{message}"
+                    );
+                }
+                other => panic!("expected transport-backed binding error, got {other:?}"),
+            }
+            assert!(ctx.active_barrier.lock().unwrap().is_none());
         }
     }
 
