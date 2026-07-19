@@ -872,7 +872,7 @@ impl fmt::Display for OrphanRecoveryOutcome {
 // OrphanIndexRoot — newtype wrapper for the orphan index B-tree root pointer
 // ---------------------------------------------------------------------------
 
-/// Newtype wrapper around `BtreeRootPointer` for the orphan index root.
+/// Newtype wrapper around the orphan index's numeric root lane.
 ///
 /// The orphan index is a B+tree keyed by [`OrphanKey`] with zero-byte values.
 /// This newtype distinguishes the orphan index root from other B-tree roots

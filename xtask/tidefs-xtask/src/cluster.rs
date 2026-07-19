@@ -670,7 +670,6 @@ pub fn check_feature_flags_current_workspace() -> Result<(), ClusterCheckError> 
             "FeatureClass",
             "FeatureFlagValueV1",
             "DatasetFeatureFlagsV1",
-            "BtreeRootPointer",
             "CANONICAL_V1_FEATURES",
             "FEATURE_POSIX_ACL",
             "FEATURE_CHECKSUM_BLAKE3",
