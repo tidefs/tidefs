@@ -6440,12 +6440,9 @@ impl FuseVfsAdapter {
             // (unflushed) ranges.  Dirty ranges must be served from
             // the engine; clean ranges may come from the block-volume
             // adapter.
-            let is_dirty = {
-                let ds = self.dirty_state.lock().unwrap();
-                ds.get(&ino)
-                    .map(|dr| dr.overlaps(plan.offset, u64::from(plan.size)))
-                    .unwrap_or(false)
-            };
+            let is_dirty =
+                self.dirty_trackers_overlap_range(ino, plan.offset, u64::from(plan.size))
+                    || self.dirty_page_caches_overlap_range(ino, plan.offset, u64::from(plan.size));
 
             if !is_dirty {
                 // Try the block-volume path first.  Walk the resolved extents:
@@ -33773,6 +33770,91 @@ mod tests {
             )
             .expect("partially dirty read");
         assert_eq!(readback, b"0123XYZ789");
+    }
+
+    #[test]
+    fn block_volume_non_primary_dirty_owners_fall_back_to_engine_read() {
+        for worker_tracker_owns_range in [true, false] {
+            let (fixture, bv) = adapter_fixture_with_mock_block_volume();
+            let ctx = root_ctx();
+            let (inode, adapter_fh, engine_fh) = create_adapter_file_handle(
+                &fixture.adapter,
+                &ctx,
+                if worker_tracker_owns_range {
+                    b"worker-dirty-bv.bin"
+                } else {
+                    b"page-dirty-bv.bin"
+                },
+                libc::O_RDWR as u32,
+            );
+            let baseline = b"0123456789";
+            fixture
+                .adapter
+                .dispatch_write(&ctx, inode.get(), adapter_fh, 0, baseline, 0)
+                .expect("baseline write");
+            fixture
+                .adapter
+                .dispatch_fsync(&ctx, inode.get(), adapter_fh)
+                .expect("baseline fsync");
+
+            {
+                let engine = fixture.adapter.engine.lock().unwrap();
+                assert_eq!(
+                    engine
+                        .write(&engine_fh, 4, b"XYZ", &ctx)
+                        .expect("lower partial overwrite"),
+                    3
+                );
+            }
+            if worker_tracker_owns_range {
+                seed_worker_dirty_range(&fixture.adapter, inode.get(), 4, 3);
+            } else {
+                if fixture
+                    .adapter
+                    .write_page_cache
+                    .lookup(inode.get(), 0)
+                    .is_none()
+                {
+                    fixture
+                        .adapter
+                        .write_page_cache
+                        .insert(inode.get(), 0)
+                        .expect("insert dirty page mirror");
+                }
+                fixture.adapter.write_page_cache.mark_dirty(inode.get(), 0);
+            }
+            assert!(
+                !fixture
+                    .adapter
+                    .dirty_state
+                    .lock()
+                    .unwrap()
+                    .get(&inode.get())
+                    .is_some_and(|ranges| ranges.overlaps(0, baseline.len() as u64)),
+                "primary dirty_state must stay empty for the non-primary-owner regression"
+            );
+            assert_eq!(
+                bv.lock().unwrap().stored(0, baseline.len() as u64),
+                baseline,
+                "lower overwrite must still be absent from the clean block-volume mirror"
+            );
+
+            let readback = fixture
+                .adapter
+                .dispatch_read(
+                    &ctx,
+                    inode.get(),
+                    adapter_fh,
+                    0,
+                    baseline.len() as u32,
+                    None,
+                )
+                .expect("read with non-primary dirty owner");
+            assert_eq!(
+                readback, b"0123XYZ789",
+                "every dirty owner must bypass stale block-volume bytes"
+            );
+        }
     }
 
     /// After a writeback flush through the block-volume adapter, a
