@@ -15,7 +15,6 @@ description = "Persistent deferred cleanup work queue backed by the generic B+tr
 [dependencies]
 tidefs-btree = { workspace = true }
 tidefs-types-deferred-cleanup-core = { workspace = true }
-tidefs-types-dataset-feature-flags-core = { workspace = true }
 tidefs-commit_group = { workspace = true }
 
 tidefs-reclaim-queue-core = { workspace = true }

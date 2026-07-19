@@ -18,5 +18,4 @@ no_std / forbid(unsafe_code).
 """
 
 [dependencies]
-tidefs-types-dataset-feature-flags-core = { workspace = true }
 serde = { version = "1", default-features = false, features = ["derive"], optional = true }

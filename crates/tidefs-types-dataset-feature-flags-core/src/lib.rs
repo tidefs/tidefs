@@ -286,23 +286,6 @@ impl fmt::Display for InvalidFeatureName {
 // DatasetFeatureFlagsV1 — on-media struct (three logical object-key roots)
 // ---------------------------------------------------------------------------
 
-/// Opaque unresolved tree handle retained for deferred-cleanup records.
-///
-/// Dataset feature-tree records deliberately do not use this type: their
-/// implemented storage family is addressed by [`FeatureTreeRootKeyV1`].
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
-pub struct BtreeRootPointer(pub u64);
-
-impl BtreeRootPointer {
-    /// Sentinel value for an empty B-tree (no features).
-    pub const EMPTY: BtreeRootPointer = BtreeRootPointer(0);
-
-    #[must_use]
-    pub const fn is_empty(self) -> bool {
-        self.0 == 0
-    }
-}
-
 /// Logical object key for one persisted feature-tree root.
 ///
 /// All 32 bytes are part of the V1 address. The all-zero value is reserved as
