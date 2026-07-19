@@ -943,20 +943,24 @@ fn device_removal_authority_line(
 }
 
 fn is_status_route(route: &LivePoolRoute<'_>) -> bool {
-    route.operation == "status" && matches!(route.command, "cluster" | "device")
+    route.operation == "status" && matches!(route.command, "pool" | "cluster" | "device")
 }
 
 fn live_owner_status_truth_carrier(
     route: &LivePoolRoute<'_>,
 ) -> Option<super::operator_truth::OperatorTruthCarrier> {
-    let command = match (route.command, route.operation) {
-        ("cluster", "status") => "cluster",
-        ("device", "status") => "device",
-        _ => return None,
-    };
-    Some(super::operator_truth::OperatorTruthCarrier::live_route(
-        command, "status", route.pool,
-    ))
+    match (route.command, route.operation) {
+        ("pool", "status") => {
+            Some(super::operator_truth::OperatorTruthCarrier::live_pool_route(route.pool))
+        }
+        ("cluster", "status") => Some(super::operator_truth::OperatorTruthCarrier::live_route(
+            "cluster", "status", route.pool,
+        )),
+        ("device", "status") => Some(super::operator_truth::OperatorTruthCarrier::live_route(
+            "device", "status", route.pool,
+        )),
+        _ => None,
+    }
 }
 
 fn live_owner_status_refusal_carrier(
@@ -2673,6 +2677,81 @@ mod tests {
     }
 
     #[test]
+    fn live_pool_status_json_carries_local_truth_without_distributed_claim() {
+        let route = LivePoolRoute {
+            command: "pool",
+            operation: "status",
+            pool: "tank",
+            pool_uuid: None,
+            json: true,
+            args: LivePoolAdminArgs::default(),
+        };
+        let mut value = serde_json::json!({
+            "pool_name": "tank",
+            "state": "Active",
+            "statfs": {"total_blocks": 1024, "free_blocks": 768},
+        });
+
+        annotate_live_owner_status_json(&route, &mut value);
+
+        assert_eq!(value["source_classification"], "source:live-owner");
+        assert_eq!(
+            value["operator_truth"]["status_path"],
+            "tidefsctl pool status"
+        );
+        assert_eq!(value["operator_truth"]["scope"], "local-pool");
+        assert_eq!(
+            value["operator_truth"]["freshness"],
+            "fresh.truth_view.live_within_budget.f0"
+        );
+        assert!(value["operator_truth"]
+            .get("distributed_surface_record")
+            .is_none());
+        assert_eq!(
+            value["operator_truth"]["truth_bundle_record"]["answer_kind"],
+            "answer.response_registry.bundle.k0"
+        );
+    }
+
+    #[test]
+    fn live_pool_status_reaches_owner_through_typed_socket_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("owner.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        write_owner_manifest(dir.path(), &socket_path);
+        let handle = spawn_owner_response(
+            listener,
+            LivePoolAdminResponse::ok_machine_json(
+                serde_json::json!({
+                    "pool_name": "tank",
+                    "pool_uuid": "42424242424242424242424242424242",
+                    "state": "Active",
+                    "statfs": {"total_blocks": 1024, "free_blocks": 768},
+                })
+                .to_string(),
+            ),
+        );
+        let route = LivePoolRoute {
+            command: "pool",
+            operation: "status",
+            pool: "tank",
+            pool_uuid: Some([0x42; 16]),
+            json: true,
+            args: LivePoolAdminArgs::default(),
+        };
+
+        send_live_owner_request_at(dir.path(), &route).unwrap();
+        let request = handle.join().unwrap();
+
+        assert_eq!(request.command, LivePoolAdminCommand::PoolStatus);
+        assert_eq!(request.output, LivePoolAdminOutput::MachineJson);
+        assert_eq!(
+            request.pool_uuid.as_deref(),
+            Some("42424242424242424242424242424242")
+        );
+    }
+
+    #[test]
     fn live_owner_status_text_json_carries_typed_operator_truth() {
         let route = LivePoolRoute {
             command: "cluster",
@@ -2732,6 +2811,32 @@ mod tests {
         assert!(lines.iter().any(|line| line == &expected_source));
         assert!(lines.iter().any(|line| line == "live status"));
         assert!(lines.iter().any(|line| line == "ready"));
+        assert!(!output.trim_start().starts_with('{'));
+    }
+
+    #[test]
+    fn live_pool_status_is_operator_readable_by_default() {
+        let route = LivePoolRoute {
+            command: "pool",
+            operation: "status",
+            pool: "tank",
+            pool_uuid: None,
+            json: false,
+            args: LivePoolAdminArgs::default(),
+        };
+        let value = serde_json::json!({
+            "text": "pool: tank\nstate: Active",
+        });
+
+        let lines = live_owner_machine_json_human_lines(&route, &value);
+        let output = lines.join("\n");
+
+        assert!(output.contains("path:       tidefsctl pool status"));
+        assert!(output.contains("scope:      local-pool"));
+        assert!(output.contains("source:     source.truth_view.runtime_mirror.a2"));
+        assert!(output.contains("freshness:  fresh.truth_view.live_within_budget.f0"));
+        assert!(lines.iter().any(|line| line == "pool: tank"));
+        assert!(lines.iter().any(|line| line == "state: Active"));
         assert!(!output.trim_start().starts_with('{'));
     }
 
