@@ -23,17 +23,19 @@ use tidefs_validation::evidence_artifact_manifest::{
     content_digest_for_bytes, BlockingIssueRef, EvidenceArtifactManifest,
     EVIDENCE_ARTIFACT_MANIFEST_VERSION,
 };
+use tidefs_validation::storage_intent_ack_runtime::{
+    ack_runtime_manifest_scope, validate_ack_runtime_evidence_json, ACK_RUNTIME_ARTIFACT_PATH,
+    ACK_RUNTIME_BLOCKING_ISSUE, ACK_RUNTIME_BLOCKING_REASON, ACK_RUNTIME_CLAIM_ID,
+    ACK_RUNTIME_COMMAND, ACK_RUNTIME_EVIDENCE_CLASS, ACK_RUNTIME_ISSUE_URL,
+    ACK_RUNTIME_LIVE_BACKEND_KIND, ACK_RUNTIME_MANIFEST_FILE, ACK_RUNTIME_MANIFEST_PATH,
+    ACK_RUNTIME_MOUNT_OPTIONS, ACK_RUNTIME_PARENT_ISSUE_URL, ACK_RUNTIME_RECEIPT_SOURCE,
+    ACK_RUNTIME_REFUSED_BACKEND_KIND, ACK_RUNTIME_REPORT_FILE, ACK_RUNTIME_REPORT_VERSION,
+    ACK_RUNTIME_SOURCE,
+};
 use tidefs_validation::validation_schema::ValidationTier;
 use tidefs_validation::validation_status::ValidationStatus;
 
 const OUTPUT_DIR_ENV: &str = "TIDEFS_ACK_RECEIPT_RUNTIME_OUTPUT_DIR";
-const CLAIM_ID: &str = "storage.intent.ack_receipt_honesty.v1";
-const EVIDENCE_CLASS: &str = "storage-intent-ack-receipt-runtime";
-const ARTIFACT_PATH: &str = "validation/artifacts/storage-intent/ack-receipt-runtime.json";
-const MANIFEST_PATH: &str = "validation/artifacts/storage-intent/ack-receipt-runtime.manifest.json";
-const SOURCE: &str = "mounted-fuse-ack-receipt-runtime-v1";
-const ISSUE_URL: &str = "https://github.com/tidefs/tidefs/issues/2223";
-const PARENT_ISSUE_URL: &str = "https://github.com/tidefs/tidefs/issues/1794";
 const RECEIPT_CHANNEL_CAPACITY: usize = 256;
 
 #[derive(Debug, Serialize)]
@@ -636,52 +638,47 @@ fn write_report_and_manifest(output_dir: &Path, report: &RuntimeReport) -> Resul
     let mut report_bytes = serde_json::to_vec_pretty(report)
         .map_err(|error| format!("encode runtime evidence: {error}"))?;
     report_bytes.push(b'\n');
-    fs::write(output_dir.join("ack-receipt-runtime.json"), &report_bytes)
-        .map_err(|error| format!("write runtime evidence: {error}"))?;
-
     let blocking_issues = if report.summary.status == ValidationStatus::Pass {
         Vec::new()
     } else {
         vec![BlockingIssueRef {
             repo: Some("tidefs/tidefs".to_string()),
-            number: 2223,
-            reason: Some(
-                "mounted acknowledgment runtime rows have not all earned their exact receipt or explicit refusal"
-                    .to_string(),
-            ),
+            number: ACK_RUNTIME_BLOCKING_ISSUE,
+            reason: Some(ACK_RUNTIME_BLOCKING_REASON.to_string()),
         }]
     };
     let manifest = EvidenceArtifactManifest {
         manifest_version: EVIDENCE_ARTIFACT_MANIFEST_VERSION,
-        claim_id: CLAIM_ID.to_string(),
-        evidence_class: EVIDENCE_CLASS.to_string(),
+        claim_id: ACK_RUNTIME_CLAIM_ID.to_string(),
+        evidence_class: ACK_RUNTIME_EVIDENCE_CLASS.to_string(),
         validation_tier: ValidationTier::MountedUserspace,
-        scope: format!(
-            "live FUSE mounted acknowledgment receipt and refusal rows for write, fsync, fdatasync, O_DSYNC, shared mmap MS_SYNC, namespace mutation, and fsyncdir; outcome={} pass={} product_fail={} environment_refusal={}",
-            report.summary.status.label(),
+        scope: ack_runtime_manifest_scope(
+            report.summary.status,
             report.summary.passed,
             report.summary.product_failed,
             report.summary.environment_refused,
         ),
-        artifact_path: ARTIFACT_PATH.to_string(),
+        artifact_path: ACK_RUNTIME_ARTIFACT_PATH.to_string(),
         content_digest: content_digest_for_bytes(&report_bytes),
         run_id: report.run_id.clone(),
         source_ref: report.source_ref.clone(),
         outcome: report.summary.status,
         residual_risk: report.residual_risk.join(" "),
-        source: SOURCE.to_string(),
+        source: ACK_RUNTIME_SOURCE.to_string(),
         generated_at: report.generated_at.clone(),
         blocking_issues,
     };
-    let mut manifest_json = manifest
+    let mut manifest_bytes = manifest
         .to_json_pretty()
+        .map_err(|error| error.to_string())?
+        .into_bytes();
+    manifest_bytes.push(b'\n');
+    validate_ack_runtime_evidence_json(&report_bytes, &manifest_bytes)
         .map_err(|error| error.to_string())?;
-    manifest_json.push('\n');
-    fs::write(
-        output_dir.join("ack-receipt-runtime.manifest.json"),
-        manifest_json,
-    )
-    .map_err(|error| format!("write runtime evidence manifest: {error}"))?;
+    fs::write(output_dir.join(ACK_RUNTIME_REPORT_FILE), &report_bytes)
+        .map_err(|error| format!("write runtime evidence: {error}"))?;
+    fs::write(output_dir.join(ACK_RUNTIME_MANIFEST_FILE), manifest_bytes)
+        .map_err(|error| format!("write runtime evidence manifest: {error}"))?;
     Ok(())
 }
 
@@ -692,14 +689,14 @@ fn main() {
     let (rows, backend_kind, environment_refusal) = match MountedReceiptHarness::new() {
         Ok(harness) => (
             run_mounted_rows(&harness),
-            "live-fuse-local-object-store",
+            ACK_RUNTIME_LIVE_BACKEND_KIND,
             None,
         ),
         Err(HarnessStartError::EnvironmentRefusal { errno, reason }) => {
             eprintln!("ENVIRONMENT REFUSAL: {reason}");
             (
                 environment_refusal_rows(errno, &reason),
-                "fuse-mount-environment-refused",
+                ACK_RUNTIME_REFUSED_BACKEND_KIND,
                 Some(reason),
             )
         }
@@ -721,10 +718,10 @@ fn main() {
         ));
     }
     let report = RuntimeReport {
-        report_version: 1,
-        claim_id: CLAIM_ID,
-        issue: ISSUE_URL,
-        parent_issue: PARENT_ISSUE_URL,
+        report_version: ACK_RUNTIME_REPORT_VERSION,
+        claim_id: ACK_RUNTIME_CLAIM_ID,
+        issue: ACK_RUNTIME_ISSUE_URL,
+        parent_issue: ACK_RUNTIME_PARENT_ISSUE_URL,
         run_id: provenance(
             "TIDEFS_ACK_RECEIPT_RUNTIME_RUN_ID",
             format!("local/{}", std::process::id()),
@@ -738,7 +735,7 @@ fn main() {
             "1970-01-01T00:00:00Z".to_string(),
         ),
         validation_tier: ValidationTier::MountedUserspace,
-        command: "storage-intent-ack-runtime-validation".to_string(),
+        command: ACK_RUNTIME_COMMAND.to_string(),
         backend: RuntimeBackend {
             kind: backend_kind,
             carrier: provenance(
@@ -749,8 +746,8 @@ fn main() {
                 .unwrap_or_else(|_| "unknown".to_string())
                 .trim()
                 .to_string(),
-            mount_options: vec!["rw", "nodev", "nosuid", "subtype=tidefs"],
-            receipt_source: "bounded LocalAckReceiptLedger diagnostic copies",
+            mount_options: ACK_RUNTIME_MOUNT_OPTIONS.to_vec(),
+            receipt_source: ACK_RUNTIME_RECEIPT_SOURCE,
             fault_injection: "none",
         },
         rows,
@@ -766,8 +763,8 @@ fn main() {
         report.summary.passed,
         report.summary.product_failed,
         report.summary.environment_refused,
-        ARTIFACT_PATH,
-        MANIFEST_PATH,
+        ACK_RUNTIME_ARTIFACT_PATH,
+        ACK_RUNTIME_MANIFEST_PATH,
         true,
     );
 }

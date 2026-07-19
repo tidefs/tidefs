@@ -37,6 +37,10 @@ path = "src/bin/storage_intent_ack_runtime_validation.rs"
 required-features = ["fuse"]
 
 [[bin]]
+name = "storage-intent-ack-runtime-report-validation"
+path = "src/bin/storage_intent_ack_runtime_report_validation.rs"
+
+[[bin]]
 name = "storage-intent-data-shape-runtime-validation"
 path = "src/bin/storage_intent_data_shape_runtime_validation.rs"
 required-features = ["fuse"]

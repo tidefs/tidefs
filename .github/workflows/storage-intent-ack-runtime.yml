@@ -58,8 +58,12 @@ jobs:
             --validation-dir "$OUTPUT_DIR" \
             --ack-receipt-runtime
 
-      - name: Validate evidence manifest
+      - name: Validate evidence report and manifest
         run: |
+          nix develop .#ci --command cargo run --locked -p tidefs-validation \
+            --bin storage-intent-ack-runtime-report-validation -- \
+            "$OUTPUT_DIR/ack-receipt-runtime.json" \
+            "$OUTPUT_DIR/ack-receipt-runtime.manifest.json"
           mkdir -p validation/artifacts/storage-intent
           cp "$OUTPUT_DIR/ack-receipt-runtime.json" \
             validation/artifacts/storage-intent/ack-receipt-runtime.json
@@ -77,7 +81,21 @@ jobs:
             "- Carrier: `" + .backend.carrier + "`\n" +
             "- Kernel: `" + .backend.kernel_release + "`\n" +
             "- Fault injection: `" + .backend.fault_injection + "`\n" +
-            "- Source ref: `" + .source_ref + "`\n"
+            "- Source ref: `" + .source_ref + "`\n\n" +
+            "| Row | Syscall result | Expected receipt | Observed operations | Outcome | Errno | Meaning |\n" +
+            "| --- | --- | --- | --- | --- | --- | --- |\n" +
+            (.rows | map(
+              "| `" + .row_id + "` | `" + .syscall_result + "` | `" +
+              .expected_receipt_operation + "` | `" +
+              ((.observed_receipts | map(.operation) | unique) as $operations |
+                if ($operations | length) == 0 then "none" else ($operations | join(", ")) end) +
+              "` | `" + .outcome + "` | `" +
+              (if .errno == null then "none" else (.errno | tostring) end) + "` | " +
+              (if .row_id == "shared-mmap-msync-receipt-or-refusal" and
+                    .outcome == "pass" and .syscall_result == "refused"
+               then "fail-closed unsupported (not mmap durability support)"
+               else (.reason | gsub("\\|"; "\\\\|")) end) + " |"
+            ) | join("\n")) + "\n"
           ' "$OUTPUT_DIR/ack-receipt-runtime.json" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload mounted receipt evidence
