@@ -8338,34 +8338,38 @@ impl FuseVfsAdapter {
                         if data.len() != length as usize {
                             return Err(Errno::EIO);
                         }
-                        // Resolve extent map for this range and write each
-                        // data chunk to the block volume at its physical offset.
-                        let entries = e.lookup_extents(efh.inode_id, start, length);
-                        if entries.is_empty() {
+                        // A range lookup clips the logical start but retains
+                        // the extent's base locator. Query from byte zero so
+                        // physical offsets remain anchored to the original
+                        // extent start, then clip locally to this dirty range.
+                        let entries = e.lookup_extents(efh.inode_id, 0, end);
+                        let mut found_extent = false;
+                        for entry in entries {
+                            let clip_start = entry.logical_offset.max(start);
+                            let clip_end = entry.end_offset().min(end);
+                            if clip_start >= clip_end {
+                                continue;
+                            }
+                            found_extent = true;
+                            if entry.is_data() {
+                                let clip_len = (clip_end - clip_start) as usize;
+                                let data_offset = (clip_start - start) as usize;
+                                let data_end =
+                                    data_offset.checked_add(clip_len).ok_or(Errno::EIO)?;
+                                let chunk = data.get(data_offset..data_end).ok_or(Errno::EIO)?;
+                                let phys_off = clip_start
+                                    .checked_sub(entry.logical_offset)
+                                    .and_then(|relative| relative.checked_add(entry.locator_id.0))
+                                    .ok_or(Errno::EIO)?;
+                                bv.write_bytes(phys_off, chunk)?;
+                            }
+                            // Holes and UNWRITTEN extents are not written
+                            // to the block volume; they stay as engine-resident.
+                        }
+                        if !found_extent {
                             // No extent allocation yet — fall back to logical
                             // offset write (the extent will be allocated later).
                             bv.write_bytes(start, &data)?;
-                        } else {
-                            for entry in entries {
-                                if entry.is_data() {
-                                    let clip_start = entry.logical_offset.max(start);
-                                    let clip_end = entry.end_offset().min(end);
-                                    let clip_len = (clip_end - clip_start) as usize;
-                                    if clip_len == 0 {
-                                        continue;
-                                    }
-                                    let data_offset = (clip_start - start) as usize;
-                                    let data_end =
-                                        data_offset.checked_add(clip_len).ok_or(Errno::EIO)?;
-                                    let chunk =
-                                        data.get(data_offset..data_end).ok_or(Errno::EIO)?;
-                                    let phys_off =
-                                        clip_start - entry.logical_offset + entry.locator_id.0;
-                                    bv.write_bytes(phys_off, chunk)?;
-                                }
-                                // Holes and UNWRITTEN extents are not written
-                                // to the block volume; they stay as engine-resident.
-                            }
                         }
                     }
                     drop(e);
@@ -8708,30 +8712,37 @@ impl FuseVfsAdapter {
                                 if data.len() != length as usize {
                                     return Err(Errno::EIO);
                                 }
-                                let extents = engine.lookup_extents(handle.inode_id, start, length);
-                                if extents.is_empty() {
-                                    block_volume.write_bytes(start, &data)?;
-                                    continue;
-                                }
+                                // Preserve the base logical offset paired with
+                                // each locator. Range lookup clips the former
+                                // without advancing the latter.
+                                let extents = engine.lookup_extents(handle.inode_id, 0, end);
+                                let mut found_extent = false;
                                 for extent in extents {
+                                    let clip_start = extent.logical_offset.max(start);
+                                    let clip_end = extent.end_offset().min(end);
+                                    if clip_start >= clip_end {
+                                        continue;
+                                    }
+                                    found_extent = true;
                                     if !extent.is_data() {
                                         continue;
                                     }
-                                    let clip_start = extent.logical_offset.max(start);
-                                    let clip_end = extent.end_offset().min(end);
                                     let clip_length = (clip_end - clip_start) as usize;
-                                    if clip_length == 0 {
-                                        continue;
-                                    }
                                     let data_offset = (clip_start - start) as usize;
                                     let data_end =
                                         data_offset.checked_add(clip_length).ok_or(Errno::EIO)?;
                                     let chunk =
                                         data.get(data_offset..data_end).ok_or(Errno::EIO)?;
                                     let physical_offset = clip_start
-                                        .saturating_sub(extent.logical_offset)
-                                        .saturating_add(extent.locator_id.0);
+                                        .checked_sub(extent.logical_offset)
+                                        .and_then(|relative| {
+                                            relative.checked_add(extent.locator_id.0)
+                                        })
+                                        .ok_or(Errno::EIO)?;
                                     block_volume.write_bytes(physical_offset, chunk)?;
+                                }
+                                if !found_extent {
+                                    block_volume.write_bytes(start, &data)?;
                                 }
                             }
                             Ok(())
@@ -33804,6 +33815,83 @@ mod tests {
             Some(false),
             "successful syncfs must publish the reclaim projection clean after block-volume drain"
         );
+    }
+
+    #[test]
+    fn block_volume_barriers_preserve_extent_locator_base_for_dirty_subrange() {
+        for barrier in ["fsync", "syncfs"] {
+            let (fixture, block_volume, _tracker) =
+                adapter_fixture_with_shared_tracker_and_mock_block_volume();
+            let ctx = root_ctx();
+            let name = format!("{barrier}-clipped-locator.bin");
+            let (inode, adapter_fh, _engine_fh) = create_adapter_file_handle(
+                &fixture.adapter,
+                &ctx,
+                name.as_bytes(),
+                libc::O_RDWR as u32,
+            );
+            let payload = b"0123456789";
+            fixture
+                .adapter
+                .dispatch_write(&ctx, inode.get(), adapter_fh, 0, payload, 0)
+                .expect("baseline write");
+            fixture
+                .adapter
+                .dispatch_fsync(&ctx, inode.get(), adapter_fh)
+                .expect("baseline fsync");
+
+            let base_locator = {
+                let engine = fixture.adapter.engine.lock().unwrap();
+                let original = engine.lookup_extents(inode, 0, payload.len() as u64);
+                let clipped = engine.lookup_extents(inode, 4, 3);
+                assert_eq!(original.len(), 1, "fixture needs one original extent");
+                assert_eq!(clipped.len(), 1, "fixture needs one clipped extent");
+                assert_eq!(original[0].logical_offset, 0);
+                assert_eq!(clipped[0].logical_offset, 4);
+                assert_eq!(clipped[0].locator_id, original[0].locator_id);
+                original[0].locator_id.0
+            };
+
+            // Model a byte-range owner inside an already allocated extent.
+            // lookup_extents(inode, 4, 3) clips logical_offset to 4 while
+            // retaining base_locator, so barrier copy must recover the
+            // original logical start before calculating the physical offset.
+            fixture
+                .adapter
+                .dirty_state
+                .lock()
+                .unwrap()
+                .entry(inode.get())
+                .or_default()
+                .mark_dirty(4, 3);
+
+            match barrier {
+                "fsync" => fixture
+                    .adapter
+                    .dispatch_fsync(&ctx, inode.get(), adapter_fh)
+                    .expect("dirty-subrange fsync"),
+                "syncfs" => fixture
+                    .adapter
+                    .dispatch_syncfs(&ctx)
+                    .expect("dirty-subrange syncfs"),
+                _ => unreachable!(),
+            }
+
+            let carrier = block_volume.lock().unwrap();
+            assert_eq!(
+                carrier.store.get(&base_locator).map(Vec::as_slice),
+                Some(payload.as_slice()),
+                "{barrier} must not overwrite the extent base with a clipped subrange"
+            );
+            assert_eq!(
+                carrier
+                    .store
+                    .get(&base_locator.saturating_add(4))
+                    .map(Vec::as_slice),
+                Some(&payload[4..7]),
+                "{barrier} must advance the base locator by the dirty subrange offset"
+            );
+        }
     }
 
     fn assert_barrier_copies_non_primary_dirty_owners_to_block_volume(barrier: &str) {
