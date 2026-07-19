@@ -17,7 +17,8 @@ use tidefs_checksum_tree::{DomainTag, ObjectDigest};
 use tidefs_compression::{decode, encode, CompressionAlgorithm, CompressionError};
 use tidefs_encryption::{decrypt_extent, encrypt_extent, DatasetDEK, EncryptionError, ExtentNonce};
 use tidefs_erasure_coding::{
-    encode_receipt_stripe, reconstruct_receipt_stripe, ReceiptStripeError, StripeConfig,
+    encode_receipt_stripe, reconstruct_receipt_stripe, ErasureShard, ReceiptStripeError, ShardKind,
+    StripeConfig,
 };
 
 use crate::evidence_artifact_manifest::{
@@ -49,7 +50,7 @@ const TRANSFORM_RESIDUAL_RISK: &[&str] = &[
 
 const PERFORMANCE_RESIDUAL_RISK: &[&str] = &[
     "Elapsed guest timings are diagnostic observations without a stable CPU, workload, topology, or comparator baseline and are not a performance claim.",
-    "Read amplification, key epochs, illegal dedupe domains, archive recall, coalescing, rebake, and cross-family malformed-frame coverage remain unexecuted.",
+    "Read amplification, key epochs, illegal dedupe domains, archive recall, coalescing, and rebake remain unexecuted; malformed-frame coverage is limited to compression frames and local EC shard sets.",
     "Local EC helper reconstruction and under-width refusal do not prove pool placement, distributed recovery, archive serving, degraded-read product safety, or availability.",
 ];
 
@@ -379,6 +380,73 @@ fn ec_reconstruction_and_under_width_refusal() -> Result<Value, String> {
     }))
 }
 
+fn expect_invalid_available_set(
+    config: &StripeConfig,
+    available: &[Option<ErasureShard>],
+    case: &str,
+) -> Result<(), String> {
+    match reconstruct_receipt_stripe(config, available) {
+        Err(ReceiptStripeError::InvalidAvailableSet { slots, expected })
+            if slots == available.len() && expected == config.stripe_width() =>
+        {
+            Ok(())
+        }
+        other => Err(format!(
+            "malformed EC {case} was not refused as an invalid available set: {other:?}"
+        )),
+    }
+}
+
+fn ec_malformed_shard_set_refusal() -> Result<Value, String> {
+    let source = payload()[..96].to_vec();
+    let config = StripeConfig {
+        data_shards: 2,
+        parity_shards: 1,
+        shard_len: 64,
+    };
+    let encoded = encode_receipt_stripe(&config, &source)
+        .map_err(|error| format!("encode malformed-set fixture: {error:?}"))?;
+    let available: Vec<_> = encoded.shards.into_iter().map(Some).collect();
+
+    let wrong_width = available[..available.len() - 1].to_vec();
+    expect_invalid_available_set(&config, &wrong_width, "wrong width")?;
+
+    let mut wrong_index = available.clone();
+    wrong_index[0]
+        .as_mut()
+        .expect("encoded shard must be present")
+        .index = 1;
+    expect_invalid_available_set(&config, &wrong_index, "slot/index mismatch")?;
+
+    let mut wrong_role = available.clone();
+    wrong_role[0]
+        .as_mut()
+        .expect("encoded shard must be present")
+        .kind = ShardKind::Parity;
+    expect_invalid_available_set(&config, &wrong_role, "slot/role mismatch")?;
+
+    let mut wrong_length = available;
+    wrong_length[0]
+        .as_mut()
+        .expect("encoded shard must be present")
+        .bytes
+        .pop();
+    expect_invalid_available_set(&config, &wrong_length, "truncated shard")?;
+
+    Ok(json!({
+        "profile": "local-helper-2-plus-1",
+        "expected_width": config.stripe_width(),
+        "wrong_width_slots": wrong_width.len(),
+        "wrong_width_refused": true,
+        "wrong_index_refused": true,
+        "wrong_role_refused": true,
+        "truncated_shard_len": config.shard_len - 1,
+        "truncated_shard_refused": true,
+        "typed_refusal": "invalid-available-set",
+        "generic_success_forbidden": true,
+    }))
+}
+
 fn summary(rows: &[DataShapeRuntimeRow]) -> RuntimeSummary {
     let count = |status| rows.iter().filter(|row| row.status == status).count();
     let product_failed = count(ValidationStatus::ProductFail);
@@ -509,6 +577,13 @@ pub fn build_runtime_reports(provenance: &DataShapeRunProvenance) -> DataShapeRu
             "Local EC helper execution only; no pool placement, distributed recovery, archive recall, availability, or degraded-read product claim.",
             ec_reconstruction_and_under_width_refusal,
         ),
+        executed_row(
+            "ec-helper-malformed-shard-set-refusal",
+            vec!["erasure-coding"],
+            "refuse wrong-width, wrong-index, wrong-role, and truncated local EC helper shard sets",
+            "Local EC helper input validation only; no pool placement, repair receipt, archive, distributed recovery, availability, or degraded-read product claim.",
+            ec_malformed_shard_set_refusal,
+        ),
         skipped_row(
             "dedupe-domain-transform-execution",
             vec!["dedupe"],
@@ -627,6 +702,14 @@ pub fn build_runtime_reports(provenance: &DataShapeRunProvenance) -> DataShapeRu
         ),
         mirrored_row(
             &transform_rows,
+            "ec-helper-malformed-shard-set-refusal",
+            "malformed-ec-shard-set",
+            vec!["erasure-coding"],
+            "reject wrong-width, wrong-index, wrong-role, and truncated local EC helper shard sets",
+            "Typed local helper refusal only; no EC placement, repair, archive, distributed recovery, or degraded-read product authority.",
+        ),
+        mirrored_row(
+            &transform_rows,
             "ec-helper-degraded-reconstruction-under-width-refusal",
             "ec-helper-under-width",
             vec!["erasure-coding"],
@@ -661,7 +744,7 @@ pub fn build_runtime_reports(provenance: &DataShapeRunProvenance) -> DataShapeRu
                 "not EC placement, archive, distributed recovery, or availability proof",
                 "not dedupe, coalescing, rebake, reclaim, or source-retirement execution",
             ],
-            "Actual helper execution now exists for compression, stored-frame digest rejection, AEAD refusal, and local EC reconstruction/refusal, but the registered evidence class and claim remain blocked on the skipped rows and end-to-end authority boundaries.",
+            "Actual helper execution now exists for compression, stored-frame digest rejection, AEAD refusal, and local EC reconstruction, under-width, and malformed-set refusal, but the registered evidence class and claim remain blocked on the skipped rows and end-to-end authority boundaries.",
             TRANSFORM_RESIDUAL_RISK.to_vec(),
         ),
         performance_fault: report(
@@ -673,7 +756,7 @@ pub fn build_runtime_reports(provenance: &DataShapeRunProvenance) -> DataShapeRu
                 "not a service objective or comparator row",
                 "not mounted, archive, distributed, production, or release evidence",
             ],
-            "Malformed compression, wrong-key/tamper, and local EC under-width helper faults were executed, but CPU, read-amplification, key-epoch, dedupe-domain, archive, coalescing, and rebake rows keep this evidence class and claim blocked.",
+            "Malformed compression and local EC shard-set refusals, wrong-key/tamper, and local EC under-width helper faults were executed, but CPU, read-amplification, key-epoch, dedupe-domain, archive, coalescing, and rebake rows keep this evidence class and claim blocked.",
             PERFORMANCE_RESIDUAL_RISK.to_vec(),
         ),
     }
@@ -795,11 +878,27 @@ mod tests {
             reports.transform_execution.outcome(),
             ValidationStatus::Skip
         );
-        assert!(reports.transform_execution.passed_rows() >= 6);
+        assert!(reports.transform_execution.passed_rows() >= 7);
         assert!(reports.transform_execution.skipped_rows() >= 4);
         assert_eq!(reports.performance_fault.outcome(), ValidationStatus::Skip);
-        assert!(reports.performance_fault.passed_rows() >= 5);
+        assert!(reports.performance_fault.passed_rows() >= 6);
         assert!(reports.performance_fault.skipped_rows() >= 6);
+
+        let malformed = reports
+            .transform_execution
+            .rows
+            .iter()
+            .find(|row| row.row == "ec-helper-malformed-shard-set-refusal")
+            .expect("malformed EC shard-set row");
+        assert_eq!(malformed.status, ValidationStatus::Pass);
+        for field in [
+            "wrong_width_refused",
+            "wrong_index_refused",
+            "wrong_role_refused",
+            "truncated_shard_refused",
+        ] {
+            assert_eq!(malformed.observation[field].as_bool(), Some(true));
+        }
     }
 
     #[test]
