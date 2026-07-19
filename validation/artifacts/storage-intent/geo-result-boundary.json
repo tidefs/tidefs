@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "claim_id": "storage.intent.geo_async_rpo.v1",
+  "issue": "https://github.com/tidefs/tidefs/issues/1795",
+  "validation_tier": "source-model",
+  "artifact_scope": "source-model result/refusal boundary for the bounded WAN/TCP and RDMA-absent geo-RPO validation row",
+  "reviewed_authorities": [
+    "docs/STORAGE_INTENT_POLICY_AUTHORITY.md",
+    "docs/STORAGE_INTENT_RESULT_REFUSAL_EVIDENCE_DESIGN.md",
+    "docs/CLAIMS_GATE_POLICY.md",
+    "validation/claims.toml",
+    "crates/tidefs-two-node-harness/src/geo_rpo.rs",
+    "crates/tidefs-two-node-harness/src/bin/geo_rpo_wan_tcp_validation.rs"
+  ],
+  "boundaries": [
+    {
+      "boundary": "rdma-absence-is-not-geo-rpo-proof",
+      "proof": "The bounded runner selects the live TCP carrier and records rdma_absent=true, but carrier selection, TCP connectivity, or an RDMA-free baseline are not by themselves evidence of geo-async RPO, latest-read freshness, or geo-intent correctness.",
+      "required_to_strengthen": "current multi-process artifacts for the declared WAN/TCP topology, temporal recovery, performance/fault rows, and a passing claim review"
+    },
+    {
+      "boundary": "stale-freshness-must-refuse-visibly",
+      "proof": "A receiver whose observed lag exceeds the row maximum returns a typed stale-freshness refusal. The result record must preserve the lag, RPO bound, policy/evidence context, and retry law instead of translating the stale row into a generic success, timeout, or transport-only error.",
+      "required_to_strengthen": "runtime evidence that records the declared freshness frontier and verifies the caller-visible refusal for the exact transport, topology, and policy"
+    },
+    {
+      "boundary": "partition-and-catch-up-remain-degraded-visible",
+      "proof": "Partitioned rows may retain a backlog and enter a degraded-visible or refused state; later catch-up must show the backlog transition and must not rewrite the partition interval as an uninterrupted fresh success. Recovery, repair, and receipt state remain visible until the applicable policy floor is earned.",
+      "required_to_strengthen": "multi-process partition, catch-up, and recovery artifacts with current manifests for the declared RPO envelope"
+    },
+    {
+      "boundary": "bounded-runtime-row-is-not-distributed-product-admission",
+      "proof": "The supervisor, sender, and receiver children exercise one loopback TCP topology with application-level impairment. This source-model boundary neither makes storage-node runtime behavior authoritative nor admits production cluster, successor/comparator, release, or broad distributed-product wording.",
+      "required_to_strengthen": "separate current product-admission evidence for the relevant distributed scope outside this issue"
+    }
+  ],
+  "forbidden_inferences": [
+    "RDMA absence implies geo-async durability",
+    "TCP connectivity implies an earned geo RPO receipt",
+    "a backlog counter implies latest-read freshness",
+    "catch-up after a partition erases the prior degraded interval",
+    "a source-model result boundary implies multi-process runtime execution",
+    "a bounded WAN/TCP row implies storage-node, production, release, successor, or comparator readiness"
+  ],
+  "claim_effect": "This source-model result/refusal boundary passes only as a fail-closed interpretation of the registered geo-RPO rows. It leaves storage.intent.geo_async_rpo.v1 blocked and does not substitute for any required multi-process distributed evidence class."
+}

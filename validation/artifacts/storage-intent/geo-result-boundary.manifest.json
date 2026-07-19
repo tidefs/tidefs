@@ -1,0 +1,16 @@
+{
+  "manifest_version": 2,
+  "claim_id": "storage.intent.geo_async_rpo.v1",
+  "evidence_class": "storage-intent-geo-result-boundary",
+  "validation_tier": "source-model",
+  "scope": "source-model result/refusal boundary for the bounded WAN/TCP and RDMA-absent geo-RPO validation row",
+  "artifact_path": "validation/artifacts/storage-intent/geo-result-boundary.json",
+  "content_digest": "blake3:28f64733041bef68f41351f285d09af8e729831cdd5960445824f4e3970e7684",
+  "run_id": "deterministic-fixture:issue-1795-geo-result-boundary-v1",
+  "source_ref": "refs/heads/codex1/issue-1795-geo-rpo-claim-boundary",
+  "outcome": "pass",
+  "residual_risk": "This source-model boundary review does not prove WAN or internet RPO, latest-read freshness, geo-intent correctness, storage-node runtime behavior, or broad distributed product readiness. The required multi-process artifacts remain absent.",
+  "source": "issue-1795-source-review",
+  "generated_at": "2026-07-19T21:55:59Z",
+  "blocking_issues": []
+}

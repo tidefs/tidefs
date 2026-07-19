@@ -1,0 +1,87 @@
+schema_version = 1
+claim_id = "storage.intent.geo_async_rpo.v1"
+issue = "https://github.com/tidefs/tidefs/issues/1795"
+reviewed_at = "2026-07-19T21:55:59Z"
+reviewed_tree = "bcd2090287af49567d1850b7483434b1d5f2d96e"
+validation_tier = "source-model"
+review_scope = "claims-gate review of the bounded WAN/TCP and RDMA-absent geo-RPO evidence boundary and the remaining multi-process runtime artifacts"
+review_outcome = "blocked"
+decision = "The claim remains blocked. This review and the geo result/refusal boundary are current source-model receipts, but the registered policy/transport, temporal/recovery, and performance/fault evidence artifacts and their version-2 manifests have not been produced by the manual Geo RPO WAN TCP workflow."
+
+required_evidence_classes = [
+  "storage-intent-geo-policy-transport-evidence",
+  "storage-intent-geo-temporal-recovery-evidence",
+  "storage-intent-geo-performance-fault-rows",
+  "storage-intent-geo-result-boundary",
+  "claims-gate-review",
+]
+
+missing_evidence = [
+  "validation/artifacts/storage-intent/geo-policy-transport-evidence.json and its version-2 manifest from the WAN/TCP, RDMA-absent multi-process row",
+  "validation/artifacts/storage-intent/geo-temporal-recovery-evidence.json and its version-2 manifest covering lag, catch-up, freshness, backlog, and degraded-visible or refusal state",
+  "validation/artifacts/storage-intent/geo-performance-fault-rows.json and its version-2 manifest covering partition, stale clocks, loss/jitter, bandwidth clamps, and forbidden remote-lag outcomes",
+]
+
+non_claim_boundaries = [
+  "No source-model, TCP-only, or RDMA-absent observation is treated as proof of RPO seconds, latest-read freshness, geo-intent correctness, or an earned geo durability receipt.",
+  "No storage-node runtime, distributed product mode, production, release-readiness, successor, comparator, or OpenZFS/Ceph-class wording is widened.",
+  "The manual runtime workflow remains the owner of the three multi-process distributed artifacts; this review does not replace it.",
+]
+
+[[evidence_checks]]
+class = "storage-intent-geo-policy-transport-evidence"
+artifact_path = "validation/artifacts/storage-intent/geo-policy-transport-evidence.json"
+manifest_path = "validation/artifacts/storage-intent/geo-policy-transport-evidence.manifest.json"
+artifact_status = "missing"
+manifest_schema = "missing"
+outcome_status = "missing"
+currentness_status = "missing"
+notes = "The source contains the Geo RPO WAN TCP producer, but the required multi-process runtime artifact has not been captured on the reviewed tree."
+
+[[evidence_checks]]
+class = "storage-intent-geo-temporal-recovery-evidence"
+artifact_path = "validation/artifacts/storage-intent/geo-temporal-recovery-evidence.json"
+manifest_path = "validation/artifacts/storage-intent/geo-temporal-recovery-evidence.manifest.json"
+artifact_status = "missing"
+manifest_schema = "missing"
+outcome_status = "missing"
+currentness_status = "missing"
+notes = "No current manifest records the required lag, catch-up, freshness, backlog, and degraded-visible or refusal rows for the declared topology."
+
+[[evidence_checks]]
+class = "storage-intent-geo-performance-fault-rows"
+artifact_path = "validation/artifacts/storage-intent/geo-performance-fault-rows.json"
+manifest_path = "validation/artifacts/storage-intent/geo-performance-fault-rows.manifest.json"
+artifact_status = "missing"
+manifest_schema = "missing"
+outcome_status = "missing"
+currentness_status = "missing"
+notes = "No current manifest records the partition, stale-clock, loss/jitter, bandwidth-clamp, and forbidden remote-lag rows."
+
+[[evidence_checks]]
+class = "storage-intent-geo-result-boundary"
+artifact_path = "validation/artifacts/storage-intent/geo-result-boundary.json"
+manifest_path = "validation/artifacts/storage-intent/geo-result-boundary.manifest.json"
+artifact_status = "present"
+artifact_schema = "json-report-v1"
+manifest_schema = "v2-pass"
+outcome_status = "pass"
+currentness_status = "current-in-reviewed-tree"
+notes = "The source-model receipt preserves the stale-freshness, partition, catch-up, RDMA-absent, and product-boundary refusal laws without substituting for runtime rows."
+
+[[evidence_checks]]
+class = "claims-gate-review"
+artifact_path = "validation/artifacts/storage-intent/geo-async-rpo-claims-gate-review.toml"
+manifest_path = "validation/artifacts/storage-intent/geo-async-rpo-claims-gate-review.manifest.json"
+artifact_status = "present"
+artifact_schema = "toml-review-v1"
+manifest_schema = "v2-pass"
+digest_status = "bound-by-companion-manifest"
+outcome_status = "pass"
+currentness_status = "current-on-review-branch"
+notes = "This review receipt passes because it accurately preserves the three missing runtime classes; review_outcome remains blocked."
+
+[registry_effect]
+claims_toml_changed = false
+claim_status_after_review = "blocked"
+stronger_wording_allowed = false

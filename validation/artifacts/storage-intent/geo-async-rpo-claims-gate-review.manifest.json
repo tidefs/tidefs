@@ -1,0 +1,16 @@
+{
+  "manifest_version": 2,
+  "claim_id": "storage.intent.geo_async_rpo.v1",
+  "evidence_class": "claims-gate-review",
+  "validation_tier": "source-model",
+  "scope": "claims-gate source review of the bounded geo-RPO result/refusal boundary and missing multi-process WAN/TCP runtime classes",
+  "artifact_path": "validation/artifacts/storage-intent/geo-async-rpo-claims-gate-review.toml",
+  "content_digest": "blake3:f0399ff53788ce51efff65293f4f2dcb3c282a78c37d8bdbf667c9a14700689a",
+  "run_id": "deterministic-fixture:issue-1795-geo-async-rpo-claims-gate-review-v1",
+  "source_ref": "refs/heads/codex1/issue-1795-geo-rpo-claim-boundary",
+  "outcome": "pass",
+  "residual_risk": "The review leaves storage.intent.geo_async_rpo.v1 blocked because its policy/transport, temporal/recovery, and performance/fault multi-process evidence manifests are absent. It does not widen geo/RPO, distributed, production, release, successor, or comparator wording.",
+  "source": "issue-1795-claims-gate-review",
+  "generated_at": "2026-07-19T21:55:59Z",
+  "blocking_issues": []
+}
