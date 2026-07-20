@@ -56,13 +56,16 @@ may use non-secret repository variables for scheduling gates, such as
   through the build/test lanes that consume the updated pin.
 - `Clippy` runs on the TideFS self-hosted runner VMs through the same repo
   `.#ci` Nix development shell. On pull requests it selects changed workspace
-  crates, compares their clippy warning counts against
-  `docs/clippy-baseline.json`, and fails when a crate introduces warnings
-  above the recorded baseline. Manual dispatch can run either changed-crate or
-  full-workspace clippy checks against a feature branch and uploads
-  `clippy-baseline-summary`. Root lint policy remains in `Cargo.toml`;
+  crates from locked Cargo metadata and the merge-base diff, then runs direct
+  `cargo clippy -p <crate> --locked --all-targets` checks. Cargo failures fail
+  the job and ordinary diagnostics remain in the job log; no warning-count
+  snapshot or result artifact is maintained. Root workspace, Cargo
+  configuration, lockfile, and toolchain changes select the whole workspace.
+  Manual dispatch can run either changed-crate or full-workspace checks
+  against a feature branch. Root lint policy remains in `Cargo.toml`;
   kernel, FFI, and capability-test crates that cannot inherit those lints use
-  explicit crate-local manifest policy instead of weakening the baseline gate.
+  explicit crate-local manifest policy instead of weakening workspace lint
+  policy.
 - `Dependency License` (`.github/workflows/dependency-license.yml`) runs
   `cargo deny check licenses` through the repo `.#ci` Nix development shell on
   every `master` push, on pull requests that touch `Cargo.toml`, `Cargo.lock`,
