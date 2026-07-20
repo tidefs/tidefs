@@ -71,7 +71,7 @@ jobs:
         with:
           name: focused-rust-summary
           path: ci-test-summary.json
-          if-no-files-found: ignore
+          if-no-files-found: error
           retention-days: 7
 
       - name: Report summary
