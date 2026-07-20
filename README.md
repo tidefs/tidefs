@@ -196,18 +196,14 @@ cargo check --workspace --locked
 
 ## Start Here
 
-Use this repo-local reading order before changing behavior or documentation:
+The complete baseline for ordinary work is:
 
-1. `README.md` - repository overview and current policy summary
-2. `AGENTS.md` - agent and managed-worker contract
-3. `CONTRIBUTING.md` - contribution, local build, and PR guidance
-4. `docs/GITHUB_CI.md` - CI workflow, validation lanes, and secret boundary
-5. `docs/CLAIMS_GATE_POLICY.md` - publishing-facing claim guardrails
-6. `docs/REVIEW_TODO_POLICY.md` - durable review-debt policy
-7. `docs/REVIEW_TODO_REGISTER.md` - current review-debt register
-8. `docs/DOCUMENTATION_AUTHORITY_REGISTER.md` - document authority and classification
-9. `docs/INDEX.md` - documentation index and authority-family map
+1. `README.md` — product contract and current development direction;
+2. `AGENTS.md` — repository development rules; and
+3. `CONTRIBUTING.md` — contribution path and ordinary definition of done.
 
-Read `docs/LICENSING.md`, `docs/TEST_SIGNAL_POLICY.md`,
-`docs/UNRELEASED_AUTHORITY_POLICY.md`, and
-`docs/CONTROL_FORMAT_AND_JSON_POLICY.md` when a change touches those surfaces.
+Load specialized references only when the touched surface needs them.
+`CONTRIBUTING.md` routes to testing, CI and secrets, licensing, review debt,
+unreleased compatibility, and control-format policy. `docs/INDEX.md` is
+optional navigation for those references and for claims/publication,
+architecture, and operator documents; it is not baseline authority.
