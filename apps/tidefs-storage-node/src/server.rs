@@ -5552,6 +5552,13 @@ fn handle_frame_ctx(
                 report,
             })
         }
+        Frame::Send { .. } | Frame::SendChunked { .. }
+            if matches!(&*store.lock().unwrap(), StoreBackend::TransportBacked(_)) =>
+        {
+            Some(Frame::Error {
+                message: "sender_authority_stale".into(),
+            })
+        }
         Frame::Send { key } => {
             let fs_root = ctx.config.fs_root.as_ref()?;
             let auth_key = ctx.config.root_auth_key?;

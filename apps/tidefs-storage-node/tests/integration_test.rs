@@ -101,6 +101,12 @@ impl TestServer {
             carrier_policy: None,
         };
 
+        Self::spawn_configured(config)
+    }
+
+    fn spawn_configured(config: StorageNodeConfig) -> Self {
+        let addr = config.bind_addr;
+
         let mut node = StorageNode::start(config).expect("start server");
         let stop = Arc::new(AtomicBool::new(false));
         let stop_clone = Arc::clone(&stop);
@@ -461,6 +467,66 @@ fn stats_returns_typed_report() {
 
 use tidefs_local_filesystem::{self as vfs, RootAuthenticationKey};
 use tidefs_local_object_store::StoreOptions;
+
+#[test]
+fn transport_backed_send_refuses_unbound_sender_authority() {
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), pick_port());
+    let store_dir = tempfile::tempdir().expect("store tempdir");
+    let fs_parent = tempfile::tempdir().expect("filesystem parent tempdir");
+    let fs_root = fs_parent.path().join("must-not-open");
+    let authority = tidefs_storage_node::authority_spine::RuntimeAuthority::build(
+        tidefs_membership_live::BackendDisclosure::Tcp(addr),
+        31,
+        Some(MemberClass::Voter),
+        Some(31),
+        1,
+    )
+    .expect("build live TCP authority");
+    let config = StorageNodeConfig {
+        bind_addr: addr,
+        node_id: 31,
+        store_paths: vec![store_dir.path().join("store")],
+        fs_root: Some(fs_root.clone()),
+        root_auth_key: Some(RootAuthenticationKey::demo_key()),
+        member_class: None,
+        failure_domain: None,
+        membership_bind_addr: None,
+        membership_peers: vec![],
+        replica_peers: vec![],
+        pool_device_paths: Vec::new(),
+        pool_lock_dir: None,
+        node_identity: Some("unbound-transport-send".into()),
+        authority: Some(authority),
+        ready_file: None,
+        drain_timeout_secs: 30,
+        cluster_lease_config: None,
+        membership_checkpoint_dir: None,
+        rdma: false,
+        carrier_policy: None,
+    };
+
+    assert!(!fs_root.exists(), "send source sentinel must start absent");
+    let server = TestServer::spawn_configured(config);
+
+    for (client_id, frame) in [
+        (32, Frame::Send { key: Vec::new() }),
+        (33, Frame::SendChunked { key: Vec::new() }),
+    ] {
+        let response = client::request(client_id, 31, server.addr, frame, false)
+            .expect("live transport-backed send request");
+        assert_eq!(
+            response,
+            Frame::Error {
+                message: "sender_authority_stale".into(),
+            }
+        );
+    }
+
+    assert!(
+        !fs_root.exists(),
+        "transport-backed refusal must precede filesystem open"
+    );
+}
 
 #[test]
 fn send_vfssend2_roundtrip_via_server() {
