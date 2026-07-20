@@ -168,10 +168,6 @@ demonstrated safety prerequisite requires earlier work.
 - Mounted device-level compression and encryption are blocked behind
   `docs/MOUNTED_TRANSFORM_AUTHORITY_RAW_STORE_INVENTORY.md`; lower object-store
   wrappers are not an end-to-end mounted filesystem claim.
-- Until its aggregate-check wiring is removed, the existing
-  `cargo run -p tidefs-xtask -- check-claims-gate` command remains a
-  compatibility check for publication metadata. It neither establishes
-  capability nor completes ordinary work.
 - Commits should be clean, scoped, and bisectable in the same spirit as Linux
   kernel development.
 

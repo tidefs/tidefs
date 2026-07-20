@@ -1384,7 +1384,7 @@ fn main() {
         Some("check-group") => {
             let group = args.next().unwrap_or_else(|| {
                 eprintln!("check-group requires a group name");
-                eprintln!("Available groups: policy, terminology, platform, observe, authority, cluster, block, ublk-surface, storage, claims, format, all");
+                eprintln!("Available groups: policy, terminology, platform, observe, authority, cluster, block, ublk-surface, storage, format, all");
                 process::exit(1);
             });
             match group.as_str() {
@@ -1465,11 +1465,6 @@ fn main() {
                     storage::check_dataset_lifecycle_current_workspace(),
                     storage::check_space_accounting_watermarks_current_workspace(),
                 ),
-                "claims" => run_checks!(
-                    claims::check_current_workspace(),
-                    forgejo_work::check_claim_gate_current_workspace(),
-                    forgejo_work::check_abandoned_worktrees_current_workspace(),
-                ),
                 "format" => run_checks!(
                     format_golden::validate_format_golden(),
                     run_cargo_fmt_check(),
@@ -1477,7 +1472,7 @@ fn main() {
                 "all" => run_all_checks(),
                 _ => {
                     eprintln!("unknown check group: {group}");
-                    eprintln!("Available groups: policy, terminology, platform, observe, authority, cluster, block, ublk-surface, storage, claims, format, all");
+                    eprintln!("Available groups: policy, terminology, platform, observe, authority, cluster, block, ublk-surface, storage, format, all");
                     process::exit(2);
                 }
             }
@@ -1711,10 +1706,6 @@ fn run_all_checks() {
     if let Err(e) = storage::check_space_accounting_watermarks_current_workspace() {
         errors.push(format!("storage/check-space-accounting-watermarks: {e}"));
     }
-    // claims
-    if let Err(e) = claims::check_current_workspace() {
-        errors.push(format!("claims/check-claims-gate: {e}"));
-    }
     // worktree claim gate and abandoned worktrees check
     if let Err(e) = forgejo_work::check_claim_gate_current_workspace() {
         errors.push(format!("worktree/check-claim-gate: {e}"));
@@ -1739,7 +1730,7 @@ fn run_all_checks() {
         eprintln!("\n{total} checks FAILED");
         process::exit(1);
     }
-    println!("All 67 checks passed");
+    println!("All aggregate checks passed");
 }
 
 fn run_code_navigability_check() -> Result<(), String> {
@@ -2218,7 +2209,7 @@ fn run_cargo_fmt_check() -> Result<(), String> {
 
 fn print_summary() {
     println!("tidefs workspace summary");
-    println!("group_commands=check-group-policy,check-group-terminology,check-group-platform,check-group-observe,check-group-authority,check-group-cluster,check-group-block,check-group-storage,check-group-claims,check-group-all");
+    println!("group_commands=check-group-policy,check-group-terminology,check-group-platform,check-group-observe,check-group-authority,check-group-cluster,check-group-block,check-group-storage,check-group-all");
     println!("human_spine=Control Plane -> Policy Authority -> Publication Pipeline -> Response Registry");
     println!("stable_locator_spine=control_plane -> policy_authority -> publication_pipeline -> response_registry");
     for surface in SURFACES {
@@ -2394,8 +2385,7 @@ fn print_help() {
     println!("  check-group cluster       run all cluster checks (7 checks)");
     println!("  check-group block         run all block-volume checks (26 checks)");
     println!("  check-group storage       run all storage checks (36 checks)");
-    println!("  check-group claims        run claims gate + work ownership checks (3 checks)");
-    println!("  check-group all           run all 80 checks, report all failures");
+    println!("  check-group all           run configured checks, report all failures");
     println!();
     println!("  --- Individual check commands ---");
     println!("  check-workspace-policy   validate workspace_layout dependency-edge rules");
