@@ -83,10 +83,21 @@ all_workspace_crates() {
     cut -f1 "$package_rows_file" | sort -u
 }
 
+package_path_affects_clippy() {
+    case "$1" in
+        Cargo.toml|*.rs|*.c|*.cc|*.cpp|*.cxx|*.h|*.hh|*.hpp|*.S|*.s)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
 changed_workspace_crates() {
     local workspace_root="$1" package_rows_file="$2" base_ref="$3"
     local changed_files_file="$4" merge_base
-    local changed_file crate relative_dir row
+    local changed_file crate relative_dir row package_path
     local -a changed_files package_rows
     declare -A selected=()
 
@@ -115,8 +126,12 @@ changed_workspace_crates() {
     for changed_file in "${changed_files[@]}"; do
         for row in "${package_rows[@]}"; do
             IFS=$'\t' read -r crate relative_dir <<< "$row"
-            if [[ "$changed_file" == "$relative_dir" ||
-                  "$changed_file" == "$relative_dir/"* ]]; then
+            if [[ "$changed_file" == "$relative_dir/"* ]]; then
+                package_path="${changed_file#"$relative_dir/"}"
+            else
+                continue
+            fi
+            if package_path_affects_clippy "$package_path"; then
                 selected["$crate"]=1
             fi
         done
