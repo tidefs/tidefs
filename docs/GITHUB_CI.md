@@ -238,11 +238,10 @@ may use non-secret repository variables for scheduling gates, such as
   `authority/missing-pool` and `configured-pool-member`, and fails closed for
   upstream xfstests row names. Reserve broad target dispatches such as
   `target=fuse` or `target=all` for acceptance gates, scheduled coverage, or
-  when the failure set is not yet isolated. `RDMA`
-  dispatch runs three matrix targets: `static-carrier-check` for source/harness
-  structure, `host-probe` for non-mutating runner capability inspection, and
-  `qemu-two-node` for multi-process distributed transport evidence. The first
-  two are harness/host evidence only; they do not prove live two-node transport
+  when the failure set is not yet isolated. `RDMA` dispatch runs two matrix
+  targets: `host-probe` for non-mutating runner capability inspection and
+  `qemu-two-node` for multi-process distributed transport evidence. The host
+  probe is harness/host evidence only; it does not prove live two-node transport
   behavior. xfstests uploads its run-level manifest as
   `xfstests-run-manifest.json`; RDMA claim-shaped rows use v2
   `evidence-manifest.json` records with explicit outcomes.

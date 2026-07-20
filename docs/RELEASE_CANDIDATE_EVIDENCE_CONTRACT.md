@@ -60,8 +60,7 @@ Always runs for both profiles. Depends on `rust-smoke`.
 |---|---|
 | Runner labels | `self-hosted, linux, x64, tidefs, nix` |
 | Timeout | 180 min |
-| Commands | `nix build -L .#checks.x86_64-linux.rdmaCarrierTwoNode` |
-|  | `nix build -L .#packages.x86_64-linux.default` |
+| Commands | `nix build -L .#packages.x86_64-linux.default` |
 |  | `nix build -L .#packages.x86_64-linux.tidefsFuseRuntime` |
 |  | `nix build -L .#packages.x86_64-linux.tidefsUblkRuntime` |
 |  | `nix build -L .#packages.x86_64-linux.tidefsPosixVfsKmod` |
@@ -106,7 +105,7 @@ Full profile only. Depends on `qemu`. Matrix of three targets.
 
 ### rdma
 
-Full profile only. Depends on `qemu`. Matrix of three targets.
+Full profile only. Depends on `qemu`. Matrix of two targets.
 
 | Attribute | Value |
 |---|---|
@@ -116,7 +115,6 @@ Full profile only. Depends on `qemu`. Matrix of three targets.
 
 | Target | Command | Artifact name | Artifact path globs |
 |---|---|---|---|
-| `static-carrier-check` | `nix build -L .#checks.x86_64-linux.rdmaCarrierTwoNode` | `release-candidate-rdma-static-carrier-check` | `/tmp/tidefs-rdma-two-node/**`, `/tmp/tidefs-validation/**` |
 | `host-probe` | `nix run .#rdma-probe -- --validation-dir /tmp/tidefs-validation/rdma/host-probe` | `release-candidate-rdma-host-probe` | `/tmp/tidefs-rdma-two-node/**`, `/tmp/tidefs-validation/**` |
 | `qemu-two-node` | `nix run .#qemu-rdma-two-node-nixos -- --validation-dir /tmp/tidefs-rdma-two-node` | `release-candidate-rdma-qemu-two-node` | `/tmp/tidefs-rdma-two-node/**`, `/tmp/tidefs-validation/**` |
 
@@ -432,7 +430,7 @@ workflows. Key differences:
 | **Nix Checks** (`nix-checks.yml`) | Builds `tidefsBlockKmod` in addition to the core packages. PR-triggered; path-filtered. | Does **not** build `tidefsBlockKmod`. Manual only. |
 | **QEMU Smoke** (`qemu-smoke.yml`) | 7 matrix targets including `kernel-teardown-validation`, `kernel-no-daemon-teardown-validation`, `kernel-fsync-validation`, `kernel-mmap-validation`, `fuse-vm-test`, `qemu-ublk-smoke`. | 1 target: `kmod-xfstests-smoke`. |
 | **xfstests** (`xfstests.yml`) | 3 targets (same). Scheduled daily + manual dispatch. 7 day retention. | 3 targets (same). Manual only, as part of `full` profile. 14 day retention. |
-| **RDMA** (`rdma.yml`) | 3 targets (same). Scheduled daily + manual dispatch. 7 day retention. | 3 targets (same). Manual only, as part of `full` profile. 14 day retention. |
+| **RDMA** (`rdma.yml`) | 2 targets (same). Scheduled daily + manual dispatch. 7 day retention. | 2 targets (same). Manual only, as part of `full` profile. 14 day retention. |
 
 The RC workflow intentionally runs a narrower QEMU smoke surface than the
 standalone workflow and omits `tidefsBlockKmod` from the Nix build. These are
@@ -448,8 +446,7 @@ source, or behavior changes are made by this contract.
 
 1. **`docs/GITHUB_CI.md` description of RC nix job**: The prose says the RC
    runs "Nix ... lanes" without listing the exact derivations. The actual YAML
-   builds `rdmaCarrierTwoNode` as a pure check derivation plus four core
-   packages (`default`, `tidefsFuseRuntime`, `tidefsUblkRuntime`,
+   builds four core packages (`default`, `tidefsFuseRuntime`, `tidefsUblkRuntime`,
    `tidefsPosixVfsKmod`). The standalone `nix-checks.yml` also builds
    `tidefsBlockKmod`, which the RC omits. A reader relying only on
    `docs/GITHUB_CI.md` might assume parity between the two nix jobs.

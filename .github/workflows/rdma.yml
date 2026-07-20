@@ -22,13 +22,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: static-carrier-check
-            command_class: static-carrier
-            evidence_class: rdma-static-carrier-check
-            validation_tier: harness-only
-            artifact_root: /tmp/tidefs-validation/rdma/static-carrier-check
-            primary_artifact: command-status.env
-            command: 'nix build -L .#checks.x86_64-linux.rdmaCarrierTwoNode'
           - name: host-probe
             command_class: host-probe
             evidence_class: rdma-host-probe

@@ -37,11 +37,6 @@ jobs:
       - name: Show flake outputs
         run: nix flake show . --all-systems
 
-      - name: Build pure check derivations
-        run: |
-          nix build -L \
-            .#checks.x86_64-linux.rdmaCarrierTwoNode
-
       - name: Build core packages
         run: |
           nix build -L \

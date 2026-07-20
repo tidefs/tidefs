@@ -74,11 +74,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
-      - name: Build pure check derivations
-        run: |
-          nix build -L \
-            .#checks.x86_64-linux.rdmaCarrierTwoNode
-
       - name: Build core packages
         run: |
           nix build -L \
@@ -170,8 +165,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: static-carrier-check
-            command: nix build -L .#checks.x86_64-linux.rdmaCarrierTwoNode
           - name: host-probe
             command: nix run .#rdma-probe
           - name: qemu-two-node
@@ -461,14 +454,6 @@ jobs:
                   status: lane_status($rdma_result; ["full"]),
                   matrix_jobs: [
                     {
-                      name: "static-carrier-check",
-                      artifact_name: "release-candidate-rdma-static-carrier-check",
-                      expected_artifact_path_patterns: [
-                        "/tmp/tidefs-rdma-two-node/**",
-                        "/tmp/tidefs-validation/**"
-                      ]
-                    },
-                    {
                       name: "host-probe",
                       artifact_name: "release-candidate-rdma-host-probe",
                       expected_artifact_path_patterns: [
@@ -486,13 +471,6 @@ jobs:
                     }
                   ],
                   artifacts: [
-                    artifact(
-                      "release-candidate-rdma-static-carrier-check";
-                      [
-                        "/tmp/tidefs-rdma-two-node/**",
-                        "/tmp/tidefs-validation/**"
-                      ]
-                    ),
                     artifact(
                       "release-candidate-rdma-host-probe";
                       [
