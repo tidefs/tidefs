@@ -52,7 +52,6 @@ pub mod placement_transfer;
 pub mod rebuild_backfill;
 pub mod write_fence;
 
-pub mod channel_transport;
 pub mod placement_heal;
 pub mod pool_config;
 pub mod pool_label_bridge;
@@ -73,7 +72,6 @@ pub mod types;
 // Re-exports
 pub use authority::{AcquireOutcome, LeaseAuthority, RenewOutcome};
 pub use catalog_commit_handler::{make_coordinator_handler, CatalogDeltaSubscriber};
-pub use channel_transport::{ChannelPoolTransport, ChannelTransportError};
 pub use client_mode::{
     ClientMode, ClientModeConfig, ClientModeSnapshot, ClientModeTracker, ModeTransitionError,
 };
