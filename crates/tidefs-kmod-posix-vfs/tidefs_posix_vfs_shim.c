@@ -614,6 +614,8 @@ int tidefs_posix_vfs_engine_tmpfile(
 	unsigned int mode, unsigned int flags,
 	unsigned long long *out_ino, unsigned int *out_mode,
 	unsigned long long *out_generation);
+int tidefs_posix_vfs_engine_abort_tmpfile(
+	unsigned long long ino, unsigned long long generation);
 
 
 /* Engine-backed setattr bridge (#6143): chmod, chown, truncate, utimes. */
@@ -2212,9 +2214,9 @@ static struct dentry *tidefs_posix_vfs_lookup(struct inode *dir,
 }
 
 /*
- * tmpfile does not yet install inherited ACL xattrs. Keep that caller
- * fail-closed below a directory with a default ACL; otherwise apply the
- * ordinary umask that SB_POSIXACL delegates to the filesystem.
+ * Fallback creation callers apply the ordinary umask. Retain the
+ * engine-backed ACL probe defensively so inheritance cannot be skipped by a
+ * new caller.
  */
 static int tidefs_posix_vfs_prepare_create_mode(struct inode *dir,
 						 umode_t *mode)
@@ -2491,32 +2493,56 @@ static int tidefs_posix_vfs_tmpfile(struct mnt_idmap *idmap,
 				     struct file *file, umode_t mode)
 {
 	struct tidefs_posix_vfs_kernel_pool_core *pool;
-	struct tidefs_posix_vfs_mount *ctx;
+	struct tidefs_posix_vfs_mount *ctx = dir->i_sb->s_fs_info;
+	struct tidefs_posix_vfs_create_acl create_acl;
 	struct inode *inode;
-	u64 out_ino;
+	u64 out_ino = 0;
 	u32 out_mode;
 	u64 out_generation = 0;
-	int ret, pool_idx;
+	int ret, rollback_ret, pool_idx;
 
-	ret = tidefs_posix_vfs_prepare_create_mode(dir, &mode);
-	if (ret)
+	if (!ctx || !ctx->engine_backed)
+		return -EOPNOTSUPP;
+	if (ctx->read_only)
+		return -EROFS;
+
+	ret = tidefs_posix_vfs_require_live_dir(dir);
+	if (ret < 0)
 		return ret;
 
 	pool = tidefs_posix_vfs_pool_core_from_sb(dir->i_sb);
 	if (IS_ERR(pool))
 		return PTR_ERR(pool);
 
-	ctx = dir->i_sb->s_fs_info;
-	if (!ctx || !ctx->engine_backed)
-		return -EOPNOTSUPP;
+	ret = tidefs_posix_vfs_prepare_create_acl(
+		dir, &mode, S_IFREG, &create_acl);
+	if (ret)
+		return ret;
 
 	ret = tidefs_posix_vfs_engine_tmpfile(
 		dir->i_ino, mode, file->f_flags,
 		&out_ino, &out_mode, &out_generation);
 	if (ret < 0)
-		return ret;
-	if (!out_generation)
-		return -EIO;
+		goto out_release_acl;
+	if (!out_ino || !out_generation) {
+		ret = -EIO;
+		goto rollback_engine_tmpfile;
+	}
+
+	inode = new_inode(dir->i_sb);
+	if (!inode) {
+		ret = -ENOMEM;
+		goto rollback_engine_tmpfile;
+	}
+	inode->i_ino = out_ino;
+	inode->i_generation = out_generation;
+	inode_init_owner(idmap, inode, dir, out_mode);
+	tidefs_posix_vfs_apply_inode_ops(inode, out_mode, 0);
+	ret = tidefs_posix_vfs_init_new_inode_acl(inode, &create_acl);
+	if (ret) {
+		iput(inode);
+		goto rollback_engine_tmpfile;
+	}
 
 	pool_idx = tidefs_kernel_pool_mirror_engine_inode(
 		pool, out_ino, dir->i_ino, out_mode, 0, NULL, 0);
@@ -2524,15 +2550,9 @@ static int tidefs_posix_vfs_tmpfile(struct mnt_idmap *idmap,
 		pr_debug("tidefs_posix_vfs: tmpfile skipped full C mirror for ino=%llu\n",
 			 out_ino);
 
-	inode = new_inode(dir->i_sb);
-	if (!inode)
-		return -ENOMEM;
-	inode->i_ino = out_ino;
-	inode->i_generation = out_generation;
-	inode_init_owner(idmap, inode, dir, out_mode);
-	tidefs_posix_vfs_apply_inode_ops(inode, out_mode, 0);
 	tidefs_posix_vfs_init_new_inode_times(inode);
 	insert_inode_hash(inode);
+	tidefs_posix_vfs_release_create_acl(&create_acl);
 	d_tmpfile(file, inode);
 
 	/*
@@ -2541,6 +2561,18 @@ static int tidefs_posix_vfs_tmpfile(struct mnt_idmap *idmap,
 	 * dput(child) does not free it before may_open().
 	 */
 	return finish_open_simple(file, 0);
+
+rollback_engine_tmpfile:
+	rollback_ret = tidefs_posix_vfs_engine_abort_tmpfile(
+		out_ino, out_generation);
+	if (rollback_ret < 0) {
+		pr_err("tidefs_posix_vfs: tmpfile initialization rollback failed ino=%llu ret=%d\n",
+		       out_ino, rollback_ret);
+		ret = -EIO;
+	}
+out_release_acl:
+	tidefs_posix_vfs_release_create_acl(&create_acl);
+	return ret;
 }
 
 static struct dentry *tidefs_posix_vfs_mkdir(struct mnt_idmap *idmap,

@@ -838,6 +838,69 @@ let
                 clear_active_xfstest(test_name)
                 continue
 
+            if test_name == "tidefs/tmpfile-acl-inheritance":
+                run_script = textwrap.dedent("""
+                  set -euo pipefail
+                  parent=/mnt/tidefs/.tidefs-tmpfile-acl-inheritance
+                  trap 'rm -rf "$parent"' EXIT
+                  rm -rf "$parent"
+                  mkdir "$parent"
+                  setfacl -m 'd:u::rwx,d:u:12345:rw-,d:g::r--,d:m::rw-,d:o::---' "$parent"
+                  python3 - "$parent" <<'PY'
+                import os
+                import stat
+                import subprocess
+                import sys
+
+                parent = sys.argv[1]
+                old_umask = os.umask(0o077)
+                try:
+                    fd = os.open(parent, os.O_TMPFILE | os.O_RDWR, 0o666)
+                finally:
+                    os.umask(old_umask)
+
+                try:
+                    mode = stat.S_IMODE(os.fstat(fd).st_mode)
+                    acl = subprocess.check_output(
+                        ["getfacl", "-cpn", f"/proc/self/fd/{fd}"],
+                        pass_fds=(fd,),
+                        text=True,
+                    )
+                    actual = {line.strip() for line in acl.splitlines() if line.strip()}
+                    expected = {
+                        "user::rw-",
+                        "user:12345:rw-",
+                        "group::r--",
+                        "mask::rw-",
+                        "other::---",
+                    }
+                    print(f"type=tmpfile mode={mode:o}")
+                    print(acl, end="")
+                    if mode != 0o660:
+                        raise SystemExit(f"unexpected tmpfile mode: {mode:o}")
+                    if actual != expected:
+                        raise SystemExit(
+                            f"unexpected tmpfile ACL: actual={sorted(actual)!r} "
+                            f"expected={sorted(expected)!r}"
+                        )
+                finally:
+                    os.close(fd)
+                PY
+                """)
+                set_active_xfstest(test_name, case_name, "mounted-product-check")
+                start = time.time()
+                rc, output = shell(run_script, timeout=per_test_timeout)
+                duration = time.time() - start
+                if rc == 0:
+                    record(test_name, "pass", output.strip(),
+                           duration_secs=round(duration, 3))
+                else:
+                    record(test_name, "product-fail", output.strip(),
+                           failure_class=classify_failure(output, rc),
+                           duration_secs=round(duration, 3))
+                clear_active_xfstest(test_name)
+                continue
+
             case_dir = f"/tmp/xfstests-runs/{case_name}"
             quoted_test = shlex.quote(test_name)
             run_script = textwrap.dedent(f"""

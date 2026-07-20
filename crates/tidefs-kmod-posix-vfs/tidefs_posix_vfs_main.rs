@@ -2744,6 +2744,38 @@ impl KernelEngine {
         Ok(())
     }
 
+    /// Abort an unnamed inode before the VFS publishes it with `d_tmpfile()`.
+    ///
+    /// The generation and lifecycle checks keep this rollback from deleting a
+    /// reused inode or one that has already become visible or open.
+    fn abort_tmpfile(
+        &self,
+        ino: u64,
+        generation: u64,
+    ) -> core::result::Result<(), crate::tidefs_kmod_bridge::kernel_types::Errno> {
+        use crate::tidefs_kmod_bridge::kernel_types::Errno;
+
+        let Some(idx) = self.find_inode(ino) else {
+            return Err(Errno::ENOENT);
+        };
+        let (record_generation, nlink) = {
+            let inodes = self.inodes.borrow();
+            let record = &inodes[idx];
+            (record.generation, record.nlink)
+        };
+
+        if record_generation != generation {
+            return Err(Errno::ESTALE);
+        }
+        if nlink != 0 || self.inode_open_count(ino) != 0 {
+            return Err(Errno::EBUSY);
+        }
+        if !self.remove_inode_record(ino)? {
+            return Err(Errno::ENOENT);
+        }
+        Ok(())
+    }
+
     fn push_inode_record(
         &self,
         rec: InodeRecord,
@@ -9799,7 +9831,18 @@ pub extern "C" fn tidefs_posix_vfs_engine_tmpfile(
 
     let result = with_mounted_engine(
         Err(crate::tidefs_kmod_bridge::kernel_types::Errno::ENODEV),
-        |engine| engine.tmpfile(parent, mode, flags, &ctx),
+        |engine| {
+            let (attr, handle) = engine.tmpfile(parent, mode, flags, &ctx)?;
+            let ino = attr.inode_id.get();
+            let generation = attr.generation.0;
+            if ino == 0 || generation == 0 {
+                if ino != 0 {
+                    engine.abort_tmpfile(ino, generation)?;
+                }
+                return Err(crate::tidefs_kmod_bridge::kernel_types::Errno::EIO);
+            }
+            Ok((attr, handle))
+        },
     );
 
     match result {
@@ -9813,6 +9856,28 @@ pub extern "C" fn tidefs_posix_vfs_engine_tmpfile(
         Err(e) => return -(e.0 as core::ffi::c_int),
     }
     0
+}
+
+/// C-visible rollback for an unnamed inode that failed initialization before
+/// `d_tmpfile()` made it visible to the VFS.
+#[no_mangle]
+pub extern "C" fn tidefs_posix_vfs_engine_abort_tmpfile(
+    ino: u64,
+    generation: u64,
+) -> core::ffi::c_int {
+    use crate::tidefs_kmod_bridge::kernel_types::Errno;
+
+    if ino == 0 || generation == 0 {
+        return -(Errno::EINVAL.0 as core::ffi::c_int);
+    }
+
+    let result = with_mounted_engine(Err(Errno::ENODEV), |engine| {
+        engine.abort_tmpfile(ino, generation)
+    });
+    match result {
+        Ok(()) => 0,
+        Err(e) => -(e.0 as core::ffi::c_int),
+    }
 }
 
 /// C-visible bridge: engine-backed directory creation.
