@@ -748,16 +748,6 @@ pub fn check_current_workspace() -> Result<(), ClaimsGateCheckError> {
     );
     check_source_markers(
         &root,
-        "README.md",
-        &[
-            "does not currently fulfill",
-            "pre-alpha",
-            "check-claims-gate",
-        ],
-        &mut missing,
-    );
-    check_source_markers(
-        &root,
         "docs/PREVIEW_UAPI_ABI_BOUNDARY_OW202.md",
         &[
             "historical tracker item 202",

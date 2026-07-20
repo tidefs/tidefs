@@ -2,22 +2,27 @@
 
 Maturity: current policy guardrail.
 
-TideFS may describe ambition and future direction, but publishing-facing docs
-must not present future capability as current product fact.
+Publishing-facing docs and output may describe ambition, but must not present
+future capability as current product fact. This policy applies only to
+publication, release, support, and comparison decisions, not ordinary
+implementation or its definition of done.
 
 ## Required command
 
-Run this before publishing a tarball, tag, external summary, or handoff that a
-reader could treat as a capability statement:
+Run this directly before publishing a tarball, tag, external capability or
+support summary, comparison, or handoff that a reader could treat as a
+capability statement:
 
 ```text
 cargo run -p tidefs-xtask -- check-claims-gate
 ```
 
-This command checks publishing-facing capability wording. It does not validate
-active work ownership. Foreground Codex work is coordinated through GitHub
-issues and pull requests in `tidefs/tidefs`; use the separate worktree/claim
-diagnostic commands when checking local worker ownership.
+The command is absent from aggregate check groups. Ordinary work uses the
+focused carrier or invariant validation named by its issue; claim ids,
+manifests, generated registries, and release verdicts neither establish
+capability nor complete that work. The command does not validate ownership;
+GitHub issues and pull requests do. Use separate worktree diagnostics for local
+worker ownership.
 
 ## Claim Registry Authority
 
@@ -114,17 +119,10 @@ evidence classes are present and current, including:
 - `storage-intent-operator-explanation-evidence`;
 - `claims-gate-review`.
 
-Normal implementation PRs need the focused validation named by their GitHub
-issue; they do not prove the whole successor claim. Product-facing comparator
-evidence is collected only at named product gates such as `validate-claim`,
-proof-train packets, release-readiness verdict review, explicit
-performance/fault/attribution/evidence-query/service-objective matrices, or
-claim-boundary manifests under `validation/artifacts/`.
-
-If a PR touches product claims, successor wording, comparator baselines,
-release-readiness wording, or evidence manifests, it must run the relevant
-claim gate and preserve blocked status unless the same issue adds matching
-evidence for the exact claimed scope.
+Use the relevant direct claim command only when a change edits product claims,
+successor wording, comparator baselines, publication evidence, or
+release-readiness wording. Preserve blocked status unless matching evidence
+exists for the exact scope under publication review.
 
 ## Validation Tier Evidence Map
 
