@@ -1,34 +1,27 @@
 # TideFS
 
-TideFS is a Rust filesystem and storage stack aimed at OpenZFS/Ceph-class
-reliability and scale. It is not there yet. The repo is a pre-alpha
-implementation with serious architectural debt tracked in
-`docs/REVIEW_TODO_REGISTER.md`.
-TideFS does not currently fulfill the OpenZFS/Ceph-class narrative; that is
-the target, not a present-tense capability claim.
+TideFS is a pre-alpha Rust filesystem and storage stack pursuing
+OpenZFS/Ceph-class reliability and scale. It does not currently fulfill that
+target and is not production-ready.
 
-This repository is the fresh TideFS tree on `master`; source paths, crates,
-binaries, and docs should use TideFS names.
-
-The primary remote is the public repository `tidefs/tidefs` on GitHub; the
-operator approved making that main repository public on 2026-06-21. Public
-visibility is a read boundary only, not a product release: outsider interaction
-remains restricted by the documented public-read controls in `docs/GITHUB_CI.md`,
-and TideFS infrastructure, runner credentials, deployment keys, API tokens, TLS
-keys, and other secrets remain outside this repository. The companion
-`tidefs/tidefs-infra-configuration` repository remains private.
+The public `tidefs/tidefs` repository is not a product release. Outsider
+interaction remains restricted by `docs/GITHUB_CI.md`; infrastructure and
+secrets remain outside it, and `tidefs/tidefs-infra-configuration` remains
+private.
 
 ## Product Contract
 
-This section is the canonical product shape for TideFS. It is a product
-contract, not a roadmap and not a status report. It defines the final target
-shape; current capability remains controlled by the claim registry, review
-register, and live issues/PRs.
+This is TideFS's sole authority for product modes and public surfaces. It
+defines the final target, not present support. No mode below is currently
+supported. Source plus focused tests through the relevant product surface
+establish current behavior. Issues and pull requests select work and record
+blockers. Claims, evidence packets, generated registers, and release verdicts
+belong only to publication decisions; they neither establish capability nor
+complete ordinary development.
 
-No other document, issue, prototype, crate, daemon, command, test, or
-automation path may add a user-facing TideFS product mode or public product
-surface by implication. If the final product shape changes, this section must
-change in the same reviewable path.
+No other document, issue, prototype, crate, daemon, command, test, or automation
+may imply a user-facing mode or surface. Changes to the final shape must update
+this section in the same review.
 
 ### Canonical Shape
 
@@ -80,17 +73,11 @@ surfaces:
 - Block device or block export paths for advertised block-volume modes.
 - Runtime state for the current owner, peer membership, devices, pools,
   filesystems, volumes, snapshots, clones, and recovery state.
-- Validation evidence packets tied to the claim registry for publishable
-  capability claims.
-- Repository documentation and generated claim registers as the publication
-  authority for what is promised, proven, blocked, or intentionally excluded.
 
-Internal crates, helper binaries, test fixtures, validation harnesses, service
-protocols, on-disk implementation details, and automation endpoints are not
-public product surfaces merely because they exist. A daemon, kernel module, or
-background worker may be required implementation machinery, but it is not an
-operator product interface unless this contract or a current repo-local
-authority document names that interface as public.
+These surfaces are product carriers only when they exercise the real
+implementation path. Internal crates, helpers, fixtures, harnesses, protocols,
+on-disk details, daemons, kernel modules, background workers, and automation
+endpoints are not public interfaces merely because they exist.
 
 ### Required Final Behavior
 
@@ -107,8 +94,8 @@ answers for:
   restore, and reclaim behavior for mounted filesystem modes.
 - Volume create, open/export, close/unexport, destroy, capacity limit, resize,
   snapshot, restore, and reclaim behavior for block-volume modes.
-- Clone behavior, either as supported behavior with validation evidence or as an
-  explicit refusal in each mode.
+- Clone behavior, either supported and tested or explicitly refused in each
+  mode.
 - Crash recovery to the last committed root, or an explicit integrity or media
   failure when recovery cannot be completed.
 - Integrity verification using checksums or equivalent end-to-end protection,
@@ -123,8 +110,8 @@ answers for:
   recovery state.
 - Kernel-resident data paths where the product claims kernel-resident behavior;
   user-space shims do not satisfy those claims.
-- Repeatable validation that records the tested build, configuration, devices,
-  commands, results, and claim identifiers.
+- Repeatable tests through the relevant product surface for each supported,
+  refused, and high-risk failure behavior.
 
 ### Exclusions
 
@@ -144,13 +131,25 @@ ambiguous:
 - TideFS is not POSIX-complete.
 - TideFS does not claim a final distributed operator UAPI.
 - Unreleased data formats and control surfaces do not carry compatibility
-  promises unless a repo-local authority document says so explicitly.
+  promises except for a named, tested external ABI, protocol, or operator-owned
+  data set.
 - Separate requirements, roadmap, status, or vision Markdown roots must not be
   created for this same product story.
 
-Current implementation status and blockers belong in
-`docs/CLAIMS_GATE_POLICY.md`, generated `docs/CLAIM_REGISTRY.md`,
-`docs/REVIEW_TODO_REGISTER.md`, and live GitHub issues and pull requests.
+## Current Development Direction
+
+The first pilot targets one local, single-node mounted-filesystem carrier:
+`tidefsctl` creates or imports a pool and creates one filesystem; the actual
+POSIX/FUSE path mounts it; real file and directory I/O exercises storage;
+`fsync`/`fdatasync` and rename durability are observed; the process stops or
+crashes; the pool reopens; data and metadata are read back through the mount
+with integrity verification; truthful status is inspected; the filesystem
+unmounts; and the pool exports and reimports.
+
+This sequence is an acceptance target, not present support. The mounted path
+remains a development harness until the full lifecycle passes focused boundary
+tests. Block-volume, kernel-resident, and clustered modes follow unless a
+demonstrated safety prerequisite requires earlier work.
 
 ## Current Policy
 
@@ -169,8 +168,10 @@ Current implementation status and blockers belong in
 - Mounted device-level compression and encryption are blocked behind
   `docs/MOUNTED_TRANSFORM_AUTHORITY_RAW_STORE_INVENTORY.md`; lower object-store
   wrappers are not an end-to-end mounted filesystem claim.
-- Publishing-facing capability wording must pass
-  `cargo run -p tidefs-xtask -- check-claims-gate`.
+- Until its aggregate-check wiring is removed, the existing
+  `cargo run -p tidefs-xtask -- check-claims-gate` command remains a
+  compatibility check for publication metadata. It neither establishes
+  capability nor completes ordinary work.
 - Commits should be clean, scoped, and bisectable in the same spirit as Linux
   kernel development.
 
