@@ -14,7 +14,6 @@ pub mod crash_recovery;
 pub mod evidence_artifact_manifest;
 pub mod failed_quorum_ledger_validation;
 pub mod failure_blocker_triage;
-pub mod fault_injection_scenario_catalog;
 pub mod fio_integrity;
 pub mod fuse_inode_metadata_validation;
 pub mod fuse_read_validation;
