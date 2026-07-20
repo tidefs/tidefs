@@ -286,7 +286,6 @@ pub mod message_dispatch;
 pub mod message_priority;
 pub mod messages;
 pub mod object_enumerator;
-pub mod object_list;
 pub mod object_transfer;
 pub mod outbound_send;
 pub mod path_evidence;
@@ -378,11 +377,6 @@ pub use messages::{StateTransferChunk, StateTransferRequest};
 pub use object_enumerator::{
     compute_per_node_object_deltas, ObjectEnumerator, ObjectPlacementEntry, PerNodeObjectDelta,
     PlacementMap, PlacementTableObjectEnumerator, ShardKind,
-};
-pub use object_list::{
-    recv_list_objects_request, recv_list_objects_response, send_list_objects_request,
-    send_list_objects_response, serve_list_objects_request, ListObjectsError, ListObjectsHandler,
-    ListObjectsRequest, ListObjectsResponse, ObjectListEntry,
 };
 pub use peer_manager::{
     new_peer_manager_handle, MembershipEvent, MembershipEventSink, PeerEntry, PeerManager,
