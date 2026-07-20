@@ -5257,6 +5257,19 @@ impl<'a> PoolStoreMut<'a> {
         self.pool.get(IoClass::Data, key)
     }
 
+    /// Load the current persisted data-class receipt and bind a read to it.
+    ///
+    /// This is the mutable-handle counterpart of
+    /// [`Pool::current_placement_receipt_read`]. It lets mutation code validate
+    /// the authority for existing content without exposing the underlying
+    /// mutable [`Pool`].
+    pub fn current_placement_receipt_read(
+        &self,
+        key: ObjectKey,
+    ) -> Result<Option<CurrentPlacementReceiptRead<'_>>> {
+        self.pool.current_placement_receipt_read(IoClass::Data, key)
+    }
+
     /// Store an object, compressing/encrypting transparently.
     pub fn put(&mut self, key: ObjectKey, payload: &[u8]) -> Result<StoredObject> {
         self.pool.put(IoClass::Data, key, payload)

@@ -4,7 +4,9 @@ use std::convert::TryFrom;
 use std::vec;
 
 use tidefs_dedup::{decide_inline_dedup, InlineDedupDecision};
-use tidefs_local_object_store::pool::{PlacementReceipt, PoolStoreMut};
+use tidefs_local_object_store::pool::{
+    CurrentPlacementReceiptRead, PlacementReceipt, PoolStoreMut,
+};
 use tidefs_local_object_store::DeviceIoClass;
 use tidefs_local_object_store::Pool;
 use tidefs_local_object_store::{
@@ -34,6 +36,29 @@ use crate::{ContentChunkObject, ContentChunkRef, ContentLayout, ContentManifestO
 pub(crate) trait ContentWriteStore {
     fn get(&self, key: ObjectKey) -> Result<Option<Vec<u8>>>;
 
+    /// Read an existing chunk through the authority appropriate for this
+    /// mutation store.
+    ///
+    /// Raw transaction/recovery stores deliberately use their local bytes.
+    /// Pool-backed mounted mutation stores override this method so a
+    /// receipt-bound chunk uses current Pool authority.
+    fn read_existing_chunk_bytes(
+        &self,
+        key: ObjectKey,
+        _chunk_ref: &ContentChunkRef,
+    ) -> Result<Vec<u8>> {
+        self.get(key)?.ok_or(FileSystemError::CorruptState {
+            reason: "content manifest references a missing chunk object",
+        })
+    }
+
+    /// Whether a failed current chunk may be recovered from raw historical
+    /// versions. Pool-backed receipt authority overrides this for nonzero
+    /// recorded generations.
+    fn allows_untrusted_historical_chunk_fallback(&self, _chunk_ref: &ContentChunkRef) -> bool {
+        true
+    }
+
     fn put_with_receipt(
         &mut self,
         key: ObjectKey,
@@ -49,6 +74,28 @@ pub(crate) trait ContentWriteStore {
 impl<'a> ContentWriteStore for PoolStoreMut<'a> {
     fn get(&self, key: ObjectKey) -> Result<Option<Vec<u8>>> {
         Ok(PoolStoreMut::get(self, key)?)
+    }
+
+    fn read_existing_chunk_bytes(
+        &self,
+        key: ObjectKey,
+        chunk_ref: &ContentChunkRef,
+    ) -> Result<Vec<u8>> {
+        let recorded_generation = chunk_ref.placement_receipt_generation;
+        if recorded_generation == 0 {
+            return self.get(key)?.ok_or(FileSystemError::CorruptState {
+                reason: "content manifest references a missing chunk object",
+            });
+        }
+        read_chunk_bytes_from_current_receipt(
+            PoolStoreMut::current_placement_receipt_read(self, key),
+            recorded_generation,
+            key,
+        )
+    }
+
+    fn allows_untrusted_historical_chunk_fallback(&self, chunk_ref: &ContentChunkRef) -> bool {
+        chunk_ref.placement_receipt_generation == 0
     }
 
     fn put_with_receipt(
@@ -791,7 +838,7 @@ fn try_validate_chunk_bytes_with_get(
         return Ok(None);
     }
     let resolved_vec;
-    let (chunk_bytes, resolved_via_dedup) = if is_dedup_redirect(raw_bytes) {
+    let (chunk_bytes, redirect_canonical_key) = if is_dedup_redirect(raw_bytes) {
         let Ok(canonical_key) = decode_dedup_redirect(raw_bytes) else {
             return Ok(None);
         };
@@ -799,13 +846,20 @@ fn try_validate_chunk_bytes_with_get(
             return Ok(None);
         };
         resolved_vec = canonical;
-        (resolved_vec.as_slice(), true)
+        (resolved_vec.as_slice(), Some(canonical_key))
     } else {
-        (raw_bytes, false)
+        (raw_bytes, None)
     };
     let Ok(chunk) = decode_content_chunk(chunk_bytes) else {
         return Ok(None);
     };
+    if let Some(canonical_key) = redirect_canonical_key {
+        let fingerprint = crate::encoding::compute_content_fingerprint(&chunk.bytes);
+        if crate::object_keys::content_dedup_object_key(&fingerprint) != canonical_key {
+            return Ok(None);
+        }
+    }
+    let resolved_via_dedup = redirect_canonical_key.is_some();
     // For dedup-resolved chunks, skip inode_id, data_version, and
     // chunk_index checks: the canonical data may have been written by
     // a different inode, with a different data version, and at a
@@ -887,13 +941,16 @@ fn read_content_chunk_from_write_store<S: ContentWriteStore + ?Sized>(
         chunk_ref.data_version,
         chunk_ref.chunk_index,
     );
-    let bytes = store.get(key)?.ok_or(FileSystemError::CorruptState {
-        reason: "content manifest references a missing chunk object",
-    })?;
+    let bytes = store.read_existing_chunk_bytes(key, chunk_ref)?;
     if let Some((chunk, _dedup)) =
         try_validate_chunk_bytes_from_write_store(store, inode_id, chunk_ref, &bytes)?
     {
         return Ok(chunk);
+    }
+    if !store.allows_untrusted_historical_chunk_fallback(chunk_ref) {
+        return Err(FileSystemError::CorruptState {
+            reason: "content chunk failed integrity validation under current placement receipt",
+        });
     }
     if let Some(chunk) = try_self_heal_chunk_from_write_store(store, inode_id, chunk_ref, key)? {
         return Ok(chunk);
@@ -1087,9 +1144,21 @@ fn read_chunk_bytes_with_receipt(
         };
     }
 
-    // Load one current receipt and retain the Pool-bound route for that exact
-    // authority value.
-    let receipt_read = match pool.current_placement_receipt_read(DeviceIoClass::Data, key) {
+    read_chunk_bytes_from_current_receipt(
+        pool.current_placement_receipt_read(DeviceIoClass::Data, key),
+        recorded_generation,
+        key,
+    )
+}
+
+/// Classify one Pool-selected current receipt and consume the read handle that
+/// is bound to that exact receipt.
+fn read_chunk_bytes_from_current_receipt(
+    receipt_read: tidefs_local_object_store::Result<Option<CurrentPlacementReceiptRead<'_>>>,
+    recorded_generation: u64,
+    key: ObjectKey,
+) -> Result<Vec<u8>> {
+    let receipt_read = match receipt_read {
         Ok(Some(receipt_read)) => receipt_read,
         Ok(None) => {
             return Err(FileSystemError::ReceiptAuthorityMissing {
@@ -2720,51 +2789,35 @@ pub(crate) fn reflink_chunked_content<S: ContentWriteStore>(
                     ));
                     continue;
                 }
-                let src_chunk_key = content_chunk_object_key_for_version(
-                    source_inode_id,
-                    src_chunk_ref.data_version,
-                    src_chunk_ref.chunk_index,
-                );
-                let src_encoded =
-                    store
-                        .get(src_chunk_key)?
-                        .ok_or(FileSystemError::CorruptState {
-                            reason: "reflink: source chunk object missing",
-                        })?;
+                let source_chunk =
+                    read_content_chunk_from_write_store(store, source_inode_id, src_chunk_ref)?;
+                let fingerprint = crate::encoding::compute_content_fingerprint(&source_chunk.bytes);
+                let canonical_key = crate::object_keys::content_dedup_object_key(&fingerprint);
 
-                let (canonical_key, fingerprint) = if is_dedup_redirect(&src_encoded) {
-                    // Source already has a dedup redirect; chain to the same
-                    // canonical key and add the fingerprint to the local index.
-                    let ck = decode_dedup_redirect(&src_encoded)?;
-                    let canon_bytes = store.get(ck)?.ok_or(FileSystemError::CorruptState {
-                        reason: "reflink: dedup redirect references missing canonical chunk",
-                    })?;
-                    let chunk = decode_content_chunk(&canon_bytes)?;
-                    let fp = crate::encoding::compute_content_fingerprint(&chunk.bytes);
-                    // Existing canonical: increment refcount for this new redirect.
-                    let _ =
-                        crate::dedup_refcount::DedupRefCount::increment(store.raw_store_mut(), &fp);
-                    (ck, fp)
-                } else {
-                    // Source chunk is stored inline (no previous dedup).
-                    // Compute its fingerprint, store at the canonical key if
-                    // not already present, then redirect.
-                    let chunk = decode_content_chunk(&src_encoded)?;
-                    let fp = crate::encoding::compute_content_fingerprint(&chunk.bytes);
-                    let ck = crate::object_keys::content_dedup_object_key(&fp);
-                    // Only store the canonical chunk if it's not already there
-                    let canonical_existed = store.get(ck)?.is_some();
-                    if !canonical_existed {
-                        store.put(ck, &src_encoded)?;
-                        crate::dedup_refcount::DedupRefCount::init(store.raw_store_mut(), &fp)?;
-                    } else {
-                        let _ = crate::dedup_refcount::DedupRefCount::increment(
-                            store.raw_store_mut(),
-                            &fp,
-                        );
+                if let Some(existing) = store.get(canonical_key)? {
+                    let existing_chunk = decode_content_chunk(&existing)?;
+                    if existing_chunk.bytes != source_chunk.bytes {
+                        return Err(FileSystemError::CorruptState {
+                            reason: "reflink: canonical chunk does not match its content key",
+                        });
                     }
-                    (ck, fp)
-                };
+                    let _ = crate::dedup_refcount::DedupRefCount::increment(
+                        store.raw_store_mut(),
+                        &fingerprint,
+                    );
+                } else {
+                    let canonical = encode_content_chunk(
+                        source_record,
+                        src_chunk_ref.chunk_index,
+                        &source_chunk.bytes,
+                        compression_policy,
+                    );
+                    store.put(canonical_key, &canonical)?;
+                    crate::dedup_refcount::DedupRefCount::init(
+                        store.raw_store_mut(),
+                        &fingerprint,
+                    )?;
+                }
 
                 // Record the fingerprint in the local dedup index so future
                 // writes within this session can also share it.
@@ -2924,6 +2977,162 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    enum ReceiptFailure {
+        Missing,
+        Older,
+    }
+
+    #[derive(Clone, Copy)]
+    enum ReceiptBoundMutation {
+        PartialOverlay,
+        PartialHolePunch,
+        Reflink,
+    }
+
+    impl ReceiptBoundMutation {
+        fn label(self) -> &'static str {
+            match self {
+                Self::PartialOverlay => "partial overlay",
+                Self::PartialHolePunch => "partial hole punch",
+                Self::Reflink => "reflink",
+            }
+        }
+    }
+
+    fn receipt_bound_mutation_error(
+        failure: ReceiptFailure,
+        mutation: ReceiptBoundMutation,
+    ) -> FileSystemError {
+        let failure_label = match failure {
+            ReceiptFailure::Missing => "missing",
+            ReceiptFailure::Older => "older",
+        };
+        let mut pool = temp_pool(&format!(
+            "mutation-{failure_label}-{}",
+            mutation.label().replace(' ', "-")
+        ));
+        let payload = vec![0x51; 64];
+        let old_record = test_record(91, 1, payload.len() as u64);
+        let old_chunk_key =
+            content_chunk_object_key_for_version(old_record.inode_id, old_record.data_version, 0);
+        let encoded =
+            encode_content_chunk(&old_record, 0, &payload, &ContentCompressionPolicy::off());
+        let recorded_generation = match failure {
+            ReceiptFailure::Missing => {
+                pool.raw_primary_store_mut()
+                    .put(old_chunk_key, &encoded)
+                    .expect("seed unauthoritative raw chunk");
+                1
+            }
+            ReceiptFailure::Older => {
+                let (_, receipt) = pool
+                    .put_with_receipt(DeviceIoClass::Data, old_chunk_key, &encoded)
+                    .expect("seed older authoritative chunk");
+                receipt.generation.saturating_add(1)
+            }
+        };
+        let old_manifest = ContentManifestObject {
+            inode_id: old_record.inode_id,
+            data_version: old_record.data_version,
+            file_size: old_record.size,
+            chunk_size: content_chunk_size(),
+            chunks: vec![ContentChunkRef {
+                chunk_index: 0,
+                data_version: old_record.data_version,
+                len: payload.len() as u32,
+                checksum: checksum64(&encoded),
+                placement_receipt_generation: recorded_generation,
+            }],
+        };
+        pool.put(
+            DeviceIoClass::Data,
+            content_object_key_for_version(old_record.inode_id, old_record.data_version),
+            &encode_content_manifest_sparse(&old_manifest),
+        )
+        .expect("seed source manifest");
+
+        let mut store = pool.pool_store_mut();
+        let compression_policy = ContentCompressionPolicy::off();
+        let mut dedup_index = DedupIndex::new();
+        match mutation {
+            ReceiptBoundMutation::PartialOverlay => {
+                let new_record = test_record(91, 2, old_record.size);
+                write_chunked_content_with_overlay(WriteChunkedContentOverlay {
+                    dedup_enabled: false,
+                    store: &mut store,
+                    inode_id: old_record.inode_id,
+                    old_record: &old_record,
+                    new_record: &new_record,
+                    overlay_offset: 1,
+                    overlay_bytes: b"x",
+                    allow_holes: true,
+                    dedup_index: &mut dedup_index,
+                    quorum_store: None,
+                    compression_policy: &compression_policy,
+                })
+            }
+            ReceiptBoundMutation::PartialHolePunch => {
+                let new_record = test_record(91, 2, old_record.size);
+                punch_hole_content(PunchHoleContent {
+                    store: &mut store,
+                    inode_id: old_record.inode_id,
+                    old_record: &old_record,
+                    new_record: &new_record,
+                    hole_offset: 1,
+                    hole_length: 1,
+                    quorum_store: None,
+                    compression_policy: &compression_policy,
+                })
+            }
+            ReceiptBoundMutation::Reflink => {
+                let dest_record = test_record(92, 1, old_record.size);
+                reflink_chunked_content(
+                    true,
+                    &mut store,
+                    old_record.inode_id,
+                    &old_record,
+                    &dest_record,
+                    &mut dedup_index,
+                    &compression_policy,
+                )
+            }
+        }
+        .expect_err("receipt-bound mutation must fail closed")
+    }
+
+    #[test]
+    fn pool_mutations_reject_missing_chunk_receipts() {
+        for mutation in [
+            ReceiptBoundMutation::PartialOverlay,
+            ReceiptBoundMutation::PartialHolePunch,
+            ReceiptBoundMutation::Reflink,
+        ] {
+            let err = receipt_bound_mutation_error(ReceiptFailure::Missing, mutation);
+            assert!(
+                matches!(&err, FileSystemError::ReceiptAuthorityMissing { .. }),
+                "{} accepted a missing current receipt: {err:?}",
+                mutation.label()
+            );
+        }
+    }
+
+    #[test]
+    fn pool_mutations_reject_older_chunk_receipts() {
+        for mutation in [
+            ReceiptBoundMutation::PartialOverlay,
+            ReceiptBoundMutation::PartialHolePunch,
+            ReceiptBoundMutation::Reflink,
+        ] {
+            let err = receipt_bound_mutation_error(ReceiptFailure::Older, mutation);
+            assert!(
+                matches!(&err, FileSystemError::ReceiptAuthorityStale { .. }),
+                "{} accepted an older current receipt: {err:?}",
+                mutation.label()
+            );
+        }
+    }
+
     #[test]
     fn inline_dedup_helper_routes_duplicate_chunk_through_dedup_authority() {
         let mut store = temp_store("inline-dedup-authority");
@@ -3067,6 +3276,113 @@ mod tests {
             err,
             FileSystemError::CorruptState {
                 reason: "routed canonical read failure"
+            }
+        ));
+    }
+
+    #[test]
+    fn dedup_redirect_rejects_canonical_key_mismatch() {
+        let expected_payload = vec![0x61; 64];
+        let wrong_payload = vec![0x62; expected_payload.len()];
+        let record = test_record(93, 1, expected_payload.len() as u64);
+        let fingerprint = crate::encoding::compute_content_fingerprint(&expected_payload);
+        let canonical_key = crate::object_keys::content_dedup_object_key(&fingerprint);
+        let wrong_canonical =
+            encode_content_chunk(&record, 0, &wrong_payload, &ContentCompressionPolicy::off());
+        let redirect = crate::encoding::encode_dedup_redirect(canonical_key);
+        let chunk_key =
+            content_chunk_object_key_for_version(record.inode_id, record.data_version, 0);
+        let mut pool = temp_pool("dedup-canonical-key-mismatch");
+        pool.put_with_receipt(DeviceIoClass::Data, canonical_key, &wrong_canonical)
+            .expect("seed wrong same-length canonical chunk");
+        let (_, receipt) = pool
+            .put_with_receipt(DeviceIoClass::Data, chunk_key, &redirect)
+            .expect("seed receipt-bound redirect");
+        let chunk_ref = ContentChunkRef {
+            chunk_index: 0,
+            data_version: record.data_version,
+            len: expected_payload.len() as u32,
+            checksum: checksum64(&redirect),
+            placement_receipt_generation: receipt.generation,
+        };
+
+        read_content_chunk_from_store(pool.raw_primary_store(), record.inode_id, &chunk_ref, &pool)
+            .expect_err("strict read must reject canonical bytes under the wrong content key");
+        read_untrusted_raw_content_chunk_for_integrity(
+            pool.raw_primary_store(),
+            record.inode_id,
+            &chunk_ref,
+        )
+        .expect_err("raw integrity read must reject canonical bytes under the wrong content key");
+    }
+
+    #[test]
+    fn dedup_reflink_rejects_mismatched_existing_canonical() {
+        let source_payload = vec![0x71; 64];
+        let wrong_payload = vec![0x72; source_payload.len()];
+        let source_record = test_record(94, 1, source_payload.len() as u64);
+        let dest_record = test_record(95, 1, source_payload.len() as u64);
+        let source_key = content_chunk_object_key_for_version(
+            source_record.inode_id,
+            source_record.data_version,
+            0,
+        );
+        let source_encoded = encode_content_chunk(
+            &source_record,
+            0,
+            &source_payload,
+            &ContentCompressionPolicy::off(),
+        );
+        let mut pool = temp_pool("dedup-reflink-canonical-mismatch");
+        let (_, source_receipt) = pool
+            .put_with_receipt(DeviceIoClass::Data, source_key, &source_encoded)
+            .expect("seed authoritative source chunk");
+        let source_manifest = ContentManifestObject {
+            inode_id: source_record.inode_id,
+            data_version: source_record.data_version,
+            file_size: source_record.size,
+            chunk_size: content_chunk_size(),
+            chunks: vec![ContentChunkRef {
+                chunk_index: 0,
+                data_version: source_record.data_version,
+                len: source_payload.len() as u32,
+                checksum: checksum64(&source_encoded),
+                placement_receipt_generation: source_receipt.generation,
+            }],
+        };
+        pool.put(
+            DeviceIoClass::Data,
+            content_object_key_for_version(source_record.inode_id, source_record.data_version),
+            &encode_content_manifest_sparse(&source_manifest),
+        )
+        .expect("seed source manifest");
+        let fingerprint = crate::encoding::compute_content_fingerprint(&source_payload);
+        let canonical_key = crate::object_keys::content_dedup_object_key(&fingerprint);
+        let wrong_canonical = encode_content_chunk(
+            &source_record,
+            0,
+            &wrong_payload,
+            &ContentCompressionPolicy::off(),
+        );
+        pool.put(DeviceIoClass::Data, canonical_key, &wrong_canonical)
+            .expect("seed mismatched canonical chunk");
+
+        let mut store = pool.pool_store_mut();
+        let mut dedup_index = DedupIndex::new();
+        let err = reflink_chunked_content(
+            true,
+            &mut store,
+            source_record.inode_id,
+            &source_record,
+            &dest_record,
+            &mut dedup_index,
+            &ContentCompressionPolicy::off(),
+        )
+        .expect_err("reflink must not reuse mismatched canonical content");
+        assert!(matches!(
+            err,
+            FileSystemError::CorruptState {
+                reason: "reflink: canonical chunk does not match its content key"
             }
         ));
     }
