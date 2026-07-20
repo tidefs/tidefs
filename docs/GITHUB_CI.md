@@ -47,8 +47,8 @@ may use non-secret repository variables for scheduling gates, such as
   session test. It does not run documentation-authority or publication checks.
 - `Rust Toolchain` (`.github/workflows/rust-toolchain.yml`) runs on the
   TideFS self-hosted runner VMs through the repo `.#ci` Nix development shell
-  when `rust-toolchain.toml`, `flake.nix`, `flake.lock`, the workflow, or this
-  CI authority doc changes, and on manual dispatch. It verifies that the
+  when a pull request changes `rust-toolchain.toml`, `flake.nix`, or
+  `flake.lock`, and on manual dispatch. It verifies that the
   `rust-toolchain.toml` channel matches `rustc -Vv`, records `cargo`,
   `clippy`, `rustfmt`, and `rust-src` availability in the job summary, and
   fails closed on missing components. It is a fast toolchain-coherence gate

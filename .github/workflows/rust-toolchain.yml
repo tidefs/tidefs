@@ -1,14 +1,6 @@
 name: Rust Toolchain
 
 on:
-  push:
-    branches: [master]
-    paths:
-      - 'rust-toolchain.toml'
-      - 'flake.nix'
-      - 'flake.lock'
-      - '.github/workflows/rust-toolchain.yml'
-      - 'docs/GITHUB_CI.md'
   pull_request:
     branches: [master]
     types: [opened, synchronize, reopened, ready_for_review]
@@ -16,8 +8,6 @@ on:
       - 'rust-toolchain.toml'
       - 'flake.nix'
       - 'flake.lock'
-      - '.github/workflows/rust-toolchain.yml'
-      - 'docs/GITHUB_CI.md'
   workflow_dispatch:
 
 permissions:
@@ -31,7 +21,7 @@ jobs:
   verify:
     name: Verify Rust toolchain
     # Draft PRs are not integration candidates; save scarce self-hosted runner
-    # capacity for ready PRs, master pushes, and explicit dispatches.
+    # capacity for ready PRs and explicit dispatches.
     if: ${{ (github.event_name == 'workflow_dispatch' || vars.TIDEFS_SELF_HOSTED_READY == '1') && (github.event_name != 'pull_request' || github.event.pull_request.draft == false) }}
     runs-on: [self-hosted, linux, x64, tidefs, nix]
     timeout-minutes: 10
