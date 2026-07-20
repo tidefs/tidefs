@@ -9,8 +9,8 @@ use crate::dedup::DedupIndex;
 use crate::encoding::*;
 use crate::error::FileSystemError;
 use crate::object_keys::*;
-use crate::read_content_from_store;
 use crate::read_untrusted_raw_content_chunk_for_integrity;
+use crate::read_untrusted_raw_content_from_store_for_integrity;
 use crate::records::*;
 use crate::types::*;
 use crate::validate_content_layout;
@@ -130,7 +130,8 @@ pub(crate) fn ensure_versioned_content_object(
     if inode.size == 0 {
         return Ok(());
     }
-    let content = read_content_from_store(store, inode.inode_id, inode, true, None)?;
+    let content =
+        read_untrusted_raw_content_from_store_for_integrity(store, inode.inode_id, inode, true)?;
     write_chunked_content(
         false,
         store,
@@ -514,6 +515,18 @@ mod tests {
         assert_eq!(fs.read_file("/stable").expect("read stable file"), payload);
 
         drop(fs);
+        let reopened = crate::LocalFileSystem::open_with_options(
+            &root,
+            tidefs_local_object_store::StoreOptions::test_fast(),
+        )
+        .expect("reopen after metadata-only recommit");
+        assert_eq!(
+            reopened
+                .read_file("/stable")
+                .expect("read stable file after reopen"),
+            payload
+        );
+        drop(reopened);
         let _ = std::fs::remove_dir_all(root);
     }
 }

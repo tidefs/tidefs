@@ -17,8 +17,8 @@ use crate::helpers::*;
 use crate::intent_log::{replay_uncommitted, IntentLog};
 use crate::merge_allocation_entries;
 use crate::object_keys::*;
-use crate::read_content_from_store;
 use crate::read_content_layout_from_store;
+use crate::read_untrusted_raw_content_from_store_for_integrity;
 use crate::records::*;
 use crate::transaction_manifest_entries_for_existing_content;
 use crate::types::*;
@@ -396,7 +396,12 @@ pub fn online_verifier_content_counts(
                 continue;
             }
             let layout = read_content_layout_from_store(store, inode.inode_id, inode, false)?;
-            let _ = read_content_from_store(store, inode.inode_id, inode, false, None)?;
+            let _ = read_untrusted_raw_content_from_store_for_integrity(
+                store,
+                inode.inode_id,
+                inode,
+                false,
+            )?;
             checked_content_objects = checked_content_objects.saturating_add(1);
             if let ContentLayout::Chunked(manifest) = layout {
                 checked_content_chunks =
@@ -1900,12 +1905,11 @@ fn validate_loaded_state_incremental(
     for &inode_id in reloaded_inode_ids {
         if let Some(inode) = inodes.get(&inode_id) {
             if inode.is_file_like() {
-                let _ = read_content_from_store(
+                let _ = read_untrusted_raw_content_from_store_for_integrity(
                     store,
                     inode.inode_id,
                     inode,
                     allow_v0390_fixed_content,
-                    None,
                 )?;
             }
         }
@@ -1970,12 +1974,11 @@ fn validate_loaded_file_content(
 ) -> Result<()> {
     for inode in inodes.values() {
         if inode.is_file_like() {
-            let _ = read_content_from_store(
+            let _ = read_untrusted_raw_content_from_store_for_integrity(
                 store,
                 inode.inode_id,
                 inode,
                 allow_v0390_fixed_content,
-                None,
             )?;
         }
     }

@@ -1471,7 +1471,8 @@ fn validate_omitted_incremental_content_manifest(
             reason: "omitted content manifest has no matching file inode",
         })?;
 
-    let _content = read_content_from_store(store, inode.inode_id, inode, true, None)?;
+    let _content =
+        read_untrusted_raw_content_from_store_for_integrity(store, inode.inode_id, inode, true)?;
     Ok(())
 }
 
@@ -1711,8 +1712,12 @@ fn normalize_received_content_receipts(
         }
         // Decode imported bytes without trusting the sender's placement receipt,
         // then rewrite once through the target pool so root manifests stay stable.
-        let content =
-            read_content_from_store(pool.raw_primary_store(), inode.inode_id, inode, true, None)?;
+        let content = read_untrusted_raw_content_from_store_for_integrity(
+            pool.raw_primary_store(),
+            inode.inode_id,
+            inode,
+            true,
+        )?;
         let mut store = pool.pool_store_mut();
         write_chunked_content(
             false,

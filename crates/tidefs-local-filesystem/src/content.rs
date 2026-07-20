@@ -439,29 +439,24 @@ fn placement_evidence_for_content_key(
     }
 }
 
-/// Read decoded content from either Pool authority or an authority-less raw
-/// recovery/import staging store.
+/// Decode content for raw recovery/import staging or integrity validation.
 ///
-/// Mounted callers must pass `Some(pool)` or use [`MountedContentReadAuthority`].
-/// The `None` branch intentionally ignores sender/source placement receipts so
-/// receive normalization and pre-Pool recovery can validate and rewrite staged
-/// bytes. It is not placement-authority validation and must not serve mounted
-/// reads.
-pub(crate) fn read_content_from_store(
+/// This deliberately ignores sender/source placement receipts so callers can
+/// validate and rewrite bytes before Pool authority exists. Mounted and
+/// general content reads must use [`MountedContentReadAuthority`].
+pub(crate) fn read_untrusted_raw_content_from_store_for_integrity(
     store: &LocalObjectStore,
     inode_id: InodeId,
     record: &InodeRecord,
     allow_v0390_fixed_content: bool,
-    pool: Option<&Pool>,
 ) -> Result<Vec<u8>> {
     let layout =
         read_content_layout_from_store(store, inode_id, record, allow_v0390_fixed_content)?;
     match &layout {
         ContentLayout::Inline(content) => Ok(content.bytes.clone()),
-        ContentLayout::Chunked(manifest) => match pool {
-            Some(pool) => read_chunked_content(store, manifest, record.size, Some(pool)),
-            None => read_untrusted_raw_staging_chunked_content(store, manifest, record.size),
-        },
+        ContentLayout::Chunked(manifest) => {
+            read_untrusted_raw_staging_chunked_content(store, manifest, record.size)
+        }
     }
 }
 
@@ -498,7 +493,7 @@ impl<'a> MountedContentReadAuthority<'a> {
         match &layout {
             ContentLayout::Inline(content) => Ok(content.bytes.clone()),
             ContentLayout::Chunked(manifest) => {
-                read_chunked_content(self.store, manifest, record.size, Some(self.pool))
+                read_chunked_content(self.store, manifest, record.size, self.pool)
             }
         }
     }
@@ -509,7 +504,7 @@ impl<'a> MountedContentReadAuthority<'a> {
         offset: u64,
         len: usize,
     ) -> Result<Vec<u8>> {
-        read_content_range_from_layout(self.store, layout, offset, len, Some(self.pool))
+        read_content_range_from_layout(self.store, layout, offset, len, self.pool)
     }
 
     pub(crate) fn read_chunk(
@@ -517,7 +512,7 @@ impl<'a> MountedContentReadAuthority<'a> {
         inode_id: InodeId,
         chunk_ref: &ContentChunkRef,
     ) -> Result<ContentChunkObject> {
-        read_content_chunk_from_store(self.store, inode_id, chunk_ref, Some(self.pool))
+        read_content_chunk_from_store(self.store, inode_id, chunk_ref, self.pool)
     }
 }
 
@@ -909,19 +904,19 @@ fn read_content_chunk_from_write_store<S: ContentWriteStore + ?Sized>(
     })
 }
 
-pub(crate) fn read_content_chunk_from_store(
+fn read_content_chunk_from_store(
     store: &LocalObjectStore,
     inode_id: InodeId,
     chunk_ref: &ContentChunkRef,
-    pool: Option<&Pool>,
+    pool: &Pool,
 ) -> Result<ContentChunkObject> {
     read_content_chunk_with(
         store,
         inode_id,
         chunk_ref,
-        pool,
+        Some(pool),
         chunk_ref.placement_receipt_generation == 0,
-        |key| read_chunk_bytes_with_receipt(store, pool, chunk_ref, key),
+        |key| read_chunk_bytes_with_receipt(store, Some(pool), chunk_ref, key),
     )
 }
 
@@ -2333,11 +2328,11 @@ pub(crate) fn overlay_chunk_writes_only_zeros(
         .all(|byte| *byte == 0))
 }
 
-pub(crate) fn read_chunked_content(
+fn read_chunked_content(
     store: &LocalObjectStore,
     manifest: &ContentManifestObject,
     file_size: u64,
-    pool: Option<&Pool>,
+    pool: &Pool,
 ) -> Result<Vec<u8>> {
     read_chunked_content_with(manifest, file_size, |inode_id, chunk_ref| {
         read_content_chunk_from_store(store, inode_id, chunk_ref, pool)
@@ -2390,15 +2385,27 @@ fn read_chunked_content_with(
     Ok(out)
 }
 
-pub(crate) fn read_content_range_from_layout(
+fn read_content_range_from_layout(
     store: &LocalObjectStore,
     layout: &ContentLayout,
     offset: u64,
     len: usize,
-    pool: Option<&Pool>,
+    pool: &Pool,
 ) -> Result<Vec<u8>> {
     read_content_range_with(layout, offset, len, |inode_id, chunk_ref| {
         read_content_chunk_from_store(store, inode_id, chunk_ref, pool)
+    })
+}
+
+#[cfg(test)]
+fn read_untrusted_raw_content_range_from_layout_for_integrity(
+    store: &LocalObjectStore,
+    layout: &ContentLayout,
+    offset: u64,
+    len: usize,
+) -> Result<Vec<u8>> {
+    read_content_range_with(layout, offset, len, |inode_id, chunk_ref| {
+        read_untrusted_raw_content_chunk_for_integrity(store, inode_id, chunk_ref)
     })
 }
 
@@ -3367,8 +3374,13 @@ mod tests {
             chunks: vec![ContentChunkRef::hole(0, u32::MAX)],
         });
 
-        let bytes = read_content_range_from_layout(&store, &layout, u32::MAX as u64 - 1, 1, None)
-            .expect("read tail byte from sparse hole ref");
+        let bytes = read_untrusted_raw_content_range_from_layout_for_integrity(
+            &store,
+            &layout,
+            u32::MAX as u64 - 1,
+            1,
+        )
+        .expect("read tail byte from sparse hole ref");
 
         assert_eq!(bytes, vec![0]);
     }
@@ -3384,8 +3396,13 @@ mod tests {
             chunks: Vec::new(),
         });
 
-        let bytes = read_content_range_from_layout(&store, &layout, u32::MAX as u64 - 1, 1, None)
-            .expect("read tail byte from implicit sparse chunk");
+        let bytes = read_untrusted_raw_content_range_from_layout_for_integrity(
+            &store,
+            &layout,
+            u32::MAX as u64 - 1,
+            1,
+        )
+        .expect("read tail byte from implicit sparse chunk");
 
         assert_eq!(bytes, vec![0]);
     }
@@ -3455,9 +3472,13 @@ mod tests {
         let mut expected = payload;
         expected[overlay_offset as usize..overlay_offset as usize + overlay.len()]
             .copy_from_slice(overlay);
-        let rewritten =
-            read_content_from_store(&store.raw, new_record.inode_id, &new_record, false, None)
-                .expect("read rewritten sparse content");
+        let rewritten = read_untrusted_raw_content_from_store_for_integrity(
+            &store.raw,
+            new_record.inode_id,
+            &new_record,
+            false,
+        )
+        .expect("read rewritten sparse content");
         assert_eq!(rewritten, expected);
     }
 
@@ -3505,13 +3526,21 @@ mod tests {
         );
         assert!(!chunk_ref.is_hole());
 
-        let prefix =
-            read_content_range_from_layout(&store, &layout, far_chunk_index * chunk_size, 8, None)
-                .expect("read sparse prefix in touched chunk");
+        let prefix = read_untrusted_raw_content_range_from_layout_for_integrity(
+            &store,
+            &layout,
+            far_chunk_index * chunk_size,
+            8,
+        )
+        .expect("read sparse prefix in touched chunk");
         assert_eq!(prefix, vec![0_u8; 8]);
-        let read_back =
-            read_content_range_from_layout(&store, &layout, overlay_offset, payload.len(), None)
-                .expect("read far sparse overlay bytes");
+        let read_back = read_untrusted_raw_content_range_from_layout_for_integrity(
+            &store,
+            &layout,
+            overlay_offset,
+            payload.len(),
+        )
+        .expect("read far sparse overlay bytes");
         assert_eq!(read_back, payload);
     }
 
@@ -3588,15 +3617,16 @@ mod tests {
         assert_eq!(chunk.bytes, payload);
     }
 
-    /// `read_content_chunk_from_store` with a hole ref must synthesize zeros
-    /// and never touch the pool or store.
+    /// Raw integrity validation synthesizes hole bytes without a backing
+    /// object.
     #[test]
     fn hole_chunk_synthesizes_zeros() {
         let store = temp_store("hole-zeros");
         let hole_ref = ContentChunkRef::hole(0, 128);
 
-        let result = read_content_chunk_from_store(&store, InodeId::new(30), &hole_ref, None)
-            .expect("read hole chunk");
+        let result =
+            read_untrusted_raw_content_chunk_for_integrity(&store, InodeId::new(30), &hole_ref)
+                .expect("read hole chunk");
         assert_eq!(result.bytes, vec![0u8; 128]);
     }
 }
