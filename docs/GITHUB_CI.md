@@ -127,9 +127,9 @@ may use non-secret repository variables for scheduling gates, such as
   manual dispatch remains available when a merge or milestone invalidates the
   existing result. If another change needs runtime or build coverage, name the
   risk in the issue and dispatch the focused workflow explicitly.
-- `Nix Checks` runs on self-hosted TideFS runners and builds pure check
-  derivations plus core Nix packages for Nix, Cargo, and toolchain input
-  changes, or by manual dispatch. It is a compile/build gate only: a green run
+- `Nix Checks` runs on self-hosted TideFS runners and builds core Nix packages
+  for Nix, Cargo, and toolchain input changes, or by manual dispatch. It is a
+  compile/build gate only: a green run
   does not prove FUSE, uBLK, RDMA, mounted-kernel behavior, filesystem
   correctness, crash consistency, performance, or release readiness.
 - `QEMU Smoke` runs outside-sandbox kernel runtime rows on self-hosted
