@@ -8,12 +8,13 @@ on:
       - '.github/workflows/clippy.yml'
       - 'Cargo.lock'
       - 'Cargo.toml'
+      - '.cargo/config.toml'
       - 'apps/**'
       - 'crates/**'
       - 'kmod/**'
+      - 'rust-toolchain.toml'
       - 'xtask/**'
-      - 'scripts/clippy-baseline.sh'
-      - 'docs/clippy-baseline.json'
+      - 'scripts/clippy-check.sh'
   workflow_dispatch:
     inputs:
       scope:
@@ -63,7 +64,7 @@ jobs:
         run: |
           mkdir -p "$CARGO_HOME" "$CARGO_TARGET_DIR"
 
-      - name: Run clippy baseline gate
+      - name: Run direct clippy checks
         env:
           CLIPPY_SCOPE: ${{ github.event_name == 'workflow_dispatch' && inputs.scope || 'changed' }}
           CLIPPY_BASE_REF: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || inputs.base_ref }}
@@ -74,31 +75,12 @@ jobs:
             mode=check-workspace
           fi
 
-          args=("$mode" --json clippy-baseline-summary.json)
+          args=("$mode")
           if [[ -n "${CLIPPY_BASE_REF:-}" && "$mode" == "check-changed" ]]; then
             args+=(--base "$CLIPPY_BASE_REF")
           fi
 
-          nix develop .#ci --command bash -c './scripts/clippy-baseline.sh "$@"' -- "${args[@]}"
-
-      - name: Upload clippy summary
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: clippy-baseline-summary
-          path: clippy-baseline-summary.json
-          if-no-files-found: ignore
-          retention-days: 7
-
-      - name: Report summary
-        if: always()
-        run: |
-          if [[ -f clippy-baseline-summary.json ]]; then
-            echo '## Clippy Baseline Results' >> "$GITHUB_STEP_SUMMARY"
-            echo '```json' >> "$GITHUB_STEP_SUMMARY"
-            nix develop .#ci --command jq -c '{mode, head_sha, totals, failed_crates: [.results[] | select(.status != "pass") | {crate, status, warnings, baseline_warnings}]}' clippy-baseline-summary.json >> "$GITHUB_STEP_SUMMARY" || true
-            echo '```' >> "$GITHUB_STEP_SUMMARY"
-          fi
+          nix develop .#ci --command ./scripts/clippy-check.sh "${args[@]}"
 
       - name: Clean cargo target
         if: always()
