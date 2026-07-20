@@ -10,13 +10,11 @@
 //!
 //! The orchestrator does not own membership, transport authentication,
 //! storage-node runtime authority, cluster status, or final distributed
-//! operator UAPI.  Live transport adapters provide delivery, while
-//! [`ChannelPoolTransport`](crate::channel_transport::ChannelPoolTransport)
-//! remains a harness transport for orchestrator tests.  Successful create
-//! dispatch returns typed boundary evidence that callers must preserve in CLI
-//! output, so the live transport path is not mistaken for final distributed
-//! pool UAPI.  TFR-017 remains open for end-to-end distributed authority
-//! beyond this crate-local boundary.
+//! operator UAPI. A caller-supplied transport adapter provides delivery.
+//! Successful create dispatch returns typed boundary evidence that callers
+//! must preserve in CLI output, so the transport path is not mistaken for
+//! final distributed pool UAPI. TFR-017 remains open for end-to-end
+//! distributed authority beyond this crate-local boundary.
 
 use std::collections::BTreeMap;
 
