@@ -1,31 +1,21 @@
 Fixes #
 
-## Summary
+## Outcome
 
-- <behavior change summary>
+<!-- State the observable carrier, failure, or waste-removal result delivered. -->
 
-## Validation
+## Focused acceptance and validation
 
-- [ ] `git diff --check`
-- [ ] GitHub Actions or focused command evidence:
-- [ ] Validation is scoped to the touched surface:
+<!-- Map the issue's acceptance checks to results and exact focused commands. -->
 
-## Prerequisite / Design Gates
+- <check, command, and result>
 
-- [ ] Live issue, prerequisite, dependency, and design-gate state reviewed.
-- Blocking or non-blocking gate notes:
+## Actual versus expected paths
 
-## Write-Set Overlap
+- Expected issue paths:
+- Actual `git diff --name-only` paths:
+- Difference: <none, or explain the issue rescope>
 
-- Expected write set:
-- Open PR / active worktree overlap review:
+## Residual risk
 
-## Residual Risk
-
-- <known remaining risk, or none>
-
-## Boundaries
-
-- [ ] No secrets, secret-derived payloads, host credentials, or encrypted secret material are included.
-- [ ] Runtime, product-readiness, and release-readiness claims are limited to the evidence above.
-- [ ] This PR is its own integration gate and should use a linear merge method, not a merge commit.
+<!-- Name remaining product risk, or "None identified". Secret exposure and unsupported current-capability wording are blockers. -->

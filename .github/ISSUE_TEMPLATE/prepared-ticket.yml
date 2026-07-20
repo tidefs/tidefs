@@ -1,31 +1,25 @@
 name: Prepared ticket
-description: Define an implementation-ready TideFS issue before a worker owns a branch.
-title: "<area>: <behavior>"
+description: Define one bounded TideFS outcome before implementation starts.
+title: "<area>: <outcome>"
 body:
-  - type: markdown
-    attributes:
-      value: |
-        Use this form for a TideFS slice that is ready to coordinate through GitHub issues and pull requests.
-
-        Keep the issue aligned with the [TideFS GitHub PR development policy](https://github.com/tidefs/tidefs/blob/master/docs/GITHUB_PR_DEVELOPMENT.md).
-        This form does not change workflow files, runner settings, repository settings, labels, secrets, or TideFS product policy.
   - type: textarea
-    id: behavior
+    id: observable-outcome
     attributes:
-      label: Behavior
+      label: Observable outcome
       description: >-
-        Describe the concrete behavior to add, change, investigate, or document.
-        Keep the slice small enough for one branch.
+        Name the single mounted, block, tidefsctl, runtime-state, kernel,
+        failure, or waste-removal result this issue must deliver.
       placeholder: |
-        Add ...
+        After this change, ...
     validations:
       required: true
   - type: textarea
-    id: acceptance-criteria
+    id: acceptance-checks
     attributes:
-      label: Acceptance criteria
-      description: List the observable conditions that make this issue complete.
+      label: Acceptance checks
+      description: List 3–5 objective checks that make the outcome complete.
       placeholder: |
+        - ...
         - ...
         - ...
     validations:
@@ -33,49 +27,25 @@ body:
   - type: textarea
     id: expected-write-set
     attributes:
-      label: Expected write set
+      label: Exact file paths
       description: >-
-        List exact paths or path prefixes this issue authorizes, and state why
-        they do not overlap active issues, PRs, branches, or worktrees.
+        List every repository-relative file to edit, create, or delete. Each
+        entry must be an exact nonempty file path; directories, globs, and path
+        prefixes are not valid.
       placeholder: |
-        Expected paths:
-        - `path/or/prefix`
-
-        Non-overlap evidence:
-        - Checked ...
+        - `path/to/file.rs`
+        - `docs/exact-file.md`
     validations:
       required: true
   - type: textarea
-    id: prerequisites
+    id: focused-test-commands
     attributes:
-      label: Prerequisites and design gates
+      label: Focused test commands
       description: >-
-        Name blocking issues, PRs, design questions, prerequisites, or stop
-        conditions, or state "None" with the evidence reviewed.
+        Give exact focused checks for the touched files or packages and, when
+        product behavior changes, the smallest meaningful outer-boundary test.
       placeholder: |
-        - None. Reviewed ...
-
-        or
-
-        - Blocks on #...
-    validations:
-      required: true
-  - type: textarea
-    id: validation-tier
-    attributes:
-      label: Validation tier
-      description: >-
-        State the smallest validation tier that proves this slice.
-        Documentation/source inspection is enough for docs-only work; do not
-        require runtime validation unless behavior changed at that layer.
-      placeholder: |
-        Documentation/source inspection only:
-        - Review ...
-        - Run `git diff --check`
-
-        or
-
-        Focused GitHub Actions:
-        - Dispatch ...
+        - `cargo test -p <package> --locked <test>`
+        - `git diff --check`
     validations:
       required: true
