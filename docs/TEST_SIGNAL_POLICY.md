@@ -1,131 +1,72 @@
 # Test Signal Policy
 
-TideFS tests exist to increase product confidence. They are not a delivery
-surface by themselves, and a larger test count is not evidence that the
-filesystem is healthier.
+TideFS tests protect observable product behavior and difficult correctness
+boundaries. Keep a test only when its failure identifies a plausible product
+defect, a distinct diagnostic invariant, or a necessary harness fault.
 
-This policy is current TideFS repo policy. It applies to foreground Codex work,
-managed TideFS Codex Nexus work, review, and future cleanup. Do not encode
-these project-specific rules in Nexus or Factory automation. Current TideFS
-Codex Nexus work must stay mechanics-only and derive work selection from live
-GitHub issue/PR state plus repo docs; Factory and legacy automation remain
-parked unless separately reauthorized.
+## Signal Priority
 
-## Core Rule
+For a product change, use the smallest meaningful test at the strongest
+applicable outer boundary. The boundaries are the carriers named by the
+[Product Contract](../README.md#product-contract): `tidefsctl`, a mounted
+filesystem, a block device or export, operator-visible runtime state, and a
+kernel entrypoint only when the contract explicitly admits it. This is product
+signal.
 
-Prefer tests that prove externally meaningful TideFS behavior over tests that
-preserve implementation shape, historical issue closeout text, or marker
-strings.
+Keep a compact internal invariant test only when it materially shortens
+diagnosis of a failure that would be ambiguous or expensive to isolate through
+the carrier. It must protect a stable correctness rule rather than a private
+implementation layout.
 
-Every test change must be classified as one of:
+Keep harness signal only when the harness is necessary to reach the product
+boundary or control a relevant platform or fault mode. A harness check must
+show that the harness can perform that job faithfully; it is not evidence that
+the product behavior itself works.
 
-- **Product signal**: proves mounted filesystem, block, kernel, storage,
-  recovery, durability, transport, or operator behavior through the real public
-  boundary for that layer.
-- **Invariant signal**: proves a compact internal invariant that would be hard
-  to observe through an outer boundary, such as codec round trips, authenticated
-  record rejection, allocator accounting, or state-machine ordering.
-- **Harness signal**: proves a test runner, mount harness, QEMU wrapper, parser,
-  or CI adapter. Harness signal is useful only when named as harness signal and
-  must not be used as product proof.
-- **Policy/tooling signal**: proves a repo guard such as licensing, claims,
-  documentation authority, or workspace classification. Policy/tooling signal
-  must avoid brittle source-marker checks when a structured check is practical.
-- **Low-value signal**: preserves string markers, issue-era wording, fixture
-  shape, redundant branch behavior, or a stale assertion. Low-value signal
-  should be deleted, compressed, or replaced when touched.
+When several layers exercise the same behavior, retain the strongest outer
+product test plus the smallest useful diagnostic invariant. Separate tests are
+justified when different platforms or fault modes carry distinct risks. Remove
+tests that provide no product, diagnostic, or necessary harness signal.
 
-## What To Keep
+## Fixtures
 
-Keep and strengthen tests that exercise:
+A test must not imply behavior that its fixture weakens or bypasses.
 
-- mounted FUSE or kernel behavior through real operations;
-- crash/reopen, fsync, writeback, mmap, direct I/O, sparse writes, and recovery;
-- xfstests, fsx, fsstress, fio, QEMU, Kbuild, module-load, ublk, and RDMA lanes;
-- durable on-disk format compatibility and corruption rejection;
-- security boundaries using real key material and production session semantics;
-- small pure invariants where exhaustive unit coverage is cheaper and clearer
-  than an outer integration test.
-
-When a focused unit test and an integration test prove the same behavior, keep
-the outer product test and only keep the unit test if it isolates a failure
-mode the product test cannot diagnose well.
-
-## What To Avoid
-
-Do not add or preserve tests whose main value is:
-
-- raising test count;
-- asserting that a doc/source string contains a marker phrase;
-- proving that a placeholder, scaffold, or deferred surface exists;
-- locking down private helper names or exact intermediate structure;
-- passing under `StoreOptions::test_fast()` or equivalent weakened options while
-  claiming durable integrity, recovery, or production-read behavior;
-- turning a stale xfstests expectation, fixture issue, or harness limitation
-  into production code churn;
-- keeping ignored tests as a roadmap or issue tracker.
-
-Marker/source-presence checks are allowed only as transitional guardrails for a
-specific review register item. Prefer structured parsing, cargo metadata, public
-API behavior, or runtime validation.
-
-## Fixture Rules
-
-Test fixtures must not silently weaken the behavior being claimed.
-
-- If a test claims checksum, integrity, durable-read, or corruption behavior, it
-  must use production-equivalent verification settings.
-- If a test uses fast or relaxed options, its name or surrounding comments must
-  make the narrowed claim explicit.
-- If a fixture bypasses FUSE, kernel, ublk, or transport runtime boundaries,
-  the test must not be cited as proof for those boundaries.
-- If a test is about an unreleased internal format, remove or redesign wrong
-  expectations instead of preserving compatibility stubs by default. See
-  `docs/UNRELEASED_AUTHORITY_POLICY.md` before keeping a stale pre-release
-  fixture as a compatibility or migration claim.
+- Durability, integrity, recovery, and corruption tests use
+  production-equivalent verification, commit, stop or crash, and reopen paths.
+- Security tests use production-equivalent algorithms and session semantics
+  with synthetic test material. Production credentials, keys, and user data
+  never belong in tests or artifacts.
+- Fast or relaxed options narrow the behavior tested and must be explicit in
+  the test name or nearby explanation.
+- A test that bypasses a mounted, kernel, block, or transport boundary is
+  internal signal only for that boundary.
+- For unreleased internal formats, redesign or delete stale fixtures instead
+  of adding compatibility behavior without a current external consumer; see
+  the [Unreleased Authority Policy](UNRELEASED_AUTHORITY_POLICY.md).
 
 ## Placement
 
-Use the narrowest placement that keeps production code readable:
-
-- Inline `#[cfg(test)]` modules are fine for small pure invariants that need
-  private access.
-- Move large test blocks out of production files when they make the logic hard
-  to scan.
-- Put public crate behavior in crate `tests/`.
+- Keep small pure invariants that need private access in inline `#[cfg(test)]`
+  modules.
+- Test public crate behavior in the crate's `tests/` directory.
 - Put mounted, QEMU, xfstests, ublk, kernel, RDMA, and multi-process behavior in
   the dedicated harness or CI lane for that runtime.
+- Move large test blocks when they obscure production logic, but avoid broad
+  mechanical moves whose only result is rearrangement.
 
-Avoid sweeping mechanical test moves. When refactoring, improve one touched
-surface at a time and keep commits bisectable.
+## Proportional Validation
 
-## Review Checklist
+The changed product risk selects the validation lane. During implementation,
+run focused touched-package checks after a coherent change. Before readiness,
+run the smallest carrier case that exercises the changed behavior.
 
-When adding, modifying, or deleting tests, answer these before committing:
+Crash, durability, integrity, FUSE, kernel, block, and distributed changes use
+the corresponding real fault or runtime lane. Broad xfstests, fsx, fio, QEMU,
+kernel, ublk, RDMA, distributed, or whole-workspace suites belong at a relevant
+milestone, release candidate, or when the failure cannot first be narrowed.
+After the final rebase, repeat only checks invalidated by the new patch.
 
-1. What product or invariant claim does this test prove?
-2. Is this claim already covered at a stronger outer boundary?
-3. Does the fixture use production-equivalent durability, checksum, security,
-   and recovery settings for the claim being made?
-4. Would a failure identify a real TideFS defect, or only a stale assertion,
-   marker, fixture, or harness problem?
-5. Should this be a unit test, integration test, xfstests/QEMU row, or no test?
-
-Test-only commits remain prohibited. Test cleanup should ship with the product
-or policy change that makes the old test redundant, stale, or misleading.
-
-## Initial Audit Signal
-
-The 2026-06-05 static review found heavy test mass and uneven signal:
-
-- 1,595 Rust files in the tree;
-- 1,427 Rust files with `#[cfg(test)]` or test attributes;
-- 1,056 non-test-named Rust source files with test markers;
-- 362 dedicated Rust test files;
-- 148 workspace packages and 345 Cargo integration-test targets;
-- roughly 35k Rust test attributes;
-- many uses of `StoreOptions::test_fast()` or explicit disabled read
-  verification in test fixtures.
-
-These numbers are not targets. They are the reason to optimize for stronger
-test signal, not higher test count.
+A flaky required test is fixed, temporarily quarantined with an owner and
+expiry, or removed when it has no retained signal. It is never silently
+ignored.
