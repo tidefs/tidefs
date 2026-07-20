@@ -9,8 +9,8 @@ use crate::dedup::DedupIndex;
 use crate::encoding::*;
 use crate::error::FileSystemError;
 use crate::object_keys::*;
-use crate::read_content_chunk_from_store;
 use crate::read_content_from_store;
+use crate::read_untrusted_raw_content_chunk_for_integrity;
 use crate::records::*;
 use crate::types::*;
 use crate::validate_content_layout;
@@ -186,8 +186,8 @@ pub(crate) fn transaction_manifest_entries_for_content(
                 // Check stored bytes to determine if this is a dedup redirect.
                 // For dedup-resolved chunks the canonical data carries a
                 // different chunk_index, inode_id, and data_version than the
-                // redirect reference (#841). The checksum validation in
-                // read_content_chunk_from_store already ensures data integrity;
+                // redirect reference (#841). The raw integrity helper
+                // verifies the stored chunk bytes;
                 // only verify chunk_index for non-dedup chunks.
                 let stored_bytes = store
                     .get(object_key)?
@@ -195,8 +195,11 @@ pub(crate) fn transaction_manifest_entries_for_content(
                         reason: "transaction manifest references a missing content chunk",
                     })?;
                 let is_dedup = crate::encoding::is_dedup_redirect(&stored_bytes);
-                let chunk =
-                    read_content_chunk_from_store(store, manifest.inode_id, chunk_ref, None)?;
+                let chunk = read_untrusted_raw_content_chunk_for_integrity(
+                    store,
+                    manifest.inode_id,
+                    chunk_ref,
+                )?;
                 if !is_dedup && chunk.chunk_index != chunk_ref.chunk_index {
                     return Err(FileSystemError::CorruptState {
                         reason: "content chunk does not match manifest",
@@ -453,4 +456,64 @@ pub(crate) fn publish_root_commit(
 
 pub(crate) fn root_slot_for_transaction(transaction_id: u64) -> u64 {
     transaction_id % FILESYSTEM_ROOT_SLOT_COUNT
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_root(label: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "tidefs-persistence-{label}-{nanos}-{}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn transaction_manifest_entries_for_existing_content_recommit_clean_receipted_file() {
+        let root = temp_root("clean-receipted-recommit");
+        let mut fs = crate::LocalFileSystem::open_with_options(
+            &root,
+            tidefs_local_object_store::StoreOptions::test_fast(),
+        )
+        .expect("open filesystem");
+        fs.set_auto_commit(false);
+
+        fs.create_file("/stable", 0o644).expect("create file");
+        let payload = vec![0x5a; FILESYSTEM_CONTENT_CHUNK_SIZE + 17];
+        fs.write_file("/stable", 0, &payload).expect("write file");
+        fs.commit().expect("commit receipted content");
+
+        let inode_id = fs.lookup("/stable").expect("lookup stable file");
+        assert!(!fs.state.dirty_inodes.contains(&inode_id));
+        let record = fs.stat("/stable").expect("stat stable file");
+        let layout = crate::content::read_content_layout_from_store(
+            fs.store.raw_primary_store(),
+            inode_id,
+            &record,
+            false,
+        )
+        .expect("read committed content layout");
+        let ContentLayout::Chunked(manifest) = layout else {
+            panic!("large committed file must use chunked content");
+        };
+        assert!(manifest
+            .chunks
+            .iter()
+            .any(|chunk| { !chunk.is_hole() && chunk.placement_receipt_generation != 0 }));
+
+        fs.create_dir("/metadata-only", 0o755)
+            .expect("create unrelated directory");
+        assert!(!fs.state.dirty_inodes.contains(&inode_id));
+        fs.commit().expect("recommit with unchanged receipted file");
+        assert_eq!(fs.read_file("/stable").expect("read stable file"), payload);
+
+        drop(fs);
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

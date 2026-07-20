@@ -1103,6 +1103,30 @@ pub struct Pool {
     locked: bool,
 }
 
+/// A read bound to the current persisted placement receipt loaded by a pool.
+///
+/// The receipt is immutable and the fields are private so callers can inspect
+/// the authority selected by the pool, then route through that exact receipt
+/// without supplying replacement receipt data of their own.
+#[derive(Debug)]
+pub struct CurrentPlacementReceiptRead<'a> {
+    pool: &'a Pool,
+    receipt: PlacementReceipt,
+}
+
+impl CurrentPlacementReceiptRead<'_> {
+    /// Return the receipt that will route this read.
+    #[must_use]
+    pub fn receipt(&self) -> &PlacementReceipt {
+        &self.receipt
+    }
+
+    /// Read the object through the receipt returned by [`Self::receipt`].
+    pub fn read(self) -> Result<Option<Vec<u8>>> {
+        self.pool.get_with_receipt(&self.receipt)
+    }
+}
+
 /// Versioned, checksummed replacement evidence published before an in-memory
 /// topology swap. Device transform configuration is intentionally absent: it
 /// may carry key material and must be supplied again by the caller on resume.
@@ -2554,6 +2578,36 @@ impl Pool {
             return Ok(None);
         }
         self.load_placement_receipt(&indices, key)
+    }
+
+    /// Load the current persisted receipt and bind a read to that exact value.
+    ///
+    /// `None` means that no placement receipt exists for the key. Callers that
+    /// require receipt authority can inspect [`CurrentPlacementReceiptRead::receipt`]
+    /// before consuming the handle with [`CurrentPlacementReceiptRead::read`].
+    pub fn current_placement_receipt_read(
+        &self,
+        class: IoClass,
+        key: ObjectKey,
+    ) -> Result<Option<CurrentPlacementReceiptRead<'_>>> {
+        if self.locked {
+            return Err(StoreError::InvalidOptions {
+                reason: "pool is locked: encryption key required for I/O",
+            });
+        }
+        let indices: Vec<usize> = self.class_map.get(class).to_vec();
+        if indices.is_empty() {
+            return Err(StoreError::InvalidOptions {
+                reason: "pool has no devices for this I/O class",
+            });
+        }
+
+        Ok(self
+            .load_placement_receipt(&indices, key)?
+            .map(|receipt| CurrentPlacementReceiptRead {
+                pool: self,
+                receipt,
+            }))
     }
 
     /// Return the latest persisted placement receipt for every logical object
