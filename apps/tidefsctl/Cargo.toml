@@ -23,7 +23,6 @@ tidefs-recovery-loop = { workspace = true }
 tidefs-replication-model = { workspace = true }
 tidefs-device-removal = { workspace = true }
 tidefs-types-pool-label-core = { workspace = true }
-tidefs-types-vfs-core = { workspace = true }
 tidefs-local-object-store = { workspace = true }
 tidefs-local-filesystem = { workspace = true }
 tidefs-dataset-lifecycle = { workspace = true }
