@@ -1,17 +1,21 @@
 name: Rust Fast
 
 on:
-  push:
-    branches: [master]
   pull_request:
     branches: [master]
     types: [opened, synchronize, reopened, ready_for_review]
-    paths-ignore:
-      - 'docs/**'
-      - '*.md'
-      - 'COPYING'
-      - '.github/ISSUE_TEMPLATE/**'
-      - '.github/pull_request_template.md'
+    paths:
+      - '.cargo/config.toml'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'crates/tidefs-extent-map/**'
+      - 'crates/tidefs-schema-codec-posix-filesystem-adapter/**'
+      - 'crates/tidefs-secret-key-policy-runtime/**'
+      - 'crates/tidefs-transport/**'
+      - 'flake.lock'
+      - 'flake.nix'
+      - 'rust-toolchain.toml'
+      - 'scripts/ci-test-runner.sh'
   workflow_dispatch:
 
 permissions:
@@ -28,13 +32,13 @@ env:
   CARGO_TEST_FLAGS: --locked
   CARGO_TARGET_DIR: /var/tmp/tidefs-ci/cargo-target/${{ github.run_id }}-${{ github.run_attempt }}
   RUST_BACKTRACE: 1
-  TIDEFS_RUST_FAST_CRATES: tidefs-xtask,tidefs-extent-map,tidefs-schema-codec-posix-filesystem-adapter,tidefs-secret-key-policy-runtime
+  TIDEFS_RUST_FAST_CRATES: tidefs-extent-map,tidefs-schema-codec-posix-filesystem-adapter,tidefs-secret-key-policy-runtime
 
 jobs:
   workspace:
     name: Workspace
     # Draft PRs are not integration candidates; save scarce self-hosted runner
-    # capacity for ready PRs, master pushes, and explicit dispatches.
+    # capacity for ready PRs and explicit dispatches.
     if: ${{ (github.event_name == 'workflow_dispatch' || vars.TIDEFS_SELF_HOSTED_READY == '1') && (github.event_name != 'pull_request' || github.event.pull_request.draft == false) }}
     runs-on: [self-hosted, linux, x64, tidefs, nix]
     timeout-minutes: 90
@@ -49,10 +53,6 @@ jobs:
 
       - name: Check workspace metadata
         run: nix develop .#ci --command bash -c 'cargo metadata --locked --format-version 1 --no-deps >/dev/null'
-
-      - name: Check doc authority drift
-        continue-on-error: true
-        run: nix develop .#ci --command bash -c 'cargo run -p tidefs-xtask -- check-doc-authority-drift'
 
       - name: Run selected crate tests
         run: nix develop .#ci --command bash -c './scripts/ci-test-runner.sh --crates "$TIDEFS_RUST_FAST_CRATES" --json ci-test-summary.json'

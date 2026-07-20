@@ -40,15 +40,15 @@ may use non-secret repository variables for scheduling gates, such as
   version and report in the step summary, and uploads no long-lived artifacts.
 - `Rust Fast` runs on the TideFS self-hosted runner VMs through the repo
   `.#ci` Nix development shell. It covers workspace metadata plus a focused
-  Rust smoke set:
-  `tidefs-xtask`, `tidefs-extent-map`,
+  Rust smoke set for changes to its direct inputs:
+  `tidefs-extent-map`,
   `tidefs-schema-codec-posix-filesystem-adapter`, and
   `tidefs-secret-key-policy-runtime`, plus a targeted `tidefs-transport`
-  session test.
+  session test. It does not run documentation-authority or publication checks.
 - `Rust Toolchain` (`.github/workflows/rust-toolchain.yml`) runs on the
   TideFS self-hosted runner VMs through the repo `.#ci` Nix development shell
-  when `rust-toolchain.toml`, `flake.nix`, `flake.lock`, the workflow, or this
-  CI authority doc changes, and on manual dispatch. It verifies that the
+  when a pull request changes `rust-toolchain.toml`, `flake.nix`, or
+  `flake.lock`, and on manual dispatch. It verifies that the
   `rust-toolchain.toml` channel matches `rustc -Vv`, records `cargo`,
   `clippy`, `rustfmt`, and `rust-src` availability in the job summary, and
   fails closed on missing components. It is a fast toolchain-coherence gate
@@ -68,10 +68,9 @@ may use non-secret repository variables for scheduling gates, such as
   policy.
 - `Dependency License` (`.github/workflows/dependency-license.yml`) runs
   `cargo deny check licenses` through the repo `.#ci` Nix development shell on
-  every `master` push, on pull requests that touch `Cargo.toml`, `Cargo.lock`,
-  `deny.toml`, `flake.nix`, `flake.lock`, the workflow, ADR-0006, or this CI
-  authority doc, and on manual dispatch. `deny.toml` remains the accepted
-  license allowlist and dependency rule source;
+  pull requests that touch `Cargo.toml`, `Cargo.lock`, `deny.toml`, `flake.nix`,
+  `flake.lock`, or ADR-0006, and on manual dispatch. `deny.toml` remains the
+  accepted license allowlist and dependency rule source;
   `docs/adr/0006-license-compliance-cargo-deny.md` records the architectural
   decision to use `cargo-deny`. The workflow summary records the source ref,
   SHA, command, and pass/fail outcome. License allowlist changes must edit
@@ -120,45 +119,39 @@ may use non-secret repository variables for scheduling gates, such as
   uploads `dependency-advisory-report`, and leaves remediation to a separate
   issue/PR. Its job summary links `docs/DEPENDENCY_ADVISORY_CI.md`, which is
   retained as the narrow remediation guide for this workflow.
-- Standing PR validation is path-filtered so docs-only design and authority
-  PRs do not occupy scarce self-hosted runner slots when their issue validation
-  tier is documentation/design/source inspection. `Rust Fast` and `Nix Checks`
-  ignore pull requests that only touch `docs/**`, root Markdown policy text, or
-  `COPYING`. `Actionlint`, `Secret Policy`, dependency workflows, and the
-  `Focused Rust` self-test each use narrower pull-request path filters tied to
-  the files they validate. Pushes to `master` and manual dispatches still run
-  standing workflows according to their own trigger filters. If a
-  documentation-only PR needs runtime or build validation, record that in the
-  issue validation tier and dispatch the focused workflow explicitly.
-- `Codex Nexus Relay` is a self-hosted event bridge for the local
-  `tidefs-codex-nexus` dashboard. It does not run tests or checkout source; it
-  relays issue, pull-request, push, and manual-dispatch events by signing the
-  original GitHub event payload with the host-local relay HMAC secret and
-  posting it to the operator-owned Nexus webhook endpoint configured on the
-  self-hosted runner hosts. Comment and workflow-run events stay out of the
-  relay to avoid recursive automation chatter; the Nexus safety poll still
-  refreshes workflow state.
+- Standing PR checks use explicit risk paths. `Rust Fast` runs only for its
+  selected crates, transport smoke, and shared build inputs. `Nix Checks` runs
+  only for Nix, Cargo, and toolchain inputs. Rustfmt, Secret Policy, and the
+  dependency workflows likewise run only for files they inspect. These PR
+  checks do not rerun automatically after the identical tree reaches `master`;
+  manual dispatch remains available when a merge or milestone invalidates the
+  existing result. If another change needs runtime or build coverage, name the
+  risk in the issue and dispatch the focused workflow explicitly.
 - `Nix Checks` runs on self-hosted TideFS runners and builds pure check
-  derivations plus core Nix packages. It is a compile/build gate only: a green
-  run does not prove FUSE, uBLK, RDMA, mounted-kernel behavior, filesystem
+  derivations plus core Nix packages for Nix, Cargo, and toolchain input
+  changes, or by manual dispatch. It is a compile/build gate only: a green run
+  does not prove FUSE, uBLK, RDMA, mounted-kernel behavior, filesystem
   correctness, crash consistency, performance, or release readiness.
 - `QEMU Smoke` runs outside-sandbox kernel runtime rows on self-hosted
-  TideFS runners with KVM and FUSE access. Pushes to `master` run only the
-  standing `kmod-xfstests-smoke` target: load `tidefs_posix_vfs.ko`, mount the
-  explicit bootstrap VFS root, exercise supported
-  directory/symlink/readdir/statfs operations, and keep engine-backed storage
-  checks in the longer filesystem lanes. Manual `workflow_dispatch` exposes a
+  TideFS runners with KVM and FUSE access. Only `master` pushes that touch the
+  explicit kernel-module, kernel package, smoke harness, toolchain, or direct
+  `tidefsctl` setup paths run the standing `kmod-xfstests-smoke` target: load
+  `tidefs_posix_vfs.ko`, mount the explicit bootstrap VFS root, exercise
+  directory/symlink/readdir/statfs operations, and leave engine-backed storage
+  checks to the longer filesystem lanes. Manual `workflow_dispatch` exposes a
   `target` choice for `kmod-xfstests-smoke`, `kernel-fsync-validation`,
   `kernel-mmap-validation`, `kernel-teardown-validation`,
   `kernel-no-daemon-teardown-validation`, `two-node-carrier-validation`,
   `fuse-vm-test`, `fuse-inode-metadata-validation`, `qemu-ublk-smoke`,
   `qemu-ublk-qid-tag-runtime`, `storage-intent-ack-fault-matrix`,
   `receipt-bound-reclaim-runtime`, `scrub-foreground-read-runtime`, and `all`;
-  `.github/workflows/qemu-smoke.yml`
-  remains the exact source for matrix commands, output directories, artifact
-  upload names, and retention. Except for the standing `master` smoke target,
-  non-default targets and `all` are manual validation tiers; dispatch them only
-  when the issue or pull request validation tier names the row set. QEMU Smoke
+  `.github/workflows/qemu-smoke.yml` remains the exact source for target
+  commands, output directories, artifact upload names, and retention. The
+  workflow constructs its matrix from the selected target before KVM runner
+  allocation: one specific target creates one runtime job, while `all` creates
+  the complete set. Except for the standing `master` smoke target, non-default
+  targets and `all` are manual validation tiers; dispatch them only when the
+  issue or pull request validation tier names the row set. QEMU Smoke
   artifacts are not xfstests, RDMA, release-candidate, broad filesystem
   correctness, product-readiness, performance-comparator, or
   successor/comparator evidence unless the relevant validation tier and
@@ -222,6 +215,15 @@ may use non-secret repository variables for scheduling gates, such as
   mounted-kernel cutover phase, fence, truth, trace, refusal, cleanup, source,
   or dmesg-danger fields are malformed or missing. It does not cover T6
   full-kernel/no-daemon rows and does not update claim registry status.
+- `Kernel no-daemon teardown validation` is a manual self-hosted QEMU Smoke
+  target for the T6 full-kernel-no-daemon teardown and recovery runtime
+  evidence row. It runs `.#kernel-no-daemon-teardown-validation` against the
+  selected branch, exercises mount/write/sync/teardown/unmount/module-unload
+  lifecycle with ftrace workqueue tracing, zero userspace daemons, post-final
+  refusal probes, and no-daemon crash/recovery cycles, and uploads
+  `kernel-teardown-runtime.json` and `evidence-manifest.json` under
+  `kernel-no-daemon-teardown-validation`. It does not update claim registry
+  status or generated claim docs.
 - Kernel module CI builds use the Linux 7.0 Rust-for-Linux baseline, require
   Rust-enabled prepared kernel trees, use LLVM tooling, and compile module C and
   Rust paths with warnings treated as errors. Local build recipes are helper
@@ -270,50 +272,20 @@ The runners need Nix, KVM, FUSE, ublk, loop devices, QEMU, RDMA userspace
 tools, and enough local scratch space for Nix builds and VM disks.
 Individual workflows select narrower subsets of that label set: Rust, Nix,
 Secret Policy, dependency, and actionlint lanes use the `nix` subset; QEMU and
-kernel validation lanes add `kvm`; xfstests adds `xfstests`; RDMA adds `rdma`;
-and Codex Nexus Relay intentionally uses only the minimal TideFS runner labels
-because it signs and forwards events rather than building or testing source.
+kernel validation lanes add `kvm`; xfstests adds `xfstests`; and RDMA adds
+`rdma`.
 
-Push-triggered and scheduled self-hosted jobs stay skipped until the repository
-variable `TIDEFS_SELF_HOSTED_READY` is set to `1`. Manual dispatch ignores that
-gate so a specific lane can be run during bring-up.
+The path-gated QEMU push and scheduled self-hosted jobs stay skipped until the
+repository variable `TIDEFS_SELF_HOSTED_READY` is set to `1`. Manual dispatch
+ignores that gate so a specific lane can be run during bring-up.
 
 Draft pull requests are not integration candidates, so required self-hosted PR
 checks skip them until the PR is marked ready for review. The `ready_for_review`
 event reruns the standing checks on the current head before integration.
 Manual workflow dispatch remains available for draft branches that need early
-evidence. Codex Nexus Relay jobs are controller telemetry, not TideFS
-validation. Pull-request relay runs allocate a runner only for source-head and
-lifecycle wakeups, while metadata-only PR edits wait for the next delivered
-wakeup or controller poll to refresh live state. Pending pull-request relay
-wakeups coalesce per PR while already-running deliveries finish; issue, push,
-and manual-dispatch relay wakeups still share a global cancelling concurrency
-group. Any delivered relay wakeup causes Nexus to reconcile live GitHub state
-rather than treating each queued relay job as durable work.
+evidence. Live GitHub state is authoritative for automation; issue, pull-request,
+and push events do not allocate a self-hosted runner merely to wake a local
+controller.
 
 Runner host configuration and bring-up notes live in
 `tidefs/tidefs-infra-configuration`.
-
-## Codex Nexus Relay Operator Boundary
-
-The relay HMAC secret, webhook endpoint, runner host environment, bring-up
-steps, and post-maintenance recovery checks are intentionally host-local
-operator state. Keep those values and procedures in private infrastructure or
-operator-owned process documentation, such as
-`tidefs/tidefs-infra-configuration` and the Codex Nexus operator docs. The
-public workflow consumes `TIDEFS_CODEX_NEXUS_WEBHOOK_URL` and
-`TIDEFS_CODEX_NEXUS_SECRET_FILE` from that runner-host environment; those
-variables must not be replaced with GitHub secrets, repository variables, or
-public endpoint literals. The public repo owns only the relay contract: signed
-original GitHub event payloads are delivered from self-hosted runners to Nexus,
-and relay jobs remain controller telemetry rather than TideFS validation.
-
-- `Kernel no-daemon teardown validation` is a manual self-hosted QEMU Smoke
-  target for the T6 full-kernel-no-daemon teardown and recovery runtime
-  evidence row. It runs `.#kernel-no-daemon-teardown-validation` against the
-  selected branch, exercises mount/write/sync/teardown/unmount/module-unload
-  lifecycle with ftrace workqueue tracing, zero userspace daemons, post-final
-  refusal probes, and no-daemon crash/recovery cycles, and uploads
-  `kernel-teardown-runtime.json` and `evidence-manifest.json` under
-  `kernel-no-daemon-teardown-validation`. It does not update claim registry
-  status or generated claim docs.

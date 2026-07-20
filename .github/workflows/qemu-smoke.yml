@@ -3,6 +3,19 @@ name: QEMU Smoke
 on:
   push:
     branches: [master]
+    paths:
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'apps/tidefsctl/**'
+      - 'crates/tidefs-kmod-posix-vfs/**'
+      - 'flake.lock'
+      - 'flake.nix'
+      - 'kmod/**'
+      - 'nix/packages/linux-7.0-kernel.nix'
+      - 'nix/packages/tidefs-kmod-posix-vfs.nix'
+      - 'nix/vm/kernel-7.0-config'
+      - 'nix/vm/kmod-xfstests-smoke.nix'
+      - 'rust-toolchain.toml'
   workflow_dispatch:
     inputs:
       target:
@@ -35,7 +48,7 @@ concurrency:
 
 jobs:
   smoke:
-    name: ${{ matrix.name }}
+    name: ${{ matrix.id }}
     if: ${{ github.event_name == 'workflow_dispatch' || vars.TIDEFS_SELF_HOSTED_READY == '1' }}
     runs-on: [self-hosted, linux, x64, tidefs, nix, kvm]
     timeout-minutes: 120
@@ -47,72 +60,70 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - id: kmod-xfstests-smoke
-            name: kmod-xfstests-smoke
-            command: nix run .#kmod-xfstests-smoke -- --timeout 1800
-            output_dir: /tmp/tidefs-validation/kmod-xfstests-smoke
-          - id: kernel-teardown-validation
-            name: kernel-teardown-validation
-            command: nix run .#kernel-teardown-validation -- --timeout 600
-            output_dir: /tmp/tidefs-validation/kernel-teardown-validation
-          - id: kernel-fsync-validation
-            name: kernel-fsync-validation
-            command: nix run .#kernel-fsync-validation -- --timeout 600 --pool-size 256
-            output_dir: /tmp/tidefs-validation/kernel-fsync-validation
-          - id: kernel-mmap-validation
-            name: kernel-mmap-validation
-            command: nix run .#kernel-mmap-validation -- --timeout 900
-            output_dir: /tmp/tidefs-validation/kernel-mmap-validation
-          - id: kernel-no-daemon-teardown-validation
-            name: kernel-no-daemon-teardown-validation
-            command: nix run .#kernel-no-daemon-teardown-validation -- --timeout 600
-            output_dir: /tmp/tidefs-validation/kernel-no-daemon-teardown-validation
-          - id: two-node-carrier-validation
-            name: two-node-carrier-validation
-            command: nix run .#two-node-carrier-validation -- --timeout 600 --validation-dir /tmp/tidefs-validation/two-node-carrier-validation
-            output_dir: /tmp/tidefs-validation/two-node-carrier-validation
-          - id: fuse-vm-test
-            name: fuse-vm-test
-            command: nix run .#fuse-vm-test -- --timeout 900 --validation-dir /tmp/tidefs-validation/fuse-vm-test --queue-depth-artifact /tmp/tidefs-validation/fuse-vm-test/performance/queue-depth-runtime.json
-            output_dir: /tmp/tidefs-validation/fuse-vm-test
-          - id: fuse-inode-metadata-validation
-            name: fuse-inode-metadata-validation
-            command: TIDEFS_SOURCE_COMMIT="$(git rev-parse HEAD)" TIDEFS_ROOT_AUTHENTICATION_KEY_HEX=0000000000000000000000000000000000000000000000000000000000000001 nix run .#fuse-inode-metadata-validation -- --timeout 900 --validation-dir /tmp/tidefs-validation/fuse-inode-metadata-validation --keep-tmp
-            output_dir: /tmp/tidefs-validation/fuse-inode-metadata-validation
-          - id: qemu-ublk-smoke
-            name: qemu-ublk-smoke
-            command: nix run .#qemu-ublk-smoke -- --timeout 3600
-            output_dir: /tmp/tidefs-validation/ublk
-          - id: qemu-ublk-qid-tag-runtime
-            name: qemu-ublk-qid-tag-runtime
-            command: nix run .#qemu-ublk-qid-tag-runtime -- --timeout 3600 --validation-dir /tmp/tidefs-validation/ublk-qid-tag-runtime
-            output_dir: /tmp/tidefs-validation/ublk-qid-tag-runtime
-          - id: storage-intent-ack-fault-matrix
-            name: storage-intent-ack-fault-matrix
-            command: >-
-              TIDEFS_ACK_FAULT_RUN_ID="${{ github.run_id }}/${{ github.run_attempt }}"
-              TIDEFS_ACK_FAULT_SOURCE_REF="${{ github.sha }}"
-              nix run .#storage-intent-ack-fault-matrix --
-              --timeout 600
-              --validation-dir /tmp/tidefs-validation/storage-intent-ack-fault-matrix
-            output_dir: /tmp/tidefs-validation/storage-intent-ack-fault-matrix
-          - id: receipt-bound-reclaim-runtime
-            name: receipt-bound-reclaim-runtime
-            command: nix develop .#ci --command cargo run --locked -p tidefs-validation --features receipt-bound-physical-reclaim --bin receipt-bound-reclaim-validation -- --row receipt-bound-obsolete-location-trim --output-dir /tmp/tidefs-validation/receipt-bound-reclaim-runtime
-            output_dir: /tmp/tidefs-validation/receipt-bound-reclaim-runtime
-          - id: scrub-foreground-read-runtime
-            name: scrub-foreground-read-runtime
-            command: nix run .#scrub-foreground-read-runtime -- --row scrub-foreground-read-runtime --output-dir /tmp/tidefs-validation/scrub-foreground-read-runtime
-            output_dir: /tmp/tidefs-validation/scrub-foreground-read-runtime
+        id: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.target == 'all' && '["kmod-xfstests-smoke","kernel-fsync-validation","kernel-mmap-validation","kernel-teardown-validation","kernel-no-daemon-teardown-validation","two-node-carrier-validation","fuse-vm-test","fuse-inode-metadata-validation","qemu-ublk-smoke","qemu-ublk-qid-tag-runtime","storage-intent-ack-fault-matrix","receipt-bound-reclaim-runtime","scrub-foreground-read-runtime"]' || format('["{0}"]', github.event_name == 'workflow_dispatch' && inputs.target || 'kmod-xfstests-smoke')) }}
 
     steps:
       - name: Checkout
-        if: ${{ (github.event_name == 'workflow_dispatch' && (inputs.target == 'all' || inputs.target == matrix.id)) || (github.event_name != 'workflow_dispatch' && matrix.id == 'kmod-xfstests-smoke') }}
         uses: actions/checkout@v6
 
+      - name: Configure selected target
+        id: target
+        shell: bash
+        run: |
+          target='${{ matrix.id }}'
+          output_dir="/tmp/tidefs-validation/$target"
+
+          case "$target" in
+            kmod-xfstests-smoke)
+              command='nix run .#kmod-xfstests-smoke -- --timeout 1800'
+              ;;
+            kernel-fsync-validation)
+              command='nix run .#kernel-fsync-validation -- --timeout 600 --pool-size 256'
+              ;;
+            kernel-mmap-validation)
+              command='nix run .#kernel-mmap-validation -- --timeout 900'
+              ;;
+            kernel-teardown-validation)
+              command='nix run .#kernel-teardown-validation -- --timeout 600'
+              ;;
+            kernel-no-daemon-teardown-validation)
+              command='nix run .#kernel-no-daemon-teardown-validation -- --timeout 600'
+              ;;
+            two-node-carrier-validation)
+              command='nix run .#two-node-carrier-validation -- --timeout 600 --validation-dir /tmp/tidefs-validation/two-node-carrier-validation'
+              ;;
+            fuse-vm-test)
+              command='nix run .#fuse-vm-test -- --timeout 900 --validation-dir /tmp/tidefs-validation/fuse-vm-test --queue-depth-artifact /tmp/tidefs-validation/fuse-vm-test/performance/queue-depth-runtime.json'
+              ;;
+            fuse-inode-metadata-validation)
+              command='TIDEFS_SOURCE_COMMIT="$(git rev-parse HEAD)" TIDEFS_ROOT_AUTHENTICATION_KEY_HEX=0000000000000000000000000000000000000000000000000000000000000001 nix run .#fuse-inode-metadata-validation -- --timeout 900 --validation-dir /tmp/tidefs-validation/fuse-inode-metadata-validation --keep-tmp'
+              ;;
+            qemu-ublk-smoke)
+              command='nix run .#qemu-ublk-smoke -- --timeout 3600'
+              output_dir='/tmp/tidefs-validation/ublk'
+              ;;
+            qemu-ublk-qid-tag-runtime)
+              command='nix run .#qemu-ublk-qid-tag-runtime -- --timeout 3600 --validation-dir /tmp/tidefs-validation/ublk-qid-tag-runtime'
+              ;;
+            storage-intent-ack-fault-matrix)
+              command='TIDEFS_ACK_FAULT_RUN_ID="${{ github.run_id }}/${{ github.run_attempt }}" TIDEFS_ACK_FAULT_SOURCE_REF="${{ github.sha }}" nix run .#storage-intent-ack-fault-matrix -- --timeout 600 --validation-dir /tmp/tidefs-validation/storage-intent-ack-fault-matrix'
+              ;;
+            receipt-bound-reclaim-runtime)
+              command='nix develop .#ci --command cargo run --locked -p tidefs-validation --features receipt-bound-physical-reclaim --bin receipt-bound-reclaim-validation -- --row receipt-bound-obsolete-location-trim --output-dir /tmp/tidefs-validation/receipt-bound-reclaim-runtime'
+              ;;
+            scrub-foreground-read-runtime)
+              command='nix run .#scrub-foreground-read-runtime -- --row scrub-foreground-read-runtime --output-dir /tmp/tidefs-validation/scrub-foreground-read-runtime'
+              ;;
+            *)
+              echo "unknown QEMU Smoke target: $target" >&2
+              exit 2
+              ;;
+          esac
+
+          printf 'command=%s\n' "$command" >> "$GITHUB_OUTPUT"
+          printf 'output_dir=%s\n' "$output_dir" >> "$GITHUB_OUTPUT"
+
       - name: Host preflight
-        if: ${{ (github.event_name == 'workflow_dispatch' && (inputs.target == 'all' || inputs.target == matrix.id)) || (github.event_name != 'workflow_dispatch' && matrix.id == 'kmod-xfstests-smoke') }}
         run: |
           if [[ '${{ matrix.id }}' == 'scrub-foreground-read-runtime' ]]; then
             exit 0
@@ -121,29 +132,27 @@ jobs:
           test -c /dev/fuse
 
       - name: Prepare runtime output
-        if: ${{ (github.event_name == 'workflow_dispatch' && (inputs.target == 'all' || inputs.target == matrix.id)) || (github.event_name != 'workflow_dispatch' && matrix.id == 'kmod-xfstests-smoke') }}
         run: |
-          rm -rf '${{ matrix.output_dir }}'
-          mkdir -p '${{ matrix.output_dir }}'
+          rm -rf '${{ steps.target.outputs.output_dir }}'
+          mkdir -p '${{ steps.target.outputs.output_dir }}'
           mkdir -p "$CARGO_HOME" "$CARGO_TARGET_DIR"
 
       - name: Run smoke target
-        if: ${{ (github.event_name == 'workflow_dispatch' && (inputs.target == 'all' || inputs.target == matrix.id)) || (github.event_name != 'workflow_dispatch' && matrix.id == 'kmod-xfstests-smoke') }}
         env:
-          TIDEFS_FSYNC_SUMMARY_DIR: ${{ matrix.output_dir }}
-          TIDEFS_TEARDOWN_OUTPUT_DIR: ${{ matrix.output_dir }}
-          TIDEFS_NO_DAEMON_TEARDOWN_OUTPUT_DIR: ${{ matrix.output_dir }}
+          TIDEFS_FSYNC_SUMMARY_DIR: ${{ steps.target.outputs.output_dir }}
+          TIDEFS_TEARDOWN_OUTPUT_DIR: ${{ steps.target.outputs.output_dir }}
+          TIDEFS_NO_DAEMON_TEARDOWN_OUTPUT_DIR: ${{ steps.target.outputs.output_dir }}
         run: |
           TIDEFS_GENERATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           export TIDEFS_GENERATED_AT
-          timeout --foreground 7200s bash -lc '${{ matrix.command }}'
+          timeout --foreground 7200s bash -lc '${{ steps.target.outputs.command }}'
 
       - name: Write kernel-fsync evidence manifest (smoke)
-        if: ${{ always() && matrix.id == 'kernel-fsync-validation' && github.event_name == 'workflow_dispatch' && (inputs.target == 'all' || inputs.target == 'kernel-fsync-validation') }}
+        if: ${{ always() && steps.target.outputs.output_dir != '' && matrix.id == 'kernel-fsync-validation' && github.event_name == 'workflow_dispatch' && (inputs.target == 'all' || inputs.target == 'kernel-fsync-validation') }}
         run: |
           set -euo pipefail
 
-          SUMMARY_DIR="${{ matrix.output_dir }}"
+          SUMMARY_DIR="${{ steps.target.outputs.output_dir }}"
           mkdir -p "$SUMMARY_DIR"
           MANIFEST_PATH="$SUMMARY_DIR/evidence-manifest.json"
           GENERATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -257,12 +266,12 @@ jobs:
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload runtime output
-        if: ${{ always() && ((github.event_name == 'workflow_dispatch' && (inputs.target == 'all' || inputs.target == matrix.id)) || (github.event_name != 'workflow_dispatch' && matrix.id == 'kmod-xfstests-smoke')) }}
+        if: ${{ always() && steps.target.outputs.output_dir != '' }}
         uses: actions/upload-artifact@v7
         with:
-          name: qemu-smoke-${{ matrix.name }}
+          name: qemu-smoke-${{ matrix.id }}
           path: |
-            ${{ matrix.output_dir }}/**
+            ${{ steps.target.outputs.output_dir }}/**
           if-no-files-found: ignore
           retention-days: 7
 
