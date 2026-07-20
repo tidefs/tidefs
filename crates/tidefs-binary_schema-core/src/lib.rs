@@ -853,8 +853,6 @@ pub enum DomainTag {
     TransferStream = 8,
     /// Object payload chunk domain.
     ObjectPayloadChunk = 9,
-    /// Object enumeration domain.
-    ObjectEnumeration = 10,
 }
 
 impl DomainTag {
