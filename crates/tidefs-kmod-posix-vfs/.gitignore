@@ -6,4 +6,5 @@
 Module.symvers
 modules.order
 .*.cmd
+.*.o.d
 .module-common.o
