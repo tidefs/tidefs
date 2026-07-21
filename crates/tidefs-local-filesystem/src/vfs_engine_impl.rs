@@ -3399,7 +3399,17 @@ impl VfsLocalFileSystem {
         }
 
         let mut fs = self.fs.borrow_mut();
-        let result = match fs.store.safe_remove_device(&device_path) {
+        if let Err(err) = fs.sync_all() {
+            return live_admin_error(
+                1,
+                format!(
+                    "device remove: could not commit mounted filesystem state before evacuating '{}': {err}",
+                    device_path.display()
+                ),
+            );
+        }
+
+        let mut result = match fs.store.safe_remove_device(&device_path) {
             Ok(result) => result,
             Err(err) => {
                 return live_admin_error(
@@ -3412,16 +3422,89 @@ impl VfsLocalFileSystem {
             }
         };
 
-        if !result.complete || result.objects_failed > 0 {
-            return live_admin_error(
-                1,
-                format!(
-                    "device remove: evacuation of '{}' did not complete (objects_evacuated={}, objects_failed={})",
-                    device_path.display(),
-                    result.objects_evacuated,
-                    result.objects_failed,
-                ),
-            );
+        const MAX_RECLAIM_PER_PASS: usize = 1024;
+        while !result.complete {
+            if result.objects_failed > 0 {
+                return live_admin_error(
+                    1,
+                    format!(
+                        "device remove: evacuation of '{}' failed (objects_evacuated={}, objects_failed={})",
+                        device_path.display(),
+                        result.objects_evacuated,
+                        result.objects_failed,
+                    ),
+                );
+            }
+
+            let drain = match fs
+                .store
+                .sync_and_drain_committed_placement_mutations(MAX_RECLAIM_PER_PASS)
+            {
+                Ok(stats) => stats,
+                Err(err) => {
+                    return live_admin_error(
+                        1,
+                        format!(
+                            "device remove: evacuation of '{}' completed, but committed predecessor reclaim failed: {err}",
+                            device_path.display()
+                        ),
+                    )
+                }
+            };
+
+            let next = match fs.store.safe_remove_device(&device_path) {
+                Ok(result) => result,
+                Err(err) => {
+                    return live_admin_error(
+                        1,
+                        format!(
+                            "device remove: reclaim completed, but mounted pool owner could not finish removing '{}': {err}",
+                            device_path.display()
+                        ),
+                    )
+                }
+            };
+            let made_progress = drain.objects_examined > 0
+                || drain.segments_reclaimed > 0
+                || next.objects_evacuated > 0;
+
+            result.objects_evacuated = result
+                .objects_evacuated
+                .saturating_add(next.objects_evacuated);
+            result.objects_failed = result.objects_failed.saturating_add(next.objects_failed);
+            result.bytes_evacuated = result.bytes_evacuated.saturating_add(next.bytes_evacuated);
+            for failed_key in next.failed_keys {
+                if !result.failed_keys.contains(&failed_key) {
+                    result.failed_keys.push(failed_key);
+                }
+            }
+            for (key, digest) in next.content_digests {
+                if result
+                    .content_digests
+                    .insert(key, digest)
+                    .is_some_and(|existing| existing != digest)
+                {
+                    return live_admin_error(
+                        1,
+                        format!(
+                            "device remove: evacuation of '{}' produced conflicting content evidence for one object",
+                            device_path.display()
+                        ),
+                    );
+                }
+            }
+            result.complete = next.complete;
+
+            if !result.complete && !made_progress {
+                return live_admin_error(
+                    1,
+                    format!(
+                        "device remove: evacuation of '{}' is complete, but predecessor reclaim is blocked (remaining_queue_depth={}); retained snapshot pins or incomplete durable placement authority must be resolved",
+                        device_path.display(),
+                        drain.reclaim_queue_depth,
+                    ),
+                );
+            }
         }
 
         if let Err(err) = fs.store.sync_all() {
@@ -7397,19 +7480,41 @@ mod tests {
     fn live_device_remove_evacuates_through_mounted_pool_owner() {
         let (engine, _td, devices) = temp_fs_with_block_devices(2);
         let payload = b"live owner device remove keeps mounted data reachable";
-        {
+        let target_path = {
             let mut fs = engine.fs.borrow_mut();
             fs.create_file("/keep", 0o644).expect("create file");
             fs.write_file("/keep", 0, payload).expect("write file");
             fs.sync_all().expect("sync file before removal");
             assert_eq!(fs.store.stats().device_count, 2);
-        }
+            let record = fs.stat("/keep").expect("stat written file");
+            let content_key = crate::object_keys::content_object_key_for_version(
+                record.inode_id,
+                record.data_version,
+            );
+            let receipt = fs
+                .store
+                .placement_receipt_for_key(
+                    tidefs_local_object_store::DeviceIoClass::Data,
+                    content_key,
+                )
+                .expect("load written content placement receipt")
+                .expect("written content has placement receipt");
+            let target_index = receipt
+                .targets
+                .first()
+                .expect("content receipt target")
+                .device_index as usize;
+            devices
+                .get(target_index)
+                .expect("receipt target maps to configured device")
+                .clone()
+        };
 
         let removed = live_device_admin(
             &engine,
             "remove",
             json!({
-                "device_path": devices[0].display().to_string(),
+                "device_path": target_path.display().to_string(),
                 "force": false,
             }),
             true,
@@ -7417,6 +7522,10 @@ mod tests {
 
         assert_eq!(removed["ok"], true, "remove response: {removed}");
         assert_eq!(removed["json"]["objects_failed"], 0);
+        assert!(
+            removed["json"]["objects_evacuated"].as_u64().unwrap_or(0) > 0,
+            "the selected receipt owner must exercise evacuation: {removed}"
+        );
         assert_eq!(removed["json"]["remaining_devices"], 1);
 
         let fs = engine.fs.borrow();

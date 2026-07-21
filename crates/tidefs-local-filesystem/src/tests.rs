@@ -7055,7 +7055,9 @@ fn mounted_open_recovery_authority_raw_only_initializes_empty_pool() {
         let mut state = authority
             .load_or_initialize_state()
             .expect("initialize state through mounted open/recovery authority");
-        authority.merge_space_counters_into(&mut state);
+        authority
+            .merge_space_counters_into(&mut state)
+            .expect("merge persisted space counters");
         authority.merge_dataset_usage_into(&mut state);
 
         let intent_log = authority

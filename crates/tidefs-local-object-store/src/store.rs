@@ -164,6 +164,12 @@ struct ReceiptBoundDeadObjectSegmentPlan {
     object_ids: Vec<ReclaimObjectKey>,
 }
 
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ReceiptBoundDeadObjectRetireOutcome {
+    pub stats: tidefs_reclaim::ReclaimConsumerStats,
+    pub entries_budgeted: usize,
+}
+
 /// One verified live-object relocation to publish at a compaction commit boundary.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VerifiedCompactionRewrite {
@@ -2980,25 +2986,20 @@ impl LocalObjectStore {
             self.reclaim_consumer.live_counts_mut().remove(segment_id);
 
             for extent_key in extent_keys {
-                let resolved =
-                    match <LocalObjectStore as tidefs_reclaim::SegmentResolver>::resolve(
-                        self,
-                        &extent_key,
-                    ) {
-                        Ok(segment) => segment,
-                        Err(never) => match never {},
-                    };
+                let resolved = match <LocalObjectStore as tidefs_reclaim::SegmentResolver>::resolve(
+                    self,
+                    &extent_key,
+                ) {
+                    Ok(segment) => segment,
+                    Err(never) => match never {},
+                };
                 if resolved == Some(segment_id) {
                     acknowledged.push(extent_key);
                 }
             }
         }
 
-        if self
-            .dead_object_reclaim_queue
-            .ack_reclaimed(&acknowledged)
-            != 0
-        {
+        if self.dead_object_reclaim_queue.ack_reclaimed(&acknowledged) != 0 {
             self.dead_object_reclaim_queue_dirty = true;
         }
         if allocator_changed || self.dead_object_reclaim_queue_dirty {
@@ -3214,6 +3215,7 @@ impl LocalObjectStore {
             stable_committed_generation,
             max_count,
             None,
+            None,
         )
     }
 
@@ -3222,9 +3224,8 @@ impl LocalObjectStore {
         stable_committed_txg: u64,
         stable_committed_generation: u64,
         max_count: usize,
-        authorized_receipts: Option<
-            &BTreeMap<ReclaimObjectKey, DeadObjectReplacementReceipt>,
-        >,
+        authorized_receipts: Option<&BTreeMap<ReclaimObjectKey, DeadObjectReplacementReceipt>>,
+        selected_object_ids: Option<&BTreeSet<ReclaimObjectKey>>,
     ) -> std::result::Result<tidefs_reclaim::ReclaimConsumerStats, ReceiptBoundDeadObjectDrainError>
     {
         self.ensure_writable("drain_receipt_bound_dead_objects_at_stable_generation")?;
@@ -3240,6 +3241,7 @@ impl LocalObjectStore {
             stable_committed_generation,
             max_count,
             authorized_receipts,
+            selected_object_ids,
         );
         if plan.current_segment_would_be_reclaimed(self.current_segment_id) {
             self.rotate_segment()?;
@@ -3334,9 +3336,7 @@ impl LocalObjectStore {
             .iter()
             .flat_map(|segment| segment.object_ids.iter().copied())
             .collect();
-        let removed = self
-            .dead_object_reclaim_queue
-            .ack_reclaimed(&acknowledged);
+        let removed = self.dead_object_reclaim_queue.ack_reclaimed(&acknowledged);
         if removed != 0 {
             self.dead_object_reclaim_queue_dirty = true;
         }
@@ -3377,49 +3377,62 @@ impl LocalObjectStore {
         stable_committed_generation: u64,
         max_count: usize,
         authorized_receipts: &BTreeMap<ReclaimObjectKey, DeadObjectReplacementReceipt>,
-    ) -> std::result::Result<tidefs_reclaim::ReclaimConsumerStats, ReceiptBoundDeadObjectDrainError>
-    {
+    ) -> std::result::Result<
+        ReceiptBoundDeadObjectRetireOutcome,
+        ReceiptBoundDeadObjectDrainError,
+    > {
         self.ensure_writable("retire_and_drain_receipt_bound_dead_objects_at_stable_generation")?;
+        if max_count == 0 {
+            return Ok(ReceiptBoundDeadObjectRetireOutcome {
+                stats: tidefs_reclaim::ReclaimConsumerStats {
+                    reclaim_queue_depth: self.dead_object_reclaim_queue.len(),
+                    ..tidefs_reclaim::ReclaimConsumerStats::ZERO
+                },
+                entries_budgeted: 0,
+            });
+        }
         if self.dead_object_reclaim_queue_dirty {
             self.sync_all()?;
         }
-        if max_count == 0 {
-            return Ok(tidefs_reclaim::ReclaimConsumerStats {
-                reclaim_queue_depth: self.dead_object_reclaim_queue.len(),
-                ..tidefs_reclaim::ReclaimConsumerStats::ZERO
+
+        let effective_max_count = max_count.min(self.reclaim_consumer.config().max_entries_per_drain);
+        if effective_max_count == 0 || self.reclaim_consumer.config().max_free_batch == 0 {
+            return Ok(ReceiptBoundDeadObjectRetireOutcome {
+                stats: tidefs_reclaim::ReclaimConsumerStats {
+                    reclaim_queue_depth: self.dead_object_reclaim_queue.len(),
+                    ..tidefs_reclaim::ReclaimConsumerStats::ZERO
+                },
+                entries_budgeted: 0,
             });
         }
 
-        let eligible = self
-            .dead_object_reclaim_queue
-            .all_entries()
-            .into_iter()
-            .filter(|entry| {
-                entry.is_receipt_bound_reclaimable_with_stable_generation(
-                    stable_committed_txg,
-                    stable_committed_generation,
-                ) && authorized_receipts.get(&entry.object_id)
-                    == entry.replacement_receipt.as_ref()
-            })
-            .collect::<Vec<_>>();
         let mut retirement_groups: BTreeMap<u64, Vec<DeadObjectEntry>> = BTreeMap::new();
-        for entry in eligible {
-            if self.snapshot_extent_pin_set.is_pinned(&entry.object_id) {
+        for entry in self.dead_object_reclaim_queue.iter() {
+            if !entry.is_receipt_bound_reclaimable_with_stable_generation(
+                stable_committed_txg,
+                stable_committed_generation,
+            ) || authorized_receipts.get(&entry.object_id) != entry.replacement_receipt.as_ref()
+                || self.snapshot_extent_pin_set.is_pinned(&entry.object_id)
+            {
                 continue;
             }
             if let Some(location) = self.index.get(&ObjectKey(entry.object_id.0)) {
                 retirement_groups
                     .entry(location.segment_id)
                     .or_default()
-                    .push(entry);
+                    .push(*entry);
             }
         }
         let mut retired = false;
-        let mut retired_count = 0usize;
+        let mut retired_object_ids = BTreeSet::new();
+        let mut retirement_segments = 0usize;
         for entries in retirement_groups.into_values() {
-            if retired_count >= max_count {
+            if (retired_object_ids.len() >= effective_max_count && retirement_segments != 0)
+                || retirement_segments >= self.reclaim_consumer.config().max_free_batch
+            {
                 break;
             }
+            retirement_segments = retirement_segments.saturating_add(1);
             // The object budget is soft at a segment boundary. Retire the
             // whole selected segment so a dense segment can make progress.
             for entry in entries {
@@ -3427,7 +3440,7 @@ impl LocalObjectStore {
                 if self.index.contains_key(&key) {
                     self.delete(key)?;
                     retired = true;
-                    retired_count = retired_count.saturating_add(1);
+                    retired_object_ids.insert(entry.object_id);
                 }
             }
         }
@@ -3435,16 +3448,38 @@ impl LocalObjectStore {
             self.sync_all()?;
         }
 
-        self.drain_receipt_bound_dead_objects_with_authority(
+        let selected_object_ids = (!retired_object_ids.is_empty()).then_some(&retired_object_ids);
+        let stats = self.drain_receipt_bound_dead_objects_with_authority(
             stable_committed_txg,
             stable_committed_generation,
-            max_count,
+            effective_max_count,
             Some(authorized_receipts),
-        )
+            selected_object_ids,
+        )?;
+        let entries_budgeted = if retired_object_ids.is_empty() {
+            stats.entries_processed
+        } else {
+            retired_object_ids.len()
+        };
+        Ok(ReceiptBoundDeadObjectRetireOutcome {
+            stats,
+            entries_budgeted,
+        })
     }
 
     pub(crate) fn receipt_bound_dead_object_queue_depth(&self) -> usize {
         self.dead_object_reclaim_queue.len()
+    }
+
+    pub(crate) fn stable_exclusive_commit_group(&self) -> Result<u64> {
+        self.commit_group
+            .committed_root()
+            .commit_group_id
+            .0
+            .checked_add(1)
+            .ok_or(StoreError::InvalidOptions {
+                reason: "local object-store commit-group authority is exhausted",
+            })
     }
 
     pub(crate) fn reclaim_receipt_covers_object(&self, object_id: ReclaimObjectKey) -> bool {
@@ -3525,15 +3560,14 @@ impl LocalObjectStore {
             {
                 continue;
             }
-            let segment_id =
-                match <LocalObjectStore as tidefs_reclaim::SegmentResolver>::resolve(
-                    self,
-                    &entry.object_id,
-                ) {
-                    Ok(Some(segment_id)) => segment_id,
-                    Ok(None) => continue,
-                    Err(never) => match never {},
-                };
+            let segment_id = match <LocalObjectStore as tidefs_reclaim::SegmentResolver>::resolve(
+                self,
+                &entry.object_id,
+            ) {
+                Ok(Some(segment_id)) => segment_id,
+                Ok(None) => continue,
+                Err(never) => match never {},
+            };
             if self
                 .index
                 .values()
@@ -3560,11 +3594,14 @@ impl LocalObjectStore {
         }
         self.sync_all()?;
 
-        if self.index.values().any(|location| {
-            blocked_segments.contains(&location.segment_id)
-        }) {
+        if self
+            .index
+            .values()
+            .any(|location| blocked_segments.contains(&location.segment_id))
+        {
             return Err(StoreError::InvalidOptions {
-                reason: "device-removal reclaim relocation left a live record in a predecessor segment",
+                reason:
+                    "device-removal reclaim relocation left a live record in a predecessor segment",
             });
         }
         Ok(live_records.len())
@@ -3594,21 +3631,18 @@ impl LocalObjectStore {
         }
         let entries = self
             .dead_object_reclaim_queue
-            .all_entries()
-            .into_iter()
+            .iter()
             .filter(|entry| {
                 entry.is_receipt_bound_reclaimable_with_stable_generation(
                     stable_committed_txg,
                     stable_committed_generation,
-                ) && authorized_receipts.get(&entry.object_id)
-                    == entry.replacement_receipt.as_ref()
+                ) && authorized_receipts.get(&entry.object_id) == entry.replacement_receipt.as_ref()
+                    && !self.snapshot_extent_pin_set.is_pinned(&entry.object_id)
             })
-            .take(max_count);
+            .take(max_count)
+            .copied();
         let mut acknowledged = Vec::new();
         for entry in entries {
-            if self.snapshot_extent_pin_set.is_pinned(&entry.object_id) {
-                continue;
-            }
             let key = ObjectKey(entry.object_id.0);
             let historical_segment =
                 match <LocalObjectStore as tidefs_reclaim::SegmentResolver>::resolve(
@@ -3640,19 +3674,19 @@ impl LocalObjectStore {
         stable_committed_txg: u64,
         stable_committed_generation: u64,
         max_count: usize,
-        authorized_receipts: Option<
-            &BTreeMap<ReclaimObjectKey, DeadObjectReplacementReceipt>,
-        >,
+        authorized_receipts: Option<&BTreeMap<ReclaimObjectKey, DeadObjectReplacementReceipt>>,
+        selected_object_ids: Option<&BTreeSet<ReclaimObjectKey>>,
     ) -> ReceiptBoundDeadObjectDrainPlan {
-        if max_count == 0 {
+        let effective_max_count = max_count.min(self.reclaim_consumer.config().max_entries_per_drain);
+        let max_segments = self.reclaim_consumer.config().max_free_batch;
+        if effective_max_count == 0 || max_segments == 0 {
             return ReceiptBoundDeadObjectDrainPlan::default();
         }
 
-        let all_entries = self.dead_object_reclaim_queue.all_entries();
-        let mut all_by_segment: BTreeMap<u64, BTreeSet<ReclaimObjectKey>> = BTreeMap::new();
+        let mut all_by_segment: BTreeMap<u64, usize> = BTreeMap::new();
         let mut eligible_by_segment: BTreeMap<u64, BTreeSet<ReclaimObjectKey>> = BTreeMap::new();
 
-        for entry in &all_entries {
+        for entry in self.dead_object_reclaim_queue.iter() {
             let Ok(Some(segment_id)) =
                 <LocalObjectStore as tidefs_reclaim::SegmentResolver>::resolve(
                     self,
@@ -3661,13 +3695,10 @@ impl LocalObjectStore {
             else {
                 continue;
             };
-            all_by_segment
-                .entry(segment_id)
-                .or_default()
-                .insert(entry.object_id);
+            *all_by_segment.entry(segment_id).or_default() += 1;
             let authority_matches = authorized_receipts.is_none_or(|authorized| {
                 authorized.get(&entry.object_id) == entry.replacement_receipt.as_ref()
-            });
+            }) && selected_object_ids.is_none_or(|selected| selected.contains(&entry.object_id));
             if authority_matches
                 && entry.is_receipt_bound_reclaimable_with_stable_generation(
                     stable_committed_txg,
@@ -3687,10 +3718,12 @@ impl LocalObjectStore {
         let mut gate_extents_denied = 0u64;
 
         for (segment_id, object_ids) in eligible_by_segment {
-            if selected_entries >= max_count && !segments.is_empty() {
+            if (selected_entries >= effective_max_count && !segments.is_empty())
+                || segments.len() >= max_segments
+            {
                 break;
             }
-            if all_by_segment.get(&segment_id) != Some(&object_ids) {
+            if all_by_segment.get(&segment_id).copied() != Some(object_ids.len()) {
                 continue;
             }
             // A segment can be released only when no currently indexed
@@ -9657,13 +9690,17 @@ mod reclaim_queue_production_tests {
             source_segments.insert(store.index.get(&key).unwrap().segment_id);
             keys.push(key);
         }
-        assert_eq!(source_segments.len(), 1, "dense fixture must use one segment");
+        assert_eq!(
+            source_segments.len(),
+            1,
+            "dense fixture must use one segment"
+        );
         for key in &keys {
             assert!(store.delete(*key).unwrap());
             let object_id = reclaim_key(*key);
-            assert!(store.dead_object_reclaim_queue.enqueue(
-                dead_object_entry_for_key(object_id, 0, true, 1)
-            ));
+            assert!(store
+                .dead_object_reclaim_queue
+                .enqueue(dead_object_entry_for_key(object_id, 0, true, 1)));
         }
         store.dead_object_reclaim_queue_dirty = true;
         store.sync_all().unwrap();
@@ -9689,9 +9726,7 @@ mod reclaim_queue_production_tests {
         assert!(store.delete(dead).unwrap());
         let dead_id = reclaim_key(dead);
         assert!(store
-            .enqueue_receipt_bound_dead_object(dead_object_entry_for_key(
-                dead_id, 0, true, 1,
-            ))
+            .enqueue_receipt_bound_dead_object(dead_object_entry_for_key(dead_id, 0, true, 1,))
             .unwrap());
 
         let held = store

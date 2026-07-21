@@ -4491,14 +4491,19 @@ impl LocalFileSystem {
             return;
         }
 
+        match self.store.has_pending_placement_reclaim() {
+            Ok(false) => return,
+            Ok(true) => {}
+            Err(error) => {
+                self.receipt_bound_reclaim_idle_ticks_remaining = ERROR_BACKOFF_TICKS;
+                eprintln!("background-services: receipt-bound reclaim debt check failed: {error}");
+                return;
+            }
+        }
+
         let drain_result = self
             .store
-            .drain_receipt_bound_dead_objects_at_stable_generation(
-                DeviceIoClass::Data,
-                u64::MAX,
-                u64::MAX,
-                MAX_RECEIPT_BOUND_RECLAIM_PER_TICK,
-            );
+            .sync_and_drain_committed_placement_mutations(MAX_RECEIPT_BOUND_RECLAIM_PER_TICK);
         match drain_result {
             Ok(stats) => self.record_receipt_bound_reclaim_result(
                 stats.segments_reclaimed,

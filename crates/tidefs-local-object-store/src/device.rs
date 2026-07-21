@@ -3057,19 +3057,6 @@ impl Device {
         }
     }
 
-    /// Enumerate every independently observable logical placement-receipt
-    /// candidate on this top-level device.
-    ///
-    /// This bypasses normal mirror failover and parity physical-key layout so
-    /// pool authority selection sees every copy without decoding column or
-    /// length artifacts as receipts.  Any listed prefixed fragment that cannot
-    /// be read, reconstructed, or accounted for makes the scan fail closed.
-    pub(crate) fn placement_receipt_candidates(&self) -> Result<Vec<DeviceReceiptCandidate>> {
-        let candidates =
-            self.logical_object_candidates_matching(crate::is_pool_placement_receipt_key)?;
-        self.require_complete_logical_candidates(candidates)
-    }
-
     /// Observe every physical copy or reconstructable fragment set for one
     /// exact logical placement-receipt storage key.
     pub(crate) fn logical_object_candidates_for_key(

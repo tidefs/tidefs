@@ -263,7 +263,7 @@ mod tests {
         };
         let mut admission = LocalWriteAdmission::new(caps);
         // First write fills the cap
-        admission
+        let _permit = admission
             .try_admit_dirty_write(1024, 1)
             .expect("should admit up to cap");
         // Second write exceeds cap
@@ -294,7 +294,7 @@ mod tests {
     #[test]
     fn peak_snapshot_resets_after_take() {
         let mut admission = LocalWriteAdmission::new(LocalAdmissionCaps::default());
-        admission
+        let _permit = admission
             .try_admit_dirty_write(8192, 2)
             .expect("should admit");
         let snap1 = admission.take_peak_snapshot();

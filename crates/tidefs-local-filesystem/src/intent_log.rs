@@ -945,22 +945,9 @@ pub struct IntentLog {
 }
 
 impl IntentLog {
+    #[cfg(test)]
     pub fn new() -> Self {
-        Self {
-            next_entry_id: 0,
-            entries: Vec::new(),
-            flushed_entry_count: 0,
-            config: IntentLogConfig::default(),
-            last_flush: None,
-            first_unflushed_at: None,
-            flush_history: [0; FLUSH_HISTORY_LEN],
-            flush_history_pos: 0,
-            flush_history_filled: false,
-            log_device: None,
-            used_bytes: 0,
-            throttle_events: 0,
-            segments_trimmed: 0,
-        }
+        Self::with_config(IntentLogConfig::default())
     }
 
     #[allow(dead_code)] // INTENT: intent-log types for planned log device fast path and crash recovery

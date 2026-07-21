@@ -274,7 +274,7 @@ fn capacity_reflects_freed_extents_after_destroy() {
     let held = store
         .drain_receipt_bound_dead_objects_at_stable_generation(6, 1, 16)
         .unwrap();
-    assert_eq!(held.entries_processed, 1);
+    assert_eq!(held.entries_processed, 0);
     assert_eq!(held.segments_reclaimed, 0);
     assert_eq!(held.gate_extents_denied, 1);
     assert_eq!(held.reclaim_queue_depth, 1);

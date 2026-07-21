@@ -601,10 +601,8 @@ struct PlacementMutationIntent {
     replacement_receipt: PlacementReceipt,
 }
 
-type PlacementReclaimAuthority = BTreeMap<
-    (usize, usize),
-    BTreeMap<ReclaimObjectKey, DeadObjectReplacementReceipt>,
->;
+type PlacementReclaimAuthority =
+    BTreeMap<(usize, usize), BTreeMap<ReclaimObjectKey, DeadObjectReplacementReceipt>>;
 
 fn placement_reclaim_authority_fragments(
     authority: &PlacementReclaimAuthority,
@@ -1927,19 +1925,6 @@ fn invalid_device_removal_marker() -> StoreError {
     }
 }
 
-fn encode_device_removal_marker(
-    pool_guid: [u8; 16],
-    target_path: &Path,
-    target_guid: [u8; 16],
-) -> Result<Vec<u8>> {
-    encode_device_removal_marker_state(&DeviceRemovalMarker {
-        pool_guid,
-        target_path: target_path.to_path_buf(),
-        target_guid,
-        phase: DeviceRemovalPhase::Pending,
-    })
-}
-
 fn encode_device_removal_marker_state(marker: &DeviceRemovalMarker) -> Result<Vec<u8>> {
     let path = marker.target_path.as_os_str().as_bytes();
     if path.is_empty() {
@@ -2077,17 +2062,26 @@ fn decode_device_removal_marker(encoded: &[u8]) -> Result<DeviceRemovalMarker> {
         let phase = match phase_tag {
             0 if stable_exclusive_generation == 0
                 && stable_committed_generation == 0
-                && fragments.is_empty() => DeviceRemovalPhase::Pending,
+                && fragments.is_empty() =>
+            {
+                DeviceRemovalPhase::Pending
+            }
             1 if stable_exclusive_generation == 0
                 && stable_committed_generation == 0
-                && fragments.is_empty() => DeviceRemovalPhase::Evacuated,
+                && fragments.is_empty() =>
+            {
+                DeviceRemovalPhase::Evacuated
+            }
             2 if stable_exclusive_generation != 0
                 && stable_committed_generation != 0
-                && !fragments.is_empty() => DeviceRemovalPhase::ReclaimAuthorized {
+                && !fragments.is_empty() =>
+            {
+                DeviceRemovalPhase::ReclaimAuthorized {
                     stable_exclusive_generation,
                     stable_committed_generation,
                     fragments,
-                },
+                }
+            }
             _ => return None,
         };
         Some(DeviceRemovalMarker {
@@ -2164,10 +2158,7 @@ fn resume_device_removal_if_pending(pool: &mut Pool) {
     let marker_path = pool.config.root_path.join(DEVICE_REMOVAL_MARKER_FILE);
     if marker_path.exists() {
         if let Ok(marker) = read_device_removal_marker(&marker_path) {
-            let marker_tmp_path = pool
-                .config
-                .root_path
-                .join(DEVICE_REMOVAL_MARKER_TMP_FILE);
+            let marker_tmp_path = pool.config.root_path.join(DEVICE_REMOVAL_MARKER_TMP_FILE);
             if marker_tmp_path.exists() {
                 if std::fs::remove_file(&marker_tmp_path).is_ok() {
                     let _ = fs::File::open(&pool.config.root_path)
@@ -3471,24 +3462,22 @@ impl Pool {
                 }
 
                 for target in &predecessor.targets {
-                    let device_index = self.resolve_receipt_target(target).ok_or(
-                        StoreError::InvalidOptions {
-                            reason: "placement reclaim predecessor target is unavailable",
-                        },
-                    )?;
+                    let device_index =
+                        self.resolve_receipt_target(target)
+                            .ok_or(StoreError::InvalidOptions {
+                                reason: "placement reclaim predecessor target is unavailable",
+                            })?;
                     let logical_payload_key =
                         placement_payload_object_key_for_target(predecessor, target).ok_or(
                             StoreError::InvalidOptions {
                                 reason: "placement reclaim predecessor has no physical payload key",
                             },
                         )?;
-                    for fragment in self.devices[device_index]
-                        .physical_fragments_for_key(logical_payload_key)
+                    for fragment in
+                        self.devices[device_index].physical_fragments_for_key(logical_payload_key)
                     {
-                        let replacement = dead_object_replacement_receipt_for_object(
-                            fragment.key,
-                            successor,
-                        )?;
+                        let replacement =
+                            dead_object_replacement_receipt_for_object(fragment.key, successor)?;
                         let entries = authority
                             .entry((device_index, fragment.leaf_index))
                             .or_default();
@@ -4084,8 +4073,8 @@ impl Pool {
                 if store.reclaim_receipt_covers_object(object_id) {
                     continue;
                 }
-                let marker_authorizes_completed_removal = removal_marker.as_ref().is_some_and(
-                    |marker| {
+                let marker_authorizes_completed_removal =
+                    removal_marker.as_ref().is_some_and(|marker| {
                         marker.pool_guid == self.pool_guid
                             && marker.target_guid == target.device_guid
                             && matches!(
@@ -4099,8 +4088,7 @@ impl Pool {
                                     && fragments.contains(&fragment)
                             )
                             && store.device_removal_reclaim_is_acknowledged(object_id)
-                    },
-                );
+                    });
                 if !marker_authorizes_completed_removal {
                     return Ok(false);
                 }
@@ -4418,7 +4406,12 @@ impl Pool {
             }
             let replacement =
                 dead_object_replacement_receipt_for_object(fragment.key, replacement_receipt)?;
-            let death_txg = replacement.receipt_generation;
+            let store = self.devices[device_index]
+                .physical_store_mut(fragment.leaf_index)
+                .ok_or(StoreError::InvalidOptions {
+                    reason: "obsolete placement fragment references an unavailable leaf",
+                })?;
+            let death_txg = store.txg_manager().current_id().0;
             let entry = DeadObjectEntry::new(
                 reclaim_object_key(fragment.key),
                 self.pool_guid,
@@ -4427,12 +4420,7 @@ impl Pool {
                 death_txg,
             )
             .with_replacement_receipt(replacement);
-            self.devices[device_index]
-                .physical_store_mut(fragment.leaf_index)
-                .ok_or(StoreError::InvalidOptions {
-                    reason: "obsolete placement fragment references an unavailable leaf",
-                })?
-                .enqueue_receipt_bound_dead_object(entry)?;
+            store.enqueue_receipt_bound_dead_object(entry)?;
         }
         Ok(())
     }
@@ -5007,7 +4995,6 @@ impl Pool {
     /// are pool-global while object-store transaction groups are leaf-local.
     pub fn sync_and_drain_committed_placement_mutations(
         &mut self,
-        class: IoClass,
         max_count: usize,
     ) -> std::result::Result<
         PoolReceiptBoundDeadObjectDrainStats,
@@ -5018,15 +5005,16 @@ impl Pool {
         let stable_exclusive_generation = self.next_placement_receipt_generation.max(1);
         let stable_committed_generation = stable_exclusive_generation.saturating_sub(1);
         self.drain_receipt_bound_dead_objects_at_stable_generation(
-            class,
+            IoClass::Data,
             stable_exclusive_generation,
             stable_committed_generation,
             max_count,
         )
     }
 
-    /// Drain receipt-authorized dead objects across the devices for an I/O class
-    /// using the last generation strictly below `stable_committed_txg`.
+    /// Compatibility entry point using an exclusive pool placement-generation
+    /// boundary. Each physical leaf still derives its own committed
+    /// commit-group boundary after the pool-wide sync.
     ///
     /// Prefer
     /// [`Self::drain_receipt_bound_dead_objects_at_stable_generation`] when the
@@ -5034,16 +5022,17 @@ impl Pool {
     pub fn drain_receipt_bound_dead_objects_at_txg(
         &mut self,
         class: IoClass,
-        stable_committed_txg: u64,
+        stable_exclusive_generation: u64,
         max_count: usize,
     ) -> std::result::Result<
         PoolReceiptBoundDeadObjectDrainStats,
         crate::store::ReceiptBoundDeadObjectDrainError,
     > {
+        self.sync_all()?;
         self.drain_receipt_bound_dead_objects_at_stable_generation(
             class,
-            stable_committed_txg,
-            stable_committed_txg.saturating_sub(1),
+            stable_exclusive_generation,
+            stable_exclusive_generation.saturating_sub(1),
             max_count,
         )
     }
@@ -5128,9 +5117,10 @@ impl Pool {
                     .get(&(idx, leaf_index))
                     .cloned()
                     .unwrap_or_default();
+                let stable_exclusive_commit_group = store.stable_exclusive_commit_group()?;
                 let stats = store
                     .retire_and_drain_receipt_bound_dead_objects_at_stable_generation(
-                        stable_exclusive_generation,
+                        stable_exclusive_commit_group,
                         stable_committed_generation,
                         remaining,
                         &authorized_receipts,
@@ -5162,19 +5152,20 @@ impl Pool {
                             .ok_or(StoreError::InvalidOptions {
                                 reason: "device-removal reclaim relocation references an unavailable physical leaf",
                             })?;
+                        let stable_exclusive_commit_group =
+                            store.stable_exclusive_commit_group()?;
                         let depth_before = store.receipt_bound_dead_object_queue_depth();
-                        let relocated = store
-                            .relocate_live_records_for_device_removal_reclaim(
-                                stable_exclusive_generation,
-                                stable_committed_generation,
-                                authorized_receipts,
-                            )?;
+                        let relocated = store.relocate_live_records_for_device_removal_reclaim(
+                            stable_exclusive_commit_group,
+                            stable_committed_generation,
+                            authorized_receipts,
+                        )?;
                         if relocated == 0 {
                             continue;
                         }
                         let stats = store
                             .retire_and_drain_receipt_bound_dead_objects_at_stable_generation(
-                                stable_exclusive_generation,
+                                stable_exclusive_commit_group,
                                 stable_committed_generation,
                                 remaining,
                                 authorized_receipts,
@@ -5203,17 +5194,25 @@ impl Pool {
                 let authority_ready = reclaim_authority
                     .iter()
                     .filter(|((device_index, _), _)| *device_index == target_idx)
-                    .all(|((_, leaf_index), authorized_receipts)| {
-                        self.devices[target_idx]
+                    .try_fold(true, |ready, ((_, leaf_index), authorized_receipts)| {
+                        if !ready {
+                            return Ok(false);
+                        }
+                        let store = self.devices[target_idx]
                             .physical_store(*leaf_index)
-                            .is_some_and(|store| {
-                                store.device_removal_reclaim_authority_is_ready(
-                                    stable_exclusive_generation,
-                                    stable_committed_generation,
-                                    authorized_receipts,
-                                )
-                            })
-                    });
+                            .ok_or(StoreError::InvalidOptions {
+                                reason: "device-removal reclaim authority references an unavailable physical leaf",
+                            })?;
+                        let stable_exclusive_commit_group =
+                            store.stable_exclusive_commit_group()?;
+                        Ok::<bool, StoreError>(
+                            store.device_removal_reclaim_authority_is_ready(
+                                stable_exclusive_commit_group,
+                                stable_committed_generation,
+                                authorized_receipts,
+                            ),
+                        )
+                    })?;
 
                 let reclaim_authorized = match &marker.phase {
                     DeviceRemovalPhase::Pending => false,
@@ -5262,9 +5261,11 @@ impl Pool {
                             .ok_or(StoreError::InvalidOptions {
                                 reason: "device-removal reclaim references an unavailable physical leaf",
                             })?;
+                        let stable_exclusive_commit_group =
+                            store.stable_exclusive_commit_group()?;
                         let removed = store
                             .acknowledge_retired_receipt_bound_objects_for_device_removal(
-                                stable_exclusive_generation,
+                                stable_exclusive_commit_group,
                                 stable_committed_generation,
                                 remaining,
                                 authorized_receipts,
@@ -5730,10 +5731,7 @@ impl Pool {
             .any(|observation| intent_depends_on_target(&observation));
         let target_has_pending_reclaim =
             self.device_has_pending_receipt_bound_reclaim(target_idx)?;
-        if target_has_pending_reclaim
-            && !target_has_dependent_intent
-            && !removal_already_pending
-        {
+        if target_has_pending_reclaim && !target_has_dependent_intent && !removal_already_pending {
             return Err(StoreError::InvalidOptions {
                 reason: "device removal target has reclaim state not owned by a retained placement mutation",
             });
@@ -7885,24 +7883,33 @@ mod tests {
     ) -> PoolReceiptBoundDeadObjectDrainStats {
         pool.sync_all()
             .expect("commit replacement placement before stable reclaim");
-        let stable_generation = pool.next_placement_receipt_generation.saturating_sub(1);
-        let stable_txg = stable_generation
+        let retained = placement_mutation_intent_inventory(&pool.devices)
+            .expect("inspect retained placement mutations before stable reclaim");
+        let stable_generation = retained
+            .values()
+            .map(|observation| observation.intent.replacement_receipt.generation)
+            .max()
+            .expect("stable reclaim requires exact retained successor authority");
+        let stable_exclusive_generation = stable_generation
             .checked_add(1)
-            .expect("test stable commit boundary");
+            .expect("test stable placement-generation boundary");
         for device in &pool.devices {
             for leaf_index in 0..device.physical_leaf_count() {
                 let store = device
                     .physical_store(leaf_index)
                     .expect("physical leaf while checking stable reclaim");
+                let stable_exclusive_commit_group = store
+                    .stable_exclusive_commit_group()
+                    .expect("physical leaf committed boundary");
                 for entry in
                     crate::reclaim_queue::load_dead_object_reclaim_queue(store).all_entries()
                 {
                     assert!(
                         entry.is_receipt_bound_reclaimable_with_stable_generation(
-                            stable_txg,
+                            stable_exclusive_commit_group,
                             stable_generation
                         ),
-                        "queued predecessor is not authorized at stable_txg={stable_txg}, stable_generation={stable_generation}: {entry:?}"
+                        "queued predecessor is not authorized at stable_commit_group={stable_exclusive_commit_group}, stable_generation={stable_generation}: {entry:?}"
                     );
                 }
             }
@@ -7910,7 +7917,7 @@ mod tests {
         let stats = pool
             .drain_receipt_bound_dead_objects_at_stable_generation(
                 IoClass::Data,
-                stable_txg,
+                stable_exclusive_generation,
                 stable_generation,
                 usize::MAX,
             )
@@ -9700,12 +9707,14 @@ mod tests {
         );
 
         let receipt_key = placement_receipt_object_key(key);
-        let candidate = pool.devices[0]
-            .placement_receipt_candidates()
-            .unwrap()
-            .into_iter()
-            .find(|candidate| candidate.storage_key == receipt_key)
-            .expect("logical parity receipt candidate");
+        let candidate = decoded_placement_receipt_candidates(
+            std::iter::once((0, &pool.devices[0])),
+            "placement receipt corrupt or unverifiable",
+        )
+        .unwrap()
+        .into_iter()
+        .find(|candidate| placement_receipt_object_key(candidate.receipt.object_key) == receipt_key)
+        .expect("logical parity receipt candidate");
         let fragment = candidate
             .fragments
             .iter()
@@ -12914,8 +12923,13 @@ mod tests {
         let target_path = PathBuf::from(OsString::from_vec(b"/dev/data-\xff".to_vec()));
         let pool_guid = [0xa5; 16];
         let target_guid = [0x5a; 16];
-        let mut encoded =
-            encode_device_removal_marker(pool_guid, &target_path, target_guid).unwrap();
+        let mut encoded = encode_device_removal_marker_state(&DeviceRemovalMarker {
+            pool_guid,
+            target_path,
+            target_guid,
+            phase: DeviceRemovalPhase::Pending,
+        })
+        .unwrap();
         let checksum_byte = encoded.last_mut().unwrap();
         *checksum_byte ^= 0x80;
 

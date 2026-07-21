@@ -628,6 +628,12 @@ impl DeadObjectReclaimQueue {
         self.entries.values().copied().collect()
     }
 
+    /// Borrow entries in deterministic object-key order without cloning the
+    /// queue.
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = &DeadObjectEntry> {
+        self.entries.values()
+    }
+
     /// Number of entries currently eligible for reclamation given a
     /// stable committed commit_group.
     #[must_use]
