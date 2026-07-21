@@ -946,43 +946,23 @@ fn is_status_route(route: &LivePoolRoute<'_>) -> bool {
     route.operation == "status" && matches!(route.command, "pool" | "cluster" | "device")
 }
 
-fn live_owner_status_truth_carrier(
-    route: &LivePoolRoute<'_>,
-) -> Option<super::operator_truth::OperatorTruthCarrier> {
-    match (route.command, route.operation) {
-        ("pool", "status") => {
-            Some(super::operator_truth::OperatorTruthCarrier::live_pool_route(route.pool))
-        }
-        ("cluster", "status") => Some(super::operator_truth::OperatorTruthCarrier::live_route(
-            "cluster", "status", route.pool,
-        )),
-        ("device", "status") => Some(super::operator_truth::OperatorTruthCarrier::live_route(
-            "device", "status", route.pool,
-        )),
-        _ => None,
-    }
+fn live_owner_status_scope(route: &LivePoolRoute<'_>) -> Option<&'static str> {
+    matches!((route.command, route.operation), ("pool", "status")).then_some("local-pool")
 }
 
-fn live_owner_status_refusal_carrier(
+fn is_exact_live_owner_status_refusal(
     route: &LivePoolRoute<'_>,
     detail: Option<&serde_json::Value>,
-) -> Option<super::operator_truth::OperatorTruthCarrier> {
-    let command = match (route.command, route.operation) {
-        ("device", "status") => "device",
-        _ => return None,
-    };
-    let detail = detail?.as_object()?;
-    if detail.get("kind").and_then(serde_json::Value::as_str) != Some("unsupported_command")
-        || detail.get("command").and_then(serde_json::Value::as_str) != Some(command)
-        || detail.get("operation").and_then(serde_json::Value::as_str) != Some("status")
-    {
-        return None;
+) -> bool {
+    if !matches!((route.command, route.operation), ("pool", "status")) {
+        return false;
     }
-    Some(
-        super::operator_truth::OperatorTruthCarrier::live_owner_refusal(
-            command, "status", route.pool,
-        ),
-    )
+    let Some(detail) = detail.and_then(serde_json::Value::as_object) else {
+        return false;
+    };
+    detail.get("kind").and_then(serde_json::Value::as_str) == Some("unsupported_command")
+        && detail.get("command").and_then(serde_json::Value::as_str) == Some("pool")
+        && detail.get("operation").and_then(serde_json::Value::as_str) == Some("status")
 }
 
 fn annotate_live_owner_status_refusal_json(
@@ -990,9 +970,9 @@ fn annotate_live_owner_status_refusal_json(
     detail: Option<&serde_json::Value>,
     value: &mut serde_json::Value,
 ) {
-    let Some(carrier) = live_owner_status_refusal_carrier(route, detail) else {
+    if !is_exact_live_owner_status_refusal(route, detail) {
         return;
-    };
+    }
     let source = super::classification::StatusSource::LiveOwner.label();
     let Some(object) = value.as_object_mut() else {
         return;
@@ -1009,65 +989,84 @@ fn annotate_live_owner_status_refusal_json(
         "owner_response".to_string(),
         serde_json::Value::String("refused".to_string()),
     );
-    object.insert("operator_truth".to_string(), carrier.json_value());
+    object.insert(
+        "status_facts_accepted".to_string(),
+        serde_json::Value::Bool(false),
+    );
+    if let Some(scope) = live_owner_status_scope(route) {
+        object.insert(
+            "scope".to_string(),
+            serde_json::Value::String(scope.to_string()),
+        );
+    }
 }
 
 fn live_owner_status_refusal_human_lines(
     route: &LivePoolRoute<'_>,
     detail: Option<&serde_json::Value>,
 ) -> Vec<String> {
-    let Some(carrier) = live_owner_status_refusal_carrier(route, detail) else {
+    if !is_exact_live_owner_status_refusal(route, detail) {
         return Vec::new();
-    };
-    let mut lines = carrier.operator_lines();
+    }
+    let mut lines = vec![format!(
+        "path:       tidefsctl {} {}",
+        route.command, route.operation
+    )];
+    if let Some(scope) = live_owner_status_scope(route) {
+        lines.push(format!("scope:      {scope}"));
+    }
+    lines.push("response:   refused".to_string());
     lines.push(format!(
         "source_classification: {}",
         super::classification::StatusSource::LiveOwner.label()
+    ));
+    lines.push(format!(
+        "tidefsctl {} {}: no {} status facts were accepted",
+        route.command, route.operation, route.command
     ));
     lines
 }
 
 fn annotate_live_owner_status_json(route: &LivePoolRoute<'_>, value: &mut serde_json::Value) {
-    let Some(carrier) = live_owner_status_truth_carrier(route) else {
+    if !is_status_route(route) {
         return;
-    };
+    }
 
     let source = super::classification::StatusSource::LiveOwner.label();
-    let operator_truth = carrier.json_value();
-    match value {
-        serde_json::Value::Object(map) => {
-            map.entry("source_classification")
-                .or_insert_with(|| serde_json::Value::String(source.to_string()));
-            map.entry("source:status")
-                .or_insert_with(|| serde_json::Value::String(source.to_string()));
-            map.insert("operator_truth".to_string(), operator_truth);
-        }
-        _ => {
-            let original = std::mem::take(value);
-            *value = serde_json::json!({
-                "ok": true,
-                "source_classification": source,
-                "source:status": source,
-                "operator_truth": operator_truth,
-                "value": original,
-            });
-        }
+    if !value.is_object() {
+        let original = std::mem::take(value);
+        *value = serde_json::json!({"ok": true, "value": original});
+    }
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    object.insert(
+        "source_classification".to_string(),
+        serde_json::Value::String(source.to_string()),
+    );
+    if let Some(scope) = live_owner_status_scope(route) {
+        object.insert(
+            "scope".to_string(),
+            serde_json::Value::String(scope.to_string()),
+        );
     }
 }
 
 fn live_owner_status_text_json(route: &LivePoolRoute<'_>, text: &str) -> serde_json::Value {
-    if let Some(carrier) = live_owner_status_truth_carrier(route) {
+    if is_status_route(route) {
         let source = super::classification::StatusSource::LiveOwner.label();
-        serde_json::json!({
+        let mut value = serde_json::json!({
             "ok": true,
             "command": route.command,
             "operation": route.operation,
             "pool_name": route.pool,
             "source_classification": source,
-            "source:status": source,
-            "operator_truth": carrier.json_value(),
             "text": text,
-        })
+        });
+        if let Some(scope) = live_owner_status_scope(route) {
+            value["scope"] = serde_json::Value::String(scope.to_string());
+        }
+        value
     } else {
         serde_json::json!({
             "ok": true,
@@ -1107,11 +1106,17 @@ fn live_owner_machine_json_human_lines(
 }
 
 fn live_owner_status_human_lines(route: &LivePoolRoute<'_>) -> Vec<String> {
-    let Some(carrier) = live_owner_status_truth_carrier(route) else {
+    if !is_status_route(route) {
         return Vec::new();
-    };
+    }
 
-    let mut lines = carrier.operator_lines();
+    let mut lines = vec![format!(
+        "path:       tidefsctl {} {}",
+        route.command, route.operation
+    )];
+    if let Some(scope) = live_owner_status_scope(route) {
+        lines.push(format!("scope:      {scope}"));
+    }
     lines.push(format!(
         "source_classification: {}",
         super::classification::StatusSource::LiveOwner.label()
@@ -2444,6 +2449,10 @@ mod tests {
     fn status_json_refusal_names_unavailable_owner_and_unsupported_local_mode() {
         let json = no_live_status_refusal_json("device", "status", "tank");
 
+        assert_eq!(json["ok"], false);
+        assert_eq!(json["command"], "device");
+        assert_eq!(json["operation"], "status");
+        assert_eq!(json["pool_name"], "tank");
         assert_eq!(
             json.get("source_classification")
                 .and_then(serde_json::Value::as_str),
@@ -2454,73 +2463,122 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some(super::super::classification::StatusSource::UnsupportedLocalMode.label())
         );
+        assert!(json["error"].as_str().is_some_and(|error| {
+            error.contains("no live status evidence obtained")
+                && error.contains("cached local metadata is non-authoritative")
+        }));
+        assert!(json["recovery"]
+            .as_str()
+            .is_some_and(|recovery| recovery.contains("start or repair")));
+
+        let output = no_live_status_refusal_lines("device", "status", "tank").join("\n");
+        assert!(output.contains("no live status evidence obtained"));
+        assert!(output.contains("[source:unavailable-live-owner]"));
+        assert!(output.contains("[source:unsupported-local-mode]"));
+        assert!(output.contains("cached local metadata"));
+        assert!(output.contains("non-authoritative"));
     }
 
     #[test]
-    fn reachable_owner_status_refusal_carries_operator_truth_json() {
+    fn live_pool_status_reaches_owner_and_classifies_typed_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("owner.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        write_owner_manifest(dir.path(), &socket_path);
+        let owner_error = LivePoolAdminError::unsupported_command("pool", "status");
+        let machine_json = serde_json::to_string(&owner_error.kind).unwrap();
+        let handle = spawn_owner_response(
+            listener,
+            LivePoolAdminResponse::error_machine_json(
+                owner_error.exit_code,
+                owner_error.message,
+                machine_json,
+            ),
+        );
         let route = LivePoolRoute {
-            command: "device",
+            command: "pool",
+            operation: "status",
+            pool: "tank",
+            pool_uuid: Some([0x42; 16]),
+            json: true,
+            args: LivePoolAdminArgs::default(),
+        };
+
+        let err = send_live_owner_request_at(dir.path(), &route).unwrap_err();
+        let request = handle.join().unwrap();
+
+        assert_eq!(request.command, LivePoolAdminCommand::PoolStatus);
+        assert_eq!(request.output, LivePoolAdminOutput::MachineJson);
+        let (message, detail) = match err {
+            LiveOwnerRequestError::Owner {
+                exit_code,
+                message,
+                detail: Some(detail),
+            } => {
+                assert_eq!(exit_code, 1);
+                assert_eq!(detail["kind"], "unsupported_command");
+                assert_eq!(detail["command"], "pool");
+                assert_eq!(detail["operation"], "status");
+                (message, detail)
+            }
+            other => panic!("expected typed live-owner refusal, got {other:?}"),
+        };
+
+        let mut value = live_owner_error_detail_json(&route, &message, &detail);
+
+        annotate_live_owner_status_refusal_json(&route, Some(&detail), &mut value);
+
+        assert_eq!(value["source_classification"], "source:live-owner");
+        assert_eq!(value["owner_response"], "refused");
+        assert_eq!(value["scope"], "local-pool");
+        assert_eq!(value["status_facts_accepted"], false);
+
+        let output = live_owner_status_refusal_human_lines(&route, Some(&detail)).join("\n");
+        assert!(output.contains("path:       tidefsctl pool status"));
+        assert!(output.contains("scope:      local-pool"));
+        assert!(output.contains("response:   refused"));
+        assert!(output.contains("no pool status facts were accepted"));
+        assert!(!output.trim_start().starts_with('{'));
+    }
+
+    #[test]
+    fn pool_status_refusal_requires_exact_owner_detail() {
+        let route = LivePoolRoute {
+            command: "pool",
             operation: "status",
             pool: "tank",
             pool_uuid: None,
             json: true,
             args: LivePoolAdminArgs::default(),
         };
-        let detail = serde_json::json!({
-            "kind": "unsupported_command",
-            "command": "device",
-            "operation": "status",
-        });
-        let mut value = live_owner_error_detail_json(
-            &route,
-            "unsupported live-owner command tidefsctl device status",
-            &detail,
-        );
 
-        annotate_live_owner_status_refusal_json(&route, Some(&detail), &mut value);
+        for detail in [
+            None,
+            Some(serde_json::json!("malformed")),
+            Some(serde_json::json!({"kind": "malformed"})),
+            Some(serde_json::json!({
+                "kind": "unsupported_command",
+                "command": "device",
+                "operation": "status",
+            })),
+            Some(serde_json::json!({
+                "kind": "unsupported_command",
+                "command": "pool",
+                "operation": "remove",
+            })),
+        ] {
+            let mut value = serde_json::json!({"ok": false});
 
-        assert_eq!(value["kind"], "unsupported_command");
-        assert_eq!(value["source_classification"], "source:live-owner");
-        assert_eq!(value["owner_response"], "refused");
-        assert_eq!(value["operator_truth"]["evidence_state"], "refused");
-        assert_eq!(
-            value["operator_truth"]["freshness"],
-            "fresh.truth_view.refused.f4"
-        );
-        assert_eq!(
-            value["operator_truth"]["truth_bundle_record"]["answer_kind"],
-            "answer.response_registry.refusal.k1"
-        );
+            annotate_live_owner_status_refusal_json(&route, detail.as_ref(), &mut value);
+
+            assert!(value.get("owner_response").is_none());
+            assert!(value.get("status_facts_accepted").is_none());
+            assert!(live_owner_status_refusal_human_lines(&route, detail.as_ref()).is_empty());
+        }
     }
 
     #[test]
-    fn reachable_owner_status_refusal_is_operator_readable() {
-        let route = LivePoolRoute {
-            command: "device",
-            operation: "status",
-            pool: "tank",
-            pool_uuid: None,
-            json: false,
-            args: LivePoolAdminArgs::default(),
-        };
-        let detail = serde_json::json!({
-            "kind": "unsupported_command",
-            "command": "device",
-            "operation": "status",
-        });
-
-        let lines = live_owner_status_refusal_human_lines(&route, Some(&detail));
-        let output = lines.join("\n");
-
-        assert!(output.contains("path:       tidefsctl device status"));
-        assert!(output.contains("evidence:   refused"));
-        assert!(output.contains("no status facts were accepted"));
-        assert!(output.contains("source_classification: source:live-owner"));
-        assert!(!output.trim_start().starts_with('{'));
-    }
-
-    #[test]
-    fn device_status_refusal_carrier_rejects_nonmatching_owner_errors() {
+    fn device_status_refusal_remains_generic() {
         let route = LivePoolRoute {
             command: "device",
             operation: "status",
@@ -2538,6 +2596,14 @@ mod tests {
                 Some(serde_json::json!({
                     "kind": "unsupported_version",
                     "version": 42,
+                })),
+            ),
+            (
+                "exact-device-status",
+                Some(serde_json::json!({
+                    "kind": "unsupported_command",
+                    "command": "device",
+                    "operation": "status",
                 })),
             ),
             (
@@ -2566,12 +2632,12 @@ mod tests {
                 "{name} owner error must not be classified as a status refusal"
             );
             assert!(
-                value.get("operator_truth").is_none(),
-                "{name} owner error must not carry operator truth"
+                value.get("status_facts_accepted").is_none(),
+                "{name} owner error must not gain status-refusal fields"
             );
             assert!(
                 live_owner_status_refusal_human_lines(&route, detail.as_ref()).is_empty(),
-                "{name} owner error must not render refusal carrier lines"
+                "{name} owner error must not render exact-refusal lines"
             );
         }
     }
@@ -2645,39 +2711,12 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some(super::super::classification::StatusSource::LiveOwner.label())
         );
-        let operator_truth = &value["operator_truth"];
-        assert_eq!(operator_truth["status_path"], "tidefsctl device status");
-        assert_eq!(operator_truth["pool_name"], "tank");
-        assert_eq!(operator_truth["evidence_state"], "live-within-budget");
-        assert_eq!(
-            operator_truth["source"],
-            "source.truth_view.runtime_mirror.a2"
-        );
-        assert_eq!(operator_truth["cut"], "cut.truth_view.live_window.c0");
-        assert_eq!(
-            operator_truth["provenance"],
-            "prov.truth_view.live_mirror.p4"
-        );
-        assert_eq!(
-            operator_truth["exactness"],
-            "exact.truth_view.source_bound_projection.e1"
-        );
-        assert_eq!(
-            operator_truth["freshness"],
-            "fresh.truth_view.live_within_budget.f0"
-        );
-        assert_eq!(
-            operator_truth["distributed_surface_record"]["status"],
-            "status.truth_view.operator.nominal.s0"
-        );
-        assert_eq!(
-            operator_truth["truth_bundle_record"]["answer_kind"],
-            "answer.response_registry.bundle.k0"
-        );
+        assert_eq!(value["devices"], serde_json::json!([]));
+        assert!(value.get("scope").is_none());
     }
 
     #[test]
-    fn live_pool_status_json_carries_local_truth_without_distributed_claim() {
+    fn live_pool_status_json_carries_local_scope() {
         let route = LivePoolRoute {
             command: "pool",
             operation: "status",
@@ -2695,22 +2734,9 @@ mod tests {
         annotate_live_owner_status_json(&route, &mut value);
 
         assert_eq!(value["source_classification"], "source:live-owner");
-        assert_eq!(
-            value["operator_truth"]["status_path"],
-            "tidefsctl pool status"
-        );
-        assert_eq!(value["operator_truth"]["scope"], "local-pool");
-        assert_eq!(
-            value["operator_truth"]["freshness"],
-            "fresh.truth_view.live_within_budget.f0"
-        );
-        assert!(value["operator_truth"]
-            .get("distributed_surface_record")
-            .is_none());
-        assert_eq!(
-            value["operator_truth"]["truth_bundle_record"]["answer_kind"],
-            "answer.response_registry.bundle.k0"
-        );
+        assert_eq!(value["scope"], "local-pool");
+        assert_eq!(value["state"], "Active");
+        assert_eq!(value["statfs"]["free_blocks"], 768);
     }
 
     #[test]
@@ -2752,7 +2778,7 @@ mod tests {
     }
 
     #[test]
-    fn live_owner_status_text_json_carries_typed_operator_truth() {
+    fn live_owner_status_text_json_carries_concise_source() {
         let route = LivePoolRoute {
             command: "cluster",
             operation: "status",
@@ -2765,18 +2791,11 @@ mod tests {
         let value = live_owner_status_text_json(&route, "healthy");
 
         assert_eq!(value["text"], "healthy");
-        assert_eq!(
-            value["operator_truth"]["status_path"],
-            "tidefsctl cluster status"
-        );
-        assert_eq!(
-            value["operator_truth"]["evidence_state"],
-            "live-within-budget"
-        );
-        assert_eq!(
-            value["operator_truth"]["distributed_surface_record"]["live_view"],
-            "view.truth_view.cluster_health.v8"
-        );
+        assert_eq!(value["command"], "cluster");
+        assert_eq!(value["operation"], "status");
+        assert_eq!(value["pool_name"], "tank");
+        assert_eq!(value["source_classification"], "source:live-owner");
+        assert!(value.get("scope").is_none());
     }
 
     #[test]
@@ -2802,12 +2821,6 @@ mod tests {
         );
 
         assert!(output.contains("path:       tidefsctl device status"));
-        assert!(output.contains("evidence:   live-within-budget"));
-        assert!(output.contains("source:     source.truth_view.runtime_mirror.a2"));
-        assert!(output.contains("cut:        cut.truth_view.live_window.c0"));
-        assert!(output.contains("provenance: prov.truth_view.live_mirror.p4"));
-        assert!(output.contains("exactness:  exact.truth_view.source_bound_projection.e1"));
-        assert!(output.contains("freshness:  fresh.truth_view.live_within_budget.f0"));
         assert!(lines.iter().any(|line| line == &expected_source));
         assert!(lines.iter().any(|line| line == "live status"));
         assert!(lines.iter().any(|line| line == "ready"));
@@ -2833,8 +2846,7 @@ mod tests {
 
         assert!(output.contains("path:       tidefsctl pool status"));
         assert!(output.contains("scope:      local-pool"));
-        assert!(output.contains("source:     source.truth_view.runtime_mirror.a2"));
-        assert!(output.contains("freshness:  fresh.truth_view.live_within_budget.f0"));
+        assert!(output.contains("source_classification: source:live-owner"));
         assert!(lines.iter().any(|line| line == "pool: tank"));
         assert!(lines.iter().any(|line| line == "state: Active"));
         assert!(!output.trim_start().starts_with('{'));

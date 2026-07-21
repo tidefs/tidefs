@@ -20,7 +20,9 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use clap::Subcommand;
-use tidefs_local_filesystem::{RootAuthenticationKey, ROOT_AUTHENTICATION_ENV_VAR};
+use tidefs_local_filesystem::RootAuthenticationKey;
+#[cfg(test)]
+use tidefs_local_filesystem::ROOT_AUTHENTICATION_ENV_VAR;
 use tidefs_vfs_engine::LivePoolAdminArg;
 
 /// Subcommands for the `tidefsctl block` group.

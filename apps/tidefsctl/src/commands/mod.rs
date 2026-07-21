@@ -12,7 +12,6 @@ mod live_owner;
 pub mod merge;
 pub mod mount;
 mod offline_pool;
-mod operator_truth;
 pub mod pool;
 pub mod snapshot;
 pub mod storage_intent;
