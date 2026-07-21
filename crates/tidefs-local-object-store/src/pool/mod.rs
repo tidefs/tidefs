@@ -433,7 +433,7 @@ pub struct PoolStats {
 pub struct PoolReceiptBoundDeadObjectDrainStats {
     /// Number of writable pool devices whose dead-object queues were examined.
     pub devices_scanned: usize,
-    /// Number of receipt-authorized dead objects examined.
+    /// Number of receipt-authorized dead objects selected and released.
     pub objects_examined: usize,
     /// Number of segments identified as fully dead and freed.
     pub segments_reclaimed: u64,
@@ -599,6 +599,30 @@ const PLACEMENT_HASH_RING_VNODES_PER_GB: u64 = 16;
 struct PlacementMutationIntent {
     old_receipt: Option<PlacementReceipt>,
     replacement_receipt: PlacementReceipt,
+}
+
+type PlacementReclaimAuthority = BTreeMap<
+    (usize, usize),
+    BTreeMap<ReclaimObjectKey, DeadObjectReplacementReceipt>,
+>;
+
+fn placement_reclaim_authority_fragments(
+    authority: &PlacementReclaimAuthority,
+    device_index: usize,
+) -> Vec<DeviceObjectFragment> {
+    let mut fragments: Vec<_> = authority
+        .iter()
+        .filter(|((candidate_index, _), _)| *candidate_index == device_index)
+        .flat_map(|((_, leaf_index), entries)| {
+            entries.keys().map(|object_id| DeviceObjectFragment {
+                leaf_index: *leaf_index,
+                key: ObjectKey(object_id.0),
+            })
+        })
+        .collect();
+    fragments.sort();
+    fragments.dedup();
+    fragments
 }
 
 impl PlacementReceipt {
@@ -1411,6 +1435,10 @@ impl<'a> ReceiptCursor<'a> {
     fn is_finished(&self) -> bool {
         self.offset == self.raw.len()
     }
+
+    fn remaining_len(&self) -> usize {
+        self.raw.len().saturating_sub(self.offset)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1871,13 +1899,26 @@ fn restore_device_replacement_evidence(pool: &mut Pool) -> Result<()> {
 const DEVICE_REMOVAL_MARKER_FILE: &str = ".tidefs_device_removal_pending";
 const DEVICE_REMOVAL_MARKER_TMP_FILE: &str = ".tidefs_device_removal_pending.tmp";
 const DEVICE_REMOVAL_MARKER_MAGIC_V2: &[u8; 8] = b"TFSDRM2\0";
+const DEVICE_REMOVAL_MARKER_MAGIC_V3: &[u8; 8] = b"TFSDRM3\0";
 const DEVICE_REMOVAL_MARKER_CHECKSUM_LEN: usize = 32;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum DeviceRemovalPhase {
+    Pending,
+    Evacuated,
+    ReclaimAuthorized {
+        stable_exclusive_generation: u64,
+        stable_committed_generation: u64,
+        fragments: Vec<DeviceObjectFragment>,
+    },
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct DeviceRemovalMarker {
     pool_guid: [u8; 16],
     target_path: PathBuf,
     target_guid: [u8; 16],
+    phase: DeviceRemovalPhase,
 }
 
 fn invalid_device_removal_marker() -> StoreError {
@@ -1891,23 +1932,70 @@ fn encode_device_removal_marker(
     target_path: &Path,
     target_guid: [u8; 16],
 ) -> Result<Vec<u8>> {
-    let path = target_path.as_os_str().as_bytes();
+    encode_device_removal_marker_state(&DeviceRemovalMarker {
+        pool_guid,
+        target_path: target_path.to_path_buf(),
+        target_guid,
+        phase: DeviceRemovalPhase::Pending,
+    })
+}
+
+fn encode_device_removal_marker_state(marker: &DeviceRemovalMarker) -> Result<Vec<u8>> {
+    let path = marker.target_path.as_os_str().as_bytes();
     if path.is_empty() {
         return Err(invalid_device_removal_marker());
     }
     let path_len = u32::try_from(path.len()).map_err(|_| invalid_device_removal_marker())?;
+    let (phase_tag, stable_exclusive_generation, stable_committed_generation, fragments) =
+        match &marker.phase {
+            DeviceRemovalPhase::Pending => (0u8, 0, 0, Vec::new()),
+            DeviceRemovalPhase::Evacuated => (1u8, 0, 0, Vec::new()),
+            DeviceRemovalPhase::ReclaimAuthorized {
+                stable_exclusive_generation,
+                stable_committed_generation,
+                fragments,
+            } => {
+                let mut fragments = fragments.clone();
+                fragments.sort();
+                fragments.dedup();
+                (
+                    2u8,
+                    *stable_exclusive_generation,
+                    *stable_committed_generation,
+                    fragments,
+                )
+            }
+        };
+    let fragment_count =
+        u32::try_from(fragments.len()).map_err(|_| invalid_device_removal_marker())?;
     let mut encoded = Vec::with_capacity(
-        DEVICE_REMOVAL_MARKER_MAGIC_V2.len()
-            + pool_guid.len()
-            + target_guid.len()
-            + std::mem::size_of::<u32>()
+        DEVICE_REMOVAL_MARKER_MAGIC_V3.len()
+            + marker.pool_guid.len()
+            + marker.target_guid.len()
+            + 1
+            + 2 * std::mem::size_of::<u64>()
+            + 2 * std::mem::size_of::<u32>()
+            + fragments.len() * (std::mem::size_of::<u32>() + 32)
             + path.len()
             + DEVICE_REMOVAL_MARKER_CHECKSUM_LEN,
     );
-    encoded.extend_from_slice(DEVICE_REMOVAL_MARKER_MAGIC_V2);
-    encoded.extend_from_slice(&pool_guid);
-    encoded.extend_from_slice(&target_guid);
+    encoded.extend_from_slice(DEVICE_REMOVAL_MARKER_MAGIC_V3);
+    encoded.extend_from_slice(&marker.pool_guid);
+    encoded.extend_from_slice(&marker.target_guid);
+    encoded.push(phase_tag);
+    // Preserve the V3 wire slot while naming its actual Pool authority: the
+    // first generation that is not yet stable, not a leaf-local transaction
+    // group.
+    encoded.extend_from_slice(&stable_exclusive_generation.to_le_bytes());
+    encoded.extend_from_slice(&stable_committed_generation.to_le_bytes());
+    encoded.extend_from_slice(&fragment_count.to_le_bytes());
     encoded.extend_from_slice(&path_len.to_le_bytes());
+    for fragment in fragments {
+        let leaf_index =
+            u32::try_from(fragment.leaf_index).map_err(|_| invalid_device_removal_marker())?;
+        encoded.extend_from_slice(&leaf_index.to_le_bytes());
+        encoded.extend_from_slice(fragment.key.as_bytes());
+    }
     encoded.extend_from_slice(path);
     let checksum = blake3::hash(&encoded);
     encoded.extend_from_slice(checksum.as_bytes());
@@ -1917,13 +2005,62 @@ fn encode_device_removal_marker(
 fn decode_device_removal_marker(encoded: &[u8]) -> Result<DeviceRemovalMarker> {
     let decoded = (|| -> Option<DeviceRemovalMarker> {
         let mut cursor = ReceiptCursor::new(encoded);
-        if cursor.take(DEVICE_REMOVAL_MARKER_MAGIC_V2.len())? != DEVICE_REMOVAL_MARKER_MAGIC_V2 {
+        let magic = cursor.take(DEVICE_REMOVAL_MARKER_MAGIC_V3.len())?;
+        if magic == DEVICE_REMOVAL_MARKER_MAGIC_V2 {
+            let pool_guid = cursor.array()?;
+            let target_guid = cursor.array()?;
+            let path_len = u32::from_le_bytes(cursor.array()?) as usize;
+            if path_len == 0 {
+                return None;
+            }
+            let target_path = PathBuf::from(OsString::from_vec(cursor.take(path_len)?.to_vec()));
+            let checksum = cursor.array::<DEVICE_REMOVAL_MARKER_CHECKSUM_LEN>()?;
+            if !cursor.is_finished() {
+                return None;
+            }
+            let checksum_input_len = encoded
+                .len()
+                .checked_sub(DEVICE_REMOVAL_MARKER_CHECKSUM_LEN)?;
+            if blake3::hash(&encoded[..checksum_input_len]).as_bytes() != &checksum {
+                return None;
+            }
+            return Some(DeviceRemovalMarker {
+                pool_guid,
+                target_path,
+                target_guid,
+                phase: DeviceRemovalPhase::Pending,
+            });
+        }
+        if magic != DEVICE_REMOVAL_MARKER_MAGIC_V3 {
             return None;
         }
         let pool_guid = cursor.array()?;
         let target_guid = cursor.array()?;
+        let phase_tag = cursor.u8()?;
+        let stable_exclusive_generation = u64::from_le_bytes(cursor.array()?);
+        let stable_committed_generation = u64::from_le_bytes(cursor.array()?);
+        let fragment_count = u32::from_le_bytes(cursor.array()?) as usize;
         let path_len = u32::from_le_bytes(cursor.array()?) as usize;
         if path_len == 0 {
+            return None;
+        }
+        let fragment_bytes = fragment_count.checked_mul(std::mem::size_of::<u32>() + 32)?;
+        let expected_remaining = fragment_bytes
+            .checked_add(path_len)?
+            .checked_add(DEVICE_REMOVAL_MARKER_CHECKSUM_LEN)?;
+        if cursor.remaining_len() != expected_remaining {
+            return None;
+        }
+        let mut fragments = Vec::with_capacity(fragment_count);
+        for _ in 0..fragment_count {
+            let leaf_index = u32::from_le_bytes(cursor.array()?) as usize;
+            let key = ObjectKey::from_bytes32(cursor.array()?);
+            fragments.push(DeviceObjectFragment { leaf_index, key });
+        }
+        let mut canonical_fragments = fragments.clone();
+        canonical_fragments.sort();
+        canonical_fragments.dedup();
+        if canonical_fragments != fragments {
             return None;
         }
         let target_path = PathBuf::from(OsString::from_vec(cursor.take(path_len)?.to_vec()));
@@ -1937,10 +2074,27 @@ fn decode_device_removal_marker(encoded: &[u8]) -> Result<DeviceRemovalMarker> {
         if blake3::hash(&encoded[..checksum_input_len]).as_bytes() != &checksum {
             return None;
         }
+        let phase = match phase_tag {
+            0 if stable_exclusive_generation == 0
+                && stable_committed_generation == 0
+                && fragments.is_empty() => DeviceRemovalPhase::Pending,
+            1 if stable_exclusive_generation == 0
+                && stable_committed_generation == 0
+                && fragments.is_empty() => DeviceRemovalPhase::Evacuated,
+            2 if stable_exclusive_generation != 0
+                && stable_committed_generation != 0
+                && !fragments.is_empty() => DeviceRemovalPhase::ReclaimAuthorized {
+                    stable_exclusive_generation,
+                    stable_committed_generation,
+                    fragments,
+                },
+            _ => return None,
+        };
         Some(DeviceRemovalMarker {
             pool_guid,
             target_path,
             target_guid,
+            phase,
         })
     })();
 
@@ -1953,9 +2107,24 @@ fn persist_device_removal_marker(
     target_path: &Path,
     target_guid: [u8; 16],
 ) -> Result<()> {
+    persist_device_removal_marker_state(
+        pool_root,
+        &DeviceRemovalMarker {
+            pool_guid,
+            target_path: target_path.to_path_buf(),
+            target_guid,
+            phase: DeviceRemovalPhase::Pending,
+        },
+    )
+}
+
+fn persist_device_removal_marker_state(
+    pool_root: &Path,
+    marker_state: &DeviceRemovalMarker,
+) -> Result<()> {
     let marker_path = pool_root.join(DEVICE_REMOVAL_MARKER_FILE);
     let tmp_path = pool_root.join(DEVICE_REMOVAL_MARKER_TMP_FILE);
-    let encoded = encode_device_removal_marker(pool_guid, target_path, target_guid)?;
+    let encoded = encode_device_removal_marker_state(marker_state)?;
     let persist_result = (|| -> std::io::Result<()> {
         let mut marker = fs::OpenOptions::new()
             .create(true)
@@ -1995,6 +2164,16 @@ fn resume_device_removal_if_pending(pool: &mut Pool) {
     let marker_path = pool.config.root_path.join(DEVICE_REMOVAL_MARKER_FILE);
     if marker_path.exists() {
         if let Ok(marker) = read_device_removal_marker(&marker_path) {
+            let marker_tmp_path = pool
+                .config
+                .root_path
+                .join(DEVICE_REMOVAL_MARKER_TMP_FILE);
+            if marker_tmp_path.exists() {
+                if std::fs::remove_file(&marker_tmp_path).is_ok() {
+                    let _ = fs::File::open(&pool.config.root_path)
+                        .and_then(|directory| directory.sync_all());
+                }
+            }
             if marker.pool_guid != pool.pool_guid {
                 // A marker copied from another pool cannot authorize
                 // automatic evacuation or detach in this pool, even if a
@@ -3227,6 +3406,108 @@ impl Pool {
         Ok(())
     }
 
+    fn committed_placement_reclaim_authority(
+        &self,
+        stable_committed_generation: u64,
+    ) -> Result<PlacementReclaimAuthority> {
+        let mut grouped: BTreeMap<ObjectKey, Vec<PlacementMutationIntentObservation>> =
+            BTreeMap::new();
+        for observation in placement_mutation_intent_inventory(&self.devices)?.into_values() {
+            grouped
+                .entry(observation.intent.replacement_receipt.object_key)
+                .or_default()
+                .push(observation);
+        }
+
+        let receipt_inventory = self.placement_receipt_inventory_allowing_incomplete()?;
+        let scope: BTreeSet<_> = (0..self.devices.len()).collect();
+        let mut authority = PlacementReclaimAuthority::new();
+
+        for (logical_key, observations) in &mut grouped {
+            observations.sort_by_key(|observation| {
+                (
+                    observation.intent.replacement_receipt.epoch,
+                    observation.intent.replacement_receipt.generation,
+                )
+            });
+            self.validate_placement_mutation_chain(observations)?;
+
+            let current = receipt_inventory
+                .select_current(*logical_key, &self.device_guids, &scope)?
+                .ok_or(StoreError::InvalidOptions {
+                    reason: "placement reclaim intent has no committed successor authority",
+                })?;
+            let current_version = (current.epoch, current.generation);
+            let highest_intent_version = observations
+                .last()
+                .map(|observation| {
+                    (
+                        observation.intent.replacement_receipt.epoch,
+                        observation.intent.replacement_receipt.generation,
+                    )
+                })
+                .ok_or(StoreError::InvalidOptions {
+                    reason: "placement reclaim intent group is unexpectedly empty",
+                })?;
+            if current_version < highest_intent_version {
+                return Err(StoreError::InvalidOptions {
+                    reason: "placement reclaim successor is not completely committed",
+                });
+            }
+            self.verify_placement_receipt_payload(&current)?;
+
+            for observation in observations.iter() {
+                let successor = &observation.intent.replacement_receipt;
+                if successor.generation > stable_committed_generation
+                    || current_version < (successor.epoch, successor.generation)
+                {
+                    continue;
+                }
+                let Some(predecessor) = observation.intent.old_receipt.as_ref() else {
+                    continue;
+                };
+                if predecessor.is_deleted() {
+                    continue;
+                }
+
+                for target in &predecessor.targets {
+                    let device_index = self.resolve_receipt_target(target).ok_or(
+                        StoreError::InvalidOptions {
+                            reason: "placement reclaim predecessor target is unavailable",
+                        },
+                    )?;
+                    let logical_payload_key =
+                        placement_payload_object_key_for_target(predecessor, target).ok_or(
+                            StoreError::InvalidOptions {
+                                reason: "placement reclaim predecessor has no physical payload key",
+                            },
+                        )?;
+                    for fragment in self.devices[device_index]
+                        .physical_fragments_for_key(logical_payload_key)
+                    {
+                        let replacement = dead_object_replacement_receipt_for_object(
+                            fragment.key,
+                            successor,
+                        )?;
+                        let entries = authority
+                            .entry((device_index, fragment.leaf_index))
+                            .or_default();
+                        match entries.insert(reclaim_object_key(fragment.key), replacement) {
+                            Some(existing) if existing != replacement => {
+                                return Err(StoreError::InvalidOptions {
+                                    reason: "placement reclaim fragment has conflicting intent authority",
+                                })
+                            }
+                            Some(_) | None => {}
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(authority)
+    }
+
     fn replay_placement_mutation_intents(&mut self) -> Result<()> {
         let mut grouped: BTreeMap<ObjectKey, Vec<PlacementMutationIntentObservation>> =
             BTreeMap::new();
@@ -3347,7 +3628,8 @@ impl Pool {
                     observation.source_devices.iter().copied(),
                 ) {
                     Ok(true) => {}
-                    Ok(false) | Err(_) => break,
+                    Ok(false) => break,
+                    Err(error) => return Err(error),
                 }
             }
         }
@@ -3766,7 +4048,7 @@ impl Pool {
         Ok(())
     }
 
-    fn obsolete_placement_payload_is_absent(
+    fn obsolete_placement_reclaim_is_terminal(
         &self,
         intent: &PlacementMutationIntent,
     ) -> Result<bool> {
@@ -3776,7 +4058,11 @@ impl Pool {
         if old_receipt.is_deleted() {
             return Ok(true);
         }
-        let mut objects = BTreeSet::new();
+        let marker_path = self.config.root_path.join(DEVICE_REMOVAL_MARKER_FILE);
+        let removal_marker = marker_path
+            .exists()
+            .then(|| read_device_removal_marker(&marker_path))
+            .transpose()?;
         for target in &old_receipt.targets {
             let idx = self
                 .resolve_receipt_target(target)
@@ -3788,13 +4074,36 @@ impl Pool {
                     reason: "obsolete live placement has no generation-bound payload key",
                 },
             )?;
-            objects.insert((idx, key));
-        }
-        for (idx, key) in objects {
-            match self.devices[idx].logical_object_candidates_for_key(key) {
-                Ok(candidates) if candidates.is_empty() => {}
-                Ok(_) => return Ok(false),
-                Err(error) => return Err(error),
+            for fragment in self.devices[idx].physical_fragments_for_key(key) {
+                let object_id = reclaim_object_key(fragment.key);
+                let store = self.devices[idx]
+                    .physical_store(fragment.leaf_index)
+                    .ok_or(StoreError::InvalidOptions {
+                        reason: "obsolete placement fragment references an unavailable leaf",
+                    })?;
+                if store.reclaim_receipt_covers_object(object_id) {
+                    continue;
+                }
+                let marker_authorizes_completed_removal = removal_marker.as_ref().is_some_and(
+                    |marker| {
+                        marker.pool_guid == self.pool_guid
+                            && marker.target_guid == target.device_guid
+                            && matches!(
+                                &marker.phase,
+                                DeviceRemovalPhase::ReclaimAuthorized {
+                                    stable_committed_generation,
+                                    fragments,
+                                    ..
+                                } if *stable_committed_generation
+                                    >= intent.replacement_receipt.generation
+                                    && fragments.contains(&fragment)
+                            )
+                            && store.device_removal_reclaim_is_acknowledged(object_id)
+                    },
+                );
+                if !marker_authorizes_completed_removal {
+                    return Ok(false);
+                }
             }
         }
         Ok(true)
@@ -3806,7 +4115,7 @@ impl Pool {
         intent_devices: impl IntoIterator<Item = usize>,
     ) -> Result<bool> {
         self.remove_stale_predecessor_receipts(intent)?;
-        if self.obsolete_placement_payload_is_absent(intent)? {
+        if self.obsolete_placement_reclaim_is_terminal(intent)? {
             let mut sources: BTreeSet<_> = intent_devices.into_iter().collect();
             sources.extend(receipt_target_indices(
                 &intent.replacement_receipt,
@@ -3937,7 +4246,12 @@ impl Pool {
         // Receipt readback above is the commit point. Cleanup failure cannot
         // turn a committed write into a reported precommit failure: retain the
         // durable intent so reopen or a stable-generation drain can retry it.
-        let _ = self.record_committed_placement_mutation(&intent, std::iter::empty());
+        if self
+            .record_committed_placement_mutation(&intent, std::iter::empty())
+            .is_err()
+        {
+            self.placement_mutation_recovery_required = true;
+        }
 
         self.health = compute_health(&self.devices);
         self.record_health_transitions();
@@ -4636,7 +4950,12 @@ impl Pool {
             self.placement_mutation_recovery_required = true;
             return Err(error);
         }
-        let _ = self.record_committed_placement_mutation(&intent, std::iter::empty());
+        if self
+            .record_committed_placement_mutation(&intent, std::iter::empty())
+            .is_err()
+        {
+            self.placement_mutation_recovery_required = true;
+        }
         Ok(())
     }
 
@@ -4663,6 +4982,47 @@ impl Pool {
             });
         }
         Ok(true)
+    }
+
+    /// Return whether the pool has placement-mutation recovery or physical
+    /// reclaim debt that warrants a pool-wide durability barrier.
+    pub fn has_pending_placement_reclaim(&self) -> Result<bool> {
+        if self.placement_mutation_recovery_required {
+            return Ok(true);
+        }
+        for device_index in 0..self.devices.len() {
+            if self.device_has_pending_receipt_bound_reclaim(device_index)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Make all currently published placement mutations durable, capture the
+    /// pool-owned exclusive generation boundary, and drain only mutations
+    /// below that boundary.
+    ///
+    /// Production callers use this operation instead of manufacturing a
+    /// transaction-group or receipt-generation pair. Placement generations
+    /// are pool-global while object-store transaction groups are leaf-local.
+    pub fn sync_and_drain_committed_placement_mutations(
+        &mut self,
+        class: IoClass,
+        max_count: usize,
+    ) -> std::result::Result<
+        PoolReceiptBoundDeadObjectDrainStats,
+        crate::store::ReceiptBoundDeadObjectDrainError,
+    > {
+        self.recover_pending_placement_mutation_if_required()?;
+        self.sync_all()?;
+        let stable_exclusive_generation = self.next_placement_receipt_generation.max(1);
+        let stable_committed_generation = stable_exclusive_generation.saturating_sub(1);
+        self.drain_receipt_bound_dead_objects_at_stable_generation(
+            class,
+            stable_exclusive_generation,
+            stable_committed_generation,
+            max_count,
+        )
     }
 
     /// Drain receipt-authorized dead objects across the devices for an I/O class
@@ -4693,10 +5053,10 @@ impl Pool {
     /// The stable boundaries are caller-supplied so higher layers can tie
     /// source reclamation to the replacement placement receipt that made the
     /// new placement legal.
-    pub fn drain_receipt_bound_dead_objects_at_stable_generation(
+    fn drain_receipt_bound_dead_objects_at_stable_generation(
         &mut self,
         _class: IoClass,
-        stable_committed_txg: u64,
+        stable_exclusive_generation: u64,
         stable_committed_generation: u64,
         max_count: usize,
     ) -> std::result::Result<
@@ -4722,7 +5082,7 @@ impl Pool {
         }
 
         let removal_marker_path = self.config.root_path.join(DEVICE_REMOVAL_MARKER_FILE);
-        let pending_removal_target = if removal_marker_path.exists() {
+        let removal_marker = if removal_marker_path.exists() {
             let marker = read_device_removal_marker(&removal_marker_path)?;
             if marker.pool_guid != self.pool_guid {
                 return Err(StoreError::InvalidOptions {
@@ -4737,7 +5097,7 @@ impl Pool {
                 .filter_map(|(idx, guid)| (*guid == marker.target_guid).then_some(idx))
                 .collect();
             match matches.as_slice() {
-                [idx] => Some(*idx),
+                [idx] => Some((*idx, marker)),
                 [] => None,
                 _ => {
                     return Err(StoreError::InvalidOptions {
@@ -4750,6 +5110,9 @@ impl Pool {
             None
         };
 
+        let reclaim_authority =
+            self.committed_placement_reclaim_authority(stable_committed_generation)?;
+
         let mut aggregate = PoolReceiptBoundDeadObjectDrainStats::default();
         let mut remaining = max_count;
         for idx in self.usable_candidates(&indices) {
@@ -4761,28 +5124,17 @@ impl Pool {
                         reason: "receipt-bound reclaim references an unavailable physical leaf",
                     },
                 )?;
-                let queue_depth_before = store.receipt_bound_dead_object_queue_depth();
-                let mut stats = store
+                let authorized_receipts = reclaim_authority
+                    .get(&(idx, leaf_index))
+                    .cloned()
+                    .unwrap_or_default();
+                let stats = store
                     .retire_and_drain_receipt_bound_dead_objects_at_stable_generation(
-                        stable_committed_txg,
+                        stable_exclusive_generation,
                         stable_committed_generation,
                         remaining,
+                        &authorized_receipts,
                     )?;
-                if pending_removal_target == Some(idx) && stats.reclaim_queue_depth != 0 {
-                    let removed_by_generic_drain =
-                        queue_depth_before.saturating_sub(stats.reclaim_queue_depth);
-                    let acknowledge_limit = remaining.saturating_sub(removed_by_generic_drain);
-                    if acknowledge_limit != 0 {
-                        store.acknowledge_retired_receipt_bound_objects_for_device_removal(
-                            stable_committed_txg,
-                            stable_committed_generation,
-                            acknowledge_limit,
-                        )?;
-                    }
-                    let queue_depth_after = store.receipt_bound_dead_object_queue_depth();
-                    stats.entries_processed = queue_depth_before.saturating_sub(queue_depth_after);
-                    stats.reclaim_queue_depth = queue_depth_after;
-                }
                 aggregate.absorb_reclaim_stats(stats);
                 remaining = remaining.saturating_sub(stats.entries_processed);
             }
@@ -4793,6 +5145,138 @@ impl Pool {
                 reason: "receipt-bound reclaim found no writable pool devices",
             }
             .into());
+        }
+
+        if max_count != 0 {
+            if let Some((target_idx, mut marker)) = removal_marker {
+                if !matches!(marker.phase, DeviceRemovalPhase::Pending) {
+                    for ((device_index, leaf_index), authorized_receipts) in &reclaim_authority {
+                        if remaining == 0 {
+                            break;
+                        }
+                        if authorized_receipts.is_empty() {
+                            continue;
+                        }
+                        let store = self.devices[*device_index]
+                            .physical_store_mut(*leaf_index)
+                            .ok_or(StoreError::InvalidOptions {
+                                reason: "device-removal reclaim relocation references an unavailable physical leaf",
+                            })?;
+                        let depth_before = store.receipt_bound_dead_object_queue_depth();
+                        let relocated = store
+                            .relocate_live_records_for_device_removal_reclaim(
+                                stable_exclusive_generation,
+                                stable_committed_generation,
+                                authorized_receipts,
+                            )?;
+                        if relocated == 0 {
+                            continue;
+                        }
+                        let stats = store
+                            .retire_and_drain_receipt_bound_dead_objects_at_stable_generation(
+                                stable_exclusive_generation,
+                                stable_committed_generation,
+                                remaining,
+                                authorized_receipts,
+                            )?;
+                        aggregate.objects_examined = aggregate
+                            .objects_examined
+                            .saturating_add(stats.entries_processed);
+                        aggregate.segments_reclaimed = aggregate
+                            .segments_reclaimed
+                            .saturating_add(stats.segments_reclaimed);
+                        aggregate.blocks_freed =
+                            aggregate.blocks_freed.saturating_add(stats.blocks_freed);
+                        aggregate.checkpoint_batches = aggregate
+                            .checkpoint_batches
+                            .saturating_add(stats.checkpoint_batches);
+                        aggregate.reclaim_queue_depth = aggregate
+                            .reclaim_queue_depth
+                            .saturating_sub(depth_before)
+                            .saturating_add(stats.reclaim_queue_depth);
+                        remaining = remaining.saturating_sub(stats.entries_processed);
+                    }
+                }
+
+                let target_fragments =
+                    placement_reclaim_authority_fragments(&reclaim_authority, target_idx);
+                let authority_ready = reclaim_authority
+                    .iter()
+                    .filter(|((device_index, _), _)| *device_index == target_idx)
+                    .all(|((_, leaf_index), authorized_receipts)| {
+                        self.devices[target_idx]
+                            .physical_store(*leaf_index)
+                            .is_some_and(|store| {
+                                store.device_removal_reclaim_authority_is_ready(
+                                    stable_exclusive_generation,
+                                    stable_committed_generation,
+                                    authorized_receipts,
+                                )
+                            })
+                    });
+
+                let reclaim_authorized = match &marker.phase {
+                    DeviceRemovalPhase::Pending => false,
+                    DeviceRemovalPhase::Evacuated
+                        if authority_ready && !target_fragments.is_empty() =>
+                    {
+                        marker.phase = DeviceRemovalPhase::ReclaimAuthorized {
+                            stable_exclusive_generation,
+                            stable_committed_generation,
+                            fragments: target_fragments.clone(),
+                        };
+                        persist_device_removal_marker_state(&self.config.root_path, &marker)?;
+                        true
+                    }
+                    DeviceRemovalPhase::Evacuated => false,
+                    DeviceRemovalPhase::ReclaimAuthorized {
+                        stable_exclusive_generation: marker_exclusive_generation,
+                        stable_committed_generation: marker_generation,
+                        fragments,
+                    } => {
+                        if stable_exclusive_generation < *marker_exclusive_generation
+                            || stable_committed_generation < *marker_generation
+                            || target_fragments
+                                .iter()
+                                .any(|fragment| !fragments.contains(fragment))
+                        {
+                            return Err(StoreError::InvalidOptions {
+                                reason: "device removal reclaim marker does not match retained intent authority",
+                            }
+                            .into());
+                        }
+                        true
+                    }
+                };
+
+                if reclaim_authorized {
+                    for ((device_index, leaf_index), authorized_receipts) in &reclaim_authority {
+                        if remaining == 0 {
+                            break;
+                        }
+                        if *device_index != target_idx || authorized_receipts.is_empty() {
+                            continue;
+                        }
+                        let store = self.devices[target_idx]
+                            .physical_store_mut(*leaf_index)
+                            .ok_or(StoreError::InvalidOptions {
+                                reason: "device-removal reclaim references an unavailable physical leaf",
+                            })?;
+                        let removed = store
+                            .acknowledge_retired_receipt_bound_objects_for_device_removal(
+                                stable_exclusive_generation,
+                                stable_committed_generation,
+                                remaining,
+                                authorized_receipts,
+                            )?;
+                        aggregate.objects_examined =
+                            aggregate.objects_examined.saturating_add(removed);
+                        aggregate.reclaim_queue_depth =
+                            aggregate.reclaim_queue_depth.saturating_sub(removed);
+                        remaining = remaining.saturating_sub(removed);
+                    }
+                }
+            }
         }
 
         self.replay_placement_mutation_intents()?;
@@ -5212,7 +5696,7 @@ impl Pool {
         }
 
         let marker_path = self.config.root_path.join(DEVICE_REMOVAL_MARKER_FILE);
-        let removal_already_pending = if marker_path.exists() {
+        let existing_removal_marker = if marker_path.exists() {
             let pending_marker = read_device_removal_marker(&marker_path)?;
             if pending_marker.pool_guid != self.pool_guid {
                 return Err(StoreError::InvalidOptions {
@@ -5224,10 +5708,11 @@ impl Pool {
                     reason: "another device removal is already pending",
                 });
             }
-            true
+            Some(pending_marker)
         } else {
-            false
+            None
         };
+        let removal_already_pending = existing_removal_marker.is_some();
 
         let intent_depends_on_target = |observation: &PlacementMutationIntentObservation| {
             observation.source_devices.contains(&target_idx)
@@ -5245,16 +5730,12 @@ impl Pool {
             .any(|observation| intent_depends_on_target(&observation));
         let target_has_pending_reclaim =
             self.device_has_pending_receipt_bound_reclaim(target_idx)?;
-        if target_has_dependent_intent || target_has_pending_reclaim {
-            if removal_already_pending {
-                // Evacuation cutovers retain their intent until the caller
-                // advances the real stable commit/generation boundary and
-                // drains predecessor fragments. The durable marker makes this
-                // an idempotent phase-one retry, not a foreign mutation.
-                return Ok(EvacuationResult::default());
-            }
+        if target_has_pending_reclaim
+            && !target_has_dependent_intent
+            && !removal_already_pending
+        {
             return Err(StoreError::InvalidOptions {
-                reason: "device removal target has unresolved placement mutation or reclaim state",
+                reason: "device removal target has reclaim state not owned by a retained placement mutation",
             });
         }
 
@@ -5271,7 +5752,14 @@ impl Pool {
         // Publish the marker atomically and sync both the file and pool root
         // before evacuation starts. A crash during a retry therefore leaves
         // either the previous complete marker or the new complete marker.
-        persist_device_removal_marker(&self.config.root_path, self.pool_guid, path, target_guid)?;
+        if !removal_already_pending {
+            persist_device_removal_marker(
+                &self.config.root_path,
+                self.pool_guid,
+                path,
+                target_guid,
+            )?;
+        }
 
         // This removal path rewrites every receipt-backed object through the
         // data-class fallback. Keep its candidates inside that I/O class: an
@@ -5298,11 +5786,20 @@ impl Pool {
         for name in [
             crate::reclaim_queue::DEAD_OBJECT_RECLAIM_QUEUE_OBJECT_NAME,
             crate::reclaim_queue::RECLAIM_RECEIPTS_OBJECT_NAME,
+            crate::reclaim_queue::SNAPSHOT_EXTENT_PIN_SET_OBJECT_NAME,
         ] {
             accounted_physical_fragments.extend(
                 self.devices[target_idx]
                     .physical_fragments_for_key(ObjectKey::from_name(name.as_bytes())),
             );
+        }
+        for observation in placement_mutation_intent_inventory(&self.devices)?.into_values() {
+            if observation.source_devices.contains(&target_idx) {
+                accounted_physical_fragments.extend(
+                    self.devices[target_idx]
+                        .physical_fragments_for_key(observation.intent.storage_key()),
+                );
+            }
         }
         let mut placement_receipts = PlacementReceiptInventory::default();
         let mut failed_logical_keys = BTreeSet::new();
@@ -5504,6 +6001,11 @@ impl Pool {
             .any(|observation| intent_depends_on_target(&observation))
             || self.device_has_pending_receipt_bound_reclaim(target_idx)?
         {
+            let mut marker = read_device_removal_marker(&marker_path)?;
+            if matches!(marker.phase, DeviceRemovalPhase::Pending) {
+                marker.phase = DeviceRemovalPhase::Evacuated;
+                persist_device_removal_marker_state(&self.config.root_path, &marker)?;
+            }
             result.complete = false;
             return Ok(result);
         }
@@ -8531,7 +9033,7 @@ mod tests {
         );
         assert_invalid_options_reason_contains(
             pool.get(IoClass::Data, key),
-            "placement receipt payload is unavailable or corrupt",
+            "placement receipt references unavailable device",
         );
 
         let _ = std::fs::remove_dir_all(&root);
@@ -12423,6 +12925,35 @@ mod tests {
                 reason: "device removal marker is corrupt or unverifiable"
             })
         ));
+    }
+
+    #[test]
+    fn device_removal_marker_round_trips_durable_phases_and_exact_fragments() {
+        let target_path = PathBuf::from(OsString::from_vec(b"/dev/data-\xff".to_vec()));
+        let fragment = DeviceObjectFragment {
+            leaf_index: 2,
+            key: ObjectKey::from_name(b"removal-authorized-fragment"),
+        };
+        let phases = [
+            DeviceRemovalPhase::Pending,
+            DeviceRemovalPhase::Evacuated,
+            DeviceRemovalPhase::ReclaimAuthorized {
+                stable_exclusive_generation: 9,
+                stable_committed_generation: 8,
+                fragments: vec![fragment],
+            },
+        ];
+
+        for phase in phases {
+            let marker = DeviceRemovalMarker {
+                pool_guid: [0xa5; 16],
+                target_path: target_path.clone(),
+                target_guid: [0x5a; 16],
+                phase,
+            };
+            let encoded = encode_device_removal_marker_state(&marker).unwrap();
+            assert_eq!(decode_device_removal_marker(&encoded).unwrap(), marker);
+        }
     }
 
     #[test]

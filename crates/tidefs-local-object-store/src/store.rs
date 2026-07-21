@@ -66,9 +66,8 @@ use tidefs_durability_layout::DurabilityLayoutV1;
 use tidefs_gc_pin_set::SnapshotExtentPinSet;
 use tidefs_pool_allocator::{PoolAllocator, PoolAllocatorError, SpacePressureEvent};
 use tidefs_reclaim::{
-    ClearanceEvidence, DrainError, GateDecision, GateDenyReason, ReclaimConfig,
-    ReclaimConsumerConfig, ReclaimConsumerService, ReclaimGate, ReclaimReceipt, ReclaimScheduler,
-    SegmentLiveCounts,
+    DrainError, ReclaimConfig, ReclaimConsumerConfig, ReclaimConsumerService, ReclaimReceipt,
+    ReclaimScheduler, SegmentLiveCounts,
 };
 use tidefs_reclaim_queue_core::{
     BPlusTreeReclaimQueue, DeadObjectReclaimQueue, SegmentLivenessQueue,
@@ -144,29 +143,25 @@ pub struct FreeSegmentCounter {
 }
 
 #[derive(Clone, Debug, Default)]
-struct DeadObjectDrainSegmentResolver {
-    segments: BTreeMap<ReclaimObjectKey, u64>,
-}
-
-impl tidefs_reclaim::SegmentResolver for DeadObjectDrainSegmentResolver {
-    type Error = Infallible;
-
-    fn resolve(&self, key: &ReclaimObjectKey) -> std::result::Result<Option<u64>, Self::Error> {
-        Ok(self.segments.get(key).copied())
-    }
-}
-
-#[derive(Clone, Debug, Default)]
 struct ReceiptBoundDeadObjectDrainPlan {
-    resolver: DeadObjectDrainSegmentResolver,
-    dead_segments: Vec<u64>,
-    eligible_object_ids: BTreeSet<ReclaimObjectKey>,
+    segments: Vec<ReceiptBoundDeadObjectSegmentPlan>,
+    entries_selected: usize,
+    gate_segments_skipped: u64,
+    gate_extents_denied: u64,
 }
 
 impl ReceiptBoundDeadObjectDrainPlan {
     fn current_segment_would_be_reclaimed(&self, current_segment_id: u64) -> bool {
-        self.dead_segments.contains(&current_segment_id)
+        self.segments
+            .iter()
+            .any(|segment| segment.segment_id == current_segment_id)
     }
+}
+
+#[derive(Clone, Debug, Default)]
+struct ReceiptBoundDeadObjectSegmentPlan {
+    segment_id: u64,
+    object_ids: Vec<ReclaimObjectKey>,
 }
 
 /// One verified live-object relocation to publish at a compaction commit boundary.
@@ -208,30 +203,6 @@ struct PersistedCompactionPublishEntry {
     target_location: ObjectLocation,
     new_extent: ExtentMapEntryV2,
     receipt: DeadObjectReplacementReceipt,
-}
-
-#[derive(Clone, Debug)]
-struct CommittedDeadObjectReclaimGate {
-    eligible_object_ids: BTreeSet<ReclaimObjectKey>,
-    stable_committed_txg: u64,
-    snapshot_extent_pin_set: SnapshotExtentPinSet,
-}
-
-impl ReclaimGate for CommittedDeadObjectReclaimGate {
-    fn check_extent(&self, extent_key: &ReclaimObjectKey) -> GateDecision {
-        if !self.eligible_object_ids.contains(extent_key) {
-            return GateDecision::Deny(GateDenyReason::DeadlistReferenced);
-        }
-
-        if self.snapshot_extent_pin_set.is_pinned(extent_key) {
-            return GateDecision::Deny(GateDenyReason::SnapshotPinned);
-        }
-
-        GateDecision::Allow(ClearanceEvidence::Verified {
-            deadlist_committed_txg: self.stable_committed_txg,
-            pin_clearance_epoch: self.snapshot_extent_pin_set.epoch(),
-        })
-    }
 }
 
 /// Error returned by the receipt-bound dead-object drain entry point.
@@ -1550,7 +1521,7 @@ impl LocalObjectStore {
         let fm = SegmentFreeMap::new(2, vec![(0, 1)]).unwrap();
         let free_map = PoolAllocator::new(fm);
 
-        Ok(Self {
+        let mut store = Self {
             root,
             segments_dir,
             options,
@@ -1606,7 +1577,20 @@ impl LocalObjectStore {
             current_dataset_id: None,
             checksums: BTreeMap::new(),
             block_device_mode: true,
-        })
+        };
+        store.reclaim_queue = load_reclaim_queue_entries(&store);
+        store.dead_object_reclaim_queue = load_dead_object_reclaim_queue(&store);
+        store.reclaim_receipts = load_reclaim_receipts(&store)?;
+        store.snapshot_extent_pin_set = load_snapshot_extent_pin_set(&store)?;
+        {
+            let live_counts = store.reclaim_consumer.live_counts_mut();
+            for location in store.index.values() {
+                let count = live_counts.live_count(location.segment_id);
+                live_counts.set_live_count(location.segment_id, count.saturating_add(1));
+            }
+        }
+        store.replay_reclaim_receipts_on_open()?;
+        Ok(store)
     }
 
     fn open_with_mode(
@@ -2938,7 +2922,7 @@ impl LocalObjectStore {
     }
 
     fn replay_reclaim_receipts_on_open(&mut self) -> Result<()> {
-        if self.block_device_mode || sidecar_files_unavailable(&self.segments_dir) {
+        if self.read_only {
             return Ok(());
         }
 
@@ -2953,6 +2937,10 @@ impl LocalObjectStore {
             }
         }
 
+        let mut acknowledged = Vec::new();
+        let mut allocator_changed = false;
+        let sidecar_segments =
+            !self.block_device_mode && !sidecar_files_unavailable(&self.segments_dir);
         for (segment_id, extent_keys) in receipt_extents_by_segment {
             if segment_id == self.current_segment_id
                 || self
@@ -2963,18 +2951,23 @@ impl LocalObjectStore {
                 continue;
             }
 
-            let seg_path = segment_path(&self.segments_dir, segment_id);
-            if seg_path.exists() {
-                if !self.receipt_replay_extents_match_dead_history(segment_id, &extent_keys) {
-                    continue;
+            if !self.receipt_replay_extents_match_dead_history(segment_id, &extent_keys) {
+                continue;
+            }
+
+            if sidecar_segments {
+                let seg_path = segment_path(&self.segments_dir, segment_id);
+                match fs::remove_file(&seg_path) {
+                    Ok(()) => sync_directory(&self.segments_dir)?,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(source) => {
+                        return Err(io_error(
+                            "remove reclaim receipt segment",
+                            &seg_path,
+                            source,
+                        ))
+                    }
                 }
-                if self.read_only {
-                    continue;
-                }
-                fs::remove_file(&seg_path).map_err(|source| {
-                    io_error("remove reclaim receipt segment", &seg_path, source)
-                })?;
-                sync_directory(&self.segments_dir)?;
             }
 
             if !self.free_map.is_free(segment_id) {
@@ -2982,8 +2975,34 @@ impl LocalObjectStore {
                     .add_free(segment_id)
                     .map_err(reclaim_receipt_replay_allocator_error)?;
                 self.free_segment_counter.freed();
+                allocator_changed = true;
             }
             self.reclaim_consumer.live_counts_mut().remove(segment_id);
+
+            for extent_key in extent_keys {
+                let resolved =
+                    match <LocalObjectStore as tidefs_reclaim::SegmentResolver>::resolve(
+                        self,
+                        &extent_key,
+                    ) {
+                        Ok(segment) => segment,
+                        Err(never) => match never {},
+                    };
+                if resolved == Some(segment_id) {
+                    acknowledged.push(extent_key);
+                }
+            }
+        }
+
+        if self
+            .dead_object_reclaim_queue
+            .ack_reclaimed(&acknowledged)
+            != 0
+        {
+            self.dead_object_reclaim_queue_dirty = true;
+        }
+        if allocator_changed || self.dead_object_reclaim_queue_dirty {
+            self.sync_all()?;
         }
 
         Ok(())
@@ -3190,6 +3209,24 @@ impl LocalObjectStore {
         max_count: usize,
     ) -> std::result::Result<tidefs_reclaim::ReclaimConsumerStats, ReceiptBoundDeadObjectDrainError>
     {
+        self.drain_receipt_bound_dead_objects_with_authority(
+            stable_committed_txg,
+            stable_committed_generation,
+            max_count,
+            None,
+        )
+    }
+
+    fn drain_receipt_bound_dead_objects_with_authority(
+        &mut self,
+        stable_committed_txg: u64,
+        stable_committed_generation: u64,
+        max_count: usize,
+        authorized_receipts: Option<
+            &BTreeMap<ReclaimObjectKey, DeadObjectReplacementReceipt>,
+        >,
+    ) -> std::result::Result<tidefs_reclaim::ReclaimConsumerStats, ReceiptBoundDeadObjectDrainError>
+    {
         self.ensure_writable("drain_receipt_bound_dead_objects_at_stable_generation")?;
         if self.dead_object_reclaim_queue_dirty {
             return Ok(tidefs_reclaim::ReclaimConsumerStats {
@@ -3202,74 +3239,125 @@ impl LocalObjectStore {
             stable_committed_txg,
             stable_committed_generation,
             max_count,
+            authorized_receipts,
         );
         if plan.current_segment_would_be_reclaimed(self.current_segment_id) {
             self.rotate_segment()?;
         }
-        // The plan already examined the bounded eligible batch. If it cannot
-        // free any complete segment, skip the consumer's second queue walk.
-        if plan.eligible_object_ids.is_empty() || plan.dead_segments.is_empty() {
+        if plan.segments.is_empty() {
             return Ok(tidefs_reclaim::ReclaimConsumerStats {
-                entries_processed: plan.eligible_object_ids.len(),
+                entries_processed: 0,
                 reclaim_queue_depth: self.dead_object_reclaim_queue.len(),
+                gate_segments_skipped: plan.gate_segments_skipped,
+                gate_extents_denied: plan.gate_extents_denied,
                 ..tidefs_reclaim::ReclaimConsumerStats::ZERO
             });
         }
 
-        let queue_snapshot = self.dead_object_reclaim_queue.clone();
-        let gate = CommittedDeadObjectReclaimGate {
-            eligible_object_ids: plan.eligible_object_ids.clone(),
+        let freed_segment_extents = plan
+            .segments
+            .iter()
+            .flat_map(|segment| {
+                segment.object_ids.iter().copied().map(|object_id| {
+                    tidefs_reclaim::ReclaimReceiptExtent::new(segment.segment_id, object_id)
+                })
+            })
+            .collect();
+        self.reclaim_receipts.push(ReclaimReceipt::new(
+            freed_segment_extents,
             stable_committed_txg,
-            snapshot_extent_pin_set: self.snapshot_extent_pin_set.clone(),
-        };
-        let mut reclaim_consumer = std::mem::replace(
-            &mut self.reclaim_consumer,
-            ReclaimConsumerService::new(ReclaimConsumerConfig::default(), SegmentLiveCounts::new()),
-        );
-        let drain_result = reclaim_consumer.drain_receipt_bound_dead_objects(
-            &queue_snapshot,
-            stable_committed_txg,
-            stable_committed_generation,
-            max_count,
-            &plan.resolver,
-            self,
-            &gate,
-        );
-        self.reclaim_consumer = reclaim_consumer;
-        let drain = drain_result?;
+            self.snapshot_extent_pin_set.epoch(),
+        ));
+        self.reclaim_receipts_dirty = true;
 
-        if drain.ack_object_ids.is_empty() {
-            debug_assert!(drain.receipt.is_none());
-            return Ok(tidefs_reclaim::ReclaimConsumerStats {
-                reclaim_queue_depth: self.dead_object_reclaim_queue.len(),
-                ..drain.stats
-            });
-        }
-
-        if let Some(receipt) = drain.receipt {
-            self.reclaim_receipts.push(receipt);
-            self.reclaim_receipts_dirty = true;
-        }
-
-        let removed = self
-            .dead_object_reclaim_queue
-            .ack_reclaimed(&drain.ack_object_ids);
-        if removed > 0 {
+        let reclaimed_segment_ids: BTreeSet<_> = plan
+            .segments
+            .iter()
+            .map(|segment| segment.segment_id)
+            .collect();
+        let queue_key = ObjectKey::from_name(DEAD_OBJECT_RECLAIM_QUEUE_OBJECT_NAME.as_bytes());
+        if self
+            .index
+            .get(&queue_key)
+            .is_some_and(|location| reclaimed_segment_ids.contains(&location.segment_id))
+        {
+            // Rewrite the still-unacknowledged queue into retained storage at
+            // the first barrier; acknowledgement remains a second-barrier
+            // mutation after physical release.
             self.dead_object_reclaim_queue_dirty = true;
         }
+        let pin_set_key = ObjectKey::from_name(SNAPSHOT_EXTENT_PIN_SET_OBJECT_NAME.as_bytes());
+        if self
+            .index
+            .get(&pin_set_key)
+            .is_some_and(|location| reclaimed_segment_ids.contains(&location.segment_id))
+        {
+            self.snapshot_extent_pin_set_dirty = true;
+        }
+
+        // First durability barrier: commit exact reclaim-receipt evidence
+        // while both the source queue and allocator ownership remain intact.
+        // A segment must not enter the free map before this barrier: metadata
+        // written by sync_all() is allowed to allocate, and early reuse could
+        // otherwise overwrite a selected segment before physical release.
+        // Recovery can finish release from the durable receipt after a crash.
+        self.sync_all()?;
 
         if !self.block_device_mode {
-            for segment_id in &drain.reclaimed_segment_ids {
-                let seg_path = segment_path(&self.segments_dir, *segment_id);
-                let _ = std::fs::remove_file(&seg_path);
+            for segment in &plan.segments {
+                let seg_path = segment_path(&self.segments_dir, segment.segment_id);
+                match fs::remove_file(&seg_path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(source) => {
+                        return Err(io_error("remove reclaimed segment", &seg_path, source).into())
+                    }
+                }
+            }
+            sync_directory(&self.segments_dir)?;
+        }
+
+        // Physical release is now complete (or, for an in-place block image,
+        // the durable receipt is the release boundary). Only now may the
+        // allocator advertise these segments as reusable.
+        for segment in &plan.segments {
+            if !self.free_map.is_free(segment.segment_id) {
+                self.free_map
+                    .add_free(segment.segment_id)
+                    .map_err(reclaim_receipt_replay_allocator_error)?;
+                self.free_segment_counter.freed();
             }
         }
 
+        let acknowledged: Vec<_> = plan
+            .segments
+            .iter()
+            .flat_map(|segment| segment.object_ids.iter().copied())
+            .collect();
+        let removed = self
+            .dead_object_reclaim_queue
+            .ack_reclaimed(&acknowledged);
+        if removed != 0 {
+            self.dead_object_reclaim_queue_dirty = true;
+        }
+        // Second durability barrier: queue acknowledgement is never allowed
+        // to outrun committed receipt/free-map evidence or physical release.
         self.sync_all()?;
 
+        for segment in &plan.segments {
+            self.reclaim_consumer
+                .live_counts_mut()
+                .remove(segment.segment_id);
+        }
+
         Ok(tidefs_reclaim::ReclaimConsumerStats {
+            entries_processed: plan.entries_selected,
+            segments_reclaimed: plan.segments.len() as u64,
+            blocks_freed: removed as u64,
             reclaim_queue_depth: self.dead_object_reclaim_queue.len(),
-            ..drain.stats
+            gate_segments_skipped: plan.gate_segments_skipped,
+            gate_extents_denied: plan.gate_extents_denied,
+            checkpoint_batches: usize::from(!plan.segments.is_empty()),
         })
     }
 
@@ -3288,42 +3376,198 @@ impl LocalObjectStore {
         stable_committed_txg: u64,
         stable_committed_generation: u64,
         max_count: usize,
+        authorized_receipts: &BTreeMap<ReclaimObjectKey, DeadObjectReplacementReceipt>,
     ) -> std::result::Result<tidefs_reclaim::ReclaimConsumerStats, ReceiptBoundDeadObjectDrainError>
     {
         self.ensure_writable("retire_and_drain_receipt_bound_dead_objects_at_stable_generation")?;
         if self.dead_object_reclaim_queue_dirty {
             self.sync_all()?;
         }
+        if max_count == 0 {
+            return Ok(tidefs_reclaim::ReclaimConsumerStats {
+                reclaim_queue_depth: self.dead_object_reclaim_queue.len(),
+                ..tidefs_reclaim::ReclaimConsumerStats::ZERO
+            });
+        }
 
-        let limit = max_count.min(self.reclaim_consumer.config().max_entries_per_drain);
         let eligible = self
             .dead_object_reclaim_queue
-            .dequeue_receipt_bound_batch_with_stable_generation(
-                limit,
-                stable_committed_txg,
-                stable_committed_generation,
-            );
-        let mut retired = false;
+            .all_entries()
+            .into_iter()
+            .filter(|entry| {
+                entry.is_receipt_bound_reclaimable_with_stable_generation(
+                    stable_committed_txg,
+                    stable_committed_generation,
+                ) && authorized_receipts.get(&entry.object_id)
+                    == entry.replacement_receipt.as_ref()
+            })
+            .collect::<Vec<_>>();
+        let mut retirement_groups: BTreeMap<u64, Vec<DeadObjectEntry>> = BTreeMap::new();
         for entry in eligible {
-            let key = ObjectKey(entry.object_id.0);
-            if self.index.contains_key(&key) {
-                self.delete(key)?;
-                retired = true;
+            if self.snapshot_extent_pin_set.is_pinned(&entry.object_id) {
+                continue;
+            }
+            if let Some(location) = self.index.get(&ObjectKey(entry.object_id.0)) {
+                retirement_groups
+                    .entry(location.segment_id)
+                    .or_default()
+                    .push(entry);
+            }
+        }
+        let mut retired = false;
+        let mut retired_count = 0usize;
+        for entries in retirement_groups.into_values() {
+            if retired_count >= max_count {
+                break;
+            }
+            // The object budget is soft at a segment boundary. Retire the
+            // whole selected segment so a dense segment can make progress.
+            for entry in entries {
+                let key = ObjectKey(entry.object_id.0);
+                if self.index.contains_key(&key) {
+                    self.delete(key)?;
+                    retired = true;
+                    retired_count = retired_count.saturating_add(1);
+                }
             }
         }
         if retired {
             self.sync_all()?;
         }
 
-        self.drain_receipt_bound_dead_objects_at_stable_generation(
+        self.drain_receipt_bound_dead_objects_with_authority(
             stable_committed_txg,
             stable_committed_generation,
             max_count,
+            Some(authorized_receipts),
         )
     }
 
     pub(crate) fn receipt_bound_dead_object_queue_depth(&self) -> usize {
         self.dead_object_reclaim_queue.len()
+    }
+
+    pub(crate) fn reclaim_receipt_covers_object(&self, object_id: ReclaimObjectKey) -> bool {
+        self.reclaim_receipts
+            .iter()
+            .any(|receipt| receipt.freed_extents.contains(&object_id))
+    }
+
+    pub(crate) fn device_removal_reclaim_is_acknowledged(
+        &self,
+        object_id: ReclaimObjectKey,
+    ) -> bool {
+        let key = ObjectKey(object_id.0);
+        !self.index.contains_key(&key)
+            && !self
+                .dead_object_reclaim_queue
+                .all_entries()
+                .iter()
+                .any(|entry| entry.object_id == object_id)
+    }
+
+    pub(crate) fn device_removal_reclaim_authority_is_ready(
+        &self,
+        stable_committed_txg: u64,
+        stable_committed_generation: u64,
+        authorized_receipts: &BTreeMap<ReclaimObjectKey, DeadObjectReplacementReceipt>,
+    ) -> bool {
+        let entries: BTreeMap<_, _> = self
+            .dead_object_reclaim_queue
+            .all_entries()
+            .into_iter()
+            .map(|entry| (entry.object_id, entry))
+            .collect();
+        authorized_receipts.iter().all(|(object_id, expected)| {
+            if self.reclaim_receipt_covers_object(*object_id) {
+                return true;
+            }
+            let Some(entry) = entries.get(object_id) else {
+                return false;
+            };
+            entry.replacement_receipt.as_ref() == Some(expected)
+                && entry.is_receipt_bound_reclaimable_with_stable_generation(
+                    stable_committed_txg,
+                    stable_committed_generation,
+                )
+                && !self.snapshot_extent_pin_set.is_pinned(object_id)
+                && !self.index.contains_key(&ObjectKey(object_id.0))
+        })
+    }
+
+    /// Durably relocate current records that share segments with exact,
+    /// device-removal-owned predecessor fragments.
+    ///
+    /// Ordinary reclaim never rewrites unrelated live records implicitly.
+    /// Device evacuation is different: its durable marker owns a bounded
+    /// compaction phase needed to make the retiring predecessor segments
+    /// physically releasable without weakening the zero-live-index gate.
+    pub(crate) fn relocate_live_records_for_device_removal_reclaim(
+        &mut self,
+        stable_committed_txg: u64,
+        stable_committed_generation: u64,
+        authorized_receipts: &BTreeMap<ReclaimObjectKey, DeadObjectReplacementReceipt>,
+    ) -> Result<usize> {
+        self.ensure_writable("relocate_live_records_for_device_removal_reclaim")?;
+        if self.block_device_mode || authorized_receipts.is_empty() {
+            return Ok(0);
+        }
+
+        let mut blocked_segments = BTreeSet::new();
+        for entry in self.dead_object_reclaim_queue.all_entries() {
+            if authorized_receipts.get(&entry.object_id) != entry.replacement_receipt.as_ref()
+                || !entry.is_receipt_bound_reclaimable_with_stable_generation(
+                    stable_committed_txg,
+                    stable_committed_generation,
+                )
+                || self.snapshot_extent_pin_set.is_pinned(&entry.object_id)
+                || self.index.contains_key(&ObjectKey(entry.object_id.0))
+            {
+                continue;
+            }
+            let segment_id =
+                match <LocalObjectStore as tidefs_reclaim::SegmentResolver>::resolve(
+                    self,
+                    &entry.object_id,
+                ) {
+                    Ok(Some(segment_id)) => segment_id,
+                    Ok(None) => continue,
+                    Err(never) => match never {},
+                };
+            if self
+                .index
+                .values()
+                .any(|location| location.segment_id == segment_id)
+            {
+                blocked_segments.insert(segment_id);
+            }
+        }
+        if blocked_segments.is_empty() {
+            return Ok(0);
+        }
+
+        if blocked_segments.contains(&self.current_segment_id) {
+            self.rotate_segment()?;
+        }
+        let live_records: Vec<_> = self
+            .index
+            .iter()
+            .filter(|(_, location)| blocked_segments.contains(&location.segment_id))
+            .map(|(key, location)| Ok((*key, self.read_location(*location)?)))
+            .collect::<Result<_>>()?;
+        for (key, payload) in &live_records {
+            self.put_direct(*key, payload)?;
+        }
+        self.sync_all()?;
+
+        if self.index.values().any(|location| {
+            blocked_segments.contains(&location.segment_id)
+        }) {
+            return Err(StoreError::InvalidOptions {
+                reason: "device-removal reclaim relocation left a live record in a predecessor segment",
+            });
+        }
+        Ok(live_records.len())
     }
 
     /// Acknowledge stably retired records whose containing device is covered
@@ -3339,20 +3583,32 @@ impl LocalObjectStore {
         stable_committed_txg: u64,
         stable_committed_generation: u64,
         max_count: usize,
+        authorized_receipts: &BTreeMap<ReclaimObjectKey, DeadObjectReplacementReceipt>,
     ) -> std::result::Result<usize, ReceiptBoundDeadObjectDrainError> {
         self.ensure_writable("acknowledge_retired_receipt_bound_objects_for_device_removal")?;
         if self.dead_object_reclaim_queue_dirty {
             self.sync_all()?;
         }
+        if max_count == 0 {
+            return Ok(0);
+        }
         let entries = self
             .dead_object_reclaim_queue
-            .dequeue_receipt_bound_batch_with_stable_generation(
-                max_count,
-                stable_committed_txg,
-                stable_committed_generation,
-            );
+            .all_entries()
+            .into_iter()
+            .filter(|entry| {
+                entry.is_receipt_bound_reclaimable_with_stable_generation(
+                    stable_committed_txg,
+                    stable_committed_generation,
+                ) && authorized_receipts.get(&entry.object_id)
+                    == entry.replacement_receipt.as_ref()
+            })
+            .take(max_count);
         let mut acknowledged = Vec::new();
         for entry in entries {
+            if self.snapshot_extent_pin_set.is_pinned(&entry.object_id) {
+                continue;
+            }
             let key = ObjectKey(entry.object_id.0);
             let historical_segment =
                 match <LocalObjectStore as tidefs_reclaim::SegmentResolver>::resolve(
@@ -3384,28 +3640,19 @@ impl LocalObjectStore {
         stable_committed_txg: u64,
         stable_committed_generation: u64,
         max_count: usize,
+        authorized_receipts: Option<
+            &BTreeMap<ReclaimObjectKey, DeadObjectReplacementReceipt>,
+        >,
     ) -> ReceiptBoundDeadObjectDrainPlan {
-        let limit = max_count.min(self.reclaim_consumer.config().max_entries_per_drain);
-        let entries = self
-            .dead_object_reclaim_queue
-            .dequeue_receipt_bound_batch_with_stable_generation(
-                limit,
-                stable_committed_txg,
-                stable_committed_generation,
-            );
-        let mut resolver = DeadObjectDrainSegmentResolver::default();
-        let mut eligible_object_ids = BTreeSet::new();
-        let mut segment_refdrops: std::collections::HashMap<u64, u64> =
-            std::collections::HashMap::new();
-        let mut segment_queued_entries: std::collections::HashMap<u64, u64> =
-            std::collections::HashMap::new();
-        let mut indexed_live_records: std::collections::HashMap<u64, u64> =
-            std::collections::HashMap::new();
-        for location in self.index.values() {
-            *indexed_live_records.entry(location.segment_id).or_default() += 1;
+        if max_count == 0 {
+            return ReceiptBoundDeadObjectDrainPlan::default();
         }
 
-        for entry in self.dead_object_reclaim_queue.all_entries() {
+        let all_entries = self.dead_object_reclaim_queue.all_entries();
+        let mut all_by_segment: BTreeMap<u64, BTreeSet<ReclaimObjectKey>> = BTreeMap::new();
+        let mut eligible_by_segment: BTreeMap<u64, BTreeSet<ReclaimObjectKey>> = BTreeMap::new();
+
+        for entry in &all_entries {
             let Ok(Some(segment_id)) =
                 <LocalObjectStore as tidefs_reclaim::SegmentResolver>::resolve(
                     self,
@@ -3414,42 +3661,72 @@ impl LocalObjectStore {
             else {
                 continue;
             };
-            resolver.segments.insert(entry.object_id, segment_id);
-            *segment_queued_entries.entry(segment_id).or_default() += 1;
+            all_by_segment
+                .entry(segment_id)
+                .or_default()
+                .insert(entry.object_id);
+            let authority_matches = authorized_receipts.is_none_or(|authorized| {
+                authorized.get(&entry.object_id) == entry.replacement_receipt.as_ref()
+            });
+            if authority_matches
+                && entry.is_receipt_bound_reclaimable_with_stable_generation(
+                    stable_committed_txg,
+                    stable_committed_generation,
+                )
+            {
+                eligible_by_segment
+                    .entry(segment_id)
+                    .or_default()
+                    .insert(entry.object_id);
+            }
         }
 
-        for entry in entries {
-            let Some(segment_id) = resolver.segments.get(&entry.object_id).copied() else {
+        let mut segments = Vec::new();
+        let mut selected_entries = 0usize;
+        let mut gate_segments_skipped = 0u64;
+        let mut gate_extents_denied = 0u64;
+
+        for (segment_id, object_ids) in eligible_by_segment {
+            if selected_entries >= max_count && !segments.is_empty() {
+                break;
+            }
+            if all_by_segment.get(&segment_id) != Some(&object_ids) {
                 continue;
-            };
-            eligible_object_ids.insert(entry.object_id);
-            *segment_refdrops.entry(segment_id).or_default() += 1;
-        }
+            }
+            // A segment can be released only when no currently indexed
+            // record points into it. Reclaim refdrops never cancel unrelated
+            // live product or internal metadata records.
+            let rewritten_metadata_keys = [
+                ObjectKey::from_name(DEAD_OBJECT_RECLAIM_QUEUE_OBJECT_NAME.as_bytes()),
+                ObjectKey::from_name(RECLAIM_RECEIPTS_OBJECT_NAME.as_bytes()),
+                ObjectKey::from_name(SNAPSHOT_EXTENT_PIN_SET_OBJECT_NAME.as_bytes()),
+            ];
+            if self.index.iter().any(|(key, location)| {
+                location.segment_id == segment_id && !rewritten_metadata_keys.contains(key)
+            }) {
+                continue;
+            }
+            if object_ids
+                .iter()
+                .any(|object_id| self.snapshot_extent_pin_set.is_pinned(object_id))
+            {
+                gate_segments_skipped += 1;
+                gate_extents_denied += 1;
+                continue;
+            }
 
-        let dead_segments = segment_refdrops
-            .into_iter()
-            .filter_map(|(segment_id, refdrops)| {
-                // The consumer's accounting intentionally omits some
-                // internal records from product statistics. Physical segment
-                // reclaim cannot: a live mutation intent, receipt, queue, or
-                // other indexed record must keep its containing segment.
-                let live_count = self
-                    .reclaim_consumer
-                    .live_counts()
-                    .live_count(segment_id)
-                    .max(indexed_live_records.get(&segment_id).copied().unwrap_or(0));
-                let queued_entries = segment_queued_entries
-                    .get(&segment_id)
-                    .copied()
-                    .unwrap_or(refdrops);
-                (live_count <= refdrops && queued_entries == refdrops).then_some(segment_id)
-            })
-            .collect();
+            selected_entries = selected_entries.saturating_add(object_ids.len());
+            segments.push(ReceiptBoundDeadObjectSegmentPlan {
+                segment_id,
+                object_ids: object_ids.into_iter().collect(),
+            });
+        }
 
         ReceiptBoundDeadObjectDrainPlan {
-            resolver,
-            dead_segments,
-            eligible_object_ids,
+            segments,
+            entries_selected: selected_entries,
+            gate_segments_skipped,
+            gate_extents_denied,
         }
     }
 
@@ -4640,15 +4917,10 @@ impl LocalObjectStore {
     }
 
     pub fn sync_all(&mut self) -> Result<()> {
-        if self.dead_object_reclaim_queue_dirty {
-            let queue = std::mem::replace(
-                &mut self.dead_object_reclaim_queue,
-                DeadObjectReclaimQueue::new(),
-            );
-            let result = store_dead_object_reclaim_queue(&queue, self);
-            self.dead_object_reclaim_queue = queue;
-            result?;
-            self.dead_object_reclaim_queue_dirty = false;
+        if self.snapshot_extent_pin_set_dirty {
+            let pin_set = self.snapshot_extent_pin_set.clone();
+            store_snapshot_extent_pin_set(&pin_set, self)?;
+            self.snapshot_extent_pin_set_dirty = false;
         }
 
         if self.reclaim_receipts_dirty {
@@ -4659,10 +4931,19 @@ impl LocalObjectStore {
             self.reclaim_receipts_dirty = false;
         }
 
-        if self.snapshot_extent_pin_set_dirty {
-            let pin_set = self.snapshot_extent_pin_set.clone();
-            store_snapshot_extent_pin_set(&pin_set, self)?;
-            self.snapshot_extent_pin_set_dirty = false;
+        // Reclaim queue removal is deliberately persisted after snapshot-pin
+        // state and reclaim receipts. Receipt-bound drains place a separate
+        // durability barrier before setting this dirty bit, so acknowledged
+        // work can never outrun the evidence needed to replay physical release.
+        if self.dead_object_reclaim_queue_dirty {
+            let queue = std::mem::replace(
+                &mut self.dead_object_reclaim_queue,
+                DeadObjectReclaimQueue::new(),
+            );
+            let result = store_dead_object_reclaim_queue(&queue, self);
+            self.dead_object_reclaim_queue = queue;
+            result?;
+            self.dead_object_reclaim_queue_dirty = false;
         }
 
         let path = segment_path(&self.segments_dir, self.current_segment_id);
@@ -8054,7 +8335,7 @@ mod block_device_open_tests {
     }
 
     #[test]
-    fn block_device_receipt_bound_drain_keeps_backing_image() {
+    fn block_device_receipt_bound_drain_keeps_uncompacted_debt_and_backing_image() {
         let dir = tempdir().expect("tempdir");
         let image = create_block_image(&dir);
         let mut store = LocalObjectStore::open_block_device(&image, block_options(80 * 1024))
@@ -8080,13 +8361,19 @@ mod block_device_open_tests {
             .drain_receipt_bound_dead_objects_at_stable_generation(2, 1, 16)
             .expect("drain receipt-bound dead object");
 
-        assert_eq!(stats.reclaim_queue_depth, 0);
+        assert_eq!(stats.segments_reclaimed, 0);
+        assert_eq!(stats.reclaim_queue_depth, 1);
         assert!(image.exists(), "block backing image must not be unlinked");
         drop(store);
 
         let reopened = LocalObjectStore::open_block_device(&image, block_options(80 * 1024))
             .expect("reopen block image");
         assert_eq!(reopened.get(key).expect("get reopened deleted"), None);
+        assert_eq!(
+            reopened.receipt_bound_dead_object_queue_depth(),
+            1,
+            "single-segment block media must retain physical-reclaim debt until compaction"
+        );
     }
 }
 
@@ -8949,7 +9236,7 @@ mod reclaim_queue_production_tests {
         let held = store
             .drain_receipt_bound_dead_objects_at_stable_generation(1, 1, 16)
             .expect("snapshot-pinned snapshot-deadlist drain");
-        assert_eq!(held.entries_processed, 1);
+        assert_eq!(held.entries_processed, 0);
         assert_eq!(held.segments_reclaimed, 0);
         assert_eq!(held.gate_extents_denied, 1);
         assert_eq!(held.gate_segments_skipped, 1);
@@ -9146,7 +9433,7 @@ mod reclaim_queue_production_tests {
             .drain_receipt_bound_dead_objects_at_stable_generation(1, 1, 16)
             .expect("snapshot-pinned drain");
 
-        assert_eq!(held.entries_processed, 1);
+        assert_eq!(held.entries_processed, 0);
         assert_eq!(held.segments_reclaimed, 0);
         assert_eq!(held.gate_extents_denied, 1);
         assert_eq!(held.gate_segments_skipped, 1);
@@ -9219,7 +9506,7 @@ mod reclaim_queue_production_tests {
             .drain_receipt_bound_dead_objects_at_stable_generation(1, 1, 16)
             .expect("snapshot-pinned drain after reopen");
 
-        assert_eq!(held.entries_processed, 1);
+        assert_eq!(held.entries_processed, 0);
         assert_eq!(held.segments_reclaimed, 0);
         assert_eq!(held.gate_extents_denied, 1);
         assert_eq!(held.gate_segments_skipped, 1);
@@ -9283,9 +9570,14 @@ mod reclaim_queue_production_tests {
         let partial = store
             .drain_receipt_bound_dead_objects_at_stable_generation(1, 1, 1)
             .expect("partial receipt-bound drain");
-        assert_eq!(partial.entries_processed, 1);
+        // The entry budget is soft at a segment boundary: selecting only one
+        // of these two entries would make this dense segment permanently
+        // unreclaimable. The pin gate rejects the complete segment before any
+        // entry is selected or released.
+        assert_eq!(partial.entries_processed, 0);
         assert_eq!(partial.segments_reclaimed, 0);
-        assert_eq!(partial.gate_extents_denied, 0);
+        assert_eq!(partial.gate_extents_denied, 1);
+        assert_eq!(partial.gate_segments_skipped, 1);
         assert_eq!(partial.reclaim_queue_depth, 2);
         assert_eq!(store.dead_object_reclaim_queue.len(), 2);
         assert!(store.reclaim_receipts().is_empty());
@@ -9297,7 +9589,7 @@ mod reclaim_queue_production_tests {
         let held = store
             .drain_receipt_bound_dead_objects_at_stable_generation(1, 1, 16)
             .expect("full pinned drain");
-        assert_eq!(held.entries_processed, 2);
+        assert_eq!(held.entries_processed, 0);
         assert_eq!(held.segments_reclaimed, 0);
         assert_eq!(held.gate_extents_denied, 1);
         assert_eq!(held.gate_segments_skipped, 1);
@@ -9311,7 +9603,7 @@ mod reclaim_queue_production_tests {
 
         assert_eq!(store.release_snapshot_extent_pins(snapshot_id), 2);
         let freed = store
-            .drain_receipt_bound_dead_objects_at_stable_generation(1, 1, 16)
+            .drain_receipt_bound_dead_objects_at_stable_generation(1, 1, 1024)
             .expect("released full drain");
         assert_eq!(freed.entries_processed, 2);
         assert_eq!(freed.segments_reclaimed, 1);
@@ -9346,6 +9638,71 @@ mod reclaim_queue_production_tests {
             !segment_path(&store.segments_dir, segment_id).exists(),
             "released pins should allow the segment to be physically reclaimed"
         );
+    }
+
+    #[test]
+    fn receipt_bound_dead_object_drain_advances_one_dense_segment_past_batch_limit() {
+        const ENTRY_COUNT: usize = 1025;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut options = StoreOptions::test_fast();
+        options.max_segment_bytes = 8 * 1024 * 1024;
+        options.segment_count = tidefs_spacemap_allocator::DEFAULT_SEGMENT_GROUP_SEGMENTS;
+        let mut store = LocalObjectStore::open_with_options(dir.path(), options).unwrap();
+        let mut keys = Vec::with_capacity(ENTRY_COUNT);
+        let mut source_segments = BTreeSet::new();
+
+        for ordinal in 0..ENTRY_COUNT {
+            let key = ObjectKey::from_name(format!("dense-reclaim/{ordinal}"));
+            store.put(key, &[ordinal as u8]).unwrap();
+            source_segments.insert(store.index.get(&key).unwrap().segment_id);
+            keys.push(key);
+        }
+        assert_eq!(source_segments.len(), 1, "dense fixture must use one segment");
+        for key in &keys {
+            assert!(store.delete(*key).unwrap());
+            let object_id = reclaim_key(*key);
+            assert!(store.dead_object_reclaim_queue.enqueue(
+                dead_object_entry_for_key(object_id, 0, true, 1)
+            ));
+        }
+        store.dead_object_reclaim_queue_dirty = true;
+        store.sync_all().unwrap();
+
+        let drained = store
+            .drain_receipt_bound_dead_objects_at_stable_generation(1, 1, 16)
+            .unwrap();
+        assert_eq!(drained.entries_processed, ENTRY_COUNT);
+        assert_eq!(drained.blocks_freed, ENTRY_COUNT as u64);
+        assert_eq!(drained.segments_reclaimed, 1);
+        assert_eq!(drained.reclaim_queue_depth, 0);
+    }
+
+    #[test]
+    fn receipt_bound_dead_object_drain_retains_mixed_live_segment_and_debt() {
+        let (mut store, _dir) = temp_store();
+        let dead = ObjectKey::from_name(b"mixed-reclaim/dead");
+        let live = ObjectKey::from_name(b"mixed-reclaim/live");
+        store.put(dead, b"dead payload").unwrap();
+        let segment_id = store.index.get(&dead).unwrap().segment_id;
+        store.put(live, b"live payload").unwrap();
+        assert_eq!(store.index.get(&live).unwrap().segment_id, segment_id);
+        assert!(store.delete(dead).unwrap());
+        let dead_id = reclaim_key(dead);
+        assert!(store
+            .enqueue_receipt_bound_dead_object(dead_object_entry_for_key(
+                dead_id, 0, true, 1,
+            ))
+            .unwrap());
+
+        let held = store
+            .drain_receipt_bound_dead_objects_at_stable_generation(1, 1, 16)
+            .unwrap();
+        assert_eq!(held.entries_processed, 0);
+        assert_eq!(held.segments_reclaimed, 0);
+        assert_eq!(held.reclaim_queue_depth, 1);
+        assert_eq!(store.get(live).unwrap(), Some(b"live payload".to_vec()));
+        assert!(segment_path(&store.segments_dir, segment_id).exists());
+        assert!(!store.reclaim_receipt_covers_object(dead_id));
     }
 
     #[test]
@@ -9412,6 +9769,15 @@ mod reclaim_queue_production_tests {
                 .segment_id;
             assert_ne!(old_segment_id, replacement_segment_id);
 
+            assert!(store
+                .enqueue_receipt_bound_dead_object(dead_object_entry_for_key(
+                    reclaim_key,
+                    5,
+                    true,
+                    1,
+                ))
+                .expect("persist queue before simulated evidence-first crash"));
+
             store.reclaim_receipts.push(ReclaimReceipt::new(
                 vec![ReclaimReceiptExtent::new(old_segment_id, reclaim_key)],
                 6,
@@ -9435,7 +9801,16 @@ mod reclaim_queue_production_tests {
         assert_eq!(reopened.free_segment_count(), free_before_replay + 1);
         assert!(!segment_path(&segments_dir, old_segment_id).exists());
         assert!(segment_path(&segments_dir, replacement_segment_id).exists());
-        assert_eq!(reopened.get(key).unwrap(), Some(new_payload));
+        assert!(reopened.dead_object_reclaim_queue.is_empty());
+        assert_eq!(reopened.get(key).unwrap(), Some(new_payload.clone()));
+        drop(reopened);
+
+        let reopened_again =
+            LocalObjectStore::open_with_options(dir.path(), receipt_replay_options())
+                .expect("second reopen keeps receipt replay idempotent");
+        assert!(reopened_again.dead_object_reclaim_queue.is_empty());
+        assert!(!segment_path(&segments_dir, old_segment_id).exists());
+        assert_eq!(reopened_again.get(key).unwrap(), Some(new_payload));
     }
 
     #[test]
