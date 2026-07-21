@@ -5788,19 +5788,32 @@ impl Pool {
         let mut result = EvacuationResult::default();
 
         let mut accounted_physical_fragments = BTreeSet::new();
-        // A completed stable drain leaves an empty persisted queue and its
-        // reclaim receipt log on the retiring leaf. The queue depth was
-        // checked above; these two device-local records are therefore
-        // acknowledged cleanup metadata, not unreceipted product objects.
-        for name in [
-            crate::reclaim_queue::DEAD_OBJECT_RECLAIM_QUEUE_OBJECT_NAME,
-            crate::reclaim_queue::RECLAIM_RECEIPTS_OBJECT_NAME,
-            crate::reclaim_queue::SNAPSHOT_EXTENT_PIN_SET_OBJECT_NAME,
-        ] {
-            accounted_physical_fragments.extend(
+        // Reclaim logs and snapshot pins are leaf-local authority. Recognized
+        // filenames alone cannot make them disposable: every physical leaf
+        // must prove an exact, persisted, terminal cleanup state first.
+        let reclaim_cleanup_is_terminal = (0..self.devices[target_idx].physical_leaf_count())
+            .map(|leaf_index| {
                 self.devices[target_idx]
-                    .physical_fragments_for_key(ObjectKey::from_name(name.as_bytes())),
-            );
+                    .physical_store(leaf_index)
+                    .ok_or(StoreError::InvalidOptions {
+                        reason: "device removal cannot inspect a physical leaf",
+                    })?
+                    .device_removal_reclaim_cleanup_is_terminal()
+            })
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .all(|terminal| terminal);
+        if reclaim_cleanup_is_terminal {
+            for name in [
+                crate::reclaim_queue::DEAD_OBJECT_RECLAIM_QUEUE_OBJECT_NAME,
+                crate::reclaim_queue::RECLAIM_RECEIPTS_OBJECT_NAME,
+                crate::reclaim_queue::SNAPSHOT_EXTENT_PIN_SET_OBJECT_NAME,
+            ] {
+                accounted_physical_fragments.extend(
+                    self.devices[target_idx]
+                        .physical_fragments_for_key(ObjectKey::from_name(name.as_bytes())),
+                );
+            }
         }
         for observation in placement_mutation_intent_inventory(&self.devices)?.into_values() {
             if observation.source_devices.contains(&target_idx) {
@@ -12071,6 +12084,71 @@ mod tests {
     }
 
     #[test]
+    fn safe_remove_device_refuses_nonempty_snapshot_pins() {
+        let root = temp_dir("safe-remove-snapshot-pins");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = multi_data_device_config(&root, 2);
+        let mut pool = Pool::create(config, PoolProperties::default(), &test_options()).unwrap();
+        let target_path = pool.devices[0].root().to_path_buf();
+        let pinned_extent = ReclaimObjectKey([0x5a; 32]);
+
+        pool.devices[0]
+            .store_mut()
+            .pin_snapshot_extent("live-snapshot", pinned_extent);
+        pool.devices[0].sync_all().unwrap();
+
+        let refused = pool.safe_remove_device(&target_path).unwrap();
+        assert!(!refused.complete);
+        assert!(refused.failed_keys.contains(&ObjectKey::from_name(
+            crate::reclaim_queue::SNAPSHOT_EXTENT_PIN_SET_OBJECT_NAME.as_bytes(),
+        )));
+        assert_eq!(pool.stats().device_count, 2);
+
+        assert_eq!(
+            pool.devices[0]
+                .store_mut()
+                .release_snapshot_extent_pins("live-snapshot"),
+            1
+        );
+        pool.devices[0].sync_all().unwrap();
+
+        let completed = pool.safe_remove_device(&target_path).unwrap();
+        assert!(completed.complete, "{completed:?}");
+        assert_eq!(pool.stats().device_count, 1);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn safe_remove_device_refuses_corrupt_snapshot_pin_metadata() {
+        let root = temp_dir("safe-remove-corrupt-snapshot-pins");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = multi_data_device_config(&root, 2);
+        let mut pool = Pool::create(config, PoolProperties::default(), &test_options()).unwrap();
+        let target_path = pool.devices[0].root().to_path_buf();
+
+        pool.devices[0]
+            .store_mut()
+            .put_named(
+                crate::reclaim_queue::SNAPSHOT_EXTENT_PIN_SET_OBJECT_NAME,
+                b"corrupt snapshot pins",
+            )
+            .unwrap();
+        pool.devices[0].sync_all().unwrap();
+
+        assert!(matches!(
+            pool.safe_remove_device(&target_path),
+            Err(StoreError::InvalidOptions {
+                reason: "snapshot extent pin set log invalid magic"
+            })
+        ));
+        assert_eq!(pool.stats().device_count, 2);
+        assert!(root.join(DEVICE_REMOVAL_MARKER_FILE).exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn safe_remove_device_refuses_unverifiable_survivor_receipts() {
         let root = temp_dir("safe-remove-unverifiable-survivor-receipts");
         let _ = std::fs::remove_dir_all(&root);
@@ -12789,8 +12867,7 @@ mod tests {
         let reduced_config = pool2.config.clone();
         drop(pool2);
 
-        let pool3 =
-            Pool::open(reduced_config, PoolProperties::default(), &test_options()).unwrap();
+        let pool3 = Pool::open(reduced_config, PoolProperties::default(), &test_options()).unwrap();
         assert!(marker_path.exists());
         assert_eq!(pool3.stats().device_count, 1);
         assert_eq!(pool3.get(IoClass::Data, key1).unwrap(), Some(data1));
