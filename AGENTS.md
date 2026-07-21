@@ -60,8 +60,10 @@ machinery. It must name the product risk and current consumer; test-count
 - Keep build output outside the repository, normally in
   `/root/ai/tmp/tidefs-target-codexN`.
 - Check disk headroom before work, before heavy validation, and after creating
-  large artifacts. Do not start or continue heavy validation when `/root` has
-  less than 20 percent free or less than 50 GiB free.
+  large artifacts. Compare a heavy run's measured or conservatively estimated
+  peak with available space. If it cannot fit while leaving enough space to
+  abort and remove this task's own output, use a focused run or ask the
+  operator; do not invent a fixed host threshold or delete another task's data.
 - Use the narrowest checks that cover the changed risk. Reserve broad xfstests,
   RDMA, kernel, distributed, and release-candidate runs for relevant pull
   request or milestone gates.
