@@ -138,8 +138,14 @@ pub struct EvacuationResult {
     pub failed_keys: Vec<ObjectKey>,
     /// BLAKE3 content digests of evacuated objects (key -> digest).
     pub content_digests: BTreeMap<ObjectKey, [u8; 32]>,
-    /// Whether all objects were evacuated successfully.
+    /// Whether the caller's full durable removal boundary completed.
+    ///
+    /// Pool removal keeps this false after successful evacuation and an
+    /// in-memory detach until the surviving topology is durably committed.
     pub complete: bool,
+    /// Whether evacuation succeeded and the current Pool detached the target,
+    /// but durable topology publication is still unavailable.
+    pub topology_commit_pending: bool,
 }
 
 // ---------------------------------------------------------------------------

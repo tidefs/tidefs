@@ -5524,9 +5524,11 @@ impl Pool {
         }
     }
 
-    /// Remove a device by path. The device must be quiesced first (data on it
-    /// will be unavailable after removal).
-    pub fn remove_device(&mut self, path: &Path) -> Result<()> {
+    /// Detach an already-evacuated device from this Pool instance.
+    ///
+    /// This does not publish durable topology and therefore must remain behind
+    /// [`Self::safe_remove_device`].
+    fn remove_device(&mut self, path: &Path) -> Result<()> {
         let next_topology_epoch = self.next_placement_epoch()?;
         let idx = self.devices.iter().position(|v| v.root() == path).ok_or(
             StoreError::InvalidOptions {
@@ -5621,7 +5623,10 @@ impl Pool {
     /// receipt-bound predecessor reclaim returns `complete = false`; the
     /// caller must advance the real stable commit/generation boundary, drain
     /// receipt-bound dead objects, and retry. The retry detaches the device
-    /// only after no intent or unreceipted physical object still names it.
+    /// from the current Pool only after no intent or unreceipted physical
+    /// object still names it. Because the current V1 labels have no topology
+    /// commit point, that detach returns `topology_commit_pending = true` and
+    /// keeps `complete = false` plus the durable recovery marker.
     ///
     /// # Errors
     ///
@@ -5788,33 +5793,6 @@ impl Pool {
         let mut result = EvacuationResult::default();
 
         let mut accounted_physical_fragments = BTreeSet::new();
-        // Reclaim logs and snapshot pins are leaf-local authority. Recognized
-        // filenames alone cannot make them disposable: every physical leaf
-        // must prove an exact, persisted, terminal cleanup state first.
-        let reclaim_cleanup_is_terminal = (0..self.devices[target_idx].physical_leaf_count())
-            .map(|leaf_index| {
-                self.devices[target_idx]
-                    .physical_store(leaf_index)
-                    .ok_or(StoreError::InvalidOptions {
-                        reason: "device removal cannot inspect a physical leaf",
-                    })?
-                    .device_removal_reclaim_cleanup_is_terminal()
-            })
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .all(|terminal| terminal);
-        if reclaim_cleanup_is_terminal {
-            for name in [
-                crate::reclaim_queue::DEAD_OBJECT_RECLAIM_QUEUE_OBJECT_NAME,
-                crate::reclaim_queue::RECLAIM_RECEIPTS_OBJECT_NAME,
-                crate::reclaim_queue::SNAPSHOT_EXTENT_PIN_SET_OBJECT_NAME,
-            ] {
-                accounted_physical_fragments.extend(
-                    self.devices[target_idx]
-                        .physical_fragments_for_key(ObjectKey::from_name(name.as_bytes())),
-                );
-            }
-        }
         for observation in placement_mutation_intent_inventory(&self.devices)?.into_values() {
             if observation.source_devices.contains(&target_idx) {
                 accounted_physical_fragments.extend(
@@ -5996,6 +5974,43 @@ impl Pool {
             self.devices[idx].sync_all()?;
         }
 
+        // Evacuation publishes survivor authority before predecessor reclaim.
+        // Any intent or queue entry that still names the retiring GUID is the
+        // durable phase boundary. Leave the device attached and the marker
+        // present until caller-owned stable-generation reclaim completes.
+        if placement_mutation_intent_inventory(&self.devices)?
+            .into_values()
+            .any(|observation| intent_depends_on_target(&observation))
+            || self.device_has_pending_receipt_bound_reclaim(target_idx)?
+        {
+            let mut marker = read_device_removal_marker(&marker_path)?;
+            if matches!(marker.phase, DeviceRemovalPhase::Pending) {
+                marker.phase = DeviceRemovalPhase::Evacuated;
+                persist_device_removal_marker_state(&self.config.root_path, &marker)?;
+            }
+            result.complete = false;
+            return Ok(result);
+        }
+
+        // Reclaim logs and snapshot pins are written directly into each
+        // physical LocalObjectStore, including parity leaves. Account only
+        // keys whose freshly decoded state proves terminal, and preserve their
+        // direct leaf/key identity instead of mapping them as logical parity
+        // objects.
+        for leaf_index in 0..self.devices[target_idx].physical_leaf_count() {
+            let store = self.devices[target_idx].physical_store(leaf_index).ok_or(
+                StoreError::InvalidOptions {
+                    reason: "device removal cannot inspect a physical leaf",
+                },
+            )?;
+            accounted_physical_fragments.extend(
+                store
+                    .terminal_device_removal_reclaim_metadata_keys()?
+                    .into_iter()
+                    .map(|key| DeviceObjectFragment { leaf_index, key }),
+            );
+        }
+
         // Receipt-backed logical objects and every composite fragment used to
         // store them are accounted above. An orphaned copy, column, length
         // marker, or any other physical key remains a removal blocker.
@@ -6013,25 +6028,6 @@ impl Pool {
             return Ok(result);
         }
 
-        // Evacuation publishes survivor authority before predecessor reclaim.
-        // Any intent that still names the retiring GUID is the durable phase
-        // boundary: leave the device attached and the marker present until a
-        // caller-owned stable-generation drain reclaims the predecessor and
-        // replay removes the intent last.
-        if placement_mutation_intent_inventory(&self.devices)?
-            .into_values()
-            .any(|observation| intent_depends_on_target(&observation))
-            || self.device_has_pending_receipt_bound_reclaim(target_idx)?
-        {
-            let mut marker = read_device_removal_marker(&marker_path)?;
-            if matches!(marker.phase, DeviceRemovalPhase::Pending) {
-                marker.phase = DeviceRemovalPhase::Evacuated;
-                persist_device_removal_marker_state(&self.config.root_path, &marker)?;
-            }
-            result.complete = false;
-            return Ok(result);
-        }
-
         // All objects evacuated -- remove the device.
         self.remove_device(path)?;
 
@@ -6041,7 +6037,8 @@ impl Pool {
         // could otherwise reattach the target after a crash with no marker
         // left to resume removal.
 
-        result.complete = true;
+        result.complete = false;
+        result.topology_commit_pending = true;
         Ok(result)
     }
 
@@ -7988,13 +7985,20 @@ mod tests {
             .safe_remove_device(path)
             .expect("resume safe removal after stable reclaim");
         assert!(
-            resumed.complete,
-            "stable reclaim did not make detach eligible: stats={stats:?}, queued={queued:?}, resumed={resumed:?}"
+            !resumed.complete && resumed.topology_commit_pending,
+            "stable reclaim did not reach topology-pending detach: stats={stats:?}, queued={queued:?}, resumed={resumed:?}"
         );
         first.complete = resumed.complete;
+        first.topology_commit_pending = resumed.topology_commit_pending;
         first.objects_failed += resumed.objects_failed;
         first.failed_keys.extend(resumed.failed_keys);
         first
+    }
+
+    fn assert_topology_commit_pending(result: &crate::device_removal::EvacuationResult) {
+        assert!(!result.complete, "{result:?}");
+        assert!(result.topology_commit_pending, "{result:?}");
+        assert_eq!(result.objects_failed, 0, "{result:?}");
     }
 
     #[test]
@@ -10591,7 +10595,7 @@ mod tests {
             .any(|observation| { observation.intent.replacement_receipt == survivor_tombstone }));
 
         let removal = finish_safe_removal(&mut pool, &target_path, first);
-        assert!(removal.complete, "{removal:?}");
+        assert_topology_commit_pending(&removal);
         assert_eq!(pool.get(IoClass::Data, key).unwrap(), None);
         assert_eq!(
             pool.load_current_placement_receipt(key).unwrap(),
@@ -11276,8 +11280,7 @@ mod tests {
         let first = pool.safe_remove_device(&victim_path).unwrap();
         assert!(!first.complete, "replacement reclaim must precede detach");
         let removal = finish_safe_removal(&mut pool, &victim_path, first);
-        assert!(removal.complete);
-        assert_eq!(removal.objects_failed, 0);
+        assert_topology_commit_pending(&removal);
         assert_eq!(
             pool.get(IoClass::Data, key).unwrap(),
             Some(payload.to_vec())
@@ -11440,9 +11443,8 @@ mod tests {
         );
 
         let removal = pool.safe_remove_device(&target_path).unwrap();
-        assert!(removal.complete, "{removal:?}");
+        assert_topology_commit_pending(&removal);
         assert_eq!(removal.objects_evacuated, 0);
-        assert_eq!(removal.objects_failed, 0);
         assert_eq!(
             pool.get(IoClass::Data, key).unwrap(),
             Some(current_payload.to_vec()),
@@ -11521,9 +11523,8 @@ mod tests {
         );
 
         let removal = pool.safe_remove_device(&target_path).unwrap();
-        assert!(removal.complete, "{removal:?}");
+        assert_topology_commit_pending(&removal);
         assert_eq!(removal.objects_evacuated, 1);
-        assert_eq!(removal.objects_failed, 0);
         assert_eq!(
             pool.get(IoClass::Metadata, key).unwrap(),
             Some(current_payload.to_vec()),
@@ -11838,6 +11839,15 @@ mod tests {
         pool.put(IoClass::Data, key2, &data2).unwrap();
         pool.put(IoClass::Data, key3, &data3).unwrap();
         pool.sync_all().unwrap();
+        let original_labels: Vec<_> = config
+            .devices
+            .iter()
+            .map(|device| {
+                let path = label_file_path(&device_root_path(device));
+                let bytes = fs::read(&path).expect("read original topology label");
+                (path, bytes)
+            })
+            .collect();
         let key1_receipt = pool
             .placement_receipt_for_key(IoClass::Data, key1)
             .unwrap()
@@ -11865,8 +11875,7 @@ mod tests {
         let first = pool.safe_remove_device(&victim_path).unwrap();
         assert!(!first.complete, "replacement reclaim must precede detach");
         let result = finish_safe_removal(&mut pool, &victim_path, first);
-        assert!(result.complete);
-        assert_eq!(result.objects_failed, 0);
+        assert_topology_commit_pending(&result);
 
         // Pool now has 1 device.
         assert_eq!(pool.stats().device_count, 1);
@@ -11956,7 +11965,7 @@ mod tests {
         let first = pool.safe_remove_device(&victim_path).unwrap();
         assert!(!first.complete, "replacement reclaim must precede detach");
         let removal = finish_safe_removal(&mut pool, &victim_path, first);
-        assert!(removal.complete);
+        assert_topology_commit_pending(&removal);
         assert_eq!(removal.objects_evacuated, 1);
         assert_eq!(removal.bytes_evacuated, victim_payload.len() as u64);
         assert_eq!(removal.content_digests.len(), 1);
@@ -12097,11 +12106,12 @@ mod tests {
             .pin_snapshot_extent("live-snapshot", pinned_extent);
         pool.devices[0].sync_all().unwrap();
 
-        let refused = pool.safe_remove_device(&target_path).unwrap();
-        assert!(!refused.complete);
-        assert!(refused.failed_keys.contains(&ObjectKey::from_name(
-            crate::reclaim_queue::SNAPSHOT_EXTENT_PIN_SET_OBJECT_NAME.as_bytes(),
-        )));
+        assert!(matches!(
+            pool.safe_remove_device(&target_path),
+            Err(StoreError::InvalidOptions {
+                reason: "device removal snapshot extent pins are not empty"
+            })
+        ));
         assert_eq!(pool.stats().device_count, 2);
 
         assert_eq!(
@@ -12113,7 +12123,7 @@ mod tests {
         pool.devices[0].sync_all().unwrap();
 
         let completed = pool.safe_remove_device(&target_path).unwrap();
-        assert!(completed.complete, "{completed:?}");
+        assert_topology_commit_pending(&completed);
         assert_eq!(pool.stats().device_count, 1);
 
         let _ = std::fs::remove_dir_all(&root);
@@ -12625,7 +12635,7 @@ mod tests {
         let second_target = pool.devices[1].root().to_path_buf();
 
         let first_result = pool.safe_remove_device(&first_target).unwrap();
-        assert!(first_result.complete);
+        assert_topology_commit_pending(&first_result);
         assert_eq!(pool.stats().device_count, 2);
         assert!(!pool.device_guids.contains(&first_target_guid));
 
@@ -12714,8 +12724,7 @@ mod tests {
         let first = pool.safe_remove_device(&d1).unwrap();
         assert!(!first.complete, "replacement reclaim must precede detach");
         let result = finish_safe_removal(&mut pool, &d1, first);
-        assert!(result.complete);
-        assert_eq!(result.objects_failed, 0);
+        assert_topology_commit_pending(&result);
 
         // Pool now has 2 devices.
         assert_eq!(pool.stats().device_count, 2);
@@ -12822,7 +12831,8 @@ mod tests {
 
         // Re-open. The resume logic in Pool::open should detect the marker,
         // evacuate objects from d1 to d2, and remove d1.
-        let mut pool2 = Pool::open(config, PoolProperties::default(), &test_options()).unwrap();
+        let mut pool2 =
+            Pool::open(config.clone(), PoolProperties::default(), &test_options()).unwrap();
 
         // Automatic resume publishes survivor authority but cannot invent the
         // caller-owned stable reclaim boundary. It therefore keeps both the
@@ -12844,12 +12854,19 @@ mod tests {
         let target_queue_after_drain = pool2
             .device_has_pending_receipt_bound_reclaim(target_idx_after_drain)
             .unwrap();
+        assert_eq!(retained_after_drain, 0);
+        assert!(!target_queue_after_drain);
         let resumed = pool2.safe_remove_device(&target_path).unwrap();
-        assert!(
-            resumed.complete,
-            "{resumed:?}, retained_after_drain={retained_after_drain}, target_queue_after_drain={target_queue_after_drain}"
-        );
+        assert_topology_commit_pending(&resumed);
         assert_eq!(pool2.stats().device_count, 1);
+        for (path, expected) in &original_labels {
+            let actual = fs::read(path).expect("read topology label after in-memory detach");
+            assert_eq!(
+                actual.as_slice(),
+                expected.as_slice(),
+                "topology-pending removal must not publish a partial V1 label cohort"
+            );
+        }
 
         // All objects must still be readable.
         let obj1 = pool2.get(IoClass::Data, key1).unwrap();
@@ -12864,15 +12881,21 @@ mod tests {
         assert!(obj3.is_some(), "key3 not found after resume");
         assert_eq!(obj3.unwrap(), data3);
 
-        let reduced_config = pool2.config.clone();
         drop(pool2);
 
-        let pool3 = Pool::open(reduced_config, PoolProperties::default(), &test_options()).unwrap();
+        let pool3 = Pool::open(config, PoolProperties::default(), &test_options()).unwrap();
         assert!(marker_path.exists());
         assert_eq!(pool3.stats().device_count, 1);
         assert_eq!(pool3.get(IoClass::Data, key1).unwrap(), Some(data1));
         assert_eq!(pool3.get(IoClass::Data, key2).unwrap(), Some(data2));
         assert_eq!(pool3.get(IoClass::Data, key3).unwrap(), Some(data3));
+        for (path, expected) in &original_labels {
+            let actual = fs::read(path).expect("read topology label after original-config reopen");
+            assert_eq!(
+                actual.as_slice(),
+                expected.as_slice()
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -12915,7 +12938,7 @@ mod tests {
             .expect("resume target resolved by GUID");
         drain_committed_placement_mutations(&mut reopened);
         let resumed = reopened.safe_remove_device(&target_path).unwrap();
-        assert!(resumed.complete, "{resumed:?}");
+        assert_topology_commit_pending(&resumed);
         assert_eq!(reopened.stats().device_count, 1);
         assert_eq!(
             reopened.get(IoClass::Data, key).unwrap(),
@@ -12976,7 +12999,7 @@ mod tests {
         let target_guid = pool.device_guid_for_index(0);
         let first = pool.safe_remove_device(&d1).unwrap();
         let result = finish_safe_removal(&mut pool, &d1, first);
-        assert!(result.complete);
+        assert_topology_commit_pending(&result);
         assert_eq!(pool.stats().device_count, 1);
         assert!(d1.exists());
 
@@ -14832,7 +14855,7 @@ mod tests {
         std::fs::write(&log_path, &valid_header).unwrap();
         let drained_log_len = std::fs::metadata(&log_path).unwrap().len();
         let removal = pool.safe_remove_device(&log_dir).unwrap();
-        assert!(removal.complete);
+        assert_topology_commit_pending(&removal);
         assert_eq!(pool.log_device_count(), 0);
         assert!(!pool.log_device_healthy());
         assert!(!pool.has_log_device());

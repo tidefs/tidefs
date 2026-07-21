@@ -3424,6 +3424,27 @@ impl VfsLocalFileSystem {
 
         const MAX_RECLAIM_PER_PASS: usize = 1024;
         while !result.complete {
+            if result.topology_commit_pending {
+                if let Err(err) = fs.store.sync_all() {
+                    return live_admin_error(
+                        1,
+                        format!(
+                            "device remove: evacuation of '{}' completed and the current mounted state detached the target, but surviving-device sync failed while durable topology commit remains pending: {err}",
+                            device_path.display()
+                        ),
+                    );
+                }
+                return live_admin_error(
+                    1,
+                    format!(
+                        "device remove: evacuation of '{}' completed with no object failures, but durable topology commit is unavailable; removal remains pending and its recovery marker was retained (objects_evacuated={}, bytes_evacuated={})",
+                        device_path.display(),
+                        result.objects_evacuated,
+                        result.bytes_evacuated,
+                    ),
+                );
+            }
+
             if result.objects_failed > 0 {
                 return live_admin_error(
                     1,
@@ -3473,6 +3494,7 @@ impl VfsLocalFileSystem {
                 .saturating_add(next.objects_evacuated);
             result.objects_failed = result.objects_failed.saturating_add(next.objects_failed);
             result.bytes_evacuated = result.bytes_evacuated.saturating_add(next.bytes_evacuated);
+            result.topology_commit_pending |= next.topology_commit_pending;
             for failed_key in next.failed_keys {
                 if !result.failed_keys.contains(&failed_key) {
                     result.failed_keys.push(failed_key);
@@ -3495,7 +3517,7 @@ impl VfsLocalFileSystem {
             }
             result.complete = next.complete;
 
-            if !result.complete && !made_progress {
+            if !result.complete && !result.topology_commit_pending && !made_progress {
                 return live_admin_error(
                     1,
                     format!(
@@ -3524,14 +3546,14 @@ impl VfsLocalFileSystem {
             "objects_failed": result.objects_failed,
             "bytes_evacuated": result.bytes_evacuated,
             "remaining_devices": remaining_devices,
-            "active_label_persistence": "not yet wired in mounted-pool topology updates; tracked by TFR-011/TFR-012",
+            "topology_committed": true,
         });
 
         if wants_json {
             live_admin_ok_json(response)
         } else {
             live_admin_ok_text(format!(
-                "device '{}' removed through live pool owner\n  objects evacuated: {}\n  bytes evacuated:   {}\n  objects failed:    {}\n  remaining devices: {}\n  active labels:     mounted-pool topology labels still need TFR-011/TFR-012 wiring",
+                "device '{}' removed through live pool owner\n  objects evacuated: {}\n  bytes evacuated:   {}\n  objects failed:    {}\n  remaining devices: {}\n  topology:          committed",
                 device_path.display(),
                 result.objects_evacuated,
                 result.bytes_evacuated,
@@ -7477,7 +7499,7 @@ mod tests {
     }
 
     #[test]
-    fn live_device_remove_evacuates_through_mounted_pool_owner() {
+    fn live_device_remove_reports_topology_commit_pending() {
         let (engine, _td, devices) = temp_fs_with_block_devices(2);
         let payload = b"live owner device remove keeps mounted data reachable";
         let target_path = {
@@ -7520,13 +7542,16 @@ mod tests {
             true,
         );
 
-        assert_eq!(removed["ok"], true, "remove response: {removed}");
-        assert_eq!(removed["json"]["objects_failed"], 0);
+        assert_eq!(removed["ok"], false, "remove response: {removed}");
+        assert_eq!(removed["exit_code"], 1);
         assert!(
-            removed["json"]["objects_evacuated"].as_u64().unwrap_or(0) > 0,
-            "the selected receipt owner must exercise evacuation: {removed}"
+            removed["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("durable topology commit is unavailable")
+                    && error.contains("removal remains pending")
+                    && error.contains("objects_evacuated=")),
+            "mounted removal must report successful evacuation as topology-pending, not removed: {removed}"
         );
-        assert_eq!(removed["json"]["remaining_devices"], 1);
 
         let fs = engine.fs.borrow();
         assert_eq!(fs.store.stats().device_count, 1);

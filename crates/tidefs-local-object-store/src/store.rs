@@ -2842,15 +2842,17 @@ impl LocalObjectStore {
         self.dead_object_reclaim_queue.len()
     }
 
-    /// Whether leaf-local reclaim metadata is terminal and may disappear with
-    /// a retiring whole device.
+    /// Return leaf-local reclaim metadata that is terminal for whole-device
+    /// removal.
     ///
     /// These objects are redo and snapshot-liveness authority, not disposable
-    /// merely because their names are recognized.  Removal may account for
-    /// them only after the persisted bytes decode to the exact clean in-memory
-    /// state, every queue entry is acknowledged, every snapshot pin is gone,
-    /// and every receipted segment is already free with no live index entry.
-    pub(crate) fn device_removal_reclaim_cleanup_is_terminal(&self) -> Result<bool> {
+    /// merely because their names are recognized. Removal may account for
+    /// only the exact keys whose persisted bytes match clean in-memory state.
+    /// A retained receipt log additionally requires a durably persisted empty
+    /// queue, because receipt presence alone can be prepared redo evidence.
+    pub(crate) fn terminal_device_removal_reclaim_metadata_keys(
+        &self,
+    ) -> Result<Vec<ObjectKey>> {
         let persisted_queue = load_dead_object_reclaim_queue(self)?;
         let persisted_receipts = load_reclaim_receipts(self)?;
         let persisted_pins = load_snapshot_extent_pin_set(self)?;
@@ -2858,25 +2860,45 @@ impl LocalObjectStore {
         if self.dead_object_reclaim_queue_dirty
             || self.reclaim_receipts_dirty
             || self.snapshot_extent_pin_set_dirty
-            || persisted_queue != self.dead_object_reclaim_queue
+        {
+            return Err(StoreError::InvalidOptions {
+                reason: "device removal reclaim metadata has uncommitted changes",
+            });
+        }
+        if persisted_queue != self.dead_object_reclaim_queue
             || persisted_receipts != self.reclaim_receipts
             || persisted_pins != self.snapshot_extent_pin_set
-            || !persisted_queue.is_empty()
-            || !persisted_pins.is_empty()
         {
-            return Ok(false);
+            return Err(StoreError::InvalidOptions {
+                reason: "device removal reclaim metadata differs from persisted state",
+            });
+        }
+        if !persisted_queue.is_empty() {
+            return Err(StoreError::InvalidOptions {
+                reason: "device removal reclaim queue is not empty",
+            });
+        }
+        if !persisted_pins.is_empty() {
+            return Err(StoreError::InvalidOptions {
+                reason: "device removal snapshot extent pins are not empty",
+            });
         }
 
-        Ok(persisted_receipts.iter().all(|receipt| {
-            !receipt.is_empty()
-                && receipt.freed_segment_extents.iter().all(|extent| {
-                    self.free_map.is_free(extent.segment_id)
-                        && self
-                            .index
-                            .values()
-                            .all(|location| location.segment_id != extent.segment_id)
-                })
-        }))
+        let queue_key = ObjectKey::from_name(DEAD_OBJECT_RECLAIM_QUEUE_OBJECT_NAME.as_bytes());
+        if !persisted_receipts.is_empty() && !self.index.contains_key(&queue_key) {
+            return Err(StoreError::InvalidOptions {
+                reason: "device removal reclaim receipts lack durable queue acknowledgement",
+            });
+        }
+
+        Ok([
+            queue_key,
+            ObjectKey::from_name(RECLAIM_RECEIPTS_OBJECT_NAME.as_bytes()),
+            ObjectKey::from_name(SNAPSHOT_EXTENT_PIN_SET_OBJECT_NAME.as_bytes()),
+        ]
+        .into_iter()
+        .filter(|key| self.index.contains_key(key))
+        .collect())
     }
 
     pub(crate) fn stable_exclusive_commit_group(&self) -> Result<u64> {
