@@ -3377,10 +3377,8 @@ impl LocalObjectStore {
         stable_committed_generation: u64,
         max_count: usize,
         authorized_receipts: &BTreeMap<ReclaimObjectKey, DeadObjectReplacementReceipt>,
-    ) -> std::result::Result<
-        ReceiptBoundDeadObjectRetireOutcome,
-        ReceiptBoundDeadObjectDrainError,
-    > {
+    ) -> std::result::Result<ReceiptBoundDeadObjectRetireOutcome, ReceiptBoundDeadObjectDrainError>
+    {
         self.ensure_writable("retire_and_drain_receipt_bound_dead_objects_at_stable_generation")?;
         if max_count == 0 {
             return Ok(ReceiptBoundDeadObjectRetireOutcome {
@@ -3395,7 +3393,8 @@ impl LocalObjectStore {
             self.sync_all()?;
         }
 
-        let effective_max_count = max_count.min(self.reclaim_consumer.config().max_entries_per_drain);
+        let effective_max_count =
+            max_count.min(self.reclaim_consumer.config().max_entries_per_drain);
         if effective_max_count == 0 || self.reclaim_consumer.config().max_free_batch == 0 {
             return Ok(ReceiptBoundDeadObjectRetireOutcome {
                 stats: tidefs_reclaim::ReclaimConsumerStats {
@@ -3677,7 +3676,8 @@ impl LocalObjectStore {
         authorized_receipts: Option<&BTreeMap<ReclaimObjectKey, DeadObjectReplacementReceipt>>,
         selected_object_ids: Option<&BTreeSet<ReclaimObjectKey>>,
     ) -> ReceiptBoundDeadObjectDrainPlan {
-        let effective_max_count = max_count.min(self.reclaim_consumer.config().max_entries_per_drain);
+        let effective_max_count =
+            max_count.min(self.reclaim_consumer.config().max_entries_per_drain);
         let max_segments = self.reclaim_consumer.config().max_free_batch;
         if effective_max_count == 0 || max_segments == 0 {
             return ReceiptBoundDeadObjectDrainPlan::default();
@@ -3698,7 +3698,8 @@ impl LocalObjectStore {
             *all_by_segment.entry(segment_id).or_default() += 1;
             let authority_matches = authorized_receipts.is_none_or(|authorized| {
                 authorized.get(&entry.object_id) == entry.replacement_receipt.as_ref()
-            }) && selected_object_ids.is_none_or(|selected| selected.contains(&entry.object_id));
+            }) && selected_object_ids
+                .is_none_or(|selected| selected.contains(&entry.object_id));
             if authority_matches
                 && entry.is_receipt_bound_reclaimable_with_stable_generation(
                     stable_committed_txg,

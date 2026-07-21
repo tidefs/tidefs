@@ -447,11 +447,16 @@ pub struct PoolReceiptBoundDeadObjectDrainStats {
 
 impl PoolReceiptBoundDeadObjectDrainStats {
     fn absorb_reclaim_stats(&mut self, stats: tidefs_reclaim::ReclaimConsumerStats) {
-        self.objects_examined += stats.entries_processed;
-        self.segments_reclaimed += stats.segments_reclaimed;
-        self.blocks_freed += stats.blocks_freed;
-        self.reclaim_queue_depth += stats.reclaim_queue_depth;
-        self.checkpoint_batches += stats.checkpoint_batches;
+        self.objects_examined = self
+            .objects_examined
+            .saturating_add(stats.entries_processed);
+        self.segments_reclaimed = self
+            .segments_reclaimed
+            .saturating_add(stats.segments_reclaimed);
+        self.blocks_freed = self.blocks_freed.saturating_add(stats.blocks_freed);
+        self.checkpoint_batches = self
+            .checkpoint_batches
+            .saturating_add(stats.checkpoint_batches);
     }
 }
 
@@ -3686,6 +3691,27 @@ impl Pool {
         Ok(false)
     }
 
+    fn receipt_bound_dead_object_queue_depth(&self) -> Result<usize> {
+        let mut depth = 0usize;
+        for device in &self.devices {
+            for leaf_index in 0..device.physical_leaf_count() {
+                let store =
+                    device
+                        .physical_store(leaf_index)
+                        .ok_or(StoreError::InvalidOptions {
+                        reason:
+                            "receipt-bound reclaim depth references an unavailable physical leaf",
+                    })?;
+                depth = depth
+                    .checked_add(store.receipt_bound_dead_object_queue_depth())
+                    .ok_or(StoreError::InvalidOptions {
+                        reason: "receipt-bound reclaim queue depth overflow",
+                    })?;
+            }
+        }
+        Ok(depth)
+    }
+
     fn write_exact_logical_object(
         &mut self,
         device_index: usize,
@@ -5118,15 +5144,21 @@ impl Pool {
                     .cloned()
                     .unwrap_or_default();
                 let stable_exclusive_commit_group = store.stable_exclusive_commit_group()?;
-                let stats = store
+                let outcome = store
                     .retire_and_drain_receipt_bound_dead_objects_at_stable_generation(
                         stable_exclusive_commit_group,
                         stable_committed_generation,
                         remaining,
                         &authorized_receipts,
                     )?;
+                let stats = outcome.stats;
                 aggregate.absorb_reclaim_stats(stats);
-                remaining = remaining.saturating_sub(stats.entries_processed);
+                aggregate.objects_examined = aggregate.objects_examined.saturating_add(
+                    outcome
+                        .entries_budgeted
+                        .saturating_sub(stats.entries_processed),
+                );
+                remaining = remaining.saturating_sub(outcome.entries_budgeted);
             }
         }
 
@@ -5154,7 +5186,6 @@ impl Pool {
                             })?;
                         let stable_exclusive_commit_group =
                             store.stable_exclusive_commit_group()?;
-                        let depth_before = store.receipt_bound_dead_object_queue_depth();
                         let relocated = store.relocate_live_records_for_device_removal_reclaim(
                             stable_exclusive_commit_group,
                             stable_committed_generation,
@@ -5163,29 +5194,21 @@ impl Pool {
                         if relocated == 0 {
                             continue;
                         }
-                        let stats = store
+                        let outcome = store
                             .retire_and_drain_receipt_bound_dead_objects_at_stable_generation(
                                 stable_exclusive_commit_group,
                                 stable_committed_generation,
                                 remaining,
                                 authorized_receipts,
                             )?;
-                        aggregate.objects_examined = aggregate
-                            .objects_examined
-                            .saturating_add(stats.entries_processed);
-                        aggregate.segments_reclaimed = aggregate
-                            .segments_reclaimed
-                            .saturating_add(stats.segments_reclaimed);
-                        aggregate.blocks_freed =
-                            aggregate.blocks_freed.saturating_add(stats.blocks_freed);
-                        aggregate.checkpoint_batches = aggregate
-                            .checkpoint_batches
-                            .saturating_add(stats.checkpoint_batches);
-                        aggregate.reclaim_queue_depth = aggregate
-                            .reclaim_queue_depth
-                            .saturating_sub(depth_before)
-                            .saturating_add(stats.reclaim_queue_depth);
-                        remaining = remaining.saturating_sub(stats.entries_processed);
+                        let stats = outcome.stats;
+                        aggregate.absorb_reclaim_stats(stats);
+                        aggregate.objects_examined = aggregate.objects_examined.saturating_add(
+                            outcome
+                                .entries_budgeted
+                                .saturating_sub(stats.entries_processed),
+                        );
+                        remaining = remaining.saturating_sub(outcome.entries_budgeted);
                     }
                 }
 
@@ -5281,6 +5304,7 @@ impl Pool {
         }
 
         self.replay_placement_mutation_intents()?;
+        aggregate.reclaim_queue_depth = self.receipt_bound_dead_object_queue_depth()?;
         self.health = compute_health(&self.devices);
         self.record_health_transitions();
         Ok(aggregate)
