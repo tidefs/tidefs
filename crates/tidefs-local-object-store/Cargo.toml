@@ -26,7 +26,6 @@ tidefs-segment-cleaner = { workspace = true }
 tidefs-types-incremental-job-core = { workspace = true }
 tidefs-reclaim-queue-core = { workspace = true }
 tidefs-types-reclaim-queue-core = { workspace = true }
-tidefs-types-extent-map-core = { workspace = true }
 tidefs-binary_schema-checksum = { workspace = true }
 tidefs-binary_schema-core = { workspace = true }
 tidefs-binary_schema-framing = { workspace = true }

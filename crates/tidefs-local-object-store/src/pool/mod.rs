@@ -4096,7 +4096,7 @@ impl Pool {
                     .ok_or(StoreError::InvalidOptions {
                         reason: "obsolete placement fragment references an unavailable leaf",
                     })?;
-                if store.reclaim_receipt_covers_object(object_id) {
+                if store.completed_reclaim_receipt_covers_generation_bound_object(object_id) {
                     continue;
                 }
                 let marker_authorizes_completed_removal =
@@ -7925,8 +7925,9 @@ mod tests {
                 let stable_exclusive_commit_group = store
                     .stable_exclusive_commit_group()
                     .expect("physical leaf committed boundary");
-                for entry in
-                    crate::reclaim_queue::load_dead_object_reclaim_queue(store).all_entries()
+                for entry in crate::reclaim_queue::load_dead_object_reclaim_queue(store)
+                    .expect("load physical leaf reclaim queue")
+                    .all_entries()
                 {
                     assert!(
                         entry.is_receipt_bound_reclaimable_with_stable_generation(
@@ -7971,6 +7972,7 @@ mod tests {
                         .into_iter()
                         .flat_map(|store| {
                             crate::reclaim_queue::load_dead_object_reclaim_queue(store)
+                                .expect("load physical leaf reclaim queue")
                                 .all_entries()
                         })
                 })
@@ -9363,6 +9365,62 @@ mod tests {
     }
 
     #[test]
+    fn receipt_bound_reclaim_max_count_is_global_across_mirror_leaves() {
+        let root = temp_dir("receipt-bound-global-budget-mirror");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = mirror_device_config(&root);
+        let properties = PoolProperties::default();
+        let mut pool = Pool::create(config, properties, &test_options()).unwrap();
+        set_deterministic_device_guids(&mut pool);
+        assert_eq!(pool.devices[0].physical_leaf_count(), 2);
+
+        let key = ObjectKey::from_name(b"receipt-bound-global-budget-mirror");
+        pool.put(IoClass::Data, key, b"old mirrored payload")
+            .unwrap();
+        for leaf_index in 0..2 {
+            pool.devices[0]
+                .physical_store_mut_for_test(leaf_index)
+                .expect("mirror leaf")
+                .rotate_segment()
+                .expect("seal predecessor segment");
+        }
+        pool.put(IoClass::Data, key, b"new mirrored payload")
+            .unwrap();
+        pool.sync_all().unwrap();
+        assert_eq!(pool.receipt_bound_dead_object_queue_depth().unwrap(), 2);
+
+        let first = pool
+            .sync_and_drain_committed_placement_mutations(1)
+            .expect("first globally budgeted drain");
+        assert_eq!(first.objects_examined, 1);
+        assert_eq!(first.blocks_freed, 1);
+        assert_eq!(first.reclaim_queue_depth, 1);
+        assert_eq!(
+            placement_mutation_intent_inventory(&pool.devices)
+                .unwrap()
+                .len(),
+            1,
+            "one unreclaimed mirror leaf must retain the placement intent"
+        );
+
+        let second = pool
+            .sync_and_drain_committed_placement_mutations(1)
+            .expect("second globally budgeted drain");
+        assert_eq!(second.objects_examined, 1);
+        assert_eq!(second.blocks_freed, 1);
+        assert_eq!(second.reclaim_queue_depth, 0);
+        assert!(placement_mutation_intent_inventory(&pool.devices)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            pool.get(IoClass::Data, key).unwrap(),
+            Some(b"new mirrored payload".to_vec())
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn erasure_rewrite_publishes_receipt_bound_dead_shards() {
         let root = temp_dir("receipt-bound-rewrite-erasure");
         let _ = std::fs::remove_dir_all(&root);
@@ -10047,6 +10105,62 @@ mod tests {
                 .len(),
             1,
             "complete receipt must not erase unfinished reclaim evidence"
+        );
+
+        for (device_index, object_key) in &predecessor_objects {
+            let fragments = pool.devices[*device_index].physical_fragments_for_key(*object_key);
+            for fragment in fragments {
+                let store = pool.devices[*device_index]
+                    .physical_store_mut(fragment.leaf_index)
+                    .expect("predecessor physical leaf");
+                let source_segment_id = store
+                    .location_of(fragment.key)
+                    .expect("predecessor source location")
+                    .segment_id;
+                assert!(store.delete(fragment.key).expect("retire predecessor"));
+                store.sync_all().expect("commit predecessor retirement");
+
+                let source_path =
+                    crate::store::segment_path(store.segments_dir(), source_segment_id);
+                let retained_path = source_path.with_extension("pool-reclaim-retained");
+                std::fs::rename(&source_path, &retained_path)
+                    .expect("retain source while injecting unlink failure");
+                std::fs::create_dir(&source_path).expect("block physical unlink");
+                let stable_exclusive_commit_group = store
+                    .stable_exclusive_commit_group()
+                    .expect("stable leaf boundary");
+                let error = store
+                    .drain_receipt_bound_dead_objects_at_stable_generation(
+                        stable_exclusive_commit_group,
+                        intent.replacement_receipt.generation,
+                        16,
+                    )
+                    .expect_err("prepared release must stop at injected unlink failure");
+                assert!(error.to_string().contains("remove reclaimed segment"));
+                std::fs::remove_dir(&source_path).expect("remove injected unlink blocker");
+                std::fs::rename(&retained_path, &source_path)
+                    .expect("restore retained predecessor segment");
+
+                let object_id = reclaim_object_key(fragment.key);
+                assert!(store.reclaim_receipts().iter().any(|receipt| receipt
+                    .freed_segment_extents
+                    .iter()
+                    .any(|extent| extent.segment_id == source_segment_id
+                        && extent.extent_key == object_id)));
+                assert!(!store.completed_reclaim_receipt_covers_generation_bound_object(object_id));
+                assert_ne!(store.receipt_bound_dead_object_queue_depth(), 0);
+            }
+        }
+        assert!(!pool
+            .obsolete_placement_reclaim_is_terminal(&intent)
+            .expect("prepared reclaim terminal check"));
+        pool.replay_placement_mutation_intents().unwrap();
+        assert_eq!(
+            placement_mutation_intent_inventory(&pool.devices)
+                .unwrap()
+                .len(),
+            1,
+            "prepared receipts must not erase retained replacement authority"
         );
         drain_committed_placement_mutations(&mut pool);
         assert!(predecessor_objects

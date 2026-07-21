@@ -2741,7 +2741,6 @@ dependencies = [
  "tidefs-segment-cleaner",
  "tidefs-space-accounting",
  "tidefs-spacemap-allocator",
- "tidefs-types-extent-map-core",
  "tidefs-types-incremental-job-core",
  "tidefs-types-pool-label-core",
  "tidefs-types-reclaim-queue-core",

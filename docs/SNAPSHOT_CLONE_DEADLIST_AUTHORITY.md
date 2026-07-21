@@ -159,7 +159,9 @@ model must use instead of bypassing:
 - The legacy `drain_dead_segments` entry point now fails closed and does not
   physically free segments.
 - `tidefs-dead-object-reclaim-queue` persists receipt-bound dead-object work.
-- `tidefs-reclaim-receipts` persists committed physical-free evidence.
+- `tidefs-reclaim-receipts` persists exact physical-release redo evidence.
+  While the matching dead-object queue entry remains, that evidence is
+  prepared rather than terminal.
 - `tidefs-snapshot-extent-pins` persists the `SnapshotExtentPinSet`; corrupt
   persisted pin state fails closed, and the receipt-bound reclaim gate denies
   reclaim while an extent is still snapshot-pinned.
@@ -217,8 +219,9 @@ object-store named objects that already exist for reclaim state:
 
 - `tidefs-dead-object-reclaim-queue`: pending or receipt-bearing dead-object
   candidates derived from released roots.
-- `tidefs-reclaim-receipts`: committed evidence for physical frees performed
-  by the receipt-bound drain.
+- `tidefs-reclaim-receipts`: exact prepared-or-completed physical-release
+  evidence for the receipt-bound drain; the matching queue entry distinguishes
+  prepared redo from terminal completion.
 - `tidefs-snapshot-extent-pins`: the persisted extent pin guard consulted
   before physical reclaim.
 
@@ -235,8 +238,10 @@ The lifecycle is:
    queue entries or a fail-closed pending cursor.
 3. A subsequent receipt-bound drain processes stable, eligible entries only when
    receipt evidence and snapshot-extent-pin clearance agree.
-4. Queue acknowledgement happens only after the physical-free receipt has been
-   persisted; receipts survive replay as committed evidence.
+4. Exact release evidence is persisted before physical release as a redo
+   locator. Queue acknowledgement happens only after physical release and
+   allocator update; terminal completion requires that durable acknowledgement,
+   not receipt presence alone.
 
 ### 4.5 Send/receive interaction
 

@@ -829,13 +829,16 @@ pub trait ReclaimGate {
 // ReclaimReceipt — committed evidence of freed extents
 // =========================================================================
 
-/// A durable receipt recording a batch of freed extents together with the
-/// deadlist and snapshot-pin clearance evidence at time of free.
+/// A durable receipt recording a batch of physical-release extents together
+/// with the deadlist and snapshot-pin clearance evidence for that release.
 ///
-/// Receipts are persisted and loaded during store open as committed evidence
-/// for extents that were physically freed after deadlist and snapshot-pin
-/// clearance. Corrupt receipt logs must fail closed at open so recovery does
-/// not silently lose that clearance evidence.
+/// Evidence-first stores may persist this record before unlink/reuse so it can
+/// serve as a redo locator. In that ordering, the record is prepared evidence
+/// while the exact source-queue entry remains and becomes terminal only after
+/// physical release and durable queue acknowledgement. Receipt presence alone
+/// is therefore not a completion predicate. The `freed_*` field names remain
+/// part of the existing wire/API vocabulary. Corrupt receipt logs must fail
+/// closed at open so recovery does not silently lose release evidence.
 ///
 /// # Wire format
 ///

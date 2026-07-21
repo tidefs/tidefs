@@ -147,22 +147,19 @@ pub(crate) fn store_reclaim_queue_entries(
 
 /// Load a [`DeadObjectReclaimQueue`] from the object store.
 ///
-/// Missing or corrupt persisted bytes fail closed to an empty queue; callers
-/// must only acknowledge dead-object reclamation after their own durable flush.
-pub(crate) fn load_dead_object_reclaim_queue(store: &LocalObjectStore) -> DeadObjectReclaimQueue {
+/// Missing bytes denote a fresh queue. Read or decode failures fail store open
+/// instead of silently converting unknown reclaim debt into completion.
+pub(crate) fn load_dead_object_reclaim_queue(
+    store: &LocalObjectStore,
+) -> Result<DeadObjectReclaimQueue, StoreError> {
     match store.get_named(DEAD_OBJECT_RECLAIM_QUEUE_OBJECT_NAME) {
-        Ok(Some(bytes)) => match DeadObjectReclaimQueue::decode(&bytes) {
-            Ok(queue) => queue,
-            Err(e) => {
-                eprintln!("tidefs: dead-object reclaim-queue decode error: {e}");
-                DeadObjectReclaimQueue::new()
-            }
-        },
-        Ok(None) => DeadObjectReclaimQueue::new(),
-        Err(e) => {
-            eprintln!("tidefs: dead-object reclaim-queue load error: {e}");
-            DeadObjectReclaimQueue::new()
+        Ok(Some(bytes)) => {
+            DeadObjectReclaimQueue::decode(&bytes).map_err(|_| StoreError::InvalidOptions {
+                reason: "dead-object reclaim queue decode failed",
+            })
         }
+        Ok(None) => Ok(DeadObjectReclaimQueue::new()),
+        Err(error) => Err(error),
     }
 }
 
@@ -664,9 +661,24 @@ mod tests {
     fn dead_object_reclaim_queue_loads_empty_when_absent() {
         let (store, _dir) = temp_store();
 
-        let loaded = load_dead_object_reclaim_queue(&store);
+        let loaded = load_dead_object_reclaim_queue(&store).expect("load absent queue");
 
         assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn fresh_store_without_dead_object_reclaim_queue_reopens_empty() {
+        let (store, dir) = temp_store();
+        assert!(store
+            .get_named(DEAD_OBJECT_RECLAIM_QUEUE_OBJECT_NAME)
+            .expect("inspect fresh queue state")
+            .is_none());
+        drop(store);
+
+        let reopened = LocalObjectStore::open(dir.path()).expect("reopen fresh store");
+        assert!(load_dead_object_reclaim_queue(&reopened)
+            .expect("load fresh queue after reopen")
+            .is_empty());
     }
 
     #[test]
@@ -675,7 +687,7 @@ mod tests {
         let queue = DeadObjectReclaimQueue::new();
 
         store_dead_object_reclaim_queue(&queue, &mut store).expect("store empty");
-        let loaded = load_dead_object_reclaim_queue(&store);
+        let loaded = load_dead_object_reclaim_queue(&store).expect("load empty queue");
 
         assert!(loaded.is_empty());
     }
@@ -688,7 +700,7 @@ mod tests {
         assert!(queue.enqueue(entry));
 
         store_dead_object_reclaim_queue(&queue, &mut store).expect("store populated");
-        let loaded = load_dead_object_reclaim_queue(&store);
+        let loaded = load_dead_object_reclaim_queue(&store).expect("load populated queue");
 
         assert_eq!(loaded, queue);
         assert_eq!(loaded.all_entries(), vec![entry]);
@@ -715,6 +727,8 @@ mod tests {
         ];
 
         store_reclaim_receipts(&receipts, &mut store).expect("store reclaim receipts");
+        store_dead_object_reclaim_queue(&DeadObjectReclaimQueue::new(), &mut store)
+            .expect("persist terminal empty queue authority");
         assert_eq!(
             load_reclaim_receipts(&store).expect("load receipts"),
             receipts
@@ -819,15 +833,15 @@ mod tests {
         drop(store);
 
         let reopened = LocalObjectStore::open(dir.path()).expect("reopen");
-        let loaded = load_dead_object_reclaim_queue(&reopened);
+        let loaded = load_dead_object_reclaim_queue(&reopened).expect("load queue after reopen");
 
         assert_eq!(loaded, queue);
         assert_eq!(loaded.receipt_bound_eligible_count(6), 2);
     }
 
     #[test]
-    fn dead_object_reclaim_queue_corrupt_bytes_load_empty() {
-        let (mut store, _dir) = temp_store();
+    fn dead_object_reclaim_queue_corrupt_bytes_fail_reopen_closed() {
+        let (mut store, dir) = temp_store();
 
         store
             .put_named(
@@ -835,9 +849,36 @@ mod tests {
                 b"not a dead-object queue",
             )
             .expect("store corrupt bytes");
-        let loaded = load_dead_object_reclaim_queue(&store);
+        assert!(load_dead_object_reclaim_queue(&store).is_err());
+        store.sync_all().expect("sync corrupt queue bytes");
+        drop(store);
 
-        assert!(loaded.is_empty());
+        assert!(
+            LocalObjectStore::open(dir.path()).is_err(),
+            "corrupt dead-object queue must fail store open closed"
+        );
+    }
+
+    #[test]
+    fn reclaim_receipts_without_dead_object_queue_fail_reopen_closed() {
+        let (mut store, dir) = temp_store();
+        let receipt = ReclaimReceipt::new(
+            vec![ReclaimReceiptExtent::new(31, dead_object_key(0x31))],
+            7,
+            11,
+        );
+        store_reclaim_receipts(&[receipt], &mut store).expect("store reclaim receipt");
+        assert!(store
+            .get_named(DEAD_OBJECT_RECLAIM_QUEUE_OBJECT_NAME)
+            .expect("inspect missing queue state")
+            .is_none());
+        store.sync_all().expect("sync receipt without queue");
+        drop(store);
+
+        assert!(
+            LocalObjectStore::open(dir.path()).is_err(),
+            "receipts without persisted queue authority must fail store open closed"
+        );
     }
 
     // -- DeadObjectReclaimQueue #346 receipt-bound drain tests --
@@ -870,7 +911,7 @@ mod tests {
         assert!(queue.enqueue(entry));
 
         store_dead_object_reclaim_queue(&queue, &mut store).expect("store erasure entry");
-        let loaded = load_dead_object_reclaim_queue(&store);
+        let loaded = load_dead_object_reclaim_queue(&store).expect("load erasure queue");
 
         assert_eq!(loaded, queue);
         assert_eq!(loaded.receipt_bound_eligible_count(6), 1);
@@ -903,7 +944,7 @@ mod tests {
 
         // Persist and verify drain state
         store_dead_object_reclaim_queue(&queue, &mut store).expect("store");
-        let loaded = load_dead_object_reclaim_queue(&store);
+        let loaded = load_dead_object_reclaim_queue(&store).expect("load stable queue");
         assert_eq!(loaded, queue);
         assert_eq!(
             loaded.receipt_bound_eligible_count_with_stable_generation(6, 3),
@@ -1047,7 +1088,7 @@ mod tests {
         assert!(updated);
         store.sync_all().expect("sync");
 
-        let loaded = load_dead_object_reclaim_queue(&store);
+        let loaded = load_dead_object_reclaim_queue(&store).expect("load published receipt");
         let entries = loaded.all_entries();
         let published = entries.iter().find(|e| e.object_id == key).unwrap();
         assert_eq!(published.replacement_receipt, Some(receipt));
@@ -1070,7 +1111,7 @@ mod tests {
             .expect("publish gen10"));
 
         store.sync_all().expect("sync");
-        let loaded = load_dead_object_reclaim_queue(&store);
+        let loaded = load_dead_object_reclaim_queue(&store).expect("load replaced receipt");
         let entries = loaded.all_entries();
         let published = entries.iter().find(|e| e.object_id == key).unwrap();
         assert_eq!(published.replacement_receipt, Some(receipt_gen10));
@@ -1098,14 +1139,15 @@ mod tests {
             .expect("ignore duplicate gen5"));
 
         store.sync_all().expect("sync");
-        let loaded = load_dead_object_reclaim_queue(&store);
+        let loaded = load_dead_object_reclaim_queue(&store).expect("load retained receipt");
         let entries = loaded.all_entries();
         let published = entries.iter().find(|e| e.object_id == key).unwrap();
         assert_eq!(published.replacement_receipt, Some(receipt_gen5));
         drop(store);
 
         let reopened = LocalObjectStore::open(dir.path()).expect("reopen store");
-        let loaded = load_dead_object_reclaim_queue(&reopened);
+        let loaded =
+            load_dead_object_reclaim_queue(&reopened).expect("load retained receipt after reopen");
         let entries = loaded.all_entries();
         let published = entries.iter().find(|e| e.object_id == key).unwrap();
         assert_eq!(published.replacement_receipt, Some(receipt_gen5));
@@ -1146,7 +1188,7 @@ mod tests {
             }
         ));
 
-        let loaded = load_dead_object_reclaim_queue(&store);
+        let loaded = load_dead_object_reclaim_queue(&store).expect("load rejected receipt state");
         let entries = loaded.all_entries();
         let entry = entries.iter().find(|e| e.object_id == key).unwrap();
         assert_eq!(entry.replacement_receipt, None);
