@@ -144,16 +144,10 @@ Functions on the FUSE/ublk I/O hot path must not hash data with BLAKE3 when
 the storage layer already computes and verifies the same digest on
 commit/read. Doing it twice wastes CPU in the daemon's hottest loop.
 
-Affected code:
-- `apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_vfs_adapter.rs` —
-  `blake3::hash(&data[..written])` in dispatch_write
-- `apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_write.rs` —
-  `use blake3::Hasher`
-
-**Fix**: Remove the BLAKE3 hash from the write path. The intent log and object
-store already compute and verify BLAKE3 digests at persist time. If the write
-path needs an intent-log record identifier, use a monotonic sequence number or
-the object store key returned after commit.
+The current FUSE write path does not compute a second BLAKE3 digest. Its
+`staged_write_hash64` value is derived scheduler bookkeeping; the object store
+computes and verifies the durable BLAKE3 digest at persist/read time. Do not
+add a duplicate hot-path BLAKE3 pass for intent or adapter bookkeeping.
 
 ### 3.3 Non-Durable Bookkeeping
 

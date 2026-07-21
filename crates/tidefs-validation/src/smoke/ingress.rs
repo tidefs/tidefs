@@ -25,9 +25,8 @@ use tidefs_posix_filesystem_adapter_daemon::ingress::{
     FUSE_OPENDIR_OPCODE, FUSE_OPEN_OPCODE, FUSE_READDIRPLUS_OPCODE, FUSE_READDIR_OPCODE,
     FUSE_READLINK_OPCODE, FUSE_READ_OPCODE, FUSE_RELEASEDIR_OPCODE, FUSE_RELEASE_OPCODE,
     FUSE_RENAME2_OPCODE, FUSE_RENAME_OPCODE, FUSE_RMDIR_OPCODE, FUSE_STATFS_OPCODE,
-    FUSE_SYMLINK_OPCODE, FUSE_UNLINK_OPCODE, FUSE_WRITE_CACHE, FUSE_WRITE_KILL_PRIV,
-    FUSE_WRITE_LOCKOWNER, FUSE_WRITE_OPCODE, SEAM_FAMILY_DOC, WRITE_ERRNO_EBADF,
-    WRITE_ERRNO_EINVAL,
+    FUSE_SYMLINK_OPCODE, FUSE_UNLINK_OPCODE, FUSE_WRITE_KILL_PRIV, FUSE_WRITE_LOCKOWNER,
+    FUSE_WRITE_OPCODE, SEAM_FAMILY_DOC, WRITE_ERRNO_EBADF, WRITE_ERRNO_EINVAL,
 };
 use tidefs_types_posix_filesystem_adapter_core::{
     PosixFilesystemAdapterBackpressureStateRecord, PosixFilesystemAdapterRequestClass,
@@ -440,23 +439,17 @@ fn smoke_write_classifier(h: &mut SmokeHarness) {
         Some(WRITE_ERRNO_EBADF),
     );
 
+    const UNNEGOTIATED_FUSE_WRITE_CACHE: u32 = 1;
     let cache_flag = RawFuseWriteRequest {
-        write_flags: FUSE_WRITE_CACHE,
+        write_flags: UNNEGOTIATED_FUSE_WRITE_CACHE,
         ..write_req()
     };
     let cache_classification = WriteClassifier::new().classify(&write_handles(), cache_flag);
     h.assert_eq_ev(
-        "cache flag should not reject at ingress",
+        "unnegotiated kernel writeback-cache flag rejects with EINVAL",
         cache_classification.errno(),
-        None,
+        Some(WRITE_ERRNO_EINVAL),
     );
-    if let ClassifiedWrite::DirtyExtent(staging) = cache_classification {
-        h.assert_eq_ev(
-            "cache flag is preserved for handler gating",
-            staging.write_flags,
-            FUSE_WRITE_CACHE,
-        );
-    }
 
     let unsupported_flag = RawFuseWriteRequest {
         write_flags: 0x08,

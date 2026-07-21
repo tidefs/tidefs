@@ -21,12 +21,11 @@
 //!    the appropriate dispatch handler.
 //!
 //! 2. **Dispatch**: the [`FuseVfsAdapter`] implements [`fuser::Filesystem`]
-//!    and dispatches each operation to a type-safe handler.  Namespace
-//!    operations (lookup, mkdir, unlink, rename, symlink, …) go through
-//!    [`Namespace`]; data-path operations (read, write, fallocate, flush,
-//!    fsync) go through the page-cache and extent-map; metadata operations
-//!    (getattr, setattr, access) go through the inode table and permission
-//!    checker.
+//!    and dispatches each operation to a type-safe handler. Mounted reads and
+//!    mutations enter the [`VfsEngine`]; adapter caches and write trackers are
+//!    derived coordination state, not alternate byte or namespace authority.
+//!    The optional [`Namespace`] handle remains a fallback for isolated test
+//!    fixtures and does not own mounted mutation semantics.
 //!
 //! 3. **Reply**: each handler returns either a success value (packed into
 //!    a FUSE reply) or an [`Errno`] error code.  The reply layer
@@ -62,28 +61,18 @@
 //! | Module | Purpose |
 //! |--------|---------|
 //! | [`fuse_vfs_adapter`] | Main `fuser::Filesystem` impl; ~30 FUSE op handlers |
-//! | [`fuse_write`] | Write/write_buf dispatch with page-cache dirty tracking |
-//! | [`fuse_read`] | Read dispatch with page-cache look-aside |
-//! | [`fuse_flush_fsync`] | Flush/fsync dispatch with writeback and extent commit |
+//! | [`fuse_flush_fsync`] | Engine-backed bridge for mounted flush/fsync durability |
 //! | [`fuse_lookup_forget`] | Lookup and forget dispatch |
 //! | [`fuse_rename`] | Atomic rename with cross-directory validation |
 //! | [`fuse_create_unlink_dispatch`] | Unlink/rmdir with capacity release |
 //! | [`readdir_dispatch`] | Readdir/readdirplus with cookie-based pagination |
-//! | [`write_dispatch`] | Ingress-classified write staging and dirty scheduling |
-//! | [`read_cache`] | In-memory read-ahead cache for hot data |
-//! | [`writeback_reclaim`] | Dirty-page writeback and reclaim |
 //!
 //! [`fuse_vfs_adapter`]: crate::fuse_vfs_adapter
-//! [`fuse_write`]: crate::fuse_write
-//! [`fuse_read`]: crate::fuse_read
 //! [`fuse_flush_fsync`]: crate::fuse_flush_fsync
 //! [`fuse_lookup_forget`]: crate::fuse_lookup_forget
 //! [`fuse_rename`]: crate::fuse_rename
 //! [`fuse_create_unlink_dispatch`]: crate::fuse_create_unlink_dispatch
 //! [`readdir_dispatch`]: crate::readdir_dispatch
-//! [`write_dispatch`]: crate::write_dispatch
-//! [`read_cache`]: crate::read_cache
-//! [`writeback_reclaim`]: crate::writeback_reclaim
 
 pub mod observability;
 pub mod trace;
@@ -95,29 +84,16 @@ pub mod fuse_create_unlink_dispatch;
 pub mod fuse_flush_fsync;
 pub mod fuse_lookup_forget;
 pub mod fuse_posix_lock;
-pub mod fuse_read;
 pub mod fuse_rename;
 pub mod fuse_vfs_adapter;
-pub mod fuse_write;
 pub mod handler_prelude;
 pub mod live_owner;
 pub mod lock_dispatch;
-pub mod materialized_cache;
 pub mod mmap_coherency;
 
-/// Canonical cache authority model version (docs/cache-authority-model.md).
-/// The daemon ReadCache is Derived and superseded by cache-core::PageCache.
-/// The FUSE writeback cache is Optional, gated behind --writeback-cache.
-pub const DAEMON_CACHE_AUTHORITY_MODEL_VERSION: &str = "v0.420";
-
 pub mod mount_options;
-pub mod read_cache;
 pub mod readdir_dispatch;
 pub mod txg_cycle;
-pub mod workload_observer;
-pub mod write_dispatch;
-
-pub mod writeback_reclaim;
 pub mod xattr_integrity;
 pub mod xfstests_harness;
 
@@ -130,10 +106,8 @@ pub mod maintenance;
 pub mod placement_recorder;
 pub mod reply;
 pub mod runtime;
-pub mod scheduler;
 pub mod workers_meta;
 pub mod workers_ns;
-pub mod workers_writeback;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -255,21 +229,10 @@ pub struct MountConfig {
     pub foreground: bool,
     /// Enable debug logging to stderr.
     pub debug: bool,
-    /// Enable FUSE writeback cache for mmap support.
-    /// When true, FUSE_WRITE_CACHE flagged writes are accepted and
-    /// the kernel page cache is used for buffered writes, enabling
-    /// mmap(2) and reducing write-amplification for small I/O.
-    /// This is the final authority for both the FUSE mount option
-    /// (`fuser::MountOption::WritebackCache`) and the adapter's
-    /// `writeback_cache_enabled` flag.  It defaults to false until mounted
-    /// writeback-cache validation closes the A11 authority gate.
-    pub writeback_cache: bool,
     /// Coherency profile for FUSE caching behaviour.
-    /// Determines attribute/entry TTLs and invalidation policy. The boolean
-    /// [`writeback_cache`] field, not the profile, controls kernel writeback
-    /// negotiation and `FUSE_WRITE_CACHE` admission.
-    /// Default: Writeback for TTL/invalidation only; kernel writeback remains
-    /// opt-in through [`writeback_cache`].
+    /// Determines attribute/entry TTLs and invalidation policy. No profile
+    /// enables kernel writeback caching or permits readable opens to bypass
+    /// receipt-authoritative direct I/O.
     pub coherency_profile: crate::coherency_profile::CoherencyProfile,
     /// Block devices backing the pool (when set,  is used
     /// only for pool metadata such as labels and markers; all object data
@@ -464,9 +427,7 @@ pub fn run_mount(config: MountConfig) -> Result<(), String> {
         }
     }
 
-    let (base_engine, writeback_tracker, dataset_id) = if let Some(ref snapshot_name) =
-        config.snapshot_name
-    {
+    let (base_engine, dataset_id) = if let Some(ref snapshot_name) = config.snapshot_name {
         // Snapshot export: open the snapshot's committed root as a
         // read-only namespace with no writeback, scrub, or reclaim.
         use tidefs_local_filesystem::LocalFileSystemOpenConfig;
@@ -497,7 +458,7 @@ pub fn run_mount(config: MountConfig) -> Result<(), String> {
         engine.set_timestamp_policy(tidefs_inode_attributes::timestamp::TimestampPolicy::Noatime);
         engine = engine.with_read_only();
         let dataset_id: Option<DatasetId> = None;
-        (engine, None, dataset_id)
+        (engine, dataset_id)
     } else {
         let mut lfs = if let Some(ref devices) = config.block_devices {
             // Block-device-backed pool: use metadata dir + block devices.
@@ -577,8 +538,6 @@ pub fn run_mount(config: MountConfig) -> Result<(), String> {
         lfs.set_commit_group_throughput_profile();
         lfs.set_max_uncommitted_mutations(MOUNT_MAX_UNCOMMITTED_MUTATIONS);
 
-        let tracker = Arc::clone(lfs.writeback_range_tracker());
-
         // Build the base VfsLocalFileSystem, optionally scoped to a dataset root.
         let mut engine = VfsLocalFileSystem::new(lfs);
         // When mounting a non-root dataset, scope path resolution to the
@@ -593,7 +552,7 @@ pub fn run_mount(config: MountConfig) -> Result<(), String> {
                 engine = engine.with_dataset_root(&dataset_fs_path);
             }
         }
-        (engine, Some(tracker), dataset_id)
+        (engine, dataset_id)
     };
 
     // When cluster-authorized, wrap the engine in a placement-recording layer.
@@ -620,18 +579,6 @@ pub fn run_mount(config: MountConfig) -> Result<(), String> {
         adapter = adapter.with_dataset_id(ds_id);
     }
 
-    if snapshot_export {
-        adapter = adapter.with_writeback_cache_disabled();
-    } else if config.writeback_cache {
-        adapter = adapter
-            .with_writeback_cache_enabled()
-            .with_writeback_range_tracker(
-                writeback_tracker.expect("writeback tracker must be present for live mount"),
-            );
-    } else {
-        adapter = adapter.with_writeback_cache_disabled();
-    }
-
     let shutdown = Arc::new(AtomicBool::new(false));
     install_signal_handlers(Arc::clone(&shutdown)).map_err(|e| format!("signal handler: {e}"))?;
     let live_owner_engine = adapter.engine_handle();
@@ -643,10 +590,6 @@ pub fn run_mount(config: MountConfig) -> Result<(), String> {
     if !config.foreground {
         options.push(fuser::MountOption::AllowOther);
     }
-    if !snapshot_export && config.writeback_cache {
-        options.push(fuser::MountOption::WritebackCache);
-    }
-
     let session = fuser::spawn_mount2(adapter, &config.mountpoint, &options)
         .map_err(|e| format!("FUSE mount: {e}"))?;
 

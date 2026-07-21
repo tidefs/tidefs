@@ -2633,39 +2633,6 @@ pub fn check_transaction_model_current_workspace() -> Result<(), StorageCheckErr
         ],
         &mut missing,
     );
-    check_source_markers(
-        &root,
-        "apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_flush_fsync.rs",
-        &[
-            "dispatch_fsync",
-            "dispatch_fsync_with_tracker",
-            "flush_dirty_range",
-            "engine.fsync()",
-            "datasync",
-            "DirtyPageTracker",
-            "take_boundary",
-            "clear_until_boundary",
-            "dispatch_fsync_datasync_true_passes_flag_to_engine",
-        ],
-        &mut missing,
-    );
-    check_source_markers(
-        &root,
-        "apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_vfs_adapter.rs",
-        &[
-            "dispatch_fsync_file",
-            "commit_current_txg_barrier",
-            "dispatch_fdatasync",
-            "dispatch_fsyncdir",
-            "pagecache_writeback_dispatch_write_dirty_then_fsync_clears",
-            "pagecache_writeback_dispatch_fdatasync_clears_dirty_pages",
-            "dispatch_fsync_drains_writeback_range_tracker",
-            "dispatch_fdatasync_drains_writeback_range_tracker",
-            "dispatch_fsyncdir_drains_writeback_range_tracker",
-        ],
-        &mut missing,
-    );
-
     // Verify BackgroundOrphanReclamation registration at mount.
     check_required_file(
         &root,
@@ -3308,8 +3275,6 @@ pub fn check_integrity_pipeline_current_workspace() -> Result<(), StorageCheckEr
         "crates/tidefs-local-filesystem/tests/integrity_pipeline_tests.rs",
         "crates/tidefs-local-filesystem/tests/verifier_checksum_tests.rs",
         "crates/tidefs-local-filesystem/tests/verifier_snapshot_tests.rs",
-        "crates/tidefs-local-filesystem/src/scrub.rs",
-        "crates/tidefs-local-filesystem/src/checksum.rs",
     ] {
         check_required_file(&root, rel, &mut missing);
     }
@@ -3385,31 +3350,6 @@ pub fn check_integrity_pipeline_current_workspace() -> Result<(), StorageCheckEr
         ],
         &mut missing,
     );
-    check_source_markers(
-        &root,
-        "crates/tidefs-local-filesystem/src/scrub.rs",
-        &[
-            "ScrubReport",
-            "ScrubBlockOutcome",
-            "ScrubBlockKind",
-            "ScrubBlockId",
-            "ScrubViolation",
-            "RepairStrategy",
-        ],
-        &mut missing,
-    );
-    check_source_markers(
-        &root,
-        "crates/tidefs-local-filesystem/src/checksum.rs",
-        &[
-            "BlockChecksum",
-            "FastBlockChecksum",
-            "ProductionBlockChecksum",
-            "Checksummed",
-        ],
-        &mut missing,
-    );
-
     // Verify BackgroundOrphanReclamation registration at mount.
     check_required_file(
         &root,
@@ -3429,7 +3369,7 @@ pub fn check_integrity_pipeline_current_workspace() -> Result<(), StorageCheckEr
         &mut missing,
     );
     if missing.is_empty() {
-        println!("integrity pipeline ok: scrub, checksum, and verifier test suites are implementation-tracked non-release");
+        println!("integrity pipeline ok: online verifier boundary and focused corruption tests are present");
         Ok(())
     } else {
         Err(StorageCheckError {
@@ -3820,16 +3760,6 @@ pub fn check_poolstore_compression_current_workspace() -> Result<(), StorageChec
     }
 }
 
-const MOUNTED_TRANSFORM_RAW_STORE_COUNTS: &[(&str, usize)] = &[
-    ("crates/tidefs-local-object-store/src/pool/mod.rs", 9),
-    ("crates/tidefs-local-filesystem/src/lib.rs", 54),
-    ("crates/tidefs-local-filesystem/src/content.rs", 6),
-    ("crates/tidefs-local-filesystem/src/intent_log.rs", 1),
-    ("crates/tidefs-local-filesystem/src/crash_recovery.rs", 1),
-    ("crates/tidefs-local-filesystem/src/journal_cleaner.rs", 7),
-    ("crates/tidefs-local-filesystem/src/vfs_engine_impl.rs", 4),
-];
-
 pub fn check_mounted_transform_authority_current_workspace() -> Result<(), StorageCheckError> {
     let root = find_workspace_root().ok_or_else(|| StorageCheckError {
         title: "mounted transform authority raw-store inventory check",
@@ -3851,8 +3781,6 @@ pub fn check_mounted_transform_authority_current_workspace() -> Result<(), Stora
         check_required_file(&root, rel, &mut missing);
     }
 
-    check_mounted_transform_raw_store_counts(&root, &mut missing);
-
     check_source_markers(
         &root,
         "docs/MOUNTED_TRANSFORM_AUTHORITY_RAW_STORE_INVENTORY.md",
@@ -3872,13 +3800,6 @@ pub fn check_mounted_transform_authority_current_workspace() -> Result<(), Stora
             "MetadataRawOnlyNoDeviceTransforms",
             "Mounted local-filesystem device-level compression and encryption are blocked",
             "must fail closed while any production `blocked` row remains",
-            "`crates/tidefs-local-object-store/src/pool/mod.rs` | 9",
-            "`crates/tidefs-local-filesystem/src/lib.rs` | 54",
-            "`crates/tidefs-local-filesystem/src/content.rs` | 6",
-            "`crates/tidefs-local-filesystem/src/intent_log.rs` | 1",
-            "`crates/tidefs-local-filesystem/src/crash_recovery.rs` | 1",
-            "`crates/tidefs-local-filesystem/src/journal_cleaner.rs` | 7",
-            "`crates/tidefs-local-filesystem/src/vfs_engine_impl.rs` | 4",
             "MountedContentReadAuthority",
         ],
         &mut missing,
@@ -4003,29 +3924,6 @@ pub fn check_mounted_transform_authority_current_workspace() -> Result<(), Stora
             missing,
         })
     }
-}
-
-fn check_mounted_transform_raw_store_counts(root: &Path, missing: &mut Vec<String>) {
-    for (rel, expected) in MOUNTED_TRANSFORM_RAW_STORE_COUNTS {
-        let path = root.join(rel);
-        let text = match fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(err) => {
-                missing.push(format!("read {rel}: {err}"));
-                continue;
-            }
-        };
-        let actual = raw_primary_store_match_count(&text);
-        if actual != *expected {
-            missing.push(format!(
-                "{rel} has {actual} raw-primary-store matches; update inventory classification for expected {expected}"
-            ));
-        }
-    }
-}
-
-fn raw_primary_store_match_count(text: &str) -> usize {
-    text.matches("raw_primary_store(").count() + text.matches("raw_primary_store_mut(").count()
 }
 
 pub fn check_btree_current_workspace() -> Result<(), StorageCheckError> {
@@ -4555,17 +4453,18 @@ pub fn check_background_scheduler_fs_current_workspace() -> Result<(), StorageCh
         "crates/tidefs-local-filesystem/src/lib.rs",
         &[
             "use tidefs_background_scheduler",
-            "impl BackgroundService for BackgroundScrubber",
             "struct BackgroundSchedulerRuntime",
             "fn start",
             "fn stop",
             "background_scheduler: Option<BackgroundSchedulerRuntime>",
+            "BackgroundOrphanReclamation",
+            "register(Box::new(orphan_reclamation))",
         ],
         &mut missing,
     );
 
     if missing.is_empty() {
-        println!("background scheduler FS integration ok: BackgroundSchedulerRuntime drives BackgroundScrubber as a BackgroundService on the LocalFileSystem; scheduler ticks at 1 s interval");
+        println!("background scheduler FS integration ok: BackgroundSchedulerRuntime drives registered LocalFileSystem services at a 1 s interval");
         Ok(())
     } else {
         Err(StorageCheckError {

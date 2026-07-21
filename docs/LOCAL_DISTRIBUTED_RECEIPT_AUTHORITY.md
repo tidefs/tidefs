@@ -24,8 +24,8 @@ can carry durable placement identity forward without doing a second lookup.
 | `Pool::put` | Writes receipt-publishing I/O classes through pool-wide placement and persists a `PlacementReceipt` |
 | `Pool::put_with_receipt` | Performs the same receipt-publishing write and returns the persisted receipt |
 | `PoolStoreMut::put_with_receipt` | Data-class convenience wrapper for callers holding a mutable pool store |
-| `Pool::get` | Prefers persisted receipt lookup and falls back to device scans only when no receipt exists |
-| `Pool::placement_receipts` | Scans persisted receipts and returns the latest logical receipt per object key |
+| `Pool::get` | Selects the current receipt across every attached device and reads only its recorded targets; receiptless raw reads are limited to `IntentLog` |
+| `Pool::placement_receipts` | Scans every attached device and returns the latest logical receipt per object key |
 | `PlacementReceipt::shared_receipt_ref` | Projects local receipts into the shared `PlacementReceiptRef` model |
 | `Pool::repair_with_receipt` | Rewrites reconstructed bytes through placement and returns the replacement receipt |
 | receipt-bound drains | Hold obsolete physical objects until replacement receipt generation is stable |
@@ -112,11 +112,20 @@ authority for subsequent reads.
 
 ## Read And Reclaim Flow
 
-`Pool::get` first loads the current receipt for the object key. Replicated
-receipts try recorded targets and verify the logical payload digest. Erasure
-receipts read recorded shards, verify stored shard digests, and reconstruct
-when enough shards remain available. If no receipt is present, pre-receipt
-device scanning remains the local fallback for older in-tree harness data.
+`Pool::get` first selects the current receipt for the object key across every
+attached device, regardless of the requested I/O class. Replicated receipts try
+only recorded targets and verify the logical payload digest. Erasure receipts
+read recorded shards, verify stored shard digests, and reconstruct only when
+enough verified shards remain available. A selected receipt whose payload is
+unavailable, corrupt, or insufficient returns an error rather than ordinary
+absence.
+
+Receiptless raw reads are limited to `IntentLog`, whose write-ahead-log
+semantics intentionally do not publish placement receipts. For `Data`,
+`Metadata`, and `ReadCache`, raw bytes without a receipt are an authority error.
+A never-present or fully deleted non-IntentLog key returns ordinary absence only
+after every attached device confirms that neither a receipt nor raw bytes for
+the key exist.
 
 Receipt-bound dead-object drains only free obsolete physical objects after the
 replacement receipt generation is stable. This keeps reclaim from racing the

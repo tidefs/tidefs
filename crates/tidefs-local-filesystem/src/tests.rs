@@ -1998,6 +1998,100 @@ fn buffered_overwrite_admission_reuses_committed_layout_cache() {
 }
 
 #[test]
+fn receipt_authority_revalidates_hot_and_layout_cache_hits() {
+    let chunk_size = content_chunk_size() as usize;
+    let payload = vec![0x5a; chunk_size + 17];
+
+    let hot_root = temp_root("receipt-hot-cache-revalidation");
+    let mut hot_fs =
+        LocalFileSystem::open_with_options(&hot_root, options()).expect("open hot-cache fixture");
+    hot_fs.hot_read_cache = RefCell::new(HotReadCache::new(HotReadCachePolicy {
+        max_entries: 2,
+        max_bytes: u64::try_from(payload.len())
+            .expect("test payload length fits u64")
+            .saturating_mul(2),
+    }));
+    let hot_inode = hot_fs
+        .create_file("/hot.bin", 0o644)
+        .expect("create hot-cache file");
+    hot_fs
+        .write_file("/hot.bin", 0, &payload)
+        .expect("write hot-cache payload");
+    hot_fs
+        .flush_write_buffer(hot_inode.inode_id)
+        .expect("flush hot-cache payload");
+    let hot_record = hot_fs.stat("/hot.bin").expect("stat hot-cache file");
+    let hot_layout = MountedContentReadAuthority::new(&hot_fs.store)
+        .read_layout(hot_inode.inode_id, &hot_record, false)
+        .expect("read hot-cache layout");
+    let ContentLayout::Chunked(hot_manifest) = hot_layout else {
+        panic!("hot-cache fixture must be chunked");
+    };
+    let hot_chunk = hot_manifest
+        .chunks
+        .iter()
+        .find(|chunk| !chunk.is_hole())
+        .expect("hot-cache non-hole chunk");
+    let hot_chunk_key = content_chunk_object_key_for_version(
+        hot_inode.inode_id,
+        hot_chunk.data_version,
+        hot_chunk.chunk_index,
+    );
+    assert_eq!(
+        hot_fs.read_file("/hot.bin").expect("fill hot cache"),
+        payload
+    );
+    let cache_report = hot_fs.hot_read_cache_report();
+    assert_eq!(cache_report.admission_bypasses, 0);
+    assert_eq!(cache_report.resident_entries, 1);
+    hot_fs
+        .store
+        .raw_primary_store_mut()
+        .put(hot_chunk_key, b"unauthorized raw chunk replacement")
+        .expect("replace chunk without receipt");
+    hot_fs
+        .read_file("/hot.bin")
+        .expect_err("hot bytes must not hide unavailable current receipt payload");
+    drop(hot_fs);
+    cleanup(&hot_root);
+
+    let layout_root = temp_root("receipt-layout-cache-revalidation");
+    let mut layout_fs = LocalFileSystem::open_with_options(&layout_root, options())
+        .expect("open layout-cache fixture");
+    let layout_inode = layout_fs
+        .create_file("/layout.bin", 0o644)
+        .expect("create layout-cache file");
+    layout_fs
+        .write_file("/layout.bin", 0, &payload)
+        .expect("write layout-cache payload");
+    layout_fs
+        .flush_write_buffer(layout_inode.inode_id)
+        .expect("flush layout-cache payload");
+    assert_eq!(layout_fs.content_layout_cache_len_for_test(), 0);
+    layout_fs
+        .read_file_range("/layout.bin", chunk_size as u64, 64)
+        .expect("fill content-layout cache");
+    assert_eq!(layout_fs.content_layout_cache_len_for_test(), 1);
+    let before = layout_fs.stat("/layout.bin").expect("stat before refusal");
+    let manifest_key = content_object_key_for_version(layout_inode.inode_id, before.data_version);
+    layout_fs
+        .store
+        .raw_primary_store_mut()
+        .put(manifest_key, b"unauthorized raw manifest replacement")
+        .expect("replace manifest without receipt");
+    layout_fs
+        .write_file("/layout.bin", chunk_size as u64 + 3, b"x")
+        .expect_err("cached layout must not authorize a mutation");
+    assert_eq!(
+        layout_fs.stat("/layout.bin").expect("stat after refusal"),
+        before
+    );
+    assert!(!layout_fs.write_buffers.contains_key(&layout_inode.inode_id));
+    drop(layout_fs);
+    cleanup(&layout_root);
+}
+
+#[test]
 fn write_file_non_empty_invalidates_hot_read_cache() {
     let root = temp_root("write-file-invalidate-hot-read-cache");
     let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
@@ -3468,6 +3562,7 @@ fn online_verifier_reports_corrupt_candidate_without_changing_live_truth() {
         reopened.read_file("/stable.txt").expect("read reopened"),
         b"stable before verifier".to_vec()
     );
+    drop(reopened);
     cleanup(&root);
 }
 
@@ -3764,6 +3859,108 @@ fn invalid_newer_same_slot_root_falls_back_to_previous_version_without_operator_
             && issue.reason.contains("stale same-slot root candidate")
     }));
     drop(reopened);
+    cleanup(&root);
+}
+
+#[test]
+fn online_verifier_newer_same_slot_root_with_broken_content_authority_is_not_hidden_by_valid_fallback(
+) {
+    let root = temp_root("newer-same-slot-broken-content-authority");
+    let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
+    fs.create_file("/old.bin", 0o644)
+        .expect("create old-root file");
+    fs.create_file("/new.bin", 0o644)
+        .expect("create future newer-root file");
+    let old_payload = vec![0x41; content_chunk_size() as usize + 17];
+    fs.replace_file("/old.bin", &old_payload)
+        .expect("commit old-root payload");
+    let old_transaction_id = fs.stats().filesystem_generation;
+    let same_slot = root_slot_for_transaction(old_transaction_id);
+    let same_slot_key = root_slot_object_key(same_slot);
+    let old_root_bytes = fs
+        .store
+        .raw_primary_store()
+        .get(same_slot_key)
+        .expect("read old root slot")
+        .expect("old root slot exists");
+
+    for index in 0..FILESYSTEM_ROOT_SLOT_COUNT - 1 {
+        fs.create_file(format!("/advance-{index}"), 0o644)
+            .expect("advance toward the same root slot");
+    }
+
+    let new_payload = vec![0x42; content_chunk_size() as usize + 29];
+    fs.replace_file("/new.bin", &new_payload)
+        .expect("commit newer same-slot payload");
+    let new_transaction_id = fs.stats().filesystem_generation;
+    assert_eq!(
+        new_transaction_id,
+        old_transaction_id + FILESYSTEM_ROOT_SLOT_COUNT
+    );
+    assert_eq!(root_slot_for_transaction(new_transaction_id), same_slot);
+    let new_root_bytes = fs
+        .store
+        .raw_primary_store()
+        .get(same_slot_key)
+        .expect("read newer root slot")
+        .expect("newer root slot exists");
+
+    // Receipt-bound dead-object draining may already have retired the old
+    // slot location. Recreate the valid historical ordering directly so the
+    // verifier must inspect a broken newer candidate and then a valid older
+    // candidate in the same slot.
+    fs.store
+        .raw_primary_store_mut()
+        .put(same_slot_key, &old_root_bytes)
+        .expect("restore older same-slot root candidate");
+    fs.store
+        .raw_primary_store_mut()
+        .put(same_slot_key, &new_root_bytes)
+        .expect("restore newer same-slot root candidate ordering");
+
+    let inode_id = fs.lookup("/new.bin").expect("lookup newer file");
+    let record = fs.stat("/new.bin").expect("stat newer file");
+    let layout = MountedContentReadAuthority::new(&fs.store)
+        .read_layout(inode_id, &record, false)
+        .expect("read newer file layout");
+    let ContentLayout::Chunked(manifest) = layout else {
+        panic!("newer payload must be chunked");
+    };
+    let chunk = manifest
+        .chunks
+        .iter()
+        .find(|chunk| !chunk.is_hole())
+        .expect("newer file has a non-hole chunk");
+    let chunk_key =
+        content_chunk_object_key_for_version(inode_id, chunk.data_version, chunk.chunk_index);
+    fs.store
+        .raw_primary_store_mut()
+        .put(chunk_key, b"raw replacement without placement receipt")
+        .expect("replace newer chunk without publishing a receipt");
+    fs.store
+        .raw_primary_store_mut()
+        .sync_all()
+        .expect("sync same-slot candidates and unauthorized replacement");
+
+    let verifier = fs
+        .online_verifier_report()
+        .expect("verifier returns an issue report");
+    assert_eq!(verifier.outcome, OnlineVerifierOutcome::IssuesFound);
+    assert!(!verifier.passed());
+    assert!(
+        verifier.verified_committed_roots.iter().any(|verified| {
+            verified.root.transaction_id == old_transaction_id && verified.root.slot == same_slot
+        }),
+        "older same-slot root must remain valid: {verifier:#?}"
+    );
+    assert!(verifier.issues.iter().any(|issue| {
+        issue.kind == OnlineVerifierIssueKind::RootCommitValidation
+            && issue.severity == OnlineVerifierIssueSeverity::Error
+            && issue.slot == Some(same_slot)
+            && issue.transaction_id == Some(new_transaction_id)
+    }));
+
+    drop(fs);
     cleanup(&root);
 }
 
@@ -6936,12 +7133,6 @@ fn mounted_committed_root_repair_authority_routes_probe_audit_verifier_and_reten
             Some(generation)
         );
 
-        let verifier = repair_authority
-            .online_verifier_report()
-            .expect("verify online through repair authority");
-        assert_eq!(verifier.outcome, OnlineVerifierOutcome::Clean);
-        assert!(verifier.passed());
-
         let plan = repair_authority
             .root_retention_plan(RootRetentionPolicy::safe_default())
             .expect("plan root retention through repair authority");
@@ -6949,6 +7140,13 @@ fn mounted_committed_root_repair_authority_routes_probe_audit_verifier_and_reten
             .protected_committed_roots
             .iter()
             .any(|root| root.generation == generation));
+        drop(repair_authority);
+
+        let verifier = open_authority
+            .online_verifier_report()
+            .expect("verify online through Pool recovery authority");
+        assert_eq!(verifier.outcome, OnlineVerifierOutcome::Clean);
+        assert!(verifier.passed());
     }
 
     cleanup(&root);

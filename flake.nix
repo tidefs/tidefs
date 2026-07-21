@@ -43,11 +43,6 @@
             cp ${./scripts/tidefs-xfstests-exclude} "$out/bin/tidefs-xfstests-exclude"
           '';
 
-          tidefsMmapWorkload = pkgs.runCommandCC "tidefs-mmap-workload" {
-          } ''
-            mkdir -p "$out/bin"
-            cc -O2 -Wall ${./scripts/tidefs-mmap-workload.c} -o "$out/bin/tidefs-mmap-workload"
-          '';
           xfstests = pkgs.xfstests.overrideAttrs (old: {
             buildInputs = (old.buildInputs or []) ++ [ pkgs.gdbm ];
             NIX_CFLAGS_COMPILE = (old.NIX_CFLAGS_COMPILE or "") + " -std=gnu99 -Wno-error=incompatible-pointer-types";
@@ -339,7 +334,7 @@
             ];
           };
 
-          inherit xfstests tidefsFsx tidefsXfstestsScripts tidefsMmapWorkload;
+          inherit xfstests tidefsFsx tidefsXfstestsScripts;
 
           qemuSmoke = pkgs.testers.runNixOSTest {
             name = "tidefs-qemu-smoke";
@@ -3028,20 +3023,6 @@ EOF
             tidefsPackage = tidefsCtlRuntime;
           };
 
-          fuseWritebackCacheValidation = import ./nix/vm/fuse-writeback-cache-validation.nix {
-            inherit pkgs;
-            linuxKernel_7_0 = linuxKernel_7_0;
-            tidefsPackage = default;
-          };
-
-          fuseWritebackCacheValidationFast = import ./nix/vm/fuse-writeback-cache-validation.nix {
-            inherit pkgs;
-            linuxKernel_7_0 = null;
-            tidefsPackage = null;
-            useHostTools = true;
-          };
-
-
           fuseXfstestsValidation = import ./nix/vm/fuse-xfstests-validation.nix {
             inherit pkgs;
             linuxKernel_7_0 = linuxKernel_7_0;
@@ -3057,7 +3038,6 @@ EOF
             linuxKernel_7_0 = linuxKernel_7_0;
             tidefsPackage = default;
             tidefsFsx = tidefsFsx;
-            tidefsMmapWorkload = tidefsMmapWorkload;
             flakeLock = ./flake.lock;
           };
 
@@ -3975,8 +3955,6 @@ EOF
             exec ${self.packages.${system}.kmodXfstestsSmoke}/bin/tidefs-kmod-xfstests-smoke \
               --module ${self.packages.${system}.tidefsPosixVfsKmod}/tidefs_posix_vfs.ko "$@"
           '';
-
-          fuse-writeback-cache-validation = qemuSourceApp "tidefs-fuse-writeback-cache-validation";
 
           fuse-xfstests-validation = script "tidefs-fuse-xfstests-validation" [
             pkgs.bash

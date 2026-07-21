@@ -47,10 +47,10 @@
 //!
 //! On open, `crash_recovery` replays the intent log and selects the
 //! newest valid committed root. The `recovery` module handles torn-tail
-//! repair without operator intervention. `repair` applies corruption
-//! resolution strategies (truncate, mark-corrupt, reconstruct), and
-//! `scrub` runs a full block-level checksum pipeline with outcome
-//! classification.
+//! recovery without operator intervention. Operator-visible online
+//! verification checks committed roots and receipt-authorized content.
+//! LocalFS has no automatic corruption-repair scheduler or foreground scrub
+//! carrier; unreadable or corrupt mounted content fails closed.
 //!
 //! # Key types
 //!
@@ -84,17 +84,11 @@
 //! 4. receipt-bound dead-object drains free segments only after committed
 //!    clearance evidence authorizes the object ids.
 //!
-//! The scrub-to-repair scheduling chain:
-//! 1. `BackgroundScrubber` periodically opens a read-only store, runs
-//!    `verify_online_store` and `scrub_inodes_content`, and sets the
-//!    shared `scrub_corruption_detected` flag when corruption is found.
-//! 2. `tick_background_services()` Duty 3 picks up the flag, runs
-//!    `repair_cycle()` (scrub → schedule → dispatch) against the live
-//!    store, and clears the flag.
-//! 3. `repair_cycle()` delegates to `schedule_scrub_repairs()` +
-//!    `dispatch_scheduled_repairs()`, which classify violations through
-//!    receipt-gated repair admission. Receiptless runtime scrub rows are
-//!    reported as blocked evidence rather than synthesized repair jobs.
+//! Automatic mounted background scrub is not yet supported. A nonzero
+//! `StoreOptions::background_scrub_interval_secs` is rejected before Pool
+//! open rather than starting a second raw-store owner or a timer whose request
+//! can remain undrained on a quiescent mount. Operator-visible online
+//! verification runs through the mounted Pool authority.
 //!
 //! # Features
 //!
@@ -172,11 +166,11 @@
 //!    clean gaps with zeros.
 //! 4. The `ContentLayout` is read from the object store, then content
 //!    objects are fetched and reassembled into the requested byte range.
-//! 5. The `PageCache` stores clean pages for hot-read acceleration;
-//!    cache hits avoid object-store round trips.
+//! 5. Cached bytes are never authoritative: persisted content is read and
+//!    receipt-validated before any cached copy can be reused.
 //! 6. BLAKE3 checksum verification runs on each content object read.
-//!    Corrupt objects trigger `ContentIntegrityError` and
-//!    self-healing via the `repair` module when replicas exist.
+//!    Integrity and placement-authority failures return [`FileSystemError`];
+//!    this crate does not silently reconstruct or rewrite corrupt objects.
 //!
 //! # Write path
 //!
@@ -248,9 +242,8 @@
 //! 6. **Torn-tail repair**: the `recovery` module handles incomplete
 //!    commits (mid-write root slots) by ignoring them — the filesystem
 //!    always selects the newest *complete* commit automatically.
-//! 7. **Background services**: compaction, reclaim, orphan-reclamation,
-//!    and writeback daemons are started via
-//!    [`tidefs_background_scheduler`].
+//! 7. **Background services**: the userspace scheduler runs the services
+//!    registered by `open`; mounted scrub and repair are not among them.
 //!
 //! # Integration points
 //!
@@ -293,11 +286,9 @@
 pub mod ack_receipt;
 pub mod admission;
 mod allocation;
-mod background_cleaner;
 pub mod background_compaction;
 mod background_orphan_reclamation;
 pub mod capacity_authority;
-mod checksum;
 mod commit_group;
 mod constants;
 mod content;
@@ -338,9 +329,6 @@ pub mod receive_persistence;
 mod records;
 mod recovery;
 pub mod release_dispatch;
-mod repair;
-mod scrub;
-mod scrub_repair_integration;
 mod send_receive;
 mod snapshot;
 mod space_pressure;
@@ -380,10 +368,7 @@ use crate::ack_receipt::{
 };
 use tidefs_intent_log::XattrNamespace;
 
-use tidefs_background_scheduler::{
-    BackgroundScheduler, BackgroundService, ServiceBudget, ServiceError, ServicePriority,
-    TickReport,
-};
+use tidefs_background_scheduler::{BackgroundScheduler, ServiceBudget};
 use tidefs_block_allocator::TrimRequest;
 use tidefs_claim_ledger::{ClaimClass, ClaimEntryRecord, ClaimantRef};
 use tidefs_commit_group::{
@@ -526,7 +511,6 @@ use crate::inode_cache::*;
 // Intent-log sync write latency module (types used via glob re-export)
 // Intent-log sync write latency module (re-exported for future use)
 use crate::admission::LocalWriteAdmission;
-use crate::background_cleaner::{BackgroundCleaner, BackgroundCleanerConfig};
 use crate::capacity_authority::{
     CapacityAuthority, CapacityAuthoritySnapshot, CapacityReservationHandle, CapacityStatfs,
 };
@@ -545,7 +529,6 @@ pub(crate) use crate::persistence::*;
 pub(crate) use crate::quota::*;
 use crate::records::*;
 pub(crate) use crate::recovery::*;
-use crate::repair::{RepairLog, RepairOutcome};
 pub(crate) use crate::send_receive::*;
 
 // Public fuzz-target entrypoints (not part of the product API).
@@ -602,6 +585,13 @@ pub fn verify_online_with_root_authentication_key(
     if !root.exists() {
         return Ok(OnlineVerifierReport::empty());
     }
+    if !require_development_pool_for_populated_store(
+        root,
+        &options,
+        "online verification requires Pool placement authority for a populated store",
+    )? {
+        return Ok(OnlineVerifierReport::empty());
+    }
     let mut store = LocalFileSystem::default_development_pool(root, &options, None, None)?;
     let mut authority = MountedOpenRecoveryAuthority::raw_only(
         &mut store,
@@ -644,18 +634,39 @@ pub fn inspect_filesystem_content_objects_with_root_authentication_key(
     root_authentication_key: RootAuthenticationKey,
 ) -> Result<FilesystemContentInspectionReport> {
     options.repair_torn_tail = false;
-    if let Some(mut store) = LocalObjectStore::open_read_only_with_options(&root, options.clone())?
-    {
-        return inspect_filesystem_content_objects_store(&mut store, root_authentication_key, None);
+    let root = root.as_ref();
+    if !root.exists() {
+        return Ok(FilesystemContentInspectionReport::empty());
     }
-    match LocalFileSystem::default_development_pool(root.as_ref(), &options, None, None) {
-        Ok(mut pool) => inspect_filesystem_content_objects_store(
-            pool.raw_primary_store_mut(),
-            root_authentication_key,
-            None,
-        ),
-        Err(_) => Ok(FilesystemContentInspectionReport::empty()),
+    if !require_development_pool_for_populated_store(
+        root,
+        &options,
+        "content inspection requires Pool placement authority for a populated store",
+    )? {
+        return Ok(FilesystemContentInspectionReport::empty());
     }
+
+    let mut pool = LocalFileSystem::default_development_pool(root, &options, None, None)?;
+    inspect_filesystem_content_objects_pool(&mut pool, root_authentication_key)
+}
+
+fn require_development_pool_for_populated_store(
+    root: &Path,
+    options: &StoreOptions,
+    refusal_reason: &'static str,
+) -> Result<bool> {
+    if LocalFileSystem::default_development_device_path(root).exists() {
+        return Ok(true);
+    }
+    let Some(store) = LocalObjectStore::open_read_only_with_options(root, options.clone())? else {
+        return Ok(false);
+    };
+    if store.list_keys_including_internal().is_empty() {
+        return Ok(false);
+    }
+    Err(FileSystemError::CorruptState {
+        reason: refusal_reason,
+    })
 }
 
 pub fn plan_root_retention(
@@ -844,7 +855,6 @@ pub(crate) struct FileSystemState {
     pub(crate) last_inode_write_tx: BTreeMap<InodeId, u64>,
     pub(crate) last_dir_write_tx: BTreeMap<InodeId, u64>,
     known_inode_ids: BTreeSet<InodeId>,
-    corrupted_inodes: BTreeSet<InodeId>,
     /// Per-directory change-stream maps keyed by InodeId, then by dir_rev.
     change_streams: BTreeMap<InodeId, BTreeMap<u64, DirChangeRecord>>,
     /// Per-file extent maps for byte-range-to-physical mapping persistence.
@@ -1193,170 +1203,6 @@ mod resolve_compression_policy_tests {
     }
 }
 
-#[derive(Debug)]
-/// Background scrubber that periodically re-opens a read-only store
-/// and runs the online verifier to detect silent data corruption.
-struct BackgroundScrubber {
-    corruption_detected: Arc<AtomicBool>,
-    root: std::path::PathBuf,
-    options: StoreOptions,
-    root_authentication_key: RootAuthenticationKey,
-    interval: Duration,
-    last_scrub: Instant,
-}
-
-impl BackgroundScrubber {
-    fn new(
-        root: std::path::PathBuf,
-        options: StoreOptions,
-        root_authentication_key: RootAuthenticationKey,
-        interval: Duration,
-        corruption_detected: Arc<AtomicBool>,
-    ) -> Self {
-        Self {
-            root,
-            options,
-            root_authentication_key,
-            interval,
-            last_scrub: Instant::now()
-                .checked_sub(interval)
-                .unwrap_or_else(Instant::now),
-            corruption_detected,
-        }
-    }
-}
-
-impl BackgroundService for BackgroundScrubber {
-    fn name(&self) -> &'static str {
-        "background-scrub"
-    }
-
-    fn priority(&self) -> ServicePriority {
-        // Scrub is integrity-critical: undetected corruption can propagate
-        // through snapshots and send/receive streams.
-        ServicePriority::Critical
-    }
-
-    fn tick(&mut self, _budget: &ServiceBudget) -> std::result::Result<TickReport, ServiceError> {
-        if !self.has_work() {
-            return Ok(TickReport::default());
-        }
-
-        self.last_scrub = Instant::now();
-
-        let mut store =
-            match LocalObjectStore::open_read_only_with_options(&self.root, self.options.clone()) {
-                Ok(Some(s)) => s,
-                Ok(None) => {
-                    eprintln!(
-                        "background-scrub: store not found at {}, skipping cycle",
-                        self.root.display()
-                    );
-                    return Ok(TickReport::default());
-                }
-                Err(e) => {
-                    eprintln!("background-scrub: failed to open read-only store: {e}");
-                    return Ok(TickReport {
-                        errors: 1,
-                        ..TickReport::default()
-                    });
-                }
-            };
-
-        match crate::recovery::verify_online_store(&mut store, self.root_authentication_key) {
-            Ok(report) => {
-                if !report.issues.is_empty() {
-                    eprintln!(
-                        "background-scrub: {} corruption issue(s) detected in {} root slots",
-                        report.issues.len(),
-                        report.root_slots_seen,
-                    );
-                    self.corruption_detected.store(true, Ordering::SeqCst);
-                    for issue in &report.issues {
-                        eprintln!(
-                            "  background-scrub: slot={:?} tx={:?} {}",
-                            issue.slot, issue.transaction_id, issue.reason
-                        );
-                    }
-                    return Ok(TickReport {
-                        processed: report.issues.len() as u64,
-                        has_more: false,
-                        ..TickReport::default()
-                    });
-                }
-
-                // Root slots verified clean — run content-block checksum verification.
-                match crate::recovery::load_latest_committed_state(
-                    &mut store,
-                    self.root_authentication_key,
-                    RecoveryPolicy::default(),
-                ) {
-                    Ok(Some(state)) => {
-                        match crate::scrub::scrub_inodes_content(&store, &state.inodes) {
-                            Ok(scrub_report) => {
-                                if !scrub_report.is_clean() {
-                                    eprintln!(
-                                        "background-scrub: {} corrupt, {} unreadable, {} missing-checksum blocks in {} scanned",
-                                        scrub_report.blocks_corrupt,
-                                        scrub_report.blocks_unreadable,
-                                        scrub_report.blocks_no_checksum,
-                                        scrub_report.blocks_scanned,
-                                    );
-                                    self.corruption_detected.store(true, Ordering::SeqCst);
-                                    for violation in &scrub_report.violations {
-                                        eprintln!(
-                                            "  background-scrub: inode={} version={} kind={:?} key={} outcome={:?}",
-                                            violation.block_id.inode_id,
-                                            violation.block_id.data_version,
-                                            violation.block_id.kind,
-                                            violation.key_hex,
-                                            violation.outcome,
-                                        );
-                                    }
-                                }
-                                Ok(TickReport {
-                                    processed: scrub_report.blocks_scanned,
-                                    errors: scrub_report.blocks_corrupt
-                                        + scrub_report.blocks_unreadable,
-                                    items_consumed: scrub_report.blocks_scanned,
-                                    has_more: false,
-                                    ..TickReport::default()
-                                })
-                            }
-                            Err(e) => {
-                                eprintln!("background-scrub: content scrub error: {e}");
-                                Ok(TickReport {
-                                    errors: 1,
-                                    ..TickReport::default()
-                                })
-                            }
-                        }
-                    }
-                    Ok(None) => Ok(TickReport::default()),
-                    Err(e) => {
-                        eprintln!("background-scrub: failed to load committed state: {e}");
-                        Ok(TickReport {
-                            errors: 1,
-                            ..TickReport::default()
-                        })
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!("background-scrub: verification error: {e}");
-                Ok(TickReport {
-                    errors: 1,
-                    ..TickReport::default()
-                })
-            }
-        }
-    }
-
-    fn has_work(&self) -> bool {
-        self.last_scrub.elapsed() >= self.interval
-    }
-}
-
 /// Runtime that drives the [`BackgroundScheduler`] on a background thread.
 ///
 /// Owns the scheduler and a tick thread that dispatches [`run_cycle()`] at a
@@ -1479,8 +1325,7 @@ pub struct FsyncStatsSnapshot {
 /// `LocalFileSystem` holds a configured object-store pool, the authoritative
 /// in-memory metadata (`FileSystemState`), an intent log for crash-safe write
 /// durability, per-inode write buffers, a page cache, extent allocator, space
-/// accounting, quota enforcement, and four background service daemons
-/// (compaction, reclaim, orphan reclamation, writeback). All POSIX-path-based
+/// accounting, quota enforcement, and registered background services. All POSIX-path-based
 /// operations flow through this handle — `create_file`, `read_file`,
 /// `write_file`, `fsync_file`, `truncate_file`, `unlink`, `rename`, and the
 /// metadata/xattr/lock suites.
@@ -1493,8 +1338,9 @@ pub struct FsyncStatsSnapshot {
 /// 2. **Use**: path-based methods read and write filesystem state through
 ///    the cached inode/directory/extent structures, with writes buffered
 ///    per inode and flushed on fsync or auto-commit.
-/// 3. **Close** via [`Drop`]: shuts down background services, drains
-///    writeback, syncs the intent log, and disconnects from the pool.
+/// 3. **Close** via [`Drop`]: shuts down background services, flushes
+///    authoritative foreground write buffers, syncs the intent log, and
+///    disconnects from the pool.
 ///
 /// # Key internal components
 ///
@@ -1503,8 +1349,8 @@ pub struct FsyncStatsSnapshot {
 /// - `extent_allocator` — maps byte ranges to physical content objects.
 /// - `intent_log` — write-ahead log for crash-safe fsync semantics.
 /// - `write_buffers` — per-inode coalescing buffers for small writes.
-/// - `page_cache` / `dirty_page_tracker` — in-memory data cache with
-///   dirty tracking and background writeback.
+/// - `page_cache` / `dirty_page_tracker` — in-memory data cache and dirty
+///   tracking; cached bytes do not bypass receipt-authorized reads.
 /// - `commit_group` — transaction group state machine driving auto-commit.
 /// - `fsync_stats` — atomic instrumentation counters for durability ops.
 ///
@@ -1562,7 +1408,6 @@ pub struct LocalFileSystem {
     budget_domain: BudgetDomain,
     auto_compaction_waste_threshold: f64,
     space_pressure: SpacePressure,
-    background_cleaner: BackgroundCleaner,
     orphan_index: Arc<Mutex<OrphanIndex>>,
     /// Shared extent maps for background defrag service. This is the
     /// same [`Arc`] held by [`FileSystemState::extent_maps`], so defrag
@@ -1583,14 +1428,6 @@ pub struct LocalFileSystem {
     /// saved after mutation.
     pool_properties: PropertySet,
     background_scheduler: Option<BackgroundSchedulerRuntime>,
-    /// Populated by `schedule_scrub_repairs()` with receipt-gated repair
-    /// admission state. Consumed by `dispatch_scheduled_repairs()` to apply
-    /// admitted repairs in priority order when receipt evidence is present.
-    scrub_repair_schedule: Option<crate::scrub_repair_integration::ScrubRepairSchedule>,
-    /// Shared flag set by the background scrubber when corruption is detected
-    /// on-disk.  Consumed by [`tick_background_services`] Duty 3 to trigger
-    /// repair scheduling and dispatch.
-    scrub_corruption_detected: Option<Arc<AtomicBool>>,
     pending_orphan_deletions: Arc<Mutex<Vec<u64>>>,
     reclaim_queue: Arc<Mutex<BPlusTreeReclaimQueue>>,
     /// Deferred rewrite extent trims: (old_key, new_key) pairs where the
@@ -1688,23 +1525,6 @@ impl MountedRawStoreDiagnostics<'_> {
     fn contains_transaction_superblock(&self, transaction_id: u64) -> bool {
         self.store
             .contains_key(transaction_superblock_object_key(transaction_id))
-    }
-
-    #[cfg(test)]
-    fn scrub_mounted_content(
-        &self,
-        inodes: &BTreeMap<InodeId, InodeRecord>,
-    ) -> Result<crate::scrub::ScrubReport> {
-        crate::scrub::scrub_inodes_content(self.store, inodes)
-    }
-
-    #[cfg(test)]
-    fn scrub_content_chunk(
-        &self,
-        record: &InodeRecord,
-        chunk_ref: &crate::records::ContentChunkRef,
-    ) -> crate::scrub::ScrubBlockOutcome {
-        crate::scrub::scrub_content_chunk(self.store, record.inode_id, record, chunk_ref)
     }
 }
 
@@ -1865,10 +1685,6 @@ impl<'a> MountedCommittedRootRepairAuthority<'a> {
         audit_recovery_store(&mut *self.store, self.root_authentication_key)
     }
 
-    fn online_verifier_report(&mut self) -> Result<OnlineVerifierReport> {
-        verify_online_store(&mut *self.store, self.root_authentication_key)
-    }
-
     fn root_retention_plan(&mut self, policy: RootRetentionPolicy) -> Result<RootRetentionPlan> {
         plan_root_retention_store(&mut *self.store, policy, self.root_authentication_key)
     }
@@ -2014,8 +1830,7 @@ impl<'a> MountedOpenRecoveryAuthority<'a> {
     }
 
     fn online_verifier_report(&mut self) -> Result<OnlineVerifierReport> {
-        self.committed_root_repair_authority()
-            .online_verifier_report()
+        verify_online_pool(&mut *self.store, self.root_authentication_key)
     }
 
     fn root_retention_plan(&mut self, policy: RootRetentionPolicy) -> Result<RootRetentionPlan> {
@@ -2045,7 +1860,7 @@ impl<'a> MountedOpenRecoveryAuthority<'a> {
             recovery_policy,
         )? {
             Some(state) => Ok(state),
-            None => match self.store.primary_store().get(superblock_object_key())? {
+            None => match self.raw_recovery_store().get(superblock_object_key())? {
                 Some(bytes) => {
                     let state =
                         load_v0390_fixed_object_state(self.raw_recovery_store_mut(), &bytes)?;
@@ -2073,27 +1888,25 @@ impl<'a> MountedOpenRecoveryAuthority<'a> {
         IntentLog::load(self.raw_recovery_store())
     }
 
-    fn load_quota_table(&self) -> QuotaTable {
-        match self.store.primary_store().get(quota_table_object_key()) {
-            Ok(Some(bytes)) => QuotaTable::decode(&bytes).unwrap_or_else(|e| {
-                eprintln!("warning: quota table decode failed: {e}; starting empty");
-                QuotaTable::new()
+    fn load_quota_table(&self) -> Result<QuotaTable> {
+        match self.store.primary_store().get(quota_table_object_key())? {
+            Some(bytes) => QuotaTable::decode(&bytes).map_err(|_| FileSystemError::CorruptState {
+                reason: "quota table decode failed during reopen",
             }),
-            Ok(None) => QuotaTable::new(),
-            Err(e) => {
-                eprintln!("warning: quota table load failed: {e}; starting empty");
-                QuotaTable::new()
-            }
+            None => Ok(QuotaTable::new()),
         }
     }
 
-    fn merge_space_counters_into(&self, state: &mut FileSystemState) {
-        if let Ok(Some(bytes)) = self.store.primary_store().get(space_counters_object_key()) {
-            state.space_accounting = SpaceAccounting::new(
-                decode_space_counters(&bytes).unwrap_or_default(),
-                SpaceDomainId::NONE,
-            );
+    fn merge_space_counters_into(&self, state: &mut FileSystemState) -> Result<()> {
+        if let Some(bytes) = self
+            .store
+            .primary_store()
+            .get(space_counters_object_key())?
+        {
+            state.space_accounting =
+                SpaceAccounting::new(decode_space_counters(&bytes)?, SpaceDomainId::NONE);
         }
+        Ok(())
     }
 
     fn merge_dataset_usage_into(&self, state: &mut FileSystemState) {
@@ -2106,9 +1919,9 @@ impl<'a> MountedOpenRecoveryAuthority<'a> {
         }
     }
 
-    fn load_orphan_index(&self) -> OrphanIndex {
-        match self.store.primary_store().get(orphan_index_object_key()) {
-            Ok(Some(bytes)) => match OrphanIndex::recover_from_log(&bytes) {
+    fn load_orphan_index(&self) -> Result<OrphanIndex> {
+        match self.store.primary_store().get(orphan_index_object_key())? {
+            Some(bytes) => match OrphanIndex::recover_from_log(&bytes) {
                 Ok((idx, corrupted)) => {
                     if !corrupted.is_empty() {
                         eprintln!(
@@ -2116,18 +1929,13 @@ impl<'a> MountedOpenRecoveryAuthority<'a> {
                             corrupted.len()
                         );
                     }
-                    idx
+                    Ok(idx)
                 }
-                Err(e) => {
-                    eprintln!("warning: orphan index recovery failed ({e}); starting empty");
-                    OrphanIndex::new()
-                }
+                Err(_) => Err(FileSystemError::CorruptState {
+                    reason: "orphan index recovery failed during reopen",
+                }),
             },
-            Ok(None) => OrphanIndex::new(),
-            Err(e) => {
-                eprintln!("warning: orphan index load failed ({e}); starting empty");
-                OrphanIndex::new()
-            }
+            None => Ok(OrphanIndex::new()),
         }
     }
 
@@ -3358,6 +3166,12 @@ impl LocalFileSystem {
             block_devices,
         } = config;
         allocator_policy.validate()?;
+        if options.background_scrub_interval_secs != 0 {
+            return Err(FileSystemError::Unsupported {
+                operation: "automatic mounted background scrub",
+                reason: "requires a bounded mounted-Pool owner driver",
+            });
+        }
         // Fail closed until TFR-006 moves mounted content and recovery paths
         // behind one transform-aware authority and the raw-store inventory
         // has no blocked production rows.
@@ -3423,22 +3237,18 @@ impl LocalFileSystem {
 
         // Load intent log for operational use (crash replay was already
         // handled by load_latest_committed_state above).
-        let mut intent_log = match open_recovery.load_operational_intent_log() {
-            Ok(log) => log,
-            Err(err) => {
-                eprintln!("warning: intent log load failed: {err}; starting with empty log");
-                IntentLog::new()
-            }
-        };
+        let mut intent_log = open_recovery.load_operational_intent_log()?;
         // Wire the log device into the intent log for future writes.
         if let Some(ref log_device_path) = log_device_device_path {
             intent_log.open_log_device(log_device_path)?;
         }
 
-        // Load persisted quota table; start empty if missing or corrupt.
-        state.quota_table = open_recovery.load_quota_table();
+        // Missing auxiliary metadata starts empty. Present but corrupt or
+        // unreadable receipt authority fails closed rather than resetting
+        // quota, accounting, or orphan state.
+        state.quota_table = open_recovery.load_quota_table()?;
         // Load persisted space counters; start with default zeros if missing.
-        open_recovery.merge_space_counters_into(&mut state);
+        open_recovery.merge_space_counters_into(&mut state)?;
 
         // Sync from the store-layer SpaceBook (which was loaded from the
         // segment write pipeline during LocalObjectStore construction) to
@@ -3448,8 +3258,8 @@ impl LocalFileSystem {
         // recovery.
         open_recovery.merge_dataset_usage_into(&mut state);
 
-        // Load persisted orphan index; start empty if missing or corrupt.
-        let orphan_index_inner = open_recovery.load_orphan_index();
+        // Load persisted orphan index; start empty only when it is absent.
+        let orphan_index_inner = open_recovery.load_orphan_index()?;
         // Production recovery must not call run_fsck during mount: fsck is
         // an explicit operator command, not a mount-time recovery authority.
         // The caller's RecoveryPolicy governs all state loading and replay.
@@ -3539,9 +3349,10 @@ impl LocalFileSystem {
         let pool_properties = match store.primary_store().get(pool_properties_object_key()) {
             Ok(Some(bytes)) => PropertySet::from_key_value_blob(&bytes),
             Ok(None) => PropertySet::new(),
-            Err(e) => {
-                eprintln!("warning: pool properties load failed: {e}; starting empty");
-                PropertySet::new()
+            Err(_) => {
+                return Err(FileSystemError::CorruptState {
+                    reason: "pool properties load failed during reopen",
+                });
             }
         };
         // Ensure the root dataset entry exists.
@@ -3664,7 +3475,6 @@ impl LocalFileSystem {
                 allocator_policy.content_capacity_bytes / 5,
             ),
             space_pressure: SpacePressure::new(SpacePressureConfig::default()),
-            background_cleaner: BackgroundCleaner::new(BackgroundCleanerConfig::default()),
             auto_compaction_waste_threshold: DEFAULT_AUTO_COMPACTION_WASTE_THRESHOLD,
             orphan_index: Arc::new(Mutex::new(orphan_index_inner)),
             lifecycle,
@@ -3677,8 +3487,6 @@ impl LocalFileSystem {
             extent_maps_shared: Some(extent_maps_shared), // Arc::clone of state.extent_maps
             online_defrag_stats: Some(Arc::clone(&online_defrag_stats)),
             background_scheduler: None,
-            scrub_repair_schedule: None,
-            scrub_corruption_detected: None,
             reclaim_queue: Arc::new(Mutex::new(BPlusTreeReclaimQueue::new())),
             deferred_rewrite_trims: Vec::new(),
             receipt_bound_reclaim_idle_ticks_remaining: 0,
@@ -3759,8 +3567,8 @@ impl LocalFileSystem {
         }
 
         // Build the background scheduler, register all services, and start
-        // the runtime thread. The runtime drives BackgroundOrphanReclamation
-        // and BackgroundScrubber under per-tick budget without blocking mount.
+        // the runtime thread. Mounted scrub is deliberately excluded until a
+        // bounded driver can run through this LocalFileSystem's Pool owner.
         if recovery_policy.allows_any_mutation() {
             let mut scheduler = BackgroundScheduler::new(ServiceBudget::DEFAULT_TICK);
 
@@ -3784,23 +3592,6 @@ impl LocalFileSystem {
                 let _ = scheduler.register_incremental_job("online-defrag", defrag_svc);
             }
 
-            let scrub_interval_secs = options.background_scrub_interval_secs;
-            if scrub_interval_secs > 0 {
-                // Shared flag: background scrubber sets it when corruption is
-                // detected, and tick_background_services Duty 3 consumes it to
-                // trigger repair scheduling and dispatch.
-                let corruption_flag = Arc::new(AtomicBool::new(false));
-                fs.scrub_corruption_detected = Some(Arc::clone(&corruption_flag));
-                let scrubber = BackgroundScrubber::new(
-                    root_path.clone(),
-                    options,
-                    root_authentication_key,
-                    Duration::from_secs(scrub_interval_secs),
-                    corruption_flag,
-                );
-                scheduler.register(Box::new(scrubber));
-            }
-
             fs.background_scheduler = Some(BackgroundSchedulerRuntime::start(
                 scheduler,
                 Duration::from_secs(1),
@@ -3822,18 +3613,6 @@ impl LocalFileSystem {
         // tick, not a synchronous flush trigger in write_file.
         // StoreFlushTarget is retained behind #[cfg(test)] only.
 
-        // Mount-time repair is intentionally not run during open (#6317).
-        // Create/import/mount/remount recovery is committed-root selection
-        // plus intent-log replay under policy (load_latest_committed_state,
-        // CommitGroupRecovery, TxgReplayEngine) -- that is the single
-        // authority.  Repair (scrub -> schedule -> dispatch) runs only
-        // through background services or explicit operator invocation, not
-        // as automatic mount-time mutation.
-        if recovery_policy.allows_repair_writeback() {
-            eprintln!(
-                "recovery: mount-time repair skipped; repair runs through background services only"
-            );
-        }
         // Load persisted feature flags from the object store (Phase 3).
         // A missing record means no features. A present non-current or
         // unresolved record is corrupt and must not silently disable gates.
@@ -4088,31 +3867,6 @@ impl LocalFileSystem {
     }
 
     #[cfg(test)]
-    pub(crate) fn scrub_mounted_content_for_test(&self) -> Result<crate::scrub::ScrubReport> {
-        self.mounted_raw_store_diagnostics()
-            .scrub_mounted_content(&self.state.inodes)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn scrub_mounted_content_records_for_test(
-        &self,
-        inodes: &BTreeMap<InodeId, InodeRecord>,
-    ) -> Result<crate::scrub::ScrubReport> {
-        self.mounted_raw_store_diagnostics()
-            .scrub_mounted_content(inodes)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn scrub_content_chunk_for_test(
-        &self,
-        record: &InodeRecord,
-        chunk_ref: &crate::records::ContentChunkRef,
-    ) -> crate::scrub::ScrubBlockOutcome {
-        self.mounted_raw_store_diagnostics()
-            .scrub_content_chunk(record, chunk_ref)
-    }
-
-    #[cfg(test)]
     pub(crate) fn chunked_content_receipt_generations_for_test(
         &self,
         inode_id: InodeId,
@@ -4247,17 +4001,22 @@ impl LocalFileSystem {
         // so the legacy key is only queued for reclaim after the replacement
         // receipt is durably committed.
         let legacy_key = content_object_key(inode_id);
+        let legacy_object_key =
+            tidefs_local_object_store::ObjectKey::from_bytes(*legacy_key.as_bytes());
         let legacy_nlink = record.as_ref().map(|r| r.nlink).unwrap_or(0);
-        if legacy_nlink == 0
-            || crate::allocation::replacement_receipt_is_durable(
-                &self.store,
-                tidefs_local_object_store::ObjectKey::from_bytes(*legacy_key.as_bytes()),
-                crate::content::latest_receipt_generation_for_key(
+        let legacy_reclaim_is_authorized =
+            match crate::content::latest_receipt_generation_for_key(&self.store, legacy_object_key)
+            {
+                Ok(_) if legacy_nlink == 0 => true,
+                Ok(None) => true,
+                Ok(Some(old_generation)) => crate::allocation::replacement_receipt_is_durable(
                     &self.store,
-                    tidefs_local_object_store::ObjectKey::from_bytes(*legacy_key.as_bytes()),
+                    legacy_object_key,
+                    old_generation,
                 ),
-            )
-        {
+                Err(_) => false,
+            };
+        if legacy_reclaim_is_authorized {
             rq.insert(ReclaimQueueEntry::new(
                 ReclaimObjectKey(*legacy_key.as_bytes()),
                 -1,
@@ -4491,11 +4250,6 @@ impl LocalFileSystem {
         }
     }
 
-    /// Return background cleaner statistics for observability.
-    pub fn background_cleaner_stats(&self) -> &crate::background_cleaner::BackgroundCleanerStats {
-        self.background_cleaner.stats()
-    }
-
     /// Return the latest online defrag counters published by the background job.
     pub fn online_defrag_stats(&self) -> Option<DefragStats> {
         self.online_defrag_stats
@@ -4575,8 +4329,6 @@ impl LocalFileSystem {
                 .map(|(k, e)| (k, e.delta))
                 .collect()
         };
-        let entries_drained = batch.len();
-
         // Pre-compute receipt durability: for each key in the batch, check
         // whether its placement receipt is durable.  Keys that pass are safe
         // to delete; keys that fail stay in the queue.
@@ -4591,6 +4343,7 @@ impl LocalFileSystem {
 
         if !batch.is_empty() {
             let mut dedup_index = self.dedup_index.borrow_mut();
+            let mut completed_deletes = std::collections::BTreeSet::new();
 
             for (object_key, _delta) in &batch {
                 let local_key = tidefs_local_object_store::ObjectKey::from_bytes(object_key.0);
@@ -4600,55 +4353,76 @@ impl LocalFileSystem {
                     continue;
                 }
 
-                // Before deleting the per-inode chunk key, check whether it is
-                // a dedup redirect.  If the redirect is the last reference to a
-                // canonical dedup object, decrement the durable refcount and
-                // queue the canonical data object for reclaim (#6326).
-                {
-                    let store = self.store.raw_primary_store_mut();
-                    if let Ok(Some(payload)) = store.get(local_key) {
-                        if crate::encoding::is_dedup_redirect(&payload) {
-                            if let Ok(canonical_key) =
-                                crate::encoding::decode_dedup_redirect(&payload)
-                            {
-                                if let Ok(Some(canon_data)) = store.get(canonical_key) {
-                                    if let Ok(chunk) =
-                                        crate::encoding::decode_content_chunk(&canon_data)
-                                    {
-                                        let fp = crate::encoding::compute_content_fingerprint(
-                                            &chunk.bytes,
-                                        );
-                                        if let Ok(true) =
-                                            crate::dedup_refcount::DedupRefCount::decrement(
-                                                store, &fp,
-                                            )
-                                        {
-                                            let canon_data_key =
-                                                crate::object_keys::content_dedup_object_key(&fp);
-                                            let rq_entry = ReclaimQueueEntry::new(
-                                                ReclaimObjectKey(*canon_data_key.as_bytes()),
-                                                -1,
-                                                QueueFamily::Extent,
-                                            );
-                                            self.reclaim_queue.lock().unwrap().insert(rq_entry);
-                                            dedup_index.remove(&fp);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
                 // Receipt authority gate: skip objects whose placement receipt
-                // is not yet durable.  The pre-computed set includes both content
+                // is not yet durable. The pre-computed set includes both content
                 // chunks with uncommitted receipts and keys where the pool was
                 // unreadable (conservative retain).
                 if !receipt_durable_keys.contains(&local_key) {
                     continue;
                 }
 
-                let _ = self.store.delete(DeviceIoClass::Data, local_key);
+                // Capture dedup identity before deletion, but do not mutate its
+                // refcount until Pool confirms the delete or proves absence.
+                // A failed Pool delete is retryable and must not decrement the
+                // canonical refcount on every retry.
+                let dedup_fingerprint = match self.store.get(DeviceIoClass::Data, local_key) {
+                    Ok(Some(payload)) if crate::encoding::is_dedup_redirect(&payload) => {
+                        let Ok(canonical_key) = crate::encoding::decode_dedup_redirect(&payload)
+                        else {
+                            continue;
+                        };
+                        let Ok(Some(canonical)) =
+                            self.store.get(DeviceIoClass::Data, canonical_key)
+                        else {
+                            continue;
+                        };
+                        let Ok(chunk) = crate::encoding::decode_content_chunk(&canonical) else {
+                            continue;
+                        };
+                        let fingerprint =
+                            crate::encoding::compute_content_fingerprint(&chunk.bytes);
+                        if crate::object_keys::content_dedup_object_key(&fingerprint)
+                            != canonical_key
+                        {
+                            continue;
+                        }
+                        Some(fingerprint)
+                    }
+                    Ok(Some(_)) | Ok(None) => None,
+                    Err(_) => continue,
+                };
+
+                match self.store.delete(DeviceIoClass::Data, local_key) {
+                    Ok(false) => {
+                        completed_deletes.insert(local_key);
+                    }
+                    Ok(true) => {
+                        if let Some(fingerprint) = dedup_fingerprint {
+                            let store = self.store.raw_primary_store_mut();
+                            let Ok(last_reference) =
+                                crate::dedup_refcount::DedupRefCount::decrement(
+                                    store,
+                                    &fingerprint,
+                                )
+                            else {
+                                continue;
+                            };
+                            if last_reference {
+                                let canonical_key =
+                                    crate::object_keys::content_dedup_object_key(&fingerprint);
+                                let entry = ReclaimQueueEntry::new(
+                                    ReclaimObjectKey(*canonical_key.as_bytes()),
+                                    -1,
+                                    QueueFamily::Extent,
+                                );
+                                self.reclaim_queue.lock().unwrap().insert(entry);
+                                dedup_index.remove(&fingerprint);
+                            }
+                        }
+                        completed_deletes.insert(local_key);
+                    }
+                    Err(_) => continue,
+                }
             }
             // Remove processed entries from the queue.
             // Entries whose receipt is not yet durable are re-enqueued
@@ -4658,18 +4432,24 @@ impl LocalFileSystem {
             for (object_key, delta) in &batch {
                 q.delete(object_key);
                 let local_key = tidefs_local_object_store::ObjectKey::from_bytes(object_key.0);
-                if !receipt_durable_keys.contains(&local_key)
-                    && !protected_keys.contains(&local_key)
-                {
+                if !completed_deletes.contains(&local_key) && !protected_keys.contains(&local_key) {
                     let entry = ReclaimQueueEntry::new(*object_key, *delta, QueueFamily::Extent);
                     q.insert(entry);
                 }
             }
+            let entries_drained = batch
+                .iter()
+                .filter(|(object_key, _)| {
+                    let local_key = tidefs_local_object_store::ObjectKey::from_bytes(object_key.0);
+                    completed_deletes.contains(&local_key) || protected_keys.contains(&local_key)
+                })
+                .count();
             self.total_reclaim_drains += 1;
             self.total_reclaim_entries_drained += entries_drained as u64;
+            return ReclaimDrainStats { entries_drained };
         }
 
-        ReclaimDrainStats { entries_drained }
+        ReclaimDrainStats { entries_drained: 0 }
     }
 
     fn should_attempt_receipt_bound_reclaim(&mut self, local_entries_drained: usize) -> bool {
@@ -4996,172 +4776,6 @@ impl LocalFileSystem {
         self.mount_invariant_report()
     }
 
-    /// Run a full scrub-repair-re-scrub cycle on all inodes.
-    ///
-    /// Returns the repair log with actual outcomes applied.
-    /// On mount, this classifies any corruption detected by a previous
-    /// background scrub and dispatches only receipt-backed repair work before
-    /// user I/O begins.
-    pub fn repair_cycle(&mut self) -> Result<RepairLog> {
-        use crate::crash_hooks::check_crash_hook;
-        use tidefs_local_object_store::CrashInjectionPoint;
-        if !self.recovery_policy.allows_repair_writeback() {
-            return Ok(RepairLog::new());
-        }
-
-        // Populate the scheduling bridge from scrub findings.
-        let _ledger = self.schedule_scrub_repairs()?;
-
-        check_crash_hook(CrashInjectionPoint::RepairBeforeApply);
-
-        // Dispatch prioritized repairs from the bridge.
-        Ok(self.dispatch_scheduled_repairs())
-    }
-
-    /// Run a scrub pass and populate the repair scheduling bridge.
-    ///
-    /// Scrubs all inode content, records corruption validation into a BLAKE3-verified
-    /// [`ScrubRepairLedger`], and classifies findings through receipt-gated
-    /// repair and rebake admission via [`run_scrub_repair_scheduling`].
-    ///
-    /// Current runtime scrub rows do not carry placement receipts, so scheduling
-    /// records blocked evidence counters instead of claiming a dispatchable
-    /// repair source set.
-    ///
-    /// Returns the validation ledger. The scheduling bridge is stored on `self`
-    /// and consumed by [`dispatch_scheduled_repairs`](Self::dispatch_scheduled_repairs).
-    pub fn schedule_scrub_repairs(
-        &mut self,
-    ) -> Result<tidefs_scrub::scrub_repair::ScrubRepairLedger> {
-        if !self.recovery_policy.allows_repair_writeback() {
-            return Ok(tidefs_scrub::scrub_repair::ScrubRepairLedger::new());
-        }
-        let report =
-            crate::scrub::scrub_inodes_content(self.store.raw_primary_store(), &self.state.inodes)?;
-
-        // Populate the scheduling bridge with receipt-gated admission state.
-        let schedule = crate::scrub_repair_integration::run_scrub_repair_scheduling(&report);
-        self.scrub_repair_schedule = Some(schedule);
-
-        // Also record validation in the BLAKE3-verified ledger.
-        Ok(crate::scrub_repair_integration::run_scrub_repair_pass(
-            &report,
-        ))
-    }
-
-    /// Legacy read-only scrub repair pass — records validation only.
-    ///
-    /// Prefer [`schedule_scrub_repairs`](Self::schedule_scrub_repairs) for
-    /// the full detect→schedule→dispatch pipeline. This method remains for
-    /// callers that only need the validation ledger.
-    pub fn scrub_repair_pass(&self) -> Result<tidefs_scrub::scrub_repair::ScrubRepairLedger> {
-        if !self.recovery_policy.allows_repair_writeback() {
-            return Ok(tidefs_scrub::scrub_repair::ScrubRepairLedger::new());
-        }
-        let report =
-            crate::scrub::scrub_inodes_content(self.store.raw_primary_store(), &self.state.inodes)?;
-        Ok(crate::scrub_repair_integration::run_scrub_repair_pass(
-            &report,
-        ))
-    }
-
-    /// Dispatch prioritized repair jobs from the scheduling bridge through
-    /// the repair pipeline.
-    ///
-    /// Consumes the schedule populated by [`schedule_scrub_repairs`], dispatches
-    /// each repair job in priority order (Immediate → Urgent → Normal → Background)
-    /// through the existing repair resolution and application pipeline, and
-    /// records outcomes.
-    ///
-    /// Repaired jobs are marked resolved in the bridge; failed jobs are
-    /// escalated for retry or marked exhausted.
-    ///
-    /// Returns the repair log with applied outcomes, or an empty log if
-    /// no schedule is pending.
-    pub fn dispatch_scheduled_repairs(&mut self) -> RepairLog {
-        use crate::crash_hooks::check_crash_hook;
-        use tidefs_local_object_store::CrashInjectionPoint;
-        let mut schedule = match self.scrub_repair_schedule.take() {
-            Some(s) => s,
-            None => return RepairLog::new(),
-        };
-
-        let repair_blocked_missing = schedule.bridge.stats().entries_blocked_missing_receipt;
-        let repair_blocked_stale = schedule.bridge.stats().entries_blocked_stale_receipt;
-        let rebake_blocked_missing = schedule.rebake.entries_blocked_missing_receipt();
-        let rebake_blocked_stale = schedule.rebake.entries_blocked_stale_receipt();
-        let has_blocked_evidence = repair_blocked_missing != 0
-            || repair_blocked_stale != 0
-            || rebake_blocked_missing != 0
-            || rebake_blocked_stale != 0;
-
-        if !schedule.bridge.has_work() && !has_blocked_evidence {
-            return RepairLog::new();
-        }
-
-        eprintln!(
-            "repair-dispatch: {} pending repair jobs, {} rebake entries, repair evidence blocked missing={} stale={}, rebake evidence blocked missing={} stale={}",
-            schedule.bridge.pending_count(),
-            schedule.rebake.entries_generated(),
-            repair_blocked_missing,
-            repair_blocked_stale,
-            rebake_blocked_missing,
-            rebake_blocked_stale,
-        );
-
-        if !schedule.bridge.has_work() {
-            return RepairLog::new();
-        }
-
-        check_crash_hook(CrashInjectionPoint::RepairBeforeWriteback);
-
-        let mut content_layout_cache: BTreeMap<InodeId, ContentLayout> = BTreeMap::new();
-        let applied = crate::scrub_repair_integration::dispatch_repair_from_bridge(
-            &mut schedule.bridge,
-            &mut self.state,
-            self.store.raw_primary_store_mut(),
-            &mut content_layout_cache,
-        );
-        check_crash_hook(CrashInjectionPoint::RepairAfterWriteback);
-
-        // Re-scrub repaired inodes to verify healing.
-        let mut re_scrub_inodes: BTreeMap<InodeId, InodeRecord> = BTreeMap::new();
-        for entry in &applied.entries {
-            if entry.outcome != RepairOutcome::Skipped {
-                let inode_id = InodeId::new(entry.block_id.inode_id);
-                if let Some(record) = self.state.inodes.get(&inode_id) {
-                    re_scrub_inodes.insert(inode_id, record.clone());
-                }
-            }
-        }
-
-        if !re_scrub_inodes.is_empty() {
-            match crate::scrub::scrub_inodes_content(
-                self.store.raw_primary_store(),
-                &re_scrub_inodes,
-            ) {
-                Ok(re_report) => {
-                    if !re_report.is_clean() {
-                        eprintln!(
-                            "repair-dispatch: {} blocks still corrupt after scheduled repair, marking inodes",
-                            re_report.blocks_corrupt,
-                        );
-                        for violation in &re_report.violations {
-                            let inode_id = InodeId::new(violation.block_id.inode_id);
-                            self.state.corrupted_inodes.insert(inode_id);
-                            self.invalidate_hot_read_cache_for_inode(inode_id);
-                        }
-                    }
-                }
-                Err(e) => {
-                    eprintln!("repair-dispatch: re-scrub error: {e}");
-                }
-            }
-        }
-
-        applied
-    }
-
     /// Drive one cycle of the background service scheduler.
     ///
     /// Dispatches ticks to all registered services that have work,
@@ -5211,28 +4825,6 @@ impl LocalFileSystem {
         // Physical segment freeing is reserved for the receipt-bound drain below.
         let drain_stats = self.drain_local_reclaim_queue_into_store();
         self.drain_receipt_bound_reclaim_for_committed_state(drain_stats.entries_drained);
-
-        // --- Duty 3: dispatch pending scrub-triggered repairs ---
-        // The background scrubber sets scrub_corruption_detected when it finds
-        // on-disk corruption.  Duty 3 picks up that signal, re-scrubs through
-        // the live store, schedules prioritized repairs, and dispatches them
-        // without blocking foreground I/O beyond a single tick.
-        if let Some(ref flag) = self.scrub_corruption_detected {
-            if flag.swap(false, Ordering::SeqCst) {
-                if self.recovery_policy.allows_repair_writeback() {
-                    if let Err(e) = self.repair_cycle() {
-                        eprintln!("background-services: repair cycle from scrub flag failed: {e}");
-                    }
-                }
-                // --- Duty 4: background segment cleaning with throttle ---
-                // Consults the watermark-based CleanerScheduler from
-                // tidefs-space-accounting.  When free segments drop below
-                // target_free_segments, activates the cleaner and runs one
-                // round of journal segment cleaning per tick, subject to
-                // the rate limiter so foreground I/O is not starved.
-                self.background_cleaner.tick(&mut self.store);
-            }
-        }
     }
 
     #[allow(dead_code)]
@@ -7281,16 +6873,17 @@ impl LocalFileSystem {
                 bytes: &patch.bytes,
             })
             .collect();
+        let old_layout = self.read_committed_content_layout_cached(inode_id, &old_record)?;
         let planned_entries = planned_chunk_allocation_entries_for_patch_batch(
-            self.store.raw_primary_store(),
+            &old_layout,
             &old_record,
             &planned_record,
             &content_patches,
             allow_holes,
         )?;
-        let old_allocation_bytes = allocation_bytes(&content_allocation_entries_for_inode(
-            self.store.raw_primary_store(),
-            &old_record,
+        let old_allocation_bytes = allocation_bytes(&content_allocation_entries_for_layout(
+            inode_id,
+            &old_layout,
         )?)?;
         let allocation_bytes = allocation_bytes(&planned_entries).unwrap_or(0);
         let dirty_allocation_bytes = dirty_patch_batch_allocation_bytes(new_size, patches)?;
@@ -7333,17 +6926,14 @@ impl LocalFileSystem {
             self.rollback_mutation_delta();
             return Err(err);
         }
-        let mut rewrite_trim_plan = match self
-            .read_committed_content_layout_cached(inode_id, &old_record)
-            .and_then(|old_layout| {
-                self.rewrite_trim_plan_for_layout(inode_id, &old_layout, &record)
-            }) {
-            Ok(plan) => plan,
-            Err(err) => {
-                self.rollback_mutation_delta();
-                return Err(err);
-            }
-        };
+        let mut rewrite_trim_plan =
+            match self.rewrite_trim_plan_for_layout(inode_id, &old_layout, &record) {
+                Ok(plan) => plan,
+                Err(err) => {
+                    self.rollback_mutation_delta();
+                    return Err(err);
+                }
+            };
         rewrite_trim_plan.replaced_data_bytes = replaced_data_bytes;
         if dirty_allocation_bytes > 0 {
             self.dirty_set
@@ -10772,9 +10362,10 @@ impl LocalFileSystem {
         planned_record.data_version = planned_tick;
         planned_record.metadata_version = planned_tick;
         let planned_entries = planned_chunk_allocation_entries_for_full_content(&planned_record)?;
-        let old_allocation_bytes = allocation_bytes(&content_allocation_entries_for_inode(
-            self.store.raw_primary_store(),
-            &record,
+        let old_layout = self.read_committed_content_layout_cached(inode_id, &record)?;
+        let old_allocation_bytes = allocation_bytes(&content_allocation_entries_for_layout(
+            inode_id,
+            &old_layout,
         )?)?;
         // Pre-check obligation ledger before allocator (Design rule Rule 3: authority is scarce)
         let allocation_bytes = allocation_bytes(&planned_entries).unwrap_or(0);
@@ -10790,7 +10381,6 @@ impl LocalFileSystem {
         self.begin_mutation(); // was: let previous_state = self.state.clone()
         let tick = self.bump_generation();
         debug_assert_eq!(tick, planned_tick);
-        let old_record = record.clone();
         record.size = size;
         record.data_version = tick;
         record.metadata_version = tick;
@@ -10818,17 +10408,14 @@ impl LocalFileSystem {
         // applied only after commit_mutation succeeds so rollback paths do
         // not leave stale reclaim work for still-live extents.
         // INTENT: rewrite-path extent trimming with receipt durability gating (issue #377)
-        let rewrite_trim_plan = match self
-            .read_committed_content_layout_cached(inode_id, &old_record)
-            .and_then(|old_layout| {
-                self.rewrite_trim_plan_for_layout(inode_id, &old_layout, &record)
-            }) {
-            Ok(plan) => plan,
-            Err(err) => {
-                self.rollback_mutation_delta();
-                return Err(err);
-            }
-        };
+        let rewrite_trim_plan =
+            match self.rewrite_trim_plan_for_layout(inode_id, &old_layout, &record) {
+                Ok(plan) => plan,
+                Err(err) => {
+                    self.rollback_mutation_delta();
+                    return Err(err);
+                }
+            };
 
         // Release old claims and register new allocation claim per Rule 8
         // (space-as-claimed-capital: every allocation is an obligation)
@@ -10889,17 +10476,18 @@ impl LocalFileSystem {
         planned_record.size = new_size;
         planned_record.data_version = planned_tick;
         planned_record.metadata_version = planned_tick;
+        let old_layout = self.read_committed_content_layout_cached(inode_id, &old_record)?;
         let planned_entries = planned_chunk_allocation_entries_for_overlay(
-            self.store.raw_primary_store(),
+            &old_layout,
             &old_record,
             &planned_record,
             overlay_offset,
             overlay_bytes,
             allow_holes,
         )?;
-        let old_allocation_bytes = allocation_bytes(&content_allocation_entries_for_inode(
-            self.store.raw_primary_store(),
-            &old_record,
+        let old_allocation_bytes = allocation_bytes(&content_allocation_entries_for_layout(
+            inode_id,
+            &old_layout,
         )?)?;
         // Pre-check obligation ledger before allocator (Design rule Rule 3: authority is scarce)
         let allocation_bytes = allocation_bytes(&planned_entries).unwrap_or(0);
@@ -10961,17 +10549,14 @@ impl LocalFileSystem {
         // plan is applied only after commit_mutation succeeds so rollback
         // paths do not leave stale reclaim work for still-live extents.
         // INTENT: rewrite-path extent trimming with receipt durability gating (issue #377)
-        let mut rewrite_trim_plan = match self
-            .read_committed_content_layout_cached(inode_id, &old_record)
-            .and_then(|old_layout| {
-                self.rewrite_trim_plan_for_layout(inode_id, &old_layout, &record)
-            }) {
-            Ok(plan) => plan,
-            Err(err) => {
-                self.rollback_mutation_delta();
-                return Err(err);
-            }
-        };
+        let mut rewrite_trim_plan =
+            match self.rewrite_trim_plan_for_layout(inode_id, &old_layout, &record) {
+                Ok(plan) => plan,
+                Err(err) => {
+                    self.rollback_mutation_delta();
+                    return Err(err);
+                }
+            };
         rewrite_trim_plan.replaced_data_bytes = replaced_data_bytes;
 
         if dirty_allocation_bytes > 0 {
@@ -12167,7 +11752,7 @@ impl LocalFileSystem {
             // run the same validation that mount uses.
             let transaction_id = self.state.generation.max(ROOT_COMMIT_MIN_TRANSACTION_ID);
             let slot_key = root_slot_object_key(root_slot_for_transaction(transaction_id));
-            let stored_bytes = match self.store.primary_store().get(slot_key)? {
+            let stored_bytes = match self.store.raw_primary_store().get(slot_key)? {
                 Some(b) => b,
                 None => {
                     if let Some(ref qs) = self.quorum_store {
@@ -12216,8 +11801,7 @@ impl LocalFileSystem {
             // Remove the key when the index is empty to avoid stale reads.
             let _ = self
                 .store
-                .raw_primary_store_mut()
-                .delete(orphan_index_object_key());
+                .delete(DeviceIoClass::Data, orphan_index_object_key());
             // Persist feature flags alongside committed state (Phase 3).
             // Every commit snapshots the current feature flag set so that
             // feature enable/disable mutations survive crashes.
@@ -12664,14 +12248,23 @@ impl LocalFileSystem {
         replaced_inode: Option<InodeId>,
         planned_entries: BTreeMap<ObjectKey, u64>,
     ) -> Result<()> {
-        let mut current_entries =
-            content_allocation_entries_for_state(self.store.raw_primary_store(), &self.state)?;
+        let mut current_entries = BTreeMap::new();
+        for inode in self
+            .state
+            .inodes
+            .values()
+            .filter(|inode| inode.is_file_like())
+        {
+            let layout = self.read_committed_content_layout_cached(inode.inode_id, inode)?;
+            merge_allocation_entries(
+                &mut current_entries,
+                content_allocation_entries_for_layout(inode.inode_id, &layout)?,
+            );
+        }
         if let Some(inode_id) = replaced_inode {
             let old_record = self.committed_inode_record(inode_id)?;
-            for key in
-                content_allocation_entries_for_inode(self.store.raw_primary_store(), &old_record)?
-                    .keys()
-            {
+            let old_layout = self.read_committed_content_layout_cached(inode_id, &old_record)?;
+            for key in content_allocation_entries_for_layout(inode_id, &old_layout)?.keys() {
                 current_entries.remove(key);
             }
         }
@@ -12767,16 +12360,13 @@ impl LocalFileSystem {
                 }
             }
         }
-        // Return EIO for inodes that have been marked corrupted by repair.
-        if self.state.corrupted_inodes.contains(&inode_id) {
-            return Err(FileSystemError::CorruptContent { inode_id });
-        }
-
-        if let Some(bytes) = self.hot_read_cache.borrow_mut().get(key) {
-            return Ok(bytes);
-        }
         let content_reader = MountedContentReadAuthority::new(&self.store);
         let bytes = content_reader.read_all(inode_id, record, true)?;
+        if let Some(cached) = self.hot_read_cache.borrow_mut().get(key) {
+            if cached == bytes {
+                return Ok(cached);
+            }
+        }
         self.hot_read_cache.borrow_mut().admit(key, &bytes);
         Ok(bytes)
     }
@@ -12793,10 +12383,6 @@ impl LocalFileSystem {
         {
             return Ok(buffered);
         }
-        if self.state.corrupted_inodes.contains(&inode_id) {
-            return Err(FileSystemError::CorruptContent { inode_id });
-        }
-
         self.read_committed_content_range_cached(inode_id, record, offset, length)
     }
 
@@ -12821,7 +12407,17 @@ impl LocalFileSystem {
                 requested: clipped_len_u64,
             })?;
         let key = Self::content_layout_cache_key(inode_id, record)?;
-        if let Some(bytes) = self.hot_read_cache.borrow_mut().get(key) {
+        let covers_whole_file = offset == 0 && length_u64 >= record.size;
+        let bytes = if covers_whole_file {
+            let content_reader = MountedContentReadAuthority::new(&self.store);
+            content_reader.read_all(inode_id, record, true)?
+        } else {
+            let layout = self.read_committed_content_layout_cached(inode_id, record)?;
+            let content_reader = MountedContentReadAuthority::new(&self.store);
+            content_reader.read_range(&layout, offset, clipped_len)?
+        };
+
+        if let Some(cached) = self.hot_read_cache.borrow_mut().get(key) {
             let start = usize::try_from(offset)
                 .map_err(|_| FileSystemError::SizeOverflow { requested: offset })?;
             let end_offset =
@@ -12833,29 +12429,18 @@ impl LocalFileSystem {
             let end = usize::try_from(end_offset).map_err(|_| FileSystemError::SizeOverflow {
                 requested: end_offset,
             })?;
-            if end > bytes.len() {
+            if end > cached.len() {
                 return Err(FileSystemError::CorruptState {
                     reason: "hot read cache content range exceeds cached object size",
                 });
             }
-            return Ok(bytes[start..end].to_vec());
+            if cached[start..end] == bytes {
+                return Ok(cached[start..end].to_vec());
+            }
         }
-
-        if offset == 0 && length_u64 >= record.size {
-            let content_reader = MountedContentReadAuthority::new(&self.store);
-            let bytes = content_reader.read_all(inode_id, record, true)?;
+        if covers_whole_file {
             self.hot_read_cache.borrow_mut().admit(key, &bytes);
-            return Ok(bytes);
         }
-
-        if let Some(layout) = self.content_layout_cache.borrow().get(&key).cloned() {
-            let content_reader = MountedContentReadAuthority::new(&self.store);
-            return content_reader.read_range(&layout, offset, clipped_len);
-        }
-
-        let layout = self.read_committed_content_layout_cached(inode_id, record)?;
-        let content_reader = MountedContentReadAuthority::new(&self.store);
-        let bytes = content_reader.read_range(&layout, offset, clipped_len)?;
         Ok(bytes)
     }
 
@@ -12883,12 +12468,11 @@ impl LocalFileSystem {
         record: &InodeRecord,
     ) -> Result<ContentLayout> {
         let key = Self::content_layout_cache_key(inode_id, record)?;
-        if let Some(layout) = self.content_layout_cache.borrow().get(&key).cloned() {
-            return Ok(layout);
-        }
-
         let content_reader = MountedContentReadAuthority::new(&self.store);
         let layout = content_reader.read_layout(inode_id, record, true)?;
+        if self.content_layout_cache.borrow().get(&key) == Some(&layout) {
+            return Ok(layout);
+        }
         if matches!(layout, ContentLayout::Chunked(_)) {
             self.content_layout_cache
                 .borrow_mut()
@@ -13095,14 +12679,12 @@ impl LocalFileSystem {
             });
         }
         // 4. Load from object store on demand.
-        let key = inode_object_key(inode_id);
-        let bytes =
-            self.store
-                .raw_primary_store()
-                .get(key)?
-                .ok_or(FileSystemError::CorruptState {
-                    reason: "known inode id references a missing inode object in store",
-                })?;
+        let metadata = self.mounted_metadata_fallback_authority();
+        let bytes = metadata
+            .read_inode_bytes(inode_id)?
+            .ok_or(FileSystemError::CorruptState {
+                reason: "known inode id references a missing inode object in store",
+            })?;
         let inode = decode_inode(&bytes)?;
         if inode.inode_id != inode_id {
             return Err(FileSystemError::CorruptState {
@@ -13110,18 +12692,17 @@ impl LocalFileSystem {
             });
         }
         // 5. If directory, also load the directory object.
-        let dir =
-            if inode.carries_child_namespace() {
-                let dir_key = directory_object_key(inode_id);
-                let dir_bytes = self.store.primary_store().get(dir_key)?.ok_or(
-                    FileSystemError::CorruptState {
+        let dir = if inode.carries_child_namespace() {
+            let dir_bytes =
+                metadata
+                    .read_directory_bytes(inode_id)?
+                    .ok_or(FileSystemError::CorruptState {
                         reason: "directory inode is missing its directory object in store",
-                    },
-                )?;
-                Some(decode_directory(&dir_bytes)?)
-            } else {
-                None
-            };
+                    })?;
+            Some(decode_directory(&dir_bytes)?)
+        } else {
+            None
+        };
         // 6. Admit to ARC cache.
         let record = inode.clone();
         self.inode_cache.borrow_mut().insert(
@@ -13745,6 +13326,16 @@ mod orphan_index_integration_tests {
         Ok((root, fs))
     }
 
+    fn placement_receipt_key_for_test(object_key: ObjectKey) -> ObjectKey {
+        let mut hasher =
+            blake3::Hasher::new_derive_key("TideFS pool placement receipt object key v1");
+        hasher.update(b"receipt");
+        hasher.update(object_key.as_bytes());
+        let mut bytes = *hasher.finalize().as_bytes();
+        bytes[..8].copy_from_slice(b"TFSPRCPT");
+        ObjectKey::from_bytes32(bytes)
+    }
+
     fn assert_parent_metadata_time_advanced(
         before: crate::types::PosixTimeRecord,
         after: crate::types::PosixTimeRecord,
@@ -13818,6 +13409,36 @@ mod orphan_index_integration_tests {
         let (_root, fs) = make_test_fs("oi_test_empty").expect("open");
         assert!(fs.orphan_index.lock().unwrap().is_empty());
         assert_eq!(fs.orphan_index.lock().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn reopen_refuses_corrupt_auxiliary_metadata_receipt() {
+        let (root, mut fs) = make_test_fs("open_corrupt_auxiliary_metadata_receipt").expect("open");
+        fs.stop_background_scheduler();
+        fs.create_file("/persist-quota-receipt", 0o644)
+            .expect("create file");
+        fs.do_commit().expect("persist quota metadata");
+
+        let quota_key = quota_table_object_key();
+        assert!(fs
+            .store
+            .placement_receipt_for_key(DeviceIoClass::Data, quota_key)
+            .expect("select quota receipt")
+            .is_some());
+        fs.store
+            .raw_primary_store_mut()
+            .put(
+                placement_receipt_key_for_test(quota_key),
+                b"corrupt receipt",
+            )
+            .expect("corrupt quota receipt");
+        drop(fs);
+
+        assert!(
+            LocalFileSystem::open(&root).is_err(),
+            "mounted reopen must not replace unreadable quota authority with empty state"
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -14019,63 +13640,6 @@ mod orphan_index_integration_tests {
             fs.create_file("/test", 0o644).expect("create_file");
             fs.tick_background_services();
         }
-
-        #[test]
-        fn background_cleaner_integration_pipeline() {
-            // Tier 3 storage runtime validation: exercises the full background
-            // cleaner pipeline through tick_background_services().  Writes
-            // files to fill pool space, triggers cleaning via do_commit(),
-            // asserts the cleaner activates and foreground I/O is not starved.
-            let root = std::env::temp_dir().join("bs_test_bgcleaner_pipeline");
-            if root.exists() {
-                let _ = std::fs::remove_dir_all(&root);
-            }
-            let mut fs = LocalFileSystem::open(&root).expect("open");
-
-            // Write files to consume pool segments and trigger cleaning.
-            for i in 0..20 {
-                let path = format!("/file_{i}");
-                fs.create_file(&path, 0o644).expect("create_file");
-                // Write 64 KiB per file — accumulates segment pressure.
-                fs.write_file(&path, 0, &[i as u8; 65536])
-                    .expect("write_file");
-            }
-
-            // Commit, which triggers tick_background_services() including
-            // Duty 4: background_cleaner.tick().
-            fs.do_commit().expect("commit");
-
-            // Check cleaner stats — the cleaner should have attempted
-            // at least one round (depends on pool size and watermark config).
-            let cleaner_stats = fs.background_cleaner_stats();
-            eprintln!(
-                "background-cleaner pipeline stats: rounds_attempted={} rounds_completed={} rounds_throttled={} rounds_inactive={} segments_retired={} active={} free={}/{} total",
-                cleaner_stats.rounds_attempted,
-                cleaner_stats.rounds_completed,
-                cleaner_stats.rounds_throttled,
-                cleaner_stats.rounds_inactive,
-                cleaner_stats.total_segments_retired,
-                cleaner_stats.active,
-                cleaner_stats.last_free_segments,
-                cleaner_stats.last_total_segments,
-            );
-
-            // Foreground I/O must still work after cleaning.
-            let data = fs.read_file("/file_0").expect("read after clean");
-            assert!(
-                !data.is_empty(),
-                "foreground read must succeed after cleaning"
-            );
-
-            // Write another file — foreground write must not be starved.
-            fs.create_file("/post_clean", 0o644)
-                .expect("create after clean");
-            fs.write_file("/post_clean", 0, b"post-clean-data")
-                .expect("write after clean");
-            fs.do_commit().expect("commit after clean");
-
-            let _ = std::fs::remove_dir_all(&root);
-        }
     }
 
     #[test]
@@ -14132,6 +13696,62 @@ mod orphan_index_integration_tests {
             -1,
             "inode tombstone delta should be -1"
         );
+    }
+
+    #[test]
+    fn reclaim_delta_retains_corrupt_receipt_authority() {
+        let (root, mut fs) = make_test_fs("rd_test_corrupt_receipt_authority").expect("open");
+        fs.stop_background_scheduler();
+        fs.set_auto_commit(false);
+
+        let inode_id = InodeId::new(88_101);
+        let legacy_key = content_object_key(inode_id);
+        let object_key = ObjectKey::from_bytes(*legacy_key.as_bytes());
+        fs.store
+            .put(
+                DeviceIoClass::Data,
+                object_key,
+                b"receipt-bound legacy bytes",
+            )
+            .expect("publish receipt-backed object");
+
+        fs.store
+            .raw_primary_store_mut()
+            .put(
+                placement_receipt_key_for_test(object_key),
+                b"corrupt receipt",
+            )
+            .expect("replace receipt with corrupt bytes");
+
+        assert!(fs
+            .store
+            .placement_receipt_for_key(DeviceIoClass::Data, object_key)
+            .is_err());
+        fs.record_reclaim_delta(inode_id, 1);
+        assert_eq!(
+            fs.reclaim_queue_depth(),
+            0,
+            "selector failure must not become generation-zero reclaim authority"
+        );
+
+        fs.reclaim_queue
+            .lock()
+            .unwrap()
+            .insert(ReclaimQueueEntry::new(
+                ReclaimObjectKey(*legacy_key.as_bytes()),
+                -1,
+                ReclaimQueueFamily::Extent,
+            ));
+        let stats = fs.drain_local_reclaim_queue_into_store();
+        assert_eq!(stats.entries_drained, 0);
+        assert_eq!(
+            fs.reclaim_queue_depth(),
+            1,
+            "authority failure must retain an explicitly queued cleanup request"
+        );
+
+        drop(fs);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -15980,6 +15600,29 @@ mod recovery_integration_tests {
         let _ = std::fs::remove_dir_all(path);
     }
 
+    #[test]
+    fn background_scrub_interval_is_rejected_before_pool_creation() {
+        let root = temp_root("background-scrub-unsupported");
+        let mut options = test_options();
+        options.background_scrub_interval_secs = 1;
+
+        let error = match LocalFileSystem::open_with_options(&root, options) {
+            Ok(_) => panic!("automatic mounted background scrub must be rejected"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            FileSystemError::Unsupported {
+                operation: "automatic mounted background scrub",
+                reason: "requires a bounded mounted-Pool owner driver",
+            }
+        ));
+        assert!(
+            !root.exists(),
+            "unsupported scrub configuration must fail before Pool creation"
+        );
+    }
+
     fn namespace_create_fixture(
         fs: &mut LocalFileSystem,
         name: &str,
@@ -16391,22 +16034,6 @@ mod recovery_integration_tests {
     fn recovery_policy_replay_only_allows_replay() {
         let p = RecoveryPolicy::ReplayOnly;
         assert!(p.allows_replay());
-        assert!(!p.allows_repair_writeback());
-    }
-
-    /// Verify that scrub_repair_pass is gated by RecoveryPolicy and
-    /// returns an empty ledger when repair is not permitted.
-    #[test]
-    fn scrub_repair_pass_gated_by_policy() {
-        let tmp = TempDir::new().expect("tempdir");
-        let opts = StoreOptions::test_fast();
-        let fs =
-            crate::LocalFileSystem::open_with_options(tmp.path(), opts).expect("open filesystem");
-
-        // Default policy is ReplayOnly — repair writeback not allowed.
-        let ledger = fs.scrub_repair_pass().expect("scrub_repair_pass");
-        assert_eq!(ledger.repair_count, 0);
-        assert_eq!(ledger.repair_failure_count, 0);
     }
 
     /// Transaction rollback must restore all mutable side ledgers (#5980).

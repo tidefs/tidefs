@@ -228,7 +228,6 @@ fn handle_mount(
         pool_uuid: None,
         foreground,
         debug,
-        writeback_cache: false,
         coherency_profile: CoherencyProfile::Writeback,
         block_devices: None,
         dataset_path: Some(dataset),

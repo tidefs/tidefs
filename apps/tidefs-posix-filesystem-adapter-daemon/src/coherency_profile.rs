@@ -2,21 +2,18 @@
 #![allow(non_local_definitions)]
 //! Named coherency profiles for FUSE daemon caching semantics.
 //!
-//! Each profile bundles cache timeouts, invalidation strategy, and durability
-//! behaviour into a single meaningful name. Operators select a profile per
-//! mount or per dataset rather than tuning individual FUSE TTL knobs.
+//! Each profile bundles metadata-cache timeouts and invalidation strategy into
+//! a single meaningful name. Operators select a profile per mount or per
+//! dataset rather than tuning individual FUSE TTL knobs. Profiles never enable
+//! kernel writeback caching or allow regular-file reads to bypass direct I/O.
 //!
 //! Profiles:
-//! - `Strict`:   POSIX-exact; every read checks authority, every write
-//!   invalidates immediately. No kernel caching. (NFS-level consistency).
-//! - `Writeback`: Writes cached locally, flushed on fsync/txg commit. Reads
-//!   check authority if cache entry > TTL. Default for single-node.
-//! - `Nearline`:  Aggressive local caching with background invalidation feed.
-//!   For read-heavy workloads with occasional writes.
-//! - `Async`:     Local cache with lazy invalidation. Suitable for datasets
-//!   rarely modified by other nodes.
-//! - `Offline`:   Full local cache, no invalidation. Suitable for read-only
-//!   or single-writer datasets.
+//! - `Strict`: zero metadata TTLs and immediate invalidation.
+//! - `Writeback`: short metadata TTLs and invalidation on writes; the name does
+//!   not imply FUSE kernel writeback-cache negotiation.
+//! - `Nearline`: longer negative-entry caching with TTL-based invalidation.
+//! - `Async`: longer metadata TTLs with explicit lazy invalidation.
+//! - `Offline`: longest metadata TTLs with no notification-driven invalidation.
 
 use std::fmt;
 use std::str::FromStr;
@@ -26,29 +23,24 @@ use std::time::Duration;
 
 /// Named coherency profile for the FUSE daemon.
 ///
-/// Each variant bundles caching, invalidation, and durability behaviour
-/// into a single meaningful name.
+/// Each variant bundles metadata caching and invalidation behaviour.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 #[repr(u8)]
 #[derive(Default)]
 pub enum CoherencyProfile {
     /// Every read checks authority, every write invalidates immediately.
-    /// No kernel caching (attr_timeout=0, entry_timeout=0, no writeback cache).
+    /// No metadata caching (attr_timeout=0, entry_timeout=0).
     /// Target: NFS-level consistency, POSIX-exact behaviour.
     Strict = 0,
-    /// Writes cached locally, flushed on fsync/txg commit.
-    /// Reads check authority if cache entry exceeds TTL.
+    /// Short metadata TTLs with invalidation on writes.
     /// Default for single-node deployments.
     #[default]
     Writeback = 1,
-    /// Aggressive local caching with background invalidation feed.
-    /// For read-heavy workloads with occasional writes.
+    /// Longer negative-entry caching with TTL-based invalidation.
     Nearline = 2,
-    /// Local cache with lazy invalidation.
-    /// Suitable for datasets rarely modified by other nodes.
+    /// Longer metadata TTLs with explicit lazy invalidation.
     Async = 3,
-    /// Full local cache, no invalidation.
-    /// Suitable for read-only or single-writer datasets.
+    /// Longest metadata TTLs with no notification-driven invalidation.
     Offline = 4,
 }
 
@@ -71,35 +63,30 @@ impl CoherencyProfile {
                 attr_ttl: Duration::ZERO,
                 entry_ttl: Duration::ZERO,
                 negative_ttl: Duration::ZERO,
-                kernel_writeback: false,
                 invalidation: InvalidationPolicy::Immediate,
             },
             CoherencyProfile::Writeback => CoherencyProfileParams {
                 attr_ttl: Duration::from_secs(5),
                 entry_ttl: Duration::from_secs(5),
                 negative_ttl: Duration::from_millis(250),
-                kernel_writeback: true,
                 invalidation: InvalidationPolicy::OnWrite,
             },
             CoherencyProfile::Nearline => CoherencyProfileParams {
                 attr_ttl: Duration::from_secs(5),
                 entry_ttl: Duration::from_secs(5),
                 negative_ttl: Duration::from_secs(5),
-                kernel_writeback: true,
                 invalidation: InvalidationPolicy::TtlBased,
             },
             CoherencyProfile::Async => CoherencyProfileParams {
                 attr_ttl: Duration::from_secs(10),
                 entry_ttl: Duration::from_secs(10),
                 negative_ttl: Duration::from_secs(5),
-                kernel_writeback: true,
                 invalidation: InvalidationPolicy::Lazy,
             },
             CoherencyProfile::Offline => CoherencyProfileParams {
                 attr_ttl: Duration::from_secs(60),
                 entry_ttl: Duration::from_secs(60),
                 negative_ttl: Duration::from_secs(30),
-                kernel_writeback: true,
                 invalidation: InvalidationPolicy::None,
             },
         }
@@ -108,11 +95,6 @@ impl CoherencyProfile {
     /// When to send FUSE_NOTIFY_INVAL_INODE / FUSE_NOTIFY_INVAL_ENTRY.
     pub fn invalidation_policy(self) -> InvalidationPolicy {
         self.params().invalidation
-    }
-
-    /// Whether the kernel writeback cache is enabled for this profile.
-    pub fn kernel_writeback_enabled(self) -> bool {
-        self.params().kernel_writeback
     }
 }
 
@@ -150,8 +132,6 @@ pub struct CoherencyProfileParams {
     pub entry_ttl: Duration,
     /// Negative cache TTL (for ENOENT responses).
     pub negative_ttl: Duration,
-    /// Whether the kernel writeback cache (FUSE writeback_cache) is enabled.
-    pub kernel_writeback: bool,
     /// Invalidation strategy: when cached data is invalidated.
     pub invalidation: InvalidationPolicy,
 }
@@ -229,7 +209,6 @@ mod tests {
         assert_eq!(p.attr_ttl, Duration::ZERO);
         assert_eq!(p.entry_ttl, Duration::ZERO);
         assert_eq!(p.negative_ttl, Duration::ZERO);
-        assert!(!p.kernel_writeback);
         assert_eq!(p.invalidation, InvalidationPolicy::Immediate);
     }
 
@@ -239,7 +218,6 @@ mod tests {
         assert_eq!(p.attr_ttl, Duration::from_secs(5));
         assert_eq!(p.entry_ttl, Duration::from_secs(5));
         assert_eq!(p.negative_ttl, Duration::from_millis(250));
-        assert!(p.kernel_writeback);
         assert_eq!(p.invalidation, InvalidationPolicy::OnWrite);
     }
 
@@ -248,7 +226,6 @@ mod tests {
         let p = CoherencyProfile::Nearline.params();
         assert_eq!(p.attr_ttl, Duration::from_secs(5));
         assert_eq!(p.entry_ttl, Duration::from_secs(5));
-        assert!(p.kernel_writeback);
         assert_eq!(p.invalidation, InvalidationPolicy::TtlBased);
     }
 
@@ -258,7 +235,6 @@ mod tests {
         assert_eq!(p.attr_ttl, Duration::from_secs(10));
         assert_eq!(p.entry_ttl, Duration::from_secs(10));
         assert_eq!(p.negative_ttl, Duration::from_secs(5));
-        assert!(p.kernel_writeback);
         assert_eq!(p.invalidation, InvalidationPolicy::Lazy);
     }
 
@@ -268,7 +244,6 @@ mod tests {
         assert_eq!(p.attr_ttl, Duration::from_secs(60));
         assert_eq!(p.entry_ttl, Duration::from_secs(60));
         assert_eq!(p.negative_ttl, Duration::from_secs(30));
-        assert!(p.kernel_writeback);
         assert_eq!(p.invalidation, InvalidationPolicy::None);
     }
 
@@ -363,14 +338,5 @@ mod tests {
         assert_eq!(p.attr_ttl, Duration::ZERO);
         assert_eq!(p.entry_ttl, Duration::ZERO);
         assert_eq!(p.negative_ttl, Duration::ZERO);
-    }
-
-    #[test]
-    fn profile_kernel_writeback() {
-        assert!(!CoherencyProfile::Strict.kernel_writeback_enabled());
-        assert!(CoherencyProfile::Writeback.kernel_writeback_enabled());
-        assert!(CoherencyProfile::Nearline.kernel_writeback_enabled());
-        assert!(CoherencyProfile::Async.kernel_writeback_enabled());
-        assert!(CoherencyProfile::Offline.kernel_writeback_enabled());
     }
 }

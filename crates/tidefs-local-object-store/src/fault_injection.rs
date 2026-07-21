@@ -44,10 +44,6 @@ pub enum CrashInjectionPoint {
     RecoveryBeforeReplay,
     RecoveryAfterReplay,
     RecoveryBeforeRootSelect,
-    // Repair hooks -- crash during scrub/repair operations
-    RepairBeforeApply,
-    RepairBeforeWriteback,
-    RepairAfterWriteback,
 }
 
 impl CrashInjectionPoint {
@@ -70,9 +66,6 @@ impl CrashInjectionPoint {
         Self::RecoveryBeforeReplay,
         Self::RecoveryAfterReplay,
         Self::RecoveryBeforeRootSelect,
-        Self::RepairBeforeApply,
-        Self::RepairBeforeWriteback,
-        Self::RepairAfterWriteback,
     ];
 
     pub fn label(&self) -> &'static str {
@@ -95,9 +88,6 @@ impl CrashInjectionPoint {
             Self::RecoveryBeforeReplay => "RECOVERY_BEFORE_REPLAY",
             Self::RecoveryAfterReplay => "RECOVERY_AFTER_REPLAY",
             Self::RecoveryBeforeRootSelect => "RECOVERY_BEFORE_ROOT_SELECT",
-            Self::RepairBeforeApply => "REPAIR_BEFORE_APPLY",
-            Self::RepairBeforeWriteback => "REPAIR_BEFORE_WRITEBACK",
-            Self::RepairAfterWriteback => "REPAIR_AFTER_WRITEBACK",
         }
     }
 
@@ -129,13 +119,6 @@ impl CrashInjectionPoint {
             Self::OpRenameAfterResolve
                 | Self::OpUnlinkBeforeNlinkDecr
                 | Self::OpUnlinkAfterNlinkZero
-        )
-    }
-
-    pub fn is_repair_hook(&self) -> bool {
-        matches!(
-            self,
-            Self::RepairBeforeApply | Self::RepairBeforeWriteback | Self::RepairAfterWriteback
         )
     }
 }

@@ -3,15 +3,13 @@
 This document is the narrow repo-tracked authority table for TideFS cache
 classification vocabulary and cache-layer ownership. It names which cache
 layers are authoritative, derived, optional, or experimental so source comments
-can share one boundary for FUSE read cache, page cache, ARC, L2ARC, dirty
-tracking, writeback, inode metadata cache, directory listing cache,
+can share one boundary for page cache, ARC, L2ARC, dirty tracking, writeback,
+inode metadata cache, directory listing cache,
 path-lookup cache, and future kernel page-cache roles.
 
-This is not an end-to-end page-cache/writeback/mmap durability proof, a kernel
-page-cache completion claim, production readiness evidence, or
-OpenZFS/Ceph-class successor evidence. Those broader claims remain governed by
-`docs/DOCUMENTATION_AUTHORITY_REGISTER.md`, `docs/REVIEW_TODO_REGISTER.md`,
-and `validation/claims.toml`.
+This table describes current implementation ownership. It is not an end-to-end
+page-cache, writeback, mmap, or durability test; mounted and kernel behavior
+must be established through the corresponding runtime boundary.
 
 ## Authority Classes
 
@@ -26,39 +24,38 @@ and `validation/claims.toml`.
 
 | Cache Layer | Location | Data Scope | Dirty Ownership | Classification | Kernel Role |
 |---|---|---|---|---|---|
-| **PageCache** | `tidefs-cache-core` | Page-granularity read cache (4 KiB pages) with LRU eviction, dirty tracking, and writeback coordination | Authoritative for dirty pages in flight; writeback lifecycle gates this cache layer's dirty-page ownership handoff | **Authoritative** | Mirrors kernel page cache in FUSE mode |
+| **PageCache** | `tidefs-cache-core` | Page-granularity cache (4 KiB pages) with LRU eviction, dirty tracking, and writeback coordination | Authoritative only for a consumer that explicitly attaches it; never mounted-read authority | **Authoritative** (for an attached dirty-page scope) | Not attached to the current FUSE carrier and not the Linux kernel writeback cache |
 | **WeightedArc** | `tidefs-cache-core` | Generic ARC eviction policy (T1/T2/B1/B2) with byte-weight tracking for metadata entries | None (metadata-only, no dirty data) | **Authoritative** (for metadata placement) | ARC policy may inform kernel LRU |
 | **L2ARC** | `tidefs-cache-core` | Persistent second-level read cache on fast NVMe/SSD devices | None -- every entry has an authoritative copy on main pool devices | **Derived** | Kernel page cache is the final L1; L2ARC is a userspace flash tier |
 | **Prefetch** | `tidefs-cache-core` | Sequential-read detection and readahead planning | None (populates PageCache) | **Derived** | Kernel readahead is authoritative in kernel mode |
-| **HotReadCache** | `tidefs-local-filesystem` | Whole-file read cache for `read_file`/`read_symlink` with ARC eviction | None -- source-owned as a non-authoritative runtime mirror | **Derived** (superseded by cache-core PageCache) | Not applicable in kernel mode |
+| **HotReadCache** | `tidefs-local-filesystem` | Whole-file read cache for `read_file`/`read_symlink` with ARC eviction | None -- a hit is usable only after current strict receipt authority is re-read | **Derived** | Not applicable in kernel mode |
 | **InodeCache** | `tidefs-local-filesystem` | ARC cache for inode metadata with lazy on-demand loading | None (metadata-only) | **Authoritative** (for inode metadata caching) | Future kernel inode cache |
 | **local-fs PageCache** | `tidefs-local-filesystem/src/page_cache/` | Page cache mirroring object-store content with its own DirtyPageTracker and reclaim | Derived from object store; never authoritative for durability | **Derived** (delegates to cache-core PageCache for page-level authority) | Merged into kernel page cache in kernel mode |
 | **DirtyPageTracker (range)** | `tidefs-local-filesystem/src/dirty_page_tracker.rs` | Per-inode dirty range tracking with coalescing for writeback flush path | Authoritative for dirty byte ranges awaiting flush | **Authoritative** | Replaced by kernel dirty-folio tracking in kernel mode |
 | **DirtySet** | `tidefs-local-filesystem/src/writeback.rs` | Writeback dirty accounting: data bytes, metadata ops, dirty inodes, catalog dirty flag | Authoritative for dirty-state classification and commit-group triggers | **Authoritative** | Replaced by kernel writeback in kernel mode |
 | **WritebackDaemon** | `tidefs-local-filesystem/src/writeback_daemon.rs` | Periodic dirty-page flush scheduling loop | Delegates to DirtyPageTracker and FlushTarget | **Derived** | Replaced by kernel bdflush/kworker in kernel mode |
 | **Readahead** | `tidefs-local-filesystem/src/readahead.rs` | Sequential-read detection and prefetch window planning | None (populates caches) | **Derived** (supplements cache-core Prefetch) | Kernel readahead is authoritative in kernel mode |
-| **FUSE ReadCache** | `tidefs-posix-filesystem-adapter-daemon` | Whole-file LRU read cache keyed by inode (64 MiB default byte limit) | None (non-authoritative by design) | **Derived** (superseded by cache-core PageCache; duplicate of HotReadCache) | Not applicable in kernel mode |
-| **FUSE WritebackInodeCache** | `tidefs-posix-filesystem-adapter-daemon` | Buffered-write inode cache for FUSE writeback-cache path | Delegated to local-filesystem writeback path | **Derived** | Not applicable in kernel mode |
-| **FUSE writeback cache** | `tidefs-posix-filesystem-adapter-daemon` | Optional buffered-write cache in the FUSE daemon hot path | Delegated to local-filesystem writeback path; gated behind `--writeback-cache` flag | **Optional** (off by default per A11/A16 red gate) | Not applicable in kernel mode |
-| **Kernel page cache** | Linux 7.0 VFS | Native kernel folio/page cache for FUSE and kmod mounts | Authoritative in kernel mode; mirrors userspace authorities in FUSE mode | **Authoritative** (kernel mode) / **Experimental** (FUSE mode: kernel decides eviction) | Definitive |
+| **FUSE `dirty_state` ranges** | `tidefs-posix-filesystem-adapter-daemon` | Per-inode ranges for registered-handle release/prune coordination | Derived from successful engine writes and cleared only after engine durability or exact authoritative-range replacement; never byte or durability authority | **Derived** | The sole adapter dirty projection; distinct from unavailable kernel writeback-cache negotiation |
+| **FUSE writeback cache** | `tidefs-posix-filesystem-adapter-daemon` | Kernel writeback-cache negotiation | No product dirty ownership: requests are refused pending receipt-aware coherency | **Unavailable** | Product mounts do not negotiate it |
+| **Kernel page cache** | Linux VFS | Native kernel folio/page cache | No regular-file read authority in the current FUSE adapter contract | **Bypassed by readable-open reply policy** | The adapter returns `FOPEN_DIRECT_IO`; the real mounted receipt-authority test verifies the same-open-file-descriptor behavior |
 
 ## Invariants
 
 1. No two cache layers may hold overlapping dirty-data authority for the same
-   byte range.  The authoritative dirty owner for in-flight page data is
-   `tidefs-cache-core::PageCache`.  The authoritative dirty owner for
-   writeback accounting is `tidefs-local-filesystem::DirtySet`.
+   byte range. `tidefs-cache-core::PageCache` owns dirty pages only for an
+   explicitly attached consumer. In the current mounted carrier, engine/local
+   filesystem state owns bytes and writeback; adapter `dirty_state` is only a
+   derived range projection.
 
-2. The `HotReadCache` in local-filesystem is classified as **Derived** and
-   superseded by `tidefs-cache-core::PageCache`. It must not grow new
-   ownership rules that conflict with cache-core. Future work should remove it
-   in favor of cache-core delegation.
+2. The `HotReadCache` in local-filesystem is classified as **Derived**. A hit
+   may be returned only after the current Pool placement receipt is re-read and
+   validated; cached bytes never substitute for placement authority.
 
-3. The FUSE daemon `ReadCache` in `read_cache.rs` is classified as **Derived**
-   and superseded by `tidefs-cache-core::PageCache`. It is a functional
-   duplicate of the local-filesystem `HotReadCache`: both are whole-file
-   read caches that mirror authoritative content. The canonical read-cache
-   authority in the userspace stack is `tidefs-cache-core::PageCache`.
+3. The FUSE daemon has no file-data read cache or alternate block-volume read
+   plane. Its open-reply policy adds `FOPEN_DIRECT_IO` to every readable open
+   and masks `FOPEN_KEEP_CACHE`; the mounted acceptance test must verify that a
+   same-file-descriptor read reaches the VFS engine and current Pool
+   placement-receipt authority.
 
 4. The local-filesystem `page_cache/` module is classified as **Derived**. It
    mirrors object-store content for read acceleration and must never be cited
@@ -72,10 +69,11 @@ and `validation/claims.toml`.
    checksums are used for on-device integrity verification only, not as a
    generic proof marker.
 
-6. In FUSE userspace mode, the Linux kernel page cache is the primary
-   byte-residency plane.  Userspace keeps mirrors, dirty-epoch state, and
-   staging buffers only.  The `tidefs-cache-core::PageCache` mirrors the
-   kernel page cache for read acceleration.
+6. The current FUSE adapter configures the Linux kernel page cache out of the
+   regular-file read plane. Kernel writeback caching is unavailable until it
+   can preserve receipt-aware coherency. The adapter has no byte mirror or
+   writeback scheduler; its one `dirty_state` range map coordinates release
+   and pruning without negotiating kernel writeback.
 
 7. In full-kernel mode (kmod-posix-vfs), the kernel page cache is the single
    authoritative byte-residency plane.  All userspace cache layers are absent
@@ -88,7 +86,7 @@ and `validation/claims.toml`.
 | L2ARC | Ghost-hit filter eviction, index capacity pressure, device trim | L2ArcIndex entry removal, circular-log overwrite |
 | local-fs PageCache | Dirty page flush completion, memory pressure reclaim | `DirtyPageTracker::mark_clean`, `reclaim::evict_clean_pages` |
 | DirtyPageTracker (range) | Writeback flush completion | `flush_inode` removal |
-| FUSE writeback cache | `fsync`/`fdatasync`/`O_SYNC`/commit barrier | Writeback daemon flush + commit-group sync |
+| FUSE `dirty_state` ranges | Successful flush, `fsync`/`fdatasync`, `syncfs`, release flush, or exact authoritative-range replacement | Derived range removal; engine/local-filesystem bytes remain authoritative |
 
 ## Reclaim and Memory Pressure
 
@@ -115,18 +113,18 @@ and `validation/claims.toml`.
 | Block kmod | Kernel block I/O page cache | Block-device page cache for ublk direct and ext4 mounts |
 | Full-kernel no-daemon | Kernel page cache (unified) | Single authoritative cache plane; all userspace caches disabled |
 
-## Validation And Claim Boundary
+## Validation Boundary
 
 This document provides the cache/page-cache authority vocabulary and the
-duplicate-read-cache classification used by current source comments. It keeps
-`HotReadCache`, local-fs `page_cache/`, and the FUSE daemon `ReadCache`
-classified as derived or transitional rather than durability authority.
+receipt-aware cache classification used by current source comments. It keeps
+`HotReadCache` and local-fs `page_cache/` derived or scoped rather than
+durability or placement authority, and records that the duplicate FUSE read
+cache has been removed.
 
-It does not close the writeback-cache correctness gate, performance evidence,
-mmap durability, full-kernel no-daemon integration, production readiness, or
-successor/comparator claims.
+It does not establish kernel writeback-cache correctness, mmap durability,
+full-kernel integration, performance, or production readiness.
 
-| Evidence class | Boundary |
+| Check | Boundary |
 |---|---|
 | `cargo test -p tidefs-cache-core` | Exercises page cache, weighted ARC, L2ARC, directory listing cache, path lookup cache, and prefetch units; non-closing by itself. |
 | `cargo test -p tidefs-local-filesystem` | Exercises hot read cache, inode cache, local page cache, dirty page tracker, and writeback units; non-closing by itself. |

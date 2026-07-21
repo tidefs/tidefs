@@ -1118,7 +1118,6 @@ pub(crate) fn load_state_from_superblock_changed_records(
         quota_table: QuotaTable::new(),
         space_accounting: SpaceAccounting::empty(),
         known_inode_ids,
-        corrupted_inodes: BTreeSet::new(),
         change_streams: BTreeMap::new(),
         extent_maps: Arc::new(Mutex::new(extent_maps)),
         dirty_extent_maps: BTreeSet::new(),
@@ -2912,7 +2911,6 @@ mod tests {
                 completed_keys: all_keys.clone(),
             };
             write_receive_checkpoint(store, &cp).expect("write checkpoint");
-            drop(store);
         }
 
         // 6. Call the resume-aware receive with all keys as skip set.

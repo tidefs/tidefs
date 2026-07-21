@@ -416,17 +416,17 @@ fn enospc_during_filesystem_transaction_preserves_committed_state() {
 }
 
 #[test]
-fn scrub_detects_injected_byte_corruption() {
+fn online_verifier_detects_injected_byte_corruption() {
     set_test_key();
-    let root = temp_root("scrub-fault");
+    let root = temp_root("online-verifier-fault");
 
     // Phase 1: create committed filesystem content with known checksums.
     {
         let mut fs = LocalFileSystem::open_with_options(&root, opts()).expect("open fs");
-        fs.create_dir("/scrub", DEFAULT_DIRECTORY_PERMISSIONS)
-            .expect("mkdir scrub");
+        fs.create_dir("/verify", DEFAULT_DIRECTORY_PERMISSIONS)
+            .expect("mkdir verify");
         for i in 0..5 {
-            let path = format!("/scrub/data_{i}.txt");
+            let path = format!("/verify/data_{i}.txt");
             fs.create_file(&path, DEFAULT_FILE_PERMISSIONS)
                 .expect("create data file");
             let payload = format!("data-block-{i}-padding-to-reach-reasonable-size-xxxxxxxxxx");
@@ -754,9 +754,6 @@ fn crash_test_child_workload() {
         "RecoveryBeforeReplay" => CrashInjectionPoint::RecoveryBeforeReplay,
         "RecoveryAfterReplay" => CrashInjectionPoint::RecoveryAfterReplay,
         "RecoveryBeforeRootSelect" => CrashInjectionPoint::RecoveryBeforeRootSelect,
-        "RepairBeforeApply" => CrashInjectionPoint::RepairBeforeApply,
-        "RepairBeforeWriteback" => CrashInjectionPoint::RepairBeforeWriteback,
-        "RepairAfterWriteback" => CrashInjectionPoint::RepairAfterWriteback,
         _ => return,
     };
 
@@ -811,12 +808,6 @@ fn crash_test_child_workload() {
             fs.create_file("/alloc_test.txt", 0o644).ok();
             let _ = fs.fallocate_file("/alloc_test.txt", 0, 4096);
             let _ = fs.sync_all();
-        }
-        // Repair hooks: trigger repair_cycle
-        CrashInjectionPoint::RepairBeforeApply
-        | CrashInjectionPoint::RepairBeforeWriteback
-        | CrashInjectionPoint::RepairAfterWriteback => {
-            let _ = fs.repair_cycle();
         }
         _ => {}
     }
@@ -1458,127 +1449,6 @@ fn double_crash_recovery_chain_preserves_committed_roots() {
 }
 
 // ---------------------------------------------------------------------------
-// Test: Interrupted repair preserves committed data
-// ---------------------------------------------------------------------------
-
-/// Create a filesystem with committed data, inject byte corruption into
-/// segment files via direct on-disk tampering, arm a repair crash hook,
-/// and crash during repair_cycle(). After reopening, committed data must
-/// survive and the filesystem must be mountable and accept new writes.
-///
-/// REL-STOR-014: interrupted repair scenario for the storage recovery
-/// failure-injection campaign.
-#[test]
-fn interrupted_repair_preserves_committed_data() {
-    set_test_key();
-    let root = temp_root("interrupted-repair");
-    let mut store_opts = opts();
-    store_opts.max_segment_bytes = 65536;
-
-    // -- Phase 1: Create filesystem with committed data -----------------
-    {
-        let mut fs =
-            LocalFileSystem::open_with_options(&root, store_opts.clone()).expect("open fs");
-        fs.create_file("/precious.txt", 0o644)
-            .expect("create precious");
-        fs.write_file("/precious.txt", 0, b"precious-data-survives-repair-crash")
-            .expect("write precious");
-        fs.sync_all().expect("sync precious");
-        drop(fs);
-    }
-
-    // -- Phase 2: Inject corruption into a segment file on disk ---------
-    {
-        let store =
-            LocalObjectStore::open_with_options(&root, store_opts.clone()).expect("open store");
-        let segments_dir = store.segments_dir().to_path_buf();
-        let keys = store.list_keys();
-
-        let mut corrupted = false;
-        for key in &keys {
-            let locs = store.version_locations_of(*key);
-            if let Some(loc) = locs.first() {
-                let seg_path =
-                    segments_dir.join(tidefs_local_object_store::segment_file_name(loc.segment_id));
-                let payload_start =
-                    loc.record_offset + tidefs_local_object_store::RECORD_HEADER_LEN as u64;
-
-                corrupt_segment_byte(&seg_path, payload_start);
-                corrupted = true;
-            }
-            if corrupted {
-                break;
-            }
-        }
-        drop(store);
-    }
-
-    // -- Phase 3: Crash during repair (RepairBeforeApply hook) ----------
-    let hook = CrashInjectionPoint::RepairBeforeApply;
-    let root_str = root.to_str().unwrap().to_string();
-    let _output = Command::new(std::env::current_exe().expect("current exe"))
-        .env("TIDEFS_ROOT_AUTHENTICATION_KEY_HEX", "A".repeat(64))
-        .env("TIDEFS_CRASH_TEST_ROOT", &root_str)
-        .env("TIDEFS_CRASH_TEST_HOOK", format!("{hook:?}"))
-        .arg("--exact")
-        .arg("crash_test_child_workload")
-        .output()
-        .expect("spawn child for repair crash");
-
-    // -- Phase 4: Reopen after crash -- committed data must survive -----
-    // Two valid outcomes after corruption + repair crash:
-    // 1. Recovery succeeds and committed data is intact.
-    // 2. Store-level integrity checks catch the corruption at open time
-    //    and return an error. This is a correct detection path.
-    match LocalFileSystem::open_with_options(&root, store_opts.clone()) {
-        Ok(fs) => {
-            match fs.read_file("/precious.txt") {
-                Ok(content) => {
-                    assert_eq!(
-                        std::str::from_utf8(&content).unwrap(),
-                        "precious-data-survives-repair-crash",
-                        "committed data must survive interrupted repair"
-                    );
-                }
-                Err(_) => {
-                    // File may be unreadable after corruption + crash.
-                    // The filesystem mounted successfully regardless.
-                }
-            }
-        }
-        Err(_err) => {
-            // Store-level integrity caught the corruption before recovery.
-            // This is a valid fault-detection outcome.
-        }
-    }
-
-    // -- Phase 5: New writes after recovery prove filesystem is healthy -
-    match LocalFileSystem::open_with_options(&root, store_opts.clone()) {
-        Ok(mut fs) => {
-            fs.create_file("/recovered.txt", 0o644).ok();
-            fs.write_file("/recovered.txt", 0, b"new-data-after-interrupted-repair")
-                .ok();
-            let _ = fs.sync_all();
-            drop(fs);
-
-            // Verify new writes survived reopen
-            if let Ok(fs2) = LocalFileSystem::open_with_options(&root, store_opts.clone()) {
-                assert!(
-                    fs2.read_file("/recovered.txt").is_ok(),
-                    "new writes must succeed after interrupted repair recovery"
-                );
-            }
-        }
-        Err(_) => {
-            // Integrity guard caught corruption — pool may need operator
-            // attention but the system correctly detected the fault.
-        }
-    }
-
-    cleanup(&root);
-}
-
-// ---------------------------------------------------------------------------
 // Test: Missing device — backing storage removed between mounts
 // ---------------------------------------------------------------------------
 
@@ -1851,9 +1721,6 @@ fn chaos_cycle_child_workload() {
         "RecoveryBeforeReplay" => CrashInjectionPoint::RecoveryBeforeReplay,
         "RecoveryAfterReplay" => CrashInjectionPoint::RecoveryAfterReplay,
         "RecoveryBeforeRootSelect" => CrashInjectionPoint::RecoveryBeforeRootSelect,
-        "RepairBeforeApply" => CrashInjectionPoint::RepairBeforeApply,
-        "RepairBeforeWriteback" => CrashInjectionPoint::RepairBeforeWriteback,
-        "RepairAfterWriteback" => CrashInjectionPoint::RepairAfterWriteback,
         _ => return,
     };
 
@@ -1915,11 +1782,6 @@ fn chaos_cycle_child_workload() {
             fs.create_file("/chaos_alloc.txt", 0o644).ok();
             let _ = fs.fallocate_file("/chaos_alloc.txt", 0, 4096);
             let _ = fs.sync_all();
-        }
-        CrashInjectionPoint::RepairBeforeApply
-        | CrashInjectionPoint::RepairBeforeWriteback
-        | CrashInjectionPoint::RepairAfterWriteback => {
-            let _ = fs.repair_cycle();
         }
         _ => {}
     }
@@ -2001,8 +1863,6 @@ fn chaos_soak_crash_recovery_campaign() {
             (0.15, 0.02)
         } else if hook.is_namespace_hook() {
             (0.10, 0.01)
-        } else if hook.is_repair_hook() {
-            (0.08, 0.04)
         } else {
             (0.12, 0.02)
         }
@@ -2064,168 +1924,6 @@ fn chaos_soak_crash_recovery_campaign() {
         audit_after.selected_root.is_some(),
         "must have a selected committed root after campaign"
     );
-
-    cleanup(&root);
-}
-
-// ── Tier 3: Mounted repair-cycle idempotence under repeated failures ─────
-
-/// Tier 3 validation: prove that repeated repair_cycle()
-/// calls on a mounted filesystem are idempotent and auditable.
-///
-/// Creates a filesystem with data, runs repair_cycle() multiple times under
-/// RepairWriteback policy, and verifies the filesystem remains mountable and
-/// writable after each cycle. The bridge's internal idempotence (proven by
-/// the 12 crate-level tests in repair_scheduling.rs) ensures duplicate
-/// mark_repaired/mark_failed/ingest operations are safe no-ops.
-#[test]
-fn repair_cycle_repeated_calls_idempotent() {
-    set_test_key();
-    let root = temp_root("repair-idempotent");
-    let store_opts = StoreOptions::test_fast();
-
-    let recovery_policy = tidefs_local_filesystem::RecoveryPolicy::RepairWriteback;
-    let root_auth_key = tidefs_local_filesystem::RootAuthenticationKey::demo_key();
-
-    // Phase 1: Create filesystem with data.
-    {
-        let mut fs = tidefs_local_filesystem::LocalFileSystem::open_with_allocator_policy_and_root_authentication_key(
-            &root,
-            tidefs_local_filesystem::LocalFileSystemOpenConfig {
-                options: store_opts.clone(),
-                allocator_policy: tidefs_local_filesystem::LocalStorageAllocatorPolicy::default(),
-                root_authentication_key: root_auth_key,
-                encryption: None,
-                compression: None,
-                log_device_device_path: None,
-                recovery_policy,
-                block_devices: None,
-            },
-        ).expect("create fs");
-
-        fs.create_file("/data.txt", DEFAULT_FILE_PERMISSIONS)
-            .expect("create");
-        fs.write_file("/data.txt", 0, b"idempotence-test-data-v1")
-            .expect("write");
-        fs.create_dir("/subdir", DEFAULT_DIRECTORY_PERMISSIONS)
-            .expect("mkdir");
-        fs.create_file("/subdir/nested.txt", DEFAULT_FILE_PERMISSIONS)
-            .expect("create nested");
-        fs.write_file("/subdir/nested.txt", 0, b"nested-payload")
-            .expect("write nested");
-        fs.sync_all().expect("sync");
-    }
-
-    // Phase 2: Re-open and run repair_cycle() multiple times. Each call
-    // creates a fresh bridge, ingests scrub findings, and dispatches repairs.
-    // The idempotence guarantee: repeated dispatch within a single call is
-    // safe (proven by crate tests), and repeated calls across re-opens
-    // don't corrupt filesystem state.
-    for cycle in 1..=3 {
-        let mut fs = tidefs_local_filesystem::LocalFileSystem::open_with_allocator_policy_and_root_authentication_key(
-            &root,
-            tidefs_local_filesystem::LocalFileSystemOpenConfig {
-                options: store_opts.clone(),
-                allocator_policy: tidefs_local_filesystem::LocalStorageAllocatorPolicy::default(),
-                root_authentication_key: root_auth_key,
-                encryption: None,
-                compression: None,
-                log_device_device_path: None,
-                recovery_policy,
-                block_devices: None,
-            },
-        ).unwrap_or_else(|_| panic!("reopen cycle {cycle}"));
-
-        let log = fs
-            .repair_cycle()
-            .unwrap_or_else(|_| panic!("repair_cycle {cycle}"));
-        eprintln!(
-            "repair-idempotent: cycle={cycle} repaired={}",
-            log.entries.len()
-        );
-
-        // Filesystem must remain writable after repair.
-        let test_file = format!("/cycle-{cycle}.txt");
-        fs.create_file(&test_file, DEFAULT_FILE_PERMISSIONS)
-            .unwrap_or_else(|_| panic!("create file cycle {cycle}"));
-        let payload = format!("cycle-{cycle}-payload").into_bytes();
-        fs.write_file(&test_file, 0, &payload)
-            .unwrap_or_else(|_| panic!("write cycle {cycle}"));
-        fs.sync_all()
-            .unwrap_or_else(|_| panic!("sync cycle {cycle}"));
-    }
-
-    // Phase 3: Final audit — pool must be cleanly mountable and writable
-    // after all repair cycles.
-    {
-        let mut fs = tidefs_local_filesystem::LocalFileSystem::open_with_allocator_policy_and_root_authentication_key(
-            &root,
-            tidefs_local_filesystem::LocalFileSystemOpenConfig {
-                options: store_opts.clone(),
-                allocator_policy: tidefs_local_filesystem::LocalStorageAllocatorPolicy::default(),
-                root_authentication_key: root_auth_key,
-                encryption: None,
-                compression: None,
-                log_device_device_path: None,
-                recovery_policy,
-                block_devices: None,
-            },
-        ).expect("final reopen");
-
-        // Read original data.
-        let data = fs.read_file("/data.txt").expect("read original data");
-        assert_eq!(
-            std::str::from_utf8(&data).unwrap(),
-            "idempotence-test-data-v1",
-            "original data survives repeated repair cycles"
-        );
-
-        // Read nested data.
-        let nested = fs.read_file("/subdir/nested.txt").expect("read nested");
-        assert_eq!(
-            std::str::from_utf8(&nested).unwrap(),
-            "nested-payload",
-            "nested data survives repeated repair cycles"
-        );
-
-        // Verify cycle files exist.
-        for cycle in 1..=3 {
-            let path = format!("/cycle-{cycle}.txt");
-            let content = fs
-                .read_file(&path)
-                .unwrap_or_else(|_| panic!("read {path}"));
-            let expected = format!("cycle-{cycle}-payload");
-            assert_eq!(
-                std::str::from_utf8(&content).unwrap(),
-                expected.as_str(),
-                "cycle-{cycle} data intact"
-            );
-        }
-
-        // Final new write.
-        fs.create_file("/done.txt", DEFAULT_FILE_PERMISSIONS)
-            .expect("final create");
-        fs.write_file("/done.txt", 0, b"done").expect("final write");
-        fs.sync_all().expect("final sync");
-    }
-
-    // Phase 4: Final reopen — verify the pool is cleanly mountable.
-    {
-        let fs = tidefs_local_filesystem::LocalFileSystem::open_with_allocator_policy_and_root_authentication_key(
-            &root,
-            tidefs_local_filesystem::LocalFileSystemOpenConfig {
-                options: store_opts.clone(),
-                allocator_policy: tidefs_local_filesystem::LocalStorageAllocatorPolicy::default(),
-                root_authentication_key: root_auth_key,
-                encryption: None,
-                compression: None,
-                log_device_device_path: None,
-                recovery_policy,
-                block_devices: None,
-            },
-        ).expect("final reopen after 3 repair cycles");
-        drop(fs);
-    }
 
     cleanup(&root);
 }

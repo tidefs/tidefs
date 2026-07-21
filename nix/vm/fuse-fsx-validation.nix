@@ -1,8 +1,8 @@
-# TideFS: FUSE fsx (with mmap) validation in QEMU.
+# TideFS: direct-I/O FUSE fsx validation in QEMU.
 #
 # Mounts a TideFS FUSE filesystem inside a Linux 7.0 QEMU VM,
-# runs the TideFS fsx exerciser with mmap operations, and produces
-# tier-classified validation rows.
+# runs the TideFS fsx exerciser, requires shared mmap to be refused by the
+# direct-I/O carrier, and produces tier-classified validation rows.
 #
 # Multi-seed corpus mode (--seeds <s1 s2 ...> or --seeds-file <path>):
 #   Runs fsx once per seed against separate test files, records
@@ -18,7 +18,6 @@
   linuxKernel_7_0,
   tidefsPackage,
   tidefsFsx,
-  tidefsMmapWorkload ? null,
   flakeLock ? null,
 }:
 
@@ -35,7 +34,6 @@ let
     GLIBC_LIB="${glibc}/lib"
     FUSE_DAEMON="${tidefsPackage}/bin/tidefs-posix-filesystem-adapter-daemon"
     FSX_BIN="${tidefsFsx}/bin/fsx"
-    MMAP_BIN="${tidefsMmapWorkload}/bin/tidefs-mmap-workload"
     XTAST_BIN="${tidefsPackage}/bin/tidefs-xtask"
     FLAKE_LOCK="${flakeLock}"  # Nix store path to flake.lock
 
@@ -132,10 +130,6 @@ let
     chmod +x "$RUN_DIR/bin/tidefs-posix-filesystem-adapter-daemon"
     cp "$FSX_BIN" "$RUN_DIR/bin/fsx"
     chmod +x "$RUN_DIR/bin/fsx"
-    if [ -n "$MMAP_BIN" ] && [ -f "$MMAP_BIN" ]; then
-      cp "$MMAP_BIN" "$RUN_DIR/bin/tidefs-mmap-workload"
-      chmod +x "$RUN_DIR/bin/tidefs-mmap-workload"
-    fi
 
     # Copy shared libraries BEFORE patchelf so ldd works on the original binaries
     if command -v ldd >/dev/null 2>&1; then
@@ -249,7 +243,6 @@ if [ "$FUSE_READY" -eq 1 ]; then
       --store "$STORE" \
       --mount "$MNT" \
       --root-auth-key-hex 4141414141414141414141414141414141414141414141414141414141414141 \
-      --no-writeback-cache \
       > /tmp/daemon.log 2>&1 &
     DAEMON_PID=$!
 
@@ -279,7 +272,7 @@ if [ "$MOUNTED" -eq 1 ]; then
         for seed in $SEEDS_STR; do
             FSX_PATH="$MNT/fsx-seed-$seed"
             echo "=== fsx seed=$seed nops=$FSX_N ==="
-            /bin/fsx -N "$FSX_N" -S "$seed" "$FSX_PATH" > "/tmp/fsx-seed-$seed.out" 2>&1
+            /bin/fsx --expect-mmap-refused -N "$FSX_N" -S "$seed" "$FSX_PATH" > "/tmp/fsx-seed-$seed.out" 2>&1
             RC=$?
             if [ "$RC" -eq 0 ]; then
                 pass "fsx_seed_$seed" "PASS"
@@ -291,7 +284,7 @@ if [ "$MOUNTED" -eq 1 ]; then
     else
         FSX_PATH="$MNT/fsx-test-file"
         echo "Running fsx -N $FSX_N $FSX_PATH"
-        /bin/fsx -N "$FSX_N" "$FSX_PATH" > /tmp/fsx.out 2>&1
+        /bin/fsx --expect-mmap-refused -N "$FSX_N" "$FSX_PATH" > /tmp/fsx.out 2>&1
         FSX_RC=$?
         echo "=== fsx output ==="
         cat /tmp/fsx.out
@@ -301,10 +294,10 @@ if [ "$MOUNTED" -eq 1 ]; then
         echo "=== end daemon log ==="
         if [ "$FSX_RC" -eq 0 ]; then
             FSX_LINE=$(grep '^fsx:' /tmp/fsx.out | tail -1 || echo "no summary line")
-            pass "fsx_mmap" "fsx: $FSX_LINE"
+            pass "fsx_direct_io" "fsx: $FSX_LINE"
         else
             FSX_LINE=$(grep '^fsx:' /tmp/fsx.out | tail -1 || echo "no summary line")
-            fail "fsx_mmap" "fsx exit=$FSX_RC: $FSX_LINE"
+            fail "fsx_direct_io" "fsx exit=$FSX_RC: $FSX_LINE"
         fi
     fi
 else
@@ -313,32 +306,8 @@ else
             blocked "fsx_seed_$seed" "filesystem not mounted"
         done
     else
-        blocked "fsx_mmap" "filesystem not mounted"
+        blocked "fsx_direct_io" "filesystem not mounted"
     fi
-fi
-
-# ── Phase 2b: mmap workload ──────────────────────────────────────────
-if [ "$MOUNTED" -eq 1 ] && [ -x /bin/tidefs-mmap-workload ]; then
-    MMAP_DIR="$MNT/mmap-workload"
-    mkdir -p "$MMAP_DIR"
-
-    echo "Running tidefs-mmap-workload $MMAP_DIR"
-    if /bin/tidefs-mmap-workload "$MMAP_DIR" > /tmp/mmap.out 2>&1; then
-        PASS_LINES=$(grep -c '"status":"PASS"' /tmp/mmap.out 2>/dev/null || echo 0)
-        FAIL_LINES=$(grep -c '"status":"FAIL"' /tmp/mmap.out 2>/dev/null || echo 0)
-        if [ "$FAIL_LINES" -eq 0 ]; then
-            pass "mmap_workload" "$PASS_LINES tests passed"
-        else
-            fail "mmap_workload" "$FAIL_LINES failures (see /tmp/mmap.out)"
-        fi
-    else
-        MMAP_RC=$?
-        fail "mmap_workload" "exit=$MMAP_RC (see /tmp/mmap.out)"
-    fi
-elif [ "$MOUNTED" -eq 1 ]; then
-    blocked "mmap_workload" "mmap workload binary not available"
-else
-    blocked "mmap_workload" "filesystem not mounted"
 fi
 
 # ── Phase 3: Tear-down ───────────────────────────────────────────────
@@ -367,7 +336,7 @@ echo "FAILED=$FAILED"
 echo "BLOCKED=$BLOCKED"
 echo "timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo "validation_tier=mounted-userspace"
-echo "filesystem=fuse-fsx-mmap"
+echo "filesystem=fuse-fsx-direct-io"
 echo "=== End ==="
 
 sync
@@ -473,7 +442,7 @@ SEEDEOF
   "kernel_version": "$(grep 'kernel_version=' "$VAL_LOG" 2>/dev/null | head -1 | cut -d= -f2 || echo unknown)",
   "backend": "file",
   "validation_tier": "mounted-userspace",
-  "test": "fuse-fsx-mmap",
+  "test": "fuse-fsx-direct-io",
   "nops": $N_OPS,
   "summary": {
     "passed": $PASSC,
@@ -490,7 +459,7 @@ JSONEOF
     if [ -x "$XTAST_BIN" ] && [ -f "$FLAKE_LOCK" ]; then
       echo "Collecting QEMU pin manifest via tidefs-xtask..."
       "$XTAST_BIN" collect-qemu-pin-manifest \
-        --validation-id fuse-fsx-mmap \
+        --validation-id fuse-fsx-direct-io \
         --kernel "$KERNEL_IMG" \
         --initrd "$RUN_DIR/initrd.img" \
         --flake-lock "$FLAKE_LOCK" \
@@ -505,7 +474,7 @@ JSONEOF
           INITRD_SHA=$(sha256sum "$RUN_DIR/initrd.img" 2>/dev/null | cut -d' ' -f1 || echo unknown)
           cat > "$PIN_MANIFEST" << PINEOF
 {
-  "validation_id": "fuse-fsx-mmap",
+  "validation_id": "fuse-fsx-direct-io",
   "commit": "$COMMIT",
   "kernel_sha256": "$KERN_SHA",
   "initrd_sha256": "$INITRD_SHA",

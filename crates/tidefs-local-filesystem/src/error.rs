@@ -5,7 +5,7 @@ use tidefs_local_object_store::StoreError;
 use tidefs_receive_stream::ReceiverRefusalReason;
 use tidefs_storage_intent_read_serving::ReadServingDecisionRecord;
 use tidefs_types_space_accounting_core::AdmissionResult;
-use tidefs_types_vfs_core::{InodeId, NodeKind};
+use tidefs_types_vfs_core::NodeKind;
 
 use crate::types::{
     CommittedRootSummary, CrashRecoveryExpectation, FilesystemCommitBoundary, LocalStorageResource,
@@ -139,11 +139,6 @@ pub enum FileSystemError {
     CorruptState {
         reason: &'static str,
     },
-    /// Content on an inode has been detected as corrupt and could not
-    /// be repaired automatically. Reads return EIO.
-    CorruptContent {
-        inode_id: InodeId,
-    },
     Decode {
         object: &'static str,
         reason: &'static str,
@@ -256,28 +251,6 @@ pub enum FileSystemError {
         object_key: tidefs_local_object_store::ObjectKey,
         expected_generation: u64,
     },
-    /// The pool receipt's redundancy policy is not well-formed (e.g.
-    /// zero copies or zero data/parity shards).
-    ReceiptAuthorityMalformedPolicy {
-        object_key: tidefs_local_object_store::ObjectKey,
-        generation: u64,
-    },
-    /// The pool receipt's target count is less than the policy's
-    /// required placement width.
-    ReceiptAuthorityUnderWidth {
-        object_key: tidefs_local_object_store::ObjectKey,
-        generation: u64,
-        target_count: u16,
-        required_width: u16,
-    },
-    /// The pool receipt's target count exceeds the policy's required
-    /// placement width.
-    ReceiptAuthorityOverWidth {
-        object_key: tidefs_local_object_store::ObjectKey,
-        generation: u64,
-        target_count: u16,
-        required_width: u16,
-    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -372,9 +345,6 @@ impl fmt::Display for FileSystemError {
                 f,
                 "cannot reclaim local storage while retention debt remains: required {required}, available {available}, missing {missing}"
             ),
-            Self::CorruptContent { inode_id } => {
-                write!(f, "content corrupt on inode {}: repair attempted, file truncated or marked corrupted", inode_id.get())
-            }
             Self::CorruptState { reason } => write!(f, "corrupt local filesystem state: {reason}"),
             Self::Decode { object, reason } => write!(f, "could not decode {object}: {reason}"),
             Self::QuotaExceeded { path, limit, usage, delta, kind } => {
@@ -449,15 +419,6 @@ impl fmt::Display for FileSystemError {
             }
             Self::ReceiptAuthoritySynthetic { object_key, expected_generation } => {
                 write!(f, "placement receipt synthetic for object key {object_key:?}: expected generation {expected_generation}, pool receipt generation is zero")
-            }
-            Self::ReceiptAuthorityMalformedPolicy { object_key, generation } => {
-                write!(f, "placement receipt malformed policy for object key {object_key:?} generation {generation}")
-            }
-            Self::ReceiptAuthorityUnderWidth { object_key, generation, target_count, required_width } => {
-                write!(f, "placement receipt under-width for object key {object_key:?} generation {generation}: target_count {target_count} < required_width {required_width}")
-            }
-            Self::ReceiptAuthorityOverWidth { object_key, generation, target_count, required_width } => {
-                write!(f, "placement receipt over-width for object key {object_key:?} generation {generation}: target_count {target_count} > required_width {required_width}")
             }
         }
     }
@@ -596,7 +557,7 @@ mod tests {
     use crate::types::{CrashRecoveryExpectation, FilesystemCommitBoundary, LocalStorageResource};
     use std::error::Error;
     use tidefs_local_object_store::StoreError;
-    use tidefs_types_vfs_core::{InodeId, NodeKind};
+    use tidefs_types_vfs_core::NodeKind;
 
     // ── Error creation ──────────────────────────────────────────────────
 
@@ -738,9 +699,6 @@ mod tests {
             FileSystemError::InvalidPath {
                 path: "bad".to_string(),
                 reason: "too short",
-            },
-            FileSystemError::CorruptContent {
-                inode_id: InodeId::new(42),
             },
             FileSystemError::Decode {
                 object: "inode",
@@ -966,19 +924,6 @@ mod tests {
         }
         let display = format!("{err}");
         assert!(!display.is_empty());
-    }
-
-    #[test]
-    fn test_corrupt_content_creation() {
-        let err = FileSystemError::CorruptContent {
-            inode_id: InodeId::new(12345),
-        };
-        match &err {
-            FileSystemError::CorruptContent { inode_id } => {
-                assert_eq!(inode_id.get(), 12345);
-            }
-            _ => panic!("expected CorruptContent"),
-        }
     }
 
     // ── Additional coverage (s12 #4226) ──────────────────────────────────

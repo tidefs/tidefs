@@ -386,7 +386,6 @@ mod tests {
                 ids.insert(root_inode_id);
                 ids
             },
-            corrupted_inodes: Default::default(),
             change_streams: BTreeMap::new(),
             extent_maps: Arc::new(Mutex::new(BTreeMap::new())),
             dirty_extent_maps: Default::default(),

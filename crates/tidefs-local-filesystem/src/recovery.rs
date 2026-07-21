@@ -9,6 +9,7 @@ use tidefs_types_vfs_core::{Generation, InodeId, NodeKind, ROOT_INODE_ID};
 
 use crate::allocation_bytes;
 use crate::constants::*;
+use crate::content::MountedContentReadAuthority;
 use crate::content_allocation_entries_for_state;
 use crate::crash_hooks::check_crash_hook;
 use crate::encoding::*;
@@ -70,7 +71,6 @@ pub(crate) fn initial_state() -> FileSystemState {
             ids.insert(root_inode_id);
             ids
         },
-        corrupted_inodes: BTreeSet::new(),
         change_streams: BTreeMap::new(),
         extent_maps: Arc::new(Mutex::new(BTreeMap::new())),
         dirty_extent_maps: BTreeSet::new(),
@@ -213,8 +213,41 @@ pub(crate) fn audit_recovery_store(
     Ok(report)
 }
 
-pub fn verify_online_store(
-    store: &mut LocalObjectStore,
+pub(crate) fn verify_online_pool(
+    pool: &mut Pool,
+    root_authentication_key: RootAuthenticationKey,
+) -> Result<OnlineVerifierReport> {
+    verify_online_pool_authority(pool, root_authentication_key)
+}
+
+struct PendingOnlineVerifierIssue {
+    issue: OnlineVerifierIssue,
+    downgrade_after_valid_fallback: bool,
+}
+
+struct OnlineVerifierRootFailure {
+    kind: OnlineVerifierIssueKind,
+    error: FileSystemError,
+}
+
+impl OnlineVerifierRootFailure {
+    fn root_validation(error: FileSystemError) -> Self {
+        Self {
+            kind: OnlineVerifierIssueKind::RootCommitValidation,
+            error,
+        }
+    }
+
+    fn snapshot(error: FileSystemError) -> Self {
+        Self {
+            kind: OnlineVerifierIssueKind::SnapshotRootValidation,
+            error,
+        }
+    }
+}
+
+fn verify_online_pool_authority(
+    pool: &mut Pool,
     root_authentication_key: RootAuthenticationKey,
 ) -> Result<OnlineVerifierReport> {
     let mut report = OnlineVerifierReport::empty();
@@ -222,7 +255,7 @@ pub fn verify_online_store(
 
     for slot in 0..FILESYSTEM_ROOT_SLOT_COUNT {
         let slot_key = root_slot_object_key(slot);
-        let locations = store.version_locations_of(slot_key);
+        let locations = pool.raw_primary_store().version_locations_of(slot_key);
         if locations.is_empty() {
             continue;
         }
@@ -235,18 +268,21 @@ pub fn verify_online_store(
 
         for location in locations.into_iter().rev() {
             report.root_candidates_seen = report.root_candidates_seen.saturating_add(1);
-            let bytes = match store.get_at_location(location) {
+            let bytes = match pool.raw_primary_store().get_at_location(location) {
                 Ok(bytes) => bytes,
                 Err(err) => {
                     report.invalid_root_candidates =
                         report.invalid_root_candidates.saturating_add(1);
-                    slot_issues.push(online_verifier_issue(
-                        OnlineVerifierIssueKind::RootSlotRead,
-                        Some(slot),
-                        Some(location),
-                        None,
-                        format!("could not read root-slot candidate: {err}"),
-                    ));
+                    slot_issues.push(PendingOnlineVerifierIssue {
+                        issue: online_verifier_issue(
+                            OnlineVerifierIssueKind::RootSlotRead,
+                            Some(slot),
+                            Some(location),
+                            None,
+                            format!("could not read root-slot candidate: {err}"),
+                        ),
+                        downgrade_after_valid_fallback: true,
+                    });
                     continue;
                 }
             };
@@ -255,29 +291,35 @@ pub fn verify_online_store(
                 Err(err) => {
                     report.invalid_root_candidates =
                         report.invalid_root_candidates.saturating_add(1);
-                    slot_issues.push(online_verifier_issue(
-                        OnlineVerifierIssueKind::RootCommitDecode,
-                        Some(slot),
-                        Some(location),
-                        None,
-                        err.to_string(),
-                    ));
+                    slot_issues.push(PendingOnlineVerifierIssue {
+                        issue: online_verifier_issue(
+                            OnlineVerifierIssueKind::RootCommitDecode,
+                            Some(slot),
+                            Some(location),
+                            None,
+                            err.to_string(),
+                        ),
+                        downgrade_after_valid_fallback: true,
+                    });
                     continue;
                 }
             };
             if root.slot != slot || root.transaction_id < ROOT_COMMIT_MIN_TRANSACTION_ID {
                 report.invalid_root_candidates = report.invalid_root_candidates.saturating_add(1);
-                slot_issues.push(online_verifier_issue(
-                    OnlineVerifierIssueKind::RootCommitIdentity,
-                    Some(slot),
-                    Some(location),
-                    Some(&root),
-                    "root commit slot or transaction id does not match the root-slot ring",
-                ));
+                slot_issues.push(PendingOnlineVerifierIssue {
+                    issue: online_verifier_issue(
+                        OnlineVerifierIssueKind::RootCommitIdentity,
+                        Some(slot),
+                        Some(location),
+                        Some(&root),
+                        "root commit slot or transaction id does not match the root-slot ring",
+                    ),
+                    downgrade_after_valid_fallback: true,
+                });
                 continue;
             }
 
-            match online_verifier_root_report(store, &root, root_authentication_key) {
+            match online_verifier_pool_root_report(pool, &root, root_authentication_key) {
                 Ok(root_report) => {
                     if selected
                         .as_ref()
@@ -299,13 +341,20 @@ pub fn verify_online_store(
                         .verified_snapshot_roots
                         .saturating_add(root_report.verified_snapshot_roots);
                     report.verified_committed_roots.push(root_report);
-                    for mut issue in slot_issues.drain(..) {
-                        issue.severity = OnlineVerifierIssueSeverity::Warning;
-                        issue.reason = format!(
-                            "stale same-slot root candidate ignored after validating fallback root: {}",
-                            issue.reason
-                        );
-                        report.issues.push(issue);
+                    for mut pending in slot_issues.drain(..) {
+                        if pending.downgrade_after_valid_fallback {
+                            pending.issue.severity = OnlineVerifierIssueSeverity::Warning;
+                            pending.issue.reason = format!(
+                                "stale same-slot root candidate ignored after validating fallback root: {}",
+                                pending.issue.reason
+                            );
+                        } else {
+                            pending.issue.reason = format!(
+                                "same-slot root candidate failed committed authority; a fallback cannot establish a clean outcome: {}",
+                                pending.issue.reason
+                            );
+                        }
+                        report.issues.push(pending.issue);
                     }
                     slot_verified = true;
                     // Only validate the latest (most recent) root commit per slot.
@@ -313,26 +362,26 @@ pub fn verify_online_store(
                     // have been cleaned up by segment rotation.
                     break;
                 }
-                Err(err) => {
+                Err(failure) => {
                     report.invalid_root_candidates =
                         report.invalid_root_candidates.saturating_add(1);
-                    let kind = if matches!(&err, FileSystemError::SnapshotNotFound { .. }) {
-                        OnlineVerifierIssueKind::SnapshotRootValidation
-                    } else {
-                        OnlineVerifierIssueKind::RootCommitValidation
-                    };
-                    slot_issues.push(online_verifier_issue(
-                        kind,
-                        Some(slot),
-                        Some(location),
-                        Some(&root),
-                        err.to_string(),
-                    ));
+                    slot_issues.push(PendingOnlineVerifierIssue {
+                        issue: online_verifier_issue(
+                            failure.kind,
+                            Some(slot),
+                            Some(location),
+                            Some(&root),
+                            failure.error.to_string(),
+                        ),
+                        downgrade_after_valid_fallback: false,
+                    });
                 }
             }
         }
         if !slot_verified {
-            report.issues.extend(slot_issues);
+            report
+                .issues
+                .extend(slot_issues.into_iter().map(|pending| pending.issue));
         }
     }
 
@@ -351,27 +400,38 @@ pub fn verify_online_store(
     Ok(report)
 }
 
-pub fn online_verifier_root_report(
-    store: &mut LocalObjectStore,
+fn online_verifier_pool_root_report(
+    pool: &mut Pool,
     root: &RootCommitRecord,
     root_authentication_key: RootAuthenticationKey,
-) -> Result<OnlineVerifierRootReport> {
+) -> std::result::Result<OnlineVerifierRootReport, OnlineVerifierRootFailure> {
     if !root.has_manifest() {
-        return Err(FileSystemError::CorruptState {
-            reason: "online verifier requires manifest-backed committed roots",
-        });
+        return Err(OnlineVerifierRootFailure::root_validation(
+            FileSystemError::CorruptState {
+                reason: "online verifier requires manifest-backed committed roots",
+            },
+        ));
     }
     if root.root_authentication.is_none() {
-        return Err(FileSystemError::CorruptState {
-            reason: "online verifier requires authenticated committed roots",
-        });
+        return Err(OnlineVerifierRootFailure::root_validation(
+            FileSystemError::CorruptState {
+                reason: "online verifier requires authenticated committed roots",
+            },
+        ));
     }
-    let state = load_state_from_transaction(store, root, root_authentication_key)?;
-    let mount_invariant = mount_invariant_report_from_state(&state)?;
+
+    let state =
+        load_state_from_transaction(pool.raw_primary_store_mut(), root, root_authentication_key)
+            .map_err(OnlineVerifierRootFailure::root_validation)?;
+    let mount_invariant = mount_invariant_report_from_state(&state)
+        .map_err(OnlineVerifierRootFailure::root_validation)?;
     let (checked_content_objects, checked_content_chunks) =
-        online_verifier_content_counts(store, &state)?;
+        online_verifier_pool_content_counts(pool, &state)
+            .map_err(OnlineVerifierRootFailure::root_validation)?;
     let verified_snapshot_roots =
-        online_verifier_snapshot_roots(store, root, &state, root_authentication_key)?;
+        online_verifier_pool_snapshot_roots(pool, root, &state, root_authentication_key)
+            .map_err(OnlineVerifierRootFailure::snapshot)?;
+
     Ok(OnlineVerifierRootReport {
         root: root.summary(),
         mount_invariant,
@@ -383,46 +443,51 @@ pub fn online_verifier_root_report(
     })
 }
 
-pub fn online_verifier_content_counts(
-    store: &LocalObjectStore,
-    state: &FileSystemState,
-) -> Result<(u64, u64)> {
+fn online_verifier_pool_content_counts(pool: &Pool, state: &FileSystemState) -> Result<(u64, u64)> {
+    let authority = MountedContentReadAuthority::new(pool);
     let mut checked_content_objects = 0_u64;
     let mut checked_content_chunks = 0_u64;
     for inode in state.inodes.values() {
-        if inode.is_file_like() {
-            let content_key = content_object_key_for_version(inode.inode_id, inode.data_version);
-            if inode.size == 0 && !store.contains_key(content_key) {
-                continue;
-            }
-            let layout = read_content_layout_from_store(store, inode.inode_id, inode, false)?;
-            let _ = read_untrusted_raw_content_from_store_for_integrity(
-                store,
-                inode.inode_id,
-                inode,
-                false,
-            )?;
-            checked_content_objects = checked_content_objects.saturating_add(1);
-            if let ContentLayout::Chunked(manifest) = layout {
-                checked_content_chunks =
-                    checked_content_chunks.saturating_add(manifest.chunks.len() as u64);
-            }
+        if !inode.is_file_like() {
+            continue;
+        }
+
+        let content_key = content_object_key_for_version(inode.inode_id, inode.data_version);
+        if inode.size == 0 && !pool.raw_primary_store().contains_key(content_key) {
+            continue;
+        }
+        let layout = authority.read_layout(inode.inode_id, inode, false)?;
+        let _ = authority.read_all(inode.inode_id, inode, false)?;
+        checked_content_objects = checked_content_objects.saturating_add(1);
+        if let ContentLayout::Chunked(manifest) = layout {
+            checked_content_chunks =
+                checked_content_chunks.saturating_add(manifest.chunks.len() as u64);
         }
     }
     Ok((checked_content_objects, checked_content_chunks))
 }
 
-pub fn inspect_filesystem_content_objects_store(
-    store: &mut LocalObjectStore,
+pub(crate) fn inspect_filesystem_content_objects_pool(
+    pool: &mut Pool,
     root_authentication_key: RootAuthenticationKey,
-    pool: Option<&Pool>,
+) -> Result<FilesystemContentInspectionReport> {
+    let selected = {
+        let store = pool.raw_primary_store_mut();
+        load_newest_content_inspection_state(store, root_authentication_key)?
+    };
+    let Some((selected_root, state)) = selected else {
+        return Ok(FilesystemContentInspectionReport::empty());
+    };
+    inspect_filesystem_content_state(pool.raw_primary_store(), selected_root, &state, pool)
+}
+
+fn inspect_filesystem_content_state(
+    store: &LocalObjectStore,
+    selected_root: CommittedRootSummary,
+    state: &FileSystemState,
+    pool: &Pool,
 ) -> Result<FilesystemContentInspectionReport> {
     let mut report = FilesystemContentInspectionReport::empty();
-    let Some((selected_root, state)) =
-        load_newest_content_inspection_state(store, root_authentication_key)?
-    else {
-        return Ok(report);
-    };
     report.selected_root = Some(selected_root);
 
     for inode in state.inodes.values() {
@@ -430,7 +495,7 @@ pub fn inspect_filesystem_content_objects_store(
             continue;
         }
         report.file_like_inodes = report.file_like_inodes.saturating_add(1);
-        inspect_inode_content_objects(store, inode, &mut report, pool)?;
+        inspect_inode_content_objects(store, inode, &mut report, Some(pool))?;
     }
     Ok(report)
 }
@@ -490,6 +555,9 @@ fn inspect_inode_content_objects(
     report: &mut FilesystemContentInspectionReport,
     pool: Option<&Pool>,
 ) -> Result<()> {
+    if let Some(pool) = pool {
+        MountedContentReadAuthority::new(pool).read_all(inode.inode_id, inode, false)?;
+    }
     let content_key = content_object_key_for_version(inode.inode_id, inode.data_version);
     let content_bytes = store.get(content_key)?;
     let missing = content_bytes.is_none();
@@ -626,18 +694,18 @@ fn inspect_chunk_object(
         malformed_reason,
     });
 
-    // Validate stored receipt generation against pool when pool is available.
-    // Uses chunk_receipt_is_durable from allocation.rs for authoritative
-    // receipt-authority gating: hole chunks and zero-generation (pre-v6)
-    // chunks return durable-trivial, while non-zero chunks must match the
-    // pool's current durable receipt.
-    if let Some(pool) = pool {
-        if !crate::allocation::chunk_receipt_is_durable(pool, chunk_ref, key) {
-            if let Some(last) = report.referenced_objects.last_mut() {
-                if !last.receipt_mismatch {
-                    last.receipt_mismatch = true;
-                    report.receipt_mismatches = report.receipt_mismatches.saturating_add(1);
-                }
+    // A nonzero generation is verified only when Pool authority confirms it.
+    // Raw diagnostics without a Pool fail closed as a mismatch instead of
+    // letting a zero mismatch count imply verified placement.
+    if !chunk_ref.is_hole()
+        && chunk_ref.placement_receipt_generation != 0
+        && pool
+            .is_none_or(|pool| !crate::allocation::chunk_receipt_is_durable(pool, chunk_ref, key))
+    {
+        if let Some(last) = report.referenced_objects.last_mut() {
+            if !last.receipt_mismatch {
+                last.receipt_mismatch = true;
+                report.receipt_mismatches = report.receipt_mismatches.saturating_add(1);
             }
         }
     }
@@ -645,8 +713,8 @@ fn inspect_chunk_object(
     Ok(())
 }
 
-pub fn online_verifier_snapshot_roots(
-    store: &mut LocalObjectStore,
+fn online_verifier_pool_snapshot_roots(
+    pool: &mut Pool,
     current_root: &RootCommitRecord,
     state: &FileSystemState,
     root_authentication_key: RootAuthenticationKey,
@@ -658,9 +726,13 @@ pub fn online_verifier_snapshot_roots(
                 reason: "online verifier found a snapshot root at or after the current root",
             });
         }
-        let _locations = root_slot_locations_for_summary(store, &snapshot.root)?;
         let root = root_commit_from_summary(&snapshot.root);
-        let _state = load_state_from_transaction(store, &root, root_authentication_key)?;
+        let snapshot_state = {
+            let store = pool.raw_primary_store_mut();
+            let _locations = root_slot_locations_for_summary(store, &snapshot.root)?;
+            load_state_from_transaction(store, &root, root_authentication_key)?
+        };
+        let _ = online_verifier_pool_content_counts(pool, &snapshot_state)?;
         verified = verified.saturating_add(1);
     }
     Ok(verified)
@@ -1534,7 +1606,6 @@ fn load_state_from_superblock_with_content_validation(
         quota_table: QuotaTable::new(),
         space_accounting: SpaceAccounting::empty(),
         known_inode_ids,
-        corrupted_inodes: BTreeSet::new(),
         last_inode_write_tx: BTreeMap::new(),
         last_dir_write_tx: BTreeMap::new(),
         change_streams: BTreeMap::new(),
@@ -1729,7 +1800,6 @@ pub(crate) fn load_state_from_superblock_incremental(
         quota_table: QuotaTable::new(),
         space_accounting: SpaceAccounting::empty(),
         known_inode_ids,
-        corrupted_inodes: BTreeSet::new(),
         last_inode_write_tx: BTreeMap::new(),
         last_dir_write_tx: BTreeMap::new(),
         change_streams: BTreeMap::new(),
@@ -2424,7 +2494,7 @@ mod receipt_validation_tests {
     use crate::types::PosixTimeRecord;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
-    use tidefs_local_object_store::pool::Pool;
+    use tidefs_local_object_store::pool::{Pool, RepairSource};
     use tidefs_local_object_store::{
         DeviceBacking, DeviceClass, DeviceConfig, DeviceIoClass, DeviceKind, IntegrityDigest64,
         LocalObjectStore, PoolConfig, PoolProperties, StoreOptions,
@@ -2634,30 +2704,6 @@ mod receipt_validation_tests {
         cleanup(&pool_root);
     }
 
-    /// A chunk with no pool provided should never trigger receipt validation
-    /// and should therefore never set receipt_mismatch.
-    #[test]
-    fn chunk_without_pool_never_flags_mismatch() {
-        let root = temp_dir("no-pool-mismatch");
-        let mut store = make_store(&root);
-        let inode = make_file_inode(2, 1, 4096);
-        let chunk_ref = make_chunk_ref(0, 1, 4096, 5);
-        put_chunk_data(&mut store, &inode, &chunk_ref);
-        let mut report = FilesystemContentInspectionReport::empty();
-
-        inspect_chunk_object(&store, &inode, &chunk_ref, &mut report, None)
-            .expect("inspect_chunk_object success");
-
-        assert_eq!(report.referenced_objects.len(), 1);
-        let obj = &report.referenced_objects[0];
-        assert!(
-            !obj.receipt_mismatch,
-            "without pool no mismatch can be detected"
-        );
-        assert_eq!(report.receipt_mismatches, 0);
-        cleanup(&root);
-    }
-
     /// Receipt validation state accumulates across multiple chunk inspections
     /// with both matching and mismatching receipts.
     #[test]
@@ -2711,5 +2757,284 @@ mod receipt_validation_tests {
         assert_eq!(report.receipt_mismatches, 2);
         cleanup(&store_root);
         cleanup(&pool_root);
+    }
+
+    #[test]
+    fn receipt_operator_visible_inspection_fails_closed_on_raw_replacement() {
+        let root = temp_dir("operator-inspection-raw-replacement");
+        let mut fs = crate::LocalFileSystem::open_with_options(&root, StoreOptions::test_fast())
+            .expect("open filesystem");
+        fs.create_file("/inspected", DEFAULT_FILE_PERMISSIONS)
+            .expect("create file");
+        let payload = vec![0x69; FILESYSTEM_CONTENT_CHUNK_SIZE + 5];
+        fs.write_file("/inspected", 0, &payload)
+            .expect("write receipt-bound content");
+        fs.commit().expect("commit content");
+
+        let inode_id = fs.lookup("/inspected").expect("lookup file");
+        let record = fs.stat("/inspected").expect("stat file");
+        let layout = MountedContentReadAuthority::new(&fs.store)
+            .read_layout(inode_id, &record, false)
+            .expect("read committed layout");
+        let ContentLayout::Chunked(manifest) = layout else {
+            panic!("test payload must be chunked");
+        };
+        let chunk_ref = manifest
+            .chunks
+            .iter()
+            .find(|chunk| !chunk.is_hole())
+            .expect("non-hole chunk");
+        let chunk_key = content_chunk_object_key_for_version(
+            inode_id,
+            chunk_ref.data_version,
+            chunk_ref.chunk_index,
+        );
+        fs.store
+            .raw_primary_store_mut()
+            .put(chunk_key, b"raw replacement without receipt")
+            .expect("append raw replacement");
+        fs.store
+            .raw_primary_store_mut()
+            .sync_all()
+            .expect("sync raw replacement");
+        drop(fs);
+
+        crate::inspect_filesystem_content_objects_with_root_authentication_key(
+            &root,
+            StoreOptions::test_fast(),
+            RootAuthenticationKey::demo_key(),
+        )
+        .expect_err("operator inspection must reject receipt-unverified replacement bytes");
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn online_verifier_refuses_populated_raw_only_store() {
+        let root = temp_dir("online-verifier-raw-only");
+        let device_path = crate::LocalFileSystem::default_development_device_path(&root);
+        let mut store = LocalObjectStore::open_with_options(&root, StoreOptions::test_fast())
+            .expect("open raw-only store");
+        store
+            .put(
+                tidefs_local_object_store::ObjectKey::from_name(b"raw-only-verifier-object"),
+                b"raw-only bytes have no Pool placement authority",
+            )
+            .expect("populate raw-only store");
+        store.sync_all().expect("sync raw-only store");
+        drop(store);
+        assert!(!device_path.exists());
+
+        let error = crate::verify_online_with_root_authentication_key(
+            &root,
+            StoreOptions::test_fast(),
+            RootAuthenticationKey::demo_key(),
+        )
+        .expect_err("online verification must reject populated raw-only storage");
+        assert!(matches!(
+            error,
+            FileSystemError::CorruptState {
+                reason:
+                    "online verification requires Pool placement authority for a populated store",
+            }
+        ));
+        assert!(
+            !device_path.exists(),
+            "verification refusal must not create an unrelated development Pool"
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn replacement_receipt_survives_reopen_across_foreground_consumers() {
+        let root = temp_dir("replacement-reopen-consumers");
+        let payload = vec![0x62; FILESYSTEM_CONTENT_CHUNK_SIZE + 31];
+        let chunk_key = {
+            let mut fs =
+                crate::LocalFileSystem::open_with_options(&root, StoreOptions::test_fast())
+                    .expect("open filesystem");
+            fs.create_file("/repaired", DEFAULT_FILE_PERMISSIONS)
+                .expect("create file");
+            fs.write_file("/repaired", 0, &payload).expect("write file");
+            fs.commit().expect("commit file");
+
+            let inode_id = fs.lookup("/repaired").expect("lookup file");
+            let record = fs.stat("/repaired").expect("stat file");
+            let layout = MountedContentReadAuthority::new(&fs.store)
+                .read_layout(inode_id, &record, false)
+                .expect("read committed layout");
+            let ContentLayout::Chunked(manifest) = layout else {
+                panic!("test payload must be chunked");
+            };
+            let chunk_ref = manifest
+                .chunks
+                .into_iter()
+                .find(|chunk| !chunk.is_hole())
+                .expect("non-hole chunk");
+            let chunk_key = content_chunk_object_key_for_version(
+                inode_id,
+                chunk_ref.data_version,
+                chunk_ref.chunk_index,
+            );
+            let encoded = fs
+                .store
+                .get(DeviceIoClass::Data, chunk_key)
+                .expect("read current encoded chunk")
+                .expect("encoded chunk exists");
+            let (_, replacement) = fs
+                .store
+                .repair_with_receipt(
+                    DeviceIoClass::Data,
+                    chunk_key,
+                    &encoded,
+                    RepairSource::ExternalRecovery,
+                )
+                .expect("publish replacement receipt");
+            assert!(replacement.generation > chunk_ref.placement_receipt_generation);
+            fs.store
+                .raw_primary_store_mut()
+                .sync_all()
+                .expect("sync replacement receipt");
+            chunk_key
+        };
+
+        let mut reopened =
+            crate::LocalFileSystem::open_with_options(&root, StoreOptions::test_fast())
+                .expect("reopen filesystem");
+        assert_eq!(
+            reopened.read_file("/repaired").expect("mounted read"),
+            payload
+        );
+        let verifier = reopened
+            .online_verifier_report()
+            .expect("live verifier accepts replacement receipt after reopen");
+        assert_eq!(verifier.outcome, OnlineVerifierOutcome::Clean);
+        assert!(verifier.passed());
+        reopened
+            .write_file("/repaired", 1, b"x")
+            .expect("partial mutation reads through replacement receipt");
+        let mut expected = payload.clone();
+        expected[1] = b'x';
+        assert_eq!(
+            reopened.read_file("/repaired").expect("read mutation"),
+            expected
+        );
+
+        assert!(reopened
+            .store
+            .placement_receipt_for_key(DeviceIoClass::Data, chunk_key)
+            .expect("load replacement receipt")
+            .is_some());
+
+        reopened.commit().expect("commit partial mutation");
+        let inode_id = reopened.lookup("/repaired").expect("lookup mutated file");
+        let record = reopened.stat("/repaired").expect("stat mutated file");
+        let layout = MountedContentReadAuthority::new(&reopened.store)
+            .read_layout(inode_id, &record, false)
+            .expect("read mutated layout");
+        let ContentLayout::Chunked(manifest) = layout else {
+            panic!("mutated payload must remain chunked");
+        };
+        let current_chunk = manifest
+            .chunks
+            .iter()
+            .find(|chunk| !chunk.is_hole())
+            .expect("current non-hole chunk");
+        let current_chunk_key = content_chunk_object_key_for_version(
+            inode_id,
+            current_chunk.data_version,
+            current_chunk.chunk_index,
+        );
+        reopened
+            .store
+            .raw_primary_store_mut()
+            .put(current_chunk_key, b"corrupt current chunk")
+            .expect("append corruption after the valid historical chunk");
+        reopened
+            .store
+            .raw_primary_store_mut()
+            .sync_all()
+            .expect("sync corruption fixture");
+        drop(reopened);
+
+        let mut failed =
+            crate::LocalFileSystem::open_with_options(&root, StoreOptions::test_fast())
+                .expect("raw recovery may reopen using integrity-only historical bytes");
+        assert!(failed.read_file("/repaired").is_err());
+        failed
+            .write_file("/repaired", 1, b"y")
+            .expect("buffer partial mutation before authoritative read");
+        assert!(failed.commit().is_err());
+        match failed.online_verifier_report() {
+            Ok(verifier) => {
+                assert_eq!(verifier.outcome, OnlineVerifierOutcome::IssuesFound);
+                assert!(!verifier.passed());
+            }
+            Err(_) => {}
+        }
+        drop(failed);
+        cleanup(&root);
+    }
+
+    #[test]
+    fn online_verifier_checks_snapshot_content_authority() {
+        let root = temp_dir("online-verifier-snapshot-authority");
+        let mut fs = crate::LocalFileSystem::open_with_options(&root, StoreOptions::test_fast())
+            .expect("open filesystem");
+        fs.create_file("/snapshotted", DEFAULT_FILE_PERMISSIONS)
+            .expect("create file");
+        let old_payload = vec![0x73; FILESYSTEM_CONTENT_CHUNK_SIZE + 9];
+        fs.write_file("/snapshotted", 0, &old_payload)
+            .expect("write snapshot source");
+        fs.commit().expect("commit snapshot source");
+
+        let inode_id = fs.lookup("/snapshotted").expect("lookup file");
+        let old_record = fs.stat("/snapshotted").expect("stat file");
+        let old_layout = MountedContentReadAuthority::new(&fs.store)
+            .read_layout(inode_id, &old_record, false)
+            .expect("read old layout");
+        let ContentLayout::Chunked(old_manifest) = old_layout else {
+            panic!("test payload must be chunked");
+        };
+        let old_chunk = old_manifest
+            .chunks
+            .iter()
+            .find(|chunk| !chunk.is_hole())
+            .expect("old non-hole chunk");
+        let old_chunk_key = content_chunk_object_key_for_version(
+            inode_id,
+            old_chunk.data_version,
+            old_chunk.chunk_index,
+        );
+
+        fs.create_snapshot("before-overwrite")
+            .expect("create snapshot");
+        let new_payload = vec![0x74; old_payload.len()];
+        fs.write_file("/snapshotted", 0, &new_payload)
+            .expect("overwrite live file");
+        fs.commit().expect("commit live overwrite");
+        assert_eq!(
+            fs.read_file("/snapshotted").expect("read live file"),
+            new_payload
+        );
+
+        fs.store
+            .raw_primary_store_mut()
+            .put(old_chunk_key, b"corrupt snapshot chunk")
+            .expect("corrupt only the snapshot chunk target");
+        fs.store
+            .raw_primary_store_mut()
+            .sync_all()
+            .expect("sync corruption fixture");
+
+        let report = fs
+            .online_verifier_report()
+            .expect("verifier returns an issue report");
+        assert_eq!(report.outcome, OnlineVerifierOutcome::IssuesFound);
+        assert!(!report.issues.is_empty());
+
+        drop(fs);
+        cleanup(&root);
     }
 }

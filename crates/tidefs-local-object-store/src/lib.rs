@@ -184,15 +184,23 @@ impl ObjectKey {
 
 pub(crate) const POOL_PLACEMENT_RECEIPT_KEY_PREFIX: [u8; 8] = *b"TFSPRCPT";
 pub(crate) const POOL_PLACEMENT_SHARD_KEY_PREFIX: [u8; 8] = *b"TFSPSHRD";
+pub(crate) const POOL_PLACEMENT_MUTATION_INTENT_KEY_PREFIX: [u8; 8] = *b"TFSPMIK\0";
 
 pub(crate) fn is_pool_placement_receipt_key(key: ObjectKey) -> bool {
     let bytes = key.as_bytes();
     bytes[..8] == POOL_PLACEMENT_RECEIPT_KEY_PREFIX
 }
 
+pub(crate) fn is_pool_placement_mutation_intent_key(key: ObjectKey) -> bool {
+    let bytes = key.as_bytes();
+    bytes[..8] == POOL_PLACEMENT_MUTATION_INTENT_KEY_PREFIX
+}
+
 pub(crate) fn is_pool_placement_scan_internal_key(key: ObjectKey) -> bool {
     let bytes = key.as_bytes();
-    bytes[..8] == POOL_PLACEMENT_RECEIPT_KEY_PREFIX || bytes[..8] == POOL_PLACEMENT_SHARD_KEY_PREFIX
+    bytes[..8] == POOL_PLACEMENT_RECEIPT_KEY_PREFIX
+        || bytes[..8] == POOL_PLACEMENT_SHARD_KEY_PREFIX
+        || bytes[..8] == POOL_PLACEMENT_MUTATION_INTENT_KEY_PREFIX
 }
 
 impl fmt::Debug for ObjectKey {

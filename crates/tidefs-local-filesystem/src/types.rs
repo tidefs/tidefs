@@ -8,7 +8,6 @@ use std::fmt;
 use tidefs_local_object_store::{
     IntegrityDigest64, ObjectKey, ObjectLocation, StoreRetentionCompactionReport, StoreStats,
 };
-use tidefs_replication_model::PlacementReceiptRef;
 use tidefs_types_vfs_core::{
     Generation, InodeAttr, InodeFlags, InodeId, NodeFacets, NodeKind, PosixAttrs, S_IFBLK, S_IFCHR,
     S_IFIFO, S_IFLNK, S_IFMT, S_IFSOCK,
@@ -52,80 +51,6 @@ impl CrossPoolReceiveAuthorization {
             && self.sender_pool_epoch == sender.sender_pool_epoch
             && self.sender_membership_generation == sender.sender_membership_generation
     }
-}
-
-/// Identity of a content block being scrubbed.
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub struct ScrubBlockId {
-    pub inode_id: u64,
-    pub data_version: u64,
-    pub kind: ScrubBlockKind,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub enum ScrubBlockKind {
-    InlineContent,
-    ContentManifest,
-    ContentChunk { chunk_index: u64 },
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MountedContentChecksumLayer {
-    InlineContentBody,
-    EncodedContentChunk,
-    SparseHole,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MountedContentChecksumEvidence {
-    pub layer: MountedContentChecksumLayer,
-    pub expected: Option<IntegrityDigest64>,
-    pub actual: IntegrityDigest64,
-    pub encoded_len: u64,
-}
-
-impl MountedContentChecksumEvidence {
-    pub fn matches_expected(&self) -> bool {
-        self.expected
-            .map_or(true, |expected| expected == self.actual)
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum MountedContentPlacementEvidence {
-    SparseHole,
-    ReceiptVerified {
-        generation: u64,
-        placement_receipt_ref: PlacementReceiptRef,
-    },
-    ReceiptObservedButUnbound {
-        generation: u64,
-    },
-    ReceiptMissing {
-        expected_generation: Option<u64>,
-    },
-    ReceiptStale {
-        expected_generation: u64,
-        observed_generation: u64,
-    },
-    ReceiptUnavailable {
-        expected_generation: Option<u64>,
-    },
-}
-
-impl MountedContentPlacementEvidence {
-    pub fn allows_repair_dispatch(&self) -> bool {
-        matches!(self, Self::ReceiptVerified { .. })
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MountedContentScrubRead {
-    pub block_id: ScrubBlockId,
-    pub object_key: Option<ObjectKey>,
-    pub plaintext_bytes: Vec<u8>,
-    pub checksum_evidence: MountedContentChecksumEvidence,
-    pub placement_evidence: MountedContentPlacementEvidence,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

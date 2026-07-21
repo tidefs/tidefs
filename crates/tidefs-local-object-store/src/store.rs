@@ -633,6 +633,7 @@ fn is_stats_internal_key(key: ObjectKey) -> bool {
     key == committed_root_key()
         || is_persistent_reclaim_metadata_key(key)
         || crate::is_pool_placement_receipt_key(key)
+        || crate::is_pool_placement_mutation_intent_key(key)
         || is_compaction_target_key(key)
 }
 

@@ -22,8 +22,7 @@
 
 /// Stable scrub-subject identity for mounted content.
 ///
-/// Mirrors the `ScrubBlockId` concept from `tidefs_local_filesystem` while
-/// keeping `tidefs-scrub-core` self-contained for comparison purposes.
+/// Identifies the inode generation and byte range compared across replicas.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ScrubSubject {
     pub inode_id: u64,

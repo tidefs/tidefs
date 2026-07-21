@@ -14,8 +14,6 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use std::sync::Arc;
-use tidefs_cache_core::page_cache::PageCache;
 use tidefs_local_filesystem::{
     human::local_filesystem::StoreOptions, vfs_engine_impl::VfsLocalFileSystem, LocalFileSystem,
     RootAuthenticationKey,
@@ -54,7 +52,6 @@ struct MountedVfs {
     store: PathBuf,
     mount: PathBuf,
     session: Option<fuser::BackgroundSession>,
-    writeback_page_cache: Option<Arc<PageCache>>,
 }
 
 impl MountedVfs {
@@ -70,7 +67,6 @@ impl MountedVfs {
             store,
             mount,
             session: None,
-            writeback_page_cache: None,
         };
         mounted.seed_entries(filenames, dirnames);
         mounted.mount();
@@ -81,21 +77,9 @@ impl MountedVfs {
         self.mount.join(relative.trim_start_matches('/'))
     }
 
-    fn with_writeback_page_cache(mut self, cache: Arc<PageCache>) -> Self {
-        self.writeback_page_cache = Some(cache);
-        if self.session.is_some() {
-            self.unmount();
-            self.mount();
-        }
-        self
-    }
-
     fn mount(&mut self) {
         let engine = self.open_engine();
-        let mut adapter = FuseVfsAdapter::new(Box::new(engine)).expect("create FUSE VFS adapter");
-        if let Some(ref cache) = self.writeback_page_cache {
-            adapter = adapter.with_writeback_page_cache(Arc::clone(cache));
-        }
+        let adapter = FuseVfsAdapter::new(Box::new(engine)).expect("create FUSE VFS adapter");
         let session =
             fuser::spawn_mount2(adapter, &self.mount, &mount_options()).expect("mount FUSE");
         self.session = Some(session);
@@ -448,148 +432,16 @@ fn fsyncdir_regular_file_cannot_be_opened_as_directory() {
 }
 
 // ===========================================================================
-// PageCache writeback integration tests (issue #3538)
-// ===========================================================================
-
-/// Write data, fsync, and verify the writeback PageCache has no remaining
-/// dirty pages for the inode — all were flushed.
-#[test]
-fn fsync_pagecache_writeback_clears_dirty_pages() {
-    use std::sync::Arc;
-    use tidefs_cache_core::page_cache::PageCache;
-
-    let page_cache = Arc::new(PageCache::new(1024, 4096));
-    let mnt =
-        MountedVfs::new(&["fsync-pc.bin"], &[]).with_writeback_page_cache(Arc::clone(&page_cache));
-    let path = mnt.path("/fsync-pc.bin");
-    let payload = &[0xAB_u8; 8192]; // 2 pages
-
-    // Write 8 KiB of data through the FUSE mount.
-    {
-        let mut file = create_read_write(&path);
-        file.write_all(payload).expect("write payload");
-        // fsync triggers PageCache writeback.
-        file.sync_all().expect("fsync via FUSE mount");
-    }
-
-    // After fsync, the writeback PageCache should have no dirty pages
-    // for this inode (all were written back and cleared).
-    // We need the inode number.  Since the file was newly created as
-    // the first child of the root, it should be inode 2 or 3 depending
-    // on root-inode numbering.  We iterate the dirty_pages list to
-    // check virtually.
-    assert!(
-        page_cache.dirty_pages().is_empty(),
-        "all dirty pages must be cleared after fsync"
-    );
-
-    // Read back to confirm data integrity.
-    let readback = read_all(&path);
-    assert_eq!(readback, payload);
-}
-
-/// Write data, close (triggering flush), then reopen and verify data
-/// survives.  Also verify PageCache dirty pages are cleared by flush.
-#[test]
-fn flush_pagecache_writeback_clears_dirty_pages_on_close() {
-    let page_cache = Arc::new(PageCache::new(1024, 4096));
-    let mut mnt = MountedVfs::new(&[], &[]).with_writeback_page_cache(Arc::clone(&page_cache));
-    let path = mnt.path("/flush-pc.bin");
-    let payload = b"flush on close writes back dirty pages via PageCache";
-
-    // Write through FUSE, then close.  close() triggers FUSE flush.
-    {
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .expect("create mounted VFS file");
-        file.write_all(payload).expect("write payload");
-        // file drops here -> close() -> FUSE flush -> PageCache writeback
-    }
-
-    // After close+flush, PageCache should have no dirty pages.
-    assert!(
-        page_cache.dirty_pages().is_empty(),
-        "dirty pages must be cleared after flush (close)"
-    );
-
-    // Remount and verify data survived.
-    mnt.remount();
-    assert_eq!(read_all(&mnt.path("/flush-pc.bin")), payload);
-}
-
-/// Write data, fsync, then check that the writeback PageCache has
-/// evictable clean pages (not dirty, not pinned) for the written ranges.
-#[test]
-fn fsync_pagecache_pages_are_clean_not_pinned_after_writeback() {
-    let page_cache = Arc::new(PageCache::new(1024, 4096));
-    let mnt = MountedVfs::new(&["clean-pages.bin"], &[])
-        .with_writeback_page_cache(Arc::clone(&page_cache));
-    let path = mnt.path("/clean-pages.bin");
-
-    // Write 12 KiB (3 pages).
-    {
-        let mut file = create_read_write(&path);
-        file.write_all(&[0xCC_u8; 12288]).expect("write 3 pages");
-        file.sync_all().expect("fsync");
-    }
-
-    // All dirty pages must be clean now.
-    assert!(
-        page_cache.dirty_pages().is_empty(),
-        "all dirty pages must be cleared after fsync"
-    );
-
-    // The pages should still be resident (clean, evictable) in the cache
-    // since mark_dirty inserted them and complete_writeback made them clean.
-    // We can't directly count by inode without knowing the inode number,
-    // but we can verify the cache is non-empty.
-    assert!(
-        page_cache.len() >= 3,
-        "at least 3 pages should remain resident after fsync"
-    );
-
-    // Read back and verify data.
-    assert_eq!(read_all(&path), &[0xCC_u8; 12288]);
-}
-
-/// Write through FUSE, fsync, verify data persists across remount,
-/// and confirm the writeback PageCache dirty-set is empty after fsync.
-#[test]
-fn fsync_pagecache_writeback_remount_persistence() {
-    let page_cache = Arc::new(PageCache::new(1024, 4096));
-    let mut mnt = MountedVfs::new(&["persist-pc.bin"], &[])
-        .with_writeback_page_cache(Arc::clone(&page_cache));
-    let path = mnt.path("/persist-pc.bin");
-    let payload = b"fsync pagecache writeback survives remount cycle";
-
-    {
-        let mut file = create_read_write(&path);
-        file.write_all(payload).expect("write payload");
-        file.sync_all().expect("fsync");
-    }
-
-    assert!(page_cache.dirty_pages().is_empty());
-
-    mnt.remount();
-    assert_eq!(read_all(&mnt.path("/persist-pc.bin")), payload);
-}
-
-// ===========================================================================
 // Object-store persistence verification (issue #3732)
 // ===========================================================================
 
 /// Write through FUSE, fsync, unmount, then open the same LocalFileSystem
 /// store directly (bypassing FUSE) and verify the data is present in the
-/// backing object store.  This confirms that fsync flushes writeback
-/// through the LocalFileSystem into durable segment storage.
+/// backing object store. This confirms that fsync reaches durable segment
+/// storage through the LocalFileSystem.
 #[test]
-fn fsync_flushes_writeback_to_object_store_verified_direct() {
-    let page_cache = Arc::new(PageCache::new(1024, 4096));
-    let mut mnt = MountedVfs::new(&["store-verify.bin"], &[])
-        .with_writeback_page_cache(Arc::clone(&page_cache));
+fn fsync_persists_to_object_store_verified_direct() {
+    let mut mnt = MountedVfs::new(&["store-verify.bin"], &[]);
     let path = mnt.path("/store-verify.bin");
     let payload: Vec<u8> = (0..2048u16).map(|i| (i % 251) as u8).collect();
 
@@ -600,13 +452,7 @@ fn fsync_flushes_writeback_to_object_store_verified_direct() {
         file.sync_all().expect("fsync via FUSE");
     }
 
-    // PageCache dirty set must be empty after fsync.
-    assert!(
-        page_cache.dirty_pages().is_empty(),
-        "no dirty pages should remain after fsync"
-    );
-
-    // Unmount to flush all adapter state.
+    // Unmount before opening the backing store directly.
     mnt.unmount();
 
     // Open the store directly via LocalFileSystem (bypass FUSE entirely).
@@ -645,10 +491,8 @@ fn fsync_flushes_writeback_to_object_store_verified_direct() {
 /// directly and verify data is present.  Same pattern as the fsync
 /// variant but uses fdatasync (sync_data) instead of sync_all.
 #[test]
-fn fdatasync_flushes_writeback_to_object_store_verified_direct() {
-    let page_cache = Arc::new(PageCache::new(1024, 4096));
-    let mut mnt = MountedVfs::new(&["fdatasync-store.bin"], &[])
-        .with_writeback_page_cache(Arc::clone(&page_cache));
+fn fdatasync_persists_to_object_store_verified_direct() {
+    let mut mnt = MountedVfs::new(&["fdatasync-store.bin"], &[]);
     let path = mnt.path("/fdatasync-store.bin");
     let payload: Vec<u8> = (0..4096u16)
         .map(|i| (i.wrapping_mul(17) % 251) as u8)
@@ -661,13 +505,7 @@ fn fdatasync_flushes_writeback_to_object_store_verified_direct() {
         file.sync_data().expect("fdatasync via FUSE");
     }
 
-    // PageCache dirty set must be empty after fdatasync.
-    assert!(
-        page_cache.dirty_pages().is_empty(),
-        "no dirty pages should remain after fdatasync"
-    );
-
-    // Unmount to flush all adapter state.
+    // Unmount before opening the backing store directly.
     mnt.unmount();
 
     // Open the store directly via LocalFileSystem (bypass FUSE entirely).

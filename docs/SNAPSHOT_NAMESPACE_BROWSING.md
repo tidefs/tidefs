@@ -75,12 +75,12 @@ design is resolved:
 - `generic/006` (permname namespace stress) — preserved through child work
 - `generic/007` and `generic/011` (namespace stress) — proven by PR #384
 
-The remaining `generic/013` fsstress CPU exhaustion is tracked by child #929,
-split into PR #1132 (localfs sparse overlay chunk scans) and #1175 (adapter
-writeback-cache clean write-through invalidation hang). These are write-path
-performance/correctness issues that do not change the FUSE namespace semantics
+The remaining `generic/013` fsstress CPU exhaustion is tracked by child #929
+and PR #1132 (localfs sparse overlay chunk scans). It is a write-path
+performance/correctness issue that does not change the FUSE namespace semantics
 (lookup, readdir, synthetic entry handling, read-only enforcement) that inform
-the Alternative B design.
+the Alternative B design. Kernel writeback-cache mode is unavailable in the
+current adapter and is not a live snapshot-browsing dependency.
 
 **ACL infrastructure.** Issue #442 and PR #682 (POSIX ACL inheritance
 boundaries) are closed/merged. The `tidefs-permission` and `tidefs-posix-acl`
@@ -164,11 +164,10 @@ The three blockers from the original #699 evaluation are now resolved:
    InodeIds" question that blocked the original evaluation.
 
 2. *FUSE namespace stress.* The resolved stress rows (generic/001, 006, 007,
-   011) prove that the FUSE adapter's lookup, readdir, getattr, and forget
-   paths are stable under namespace churn. The remaining #1175 writeback-cache
-   issue is a write-path concern that does not affect the read-only `.snapshot`
-   browsing path or the synthetic-entry mechanisms already exercised by `.`
-   and `..` entries.
+   011) exercise the FUSE adapter's lookup, readdir, getattr, and forget paths
+   under namespace churn. Kernel writeback cache is refused by the current
+   direct-I/O carrier and therefore supplies no evidence or dependency for the
+   read-only `.snapshot` browsing design.
 
 3. *ACL infrastructure.* The `tidefs-permission` and `tidefs-posix-acl` crates
    provide the evaluation engine. Snapshot entries carry frozen ACL xattrs from
@@ -333,15 +332,6 @@ temporary reference on the lifecycle pin; the pin is released on forget.
 
 **Residual risks.**
 
-- **#1175 writeback-cache hang.** The adapter writeback-cache clean-write
-  invalidation hang is a write-path issue under extreme fsstress. It is not
-  expected to affect read-only `.snapshot` browsing, but if writeback-cache
-  dirty pages block read operations on the same inode that is being browsed
-  through a snapshot, there may be an unexpected interaction. Recorded as an
-  implementation-phase risk; the `.snapshot` implementation should include a
-  focused test that browses a file through `.snapshot` while the live file is
-  under writeback pressure.
-
 - **Inode slot reuse between snapshot and live.** If a file is unlinked and its
   inode slot is reused between snapshot time and live time, a snapshot handle
   carries the old generation and correctly fails `validate_generation`. This
@@ -423,7 +413,7 @@ satisfied.
 | (E) snapshot-dotdir-readdir | Emit synthetic `.snapshot` entry in `iter_dir_entries` at reserved cookie 3, with the snapshot-root sentinel InodeId and catalog generation. | `apps/tidefs-posix-filesystem-adapter-daemon/src/readdir_dispatch.rs`, `crates/tidefs-types-vfs-core/src/lib.rs` (sentinel constant) | Requires this decision documented. |
 | (F) snapshot-dotdir-lookup | Route lookup on the snapshot-root sentinel InodeId to snapshot-catalog enumeration. Each catalog entry maps to a synthetic InodeId. | `apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_vfs_adapter.rs` (lookup dispatch), `crates/tidefs-local-filesystem/src/snapshot.rs` (catalog enumeration adapter) | Gates on (E) for sentinel InodeId. |
 | (G) snapshot-tree-traversal | Lookup inside a snapshot-named directory loads the snapshot's committed root and projects its root InodeId. Subsequent lookups traverse the snapshot tree through the same engine lookup path with snapshot generation. | `apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_vfs_adapter.rs` (lookup dispatch, file-handle tracking), `crates/tidefs-local-filesystem/src/export.rs` (committed-root loading reuse) | Gates on (F) for catalog-entry to snapshot mapping. |
-| (H) snapshot-readonly-enforce | Add snapshot-subtree flag to file-handle table. Check flag in `dispatch_create`, `dispatch_mkdir`, `dispatch_unlink`, `dispatch_rmdir`, `dispatch_rename`, `dispatch_setattr`, `dispatch_write`, `dispatch_truncate`. | `apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_vfs_adapter.rs` (mutation dispatch), `apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_write.rs` | Gates on (G) for file-handle creation through snapshot path. |
+| (H) snapshot-readonly-enforce | Add snapshot-subtree flag to file-handle table. Check flag in `dispatch_create`, `dispatch_mkdir`, `dispatch_unlink`, `dispatch_rmdir`, `dispatch_rename`, `dispatch_setattr`, `dispatch_write`, `dispatch_truncate`. | `apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_vfs_adapter.rs` (mutation dispatch) | Gates on (G) for file-handle creation through snapshot path. |
 | (I) snapshot-acl-evaluation | Integrate frozen ACL xattr retrieval from snapshot inodes with `tidefs_permission::check_access`. Test mask-narrowing and default-ACL suppression. Test legacy-format fallback. | `apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_vfs_adapter.rs` (getattr/lookup with ACL), `apps/tidefs-posix-filesystem-adapter-daemon/tests/` (ACL-on-snapshot tests) | Gates on (G) for snapshot inode attribute retrieval. |
 | (J) snapshot-deletion-race | Wire lifecycle pin acquire/release on snapshot-tree handle open/forget. Validate generation on each operation through the snapshot handle. | `apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_lookup_forget.rs` (forget with pin release), `crates/tidefs-local-filesystem/src/snapshot.rs` (pin API exposure) | Gates on (G) for handle tracking through snapshot tree. |
 | (K) snapshot-browse-validation | Focused FUSE validation: readdir with `.snapshot`, lookup into snapshot tree, read a known file, verify EROFS on mutation, verify ESTALE after snapshot deletion, verify ACL enforcement on snapshot entries. | `apps/tidefs-posix-filesystem-adapter-daemon/tests/` (new integration test file) | Gates on (E)-(J) complete. |
@@ -468,8 +458,6 @@ Follow-up implementation issues (E)-(J) require:
 
 - The follow-up implementation issues (E)-(K) remain open. The design
   decision enables them; it does not implement them.
-- The #1175 writeback-cache hang is an implementation-phase risk for `.snapshot`
-  browsing under concurrent writeback pressure. It is not a design gate.
 - Snapshot quota policy is not addressed here.
 - Distributed snapshot replication and incremental receive resume are separate
   work.

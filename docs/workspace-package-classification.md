@@ -1,6 +1,6 @@
 # Workspace Package Classification
 
-Updated from current Cargo metadata, on-disk manifest discovery, and harness-consumer audit for issue #1974 on 2026-07-12.
+Updated from current Cargo metadata, on-disk manifest discovery, and consumer audit for issue #2360 on 2026-07-21.
 This document is the package-role authority for TideFS workspace selection and TFR-002/TFR-019 reduction.
 It is enforced by `cargo run -p tidefs-xtask -- check-workspace-policy`.
 
@@ -10,10 +10,10 @@ This is not a production-readiness claim. TideFS remains a pre-alpha filesystem/
 
 | Counted set | Value |
 | --- | ---: |
-| Workspace packages | 166 |
+| Workspace packages | 164 |
 | Explicitly excluded package roots | 4 |
-| Discovered package manifests | 170 |
-| Classified package roots | 170 |
+| Discovered package manifests | 168 |
+| Classified package roots | 168 |
 
 ## TFR-002 Category Mapping
 
@@ -25,8 +25,8 @@ root.
 
 | TFR-002 category | Current roles | Count | Boundary |
 | --- | --- | ---: | --- |
-| `product` | `product-code`, `adapter-operator` | 144 | Shipped or planned-to-ship libraries, binaries, adapters, kernel surfaces, and operator entrypoints. |
-| `harness` | `policy-tooling`, `proof-harness`, `standalone-fuzz` | 24 | Repo policy tooling, CI/developer support, demos, validation harnesses, model/oracle crates, and excluded fuzz harnesses. |
+| `product` | `product-code`, `adapter-operator` | 145 | Shipped or planned-to-ship libraries, binaries, adapters, kernel surfaces, and operator entrypoints. |
+| `harness` | `policy-tooling`, `proof-harness`, `standalone-fuzz` | 22 | Repo policy tooling, CI/developer support, demos, validation harnesses, model/oracle crates, and excluded fuzz harnesses. |
 | `third-party` | `vendored-third-party` | 1 | Vendored or forked upstream code carried with separate provenance. |
 | `delete` | `scaffold-transitional`, `archive-delete-candidate` | 0 | No current package root is classified for deletion. Both roles are retired and rejected by `check-workspace-policy`; any future dead-scaffolding candidate must reference TFR-002/TFR-013 evidence and an issue-backed delete/archive plan. |
 
@@ -52,10 +52,10 @@ holding area.
 
 | Role | Count |
 | --- | ---: |
-| `product-code` | 129 |
+| `product-code` | 131 |
 | `adapter-operator` | 14 |
 | `policy-tooling` | 8 |
-| `proof-harness` | 12 |
+| `proof-harness` | 10 |
 | `vendored-third-party` | 1 |
 | `standalone-fuzz` | 4 |
 | `scaffold-transitional` | 0 |
@@ -117,7 +117,6 @@ one-line justification. The table keeps the five machine-checked columns so
 | `crates/tidefs-dir-index` | `tidefs-dir-index` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-durability-layout` | `tidefs-durability-layout` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-encryption` | `tidefs-encryption` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
-| `crates/tidefs-env-fuse-model` | `tidefs-env-fuse-model` | `workspace-member` | `proof-harness` | standalone-checkable current proof harness for bounded FUSE adapter lifecycle translation; source-model evidence is recorded at `validation/artifacts/fuse/adapter-lifecycle-model.json` with v2 manifest `validation/artifacts/fuse/adapter-lifecycle-model.manifest.json`, while mounted FUSE runtime claims remain separate. |
 | `crates/tidefs-env-ublk-model` | `tidefs-env-ublk-model` | `workspace-member` | `proof-harness` | standalone-checkable current proof harness for bounded uBLK qid/tag lifecycle translation; source-model evidence is recorded at `validation/artifacts/ublk/qid-tag-state-model.json` with v2 manifest `validation/artifacts/ublk/qid-tag-state-model.manifest.json`, while live daemon, fio, mkfs, mount, and block-volume runtime claims remain separate. |
 | `crates/tidefs-erasure-coded-store` | `tidefs-erasure-coded-store` | `workspace-member` | `product-code` | standalone-checkable current product component for local EC encode/decode/read/repair with placement-backed shard routing and shard-digest validation; pool receipt, recovery-loop, and release claims remain limited by the review register and EC authority follow-ups. |
 | `crates/tidefs-erasure-coding` | `tidefs-erasure-coding` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
@@ -146,7 +145,7 @@ one-line justification. The table keeps the five machine-checked columns so
 | `crates/tidefs-membership-epoch` | `tidefs-membership-epoch` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-membership-live` | `tidefs-membership-live` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-membership-types` | `tidefs-membership-types` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
-| `crates/tidefs-model-core` | `tidefs-model-core` | `workspace-member` | `proof-harness` | current proof harness for pure deterministic VFS model; 8 unit tests cover all 10 canonical VFS operations through ModelRequest and contract-envelope APIs with full invariant checking; 8 integration tests validate ModelRunReceipt serialization and field-level rejection; used by tidefs-crash-oracle, tidefs-env-fuse-model, and tidefs-trace-oracle; runtime claims remain separately gated. |
+| `crates/tidefs-model-core` | `tidefs-model-core` | `workspace-member` | `proof-harness` | current proof harness for pure deterministic VFS model; 8 unit tests cover all 10 canonical VFS operations through ModelRequest and contract-envelope APIs with full invariant checking; 8 integration tests validate ModelRunReceipt serialization and field-level rejection; used by tidefs-crash-oracle and tidefs-trace-oracle; runtime claims remain separately gated. |
 | `crates/tidefs-namespace` | `tidefs-namespace` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-node-drain` | `tidefs-node-drain` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-node-join` | `tidefs-node-join` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
@@ -235,7 +234,6 @@ one-line justification. The table keeps the five machine-checked columns so
 | `crates/tidefs-vfs-engine` | `tidefs-vfs-engine` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-vfs-rpc` | `tidefs-vfs-rpc` | `workspace-member` | `product-code` | planned authority surface for VFS_RPC wire protocol; 14 unit tests cover all 36 method definitions, request/response encode/decode roundtrips, per-peer dedup window, flagged bypass paths, handle encoding, and client-side multiplexing; forbid(unsafe_code); zero reverse dependencies reflect service-surface boundaries, not placeholder status; #1518 selects the first live control/inline forwarding boundary while #1521-#1524 gate live transport, VFS Engine bridge, BULK/RDMA handoff, and validation claims. |
 | `crates/tidefs-witness-set` | `tidefs-witness-set` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
-| `crates/tidefs-workload` | `tidefs-workload` | `workspace-member` | `proof-harness` | current workload-signal harness consumed by the POSIX adapter workload observer; classification tests cover OLTP/OLAP/backup/VM signatures, and adaptive-runtime claims remain separately gated. |
 | `crates/tidefs-xattr-storage` | `tidefs-xattr-storage` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `fuzz` | `tidefs-fuzz` | `workspace-excluded` | `standalone-fuzz` | standalone-checkable fuzz package; keep mirrored in workspace.exclude until restored or made an issue-backed archive/delete candidate. |
 | `kmod` | `tidefs-kmod-bridge` | `workspace-member` | `adapter-operator` | current adapter/operator surface; capability claims remain behind focused validation. |
@@ -258,13 +256,12 @@ Zero reverse dependencies do not imply deletion. They mean the package is an ent
 | `crates/tidefs-crash-oracle` | `tidefs-crash-oracle` | `proof-harness` | current proof-harness surface for model crash matrices, runtime injection definitions, and runtime-report coverage validation; `validation/claims.toml` bounds runtime crash claims. |
 | `crates/tidefs-data-cleaner` | `tidefs-data-cleaner` | `product-code` | live entrypoint for refcount-delta draining into liveness/deadlist handoff evidence; PR #1009/#804 records focused validation, and #889 owns any future mounted runtime scheduler wiring. |
 | `crates/tidefs-distributed-model-check` | `tidefs-distributed-model-check` | `proof-harness` | live entrypoint for bounded deterministic distributed safety source-model proof harness; `DistributedSafetyReceipt` and manifest evidence record model coverage for `distributed.combined_safety.model.v1` while runtime distributed correctness remains separately claim-gated. |
-| `crates/tidefs-env-fuse-model` | `tidefs-env-fuse-model` | `proof-harness` | standalone-checkable current proof harness for bounded FUSE adapter lifecycle translation; source-model evidence is recorded at `validation/artifacts/fuse/adapter-lifecycle-model.json` with v2 manifest `validation/artifacts/fuse/adapter-lifecycle-model.manifest.json`, while mounted FUSE runtime claims remain separate. |
 | `crates/tidefs-env-ublk-model` | `tidefs-env-ublk-model` | `proof-harness` | standalone-checkable current proof harness for bounded uBLK qid/tag lifecycle translation; source-model evidence is recorded at `validation/artifacts/ublk/qid-tag-state-model.json` with v2 manifest `validation/artifacts/ublk/qid-tag-state-model.manifest.json`, while live daemon, fio, mkfs, mount, and block-volume runtime claims remain separate. |
 | `crates/tidefs-erasure-coded-store` | `tidefs-erasure-coded-store` | `product-code` | live local EC object-store authority; zero reverse dependencies reflect pool-integration boundaries, not placeholder status; issue #823 records placement-backed runtime validation while pool receipt and recovery follow-ups remain separate. |
 | `crates/tidefs-geometry-convert` | `tidefs-geometry-convert` | `product-code` | current geometry-conversion job component with harness-backed pool/locator/EC runtime wiring; zero reverse dependencies reflect scheduler/mounted integration boundaries, not placeholder status; issue #824 records focused cursor/failure validation while issue #1181 records the pool-backed runtime authority slice. |
 | `crates/tidefs-kernel-cutover-runtime` | `tidefs-kernel-cutover-runtime` | `product-code` | current source/model authority for kernel cutover sequencing, dry-run gate admission, fence management, rollback receipts, deterministic validation digests, and the source/model teardown proof review receipt; closed #1186 / merged PR #1463 provide bounded T5 mounted-kernel cutover/teardown lineage only, while T6 full-kernel/no-daemon evidence and kernel-mode release claims remain blocked by the claim registry. |
 | `crates/tidefs-kmod-posix-vfs` | `tidefs-kmod-posix-vfs` | `adapter-operator` | current adapter-operator operator entrypoint for kernel VFS dispatch authority; all implemented file_operations, inode_operations, and super_operations delegate through kmod-bridge to VfsEngine; xfstests coverage recorded in TFR-018 while mounted-kernel validation for mount lifecycle, readdir, flock, and invalidate_folio remain separately gated. |
-| `crates/tidefs-model-core` | `tidefs-model-core` | `proof-harness` | current proof harness for pure deterministic VFS model; 16 tests cover all canonical VFS operations, receipt validation, path parsing, fingerprinting, and invariant checking; used by tidefs-crash-oracle, tidefs-env-fuse-model, and tidefs-trace-oracle; runtime claims remain separately gated. |
+| `crates/tidefs-model-core` | `tidefs-model-core` | `proof-harness` | current proof harness for pure deterministic VFS model; 16 tests cover all canonical VFS operations, receipt validation, path parsing, fingerprinting, and invariant checking; used by tidefs-crash-oracle and tidefs-trace-oracle; runtime claims remain separately gated. |
 | `crates/tidefs-offload-core` | `tidefs-offload-core` | `product-code` | current standalone-checkable product-code authority for non-authoritative offload descriptors, completions, leases, and CPU reference kernels; 16 unit tests validate all descriptor/completion/lease ABI and three CPU reference kernels; offload remains non-authoritative for storage semantics and no GPU/FPGA production acceleration is claimed.
 | `crates/tidefs-online-defrag` | `tidefs-online-defrag` | `product-code` | current product-code authority for online extent-map defragmentation and physical object relocation as IncrementalJob (JobKind::Defrag) implementations; 51 unit tests validate OnlineDefragService (extent-map defragmentation, fragmentation scoring, cursor resumption, budget-aware walk) and ObjectRelocator (physical fragmentation detection, relocation correctness, budget exhaustion/resumption); zero reverse dependencies reflect service-boundary wiring, not placeholder status; mounted filesystem integration and live runtime scheduling remain separately gated. |
 | `crates/tidefs-performance-contract` | `tidefs-performance-contract` | `product-code` | current product-code authority for typed performance-correctness contracts: admission permit tokens, dirty-byte/operation accounting, budgeted queues with service curves, and deterministic scheduling-oracle signal; 20 unit tests validate all public enums, admission-state lifecycle, permit-gated queue operations, metadata-only admission, BudgetedQueue accounting, and foreground-read protection through service-curve scheduling; the crate is no_std with forbid(unsafe_code); runtime throughput and mounted performance claims remain separately gated. |

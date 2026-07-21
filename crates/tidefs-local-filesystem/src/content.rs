@@ -14,13 +14,12 @@ use tidefs_local_object_store::{
 };
 use tidefs_types_vfs_core::InodeId;
 
-use crate::checksum::{BlockChecksum, FastBlockChecksum};
 use crate::constants::*;
 use crate::dedup::DedupIndex;
 use crate::encoding::{
     decode_content, decode_content_chunk, decode_content_manifest, decode_dedup_redirect,
     encode_content, encode_content_chunk, encode_content_manifest, encode_content_manifest_sparse,
-    is_dedup_redirect, split_inline_checksum,
+    is_dedup_redirect,
 };
 use crate::error::FileSystemError;
 use crate::object_keys::{
@@ -52,6 +51,13 @@ pub(crate) trait ContentWriteStore {
         })
     }
 
+    /// Read a dedup canonical object through this store's authority. A Pool
+    /// implementation must distinguish a truly absent canonical object from
+    /// raw bytes that exist without a current receipt.
+    fn read_dedup_canonical_bytes(&self, key: ObjectKey) -> Result<Option<Vec<u8>>> {
+        self.get(key)
+    }
+
     /// Whether a failed current chunk may be recovered from raw historical
     /// versions. Pool-backed receipt authority overrides this for nonzero
     /// recorded generations.
@@ -73,7 +79,12 @@ pub(crate) trait ContentWriteStore {
 
 impl<'a> ContentWriteStore for PoolStoreMut<'a> {
     fn get(&self, key: ObjectKey) -> Result<Option<Vec<u8>>> {
-        Ok(PoolStoreMut::get(self, key)?)
+        read_optional_current_receipt_object(
+            PoolStoreMut::current_placement_receipt_read(self, key),
+            || PoolStoreMut::get(self, key),
+            key,
+        )
+        .map(|read| read.map(|read| read.bytes))
     }
 
     fn read_existing_chunk_bytes(
@@ -83,8 +94,9 @@ impl<'a> ContentWriteStore for PoolStoreMut<'a> {
     ) -> Result<Vec<u8>> {
         let recorded_generation = chunk_ref.placement_receipt_generation;
         if recorded_generation == 0 {
-            return self.get(key)?.ok_or(FileSystemError::CorruptState {
-                reason: "content manifest references a missing chunk object",
+            return Err(FileSystemError::ReceiptAuthoritySynthetic {
+                object_key: key,
+                expected_generation: 0,
             });
         }
         read_chunk_bytes_from_current_receipt(
@@ -94,8 +106,17 @@ impl<'a> ContentWriteStore for PoolStoreMut<'a> {
         )
     }
 
-    fn allows_untrusted_historical_chunk_fallback(&self, chunk_ref: &ContentChunkRef) -> bool {
-        chunk_ref.placement_receipt_generation == 0
+    fn read_dedup_canonical_bytes(&self, key: ObjectKey) -> Result<Option<Vec<u8>>> {
+        read_optional_current_receipt_object(
+            PoolStoreMut::current_placement_receipt_read(self, key),
+            || PoolStoreMut::get(self, key),
+            key,
+        )
+        .map(|read| read.map(|read| read.bytes))
+    }
+
+    fn allows_untrusted_historical_chunk_fallback(&self, _chunk_ref: &ContentChunkRef) -> bool {
+        false
     }
 
     fn put_with_receipt(
@@ -232,260 +253,6 @@ pub(crate) struct PunchHoleContent<'a, S: ContentWriteStore> {
     pub compression_policy: &'a ContentCompressionPolicy,
 }
 
-#[allow(dead_code)] // INTENT: issue #650 API consumed by later scrub routing.
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum MountedContentScrubReadTarget<'a> {
-    Inline,
-    ContentChunk(&'a ContentChunkRef),
-}
-
-#[allow(dead_code)] // INTENT: issue #650 API consumed by later scrub routing.
-pub(crate) fn read_mounted_content_scrub_block(
-    store: &LocalObjectStore,
-    inode_id: InodeId,
-    record: &InodeRecord,
-    target: MountedContentScrubReadTarget<'_>,
-    pool: Option<&Pool>,
-) -> Result<MountedContentScrubRead> {
-    if record.inode_id != inode_id {
-        return Err(FileSystemError::CorruptState {
-            reason: "mounted content scrub authority inode record mismatch",
-        });
-    }
-
-    match target {
-        MountedContentScrubReadTarget::Inline => {
-            read_mounted_inline_content_scrub_block(store, inode_id, record, pool)
-        }
-        MountedContentScrubReadTarget::ContentChunk(chunk_ref) => {
-            if chunk_ref.data_version != record.data_version {
-                return Err(FileSystemError::CorruptState {
-                    reason: "mounted content scrub authority stale chunk data version",
-                });
-            }
-            read_mounted_chunk_content_scrub_block(store, inode_id, chunk_ref, pool)
-        }
-    }
-}
-
-fn read_mounted_inline_content_scrub_block(
-    store: &LocalObjectStore,
-    inode_id: InodeId,
-    record: &InodeRecord,
-    pool: Option<&Pool>,
-) -> Result<MountedContentScrubRead> {
-    let key = content_object_key_for_version(inode_id, record.data_version);
-    let encoded = read_mounted_scrub_object_bytes(
-        store,
-        pool,
-        key,
-        "mounted content scrub authority missing inline content object",
-    )?;
-    let (checksum_body, expected) = split_inline_checksum(&encoded)?;
-    let checksum_evidence = MountedContentChecksumEvidence {
-        layer: MountedContentChecksumLayer::InlineContentBody,
-        expected,
-        actual: FastBlockChecksum::compute(checksum_body),
-        encoded_len: checksum_body.len() as u64,
-    };
-    if !checksum_evidence.matches_expected() {
-        return Err(FileSystemError::CorruptState {
-            reason: "mounted content scrub authority inline checksum mismatch",
-        });
-    }
-
-    let content = decode_content(&encoded)?;
-    if content.inode_id != inode_id {
-        return Err(FileSystemError::CorruptState {
-            reason: "mounted content scrub authority inline inode mismatch",
-        });
-    }
-    if content.data_version != record.data_version {
-        return Err(FileSystemError::CorruptState {
-            reason: "mounted content scrub authority inline data version mismatch",
-        });
-    }
-    if u64::try_from(content.bytes.len()).unwrap_or(u64::MAX) != record.size {
-        return Err(FileSystemError::CorruptState {
-            reason: "mounted content scrub authority inline size mismatch",
-        });
-    }
-
-    Ok(MountedContentScrubRead {
-        block_id: ScrubBlockId {
-            inode_id: inode_id.get(),
-            data_version: record.data_version,
-            kind: ScrubBlockKind::InlineContent,
-        },
-        object_key: Some(key),
-        plaintext_bytes: content.bytes,
-        checksum_evidence,
-        placement_evidence: placement_evidence_for_content_key(pool, key, inode_id.get(), None),
-    })
-}
-
-fn read_mounted_chunk_content_scrub_block(
-    store: &LocalObjectStore,
-    inode_id: InodeId,
-    chunk_ref: &ContentChunkRef,
-    pool: Option<&Pool>,
-) -> Result<MountedContentScrubRead> {
-    if chunk_ref.is_hole() {
-        return Ok(MountedContentScrubRead {
-            block_id: ScrubBlockId {
-                inode_id: inode_id.get(),
-                data_version: chunk_ref.data_version,
-                kind: ScrubBlockKind::ContentChunk {
-                    chunk_index: chunk_ref.chunk_index,
-                },
-            },
-            object_key: None,
-            plaintext_bytes: vec![0_u8; chunk_ref.len as usize],
-            checksum_evidence: MountedContentChecksumEvidence {
-                layer: MountedContentChecksumLayer::SparseHole,
-                expected: Some(IntegrityDigest64(0)),
-                actual: IntegrityDigest64(0),
-                encoded_len: 0,
-            },
-            placement_evidence: MountedContentPlacementEvidence::SparseHole,
-        });
-    }
-
-    let key = content_chunk_object_key_for_version(
-        inode_id,
-        chunk_ref.data_version,
-        chunk_ref.chunk_index,
-    );
-    let encoded = read_mounted_scrub_object_bytes(
-        store,
-        pool,
-        key,
-        "mounted content scrub authority missing content chunk object",
-    )?;
-    let checksum_evidence = MountedContentChecksumEvidence {
-        layer: MountedContentChecksumLayer::EncodedContentChunk,
-        expected: Some(chunk_ref.checksum),
-        actual: FastBlockChecksum::compute(&encoded),
-        encoded_len: encoded.len() as u64,
-    };
-    if !checksum_evidence.matches_expected() {
-        return Err(FileSystemError::CorruptState {
-            reason: "mounted content scrub authority chunk checksum mismatch",
-        });
-    }
-
-    let (chunk, resolved_via_dedup) = try_validate_chunk_bytes(
-        store, pool, inode_id, chunk_ref, &encoded,
-    )?
-    .ok_or(FileSystemError::CorruptState {
-        reason: "mounted content scrub authority chunk decode mismatch",
-    })?;
-    if !resolved_via_dedup
-        && (chunk.inode_id != inode_id
-            || chunk.data_version != chunk_ref.data_version
-            || chunk.chunk_index != chunk_ref.chunk_index)
-    {
-        return Err(FileSystemError::CorruptState {
-            reason: "mounted content scrub authority chunk identity mismatch",
-        });
-    }
-
-    Ok(MountedContentScrubRead {
-        block_id: ScrubBlockId {
-            inode_id: inode_id.get(),
-            data_version: chunk_ref.data_version,
-            kind: ScrubBlockKind::ContentChunk {
-                chunk_index: chunk_ref.chunk_index,
-            },
-        },
-        object_key: Some(key),
-        plaintext_bytes: chunk.bytes,
-        checksum_evidence,
-        placement_evidence: placement_evidence_for_content_key(
-            pool,
-            key,
-            inode_id.get(),
-            nonzero_receipt_generation(chunk_ref.placement_receipt_generation),
-        ),
-    })
-}
-
-fn read_mounted_scrub_object_bytes(
-    store: &LocalObjectStore,
-    pool: Option<&Pool>,
-    key: ObjectKey,
-    missing_reason: &'static str,
-) -> Result<Vec<u8>> {
-    let Some(pool) = pool else {
-        return store.get(key)?.ok_or(FileSystemError::CorruptState {
-            reason: missing_reason,
-        });
-    };
-
-    match pool.get(DeviceIoClass::Data, key) {
-        Ok(Some(bytes)) => Ok(bytes),
-        Ok(None) => Err(FileSystemError::CorruptState {
-            reason: missing_reason,
-        }),
-        Err(e) => Err(FileSystemError::Store(e)),
-    }
-}
-
-fn nonzero_receipt_generation(generation: u64) -> Option<u64> {
-    if generation == 0 {
-        None
-    } else {
-        Some(generation)
-    }
-}
-
-fn placement_evidence_for_content_key(
-    pool: Option<&Pool>,
-    key: ObjectKey,
-    subject_id: u64,
-    expected_generation: Option<u64>,
-) -> MountedContentPlacementEvidence {
-    let Some(pool) = pool else {
-        return match expected_generation {
-            Some(expected_generation) => MountedContentPlacementEvidence::ReceiptUnavailable {
-                expected_generation: Some(expected_generation),
-            },
-            None => MountedContentPlacementEvidence::ReceiptMissing {
-                expected_generation: None,
-            },
-        };
-    };
-
-    match pool.placement_receipt_for_key(DeviceIoClass::Data, key) {
-        Ok(Some(receipt)) => match expected_generation {
-            Some(expected_generation) if receipt.generation == expected_generation => {
-                match receipt.shared_receipt_ref_for_subject(subject_id) {
-                    Ok(placement_receipt_ref) => MountedContentPlacementEvidence::ReceiptVerified {
-                        generation: expected_generation,
-                        placement_receipt_ref,
-                    },
-                    Err(_) => MountedContentPlacementEvidence::ReceiptUnavailable {
-                        expected_generation: Some(expected_generation),
-                    },
-                }
-            }
-            Some(expected_generation) => MountedContentPlacementEvidence::ReceiptStale {
-                expected_generation,
-                observed_generation: receipt.generation,
-            },
-            None => MountedContentPlacementEvidence::ReceiptObservedButUnbound {
-                generation: receipt.generation,
-            },
-        },
-        Ok(None) => MountedContentPlacementEvidence::ReceiptMissing {
-            expected_generation,
-        },
-        Err(_) => MountedContentPlacementEvidence::ReceiptUnavailable {
-            expected_generation,
-        },
-    }
-}
-
 /// Decode content for raw recovery/import staging or integrity validation.
 ///
 /// This deliberately ignores sender/source placement receipts so callers can
@@ -598,7 +365,14 @@ pub(crate) fn read_content_layout_from_pool(
     allow_v0390_fixed_content: bool,
 ) -> Result<ContentLayout> {
     read_content_layout_with_get(
-        |key| Ok(pool.get(DeviceIoClass::Data, key)?),
+        |key| {
+            read_optional_current_receipt_object(
+                pool.current_placement_receipt_read(DeviceIoClass::Data, key),
+                || pool.get(DeviceIoClass::Data, key),
+                key,
+            )
+            .map(|read| read.map(|read| read.bytes))
+        },
         inode_id,
         record,
         allow_v0390_fixed_content,
@@ -809,7 +583,12 @@ fn try_validate_chunk_bytes(
     raw_bytes: &[u8],
 ) -> Result<Option<(ContentChunkObject, bool)>> {
     try_validate_chunk_bytes_with_get(inode_id, chunk_ref, raw_bytes, |canonical_key| match pool {
-        Some(pool) => Ok(pool.get(DeviceIoClass::Data, canonical_key)?),
+        Some(pool) => read_optional_current_receipt_object(
+            pool.current_placement_receipt_read(DeviceIoClass::Data, canonical_key),
+            || pool.get(DeviceIoClass::Data, canonical_key),
+            canonical_key,
+        )
+        .map(|read| read.map(|read| read.bytes)),
         None => Ok(store.get(canonical_key)?),
     })
 }
@@ -821,7 +600,7 @@ fn try_validate_chunk_bytes_from_write_store<S: ContentWriteStore + ?Sized>(
     raw_bytes: &[u8],
 ) -> Result<Option<(ContentChunkObject, bool)>> {
     try_validate_chunk_bytes_with_get(inode_id, chunk_ref, raw_bytes, |canonical_key| {
-        store.get(canonical_key)
+        store.read_dedup_canonical_bytes(canonical_key)
     })
 }
 
@@ -967,14 +746,9 @@ fn read_content_chunk_from_store(
     chunk_ref: &ContentChunkRef,
     pool: &Pool,
 ) -> Result<ContentChunkObject> {
-    read_content_chunk_with(
-        store,
-        inode_id,
-        chunk_ref,
-        Some(pool),
-        chunk_ref.placement_receipt_generation == 0,
-        |key| read_chunk_bytes_with_receipt(store, Some(pool), chunk_ref, key),
-    )
+    read_content_chunk_with(store, inode_id, chunk_ref, Some(pool), false, |key| {
+        read_chunk_bytes_with_receipt(store, Some(pool), chunk_ref, key)
+    })
 }
 
 /// Decode a chunk for raw recovery/import staging or transaction-manifest
@@ -1046,26 +820,9 @@ fn read_content_chunk_with(
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ReadReceiptEvidence {
-    Valid {
-        generation: u64,
-    },
-    Stale {
-        observed_generation: u64,
-    },
+    Valid,
+    Stale { observed_generation: u64 },
     Synthetic,
-    MalformedPolicy {
-        generation: u64,
-    },
-    UnderWidth {
-        generation: u64,
-        target_count: u16,
-        required_width: u16,
-    },
-    OverWidth {
-        generation: u64,
-        target_count: u16,
-        required_width: u16,
-    },
 }
 
 /// Classify the current Pool receipt against the generation recorded by a
@@ -1084,65 +841,31 @@ fn classify_read_receipt(
         };
     }
 
-    let policy = receipt.policy.to_receipt_redundancy_policy();
-    if !policy.is_well_formed() {
-        return ReadReceiptEvidence::MalformedPolicy {
-            generation: receipt.generation,
-        };
-    }
-
-    let required_width = policy.target_width();
-    let target_count = u16::try_from(receipt.targets.len()).unwrap_or(u16::MAX);
-    if target_count < required_width {
-        return ReadReceiptEvidence::UnderWidth {
-            generation: receipt.generation,
-            target_count,
-            required_width,
-        };
-    }
-    if target_count > required_width {
-        return ReadReceiptEvidence::OverWidth {
-            generation: receipt.generation,
-            target_count,
-            required_width,
-        };
-    }
-
-    ReadReceiptEvidence::Valid {
-        generation: receipt.generation,
-    }
+    ReadReceiptEvidence::Valid
 }
 
-/// Read a chunk through current Pool authority when its reference is
-/// receipt-bound. Receiptless pre-Pool chunks retain their raw fallback.
+/// Read a chunk only through current Pool authority. Receiptless chunks have
+/// no strict read authority and fail closed; raw staging callers use the
+/// explicitly named integrity helpers instead.
 fn read_chunk_bytes_with_receipt(
-    store: &LocalObjectStore,
+    _store: &LocalObjectStore,
     pool: Option<&Pool>,
     chunk_ref: &ContentChunkRef,
     key: ObjectKey,
 ) -> Result<Vec<u8>> {
     let recorded_generation = chunk_ref.placement_receipt_generation;
+    if recorded_generation == 0 {
+        return Err(FileSystemError::ReceiptAuthoritySynthetic {
+            object_key: key,
+            expected_generation: 0,
+        });
+    }
     let Some(pool) = pool else {
-        if recorded_generation != 0 {
-            return Err(FileSystemError::ReceiptAuthorityUnavailable {
-                object_key: key,
-                expected_generation: recorded_generation,
-            });
-        }
-        return store.get(key)?.ok_or(FileSystemError::CorruptState {
-            reason: "content manifest references a missing chunk object",
+        return Err(FileSystemError::ReceiptAuthorityUnavailable {
+            object_key: key,
+            expected_generation: recorded_generation,
         });
     };
-
-    if recorded_generation == 0 {
-        return match pool.get(DeviceIoClass::Data, key) {
-            Ok(Some(bytes)) => Ok(bytes),
-            Ok(None) => Err(FileSystemError::CorruptState {
-                reason: "content manifest references a missing chunk object",
-            }),
-            Err(e) => Err(FileSystemError::Store(e)),
-        };
-    }
 
     read_chunk_bytes_from_current_receipt(
         pool.current_placement_receipt_read(DeviceIoClass::Data, key),
@@ -1158,6 +881,18 @@ fn read_chunk_bytes_from_current_receipt(
     recorded_generation: u64,
     key: ObjectKey,
 ) -> Result<Vec<u8>> {
+    Ok(read_object_from_current_receipt(receipt_read, recorded_generation, key)?.bytes)
+}
+
+struct ReceiptBoundObjectRead {
+    bytes: Vec<u8>,
+}
+
+fn read_object_from_current_receipt(
+    receipt_read: tidefs_local_object_store::Result<Option<CurrentPlacementReceiptRead<'_>>>,
+    recorded_generation: u64,
+    key: ObjectKey,
+) -> Result<ReceiptBoundObjectRead> {
     let receipt_read = match receipt_read {
         Ok(Some(receipt_read)) => receipt_read,
         Ok(None) => {
@@ -1175,8 +910,8 @@ fn read_chunk_bytes_from_current_receipt(
     };
 
     match classify_read_receipt(receipt_read.receipt(), recorded_generation) {
-        ReadReceiptEvidence::Valid { .. } => match receipt_read.read() {
-            Ok(Some(bytes)) => Ok(bytes),
+        ReadReceiptEvidence::Valid => match receipt_read.read() {
+            Ok(Some(bytes)) => Ok(ReceiptBoundObjectRead { bytes }),
             Ok(None) => Err(FileSystemError::CorruptState {
                 reason: "content chunk receipt verified but pool read returned no data",
             }),
@@ -1193,31 +928,32 @@ fn read_chunk_bytes_from_current_receipt(
             object_key: key,
             expected_generation: recorded_generation,
         }),
-        ReadReceiptEvidence::MalformedPolicy { generation } => {
-            Err(FileSystemError::ReceiptAuthorityMalformedPolicy {
-                object_key: key,
-                generation,
-            })
+    }
+}
+
+fn read_optional_current_receipt_object(
+    receipt_read: tidefs_local_object_store::Result<Option<CurrentPlacementReceiptRead<'_>>>,
+    read_without_receipt: impl FnOnce() -> tidefs_local_object_store::Result<Option<Vec<u8>>>,
+    key: ObjectKey,
+) -> Result<Option<ReceiptBoundObjectRead>> {
+    match receipt_read {
+        Ok(Some(receipt_read)) => {
+            read_object_from_current_receipt(Ok(Some(receipt_read)), 1, key).map(Some)
         }
-        ReadReceiptEvidence::UnderWidth {
-            generation,
-            target_count,
-            required_width,
-        } => Err(FileSystemError::ReceiptAuthorityUnderWidth {
+        Ok(None) => match read_without_receipt() {
+            Ok(Some(_)) => Err(FileSystemError::ReceiptAuthorityMissing {
+                object_key: key,
+                expected_generation: 1,
+            }),
+            Ok(None) => Ok(None),
+            Err(_) => Err(FileSystemError::ReceiptAuthorityUnavailable {
+                object_key: key,
+                expected_generation: 1,
+            }),
+        },
+        Err(_) => Err(FileSystemError::ReceiptAuthorityUnavailable {
             object_key: key,
-            generation,
-            target_count,
-            required_width,
-        }),
-        ReadReceiptEvidence::OverWidth {
-            generation,
-            target_count,
-            required_width,
-        } => Err(FileSystemError::ReceiptAuthorityOverWidth {
-            object_key: key,
-            generation,
-            target_count,
-            required_width,
+            expected_generation: 1,
         }),
     }
 }
@@ -1273,7 +1009,7 @@ fn encode_chunk_with_dedup<S: ContentWriteStore>(
         &hash,
         canonical_key,
         |candidate| dedup_index.lookup_hash(candidate),
-        |candidate| match store.get(candidate) {
+        |candidate| match store.read_dedup_canonical_bytes(candidate) {
             Ok(Some(_)) => true,
             Ok(None) => false,
             Err(err) => {
@@ -2794,7 +2530,7 @@ pub(crate) fn reflink_chunked_content<S: ContentWriteStore>(
                 let fingerprint = crate::encoding::compute_content_fingerprint(&source_chunk.bytes);
                 let canonical_key = crate::object_keys::content_dedup_object_key(&fingerprint);
 
-                if let Some(existing) = store.get(canonical_key)? {
+                if let Some(existing) = store.read_dedup_canonical_bytes(canonical_key)? {
                     let existing_chunk = decode_content_chunk(&existing)?;
                     if existing_chunk.bytes != source_chunk.bytes {
                         return Err(FileSystemError::CorruptState {
@@ -3000,6 +2736,67 @@ mod tests {
         }
     }
 
+    fn run_receipt_bound_mutation(
+        pool: &mut Pool,
+        old_record: &InodeRecord,
+        mutation: ReceiptBoundMutation,
+    ) -> Result<()> {
+        let mut store = pool.pool_store_mut();
+        let compression_policy = ContentCompressionPolicy::off();
+        let mut dedup_index = DedupIndex::new();
+        match mutation {
+            ReceiptBoundMutation::PartialOverlay => {
+                let new_record = test_record(
+                    old_record.inode_id.get(),
+                    old_record.data_version + 1,
+                    old_record.size,
+                );
+                write_chunked_content_with_overlay(WriteChunkedContentOverlay {
+                    dedup_enabled: false,
+                    store: &mut store,
+                    inode_id: old_record.inode_id,
+                    old_record,
+                    new_record: &new_record,
+                    overlay_offset: 1,
+                    overlay_bytes: b"x",
+                    allow_holes: true,
+                    dedup_index: &mut dedup_index,
+                    quorum_store: None,
+                    compression_policy: &compression_policy,
+                })
+            }
+            ReceiptBoundMutation::PartialHolePunch => {
+                let new_record = test_record(
+                    old_record.inode_id.get(),
+                    old_record.data_version + 1,
+                    old_record.size,
+                );
+                punch_hole_content(PunchHoleContent {
+                    store: &mut store,
+                    inode_id: old_record.inode_id,
+                    old_record,
+                    new_record: &new_record,
+                    hole_offset: 1,
+                    hole_length: 1,
+                    quorum_store: None,
+                    compression_policy: &compression_policy,
+                })
+            }
+            ReceiptBoundMutation::Reflink => {
+                let dest_record = test_record(old_record.inode_id.get() + 1, 1, old_record.size);
+                reflink_chunked_content(
+                    true,
+                    &mut store,
+                    old_record.inode_id,
+                    old_record,
+                    &dest_record,
+                    &mut dedup_index,
+                    &compression_policy,
+                )
+            }
+        }
+    }
+
     fn receipt_bound_mutation_error(
         failure: ReceiptFailure,
         mutation: ReceiptBoundMutation,
@@ -3051,54 +2848,48 @@ mod tests {
             &encode_content_manifest_sparse(&old_manifest),
         )
         .expect("seed source manifest");
+        run_receipt_bound_mutation(&mut pool, &old_record, mutation)
+            .expect_err("receipt-bound mutation must fail closed")
+    }
 
-        let mut store = pool.pool_store_mut();
-        let compression_policy = ContentCompressionPolicy::off();
-        let mut dedup_index = DedupIndex::new();
-        match mutation {
-            ReceiptBoundMutation::PartialOverlay => {
-                let new_record = test_record(91, 2, old_record.size);
-                write_chunked_content_with_overlay(WriteChunkedContentOverlay {
-                    dedup_enabled: false,
-                    store: &mut store,
-                    inode_id: old_record.inode_id,
-                    old_record: &old_record,
-                    new_record: &new_record,
-                    overlay_offset: 1,
-                    overlay_bytes: b"x",
-                    allow_holes: true,
-                    dedup_index: &mut dedup_index,
-                    quorum_store: None,
-                    compression_policy: &compression_policy,
-                })
-            }
-            ReceiptBoundMutation::PartialHolePunch => {
-                let new_record = test_record(91, 2, old_record.size);
-                punch_hole_content(PunchHoleContent {
-                    store: &mut store,
-                    inode_id: old_record.inode_id,
-                    old_record: &old_record,
-                    new_record: &new_record,
-                    hole_offset: 1,
-                    hole_length: 1,
-                    quorum_store: None,
-                    compression_policy: &compression_policy,
-                })
-            }
-            ReceiptBoundMutation::Reflink => {
-                let dest_record = test_record(92, 1, old_record.size);
-                reflink_chunked_content(
-                    true,
-                    &mut store,
-                    old_record.inode_id,
-                    &old_record,
-                    &dest_record,
-                    &mut dedup_index,
-                    &compression_policy,
-                )
-            }
-        }
-        .expect_err("receipt-bound mutation must fail closed")
+    fn raw_only_manifest_mutation_error(
+        mutation: ReceiptBoundMutation,
+    ) -> (FileSystemError, ObjectKey) {
+        let mut pool = temp_pool(&format!(
+            "raw-only-manifest-{}",
+            mutation.label().replace(' ', "-")
+        ));
+        let payload = vec![0x52; 64];
+        let old_record = test_record(98, 1, payload.len() as u64);
+        let chunk_key =
+            content_chunk_object_key_for_version(old_record.inode_id, old_record.data_version, 0);
+        let encoded =
+            encode_content_chunk(&old_record, 0, &payload, &ContentCompressionPolicy::off());
+        let (_, receipt) = pool
+            .put_with_receipt(DeviceIoClass::Data, chunk_key, &encoded)
+            .expect("seed authoritative source chunk");
+        let manifest = ContentManifestObject {
+            inode_id: old_record.inode_id,
+            data_version: old_record.data_version,
+            file_size: old_record.size,
+            chunk_size: content_chunk_size(),
+            chunks: vec![ContentChunkRef {
+                chunk_index: 0,
+                data_version: old_record.data_version,
+                len: payload.len() as u32,
+                checksum: checksum64(&encoded),
+                placement_receipt_generation: receipt.generation,
+            }],
+        };
+        let manifest_key =
+            content_object_key_for_version(old_record.inode_id, old_record.data_version);
+        pool.raw_primary_store_mut()
+            .put(manifest_key, &encode_content_manifest_sparse(&manifest))
+            .expect("seed raw-only source manifest");
+
+        let error = run_receipt_bound_mutation(&mut pool, &old_record, mutation)
+            .expect_err("raw-only source manifest must fail closed");
+        (error, manifest_key)
     }
 
     #[test]
@@ -3128,6 +2919,26 @@ mod tests {
             assert!(
                 matches!(&err, FileSystemError::ReceiptAuthorityStale { .. }),
                 "{} accepted an older current receipt: {err:?}",
+                mutation.label()
+            );
+        }
+    }
+
+    #[test]
+    fn pool_receipt_mutations_reject_raw_only_manifest_authority() {
+        for mutation in [
+            ReceiptBoundMutation::PartialOverlay,
+            ReceiptBoundMutation::PartialHolePunch,
+            ReceiptBoundMutation::Reflink,
+        ] {
+            let (error, manifest_key) = raw_only_manifest_mutation_error(mutation);
+            assert!(
+                matches!(
+                    &error,
+                    FileSystemError::ReceiptAuthorityMissing { object_key, .. }
+                        if *object_key == manifest_key
+                ),
+                "{} did not reject the raw-only manifest authority: {error:?}",
                 mutation.label()
             );
         }
@@ -3281,7 +3092,7 @@ mod tests {
     }
 
     #[test]
-    fn dedup_redirect_rejects_canonical_key_mismatch() {
+    fn receipt_bound_dedup_redirect_rejects_canonical_key_mismatch() {
         let expected_payload = vec![0x61; 64];
         let wrong_payload = vec![0x62; expected_payload.len()];
         let record = test_record(93, 1, expected_payload.len() as u64);
@@ -3314,6 +3125,104 @@ mod tests {
             &chunk_ref,
         )
         .expect_err("raw integrity read must reject canonical bytes under the wrong content key");
+    }
+
+    fn raw_only_canonical_fixture(
+        label: &str,
+    ) -> (Pool, InodeRecord, ContentChunkRef, ObjectKey, Vec<u8>) {
+        let payload = vec![0x63; 64];
+        let source_record = test_record(96, 1, payload.len() as u64);
+        let fingerprint = crate::encoding::compute_content_fingerprint(&payload);
+        let canonical_key = crate::object_keys::content_dedup_object_key(&fingerprint);
+        let canonical = encode_content_chunk(
+            &source_record,
+            0,
+            &payload,
+            &ContentCompressionPolicy::off(),
+        );
+        let redirect = crate::encoding::encode_dedup_redirect(canonical_key);
+        let redirect_key = content_chunk_object_key_for_version(
+            source_record.inode_id,
+            source_record.data_version,
+            0,
+        );
+        let mut pool = temp_pool(label);
+        pool.raw_primary_store_mut()
+            .put(canonical_key, &canonical)
+            .expect("seed raw-only canonical bytes");
+        let (_, redirect_receipt) = pool
+            .put_with_receipt(DeviceIoClass::Data, redirect_key, &redirect)
+            .expect("seed authoritative redirect");
+        let chunk_ref = ContentChunkRef {
+            chunk_index: 0,
+            data_version: source_record.data_version,
+            len: payload.len() as u32,
+            checksum: checksum64(&redirect),
+            placement_receipt_generation: redirect_receipt.generation,
+        };
+        let manifest = ContentManifestObject {
+            inode_id: source_record.inode_id,
+            data_version: source_record.data_version,
+            file_size: source_record.size,
+            chunk_size: content_chunk_size(),
+            chunks: vec![chunk_ref.clone()],
+        };
+        pool.put(
+            DeviceIoClass::Data,
+            content_object_key_for_version(source_record.inode_id, source_record.data_version),
+            &encode_content_manifest_sparse(&manifest),
+        )
+        .expect("seed authoritative source manifest");
+
+        (pool, source_record, chunk_ref, canonical_key, payload)
+    }
+
+    #[test]
+    fn receipt_bound_dedup_rejects_raw_only_canonical_authority() {
+        let (pool, source_record, chunk_ref, canonical_key, payload) =
+            raw_only_canonical_fixture("dedup-raw-only-canonical-read");
+
+        let raw = read_untrusted_raw_content_chunk_for_integrity(
+            pool.raw_primary_store(),
+            source_record.inode_id,
+            &chunk_ref,
+        )
+        .expect("raw staging may inspect an unbound canonical object");
+        assert_eq!(raw.bytes, payload);
+        let strict_error = read_content_chunk_from_store(
+            pool.raw_primary_store(),
+            source_record.inode_id,
+            &chunk_ref,
+            &pool,
+        )
+        .expect_err("strict read must reject raw-only canonical authority");
+        assert!(matches!(
+            &strict_error,
+            FileSystemError::ReceiptAuthorityMissing { object_key, .. }
+                if *object_key == canonical_key
+        ));
+        for mutation in [
+            ReceiptBoundMutation::PartialOverlay,
+            ReceiptBoundMutation::PartialHolePunch,
+            ReceiptBoundMutation::Reflink,
+        ] {
+            let (mut pool, source_record, _, canonical_key, _) =
+                raw_only_canonical_fixture(&format!(
+                    "dedup-raw-only-canonical-{}",
+                    mutation.label().replace(' ', "-")
+                ));
+            let error = run_receipt_bound_mutation(&mut pool, &source_record, mutation)
+                .expect_err("mutation must reject raw-only canonical authority");
+            assert!(
+                matches!(
+                    &error,
+                    FileSystemError::ReceiptAuthorityMissing { object_key, .. }
+                        if *object_key == canonical_key
+                ),
+                "{} did not reject raw-only canonical authority: {error:?}",
+                mutation.label()
+            );
+        }
     }
 
     #[test]
@@ -3385,298 +3294,6 @@ mod tests {
                 reason: "reflink: canonical chunk does not match its content key"
             }
         ));
-    }
-
-    #[test]
-    fn mounted_content_scrub_authority_reads_inline_plaintext_and_evidence() {
-        let mut store = temp_store("mounted-inline-authority");
-        let payload = b"inline plaintext".to_vec();
-        let record = test_record(7, 3, payload.len() as u64);
-        let key = content_object_key_for_version(record.inode_id, record.data_version);
-        let encoded = encode_content(&record, &payload);
-        store.put(key, &encoded).expect("write inline");
-
-        let read = read_mounted_content_scrub_block(
-            &store,
-            record.inode_id,
-            &record,
-            MountedContentScrubReadTarget::Inline,
-            None,
-        )
-        .expect("authority read");
-
-        assert_eq!(
-            read.block_id,
-            ScrubBlockId {
-                inode_id: record.inode_id.get(),
-                data_version: record.data_version,
-                kind: ScrubBlockKind::InlineContent,
-            }
-        );
-        assert_eq!(read.object_key, Some(key));
-        assert_eq!(read.plaintext_bytes, payload);
-        assert_eq!(
-            read.checksum_evidence.layer,
-            MountedContentChecksumLayer::InlineContentBody
-        );
-        assert!(read.checksum_evidence.matches_expected());
-        assert_eq!(
-            read.placement_evidence,
-            MountedContentPlacementEvidence::ReceiptMissing {
-                expected_generation: None,
-            }
-        );
-        assert!(!read.placement_evidence.allows_repair_dispatch());
-    }
-
-    #[test]
-    fn mounted_content_scrub_authority_reads_inline_through_pool_when_available() {
-        let raw_store = temp_store("mounted-inline-pool-empty-raw");
-        let mut pool = temp_pool("mounted-inline-pool-authority");
-        let payload = b"inline pool plaintext".to_vec();
-        let record = test_record(7, 4, payload.len() as u64);
-        let key = content_object_key_for_version(record.inode_id, record.data_version);
-        let encoded = encode_content(&record, &payload);
-        pool.put(DeviceIoClass::Data, key, &encoded)
-            .expect("write inline through pool");
-
-        let read = read_mounted_content_scrub_block(
-            &raw_store,
-            record.inode_id,
-            &record,
-            MountedContentScrubReadTarget::Inline,
-            Some(&pool),
-        )
-        .expect("authority read through pool");
-
-        assert_eq!(read.object_key, Some(key));
-        assert_eq!(read.plaintext_bytes, payload);
-        assert!(read.checksum_evidence.matches_expected());
-        assert_eq!(
-            read.placement_evidence,
-            MountedContentPlacementEvidence::ReceiptObservedButUnbound { generation: 1 }
-        );
-    }
-
-    #[test]
-    fn mounted_content_scrub_authority_reads_chunk_plaintext_and_checksum_layer() {
-        let mut store = temp_store("mounted-chunk-authority");
-        let payload = b"chunk plaintext authority".to_vec();
-        let record = test_record(9, 4, payload.len() as u64);
-        let key = content_chunk_object_key_for_version(record.inode_id, record.data_version, 0);
-        let encoded = encode_content_chunk(&record, 0, &payload, &ContentCompressionPolicy::off());
-        let checksum = FastBlockChecksum::compute(&encoded);
-        store.put(key, &encoded).expect("write chunk");
-        let chunk_ref = ContentChunkRef {
-            chunk_index: 0,
-            data_version: record.data_version,
-            len: payload.len() as u32,
-            checksum,
-            placement_receipt_generation: 0,
-        };
-
-        let read = read_mounted_content_scrub_block(
-            &store,
-            record.inode_id,
-            &record,
-            MountedContentScrubReadTarget::ContentChunk(&chunk_ref),
-            None,
-        )
-        .expect("authority read");
-
-        assert_eq!(
-            read.block_id,
-            ScrubBlockId {
-                inode_id: record.inode_id.get(),
-                data_version: record.data_version,
-                kind: ScrubBlockKind::ContentChunk { chunk_index: 0 },
-            }
-        );
-        assert_eq!(read.object_key, Some(key));
-        assert_eq!(read.plaintext_bytes, payload);
-        assert_eq!(
-            read.checksum_evidence,
-            MountedContentChecksumEvidence {
-                layer: MountedContentChecksumLayer::EncodedContentChunk,
-                expected: Some(checksum),
-                actual: checksum,
-                encoded_len: encoded.len() as u64,
-            }
-        );
-        assert_eq!(
-            read.placement_evidence,
-            MountedContentPlacementEvidence::ReceiptMissing {
-                expected_generation: None,
-            }
-        );
-        assert!(!read.placement_evidence.allows_repair_dispatch());
-    }
-
-    #[test]
-    fn mounted_content_scrub_authority_reads_chunk_through_pool_when_available() {
-        let raw_store = temp_store("mounted-chunk-pool-empty-raw");
-        let mut pool = temp_pool("mounted-chunk-pool-authority");
-        let payload = b"chunk pool plaintext authority".to_vec();
-        let record = test_record(9, 5, payload.len() as u64);
-        let key = content_chunk_object_key_for_version(record.inode_id, record.data_version, 0);
-        let encoded = encode_content_chunk(&record, 0, &payload, &ContentCompressionPolicy::off());
-        let checksum = FastBlockChecksum::compute(&encoded);
-        pool.put(DeviceIoClass::Data, key, &encoded)
-            .expect("write chunk through pool");
-        let chunk_ref = ContentChunkRef {
-            chunk_index: 0,
-            data_version: record.data_version,
-            len: payload.len() as u32,
-            checksum,
-            placement_receipt_generation: 0,
-        };
-
-        let read = read_mounted_content_scrub_block(
-            &raw_store,
-            record.inode_id,
-            &record,
-            MountedContentScrubReadTarget::ContentChunk(&chunk_ref),
-            Some(&pool),
-        )
-        .expect("authority read through pool");
-
-        assert_eq!(read.object_key, Some(key));
-        assert_eq!(read.plaintext_bytes, payload);
-        assert_eq!(
-            read.checksum_evidence,
-            MountedContentChecksumEvidence {
-                layer: MountedContentChecksumLayer::EncodedContentChunk,
-                expected: Some(checksum),
-                actual: checksum,
-                encoded_len: encoded.len() as u64,
-            }
-        );
-        assert_eq!(
-            read.placement_evidence,
-            MountedContentPlacementEvidence::ReceiptObservedButUnbound { generation: 1 }
-        );
-    }
-
-    #[test]
-    fn mounted_content_scrub_authority_resolves_dedup_canonical_through_pool() {
-        let raw_store = temp_store("mounted-dedup-pool-empty-raw");
-        let mut pool = temp_pool("mounted-dedup-pool-authority");
-        let payload = b"canonical pool plaintext authority".to_vec();
-        let record = test_record(15, 8, payload.len() as u64);
-        let canonical_record = test_record(16, 3, payload.len() as u64);
-        let fingerprint = crate::encoding::compute_content_fingerprint(&payload);
-        let canonical_key = crate::object_keys::content_dedup_object_key(&fingerprint);
-        let canonical_encoded = encode_content_chunk(
-            &canonical_record,
-            0,
-            &payload,
-            &ContentCompressionPolicy::off(),
-        );
-        pool.put(DeviceIoClass::Data, canonical_key, &canonical_encoded)
-            .expect("write canonical chunk through pool");
-
-        let redirect_key =
-            content_chunk_object_key_for_version(record.inode_id, record.data_version, 0);
-        let redirect = crate::encoding::encode_dedup_redirect(canonical_key);
-        let checksum = FastBlockChecksum::compute(&redirect);
-        pool.put(DeviceIoClass::Data, redirect_key, &redirect)
-            .expect("write dedup redirect through pool");
-        let chunk_ref = ContentChunkRef {
-            chunk_index: 0,
-            data_version: record.data_version,
-            len: payload.len() as u32,
-            checksum,
-            placement_receipt_generation: 0,
-        };
-
-        let read = read_mounted_content_scrub_block(
-            &raw_store,
-            record.inode_id,
-            &record,
-            MountedContentScrubReadTarget::ContentChunk(&chunk_ref),
-            Some(&pool),
-        )
-        .expect("dedup canonical read through pool");
-
-        assert_eq!(read.object_key, Some(redirect_key));
-        assert_eq!(read.plaintext_bytes, payload);
-        assert_eq!(read.checksum_evidence.expected, Some(checksum));
-        assert!(read.checksum_evidence.matches_expected());
-    }
-
-    #[test]
-    fn mounted_content_scrub_authority_rejects_stale_chunk_ref() {
-        let mut store = temp_store("mounted-stale-chunk-ref");
-        let payload = b"stale chunk reference".to_vec();
-        let stale_record = test_record(13, 6, payload.len() as u64);
-        let current_record = test_record(13, 7, payload.len() as u64);
-        let key = content_chunk_object_key_for_version(
-            stale_record.inode_id,
-            stale_record.data_version,
-            0,
-        );
-        let encoded =
-            encode_content_chunk(&stale_record, 0, &payload, &ContentCompressionPolicy::off());
-        let checksum = FastBlockChecksum::compute(&encoded);
-        store.put(key, &encoded).expect("write stale chunk");
-        let chunk_ref = ContentChunkRef {
-            chunk_index: 0,
-            data_version: stale_record.data_version,
-            len: payload.len() as u32,
-            checksum,
-            placement_receipt_generation: 0,
-        };
-
-        let err = read_mounted_content_scrub_block(
-            &store,
-            current_record.inode_id,
-            &current_record,
-            MountedContentScrubReadTarget::ContentChunk(&chunk_ref),
-            None,
-        )
-        .expect_err("stale chunk refs must fail closed");
-
-        assert!(matches!(err, FileSystemError::CorruptState { .. }));
-    }
-
-    #[test]
-    fn mounted_content_scrub_authority_marks_stale_chunk_receipt() {
-        let mut pool = temp_pool("mounted-stale-receipt");
-        let payload = b"receipt-stale chunk".to_vec();
-        let record = test_record(11, 5, payload.len() as u64);
-        let key = content_chunk_object_key_for_version(record.inode_id, record.data_version, 0);
-        let encoded = encode_content_chunk(&record, 0, &payload, &ContentCompressionPolicy::off());
-        let checksum = FastBlockChecksum::compute(&encoded);
-        let (_, receipt) = pool
-            .put_with_receipt(DeviceIoClass::Data, key, &encoded)
-            .expect("write through pool");
-        let expected_generation = receipt.generation.saturating_add(1);
-        let chunk_ref = ContentChunkRef {
-            chunk_index: 0,
-            data_version: record.data_version,
-            len: payload.len() as u32,
-            checksum,
-            placement_receipt_generation: expected_generation,
-        };
-
-        let read = read_mounted_content_scrub_block(
-            pool.raw_primary_store(),
-            record.inode_id,
-            &record,
-            MountedContentScrubReadTarget::ContentChunk(&chunk_ref),
-            Some(&pool),
-        )
-        .expect("authority read");
-
-        assert_eq!(read.plaintext_bytes, payload);
-        assert_eq!(
-            read.placement_evidence,
-            MountedContentPlacementEvidence::ReceiptStale {
-                expected_generation,
-                observed_generation: receipt.generation,
-            }
-        );
-        assert!(!read.placement_evidence.allows_repair_dispatch());
     }
 
     #[test]
@@ -3860,10 +3477,8 @@ mod tests {
         assert_eq!(read_back, payload);
     }
 
-    /// `read_chunk_bytes_with_receipt` falls back to the raw store when
-    /// the chunk ref carries receipt generation zero (receiptless path).
     #[test]
-    fn receiptless_chunk_reads_via_raw_store() {
+    fn receiptless_chunk_fails_strict_read_without_pool() {
         let mut store = temp_store("receiptless-raw");
         let key = ObjectKey::from_name([1; 32]);
         let payload = b"receiptless test payload".to_vec();
@@ -3877,9 +3492,13 @@ mod tests {
             placement_receipt_generation: 0,
         };
 
-        let result = read_chunk_bytes_with_receipt(&store, None, &chunk_ref, key)
-            .expect("read receiptless chunk bytes");
-        assert_eq!(result, payload);
+        assert!(matches!(
+            read_chunk_bytes_with_receipt(&store, None, &chunk_ref, key),
+            Err(FileSystemError::ReceiptAuthoritySynthetic {
+                object_key,
+                expected_generation: 0,
+            }) if object_key == key
+        ));
     }
 
     /// Receipt-bound chunks cannot fall back to the raw store when Pool
@@ -4052,10 +3671,8 @@ mod receipt_readback_authority_tests {
         assert!(matches!(result, Err(FileSystemError::CorruptState { .. })));
     }
 
-    /// Receiptless chunk refs should still route through the pool when a pool
-    /// is available, using the pool's no-receipt read behavior.
     #[test]
-    fn receiptless_chunk_reads_through_pool_when_available() {
+    fn receiptless_chunk_fails_strict_read_with_pool() {
         let raw_store = temp_store("receiptless-pool-empty-raw");
         let mut pool = temp_pool("receiptless-pool-rdbk");
         let key = tidefs_local_object_store::ObjectKey::from_name(b"chunk-receiptless-pool");
@@ -4072,9 +3689,13 @@ mod receipt_readback_authority_tests {
             placement_receipt_generation: 0,
         };
 
-        let result = read_chunk_bytes_with_receipt(&raw_store, Some(&pool), &chunk_ref, key)
-            .expect("receiptless chunk should read through pool");
-        assert_eq!(result, payload);
+        assert!(matches!(
+            read_chunk_bytes_with_receipt(&raw_store, Some(&pool), &chunk_ref, key),
+            Err(FileSystemError::ReceiptAuthoritySynthetic {
+                object_key,
+                expected_generation: 0,
+            }) if object_key == key
+        ));
     }
 
     /// Missing receipt: chunk ref expects a receipt generation, but pool
@@ -4171,64 +3792,6 @@ mod receipt_readback_authority_tests {
         ));
     }
 
-    /// classify_read_receipt returns Valid for a well-formed committed receipt.
-    #[test]
-    fn classify_valid_receipt() {
-        let mut pool = temp_pool("classify-valid");
-        let key = tidefs_local_object_store::ObjectKey::from_name(b"classify-key");
-        let (_stored, receipt) = pool
-            .put_with_receipt(DeviceIoClass::Data, key, b"payload")
-            .expect("put");
-
-        let evidence = classify_read_receipt(&receipt, receipt.generation);
-        assert_eq!(
-            evidence,
-            ReadReceiptEvidence::Valid {
-                generation: receipt.generation,
-            }
-        );
-    }
-
-    /// classify_read_receipt rejects only an observed generation older than
-    /// the chunk reference.
-    #[test]
-    fn classify_older_receipt_as_stale() {
-        let mut pool = temp_pool("classify-stale");
-        let key = tidefs_local_object_store::ObjectKey::from_name(b"stale-key");
-        let (_stored, receipt) = pool
-            .put_with_receipt(DeviceIoClass::Data, key, b"payload")
-            .expect("put");
-
-        let evidence = classify_read_receipt(&receipt, receipt.generation + 1);
-        assert_eq!(
-            evidence,
-            ReadReceiptEvidence::Stale {
-                observed_generation: receipt.generation,
-            }
-        );
-    }
-
-    /// classify_read_receipt accepts a well-formed replacement generation.
-    #[test]
-    fn classify_newer_receipt_as_valid() {
-        let mut pool = temp_pool("classify-newer");
-        let key = tidefs_local_object_store::ObjectKey::from_name(b"newer-key");
-        let (_first, first_receipt) = pool
-            .put_with_receipt(DeviceIoClass::Data, key, b"payload")
-            .expect("first put");
-        let (_second, current_receipt) = pool
-            .put_with_receipt(DeviceIoClass::Data, key, b"payload")
-            .expect("replacement put");
-
-        let evidence = classify_read_receipt(&current_receipt, first_receipt.generation);
-        assert_eq!(
-            evidence,
-            ReadReceiptEvidence::Valid {
-                generation: current_receipt.generation,
-            }
-        );
-    }
-
     /// classify_read_receipt returns Synthetic when pool receipt generation is 0.
     #[test]
     fn classify_synthetic_receipt() {
@@ -4249,114 +3812,27 @@ mod receipt_readback_authority_tests {
         let evidence = classify_read_receipt(&synthetic, 1);
         assert_eq!(evidence, ReadReceiptEvidence::Synthetic);
     }
-
-    /// classify_read_receipt reports MalformedPolicy for an ill-formed policy.
-    #[test]
-    fn classify_malformed_policy_receipt() {
-        use tidefs_local_object_store::pool::{PlacementReceipt, PoolRedundancyPolicy};
-        let malformed = PlacementReceipt {
-            object_key: tidefs_local_object_store::ObjectKey::from_name(b"malformed"),
-            epoch: 0,
-            generation: 1,
-            policy: PoolRedundancyPolicy::Erasure {
-                data_shards: 0,
-                parity_shards: 1,
-            },
-            failure_domain_level: tidefs_durability_layout::FailureDomainLevel::Device,
-            payload_len: 0,
-            shard_len: 0,
-            payload_digest: [0u8; 32],
-            targets: vec![],
-            planner_replay_receipt: None,
-        };
-
-        let evidence = classify_read_receipt(&malformed, 1);
-        assert!(matches!(
-            evidence,
-            ReadReceiptEvidence::MalformedPolicy { .. }
-        ));
-    }
-
-    /// classify_read_receipt reports UnderWidth when target_count < required_width.
-    #[test]
-    fn classify_under_width_receipt() {
-        use tidefs_local_object_store::pool::{PlacementReceipt, PoolRedundancyPolicy};
-        let under = PlacementReceipt {
-            object_key: tidefs_local_object_store::ObjectKey::from_name(b"under"),
-            epoch: 0,
-            generation: 1,
-            policy: PoolRedundancyPolicy::Replicated { copies: 2 },
-            failure_domain_level: tidefs_durability_layout::FailureDomainLevel::Device,
-            payload_len: 0,
-            shard_len: 0,
-            payload_digest: [0u8; 32],
-            targets: vec![],
-            planner_replay_receipt: None,
-        };
-
-        let evidence = classify_read_receipt(&under, 1);
-        assert!(matches!(evidence, ReadReceiptEvidence::UnderWidth { .. }));
-    }
-
-    /// classify_read_receipt reports OverWidth when target_count > required_width.
-    #[test]
-    fn classify_over_width_receipt() {
-        use tidefs_local_object_store::pool::{
-            PlacementReceipt, PlacementReceiptTarget, PoolRedundancyPolicy,
-        };
-        let over = PlacementReceipt {
-            object_key: tidefs_local_object_store::ObjectKey::from_name(b"over"),
-            epoch: 0,
-            generation: 1,
-            policy: PoolRedundancyPolicy::Replicated { copies: 1 },
-            failure_domain_level: tidefs_durability_layout::FailureDomainLevel::Device,
-            payload_len: 0,
-            shard_len: 0,
-            payload_digest: [0u8; 32],
-            targets: vec![
-                PlacementReceiptTarget {
-                    device_index: 0,
-                    device_guid: [0u8; 16],
-                    shard_index: 0,
-                    role: tidefs_local_object_store::pool::PlacementTargetRole::Data,
-                    stored_digest: [0u8; 32],
-                },
-                PlacementReceiptTarget {
-                    device_index: 1,
-                    device_guid: [0u8; 16],
-                    shard_index: 0,
-                    role: tidefs_local_object_store::pool::PlacementTargetRole::Data,
-                    stored_digest: [0u8; 32],
-                },
-            ],
-            planner_replay_receipt: None,
-        };
-
-        let evidence = classify_read_receipt(&over, 1);
-        assert!(matches!(evidence, ReadReceiptEvidence::OverWidth { .. }));
-    }
 }
 
 // ────────────────────────────────────────────────────────────────────
 // Receipt-aware chunk replacement helpers
 // ────────────────────────────────────────────────────────────────────
 
-/// Return the pool placement receipt generation for `object_key`, or 0 if
-/// no receipt is available.
+/// Return the pool placement receipt generation for `object_key`.
 ///
 /// This is the authoritative lookup that ties local-filesystem chunk refs
 /// to the pool's receipt authority. Callers use it to decide whether an old
-/// chunk can be reclaimed after a rewrite.
+/// chunk can be reclaimed after a rewrite. `Ok(None)` is proven receipt
+/// absence; selector failures remain errors so corrupt or unreadable authority
+/// cannot be mistaken for a legacy generation-zero object.
 pub(crate) fn latest_receipt_generation_for_key(
     pool: &tidefs_local_object_store::pool::Pool,
     object_key: tidefs_local_object_store::ObjectKey,
-) -> u64 {
+) -> tidefs_local_object_store::Result<Option<u64>> {
     use tidefs_local_object_store::DeviceIoClass;
 
     pool.placement_receipt_for_key(DeviceIoClass::Data, object_key)
-        .ok()
-        .flatten()
-        .map_or(0, |r| r.generation)
+        .map(|receipt| receipt.map(|receipt| receipt.generation))
 }
 
 #[cfg(test)]

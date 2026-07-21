@@ -3,8 +3,6 @@
 Maturity: current authority document for TFR-008 and GitHub issues #511 and
 #1065.
 
-Authority claim path: `local.vfs.page_cache_writeback_authority.v1`.
-
 Decision id: `tfr-008.page_cache_writeback_recovery_authority.v1`.
 
 This document defines the contract that TideFS implementations must satisfy
@@ -12,10 +10,6 @@ when cached file bytes become dirty, are written back, become clean, interact
 with `fsync`/`syncfs`, and recover after a crash. It is a specification and
 authority boundary only. It does not implement writeback behavior, wire runtime
 enforcement, or validate any present-tense crash-safety claim.
-
-The claim path above is a named authority path, not a validated product claim.
-It must remain blocked until the implementation and validation evidence named
-below exist.
 
 ## Scope
 
@@ -70,13 +64,12 @@ The current authority is narrow:
   write-intent acknowledgments are ordering evidence. They do not by
   themselves mark a page-cache range clean; the writeback owner must join them
   with content/metadata persistence and recovery rules.
-- TFR-008 remains open. Issue #443 (cache-coherency/writeback proof, closed)
-  and issue #445 (intent-log replay idempotency, closed) provided focused-unit
-  evidence now consumed by this authority document. Issue #486 (local VFS
-  write/fsync crash evidence, closed) provided bounded OpFsyncBeforeFlush
-  runtime crash evidence consumed by `local.vfs.write_fsync_crash.v1`. Issue
-  #1065 records the broader survey, boundary decision, and follow-up map.
-  Mounted writeback, mmap, and broader durability evidence remain future work.
+- TFR-008 remains open. The retained FUSE path forces direct I/O for every
+  readable open, masks `FOPEN_KEEP_CACHE`, and refuses kernel writeback-cache
+  options. The adapter has no byte-data read/page cache or background
+  writeback queue; its registered-handle dirty tracking and engine
+  flush/fsync barriers remain. Mounted mmap, kernel writeback, and broader
+  crash-durability behavior are still unproven.
 
 ## Evidence Reviewed For Issue #1065
 
@@ -87,14 +80,9 @@ Documentation reviewed:
   several mechanisms.
 - `docs/PAGE_CACHE_INVALIDATION_AUTHORITY.md` decides the invalidation trigger
   surface, stale-generation rule, and FUSE/kernel/cluster lease model.
-- The `page_cache_writeback_mmap_acceptance_cases()` source binding is a
-  source-model input. Current mmap/writeback status lives in this authority
-  document, `docs/PAGE_CACHE_INVALIDATION_AUTHORITY.md`,
-  `validation/claims.toml`, and live GitHub issues; this does not claim live
-  mounted mmap/writeback closure.
-- `validation/claims.toml` and `docs/CLAIM_REGISTRY.md` keep
-  `local.vfs.page_cache_writeback_authority.v1` blocked pending mounted
-  writeback, mmap coherency, no-hidden-queue, and broader durability evidence.
+- Current implementation status comes from the mounted carrier source and
+  tests plus live GitHub work. This document does not turn a source model,
+  claim row, or authority label into mounted mmap/writeback support.
 
 Current source reviewed:
 
@@ -120,11 +108,11 @@ Current source reviewed:
   `crates/tidefs-lease-manager/` define invalidation messages, wait policies,
   range/inode/dataset scopes, lease domains, lease epochs, generation tracking,
   and dirty-drain/fence behavior for clustered coherency.
-- `apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_vfs_adapter.rs` and
-  `mmap_coherency.rs` are FUSE projections: writeback-cache mode still writes
-  through to the engine before replying, tracks daemon dirty ranges, reconciles
-  direct writes, exposes FUSE fsync/flush behavior, and has mmap invalidation
-  generation callbacks.
+- `apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_vfs_adapter.rs` is a
+  direct-I/O FUSE projection. Readable opens bypass the kernel byte cache and
+  the adapter owns no byte-data read/page cache. Registered handles still track
+  accepted mutations and route flush, fsync/fdatasync, syncfs, release, and
+  range-mutation reconciliation to the engine durability boundary.
 - `kmod/src/kernel_types.rs` and
   `crates/tidefs-kmod-posix-vfs/tidefs_posix_vfs_shim.c` are kernel
   projections: kmod traits expose fsync, syncfs, writeback_folios, mmap,
@@ -138,12 +126,12 @@ Current source reviewed:
 |---|---|---|
 | Committed-root recovery | `crates/tidefs-local-filesystem/src/recovery.rs`, `crash_recovery.rs`, root-slot helpers, commit-group and txg replay paths | Canonical local durability input. Recovery chooses committed roots and replays durable intents; in-memory cache state is gone after crash. |
 | Intent-log replay | `crates/tidefs-intent-log/`, local `intent_log.rs`, LOG_DEVICE file handling | Canonical replay input, but marker records and acknowledgments are ordering evidence, not clean-page authority. |
-| Dirty accounting | Local `DirtySet`, range `DirtyPageTracker`, local page-cache tracker, FUSE dirty-state ranges, kmod live write buffer | Split implementation state. The authority target is one observable dirty lifecycle; current copies are projections or partial indexes until unified. |
-| Writeback scheduling | `tidefs-cache-core::PageCache`, local `WritebackDaemon`, FUSE writeback scheduler/cache, kmod `writeback_folios` and C address-space callbacks | Cache-core owns non-durable page state transitions. Local/FUSE/kmod schedulers consume that authority and must not mark clean before storage or replay authority completes. |
+| Dirty accounting | Local `DirtySet`, range `DirtyPageTracker`, local page-cache tracker, FUSE registered-handle dirty state, kmod live write buffer | Split implementation state. The authority target is one observable dirty lifecycle; current copies are projections or partial indexes until unified. |
+| Writeback scheduling | `tidefs-cache-core::PageCache`, local `WritebackDaemon`, and kmod `writeback_folios` plus C address-space callbacks | Cache-core owns non-durable page state transitions. Local and kmod schedulers consume that authority and must not mark clean before storage or replay authority completes. The retained FUSE adapter has no page-cache scheduler. |
 | `fsync` and `fdatasync` | Local `DirtyFlush`, `dispatch_engine_fsync`, `fdatasync_inode`, local commit-group and sync gates, FUSE fsync handler, kmod file fsync | Caller-visible durability barriers. They must wait for dirty ranges, intent/replay coverage, and committed-root or equivalent receipt authority. |
 | `syncfs`, flush, and clean unmount | Local `flush_all`, `sync_all`, commit-group close, FUSE flush/syncfs, kmod syncfs and unmount barrier | Filesystem or mount-scope barriers. They cannot replace single-inode fsync correctness with unbounded global flushing as the default design. |
 | Mmap | Local `SharedMmapMsync` intent kind, FUSE `MmapCoherency`, kmod `generic_file_mmap()` path and C address-space callbacks | Shared writable mmap dirties must join writeback authority. Private COW bytes are outside this authority. Cross-node mmap remains a non-claim without a lease manager. |
-| Page-cache invalidation | `tidefs-cache-core`, local page caches, FUSE page/read/writeback caches, kmod filemap invalidation helpers | Invalidation may evict clean mirrors and fence dirty/writeback overlap. It cannot decide durability. |
+| Page-cache invalidation | `tidefs-cache-core`, local page caches, and kmod filemap invalidation helpers | Invalidation may evict clean mirrors and fence dirty/writeback overlap. It cannot decide durability. FUSE byte reads bypass kernel and adapter byte caches. |
 | Stale-generation fencing | `docs/PAGE_CACHE_INVALIDATION_AUTHORITY.md`, lease-manager generation tracking, FUSE/kmod invalidation projections | Canonical coherency rule. A cached byte may be served only while its dataset/inode/range/lease generation still matches current authority. |
 | Cluster lease/revocation | `tidefs-cache-coherency`, `tidefs-invalidation-feed`, `tidefs-lease`, `tidefs-lease-manager` | Canonical coherency event and lease epoch authority. It drains, transfers, rejects, or fences dirty overlap before conflicting grants or epochs publish. |
 
@@ -151,9 +139,9 @@ Current source reviewed:
 
 | Model | Description | Strengths | Weaknesses | Decision |
 |---|---|---|---|---|
-| Kernel-resident page cache with userspace writeback | Linux/FUSE or kmod page cache holds dirty bytes while userspace or an engine path later writes them to storage. | Fits buffered I/O and mmap mechanics, uses existing kernel writeback hooks, and can reuse FUSE/kmod cache notifications. | Page-cache state vanishes on crash, FUSE and kmod have different callback surfaces, cross-node invalidation still needs leases, and clean kernel pages cannot prove storage durability. | Projection only. Kernel/FUSE caches may hold and expose bytes, but they do not own durability or stale-generation truth. |
-| Userspace-resident cache with kernel lease callbacks | TideFS keeps the primary dirty/cache state in userspace crates and drives kernel cache invalidation through FUSE notifications, kmod callbacks, and lease messages. | Centralizes local dirty accounting and cluster invalidation policy, and fits the existing `tidefs-cache-core` and lease-manager crates. | Pure userspace ownership cannot satisfy the full-kernel product boundary, and callback failure must still fail closed through generation fences. | Partial local authority. Useful for FUSE/userspace mode, but kernel-mode projections must consume the same contract rather than depend on a daemon for mounted operation. |
-| Storage/replay authority with cache projections | Committed roots, replayable intent records, and explicit barrier receipts decide durability. Cache-core, FUSE, kmod, and cluster lease paths are projections that must prove their generation and dirty/writeback state before serving or cleaning bytes. | Survives crash, applies to FUSE and kmod, gives clustered leases a clear drain/fence target, and keeps claim-gate evidence source-qualified. | Requires implementation work to remove duplicated dirty indexes and to prove mounted runtime paths. | Chosen boundary for TFR-008. |
+| Kernel-resident page cache with engine writeback | A kernel page cache holds dirty bytes while an engine path later writes them to storage. | Fits buffered I/O and mmap mechanics and existing kmod writeback hooks. | Page-cache state vanishes on crash, cross-node invalidation still needs leases, and clean kernel pages cannot prove storage durability. | Projection only. This remains relevant to kmod; the retained FUSE path does not negotiate kernel writeback cache. |
+| Userspace-resident cache with kernel lease callbacks | TideFS keeps dirty/cache state in userspace crates and drives kernel invalidation through callbacks and lease messages. | Centralizes local dirty accounting and cluster invalidation policy, and fits the existing `tidefs-cache-core` and lease-manager crates. | Pure userspace ownership cannot satisfy the full-kernel product boundary, and callback failure must still fail closed through generation fences. | Partial local authority for current cache-core consumers, not a reason to restore an adapter byte cache. |
+| Storage/replay authority with cache projections | Committed roots, replayable intent records, and explicit barrier receipts decide durability. Cache-core, FUSE registered-handle state, kmod, and cluster lease paths consume that authority before serving or cleaning bytes. | Survives crash, applies to direct-I/O FUSE and kmod, and gives clustered leases a clear drain/fence target. | Requires implementation work to remove duplicated dirty indexes and to prove mounted runtime paths. | Chosen boundary for TFR-008. |
 
 ## Chosen Authority Boundary
 
@@ -164,7 +152,7 @@ Canonical local durability authority belongs to
 committed-root publication, commit-group ordering, sync barriers, durable
 intent-log append/replay, LOG_DEVICE handling, and mount recovery decide which
 bytes exist after restart. These crates must converge on one dirty lifecycle
-before the claim path can validate.
+before mounted durability can be claimed.
 
 Canonical page-state authority for non-durable cache transitions belongs to
 `crates/tidefs-cache-core/`. It may decide whether a cached page is clean,
@@ -180,15 +168,13 @@ drained, transferred, rejected, or fenced.
 
 The following crates and paths are projections or consumers:
 
-- `apps/tidefs-posix-filesystem-adapter-daemon/`: FUSE write, flush, fsync,
-  writeback-cache, mmap-coherency, and notification projection.
+- `apps/tidefs-posix-filesystem-adapter-daemon/`: direct-I/O FUSE mutation,
+  registered-handle dirty tracking, flush, fsync/fdatasync, syncfs, release,
+  mmap-coherency, and notification projection. It does not own a byte cache.
 - `kmod/` and `crates/tidefs-kmod-posix-vfs/`: kernel address-space,
   writeback, fsync, syncfs, mmap, invalidation, and committed-root projection.
-- `crates/tidefs-local-filesystem/src/page_cache/`, hot-read cache, inode
-  cache, and adapter read caches: non-authoritative read/cache acceleration.
-- `validation/`, `docs/CLAIM_REGISTRY.md`, and `validation/claims.toml`: claim
-  consumers. They may record evidence only after the runtime authority is
-  implemented and validated.
+- `crates/tidefs-local-filesystem/src/page_cache/`, hot-read cache, and inode
+  cache: non-authoritative cache acceleration for their actual consumers.
 
 The chosen boundary covers the issue's required edges as follows:
 
@@ -222,14 +208,15 @@ This authority does not claim:
   invalidation/drain evidence.
 - Production crash safety for mounted FUSE or kmod writeback before mounted
   runtime crash evidence exists.
-- That FUSE writeback-cache mode may acknowledge bytes that only live in
-  daemon-side dirty trackers.
+- Kernel writeback-cache mode for the retained FUSE mount. Both CLI spellings
+  are refused and readable opens force direct I/O; it is not a future mode
+  implied by this authority.
 - That `Flush`, `Fsync`, `WriteIntentAck`, or transaction markers alone make a
   page-cache range clean.
 - That a global pool-wide flush is the normal answer to per-inode fsync
   correctness.
 - That closed focused issues #443, #445, #486, #753, or #754 validate the
-  broader TFR-008 claim path.
+  broader TFR-008 durability contract.
 
 ## Aspirational Design Not Yet Authority
 
@@ -241,10 +228,9 @@ The following are required future behavior, not current proof:
 - Crash-injection evidence proving that dirty bytes acknowledged by `fsync`
   either survive in the committed root or replay exactly once from the
   intent log.
-- Mounted FUSE, mounted kernel, mmap, direct write, and syncfs paths using one
-  shared writeback authority rather than independent local conventions.
-- A validated claim registry entry for
-  `local.vfs.page_cache_writeback_authority.v1`.
+- The retained direct-I/O FUSE path, mounted kernel, mmap, direct write, and
+  syncfs paths using recovery-safe engine barriers rather than independent
+  local conventions. This does not require an adapter byte cache.
 
 ## Dirty Page Lifecycle
 
@@ -456,8 +442,7 @@ This writeback authority owns how page-cache state consumes that log:
   relevant log ordering;
 - replay markers must not be treated as clean-page authority unless the bytes
   are also durable or replayable;
-- replay idempotency must be proven before the claim path can validate crash
-  behavior.
+- replay idempotency must be proven before crash durability can be claimed.
 
 Issue #445 (closed) provided the focused-unit intent-log replay idempotency
 proof under repeated replay and crash during replay.
@@ -465,25 +450,20 @@ proof under repeated replay and crash during replay.
 ## Follow-Up Implementation Map
 
 The implementation work is intentionally split so each follow-up can own a
-non-overlapping write set. The rows marked "create after #1065" are design
-outputs from this decision; they should become GitHub issues after this design
-lands, before implementation starts.
+non-overlapping write set. Live GitHub state, not this table, decides whether a
+slice remains actionable.
 
 | Issue | Slice | Primary write set | Boundary |
 |---|---|---|---|
 | #1532 | Dirty-page lifecycle unification. | `crates/tidefs-cache-core/src/page_cache.rs`, `crates/tidefs-cache-core/tests/`, `crates/tidefs-local-filesystem/src/dirty_page_tracker.rs`, `writeback.rs`, `writeback_daemon.rs`, `page_cache/`, and focused local/cache tests. | Owns dirty/writeback/clean state and duplicate dirty-index reconciliation. Does not edit FUSE adapter policy, kmod address-space callbacks, lease transport, or intent-log schema. |
 | create after #1065 | Local fsync/fdatasync and recovery ordering. | `crates/tidefs-local-filesystem/src/fuse_fsync.rs`, `lib.rs` sync paths, `commit_group.rs`, `intent_log.rs`, `recovery.rs`, `crash_recovery.rs`, `txg_replay.rs`, and focused local runtime/unit tests. | Owns local recovery-safe barrier semantics and LOG_DEVICE/import ordering. Does not change adapter cache invalidation, kmod callbacks, or cluster leases. Must coordinate with #842 for receipt emission rather than duplicate receipt policy. |
-| create after #1065 | FUSE writeback-cache projection. | `apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_vfs_adapter.rs`, `fsync_handler.rs`, `mmap_coherency.rs`, FUSE writeback/read cache tests, and focused FUSE validation artifacts. | Consumes local durability authority. Does not own durable inode lookup/forget (#665/#709), FUSE invalidation fences (#752), or cluster lease transport. |
 | create after #1065 | Kernel mmap/writeback projection. | `kmod/`, `crates/tidefs-kmod-posix-vfs/`, kernel address-space/writeback/fsync/mmap validation hooks, and focused kernel validation artifacts. | Consumes local/kernel storage authority. Does not change FUSE adapter policy, userspace local-fs dirty accounting, or clustered invalidation feed. |
-| create after #1065 | Claim-gate and no-hidden-writeback evidence. | `validation/`, `validation/claims.toml`, `docs/CLAIM_REGISTRY.md`, `xtask/`, and evidence manifests. | Records evidence only after runtime implementation exists. Does not implement writeback, recovery, FUSE, kmod, or lease behavior. |
-| #752 | FUSE data-cache invalidation and generation fences. | `apps/tidefs-posix-filesystem-adapter-daemon/src/` data-cache, notification, mmap-coherency, and adapter tests only. | Existing invalidation implementation slice. Does not edit durable lookup/forget ownership or writeback durability policy. |
 | #753 | Kernel page-cache coherency notifications and stale-generation checks. | `kmod/`, `crates/tidefs-kmod-posix-vfs/`, kernel-facing validation hooks, and focused kernel cache tests. | Existing kernel invalidation slice; closed evidence remains bounded to invalidation/fencing and does not close writeback durability. |
 | #754 | Clustered cache lease and epoch invalidation plumbing. | `crates/tidefs-cache-coherency/`, `crates/tidefs-lease/`, `crates/tidefs-lease-manager/`, `crates/tidefs-membership-epoch/`, `crates/tidefs-transport/`, and focused lease/transport tests as needed. | Existing cluster invalidation slice; closed evidence remains bounded to invalidation messages and wait policy, not runtime dirty durability. |
 
-## Claim Path Gates
+## Durability Completion Conditions
 
-`local.vfs.page_cache_writeback_authority.v1` may move from authority path to
-validated claim only when evidence shows:
+TFR-008 may close only when runtime behavior shows:
 
 - every dirty lifecycle transition is observable in the relevant runtime path;
 - writeback triggers cover memory pressure, `fsync`/`fdatasync`/`syncfs`,
@@ -494,11 +474,12 @@ validated claim only when evidence shows:
   during replay;
 - runtime crash evidence covers write -> fsync -> read -> crash/recover for the
   local VFS path;
-- no-hidden-queue evidence accounts for dirty bytes, writeback work, and
-  retries.
+- every retained dirty-byte queue accounts for dirty bytes, writeback work,
+  and retries; the direct-I/O FUSE adapter must not grow a hidden byte cache or
+  writeback queue.
 
-Until those gates are met, this document is the current authority vocabulary
-and ordering target only. It is not production durability evidence.
+Until those conditions are met, this document is the current authority
+vocabulary and ordering target only. It is not production durability evidence.
 
 ## Related Work
 
@@ -507,16 +488,5 @@ and ordering target only. It is not production durability evidence.
 - `docs/PAGE_CACHE_INVALIDATION_AUTHORITY.md`: defines the invalidation
   trigger surface, stale-generation rule, and FUSE/kernel/cluster coherency
   lease model.
-- GitHub issue #443 (closed): cache-coherency proof for writeback lifecycle,
-  invalidation, and crash integration. Evidence consumed by this authority
-  document.
-- GitHub issue #445 (closed): intent-log replay idempotency under crash
-  injection. Evidence consumed by this authority document.
-- GitHub issue #486 (closed): local VFS write/fsync/read crash-recover runtime
-  evidence. Bounded to OpFsyncBeforeFlush; consumed by
-  `local.vfs.write_fsync_crash.v1`.
-- `validation/claims.toml`: `local.vfs.page_cache_writeback_authority.v1` is
-  registered as blocked; mounted writeback, mmap, and no-hidden-queue runtime
-  evidence remain required before the claim can validate.
 - GitHub issue #1065: records this integrated survey, authority-model
   comparison, chosen boundary, non-claims, and follow-up implementation map.

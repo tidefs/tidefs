@@ -185,7 +185,9 @@ change those paths.
 - Orphan cleanup may scan versioned key names to discover stale keys in the
   current format, but that scan does not define ordering, reachability, or
   storage-format compatibility.
-- Implementation issues #675 and #676 (now closed) resolved the policy and runtime changes for receipt-driven read/scrub/repair/rebuild consumers and rebake/reclaim trims. This document named the boundary those slices preserved.
+- Receipt-authorized reads and the online verifier consume current content
+  versions. LocalFS has no foreground scrub or corruption-repair consumer;
+  future carrier work must not infer authority from `data_version` ordering.
 
 ## Non-Claims
 

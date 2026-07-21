@@ -132,9 +132,10 @@ pub fn engine_setattr(
         });
     }
 
-    // Read current record.
+    // Metadata-only setattr must not persist the write-buffer-adjusted size;
+    // content size and data_version change only when the buffer is flushed.
     let record = fs
-        .inode(inode_id)
+        .committed_inode_record(inode_id)
         .map_err(|e| SetattrDispatchError::from(&e))?;
     let mut updated = record.clone();
 
@@ -227,7 +228,10 @@ pub fn engine_setattr(
     }
 
     if !changed {
-        return Ok(record.to_inode_attr());
+        let visible = fs
+            .inode(inode_id)
+            .map_err(|e| SetattrDispatchError::from(&e))?;
+        return Ok(visible.to_inode_attr());
     }
 
     fs.begin_mutation();
@@ -247,4 +251,78 @@ pub fn engine_setattr(
         .inode(inode_id)
         .map_err(|e| SetattrDispatchError::from(&e))?;
     Ok(result.to_inode_attr())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn metadata_setattr_preserves_pending_write_content() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let mut fs = LocalFileSystem::open(root.path()).expect("open filesystem");
+        fs.set_auto_commit(false);
+        fs.begin_transaction().expect("begin deferred transaction");
+        fs.set_write_buffer_flush_threshold_bytes(usize::MAX);
+
+        let record = fs
+            .create_file("/pending-write", 0o644)
+            .expect("create file");
+        let payload = b"pending content survives metadata setattr";
+        fs.write_file("/pending-write", 0, payload)
+            .expect("buffer write");
+
+        assert!(
+            fs.write_buffers.contains_key(&record.inode_id),
+            "test setup must leave the write pending"
+        );
+        assert_eq!(
+            fs.committed_inode_record(record.inode_id)
+                .expect("committed inode before setattr")
+                .size,
+            0,
+            "pending content must not already be committed"
+        );
+
+        let no_change = SetAttr {
+            valid: FATTR_MODE,
+            mode: 0o644,
+            ..SetAttr::default()
+        };
+        let attr = engine_setattr(&mut fs, record.inode_id.get(), &no_change)
+            .expect("no-change metadata setattr");
+        assert_eq!(
+            attr.posix.size,
+            payload.len() as u64,
+            "no-change setattr must return the write-buffer-adjusted size"
+        );
+
+        let set = SetAttr {
+            valid: FATTR_MODE,
+            mode: 0o600,
+            ..SetAttr::default()
+        };
+        let attr =
+            engine_setattr(&mut fs, record.inode_id.get(), &set).expect("metadata-only setattr");
+
+        assert_eq!(attr.posix.size, payload.len() as u64);
+        assert!(
+            fs.write_buffers.contains_key(&record.inode_id),
+            "metadata setattr must not flush or discard pending content"
+        );
+        assert_eq!(
+            fs.committed_inode_record(record.inode_id)
+                .expect("committed inode after setattr")
+                .size,
+            0,
+            "metadata setattr must not publish the visible overlay size"
+        );
+        assert_eq!(
+            fs.read_file("/pending-write")
+                .expect("read after metadata setattr"),
+            payload
+        );
+
+        fs.rollback_transaction().expect("rollback test fixture");
+    }
 }

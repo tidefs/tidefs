@@ -97,6 +97,5 @@ pub use crate::ingress::classify_poll_request;
 
 pub use crate::ingress::IngressWriteHandle;
 pub use crate::ingress::IngressWriteHandleTable;
-pub use crate::ingress::FUSE_WRITE_CACHE;
 pub use crate::ingress::FUSE_WRITE_KILL_PRIV;
 pub use crate::ingress::FUSE_WRITE_LOCKOWNER;

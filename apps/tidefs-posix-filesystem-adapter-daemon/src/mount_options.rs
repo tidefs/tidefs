@@ -28,9 +28,9 @@ pub enum TimestampPolicy {
 impl TimestampPolicy {
     /// Return the FUSE kernel mount option needed for this timestamp policy.
     ///
-    /// The daemon also records read access in the backing VFS engine, but the
-    /// kernel still needs the matching mount flag for reads served from its
-    /// page cache without crossing the daemon boundary.
+    /// The daemon also records read access in the backing VFS engine. Regular
+    /// file opens force FUSE direct I/O, while this option preserves the
+    /// corresponding kernel VFS timestamp policy for the mount.
     pub fn to_fuse_mount_option(self) -> Option<fuser::MountOption> {
         match self {
             TimestampPolicy::StrictAtime => Some(fuser::MountOption::StrictAtime),

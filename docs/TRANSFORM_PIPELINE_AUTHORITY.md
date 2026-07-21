@@ -257,15 +257,11 @@ changes belong to the non-overlapping follow-up rows below.
 |---|---|---|
 | Lower pool transform dispatch is not yet one named authority. | #779 | `crates/tidefs-local-object-store/src/pool/mod.rs`, a new pool transform module, `crates/tidefs-local-object-store/src/device.rs`, and narrow helper-crate adapters if needed. |
 | Transform metadata persistence needs one typed handoff from frame metadata to locator, integrity trailer, or placement receipt evidence. | #779 | Same lower-pool transform module, local-object-store receipt/trailer adapters, and narrow helper-crate adapters needed by that dispatcher. |
-| Mounted content scrub/read needs plaintext identity with checksum and receipt evidence. | #650 | `crates/tidefs-local-filesystem/src/content.rs` and focused local-filesystem helper/tests. |
-| Local scrub still needs to consume the mounted content identity authority. | #651 | `crates/tidefs-local-filesystem/src/scrub.rs` and focused scrub tests. |
-| Repair dispatch must require transform-aware scrub evidence before writeback. | #652 | `crates/tidefs-local-filesystem/src/scrub_repair_integration.rs`, `crates/tidefs-local-filesystem/src/repair.rs`, and scrub-core evidence types only if needed. |
 | Crash-matrix raw staging must be isolated as validation-only. | #692 | `crates/tidefs-local-filesystem/src/crash_recovery.rs`, the mounted raw-store inventory, and TFR-006 register notes. |
-| Placement, degraded read, scrub, repair, and rebuild consumers must use receipt authority rather than raw topology scans. | #18 and #675 | Receipt/locator/rebuild models plus the local-filesystem, scrub, and rebuild consumers named by those issues. |
+| Placement, degraded read, scrub, and rebuild consumers must use receipt authority rather than raw topology scans. | #18 and #675 | Receipt/locator/rebuild models plus the local-filesystem, scrub, and rebuild consumers named by those issues. |
 | Distributed primary writes must not create a second placement authority beside local receipts. | #674 | `apps/tidefs-storage-node/src/`, `crates/tidefs-replicated-object-store/`, and `crates/tidefs-transport/`. |
 | Reclaim and rebake must consume replacement/base receipt evidence before trimming physical storage. | #605 and #676 | `crates/tidefs-reclaim/`, `crates/tidefs-reclaim-queue-core/`, and local-object-store reclaim/replay surfaces. |
 | Durable receive must validate receive contracts before persisting or promoting received objects. | #566 and PR #623 | `crates/tidefs-receive-stream/`, local receive integration, and two-node receive harness paths named there. |
-| Scrub block identity needs a documentation-only data_version boundary. | #742 | `docs/SCRUB_IDENTITY_AUTHORITY.md` and narrow TFR-005 cross-references. |
 
 If later source inspection finds a production raw-store path not covered by
 the rows above, create or update a focused issue with a non-overlapping

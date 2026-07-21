@@ -172,10 +172,6 @@ pub mod ingress;
 #[cfg(feature = "fuse")]
 pub mod capacity;
 
-// ── P5-02 scheduler smoke ─────────────────────────────────────────────────
-#[cfg(feature = "fuse")]
-pub mod scheduler;
-
 // ── P5-02 fusewire smoke ──────────────────────────────────────────────────
 #[cfg(feature = "fuse")]
 pub mod fusewire;

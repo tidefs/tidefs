@@ -1260,7 +1260,7 @@ mod tests {
     #[test]
     fn ignores_non_text_code_identifiers() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("scripts/tidefs-mmap-workload.c");
+        let path = dir.path().join("scripts/identifier-fixture.c");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, "char dummy = vp[PAGE + 1];\n(void)dummy;\n").unwrap();
 

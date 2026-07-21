@@ -92,9 +92,7 @@ impl From<&FileSystemError> for XattrDispatchError {
             FileSystemError::AlreadyExists { .. } => Self::AlreadyExists,
             FileSystemError::InvalidName { .. } => Self::Invalid,
             FileSystemError::NoSpace { .. } => Self::NoSpace,
-            FileSystemError::CorruptState { .. } | FileSystemError::CorruptContent { .. } => {
-                Self::Io
-            }
+            FileSystemError::CorruptState { .. } => Self::Io,
             FileSystemError::AclValidationFailed { .. } => Self::Invalid,
             _ => Self::Io,
         }

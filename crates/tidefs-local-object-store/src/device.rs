@@ -17,7 +17,7 @@ use crate::compress::CompressionConfig;
 use crate::encrypt::EncryptionConfig;
 use std::cell::Cell;
 use std::cell::RefCell;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -521,6 +521,30 @@ pub trait DeviceImpl {
     fn supports_discard(&self) -> bool {
         self.discard_capability().is_supported()
     }
+}
+
+/// One physical leaf/key pair belonging to a logical object on a device.
+///
+/// Pool receipt authority uses this identity when a composite device stores
+/// several independently observable copies (mirror) or several encoded
+/// fragments (parity).  The leaf index is local to the top-level [`Device`].
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct DeviceObjectFragment {
+    pub(crate) leaf_index: usize,
+    pub(crate) key: ObjectKey,
+}
+
+/// One independently observed logical placement-receipt candidate.
+///
+/// Mirrors return one candidate per readable leg so stale, newer, conflicting,
+/// and corrupt copies cannot be hidden by normal mirror read failover.  Parity
+/// devices return reconstructed logical bytes plus every physical fragment
+/// that accounted for that candidate.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DeviceReceiptCandidate {
+    pub(crate) storage_key: ObjectKey,
+    pub(crate) payload: Vec<u8>,
+    pub(crate) fragments: Vec<DeviceObjectFragment>,
 }
 
 fn store_error_counts_as_device_write_fault(error: &StoreError) -> bool {
@@ -1287,28 +1311,43 @@ impl DeviceImpl for MirrorDevice {
     }
 
     fn delete(&mut self, key: ObjectKey) -> Result<bool> {
-        let mut last_result: Option<bool> = None;
+        if self.members.is_empty() {
+            return Err(StoreError::Io {
+                operation: "mirror_delete",
+                path: PathBuf::from("<mirror>"),
+                source: std::io::Error::other("mirror: no children configured"),
+            });
+        }
+
+        let mut existed = false;
+        let mut last_error = None;
         for member in &mut self.members {
-            if member.status.state != DeviceState::Online {
-                continue;
+            match member.delete(key) {
+                Ok(was_present) => existed |= was_present,
+                Err(error) => last_error = Some(error),
             }
-            if let Ok(existed) = member.delete(key) {
-                last_result = Some(existed);
+        }
+        for member in &self.members {
+            match member.get(key) {
+                Ok(None) => {}
+                Ok(Some(_)) => {
+                    last_error = Some(StoreError::InvalidOptions {
+                        reason: "mirror delete left an attached physical copy",
+                    });
+                }
+                Err(error) => last_error = Some(error),
             }
         }
         self.recompute_state();
-        last_result.ok_or_else(|| StoreError::Io {
-            operation: "mirror_delete",
-            path: PathBuf::from("<mirror>"),
-            source: std::io::Error::other("mirror: no healthy members for delete"),
-        })
+        last_error.map_or(Ok(existed), Err)
     }
 
     fn sync_all(&mut self) -> Result<()> {
         for member in &mut self.members {
-            if member.status.state == DeviceState::Online {
-                member.sync_all()?;
-            }
+            // Every attached mirror leg participates in deletion durability.
+            // Health affects read/write preference, not whether a tombstone
+            // may be skipped at the persistence barrier.
+            member.sync_all()?;
         }
         Ok(())
     }
@@ -1668,11 +1707,13 @@ impl DeviceImpl for ParityRaidDevice {
         let total = stripes.len();
         let mut last_ok: Option<StoredObject> = None;
         let mut ok_count = 0;
+        let mut written_columns = Vec::new();
         for (i, stripe) in stripes.iter().enumerate().take(total) {
             let col_key = Self::column_key(key, i as u8);
             match self.children[i].put(col_key, stripe) {
                 Ok(obj) => {
                     ok_count += 1;
+                    written_columns.push(i);
                     last_ok = Some(obj);
                 }
                 Err(_e) => {
@@ -1685,11 +1726,22 @@ impl DeviceImpl for ParityRaidDevice {
         self.write_ops = self.write_ops.saturating_add(1);
         self.row_sequence = self.row_sequence.saturating_add(1);
         self.evaluate_health();
-        if ok_count == 0 {
+        if ok_count < usize::from(self.n_data) {
+            // Fewer than n_data columns can never reconstruct the acknowledged
+            // logical object. Best-effort rollback keeps the failed write from
+            // leaving a plausible length marker plus partial authority; any
+            // rollback error remains visible through later fragment scans.
+            for i in written_columns {
+                let _ = self.children[i].delete(Self::column_key(key, i as u8));
+            }
+            let _ = self.children[0].delete(len_key);
             Err(StoreError::Io {
                 operation: "parity_raid_put",
                 path: PathBuf::from("<parity_raid>"),
-                source: std::io::Error::other("parity_raid: no healthy children for write"),
+                source: std::io::Error::other(format!(
+                    "parity_raid: only {ok_count}/{total} columns succeeded; {} required",
+                    self.n_data
+                )),
             })
         } else {
             let mut obj = last_ok.unwrap();
@@ -1788,17 +1840,43 @@ impl DeviceImpl for ParityRaidDevice {
 
     fn delete(&mut self, key: ObjectKey) -> Result<bool> {
         let mut existed = false;
+        let mut last_error = None;
         for i in 0..self.children.len() {
             let col_key = Self::column_key(key, i as u8);
-            if self.children[i].delete(col_key).unwrap_or(false) {
-                existed = true;
+            match self.children[i].delete(col_key) {
+                Ok(was_present) => existed |= was_present,
+                Err(error) => last_error = Some(error),
             }
         }
         let len_key = Self::len_key(key);
-        let _ = self.children[0].delete(len_key);
+        match self.children[0].delete(len_key) {
+            Ok(was_present) => existed |= was_present,
+            Err(error) => last_error = Some(error),
+        }
+        for i in 0..self.children.len() {
+            let col_key = Self::column_key(key, i as u8);
+            match self.children[i].get(col_key) {
+                Ok(None) => {}
+                Ok(Some(_)) => {
+                    last_error = Some(StoreError::InvalidOptions {
+                        reason: "parity delete left an attached physical fragment",
+                    });
+                }
+                Err(error) => last_error = Some(error),
+            }
+        }
+        match self.children[0].get(len_key) {
+            Ok(None) => {}
+            Ok(Some(_)) => {
+                last_error = Some(StoreError::InvalidOptions {
+                    reason: "parity delete left an attached physical length fragment",
+                });
+            }
+            Err(error) => last_error = Some(error),
+        }
         self.delete_ops = self.delete_ops.saturating_add(1);
         self.evaluate_health();
-        Ok(existed)
+        last_error.map_or(Ok(existed), Err)
     }
 
     fn sync_all(&mut self) -> Result<()> {
@@ -2645,6 +2723,249 @@ impl DeviceImpl for EncryptedDevice {
     }
 }
 
+fn invalid_receipt_fragments() -> StoreError {
+    StoreError::InvalidOptions {
+        reason: "placement receipt physical fragments corrupt or unverifiable",
+    }
+}
+
+fn object_candidates_from_leaf(
+    device: &dyn DeviceImpl,
+    leaf_index: usize,
+    key_matches: fn(ObjectKey) -> bool,
+) -> Result<Vec<DeviceReceiptCandidate>> {
+    let mut candidates = Vec::new();
+    for key in device.store().list_keys_including_internal() {
+        if !key_matches(key) {
+            continue;
+        }
+        let payload = device.get(key)?.ok_or_else(invalid_receipt_fragments)?;
+        candidates.push(DeviceReceiptCandidate {
+            storage_key: key,
+            payload,
+            fragments: vec![DeviceObjectFragment { leaf_index, key }],
+        });
+    }
+    Ok(candidates)
+}
+
+fn object_candidates_from_leaf_for_key(
+    device: &dyn DeviceImpl,
+    leaf_index: usize,
+    key: ObjectKey,
+) -> Result<Vec<DeviceReceiptCandidate>> {
+    let Some(payload) = device.get(key)? else {
+        return Ok(Vec::new());
+    };
+    Ok(vec![DeviceReceiptCandidate {
+        storage_key: key,
+        payload,
+        fragments: vec![DeviceObjectFragment { leaf_index, key }],
+    }])
+}
+
+fn mirror_object_candidates(
+    mirror: &MirrorDevice,
+    key_matches: fn(ObjectKey) -> bool,
+) -> Result<Vec<DeviceReceiptCandidate>> {
+    let mut candidates = Vec::new();
+    for (leaf_index, member) in mirror.members.iter().enumerate() {
+        candidates.extend(object_candidates_from_leaf(
+            member,
+            leaf_index,
+            key_matches,
+        )?);
+    }
+    Ok(candidates)
+}
+
+fn mirror_object_candidates_for_key(
+    mirror: &MirrorDevice,
+    key: ObjectKey,
+) -> Result<Vec<DeviceReceiptCandidate>> {
+    let mut candidates = Vec::new();
+    for (leaf_index, member) in mirror.members.iter().enumerate() {
+        candidates.extend(object_candidates_from_leaf_for_key(
+            member, leaf_index, key,
+        )?);
+    }
+    Ok(candidates)
+}
+
+fn parity_candidate_matches_fragments(
+    raid: &ParityRaidDevice,
+    storage_key: ObjectKey,
+    payload: &[u8],
+    physical: &[(DeviceObjectFragment, Vec<u8>)],
+) -> bool {
+    use crate::parity_raid::ParityRaidLayout;
+
+    let Ok(stripes) = ParityRaidLayout::stripe_write(payload, raid.n_data, raid.n_parity) else {
+        return false;
+    };
+    let expected_len = (payload.len() as u64).to_le_bytes();
+    physical.iter().all(|(fragment, bytes)| {
+        if fragment.leaf_index == 0 && fragment.key == ParityRaidDevice::len_key(storage_key) {
+            return bytes.as_slice() == expected_len;
+        }
+        let leaf_index = fragment.leaf_index;
+        fragment.key == ParityRaidDevice::column_key(storage_key, leaf_index as u8)
+            && stripes
+                .get(leaf_index)
+                .is_some_and(|expected| expected == bytes)
+    })
+}
+
+fn parity_object_candidates(
+    raid: &ParityRaidDevice,
+    key_matches: fn(ObjectKey) -> bool,
+) -> Result<Vec<DeviceReceiptCandidate>> {
+    let mut physical = Vec::new();
+    for (leaf_index, child) in raid.children.iter().enumerate() {
+        for key in child.store().list_keys_including_internal() {
+            if !key_matches(key) {
+                continue;
+            }
+            let payload = child.get(key)?.ok_or_else(invalid_receipt_fragments)?;
+            physical.push((DeviceObjectFragment { leaf_index, key }, payload));
+        }
+    }
+
+    // A parity logical object is named by its reversible eight-byte length
+    // marker on child zero.  Column and length keys preserve the receipt
+    // prefix, so decoding every prefixed physical key directly would invent
+    // false receipts.  Recover only bases proven by an exact length marker.
+    let logical_keys: BTreeSet<ObjectKey> = physical
+        .iter()
+        .filter(|(fragment, payload)| fragment.leaf_index == 0 && payload.len() == 8)
+        .map(|(fragment, _)| ParityRaidDevice::len_key(fragment.key))
+        .collect();
+
+    let mut accounted = BTreeSet::new();
+    let mut candidates = Vec::new();
+    for storage_key in logical_keys {
+        let expected: BTreeSet<DeviceObjectFragment> = std::iter::once(DeviceObjectFragment {
+            leaf_index: 0,
+            key: ParityRaidDevice::len_key(storage_key),
+        })
+        .chain(
+            (0..raid.children.len()).map(|leaf_index| DeviceObjectFragment {
+                leaf_index,
+                key: ParityRaidDevice::column_key(storage_key, leaf_index as u8),
+            }),
+        )
+        .collect();
+        let candidate_physical: Vec<(DeviceObjectFragment, Vec<u8>)> = physical
+            .iter()
+            .filter(|(fragment, _)| expected.contains(fragment))
+            .cloned()
+            .collect();
+        let fragments: Vec<DeviceObjectFragment> = candidate_physical
+            .iter()
+            .map(|(fragment, _)| *fragment)
+            .collect();
+        accounted.extend(fragments.iter().copied());
+
+        let payload = raid
+            .get(storage_key)?
+            .ok_or_else(invalid_receipt_fragments)?;
+        if !parity_candidate_matches_fragments(raid, storage_key, &payload, &candidate_physical) {
+            return Err(invalid_receipt_fragments());
+        }
+        candidates.push(DeviceReceiptCandidate {
+            storage_key,
+            payload,
+            fragments,
+        });
+    }
+
+    if physical
+        .iter()
+        .any(|(fragment, _)| !accounted.contains(fragment))
+    {
+        return Err(invalid_receipt_fragments());
+    }
+    Ok(candidates)
+}
+
+fn parity_object_candidates_for_key(
+    raid: &ParityRaidDevice,
+    storage_key: ObjectKey,
+) -> Result<Vec<DeviceReceiptCandidate>> {
+    let mut physical = Vec::new();
+    let len_key = ParityRaidDevice::len_key(storage_key);
+    let len_payload = raid.children[0].get(len_key)?;
+    if len_payload
+        .as_ref()
+        .is_some_and(|payload| payload.len() != 8)
+    {
+        return Err(invalid_receipt_fragments());
+    }
+    if let Some(payload) = len_payload.as_ref() {
+        physical.push((
+            DeviceObjectFragment {
+                leaf_index: 0,
+                key: len_key,
+            },
+            payload.clone(),
+        ));
+    }
+    for (leaf_index, child) in raid.children.iter().enumerate() {
+        let key = ParityRaidDevice::column_key(storage_key, leaf_index as u8);
+        if let Some(payload) = child.get(key)? {
+            physical.push((DeviceObjectFragment { leaf_index, key }, payload));
+        }
+    }
+
+    if physical.is_empty() {
+        return Ok(Vec::new());
+    }
+    if len_payload.is_none() {
+        return Err(invalid_receipt_fragments());
+    }
+    let payload = raid
+        .get(storage_key)?
+        .ok_or_else(invalid_receipt_fragments)?;
+    if !parity_candidate_matches_fragments(raid, storage_key, &payload, &physical) {
+        return Err(invalid_receipt_fragments());
+    }
+    Ok(vec![DeviceReceiptCandidate {
+        storage_key,
+        payload,
+        fragments: physical.into_iter().map(|(fragment, _)| fragment).collect(),
+    }])
+}
+
+fn decode_compressed_receipt_candidate(framed: &[u8]) -> Result<Vec<u8>> {
+    crate::compress::decompress_frame(framed).map_err(|_| invalid_receipt_fragments())
+}
+
+fn decode_compressed_receipt_candidates(
+    candidates: Vec<DeviceReceiptCandidate>,
+) -> Result<Vec<DeviceReceiptCandidate>> {
+    candidates
+        .into_iter()
+        .map(|mut candidate| {
+            candidate.payload = decode_compressed_receipt_candidate(&candidate.payload)?;
+            Ok(candidate)
+        })
+        .collect()
+}
+
+fn decrypt_receipt_candidates(
+    candidates: Vec<DeviceReceiptCandidate>,
+    config: &EncryptionConfig,
+) -> Result<Vec<DeviceReceiptCandidate>> {
+    candidates
+        .into_iter()
+        .map(|mut candidate| {
+            candidate.payload = crate::encrypt::decrypt_object(&config.key, &candidate.payload)
+                .ok_or_else(invalid_receipt_fragments)?;
+            Ok(candidate)
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Device — public enum handle
 // ---------------------------------------------------------------------------
@@ -2664,6 +2985,271 @@ pub enum Device {
 }
 
 impl Device {
+    fn require_complete_logical_candidates(
+        &self,
+        candidates: Vec<DeviceReceiptCandidate>,
+    ) -> Result<Vec<DeviceReceiptCandidate>> {
+        let mut grouped: BTreeMap<ObjectKey, (Vec<u8>, BTreeSet<DeviceObjectFragment>)> =
+            BTreeMap::new();
+        for candidate in candidates {
+            let entry = grouped
+                .entry(candidate.storage_key)
+                .or_insert_with(|| (candidate.payload.clone(), BTreeSet::new()));
+            if entry.0 != candidate.payload {
+                return Err(invalid_receipt_fragments());
+            }
+            entry.1.extend(candidate.fragments);
+        }
+
+        grouped
+            .into_iter()
+            .map(|(storage_key, (payload, fragments))| {
+                let expected: BTreeSet<_> = self
+                    .physical_fragments_for_key(storage_key)
+                    .into_iter()
+                    .collect();
+                if fragments != expected {
+                    return Err(invalid_receipt_fragments());
+                }
+                Ok(DeviceReceiptCandidate {
+                    storage_key,
+                    payload,
+                    fragments: fragments.into_iter().collect(),
+                })
+            })
+            .collect()
+    }
+
+    /// Enumerate logical objects whose reserved storage keys match a caller
+    /// supplied internal namespace predicate.
+    ///
+    /// Composite devices are inspected below normal read failover so callers
+    /// can detect conflicting mirror legs and incomplete parity fragments.
+    pub(crate) fn logical_object_candidates_matching(
+        &self,
+        key_matches: fn(ObjectKey) -> bool,
+    ) -> Result<Vec<DeviceReceiptCandidate>> {
+        match self {
+            Device::Single(device) => object_candidates_from_leaf(device, 0, key_matches),
+            Device::Mirror(device) => mirror_object_candidates(device, key_matches),
+            Device::Compressed(device) => decode_compressed_receipt_candidates(
+                device
+                    .inner
+                    .logical_object_candidates_matching(key_matches)?,
+            ),
+            Device::Encrypted(device) => decrypt_receipt_candidates(
+                device
+                    .inner
+                    .logical_object_candidates_matching(key_matches)?,
+                &device.config,
+            ),
+            Device::LogDevice(device) => object_candidates_from_leaf(device, 0, key_matches),
+            Device::ParityRaid1(device)
+            | Device::ParityRaid2(device)
+            | Device::ParityRaid3(device) => parity_object_candidates(device, key_matches),
+        }
+    }
+
+    /// Enumerate every independently observable logical placement-receipt
+    /// candidate on this top-level device.
+    ///
+    /// This bypasses normal mirror failover and parity physical-key layout so
+    /// pool authority selection sees every copy without decoding column or
+    /// length artifacts as receipts.  Any listed prefixed fragment that cannot
+    /// be read, reconstructed, or accounted for makes the scan fail closed.
+    pub(crate) fn placement_receipt_candidates(&self) -> Result<Vec<DeviceReceiptCandidate>> {
+        let candidates =
+            self.logical_object_candidates_matching(crate::is_pool_placement_receipt_key)?;
+        self.require_complete_logical_candidates(candidates)
+    }
+
+    /// Observe every physical copy or reconstructable fragment set for one
+    /// exact logical placement-receipt storage key.
+    pub(crate) fn logical_object_candidates_for_key(
+        &self,
+        key: ObjectKey,
+    ) -> Result<Vec<DeviceReceiptCandidate>> {
+        match self {
+            Device::Single(device) => object_candidates_from_leaf_for_key(device, 0, key),
+            Device::Mirror(device) => mirror_object_candidates_for_key(device, key),
+            Device::Compressed(device) => decode_compressed_receipt_candidates(
+                device.inner.logical_object_candidates_for_key(key)?,
+            ),
+            Device::Encrypted(device) => decrypt_receipt_candidates(
+                device.inner.logical_object_candidates_for_key(key)?,
+                &device.config,
+            ),
+            Device::LogDevice(device) => object_candidates_from_leaf_for_key(device, 0, key),
+            Device::ParityRaid1(device)
+            | Device::ParityRaid2(device)
+            | Device::ParityRaid3(device) => parity_object_candidates_for_key(device, key),
+        }
+    }
+
+    /// Read one logical object only when every physical leaf fragment is
+    /// present and every independently observable copy decodes to identical
+    /// bytes.
+    pub(crate) fn exact_logical_object_for_key(
+        &self,
+        key: ObjectKey,
+    ) -> Result<Option<DeviceReceiptCandidate>> {
+        let candidates = self.logical_object_candidates_for_key(key)?;
+        let mut exact = self.require_complete_logical_candidates(candidates)?;
+        match exact.len() {
+            0 => Ok(None),
+            1 => Ok(exact.pop()),
+            _ => Err(invalid_receipt_fragments()),
+        }
+    }
+
+    /// Return all currently indexed physical leaf/key fragments.
+    pub(crate) fn physical_object_fragments(&self) -> Vec<DeviceObjectFragment> {
+        match self {
+            Device::Single(device) => device
+                .store()
+                .list_keys_including_internal()
+                .into_iter()
+                .map(|key| DeviceObjectFragment { leaf_index: 0, key })
+                .collect(),
+            Device::Mirror(device) => device
+                .members
+                .iter()
+                .enumerate()
+                .flat_map(|(leaf_index, member)| {
+                    member
+                        .store()
+                        .list_keys_including_internal()
+                        .into_iter()
+                        .map(move |key| DeviceObjectFragment { leaf_index, key })
+                })
+                .collect(),
+            Device::Compressed(device) => device.inner.physical_object_fragments(),
+            Device::Encrypted(device) => device.inner.physical_object_fragments(),
+            Device::LogDevice(device) => device
+                .store()
+                .list_keys_including_internal()
+                .into_iter()
+                .map(|key| DeviceObjectFragment { leaf_index: 0, key })
+                .collect(),
+            Device::ParityRaid1(device)
+            | Device::ParityRaid2(device)
+            | Device::ParityRaid3(device) => device
+                .children
+                .iter()
+                .enumerate()
+                .flat_map(|(leaf_index, child)| {
+                    child
+                        .store()
+                        .list_keys_including_internal()
+                        .into_iter()
+                        .map(move |key| DeviceObjectFragment { leaf_index, key })
+                })
+                .collect(),
+        }
+    }
+
+    /// Return every physical fragment location used for one logical object.
+    pub(crate) fn physical_fragments_for_key(&self, key: ObjectKey) -> Vec<DeviceObjectFragment> {
+        match self {
+            Device::Single(_) | Device::LogDevice(_) => {
+                vec![DeviceObjectFragment { leaf_index: 0, key }]
+            }
+            Device::Mirror(device) => (0..device.members.len())
+                .map(|leaf_index| DeviceObjectFragment { leaf_index, key })
+                .collect(),
+            Device::Compressed(device) => device.inner.physical_fragments_for_key(key),
+            Device::Encrypted(device) => device.inner.physical_fragments_for_key(key),
+            Device::ParityRaid1(device)
+            | Device::ParityRaid2(device)
+            | Device::ParityRaid3(device) => std::iter::once(DeviceObjectFragment {
+                leaf_index: 0,
+                key: ParityRaidDevice::len_key(key),
+            })
+            .chain(
+                (0..device.children.len()).map(|leaf_index| DeviceObjectFragment {
+                    leaf_index,
+                    key: ParityRaidDevice::column_key(key, leaf_index as u8),
+                }),
+            )
+            .collect(),
+        }
+    }
+
+    pub(crate) fn physical_store(&self, leaf_index: usize) -> Option<&LocalObjectStore> {
+        match self {
+            Device::Single(device) => (leaf_index == 0).then(|| device.store()),
+            Device::Mirror(device) => device.members.get(leaf_index).map(DeviceImpl::store),
+            Device::Compressed(device) => device.inner.physical_store(leaf_index),
+            Device::Encrypted(device) => device.inner.physical_store(leaf_index),
+            Device::LogDevice(device) => (leaf_index == 0).then(|| device.store()),
+            Device::ParityRaid1(device)
+            | Device::ParityRaid2(device)
+            | Device::ParityRaid3(device) => device.children.get(leaf_index).map(DeviceImpl::store),
+        }
+    }
+
+    pub(crate) fn physical_store_mut(
+        &mut self,
+        leaf_index: usize,
+    ) -> Option<&mut LocalObjectStore> {
+        match self {
+            Device::Single(device) => (leaf_index == 0).then(|| device.store_mut()),
+            Device::Mirror(device) => device
+                .members
+                .get_mut(leaf_index)
+                .map(DeviceImpl::store_mut),
+            Device::Compressed(device) => device.inner.physical_store_mut(leaf_index),
+            Device::Encrypted(device) => device.inner.physical_store_mut(leaf_index),
+            Device::LogDevice(device) => (leaf_index == 0).then(|| device.store_mut()),
+            Device::ParityRaid1(device)
+            | Device::ParityRaid2(device)
+            | Device::ParityRaid3(device) => device
+                .children
+                .get_mut(leaf_index)
+                .map(DeviceImpl::store_mut),
+        }
+    }
+
+    pub(crate) fn physical_leaf_count(&self) -> usize {
+        match self {
+            Device::Single(_) | Device::LogDevice(_) => 1,
+            Device::Mirror(device) => device.members.len(),
+            Device::Compressed(device) => device.inner.physical_leaf_count(),
+            Device::Encrypted(device) => device.inner.physical_leaf_count(),
+            Device::ParityRaid1(device)
+            | Device::ParityRaid2(device)
+            | Device::ParityRaid3(device) => device.children.len(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn physical_store_for_test(&self, leaf_index: usize) -> Option<&LocalObjectStore> {
+        self.physical_store(leaf_index)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn physical_store_mut_for_test(
+        &mut self,
+        leaf_index: usize,
+    ) -> Option<&mut LocalObjectStore> {
+        match self {
+            Device::Single(device) => (leaf_index == 0).then(|| device.store_mut()),
+            Device::Mirror(device) => device
+                .members
+                .get_mut(leaf_index)
+                .map(DeviceImpl::store_mut),
+            Device::Compressed(device) => device.inner.physical_store_mut_for_test(leaf_index),
+            Device::Encrypted(device) => device.inner.physical_store_mut_for_test(leaf_index),
+            Device::LogDevice(device) => (leaf_index == 0).then(|| device.store_mut()),
+            Device::ParityRaid1(device)
+            | Device::ParityRaid2(device)
+            | Device::ParityRaid3(device) => device
+                .children
+                .get_mut(leaf_index)
+                .map(DeviceImpl::store_mut),
+        }
+    }
+
     /// Run an incremental background integrity scrub on this device's store.
     ///
     /// Delegates to [`LocalObjectStore::run_background_scrub`]. The scrub

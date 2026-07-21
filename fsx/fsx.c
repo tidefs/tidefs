@@ -1,8 +1,11 @@
-/* FUSE mmap/fsx file exerciser with mmap operations.
+/* FUSE file exerciser with explicit mmap outcome policy.
  *
  * Performs randomized read/write/mmap-write/truncate/append operations
  * with fsync after each op, followed by a full data-integrity verification
- * pass.  Designed for FUSE mmap/fsx/fsstress validation.
+ * pass. By default every attempted mmap must succeed. Mounted direct-I/O
+ * callers can pass --expect-mmap-refused to require every mmap attempt to be
+ * rejected while the ordinary read/write/truncate/fsync operations still
+ * complete correctly.
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -23,6 +26,13 @@ static unsigned long file_len = 0;
 static unsigned long page_size = 4096;
 static int mmap_ops = 0;
 static int mmap_failures = 0;
+static int expect_mmap_refused = 0;
+
+static void usage(void)
+{
+	fprintf(stderr,
+		"Usage: fsx [-N nops] [-S seed] [--expect-mmap-refused] <testfile>\n");
+}
 
 static unsigned long xrand(unsigned long max)
 {
@@ -118,8 +128,7 @@ static int mmap_write_op(int fd, unsigned long off, unsigned long len)
 int main(int argc, char **argv)
 {
 	if (argc < 2) {
-		fprintf(stderr,
-			"Usage: fsx [-N nops] [-S seed] <testfile>\n");
+		usage();
 		return 1;
 	}
 
@@ -132,13 +141,18 @@ int main(int argc, char **argv)
 			nops = atoi(argv[++i]);
 		else if (strcmp(argv[i], "-S") == 0 && i + 1 < argc)
 			seed = (unsigned)atoi(argv[++i]);
+		else if (strcmp(argv[i], "--expect-mmap-refused") == 0)
+			expect_mmap_refused = 1;
+		else if (argv[i][0] == '-') {
+			usage();
+			return 1;
+		}
 		else
 			path = argv[i];
 	}
 
 	if (!path) {
-		fprintf(stderr,
-			"Usage: fsx [-N nops] [-S seed] <testfile>\n");
+		usage();
 		return 1;
 	}
 
@@ -257,8 +271,23 @@ int main(int argc, char **argv)
 	}
 
 	int rc = check_file(fd);
+	if (expect_mmap_refused) {
+		if (mmap_ops == 0 || mmap_failures != mmap_ops) {
+			fprintf(stderr,
+				"MMAP REFUSAL MISMATCH: attempted=%d refused=%d\n",
+				mmap_ops, mmap_failures);
+			rc = 1;
+		}
+	} else if (mmap_failures != 0) {
+		fprintf(stderr,
+			"MMAP FAILURE: attempted=%d failed=%d\n",
+			mmap_ops, mmap_failures);
+		rc = 1;
+	}
 	close(fd);
-	fprintf(stderr, "fsx: %d ops %d mmap %d mmap_fail %s\n",
-		nops, mmap_ops, mmap_failures, rc ? "FAIL" : "PASS");
+	fprintf(stderr, "fsx: %d ops %d mmap %d mmap_fail mode=%s %s\n",
+		nops, mmap_ops, mmap_failures,
+		expect_mmap_refused ? "refused" : "required",
+		rc ? "FAIL" : "PASS");
 	return rc;
 }

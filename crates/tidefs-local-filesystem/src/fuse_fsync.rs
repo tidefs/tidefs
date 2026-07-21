@@ -29,7 +29,7 @@ use crate::LocalFileSystem;
 /// The trait is hosted with the local-filesystem fsync dispatch so handle
 /// validation, errno mapping, and durability barriers share one call contract.
 /// Current implementations include [`LocalFsDirtyFlush`] for
-/// [`LocalFileSystem`] and the adapter daemon's `PageCacheDirtyFlush` bridge.
+/// [`LocalFileSystem`] and the adapter daemon's engine-backed bridge.
 /// Broader recovery/fsync/writeback/mmap authority remains tracked by
 /// TFR-008.
 pub trait DirtyFlush {
@@ -127,7 +127,7 @@ fn validate_handle(
 /// # Parameters
 ///
 /// - `dirty_flush`: the flush implementation, such as [`LocalFsDirtyFlush`]
-///   or the adapter daemon's `PageCacheDirtyFlush` bridge.
+///   or the adapter daemon's engine-backed bridge.
 /// - `fh`: the engine file handle obtained from `engine_open`.
 /// - `datasync`: if true, only data pages are flushed; metadata may be
 ///   skipped.

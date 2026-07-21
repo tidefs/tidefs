@@ -274,17 +274,6 @@ fn check_service_registrations(root: &Path, missing: &mut Vec<String>) {
         missing,
     );
 
-    check_source_markers(
-        root,
-        "crates/tidefs-local-filesystem/src/lib.rs",
-        &[
-            "BackgroundScrubber",
-            "impl BackgroundService for BackgroundScrubber",
-            "ServicePriority::Critical",
-        ],
-        missing,
-    );
-
     // Model-surface crate existence checks (not integration validation).
     // The live mounted-pool reclaim authority is LocalObjectStore::drain_dead_segments.
     for rel in [
@@ -322,16 +311,6 @@ fn check_priority_ordering_in_registrations(root: &Path, missing: &mut Vec<Strin
         &[
             "impl BackgroundService for BackgroundOrphanReclamation",
             "fn priority",
-            "ServicePriority::Critical",
-        ],
-        missing,
-    );
-
-    check_source_markers(
-        root,
-        "crates/tidefs-local-filesystem/src/lib.rs",
-        &[
-            "impl BackgroundService for BackgroundScrubber",
             "ServicePriority::Critical",
         ],
         missing,

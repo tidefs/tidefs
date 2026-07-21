@@ -187,8 +187,6 @@ pub static HIST_READ: LazyLock<LatencyHistogram> = LazyLock::new(LatencyHistogra
 /// Metadata operations (lookup, getattr, setattr, readdir, opendir, statfs)
 /// aggregate latency histogram.
 pub static HIST_METADATA: LazyLock<LatencyHistogram> = LazyLock::new(LatencyHistogram::new);
-/// Scheduler cycle (background work dispatch) latency histogram.
-pub static HIST_BG_SCHEDULER: LazyLock<LatencyHistogram> = LazyLock::new(LatencyHistogram::new);
 
 /// Reason class recorded by the FUSE governor-admission boundary.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -325,7 +323,6 @@ pub fn emit_all_summaries() {
     HIST_CREATE.emit_summary("fuse_create");
     HIST_READ.emit_summary("fuse_read");
     HIST_METADATA.emit_summary("fuse_metadata");
-    HIST_BG_SCHEDULER.emit_summary("bg_scheduler_cycle");
     crate::observability::emit_commit_group_summary();
 }
 
@@ -349,33 +346,6 @@ impl HistogramSnapshot {
             self.sum_ns / self.count / 1_000
         }
     }
-}
-
-// ---------------------------------------------------------------------------
-// BackgroundSchedulerSnapshot — scheduler observability
-// ---------------------------------------------------------------------------
-
-/// A point-in-time snapshot of background scheduler statistics.
-#[derive(Debug, Clone, Copy)]
-#[allow(dead_code)]
-#[derive(Default)]
-pub struct BgSchedulerSnapshot {
-    /// Number of registered background services.
-    pub service_count: usize,
-    /// Number of cycles executed since daemon start.
-    pub cycles_executed: u64,
-    /// Number of cycles that completed without budget exhaustion.
-    pub cycles_completed: u64,
-    /// Number of cycles preempted by demand signal.
-    pub cycles_preempted: u64,
-    /// Number of ticks that found no work (idle).
-    pub idle_ticks: u64,
-    /// Total items processed by background services.
-    pub total_processed: u64,
-    /// Total errors encountered by background services.
-    pub total_errors: u64,
-    /// Wall-clock milliseconds spent in background cycles.
-    pub cumulative_wall_ms: u64,
 }
 
 // ---------------------------------------------------------------------------

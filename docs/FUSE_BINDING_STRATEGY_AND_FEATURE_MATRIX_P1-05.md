@@ -85,9 +85,9 @@ Strategy A (`fuser`) is the chosen primary binding for the userspace FUSE daemon
 The FUSE `INIT` handshake negotiates capabilities bidirectionally. The daemon sets capability
 flags in `KernelConfig` during `init()`, and the kernel responds with its supported set.
 
-The current `init()` implementation accepts all kernel-supported capabilities, which is
-insufficient: some capabilities have semantic side effects (e.g. `AUTO_INVAL_DATA` changes
-page cache behavior) and must be explicitly opted into.
+The current adapter selects an explicit capability set. Capabilities with
+semantic side effects (for example, page-cache ownership changes) remain
+excluded until the mounted carrier can preserve its receipt-authority contract.
 
 ### 2.2 Required capabilities (must be negotiated)
 
@@ -97,7 +97,6 @@ page cache behavior) and must be explicitly opted into.
 | `FUSE_CAP_DONT_MASK` | protocol ≥ 7.12 | `KernelConfig` writable | Daemon receives raw create/mkdir/mknod mode plus umask | **Required** — default ACL inheritance ignores umask when parent default ACL exists |
 | `FUSE_CAP_HANDLE_KILLPRIV_V2` | protocol ≥ 7.38 | `KernelConfig` writable | Proper SGID/security.capability clearing on chown/truncate | **Required** — xfstests killpriv |
 | `FUSE_CAP_SETXATTR_EXT` | protocol ≥ 7.40 | `KernelConfig` writable | Extended xattr flags for ACL | **Required** — ACL flag passthrough |
-| `FUSE_CAP_WRITEBACK_CACHE` | protocol ≥ 7.26 | `KernelConfig` writable | Kernel page cache for writes | **Perf gate** — §6.1 |
 | `FUSE_CAP_PARALLEL_DIROPS` | protocol ≥ 7.25 | `KernelConfig` writable | Parallel directory operations | **Required** — dir concurrency |
 | `FUSE_CAP_SPLICE_WRITE` | protocol ≥ 7.1 | `KernelConfig` writable | Zero-copy splice from pipe | **Perf gate** |
 | `FUSE_CAP_SPLICE_MOVE` | protocol ≥ 7.1 | `KernelConfig` writable | Zero-copy splice to pipe | **Perf gate** |
@@ -115,7 +114,8 @@ page cache behavior) and must be explicitly opted into.
 
 | Capability flag | Reason |
 |---|---|
-| `FUSE_CAP_ASYNC_READ` | Managed at daemon level via worker pools (P5-02); kernel async reads add complexity without benefit |
+| `FUSE_CAP_ASYNC_READ` | Not negotiated by the current direct engine-dispatch carrier; no adapter read worker-pool authority exists |
+| `FUSE_CAP_WRITEBACK_CACHE` | Product mounts force direct I/O and refuse both writeback-cache option spellings; no adapter byte mirror or writeback scheduler exists |
 | `FUSE_CAP_PASSTHROUGH` | tidefs does not delegate to a backing filesystem |
 | `FUSE_CAP_NO_OPENDIR_SUPPORT` | tidefs needs opendir/releasedir for handle lifecycle |
 
@@ -200,8 +200,8 @@ stub placeholders.
 | `FUSE_LSEEK` | `lseek()` | **Implemented** | SEEK_SET/END/CUR/DATA/HOLE (PC-004B) |
 | `FUSE_IOCTL` | `ioctl()` | **Partial-boundary** | `FS_IOC_FIEMAP`, `FS_IOC_FSGETXATTR`, and `TIDEFS_IOC_DEFRAG` are wired; other commands return `EOPNOTSUPP` |
 | `FUSE_POLL` | `poll()` | **Implemented** | Regular-file readiness and schedule-notify registration bookkeeping |
-| `FUSE_COPY_FILE_RANGE` | `copy_file_range()` | **Implemented** | Engine copy path plus writeback-cache fallback |
-| `FUSE_SYNCFS` | `syncfs()` | **Implemented** | Mount-wide dirty-page, engine syncfs, and txg barrier |
+| `FUSE_COPY_FILE_RANGE` | `copy_file_range()` | **Implemented** | Engine copy path with derived dirty-state reconciliation |
+| `FUSE_SYNCFS` | `syncfs()` | **Implemented** | Mount-wide engine dirty flush, engine syncfs, and txg barrier |
 | `FUSE_STATX` | `statx()` | **Implemented** | Encodes `ReplyStatx` from adapter metadata projection |
 | `FUSE_BMAP` | `bmap()` | **Explicitly unsupported** | Current userspace adapter returns `EOPNOTSUPP`; FIEMAP is the supported extent-query surface, and BMAP support would require a real block-device address mapping |
 | `FUSE_DESTROY` | `destroy()` | **Implemented** | |

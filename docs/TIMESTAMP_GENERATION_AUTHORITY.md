@@ -32,7 +32,6 @@ Callers that consume a concept must go through the defining crate's public API.
 | Metadata version                 | `tidefs-local-filesystem`          | `metadata_version: u64` on `InodeRecord`         |
 | Namespace subtree revision       | `tidefs-types-vfs-core`            | `InodeAttr::subtree_rev: u64`                    |
 | Namespace directory revision     | `tidefs-types-vfs-core`            | `InodeAttr::dir_rev: u64`                        |
-| Scrub block identity             | `tidefs-local-filesystem`          | `ScrubBlockId` (inode_id + data_version + kind)  |
 | On-disk format version           | `tidefs-local-filesystem`          | `FILESYSTEM_FORMAT_VERSION` (u16, currently 6)   |
 | Content dedup redirect version   | `tidefs-local-filesystem`          | `CONTENT_DEDUP_REDIRECT_FORMAT_VERSION` (u16, 1) |
 | Object store format manifest     | `tidefs-local-object-store`        | `LocalObjectStoreFormatManifest`                 |
@@ -123,7 +122,7 @@ Callers that consume a concept must go through the defining crate's public API.
 - **Authority boundary**: Owned by `tidefs-local-filesystem`; encoded in
   `InodeRecord`, `ContentManifest`, and `ContentChunk` serialization.
   Consumed by object key generation (`content_object_key_for_version`) and
-  scrub identity (`ScrubBlockId.data_version`).
+  receipt-authorized content reads.
 
 ### 2.5 Metadata Version (`metadata_version`)
 
@@ -159,15 +158,7 @@ Callers that consume a concept must go through the defining crate's public API.
   independently of `metadata_version` (see `advance_subtree_revision` and
 directory entry mutation paths).
 
-### 2.7 Scrub Block Identity (`ScrubBlockId`)
-
-- **Domain**: `(inode_id: u64, data_version: u64, kind: ScrubBlockKind)`.
-- **Monotonicity**: Not applicable. Scrub identity is a snapshot key, not a
-  sequence.
-- **Authority boundary**: Owned by `tidefs-local-filesystem/src/scrub.rs`.
-  Constructed from the inode's current `data_version` at scrub time.
-
-### 2.8 Format Versions
+### 2.7 Format Versions
 
 - **Domain**: `u16` per format family.
 - **Monotonicity**: Monotonically increasing across TideFS releases. A format
@@ -202,7 +193,6 @@ POSIX inode timestamps (atime_ns, mtime_ns, ctime_ns, btime_ns)
 │    │                                                │
 │  data_version                                       │
 │    │  -- keyed into -->  content object keys        │
-│    │  -- keyed into -->  ScrubBlockId               │
 │    │  -- serialized in -->  InodeRecord,            │
 │    │       ContentManifest, ContentChunk            │
 │    │                                                │
@@ -238,9 +228,6 @@ rename) advance `metadata_version` to the current `CommitGroupId` tick.
 `(inode_id, data_version)`. The `data_version` component ensures that each
 content version has a distinct storage identity.
 
-**data_version to scrub identity**: `ScrubBlockId` uses `data_version` to
-identify which version of a content block is being checked.
-
  **metadata_version to subtree_rev / dir_rev (resolved, issue #688)**:
 `InodeRecord::to_inode_attr()` projects both `subtree_rev` and `dir_rev` from
 their own stored `InodeRecord` fields (not `metadata_version`). Both counters are
@@ -268,10 +255,11 @@ the same fresh recovery tick into all three local fields:
 - `generation` is the VFS file-handle identity generation. It protects the
   `(inode_id, generation)` identity observed through directory entries,
   `InodeAttr`, and file handles. It is not a content freshness counter, a POSIX
-  timestamp, or a scrub row id.
+  timestamp or integrity-verifier row id.
 - `data_version` is the content-object version. It selects the stored content
   identity through `content_object_key_for_version()` and the content chunk /
-  manifest records. Scrub consumes this value through `ScrubBlockId`.
+  manifest records. Receipt-authorized reads and verification consume the same
+  value through those records.
 - `metadata_version` is the local metadata storage version. It orders durable
   inode metadata changes. The `subtree_rev` and `dir_rev` counters are now
   projected and advanced independently (section 9.1, resolved by issue #688).
@@ -489,8 +477,7 @@ runtime owners to land and any claim evidence to support closure.
 | Site | Classification | Closeout / owner |
 | --- | --- | --- |
 | `metadata_version` to `subtree_rev` / `dir_rev` coupling | Resolved by closed source/docs | Issues #688 and #994 split namespace revision counters from `metadata_version`. `InodeRecord::to_inode_attr()` projects from stored `subtree_rev` and `dir_rev` fields, the counters persist across encode/decode round trips, content and metadata mutation paths advance `subtree_rev` independently, directory mutation paths advance `dir_rev`, and non-directory inodes keep `dir_rev == 0`. |
-| Intent-log replay and commit-group recovery | Resolved by closed decision; conditional/future-only coverage | Issue #694 recorded the recovery-generation drift contract in section 3.2. Recovery paths may initialize `generation`, `data_version`, and `metadata_version` from one accepted recovery tick, and later mounted writes intentionally let those identities diverge. No recovery source change is required merely to preserve or restore equality. A future focused issue is needed only if executable recovery/write/scrub coverage or runtime guards are added for this contract. |
-| Scrub and repair identity | Delegated to live non-overlapping issue family | Issue #742 records the local scrub identity boundary: `ScrubBlockId` identifies content by `(inode_id, data_version)` and must not treat POSIX time, `metadata_version`, storage-generation ticks, or intent-log epochs as identity substitutes. Issue #650 closed the mounted content scrub-read authority slice. Issues #651 and #652 (now closed) resolved transform-aware scrub routing and repair dispatch gating while preserving this identity boundary. |
+| Intent-log replay and commit-group recovery | Resolved by closed decision; conditional/future-only coverage | Issue #694 recorded the recovery-generation drift contract in section 3.2. Recovery paths may initialize `generation`, `data_version`, and `metadata_version` from one accepted recovery tick, and later mounted writes intentionally let those identities diverge. No recovery source change is required merely to preserve or restore equality. A future focused issue is needed only if executable recovery/write coverage or runtime guards are added for this contract. |
 | Send/receive export/import | Resolved by closed docs/source issues | Issue #695 records that changed-record stream versions own only envelope shape, while each local record payload's local filesystem format version owns POSIX timestamp, `data_version`, and `metadata_version` layout. Issue #1002 added the focused VFSSEND1 guard coverage; related sender-authority and receive-merge follow-ups #777 and #703 are closed. Future send-stream work must preserve this rule instead of adding a timestamp/version reconciliation pass. |
 | Content object reclaim and orphan cleanup | Delegated to live non-overlapping issue family | Issue #746 records `data_version` as the `(inode_id, data_version)` content identity token and names the separate reclaim liveness guard: commit-group death/stability, placement receipt epoch/generation evidence, and orphan replay watermarks. Issues #675 and #676 (now closed) resolved receipt-driven consumer policy and rebake/reclaim trims without treating `data_version` as the reclaim clock. |
 | Format-golden and codec surfaces | Conditional/future-only; gate resolved by closed issue | Issue #696 made VFS codec/vector manifest drift fail in focused tooling. No source, serialized ABI, or golden-vector update is due for this document-only reconciliation. If a later slice intentionally changes serialized ABI, such as a `FILESYSTEM_FORMAT_VERSION` bump from 6 to 7, that slice must update the golden-format corpus and codec surfaces atomically with the format version change. |

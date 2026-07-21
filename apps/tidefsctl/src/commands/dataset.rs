@@ -1733,7 +1733,7 @@ fn handle_set(args: DatasetSetArgs) {
         &target.pool,
         args.devices.as_deref(),
         "set",
-        RecoveryPolicy::RepairWriteback,
+        RecoveryPolicy::ReplayOnly,
         args.json,
         super::live_owner::live_admin_args([
             ("target", LivePoolAdminArg::String(args.target.clone())),

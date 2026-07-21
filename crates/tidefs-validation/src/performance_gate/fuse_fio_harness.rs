@@ -68,7 +68,6 @@ impl FuseFioHarness {
             .arg(&sp)
             .arg("--mount")
             .arg(&mp)
-            .arg("--no-writeback-cache")
             .arg("-f")
             .spawn()
         {

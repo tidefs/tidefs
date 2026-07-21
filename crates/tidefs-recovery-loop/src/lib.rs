@@ -21,13 +21,12 @@ use std::path::Path;
 
 // ── RecoveryPolicy ───────────────────────────────────────────────────
 
-/// Policy gate that controls which recovery operations are permitted
-/// during mount and open paths.
+/// Policy gate that controls whether mount and open paths may replay the
+/// intent log.
 ///
-/// Every recovery code path (committed-root selection, intent-log replay,
-/// scrub, repair writeback) must consult this policy before mutating
-/// durable state. The policy replaces the prior implicit repair behavior
-/// with explicit, testable branches.
+/// Every recovery code path must consult this policy before mutating durable
+/// state. Committed-root inspection is available under either policy;
+/// intent-log replay requires [`RecoveryPolicy::ReplayOnly`].
 ///
 /// # Variants
 ///
@@ -35,41 +34,27 @@ use std::path::Path;
 ///   validation but never writes. Suitable for forensics and online
 ///   verification.
 /// - \`ReplayOnly\`: Intent-log replay to the last committed state is
-///   permitted. Scrub inspection runs read-only. Repair writeback and
-///   metadata fixup are skipped. This is the safe production default.
-/// - \`RepairWriteback\`: Full recovery including intent-log replay,
-///   scrub repair, and metadata fixup. Requires explicit operator
-///   opt-in and validation output.
+///   permitted. This is the safe production default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RecoveryPolicy {
     /// No mutation allowed — inspect and report only.
     ReadOnly,
-    /// Replay intent-log to committed state; no repair writeback.
+    /// Replay the intent log to the last committed state.
     ReplayOnly,
-    /// Full repair: replay, scrub repair, and metadata fixup.
-    RepairWriteback,
 }
 
 impl RecoveryPolicy {
     /// Returns \`true\` when this policy permits intent-log replay.
     #[must_use]
     pub fn allows_replay(&self) -> bool {
-        matches!(self, Self::ReplayOnly | Self::RepairWriteback)
-    }
-
-    /// Returns \`true\` when this policy permits repair writeback
-    /// (scrub repair, metadata fixup, or any durable mutation beyond
-    /// intent-log replay).
-    #[must_use]
-    pub fn allows_repair_writeback(&self) -> bool {
-        matches!(self, Self::RepairWriteback)
+        matches!(self, Self::ReplayOnly)
     }
 
     /// Returns \`true\` when this policy permits any mutation at all
-    /// (replay or repair).
+    /// (intent-log replay).
     #[must_use]
     pub fn allows_any_mutation(&self) -> bool {
-        !matches!(self, Self::ReadOnly)
+        matches!(self, Self::ReplayOnly)
     }
 
     /// Human-readable label for diagnostics and validation recording.
@@ -78,14 +63,12 @@ impl RecoveryPolicy {
         match self {
             Self::ReadOnly => "read-only",
             Self::ReplayOnly => "replay-only",
-            Self::RepairWriteback => "repair-writeback",
         }
     }
 }
 
 impl Default for RecoveryPolicy {
-    /// The safe production default: replay intent-log to committed
-    /// state without silent repair writeback.
+    /// The safe production default: replay the intent log to committed state.
     fn default() -> Self {
         Self::ReplayOnly
     }
@@ -2692,36 +2675,22 @@ mod recovery_policy_tests {
     fn read_only_allows_no_mutation() {
         let p = RecoveryPolicy::ReadOnly;
         assert!(!p.allows_replay());
-        assert!(!p.allows_repair_writeback());
         assert!(!p.allows_any_mutation());
     }
 
     #[test]
-    fn replay_only_allows_replay_not_repair() {
+    fn replay_only_allows_replay() {
         let p = RecoveryPolicy::ReplayOnly;
         assert!(p.allows_replay());
-        assert!(!p.allows_repair_writeback());
-        assert!(p.allows_any_mutation());
-    }
-
-    #[test]
-    fn repair_writeback_allows_everything() {
-        let p = RecoveryPolicy::RepairWriteback;
-        assert!(p.allows_replay());
-        assert!(p.allows_repair_writeback());
         assert!(p.allows_any_mutation());
     }
 
     #[test]
     fn labels_are_distinct() {
-        let labels: Vec<&str> = [
-            RecoveryPolicy::ReadOnly,
-            RecoveryPolicy::ReplayOnly,
-            RecoveryPolicy::RepairWriteback,
-        ]
-        .iter()
-        .map(|p| p.label())
-        .collect();
+        let labels: Vec<&str> = [RecoveryPolicy::ReadOnly, RecoveryPolicy::ReplayOnly]
+            .iter()
+            .map(|p| p.label())
+            .collect();
         let mut unique = labels.clone();
         unique.sort();
         unique.dedup();
@@ -2733,7 +2702,6 @@ mod recovery_policy_tests {
         let expected = [
             (RecoveryPolicy::ReadOnly, "ReadOnly"),
             (RecoveryPolicy::ReplayOnly, "ReplayOnly"),
-            (RecoveryPolicy::RepairWriteback, "RepairWriteback"),
         ];
         for (policy, variant_name) in expected {
             let s = format!("{policy:?}");

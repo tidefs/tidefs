@@ -2373,14 +2373,12 @@ fn classify_library_family(name: &str) -> Family {
         || name.starts_with("tidefs-tdma-")
         || name.starts_with("tidefs-vfs-")
         || name == "tidefs-cluster"
-        || name == "tidefs-workload"
     {
         Family::Storage
     } else if name.starts_with("tidefs-test-")
         || name == "tidefs-model-core"
         || name == "tidefs-crash-oracle"
         || name == "tidefs-distributed-model-check"
-        || name == "tidefs-env-fuse-model"
         || name == "tidefs-env-ublk-model"
         || name == "tidefs-trace-oracle"
         || name == "tidefs-two-node-harness"
@@ -2396,7 +2394,6 @@ fn classify_library_class(name: &str) -> CrateClass {
     if name == "tidefs-model-core"
         || name == "tidefs-crash-oracle"
         || name == "tidefs-distributed-model-check"
-        || name == "tidefs-env-fuse-model"
         || name == "tidefs-env-ublk-model"
     {
         CrateClass::TestOrXtask

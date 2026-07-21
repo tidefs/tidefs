@@ -33,15 +33,13 @@ blockers = [
 [[product_admission_gates]]
 id = "mounted-posix-operator-runtime"
 status = "blocked"
-scope = "mounted POSIX path, FUSE adapter lifecycle, namespace behavior, and operator-visible local filesystem behavior"
+scope = "mounted POSIX path, namespace behavior, and operator-visible local filesystem behavior"
 claim_ids = [
-  "fuse.adapter.lifecycle_translation.model.v1",
   "namespace.rename.atomicity.v1",
   "local.vfs.rename_atomic_crash.v1",
   "storage.local.successor_comparator.v1",
 ]
 required_evidence_classes = [
-  "fuse-adapter-lifecycle-model",
   "model-crash-matrix",
   "runtime-namespace-crash-artifact",
   "no-hidden-queue-gate",
@@ -54,9 +52,8 @@ authority_paths = [
   "docs/CLAIMS_GATE_POLICY.md",
   "validation/claims.toml",
 ]
-admission_rule = "Mounted POSIX or operator-facing filesystem wording may strengthen only when FUSE lifecycle, namespace crash/runtime, local successor boundary, and claims-gate evidence all validate for the mounted local scope."
+admission_rule = "Mounted POSIX or operator-facing filesystem wording may strengthen only when namespace crash/runtime, local successor boundary, and claims-gate evidence all validate for the mounted local scope."
 blockers = [
-  "FUSE lifecycle evidence is model-only and does not validate mounted runtime behavior.",
   "Namespace and local VFS rename claims remain blocked on active runtime/no-hidden-queue admission proof.",
 ]
 
@@ -577,24 +574,6 @@ evidence_artifacts = [
   { class = "descriptor-completion-validation", path = "validation/artifacts/offload/descriptor-completion-validation.toml" },
   { class = "claims-gate-review", path = "validation/artifacts/offload/claims-gate-review.toml" },
   { class = "external-backend-conformance-manifest", path = "validation/artifacts/offload/external-backend-conformance-manifest.toml" },
-]
-
-[[claims]]
-id = "fuse.adapter.lifecycle_translation.model.v1"
-status = "planned"
-scope = "FUSE adapter lifecycle translation source model"
-required_evidence_classes = [
-  "fuse-adapter-lifecycle-model",
-]
-evidence_requirements = [
-  { class = "fuse-adapter-lifecycle-model", path = "validation/artifacts/fuse/adapter-lifecycle-model.json", validation_tier = "source-model", manifest_path = "validation/artifacts/fuse/adapter-lifecycle-model.manifest.json", blocking_issues = [] },
-]
-blockers = [
-  "The FUSE adapter lifecycle receipt is bounded source-model evidence only; mounted FUSE adapter runtime behavior, xfstests, crash, and writeback durability evidence remain separate claim-gated work.",
-]
-generated_doc = "Planned FUSE adapter lifecycle translation model claim. The source-model fixture covers init, queue saturation, interrupt, abort, reissue, writeback-cache sync, unsupported capability handling, teardown, and destroy at the adapter boundary. It is not mounted FUSE runtime proof."
-evidence_artifacts = [
-  { class = "fuse-adapter-lifecycle-model", path = "validation/artifacts/fuse/adapter-lifecycle-model.json", source = "tidefs-env-fuse-model", scope = "source-model-fuse-adapter-lifecycle" },
 ]
 
 [[claims]]

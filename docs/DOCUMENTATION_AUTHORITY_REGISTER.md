@@ -103,8 +103,8 @@ register's authority rule and review method, `docs/REQUEST_CONTRACT.md`,
 `docs/TRACE_ORACLE_ARTIFACT_SCHEMA.md`, the claim registry and scanned
 claims-gate document list, the source anchors in `crates/tidefs-types-vfs-core/`
 and `crates/tidefs-schema-codec-vfs/`, the model references in
-`crates/tidefs-env-fuse-model/`, `crates/tidefs-env-ublk-model/`,
-`crates/tidefs-model-core/`, and `crates/tidefs-trace-oracle/`, and closed
+`crates/tidefs-env-ublk-model/`, `crates/tidefs-model-core/`, and
+`crates/tidefs-trace-oracle/`, and closed
 GitHub issues #282, #528, #751, and #1066 as historical lineage evidence. This
 slice is documentation/source inspection only; it does not change source,
 claims-gate requirements, runtime behavior, or validation promises.
@@ -219,7 +219,7 @@ xfstests coverage, distributed behavior, or runtime crash claims.
 
 | Path | State | Classification note |
 |---|---|---|
-| `docs/FUSE_ADAPTER_CONTRACT_ASSUMPTIONS.md` | Current policy | Binding only as the adapter-boundary guardrail that prevents runtime FUSE handlers from bypassing the TideFS request/VfsEngine path into storage mutation authority. It does not close xfstests rows or broader POSIX/FUSE completeness. |
+| `docs/FUSE_ADAPTER_CONTRACT_ASSUMPTIONS.md` | Current policy | Binding only for the current userspace adapter carrier boundary: readable handles use direct I/O, kernel writeback-cache mode is refused, and registered-handle operations dispatch through the VFS engine into receipt-authoritative storage. It does not close xfstests rows or broader POSIX/FUSE completeness. |
 | `docs/FUSE_LSEEK_PC004B.md` | Current spec | Scoped current spec for the non-release dense-file preview `lseek` behavior described in the file. It does not claim sparse-file fidelity or parent POSIX-complete FUSE closure. |
 
 **Operator, placement, and distributed-runtime docs**

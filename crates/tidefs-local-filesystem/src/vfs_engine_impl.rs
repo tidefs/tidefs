@@ -10,6 +10,8 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::Write as _;
+#[cfg(feature = "receipt-authority-mount-test")]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use serde_json::{json, Value};
@@ -37,6 +39,8 @@ use crate::fuse_getattr;
 use crate::fuse_setattr;
 use crate::fuse_statfs;
 use crate::helpers::{kind_bits, validate_name};
+#[cfg(feature = "receipt-authority-mount-test")]
+use crate::object_keys::content_chunk_object_key_for_version;
 use crate::open_dispatch::{self, FileHandleState, FileHandleTable};
 use crate::readahead::ReadaheadTracker;
 use crate::release_dispatch;
@@ -143,7 +147,6 @@ fn map_errno(err: &FileSystemError) -> Errno {
         FileSystemError::InvalidName { .. } => Errno::ENAMETOOLONG,
         FileSystemError::InvalidPath { .. } => Errno::EINVAL,
         FileSystemError::CorruptState { .. } => Errno::EIO,
-        FileSystemError::CorruptContent { .. } => Errno::EIO,
         FileSystemError::Unsupported { .. } => Errno::EOPNOTSUPP,
         FileSystemError::SizeOverflow { .. } => Errno::EFBIG,
         FileSystemError::ReadServingRefused { .. } => Errno::EIO,
@@ -199,6 +202,8 @@ pub struct VfsLocalFileSystem {
     readahead_tracker: ReadaheadTracker,
     readahead_executor_input_hook: Option<ReadaheadExecutorInputHook>,
     readahead_executor_outcomes: RefCell<VecDeque<VfsReadaheadExecutorOutcome>>,
+    #[cfg(feature = "receipt-authority-mount-test")]
+    receipt_authority_raw_replacement_before_next_read_test_trigger: Option<Arc<AtomicBool>>,
 }
 
 // ActiveFileHandle replaced by FileHandleState from open_dispatch
@@ -520,7 +525,25 @@ impl VfsLocalFileSystem {
             sync_guarantee: SyncGuarantee::Local,
             readahead_executor_input_hook: None,
             readahead_executor_outcomes: RefCell::new(VecDeque::new()),
+            #[cfg(feature = "receipt-authority-mount-test")]
+            receipt_authority_raw_replacement_before_next_read_test_trigger: None,
         }
+    }
+
+    /// Attach the one-shot raw-replacement trigger used by the mounted
+    /// receipt-authority integration test.
+    ///
+    /// This feature-gated seam exposes no store, path, object key, or payload.
+    /// When armed, the next regular-file read replaces that exact inode's first
+    /// non-hole chunk with fixed unauthorized bytes inside the live Pool.
+    #[cfg(feature = "receipt-authority-mount-test")]
+    #[doc(hidden)]
+    pub fn with_receipt_authority_raw_replacement_before_next_read_for_test(
+        mut self,
+        trigger: Arc<AtomicBool>,
+    ) -> Self {
+        self.receipt_authority_raw_replacement_before_next_read_test_trigger = Some(trigger);
+        self
     }
 
     /// Scope all path resolution to a dataset directory within the pool.
@@ -4402,6 +4425,56 @@ impl VfsLocalFileSystem {
             .map_err(|_| Errno::EFBIG)
     }
 
+    #[cfg(feature = "receipt-authority-mount-test")]
+    fn inject_unauthorized_first_chunk_before_armed_read(
+        &self,
+        inode_id: InodeId,
+    ) -> std::result::Result<(), Errno> {
+        let Some(trigger) = self
+            .receipt_authority_raw_replacement_before_next_read_test_trigger
+            .as_ref()
+        else {
+            return Ok(());
+        };
+        if !trigger.swap(false, Ordering::AcqRel) {
+            return Ok(());
+        }
+
+        let result = (|| {
+            let mut fs = self.fs.borrow_mut();
+            let record = fs.inode(inode_id).map_err(|err| map_errno(&err))?.clone();
+            let layout = MountedContentReadAuthority::new(&fs.store)
+                .read_layout(inode_id, &record, false)
+                .map_err(|err| map_errno(&err))?;
+            let ContentLayout::Chunked(manifest) = layout else {
+                return Err(Errno::EIO);
+            };
+            let chunk = manifest
+                .chunks
+                .iter()
+                .find(|chunk| !chunk.is_hole())
+                .ok_or(Errno::EIO)?;
+            let chunk_key = content_chunk_object_key_for_version(
+                inode_id,
+                chunk.data_version,
+                chunk.chunk_index,
+            );
+            let raw_store = fs.store.raw_primary_store_mut();
+            raw_store
+                .put(
+                    chunk_key,
+                    b"unauthorized receipt-authority mount-test replacement",
+                )
+                .map_err(|_| Errno::EIO)?;
+            raw_store.sync_all().map_err(|_| Errno::EIO)
+        })();
+
+        if result.is_err() {
+            trigger.store(true, Ordering::Release);
+        }
+        result
+    }
+
     fn read_impl(
         &self,
         fh: &EngineFileHandle,
@@ -4418,6 +4491,8 @@ impl VfsLocalFileSystem {
             return file.data.read_at(offset, size, file.attr.posix.size);
         }
         let path = self.inode_path(fh.inode_id)?;
+        #[cfg(feature = "receipt-authority-mount-test")]
+        self.inject_unauthorized_first_chunk_before_armed_read(fh.inode_id)?;
 
         // Keep read-pattern accounting for both user reads and internal cache
         // fills; only user-visible reads are POSIX atime events.
@@ -5298,16 +5373,6 @@ impl VfsEngine for VfsLocalFileSystem {
         ctx: &RequestCtx,
     ) -> std::result::Result<Vec<u8>, Errno> {
         self.read_impl(fh, offset, size, ctx, true)
-    }
-
-    fn read_for_cache_fill(
-        &self,
-        fh: &EngineFileHandle,
-        offset: u64,
-        size: u32,
-        ctx: &RequestCtx,
-    ) -> std::result::Result<Vec<u8>, Errno> {
-        self.read_impl(fh, offset, size, ctx, false)
     }
 
     fn record_read_access(
@@ -13937,16 +14002,6 @@ mod tests {
         use crate::error::FileSystemError;
 
         let err = FileSystemError::CorruptState { reason: "test" };
-        assert_eq!(map_errno(&err), Errno::EIO);
-    }
-
-    #[test]
-    fn map_errno_maps_corrupt_content_to_eio() {
-        use crate::error::FileSystemError;
-
-        let err = FileSystemError::CorruptContent {
-            inode_id: tidefs_types_vfs_core::InodeId::new(1),
-        };
         assert_eq!(map_errno(&err), Errno::EIO);
     }
 

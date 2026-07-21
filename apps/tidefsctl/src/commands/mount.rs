@@ -560,7 +560,6 @@ pub fn handle_mount(args: PoolMountArgs) {
         pool_uuid: owner_pool_uuid,
         foreground: true,
         debug: false,
-        writeback_cache: false,
         coherency_profile:
             tidefs_posix_filesystem_adapter_daemon::coherency_profile::CoherencyProfile::Writeback,
         block_devices: args.devices.clone(),

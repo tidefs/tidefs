@@ -171,7 +171,6 @@ const GATE_SPECS: &[GateSpec] = &[
             "nlink",
         ],
         required_evidence_classes: &[
-            "fuse-adapter-lifecycle-model",
             "model-crash-matrix",
             "runtime-namespace-crash-artifact",
             "no-hidden-queue-gate",

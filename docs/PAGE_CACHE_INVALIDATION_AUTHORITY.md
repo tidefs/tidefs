@@ -22,8 +22,9 @@ cached bytes.
 
 This authority covers:
 
-- clean page-cache mirrors in the FUSE adapter, kernel module, and shared cache
-  crates;
+- clean page-cache mirrors in the kernel module and shared cache crates. The
+  retained FUSE adapter has no byte-data read/page cache and forces direct I/O
+  for every readable open;
 - dirty or writeback ranges that overlap a coherency event and therefore must
   be fenced, drained, retried, or classified before stale bytes can be served;
 - metadata and dentry invalidation only where they decide whether page bytes
@@ -39,8 +40,7 @@ This authority does not cover:
 - FUSE lookup/forget durable inode ownership, which is decided by
   `docs/INODE_NAMESPACE_AUTHORITY.md` and issue #665;
 - POSIX lock identity or lock transport behavior from issues #618 and #633;
-- cache admission and memory-budget policy from issue #685;
-- claim-gate evidence reconciliation from issue #697.
+- cache admission and memory-budget policy from issue #685.
 
 ## Authority Terms
 
@@ -87,9 +87,10 @@ Current source:
   invalidation hooks.
 - `apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_vfs_adapter.rs`
   records dentry invalidation generations for child mutations and renames,
-  invalidates metadata caches after engine writes, invalidates read-side caches
-  after direct writes, and reconciles dirty mirrors after authoritative range
-  mutations.
+  invalidates metadata projections after engine writes, forces
+  `FOPEN_DIRECT_IO` and masks `FOPEN_KEEP_CACHE` for readable handles, and
+  reconciles registered-handle dirty state after authoritative range
+  mutations. It has no adapter-side byte-data read/page cache to invalidate.
 - `apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_lookup_forget.rs`
   still treats lookup/forget reference accounting separately from durable inode
   identity. Issue #665 owns the implementation cleanup for that projection.
@@ -129,7 +130,7 @@ discarded as durable data; it is fenced and handed to the writeback authority
 for drain, retry, or a classified superseded result.
 
 The generation rule is the correctness boundary. Kernel notifications, FUSE
-TTL expiration, daemon cache eviction, and cluster invalidation messages are
+TTL expiration, userspace cache eviction, and cluster invalidation messages are
 delivery mechanisms. Missing or delayed delivery must not allow stale cached
 bytes to be served after a generation mismatch is visible to the mount.
 
@@ -141,7 +142,7 @@ authority at the named granularity.
 | Trigger | Required granularity | Authority rule |
 |---|---|---|
 | Buffered write accepted by the mounted engine | Written byte range, plus inode metadata when size or privilege bits change | The written range becomes the current range generation. Read-side clean mirrors overlapping the range must be refreshed or invalidated before later reads can use them. Dirty trackers for the same range stay with the writeback authority. |
-| Direct I/O write or any engine write that bypasses the adapter page cache | Written byte range | Mandatory range invalidation or reconciliation. Dirty mirrors overlapping the range must be fenced so later writeback cannot replay older bytes over the authoritative write. |
+| Direct I/O write or any engine write that bypasses cached byte mirrors | Written byte range | Mandatory range invalidation or reconciliation for any actual cache consumer. Dirty mirrors overlapping the range must be fenced so later writeback cannot replay older bytes over the authoritative write. The retained FUSE adapter has no byte-data cache; its registered-handle state is reconciled directly. |
 | `truncate` shrink | `[new_size, old_size)` plus the boundary page and inode size metadata | Mandatory range invalidation. Dirty/writeback ranges beyond the new EOF must be drained, retried against the new EOF, or classified as superseded by the successful truncate before success is published. |
 | `truncate` grow | `[old_size, new_size)` plus inode size metadata | Newly exposed bytes are authoritative zeroes or holes under a new range generation. Any speculative clean mirror in that span is stale. |
 | Hole punch or zero range | Punched or zeroed byte range | Mandatory range invalidation or clean zero reconciliation. Dirty/writeback overlap must not be written back later as old data. |
@@ -159,25 +160,31 @@ authority at the named granularity.
 
 ## FUSE And Kernel Coherency Contract
 
-FUSE lookup, forget, dentry TTLs, attribute TTLs, kernel page-cache state, and
-daemon page-cache state are projections of mounted dataset authority.
+FUSE lookup, forget, dentry TTLs, attribute TTLs, and any kernel page-cache
+state are projections of mounted dataset authority. On the retained FUSE path,
+every readable open returns `FOPEN_DIRECT_IO`, `FOPEN_KEEP_CACHE` is masked,
+and kernel writeback-cache negotiation is refused. Neither the kernel data
+cache nor an adapter byte-data cache may satisfy those reads.
 
 FUSE forget is advisory for page data. It releases kernel references and may
 allow reclaim, but it must not drop dirty data or decide that an inode's page
 bytes are no longer reachable. Unlink, orphan last-close, truncate, range
 mutation, lease revocation, or epoch transition must provide that authority.
 
-Kernel page-cache invalidation is mandatory when the kernel could otherwise
+Kernel page-cache invalidation is mandatory for a carrier that can otherwise
 serve bytes from an older generation after a destructive mutation or external
-lease revocation. If the adapter cannot prove the kernel accepted a precise
-notification, the mount must record a generation fence so the next read, fault,
-or writeback completion cannot trust the old cache state.
+lease revocation. If that carrier cannot prove the kernel accepted a precise
+notification, it must record a generation fence so the next read, fault, or
+writeback completion cannot trust the old cache state. The current FUSE data
+path satisfies the byte-read side by bypassing the kernel cache; this does not
+weaken the requirement for kmod or any future cached carrier.
 
-Daemon read caches and cache-core page caches follow the same rule. Clean
-entries may be evicted eagerly. Dirty and writeback entries may be removed
-only when the owning operation has made the bytes unreachable or has reconciled
-them with the current authoritative payload; otherwise they remain fenced
-until writeback, retry, or error classification finishes.
+Cache-core and local page-cache consumers follow the same rule. Clean entries
+may be evicted eagerly. Dirty and writeback entries may be removed only when
+the owning operation has made the bytes unreachable or has reconciled them
+with the current authoritative payload; otherwise they remain fenced until
+writeback, retry, or error classification finishes. This rule does not imply
+an adapter read/page cache.
 
 ## Race Rules
 
@@ -199,6 +206,8 @@ Direct I/O and other authoritative engine writes bypass cached byte mirrors.
 Before a later buffered read or writeback can use a cached page overlapping the
 direct-write range, the cache must either hold the direct-write payload as the
 current range generation or have no readable cached page for that range.
+The retained FUSE adapter takes the latter path: readable handles use direct
+I/O and no adapter byte cache is populated.
 
 ### Invalidation Versus Mmap Faults
 
@@ -243,7 +252,6 @@ lands; they are not part of this slice.
 
 | Issue | Slice | Primary write set | Boundary |
 |---|---|---|---|
-| #752 | FUSE data-cache invalidation and generation fences. | `apps/tidefs-posix-filesystem-adapter-daemon/src/` data-cache, notification, mmap-coherency, and adapter tests only. | Must wait until active issue #665 / PR #709 clears or records an explicit non-overlap. Does not edit durable lookup/forget ownership. |
 | #753 | Kernel page-cache coherency notifications and stale-generation checks. | `kmod/`, `crates/tidefs-kmod-posix-vfs/`, kernel-facing validation hooks, and focused kernel cache tests. | Owns kernel invalidation/fault/writeback checks. Does not change FUSE adapter policy or clustered lease transport. |
 | #754 | Clustered cache lease and epoch invalidation plumbing. | `crates/tidefs-cache-coherency/`, `crates/tidefs-lease/`, `crates/tidefs-lease-manager/`, `crates/tidefs-membership-epoch/`, `crates/tidefs-transport/`, and focused lease/transport tests as needed. | Owns cross-node invalidation messages and wait policies. Does not implement POSIX lock forwarding from #633 or cache admission from #685. |
 

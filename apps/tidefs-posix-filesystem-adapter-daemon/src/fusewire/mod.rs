@@ -330,10 +330,8 @@ pub const TIDEFS_FUSE_INIT_REQUIRED_FLAGS: u32 = init_flags::FUSE_POSIX_ACL
     | init_flags::FUSE_HANDLE_KILLPRIV;
 
 /// Capabilities the current daemon requests opportunistically during INIT.
-pub const TIDEFS_FUSE_INIT_BEST_EFFORT_FLAGS: u32 = init_flags::FUSE_WRITEBACK_CACHE
-    | init_flags::FUSE_SPLICE_WRITE
-    | init_flags::FUSE_SPLICE_MOVE
-    | init_flags::FUSE_SPLICE_READ;
+pub const TIDEFS_FUSE_INIT_BEST_EFFORT_FLAGS: u32 =
+    init_flags::FUSE_SPLICE_WRITE | init_flags::FUSE_SPLICE_MOVE | init_flags::FUSE_SPLICE_READ;
 
 /// Full INIT capability request set used by the deterministic current-adapter plan.
 pub const TIDEFS_FUSE_INIT_DEFAULT_WANTED_FLAGS: u32 = init_flags::FUSE_ASYNC_READ
@@ -3646,6 +3644,14 @@ mod tests {
         assert_eq!(
             TIDEFS_FUSE_INIT_REQUIRED_FLAGS & TIDEFS_FUSE_INIT_DEFAULT_WANTED_FLAGS,
             TIDEFS_FUSE_INIT_REQUIRED_FLAGS,
+        );
+    }
+
+    #[test]
+    fn fuse_init_defaults_do_not_request_writeback_cache() {
+        assert_eq!(
+            TIDEFS_FUSE_INIT_DEFAULT_WANTED_FLAGS & init_flags::FUSE_WRITEBACK_CACHE,
+            0,
         );
     }
 

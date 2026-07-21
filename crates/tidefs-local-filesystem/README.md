@@ -65,7 +65,7 @@ FUSE daemon (tidefs-posix-filesystem-adapter-daemon)
 | [`OnlineVerifierReport`] | Live integrity scan of pool object state |
 | [`CommitGroupConfig`] | Transaction-group config: sync thresholds, auto-commit policy |
 | [`IntentLog`] | Metadata-level intent-log buffer for crash-safe namespace operations |
-| [`PageCache`] | In-memory page cache for read acceleration and dirty-page tracking |
+| [`PageCache`] | In-memory cached-copy and dirty-page tracking; persisted reads revalidate receipt authority |
 | [`TxgReplayEngine`] | Replays committed txgs during mount, bridging committed-root discovery to commit_group journal records |
 
 ## Transaction Model
@@ -80,14 +80,13 @@ groups after a crash.
 ## Recovery Model
 
 On open, [`crash_recovery`] replays the intent log and selects the
-newest valid committed root. The [`recovery`] module implements the current
-torn-tail repair path. [`repair`] applies corruption resolution strategies
-(truncate, mark-corrupt, reconstruct), and
-[`scrub`] runs a full block-level checksum pipeline with outcome
-classification.
+newest valid committed root. The [`recovery`] module implements torn-tail
+recovery and the receipt-authorized online verifier. LocalFS has no automatic
+corruption-repair scheduler or foreground scrub carrier; corrupt or
+unverifiable mounted content fails closed.
 
 These mechanics describe current source behavior and focused tests. Broader
-recovery, write/fsync/writeback, mmap, and automatic repair admission remains
+recovery, write/fsync/writeback, mmap, and repair admission remains
 non-claim authority tracked by `docs/PAGE_CACHE_WRITEBACK_AUTHORITY.md`,
 TFR-008, `validation/claims.toml`, and the claim-registry product gates.
 
@@ -217,7 +216,7 @@ three categories:
   summaries, corrupt inode/directory records, intent-log replay failures.
 - **Semantic errors** — `NotFound`, `AlreadyExists`, `DirectoryNotEmpty`,
   `QuotaExceeded`, `IsDirectory`, `NotFile`, `PermissionDenied`,
-  `NoSpace`, `CorruptContent`, `Unsupported`.
+  `NoSpace`, `Unsupported`.
 
 ## Module Map
 
@@ -231,9 +230,7 @@ three categories:
 | `txg_replay.rs` | [`TxgReplayEngine`]: committed-txg roll-forward with BLAKE3 chain verification |
 | `intent_log.rs` | `IntentLog` and intent-log buffer for crash-safe mutations |
 | `crash_recovery.rs` | Mount-time intent-log replay and root selection |
-| `recovery.rs` | Torn-tail repair, committed-root chain traversal |
-| `repair.rs` | Corruption resolution: truncate, mark-corrupt, reconstruct |
-| `scrub.rs` | Block-level checksum pipeline with outcome classification |
+| `recovery.rs` | Torn-tail recovery and committed-root chain traversal |
 | `fsck.rs` | `FsckReport`, `FsckCategory`, `FsckSeverity` |
 | `dedup.rs` | `DedupIndex`: in-memory BTreeMap-backed content dedup |
 | `page_cache/` | `PageCache`, `DirtyPageTracker`, LRU reclaim |
@@ -252,7 +249,6 @@ three categories:
 | `open_dispatch.rs` | File open/release dispatch with handle lifecycle |
 | `release_dispatch.rs` | File release and resource cleanup |
 | `crash_hooks.rs` | Deterministic crash-injection points for testing |
-| `checksum.rs` | Block-level checksum computation and verification |
 | `background_compaction.rs` | `BackgroundCompaction`: B+tree compaction service |
 | `background_reclaim.rs` | `BackgroundReclaim`: model/test reclaim-queue entry processing (quarantined behind `#[cfg(test)]`) |
 | `background_orphan_reclamation.rs` | `BackgroundOrphanReclamation`: orphan cleanup service |

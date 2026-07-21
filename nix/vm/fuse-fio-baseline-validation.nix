@@ -270,7 +270,6 @@ if [ -e /dev/fuse ] && grep -q fuse /proc/filesystems 2>/dev/null; then
       --store "$STORE" \
       --mount "$MNT" \
       --root-auth-key-hex 4141414141414141414141414141414141414141414141414141414141414141 \
-      --no-writeback-cache \
       > /tmp/tidefs-fuse-daemon.log 2>&1 &
     DAEMON_PID=$!
     echo "daemon_pid=$DAEMON_PID"

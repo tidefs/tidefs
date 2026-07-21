@@ -1974,7 +1974,6 @@ fn handle_export(args: SnapshotExportArgs) {
         pool_uuid: None,
         foreground: true,
         debug: false,
-        writeback_cache: false,
         coherency_profile:
             tidefs_posix_filesystem_adapter_daemon::coherency_profile::CoherencyProfile::Writeback,
         block_devices: None,

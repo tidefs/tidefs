@@ -47,8 +47,6 @@
 //! | Error enum            | Module                  | Returns | Variants mapped to errno                       |
 //! |-----------------------|-------------------------|---------|-------------------------------------------------|
 //! | `WriteError`          | `fuse_write`            | `Errno` | `BadFileDescriptor→EBADF`, `NotWritable→EBADF`, `NoSpace→ENOSPC`, `IoError→EIO`, `InvalidArgument→EINVAL` |
-//! | `FlushError`          | `fuse_flush_fsync`      | `Errno` | `BadFileDescriptor→EBADF`, `IoError→EIO`, `NoSpace→ENOSPC`, `Interrupted→EINTR` |
-//! | `FsyncError`          | `fuse_flush_fsync`      | `Errno` | Same as FlushError                              |
 //! | `LockDispatchError`   | `lock_dispatch`         | `Errno` | `InvalidLockType→EINVAL`, `Conflict→EAGAIN`, `WouldBlock→EAGAIN` |
 //!
 //! ## 4. Inline Errno values in helper functions (fuse_vfs_adapter.rs)
@@ -94,7 +92,7 @@
 //!
 //! | Handler    | Condition                            | Errno        |
 //! |-----------|--------------------------------------|--------------|
-//! | `write`   | `FUSE_WRITE_CACHE` (when writeback-cache disabled) or unknown flags  | `EINVAL`     |
+//! | `write`   | kernel writeback-cache marker or any unknown flag | `EINVAL`     |
 //! | `lookup`  | `emit_lookup_reply` (no attr+no err) | `EIO`        |
 //! | `ioctl`   | bad fiemap request                   | (varies)     |
 //! | `getlk`   | deadlock detected                    | `EDEADLK`    |

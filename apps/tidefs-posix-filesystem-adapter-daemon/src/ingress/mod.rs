@@ -19,8 +19,10 @@ pub const SEAM_FAMILY_DOC: &str = concat!("seam.", env!("CARGO_PKG_NAME"), ".   
 pub const FUSE_WRITE_OPCODE: u32 = 16;
 /// FUSE fallocate operation opcode (kernel ABI).
 pub const FUSE_FALLOCATE_OPCODE: u32 = 43;
-/// FUSE_WRITE_CACHE: accepted when writeback-cache is enabled; rejected otherwise by the handler, not the classifier.
-pub const FUSE_WRITE_CACHE: u32 = 1;
+/// Kernel writeback-cache marker. The adapter never negotiates the
+/// corresponding capability, so ingress rejects this bit.
+#[cfg(test)]
+const FUSE_WRITE_CACHE: u32 = 1;
 /// FUSE_WRITE_LOCKOWNER marks `lock_owner` as valid.
 pub const FUSE_WRITE_LOCKOWNER: u32 = 2;
 /// FUSE_WRITE_KILL_PRIV / FUSE_WRITE_KILL_SUIDGID may be carried downstream.
@@ -30,7 +32,7 @@ pub const WRITE_ERRNO_EBADF: i32 = 9;
 /// POSIX EINVAL.
 pub const WRITE_ERRNO_EINVAL: i32 = 22;
 
-const SUPPORTED_WRITE_FLAGS: u32 = FUSE_WRITE_CACHE | FUSE_WRITE_LOCKOWNER | FUSE_WRITE_KILL_PRIV;
+const SUPPORTED_WRITE_FLAGS: u32 = FUSE_WRITE_LOCKOWNER | FUSE_WRITE_KILL_PRIV;
 
 /// Open-file handle projection needed by write ingress classification.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -2310,7 +2312,7 @@ mod tests {
             WriteClassifier::new()
                 .classify(&write_handles(), request)
                 .errno(),
-            None // FUSE_WRITE_CACHE is a known flag; gating happens in the handler
+            Some(WRITE_ERRNO_EINVAL)
         );
     }
 
@@ -2365,20 +2367,18 @@ mod tests {
     }
 
     #[test]
-    fn classify_write_accepts_cache_flag() {
+    fn classify_write_rejects_cache_flag() {
         let request = RawFuseWriteRequest {
             write_flags: FUSE_WRITE_CACHE,
             ..write_req()
         };
 
-        // FUSE_WRITE_CACHE is a known flag; gating on writeback-cache
-        // enablement happens in the handler, not the classifier.
-        match WriteClassifier::new().classify(&write_handles(), request) {
-            ClassifiedWrite::DirtyExtent(staging) => {
-                assert_eq!(staging.write_flags, FUSE_WRITE_CACHE);
-            }
-            other => panic!("expected DirtyExtent, got {other:?}"),
-        }
+        assert_eq!(
+            WriteClassifier::new()
+                .classify(&write_handles(), request)
+                .errno(),
+            Some(WRITE_ERRNO_EINVAL)
+        );
     }
 
     #[test]
@@ -2564,7 +2564,7 @@ mod tests {
             WriteClassifier::new()
                 .classify(&write_handles(), request)
                 .errno(),
-            None // FUSE_WRITE_CACHE is a known flag; gating happens in the handler
+            Some(WRITE_ERRNO_EINVAL)
         );
     }
 
@@ -2578,7 +2578,7 @@ mod tests {
             WriteClassifier::new()
                 .classify(&write_handles(), request)
                 .errno(),
-            None // FUSE_WRITE_CACHE is a known flag; gating happens in the handler
+            Some(WRITE_ERRNO_EINVAL)
         );
     }
 

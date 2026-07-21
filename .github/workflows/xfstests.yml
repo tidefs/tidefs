@@ -53,6 +53,10 @@ jobs:
           test -c /dev/kvm
           test -c /dev/fuse
 
+      - name: Mounted receipt-authority regression
+        if: ${{ matrix.target == 'fuse' && (github.event_name == 'schedule' || inputs.target == 'all' || inputs.target == matrix.target) }}
+        run: nix develop .#ci --command cargo test --locked -p tidefs-posix-filesystem-adapter-daemon --test receipt_authority_mount -- --nocapture
+
       - name: Prepare xfstests artifact root
         if: ${{ github.event_name == 'schedule' || inputs.target == 'all' || inputs.target == matrix.target }}
         env:

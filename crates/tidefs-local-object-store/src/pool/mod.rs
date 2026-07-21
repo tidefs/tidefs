@@ -33,8 +33,8 @@ use tidefs_types_pool_label_core::{
 };
 
 use crate::device::{
-    Device, DeviceBacking, DeviceClass, DeviceConfig, DeviceImpl, DeviceKind, DeviceState,
-    DeviceStats, DeviceStatus, IoClass,
+    Device, DeviceBacking, DeviceClass, DeviceConfig, DeviceImpl, DeviceKind, DeviceObjectFragment,
+    DeviceState, DeviceStats, DeviceStatus, IoClass,
 };
 use crate::device_health::{DeviceHealth, DeviceHealthState, DeviceHealthTransition};
 use crate::device_layout::{
@@ -584,10 +584,48 @@ struct ReconstructedErasureRead {
 const PLACEMENT_RECEIPT_MAGIC_V1: &[u8; 8] = b"TFSPRC1\0";
 const PLACEMENT_RECEIPT_MAGIC_V2: &[u8; 8] = b"TFSPRC2\0";
 const PLACEMENT_RECEIPT_MAGIC_V3: &[u8; 8] = b"TFSPRC3\0";
+const PLACEMENT_MUTATION_INTENT_MAGIC: &[u8; 8] = b"TFSPMI1\0";
 const PLACEMENT_RECEIPT_CONTEXT: &str = "TideFS pool placement receipt object key v1";
 const PLACEMENT_HASH_RING_VNODES_PER_GB: u64 = 16;
 
+/// Durable, replayable bridge between generation staging, receipt cutover,
+/// and receipt-bound physical reclaim.
+///
+/// The intent is persisted on every successor target before payload staging.
+/// It is retained after cutover until every obsolete physical fragment has
+/// actually disappeared, so a lost or corrupt reclaim queue cannot turn into
+/// a silent permanent leak.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PlacementMutationIntent {
+    old_receipt: Option<PlacementReceipt>,
+    replacement_receipt: PlacementReceipt,
+}
+
 impl PlacementReceipt {
+    /// Whether this generation is a durable deletion cutover rather than a
+    /// live payload locator.
+    #[must_use]
+    pub fn is_deleted(&self) -> bool {
+        self.shard_len == u32::MAX
+    }
+
+    fn has_valid_delete_tombstone_shape(&self) -> bool {
+        self.is_deleted()
+            && self.payload_len == 0
+            && self.payload_digest == digest32(&[])
+            && !self.targets.is_empty()
+            && self
+                .targets
+                .iter()
+                .all(|target| target.stored_digest == self.payload_digest)
+            && self
+                .planner_replay_receipt
+                .as_ref()
+                .is_some_and(|replay| {
+                    replay.size_hint_bytes == 0 && replay.per_target_bytes == 0
+                })
+    }
+
     /// Deterministic object-store subject id for shared rebuild/backfill models.
     ///
     /// Local pool receipts carry the full 32-byte object key rather than a
@@ -609,6 +647,11 @@ impl PlacementReceipt {
     /// Project this local placement receipt into the shared distributed receipt
     /// reference with an explicit caller-supplied subject id.
     pub fn shared_receipt_ref_for_subject(&self, object_id: u64) -> Result<PlacementReceiptRef> {
+        if self.is_deleted() {
+            return Err(StoreError::InvalidOptions {
+                reason: "deleted placement authority has no live shared receipt reference",
+            });
+        }
         let target_count =
             u16::try_from(self.targets.len()).map_err(|_| StoreError::InvalidOptions {
                 reason: "placement receipt target count exceeds shared receipt ref format",
@@ -626,6 +669,11 @@ impl PlacementReceipt {
     }
 
     fn encode(&self) -> Result<Vec<u8>> {
+        if self.is_deleted() && !self.has_valid_delete_tombstone_shape() {
+            return Err(StoreError::InvalidOptions {
+                reason: "invalid placement receipt delete tombstone",
+            });
+        }
         if self.targets.len() > u16::MAX as usize {
             return Err(StoreError::InvalidOptions {
                 reason: "placement receipt target count exceeds wire format",
@@ -752,10 +800,110 @@ impl PlacementReceipt {
             targets,
             planner_replay_receipt,
         };
-        if !planner_replay_receipt_matches_receipt(&receipt) {
+        if receipt.planner_replay_receipt.is_some()
+            && !planner_replay_receipt_matches_receipt(&receipt)
+        {
+            return None;
+        }
+        if receipt.is_deleted() && !receipt.has_valid_delete_tombstone_shape() {
             return None;
         }
         Some(receipt)
+    }
+}
+
+impl PlacementMutationIntent {
+    fn new(
+        old_receipt: Option<PlacementReceipt>,
+        replacement_receipt: PlacementReceipt,
+    ) -> Result<Self> {
+        if !placement_receipt_has_strict_authority(&replacement_receipt) {
+            return Err(StoreError::InvalidOptions {
+                reason: "placement mutation intent has invalid successor authority",
+            });
+        }
+        if let Some(old_receipt) = old_receipt.as_ref() {
+            if !placement_receipt_has_strict_authority(old_receipt)
+                || old_receipt.object_key != replacement_receipt.object_key
+                || (old_receipt.epoch, old_receipt.generation)
+                    >= (replacement_receipt.epoch, replacement_receipt.generation)
+            {
+                return Err(StoreError::InvalidOptions {
+                    reason: "placement mutation intent has invalid predecessor authority",
+                });
+            }
+        }
+        Ok(Self {
+            old_receipt,
+            replacement_receipt,
+        })
+    }
+
+    fn storage_key(&self) -> ObjectKey {
+        placement_mutation_intent_object_key(
+            self.replacement_receipt.object_key,
+            self.replacement_receipt.generation,
+        )
+    }
+
+    fn encode(&self) -> Result<Vec<u8>> {
+        let old = self
+            .old_receipt
+            .as_ref()
+            .map(PlacementReceipt::encode)
+            .transpose()?
+            .unwrap_or_default();
+        let replacement = self.replacement_receipt.encode()?;
+        let old_len = u32::try_from(old.len()).map_err(|_| StoreError::InvalidOptions {
+            reason: "placement mutation predecessor exceeds journal format",
+        })?;
+        let replacement_len =
+            u32::try_from(replacement.len()).map_err(|_| StoreError::InvalidOptions {
+                reason: "placement mutation successor exceeds journal format",
+            })?;
+        let mut encoded = Vec::with_capacity(17 + old.len() + replacement.len() + 32);
+        encoded.extend_from_slice(PLACEMENT_MUTATION_INTENT_MAGIC);
+        encoded.push(u8::from(self.old_receipt.is_some()));
+        encoded.extend_from_slice(&old_len.to_le_bytes());
+        encoded.extend_from_slice(&replacement_len.to_le_bytes());
+        encoded.extend_from_slice(&old);
+        encoded.extend_from_slice(&replacement);
+        let checksum = digest32(&encoded);
+        encoded.extend_from_slice(&checksum);
+        Ok(encoded)
+    }
+
+    fn decode(encoded: &[u8]) -> Option<Self> {
+        if encoded.len() < 8 + 1 + 4 + 4 + 32 {
+            return None;
+        }
+        let payload_end = encoded.len().checked_sub(32)?;
+        if digest32(encoded.get(..payload_end)?) != encoded.get(payload_end..)? {
+            return None;
+        }
+        let mut cursor = ReceiptCursor::new(encoded.get(..payload_end)?);
+        if cursor.take(8)? != PLACEMENT_MUTATION_INTENT_MAGIC {
+            return None;
+        }
+        let has_old = match cursor.u8()? {
+            0 => false,
+            1 => true,
+            _ => return None,
+        };
+        let old_len = u32::from_le_bytes(cursor.array()?) as usize;
+        let replacement_len = u32::from_le_bytes(cursor.array()?) as usize;
+        let old_bytes = cursor.take(old_len)?;
+        let replacement_bytes = cursor.take(replacement_len)?;
+        if !cursor.is_finished() || has_old != !old_bytes.is_empty() {
+            return None;
+        }
+        let old_receipt = if has_old {
+            Some(PlacementReceipt::decode(old_bytes)?)
+        } else {
+            None
+        };
+        let replacement_receipt = PlacementReceipt::decode(replacement_bytes)?;
+        Self::new(old_receipt, replacement_receipt).ok()
     }
 }
 
@@ -857,7 +1005,7 @@ fn placement_target_device_id(target: &PlacementReceiptTarget) -> u64 {
 
 fn planner_replay_receipt_matches_receipt(receipt: &PlacementReceipt) -> bool {
     let Some(replay_receipt) = receipt.planner_replay_receipt.as_ref() else {
-        return true;
+        return false;
     };
     let Ok(layout) = receipt.policy.layout() else {
         return false;
@@ -891,6 +1039,10 @@ fn planner_replay_receipt_matches_receipt(receipt: &PlacementReceipt) -> bool {
         }
     }
     true
+}
+
+fn placement_receipt_has_strict_authority(receipt: &PlacementReceipt) -> bool {
+    receipt.generation != 0 && planner_replay_receipt_matches_receipt(receipt)
 }
 
 fn reclaim_object_key(key: ObjectKey) -> ReclaimObjectKey {
@@ -928,18 +1080,327 @@ fn dead_object_replacement_receipt_for_object(
     ))
 }
 
-fn receipt_supersedes(candidate: &PlacementReceipt, current: &PlacementReceipt) -> Result<bool> {
-    let candidate_version = (candidate.epoch, candidate.generation);
-    let current_version = (current.epoch, current.generation);
-    if candidate_version == current_version {
-        if candidate != current {
+struct PlacementReceiptSelection {
+    receipt: PlacementReceipt,
+    conflicting_current: bool,
+}
+
+#[derive(Default)]
+struct PlacementReceiptAccumulator {
+    by_key: BTreeMap<ObjectKey, PlacementReceiptSelection>,
+}
+
+impl PlacementReceiptAccumulator {
+    fn observe(&mut self, candidate: PlacementReceipt) {
+        let candidate_version = (candidate.epoch, candidate.generation);
+        match self.by_key.entry(candidate.object_key) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(PlacementReceiptSelection {
+                    receipt: candidate,
+                    conflicting_current: false,
+                });
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                let selection = entry.get_mut();
+                let current_version = (selection.receipt.epoch, selection.receipt.generation);
+                if candidate_version > current_version {
+                    *selection = PlacementReceiptSelection {
+                        receipt: candidate,
+                        conflicting_current: false,
+                    };
+                } else if candidate_version == current_version && candidate != selection.receipt {
+                    selection.conflicting_current = true;
+                }
+            }
+        }
+    }
+
+    fn into_receipts(self) -> Result<BTreeMap<ObjectKey, PlacementReceipt>> {
+        let mut receipts = BTreeMap::new();
+        for (key, selection) in self.by_key {
+            if selection.conflicting_current {
+                return Err(StoreError::InvalidOptions {
+                    reason: "conflicting placement receipts share epoch and generation",
+                });
+            }
+            receipts.insert(key, selection.receipt);
+        }
+        Ok(receipts)
+    }
+}
+
+struct PlacementReceiptVersionObservation {
+    receipt: PlacementReceipt,
+    source_devices: BTreeSet<usize>,
+    conflicting: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PlacementReceiptPublicationState {
+    Absent,
+    Partial,
+    Complete,
+}
+
+#[derive(Default)]
+struct PlacementReceiptInventory {
+    by_key: BTreeMap<ObjectKey, BTreeMap<(u64, u64), PlacementReceiptVersionObservation>>,
+}
+
+impl PlacementReceiptInventory {
+    fn observe(&mut self, receipt: PlacementReceipt, source_device: usize) {
+        let version = (receipt.epoch, receipt.generation);
+        let versions = self.by_key.entry(receipt.object_key).or_default();
+        match versions.entry(version) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(PlacementReceiptVersionObservation {
+                    receipt,
+                    source_devices: BTreeSet::from([source_device]),
+                    conflicting: false,
+                });
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                let observation = entry.get_mut();
+                observation.source_devices.insert(source_device);
+                if observation.receipt != receipt {
+                    observation.conflicting = true;
+                }
+            }
+        }
+    }
+
+    fn select_current(
+        &self,
+        key: ObjectKey,
+        device_guids: &[[u8; 16]],
+        scope: &BTreeSet<usize>,
+    ) -> Result<Option<PlacementReceipt>> {
+        let Some(versions) = self.by_key.get(&key) else {
+            return Ok(None);
+        };
+
+        for observation in versions.values().rev() {
+            if observation.conflicting {
+                return Err(StoreError::InvalidOptions {
+                    reason: "conflicting placement receipts share epoch and generation",
+                });
+            }
+            let target_indices = receipt_target_indices(&observation.receipt, device_guids)?;
+            let observed_target_count = target_indices
+                .iter()
+                .filter(|idx| observation.source_devices.contains(idx))
+                .count();
+            if observed_target_count == 0 {
+                // A receipt copied only outside its recorded payload targets
+                // is not a cutover record and cannot supersede current data.
+                continue;
+            }
+            if target_indices.is_subset(scope)
+                && target_indices.is_subset(&observation.source_devices)
+            {
+                return Ok(Some(observation.receipt.clone()));
+            }
             return Err(StoreError::InvalidOptions {
-                reason: "conflicting placement receipts share epoch and generation",
+                reason: "placement receipt publication is incomplete or lost",
             });
         }
-        return Ok(false);
+        Ok(None)
     }
-    Ok(candidate_version > current_version)
+
+    fn observation(
+        &self,
+        receipt: &PlacementReceipt,
+    ) -> Option<&PlacementReceiptVersionObservation> {
+        self.by_key
+            .get(&receipt.object_key)?
+            .get(&(receipt.epoch, receipt.generation))
+    }
+
+    fn publication_state(
+        &self,
+        receipt: &PlacementReceipt,
+        device_guids: &[[u8; 16]],
+    ) -> Result<PlacementReceiptPublicationState> {
+        let Some(observation) = self.observation(receipt) else {
+            return Ok(PlacementReceiptPublicationState::Absent);
+        };
+        if observation.conflicting || observation.receipt != *receipt {
+            return Err(StoreError::InvalidOptions {
+                reason: "placement mutation successor receipt conflicts with durable intent",
+            });
+        }
+        let target_indices = receipt_target_indices(receipt, device_guids)?;
+        let observed_targets = target_indices
+            .intersection(&observation.source_devices)
+            .count();
+        if observed_targets == 0 {
+            Err(StoreError::InvalidOptions {
+                reason: "placement receipt exists only outside its recorded targets",
+            })
+        } else if target_indices.is_subset(&observation.source_devices) {
+            Ok(PlacementReceiptPublicationState::Complete)
+        } else {
+            Ok(PlacementReceiptPublicationState::Partial)
+        }
+    }
+
+    fn highest_observation(&self, key: ObjectKey) -> Option<&PlacementReceiptVersionObservation> {
+        self.by_key.get(&key)?.values().next_back()
+    }
+
+    fn select_all_current(
+        &self,
+        device_guids: &[[u8; 16]],
+        scope: &BTreeSet<usize>,
+    ) -> Result<Vec<PlacementReceipt>> {
+        self.by_key
+            .keys()
+            .copied()
+            .map(|key| self.select_current(key, device_guids, scope))
+            .filter_map(|result| match result {
+                Ok(Some(receipt)) => Some(Ok(receipt)),
+                Ok(None) => None,
+                Err(error) => Some(Err(error)),
+            })
+            .collect()
+    }
+}
+
+fn receipt_target_indices(
+    receipt: &PlacementReceipt,
+    device_guids: &[[u8; 16]],
+) -> Result<BTreeSet<usize>> {
+    let mut indices = BTreeSet::new();
+    for target in &receipt.targets {
+        let idx = device_guids
+            .iter()
+            .position(|guid| *guid == target.device_guid)
+            .ok_or(StoreError::InvalidOptions {
+                reason: "placement receipt references unavailable device",
+            })?;
+        if !indices.insert(idx) {
+            return Err(StoreError::InvalidOptions {
+                reason: "placement receipt repeats a target device",
+            });
+        }
+    }
+    if indices.len() != receipt.targets.len() {
+        return Err(StoreError::InvalidOptions {
+            reason: "placement receipt target identity is ambiguous",
+        });
+    }
+    Ok(indices)
+}
+
+struct DecodedPlacementReceiptCandidate {
+    receipt: PlacementReceipt,
+    fragments: Vec<DeviceObjectFragment>,
+    top_level_device_index: usize,
+}
+
+fn decoded_placement_receipt_candidates<'a>(
+    devices: impl IntoIterator<Item = (usize, &'a Device)>,
+    invalid_reason: &'static str,
+) -> Result<Vec<DecodedPlacementReceiptCandidate>> {
+    decoded_placement_receipt_candidates_inner(devices, invalid_reason, true)
+}
+
+fn decoded_placement_receipt_candidates_allowing_incomplete<'a>(
+    devices: impl IntoIterator<Item = (usize, &'a Device)>,
+    invalid_reason: &'static str,
+) -> Result<Vec<DecodedPlacementReceiptCandidate>> {
+    decoded_placement_receipt_candidates_inner(devices, invalid_reason, false)
+}
+
+fn decoded_placement_receipt_candidates_inner<'a>(
+    devices: impl IntoIterator<Item = (usize, &'a Device)>,
+    invalid_reason: &'static str,
+    require_complete_fragments: bool,
+) -> Result<Vec<DecodedPlacementReceiptCandidate>> {
+    let mut decoded = Vec::new();
+    for (top_level_device_index, device) in devices {
+        let candidates = if require_complete_fragments {
+            device.placement_receipt_candidates()
+        } else {
+            device.logical_object_candidates_matching(crate::is_pool_placement_receipt_key)
+        }
+        .map_err(|_| StoreError::InvalidOptions {
+            reason: invalid_reason,
+        })?;
+        for candidate in candidates {
+            let receipt =
+                PlacementReceipt::decode(&candidate.payload).ok_or(StoreError::InvalidOptions {
+                    reason: invalid_reason,
+                })?;
+            if placement_receipt_object_key(receipt.object_key) != candidate.storage_key
+                || !placement_receipt_has_strict_authority(&receipt)
+            {
+                return Err(StoreError::InvalidOptions {
+                    reason: invalid_reason,
+                });
+            }
+            decoded.push(DecodedPlacementReceiptCandidate {
+                receipt,
+                fragments: candidate.fragments,
+                top_level_device_index,
+            });
+        }
+    }
+    Ok(decoded)
+}
+
+#[derive(Clone)]
+struct PlacementMutationIntentObservation {
+    intent: PlacementMutationIntent,
+    source_devices: BTreeSet<usize>,
+    conflicting: bool,
+}
+
+fn placement_mutation_intent_inventory(
+    devices: &[Device],
+) -> Result<BTreeMap<ObjectKey, PlacementMutationIntentObservation>> {
+    let mut observations: BTreeMap<ObjectKey, PlacementMutationIntentObservation> = BTreeMap::new();
+    for (idx, device) in devices.iter().enumerate() {
+        let candidates = device
+            .logical_object_candidates_matching(crate::is_pool_placement_mutation_intent_key)
+            .map_err(|_| StoreError::InvalidOptions {
+                reason: "placement mutation intent fragments are unreadable",
+            })?;
+        for candidate in candidates {
+            let intent = PlacementMutationIntent::decode(&candidate.payload).ok_or(
+                StoreError::InvalidOptions {
+                    reason: "placement mutation intent is corrupt or unverifiable",
+                },
+            )?;
+            if candidate.storage_key != intent.storage_key() {
+                return Err(StoreError::InvalidOptions {
+                    reason: "placement mutation intent storage key mismatch",
+                });
+            }
+            match observations.entry(candidate.storage_key) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(PlacementMutationIntentObservation {
+                        intent,
+                        source_devices: BTreeSet::from([idx]),
+                        conflicting: false,
+                    });
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    let observation = entry.get_mut();
+                    observation.source_devices.insert(idx);
+                    if observation.intent != intent {
+                        observation.conflicting = true;
+                    }
+                }
+            }
+        }
+    }
+    if observations.values().any(|entry| entry.conflicting) {
+        return Err(StoreError::InvalidOptions {
+            reason: "placement mutation intent copies conflict",
+        });
+    }
+    Ok(observations)
 }
 
 struct ReceiptCursor<'a> {
@@ -1078,6 +1539,9 @@ pub struct Pool {
     /// Next monotonic receipt generation for distinguishing same-topology
     /// rewrites of the same logical object.
     next_placement_receipt_generation: u64,
+    /// A foreground mutation failed after durable intent persistence and must
+    /// be reconciled before another receipt mutation can create a sibling.
+    placement_mutation_recovery_required: bool,
     /// Hot-spare activation policy.  Defaults to [`SparePolicy::Manual`].
     spare_policy: SparePolicy,
     /// Log of device health transitions for observability.
@@ -1123,7 +1587,7 @@ impl CurrentPlacementReceiptRead<'_> {
 
     /// Read the object through the receipt returned by [`Self::receipt`].
     pub fn read(self) -> Result<Option<Vec<u8>>> {
-        self.pool.get_with_receipt(&self.receipt)
+        self.pool.get_with_current_receipt(&self.receipt)
     }
 }
 
@@ -1155,42 +1619,10 @@ fn discover_replacement_rebuild_subject_count(
     pool: &Pool,
     old_device_guid: [u8; 16],
 ) -> Result<u64> {
-    let mut receipts = BTreeMap::new();
-
-    for device in &pool.devices {
-        for receipt_key in device.store().list_keys_including_internal() {
-            if !crate::is_pool_placement_receipt_key(receipt_key) {
-                continue;
-            }
-
-            let raw = device.get(receipt_key)?.ok_or(StoreError::InvalidOptions {
-                reason: "replacement subject discovery found an unreadable placement receipt",
-            })?;
-            let receipt = PlacementReceipt::decode(&raw).ok_or(StoreError::InvalidOptions {
-                reason: "replacement subject discovery found a corrupt placement receipt",
-            })?;
-            if placement_receipt_object_key(receipt.object_key) != receipt_key
-                || receipt.planner_replay_receipt.is_none()
-                || !planner_replay_receipt_matches_receipt(&receipt)
-            {
-                return Err(StoreError::InvalidOptions {
-                    reason: "replacement subject discovery requires verified placement receipt authority",
-                });
-            }
-
-            let replace = match receipts.get(&receipt.object_key) {
-                Some(current) => receipt_supersedes(&receipt, current)?,
-                None => true,
-            };
-            if replace {
-                receipts.insert(receipt.object_key, receipt);
-            }
-        }
-    }
-
+    let receipts = pool.placement_receipts(IoClass::Data)?;
     u64::try_from(
         receipts
-            .values()
+            .iter()
             .filter(|receipt| {
                 receipt
                     .targets
@@ -1636,35 +2068,38 @@ fn placement_receipt_proves_device_evacuation(
 ) -> bool {
     receipt.payload_digest == payload_digest
         && receipt.payload_len == expected_payload.len() as u64
-        && receipt.planner_replay_receipt.is_some()
+        && placement_receipt_has_strict_authority(receipt)
         && !receipt.targets.is_empty()
         && receipt
             .targets
             .iter()
             .all(|target| target.device_guid != removed_device_guid)
-        && planner_replay_receipt_matches_receipt(receipt)
         && matches!(
             pool.get_with_receipt(receipt),
             Ok(Some(payload)) if payload.as_slice() == expected_payload
         )
 }
 
-fn next_placement_receipt_generation_for_devices(devices: &[Device]) -> u64 {
-    let max_generation = devices
-        .iter()
-        .flat_map(|device| {
-            device
-                .store()
-                .list_keys_including_internal()
-                .into_iter()
-                .filter(|key| crate::is_pool_placement_receipt_key(*key))
-                .filter_map(|key| device.get(key).ok().flatten())
-                .filter_map(|raw| PlacementReceipt::decode(&raw))
-                .map(|receipt| receipt.generation)
+fn next_placement_receipt_generation_for_devices(devices: &[Device]) -> Result<u64> {
+    let mut receipts = PlacementReceiptAccumulator::default();
+    let mut max_generation = 0;
+    for candidate in decoded_placement_receipt_candidates_allowing_incomplete(
+        devices.iter().enumerate(),
+        "placement receipt generation authority corrupt or unverifiable",
+    )? {
+        max_generation = max_generation.max(candidate.receipt.generation);
+        receipts.observe(candidate.receipt);
+    }
+    for observation in placement_mutation_intent_inventory(devices)?.into_values() {
+        max_generation = max_generation.max(observation.intent.replacement_receipt.generation);
+    }
+
+    let _ = receipts.into_receipts()?;
+    max_generation
+        .checked_add(1)
+        .ok_or(StoreError::InvalidOptions {
+            reason: "placement receipt generation authority is exhausted",
         })
-        .max()
-        .unwrap_or(0);
-    max_generation.saturating_add(1).max(1)
 }
 
 impl Pool {
@@ -1689,6 +2124,11 @@ impl Pool {
         properties: PoolProperties,
         options: &StoreOptions,
     ) -> Result<Self> {
+        if options.replica_count() != 0 {
+            return Err(StoreError::InvalidOptions {
+                reason: "Pool receipt durability cannot enumerate nested LocalObjectStore replicas",
+            });
+        }
         if pool_config_has_label_authority(&config) {
             return Self::open(config, properties, options);
         }
@@ -1714,7 +2154,7 @@ impl Pool {
 
         let devices = open_devices(&config, options)?;
         let next_placement_receipt_generation =
-            next_placement_receipt_generation_for_devices(&devices);
+            next_placement_receipt_generation_for_devices(&devices)?;
 
         // Build device-class-aware layout state.
         let media_classes: Vec<DeviceMediaClass> =
@@ -1764,6 +2204,7 @@ impl Pool {
             placement_epoch: 1,
             persisted_label_epoch: None,
             next_placement_receipt_generation,
+            placement_mutation_recovery_required: false,
             spare_policy: SparePolicy::Manual,
             health_transitions: Vec::new(),
             replacement: None,
@@ -1773,6 +2214,7 @@ impl Pool {
         };
 
         pool.persist_active_labels_if_needed()?;
+        pool.replay_placement_mutation_intents()?;
 
         // Resume interrupted device removal if a pending marker exists.
         resume_device_removal_if_pending(&mut pool);
@@ -1790,6 +2232,11 @@ impl Pool {
         properties: PoolProperties,
         options: &StoreOptions,
     ) -> Result<Self> {
+        if options.replica_count() != 0 {
+            return Err(StoreError::InvalidOptions {
+                reason: "Pool receipt durability cannot enumerate nested LocalObjectStore replicas",
+            });
+        }
         let mut properties = properties;
         let mut pool_guid: Option<[u8; 16]> = None;
         let mut device_guids: Vec<[u8; 16]> = Vec::new();
@@ -1982,8 +2429,14 @@ impl Pool {
         let classes: Vec<DeviceClass> = config.devices.iter().map(|vc| vc.class).collect();
         let class_map = build_class_map(&classes);
         let mut devices = open_devices(&config, options)?;
-        let next_placement_receipt_generation =
-            next_placement_receipt_generation_for_devices(&devices);
+        // A keyless encrypted import is an intentionally non-I/O handle. Its
+        // device wrappers cannot decode receipt or intent bytes, so defer both
+        // generation recovery and mutation replay until a keyed reopen.
+        let next_placement_receipt_generation = if locked {
+            1
+        } else {
+            next_placement_receipt_generation_for_devices(&devices)?
+        };
         if label_device_layouts.len() != devices.len() {
             return Err(StoreError::InvalidOptions {
                 reason: "pool label DeviceLayoutV1 count does not match devices",
@@ -2038,6 +2491,7 @@ impl Pool {
             placement_epoch: topology_generation.unwrap_or(1).max(1),
             persisted_label_epoch: Some(topology_generation.unwrap_or(1).max(1)),
             next_placement_receipt_generation,
+            placement_mutation_recovery_required: false,
             spare_policy: SparePolicy::Manual,
             health_transitions: Vec::new(),
             replacement: None,
@@ -2046,10 +2500,15 @@ impl Pool {
             locked,
         };
 
+        if !pool.locked {
+            pool.replay_placement_mutation_intents()?;
+        }
         restore_device_replacement_evidence(&mut pool)?;
 
         // Resume interrupted device removal if a pending marker exists.
-        resume_device_removal_if_pending(&mut pool);
+        if !pool.locked {
+            resume_device_removal_if_pending(&mut pool);
+        }
 
         Ok(pool)
     }
@@ -2400,17 +2859,32 @@ impl Pool {
         self.properties.redundancy_policy
     }
 
-    fn bump_placement_epoch(&mut self) {
-        self.placement_epoch = self.placement_epoch.saturating_add(1).max(1);
+    fn next_placement_epoch(&self) -> Result<u64> {
+        if self.placement_epoch == 0 {
+            return Ok(1);
+        }
+        self.placement_epoch
+            .checked_add(1)
+            .ok_or(StoreError::InvalidOptions {
+                reason: "placement topology epoch authority is exhausted",
+            })
     }
 
-    fn allocate_placement_receipt_generation(&mut self) -> u64 {
+    #[cfg(test)]
+    fn bump_placement_epoch(&mut self) -> Result<()> {
+        self.placement_epoch = self.next_placement_epoch()?;
+        Ok(())
+    }
+
+    fn allocate_placement_receipt_generation(&mut self) -> Result<u64> {
         let generation = self.next_placement_receipt_generation.max(1);
-        self.next_placement_receipt_generation = self
-            .next_placement_receipt_generation
-            .saturating_add(1)
-            .max(1);
-        generation
+        self.next_placement_receipt_generation =
+            generation
+                .checked_add(1)
+                .ok_or(StoreError::InvalidOptions {
+                    reason: "placement receipt generation authority is exhausted",
+                })?;
+        Ok(generation)
     }
 
     fn placement_failure_domain(&self, candidate_count: usize) -> Result<FailureDomainV1> {
@@ -2567,17 +3041,21 @@ impl Pool {
         })
     }
 
-    /// Return the persisted placement receipt for a key, if one exists.
+    /// Return the pool-wide current persisted placement receipt for a key, if
+    /// one exists.
     pub fn placement_receipt_for_key(
         &self,
-        class: IoClass,
+        _class: IoClass,
         key: ObjectKey,
     ) -> Result<Option<PlacementReceipt>> {
-        let indices: Vec<usize> = self.class_map.get(class).to_vec();
-        if indices.is_empty() {
+        let receipt = self.load_current_placement_receipt(key)?;
+        if receipt.as_ref().is_some_and(PlacementReceipt::is_deleted) {
             return Ok(None);
         }
-        self.load_placement_receipt(&indices, key)
+        if receipt.is_some() {
+            return Ok(receipt);
+        }
+        Ok(None)
     }
 
     /// Load the current persisted receipt and bind a read to that exact value.
@@ -2595,61 +3073,49 @@ impl Pool {
                 reason: "pool is locked: encryption key required for I/O",
             });
         }
-        let indices: Vec<usize> = self.class_map.get(class).to_vec();
-        if indices.is_empty() {
+        if let Some(receipt) = self.load_current_placement_receipt(key)? {
+            if receipt.is_deleted() {
+                return Ok(None);
+            }
+            return Ok(Some(CurrentPlacementReceiptRead {
+                pool: self,
+                receipt,
+            }));
+        }
+        if self.class_map.get(class).is_empty() {
             return Err(StoreError::InvalidOptions {
                 reason: "pool has no devices for this I/O class",
             });
         }
-
-        Ok(self
-            .load_placement_receipt(&indices, key)?
-            .map(|receipt| CurrentPlacementReceiptRead {
-                pool: self,
-                receipt,
-            }))
+        Ok(None)
     }
 
-    /// Return the latest persisted placement receipt for every logical object
-    /// in an I/O class.
+    /// Return the latest pool-wide persisted placement receipt for every
+    /// logical object visible to an I/O class.
     ///
     /// This is the public receipt-authority scan for rebuild, repair,
     /// relocation, and distributed state-transfer consumers. It hides the
     /// internal receipt object-key namespace and returns decoded logical
     /// receipts keyed by `object_key`.
-    pub fn placement_receipts(&self, class: IoClass) -> Result<Vec<PlacementReceipt>> {
-        let indices: Vec<usize> = self.class_map.get(class).to_vec();
-        if indices.is_empty() {
-            return Ok(Vec::new());
+    pub fn placement_receipts(&self, _class: IoClass) -> Result<Vec<PlacementReceipt>> {
+        let mut receipts = PlacementReceiptInventory::default();
+        for candidate in decoded_placement_receipt_candidates(
+            self.devices.iter().enumerate(),
+            "placement receipt corrupt or unverifiable",
+        )? {
+            receipts.observe(candidate.receipt, candidate.top_level_device_index);
         }
 
-        let mut receipts: BTreeMap<ObjectKey, PlacementReceipt> = BTreeMap::new();
-        for idx in self.usable_candidates(&indices) {
-            for key in self.devices[idx].store().list_keys_including_internal() {
-                if !crate::is_pool_placement_receipt_key(key) {
-                    continue;
-                }
-                let Ok(Some(raw)) = self.devices[idx].get(key) else {
-                    continue;
-                };
-                let Some(receipt) = PlacementReceipt::decode(&raw) else {
-                    continue;
-                };
-                if placement_receipt_object_key(receipt.object_key) != key {
-                    continue;
-                }
-
-                let replace = match receipts.get(&receipt.object_key) {
-                    Some(current) => receipt_supersedes(&receipt, current)?,
-                    None => true,
-                };
-                if replace {
-                    receipts.insert(receipt.object_key, receipt);
-                }
-            }
+        let scope: BTreeSet<usize> = (0..self.devices.len()).collect();
+        let receipts: Vec<_> = receipts
+            .select_all_current(&self.device_guids, &scope)?
+            .into_iter()
+            .filter(|receipt| !receipt.is_deleted())
+            .collect();
+        if !receipts.is_empty() {
+            return Ok(receipts);
         }
-
-        Ok(receipts.into_values().collect())
+        Ok(Vec::new())
     }
 
     /// Return the latest local placement receipts projected into the shared
@@ -2661,41 +3127,380 @@ impl Pool {
             .collect()
     }
 
+    fn load_current_placement_receipt(&self, key: ObjectKey) -> Result<Option<PlacementReceipt>> {
+        let indices: Vec<usize> = (0..self.devices.len()).collect();
+        self.load_placement_receipt(&indices, key)
+    }
+
+    /// Select a receipt from an explicitly scoped device set.
+    ///
+    /// Ordinary current-authority callers must use
+    /// [`Self::load_current_placement_receipt`]. The scoped form is retained
+    /// for safe-removal checks that deliberately ask whether the surviving
+    /// device set already contains the selected authority.
     fn load_placement_receipt(
         &self,
         indices: &[usize],
         key: ObjectKey,
     ) -> Result<Option<PlacementReceipt>> {
         let receipt_key = placement_receipt_object_key(key);
-        let mut best: Option<PlacementReceipt> = None;
-        let mut saw_invalid_receipt = false;
-        for idx in self.usable_candidates(indices) {
-            let raw = match self.devices[idx].get(receipt_key) {
-                Ok(Some(raw)) => raw,
-                Ok(None) | Err(_) => continue,
-            };
-            let Some(receipt) = PlacementReceipt::decode(&raw) else {
-                saw_invalid_receipt = true;
-                continue;
-            };
-            if receipt.object_key != key {
-                saw_invalid_receipt = true;
-                continue;
-            }
-            let replace = match best.as_ref() {
-                Some(current) => receipt_supersedes(&receipt, current)?,
-                None => true,
-            };
-            if replace {
-                best = Some(receipt);
+        let mut receipts = PlacementReceiptInventory::default();
+        for idx in indices.iter().copied() {
+            let candidate = self.devices[idx]
+                .exact_logical_object_for_key(receipt_key)
+                .map_err(|_| StoreError::InvalidOptions {
+                    reason: "placement receipt corrupt or unverifiable",
+                })?;
+            if let Some(candidate) = candidate {
+                let receipt = PlacementReceipt::decode(&candidate.payload).ok_or(
+                    StoreError::InvalidOptions {
+                        reason: "placement receipt corrupt or unverifiable",
+                    },
+                )?;
+                if candidate.storage_key != receipt_key
+                    || receipt.object_key != key
+                    || !placement_receipt_has_strict_authority(&receipt)
+                {
+                    return Err(StoreError::InvalidOptions {
+                        reason: "placement receipt corrupt or unverifiable",
+                    });
+                }
+                receipts.observe(receipt, idx);
             }
         }
-        if best.is_none() && saw_invalid_receipt {
+        let scope: BTreeSet<usize> = indices.iter().copied().collect();
+        receipts.select_current(key, &self.device_guids, &scope)
+    }
+
+    fn receipt_target_indices_in_scope(
+        &self,
+        indices: &[usize],
+        receipt: &PlacementReceipt,
+    ) -> Result<Vec<usize>> {
+        let scope: BTreeSet<_> = indices.iter().copied().collect();
+        let targets = receipt_target_indices(receipt, &self.device_guids)?;
+        if !targets.is_subset(&scope) {
             return Err(StoreError::InvalidOptions {
-                reason: "placement receipt corrupt or unverifiable",
+                reason: "placement receipt target is outside the authorized device scope",
             });
         }
-        Ok(best)
+        Ok(targets.into_iter().collect())
+    }
+
+    fn placement_receipt_inventory_allowing_incomplete(&self) -> Result<PlacementReceiptInventory> {
+        let mut inventory = PlacementReceiptInventory::default();
+        for candidate in decoded_placement_receipt_candidates_allowing_incomplete(
+            self.devices.iter().enumerate(),
+            "placement receipt replay inventory is corrupt or unverifiable",
+        )? {
+            inventory.observe(candidate.receipt, candidate.top_level_device_index);
+        }
+        Ok(inventory)
+    }
+
+    fn verify_complete_placement_receipt_inventory(&self) -> Result<()> {
+        let mut inventory = PlacementReceiptInventory::default();
+        for candidate in decoded_placement_receipt_candidates(
+            self.devices.iter().enumerate(),
+            "placement receipt replay left corrupt or incomplete authority",
+        )? {
+            inventory.observe(candidate.receipt, candidate.top_level_device_index);
+        }
+        let scope: BTreeSet<_> = (0..self.devices.len()).collect();
+        let _ = inventory.select_all_current(&self.device_guids, &scope)?;
+        Ok(())
+    }
+
+    fn verify_placement_mutation_intent_durability(
+        &self,
+        intent: &PlacementMutationIntent,
+    ) -> Result<()> {
+        let encoded = intent.encode()?;
+        for idx in receipt_target_indices(&intent.replacement_receipt, &self.device_guids)? {
+            self.verify_exact_logical_object(idx, intent.storage_key(), &encoded)?;
+        }
+        Ok(())
+    }
+
+    fn validate_placement_mutation_chain(
+        &self,
+        observations: &[PlacementMutationIntentObservation],
+    ) -> Result<()> {
+        for observation in observations {
+            let expected_targets = receipt_target_indices(
+                &observation.intent.replacement_receipt,
+                &self.device_guids,
+            )?;
+            if !observation.source_devices.is_subset(&expected_targets) {
+                return Err(StoreError::InvalidOptions {
+                    reason: "placement mutation intent exists outside its successor targets",
+                });
+            }
+        }
+        for pair in observations.windows(2) {
+            if pair[1].intent.old_receipt.as_ref() != Some(&pair[0].intent.replacement_receipt) {
+                return Err(StoreError::InvalidOptions {
+                    reason: "placement mutation intents do not form one linear authority chain",
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn replay_placement_mutation_intents(&mut self) -> Result<()> {
+        let mut grouped: BTreeMap<ObjectKey, Vec<PlacementMutationIntentObservation>> =
+            BTreeMap::new();
+        for observation in placement_mutation_intent_inventory(&self.devices)?.into_values() {
+            grouped
+                .entry(observation.intent.replacement_receipt.object_key)
+                .or_default()
+                .push(observation);
+        }
+
+        let receipt_inventory = self.placement_receipt_inventory_allowing_incomplete()?;
+        let all_indices: Vec<usize> = (0..self.devices.len()).collect();
+        let all_scope: BTreeSet<usize> = all_indices.iter().copied().collect();
+
+        for (logical_key, observations) in &mut grouped {
+            observations.sort_by_key(|observation| {
+                (
+                    observation.intent.replacement_receipt.epoch,
+                    observation.intent.replacement_receipt.generation,
+                )
+            });
+            self.validate_placement_mutation_chain(observations)?;
+
+            let highest = observations
+                .last()
+                .cloned()
+                .ok_or(StoreError::InvalidOptions {
+                    reason: "placement mutation intent group is unexpectedly empty",
+                })?;
+            let successor = &highest.intent.replacement_receipt;
+            let successor_version = (successor.epoch, successor.generation);
+            let highest_receipt = receipt_inventory.highest_observation(*logical_key);
+            let superseded = if let Some(observation) = highest_receipt {
+                let observed_version = (observation.receipt.epoch, observation.receipt.generation);
+                if observed_version > successor_version {
+                    if observation.conflicting
+                        || receipt_inventory
+                            .publication_state(&observation.receipt, &self.device_guids)?
+                            != PlacementReceiptPublicationState::Complete
+                    {
+                        return Err(StoreError::InvalidOptions {
+                            reason: "higher placement receipt does not completely supersede retained intent",
+                        });
+                    }
+                    self.verify_placement_receipt_payload(&observation.receipt)?;
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+            if !superseded {
+                match receipt_inventory.publication_state(successor, &self.device_guids)? {
+                    PlacementReceiptPublicationState::Absent => {
+                        let current = receipt_inventory.select_current(
+                            *logical_key,
+                            &self.device_guids,
+                            &all_scope,
+                        )?;
+                        if current.as_ref() != highest.intent.old_receipt.as_ref() {
+                            return Err(StoreError::InvalidOptions {
+                                reason:
+                                    "receipt-absent placement mutation lost predecessor authority",
+                            });
+                        }
+                        let mut intent_devices = highest.source_devices.clone();
+                        intent_devices
+                            .extend(receipt_target_indices(successor, &self.device_guids)?);
+                        self.rollback_precommit_placement_mutation(
+                            &highest.intent,
+                            intent_devices,
+                        )?;
+                        let current = self.load_current_placement_receipt(*logical_key)?;
+                        if current.as_ref() != highest.intent.old_receipt.as_ref() {
+                            return Err(StoreError::InvalidOptions {
+                                reason: "placement mutation rollback did not restore predecessor authority",
+                            });
+                        }
+                        observations.pop();
+                    }
+                    PlacementReceiptPublicationState::Partial
+                    | PlacementReceiptPublicationState::Complete => {
+                        self.verify_placement_mutation_intent_durability(&highest.intent)?;
+                        self.verify_placement_mutation_payload(&highest.intent)?;
+                        self.write_placement_receipt(&all_indices, successor)?;
+                    }
+                }
+            }
+
+            // Clear committed intents oldest-first. Stopping at the first
+            // unfinished reclaim preserves a contiguous retained chain.
+            for observation in observations.iter() {
+                match self.finalize_committed_placement_mutation_cleanup(
+                    &observation.intent,
+                    observation.source_devices.iter().copied(),
+                ) {
+                    Ok(true) => {}
+                    Ok(false) | Err(_) => break,
+                }
+            }
+        }
+
+        self.verify_complete_placement_receipt_inventory()?;
+        self.placement_mutation_recovery_required = false;
+        Ok(())
+    }
+
+    fn recover_pending_placement_mutation_if_required(&mut self) -> Result<()> {
+        if !self.placement_mutation_recovery_required {
+            return Ok(());
+        }
+        self.replay_placement_mutation_intents()
+    }
+
+    fn verify_exact_logical_object(
+        &self,
+        device_index: usize,
+        key: ObjectKey,
+        expected_payload: &[u8],
+    ) -> Result<()> {
+        self.ensure_explicit_physical_leaf_authority(device_index)?;
+        let candidate = self.devices[device_index]
+            .exact_logical_object_for_key(key)?
+            .ok_or(StoreError::InvalidOptions {
+                reason: "durability barrier lost a required physical object fragment",
+            })?;
+        if candidate.storage_key != key || candidate.payload != expected_payload {
+            return Err(StoreError::InvalidOptions {
+                reason: "durability barrier readback did not match the staged logical object",
+            });
+        }
+        Ok(())
+    }
+
+    fn ensure_explicit_physical_leaf_authority(&self, device_index: usize) -> Result<()> {
+        for leaf_index in 0..self.devices[device_index].physical_leaf_count() {
+            let store = self.devices[device_index]
+                .physical_store(leaf_index)
+                .ok_or(StoreError::InvalidOptions {
+                    reason: "placement target references an unavailable physical leaf",
+                })?;
+            if store.replica_count() != 0 {
+                return Err(StoreError::InvalidOptions {
+                    reason: "placement durability cannot verify nested LocalObjectStore replicas",
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn write_exact_logical_object(
+        &mut self,
+        device_index: usize,
+        key: ObjectKey,
+        payload: &[u8],
+        replace_existing: bool,
+    ) -> Result<StoredObject> {
+        self.ensure_explicit_physical_leaf_authority(device_index)?;
+        let state = self.devices[device_index].status().state;
+        if matches!(state, DeviceState::Faulted | DeviceState::Removed) {
+            return Err(StoreError::InvalidOptions {
+                reason: "placement target is unavailable for an exact durable write",
+            });
+        }
+        match self.devices[device_index].exact_logical_object_for_key(key) {
+            Ok(Some(candidate)) if candidate.payload == payload => {
+                self.devices[device_index].sync_all()?;
+                self.verify_exact_logical_object(device_index, key, payload)?;
+                return Ok(StoredObject {
+                    key,
+                    sequence: 0,
+                    len: payload.len() as u64,
+                    checksum: crate::store::checksum64(payload),
+                });
+            }
+            Ok(Some(_)) if !replace_existing => {
+                return Err(StoreError::InvalidOptions {
+                    reason: "generation-bound placement object already contains different bytes",
+                });
+            }
+            Err(error) if !replace_existing => return Err(error),
+            Ok(_) | Err(_) => {}
+        }
+        let stored = self.devices[device_index].put(key, payload)?;
+        self.devices[device_index].sync_all()?;
+        self.verify_exact_logical_object(device_index, key, payload)?;
+        Ok(stored)
+    }
+
+    fn delete_exact_logical_object(&mut self, device_index: usize, key: ObjectKey) -> Result<bool> {
+        self.ensure_explicit_physical_leaf_authority(device_index)?;
+        let fragments = self.devices[device_index].physical_fragments_for_key(key);
+        let existed = self.devices[device_index].delete(key)?;
+        self.devices[device_index].sync_all()?;
+        for fragment in fragments {
+            let store = self.devices[device_index]
+                .physical_store(fragment.leaf_index)
+                .ok_or(StoreError::InvalidOptions {
+                    reason: "physical object fragment references an unavailable leaf",
+                })?;
+            if store.get(fragment.key)?.is_some() {
+                return Err(StoreError::InvalidOptions {
+                    reason: "durable logical object deletion left a physical fragment",
+                });
+            }
+        }
+        Ok(existed)
+    }
+
+    fn persist_placement_mutation_intent(
+        &mut self,
+        indices: &[usize],
+        intent: &PlacementMutationIntent,
+    ) -> Result<()> {
+        let encoded = intent.encode()?;
+        let key = intent.storage_key();
+        let target_indices =
+            self.receipt_target_indices_in_scope(indices, &intent.replacement_receipt)?;
+        let mut written = Vec::new();
+        for idx in target_indices {
+            match self.write_exact_logical_object(idx, key, &encoded, false) {
+                Ok(_) => written.push(idx),
+                Err(error) => {
+                    let mut rollback_error = None;
+                    written.push(idx);
+                    for written_idx in written {
+                        if let Err(cleanup_error) =
+                            self.delete_exact_logical_object(written_idx, key)
+                        {
+                            rollback_error = Some(cleanup_error);
+                        }
+                    }
+                    return Err(rollback_error.unwrap_or(error));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn remove_placement_mutation_intent_from_devices(
+        &mut self,
+        intent: &PlacementMutationIntent,
+        source_devices: impl IntoIterator<Item = usize>,
+    ) -> Result<()> {
+        let key = intent.storage_key();
+        let mut last_error = None;
+        for idx in source_devices.into_iter().collect::<BTreeSet<_>>() {
+            if let Err(error) = self.delete_exact_logical_object(idx, key) {
+                last_error = Some(error);
+            }
+        }
+        last_error.map_or(Ok(()), Err)
     }
 
     fn write_placement_receipt(
@@ -2706,30 +3511,309 @@ impl Pool {
         self.ensure_receipt_replay_authority(receipt)?;
         let receipt_key = placement_receipt_object_key(receipt.object_key);
         let encoded = receipt.encode()?;
-        let mut wrote = false;
+        let target_indices = self.receipt_target_indices_in_scope(indices, receipt)?;
+        let target_count = target_indices.len();
+        let mut wrote = 0usize;
         let mut last_err = None;
-        for idx in self.usable_candidates(indices) {
-            match self.devices[idx].put(receipt_key, &encoded) {
-                Ok(_) => wrote = true,
+        for idx in target_indices {
+            match self.write_exact_logical_object(idx, receipt_key, &encoded, true) {
+                Ok(_) => wrote += 1,
                 Err(err) => last_err = Some(err),
             }
         }
-        if wrote {
-            Ok(())
-        } else {
-            Err(last_err.unwrap_or(StoreError::InvalidOptions {
-                reason: "placement receipt could not be persisted",
-            }))
+        if wrote != target_count {
+            return Err(last_err.unwrap_or(StoreError::InvalidOptions {
+                reason: "placement receipt target publication is incomplete",
+            }));
         }
+        let selected = self.load_placement_receipt(indices, receipt.object_key)?;
+        if selected.as_ref() != Some(receipt) {
+            return Err(StoreError::InvalidOptions {
+                reason: "placement receipt target publication failed readback",
+            });
+        }
+        Ok(())
     }
 
     fn ensure_receipt_replay_authority(&self, receipt: &PlacementReceipt) -> Result<()> {
-        if planner_replay_receipt_matches_receipt(receipt) {
+        if placement_receipt_has_strict_authority(receipt) {
             Ok(())
         } else {
             Err(StoreError::InvalidOptions {
                 reason: "placement replay receipt does not match local locator authority",
             })
+        }
+    }
+
+    fn prepare_placement_payload(
+        receipt: &mut PlacementReceipt,
+        payload: &[u8],
+    ) -> Result<Option<Vec<ErasureShard>>> {
+        match receipt.policy {
+            PoolRedundancyPolicy::Replicated { .. } => {
+                for target in &mut receipt.targets {
+                    target.stored_digest = receipt.payload_digest;
+                }
+                Ok(None)
+            }
+            PoolRedundancyPolicy::Erasure {
+                data_shards,
+                parity_shards,
+            } => {
+                let shard_len = payload.len().div_ceil(data_shards as usize).max(1);
+                if shard_len >= u32::MAX as usize {
+                    return Err(StoreError::PayloadTooLarge {
+                        len: payload.len() as u64,
+                        max: (u32::MAX as u64 - 1) * data_shards as u64,
+                    });
+                }
+                let stripe_config = StripeConfig {
+                    data_shards: data_shards as usize,
+                    parity_shards: parity_shards as usize,
+                    shard_len,
+                };
+                let encoded = encode_receipt_stripe(&stripe_config, payload).map_err(|_| {
+                    StoreError::InvalidOptions {
+                        reason: "erasure encoder rejected pool placement payload",
+                    }
+                })?;
+                let shard_len =
+                    u32::try_from(shard_len).map_err(|_| StoreError::PayloadTooLarge {
+                        len: payload.len() as u64,
+                        max: u32::MAX as u64 * data_shards as u64,
+                    })?;
+                receipt.shard_len = shard_len;
+                for target in &mut receipt.targets {
+                    let shard = encoded
+                        .shards
+                        .iter()
+                        .find(|shard| shard.index == target.shard_index as usize)
+                        .ok_or(StoreError::InvalidOptions {
+                            reason: "erasure placement receipt missing encoded shard",
+                        })?;
+                    target.stored_digest = digest32(&shard.bytes);
+                }
+                Ok(Some(encoded.shards))
+            }
+        }
+    }
+
+    fn rollback_replacement_payload(&mut self, intent: &PlacementMutationIntent) -> Result<()> {
+        let receipt = &intent.replacement_receipt;
+        let mut objects = BTreeSet::new();
+        for target in &receipt.targets {
+            let Some(key) = placement_payload_object_key_for_target(receipt, target) else {
+                continue;
+            };
+            let idx = self
+                .resolve_receipt_target(target)
+                .ok_or(StoreError::InvalidOptions {
+                    reason: "placement mutation rollback target is unavailable",
+                })?;
+            objects.insert((idx, key));
+        }
+        let mut last_error = None;
+        for (idx, key) in objects {
+            if let Err(error) = self.delete_exact_logical_object(idx, key) {
+                last_error = Some(error);
+            }
+        }
+        last_error.map_or(Ok(()), Err)
+    }
+
+    fn rollback_precommit_placement_mutation(
+        &mut self,
+        intent: &PlacementMutationIntent,
+        intent_devices: impl IntoIterator<Item = usize>,
+    ) -> Result<()> {
+        self.rollback_replacement_payload(intent)?;
+        self.remove_placement_mutation_intent_from_devices(intent, intent_devices)
+    }
+
+    fn verify_placement_receipt_payload(&self, receipt: &PlacementReceipt) -> Result<()> {
+        self.ensure_receipt_replay_authority(receipt)?;
+        if receipt.is_deleted() {
+            return Ok(());
+        }
+        for target in &receipt.targets {
+            let idx = self
+                .resolve_receipt_target(target)
+                .ok_or(StoreError::InvalidOptions {
+                    reason: "placement mutation payload target is unavailable",
+                })?;
+            self.ensure_explicit_physical_leaf_authority(idx)?;
+            let key = placement_payload_object_key_for_target(receipt, target).ok_or(
+                StoreError::InvalidOptions {
+                    reason: "live placement mutation has no generation-bound payload key",
+                },
+            )?;
+            let candidate = self.devices[idx].exact_logical_object_for_key(key)?.ok_or(
+                StoreError::InvalidOptions {
+                    reason: "placement mutation payload is incomplete or lost",
+                },
+            )?;
+            if candidate.storage_key != key
+                || digest32(&candidate.payload) != target.stored_digest
+                || (matches!(receipt.policy, PoolRedundancyPolicy::Replicated { .. })
+                    && (candidate.payload.len() as u64 != receipt.payload_len
+                        || target.stored_digest != receipt.payload_digest))
+                || (matches!(receipt.policy, PoolRedundancyPolicy::Erasure { .. })
+                    && candidate.payload.len() != receipt.shard_len as usize)
+            {
+                return Err(StoreError::InvalidOptions {
+                    reason: "placement mutation payload readback failed receipt verification",
+                });
+            }
+        }
+        let payload = self
+            .get_with_receipt(receipt)?
+            .ok_or(StoreError::InvalidOptions {
+                reason: "placement mutation payload cannot be reconstructed from its targets",
+            })?;
+        if payload.len() as u64 != receipt.payload_len
+            || digest32(&payload) != receipt.payload_digest
+        {
+            return Err(StoreError::InvalidOptions {
+                reason: "placement mutation logical payload digest does not match its receipt",
+            });
+        }
+        Ok(())
+    }
+
+    fn verify_placement_mutation_payload(&self, intent: &PlacementMutationIntent) -> Result<()> {
+        self.verify_placement_receipt_payload(&intent.replacement_receipt)
+    }
+
+    fn remove_stale_predecessor_receipts(
+        &mut self,
+        intent: &PlacementMutationIntent,
+    ) -> Result<()> {
+        let Some(old_receipt) = intent.old_receipt.as_ref() else {
+            return Ok(());
+        };
+        let replacement_targets =
+            receipt_target_indices(&intent.replacement_receipt, &self.device_guids)?;
+        let receipt_key = placement_receipt_object_key(old_receipt.object_key);
+        let replacement_version = (
+            intent.replacement_receipt.epoch,
+            intent.replacement_receipt.generation,
+        );
+        let mut old_only_targets = BTreeSet::new();
+        for target in &old_receipt.targets {
+            let idx = self
+                .resolve_receipt_target(target)
+                .ok_or(StoreError::InvalidOptions {
+                    reason: "placement mutation predecessor target is unavailable",
+                })?;
+            if !replacement_targets.contains(&idx) {
+                old_only_targets.insert(idx);
+            }
+        }
+        for idx in old_only_targets {
+            let Some(candidate) = self.devices[idx].exact_logical_object_for_key(receipt_key)?
+            else {
+                continue;
+            };
+            let stored_receipt =
+                PlacementReceipt::decode(&candidate.payload).ok_or(StoreError::InvalidOptions {
+                    reason: "stale predecessor receipt is corrupt or unverifiable",
+                })?;
+            if stored_receipt.object_key != old_receipt.object_key {
+                return Err(StoreError::InvalidOptions {
+                    reason: "stale predecessor receipt has the wrong logical key",
+                });
+            }
+            if (stored_receipt.epoch, stored_receipt.generation) <= replacement_version {
+                self.delete_exact_logical_object(idx, receipt_key)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn obsolete_placement_payload_is_absent(
+        &self,
+        intent: &PlacementMutationIntent,
+    ) -> Result<bool> {
+        let Some(old_receipt) = intent.old_receipt.as_ref() else {
+            return Ok(true);
+        };
+        if old_receipt.is_deleted() {
+            return Ok(true);
+        }
+        let mut objects = BTreeSet::new();
+        for target in &old_receipt.targets {
+            let idx = self
+                .resolve_receipt_target(target)
+                .ok_or(StoreError::InvalidOptions {
+                    reason: "obsolete placement target is unavailable",
+                })?;
+            let key = placement_payload_object_key_for_target(old_receipt, target).ok_or(
+                StoreError::InvalidOptions {
+                    reason: "obsolete live placement has no generation-bound payload key",
+                },
+            )?;
+            objects.insert((idx, key));
+        }
+        for (idx, key) in objects {
+            match self.devices[idx].logical_object_candidates_for_key(key) {
+                Ok(candidates) if candidates.is_empty() => {}
+                Ok(_) => return Ok(false),
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(true)
+    }
+
+    fn finalize_committed_placement_mutation_cleanup(
+        &mut self,
+        intent: &PlacementMutationIntent,
+        intent_devices: impl IntoIterator<Item = usize>,
+    ) -> Result<bool> {
+        self.remove_stale_predecessor_receipts(intent)?;
+        if self.obsolete_placement_payload_is_absent(intent)? {
+            let mut sources: BTreeSet<_> = intent_devices.into_iter().collect();
+            sources.extend(receipt_target_indices(
+                &intent.replacement_receipt,
+                &self.device_guids,
+            )?);
+            self.remove_placement_mutation_intent_from_devices(intent, sources)?;
+            return Ok(true);
+        }
+        if let Some(old_receipt) = intent.old_receipt.as_ref() {
+            if !old_receipt.is_deleted() {
+                self.enqueue_obsolete_placement_after_replacement(
+                    old_receipt,
+                    &intent.replacement_receipt,
+                )?;
+            }
+        }
+        Ok(false)
+    }
+
+    fn record_committed_placement_mutation(
+        &mut self,
+        intent: &PlacementMutationIntent,
+        intent_devices: impl IntoIterator<Item = usize>,
+    ) -> Result<()> {
+        self.remove_stale_predecessor_receipts(intent)?;
+        match intent.old_receipt.as_ref() {
+            None => {
+                let mut sources: BTreeSet<_> = intent_devices.into_iter().collect();
+                sources.extend(receipt_target_indices(
+                    &intent.replacement_receipt,
+                    &self.device_guids,
+                )?);
+                self.remove_placement_mutation_intent_from_devices(intent, sources)
+            }
+            Some(old_receipt) if !old_receipt.is_deleted() => self
+                .enqueue_obsolete_placement_after_replacement(
+                    old_receipt,
+                    &intent.replacement_receipt,
+                ),
+            // A rewrite after a tombstone can coexist with an older retained
+            // cleanup intent. Keep this successor intent until oldest-first
+            // replay proves the whole chain can advance without a gap.
+            Some(_) => Ok(()),
         }
     }
 
@@ -2740,25 +3824,71 @@ impl Pool {
         payload: &[u8],
         indices: &[usize],
     ) -> Result<StoredObject> {
-        let old_receipt = self.load_placement_receipt(indices, key)?;
+        self.recover_pending_placement_mutation_if_required()?;
+        let old_receipt = self.load_current_placement_receipt(key)?;
         let mut receipt = self.plan_pool_wide_placement(class, key, payload.len(), indices)?;
-        receipt.generation = self.allocate_placement_receipt_generation();
+        receipt.generation = self.allocate_placement_receipt_generation()?;
         receipt.payload_digest = digest32(payload);
+        let erasure_shards = Self::prepare_placement_payload(&mut receipt, payload)?;
+        self.ensure_receipt_replay_authority(&receipt)?;
         self.persist_active_labels_if_needed()?;
+
+        let intent = PlacementMutationIntent::new(old_receipt.clone(), receipt.clone())?;
+        self.persist_placement_mutation_intent(indices, &intent)?;
 
         let stored = match receipt.policy {
             PoolRedundancyPolicy::Replicated { .. } => {
-                self.put_replicated_with_receipt(key, payload, indices, &mut receipt)
+                self.put_replicated_with_receipt(key, payload, &receipt)
             }
-            PoolRedundancyPolicy::Erasure { .. } => {
-                self.put_erasure_with_receipt(key, payload, indices, &mut receipt)
-            }
-        }?;
+            PoolRedundancyPolicy::Erasure { .. } => self.put_erasure_with_receipt(
+                key,
+                payload,
+                erasure_shards
+                    .as_deref()
+                    .ok_or(StoreError::InvalidOptions {
+                        reason: "erasure placement payload was not prepared",
+                    })?,
+                &receipt,
+            ),
+        };
 
-        if let Some(old_receipt) = old_receipt.as_ref() {
-            self.enqueue_obsolete_placement_after_replacement(old_receipt, &receipt)?;
+        let stored = match stored {
+            Ok(stored) => stored,
+            Err(error) => {
+                let target_indices =
+                    self.receipt_target_indices_in_scope(indices, &intent.replacement_receipt)?;
+                let rollback = self.rollback_precommit_placement_mutation(&intent, target_indices);
+                self.health = compute_health(&self.devices);
+                self.record_health_transitions();
+                return Err(rollback.err().unwrap_or(error));
+            }
+        };
+
+        if let Err(error) = self.verify_placement_mutation_payload(&intent) {
+            let target_indices =
+                self.receipt_target_indices_in_scope(indices, &intent.replacement_receipt)?;
+            let rollback = self.rollback_precommit_placement_mutation(&intent, target_indices);
+            self.health = compute_health(&self.devices);
+            self.record_health_transitions();
+            return Err(rollback.err().unwrap_or(error));
         }
 
+        if let Err(error) = self.write_placement_receipt(indices, &receipt) {
+            // Payload and intent are already durable. Never delete staged data
+            // after publication may have reached one target; reopen replay will
+            // finish the cutover or fail closed.
+            self.health = compute_health(&self.devices);
+            self.record_health_transitions();
+            return Err(error);
+        }
+
+        // Receipt readback above is the commit point. Cleanup failure cannot
+        // turn a committed write into a reported precommit failure: retain the
+        // durable intent so reopen or a stable-generation drain can retry it.
+        let _ = self.record_committed_placement_mutation(&intent, std::iter::empty());
+
+        self.health = compute_health(&self.devices);
+        self.record_health_transitions();
         Ok(stored)
     }
 
@@ -2766,8 +3896,7 @@ impl Pool {
         &mut self,
         key: ObjectKey,
         payload: &[u8],
-        indices: &[usize],
-        receipt: &mut PlacementReceipt,
+        receipt: &PlacementReceipt,
     ) -> Result<StoredObject> {
         let target_indices: Vec<(usize, usize)> = receipt
             .targets
@@ -2781,77 +3910,44 @@ impl Pool {
             });
         }
 
-        let mut written_indices = Vec::with_capacity(target_indices.len());
+        let staged_key = placement_replica_object_key(key, receipt.generation);
         let mut last_object = None;
-        for (target_pos, idx) in target_indices {
-            let result = self.devices[idx].put(key, payload);
+        for (_target_pos, idx) in target_indices {
+            let result = self.write_exact_logical_object(idx, staged_key, payload, false);
             self.record_device_write_result(idx, payload.len(), &result);
             match result {
                 Ok(object) => {
-                    receipt.targets[target_pos].stored_digest = receipt.payload_digest;
-                    written_indices.push(idx);
                     last_object = Some(object);
                 }
-                Err(err) => {
-                    for rollback_idx in written_indices {
-                        let _ = self.devices[rollback_idx].delete(key);
-                    }
-                    self.health = compute_health(&self.devices);
-                    self.record_health_transitions();
-                    return Err(err);
-                }
+                Err(err) => return Err(err),
             }
         }
-
-        self.write_placement_receipt(indices, receipt)?;
-        self.cleanup_stale_replicated_copies(key, indices, receipt);
-        self.health = compute_health(&self.devices);
-        self.record_health_transitions();
-        Ok(last_object.unwrap_or(StoredObject {
+        let mut stored = last_object.unwrap_or(StoredObject {
             key,
             sequence: 0,
             len: payload.len() as u64,
             checksum: crate::store::checksum64(payload),
-        }))
+        });
+        stored.key = key;
+        Ok(stored)
     }
 
     fn put_erasure_with_receipt(
         &mut self,
         key: ObjectKey,
         payload: &[u8],
-        indices: &[usize],
-        receipt: &mut PlacementReceipt,
+        shards: &[ErasureShard],
+        receipt: &PlacementReceipt,
     ) -> Result<StoredObject> {
-        let PoolRedundancyPolicy::Erasure {
-            data_shards,
-            parity_shards,
-        } = receipt.policy
-        else {
+        if !matches!(receipt.policy, PoolRedundancyPolicy::Erasure { .. }) {
             return Err(StoreError::InvalidOptions {
                 reason: "erasure write requested for non-erasure receipt",
             });
-        };
-        let shard_len = payload.len().div_ceil(data_shards as usize).max(1);
-        let stripe_config = StripeConfig {
-            data_shards: data_shards as usize,
-            parity_shards: parity_shards as usize,
-            shard_len,
-        };
-        let encoded = encode_receipt_stripe(&stripe_config, payload).map_err(|_| {
-            StoreError::InvalidOptions {
-                reason: "erasure encoder rejected pool placement payload",
-            }
-        })?;
-        receipt.shard_len = shard_len as u32;
+        }
 
-        let mut written = Vec::with_capacity(receipt.targets.len());
         for target_pos in 0..receipt.targets.len() {
             let shard_index = receipt.targets[target_pos].shard_index as usize;
-            let Some(shard) = encoded
-                .shards
-                .iter()
-                .find(|shard| shard.index == shard_index)
-            else {
+            let Some(shard) = shards.iter().find(|shard| shard.index == shard_index) else {
                 return Err(StoreError::InvalidOptions {
                     reason: "erasure placement receipt missing encoded shard",
                 });
@@ -2861,29 +3957,14 @@ impl Pool {
                     reason: "erasure placement receipt references unavailable device",
                 });
             };
-            let shard_key = placement_shard_object_key(key, shard_index as u16);
-            let result = self.devices[idx].put(shard_key, &shard.bytes);
+            let shard_key = placement_shard_object_key(key, receipt.generation, shard_index as u16);
+            let result = self.write_exact_logical_object(idx, shard_key, &shard.bytes, false);
             self.record_device_write_result(idx, shard.bytes.len(), &result);
             match result {
-                Ok(_) => {
-                    receipt.targets[target_pos].stored_digest = digest32(&shard.bytes);
-                    written.push((idx, shard_key));
-                }
-                Err(err) => {
-                    for (rollback_idx, rollback_key) in written {
-                        let _ = self.devices[rollback_idx].delete(rollback_key);
-                    }
-                    self.health = compute_health(&self.devices);
-                    self.record_health_transitions();
-                    return Err(err);
-                }
+                Ok(_) => {}
+                Err(err) => return Err(err),
             }
         }
-
-        self.write_placement_receipt(indices, receipt)?;
-        self.cleanup_stale_erasure_shards(key, indices, receipt);
-        self.health = compute_health(&self.devices);
-        self.record_health_transitions();
         Ok(StoredObject {
             key,
             sequence: 0,
@@ -2900,10 +3981,6 @@ impl Pool {
         self.enqueue_obsolete_placement_with_clearance(old_receipt, replacement_receipt)
     }
 
-    fn enqueue_committed_deleted_placement(&mut self, receipt: &PlacementReceipt) -> Result<()> {
-        self.enqueue_obsolete_placement_with_clearance(receipt, receipt)
-    }
-
     fn enqueue_obsolete_placement_with_clearance(
         &mut self,
         old_receipt: &PlacementReceipt,
@@ -2913,13 +3990,18 @@ impl Pool {
             PoolRedundancyPolicy::Replicated { .. } => {
                 let mut queued_indices = BTreeSet::new();
                 for target in &old_receipt.targets {
-                    let Some(idx) = self.resolve_receipt_target(target) else {
-                        continue;
-                    };
+                    let idx =
+                        self.resolve_receipt_target(target)
+                            .ok_or(StoreError::InvalidOptions {
+                                reason: "obsolete replicated placement target is unavailable",
+                            })?;
                     if queued_indices.insert(idx) {
                         self.enqueue_replaced_physical_object(
                             idx,
-                            old_receipt.object_key,
+                            placement_replica_object_key(
+                                old_receipt.object_key,
+                                old_receipt.generation,
+                            ),
                             replacement_receipt,
                         )?;
                     }
@@ -2928,11 +4010,16 @@ impl Pool {
             PoolRedundancyPolicy::Erasure { .. } => {
                 let mut queued_objects = BTreeSet::new();
                 for target in &old_receipt.targets {
-                    let Some(idx) = self.resolve_receipt_target(target) else {
-                        continue;
-                    };
-                    let shard_key =
-                        placement_shard_object_key(old_receipt.object_key, target.shard_index);
+                    let idx =
+                        self.resolve_receipt_target(target)
+                            .ok_or(StoreError::InvalidOptions {
+                                reason: "obsolete erasure placement target is unavailable",
+                            })?;
+                    let shard_key = placement_shard_object_key(
+                        old_receipt.object_key,
+                        old_receipt.generation,
+                        target.shard_index,
+                    );
                     if queued_objects.insert((idx, shard_key)) {
                         self.enqueue_replaced_physical_object(idx, shard_key, replacement_receipt)?;
                     }
@@ -2948,65 +4035,40 @@ impl Pool {
         object_key: ObjectKey,
         replacement_receipt: &PlacementReceipt,
     ) -> Result<()> {
-        let replacement =
-            dead_object_replacement_receipt_for_object(object_key, replacement_receipt)?;
-        let death_txg = replacement.receipt_generation;
-        let entry = DeadObjectEntry::new(
-            reclaim_object_key(object_key),
-            self.pool_guid,
-            death_txg,
-            true,
-            death_txg,
-        )
-        .with_replacement_receipt(replacement);
-        self.devices[device_index]
-            .store_mut()
-            .enqueue_receipt_bound_dead_object(entry)?;
+        let fragments: BTreeSet<_> = self.devices[device_index]
+            .physical_fragments_for_key(object_key)
+            .into_iter()
+            .collect();
+        for fragment in fragments {
+            let present = self.devices[device_index]
+                .physical_store(fragment.leaf_index)
+                .ok_or(StoreError::InvalidOptions {
+                    reason: "obsolete placement fragment references an unavailable leaf",
+                })?
+                .get(fragment.key)?
+                .is_some();
+            if !present {
+                continue;
+            }
+            let replacement =
+                dead_object_replacement_receipt_for_object(fragment.key, replacement_receipt)?;
+            let death_txg = replacement.receipt_generation;
+            let entry = DeadObjectEntry::new(
+                reclaim_object_key(fragment.key),
+                self.pool_guid,
+                death_txg,
+                true,
+                death_txg,
+            )
+            .with_replacement_receipt(replacement);
+            self.devices[device_index]
+                .physical_store_mut(fragment.leaf_index)
+                .ok_or(StoreError::InvalidOptions {
+                    reason: "obsolete placement fragment references an unavailable leaf",
+                })?
+                .enqueue_receipt_bound_dead_object(entry)?;
+        }
         Ok(())
-    }
-
-    fn cleanup_stale_replicated_copies(
-        &mut self,
-        key: ObjectKey,
-        indices: &[usize],
-        receipt: &PlacementReceipt,
-    ) {
-        let target_indices: BTreeSet<usize> = receipt
-            .targets
-            .iter()
-            .filter_map(|target| self.resolve_receipt_target(target))
-            .collect();
-        for idx in self.usable_candidates(indices) {
-            if !target_indices.contains(&idx) {
-                let _ = self.devices[idx].delete(key);
-            }
-        }
-    }
-
-    fn cleanup_stale_erasure_shards(
-        &mut self,
-        key: ObjectKey,
-        indices: &[usize],
-        receipt: &PlacementReceipt,
-    ) {
-        let target_by_index: BTreeMap<usize, u16> = receipt
-            .targets
-            .iter()
-            .filter_map(|target| {
-                self.resolve_receipt_target(target)
-                    .map(|idx| (idx, target.shard_index))
-            })
-            .collect();
-        for idx in self.usable_candidates(indices) {
-            let keep_shard = target_by_index.get(&idx).copied();
-            for shard_index in 0..receipt.targets.len() {
-                let shard_key = placement_shard_object_key(key, shard_index as u16);
-                if keep_shard != Some(shard_index as u16) {
-                    let _ = self.devices[idx].delete(shard_key);
-                }
-            }
-            let _ = self.devices[idx].delete(key);
-        }
     }
 
     /// Store an object, routing by `class`.
@@ -3092,9 +4154,8 @@ impl Pool {
         }
 
         let stored = self.put(class, key, payload)?;
-        let indices: Vec<usize> = self.class_map.get(class).to_vec();
         let receipt =
-            self.load_placement_receipt(&indices, key)?
+            self.load_current_placement_receipt(key)?
                 .ok_or(StoreError::InvalidOptions {
                     reason: "placement receipt not found after pool-wide write",
                 })?;
@@ -3150,7 +4211,7 @@ impl Pool {
             });
         }
         let receipt =
-            self.load_placement_receipt(&indices, key)?
+            self.load_current_placement_receipt(key)?
                 .ok_or(StoreError::InvalidOptions {
                     reason: "erasure read repair requires a placement receipt",
                 })?;
@@ -3160,9 +4221,11 @@ impl Pool {
             });
         }
 
-        let Some(read) = self.reconstruct_erasure_with_receipt(&receipt)? else {
-            return Ok(None);
-        };
+        let read =
+            self.reconstruct_erasure_with_receipt(&receipt)?
+                .ok_or(StoreError::InvalidOptions {
+                    reason: "placement receipt payload is unavailable or corrupt",
+                })?;
         if read.rebuilt_shard_indices.is_empty() {
             return Ok(Some(ErasureReadWithReceipt {
                 payload: read.payload,
@@ -3186,13 +4249,25 @@ impl Pool {
         }))
     }
 
-    /// Retrieve an object from its persisted placement receipt when present.
+    /// Retrieve an object through pool-wide current placement authority.
+    ///
+    /// Receiptless raw reads are valid only for [`IoClass::IntentLog`]. Other
+    /// classes return ordinary absence only after every attached device proves
+    /// that neither a receipt nor raw bytes for the key exist.
     pub fn get(&self, class: IoClass, key: ObjectKey) -> Result<Option<Vec<u8>>> {
         if self.locked {
             return Err(StoreError::InvalidOptions {
                 reason: "pool is locked: encryption key required for I/O",
             });
         }
+
+        if let Some(receipt) = self.load_current_placement_receipt(key)? {
+            if receipt.is_deleted() {
+                return Ok(None);
+            }
+            return self.get_with_current_receipt(&receipt);
+        }
+
         let indices: Vec<usize> = self.class_map.get(class).to_vec();
         if indices.is_empty() {
             return Err(StoreError::InvalidOptions {
@@ -3200,19 +4275,37 @@ impl Pool {
             });
         }
 
-        if let Some(receipt) = self.load_placement_receipt(&indices, key)? {
-            return self.get_with_receipt(&receipt);
+        if matches!(class, IoClass::IntentLog) {
+            let mut last_error = None;
+            for idx in self.read_order_for_key(class, key, &indices) {
+                match self.devices[idx].get(key) {
+                    Ok(Some(data)) => return Ok(Some(data)),
+                    Ok(None) => continue,
+                    Err(error) => {
+                        // IntentLog keeps receiptless write-all semantics, so a
+                        // failed member does not prevent another member from
+                        // serving the same log record.
+                        last_error = Some(error);
+                        continue;
+                    }
+                }
+            }
+            return last_error.map_or(Ok(None), Err);
         }
 
-        for idx in self.read_order_for_key(class, key, &indices) {
+        for idx in 0..self.devices.len() {
             match self.devices[idx].get(key) {
-                Ok(Some(data)) => return Ok(Some(data)),
-                Ok(None) => continue,
-                Err(e) => {
-                    // Log the error but try other devices (e.g., mirrors with
-                    // one bad member)
-                    let _ = e;
-                    continue;
+                Ok(Some(_)) => {
+                    return Err(StoreError::InvalidOptions {
+                        reason:
+                            "non-IntentLog object bytes exist without placement receipt authority",
+                    });
+                }
+                Ok(None) => {}
+                Err(_) => {
+                    return Err(StoreError::InvalidOptions {
+                        reason: "non-IntentLog receiptless object absence cannot be verified",
+                    });
                 }
             }
         }
@@ -3220,19 +4313,31 @@ impl Pool {
     }
 
     fn get_with_receipt(&self, receipt: &PlacementReceipt) -> Result<Option<Vec<u8>>> {
+        if receipt.is_deleted() {
+            return Ok(None);
+        }
         match receipt.policy {
             PoolRedundancyPolicy::Replicated { .. } => self.get_replicated_with_receipt(receipt),
             PoolRedundancyPolicy::Erasure { .. } => self.get_erasure_with_receipt(receipt),
         }
     }
 
+    fn get_with_current_receipt(&self, receipt: &PlacementReceipt) -> Result<Option<Vec<u8>>> {
+        self.get_with_receipt(receipt)?
+            .map(Some)
+            .ok_or(StoreError::InvalidOptions {
+                reason: "placement receipt payload is unavailable or corrupt",
+            })
+    }
+
     fn get_replicated_with_receipt(&self, receipt: &PlacementReceipt) -> Result<Option<Vec<u8>>> {
         self.ensure_receipt_replay_authority(receipt)?;
+        let physical_key = placement_replica_object_key(receipt.object_key, receipt.generation);
         for target in &receipt.targets {
             let Some(idx) = self.resolve_receipt_target(target) else {
                 continue;
             };
-            match self.devices[idx].get(receipt.object_key) {
+            match self.devices[idx].get(physical_key) {
                 Ok(Some(payload)) if digest32(&payload) == receipt.payload_digest => {
                     return Ok(Some(payload));
                 }
@@ -3310,9 +4415,14 @@ impl Pool {
             let Some(idx) = self.resolve_receipt_target(target) else {
                 continue;
             };
-            let shard_key = placement_shard_object_key(receipt.object_key, target.shard_index);
-            let Some(bytes) = self.devices[idx].get(shard_key)? else {
-                continue;
+            let shard_key = placement_shard_object_key(
+                receipt.object_key,
+                receipt.generation,
+                target.shard_index,
+            );
+            let bytes = match self.devices[idx].get(shard_key) {
+                Ok(Some(bytes)) => bytes,
+                Ok(None) | Err(_) => continue,
             };
             if digest32(&bytes) != target.stored_digest {
                 continue;
@@ -3363,31 +4473,48 @@ impl Pool {
 
     /// Delete an object from every device that can hold this I/O class.
     pub fn delete(&mut self, class: IoClass, key: ObjectKey) -> Result<bool> {
-        let indices: Vec<usize> = self.class_map.get(class).to_vec();
-        if indices.is_empty() {
+        self.recover_pending_placement_mutation_if_required()?;
+        let class_indices: Vec<usize> = self.class_map.get(class).to_vec();
+        if class_indices.is_empty() {
             return Err(StoreError::InvalidOptions {
                 reason: "pool has no devices for this I/O class",
             });
         }
-
-        if let Some(receipt) = self.load_placement_receipt(&indices, key)? {
-            let deleted = self.delete_with_receipt(&receipt, &indices)?;
-            if deleted {
-                self.enqueue_committed_deleted_placement(&receipt)?;
+        if let Some(receipt) = self.load_current_placement_receipt(key)? {
+            if receipt.is_deleted() {
+                return Ok(false);
             }
+            let deleted = self.delete_with_receipt(class, &receipt, &class_indices)?;
             self.health = compute_health(&self.devices);
             self.record_health_transitions();
             return Ok(deleted);
         }
 
+        let indices: Vec<usize> = if matches!(class, IoClass::IntentLog) {
+            class_indices
+        } else {
+            (0..self.devices.len()).collect()
+        };
+
         let mut deleted = false;
         let mut attempted = false;
         let mut last_err = None;
 
-        for idx in self.usable_candidates(&indices) {
+        for idx in indices.iter().copied() {
             attempted = true;
             match self.devices[idx].delete(key) {
                 Ok(was_present) => deleted |= was_present,
+                Err(err) => last_err = Some(err),
+            }
+        }
+        for idx in indices.iter().copied() {
+            match self.devices[idx].get(key) {
+                Ok(None) => {}
+                Ok(Some(_)) => {
+                    last_err = Some(StoreError::InvalidOptions {
+                        reason: "delete left an attached logical object copy",
+                    });
+                }
                 Err(err) => last_err = Some(err),
             }
         }
@@ -3395,14 +4522,12 @@ impl Pool {
         self.health = compute_health(&self.devices);
         self.record_health_transitions();
 
-        if deleted {
+        if let Some(err) = last_err {
+            Err(err)
+        } else if deleted {
             Ok(true)
         } else if attempted {
-            if let Some(err) = last_err {
-                Err(err)
-            } else {
-                Ok(false)
-            }
+            Ok(false)
         } else {
             Err(StoreError::InvalidOptions {
                 reason: "delete: no healthy devices available",
@@ -3410,39 +4535,72 @@ impl Pool {
         }
     }
 
+    fn prepare_delete_tombstone(
+        &mut self,
+        class: IoClass,
+        receipt: &PlacementReceipt,
+        indices: &[usize],
+    ) -> Result<PlacementReceipt> {
+        let mut tombstone = self.plan_pool_wide_placement(class, receipt.object_key, 0, indices)?;
+        tombstone.generation = self.allocate_placement_receipt_generation()?;
+        tombstone.payload_len = 0;
+        tombstone.shard_len = u32::MAX;
+        tombstone.payload_digest = digest32(&[]);
+        for target in &mut tombstone.targets {
+            target.stored_digest = tombstone.payload_digest;
+        }
+        self.ensure_receipt_replay_authority(&tombstone)?;
+        Ok(tombstone)
+    }
+
+    fn publish_delete_tombstone(
+        &mut self,
+        receipt: &PlacementReceipt,
+        tombstone: &PlacementReceipt,
+        indices: &[usize],
+    ) -> Result<()> {
+        let intent = PlacementMutationIntent::new(Some(receipt.clone()), tombstone.clone())?;
+        self.persist_active_labels_if_needed()?;
+        self.persist_placement_mutation_intent(indices, &intent)?;
+        if let Err(error) = self.verify_placement_mutation_intent_durability(&intent) {
+            let target_indices =
+                self.receipt_target_indices_in_scope(indices, &intent.replacement_receipt)?;
+            let rollback = self.rollback_precommit_placement_mutation(&intent, target_indices);
+            return Err(rollback.err().unwrap_or(error));
+        }
+        if let Err(error) = self.write_placement_receipt(indices, tombstone) {
+            // A target may already contain the successor receipt. Retain the
+            // intent so reopen completes rather than rolling back a deletion
+            // that may already be authoritative.
+            return Err(error);
+        }
+        let _ = self.record_committed_placement_mutation(&intent, std::iter::empty());
+        Ok(())
+    }
+
     fn delete_with_receipt(
         &mut self,
+        class: IoClass,
         receipt: &PlacementReceipt,
         indices: &[usize],
     ) -> Result<bool> {
-        let mut deleted = false;
-        match receipt.policy {
-            PoolRedundancyPolicy::Replicated { .. } => {
-                for idx in self.usable_candidates(indices) {
-                    deleted |= self.devices[idx]
-                        .delete(receipt.object_key)
-                        .unwrap_or(false);
-                }
-            }
-            PoolRedundancyPolicy::Erasure { .. } => {
-                for idx in self.usable_candidates(indices) {
-                    for target in &receipt.targets {
-                        let shard_key =
-                            placement_shard_object_key(receipt.object_key, target.shard_index);
-                        deleted |= self.devices[idx].delete(shard_key).unwrap_or(false);
-                    }
-                    deleted |= self.devices[idx]
-                        .delete(receipt.object_key)
-                        .unwrap_or(false);
-                }
-            }
+        if receipt.is_deleted() {
+            return Ok(false);
         }
+        let tombstone = self.prepare_delete_tombstone(class, receipt, indices)?;
+        self.publish_delete_tombstone(receipt, &tombstone, indices)?;
 
-        let receipt_key = placement_receipt_object_key(receipt.object_key);
-        for idx in self.usable_candidates(indices) {
-            deleted |= self.devices[idx].delete(receipt_key).unwrap_or(false);
+        let selected = self
+            .load_current_placement_receipt(receipt.object_key)?
+            .ok_or(StoreError::InvalidOptions {
+                reason: "placement delete tombstone was not readable after publication",
+            })?;
+        if selected != tombstone || !selected.is_deleted() {
+            return Err(StoreError::InvalidOptions {
+                reason: "placement delete tombstone did not become current authority",
+            });
         }
-        Ok(deleted)
+        Ok(true)
     }
 
     /// Drain receipt-authorized dead objects across the devices for an I/O class
@@ -3501,16 +4659,22 @@ impl Pool {
         let mut aggregate = PoolReceiptBoundDeadObjectDrainStats::default();
         let mut remaining = max_count;
         for idx in self.usable_candidates(&indices) {
-            let stats = self.devices[idx]
-                .store_mut()
-                .drain_receipt_bound_dead_objects_at_stable_generation(
-                    stable_committed_txg,
-                    stable_committed_generation,
-                    remaining,
-                )?;
             aggregate.devices_scanned += 1;
-            aggregate.absorb_reclaim_stats(stats);
-            remaining = remaining.saturating_sub(stats.entries_processed);
+            let leaf_count = self.devices[idx].physical_leaf_count();
+            for leaf_index in 0..leaf_count {
+                let stats = self.devices[idx]
+                    .physical_store_mut(leaf_index)
+                    .ok_or(StoreError::InvalidOptions {
+                        reason: "receipt-bound reclaim references an unavailable physical leaf",
+                    })?
+                    .drain_receipt_bound_dead_objects_at_stable_generation(
+                        stable_committed_txg,
+                        stable_committed_generation,
+                        remaining,
+                    )?;
+                aggregate.absorb_reclaim_stats(stats);
+                remaining = remaining.saturating_sub(stats.entries_processed);
+            }
         }
 
         if aggregate.devices_scanned == 0 {
@@ -3520,6 +4684,7 @@ impl Pool {
             .into());
         }
 
+        self.replay_placement_mutation_intents()?;
         self.health = compute_health(&self.devices);
         self.record_health_transitions();
         Ok(aggregate)
@@ -3551,6 +4716,7 @@ impl Pool {
 
     /// Add a device to the running pool.
     pub fn add_device(&mut self, config: DeviceConfig, options: &StoreOptions) -> Result<()> {
+        let next_topology_epoch = self.next_placement_epoch()?;
         let config_for_record = config.clone();
         let mut dev_opts = options.clone();
         dev_opts.max_segment_bytes = config.media_class.default_segment_size();
@@ -3573,7 +4739,7 @@ impl Pool {
         self.write_allocator = WriteAllocator::new(self.media_classes.clone(), total_bytes);
         self.health = compute_health(&self.devices);
         self.config.devices.push(config_for_record);
-        self.bump_placement_epoch();
+        self.placement_epoch = next_topology_epoch;
         self.record_health_transitions();
         Ok(())
     }
@@ -3639,6 +4805,7 @@ impl Pool {
         commit_group: u64,
         options: &StoreOptions,
     ) -> Result<()> {
+        let next_topology_epoch = self.next_placement_epoch()?;
         // Find the faulted device's index.
         let faulted_index = self
             .device_guids
@@ -3692,7 +4859,7 @@ impl Pool {
         self.write_allocator = WriteAllocator::new(self.media_classes.clone(), total_bytes);
 
         self.health = compute_health(&self.devices);
-        self.bump_placement_epoch();
+        self.placement_epoch = next_topology_epoch;
         self.record_health_transitions();
 
         Ok(())
@@ -3753,6 +4920,7 @@ impl Pool {
     /// Remove a device by path. The device must be quiesced first (data on it
     /// will be unavailable after removal).
     pub fn remove_device(&mut self, path: &Path) -> Result<()> {
+        let next_topology_epoch = self.next_placement_epoch()?;
         let idx = self.devices.iter().position(|v| v.root() == path).ok_or(
             StoreError::InvalidOptions {
                 reason: "device not found",
@@ -3831,7 +4999,7 @@ impl Pool {
             .map(|d| d.store().capacity_bytes())
             .collect();
         self.write_allocator = WriteAllocator::new(self.media_classes.clone(), total_bytes);
-        self.bump_placement_epoch();
+        self.placement_epoch = next_topology_epoch;
         self.health = compute_health(&self.devices);
         self.record_health_transitions();
         Ok(())
@@ -3862,6 +5030,7 @@ impl Pool {
                 reason: "pool is locked: encryption key required for I/O",
             });
         }
+        self.recover_pending_placement_mutation_if_required()?;
 
         let target_idx = self.devices.iter().position(|v| v.root() == path).ok_or(
             StoreError::InvalidOptions {
@@ -3929,6 +5098,24 @@ impl Pool {
             });
         }
 
+        for observation in placement_mutation_intent_inventory(&self.devices)?.into_values() {
+            let depends_on_target = observation.source_devices.contains(&target_idx)
+                || observation
+                    .intent
+                    .old_receipt
+                    .as_ref()
+                    .into_iter()
+                    .chain(std::iter::once(&observation.intent.replacement_receipt))
+                    .flat_map(|receipt| receipt.targets.iter())
+                    .any(|target| target.device_guid == target_guid);
+            if depends_on_target {
+                return Err(StoreError::InvalidOptions {
+                    reason:
+                        "device removal target is referenced by an unresolved placement mutation",
+                });
+            }
+        }
+
         // Refuse to remove the last device.
         if self.devices.len() <= 1 {
             return Err(StoreError::InvalidOptions {
@@ -3969,19 +5156,15 @@ impl Pool {
             .filter(|&i| i != target_idx)
             .collect();
 
-        // Enumerate objects on the target device so internal metadata can be
-        // ignored and unreceipted logical keys can fail closed.
-        let keys = self.devices[target_idx]
-            .store()
-            .list_keys_including_internal();
+        // Enumerate every physical leaf of the target. Composite receipt
+        // fragments are accounted below; anything else left without current
+        // receipt authority remains a removal blocker.
+        let physical_fragments = self.devices[target_idx].physical_object_fragments();
         let mut result = EvacuationResult::default();
 
-        let mut internal_placement_keys = BTreeSet::new();
-        let mut current_logical_keys = BTreeSet::new();
-        let mut rewritten_logical_keys = BTreeSet::new();
-        let mut placement_receipts = BTreeMap::new();
+        let mut accounted_physical_fragments = BTreeSet::new();
+        let mut placement_receipts = PlacementReceiptInventory::default();
         let mut failed_logical_keys = BTreeSet::new();
-        let mut unverifiable_receipt_keys = BTreeSet::new();
 
         let mut mark_failed = |result: &mut EvacuationResult, key: ObjectKey| {
             if failed_logical_keys.insert(key) {
@@ -3990,115 +5173,94 @@ impl Pool {
             }
         };
 
-        for key in &keys {
-            if !crate::is_pool_placement_receipt_key(*key) {
-                continue;
-            }
-            let raw = self.devices[target_idx]
-                .get(*key)?
-                .ok_or(StoreError::InvalidOptions {
-                    reason: "placement receipt corrupt or unverifiable",
-                })?;
-            let receipt = PlacementReceipt::decode(&raw).ok_or(StoreError::InvalidOptions {
-                reason: "placement receipt corrupt or unverifiable",
-            })?;
-            if placement_receipt_object_key(receipt.object_key) != *key {
-                return Err(StoreError::InvalidOptions {
-                    reason: "placement receipt corrupt or unverifiable",
-                });
-            }
-
-            internal_placement_keys.insert(*key);
-            if matches!(receipt.policy, PoolRedundancyPolicy::Erasure { .. }) {
-                for target in &receipt.targets {
-                    internal_placement_keys.insert(placement_shard_object_key(
-                        receipt.object_key,
-                        target.shard_index,
-                    ));
-                }
-            }
-
-            // Faulted devices are excluded from the pool-wide receipt scan,
-            // so retain target-local authority for evacuation selection.
-            let replace = match placement_receipts.get(&receipt.object_key) {
-                Some(current) => receipt_supersedes(&receipt, current)?,
-                None => true,
-            };
-            if replace {
-                placement_receipts.insert(receipt.object_key, receipt);
-            }
-        }
-
         // Device class and health control rewrite eligibility, not receipt
         // authority. A dedicated metadata or cache device, including a
         // faulted one, can still carry a readable newer receipt; hiding it
         // here could let removal republish stale payload with a newer
-        // generation. Inspect every other pool device and fail closed when a
-        // visible receipt cannot be read or verified.
-        for idx in (0..self.devices.len()).filter(|idx| *idx != target_idx) {
-            for key in self.devices[idx].store().list_keys_including_internal() {
-                if !crate::is_pool_placement_receipt_key(key) {
-                    continue;
+        // generation. Inspect every physical receipt observation on every
+        // attached device and fail closed when any cannot be verified.
+        for (idx, device) in self.devices.iter().enumerate() {
+            for candidate in decoded_placement_receipt_candidates(
+                std::iter::once((idx, device)),
+                "placement receipt corrupt or unverifiable",
+            )? {
+                if idx == target_idx {
+                    accounted_physical_fragments.extend(candidate.fragments.iter().copied());
                 }
-                let Some(raw) = self.devices[idx].get(key)? else {
-                    unverifiable_receipt_keys.insert(key);
-                    continue;
-                };
-                let Some(receipt) = PlacementReceipt::decode(&raw) else {
-                    unverifiable_receipt_keys.insert(key);
-                    continue;
-                };
-                if placement_receipt_object_key(receipt.object_key) != key {
-                    unverifiable_receipt_keys.insert(key);
-                    continue;
-                }
+                placement_receipts.observe(candidate.receipt, idx);
+            }
+        }
 
-                internal_placement_keys.insert(key);
-                if matches!(receipt.policy, PoolRedundancyPolicy::Erasure { .. }) {
+        let all_indices: BTreeSet<usize> = (0..self.devices.len()).collect();
+        let placement_receipts =
+            placement_receipts.select_all_current(&self.device_guids, &all_indices)?;
+
+        for receipt in placement_receipts {
+            accounted_physical_fragments.extend(
+                self.devices[target_idx]
+                    .physical_fragments_for_key(placement_receipt_object_key(receipt.object_key)),
+            );
+            match receipt.policy {
+                PoolRedundancyPolicy::Replicated { .. } => {
+                    accounted_physical_fragments.extend(
+                        self.devices[target_idx].physical_fragments_for_key(
+                            placement_replica_object_key(receipt.object_key, receipt.generation),
+                        ),
+                    );
+                }
+                PoolRedundancyPolicy::Erasure { .. } => {
                     for target in &receipt.targets {
-                        internal_placement_keys.insert(placement_shard_object_key(
-                            receipt.object_key,
-                            target.shard_index,
-                        ));
+                        accounted_physical_fragments.extend(
+                            self.devices[target_idx].physical_fragments_for_key(
+                                placement_shard_object_key(
+                                    receipt.object_key,
+                                    receipt.generation,
+                                    target.shard_index,
+                                ),
+                            ),
+                        );
                     }
                 }
+            }
 
-                let replace = match placement_receipts.get(&receipt.object_key) {
-                    Some(current) => receipt_supersedes(&receipt, current)?,
-                    None => true,
-                };
-                if replace {
-                    placement_receipts.insert(receipt.object_key, receipt);
+            if receipt.is_deleted() {
+                if !receipt
+                    .targets
+                    .iter()
+                    .any(|target| target.device_guid == target_guid)
+                {
+                    continue;
                 }
-            }
-        }
-
-        let mut unverifiable_logical_keys = BTreeSet::new();
-        for receipt_key in unverifiable_receipt_keys {
-            let Some(receipt) = placement_receipts
-                .values()
-                .find(|receipt| placement_receipt_object_key(receipt.object_key) == receipt_key)
-            else {
-                return Err(StoreError::InvalidOptions {
-                    reason: "placement receipt corrupt or unverifiable",
-                });
-            };
-            unverifiable_logical_keys.insert(receipt.object_key);
-        }
-
-        for receipt in placement_receipts.into_values() {
-            current_logical_keys.insert(receipt.object_key);
-
-            if unverifiable_logical_keys.contains(&receipt.object_key) {
-                mark_failed(&mut result, receipt.object_key);
-                continue;
-            }
-
-            // Older receipt encodings have no sealed planner replay authority.
-            // They remain readable for in-tree harness data, but cannot prove
-            // which payload and targets are current enough to retire a source.
-            if receipt.planner_replay_receipt.is_none() {
-                mark_failed(&mut result, receipt.object_key);
+                let tombstone =
+                    self.prepare_delete_tombstone(IoClass::Data, &receipt, &surviving_indices)?;
+                self.publish_delete_tombstone(&receipt, &tombstone, &surviving_indices)?;
+                let survivor_receipt = self
+                    .load_placement_receipt(&surviving_indices, receipt.object_key)?
+                    .ok_or(StoreError::InvalidOptions {
+                        reason: "safe removal could not preserve placement delete authority",
+                    })?;
+                if survivor_receipt != tombstone || !survivor_receipt.is_deleted() {
+                    return Err(StoreError::InvalidOptions {
+                        reason: "safe removal could not preserve placement delete authority",
+                    });
+                }
+                if placement_mutation_intent_inventory(&self.devices)?
+                    .into_values()
+                    .any(|observation| observation.intent.replacement_receipt == tombstone)
+                {
+                    return Err(StoreError::InvalidOptions {
+                        reason: "safe removal delete cutover cleanup remains unresolved",
+                    });
+                }
+                let receipt_key = placement_receipt_object_key(receipt.object_key);
+                if self.devices[target_idx]
+                    .exact_logical_object_for_key(receipt_key)?
+                    .is_some()
+                {
+                    return Err(StoreError::InvalidOptions {
+                        reason: "safe removal left stale delete authority on retiring device",
+                    });
+                }
                 continue;
             }
 
@@ -4163,7 +5325,6 @@ impl Pool {
                 continue;
             }
 
-            rewritten_logical_keys.insert(receipt.object_key);
             result.objects_evacuated += 1;
             result.bytes_evacuated += len;
             result.content_digests.insert(receipt.object_key, digest);
@@ -4183,19 +5344,15 @@ impl Pool {
             self.devices[idx].sync_all()?;
         }
 
-        // Receipt-backed logical objects were rewritten above; placement
-        // metadata is skipped only when a readable receipt accounts for it.
-        // An orphaned shard or any remaining logical key on the target is a
-        // removal blocker, not a legacy hash-routed evacuation candidate.
-        for key in &keys {
-            if internal_placement_keys.contains(key)
-                || rewritten_logical_keys.contains(key)
-                || current_logical_keys.contains(key)
-            {
+        // Receipt-backed logical objects and every composite fragment used to
+        // store them are accounted above. An orphaned copy, column, length
+        // marker, or any other physical key remains a removal blocker.
+        for fragment in &physical_fragments {
+            if accounted_physical_fragments.contains(fragment) {
                 continue;
             }
 
-            mark_failed(&mut result, *key);
+            mark_failed(&mut result, fragment.key);
         }
 
         // If any objects failed, do not remove the device.
@@ -4249,6 +5406,7 @@ impl Pool {
                 reason: "a device replacement is already in progress",
             });
         }
+        let next_topology_epoch = self.next_placement_epoch()?;
 
         let replayed_evidence = self
             .replacement_evidence
@@ -4267,7 +5425,7 @@ impl Pool {
                     != Some(old_path)
                 || self.device_guids.get(evidence.device_index).copied()
                     != Some(evidence.old_device_guid)
-                || evidence.topology_epoch != self.placement_epoch.saturating_add(1).max(1)
+                || evidence.topology_epoch != next_topology_epoch
             {
                 return Err(StoreError::InvalidOptions {
                     reason: "device replacement resume does not match durable evidence",
@@ -4319,7 +5477,7 @@ impl Pool {
                 pool_guid: self.pool_guid,
                 old_device_guid,
                 new_device_guid: rand::random(),
-                topology_epoch: self.placement_epoch.saturating_add(1).max(1),
+                topology_epoch: next_topology_epoch,
                 device_index: idx,
                 old_path: old_path.to_path_buf(),
                 new_path: new_config.path.clone(),
@@ -4520,7 +5678,7 @@ impl Pool {
                 });
             }
             evidence.state = ReplacementRebuildStatusState::Canceled;
-            evidence.topology_epoch = self.placement_epoch.saturating_add(1).max(1);
+            evidence.topology_epoch = self.next_placement_epoch()?;
             persist_device_replacement_evidence(&self.config.root_path, &evidence)?;
             let canceled_topology_epoch = evidence.topology_epoch;
             self.replacement_evidence = Some(evidence);
@@ -4555,7 +5713,7 @@ impl Pool {
             });
         }
         evidence.state = ReplacementRebuildStatusState::Canceled;
-        evidence.topology_epoch = self.placement_epoch.saturating_add(1).max(1);
+        evidence.topology_epoch = self.next_placement_epoch()?;
         persist_device_replacement_evidence(&self.config.root_path, &evidence)?;
         self.replacement_evidence = Some(evidence.clone());
 
@@ -5757,14 +6915,52 @@ fn placement_receipt_object_key(key: ObjectKey) -> ObjectKey {
     ObjectKey::from_bytes32(bytes)
 }
 
-fn placement_shard_object_key(key: ObjectKey, shard_index: u16) -> ObjectKey {
+fn placement_mutation_intent_object_key(key: ObjectKey, generation: u64) -> ObjectKey {
     let mut hasher = blake3::Hasher::new_derive_key(PLACEMENT_RECEIPT_CONTEXT);
-    hasher.update(b"shard");
+    hasher.update(b"mutation-intent");
     hasher.update(&key.as_bytes32());
+    hasher.update(&generation.to_le_bytes());
+    let mut bytes = *hasher.finalize().as_bytes();
+    bytes[..8].copy_from_slice(&crate::POOL_PLACEMENT_MUTATION_INTENT_KEY_PREFIX);
+    ObjectKey::from_bytes32(bytes)
+}
+
+fn placement_replica_object_key(key: ObjectKey, generation: u64) -> ObjectKey {
+    let mut hasher = blake3::Hasher::new_derive_key(PLACEMENT_RECEIPT_CONTEXT);
+    hasher.update(b"replica-generation");
+    hasher.update(&key.as_bytes32());
+    hasher.update(&generation.to_le_bytes());
+    let mut bytes = *hasher.finalize().as_bytes();
+    bytes[..8].copy_from_slice(&crate::POOL_PLACEMENT_SHARD_KEY_PREFIX);
+    ObjectKey::from_bytes32(bytes)
+}
+
+fn placement_shard_object_key(key: ObjectKey, generation: u64, shard_index: u16) -> ObjectKey {
+    let mut hasher = blake3::Hasher::new_derive_key(PLACEMENT_RECEIPT_CONTEXT);
+    hasher.update(b"shard-generation");
+    hasher.update(&key.as_bytes32());
+    hasher.update(&generation.to_le_bytes());
     hasher.update(&shard_index.to_le_bytes());
     let mut bytes = *hasher.finalize().as_bytes();
     bytes[..8].copy_from_slice(&crate::POOL_PLACEMENT_SHARD_KEY_PREFIX);
     ObjectKey::from_bytes32(bytes)
+}
+
+fn placement_payload_object_key_for_target(
+    receipt: &PlacementReceipt,
+    target: &PlacementReceiptTarget,
+) -> Option<ObjectKey> {
+    if receipt.is_deleted() {
+        return None;
+    }
+    Some(match receipt.policy {
+        PoolRedundancyPolicy::Replicated { .. } => {
+            placement_replica_object_key(receipt.object_key, receipt.generation)
+        }
+        PoolRedundancyPolicy::Erasure { .. } => {
+            placement_shard_object_key(receipt.object_key, receipt.generation, target.shard_index)
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -5778,6 +6974,9 @@ mod tests {
     use crate::ObjectKey;
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    const PLACEMENT_RECEIPT_GENERATION_FIXED_WIRE_LEN: usize = 106;
+    const PLACEMENT_RECEIPT_TARGET_WIRE_LEN: usize = 55;
 
     fn temp_dir(label: &str) -> PathBuf {
         let ts = SystemTime::now()
@@ -5827,6 +7026,23 @@ mod tests {
             name: "testpool".into(),
             root_path: root.to_path_buf(),
             devices,
+        }
+    }
+
+    fn mirror_device_config(root: &Path) -> PoolConfig {
+        let paths = vec![root.join("mirror-0"), root.join("mirror-1")];
+        PoolConfig {
+            name: "testpool-mirror".into(),
+            root_path: root.to_path_buf(),
+            devices: vec![DeviceConfig {
+                media_class: Default::default(),
+                path: paths[0].clone(),
+                backing: DeviceBacking::DirectoryObjectStoreCompat,
+                class: DeviceClass::Data,
+                kind: DeviceKind::Mirror { paths },
+                encryption: None,
+                compression: None,
+            }],
         }
     }
 
@@ -5900,6 +7116,36 @@ mod tests {
         pool.persisted_label_epoch = None;
         pool.persist_active_labels_if_needed()
             .expect("persist deterministic test device GUID labels");
+    }
+
+    fn replayless_v2_receipt_bytes(receipt: &PlacementReceipt) -> Vec<u8> {
+        let mut encoded = receipt.encode().expect("encode V3 placement receipt");
+        encoded[..PLACEMENT_RECEIPT_MAGIC_V2.len()].copy_from_slice(PLACEMENT_RECEIPT_MAGIC_V2);
+        encoded.truncate(
+            PLACEMENT_RECEIPT_GENERATION_FIXED_WIRE_LEN
+                + receipt.targets.len() * PLACEMENT_RECEIPT_TARGET_WIRE_LEN,
+        );
+        encoded
+    }
+
+    fn corrupt_current_object_payload(store: &LocalObjectStore, key: ObjectKey) {
+        let location = store.location_of(key).expect("current object location");
+        let path = crate::store::segment_path(store.segments_dir(), location.segment_id);
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .expect("open segment for corruption");
+        file.seek(SeekFrom::Start(location.payload_offset))
+            .expect("seek to object payload");
+        let mut byte = [0_u8; 1];
+        file.read_exact(&mut byte)
+            .expect("read object payload byte");
+        byte[0] ^= 0x5a;
+        file.seek(SeekFrom::Start(location.payload_offset))
+            .expect("rewind to object payload");
+        file.write_all(&byte).expect("corrupt object payload");
+        file.sync_data().expect("persist object corruption");
     }
 
     #[test]
@@ -6316,6 +7562,623 @@ mod tests {
     }
 
     #[test]
+    fn placement_receipt_selection_rejects_corrupt_newer_copy_with_valid_older() {
+        let root = temp_dir("receipt-selection-corrupt-newer");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = multi_data_device_config(&root, 3);
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::replicated(2),
+            ..PoolProperties::default()
+        };
+        let mut pool = Pool::create(config, properties, &test_options()).unwrap();
+        set_deterministic_device_guids(&mut pool);
+
+        let key = ObjectKey::from_name(b"receipt-selection-corrupt-newer");
+        pool.put(IoClass::Data, key, b"older payload").unwrap();
+        let older = pool
+            .placement_receipt_for_key(IoClass::Data, key)
+            .unwrap()
+            .expect("older placement receipt");
+        pool.put(IoClass::Data, key, b"newer payload").unwrap();
+        let newer = pool
+            .placement_receipt_for_key(IoClass::Data, key)
+            .unwrap()
+            .expect("newer placement receipt");
+        assert!(newer.generation > older.generation);
+
+        let receipt_key = placement_receipt_object_key(key);
+        let older_encoded = older.encode().unwrap();
+        for idx in 0..2 {
+            pool.devices[idx]
+                .put(receipt_key, &older_encoded)
+                .expect("install valid older receipt");
+        }
+        let mut corrupt_newer = newer.encode().unwrap();
+        let last = corrupt_newer.len() - 1;
+        corrupt_newer[last] ^= 0x5a;
+        pool.devices[2]
+            .put(receipt_key, &corrupt_newer)
+            .expect("install corrupt newer receipt");
+
+        assert_invalid_options_reason_contains(
+            pool.current_placement_receipt_read(IoClass::Data, key),
+            "placement receipt corrupt or unverifiable",
+        );
+        assert_invalid_options_reason_contains(
+            pool.get(IoClass::Data, key),
+            "placement receipt corrupt or unverifiable",
+        );
+        assert_invalid_options_reason_contains(
+            pool.placement_receipts(IoClass::Data),
+            "placement receipt corrupt or unverifiable",
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn placement_receipt_selection_rejects_unreadable_newer_copy_with_valid_older() {
+        let root = temp_dir("receipt-selection-unreadable-newer");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = multi_data_device_config(&root, 3);
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::replicated(2),
+            ..PoolProperties::default()
+        };
+        let mut pool = Pool::create(config, properties, &test_options()).unwrap();
+        set_deterministic_device_guids(&mut pool);
+
+        let key = ObjectKey::from_name(b"receipt-selection-unreadable-newer");
+        pool.put(IoClass::Data, key, b"older payload").unwrap();
+        let older = pool
+            .placement_receipt_for_key(IoClass::Data, key)
+            .unwrap()
+            .expect("older placement receipt");
+        pool.put(IoClass::Data, key, b"newer payload").unwrap();
+        let newer = pool
+            .placement_receipt_for_key(IoClass::Data, key)
+            .unwrap()
+            .expect("newer placement receipt");
+        assert!(newer.generation > older.generation);
+
+        let receipt_key = placement_receipt_object_key(key);
+        let older_encoded = older.encode().unwrap();
+        for idx in 0..2 {
+            pool.devices[idx]
+                .put(receipt_key, &older_encoded)
+                .expect("install valid older receipt");
+        }
+        corrupt_current_object_payload(pool.devices[2].store(), receipt_key);
+
+        assert_invalid_options_reason_contains(
+            pool.current_placement_receipt_read(IoClass::Data, key),
+            "placement receipt corrupt or unverifiable",
+        );
+        assert!(pool.placement_receipts(IoClass::Data).is_err());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn placement_receipt_selection_is_pool_wide_across_io_classes() {
+        let root = temp_dir("receipt-selection-pool-wide-classes");
+        let _ = std::fs::remove_dir_all(&root);
+        let metadata_path = root.join("metadata");
+        let mut config = multi_data_device_config(&root, 2);
+        config.devices.insert(
+            0,
+            DeviceConfig {
+                media_class: DeviceMediaClass::Nvme,
+                path: metadata_path.clone(),
+                backing: DeviceBacking::DirectoryObjectStoreCompat,
+                class: DeviceClass::Metadata,
+                kind: DeviceKind::Single {
+                    path: metadata_path,
+                },
+                encryption: None,
+                compression: None,
+            },
+        );
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::replicated(1),
+            ..PoolProperties::default()
+        };
+        let mut pool = Pool::create(config, properties, &test_options()).unwrap();
+        set_deterministic_device_guids(&mut pool);
+
+        let key = ObjectKey::from_name(b"pool-wide-class-receipt");
+        pool.put(IoClass::Data, key, b"stale data-class payload")
+            .unwrap();
+        let stale = pool
+            .placement_receipt_for_key(IoClass::Data, key)
+            .unwrap()
+            .expect("stale data-class receipt");
+
+        let current_payload = b"current metadata-class payload";
+        let metadata_indices = [0];
+        let mut current = pool
+            .plan_pool_wide_placement(
+                IoClass::Metadata,
+                key,
+                current_payload.len(),
+                &metadata_indices,
+            )
+            .unwrap();
+        current.generation = pool.allocate_placement_receipt_generation().unwrap();
+        current.payload_digest = digest32(current_payload);
+        pool.put_replicated_with_receipt(key, current_payload, &metadata_indices, &mut current)
+            .unwrap();
+        assert!(
+            (current.epoch, current.generation) > (stale.epoch, stale.generation),
+            "metadata-class receipt must supersede stale data-class authority"
+        );
+
+        assert_eq!(
+            pool.placement_receipt_for_key(IoClass::Data, key).unwrap(),
+            Some(current.clone())
+        );
+        let selected = pool
+            .current_placement_receipt_read(IoClass::Data, key)
+            .unwrap()
+            .expect("pool-wide current receipt");
+        assert_eq!(selected.receipt(), &current);
+        assert_eq!(selected.read().unwrap(), Some(current_payload.to_vec()));
+        assert_eq!(
+            pool.get(IoClass::Data, key).unwrap(),
+            Some(current_payload.to_vec())
+        );
+        assert_eq!(
+            pool.placement_receipts(IoClass::Data).unwrap(),
+            vec![current]
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn placement_receipt_non_intent_get_refuses_raw_only_bytes_but_preserves_true_absence() {
+        let root = temp_dir("receiptless-raw-authority");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = single_device_config(&root);
+        let mut pool = Pool::create(config, PoolProperties::default(), &test_options()).unwrap();
+
+        for (class, name) in [
+            (IoClass::Data, b"raw-only-data".as_slice()),
+            (IoClass::Metadata, b"raw-only-metadata".as_slice()),
+            (IoClass::ReadCache, b"raw-only-read-cache".as_slice()),
+        ] {
+            let key = ObjectKey::from_name(name);
+            pool.devices[0]
+                .put(key, b"unreceipted bytes")
+                .expect("inject receiptless raw bytes");
+            assert!(pool
+                .placement_receipt_for_key(class, key)
+                .unwrap()
+                .is_none());
+            assert_invalid_options_reason_contains(
+                pool.get(class, key),
+                "without placement receipt authority",
+            );
+            assert!(pool.devices[0].delete(key).unwrap());
+            assert_eq!(pool.get(class, key).unwrap(), None);
+        }
+
+        let never_present = ObjectKey::from_name(b"receiptless-never-present");
+        assert_eq!(pool.get(IoClass::Data, never_present).unwrap(), None);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn placement_receipt_intent_log_get_retains_receiptless_raw_semantics() {
+        let root = temp_dir("receiptless-intent-log");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = single_device_config(&root);
+        let mut pool = Pool::create(config, PoolProperties::default(), &test_options()).unwrap();
+
+        let key = ObjectKey::from_name(b"receiptless-intent-log-entry");
+        pool.put(IoClass::IntentLog, key, b"intent payload")
+            .unwrap();
+        assert!(pool
+            .placement_receipt_for_key(IoClass::IntentLog, key)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            pool.get(IoClass::IntentLog, key).unwrap(),
+            Some(b"intent payload".to_vec())
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn placement_receipt_selected_replicated_unavailable_payload_returns_error() {
+        let root = temp_dir("receipt-payload-unavailable-replicated");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = multi_data_device_config(&root, 3);
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::replicated(2),
+            ..PoolProperties::default()
+        };
+        let mut pool = Pool::create(config, properties, &test_options()).unwrap();
+        set_deterministic_device_guids(&mut pool);
+
+        let key = ObjectKey::from_name(b"unavailable-replicated-payload");
+        pool.put(IoClass::Data, key, b"replicated payload").unwrap();
+        let receipt = pool
+            .placement_receipt_for_key(IoClass::Data, key)
+            .unwrap()
+            .expect("replicated receipt");
+        for target in &receipt.targets {
+            let idx = pool.resolve_receipt_target(target).unwrap();
+            assert!(pool.devices[idx].delete(key).unwrap());
+        }
+
+        let selected = pool
+            .current_placement_receipt_read(IoClass::Data, key)
+            .unwrap()
+            .expect("selected receipt remains present");
+        assert_invalid_options_reason_contains(
+            selected.read(),
+            "placement receipt payload is unavailable or corrupt",
+        );
+        assert_invalid_options_reason_contains(
+            pool.get(IoClass::Data, key),
+            "placement receipt payload is unavailable or corrupt",
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn placement_receipt_selected_erasure_insufficient_shards_returns_error() {
+        let root = temp_dir("receipt-payload-unavailable-erasure");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = multi_data_device_config(&root, 4);
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::erasure(2, 1),
+            ..PoolProperties::default()
+        };
+        let mut pool = Pool::create(config, properties, &test_options()).unwrap();
+        set_deterministic_device_guids(&mut pool);
+
+        let key = ObjectKey::from_name(b"insufficient-erasure-shards");
+        pool.put(
+            IoClass::Data,
+            key,
+            b"erasure payload needs two verified shards",
+        )
+        .unwrap();
+        let receipt = pool
+            .placement_receipt_for_key(IoClass::Data, key)
+            .unwrap()
+            .expect("erasure receipt");
+        for target in receipt.targets.iter().take(2) {
+            let idx = pool.resolve_receipt_target(target).unwrap();
+            let shard_key = placement_shard_object_key(key, receipt.generation, target.shard_index);
+            assert!(pool.devices[idx].delete(shard_key).unwrap());
+        }
+
+        let selected = pool
+            .current_placement_receipt_read(IoClass::Data, key)
+            .unwrap()
+            .expect("selected receipt remains present");
+        assert_invalid_options_reason_contains(
+            selected.read(),
+            "placement receipt payload is unavailable or corrupt",
+        );
+        assert_invalid_options_reason_contains(
+            pool.get(IoClass::Data, key),
+            "placement receipt payload is unavailable or corrupt",
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn placement_receipt_selection_rejects_conflicting_equal_version_in_both_orders() {
+        let root = temp_dir("receipt-selection-equal-conflict");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = multi_data_device_config(&root, 3);
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::replicated(2),
+            ..PoolProperties::default()
+        };
+        let mut pool = Pool::create(config, properties, &test_options()).unwrap();
+        set_deterministic_device_guids(&mut pool);
+
+        let key = ObjectKey::from_name(b"receipt-selection-equal-conflict");
+        pool.put(IoClass::Data, key, b"authoritative payload")
+            .unwrap();
+        let receipt = pool
+            .placement_receipt_for_key(IoClass::Data, key)
+            .unwrap()
+            .expect("placement receipt");
+        let mut conflicting = receipt.clone();
+        conflicting.payload_digest[0] ^= 0x5a;
+        for target in &mut conflicting.targets {
+            target.stored_digest = conflicting.payload_digest;
+        }
+        assert!(planner_replay_receipt_matches_receipt(&conflicting));
+
+        let receipt_key = placement_receipt_object_key(key);
+        let encoded = receipt.encode().unwrap();
+        let conflicting_encoded = conflicting.encode().unwrap();
+        for conflict_idx in [pool.devices.len() - 1, 0] {
+            for device in &mut pool.devices {
+                device
+                    .put(receipt_key, &encoded)
+                    .expect("restore unambiguous receipt");
+            }
+            pool.devices[conflict_idx]
+                .put(receipt_key, &conflicting_encoded)
+                .expect("install conflicting receipt");
+
+            assert_invalid_options_reason_contains(
+                pool.current_placement_receipt_read(IoClass::Data, key),
+                "conflicting placement receipts share epoch and generation",
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn placement_receipt_selection_ignores_conflicting_superseded_version() {
+        let root = temp_dir("receipt-selection-superseded-conflict");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = multi_data_device_config(&root, 3);
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::replicated(2),
+            ..PoolProperties::default()
+        };
+        let mut pool = Pool::create(config, properties, &test_options()).unwrap();
+        set_deterministic_device_guids(&mut pool);
+
+        let key = ObjectKey::from_name(b"receipt-selection-superseded-conflict");
+        pool.put(IoClass::Data, key, b"current payload").unwrap();
+        let older = pool
+            .placement_receipt_for_key(IoClass::Data, key)
+            .unwrap()
+            .expect("older placement receipt");
+        let mut newer = older.clone();
+        newer.generation = pool.allocate_placement_receipt_generation().unwrap();
+        assert!((newer.epoch, newer.generation) > (older.epoch, older.generation));
+
+        let mut conflicting_older = older.clone();
+        conflicting_older.payload_digest[0] ^= 0x5a;
+        for target in &mut conflicting_older.targets {
+            target.stored_digest = conflicting_older.payload_digest;
+        }
+        assert!(planner_replay_receipt_matches_receipt(&conflicting_older));
+
+        let receipt_key = placement_receipt_object_key(key);
+        pool.devices[0]
+            .put(receipt_key, &older.encode().unwrap())
+            .expect("install first older receipt");
+        pool.devices[1]
+            .put(receipt_key, &conflicting_older.encode().unwrap())
+            .expect("install conflicting older receipt");
+        pool.devices[2]
+            .put(receipt_key, &newer.encode().unwrap())
+            .expect("retain unique current receipt");
+
+        let selected = pool
+            .current_placement_receipt_read(IoClass::Data, key)
+            .expect("select current receipt")
+            .expect("current receipt exists");
+        assert_eq!(selected.receipt(), &newer);
+        assert_eq!(selected.read().unwrap(), Some(b"current payload".to_vec()));
+        assert_eq!(
+            pool.placement_receipts(IoClass::Data).unwrap(),
+            vec![newer.clone()]
+        );
+
+        let removal_path = pool.devices[0].root().to_path_buf();
+        let removal = pool.safe_remove_device(&removal_path).unwrap();
+        assert!(removal.complete, "{removal:?}");
+        assert_eq!(
+            pool.get(IoClass::Data, key).unwrap(),
+            Some(b"current payload".to_vec())
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn placement_receipt_selection_rejects_replayless_v2_copy() {
+        let root = temp_dir("receipt-selection-replayless-v2");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = multi_data_device_config(&root, 3);
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::replicated(2),
+            ..PoolProperties::default()
+        };
+        let mut pool = Pool::create(config, properties, &test_options()).unwrap();
+        set_deterministic_device_guids(&mut pool);
+
+        let key = ObjectKey::from_name(b"receipt-selection-replayless-v2");
+        pool.put(IoClass::Data, key, b"receipt payload").unwrap();
+        let receipt = pool
+            .placement_receipt_for_key(IoClass::Data, key)
+            .unwrap()
+            .expect("placement receipt");
+        let replayless = replayless_v2_receipt_bytes(&receipt);
+        let decoded = PlacementReceipt::decode(&replayless).expect("decode V2 receipt");
+        assert!(decoded.planner_replay_receipt.is_none());
+
+        let receipt_key = placement_receipt_object_key(key);
+        pool.devices[2]
+            .put(receipt_key, &replayless)
+            .expect("install replayless V2 receipt");
+
+        assert_invalid_options_reason_contains(
+            pool.current_placement_receipt_read(IoClass::Data, key),
+            "placement receipt corrupt or unverifiable",
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn placement_receipt_selection_rejects_zero_generation_copy() {
+        let root = temp_dir("receipt-selection-zero-generation");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = multi_data_device_config(&root, 3);
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::replicated(2),
+            ..PoolProperties::default()
+        };
+        let mut pool = Pool::create(config, properties, &test_options()).unwrap();
+        set_deterministic_device_guids(&mut pool);
+
+        let key = ObjectKey::from_name(b"receipt-selection-zero-generation");
+        pool.put(IoClass::Data, key, b"receipt payload").unwrap();
+        let mut receipt = pool
+            .placement_receipt_for_key(IoClass::Data, key)
+            .unwrap()
+            .expect("placement receipt");
+        receipt.generation = 0;
+        assert!(planner_replay_receipt_matches_receipt(&receipt));
+        assert!(!placement_receipt_has_strict_authority(&receipt));
+
+        let receipt_key = placement_receipt_object_key(key);
+        let encoded = receipt.encode().unwrap();
+        assert_eq!(
+            PlacementReceipt::decode(&encoded)
+                .expect("zero-generation V3 remains decodable for diagnostics")
+                .generation,
+            0
+        );
+        for device in &mut pool.devices {
+            device
+                .put(receipt_key, &encoded)
+                .expect("install zero-generation receipt");
+        }
+
+        assert_invalid_options_reason_contains(
+            pool.current_placement_receipt_read(IoClass::Data, key),
+            "placement receipt corrupt or unverifiable",
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn placement_receipt_selection_rejects_malformed_v3_policy_and_widths() {
+        let root = temp_dir("receipt-selection-malformed-v3");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = multi_data_device_config(&root, 4);
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::erasure(2, 1),
+            ..PoolProperties::default()
+        };
+        let mut pool = Pool::create(config, properties, &test_options()).unwrap();
+        set_deterministic_device_guids(&mut pool);
+
+        let key = ObjectKey::from_name(b"receipt-selection-malformed-v3");
+        pool.put(IoClass::Data, key, b"persisted receipt validation")
+            .unwrap();
+        let receipt = pool
+            .placement_receipt_for_key(IoClass::Data, key)
+            .unwrap()
+            .expect("placement receipt");
+        assert_eq!(receipt.targets.len(), 3);
+
+        let valid = receipt.encode().unwrap();
+        let target_count_offset =
+            PLACEMENT_RECEIPT_GENERATION_FIXED_WIRE_LEN - std::mem::size_of::<u16>();
+        let targets_offset = PLACEMENT_RECEIPT_GENERATION_FIXED_WIRE_LEN;
+        let replay_offset =
+            targets_offset + receipt.targets.len() * PLACEMENT_RECEIPT_TARGET_WIRE_LEN;
+
+        let mut malformed_policy = valid.clone();
+        let policy_first_offset = PLACEMENT_RECEIPT_MAGIC_V3.len()
+            + std::mem::size_of::<[u8; 32]>()
+            + std::mem::size_of::<u64>() * 2
+            + 2;
+        malformed_policy[policy_first_offset] = 0;
+
+        let mut under_width = valid.clone();
+        under_width.drain(replay_offset - PLACEMENT_RECEIPT_TARGET_WIRE_LEN..replay_offset);
+        under_width[target_count_offset..targets_offset]
+            .copy_from_slice(&((receipt.targets.len() - 1) as u16).to_le_bytes());
+
+        let mut over_width = valid.clone();
+        let duplicate_target =
+            over_width[targets_offset..targets_offset + PLACEMENT_RECEIPT_TARGET_WIRE_LEN].to_vec();
+        over_width.splice(replay_offset..replay_offset, duplicate_target);
+        over_width[target_count_offset..targets_offset]
+            .copy_from_slice(&((receipt.targets.len() + 1) as u16).to_le_bytes());
+
+        let receipt_key = placement_receipt_object_key(key);
+        for (case, invalid) in [
+            ("malformed policy", malformed_policy),
+            ("under-width targets", under_width),
+            ("over-width targets", over_width),
+        ] {
+            assert!(
+                PlacementReceipt::decode(&invalid).is_none(),
+                "{case} fixture must fail V3 validation"
+            );
+            for device in &mut pool.devices {
+                device
+                    .put(receipt_key, &valid)
+                    .expect("restore valid receipt");
+            }
+            pool.devices[0]
+                .put(receipt_key, &invalid)
+                .expect("persist invalid receipt candidate");
+
+            assert_invalid_options_reason_contains(
+                pool.current_placement_receipt_read(IoClass::Data, key),
+                "placement receipt corrupt or unverifiable",
+            );
+            assert_invalid_options_reason_contains(
+                pool.placement_receipts(IoClass::Data),
+                "placement receipt corrupt or unverifiable",
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn placement_receipt_selection_rejects_wrong_object_key_copy() {
+        let root = temp_dir("receipt-selection-wrong-key");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = multi_data_device_config(&root, 3);
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::replicated(2),
+            ..PoolProperties::default()
+        };
+        let mut pool = Pool::create(config, properties, &test_options()).unwrap();
+        set_deterministic_device_guids(&mut pool);
+
+        let key = ObjectKey::from_name(b"receipt-selection-requested-key");
+        let wrong_key = ObjectKey::from_name(b"receipt-selection-wrong-key");
+        pool.put(IoClass::Data, key, b"requested payload").unwrap();
+        pool.put(IoClass::Data, wrong_key, b"wrong-key payload")
+            .unwrap();
+        let wrong_receipt = pool
+            .placement_receipt_for_key(IoClass::Data, wrong_key)
+            .unwrap()
+            .expect("wrong-key placement receipt");
+
+        let receipt_key = placement_receipt_object_key(key);
+        pool.devices[2]
+            .put(receipt_key, &wrong_receipt.encode().unwrap())
+            .expect("install receipt under wrong object key");
+
+        assert_invalid_options_reason_contains(
+            pool.current_placement_receipt_read(IoClass::Data, key),
+            "placement receipt corrupt or unverifiable",
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn receipt_target_resolution_requires_recorded_device_guid() {
         let root = temp_dir("receipt-guid-authority");
         let _ = std::fs::remove_dir_all(&root);
@@ -6344,10 +8207,9 @@ mod tests {
             pool.resolve_receipt_target(&receipt.targets[0]).is_none(),
             "receipt targets are addressed by persistent GUID, not current index"
         );
-        assert_eq!(
-            pool.get(IoClass::Data, key).unwrap(),
-            None,
-            "read must not fall back to the device currently occupying the old index"
+        assert_invalid_options_reason_contains(
+            pool.get(IoClass::Data, key),
+            "placement receipt payload is unavailable or corrupt",
         );
 
         let _ = std::fs::remove_dir_all(&root);
@@ -6446,7 +8308,7 @@ mod tests {
     }
 
     #[test]
-    fn receipt_generation_prefers_newer_same_epoch_rewrite() {
+    fn placement_receipt_selection_prefers_newer_same_epoch_rewrite() {
         let root = temp_dir("receipt-generation-rewrite");
         let _ = std::fs::remove_dir_all(&root);
         let config = multi_data_device_config(&root, 3);
@@ -6494,7 +8356,7 @@ mod tests {
     }
 
     #[test]
-    fn receipt_epoch_prefers_newer_topology_over_higher_old_generation() {
+    fn placement_receipt_selection_orders_epoch_before_generation() {
         let root = temp_dir("receipt-epoch-authority");
         let _ = std::fs::remove_dir_all(&root);
         let config = multi_data_device_config(&root, 3);
@@ -6657,7 +8519,11 @@ mod tests {
             .map(|target| {
                 (
                     pool.resolve_receipt_target(target).unwrap(),
-                    placement_shard_object_key(old_receipt.object_key, target.shard_index),
+                    placement_shard_object_key(
+                        old_receipt.object_key,
+                        old_receipt.generation,
+                        target.shard_index,
+                    ),
                 )
             })
             .collect();
@@ -6843,6 +8709,517 @@ mod tests {
     }
 
     #[test]
+    fn mirror_receipt_authority_observes_newer_second_leg_across_reopen() {
+        let root = temp_dir("mirror-receipt-newer-second-leg");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = mirror_device_config(&root);
+        let properties = PoolProperties::default();
+        let mut pool = Pool::create(config.clone(), properties.clone(), &test_options()).unwrap();
+
+        let key = ObjectKey::from_name(b"mirror-newer-second-leg");
+        pool.put(IoClass::Data, key, b"older").unwrap();
+        let older = pool
+            .placement_receipt_for_key(IoClass::Data, key)
+            .unwrap()
+            .expect("older receipt");
+        pool.put(IoClass::Data, key, b"newer").unwrap();
+        let newer = pool
+            .placement_receipt_for_key(IoClass::Data, key)
+            .unwrap()
+            .expect("newer receipt");
+        assert!(newer.generation > older.generation);
+
+        let receipt_key = placement_receipt_object_key(key);
+        pool.devices[0]
+            .physical_store_mut_for_test(0)
+            .unwrap()
+            .put(receipt_key, &older.encode().unwrap())
+            .unwrap();
+        assert_eq!(
+            pool.placement_receipt_for_key(IoClass::Data, key).unwrap(),
+            Some(newer.clone())
+        );
+        assert_eq!(
+            pool.placement_receipts(IoClass::Data).unwrap(),
+            vec![newer.clone()]
+        );
+        pool.sync_all().unwrap();
+        drop(pool);
+
+        let mut reopened = Pool::create(config, properties, &test_options()).unwrap();
+        assert_eq!(
+            reopened
+                .placement_receipt_for_key(IoClass::Data, key)
+                .unwrap(),
+            Some(newer.clone())
+        );
+        let next_key = ObjectKey::from_name(b"mirror-generation-after-reopen");
+        reopened.put(IoClass::Data, next_key, b"next").unwrap();
+        let next = reopened
+            .placement_receipt_for_key(IoClass::Data, next_key)
+            .unwrap()
+            .expect("next receipt");
+        assert!(next.generation > newer.generation);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn mirror_receipt_authority_rejects_conflicting_and_corrupt_second_copy() {
+        let root = temp_dir("mirror-receipt-conflict-corrupt");
+        let _ = std::fs::remove_dir_all(&root);
+        let mut pool = Pool::create(
+            mirror_device_config(&root),
+            PoolProperties::default(),
+            &test_options(),
+        )
+        .unwrap();
+
+        let key = ObjectKey::from_name(b"mirror-receipt-conflict-corrupt");
+        pool.put(IoClass::Data, key, b"payload").unwrap();
+        let receipt = pool
+            .placement_receipt_for_key(IoClass::Data, key)
+            .unwrap()
+            .expect("receipt");
+        let receipt_key = placement_receipt_object_key(key);
+        let mut conflicting = receipt.clone();
+        conflicting.payload_digest[0] ^= 0x5a;
+        for target in &mut conflicting.targets {
+            target.stored_digest = conflicting.payload_digest;
+        }
+        pool.devices[0]
+            .physical_store_mut_for_test(1)
+            .unwrap()
+            .put(receipt_key, &conflicting.encode().unwrap())
+            .unwrap();
+        assert_invalid_options_reason_contains(
+            pool.placement_receipt_for_key(IoClass::Data, key),
+            "conflicting placement receipts",
+        );
+
+        let mut corrupt = receipt.encode().unwrap();
+        corrupt[0] ^= 0x5a;
+        pool.devices[0]
+            .physical_store_mut_for_test(1)
+            .unwrap()
+            .put(receipt_key, &corrupt)
+            .unwrap();
+        assert_invalid_options_reason_contains(
+            pool.placement_receipt_for_key(IoClass::Data, key),
+            "placement receipt corrupt or unverifiable",
+        );
+        assert_invalid_options_reason_contains(
+            pool.placement_receipts(IoClass::Data),
+            "placement receipt corrupt or unverifiable",
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn parity_receipt_inventory_reopen_and_wrong_fragment_fail_closed() {
+        let root = temp_dir("parity-receipt-inventory-corruption");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = parity_raid1_device_config(&root, 2);
+        let properties = PoolProperties::default();
+        let mut pool = Pool::create(config.clone(), properties.clone(), &test_options()).unwrap();
+
+        let key = ObjectKey::from_name(b"parity-receipt-inventory-corruption");
+        pool.put(IoClass::Data, key, b"parity receipt payload")
+            .unwrap();
+        let receipt = pool
+            .placement_receipt_for_key(IoClass::Data, key)
+            .unwrap()
+            .expect("parity receipt");
+        assert_eq!(
+            pool.placement_receipts(IoClass::Data).unwrap(),
+            vec![receipt.clone()]
+        );
+
+        let receipt_key = placement_receipt_object_key(key);
+        let candidate = pool.devices[0]
+            .placement_receipt_candidates()
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.storage_key == receipt_key)
+            .expect("logical parity receipt candidate");
+        let fragment = candidate
+            .fragments
+            .iter()
+            .copied()
+            .find(|fragment| fragment.leaf_index == 2)
+            .expect("parity column fragment");
+        let store = pool.devices[0]
+            .physical_store_mut_for_test(fragment.leaf_index)
+            .unwrap();
+        let mut wrong = store.get(fragment.key).unwrap().expect("parity bytes");
+        wrong[0] ^= 0x5a;
+        store.put(fragment.key, &wrong).unwrap();
+
+        assert_invalid_options_reason_contains(
+            pool.placement_receipts(IoClass::Data),
+            "placement receipt corrupt or unverifiable",
+        );
+        pool.sync_all().unwrap();
+        drop(pool);
+        assert_invalid_options_reason_contains(
+            Pool::create(config, properties, &test_options()),
+            "placement receipt generation authority corrupt or unverifiable",
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn failed_receipt_cutover_preserves_previous_generation_across_reopen() {
+        let root = temp_dir("staged-receipt-cutover-failure");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = single_device_config(&root);
+        let properties = PoolProperties::default();
+        let mut pool = Pool::create(config.clone(), properties.clone(), &test_options()).unwrap();
+
+        let key = ObjectKey::from_name(b"staged-receipt-cutover-failure");
+        let old_payload = b"old committed payload";
+        pool.put(IoClass::Data, key, old_payload).unwrap();
+        let old_receipt = pool
+            .placement_receipt_for_key(IoClass::Data, key)
+            .unwrap()
+            .expect("old receipt");
+        let new_payload = b"new staged payload";
+        let store = pool.devices[0].store_mut();
+        let limit = store.enospc_bytes_written + new_payload.len() as u64;
+        let mut fault = crate::FaultInjectionConfig::off();
+        fault.enospc_after_bytes = Some(limit);
+        store.enable_fault_injection(fault);
+
+        assert!(pool.put(IoClass::Data, key, new_payload).is_err());
+        assert_eq!(
+            pool.get(IoClass::Data, key).unwrap(),
+            Some(old_payload.to_vec())
+        );
+        assert_eq!(
+            pool.placement_receipt_for_key(IoClass::Data, key).unwrap(),
+            Some(old_receipt.clone())
+        );
+        pool.devices[0].store_mut().disable_fault_injection();
+        pool.sync_all().unwrap();
+        drop(pool);
+
+        let reopened = Pool::create(config, properties, &test_options()).unwrap();
+        assert_eq!(
+            reopened.get(IoClass::Data, key).unwrap(),
+            Some(old_payload.to_vec())
+        );
+        assert_eq!(
+            reopened
+                .placement_receipt_for_key(IoClass::Data, key)
+                .unwrap(),
+            Some(old_receipt)
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn delete_tombstone_is_durable_hidden_and_allows_later_rewrite() {
+        let root = temp_dir("delete-tombstone-reopen-rewrite");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = single_device_config(&root);
+        let properties = PoolProperties::default();
+        let mut pool = Pool::create(config.clone(), properties.clone(), &test_options()).unwrap();
+
+        let key = ObjectKey::from_name(b"delete-tombstone-reopen-rewrite");
+        pool.put(IoClass::Data, key, b"before delete").unwrap();
+        let live = pool
+            .placement_receipt_for_key(IoClass::Data, key)
+            .unwrap()
+            .expect("live receipt");
+        assert!(pool.delete(IoClass::Data, key).unwrap());
+        let tombstone = pool
+            .load_current_placement_receipt(key)
+            .unwrap()
+            .expect("internal tombstone");
+        assert!(tombstone.is_deleted());
+        assert!(tombstone.generation > live.generation);
+        assert_eq!(pool.get(IoClass::Data, key).unwrap(), None);
+        assert!(pool
+            .placement_receipt_for_key(IoClass::Data, key)
+            .unwrap()
+            .is_none());
+        assert!(pool.placement_receipts(IoClass::Data).unwrap().is_empty());
+        assert!(!pool.delete(IoClass::Data, key).unwrap());
+        pool.sync_all().unwrap();
+        drop(pool);
+
+        let mut reopened = Pool::create(config, properties, &test_options()).unwrap();
+        assert_eq!(reopened.get(IoClass::Data, key).unwrap(), None);
+        assert!(reopened
+            .placement_receipt_for_key(IoClass::Data, key)
+            .unwrap()
+            .is_none());
+        reopened.put(IoClass::Data, key, b"after delete").unwrap();
+        let replacement = reopened
+            .placement_receipt_for_key(IoClass::Data, key)
+            .unwrap()
+            .expect("replacement live receipt");
+        assert!(replacement.generation > tombstone.generation);
+        assert_eq!(
+            reopened.get(IoClass::Data, key).unwrap(),
+            Some(b"after delete".to_vec())
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn failed_delete_tombstone_publish_preserves_live_authority() {
+        let root = temp_dir("delete-tombstone-publish-failure");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = single_device_config(&root);
+        let properties = PoolProperties::default();
+        let mut pool = Pool::create(config.clone(), properties.clone(), &test_options()).unwrap();
+
+        let key = ObjectKey::from_name(b"delete-tombstone-publish-failure");
+        let payload = b"must remain live";
+        pool.put(IoClass::Data, key, payload).unwrap();
+        let live = pool
+            .placement_receipt_for_key(IoClass::Data, key)
+            .unwrap()
+            .expect("live receipt");
+        let store = pool.devices[0].store_mut();
+        let mut fault = crate::FaultInjectionConfig::off();
+        fault.enospc_after_bytes = Some(store.enospc_bytes_written);
+        store.enable_fault_injection(fault);
+
+        assert!(pool.delete(IoClass::Data, key).is_err());
+        assert_eq!(
+            pool.get(IoClass::Data, key).unwrap(),
+            Some(payload.to_vec())
+        );
+        assert_eq!(
+            pool.placement_receipt_for_key(IoClass::Data, key).unwrap(),
+            Some(live.clone())
+        );
+        pool.devices[0].store_mut().disable_fault_injection();
+        pool.sync_all().unwrap();
+        drop(pool);
+
+        let reopened = Pool::create(config, properties, &test_options()).unwrap();
+        assert_eq!(
+            reopened.get(IoClass::Data, key).unwrap(),
+            Some(payload.to_vec())
+        );
+        assert_eq!(
+            reopened
+                .placement_receipt_for_key(IoClass::Data, key)
+                .unwrap(),
+            Some(live)
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn safe_removal_preserves_delete_tombstone_on_survivor() {
+        let root = temp_dir("safe-remove-delete-tombstone");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = multi_data_device_config(&root, 2);
+        let mut pool = Pool::create(config, PoolProperties::default(), &test_options()).unwrap();
+        set_deterministic_device_guids(&mut pool);
+
+        let key = ObjectKey::from_name(b"safe-remove-delete-tombstone");
+        pool.put(IoClass::Data, key, b"deleted payload").unwrap();
+        assert!(pool.delete(IoClass::Data, key).unwrap());
+        let tombstone = pool
+            .load_current_placement_receipt(key)
+            .unwrap()
+            .expect("delete tombstone");
+        assert!(tombstone.is_deleted());
+
+        let target_path = pool.devices[0].root().to_path_buf();
+        let removal = pool.safe_remove_device(&target_path).unwrap();
+        assert!(removal.complete, "{removal:?}");
+        assert_eq!(pool.get(IoClass::Data, key).unwrap(), None);
+        assert_eq!(
+            pool.load_current_placement_receipt(key).unwrap(),
+            Some(tombstone)
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pool_wide_receipt_precedes_requested_class_refusal() {
+        let root = temp_dir("receipt-before-class-refusal");
+        let _ = std::fs::remove_dir_all(&root);
+        let path = root.join("metadata");
+        let config = PoolConfig {
+            name: "metadata-only".into(),
+            root_path: root.clone(),
+            devices: vec![DeviceConfig {
+                media_class: Default::default(),
+                path: path.clone(),
+                backing: DeviceBacking::DirectoryObjectStoreCompat,
+                class: DeviceClass::Metadata,
+                kind: DeviceKind::Single { path },
+                encryption: None,
+                compression: None,
+            }],
+        };
+        let mut pool = Pool::create(config, PoolProperties::default(), &test_options()).unwrap();
+        let key = ObjectKey::from_name(b"metadata-receipt-queried-as-data");
+        let payload = b"metadata payload";
+        pool.put(IoClass::Metadata, key, payload).unwrap();
+
+        assert_eq!(
+            pool.get(IoClass::Data, key).unwrap(),
+            Some(payload.to_vec())
+        );
+        assert!(pool
+            .placement_receipt_for_key(IoClass::Data, key)
+            .unwrap()
+            .is_some());
+        assert!(pool
+            .current_placement_receipt_read(IoClass::Data, key)
+            .unwrap()
+            .is_some());
+        assert_eq!(pool.placement_receipts(IoClass::Data).unwrap().len(), 1);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn intent_log_absence_requires_every_member_and_valid_sibling_wins() {
+        let root = temp_dir("intent-log-member-errors");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = multi_data_device_config(&root, 2);
+        let mut pool = Pool::create(config, PoolProperties::default(), &test_options()).unwrap();
+        let key = ObjectKey::from_name(b"intent-log-member-errors");
+        let payload = b"intent log bytes";
+        pool.put(IoClass::IntentLog, key, payload).unwrap();
+
+        corrupt_current_object_payload(pool.devices[0].store(), key);
+        assert_eq!(
+            pool.get(IoClass::IntentLog, key).unwrap(),
+            Some(payload.to_vec()),
+            "a valid sibling must win over one member error"
+        );
+        assert!(pool.devices[1].delete(key).unwrap());
+        assert!(pool.get(IoClass::IntentLog, key).is_err());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn receiptless_non_log_delete_covers_every_attached_class() {
+        let root = temp_dir("receiptless-cross-class-delete");
+        let _ = std::fs::remove_dir_all(&root);
+        let data_path = root.join("data");
+        let metadata_path = root.join("metadata");
+        let config = PoolConfig {
+            name: "cross-class-delete".into(),
+            root_path: root.clone(),
+            devices: vec![
+                DeviceConfig {
+                    media_class: Default::default(),
+                    path: data_path.clone(),
+                    backing: DeviceBacking::DirectoryObjectStoreCompat,
+                    class: DeviceClass::Data,
+                    kind: DeviceKind::Single { path: data_path },
+                    encryption: None,
+                    compression: None,
+                },
+                DeviceConfig {
+                    media_class: Default::default(),
+                    path: metadata_path.clone(),
+                    backing: DeviceBacking::DirectoryObjectStoreCompat,
+                    class: DeviceClass::Metadata,
+                    kind: DeviceKind::Single {
+                        path: metadata_path,
+                    },
+                    encryption: None,
+                    compression: None,
+                },
+            ],
+        };
+        let mut pool = Pool::create(config, PoolProperties::default(), &test_options()).unwrap();
+        let key = ObjectKey::from_name(b"receiptless-cross-class-delete");
+        for device in &mut pool.devices {
+            device.put(key, b"raw").unwrap();
+        }
+        assert!(pool.delete(IoClass::Data, key).unwrap());
+        assert!(pool
+            .devices
+            .iter()
+            .all(|device| device.get(key).unwrap().is_none()));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn erasure_receipt_read_reconstructs_after_target_io_error() {
+        let root = temp_dir("erasure-target-io-error");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = multi_data_device_config(&root, 4);
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::erasure(2, 1),
+            ..PoolProperties::default()
+        };
+        let mut pool = Pool::create(config, properties, &test_options()).unwrap();
+        set_deterministic_device_guids(&mut pool);
+        let key = ObjectKey::from_name(b"erasure-target-io-error");
+        let payload = b"enough verified shards reconstruct around one read error";
+        pool.put(IoClass::Data, key, payload).unwrap();
+        let receipt = pool
+            .placement_receipt_for_key(IoClass::Data, key)
+            .unwrap()
+            .expect("erasure receipt");
+        let victim = &receipt.targets[0];
+        let victim_idx = pool.resolve_receipt_target(victim).unwrap();
+        let victim_key = placement_shard_object_key(key, receipt.generation, victim.shard_index);
+        corrupt_current_object_payload(pool.devices[victim_idx].store(), victim_key);
+
+        assert_eq!(
+            pool.get(IoClass::Data, key).unwrap(),
+            Some(payload.to_vec())
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn topology_epoch_exhaustion_refuses_before_device_mutation() {
+        let root = temp_dir("topology-epoch-exhaustion");
+        let _ = std::fs::remove_dir_all(&root);
+        let mut pool = Pool::create(
+            single_device_config(&root),
+            PoolProperties::default(),
+            &test_options(),
+        )
+        .unwrap();
+        pool.placement_epoch = u64::MAX;
+        let before = pool.devices.len();
+        let path = root.join("new-device");
+        let config = DeviceConfig {
+            media_class: Default::default(),
+            path: path.clone(),
+            backing: DeviceBacking::DirectoryObjectStoreCompat,
+            class: DeviceClass::Data,
+            kind: DeviceKind::Single { path },
+            encryption: None,
+            compression: None,
+        };
+        assert_invalid_options_reason_contains(
+            pool.add_device(config, &test_options()),
+            "topology epoch authority is exhausted",
+        );
+        assert_eq!(pool.devices.len(), before);
+        assert_eq!(pool.placement_epoch, u64::MAX);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn receipt_generation_recovers_after_pool_reopen() {
         let root = temp_dir("receipt-generation-reopen");
         let _ = std::fs::remove_dir_all(&root);
@@ -6867,6 +9244,126 @@ mod tests {
             .unwrap()
             .expect("second receipt");
         assert!(second_receipt.generation > first_receipt.generation);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn receipt_generation_reopen_rejects_corrupt_newer_candidate_with_valid_older() {
+        let root = temp_dir("receipt-generation-reopen-corrupt-newer");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = multi_data_device_config(&root, 3);
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::replicated(2),
+            ..PoolProperties::default()
+        };
+
+        let mut pool = Pool::create(config.clone(), properties.clone(), &test_options()).unwrap();
+        set_deterministic_device_guids(&mut pool);
+        let key = ObjectKey::from_name(b"generation-floor-corrupt-newer");
+        pool.put(IoClass::Data, key, b"older payload").unwrap();
+        let older = pool
+            .placement_receipt_for_key(IoClass::Data, key)
+            .unwrap()
+            .expect("older placement receipt");
+        pool.put(IoClass::Data, key, b"newer payload").unwrap();
+        let newer = pool
+            .placement_receipt_for_key(IoClass::Data, key)
+            .unwrap()
+            .expect("newer placement receipt");
+        assert!(newer.generation > older.generation);
+
+        let receipt_key = placement_receipt_object_key(key);
+        let older_encoded = older.encode().unwrap();
+        for device in pool.devices.iter_mut().skip(1) {
+            device
+                .put(receipt_key, &older_encoded)
+                .expect("restore valid older receipt");
+        }
+        let mut corrupt_newer = newer.encode().unwrap();
+        let last = corrupt_newer.len() - 1;
+        corrupt_newer[last] ^= 0x5a;
+        assert!(PlacementReceipt::decode(&corrupt_newer).is_none());
+        pool.devices[0]
+            .put(receipt_key, &corrupt_newer)
+            .expect("install corrupt concealed newer receipt");
+        drop(pool);
+
+        assert_invalid_options_reason_contains(
+            Pool::create(config, properties, &test_options()),
+            "placement receipt generation authority corrupt or unverifiable",
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn receipt_generation_reopen_uses_global_max_across_epoch_order() {
+        let root = temp_dir("receipt-generation-reopen-global-max");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = multi_data_device_config(&root, 3);
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::replicated(2),
+            ..PoolProperties::default()
+        };
+
+        let mut pool = Pool::create(config.clone(), properties.clone(), &test_options()).unwrap();
+        set_deterministic_device_guids(&mut pool);
+        let key = ObjectKey::from_name(b"generation-floor-epoch-order");
+        pool.put(IoClass::Data, key, b"payload").unwrap();
+        let mut high_generation = pool
+            .placement_receipt_for_key(IoClass::Data, key)
+            .unwrap()
+            .expect("older-epoch placement receipt");
+        high_generation.generation = 100;
+        assert!(placement_receipt_has_strict_authority(&high_generation));
+
+        pool.bump_placement_epoch().unwrap();
+        pool.put(IoClass::Data, key, b"payload").unwrap();
+        let mut newer_epoch = pool
+            .placement_receipt_for_key(IoClass::Data, key)
+            .unwrap()
+            .expect("newer-epoch placement receipt");
+        newer_epoch.generation = 2;
+        assert!(placement_receipt_has_strict_authority(&newer_epoch));
+        assert!(newer_epoch.epoch > high_generation.epoch);
+
+        let receipt_key = placement_receipt_object_key(key);
+        pool.devices[0]
+            .put(receipt_key, &high_generation.encode().unwrap())
+            .expect("install older-epoch higher-generation receipt");
+        for device in pool.devices.iter_mut().skip(1) {
+            device
+                .put(receipt_key, &newer_epoch.encode().unwrap())
+                .expect("install newer-epoch lower-generation receipt");
+        }
+        drop(pool);
+
+        let mut reopened = Pool::create(config, properties, &test_options()).unwrap();
+        let next_key = ObjectKey::from_name(b"generation-after-epoch-order-reopen");
+        reopened.put(IoClass::Data, next_key, b"next").unwrap();
+        let next = reopened
+            .placement_receipt_for_key(IoClass::Data, next_key)
+            .unwrap()
+            .expect("next placement receipt");
+        assert_eq!(next.generation, 101);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn placement_receipt_generation_allocation_refuses_exhaustion() {
+        let root = temp_dir("receipt-generation-exhaustion");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = single_device_config(&root);
+        let mut pool = Pool::create(config, PoolProperties::default(), &test_options()).unwrap();
+        pool.next_placement_receipt_generation = u64::MAX;
+
+        assert_invalid_options_reason_contains(
+            pool.allocate_placement_receipt_generation(),
+            "placement receipt generation authority is exhausted",
+        );
+        assert_eq!(pool.next_placement_receipt_generation, u64::MAX);
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -6963,7 +9460,11 @@ mod tests {
         );
         for target in &receipt.targets {
             assert!(
-                !public_keys.contains(&placement_shard_object_key(key, target.shard_index)),
+                !public_keys.contains(&placement_shard_object_key(
+                    key,
+                    receipt.generation,
+                    target.shard_index,
+                )),
                 "receipt snapshot must not make internal shard keys public"
             );
         }
@@ -7090,7 +9591,7 @@ mod tests {
         );
         for target in &receipt.targets {
             let idx = pool.resolve_receipt_target(target).unwrap();
-            let shard_key = placement_shard_object_key(key, target.shard_index);
+            let shard_key = placement_shard_object_key(key, receipt.generation, target.shard_index);
             assert!(
                 pool.devices[idx]
                     .store()
@@ -7110,7 +9611,7 @@ mod tests {
 
         let victim = receipt.targets[0].clone();
         let victim_idx = pool.resolve_receipt_target(&victim).unwrap();
-        let victim_key = placement_shard_object_key(key, victim.shard_index);
+        let victim_key = placement_shard_object_key(key, receipt.generation, victim.shard_index);
         assert!(pool.devices[victim_idx].delete(victim_key).unwrap());
 
         assert_eq!(
@@ -7153,7 +9654,8 @@ mod tests {
 
         let victim = original_receipt.targets[0].clone();
         let victim_idx = pool.resolve_receipt_target(&victim).unwrap();
-        let victim_key = placement_shard_object_key(key, victim.shard_index);
+        let victim_key =
+            placement_shard_object_key(key, original_receipt.generation, victim.shard_index);
         assert!(pool.devices[victim_idx].delete(victim_key).unwrap());
 
         let repaired_read = pool
@@ -7180,7 +9682,11 @@ mod tests {
         );
         for target in &repaired_read.receipt.targets {
             let idx = pool.resolve_receipt_target(target).unwrap();
-            let shard_key = placement_shard_object_key(key, target.shard_index);
+            let shard_key = placement_shard_object_key(
+                key,
+                repaired_read.receipt.generation,
+                target.shard_index,
+            );
             let shard = pool.devices[idx]
                 .get(shard_key)
                 .unwrap()
@@ -7189,138 +9695,6 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn erasure_policy_rejects_malformed_receipt_target_set() {
-        let root = temp_dir("erasure-receipt-out-of-range");
-        let _ = std::fs::remove_dir_all(&root);
-        let config = multi_data_device_config(&root, 4);
-        let properties = PoolProperties {
-            redundancy_policy: PoolRedundancyPolicy::erasure(2, 1),
-            ..PoolProperties::default()
-        };
-        let mut pool = Pool::create(config, properties, &test_options()).unwrap();
-        set_deterministic_device_guids(&mut pool);
-
-        let key = ObjectKey::from_name(b"erasure-receipt-out-of-range");
-        let payload = b"payload large enough to span both data shards";
-        pool.put(IoClass::Data, key, payload).unwrap();
-
-        let mut receipt = pool
-            .placement_receipt_for_key(IoClass::Data, key)
-            .unwrap()
-            .expect("erasure receipt must persist");
-        receipt.planner_replay_receipt = None;
-
-        let mut under_width = receipt.clone();
-        assert!(under_width.targets.pop().is_some());
-        let err = pool.get_erasure_with_receipt(&under_width).unwrap_err();
-        assert!(matches!(
-            err,
-            StoreError::InvalidOptions {
-                reason: "invalid erasure placement receipt availability set"
-            }
-        ));
-
-        receipt.targets[0].shard_index = receipt.targets.len() as u16;
-        let err = pool.get_erasure_with_receipt(&receipt).unwrap_err();
-        assert!(matches!(
-            err,
-            StoreError::InvalidOptions {
-                reason: "invalid erasure placement receipt availability set"
-            }
-        ));
-
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn erasure_policy_rejects_duplicate_receipt_shard() {
-        let root = temp_dir("erasure-receipt-duplicate-shard");
-        let _ = std::fs::remove_dir_all(&root);
-        let config = multi_data_device_config(&root, 4);
-        let properties = PoolProperties {
-            redundancy_policy: PoolRedundancyPolicy::erasure(2, 1),
-            ..PoolProperties::default()
-        };
-        let mut pool = Pool::create(config, properties, &test_options()).unwrap();
-        set_deterministic_device_guids(&mut pool);
-
-        let key = ObjectKey::from_name(b"erasure-receipt-duplicate-shard");
-        let payload = b"payload large enough to span both data shards";
-        pool.put(IoClass::Data, key, payload).unwrap();
-
-        let mut receipt = pool
-            .placement_receipt_for_key(IoClass::Data, key)
-            .unwrap()
-            .expect("erasure receipt must persist");
-        receipt.planner_replay_receipt = None;
-        receipt.targets[1].shard_index = receipt.targets[0].shard_index;
-        let err = pool.get_erasure_with_receipt(&receipt).unwrap_err();
-        assert!(matches!(
-            err,
-            StoreError::InvalidOptions {
-                reason: "invalid erasure placement receipt availability set"
-            }
-        ));
-
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn erasure_policy_rejects_receipt_role_mismatch() {
-        fn assert_rejects_role_mismatch(
-            root_name: &str,
-            shard_index: u16,
-            role: PlacementTargetRole,
-        ) {
-            let root = temp_dir(root_name);
-            let _ = std::fs::remove_dir_all(&root);
-            let config = multi_data_device_config(&root, 4);
-            let properties = PoolProperties {
-                redundancy_policy: PoolRedundancyPolicy::erasure(2, 1),
-                ..PoolProperties::default()
-            };
-            let mut pool = Pool::create(config, properties, &test_options()).unwrap();
-            set_deterministic_device_guids(&mut pool);
-
-            let key = ObjectKey::from_name(root_name.as_bytes());
-            let payload = b"payload large enough to span both data shards";
-            pool.put(IoClass::Data, key, payload).unwrap();
-
-            let mut receipt = pool
-                .placement_receipt_for_key(IoClass::Data, key)
-                .unwrap()
-                .expect("erasure receipt must persist");
-            receipt.planner_replay_receipt = None;
-            receipt
-                .targets
-                .iter_mut()
-                .find(|target| target.shard_index == shard_index)
-                .expect("target shard")
-                .role = role;
-            let err = pool.get_erasure_with_receipt(&receipt).unwrap_err();
-            assert!(matches!(
-                err,
-                StoreError::InvalidOptions {
-                    reason: "invalid erasure placement receipt availability set"
-                }
-            ));
-
-            let _ = std::fs::remove_dir_all(&root);
-        }
-
-        assert_rejects_role_mismatch(
-            "erasure-receipt-data-index-as-parity",
-            0,
-            PlacementTargetRole::Parity,
-        );
-        assert_rejects_role_mismatch(
-            "erasure-receipt-parity-index-as-data",
-            2,
-            PlacementTargetRole::Data,
-        );
     }
 
     #[test]
@@ -7463,7 +9837,7 @@ mod tests {
                 &surviving_indices,
             )
             .unwrap();
-        current_receipt.generation = pool.allocate_placement_receipt_generation();
+        current_receipt.generation = pool.allocate_placement_receipt_generation().unwrap();
         current_receipt.payload_digest = digest32(current_payload);
         pool.put_replicated_with_receipt(
             key,
@@ -7510,9 +9884,20 @@ mod tests {
             Some(current_payload.to_vec())
         );
 
+        let selected = pool
+            .current_placement_receipt_read(IoClass::Data, key)
+            .expect("select receipt with faulted readable member")
+            .expect("current receipt exists");
+        assert_eq!(selected.receipt(), &current_receipt);
+        assert_eq!(selected.read().unwrap(), Some(current_payload.to_vec()));
+        assert_eq!(
+            pool.placement_receipts(IoClass::Data).unwrap(),
+            vec![current_receipt.clone()]
+        );
+
         let removal = pool.safe_remove_device(&target_path).unwrap();
         assert!(removal.complete, "{removal:?}");
-        assert_eq!(removal.objects_evacuated, 1);
+        assert_eq!(removal.objects_evacuated, 0);
         assert_eq!(removal.objects_failed, 0);
         assert_eq!(
             pool.get(IoClass::Data, key).unwrap(),
@@ -7572,7 +9957,7 @@ mod tests {
                 &metadata_indices,
             )
             .unwrap();
-        current_receipt.generation = pool.allocate_placement_receipt_generation();
+        current_receipt.generation = pool.allocate_placement_receipt_generation().unwrap();
         current_receipt.payload_digest = digest32(current_payload);
         pool.put_replicated_with_receipt(
             key,
@@ -7731,7 +10116,7 @@ mod tests {
         let victim = &receipt.targets[0];
         let victim_idx = pool.resolve_receipt_target(victim).unwrap();
         let victim_path = pool.devices[victim_idx].root().to_path_buf();
-        let shard_key = placement_shard_object_key(key, victim.shard_index);
+        let shard_key = placement_shard_object_key(key, receipt.generation, victim.shard_index);
         let receipt_key = placement_receipt_object_key(key);
 
         for device in &mut pool.devices {
@@ -8071,7 +10456,10 @@ mod tests {
         // alone must not let removal detach the only readable bytes.
         pool.devices[victim_idx].put(key, payload).unwrap();
         assert!(pool.devices[owner_idx].delete(key).unwrap());
-        assert_eq!(pool.get(IoClass::Data, key).unwrap(), None);
+        assert_invalid_options_reason_contains(
+            pool.get(IoClass::Data, key),
+            "placement receipt payload is unavailable or corrupt",
+        );
 
         let removal = pool.safe_remove_device(&victim_path).unwrap();
 
@@ -8183,10 +10571,10 @@ mod tests {
                 .expect("replace survivor receipt with bad replay seal");
         }
 
-        let result = pool.safe_remove_device(&victim_path).unwrap();
-        assert!(!result.complete);
-        assert_eq!(result.objects_failed, 1);
-        assert_eq!(result.failed_keys, vec![key]);
+        assert_invalid_options_reason_contains(
+            pool.safe_remove_device(&victim_path),
+            "placement receipt corrupt or unverifiable",
+        );
         assert_eq!(pool.stats().device_count, 3);
         assert!(root.join(DEVICE_REMOVAL_MARKER_FILE).exists());
 
@@ -8259,7 +10647,7 @@ mod tests {
     }
 
     #[test]
-    fn safe_remove_device_refuses_current_receipt_without_replay_authority() {
+    fn safe_remove_device_refuses_replayless_v2_placement_receipt() {
         let root = temp_dir("safe-remove-refuses-replayless-current-receipt");
         let _ = std::fs::remove_dir_all(&root);
         let config = multi_data_device_config(&root, 3);
@@ -8280,37 +10668,78 @@ mod tests {
         let victim_idx = pool.resolve_receipt_target(&receipt.targets[0]).unwrap();
         let victim_path = pool.devices[victim_idx].root().to_path_buf();
 
-        // Re-encode the current receipt as the replayless V2 format still
-        // accepted for older in-tree harness data. Every receipt copy is V2,
-        // so no sealed locator authority remains for source retirement.
-        let mut replayless = receipt.encode().unwrap();
-        replayless[..PLACEMENT_RECEIPT_MAGIC_V2.len()].copy_from_slice(PLACEMENT_RECEIPT_MAGIC_V2);
-        const V2_FIXED_WIRE_LEN: usize = 106;
-        const RECEIPT_TARGET_WIRE_LEN: usize = 55;
-        let v2_len = V2_FIXED_WIRE_LEN + receipt.targets.len() * RECEIPT_TARGET_WIRE_LEN;
-        replayless.truncate(v2_len);
+        // V2 remains decodable for diagnostics, but it has no sealed replay
+        // authority and therefore cannot become current read/removal authority.
+        let replayless = replayless_v2_receipt_bytes(&receipt);
         let decoded = PlacementReceipt::decode(&replayless).expect("V2 placement receipt");
         assert!(decoded.planner_replay_receipt.is_none());
+        assert!(!planner_replay_receipt_matches_receipt(&decoded));
 
         let receipt_key = placement_receipt_object_key(key);
         for device in &mut pool.devices {
             device.put(receipt_key, &replayless).unwrap();
         }
 
-        let removal = pool.safe_remove_device(&victim_path).unwrap();
-
-        assert!(!removal.complete);
-        assert_eq!(removal.objects_failed, 1);
-        assert_eq!(removal.failed_keys, vec![key]);
+        assert_invalid_options_reason_contains(
+            pool.current_placement_receipt_read(IoClass::Data, key),
+            "placement receipt corrupt or unverifiable",
+        );
+        assert_invalid_options_reason_contains(
+            pool.safe_remove_device(&victim_path),
+            "placement receipt corrupt or unverifiable",
+        );
         assert_eq!(pool.stats().device_count, 3);
         assert!(pool
             .devices
             .iter()
             .any(|device| device.root() == victim_path));
-        assert_eq!(
-            pool.get(IoClass::Data, key).unwrap(),
-            Some(payload.to_vec())
+        assert!(root.join(DEVICE_REMOVAL_MARKER_FILE).exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn safe_remove_device_refuses_older_replayless_candidate_beside_newer_receipt() {
+        let root = temp_dir("safe-remove-refuses-older-replayless-candidate");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = multi_data_device_config(&root, 3);
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::replicated(2),
+            ..PoolProperties::default()
+        };
+        let mut pool = Pool::create(config, properties, &test_options()).unwrap();
+        set_deterministic_device_guids(&mut pool);
+
+        let key = ObjectKey::from_name(b"older-replayless-removal-candidate");
+        pool.put(IoClass::Data, key, b"older payload").unwrap();
+        let older = pool
+            .placement_receipt_for_key(IoClass::Data, key)
+            .unwrap()
+            .expect("older placement receipt");
+        pool.put(IoClass::Data, key, b"newer payload").unwrap();
+        let newer = pool
+            .placement_receipt_for_key(IoClass::Data, key)
+            .unwrap()
+            .expect("newer placement receipt");
+        assert!(newer.generation > older.generation);
+
+        let victim_idx = 0;
+        let victim_path = pool.devices[victim_idx].root().to_path_buf();
+        let receipt_key = placement_receipt_object_key(key);
+        let replayless_older = replayless_v2_receipt_bytes(&older);
+        pool.devices[victim_idx]
+            .put(receipt_key, &replayless_older)
+            .expect("install older replayless candidate on retiring device");
+
+        assert_invalid_options_reason_contains(
+            pool.placement_receipt_for_key(IoClass::Data, key),
+            "placement receipt corrupt or unverifiable",
         );
+        assert_invalid_options_reason_contains(
+            pool.safe_remove_device(&victim_path),
+            "placement receipt corrupt or unverifiable",
+        );
+        assert_eq!(pool.stats().device_count, 3);
         assert!(root.join(DEVICE_REMOVAL_MARKER_FILE).exists());
 
         let _ = std::fs::remove_dir_all(&root);
@@ -9338,6 +11767,100 @@ mod tests {
             &test_options(),
         );
         assert!(result.is_err());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn replacement_subject_discovery_uses_faulted_current_receipt_and_rejects_conflict() {
+        let root = temp_dir("replace-subject-current-receipt");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = multi_data_device_config(&root, 3);
+        let properties = PoolProperties {
+            redundancy_policy: PoolRedundancyPolicy::replicated(1),
+            ..PoolProperties::default()
+        };
+        let mut pool = Pool::create(config, properties, &test_options()).unwrap();
+        set_deterministic_device_guids(&mut pool);
+
+        let key = ObjectKey::from_name(b"replace-subject-current-receipt");
+        pool.put(IoClass::Data, key, b"superseded replacement payload")
+            .unwrap();
+        let older = pool
+            .placement_receipt_for_key(IoClass::Data, key)
+            .unwrap()
+            .expect("older receipt");
+        let old_idx = pool.resolve_receipt_target(&older.targets[0]).unwrap();
+        let old_device_guid = pool.device_guid_for_index(old_idx);
+        let surviving_indices: Vec<_> = (0..pool.devices.len())
+            .filter(|idx| *idx != old_idx)
+            .collect();
+
+        let current_payload = b"current replacement payload";
+        let mut current = pool
+            .plan_pool_wide_placement(
+                IoClass::Data,
+                key,
+                current_payload.len(),
+                &surviving_indices,
+            )
+            .unwrap();
+        current.generation = pool.allocate_placement_receipt_generation().unwrap();
+        current.payload_digest = digest32(current_payload);
+        pool.put_replicated_with_receipt(key, current_payload, &surviving_indices, &mut current)
+            .unwrap();
+        assert!(current
+            .targets
+            .iter()
+            .all(|target| target.device_guid != old_device_guid));
+
+        let current_owner_idx = pool.resolve_receipt_target(&current.targets[0]).unwrap();
+        let lower_conflict_idx = surviving_indices
+            .iter()
+            .copied()
+            .find(|idx| *idx != current_owner_idx)
+            .unwrap();
+        let mut conflicting_older = older.clone();
+        conflicting_older.payload_digest[0] ^= 0x5a;
+        for target in &mut conflicting_older.targets {
+            target.stored_digest = conflicting_older.payload_digest;
+        }
+        assert!(planner_replay_receipt_matches_receipt(&conflicting_older));
+
+        let receipt_key = placement_receipt_object_key(key);
+        pool.devices[old_idx]
+            .put(receipt_key, &older.encode().unwrap())
+            .expect("install first superseded receipt");
+        pool.devices[lower_conflict_idx]
+            .put(receipt_key, &conflicting_older.encode().unwrap())
+            .expect("install conflicting superseded receipt");
+        for _ in 0..3 {
+            pool.devices[current_owner_idx].record_checksum_error();
+        }
+        assert_eq!(
+            pool.devices[current_owner_idx].status().state,
+            DeviceState::Faulted
+        );
+
+        assert_eq!(
+            discover_replacement_rebuild_subject_count(&pool, old_device_guid).unwrap(),
+            0,
+            "faulted readable current authority must supersede lower conflicts"
+        );
+
+        let mut conflicting_current = current.clone();
+        conflicting_current.payload_digest[0] ^= 0xa5;
+        for target in &mut conflicting_current.targets {
+            target.stored_digest = conflicting_current.payload_digest;
+        }
+        assert!(planner_replay_receipt_matches_receipt(&conflicting_current));
+        pool.devices[old_idx]
+            .put(receipt_key, &conflicting_current.encode().unwrap())
+            .expect("install conflicting current receipt");
+        assert_invalid_options_reason_contains(
+            discover_replacement_rebuild_subject_count(&pool, old_device_guid),
+            "conflicting placement receipts share epoch and generation",
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -10742,13 +13265,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(root.join("device-1"));
         let _ = std::fs::remove_dir_all(root.join("device-2"));
 
-        // Pool::get swallows device errors (by design: mirrors fail over
-        // between legs).  With a single PARITY_RAID1 device and two faulted
-        // children, data is unrecoverable so get returns None.
-        let val = pool.get(IoClass::Data, key).unwrap();
-        assert!(
-            val.is_none(),
-            "unrecoverable double fault: data must be None"
+        // The composite device can no longer read even the persisted receipt,
+        // so authority selection fails instead of reporting ordinary absence.
+        assert_invalid_options_reason_contains(
+            pool.get(IoClass::Data, key),
+            "placement receipt corrupt or unverifiable",
         );
 
         let _ = std::fs::remove_dir_all(&root);

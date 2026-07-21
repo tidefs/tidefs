@@ -821,24 +821,6 @@ pub trait VfsEngine {
         ctx: &RequestCtx,
     ) -> Result<Vec<u8>, Errno>;
 
-    /// Read bytes for internal cache maintenance without recording POSIX
-    /// read access time.
-    ///
-    /// Adapters use this to preserve untouched bytes while staging dirty
-    /// writeback-cache pages. That read is an implementation detail of the
-    /// write path, not a successful userspace read, so it must not consume
-    /// the next relatime atime update. Engines that cannot separate the
-    /// paths may fall back to [`VfsEngine::read`].
-    fn read_for_cache_fill(
-        &self,
-        fh: &EngineFileHandle,
-        offset: u64,
-        size: u32,
-        ctx: &RequestCtx,
-    ) -> Result<Vec<u8>, Errno> {
-        self.read(fh, offset, size, ctx)
-    }
-
     /// Record an automatic read access timestamp update for `inode`.
     ///
     /// Adapters use this when a successful read is served from an adapter-side

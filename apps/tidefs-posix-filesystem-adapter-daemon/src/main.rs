@@ -11,7 +11,6 @@ mod fsync_handler;
 mod fuse_create_unlink_dispatch;
 mod fuse_flush_fsync;
 mod fuse_posix_lock;
-mod fuse_read;
 mod fuse_rename;
 mod fuse_vfs_adapter;
 mod fusewire;
@@ -20,22 +19,14 @@ mod ingress;
 mod live_owner;
 mod lock_dispatch;
 mod maintenance;
-mod materialized_cache;
 mod mmap_coherency;
 pub mod mount_options;
 mod observability;
-mod read_cache;
 mod reply;
 mod runtime;
-mod scheduler;
 mod txg_cycle;
 mod workers_meta;
 mod workers_ns;
-mod workers_writeback;
-mod workload_observer;
-mod write_dispatch;
-
-mod writeback_reclaim;
 mod xattr_integrity;
 mod xfstests_harness;
 use std::collections::BTreeMap;
@@ -49,16 +40,11 @@ use crate::runtime::{
     PosixFilesystemAdapterDemoVisibleAnswerRecord,
     FIRST_PUBLICATION_PIPELINE_RESPONSE_REGISTRY_TO_POSIX_FILESYSTEM_ADAPTER_WAKE_CHAIN,
 };
-use tidefs_background_scheduler::{
-    BackgroundScheduler, BackgroundService, ServiceBudget, ServiceError, ServicePriority,
-    TickReport,
-};
 use tidefs_intent_log::IntentLogBuffer;
 use tidefs_local_filesystem::{
     LocalFileSystemOpenConfig, LocalStorageAllocatorPolicy, RootAuthenticationKey,
     ROOT_AUTHENTICATION_ENV_VAR,
 };
-use tidefs_performance_contract::{ScrubRuntimeObservation, ServiceCurve};
 #[cfg(feature = "receipt-demo")]
 use tidefs_schema_codec_posix_filesystem_adapter::CanonicalFixedWidth;
 #[cfg(feature = "receipt-demo")]
@@ -82,140 +68,7 @@ use tidefs_inode_attributes::timestamp::TimestampPolicy as EngineTimestampPolicy
 const MOUNT_VFS_WRITE_BUFFER_FLUSH_THRESHOLD_BYTES: usize = 64 * 1024 * 1024;
 const MOUNT_VFS_MAX_UNCOMMITTED_MUTATIONS: u64 = 64 * 1024;
 const MOUNT_VFS_TXG_COMMIT_INTERVAL_SECS: u64 = 30;
-const MOUNT_VFS_DEFAULT_BACKGROUND_SCRUB_INTERVAL_SECS: u64 = 0;
 
-struct MountedBackgroundScrubService {
-    store: tidefs_local_object_store::LocalObjectStore,
-    observation: ScrubRuntimeObservation,
-    observation_artifact: Option<PathBuf>,
-    next_tick_not_before: std::time::Instant,
-}
-
-impl MountedBackgroundScrubService {
-    const NAME: &'static str = "mounted-segment-scrub";
-
-    fn open(
-        root: &Path,
-        options: tidefs_local_object_store::StoreOptions,
-        observation_artifact: Option<PathBuf>,
-    ) -> Result<Self, String> {
-        let store = tidefs_local_object_store::LocalObjectStore::open_with_options(root, options)
-            .map_err(|error| format!("open scheduled scrub store: {error}"))?;
-        let service = Self {
-            store,
-            observation: ScrubRuntimeObservation::new(std::process::id()),
-            observation_artifact,
-            next_tick_not_before: std::time::Instant::now(),
-        };
-        service.publish_observation()?;
-        Ok(service)
-    }
-
-    fn publish_observation(&self) -> Result<(), String> {
-        if let Some(path) = self.observation_artifact.as_deref() {
-            write_scrub_runtime_observation(path, &self.observation)?;
-        }
-        Ok(())
-    }
-
-    fn bounded_limit(scheduler_limit: u64, curve_limit: u64) -> u64 {
-        if scheduler_limit == 0 {
-            curve_limit
-        } else {
-            scheduler_limit.min(curve_limit)
-        }
-    }
-}
-
-impl BackgroundService for MountedBackgroundScrubService {
-    fn name(&self) -> &'static str {
-        Self::NAME
-    }
-
-    fn priority(&self) -> ServicePriority {
-        ServicePriority::Critical
-    }
-
-    fn tick(&mut self, budget: &ServiceBudget) -> Result<TickReport, ServiceError> {
-        let curve = ServiceCurve::SCRUB_BOUNDED_DEFAULT;
-        let max_records = Self::bounded_limit(budget.max_items, u64::from(curve.max_ops_per_tick));
-        let max_bytes = Self::bounded_limit(budget.max_bytes, curve.max_bytes_per_tick);
-        let report = self
-            .store
-            .run_background_scrub_with_budget(max_records, max_bytes)
-            .map_err(|error| {
-                eprintln!("background-scrub: scheduled tick failed: {error}");
-                ServiceError::Internal {
-                    service: Self::NAME,
-                    message: "object-store scrub tick failed",
-                }
-            })?;
-
-        if report.records_verified > max_records {
-            return Err(ServiceError::BudgetExceeded {
-                service: Self::NAME,
-                limit: max_records,
-                actual: report.records_verified,
-            });
-        }
-        if report.bytes_scanned > max_bytes {
-            return Err(ServiceError::BudgetExceeded {
-                service: Self::NAME,
-                limit: max_bytes,
-                actual: report.bytes_scanned,
-            });
-        }
-
-        if self.store.background_scrub_pending() && budget.max_ms > 0 {
-            self.next_tick_not_before =
-                std::time::Instant::now() + std::time::Duration::from_millis(budget.max_ms);
-        }
-
-        let work_observed =
-            report.segments_scanned > 0 || report.records_verified > 0 || report.bytes_scanned > 0;
-        let work_pending = self.store.background_scrub_pending();
-        if work_observed {
-            self.observation.record_admitted_cycle(
-                report.records_verified,
-                report.bytes_scanned,
-                work_pending,
-            );
-            if work_pending {
-                self.observation.record_budget_throttle();
-            }
-            if let Err(error) = self.publish_observation() {
-                eprintln!("background-scrub: failed to write runtime observation: {error}");
-            }
-        }
-
-        if report.segments_scanned > 0 || report.records_verified > 0 {
-            tracing::info!(
-                target: "tidefs.scrub",
-                segments = report.segments_scanned,
-                records = report.records_verified,
-                bytes = report.bytes_scanned,
-                completed = report.completed,
-                work_pending,
-                "scheduled segment scrub tick completed",
-            );
-        }
-
-        Ok(TickReport {
-            processed: report.records_verified,
-            skipped: 0,
-            errors: 0,
-            items_consumed: report.records_verified,
-            bytes_consumed: report.bytes_scanned,
-            has_more: work_pending,
-        })
-    }
-
-    fn has_work(&self) -> bool {
-        self.store.should_scrub() && std::time::Instant::now() >= self.next_tick_not_before
-    }
-}
-
-/// RAII guard that removes a PID file on drop (clean shutdown).
 /// On SIGKILL the guard never runs, leaving the PID file as validation.
 struct PidFileGuard(Option<PathBuf>);
 
@@ -343,8 +196,6 @@ fn run() -> Result<(), String> {
             let config = parse_smoke_mount_config(args.collect())?;
             run_smoke_mount(config)
         }
-        Some("scrub-repair-smoke") => run_scrub_repair_smoke(),
-
         Some("help" | "--help" | "-h") => {
             print_help();
             Ok(())
@@ -360,19 +211,6 @@ fn mount_vfs(config: MountVfsConfig) -> Result<(), String> {
     let effective_mode = effective_mount_mode(&config);
     if snapshot_export && config.queue_depth_artifact.is_some() {
         return Err("--queue-depth-artifact is not supported for snapshot export mounts".into());
-    }
-    if snapshot_export && config.scrub_runtime_observation_artifact.is_some() {
-        return Err(
-            "--scrub-runtime-observation-artifact is not supported for snapshot export mounts"
-                .into(),
-        );
-    }
-    if effective_mode.background_scrub_interval_secs == 0
-        && config.scrub_runtime_observation_artifact.is_some()
-    {
-        return Err(
-            "--scrub-runtime-observation-artifact requires --background-scrub-interval > 0".into(),
-        );
     }
     use std::fs;
     use std::sync::{
@@ -450,7 +288,6 @@ fn mount_vfs(config: MountVfsConfig) -> Result<(), String> {
     }
 
     let store_options = StoreOptions {
-        background_scrub_interval_secs: effective_mode.background_scrub_interval_secs,
         reclaim_enabled: !snapshot_export && config.enable_reclaim,
         fault_injection_config: if snapshot_export {
             None
@@ -464,10 +301,6 @@ fn mount_vfs(config: MountVfsConfig) -> Result<(), String> {
         },
         ..StoreOptions::default()
     };
-    let scrub_interval = effective_mode.background_scrub_interval_secs;
-    let scrub_store_root = config.store_root.clone();
-    let scrub_runtime_observation_artifact = config.scrub_runtime_observation_artifact.clone();
-
     let open_config = LocalFileSystemOpenConfig {
         options: store_options,
         allocator_policy: LocalStorageAllocatorPolicy {
@@ -480,16 +313,13 @@ fn mount_vfs(config: MountVfsConfig) -> Result<(), String> {
         log_device_device_path: None,
         recovery_policy: if snapshot_export {
             tidefs_recovery_loop::RecoveryPolicy::ReadOnly
-        } else if config.enable_repair_writeback {
-            tidefs_recovery_loop::RecoveryPolicy::RepairWriteback
         } else {
             tidefs_recovery_loop::RecoveryPolicy::default()
         },
         block_devices: None,
     };
 
-    let (mut vfs_engine, writeback_tracker) = if let Some(snapshot_name) = snapshot_name.as_deref()
-    {
+    let mut vfs_engine = if let Some(snapshot_name) = snapshot_name.as_deref() {
         let session =
             LocalFileSystem::open_snapshot_export(&config.store_root, snapshot_name, open_config)
                 .map_err(|e| format!("open snapshot export `{snapshot_name}`: {e}"))?;
@@ -500,12 +330,9 @@ fn mount_vfs(config: MountVfsConfig) -> Result<(), String> {
             summary.generation,
             summary.root_inode_id.get()
         );
-        (
-            session
-                .into_engine()
-                .with_sync_guarantee(SyncGuarantee::Local),
-            None,
-        )
+        session
+            .into_engine()
+            .with_sync_guarantee(SyncGuarantee::Local)
     } else {
         let mut lfs = LocalFileSystem::open_with_allocator_policy_and_root_authentication_key(
             &config.store_root,
@@ -582,11 +409,7 @@ fn mount_vfs(config: MountVfsConfig) -> Result<(), String> {
         lfs.set_commit_group_throughput_profile();
         lfs.set_max_uncommitted_mutations(MOUNT_VFS_MAX_UNCOMMITTED_MUTATIONS);
 
-        let writeback_tracker = std::sync::Arc::clone(lfs.writeback_range_tracker());
-        (
-            VfsLocalFileSystem::new(lfs).with_sync_guarantee(effective_sync_guarantee),
-            Some(writeback_tracker),
-        )
+        VfsLocalFileSystem::new(lfs).with_sync_guarantee(effective_sync_guarantee)
     };
     let engine_timestamp_policy = if effective_mode.read_only {
         EngineTimestampPolicy::Noatime
@@ -610,32 +433,13 @@ fn mount_vfs(config: MountVfsConfig) -> Result<(), String> {
     .map_err(|e| format!("adapter init: {e:?}"))?
     .with_coherency_profile(config.coherency_profile);
     if !snapshot_export {
-        adapter = adapter
-            .with_commit_group_cycle(Arc::new(
-                crate::txg_cycle::CommitGroupCycle::with_store_root(config.store_root.clone()),
-            ))
-            .with_background_scheduler(BackgroundScheduler::new(ServiceBudget::MAINTENANCE_TICK));
+        adapter = adapter.with_commit_group_cycle(Arc::new(
+            crate::txg_cycle::CommitGroupCycle::with_store_root(config.store_root.clone()),
+        ));
     }
     if let Some(ref namespace) = namespace {
         adapter = adapter.with_namespace(Arc::clone(namespace));
     }
-    // Demand-preemption signal: when set, the background scheduler yields
-
-    // after the current service tick so foreground FUSE I/O is not starved.
-
-    let fuse_demand = Arc::new(AtomicBool::new(false));
-
-    adapter.set_scheduler_preempt_signal(Arc::clone(&fuse_demand));
-    let adapter = if effective_mode.writeback_cache {
-        let writeback_tracker =
-            writeback_tracker.ok_or("writeback cache is unavailable for snapshot export")?;
-        adapter
-            .with_writeback_cache_enabled()
-            .with_writeback_cache_timeout(config.writeback_cache_timeout)
-            .with_writeback_range_tracker(writeback_tracker)
-    } else {
-        adapter.with_writeback_cache_disabled()
-    };
     let adapter = if config.mount_opts.sync {
         adapter.with_force_sync_writes()
     } else {
@@ -674,13 +478,8 @@ fn mount_vfs(config: MountVfsConfig) -> Result<(), String> {
         &config.mount_opts,
         effective_mode.read_only,
     ));
-    if effective_mode.writeback_cache {
-        options.push(fuser::MountOption::WritebackCache);
-    }
-
     let ns_handle = adapter.namespace_handle();
     let queue_depth_engine = adapter.engine_handle();
-    let bg_scheduler = adapter.background_scheduler_handle();
     let txg_cycle = if snapshot_export {
         None
     } else {
@@ -702,7 +501,7 @@ fn mount_vfs(config: MountVfsConfig) -> Result<(), String> {
         .map_err(|e| format!("mount: {e}"))?;
     // Immediate liveness check: if the FUSE background session thread
     // exited during spawn (panic, init failure, or kernel error), fail
-    // fast instead of entering the scheduler loop with a dead session.
+    // fast instead of entering the mount wait loop with a dead session.
     if _session.guard.is_finished() {
         return Err(
             "FUSE background session exited during mount; refusing to leave a hung mountpoint"
@@ -712,7 +511,7 @@ fn mount_vfs(config: MountVfsConfig) -> Result<(), String> {
     // Install the notifier so dispatch methods can invalidate kernel caches.
     *notifier_cell.lock().unwrap() = Some(_session.notifier());
     // Wait for the FUSE background session thread to enter its run loop
-    // before the main thread acquires scheduler, txg, and scrub locks.
+    // before the main thread starts its periodic lifecycle work.
     // Avoid std::fs::metadata() on the mountpoint: reentrant FUSE access
     // (the daemon calling stat() on its own mount) can deadlock with the
     // kernel FUSE device lock when a concurrent directory operation (e.g.
@@ -739,40 +538,8 @@ fn mount_vfs(config: MountVfsConfig) -> Result<(), String> {
     // UID/GID translation in the current FUSE adapter boundary.
     tidefs_posix_filesystem_adapter_daemon::check_idmapped_mount(&config.mountpoint)?;
 
-    // Register mounted scrub with the same bounded scheduler that drives the
-    // daemon's other idle-period maintenance. The service clamps each tick to
-    // the typed scrub service curve and retains its cursor between ticks.
-    if scrub_interval > 0 {
-        let scrub_options = StoreOptions {
-            background_scrub_interval_secs: scrub_interval,
-            reclaim_enabled: config.enable_reclaim,
-            ..StoreOptions::default()
-        };
-        let observation_required = scrub_runtime_observation_artifact.is_some();
-        match MountedBackgroundScrubService::open(
-            &scrub_store_root,
-            scrub_options,
-            scrub_runtime_observation_artifact,
-        ) {
-            Ok(service) => {
-                let mut scheduler = bg_scheduler.lock().unwrap();
-                let scheduler = scheduler
-                    .as_mut()
-                    .ok_or("background scrub requires the mounted background scheduler")?;
-                scheduler.register(Box::new(service));
-                eprintln!("background-scrub: scheduled (interval={scrub_interval}s)");
-            }
-            Err(error) if observation_required => {
-                return Err(format!("background-scrub: {error}"));
-            }
-            Err(error) => {
-                eprintln!("background-scrub: disabled after setup failure: {error}");
-            }
-        }
-    }
-
     // ── Clean shutdown via SIGINT/SIGTERM ─────────────────────────
-    let shutdown_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
     let shutdown_for_sig = std::sync::Arc::clone(&shutdown_flag);
     let msp_for_sig = mount_state_path.clone();
 
@@ -814,83 +581,16 @@ fn mount_vfs(config: MountVfsConfig) -> Result<(), String> {
         })
     });
 
-    // Wait until a shutdown signal arrives, running background scheduler
-    // cycles, including mounted scrub, during FUSE idle periods. Uses
-    // tick_if_idle() to avoid
-    // starting work when the demand-preemption signal is asserted.
-    // Each cycle is bounded by the MAINTENANCE_TICK budget (50ms max)
-    // to avoid starving the FUSE dispatch thread.
-    //
-    // Periodically check whether the FUSE background session thread is still
-    // alive.  If the session thread exits (panic, unhandled kernel error, or
-    // normal teardown), the /dev/fuse fd may remain open via the notifier
-    // clone held by BackgroundSession, causing guest filesystem I/O to hang
-    // indefinitely.  Detecting the thread exit and shutting down prevents
-    // that hang and lets the kernel properly unmount.
-    let mut idle_cycles: u64 = 0;
-    let mut loop_iter: u64 = 0;
+    // Wait for a shutdown signal while draining a bounded number of pending
+    // mmap invalidations and checking that the FUSE session remains alive.
+    // A finished session can otherwise leave callers waiting on a dead mount.
     while !shutdown_flag.load(Ordering::Relaxed) {
-        loop_iter = loop_iter.saturating_add(1);
-        let report_opt = bg_scheduler.lock().unwrap().as_mut().and_then(|sched| {
-            let cycle_start = std::time::Instant::now();
-            let result = sched.tick_if_idle();
-            if result.is_some() {
-                crate::observability::HIST_BG_SCHEDULER.record(cycle_start.elapsed());
-            }
-            result
-        });
-        match report_opt {
-            Some(report) => {
-                if report.preempted {
-                    tracing::debug!(
-                        target: "tidefs.bg_scheduler",
-                        services_ran = report.services_ran,
-                        total_processed = report.total_processed,
-                        wall_ms = report.wall_ms,
-                        preempted = true,
-                        "background scheduler cycle preempted",
-                    );
-                } else {
-                    tracing::debug!(
-                        target: "tidefs.bg_scheduler",
-                        services_ran = report.services_ran,
-                        services_skipped = report.services_skipped,
-                        total_processed = report.total_processed,
-                        total_errors = report.total_errors,
-                        wall_ms = report.wall_ms,
-                        "background scheduler cycle completed",
-                    );
-                }
-                std::thread::yield_now();
-            }
-            None => {
-                idle_cycles = idle_cycles.saturating_add(1);
-                if idle_cycles % 60 == 0 {
-                    tracing::info!(
-                        target: "tidefs.bg_scheduler",
-                        idle_cycles = idle_cycles,
-                        "background scheduler periodic summary",
-                    );
-                    crate::observability::HIST_BG_SCHEDULER.emit_summary("bg_scheduler_cycle");
-                }
-                std::thread::park_timeout(std::time::Duration::from_millis(500));
-                // Drain pending mmap coherency invalidation events.
-                // Budget: at most 16 events per tick to bound latency.
-                mmap_coherency.process_tick(16);
-            }
-        }
-
-        // Check whether the FUSE background session thread is still alive
-        // on every loop iteration, not just idle cycles.  If the session
-        // thread exits (panic, unhandled kernel error, or normal teardown),
-        // shut down immediately to prevent guest filesystem I/O from
-        // hanging indefinitely on a dead mountpoint.
-        if loop_iter % 2 == 0 && _session.guard.is_finished() {
+        std::thread::park_timeout(std::time::Duration::from_millis(500));
+        mmap_coherency.process_tick(16);
+        if _session.guard.is_finished() {
             eprintln!(
-                "FUSE background session thread exited prematurely;                  shutting down to prevent hung mountpoint"
+                "FUSE background session thread exited prematurely; shutting down to prevent hung mountpoint"
             );
-            // Diagnostic: if the session already finished, try to join and report the outcome.
-            // We cannot join() here because it consumes self, but we can inspect the guard.
             tracing::error!(
                 target: "tidefs.fuse_session",
                 "FUSE background session thread finished prematurely on mount {}",
@@ -916,10 +616,6 @@ fn mount_vfs(config: MountVfsConfig) -> Result<(), String> {
     if let Some(handle) = txg_handle {
         let _ = handle.join();
     }
-
-    // Drop scheduled maintenance stores before unmount and the final
-    // namespace flush open the backing store again.
-    *bg_scheduler.lock().unwrap() = None;
 
     // Unmount and join the FUSE background session.  The session's Drop
     // triggers adapter.destroy() which flushes writeback data via shutdown().
@@ -949,39 +645,6 @@ fn mount_vfs(config: MountVfsConfig) -> Result<(), String> {
             .write_to_path(&msp_for_sig)
             .map_err(|e| format!("write clean mount-state: {e}"))?;
     }
-    Ok(())
-}
-
-fn write_scrub_runtime_observation(
-    path: &Path,
-    observation: &ScrubRuntimeObservation,
-) -> Result<(), String> {
-    if let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        std::fs::create_dir_all(parent).map_err(|error| {
-            format!(
-                "create scrub runtime observation dir {}: {error}",
-                parent.display()
-            )
-        })?;
-    }
-    let bytes = serde_json::to_vec_pretty(observation)
-        .map_err(|error| format!("encode scrub runtime observation: {error}"))?;
-    let temp_path = path.with_extension(format!("tmp-{}", observation.daemon_pid));
-    std::fs::write(&temp_path, bytes).map_err(|error| {
-        format!(
-            "write scrub runtime observation temp file {}: {error}",
-            temp_path.display()
-        )
-    })?;
-    std::fs::rename(&temp_path, path).map_err(|error| {
-        format!(
-            "publish scrub runtime observation {}: {error}",
-            path.display()
-        )
-    })?;
     Ok(())
 }
 
@@ -1051,22 +714,14 @@ fn write_queue_depth_runtime_artifact(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct EffectiveMountMode {
     read_only: bool,
-    writeback_cache: bool,
     intent_log_write: bool,
-    background_scrub_interval_secs: u64,
 }
 
 fn effective_mount_mode(config: &MountVfsConfig) -> EffectiveMountMode {
     let snapshot_export = config.snapshot_name.is_some();
     EffectiveMountMode {
         read_only: config.read_only || snapshot_export,
-        writeback_cache: config.writeback_cache && !snapshot_export,
         intent_log_write: config.intent_log_write && !snapshot_export,
-        background_scrub_interval_secs: if snapshot_export {
-            0
-        } else {
-            config.background_scrub_interval_secs
-        },
     }
 }
 
@@ -1075,9 +730,9 @@ fn fuse_mount_options_for_mode(
     read_only: bool,
 ) -> Vec<fuser::MountOption> {
     let mut effective = mount_opts.clone();
-    // Read-write mounts keep the kernel-visible atime policy so cached reads
-    // update user-visible attrs. The adapter still records read access in the
-    // engine/namespace authority; read-only mounts suppress both paths.
+    // Read-write mounts expose the selected atime policy. Regular-file reads
+    // use direct I/O and update atime in the VFS engine; read-only mounts
+    // suppress both engine and kernel-originated timestamp updates.
     if read_only {
         effective.timestamp_policy = crate::mount_options::TimestampPolicy::NoAtime;
     }
@@ -1096,9 +751,6 @@ pub struct MountVfsConfig {
     /// Source name reported by the FUSE mount in mount tables.
     pub fs_name: String,
     pub root_authentication_key: RootAuthenticationKey,
-    /// When true, enables FUSE writeback-cache for buffered writes.
-    /// Default: false (safe direct-write path).
-    pub writeback_cache: bool,
     /// Content capacity configured for the mounted local filesystem.
     pub content_capacity_bytes: u64,
 
@@ -1109,19 +761,13 @@ pub struct MountVfsConfig {
     /// Larger writes rely on the storage commit path instead of hashing data
     /// in the FUSE hot path.
     pub intent_log_write: bool,
-    /// Maximum age (in seconds) of dirty pages in the writeback cache
-    /// before the background flush service writes them to storage.
-    pub writeback_cache_timeout: u64,
     /// Seconds to wait after receiving SIGTERM/SIGINT before forcing
     /// unmount.  During this grace period in-flight FUSE requests
     /// complete naturally.  Default 0 means no extra drain wait.
     pub drain_timeout_secs: u64,
-    /// Background segment integrity scrub interval in seconds.
-    /// 0 disables.  Default: 0 (disabled).
-    pub background_scrub_interval_secs: u64,
     /// Coherency profile for FUSE caching behaviour.
-    /// Default: Writeback for TTL/invalidation only; kernel writeback remains
-    /// opt-in through `writeback_cache`.
+    /// Default: Writeback for TTL/invalidation only; kernel writeback-cache
+    /// remains unavailable regardless of this profile.
     pub coherency_profile: crate::coherency_profile::CoherencyProfile,
     /// Optional per-object compression configuration for the backing store.
     /// When set, all objects written to the pool are compressed with the
@@ -1135,11 +781,6 @@ pub struct MountVfsConfig {
     /// are freed after committed-root safety.  FUSE-mounted writes and
     /// deletions will drive reclaim population.  Default: false.
     pub enable_reclaim: bool,
-    /// When true, sets RecoveryPolicy::RepairWriteback so the repair
-    /// cycle can write reconstructed bytes, truncate corrupt content,
-    /// and mark inodes as corrupt during mounted operation.
-    /// Default: false (ReplayOnly).
-    pub enable_repair_writeback: bool,
     /// When set, enables byte-level corruption injection on every write
     /// at the given probability (0.0-1.0).  Corruption is applied before
     /// integrity-trailer computation, so it tests error-path behavior
@@ -1147,9 +788,6 @@ pub struct MountVfsConfig {
     pub fault_inject_corruption: Option<f64>,
     /// Optional JSON artifact path for mounted queue-depth evidence.
     pub queue_depth_artifact: Option<PathBuf>,
-    /// Optional validation-only JSON path for typed daemon scrub observations.
-    /// Issue #1792 owns graduation or removal of this evidence surface.
-    pub scrub_runtime_observation_artifact: Option<PathBuf>,
 }
 
 fn parse_mount_vfs_config(args: Vec<String>) -> Result<MountVfsConfig, String> {
@@ -1158,23 +796,18 @@ fn parse_mount_vfs_config(args: Vec<String>) -> Result<MountVfsConfig, String> {
     let mut fs_name = "tidefs-vfs".to_string();
     let mut read_only = false;
     let mut root_authentication_key = None;
-    let mut writeback_cache = false;
     let mut content_capacity_bytes = LocalStorageAllocatorPolicy::default().content_capacity_bytes;
     let mut snapshot_name: Option<String> = None;
     let mut mount_opts = MountOptions::default();
     let mut sync_guarantee = SyncGuarantee::Local;
     let mut intent_log_write = mount_opts.intent_log_write;
-    let mut writeback_cache_timeout: Option<u64> = None;
     let mut drain_timeout_secs: Option<u64> = None;
-    let mut background_scrub_interval_secs: Option<u64> = None;
     let mut cache_profile = None;
     let mut compression: Option<tidefs_local_object_store::CompressionConfig> = None;
     let mut enable_dedup = false;
     let mut enable_reclaim = false;
-    let mut enable_repair_writeback = false;
     let mut fault_inject_corruption: Option<f64> = None;
     let mut queue_depth_artifact = None;
-    let mut scrub_runtime_observation_artifact = None;
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -1208,7 +841,7 @@ fn parse_mount_vfs_config(args: Vec<String>) -> Result<MountVfsConfig, String> {
                 read_only = true;
             }
             "--writeback-cache" => {
-                writeback_cache = true;
+                return Err(fuse_vfs_adapter::WRITEBACK_CACHE_RECEIPT_AUTHORITY_REFUSAL.to_string());
             }
             "--content-capacity-bytes" => {
                 let val = iter
@@ -1226,9 +859,6 @@ fn parse_mount_vfs_config(args: Vec<String>) -> Result<MountVfsConfig, String> {
                     iter.next()
                         .ok_or("--snapshot requires a snapshot name argument")?,
                 );
-            }
-            "--no-writeback-cache" => {
-                writeback_cache = false;
             }
             "--options" | "-o" => {
                 let val = iter
@@ -1259,16 +889,7 @@ fn parse_mount_vfs_config(args: Vec<String>) -> Result<MountVfsConfig, String> {
                 intent_log_write = true;
             }
             "--writeback-cache-timeout" => {
-                let val = iter
-                    .next()
-                    .ok_or("--writeback-cache-timeout requires an integer argument")?;
-                let secs: u64 = val
-                    .parse()
-                    .map_err(|e| format!("invalid writeback-cache-timeout `{val}`: {e}"))?;
-                if secs == 0 {
-                    return Err("writeback-cache-timeout must be > 0".into());
-                }
-                writeback_cache_timeout = Some(secs);
+                return Err(fuse_vfs_adapter::WRITEBACK_CACHE_RECEIPT_AUTHORITY_REFUSAL.to_string());
             }
             "--drain-timeout-secs" => {
                 let val = iter
@@ -1279,15 +900,6 @@ fn parse_mount_vfs_config(args: Vec<String>) -> Result<MountVfsConfig, String> {
                     .map_err(|e| format!("invalid drain-timeout-secs `{val}`: {e}"))?;
                 // Set in the config below; we need a local variable
                 drain_timeout_secs = Some(secs);
-            }
-            "--background-scrub-interval" => {
-                let val = iter
-                    .next()
-                    .ok_or("--background-scrub-interval requires an integer argument")?;
-                let secs: u64 = val
-                    .parse()
-                    .map_err(|e| format!("invalid background-scrub-interval `{val}`: {e}"))?;
-                background_scrub_interval_secs = Some(secs);
             }
             "--coherency" | "--coherency-profile" => {
                 let val = iter
@@ -1329,9 +941,6 @@ fn parse_mount_vfs_config(args: Vec<String>) -> Result<MountVfsConfig, String> {
             "--enable-reclaim" => {
                 enable_reclaim = true;
             }
-            "--enable-repair-writeback" => {
-                enable_repair_writeback = true;
-            }
             "--fault-inject-corruption" => {
                 let val = iter
                     .next()
@@ -1358,18 +967,6 @@ fn parse_mount_vfs_config(args: Vec<String>) -> Result<MountVfsConfig, String> {
                     .expect("prefix checked");
                 queue_depth_artifact = Some(PathBuf::from(value));
             }
-            "--scrub-runtime-observation-artifact" => {
-                let val = iter
-                    .next()
-                    .ok_or("--scrub-runtime-observation-artifact requires a path argument")?;
-                scrub_runtime_observation_artifact = Some(PathBuf::from(val));
-            }
-            _ if arg.starts_with("--scrub-runtime-observation-artifact=") => {
-                let value = arg
-                    .strip_prefix("--scrub-runtime-observation-artifact=")
-                    .expect("prefix checked");
-                scrub_runtime_observation_artifact = Some(PathBuf::from(value));
-            }
             other => return Err(format!("unknown mount-vfs argument `{other}`")),
         }
     }
@@ -1385,24 +982,18 @@ fn parse_mount_vfs_config(args: Vec<String>) -> Result<MountVfsConfig, String> {
         mountpoint: mountpoint.ok_or("mount-vfs requires --mount <path>")?,
         fs_name,
         root_authentication_key,
-        writeback_cache,
         content_capacity_bytes,
         mount_opts,
         sync_guarantee,
         intent_log_write,
-        writeback_cache_timeout: writeback_cache_timeout.unwrap_or(60),
         drain_timeout_secs: drain_timeout_secs.unwrap_or(0),
-        background_scrub_interval_secs: background_scrub_interval_secs
-            .unwrap_or(MOUNT_VFS_DEFAULT_BACKGROUND_SCRUB_INTERVAL_SECS),
         coherency_profile: cache_profile.unwrap_or_default(),
         compression,
         enable_dedup,
         enable_reclaim,
-        enable_repair_writeback,
         snapshot_name,
         fault_inject_corruption,
         queue_depth_artifact,
-        scrub_runtime_observation_artifact,
     })
 }
 
@@ -3629,339 +3220,6 @@ fn run_smoke_mount(config: SmokeMountConfig) -> Result<(), String> {
         Ok(())
     });
 
-    // ── Phase 8: Repair writeback policy and recovery loop ──
-    // Opens the store directly with RepairWriteback policy, runs the
-    // committed-root recovery loop, scrubs the segment chain, and
-    // verifies the repair log is well-formed.  This proves the repair
-    // writeback code path is functional on the mounted pool even
-    // though the daemon itself defaults to ReplayOnly.
-    eprintln!("=== Phase 8: repair writeback recovery verification ===");
-
-    smoke_test!("phase8_recovery_loop_repair_writeback", {
-        use tidefs_local_filesystem::human::local_filesystem::{
-            LocalFileSystem, LocalStorageAllocatorPolicy, StoreOptions,
-        };
-        let auth_key = tidefs_local_filesystem::RootAuthenticationKey::from_hex(
-            "4141414141414141414141414141414141414141414141414141414141414141",
-        )
-        .map_err(|e| format!("auth key: {e}"))?;
-        let store_opts = StoreOptions {
-            reclaim_enabled: true,
-            ..Default::default()
-        };
-        let _lfs = LocalFileSystem::open_with_allocator_policy_and_root_authentication_key(
-            store_root,
-            tidefs_local_filesystem::LocalFileSystemOpenConfig {
-                options: store_opts,
-                allocator_policy: LocalStorageAllocatorPolicy::default(),
-                root_authentication_key: auth_key,
-                encryption: None,
-                compression: None,
-                log_device_device_path: None,
-                recovery_policy: tidefs_recovery_loop::RecoveryPolicy::RepairWriteback,
-                block_devices: None,
-            },
-        )
-        .map_err(|e| format!("open with RepairWriteback: {e}"))?;
-        eprintln!("  DIAG  RepairWriteback open succeeded, recovery loop completed");
-        Ok(())
-    });
-
-    smoke_test!("phase8_run_background_scrub_on_mounted_pool", {
-        let mut store = tidefs_local_object_store::LocalObjectStore::open_with_options(
-            store_root,
-            tidefs_local_object_store::StoreOptions {
-                background_scrub_interval_secs: 1,
-                reclaim_enabled: true,
-                ..tidefs_local_object_store::StoreOptions::default()
-            },
-        )
-        .map_err(|e| format!("open scrub store: {e}"))?;
-        // Run one scrub pass and confirm it completes without error.
-        let report = store
-            .run_background_scrub()
-            .map_err(|e| format!("run_background_scrub: {e}"))?;
-        eprintln!(
-            "  DIAG  scrub on mounted pool: segments_scanned={} records_verified={}",
-            report.segments_scanned, report.records_verified
-        );
-        let suspect_text = store.suspect_log_text_report();
-        if !suspect_text.is_empty() {
-            eprintln!("  DIAG  suspect_log_report:\n{suspect_text}");
-        }
-        Ok(())
-    });
-
-    smoke_test!("phase8_discover_suspect_entries_via_chain_verify", {
-        let store = tidefs_local_object_store::LocalObjectStore::open(store_root)
-            .map_err(|e| format!("open store: {e}"))?;
-        let (_stats, suspect_log) = store
-            .verify_segment_chain()
-            .map_err(|e| format!("verify_segment_chain: {e}"))?;
-        let entry_count = suspect_log.len();
-        eprintln!(
-            "  DIAG  suspect_entries_from_chain_verify={entry_count} (0 expected on clean pool)"
-        );
-        if entry_count > 0 {
-            eprintln!(
-                "  WARN  {entry_count} suspect entries found on clean pool (may indicate pre-existing on-disk issue)"
-            );
-        }
-        Ok(())
-    });
-
-    // ── Phase 9: Fault injection corruption, scrub detection, repair ──
-    // Uses the object-store FaultInjectionConfig to write corrupted
-    // payloads, then reopens the store cleanly and runs scrub+repair
-    // to verify the detection→repair handoff pipeline.
-    eprintln!("=== Phase 9: fault injection corruption and repair ===");
-
-    let corrupt_key = tidefs_local_object_store::ObjectKey::from_name(b"phase9_corrupt_test_key__");
-
-    smoke_test!("phase9_write_with_corruption_injection", {
-        let mut store = tidefs_local_object_store::LocalObjectStore::open_with_options(
-            store_root,
-            tidefs_local_object_store::StoreOptions {
-                fault_injection_config: Some(tidefs_local_object_store::FaultInjectionConfig {
-                    byte_corruption_probability: 0.5,
-                    ..tidefs_local_object_store::FaultInjectionConfig::off()
-                }),
-                ..tidefs_local_object_store::StoreOptions::default()
-            },
-        )
-        .map_err(|e| format!("open corrupt store: {e}"))?;
-        let payload = vec![0xABu8; 2048];
-        match store.put(corrupt_key, &payload) {
-            Ok(_) => eprintln!("  DIAG  corrupt write succeeded (payload may be altered)"),
-            Err(e) => eprintln!("  DIAG  corrupt write failed (expected path): {e}"),
-        }
-        Ok(())
-    });
-
-    smoke_test!("phase9_reopen_and_read_corrupted_data", {
-        let store = tidefs_local_object_store::LocalObjectStore::open_with_options(
-            store_root,
-            tidefs_local_object_store::StoreOptions {
-                verify_read_checksums: true,
-                ..tidefs_local_object_store::StoreOptions::default()
-            },
-        )
-        .map_err(|e| format!("open verify store: {e}"))?;
-        let original = vec![0xABu8; 2048];
-        match store.get(corrupt_key) {
-            Ok(Some(readback)) => {
-                let differs = readback != original;
-                eprintln!(
-                    "  DIAG  readback len={} differs_from_original={}",
-                    readback.len(),
-                    differs
-                );
-                if !differs {
-                    eprintln!("  DIAG  corruption did not fire (probabilistic); data matches");
-                }
-            }
-            Ok(None) => {
-                eprintln!("  DIAG  key not found (write may have failed)");
-            }
-            Err(e) => {
-                eprintln!("  DIAG  read error (checksum mismatch expected): {e}");
-            }
-        }
-        Ok(())
-    });
-
-    smoke_test!("phase9_scrub_after_corruption_injection", {
-        let mut store = tidefs_local_object_store::LocalObjectStore::open_with_options(
-            store_root,
-            tidefs_local_object_store::StoreOptions {
-                background_scrub_interval_secs: 1,
-                reclaim_enabled: true,
-                ..tidefs_local_object_store::StoreOptions::default()
-            },
-        )
-        .map_err(|e| format!("open scrub store: {e}"))?;
-        let report = store
-            .run_background_scrub()
-            .map_err(|e| format!("run_background_scrub: {e}"))?;
-        eprintln!(
-            "  DIAG  post-corruption scrub: segments={} records={} bytes={}",
-            report.segments_scanned, report.records_verified, report.bytes_scanned
-        );
-        let suspect_text = store.suspect_log_text_report();
-        let suspect_count = store.suspect_log().len();
-        eprintln!("  DIAG  suspect_log entries after corruption scrub: {suspect_count}");
-        if !suspect_text.is_empty() {
-            eprintln!("  DIAG  suspect_log_report:\n{suspect_text}");
-        }
-        Ok(())
-    });
-
-    smoke_test!("phase9_recovery_loop_after_corruption", {
-        use tidefs_local_filesystem::human::local_filesystem::{
-            LocalFileSystem, LocalStorageAllocatorPolicy, StoreOptions,
-        };
-        let auth_key = tidefs_local_filesystem::RootAuthenticationKey::from_hex(
-            "4141414141414141414141414141414141414141414141414141414141414141",
-        )
-        .map_err(|e| format!("auth key: {e}"))?;
-        let store_opts = StoreOptions {
-            reclaim_enabled: true,
-            ..Default::default()
-        };
-        let _lfs = LocalFileSystem::open_with_allocator_policy_and_root_authentication_key(
-            store_root,
-            tidefs_local_filesystem::LocalFileSystemOpenConfig {
-                options: store_opts,
-                allocator_policy: LocalStorageAllocatorPolicy::default(),
-                root_authentication_key: auth_key,
-                encryption: None,
-                compression: None,
-                log_device_device_path: None,
-                recovery_policy: tidefs_recovery_loop::RecoveryPolicy::RepairWriteback,
-                block_devices: None,
-            },
-        )
-        .map_err(|e| format!("open with RepairWriteback after corruption: {e}"))?;
-        eprintln!("  DIAG  RepairWriteback recovery loop succeeded after corruption");
-        Ok(())
-    });
-
-    // ── Phase 10: On-disk segment corruption → scrub detection → repair ──
-    // Directly modifies a closed segment file to inject payload-level
-    // corruption that scub will detect (unlike Phase 9's pre-trailer
-    // injection).  Verifies the full detect→persist→repair pipeline.
-    eprintln!("=== Phase 10: segment-level corruption and repair ===");
-
-    smoke_test!("phase10_inject_segment_corruption", {
-        let store = tidefs_local_object_store::LocalObjectStore::open(store_root)
-            .map_err(|e| format!("open store for corruption: {e}"))?;
-        let seg_dir = store.segments_dir().to_path_buf();
-        drop(store);
-
-        // Find the newest non-empty segment file.
-        let mut seg_files: Vec<std::path::PathBuf> = std::fs::read_dir(&seg_dir)
-            .map_err(|e| format!("read segments dir: {e}"))?
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| p.is_file())
-            .collect();
-        if seg_files.is_empty() {
-            return Err("no segment files found".to_string());
-        }
-        seg_files.sort_by_key(|p| std::fs::metadata(p).ok().and_then(|m| m.modified().ok()));
-        let target = seg_files.last().ok_or("no segment file")?.clone();
-        let file_len = std::fs::metadata(&target)
-            .map_err(|e| format!("metadata: {e}"))?
-            .len();
-
-        eprintln!(
-            "  DIAG  corrupting segment file {:?} (len={})",
-            target.file_name().unwrap_or_default(),
-            file_len
-        );
-
-        // Corrupt bytes in the first record's payload area.
-        // Record layout: header(96) + payload + footer(16) + trailer(112).
-        // Flip 8 bytes at offset 100 (well into payload for any real object).
-        let corrupt_offset: u64 = 100;
-        let mut buf = std::fs::read(&target).map_err(|e| format!("read segment: {e}"))?;
-        if buf.len() as u64 > corrupt_offset + 8 {
-            for i in 0..8 {
-                buf[(corrupt_offset + i) as usize] ^= 0xFF;
-            }
-            std::fs::write(&target, &buf).map_err(|e| format!("write corrupted segment: {e}"))?;
-            eprintln!("  DIAG  flipped 8 bytes at offset {corrupt_offset}");
-        } else {
-            eprintln!(
-                "  DIAG  segment too short for payload corruption (len={})",
-                buf.len()
-            );
-        }
-        Ok(())
-    });
-
-    smoke_test!("phase10_scrub_detects_corruption", {
-        let mut store = tidefs_local_object_store::LocalObjectStore::open_with_options(
-            store_root,
-            tidefs_local_object_store::StoreOptions {
-                background_scrub_interval_secs: 1,
-                reclaim_enabled: true,
-                ..tidefs_local_object_store::StoreOptions::default()
-            },
-        )
-        .map_err(|e| format!("open scrub store: {e}"))?;
-        let report = store
-            .run_background_scrub()
-            .map_err(|e| format!("run_background_scrub: {e}"))?;
-        eprintln!(
-            "  DIAG  post-corruption scrub: segments={} records={} bytes={} outcomes={}",
-            report.segments_scanned,
-            report.records_verified,
-            report.bytes_scanned,
-            report.outcomes.len()
-        );
-        for outcome in &report.outcomes {
-            eprintln!("  DIAG  scrub outcome: {outcome:?}");
-        }
-
-        let suspect_count = store.suspect_log().len();
-        eprintln!("  DIAG  suspect_log entries after corruption: {suspect_count}");
-        if suspect_count == 0 {
-            eprintln!("  WARN  scrub did not detect corruption (offset may have hit benign area)");
-        }
-        let suspect_text = store.suspect_log_text_report();
-        if !suspect_text.is_empty() {
-            eprintln!("  DIAG  suspect_log text report follows:");
-            for line in suspect_text.lines().take(10) {
-                eprintln!("    {line}");
-            }
-        }
-        Ok(())
-    });
-
-    smoke_test!("phase10_suspect_log_survives_reopen", {
-        // Reopen the store and verify SuspectLog entries persist.
-        let store = tidefs_local_object_store::LocalObjectStore::open(store_root)
-            .map_err(|e| format!("reopen store: {e}"))?;
-        let suspect_count = store.suspect_log().len();
-        eprintln!(
-            "  DIAG  suspect_log after reopen: {suspect_count} entries (should be >0 if corruption detected)"
-        );
-        // Don't fail if 0 — the corruption offset may not always hit payload.
-        // The important thing is the SuspectLog loads correctly across reopen.
-        Ok(())
-    });
-
-    smoke_test!("phase10_repair_recovery_after_corruption", {
-        use tidefs_local_filesystem::human::local_filesystem::{
-            LocalFileSystem, LocalStorageAllocatorPolicy, StoreOptions,
-        };
-        let auth_key = tidefs_local_filesystem::RootAuthenticationKey::from_hex(
-            "4141414141414141414141414141414141414141414141414141414141414141",
-        )
-        .map_err(|e| format!("auth key: {e}"))?;
-        let store_opts = StoreOptions {
-            reclaim_enabled: true,
-            ..Default::default()
-        };
-        let _lfs = LocalFileSystem::open_with_allocator_policy_and_root_authentication_key(
-            store_root,
-            tidefs_local_filesystem::LocalFileSystemOpenConfig {
-                options: store_opts,
-                allocator_policy: LocalStorageAllocatorPolicy::default(),
-                root_authentication_key: auth_key,
-                encryption: None,
-                compression: None,
-                log_device_device_path: None,
-                recovery_policy: tidefs_recovery_loop::RecoveryPolicy::RepairWriteback,
-                block_devices: None,
-            },
-        )
-        .map_err(|e| format!("open with RepairWriteback after segment corruption: {e}"))?;
-        eprintln!("  DIAG  RepairWriteback recovery succeeded after segment corruption");
-        Ok(())
-    });
-
     // Clean up temp dirs.
     let _ = fs::remove_dir_all(store_root);
     let _ = fs::remove_dir_all(mountpoint);
@@ -3974,388 +3232,13 @@ fn run_smoke_mount(config: SmokeMountConfig) -> Result<(), String> {
     Ok(())
 }
 
-/// Standalone scrub-repair-reclaim smoke test that does NOT require FUSE.
-///
-/// Creates a LocalFileSystem directly, writes data, commits, then runs
-/// Phases 7b-10 (SuspectLog persistence, segment chain verify, repair
-/// writeback recovery, fault injection, segment-level corruption +
-/// scrub detection + SuspectLog survival + RepairWriteback recovery).
-///
-/// This produces runtime validation output for the scrub/repair/reclaim
-/// pipeline without needing /dev/fuse or a mounted kernel.
-#[allow(unsafe_code)]
-fn run_scrub_repair_smoke() -> Result<(), String> {
-    use tidefs_local_filesystem::human::local_filesystem::{
-        LocalFileSystem, LocalStorageAllocatorPolicy, StoreOptions,
-    };
-
-    let store_root = "/tmp/tidefs-scrub-repair-smoke-store";
-    let _ = std::fs::remove_dir_all(store_root);
-    std::fs::create_dir_all(store_root).map_err(|e| format!("create store dir: {e}"))?;
-
-    let mut passed = 0_u32;
-    let mut failed = 0_u32;
-
-    macro_rules! smoke_test {
-        ($name:expr, $body:block) => {
-            match (|| -> Result<(), String> { $body })() {
-                Ok(()) => {
-                    eprintln!("  PASS  {}", $name);
-                    passed += 1;
-                }
-                Err(e) => {
-                    eprintln!("  FAIL  {}: {}", $name, e);
-                    failed += 1;
-                }
-            }
-        };
-    }
-
-    let auth_key = tidefs_local_filesystem::RootAuthenticationKey::from_hex(
-        "4141414141414141414141414141414141414141414141414141414141414141",
-    )
-    .map_err(|e| format!("auth key: {e}"))?;
-
-    // Phase A: Create filesystem and write data (no FUSE needed)
-    eprintln!("=== Phase A: create filesystem and write data ===");
-
-    smoke_test!("phaseA_open_filesystem", {
-        let opts = StoreOptions {
-            reclaim_enabled: true,
-            ..Default::default()
-        };
-        let _lfs = LocalFileSystem::open_with_allocator_policy_and_root_authentication_key(
-            store_root,
-            tidefs_local_filesystem::LocalFileSystemOpenConfig {
-                options: opts,
-                allocator_policy: LocalStorageAllocatorPolicy::default(),
-                root_authentication_key: auth_key,
-                encryption: None,
-                compression: None,
-                log_device_device_path: None,
-                recovery_policy: tidefs_recovery_loop::RecoveryPolicy::RepairWriteback,
-                block_devices: None,
-            },
-        )
-        .map_err(|e| format!("open: {e}"))?;
-        Ok(())
-    });
-
-    smoke_test!("phaseA_create_files_and_dirs", {
-        let opts = StoreOptions {
-            reclaim_enabled: true,
-            ..Default::default()
-        };
-        let mut lfs = LocalFileSystem::open_with_allocator_policy_and_root_authentication_key(
-            store_root,
-            tidefs_local_filesystem::LocalFileSystemOpenConfig {
-                options: opts,
-                allocator_policy: LocalStorageAllocatorPolicy::default(),
-                root_authentication_key: auth_key,
-                encryption: None,
-                compression: None,
-                log_device_device_path: None,
-                recovery_policy: tidefs_recovery_loop::RecoveryPolicy::RepairWriteback,
-                block_devices: None,
-            },
-        )
-        .map_err(|e| format!("open: {e}"))?;
-        // Create a file with data
-        let _rec = lfs
-            .create_file("/scrub-test-file.txt", 0o644)
-            .map_err(|e| format!("create_file: {e}"))?;
-        let data = vec![0xABu8; 4096];
-        lfs.write_file("/scrub-test-file.txt", 0, &data)
-            .map_err(|e| format!("write_file: {e}"))?;
-        // Create a subdirectory
-        let _dirrec = lfs
-            .create_dir("/scrub-test-subdir", 0o755)
-            .map_err(|e| format!("create_dir: {e}"))?;
-        // Create another file
-        let _rec2 = lfs
-            .create_file("/scrub-test-subdir/nested.txt", 0o644)
-            .map_err(|e| format!("create nested file: {e}"))?;
-        let data2 = b"nested file content for scrub testing\n".to_vec();
-        lfs.write_file("/scrub-test-subdir/nested.txt", 0, &data2)
-            .map_err(|e| format!("write nested: {e}"))?;
-        // Commit and close
-        lfs.commit().map_err(|e| format!("commit: {e}"))?;
-        drop(lfs);
-        eprintln!("  DIAG  created 2 files, 1 dir, committed");
-        Ok(())
-    });
-
-    // ── Phase 7b: SuspectLog persistence ──
-    eprintln!("=== Phase B: SuspectLog persistence verification ===");
-
-    smoke_test!("phaseB_suspect_log_loads", {
-        let store = tidefs_local_object_store::LocalObjectStore::open(store_root)
-            .map_err(|e| format!("open store: {e}"))?;
-        let log = store.suspect_log();
-        eprintln!("  DIAG  suspect_log entries={}", log.len());
-        Ok(())
-    });
-
-    smoke_test!("phaseB_segment_chain_verify", {
-        let store = tidefs_local_object_store::LocalObjectStore::open(store_root)
-            .map_err(|e| format!("open store: {e}"))?;
-        let (stats, _log) = store
-            .verify_segment_chain()
-            .map_err(|e| format!("segment chain verify: {e}"))?;
-        eprintln!(
-            "  DIAG  chain: segments={} breaks={} last={}",
-            stats.segments_in_chain, stats.chain_breaks_detected, stats.last_verified_segment
-        );
-        if stats.chain_breaks_detected > 0 {
-            eprintln!(
-                "  DIAG  {} chain breaks detected (may be from pre-existing suspect entries or corruption in Phase A/B)",
-                stats.chain_breaks_detected
-            );
-        }
-        Ok(())
-    });
-
-    // ── Phase 8: Repair writeback recovery ──
-    eprintln!("=== Phase C: repair writeback recovery ===");
-
-    smoke_test!("phaseC_recovery_loop_repair_writeback", {
-        let opts = StoreOptions {
-            reclaim_enabled: true,
-            ..Default::default()
-        };
-        let _lfs = LocalFileSystem::open_with_allocator_policy_and_root_authentication_key(
-            store_root,
-            tidefs_local_filesystem::LocalFileSystemOpenConfig {
-                options: opts,
-                allocator_policy: LocalStorageAllocatorPolicy::default(),
-                root_authentication_key: auth_key,
-                encryption: None,
-                compression: None,
-                log_device_device_path: None,
-                recovery_policy: tidefs_recovery_loop::RecoveryPolicy::RepairWriteback,
-                block_devices: None,
-            },
-        )
-        .map_err(|e| format!("open: {e}"))?;
-        eprintln!("  DIAG  RepairWriteback recovery loop completed");
-        Ok(())
-    });
-
-    smoke_test!("phaseC_run_background_scrub", {
-        let mut store = tidefs_local_object_store::LocalObjectStore::open_with_options(
-            store_root,
-            tidefs_local_object_store::StoreOptions {
-                background_scrub_interval_secs: 1,
-                reclaim_enabled: true,
-                ..tidefs_local_object_store::StoreOptions::default()
-            },
-        )
-        .map_err(|e| format!("open: {e}"))?;
-        let report = store
-            .run_background_scrub()
-            .map_err(|e| format!("scrub: {e}"))?;
-        eprintln!(
-            "  DIAG  scrub: segments={} records={} bytes={}",
-            report.segments_scanned, report.records_verified, report.bytes_scanned
-        );
-        Ok(())
-    });
-
-    // ── Phase 9: Fault injection corruption ──
-    eprintln!("=== Phase D: fault injection corruption ===");
-
-    let _corrupt_key = tidefs_local_object_store::ObjectKey::from_name(b"phaseD_corrupt_test");
-
-    smoke_test!("phaseD_write_with_corruption_injection", {
-        let mut store = tidefs_local_object_store::LocalObjectStore::open_with_options(
-            store_root,
-            tidefs_local_object_store::StoreOptions {
-                fault_injection_config: Some(tidefs_local_object_store::FaultInjectionConfig {
-                    byte_corruption_probability: 0.5,
-                    ..tidefs_local_object_store::FaultInjectionConfig::off()
-                }),
-                ..tidefs_local_object_store::StoreOptions::default()
-            },
-        )
-        .map_err(|e| format!("open: {e}"))?;
-        let payload = vec![0xABu8; 2048];
-        match store.put_named(b"phaseD_corrupt_test", &payload) {
-            Ok(_) => eprintln!("  DIAG  corrupt write succeeded"),
-            Err(e) => eprintln!("  DIAG  corrupt write: {e}"),
-        }
-        Ok(())
-    });
-
-    smoke_test!("phaseD_reopen_and_read", {
-        let store = tidefs_local_object_store::LocalObjectStore::open_with_options(
-            store_root,
-            tidefs_local_object_store::StoreOptions {
-                verify_read_checksums: true,
-                ..tidefs_local_object_store::StoreOptions::default()
-            },
-        )
-        .map_err(|e| format!("open: {e}"))?;
-        let original = vec![0xABu8; 2048];
-        match store.get_named(b"phaseD_corrupt_test") {
-            Ok(Some(readback)) => {
-                let differs = readback != original;
-                eprintln!(
-                    "  DIAG  readback len={} differs={}",
-                    readback.len(),
-                    differs
-                );
-            }
-            Ok(None) => eprintln!("  DIAG  key not found"),
-            Err(e) => eprintln!("  DIAG  read error (checksum mismatch?): {e}"),
-        }
-        Ok(())
-    });
-
-    smoke_test!("phaseD_scrub_after_corruption", {
-        let mut store = tidefs_local_object_store::LocalObjectStore::open_with_options(
-            store_root,
-            tidefs_local_object_store::StoreOptions {
-                background_scrub_interval_secs: 1,
-                reclaim_enabled: true,
-                ..tidefs_local_object_store::StoreOptions::default()
-            },
-        )
-        .map_err(|e| format!("open: {e}"))?;
-        let _report = store
-            .run_background_scrub()
-            .map_err(|e| format!("scrub: {e}"))?;
-        let suspect_count = store.suspect_log().len();
-        eprintln!("  DIAG  suspect_log after corruption scrub: {suspect_count} entries");
-        Ok(())
-    });
-
-    // ── Phase 10: Segment-level corruption ──
-    eprintln!("=== Phase E: segment-level corruption injection ===");
-
-    smoke_test!("phaseE_inject_segment_corruption", {
-        let store = tidefs_local_object_store::LocalObjectStore::open(store_root)
-            .map_err(|e| format!("open: {e}"))?;
-        let seg_dir = store.segments_dir().to_path_buf();
-        drop(store);
-
-        let mut seg_files: Vec<std::path::PathBuf> = std::fs::read_dir(&seg_dir)
-            .map_err(|e| format!("read dir: {e}"))?
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| p.is_file())
-            .collect();
-        if seg_files.is_empty() {
-            return Err("no segment files found".to_string());
-        }
-        seg_files.sort_by_key(|p| std::fs::metadata(p).ok().and_then(|m| m.modified().ok()));
-        let target = seg_files.last().ok_or("no segment")?.clone();
-
-        let mut buf = std::fs::read(&target).map_err(|e| format!("read: {e}"))?;
-        let corrupt_offset: u64 = 100;
-        if buf.len() as u64 > corrupt_offset + 8 {
-            for i in 0..8 {
-                buf[(corrupt_offset + i) as usize] ^= 0xFF;
-            }
-            std::fs::write(&target, &buf).map_err(|e| format!("write: {e}"))?;
-            eprintln!(
-                "  DIAG  flipped 8 bytes at offset {corrupt_offset} in {:?}",
-                target.file_name().unwrap_or_default()
-            );
-        } else {
-            eprintln!("  DIAG  segment too short (len={})", buf.len());
-        }
-        Ok(())
-    });
-
-    smoke_test!("phaseE_scrub_detects_corruption", {
-        let mut store = tidefs_local_object_store::LocalObjectStore::open_with_options(
-            store_root,
-            tidefs_local_object_store::StoreOptions {
-                background_scrub_interval_secs: 1,
-                reclaim_enabled: true,
-                verify_read_checksums: false,
-                ..tidefs_local_object_store::StoreOptions::default()
-            },
-        )
-        .map_err(|e| format!("open: {e}"))?;
-        let report = store
-            .run_background_scrub()
-            .map_err(|e| format!("scrub: {e}"))?;
-        let suspect_count = store.suspect_log().len();
-        eprintln!(
-            "  DIAG  post-segment-corruption scrub: outcomes={} suspect_entries={}",
-            report.outcomes.len(),
-            suspect_count
-        );
-        for outcome in &report.outcomes {
-            eprintln!("  DIAG  outcome: {outcome:?}");
-        }
-        Ok(())
-    });
-
-    smoke_test!("phaseE_suspect_log_survives_reopen", {
-        let store = tidefs_local_object_store::LocalObjectStore::open_with_options(
-            store_root,
-            tidefs_local_object_store::StoreOptions {
-                verify_read_checksums: false,
-                ..tidefs_local_object_store::StoreOptions::default()
-            },
-        )
-        .map_err(|e| format!("open: {e}"))?;
-        let suspect_count = store.suspect_log().len();
-        eprintln!("  DIAG  suspect_log after reopen: {suspect_count} entries");
-        Ok(())
-    });
-
-    smoke_test!("phaseE_repair_recovery_after_corruption", {
-        let opts = StoreOptions {
-            reclaim_enabled: true,
-            verify_read_checksums: false,
-            ..Default::default()
-        };
-        let _lfs = LocalFileSystem::open_with_allocator_policy_and_root_authentication_key(
-            store_root,
-            tidefs_local_filesystem::LocalFileSystemOpenConfig {
-                options: opts,
-                allocator_policy: LocalStorageAllocatorPolicy::default(),
-                root_authentication_key: auth_key,
-                encryption: None,
-                compression: None,
-                log_device_device_path: None,
-                recovery_policy: tidefs_recovery_loop::RecoveryPolicy::RepairWriteback,
-                block_devices: None,
-            },
-        )
-        .map_err(|e| format!("open: {e}"))?;
-        eprintln!("  DIAG  RepairWriteback recovery after corruption succeeded");
-        Ok(())
-    });
-
-    // Cleanup
-    let _ = std::fs::remove_dir_all(store_root);
-
-    eprintln!("=== scrub-repair-smoke: {passed} passed, {failed} failed ===");
-    if failed > 0 {
-        return Err(format!("{failed} test(s) failed"));
-    }
-    Ok(())
-}
-
 fn print_help() {
     println!("tidefs-posix-filesystem-adapter-daemon");
-    println!("  mount-vfs --store <path> --mount <path> [--fs-name <name>] [--root-auth-key-hex <64 hex>] [--read-only] [--snapshot <name>] [--sync] [--writeback-cache] [--no-writeback-cache] [--content-capacity-bytes <bytes>] [--writeback-cache-timeout <seconds>] [--drain-timeout-secs <seconds>] [--background-scrub-interval <seconds>] [--queue-depth-artifact <path>] [--scrub-runtime-observation-artifact <path>]");
+    println!("  mount-vfs --store <path> --mount <path> [--fs-name <name>] [--root-auth-key-hex <64 hex>] [--read-only] [--snapshot <name>] [--sync] [--content-capacity-bytes <bytes>] [--drain-timeout-secs <seconds>] [--queue-depth-artifact <path>]");
     println!("    root auth key fallback env: {ROOT_AUTHENTICATION_ENV_VAR}");
-    println!(
-        "    --background-scrub-interval  seconds between scrub cycles (0 disables, default 0)"
-    );
-    println!(
-        "    --scrub-runtime-observation-artifact  validation-only typed scrub observation JSON (#1792)"
-    );
-    println!("    --writeback-cache            enable FUSE writeback-cache (opt-in, default: off)");
     println!(
         "    --content-capacity-bytes N   configure mounted local filesystem content capacity"
     );
-    println!("    --no-writeback-cache         disable FUSE writeback-cache (default)");
     println!("  mount           (alias for mount-vfs)");
     println!("  smoke-mount [--profile full|quick] [--queue-depth-artifact <path>]");
     println!("    run a self-contained FUSE mount smoke test; quick stops after core mounted I/O and teardown");
@@ -4551,50 +3434,12 @@ mod tests {
     }
 
     #[test]
-    fn mount_vfs_config_defaults_to_no_writeback_cache() {
+    fn mount_vfs_config_uses_expected_storage_defaults() {
         let config = parse_mount_vfs_config(required_mount_args()).expect("parse mount config");
 
         assert!(!config.mount_opts.sync);
         assert_eq!(config.sync_guarantee, SyncGuarantee::Local);
-        assert!(
-            !config.writeback_cache,
-            "writeback_cache must remain opt-in for the default qemu-smoke mount"
-        );
         assert_eq!(config.fs_name, "tidefs-vfs");
-    }
-
-    #[test]
-    fn mount_vfs_config_disables_background_scrub_by_default() {
-        let config = parse_mount_vfs_config(required_mount_args()).expect("parse mount config");
-
-        assert_eq!(config.background_scrub_interval_secs, 0);
-    }
-
-    #[test]
-    fn mount_vfs_config_accepts_background_scrub_interval() {
-        let mut args = required_mount_args();
-        args.push("--background-scrub-interval".to_string());
-        args.push("300".to_string());
-
-        let config = parse_mount_vfs_config(args).expect("parse mount config");
-
-        assert_eq!(config.background_scrub_interval_secs, 300);
-    }
-
-    #[test]
-    fn mount_vfs_config_accepts_scrub_runtime_observation_artifact() {
-        let mut args = required_mount_args();
-        args.push("--background-scrub-interval".to_string());
-        args.push("1".to_string());
-        args.push("--scrub-runtime-observation-artifact".to_string());
-        args.push("/tmp/tidefs-scrub-observation.json".to_string());
-
-        let config = parse_mount_vfs_config(args).expect("parse mount config");
-
-        assert_eq!(
-            config.scrub_runtime_observation_artifact.as_deref(),
-            Some(Path::new("/tmp/tidefs-scrub-observation.json"))
-        );
     }
 
     #[test]
@@ -4687,47 +3532,24 @@ mod tests {
             "--no-intent-log-write should disable intent log write"
         );
     }
-    #[test]
-    fn mount_vfs_config_writeback_cache_ignores_profile_default() {
-        let config = parse_mount_vfs_config(required_mount_args()).expect("parse mount config");
-        assert!(
-            !config.writeback_cache,
-            "coherency profile must not silently enable FUSE writeback cache"
-        );
-    }
 
     #[test]
-    fn mount_vfs_config_enables_writeback_cache_with_flag() {
-        let mut args = required_mount_args();
-        args.push("--writeback-cache".to_string());
-        let config = parse_mount_vfs_config(args).expect("parse mount config");
-        assert!(
-            config.writeback_cache,
-            "--writeback-cache should enable writeback cache"
-        );
-    }
+    fn mount_vfs_config_refuses_unavailable_writeback_configuration() {
+        for (option, value) in [
+            ("--writeback-cache", None),
+            ("--writeback-cache-timeout", Some("60")),
+        ] {
+            let mut args = required_mount_args();
+            args.push(option.to_string());
+            args.extend(value.map(str::to_string));
 
-    #[test]
-    fn mount_vfs_config_disables_writeback_cache_with_flag() {
-        let mut args = required_mount_args();
-        args.push("--no-writeback-cache".to_string());
-        let config = parse_mount_vfs_config(args).expect("parse mount config");
-        assert!(
-            !config.writeback_cache,
-            "--no-writeback-cache should disable writeback cache"
-        );
-    }
-
-    #[test]
-    fn mount_vfs_config_writeback_cache_no_overrides_writeback() {
-        let mut args = required_mount_args();
-        args.push("--writeback-cache".to_string());
-        args.push("--no-writeback-cache".to_string());
-        let config = parse_mount_vfs_config(args).expect("parse mount config");
-        assert!(
-            !config.writeback_cache,
-            "--no-writeback-cache after --writeback-cache should win"
-        );
+            assert_eq!(
+                parse_mount_vfs_config(args)
+                    .err()
+                    .expect("writeback configuration must fail"),
+                fuse_vfs_adapter::WRITEBACK_CACHE_RECEIPT_AUTHORITY_REFUSAL
+            );
+        }
     }
 
     #[test]
@@ -4735,10 +3557,7 @@ mod tests {
         let mut args = required_mount_args();
         args.push("--snapshot".to_string());
         args.push("snap0".to_string());
-        args.push("--writeback-cache".to_string());
         args.push("--intent-log-write".to_string());
-        args.push("--background-scrub-interval".to_string());
-        args.push("60".to_string());
 
         let config = parse_mount_vfs_config(args).expect("parse mount config");
         let mode = effective_mount_mode(&config);
@@ -4746,8 +3565,6 @@ mod tests {
         assert_eq!(config.snapshot_name.as_deref(), Some("snap0"));
         assert!(!config.read_only);
         assert!(mode.read_only);
-        assert!(!mode.writeback_cache);
         assert!(!mode.intent_log_write);
-        assert_eq!(mode.background_scrub_interval_secs, 0);
     }
 }

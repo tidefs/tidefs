@@ -37,7 +37,6 @@ tidefs-types-vfs-owned = { workspace = true }
 tidefs-types-claim-ledger-core = { workspace = true }
 tidefs-reserve-ledger = { workspace = true }
 tidefs-claim-ledger = { workspace = true }
-tidefs-erasure-coding = { workspace = true }
 tidefs-performance-contract = { workspace = true, features = ["alloc"] }
 tidefs-types-polymorphic-xattr-core = { workspace = true, features = ["alloc"] }
 tidefs-posix-acl = { workspace = true, features = ["alloc"] }
@@ -55,8 +54,6 @@ tidefs-storage-intent-prefetch-executor = { workspace = true }
 
 tidefs-background-scheduler = { workspace = true }
 tidefs-compaction = { workspace = true }
-tidefs-replication-model = { workspace = true }
-tidefs-scrub-core = { workspace = true }
 tidefs-reclaim-queue-core = { workspace = true }
 tidefs-types-reclaim-queue-core = { workspace = true }
 tidefs-online-defrag = { workspace = true }
@@ -77,6 +74,7 @@ thiserror = "2"
 
 [features]
 encryption = ["dep:tidefs-encryption"]
+receipt-authority-mount-test = []
 [lib]
 path = "src/lib.rs"
 
@@ -87,6 +85,7 @@ criterion = { workspace = true }
 proptest = { version = "=1.9.0", default-features = false, features = ["std"] }
 tidefs-types-dataset-lifecycle-core = { workspace = true }
 tidefs-reclaim = { workspace = true }
+tidefs-replication-model = { workspace = true }
 
 [[bench]]
 name = "filesystem"

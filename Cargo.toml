@@ -82,7 +82,6 @@ members = [
   "crates/tidefs-trace-oracle",
   "crates/tidefs-crash-oracle",
   "crates/tidefs-model-core",
-  "crates/tidefs-env-fuse-model",
   "crates/tidefs-clock-timing",
   "crates/tidefs-chunk-shipper",
   "crates/tidefs-checksum-tree",
@@ -102,7 +101,6 @@ members = [
   "crates/tidefs-commit_group",
   "crates/tidefs-types-transport-session",
   "crates/tidefs-validation",
-  "crates/tidefs-workload",
   "crates/tidefs-types-claim-ledger-core",
   "crates/tidefs-types-dataset-feature-flags-core",
   "crates/tidefs-dataset-feature-flags",
@@ -345,7 +343,6 @@ tidefs-validation = { path = "crates/tidefs-validation", default-features = fals
 tidefs-verification-engine = { path = "crates/tidefs-verification-engine" }
 tidefs-vfs-engine = { path = "crates/tidefs-vfs-engine" }
 tidefs-witness-set = { path = "crates/tidefs-witness-set" }
-tidefs-workload = { path = "crates/tidefs-workload" }
 tidefs-xattr-storage = { path = "crates/tidefs-xattr-storage" }
 
 [workspace.lints.rust]

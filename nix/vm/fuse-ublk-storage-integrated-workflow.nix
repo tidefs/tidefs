@@ -424,7 +424,6 @@ if [ "$FUSE_READY" -eq 1 ]; then
       mount-vfs \
       --store "$POOL_DIR" \
       --mount "$MNT" \
-      --writeback-cache \
       > /tmp/fuse_daemon.log 2>&1 &
 
     FUSE_DAEMON_PID=$!
@@ -563,7 +562,6 @@ if [ "$FUSE_READY" -eq 1 ]; then
       mount-vfs \
       --store "$POOL_DIR" \
       --mount "$MNT" \
-      --writeback-cache \
       > /tmp/fuse_daemon2.log 2>&1 &
 
     FUSE_DAEMON_PID=$!

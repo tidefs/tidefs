@@ -1,38 +1,33 @@
 # Cross-Replica Scrub Comparison Design
 
-**Status**: Decision record
+**Status**: Model-only decision record; no LocalFS or repair consumer
 **Issue**: [#738](https://github.com/tidefs/tidefs/issues/738)
 **Date**: 2026-06-21
 **TFR link**: TFR-017
 
 ## Purpose
 
-Local scrub can currently prove that one local content object matches or
-does not match the checksum evidence available to that replica. It cannot yet
-prove which replica is correct when replicas disagree, nor can it safely turn
-a peer response into repair writeback authority.
+`tidefs-scrub-core` contains a self-contained comparison model. LocalFS has no
+foreground scrub producer or repair-dispatch consumer for that model.
 
 This decision defines the cross-replica comparison contract that must sit
-between local scrub evidence and repair dispatch. The comparison contract
-consumes `ScrubBlockId`-keyed evidence, placement receipt identity, membership
+between replica evidence and any future repair dispatch. The comparison contract
+consumes `ScrubSubject`-keyed evidence, placement receipt identity, membership
 epoch evidence, and checksum-layer evidence from each replica. It produces a
 reconciled decision before repair code may choose a source or write repaired
 bytes.
 
-This is a design record only. It does not implement cross-replica scrub,
-transport messaging, transport framing, network I/O, or repair dispatch.
+This is a design/model record only. It does not establish cross-replica scrub,
+transport messaging, network I/O, a LocalFS bridge, or repair dispatch.
 
 ## Evidence Reviewed
 
 - `docs/REVIEW_TODO_REGISTER.md` TFR-017: transport/cluster authority remains
   open for cross-replica scrub/repair, digest comparison, epochs, membership
   fencing, and repair source selection.
-- `docs/MOUNTED_TRANSFORM_AUTHORITY_RAW_STORE_INVENTORY.md`: the mounted
-  scrub/repair boundary is `ScrubBlockId + current data_version + plaintext
-  content identity + checksum-layer evidence + placement/receipt evidence`.
-- `crates/tidefs-local-filesystem/src/scrub.rs`: local scrub reports
-  `ScrubBlockId` for inline content, manifests, and content chunks, and
-  compares local checksums only.
+- `docs/MOUNTED_TRANSFORM_AUTHORITY_RAW_STORE_INVENTORY.md`: LocalFS has no
+  foreground scrub or repair bridge; its live verifier reads through current
+  Pool receipt authority.
 - `crates/tidefs-local-filesystem/src/records.rs`: `ContentChunkRef` carries
   `checksum`, `data_version`, and `placement_receipt_generation`; generation
   zero is receiptless.
@@ -59,14 +54,12 @@ transport messaging, transport framing, network I/O, or repair dispatch.
 - Do not close TFR-017. This decision only narrows the scrub comparison
   authority needed by later implementation issues.
 - Do not replace #18, #674, or #675 placement receipt authority.
-- Do not replace #650, #651, or #652 mounted transform-aware scrub/repair
-  evidence.
 
 ## Decision Summary
 
 TideFS will use a receipt-bound, epoch-bound comparison model:
 
-1. A comparison candidate is keyed by `ScrubBlockId`, checksum layer, object
+1. A comparison candidate is keyed by `ScrubSubject`, checksum layer, object
    key, current content generation, placement receipt epoch, and placement
    receipt generation.
 2. Each replica reports evidence that is authoritative only for that replica:
@@ -101,7 +94,7 @@ multi-replica.
 
 ### Subject Key
 
-`ScrubBlockId` remains the stable scrub subject for mounted content:
+`ScrubSubject` is the comparison model's stable content subject:
 
 - `inode_id`
 - `data_version`
@@ -123,7 +116,7 @@ prove every replica is talking about the same bytes:
 - membership epoch used to contact the peer;
 - redundancy policy identity and target count.
 
-`ScrubBlockId` alone is not sufficient for writeback. Two replicas with the
+`ScrubSubject` alone is not sufficient for writeback. Two replicas with the
 same inode id, data version, and chunk index are comparable only when their
 receipt and checksum-layer evidence also match.
 
@@ -134,7 +127,7 @@ Each replica contributes evidence with this ownership:
 | Field | Authority | Comparison rule |
 |---|---|---|
 | `replica_id` / member id | Membership authority | Names the reporting replica. It must be in the committed roster for the comparison epoch. |
-| `ScrubBlockId` | Local scrub authority | Must exactly match the comparison subject. |
+| `ScrubSubject` | Scrub-core comparison model | Must exactly match the comparison subject. |
 | object key | Placement/content authority | Must match the receipt-bound object key for the subject. |
 | local checksum | Reporting replica | Authoritative only for bytes read by that replica under the named checksum layer. |
 | remote checksum | Remote reporting replica | Authoritative only for that remote replica and only after subject, receipt, and epoch checks pass. |
@@ -199,7 +192,7 @@ not a repair source.
 Repair dispatch must receive a comparison record before any multi-replica
 writeback. The record must include:
 
-- comparison subject (`ScrubBlockId`, object key, checksum layer);
+- comparison subject (`ScrubSubject`, object key, checksum layer);
 - placement receipt epoch and generation;
 - membership epoch;
 - participating replica ids and per-replica outcomes;
@@ -259,32 +252,9 @@ The scrub comparison layer owns the comparison request/response exchange above
 transport. Transport carries and gates the exchange; it does not decide which
 replica is correct.
 
-## Follow-Up Implementation Issues
-
-The design split is:
-
-1. [#756](https://github.com/tidefs/tidefs/issues/756)
-   `cross-replica-scrub-transport`: exchange receipt-bound comparison
-   evidence through the scrub fanout/transport surface.
-2. [#757](https://github.com/tidefs/tidefs/issues/757)
-   `cross-replica-scrub-engine`: implement deterministic reconciliation of
-   multi-replica checksum evidence.
-3. [#758](https://github.com/tidefs/tidefs/issues/758)
-   `cross-replica-scrub-repair`: gate repair writeback on a reconciled
-   comparison record and fail closed as
-   `ScrubRepairOutcome::CrossReplicaDisagreement` when replicas disagree.
-
-These issues leave #674 primary receipt fanout, #675 receipt-driven local
-read/scrub/repair/rebuild consumers, #650/#651 local transform-aware scrub,
-#652 mounted repair evidence, and #18 placement receipt authority as adjacent
-or prerequisite authorities rather than taking over their behavior. Where #758
-needs repair or local-filesystem writeback paths, it is explicitly gated on
-#652/#675 coordination. If a later implementation finds that an expected write
-set overlaps an active PR branch, that implementation issue must defer or
-narrow before source edits.
-
 ## What This Decision Does Not Close
 
+- There is no current LocalFS producer or repair consumer for this model.
 - TFR-017 remains open until transport, comparison, repair dispatch, recovery,
   partition handling, and runtime proof are implemented and validated.
 - This decision does not make multi-node scrub a product-grade repair path.
@@ -292,4 +262,4 @@ narrow before source edits.
   the mounted transform inventory remains blocked by its existing production
   rows.
 - This decision does not authorize repair from a single clean peer response,
-  from current topology alone, or from receiptless local scrub evidence.
+  current topology, or receiptless evidence.
