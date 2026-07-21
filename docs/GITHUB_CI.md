@@ -127,9 +127,9 @@ may use non-secret repository variables for scheduling gates, such as
   manual dispatch remains available when a merge or milestone invalidates the
   existing result. If another change needs runtime or build coverage, name the
   risk in the issue and dispatch the focused workflow explicitly.
-- `Nix Checks` runs on self-hosted TideFS runners and builds pure check
-  derivations plus core Nix packages for Nix, Cargo, and toolchain input
-  changes, or by manual dispatch. It is a compile/build gate only: a green run
+- `Nix Checks` runs on self-hosted TideFS runners and builds core Nix packages
+  for Nix, Cargo, and toolchain input changes, or by manual dispatch. It is a
+  compile/build gate only: a green run
   does not prove FUSE, uBLK, RDMA, mounted-kernel behavior, filesystem
   correctness, crash consistency, performance, or release readiness.
 - `QEMU Smoke` runs outside-sandbox kernel runtime rows on self-hosted
@@ -238,11 +238,10 @@ may use non-secret repository variables for scheduling gates, such as
   `authority/missing-pool` and `configured-pool-member`, and fails closed for
   upstream xfstests row names. Reserve broad target dispatches such as
   `target=fuse` or `target=all` for acceptance gates, scheduled coverage, or
-  when the failure set is not yet isolated. `RDMA`
-  dispatch runs three matrix targets: `static-carrier-check` for source/harness
-  structure, `host-probe` for non-mutating runner capability inspection, and
-  `qemu-two-node` for multi-process distributed transport evidence. The first
-  two are harness/host evidence only; they do not prove live two-node transport
+  when the failure set is not yet isolated. `RDMA` dispatch runs two matrix
+  targets: `host-probe` for non-mutating runner capability inspection and
+  `qemu-two-node` for multi-process distributed transport evidence. The host
+  probe is harness/host evidence only; it does not prove live two-node transport
   behavior. xfstests uploads its run-level manifest as
   `xfstests-run-manifest.json`; RDMA claim-shaped rows use v2
   `evidence-manifest.json` records with explicit outcomes.

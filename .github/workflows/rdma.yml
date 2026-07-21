@@ -22,13 +22,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: static-carrier-check
-            command_class: static-carrier
-            evidence_class: rdma-static-carrier-check
-            validation_tier: harness-only
-            artifact_root: /tmp/tidefs-validation/rdma/static-carrier-check
-            primary_artifact: command-status.env
-            command: 'nix build -L .#checks.x86_64-linux.rdmaCarrierTwoNode'
           - name: host-probe
             command_class: host-probe
             evidence_class: rdma-host-probe
@@ -258,7 +251,7 @@ jobs:
           else
             OUTCOME="harness-fail"
           fi
-          RESIDUAL_RISK="RDMA workflow evidence is bounded to matrix target ${MATRIX_TARGET} at validation tier ${VALIDATION_TIER}; static-carrier and host-probe rows are harness/host evidence only, and this manifest does not broaden release, production, or successor/comparator claims."
+          RESIDUAL_RISK="RDMA workflow evidence is bounded to matrix target ${MATRIX_TARGET} at validation tier ${VALIDATION_TIER}; the host-probe row is harness/host evidence only, and this manifest does not broaden release, production, or successor/comparator claims."
           SCOPE="workflow=${EVIDENCE_WORKFLOW} run_id=${EVIDENCE_RUN_ID} run_attempt=${EVIDENCE_RUN_ATTEMPT} source_ref=${EVIDENCE_SOURCE_REF} source_sha=${EVIDENCE_SOURCE_SHA} matrix_target=${MATRIX_TARGET} command_class=${COMMAND_CLASS} command=${RDMA_COMMAND} status=${RESULT_STATUS} command_status=${COMMAND_STATUS} validation_tier=${VALIDATION_TIER} artifact_root=${ARTIFACT_ROOT} output_dir_state=${OUTPUT_DIR_STATE} primary_artifact=${PRIMARY_PATH} primary_artifact_state=${PRIMARY_STATE} artifact_paths=${ARTIFACT_PATHS}"
 
           jq -n \

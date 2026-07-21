@@ -10,9 +10,9 @@
 //! adapter inside a real kernel via QEMU + NixOS VM, running fio with
 //! verify=crc32c against /dev/ublkb0 and asserting zero data corruption.
 //!
-//! RDMA carrier tests validate the Nix/QEMU SoftRoCE infrastructure without
-//! requiring KVM: host probe classification, two-node topology dry-run, and
-//! structural flake.nix config inspection.
+//! RDMA harness tests cover host probe classification and the two-node topology
+//! dry-run without requiring KVM. Executable VM behavior belongs to the NixOS
+//! test itself, not source-string inspection.
 
 #[cfg(test)]
 use std::path::PathBuf;
@@ -96,81 +96,6 @@ fn qemu_rdma_two_node_dry_run() {
     assert!(
         stdout.contains("qemu_socket_netdev"),
         "dry-run should describe QEMU socket netdev; output:\n{stdout}"
-    );
-}
-
-/// Validate the `flake.nix` contains all required RDMA carrier
-/// configuration: the NixOS guest system with necessary kernel modules
-/// and initrd tools, the `rdmaCarrierTwoNodeTest` package, and the
-/// `rdma-carrier-test` app.
-#[test]
-fn qemu_rdma_guest_system_config() {
-    let flake_path = workspace_flake();
-    assert!(flake_path.exists(), "flake.nix not found");
-
-    let flake_content = std::fs::read_to_string(&flake_path).expect("failed to read flake.nix");
-
-    // NixOS guest system must include all required RDMA kernel modules.
-    let required_modules = [
-        "rdma_rxe",
-        "siw",
-        "ib_core",
-        "ib_uverbs",
-        "rdma_cm",
-        "rdma_ucm",
-        "virtio_pci",
-        "virtio_net",
-    ];
-    for module in &required_modules {
-        assert!(
-            flake_content.contains(module),
-            "flake.nix qemuRdmaGuestSystem missing kernel module {module}"
-        );
-    }
-
-    // Initrd extra-utils must include RDMA tools.
-    let required_tools = ["ibv_devices", "ibv_devinfo", "rping"];
-    for tool in &required_tools {
-        assert!(
-            flake_content.contains(tool),
-            "flake.nix qemuRdmaGuestSystem initrd missing tool {tool}"
-        );
-    }
-
-    // rdma-carrier-test app must exist.
-    assert!(
-        flake_content.contains("rdma-carrier-test"),
-        "flake.nix missing rdma-carrier-test app"
-    );
-
-    // rdmaCarrierTwoNodeTest package must exist with two nodes.
-    assert!(
-        flake_content.contains("rdmaCarrierTwoNodeTest"),
-        "flake.nix missing rdmaCarrierTwoNodeTest package"
-    );
-    assert!(
-        flake_content.contains("nodes.server"),
-        "flake.nix rdmaCarrierTwoNodeTest missing nodes.server"
-    );
-    assert!(
-        flake_content.contains("nodes.client"),
-        "flake.nix rdmaCarrierTwoNodeTest missing nodes.client"
-    );
-
-    // Two-node test must include cross-node rping.
-    assert!(
-        flake_content.contains("rping -s -v") || flake_content.contains("rping -s"),
-        "flake.nix rdmaCarrierTwoNodeTest missing rping server"
-    );
-    assert!(
-        flake_content.contains("rping -c -a 192.168.77.10"),
-        "flake.nix rdmaCarrierTwoNodeTest missing rping client to 192.168.77.10"
-    );
-
-    // rdmaCarrierTwoNode check must exist (structural validation, non-KVM).
-    assert!(
-        flake_content.contains("rdmaCarrierTwoNode"),
-        "flake.nix missing rdmaCarrierTwoNode check"
     );
 }
 

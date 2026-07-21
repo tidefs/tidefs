@@ -3337,18 +3337,6 @@ EOF
             mkdir -p "$out"
           '';
 
-          rdmaCarrierTwoNode = pkgs.runCommandCC "tidefs-rdma-carrier-two-node-check" {
-          } ''
-            for needle in "rdmaCarrierTwoNodeTest" "nodes.server" "nodes.client" "rping -c -a 192.168.77.10"; do
-              if ! grep -qF "$needle" ${./flake.nix}; then
-                echo "MISSING in flake.nix: $needle" >&2
-                exit 1
-              fi
-            done
-            mkdir -p "$out"
-            echo "rdma-carrier-two-node check passed" > "$out/status"
-          '';
-
         });
 
       devShells = forAllSystems (system:
