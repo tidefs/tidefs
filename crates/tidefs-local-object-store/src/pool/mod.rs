@@ -12891,10 +12891,7 @@ mod tests {
         assert_eq!(pool3.get(IoClass::Data, key3).unwrap(), Some(data3));
         for (path, expected) in &original_labels {
             let actual = fs::read(path).expect("read topology label after original-config reopen");
-            assert_eq!(
-                actual.as_slice(),
-                expected.as_slice()
-            );
+            assert_eq!(actual.as_slice(), expected.as_slice());
         }
 
         let _ = std::fs::remove_dir_all(&root);

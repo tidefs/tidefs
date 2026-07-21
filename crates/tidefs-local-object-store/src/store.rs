@@ -2850,9 +2850,7 @@ impl LocalObjectStore {
     /// only the exact keys whose persisted bytes match clean in-memory state.
     /// A retained receipt log additionally requires a durably persisted empty
     /// queue, because receipt presence alone can be prepared redo evidence.
-    pub(crate) fn terminal_device_removal_reclaim_metadata_keys(
-        &self,
-    ) -> Result<Vec<ObjectKey>> {
+    pub(crate) fn terminal_device_removal_reclaim_metadata_keys(&self) -> Result<Vec<ObjectKey>> {
         let persisted_queue = load_dead_object_reclaim_queue(self)?;
         let persisted_receipts = load_reclaim_receipts(self)?;
         let persisted_pins = load_snapshot_extent_pin_set(self)?;
