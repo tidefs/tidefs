@@ -2826,8 +2826,9 @@ fn parity_object_candidates(
             if !key_matches(key) {
                 continue;
             }
-            let payload = child.get(key)?.ok_or_else(invalid_receipt_fragments)?;
-            physical.push((DeviceObjectFragment { leaf_index, key }, payload));
+            if let Ok(Some(payload)) = child.get(key) {
+                physical.push((DeviceObjectFragment { leaf_index, key }, payload));
+            }
         }
     }
 
@@ -2864,14 +2865,20 @@ fn parity_object_candidates(
             .iter()
             .map(|(fragment, _)| *fragment)
             .collect();
-        accounted.extend(fragments.iter().copied());
-
-        let payload = raid
-            .get(storage_key)?
-            .ok_or_else(invalid_receipt_fragments)?;
+        let payload = match raid.get(storage_key) {
+            Ok(Some(payload)) => payload,
+            Ok(None) | Err(_) => continue,
+        };
         if !parity_candidate_matches_fragments(raid, storage_key, &payload, &candidate_physical) {
+            continue;
+        }
+        if fragments
+            .iter()
+            .any(|fragment| accounted.contains(fragment))
+        {
             return Err(invalid_receipt_fragments());
         }
+        accounted.extend(fragments.iter().copied());
         candidates.push(DeviceReceiptCandidate {
             storage_key,
             payload,
@@ -2912,7 +2919,7 @@ fn parity_object_candidates_for_key(
     }
     for (leaf_index, child) in raid.children.iter().enumerate() {
         let key = ParityRaidDevice::column_key(storage_key, leaf_index as u8);
-        if let Some(payload) = child.get(key)? {
+        if let Ok(Some(payload)) = child.get(key) {
             physical.push((DeviceObjectFragment { leaf_index, key }, payload));
         }
     }
@@ -3220,11 +3227,6 @@ impl Device {
             | Device::ParityRaid2(device)
             | Device::ParityRaid3(device) => device.children.len(),
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn physical_store_for_test(&self, leaf_index: usize) -> Option<&LocalObjectStore> {
-        self.physical_store(leaf_index)
     }
 
     #[cfg(test)]

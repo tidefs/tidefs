@@ -3273,6 +3273,112 @@ impl LocalObjectStore {
         })
     }
 
+    /// Retire current generation-bound objects after their replacement is
+    /// stable, then drain and durably acknowledge their reclaim entries.
+    ///
+    /// Placement payload keys include their receipt generation, so publishing
+    /// a successor does not overwrite the predecessor key. The generic
+    /// reclaim consumer resolves historical records; this boundary first
+    /// writes the exact predecessor tombstone under the caller-supplied stable
+    /// commit/generation authority, making the queued record historical. A
+    /// crash after that tombstone but before queue acknowledgement is safe:
+    /// the durable queue remains and a retry resumes the same drain.
+    pub(crate) fn retire_and_drain_receipt_bound_dead_objects_at_stable_generation(
+        &mut self,
+        stable_committed_txg: u64,
+        stable_committed_generation: u64,
+        max_count: usize,
+    ) -> std::result::Result<tidefs_reclaim::ReclaimConsumerStats, ReceiptBoundDeadObjectDrainError>
+    {
+        self.ensure_writable("retire_and_drain_receipt_bound_dead_objects_at_stable_generation")?;
+        if self.dead_object_reclaim_queue_dirty {
+            self.sync_all()?;
+        }
+
+        let limit = max_count.min(self.reclaim_consumer.config().max_entries_per_drain);
+        let eligible = self
+            .dead_object_reclaim_queue
+            .dequeue_receipt_bound_batch_with_stable_generation(
+                limit,
+                stable_committed_txg,
+                stable_committed_generation,
+            );
+        let mut retired = false;
+        for entry in eligible {
+            let key = ObjectKey(entry.object_id.0);
+            if self.index.contains_key(&key) {
+                self.delete(key)?;
+                retired = true;
+            }
+        }
+        if retired {
+            self.sync_all()?;
+        }
+
+        self.drain_receipt_bound_dead_objects_at_stable_generation(
+            stable_committed_txg,
+            stable_committed_generation,
+            max_count,
+        )
+    }
+
+    pub(crate) fn receipt_bound_dead_object_queue_depth(&self) -> usize {
+        self.dead_object_reclaim_queue.len()
+    }
+
+    /// Acknowledge stably retired records whose containing device is covered
+    /// by a durable removal marker.
+    ///
+    /// The pool caller must prove the marker and target identity before using
+    /// this boundary. Every acknowledged key must already have a durable
+    /// tombstone and a resolvable historical record. The subsequent device
+    /// detach is the physical-reclaim action; if a crash intervenes, the
+    /// marker forces the same detach to resume.
+    pub(crate) fn acknowledge_retired_receipt_bound_objects_for_device_removal(
+        &mut self,
+        stable_committed_txg: u64,
+        stable_committed_generation: u64,
+        max_count: usize,
+    ) -> std::result::Result<usize, ReceiptBoundDeadObjectDrainError> {
+        self.ensure_writable("acknowledge_retired_receipt_bound_objects_for_device_removal")?;
+        if self.dead_object_reclaim_queue_dirty {
+            self.sync_all()?;
+        }
+        let entries = self
+            .dead_object_reclaim_queue
+            .dequeue_receipt_bound_batch_with_stable_generation(
+                max_count,
+                stable_committed_txg,
+                stable_committed_generation,
+            );
+        let mut acknowledged = Vec::new();
+        for entry in entries {
+            let key = ObjectKey(entry.object_id.0);
+            let historical_segment =
+                match <LocalObjectStore as tidefs_reclaim::SegmentResolver>::resolve(
+                    self,
+                    &entry.object_id,
+                ) {
+                    Ok(segment) => segment,
+                    Err(never) => match never {},
+                };
+            if self.index.contains_key(&key) || historical_segment.is_none() {
+                return Err(StoreError::InvalidOptions {
+                    reason: "device-removal reclaim acknowledgement lacks a durable retired record",
+                }
+                .into());
+            }
+            acknowledged.push(entry.object_id);
+        }
+
+        let removed = self.dead_object_reclaim_queue.ack_reclaimed(&acknowledged);
+        if removed != 0 {
+            self.dead_object_reclaim_queue_dirty = true;
+            self.sync_all()?;
+        }
+        Ok(removed)
+    }
+
     fn receipt_bound_dead_object_drain_plan(
         &self,
         stable_committed_txg: u64,
@@ -3293,6 +3399,11 @@ impl LocalObjectStore {
             std::collections::HashMap::new();
         let mut segment_queued_entries: std::collections::HashMap<u64, u64> =
             std::collections::HashMap::new();
+        let mut indexed_live_records: std::collections::HashMap<u64, u64> =
+            std::collections::HashMap::new();
+        for location in self.index.values() {
+            *indexed_live_records.entry(location.segment_id).or_default() += 1;
+        }
 
         for entry in self.dead_object_reclaim_queue.all_entries() {
             let Ok(Some(segment_id)) =
@@ -3318,7 +3429,15 @@ impl LocalObjectStore {
         let dead_segments = segment_refdrops
             .into_iter()
             .filter_map(|(segment_id, refdrops)| {
-                let live_count = self.reclaim_consumer.live_counts().live_count(segment_id);
+                // The consumer's accounting intentionally omits some
+                // internal records from product statistics. Physical segment
+                // reclaim cannot: a live mutation intent, receipt, queue, or
+                // other indexed record must keep its containing segment.
+                let live_count = self
+                    .reclaim_consumer
+                    .live_counts()
+                    .live_count(segment_id)
+                    .max(indexed_live_records.get(&segment_id).copied().unwrap_or(0));
                 let queued_entries = segment_queued_entries
                     .get(&segment_id)
                     .copied()
