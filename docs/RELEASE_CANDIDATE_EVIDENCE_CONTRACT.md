@@ -115,7 +115,7 @@ Full profile only. Depends on `qemu`. Matrix of two targets.
 
 | Target | Command | Artifact name | Artifact path globs |
 |---|---|---|---|
-| `host-probe` | `nix run .#rdma-probe -- --validation-dir /tmp/tidefs-validation/rdma/host-probe` | `release-candidate-rdma-host-probe` | `/tmp/tidefs-rdma-two-node/**`, `/tmp/tidefs-validation/**` |
+| `host-probe` | `nix run .#rdma-probe` | `release-candidate-rdma-host-probe` | `/tmp/tidefs-rdma-two-node/**`, `/tmp/tidefs-validation/**` |
 | `qemu-two-node` | `nix run .#qemu-rdma-two-node-nixos -- --validation-dir /tmp/tidefs-rdma-two-node` | `release-candidate-rdma-qemu-two-node` | `/tmp/tidefs-rdma-two-node/**`, `/tmp/tidefs-validation/**` |
 
 | Attribute | Value |
