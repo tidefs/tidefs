@@ -138,8 +138,16 @@ pub struct EvacuationResult {
     pub failed_keys: Vec<ObjectKey>,
     /// BLAKE3 content digests of evacuated objects (key -> digest).
     pub content_digests: BTreeMap<ObjectKey, [u8; 32]>,
-    /// Whether all objects were evacuated successfully.
+    /// Whether the operation-specific completion boundary was reached.
+    ///
+    /// Generic evacuation helpers set this when every source object was
+    /// evacuated. [`crate::pool::Pool::safe_remove_device`] keeps it false
+    /// after evacuation and an in-memory detach until the surviving topology
+    /// has a durable commit point.
     pub complete: bool,
+    /// Whether evacuation succeeded and the current pool instance detached
+    /// the target, but durable topology publication is still unavailable.
+    pub topology_commit_pending: bool,
 }
 
 // ---------------------------------------------------------------------------
