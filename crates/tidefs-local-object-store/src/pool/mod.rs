@@ -1993,8 +1993,20 @@ fn encode_device_removal_marker_state(marker: &DeviceRemovalMarker) -> Result<Ve
 }
 
 fn decode_device_removal_marker(encoded: &[u8]) -> Result<DeviceRemovalMarker> {
+    let checksum_input_len = encoded
+        .len()
+        .checked_sub(DEVICE_REMOVAL_MARKER_CHECKSUM_LEN)
+        .ok_or_else(invalid_device_removal_marker)?;
+    let (authenticated, checksum) = encoded.split_at(checksum_input_len);
+    if blake3::hash(authenticated).as_bytes() != checksum {
+        return Err(invalid_device_removal_marker());
+    }
+
     let decoded = (|| -> Option<DeviceRemovalMarker> {
-        let mut cursor = ReceiptCursor::new(encoded);
+        // Lengths and counts below control allocation and cursor movement. Do
+        // not consume any of them until the complete marker has passed its
+        // integrity check above.
+        let mut cursor = ReceiptCursor::new(authenticated);
         let magic = cursor.take(DEVICE_REMOVAL_MARKER_MAGIC_V3.len())?;
         if magic == DEVICE_REMOVAL_MARKER_MAGIC_V2 {
             let pool_guid = cursor.array()?;
@@ -2004,14 +2016,7 @@ fn decode_device_removal_marker(encoded: &[u8]) -> Result<DeviceRemovalMarker> {
                 return None;
             }
             let target_path = PathBuf::from(OsString::from_vec(cursor.take(path_len)?.to_vec()));
-            let checksum = cursor.array::<DEVICE_REMOVAL_MARKER_CHECKSUM_LEN>()?;
             if !cursor.is_finished() {
-                return None;
-            }
-            let checksum_input_len = encoded
-                .len()
-                .checked_sub(DEVICE_REMOVAL_MARKER_CHECKSUM_LEN)?;
-            if blake3::hash(&encoded[..checksum_input_len]).as_bytes() != &checksum {
                 return None;
             }
             return Some(DeviceRemovalMarker {
@@ -2035,9 +2040,7 @@ fn decode_device_removal_marker(encoded: &[u8]) -> Result<DeviceRemovalMarker> {
             return None;
         }
         let fragment_bytes = fragment_count.checked_mul(std::mem::size_of::<u32>() + 32)?;
-        let expected_remaining = fragment_bytes
-            .checked_add(path_len)?
-            .checked_add(DEVICE_REMOVAL_MARKER_CHECKSUM_LEN)?;
+        let expected_remaining = fragment_bytes.checked_add(path_len)?;
         if cursor.remaining_len() != expected_remaining {
             return None;
         }
@@ -2054,14 +2057,7 @@ fn decode_device_removal_marker(encoded: &[u8]) -> Result<DeviceRemovalMarker> {
             return None;
         }
         let target_path = PathBuf::from(OsString::from_vec(cursor.take(path_len)?.to_vec()));
-        let checksum = cursor.array::<DEVICE_REMOVAL_MARKER_CHECKSUM_LEN>()?;
         if !cursor.is_finished() {
-            return None;
-        }
-        let checksum_input_len = encoded
-            .len()
-            .checked_sub(DEVICE_REMOVAL_MARKER_CHECKSUM_LEN)?;
-        if blake3::hash(&encoded[..checksum_input_len]).as_bytes() != &checksum {
             return None;
         }
         let phase = match phase_tag {
@@ -2159,59 +2155,50 @@ fn read_device_removal_marker(marker_path: &Path) -> Result<DeviceRemovalMarker>
 }
 
 /// Check for a pending device removal marker and resume evacuation if found.
-fn resume_device_removal_if_pending(pool: &mut Pool) {
+fn resume_device_removal_if_pending(pool: &mut Pool) -> Result<()> {
     let marker_path = pool.config.root_path.join(DEVICE_REMOVAL_MARKER_FILE);
     if marker_path.exists() {
-        if let Ok(marker) = read_device_removal_marker(&marker_path) {
-            let marker_tmp_path = pool.config.root_path.join(DEVICE_REMOVAL_MARKER_TMP_FILE);
-            if marker_tmp_path.exists() {
-                if std::fs::remove_file(&marker_tmp_path).is_ok() {
-                    let _ = fs::File::open(&pool.config.root_path)
-                        .and_then(|directory| directory.sync_all());
-                }
-            }
-            if marker.pool_guid != pool.pool_guid {
-                // A marker copied from another pool cannot authorize
-                // automatic evacuation or detach in this pool, even if a
-                // device GUID happens to be reused.
-                return;
-            }
-            let mut unique_device_guids = BTreeSet::new();
-            if pool.device_guids.len() != pool.devices.len()
-                || !pool
-                    .device_guids
-                    .iter()
-                    .copied()
-                    .all(|guid| unique_device_guids.insert(guid))
-            {
-                // GUID absence proves replay-visible detach only when the
-                // loaded device table is complete and unambiguous. Preserve
-                // the marker when topology identity cannot be trusted.
-                return;
-            }
-            let target_path = pool
-                .device_guids
-                .iter()
-                .position(|guid| *guid == marker.target_guid)
-                .and_then(|idx| pool.devices.get(idx))
-                .map(|device| device.root().to_path_buf());
-            if let Some(target_path) = target_path {
-                // A successful retry only removes the target from this Pool
-                // instance. Keep the marker until a later topology load no
-                // longer contains the GUID, proving detach is replay-visible.
-                let _ = pool.safe_remove_device(&target_path);
-            } else if pool
-                .devices
-                .iter()
-                .all(|device| device.root() != marker.target_path.as_path())
-            {
-                // GUID absence is not detach evidence while the recorded path
-                // remains attached under a different identity. Preserve the
-                // marker so path rebinding cannot skip recovery.
-                let _ = std::fs::remove_file(&marker_path);
+        let marker = read_device_removal_marker(&marker_path)?;
+        let marker_tmp_path = pool.config.root_path.join(DEVICE_REMOVAL_MARKER_TMP_FILE);
+        if marker_tmp_path.exists() {
+            if std::fs::remove_file(&marker_tmp_path).is_ok() {
+                let _ = fs::File::open(&pool.config.root_path)
+                    .and_then(|directory| directory.sync_all());
             }
         }
+        if marker.pool_guid != pool.pool_guid {
+            // A marker copied from another pool cannot authorize automatic
+            // evacuation or detach in this pool, even if a device GUID
+            // happens to be reused.
+            return Ok(());
+        }
+        let mut unique_device_guids = BTreeSet::new();
+        if pool.device_guids.len() != pool.devices.len()
+            || !pool
+                .device_guids
+                .iter()
+                .copied()
+                .all(|guid| unique_device_guids.insert(guid))
+        {
+            // GUID absence proves replay-visible detach only when the loaded
+            // device table is complete and unambiguous. Preserve the marker
+            // when topology identity cannot be trusted.
+            return Ok(());
+        }
+        let target_path = pool
+            .device_guids
+            .iter()
+            .position(|guid| *guid == marker.target_guid)
+            .and_then(|idx| pool.devices.get(idx))
+            .map(|device| device.root().to_path_buf());
+        if let Some(target_path) = target_path {
+            // A successful retry only removes the target from this Pool
+            // instance. Keep the marker until a later topology load no
+            // longer contains the GUID, proving detach is replay-visible.
+            let _ = pool.safe_remove_device(&target_path);
+        }
     }
+    Ok(())
 }
 
 fn placement_receipt_proves_device_evacuation(
@@ -2372,7 +2359,7 @@ impl Pool {
         pool.replay_placement_mutation_intents()?;
 
         // Resume interrupted device removal if a pending marker exists.
-        resume_device_removal_if_pending(&mut pool);
+        resume_device_removal_if_pending(&mut pool)?;
 
         Ok(pool)
     }
@@ -2662,7 +2649,7 @@ impl Pool {
 
         // Resume interrupted device removal if a pending marker exists.
         if !pool.locked {
-            resume_device_removal_if_pending(&mut pool);
+            resume_device_removal_if_pending(&mut pool)?;
         }
 
         Ok(pool)
@@ -12685,7 +12672,8 @@ mod tests {
         // Simulate a crash during device removal.
         // 1. Create a 2-device pool with objects.
         // 2. Manually write the removal-pending marker (as if crash in safe_remove_device).
-        // 3. Re-open the pool -- the resume should evacuate objects and remove the device.
+        // 3. Re-open the pool -- resume evacuates objects but keeps the marker
+        //    until durable topology state proves the detach.
 
         let root = temp_dir("safe-remove-resume");
         let _ = std::fs::remove_dir_all(&root);
@@ -12798,16 +12786,12 @@ mod tests {
         assert!(obj3.is_some(), "key3 not found after resume");
         assert_eq!(obj3.unwrap(), data3);
 
-        let replay_visible_config = pool2.config.clone();
+        let reduced_config = pool2.config.clone();
         drop(pool2);
 
-        let pool3 = Pool::open(
-            replay_visible_config,
-            PoolProperties::default(),
-            &test_options(),
-        )
-        .unwrap();
-        assert!(!marker_path.exists());
+        let pool3 =
+            Pool::open(reduced_config, PoolProperties::default(), &test_options()).unwrap();
+        assert!(marker_path.exists());
         assert_eq!(pool3.stats().device_count, 1);
         assert_eq!(pool3.get(IoClass::Data, key1).unwrap(), Some(data1));
         assert_eq!(pool3.get(IoClass::Data, key2).unwrap(), Some(data2));
@@ -12861,15 +12845,11 @@ mod tests {
             Some(payload.to_vec())
         );
 
-        let replay_visible_config = reopened.config.clone();
+        let reduced_config = reopened.config.clone();
         drop(reopened);
-        let reopened = Pool::open(
-            replay_visible_config,
-            PoolProperties::default(),
-            &test_options(),
-        )
-        .unwrap();
-        assert!(!marker_path.exists());
+        let reopened =
+            Pool::open(reduced_config, PoolProperties::default(), &test_options()).unwrap();
+        assert!(marker_path.exists());
         assert_eq!(reopened.stats().device_count, 1);
         assert_eq!(
             reopened.get(IoClass::Data, key).unwrap(),
@@ -12880,7 +12860,7 @@ mod tests {
     }
 
     #[test]
-    fn safe_remove_device_resume_clears_marker_after_detach() {
+    fn safe_remove_device_resume_preserves_marker_after_in_memory_detach() {
         let root = temp_dir("safe-remove-resume-after-detach");
         let _ = std::fs::remove_dir_all(&root);
         let d1 = root.join("data1");
@@ -12926,9 +12906,9 @@ mod tests {
         let marker_path = root.join(DEVICE_REMOVAL_MARKER_FILE);
         persist_device_removal_marker(&root, pool.pool_guid, &d1, target_guid).unwrap();
 
-        resume_device_removal_if_pending(&mut pool);
+        resume_device_removal_if_pending(&mut pool).unwrap();
 
-        assert!(!marker_path.exists());
+        assert!(marker_path.exists());
         assert_eq!(pool.stats().device_count, 1);
         assert_eq!(pool.get(IoClass::Data, key).unwrap(), Some(data));
 
@@ -12947,7 +12927,7 @@ mod tests {
         persist_device_removal_marker(&root, pool.pool_guid, &target_path, target_guid).unwrap();
 
         pool.device_guids.pop();
-        resume_device_removal_if_pending(&mut pool);
+        resume_device_removal_if_pending(&mut pool).unwrap();
 
         assert!(marker_path.exists());
         assert_eq!(pool.stats().device_count, 2);
@@ -12972,7 +12952,7 @@ mod tests {
         let marker_path = root.join(DEVICE_REMOVAL_MARKER_FILE);
         persist_device_removal_marker(&root, marker_pool_guid, &target_path, target_guid).unwrap();
 
-        resume_device_removal_if_pending(&mut pool);
+        resume_device_removal_if_pending(&mut pool).unwrap();
 
         let marker = read_device_removal_marker(&marker_path).unwrap();
         assert_eq!(marker.pool_guid, marker_pool_guid);
@@ -13002,7 +12982,7 @@ mod tests {
         persist_device_removal_marker(&root, pool.pool_guid, &target_path, target_guid).unwrap();
 
         pool.device_guids[1] = deterministic_device_guid(2);
-        resume_device_removal_if_pending(&mut pool);
+        resume_device_removal_if_pending(&mut pool).unwrap();
 
         let marker = read_device_removal_marker(&marker_path).unwrap();
         assert_eq!(marker.pool_guid, pool.pool_guid);
@@ -13109,7 +13089,7 @@ mod tests {
     }
 
     #[test]
-    fn safe_remove_device_resume_preserves_empty_marker() {
+    fn safe_remove_device_resume_refuses_empty_marker() {
         let root = temp_dir("safe-remove-resume-empty-marker");
         let _ = std::fs::remove_dir_all(&root);
         let config = multi_data_device_config(&root, 2);
@@ -13120,9 +13100,13 @@ mod tests {
 
         drop(pool);
 
-        let reopened = Pool::open(config, PoolProperties::default(), &test_options()).unwrap();
+        assert!(matches!(
+            Pool::open(config, PoolProperties::default(), &test_options()),
+            Err(StoreError::InvalidOptions {
+                reason: "device removal marker is corrupt or unverifiable"
+            })
+        ));
         assert_eq!(std::fs::read(&marker_path).unwrap(), b"");
-        assert_eq!(reopened.stats().device_count, 2);
 
         let _ = std::fs::remove_dir_all(&root);
     }
