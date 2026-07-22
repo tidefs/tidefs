@@ -1811,6 +1811,9 @@ fn load_state_from_transaction_with_manifest_validation(
             &superblock,
             Some(root.transaction_id),
             legacy_snapshots,
+            manifest
+                .as_ref()
+                .map(|manifest| manifest.entries.as_slice()),
         )?
     } else {
         if manifest.is_none() {
@@ -1823,6 +1826,11 @@ fn load_state_from_transaction_with_manifest_validation(
             &superblock,
             root.transaction_id,
             legacy_snapshots,
+            manifest
+                .as_ref()
+                .expect("content inspection requires a manifest")
+                .entries
+                .as_slice(),
         )?
     };
     if validate_manifest_against_loaded_state {
@@ -1925,20 +1933,28 @@ fn validate_transaction_manifest_matches_loaded_state_with_content(
     superblock_bytes: &[u8],
     mut content_entries: impl FnMut(&InodeRecord) -> Result<Vec<TransactionManifestEntry>>,
 ) -> Result<()> {
+    let (manifest_inode_keys, manifest_directory_keys) =
+        manifest_transaction_object_key_maps(store, &manifest.entries)?;
     let mut expected = Vec::new();
     for inode in state.inodes.values() {
         if inode.is_file_like() {
             expected.extend(content_entries(inode)?);
         }
 
-        let inode_key = find_inode_key(store, root.transaction_id, inode.inode_id).ok_or(
-            FileSystemError::CorruptState {
-                reason: "transaction manifest validation expected a missing inode object",
-            },
-        )?;
-        let inode_bytes = store
-            .get(inode_key)?
-            .expect("find_inode_key confirmed existence");
+        let inode_key =
+            *manifest_inode_keys
+                .get(&inode.inode_id)
+                .ok_or(FileSystemError::CorruptState {
+                    reason: "transaction manifest validation expected a missing inode object",
+                })?;
+        let inode_bytes = store.get(inode_key)?.ok_or(FileSystemError::CorruptState {
+            reason: "transaction manifest validation expected a missing inode object",
+        })?;
+        if try_encode_inode(inode)? != inode_bytes {
+            return Err(FileSystemError::CorruptState {
+                reason: "transaction manifest inode object does not match loaded state",
+            });
+        }
         expected.push(TransactionManifestEntry {
             role: TransactionManifestObjectRole::TransactionInode,
             object_key: inode_key,
@@ -1946,13 +1962,30 @@ fn validate_transaction_manifest_matches_loaded_state_with_content(
         });
 
         if inode.carries_child_namespace() {
-            let directory_key = find_directory_key(store, root.transaction_id, inode.inode_id)
-                .ok_or(FileSystemError::CorruptState {
+            let directory_key = *manifest_directory_keys.get(&inode.inode_id).ok_or(
+                FileSystemError::CorruptState {
                     reason: "transaction manifest validation expected a missing directory object",
-                })?;
-            let directory_bytes = store
-                .get(directory_key)?
-                .expect("find_directory_key confirmed existence");
+                },
+            )?;
+            let directory_bytes =
+                store
+                    .get(directory_key)?
+                    .ok_or(FileSystemError::CorruptState {
+                        reason:
+                            "transaction manifest validation expected a missing directory object",
+                    })?;
+            let directory =
+                state
+                    .directories
+                    .get(&inode.inode_id)
+                    .ok_or(FileSystemError::CorruptState {
+                        reason: "loaded directory inode has no directory table",
+                    })?;
+            if encode_directory(inode, directory) != directory_bytes {
+                return Err(FileSystemError::CorruptState {
+                    reason: "transaction manifest directory object does not match loaded state",
+                });
+            }
             expected.push(TransactionManifestEntry {
                 role: TransactionManifestObjectRole::TransactionDirectory,
                 object_key: directory_key,
@@ -2046,6 +2079,74 @@ fn find_directory_key(
     None
 }
 
+fn manifest_transaction_object_key_maps(
+    store: &LocalObjectStore,
+    entries: &[TransactionManifestEntry],
+) -> Result<(BTreeMap<InodeId, ObjectKey>, BTreeMap<InodeId, ObjectKey>)> {
+    let mut inode_keys = BTreeMap::new();
+    let mut directory_keys = BTreeMap::new();
+    for entry in entries {
+        let target = match entry.role {
+            TransactionManifestObjectRole::TransactionInode => &mut inode_keys,
+            TransactionManifestObjectRole::TransactionDirectory => &mut directory_keys,
+            _ => continue,
+        };
+        let bytes = store
+            .get(entry.object_key)?
+            .ok_or(FileSystemError::CorruptState {
+                reason: "transaction manifest references a missing namespace object",
+            })?;
+        if checksum64(&bytes) != entry.checksum {
+            return Err(FileSystemError::CorruptState {
+                reason: "transaction manifest namespace object checksum mismatch",
+            });
+        }
+        let inode_id = match entry.role {
+            TransactionManifestObjectRole::TransactionInode => decode_inode(&bytes)?.inode_id,
+            TransactionManifestObjectRole::TransactionDirectory => {
+                decode_directory_inode_id(&bytes)?
+            }
+            _ => unreachable!("non-namespace roles were skipped"),
+        };
+        if target.insert(inode_id, entry.object_key).is_some() {
+            return Err(FileSystemError::CorruptState {
+                reason: "transaction manifest contains duplicate namespace objects for an inode",
+            });
+        }
+    }
+    Ok((inode_keys, directory_keys))
+}
+
+fn manifest_snapshot_records(
+    store: &LocalObjectStore,
+    entries: &[TransactionManifestEntry],
+) -> Result<BTreeMap<Vec<u8>, SnapshotRecord>> {
+    let mut snapshots = BTreeMap::new();
+    for entry in entries {
+        if entry.role != TransactionManifestObjectRole::TransactionSnapshotCatalogEntry {
+            continue;
+        }
+        let bytes = store
+            .get(entry.object_key)?
+            .ok_or(FileSystemError::CorruptState {
+                reason: "manifest references missing snapshot catalog entry",
+            })?;
+        if checksum64(&bytes) != entry.checksum {
+            return Err(FileSystemError::CorruptState {
+                reason: "transaction manifest snapshot object checksum mismatch",
+            });
+        }
+        let snapshot = decode_snapshot_record(&bytes)?;
+        if snapshots.insert(snapshot.name.clone(), snapshot).is_some() {
+            return Err(FileSystemError::Decode {
+                object: "local filesystem superblock",
+                reason: "duplicate snapshot name",
+            });
+        }
+    }
+    Ok(snapshots)
+}
+
 pub(crate) fn load_v0390_fixed_object_state(
     store: &mut LocalObjectStore,
     superblock_bytes: &[u8],
@@ -2057,6 +2158,7 @@ pub(crate) fn load_v0390_fixed_object_state(
         None,
         legacy_snapshots,
         false,
+        None,
     )?;
     for inode in state.inodes.values().filter(|inode| inode.is_file_like()) {
         let _ = crate::read_v0390_fixed_content_from_store(store, inode.inode_id, inode)?;
@@ -2069,6 +2171,7 @@ pub(crate) fn load_state_from_superblock(
     superblock: &SuperblockRecord,
     transaction_id: Option<u64>,
     legacy_snapshots: Option<Vec<SnapshotRecord>>,
+    manifest_entries: Option<&[TransactionManifestEntry]>,
 ) -> Result<FileSystemState> {
     load_state_from_superblock_with_content_validation(
         store,
@@ -2076,6 +2179,7 @@ pub(crate) fn load_state_from_superblock(
         transaction_id,
         legacy_snapshots,
         true,
+        manifest_entries,
     )
 }
 
@@ -2084,6 +2188,7 @@ fn load_state_from_superblock_for_content_inspection(
     superblock: &SuperblockRecord,
     transaction_id: u64,
     legacy_snapshots: Option<Vec<SnapshotRecord>>,
+    manifest_entries: &[TransactionManifestEntry],
 ) -> Result<FileSystemState> {
     load_state_from_superblock_with_content_validation(
         store,
@@ -2091,6 +2196,7 @@ fn load_state_from_superblock_for_content_inspection(
         Some(transaction_id),
         legacy_snapshots,
         false,
+        Some(manifest_entries),
     )
 }
 
@@ -2100,7 +2206,14 @@ fn load_state_from_superblock_with_content_validation(
     transaction_id: Option<u64>,
     legacy_snapshots: Option<Vec<SnapshotRecord>>,
     validate_file_content: bool,
+    manifest_entries: Option<&[TransactionManifestEntry]>,
 ) -> Result<FileSystemState> {
+    let (manifest_inode_keys, manifest_directory_keys) = manifest_entries
+        .map(|entries| manifest_transaction_object_key_maps(store, entries))
+        .transpose()?
+        .map_or((None, None), |(inode_keys, directory_keys)| {
+            (Some(inode_keys), Some(directory_keys))
+        });
     let mut known_inode_ids = BTreeSet::new();
     let mut inodes = BTreeMap::new();
     let mut directories = BTreeMap::new();
@@ -2111,10 +2224,15 @@ fn load_state_from_superblock_with_content_validation(
             bits &= bits - 1;
             let inode_id = InodeId::new((word_idx * 64 + bit as usize + 1) as u64);
             known_inode_ids.insert(inode_id);
-            let inode_key = match transaction_id {
-                Some(tx) => find_inode_key(store, tx, inode_id)
-                    .unwrap_or_else(|| inode_object_key(inode_id)),
-                None => inode_object_key(inode_id),
+            let inode_key = match manifest_inode_keys.as_ref() {
+                Some(keys) => *keys.get(&inode_id).ok_or(FileSystemError::CorruptState {
+                    reason: "superblock references an inode id not present in the manifest",
+                })?,
+                None => match transaction_id {
+                    Some(tx) => find_inode_key(store, tx, inode_id)
+                        .unwrap_or_else(|| inode_object_key(inode_id)),
+                    None => inode_object_key(inode_id),
+                },
             };
             let bytes = store.get(inode_key)?.ok_or(FileSystemError::CorruptState {
                 reason: "superblock references a missing inode object",
@@ -2126,10 +2244,15 @@ fn load_state_from_superblock_with_content_validation(
                 });
             }
             if inode.carries_child_namespace() {
-                let dir_key = match transaction_id {
-                    Some(tx) => find_directory_key(store, tx, inode_id)
-                        .unwrap_or_else(|| directory_object_key(inode_id)),
-                    None => directory_object_key(inode_id),
+                let dir_key = match manifest_directory_keys.as_ref() {
+                    Some(keys) => *keys.get(&inode_id).ok_or(FileSystemError::CorruptState {
+                        reason: "directory inode id is not present in the manifest",
+                    })?,
+                    None => match transaction_id {
+                        Some(tx) => find_directory_key(store, tx, inode_id)
+                            .unwrap_or_else(|| directory_object_key(inode_id)),
+                        None => directory_object_key(inode_id),
+                    },
                 };
                 let dir_bytes = store.get(dir_key)?.ok_or(FileSystemError::CorruptState {
                     reason: "directory inode is missing its directory object",
@@ -2160,32 +2283,14 @@ fn load_state_from_superblock_with_content_validation(
                 });
             }
         }
+    } else if let Some(entries) = manifest_entries {
+        snapshots = manifest_snapshot_records(store, entries)?;
     } else if let Some(cg_id) = transaction_id {
-        // New format: load snapshots from transaction manifest entries.
+        // Legacy caller without an already-authenticated manifest.
         let manifest_key = transaction_manifest_object_key(cg_id);
         if let Some(manifest_bytes) = store.get(manifest_key)? {
             let manifest = decode_transaction_manifest(&manifest_bytes)?;
-            for entry in manifest.entries {
-                if entry.role == TransactionManifestObjectRole::TransactionExtentMap {
-                    // Extent maps are now tracked within FileSystemState; skip here.
-                    // They are loaded and validated separately during mount.
-                }
-                if entry.role == TransactionManifestObjectRole::TransactionSnapshotCatalogEntry {
-                    let snap_bytes =
-                        store
-                            .get(entry.object_key)?
-                            .ok_or(FileSystemError::CorruptState {
-                                reason: "manifest references missing snapshot catalog entry",
-                            })?;
-                    let snapshot = decode_snapshot_record(&snap_bytes)?;
-                    if snapshots.insert(snapshot.name.clone(), snapshot).is_some() {
-                        return Err(FileSystemError::Decode {
-                            object: "local filesystem superblock",
-                            reason: "duplicate snapshot name",
-                        });
-                    }
-                }
-            }
+            snapshots = manifest_snapshot_records(store, &manifest.entries)?;
         }
     }
     Ok(FileSystemState {
@@ -2249,78 +2354,22 @@ pub(crate) fn load_state_from_superblock_incremental(
     // inodes whose object keys live in prior transactions.
     let inode_key_map: Option<BTreeMap<InodeId, ObjectKey>>;
     let dir_key_map: Option<BTreeMap<InodeId, ObjectKey>>;
-    let mut snapshots = BTreeMap::new();
+    let mut snapshots;
     if let Some(entries) = manifest_entries {
-        let mut ikm: BTreeMap<InodeId, ObjectKey> = BTreeMap::new();
-        let mut dkm: BTreeMap<InodeId, ObjectKey> = BTreeMap::new();
-        for entry in entries {
-            match entry.role {
-                TransactionManifestObjectRole::TransactionInode => {
-                    let bytes =
-                        store
-                            .get(entry.object_key)?
-                            .ok_or(FileSystemError::CorruptState {
-                                reason: "manifest inode entry references missing object",
-                            })?;
-                    let inode = decode_inode(&bytes)?;
-                    ikm.insert(inode.inode_id, entry.object_key);
-                }
-                TransactionManifestObjectRole::TransactionDirectory => {
-                    let bytes =
-                        store
-                            .get(entry.object_key)?
-                            .ok_or(FileSystemError::CorruptState {
-                                reason: "manifest directory entry references missing object",
-                            })?;
-                    let dir_inode_id = decode_directory_inode_id(&bytes)?;
-                    dkm.insert(dir_inode_id, entry.object_key);
-                }
-                TransactionManifestObjectRole::TransactionSnapshotCatalogEntry => {
-                    let snap_bytes =
-                        store
-                            .get(entry.object_key)?
-                            .ok_or(FileSystemError::CorruptState {
-                                reason: "manifest references missing snapshot catalog entry",
-                            })?;
-                    let snapshot = decode_snapshot_record(&snap_bytes)?;
-                    if snapshots.insert(snapshot.name.clone(), snapshot).is_some() {
-                        return Err(FileSystemError::Decode {
-                            object: "local filesystem superblock",
-                            reason: "duplicate snapshot name",
-                        });
-                    }
-                }
-                _ => {}
-            }
-        }
+        let (ikm, dkm) = manifest_transaction_object_key_maps(store, entries)?;
+        snapshots = manifest_snapshot_records(store, entries)?;
         inode_key_map = Some(ikm);
         dir_key_map = Some(dkm);
     } else {
         inode_key_map = None;
         dir_key_map = None;
+        snapshots = BTreeMap::new();
         // Old format: load snapshots from store-embedded manifest.
         if legacy_snapshots.is_none() {
             let manifest_key = transaction_manifest_object_key(transaction_id);
             if let Some(manifest_bytes) = store.get(manifest_key)? {
                 let manifest = decode_transaction_manifest(&manifest_bytes)?;
-                for entry in manifest.entries {
-                    if entry.role == TransactionManifestObjectRole::TransactionSnapshotCatalogEntry
-                    {
-                        let snap_bytes =
-                            store
-                                .get(entry.object_key)?
-                                .ok_or(FileSystemError::CorruptState {
-                                    reason: "manifest references missing snapshot catalog entry",
-                                })?;
-                        let snapshot = decode_snapshot_record(&snap_bytes)?;
-                        if snapshots.insert(snapshot.name.clone(), snapshot).is_some() {
-                            return Err(FileSystemError::Decode {
-                                object: "local filesystem superblock",
-                                reason: "duplicate snapshot name",
-                            });
-                        }
-                    }
-                }
+                snapshots = manifest_snapshot_records(store, &manifest.entries)?;
             }
         }
     }
