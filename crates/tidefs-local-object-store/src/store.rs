@@ -3190,6 +3190,15 @@ impl LocalObjectStore {
     ) -> std::result::Result<tidefs_reclaim::ReclaimConsumerStats, ReceiptBoundDeadObjectDrainError>
     {
         self.ensure_writable("drain_receipt_bound_dead_objects_at_stable_generation")?;
+        // A block backing is one virtual segment containing labels, recovery
+        // state, and every live record. It cannot be handed to segment-file
+        // reclamation; physical recovery waits for block compaction authority.
+        if self.block_device_mode {
+            return Ok(tidefs_reclaim::ReclaimConsumerStats {
+                reclaim_queue_depth: self.dead_object_reclaim_queue.len(),
+                ..tidefs_reclaim::ReclaimConsumerStats::ZERO
+            });
+        }
         if self.dead_object_reclaim_queue_dirty {
             return Ok(tidefs_reclaim::ReclaimConsumerStats {
                 reclaim_queue_depth: self.dead_object_reclaim_queue.len(),
@@ -7937,9 +7946,30 @@ mod block_device_open_tests {
     fn block_device_receipt_bound_drain_keeps_backing_image() {
         let dir = tempdir().expect("tempdir");
         let image = create_block_image(&dir);
-        let mut store = LocalObjectStore::open_block_device(&image, block_options(80 * 1024))
-            .expect("open block image");
+        {
+            let mut backing = OpenOptions::new()
+                .write(true)
+                .open(&image)
+                .expect("open block image for reserved bytes");
+            backing
+                .write_all(&vec![0xa5; BLOCK_DEVICE_DATA_REGION_OFFSET as usize])
+                .expect("seed primary label and bootstrap region");
+            backing
+                .seek(SeekFrom::Start(BLOCK_IMAGE_BYTES - POOL_LABEL_SIZE as u64))
+                .expect("seek trailing label reservation");
+            backing
+                .write_all(&vec![0x5a; POOL_LABEL_SIZE])
+                .expect("seed trailing label reservation");
+            backing.sync_all().expect("sync reserved bytes");
+        }
+
+        const RECLAIM_SEGMENT_BYTES: u64 = 4 * 1024 * 1024;
+        let mut store =
+            LocalObjectStore::open_block_device(&image, block_options(RECLAIM_SEGMENT_BYTES))
+                .expect("open block image");
         let key = ObjectKey::from_name(b"block-device/receipt-bound/delete");
+        let live_key = ObjectKey::from_name(b"block-device/receipt-bound/live");
+        let live_payload = b"live append-log payload";
         let reclaim_key = reclaim_key(key);
         let entry = tidefs_types_reclaim_queue_core::DeadObjectEntry::new(
             reclaim_key,
@@ -7951,22 +7981,57 @@ mod block_device_open_tests {
         .with_replacement_receipt(dead_object_receipt(reclaim_key));
 
         store.put(key, b"receipt-bound payload").expect("put");
+        // Keep one live append-log record without changing the segment-level
+        // liveness count, so the pre-fix drain still selects virtual segment 0.
+        store
+            .put_direct(live_key, live_payload)
+            .expect("put live record");
         assert!(store.delete(key).expect("delete"));
         assert!(store
             .enqueue_receipt_bound_dead_object(entry)
             .expect("enqueue receipt-bound dead object"));
 
+        let protected_image = std::fs::read(&image).expect("read protected block image");
+        let free_segments_before = store.free_segment_count();
+
+        store.release_segment_file_capacity_best_effort(0);
+        assert_eq!(
+            std::fs::read(&image).expect("read block image after defensive release"),
+            protected_image,
+            "block-mode capacity-release backstop must not punch the pool member"
+        );
+
         let stats = store
             .drain_receipt_bound_dead_objects_at_stable_generation(2, 1, 16)
             .expect("drain receipt-bound dead object");
 
-        assert_eq!(stats.reclaim_queue_depth, 0);
+        assert_eq!(stats.entries_processed, 0);
+        assert_eq!(stats.segments_reclaimed, 0);
+        assert_eq!(stats.blocks_freed, 0);
+        assert_eq!(stats.reclaim_queue_depth, 1);
+        assert_eq!(store.free_segment_count(), free_segments_before);
+        assert_eq!(store.dead_object_reclaim_queue.len(), 1);
+        assert!(store.reclaim_receipts().is_empty());
+        assert_eq!(
+            store.get(live_key).expect("get live record after drain"),
+            Some(live_payload.to_vec())
+        );
+        assert_eq!(
+            std::fs::read(&image).expect("read block image after drain"),
+            protected_image,
+            "receipt-bound drain must preserve labels, bootstrap/header bytes, live records, and the trailing label reservation"
+        );
         assert!(image.exists(), "block backing image must not be unlinked");
         drop(store);
 
-        let reopened = LocalObjectStore::open_block_device(&image, block_options(80 * 1024))
-            .expect("reopen block image");
+        let reopened =
+            LocalObjectStore::open_block_device(&image, block_options(RECLAIM_SEGMENT_BYTES))
+                .expect("reopen block image");
         assert_eq!(reopened.get(key).expect("get reopened deleted"), None);
+        assert_eq!(
+            reopened.get(live_key).expect("get reopened live record"),
+            Some(live_payload.to_vec())
+        );
     }
 }
 
@@ -10120,6 +10185,9 @@ impl LocalObjectStore {
     /// remanence outcome, and failures are intentionally ignored so capacity
     /// accounting remains driven by the committed free map.
     fn release_segment_file_capacity_best_effort(&self, segment_id: u64) {
+        if self.block_device_mode {
+            return;
+        }
         let max_segment = self.max_segment_bytes();
         if max_segment == 0 {
             return;
