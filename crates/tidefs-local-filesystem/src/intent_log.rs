@@ -7,7 +7,7 @@ use crate::encoding::*;
 use crate::error::FileSystemError;
 use crate::object_keys::*;
 use crate::records::NamespaceCreateIntentRecord;
-use crate::types::{InodeRecord, NamespaceEntry};
+use crate::types::{DirChangeRecord, InodeRecord, NamespaceEntry};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -945,6 +945,7 @@ pub struct IntentLog {
 }
 
 impl IntentLog {
+    #[cfg(test)]
     pub fn new() -> Self {
         Self {
             next_entry_id: 0,
@@ -1644,10 +1645,40 @@ fn replay_namespace_create_intent(
     // overwriting it or resurrecting the creation-time name. Recovery of a
     // missing create still takes the inode-absent branch above.
     if !inode_already_present && !entry_already_present {
-        Arc::make_mut(&mut state.directories)
+        let directory = Arc::make_mut(&mut state.directories)
             .get_mut(&intent.parent_inode_id)
-            .expect("namespace create parent directory was validated before replay mutation")
-            .insert(intent.entry.name.clone(), intent.entry.clone());
+            .expect("namespace create parent directory was validated before replay mutation");
+        directory.insert(intent.entry.name.clone(), intent.entry.clone());
+        let directory_size = directory.len() as u64;
+
+        let parent = Arc::make_mut(&mut state.inodes)
+            .get_mut(&intent.parent_inode_id)
+            .expect("namespace create parent inode was validated before replay mutation");
+        parent.size = directory_size;
+        parent.metadata_version = parent.metadata_version.max(intent.inode.metadata_version);
+        parent.data_version = parent.data_version.max(intent.inode.data_version);
+        parent.dir_rev = parent.dir_rev.saturating_add(1);
+        let next_time = intent
+            .inode
+            .posix_time
+            .ctime_ns
+            .max(parent.posix_time.mtime_ns.saturating_add(1))
+            .max(parent.posix_time.ctime_ns.saturating_add(1));
+        parent.posix_time.mtime_ns = next_time;
+        parent.posix_time.ctime_ns = next_time;
+        let revision = parent.dir_rev;
+        state
+            .change_streams
+            .entry(intent.parent_inode_id)
+            .or_default()
+            .insert(
+                revision,
+                DirChangeRecord::Add {
+                    name: intent.entry.name.clone(),
+                    inode_id: intent.entry.inode_id,
+                    facets: intent.entry.facets,
+                },
+            );
     }
 
     state.observe_explicit_inode_id(intent.inode.inode_id);

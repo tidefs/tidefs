@@ -7,22 +7,32 @@ use tidefs_local_object_store::{
 };
 use tidefs_types_vfs_core::{Generation, InodeId, NodeKind, ROOT_INODE_ID};
 
+use crate::allocation::next_generation_after;
 use crate::allocation_bytes;
 use crate::constants::*;
+use crate::content::MountedContentReadAuthority;
 use crate::content_allocation_entries_for_state;
 use crate::crash_hooks::check_crash_hook;
+use crate::dedup::DedupIndex;
 use crate::encoding::*;
 use crate::error::FileSystemError;
 use crate::helpers::*;
-use crate::intent_log::{replay_uncommitted, IntentLog};
+use crate::intent_log::{
+    replay_entry, replay_uncommitted as replay_uncommitted_raw, IntentLog, IntentLogEntryKind,
+    IntentLogRootAnchor,
+};
 use crate::merge_allocation_entries;
 use crate::object_keys::*;
 use crate::read_content_from_store;
 use crate::read_content_layout_from_store;
 use crate::records::*;
-use crate::transaction_manifest_entries_for_existing_content;
 use crate::types::*;
+use crate::write_chunked_content;
 use crate::{is_skippable_recovery_error, is_skippable_store_error};
+use crate::{
+    transaction_manifest_entries_for_existing_content,
+    transaction_manifest_entries_for_pool_content,
+};
 use crate::{DatasetInodeAuthority, FileSystemState, QuotaTable, Result, ROOT_DATASET_ID};
 use tidefs_recovery_loop::RecoveryPolicy;
 use tidefs_space_accounting::SpaceAccounting;
@@ -87,7 +97,470 @@ fn namespace_entry_matches_target_inode(entry: &NamespaceEntry, target: &InodeRe
 
 pub(crate) struct RootSelection {
     report: RecoveryProbeReport,
+    root: Option<RootCommitRecord>,
     state: Option<FileSystemState>,
+}
+
+pub(crate) struct MountedRecoveryState {
+    pub(crate) state: FileSystemState,
+    pub(crate) committed_replay_base: CommittedReplayBase,
+    pub(crate) root_anchor: IntentLogRootAnchor,
+    pub(crate) replayed_intent_entry_id: Option<u64>,
+    pub(crate) intent_log: IntentLog,
+}
+
+pub(crate) struct PoolReplayOutcome {
+    pub(crate) replayed_count: u64,
+    pub(crate) examined_through_entry_id: Option<u64>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CommittedReplayBase {
+    inodes: Arc<BTreeMap<InodeId, InodeRecord>>,
+}
+
+impl CommittedReplayBase {
+    pub(crate) fn from_state(state: &FileSystemState) -> Self {
+        Self {
+            inodes: Arc::clone(&state.inodes),
+        }
+    }
+
+    pub(crate) fn inode(&self, inode_id: InodeId) -> Option<&InodeRecord> {
+        self.inodes.get(&inode_id)
+    }
+}
+
+pub(crate) fn intent_log_anchor_for_root(root: &RootCommitRecord) -> IntentLogRootAnchor {
+    IntentLogRootAnchor {
+        transaction_id: root.transaction_id,
+        generation: root.generation,
+        manifest_digest: root.manifest_checksum,
+    }
+}
+
+trait CommittedRootRecoverySource {
+    fn raw_store(&self) -> &LocalObjectStore;
+    fn load_committed_state(
+        &mut self,
+        root: &RootCommitRecord,
+        root_authentication_key: RootAuthenticationKey,
+    ) -> Result<FileSystemState>;
+}
+
+impl CommittedRootRecoverySource for LocalObjectStore {
+    fn raw_store(&self) -> &LocalObjectStore {
+        self
+    }
+
+    fn load_committed_state(
+        &mut self,
+        root: &RootCommitRecord,
+        root_authentication_key: RootAuthenticationKey,
+    ) -> Result<FileSystemState> {
+        load_state_from_transaction(self, root, root_authentication_key)
+    }
+}
+
+impl CommittedRootRecoverySource for Pool {
+    fn raw_store(&self) -> &LocalObjectStore {
+        self.raw_primary_store()
+    }
+
+    fn load_committed_state(
+        &mut self,
+        root: &RootCommitRecord,
+        root_authentication_key: RootAuthenticationKey,
+    ) -> Result<FileSystemState> {
+        load_state_from_transaction_pool(self, root, root_authentication_key)
+            .map_err(pool_candidate_content_error)
+    }
+}
+
+fn pool_candidate_content_error(error: FileSystemError) -> FileSystemError {
+    if matches!(
+        &error,
+        FileSystemError::ReceiptAuthorityUnavailable { .. }
+            | FileSystemError::ReceiptAuthorityMissing { .. }
+            | FileSystemError::ReceiptAuthorityStale { .. }
+            | FileSystemError::ReceiptAuthoritySynthetic { .. }
+            | FileSystemError::ReceiptAuthorityMalformedPolicy { .. }
+            | FileSystemError::ReceiptAuthorityUnderWidth { .. }
+            | FileSystemError::ReceiptAuthorityOverWidth { .. }
+    ) {
+        FileSystemError::CorruptState {
+            reason: "committed root content lacks current Pool placement authority",
+        }
+    } else {
+        error
+    }
+}
+
+#[derive(Debug)]
+struct PoolReplayWrite {
+    offset: u64,
+    length: u64,
+    data: Vec<u8>,
+}
+
+/// Replay data intents against a strictly Pool-authorized committed base.
+///
+/// Intent records and their payloads remain raw recovery metadata. Payload
+/// bytes become live only after length/digest validation, reconstruction
+/// against the current receipt-backed base, and receipt-producing Pool
+/// placement before a later transaction can publish them.
+pub(crate) fn replay_uncommitted_with_pool(
+    log: &IntentLog,
+    state: &mut FileSystemState,
+    committed_replay_base: &CommittedReplayBase,
+    preferred_pool_base: Option<&CommittedReplayBase>,
+    already_examined_through_entry_id: Option<u64>,
+    pool: &mut Pool,
+    selected_root: &IntentLogRootAnchor,
+) -> Result<PoolReplayOutcome> {
+    let examined_through_entry_id = log.pending_entries().last().map(|entry| entry.entry_id);
+    let entries = log
+        .pending_entries()
+        .iter()
+        .filter(|entry| {
+            already_examined_through_entry_id
+                .map(|entry_id| entry.entry_id > entry_id)
+                .unwrap_or(true)
+        })
+        .filter_map(
+            |entry| match intent_entry_matches_selected_root(entry, selected_root) {
+                Ok(true) => Some(Ok(entry)),
+                Ok(false) => None,
+                Err(error) => Some(Err(error)),
+            },
+        )
+        .collect::<Result<Vec<_>>>()?;
+    if entries.is_empty() {
+        return Ok(PoolReplayOutcome {
+            replayed_count: 0,
+            examined_through_entry_id,
+        });
+    }
+    let mut writes: BTreeMap<InodeId, Vec<PoolReplayWrite>> = BTreeMap::new();
+    let mut replayed_content: BTreeMap<InodeId, Vec<u8>> = BTreeMap::new();
+    let mut validated_payloads = BTreeMap::new();
+    let mut replayed = 0_u64;
+    let replay_generation =
+        next_generation_after(entries.iter().fold(state.generation, |generation, entry| {
+            generation
+                .max(entry.root_anchor.generation)
+                .max(entry.root_anchor.transaction_id)
+        }));
+
+    // Authenticate every selected external payload before any replay write or
+    // state mutation. A corrupt later entry must not partially apply an
+    // earlier entry or create receipt-backed content that no root may publish.
+    for entry in &entries {
+        let (length, payload_digest) = match &entry.entry_kind {
+            IntentLogEntryKind::SyncWriteRange {
+                length,
+                payload_digest,
+                ..
+            }
+            | IntentLogEntryKind::OdsyncDataRange {
+                length,
+                payload_digest,
+                ..
+            }
+            | IntentLogEntryKind::SharedMmapMsync {
+                length,
+                payload_digest,
+                ..
+            } => (*length, *payload_digest),
+            _ => continue,
+        };
+        let data = pool
+            .raw_primary_store()
+            .get(intent_log_data_object_key(entry.entry_id))?
+            .ok_or(FileSystemError::CorruptState {
+                reason: "Pool intent replay is missing its data payload",
+            })?;
+        if usize::try_from(length).ok() != Some(data.len()) {
+            return Err(FileSystemError::CorruptState {
+                reason: "Pool intent replay payload length does not match its record",
+            });
+        }
+        if checksum64(&data) != payload_digest {
+            return Err(FileSystemError::CorruptState {
+                reason: "Pool intent replay payload checksum does not match its record",
+            });
+        }
+        validated_payloads.insert(entry.entry_id, data);
+    }
+
+    for entry in entries {
+        match &entry.entry_kind {
+            IntentLogEntryKind::SyncWriteRange {
+                inode_id,
+                offset,
+                length,
+                ..
+            }
+            | IntentLogEntryKind::OdsyncDataRange {
+                inode_id,
+                offset,
+                length,
+                ..
+            }
+            | IntentLogEntryKind::SharedMmapMsync {
+                inode_id,
+                offset,
+                length,
+                ..
+            } => {
+                let data = validated_payloads.remove(&entry.entry_id).ok_or(
+                    FileSystemError::CorruptState {
+                        reason: "Pool intent replay lost a validated data payload",
+                    },
+                )?;
+                writes.entry(*inode_id).or_default().push(PoolReplayWrite {
+                    offset: *offset,
+                    length: *length,
+                    data,
+                });
+            }
+            IntentLogEntryKind::MetadataSetattrIntent(_) => {
+                replayed = replayed.saturating_add(flush_pool_replay_writes(
+                    &mut writes,
+                    &mut replayed_content,
+                    state,
+                    committed_replay_base,
+                    preferred_pool_base,
+                    pool,
+                    replay_generation,
+                )?);
+                replay_pool_metadata_setattr(
+                    entry,
+                    state,
+                    committed_replay_base,
+                    preferred_pool_base,
+                    &mut replayed_content,
+                    pool,
+                    replay_generation,
+                )?;
+                replayed = replayed.saturating_add(1);
+            }
+            _ => {
+                replay_entry(entry, state, pool.raw_primary_store_mut())?;
+                replayed = replayed.saturating_add(1);
+            }
+        }
+    }
+
+    replayed = replayed.saturating_add(flush_pool_replay_writes(
+        &mut writes,
+        &mut replayed_content,
+        state,
+        committed_replay_base,
+        preferred_pool_base,
+        pool,
+        replay_generation,
+    )?);
+    if replayed > 0 {
+        state.generation = replay_generation;
+    }
+    Ok(PoolReplayOutcome {
+        replayed_count: replayed,
+        examined_through_entry_id,
+    })
+}
+
+fn intent_entry_matches_selected_root(
+    entry: &crate::intent_log::IntentLogEntry,
+    selected_root: &IntentLogRootAnchor,
+) -> Result<bool> {
+    if entry.root_anchor.transaction_id <= selected_root.transaction_id {
+        return Ok(false);
+    }
+    if selected_root.manifest_digest.is_zero()
+        || entry.root_anchor.manifest_digest.is_zero()
+        || entry.root_anchor.manifest_digest != selected_root.manifest_digest
+        || entry.root_anchor.generation <= selected_root.generation
+    {
+        return Err(FileSystemError::CorruptState {
+            reason: "intent log anchor does not match the selected committed root",
+        });
+    }
+    Ok(true)
+}
+
+fn flush_pool_replay_writes(
+    writes: &mut BTreeMap<InodeId, Vec<PoolReplayWrite>>,
+    replayed_content: &mut BTreeMap<InodeId, Vec<u8>>,
+    state: &mut FileSystemState,
+    committed_replay_base: &CommittedReplayBase,
+    preferred_pool_base: Option<&CommittedReplayBase>,
+    pool: &mut Pool,
+    replay_generation: u64,
+) -> Result<u64> {
+    let mut replayed = 0_u64;
+    for (inode_id, inode_writes) in std::mem::take(writes) {
+        if inode_writes.is_empty() {
+            continue;
+        }
+        let mut record =
+            state
+                .inodes
+                .get(&inode_id)
+                .cloned()
+                .ok_or(FileSystemError::CorruptState {
+                    reason: "Pool intent replay references a missing inode",
+                })?;
+        let mut content = match replayed_content.get(&inode_id) {
+            Some(content) => content.clone(),
+            None => {
+                pool_replay_base_bytes(pool, committed_replay_base, preferred_pool_base, inode_id)?
+            }
+        };
+        let current_size =
+            usize::try_from(record.size).map_err(|_| FileSystemError::SizeOverflow {
+                requested: record.size,
+            })?;
+        content.resize(current_size, 0);
+        let new_end = inode_writes.iter().try_fold(0_u64, |end, write| {
+            write
+                .offset
+                .checked_add(write.length)
+                .map(|write_end| end.max(write_end))
+                .ok_or(FileSystemError::SizeOverflow {
+                    requested: u64::MAX,
+                })
+        })?;
+        let new_size = record.size.max(new_end);
+        let new_size_usize =
+            usize::try_from(new_size).map_err(|_| FileSystemError::SizeOverflow {
+                requested: new_size,
+            })?;
+        content.resize(new_size_usize, 0);
+        for write in &inode_writes {
+            let start =
+                usize::try_from(write.offset).map_err(|_| FileSystemError::SizeOverflow {
+                    requested: write.offset,
+                })?;
+            let end = start
+                .checked_add(write.data.len())
+                .ok_or(FileSystemError::SizeOverflow {
+                    requested: u64::MAX,
+                })?;
+            if end > content.len() {
+                return Err(FileSystemError::CorruptState {
+                    reason: "Pool intent replay payload exceeds its declared range",
+                });
+            }
+            content[start..end].copy_from_slice(&write.data);
+        }
+
+        record.size = new_size;
+        record.data_version = replay_generation;
+        record.metadata_version = replay_generation;
+        write_pool_replay_content(pool, state, &record, &content)?;
+
+        Arc::make_mut(&mut state.inodes).insert(inode_id, record);
+        state.dirty_inodes.insert(inode_id);
+        state.dirty_content.insert(inode_id);
+        replayed_content.insert(inode_id, content);
+        replayed = replayed.saturating_add(inode_writes.len() as u64);
+    }
+    Ok(replayed)
+}
+
+fn pool_replay_base_bytes(
+    pool: &Pool,
+    committed_replay_base: &CommittedReplayBase,
+    preferred_pool_base: Option<&CommittedReplayBase>,
+    inode_id: InodeId,
+) -> Result<Vec<u8>> {
+    if let Some(record) = preferred_pool_base.and_then(|base| base.inode(inode_id)) {
+        return MountedContentReadAuthority::new(pool).read_all_current(inode_id, record);
+    }
+    match committed_replay_base.inode(inode_id) {
+        Some(record) => MountedContentReadAuthority::new(pool).read_all_current(inode_id, record),
+        None => Ok(Vec::new()),
+    }
+}
+
+fn replay_pool_metadata_setattr(
+    entry: &crate::intent_log::IntentLogEntry,
+    state: &mut FileSystemState,
+    committed_replay_base: &CommittedReplayBase,
+    preferred_pool_base: Option<&CommittedReplayBase>,
+    replayed_content: &mut BTreeMap<InodeId, Vec<u8>>,
+    pool: &mut Pool,
+    replay_generation: u64,
+) -> Result<()> {
+    let IntentLogEntryKind::MetadataSetattrIntent(updated) = &entry.entry_kind else {
+        return Err(FileSystemError::CorruptState {
+            reason: "Pool setattr replay received a non-setattr intent",
+        });
+    };
+    let current = state
+        .inodes
+        .get(&updated.inode_id)
+        .ok_or(FileSystemError::CorruptState {
+            reason: "Pool setattr replay references a missing inode",
+        })?;
+    let content_changed =
+        current.size != updated.size || current.data_version != updated.data_version;
+    let mut content = if content_changed && updated.is_file_like() {
+        Some(match replayed_content.get(&updated.inode_id) {
+            Some(content) => content.clone(),
+            None => pool_replay_base_bytes(
+                pool,
+                committed_replay_base,
+                preferred_pool_base,
+                updated.inode_id,
+            )?,
+        })
+    } else {
+        None
+    };
+
+    let mut adjusted_entry = entry.clone();
+    let IntentLogEntryKind::MetadataSetattrIntent(adjusted) = &mut adjusted_entry.entry_kind else {
+        unreachable!("entry kind was checked above")
+    };
+    adjusted.metadata_version = replay_generation;
+    if content_changed {
+        adjusted.data_version = replay_generation;
+    }
+    if let Some(content) = &mut content {
+        let size = usize::try_from(adjusted.size).map_err(|_| FileSystemError::SizeOverflow {
+            requested: adjusted.size,
+        })?;
+        content.resize(size, 0);
+    }
+    let adjusted = adjusted.clone();
+
+    replay_entry(&adjusted_entry, state, pool.raw_primary_store_mut())?;
+    if let Some(content) = content {
+        write_pool_replay_content(pool, state, &adjusted, &content)?;
+        replayed_content.insert(adjusted.inode_id, content);
+    }
+    Ok(())
+}
+
+fn write_pool_replay_content(
+    pool: &mut Pool,
+    state: &FileSystemState,
+    record: &InodeRecord,
+    content: &[u8],
+) -> Result<()> {
+    let compression_policy = state.content_compression_policy.clone();
+    let mut pool_store = pool.primary_store_mut();
+    write_chunked_content(
+        false,
+        &mut pool_store,
+        record,
+        content,
+        &mut DedupIndex::new(),
+        None,
+        &compression_policy,
+    )
 }
 
 pub(crate) fn load_latest_committed_state(
@@ -95,35 +568,103 @@ pub(crate) fn load_latest_committed_state(
     root_authentication_key: RootAuthenticationKey,
     policy: RecoveryPolicy,
 ) -> Result<Option<FileSystemState>> {
-    let selection = select_latest_committed_root(store, root_authentication_key)?;
-    match selection.report.outcome {
-        RecoveryProbeOutcome::SelectedCommittedRoot => {
-            let mut state = selection.state.ok_or(FileSystemError::CorruptState {
-                reason: "recovery selected a committed root without decoded state",
-            })?;
-            // After selecting the newest valid committed root, replay any
-            // uncommitted intent log entries (fsynced data that survived
-            // a crash but was never promoted to a transaction group commit).
-            let since_tx = selection.report.selected_transaction_id.unwrap_or(0);
-            if policy.allows_replay() {
-                let log = IntentLog::load(store)?;
-                check_crash_hook(CrashInjectionPoint::RecoveryBeforeReplay);
-                if log.replay_is_needed(since_tx) {
-                    let count = replay_uncommitted(&log, &mut state, store, since_tx)?;
-                    check_crash_hook(CrashInjectionPoint::RecoveryAfterReplay);
-                    if count > 0 {
-                        eprintln!(
-                            "recovery: replayed {count} uncommitted intent log entries after transaction {since_tx}"
-                        );
-                    }
-                }
-            } else {
+    let selection = select_latest_committed_root_from_source(store, root_authentication_key)?;
+    let Some((root, mut state)) = selected_root_and_state(selection)? else {
+        return Ok(None);
+    };
+    if policy.allows_replay() {
+        let log = IntentLog::load(store)?;
+        check_crash_hook(CrashInjectionPoint::RecoveryBeforeReplay);
+        if log.replay_is_needed(root.transaction_id) {
+            let count = replay_uncommitted_raw(&log, &mut state, store, root.transaction_id)?;
+            check_crash_hook(CrashInjectionPoint::RecoveryAfterReplay);
+            if count > 0 {
                 eprintln!(
-                    "recovery: policy={} skips intent-log replay after tx {since_tx}",
-                    policy.label(),
+                    "recovery: replayed {count} uncommitted intent log entries after transaction {}",
+                    root.transaction_id
                 );
             }
-            Ok(Some(state))
+        }
+    } else {
+        eprintln!(
+            "recovery: policy={} skips intent-log replay after tx {}",
+            policy.label(),
+            root.transaction_id,
+        );
+    }
+    Ok(Some(state))
+}
+
+pub(crate) fn load_latest_committed_state_pool(
+    pool: &mut Pool,
+    root_authentication_key: RootAuthenticationKey,
+    policy: RecoveryPolicy,
+) -> Result<Option<MountedRecoveryState>> {
+    let selection = select_latest_committed_root_from_source(pool, root_authentication_key)?;
+    let Some((root, committed_state)) = selected_root_and_state(selection)? else {
+        return Ok(None);
+    };
+    let root_anchor = intent_log_anchor_for_root(&root);
+    // Load the durable log exactly once. Replay and the mounted instance must
+    // share one view; substituting an empty log after successful replay can
+    // strand the high-water marker and collide with durable entry ids.
+    let intent_log = IntentLog::load(pool.raw_primary_store())?;
+    let mut committed_replay_base = CommittedReplayBase::from_state(&committed_state);
+    let mut state = committed_state.clone();
+    let replayed_intent_entry_id = if policy.allows_replay() {
+        check_crash_hook(CrashInjectionPoint::RecoveryBeforeReplay);
+        let outcome = replay_uncommitted_with_pool(
+            &intent_log,
+            &mut state,
+            &committed_replay_base,
+            None,
+            None,
+            pool,
+            &root_anchor,
+        )?;
+        check_crash_hook(CrashInjectionPoint::RecoveryAfterReplay);
+        if outcome.replayed_count > 0 {
+            eprintln!(
+                "recovery: replayed {} uncommitted intent log entries after transaction {}",
+                outcome.replayed_count, root.transaction_id
+            );
+        }
+        if outcome.examined_through_entry_id.is_some() {
+            // Future suffix replay must reconstruct unaffected ranges from the
+            // exact receipt-backed state at this high-water mark, not from the
+            // older selected root or mutable live state.
+            committed_replay_base = CommittedReplayBase::from_state(&state);
+        }
+        outcome.examined_through_entry_id
+    } else {
+        eprintln!(
+            "recovery: policy={} skips intent-log replay after tx {}",
+            policy.label(),
+            root.transaction_id,
+        );
+        None
+    };
+    Ok(Some(MountedRecoveryState {
+        state,
+        committed_replay_base,
+        root_anchor,
+        replayed_intent_entry_id,
+        intent_log,
+    }))
+}
+
+fn selected_root_and_state(
+    selection: RootSelection,
+) -> Result<Option<(RootCommitRecord, FileSystemState)>> {
+    match selection.report.outcome {
+        RecoveryProbeOutcome::SelectedCommittedRoot => {
+            let root = selection.root.ok_or(FileSystemError::CorruptState {
+                reason: "recovery selected a committed root without its root record",
+            })?;
+            let state = selection.state.ok_or(FileSystemError::CorruptState {
+                reason: "recovery selected a committed root without decoded state",
+            })?;
+            Ok(Some((root, state)))
         }
         RecoveryProbeOutcome::EmptyStore => Ok(None),
         RecoveryProbeOutcome::ExplicitIntegrityOrMediaError => Err(FileSystemError::CorruptState {
@@ -983,20 +1524,27 @@ pub(crate) fn select_latest_committed_root(
     store: &mut LocalObjectStore,
     root_authentication_key: RootAuthenticationKey,
 ) -> Result<RootSelection> {
-    let mut report =
-        RecoveryProbeReport::empty_with_replay_tail(store.replay_report().repaired_tail_bytes);
+    select_latest_committed_root_from_source(store, root_authentication_key)
+}
+
+fn select_latest_committed_root_from_source<S: CommittedRootRecoverySource>(
+    source: &mut S,
+    root_authentication_key: RootAuthenticationKey,
+) -> Result<RootSelection> {
+    let mut report = RecoveryProbeReport::empty_with_replay_tail(
+        source.raw_store().replay_report().repaired_tail_bytes,
+    );
     let mut best: Option<(RootCommitRecord, FileSystemState)> = None;
-    let total_stores = store.stores_count();
+    let total_stores = source.raw_store().stores_count();
     // Quorum: majority of all stores (primary + replicas).
     // A root commit on only a minority is stale and must be rejected.
     let quorum = (total_stores / 2) + 1;
     // Track which store indices have seen each txg for quorum validation.
-    let mut quorum_seen: std::collections::BTreeMap<u64, std::collections::BTreeSet<usize>> =
-        std::collections::BTreeMap::new();
+    let mut quorum_seen: BTreeMap<u64, BTreeSet<usize>> = BTreeMap::new();
 
     for slot in 0..FILESYSTEM_ROOT_SLOT_COUNT {
         let slot_key = root_slot_object_key(slot);
-        let all_store_locations = store.version_locations_across_stores(slot_key);
+        let all_store_locations = source.raw_store().version_locations_across_stores(slot_key);
 
         for (store_idx, locations) in all_store_locations.iter().enumerate() {
             if locations.is_empty() {
@@ -1010,7 +1558,10 @@ pub(crate) fn select_latest_committed_root(
             for location in locations.iter().rev() {
                 report.root_slot_candidates_seen =
                     report.root_slot_candidates_seen.saturating_add(1);
-                let bytes = match store.read_location_from_store(store_idx, *location) {
+                let bytes = match source
+                    .raw_store()
+                    .read_location_from_store(store_idx, *location)
+                {
                     Ok(bytes) => bytes,
                     Err(err) if is_skippable_store_error(&err) => {
                         report.skipped_root_candidates =
@@ -1045,8 +1596,7 @@ pub(crate) fn select_latest_committed_root(
                     continue;
                 }
 
-                let state = match load_state_from_transaction(store, &root, root_authentication_key)
-                {
+                let state = match source.load_committed_state(&root, root_authentication_key) {
                     Ok(state) => state,
                     Err(err) if is_skippable_recovery_error(&err) => {
                         report.skipped_root_candidates =
@@ -1080,6 +1630,7 @@ pub(crate) fn select_latest_committed_root(
         report.outcome = RecoveryProbeOutcome::SelectedCommittedRoot;
         Ok(RootSelection {
             report,
+            root: Some(root),
             state: Some(state),
         })
     } else {
@@ -1088,6 +1639,7 @@ pub(crate) fn select_latest_committed_root(
         }
         Ok(RootSelection {
             report,
+            root: None,
             state: None,
         })
     }
@@ -1099,6 +1651,41 @@ pub(crate) fn load_state_from_transaction(
     root_authentication_key: RootAuthenticationKey,
 ) -> Result<FileSystemState> {
     load_state_from_transaction_with_manifest_validation(store, root, root_authentication_key, true)
+}
+
+/// Load transaction metadata from the raw recovery store, then validate every
+/// committed file-content entry through the current Pool placement path.
+pub(crate) fn load_state_from_transaction_pool(
+    pool: &mut Pool,
+    root: &RootCommitRecord,
+    root_authentication_key: RootAuthenticationKey,
+) -> Result<FileSystemState> {
+    let state = load_state_from_transaction_for_content_inspection(
+        pool.raw_primary_store_mut(),
+        root,
+        root_authentication_key,
+    )?;
+    let superblock_bytes = pool
+        .raw_primary_store()
+        .get(transaction_superblock_object_key(root.transaction_id))?
+        .ok_or(FileSystemError::CorruptState {
+            reason: "root commit references a missing transaction superblock",
+        })?;
+    let root_authentication = validate_root_authentication_record(root, root_authentication_key)?;
+    let manifest = validate_root_transaction_manifest(
+        pool.raw_primary_store(),
+        root,
+        &superblock_bytes,
+        &root_authentication,
+    )?;
+    validate_transaction_manifest_matches_loaded_state_pool(
+        pool,
+        root,
+        &state,
+        &manifest,
+        &superblock_bytes,
+    )?;
+    Ok(state)
 }
 
 fn load_state_from_transaction_for_content_inspection(
@@ -1258,12 +1845,45 @@ pub(crate) fn validate_transaction_manifest_matches_loaded_state(
     manifest: &TransactionManifestRecord,
     superblock_bytes: &[u8],
 ) -> Result<()> {
+    validate_transaction_manifest_matches_loaded_state_with_content(
+        store,
+        root,
+        state,
+        manifest,
+        superblock_bytes,
+        |inode| transaction_manifest_entries_for_existing_content(store, inode),
+    )
+}
+
+fn validate_transaction_manifest_matches_loaded_state_pool(
+    pool: &Pool,
+    root: &RootCommitRecord,
+    state: &FileSystemState,
+    manifest: &TransactionManifestRecord,
+    superblock_bytes: &[u8],
+) -> Result<()> {
+    validate_transaction_manifest_matches_loaded_state_with_content(
+        pool.raw_primary_store(),
+        root,
+        state,
+        manifest,
+        superblock_bytes,
+        |inode| transaction_manifest_entries_for_pool_content(pool, inode),
+    )
+}
+
+fn validate_transaction_manifest_matches_loaded_state_with_content(
+    store: &LocalObjectStore,
+    root: &RootCommitRecord,
+    state: &FileSystemState,
+    manifest: &TransactionManifestRecord,
+    superblock_bytes: &[u8],
+    mut content_entries: impl FnMut(&InodeRecord) -> Result<Vec<TransactionManifestEntry>>,
+) -> Result<()> {
     let mut expected = Vec::new();
     for inode in state.inodes.values() {
         if inode.is_file_like() {
-            expected.extend(transaction_manifest_entries_for_existing_content(
-                store, inode,
-            )?);
+            expected.extend(content_entries(inode)?);
         }
 
         let inode_key = find_inode_key(store, root.transaction_id, inode.inode_id).ok_or(
@@ -1386,7 +2006,17 @@ pub(crate) fn load_v0390_fixed_object_state(
     superblock_bytes: &[u8],
 ) -> Result<FileSystemState> {
     let (superblock, legacy_snapshots) = decode_superblock(superblock_bytes)?;
-    load_state_from_superblock(store, &superblock, None, legacy_snapshots)
+    let state = load_state_from_superblock_with_content_validation(
+        store,
+        &superblock,
+        None,
+        legacy_snapshots,
+        false,
+    )?;
+    for inode in state.inodes.values().filter(|inode| inode.is_file_like()) {
+        let _ = crate::read_v0390_fixed_content_from_store(store, inode.inode_id, inode)?;
+    }
+    Ok(state)
 }
 
 pub(crate) fn load_state_from_superblock(

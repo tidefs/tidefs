@@ -3,14 +3,16 @@
 use super::*;
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tidefs_dataset_lifecycle::{DatasetFlags, DatasetId, DatasetType};
 use tidefs_local_object_store::CompressionAlgorithm;
 use tidefs_local_object_store::{checksum64, IntegrityDigest64, LocalObjectStore, ObjectKey};
 use tidefs_recovery_loop::RecoveryPolicy;
-use tidefs_types_vfs_core::S_IFDIR;
-use tidefs_types_vfs_core::{LockRange, LockTracker, LockType};
+use tidefs_types_vfs_core::{
+    LockRange, LockTracker, LockType, SetAttr, FATTR_MODE, S_IFDIR, S_IFMT,
+};
 
 fn temp_root(name: &str) -> PathBuf {
     let nanos = SystemTime::now()
@@ -381,8 +383,16 @@ fn stage_probe_file_state(
     name: &[u8],
     bytes: &[u8],
 ) -> (FileSystemState, String, InodeId, Vec<u8>) {
+    stage_probe_file_state_from_state(&fs.state, name, bytes)
+}
+
+fn stage_probe_file_state_from_state(
+    base: &FileSystemState,
+    name: &[u8],
+    bytes: &[u8],
+) -> (FileSystemState, String, InodeId, Vec<u8>) {
     validate_name(name).expect("probe file name is valid");
-    let mut staged = fs.state.clone();
+    let mut staged = base.clone();
     let tick = staged.generation.saturating_add(1).max(1);
     staged.generation = tick;
     let inode_id = staged.allocate_inode_id();
@@ -443,6 +453,26 @@ fn write_staged_content(
         .expect("write staged content object");
 }
 
+fn write_staged_pool_content(
+    pool: &mut Pool,
+    staged: &FileSystemState,
+    inode_id: InodeId,
+    bytes: &[u8],
+) {
+    let record = staged.inodes.get(&inode_id).expect("staged inode exists");
+    let mut pool_store = pool.primary_store_mut();
+    write_chunked_content(
+        false,
+        &mut pool_store,
+        record,
+        bytes,
+        &mut DedupIndex::new(),
+        None,
+        &staged.content_compression_policy,
+    )
+    .expect("write staged content through Pool placement");
+}
+
 fn current_content_manifest(fs: &LocalFileSystem, path: &str) -> ContentManifestObject {
     let record = fs.stat(path).expect("stat file");
     let bytes = fs
@@ -457,6 +487,200 @@ fn current_content_manifest(fs: &LocalFileSystem, path: &str) -> ContentManifest
     validate_content_manifest(record.inode_id, &record, &manifest)
         .expect("manifest validates against inode");
     manifest
+}
+
+fn stage_receiptless_raw_object_substitute(fs: &mut LocalFileSystem, key: ObjectKey) -> Vec<u8> {
+    let bytes = fs
+        .store
+        .get(DeviceIoClass::Data, key)
+        .expect("read receipt-backed object")
+        .expect("receipt-backed object exists");
+    assert!(
+        fs.store
+            .delete(DeviceIoClass::Data, key)
+            .expect("delete receipt-backed object"),
+        "receipt-backed object must exist before raw substitution"
+    );
+    fs.store
+        .raw_primary_store_mut()
+        .put(key, &bytes)
+        .expect("stage receiptless raw-primary substitute");
+    fs.store
+        .sync_all()
+        .expect("sync receiptless raw-primary substitute");
+    assert!(
+        fs.store
+            .placement_receipt_for_key(DeviceIoClass::Data, key)
+            .expect("inspect removed placement receipt")
+            .is_none(),
+        "raw substitute must not retain placement authority"
+    );
+    assert!(fs.store.raw_primary_store().contains_key(key));
+    bytes
+}
+
+struct TwoDeviceBlockFixture {
+    metadata_root: PathBuf,
+    devices: Vec<PathBuf>,
+}
+
+impl TwoDeviceBlockFixture {
+    fn new(label: &str) -> Self {
+        let metadata_root = temp_root(&format!("{label}-meta"));
+        let devices = vec![
+            temp_root(&format!("{label}-dev0")),
+            temp_root(&format!("{label}-dev1")),
+        ];
+        fs::create_dir_all(&metadata_root).expect("create block-device metadata directory");
+        for device in &devices {
+            let file = fs::File::create(device).expect("create block-device image");
+            file.set_len(8 * 1024 * 1024)
+                .expect("size block-device image");
+        }
+        Self {
+            metadata_root,
+            devices,
+        }
+    }
+
+    fn open(&self) -> LocalFileSystem {
+        LocalFileSystem::open_with_block_devices(
+            &self.metadata_root,
+            &self.devices,
+            options(),
+            RootAuthenticationKey::demo_key(),
+        )
+        .expect("open two-device filesystem")
+    }
+
+    fn open_pool(&self) -> Pool {
+        LocalFileSystem::block_device_pool(
+            &self.metadata_root,
+            &self.devices,
+            None,
+            None,
+            &options(),
+        )
+        .expect("open two-device Pool")
+    }
+}
+
+impl Drop for TwoDeviceBlockFixture {
+    fn drop(&mut self) {
+        cleanup(&self.metadata_root);
+        for device in &self.devices {
+            let _ = fs::remove_file(device);
+        }
+    }
+}
+
+fn content_manifest_away_from_raw_primary(
+    pool: &Pool,
+    record: &InodeRecord,
+) -> Option<ContentManifestObject> {
+    let content_key = content_object_key_for_version(record.inode_id, record.data_version);
+    let content_receipt = pool
+        .placement_receipt_for_key(DeviceIoClass::Data, content_key)
+        .expect("read content placement receipt")
+        .expect("content placement receipt exists");
+    let content_bytes = pool
+        .get(DeviceIoClass::Data, content_key)
+        .expect("read placed content manifest")
+        .expect("placed content manifest exists");
+    let manifest = decode_content_manifest(&content_bytes).expect("decode placed content manifest");
+    validate_content_manifest(record.inode_id, record, &manifest)
+        .expect("placed content manifest validates");
+
+    if content_receipt
+        .targets
+        .iter()
+        .any(|target| target.device_index == 0)
+    {
+        return None;
+    }
+    let mut chunk_keys = Vec::new();
+    for chunk in manifest.chunks.iter().filter(|chunk| !chunk.is_hole()) {
+        let chunk_key = content_chunk_object_key_for_version(
+            record.inode_id,
+            chunk.data_version,
+            chunk.chunk_index,
+        );
+        let chunk_receipt = pool
+            .placement_receipt_for_key(DeviceIoClass::Data, chunk_key)
+            .expect("read content-chunk placement receipt")
+            .expect("content-chunk placement receipt exists");
+        if chunk_receipt
+            .targets
+            .iter()
+            .any(|target| target.device_index == 0)
+        {
+            return None;
+        }
+        assert_eq!(
+            chunk_receipt.generation, chunk.placement_receipt_generation,
+            "chunk reference must bind the current Pool receipt"
+        );
+        chunk_keys.push(chunk_key);
+    }
+    assert!(
+        !chunk_keys.is_empty(),
+        "off-primary fixture needs at least one stored content chunk"
+    );
+    assert!(
+        !pool.raw_primary_store().contains_key(content_key),
+        "content manifest must be absent from the raw primary"
+    );
+    for chunk_key in chunk_keys {
+        assert!(
+            !pool.raw_primary_store().contains_key(chunk_key),
+            "content chunk must be absent from the raw primary"
+        );
+    }
+    Some(manifest)
+}
+
+fn flush_uncommitted_content_away_from_raw_primary(
+    fs: &mut LocalFileSystem,
+    path: &str,
+    label: &str,
+) -> (Vec<u8>, InodeRecord, ContentManifestObject) {
+    for candidate in 0..64_u8 {
+        let bytes = format!("{label}-{candidate:02}").into_bytes();
+        fs.write_file(path, 0, &bytes)
+            .expect("buffer candidate content");
+        let inode_id = fs.stat(path).expect("stat candidate file").inode_id;
+        fs.flush_write_buffer(inode_id)
+            .expect("flush candidate through Pool placement");
+        let record = fs.stat(path).expect("stat flushed candidate file");
+        if let Some(manifest) = content_manifest_away_from_raw_primary(&fs.store, &record) {
+            return (bytes, record, manifest);
+        }
+    }
+    panic!("candidate set must place uncommitted content away from the raw primary");
+}
+
+fn commit_file_away_from_raw_primary(
+    fixture: &TwoDeviceBlockFixture,
+    label: &str,
+) -> (String, Vec<u8>, InodeId, u64) {
+    let mut pool = fixture.open_pool();
+    for candidate in 0..64_u8 {
+        let mut base_state = initial_state();
+        base_state.generation = u64::from(candidate).saturating_add(1);
+        let bytes = format!("prefix-{candidate:02}-{label}-committed-base-suffix").into_bytes();
+        let name = format!("{label}-{candidate}");
+        let (staged, path, inode_id, base) =
+            stage_probe_file_state_from_state(&base_state, name.as_bytes(), &bytes);
+        write_staged_pool_content(&mut pool, &staged, inode_id, &base);
+        let record = staged.inodes.get(&inode_id).expect("staged file inode");
+        if content_manifest_away_from_raw_primary(&pool, record).is_none() {
+            continue;
+        }
+        persist_state_with_pool(&mut pool, &staged, RootAuthenticationKey::demo_key())
+            .expect("commit off-primary file base");
+        return (path, base, inode_id, staged.generation);
+    }
+    panic!("candidate set must place manifest and chunks away from the raw primary");
 }
 
 fn write_transaction_inodes(
@@ -558,14 +782,9 @@ fn apply_crash_boundary(
     let transaction_id = staged.generation.max(ROOT_COMMIT_MIN_TRANSACTION_ID);
     match boundary {
         CrashInjectionBoundary::NoCrash | CrashInjectionBoundary::AfterRootCommitSynced => {
-            write_staged_content(
-                fs.store.primary_store_mut().raw_store_mut(),
-                staged,
-                inode_id,
-                bytes,
-            );
-            let observed = persist_state_until_boundary(
-                fs.store.primary_store_mut().raw_store_mut(),
+            write_staged_pool_content(&mut fs.store, staged, inode_id, bytes);
+            let observed = persist_state_with_pool_until_boundary(
+                &mut fs.store,
                 staged,
                 fs.root_authentication_key,
                 Some(FilesystemCommitBoundary::RootCommitSynced),
@@ -577,21 +796,11 @@ fn apply_crash_boundary(
             fs.store.sync_all().expect("sync previous state only");
         }
         CrashInjectionBoundary::AfterContentObjects => {
-            write_staged_content(
-                fs.store.primary_store_mut().raw_store_mut(),
-                staged,
-                inode_id,
-                bytes,
-            );
+            write_staged_pool_content(&mut fs.store, staged, inode_id, bytes);
             fs.store.sync_all().expect("sync staged content object");
         }
         CrashInjectionBoundary::AfterTransactionInodes => {
-            write_staged_content(
-                fs.store.primary_store_mut().raw_store_mut(),
-                staged,
-                inode_id,
-                bytes,
-            );
+            write_staged_pool_content(&mut fs.store, staged, inode_id, bytes);
             write_transaction_inodes(
                 fs.store.primary_store_mut().raw_store_mut(),
                 staged,
@@ -600,12 +809,7 @@ fn apply_crash_boundary(
             fs.store.sync_all().expect("sync staged inodes");
         }
         CrashInjectionBoundary::AfterTransactionDirectories => {
-            write_staged_content(
-                fs.store.primary_store_mut().raw_store_mut(),
-                staged,
-                inode_id,
-                bytes,
-            );
+            write_staged_pool_content(&mut fs.store, staged, inode_id, bytes);
             write_transaction_inodes(
                 fs.store.primary_store_mut().raw_store_mut(),
                 staged,
@@ -619,12 +823,7 @@ fn apply_crash_boundary(
             fs.store.sync_all().expect("sync staged directories");
         }
         CrashInjectionBoundary::AfterTransactionSuperblock => {
-            write_staged_content(
-                fs.store.primary_store_mut().raw_store_mut(),
-                staged,
-                inode_id,
-                bytes,
-            );
+            write_staged_pool_content(&mut fs.store, staged, inode_id, bytes);
             write_transaction_inodes(
                 fs.store.primary_store_mut().raw_store_mut(),
                 staged,
@@ -645,14 +844,9 @@ fn apply_crash_boundary(
                 .expect("sync staged transaction superblock");
         }
         CrashInjectionBoundary::AfterTransactionObjectsSynced => {
-            write_staged_content(
-                fs.store.primary_store_mut().raw_store_mut(),
-                staged,
-                inode_id,
-                bytes,
-            );
-            let observed = persist_state_until_boundary(
-                fs.store.primary_store_mut().raw_store_mut(),
+            write_staged_pool_content(&mut fs.store, staged, inode_id, bytes);
+            let observed = persist_state_with_pool_until_boundary(
+                &mut fs.store,
                 staged,
                 fs.root_authentication_key,
                 Some(FilesystemCommitBoundary::TransactionObjectsSynced),
@@ -661,12 +855,7 @@ fn apply_crash_boundary(
             assert_eq!(observed, FilesystemCommitBoundary::TransactionObjectsSynced);
         }
         CrashInjectionBoundary::AfterMalformedRootCommit => {
-            write_staged_content(
-                fs.store.primary_store_mut().raw_store_mut(),
-                staged,
-                inode_id,
-                bytes,
-            );
+            write_staged_pool_content(&mut fs.store, staged, inode_id, bytes);
             write_transaction_inodes(
                 fs.store.primary_store_mut().raw_store_mut(),
                 staged,
@@ -683,8 +872,8 @@ fn apply_crash_boundary(
                 transaction_id,
             );
             fs.store
+                .raw_primary_store_mut()
                 .put(
-                    DeviceIoClass::Data,
                     root_slot_object_key(root.slot),
                     b"malformed root-slot bytes with a valid object-store checksum",
                 )
@@ -706,14 +895,9 @@ fn apply_crash_boundary(
                 .expect("sync missing-transaction root commit candidate");
         }
         CrashInjectionBoundary::AfterRootCommitWritten => {
-            write_staged_content(
-                fs.store.primary_store_mut().raw_store_mut(),
-                staged,
-                inode_id,
-                bytes,
-            );
-            let observed = persist_state_until_boundary(
-                fs.store.primary_store_mut().raw_store_mut(),
+            write_staged_pool_content(&mut fs.store, staged, inode_id, bytes);
+            let observed = persist_state_with_pool_until_boundary(
+                &mut fs.store,
                 staged,
                 fs.root_authentication_key,
                 Some(FilesystemCommitBoundary::RootCommitWritten),
@@ -2755,6 +2939,147 @@ fn punch_hole_subchunk_boundary_zeros_partial_chunk() {
 }
 
 #[test]
+fn partial_sparse_mutations_reject_receiptless_chunk_without_live_state_change() {
+    for operation in ["punch-hole", "zero-range", "free-extent-range"] {
+        let root = temp_root(&format!("{operation}-receiptless-chunk"));
+        let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
+        fs.set_dedup_enabled(false);
+        fs.create_file("/file.bin", 0o644).expect("create file");
+
+        let chunk_size = content_chunk_size() as usize;
+        let bytes: Vec<u8> = (0..chunk_size).map(|index| (index % 251) as u8).collect();
+        fs.write_file("/file.bin", 0, &bytes)
+            .expect("write one full content chunk");
+        fs.sync_all().expect("commit source content");
+        fs.set_auto_commit(false);
+
+        let record_before = fs.stat("/file.bin").expect("stat committed file");
+        let manifest = current_content_manifest(&fs, "/file.bin");
+        let chunk_ref = manifest
+            .chunks
+            .iter()
+            .find(|chunk| !chunk.is_hole())
+            .cloned()
+            .expect("committed file has a materialized chunk");
+        let chunk_key = content_chunk_object_key_for_version(
+            record_before.inode_id,
+            chunk_ref.data_version,
+            chunk_ref.chunk_index,
+        );
+        let encoded = stage_receiptless_raw_object_substitute(&mut fs, chunk_key);
+        assert_eq!(checksum64(&encoded), chunk_ref.checksum);
+
+        let stats_before = fs.stats();
+        let extents_before = fs.lookup_extents(record_before.inode_id.get(), 0, record_before.size);
+        assert!(
+            !extents_before.is_empty(),
+            "sparse mutation rollback needs a live extent"
+        );
+        let accounting_before = fs.state.space_accounting.clone();
+        let capacity_before = (
+            fs.capacity_authority().used_bytes(),
+            fs.capacity_authority().reserved_bytes(),
+            fs.capacity_authority().pending_bytes(),
+        );
+        let dirty_extent_maps_before = fs.state.dirty_extent_maps.clone();
+        let reclaim_before = fs.reclaim_stats();
+        let candidate_generation = next_generation_after(stats_before.filesystem_generation);
+        let candidate_manifest_key =
+            content_object_key_for_version(record_before.inode_id, candidate_generation);
+        let candidate_chunk_key = content_chunk_object_key_for_version(
+            record_before.inode_id,
+            candidate_generation,
+            chunk_ref.chunk_index,
+        );
+        let candidate_root_key = root_slot_object_key(root_slot_for_transaction(
+            candidate_generation.max(ROOT_COMMIT_MIN_TRANSACTION_ID),
+        ));
+        let root_locations_before = fs
+            .store
+            .raw_primary_store()
+            .version_locations_of(candidate_root_key);
+        let live_before_failure = fs
+            .read_file(&path)
+            .expect("read buffered live view before induced failure");
+
+        let result: Result<()> = match operation {
+            "punch-hole" => fs.punch_hole("/file.bin", 100, 400).map(|_| ()),
+            "zero-range" => fs.zero_range("/file.bin", 100, 400).map(|_| ()),
+            "free-extent-range" => fs
+                .free_extent_range(record_before.inode_id, 100, 400)
+                .map(|_| ()),
+            _ => unreachable!("bounded sparse-mutation test case"),
+        };
+        let error = result.expect_err("receiptless old chunk must fail before publication");
+        assert!(matches!(
+            error,
+            FileSystemError::ReceiptAuthorityMissing {
+                object_key,
+                expected_generation,
+            } if object_key == chunk_key
+                && expected_generation == chunk_ref.placement_receipt_generation
+        ));
+
+        assert_eq!(fs.stats(), stats_before, "{operation} changed fs stats");
+        assert_eq!(
+            fs.stat("/file.bin").expect("stat after refused mutation"),
+            record_before,
+            "{operation} changed the live inode"
+        );
+        assert_eq!(
+            fs.lookup_extents(record_before.inode_id.get(), 0, record_before.size),
+            extents_before,
+            "{operation} changed live extents"
+        );
+        assert_eq!(
+            fs.state.space_accounting, accounting_before,
+            "{operation} changed space accounting"
+        );
+        assert_eq!(
+            (
+                fs.capacity_authority().used_bytes(),
+                fs.capacity_authority().reserved_bytes(),
+                fs.capacity_authority().pending_bytes(),
+            ),
+            capacity_before,
+            "{operation} changed capacity authority"
+        );
+        assert_eq!(fs.state.dirty_extent_maps, dirty_extent_maps_before);
+        assert_eq!(fs.reclaim_stats(), reclaim_before);
+        assert!(fs.mutation_delta.is_none());
+        assert!(fs
+            .store
+            .placement_receipt_for_key(DeviceIoClass::Data, candidate_manifest_key)
+            .expect("inspect candidate manifest receipt")
+            .is_none());
+        assert!(fs
+            .store
+            .placement_receipt_for_key(DeviceIoClass::Data, candidate_chunk_key)
+            .expect("inspect candidate chunk receipt")
+            .is_none());
+        assert!(!fs
+            .store
+            .raw_primary_store()
+            .contains_key(candidate_manifest_key));
+        assert!(!fs
+            .store
+            .raw_primary_store()
+            .contains_key(candidate_chunk_key));
+        assert_eq!(
+            fs.store
+                .raw_primary_store()
+                .version_locations_of(candidate_root_key),
+            root_locations_before,
+            "{operation} appended a root candidate"
+        );
+
+        fs.recovery_policy = RecoveryPolicy::ReadOnly;
+        drop(fs);
+        cleanup(&root);
+    }
+}
+
+#[test]
 fn punch_hole_manifest_is_sparse() {
     let root = temp_root("punch-hole-sparse-manifest");
     let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
@@ -3671,7 +3996,63 @@ fn pre_publish_sync_failure_rolls_back_live_state() {
 }
 
 #[test]
-fn root_sync_failure_keeps_live_state_and_avoids_transaction_id_reuse() {
+fn successful_public_commit_discards_its_rollback_delta() {
+    let root = temp_root("public-commit-discards-rollback-delta");
+    let committed_generation;
+
+    {
+        let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
+        fs.set_auto_commit(false);
+        fs.create_file("/committed.txt", 0o644)
+            .expect("create committed file");
+        fs.write_file("/committed.txt", 0, b"committed")
+            .expect("write committed file");
+        fs.sync_all()
+            .expect("publish through public commit boundary");
+        committed_generation = fs.generation();
+
+        fs.set_auto_commit(true);
+        inject_next_sync_failure_after_boundary(
+            FilesystemCommitBoundary::TransactionObjectsWritten,
+        );
+        let error = fs
+            .create_file("/failed.txt", 0o644)
+            .expect_err("second mutation must fail before root publication");
+        assert!(matches!(
+            error,
+            FileSystemError::Store(StoreError::Io { .. })
+        ));
+        assert_eq!(fs.generation(), committed_generation);
+        assert_eq!(
+            fs.read_file("/committed.txt")
+                .expect("published file remains live"),
+            b"committed"
+        );
+        assert!(matches!(
+            fs.lookup("/failed.txt"),
+            Err(FileSystemError::NotFound { .. })
+        ));
+        fs.recovery_policy = RecoveryPolicy::ReadOnly;
+    }
+
+    let reopened = LocalFileSystem::open_with_options(&root, options()).expect("reopen fs");
+    assert_eq!(reopened.generation(), committed_generation);
+    assert_eq!(
+        reopened
+            .read_file("/committed.txt")
+            .expect("published file survives reopen"),
+        b"committed"
+    );
+    assert!(matches!(
+        reopened.lookup("/failed.txt"),
+        Err(FileSystemError::NotFound { .. })
+    ));
+    drop(reopened);
+    cleanup(&root);
+}
+
+#[test]
+fn root_sync_failure_requires_reopen_before_further_mutation() {
     let root = temp_root("root-sync-failure-keeps-live-state");
     let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
     fs.create_file("/stable.txt", 0o644)
@@ -3710,16 +4091,126 @@ fn root_sync_failure_keeps_live_state_and_avoids_transaction_id_reuse() {
     assert!(fs.lookup("/uncertain.txt").is_ok());
     assert!(fs.transaction_superblock_exists_for_test(uncertain_generation));
 
-    fs.create_file("/after.txt", 0o644)
-        .expect("next mutation should not reuse the uncertain transaction id");
-    let after_generation = uncertain_generation.saturating_add(1);
-    assert_eq!(fs.stats().filesystem_generation, after_generation);
-    assert!(fs.transaction_superblock_exists_for_test(after_generation));
+    let sync_error = fs
+        .sync_all()
+        .expect_err("uncertain publication must reject same-mount sync");
+    assert!(matches!(sync_error, FileSystemError::CorruptState { .. }));
+    let mutation_error = fs
+        .create_file("/after.txt", 0o644)
+        .expect_err("uncertain publication must reject same-mount mutation");
+    assert!(matches!(
+        mutation_error,
+        FileSystemError::CorruptState { .. }
+    ));
+    assert!(matches!(
+        fs.lookup("/after.txt"),
+        Err(FileSystemError::NotFound { .. })
+    ));
+    fs.recovery_policy = RecoveryPolicy::ReadOnly;
+    drop(fs);
 
-    fs.sync_all().expect("sync reconciled state");
+    let mut reopened = LocalFileSystem::open_with_options(&root, options()).expect("reopen fs");
+    let selected_generation = reopened.stats().filesystem_generation;
+    assert!(
+        selected_generation == committed_generation || selected_generation == uncertain_generation,
+        "reopen must select only the old or uncertain root"
+    );
+    let uncertain_selected = reopened.lookup("/uncertain.txt").is_ok();
+    assert_eq!(
+        uncertain_selected,
+        selected_generation == uncertain_generation
+    );
+    assert!(matches!(
+        reopened.lookup("/after.txt"),
+        Err(FileSystemError::NotFound { .. })
+    ));
+
+    reopened
+        .create_file("/after.txt", 0o644)
+        .expect("mutation may resume after exact reopen");
+    assert!(reopened.stats().filesystem_generation > selected_generation);
+    reopened.sync_all().expect("sync post-reopen state");
+    drop(reopened);
+
+    let final_reopen = LocalFileSystem::open_with_options(&root, options()).expect("final reopen");
+    assert_eq!(
+        final_reopen.lookup("/uncertain.txt").is_ok(),
+        uncertain_selected
+    );
+    assert!(final_reopen.lookup("/after.txt").is_ok());
+    cleanup(&root);
+}
+
+#[test]
+fn threshold_flush_uncertain_publication_keeps_live_admission_and_requires_reopen() {
+    let root = temp_root("threshold-flush-uncertain-publication");
+    let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
+    let record = fs
+        .create_file("/data", DEFAULT_FILE_PERMISSIONS)
+        .expect("create data file");
+    fs.sync_all().expect("commit empty data file");
+    let old_generation = fs.generation();
+
+    fs.set_write_buffer_flush_threshold_bytes(2);
+    fs.write_file("/data", 0, b"A")
+        .expect("buffer first byte below threshold");
+    assert!(fs.write_buffers.contains_key(&record.inode_id));
+    let capacity_after_first = (
+        fs.capacity_authority().used_bytes(),
+        fs.capacity_authority().reserved_bytes(),
+        fs.capacity_authority().pending_bytes(),
+    );
+
+    inject_next_sync_failure_after_boundary(FilesystemCommitBoundary::RootCommitWritten);
+    let error = fs
+        .write_file("/data", 1, b"B")
+        .expect_err("threshold publication must report uncertain root sync");
+    assert!(matches!(
+        error,
+        FileSystemError::PublishOutcomeUncertain {
+            completed_boundary: FilesystemCommitBoundary::RootCommitWritten,
+            recovery_expectation: CrashRecoveryExpectation::OldOrNewCommittedRoot,
+            live_state_reconciled: true,
+            ..
+        }
+    ));
+    assert!(!fs.write_buffers.contains_key(&record.inode_id));
+    assert_eq!(
+        (
+            fs.capacity_authority().used_bytes(),
+            fs.capacity_authority().reserved_bytes(),
+            fs.capacity_authority().pending_bytes(),
+        ),
+        (
+            capacity_after_first.0 + 1,
+            capacity_after_first.1,
+            capacity_after_first.2 + 1,
+        ),
+        "the uncertain root keeps both capacity and pending ownership of the threshold-triggering byte"
+    );
+    let uncertain_generation = old_generation.saturating_add(1);
+    assert_eq!(fs.generation(), uncertain_generation);
+    assert!(matches!(
+        fs.sync_all(),
+        Err(FileSystemError::CorruptState { .. })
+    ));
+    assert!(matches!(
+        fs.write_file("/data", 2, b"C"),
+        Err(FileSystemError::CorruptState { .. })
+    ));
+
+    fs.recovery_policy = RecoveryPolicy::ReadOnly;
+    drop(fs);
+
     let reopened = LocalFileSystem::open_with_options(&root, options()).expect("reopen fs");
-    assert!(reopened.lookup("/uncertain.txt").is_ok());
-    assert!(reopened.lookup("/after.txt").is_ok());
+    let selected_generation = reopened.generation();
+    let selected_content = reopened.read_file("/data").expect("read selected root");
+    match selected_generation {
+        generation if generation == old_generation => assert!(selected_content.is_empty()),
+        generation if generation == uncertain_generation => assert_eq!(selected_content, b"AB"),
+        other => panic!("reopen selected generation outside old-or-new set: {other}"),
+    }
+    drop(reopened);
     cleanup(&root);
 }
 
@@ -3890,26 +4381,6 @@ fn auto_commit_disabled_batches_mutations() {
 }
 
 #[test]
-fn auto_commit_disabled_mutations_lost_on_unclean_shutdown() {
-    let root = temp_root("auto-commit-disabled-lost");
-    {
-        let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
-        fs.set_auto_commit(false);
-        fs.create_file("/uncommitted.txt", 0o644)
-            .expect("create uncommitted.txt");
-        // Drop without committing simulates unclean shutdown.
-    }
-    {
-        let fs = LocalFileSystem::open_with_options(&root, options()).expect("reopen fs");
-        assert!(matches!(
-            fs.lookup("/uncommitted.txt"),
-            Err(FileSystemError::NotFound { .. })
-        ));
-    }
-    cleanup(&root);
-}
-
-#[test]
 fn commit_is_idempotent_when_not_dirty() {
     let root = temp_root("commit-idempotent");
     let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
@@ -4057,6 +4528,104 @@ fn begin_transaction_then_commit_persists_mutations() {
 }
 
 #[test]
+fn transaction_commit_flushes_buffer_with_single_root_publication() {
+    let root = temp_root("transaction-buffer-single-publication");
+    let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
+    let record = fs
+        .create_file("/buffered", DEFAULT_FILE_PERMISSIONS)
+        .expect("create buffered file");
+    fs.sync_all().expect("commit empty file");
+    fs.set_write_buffer_flush_threshold_bytes(1024);
+    let publication_before = fs.root_publication_epoch;
+
+    fs.begin_transaction().expect("begin transaction");
+    fs.write_file("/buffered", 0, b"transaction-data")
+        .expect("buffer transaction data");
+    assert!(fs.write_buffers.contains_key(&record.inode_id));
+    fs.commit_transaction()
+        .expect("publish transaction buffer once");
+
+    assert_eq!(
+        fs.root_publication_epoch,
+        publication_before.wrapping_add(1),
+        "flushing inside do_commit must not recursively publish the caller-owned mutation"
+    );
+    assert!(!fs.write_buffers.contains_key(&record.inode_id));
+    assert!(fs.mutation_delta.is_none());
+    assert!(!fs.in_transaction);
+    let extents = fs.lookup_extents(record.inode_id.get(), 0, 16);
+    assert_eq!(extents.len(), 1);
+    assert!(extents[0].is_data());
+    assert_eq!(
+        extents[0].checksum,
+        *blake3::hash(b"transaction-data").as_bytes()
+    );
+
+    drop(fs);
+    let reopened = LocalFileSystem::open_with_options(&root, options()).expect("reopen fs");
+    assert_eq!(
+        reopened
+            .read_file("/buffered")
+            .expect("read committed transaction data"),
+        b"transaction-data"
+    );
+    drop(reopened);
+    cleanup(&root);
+}
+
+#[test]
+fn unsupported_batch_fallback_preserves_preexisting_transaction_mutation() {
+    let root = temp_root("unsupported-batch-preserves-transaction");
+    let mut initial = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
+    let (staged, _path, target_inode, empty) = stage_probe_file_state(&initial, b"empty", b"");
+    let staged_record = staged
+        .inodes
+        .get(&target_inode)
+        .expect("staged inline target");
+    initial
+        .store
+        .put(
+            DeviceIoClass::Data,
+            content_object_key_for_version(target_inode, staged_record.data_version),
+            &encode_content(staged_record, &empty),
+        )
+        .expect("place inline target through Pool authority");
+    persist_state_with_pool(&mut initial.store, &staged, initial.root_authentication_key)
+        .expect("commit inline target fixture");
+    drop(initial);
+
+    let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("reopen fixture");
+    let target_record = fs.stat("/empty").expect("stat empty target");
+    assert!(matches!(
+        fs.read_committed_content_layout_cached(target_inode, &target_record)
+            .expect("read empty target layout"),
+        ContentLayout::Inline(_)
+    ));
+
+    fs.set_auto_commit(false);
+    fs.set_write_buffer_flush_threshold_bytes(1);
+    fs.begin_transaction().expect("begin transaction");
+    fs.create_file("/kept", DEFAULT_FILE_PERMISSIONS)
+        .expect("create earlier transaction file");
+    fs.write_file("/empty", 0, b"X")
+        .expect("fallback write to inline content");
+    assert!(fs.in_transaction);
+    assert!(fs.lookup("/kept").is_ok());
+    assert_eq!(fs.read_file("/empty").expect("read fallback write"), b"X");
+    fs.commit_transaction().expect("commit whole transaction");
+    drop(fs);
+
+    let reopened = LocalFileSystem::open_with_options(&root, options()).expect("reopen fs");
+    assert!(reopened.lookup("/kept").is_ok());
+    assert_eq!(
+        reopened.read_file("/empty").expect("read committed target"),
+        b"X"
+    );
+    drop(reopened);
+    cleanup(&root);
+}
+
+#[test]
 fn begin_transaction_then_rollback_discards_mutations() {
     let root = temp_root("begin-then-rollback");
     let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
@@ -4115,31 +4684,54 @@ fn rollback_without_transaction_is_rejected() {
 }
 
 #[test]
-fn fsync_data_only_persists_content_without_metadata() {
-    let root = temp_root("fsync-data-only");
-    let content = b"dsync content";
-    let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
-    fs.set_auto_commit(false);
-    fs.create_file("/dsync.txt", 0o644)
-        .expect("create dsync.txt");
-    fs.write_file("/dsync.txt", 0, content)
-        .expect("write dsync.txt");
-    // Metadata is dirty (new inode, dir entry), content is dirty.
-    assert!(fs.has_dirty_metadata());
-    fs.fsync_data_only().expect("fsync data only");
-    // Content was synced to disk but metadata may still be dirty.
-    // Data survives reopen if we force-commit via another path.
-    drop(fs);
-    // Without a metadata commit, the file may not be reachable.
-    // But if we reopen and commit, the content objects are present.
-    // Test: reopen and verify that a subsequent metadata commit
-    // makes the file reachable.
+fn fdatasync_retained_intent_survives_reopen_then_full_commit_clears_it() {
+    let root = temp_root("fdatasync-retained-intent-reopen");
+    let payload = b"fdatasync retained intent payload";
+
     {
-        let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("reopen fs");
-        fs.set_auto_commit(false);
-        // File should not be reachable yet (metadata wasn't committed).
-        assert!(fs.lookup("/dsync.txt").is_err());
+        let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
+        let inode = fs
+            .create_file("/fdatasynced", 0o644)
+            .expect("create committed file");
+        fs.sync_write_intent(
+            inode.inode_id,
+            0,
+            payload.len() as u64,
+            checksum64(payload),
+            payload,
+        )
+        .expect("record sync-write intent");
+        fs.fsync_data_only_file("/fdatasynced")
+            .expect("fdatasync file");
+        assert_eq!(fs.intent_log.len(), 1);
+        fs.recovery_policy = RecoveryPolicy::ReadOnly;
     }
+
+    {
+        let mut reopened =
+            LocalFileSystem::open_with_options(&root, options()).expect("reopen intent");
+        assert_eq!(
+            reopened
+                .read_file("/fdatasynced")
+                .expect("read replayed fdatasync payload"),
+            payload
+        );
+        assert_eq!(reopened.intent_log.len(), 1);
+        reopened
+            .commit()
+            .expect("publish replayed fdatasync payload");
+        assert!(reopened.intent_log.is_empty());
+    }
+
+    let reopened =
+        LocalFileSystem::open_with_options(&root, options()).expect("reopen published payload");
+    assert_eq!(
+        reopened
+            .read_file("/fdatasynced")
+            .expect("read published fdatasync payload"),
+        payload
+    );
+    assert!(reopened.intent_log.is_empty());
     cleanup(&root);
 }
 
@@ -4489,37 +5081,28 @@ fn invalid_transaction_manifest_makes_newer_root_candidate_unselectable() {
 
     let (staged, candidate_path, inode_id, new_bytes) =
         stage_probe_file_state(&fs, b"candidate.txt", b"candidate after bad manifest");
-    write_staged_content(
-        fs.store.primary_store_mut().raw_store_mut(),
+    write_staged_pool_content(&mut fs.store, &staged, inode_id, &new_bytes);
+    let boundary = persist_state_with_pool_until_boundary(
+        &mut fs.store,
         &staged,
-        inode_id,
-        &new_bytes,
-    );
-    let root_commit = persist_transaction_objects(
-        fs.store.primary_store_mut().raw_store_mut(),
-        &staged,
-        staged.generation,
+        fs.root_authentication_key,
+        Some(FilesystemCommitBoundary::RootCommitWritten),
     )
-    .expect("write newer transaction objects");
+    .expect("publish newer root before corrupting its manifest");
+    assert_eq!(boundary, FilesystemCommitBoundary::RootCommitWritten);
     fs.store
+        .raw_primary_store_mut()
         .put(
-            DeviceIoClass::Data,
-            transaction_manifest_object_key(root_commit.transaction_id),
+            transaction_manifest_object_key(staged.generation),
             b"corrupt manifest bytes",
         )
         .expect("overwrite transaction manifest with corrupt bytes");
-    publish_root_commit(
-        fs.store.primary_store_mut().raw_store_mut(),
-        &root_commit,
-        fs.root_authentication_key,
-    )
-    .expect("publish newer root commit");
     fs.store
         .sync_all()
         .expect("sync corrupt manifest candidate");
     drop(fs);
 
-    let reopened = LocalFileSystem::open_with_options(&root, options())
+    let mut reopened = LocalFileSystem::open_with_options(&root, options())
         .expect("reopen previous committed root");
     assert_eq!(reopened.stats().filesystem_generation, committed_generation);
     assert_eq!(
@@ -4530,13 +5113,14 @@ fn invalid_transaction_manifest_makes_newer_root_candidate_unselectable() {
         reopened.read_file(&candidate_path),
         Err(FileSystemError::NotFound { .. })
     ));
-    drop(reopened);
-
-    let report = LocalFileSystem::probe_recovery(&root, options()).expect("probe recovery");
+    let report = reopened
+        .recovery_probe_report()
+        .expect("probe mounted recovery store");
     assert_eq!(report.outcome, RecoveryProbeOutcome::SelectedCommittedRoot);
     assert!(report.skipped_root_candidates >= 1);
     assert_eq!(report.selected_generation, Some(committed_generation));
     assert!(!report.production_recovery_requires_operator_repair());
+    drop(reopened);
     cleanup(&root);
 }
 
@@ -5566,116 +6150,6 @@ fn intent_log_empty_after_fresh_mount_and_commit() {
 }
 
 #[test]
-fn sync_write_intent_appends_and_commit_clears() {
-    let root = temp_root("intent-log-append");
-    let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
-    assert!(fs.intent_log.is_empty());
-
-    let rec = fs.create_file("/f", 0o644).expect("create");
-    let ino = rec.inode_id;
-    fs.write_file("/f", 0, b"payload data").expect("write");
-    assert!(
-        fs.intent_log.is_empty(),
-        "ordinary write_file stays on the buffered dirty path"
-    );
-    fs.commit().expect("commit content");
-    assert!(
-        fs.intent_log.is_empty(),
-        "committing normal content does not create intent-log raw state"
-    );
-
-    let digest = IntegrityDigest64(0xCAFE1234);
-    let reply = fs
-        .sync_write_intent(ino, 0, 12, digest, b"payload data")
-        .expect("sync_write_intent");
-    assert_eq!(reply, IntentLogReplyState::IntentDurable);
-    assert_eq!(fs.intent_log.len(), 1);
-
-    // Commit clears the intent log
-    fs.commit().expect("commit");
-    assert!(fs.intent_log.is_empty());
-
-    cleanup(&root);
-}
-
-#[test]
-fn sync_write_intent_replays_on_reopen() {
-    let root = temp_root("intent-log-replay");
-
-    // Phase 1: write data via normal path, record intent, drop without commit
-    {
-        let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
-        let rec = fs.create_file("/f", 0o644).expect("create");
-        let ino = rec.inode_id;
-        fs.commit().expect("commit inode");
-        // Write data through normal path but don't commit — intent log preserves it
-        fs.write_file("/f", 0, b"sync data").expect("write");
-
-        let digest = IntegrityDigest64(0xBEEF);
-        let reply = fs
-            .sync_write_intent(ino, 0, 9, digest, b"sync data")
-            .expect("sync_write_intent");
-        assert_eq!(reply, IntentLogReplyState::IntentDurable);
-        assert_eq!(fs.intent_log.len(), 1);
-        // Drop without commit — simulates crash
-    }
-
-    // Phase 2: reopen — intent log replays on mount and should be empty
-    {
-        let fs = LocalFileSystem::open_with_options(&root, options()).expect("reopen fs");
-        assert!(
-            fs.intent_log.is_empty(),
-            "intent log should be empty after mount replay"
-        );
-        // Data written through normal path should still be accessible
-        let content = fs.read_file("/f").expect("read after replay");
-        assert_eq!(content, b"sync data");
-    }
-
-    cleanup(&root);
-}
-
-#[test]
-fn intent_log_clear_persists_across_clean_shutdown() {
-    let root = temp_root("intent-log-clear");
-
-    {
-        let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
-        let rec = fs.create_file("/f", 0o644).expect("create");
-        let ino = rec.inode_id;
-        fs.write_file("/f", 0, b"data").expect("write");
-        assert!(
-            fs.intent_log.is_empty(),
-            "ordinary write_file stays on the buffered dirty path"
-        );
-        fs.commit().expect("commit content");
-        assert!(
-            fs.intent_log.is_empty(),
-            "committing normal content does not create intent-log raw state"
-        );
-
-        let digest = IntegrityDigest64(0xABCD);
-        fs.sync_write_intent(ino, 0, 4, digest, b"data")
-            .expect("sync_write_intent");
-        assert_eq!(fs.intent_log.len(), 1);
-
-        // sync_all commits and clears the intent log
-        fs.sync_all().expect("sync_all");
-        assert!(fs.intent_log.is_empty());
-    }
-
-    {
-        let fs = LocalFileSystem::open_with_options(&root, options()).expect("reopen fs");
-        assert!(
-            fs.intent_log.is_empty(),
-            "intent log should remain empty after clean shutdown"
-        );
-    }
-
-    cleanup(&root);
-}
-
-#[test]
 fn multiple_intent_entries_replay_on_mount() {
     let root = temp_root("intent-log-multi");
 
@@ -5690,24 +6164,24 @@ fn multiple_intent_entries_replay_on_mount() {
         fs.write_file("/a", 0, b"alpha").expect("write a");
         fs.write_file("/b", 0, b"beta").expect("write b");
 
-        let d1 = IntegrityDigest64(1);
+        let d1 = checksum64(b"alpha");
         fs.sync_write_intent(ino_a, 0, 5, d1, b"alpha")
             .expect("intent 1");
-        let d2 = IntegrityDigest64(2);
+        let d2 = checksum64(b"beta");
         fs.sync_write_intent(ino_b, 0, 4, d2, b"beta")
             .expect("intent 2");
         assert_eq!(fs.intent_log.len(), 2);
-        // Drop without commit
+        // Test-only unclean close: keep the durable entries out of Drop's
+        // normal committed-root publication path.
+        fs.recovery_policy = RecoveryPolicy::ReadOnly;
     }
 
     {
-        let fs = LocalFileSystem::open_with_options(&root, options()).expect("reopen fs");
-        assert!(
-            fs.intent_log.is_empty(),
-            "intent log should replay and clear multiple entries"
-        );
+        let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("reopen fs");
+        assert_eq!(fs.intent_log.len(), 2);
         assert_eq!(fs.read_file("/a").expect("read a"), b"alpha");
         assert_eq!(fs.read_file("/b").expect("read b"), b"beta");
+        fs.recovery_policy = RecoveryPolicy::ReadOnly;
     }
 
     cleanup(&root);
@@ -5715,12 +6189,11 @@ fn multiple_intent_entries_replay_on_mount() {
 
 // ── Intent log dirty-commit invariants (#863) ───────────────────────────────
 //
-// Acknowledged intent log entries must survive until a state commit.
-// sync_write_intent must mark state dirty; do_commit must not clear
-// the intent log without persisting state first.
+// Acknowledged intent log entries must survive until replay publishes them.
+// Intent admission itself must not fabricate an unreadable content version.
 
 #[test]
-fn sync_write_intent_marks_state_dirty() {
+fn sync_write_intent_stays_log_only_until_commit_replay() {
     let root = temp_root("intent-dirty-mark");
     let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
     fs.set_auto_commit(false);
@@ -5732,112 +6205,51 @@ fn sync_write_intent_marks_state_dirty() {
     assert!(!fs.has_dirty_metadata());
     assert!(fs.intent_log.is_empty());
 
-    // sync_write_intent must mark the inode dirty.
-    let digest = IntegrityDigest64(0xDEAD);
+    let committed = fs.stat("/f").expect("stat committed file");
+    let digest = checksum64(b"next");
     let reply = fs
-        .sync_write_intent(f_rec.inode_id, 0, 4, digest, b"data")
+        .sync_write_intent(f_rec.inode_id, 0, 4, digest, b"next")
         .expect("sync_write_intent");
     assert_eq!(reply, IntentLogReplyState::IntentDurable);
-    assert!(
-        fs.has_dirty_metadata(),
-        "sync_write_intent must mark state dirty"
-    );
+    assert!(!fs.has_dirty_metadata());
+    assert_eq!(fs.stat("/f").expect("stat intent-only file"), committed);
     assert_eq!(fs.intent_log.len(), 1);
 
-    // Commit must persist state and clear the intent log.
+    // Commit replays the acknowledged range through Pool, then clears the log.
     fs.commit().expect("commit");
     assert!(fs.intent_log.is_empty());
     assert!(!fs.has_dirty_metadata());
+    assert_eq!(fs.read_file("/f").expect("read replayed data"), b"next");
 
     cleanup(&root);
 }
 
 #[test]
-fn do_commit_replays_and_clears_intent_log_when_state_clean() {
-    // Simulates the #863 data-loss scenario: intent log entries exist
-    // but state is clean. do_commit() must replay the log into a state
-    // commit before clearing it.
-    //
-    // Auto-commit is disabled so we control exactly when commits fire.
-    let root = temp_root("intent-no-clear-clean");
+fn sync_write_intent_refuses_uncommitted_or_missing_inode_before_writes() {
+    let root = temp_root("intent-requires-committed-inode");
     let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
     fs.set_auto_commit(false);
+    let uncommitted = fs
+        .create_file("/new", 0o644)
+        .expect("create uncommitted file");
+    let payload_key = intent_log_data_object_key(fs.intent_log.next_entry_id());
 
-    // Write some data to dirty the state, then commit to make it clean.
-    let f_rec = fs.create_file("/f", 0o644).expect("create");
-    fs.write_file("/f", 0, b"olddata").expect("write");
-    fs.commit().expect("commit write");
+    let reply = fs
+        .sync_write_intent(uncommitted.inode_id, 0, 4, checksum64(b"data"), b"data")
+        .expect("uncommitted inode is a normal full-commit fallback");
+    assert_eq!(reply, IntentLogReplyState::Refused);
     assert!(fs.intent_log.is_empty());
-    assert!(!fs.has_dirty_metadata(), "state must be clean after commit");
+    assert!(!fs.store.raw_primary_store().contains_key(payload_key));
 
-    // Append an intent log entry directly — no dirty marks from
-    // sync_write_intent, simulating a race with a clean commit.
-    fs.intent_log
-        .write_next_data_payload(&mut fs.store, b"payload")
-        .expect("write intent payload");
-    let root_anchor = IntentLogRootAnchor {
-        transaction_id: fs.state.generation,
-        generation: fs.state.generation,
-        manifest_digest: IntegrityDigest64(0),
-    };
-    let accepted = fs
-        .intent_log
-        .append(
-            fs.store.primary_store_mut().raw_store_mut(),
-            IntentLogEntryKind::SyncWriteRange {
-                inode_id: f_rec.inode_id,
-                offset: 0,
-                length: 7,
-                payload_digest: IntegrityDigest64(0xCAFE),
-                data_version: 0,
-            },
-            root_anchor,
-            0,
-        )
-        .expect("append intent");
-    assert!(accepted, "intent log append must be accepted");
-    assert_eq!(fs.intent_log.len(), 1);
-    assert!(!fs.has_dirty_metadata(), "state must still be clean");
-
-    // do_commit() must not drop the intent. It replays the log into the
-    // state commit, then clears the redundant log records.
-    fs.commit().expect("commit while clean");
+    let missing = InodeId::new(u64::MAX);
+    assert!(matches!(
+        fs.sync_write_intent(missing, 0, 4, checksum64(b"data"), b"data"),
+        Err(FileSystemError::NotFound { .. })
+    ));
     assert!(fs.intent_log.is_empty());
-    assert!(!fs.has_dirty_metadata());
-    let content = fs.read_file("/f").expect("read replayed content");
-    assert_eq!(content, b"payload");
+    assert!(!fs.store.raw_primary_store().contains_key(payload_key));
 
-    cleanup(&root);
-}
-
-#[test]
-fn do_commit_clears_intent_log_after_state_persist() {
-    // Normal path: sync_write_intent dirties state → commit persists
-    // and clears the intent log.
-    let root = temp_root("intent-clear-after-persist");
-    let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
-    fs.set_auto_commit(false);
-    let f_rec = fs.create_file("/f", 0o644).expect("create");
-    fs.write_file("/f", 0, b"committed data").expect("write");
-    fs.commit().expect("commit initial content");
-    assert!(fs.intent_log.is_empty());
-    assert!(!fs.has_dirty_metadata());
-
-    let digest = IntegrityDigest64(0xFEED);
-    fs.sync_write_intent(f_rec.inode_id, 0, 14, digest, b"committed data")
-        .expect("sync_write_intent");
-    assert_eq!(fs.intent_log.len(), 1);
-    assert!(fs.has_dirty_metadata());
-
-    // Commit: state is dirty → persist + clear intent log.
-    fs.commit().expect("commit");
-    assert!(fs.intent_log.is_empty());
-    assert!(!fs.has_dirty_metadata());
-
-    // Data survived the commit.
-    let content = fs.read_file("/f").expect("read after commit");
-    assert_eq!(content, b"committed data");
-
+    fs.recovery_policy = RecoveryPolicy::ReadOnly;
     cleanup(&root);
 }
 
@@ -6694,6 +7106,139 @@ fn reflink_file_large_content() {
 }
 
 #[test]
+fn reflink_rejects_receiptless_source_authority_without_destination_state() {
+    for missing_authority in ["manifest", "chunk"] {
+        let root = temp_root(&format!("reflink-receiptless-{missing_authority}"));
+        let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
+        fs.set_dedup_enabled(false);
+        fs.create_file("/source.bin", 0o644).expect("create source");
+        let source_bytes: Vec<u8> = (0..content_chunk_size() as usize)
+            .map(|index| (index % 251) as u8)
+            .collect();
+        fs.write_file("/source.bin", 0, &source_bytes)
+            .expect("write source chunk");
+        fs.sync_all().expect("commit source");
+        fs.set_auto_commit(false);
+
+        let source_record = fs.stat("/source.bin").expect("stat source");
+        let _ = fs
+            .read_committed_content_layout_cached(source_record.inode_id, &source_record)
+            .expect("prime decoded source-layout cache");
+        let manifest = current_content_manifest(&fs, "/source.bin");
+        let source_chunk_ref = manifest
+            .chunks
+            .iter()
+            .find(|chunk| !chunk.is_hole())
+            .cloned()
+            .expect("source has a materialized chunk");
+        let source_chunk_key = content_chunk_object_key_for_version(
+            source_record.inode_id,
+            source_chunk_ref.data_version,
+            source_chunk_ref.chunk_index,
+        );
+        let (missing_key, expected_generation) = match missing_authority {
+            "manifest" => (
+                content_object_key_for_version(source_record.inode_id, source_record.data_version),
+                0,
+            ),
+            "chunk" => (
+                source_chunk_key,
+                source_chunk_ref.placement_receipt_generation,
+            ),
+            _ => unreachable!("bounded reflink authority case"),
+        };
+        let raw_substitute = stage_receiptless_raw_object_substitute(&mut fs, missing_key);
+        if missing_authority == "chunk" {
+            assert_eq!(checksum64(&raw_substitute), source_chunk_ref.checksum);
+        }
+
+        let stats_before = fs.stats();
+        let accounting_before = fs.state.space_accounting.clone();
+        let capacity_before = (
+            fs.capacity_authority().used_bytes(),
+            fs.capacity_authority().reserved_bytes(),
+            fs.capacity_authority().pending_bytes(),
+        );
+        let source_extents_before =
+            fs.lookup_extents(source_record.inode_id.get(), 0, source_record.size);
+        let root_entries_before = fs.list_dir("/").expect("list root before reflink");
+        let planned_dest_inode = fs.next_inode_id();
+        let planned_generation = next_generation_after(fs.generation());
+        let planned_manifest_key =
+            content_object_key_for_version(planned_dest_inode, planned_generation);
+        let planned_chunk_key = content_chunk_object_key_for_version(
+            planned_dest_inode,
+            planned_generation,
+            source_chunk_ref.chunk_index,
+        );
+        let candidate_root_key = root_slot_object_key(root_slot_for_transaction(
+            planned_generation.max(ROOT_COMMIT_MIN_TRANSACTION_ID),
+        ));
+        let root_locations_before = fs
+            .store
+            .raw_primary_store()
+            .version_locations_of(candidate_root_key);
+
+        let error = fs
+            .reflink_file("/source.bin", "/dest.bin")
+            .expect_err("receiptless source must not be cloned");
+        assert!(matches!(
+            error,
+            FileSystemError::ReceiptAuthorityMissing {
+                object_key,
+                expected_generation: observed_generation,
+            } if object_key == missing_key && observed_generation == expected_generation
+        ));
+        assert!(matches!(
+            fs.lookup("/dest.bin"),
+            Err(FileSystemError::NotFound { .. })
+        ));
+        assert_eq!(
+            fs.stat("/source.bin").expect("stat source after refusal"),
+            source_record
+        );
+        assert_eq!(fs.stats(), stats_before);
+        assert_eq!(fs.state.space_accounting, accounting_before);
+        assert_eq!(
+            (
+                fs.capacity_authority().used_bytes(),
+                fs.capacity_authority().reserved_bytes(),
+                fs.capacity_authority().pending_bytes(),
+            ),
+            capacity_before
+        );
+        assert_eq!(
+            fs.lookup_extents(source_record.inode_id.get(), 0, source_record.size),
+            source_extents_before
+        );
+        assert_eq!(
+            fs.list_dir("/").expect("list root after refused reflink"),
+            root_entries_before
+        );
+        assert!(fs.mutation_delta.is_none());
+        for candidate_key in [planned_manifest_key, planned_chunk_key] {
+            assert!(fs
+                .store
+                .placement_receipt_for_key(DeviceIoClass::Data, candidate_key)
+                .expect("inspect planned destination receipt")
+                .is_none());
+            assert!(!fs.store.raw_primary_store().contains_key(candidate_key));
+        }
+        assert_eq!(
+            fs.store
+                .raw_primary_store()
+                .version_locations_of(candidate_root_key),
+            root_locations_before,
+            "refused reflink appended a root candidate"
+        );
+
+        fs.recovery_policy = RecoveryPolicy::ReadOnly;
+        drop(fs);
+        cleanup(&root);
+    }
+}
+
+#[test]
 fn format_version_new_superblock_has_current_version() {
     let superblock = SuperblockRecord {
         next_inode_id: 2,
@@ -6855,15 +7400,14 @@ fn mounted_open_recovery_authority_raw_only_initializes_empty_pool() {
             MountedOpenRecoveryTransformMode::RawOnlyNoDeviceTransforms
         );
 
-        let mut state = authority
+        let recovered = authority
             .load_or_initialize_state()
             .expect("initialize state through mounted open/recovery authority");
+        let intent_log = recovered.intent_log;
+        let mut state = recovered.state;
         authority.merge_space_counters_into(&mut state);
         authority.merge_dataset_usage_into(&mut state);
 
-        let intent_log = authority
-            .load_operational_intent_log()
-            .expect("load intent log through authority");
         assert!(
             intent_log.is_empty(),
             "new pool should not have pending intent-log entries"
@@ -8206,205 +8750,6 @@ fn debug_incremental_validate() {
     cleanup(&target_root);
 }
 
-#[test]
-fn fsync_file_takes_fast_path_when_intents_pending() {
-    // When intent log has pending data entries for the fsync'd inode,
-    // fsync_file should flush the intent log (fast path) instead of
-    // performing a full do_commit().
-    let root = temp_root("fsync-fastpath-file");
-    let content = b"fast path data";
-    {
-        let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
-        fs.set_auto_commit(false);
-        let rec = fs.create_file("/data.bin", 0o644).expect("create");
-        let ino = rec.inode_id;
-        fs.commit().expect("commit inode");
-
-        // Write data and record a sync write intent, which puts the
-        // inode in the intent log.
-        fs.write_file("/data.bin", 0, content).expect("write");
-        let digest = IntegrityDigest64(0xFA57);
-        let reply = fs
-            .sync_write_intent(ino, 0, content.len() as u64, digest, content)
-            .expect("sync_write_intent");
-        assert_eq!(reply, IntentLogReplyState::IntentDurable);
-        // After sync_write_intent, entries are flushed to LOG_DEVICE but
-        // remain in the intent log until do_commit() clears them.
-        // pending_flush_count() is 0 because sync() already flushed,
-        // but !is_empty() is true because entries are not cleared.
-        let has_entries = !fs.intent_log.is_empty();
-        assert!(
-            has_entries,
-            "intent log should have entries after sync_write_intent"
-        );
-
-        // fsync_file should take the fast path: flush_and_sync (no-op since
-        // already flushed) and return without doing a full do_commit.
-        fs.fsync_file("/data.bin").expect("fsync_file fast path");
-
-        // After fsync_file fast path, intent log entries are still present
-        // (they were flushed to LOG_DEVICE but not cleared — only do_commit clears).
-        assert!(
-            !fs.intent_log.is_empty(),
-            "intent log should NOT be cleared by fast path; only full commit clears"
-        );
-        // State should still be dirty — fast path does not persist state.
-        assert!(
-            fs.is_state_dirty(),
-            "state should remain dirty after fast path fsync"
-        );
-    }
-    // Reopen: intent log replays, data survives.
-    {
-        let fs = LocalFileSystem::open_with_options(&root, options()).expect("reopen fs");
-        let buf = fs.read_file("/data.bin").expect("read after reopen");
-        assert_eq!(
-            &buf[..],
-            &content[..],
-            "written data should survive crash via intent log replay"
-        );
-        assert!(
-            fs.intent_log.is_empty(),
-            "intent log should be empty after mount replay"
-        );
-    }
-    cleanup(&root);
-}
-
-#[test]
-fn fsync_file_falls_back_to_do_commit_when_no_intents_pending() {
-    // When intent log has no entries for the fsync'd file, the fast path
-    // check fails and fsync_file falls through to do_commit().
-    let root = temp_root("fsync-fallback-do-commit");
-    let content = b"fallback data";
-    {
-        let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
-        fs.set_auto_commit(false);
-        fs.create_file("/data.bin", 0o644).expect("create");
-        fs.write_file("/data.bin", 0, content).expect("write");
-        // No sync_write_intent called — intent log has no entries for this inode.
-        assert!(fs.intent_log.is_empty());
-
-        fs.fsync_file("/data.bin").expect("fsync_file fallback");
-
-        // After full commit, intent log is empty and state is clean.
-        assert!(fs.intent_log.is_empty());
-        assert!(
-            !fs.is_state_dirty(),
-            "state should be clean after do_commit fallback"
-        );
-    }
-    {
-        let fs = LocalFileSystem::open_with_options(&root, options()).expect("reopen fs");
-        let buf = fs.read_file("/data.bin").expect("read after reopen");
-        assert_eq!(&buf[..], &content[..]);
-    }
-    cleanup(&root);
-}
-
-#[test]
-fn fsync_data_only_takes_fast_path_when_intents_pending() {
-    // When intent log has any pending entries, fsync_data_only flushes
-    // them instead of walking dirty inodes individually.
-    let root = temp_root("fsync-dataonly-fastpath");
-    let content = b"data only fast path";
-    {
-        let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
-        fs.set_auto_commit(false);
-        let rec = fs.create_file("/data.bin", 0o644).expect("create");
-        let ino = rec.inode_id;
-        fs.commit().expect("commit inode");
-
-        fs.write_file("/data.bin", 0, content).expect("write");
-        let digest = IntegrityDigest64(0xDA7A);
-        fs.sync_write_intent(ino, 0, content.len() as u64, digest, content)
-            .expect("sync_write_intent");
-
-        assert!(!fs.intent_log.is_empty());
-        assert!(fs.is_state_dirty());
-
-        fs.fsync_data_only().expect("fsync_data_only fast path");
-
-        // Fast path flushed intent log but did NOT clear it or clean state.
-        assert!(
-            !fs.intent_log.is_empty(),
-            "intent log NOT cleared by fast path"
-        );
-        assert!(fs.is_state_dirty(), "state still dirty after fast path");
-    }
-    // Reopen verifies data survived via intent log replay.
-    {
-        let fs = LocalFileSystem::open_with_options(&root, options()).expect("reopen fs");
-        let buf = fs.read_file("/data.bin").expect("read after reopen");
-        assert_eq!(&buf[..], &content[..]);
-    }
-    cleanup(&root);
-}
-
-#[test]
-fn fsync_directory_takes_fast_path_for_namespace_intents() {
-    // When intent log has NamespaceSyncIntent entries for a directory,
-    // fsync_directory flushes them (fast path) instead of do_commit().
-    let root = temp_root("fsync-dir-fastpath");
-    {
-        let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
-        fs.set_auto_commit(false);
-        let dir_rec = fs.create_dir("/mydir", 0o755).expect("mkdir");
-        let dir_ino = dir_rec.inode_id;
-
-        // Create a file inside the directory — this dirties the dir.
-        fs.create_file("/mydir/file.txt", 0o644)
-            .expect("create file in dir");
-
-        // Record a NamespaceSyncIntent for the directory.
-        // This simulates what would happen during mkdir/unlink/rename
-        // operations that go through the namespace fast path.
-        let root_anchor = IntentLogRootAnchor {
-            transaction_id: fs.state.generation.max(1),
-            generation: fs.state.generation,
-            manifest_digest: IntegrityDigest64(0),
-        };
-        let timestamp_ns = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
-        let file_ino = InodeId::new(dir_ino.get() + 1);
-        let accepted = fs
-            .intent_log
-            .append(
-                fs.store.primary_store_mut().raw_store_mut(),
-                IntentLogEntryKind::NamespaceSyncIntent {
-                    parent_inode_id: dir_ino,
-                    affected_inode_ids: vec![file_ino],
-                    link_count_deltas: vec![(file_ino, 1)],
-                },
-                root_anchor,
-                timestamp_ns,
-            )
-            .expect("append namespace intent");
-        assert!(accepted, "namespace intent should be accepted");
-
-        // Fast path: has_pending_namespace_for_dir should return true.
-        assert!(
-            fs.intent_log.has_pending_namespace_for_dir(dir_ino),
-            "should detect pending namespace intent for dir"
-        );
-
-        fs.fsync_directory("/mydir")
-            .expect("fsync_directory fast path");
-
-        // After fast path, intent log still has entries (not cleared).
-        assert!(
-            !fs.intent_log.is_empty(),
-            "intent log NOT cleared by fast path"
-        );
-    }
-    // NOTE: NamespaceSyncIntent replay is not yet wired (see
-    // intent_log.rs replay_entries_against_state).  Once wired, add a
-    // reopen + verify step here to confirm directory entries survive.
-    cleanup(&root);
-}
-
 // ── Space accounting integration tests ─────────────────────────────
 
 #[test]
@@ -9001,46 +9346,1238 @@ fn quorum_reopen_with_quorum_persists_across_both() {
 
 #[test]
 fn block_device_reopen_after_sync_persists_file_data() {
-    let root = temp_root("block-device-reopen-meta");
-    let dev0 = temp_root("block-device-reopen-dev0");
-    let dev1 = temp_root("block-device-reopen-dev1");
-    std::fs::create_dir_all(&root).expect("create metadata dir");
-    for dev in [&dev0, &dev1] {
-        let file = std::fs::File::create(dev).expect("create block-device image");
-        file.set_len(8 * 1024 * 1024)
-            .expect("size block-device image");
-    }
-
-    let devices = vec![dev0.clone(), dev1.clone()];
-    let payload = b"block-device persistence payload";
+    let fixture = TwoDeviceBlockFixture::new("block-device-reopen");
+    let selected;
     {
-        let mut fs = LocalFileSystem::open_with_block_devices(
-            &root,
-            &devices,
-            options(),
-            RootAuthenticationKey::demo_key(),
-        )
-        .expect("open block-device fs");
-        fs.create_file("/persist", 0o644).expect("create file");
-        fs.write_file("/persist", 0, payload).expect("write file");
+        let mut fs = fixture.open();
+        fs.set_auto_commit(false);
+
+        let mut placed_away_from_primary = None;
+        for candidate in 0..64_u8 {
+            let path = format!("/persist-{candidate}");
+            let payload = format!("block-device persistence payload {candidate}").into_bytes();
+            fs.create_file(&path, 0o644).expect("create file");
+            fs.write_file(&path, 0, &payload).expect("write file");
+            let inode_id = fs.stat(&path).expect("stat candidate file").inode_id;
+            fs.flush_write_buffer(inode_id)
+                .expect("flush candidate through Pool placement");
+            let inode = fs.stat(&path).expect("stat flushed candidate file");
+            if content_manifest_away_from_raw_primary(&fs.store, &inode).is_some() {
+                placed_away_from_primary = Some((path, payload));
+                break;
+            }
+        }
+        selected = placed_away_from_primary
+            .expect("deterministic candidate set must place content away from the raw primary");
+
+        // Publish all buffered candidate state once, after selecting a file
+        // whose content placement excludes the raw primary.
         fs.sync_all().expect("sync fs");
+        fs.create_dir("/metadata-only", 0o755)
+            .expect("create metadata-only recommit");
+        fs.sync_all().expect("sync metadata-only recommit");
     }
 
     {
-        let fs = LocalFileSystem::open_with_block_devices(
-            &root,
-            &devices,
+        let fs = fixture.open();
+        let read_back = fs
+            .read_file(&selected.0)
+            .expect("read placed file after reopen");
+        assert_eq!(read_back, selected.1);
+    }
+}
+
+#[test]
+fn block_device_v0390_import_promotes_content_to_pool_receipts() {
+    let fixture = TwoDeviceBlockFixture::new("block-device-v0390-import");
+    let payload = b"fixed-object import content promoted through Pool";
+    let conflicting_payload = vec![b'X'; payload.len()];
+    let (staged, path, inode_id, _) =
+        stage_probe_file_state_from_state(&initial_state(), b"imported", payload);
+
+    {
+        let mut pool = fixture.open_pool();
+        let (_, superblock_bytes) = root_for_staged_state(
+            &staged,
+            staged.generation.max(ROOT_COMMIT_MIN_TRANSACTION_ID),
+        );
+        let raw = pool.raw_primary_store_mut();
+        raw.put(superblock_object_key(), &superblock_bytes)
+            .expect("stage fixed superblock");
+        for inode in staged.inodes.values() {
+            raw.put(
+                inode_object_key(inode.inode_id),
+                &try_encode_inode(inode).expect("encode fixed inode"),
+            )
+            .expect("stage fixed inode");
+            if inode.carries_child_namespace() {
+                let directory = staged
+                    .directories
+                    .get(&inode.inode_id)
+                    .expect("fixed directory exists");
+                raw.put(
+                    directory_object_key(inode.inode_id),
+                    &encode_directory(inode, directory),
+                )
+                .expect("stage fixed directory");
+            }
+        }
+        let file_record = staged.inodes.get(&inode_id).expect("fixed file inode");
+        raw.put(
+            content_object_key(inode_id),
+            &encode_content(file_record, payload),
+        )
+        .expect("stage fixed content");
+        raw.put(
+            content_object_key_for_version(inode_id, file_record.data_version),
+            &encode_content(file_record, &conflicting_payload),
+        )
+        .expect("stage conflicting versioned raw content");
+        pool.sync_all().expect("sync fixed-object staging");
+    }
+
+    {
+        let fs = fixture.open();
+        assert_eq!(fs.read_file(&path).expect("read imported file"), payload);
+        let record = fs.stat(&path).expect("stat imported file");
+        let content_key = content_object_key_for_version(inode_id, record.data_version);
+        let content_receipt = fs
+            .store
+            .placement_receipt_for_key(DeviceIoClass::Data, content_key)
+            .expect("read promoted content receipt")
+            .expect("promoted content receipt exists");
+        assert!(content_receipt.generation > 0);
+        let manifest = current_content_manifest(&fs, &path);
+        for chunk_ref in manifest.chunks.iter().filter(|chunk| !chunk.is_hole()) {
+            assert!(chunk_ref.placement_receipt_generation > 0);
+            let chunk_key = content_chunk_object_key_for_version(
+                inode_id,
+                chunk_ref.data_version,
+                chunk_ref.chunk_index,
+            );
+            let receipt = fs
+                .store
+                .placement_receipt_for_key(DeviceIoClass::Data, chunk_key)
+                .expect("read promoted chunk receipt")
+                .expect("promoted chunk receipt exists");
+            assert_eq!(receipt.generation, chunk_ref.placement_receipt_generation);
+        }
+    }
+
+    {
+        let fs = fixture.open();
+        assert_eq!(fs.read_file(&path).expect("read after reopen"), payload);
+    }
+}
+
+#[test]
+fn block_device_full_commit_replays_intent_over_flushed_pool_base() {
+    let fixture = TwoDeviceBlockFixture::new("block-device-full-commit-replay-base");
+    let path = "/merge";
+    let expected;
+
+    {
+        let mut fs = fixture.open();
+        fs.set_auto_commit(false);
+        fs.create_file(path, 0o644).expect("create merge file");
+        fs.write_file(path, 0, b"AAAA")
+            .expect("write committed base");
+        fs.sync_all().expect("commit base");
+    }
+
+    {
+        let mut fs = fixture.open();
+        fs.set_auto_commit(false);
+        let inode_id = fs.stat(path).expect("stat merge file").inode_id;
+        let (buffered_base, buffered_record, _manifest) =
+            flush_uncommitted_content_away_from_raw_primary(&mut fs, path, "buffered-B");
+        assert_eq!(buffered_record.inode_id, inode_id);
+        let mut merged = buffered_base.clone();
+        merged[1] = b'P';
+        expected = merged;
+        let reply = fs
+            .sync_write_intent(inode_id, 1, 1, checksum64(b"P"), b"P")
+            .expect("append durable patch intent");
+        assert_eq!(reply, IntentLogReplyState::IntentDurable);
+
+        fs.sync_all()
+            .expect("commit buffered byte and patch intent");
+        assert_eq!(
+            fs.read_file(path).expect("read merged live content"),
+            expected
+        );
+        assert!(fs.intent_log.is_empty());
+
+        fs.recovery_policy = RecoveryPolicy::ReadOnly;
+    }
+
+    let fs = fixture.open();
+    assert_eq!(
+        fs.read_file(path)
+            .expect("read merged content after reopen"),
+        expected
+    );
+}
+
+#[test]
+fn block_device_growth_after_reopen_plans_capacity_from_pool_content() {
+    let fixture = TwoDeviceBlockFixture::new("block-device-pool-capacity-growth");
+    let (path, base, inode_id, _) = commit_file_away_from_raw_primary(&fixture, "capacity-growth");
+    let write_offset = u64::from(content_chunk_size()) + 17;
+    let mut expected = base;
+    expected.resize(
+        usize::try_from(write_offset).expect("test write offset fits usize"),
+        0,
+    );
+    expected.push(b'G');
+
+    {
+        let mut fs = fixture.open();
+        fs.set_auto_commit(false);
+        assert_eq!(
+            fs.stat(&path).expect("stat off-primary base").inode_id,
+            inode_id
+        );
+        fs.write_file(&path, write_offset, b"G")
+            .expect("buffer growth over Pool-authorized content");
+        fs.flush_write_buffer(inode_id)
+            .expect("plan growing allocation from Pool-authorized content");
+        fs.sync_all().expect("commit grown content");
+    }
+
+    let fs = fixture.open();
+    assert_eq!(
+        fs.read_file(&path)
+            .expect("read grown content after reopen"),
+        expected
+    );
+}
+
+#[test]
+fn full_replacement_refuses_receiptless_manifest_before_capacity_credit() {
+    let root = temp_root("full-replacement-receiptless-manifest");
+    let content_capacity = u64::from(content_chunk_size());
+    let mut fs =
+        LocalFileSystem::open_with_capacity(&root, StoreOptions::test_fast(), content_capacity)
+            .expect("open capacity-bounded fs");
+    fs.set_dedup_enabled(false);
+    fs.create_file("/replace.bin", 0o644)
+        .expect("create replacement source");
+    let old_bytes = vec![0x31; content_chunk_size() as usize];
+    fs.write_file("/replace.bin", 0, &old_bytes)
+        .expect("write replacement source");
+    fs.sync_all().expect("commit replacement source");
+    assert_eq!(fs.capacity_authority().used_bytes(), content_capacity);
+    fs.set_auto_commit(false);
+
+    let record_before = fs.stat("/replace.bin").expect("stat replacement source");
+    let _ = fs
+        .read_committed_content_layout_cached(record_before.inode_id, &record_before)
+        .expect("prime decoded layout cache");
+    assert_eq!(fs.content_layout_cache_len_for_test(), 1);
+    let manifest_key =
+        content_object_key_for_version(record_before.inode_id, record_before.data_version);
+    let _raw_manifest = stage_receiptless_raw_object_substitute(&mut fs, manifest_key);
+
+    let stats_before = fs.stats();
+    let accounting_before = fs.state.space_accounting.clone();
+    let capacity_before = (
+        fs.capacity_authority().used_bytes(),
+        fs.capacity_authority().reserved_bytes(),
+        fs.capacity_authority().pending_bytes(),
+    );
+    let extents_before = fs.lookup_extents(record_before.inode_id.get(), 0, record_before.size);
+    let candidate_generation = next_generation_after(stats_before.filesystem_generation);
+    let candidate_manifest_key =
+        content_object_key_for_version(record_before.inode_id, candidate_generation);
+    let candidate_root_key = root_slot_object_key(root_slot_for_transaction(
+        candidate_generation.max(ROOT_COMMIT_MIN_TRANSACTION_ID),
+    ));
+    let root_locations_before = fs
+        .store
+        .raw_primary_store()
+        .version_locations_of(candidate_root_key);
+
+    let replacement = vec![0x52; old_bytes.len()];
+    let error = fs
+        .replace_file("/replace.bin", &replacement)
+        .expect_err("receiptless old manifest must not supply replacement credit");
+    assert!(matches!(
+        error,
+        FileSystemError::ReceiptAuthorityMissing {
+            object_key,
+            expected_generation: 0,
+        } if object_key == manifest_key
+    ));
+    assert_eq!(fs.stats(), stats_before);
+    assert_eq!(
+        fs.stat("/replace.bin").expect("stat refused replacement"),
+        record_before
+    );
+    assert_eq!(fs.state.space_accounting, accounting_before);
+    assert_eq!(
+        (
+            fs.capacity_authority().used_bytes(),
+            fs.capacity_authority().reserved_bytes(),
+            fs.capacity_authority().pending_bytes(),
+        ),
+        capacity_before
+    );
+    assert_eq!(
+        fs.lookup_extents(record_before.inode_id.get(), 0, record_before.size),
+        extents_before
+    );
+    assert!(fs.mutation_delta.is_none());
+    assert!(fs
+        .store
+        .placement_receipt_for_key(DeviceIoClass::Data, candidate_manifest_key)
+        .expect("inspect replacement manifest receipt")
+        .is_none());
+    assert!(!fs
+        .store
+        .raw_primary_store()
+        .contains_key(candidate_manifest_key));
+    assert_eq!(
+        fs.store
+            .raw_primary_store()
+            .version_locations_of(candidate_root_key),
+        root_locations_before,
+        "refused replacement appended a root candidate"
+    );
+
+    fs.recovery_policy = RecoveryPolicy::ReadOnly;
+    drop(fs);
+    cleanup(&root);
+}
+
+#[test]
+fn buffered_partial_patch_refuses_receiptless_old_chunk_before_publication() {
+    let root = temp_root("buffered-patch-receiptless-chunk");
+    let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
+    fs.set_dedup_enabled(false);
+    fs.create_file("/patch.bin", 0o644)
+        .expect("create patch source");
+    let old_bytes = vec![0x41; content_chunk_size() as usize];
+    fs.write_file("/patch.bin", 0, &old_bytes)
+        .expect("write patch source");
+    fs.sync_all().expect("commit patch source");
+    fs.set_auto_commit(false);
+
+    let record_before = fs.stat("/patch.bin").expect("stat patch source");
+    let manifest = current_content_manifest(&fs, "/patch.bin");
+    let chunk_ref = manifest
+        .chunks
+        .iter()
+        .find(|chunk| !chunk.is_hole())
+        .cloned()
+        .expect("patch source has a materialized chunk");
+    let chunk_key = content_chunk_object_key_for_version(
+        record_before.inode_id,
+        chunk_ref.data_version,
+        chunk_ref.chunk_index,
+    );
+    let raw_chunk = stage_receiptless_raw_object_substitute(&mut fs, chunk_key);
+    assert_eq!(checksum64(&raw_chunk), chunk_ref.checksum);
+
+    let patch_offset = 100_u64;
+    let patch = b"PATCH";
+    fs.write_file("/patch.bin", patch_offset, patch)
+        .expect("buffer partial patch");
+    let stats_before_flush = fs.stats();
+    let accounting_before_flush = fs.state.space_accounting.clone();
+    let capacity_before_flush = (
+        fs.capacity_authority().used_bytes(),
+        fs.capacity_authority().reserved_bytes(),
+        fs.capacity_authority().pending_bytes(),
+    );
+    let extents_before_flush =
+        fs.lookup_extents(record_before.inode_id.get(), 0, record_before.size);
+    let candidate_generation = next_generation_after(stats_before_flush.filesystem_generation);
+    let candidate_manifest_key =
+        content_object_key_for_version(record_before.inode_id, candidate_generation);
+    let candidate_chunk_key = content_chunk_object_key_for_version(
+        record_before.inode_id,
+        candidate_generation,
+        chunk_ref.chunk_index,
+    );
+    let candidate_root_key = root_slot_object_key(root_slot_for_transaction(
+        candidate_generation.max(ROOT_COMMIT_MIN_TRANSACTION_ID),
+    ));
+    let root_locations_before = fs
+        .store
+        .raw_primary_store()
+        .version_locations_of(candidate_root_key);
+
+    let error = fs
+        .flush_write_buffer(record_before.inode_id)
+        .expect_err("partial patch must not read a receiptless old chunk");
+    assert!(matches!(
+        error,
+        FileSystemError::ReceiptAuthorityMissing {
+            object_key,
+            expected_generation,
+        } if object_key == chunk_key
+            && expected_generation == chunk_ref.placement_receipt_generation
+    ));
+    assert_eq!(fs.stats(), stats_before_flush);
+    assert_eq!(fs.state.space_accounting, accounting_before_flush);
+    assert_eq!(
+        (
+            fs.capacity_authority().used_bytes(),
+            fs.capacity_authority().reserved_bytes(),
+            fs.capacity_authority().pending_bytes(),
+        ),
+        capacity_before_flush
+    );
+    assert_eq!(
+        fs.lookup_extents(record_before.inode_id.get(), 0, record_before.size),
+        extents_before_flush
+    );
+    assert!(fs.write_buffers.contains_key(&record_before.inode_id));
+    assert_eq!(
+        fs.read_file_range("/patch.bin", patch_offset, patch.len())
+            .expect("read restored buffered patch"),
+        patch
+    );
+    for candidate_key in [candidate_manifest_key, candidate_chunk_key] {
+        assert!(fs
+            .store
+            .placement_receipt_for_key(DeviceIoClass::Data, candidate_key)
+            .expect("inspect refused patch receipt")
+            .is_none());
+        assert!(!fs.store.raw_primary_store().contains_key(candidate_key));
+    }
+    assert_eq!(
+        fs.store
+            .raw_primary_store()
+            .version_locations_of(candidate_root_key),
+        root_locations_before,
+        "refused patch appended a root candidate"
+    );
+
+    fs.recovery_policy = RecoveryPolicy::ReadOnly;
+    drop(fs);
+    cleanup(&root);
+}
+
+#[test]
+fn foreground_partial_write_releases_capacity_when_strict_flush_fails() {
+    let root = temp_root("foreground-patch-receiptless-chunk");
+    let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
+    fs.set_dedup_enabled(false);
+    fs.create_file("/patch.bin", 0o644)
+        .expect("create patch source");
+    let old_bytes = vec![0x61; content_chunk_size() as usize];
+    fs.write_file("/patch.bin", 0, &old_bytes)
+        .expect("write patch source");
+    fs.sync_all().expect("commit patch source");
+
+    let record_before = fs.stat("/patch.bin").expect("stat patch source");
+    let manifest = current_content_manifest(&fs, "/patch.bin");
+    let chunk_ref = manifest
+        .chunks
+        .iter()
+        .find(|chunk| !chunk.is_hole())
+        .cloned()
+        .expect("patch source has a materialized chunk");
+    let chunk_key = content_chunk_object_key_for_version(
+        record_before.inode_id,
+        chunk_ref.data_version,
+        chunk_ref.chunk_index,
+    );
+    let raw_chunk = stage_receiptless_raw_object_substitute(&mut fs, chunk_key);
+    assert_eq!(checksum64(&raw_chunk), chunk_ref.checksum);
+    fs.set_write_buffer_flush_threshold_bytes(1);
+
+    let stats_before = fs.stats();
+    let accounting_before = fs.state.space_accounting.clone();
+    let capacity_before = (
+        fs.capacity_authority().used_bytes(),
+        fs.capacity_authority().reserved_bytes(),
+        fs.capacity_authority().pending_bytes(),
+    );
+    let extents_before = fs.lookup_extents(record_before.inode_id.get(), 0, record_before.size);
+    let dirty_ranges_before = fs
+        .writeback_range_tracker
+        .lock()
+        .expect("locked")
+        .snapshot_ranges();
+    let admission_before = fs.write_admission.usage();
+    let permits_before = fs.pending_permits.len();
+    let candidate_generation = next_generation_after(stats_before.filesystem_generation);
+    let candidate_manifest_key =
+        content_object_key_for_version(record_before.inode_id, candidate_generation);
+    let candidate_chunk_key = content_chunk_object_key_for_version(
+        record_before.inode_id,
+        candidate_generation,
+        chunk_ref.chunk_index,
+    );
+    let candidate_root_key = root_slot_object_key(root_slot_for_transaction(
+        candidate_generation.max(ROOT_COMMIT_MIN_TRANSACTION_ID),
+    ));
+    let root_locations_before = fs
+        .store
+        .raw_primary_store()
+        .version_locations_of(candidate_root_key);
+
+    let error = fs
+        .write_file("/patch.bin", 100, b"Z")
+        .expect_err("threshold flush must reject receiptless preserved bytes");
+    assert!(matches!(
+        error,
+        FileSystemError::ReceiptAuthorityMissing {
+            object_key,
+            expected_generation,
+        } if object_key == chunk_key
+            && expected_generation == chunk_ref.placement_receipt_generation
+    ));
+    assert_eq!(fs.stats(), stats_before);
+    assert_eq!(
+        fs.stat("/patch.bin")
+            .expect("stat refused foreground write"),
+        record_before
+    );
+    assert_eq!(fs.state.space_accounting, accounting_before);
+    assert_eq!(
+        (
+            fs.capacity_authority().used_bytes(),
+            fs.capacity_authority().reserved_bytes(),
+            fs.capacity_authority().pending_bytes(),
+        ),
+        capacity_before,
+        "failed foreground flush leaked capacity"
+    );
+    assert_eq!(
+        fs.lookup_extents(record_before.inode_id.get(), 0, record_before.size),
+        extents_before
+    );
+    assert_eq!(
+        fs.writeback_range_tracker
+            .lock()
+            .expect("locked")
+            .snapshot_ranges(),
+        dirty_ranges_before
+    );
+    assert_eq!(fs.write_admission.usage(), admission_before);
+    assert_eq!(fs.pending_permits.len(), permits_before);
+    assert!(!fs.write_buffers.contains_key(&record_before.inode_id));
+    assert!(fs.mutation_delta.is_none());
+    for candidate_key in [candidate_manifest_key, candidate_chunk_key] {
+        assert!(fs
+            .store
+            .placement_receipt_for_key(DeviceIoClass::Data, candidate_key)
+            .expect("inspect refused foreground-write receipt")
+            .is_none());
+        assert!(!fs.store.raw_primary_store().contains_key(candidate_key));
+    }
+    assert_eq!(
+        fs.store
+            .raw_primary_store()
+            .version_locations_of(candidate_root_key),
+        root_locations_before,
+        "failed foreground write appended a root candidate"
+    );
+
+    fs.recovery_policy = RecoveryPolicy::ReadOnly;
+    drop(fs);
+    cleanup(&root);
+}
+
+#[test]
+fn foreground_flush_failure_aborts_preexisting_transaction_without_leaks() {
+    let root = temp_root("foreground-flush-transaction-rollback");
+    let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
+    fs.set_dedup_enabled(false);
+    fs.create_file("/patch.bin", 0o644)
+        .expect("create patch source");
+    let old_bytes = vec![0x71; content_chunk_size() as usize];
+    fs.write_file("/patch.bin", 0, &old_bytes)
+        .expect("write patch source");
+    fs.sync_all().expect("commit patch source");
+
+    let record_before = fs.stat("/patch.bin").expect("stat patch source");
+    let manifest = current_content_manifest(&fs, "/patch.bin");
+    let chunk_ref = manifest
+        .chunks
+        .iter()
+        .find(|chunk| !chunk.is_hole())
+        .cloned()
+        .expect("patch source has a materialized chunk");
+    let chunk_key = content_chunk_object_key_for_version(
+        record_before.inode_id,
+        chunk_ref.data_version,
+        chunk_ref.chunk_index,
+    );
+
+    fs.set_auto_commit(false);
+    fs.set_write_buffer_flush_threshold_bytes(2);
+    let accounting_before = fs.state.space_accounting.clone();
+    let capacity_before = (
+        fs.capacity_authority().used_bytes(),
+        fs.capacity_authority().reserved_bytes(),
+        fs.capacity_authority().pending_bytes(),
+    );
+    let extents_before = fs.lookup_extents(record_before.inode_id.get(), 0, record_before.size);
+    let dirty_ranges_before = fs
+        .writeback_range_tracker
+        .lock()
+        .expect("locked")
+        .snapshot_ranges();
+    let admission_before = fs.write_admission.usage();
+    let permits_before = fs.pending_permits.len();
+
+    fs.begin_transaction().expect("begin transaction");
+    fs.write_file("/patch.bin", 100, b"A")
+        .expect("buffer first transaction byte below threshold");
+    assert!(fs.write_buffers.contains_key(&record_before.inode_id));
+    let raw_chunk = stage_receiptless_raw_object_substitute(&mut fs, chunk_key);
+    assert_eq!(checksum64(&raw_chunk), chunk_ref.checksum);
+    let stats_before_failure = fs.stats();
+
+    let error = fs
+        .write_file("/patch.bin", 200, b"B")
+        .expect_err("second byte must trigger strict flush failure");
+    assert!(matches!(
+        error,
+        FileSystemError::ReceiptAuthorityMissing {
+            object_key,
+            expected_generation,
+        } if object_key == chunk_key
+            && expected_generation == chunk_ref.placement_receipt_generation
+    ));
+    assert_eq!(fs.stats(), stats_before_failure);
+    assert_eq!(
+        fs.stat("/patch.bin")
+            .expect("stat transaction-rollback file"),
+        record_before
+    );
+    assert_eq!(fs.state.space_accounting, accounting_before);
+    assert_eq!(
+        (
+            fs.capacity_authority().used_bytes(),
+            fs.capacity_authority().reserved_bytes(),
+            fs.capacity_authority().pending_bytes(),
+        ),
+        capacity_before
+    );
+    assert_eq!(
+        fs.lookup_extents(record_before.inode_id.get(), 0, record_before.size),
+        extents_before
+    );
+    assert_eq!(
+        fs.writeback_range_tracker
+            .lock()
+            .expect("locked")
+            .snapshot_ranges(),
+        dirty_ranges_before
+    );
+    assert_eq!(fs.write_admission.usage(), admission_before);
+    assert_eq!(fs.pending_permits.len(), permits_before);
+    assert!(!fs.write_buffers.contains_key(&record_before.inode_id));
+    assert!(fs.mutation_delta.is_none());
+    assert!(!fs.in_transaction);
+
+    fs.recovery_policy = RecoveryPolicy::ReadOnly;
+    drop(fs);
+    cleanup(&root);
+}
+
+#[test]
+fn block_device_full_commit_refuses_missing_off_primary_buffered_base() {
+    let fixture = TwoDeviceBlockFixture::new("block-device-missing-buffered-base");
+    let (path, committed_base, inode_id, committed_transaction) =
+        commit_file_away_from_raw_primary(&fixture, "missing-buffered");
+    let patch = b"C";
+    let patch_offset = 1_u64;
+
+    {
+        let mut fs = fixture.open();
+        fs.set_auto_commit(false);
+        let (_buffered_base, buffered_record, _manifest) =
+            flush_uncommitted_content_away_from_raw_primary(&mut fs, &path, "buffered-B");
+        assert_eq!(buffered_record.inode_id, inode_id);
+        let buffered_key = content_object_key_for_version(inode_id, buffered_record.data_version);
+
+        let reply = fs
+            .sync_write_intent(
+                inode_id,
+                patch_offset,
+                patch.len() as u64,
+                checksum64(patch),
+                patch,
+            )
+            .expect("append acknowledged patch intent");
+        assert_eq!(reply, IntentLogReplyState::IntentDurable);
+        let entry = fs
+            .intent_log
+            .pending_entries()
+            .last()
+            .expect("acknowledged patch entry");
+        let candidate_transaction = next_generation_after(entry.root_anchor.generation);
+        let candidate_root_key =
+            root_slot_object_key(root_slot_for_transaction(candidate_transaction));
+        let root_locations_before = fs
+            .store
+            .raw_primary_store()
+            .version_locations_of(candidate_root_key);
+
+        assert!(fs
+            .store
+            .delete(DeviceIoClass::Data, buffered_key)
+            .expect("remove buffered Pool content and receipt"));
+        assert!(fs
+            .store
+            .placement_receipt_for_key(DeviceIoClass::Data, buffered_key)
+            .expect("inspect removed buffered receipt")
+            .is_none());
+        assert!(!fs.store.raw_primary_store().contains_key(buffered_key));
+
+        let error = fs
+            .sync_all()
+            .expect_err("full commit must refuse a missing preferred Pool base");
+        assert!(matches!(
+            error,
+            FileSystemError::ReceiptAuthorityMissing {
+                object_key,
+                expected_generation: 0,
+            } if object_key == buffered_key
+        ));
+        assert_eq!(fs.generation(), committed_transaction);
+        assert_eq!(
+            fs.read_file(&path)
+                .expect("read preserved buffered live view"),
+            live_before_failure
+        );
+        assert_eq!(
+            fs.intent_log.len(),
+            1,
+            "acknowledged patch must survive rollback"
+        );
+        assert_eq!(
+            fs.store
+                .raw_primary_store()
+                .version_locations_of(candidate_root_key),
+            root_locations_before,
+            "failed prepublication replay must not append a root"
+        );
+        assert!(!fs
+            .store
+            .raw_primary_store()
+            .contains_key(transaction_superblock_object_key(candidate_transaction)));
+        assert!(!fs
+            .store
+            .raw_primary_store()
+            .contains_key(transaction_manifest_object_key(candidate_transaction)));
+        fs.recovery_policy = RecoveryPolicy::ReadOnly;
+    }
+
+    let mut expected = committed_base;
+    expected[patch_offset as usize] = patch[0];
+    let mut reopened = fixture.open();
+    assert_eq!(
+        reopened
+            .read_file(&path)
+            .expect("replay acknowledged patch"),
+        expected
+    );
+    assert_eq!(reopened.intent_log.len(), 1);
+    reopened.sync_all().expect("publish recovered patch");
+    assert!(reopened.intent_log.is_empty());
+}
+
+#[test]
+fn block_device_failed_metadata_commit_preserves_replayed_intent_prefix() {
+    let fixture = TwoDeviceBlockFixture::new("block-device-replayed-prefix-rollback");
+    let path = "/prefix";
+    let inode_id;
+    let committed_mode;
+
+    {
+        let mut fs = fixture.open();
+        fs.set_auto_commit(false);
+        fs.create_file(path, 0o644).expect("create prefix file");
+        fs.write_file(path, 0, b"0000")
+            .expect("write committed prefix base");
+        fs.sync_all().expect("commit prefix base");
+        let record = fs.stat(path).expect("stat committed prefix base");
+        inode_id = record.inode_id;
+        committed_mode = record.mode;
+    }
+
+    {
+        let mut fs = fixture.open();
+        fs.set_auto_commit(false);
+        let reply = fs
+            .sync_write_intent(inode_id, 1, 1, checksum64(b"P"), b"P")
+            .expect("append durable prefix patch");
+        assert_eq!(reply, IntentLogReplyState::IntentDurable);
+        fs.recovery_policy = RecoveryPolicy::ReadOnly;
+    }
+
+    {
+        let mut fs = fixture.open();
+        assert_eq!(fs.read_file(path).expect("read replayed prefix"), b"0P00");
+        assert!(fs.replayed_intent_entry_id.is_some());
+        assert!(!fs.intent_log.is_empty());
+
+        let mut updated = fs.stat(path).expect("stat replayed prefix");
+        updated.mode = (updated.mode & S_IFMT) | 0o600;
+        assert_eq!(
+            fs.metadata_setattr_intent(&updated)
+                .expect("refuse metadata suffix behind replayed prefix"),
+            IntentLogReplyState::Refused
+        );
+
+        inject_next_sync_failure_after_boundary(
+            FilesystemCommitBoundary::TransactionObjectsWritten,
+        );
+        let error = fs
+            .set_attr(
+                inode_id.get(),
+                &SetAttr {
+                    valid: FATTR_MODE,
+                    mode: updated.mode,
+                    ..SetAttr::default()
+                },
+            )
+            .expect_err("metadata commit must fail before root publication");
+        assert_eq!(error.0, 5);
+        assert_eq!(
+            fs.stat(path).expect("stat rolled-back metadata").mode,
+            committed_mode
+        );
+        assert_eq!(fs.read_file(path).expect("read preserved prefix"), b"0P00");
+        assert!(!fs.intent_log.is_empty());
+        fs.recovery_policy = RecoveryPolicy::ReadOnly;
+    }
+
+    let mut reopened = fixture.open();
+    assert_eq!(
+        reopened.read_file(path).expect("recover durable prefix"),
+        b"0P00"
+    );
+    assert_eq!(
+        reopened.stat(path).expect("stat recovered metadata").mode,
+        committed_mode
+    );
+    reopened.sync_all().expect("publish recovered prefix");
+    assert!(reopened.intent_log.is_empty());
+}
+
+#[test]
+fn block_device_intent_replay_uses_pool_base_away_from_raw_primary() {
+    let fixture = TwoDeviceBlockFixture::new("block-device-pool-intent-replay");
+    let patch = b"PATCH";
+    let patch_offset = 8_u64;
+    let (selected_path, base, inode_id, committed_transaction) =
+        commit_file_away_from_raw_primary(&fixture, "replay");
+
+    let mut expected = base.clone();
+    let start = patch_offset as usize;
+    expected[start..start + patch.len()].copy_from_slice(patch);
+    let buffered_only = b"BUFFER";
+    let expected_replay_generation;
+
+    {
+        let mut fs = fixture.open();
+        fs.set_auto_commit(false);
+        assert_eq!(fs.generation(), committed_transaction);
+
+        // B is deliberately different from both committed base A and durable
+        // intent C. It remains only in the volatile write buffer and must not
+        // become the source for C's unaffected ranges after the crash.
+        fs.write_file(&selected_path, 0, buffered_only)
+            .expect("buffer unacknowledged state B");
+        let generation_after_buffered_write = fs.generation();
+        assert_eq!(
+            generation_after_buffered_write, committed_transaction,
+            "volatile buffered bytes must not advance committed generation"
+        );
+        let reply = fs
+            .sync_write_intent(
+                inode_id,
+                patch_offset,
+                patch.len() as u64,
+                checksum64(patch),
+                patch,
+            )
+            .expect("persist patch intent");
+        assert_eq!(reply, IntentLogReplyState::IntentDurable);
+        let entry = fs
+            .intent_log
+            .pending_entries()
+            .last()
+            .expect("durable intent entry exists");
+        let intent_generation = next_generation_after(committed_transaction);
+        assert_eq!(entry.root_anchor.transaction_id, intent_generation);
+        assert_eq!(entry.root_anchor.generation, intent_generation);
+        assert!(!entry.root_anchor.manifest_digest.is_zero());
+        expected_replay_generation = next_generation_after(entry.root_anchor.generation);
+
+        let replay_key = content_object_key_for_version(inode_id, expected_replay_generation);
+        assert!(fs
+            .store
+            .placement_receipt_for_key(DeviceIoClass::Data, replay_key)
+            .expect("inspect absent replay receipt")
+            .is_none());
+        assert!(!fs.store.raw_primary_store().contains_key(replay_key));
+
+        // Test-only unclean close: release resources without allowing Drop to
+        // fold the durable intent into a normal committed root.
+        fs.recovery_policy = RecoveryPolicy::ReadOnly;
+    }
+
+    {
+        let mut fs = fixture.open();
+        assert_eq!(fs.generation(), expected_replay_generation);
+        assert_eq!(
+            fs.read_file(&selected_path)
+                .expect("read Pool-backed replay"),
+            expected
+        );
+        let record = fs.stat(&selected_path).expect("stat replayed file");
+        assert_eq!(record.data_version, expected_replay_generation);
+        assert_eq!(record.metadata_version, expected_replay_generation);
+        fs.sync_all().expect("publish replayed state");
+        assert_eq!(fs.generation(), expected_replay_generation);
+        assert!(fs.intent_log.is_empty());
+    }
+
+    {
+        let fs = fixture.open();
+        assert_eq!(fs.generation(), expected_replay_generation);
+        assert_eq!(
+            fs.read_file(&selected_path).expect("read committed replay"),
+            expected
+        );
+    }
+}
+
+#[test]
+fn block_device_intent_replay_rejects_corrupt_raw_payload_before_pool_write() {
+    for same_length in [false, true] {
+        let case = if same_length { "digest" } else { "length" };
+        let fixture = TwoDeviceBlockFixture::new(&format!("intent-payload-{case}"));
+        let (_path, _base, inode_id, committed_transaction) =
+            commit_file_away_from_raw_primary(&fixture, case);
+        let valid_patch = b"GOOD";
+        let corruptible_patch = b"PATCH";
+        let candidate_root_key;
+        let candidate_content_key;
+        let candidate_transaction;
+        let root_locations_before;
+
+        {
+            let mut fs = fixture.open();
+            fs.set_auto_commit(false);
+            let valid_reply = fs
+                .sync_write_intent(
+                    inode_id,
+                    2,
+                    valid_patch.len() as u64,
+                    checksum64(valid_patch),
+                    valid_patch,
+                )
+                .expect("append earlier valid intent");
+            assert_eq!(valid_reply, IntentLogReplyState::IntentDurable);
+            let corruptible_reply = fs
+                .sync_write_intent(
+                    inode_id,
+                    8,
+                    corruptible_patch.len() as u64,
+                    checksum64(corruptible_patch),
+                    corruptible_patch,
+                )
+                .expect("append later corruptible intent");
+            assert_eq!(corruptible_reply, IntentLogReplyState::IntentDurable);
+            let entries = fs.intent_log.pending_entries();
+            assert_eq!(entries.len(), 2);
+            let entry_id = entries[1].entry_id;
+            candidate_transaction = next_generation_after(entries[1].root_anchor.generation);
+            candidate_content_key = content_object_key_for_version(inode_id, candidate_transaction);
+            candidate_root_key =
+                root_slot_object_key(root_slot_for_transaction(candidate_transaction));
+            root_locations_before = fs
+                .store
+                .raw_primary_store()
+                .version_locations_of(candidate_root_key);
+
+            let corrupt_payload = if same_length {
+                let mut bytes = corruptible_patch.to_vec();
+                bytes[0] ^= 0xff;
+                bytes
+            } else {
+                corruptible_patch[..corruptible_patch.len() - 1].to_vec()
+            };
+            fs.store
+                .raw_primary_store_mut()
+                .put(intent_log_data_object_key(entry_id), &corrupt_payload)
+                .expect("replace durable intent payload");
+            fs.store
+                .sync_all()
+                .expect("sync corrupt intent payload fixture");
+            assert_eq!(fs.generation(), committed_transaction);
+            fs.recovery_policy = RecoveryPolicy::ReadOnly;
+        }
+
+        let error = LocalFileSystem::open_with_block_devices(
+            &fixture.metadata_root,
+            &fixture.devices,
             options(),
             RootAuthenticationKey::demo_key(),
         )
-        .expect("reopen block-device fs");
-        let read_back = fs.read_file("/persist").expect("read file after reopen");
-        assert_eq!(read_back, payload);
+        .expect_err("corrupt raw intent payload must fail mounted recovery");
+        assert!(matches!(error, FileSystemError::CorruptState { .. }));
+
+        let pool = fixture.open_pool();
+        assert_eq!(
+            pool.raw_primary_store()
+                .version_locations_of(candidate_root_key),
+            root_locations_before,
+            "failed replay must not publish a root candidate"
+        );
+        assert!(!pool
+            .raw_primary_store()
+            .contains_key(transaction_superblock_object_key(candidate_transaction)));
+        assert!(!pool
+            .raw_primary_store()
+            .contains_key(transaction_manifest_object_key(candidate_transaction)));
+        assert!(pool
+            .placement_receipt_for_key(DeviceIoClass::Data, candidate_content_key)
+            .expect("inspect candidate content receipt")
+            .is_none());
+        assert!(!pool.raw_primary_store().contains_key(candidate_content_key));
+    }
+}
+
+#[test]
+fn block_device_truncate_intent_replays_from_pool_committed_base() {
+    let fixture = TwoDeviceBlockFixture::new("block-device-truncate-intent");
+    let (path, base, inode_id, committed_transaction) =
+        commit_file_away_from_raw_primary(&fixture, "truncate");
+    let truncated_len = base.len() / 2;
+    let expected = base[..truncated_len].to_vec();
+    let expected_replay_generation;
+
+    {
+        let mut fs = fixture.open();
+        fs.set_auto_commit(false);
+        assert_eq!(fs.generation(), committed_transaction);
+        let mut updated = fs.stat(&path).expect("stat committed truncate base");
+        assert_eq!(updated.inode_id, inode_id);
+        updated.size = truncated_len as u64;
+        let reply = fs
+            .metadata_setattr_intent(&updated)
+            .expect("append truncate-only metadata intent");
+        assert_eq!(reply, IntentLogReplyState::IntentDurable);
+        let [entry] = fs.intent_log.pending_entries() else {
+            panic!("truncate recovery must contain exactly one intent entry");
+        };
+        assert!(matches!(
+            entry.entry_kind,
+            IntentLogEntryKind::MetadataSetattrIntent(_)
+        ));
+        expected_replay_generation = next_generation_after(entry.root_anchor.generation);
+        fs.recovery_policy = RecoveryPolicy::ReadOnly;
     }
 
-    cleanup(&root);
-    let _ = std::fs::remove_file(dev0);
-    let _ = std::fs::remove_file(dev1);
+    {
+        let mut fs = fixture.open();
+        assert_eq!(fs.generation(), expected_replay_generation);
+        assert_eq!(
+            fs.read_file(&path).expect("read replayed truncate"),
+            expected
+        );
+        let record = fs.stat(&path).expect("stat replayed truncate");
+        assert_eq!(record.size, truncated_len as u64);
+        assert_eq!(record.data_version, expected_replay_generation);
+        assert_eq!(record.metadata_version, expected_replay_generation);
+        fs.recovery_policy = RecoveryPolicy::ReadOnly;
+    }
+}
+
+#[test]
+fn block_device_reopen_rejects_receiptless_raw_content_substitute() {
+    let fixture = TwoDeviceBlockFixture::new("block-device-raw-content-rejected");
+    let older_payload = b"older committed Pool-backed content".to_vec();
+    let (older_state, path, inode_id, older_payload) =
+        stage_probe_file_state_from_state(&initial_state(), b"persist", &older_payload);
+    let older_generation = older_state.generation;
+
+    {
+        let mut pool = fixture.open_pool();
+        write_staged_pool_content(&mut pool, &older_state, inode_id, &older_payload);
+        persist_state_with_pool(&mut pool, &older_state, RootAuthenticationKey::demo_key())
+            .expect("commit older Pool-backed root");
+
+        let mut selected_newer = None;
+        for candidate in 1..=64_u64 {
+            let generation = older_generation.saturating_add(candidate);
+            let payload = format!("newer-{candidate:02}-{}", "N".repeat(64)).into_bytes();
+            let mut state = older_state.clone();
+            state.generation = generation;
+            let record = Arc::make_mut(&mut state.inodes)
+                .get_mut(&inode_id)
+                .expect("newer staged inode exists");
+            record.size = payload.len() as u64;
+            record.data_version = generation;
+            record.metadata_version = generation;
+            write_staged_pool_content(&mut pool, &state, inode_id, &payload);
+            let record = state.inodes.get(&inode_id).expect("newer staged record");
+            if let Some(manifest) = content_manifest_away_from_raw_primary(&pool, record) {
+                selected_newer = Some((state, payload, manifest));
+                break;
+            }
+        }
+        let (newer_state, newer_payload, manifest) = selected_newer
+            .expect("candidate set must place the newer root content away from raw primary");
+        persist_state_with_pool(&mut pool, &newer_state, RootAuthenticationKey::demo_key())
+            .expect("commit newer off-primary root");
+
+        let chunk_ref = manifest
+            .chunks
+            .iter()
+            .find(|chunk| !chunk.is_hole())
+            .cloned()
+            .expect("test content has a stored chunk");
+        let chunk_key = content_chunk_object_key_for_version(
+            inode_id,
+            chunk_ref.data_version,
+            chunk_ref.chunk_index,
+        );
+        let chunk_bytes = pool
+            .get(DeviceIoClass::Data, chunk_key)
+            .expect("read receipt-backed chunk")
+            .expect("receipt-backed chunk exists");
+        assert!(
+            pool.delete(DeviceIoClass::Data, chunk_key)
+                .expect("delete receipt-backed chunk"),
+            "receipt-backed chunk must be deleted before staging substitute"
+        );
+        pool.raw_primary_store_mut()
+            .put(chunk_key, &chunk_bytes)
+            .expect("stage receiptless raw-primary chunk substitute");
+        pool.sync_all().expect("sync raw-primary chunk substitute");
+        assert!(pool.raw_primary_store().contains_key(chunk_key));
+        assert!(pool
+            .placement_receipt_for_key(DeviceIoClass::Data, chunk_key)
+            .expect("inspect removed chunk receipt")
+            .is_none());
+        assert_ne!(newer_payload, older_payload);
+    }
+
+    let reopened = fixture.open();
+    assert_eq!(reopened.generation(), older_generation);
+    assert_eq!(
+        reopened.read_file(path).expect("read older fallback root"),
+        older_payload
+    );
+}
+
+#[test]
+fn block_device_reopen_rejects_unreadable_receipt_target() {
+    let fixture = TwoDeviceBlockFixture::new("block-device-unreadable-receipt-target");
+    let (path, _base, _inode_id, _transaction_id) =
+        commit_file_away_from_raw_primary(&fixture, "unreadable");
+
+    {
+        let mut fs = fixture.open();
+        fs.set_auto_commit(false);
+        let record = fs.stat(&path).expect("stat receipt-backed file");
+        let manifest = current_content_manifest(&fs, &path);
+        let chunk = manifest
+            .chunks
+            .iter()
+            .find(|chunk| !chunk.is_hole())
+            .expect("receipt-backed file has a stored chunk");
+        let chunk_key = content_chunk_object_key_for_version(
+            record.inode_id,
+            chunk.data_version,
+            chunk.chunk_index,
+        );
+        let receipt = fs
+            .store
+            .placement_receipt_for_key(DeviceIoClass::Data, chunk_key)
+            .expect("read retained chunk receipt")
+            .expect("retained chunk receipt exists");
+        let target = receipt.targets.first().expect("chunk receipt has a target");
+        let target_index = usize::try_from(target.device_index).expect("device index fits usize");
+        let target_path = fixture
+            .devices
+            .get(target_index)
+            .expect("receipt target belongs to the fixture");
+        let location = {
+            let target_store = LocalObjectStore::open_block_device(target_path, options())
+                .expect("open receipt target for location discovery");
+            target_store
+                .location_of(chunk_key)
+                .expect("receipt target contains the chunk")
+        };
+        assert!(location.payload_len > 0);
+
+        let mut device = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(target_path)
+            .expect("open receipt target bytes");
+        device
+            .seek(SeekFrom::Start(location.payload_offset))
+            .expect("seek to chunk payload");
+        let mut byte = [0_u8; 1];
+        device
+            .read_exact(&mut byte)
+            .expect("read chunk payload byte");
+        byte[0] ^= 0xff;
+        device
+            .seek(SeekFrom::Start(location.payload_offset))
+            .expect("rewind to chunk payload");
+        device.write_all(&byte).expect("corrupt chunk payload byte");
+        device.sync_all().expect("sync corrupt receipt target");
+
+        fs.create_dir("/metadata-only", 0o755)
+            .expect("stage metadata-only recommit");
+        let candidate_transaction = fs.state.generation.max(ROOT_COMMIT_MIN_TRANSACTION_ID);
+        let candidate_root_key =
+            root_slot_object_key(root_slot_for_transaction(candidate_transaction));
+        let root_locations_before = fs
+            .store
+            .raw_primary_store()
+            .version_locations_of(candidate_root_key);
+        let error = fs
+            .sync_all()
+            .expect_err("unreadable receipt target must fail before publication");
+        assert!(matches!(
+            error,
+            FileSystemError::ReceiptAuthorityUnavailable {
+                object_key,
+                expected_generation,
+            } if object_key == chunk_key && expected_generation == receipt.generation
+        ));
+        assert_eq!(
+            fs.store
+                .raw_primary_store()
+                .version_locations_of(candidate_root_key),
+            root_locations_before
+        );
+        assert!(!fs
+            .store
+            .raw_primary_store()
+            .contains_key(transaction_superblock_object_key(candidate_transaction)));
+        assert!(!fs
+            .store
+            .raw_primary_store()
+            .contains_key(transaction_manifest_object_key(candidate_transaction)));
+        fs.recovery_policy = RecoveryPolicy::ReadOnly;
+    }
+
+    let error = LocalFileSystem::open_with_block_devices(
+        &fixture.metadata_root,
+        &fixture.devices,
+        options(),
+        RootAuthenticationKey::demo_key(),
+    )
+    .expect_err("sole committed root with unreadable content must fail reopen");
+    assert!(matches!(error, FileSystemError::CorruptState { .. }));
 }
 
 #[test]
@@ -9519,6 +11056,215 @@ fn extent_allocator_write_and_lookup() {
     assert_eq!(extents[1].logical_offset, 8192);
     assert_eq!(extents[1].length, 4096);
 
+    cleanup(&root);
+}
+
+#[test]
+fn existing_write_buffer_adopts_raised_flush_threshold() {
+    let root = temp_root("write-buffer-raised-threshold");
+    let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open filesystem");
+    let record = fs
+        .create_file("/buffered", DEFAULT_FILE_PERMISSIONS)
+        .expect("create buffered file");
+    fs.set_auto_commit(false);
+    fs.set_write_buffer_flush_threshold_bytes(2);
+
+    fs.write_file("/buffered", 0, b"A")
+        .expect("buffer first byte");
+    let data_version_before = fs
+        .state
+        .inodes
+        .get(&record.inode_id)
+        .expect("buffered inode")
+        .data_version;
+    fs.set_write_buffer_flush_threshold_bytes(4);
+    fs.write_file("/buffered", 1, b"B")
+        .expect("buffer second byte under raised threshold");
+
+    assert_eq!(
+        fs.write_buffers
+            .get(&record.inode_id)
+            .expect("updated buffer remains dirty")
+            .len(),
+        2
+    );
+    assert_eq!(
+        fs.state
+            .inodes
+            .get(&record.inode_id)
+            .expect("buffered inode after second write")
+            .data_version,
+        data_version_before,
+        "the stale creation-time threshold must not flush the existing buffer"
+    );
+    assert_eq!(
+        fs.read_file("/buffered").expect("read buffered bytes"),
+        b"AB"
+    );
+    fs.recovery_policy = RecoveryPolicy::ReadOnly;
+    drop(fs);
+    cleanup(&root);
+}
+
+#[test]
+fn exact_threshold_first_write_is_finalized_before_root_publication() {
+    let root = temp_root("exact-threshold-finalized-extent");
+    let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open filesystem");
+    let record = fs
+        .create_file("/threshold", DEFAULT_FILE_PERMISSIONS)
+        .expect("create threshold file");
+    fs.set_write_buffer_flush_threshold_bytes(1);
+
+    fs.write_file("/threshold", 0, b"Z")
+        .expect("publish exact-threshold write");
+    assert!(!fs.write_buffers.contains_key(&record.inode_id));
+    let extents = fs.lookup_extents(record.inode_id.get(), 0, 1);
+    assert_eq!(extents.len(), 1);
+    assert!(extents[0].is_data());
+    assert!(!extents[0].is_pending_data());
+    assert_eq!(extents[0].checksum, *blake3::hash(b"Z").as_bytes());
+
+    drop(fs);
+    let reopened = LocalFileSystem::open_with_options(&root, options()).expect("reopen filesystem");
+    assert_eq!(
+        reopened
+            .read_file("/threshold")
+            .expect("read exact-threshold write"),
+        b"Z"
+    );
+    drop(reopened);
+    cleanup(&root);
+}
+
+#[test]
+fn write_larger_than_threshold_finalizes_full_extent_checksum() {
+    let root = temp_root("larger-than-threshold-full-extent-checksum");
+    let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open filesystem");
+    let record = fs
+        .create_file("/large-write", DEFAULT_FILE_PERMISSIONS)
+        .expect("create large-write file");
+    fs.set_write_buffer_flush_threshold_bytes(2);
+    let data = b"ABCDE";
+
+    fs.write_file("/large-write", 0, data)
+        .expect("publish write larger than flush threshold");
+
+    assert!(!fs.write_buffers.contains_key(&record.inode_id));
+    let extents = fs.lookup_extents(record.inode_id.get(), 0, data.len() as u64);
+    assert_eq!(extents.len(), 1);
+    assert_eq!(extents[0].length, data.len() as u64);
+    assert!(extents[0].is_data());
+    assert_eq!(extents[0].checksum, *blake3::hash(data).as_bytes());
+
+    drop(fs);
+    let reopened = LocalFileSystem::open_with_options(&root, options()).expect("reopen filesystem");
+    assert_eq!(
+        reopened
+            .read_file("/large-write")
+            .expect("read larger-than-threshold write"),
+        data
+    );
+    drop(reopened);
+    cleanup(&root);
+}
+
+#[test]
+fn incomplete_pending_extent_coverage_refuses_publication_and_restores_buffer() {
+    let root = temp_root("incomplete-pending-extent-coverage");
+    let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open filesystem");
+    let record = fs
+        .create_file("/coverage", DEFAULT_FILE_PERMISSIONS)
+        .expect("create coverage file");
+    fs.sync_all().expect("commit empty coverage file");
+    fs.set_write_buffer_flush_threshold_bytes(64);
+    let data = b"ABCD";
+    fs.write_file("/coverage", 0, data)
+        .expect("buffer coverage data");
+
+    fs.extent_allocator
+        .free_extent(record.inode_id.get(), 0, data.len() as u64)
+        .expect("remove complete pending extent");
+    fs.extent_allocator
+        .allocate_extent(record.inode_id.get(), 0, 2, None)
+        .expect("install incomplete pending coverage");
+    let generation_before = fs.generation();
+    let publication_before = fs.root_publication_epoch;
+
+    let error = fs
+        .flush_write_buffer(record.inode_id)
+        .expect_err("incomplete pending extent coverage must refuse publication");
+    assert!(matches!(
+        error,
+        FileSystemError::CorruptState {
+            reason: "drained write has missing pending extent coverage"
+        }
+    ));
+    assert_eq!(fs.generation(), generation_before);
+    assert_eq!(fs.root_publication_epoch, publication_before);
+    assert!(fs.mutation_delta.is_none());
+    assert!(!fs.in_transaction);
+    assert_eq!(
+        fs.write_buffers
+            .get(&record.inode_id)
+            .expect("failed flush restores caller buffer")
+            .len(),
+        data.len()
+    );
+    assert_eq!(
+        fs.read_file("/coverage")
+            .expect("read restored caller buffer"),
+        data
+    );
+
+    fs.recovery_policy = RecoveryPolicy::ReadOnly;
+    drop(fs);
+    cleanup(&root);
+}
+
+#[test]
+fn coalesced_write_buffer_finalizes_each_extent_with_its_own_checksum() {
+    let root = temp_root("coalesced-per-extent-checksum");
+    let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open filesystem");
+    let record = fs
+        .create_file("/coalesced", DEFAULT_FILE_PERMISSIONS)
+        .expect("create coalesced file");
+    fs.set_auto_commit(false);
+    fs.set_write_buffer_flush_threshold_bytes(8);
+
+    let first = b"AA";
+    let second = b"BBB";
+    fs.write_file("/coalesced", 0, first)
+        .expect("buffer first extent");
+    fs.write_file("/coalesced", first.len() as u64, second)
+        .expect("buffer adjacent second extent");
+    assert_eq!(
+        fs.write_buffers
+            .get(&record.inode_id)
+            .expect("coalesced buffer")
+            .len(),
+        first.len() + second.len()
+    );
+    let pending = fs.lookup_extents(record.inode_id.get(), 0, 5);
+    assert_eq!(pending.len(), 2);
+    assert!(pending.iter().all(|extent| extent.is_pending_data()));
+
+    fs.flush_write_buffer(record.inode_id)
+        .expect("flush coalesced buffer");
+    let finalized = fs.lookup_extents(record.inode_id.get(), 0, 5);
+    assert_eq!(finalized.len(), 2);
+    assert!(finalized.iter().all(|extent| extent.is_data()));
+    assert_eq!(finalized[0].checksum, *blake3::hash(first).as_bytes());
+    assert_eq!(finalized[1].checksum, *blake3::hash(second).as_bytes());
+    assert_ne!(
+        finalized[0].checksum,
+        *blake3::hash([first.as_slice(), second.as_slice()].concat().as_slice()).as_bytes()
+    );
+    assert_eq!(
+        fs.read_file("/coalesced").expect("read coalesced content"),
+        b"AABBB"
+    );
+    fs.recovery_policy = RecoveryPolicy::ReadOnly;
+    drop(fs);
     cleanup(&root);
 }
 

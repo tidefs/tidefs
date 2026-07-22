@@ -226,47 +226,6 @@ impl WriteBuffer {
         result
     }
 
-    /// Drain one foreground writeback batch, leaving later dirty segments buffered.
-    ///
-    /// This is used by byte-threshold flushes. Explicit fences still use
-    /// [`WriteBuffer::drain`] so fsync/truncate/unmount publish all pending bytes.
-    pub fn drain_flush_batch(&mut self) -> Vec<(u64, Vec<u8>)> {
-        if self.segments.is_empty() {
-            return Vec::new();
-        }
-
-        let mut remaining = self.config.flush_threshold_bytes;
-        if remaining == 0 {
-            return self.drain();
-        }
-
-        let mut drained = Vec::new();
-        while remaining > 0 && !self.segments.is_empty() {
-            let Some((&offset, _)) = self.segments.iter().next() else {
-                break;
-            };
-            let mut data = self
-                .segments
-                .remove(&offset)
-                .expect("first segment key was present");
-            if data.len() <= remaining {
-                remaining -= data.len();
-                self.total_bytes = self.total_bytes.saturating_sub(data.len());
-                drained.push((offset, data));
-                continue;
-            }
-
-            let split_len = remaining;
-            let tail = data.split_off(split_len);
-            let tail_offset = offset.saturating_add(split_len as u64);
-            self.segments.insert(tail_offset, tail);
-            self.total_bytes = self.total_bytes.saturating_sub(data.len());
-            drained.push((offset, data));
-            remaining = 0;
-        }
-        drained
-    }
-
     /// Truncate buffered writes to at most `size` bytes.
     ///
     /// Removes segments whose offset is beyond `size`, and truncates any
@@ -679,53 +638,6 @@ mod tests {
                 &mmap_marker
             );
         }
-    }
-
-    #[test]
-    fn batch_drain_leaves_future_sparse_markers_buffered() {
-        let mut wb = WriteBuffer::new(WriteBufferConfig {
-            flush_threshold_bytes: 8192,
-            flush_threshold_age: Duration::from_millis(50),
-        });
-        let page_size = 4096usize;
-        let pwrite_offset = 1024usize;
-        let marker = 0xaabb_ccdd_eeff_0011_u64.to_le_bytes();
-
-        for page in 0..4 {
-            wb.ingest(&marker, (page * page_size + pwrite_offset) as u64);
-        }
-        for page in 0..2 {
-            let mut page_bytes = vec![0_u8; page_size];
-            page_bytes[pwrite_offset..pwrite_offset + marker.len()].copy_from_slice(&marker);
-            wb.ingest(&page_bytes, (page * page_size) as u64);
-        }
-
-        assert!(wb.should_flush());
-        let batch = wb.drain_flush_batch();
-        assert_eq!(batch.len(), 1);
-        assert_eq!(batch[0].0, 0);
-        assert_eq!(batch[0].1.len(), 8192);
-        assert_eq!(wb.len(), marker.len() * 2);
-
-        let remaining = wb.drain();
-        assert_eq!(remaining.len(), 2);
-        assert_eq!(remaining[0].0, (2 * page_size + pwrite_offset) as u64);
-        assert_eq!(remaining[1].0, (3 * page_size + pwrite_offset) as u64);
-    }
-
-    #[test]
-    fn batch_drain_splits_large_segment_at_threshold() {
-        let mut wb = WriteBuffer::new(WriteBufferConfig {
-            flush_threshold_bytes: 4,
-            flush_threshold_age: Duration::from_millis(50),
-        });
-
-        wb.ingest(b"abcdefghij", 0);
-        let batch = wb.drain_flush_batch();
-
-        assert_eq!(batch, vec![(0, b"abcd".to_vec())]);
-        assert_eq!(wb.len(), 6);
-        assert_eq!(wb.drain(), vec![(4, b"efghij".to_vec())]);
     }
 
     #[test]

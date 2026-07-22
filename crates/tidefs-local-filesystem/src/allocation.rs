@@ -8,8 +8,8 @@ use crate::constants::*;
 use crate::content::{
     content_chunk_count, content_chunk_len, content_chunk_start, decode_content_layout,
     find_chunk_in_manifest, overlay_chunk_index_bounds, overlay_chunk_writes_only_zeros,
-    range_intersects_overlay, read_content_layout_from_store, retained_content_chunk_ref,
-    validate_content_layout, ContentOverlayPatch,
+    range_intersects_overlay, retained_content_chunk_ref, validate_content_layout,
+    ContentOverlayPatch,
 };
 use crate::error::FileSystemError;
 use crate::object_keys::{content_chunk_object_key_for_version, content_object_key_for_version};
@@ -20,13 +20,19 @@ pub(crate) fn content_allocation_entries_for_state(
     store: &LocalObjectStore,
     state: &FileSystemState,
 ) -> Result<BTreeMap<ObjectKey, u64>> {
+    content_allocation_entries_for_state_with(state, |inode| {
+        content_allocation_entries_for_inode(store, inode)
+    })
+}
+
+pub(crate) fn content_allocation_entries_for_state_with(
+    state: &FileSystemState,
+    mut entries_for_inode: impl FnMut(&InodeRecord) -> Result<BTreeMap<ObjectKey, u64>>,
+) -> Result<BTreeMap<ObjectKey, u64>> {
     let mut entries = BTreeMap::new();
     for inode in state.inodes.values() {
         if inode.is_file_like() {
-            merge_allocation_entries(
-                &mut entries,
-                content_allocation_entries_for_inode(store, inode)?,
-            );
+            merge_allocation_entries(&mut entries, entries_for_inode(inode)?);
         }
     }
     Ok(entries)
@@ -173,14 +179,13 @@ pub(crate) fn materialized_content_bytes_for_layout(layout: &ContentLayout) -> R
 }
 
 pub(crate) fn planned_chunk_allocation_entries_for_overlay(
-    store: &LocalObjectStore,
+    old_layout: &ContentLayout,
     old_record: &InodeRecord,
     new_record: &InodeRecord,
     overlay_offset: u64,
     overlay_bytes: &[u8],
     allow_holes: bool,
 ) -> Result<BTreeMap<ObjectKey, u64>> {
-    let old_layout = read_content_layout_from_store(store, old_record.inode_id, old_record, true)?;
     let mut entries = BTreeMap::new();
     if allow_holes && overlay_bytes.is_empty() {
         if let crate::records::ContentLayout::Chunked(ref manifest) = old_layout {
@@ -361,7 +366,7 @@ pub(crate) fn planned_chunk_allocation_entries_for_overlay(
     }
     for chunk_index in 0..content_chunk_count(new_record.size)? {
         if let Some(retained) = retained_content_chunk_ref(
-            &old_layout,
+            old_layout,
             old_record.size,
             new_record.size,
             overlay_offset,
@@ -428,13 +433,12 @@ pub(crate) fn planned_chunk_allocation_entries_for_overlay(
 }
 
 pub(crate) fn planned_chunk_allocation_entries_for_patch_batch(
-    store: &LocalObjectStore,
+    old_layout: &ContentLayout,
     old_record: &InodeRecord,
     new_record: &InodeRecord,
     patches: &[ContentOverlayPatch<'_>],
     allow_holes: bool,
 ) -> Result<BTreeMap<ObjectKey, u64>> {
-    let old_layout = read_content_layout_from_store(store, old_record.inode_id, old_record, true)?;
     let mut entries = BTreeMap::new();
     if !allow_holes || old_record.size > new_record.size {
         return Err(FileSystemError::Unsupported {
@@ -868,20 +872,8 @@ pub(crate) fn queue_extent_keys_for_reclaim(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use crate::records::ContentManifestObject;
     use tidefs_types_vfs_core::{Generation, NodeKind};
-
-    fn temp_store(label: &str) -> LocalObjectStore {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time before epoch")
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "tidefs-allocation-{label}-{nanos}-{}",
-            std::process::id()
-        ));
-        LocalObjectStore::open(root).expect("open temp object store")
-    }
 
     fn test_record(inode_id: u64, data_version: u64, size: u64) -> InodeRecord {
         InodeRecord {
@@ -907,8 +899,14 @@ mod tests {
 
     #[test]
     fn sparse_size_changing_overlay_allocation_plans_only_touched_far_chunk() {
-        let store = temp_store("far-sparse-overlay-plan");
         let old_record = test_record(42, 1, 0);
+        let old_layout = ContentLayout::Chunked(ContentManifestObject {
+            inode_id: old_record.inode_id,
+            data_version: old_record.data_version,
+            file_size: 0,
+            chunk_size: content_chunk_size(),
+            chunks: Vec::new(),
+        });
         let far_chunk_index = 100_000_000_u64;
         let chunk_size = u64::from(content_chunk_size());
         let offset_in_chunk = 123_u64;
@@ -917,7 +915,7 @@ mod tests {
         let new_record = test_record(42, 2, overlay_offset + payload.len() as u64);
 
         let entries = planned_chunk_allocation_entries_for_overlay(
-            &store,
+            &old_layout,
             &old_record,
             &new_record,
             overlay_offset,

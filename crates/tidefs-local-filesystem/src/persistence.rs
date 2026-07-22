@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
+use std::collections::BTreeMap;
 use std::path::Path;
 
-use tidefs_local_object_store::{checksum64, LocalObjectStore, StoreError};
+use tidefs_local_object_store::{checksum64, pool::Pool, LocalObjectStore, StoreError};
+use tidefs_types_vfs_core::InodeId;
 
 use crate::constants::*;
+use crate::content::MountedContentReadAuthority;
 use crate::decode_content_layout;
 use crate::dedup::DedupIndex;
 use crate::encoding::*;
@@ -17,6 +20,7 @@ use crate::validate_content_layout;
 use crate::write_chunked_content;
 use crate::FileSystemState;
 use crate::Result;
+#[cfg(test)]
 pub(crate) fn persist_state(
     store: &mut LocalObjectStore,
     state: &FileSystemState,
@@ -24,6 +28,54 @@ pub(crate) fn persist_state(
 ) -> Result<()> {
     let _ = persist_state_until_boundary(store, state, root_authentication_key, None)?;
     Ok(())
+}
+
+/// Persist a mounted transaction with file content validated through Pool
+/// placement authority and transaction metadata retained on the raw primary.
+pub(crate) fn persist_state_with_pool(
+    pool: &mut Pool,
+    state: &FileSystemState,
+    root_authentication_key: RootAuthenticationKey,
+) -> Result<()> {
+    let _ = persist_state_with_pool_until_boundary(pool, state, root_authentication_key, None)?;
+    Ok(())
+}
+
+pub(crate) fn persist_state_with_pool_until_boundary(
+    pool: &mut Pool,
+    state: &FileSystemState,
+    root_authentication_key: RootAuthenticationKey,
+    stop_after: Option<FilesystemCommitBoundary>,
+) -> Result<FilesystemCommitBoundary> {
+    let transaction_id = state.generation.max(ROOT_COMMIT_MIN_TRANSACTION_ID);
+    let content_entries = pool_content_manifest_entries_for_state(pool, state)?;
+    let root = persist_transaction_objects_with_precomputed_content(
+        pool.raw_primary_store_mut(),
+        state,
+        transaction_id,
+        &content_entries,
+    )?;
+    if stop_after == Some(FilesystemCommitBoundary::TransactionObjectsWritten) {
+        return Ok(FilesystemCommitBoundary::TransactionObjectsWritten);
+    }
+    sync_pool_after_commit_boundary(pool, FilesystemCommitBoundary::TransactionObjectsWritten)
+        .map_err(FileSystemError::from)?;
+    if stop_after == Some(FilesystemCommitBoundary::TransactionObjectsSynced) {
+        return Ok(FilesystemCommitBoundary::TransactionObjectsSynced);
+    }
+    publish_root_commit(pool.raw_primary_store_mut(), &root, root_authentication_key)?;
+    if stop_after == Some(FilesystemCommitBoundary::RootCommitWritten) {
+        return Ok(FilesystemCommitBoundary::RootCommitWritten);
+    }
+    sync_pool_after_commit_boundary(pool, FilesystemCommitBoundary::RootCommitWritten).map_err(
+        |source| FileSystemError::PublishOutcomeUncertain {
+            completed_boundary: FilesystemCommitBoundary::RootCommitWritten,
+            recovery_expectation: CrashRecoveryExpectation::OldOrNewCommittedRoot,
+            live_state_reconciled: true,
+            source,
+        },
+    )?;
+    Ok(FilesystemCommitBoundary::RootCommitSynced)
 }
 
 pub(crate) fn persist_state_until_boundary(
@@ -63,6 +115,14 @@ pub(crate) fn sync_store_after_commit_boundary(
 ) -> std::result::Result<(), StoreError> {
     maybe_inject_sync_failure_after_boundary(store, boundary)?;
     store.sync_all()
+}
+
+fn sync_pool_after_commit_boundary(
+    pool: &mut Pool,
+    boundary: FilesystemCommitBoundary,
+) -> std::result::Result<(), StoreError> {
+    maybe_inject_sync_failure_after_boundary(pool.raw_primary_store(), boundary)?;
+    pool.sync_all()
 }
 
 #[cfg(not(test))]
@@ -217,6 +277,65 @@ pub(crate) fn transaction_manifest_entries_for_content(
     Ok(entries)
 }
 
+/// Build committed-root content entries exclusively from Pool-authorized
+/// reads. Raw-primary bytes cannot satisfy this mounted persistence boundary.
+pub(crate) fn transaction_manifest_entries_for_pool_content(
+    pool: &Pool,
+    inode: &InodeRecord,
+) -> Result<Vec<TransactionManifestEntry>> {
+    let authority = MountedContentReadAuthority::new(pool);
+    let content_key = content_object_key_for_version(inode.inode_id, inode.data_version);
+    let Some(content_bytes) = authority.read_current_object(content_key)? else {
+        if inode.size == 0 {
+            return Ok(Vec::new());
+        }
+        return Err(FileSystemError::ReceiptAuthorityMissing {
+            object_key: content_key,
+            expected_generation: 0,
+        });
+    };
+    let layout = decode_content_layout(&content_bytes)?;
+    validate_content_layout(inode.inode_id, inode, &layout)?;
+
+    let mut entries = vec![TransactionManifestEntry {
+        role: TransactionManifestObjectRole::VersionedContent,
+        object_key: content_key,
+        checksum: checksum64(&content_bytes),
+    }];
+    if let ContentLayout::Chunked(manifest) = layout {
+        for chunk_ref in &manifest.chunks {
+            if chunk_ref.is_hole() {
+                continue;
+            }
+            let _ = authority.read_current_chunk(manifest.inode_id, chunk_ref)?;
+            entries.push(TransactionManifestEntry {
+                role: TransactionManifestObjectRole::VersionedContentChunk,
+                object_key: content_chunk_object_key_for_version(
+                    manifest.inode_id,
+                    chunk_ref.data_version,
+                    chunk_ref.chunk_index,
+                ),
+                checksum: chunk_ref.checksum,
+            });
+        }
+    }
+    Ok(entries)
+}
+
+fn pool_content_manifest_entries_for_state(
+    pool: &Pool,
+    state: &FileSystemState,
+) -> Result<BTreeMap<InodeId, Vec<TransactionManifestEntry>>> {
+    let mut entries = BTreeMap::new();
+    for inode in state.inodes.values().filter(|inode| inode.is_file_like()) {
+        entries.insert(
+            inode.inode_id,
+            transaction_manifest_entries_for_pool_content(pool, inode)?,
+        );
+    }
+    Ok(entries)
+}
+
 pub(crate) fn fs_io_error(
     operation: &'static str,
     path: &Path,
@@ -234,13 +353,38 @@ pub(crate) fn persist_transaction_objects(
     state: &FileSystemState,
     transaction_id: u64,
 ) -> Result<RootCommitRecord> {
+    persist_transaction_objects_impl(store, state, transaction_id, None)
+}
+
+fn persist_transaction_objects_with_precomputed_content(
+    store: &mut LocalObjectStore,
+    state: &FileSystemState,
+    transaction_id: u64,
+    content_entries: &BTreeMap<InodeId, Vec<TransactionManifestEntry>>,
+) -> Result<RootCommitRecord> {
+    persist_transaction_objects_impl(store, state, transaction_id, Some(content_entries))
+}
+
+fn persist_transaction_objects_impl(
+    store: &mut LocalObjectStore,
+    state: &FileSystemState,
+    transaction_id: u64,
+    precomputed_content_entries: Option<&BTreeMap<InodeId, Vec<TransactionManifestEntry>>>,
+) -> Result<RootCommitRecord> {
     let mut manifest_entries = Vec::new();
     for inode in state.inodes.values() {
         let is_dirty = state.dirty_inodes.contains(&inode.inode_id);
         let needs_inode_write =
             is_dirty || !state.last_inode_write_tx.contains_key(&inode.inode_id);
 
-        if inode.is_file_like() && needs_inode_write {
+        if inode.is_file_like() && precomputed_content_entries.is_some() {
+            let entries = precomputed_content_entries
+                .and_then(|entries| entries.get(&inode.inode_id))
+                .ok_or(FileSystemError::CorruptState {
+                    reason: "mounted transaction is missing prevalidated content entries",
+                })?;
+            manifest_entries.extend(entries.iter().cloned());
+        } else if inode.is_file_like() && needs_inode_write {
             ensure_versioned_content_object(store, inode, &state.content_compression_policy)?;
             manifest_entries.extend(transaction_manifest_entries_for_content(
                 store, inode, false,
@@ -268,7 +412,7 @@ pub(crate) fn persist_transaction_objects(
                 reason: "clean inode reference points to missing object",
             })?;
             if current_bytes != existing_bytes {
-                if inode.is_file_like() {
+                if inode.is_file_like() && precomputed_content_entries.is_none() {
                     ensure_versioned_content_object(
                         store,
                         inode,
