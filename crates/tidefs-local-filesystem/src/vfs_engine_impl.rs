@@ -3376,18 +3376,94 @@ impl VfsLocalFileSystem {
         }
 
         let mut fs = self.fs.borrow_mut();
-        let result = match fs.store.safe_remove_device(&device_path) {
-            Ok(result) => result,
+        let pending = match fs.store.pending_device_removal_result(&device_path) {
+            Ok(pending) => pending,
             Err(err) => {
                 return live_admin_error(
                     1,
                     format!(
-                        "device remove: mounted pool owner could not remove '{}': {err}",
+                        "device remove: could not inspect pending removal state for '{}': {err}",
                         device_path.display()
                     ),
                 )
             }
         };
+        let result = if let Some(result) = pending {
+            result
+        } else {
+            if let Err(err) = fs.sync_all() {
+                return live_admin_error(
+                    1,
+                    format!(
+                        "device remove: could not sync mounted filesystem state before evacuating '{}': {err}",
+                        device_path.display()
+                    ),
+                );
+            }
+
+            match fs.store.safe_remove_device(&device_path) {
+                Ok(result) => result,
+                Err(err) => {
+                    return live_admin_error(
+                        1,
+                        format!(
+                            "device remove: mounted pool owner could not remove '{}': {err}",
+                            device_path.display()
+                        ),
+                    )
+                }
+            }
+        };
+
+        if result.topology_commit_pending {
+            let remaining_devices = fs.store.stats().device_count;
+            let mut machine = json!({
+                "status": "topology_commit_pending",
+                "device_path": device_path.display().to_string(),
+                "topology_commit_pending": true,
+                "topology_committed": false,
+                "marker_retained": true,
+                "current_process_detached": true,
+                "objects_evacuated": result.objects_evacuated,
+                "objects_failed": result.objects_failed,
+                "bytes_evacuated": result.bytes_evacuated,
+                "remaining_devices": remaining_devices,
+                "action": "reopen with the original pre-removal device configuration to resume; keep the target attached and do not decommission or treat it as removed",
+            });
+
+            if let Err(err) = fs.store.sync_all() {
+                machine["surviving_devices_synced"] = Value::Bool(false);
+                machine["survivor_sync_error"] = Value::String(err.to_string());
+                let message = format!(
+                    "device remove: evacuation of '{}' completed and the current process detached the target, but survivor sync failed while durable topology commit remains pending and the recovery marker is retained: {err}; reopen with the original pre-removal device configuration to resume, keep the target attached, and do not decommission or treat it as removed (objects_evacuated={}, objects_failed={}, bytes_evacuated={}, remaining_devices={})",
+                    device_path.display(),
+                    result.objects_evacuated,
+                    result.objects_failed,
+                    result.bytes_evacuated,
+                    remaining_devices,
+                );
+                return if wants_json {
+                    LivePoolAdminResponse::error_machine_json(1, message, machine.to_string())
+                } else {
+                    live_admin_error(1, message)
+                };
+            }
+
+            machine["surviving_devices_synced"] = Value::Bool(true);
+            let message = format!(
+                "device remove: evacuation of '{}' completed, the current process detached the target, and surviving devices were synced, but durable topology commit is unavailable; removal remains pending and the recovery marker is retained; reopen with the original pre-removal device configuration to resume, keep the target attached, and do not decommission or treat it as removed (objects_evacuated={}, objects_failed={}, bytes_evacuated={}, remaining_devices={})",
+                device_path.display(),
+                result.objects_evacuated,
+                result.objects_failed,
+                result.bytes_evacuated,
+                remaining_devices,
+            );
+            return if wants_json {
+                LivePoolAdminResponse::error_machine_json(1, message, machine.to_string())
+            } else {
+                live_admin_error(1, message)
+            };
+        }
 
         if !result.complete || result.objects_failed > 0 {
             return live_admin_error(
@@ -3401,38 +3477,16 @@ impl VfsLocalFileSystem {
             );
         }
 
-        if let Err(err) = fs.store.sync_all() {
-            return live_admin_error(
-                1,
-                format!(
-                    "device remove: '{}' was removed from mounted state, but surviving-device sync failed: {err}",
-                    device_path.display()
-                ),
-            );
-        }
-
-        let remaining_devices = fs.store.stats().device_count;
-        let response = json!({
-            "device_path": device_path.display().to_string(),
-            "objects_evacuated": result.objects_evacuated,
-            "objects_failed": result.objects_failed,
-            "bytes_evacuated": result.bytes_evacuated,
-            "remaining_devices": remaining_devices,
-            "active_label_persistence": "not yet wired in mounted-pool topology updates; tracked by TFR-011/TFR-012",
-        });
-
-        if wants_json {
-            live_admin_ok_json(response)
-        } else {
-            live_admin_ok_text(format!(
-                "device '{}' removed through live pool owner\n  objects evacuated: {}\n  bytes evacuated:   {}\n  objects failed:    {}\n  remaining devices: {}\n  active labels:     mounted-pool topology labels still need TFR-011/TFR-012 wiring",
+        live_admin_error(
+            1,
+            format!(
+                "device remove: mounted pool owner reported completion for '{}' without the required topology-pending state; refusing to report the target removed because this path has no durable topology commit (objects_evacuated={}, objects_failed={}, bytes_evacuated={})",
                 device_path.display(),
                 result.objects_evacuated,
-                result.bytes_evacuated,
                 result.objects_failed,
-                remaining_devices,
-            ))
-        }
+                result.bytes_evacuated,
+            ),
+        )
     }
 }
 
@@ -7103,6 +7157,13 @@ mod tests {
         (VfsLocalFileSystem::new(fs), root, devices)
     }
 
+    fn fixed_offset_pool_label(path: &std::path::Path) -> Vec<u8> {
+        let mut file = std::fs::File::open(path).expect("open device image label");
+        let mut label = vec![0u8; tidefs_types_pool_label_core::POOL_LABEL_SIZE];
+        std::io::Read::read_exact(&mut file, &mut label).expect("read fixed-offset pool label");
+        label
+    }
+
     #[test]
     fn live_pool_admin_unsupported_local_command_returns_typed_error() {
         let (engine, _td) = temp_fs();
@@ -7329,39 +7390,205 @@ mod tests {
     }
 
     #[test]
-    fn live_device_remove_evacuates_through_mounted_pool_owner() {
-        let (engine, _td, devices) = temp_fs_with_block_devices(2);
-        let payload = b"live owner device remove keeps mounted data reachable";
-        {
+    fn live_device_remove_reports_topology_commit_pending() {
+        let (engine, td, devices) = temp_fs_with_block_devices(2);
+        let payload = b"live owner device remove keeps receipt-backed data reachable";
+        let (target_path, target_guid, object_key) = {
             let mut fs = engine.fs.borrow_mut();
-            fs.create_file("/keep", 0o644).expect("create file");
-            fs.write_file("/keep", 0, payload).expect("write file");
-            fs.sync_all().expect("sync file before removal");
+            // Device zero also owns raw filesystem transaction metadata. Pick
+            // a receipt-backed object placed on the other member so this test
+            // isolates the mounted device-removal boundary.
+            let mut selected = None;
+            for candidate in 0..64 {
+                let object_key = tidefs_local_object_store::ObjectKey::from_name(
+                    format!("mounted-live-owner-device-removal-data-{candidate}").as_bytes(),
+                );
+                fs.store
+                    .put(
+                        tidefs_local_object_store::DeviceIoClass::Data,
+                        object_key,
+                        payload,
+                    )
+                    .expect("write receipt-backed data through mounted pool owner");
+                let receipt = fs
+                    .store
+                    .placement_receipt_for_key(
+                        tidefs_local_object_store::DeviceIoClass::Data,
+                        object_key,
+                    )
+                    .expect("load data placement receipt")
+                    .expect("written data has placement receipt");
+                assert_eq!(receipt.targets.len(), 1, "test expects one receipt target");
+                let target = receipt.targets.first().expect("data receipt target");
+                let target_index = target.device_index as usize;
+                if target_index != 0 {
+                    selected = Some((
+                        devices
+                            .get(target_index)
+                            .expect("receipt target maps to configured device")
+                            .clone(),
+                        target.device_guid,
+                        object_key,
+                    ));
+                    break;
+                }
+            }
+            fs.store
+                .sync_all()
+                .expect("sync receipt-backed data before removal");
             assert_eq!(fs.store.stats().device_count, 2);
-        }
+            selected.expect("planner must place a bounded candidate on the non-primary device")
+        };
+        let original_labels: Vec<_> = devices
+            .iter()
+            .map(|path| fixed_offset_pool_label(path))
+            .collect();
+        let marker_path = td.path().join("metadata/.tidefs_device_removal_pending");
 
         let removed = live_device_admin(
             &engine,
             "remove",
             json!({
-                "device_path": devices[0].display().to_string(),
+                "device_path": target_path.display().to_string(),
                 "force": false,
             }),
             true,
         );
 
-        assert_eq!(removed["ok"], true, "remove response: {removed}");
+        assert_eq!(removed["ok"], false, "remove response: {removed}");
+        assert_eq!(removed["exit_code"], 1);
+        assert_eq!(
+            removed["json"]["status"], "topology_commit_pending",
+            "remove response: {removed}"
+        );
+        assert_eq!(removed["json"]["topology_commit_pending"], true);
+        assert_eq!(removed["json"]["topology_committed"], false);
+        assert_eq!(removed["json"]["marker_retained"], true);
+        assert_eq!(removed["json"]["current_process_detached"], true);
+        assert_eq!(removed["json"]["surviving_devices_synced"], true);
         assert_eq!(removed["json"]["objects_failed"], 0);
+        assert!(
+            removed["json"]["objects_evacuated"]
+                .as_u64()
+                .is_some_and(|count| count > 0),
+            "evacuation count must be numeric and nonzero: {removed}"
+        );
+        assert!(
+            removed["json"]["bytes_evacuated"]
+                .as_u64()
+                .is_some_and(|count| count >= payload.len() as u64),
+            "evacuated byte count must cover the selected content: {removed}"
+        );
         assert_eq!(removed["json"]["remaining_devices"], 1);
+        assert_eq!(
+            removed["json"]["action"],
+            "reopen with the original pre-removal device configuration to resume; keep the target attached and do not decommission or treat it as removed"
+        );
+        assert!(
+            removed["error"].as_str().is_some_and(|message| {
+                message.contains("durable topology commit is unavailable")
+                    && message.contains("recovery marker is retained")
+                    && message.contains("do not decommission or treat it as removed")
+            }),
+            "pending response must be explicit and actionable: {removed}"
+        );
+        assert!(marker_path.exists());
 
         let fs = engine.fs.borrow();
         assert_eq!(fs.store.stats().device_count, 1);
         assert_eq!(
-            fs.read_file("/keep").expect("read after live removal"),
-            payload
+            fs.store
+                .get(tidefs_local_object_store::DeviceIoClass::Data, object_key)
+                .expect("read after live removal"),
+            Some(payload.to_vec())
         );
+        let survivor_receipt = fs
+            .store
+            .placement_receipt_for_key(tidefs_local_object_store::DeviceIoClass::Data, object_key)
+            .expect("load survivor receipt after live removal")
+            .expect("survivor receipt exists after live removal");
+        assert!(
+            survivor_receipt
+                .targets
+                .iter()
+                .all(|target| target.device_guid != target_guid),
+            "current receipt must exclude the detached device"
+        );
+        fs.stat("/").expect("mounted namespace remains readable");
         drop(fs);
+        for (path, expected) in devices.iter().zip(&original_labels) {
+            assert!(
+                fixed_offset_pool_label(path).as_slice() == expected.as_slice(),
+                "in-memory detach must not change fixed-offset topology labels"
+            );
+        }
         drop(engine);
+
+        let reopened = LocalFileSystem::open_with_block_devices(
+            td.path().join("metadata"),
+            &devices,
+            tidefs_local_object_store::StoreOptions::default(),
+            RootAuthenticationKey::demo_key(),
+        )
+        .expect("reopen original two-device configuration");
+        assert!(marker_path.exists());
+        assert_eq!(reopened.store.stats().device_count, 1);
+        assert_eq!(
+            reopened
+                .store
+                .get(tidefs_local_object_store::DeviceIoClass::Data, object_key)
+                .expect("read before repeated removal status"),
+            Some(payload.to_vec())
+        );
+
+        let reopened_engine = VfsLocalFileSystem::new(reopened);
+        let repeated = live_device_admin(
+            &reopened_engine,
+            "remove",
+            json!({
+                "device_path": target_path.display().to_string(),
+                "force": false,
+            }),
+            true,
+        );
+        assert_eq!(repeated["ok"], false, "repeat response: {repeated}");
+        assert_eq!(repeated["exit_code"], 1);
+        assert_eq!(repeated["json"]["status"], "topology_commit_pending");
+        assert_eq!(repeated["json"]["marker_retained"], true);
+        assert_eq!(repeated["json"]["current_process_detached"], true);
+        assert_eq!(repeated["json"]["objects_failed"], 0);
+        assert_eq!(repeated["json"]["surviving_devices_synced"], true);
+        assert_eq!(repeated["json"]["remaining_devices"], 1);
+
+        let reopened = reopened_engine.fs.borrow();
+        assert_eq!(
+            reopened
+                .store
+                .get(tidefs_local_object_store::DeviceIoClass::Data, object_key)
+                .expect("read after reopen"),
+            Some(payload.to_vec())
+        );
+        let reopened_receipt = reopened
+            .store
+            .placement_receipt_for_key(tidefs_local_object_store::DeviceIoClass::Data, object_key)
+            .expect("load receipt after original-config reopen")
+            .expect("receipt exists after original-config reopen");
+        assert!(
+            reopened_receipt
+                .targets
+                .iter()
+                .all(|target| target.device_guid != target_guid),
+            "reopen must retain survivor receipt authority"
+        );
+        reopened
+            .stat("/")
+            .expect("reopened mounted namespace remains readable");
+        for (path, expected) in devices.iter().zip(&original_labels) {
+            assert!(
+                fixed_offset_pool_label(path).as_slice() == expected.as_slice(),
+                "original-config reopen must not change fixed-offset topology labels"
+            );
+        }
     }
 
     #[test]
