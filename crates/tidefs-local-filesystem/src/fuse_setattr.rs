@@ -230,7 +230,8 @@ pub fn engine_setattr(
         return Ok(record.to_inode_attr());
     }
 
-    fs.begin_mutation();
+    fs.try_begin_mutation()
+        .map_err(|error| SetattrDispatchError::from(&error))?;
     let tick = fs.bump_generation();
     updated.metadata_version = updated.metadata_version.max(tick);
 

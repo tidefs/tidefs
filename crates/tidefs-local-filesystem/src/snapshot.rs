@@ -605,7 +605,7 @@ impl LocalFileSystem {
             });
         }
 
-        self.begin_mutation();
+        self.try_begin_mutation()?;
         let created_at_generation = self.bump_generation();
 
         let record = SnapshotRecord {
@@ -675,7 +675,7 @@ impl LocalFileSystem {
 
         self.ensure_snapshot_authority_consistent()?;
 
-        self.begin_mutation();
+        self.try_begin_mutation()?;
         self.bump_generation();
         self.state.snapshots.remove(&name_bytes);
         self.mark_inode_metadata_dirty(ROOT_INODE_ID);
@@ -737,7 +737,7 @@ impl LocalFileSystem {
         self.ensure_snapshot_record_authority(&record)?;
         self.ensure_snapshot_record_authority(&origin_record)?;
 
-        self.begin_mutation();
+        self.try_begin_mutation()?;
         let generation = self.bump_generation();
 
         let promoted = SnapshotRecord {
@@ -957,7 +957,7 @@ impl LocalFileSystem {
             });
         }
 
-        self.begin_mutation();
+        self.try_begin_mutation()?;
         let created_at_generation = self.bump_generation();
 
         let record = SnapshotRecord {
@@ -1006,7 +1006,7 @@ impl LocalFileSystem {
             });
         }
 
-        self.begin_mutation();
+        self.try_begin_mutation()?;
         self.bump_generation();
         self.state.snapshots.remove(&name_bytes);
         self.mark_inode_metadata_dirty(ROOT_INODE_ID);
@@ -1077,7 +1077,7 @@ impl LocalFileSystem {
             });
         }
 
-        self.begin_mutation();
+        self.try_begin_mutation()?;
         self.bump_generation();
 
         let mut updated = record;
@@ -1134,7 +1134,7 @@ impl LocalFileSystem {
             });
         }
 
-        self.begin_mutation();
+        self.try_begin_mutation()?;
         self.bump_generation();
 
         let mut updated = record;

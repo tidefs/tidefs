@@ -1251,7 +1251,7 @@ impl VfsLocalFileSystem {
             return Ok(());
         }
 
-        fs.begin_mutation();
+        fs.try_begin_mutation().map_err(|error| map_errno(&error))?;
         let tick = fs.bump_generation();
         updated.metadata_version = updated.metadata_version.max(tick);
         updated.subtree_rev = updated.subtree_rev.saturating_add(1).max(1);
@@ -1319,7 +1319,7 @@ impl VfsLocalFileSystem {
         fs.ensure_inode_capacity_for_new_inode()
             .map_err(|e| map_errno(&e))?;
 
-        fs.begin_mutation();
+        fs.try_begin_mutation().map_err(|error| map_errno(&error))?;
         if !fs.state.inodes.contains_key(&parent_id) {
             fs.rollback_mutation_delta();
             return Err(Errno::ENOENT);
@@ -1455,7 +1455,7 @@ impl VfsLocalFileSystem {
         fs.ensure_inode_capacity_for_new_inode()
             .map_err(|e| map_errno(&e))?;
 
-        fs.begin_mutation();
+        fs.try_begin_mutation().map_err(|error| map_errno(&error))?;
         if !fs.state.inodes.contains_key(&parent_id) {
             fs.rollback_mutation_delta();
             return Err(Errno::ENOENT);
@@ -1634,7 +1634,7 @@ impl VfsLocalFileSystem {
         fs.ensure_inode_capacity_for_new_inode()
             .map_err(|e| map_errno(&e))?;
 
-        fs.begin_mutation();
+        fs.try_begin_mutation().map_err(|error| map_errno(&error))?;
         if !fs.state.inodes.contains_key(&parent_id) {
             fs.rollback_mutation_delta();
             return Err(Errno::ENOENT);
@@ -4393,7 +4393,7 @@ impl VfsLocalFileSystem {
         fs.ensure_content_capacity_with_planned_inode(Some(dest_fh.inode_id), planned_entries)
             .map_err(|e| map_errno(&e))?;
 
-        fs.begin_mutation();
+        fs.try_begin_mutation().map_err(|error| map_errno(&error))?;
         let tick = fs.bump_generation();
         debug_assert_eq!(tick, planned_tick);
         dest_record.data_version = tick;
@@ -4619,6 +4619,10 @@ impl VfsEngine for VfsLocalFileSystem {
         _ctx: &RequestCtx,
     ) -> std::result::Result<InodeAttr, Errno> {
         self.ensure_writable()?;
+        self.fs
+            .borrow()
+            .ensure_mutation_root_authority()
+            .map_err(|error| map_errno(&error))?;
         self.validate_optional_file_handle(inode, handle)?;
         const SUPPORTED_SETATTR_BITS: u32 = FATTR_MODE
             | FATTR_UID
@@ -4714,6 +4718,10 @@ impl VfsEngine for VfsLocalFileSystem {
         ctx: &RequestCtx,
     ) -> std::result::Result<(InodeAttr, EngineFileHandle), Errno> {
         self.ensure_writable()?;
+        self.fs
+            .borrow()
+            .ensure_mutation_root_authority()
+            .map_err(|error| map_errno(&error))?;
         let parent_path = self.inode_path(parent)?;
         let child_path = build_child_path(&parent_path, name)?;
 
@@ -4805,6 +4813,10 @@ impl VfsEngine for VfsLocalFileSystem {
         ctx: &RequestCtx,
     ) -> std::result::Result<(InodeAttr, EngineFileHandle), Errno> {
         self.ensure_writable()?;
+        self.fs
+            .borrow()
+            .ensure_mutation_root_authority()
+            .map_err(|error| map_errno(&error))?;
         let parent_path = self.inode_path(parent)?;
         let child_path = build_child_path(&parent_path, name)?;
 
@@ -4860,6 +4872,10 @@ impl VfsEngine for VfsLocalFileSystem {
         ctx: &RequestCtx,
     ) -> std::result::Result<(InodeAttr, EngineFileHandle), Errno> {
         self.ensure_writable()?;
+        self.fs
+            .borrow()
+            .ensure_mutation_root_authority()
+            .map_err(|error| map_errno(&error))?;
         let parent_path = self.inode_path(parent)?;
         let parent_record = self
             .fs
@@ -5386,6 +5402,10 @@ impl VfsEngine for VfsLocalFileSystem {
         _ctx: &RequestCtx,
     ) -> std::result::Result<u32, Errno> {
         self.ensure_writable()?;
+        self.fs
+            .borrow()
+            .ensure_mutation_root_authority()
+            .map_err(|error| map_errno(&error))?;
         let live = self.validate_file_handle(fh)?;
         if live.enforce_access_mode && !open_flags_allow_write(live.open_flags) {
             return Err(Errno::EBADF);
@@ -5516,6 +5536,10 @@ impl VfsEngine for VfsLocalFileSystem {
         _ctx: &RequestCtx,
     ) -> std::result::Result<(), Errno> {
         self.ensure_writable()?;
+        self.fs
+            .borrow()
+            .ensure_mutation_root_authority()
+            .map_err(|error| map_errno(&error))?;
         self.validate_file_handle(fh)?;
         if let Some(file) = self.anonymous_tmpfiles.borrow_mut().get_mut(&fh.inode_id) {
             let end = offset.checked_add(length).ok_or(Errno::EINVAL)?;
@@ -5683,6 +5707,10 @@ impl VfsEngine for VfsLocalFileSystem {
         {
             return Err(Errno::EINVAL);
         }
+        self.fs
+            .borrow()
+            .ensure_mutation_root_authority()
+            .map_err(|error| map_errno(&error))?;
 
         // Record intent-log entry for crash-recovery replay (non-tmpfile only).
         if !self
@@ -5704,7 +5732,8 @@ impl VfsEngine for VfsLocalFileSystem {
                     src_offset: offset_in,
                     dst_offset: offset_out,
                     len: length,
-                });
+                })
+                .map_err(|error| map_errno(&error))?;
         }
 
         let source_is_anonymous = self
@@ -6342,6 +6371,10 @@ impl VfsEngine for VfsLocalFileSystem {
         _ctx: &RequestCtx,
     ) -> std::result::Result<(u64, u64), Errno> {
         self.ensure_writable()?;
+        self.fs
+            .borrow()
+            .ensure_mutation_root_authority()
+            .map_err(|error| map_errno(&error))?;
         let mut fs = self.fs.borrow_mut();
         let before_after = fs.defrag_extent_map(ino).map_err(|_e| Errno::EIO)?;
         if before_after.1 < before_after.0 {
@@ -15523,6 +15556,88 @@ mod tests {
 
         let after_write = engine.getattr(attr.inode_id, Some(&fh), &ctx()).unwrap();
         assert_eq!(after_write.posix.size, b"tmpfile bytes".len() as u64);
+    }
+
+    #[test]
+    fn mutation_entries_refuse_after_uncertain_root_publication() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).expect("root inode");
+        let (source_attr, source_fh) = engine
+            .create(root, b"source", 0o644, O_RDWR, &ctx())
+            .expect("create source");
+        let (_dest_attr, dest_fh) = engine
+            .create(root, b"dest", 0o644, O_RDWR, &ctx())
+            .expect("create destination");
+        engine
+            .write(&source_fh, 0, b"copy source", &ctx())
+            .expect("write source");
+        engine
+            .fs
+            .borrow_mut()
+            .sync_all()
+            .expect("sync stable state");
+        let source_before = engine
+            .getattr(source_attr.inode_id, Some(&source_fh), &ctx())
+            .expect("source attr before uncertainty");
+
+        crate::persistence::inject_next_sync_failure_after_boundary(
+            crate::FilesystemCommitBoundary::RootCommitWritten,
+        );
+        let error = engine
+            .fs
+            .borrow_mut()
+            .create_file("/uncertain", 0o644)
+            .expect_err("inject uncertain root publication");
+        assert!(matches!(
+            error,
+            FileSystemError::PublishOutcomeUncertain { .. }
+        ));
+
+        let next_inode_after_uncertainty = engine.fs.borrow().stats().next_inode_id;
+        let next_intent_after_uncertainty = engine.fs.borrow().intent_log.next_entry_id();
+        let mut mode_update = SetAttr::new();
+        mode_update.valid = FATTR_MODE;
+        mode_update.mode = (source_before.posix.mode & S_IFMT) | 0o600;
+
+        assert_eq!(
+            engine
+                .setattr(source_attr.inode_id, &mode_update, Some(&source_fh), &ctx())
+                .unwrap_err(),
+            Errno::EIO
+        );
+        assert_eq!(
+            engine.tmpfile(root, 0o600, O_RDWR, &ctx()).unwrap_err(),
+            Errno::EIO
+        );
+        assert_eq!(
+            engine
+                .copy_file_range(&source_fh, 0, &dest_fh, 0, source_before.posix.size, &ctx(),)
+                .unwrap_err(),
+            Errno::EIO
+        );
+
+        assert_eq!(
+            engine
+                .getattr(source_attr.inode_id, Some(&source_fh), &ctx())
+                .expect("source attr after refusals")
+                .posix
+                .mode,
+            source_before.posix.mode
+        );
+        assert_eq!(
+            engine.fs.borrow().stats().next_inode_id,
+            next_inode_after_uncertainty
+        );
+        assert_eq!(
+            engine.fs.borrow().intent_log.next_entry_id(),
+            next_intent_after_uncertainty
+        );
+        assert!(engine
+            .fs
+            .borrow()
+            .read_file("/dest")
+            .expect("destination remains readable")
+            .is_empty());
     }
 
     #[test]

@@ -1766,6 +1766,47 @@ fn direct_write_superseding_buffered_dirty_bytes_releases_dirty_charge() {
 }
 
 #[test]
+fn direct_write_contiguous_batch_has_exact_finalized_extent_coverage() {
+    let root = temp_root("direct-write-contiguous-extents");
+    let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
+    let inode_id = fs
+        .create_file("/data", DEFAULT_FILE_PERMISSIONS)
+        .expect("create data file")
+        .inode_id;
+    fs.sync_all().expect("commit empty file");
+    fs.set_auto_commit(false);
+
+    let segment_len = 1024_usize;
+    let mut expected = Vec::new();
+    let mut segments = Vec::new();
+    for index in 0..8_u64 {
+        let bytes = vec![u8::try_from(index + 1).expect("test byte"); segment_len];
+        expected.extend_from_slice(&bytes);
+        segments.push((index * segment_len as u64, bytes));
+    }
+    fs.write_file_ranges_direct("/data", segments)
+        .expect("write contiguous direct batch");
+
+    let extents = fs.lookup_extents(inode_id.get(), 0, expected.len() as u64);
+    assert_eq!(extents.len(), 1);
+    assert!(extents[0].is_data());
+    assert!(!extents[0].is_pending_data());
+    assert_eq!(extents[0].logical_offset, 0);
+    assert_eq!(extents[0].length, expected.len() as u64);
+    assert_eq!(extents[0].checksum, *blake3::hash(&expected).as_bytes());
+    fs.sync_all().expect("commit direct batch");
+    drop(fs);
+
+    let reopened = LocalFileSystem::open_with_options(&root, options()).expect("reopen fs");
+    assert_eq!(
+        reopened.read_file("/data").expect("read direct batch"),
+        expected
+    );
+    drop(reopened);
+    cleanup(&root);
+}
+
+#[test]
 fn unlink_of_buffered_dirty_file_releases_dirty_capacity() {
     let root = temp_root("unlink-buffered-dirty-capacity");
     let data_len = content_chunk_size() as usize;
@@ -2998,10 +3039,6 @@ fn partial_sparse_mutations_reject_receiptless_chunk_without_live_state_change()
             .store
             .raw_primary_store()
             .version_locations_of(candidate_root_key);
-        let live_before_failure = fs
-            .read_file(&path)
-            .expect("read buffered live view before induced failure");
-
         let result: Result<()> = match operation {
             "punch-hole" => fs.punch_hole("/file.bin", 100, 400).map(|_| ()),
             "zero-range" => fs.zero_range("/file.bin", 100, 400).map(|_| ()),
@@ -3360,7 +3397,7 @@ fn unauthenticated_newer_root_candidate_is_skipped() {
 }
 
 #[test]
-fn snapshot_rollback_restores_an_isolated_committed_root() {
+fn snapshot_rollback_is_synchronous_and_atomic() {
     let root = temp_root("snapshot-rollback-isolated-root");
     let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
     fs.create_file("/file.txt", 0o644).expect("create file");
@@ -3381,6 +3418,9 @@ fn snapshot_rollback_restores_an_isolated_committed_root() {
         .expect("create post-snapshot file");
     fs.write_file("/after.txt", 0, b"post-snapshot only")
         .expect("write post-snapshot file");
+    fs.set_auto_commit(false);
+    fs.sync_all()
+        .expect("settle current state before snapshot replacement");
     let generation_before_rollback = fs.stats().filesystem_generation;
     let next_inode_before_rollback = fs.stats().next_inode_id;
 
@@ -3403,6 +3443,7 @@ fn snapshot_rollback_restores_an_isolated_committed_root() {
         Err(FileSystemError::NotFound { .. })
     ));
     assert_eq!(fs.stats().next_inode_id, next_inode_before_rollback);
+    assert_eq!(fs.uncommitted_mutation_count(), 0);
     assert_eq!(fs.list_snapshots().len(), 1);
     drop(fs);
 
@@ -3419,6 +3460,64 @@ fn snapshot_rollback_restores_an_isolated_committed_root() {
         Err(FileSystemError::NotFound { .. })
     ));
     assert_eq!(reopened.list_snapshots().len(), 1);
+    drop(reopened);
+    cleanup(&root);
+
+    let root = temp_root("snapshot-rollback-prepublication");
+    let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
+    fs.create_file("/file.txt", 0o644).expect("create file");
+    fs.write_file("/file.txt", 0, b"before-state")
+        .expect("write before snapshot");
+    fs.sync_all().expect("sync before snapshot");
+    fs.create_snapshot("before").expect("create snapshot");
+    fs.replace_file("/file.txt", b"current-state")
+        .expect("replace current state");
+    fs.create_file("/current-only.txt", 0o644)
+        .expect("create current-only file");
+    fs.sync_all().expect("sync current state");
+    fs.set_auto_commit(false);
+    let generation_before = fs.generation();
+
+    inject_next_sync_failure_after_boundary(FilesystemCommitBoundary::TransactionObjectsWritten);
+    let error = fs
+        .rollback_to_snapshot("before")
+        .expect_err("prepublication failure must reject snapshot rollback");
+    assert!(matches!(
+        error,
+        FileSystemError::Store(StoreError::Io { .. })
+    ));
+    assert_eq!(fs.generation(), generation_before);
+    assert_eq!(
+        fs.read_file("/file.txt")
+            .expect("read restored current state"),
+        b"current-state"
+    );
+    assert!(fs.lookup("/current-only.txt").is_ok());
+
+    fs.create_file("/continued.txt", 0o644)
+        .expect("mutate after failed snapshot replacement");
+    fs.write_file("/continued.txt", 0, b"continued")
+        .expect("write after failed snapshot replacement");
+    fs.sync_all()
+        .expect("publish mutation after failed snapshot replacement");
+    drop(fs);
+
+    let reopened = LocalFileSystem::open_with_options(&root, options())
+        .expect("reopen current root after continued mutation");
+    assert_eq!(
+        reopened
+            .read_file("/file.txt")
+            .expect("read current state after reopen"),
+        b"current-state"
+    );
+    assert!(reopened.lookup("/current-only.txt").is_ok());
+    assert_eq!(
+        reopened
+            .read_file("/continued.txt")
+            .expect("read continued mutation after reopen"),
+        b"continued"
+    );
+    drop(reopened);
     cleanup(&root);
 }
 
@@ -3996,55 +4095,63 @@ fn pre_publish_sync_failure_rolls_back_live_state() {
 }
 
 #[test]
-fn successful_public_commit_discards_its_rollback_delta() {
-    let root = temp_root("public-commit-discards-rollback-delta");
-    let committed_generation;
+fn prepublication_failure_rolls_back_only_current_mutation() {
+    let root = temp_root("prepublication-failure-current-mutation");
+    let acknowledged_generation;
 
     {
         let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
         fs.set_auto_commit(false);
-        fs.create_file("/committed.txt", 0o644)
-            .expect("create committed file");
-        fs.write_file("/committed.txt", 0, b"committed")
-            .expect("write committed file");
-        fs.sync_all()
-            .expect("publish through public commit boundary");
-        committed_generation = fs.generation();
+        let inode_id = fs
+            .create_file("/data", DEFAULT_FILE_PERMISSIONS)
+            .expect("create data file")
+            .inode_id;
+        fs.write_file("/data", 0, b"old")
+            .expect("write committed base");
+        fs.sync_all().expect("publish committed base");
+
+        fs.write_file_ranges_direct("/data", vec![(0, b"new".to_vec())])
+            .expect("acknowledge direct write");
+        acknowledged_generation = fs.generation();
+        assert!(fs.mutation_delta.is_none());
+        assert_eq!(fs.read_file("/data").expect("read direct bytes"), b"new");
+        assert!(fs.state.dirty_content.contains(&inode_id));
 
         fs.set_auto_commit(true);
         inject_next_sync_failure_after_boundary(
             FilesystemCommitBoundary::TransactionObjectsWritten,
         );
         let error = fs
-            .create_file("/failed.txt", 0o644)
-            .expect_err("second mutation must fail before root publication");
+            .create_file("/failed", DEFAULT_FILE_PERMISSIONS)
+            .expect_err("later mutation must fail before root publication");
         assert!(matches!(
             error,
             FileSystemError::Store(StoreError::Io { .. })
         ));
-        assert_eq!(fs.generation(), committed_generation);
+        assert_eq!(fs.generation(), acknowledged_generation);
         assert_eq!(
-            fs.read_file("/committed.txt")
-                .expect("published file remains live"),
-            b"committed"
+            fs.read_file("/data")
+                .expect("acknowledged direct bytes survive rollback"),
+            b"new"
         );
+        assert!(fs.state.dirty_content.contains(&inode_id));
         assert!(matches!(
-            fs.lookup("/failed.txt"),
+            fs.lookup("/failed"),
             Err(FileSystemError::NotFound { .. })
         ));
+
+        fs.sync_all().expect("publish retained direct bytes");
         fs.recovery_policy = RecoveryPolicy::ReadOnly;
     }
 
     let reopened = LocalFileSystem::open_with_options(&root, options()).expect("reopen fs");
-    assert_eq!(reopened.generation(), committed_generation);
+    assert_eq!(reopened.generation(), acknowledged_generation);
     assert_eq!(
-        reopened
-            .read_file("/committed.txt")
-            .expect("published file survives reopen"),
-        b"committed"
+        reopened.read_file("/data").expect("read direct bytes"),
+        b"new"
     );
     assert!(matches!(
-        reopened.lookup("/failed.txt"),
+        reopened.lookup("/failed"),
         Err(FileSystemError::NotFound { .. })
     ));
     drop(reopened);
@@ -4053,15 +4160,17 @@ fn successful_public_commit_discards_its_rollback_delta() {
 
 #[test]
 fn root_sync_failure_requires_reopen_before_further_mutation() {
-    let root = temp_root("root-sync-failure-keeps-live-state");
+    let root = temp_root("root-sync-failure-requires-reopen");
     let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
-    fs.create_file("/stable.txt", 0o644)
+    let stable = fs
+        .create_file("/stable.txt", 0o644)
         .expect("create stable file");
     fs.write_file("/stable.txt", 0, b"stable")
         .expect("write stable file");
+    fs.create_snapshot("stable-snapshot")
+        .expect("create stable snapshot");
     fs.sync_all().expect("sync stable state");
     let committed_generation = fs.stats().filesystem_generation;
-
     inject_next_sync_failure_after_boundary(FilesystemCommitBoundary::RootCommitWritten);
     let err = fs
         .create_file("/uncertain.txt", 0o644)
@@ -4098,15 +4207,36 @@ fn root_sync_failure_requires_reopen_before_further_mutation() {
     let mutation_error = fs
         .create_file("/after.txt", 0o644)
         .expect_err("uncertain publication must reject same-mount mutation");
-    assert!(matches!(
+    for error in [
         mutation_error,
-        FileSystemError::CorruptState { .. }
-    ));
+        fs.begin_transaction()
+            .expect_err("uncertain publication must reject explicit transaction"),
+        fs.create_bookmark("blocked-bookmark", "stable-snapshot")
+            .expect_err("uncertain publication must reject snapshot mutation"),
+        fs.flush_intent_log_if_needed()
+            .map(|_| ())
+            .expect_err("uncertain publication must reject intent flush"),
+        fs.fsync_data_only_file("/stable.txt")
+            .expect_err("uncertain publication must reject data-only sync"),
+        fs.apply_deferred_timestamp_update(
+            stable.inode_id,
+            tidefs_inode_attributes::timestamp::TimestampUpdate::Write,
+            tidefs_inode_attributes::timestamp::TimestampPolicy::Strictatime,
+        )
+        .expect_err("uncertain publication must reject deferred timestamp mutation"),
+    ] {
+        assert!(matches!(error, FileSystemError::CorruptState { .. }));
+    }
     assert!(matches!(
         fs.lookup("/after.txt"),
         Err(FileSystemError::NotFound { .. })
     ));
-    fs.recovery_policy = RecoveryPolicy::ReadOnly;
+    assert!(matches!(
+        fs.snapshot_summary("blocked-bookmark"),
+        Err(FileSystemError::SnapshotNotFound { .. })
+    ));
+    assert!(!fs.in_transaction);
+    assert!(fs.mutation_delta.is_none());
     drop(fs);
 
     let mut reopened = LocalFileSystem::open_with_options(&root, options()).expect("reopen fs");
@@ -4138,6 +4268,35 @@ fn root_sync_failure_requires_reopen_before_further_mutation() {
         uncertain_selected
     );
     assert!(final_reopen.lookup("/after.txt").is_ok());
+    drop(final_reopen);
+    cleanup(&root);
+}
+
+#[test]
+fn verified_commits_release_pending_write_admission_permits() {
+    let root = temp_root("verified-commit-releases-admission");
+    let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
+    fs.create_file("/data", DEFAULT_FILE_PERMISSIONS)
+        .expect("create data file");
+    fs.sync_all().expect("commit empty file");
+    fs.set_auto_commit(false);
+    let baseline_usage = fs.write_admission.usage();
+    assert!(fs.pending_permits.is_empty());
+
+    for byte in b"AB" {
+        fs.write_file("/data", 0, std::slice::from_ref(byte))
+            .expect("buffer admitted byte");
+        assert_eq!(fs.pending_permits.len(), 1);
+        assert_ne!(fs.write_admission.usage(), baseline_usage);
+        fs.sync_all().expect("publish admitted byte");
+        assert!(fs.pending_permits.is_empty());
+        assert_eq!(fs.write_admission.usage(), baseline_usage);
+    }
+
+    drop(fs);
+    let reopened = LocalFileSystem::open_with_options(&root, options()).expect("reopen fs");
+    assert_eq!(reopened.read_file("/data").expect("read final byte"), b"B");
+    drop(reopened);
     cleanup(&root);
 }
 
@@ -4511,40 +4670,14 @@ fn begin_transaction_then_commit_persists_mutations() {
     let root = temp_root("begin-then-commit");
     let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
     fs.set_auto_commit(false);
-    fs.begin_transaction().expect("begin transaction");
-    fs.create_file("/a.txt", 0o644).expect("create a.txt");
-    fs.write_file("/a.txt", 0, b"hello").expect("write a.txt");
-    fs.commit_transaction().expect("commit transaction");
-    // Transaction committed: data should survive reopen.
-    drop(fs);
-    {
-        let fs = LocalFileSystem::open_with_options(&root, options()).expect("reopen fs");
-        assert_eq!(
-            fs.read_file("/a.txt").expect("read a.txt"),
-            b"hello".to_vec()
-        );
-    }
-    cleanup(&root);
-}
-
-#[test]
-fn transaction_commit_flushes_buffer_with_single_root_publication() {
-    let root = temp_root("transaction-buffer-single-publication");
-    let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
-    let record = fs
-        .create_file("/buffered", DEFAULT_FILE_PERMISSIONS)
-        .expect("create buffered file");
-    fs.sync_all().expect("commit empty file");
     fs.set_write_buffer_flush_threshold_bytes(1024);
     let publication_before = fs.root_publication_epoch;
 
     fs.begin_transaction().expect("begin transaction");
-    fs.write_file("/buffered", 0, b"transaction-data")
-        .expect("buffer transaction data");
+    let record = fs.create_file("/a.txt", 0o644).expect("create a.txt");
+    fs.write_file("/a.txt", 0, b"hello").expect("write a.txt");
     assert!(fs.write_buffers.contains_key(&record.inode_id));
-    fs.commit_transaction()
-        .expect("publish transaction buffer once");
-
+    fs.commit_transaction().expect("commit transaction");
     assert_eq!(
         fs.root_publication_epoch,
         publication_before.wrapping_add(1),
@@ -4553,22 +4686,15 @@ fn transaction_commit_flushes_buffer_with_single_root_publication() {
     assert!(!fs.write_buffers.contains_key(&record.inode_id));
     assert!(fs.mutation_delta.is_none());
     assert!(!fs.in_transaction);
-    let extents = fs.lookup_extents(record.inode_id.get(), 0, 16);
+    let extents = fs.lookup_extents(record.inode_id.get(), 0, 5);
     assert_eq!(extents.len(), 1);
     assert!(extents[0].is_data());
-    assert_eq!(
-        extents[0].checksum,
-        *blake3::hash(b"transaction-data").as_bytes()
-    );
+    assert!(!extents[0].is_pending_data());
+    assert_eq!(extents[0].checksum, *blake3::hash(b"hello").as_bytes());
 
     drop(fs);
     let reopened = LocalFileSystem::open_with_options(&root, options()).expect("reopen fs");
-    assert_eq!(
-        reopened
-            .read_file("/buffered")
-            .expect("read committed transaction data"),
-        b"transaction-data"
-    );
+    assert_eq!(reopened.read_file("/a.txt").expect("read a.txt"), b"hello");
     drop(reopened);
     cleanup(&root);
 }
@@ -4684,7 +4810,7 @@ fn rollback_without_transaction_is_rejected() {
 }
 
 #[test]
-fn fdatasync_retained_intent_survives_reopen_then_full_commit_clears_it() {
+fn fdatasync_retains_existing_durable_intent_until_full_commit() {
     let root = temp_root("fdatasync-retained-intent-reopen");
     let payload = b"fdatasync retained intent payload";
 
@@ -6146,44 +6272,6 @@ fn intent_log_empty_after_fresh_mount_and_commit() {
     );
     fs.commit().expect("commit");
     assert!(fs.intent_log.is_empty());
-    cleanup(&root);
-}
-
-#[test]
-fn multiple_intent_entries_replay_on_mount() {
-    let root = temp_root("intent-log-multi");
-
-    {
-        let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
-        let rec_a = fs.create_file("/a", 0o644).expect("create a");
-        let rec_b = fs.create_file("/b", 0o644).expect("create b");
-        let ino_a = rec_a.inode_id;
-        let ino_b = rec_b.inode_id;
-        fs.commit().expect("commit inodes");
-        // Write data through normal path but don't commit — intent log preserves it
-        fs.write_file("/a", 0, b"alpha").expect("write a");
-        fs.write_file("/b", 0, b"beta").expect("write b");
-
-        let d1 = checksum64(b"alpha");
-        fs.sync_write_intent(ino_a, 0, 5, d1, b"alpha")
-            .expect("intent 1");
-        let d2 = checksum64(b"beta");
-        fs.sync_write_intent(ino_b, 0, 4, d2, b"beta")
-            .expect("intent 2");
-        assert_eq!(fs.intent_log.len(), 2);
-        // Test-only unclean close: keep the durable entries out of Drop's
-        // normal committed-root publication path.
-        fs.recovery_policy = RecoveryPolicy::ReadOnly;
-    }
-
-    {
-        let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("reopen fs");
-        assert_eq!(fs.intent_log.len(), 2);
-        assert_eq!(fs.read_file("/a").expect("read a"), b"alpha");
-        assert_eq!(fs.read_file("/b").expect("read b"), b"beta");
-        fs.recovery_policy = RecoveryPolicy::ReadOnly;
-    }
-
     cleanup(&root);
 }
 
@@ -10020,6 +10108,9 @@ fn block_device_full_commit_refuses_missing_off_primary_buffered_base() {
             .store
             .raw_primary_store()
             .version_locations_of(candidate_root_key);
+        let live_before_failure = fs
+            .read_file(&path)
+            .expect("read buffered live view before induced failure");
 
         assert!(fs
             .store
@@ -10347,6 +10438,80 @@ fn block_device_intent_replay_rejects_corrupt_raw_payload_before_pool_write() {
             .expect("inspect candidate content receipt")
             .is_none());
         assert!(!pool.raw_primary_store().contains_key(candidate_content_key));
+    }
+}
+
+#[test]
+fn block_device_intent_replay_prevalidates_semantics_before_pool_write() {
+    let fixture = TwoDeviceBlockFixture::new("intent-semantic-prevalidation");
+    let (_path, _base, inode_id, _) =
+        commit_file_away_from_raw_primary(&fixture, "semantic-prevalidation");
+    let candidate_generation;
+
+    {
+        let mut fs = fixture.open();
+        fs.set_auto_commit(false);
+        assert_eq!(
+            fs.sync_write_intent(inode_id, 0, 1, checksum64(b"P"), b"P")
+                .expect("append valid data intent"),
+            IntentLogReplyState::IntentDurable
+        );
+        let root_anchor = fs
+            .intent_log
+            .pending_entries()
+            .last()
+            .expect("valid data intent exists")
+            .root_anchor
+            .clone();
+        candidate_generation = next_generation_after(root_anchor.generation);
+
+        let accepted = {
+            let intent_log = &mut fs.intent_log;
+            let store = &mut fs.store;
+            intent_log
+                .append(
+                    store.raw_primary_store_mut(),
+                    IntentLogEntryKind::NamespaceSyncIntent {
+                        parent_inode_id: ROOT_INODE_ID,
+                        affected_inode_ids: vec![inode_id],
+                        link_count_deltas: vec![(inode_id, 1)],
+                    },
+                    root_anchor,
+                    0,
+                )
+                .expect("append individually replayable invalid link delta")
+        };
+        assert!(accepted);
+        {
+            let intent_log = &mut fs.intent_log;
+            let store = &mut fs.store;
+            intent_log
+                .sync(store.raw_primary_store_mut())
+                .expect("sync invalid namespace suffix");
+        }
+        assert_eq!(fs.intent_log.len(), 2);
+        fs.recovery_policy = RecoveryPolicy::ReadOnly;
+    }
+
+    let error = LocalFileSystem::open_with_block_devices(
+        &fixture.metadata_root,
+        &fixture.devices,
+        options(),
+        RootAuthenticationKey::demo_key(),
+    )
+    .expect_err("semantically invalid suffix must fail mounted recovery");
+    assert!(matches!(error, FileSystemError::CorruptState { .. }));
+
+    let pool = fixture.open_pool();
+    for key in [
+        content_object_key_for_version(inode_id, candidate_generation),
+        content_chunk_object_key_for_version(inode_id, candidate_generation, 0),
+    ] {
+        assert!(pool
+            .placement_receipt_for_key(DeviceIoClass::Data, key)
+            .expect("inspect candidate replay receipt")
+            .is_none());
+        assert!(!pool.raw_primary_store().contains_key(key));
     }
 }
 
@@ -11107,65 +11272,45 @@ fn existing_write_buffer_adopts_raised_flush_threshold() {
 }
 
 #[test]
-fn exact_threshold_first_write_is_finalized_before_root_publication() {
-    let root = temp_root("exact-threshold-finalized-extent");
-    let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open filesystem");
-    let record = fs
-        .create_file("/threshold", DEFAULT_FILE_PERMISSIONS)
-        .expect("create threshold file");
-    fs.set_write_buffer_flush_threshold_bytes(1);
+fn threshold_flush_finalizes_full_extent_before_root_publication() {
+    for (case, threshold, data) in [
+        ("exact", 1_usize, b"Z".as_slice()),
+        ("larger", 2_usize, b"ABCDE".as_slice()),
+    ] {
+        let root = temp_root(&format!("{case}-threshold-finalized-extent"));
+        let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open filesystem");
+        let record = fs
+            .create_file("/threshold", DEFAULT_FILE_PERMISSIONS)
+            .expect("create threshold file");
+        fs.set_write_buffer_flush_threshold_bytes(threshold);
 
-    fs.write_file("/threshold", 0, b"Z")
-        .expect("publish exact-threshold write");
-    assert!(!fs.write_buffers.contains_key(&record.inode_id));
-    let extents = fs.lookup_extents(record.inode_id.get(), 0, 1);
-    assert_eq!(extents.len(), 1);
-    assert!(extents[0].is_data());
-    assert!(!extents[0].is_pending_data());
-    assert_eq!(extents[0].checksum, *blake3::hash(b"Z").as_bytes());
+        fs.write_file("/threshold", 0, data)
+            .expect("publish threshold-triggering write");
+        assert!(!fs.write_buffers.contains_key(&record.inode_id));
+        let extents = fs.lookup_extents(record.inode_id.get(), 0, data.len() as u64);
+        assert_eq!(extents.len(), 1, "case {case}");
+        assert_eq!(extents[0].length, data.len() as u64, "case {case}");
+        assert!(extents[0].is_data(), "case {case}");
+        assert!(!extents[0].is_pending_data(), "case {case}");
+        assert_eq!(
+            extents[0].checksum,
+            *blake3::hash(data).as_bytes(),
+            "case {case}",
+        );
 
-    drop(fs);
-    let reopened = LocalFileSystem::open_with_options(&root, options()).expect("reopen filesystem");
-    assert_eq!(
-        reopened
-            .read_file("/threshold")
-            .expect("read exact-threshold write"),
-        b"Z"
-    );
-    drop(reopened);
-    cleanup(&root);
-}
-
-#[test]
-fn write_larger_than_threshold_finalizes_full_extent_checksum() {
-    let root = temp_root("larger-than-threshold-full-extent-checksum");
-    let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open filesystem");
-    let record = fs
-        .create_file("/large-write", DEFAULT_FILE_PERMISSIONS)
-        .expect("create large-write file");
-    fs.set_write_buffer_flush_threshold_bytes(2);
-    let data = b"ABCDE";
-
-    fs.write_file("/large-write", 0, data)
-        .expect("publish write larger than flush threshold");
-
-    assert!(!fs.write_buffers.contains_key(&record.inode_id));
-    let extents = fs.lookup_extents(record.inode_id.get(), 0, data.len() as u64);
-    assert_eq!(extents.len(), 1);
-    assert_eq!(extents[0].length, data.len() as u64);
-    assert!(extents[0].is_data());
-    assert_eq!(extents[0].checksum, *blake3::hash(data).as_bytes());
-
-    drop(fs);
-    let reopened = LocalFileSystem::open_with_options(&root, options()).expect("reopen filesystem");
-    assert_eq!(
-        reopened
-            .read_file("/large-write")
-            .expect("read larger-than-threshold write"),
-        data
-    );
-    drop(reopened);
-    cleanup(&root);
+        drop(fs);
+        let reopened =
+            LocalFileSystem::open_with_options(&root, options()).expect("reopen filesystem");
+        assert_eq!(
+            reopened
+                .read_file("/threshold")
+                .expect("read threshold-triggering write"),
+            data,
+            "case {case}",
+        );
+        drop(reopened);
+        cleanup(&root);
+    }
 }
 
 #[test]

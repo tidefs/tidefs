@@ -207,8 +207,9 @@ struct PoolReplayWrite {
 ///
 /// Intent records and their payloads remain raw recovery metadata. Payload
 /// bytes become live only after length/digest validation, reconstruction
-/// against the current receipt-backed base, and receipt-producing Pool
-/// placement before a later transaction can publish them.
+/// against the current receipt-backed base, semantic validation of the whole
+/// selected suffix, and receipt-producing Pool placement before a later
+/// transaction can publish them.
 pub(crate) fn replay_uncommitted_with_pool(
     log: &IntentLog,
     state: &mut FileSystemState,
@@ -361,6 +362,7 @@ pub(crate) fn replay_uncommitted_with_pool(
         pool,
         replay_generation,
     )?);
+    publish_pool_replayed_content(pool, state, &replayed_content)?;
     if replayed > 0 {
         state.generation = replay_generation;
     }
@@ -458,8 +460,6 @@ fn flush_pool_replay_writes(
         record.size = new_size;
         record.data_version = replay_generation;
         record.metadata_version = replay_generation;
-        write_pool_replay_content(pool, state, &record, &content)?;
-
         Arc::make_mut(&mut state.inodes).insert(inode_id, record);
         state.dirty_inodes.insert(inode_id);
         state.dirty_content.insert(inode_id);
@@ -538,8 +538,53 @@ fn replay_pool_metadata_setattr(
 
     replay_entry(&adjusted_entry, state, pool.raw_primary_store_mut())?;
     if let Some(content) = content {
-        write_pool_replay_content(pool, state, &adjusted, &content)?;
         replayed_content.insert(adjusted.inode_id, content);
+    }
+    Ok(())
+}
+
+/// Validate the complete replay result before creating any receipt-backed
+/// content. A semantically invalid later intent must not strand Pool objects
+/// from an earlier otherwise-valid write in the same selected suffix.
+fn publish_pool_replayed_content(
+    pool: &mut Pool,
+    state: &FileSystemState,
+    replayed_content: &BTreeMap<InodeId, Vec<u8>>,
+) -> Result<()> {
+    validate_loaded_namespace_state(&state.inodes, &state.directories)?;
+    for record in state.inodes.values().filter(|record| record.is_file_like()) {
+        if let Some(content) = replayed_content.get(&record.inode_id) {
+            let expected_len =
+                usize::try_from(record.size).map_err(|_| FileSystemError::SizeOverflow {
+                    requested: record.size,
+                })?;
+            if content.len() != expected_len {
+                return Err(FileSystemError::CorruptState {
+                    reason: "Pool intent replay staged content length does not match its inode",
+                });
+            }
+        } else {
+            let _ =
+                MountedContentReadAuthority::new(pool).read_all_current(record.inode_id, record)?;
+        }
+    }
+    if replayed_content.keys().any(|inode_id| {
+        !state
+            .inodes
+            .get(inode_id)
+            .is_some_and(|record| record.is_file_like())
+    }) {
+        return Err(FileSystemError::CorruptState {
+            reason: "Pool intent replay staged content without a file-like inode",
+        });
+    }
+
+    for (inode_id, content) in replayed_content {
+        let record = state
+            .inodes
+            .get(inode_id)
+            .expect("staged replay inode was prevalidated");
+        write_pool_replay_content(pool, state, record, content)?;
     }
     Ok(())
 }

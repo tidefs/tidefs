@@ -735,12 +735,17 @@ struct MutationDelta {
     old_capacity_authority: CapacityAuthoritySnapshot,
     old_obligation_ledger: Box<ObligationLedger>,
     old_dirty_pages: BTreeMap<InodeId, Vec<DirtyRange>>,
+    old_dirty_content: BTreeSet<InodeId>,
+    old_dirty_inodes: BTreeSet<InodeId>,
+    old_dirty_dirs: BTreeSet<InodeId>,
+    old_dirty_set: DirtySet,
     old_dirty_extent_maps: BTreeSet<InodeId>,
     old_extent_allocator: ExtentAllocator,
     old_reclaim_queue: BPlusTreeReclaimQueue,
     old_deferred_rewrite_trims: Vec<(ObjectKey, ObjectKey)>,
     pending_rewrite_trim_plans_len_at_begin: usize,
     pending_permits_len_at_begin: usize,
+    old_uncommitted_mutation_count: u64,
     intent_log_rollback_floor: u64,
 }
 
@@ -4327,6 +4332,7 @@ impl LocalFileSystem {
     /// Returns `true` when the inode was newly inserted into the persistent
     /// orphan index and `false` when it was already tracked.
     pub fn track_orphan(&mut self, inode_id: InodeId) -> Result<bool> {
+        self.ensure_mutation_root_authority()?;
         let (generation, nlink, is_dir) = {
             if let Some(record) = self.state.inodes.get(&inode_id) {
                 (record.generation.get(), record.nlink, record.is_directory())
@@ -4363,6 +4369,7 @@ impl LocalFileSystem {
         generation: u64,
         creating_pid: u32,
     ) -> Result<bool> {
+        self.ensure_mutation_root_authority()?;
         let orphan_md_permit = self.write_admission.try_admit_metadata_mutation()?;
         let insert_result = {
             let mut orphan_index = self.orphan_index.lock().unwrap();
@@ -4387,6 +4394,7 @@ impl LocalFileSystem {
 
     /// Remove an anonymous O_TMPFILE inode from the orphan index after linkat.
     pub fn remove_tmpfile_orphan_on_link(&mut self, inode_id: InodeId) -> Result<bool> {
+        self.ensure_mutation_root_authority()?;
         let orphan_md_permit = self.write_admission.try_admit_metadata_mutation()?;
         let remove_result = {
             let mut orphan_index = self.orphan_index.lock().unwrap();
@@ -4407,18 +4415,19 @@ impl LocalFileSystem {
     ///
     /// This is intentionally idempotent so adapter release paths can call it
     /// when the final file handle closes without double-enqueueing work.
-    pub fn release_orphan(&self, inode_id: InodeId) -> bool {
+    pub fn release_orphan(&self, inode_id: InodeId) -> Result<bool> {
+        self.ensure_mutation_root_authority()?;
         let raw_inode_id = inode_id.get();
         if !self.orphan_index.lock().unwrap().contains(raw_inode_id) {
-            return false;
+            return Ok(false);
         }
 
         let mut pending = self.pending_orphan_deletions.lock().unwrap();
         if pending.contains(&raw_inode_id) {
-            return false;
+            return Ok(false);
         }
         pending.push(raw_inode_id);
-        true
+        Ok(true)
     }
 
     /// Return the current local orphan/reclaim queue depth snapshot.
@@ -4644,7 +4653,7 @@ impl LocalFileSystem {
         const MAX_RECEIPT_BOUND_RECLAIM_PER_TICK: usize = 1024;
         const ERROR_BACKOFF_TICKS: u8 = 32;
 
-        if self.is_state_dirty() {
+        if self.committed_root_anchor.is_none() || self.is_state_dirty() {
             return;
         }
 
@@ -5128,6 +5137,10 @@ impl LocalFileSystem {
     /// (e.g. after commits, on a timer, or from the embedding application)
     /// to keep background work progressing.
     pub fn tick_background_services(&mut self) {
+        if self.committed_root_anchor.is_none() || self.is_state_dirty() {
+            return;
+        }
+
         // --- Duty 1: record reclaim deltas for orphaned inodes ---
         let pending: Vec<u64> = {
             let mut lock = self.pending_orphan_deletions.lock().unwrap();
@@ -5168,6 +5181,9 @@ impl LocalFileSystem {
         // --- Duty 2: drain reclaim queue into object-store authority ---
         // Hands off local B+tree reclaim queue entries through Pool::delete().
         // Physical segment freeing is reserved for the receipt-bound drain below.
+        // Reclaim queue entries may be recorded before their replacement or
+        // removal root is published. Do not hand them to Pool deletion while
+        // live state is dirty or publication authority is uncertain.
         let drain_stats = self.drain_local_reclaim_queue_into_store();
         self.drain_receipt_bound_reclaim_for_committed_state(drain_stats.entries_drained);
 
@@ -5585,6 +5601,7 @@ impl LocalFileSystem {
         &mut self,
         ino: InodeId,
     ) -> std::result::Result<(u64, u64), FilesystemError> {
+        self.ensure_mutation_root_authority()?;
         let mut extent_maps = self.state.extent_maps.lock().unwrap();
         let em = extent_maps.get_mut(&ino).ok_or(FilesystemError::NotFound {
             path: format!("inode:{}", ino.get()),
@@ -5842,11 +5859,12 @@ impl LocalFileSystem {
                 name: String::from_utf8_lossy(&name).into_owned(),
             });
         }
+        self.ensure_mutation_root_authority()?;
         self.sync_all()?;
         let source_root = self.selected_current_root_summary()?;
         let traversal_root =
             snapshot::lifecycle_traversal_root(source_root.transaction_id, source_root.generation)?;
-        self.begin_mutation()?; // was: let previous_state = self.state.clone()
+        self.try_begin_mutation()?;
         let created_at_generation = self.bump_generation();
         let record = SnapshotRecord {
             name: name.clone(),
@@ -5898,7 +5916,7 @@ impl LocalFileSystem {
             });
         }
         self.ensure_snapshot_authority_consistent()?;
-        self.begin_mutation()?; // was: let previous_state = self.state.clone()
+        self.try_begin_mutation()?;
         self.bump_generation();
         self.state.snapshots.remove(&name);
         self.mark_inode_metadata_dirty(ROOT_INODE_ID);
@@ -5936,6 +5954,18 @@ impl LocalFileSystem {
             });
         }
         self.ensure_snapshot_record_authority(&snapshot)?;
+        if self.in_transaction {
+            return Err(FileSystemError::Unsupported {
+                operation: "rollback snapshot",
+                reason: "snapshot rollback cannot run inside an explicit transaction",
+            });
+        }
+        self.ensure_mutation_root_authority()?;
+        // Settle any acknowledged intents and buffered state before replacing
+        // the live tree. The replacement then owns one isolated synchronous
+        // publication attempt and cannot replay post-snapshot intent over the
+        // restored snapshot.
+        self.sync_all()?;
         // State-replacement operation: clone the old state as fallback,
         // then use the incremental loader to only reload changed inodes.
         let previous_state = self.state.clone();
@@ -5962,6 +5992,8 @@ impl LocalFileSystem {
             snapshot_catalog_entries: restored.snapshots.len(),
             production_fsck_required: false,
         };
+        self.try_begin_mutation()?;
+        self.snapshot_write_buffers_for_rollback();
         self.clear_hot_read_cache();
         self.inode_cache.borrow_mut().clear();
         self.state = restored;
@@ -6416,8 +6448,8 @@ impl LocalFileSystem {
             .get(ACL_DEFAULT)
             .and_then(|raw| tidefs_posix_acl::decode_posix_acl_xattr(raw).ok());
 
-        self.begin_mutation()?; // was: let previous_state = self.state.clone()
-                                // Re-verify parent exists after lock acquisition
+        self.try_begin_mutation()?;
+        // Re-verify parent exists after lock acquisition
         if !self.state.inodes.contains_key(&parent_id) {
             self.rollback_mutation_delta();
             return Err(FileSystemError::NotFound {
@@ -6549,6 +6581,7 @@ impl LocalFileSystem {
         let parent_id = pre.new_parent_id;
         let name = pre.new_name;
 
+        self.ensure_mutation_root_authority()?;
         self.flush_write_buffer(inode_id)?;
         let source_record = self.inode(inode_id)?.clone();
         // Extra guard: only regular files supported in this MVP.
@@ -6563,7 +6596,7 @@ impl LocalFileSystem {
         } else {
             None
         };
-        self.begin_mutation()?;
+        self.try_begin_mutation()?;
         // Re-verify parent exists after lock acquisition
         if !self.state.inodes.contains_key(&parent_id) {
             let release_result =
@@ -6720,8 +6753,8 @@ impl LocalFileSystem {
         self.ensure_obligation_capacity("staging_dirty", new_blocks, Some(planned_inode_id))?;
         self.ensure_content_capacity_with_planned_inode(None, planned_entries)?;
 
-        self.begin_mutation()?; // was: let previous_state = self.state.clone()
-                                // Re-verify dest parent exists after lock acquisition.
+        self.try_begin_mutation()?;
+        // Re-verify dest parent exists after lock acquisition.
         if !self.state.inodes.contains_key(&parent_id) {
             self.rollback_mutation_delta();
             return Err(FileSystemError::NotFound {
@@ -7030,7 +7063,8 @@ impl LocalFileSystem {
     /// The caller is responsible for performing the actual copy.  This method
     /// only writes the intent-log record so that crash recovery can verify or
     /// redo the copy after a crash.
-    pub fn record_copy_file_range_intent(&mut self, intent: CopyFileRangeIntent) {
+    pub fn record_copy_file_range_intent(&mut self, intent: CopyFileRangeIntent) -> Result<()> {
+        self.ensure_mutation_root_authority()?;
         let _ = self.intent_log_buffer.as_ref().map(|buf| {
             let _frame = buf.append(
                 tidefs_intent_log::IntentLogRecord::CopyFileRange {
@@ -7045,6 +7079,7 @@ impl LocalFileSystem {
                 0, // txg_id assigned by TxgCoordinator at drain time
             );
         });
+        Ok(())
     }
     pub fn read_symlink(&self, path: impl AsRef<str>) -> Result<Vec<u8>> {
         let path = path.as_ref();
@@ -7110,6 +7145,98 @@ impl LocalFileSystem {
             });
         }
         Ok(patches)
+    }
+
+    fn coalesce_ordered_direct_write_segments(
+        segments: Vec<(u64, Vec<u8>)>,
+    ) -> Result<Vec<(u64, Vec<u8>)>> {
+        let mut coalesced: Vec<(u64, Vec<u8>)> = Vec::with_capacity(segments.len());
+        for (offset, data) in segments {
+            if data.is_empty() {
+                continue;
+            }
+            let data_len =
+                u64::try_from(data.len()).map_err(|_| FileSystemError::SizeOverflow {
+                    requested: u64::MAX,
+                })?;
+            offset
+                .checked_add(data_len)
+                .ok_or(FileSystemError::SizeOverflow {
+                    requested: u64::MAX,
+                })?;
+
+            if let Some((last_offset, last_data)) = coalesced.last_mut() {
+                let last_len =
+                    u64::try_from(last_data.len()).map_err(|_| FileSystemError::SizeOverflow {
+                        requested: u64::MAX,
+                    })?;
+                let last_end =
+                    last_offset
+                        .checked_add(last_len)
+                        .ok_or(FileSystemError::SizeOverflow {
+                            requested: u64::MAX,
+                        })?;
+                if offset < last_end {
+                    return Err(FileSystemError::CorruptState {
+                        reason: "direct write segments must be ordered and non-overlapping",
+                    });
+                }
+                if offset == last_end {
+                    last_data.extend_from_slice(&data);
+                    continue;
+                }
+            }
+            coalesced.push((offset, data));
+        }
+        Ok(coalesced)
+    }
+
+    fn plan_direct_write_extents(
+        &self,
+        inode_id: InodeId,
+        segments: &[(u64, Vec<u8>)],
+    ) -> Result<ExtentAllocator> {
+        let mut planned = self.extent_allocator.clone();
+        let birth_txg = self.commit_group.current_commit_group().0;
+        for (offset, bytes) in segments {
+            let length = u64::try_from(bytes.len()).map_err(|_| FileSystemError::SizeOverflow {
+                requested: u64::MAX,
+            })?;
+            let allocations = planned
+                .allocate_extent(inode_id.get(), *offset, length, None)
+                .map_err(|_| FileSystemError::CorruptState {
+                    reason: "direct write could not establish pending extent coverage",
+                })?;
+            if allocations.len() != 1 {
+                return Err(FileSystemError::CorruptState {
+                    reason: "direct write extent planning was not one-to-one",
+                });
+            }
+            let checksum = *blake3::hash(bytes).as_bytes();
+            let finalized = planned
+                .finalize_data_extent(inode_id.get(), *offset, length, checksum, birth_txg)
+                .map_err(|_| FileSystemError::CorruptState {
+                    reason: "direct write pending extent finalization failed",
+                })?;
+            if finalized != 1 {
+                return Err(FileSystemError::CorruptState {
+                    reason: "direct write pending extent finalization was not one-to-one",
+                });
+            }
+            let coverage = planned.lookup_extents(inode_id.get(), *offset, length);
+            if coverage.len() != 1
+                || coverage[0].logical_offset != *offset
+                || coverage[0].length != length
+                || !coverage[0].is_data()
+                || coverage[0].is_pending_data()
+                || coverage[0].checksum != checksum
+            {
+                return Err(FileSystemError::CorruptState {
+                    reason: "direct write lacks exact finalized extent coverage",
+                });
+            }
+        }
+        Ok(planned)
     }
 
     fn coalesced_write_segment_ranges(
@@ -7416,7 +7543,7 @@ impl LocalFileSystem {
             )?;
         }
 
-        self.begin_mutation()?;
+        self.try_begin_mutation()?;
         let tick = self.bump_generation();
         debug_assert_eq!(tick, planned_tick);
         record.size = new_size;
@@ -7592,6 +7719,7 @@ impl LocalFileSystem {
         inode_id: InodeId,
         publication: MutationPublication,
     ) -> Result<()> {
+        self.ensure_mutation_root_authority()?;
         match self.write_buffers.get(&inode_id) {
             Some(wb) if !wb.is_empty() => {}
             Some(_) => {
@@ -7604,7 +7732,7 @@ impl LocalFileSystem {
         // Establish the rollback boundary before draining caller-owned bytes.
         // An existing deferred/explicit mutation keeps its earlier boundary;
         // otherwise this snapshot owns the full buffer and extent state.
-        self.begin_mutation()?;
+        self.try_begin_mutation()?;
         self.snapshot_write_buffers_for_rollback();
         let segments = self
             .write_buffers
@@ -7640,6 +7768,7 @@ impl LocalFileSystem {
         &mut self,
         publication: MutationPublication,
     ) -> Result<()> {
+        self.ensure_mutation_root_authority()?;
         let inodes: Vec<InodeId> = self.write_buffers.keys().copied().collect();
         for inode_id in inodes {
             self.flush_write_buffer_with_publication(inode_id, publication)?;
@@ -8301,7 +8430,7 @@ impl LocalFileSystem {
         // delta does not consume them; the foreground error path releases
         // those two charges explicitly. A pre-existing transaction delta
         // predates them and therefore restores them itself.
-        self.begin_mutation()?;
+        self.try_begin_mutation()?;
         self.snapshot_write_buffers_for_rollback();
         if bytes_len > 0 {
             self.writeback_range_tracker
@@ -8425,7 +8554,7 @@ impl LocalFileSystem {
             });
         }
 
-        segments.retain(|(_, bytes)| !bytes.is_empty());
+        segments = Self::coalesce_ordered_direct_write_segments(segments)?;
         if segments.is_empty() {
             return Ok(adjusted_record);
         }
@@ -8470,110 +8599,121 @@ impl LocalFileSystem {
         }
 
         let written_ranges = self.coalesced_write_segment_ranges(&segments)?;
+        let planned_extent_allocator = self.plan_direct_write_extents(inode_id, &segments)?;
         let physical_admit_bytes = total_bytes;
         let base_record = self.committed_inode_record(inode_id)?;
         let replacement_credit_bytes =
             self.materialized_content_bytes_in_ranges(inode_id, &base_record, &written_ranges)?;
         let logical_growth_bytes = new_size.saturating_sub(effective_size);
-        if physical_admit_bytes > 0 {
-            let handle = self
-                .reserve_with_hierarchy_replacement_credit(
-                    physical_admit_bytes,
-                    replacement_credit_bytes,
-                )
-                .map_err(|_e| FileSystemError::NoSpace {
-                    resource: LocalStorageResource::ContentBytes,
-                    requested: physical_admit_bytes,
-                    available: self.capacity_authority.available_bytes(),
-                    capacity: self.capacity_authority.total_bytes(),
-                    allocated: self.capacity_authority.used_bytes(),
-                })?;
-            handle.commit();
-        }
+        let mutation_scope_was_active = self.mutation_delta.is_some();
+        self.try_begin_mutation()?;
 
-        check_crash_hook(CrashInjectionPoint::OpWriteBeforeExtentUpdate);
-        self.invalidate_hot_read_cache_for_inode(inode_id);
-
-        let patches = self.coalesced_write_buffer_patches(&segments)?;
-        // copy_file_range fallback writes should not force do_commit(), which
-        // flushes every inode's write buffer and defeats the direct path.
-        let result = (|| match self.rewrite_content_with_patch_batch(
-            inode_id,
-            base_record.clone(),
-            &patches,
-            new_size,
-            true,
-            MutationPublication::CallerOwned,
-        ) {
-            Ok(record) => Ok(record),
-            Err(FileSystemError::Unsupported { .. }) => {
-                let mut result = Ok(base_record);
-                for patch in &patches {
-                    let record = match self.committed_inode_record(inode_id) {
-                        Ok(record) => record,
-                        Err(err) => return Err(err),
-                    };
-                    result = self.rewrite_content_with_overlay(
-                        inode_id,
-                        record,
-                        patch.offset,
-                        &patch.bytes,
-                        new_size,
-                        true,
-                        MutationPublication::CallerOwned,
-                    );
-                    if result.is_err() {
-                        break;
-                    }
-                }
-                result
+        let direct_result = (|| {
+            if physical_admit_bytes > 0 {
+                let handle = self
+                    .reserve_with_hierarchy_replacement_credit(
+                        physical_admit_bytes,
+                        replacement_credit_bytes,
+                    )
+                    .map_err(|_e| FileSystemError::NoSpace {
+                        resource: LocalStorageResource::ContentBytes,
+                        requested: physical_admit_bytes,
+                        available: self.capacity_authority.available_bytes(),
+                        capacity: self.capacity_authority.total_bytes(),
+                        allocated: self.capacity_authority.used_bytes(),
+                    })?;
+                handle.commit();
             }
-            Err(err) => Err(err),
-        })();
-        let result = result?;
 
-        if delta_bytes > 0 {
-            let inode_ancestors = self.quota_ancestor_chain_for_parts(&parts);
-            self.state
-                .quota_table
-                .apply_delta(&inode_ancestors, delta_bytes, 0);
-        }
-        if logical_growth_bytes > 0 {
+            check_crash_hook(CrashInjectionPoint::OpWriteBeforeExtentUpdate);
+            self.invalidate_hot_read_cache_for_inode(inode_id);
+
+            let patches = self.coalesced_write_buffer_patches(&segments)?;
+            // copy_file_range fallback writes should not force do_commit(), which
+            // flushes every inode's write buffer and defeats the direct path.
+            let result = (|| match self.rewrite_content_with_patch_batch(
+                inode_id,
+                base_record.clone(),
+                &patches,
+                new_size,
+                true,
+                MutationPublication::CallerOwned,
+            ) {
+                Ok(record) => Ok(record),
+                Err(FileSystemError::Unsupported { .. }) => {
+                    let mut result = Ok(base_record);
+                    for patch in &patches {
+                        let record = match self.committed_inode_record(inode_id) {
+                            Ok(record) => record,
+                            Err(err) => return Err(err),
+                        };
+                        result = self.rewrite_content_with_overlay(
+                            inode_id,
+                            record,
+                            patch.offset,
+                            &patch.bytes,
+                            new_size,
+                            true,
+                            MutationPublication::CallerOwned,
+                        );
+                        if result.is_err() {
+                            break;
+                        }
+                    }
+                    result
+                }
+                Err(err) => Err(err),
+            })();
+            let result = result?;
+
+            if delta_bytes > 0 {
+                let inode_ancestors = self.quota_ancestor_chain_for_parts(&parts);
+                self.state
+                    .quota_table
+                    .apply_delta(&inode_ancestors, delta_bytes, 0);
+            }
+            if logical_growth_bytes > 0 {
+                self.state
+                    .space_accounting
+                    .accumulate_delta(SpaceDelta::new_write(logical_growth_bytes));
+            }
             self.state
                 .space_accounting
-                .accumulate_delta(SpaceDelta::new_write(logical_growth_bytes));
-        }
-        self.state
-            .space_accounting
-            .track_physical_write(total_bytes);
-        for (offset, bytes) in &segments {
-            let bytes_len =
-                u64::try_from(bytes.len()).map_err(|_| FileSystemError::SizeOverflow {
-                    requested: u64::MAX,
-                })?;
-            let _ = self
-                .extent_allocator
-                .allocate_extent(inode_id.0, *offset, bytes_len, None);
-            let blake3_hash = blake3::hash(bytes);
-            let birth_txg = self.commit_group.current_commit_group().0;
-            let _ = self.extent_allocator.finalize_data_extent(
-                inode_id.0,
-                *offset,
-                bytes_len,
-                *blake3_hash.as_bytes(),
-                birth_txg,
-            );
-        }
-        self.state.dirty_extent_maps.insert(inode_id);
-        let cleared_dirty_bytes = self.clear_write_buffer_ranges(inode_id, &written_ranges);
-        self.record_dirty_buffer_free(cleared_dirty_bytes);
-        if !written_ranges.is_empty() {
-            let mut tracker = self.writeback_range_tracker.lock().expect("locked");
-            for (offset, length) in &written_ranges {
-                tracker.clear_range(inode_id, *offset, *length);
+                .track_physical_write(total_bytes);
+            self.extent_allocator = planned_extent_allocator;
+            self.state.dirty_extent_maps.insert(inode_id);
+            let cleared_dirty_bytes = self.clear_write_buffer_ranges(inode_id, &written_ranges);
+            self.record_dirty_buffer_free(cleared_dirty_bytes);
+            if !written_ranges.is_empty() {
+                let mut tracker = self.writeback_range_tracker.lock().expect("locked");
+                for (offset, length) in &written_ranges {
+                    tracker.clear_range(inode_id, *offset, *length);
+                }
+            }
+            Ok(self.adjust_for_write_buffer(inode_id, result))
+        })();
+
+        match direct_result {
+            Ok(result) => {
+                self.uncommitted_mutation_count = self.uncommitted_mutation_count.saturating_add(1);
+                if !mutation_scope_was_active {
+                    // Establish the returned direct bytes as the next live
+                    // rollback baseline while retaining staged rewrite trims
+                    // until a verified root publishes them.
+                    self.discard_mutation_delta();
+                }
+                Ok(result)
+            }
+            Err(error) => {
+                if self.mutation_delta.is_some() {
+                    self.rollback_mutation_delta();
+                }
+                if mutation_scope_was_active && self.in_transaction {
+                    self.in_transaction = false;
+                }
+                Err(error)
             }
         }
-        Ok(self.adjust_for_write_buffer(inode_id, result))
     }
 
     pub fn fallocate_file(
@@ -8600,6 +8740,7 @@ impl LocalFileSystem {
         if length == 0 {
             return Ok(record);
         }
+        self.ensure_mutation_root_authority()?;
         self.flush_write_buffer(inode_id)?;
         let record = self.committed_inode_record(inode_id)?;
         let end = offset
@@ -8635,7 +8776,7 @@ impl LocalFileSystem {
             }
         }
         if reserve_bytes > 0 {
-            self.begin_mutation()?;
+            self.try_begin_mutation()?;
             let reservation_succeeded = self
                 .reserve_with_hierarchy(reserve_bytes)
                 .map(|handle| {
@@ -8753,6 +8894,7 @@ impl LocalFileSystem {
         if length == 0 {
             return Ok(record);
         }
+        self.ensure_mutation_root_authority()?;
         self.flush_write_buffer(inode_id)?;
         let record = self.committed_inode_record(inode_id)?;
         let end = offset
@@ -8786,7 +8928,7 @@ impl LocalFileSystem {
         }
 
         if reserve_bytes > 0 {
-            self.begin_mutation()?;
+            self.try_begin_mutation()?;
             // Capacity reservation: atomically reserve and commit bytes.
             let reservation_succeeded = self
                 .reserve_with_hierarchy(reserve_bytes)
@@ -8891,6 +9033,7 @@ impl LocalFileSystem {
         }
         let _new_len =
             usize::try_from(size).map_err(|_| FileSystemError::SizeOverflow { requested: size })?;
+        self.ensure_mutation_root_authority()?;
         let old_effective_size = self.effective_file_size(inode_id);
         if size < old_effective_size {
             self.truncate_dirty_write_buffer_for_inode(inode_id, size);
@@ -8907,7 +9050,7 @@ impl LocalFileSystem {
             let truncates_committed_record = record.size > size;
 
             if freed_bytes > 0 || truncates_committed_record {
-                self.begin_mutation()?;
+                self.try_begin_mutation()?;
                 if data_bytes > 0 && truncates_committed_record {
                     self.record_reclaim_delta(inode_id, data_bytes);
                 }
@@ -8987,6 +9130,7 @@ impl LocalFileSystem {
         if byte_len == 0 {
             return Ok(0);
         }
+        self.ensure_mutation_root_authority()?;
         // Flush pending writes so content-layout reads are coherent.
         self.flush_write_buffer(inode_id)?;
 
@@ -9013,7 +9157,7 @@ impl LocalFileSystem {
         // before changing generation, extents, or accounting. A receiptless
         // raw-primary substitute must not become the source of a new root.
         let old_layout = self.read_committed_content_layout_cached(inode_id, &record)?;
-        self.begin_mutation()?;
+        self.try_begin_mutation()?;
 
         // Free logical extents in the extent allocator.
         let freed =
@@ -9141,7 +9285,7 @@ impl LocalFileSystem {
         // Accumulate space delta only for extents that actually existed in the
         // punched range. Sparse holes must stay accounting-neutral.
         if effective_length > 0 {
-            self.begin_mutation()?;
+            self.try_begin_mutation()?;
             let (data_bytes, reserved_bytes) =
                 self.accounted_extent_bytes(inode_id, offset, effective_length);
             let freed_bytes = data_bytes.saturating_add(reserved_bytes);
@@ -9378,7 +9522,7 @@ impl LocalFileSystem {
             None
         };
         if will_mutate_capacity_or_content {
-            self.begin_mutation()?;
+            self.try_begin_mutation()?;
         }
         // Capacity reservation: charge only holes that become allocated.
         // Existing DATA and UNWRITTEN ranges already consume capacity.
@@ -9772,6 +9916,7 @@ impl LocalFileSystem {
             .ok_or_else(|| FileSystemError::NotFound {
                 path: path_for_error.to_string(),
             })?;
+        self.ensure_mutation_root_authority()?;
         self.flush_file_write_buffer_for_entry(&entry)?;
         let record = self.inode(entry.inode_id)?.clone();
         if record.kind() == NodeKind::Dir {
@@ -9787,10 +9932,10 @@ impl LocalFileSystem {
             Some(self.write_admission.try_admit_metadata_mutation()?)
         };
 
-        self.begin_mutation()?; // was: let previous_state = self.state.clone()
-                                // Accumulate space delta for unlink only when this removes the last link.
-                                // File size can include sparse holes; only data extents release logical
-                                // bytes, while unwritten extents release reservation bytes.
+        self.try_begin_mutation()?;
+        // Accumulate space delta for unlink only when this removes the last link.
+        // File size can include sparse holes; only data extents release logical
+        // bytes, while unwritten extents release reservation bytes.
         if !was_multilinked && record.size > 0 {
             let (data_bytes, reserved_bytes) =
                 self.accounted_extent_bytes(entry.inode_id, 0, record.size);
@@ -9944,6 +10089,7 @@ impl LocalFileSystem {
                 path: path_for_error.to_string(),
             });
         }
+        self.ensure_mutation_root_authority()?;
 
         // Record rmdir intent before mutation for crash recovery.
         let _ = self.intent_log_buffer.as_ref().map(|buf| {
@@ -9957,8 +10103,8 @@ impl LocalFileSystem {
             );
         });
 
-        self.begin_mutation()?; // was: let previous_state = self.state.clone()
-                                // Re-verify parent exists after lock acquisition
+        self.try_begin_mutation()?;
+        // Re-verify parent exists after lock acquisition
         if !self.state.inodes.contains_key(&parent_id) {
             self.rollback_mutation_delta();
             return Err(FileSystemError::NotFound {
@@ -10072,6 +10218,7 @@ impl LocalFileSystem {
         if pre.is_same {
             return Ok(());
         }
+        self.ensure_mutation_root_authority()?;
 
         let old_parent_id = pre.old_parent_id;
         let new_parent_id = pre.new_parent_id;
@@ -10115,7 +10262,7 @@ impl LocalFileSystem {
         // dirty permits survive until SYNC, while this slot-only metadata
         // permit is released when this mutation finishes or rolls back.
         let mut rename_md_permit = Some(self.write_admission.try_admit_metadata_mutation()?);
-        self.begin_mutation()?;
+        self.try_begin_mutation()?;
         // Re-verify both parents exist after lock acquisition.
         if !self.state.inodes.contains_key(&old_parent_id)
             || !self.state.inodes.contains_key(&new_parent_id)
@@ -10454,7 +10601,7 @@ impl LocalFileSystem {
         }
 
         let owner_generation = record.generation;
-        self.begin_mutation()?;
+        self.try_begin_mutation()?;
         if let Err(err) = self.ensure_xattr_owner_generation(inode_id, owner_generation, target) {
             self.rollback_mutation_delta();
             return Err(err);
@@ -10528,7 +10675,7 @@ impl LocalFileSystem {
             }
         }
 
-        self.begin_mutation()?; // was: let previous_state = self.state.clone()
+        self.try_begin_mutation()?;
         if let Err(err) = self.ensure_xattr_owner_generation(inode_id, record.generation, target) {
             self.rollback_mutation_delta();
             return Err(err);
@@ -10704,7 +10851,7 @@ impl LocalFileSystem {
             });
         }
 
-        self.begin_mutation()?; // was: let previous_state = self.state.clone()
+        self.try_begin_mutation()?;
         if let Err(err) = self.ensure_xattr_owner_generation(inode_id, record.generation, target) {
             self.rollback_mutation_delta();
             return Err(err);
@@ -10753,7 +10900,7 @@ impl LocalFileSystem {
             return Ok(());
         }
 
-        self.begin_mutation()?;
+        self.try_begin_mutation()?;
         if let Err(err) = self.ensure_xattr_owner_generation(inode_id, record.generation, path) {
             self.rollback_mutation_delta();
             return Err(err);
@@ -10855,6 +11002,7 @@ impl LocalFileSystem {
         };
         let planned_entries = planned_chunk_allocation_entries_for_full_content(&record)?;
         self.ensure_content_capacity_with_planned_inode(None, planned_entries)?;
+        self.ensure_mutation_root_authority()?;
 
         // Capacity reservation: atomically reserve and commit bytes for
         // file creation with content.
@@ -10872,8 +11020,8 @@ impl LocalFileSystem {
             handle.commit();
         }
 
-        self.begin_mutation()?; // was: let previous_state = self.state.clone()
-                                // Re-verify parent exists after lock acquisition.
+        self.try_begin_mutation()?;
+        // Re-verify parent exists after lock acquisition.
         if !self.state.inodes.contains_key(&parent_id) {
             self.rollback_mutation_delta();
             return Err(FileSystemError::NotFound {
@@ -11011,7 +11159,7 @@ impl LocalFileSystem {
             planned_entries.clone(),
         )?;
 
-        self.begin_mutation()?; // was: let previous_state = self.state.clone()
+        self.try_begin_mutation()?;
         let tick = self.bump_generation();
         debug_assert_eq!(tick, planned_tick);
         dest_record.size = source_record.size;
@@ -11076,7 +11224,7 @@ impl LocalFileSystem {
             )?;
         }
 
-        self.begin_mutation()?; // was: let previous_state = self.state.clone()
+        self.try_begin_mutation()?;
         let tick = self.bump_generation();
         debug_assert_eq!(tick, planned_tick);
         record.size = size;
@@ -11214,7 +11362,7 @@ impl LocalFileSystem {
             )?;
         }
 
-        self.begin_mutation()?; // was: let previous_state = self.state.clone()
+        self.try_begin_mutation()?;
         let tick = self.bump_generation();
         debug_assert_eq!(tick, planned_tick);
         record.size = new_size;
@@ -11395,53 +11543,28 @@ impl LocalFileSystem {
     /// not individual inodes/directories.
     fn commit_state_replacement<T>(
         &mut self,
-        _previous_state: FileSystemState,
+        previous_state: FileSystemState,
         value: T,
     ) -> Result<T> {
-        if self.auto_commit {
-            self.uncommitted_mutation_count = 0;
-            let publication_epoch_before = self.root_publication_epoch;
-            match self.do_commit() {
-                Ok(()) => {
-                    self.discard_mutation_delta();
-                    Ok(value)
-                }
-                Err(err) => {
-                    if err.keeps_live_state_on_error()
-                        || self.root_publication_epoch != publication_epoch_before
-                    {
-                        self.discard_mutation_delta();
-                    } else {
-                        self.rollback_mutation_delta();
-                        self.mark_metalogue_clean();
-                    }
-                    Err(err)
-                }
-            }
-        } else {
-            self.uncommitted_mutation_count = self.uncommitted_mutation_count.saturating_add(1);
-            if self.uncommitted_mutation_count >= self.max_uncommitted_mutations {
-                self.uncommitted_mutation_count = 0;
-                let publication_epoch_before = self.root_publication_epoch;
-                match self.do_commit() {
-                    Ok(()) => {
-                        self.discard_mutation_delta();
-                        Ok(value)
-                    }
-                    Err(err) => {
-                        if err.keeps_live_state_on_error()
-                            || self.root_publication_epoch != publication_epoch_before
-                        {
-                            self.discard_mutation_delta();
-                        } else {
-                            self.rollback_mutation_delta();
-                            self.mark_metalogue_clean();
-                        }
-                        Err(err)
-                    }
-                }
-            } else {
+        self.uncommitted_mutation_count = 0;
+        let publication_epoch_before = self.root_publication_epoch;
+        match self.do_commit() {
+            Ok(()) => {
+                self.discard_mutation_delta();
                 Ok(value)
+            }
+            Err(err) => {
+                if err.keeps_live_state_on_error()
+                    || self.root_publication_epoch != publication_epoch_before
+                {
+                    self.discard_mutation_delta();
+                } else {
+                    self.state = previous_state;
+                    self.rollback_mutation_delta();
+                    self.inode_cache.borrow_mut().clear();
+                    self.clear_hot_read_cache();
+                }
+                Err(err)
             }
         }
     }
@@ -11478,7 +11601,7 @@ impl LocalFileSystem {
                 reason: "a transaction is already in progress",
             });
         }
-        self.begin_mutation()?;
+        self.try_begin_mutation()?;
         self.in_transaction = true;
         Ok(())
     }
@@ -11533,7 +11656,7 @@ impl LocalFileSystem {
                 reason: "a transaction is already in progress",
             });
         }
-        self.begin_mutation()?;
+        self.try_begin_mutation()?;
         self.in_transaction = true;
         Ok(transaction::TransactionGuard::new(self))
     }
@@ -11667,6 +11790,7 @@ impl LocalFileSystem {
         if self.replayed_intent_entry_id.is_some() {
             return Ok(IntentLogReplyState::Refused);
         }
+        self.ensure_mutation_root_authority()?;
         // Sync writes get high throughput allocation to avoid intent-log backpressure.
         self.store.set_scheduling_class(IoClass::SyncData);
         if !self.commit_group.record_write(length) {
@@ -11828,6 +11952,7 @@ impl LocalFileSystem {
     }
 
     pub fn flush_intent_log_if_needed(&mut self) -> Result<bool> {
+        self.ensure_mutation_root_authority()?;
         self.intent_log
             .flush_if_needed(self.store.raw_primary_store_mut())
     }
@@ -11963,6 +12088,7 @@ impl LocalFileSystem {
     }
 
     pub fn fsync_file(&mut self, path: impl AsRef<str>) -> Result<()> {
+        self.ensure_mutation_root_authority()?;
         check_crash_hook(CrashInjectionPoint::OpFsyncBeforeFlush);
         let started = Instant::now();
         let attr = self.stat(path.as_ref())?;
@@ -12005,6 +12131,7 @@ impl LocalFileSystem {
     /// path is used when available; otherwise content objects for this inode
     /// are ensured durable individually.
     pub fn fsync_data_only_file(&mut self, path: impl AsRef<str>) -> Result<()> {
+        self.ensure_mutation_root_authority()?;
         check_crash_hook(CrashInjectionPoint::OpFsyncBeforeFlush);
         let started = Instant::now();
         let attr = self.stat(path.as_ref())?;
@@ -12172,6 +12299,7 @@ impl LocalFileSystem {
     }
 
     pub fn fsync_data_only(&mut self) -> Result<()> {
+        self.ensure_mutation_root_authority()?;
         // Intent log fast path: flush pending data entries instead of
         // walking dirty inodes and flushing content objects individually.
         if self.intent_log.pending_flush_count() > 0 {
@@ -12223,6 +12351,7 @@ impl LocalFileSystem {
     /// Pending write-intent entries are made replayable first, then the inode
     /// is covered by the same full committed-root boundary as `fsync_file`.
     pub fn sync_inode(&mut self, inode_id: InodeId) -> Result<()> {
+        self.ensure_mutation_root_authority()?;
         check_crash_hook(CrashInjectionPoint::OpFsyncBeforeFlush);
         self.flush_write_buffer(inode_id)?;
         let started = Instant::now();
@@ -12266,6 +12395,7 @@ impl LocalFileSystem {
     /// Like `fsync_data_only_file` but operates directly on an `InodeId`.
     /// Skips metadata-only flushes; only data extents are persisted.
     pub fn sync_inode_data_only(&mut self, inode_id: InodeId) -> Result<()> {
+        self.ensure_mutation_root_authority()?;
         check_crash_hook(CrashInjectionPoint::OpFsyncBeforeFlush);
         let started = Instant::now();
         self.flush_write_buffer(inode_id)?;
@@ -12327,6 +12457,7 @@ impl LocalFileSystem {
     /// flushes each inode individually. For a full transaction-group
     /// commit that also syncs metadata, use `fsync_all` instead.
     pub fn sync_all_dirty(&mut self) -> Result<()> {
+        self.ensure_mutation_root_authority()?;
         let dirty_inodes: Vec<InodeId> = self.state.dirty_content.iter().copied().collect();
         for inode_id in &dirty_inodes {
             let record = self
@@ -12366,6 +12497,7 @@ impl LocalFileSystem {
     /// When datasync is true, only data extents are flushed; metadata is
     /// skipped.  When the inode has no dirty content the call is a no-op.
     pub fn fdatasync_inode(&mut self, inode_id: InodeId, datasync: bool) -> Result<()> {
+        self.ensure_mutation_root_authority()?;
         let started = Instant::now();
 
         let had_dirty_buffer = self
@@ -12418,6 +12550,7 @@ impl LocalFileSystem {
     /// Per §6.6 of the design spec, this must also cover rename atomicity:
     /// after a crash, either the old name or the new name exists, never both.
     pub fn fsync_directory(&mut self, path: impl AsRef<str>) -> Result<()> {
+        self.ensure_mutation_root_authority()?;
         check_crash_hook(CrashInjectionPoint::OpFsyncBeforeFlush);
         let started = Instant::now();
         let attr = self.stat(path.as_ref())?;
@@ -13005,7 +13138,8 @@ impl LocalFileSystem {
         Ok(())
     }
 
-    fn begin_mutation(&mut self) -> Result<()> {
+    /// Admit a mutation and establish its rollback snapshot before staging.
+    fn try_begin_mutation(&mut self) -> Result<()> {
         self.ensure_mutation_root_authority()?;
         self.mutation_recorded_commit_group_write = false;
         if self.mutation_delta.is_none() {
@@ -13027,12 +13161,17 @@ impl LocalFileSystem {
                 old_capacity_authority: self.capacity_authority.snapshot_for_rollback(),
                 old_obligation_ledger: self.obligation_ledger.clone(),
                 old_dirty_pages,
+                old_dirty_content: self.state.dirty_content.clone(),
+                old_dirty_inodes: self.state.dirty_inodes.clone(),
+                old_dirty_dirs: self.state.dirty_dirs.clone(),
+                old_dirty_set: self.dirty_set.clone(),
                 old_dirty_extent_maps: self.state.dirty_extent_maps.clone(),
                 old_extent_allocator: self.extent_allocator.clone(),
                 old_reclaim_queue: self.reclaim_queue.lock().unwrap().clone(),
                 old_deferred_rewrite_trims: self.deferred_rewrite_trims.clone(),
                 pending_rewrite_trim_plans_len_at_begin: self.pending_rewrite_trim_plans.len(),
                 pending_permits_len_at_begin: self.pending_permits.len(),
+                old_uncommitted_mutation_count: self.uncommitted_mutation_count,
                 intent_log_rollback_floor: self.intent_log.next_entry_id(),
             });
         }
@@ -13090,11 +13229,12 @@ impl LocalFileSystem {
             self.state.snapshots = delta.old_snapshots;
             self.state.generation = delta.old_generation;
             self.state.inode_authority = delta.old_inode_authority;
-            self.state.dirty_content.clear();
-            self.state.dirty_inodes.clear();
-            self.state.dirty_dirs.clear();
+            self.state.dirty_content = delta.old_dirty_content;
+            self.state.dirty_inodes = delta.old_dirty_inodes;
+            self.state.dirty_dirs = delta.old_dirty_dirs;
             self.state.dirty_extent_maps = delta.old_dirty_extent_maps;
-            self.dirty_set.clear();
+            self.dirty_set = delta.old_dirty_set;
+            self.uncommitted_mutation_count = delta.old_uncommitted_mutation_count;
             self.release_pending_permits_from(delta.pending_permits_len_at_begin);
 
             // Restore side ledgers to pre-transaction state (#5980).
@@ -13929,6 +14069,7 @@ impl LocalFileSystem {
         update: tidefs_inode_attributes::timestamp::TimestampUpdate,
         policy: tidefs_inode_attributes::timestamp::TimestampPolicy,
     ) -> Result<()> {
+        self.ensure_mutation_root_authority()?;
         if !self.state.inodes.contains_key(&inode_id) {
             if !self.state.known_inode_ids.contains(&inode_id) && inode_id != ROOT_INODE_ID {
                 return Ok(());
@@ -13949,7 +14090,7 @@ impl LocalFileSystem {
             return Ok(());
         }
 
-        self.begin_mutation()?;
+        self.try_begin_mutation()?;
         let mut updated = record.clone();
         updated.posix_time = crate::types::PosixTimeRecord::new(
             posix.atime_ns,
@@ -13975,6 +14116,7 @@ impl LocalFileSystem {
         update: tidefs_inode_attributes::timestamp::TimestampUpdate,
         policy: tidefs_inode_attributes::timestamp::TimestampPolicy,
     ) -> Result<()> {
+        self.ensure_mutation_root_authority()?;
         if !self.state.inodes.contains_key(&inode_id) {
             if !self.state.known_inode_ids.contains(&inode_id) && inode_id != ROOT_INODE_ID {
                 return Ok(());
@@ -14045,7 +14187,7 @@ impl Drop for LocalFileSystem {
             handle.shutdown();
         }
 
-        if !self.recovery_policy.allows_any_mutation() {
+        if !self.recovery_policy.allows_any_mutation() || self.committed_root_anchor.is_none() {
             return;
         }
 
@@ -14055,14 +14197,14 @@ impl Drop for LocalFileSystem {
         // catch_unwind guards against panics that would abort the process
         // (destructors must not panic). Poisoned internal mutexes or
         // unexpected I/O failures are caught and logged.
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            if let Err(e) = self.do_commit() {
-                eprintln!("[tidefs-local-filesystem] Drop::do_commit failed: {e}");
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match self.do_commit() {
+            Ok(()) => {
+                if let Err(e) = self.store.sync_all() {
+                    eprintln!("[tidefs-local-filesystem] Drop::store.sync_all failed: {e}");
+                }
             }
-        }));
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            if let Err(e) = self.store.sync_all() {
-                eprintln!("[tidefs-local-filesystem] Drop::store.sync_all failed: {e}");
+            Err(e) => {
+                eprintln!("[tidefs-local-filesystem] Drop::do_commit failed: {e}");
             }
         }));
     }
@@ -14418,14 +14560,22 @@ mod orphan_index_integration_tests {
         assert_eq!(stats.reclaim_queue_entries, 0);
         assert!(!stats.is_idle());
 
-        assert!(fs.release_orphan(inode_id), "tracked orphan is queued");
-        assert!(!fs.release_orphan(inode_id), "second release is idempotent");
+        assert!(
+            fs.release_orphan(inode_id).expect("release orphan"),
+            "tracked orphan is queued"
+        );
+        assert!(
+            !fs.release_orphan(inode_id).expect("release orphan again"),
+            "second release is idempotent"
+        );
         let stats = fs.reclaim_stats();
         assert_eq!(stats.orphan_index_entries, 1);
         assert_eq!(stats.pending_orphan_deletions, 1);
         assert_eq!(stats.queued_work_items(), 2);
 
-        assert!(!fs.release_orphan(InodeId::new(88_002)));
+        assert!(!fs
+            .release_orphan(InodeId::new(88_002))
+            .expect("release unknown orphan"));
     }
 
     #[cfg(test)]
@@ -16944,7 +17094,7 @@ mod recovery_integration_tests {
             baseline_mode = inode.mode;
             fs.set_auto_commit(false);
 
-            fs.begin_mutation().expect("begin mode mutation");
+            fs.try_begin_mutation().expect("begin mode mutation");
             let mut updated = fs.stat("/mode").expect("stat baseline mode");
             updated.mode = (updated.mode & !0o7777) | 0o600;
             assert_eq!(
@@ -17254,53 +17404,66 @@ mod recovery_integration_tests {
     #[test]
     fn transaction_rollback_restores_rewrite_trim_side_ledgers() {
         let root = temp_root("txn-rollback-rewrite-trims");
-        let mut fs =
-            LocalFileSystem::open_with_options(&root, test_options()).expect("open filesystem");
-
-        let created = fs.create_file("/rewrite-me", 0o644).expect("create_file");
         let old_content = b"stable old content".to_vec();
-        let committed = fs
-            .replace_content(created.inode_id, created, old_content.clone())
-            .expect("write old content");
-        fs.tick_background_services();
+        {
+            let mut fs =
+                LocalFileSystem::open_with_options(&root, test_options()).expect("open filesystem");
+            let created = fs.create_file("/rewrite-me", 0o644).expect("create_file");
+            let committed = fs
+                .replace_content(created.inode_id, created, old_content.clone())
+                .expect("write old content");
+            let old_keys = [
+                content_object_key_for_version(committed.inode_id, committed.data_version),
+                content_chunk_object_key_for_version(committed.inode_id, committed.data_version, 0),
+            ];
+            let extents_before = fs.lookup_extents(
+                committed.inode_id.get(),
+                0,
+                u64::try_from(old_content.len()).expect("content length fits u64"),
+            );
+            let pending_trims_before = fs.pending_rewrite_trim_plans.len();
 
-        let reclaim_depth_before = fs.reclaim_queue_depth();
-        let deferred_trims_before = fs.deferred_rewrite_trims.len();
+            fs.set_auto_commit(false);
+            fs.begin_transaction().expect("begin_transaction");
+            fs.write_file_ranges_direct("/rewrite-me", vec![(0, b"rolled back content".to_vec())])
+                .expect("rewrite inside transaction");
+            assert!(fs.pending_rewrite_trim_plans.len() > pending_trims_before);
 
-        fs.set_auto_commit(false);
-        fs.begin_transaction().expect("begin_transaction");
-        fs.replace_content(
-            committed.inode_id,
-            committed.clone(),
-            b"rolled back content".to_vec(),
-        )
-        .expect("rewrite inside transaction");
+            fs.tick_background_services();
+            for key in old_keys {
+                assert!(fs
+                    .store
+                    .placement_receipt_for_key(DeviceIoClass::Data, key)
+                    .expect("inspect selected-root content receipt")
+                    .is_some());
+            }
 
-        assert!(
-            fs.reclaim_queue_depth() > reclaim_depth_before
-                || fs.deferred_rewrite_trims.len() > deferred_trims_before,
-            "transactional rewrite must stage trim side state before rollback"
-        );
+            fs.rollback_transaction().expect("rollback_transaction");
+            assert_eq!(fs.pending_rewrite_trim_plans.len(), pending_trims_before);
+            assert_eq!(
+                fs.lookup_extents(
+                    committed.inode_id.get(),
+                    0,
+                    u64::try_from(old_content.len()).expect("content length fits u64"),
+                ),
+                extents_before,
+            );
+            assert_eq!(
+                fs.read_file("/rewrite-me").expect("read after rollback"),
+                old_content,
+            );
+            fs.recovery_policy = RecoveryPolicy::ReadOnly;
+        }
 
-        fs.rollback_transaction().expect("rollback_transaction");
-
+        let reopened =
+            LocalFileSystem::open_with_options(&root, test_options()).expect("reopen filesystem");
         assert_eq!(
-            fs.reclaim_queue_depth(),
-            reclaim_depth_before,
-            "rollback must restore reclaim queue trim state"
-        );
-        assert_eq!(
-            fs.deferred_rewrite_trims.len(),
-            deferred_trims_before,
-            "rollback must restore deferred rewrite trim state"
-        );
-        assert_eq!(
-            fs.read_file("/rewrite-me").expect("read after rollback"),
+            reopened
+                .read_file("/rewrite-me")
+                .expect("read selected-root content"),
             old_content,
-            "rollback must leave the pre-transaction content reachable"
         );
-
-        drop(fs);
+        drop(reopened);
         cleanup(&root);
     }
 
