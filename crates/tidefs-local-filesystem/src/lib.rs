@@ -7191,18 +7191,18 @@ impl LocalFileSystem {
         Ok(coalesced)
     }
 
-    fn plan_direct_write_extents(
-        &self,
+    fn apply_direct_write_extents(
+        &mut self,
         inode_id: InodeId,
         segments: &[(u64, Vec<u8>)],
-    ) -> Result<ExtentAllocator> {
-        let mut planned = self.extent_allocator.clone();
+    ) -> Result<()> {
         let birth_txg = self.commit_group.current_commit_group().0;
         for (offset, bytes) in segments {
             let length = u64::try_from(bytes.len()).map_err(|_| FileSystemError::SizeOverflow {
                 requested: u64::MAX,
             })?;
-            let allocations = planned
+            let allocations = self
+                .extent_allocator
                 .allocate_extent(inode_id.get(), *offset, length, None)
                 .map_err(|_| FileSystemError::CorruptState {
                     reason: "direct write could not establish pending extent coverage",
@@ -7213,7 +7213,8 @@ impl LocalFileSystem {
                 });
             }
             let checksum = *blake3::hash(bytes).as_bytes();
-            let finalized = planned
+            let finalized = self
+                .extent_allocator
                 .finalize_data_extent(inode_id.get(), *offset, length, checksum, birth_txg)
                 .map_err(|_| FileSystemError::CorruptState {
                     reason: "direct write pending extent finalization failed",
@@ -7223,7 +7224,9 @@ impl LocalFileSystem {
                     reason: "direct write pending extent finalization was not one-to-one",
                 });
             }
-            let coverage = planned.lookup_extents(inode_id.get(), *offset, length);
+            let coverage = self
+                .extent_allocator
+                .lookup_extents(inode_id.get(), *offset, length);
             if coverage.len() != 1
                 || coverage[0].logical_offset != *offset
                 || coverage[0].length != length
@@ -7236,7 +7239,7 @@ impl LocalFileSystem {
                 });
             }
         }
-        Ok(planned)
+        Ok(())
     }
 
     fn coalesced_write_segment_ranges(
@@ -8599,7 +8602,6 @@ impl LocalFileSystem {
         }
 
         let written_ranges = self.coalesced_write_segment_ranges(&segments)?;
-        let planned_extent_allocator = self.plan_direct_write_extents(inode_id, &segments)?;
         let physical_admit_bytes = total_bytes;
         let base_record = self.committed_inode_record(inode_id)?;
         let replacement_credit_bytes =
@@ -8609,6 +8611,11 @@ impl LocalFileSystem {
         self.try_begin_mutation()?;
 
         let direct_result = (|| {
+            check_crash_hook(CrashInjectionPoint::OpWriteBeforeExtentUpdate);
+            // Apply extent planning inside the mutation rollback boundary but
+            // before any Pool content write. This keeps refusal atomic without
+            // cloning the global allocator a second time.
+            self.apply_direct_write_extents(inode_id, &segments)?;
             if physical_admit_bytes > 0 {
                 let handle = self
                     .reserve_with_hierarchy_replacement_credit(
@@ -8625,7 +8632,6 @@ impl LocalFileSystem {
                 handle.commit();
             }
 
-            check_crash_hook(CrashInjectionPoint::OpWriteBeforeExtentUpdate);
             self.invalidate_hot_read_cache_for_inode(inode_id);
 
             let patches = self.coalesced_write_buffer_patches(&segments)?;
@@ -8680,7 +8686,6 @@ impl LocalFileSystem {
             self.state
                 .space_accounting
                 .track_physical_write(total_bytes);
-            self.extent_allocator = planned_extent_allocator;
             self.state.dirty_extent_maps.insert(inode_id);
             let cleared_dirty_bytes = self.clear_write_buffer_ranges(inode_id, &written_ranges);
             self.record_dirty_buffer_free(cleared_dirty_bytes);
