@@ -501,13 +501,6 @@ fn audit_recovery_source_details<S: CommittedRootRecoverySource>(
     })
 }
 
-pub fn verify_online_store(
-    store: &mut LocalObjectStore,
-    root_authentication_key: RootAuthenticationKey,
-) -> Result<OnlineVerifierReport> {
-    verify_online_source(store, root_authentication_key)
-}
-
 pub(crate) fn verify_online_pool(
     pool: &mut Pool,
     root_authentication_key: RootAuthenticationKey,
@@ -1831,7 +1824,7 @@ fn decode_quorum_root_candidate(physical_slot: u64, bytes: &[u8]) -> Result<Root
 }
 
 pub(crate) fn load_state_from_transaction(
-    store: &mut LocalObjectStore,
+    store: &LocalObjectStore,
     root: &RootCommitRecord,
     root_authentication_key: RootAuthenticationKey,
 ) -> Result<FileSystemState> {
@@ -1841,12 +1834,12 @@ pub(crate) fn load_state_from_transaction(
 /// Load transaction metadata from its authenticated manifest, then validate
 /// every nonempty committed file-like inode through current Pool authority.
 pub(crate) fn load_state_from_transaction_pool(
-    pool: &mut Pool,
+    pool: &Pool,
     root: &RootCommitRecord,
     root_authentication_key: RootAuthenticationKey,
 ) -> Result<FileSystemState> {
     let state = load_state_from_transaction_for_content_inspection(
-        pool.raw_primary_store_mut(),
+        pool.raw_primary_store(),
         root,
         root_authentication_key,
     )?;
@@ -2058,7 +2051,7 @@ fn load_state_from_transaction_store_candidate(
 }
 
 fn load_state_from_transaction_pool_candidate(
-    pool: &mut Pool,
+    pool: &Pool,
     root: &RootCommitRecord,
     supporting_store_indices: &BTreeSet<usize>,
     root_authentication_key: RootAuthenticationKey,
@@ -2071,7 +2064,7 @@ fn load_state_from_transaction_pool_candidate(
     )?;
     let superblock = decode_candidate_superblock(root, &candidate.superblock_bytes)?;
     let state = load_state_from_superblock_for_content_inspection(
-        pool.raw_primary_store_mut(),
+        pool.raw_primary_store(),
         &superblock,
         root.transaction_id,
         &candidate.manifest.entries,
@@ -2089,7 +2082,7 @@ fn load_state_from_transaction_pool_candidate(
 }
 
 fn load_state_from_transaction_for_content_inspection(
-    store: &mut LocalObjectStore,
+    store: &LocalObjectStore,
     root: &RootCommitRecord,
     root_authentication_key: RootAuthenticationKey,
 ) -> Result<FileSystemState> {
@@ -2102,7 +2095,7 @@ fn load_state_from_transaction_for_content_inspection(
 }
 
 fn load_state_from_transaction_with_manifest_validation(
-    store: &mut LocalObjectStore,
+    store: &LocalObjectStore,
     root: &RootCommitRecord,
     root_authentication_key: RootAuthenticationKey,
     validate_manifest_against_loaded_state: bool,
@@ -2517,7 +2510,7 @@ fn manifest_snapshot_records(
 }
 
 fn load_state_from_superblock_for_content_inspection(
-    store: &mut LocalObjectStore,
+    store: &LocalObjectStore,
     superblock: &SuperblockRecord,
     transaction_id: u64,
     manifest_entries: &[TransactionManifestEntry],
@@ -2534,7 +2527,7 @@ fn load_state_from_superblock_for_content_inspection(
 }
 
 fn load_state_from_superblock_with_content_validation(
-    store: &mut LocalObjectStore,
+    store: &LocalObjectStore,
     superblock: &SuperblockRecord,
     transaction_id: Option<u64>,
     validate_file_content: bool,

@@ -83,9 +83,10 @@
 //!    clearance evidence authorizes the object ids.
 //!
 //! The scrub-to-repair scheduling chain:
-//! 1. `BackgroundScrubber` periodically opens a read-only store, runs
-//!    `verify_online_store` and `scrub_inodes_content`, and sets the
-//!    shared `scrub_corruption_detected` flag when corruption is found.
+//! 1. `BackgroundScrubber` periodically imports the mounted Pool topology
+//!    read-only, verifies its committed roots and content through current Pool
+//!    placement authority, and sets the shared `scrub_corruption_detected`
+//!    flag when corruption is found.
 //! 2. `tick_background_services()` Duty 3 picks up the flag, runs
 //!    `repair_cycle()` (scrub → schedule → dispatch) against the live
 //!    store, and clears the flag.
@@ -1179,11 +1180,12 @@ mod resolve_compression_policy_tests {
 }
 
 #[derive(Debug)]
-/// Background scrubber that periodically re-opens a read-only store
-/// and runs the online verifier to detect silent data corruption.
+/// Background scrubber that periodically imports the mounted Pool topology
+/// read-only and runs the online verifier to detect silent data corruption.
 struct BackgroundScrubber {
     corruption_detected: Arc<AtomicBool>,
-    root: std::path::PathBuf,
+    pool_config: PoolConfig,
+    pool_properties: PoolProperties,
     options: StoreOptions,
     root_authentication_key: RootAuthenticationKey,
     interval: Duration,
@@ -1192,14 +1194,16 @@ struct BackgroundScrubber {
 
 impl BackgroundScrubber {
     fn new(
-        root: std::path::PathBuf,
+        pool_config: PoolConfig,
+        pool_properties: PoolProperties,
         options: StoreOptions,
         root_authentication_key: RootAuthenticationKey,
         interval: Duration,
         corruption_detected: Arc<AtomicBool>,
     ) -> Self {
         Self {
-            root,
+            pool_config,
+            pool_properties,
             options,
             root_authentication_key,
             interval,
@@ -1229,55 +1233,69 @@ impl BackgroundService for BackgroundScrubber {
 
         self.last_scrub = Instant::now();
 
-        let mut store =
-            match LocalObjectStore::open_read_only_with_options(&self.root, self.options.clone()) {
-                Ok(Some(s)) => s,
-                Ok(None) => {
-                    eprintln!(
-                        "background-scrub: store not found at {}, skipping cycle",
-                        self.root.display()
-                    );
-                    return Ok(TickReport::default());
-                }
-                Err(e) => {
-                    eprintln!("background-scrub: failed to open read-only store: {e}");
-                    return Ok(TickReport {
-                        errors: 1,
-                        ..TickReport::default()
-                    });
-                }
-            };
+        let mut pool = match Pool::open_read_only_existing(
+            self.pool_config.clone(),
+            self.pool_properties.clone(),
+            &self.options,
+        ) {
+            Ok(pool) => pool,
+            Err(e) => {
+                eprintln!(
+                    "background-scrub: failed to import read-only pool at {}: {e}",
+                    self.pool_config.root_path.display()
+                );
+                return Ok(TickReport {
+                    errors: 1,
+                    ..TickReport::default()
+                });
+            }
+        };
 
-        match crate::recovery::verify_online_store(&mut store, self.root_authentication_key) {
+        match crate::recovery::verify_online_pool(&mut pool, self.root_authentication_key) {
             Ok(report) => {
+                let verifier_errors = report
+                    .issues
+                    .iter()
+                    .filter(|issue| issue.severity == OnlineVerifierIssueSeverity::Error)
+                    .count() as u64;
                 if !report.issues.is_empty() {
                     eprintln!(
-                        "background-scrub: {} corruption issue(s) detected in {} root slots",
+                        "background-scrub: {} verifier issue(s) found in {} root slots",
                         report.issues.len(),
                         report.root_slots_seen,
                     );
-                    self.corruption_detected.store(true, Ordering::SeqCst);
                     for issue in &report.issues {
                         eprintln!(
-                            "  background-scrub: slot={:?} tx={:?} {}",
-                            issue.slot, issue.transaction_id, issue.reason
+                            "  background-scrub: severity={} slot={:?} tx={:?} {}",
+                            issue.severity.human_name(),
+                            issue.slot,
+                            issue.transaction_id,
+                            issue.reason
                         );
                     }
+                }
+                if verifier_errors > 0 {
+                    self.corruption_detected.store(true, Ordering::SeqCst);
                     return Ok(TickReport {
                         processed: report.issues.len() as u64,
+                        errors: verifier_errors,
                         has_more: false,
                         ..TickReport::default()
                     });
                 }
 
                 // Root slots verified clean — run content-block checksum verification.
-                match crate::recovery::load_latest_committed_state(
-                    &mut store,
+                match crate::recovery::load_latest_committed_state_pool(
+                    &mut pool,
                     self.root_authentication_key,
-                    RecoveryPolicy::default(),
+                    RecoveryPolicy::ReadOnly,
                 ) {
                     Ok(Some(state)) => {
-                        match crate::scrub::scrub_inodes_content(&store, &state.inodes) {
+                        match crate::scrub::scrub_inodes_content_with_pool(
+                            pool.raw_primary_store(),
+                            &state.inodes,
+                            Some(&pool),
+                        ) {
                             Ok(scrub_report) => {
                                 if !scrub_report.is_clean() {
                                     eprintln!(
@@ -1317,7 +1335,15 @@ impl BackgroundService for BackgroundScrubber {
                             }
                         }
                     }
-                    Ok(None) => Ok(TickReport::default()),
+                    Ok(None) => {
+                        eprintln!(
+                            "background-scrub: imported pool has no committed filesystem root"
+                        );
+                        Ok(TickReport {
+                            errors: 1,
+                            ..TickReport::default()
+                        })
+                    }
                     Err(e) => {
                         eprintln!("background-scrub: failed to load committed state: {e}");
                         Ok(TickReport {
@@ -1339,6 +1365,199 @@ impl BackgroundService for BackgroundScrubber {
 
     fn has_work(&self) -> bool {
         self.last_scrub.elapsed() >= self.interval
+    }
+}
+
+#[cfg(test)]
+mod background_scrubber_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    struct TwoDeviceFixture {
+        _temp: TempDir,
+        metadata_root: std::path::PathBuf,
+        devices: Vec<std::path::PathBuf>,
+    }
+
+    fn two_device_fixture() -> TwoDeviceFixture {
+        let temp = TempDir::new().expect("create background scrub fixture");
+        let metadata_root = temp.path().join("metadata");
+        fs::create_dir_all(&metadata_root).expect("create metadata directory");
+        let devices: Vec<_> = (0..2)
+            .map(|index| temp.path().join(format!("device-{index}.img")))
+            .collect();
+        for device in &devices {
+            let file = fs::File::create(device).expect("create device image");
+            file.set_len(8 * 1024 * 1024).expect("size device image");
+        }
+        TwoDeviceFixture {
+            _temp: temp,
+            metadata_root,
+            devices,
+        }
+    }
+
+    fn open_two_device_filesystem(fixture: &TwoDeviceFixture) -> LocalFileSystem {
+        LocalFileSystem::open_with_allocator_policy_and_root_authentication_key(
+            &fixture.metadata_root,
+            LocalFileSystemOpenConfig {
+                options: StoreOptions::test_fast(),
+                allocator_policy: LocalStorageAllocatorPolicy::default(),
+                root_authentication_key: RootAuthenticationKey::demo_key(),
+                encryption: None,
+                compression: None,
+                log_device_device_path: None,
+                recovery_policy: RecoveryPolicy::default(),
+                block_devices: Some(&fixture.devices),
+            },
+        )
+        .expect("open two-device filesystem")
+    }
+
+    fn commit_off_primary_content(fs: &mut LocalFileSystem) -> Vec<u8> {
+        let path = "/background-scrub.bin";
+        fs.create_file(path, DEFAULT_FILE_PERMISSIONS)
+            .expect("create scrub fixture file");
+
+        for attempt in 0..64_u64 {
+            let payload = format!("background scrub off-primary payload {attempt}").into_bytes();
+            fs.replace_file(path, &payload)
+                .expect("replace scrub fixture content");
+            fs.sync_all().expect("commit scrub fixture content");
+            let record = fs.stat(path).expect("stat scrub fixture file");
+            let manifest_key = content_object_key_for_version(record.inode_id, record.data_version);
+            let manifest_receipt = fs
+                .store
+                .placement_receipt_for_key(DeviceIoClass::Data, manifest_key)
+                .expect("read manifest receipt")
+                .expect("manifest receipt exists");
+            let ContentLayout::Chunked(manifest) = fs
+                .read_committed_content_layout(record.inode_id, &record)
+                .expect("read committed content layout")
+            else {
+                panic!("committed fixture content must use a chunk manifest");
+            };
+            let chunk_ref = manifest
+                .chunks
+                .iter()
+                .find(|chunk| !chunk.is_hole())
+                .expect("non-hole committed chunk");
+            let chunk_key = content_chunk_object_key_for_version(
+                record.inode_id,
+                chunk_ref.data_version,
+                chunk_ref.chunk_index,
+            );
+            let chunk_receipt = fs
+                .store
+                .placement_receipt_for_key(DeviceIoClass::Data, chunk_key)
+                .expect("read chunk receipt")
+                .expect("chunk receipt exists");
+            if manifest_receipt
+                .targets
+                .iter()
+                .all(|target| target.device_index != 0)
+                && chunk_receipt
+                    .targets
+                    .iter()
+                    .all(|target| target.device_index != 0)
+            {
+                assert!(fs
+                    .store
+                    .raw_primary_store()
+                    .get(manifest_key)
+                    .expect("inspect raw primary manifest")
+                    .is_none());
+                assert!(fs
+                    .store
+                    .raw_primary_store()
+                    .get(chunk_key)
+                    .expect("inspect raw primary chunk")
+                    .is_none());
+                return payload;
+            }
+        }
+
+        panic!("deterministic placement did not reach the secondary device");
+    }
+
+    fn snapshot_devices(devices: &[std::path::PathBuf]) -> Vec<Vec<u8>> {
+        devices
+            .iter()
+            .map(|device| fs::read(device).expect("snapshot device"))
+            .collect()
+    }
+
+    #[test]
+    fn block_device_background_scrub_accepts_off_primary_committed_content() {
+        let fixture = two_device_fixture();
+        let mut fs = open_two_device_filesystem(&fixture);
+        let payload = commit_off_primary_content(&mut fs);
+        let pool_config = fs.store.config().clone();
+        let pool_properties = fs.store.properties().clone();
+        let receipts_before = fs
+            .store
+            .placement_receipts(DeviceIoClass::Data)
+            .expect("snapshot placement receipts");
+        let devices_before = snapshot_devices(&fixture.devices);
+        let corruption_detected = Arc::new(AtomicBool::new(false));
+        let mut scrubber = BackgroundScrubber::new(
+            pool_config,
+            pool_properties,
+            StoreOptions::test_fast(),
+            RootAuthenticationKey::demo_key(),
+            Duration::ZERO,
+            Arc::clone(&corruption_detected),
+        );
+
+        let report = scrubber
+            .tick(&ServiceBudget::DEFAULT_TICK)
+            .expect("run background scrub tick");
+        assert!(report.processed > 0, "scrub must report scanned content");
+        assert_eq!(report.errors, 0, "scrub report: {report:?}");
+        assert!(!corruption_detected.load(Ordering::SeqCst));
+        assert_eq!(
+            fs.read_file("/background-scrub.bin")
+                .expect("read committed content after scrub"),
+            payload
+        );
+        assert_eq!(snapshot_devices(&fixture.devices), devices_before);
+        assert_eq!(
+            fs.store
+                .placement_receipts(DeviceIoClass::Data)
+                .expect("re-read placement receipts"),
+            receipts_before
+        );
+    }
+
+    #[test]
+    fn block_device_background_scrub_refuses_incomplete_pool_topology() {
+        let fixture = two_device_fixture();
+        let mut fs = open_two_device_filesystem(&fixture);
+        fs.create_file("/topology.bin", DEFAULT_FILE_PERMISSIONS)
+            .expect("create topology fixture");
+        fs.replace_file("/topology.bin", b"topology must be complete")
+            .expect("write topology fixture");
+        fs.sync_all().expect("commit topology fixture");
+        let devices_before = snapshot_devices(&fixture.devices);
+        let mut incomplete_config = fs.store.config().clone();
+        incomplete_config.devices.pop();
+        let corruption_detected = Arc::new(AtomicBool::new(false));
+        let mut scrubber = BackgroundScrubber::new(
+            incomplete_config,
+            fs.store.properties().clone(),
+            StoreOptions::test_fast(),
+            RootAuthenticationKey::demo_key(),
+            Duration::ZERO,
+            Arc::clone(&corruption_detected),
+        );
+
+        let report = scrubber
+            .tick(&ServiceBudget::DEFAULT_TICK)
+            .expect("run incomplete-topology scrub tick");
+        assert_eq!(report.processed, 0);
+        assert!(report.errors > 0, "incomplete topology must be an error");
+        assert!(!corruption_detected.load(Ordering::SeqCst));
+        assert_eq!(snapshot_devices(&fixture.devices), devices_before);
     }
 }
 
@@ -3367,6 +3586,8 @@ impl LocalFileSystem {
                     .into(),
             });
         }
+        let background_scrub_pool_config = store.config().clone();
+        let background_scrub_pool_properties = store.properties().clone();
         check_crash_hook(CrashInjectionPoint::RecoveryBeforeRootSelect);
         let mut open_recovery = MountedOpenRecoveryAuthority::raw_only(
             &mut store,
@@ -3746,7 +3967,8 @@ impl LocalFileSystem {
                 let corruption_flag = Arc::new(AtomicBool::new(false));
                 fs.scrub_corruption_detected = Some(Arc::clone(&corruption_flag));
                 let scrubber = BackgroundScrubber::new(
-                    root_path.clone(),
+                    background_scrub_pool_config,
+                    background_scrub_pool_properties,
                     options,
                     root_authentication_key,
                     Duration::from_secs(scrub_interval_secs),

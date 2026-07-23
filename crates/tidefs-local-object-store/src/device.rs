@@ -561,7 +561,20 @@ impl SingleDevice {
     /// byte-addressable backing without segment files or directory operations.
     pub fn open_block(path: impl AsRef<Path>, options: StoreOptions) -> Result<Self> {
         let store = LocalObjectStore::open_block_device(path, options)?;
-        Ok(Self {
+        Ok(Self::from_block_store(store))
+    }
+
+    /// Open an existing byte-addressable backing through a read-only handle.
+    fn open_block_read_only_existing(
+        path: impl AsRef<Path>,
+        options: StoreOptions,
+    ) -> Result<Self> {
+        let store = LocalObjectStore::open_block_device_read_only_existing(path, options)?;
+        Ok(Self::from_block_store(store))
+    }
+
+    fn from_block_store(store: LocalObjectStore) -> Self {
+        Self {
             store,
             health_config: DeviceHealthConfig::default(),
             health_tracker: RefCell::new(DeviceHealthState::new(
@@ -579,7 +592,7 @@ impl SingleDevice {
             read_ops: 0,
             write_ops: 0,
             delete_ops: 0,
-        })
+        }
     }
     pub fn open_with_health(
         path: impl AsRef<Path>,
@@ -2681,6 +2694,14 @@ impl Device {
     /// Create a single block-device-backed device.
     pub fn open_single_block(path: impl AsRef<Path>, options: StoreOptions) -> Result<Self> {
         SingleDevice::open_block(path, options).map(Device::Single)
+    }
+
+    /// Open an existing single block-device-backed device read-only.
+    pub(crate) fn open_single_block_read_only_existing(
+        path: impl AsRef<Path>,
+        options: StoreOptions,
+    ) -> Result<Self> {
+        SingleDevice::open_block_read_only_existing(path, options).map(Device::Single)
     }
 
     /// Create a mirror device from a set of paths.

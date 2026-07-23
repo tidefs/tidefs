@@ -735,7 +735,6 @@ pub fn check_online_verifier_current_workspace() -> Result<(), StorageCheckError
             "verify_online",
             "verify_online_with_root_authentication_key",
             "online_verifier_report",
-            "verify_online_store",
             "online_verifier_path_does_not_initialize_missing_store",
             "online_verifier_reports_clean_committed_roots_without_mutation",
             "online_verifier_reports_corrupt_candidate_without_changing_live_truth",
