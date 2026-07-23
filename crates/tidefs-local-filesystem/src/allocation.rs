@@ -7,12 +7,18 @@ use tidefs_types_vfs_core::{InodeId, ROOT_INODE_ID};
 use crate::constants::*;
 use crate::content::{
     content_chunk_count, content_chunk_len, content_chunk_start, decode_content_layout,
-    find_chunk_in_manifest, overlay_chunk_index_bounds, overlay_chunk_writes_only_zeros,
-    range_intersects_overlay, retained_content_chunk_ref, validate_content_layout,
-    ContentOverlayPatch,
+    find_chunk_in_manifest, is_valid_content_chunk_size, overlay_chunk_index_bounds,
+    overlay_chunk_writes_only_zeros, range_intersects_overlay, read_content_layout_from_store,
+    retained_content_chunk_ref, validate_content_layout, ContentOverlayPatch,
+};
+use crate::encoding::{
+    compute_content_fingerprint, decode_content, decode_content_chunk, decode_content_manifest,
+    decode_dedup_redirect, is_dedup_redirect, split_inline_checksum,
 };
 use crate::error::FileSystemError;
-use crate::object_keys::{content_chunk_object_key_for_version, content_object_key_for_version};
+use crate::object_keys::{
+    content_chunk_object_key_for_version, content_dedup_object_key, content_object_key_for_version,
+};
 use crate::records::ContentLayout;
 use crate::types::*;
 use crate::{FileSystemState, Result};
@@ -20,19 +26,13 @@ pub(crate) fn content_allocation_entries_for_state(
     store: &LocalObjectStore,
     state: &FileSystemState,
 ) -> Result<BTreeMap<ObjectKey, u64>> {
-    content_allocation_entries_for_state_with(state, |inode| {
-        content_allocation_entries_for_inode(store, inode)
-    })
-}
-
-pub(crate) fn content_allocation_entries_for_state_with(
-    state: &FileSystemState,
-    mut entries_for_inode: impl FnMut(&InodeRecord) -> Result<BTreeMap<ObjectKey, u64>>,
-) -> Result<BTreeMap<ObjectKey, u64>> {
     let mut entries = BTreeMap::new();
     for inode in state.inodes.values() {
         if inode.is_file_like() {
-            merge_allocation_entries(&mut entries, entries_for_inode(inode)?);
+            merge_allocation_entries(
+                &mut entries,
+                content_allocation_entries_for_inode(store, inode)?,
+            );
         }
     }
     Ok(entries)
@@ -179,13 +179,14 @@ pub(crate) fn materialized_content_bytes_for_layout(layout: &ContentLayout) -> R
 }
 
 pub(crate) fn planned_chunk_allocation_entries_for_overlay(
-    old_layout: &ContentLayout,
+    store: &LocalObjectStore,
     old_record: &InodeRecord,
     new_record: &InodeRecord,
     overlay_offset: u64,
     overlay_bytes: &[u8],
     allow_holes: bool,
 ) -> Result<BTreeMap<ObjectKey, u64>> {
+    let old_layout = read_content_layout_from_store(store, old_record.inode_id, old_record)?;
     let mut entries = BTreeMap::new();
     if allow_holes && overlay_bytes.is_empty() {
         if let crate::records::ContentLayout::Chunked(ref manifest) = old_layout {
@@ -366,7 +367,7 @@ pub(crate) fn planned_chunk_allocation_entries_for_overlay(
     }
     for chunk_index in 0..content_chunk_count(new_record.size)? {
         if let Some(retained) = retained_content_chunk_ref(
-            old_layout,
+            &old_layout,
             old_record.size,
             new_record.size,
             overlay_offset,
@@ -433,12 +434,13 @@ pub(crate) fn planned_chunk_allocation_entries_for_overlay(
 }
 
 pub(crate) fn planned_chunk_allocation_entries_for_patch_batch(
-    old_layout: &ContentLayout,
+    store: &LocalObjectStore,
     old_record: &InodeRecord,
     new_record: &InodeRecord,
     patches: &[ContentOverlayPatch<'_>],
     allow_holes: bool,
 ) -> Result<BTreeMap<ObjectKey, u64>> {
+    let old_layout = read_content_layout_from_store(store, old_record.inode_id, old_record)?;
     let mut entries = BTreeMap::new();
     if !allow_holes || old_record.size > new_record.size {
         return Err(FileSystemError::Unsupported {
@@ -621,13 +623,72 @@ pub(crate) fn next_allocated_inode_id(state: &FileSystemState) -> u64 {
         .max(ROOT_INODE_ID.get().saturating_add(1))
 }
 
+fn dedup_canonical_chunk_is_current(
+    pool: &tidefs_local_object_store::pool::Pool,
+    canonical_key: ObjectKey,
+    expected_len: Option<usize>,
+) -> bool {
+    use tidefs_local_object_store::DeviceIoClass;
+
+    let Ok(Some((canonical_bytes, receipt))) =
+        pool.get_with_current_receipt(DeviceIoClass::Data, canonical_key)
+    else {
+        return false;
+    };
+    if receipt.generation == 0 {
+        return false;
+    }
+    let Ok(chunk) = decode_content_chunk(&canonical_bytes) else {
+        return false;
+    };
+    if expected_len.is_some_and(|len| chunk.bytes.len() != len) {
+        return false;
+    }
+    let fingerprint = compute_content_fingerprint(&chunk.bytes);
+    content_dedup_object_key(&fingerprint) == canonical_key
+}
+
+fn chunk_payload_matches_ref(
+    pool: &tidefs_local_object_store::pool::Pool,
+    chunk_ref: &crate::records::ContentChunkRef,
+    object_key: ObjectKey,
+    bytes: &[u8],
+) -> bool {
+    if chunk_ref.data_version == 0
+        || chunk_ref.len == 0
+        || tidefs_local_object_store::checksum64(bytes) != chunk_ref.checksum
+    {
+        return false;
+    }
+
+    if is_dedup_redirect(bytes) {
+        let Ok(canonical_key) = decode_dedup_redirect(bytes) else {
+            return false;
+        };
+        return dedup_canonical_chunk_is_current(pool, canonical_key, Some(chunk_ref.len as usize));
+    }
+
+    let Ok(chunk) = decode_content_chunk(bytes) else {
+        return false;
+    };
+    chunk.data_version == chunk_ref.data_version
+        && chunk.chunk_index == chunk_ref.chunk_index
+        && chunk.bytes.len() == chunk_ref.len as usize
+        && content_chunk_object_key_for_version(
+            chunk.inode_id,
+            chunk.data_version,
+            chunk.chunk_index,
+        ) == object_key
+}
+
 /// Returns true when the placement receipt generation recorded in a chunk ref
 /// is durable (matches the pool receipt for the same key).
 ///
-/// A receipt is durable when the pool holds a matching receipt with the same
-/// generation and the receipt is not synthetic (generation > 0). This is the
-/// receipt-authority gate that prevents reclaim from freeing chunks whose
-/// placement receipt has not been committed.
+/// A receipt is durable only when a strict current Pool read returns the exact
+/// nonzero generation recorded by the chunk ref and the receipted payload
+/// matches the ref's checksum, length, and content identity. Dedup redirects
+/// additionally require a strict current read of a canonical chunk whose
+/// plaintext fingerprint matches its content-addressed key.
 ///
 /// Hole chunks (data_version == 0, no receipt) are always durable-trivial:
 /// they consume no storage and have no receipt to validate.
@@ -643,87 +704,138 @@ pub(crate) fn chunk_receipt_is_durable(
         return true;
     }
 
-    // Zero generation means no receipt was captured (pre-v6 format or legacy
-    // write).  These chunks may be reclaimed without receipt gating.
     if chunk_ref.placement_receipt_generation == 0 {
-        return true;
+        return false;
     }
 
-    // Look up the pool's current receipt for this key.
-    let Ok(Some(receipt)) = pool.placement_receipt_for_key(DeviceIoClass::Data, object_key) else {
-        // No receipt found in pool: the chunk's receipt is not yet durable.
+    let Ok(Some((bytes, receipt))) = pool.get_with_current_receipt(DeviceIoClass::Data, object_key)
+    else {
         return false;
     };
 
-    // The chunk ref's receipt generation must match or be less than the pool receipt.
-    // A higher pool generation means a replacement was written; the old
-    // receipt is no longer authoritative but the replacement must be durable
-    // before the old chunk is freed (checked separately by the caller).
-    receipt.generation >= chunk_ref.placement_receipt_generation
+    receipt.generation == chunk_ref.placement_receipt_generation
+        && receipt.generation > 0
+        && chunk_payload_matches_ref(pool, chunk_ref, object_key, &bytes)
 }
 
-/// Check whether a content object has a durable replacement receipt.
-///
-/// Returns `true` when the pool holds a receipt for `object_key` with a
-/// generation strictly greater than `old_generation`. This means the
-/// replacement data is durably placed and the old chunk may be reclaimed
-/// once no readers depend on the old receipt.
-pub(crate) fn replacement_receipt_is_durable(
+fn content_manifest_replacement_is_current(
     pool: &tidefs_local_object_store::pool::Pool,
-    object_key: tidefs_local_object_store::ObjectKey,
-    old_generation: u64,
+    object_key: ObjectKey,
+    bytes: &[u8],
 ) -> bool {
-    use tidefs_local_object_store::DeviceIoClass;
-
-    if old_generation == 0 {
-        return true;
-    }
-
-    let Ok(Some(receipt)) = pool.placement_receipt_for_key(DeviceIoClass::Data, object_key) else {
+    let Ok(manifest) = decode_content_manifest(bytes) else {
         return false;
     };
+    if manifest.inode_id.get() == 0
+        || manifest.data_version == 0
+        || content_object_key_for_version(manifest.inode_id, manifest.data_version) != object_key
+        || !is_valid_content_chunk_size(manifest.chunk_size)
+    {
+        return false;
+    }
 
-    receipt.generation > old_generation
+    let expected_chunks = if manifest.file_size == 0 {
+        0
+    } else {
+        (manifest.file_size - 1) / u64::from(manifest.chunk_size) + 1
+    };
+    let mut previous_index = None;
+    for chunk_ref in &manifest.chunks {
+        if previous_index.is_some_and(|index| chunk_ref.chunk_index <= index)
+            || chunk_ref.chunk_index >= expected_chunks
+        {
+            return false;
+        }
+        previous_index = Some(chunk_ref.chunk_index);
+
+        let chunk_start = match chunk_ref
+            .chunk_index
+            .checked_mul(u64::from(manifest.chunk_size))
+        {
+            Some(start) => start,
+            None => return false,
+        };
+        let expected_len =
+            (manifest.file_size - chunk_start).min(u64::from(manifest.chunk_size)) as u32;
+        if chunk_ref.len != expected_len {
+            return false;
+        }
+        if chunk_ref.is_hole() {
+            continue;
+        }
+        if chunk_ref.data_version == 0 || chunk_ref.data_version > manifest.data_version {
+            return false;
+        }
+        let chunk_key = content_chunk_object_key_for_version(
+            manifest.inode_id,
+            chunk_ref.data_version,
+            chunk_ref.chunk_index,
+        );
+        if !chunk_receipt_is_durable(pool, chunk_ref, chunk_key) {
+            return false;
+        }
+    }
+    true
 }
 
-/// Check whether a content chunk object key has a durable placement receipt
-/// in the pool.  Returns true when the chunk can be reclaimed (receipt is
-/// committed and stable) or when no receipt gating is needed (metadata keys,
-/// legacy pre-v6 objects).
-///
-/// This is the authority gate used by the reclaim drain to decide whether
-/// a content chunk is safe to delete.  Queries the pool placement receipt
-/// for the key and verifies that the receipt generation has been committed.
-/// A missing receipt is treated as durable (backward compatibility with
-/// pre-receipt writes), and a pool error conservatively retains the entry.
-pub(crate) fn chunk_content_key_receipt_stable(
+fn replacement_payload_matches_key(
     pool: &tidefs_local_object_store::pool::Pool,
-    object_key: tidefs_local_object_store::ObjectKey,
+    object_key: ObjectKey,
+    bytes: &[u8],
 ) -> bool {
-    use tidefs_local_object_store::DeviceIoClass;
-
-    match pool.placement_receipt_for_key(DeviceIoClass::Data, object_key) {
-        Ok(Some(receipt)) => receipt.generation > 0,
-        Ok(None) => true,
-        Err(_) => false,
+    if is_dedup_redirect(bytes) {
+        let Ok(canonical_key) = decode_dedup_redirect(bytes) else {
+            return false;
+        };
+        return dedup_canonical_chunk_is_current(pool, canonical_key, None);
     }
+    if bytes.starts_with(&CONTENT_MANIFEST_MAGIC)
+        || bytes.starts_with(&CONTENT_MANIFEST_SPARSE_MAGIC)
+    {
+        return content_manifest_replacement_is_current(pool, object_key, bytes);
+    }
+    if bytes.starts_with(&CONTENT_CHUNK_MAGIC) {
+        let Ok(chunk) = decode_content_chunk(bytes) else {
+            return false;
+        };
+        return chunk.inode_id.get() != 0
+            && chunk.data_version != 0
+            && content_chunk_object_key_for_version(
+                chunk.inode_id,
+                chunk.data_version,
+                chunk.chunk_index,
+            ) == object_key;
+    }
+    if !bytes.starts_with(&CONTENT_MAGIC)
+        || !matches!(split_inline_checksum(bytes), Ok((_, Some(_))))
+    {
+        return false;
+    }
+    let Ok(content) = decode_content(bytes) else {
+        return false;
+    };
+    content.inode_id.get() != 0
+        && content.data_version != 0
+        && content_object_key_for_version(content.inode_id, content.data_version) == object_key
 }
 
 /// Check whether a replacement object key has a durable placement receipt.
 ///
-/// Unlike [`chunk_content_key_receipt_stable`], a missing receipt is not
-/// treated as legacy-durable here: this gate protects old extents until the
-/// replacement side of a rewrite has an explicit pool receipt.
+/// The key is durable only when a strict current Pool read returns a nonzero
+/// receipt and a decodable filesystem content payload whose identity projects
+/// back to the same key. Manifests recursively require exact current receipt
+/// authority for every non-hole chunk they reference.
 pub(crate) fn replacement_key_receipt_is_durable(
     pool: &tidefs_local_object_store::pool::Pool,
     object_key: tidefs_local_object_store::ObjectKey,
 ) -> bool {
     use tidefs_local_object_store::DeviceIoClass;
 
-    match pool.placement_receipt_for_key(DeviceIoClass::Data, object_key) {
-        Ok(Some(receipt)) => receipt.generation > 0,
-        Ok(None) | Err(_) => false,
-    }
+    let Ok(Some((bytes, receipt))) = pool.get_with_current_receipt(DeviceIoClass::Data, object_key)
+    else {
+        return false;
+    };
+    receipt.generation > 0 && replacement_payload_matches_key(pool, object_key, &bytes)
 }
 
 /// Classify old extent keys from a chunked rewrite into trimmable and
@@ -734,8 +846,8 @@ pub(crate) fn replacement_key_receipt_is_durable(
 ///
 /// - When a replacement chunk exists in `new_chunks` with a different
 ///   `data_version`, the old chunk is only safe to trim once the
-///   replacement's placement receipt is durable (generation > 0 and
-///   present in the pool).
+///   replacement's exact recorded placement generation and payload are
+///   current under strict Pool authority.
 /// - When no replacement exists (file shrunk past the chunk), the old
 ///   chunk is trimmable unconditionally — the file no longer needs it.
 /// - When the same chunk is retained (identical `data_version`), it is
@@ -872,8 +984,56 @@ pub(crate) fn queue_extent_keys_for_reclaim(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::records::ContentManifestObject;
+    use crate::{ContentChunkRef, ContentManifestObject};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use tidefs_local_object_store::pool::{Pool, PoolConfig, PoolProperties};
+    use tidefs_local_object_store::{
+        checksum64, DeviceBacking, DeviceClass, DeviceConfig, DeviceIoClass, DeviceKind,
+        StoreOptions,
+    };
     use tidefs_types_vfs_core::{Generation, NodeKind};
+
+    fn temp_store(label: &str) -> LocalObjectStore {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "tidefs-allocation-{label}-{nanos}-{}",
+            std::process::id()
+        ));
+        LocalObjectStore::open(root).expect("open temp object store")
+    }
+
+    fn temp_pool(label: &str) -> Pool {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "tidefs-allocation-pool-{label}-{nanos}-{}",
+            std::process::id()
+        ));
+        let data_dir = root.join("data");
+        Pool::create(
+            PoolConfig {
+                name: "allocation-test".into(),
+                root_path: root,
+                devices: vec![DeviceConfig {
+                    media_class: Default::default(),
+                    path: data_dir.clone(),
+                    backing: DeviceBacking::DirectoryObjectStoreCompat,
+                    class: DeviceClass::Data,
+                    kind: DeviceKind::Single { path: data_dir },
+                    encryption: None,
+                    compression: None,
+                }],
+            },
+            PoolProperties::default(),
+            &StoreOptions::test_fast(),
+        )
+        .expect("create temp pool")
+    }
 
     fn test_record(inode_id: u64, data_version: u64, size: u64) -> InodeRecord {
         InodeRecord {
@@ -897,16 +1057,227 @@ mod tests {
         }
     }
 
+    fn receipted_chunk(
+        pool: &mut Pool,
+        inode_id: u64,
+        data_version: u64,
+        chunk_index: u64,
+        payload: &[u8],
+    ) -> (ObjectKey, Vec<u8>, ContentChunkRef) {
+        let record = test_record(inode_id, data_version, payload.len() as u64);
+        let encoded = crate::encoding::encode_content_chunk(
+            &record,
+            chunk_index,
+            payload,
+            &ContentCompressionPolicy::off(),
+        );
+        let key = content_chunk_object_key_for_version(record.inode_id, data_version, chunk_index);
+        let (_, receipt) = pool
+            .put_with_receipt(DeviceIoClass::Data, key, &encoded)
+            .expect("write receipted chunk");
+        let chunk_ref = ContentChunkRef {
+            chunk_index,
+            data_version,
+            len: payload.len() as u32,
+            checksum: checksum64(&encoded),
+            placement_receipt_generation: receipt.generation,
+        };
+        (key, encoded, chunk_ref)
+    }
+
+    #[test]
+    fn reclaim_receipt_chunk_requires_exact_generation_and_payload() {
+        let mut pool = temp_pool("chunk-exact");
+        let (key, encoded, chunk_ref) = receipted_chunk(&mut pool, 100, 7, 0, b"exact chunk");
+
+        assert!(chunk_receipt_is_durable(&pool, &chunk_ref, key));
+
+        let mut zero_generation = chunk_ref.clone();
+        zero_generation.placement_receipt_generation = 0;
+        assert!(!chunk_receipt_is_durable(&pool, &zero_generation, key));
+
+        let mut future_generation = chunk_ref.clone();
+        future_generation.placement_receipt_generation += 1;
+        assert!(!chunk_receipt_is_durable(&pool, &future_generation, key));
+
+        let (_, newer_receipt) = pool
+            .put_with_receipt(DeviceIoClass::Data, key, &encoded)
+            .expect("republish identical chunk");
+        assert!(newer_receipt.generation > chunk_ref.placement_receipt_generation);
+        assert!(
+            !chunk_receipt_is_durable(&pool, &chunk_ref, key),
+            "a newer current receipt must not satisfy an older recorded generation"
+        );
+
+        let mut current_ref = chunk_ref;
+        current_ref.placement_receipt_generation = newer_receipt.generation;
+        assert!(chunk_receipt_is_durable(&pool, &current_ref, key));
+        current_ref.checksum = checksum64(b"different raw payload");
+        assert!(!chunk_receipt_is_durable(&pool, &current_ref, key));
+    }
+
+    #[test]
+    fn reclaim_receipt_chunk_rejects_receiptless_corrupt_and_wrong_identity() {
+        let mut pool = temp_pool("chunk-invalid");
+        let record = test_record(101, 3, 5);
+        let expected_key =
+            content_chunk_object_key_for_version(record.inode_id, record.data_version, 0);
+        let encoded = crate::encoding::encode_content_chunk(
+            &record,
+            0,
+            b"bytes",
+            &ContentCompressionPolicy::off(),
+        );
+        pool.raw_primary_store_mut()
+            .put(expected_key, &encoded)
+            .expect("write receiptless raw chunk");
+        let receiptless_ref = ContentChunkRef {
+            chunk_index: 0,
+            data_version: 3,
+            len: 5,
+            checksum: checksum64(&encoded),
+            placement_receipt_generation: 1,
+        };
+        assert!(!chunk_receipt_is_durable(
+            &pool,
+            &receiptless_ref,
+            expected_key
+        ));
+
+        let wrong_record = test_record(102, 3, 5);
+        let wrong_encoded = crate::encoding::encode_content_chunk(
+            &wrong_record,
+            0,
+            b"bytes",
+            &ContentCompressionPolicy::off(),
+        );
+        let wrong_key =
+            content_chunk_object_key_for_version(record.inode_id, record.data_version, 1);
+        let (_, receipt) = pool
+            .put_with_receipt(DeviceIoClass::Data, wrong_key, &wrong_encoded)
+            .expect("write wrong-identity chunk");
+        let wrong_identity_ref = ContentChunkRef {
+            chunk_index: 1,
+            data_version: 3,
+            len: 5,
+            checksum: checksum64(&wrong_encoded),
+            placement_receipt_generation: receipt.generation,
+        };
+        assert!(!chunk_receipt_is_durable(
+            &pool,
+            &wrong_identity_ref,
+            wrong_key
+        ));
+
+        pool.raw_primary_store_mut()
+            .put(wrong_key, b"corrupt current bytes")
+            .expect("corrupt current physical payload");
+        assert!(!chunk_receipt_is_durable(
+            &pool,
+            &wrong_identity_ref,
+            wrong_key
+        ));
+    }
+
+    #[test]
+    fn reclaim_receipt_chunk_validates_dedup_canonical_authority() {
+        let mut pool = temp_pool("chunk-dedup");
+        let payload = b"dedup replacement bytes";
+        let canonical_record = test_record(900, 90, payload.len() as u64);
+        let canonical_encoded = crate::encoding::encode_content_chunk(
+            &canonical_record,
+            12,
+            payload,
+            &ContentCompressionPolicy::off(),
+        );
+        let fingerprint = compute_content_fingerprint(payload);
+        let canonical_key = content_dedup_object_key(&fingerprint);
+        pool.put_with_receipt(DeviceIoClass::Data, canonical_key, &canonical_encoded)
+            .expect("write canonical chunk");
+
+        let logical_inode = InodeId::new(103);
+        let logical_key = content_chunk_object_key_for_version(logical_inode, 4, 2);
+        let redirect = crate::encoding::encode_dedup_redirect(canonical_key);
+        let (_, receipt) = pool
+            .put_with_receipt(DeviceIoClass::Data, logical_key, &redirect)
+            .expect("write logical redirect");
+        let chunk_ref = ContentChunkRef {
+            chunk_index: 2,
+            data_version: 4,
+            len: payload.len() as u32,
+            checksum: checksum64(&redirect),
+            placement_receipt_generation: receipt.generation,
+        };
+        assert!(chunk_receipt_is_durable(&pool, &chunk_ref, logical_key));
+
+        pool.raw_primary_store_mut()
+            .put(canonical_key, b"unreadable canonical bytes")
+            .expect("corrupt canonical payload");
+        assert!(!chunk_receipt_is_durable(&pool, &chunk_ref, logical_key));
+    }
+
+    #[test]
+    fn reclaim_receipt_replacement_validates_content_and_manifest_identity() {
+        let mut pool = temp_pool("replacement");
+        let inline_record = test_record(104, 5, 6);
+        let inline_key =
+            content_object_key_for_version(inline_record.inode_id, inline_record.data_version);
+        let inline = crate::encoding::encode_content(&inline_record, b"inline");
+        pool.put_with_receipt(DeviceIoClass::Data, inline_key, &inline)
+            .expect("write inline replacement");
+        assert!(replacement_key_receipt_is_durable(&pool, inline_key));
+
+        let wrong_record = test_record(105, 5, 6);
+        let wrong_key = content_object_key_for_version(InodeId::new(106), 5);
+        let wrong_inline = crate::encoding::encode_content(&wrong_record, b"inline");
+        pool.put_with_receipt(DeviceIoClass::Data, wrong_key, &wrong_inline)
+            .expect("write wrong-identity inline replacement");
+        assert!(!replacement_key_receipt_is_durable(&pool, wrong_key));
+
+        let malformed_key = content_object_key_for_version(InodeId::new(109), 5);
+        pool.put_with_receipt(
+            DeviceIoClass::Data,
+            malformed_key,
+            b"not filesystem content",
+        )
+        .expect("write malformed replacement");
+        assert!(!replacement_key_receipt_is_durable(&pool, malformed_key));
+
+        let receiptless_record = test_record(107, 5, 6);
+        let receiptless_key = content_object_key_for_version(receiptless_record.inode_id, 5);
+        let receiptless_inline = crate::encoding::encode_content(&receiptless_record, b"inline");
+        pool.raw_primary_store_mut()
+            .put(receiptless_key, &receiptless_inline)
+            .expect("write receiptless inline replacement");
+        assert!(!replacement_key_receipt_is_durable(&pool, receiptless_key));
+
+        let (chunk_key, chunk_bytes, chunk_ref) =
+            receipted_chunk(&mut pool, 108, 6, 0, b"manifest chunk");
+        let manifest = ContentManifestObject {
+            inode_id: InodeId::new(108),
+            data_version: 6,
+            file_size: b"manifest chunk".len() as u64,
+            chunk_size: content_chunk_size(),
+            chunks: vec![chunk_ref],
+        };
+        let manifest_key = content_object_key_for_version(manifest.inode_id, 6);
+        let manifest_bytes = crate::encoding::encode_content_manifest_sparse(&manifest);
+        pool.put_with_receipt(DeviceIoClass::Data, manifest_key, &manifest_bytes)
+            .expect("write replacement manifest");
+        assert!(replacement_key_receipt_is_durable(&pool, manifest_key));
+
+        pool.put_with_receipt(DeviceIoClass::Data, chunk_key, &chunk_bytes)
+            .expect("advance referenced chunk generation");
+        assert!(
+            !replacement_key_receipt_is_durable(&pool, manifest_key),
+            "a manifest must not authorize reclaim after a referenced receipt advances"
+        );
+    }
+
     #[test]
     fn sparse_size_changing_overlay_allocation_plans_only_touched_far_chunk() {
+        let store = temp_store("far-sparse-overlay-plan");
         let old_record = test_record(42, 1, 0);
-        let old_layout = ContentLayout::Chunked(ContentManifestObject {
-            inode_id: old_record.inode_id,
-            data_version: old_record.data_version,
-            file_size: 0,
-            chunk_size: content_chunk_size(),
-            chunks: Vec::new(),
-        });
         let far_chunk_index = 100_000_000_u64;
         let chunk_size = u64::from(content_chunk_size());
         let offset_in_chunk = 123_u64;
@@ -915,7 +1286,7 @@ mod tests {
         let new_record = test_record(42, 2, overlay_offset + payload.len() as u64);
 
         let entries = planned_chunk_allocation_entries_for_overlay(
-            &old_layout,
+            &store,
             &old_record,
             &new_record,
             overlay_offset,

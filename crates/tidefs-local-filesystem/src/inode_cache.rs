@@ -22,8 +22,8 @@ use crate::types::*;
 
 // ── ARC: Adaptive Replacement Cache for inode metadata ─────────────────────
 //
-// Same ARC algorithm as HotReadCache, applied to CachedInode entries keyed
-// by InodeId.  Provides lazy on-demand metadata loading: the filesystem
+// Weight-aware ARC applied to CachedInode entries keyed by InodeId. Provides
+// lazy on-demand metadata loading: the filesystem
 // can avoid eagerly loading all inode records at mount time and instead
 // cache them as they are accessed.  Directory content is cached alongside
 // the inode record so that path lookups can resolve from cache without
@@ -144,6 +144,7 @@ impl InodeCache {
     }
 
     /// Attach resource-governor accounting for per-inode cache state.
+    #[cfg(test)]
     pub(crate) fn set_governor(
         &mut self,
         governor: Governor,

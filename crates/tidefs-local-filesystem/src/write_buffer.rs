@@ -2,26 +2,18 @@
 use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::ops::Bound::{Excluded, Included, Unbounded};
-use std::time::Duration;
 
-/// Configuration for write-buffer coalescing thresholds.
+/// Configuration for the write-buffer coalescing byte threshold.
 #[derive(Debug, Clone)]
 pub struct WriteBufferConfig {
     /// Flush foreground writes when total accumulated dirty bytes reaches this limit.
     pub flush_threshold_bytes: usize,
-    /// Age threshold for background/tick-driven dirty epoch sealing.
-    ///
-    /// The foreground write path deliberately does not synchronously flush
-    /// just because this age elapsed; doing so turns slow mmap writeback into
-    /// tiny object-store rewrites.
-    pub flush_threshold_age: Duration,
 }
 
 impl Default for WriteBufferConfig {
     fn default() -> Self {
         Self {
             flush_threshold_bytes: 8 * 1024 * 1024,
-            flush_threshold_age: Duration::from_millis(32),
         }
     }
 }
@@ -31,8 +23,7 @@ impl Default for WriteBufferConfig {
 /// Accumulates small sequential writes and flushes them in fewer,
 /// larger object-store operations when a foreground byte-count threshold
 /// is crossed. Read-your-writes is preserved by serving dirty segments
-/// directly. The age threshold remains available for background/tick
-/// scheduling, but foreground writes do not enforce it synchronously.
+/// directly.
 #[derive(Debug, Clone)]
 pub struct WriteBuffer {
     config: WriteBufferConfig,
@@ -224,6 +215,47 @@ impl WriteBuffer {
         let result: Vec<_> = std::mem::take(&mut self.segments).into_iter().collect();
         self.total_bytes = 0;
         result
+    }
+
+    /// Drain one foreground writeback batch, leaving later dirty segments buffered.
+    ///
+    /// This is used by byte-threshold flushes. Explicit fences still use
+    /// [`WriteBuffer::drain`] so fsync/truncate/unmount publish all pending bytes.
+    pub fn drain_flush_batch(&mut self) -> Vec<(u64, Vec<u8>)> {
+        if self.segments.is_empty() {
+            return Vec::new();
+        }
+
+        let mut remaining = self.config.flush_threshold_bytes;
+        if remaining == 0 {
+            return self.drain();
+        }
+
+        let mut drained = Vec::new();
+        while remaining > 0 && !self.segments.is_empty() {
+            let Some((&offset, _)) = self.segments.iter().next() else {
+                break;
+            };
+            let mut data = self
+                .segments
+                .remove(&offset)
+                .expect("first segment key was present");
+            if data.len() <= remaining {
+                remaining -= data.len();
+                self.total_bytes = self.total_bytes.saturating_sub(data.len());
+                drained.push((offset, data));
+                continue;
+            }
+
+            let split_len = remaining;
+            let tail = data.split_off(split_len);
+            let tail_offset = offset.saturating_add(split_len as u64);
+            self.segments.insert(tail_offset, tail);
+            self.total_bytes = self.total_bytes.saturating_sub(data.len());
+            drained.push((offset, data));
+            remaining = 0;
+        }
+        drained
     }
 
     /// Truncate buffered writes to at most `size` bytes.
@@ -431,15 +463,13 @@ mod tests {
     fn test_config() -> WriteBufferConfig {
         WriteBufferConfig {
             flush_threshold_bytes: 1024,
-            flush_threshold_age: Duration::from_millis(50),
         }
     }
 
     #[test]
-    fn default_thresholds_match_writeback_batch_policy() {
+    fn default_threshold_matches_writeback_batch_policy() {
         let config = WriteBufferConfig::default();
         assert_eq!(config.flush_threshold_bytes, 8 * 1024 * 1024);
-        assert_eq!(config.flush_threshold_age, Duration::from_millis(32));
     }
 
     #[test]
@@ -504,7 +534,6 @@ mod tests {
     fn fragmented_sparse_writes_remain_sparse_and_ordered() {
         let mut wb = WriteBuffer::new(WriteBufferConfig {
             flush_threshold_bytes: 8 * 1024 * 1024,
-            flush_threshold_age: Duration::from_millis(50),
         });
         let segment_count = 4096usize;
         let segment_len = 512usize;
@@ -600,7 +629,6 @@ mod tests {
     fn sparse_markers_merge_with_full_page_writeback() {
         let mut wb = WriteBuffer::new(WriteBufferConfig {
             flush_threshold_bytes: 128 * 1024,
-            flush_threshold_age: Duration::from_millis(50),
         });
         let page_size = 4096usize;
         let pages = 4usize;
@@ -641,25 +669,53 @@ mod tests {
     }
 
     #[test]
-    fn age_threshold_does_not_trigger_foreground_flush() {
-        let config = WriteBufferConfig {
-            flush_threshold_bytes: 1024 * 1024,
-            flush_threshold_age: Duration::from_millis(1),
-        };
-        let mut wb = WriteBuffer::new(config);
-        wb.ingest(b"tiny", 0);
-        std::thread::sleep(Duration::from_millis(2));
-        assert!(!wb.should_flush());
+    fn batch_drain_leaves_future_sparse_markers_buffered() {
+        let mut wb = WriteBuffer::new(WriteBufferConfig {
+            flush_threshold_bytes: 8192,
+        });
+        let page_size = 4096usize;
+        let pwrite_offset = 1024usize;
+        let marker = 0xaabb_ccdd_eeff_0011_u64.to_le_bytes();
+
+        for page in 0..4 {
+            wb.ingest(&marker, (page * page_size + pwrite_offset) as u64);
+        }
+        for page in 0..2 {
+            let mut page_bytes = vec![0_u8; page_size];
+            page_bytes[pwrite_offset..pwrite_offset + marker.len()].copy_from_slice(&marker);
+            wb.ingest(&page_bytes, (page * page_size) as u64);
+        }
+
+        assert!(wb.should_flush());
+        let batch = wb.drain_flush_batch();
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].0, 0);
+        assert_eq!(batch[0].1.len(), 8192);
+        assert_eq!(wb.len(), marker.len() * 2);
+
+        let remaining = wb.drain();
+        assert_eq!(remaining.len(), 2);
+        assert_eq!(remaining[0].0, (2 * page_size + pwrite_offset) as u64);
+        assert_eq!(remaining[1].0, (3 * page_size + pwrite_offset) as u64);
     }
 
     #[test]
-    fn empty_buffer_never_triggers_age_flush() {
-        let config = WriteBufferConfig {
-            flush_threshold_bytes: 1024,
-            flush_threshold_age: Duration::from_millis(1),
-        };
-        let wb = WriteBuffer::new(config);
-        std::thread::sleep(Duration::from_millis(2));
+    fn batch_drain_splits_large_segment_at_threshold() {
+        let mut wb = WriteBuffer::new(WriteBufferConfig {
+            flush_threshold_bytes: 4,
+        });
+
+        wb.ingest(b"abcdefghij", 0);
+        let batch = wb.drain_flush_batch();
+
+        assert_eq!(batch, vec![(0, b"abcd".to_vec())]);
+        assert_eq!(wb.len(), 6);
+        assert_eq!(wb.drain(), vec![(4, b"efghij".to_vec())]);
+    }
+
+    #[test]
+    fn empty_buffer_never_needs_flush() {
+        let wb = WriteBuffer::new(test_config());
         assert!(!wb.should_flush());
     }
 
@@ -697,15 +753,10 @@ mod tests {
     }
 
     #[test]
-    fn truncate_to_empty_clears_age_state() {
-        let config = WriteBufferConfig {
-            flush_threshold_bytes: 1024,
-            flush_threshold_age: Duration::from_millis(1),
-        };
-        let mut wb = WriteBuffer::new(config);
+    fn truncate_to_empty_clears_buffer() {
+        let mut wb = WriteBuffer::new(test_config());
         wb.ingest(b"dirty", 0);
         wb.truncate(0);
-        std::thread::sleep(Duration::from_millis(2));
         assert!(wb.is_empty());
         assert!(!wb.should_flush());
     }
@@ -790,7 +841,6 @@ mod tests {
     fn sequential_full_page_writeback_extends_one_segment() {
         let mut wb = WriteBuffer::new(WriteBufferConfig {
             flush_threshold_bytes: 8 * 1024 * 1024,
-            flush_threshold_age: Duration::from_millis(50),
         });
         let page_size = 4096usize;
         let page_count = 1536usize;

@@ -7,7 +7,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
-use tidefs_local_filesystem::{LocalFileSystem, PosixTimeRecord};
+use tidefs_local_filesystem::{FileSystemError, LocalFileSystem, PosixTimeRecord};
 use tidefs_types_vfs_core::{
     Generation, InodeId, NodeFacets, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG,
     S_IFSOCK,
@@ -15,6 +15,15 @@ use tidefs_types_vfs_core::{
 
 use crate::persistence::{NamespaceDatasetIdentity, PersistentInodeStore, PersistentNamespaceRoot};
 use crate::{Inode, InodeAttributes, NamespaceError, ROOT_INODE};
+
+fn map_local_filesystem_error(error: FileSystemError, fallback: NamespaceError) -> NamespaceError {
+    match error {
+        FileSystemError::MutationRequiresReopen { operation } => {
+            NamespaceError::MutationRequiresReopen { operation }
+        }
+        _ => fallback,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // LocalFilesystemInodeStore
@@ -43,6 +52,12 @@ impl LocalFilesystemInodeStore {
 }
 
 impl PersistentInodeStore for LocalFilesystemInodeStore {
+    fn ensure_mutation_allowed(&self, operation: &'static str) -> Result<(), NamespaceError> {
+        let fs = self.fs.lock().map_err(|_| NamespaceError::NotSupported)?;
+        fs.ensure_mutation_allowed(operation)
+            .map_err(|error| map_local_filesystem_error(error, NamespaceError::NotSupported))
+    }
+
     fn dataset_identity(&self) -> NamespaceDatasetIdentity {
         self.identity.clone()
     }
@@ -60,6 +75,8 @@ impl PersistentInodeStore for LocalFilesystemInodeStore {
 
     fn alloc_inode(&self, attrs: &InodeAttributes) -> Result<(Inode, u64), NamespaceError> {
         let mut fs = self.fs.lock().map_err(|_| NamespaceError::NotSupported)?;
+        fs.ensure_mutation_allowed("allocate persistent namespace inode")
+            .map_err(|error| map_local_filesystem_error(error, NamespaceError::NotSupported))?;
         let gen = fs.generation();
         // Review debt TFR-004: namespace persistence currently delegates
         // allocation back into LocalFileSystem's global inode counter.
@@ -71,7 +88,8 @@ impl PersistentInodeStore for LocalFilesystemInodeStore {
             InodeId::new(fs.next_inode_id().get().max(1))
         };
         let record = attrs_to_inode_record(attrs, id, gen);
-        fs.insert_inode_at(id, record);
+        fs.insert_inode_at(id, record)
+            .map_err(|error| map_local_filesystem_error(error, NamespaceError::NotSupported))?;
         Ok((id.get(), gen))
     }
 
@@ -83,6 +101,8 @@ impl PersistentInodeStore for LocalFilesystemInodeStore {
 
     fn update_attrs(&self, inode: Inode, attrs: &InodeAttributes) -> Result<(), NamespaceError> {
         let mut fs = self.fs.lock().map_err(|_| NamespaceError::NotSupported)?;
+        fs.ensure_mutation_allowed("update persistent namespace inode")
+            .map_err(|error| map_local_filesystem_error(error, NamespaceError::NotSupported))?;
         let id = InodeId::new(inode);
         let existing = fs
             .get_inode_by_id(id)
@@ -104,12 +124,17 @@ impl PersistentInodeStore for LocalFilesystemInodeStore {
         }
         record.metadata_version = record.metadata_version.saturating_add(1);
         fs.update_inode_record(id, record)
-            .map_err(|_| NamespaceError::InodeNotFound)
+            .map_err(|error| map_local_filesystem_error(error, NamespaceError::InodeNotFound))
     }
 
     fn free_inode(&self, inode: Inode) -> Result<(), NamespaceError> {
         let mut fs = self.fs.lock().map_err(|_| NamespaceError::NotSupported)?;
-        if fs.free_inode_id(InodeId::new(inode)) {
+        fs.ensure_mutation_allowed("free persistent namespace inode")
+            .map_err(|error| map_local_filesystem_error(error, NamespaceError::NotSupported))?;
+        if fs
+            .free_inode_id(InodeId::new(inode))
+            .map_err(|error| map_local_filesystem_error(error, NamespaceError::NotSupported))?
+        {
             Ok(())
         } else {
             Err(NamespaceError::InodeNotFound)
@@ -125,6 +150,27 @@ impl PersistentInodeStore for LocalFilesystemInodeStore {
 
     fn generation(&self) -> u64 {
         self.fs.lock().map(|fs| fs.generation()).unwrap_or(0)
+    }
+}
+
+#[cfg(test)]
+mod error_mapping_tests {
+    use super::*;
+
+    #[test]
+    fn mounted_reopen_refusal_remains_typed_at_namespace_boundary() {
+        let mapped = map_local_filesystem_error(
+            FileSystemError::MutationRequiresReopen {
+                operation: "persist namespace inode",
+            },
+            NamespaceError::NotSupported,
+        );
+        assert_eq!(
+            mapped,
+            NamespaceError::MutationRequiresReopen {
+                operation: "persist namespace inode"
+            }
+        );
     }
 }
 
@@ -154,6 +200,7 @@ fn attrs_to_inode_record(
         xattr_storage_kind: 0,
         xattrs: std::collections::BTreeMap::new(),
         dir_rev: 0,
+        subtree_rev: 0,
         rdev: attrs.rdev,
     }
 }
@@ -299,6 +346,12 @@ impl LocalFilesystemDirectoryStore {
 }
 
 impl crate::persistence::PersistentDirectoryStore for LocalFilesystemDirectoryStore {
+    fn ensure_mutation_allowed(&self, operation: &'static str) -> Result<(), NamespaceError> {
+        let fs = self.fs.lock().map_err(|_| NamespaceError::NotSupported)?;
+        fs.ensure_mutation_allowed(operation)
+            .map_err(|error| map_local_filesystem_error(error, NamespaceError::NotSupported))
+    }
+
     fn dataset_identity(&self) -> NamespaceDatasetIdentity {
         self.identity.clone()
     }
@@ -350,10 +403,12 @@ impl crate::persistence::PersistentDirectoryStore for LocalFilesystemDirectorySt
         generation: u64,
         kind: u32,
     ) -> Result<(), NamespaceError> {
+        let mut fs = self.fs.lock().map_err(|_| NamespaceError::NotSupported)?;
+        fs.ensure_mutation_allowed("insert persistent namespace directory entry")
+            .map_err(|error| map_local_filesystem_error(error, NamespaceError::NotSupported))?;
         if name == b"." || name == b".." {
             return Ok(());
         }
-        let mut fs = self.fs.lock().map_err(|_| NamespaceError::NotSupported)?;
         let mode = match kind {
             crate::KIND_DIR => S_IFDIR | 0o755,
             crate::KIND_SYMLINK => S_IFLNK | 0o777,
@@ -372,16 +427,18 @@ impl crate::persistence::PersistentDirectoryStore for LocalFilesystemDirectorySt
             mode,
         };
         fs.insert_dir_entry(InodeId::new(parent), name.to_vec(), entry)
-            .map_err(|_| NamespaceError::NotSupported)
+            .map_err(|error| map_local_filesystem_error(error, NamespaceError::NotSupported))
     }
 
     fn remove(&self, parent: Inode, name: &[u8]) -> Result<(), NamespaceError> {
+        let mut fs = self.fs.lock().map_err(|_| NamespaceError::NotSupported)?;
+        fs.ensure_mutation_allowed("remove persistent namespace directory entry")
+            .map_err(|error| map_local_filesystem_error(error, NamespaceError::NotSupported))?;
         if name == b"." || name == b".." {
             return Ok(());
         }
-        let mut fs = self.fs.lock().map_err(|_| NamespaceError::NotSupported)?;
         fs.remove_dir_entry(InodeId::new(parent), name)
-            .map_err(|_| NamespaceError::NotFound)
+            .map_err(|error| map_local_filesystem_error(error, NamespaceError::NotFound))
     }
 
     fn list_dir(
@@ -447,6 +504,8 @@ impl crate::persistence::PersistentDirectoryStore for LocalFilesystemDirectorySt
         mode: crate::persistence::PersistentSwapMode,
     ) -> Result<Option<(Inode, u64, u32)>, NamespaceError> {
         let mut fs = self.fs.lock().map_err(|_| NamespaceError::NotSupported)?;
+        fs.ensure_mutation_allowed("atomically update persistent namespace entries")
+            .map_err(|error| map_local_filesystem_error(error, NamespaceError::NotSupported))?;
 
         // Collect source directory entries before any mutable ops.
         let src_entries = fs
@@ -477,9 +536,9 @@ impl crate::persistence::PersistentDirectoryStore for LocalFilesystemDirectorySt
                 let dst = dst_entry.ok_or(NamespaceError::NotFound)?;
 
                 fs.remove_dir_entry(InodeId::new(src_parent), src_name)
-                    .map_err(|_| NamespaceError::NotFound)?;
+                    .map_err(|error| map_local_filesystem_error(error, NamespaceError::NotFound))?;
                 fs.remove_dir_entry(InodeId::new(dst_parent), dst_name)
-                    .map_err(|_| NamespaceError::NotFound)?;
+                    .map_err(|error| map_local_filesystem_error(error, NamespaceError::NotFound))?;
 
                 // Swap: src_name gets dst's inode, dst_name gets src's inode.
                 fs.insert_dir_entry(
@@ -493,7 +552,7 @@ impl crate::persistence::PersistentDirectoryStore for LocalFilesystemDirectorySt
                         mode: dst.mode,
                     },
                 )
-                .map_err(|_| NamespaceError::NotSupported)?;
+                .map_err(|error| map_local_filesystem_error(error, NamespaceError::NotSupported))?;
                 fs.insert_dir_entry(
                     InodeId::new(dst_parent),
                     dst_name.to_vec(),
@@ -505,7 +564,7 @@ impl crate::persistence::PersistentDirectoryStore for LocalFilesystemDirectorySt
                         mode: src_mode,
                     },
                 )
-                .map_err(|_| NamespaceError::NotSupported)?;
+                .map_err(|error| map_local_filesystem_error(error, NamespaceError::NotSupported))?;
 
                 Ok(None)
             }
@@ -515,7 +574,7 @@ impl crate::persistence::PersistentDirectoryStore for LocalFilesystemDirectorySt
                 }
                 // Move source to destination.
                 fs.remove_dir_entry(InodeId::new(src_parent), src_name)
-                    .map_err(|_| NamespaceError::NotFound)?;
+                    .map_err(|error| map_local_filesystem_error(error, NamespaceError::NotFound))?;
                 fs.insert_dir_entry(
                     InodeId::new(dst_parent),
                     dst_name.to_vec(),
@@ -527,7 +586,7 @@ impl crate::persistence::PersistentDirectoryStore for LocalFilesystemDirectorySt
                         mode: src_mode,
                     },
                 )
-                .map_err(|_| NamespaceError::NotSupported)?;
+                .map_err(|error| map_local_filesystem_error(error, NamespaceError::NotSupported))?;
                 Ok(None)
             }
             crate::persistence::PersistentSwapMode::Rename => {
@@ -541,11 +600,13 @@ impl crate::persistence::PersistentDirectoryStore for LocalFilesystemDirectorySt
 
                 // Remove source entry.
                 fs.remove_dir_entry(InodeId::new(src_parent), src_name)
-                    .map_err(|_| NamespaceError::NotFound)?;
+                    .map_err(|error| map_local_filesystem_error(error, NamespaceError::NotFound))?;
                 // If target exists, remove it (overwrite).
                 if overwritten.is_some() {
                     fs.remove_dir_entry(InodeId::new(dst_parent), dst_name)
-                        .map_err(|_| NamespaceError::NotFound)?;
+                        .map_err(|error| {
+                            map_local_filesystem_error(error, NamespaceError::NotFound)
+                        })?;
                 }
                 // Insert source at destination name.
                 fs.insert_dir_entry(
@@ -559,7 +620,7 @@ impl crate::persistence::PersistentDirectoryStore for LocalFilesystemDirectorySt
                         mode: src_mode,
                     },
                 )
-                .map_err(|_| NamespaceError::NotSupported)?;
+                .map_err(|error| map_local_filesystem_error(error, NamespaceError::NotSupported))?;
                 Ok(overwritten)
             }
         }
@@ -567,9 +628,11 @@ impl crate::persistence::PersistentDirectoryStore for LocalFilesystemDirectorySt
 
     fn init_dir(&self, dir_inode: Inode) -> Result<(), NamespaceError> {
         let mut fs = self.fs.lock().map_err(|_| NamespaceError::NotSupported)?;
+        fs.ensure_mutation_allowed("initialize persistent namespace directory")
+            .map_err(|error| map_local_filesystem_error(error, NamespaceError::NotSupported))?;
         let id = InodeId::new(dir_inode);
         fs.init_dir_by_inode(id)
-            .map_err(|_| NamespaceError::NotSupported)
+            .map_err(|error| map_local_filesystem_error(error, NamespaceError::NotSupported))
     }
 }
 

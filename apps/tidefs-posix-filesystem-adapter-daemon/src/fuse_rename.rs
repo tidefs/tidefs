@@ -304,6 +304,7 @@ pub fn map_namespace_error(err: tidefs_namespace::NamespaceError) -> Errno {
 
         NamespaceError::StaleCursor => Errno(libc::EAGAIN as u16),
 
+        NamespaceError::MutationRequiresReopen { .. } => Errno(libc::EIO as u16),
         NamespaceError::DatasetIdentityMismatch { .. } => Errno(libc::EIO as u16),
     }
 }
@@ -670,6 +671,12 @@ mod tests {
             (NamespaceError::TooManySymlinks, libc::ELOOP),
             (NamespaceError::NotSymlink, libc::EINVAL),
             (NamespaceError::NotSupported, libc::EOPNOTSUPP),
+            (
+                NamespaceError::MutationRequiresReopen {
+                    operation: "rename namespace entry",
+                },
+                libc::EIO,
+            ),
         ];
         for (err, expected) in &cases {
             assert_eq!(

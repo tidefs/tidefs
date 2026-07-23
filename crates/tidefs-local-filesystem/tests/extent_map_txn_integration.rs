@@ -43,7 +43,8 @@ fn txn_allocate_extent_commit_and_lookup() {
 
     let mut fs =
         LocalFileSystem::open_with_options(&root, test_options()).expect("open filesystem");
-    fs.set_auto_commit(false);
+    fs.set_auto_commit(false)
+        .expect("test setup mutation must be admitted");
 
     // Begin transaction, create file, write data (triggers extent allocation).
     fs.begin_transaction().expect("begin transaction");
@@ -95,7 +96,8 @@ fn txn_allocate_multiple_non_contiguous_extents() {
 
     let mut fs =
         LocalFileSystem::open_with_options(&root, test_options()).expect("open filesystem");
-    fs.set_auto_commit(false);
+    fs.set_auto_commit(false)
+        .expect("test setup mutation must be admitted");
 
     fs.begin_transaction().expect("begin transaction");
     fs.create_file("/sparse.bin", DEFAULT_FILE_PERMISSIONS)
@@ -142,7 +144,8 @@ fn txn_allocate_commit_free_commit_verify_gone() {
 
     let mut fs =
         LocalFileSystem::open_with_options(&root, test_options()).expect("open filesystem");
-    fs.set_auto_commit(false);
+    fs.set_auto_commit(false)
+        .expect("test setup mutation must be admitted");
 
     // Allocate extent.
     fs.begin_transaction().expect("begin tx 1");
@@ -205,7 +208,8 @@ fn txn_allocate_free_via_unlink() {
 
     let mut fs =
         LocalFileSystem::open_with_options(&root, test_options()).expect("open filesystem");
-    fs.set_auto_commit(false);
+    fs.set_auto_commit(false)
+        .expect("test setup mutation must be admitted");
 
     fs.begin_transaction().expect("begin tx 1");
     fs.create_file("/doomed.bin", DEFAULT_FILE_PERMISSIONS)
@@ -254,7 +258,8 @@ fn extent_map_data_survives_reopen_via_read_path() {
     {
         let mut fs =
             LocalFileSystem::open_with_options(&root, test_options()).expect("open filesystem");
-        fs.set_auto_commit(false);
+        fs.set_auto_commit(false)
+            .expect("test setup mutation must be admitted");
 
         fs.begin_transaction().expect("begin tx");
         fs.create_file("/persist.bin", DEFAULT_FILE_PERMISSIONS)
@@ -317,7 +322,8 @@ fn changed_record_role_includes_transaction_extent_map() {
 
     let mut fs =
         LocalFileSystem::open_with_options(&root, test_options()).expect("open filesystem");
-    fs.set_auto_commit(false);
+    fs.set_auto_commit(false)
+        .expect("test setup mutation must be admitted");
 
     // Create and write a file to produce both extent-map and content records.
     fs.begin_transaction().expect("begin tx");
@@ -380,7 +386,8 @@ fn allocate_then_free_produces_distinct_changed_records() {
 
     let mut fs =
         LocalFileSystem::open_with_options(&root, test_options()).expect("open filesystem");
-    fs.set_auto_commit(false);
+    fs.set_auto_commit(false)
+        .expect("test setup mutation must be admitted");
 
     // Allocate extent.
     fs.begin_transaction().expect("begin tx 1");
@@ -432,7 +439,8 @@ fn lookup_extents_on_empty_file_returns_empty() {
 
     let mut fs =
         LocalFileSystem::open_with_options(&root, test_options()).expect("open filesystem");
-    fs.set_auto_commit(false);
+    fs.set_auto_commit(false)
+        .expect("test setup mutation must be admitted");
 
     fs.begin_transaction().expect("begin tx");
     fs.create_file("/empty.bin", DEFAULT_FILE_PERMISSIONS)
@@ -483,7 +491,8 @@ fn extent_allocator_multiple_inodes_isolation() {
 
     let mut fs =
         LocalFileSystem::open_with_options(&root, test_options()).expect("open filesystem");
-    fs.set_auto_commit(false);
+    fs.set_auto_commit(false)
+        .expect("test setup mutation must be admitted");
 
     fs.begin_transaction().expect("begin tx");
     fs.create_file("/a.bin", DEFAULT_FILE_PERMISSIONS)
@@ -529,7 +538,8 @@ fn double_truncate_to_zero_is_idempotent() {
 
     let mut fs =
         LocalFileSystem::open_with_options(&root, test_options()).expect("open filesystem");
-    fs.set_auto_commit(false);
+    fs.set_auto_commit(false)
+        .expect("test setup mutation must be admitted");
 
     fs.begin_transaction().expect("begin tx 1");
     fs.create_file("/shrink.bin", DEFAULT_FILE_PERMISSIONS)
@@ -572,7 +582,8 @@ fn truncate_shrink_partial_frees_tail_extent() {
 
     let mut fs =
         LocalFileSystem::open_with_options(&root, test_options()).expect("open filesystem");
-    fs.set_auto_commit(false);
+    fs.set_auto_commit(false)
+        .expect("test setup mutation must be admitted");
 
     fs.begin_transaction().expect("begin tx");
     fs.create_file("/data.bin", DEFAULT_FILE_PERMISSIONS)
@@ -620,7 +631,8 @@ fn write_beyond_eof_allocates_new_extent() {
 
     let mut fs =
         LocalFileSystem::open_with_options(&root, test_options()).expect("open filesystem");
-    fs.set_auto_commit(false);
+    fs.set_auto_commit(false)
+        .expect("test setup mutation must be admitted");
 
     fs.begin_transaction().expect("begin tx");
     fs.create_file("/sparse.bin", DEFAULT_FILE_PERMISSIONS)
@@ -656,7 +668,8 @@ fn rollback_transaction_discards_extent_allocation() {
 
     let mut fs =
         LocalFileSystem::open_with_options(&root, test_options()).expect("open filesystem");
-    fs.set_auto_commit(false);
+    fs.set_auto_commit(false)
+        .expect("test setup mutation must be admitted");
 
     fs.begin_transaction().expect("begin tx");
     fs.create_file("/discarded.bin", DEFAULT_FILE_PERMISSIONS)
@@ -684,7 +697,8 @@ fn allocate_commit_reopen_data_survives_with_changed_records() {
     {
         let mut fs =
             LocalFileSystem::open_with_options(&root, test_options()).expect("open filesystem");
-        fs.set_auto_commit(false);
+        fs.set_auto_commit(false)
+            .expect("test setup mutation must be admitted");
 
         fs.begin_transaction().expect("begin tx");
         fs.create_file("/roundtrip.bin", DEFAULT_FILE_PERMISSIONS)

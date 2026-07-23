@@ -30,8 +30,8 @@ pub(crate) fn persist_state(
     Ok(())
 }
 
-/// Persist a mounted transaction with file content validated through Pool
-/// placement authority and transaction metadata retained on the raw primary.
+/// Persist a mounted transaction only after every nonempty file-like inode's
+/// content is readable through current Pool placement authority.
 pub(crate) fn persist_state_with_pool(
     pool: &mut Pool,
     state: &FileSystemState,
@@ -190,7 +190,7 @@ pub(crate) fn ensure_versioned_content_object(
     if inode.size == 0 {
         return Ok(());
     }
-    let content = read_content_from_store(store, inode.inode_id, inode, true, None)?;
+    let content = read_content_from_store(store, inode.inode_id, inode, None)?;
     write_chunked_content(
         false,
         store,
@@ -277,23 +277,24 @@ pub(crate) fn transaction_manifest_entries_for_content(
     Ok(entries)
 }
 
-/// Build committed-root content entries exclusively from Pool-authorized
-/// reads. Raw-primary bytes cannot satisfy this mounted persistence boundary.
+/// Build mounted committed-root entries from strict, current Pool reads.
+/// Receiptless raw-primary bytes cannot satisfy this boundary.
 pub(crate) fn transaction_manifest_entries_for_pool_content(
     pool: &Pool,
     inode: &InodeRecord,
 ) -> Result<Vec<TransactionManifestEntry>> {
+    if inode.size == 0 {
+        return Ok(Vec::new());
+    }
+
     let authority = MountedContentReadAuthority::new(pool);
     let content_key = content_object_key_for_version(inode.inode_id, inode.data_version);
-    let Some(content_bytes) = authority.read_current_object(content_key)? else {
-        if inode.size == 0 {
-            return Ok(Vec::new());
-        }
-        return Err(FileSystemError::ReceiptAuthorityMissing {
+    let (content_bytes, _receipt) = authority.read_current_object(content_key)?.ok_or(
+        FileSystemError::ReceiptAuthorityMissing {
             object_key: content_key,
             expected_generation: 0,
-        });
-    };
+        },
+    )?;
     let layout = decode_content_layout(&content_bytes)?;
     validate_content_layout(inode.inode_id, inode, &layout)?;
 
@@ -307,7 +308,7 @@ pub(crate) fn transaction_manifest_entries_for_pool_content(
             if chunk_ref.is_hole() {
                 continue;
             }
-            let _ = authority.read_current_chunk(manifest.inode_id, chunk_ref)?;
+            let _ = authority.read_chunk(manifest.inode_id, chunk_ref)?;
             entries.push(TransactionManifestEntry {
                 role: TransactionManifestObjectRole::VersionedContentChunk,
                 object_key: content_chunk_object_key_for_version(

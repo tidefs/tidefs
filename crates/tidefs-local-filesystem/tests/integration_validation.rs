@@ -1297,7 +1297,9 @@ mod snapshot_lifecycle {
         h.fs_mut()
             .delete_snapshot("ephemeral")
             .expect("delete snapshot");
-        h.fs_mut().tick_background_services();
+        h.fs_mut()
+            .tick_background_services()
+            .expect("tick background services");
 
         // Remount: the unreferenced data must be gone.
         h.remount();

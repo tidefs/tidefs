@@ -984,8 +984,8 @@ fn buffered_write_read_roundtrip_autoflush() {
     let (mut fs, root) = wb_open_temp("buffered-write-read");
     fs.set_write_buffer_config(WriteBufferConfig {
         flush_threshold_bytes: 32,
-        flush_threshold_age: Duration::from_millis(60_000),
-    });
+    })
+    .expect("test setup mutation must be admitted");
 
     let rec = fs.create_file("/test.bin", 0o644).expect("create");
     assert_eq!(rec.size, 0);
@@ -1010,10 +1010,12 @@ fn threshold_autoflush_clears_flushed_writeback_range() {
     let (mut fs, root) = wb_open_temp("threshold-autoflush-clears-writeback");
     fs.set_write_buffer_config(WriteBufferConfig {
         flush_threshold_bytes: 8,
-        flush_threshold_age: Duration::from_millis(60_000),
-    });
-    fs.set_auto_commit(false);
-    fs.set_max_uncommitted_mutations(1_000_000);
+    })
+    .expect("test setup mutation must be admitted");
+    fs.set_auto_commit(false)
+        .expect("test setup mutation must be admitted");
+    fs.set_max_uncommitted_mutations(1_000_000)
+        .expect("test setup mutation must be admitted");
 
     let record = fs.create_file("/flush.bin", 0o644).expect("create");
     fs.write_file("/flush.bin", 0, b"abcdefgh")
@@ -1051,8 +1053,8 @@ fn sequential_small_writes_coalesce() {
     let (mut fs, root) = wb_open_temp("sequential-small");
     fs.set_write_buffer_config(WriteBufferConfig {
         flush_threshold_bytes: 128,
-        flush_threshold_age: Duration::from_millis(60_000),
-    });
+    })
+    .expect("test setup mutation must be admitted");
 
     let _ = fs.create_file("/seq.bin", 0o644).expect("create");
 
@@ -1084,8 +1086,8 @@ fn non_contiguous_buffered_writes() {
     let (mut fs, root) = wb_open_temp("non-contiguous");
     fs.set_write_buffer_config(WriteBufferConfig {
         flush_threshold_bytes: 1024 * 1024,
-        flush_threshold_age: Duration::from_millis(60_000),
-    });
+    })
+    .expect("test setup mutation must be admitted");
 
     let _ = fs.create_file("/gap.bin", 0o644).expect("create");
     let _ = fs.write_file("/gap.bin", 0, b"AAAA").expect("w1");
@@ -1109,10 +1111,12 @@ fn non_contiguous_buffered_writes_in_one_chunk_flush_once() {
     let (mut fs, root) = wb_open_temp("chunk-local-flush");
     fs.set_write_buffer_config(WriteBufferConfig {
         flush_threshold_bytes: 1024 * 1024,
-        flush_threshold_age: Duration::from_millis(60_000),
-    });
-    fs.set_auto_commit(false);
-    fs.set_max_uncommitted_mutations(1_000_000);
+    })
+    .expect("test setup mutation must be admitted");
+    fs.set_auto_commit(false)
+        .expect("test setup mutation must be admitted");
+    fs.set_max_uncommitted_mutations(1_000_000)
+        .expect("test setup mutation must be admitted");
 
     let record = fs.create_file("/chunk.bin", 0o644).expect("create");
     let chunk = content_chunk_size() as usize;
@@ -1177,10 +1181,12 @@ fn multi_chunk_writeback_batch_updates_touched_chunks_once() {
     let (mut fs, root) = wb_open_temp("partial-multi-chunk-batch");
     fs.set_write_buffer_config(WriteBufferConfig {
         flush_threshold_bytes: 1024 * 1024,
-        flush_threshold_age: Duration::from_millis(60_000),
-    });
-    fs.set_auto_commit(false);
-    fs.set_max_uncommitted_mutations(1_000_000);
+    })
+    .expect("test setup mutation must be admitted");
+    fs.set_auto_commit(false)
+        .expect("test setup mutation must be admitted");
+    fs.set_max_uncommitted_mutations(1_000_000)
+        .expect("test setup mutation must be admitted");
 
     let record = fs.create_file("/batch.bin", 0o644).expect("create");
     let chunk = content_chunk_size() as usize;
@@ -1274,10 +1280,12 @@ fn extending_writeback_batch_preserves_sparse_manifest_once() {
     let chunk = content_chunk_size() as usize;
     fs.set_write_buffer_config(WriteBufferConfig {
         flush_threshold_bytes: chunk * 8,
-        flush_threshold_age: Duration::from_millis(60_000),
-    });
-    fs.set_auto_commit(false);
-    fs.set_max_uncommitted_mutations(1_000_000);
+    })
+    .expect("test setup mutation must be admitted");
+    fs.set_auto_commit(false)
+        .expect("test setup mutation must be admitted");
+    fs.set_max_uncommitted_mutations(1_000_000)
+        .expect("test setup mutation must be admitted");
 
     let record = fs.create_file("/extend.bin", 0o644).expect("create");
     let prefix: Vec<u8> = (0..chunk / 2).map(|idx| (idx % 251) as u8).collect();
@@ -1344,10 +1352,12 @@ fn single_extending_writeback_flush_preserves_sparse_manifest() {
     let chunk = content_chunk_size() as usize;
     fs.set_write_buffer_config(WriteBufferConfig {
         flush_threshold_bytes: chunk * 8,
-        flush_threshold_age: Duration::from_millis(60_000),
-    });
-    fs.set_auto_commit(false);
-    fs.set_max_uncommitted_mutations(1_000_000);
+    })
+    .expect("test setup mutation must be admitted");
+    fs.set_auto_commit(false)
+        .expect("test setup mutation must be admitted");
+    fs.set_max_uncommitted_mutations(1_000_000)
+        .expect("test setup mutation must be admitted");
 
     let record = fs.create_file("/single.bin", 0o644).expect("create");
     let prefix: Vec<u8> = (0..chunk / 2).map(|idx| (idx % 251) as u8).collect();
@@ -1407,10 +1417,12 @@ fn holetest_style_mixed_writeback_flushes_one_coalesced_image() {
     let (mut fs, root) = wb_open_temp("mixed-writeback-coalesced");
     fs.set_write_buffer_config(WriteBufferConfig {
         flush_threshold_bytes: 1024 * 1024,
-        flush_threshold_age: Duration::from_millis(60_000),
-    });
-    fs.set_auto_commit(false);
-    fs.set_max_uncommitted_mutations(1_000_000);
+    })
+    .expect("test setup mutation must be admitted");
+    fs.set_auto_commit(false)
+        .expect("test setup mutation must be admitted");
+    fs.set_max_uncommitted_mutations(1_000_000)
+        .expect("test setup mutation must be admitted");
 
     let record = fs.create_file("/mixed.bin", 0o644).expect("create");
     let chunk = content_chunk_size() as usize;
@@ -1476,10 +1488,12 @@ fn holetest_style_autoflush_keeps_future_markers_buffered() {
     let chunk = content_chunk_size() as usize;
     fs.set_write_buffer_config(WriteBufferConfig {
         flush_threshold_bytes: chunk,
-        flush_threshold_age: Duration::from_millis(60_000),
-    });
-    fs.set_auto_commit(false);
-    fs.set_max_uncommitted_mutations(1_000_000);
+    })
+    .expect("test setup mutation must be admitted");
+    fs.set_auto_commit(false)
+        .expect("test setup mutation must be admitted");
+    fs.set_max_uncommitted_mutations(1_000_000)
+        .expect("test setup mutation must be admitted");
 
     let record = fs.create_file("/mixed.bin", 0o644).expect("create");
     let page_size = 4096usize;
@@ -1534,10 +1548,12 @@ fn zero_writeback_over_sparse_holes_stays_sparse() {
     let chunk = content_chunk_size() as usize;
     fs.set_write_buffer_config(WriteBufferConfig {
         flush_threshold_bytes: chunk * 8,
-        flush_threshold_age: Duration::from_millis(60_000),
-    });
-    fs.set_auto_commit(false);
-    fs.set_max_uncommitted_mutations(1_000_000);
+    })
+    .expect("test setup mutation must be admitted");
+    fs.set_auto_commit(false)
+        .expect("test setup mutation must be admitted");
+    fs.set_max_uncommitted_mutations(1_000_000)
+        .expect("test setup mutation must be admitted");
 
     let record = fs.create_file("/sparse.bin", 0o644).expect("create");
     let file_len = chunk * 4;
@@ -1592,10 +1608,12 @@ fn zero_writeback_over_sparse_hole_ignores_unrelated_dirty_buffer() {
     let chunk = content_chunk_size() as usize;
     fs.set_write_buffer_config(WriteBufferConfig {
         flush_threshold_bytes: chunk * 8,
-        flush_threshold_age: Duration::from_millis(60_000),
-    });
-    fs.set_auto_commit(false);
-    fs.set_max_uncommitted_mutations(1_000_000);
+    })
+    .expect("test setup mutation must be admitted");
+    fs.set_auto_commit(false)
+        .expect("test setup mutation must be admitted");
+    fs.set_max_uncommitted_mutations(1_000_000)
+        .expect("test setup mutation must be admitted");
 
     let record = fs.create_file("/sparse.bin", 0o644).expect("create");
     let file_len = chunk * 4;
@@ -1641,8 +1659,8 @@ fn zero_writeback_over_sparse_hole_ignores_unrelated_dirty_buffer() {
 }
 
 #[test]
-fn sparse_range_reads_reuse_layout_without_whole_file_materialization() {
-    let (mut fs, root) = wb_open_temp("sparse-range-layout-cache");
+fn sparse_range_reads_do_not_materialize_whole_file() {
+    let (mut fs, root) = wb_open_temp("sparse-range-read");
     let chunk = content_chunk_size() as usize;
     let page = 4096usize;
     let file_len = 256 * 1024 * 1024usize;
@@ -1651,11 +1669,6 @@ fn sparse_range_reads_reuse_layout_without_whole_file_materialization() {
     fs.create_file("/sparse.bin", 0o644).expect("create");
     fs.truncate_file("/sparse.bin", file_len as u64)
         .expect("sparse truncate");
-    assert_eq!(
-        fs.content_layout_cache_len_for_test(),
-        0,
-        "range layout cache starts empty"
-    );
     assert!(
         wd_current_content_manifest(&fs, "/sparse.bin")
             .chunks
@@ -1668,19 +1681,7 @@ fn sparse_range_reads_reuse_layout_without_whole_file_materialization() {
             .read_file_range("/sparse.bin", offset as u64, page)
             .expect("read sparse page");
         assert_eq!(data, vec![0_u8; page], "sparse page must read as zeros");
-        assert_eq!(
-            fs.content_layout_cache_len_for_test(),
-            1,
-            "first sparse range read should cache the decoded chunked layout"
-        );
     }
-
-    let report = fs.hot_read_cache_report();
-    assert_eq!(
-        report.insertions, 0,
-        "range sparse reads must not materialize/admit a 256 MiB whole-file cache entry"
-    );
-    assert_eq!(report.resident_bytes, 0);
     let record = fs.stat("/sparse.bin").expect("stat sparse file");
     assert!(
         fs.lookup_extents(record.inode_id.get(), 0, file_len as u64)
@@ -1698,10 +1699,12 @@ fn zero_writeback_over_materialized_data_stays_materialized() {
     let chunk = content_chunk_size() as usize;
     fs.set_write_buffer_config(WriteBufferConfig {
         flush_threshold_bytes: chunk * 8,
-        flush_threshold_age: Duration::from_millis(60_000),
-    });
-    fs.set_auto_commit(false);
-    fs.set_max_uncommitted_mutations(1_000_000);
+    })
+    .expect("test setup mutation must be admitted");
+    fs.set_auto_commit(false)
+        .expect("test setup mutation must be admitted");
+    fs.set_max_uncommitted_mutations(1_000_000)
+        .expect("test setup mutation must be admitted");
 
     let record = fs.create_file("/data.bin", 0o644).expect("create");
     let initial = vec![0x5a_u8; chunk];
@@ -1737,8 +1740,8 @@ fn fsync_triggers_buffer_flush() {
     let (mut fs, root) = wb_open_temp("fsync-triggers");
     fs.set_write_buffer_config(WriteBufferConfig {
         flush_threshold_bytes: 1024 * 1024,
-        flush_threshold_age: Duration::from_millis(60_000),
-    });
+    })
+    .expect("test setup mutation must be admitted");
 
     let _ = fs.create_file("/syncme.bin", 0o644).expect("create");
     let _ = fs.write_file("/syncme.bin", 0, b"pre-fsync").expect("w1");
@@ -1760,9 +1763,12 @@ fn fsync_triggers_buffer_flush() {
 #[test]
 fn write_buffer_flush_threshold_setter_changes_autoflush_batch_size() {
     let (mut fs, root) = wb_open_temp("flush-threshold-setter");
-    fs.set_write_buffer_flush_threshold_bytes(2 * 1024 * 1024);
-    fs.set_auto_commit(false);
-    fs.set_max_uncommitted_mutations(1_000_000);
+    fs.set_write_buffer_flush_threshold_bytes(2 * 1024 * 1024)
+        .expect("test setup mutation must be admitted");
+    fs.set_auto_commit(false)
+        .expect("test setup mutation must be admitted");
+    fs.set_max_uncommitted_mutations(1_000_000)
+        .expect("test setup mutation must be admitted");
 
     let record = fs.create_file("/batched.bin", 0o644).expect("create");
     let data = vec![0x5a; 1024 * 1024];
@@ -1792,8 +1798,8 @@ fn read_sees_buffered_data_before_flush() {
     let (mut fs, root) = wb_open_temp("read-sees-buffered");
     fs.set_write_buffer_config(WriteBufferConfig {
         flush_threshold_bytes: 1024 * 1024,
-        flush_threshold_age: Duration::from_millis(60_000),
-    });
+    })
+    .expect("test setup mutation must be admitted");
 
     let _ = fs.create_file("/interleaved.bin", 0o644).expect("create");
 
@@ -1823,8 +1829,8 @@ fn fsync_all_flushes_all_buffers() {
     let (mut fs, root) = wb_open_temp("fsync-all-flushes");
     fs.set_write_buffer_config(WriteBufferConfig {
         flush_threshold_bytes: 1024 * 1024,
-        flush_threshold_age: Duration::from_millis(60_000),
-    });
+    })
+    .expect("test setup mutation must be admitted");
 
     let _ = fs.create_file("/a.bin", 0o644).expect("create a");
     let _ = fs.create_file("/b.bin", 0o644).expect("create b");
@@ -1846,10 +1852,12 @@ fn oversized_autoflush_uses_committed_base_size() {
     let (mut fs, root) = wb_open_temp("oversized-autoflush-committed-base");
     fs.set_write_buffer_config(WriteBufferConfig {
         flush_threshold_bytes: 4096,
-        flush_threshold_age: Duration::from_millis(60_000),
-    });
-    fs.set_auto_commit(false);
-    fs.set_max_uncommitted_mutations(1_000_000);
+    })
+    .expect("test setup mutation must be admitted");
+    fs.set_auto_commit(false)
+        .expect("test setup mutation must be admitted");
+    fs.set_max_uncommitted_mutations(1_000_000)
+        .expect("test setup mutation must be admitted");
 
     let data: Vec<u8> = (0..8192).map(|idx| (idx % 251) as u8).collect();
     fs.create_file("/large.bin", 0o644).expect("create");
@@ -1873,10 +1881,12 @@ fn truncate_discards_buffered_tail_before_flush() {
     let (mut fs, root) = wb_open_temp("truncate-discards-buffered-tail");
     fs.set_write_buffer_config(WriteBufferConfig {
         flush_threshold_bytes: 1024 * 1024,
-        flush_threshold_age: Duration::from_millis(60_000),
-    });
-    fs.set_auto_commit(false);
-    fs.set_max_uncommitted_mutations(1_000_000);
+    })
+    .expect("test setup mutation must be admitted");
+    fs.set_auto_commit(false)
+        .expect("test setup mutation must be admitted");
+    fs.set_max_uncommitted_mutations(1_000_000)
+        .expect("test setup mutation must be admitted");
 
     let data = vec![0x5a; 8192];
     let record = fs.create_file("/shrink.bin", 0o644).expect("create");
@@ -1911,10 +1921,12 @@ fn final_unlink_forgets_transient_writeback_state() {
     let (mut fs, root) = wb_open_temp("final-unlink-forgets-transient");
     fs.set_write_buffer_config(WriteBufferConfig {
         flush_threshold_bytes: 1024 * 1024,
-        flush_threshold_age: Duration::from_millis(60_000),
-    });
-    fs.set_auto_commit(false);
-    fs.set_max_uncommitted_mutations(1_000_000);
+    })
+    .expect("test setup mutation must be admitted");
+    fs.set_auto_commit(false)
+        .expect("test setup mutation must be admitted");
+    fs.set_max_uncommitted_mutations(1_000_000)
+        .expect("test setup mutation must be admitted");
 
     let record = fs.create_file("/doomed.bin", 0o644).expect("create");
     fs.write_file("/doomed.bin", 0, &[0x11; 8192])
@@ -1945,10 +1957,12 @@ fn keep_size_prealloc_flushes_buffered_growth_first() {
     let (mut fs, root) = wb_open_temp("keep-size-prealloc-flushes-buffered-growth");
     fs.set_write_buffer_config(WriteBufferConfig {
         flush_threshold_bytes: 1024 * 1024,
-        flush_threshold_age: Duration::from_millis(60_000),
-    });
-    fs.set_auto_commit(false);
-    fs.set_max_uncommitted_mutations(1_000_000);
+    })
+    .expect("test setup mutation must be admitted");
+    fs.set_auto_commit(false)
+        .expect("test setup mutation must be admitted");
+    fs.set_max_uncommitted_mutations(1_000_000)
+        .expect("test setup mutation must be admitted");
 
     let record = fs.create_file("/prealloc.bin", 0o644).expect("create");
     let data = vec![0x77; 8192];
@@ -1976,8 +1990,8 @@ fn buffer_cleared_after_flush() {
     // Trigger flush on every write to test clear-then-rewrite
     fs.set_write_buffer_config(WriteBufferConfig {
         flush_threshold_bytes: 1,
-        flush_threshold_age: Duration::from_millis(60_000),
-    });
+    })
+    .expect("test setup mutation must be admitted");
 
     let _ = fs.create_file("/clear.bin", 0o644).expect("create");
     let _ = fs
@@ -1987,41 +2001,6 @@ fn buffer_cleared_after_flush() {
     // Overwrite with shorter data — buffer was cleared after flush
     let _ = fs.write_file("/clear.bin", 0, b"OK").expect("w2");
     assert_eq!(&fs.read_file("/clear.bin").expect("r"), b"OKllo world!!!");
-
-    drop(fs);
-    wd_cleanup(&root);
-}
-
-#[test]
-fn age_threshold_does_not_trigger_foreground_flush() {
-    let (mut fs, root) = wb_open_temp("age-threshold-no-foreground-flush");
-    fs.set_write_buffer_config(WriteBufferConfig {
-        flush_threshold_bytes: 1024 * 1024,
-        flush_threshold_age: Duration::from_millis(10),
-    });
-
-    let _ = fs.create_file("/aged.bin", 0o644).expect("create");
-    let created = fs.stat("/aged.bin").expect("stat created");
-    let _ = fs.write_file("/aged.bin", 0, b"tiny").expect("w");
-
-    assert_eq!(&fs.read_file("/aged.bin").expect("r"), b"tiny");
-
-    std::thread::sleep(Duration::from_millis(15));
-    let _ = fs.write_file("/aged.bin", 4, b"+more").expect("w2");
-
-    assert_eq!(&fs.read_file("/aged.bin").expect("r2"), b"tiny+more");
-    let still_buffered = fs.stat("/aged.bin").expect("stat buffered");
-    assert_eq!(
-        still_buffered.data_version, created.data_version,
-        "elapsed age alone must not publish foreground writeback"
-    );
-
-    fs.fsync_file("/aged.bin").expect("fsync");
-    let flushed = fs.stat("/aged.bin").expect("stat flushed");
-    assert!(
-        flushed.data_version > created.data_version,
-        "fsync remains the explicit durability boundary"
-    );
 
     drop(fs);
     wd_cleanup(&root);

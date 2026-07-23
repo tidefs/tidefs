@@ -378,7 +378,8 @@ fn crash_before_commit_loses_uncommitted_data() {
     {
         let mut fs = open_fs(&dir);
         assert_eq!(fs.read_file("/crash.bin").unwrap(), committed);
-        fs.set_auto_commit(false);
+        fs.set_auto_commit(false)
+            .expect("test setup mutation must be admitted");
         let uncommitted = make_data(0xFE, 2048);
         fs.write_file("/crash.bin", 0, &uncommitted)
             .expect("write uncommitted");

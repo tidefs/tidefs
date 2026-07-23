@@ -5,7 +5,7 @@ use tidefs_local_object_store::StoreError;
 use tidefs_receive_stream::ReceiverRefusalReason;
 use tidefs_storage_intent_read_serving::ReadServingDecisionRecord;
 use tidefs_types_space_accounting_core::AdmissionResult;
-use tidefs_types_vfs_core::{InodeId, NodeKind};
+use tidefs_types_vfs_core::{InodeId, LockConflict, NodeKind};
 
 use crate::types::{
     CommittedRootSummary, CrashRecoveryExpectation, FilesystemCommitBoundary, LocalStorageResource,
@@ -62,6 +62,15 @@ pub enum FileSystemError {
         recovery_expectation: CrashRecoveryExpectation,
         live_state_reconciled: bool,
         source: StoreError,
+    },
+    /// This mounted instance observed a final-root publication whose
+    /// durability outcome could not be determined. Reopen is required before
+    /// any further mutation so recovery can select one authenticated root.
+    MutationRequiresReopen {
+        operation: &'static str,
+    },
+    AdvisoryLockConflict {
+        conflict: LockConflict,
     },
     InvalidPath {
         path: String,
@@ -309,6 +318,13 @@ impl fmt::Display for FileSystemError {
                 completed_boundary.human_name(),
                 recovery_expectation.human_name()
             ),
+            Self::MutationRequiresReopen { operation } => write!(
+                f,
+                "cannot perform {operation} after an uncertain committed-root publication; reopen the filesystem first"
+            ),
+            Self::AdvisoryLockConflict { conflict } => {
+                write!(f, "advisory lock conflicts with {conflict:?}")
+            }
             Self::InvalidPath { path, reason } => write!(f, "invalid path `{path}`: {reason}"),
             Self::InvalidName { name, reason } => {
                 write!(

@@ -8,7 +8,7 @@
 //! path reconstruction.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::sync::Arc;
 
@@ -38,7 +38,6 @@ use crate::fuse_setattr;
 use crate::fuse_statfs;
 use crate::helpers::{kind_bits, validate_name};
 use crate::open_dispatch::{self, FileHandleState, FileHandleTable};
-use crate::readahead::ReadaheadTracker;
 use crate::release_dispatch;
 use crate::types::{CommittedRootSummary, InodeRecord, IntentLogReplyState, NamespaceEntry};
 use crate::xattr_dispatch;
@@ -71,16 +70,6 @@ const O_EXCL: u32 = 0o200;
 const O_TRUNC: u32 = 0o1000;
 const O_APPEND: u32 = 0o2000;
 const COPY_FILE_RANGE_DIRECT_FALLBACK_BATCH_BYTES: usize = 4 * 1024 * 1024;
-const MAX_RECORDED_READAHEAD_EXECUTOR_OUTCOMES: usize = 64;
-
-type ReadaheadExecutorInputHook = Arc<
-    dyn Fn(
-            VfsReadaheadExecutorRequest,
-        ) -> Option<tidefs_storage_intent_prefetch_executor::PrefetchExecutorInput>
-        + Send
-        + Sync
-        + 'static,
->;
 
 fn open_flags_allow_read(flags: u32) -> bool {
     flags & O_ACCMODE != O_WRONLY
@@ -159,23 +148,6 @@ fn map_errno(err: &FileSystemError) -> Errno {
 /// Maintains a lazy inode→path cache that bridges the VfsEngine inode
 /// space to LocalFileSystem path space.  The cache is populated by a
 /// single tree walk from root on first miss and invalidated as needed.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct VfsReadaheadExecutorRequest {
-    pub inode_id: InodeId,
-    pub path: String,
-    pub read_offset: u64,
-    pub read_size: u32,
-    pub file_size: u64,
-    pub readahead_offset: u64,
-    pub readahead_len: u64,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct VfsReadaheadExecutorOutcome {
-    pub executor_record: tidefs_storage_intent_prefetch_executor::PrefetchExecutorRecord,
-    pub bytes_issued: Option<u64>,
-}
-
 pub struct VfsLocalFileSystem {
     fs: RefCell<LocalFileSystem>,
     read_only: bool,
@@ -196,9 +168,6 @@ pub struct VfsLocalFileSystem {
     timestamp_policy: TimestampPolicy,
     /// Per-dataset write-acknowledgment durability guarantee.
     sync_guarantee: SyncGuarantee,
-    readahead_tracker: ReadaheadTracker,
-    readahead_executor_input_hook: Option<ReadaheadExecutorInputHook>,
-    readahead_executor_outcomes: RefCell<VecDeque<VfsReadaheadExecutorOutcome>>,
 }
 
 // ActiveFileHandle replaced by FileHandleState from open_dispatch
@@ -229,7 +198,7 @@ impl SparseAnonymousData {
 
     fn from_local_file(fs: &LocalFileSystem, record: &InodeRecord) -> crate::Result<Self> {
         let content_reader = MountedContentReadAuthority::new(&fs.store);
-        let layout = content_reader.read_layout(record.inode_id, record, true)?;
+        let layout = content_reader.read_layout(record.inode_id, record)?;
         match layout {
             ContentLayout::Inline(content) => Ok(Self::from_vec(content.bytes)),
             ContentLayout::Chunked(manifest) => {
@@ -516,10 +485,7 @@ impl VfsLocalFileSystem {
             dataset_root_path: None,
             inode_table: None,
             timestamp_policy: TimestampPolicy::Relatime,
-            readahead_tracker: ReadaheadTracker::new(),
             sync_guarantee: SyncGuarantee::Local,
-            readahead_executor_input_hook: None,
-            readahead_executor_outcomes: RefCell::new(VecDeque::new()),
         }
     }
 
@@ -553,37 +519,6 @@ impl VfsLocalFileSystem {
         self
     }
 
-    /// Install a storage-intent hook for planned VFS readahead.
-    ///
-    /// When this hook is set, every planned readahead window is evaluated by
-    /// the #972 executor adapter before dispatch. Returning `None` is treated
-    /// as missing #967/#913 evidence: the executor records a conservative
-    /// refusal and no readahead bytes are issued.
-    pub fn set_readahead_executor_input_hook<F>(&mut self, hook: F)
-    where
-        F: Fn(
-                VfsReadaheadExecutorRequest,
-            )
-                -> Option<tidefs_storage_intent_prefetch_executor::PrefetchExecutorInput>
-            + Send
-            + Sync
-            + 'static,
-    {
-        self.readahead_executor_input_hook = Some(Arc::new(hook));
-    }
-
-    /// Drain executor outcomes recorded by storage-intent-gated readahead.
-    ///
-    /// These records are cache/trial/staged execution evidence only; callers
-    /// must not treat them as durable placement, receipt-retirement, source
-    /// retirement, latest-read, or sync authority.
-    pub fn drain_readahead_executor_outcomes(&self) -> Vec<VfsReadaheadExecutorOutcome> {
-        self.readahead_executor_outcomes
-            .borrow_mut()
-            .drain(..)
-            .collect()
-    }
-
     #[must_use]
     pub fn is_read_only(&self) -> bool {
         self.read_only
@@ -591,11 +526,22 @@ impl VfsLocalFileSystem {
 
     #[inline]
     fn ensure_writable(&self) -> std::result::Result<(), Errno> {
+        self.ensure_mounted_mutation_allowed("mutate mounted filesystem through VFS")?;
         if self.read_only {
-            Err(Errno::EROFS)
-        } else {
-            Ok(())
+            return Err(Errno::EROFS);
         }
+        Ok(())
+    }
+
+    #[inline]
+    fn ensure_mounted_mutation_allowed(
+        &self,
+        operation: &'static str,
+    ) -> std::result::Result<(), Errno> {
+        self.fs
+            .borrow()
+            .ensure_mutation_allowed(operation)
+            .map_err(|e| map_errno(&e))
     }
 
     /// Return the effective root path for path resolution.
@@ -619,57 +565,23 @@ impl VfsLocalFileSystem {
     /// When set, each [`readdir`](VfsEngine::readdir) call issues a
     /// best-effort batch prefetch of the inode attributes for the listed
     /// entries to warm the in-memory cache.
-    pub fn set_inode_table(&mut self, table: Arc<InodeTable>) {
+    pub fn set_inode_table(&mut self, table: Arc<InodeTable>) -> crate::Result<()> {
+        self.fs
+            .borrow()
+            .ensure_mutation_allowed("set mounted VFS inode table")?;
         self.inode_table = Some(table);
-    }
-
-    fn record_readahead_executor_outcome(&self, outcome: VfsReadaheadExecutorOutcome) {
-        let mut outcomes = self.readahead_executor_outcomes.borrow_mut();
-        if outcomes.len() == MAX_RECORDED_READAHEAD_EXECUTOR_OUTCOMES {
-            outcomes.pop_front();
-        }
-        outcomes.push_back(outcome);
-    }
-
-    fn issue_planned_readahead(&self, request: VfsReadaheadExecutorRequest) {
-        let Some(hook) = &self.readahead_executor_input_hook else {
-            crate::readahead::issue_readahead(
-                &self.fs.borrow(),
-                &request.path,
-                request.readahead_offset,
-                request.readahead_len,
-            );
-            return;
-        };
-
-        let hook_request = VfsReadaheadExecutorRequest {
-            inode_id: request.inode_id,
-            path: request.path.clone(),
-            read_offset: request.read_offset,
-            read_size: request.read_size,
-            file_size: request.file_size,
-            readahead_offset: request.readahead_offset,
-            readahead_len: request.readahead_len,
-        };
-        let executor_input = hook(hook_request).unwrap_or_default();
-        let outcome = crate::readahead::issue_readahead_with_executor(
-            &self.fs.borrow(),
-            &request.path,
-            request.readahead_offset,
-            request.readahead_len,
-            executor_input,
-        );
-        self.record_readahead_executor_outcome(VfsReadaheadExecutorOutcome {
-            executor_record: outcome.executor_record,
-            bytes_issued: outcome.bytes_issued,
-        });
+        Ok(())
     }
 
     /// Set the mount-level atime policy for automatic timestamp updates.
     ///
     /// Defaults to [`TimestampPolicy::Relatime`].
-    pub fn set_timestamp_policy(&mut self, policy: TimestampPolicy) {
+    pub fn set_timestamp_policy(&mut self, policy: TimestampPolicy) -> crate::Result<()> {
+        self.fs
+            .borrow()
+            .ensure_mutation_allowed("set mounted VFS timestamp policy")?;
         self.timestamp_policy = policy;
+        Ok(())
     }
 
     /// Access the file-handle table for inspection or direct validation.
@@ -723,7 +635,10 @@ impl VfsLocalFileSystem {
     fn allocate_anonymous_inode_id(&self) -> std::result::Result<InodeId, Errno> {
         // Reserve from the normal inode authority so linkat can publish the
         // same inode number without inflating the persistent allocation bitmap.
-        Ok(self.fs.borrow_mut().reserve_inode_id())
+        self.fs
+            .borrow_mut()
+            .reserve_inode_id()
+            .map_err(|e| map_errno(&e))
     }
 
     fn anonymous_attr(inode_id: InodeId, mode: u32, ctx: &RequestCtx) -> InodeAttr {
@@ -1251,7 +1166,8 @@ impl VfsLocalFileSystem {
             return Ok(());
         }
 
-        fs.try_begin_mutation().map_err(|error| map_errno(&error))?;
+        fs.begin_mutation("set VFS inode attributes")
+            .map_err(|e| map_errno(&e))?;
         let tick = fs.bump_generation();
         updated.metadata_version = updated.metadata_version.max(tick);
         updated.subtree_rev = updated.subtree_rev.saturating_add(1).max(1);
@@ -1319,7 +1235,8 @@ impl VfsLocalFileSystem {
         fs.ensure_inode_capacity_for_new_inode()
             .map_err(|e| map_errno(&e))?;
 
-        fs.try_begin_mutation().map_err(|error| map_errno(&error))?;
+        fs.begin_mutation("create VFS metadata node")
+            .map_err(|e| map_errno(&e))?;
         if !fs.state.inodes.contains_key(&parent_id) {
             fs.rollback_mutation_delta();
             return Err(Errno::ENOENT);
@@ -1455,7 +1372,8 @@ impl VfsLocalFileSystem {
         fs.ensure_inode_capacity_for_new_inode()
             .map_err(|e| map_errno(&e))?;
 
-        fs.try_begin_mutation().map_err(|error| map_errno(&error))?;
+        fs.begin_mutation("create VFS directory")
+            .map_err(|e| map_errno(&e))?;
         if !fs.state.inodes.contains_key(&parent_id) {
             fs.rollback_mutation_delta();
             return Err(Errno::ENOENT);
@@ -1634,7 +1552,8 @@ impl VfsLocalFileSystem {
         fs.ensure_inode_capacity_for_new_inode()
             .map_err(|e| map_errno(&e))?;
 
-        fs.try_begin_mutation().map_err(|error| map_errno(&error))?;
+        fs.begin_mutation("create VFS file-like node")
+            .map_err(|e| map_errno(&e))?;
         if !fs.state.inodes.contains_key(&parent_id) {
             fs.rollback_mutation_delta();
             return Err(Errno::ENOENT);
@@ -1785,6 +1704,9 @@ impl VfsLocalFileSystem {
         &self,
         request: &LivePoolAdminRequest,
     ) -> std::result::Result<LivePoolAdminResponse, Errno> {
+        if Self::live_admin_request_mutates_mounted_state(request) {
+            self.ensure_mounted_mutation_allowed("administer mounted pool")?;
+        }
         if let Err(err) = request.validate_version() {
             return Ok(live_admin_typed_error(err));
         }
@@ -1854,6 +1776,46 @@ impl VfsLocalFileSystem {
         })
     }
 
+    fn live_admin_request_mutates_mounted_state(request: &LivePoolAdminRequest) -> bool {
+        match request.command {
+            LivePoolAdminCommand::PoolImport
+            | LivePoolAdminCommand::PoolMount
+            | LivePoolAdminCommand::PoolExport
+            | LivePoolAdminCommand::PoolDestroy
+            | LivePoolAdminCommand::PoolSet
+            | LivePoolAdminCommand::DatasetCreate
+            | LivePoolAdminCommand::DatasetRename
+            | LivePoolAdminCommand::DatasetDestroy
+            | LivePoolAdminCommand::DatasetUpgrade
+            | LivePoolAdminCommand::DatasetSet
+            | LivePoolAdminCommand::DatasetSealKey
+            | LivePoolAdminCommand::DatasetRotateKey
+            | LivePoolAdminCommand::SnapshotCreate
+            | LivePoolAdminCommand::SnapshotDestroy
+            | LivePoolAdminCommand::SnapshotRollback
+            | LivePoolAdminCommand::SnapshotExtract
+            | LivePoolAdminCommand::SnapshotSend
+            | LivePoolAdminCommand::PerformanceAdmissionSnapshot
+            | LivePoolAdminCommand::DeviceRemove
+            | LivePoolAdminCommand::BlockAttach
+            | LivePoolAdminCommand::BlockReceive => true,
+            LivePoolAdminCommand::DatasetSetStrategy => !matches!(
+                request.args.0.get("list"),
+                Some(LivePoolAdminArg::Bool(true))
+            ),
+            LivePoolAdminCommand::PoolStatus
+            | LivePoolAdminCommand::PoolGet
+            | LivePoolAdminCommand::PoolListProps
+            | LivePoolAdminCommand::PoolIntegrityCheck
+            | LivePoolAdminCommand::DatasetList
+            | LivePoolAdminCommand::DatasetGet
+            | LivePoolAdminCommand::DatasetListProps
+            | LivePoolAdminCommand::SnapshotList
+            | LivePoolAdminCommand::DeviceStatus
+            | LivePoolAdminCommand::BlockSend => false,
+        }
+    }
+
     fn live_performance_admission_snapshot(
         &self,
         pool: &str,
@@ -1866,7 +1828,15 @@ impl VfsLocalFileSystem {
             };
         let mut fs = self.fs.borrow_mut();
         let config = fs.admission_config();
-        let snapshot = fs.take_admission_snapshot().as_evidence_record();
+        let snapshot = match fs.take_admission_snapshot() {
+            Ok(snapshot) => snapshot.as_evidence_record(),
+            Err(err) => {
+                return live_admin_error(
+                    1,
+                    format!("performance admission snapshot refused: {err}"),
+                )
+            }
+        };
 
         live_admin_ok_json(json!({
             "schema_version": 1,
@@ -2002,7 +1972,16 @@ impl VfsLocalFileSystem {
             );
         }
 
-        if let Err(err) = fs.dataset_catalog_mut().create(
+        let catalog = match fs.dataset_catalog_mut() {
+            Ok(catalog) => catalog,
+            Err(err) => {
+                return live_admin_error(
+                    1,
+                    format!("dataset create: mutation requires reopen: {err}"),
+                )
+            }
+        };
+        if let Err(err) = catalog.create(
             &full_path,
             dataset_id,
             dataset_type,
@@ -2147,7 +2126,16 @@ impl VfsLocalFileSystem {
                 format!("dataset rename: dataset '{new_name}' already exists in the catalog"),
             );
         }
-        if let Err(err) = fs.dataset_catalog_mut().rename(old_name, new_name) {
+        let catalog = match fs.dataset_catalog_mut() {
+            Ok(catalog) => catalog,
+            Err(err) => {
+                return live_admin_error(
+                    1,
+                    format!("dataset rename: mutation requires reopen: {err}"),
+                )
+            }
+        };
+        if let Err(err) = catalog.rename(old_name, new_name) {
             return live_admin_error(
                 1,
                 format!(
@@ -2225,12 +2213,30 @@ impl VfsLocalFileSystem {
         }
 
         let destroyed_entries = if force {
-            match live_destroy_catalog_subtree(fs.dataset_catalog_mut(), name) {
+            let catalog = match fs.dataset_catalog_mut() {
+                Ok(catalog) => catalog,
+                Err(err) => {
+                    return live_admin_error(
+                        1,
+                        format!("dataset destroy: mutation requires reopen: {err}"),
+                    )
+                }
+            };
+            match live_destroy_catalog_subtree(catalog, name) {
                 Ok(count) => count,
                 Err(err) => return live_admin_error(1, err),
             }
         } else {
-            if let Err(err) = fs.dataset_catalog_mut().destroy(name) {
+            let catalog = match fs.dataset_catalog_mut() {
+                Ok(catalog) => catalog,
+                Err(err) => {
+                    return live_admin_error(
+                        1,
+                        format!("dataset destroy: mutation requires reopen: {err}"),
+                    )
+                }
+            };
+            if let Err(err) = catalog.destroy(name) {
                 return live_admin_error(
                     1,
                     format!("dataset destroy: catalog error destroying '{name}': {err}"),
@@ -2318,10 +2324,16 @@ impl VfsLocalFileSystem {
                     ),
                 );
             };
-            match fs
-                .feature_flags_mut()
-                .enable_feature_with_prereqs(feature, feature_class)
-            {
+            let enable_result = match fs.feature_flags_mut() {
+                Ok(flags) => flags.enable_feature_with_prereqs(feature, feature_class),
+                Err(err) => {
+                    return live_admin_error(
+                        1,
+                        format!("dataset set-strategy: mutation requires reopen: {err}"),
+                    )
+                }
+            };
+            match enable_result {
                 Ok(()) => {
                     out.push(format!(
                         "enabled feature '{feature_str}' (class: {feature_class})"
@@ -2349,7 +2361,16 @@ impl VfsLocalFileSystem {
                     ),
                 );
             };
-            match fs.feature_flags_mut().disable_feature(&feature) {
+            let disable_result = match fs.feature_flags_mut() {
+                Ok(flags) => flags.disable_feature(&feature),
+                Err(err) => {
+                    return live_admin_error(
+                        1,
+                        format!("dataset set-strategy: mutation requires reopen: {err}"),
+                    )
+                }
+            };
+            match disable_result {
                 Ok(()) => {
                     out.push(format!("disabled feature '{feature_str}'"));
                     changed = true;
@@ -2370,7 +2391,12 @@ impl VfsLocalFileSystem {
                     format!("dataset set-strategy: failed to persist feature flags: {err}"),
                 );
             }
-            fs.refresh_policies_from_features();
+            if let Err(err) = fs.refresh_policies_from_features() {
+                return live_admin_error(
+                    1,
+                    format!("dataset set-strategy: failed to refresh mounted policies: {err}"),
+                );
+            }
             out.push(format!("feature flags persisted for dataset '{name}'"));
         }
 
@@ -2432,10 +2458,16 @@ impl VfsLocalFileSystem {
                     skipped_count += 1;
                     continue;
                 };
-                match fs
-                    .feature_flags_mut()
-                    .enable_feature_with_prereqs(feature.clone(), class)
-                {
+                let enable_result = match fs.feature_flags_mut() {
+                    Ok(flags) => flags.enable_feature_with_prereqs(feature.clone(), class),
+                    Err(err) => {
+                        return live_admin_error(
+                            1,
+                            format!("dataset upgrade: mutation requires reopen: {err}"),
+                        )
+                    }
+                };
+                match enable_result {
                     Ok(()) => {
                         out.push(format!("  enabled {feature} ({class})"));
                         enabled_count += 1;
@@ -2461,10 +2493,16 @@ impl VfsLocalFileSystem {
                         skipped_count += 1;
                         continue;
                     };
-                    if let Err(err) = fs
-                        .feature_flags_mut()
-                        .enable_feature_with_prereqs(feature.clone(), class)
-                    {
+                    let enable_result = match fs.feature_flags_mut() {
+                        Ok(flags) => flags.enable_feature_with_prereqs(feature.clone(), class),
+                        Err(err) => {
+                            return live_admin_error(
+                                1,
+                                format!("dataset upgrade: mutation requires reopen: {err}"),
+                            )
+                        }
+                    };
+                    if let Err(err) = enable_result {
                         let msg = err.to_string();
                         out.push(format!("  FAILED {feature} ({class}) : {msg}"));
                         failed.push((feature.to_string(), msg));
@@ -2482,7 +2520,12 @@ impl VfsLocalFileSystem {
                     format!("dataset upgrade: failed to persist feature flags: {err}"),
                 );
             }
-            fs.refresh_policies_from_features();
+            if let Err(err) = fs.refresh_policies_from_features() {
+                return live_admin_error(
+                    1,
+                    format!("dataset upgrade: failed to refresh mounted policies: {err}"),
+                );
+            }
             out.push(format!("feature flags persisted for dataset '{name}'"));
         }
 
@@ -2503,6 +2546,16 @@ impl VfsLocalFileSystem {
 
     #[cfg(feature = "encryption")]
     fn live_dataset_seal_key(&self, args: &Value) -> LivePoolAdminResponse {
+        if let Err(err) = self
+            .fs
+            .borrow()
+            .ensure_mutation_allowed("seal mounted dataset encryption key")
+        {
+            return live_admin_error(
+                1,
+                format!("dataset seal-key: mutation requires reopen: {err}"),
+            );
+        }
         let name = match live_admin_arg(args, "name") {
             Ok(value) => value,
             Err(err) => return live_admin_error(2, err),
@@ -2562,6 +2615,16 @@ impl VfsLocalFileSystem {
 
     #[cfg(feature = "encryption")]
     fn live_dataset_rotate_key(&self, args: &Value) -> LivePoolAdminResponse {
+        if let Err(err) = self
+            .fs
+            .borrow()
+            .ensure_mutation_allowed("rotate mounted dataset encryption key")
+        {
+            return live_admin_error(
+                1,
+                format!("dataset rotate-key: mutation requires reopen: {err}"),
+            );
+        }
         let old_passphrase = match live_admin_arg(args, "old_passphrase") {
             Ok(value) => value,
             Err(err) => return live_admin_error(2, err),
@@ -2766,7 +2829,13 @@ impl VfsLocalFileSystem {
         } else {
             props.set_local(key.clone(), value.clone());
         }
-        if let Err(err) = fs.dataset_catalog_mut().set_properties(&path, &props) {
+        let catalog = match fs.dataset_catalog_mut() {
+            Ok(catalog) => catalog,
+            Err(err) => {
+                return live_admin_error(1, format!("dataset set: mutation requires reopen: {err}"))
+            }
+        };
+        if let Err(err) = catalog.set_properties(&path, &props) {
             return live_admin_error(
                 1,
                 format!("dataset set: cannot write properties for '{name}': {err}"),
@@ -3123,7 +3192,13 @@ impl VfsLocalFileSystem {
         } else {
             props.set_local(key.clone(), value.clone());
         }
-        fs.pool_properties_mut().clone_from(&props);
+        let pool_properties = match fs.pool_properties_mut() {
+            Ok(properties) => properties,
+            Err(err) => {
+                return live_admin_error(1, format!("pool set: mutation requires reopen: {err}"))
+            }
+        };
+        pool_properties.clone_from(&props);
         if let Err(err) = fs.persist_pool_properties() {
             return live_admin_error(
                 1,
@@ -3362,6 +3437,13 @@ impl VfsLocalFileSystem {
     }
 
     fn live_device_remove(&self, args: &Value, wants_json: bool) -> LivePoolAdminResponse {
+        if let Err(err) = self
+            .fs
+            .borrow()
+            .ensure_mutation_allowed("remove mounted pool device")
+        {
+            return live_admin_error(1, format!("device remove: mutation requires reopen: {err}"));
+        }
         let device_path = match live_admin_arg(args, "device_path") {
             Ok(value) => std::path::PathBuf::from(value),
             Err(err) => return live_admin_error(2, err),
@@ -4393,7 +4475,8 @@ impl VfsLocalFileSystem {
         fs.ensure_content_capacity_with_planned_inode(Some(dest_fh.inode_id), planned_entries)
             .map_err(|e| map_errno(&e))?;
 
-        fs.try_begin_mutation().map_err(|error| map_errno(&error))?;
+        fs.begin_mutation("clone VFS file content")
+            .map_err(|e| map_errno(&e))?;
         let tick = fs.bump_generation();
         debug_assert_eq!(tick, planned_tick);
         dest_record.data_version = tick;
@@ -4437,7 +4520,6 @@ impl VfsLocalFileSystem {
         Arc::make_mut(&mut fs.state.inodes).insert(dest_fh.inode_id, dest_record.clone());
         fs.inode_cache.borrow_mut().invalidate(dest_fh.inode_id);
         fs.mark_inode_content_dirty(dest_fh.inode_id);
-        fs.invalidate_hot_read_cache_for_inode(dest_fh.inode_id);
         fs.commit_mutation(dest_record).map_err(|e| map_errno(&e))?;
 
         let _ = fs.apply_deferred_timestamp_update(
@@ -4473,18 +4555,6 @@ impl VfsLocalFileSystem {
         }
         let path = self.inode_path(fh.inode_id)?;
 
-        // Keep read-pattern accounting for both user reads and internal cache
-        // fills; only user-visible reads are POSIX atime events.
-        let file_size = self
-            .fs
-            .borrow()
-            .inode(fh.inode_id)
-            .map_err(|e| map_errno(&e))?
-            .size;
-        let readahead_plan =
-            self.readahead_tracker
-                .record_read(fh.inode_id, offset, size, file_size);
-
         let data = match self
             .fs
             .borrow()
@@ -4513,18 +4583,6 @@ impl VfsLocalFileSystem {
                 TimestampUpdate::Read,
                 self.timestamp_policy,
             );
-        }
-
-        if let Some((ra_offset, ra_len)) = readahead_plan {
-            self.issue_planned_readahead(VfsReadaheadExecutorRequest {
-                inode_id: fh.inode_id,
-                path,
-                read_offset: offset,
-                read_size: size,
-                file_size,
-                readahead_offset: ra_offset,
-                readahead_len: ra_len,
-            });
         }
 
         Ok(data)
@@ -4619,10 +4677,6 @@ impl VfsEngine for VfsLocalFileSystem {
         _ctx: &RequestCtx,
     ) -> std::result::Result<InodeAttr, Errno> {
         self.ensure_writable()?;
-        self.fs
-            .borrow()
-            .ensure_mutation_root_authority()
-            .map_err(|error| map_errno(&error))?;
         self.validate_optional_file_handle(inode, handle)?;
         const SUPPORTED_SETATTR_BITS: u32 = FATTR_MODE
             | FATTR_UID
@@ -4718,10 +4772,6 @@ impl VfsEngine for VfsLocalFileSystem {
         ctx: &RequestCtx,
     ) -> std::result::Result<(InodeAttr, EngineFileHandle), Errno> {
         self.ensure_writable()?;
-        self.fs
-            .borrow()
-            .ensure_mutation_root_authority()
-            .map_err(|error| map_errno(&error))?;
         let parent_path = self.inode_path(parent)?;
         let child_path = build_child_path(&parent_path, name)?;
 
@@ -4813,10 +4863,6 @@ impl VfsEngine for VfsLocalFileSystem {
         ctx: &RequestCtx,
     ) -> std::result::Result<(InodeAttr, EngineFileHandle), Errno> {
         self.ensure_writable()?;
-        self.fs
-            .borrow()
-            .ensure_mutation_root_authority()
-            .map_err(|error| map_errno(&error))?;
         let parent_path = self.inode_path(parent)?;
         let child_path = build_child_path(&parent_path, name)?;
 
@@ -4872,10 +4918,6 @@ impl VfsEngine for VfsLocalFileSystem {
         ctx: &RequestCtx,
     ) -> std::result::Result<(InodeAttr, EngineFileHandle), Errno> {
         self.ensure_writable()?;
-        self.fs
-            .borrow()
-            .ensure_mutation_root_authority()
-            .map_err(|error| map_errno(&error))?;
         let parent_path = self.inode_path(parent)?;
         let parent_record = self
             .fs
@@ -5314,6 +5356,9 @@ impl VfsEngine for VfsLocalFileSystem {
         flags: u32,
         _ctx: &RequestCtx,
     ) -> std::result::Result<EngineFileHandle, Errno> {
+        if open_flags_allow_write(flags) || flags & O_TRUNC != 0 {
+            self.ensure_mounted_mutation_allowed("open writable mounted file handle")?;
+        }
         if self.read_only && (open_flags_allow_write(flags) || flags & O_TRUNC != 0) {
             return Err(Errno::EROFS);
         }
@@ -5402,10 +5447,6 @@ impl VfsEngine for VfsLocalFileSystem {
         _ctx: &RequestCtx,
     ) -> std::result::Result<u32, Errno> {
         self.ensure_writable()?;
-        self.fs
-            .borrow()
-            .ensure_mutation_root_authority()
-            .map_err(|error| map_errno(&error))?;
         let live = self.validate_file_handle(fh)?;
         if live.enforce_access_mode && !open_flags_allow_write(live.open_flags) {
             return Err(Errno::EBADF);
@@ -5481,6 +5522,7 @@ impl VfsEngine for VfsLocalFileSystem {
     }
 
     fn flush(&self, fh: &EngineFileHandle, _ctx: &RequestCtx) -> std::result::Result<(), Errno> {
+        self.ensure_mounted_mutation_allowed("flush mounted file handle")?;
         self.validate_file_handle(fh)?;
         if self.read_only {
             return Ok(());
@@ -5504,6 +5546,7 @@ impl VfsEngine for VfsLocalFileSystem {
         datasync: bool,
         _ctx: &RequestCtx,
     ) -> std::result::Result<(), Errno> {
+        self.ensure_mounted_mutation_allowed("synchronize mounted file handle")?;
         self.validate_file_handle(fh)?;
         if self.read_only {
             return Ok(());
@@ -5536,10 +5579,6 @@ impl VfsEngine for VfsLocalFileSystem {
         _ctx: &RequestCtx,
     ) -> std::result::Result<(), Errno> {
         self.ensure_writable()?;
-        self.fs
-            .borrow()
-            .ensure_mutation_root_authority()
-            .map_err(|error| map_errno(&error))?;
         self.validate_file_handle(fh)?;
         if let Some(file) = self.anonymous_tmpfiles.borrow_mut().get_mut(&fh.inode_id) {
             let end = offset.checked_add(length).ok_or(Errno::EINVAL)?;
@@ -5707,10 +5746,6 @@ impl VfsEngine for VfsLocalFileSystem {
         {
             return Err(Errno::EINVAL);
         }
-        self.fs
-            .borrow()
-            .ensure_mutation_root_authority()
-            .map_err(|error| map_errno(&error))?;
 
         // Record intent-log entry for crash-recovery replay (non-tmpfile only).
         if !self
@@ -5733,7 +5768,7 @@ impl VfsEngine for VfsLocalFileSystem {
                     dst_offset: offset_out,
                     len: length,
                 })
-                .map_err(|error| map_errno(&error))?;
+                .map_err(|e| map_errno(&e))?;
         }
 
         let source_is_anonymous = self
@@ -6200,6 +6235,7 @@ impl VfsEngine for VfsLocalFileSystem {
         datasync: bool,
         _ctx: &RequestCtx,
     ) -> std::result::Result<(), Errno> {
+        self.ensure_mounted_mutation_allowed("synchronize mounted inode data")?;
         self.validate_file_handle(fh)?;
         if self.read_only {
             return Ok(());
@@ -6219,6 +6255,7 @@ impl VfsEngine for VfsLocalFileSystem {
         _datasync: bool,
         _ctx: &RequestCtx,
     ) -> std::result::Result<(), Errno> {
+        self.ensure_mounted_mutation_allowed("synchronize mounted directory")?;
         self.validate_dir_handle(dh)?;
         if self.read_only {
             return Ok(());
@@ -6231,6 +6268,7 @@ impl VfsEngine for VfsLocalFileSystem {
     }
 
     fn syncfs(&self, _ctx: &RequestCtx) -> std::result::Result<(), Errno> {
+        self.ensure_mounted_mutation_allowed("synchronize mounted filesystem")?;
         if self.read_only {
             return Ok(());
         }
@@ -6341,9 +6379,15 @@ impl VfsEngine for VfsLocalFileSystem {
         lock: &LockSpec,
         _ctx: &RequestCtx,
     ) -> std::result::Result<(), Errno> {
+        if lock.typ != LockType::Unlock.as_fcntl() as u32 {
+            self.ensure_mounted_mutation_allowed("acquire mounted advisory lock")?;
+        }
         let requested = lock_range_from_spec(lock)?;
         let fs = self.fs.borrow_mut();
-        fs.setlk(inode, requested).map_err(|_| Errno::EAGAIN)
+        fs.setlk(inode, requested).map_err(|err| match err {
+            FileSystemError::AdvisoryLockConflict { .. } => Errno::EAGAIN,
+            other => map_errno(&other),
+        })
     }
     fn setlkw(
         &self,
@@ -6351,10 +6395,16 @@ impl VfsEngine for VfsLocalFileSystem {
         lock: &LockSpec,
         _ctx: &RequestCtx,
     ) -> std::result::Result<(), Errno> {
+        if lock.typ != LockType::Unlock.as_fcntl() as u32 {
+            self.ensure_mounted_mutation_allowed("wait for mounted advisory lock")?;
+        }
         let requested = lock_range_from_spec(lock)?;
         let fs = self.fs.borrow();
         fs.lock_wait_acquire(inode, requested, Some(std::time::Duration::from_secs(30)))
-            .map_err(|_| Errno::EAGAIN)
+            .map_err(|err| match err {
+                FileSystemError::AdvisoryLockConflict { .. } => Errno::EAGAIN,
+                other => map_errno(&other),
+            })
     }
 
     fn check_write_admission(&self, byte_count: u64) -> std::result::Result<(), Errno> {
@@ -6371,12 +6421,8 @@ impl VfsEngine for VfsLocalFileSystem {
         _ctx: &RequestCtx,
     ) -> std::result::Result<(u64, u64), Errno> {
         self.ensure_writable()?;
-        self.fs
-            .borrow()
-            .ensure_mutation_root_authority()
-            .map_err(|error| map_errno(&error))?;
         let mut fs = self.fs.borrow_mut();
-        let before_after = fs.defrag_extent_map(ino).map_err(|_e| Errno::EIO)?;
+        let before_after = fs.defrag_extent_map(ino).map_err(|e| map_errno(&e))?;
         if before_after.1 < before_after.0 {
             fs.state.dirty_extent_maps.insert(ino);
         }
@@ -6397,8 +6443,8 @@ impl VfsLocalFileSystem {
     /// Set the pool free-space low-watermark threshold in bytes.
     /// Data writes that would reduce available capacity below this
     /// threshold are refused with `ENOSPC`.  Set to 0 to disable.
-    pub fn set_low_watermark_bytes(&self, bytes: u64) {
-        self.fs.borrow_mut().set_low_watermark_bytes(bytes);
+    pub fn set_low_watermark_bytes(&self, bytes: u64) -> std::result::Result<(), FileSystemError> {
+        self.fs.borrow_mut().set_low_watermark_bytes(bytes)
     }
 }
 
@@ -6457,25 +6503,8 @@ mod tests {
     use crate::write_buffer::WriteBufferConfig;
     use crate::RootAuthenticationKey;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use tidefs_space_accounting::{DatasetQuotaConfig, DatasetQuotaHierarchy};
-    use tidefs_storage_intent_core::{
-        EvidenceCompletenessVerdict, EvidenceFamilyFreshness, EvidenceFamilyFreshnessSet,
-        EvidenceFamilyFreshnessState, EvidenceQuerySubjectScope, EvidenceQuerySubjectScopeClass,
-        PrefetchResidencyCandidateClass, PrefetchResidencyDecisionEvidenceRefs,
-        PrefetchResidencyDecisionOutcome, PrefetchResidencyDecisionRecord,
-        PrefetchResidencyStateClass, StorageIntentDomainId, StorageIntentEvidenceId,
-        StorageIntentEvidenceKind, StorageIntentEvidenceQuerySnapshot, StorageIntentEvidenceRef,
-        StorageIntentEvidenceRefs, StorageIntentObjectScope, StorageIntentPolicyId,
-        StorageIntentPolicyRevision, StorageMediaClass,
-    };
-    use tidefs_storage_intent_prefetch_executor::{
-        PrefetchExecutorActionFamily, PrefetchExecutorAdmissionRecord, PrefetchExecutorCostState,
-        PrefetchExecutorDispatchPlan, PrefetchExecutorInput, PrefetchExecutorMediaPath,
-        PrefetchExecutorOutcome, PrefetchExecutorRuntimeSupport,
-        PrefetchExecutorRuntimeSupportMask, PrefetchExecutorSchedulerLane,
-    };
     use tidefs_types_vfs_core::{
         FileHandleId, FATTR_ATIME, FATTR_CTIME, FATTR_GID, FATTR_MODE, FATTR_MTIME, FATTR_SIZE,
         FATTR_UID, RENAME_EXCHANGE, RENAME_NOREPLACE, S_IFDIR, S_IFMT, S_ISGID, XATTR_CREATE,
@@ -6503,378 +6532,134 @@ mod tests {
         engine.path_cache.borrow().get(&inode).cloned()
     }
 
-    const PREFETCH_POLICY: StorageIntentPolicyId = StorageIntentPolicyId([0x31; 16]);
-    const PREFETCH_BUDGET: StorageIntentDomainId = StorageIntentDomainId([0x41; 16]);
-    const PREFETCH_OBJECT: StorageIntentEvidenceId = StorageIntentEvidenceId([0x51; 32]);
-    const PREFETCH_QUERY: StorageIntentEvidenceId = StorageIntentEvidenceId([0x61; 32]);
-    const PREFETCH_SNAPSHOT: StorageIntentEvidenceId = StorageIntentEvidenceId([0x62; 32]);
-    const PREFETCH_DECISION: StorageIntentEvidenceId = StorageIntentEvidenceId([0x63; 32]);
-    const PREFETCH_SCHED: StorageIntentEvidenceId = StorageIntentEvidenceId([0x64; 32]);
-    const PREFETCH_MEDIA: StorageIntentEvidenceId = StorageIntentEvidenceId([0x65; 32]);
-    const PREFETCH_READ: StorageIntentEvidenceId = StorageIntentEvidenceId([0x66; 32]);
-    const PREFETCH_COST: StorageIntentEvidenceId = StorageIntentEvidenceId([0x67; 32]);
-    const PREFETCH_ISOLATION: StorageIntentEvidenceId = StorageIntentEvidenceId([0x68; 32]);
-    const PREFETCH_ACTION: StorageIntentEvidenceId = StorageIntentEvidenceId([0x69; 32]);
-    const PREFETCH_SOURCE_PATH: StorageIntentEvidenceId = StorageIntentEvidenceId([0x6a; 32]);
-    const PREFETCH_TARGET_DESTINATION: StorageIntentEvidenceId =
-        StorageIntentEvidenceId([0x6b; 32]);
-
-    fn prefetch_evidence(
-        kind: StorageIntentEvidenceKind,
-        id: StorageIntentEvidenceId,
-    ) -> StorageIntentEvidenceRef {
-        StorageIntentEvidenceRef::new(kind, id, 1, 1)
-    }
-
-    fn prefetch_scope(range_start: u64, range_len: u64) -> StorageIntentObjectScope {
-        StorageIntentObjectScope {
-            dataset_id: PREFETCH_BUDGET,
-            object_id: PREFETCH_OBJECT,
-            range_start,
-            range_len,
-            generation: 1,
-        }
-    }
-
-    fn add_prefetch_family(
-        snapshot: &mut StorageIntentEvidenceQuerySnapshot,
-        kind: StorageIntentEvidenceKind,
-        id: StorageIntentEvidenceId,
-    ) {
-        let evidence_ref = prefetch_evidence(kind, id);
-        snapshot
-            .included_refs
-            .push(evidence_ref)
-            .expect("push included evidence");
-        snapshot
-            .family_freshness
-            .push(EvidenceFamilyFreshness {
-                kind,
-                state: EvidenceFamilyFreshnessState::Fresh,
-                source_index_generation: 1,
-                producer_generation: 1,
-                freshness_frontier_ms: 100,
-                allowed_staleness_ms: 0,
-                evidence_ref,
-            })
-            .expect("push family freshness");
-    }
-
-    fn prefetch_snapshot(range_start: u64, range_len: u64) -> StorageIntentEvidenceQuerySnapshot {
-        let mut snapshot = StorageIntentEvidenceQuerySnapshot {
-            snapshot_id: PREFETCH_SNAPSHOT,
-            query_id: PREFETCH_QUERY,
-            subject: EvidenceQuerySubjectScope {
-                scope_class: EvidenceQuerySubjectScopeClass::ObjectRange,
-                object_scope: prefetch_scope(range_start, range_len),
-                ..EvidenceQuerySubjectScope::default()
-            },
-            policy_id: PREFETCH_POLICY,
-            policy_revision: StorageIntentPolicyRevision(7),
-            temporal_frontier_ms: 100,
-            freshness_frontier_ms: 100,
-            source_index_generation: 1,
-            producer_generation: 1,
-            producer_watermark_ms: 100,
-            included_refs: StorageIntentEvidenceRefs::EMPTY,
-            family_freshness: EvidenceFamilyFreshnessSet::EMPTY,
-            completeness: EvidenceCompletenessVerdict::CompleteForPurpose,
-            ..StorageIntentEvidenceQuerySnapshot::default()
+    #[test]
+    fn mutation_fence_refuses_vfs_configuration_and_lock_acquisition_but_allows_unlock() {
+        let (mut engine, _td) = temp_fs();
+        let inode = ROOT_INODE_ID;
+        let write_lock = LockSpec {
+            typ: LockType::Write.as_fcntl() as u32,
+            whence: 0,
+            start: 0,
+            end: 9,
+            pid: 41,
         };
-        add_prefetch_family(
-            &mut snapshot,
-            StorageIntentEvidenceKind::EvidenceQuerySnapshot,
-            PREFETCH_SNAPSHOT,
-        );
-        add_prefetch_family(
-            &mut snapshot,
-            StorageIntentEvidenceKind::DecisionFrontierEvidence,
-            PREFETCH_DECISION,
-        );
-        add_prefetch_family(
-            &mut snapshot,
-            StorageIntentEvidenceKind::SchedulerAdmissionRecord,
-            PREFETCH_SCHED,
-        );
-        add_prefetch_family(
-            &mut snapshot,
-            StorageIntentEvidenceKind::MediaCapabilityEvidence,
-            PREFETCH_MEDIA,
-        );
-        add_prefetch_family(
-            &mut snapshot,
-            StorageIntentEvidenceKind::ReadFreshnessEvidence,
-            PREFETCH_READ,
-        );
-        add_prefetch_family(
-            &mut snapshot,
-            StorageIntentEvidenceKind::MediaCostWearLedger,
-            PREFETCH_COST,
-        );
-        add_prefetch_family(
-            &mut snapshot,
-            StorageIntentEvidenceKind::TenantIsolationEvidence,
-            PREFETCH_ISOLATION,
-        );
-        add_prefetch_family(
-            &mut snapshot,
-            StorageIntentEvidenceKind::ActionExecutionEvidence,
-            PREFETCH_ACTION,
-        );
-        snapshot
-            .included_refs
-            .push(prefetch_evidence(
-                StorageIntentEvidenceKind::ReadFreshnessEvidence,
-                PREFETCH_SOURCE_PATH,
-            ))
-            .expect("push source path evidence");
-        snapshot
-            .included_refs
-            .push(prefetch_evidence(
-                StorageIntentEvidenceKind::ActionExecutionEvidence,
-                PREFETCH_TARGET_DESTINATION,
-            ))
-            .expect("push target destination evidence");
-        snapshot
-    }
+        engine
+            .setlk(inode, &write_lock, &ctx())
+            .expect("acquire setup lock");
 
-    fn admitted_readahead_input(range_start: u64, range_len: u64) -> PrefetchExecutorInput {
-        let scope = prefetch_scope(range_start, range_len);
-        let decision = PrefetchResidencyDecisionRecord {
-            policy_id: PREFETCH_POLICY,
-            policy_revision: StorageIntentPolicyRevision(7),
-            scope,
-            budget_owner: PREFETCH_BUDGET,
-            requested_candidate: PrefetchResidencyCandidateClass::BoundedReadahead,
-            selected_candidate: PrefetchResidencyCandidateClass::BoundedReadahead,
-            selected_residency: PrefetchResidencyStateClass::CacheOnlyRam,
-            outcome: PrefetchResidencyDecisionOutcome::Admitted,
-            source_media: StorageMediaClass::HddRotational,
-            target_media: StorageMediaClass::SystemRam,
-            source_media_ref: prefetch_evidence(
-                StorageIntentEvidenceKind::MediaCapabilityEvidence,
-                PREFETCH_MEDIA,
-            ),
-            target_media_ref: prefetch_evidence(
-                StorageIntentEvidenceKind::MediaCapabilityEvidence,
-                PREFETCH_MEDIA,
-            ),
-            max_prefetch_window_bytes: range_len.max(1),
-            evidence_refs: PrefetchResidencyDecisionEvidenceRefs {
-                evidence_query_ref: prefetch_evidence(
-                    StorageIntentEvidenceKind::EvidenceQuerySnapshot,
-                    PREFETCH_SNAPSHOT,
-                ),
-                decision_frontier_ref: prefetch_evidence(
-                    StorageIntentEvidenceKind::DecisionFrontierEvidence,
-                    PREFETCH_DECISION,
-                ),
-                scheduler_admission_ref: prefetch_evidence(
-                    StorageIntentEvidenceKind::SchedulerAdmissionRecord,
-                    PREFETCH_SCHED,
-                ),
-                media_capability_ref: prefetch_evidence(
-                    StorageIntentEvidenceKind::MediaCapabilityEvidence,
-                    PREFETCH_MEDIA,
-                ),
-                read_serving_boundary_ref: prefetch_evidence(
-                    StorageIntentEvidenceKind::ReadFreshnessEvidence,
-                    PREFETCH_READ,
-                ),
-                cost_wear_ref: prefetch_evidence(
-                    StorageIntentEvidenceKind::MediaCostWearLedger,
-                    PREFETCH_COST,
-                ),
-                tenant_isolation_ref: prefetch_evidence(
-                    StorageIntentEvidenceKind::TenantIsolationEvidence,
-                    PREFETCH_ISOLATION,
-                ),
-                ..PrefetchResidencyDecisionEvidenceRefs::default()
-            },
-            ..PrefetchResidencyDecisionRecord::default()
+        engine.fs.borrow_mut().arm_mutation_reopen_fence();
+
+        assert!(matches!(
+            engine.set_timestamp_policy(TimestampPolicy::Noatime),
+            Err(FileSystemError::MutationRequiresReopen { .. })
+        ));
+        let inode_table = Arc::new(InodeTable::new(
+            16,
+            Box::new(tidefs_inode_table::SystemTimeSource),
+        ));
+        assert!(matches!(
+            engine.set_inode_table(inode_table),
+            Err(FileSystemError::MutationRequiresReopen { .. })
+        ));
+
+        let second_lock = LockSpec {
+            start: 20,
+            end: 29,
+            pid: 42,
+            ..write_lock.clone()
         };
+        assert_eq!(
+            engine.setlk(inode, &second_lock, &ctx()).unwrap_err(),
+            Errno::EIO
+        );
+        assert_eq!(
+            engine.setlkw(inode, &second_lock, &ctx()).unwrap_err(),
+            Errno::EIO
+        );
+        let malformed_lock = LockSpec {
+            typ: u32::MAX,
+            whence: 1,
+            ..second_lock
+        };
+        assert_eq!(
+            engine.setlk(inode, &malformed_lock, &ctx()).unwrap_err(),
+            Errno::EIO
+        );
+        assert_eq!(
+            engine.setlkw(inode, &malformed_lock, &ctx()).unwrap_err(),
+            Errno::EIO
+        );
 
-        PrefetchExecutorInput {
-            decision,
-            evidence_query_snapshot: prefetch_snapshot(range_start, range_len),
-            admission: PrefetchExecutorAdmissionRecord::admitted(
-                PrefetchExecutorSchedulerLane::Speculative,
-                PREFETCH_BUDGET,
-                prefetch_evidence(
-                    StorageIntentEvidenceKind::SchedulerAdmissionRecord,
-                    PREFETCH_SCHED,
-                ),
-            )
-            .with_speculative_controls(true, true, true),
-            media_path: PrefetchExecutorMediaPath {
-                source_media: decision.source_media,
-                target_media: decision.target_media,
-                source_path_ref: prefetch_evidence(
-                    StorageIntentEvidenceKind::ReadFreshnessEvidence,
-                    PREFETCH_SOURCE_PATH,
-                ),
-                target_destination_ref: prefetch_evidence(
-                    StorageIntentEvidenceKind::ActionExecutionEvidence,
-                    PREFETCH_TARGET_DESTINATION,
-                ),
-                media_capability_ref: prefetch_evidence(
-                    StorageIntentEvidenceKind::MediaCapabilityEvidence,
-                    PREFETCH_MEDIA,
-                ),
-                ..PrefetchExecutorMediaPath::default()
-            },
-            dispatch_plan: PrefetchExecutorDispatchPlan::bounded_range(
-                range_start,
-                range_len.max(1),
-                prefetch_evidence(
-                    StorageIntentEvidenceKind::ActionExecutionEvidence,
-                    PREFETCH_ACTION,
-                ),
-            ),
-            cost_state: PrefetchExecutorCostState {
-                cost_ref: prefetch_evidence(
-                    StorageIntentEvidenceKind::MediaCostWearLedger,
-                    PREFETCH_COST,
-                ),
-                isolation_ref: prefetch_evidence(
-                    StorageIntentEvidenceKind::TenantIsolationEvidence,
-                    PREFETCH_ISOLATION,
-                ),
-                ..PrefetchExecutorCostState::default()
-            },
-            runtime_support: PrefetchExecutorRuntimeSupport::supported(
-                PrefetchExecutorRuntimeSupportMask::ALL_MODELLED_DISPATCH,
-                prefetch_evidence(
-                    StorageIntentEvidenceKind::ActionExecutionEvidence,
-                    PREFETCH_ACTION,
-                ),
-            ),
-            action_family: PrefetchExecutorActionFamily::BoundedSequentialReadahead,
-            require_budget_owner: true,
-            require_isolation_evidence: true,
-            ..PrefetchExecutorInput::default()
-        }
+        let unlock = LockSpec {
+            typ: LockType::Unlock.as_fcntl() as u32,
+            ..write_lock
+        };
+        engine
+            .setlk(inode, &unlock, &ctx())
+            .expect("unlock remains available as cleanup");
+
+        engine.read_only = true;
+        assert_eq!(
+            engine.setxattr(inode, b"", b"", u32::MAX, &ctx()),
+            Err(Errno::EIO),
+            "the reopen fence must outrank read-only and xattr validation errors"
+        );
     }
 
     #[test]
-    fn vfs_readahead_executor_hook_records_missing_evidence_refusal() {
-        let (mut engine, _dir) = temp_fs();
-        let root = engine.get_root_inode(&ctx()).expect("root inode");
-        let (attr, fh) = engine
-            .create(root, b"prefetch.bin", 0o644, O_RDWR, &ctx())
-            .expect("create file");
-        let payload = vec![0xAB; 512 * 1024];
-        engine.write(&fh, 0, &payload, &ctx()).expect("write file");
+    fn mutation_fence_precedes_sync_handle_validation() {
+        let (engine, _td) = temp_fs();
+        engine.fs.borrow_mut().arm_mutation_reopen_fence();
 
-        let hook_calls = Arc::new(AtomicUsize::new(0));
-        let hook_calls_for_hook = Arc::clone(&hook_calls);
-        let expected_inode = attr.inode_id;
-        engine.set_readahead_executor_input_hook(move |request| {
-            hook_calls_for_hook.fetch_add(1, Ordering::SeqCst);
-            assert_eq!(request.inode_id, expected_inode);
-            assert_eq!(request.path, "/prefetch.bin");
-            assert_eq!(request.read_offset, 8192);
-            assert_eq!(request.read_size, 4096);
-            assert!(request.readahead_len > 0);
-            None
-        });
-
+        let unknown_file =
+            EngineFileHandle::new(ROOT_INODE_ID, O_RDWR, FileHandleId::new(u64::MAX), 0);
+        assert_eq!(engine.flush(&unknown_file, &ctx()), Err(Errno::EIO));
+        assert_eq!(engine.fsync(&unknown_file, false, &ctx()), Err(Errno::EIO));
         assert_eq!(
-            engine.read(&fh, 0, 4096, &ctx()).expect("first read").len(),
-            4096
-        );
-        assert_eq!(
-            engine
-                .read(&fh, 4096, 4096, &ctx())
-                .expect("second read")
-                .len(),
-            4096
-        );
-        assert!(
-            engine.drain_readahead_executor_outcomes().is_empty(),
-            "executor should not run before the readahead threshold"
-        );
-        assert_eq!(
-            engine
-                .read(&fh, 8192, 4096, &ctx())
-                .expect("third read")
-                .len(),
-            4096
+            engine.fdatasync_inode(&unknown_file, true, &ctx()),
+            Err(Errno::EIO)
         );
 
-        assert_eq!(hook_calls.load(Ordering::SeqCst), 1);
-        let outcomes = engine.drain_readahead_executor_outcomes();
-        assert_eq!(outcomes.len(), 1);
-        assert_ne!(
-            outcomes[0].executor_record.outcome,
-            PrefetchExecutorOutcome::Started
+        let unknown_dir = EngineDirHandle::new(ROOT_INODE_ID, DirHandleId::new(u64::MAX));
+        assert_eq!(
+            engine.fsyncdir(&unknown_dir, false, &ctx()),
+            Err(Errno::EIO)
         );
-        assert!(
-            outcomes[0].bytes_issued.is_none(),
-            "missing #967/#913 evidence must not dispatch readahead"
-        );
-        assert!(!outcomes[0]
-            .executor_record
-            .can_publish_replacement_receipt());
-        assert!(!outcomes[0].executor_record.can_retire_source_receipt());
-        assert!(!outcomes[0].executor_record.can_satisfy_durable_sync());
+        assert_eq!(engine.syncfs(&ctx()), Err(Errno::EIO));
     }
 
     #[test]
-    fn vfs_readahead_executor_hook_records_started_cache_only_dispatch() {
-        let (mut engine, _dir) = temp_fs();
-        let root = engine.get_root_inode(&ctx()).expect("root inode");
-        let (_attr, fh) = engine
-            .create(root, b"started.bin", 0o644, O_RDWR, &ctx())
-            .expect("create file");
-        let payload = vec![0xCD; 512 * 1024];
-        engine.write(&fh, 0, &payload, &ctx()).expect("write file");
+    fn mutation_fence_precedes_live_admin_validation_but_preserves_read_only_modes() {
+        let (engine, _td) = temp_fs();
+        engine.fs.borrow_mut().arm_mutation_reopen_fence();
 
-        let hook_calls = Arc::new(AtomicUsize::new(0));
-        let hook_calls_for_hook = Arc::clone(&hook_calls);
-        engine.set_readahead_executor_input_hook(move |request| {
-            hook_calls_for_hook.fetch_add(1, Ordering::SeqCst);
-            Some(admitted_readahead_input(
-                request.readahead_offset,
-                request.readahead_len,
-            ))
-        });
+        let mut create = LivePoolAdminRequest::new(LivePoolAdminCommand::DatasetCreate, "tank");
+        create.version = 0;
+        assert_eq!(engine.live_pool_admin_request(&create), Err(Errno::EIO));
 
+        let performance =
+            LivePoolAdminRequest::new(LivePoolAdminCommand::PerformanceAdmissionSnapshot, "tank");
         assert_eq!(
-            engine.read(&fh, 0, 4096, &ctx()).expect("first read").len(),
-            4096
-        );
-        assert_eq!(
-            engine
-                .read(&fh, 4096, 4096, &ctx())
-                .expect("second read")
-                .len(),
-            4096
-        );
-        assert_eq!(
-            engine
-                .read(&fh, 8192, 4096, &ctx())
-                .expect("third read")
-                .len(),
-            4096
+            engine.live_pool_admin_request(&performance),
+            Err(Errno::EIO)
         );
 
-        assert_eq!(hook_calls.load(Ordering::SeqCst), 1);
-        let outcomes = engine.drain_readahead_executor_outcomes();
-        assert_eq!(outcomes.len(), 1);
-        assert_eq!(
-            outcomes[0].executor_record.outcome,
-            PrefetchExecutorOutcome::Started
-        );
-        assert_eq!(outcomes[0].bytes_issued, Some(512 * 1024 - 8192));
-        assert_eq!(
-            outcomes[0].executor_record.action_family,
-            PrefetchExecutorActionFamily::BoundedSequentialReadahead
-        );
-        assert!(
-            !outcomes[0].executor_record.can_satisfy_durable_sync(),
-            "cache-only readahead cannot become durable sync authority"
-        );
+        let rollback = LivePoolAdminRequest::new(LivePoolAdminCommand::SnapshotRollback, "tank");
+        assert_eq!(engine.live_pool_admin_request(&rollback), Err(Errno::EIO));
+
+        let extract = LivePoolAdminRequest::new(LivePoolAdminCommand::SnapshotExtract, "tank");
+        assert_eq!(engine.live_pool_admin_request(&extract), Err(Errno::EIO));
+
+        let send = LivePoolAdminRequest::new(LivePoolAdminCommand::SnapshotSend, "tank");
+        assert_eq!(engine.live_pool_admin_request(&send), Err(Errno::EIO));
+
+        let list = LivePoolAdminRequest::new(LivePoolAdminCommand::DatasetList, "tank");
+        assert!(engine.live_pool_admin_request(&list).is_ok());
+
+        let mut strategy =
+            LivePoolAdminRequest::new(LivePoolAdminCommand::DatasetSetStrategy, "tank");
+        strategy.args = live_admin_args_from_json(json!({ "name": "root", "list": true }));
+        assert!(engine.live_pool_admin_request(&strategy).is_ok());
     }
 
     #[test]
@@ -6892,7 +6677,9 @@ mod tests {
             )
             .expect("open local filesystem");
             let mut engine = VfsLocalFileSystem::new(local_fs);
-            engine.set_timestamp_policy(TimestampPolicy::Strictatime);
+            engine
+                .set_timestamp_policy(TimestampPolicy::Strictatime)
+                .expect("set strict-atime policy");
             let root = engine.get_root_inode(&ctx()).expect("root inode");
             let (attr, fh) = engine
                 .create(root, file_name, 0o644, O_RDWR, &ctx())
@@ -6917,7 +6704,9 @@ mod tests {
             )
             .expect("reopen local filesystem");
             let mut engine = VfsLocalFileSystem::new(local_fs);
-            engine.set_timestamp_policy(TimestampPolicy::Strictatime);
+            engine
+                .set_timestamp_policy(TimestampPolicy::Strictatime)
+                .expect("set strict-atime policy");
             let root = engine.get_root_inode(&ctx()).expect("root inode");
             let before = engine.lookup(root, file_name, &ctx()).expect("lookup file");
             assert_eq!(before.inode_id, inode_id);
@@ -6971,7 +6760,9 @@ mod tests {
             )
             .expect("open local filesystem");
             let mut engine = VfsLocalFileSystem::new(local_fs);
-            engine.set_timestamp_policy(TimestampPolicy::Strictatime);
+            engine
+                .set_timestamp_policy(TimestampPolicy::Strictatime)
+                .expect("set strict-atime policy");
             let root = engine.get_root_inode(&ctx()).expect("root inode");
             let (_attr, fh) = engine
                 .create(root, file_name, 0o644, O_RDWR, &ctx())
@@ -6992,9 +6783,13 @@ mod tests {
                 root_key,
             )
             .expect("reopen local filesystem");
-            local_fs.set_auto_commit(false);
+            local_fs
+                .set_auto_commit(false)
+                .expect("test setup mutation must be admitted");
             let mut engine = VfsLocalFileSystem::new(local_fs);
-            engine.set_timestamp_policy(TimestampPolicy::Strictatime);
+            engine
+                .set_timestamp_policy(TimestampPolicy::Strictatime)
+                .expect("set strict-atime policy");
             let root = engine.get_root_inode(&ctx()).expect("root inode");
             let before = engine.lookup(root, file_name, &ctx()).expect("lookup file");
             let fh = engine
@@ -7670,7 +7465,8 @@ mod tests {
         // Incremental send succeeds only while the base root's objects remain retained.
         let baseline = fs.create_snapshot("baseline").expect("snapshot baseline");
         let baseline_root = baseline.source_root;
-        fs.set_auto_commit(false);
+        fs.set_auto_commit(false)
+            .expect("test setup mutation must be admitted");
         fs.replace_file("/base.txt", b"updated base bytes")
             .expect("replace base");
         fs.create_file("/delta.txt", 0o644).expect("create delta");
@@ -8820,7 +8616,11 @@ mod tests {
         use crate::intent_log::IntentLogEntryKind;
 
         let (engine, _td) = temp_fs();
-        engine.fs.borrow_mut().set_auto_commit(false);
+        engine
+            .fs
+            .borrow_mut()
+            .set_auto_commit(false)
+            .expect("test setup mutation must be admitted");
         let root = engine.get_root_inode(&root_ctx()).unwrap();
 
         let (attr, fh) = engine
@@ -8997,9 +8797,12 @@ mod tests {
     fn create_burst_empty_files_stays_metadata_only_until_write() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut fs = LocalFileSystem::open(dir.path()).expect("open");
-        fs.set_auto_commit(false);
-        fs.set_commit_group_throughput_profile();
-        fs.set_max_uncommitted_mutations(16 * 1024);
+        fs.set_auto_commit(false)
+            .expect("test setup mutation must be admitted");
+        fs.set_commit_group_throughput_profile()
+            .expect("test setup mutation must be admitted");
+        fs.set_max_uncommitted_mutations(16 * 1024)
+            .expect("test setup mutation must be admitted");
         let engine = VfsLocalFileSystem::new(fs);
         let root = engine.get_root_inode(&ctx()).unwrap();
         let caller = RequestCtx {
@@ -9333,7 +9136,11 @@ mod tests {
         let (engine, _td) = temp_fs();
         let root = engine.get_root_inode(&root_ctx()).unwrap();
         let buf = Arc::new(IntentLogBuffer::new());
-        engine.fs.borrow_mut().set_intent_log_buffer(buf.clone());
+        engine
+            .fs
+            .borrow_mut()
+            .set_intent_log_buffer(buf.clone())
+            .expect("test setup mutation must be admitted");
 
         let attr = engine
             .mknod(root, b"null", S_IFCHR | 0o600, 0x0103, &root_ctx())
@@ -11119,8 +10926,14 @@ mod tests {
         engine
             .write(&dest_create, 0, b"abcdefghij", &ctx())
             .unwrap();
-        engine.set_timestamp_policy(TimestampPolicy::Strictatime);
-        engine.fs.borrow_mut().set_auto_commit(false);
+        engine
+            .set_timestamp_policy(TimestampPolicy::Strictatime)
+            .expect("set strict-atime policy");
+        engine
+            .fs
+            .borrow_mut()
+            .set_auto_commit(false)
+            .expect("test setup mutation must be admitted");
         let source_before = engine
             .getattr(source_create.inode_id, None, &ctx())
             .expect("source attr before copy");
@@ -11195,8 +11008,8 @@ mod tests {
             .borrow_mut()
             .set_write_buffer_config(WriteBufferConfig {
                 flush_threshold_bytes: 64,
-                flush_threshold_age: std::time::Duration::from_secs(60),
-            });
+            })
+            .expect("test setup mutation must be admitted");
         let outside_dirty = vec![0x5a; 60];
         engine
             .write(&dest_create, 384, &outside_dirty, &ctx())
@@ -11248,8 +11061,8 @@ mod tests {
             .borrow_mut()
             .set_write_buffer_config(WriteBufferConfig {
                 flush_threshold_bytes: 64,
-                flush_threshold_age: std::time::Duration::from_secs(60),
-            });
+            })
+            .expect("test setup mutation must be admitted");
         let outside_offset = (copy_len + 4096) as u64;
         let outside_dirty = vec![0x7c; 60];
         engine
@@ -12069,11 +11882,16 @@ mod tests {
     #[test]
     fn deferred_copy_file_range_after_fsx075_sparse_truncate_commits_consistently() {
         let (engine, _td) = temp_fs();
-        engine.fs.borrow_mut().set_auto_commit(false);
         engine
             .fs
             .borrow_mut()
-            .set_max_uncommitted_mutations(16 * 1024);
+            .set_auto_commit(false)
+            .expect("test setup mutation must be admitted");
+        engine
+            .fs
+            .borrow_mut()
+            .set_max_uncommitted_mutations(16 * 1024)
+            .expect("test setup mutation must be admitted");
         let root = engine.get_root_inode(&ctx()).unwrap();
         let (_attr, fh) = engine
             .create(
@@ -12235,11 +12053,16 @@ mod tests {
         }
 
         let (engine, _td) = temp_fs();
-        engine.fs.borrow_mut().set_auto_commit(false);
         engine
             .fs
             .borrow_mut()
-            .set_max_uncommitted_mutations(16 * 1024);
+            .set_auto_commit(false)
+            .expect("test setup mutation must be admitted");
+        engine
+            .fs
+            .borrow_mut()
+            .set_max_uncommitted_mutations(16 * 1024)
+            .expect("test setup mutation must be admitted");
         let root = engine.get_root_inode(&ctx()).unwrap();
         let (_attr, fh) = engine
             .create(root, b"fsx075-seed0.bin", 0o644, O_RDWR, &ctx())
@@ -12353,11 +12176,16 @@ mod tests {
         }
 
         let (engine, _td) = temp_fs();
-        engine.fs.borrow_mut().set_auto_commit(false);
         engine
             .fs
             .borrow_mut()
-            .set_max_uncommitted_mutations(16 * 1024);
+            .set_auto_commit(false)
+            .expect("test setup mutation must be admitted");
+        engine
+            .fs
+            .borrow_mut()
+            .set_max_uncommitted_mutations(16 * 1024)
+            .expect("test setup mutation must be admitted");
         let root = engine.get_root_inode(&ctx()).unwrap();
         let (_attr, fh) = engine
             .create(root, b"fsx075-late-sparse-copy.bin", 0o644, O_RDWR, &ctx())
@@ -12486,11 +12314,16 @@ mod tests {
         }
 
         let (engine, _td) = temp_fs();
-        engine.fs.borrow_mut().set_auto_commit(false);
         engine
             .fs
             .borrow_mut()
-            .set_max_uncommitted_mutations(16 * 1024);
+            .set_auto_commit(false)
+            .expect("test setup mutation must be admitted");
+        engine
+            .fs
+            .borrow_mut()
+            .set_max_uncommitted_mutations(16 * 1024)
+            .expect("test setup mutation must be admitted");
         let root = engine.get_root_inode(&ctx()).unwrap();
         let (_attr, fh) = engine
             .create(
@@ -12655,11 +12488,16 @@ mod tests {
         }
 
         let (engine, _td) = temp_fs();
-        engine.fs.borrow_mut().set_auto_commit(false);
         engine
             .fs
             .borrow_mut()
-            .set_max_uncommitted_mutations(16 * 1024);
+            .set_auto_commit(false)
+            .expect("test setup mutation must be admitted");
+        engine
+            .fs
+            .borrow_mut()
+            .set_max_uncommitted_mutations(16 * 1024)
+            .expect("test setup mutation must be admitted");
         let root = engine.get_root_inode(&ctx()).unwrap();
         let (_attr, fh) = engine
             .create(
@@ -12804,11 +12642,16 @@ mod tests {
         }
 
         let (engine, _td) = temp_fs();
-        engine.fs.borrow_mut().set_auto_commit(false);
         engine
             .fs
             .borrow_mut()
-            .set_max_uncommitted_mutations(16 * 1024);
+            .set_auto_commit(false)
+            .expect("test setup mutation must be admitted");
+        engine
+            .fs
+            .borrow_mut()
+            .set_max_uncommitted_mutations(16 * 1024)
+            .expect("test setup mutation must be admitted");
         let root = engine.get_root_inode(&ctx()).unwrap();
         let (_attr, fh) = engine
             .create(root, b"fsx075-qemu-seed0-op120.bin", 0o644, O_RDWR, &ctx())
@@ -14425,7 +14268,8 @@ mod tests {
 
         let canonical = {
             let mut fs = engine.fs.borrow_mut();
-            fs.set_quota_hierarchy(hierarchy);
+            fs.set_quota_hierarchy(hierarchy)
+                .expect("test setup mutation must be admitted");
             fs.statfs().unwrap()
         };
         let st = VfsEngineStatFs::statfs(&engine, &ctx()).unwrap();
@@ -14989,9 +14833,12 @@ mod tests {
     fn xattr_burst_with_deferred_commit_stays_batched_below_threshold() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut fs = LocalFileSystem::open(dir.path()).expect("open");
-        fs.set_auto_commit(false);
-        fs.set_max_uncommitted_mutations(16 * 1024);
-        fs.set_commit_group_throughput_profile();
+        fs.set_auto_commit(false)
+            .expect("test setup mutation must be admitted");
+        fs.set_max_uncommitted_mutations(16 * 1024)
+            .expect("test setup mutation must be admitted");
+        fs.set_commit_group_throughput_profile()
+            .expect("test setup mutation must be admitted");
         let engine = VfsLocalFileSystem::new(fs);
         let root = engine.get_root_inode(&ctx()).unwrap();
         let (attr, _fh) = engine
@@ -15559,88 +15406,6 @@ mod tests {
     }
 
     #[test]
-    fn mutation_entries_refuse_after_uncertain_root_publication() {
-        let (engine, _td) = temp_fs();
-        let root = engine.get_root_inode(&ctx()).expect("root inode");
-        let (source_attr, source_fh) = engine
-            .create(root, b"source", 0o644, O_RDWR, &ctx())
-            .expect("create source");
-        let (_dest_attr, dest_fh) = engine
-            .create(root, b"dest", 0o644, O_RDWR, &ctx())
-            .expect("create destination");
-        engine
-            .write(&source_fh, 0, b"copy source", &ctx())
-            .expect("write source");
-        engine
-            .fs
-            .borrow_mut()
-            .sync_all()
-            .expect("sync stable state");
-        let source_before = engine
-            .getattr(source_attr.inode_id, Some(&source_fh), &ctx())
-            .expect("source attr before uncertainty");
-
-        crate::persistence::inject_next_sync_failure_after_boundary(
-            crate::FilesystemCommitBoundary::RootCommitWritten,
-        );
-        let error = engine
-            .fs
-            .borrow_mut()
-            .create_file("/uncertain", 0o644)
-            .expect_err("inject uncertain root publication");
-        assert!(matches!(
-            error,
-            FileSystemError::PublishOutcomeUncertain { .. }
-        ));
-
-        let next_inode_after_uncertainty = engine.fs.borrow().stats().next_inode_id;
-        let next_intent_after_uncertainty = engine.fs.borrow().intent_log.next_entry_id();
-        let mut mode_update = SetAttr::new();
-        mode_update.valid = FATTR_MODE;
-        mode_update.mode = (source_before.posix.mode & S_IFMT) | 0o600;
-
-        assert_eq!(
-            engine
-                .setattr(source_attr.inode_id, &mode_update, Some(&source_fh), &ctx())
-                .unwrap_err(),
-            Errno::EIO
-        );
-        assert_eq!(
-            engine.tmpfile(root, 0o600, O_RDWR, &ctx()).unwrap_err(),
-            Errno::EIO
-        );
-        assert_eq!(
-            engine
-                .copy_file_range(&source_fh, 0, &dest_fh, 0, source_before.posix.size, &ctx(),)
-                .unwrap_err(),
-            Errno::EIO
-        );
-
-        assert_eq!(
-            engine
-                .getattr(source_attr.inode_id, Some(&source_fh), &ctx())
-                .expect("source attr after refusals")
-                .posix
-                .mode,
-            source_before.posix.mode
-        );
-        assert_eq!(
-            engine.fs.borrow().stats().next_inode_id,
-            next_inode_after_uncertainty
-        );
-        assert_eq!(
-            engine.fs.borrow().intent_log.next_entry_id(),
-            next_intent_after_uncertainty
-        );
-        assert!(engine
-            .fs
-            .borrow()
-            .read_file("/dest")
-            .expect("destination remains readable")
-            .is_empty());
-    }
-
-    #[test]
     fn tmpfile_does_not_publish_directory_entry() {
         let (engine, _td) = temp_fs();
         let root = engine.get_root_inode(&ctx()).unwrap();
@@ -15924,9 +15689,12 @@ mod tests {
     fn unlink_burst_prunes_removed_cached_paths() {
         let td = tempfile::tempdir().expect("tempdir");
         let mut fs = LocalFileSystem::open(td.path()).expect("open");
-        fs.set_auto_commit(false);
-        fs.set_commit_group_throughput_profile();
-        fs.set_max_uncommitted_mutations(16 * 1024);
+        fs.set_auto_commit(false)
+            .expect("test setup mutation must be admitted");
+        fs.set_commit_group_throughput_profile()
+            .expect("test setup mutation must be admitted");
+        fs.set_max_uncommitted_mutations(16 * 1024)
+            .expect("test setup mutation must be admitted");
         let engine = VfsLocalFileSystem::new(fs);
         let root = engine.get_root_inode(&ctx()).unwrap();
         let parent = engine.mkdir(root, b"permname", 0o755, &ctx()).unwrap();
@@ -16491,7 +16259,9 @@ mod tests {
             Box::new(tidefs_inode_table::SystemTimeSource),
         ));
         let mut engine_mut = engine;
-        engine_mut.set_inode_table(inode_table);
+        engine_mut
+            .set_inode_table(inode_table)
+            .expect("set inode prefetch table");
 
         // Open and read the root directory. Prefetch is fire-and-forget;
         // the assertion is that this does not panic or error.
@@ -16530,7 +16300,9 @@ mod tests {
             Box::new(tidefs_inode_table::SystemTimeSource),
         ));
         let mut engine_mut = engine;
-        engine_mut.set_inode_table(inode_table.clone());
+        engine_mut
+            .set_inode_table(inode_table.clone())
+            .expect("set inode prefetch table");
 
         // Open and read.
         let dh = engine_mut.opendir(root, &ctx()).unwrap();
@@ -16636,7 +16408,9 @@ mod tests {
             groups: vec![0],
         };
 
-        engine.set_low_watermark_bytes(u64::MAX);
+        engine
+            .set_low_watermark_bytes(u64::MAX)
+            .expect("test setup mutation must be admitted");
 
         assert_eq!(engine.check_write_admission(1), Err(Errno::ENOSPC));
         assert_eq!(engine.check_write_admission(4096), Err(Errno::ENOSPC));
@@ -16655,7 +16429,9 @@ mod tests {
             groups: vec![0],
         };
 
-        engine.set_low_watermark_bytes(u64::MAX);
+        engine
+            .set_low_watermark_bytes(u64::MAX)
+            .expect("test setup mutation must be admitted");
 
         // At the VfsEngine level, check_write_admission checks data writes.
         // The pool-level bypass for metadata is tested in pool/mod.rs.
@@ -16688,7 +16464,9 @@ mod tests {
         engine.flush(&fh, &ctx).expect("flush");
 
         // Now set watermark to block all subsequent data writes.
-        engine.set_low_watermark_bytes(u64::MAX);
+        engine
+            .set_low_watermark_bytes(u64::MAX)
+            .expect("test setup mutation must be admitted");
 
         // check_write_admission should reject.
         assert_eq!(engine.check_write_admission(1), Err(Errno::ENOSPC));

@@ -3,31 +3,30 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use tidefs_local_object_store::{
-    checksum64, pool::Pool, CrashInjectionPoint, LocalObjectStore, ObjectKey, ObjectLocation,
+    checksum64,
+    pool::{is_strict_read_authority_error, Pool},
+    CrashInjectionPoint, DeviceIoClass, IntegrityDigest64, LocalObjectStore, ObjectKey,
+    ObjectLocation, StoreError,
 };
 use tidefs_types_vfs_core::{Generation, InodeId, NodeKind, ROOT_INODE_ID};
 
-use crate::allocation::next_generation_after;
 use crate::allocation_bytes;
 use crate::constants::*;
-use crate::content::MountedContentReadAuthority;
 use crate::content_allocation_entries_for_state;
 use crate::crash_hooks::check_crash_hook;
-use crate::dedup::DedupIndex;
 use crate::encoding::*;
 use crate::error::FileSystemError;
 use crate::helpers::*;
 use crate::intent_log::{
-    replay_entry, replay_uncommitted as replay_uncommitted_raw, IntentLog, IntentLogEntryKind,
-    IntentLogRootAnchor,
+    replay_uncommitted, replay_uncommitted_with_pool, IntentLog, IntentLogRootAnchor,
 };
 use crate::merge_allocation_entries;
 use crate::object_keys::*;
+use crate::persistence::{persist_state_with_pool, root_slot_for_transaction};
 use crate::read_content_from_store;
 use crate::read_content_layout_from_store;
 use crate::records::*;
 use crate::types::*;
-use crate::write_chunked_content;
 use crate::{is_skippable_recovery_error, is_skippable_store_error};
 use crate::{
     transaction_manifest_entries_for_existing_content,
@@ -97,55 +96,48 @@ fn namespace_entry_matches_target_inode(entry: &NamespaceEntry, target: &InodeRe
 
 pub(crate) struct RootSelection {
     report: RecoveryProbeReport,
-    root: Option<RootCommitRecord>,
     state: Option<FileSystemState>,
+    selected_root: Option<CommittedRootSummary>,
 }
 
-pub(crate) struct MountedRecoveryState {
-    pub(crate) state: FileSystemState,
-    pub(crate) committed_replay_base: CommittedReplayBase,
-    pub(crate) root_anchor: IntentLogRootAnchor,
-    pub(crate) replayed_intent_entry_id: Option<u64>,
-    pub(crate) intent_log: IntentLog,
+#[derive(Clone)]
+struct QuorumRootCandidate {
+    root: RootCommitRecord,
+    supporting_store_indices: BTreeSet<usize>,
 }
 
-pub(crate) struct PoolReplayOutcome {
-    pub(crate) replayed_count: u64,
-    pub(crate) examined_through_entry_id: Option<u64>,
+struct QuorumRootCandidateScan {
+    roots_by_transaction: BTreeMap<u64, Vec<QuorumRootCandidate>>,
+    root_slots_seen: u64,
+    root_candidate_locations_seen: u64,
+    skipped_root_candidates: u64,
+    checked_transaction_manifests: u64,
+    first_candidate_io_error: Option<FileSystemError>,
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct CommittedReplayBase {
-    inodes: Arc<BTreeMap<InodeId, InodeRecord>>,
+#[derive(Clone)]
+struct ValidatedCommittedRoot {
+    candidate: QuorumRootCandidate,
+    state: FileSystemState,
 }
 
-impl CommittedReplayBase {
-    pub(crate) fn from_state(state: &FileSystemState) -> Self {
-        Self {
-            inodes: Arc::clone(&state.inodes),
-        }
-    }
-
-    pub(crate) fn inode(&self, inode_id: InodeId) -> Option<&InodeRecord> {
-        self.inodes.get(&inode_id)
-    }
-}
-
-pub(crate) fn intent_log_anchor_for_root(root: &RootCommitRecord) -> IntentLogRootAnchor {
-    IntentLogRootAnchor {
-        transaction_id: root.transaction_id,
-        generation: root.generation,
-        manifest_digest: root.manifest_checksum,
-    }
+struct RecoveryAuditDetails {
+    report: RecoveryAuditReport,
+    validated_roots: Vec<ValidatedCommittedRoot>,
+    quorum_candidates: Vec<QuorumRootCandidate>,
 }
 
 trait CommittedRootRecoverySource {
     fn raw_store(&self) -> &LocalObjectStore;
+
     fn load_committed_state(
         &mut self,
         root: &RootCommitRecord,
+        supporting_store_indices: &BTreeSet<usize>,
         root_authentication_key: RootAuthenticationKey,
     ) -> Result<FileSystemState>;
+
+    fn read_current_content_for_retention(&self, key: ObjectKey) -> Result<Option<Vec<u8>>>;
 }
 
 impl CommittedRootRecoverySource for LocalObjectStore {
@@ -156,9 +148,19 @@ impl CommittedRootRecoverySource for LocalObjectStore {
     fn load_committed_state(
         &mut self,
         root: &RootCommitRecord,
+        supporting_store_indices: &BTreeSet<usize>,
         root_authentication_key: RootAuthenticationKey,
     ) -> Result<FileSystemState> {
-        load_state_from_transaction(self, root, root_authentication_key)
+        load_state_from_transaction_store_candidate(
+            self,
+            root,
+            supporting_store_indices,
+            root_authentication_key,
+        )
+    }
+
+    fn read_current_content_for_retention(&self, key: ObjectKey) -> Result<Option<Vec<u8>>> {
+        Ok(self.get(key)?)
     }
 }
 
@@ -170,24 +172,39 @@ impl CommittedRootRecoverySource for Pool {
     fn load_committed_state(
         &mut self,
         root: &RootCommitRecord,
+        supporting_store_indices: &BTreeSet<usize>,
         root_authentication_key: RootAuthenticationKey,
     ) -> Result<FileSystemState> {
-        load_state_from_transaction_pool(self, root, root_authentication_key)
+        load_state_from_transaction_pool_candidate(
+            self,
+            root,
+            supporting_store_indices,
+            root_authentication_key,
+        )
+        .map_err(pool_candidate_content_error)
+    }
+
+    fn read_current_content_for_retention(&self, key: ObjectKey) -> Result<Option<Vec<u8>>> {
+        self.get_with_current_receipt(DeviceIoClass::Data, key)
+            .map(|content| content.map(|(bytes, _receipt)| bytes))
+            .map_err(FileSystemError::from)
             .map_err(pool_candidate_content_error)
     }
 }
 
 fn pool_candidate_content_error(error: FileSystemError) -> FileSystemError {
-    if matches!(
-        &error,
+    let is_content_authority_failure = match &error {
+        FileSystemError::Store(store_error) => is_strict_read_authority_error(store_error),
         FileSystemError::ReceiptAuthorityUnavailable { .. }
-            | FileSystemError::ReceiptAuthorityMissing { .. }
-            | FileSystemError::ReceiptAuthorityStale { .. }
-            | FileSystemError::ReceiptAuthoritySynthetic { .. }
-            | FileSystemError::ReceiptAuthorityMalformedPolicy { .. }
-            | FileSystemError::ReceiptAuthorityUnderWidth { .. }
-            | FileSystemError::ReceiptAuthorityOverWidth { .. }
-    ) {
+        | FileSystemError::ReceiptAuthorityMissing { .. }
+        | FileSystemError::ReceiptAuthorityStale { .. }
+        | FileSystemError::ReceiptAuthoritySynthetic { .. }
+        | FileSystemError::ReceiptAuthorityMalformedPolicy { .. }
+        | FileSystemError::ReceiptAuthorityUnderWidth { .. }
+        | FileSystemError::ReceiptAuthorityOverWidth { .. } => true,
+        _ => false,
+    };
+    if is_content_authority_failure {
         FileSystemError::CorruptState {
             reason: "committed root content lacks current Pool placement authority",
         }
@@ -196,416 +213,41 @@ fn pool_candidate_content_error(error: FileSystemError) -> FileSystemError {
     }
 }
 
-#[derive(Debug)]
-struct PoolReplayWrite {
-    offset: u64,
-    length: u64,
-    data: Vec<u8>,
+fn is_candidate_local_store_io(error: &StoreError) -> bool {
+    matches!(error, StoreError::Io { .. })
 }
 
-/// Replay data intents against a strictly Pool-authorized committed base.
-///
-/// Intent records and their payloads remain raw recovery metadata. Payload
-/// bytes become live only after length/digest validation, reconstruction
-/// against the current receipt-backed base, semantic validation of the whole
-/// selected suffix, and receipt-producing Pool placement before a later
-/// transaction can publish them.
-pub(crate) fn replay_uncommitted_with_pool(
-    log: &IntentLog,
-    state: &mut FileSystemState,
-    committed_replay_base: &CommittedReplayBase,
-    preferred_pool_base: Option<&CommittedReplayBase>,
-    already_examined_through_entry_id: Option<u64>,
-    pool: &mut Pool,
-    selected_root: &IntentLogRootAnchor,
-) -> Result<PoolReplayOutcome> {
-    let examined_through_entry_id = log.pending_entries().last().map(|entry| entry.entry_id);
-    let entries = log
-        .pending_entries()
-        .iter()
-        .filter(|entry| {
-            already_examined_through_entry_id
-                .map(|entry_id| entry.entry_id > entry_id)
-                .unwrap_or(true)
-        })
-        .filter_map(
-            |entry| match intent_entry_matches_selected_root(entry, selected_root) {
-                Ok(true) => Some(Ok(entry)),
-                Ok(false) => None,
-                Err(error) => Some(Err(error)),
-            },
-        )
-        .collect::<Result<Vec<_>>>()?;
-    if entries.is_empty() {
-        return Ok(PoolReplayOutcome {
-            replayed_count: 0,
-            examined_through_entry_id,
-        });
-    }
-    let mut writes: BTreeMap<InodeId, Vec<PoolReplayWrite>> = BTreeMap::new();
-    let mut replayed_content: BTreeMap<InodeId, Vec<u8>> = BTreeMap::new();
-    let mut validated_payloads = BTreeMap::new();
-    let mut replayed = 0_u64;
-    let replay_generation =
-        next_generation_after(entries.iter().fold(state.generation, |generation, entry| {
-            generation
-                .max(entry.root_anchor.generation)
-                .max(entry.root_anchor.transaction_id)
-        }));
-
-    // Authenticate every selected external payload before any replay write or
-    // state mutation. A corrupt later entry must not partially apply an
-    // earlier entry or create receipt-backed content that no root may publish.
-    for entry in &entries {
-        let (length, payload_digest) = match &entry.entry_kind {
-            IntentLogEntryKind::SyncWriteRange {
-                length,
-                payload_digest,
-                ..
-            }
-            | IntentLogEntryKind::OdsyncDataRange {
-                length,
-                payload_digest,
-                ..
-            }
-            | IntentLogEntryKind::SharedMmapMsync {
-                length,
-                payload_digest,
-                ..
-            } => (*length, *payload_digest),
-            _ => continue,
-        };
-        let data = pool
-            .raw_primary_store()
-            .get(intent_log_data_object_key(entry.entry_id))?
-            .ok_or(FileSystemError::CorruptState {
-                reason: "Pool intent replay is missing its data payload",
-            })?;
-        if usize::try_from(length).ok() != Some(data.len()) {
-            return Err(FileSystemError::CorruptState {
-                reason: "Pool intent replay payload length does not match its record",
-            });
-        }
-        if checksum64(&data) != payload_digest {
-            return Err(FileSystemError::CorruptState {
-                reason: "Pool intent replay payload checksum does not match its record",
-            });
-        }
-        validated_payloads.insert(entry.entry_id, data);
-    }
-
-    for entry in entries {
-        match &entry.entry_kind {
-            IntentLogEntryKind::SyncWriteRange {
-                inode_id,
-                offset,
-                length,
-                ..
-            }
-            | IntentLogEntryKind::OdsyncDataRange {
-                inode_id,
-                offset,
-                length,
-                ..
-            }
-            | IntentLogEntryKind::SharedMmapMsync {
-                inode_id,
-                offset,
-                length,
-                ..
-            } => {
-                let data = validated_payloads.remove(&entry.entry_id).ok_or(
-                    FileSystemError::CorruptState {
-                        reason: "Pool intent replay lost a validated data payload",
-                    },
-                )?;
-                writes.entry(*inode_id).or_default().push(PoolReplayWrite {
-                    offset: *offset,
-                    length: *length,
-                    data,
-                });
-            }
-            IntentLogEntryKind::MetadataSetattrIntent(_) => {
-                replayed = replayed.saturating_add(flush_pool_replay_writes(
-                    &mut writes,
-                    &mut replayed_content,
-                    state,
-                    committed_replay_base,
-                    preferred_pool_base,
-                    pool,
-                    replay_generation,
-                )?);
-                replay_pool_metadata_setattr(
-                    entry,
-                    state,
-                    committed_replay_base,
-                    preferred_pool_base,
-                    &mut replayed_content,
-                    pool,
-                    replay_generation,
-                )?;
-                replayed = replayed.saturating_add(1);
-            }
-            _ => {
-                replay_entry(entry, state, pool.raw_primary_store_mut())?;
-                replayed = replayed.saturating_add(1);
-            }
-        }
-    }
-
-    replayed = replayed.saturating_add(flush_pool_replay_writes(
-        &mut writes,
-        &mut replayed_content,
-        state,
-        committed_replay_base,
-        preferred_pool_base,
-        pool,
-        replay_generation,
-    )?);
-    publish_pool_replayed_content(pool, state, &replayed_content)?;
-    if replayed > 0 {
-        state.generation = replay_generation;
-    }
-    Ok(PoolReplayOutcome {
-        replayed_count: replayed,
-        examined_through_entry_id,
-    })
-}
-
-fn intent_entry_matches_selected_root(
-    entry: &crate::intent_log::IntentLogEntry,
-    selected_root: &IntentLogRootAnchor,
-) -> Result<bool> {
-    if entry.root_anchor.transaction_id <= selected_root.transaction_id {
-        return Ok(false);
-    }
-    if selected_root.manifest_digest.is_zero()
-        || entry.root_anchor.manifest_digest.is_zero()
-        || entry.root_anchor.manifest_digest != selected_root.manifest_digest
-        || entry.root_anchor.generation <= selected_root.generation
+fn validate_superblock_format_compatibility(superblock: &SuperblockRecord) -> Result<()> {
+    if superblock.format_version_min == 0
+        || superblock.format_version_max == 0
+        || superblock.format_version_min > superblock.format_version_max
     {
         return Err(FileSystemError::CorruptState {
-            reason: "intent log anchor does not match the selected committed root",
+            reason: "superblock contains an invalid format-version range",
         });
     }
-    Ok(true)
-}
-
-fn flush_pool_replay_writes(
-    writes: &mut BTreeMap<InodeId, Vec<PoolReplayWrite>>,
-    replayed_content: &mut BTreeMap<InodeId, Vec<u8>>,
-    state: &mut FileSystemState,
-    committed_replay_base: &CommittedReplayBase,
-    preferred_pool_base: Option<&CommittedReplayBase>,
-    pool: &mut Pool,
-    replay_generation: u64,
-) -> Result<u64> {
-    let mut replayed = 0_u64;
-    for (inode_id, inode_writes) in std::mem::take(writes) {
-        if inode_writes.is_empty() {
-            continue;
-        }
-        let mut record =
-            state
-                .inodes
-                .get(&inode_id)
-                .cloned()
-                .ok_or(FileSystemError::CorruptState {
-                    reason: "Pool intent replay references a missing inode",
-                })?;
-        let mut content = match replayed_content.get(&inode_id) {
-            Some(content) => content.clone(),
-            None => {
-                pool_replay_base_bytes(pool, committed_replay_base, preferred_pool_base, inode_id)?
-            }
-        };
-        let current_size =
-            usize::try_from(record.size).map_err(|_| FileSystemError::SizeOverflow {
-                requested: record.size,
-            })?;
-        content.resize(current_size, 0);
-        let new_end = inode_writes.iter().try_fold(0_u64, |end, write| {
-            write
-                .offset
-                .checked_add(write.length)
-                .map(|write_end| end.max(write_end))
-                .ok_or(FileSystemError::SizeOverflow {
-                    requested: u64::MAX,
-                })
-        })?;
-        let new_size = record.size.max(new_end);
-        let new_size_usize =
-            usize::try_from(new_size).map_err(|_| FileSystemError::SizeOverflow {
-                requested: new_size,
-            })?;
-        content.resize(new_size_usize, 0);
-        for write in &inode_writes {
-            let start =
-                usize::try_from(write.offset).map_err(|_| FileSystemError::SizeOverflow {
-                    requested: write.offset,
-                })?;
-            let end = start
-                .checked_add(write.data.len())
-                .ok_or(FileSystemError::SizeOverflow {
-                    requested: u64::MAX,
-                })?;
-            if end > content.len() {
-                return Err(FileSystemError::CorruptState {
-                    reason: "Pool intent replay payload exceeds its declared range",
-                });
-            }
-            content[start..end].copy_from_slice(&write.data);
-        }
-
-        record.size = new_size;
-        record.data_version = replay_generation;
-        record.metadata_version = replay_generation;
-        Arc::make_mut(&mut state.inodes).insert(inode_id, record);
-        state.dirty_inodes.insert(inode_id);
-        state.dirty_content.insert(inode_id);
-        replayed_content.insert(inode_id, content);
-        replayed = replayed.saturating_add(inode_writes.len() as u64);
-    }
-    Ok(replayed)
-}
-
-fn pool_replay_base_bytes(
-    pool: &Pool,
-    committed_replay_base: &CommittedReplayBase,
-    preferred_pool_base: Option<&CommittedReplayBase>,
-    inode_id: InodeId,
-) -> Result<Vec<u8>> {
-    if let Some(record) = preferred_pool_base.and_then(|base| base.inode(inode_id)) {
-        return MountedContentReadAuthority::new(pool).read_all_current(inode_id, record);
-    }
-    match committed_replay_base.inode(inode_id) {
-        Some(record) => MountedContentReadAuthority::new(pool).read_all_current(inode_id, record),
-        None => Ok(Vec::new()),
-    }
-}
-
-fn replay_pool_metadata_setattr(
-    entry: &crate::intent_log::IntentLogEntry,
-    state: &mut FileSystemState,
-    committed_replay_base: &CommittedReplayBase,
-    preferred_pool_base: Option<&CommittedReplayBase>,
-    replayed_content: &mut BTreeMap<InodeId, Vec<u8>>,
-    pool: &mut Pool,
-    replay_generation: u64,
-) -> Result<()> {
-    let IntentLogEntryKind::MetadataSetattrIntent(updated) = &entry.entry_kind else {
-        return Err(FileSystemError::CorruptState {
-            reason: "Pool setattr replay received a non-setattr intent",
+    if CURRENT_FORMAT_VERSION < superblock.format_version_min
+        || CURRENT_FORMAT_VERSION < superblock.format_version_max
+    {
+        return Err(FileSystemError::FormatVersionIncompatible {
+            running_version: CURRENT_FORMAT_VERSION,
+            filesystem_min: superblock.format_version_min,
+            filesystem_max: superblock.format_version_max,
         });
-    };
-    let current = state
-        .inodes
-        .get(&updated.inode_id)
-        .ok_or(FileSystemError::CorruptState {
-            reason: "Pool setattr replay references a missing inode",
-        })?;
-    let content_changed =
-        current.size != updated.size || current.data_version != updated.data_version;
-    let mut content = if content_changed && updated.is_file_like() {
-        Some(match replayed_content.get(&updated.inode_id) {
-            Some(content) => content.clone(),
-            None => pool_replay_base_bytes(
-                pool,
-                committed_replay_base,
-                preferred_pool_base,
-                updated.inode_id,
-            )?,
-        })
-    } else {
-        None
-    };
-
-    let mut adjusted_entry = entry.clone();
-    let IntentLogEntryKind::MetadataSetattrIntent(adjusted) = &mut adjusted_entry.entry_kind else {
-        unreachable!("entry kind was checked above")
-    };
-    adjusted.metadata_version = replay_generation;
-    if content_changed {
-        adjusted.data_version = replay_generation;
-    }
-    if let Some(content) = &mut content {
-        let size = usize::try_from(adjusted.size).map_err(|_| FileSystemError::SizeOverflow {
-            requested: adjusted.size,
-        })?;
-        content.resize(size, 0);
-    }
-    let adjusted = adjusted.clone();
-
-    replay_entry(&adjusted_entry, state, pool.raw_primary_store_mut())?;
-    if let Some(content) = content {
-        replayed_content.insert(adjusted.inode_id, content);
     }
     Ok(())
 }
 
-/// Validate the complete replay result before creating any receipt-backed
-/// content. A semantically invalid later intent must not strand Pool objects
-/// from an earlier otherwise-valid write in the same selected suffix.
-fn publish_pool_replayed_content(
-    pool: &mut Pool,
-    state: &FileSystemState,
-    replayed_content: &BTreeMap<InodeId, Vec<u8>>,
-) -> Result<()> {
-    validate_loaded_namespace_state(&state.inodes, &state.directories)?;
-    for record in state.inodes.values().filter(|record| record.is_file_like()) {
-        if let Some(content) = replayed_content.get(&record.inode_id) {
-            let expected_len =
-                usize::try_from(record.size).map_err(|_| FileSystemError::SizeOverflow {
-                    requested: record.size,
-                })?;
-            if content.len() != expected_len {
-                return Err(FileSystemError::CorruptState {
-                    reason: "Pool intent replay staged content length does not match its inode",
-                });
-            }
-        } else {
-            let _ =
-                MountedContentReadAuthority::new(pool).read_all_current(record.inode_id, record)?;
-        }
-    }
-    if replayed_content.keys().any(|inode_id| {
-        !state
-            .inodes
-            .get(inode_id)
-            .is_some_and(|record| record.is_file_like())
-    }) {
-        return Err(FileSystemError::CorruptState {
-            reason: "Pool intent replay staged content without a file-like inode",
-        });
-    }
-
-    for (inode_id, content) in replayed_content {
-        let record = state
-            .inodes
-            .get(inode_id)
-            .expect("staged replay inode was prevalidated");
-        write_pool_replay_content(pool, state, record, content)?;
-    }
-    Ok(())
+fn retired_v0390_fixed_superblock_marker_present(store: &LocalObjectStore) -> Result<bool> {
+    Ok(store
+        .get(retired_v0390_fixed_superblock_object_key())?
+        .is_some())
 }
 
-fn write_pool_replay_content(
-    pool: &mut Pool,
-    state: &FileSystemState,
-    record: &InodeRecord,
-    content: &[u8],
-) -> Result<()> {
-    let compression_policy = state.content_compression_policy.clone();
-    let mut pool_store = pool.primary_store_mut();
-    write_chunked_content(
-        false,
-        &mut pool_store,
-        record,
-        content,
-        &mut DedupIndex::new(),
-        None,
-        &compression_policy,
-    )
+fn retired_v0390_fixed_superblock_error() -> FileSystemError {
+    FileSystemError::CorruptState {
+        reason: RETIRED_V0390_FIXED_SUPERBLOCK_REFUSAL_REASON,
+    }
 }
 
 pub(crate) fn load_latest_committed_state(
@@ -613,107 +255,113 @@ pub(crate) fn load_latest_committed_state(
     root_authentication_key: RootAuthenticationKey,
     policy: RecoveryPolicy,
 ) -> Result<Option<FileSystemState>> {
-    let selection = select_latest_committed_root_from_source(store, root_authentication_key)?;
-    let Some((root, mut state)) = selected_root_and_state(selection)? else {
-        return Ok(None);
-    };
-    if policy.allows_replay() {
-        let log = IntentLog::load(store)?;
-        check_crash_hook(CrashInjectionPoint::RecoveryBeforeReplay);
-        if log.replay_is_needed(root.transaction_id) {
-            let count = replay_uncommitted_raw(&log, &mut state, store, root.transaction_id)?;
-            check_crash_hook(CrashInjectionPoint::RecoveryAfterReplay);
-            if count > 0 {
+    let selection = select_latest_committed_root(store, root_authentication_key)?;
+    match selection.report.outcome {
+        RecoveryProbeOutcome::SelectedCommittedRoot => {
+            let mut state = selection.state.ok_or(FileSystemError::CorruptState {
+                reason: "recovery selected a committed root without decoded state",
+            })?;
+            // After selecting the newest valid committed root, replay any
+            // uncommitted intent log entries (fsynced data that survived
+            // a crash but was never promoted to a transaction group commit).
+            let since_tx = selection.report.selected_transaction_id.unwrap_or(0);
+            if policy.allows_replay() {
+                let log = IntentLog::load(store)?;
+                check_crash_hook(CrashInjectionPoint::RecoveryBeforeReplay);
+                if log.replay_is_needed(since_tx) {
+                    let count = replay_uncommitted(&log, &mut state, store, since_tx)?;
+                    check_crash_hook(CrashInjectionPoint::RecoveryAfterReplay);
+                    if count > 0 {
+                        eprintln!(
+                            "recovery: replayed {count} uncommitted intent log entries after transaction {since_tx}"
+                        );
+                    }
+                }
+            } else {
                 eprintln!(
-                    "recovery: replayed {count} uncommitted intent log entries after transaction {}",
-                    root.transaction_id
+                    "recovery: policy={} skips intent-log replay after tx {since_tx}",
+                    policy.label(),
                 );
             }
+            Ok(Some(state))
         }
-    } else {
-        eprintln!(
-            "recovery: policy={} skips intent-log replay after tx {}",
-            policy.label(),
-            root.transaction_id,
-        );
+        RecoveryProbeOutcome::EmptyStore => {
+            if retired_v0390_fixed_superblock_marker_present(store)? {
+                Err(retired_v0390_fixed_superblock_error())
+            } else {
+                Ok(None)
+            }
+        }
+        RecoveryProbeOutcome::ExplicitIntegrityOrMediaError => Err(FileSystemError::CorruptState {
+            reason: "root slots exist but no valid committed root could be selected",
+        }),
     }
-    Ok(Some(state))
 }
 
+/// Select a mounted recovery root only when its committed content remains
+/// readable through current Pool placement authority.
 pub(crate) fn load_latest_committed_state_pool(
     pool: &mut Pool,
     root_authentication_key: RootAuthenticationKey,
     policy: RecoveryPolicy,
-) -> Result<Option<MountedRecoveryState>> {
+) -> Result<Option<FileSystemState>> {
     let selection = select_latest_committed_root_from_source(pool, root_authentication_key)?;
-    let Some((root, committed_state)) = selected_root_and_state(selection)? else {
-        return Ok(None);
-    };
-    let root_anchor = intent_log_anchor_for_root(&root);
-    // Load the durable log exactly once. Replay and the mounted instance must
-    // share one view; substituting an empty log after successful replay can
-    // strand the high-water marker and collide with durable entry ids.
-    let intent_log = IntentLog::load(pool.raw_primary_store())?;
-    let mut committed_replay_base = CommittedReplayBase::from_state(&committed_state);
-    let mut state = committed_state.clone();
-    let replayed_intent_entry_id = if policy.allows_replay() {
-        check_crash_hook(CrashInjectionPoint::RecoveryBeforeReplay);
-        let outcome = replay_uncommitted_with_pool(
-            &intent_log,
-            &mut state,
-            &committed_replay_base,
-            None,
-            None,
-            pool,
-            &root_anchor,
-        )?;
-        check_crash_hook(CrashInjectionPoint::RecoveryAfterReplay);
-        if outcome.replayed_count > 0 {
-            eprintln!(
-                "recovery: replayed {} uncommitted intent log entries after transaction {}",
-                outcome.replayed_count, root.transaction_id
-            );
-        }
-        if outcome.examined_through_entry_id.is_some() {
-            // Future suffix replay must reconstruct unaffected ranges from the
-            // exact receipt-backed state at this high-water mark, not from the
-            // older selected root or mutable live state.
-            committed_replay_base = CommittedReplayBase::from_state(&state);
-        }
-        outcome.examined_through_entry_id
-    } else {
-        eprintln!(
-            "recovery: policy={} skips intent-log replay after tx {}",
-            policy.label(),
-            root.transaction_id,
-        );
-        None
-    };
-    Ok(Some(MountedRecoveryState {
-        state,
-        committed_replay_base,
-        root_anchor,
-        replayed_intent_entry_id,
-        intent_log,
-    }))
-}
-
-fn selected_root_and_state(
-    selection: RootSelection,
-) -> Result<Option<(RootCommitRecord, FileSystemState)>> {
     match selection.report.outcome {
         RecoveryProbeOutcome::SelectedCommittedRoot => {
-            let root = selection.root.ok_or(FileSystemError::CorruptState {
-                reason: "recovery selected a committed root without its root record",
-            })?;
-            let state = selection.state.ok_or(FileSystemError::CorruptState {
+            let mut state = selection.state.ok_or(FileSystemError::CorruptState {
                 reason: "recovery selected a committed root without decoded state",
             })?;
-            Ok(Some((root, state)))
+            if !policy.allows_replay() {
+                return Ok(Some(state));
+            }
+            let selected_root =
+                selection
+                    .selected_root
+                    .as_ref()
+                    .ok_or(FileSystemError::CorruptState {
+                        reason: "recovery selected state without exact committed-root identity",
+                    })?;
+            let committed_base = IntentLogRootAnchor::from_committed_root_summary(selected_root);
+            let since_tx = committed_base.transaction_id;
+            let mut log = IntentLog::load(pool.raw_primary_store())?;
+            if log.replay_is_needed(since_tx) {
+                check_crash_hook(CrashInjectionPoint::RecoveryBeforeReplay);
+                let count = replay_uncommitted_with_pool(&log, &mut state, pool, &committed_base)?;
+                check_crash_hook(CrashInjectionPoint::RecoveryAfterReplay);
+                if count > 0 {
+                    persist_state_with_pool(pool, &state, root_authentication_key)?;
+                    let generation = state.generation;
+                    for inode_id in state.dirty_inodes.iter().copied() {
+                        state.last_inode_write_tx.insert(inode_id, generation);
+                    }
+                    for inode_id in state.dirty_dirs.iter().copied() {
+                        state.last_dir_write_tx.insert(inode_id, generation);
+                    }
+                    state.dirty_content.clear();
+                    state.dirty_inodes.clear();
+                    state.dirty_dirs.clear();
+                    eprintln!(
+                        "recovery: replayed {count} intent log entries through Pool authority after transaction {since_tx}"
+                    );
+                }
+            }
+            // A selected root at or beyond every remaining anchor already
+            // contains those intents. Clearing after root publication is
+            // retry-safe when a prior mount crashed between the two steps.
+            if !log.is_empty() {
+                log.clear(pool.raw_primary_store_mut())?;
+            }
+            Ok(Some(state))
         }
-        RecoveryProbeOutcome::EmptyStore => Ok(None),
+        RecoveryProbeOutcome::EmptyStore => {
+            if retired_v0390_fixed_superblock_marker_present(pool.raw_primary_store())? {
+                Err(retired_v0390_fixed_superblock_error())
+            } else {
+                Ok(None)
+            }
+        }
         RecoveryProbeOutcome::ExplicitIntegrityOrMediaError => Err(FileSystemError::CorruptState {
-            reason: "root slots exist but no valid committed root could be selected",
+            reason: "root slots exist but no Pool-authorized committed root could be selected",
         }),
     }
 }
@@ -722,81 +370,101 @@ pub(crate) fn recovery_probe_from_store(
     store: &mut LocalObjectStore,
     root_authentication_key: RootAuthenticationKey,
 ) -> Result<RecoveryProbeReport> {
-    select_latest_committed_root(store, root_authentication_key).map(|selection| selection.report)
+    let mut report = select_latest_committed_root(store, root_authentication_key)?.report;
+    if report.outcome == RecoveryProbeOutcome::EmptyStore
+        && retired_v0390_fixed_superblock_marker_present(store)?
+    {
+        report.outcome = RecoveryProbeOutcome::ExplicitIntegrityOrMediaError;
+    }
+    Ok(report)
 }
 
 pub(crate) fn audit_recovery_store(
     store: &mut LocalObjectStore,
     root_authentication_key: RootAuthenticationKey,
 ) -> Result<RecoveryAuditReport> {
-    let mut report = RecoveryAuditReport::empty();
-    let mut best: Option<CommittedRootSummary> = None;
+    Ok(audit_recovery_source_details(store, root_authentication_key)?.report)
+}
 
-    for slot in 0..FILESYSTEM_ROOT_SLOT_COUNT {
-        let slot_key = root_slot_object_key(slot);
-        let locations = store.version_locations_of(slot_key);
-        if locations.is_empty() {
+pub(crate) fn audit_recovery_pool(
+    pool: &mut Pool,
+    root_authentication_key: RootAuthenticationKey,
+) -> Result<RecoveryAuditReport> {
+    Ok(audit_recovery_source_details(pool, root_authentication_key)?.report)
+}
+
+fn audit_recovery_source_details<S: CommittedRootRecoverySource>(
+    source: &mut S,
+    root_authentication_key: RootAuthenticationKey,
+) -> Result<RecoveryAuditDetails> {
+    let scan = scan_quorum_root_candidates(source)?;
+    if let Some(error) = scan.first_candidate_io_error {
+        return Err(error);
+    }
+    let mut report = RecoveryAuditReport::empty();
+    report.root_slots_seen = scan.root_slots_seen;
+    report.root_candidates_seen = scan.root_candidate_locations_seen;
+    report.invalid_root_candidates = scan.skipped_root_candidates;
+    report.checked_transaction_manifests = scan.checked_transaction_manifests;
+
+    let mut protected_slots = BTreeSet::new();
+    let mut validated_roots = Vec::new();
+    let mut quorum_candidates = Vec::new();
+
+    for (_transaction_id, candidates) in scan.roots_by_transaction.into_iter().rev() {
+        quorum_candidates.extend(candidates.iter().cloned());
+        if candidates
+            .first()
+            .is_some_and(|candidate| protected_slots.contains(&candidate.root.slot))
+        {
             continue;
         }
-        report.root_slots_seen = report.root_slots_seen.saturating_add(1);
 
-        for location in locations.into_iter().rev() {
-            report.root_candidates_seen = report.root_candidates_seen.saturating_add(1);
-            let bytes = match store.get_at_location(location) {
-                Ok(bytes) => bytes,
-                Err(err) if is_skippable_store_error(&err) => {
-                    report.invalid_root_candidates =
-                        report.invalid_root_candidates.saturating_add(1);
-                    continue;
-                }
-                Err(err) => return Err(FileSystemError::from(err)),
-            };
-            let root = match decode_root_commit(&bytes) {
-                Ok(root) => root,
-                Err(_) => {
-                    report.invalid_root_candidates =
-                        report.invalid_root_candidates.saturating_add(1);
-                    continue;
-                }
-            };
-            if root.slot != slot || root.transaction_id < ROOT_COMMIT_MIN_TRANSACTION_ID {
-                report.invalid_root_candidates = report.invalid_root_candidates.saturating_add(1);
-                continue;
-            }
-            if root.has_manifest() {
-                report.checked_transaction_manifests =
-                    report.checked_transaction_manifests.saturating_add(1);
-            }
-            match load_state_from_transaction(store, &root, root_authentication_key) {
-                Ok(_state) => {
-                    let summary = root.summary();
-                    if best
-                        .as_ref()
-                        .map(|current| summary.transaction_id > current.transaction_id)
-                        .unwrap_or(true)
-                    {
-                        best = Some(summary.clone());
-                    }
-                    report.valid_committed_roots.push(summary);
-                    break;
+        let mut validated_for_transaction = Vec::new();
+        for candidate in candidates {
+            match source.load_committed_state(
+                &candidate.root,
+                &candidate.supporting_store_indices,
+                root_authentication_key,
+            ) {
+                Ok(state) => {
+                    validated_for_transaction.push(ValidatedCommittedRoot { candidate, state })
                 }
                 Err(err) if is_skippable_recovery_error(&err) => {
                     report.invalid_root_candidates =
                         report.invalid_root_candidates.saturating_add(1);
-                    continue;
                 }
                 Err(err) => return Err(err),
             }
         }
+        if validated_for_transaction.len() > 1 {
+            return Err(FileSystemError::CorruptState {
+                reason: "conflicting authenticated committed roots share a transaction id",
+            });
+        }
+        if let Some(validated) = validated_for_transaction.pop() {
+            let summary = validated.candidate.root.summary();
+            protected_slots.insert(validated.candidate.root.slot);
+            if report.selected_root.is_none() {
+                report.selected_root = Some(summary.clone());
+            }
+            report.valid_committed_roots.push(summary);
+            validated_roots.push(validated);
+        }
     }
 
-    if let Some(selected) = best {
-        report.selected_root = Some(selected);
+    if report.selected_root.is_some() {
         report.outcome = RecoveryAuditOutcome::SelectedCommittedRoot;
-    } else if report.root_slots_seen > 0 {
+    } else if report.root_slots_seen > 0
+        || retired_v0390_fixed_superblock_marker_present(source.raw_store())?
+    {
         report.outcome = RecoveryAuditOutcome::ExplicitIntegrityOrMediaError;
     }
-    Ok(report)
+    Ok(RecoveryAuditDetails {
+        report,
+        validated_roots,
+        quorum_candidates,
+    })
 }
 
 pub fn verify_online_store(
@@ -922,17 +590,30 @@ pub fn verify_online_store(
         }
     }
 
+    if selected.is_none()
+        && report.root_slot_records_seen == 0
+        && retired_v0390_fixed_superblock_marker_present(store)?
+    {
+        report.issues.push(online_verifier_issue(
+            OnlineVerifierIssueKind::RootCommitValidation,
+            None,
+            None,
+            None,
+            RETIRED_V0390_FIXED_SUPERBLOCK_REFUSAL_REASON,
+        ));
+    }
+
     let has_error_issue = report
         .issues
         .iter()
         .any(|issue| issue.severity == OnlineVerifierIssueSeverity::Error);
     report.selected_root = selected;
-    report.outcome = if report.root_slot_records_seen == 0 {
-        OnlineVerifierOutcome::EmptyStore
-    } else if !has_error_issue {
-        OnlineVerifierOutcome::Clean
-    } else {
+    report.outcome = if has_error_issue {
         OnlineVerifierOutcome::IssuesFound
+    } else if report.root_slot_records_seen == 0 {
+        OnlineVerifierOutcome::EmptyStore
+    } else {
+        OnlineVerifierOutcome::Clean
     };
     Ok(report)
 }
@@ -981,8 +662,8 @@ pub fn online_verifier_content_counts(
             if inode.size == 0 && !store.contains_key(content_key) {
                 continue;
             }
-            let layout = read_content_layout_from_store(store, inode.inode_id, inode, false)?;
-            let _ = read_content_from_store(store, inode.inode_id, inode, false, None)?;
+            let layout = read_content_layout_from_store(store, inode.inode_id, inode)?;
+            let _ = read_content_from_store(store, inode.inode_id, inode, None)?;
             checked_content_objects = checked_content_objects.saturating_add(1);
             if let ContentLayout::Chunked(manifest) = layout {
                 checked_content_chunks =
@@ -1100,7 +781,7 @@ fn inspect_inode_content_objects(
         return Ok(());
     }
 
-    match read_content_layout_from_store(store, inode.inode_id, inode, false) {
+    match read_content_layout_from_store(store, inode.inode_id, inode) {
         Ok(ContentLayout::Inline(content)) => {
             report.observe(FilesystemContentObjectRef {
                 kind: FilesystemContentObjectKind::InlineContent,
@@ -1265,13 +946,34 @@ pub fn online_verifier_issue(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn plan_root_retention_store(
     store: &mut LocalObjectStore,
     policy: RootRetentionPolicy,
     root_authentication_key: RootAuthenticationKey,
 ) -> Result<RootRetentionPlan> {
+    plan_root_retention_source(store, policy, root_authentication_key)
+}
+
+pub(crate) fn plan_root_retention_pool(
+    pool: &mut Pool,
+    policy: RootRetentionPolicy,
+    root_authentication_key: RootAuthenticationKey,
+) -> Result<RootRetentionPlan> {
+    plan_root_retention_source(pool, policy, root_authentication_key)
+}
+
+fn plan_root_retention_source<S: CommittedRootRecoverySource>(
+    source: &mut S,
+    policy: RootRetentionPolicy,
+    root_authentication_key: RootAuthenticationKey,
+) -> Result<RootRetentionPlan> {
     policy.validate()?;
-    let audit = audit_recovery_store(store, root_authentication_key)?;
+    let RecoveryAuditDetails {
+        report: audit,
+        validated_roots,
+        quorum_candidates,
+    } = audit_recovery_source_details(source, root_authentication_key)?;
     let retention_debt = RootRetentionDebt {
         policy_required_committed_roots: policy.protected_committed_roots,
         valid_committed_roots_available: audit.valid_committed_roots.len(),
@@ -1282,30 +984,49 @@ pub(crate) fn plan_root_retention_store(
     let mut protected_roots = audit.valid_committed_roots.clone();
     protected_roots.sort_by(|lhs, rhs| rhs.transaction_id.cmp(&lhs.transaction_id));
     protected_roots.truncate(policy.protected_committed_roots);
-    if let Some(selected) = audit.selected_root.clone() {
-        let selected_root = root_commit_from_summary(&selected);
-        let selected_state =
-            load_state_from_transaction(store, &selected_root, root_authentication_key)?;
-        for snapshot in selected_state.snapshots.values() {
-            if !protected_roots.contains(&snapshot.root) {
-                protected_roots.push(snapshot.root.clone());
-            }
-        }
+
+    let mut protected_candidates = Vec::with_capacity(protected_roots.len());
+    for summary in &protected_roots {
+        let validated = validated_roots
+            .iter()
+            .find(|validated| validated.candidate.root.summary() == *summary)
+            .cloned()
+            .ok_or(FileSystemError::CorruptState {
+                reason: "retention planner lost a Pool-mountable committed-root candidate",
+            })?;
+        protected_candidates.push(validated);
     }
+    expand_data_retaining_snapshot_roots(
+        source,
+        &quorum_candidates,
+        &mut protected_candidates,
+        root_authentication_key,
+    )?;
+    protected_roots = protected_candidates
+        .iter()
+        .map(|validated| validated.candidate.root.summary())
+        .collect();
 
     let mut protected_keys = BTreeSet::new();
     let mut protected_root_slot_locations = Vec::new();
-    for root in &protected_roots {
-        protected_keys.insert(root_slot_object_key(root.slot));
-        protected_root_slot_locations.extend(root_slot_locations_for_summary(store, root)?);
-        protected_keys.extend(object_keys_for_committed_root_summary(
-            store,
-            root,
+    for validated in &protected_candidates {
+        let summary = validated.candidate.root.summary();
+        // Exact locations currently identify primary-store segments only.
+        // If a mountable root exists solely on non-primary supporters, refuse
+        // compaction rather than preserving the wrong primary slot version.
+        protected_root_slot_locations.extend(root_slot_locations_for_summary(
+            source.raw_store(),
+            &summary,
+        )?);
+        protected_keys.extend(object_keys_for_validated_root_candidate(
+            source,
+            &validated.candidate,
             root_authentication_key,
+            false,
         )?);
     }
 
-    let live_keys = store.list_keys();
+    let live_keys = source.raw_store().list_keys();
     let reclaimable_live_object_keys = live_keys
         .iter()
         .copied()
@@ -1326,6 +1047,250 @@ pub(crate) fn plan_root_retention_store(
         mutating_reclamation_allowed: false,
         production_fsck_required: false,
     })
+}
+
+fn validated_root_for_summary<S: CommittedRootRecoverySource>(
+    source: &mut S,
+    quorum_candidates: &[QuorumRootCandidate],
+    summary: &CommittedRootSummary,
+    root_authentication_key: RootAuthenticationKey,
+) -> Result<ValidatedCommittedRoot> {
+    let mut matching = quorum_candidates
+        .iter()
+        .filter(|candidate| candidate.root.summary() == *summary);
+    let candidate = matching
+        .next()
+        .cloned()
+        .ok_or(FileSystemError::CorruptState {
+            reason: "retained snapshot root lacks committed-root quorum",
+        })?;
+    if matching.next().is_some() {
+        return Err(FileSystemError::CorruptState {
+            reason: "retained snapshot root has ambiguous committed-root quorum",
+        });
+    }
+    let state = source.load_committed_state(
+        &candidate.root,
+        &candidate.supporting_store_indices,
+        root_authentication_key,
+    )?;
+    Ok(ValidatedCommittedRoot { candidate, state })
+}
+
+fn expand_data_retaining_snapshot_roots<S: CommittedRootRecoverySource>(
+    source: &mut S,
+    quorum_candidates: &[QuorumRootCandidate],
+    protected_roots: &mut Vec<ValidatedCommittedRoot>,
+    root_authentication_key: RootAuthenticationKey,
+) -> Result<()> {
+    let mut cursor = 0;
+    while cursor < protected_roots.len() {
+        let parent_transaction_id = protected_roots[cursor].candidate.root.transaction_id;
+        let snapshot_roots = snapshot_retained_roots(&protected_roots[cursor].state);
+        for summary in snapshot_roots {
+            if summary.transaction_id >= parent_transaction_id {
+                return Err(FileSystemError::CorruptState {
+                    reason:
+                        "retention planner found a snapshot root at or after its containing root",
+                });
+            }
+            if protected_roots
+                .iter()
+                .any(|validated| validated.candidate.root.summary() == summary)
+            {
+                continue;
+            }
+            protected_roots.push(validated_root_for_summary(
+                source,
+                quorum_candidates,
+                &summary,
+                root_authentication_key,
+            )?);
+        }
+        cursor += 1;
+    }
+    Ok(())
+}
+
+fn require_primary_retention_bytes(
+    store: &LocalObjectStore,
+    key: ObjectKey,
+    expected_checksum: IntegrityDigest64,
+    missing_reason: &'static str,
+) -> Result<Vec<u8>> {
+    let location = store
+        .location_of(key)
+        .ok_or(FileSystemError::CorruptState {
+            reason: missing_reason,
+        })?;
+    let bytes = store.read_location_from_store(0, location)?;
+    if checksum64(&bytes) != expected_checksum {
+        return Err(FileSystemError::CorruptState {
+            reason: "retention planner: primary protected object checksum changed",
+        });
+    }
+    Ok(bytes)
+}
+
+fn object_keys_for_validated_root_candidate<S: CommittedRootRecoverySource>(
+    source: &S,
+    candidate: &QuorumRootCandidate,
+    root_authentication_key: RootAuthenticationKey,
+    content_only: bool,
+) -> Result<BTreeSet<ObjectKey>> {
+    let transaction = read_transaction_candidate_objects(
+        source.raw_store(),
+        &candidate.root,
+        &candidate.supporting_store_indices,
+        root_authentication_key,
+    )?;
+    let mut keys = BTreeSet::new();
+    if !content_only {
+        keys.insert(root_slot_object_key(candidate.root.slot));
+        keys.insert(transaction_superblock_object_key(
+            candidate.root.transaction_id,
+        ));
+        keys.insert(transaction_manifest_object_key(
+            candidate.root.transaction_id,
+        ));
+        require_primary_retention_bytes(
+            source.raw_store(),
+            transaction_superblock_object_key(candidate.root.transaction_id),
+            candidate.root.superblock_checksum,
+            "retention planner: primary cannot preserve the protected transaction superblock",
+        )?;
+        require_primary_retention_bytes(
+            source.raw_store(),
+            transaction_manifest_object_key(candidate.root.transaction_id),
+            candidate.root.manifest_checksum,
+            "retention planner: primary cannot preserve the protected transaction manifest",
+        )?;
+    }
+
+    for entry in &transaction.manifest.entries {
+        let is_content = matches!(
+            entry.role,
+            TransactionManifestObjectRole::VersionedContent
+                | TransactionManifestObjectRole::VersionedContentChunk
+        );
+        if !content_only || is_content {
+            keys.insert(entry.object_key);
+        }
+        if !content_only {
+            require_primary_retention_bytes(
+                source.raw_store(),
+                entry.object_key,
+                entry.checksum,
+                "retention planner: primary cannot preserve a protected manifest object",
+            )?;
+        }
+        if entry.role != TransactionManifestObjectRole::VersionedContentChunk {
+            continue;
+        }
+
+        let chunk_bytes = source
+            .read_current_content_for_retention(entry.object_key)?
+            .ok_or(FileSystemError::CorruptState {
+                reason: "retention planner: committed content chunk is missing",
+            })?;
+        if checksum64(&chunk_bytes) != entry.checksum {
+            return Err(FileSystemError::CorruptState {
+                reason: "retention planner: committed content chunk checksum changed",
+            });
+        }
+        if !is_dedup_redirect(&chunk_bytes) {
+            continue;
+        }
+        let canonical_key = decode_dedup_redirect(&chunk_bytes)?;
+        let canonical_bytes = source
+            .read_current_content_for_retention(canonical_key)?
+            .ok_or(FileSystemError::CorruptState {
+                reason: "retention planner: dedup redirect target is missing",
+            })?;
+        let canonical_chunk = decode_content_chunk(&canonical_bytes)?;
+        let fingerprint = compute_content_fingerprint(&canonical_chunk.bytes);
+        if content_dedup_object_key(&fingerprint) != canonical_key {
+            return Err(FileSystemError::CorruptState {
+                reason: "retention planner: dedup redirect target has the wrong content identity",
+            });
+        }
+        if !content_only {
+            let primary_location = source.raw_store().location_of(canonical_key).ok_or(
+                FileSystemError::CorruptState {
+                    reason: "retention planner: primary cannot preserve a dedup redirect target",
+                },
+            )?;
+            let primary_bytes = source
+                .raw_store()
+                .read_location_from_store(0, primary_location)?;
+            let primary_chunk = decode_content_chunk(&primary_bytes)?;
+            let primary_fingerprint = compute_content_fingerprint(&primary_chunk.bytes);
+            if content_dedup_object_key(&primary_fingerprint) != canonical_key {
+                return Err(FileSystemError::CorruptState {
+                    reason:
+                        "retention planner: primary dedup target has the wrong content identity",
+                });
+            }
+        }
+        keys.insert(canonical_key);
+    }
+    Ok(keys)
+}
+
+pub(crate) fn reclaim_protected_content_keys_pool(
+    pool: &mut Pool,
+    root_authentication_key: RootAuthenticationKey,
+    state: &FileSystemState,
+) -> Result<BTreeSet<ObjectKey>> {
+    let RecoveryAuditDetails {
+        validated_roots: mut protected_roots,
+        quorum_candidates,
+        ..
+    } = audit_recovery_source_details(pool, root_authentication_key)?;
+
+    // Protect every current root-ring fallback, not only roots named by a
+    // snapshot. A later valid candidate in the same physical slot replaces
+    // its older overwritten location in this fallback floor; retention
+    // compaction handles physical cleanup of those stale locations separately.
+    for summary in snapshot_retained_roots(state) {
+        if protected_roots
+            .iter()
+            .any(|validated: &ValidatedCommittedRoot| validated.candidate.root.summary() == summary)
+        {
+            continue;
+        }
+        if !quorum_candidates
+            .iter()
+            .any(|candidate| candidate.root.summary() == summary)
+        {
+            return Err(FileSystemError::CorruptState {
+                reason: "live snapshot references a root outside current recovery authority",
+            });
+        }
+        protected_roots.push(validated_root_for_summary(
+            pool,
+            &quorum_candidates,
+            &summary,
+            root_authentication_key,
+        )?);
+    }
+    expand_data_retaining_snapshot_roots(
+        pool,
+        &quorum_candidates,
+        &mut protected_roots,
+        root_authentication_key,
+    )?;
+
+    let mut protected_keys = BTreeSet::new();
+    for validated in protected_roots {
+        protected_keys.extend(object_keys_for_validated_root_candidate(
+            pool,
+            &validated.candidate,
+            root_authentication_key,
+            true,
+        )?);
+    }
+    Ok(protected_keys)
 }
 
 pub(crate) fn object_keys_for_committed_root_summary(
@@ -1421,10 +1386,7 @@ pub(crate) fn root_slot_locations_for_summary(
             Ok(root) => root,
             Err(_) => continue,
         };
-        if root.transaction_id == summary.transaction_id
-            && root.generation == summary.generation
-            && root.superblock_checksum == summary.superblock_checksum
-        {
+        if root.summary() == *summary {
             matches.push(location);
         }
     }
@@ -1572,6 +1534,124 @@ pub(crate) fn select_latest_committed_root(
     select_latest_committed_root_from_source(store, root_authentication_key)
 }
 
+pub(crate) fn selected_committed_root_summary_pool(
+    pool: &mut Pool,
+    root_authentication_key: RootAuthenticationKey,
+) -> Result<Option<CommittedRootSummary>> {
+    Ok(select_latest_committed_root_from_source(pool, root_authentication_key)?.selected_root)
+}
+
+fn scan_quorum_root_candidates<S: CommittedRootRecoverySource>(
+    source: &S,
+) -> Result<QuorumRootCandidateScan> {
+    let quorum = (source.raw_store().stores_count() / 2) + 1;
+    let mut encoded_candidates: BTreeMap<(u64, Vec<u8>), BTreeSet<usize>> = BTreeMap::new();
+    let mut slots_with_records = BTreeSet::new();
+    let mut root_candidate_locations_seen = 0_u64;
+    let mut skipped_root_candidates = 0_u64;
+    let mut checked_transaction_manifests = 0_u64;
+    let mut first_candidate_io_error = None;
+
+    // Retain one store vote per encoded candidate while scanning. The current
+    // quorum contract aggregates those store votes by transaction ID below;
+    // exact encoded-root vote identity is a separate follow-on boundary.
+    for slot in 0..FILESYSTEM_ROOT_SLOT_COUNT {
+        let slot_key = root_slot_object_key(slot);
+        let all_store_locations = source.raw_store().version_locations_across_stores(slot_key);
+        if all_store_locations
+            .iter()
+            .any(|locations| !locations.is_empty())
+        {
+            slots_with_records.insert(slot);
+        }
+
+        for (store_index, locations) in all_store_locations.iter().enumerate() {
+            root_candidate_locations_seen =
+                root_candidate_locations_seen.saturating_add(locations.len() as u64);
+            for location in locations.iter().rev().copied() {
+                let bytes = match source
+                    .raw_store()
+                    .read_location_from_store(store_index, location)
+                {
+                    Ok(bytes) => bytes,
+                    Err(error)
+                        if is_skippable_store_error(&error)
+                            || is_candidate_local_store_io(&error) =>
+                    {
+                        skipped_root_candidates = skipped_root_candidates.saturating_add(1);
+                        if is_candidate_local_store_io(&error) && first_candidate_io_error.is_none()
+                        {
+                            first_candidate_io_error = Some(FileSystemError::from(error));
+                        }
+                        continue;
+                    }
+                    Err(error) => return Err(FileSystemError::from(error)),
+                };
+                encoded_candidates
+                    .entry((slot, bytes))
+                    .or_default()
+                    .insert(store_index);
+            }
+        }
+    }
+
+    let mut decoded_candidates = Vec::new();
+    let mut supporting_stores_by_transaction: BTreeMap<u64, BTreeSet<usize>> = BTreeMap::new();
+    for ((slot, bytes), supporting_store_indices) in encoded_candidates {
+        let root = match decode_quorum_root_candidate(slot, &bytes) {
+            Ok(root) => root,
+            Err(error) if is_skippable_recovery_error(&error) => {
+                skipped_root_candidates = skipped_root_candidates.saturating_add(1);
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        if root.slot != slot
+            || root.slot != root_slot_for_transaction(root.transaction_id)
+            || root.transaction_id < ROOT_COMMIT_MIN_TRANSACTION_ID
+        {
+            skipped_root_candidates = skipped_root_candidates.saturating_add(1);
+            continue;
+        }
+        supporting_stores_by_transaction
+            .entry(root.transaction_id)
+            .or_default()
+            .extend(supporting_store_indices.iter().copied());
+        decoded_candidates.push(root);
+    }
+
+    let mut roots_by_transaction = BTreeMap::new();
+    for root in decoded_candidates {
+        let supporting_store_indices = supporting_stores_by_transaction
+            .get(&root.transaction_id)
+            .cloned()
+            .unwrap_or_default();
+        if supporting_store_indices.len() < quorum {
+            skipped_root_candidates = skipped_root_candidates.saturating_add(1);
+            continue;
+        }
+        if root.has_manifest() {
+            checked_transaction_manifests = checked_transaction_manifests.saturating_add(1);
+        }
+        roots_by_transaction
+            .entry(root.transaction_id)
+            .or_insert_with(Vec::new)
+            .push(QuorumRootCandidate {
+                root,
+                supporting_store_indices,
+            });
+    }
+
+    Ok(QuorumRootCandidateScan {
+        roots_by_transaction,
+        root_slots_seen: slots_with_records.len() as u64,
+        root_candidate_locations_seen,
+        skipped_root_candidates,
+        checked_transaction_manifests,
+        first_candidate_io_error,
+    })
+}
+
 fn select_latest_committed_root_from_source<S: CommittedRootRecoverySource>(
     source: &mut S,
     root_authentication_key: RootAuthenticationKey,
@@ -1579,115 +1659,108 @@ fn select_latest_committed_root_from_source<S: CommittedRootRecoverySource>(
     let mut report = RecoveryProbeReport::empty_with_replay_tail(
         source.raw_store().replay_report().repaired_tail_bytes,
     );
-    let mut best: Option<(RootCommitRecord, FileSystemState)> = None;
-    let total_stores = source.raw_store().stores_count();
-    // Quorum: majority of all stores (primary + replicas).
-    // A root commit on only a minority is stale and must be rejected.
-    let quorum = (total_stores / 2) + 1;
-    // Track which store indices have seen each txg for quorum validation.
-    let mut quorum_seen: BTreeMap<u64, BTreeSet<usize>> = BTreeMap::new();
-
-    for slot in 0..FILESYSTEM_ROOT_SLOT_COUNT {
-        let slot_key = root_slot_object_key(slot);
-        let all_store_locations = source.raw_store().version_locations_across_stores(slot_key);
-
-        for (store_idx, locations) in all_store_locations.iter().enumerate() {
-            if locations.is_empty() {
-                // This store has no history for this slot; skip.
-                continue;
-            }
-            report.root_slot_records_seen = report
-                .root_slot_records_seen
-                .saturating_add(locations.len() as u64);
-
-            for location in locations.iter().rev() {
-                report.root_slot_candidates_seen =
-                    report.root_slot_candidates_seen.saturating_add(1);
-                let bytes = match source
-                    .raw_store()
-                    .read_location_from_store(store_idx, *location)
-                {
-                    Ok(bytes) => bytes,
-                    Err(err) if is_skippable_store_error(&err) => {
-                        report.skipped_root_candidates =
-                            report.skipped_root_candidates.saturating_add(1);
-                        continue;
-                    }
-                    Err(err) => return Err(FileSystemError::from(err)),
-                };
-                let root = match decode_root_commit(&bytes) {
-                    Ok(root) => root,
-                    Err(_) => {
-                        report.skipped_root_candidates =
-                            report.skipped_root_candidates.saturating_add(1);
-                        continue;
-                    }
-                };
-                if root.slot != slot || root.transaction_id < ROOT_COMMIT_MIN_TRANSACTION_ID {
-                    report.skipped_root_candidates =
-                        report.skipped_root_candidates.saturating_add(1);
-                    continue;
-                }
-                // Track which stores have seen this txg.
-                let stores = quorum_seen.entry(root.transaction_id).or_default();
-                stores.insert(store_idx);
-                let store_count = stores.len();
-
-                // Quorum gate: only consider root commits present on majority
-                // of stores. Stale minority copies are skipped.
-                if store_count < quorum {
-                    report.skipped_root_candidates =
-                        report.skipped_root_candidates.saturating_add(1);
-                    continue;
-                }
-
-                let state = match source.load_committed_state(&root, root_authentication_key) {
-                    Ok(state) => state,
-                    Err(err) if is_skippable_recovery_error(&err) => {
-                        report.skipped_root_candidates =
-                            report.skipped_root_candidates.saturating_add(1);
-                        continue;
-                    }
-                    Err(err) => return Err(err),
-                };
-                report.valid_committed_roots_seen =
-                    report.valid_committed_roots_seen.saturating_add(1);
-                if best
-                    .as_ref()
-                    .map(|(current, _)| root.transaction_id > current.transaction_id)
-                    .unwrap_or(true)
-                {
-                    best = Some((root, state));
-                }
-                // Do NOT break: continue trying older versions in this slot.
-                // If the newest version in a slot is torn or corrupt (e.g. from
-                // PublishOutcomeUncertain crash), an older valid committed root
-                // in the same slot can still be selected. ZFS does the same thing.
-            }
-        } // end locations loop per store
+    let scan = scan_quorum_root_candidates(source)?;
+    if let Some(error) = scan.first_candidate_io_error {
+        return Err(error);
     }
-
-    if let Some((root, state)) = best {
-        report.selected_slot = Some(root.slot);
-        report.selected_transaction_id = Some(root.transaction_id);
-        report.selected_generation = Some(root.generation);
-        report.selected_inode_count = Some(root.inode_count);
-        report.outcome = RecoveryProbeOutcome::SelectedCommittedRoot;
-        Ok(RootSelection {
-            report,
-            root: Some(root),
-            state: Some(state),
-        })
-    } else {
-        if report.root_slot_records_seen > 0 {
-            report.outcome = RecoveryProbeOutcome::ExplicitIntegrityOrMediaError;
+    report.root_slot_records_seen = scan.root_candidate_locations_seen;
+    report.root_slot_candidates_seen = scan.root_candidate_locations_seen;
+    report.skipped_root_candidates = scan.skipped_root_candidates;
+    for (_transaction_id, roots) in scan.roots_by_transaction.into_iter().rev() {
+        let mut selected = None;
+        for candidate in roots {
+            match source.load_committed_state(
+                &candidate.root,
+                &candidate.supporting_store_indices,
+                root_authentication_key,
+            ) {
+                Ok(state) => {
+                    report.valid_committed_roots_seen =
+                        report.valid_committed_roots_seen.saturating_add(1);
+                    if selected.is_some() {
+                        return Err(FileSystemError::CorruptState {
+                            reason:
+                                "conflicting authenticated committed roots share a transaction id",
+                        });
+                    }
+                    selected = Some((candidate.root, state));
+                }
+                Err(err) if is_skippable_recovery_error(&err) => {
+                    report.skipped_root_candidates =
+                        report.skipped_root_candidates.saturating_add(1);
+                }
+                Err(err) => return Err(err),
+            }
         }
-        Ok(RootSelection {
-            report,
-            root: None,
-            state: None,
-        })
+        if let Some((root, state)) = selected {
+            let selected_root = root.summary();
+            report.selected_slot = Some(root.slot);
+            report.selected_transaction_id = Some(root.transaction_id);
+            report.selected_generation = Some(root.generation);
+            report.selected_inode_count = Some(root.inode_count);
+            report.outcome = RecoveryProbeOutcome::SelectedCommittedRoot;
+            return Ok(RootSelection {
+                report,
+                state: Some(state),
+                selected_root: Some(selected_root),
+            });
+        }
     }
+
+    if report.root_slot_records_seen > 0 {
+        report.outcome = RecoveryProbeOutcome::ExplicitIntegrityOrMediaError;
+    }
+    Ok(RootSelection {
+        report,
+        state: None,
+        selected_root: None,
+    })
+}
+
+fn decode_quorum_root_candidate(physical_slot: u64, bytes: &[u8]) -> Result<RootCommitRecord> {
+    const ENCODED_VERSION_OFFSET: usize = ROOT_COMMIT_MAGIC.len();
+    const ENCODED_VERSION_END: usize = ENCODED_VERSION_OFFSET + 2;
+    if bytes.get(..ROOT_COMMIT_MAGIC.len()) == Some(ROOT_COMMIT_MAGIC.as_slice()) {
+        if let Some(version_bytes) = bytes.get(ENCODED_VERSION_OFFSET..ENCODED_VERSION_END) {
+            let version = u16::from_le_bytes([version_bytes[0], version_bytes[1]]);
+            if version > FILESYSTEM_FORMAT_VERSION {
+                const RESERVED_END: usize = ENCODED_VERSION_END + 2;
+                const SLOT_END: usize = RESERVED_END + 8;
+                const TRANSACTION_END: usize = SLOT_END + 8;
+                let prefix = bytes
+                    .get(..TRANSACTION_END)
+                    .ok_or(FileSystemError::Decode {
+                        object: "local filesystem root commit",
+                        reason: "future-format root candidate lacks the stable authority prefix",
+                    })?;
+                let reserved = u16::from_le_bytes(
+                    prefix[ENCODED_VERSION_END..RESERVED_END]
+                        .try_into()
+                        .unwrap(),
+                );
+                let embedded_slot =
+                    u64::from_le_bytes(prefix[RESERVED_END..SLOT_END].try_into().unwrap());
+                let transaction_id =
+                    u64::from_le_bytes(prefix[SLOT_END..TRANSACTION_END].try_into().unwrap());
+                if reserved != ROOT_COMMIT_RESERVED
+                    || embedded_slot >= FILESYSTEM_ROOT_SLOT_COUNT
+                    || embedded_slot != physical_slot
+                    || embedded_slot != root_slot_for_transaction(transaction_id)
+                    || transaction_id < ROOT_COMMIT_MIN_TRANSACTION_ID
+                {
+                    return Err(FileSystemError::CorruptState {
+                        reason: "future-format root candidate lacks admissible stable authority",
+                    });
+                }
+                return Err(FileSystemError::FormatVersionIncompatible {
+                    running_version: FILESYSTEM_FORMAT_VERSION,
+                    filesystem_min: version,
+                    filesystem_max: version,
+                });
+            }
+        }
+    }
+    decode_root_commit(bytes)
 }
 
 pub(crate) fn load_state_from_transaction(
@@ -1698,8 +1771,8 @@ pub(crate) fn load_state_from_transaction(
     load_state_from_transaction_with_manifest_validation(store, root, root_authentication_key, true)
 }
 
-/// Load transaction metadata from the raw recovery store, then validate every
-/// committed file-content entry through the current Pool placement path.
+/// Load transaction metadata from its authenticated manifest, then validate
+/// every nonempty committed file-like inode through current Pool authority.
 pub(crate) fn load_state_from_transaction_pool(
     pool: &mut Pool,
     root: &RootCommitRecord,
@@ -1729,6 +1802,221 @@ pub(crate) fn load_state_from_transaction_pool(
         &state,
         &manifest,
         &superblock_bytes,
+        None,
+    )?;
+    Ok(state)
+}
+
+fn read_candidate_object_by_checksum(
+    store: &LocalObjectStore,
+    supporting_store_indices: &BTreeSet<usize>,
+    key: ObjectKey,
+    expected_checksum: IntegrityDigest64,
+    expected_authentication: Option<(&'static [u8], RootAuthenticationDigest)>,
+    missing_reason: &'static str,
+) -> Result<Vec<u8>> {
+    let locations_by_store = store.version_locations_across_stores(key);
+    let mut first_io_error = None;
+    for store_index in supporting_store_indices.iter().copied() {
+        let Some(locations) = locations_by_store.get(store_index) else {
+            continue;
+        };
+        for location in locations.iter().rev().copied() {
+            match store.read_location_from_store(store_index, location) {
+                Ok(bytes) if checksum64(&bytes) == expected_checksum => {
+                    if expected_authentication.is_some_and(|(domain, expected_digest)| {
+                        root_authentication_digest(domain, &bytes) != expected_digest
+                    }) {
+                        continue;
+                    }
+                    return Ok(bytes);
+                }
+                Ok(_) => {}
+                Err(error) if is_skippable_store_error(&error) => {}
+                Err(error) if is_candidate_local_store_io(&error) => {
+                    if first_io_error.is_none() {
+                        first_io_error = Some(error);
+                    }
+                }
+                Err(error) => return Err(FileSystemError::from(error)),
+            }
+        }
+    }
+    if let Some(error) = first_io_error {
+        return Err(FileSystemError::from(error));
+    }
+    Err(FileSystemError::CorruptState {
+        reason: missing_reason,
+    })
+}
+
+struct TransactionCandidateObjects {
+    superblock_bytes: Vec<u8>,
+    manifest: TransactionManifestRecord,
+    objects: BTreeMap<ObjectKey, Vec<u8>>,
+}
+
+fn read_transaction_candidate_objects(
+    store: &LocalObjectStore,
+    root: &RootCommitRecord,
+    supporting_store_indices: &BTreeSet<usize>,
+    root_authentication_key: RootAuthenticationKey,
+) -> Result<TransactionCandidateObjects> {
+    // Reject an unauthenticated root before it can influence metadata I/O or
+    // the error selected for fallback.
+    let root_authentication = validate_root_authentication_record(root, root_authentication_key)?;
+    if !root.has_manifest() {
+        return Err(FileSystemError::CorruptState {
+            reason: "candidate recovery requires a manifest-backed committed root",
+        });
+    }
+
+    let superblock_key = transaction_superblock_object_key(root.transaction_id);
+    let superblock_bytes = read_candidate_object_by_checksum(
+        store,
+        supporting_store_indices,
+        superblock_key,
+        root.superblock_checksum,
+        Some((
+            ROOT_AUTHENTICATION_SUPERBLOCK_DOMAIN,
+            root_authentication.superblock_digest,
+        )),
+        "root candidate has no authenticated transaction superblock on its supporting stores",
+    )?;
+    let manifest_key = transaction_manifest_object_key(root.transaction_id);
+    let manifest_bytes = read_candidate_object_by_checksum(
+        store,
+        supporting_store_indices,
+        manifest_key,
+        root.manifest_checksum,
+        Some((
+            ROOT_AUTHENTICATION_MANIFEST_DOMAIN,
+            root_authentication.manifest_digest,
+        )),
+        "root candidate has no authenticated transaction manifest on its supporting stores",
+    )?;
+    let manifest =
+        validate_root_transaction_manifest_bytes(root, &root_authentication, &manifest_bytes)?;
+
+    let mut objects = BTreeMap::new();
+    objects.insert(superblock_key, superblock_bytes.clone());
+    for entry in &manifest.entries {
+        match entry.role {
+            TransactionManifestObjectRole::TransactionSuperblock => {
+                if entry.object_key != superblock_key || entry.checksum != root.superblock_checksum
+                {
+                    return Err(FileSystemError::CorruptState {
+                        reason: "candidate manifest superblock entry does not match its root",
+                    });
+                }
+            }
+            TransactionManifestObjectRole::TransactionInode
+            | TransactionManifestObjectRole::TransactionDirectory
+            | TransactionManifestObjectRole::TransactionSnapshotCatalogEntry
+            | TransactionManifestObjectRole::TransactionExtentMap => {
+                let bytes = read_candidate_object_by_checksum(
+                    store,
+                    supporting_store_indices,
+                    entry.object_key,
+                    entry.checksum,
+                    None,
+                    "candidate manifest object is absent from its supporting stores",
+                )?;
+                if objects.insert(entry.object_key, bytes).is_some() {
+                    return Err(FileSystemError::CorruptState {
+                        reason: "candidate manifest repeats a transaction metadata object key",
+                    });
+                }
+            }
+            TransactionManifestObjectRole::VersionedContent
+            | TransactionManifestObjectRole::VersionedContentChunk => {}
+        }
+    }
+
+    Ok(TransactionCandidateObjects {
+        superblock_bytes,
+        manifest,
+        objects,
+    })
+}
+
+fn decode_candidate_superblock(
+    root: &RootCommitRecord,
+    superblock_bytes: &[u8],
+) -> Result<SuperblockRecord> {
+    let superblock = decode_superblock(superblock_bytes)?;
+    validate_superblock_format_compatibility(&superblock)?;
+    if superblock.generation != root.generation
+        || superblock.next_inode_id != root.next_inode_id
+        || superblock.inode_count != root.inode_count
+    {
+        return Err(FileSystemError::CorruptState {
+            reason: "candidate transaction superblock does not match root commit",
+        });
+    }
+    Ok(superblock)
+}
+
+fn load_state_from_transaction_store_candidate(
+    store: &mut LocalObjectStore,
+    root: &RootCommitRecord,
+    supporting_store_indices: &BTreeSet<usize>,
+    root_authentication_key: RootAuthenticationKey,
+) -> Result<FileSystemState> {
+    let candidate = read_transaction_candidate_objects(
+        store,
+        root,
+        supporting_store_indices,
+        root_authentication_key,
+    )?;
+    let superblock = decode_candidate_superblock(root, &candidate.superblock_bytes)?;
+    let state = load_state_from_superblock_with_content_validation(
+        store,
+        &superblock,
+        Some(root.transaction_id),
+        true,
+        Some(&candidate.manifest.entries),
+        Some(&candidate.objects),
+    )?;
+    validate_transaction_manifest_matches_loaded_state_with_content(
+        store,
+        root,
+        &state,
+        &candidate.manifest,
+        &candidate.superblock_bytes,
+        Some(&candidate.objects),
+        |inode| transaction_manifest_entries_for_existing_content(store, inode),
+    )?;
+    Ok(state)
+}
+
+fn load_state_from_transaction_pool_candidate(
+    pool: &mut Pool,
+    root: &RootCommitRecord,
+    supporting_store_indices: &BTreeSet<usize>,
+    root_authentication_key: RootAuthenticationKey,
+) -> Result<FileSystemState> {
+    let candidate = read_transaction_candidate_objects(
+        pool.raw_primary_store(),
+        root,
+        supporting_store_indices,
+        root_authentication_key,
+    )?;
+    let superblock = decode_candidate_superblock(root, &candidate.superblock_bytes)?;
+    let state = load_state_from_superblock_for_content_inspection(
+        pool.raw_primary_store_mut(),
+        &superblock,
+        root.transaction_id,
+        &candidate.manifest.entries,
+        Some(&candidate.objects),
+    )?;
+    validate_transaction_manifest_matches_loaded_state_pool(
+        pool,
+        root,
+        &state,
+        &candidate.manifest,
+        &candidate.superblock_bytes,
+        Some(&candidate.objects),
     )?;
     Ok(state)
 }
@@ -1786,17 +2074,8 @@ fn load_state_from_transaction_with_manifest_validation(
         }
         None
     };
-    let (superblock, legacy_snapshots) = decode_superblock(&superblock_bytes)?;
-    // Format-version mount gate: refuse if running code is older than
-    // the most recent writer (downgrade fence) or cannot satisfy the
-    // filesystem's minimum version requirement.
-    if CURRENT_FORMAT_VERSION < superblock.format_version_min {
-        return Err(FileSystemError::FormatVersionIncompatible {
-            running_version: CURRENT_FORMAT_VERSION,
-            filesystem_min: superblock.format_version_min,
-            filesystem_max: superblock.format_version_max,
-        });
-    }
+    let superblock = decode_superblock(&superblock_bytes)?;
+    validate_superblock_format_compatibility(&superblock)?;
     if superblock.generation != root.generation
         || superblock.next_inode_id != root.next_inode_id
         || superblock.inode_count != root.inode_count
@@ -1806,31 +2085,26 @@ fn load_state_from_transaction_with_manifest_validation(
         });
     }
     let state = if validate_manifest_against_loaded_state {
-        load_state_from_superblock(
+        load_state_from_superblock_with_content_validation(
             store,
             &superblock,
             Some(root.transaction_id),
-            legacy_snapshots,
+            true,
             manifest
                 .as_ref()
                 .map(|manifest| manifest.entries.as_slice()),
+            None,
         )?
     } else {
-        if manifest.is_none() {
-            return Err(FileSystemError::CorruptState {
-                reason: "content inspection requires a manifest-backed committed root",
-            });
-        }
+        let manifest = manifest.as_ref().ok_or(FileSystemError::CorruptState {
+            reason: "content inspection requires a manifest-backed committed root",
+        })?;
         load_state_from_superblock_for_content_inspection(
             store,
             &superblock,
             root.transaction_id,
-            legacy_snapshots,
-            manifest
-                .as_ref()
-                .expect("content inspection requires a manifest")
-                .entries
-                .as_slice(),
+            &manifest.entries,
+            None,
         )?
     };
     if validate_manifest_against_loaded_state {
@@ -1858,6 +2132,14 @@ pub(crate) fn validate_root_transaction_manifest(
         .ok_or(FileSystemError::CorruptState {
             reason: "root commit references a missing transaction manifest",
         })?;
+    validate_root_transaction_manifest_bytes(root, root_authentication, &manifest_bytes)
+}
+
+fn validate_root_transaction_manifest_bytes(
+    root: &RootCommitRecord,
+    root_authentication: &RootAuthenticationRecord,
+    manifest_bytes: &[u8],
+) -> Result<TransactionManifestRecord> {
     let actual_manifest_checksum = checksum64(&manifest_bytes);
     if actual_manifest_checksum != root.manifest_checksum {
         return Err(FileSystemError::CorruptState {
@@ -1904,6 +2186,7 @@ pub(crate) fn validate_transaction_manifest_matches_loaded_state(
         state,
         manifest,
         superblock_bytes,
+        None,
         |inode| transaction_manifest_entries_for_existing_content(store, inode),
     )
 }
@@ -1914,6 +2197,7 @@ fn validate_transaction_manifest_matches_loaded_state_pool(
     state: &FileSystemState,
     manifest: &TransactionManifestRecord,
     superblock_bytes: &[u8],
+    candidate_objects: Option<&BTreeMap<ObjectKey, Vec<u8>>>,
 ) -> Result<()> {
     validate_transaction_manifest_matches_loaded_state_with_content(
         pool.raw_primary_store(),
@@ -1921,6 +2205,7 @@ fn validate_transaction_manifest_matches_loaded_state_pool(
         state,
         manifest,
         superblock_bytes,
+        candidate_objects,
         |inode| transaction_manifest_entries_for_pool_content(pool, inode),
     )
 }
@@ -1931,10 +2216,11 @@ fn validate_transaction_manifest_matches_loaded_state_with_content(
     state: &FileSystemState,
     manifest: &TransactionManifestRecord,
     superblock_bytes: &[u8],
+    candidate_objects: Option<&BTreeMap<ObjectKey, Vec<u8>>>,
     mut content_entries: impl FnMut(&InodeRecord) -> Result<Vec<TransactionManifestEntry>>,
 ) -> Result<()> {
     let (manifest_inode_keys, manifest_directory_keys) =
-        manifest_transaction_object_key_maps(store, &manifest.entries)?;
+        manifest_transaction_object_key_maps(store, &manifest.entries, candidate_objects)?;
     let mut expected = Vec::new();
     for inode in state.inodes.values() {
         if inode.is_file_like() {
@@ -1947,9 +2233,11 @@ fn validate_transaction_manifest_matches_loaded_state_with_content(
                 .ok_or(FileSystemError::CorruptState {
                     reason: "transaction manifest validation expected a missing inode object",
                 })?;
-        let inode_bytes = store.get(inode_key)?.ok_or(FileSystemError::CorruptState {
-            reason: "transaction manifest validation expected a missing inode object",
-        })?;
+        let inode_bytes = recovery_object_bytes(store, candidate_objects, inode_key)?.ok_or(
+            FileSystemError::CorruptState {
+                reason: "transaction manifest validation expected a missing inode object",
+            },
+        )?;
         if try_encode_inode(inode)? != inode_bytes {
             return Err(FileSystemError::CorruptState {
                 reason: "transaction manifest inode object does not match loaded state",
@@ -1967,13 +2255,10 @@ fn validate_transaction_manifest_matches_loaded_state_with_content(
                     reason: "transaction manifest validation expected a missing directory object",
                 },
             )?;
-            let directory_bytes =
-                store
-                    .get(directory_key)?
-                    .ok_or(FileSystemError::CorruptState {
-                        reason:
-                            "transaction manifest validation expected a missing directory object",
-                    })?;
+            let directory_bytes = recovery_object_bytes(store, candidate_objects, directory_key)?
+                .ok_or(FileSystemError::CorruptState {
+                reason: "transaction manifest validation expected a missing directory object",
+            })?;
             let directory =
                 state
                     .directories
@@ -1999,7 +2284,9 @@ fn validate_transaction_manifest_matches_loaded_state_with_content(
     // in load_state_from_superblock once they are tracked in FileSystemState.
     for entry in &manifest.entries {
         if entry.role == TransactionManifestObjectRole::TransactionExtentMap {
-            if let Some(ext_bytes) = store.get(entry.object_key)? {
+            if let Some(ext_bytes) =
+                recovery_object_bytes(store, candidate_objects, entry.object_key)?
+            {
                 expected.push(TransactionManifestEntry {
                     role: TransactionManifestObjectRole::TransactionExtentMap,
                     object_key: entry.object_key,
@@ -2018,9 +2305,11 @@ fn validate_transaction_manifest_matches_loaded_state_with_content(
     for snapshot in state.snapshots.values() {
         let snap_key =
             transaction_snapshot_catalog_entry_object_key(root.transaction_id, &snapshot.name);
-        let snap_bytes = store.get(snap_key)?.ok_or(FileSystemError::CorruptState {
-            reason: "transaction manifest validation expected a missing snapshot catalog entry",
-        })?;
+        let snap_bytes = recovery_object_bytes(store, candidate_objects, snap_key)?.ok_or(
+            FileSystemError::CorruptState {
+                reason: "transaction manifest validation expected a missing snapshot catalog entry",
+            },
+        )?;
         expected.push(TransactionManifestEntry {
             role: TransactionManifestObjectRole::TransactionSnapshotCatalogEntry,
             object_key: snap_key,
@@ -2079,9 +2368,21 @@ fn find_directory_key(
     None
 }
 
+fn recovery_object_bytes(
+    store: &LocalObjectStore,
+    candidate_objects: Option<&BTreeMap<ObjectKey, Vec<u8>>>,
+    key: ObjectKey,
+) -> Result<Option<Vec<u8>>> {
+    match candidate_objects {
+        Some(objects) => Ok(objects.get(&key).cloned()),
+        None => Ok(store.get(key)?),
+    }
+}
+
 fn manifest_transaction_object_key_maps(
     store: &LocalObjectStore,
     entries: &[TransactionManifestEntry],
+    candidate_objects: Option<&BTreeMap<ObjectKey, Vec<u8>>>,
 ) -> Result<(BTreeMap<InodeId, ObjectKey>, BTreeMap<InodeId, ObjectKey>)> {
     let mut inode_keys = BTreeMap::new();
     let mut directory_keys = BTreeMap::new();
@@ -2091,11 +2392,11 @@ fn manifest_transaction_object_key_maps(
             TransactionManifestObjectRole::TransactionDirectory => &mut directory_keys,
             _ => continue,
         };
-        let bytes = store
-            .get(entry.object_key)?
-            .ok_or(FileSystemError::CorruptState {
+        let bytes = recovery_object_bytes(store, candidate_objects, entry.object_key)?.ok_or(
+            FileSystemError::CorruptState {
                 reason: "transaction manifest references a missing namespace object",
-            })?;
+            },
+        )?;
         if checksum64(&bytes) != entry.checksum {
             return Err(FileSystemError::CorruptState {
                 reason: "transaction manifest namespace object checksum mismatch",
@@ -2120,17 +2421,18 @@ fn manifest_transaction_object_key_maps(
 fn manifest_snapshot_records(
     store: &LocalObjectStore,
     entries: &[TransactionManifestEntry],
+    candidate_objects: Option<&BTreeMap<ObjectKey, Vec<u8>>>,
 ) -> Result<BTreeMap<Vec<u8>, SnapshotRecord>> {
     let mut snapshots = BTreeMap::new();
     for entry in entries {
         if entry.role != TransactionManifestObjectRole::TransactionSnapshotCatalogEntry {
             continue;
         }
-        let bytes = store
-            .get(entry.object_key)?
-            .ok_or(FileSystemError::CorruptState {
+        let bytes = recovery_object_bytes(store, candidate_objects, entry.object_key)?.ok_or(
+            FileSystemError::CorruptState {
                 reason: "manifest references missing snapshot catalog entry",
-            })?;
+            },
+        )?;
         if checksum64(&bytes) != entry.checksum {
             return Err(FileSystemError::CorruptState {
                 reason: "transaction manifest snapshot object checksum mismatch",
@@ -2147,56 +2449,20 @@ fn manifest_snapshot_records(
     Ok(snapshots)
 }
 
-pub(crate) fn load_v0390_fixed_object_state(
-    store: &mut LocalObjectStore,
-    superblock_bytes: &[u8],
-) -> Result<FileSystemState> {
-    let (superblock, legacy_snapshots) = decode_superblock(superblock_bytes)?;
-    let state = load_state_from_superblock_with_content_validation(
-        store,
-        &superblock,
-        None,
-        legacy_snapshots,
-        false,
-        None,
-    )?;
-    for inode in state.inodes.values().filter(|inode| inode.is_file_like()) {
-        let _ = crate::read_v0390_fixed_content_from_store(store, inode.inode_id, inode)?;
-    }
-    Ok(state)
-}
-
-pub(crate) fn load_state_from_superblock(
-    store: &mut LocalObjectStore,
-    superblock: &SuperblockRecord,
-    transaction_id: Option<u64>,
-    legacy_snapshots: Option<Vec<SnapshotRecord>>,
-    manifest_entries: Option<&[TransactionManifestEntry]>,
-) -> Result<FileSystemState> {
-    load_state_from_superblock_with_content_validation(
-        store,
-        superblock,
-        transaction_id,
-        legacy_snapshots,
-        true,
-        manifest_entries,
-    )
-}
-
 fn load_state_from_superblock_for_content_inspection(
     store: &mut LocalObjectStore,
     superblock: &SuperblockRecord,
     transaction_id: u64,
-    legacy_snapshots: Option<Vec<SnapshotRecord>>,
     manifest_entries: &[TransactionManifestEntry],
+    candidate_objects: Option<&BTreeMap<ObjectKey, Vec<u8>>>,
 ) -> Result<FileSystemState> {
     load_state_from_superblock_with_content_validation(
         store,
         superblock,
         Some(transaction_id),
-        legacy_snapshots,
         false,
         Some(manifest_entries),
+        candidate_objects,
     )
 }
 
@@ -2204,12 +2470,12 @@ fn load_state_from_superblock_with_content_validation(
     store: &mut LocalObjectStore,
     superblock: &SuperblockRecord,
     transaction_id: Option<u64>,
-    legacy_snapshots: Option<Vec<SnapshotRecord>>,
     validate_file_content: bool,
     manifest_entries: Option<&[TransactionManifestEntry]>,
+    candidate_objects: Option<&BTreeMap<ObjectKey, Vec<u8>>>,
 ) -> Result<FileSystemState> {
     let (manifest_inode_keys, manifest_directory_keys) = manifest_entries
-        .map(|entries| manifest_transaction_object_key_maps(store, entries))
+        .map(|entries| manifest_transaction_object_key_maps(store, entries, candidate_objects))
         .transpose()?
         .map_or((None, None), |(inode_keys, directory_keys)| {
             (Some(inode_keys), Some(directory_keys))
@@ -2234,9 +2500,11 @@ fn load_state_from_superblock_with_content_validation(
                     None => inode_object_key(inode_id),
                 },
             };
-            let bytes = store.get(inode_key)?.ok_or(FileSystemError::CorruptState {
-                reason: "superblock references a missing inode object",
-            })?;
+            let bytes = recovery_object_bytes(store, candidate_objects, inode_key)?.ok_or(
+                FileSystemError::CorruptState {
+                    reason: "superblock references a missing inode object",
+                },
+            )?;
             let inode = decode_inode(&bytes)?;
             if inode.inode_id != inode_id {
                 return Err(FileSystemError::CorruptState {
@@ -2254,9 +2522,11 @@ fn load_state_from_superblock_with_content_validation(
                         None => directory_object_key(inode_id),
                     },
                 };
-                let dir_bytes = store.get(dir_key)?.ok_or(FileSystemError::CorruptState {
-                    reason: "directory inode is missing its directory object",
-                })?;
+                let dir_bytes = recovery_object_bytes(store, candidate_objects, dir_key)?.ok_or(
+                    FileSystemError::CorruptState {
+                        reason: "directory inode is missing its directory object",
+                    },
+                )?;
                 let directory = decode_directory(&dir_bytes)?;
                 directories.insert(inode_id, directory);
             }
@@ -2264,33 +2534,43 @@ fn load_state_from_superblock_with_content_validation(
         }
     }
     if validate_file_content {
-        validate_loaded_state(store, &inodes, &directories, transaction_id.is_none())?;
+        validate_loaded_state(store, &inodes, &directories)?;
     } else {
         validate_loaded_namespace_state(&inodes, &directories)?;
     }
-    let mut snapshots = BTreeMap::new();
-    if let Some(legacy) = legacy_snapshots {
-        // Old-format superblock: snapshots embedded inline.
-        for snapshot in legacy {
-            validate_snapshot_name(&snapshot.name)?;
-            if snapshots
-                .insert(snapshot.name.clone(), snapshot.clone())
-                .is_some()
-            {
-                return Err(FileSystemError::Decode {
-                    object: "local filesystem superblock",
-                    reason: "duplicate snapshot name",
-                });
+    let mut snapshots = match manifest_entries {
+        Some(entries) => manifest_snapshot_records(store, entries, candidate_objects)?,
+        None => BTreeMap::new(),
+    };
+    if manifest_entries.is_none() {
+        if let Some(cg_id) = transaction_id {
+            // Load current snapshot records from transaction manifest entries.
+            let manifest_key = transaction_manifest_object_key(cg_id);
+            if let Some(manifest_bytes) = store.get(manifest_key)? {
+                let manifest = decode_transaction_manifest(&manifest_bytes)?;
+                for entry in manifest.entries {
+                    if entry.role == TransactionManifestObjectRole::TransactionExtentMap {
+                        // Extent maps are now tracked within FileSystemState; skip here.
+                        // They are loaded and validated separately during mount.
+                    }
+                    if entry.role == TransactionManifestObjectRole::TransactionSnapshotCatalogEntry
+                    {
+                        let snap_bytes =
+                            store
+                                .get(entry.object_key)?
+                                .ok_or(FileSystemError::CorruptState {
+                                    reason: "manifest references missing snapshot catalog entry",
+                                })?;
+                        let snapshot = decode_snapshot_record(&snap_bytes)?;
+                        if snapshots.insert(snapshot.name.clone(), snapshot).is_some() {
+                            return Err(FileSystemError::Decode {
+                                object: "local filesystem superblock",
+                                reason: "duplicate snapshot name",
+                            });
+                        }
+                    }
+                }
             }
-        }
-    } else if let Some(entries) = manifest_entries {
-        snapshots = manifest_snapshot_records(store, entries)?;
-    } else if let Some(cg_id) = transaction_id {
-        // Legacy caller without an already-authenticated manifest.
-        let manifest_key = transaction_manifest_object_key(cg_id);
-        if let Some(manifest_bytes) = store.get(manifest_key)? {
-            let manifest = decode_transaction_manifest(&manifest_bytes)?;
-            snapshots = manifest_snapshot_records(store, &manifest.entries)?;
         }
     }
     Ok(FileSystemState {
@@ -2342,7 +2622,6 @@ pub(crate) fn load_state_from_superblock_incremental(
     transaction_id: u64,
     current_state: &FileSystemState,
     snapshot_generation: u64,
-    legacy_snapshots: Option<Vec<SnapshotRecord>>,
     manifest_entries: Option<&[TransactionManifestEntry]>,
 ) -> Result<FileSystemState> {
     // Collect known inode IDs from bitmap without eager loading.
@@ -2354,22 +2633,74 @@ pub(crate) fn load_state_from_superblock_incremental(
     // inodes whose object keys live in prior transactions.
     let inode_key_map: Option<BTreeMap<InodeId, ObjectKey>>;
     let dir_key_map: Option<BTreeMap<InodeId, ObjectKey>>;
-    let mut snapshots;
+    let mut snapshots = BTreeMap::new();
     if let Some(entries) = manifest_entries {
-        let (ikm, dkm) = manifest_transaction_object_key_maps(store, entries)?;
-        snapshots = manifest_snapshot_records(store, entries)?;
+        let mut ikm: BTreeMap<InodeId, ObjectKey> = BTreeMap::new();
+        let mut dkm: BTreeMap<InodeId, ObjectKey> = BTreeMap::new();
+        for entry in entries {
+            match entry.role {
+                TransactionManifestObjectRole::TransactionInode => {
+                    let bytes =
+                        store
+                            .get(entry.object_key)?
+                            .ok_or(FileSystemError::CorruptState {
+                                reason: "manifest inode entry references missing object",
+                            })?;
+                    let inode = decode_inode(&bytes)?;
+                    ikm.insert(inode.inode_id, entry.object_key);
+                }
+                TransactionManifestObjectRole::TransactionDirectory => {
+                    let bytes =
+                        store
+                            .get(entry.object_key)?
+                            .ok_or(FileSystemError::CorruptState {
+                                reason: "manifest directory entry references missing object",
+                            })?;
+                    let dir_inode_id = decode_directory_inode_id(&bytes)?;
+                    dkm.insert(dir_inode_id, entry.object_key);
+                }
+                TransactionManifestObjectRole::TransactionSnapshotCatalogEntry => {
+                    let snap_bytes =
+                        store
+                            .get(entry.object_key)?
+                            .ok_or(FileSystemError::CorruptState {
+                                reason: "manifest references missing snapshot catalog entry",
+                            })?;
+                    let snapshot = decode_snapshot_record(&snap_bytes)?;
+                    if snapshots.insert(snapshot.name.clone(), snapshot).is_some() {
+                        return Err(FileSystemError::Decode {
+                            object: "local filesystem superblock",
+                            reason: "duplicate snapshot name",
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
         inode_key_map = Some(ikm);
         dir_key_map = Some(dkm);
     } else {
         inode_key_map = None;
         dir_key_map = None;
-        snapshots = BTreeMap::new();
-        // Old format: load snapshots from store-embedded manifest.
-        if legacy_snapshots.is_none() {
-            let manifest_key = transaction_manifest_object_key(transaction_id);
-            if let Some(manifest_bytes) = store.get(manifest_key)? {
-                let manifest = decode_transaction_manifest(&manifest_bytes)?;
-                snapshots = manifest_snapshot_records(store, &manifest.entries)?;
+        let manifest_key = transaction_manifest_object_key(transaction_id);
+        if let Some(manifest_bytes) = store.get(manifest_key)? {
+            let manifest = decode_transaction_manifest(&manifest_bytes)?;
+            for entry in manifest.entries {
+                if entry.role == TransactionManifestObjectRole::TransactionSnapshotCatalogEntry {
+                    let snap_bytes =
+                        store
+                            .get(entry.object_key)?
+                            .ok_or(FileSystemError::CorruptState {
+                                reason: "manifest references missing snapshot catalog entry",
+                            })?;
+                    let snapshot = decode_snapshot_record(&snap_bytes)?;
+                    if snapshots.insert(snapshot.name.clone(), snapshot).is_some() {
+                        return Err(FileSystemError::Decode {
+                            object: "local filesystem superblock",
+                            reason: "duplicate snapshot name",
+                        });
+                    }
+                }
             }
         }
     }
@@ -2416,22 +2747,8 @@ pub(crate) fn load_state_from_superblock_incremental(
     }
 
     // Structural validation covers the reloaded subset + invariants.
-    validate_loaded_state_incremental(store, &inodes, &directories, &reloaded_inode_ids, false)?;
+    validate_loaded_state_incremental(store, &inodes, &directories, &reloaded_inode_ids)?;
 
-    if let Some(legacy) = legacy_snapshots {
-        for snapshot in legacy {
-            validate_snapshot_name(&snapshot.name)?;
-            if snapshots
-                .insert(snapshot.name.clone(), snapshot.clone())
-                .is_some()
-            {
-                return Err(FileSystemError::Decode {
-                    object: "local filesystem superblock",
-                    reason: "duplicate snapshot name",
-                });
-            }
-        }
-    }
     Ok(FileSystemState {
         inode_authority: DatasetInodeAuthority::from_recovered_inode_ids(
             ROOT_DATASET_ID,
@@ -2566,17 +2883,8 @@ pub(crate) fn load_state_from_transaction_incremental(
         }
         None
     };
-    let (superblock, legacy_snapshots) = decode_superblock(&superblock_bytes)?;
-    // Format-version mount gate: refuse if running code is older than
-    // the most recent writer (downgrade fence) or cannot satisfy the
-    // filesystem's minimum version requirement.
-    if CURRENT_FORMAT_VERSION < superblock.format_version_min {
-        return Err(FileSystemError::FormatVersionIncompatible {
-            running_version: CURRENT_FORMAT_VERSION,
-            filesystem_min: superblock.format_version_min,
-            filesystem_max: superblock.format_version_max,
-        });
-    }
+    let superblock = decode_superblock(&superblock_bytes)?;
+    validate_superblock_format_compatibility(&superblock)?;
     if superblock.generation != root.generation
         || superblock.next_inode_id != root.next_inode_id
         || superblock.inode_count != root.inode_count
@@ -2591,7 +2899,6 @@ pub(crate) fn load_state_from_transaction_incremental(
         root.transaction_id,
         current_state,
         root.generation,
-        legacy_snapshots,
         manifest.as_ref().map(|m| m.entries.as_slice()),
     )?;
     if let Some(manifest) = manifest {
@@ -2615,7 +2922,6 @@ fn validate_loaded_state_incremental(
     inodes: &BTreeMap<InodeId, InodeRecord>,
     directories: &BTreeMap<InodeId, BTreeMap<Vec<u8>, NamespaceEntry>>,
     reloaded_inode_ids: &[InodeId],
-    allow_v0390_fixed_content: bool,
 ) -> Result<()> {
     validate_loaded_namespace_state(inodes, directories)?;
     // Only read content for inodes that were reloaded from the
@@ -2624,13 +2930,7 @@ fn validate_loaded_state_incremental(
     for &inode_id in reloaded_inode_ids {
         if let Some(inode) = inodes.get(&inode_id) {
             if inode.is_file_like() {
-                let _ = read_content_from_store(
-                    store,
-                    inode.inode_id,
-                    inode,
-                    allow_v0390_fixed_content,
-                    None,
-                )?;
+                let _ = read_content_from_store(store, inode.inode_id, inode, None)?;
             }
         }
     }
@@ -2681,26 +2981,18 @@ pub(crate) fn validate_loaded_state(
     store: &LocalObjectStore,
     inodes: &BTreeMap<InodeId, InodeRecord>,
     directories: &BTreeMap<InodeId, BTreeMap<Vec<u8>, NamespaceEntry>>,
-    allow_v0390_fixed_content: bool,
 ) -> Result<()> {
     validate_loaded_namespace_state(inodes, directories)?;
-    validate_loaded_file_content(store, inodes, allow_v0390_fixed_content)
+    validate_loaded_file_content(store, inodes)
 }
 
 fn validate_loaded_file_content(
     store: &LocalObjectStore,
     inodes: &BTreeMap<InodeId, InodeRecord>,
-    allow_v0390_fixed_content: bool,
 ) -> Result<()> {
     for inode in inodes.values() {
         if inode.is_file_like() {
-            let _ = read_content_from_store(
-                store,
-                inode.inode_id,
-                inode,
-                allow_v0390_fixed_content,
-                None,
-            )?;
+            let _ = read_content_from_store(store, inode.inode_id, inode, None)?;
         }
     }
     Ok(())
@@ -2902,6 +3194,650 @@ pub(crate) fn reachable_inodes_from_root(
     }
     Ok(reachable)
 }
+
+#[cfg(test)]
+mod selection_authority_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct ScriptedRecoverySource {
+        store: LocalObjectStore,
+        io_fail_transactions: BTreeSet<u64>,
+        strict_content_io_fail_transactions: BTreeSet<u64>,
+        operational_fail_transactions: BTreeSet<u64>,
+        invalid_generations: BTreeSet<u64>,
+        load_calls: Vec<u64>,
+    }
+
+    impl CommittedRootRecoverySource for ScriptedRecoverySource {
+        fn raw_store(&self) -> &LocalObjectStore {
+            &self.store
+        }
+
+        fn load_committed_state(
+            &mut self,
+            root: &RootCommitRecord,
+            _supporting_store_indices: &BTreeSet<usize>,
+            _root_authentication_key: RootAuthenticationKey,
+        ) -> Result<FileSystemState> {
+            self.load_calls.push(root.transaction_id);
+            if self.invalid_generations.contains(&root.generation) {
+                return Err(FileSystemError::CorruptState {
+                    reason: "scripted invalid committed-root candidate",
+                });
+            }
+            if self.io_fail_transactions.contains(&root.transaction_id) {
+                return Err(FileSystemError::Store(StoreError::Io {
+                    operation: "scripted candidate read",
+                    path: self.store.root().join("scripted-candidate"),
+                    source: std::io::Error::other("scripted candidate-local I/O failure"),
+                }));
+            }
+            if self
+                .strict_content_io_fail_transactions
+                .contains(&root.transaction_id)
+            {
+                return Err(pool_candidate_content_error(FileSystemError::Store(
+                    StoreError::InvalidOptions {
+                        reason: "strict read could not inspect every placement receipt copy",
+                    },
+                )));
+            }
+            if self
+                .operational_fail_transactions
+                .contains(&root.transaction_id)
+            {
+                return Err(pool_candidate_content_error(FileSystemError::Store(
+                    StoreError::InvalidOptions {
+                        reason: "pool is locked: encryption key required for I/O",
+                    },
+                )));
+            }
+            Ok(initial_state())
+        }
+
+        fn read_current_content_for_retention(&self, key: ObjectKey) -> Result<Option<Vec<u8>>> {
+            Ok(self.store.get(key)?)
+        }
+    }
+
+    fn temp_root(label: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("tidefs-root-selection-{label}-{nonce}"))
+    }
+
+    fn scripted_source(label: &str) -> (PathBuf, ScriptedRecoverySource) {
+        let root = temp_root(label);
+        let _ = std::fs::remove_dir_all(&root);
+        let store = LocalObjectStore::open(&root).expect("open scripted recovery store");
+        (
+            root,
+            ScriptedRecoverySource {
+                store,
+                io_fail_transactions: BTreeSet::new(),
+                strict_content_io_fail_transactions: BTreeSet::new(),
+                operational_fail_transactions: BTreeSet::new(),
+                invalid_generations: BTreeSet::new(),
+                load_calls: Vec::new(),
+            },
+        )
+    }
+
+    fn root_for_transaction(transaction_id: u64, generation: u64) -> RootCommitRecord {
+        RootCommitRecord {
+            slot: root_slot_for_transaction(transaction_id),
+            transaction_id,
+            generation,
+            next_inode_id: 2,
+            inode_count: 1,
+            superblock_checksum: IntegrityDigest64(1),
+            manifest_checksum: IntegrityDigest64::ZERO,
+            manifest_entry_count: 0,
+            root_authentication: None,
+        }
+    }
+
+    fn append_root_bytes(source: &mut ScriptedRecoverySource, slot: u64, bytes: &[u8]) {
+        source
+            .store
+            .put(root_slot_object_key(slot), bytes)
+            .expect("append root candidate");
+        source.store.sync_all().expect("sync root candidate");
+    }
+
+    #[test]
+    fn candidate_local_io_is_terminal_before_older_candidate() {
+        let (root, mut source) = scripted_source("candidate-io-fallback");
+        let older = root_for_transaction(2, 2);
+        let newer = root_for_transaction(3, 3);
+        append_root_bytes(&mut source, older.slot, &encode_root_commit(&older));
+        append_root_bytes(&mut source, newer.slot, &encode_root_commit(&newer));
+        source.io_fail_transactions.insert(newer.transaction_id);
+
+        let error = match select_latest_committed_root_from_source(
+            &mut source,
+            RootAuthenticationKey::demo_key(),
+        ) {
+            Ok(_) => panic!("unresolved candidate I/O must prevent writable older-root fallback"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            FileSystemError::Store(StoreError::Io { .. })
+        ));
+        assert_eq!(source.load_calls, vec![newer.transaction_id]);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn strict_content_read_io_is_skippable_before_older_candidate() {
+        let (root, mut source) = scripted_source("strict-content-io-fallback");
+        let older = root_for_transaction(2, 2);
+        let newer = root_for_transaction(3, 3);
+        append_root_bytes(&mut source, older.slot, &encode_root_commit(&older));
+        append_root_bytes(&mut source, newer.slot, &encode_root_commit(&newer));
+        source
+            .strict_content_io_fail_transactions
+            .insert(newer.transaction_id);
+
+        let selection = select_latest_committed_root_from_source(
+            &mut source,
+            RootAuthenticationKey::demo_key(),
+        )
+        .expect("object-local strict-read I/O must not fence an older candidate");
+        assert_eq!(
+            selection.report.selected_transaction_id,
+            Some(older.transaction_id)
+        );
+        assert_eq!(selection.report.selected_generation, Some(older.generation));
+        assert_eq!(
+            source.load_calls,
+            vec![newer.transaction_id, older.transaction_id]
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn operational_pool_failure_is_terminal_before_older_root_fallback() {
+        let (root, mut source) = scripted_source("candidate-operational-failure");
+        let older = root_for_transaction(2, 2);
+        let newer = root_for_transaction(3, 3);
+        append_root_bytes(&mut source, older.slot, &encode_root_commit(&older));
+        append_root_bytes(&mut source, newer.slot, &encode_root_commit(&newer));
+        source
+            .operational_fail_transactions
+            .insert(newer.transaction_id);
+
+        assert!(matches!(
+            select_latest_committed_root_from_source(
+                &mut source,
+                RootAuthenticationKey::demo_key()
+            ),
+            Err(FileSystemError::Store(StoreError::InvalidOptions {
+                reason: "pool is locked: encryption key required for I/O"
+            }))
+        ));
+        assert_eq!(source.load_calls, vec![newer.transaction_id]);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn divergent_quorum_roots_with_same_transaction_fail_closed() {
+        let (root, mut source) = scripted_source("same-transaction-divergence");
+        let first = root_for_transaction(2, 2);
+        let mut second = first.clone();
+        second.generation = 3;
+        append_root_bytes(&mut source, first.slot, &encode_root_commit(&first));
+        append_root_bytes(&mut source, second.slot, &encode_root_commit(&second));
+
+        assert!(matches!(
+            select_latest_committed_root_from_source(
+                &mut source,
+                RootAuthenticationKey::demo_key()
+            ),
+            Err(FileSystemError::CorruptState {
+                reason: "conflicting authenticated committed roots share a transaction id"
+            })
+        ));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn invalid_same_transaction_candidate_does_not_veto_valid_authority() {
+        let (root, mut source) = scripted_source("same-transaction-invalid-candidate");
+        let valid = root_for_transaction(2, 2);
+        let mut invalid = valid.clone();
+        invalid.generation = 3;
+        append_root_bytes(&mut source, valid.slot, &encode_root_commit(&valid));
+        append_root_bytes(&mut source, invalid.slot, &encode_root_commit(&invalid));
+        source.invalid_generations.insert(invalid.generation);
+
+        let selection = select_latest_committed_root_from_source(
+            &mut source,
+            RootAuthenticationKey::demo_key(),
+        )
+        .expect("an invalid peer record must not veto valid same-transaction authority");
+        assert_eq!(
+            selection.report.selected_transaction_id,
+            Some(valid.transaction_id)
+        );
+        assert_eq!(selection.report.selected_generation, Some(valid.generation));
+        assert_eq!(source.load_calls, vec![valid.transaction_id; 2]);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn quorum_future_root_version_is_terminal_before_older_fallback() {
+        let (root, mut source) = scripted_source("future-version-terminal");
+        let older = root_for_transaction(2, 2);
+        let future = root_for_transaction(3, 3);
+        append_root_bytes(&mut source, older.slot, &encode_root_commit(&older));
+        let mut future_bytes = encode_root_commit(&future);
+        let future_version = FILESYSTEM_FORMAT_VERSION.checked_add(1).unwrap();
+        future_bytes[ROOT_COMMIT_MAGIC.len()..ROOT_COMMIT_MAGIC.len() + 2]
+            .copy_from_slice(&future_version.to_le_bytes());
+        append_root_bytes(&mut source, future.slot, &future_bytes);
+
+        assert!(matches!(
+            select_latest_committed_root_from_source(
+                &mut source,
+                RootAuthenticationKey::demo_key()
+            ),
+            Err(FileSystemError::FormatVersionIncompatible {
+                running_version: FILESYSTEM_FORMAT_VERSION,
+                filesystem_min,
+                filesystem_max,
+            }) if filesystem_min == future_version && filesystem_max == future_version
+        ));
+        assert!(source.load_calls.is_empty());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn retired_lower_root_version_does_not_fence_newer_current_root() {
+        let (root, mut source) = scripted_source("retired-version-skipped");
+        let retired = root_for_transaction(2, 2);
+        let current = root_for_transaction(3, 3);
+        let mut retired_bytes = encode_root_commit(&retired);
+        let retired_version = FILESYSTEM_FORMAT_VERSION.checked_sub(1).unwrap();
+        retired_bytes[ROOT_COMMIT_MAGIC.len()..ROOT_COMMIT_MAGIC.len() + 2]
+            .copy_from_slice(&retired_version.to_le_bytes());
+        append_root_bytes(&mut source, retired.slot, &retired_bytes);
+        append_root_bytes(&mut source, current.slot, &encode_root_commit(&current));
+
+        let selection = select_latest_committed_root_from_source(
+            &mut source,
+            RootAuthenticationKey::demo_key(),
+        )
+        .expect("retired lower-version history should be skippable");
+        assert_eq!(
+            selection.report.selected_transaction_id,
+            Some(current.transaction_id)
+        );
+        assert_eq!(source.load_calls, vec![current.transaction_id]);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn inadmissible_future_version_prefix_cannot_fence_current_root() {
+        let (root, mut source) = scripted_source("future-prefix-inadmissible");
+        let current = root_for_transaction(2, 2);
+        append_root_bytes(&mut source, current.slot, &encode_root_commit(&current));
+        let mut inadmissible = root_for_transaction(0, 3);
+        inadmissible.slot = root_slot_for_transaction(0);
+        let mut inadmissible_bytes = encode_root_commit(&inadmissible);
+        let future_version = FILESYSTEM_FORMAT_VERSION.checked_add(1).unwrap();
+        inadmissible_bytes[ROOT_COMMIT_MAGIC.len()..ROOT_COMMIT_MAGIC.len() + 2]
+            .copy_from_slice(&future_version.to_le_bytes());
+        append_root_bytes(&mut source, inadmissible.slot, &inadmissible_bytes);
+
+        let selection = select_latest_committed_root_from_source(
+            &mut source,
+            RootAuthenticationKey::demo_key(),
+        )
+        .expect("inadmissible future prefix should be skipped");
+        assert_eq!(
+            selection.report.selected_transaction_id,
+            Some(current.transaction_id)
+        );
+        assert_eq!(source.load_calls, vec![current.transaction_id]);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn root_candidate_stored_in_wrong_slot_is_never_loaded() {
+        let (root, mut source) = scripted_source("wrong-slot");
+        let candidate = root_for_transaction(2, 2);
+        let wrong_slot = (candidate.slot + 1) % FILESYSTEM_ROOT_SLOT_COUNT;
+        append_root_bytes(&mut source, wrong_slot, &encode_root_commit(&candidate));
+
+        let selection = select_latest_committed_root_from_source(
+            &mut source,
+            RootAuthenticationKey::demo_key(),
+        )
+        .expect("wrong-slot candidate should be skipped");
+        assert_eq!(
+            selection.report.outcome,
+            RecoveryProbeOutcome::ExplicitIntegrityOrMediaError
+        );
+        assert!(source.load_calls.is_empty());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(test)]
+mod candidate_history_tests {
+    use super::*;
+    use crate::persistence::{persist_transaction_objects, publish_root_commit};
+    use std::fs::OpenOptions;
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use tidefs_local_object_store::{
+        segment_file_name, DeviceBacking, DeviceClass, DeviceConfig, DeviceKind, PoolConfig,
+        PoolProperties, StoreOptions,
+    };
+
+    fn temp_root(label: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("tidefs-candidate-history-{label}-{nonce}"))
+    }
+
+    fn make_pool(label: &str) -> (PathBuf, Pool) {
+        let root = temp_root(label);
+        let data_root = root.join("pool");
+        let replica_root = root.join("metadata-replica");
+        // StoreOptions replicas are LocalObjectStore replicas. Use the
+        // explicitly admitted single-store compatibility bridge so this
+        // diagnostic fixture can exercise replicated candidate history; block
+        // device admission is covered independently.
+        let mut options = StoreOptions::test_fast();
+        options.replica_paths = vec![replica_root];
+        let config = PoolConfig {
+            name: format!("candidate-history-{label}"),
+            root_path: data_root.clone(),
+            devices: vec![DeviceConfig {
+                media_class: Default::default(),
+                path: data_root.clone(),
+                backing: DeviceBacking::DirectoryObjectStoreCompat,
+                class: DeviceClass::Data,
+                kind: DeviceKind::Single { path: data_root },
+                encryption: None,
+                compression: None,
+            }],
+        };
+        let pool = Pool::create(config, PoolProperties::default(), &options)
+            .expect("create candidate-history pool");
+        (root, pool)
+    }
+
+    fn state_with_generation_uid_and_next_inode(
+        generation: u64,
+        uid: u32,
+        next_inode_id: u64,
+    ) -> FileSystemState {
+        let mut state = initial_state();
+        state.generation = generation;
+        state.set_inode_authority_next_inode_id(next_inode_id);
+        Arc::make_mut(&mut state.inodes)
+            .get_mut(&ROOT_INODE_ID)
+            .expect("root inode")
+            .uid = uid;
+        state
+    }
+
+    fn persist_candidate(
+        pool: &mut Pool,
+        state: &FileSystemState,
+        key: RootAuthenticationKey,
+    ) -> RootCommitRecord {
+        let transaction_id = state.generation.max(ROOT_COMMIT_MIN_TRANSACTION_ID);
+        let root = persist_transaction_objects(pool.raw_primary_store_mut(), state, transaction_id)
+            .expect("persist candidate transaction objects");
+        pool.raw_primary_store_mut()
+            .sync_all()
+            .expect("sync candidate transaction objects");
+        publish_root_commit(pool.raw_primary_store_mut(), &root, key)
+            .expect("publish candidate root");
+        pool.raw_primary_store_mut()
+            .sync_all()
+            .expect("sync candidate root");
+        root
+    }
+
+    #[test]
+    fn authenticated_same_transaction_candidates_conflict_only_after_candidate_binding() {
+        let (root, mut pool) = make_pool("authenticated-conflict");
+        let key = RootAuthenticationKey::demo_key();
+        let first = persist_candidate(
+            &mut pool,
+            &state_with_generation_uid_and_next_inode(2, 1001, 2),
+            key,
+        );
+        let second = persist_candidate(
+            &mut pool,
+            &state_with_generation_uid_and_next_inode(2, 1002, 3),
+            key,
+        );
+        assert_ne!(first.superblock_checksum, second.superblock_checksum);
+
+        let error = match select_latest_committed_root_from_source(&mut pool, key) {
+            Ok(_) => panic!("two independently valid same-transaction roots must conflict"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            FileSystemError::CorruptState {
+                reason: "conflicting authenticated committed roots share a transaction id"
+            }
+        ));
+
+        drop(pool);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pool_candidate_metadata_falls_back_to_matching_replica_history() {
+        let (root, mut pool) = make_pool("metadata-replica-fallback");
+        let key = RootAuthenticationKey::demo_key();
+        let expected_uid = 4242;
+        let committed = persist_candidate(
+            &mut pool,
+            &state_with_generation_uid_and_next_inode(2, expected_uid, 2),
+            key,
+        );
+        let superblock_key = transaction_superblock_object_key(committed.transaction_id);
+        let location = pool
+            .raw_primary_store()
+            .version_locations_across_stores(superblock_key)[0]
+            .last()
+            .copied()
+            .expect("primary superblock location");
+        let segment_path = pool
+            .raw_primary_store()
+            .segments_dir()
+            .join(segment_file_name(location.segment_id));
+        let mut segment = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&segment_path)
+            .expect("open primary segment for corruption injection");
+        segment
+            .seek(SeekFrom::Start(location.payload_offset))
+            .expect("seek primary superblock payload");
+        let mut byte = [0_u8; 1];
+        segment
+            .read_exact(&mut byte)
+            .expect("read primary superblock byte");
+        byte[0] ^= 0xff;
+        segment
+            .seek(SeekFrom::Start(location.payload_offset))
+            .expect("rewind primary superblock payload");
+        segment
+            .write_all(&byte)
+            .expect("corrupt primary superblock payload");
+        segment.sync_all().expect("sync primary corruption");
+        drop(segment);
+
+        let selection = select_latest_committed_root_from_source(&mut pool, key)
+            .expect("matching replica metadata history should recover the candidate");
+        assert_eq!(
+            selection.report.selected_transaction_id,
+            Some(committed.transaction_id)
+        );
+        assert_eq!(
+            selection
+                .state
+                .expect("selected state")
+                .inodes
+                .get(&ROOT_INODE_ID)
+                .expect("recovered root inode")
+                .uid,
+            expected_uid
+        );
+
+        drop(pool);
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(test)]
+mod mounted_pool_audit_retention_tests {
+    use super::*;
+    use crate::LocalFileSystem;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use tidefs_local_object_store::{DeviceIoClass, StoreOptions};
+
+    fn temp_root(label: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("tidefs-pool-recovery-{label}-{nonce}"))
+    }
+
+    fn options() -> StoreOptions {
+        StoreOptions::test_fast()
+    }
+
+    fn cleanup(paths: &[&PathBuf]) {
+        for path in paths {
+            let _ = std::fs::remove_dir_all(path);
+        }
+    }
+
+    #[test]
+    fn pool_retention_preserves_older_mountable_root_after_newer_content_loses_authority() {
+        let primary = temp_root("older-retained");
+        cleanup(&[&primary]);
+        let root_authentication_key = RootAuthenticationKey::demo_key();
+        let store_options = options();
+        let old_payload = b"older Pool-authorized payload";
+
+        let (older_root, newer_root, older_content_key, newer_content_key) = {
+            let mut fs = LocalFileSystem::open_with_root_authentication_key(
+                &primary,
+                store_options.clone(),
+                root_authentication_key,
+            )
+            .expect("open filesystem");
+            fs.set_auto_commit(false)
+                .expect("test setup mutation must be admitted");
+            fs.create_file("/data", 0o644).expect("create file");
+            fs.replace_file("/data", old_payload)
+                .expect("write older payload");
+            fs.sync_all().expect("commit older payload");
+
+            for index in 0..FILESYSTEM_ROOT_SLOT_COUNT.saturating_add(1) {
+                fs.create_dir(format!("/stable-{index}"), 0o755)
+                    .expect("advance stable root ring");
+                fs.sync_all().expect("commit stable root");
+            }
+            fs.create_snapshot("retain-older-root")
+                .expect("pin older content authority");
+            fs.sync_all().expect("commit snapshot pin");
+            let inode_id = fs.lookup("/data").expect("lookup data file");
+            let older_record = fs.state.inodes.get(&inode_id).expect("older inode");
+            let older_content_key =
+                content_object_key_for_version(inode_id, older_record.data_version);
+            let older_root = fs
+                .selected_current_root_summary()
+                .expect("capture older root");
+
+            fs.replace_file("/data", b"newer payload without retained authority")
+                .expect("write newer payload");
+            fs.sync_all().expect("commit newer root");
+            let newer_record = fs.state.inodes.get(&inode_id).expect("newer inode");
+            let newer_content_key =
+                content_object_key_for_version(inode_id, newer_record.data_version);
+            let newer_root = fs
+                .selected_current_root_summary()
+                .expect("capture newer root");
+            assert_ne!(older_content_key, newer_content_key);
+            (older_root, newer_root, older_content_key, newer_content_key)
+        };
+
+        {
+            let mut pool =
+                LocalFileSystem::default_development_pool(&primary, &store_options, None, None)
+                    .expect("open pool for authority loss");
+            assert!(pool
+                .delete(DeviceIoClass::Data, newer_content_key)
+                .expect("remove newer payload and receipt"));
+            pool.sync_all().expect("sync newer authority loss");
+        }
+
+        let mut fs = LocalFileSystem::open_with_root_authentication_key(
+            &primary,
+            store_options,
+            root_authentication_key,
+        )
+        .expect("reopen through older mountable root");
+        let plan = fs
+            .safe_root_retention_plan()
+            .expect("plan Pool-backed root retention");
+        assert_eq!(plan.audit.selected_root, Some(older_root.clone()));
+        assert_ne!(plan.audit.selected_root, Some(newer_root));
+        assert!(plan.protected_committed_roots.contains(&older_root));
+        assert!(plan.protected_object_keys.contains(&older_content_key));
+        assert!(plan.retention_policy_satisfied());
+
+        fs.safe_reclaim_unprotected_objects()
+            .expect("compact while preserving the older mountable root");
+        assert_eq!(
+            fs.read_file("/data").expect("read retained older payload"),
+            old_payload
+        );
+        assert_eq!(
+            fs.recovery_audit()
+                .expect("audit after retention compaction")
+                .selected_root,
+            Some(older_root)
+        );
+        drop(fs);
+
+        cleanup(&[&primary]);
+    }
+}
+
 // ── cross-device committed-root quorum tests ─────────────────────
 
 #[cfg(test)]
@@ -3151,6 +4087,56 @@ mod receipt_validation_tests {
         LocalObjectStore, PoolConfig, PoolProperties, StoreOptions,
     };
     use tidefs_types_vfs_core::S_IFREG;
+
+    fn superblock_with_format_range(min: u16, max: u16) -> SuperblockRecord {
+        SuperblockRecord {
+            next_inode_id: 2,
+            generation: 1,
+            inode_count: 1,
+            inode_allocation_bitmap: vec![1],
+            format_version_min: min,
+            format_version_max: max,
+        }
+    }
+
+    #[test]
+    fn superblock_format_max_is_a_terminal_downgrade_fence() {
+        let future = CURRENT_FORMAT_VERSION.checked_add(1).unwrap();
+        let error = validate_superblock_format_compatibility(&superblock_with_format_range(
+            CURRENT_FORMAT_VERSION,
+            future,
+        ))
+        .expect_err("a newer last-writer version must fence this reader");
+        assert!(matches!(
+            error,
+            FileSystemError::FormatVersionIncompatible {
+                running_version: CURRENT_FORMAT_VERSION,
+                filesystem_min: CURRENT_FORMAT_VERSION,
+                filesystem_max,
+            } if filesystem_max == future
+        ));
+    }
+
+    #[test]
+    fn superblock_format_range_must_be_nonzero_and_ordered() {
+        for (min, max) in [
+            (0, CURRENT_FORMAT_VERSION),
+            (CURRENT_FORMAT_VERSION, 0),
+            (2, 1),
+        ] {
+            assert!(matches!(
+                validate_superblock_format_compatibility(&superblock_with_format_range(min, max)),
+                Err(FileSystemError::CorruptState {
+                    reason: "superblock contains an invalid format-version range"
+                })
+            ));
+        }
+        validate_superblock_format_compatibility(&superblock_with_format_range(
+            CURRENT_FORMAT_VERSION,
+            CURRENT_FORMAT_VERSION,
+        ))
+        .expect("the running writer version is compatible");
+    }
 
     fn temp_dir(label: &str) -> PathBuf {
         let ts = SystemTime::now()

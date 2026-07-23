@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! ## Authority Classification (per docs/cache-authority-model.md)
 //!
-//! This cache is **Derived** and **superseded** by `tidefs-cache-core::PageCache`.
-//! It is a whole-file LRU read cache that mirrors the authoritative filesystem
-//! store for read acceleration.  It must not grow dirty-data ownership, page-level
-//! authority, or invalidation primitives that conflict with cache-core.
-//!
-//! Future work will remove this cache in favor of cache-core::PageCache
-//! delegation, consolidating the duplicate whole-file caching that the A16 review
-//! register identifies as a split-cache risk.  See also `read_cache.rs` in the
-//! local-filesystem for the parallel `HotReadCache` (Derived, same status).
+//! This is a **Derived** daemon-local whole-file LRU over authoritative
+//! filesystem content. It remains a separate dispatch path from
+//! `tidefs-cache-core::PageCache`; removing the local filesystem's former
+//! whole-file cache does not implicitly route adapter reads through cache-core.
+//! It must not grow dirty-data ownership or page-level authority.
 //!
 use std::collections::{HashMap, VecDeque};
 
@@ -43,7 +39,7 @@ pub struct ReadCache {
 
 impl ReadCache {
     /// Cache authority classification per docs/cache-authority-model.md.
-    /// The daemon ReadCache is Derived and superseded by cache-core::PageCache.
+    /// This derived daemon-local cache is not dispatched through cache-core.
     pub const CACHE_AUTHORITY_CLASS: &str = "Derived";
     /// Return the cache authority classification at runtime.
     pub fn cache_authority_class(&self) -> &'static str {
@@ -112,8 +108,7 @@ impl ReadCache {
     ///
     /// If the data is larger than `max_bytes`, it is not cached — caching it
     /// would force all other entries out, rendering the cache useless for
-    /// normal-sized files.  This matches the HotReadCache admission bypass
-    /// for entries exceeding its per-entry limit.
+    /// normal-sized files.
     ///
     /// Otherwise, LRU entries are evicted until both the entry-count bound
     /// and `max_bytes` are satisfied.

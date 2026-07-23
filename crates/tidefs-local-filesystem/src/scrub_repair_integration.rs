@@ -732,7 +732,7 @@ fn current_content_layout(
         return Ok(layout.clone());
     }
 
-    let layout = crate::content::read_content_layout_from_store(store, inode_id, record, true)
+    let layout = crate::content::read_content_layout_from_store(store, inode_id, record)
         .map_err(|_| RepairAuthorityMismatch::CurrentAuthorityUnavailable)?;
     content_layout_cache.insert(inode_id, layout.clone());
     Ok(layout)

@@ -447,12 +447,6 @@ fn main() {
                 process::exit(1);
             }
         }
-        Some("check-mounted-transform-authority" | "check-transform-authority") => {
-            if let Err(err) = storage::check_mounted_transform_authority_current_workspace() {
-                eprintln!("{err}");
-                process::exit(1);
-            }
-        }
         Some("check-btree") => {
             if let Err(err) = storage::check_btree_current_workspace() {
                 eprintln!("{err}");
@@ -721,12 +715,6 @@ fn main() {
         }
         Some("check-online-verifier" | "check-online-scrub") => {
             if let Err(err) = storage::check_online_verifier_current_workspace() {
-                eprintln!("{err}");
-                process::exit(1);
-            }
-        }
-        Some("check-hot-read-cache" | "check-read-cache") => {
-            if let Err(err) = storage::check_hot_read_cache_current_workspace() {
                 eprintln!("{err}");
                 process::exit(1);
             }
@@ -1661,9 +1649,6 @@ fn run_all_checks() {
     if let Err(e) = storage::check_local_filesystem_current_workspace() {
         errors.push(format!("storage/check-local-filesystem: {e}"));
     }
-    if let Err(e) = storage::check_mounted_transform_authority_current_workspace() {
-        errors.push(format!("storage/check-mounted-transform-authority: {e}"));
-    }
     if let Err(e) = storage::check_no_fsck_recovery_current_workspace() {
         errors.push(format!("storage/check-no-fsck-recovery: {e}"));
     }
@@ -2325,7 +2310,6 @@ fn print_summary() {
     println!("local_snapshots_check_command=check-local-snapshots");
     println!("send_receive_check_command=check-send-receive");
     println!("online_verifier_check_command=check-online-verifier");
-    println!("hot_read_cache_check_command=check-hot-read-cache");
     println!("claims_gate_check_command=check-claims-gate");
     println!("release_readiness_verdict_command=release-readiness-verdict");
     println!("claim_validate_command=validate-claim");
@@ -2591,18 +2575,12 @@ fn print_help() {
     println!("  check-v3-record-integrity alias for check-production-integrity-v3");
     println!("  check-root-authentication validate committed-root authentication markers");
     println!("  check-root-auth        alias for check-root-authentication");
-    println!(
-        "  check-mounted-transform-authority validate TFR-006 mounted raw-store inventory and transform claim guard"
-    );
-    println!("  check-transform-authority alias for check-mounted-transform-authority");
     println!("  check-local-snapshots validate snapshot and rollback markers");
     println!("  check-snapshot-rollback alias for check-local-snapshots");
     println!("  check-send-receive validate changed-record export/import markers");
     println!("  check-changed-record-export-import alias for check-send-receive");
     println!("  check-online-verifier validate non-mutating online verifier markers");
     println!("  check-online-scrub alias for check-online-verifier");
-    println!("  check-hot-read-cache validate hot read cache markers");
-    println!("  check-read-cache alias for check-hot-read-cache");
     println!("  check-claims-gate       validate publish-facing capability claims");
     println!("  check-overclaims        alias for check-claims-gate");
     println!("  validate-claim <id>     validate a registered claim evidence set");

@@ -106,7 +106,8 @@ pub mod materialized_cache;
 pub mod mmap_coherency;
 
 /// Canonical cache authority model version (docs/cache-authority-model.md).
-/// The daemon ReadCache is Derived and superseded by cache-core::PageCache.
+/// The daemon ReadCache is Derived and remains a separate adapter dispatch
+/// path from cache-core::PageCache.
 /// The FUSE writeback cache is Optional, gated behind --writeback-cache.
 pub const DAEMON_CACHE_AUTHORITY_MODEL_VERSION: &str = "v0.420";
 
@@ -494,7 +495,9 @@ pub fn run_mount(config: MountConfig) -> Result<(), String> {
             summary.root_inode_id.get()
         );
         let mut engine = session.into_engine();
-        engine.set_timestamp_policy(tidefs_inode_attributes::timestamp::TimestampPolicy::Noatime);
+        engine
+            .set_timestamp_policy(tidefs_inode_attributes::timestamp::TimestampPolicy::Noatime)
+            .map_err(|e| format!("set snapshot export timestamp policy: {e}"))?;
         engine = engine.with_read_only();
         let dataset_id: Option<DatasetId> = None;
         (engine, None, dataset_id)
@@ -569,15 +572,22 @@ pub fn run_mount(config: MountConfig) -> Result<(), String> {
             }
         }
         if let Some(ds_id) = dataset_id {
-            lfs.set_mounted_dataset_id(*ds_id.as_bytes());
+            lfs.set_mounted_dataset_id(*ds_id.as_bytes())
+                .map_err(|e| format!("set mounted dataset identity: {e}"))?;
         }
 
-        lfs.set_write_buffer_flush_threshold_bytes(MOUNT_WRITE_BUFFER_FLUSH_THRESHOLD_BYTES);
-        lfs.set_auto_commit(false);
-        lfs.set_commit_group_throughput_profile();
-        lfs.set_max_uncommitted_mutations(MOUNT_MAX_UNCOMMITTED_MUTATIONS);
+        lfs.set_write_buffer_flush_threshold_bytes(MOUNT_WRITE_BUFFER_FLUSH_THRESHOLD_BYTES)
+            .map_err(|e| format!("set mounted write-buffer threshold: {e}"))?;
+        lfs.set_auto_commit(false)
+            .map_err(|e| format!("set mounted auto-commit policy: {e}"))?;
+        lfs.set_commit_group_throughput_profile()
+            .map_err(|e| format!("set mounted commit-group profile: {e}"))?;
+        lfs.set_max_uncommitted_mutations(MOUNT_MAX_UNCOMMITTED_MUTATIONS)
+            .map_err(|e| format!("set mounted mutation threshold: {e}"))?;
 
-        let tracker = Arc::clone(lfs.writeback_range_tracker());
+        let tracker = lfs
+            .clone_writeback_range_tracker()
+            .map_err(|e| format!("attach mounted writeback tracker: {e}"))?;
 
         // Build the base VfsLocalFileSystem, optionally scoped to a dataset root.
         let mut engine = VfsLocalFileSystem::new(lfs);
@@ -1168,6 +1178,7 @@ mod dataset_mount_lookup_tests {
 
         let ds_id = DatasetId::from_bytes([2u8; 16]);
         fs.dataset_catalog_mut()
+            .unwrap()
             .create(
                 "ds1",
                 ds_id,
@@ -1185,6 +1196,7 @@ mod dataset_mount_lookup_tests {
 
         // Rename ds1 -> renamed_ds
         fs.dataset_catalog_mut()
+            .unwrap()
             .rename("ds1", "renamed_ds")
             .unwrap();
         fs.persist_dataset_catalog().unwrap();
@@ -1204,6 +1216,7 @@ mod dataset_mount_lookup_tests {
 
         let ds_id = DatasetId::from_bytes([3u8; 16]);
         fs.dataset_catalog_mut()
+            .unwrap()
             .create(
                 "ds3",
                 ds_id,
@@ -1217,7 +1230,7 @@ mod dataset_mount_lookup_tests {
         fs.persist_dataset_catalog().unwrap();
 
         // Destroy the dataset
-        fs.dataset_catalog_mut().destroy("ds3").unwrap();
+        fs.dataset_catalog_mut().unwrap().destroy("ds3").unwrap();
         fs.persist_dataset_catalog().unwrap();
 
         // Verify dataset entry is removed (lifecycle_state returns NotFound)

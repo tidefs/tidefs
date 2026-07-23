@@ -5,12 +5,12 @@ use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use tidefs_extent_map::ExtentMap;
-use tidefs_local_object_store::pool::Pool;
+use tidefs_local_object_store::pool::{is_strict_read_authority_error, PlacementReceipt, Pool};
 use tidefs_local_object_store::{
     checksum64, IntegrityDigest64, LocalObjectStore, ObjectKey, StoreError, StoreOptions,
+    StoredObject,
 };
 use tidefs_receive_stream::receive_persistence::{
     validate_receive_contract, BaseRootPinLookup, ReceiveContract, ReceivePersistenceError,
@@ -938,7 +938,7 @@ pub(crate) fn load_state_from_changed_records(
         });
     }
 
-    let (superblock, _legacy_snapshots) = decode_superblock(superblock_bytes)?;
+    let superblock = decode_superblock(superblock_bytes)?;
     if superblock.generation != root.generation
         || superblock.next_inode_id != root.next_inode_id
         || superblock.inode_count != root.inode_count
@@ -1432,13 +1432,17 @@ pub(crate) fn changed_record_payload(
 }
 
 fn validate_incremental_content_entry_payload(
-    store: &LocalObjectStore,
+    pool: &Pool,
     entry: &TransactionManifestEntry,
     missing_reason: &'static str,
     checksum_reason: &'static str,
 ) -> Result<()> {
-    let payload = store
-        .get(entry.object_key)?
+    let payload = pool
+        .get_with_current_receipt(
+            tidefs_local_object_store::DeviceIoClass::Data,
+            entry.object_key,
+        )?
+        .map(|(payload, _receipt)| payload)
         .ok_or(FileSystemError::Decode {
             object: "local filesystem incremental receive target",
             reason: missing_reason,
@@ -1453,7 +1457,7 @@ fn validate_incremental_content_entry_payload(
 }
 
 fn validate_omitted_incremental_content_manifest(
-    store: &LocalObjectStore,
+    pool: &Pool,
     root: &PreparedChangedRecordRoot,
     entry: &TransactionManifestEntry,
 ) -> Result<()> {
@@ -1471,12 +1475,12 @@ fn validate_omitted_incremental_content_manifest(
             reason: "omitted content manifest has no matching file inode",
         })?;
 
-    let _content = read_content_from_store(store, inode.inode_id, inode, true, None)?;
+    let _content = MountedContentReadAuthority::new(pool).read_all(inode.inode_id, inode)?;
     Ok(())
 }
 
 fn validate_incremental_content_objects(
-    store: &LocalObjectStore,
+    pool: &Pool,
     prepared: &PreparedChangedRecordExport,
     omitted_only: bool,
 ) -> Result<()> {
@@ -1502,7 +1506,7 @@ fn validate_incremental_content_objects(
                     continue;
                 }
                 validate_incremental_content_entry_payload(
-                    store,
+                    pool,
                     entry,
                     "content object required by incoming manifest is missing from target",
                     "content object required by incoming manifest failed checksum validation",
@@ -1512,11 +1516,11 @@ fn validate_incremental_content_objects(
 
             match entry.role {
                 TransactionManifestObjectRole::VersionedContent => {
-                    validate_omitted_incremental_content_manifest(store, root, entry)?;
+                    validate_omitted_incremental_content_manifest(pool, root, entry)?;
                 }
                 TransactionManifestObjectRole::VersionedContentChunk => {
                     validate_incremental_content_entry_payload(
-                        store,
+                        pool,
                         entry,
                         "omitted content object required by incremental base is missing from target",
                         "omitted content object required by incremental base failed checksum validation",
@@ -1530,17 +1534,17 @@ fn validate_incremental_content_objects(
 }
 
 fn validate_incremental_target_content_objects(
-    store: &LocalObjectStore,
+    pool: &Pool,
     prepared: &PreparedChangedRecordExport,
 ) -> Result<()> {
-    validate_incremental_content_objects(store, prepared, false)
+    validate_incremental_content_objects(pool, prepared, false)
 }
 
 fn validate_incremental_omitted_content_objects(
-    store: &LocalObjectStore,
+    pool: &Pool,
     prepared: &PreparedChangedRecordExport,
 ) -> Result<()> {
-    validate_incremental_content_objects(store, prepared, true)
+    validate_incremental_content_objects(pool, prepared, true)
 }
 
 fn target_has_incremental_base_root_slot(
@@ -1622,7 +1626,8 @@ pub(crate) fn receive_changed_records_into_empty_root(
     // Try to resume from an interrupted prior attempt.
     let skip_keys = if staging.exists() {
         let export_id = compute_export_identity(export);
-        match try_load_checkpoint_for_resume(&staging, &options, export_id) {
+        match try_load_checkpoint_for_resume(&staging, &options, export_id, prepared.total_records)
+        {
             Ok(Some(cp)) => {
                 // Matching checkpoint found: resume from completed keys.
                 cp.completed_keys
@@ -1685,20 +1690,522 @@ pub(crate) fn rewrite_snapshot_roots_for_import(
     Ok(())
 }
 
+#[derive(Default)]
+struct ReceivedContentGraph {
+    keys: BTreeSet<ObjectKey>,
+    canonical_dedup_keys: BTreeSet<ObjectKey>,
+}
+
+fn validate_received_canonical_dedup_payload(
+    canonical_key: ObjectKey,
+    payload: &[u8],
+) -> Result<()> {
+    let chunk = decode_content_chunk(payload)?;
+    let fingerprint = compute_content_fingerprint(&chunk.bytes);
+    if content_dedup_object_key(&fingerprint) != canonical_key {
+        return Err(FileSystemError::Decode {
+            object: "local filesystem send/receive root",
+            reason: "canonical dedup payload does not match its content-addressed key",
+        });
+    }
+    Ok(())
+}
+
+fn changed_record_content_graph(
+    records: &BTreeMap<ObjectKey, ChangedObjectRecord>,
+    inode: &InodeRecord,
+    layout: &ContentLayout,
+) -> Result<ReceivedContentGraph> {
+    let mut graph = ReceivedContentGraph::default();
+    graph.keys.insert(content_object_key_for_version(
+        inode.inode_id,
+        inode.data_version,
+    ));
+    let ContentLayout::Chunked(manifest) = layout else {
+        return Ok(graph);
+    };
+
+    for chunk_ref in &manifest.chunks {
+        if chunk_ref.is_hole() {
+            continue;
+        }
+        let chunk_key = content_chunk_object_key_for_version(
+            inode.inode_id,
+            chunk_ref.data_version,
+            chunk_ref.chunk_index,
+        );
+        let payload = changed_record_payload(records, chunk_key)?;
+        graph.keys.insert(chunk_key);
+        if is_dedup_redirect(payload) {
+            let canonical_key = decode_dedup_redirect(payload)?;
+            let canonical_record = records.get(&canonical_key).ok_or(FileSystemError::Decode {
+                object: "local filesystem send/receive root",
+                reason: "dedup redirect references a missing canonical changed-record object",
+            })?;
+            validate_received_canonical_dedup_payload(canonical_key, &canonical_record.payload)?;
+            graph.keys.insert(canonical_key);
+            graph.canonical_dedup_keys.insert(canonical_key);
+        }
+    }
+    Ok(graph)
+}
+
+fn pool_content_graph(
+    pool: &Pool,
+    inode: &InodeRecord,
+    layout: &ContentLayout,
+) -> Result<ReceivedContentGraph> {
+    let authority = MountedContentReadAuthority::new(pool);
+    let mut graph = ReceivedContentGraph::default();
+    graph.keys.insert(content_object_key_for_version(
+        inode.inode_id,
+        inode.data_version,
+    ));
+    let ContentLayout::Chunked(manifest) = layout else {
+        return Ok(graph);
+    };
+
+    for chunk_ref in &manifest.chunks {
+        if chunk_ref.is_hole() {
+            continue;
+        }
+        let chunk_key = content_chunk_object_key_for_version(
+            inode.inode_id,
+            chunk_ref.data_version,
+            chunk_ref.chunk_index,
+        );
+        let (payload, _receipt) = authority.read_current_object(chunk_key)?.ok_or(
+            FileSystemError::ReceiptAuthorityUnavailable {
+                object_key: chunk_key,
+                expected_generation: chunk_ref.placement_receipt_generation,
+            },
+        )?;
+        let _validated_chunk = authority.read_chunk(inode.inode_id, chunk_ref)?;
+        graph.keys.insert(chunk_key);
+        if is_dedup_redirect(&payload) {
+            let canonical_key = decode_dedup_redirect(&payload)?;
+            graph.keys.insert(canonical_key);
+            graph.canonical_dedup_keys.insert(canonical_key);
+        }
+    }
+    Ok(graph)
+}
+
+fn logical_receive_probe_is_incomplete(error: &FileSystemError) -> bool {
+    match error {
+        FileSystemError::Store(store_error) => {
+            is_strict_read_authority_error(store_error)
+                || crate::is_skippable_store_error(store_error)
+        }
+        FileSystemError::Decode { .. }
+        | FileSystemError::CorruptState { .. }
+        | FileSystemError::ReceiptAuthorityUnavailable { .. }
+        | FileSystemError::ReceiptAuthorityMissing { .. }
+        | FileSystemError::ReceiptAuthorityStale { .. }
+        | FileSystemError::ReceiptAuthoritySynthetic { .. }
+        | FileSystemError::ReceiptAuthorityMalformedPolicy { .. }
+        | FileSystemError::ReceiptAuthorityUnderWidth { .. }
+        | FileSystemError::ReceiptAuthorityOverWidth { .. } => true,
+        _ => false,
+    }
+}
+
+fn staged_content_graph_if_valid(
+    pool: &Pool,
+    inode: &InodeRecord,
+) -> Result<Option<(Vec<u8>, ReceivedContentGraph)>> {
+    let authority = MountedContentReadAuthority::new(pool);
+    let layout = match authority.read_layout(inode.inode_id, inode) {
+        Ok(layout) => layout,
+        Err(error) if logical_receive_probe_is_incomplete(&error) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let content = match authority.read_all(inode.inode_id, inode) {
+        Ok(content) => content,
+        Err(error) if logical_receive_probe_is_incomplete(&error) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let graph = match pool_content_graph(pool, inode, &layout) {
+        Ok(graph) => graph,
+        Err(error) if logical_receive_probe_is_incomplete(&error) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    Ok(Some((content, graph)))
+}
+
+fn logically_completed_received_content_keys(
+    pool: &Pool,
+    prepared: &PreparedChangedRecordExport,
+    completed: &BTreeSet<ObjectKey>,
+) -> Result<BTreeSet<(RootIdentity, ObjectKey)>> {
+    let mut logically_completed = BTreeSet::new();
+    for root in &prepared.roots {
+        let root_identity = RootIdentity::from_summary(&root.source_root);
+        for inode in root.state.inodes.values() {
+            if !inode.is_file_like() || inode.size == 0 {
+                continue;
+            }
+            let content_key = content_object_key_for_version(inode.inode_id, inode.data_version);
+            if !records_and_checkpoint_contain(&root.records, completed, content_key) {
+                continue;
+            }
+
+            let sender_layout =
+                read_content_layout_from_changed_records(&root.records, inode.inode_id, inode)?;
+            let sender_content =
+                read_content_from_changed_records(&root.records, inode.inode_id, inode)?;
+            let sender_graph = changed_record_content_graph(&root.records, inode, &sender_layout)?;
+            if !sender_graph
+                .keys
+                .iter()
+                .all(|key| records_and_checkpoint_contain(&root.records, completed, *key))
+            {
+                continue;
+            }
+
+            let Some((staged_content, staged_graph)) = staged_content_graph_if_valid(pool, inode)?
+            else {
+                continue;
+            };
+            if staged_content != sender_content {
+                continue;
+            }
+
+            for key in sender_graph.keys.intersection(&staged_graph.keys) {
+                if !sender_graph.canonical_dedup_keys.contains(key) {
+                    logically_completed.insert((root_identity, *key));
+                }
+            }
+        }
+    }
+    Ok(logically_completed)
+}
+
+fn records_and_checkpoint_contain(
+    records: &BTreeMap<ObjectKey, ChangedObjectRecord>,
+    completed: &BTreeSet<ObjectKey>,
+    key: ObjectKey,
+) -> bool {
+    records.contains_key(&key) && completed.contains(&key)
+}
+
+fn received_content_candidate_keys(
+    prepared: &PreparedChangedRecordExport,
+) -> Result<BTreeSet<ObjectKey>> {
+    let mut candidates = BTreeSet::new();
+    let mut logical_content_by_key = BTreeMap::new();
+    let mut stream_payload_by_key = BTreeMap::new();
+    for root in &prepared.roots {
+        let mut allowed_stream_keys = BTreeSet::new();
+        for inode in root.state.inodes.values() {
+            if !inode.is_file_like() {
+                continue;
+            }
+            let content_key = content_object_key_for_version(inode.inode_id, inode.data_version);
+            if !root.records.contains_key(&content_key) {
+                continue;
+            }
+
+            let sender_layout =
+                read_content_layout_from_changed_records(&root.records, inode.inode_id, inode)?;
+            let sender_content =
+                read_content_from_changed_records(&root.records, inode.inode_id, inode)?;
+            if logical_content_by_key
+                .insert(content_key, sender_content.clone())
+                .is_some_and(|existing| existing != sender_content)
+            {
+                return Err(FileSystemError::Decode {
+                    object: "local filesystem send/receive stream",
+                    reason: "deterministic content key has conflicting logical bytes across roots",
+                });
+            }
+            let sender_graph = changed_record_content_graph(&root.records, inode, &sender_layout)?;
+            allowed_stream_keys.extend(sender_graph.keys.iter().copied());
+            candidates.extend(sender_graph.keys);
+
+            if inode.size > 0 {
+                candidates.insert(content_key);
+                for chunk_index in 0..content_chunk_count(inode.size)? {
+                    candidates.insert(content_chunk_object_key_for_version(
+                        inode.inode_id,
+                        inode.data_version,
+                        chunk_index,
+                    ));
+                }
+            }
+        }
+
+        for record in root.records.values().filter(|record| {
+            matches!(
+                record.role,
+                ChangedRecordObjectRole::VersionedContent
+                    | ChangedRecordObjectRole::VersionedContentChunk
+            )
+        }) {
+            if stream_payload_by_key
+                .insert(record.object_key, record.payload.clone())
+                .is_some_and(|existing| existing != record.payload)
+            {
+                return Err(FileSystemError::Decode {
+                    object: "local filesystem send/receive stream",
+                    reason: "deterministic content key has conflicting payloads across roots",
+                });
+            }
+            if !allowed_stream_keys.contains(&record.object_key) {
+                // Incremental export can retain a canonical dedup object even
+                // when its unchanged per-inode redirect was omitted. Accept
+                // only a genuinely content-addressed canonical payload.
+                validate_received_canonical_dedup_payload(record.object_key, &record.payload)?;
+            }
+            candidates.insert(record.object_key);
+        }
+    }
+    Ok(candidates)
+}
+
+fn protected_committed_content_keys(
+    pool: &mut Pool,
+    audit_roots: &[CommittedRootSummary],
+    root_authentication_key: RootAuthenticationKey,
+) -> Result<BTreeSet<ObjectKey>> {
+    let mut protected = BTreeSet::new();
+    let mut pending = audit_roots.to_vec();
+    let mut visited = BTreeSet::new();
+
+    while let Some(summary) = pending.pop() {
+        let identity = RootIdentity::from_summary(&summary);
+        if !visited.insert(identity) {
+            continue;
+        }
+        let root = root_commit_from_summary(&summary);
+        let state = crate::recovery::load_state_from_transaction_pool(
+            pool,
+            &root,
+            root_authentication_key,
+        )?;
+        for inode in state.inodes.values() {
+            if !inode.is_file_like() {
+                continue;
+            }
+            let content_key = content_object_key_for_version(inode.inode_id, inode.data_version);
+            // Absence is part of the committed authority for an empty file.
+            // Protect the deterministic key even when the committed root has
+            // no object there, otherwise receive could stage nonempty bytes at
+            // that key and invalidate the formerly mountable root.
+            protected.insert(content_key);
+            let authority = MountedContentReadAuthority::new(pool);
+            let current = authority.read_current_object(content_key)?;
+            if current.is_none() && inode.size == 0 {
+                continue;
+            }
+            if current.is_none() {
+                return Err(FileSystemError::ReceiptAuthorityUnavailable {
+                    object_key: content_key,
+                    expected_generation: 0,
+                });
+            }
+            let layout = authority.read_layout(inode.inode_id, inode)?;
+            let _content = authority.read_all(inode.inode_id, inode)?;
+            let graph = pool_content_graph(pool, inode, &layout)?;
+            protected.extend(graph.keys);
+        }
+        for snapshot in state.snapshots.values() {
+            if crate::snapshot::snapshot_record_retains_data(snapshot) {
+                pending.push(snapshot.root.clone());
+            }
+        }
+    }
+    Ok(protected)
+}
+
 fn receive_completed_content_record_is_valid(
-    store: &LocalObjectStore,
+    pool: &Pool,
     record: &ChangedObjectRecord,
 ) -> Result<bool> {
-    let Some(payload) = store.get(record.object_key)? else {
+    match pool.get_with_current_receipt(
+        tidefs_local_object_store::DeviceIoClass::Data,
+        record.object_key,
+    ) {
+        Ok(Some((payload, _receipt))) => {
+            Ok(payload == record.payload && checksum64(&payload) == record.checksum)
+        }
+        Ok(None) => Ok(false),
+        Err(error) if is_strict_read_authority_error(&error) => Ok(false),
+        Err(error) => Err(FileSystemError::Store(error)),
+    }
+}
+
+/// Stage one validated stream payload without overwriting an existing
+/// deterministic content key with different bytes.
+fn stage_received_content_record(
+    pool: &mut Pool,
+    record: &ChangedObjectRecord,
+    proven_uncommitted_keys: &BTreeSet<ObjectKey>,
+) -> Result<bool> {
+    if receive_completed_content_record_is_valid(pool, record)? {
         return Ok(false);
-    };
-    Ok(checksum64(&payload) == record.checksum)
+    }
+    if !proven_uncommitted_keys.contains(&record.object_key) {
+        return Err(FileSystemError::CorruptState {
+            reason: "received content conflicts with protected committed authority",
+        });
+    }
+
+    // INTEGRITY: replaceable_keys is the exact candidate-key difference from
+    // every recursively retained committed content graph. Stream preparation
+    // has already authenticated this record's exact key, checksum, and bytes;
+    // Pool additionally refuses to replace a different receipt-backed value.
+    let _receipt =
+        pool.ensure_prepublication_data_object_with_receipt(record.object_key, &record.payload)?;
+    if receive_completed_content_record_is_valid(pool, record)? {
+        Ok(true)
+    } else {
+        Err(FileSystemError::CorruptState {
+            reason: "received content staging did not preserve exact receipt authority",
+        })
+    }
+}
+
+/// Receipt-producing writer for content that has been validated from a
+/// changed-record stream but is not yet named by any committed target root.
+struct ReceivedContentWriteStore<'a> {
+    pool: &'a mut Pool,
+    inode_id: InodeId,
+    data_version: u64,
+    file_size: u64,
+    records: &'a BTreeMap<ObjectKey, ChangedObjectRecord>,
+    replaceable_keys: &'a BTreeSet<ObjectKey>,
+}
+
+impl ContentWriteStore for ReceivedContentWriteStore<'_> {
+    fn get(&self, key: ObjectKey) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .pool
+            .get_with_current_receipt(tidefs_local_object_store::DeviceIoClass::Data, key)?
+            .map(|(bytes, _receipt)| bytes))
+    }
+
+    fn get_with_receipt_generation(
+        &self,
+        key: ObjectKey,
+    ) -> Result<Option<(Vec<u8>, Option<u64>)>> {
+        Ok(self
+            .pool
+            .get_with_current_receipt(tidefs_local_object_store::DeviceIoClass::Data, key)?
+            .map(|(bytes, receipt)| (bytes, Some(receipt.generation))))
+    }
+
+    fn put_with_receipt(&mut self, key: ObjectKey, payload: &[u8]) -> Result<PlacementReceipt> {
+        let manifest_key = content_object_key_for_version(self.inode_id, self.data_version);
+        let may_replace = self.replaceable_keys.contains(&key);
+        if key == manifest_key {
+            let manifest = decode_content_manifest(payload)?;
+            if manifest.inode_id != self.inode_id
+                || manifest.data_version != self.data_version
+                || manifest.file_size != self.file_size
+            {
+                return Err(FileSystemError::CorruptState {
+                    reason: "received content manifest does not match its validated inode",
+                });
+            }
+        } else {
+            let chunk = decode_content_chunk(payload)?;
+            let expected_key = content_chunk_object_key_for_version(
+                self.inode_id,
+                self.data_version,
+                chunk.chunk_index,
+            );
+            if chunk.inode_id != self.inode_id
+                || chunk.data_version != self.data_version
+                || key != expected_key
+            {
+                return Err(FileSystemError::CorruptState {
+                    reason: "received content write escaped its validated data version",
+                });
+            }
+        }
+
+        if may_replace {
+            // INTEGRITY: this exact key is in the candidate-key difference from
+            // every recursively retained committed content graph. A valid
+            // different value may be replaced only when it is byte-for-byte
+            // the already authenticated sender record being normalized. This
+            // keeps retry normalization possible without turning the generic
+            // prepublication ensure API into an arbitrary overwrite authority.
+            match self
+                .pool
+                .get_with_current_receipt(tidefs_local_object_store::DeviceIoClass::Data, key)
+            {
+                Ok(Some((current, receipt))) if current == payload => return Ok(receipt),
+                Ok(Some((current, _receipt))) => {
+                    let sender_record = self.records.get(&key).ok_or(
+                        FileSystemError::CorruptState {
+                            reason: "received normalization has no authenticated sender record for its content key",
+                        },
+                    )?;
+                    if sender_record.object_key != key
+                        || current != sender_record.payload
+                        || checksum64(&current) != sender_record.checksum
+                    {
+                        return Err(FileSystemError::CorruptState {
+                            reason: "received normalization found unexpected current receipt-backed content",
+                        });
+                    }
+                    return Ok(self
+                        .pool
+                        .put_with_receipt(
+                            tidefs_local_object_store::DeviceIoClass::Data,
+                            key,
+                            payload,
+                        )?
+                        .1);
+                }
+                Ok(None) => {}
+                Err(error) if is_strict_read_authority_error(&error) => {}
+                Err(error) => return Err(FileSystemError::Store(error)),
+            }
+            return Ok(self
+                .pool
+                .ensure_prepublication_data_object_with_receipt(key, payload)?);
+        }
+
+        match self
+            .pool
+            .get_with_current_receipt(tidefs_local_object_store::DeviceIoClass::Data, key)?
+        {
+            Some((current, receipt)) if current == payload => Ok(receipt),
+            Some((_current, _receipt)) => Err(FileSystemError::CorruptState {
+                reason: "received normalization would replace committed content authority",
+            }),
+            None => Err(FileSystemError::CorruptState {
+                reason: "received normalization lost staged content authority",
+            }),
+        }
+    }
+
+    fn put(&mut self, _key: ObjectKey, _payload: &[u8]) -> Result<StoredObject> {
+        Err(FileSystemError::Unsupported {
+            operation: "changed-record content normalization",
+            reason: "received content must publish through proven-uncommitted receipt authority",
+        })
+    }
+
+    fn raw_store(&self) -> &LocalObjectStore {
+        self.pool.raw_primary_store()
+    }
+
+    fn raw_store_mut(&mut self) -> &mut LocalObjectStore {
+        self.pool.raw_primary_store_mut()
+    }
 }
 
 fn normalize_received_content_receipts(
     pool: &mut Pool,
     state: &FileSystemState,
+    records: &BTreeMap<ObjectKey, ChangedObjectRecord>,
     normalized_content: &mut BTreeSet<ObjectKey>,
+    replaceable_keys: &BTreeSet<ObjectKey>,
+    merge_plan: Option<&crate::receive_merge_planner::ReceiveMergePlan>,
 ) -> Result<()> {
     let mut dedup_index = DedupIndex::new();
     for inode in state.inodes.values() {
@@ -1706,14 +2213,43 @@ fn normalize_received_content_receipts(
             continue;
         }
         let content_key = content_object_key_for_version(inode.inode_id, inode.data_version);
+        if !records.contains_key(&content_key) {
+            // Incremental streams omit unchanged content. Its existing target
+            // Pool authority is validated before import and must not be
+            // rewritten as if it were received payload.
+            continue;
+        }
+        // A deterministic content identity shared by several imported roots
+        // must be normalized exactly once. Rewriting it for a later root
+        // would rotate receipt generations and invalidate the manifest
+        // checksum already committed for the earlier snapshot root.
         if !normalized_content.insert(content_key) {
             continue;
         }
-        // Decode imported bytes without trusting the sender's placement receipt,
-        // then rewrite once through the target pool so root manifests stay stable.
-        let content =
-            read_content_from_store(pool.raw_primary_store(), inode.inode_id, inode, true, None)?;
-        let mut store = pool.pool_store_mut();
+        if !should_import_object(merge_plan, &content_key) {
+            // KeepLocal preserves the target's complete, strictly receipted
+            // content graph. It must not be bypassed by the target-generation
+            // normalization pass that follows ordinary record staging.
+            let authority = MountedContentReadAuthority::new(pool);
+            let _layout = authority.read_layout(inode.inode_id, inode)?;
+            let _content = authority.read_all(inode.inode_id, inode)?;
+            continue;
+        }
+        // The incoming manifest names sender-local placement generations, so
+        // decode the already-validated sender graph rather than comparing
+        // those generations with the target Pool. Rewriting below publishes
+        // target-local generations through receipt-producing writes.
+        let _sender_layout =
+            read_content_layout_from_changed_records(records, inode.inode_id, inode)?;
+        let content = read_content_from_changed_records(records, inode.inode_id, inode)?;
+        let mut store = ReceivedContentWriteStore {
+            pool,
+            inode_id: inode.inode_id,
+            data_version: inode.data_version,
+            file_size: inode.size,
+            records,
+            replaceable_keys,
+        };
         write_chunked_content(
             false,
             &mut store,
@@ -1733,17 +2269,7 @@ pub(crate) fn receive_staging_root(root: &Path) -> Result<PathBuf> {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("tidefs-receive");
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| FileSystemError::Unsupported {
-            operation: "send/receive import",
-            reason: "system clock is before unix epoch",
-        })?
-        .as_nanos();
-    Ok(parent.join(format!(
-        ".{name}.receive-staging-{}-{nanos}",
-        std::process::id()
-    )))
+    Ok(parent.join(format!(".{name}.receive-staging")))
 }
 
 pub(crate) fn sync_directory_path(path: &Path) -> Result<()> {
@@ -1829,10 +2355,9 @@ pub(crate) fn receive_incremental_changed_records(
         authorization,
     )?;
 
-    let mut preflight_pool = LocalFileSystem::default_development_pool(root, &options, None, None)?;
-    let preflight_store = preflight_pool.raw_primary_store_mut();
-    if target_has_incremental_base_root_slot(preflight_store, from_root)? {
-        validate_incremental_omitted_content_objects(preflight_store, &prepared)?;
+    let preflight_pool = LocalFileSystem::default_development_pool(root, &options, None, None)?;
+    if target_has_incremental_base_root_slot(preflight_pool.raw_primary_store(), from_root)? {
+        validate_incremental_omitted_content_objects(&preflight_pool, &prepared)?;
     }
     drop(preflight_pool);
 
@@ -1868,7 +2393,7 @@ pub(crate) fn receive_incremental_changed_records(
             options.clone(),
             root_authentication_key,
         )?;
-        let audit = existing.recovery_audit()?;
+        let audit = existing.recovery_audit_pool_authority()?;
         let stream_lineage = ReceiveMergeStreamLineageManifest::from_changed_record_export(export);
         let _common_ancestor = locate_common_ancestor(&stream_lineage, &audit)?;
         let authorized_base = verify_incremental_base_root_authority(&existing, &audit, from_root)?;
@@ -1889,41 +2414,67 @@ pub(crate) fn receive_incremental_changed_records(
     // base-state loading and omitted-content validation are skipped.  Object-
     // level import decisions come from the merge plan instead.
     let has_merge_plan = merge_plan.is_some();
-    {
-        let store = pool.raw_primary_store_mut();
-        if !has_merge_plan {
-            let base_root = root_commit_from_summary(&authorized_base);
-            let _base_state =
-                load_state_from_transaction(store, &base_root, root_authentication_key)?;
-        }
-
-        for root_rec in &prepared.roots {
-            for record in root_rec.records.values() {
-                if matches!(
-                    record.role,
-                    ChangedRecordObjectRole::VersionedContent
-                        | ChangedRecordObjectRole::VersionedContentChunk
-                ) {
-                    // When a merge plan is present, consult it for per-object
-                    // import decisions: skip objects marked KeepLocal so the
-                    // target's existing version is preserved.
-                    if !should_import_object(merge_plan, &record.object_key) {
-                        continue;
-                    }
-                    store.put(record.object_key, &record.payload)?;
-                }
-            }
-        }
-        if !has_merge_plan {
-            validate_incremental_target_content_objects(store, &prepared)?;
-        }
+    if !has_merge_plan {
+        let base_root = root_commit_from_summary(&authorized_base);
+        let _base_state = crate::recovery::load_state_from_transaction_pool(
+            &mut pool,
+            &base_root,
+            root_authentication_key,
+        )?;
     }
 
-    // Persist all roots (re-signing with the target's authentication key).
+    let candidate_keys = received_content_candidate_keys(&prepared)?;
+    let audit_roots = crate::recovery::audit_recovery_pool(&mut pool, root_authentication_key)?
+        .valid_committed_roots;
+    let protected_keys =
+        protected_committed_content_keys(&mut pool, &audit_roots, root_authentication_key)?;
+    let replaceable_keys: BTreeSet<ObjectKey> = candidate_keys
+        .difference(&protected_keys)
+        .copied()
+        .collect();
+    for root_rec in &prepared.roots {
+        for record in root_rec.records.values() {
+            if !matches!(
+                record.role,
+                ChangedRecordObjectRole::VersionedContent
+                    | ChangedRecordObjectRole::VersionedContentChunk
+            ) {
+                continue;
+            }
+            // When a merge plan is present, consult it for per-object import
+            // decisions. Existing same-key content must match byte-for-byte;
+            // receive never raw-overwrites committed deterministic keys.
+            if !should_import_object(merge_plan, &record.object_key) {
+                continue;
+            }
+            let _newly_persisted =
+                stage_received_content_record(&mut pool, record, &replaceable_keys)?;
+        }
+    }
+    if !has_merge_plan {
+        validate_incremental_target_content_objects(&pool, &prepared)?;
+    }
+
+    // Normalize every received content graph before any transaction object or
+    // root slot can name it, then make that content durable on every Pool
+    // device.
     let mut roots = prepared.roots.clone();
     roots.sort_by_key(|r| r.source_root.transaction_id);
-    let mut imported_summaries = BTreeMap::new();
     let mut normalized_content = BTreeSet::new();
+    for root_rec in &roots {
+        normalize_received_content_receipts(
+            &mut pool,
+            &root_rec.state,
+            &root_rec.records,
+            &mut normalized_content,
+            &replaceable_keys,
+            merge_plan,
+        )?;
+    }
+    pool.sync_all()?;
+
+    // Persist all roots (re-signing with the target's authentication key).
+    let mut imported_summaries = BTreeMap::new();
     let mut selected_summary = None;
     let mut snapshot_catalog_entries = 0_usize;
 
@@ -1935,7 +2486,6 @@ pub(crate) fn receive_incremental_changed_records(
             &imported_summaries,
             identity == prepared.current_identity,
         )?;
-        normalize_received_content_receipts(&mut pool, &state, &mut normalized_content)?;
         let unsigned_root = persist_transaction_objects(
             pool.raw_primary_store_mut(),
             &state,
@@ -1953,11 +2503,8 @@ pub(crate) fn receive_incremental_changed_records(
         }
         imported_summaries.insert(identity, summary);
     }
-    let final_audit = {
-        let store = pool.raw_primary_store_mut();
-        store.sync_all()?;
-        crate::recovery::audit_recovery_store(store, root_authentication_key)?
-    };
+    pool.sync_all()?;
+    let final_audit = crate::recovery::audit_recovery_pool(&mut pool, root_authentication_key)?;
     drop(pool);
 
     let selected = selected_summary.ok_or(FileSystemError::CorruptState {
@@ -2192,11 +2739,17 @@ fn try_load_checkpoint_for_resume(
     staging_root: &Path,
     options: &StoreOptions,
     expected_export_id: IntegrityDigest64,
+    expected_total_records: u64,
 ) -> Result<Option<ReceiveCheckpoint>> {
     let mut pool = LocalFileSystem::default_development_pool(staging_root, options, None, None)?;
     let store = pool.raw_primary_store_mut();
     match load_receive_checkpoint(store)? {
-        Some(cp) if cp.export_identity == expected_export_id => Ok(Some(cp)),
+        Some(cp)
+            if cp.export_identity == expected_export_id
+                && cp.total_records == expected_total_records =>
+        {
+            Ok(Some(cp))
+        }
         _ => Ok(None),
     }
 }
@@ -2233,33 +2786,57 @@ pub(crate) fn receive_changed_records_into_staging_with_skip(
     {
         let store = pool.raw_primary_store_mut();
         if let Some(existing_cp) = load_receive_checkpoint(store)? {
-            if existing_cp.export_identity == export_identity {
+            if existing_cp.export_identity == export_identity
+                && existing_cp.total_records == prepared.total_records
+            {
                 completed.extend(existing_cp.completed_keys);
             }
         }
+    }
 
-        // Phase 1: write content objects, skipping only verified staged keys.
-        for root in &prepared.roots {
-            for record in root.records.values() {
-                if !matches!(
-                    record.role,
-                    ChangedRecordObjectRole::VersionedContent
-                        | ChangedRecordObjectRole::VersionedContentChunk
-                ) {
-                    continue;
-                }
-                if completed.contains(&record.object_key)
-                    && receive_completed_content_record_is_valid(store, record)?
+    let candidate_keys = received_content_candidate_keys(&prepared)?;
+    let audit_roots = crate::recovery::audit_recovery_pool(&mut pool, root_authentication_key)?
+        .valid_committed_roots;
+    let protected_keys =
+        protected_committed_content_keys(&mut pool, &audit_roots, root_authentication_key)?;
+    let replaceable_keys: BTreeSet<ObjectKey> = candidate_keys
+        .difference(&protected_keys)
+        .copied()
+        .collect();
+    let logically_completed =
+        logically_completed_received_content_keys(&pool, &prepared, &completed)?;
+
+    // A staging key may be repaired only when no valid committed root in the
+    // staging pool (including recursively retained snapshot/clone roots)
+    // protects it. Checkpoint skips are root-scoped because normalization can
+    // legitimately change sender-local receipt fields.
+    for root in &prepared.roots {
+        let root_identity = RootIdentity::from_summary(&root.source_root);
+        for record in root.records.values() {
+            if !matches!(
+                record.role,
+                ChangedRecordObjectRole::VersionedContent
+                    | ChangedRecordObjectRole::VersionedContentChunk
+            ) {
+                continue;
+            }
+            if completed.contains(&record.object_key) {
+                if logically_completed.contains(&(root_identity, record.object_key))
+                    || receive_completed_content_record_is_valid(&pool, record)?
                 {
                     continue;
                 }
-                store.put(record.object_key, &record.payload)?;
-                completed.insert(record.object_key);
+            }
+            if stage_received_content_record(&mut pool, record, &replaceable_keys)? {
                 newly_persisted.insert(record.object_key);
             }
+            completed.insert(record.object_key);
         }
+    }
 
-        // Persist checkpoint after all content objects are written.
+    // Persist checkpoint after all content objects are receipted.
+    {
+        let store = pool.raw_primary_store_mut();
         let checkpoint = ReceiveCheckpoint {
             export_identity,
             total_records: prepared.total_records,
@@ -2268,11 +2845,26 @@ pub(crate) fn receive_changed_records_into_staging_with_skip(
         write_receive_checkpoint(store, &checkpoint)?;
     }
 
-    // Phase 2: persist transaction objects and roots.
+    // Normalize every received content graph before any transaction object or
+    // root slot can name it, then make that content durable on every Pool
+    // device.
     let mut roots = prepared.roots.clone();
     roots.sort_by_key(|r| r.source_root.transaction_id);
-    let mut imported_summaries = BTreeMap::new();
     let mut normalized_content = BTreeSet::new();
+    for root in &roots {
+        normalize_received_content_receipts(
+            &mut pool,
+            &root.state,
+            &root.records,
+            &mut normalized_content,
+            &replaceable_keys,
+            None,
+        )?;
+    }
+    pool.sync_all()?;
+
+    // Phase 2: persist transaction objects and roots.
+    let mut imported_summaries = BTreeMap::new();
     let mut selected_summary = None;
     let mut snapshot_catalog_entries = 0_usize;
 
@@ -2284,7 +2876,6 @@ pub(crate) fn receive_changed_records_into_staging_with_skip(
             &imported_summaries,
             identity == prepared.current_identity,
         )?;
-        normalize_received_content_receipts(&mut pool, &state, &mut normalized_content)?;
         let unsigned_root = persist_transaction_objects(
             pool.raw_primary_store_mut(),
             &state,
@@ -2304,12 +2895,12 @@ pub(crate) fn receive_changed_records_into_staging_with_skip(
     }
 
     // Remove the checkpoint now that all roots are persisted.
-    let audit = {
+    pool.sync_all()?;
+    {
         let store = pool.raw_primary_store_mut();
-        store.sync_all()?;
         let _ = remove_receive_checkpoint(store);
-        crate::recovery::audit_recovery_store(store, root_authentication_key)?
-    };
+    }
+    let audit = crate::recovery::audit_recovery_pool(&mut pool, root_authentication_key)?;
     drop(pool);
 
     let selected = selected_summary.ok_or(FileSystemError::CorruptState {
@@ -2379,6 +2970,172 @@ fn compute_export_identity_from_prepared(
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    fn receive_test_root(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "tidefs-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time after epoch")
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn committed_empty_file_protects_absent_content_key_from_receive_staging() {
+        let root = receive_test_root("receive-protected-empty-content-key");
+        let options = StoreOptions::test_fast();
+        let root_key = RootAuthenticationKey::from_bytes32([0xA7; ROOT_AUTHENTICATION_KEY_LEN]);
+        let (summary, content_key) = {
+            let mut fs = LocalFileSystem::open_with_root_authentication_key(
+                &root,
+                options.clone(),
+                root_key,
+            )
+            .expect("open target filesystem");
+            let inode = fs.create_file("/empty", 0o644).expect("create empty file");
+            fs.commit().expect("commit empty file");
+            let content_key = {
+                let committed = fs
+                    .state
+                    .inodes
+                    .get(&inode.inode_id)
+                    .expect("committed empty inode");
+                content_object_key_for_version(committed.inode_id, committed.data_version)
+            };
+            let summary = fs
+                .selected_current_root_summary()
+                .expect("select committed root");
+            (summary, content_key)
+        };
+
+        let mut pool = LocalFileSystem::default_development_pool(&root, &options, None, None)
+            .expect("open target pool");
+        assert_eq!(
+            pool.get_with_current_receipt(
+                tidefs_local_object_store::DeviceIoClass::Data,
+                content_key,
+            )
+            .expect("probe empty content key"),
+            None,
+            "a committed empty inode has negative content-key authority"
+        );
+        let protected = protected_committed_content_keys(&mut pool, &[summary], root_key)
+            .expect("collect protected committed keys");
+        assert!(
+            protected.contains(&content_key),
+            "receive must reserve an absent deterministic key named by a committed empty inode"
+        );
+
+        drop(pool);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn receive_normalization_preserves_keep_local_content() {
+        let source_root = receive_test_root("receive-normalize-keep-local-source");
+        let target_root = receive_test_root("receive-normalize-keep-local-target");
+        let options = StoreOptions::test_fast();
+        let source_key = RootAuthenticationKey::from_bytes32([0xB1; ROOT_AUTHENTICATION_KEY_LEN]);
+        let target_key = RootAuthenticationKey::from_bytes32([0xB2; ROOT_AUTHENTICATION_KEY_LEN]);
+
+        let export = {
+            let mut source = LocalFileSystem::open_with_root_authentication_key(
+                &source_root,
+                options.clone(),
+                source_key,
+            )
+            .expect("open source filesystem");
+            source.create_file("/f", 0o644).expect("create source file");
+            source
+                .write_file("/f", 0, b"remote payload")
+                .expect("write source payload");
+            source.commit().expect("commit source payload");
+            source.export_changed_records().expect("export source")
+        };
+        let target_content_key = {
+            let mut target = LocalFileSystem::open_with_root_authentication_key(
+                &target_root,
+                options.clone(),
+                target_key,
+            )
+            .expect("open target filesystem");
+            let created = target.create_file("/f", 0o644).expect("create target file");
+            target
+                .write_file("/f", 0, b"local payload!")
+                .expect("write target payload");
+            target.commit().expect("commit target payload");
+            let inode = target
+                .state
+                .inodes
+                .get(&created.inode_id)
+                .expect("target inode");
+            content_object_key_for_version(inode.inode_id, inode.data_version)
+        };
+
+        let prepared = validate_changed_record_export(&export, false).expect("prepare export");
+        let prepared_root = prepared
+            .roots
+            .iter()
+            .find(|root| RootIdentity::from_summary(&root.source_root) == prepared.current_identity)
+            .expect("prepared current root");
+        let remote_inode = prepared_root
+            .state
+            .inodes
+            .values()
+            .find(|inode| inode.is_file_like())
+            .expect("remote file inode");
+        let content_key =
+            content_object_key_for_version(remote_inode.inode_id, remote_inode.data_version);
+        assert_eq!(
+            content_key, target_content_key,
+            "fixture must exercise one conflicting deterministic content key"
+        );
+
+        let mut pool =
+            LocalFileSystem::default_development_pool(&target_root, &options, None, None)
+                .expect("open target pool");
+        let audit_roots = crate::recovery::audit_recovery_pool(&mut pool, target_key)
+            .expect("audit target roots")
+            .valid_committed_roots;
+        let protected = protected_committed_content_keys(&mut pool, &audit_roots, target_key)
+            .expect("collect target protection");
+        let candidates = received_content_candidate_keys(&prepared).expect("collect candidates");
+        let replaceable: BTreeSet<ObjectKey> = candidates.difference(&protected).copied().collect();
+        let merge_plan = crate::receive_merge_planner::ReceiveMergePlan {
+            policy: crate::receive_merge_planner::ReceiveMergePolicy::KeepLocal,
+            common_ancestor_transaction_id: 1,
+            common_ancestor_generation: 1,
+            decisions: vec![crate::receive_merge_planner::ReceiveMergeDecision::KeepLocal],
+            requires_operator: false,
+            keep_local_keys: BTreeSet::from([content_key]),
+        };
+        let mut normalized = BTreeSet::new();
+        normalize_received_content_receipts(
+            &mut pool,
+            &prepared_root.state,
+            &prepared_root.records,
+            &mut normalized,
+            &replaceable,
+            Some(&merge_plan),
+        )
+        .expect("KeepLocal normalization must preserve strict target authority");
+        drop(pool);
+
+        let target =
+            LocalFileSystem::open_with_root_authentication_key(&target_root, options, target_key)
+                .expect("reopen target");
+        assert_eq!(
+            target.read_file("/f").expect("read target payload"),
+            b"local payload!",
+            "normalization must not rewrite a KeepLocal content object from sender bytes"
+        );
+        drop(target);
+
+        let _ = std::fs::remove_dir_all(&source_root);
+        let _ = std::fs::remove_dir_all(&target_root);
+    }
 
     /// Round-trip encode/decode of an empty ReceiveCheckpoint.
     #[test]
@@ -2785,11 +3542,12 @@ mod tests {
     ///
     /// 1. Create a source filesystem with files and a snapshot.
     /// 2. Export changed records and validate.
-    /// 3. Manually pre-populate a staging directory with partial content
-    ///    objects and a receive checkpoint, simulating an interrupted receive.
-    /// 4. Call the resume-aware receive function with the completed-key
-    ///    skip set, proving the receive completes without duplication or drops.
-    /// 5. Open the received filesystem and verify all files match.
+    /// 3. Pre-populate staging and checkpoint every sender content key.
+    /// 4. Normalize those objects into target-local receipt generations, then
+    ///    stop before publishing any root, modelling the real crash window.
+    /// 5. Retry through the public API and prove logical checkpoint completion
+    ///    does not mistake normalized bytes for a sender-payload collision.
+    /// 6. Open the received filesystem and verify all files match.
     #[test]
     fn receive_resume_from_checkpoint_skips_completed_keys() {
         let source_root = std::env::temp_dir().join(format!(
@@ -2889,46 +3647,87 @@ mod tests {
             "need at least 2 content objects; chunk file should produce them"
         );
 
-        // 5. Create staging, pre-populate with ALL content objects plus a
-        //    checkpoint that lists ALL of them as completed.
+        // 5. Create staging, pre-populate with all sender content objects,
+        //    checkpoint them, and normalize their receipt generations without
+        //    publishing a committed root.
         let staging = receive_staging_root(&target_root).expect("staging root");
         std::fs::create_dir_all(&staging).expect("create staging dir");
         let all_keys: BTreeSet<ObjectKey> = all_content.iter().map(|(k, _)| *k).collect();
+        let sender_manifest = prepared
+            .roots
+            .iter()
+            .flat_map(|root| root.records.values())
+            .find(|record| record.role == ChangedRecordObjectRole::VersionedContent)
+            .map(|record| (record.object_key, record.payload.clone()))
+            .expect("chunked export has a content manifest");
         {
             let mut pool = LocalFileSystem::default_development_pool(&staging, &opts, None, None)
                 .expect("open staging pool");
-            let store = pool.raw_primary_store_mut();
             for (key, payload) in &all_content {
-                store.put(*key, payload).expect("put content");
+                pool.put_with_receipt(
+                    tidefs_local_object_store::DeviceIoClass::Data,
+                    *key,
+                    payload,
+                )
+                .expect("put receipted content");
             }
             let cp = ReceiveCheckpoint {
                 export_identity: export_id,
                 total_records: prepared.total_records,
                 completed_keys: all_keys.clone(),
             };
-            write_receive_checkpoint(store, &cp).expect("write checkpoint");
-            drop(store);
+            write_receive_checkpoint(pool.raw_primary_store_mut(), &cp).expect("write checkpoint");
+
+            let candidate_keys = received_content_candidate_keys(&prepared)
+                .expect("collect normalization candidate keys");
+            let protected_keys = protected_committed_content_keys(&mut pool, &[], target_key)
+                .expect("empty staging has no protected roots");
+            let replaceable_keys: BTreeSet<ObjectKey> = candidate_keys
+                .difference(&protected_keys)
+                .copied()
+                .collect();
+            let mut normalized = BTreeSet::new();
+            for root in &prepared.roots {
+                normalize_received_content_receipts(
+                    &mut pool,
+                    &root.state,
+                    &root.records,
+                    &mut normalized,
+                    &replaceable_keys,
+                    None,
+                )
+                .expect("normalize staged sender content");
+            }
+            let normalized_manifest = pool
+                .get_with_current_receipt(
+                    tidefs_local_object_store::DeviceIoClass::Data,
+                    sender_manifest.0,
+                )
+                .expect("read normalized manifest")
+                .expect("normalized manifest remains receipted")
+                .0;
+            assert_ne!(
+                normalized_manifest, sender_manifest.1,
+                "fixture must reach post-normalization sender-byte divergence"
+            );
+            pool.raw_primary_store_mut()
+                .sync_all()
+                .expect("sync normalized staging state");
         }
 
-        // 6. Call the resume-aware receive with all keys as skip set.
-        //    The function should skip all content writes (they are already
-        //    persisted and in the checkpoint) and proceed to root commits.
-        let (report, newly_persisted) = receive_changed_records_into_staging_with_skip(
+        // 6. Retry through the public API. It discovers the durable checkpoint
+        //    and accepts root-scoped logical equivalence before publication.
+        let report =
+            crate::LocalFileSystem::receive_changed_records_into_empty_root_with_root_authentication_key(
             &target_root,
-            &staging,
             opts.clone(),
-            prepared,
+            &export,
             target_key,
-            &all_keys,
+            [0; 16],
+            [0; 16],
+            None,
         )
         .expect("resume receive");
-
-        // Since all content objects were already in the completed set and
-        // already written to the store, nothing new should be persisted.
-        assert!(
-            newly_persisted.is_empty(),
-            "all content keys already persisted; newly_persisted must be empty, got {newly_persisted:?}"
-        );
 
         assert_eq!(report.imported_records, export.total_records);
         assert_eq!(report.imported_payload_bytes, export.payload_bytes);
@@ -3408,7 +4207,9 @@ mod tests {
         source.sync_all().expect("sync source");
 
         // 2. Set placement epoch on the source before export.
-        source.set_placement_epoch(99);
+        source
+            .set_placement_epoch(99)
+            .expect("test setup mutation must be admitted");
         assert!(
             source.placement_epoch == Some(99),
             "placement_epoch should be set on source"

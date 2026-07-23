@@ -382,9 +382,16 @@ fn read_content_manifest_for_scrub(
     store: &LocalObjectStore,
     inode_id: InodeId,
     record: &InodeRecord,
+    pool: Option<&Pool>,
 ) -> Result<Option<ContentManifestObject>> {
     let key = content_object_key_for_version(inode_id, record.data_version);
-    let Some(bytes) = store.get(key)? else {
+    let bytes = match pool {
+        Some(pool) => pool
+            .get_with_current_receipt(DeviceIoClass::Data, key)?
+            .map(|(bytes, _receipt)| bytes),
+        None => store.get(key)?,
+    };
+    let Some(bytes) = bytes else {
         return Ok(None);
     };
     if !bytes.starts_with(&CONTENT_MANIFEST_MAGIC)
@@ -569,7 +576,7 @@ pub(crate) fn scrub_inodes_content_with_pool(
             continue;
         }
 
-        match read_content_manifest_for_scrub(store, *inode_id, record) {
+        match read_content_manifest_for_scrub(store, *inode_id, record, pool) {
             Ok(Some(manifest)) => {
                 report.blocks_scanned += 1; // manifest
                 report.blocks_clean += 1; // manifest is clean if parsed successfully
@@ -856,7 +863,7 @@ mod tests {
     }
 
     #[test]
-    fn scrub_chunk_evidence_records_stale_receipt_without_repair_dispatch() {
+    fn scrub_chunk_refuses_stale_receipt_without_repair_dispatch() {
         let mut pool = temp_pool("stale-receipt");
         let payload = b"chunk plaintext evidence".to_vec();
         let record = test_file_record(17, 4, payload.len() as u64);
@@ -882,7 +889,7 @@ mod tests {
             Some(&pool),
         );
 
-        assert!(matches!(scrubbed.outcome, ScrubBlockOutcome::Clean));
+        assert!(matches!(scrubbed.outcome, ScrubBlockOutcome::Unreadable(_)));
         assert_eq!(
             scrubbed.evidence.plaintext_identity.block_id,
             ScrubBlockId {
@@ -910,6 +917,48 @@ mod tests {
             .evidence
             .placement_evidence
             .allows_repair_dispatch());
+    }
+
+    #[test]
+    fn scrub_chunk_refuses_receiptless_pool_visible_raw_content() {
+        let mut pool = temp_pool("receiptless-raw-content");
+        let payload = b"receiptless raw chunk".to_vec();
+        let record = test_file_record(18, 5, payload.len() as u64);
+        let key = content_chunk_object_key_for_version(record.inode_id, record.data_version, 0);
+        let encoded = encode_content_chunk(&record, 0, &payload, &ContentCompressionPolicy::off());
+        let checksum = FastBlockChecksum::compute(&encoded);
+        pool.raw_primary_store_mut()
+            .put(key, &encoded)
+            .expect("write receiptless raw chunk");
+        let chunk_ref = ContentChunkRef {
+            chunk_index: 0,
+            data_version: record.data_version,
+            len: payload.len() as u32,
+            checksum,
+            placement_receipt_generation: 1,
+        };
+
+        let scrubbed = scrub_content_chunk_with_pool(
+            pool.raw_primary_store(),
+            record.inode_id,
+            &record,
+            &chunk_ref,
+            Some(&pool),
+        );
+
+        assert!(matches!(scrubbed.outcome, ScrubBlockOutcome::Unreadable(_)));
+        assert_eq!(
+            scrubbed.evidence.placement_evidence,
+            MountedContentPlacementEvidence::ReceiptMissing {
+                expected_generation: Some(1),
+            }
+        );
+        assert!(scrubbed
+            .evidence
+            .checksum_layer
+            .as_ref()
+            .expect("raw checksum diagnostic")
+            .matches_expected());
     }
 
     #[test]

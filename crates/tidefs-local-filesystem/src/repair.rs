@@ -439,7 +439,7 @@ fn apply_truncate(
     };
 
     // Read content layout from store
-    let layout = match read_content_layout_from_store(store, inode_id, &inode, true) {
+    let layout = match read_content_layout_from_store(store, inode_id, &inode) {
         Ok(layout) => {
             content_layout_cache.insert(inode_id, layout.clone());
             layout

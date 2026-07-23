@@ -15,12 +15,12 @@ use tidefs_local_filesystem::human::local_filesystem::{
     ChangedRecordExport, CrashInjectionBoundary, LocalFilesystem, RootAuthenticationKey,
     RootRetentionPolicy, StoreOptions, FILESYSTEM_CONTENT_CHUNK_SIZE,
     FILESYSTEM_CONTENT_OBJECT_PREFIX, FILESYSTEM_FORMAT_VERSION, FILESYSTEM_ROOT_OBJECT_PREFIX,
-    FILESYSTEM_ROOT_SLOT_COUNT, FILESYSTEM_SUPERBLOCK_OBJECT_NAME,
-    FILESYSTEM_TRANSACTION_OBJECT_PREFIX, FORMAL_NO_PRODUCTION_FSCK_FAILURE_MODEL,
-    LOCAL_SNAPSHOT_ROLLBACK_SPEC, LOCAL_STORAGE_ALLOCATOR_GRAIN_BYTES,
-    LOCAL_STORAGE_ALLOCATOR_SPEC, MOUNT_INVARIANT_GATE_IS_NOT_FSCK, ONLINE_VERIFIER_IS_NOT_FSCK,
-    ONLINE_VERIFIER_SPEC, POSIX_SUBSET_POLICY_VERSION, POSIX_SUBSET_SPEC,
-    PRODUCTION_RECOVERY_DOCTRINE, RECOVERY_AUDIT_IS_NOT_FSCK, RETENTION_RECLAMATION_IS_NOT_FSCK,
+    FILESYSTEM_ROOT_SLOT_COUNT, FILESYSTEM_TRANSACTION_OBJECT_PREFIX,
+    FORMAL_NO_PRODUCTION_FSCK_FAILURE_MODEL, LOCAL_SNAPSHOT_ROLLBACK_SPEC,
+    LOCAL_STORAGE_ALLOCATOR_GRAIN_BYTES, LOCAL_STORAGE_ALLOCATOR_SPEC,
+    MOUNT_INVARIANT_GATE_IS_NOT_FSCK, ONLINE_VERIFIER_IS_NOT_FSCK, ONLINE_VERIFIER_SPEC,
+    POSIX_SUBSET_POLICY_VERSION, POSIX_SUBSET_SPEC, PRODUCTION_RECOVERY_DOCTRINE,
+    RECOVERY_AUDIT_IS_NOT_FSCK, RETENTION_RECLAMATION_IS_NOT_FSCK,
     ROOT_AUTHENTICATION_ALGORITHM_SUITE_ID, ROOT_AUTHENTICATION_CODE_LEN,
     ROOT_AUTHENTICATION_DIGEST_LEN, ROOT_AUTHENTICATION_ENV_VAR, ROOT_AUTHENTICATION_KEY_LEN,
     ROOT_AUTHENTICATION_MAGIC_ASCII, ROOT_AUTHENTICATION_POLICY_EPOCH,
@@ -37,7 +37,6 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     println!("tidefs local filesystem MVP demo");
     println!("filesystem_root={}", root.display());
-    println!("wire_v0390_fixed_superblock_object_name={FILESYSTEM_SUPERBLOCK_OBJECT_NAME}");
     println!("root_slot_object_prefix={FILESYSTEM_ROOT_OBJECT_PREFIX}");
     println!("transaction_object_prefix={FILESYSTEM_TRANSACTION_OBJECT_PREFIX}");
     println!("versioned_content_object_prefix={FILESYSTEM_CONTENT_OBJECT_PREFIX}");
@@ -215,36 +214,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         "read.immediate_utf8={}",
         String::from_utf8_lossy(&immediate)
     );
-    let cached = fs.read_file("/docs/README.txt")?;
-    let hot_read_cache = fs.hot_read_cache_report();
-    println!("hot_read_cache.spec={}", hot_read_cache.spec);
-    println!(
-        "hot_read_cache.repeated_read_matches={}",
-        cached == immediate
-    );
-    println!("hot_read_cache.hits={}", hot_read_cache.hits);
-    println!("hot_read_cache.misses={}", hot_read_cache.misses);
-    println!("hot_read_cache.insertions={}", hot_read_cache.insertions);
-    println!("hot_read_cache.evictions={}", hot_read_cache.evictions);
-    println!(
-        "hot_read_cache.invalidations={}",
-        hot_read_cache.invalidations
-    );
-    println!(
-        "hot_read_cache.admission_bypasses={}",
-        hot_read_cache.admission_bypasses
-    );
-    println!(
-        "hot_read_cache.resident_entries={}",
-        hot_read_cache.resident_entries
-    );
-    println!(
-        "hot_read_cache.resident_bytes={}",
-        hot_read_cache.resident_bytes
-    );
-    println!("hot_read_cache.max_entries={}", hot_read_cache.max_entries);
-    println!("hot_read_cache.max_bytes={}", hot_read_cache.max_bytes);
-    println!("hot_read_cache.is_bounded={}", hot_read_cache.is_bounded());
     let snapshot = fs.create_snapshot("demo-before-rollback")?;
     println!("snapshot.create.name={}", snapshot.name);
     println!(

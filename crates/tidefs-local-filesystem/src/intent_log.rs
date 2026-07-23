@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
-use tidefs_local_object_store::{IntegrityDigest64, LocalObjectStore, Pool};
+use tidefs_local_object_store::pool::PlacementReceipt;
+use tidefs_local_object_store::{
+    DeviceIoClass, IntegrityDigest64, LocalObjectStore, ObjectKey, Pool, StoredObject,
+};
 use tidefs_types_vfs_core::{Generation, InodeId, NodeKind};
 
 use crate::constants::*;
@@ -7,7 +10,7 @@ use crate::encoding::*;
 use crate::error::FileSystemError;
 use crate::object_keys::*;
 use crate::records::NamespaceCreateIntentRecord;
-use crate::types::{DirChangeRecord, InodeRecord, NamespaceEntry};
+use crate::types::{CommittedRootSummary, InodeRecord, NamespaceEntry};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -227,12 +230,27 @@ impl LogDeviceFile {
     }
 }
 
-/// Anchor identifying the filesystem root state when the intent was recorded.
+/// Exact committed-root base against which a data intent was recorded.
+///
+/// Data replay is legal only when recovery selected this transaction,
+/// generation, and transaction-manifest checksum.  The checksum is part of
+/// the identity because transaction/generation equality alone cannot
+/// distinguish divergent committed-root candidates.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IntentLogRootAnchor {
     pub transaction_id: u64,
     pub generation: u64,
-    pub manifest_digest: IntegrityDigest64,
+    pub manifest_checksum: IntegrityDigest64,
+}
+
+impl IntentLogRootAnchor {
+    pub(crate) fn from_committed_root_summary(root: &CommittedRootSummary) -> Self {
+        Self {
+            transaction_id: root.transaction_id,
+            generation: root.generation,
+            manifest_checksum: root.manifest_checksum,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -244,6 +262,7 @@ pub enum IntentLogEntryKind {
         #[allow(dead_code)]
         length: u64,
         payload_digest: IntegrityDigest64,
+        base_data_version: u64,
         data_version: u64,
     },
     /// O_DSYNC data-only range intent (may omit unrelated metadata).
@@ -254,6 +273,7 @@ pub enum IntentLogEntryKind {
         length: u64,
         payload_digest: IntegrityDigest64,
         has_size_delta: bool,
+        base_data_version: u64,
         data_version: u64,
     },
     /// fsync barrier that drains all sealed intents for the listed files.
@@ -265,6 +285,7 @@ pub enum IntentLogEntryKind {
         #[allow(dead_code)]
         length: u64,
         payload_digest: IntegrityDigest64,
+        base_data_version: u64,
         data_version: u64,
     },
     /// Namespace mutation intent (mkdir, unlink, rename, etc.).
@@ -424,7 +445,7 @@ fn try_encode_intent_log_entry(entry: &IntentLogEntry) -> Result<Vec<u8>> {
     // root anchor
     push_u64(&mut out, entry.root_anchor.transaction_id);
     push_u64(&mut out, entry.root_anchor.generation);
-    push_u64(&mut out, entry.root_anchor.manifest_digest.0);
+    push_u64(&mut out, entry.root_anchor.manifest_checksum.0);
 
     // kind-specific body
     match &entry.entry_kind {
@@ -433,6 +454,7 @@ fn try_encode_intent_log_entry(entry: &IntentLogEntry) -> Result<Vec<u8>> {
             offset,
             length,
             payload_digest,
+            base_data_version,
             data_version,
         } => {
             out.push(KIND_SYNC_WRITE_RANGE);
@@ -440,6 +462,7 @@ fn try_encode_intent_log_entry(entry: &IntentLogEntry) -> Result<Vec<u8>> {
             push_u64(&mut out, *offset);
             push_u64(&mut out, *length);
             push_u64(&mut out, payload_digest.0);
+            push_u64(&mut out, *base_data_version);
             push_u64(&mut out, *data_version);
         }
         IntentLogEntryKind::OdsyncDataRange {
@@ -448,6 +471,7 @@ fn try_encode_intent_log_entry(entry: &IntentLogEntry) -> Result<Vec<u8>> {
             length,
             payload_digest,
             has_size_delta,
+            base_data_version,
             data_version,
         } => {
             out.push(KIND_ODSYNC_DATA_RANGE);
@@ -456,6 +480,7 @@ fn try_encode_intent_log_entry(entry: &IntentLogEntry) -> Result<Vec<u8>> {
             push_u64(&mut out, *length);
             push_u64(&mut out, payload_digest.0);
             out.push(if *has_size_delta { 1 } else { 0 });
+            push_u64(&mut out, *base_data_version);
             push_u64(&mut out, *data_version);
         }
         IntentLogEntryKind::FsyncDirtyDrain { inode_ids } => {
@@ -470,6 +495,7 @@ fn try_encode_intent_log_entry(entry: &IntentLogEntry) -> Result<Vec<u8>> {
             offset,
             length,
             payload_digest,
+            base_data_version,
             data_version,
         } => {
             out.push(KIND_SHARED_MMAP_MSYNC);
@@ -477,6 +503,7 @@ fn try_encode_intent_log_entry(entry: &IntentLogEntry) -> Result<Vec<u8>> {
             push_u64(&mut out, *offset);
             push_u64(&mut out, *length);
             push_u64(&mut out, payload_digest.0);
+            push_u64(&mut out, *base_data_version);
             push_u64(&mut out, *data_version);
         }
         IntentLogEntryKind::NamespaceSyncIntent {
@@ -536,7 +563,7 @@ fn decode_intent_log_entry(bytes: &[u8]) -> Result<IntentLogEntry> {
     let root_anchor = IntentLogRootAnchor {
         transaction_id: decoder.read_u64()?,
         generation: decoder.read_u64()?,
-        manifest_digest: IntegrityDigest64(decoder.read_u64()?),
+        manifest_checksum: IntegrityDigest64(decoder.read_u64()?),
     };
 
     let kind_byte = decoder.read_u8()?;
@@ -546,6 +573,7 @@ fn decode_intent_log_entry(bytes: &[u8]) -> Result<IntentLogEntry> {
             offset: decoder.read_u64()?,
             length: decoder.read_u64()?,
             payload_digest: IntegrityDigest64(decoder.read_u64()?),
+            base_data_version: decoder.read_u64()?,
             data_version: decoder.read_u64()?,
         },
         KIND_ODSYNC_DATA_RANGE => IntentLogEntryKind::OdsyncDataRange {
@@ -554,6 +582,7 @@ fn decode_intent_log_entry(bytes: &[u8]) -> Result<IntentLogEntry> {
             length: decoder.read_u64()?,
             payload_digest: IntegrityDigest64(decoder.read_u64()?),
             has_size_delta: decoder.read_u8()? != 0,
+            base_data_version: decoder.read_u64()?,
             data_version: decoder.read_u64()?,
         },
         KIND_FSYNC_DIRTY_DRAIN => {
@@ -569,6 +598,7 @@ fn decode_intent_log_entry(bytes: &[u8]) -> Result<IntentLogEntry> {
             offset: decoder.read_u64()?,
             length: decoder.read_u64()?,
             payload_digest: IntegrityDigest64(decoder.read_u64()?),
+            base_data_version: decoder.read_u64()?,
             data_version: decoder.read_u64()?,
         },
         KIND_NAMESPACE_SYNC_INTENT => {
@@ -626,6 +656,35 @@ pub fn fuzz_decode_intent_log_entry(data: &[u8]) {
 }
 
 struct IntentLogRawStateAuthority;
+
+#[cfg(test)]
+thread_local! {
+    static TEST_FAIL_NEXT_CLEAR_BEFORE_RETIRE: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
+}
+
+#[cfg(test)]
+pub(crate) fn inject_next_intent_log_clear_failure_before_retire() {
+    TEST_FAIL_NEXT_CLEAR_BEFORE_RETIRE.with(|failure| failure.set(true));
+}
+
+#[cfg(test)]
+fn maybe_inject_intent_log_clear_failure_before_retire(store: &LocalObjectStore) -> Result<()> {
+    let should_fail = TEST_FAIL_NEXT_CLEAR_BEFORE_RETIRE.with(|failure| {
+        let should_fail = failure.get();
+        failure.set(false);
+        should_fail
+    });
+    if should_fail {
+        return Err(FileSystemError::Store(StoreError::Io {
+            operation: "intent_log_clear_before_retire",
+            path: store.root().join("<injected intent log clear failure>"),
+            source: std::io::Error::other("injected intent log clear failure"),
+        }));
+    }
+    Ok(())
+}
 
 impl IntentLogRawStateAuthority {
     fn read_head_entry_id(store: &LocalObjectStore) -> Result<u64> {
@@ -845,17 +904,17 @@ fn try_encoded_entry_len(entry: &IntentLogEntry) -> Result<usize> {
 
     match &entry.entry_kind {
         IntentLogEntryKind::SyncWriteRange { .. } => {
-            len += 1 + 8 + 8 + 8 + 8 + 8; // kind + inode_id + offset + length + digest + data_version
+            len += 1 + 8 + 8 + 8 + 8 + 8 + 8; // kind + inode_id + offset + length + digest + base_data_version + data_version
         }
         IntentLogEntryKind::OdsyncDataRange { .. } => {
-            len += 1 + 8 + 8 + 8 + 8 + 1 + 8; // kind + inode_id + offset + length + digest + has_size_delta + data_version
+            len += 1 + 8 + 8 + 8 + 8 + 1 + 8 + 8; // kind + inode_id + offset + length + digest + has_size_delta + base_data_version + data_version
         }
         IntentLogEntryKind::FsyncDirtyDrain { inode_ids } => {
             len += 1 + 8; // kind + count
             len += inode_ids.len() * 8;
         }
         IntentLogEntryKind::SharedMmapMsync { .. } => {
-            len += 1 + 8 + 8 + 8 + 8 + 8; // kind + inode_id + offset + length + digest + data_version
+            len += 1 + 8 + 8 + 8 + 8 + 8 + 8; // kind + inode_id + offset + length + digest + base_data_version + data_version
         }
         IntentLogEntryKind::NamespaceSyncIntent {
             affected_inode_ids,
@@ -1042,8 +1101,9 @@ impl IntentLog {
                     entries.push(entry);
                 }
                 None => {
-                    // Gap in entry IDs — stop reading
-                    break;
+                    return Err(FileSystemError::CorruptState {
+                        reason: "intent log contains a gap before its durable head",
+                    });
                 }
             }
         }
@@ -1255,6 +1315,41 @@ impl IntentLog {
                 .any(|e| e.entry_kind.references_data_inode(inode_id))
     }
 
+    /// Latest logged predecessor/target content-version pair for `inode_id`.
+    ///
+    /// A caller appending a later generation uses this as that intent's
+    /// predecessor when earlier durable intents have not yet been folded into
+    /// the live inode record.
+    pub(crate) fn latest_pending_data_versions_for_inode(
+        &self,
+        inode_id: InodeId,
+    ) -> Option<(u64, u64)> {
+        self.entries
+            .iter()
+            .rev()
+            .find_map(|entry| match &entry.entry_kind {
+                IntentLogEntryKind::SyncWriteRange {
+                    inode_id: logged_inode,
+                    base_data_version,
+                    data_version,
+                    ..
+                }
+                | IntentLogEntryKind::OdsyncDataRange {
+                    inode_id: logged_inode,
+                    base_data_version,
+                    data_version,
+                    ..
+                }
+                | IntentLogEntryKind::SharedMmapMsync {
+                    inode_id: logged_inode,
+                    base_data_version,
+                    data_version,
+                    ..
+                } if *logged_inode == inode_id => Some((*base_data_version, *data_version)),
+                _ => None,
+            })
+    }
+
     /// Whether any unflushed intent-log entry carries replayable data bytes
     /// for `inode_id`.
     pub fn has_unflushed_data_for_inode(&self, inode_id: InodeId) -> bool {
@@ -1368,15 +1463,27 @@ impl IntentLog {
     /// Clear the intent log (after a successful full commit has persisted all
     /// intended mutations through the normal transaction-root path).
     pub fn clear(&mut self, store: &mut LocalObjectStore) -> Result<()> {
-        for entry in &self.entries {
-            IntentLogRawStateAuthority::delete_entry(store, entry.entry_id)?;
-            IntentLogRawStateAuthority::delete_data_payload(store, entry.entry_id)?;
-        }
-        IntentLogRawStateAuthority::delete_head(store)?;
+        #[cfg(test)]
+        maybe_inject_intent_log_clear_failure_before_retire(store)?;
 
+        // Retire the replay authority before physical cleanup. A crash after
+        // the durable head deletion may leave unreachable entry/payload
+        // objects, but it cannot expose a partial prefix or require missing
+        // payloads after the new committed root already covers the log.
         if let Some(ref mut log_device) = self.log_device {
             log_device.truncate()?;
         }
+        IntentLogRawStateAuthority::delete_head(store)?;
+        IntentLogRawStateAuthority::sync_all(store)?;
+
+        // Physical cleanup is no longer part of the correctness boundary.
+        // Best-effort deletion avoids turning an already-retired, committed
+        // intent into a false commit failure.
+        for entry in &self.entries {
+            let _ = IntentLogRawStateAuthority::delete_entry(store, entry.entry_id);
+            let _ = IntentLogRawStateAuthority::delete_data_payload(store, entry.entry_id);
+        }
+        let _ = IntentLogRawStateAuthority::sync_all(store);
         self.entries.clear();
         self.flushed_entry_count = 0;
         self.next_entry_id = 0;
@@ -1519,13 +1626,20 @@ impl IntentLog {
         self.used_bytes
     }
 
-    /// Check whether any entries have a root anchor newer than
-    /// `since_transaction_id`.  Used during crash recovery to decide
-    /// whether replay is needed before mount.
+    /// Check whether any entry can be newer than the selected committed root.
+    ///
+    /// Data entries carry their target version separately because their root
+    /// anchor now identifies the committed predecessor, not the target.
+    /// Equality for a data target means the selected root already covers it.
     pub fn replay_is_needed(&self, since_transaction_id: u64) -> bool {
-        self.entries
-            .iter()
-            .any(|e| e.root_anchor.transaction_id > since_transaction_id)
+        self.entries.iter().any(|entry| match &entry.entry_kind {
+            IntentLogEntryKind::SyncWriteRange { data_version, .. }
+            | IntentLogEntryKind::OdsyncDataRange { data_version, .. }
+            | IntentLogEntryKind::SharedMmapMsync { data_version, .. } => {
+                *data_version > since_transaction_id
+            }
+            _ => entry.root_anchor.transaction_id > since_transaction_id,
+        })
     }
 }
 
@@ -1645,40 +1759,10 @@ fn replay_namespace_create_intent(
     // overwriting it or resurrecting the creation-time name. Recovery of a
     // missing create still takes the inode-absent branch above.
     if !inode_already_present && !entry_already_present {
-        let directory = Arc::make_mut(&mut state.directories)
+        Arc::make_mut(&mut state.directories)
             .get_mut(&intent.parent_inode_id)
-            .expect("namespace create parent directory was validated before replay mutation");
-        directory.insert(intent.entry.name.clone(), intent.entry.clone());
-        let directory_size = directory.len() as u64;
-
-        let parent = Arc::make_mut(&mut state.inodes)
-            .get_mut(&intent.parent_inode_id)
-            .expect("namespace create parent inode was validated before replay mutation");
-        parent.size = directory_size;
-        parent.metadata_version = parent.metadata_version.max(intent.inode.metadata_version);
-        parent.data_version = parent.data_version.max(intent.inode.data_version);
-        parent.dir_rev = parent.dir_rev.saturating_add(1);
-        let next_time = intent
-            .inode
-            .posix_time
-            .ctime_ns
-            .max(parent.posix_time.mtime_ns.saturating_add(1))
-            .max(parent.posix_time.ctime_ns.saturating_add(1));
-        parent.posix_time.mtime_ns = next_time;
-        parent.posix_time.ctime_ns = next_time;
-        let revision = parent.dir_rev;
-        state
-            .change_streams
-            .entry(intent.parent_inode_id)
-            .or_default()
-            .insert(
-                revision,
-                DirChangeRecord::Add {
-                    name: intent.entry.name.clone(),
-                    inode_id: intent.entry.inode_id,
-                    facets: intent.entry.facets,
-                },
-            );
+            .expect("namespace create parent directory was validated before replay mutation")
+            .insert(intent.entry.name.clone(), intent.entry.clone());
     }
 
     state.observe_explicit_inode_id(intent.inode.inode_id);
@@ -1717,14 +1801,26 @@ fn replay_metadata_setattr_intent(
         });
     }
 
-    let content_changed =
-        current.size != updated.size || current.data_version != updated.data_version;
-    Arc::make_mut(&mut state.inodes).insert(updated.inode_id, updated.clone());
+    if current.size != updated.size || current.data_version != updated.data_version {
+        return Err(FileSystemError::CorruptState {
+            reason: "intent log replay: metadata setattr cannot replay truncate or content-version changes",
+        });
+    }
+    if updated.metadata_version < current.metadata_version {
+        return Err(FileSystemError::CorruptState {
+            reason: "intent log replay: metadata setattr version is non-monotonic",
+        });
+    }
+
+    // A metadata intent does not carry file bytes. Preserve the content
+    // identity selected by the current state so it can never replace content
+    // materialized by an earlier replay step.
+    let mut merged = updated.clone();
+    merged.size = current.size;
+    merged.data_version = current.data_version;
+    Arc::make_mut(&mut state.inodes).insert(updated.inode_id, merged);
     state.observe_explicit_inode_id(updated.inode_id);
     state.dirty_inodes.insert(updated.inode_id);
-    if content_changed {
-        state.dirty_content.insert(updated.inode_id);
-    }
     Ok(())
 }
 
@@ -1737,7 +1833,8 @@ fn replay_metadata_setattr_intent(
 ///   parent directory dirty.
 /// - NamespaceCreateIntent: restore metadata-only create/mknod inodes and
 ///   directory entries, using the embedded inode record as `rdev` authority.
-/// - MetadataSetattrIntent: restore post-setattr inode metadata and logical size.
+/// - MetadataSetattrIntent: restore metadata-only fields; content identity
+///   changes are refused because the intent carries no file bytes.
 /// - FsyncDirtyDrain / PressureFallback / CrashReplayReconcile: no-op.
 pub(crate) fn replay_entry(
     entry: &IntentLogEntry,
@@ -1798,12 +1895,11 @@ pub(crate) fn replay_entry(
             let write_end = offset.saturating_add(*length);
             let new_size = record.size.max(write_end);
 
-            let existing_bytes = match crate::content::read_content_from_store(
-                store, *inode_id, &record, true, None,
-            ) {
-                Ok(bytes) => bytes,
-                Err(_) => vec![0u8; record.size as usize],
-            };
+            let existing_bytes =
+                match crate::content::read_content_from_store(store, *inode_id, &record, None) {
+                    Ok(bytes) => bytes,
+                    Err(_) => vec![0u8; record.size as usize],
+                };
 
             let mut full_content = existing_bytes;
             if new_size as usize > full_content.len() {
@@ -1929,6 +2025,97 @@ pub(crate) fn replay_uncommitted(
 
 use std::collections::BTreeMap;
 
+struct UncommittedReplayContentStore<'a> {
+    pool: &'a mut Pool,
+    inode_id: InodeId,
+    data_version: u64,
+    file_size: u64,
+}
+
+impl<'a> UncommittedReplayContentStore<'a> {
+    fn new(pool: &'a mut Pool, inode_id: InodeId, data_version: u64, file_size: u64) -> Self {
+        Self {
+            pool,
+            inode_id,
+            data_version,
+            file_size,
+        }
+    }
+}
+
+impl crate::content::ContentWriteStore for UncommittedReplayContentStore<'_> {
+    fn get(&self, key: ObjectKey) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .pool
+            .get_with_current_receipt(DeviceIoClass::Data, key)?
+            .map(|(bytes, _receipt)| bytes))
+    }
+
+    fn get_with_receipt_generation(
+        &self,
+        key: ObjectKey,
+    ) -> Result<Option<(Vec<u8>, Option<u64>)>> {
+        Ok(self
+            .pool
+            .get_with_current_receipt(DeviceIoClass::Data, key)?
+            .map(|(bytes, receipt)| (bytes, Some(receipt.generation))))
+    }
+
+    fn put_with_receipt(&mut self, key: ObjectKey, payload: &[u8]) -> Result<PlacementReceipt> {
+        let manifest_key = content_object_key_for_version(self.inode_id, self.data_version);
+        if key == manifest_key {
+            let manifest = crate::encoding::decode_content_manifest(payload)?;
+            if manifest.inode_id != self.inode_id
+                || manifest.data_version != self.data_version
+                || manifest.file_size != self.file_size
+            {
+                return Err(FileSystemError::CorruptState {
+                    reason:
+                        "Pool intent replay manifest does not match its proven content identity",
+                });
+            }
+        } else {
+            let chunk = crate::encoding::decode_content_chunk(payload)?;
+            let expected_key = content_chunk_object_key_for_version(
+                self.inode_id,
+                self.data_version,
+                chunk.chunk_index,
+            );
+            if chunk.inode_id != self.inode_id
+                || chunk.data_version != self.data_version
+                || key != expected_key
+            {
+                return Err(FileSystemError::CorruptState {
+                    reason: "Pool intent replay attempted to publish a key outside its proven data version",
+                });
+            }
+        }
+        // INTEGRITY: ReplayBatcher proves before constructing this writer that
+        // target_data_version strictly advances the committed inode
+        // predecessor. The decoded payload checks above bind this exact key to
+        // that inode/version, so no retained committed root can name it; only
+        // an orphan from an interrupted publication can already occupy it.
+        Ok(self
+            .pool
+            .ensure_prepublication_data_object_with_receipt(key, payload)?)
+    }
+
+    fn put(&mut self, _key: ObjectKey, _payload: &[u8]) -> Result<StoredObject> {
+        Err(FileSystemError::Unsupported {
+            operation: "Pool intent replay content write",
+            reason: "replay content must publish through uncommitted receipt authority",
+        })
+    }
+
+    fn raw_store(&self) -> &LocalObjectStore {
+        self.pool.raw_primary_store()
+    }
+
+    fn raw_store_mut(&mut self) -> &mut LocalObjectStore {
+        self.pool.raw_primary_store_mut()
+    }
+}
+
 /// A single data-write payload queued for batched replay application.
 #[derive(Clone, Debug)]
 struct BatchedWrite {
@@ -1938,10 +2125,9 @@ struct BatchedWrite {
     data: Vec<u8>,
 }
 
-/// Batches data-write intent-log entries by inode so that content is
-/// read once per file, all payloads are applied, and chunks are
-/// re-encoded once — giving O(file_size + N) replay cost instead of the
-/// O(N * file_size) incurred by replaying every write individually.
+/// Batches data-write intent-log entries by inode. The raw-store compatibility
+/// path reconstructs each file once; mounted Pool replay applies the batch to
+/// only the touched chunks and preserves sparse holes and unchanged refs.
 struct ReplayBatcher {
     /// Accumulated writes keyed by inode.
     writes: BTreeMap<InodeId, Vec<BatchedWrite>>,
@@ -2024,8 +2210,7 @@ impl ReplayBatcher {
 
             // 1. Read existing content once.
             let existing_bytes =
-                match crate::content::read_content_from_store(store, inode_id, &record, true, None)
-                {
+                match crate::content::read_content_from_store(store, inode_id, &record, None) {
                     Ok(bytes) => bytes,
                     Err(_) => vec![0u8; record.size as usize],
                 };
@@ -2102,6 +2287,653 @@ impl ReplayBatcher {
 
         Ok(total_flushed)
     }
+
+    /// Apply queued writes using current Pool receipt authority and emit a
+    /// fully receipted replacement layout.
+    ///
+    /// A process can stop after Pool payload persistence but before receipt
+    /// publication.  Such residue is deliberately not overwritten: the
+    /// generic prepublication helper has no authority to decide that an
+    /// ambiguous deterministic key is uncommitted.  Instead, replay advances
+    /// the content identity until every key it will publish is mechanically
+    /// absent.  The intent's logged version remains the ordering/provenance
+    /// input, while the returned version is the exact identity committed by
+    /// this replay attempt.
+    fn flush_with_pool(
+        &mut self,
+        state: &mut crate::FileSystemState,
+        pool: &mut Pool,
+        planned_target_data_version: u64,
+        base_data_versions: &BTreeMap<InodeId, u64>,
+    ) -> Result<u64> {
+        use std::sync::Arc;
+
+        let writes_map = std::mem::take(&mut self.writes);
+        let max_end_map = std::mem::take(&mut self.max_end);
+        let compression_policy = state.content_compression_policy.clone();
+        let mut planned_sizes = BTreeMap::new();
+
+        for (inode_id, writes) in &writes_map {
+            if writes.is_empty() {
+                continue;
+            }
+            let record = state
+                .inodes
+                .get(inode_id)
+                .ok_or(FileSystemError::CorruptState {
+                    reason: "Pool intent replay references a missing inode",
+                })?;
+            if !record.is_file_like() {
+                return Err(FileSystemError::CorruptState {
+                    reason: "Pool intent replay targets a non-file inode",
+                });
+            }
+            let base_data_version =
+                base_data_versions
+                    .get(inode_id)
+                    .ok_or(FileSystemError::CorruptState {
+                        reason: "Pool intent replay lacks an inode predecessor proof",
+                    })?;
+            if record.data_version != *base_data_version {
+                return Err(FileSystemError::CorruptState {
+                    reason: "Pool intent replay inode predecessor data version changed",
+                });
+            }
+
+            let new_size = record
+                .size
+                .max(max_end_map.get(inode_id).copied().unwrap_or(0));
+            for write in writes {
+                let payload_len =
+                    u64::try_from(write.data.len()).map_err(|_| FileSystemError::SizeOverflow {
+                        requested: u64::MAX,
+                    })?;
+                if payload_len != write.length {
+                    return Err(FileSystemError::CorruptState {
+                        reason: "Pool intent replay payload length changed after validation",
+                    });
+                }
+                let end = write.offset.checked_add(write.length).ok_or(
+                    FileSystemError::SizeOverflow {
+                        requested: u64::MAX,
+                    },
+                )?;
+                if end > new_size {
+                    return Err(FileSystemError::CorruptState {
+                        reason: "Pool intent replay range exceeds the planned file size",
+                    });
+                }
+            }
+            planned_sizes.insert(*inode_id, new_size);
+        }
+
+        let minimum_target = base_data_versions
+            .values()
+            .copied()
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or(FileSystemError::SizeOverflow {
+                requested: u64::MAX,
+            })?;
+        let mut target_data_version = planned_target_data_version.max(minimum_target);
+        loop {
+            let mut all_keys_absent = true;
+            for (&inode_id, &new_size) in &planned_sizes {
+                let manifest_key = content_object_key_for_version(inode_id, target_data_version);
+                if !pool_replay_key_is_mechanically_absent(pool, manifest_key)? {
+                    all_keys_absent = false;
+                    break;
+                }
+                for chunk_index in 0..crate::content::content_chunk_count(new_size)? {
+                    let chunk_key = content_chunk_object_key_for_version(
+                        inode_id,
+                        target_data_version,
+                        chunk_index,
+                    );
+                    if !pool_replay_key_is_mechanically_absent(pool, chunk_key)? {
+                        all_keys_absent = false;
+                        break;
+                    }
+                }
+                if !all_keys_absent {
+                    break;
+                }
+            }
+            if all_keys_absent {
+                break;
+            }
+            target_data_version =
+                target_data_version
+                    .checked_add(1)
+                    .ok_or(FileSystemError::SizeOverflow {
+                        requested: u64::MAX,
+                    })?;
+        }
+
+        for (inode_id, writes) in writes_map {
+            if writes.is_empty() {
+                continue;
+            }
+            let mut record =
+                state
+                    .inodes
+                    .get(&inode_id)
+                    .cloned()
+                    .ok_or(FileSystemError::CorruptState {
+                        reason: "Pool intent replay references a missing inode",
+                    })?;
+            if !record.is_file_like() {
+                return Err(FileSystemError::CorruptState {
+                    reason: "Pool intent replay targets a non-file inode",
+                });
+            }
+            let new_size = planned_sizes[&inode_id];
+
+            let old_record = record.clone();
+            record.size = new_size;
+            record.data_version = target_data_version;
+            record.metadata_version = record.metadata_version.max(target_data_version);
+            record.subtree_rev = record.subtree_rev.saturating_add(1).max(1);
+            let patches: Vec<crate::content::ContentOverlayPatch<'_>> = writes
+                .iter()
+                .map(|write| crate::content::ContentOverlayPatch {
+                    offset: write.offset,
+                    bytes: &write.data,
+                })
+                .collect();
+            let mut dedup_index = crate::dedup::DedupIndex::new();
+            let mut store =
+                UncommittedReplayContentStore::new(pool, inode_id, target_data_version, new_size);
+            crate::content::write_chunked_content_with_patch_batch(
+                crate::content::WriteChunkedContentPatchBatch {
+                    dedup_enabled: false,
+                    store: &mut store,
+                    inode_id,
+                    old_record: &old_record,
+                    new_record: &record,
+                    patches: &patches,
+                    allow_holes: true,
+                    dedup_index: &mut dedup_index,
+                    quorum_store: None,
+                    compression_policy: &compression_policy,
+                },
+            )?;
+
+            Arc::make_mut(&mut state.inodes).insert(inode_id, record);
+            state.dirty_inodes.insert(inode_id);
+            state.dirty_content.insert(inode_id);
+        }
+
+        Ok(target_data_version)
+    }
+}
+
+fn pool_replay_key_is_mechanically_absent(pool: &Pool, key: ObjectKey) -> Result<bool> {
+    match pool.get_with_current_receipt(DeviceIoClass::Data, key) {
+        Ok(None) => Ok(true),
+        Ok(Some(_)) => Ok(false),
+        Err(error) if tidefs_local_object_store::pool::is_strict_read_authority_error(&error) => {
+            // Receiptless, incomplete, stale, or conflicting state is occupied
+            // for replay purposes.  Advancing the deterministic content
+            // identity is safe; replacing that state without a root-exclusion
+            // proof is not.
+            Ok(false)
+        }
+        Err(error) => Err(FileSystemError::Store(error)),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PoolReplaySelection {
+    AfterCommittedBase,
+    LiveDataOnly,
+}
+
+fn is_data_intent(entry_kind: &IntentLogEntryKind) -> bool {
+    matches!(
+        entry_kind,
+        IntentLogEntryKind::SyncWriteRange { .. }
+            | IntentLogEntryKind::OdsyncDataRange { .. }
+            | IntentLogEntryKind::SharedMmapMsync { .. }
+    )
+}
+
+fn selected_for_pool_replay(
+    entry: &IntentLogEntry,
+    selection: PoolReplaySelection,
+    committed_base: &IntentLogRootAnchor,
+) -> bool {
+    match selection {
+        PoolReplaySelection::AfterCommittedBase => match &entry.entry_kind {
+            IntentLogEntryKind::SyncWriteRange { data_version, .. }
+            | IntentLogEntryKind::OdsyncDataRange { data_version, .. }
+            | IntentLogEntryKind::SharedMmapMsync { data_version, .. } => {
+                *data_version > committed_base.generation
+            }
+            _ => entry.root_anchor.transaction_id > committed_base.transaction_id,
+        },
+        PoolReplaySelection::LiveDataOnly => match &entry.entry_kind {
+            IntentLogEntryKind::SyncWriteRange { data_version, .. }
+            | IntentLogEntryKind::OdsyncDataRange { data_version, .. }
+            | IntentLogEntryKind::SharedMmapMsync { data_version, .. } => {
+                // A previous attempt may have published and validated the
+                // target root, then failed while retiring the intent log.
+                // Such entries are already covered by the selected committed
+                // root and must be retired without replaying their older root
+                // anchor or republishing deterministic content keys.
+                *data_version > committed_base.generation
+            }
+            _ => false,
+        },
+    }
+}
+
+/// Return whether the durable log still contains an entry not covered by the
+/// selected committed root.
+///
+/// A commit retry uses this distinction after root publication succeeds but
+/// intent retirement fails. Covered entries must be cleared without forcing a
+/// duplicate root publication; genuinely newer namespace, metadata, or data
+/// entries still require the normal commit path.
+pub(crate) fn intent_log_requires_commit_after(
+    log: &IntentLog,
+    committed_base: &IntentLogRootAnchor,
+) -> bool {
+    log.entries.iter().any(|entry| {
+        selected_for_pool_replay(
+            entry,
+            PoolReplaySelection::AfterCommittedBase,
+            committed_base,
+        )
+    })
+}
+
+struct PoolReplayGenerationPlan {
+    target_data_version: u64,
+    base_data_versions: BTreeMap<InodeId, u64>,
+}
+
+struct PoolReplayPlan {
+    data_generations: Vec<PoolReplayGenerationPlan>,
+    state_generation: u64,
+}
+
+fn flush_planned_pool_replay_generation(
+    batcher: &mut ReplayBatcher,
+    state: &mut crate::FileSystemState,
+    pool: &mut Pool,
+    generation: &PoolReplayGenerationPlan,
+    effective_versions: &mut BTreeMap<(InodeId, u64), u64>,
+) -> Result<u64> {
+    let mut actual_base_versions = BTreeMap::new();
+    for (&inode_id, &planned_base) in &generation.base_data_versions {
+        let actual_base = effective_versions
+            .get(&(inode_id, planned_base))
+            .copied()
+            .unwrap_or(planned_base);
+        let current = state
+            .inodes
+            .get(&inode_id)
+            .ok_or(FileSystemError::CorruptState {
+                reason: "Pool intent replay references a missing inode",
+            })?
+            .data_version;
+        if current != actual_base {
+            return Err(FileSystemError::CorruptState {
+                reason: "Pool intent replay effective inode predecessor changed",
+            });
+        }
+        actual_base_versions.insert(inode_id, actual_base);
+    }
+
+    let effective_target = batcher.flush_with_pool(
+        state,
+        pool,
+        generation.target_data_version,
+        &actual_base_versions,
+    )?;
+    for inode_id in generation.base_data_versions.keys().copied() {
+        effective_versions.insert((inode_id, generation.target_data_version), effective_target);
+    }
+    state.generation = state.generation.max(effective_target);
+    Ok(effective_target)
+}
+
+fn plan_pool_replay(
+    selected: &[&IntentLogEntry],
+    state: &crate::FileSystemState,
+    committed_base: &IntentLogRootAnchor,
+) -> Result<PoolReplayPlan> {
+    if committed_base.transaction_id == 0
+        || committed_base.transaction_id < committed_base.generation
+        || committed_base.manifest_checksum == IntegrityDigest64::ZERO
+    {
+        return Err(FileSystemError::CorruptState {
+            reason: "Pool intent replay was given an invalid committed-base root",
+        });
+    }
+
+    let mut state_generation = state.generation;
+    let mut projected_data_versions: BTreeMap<InodeId, u64> = state
+        .inodes
+        .iter()
+        .map(|(inode_id, record)| (*inode_id, record.data_version))
+        .collect();
+    let mut data_generations = Vec::new();
+    let mut active_target_data_version = None;
+    let mut active_base_data_versions = BTreeMap::new();
+
+    for entry in selected {
+        let anchor = &entry.root_anchor;
+        if anchor.transaction_id == 0 || anchor.transaction_id < anchor.generation {
+            return Err(FileSystemError::CorruptState {
+                reason: "Pool intent replay has an invalid root-anchor generation",
+            });
+        }
+        if !is_data_intent(&entry.entry_kind) {
+            // Non-data entries retain their existing replay-generation anchor.
+            // Data-entry anchors instead identify the committed predecessor.
+            state_generation = state_generation.max(anchor.generation);
+        }
+
+        if let IntentLogEntryKind::NamespaceCreateIntent(intent) = &entry.entry_kind {
+            projected_data_versions.insert(intent.inode.inode_id, intent.inode.data_version);
+            state_generation = state_generation
+                .max(intent.inode.generation.get())
+                .max(intent.inode.data_version)
+                .max(intent.inode.metadata_version);
+        } else if let IntentLogEntryKind::MetadataSetattrIntent(updated) = &entry.entry_kind {
+            state_generation = state_generation
+                .max(updated.generation.get())
+                .max(updated.data_version)
+                .max(updated.metadata_version);
+        }
+
+        let (inode_id, base_data_version, target_data_version) = match &entry.entry_kind {
+            IntentLogEntryKind::SyncWriteRange {
+                inode_id,
+                base_data_version,
+                data_version,
+                ..
+            }
+            | IntentLogEntryKind::OdsyncDataRange {
+                inode_id,
+                base_data_version,
+                data_version,
+                ..
+            }
+            | IntentLogEntryKind::SharedMmapMsync {
+                inode_id,
+                base_data_version,
+                data_version,
+                ..
+            } => (*inode_id, *base_data_version, *data_version),
+            _ => continue,
+        };
+
+        if anchor != committed_base {
+            return Err(FileSystemError::CorruptState {
+                reason: "Pool intent replay data is bound to a different committed-base root",
+            });
+        }
+        if target_data_version == 0 || target_data_version <= committed_base.generation {
+            return Err(FileSystemError::CorruptState {
+                reason: "Pool intent replay target is not newer than its committed-base root",
+            });
+        }
+
+        match active_target_data_version {
+            Some(previous) if target_data_version < previous => {
+                return Err(FileSystemError::CorruptState {
+                    reason: "Pool intent replay data generations are non-monotonic",
+                });
+            }
+            Some(previous) if target_data_version != previous => {
+                for inode_id in active_base_data_versions.keys() {
+                    projected_data_versions.insert(*inode_id, previous);
+                }
+                data_generations.push(PoolReplayGenerationPlan {
+                    target_data_version: previous,
+                    base_data_versions: std::mem::take(&mut active_base_data_versions),
+                });
+                active_target_data_version = Some(target_data_version);
+            }
+            None => active_target_data_version = Some(target_data_version),
+            Some(_) => {}
+        }
+
+        let expected_base_data_version = projected_data_versions.get(&inode_id).copied().ok_or(
+            FileSystemError::CorruptState {
+                reason: "Pool intent replay data precedes creation of its inode",
+            },
+        )?;
+        if base_data_version != expected_base_data_version {
+            return Err(FileSystemError::CorruptState {
+                reason: "Pool intent replay inode base data version does not match its predecessor",
+            });
+        }
+        if target_data_version <= base_data_version {
+            return Err(FileSystemError::CorruptState {
+                reason: "Pool intent replay target does not advance its inode base data version",
+            });
+        }
+        match active_base_data_versions.entry(inode_id) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(base_data_version);
+            }
+            std::collections::btree_map::Entry::Occupied(entry)
+                if *entry.get() != base_data_version =>
+            {
+                return Err(FileSystemError::CorruptState {
+                    reason: "Pool intent replay generation has conflicting inode predecessors",
+                });
+            }
+            std::collections::btree_map::Entry::Occupied(_) => {}
+        }
+        state_generation = state_generation.max(target_data_version);
+    }
+
+    if let Some(target_data_version) = active_target_data_version {
+        data_generations.push(PoolReplayGenerationPlan {
+            target_data_version,
+            base_data_versions: active_base_data_versions,
+        });
+    }
+
+    Ok(PoolReplayPlan {
+        data_generations,
+        state_generation,
+    })
+}
+
+fn validated_pool_replay_payload(
+    pool: &Pool,
+    entry: &IntentLogEntry,
+    offset: u64,
+    length: u64,
+    payload_digest: IntegrityDigest64,
+) -> Result<Vec<u8>> {
+    let _end = offset
+        .checked_add(length)
+        .ok_or(FileSystemError::SizeOverflow {
+            requested: u64::MAX,
+        })?;
+    let payload =
+        IntentLogRawStateAuthority::read_data_payload(pool.raw_primary_store(), entry.entry_id)?
+            .ok_or(FileSystemError::CorruptState {
+                reason: "Pool intent replay is missing its data payload",
+            })?;
+    let payload_len = u64::try_from(payload.len()).map_err(|_| FileSystemError::SizeOverflow {
+        requested: u64::MAX,
+    })?;
+    if payload_len != length {
+        return Err(FileSystemError::CorruptState {
+            reason: "Pool intent replay payload length does not match the recorded range",
+        });
+    }
+    if tidefs_local_object_store::checksum64(&payload) != payload_digest {
+        return Err(FileSystemError::CorruptState {
+            reason: "Pool intent replay payload digest does not match the recorded digest",
+        });
+    }
+    Ok(payload)
+}
+
+/// Replay mounted intents newer than the selected committed root. Content is
+/// read only through current Pool authority and every replacement chunk is
+/// written with a placement receipt.
+pub(crate) fn replay_uncommitted_with_pool(
+    log: &IntentLog,
+    state: &mut crate::FileSystemState,
+    pool: &mut Pool,
+    committed_base: &IntentLogRootAnchor,
+) -> Result<u64> {
+    replay_with_pool(
+        log,
+        state,
+        pool,
+        PoolReplaySelection::AfterCommittedBase,
+        committed_base,
+    )
+}
+
+/// Fold only data intents into the already-mutated live state before a normal
+/// commit. Namespace and metadata intents are not applied twice.
+pub(crate) fn replay_live_data_with_pool(
+    log: &IntentLog,
+    state: &mut crate::FileSystemState,
+    pool: &mut Pool,
+    committed_base: &IntentLogRootAnchor,
+) -> Result<u64> {
+    replay_with_pool(
+        log,
+        state,
+        pool,
+        PoolReplaySelection::LiveDataOnly,
+        committed_base,
+    )
+}
+
+fn replay_with_pool(
+    log: &IntentLog,
+    state: &mut crate::FileSystemState,
+    pool: &mut Pool,
+    selection: PoolReplaySelection,
+    committed_base: &IntentLogRootAnchor,
+) -> Result<u64> {
+    let selected: Vec<&IntentLogEntry> = log
+        .entries
+        .iter()
+        .filter(|entry| selected_for_pool_replay(entry, selection, committed_base))
+        .collect();
+    if selected.is_empty() {
+        return Ok(0);
+    }
+    let replay_plan = plan_pool_replay(&selected, state, committed_base)?;
+
+    let mut batcher = ReplayBatcher::new();
+    let mut data_generation_index = 0_usize;
+    let mut active_data_version = None;
+    let mut effective_versions = BTreeMap::new();
+    let mut replayed = 0_u64;
+    for entry in selected {
+        match &entry.entry_kind {
+            IntentLogEntryKind::SyncWriteRange {
+                inode_id,
+                offset,
+                length,
+                payload_digest,
+                data_version,
+                ..
+            }
+            | IntentLogEntryKind::OdsyncDataRange {
+                inode_id,
+                offset,
+                length,
+                payload_digest,
+                data_version,
+                ..
+            }
+            | IntentLogEntryKind::SharedMmapMsync {
+                inode_id,
+                offset,
+                length,
+                payload_digest,
+                data_version,
+                ..
+            } => {
+                if active_data_version != Some(*data_version) {
+                    if let Some(previous_data_version) = active_data_version {
+                        let generation = replay_plan
+                            .data_generations
+                            .get(data_generation_index)
+                            .ok_or(FileSystemError::CorruptState {
+                                reason: "Pool intent replay lost a planned data generation",
+                            })?;
+                        if generation.target_data_version != previous_data_version {
+                            return Err(FileSystemError::CorruptState {
+                                reason: "Pool intent replay data generation changed after planning",
+                            });
+                        }
+                        flush_planned_pool_replay_generation(
+                            &mut batcher,
+                            state,
+                            pool,
+                            generation,
+                            &mut effective_versions,
+                        )?;
+                        data_generation_index = data_generation_index.saturating_add(1);
+                    }
+                    active_data_version = Some(*data_version);
+                }
+                let payload =
+                    validated_pool_replay_payload(pool, entry, *offset, *length, *payload_digest)?;
+                batcher.push(*inode_id, *offset, *length, payload);
+            }
+            IntentLogEntryKind::NamespaceCreateIntent(intent) => {
+                replay_namespace_create_intent(intent, state)?;
+            }
+            IntentLogEntryKind::MetadataSetattrIntent(updated) => {
+                replay_metadata_setattr_intent(updated, state)?;
+            }
+            IntentLogEntryKind::NamespaceSyncIntent { .. } => {
+                replay_entry(entry, state, pool.raw_primary_store_mut())?;
+            }
+            IntentLogEntryKind::FsyncDirtyDrain { .. }
+            | IntentLogEntryKind::PressureFallback
+            | IntentLogEntryKind::CrashReplayReconcile => {}
+        }
+        replayed = replayed.saturating_add(1);
+    }
+    if let Some(active_data_version) = active_data_version {
+        let generation = replay_plan
+            .data_generations
+            .get(data_generation_index)
+            .ok_or(FileSystemError::CorruptState {
+                reason: "Pool intent replay lost its final planned data generation",
+            })?;
+        if generation.target_data_version != active_data_version {
+            return Err(FileSystemError::CorruptState {
+                reason: "Pool intent replay final data generation changed after planning",
+            });
+        }
+        flush_planned_pool_replay_generation(
+            &mut batcher,
+            state,
+            pool,
+            generation,
+            &mut effective_versions,
+        )?;
+        data_generation_index = data_generation_index.saturating_add(1);
+    }
+    if data_generation_index != replay_plan.data_generations.len() {
+        return Err(FileSystemError::CorruptState {
+            reason: "Pool intent replay did not consume every planned data generation",
+        });
+    }
+    state.generation = state.generation.max(replay_plan.state_generation);
+    Ok(replayed)
 }
 
 /// Replay uncommitted intent-log entries with bounded cost under
@@ -2164,9 +2996,10 @@ pub(crate) fn batched_replay_uncommitted(
                     };
                 batcher.push(*inode_id, *offset, *length, payload);
             }
-            // Non-write entries are replayed individually.
+            // Metadata-only setattr does not carry content authority. Apply it
+            // before the queued data patches so it cannot overwrite the
+            // replayed size/data version when the batch is materialized.
             IntentLogEntryKind::MetadataSetattrIntent(_) => {
-                count += batcher.flush(state, store)?;
                 replay_entry(entry, state, store)?;
                 count += 1;
             }
@@ -2196,7 +3029,7 @@ mod tests {
         IntentLogRootAnchor {
             transaction_id: 1,
             generation: 1,
-            manifest_digest: IntegrityDigest64(0xABCD),
+            manifest_checksum: IntegrityDigest64(0xABCD),
         }
     }
 
@@ -2220,6 +3053,7 @@ mod tests {
                 offset: 1024,
                 length: 4096,
                 payload_digest: IntegrityDigest64(0xDEADBEEF),
+                base_data_version: 0,
                 data_version: 1,
             },
             root_anchor: test_root_anchor(),
@@ -2236,20 +3070,24 @@ mod tests {
                     offset: a_off,
                     length: a_len,
                     payload_digest: a_dig,
-                    ..
+                    base_data_version: a_base,
+                    data_version: a_target,
                 },
                 IntentLogEntryKind::SyncWriteRange {
                     inode_id: b_id,
                     offset: b_off,
                     length: b_len,
                     payload_digest: b_dig,
-                    ..
+                    base_data_version: b_base,
+                    data_version: b_target,
                 },
             ) => {
                 assert_eq!(a_id, b_id);
                 assert_eq!(a_off, b_off);
                 assert_eq!(a_len, b_len);
                 assert_eq!(a_dig, b_dig);
+                assert_eq!(a_base, b_base);
+                assert_eq!(a_target, b_target);
             }
             _ => panic!("wrong entry kind after decode"),
         }
@@ -2265,6 +3103,7 @@ mod tests {
                 length: 512,
                 payload_digest: IntegrityDigest64(0xCAFE),
                 has_size_delta: true,
+                base_data_version: 0,
                 data_version: 1,
             },
             root_anchor: test_root_anchor(),
@@ -2414,6 +3253,7 @@ mod tests {
                 offset: 0,
                 length: 4,
                 payload_digest: IntegrityDigest64(0xAA),
+                base_data_version: 0,
                 data_version: 1,
             },
             IntentLogEntryKind::OdsyncDataRange {
@@ -2422,6 +3262,7 @@ mod tests {
                 length: 4,
                 payload_digest: IntegrityDigest64(0xBB),
                 has_size_delta: false,
+                base_data_version: 0,
                 data_version: 1,
             },
             IntentLogEntryKind::SharedMmapMsync {
@@ -2429,6 +3270,7 @@ mod tests {
                 offset: 0,
                 length: 4,
                 payload_digest: IntegrityDigest64(0xCC),
+                base_data_version: 0,
                 data_version: 1,
             },
         ];
@@ -2470,6 +3312,7 @@ mod tests {
                 offset: 0,
                 length: 4,
                 payload_digest: IntegrityDigest64(0xAA),
+                base_data_version: 0,
                 data_version: 1,
             },
             root_anchor: test_root_anchor(),
@@ -2478,6 +3321,10 @@ mod tests {
         log.flushed_entry_count = 1;
         assert!(log.has_pending_data_for_inode(inode_id));
         assert!(!log.has_unflushed_data_for_inode(inode_id));
+        assert_eq!(
+            log.latest_pending_data_versions_for_inode(inode_id),
+            Some((0, 1))
+        );
 
         log.entries.push(IntentLogEntry {
             entry_id: 1,
@@ -2508,6 +3355,7 @@ mod tests {
                 length: 4,
                 payload_digest: IntegrityDigest64(0xBB),
                 has_size_delta: false,
+                base_data_version: 1,
                 data_version: 2,
             },
             root_anchor: test_root_anchor(),
@@ -2515,6 +3363,10 @@ mod tests {
         });
         assert!(log.has_pending_data_for_inode(inode_id));
         assert!(log.has_unflushed_data_for_inode(inode_id));
+        assert_eq!(
+            log.latest_pending_data_versions_for_inode(inode_id),
+            Some((1, 2))
+        );
     }
 
     #[test]
@@ -2532,15 +3384,42 @@ mod tests {
                 offset: 0,
                 length: 0,
                 payload_digest: IntegrityDigest64(0),
+                base_data_version: 0,
                 data_version: 1,
             },
             root_anchor: test_root_anchor(),
             timestamp_ns: 0,
         };
         let mut bytes = try_encode_intent_log_entry(&entry).expect("encode");
-        let kind_pos = bytes.len().saturating_sub(41);
+        let kind_pos = 8 + 2 + 2 + 8 + 8 + 8 + 8 + 8;
         bytes[kind_pos] = 99;
         assert!(decode_intent_log_entry(&bytes).is_err());
+    }
+
+    #[test]
+    fn decode_rejects_pre_base_binding_format() {
+        let entry = IntentLogEntry {
+            entry_id: 0,
+            entry_kind: IntentLogEntryKind::SyncWriteRange {
+                inode_id: InodeId::new(1),
+                offset: 0,
+                length: 0,
+                payload_digest: IntegrityDigest64(0),
+                base_data_version: 0,
+                data_version: 1,
+            },
+            root_anchor: test_root_anchor(),
+            timestamp_ns: 0,
+        };
+        let mut bytes = try_encode_intent_log_entry(&entry).expect("encode");
+        bytes[8..10].copy_from_slice(&2_u16.to_le_bytes());
+        assert!(matches!(
+            decode_intent_log_entry(&bytes),
+            Err(FileSystemError::Decode {
+                object: "intent log entry",
+                reason: "unsupported format version"
+            })
+        ));
     }
 
     // -----------------------------------------------------------------------
@@ -2569,6 +3448,7 @@ mod tests {
                 offset: 0,
                 length: 512,
                 payload_digest: IntegrityDigest64(0xAAAA),
+                base_data_version: 0,
                 data_version: 1,
             },
             root_anchor: test_root_anchor(),
@@ -2608,6 +3488,7 @@ mod tests {
                         offset: i * 4096,
                         length: 4096,
                         payload_digest: IntegrityDigest64(0xBEEF0000 + i),
+                        base_data_version: 0,
                         data_version: 1,
                     },
                     root_anchor: test_root_anchor(),
@@ -2660,6 +3541,7 @@ mod tests {
                     offset: entry_id * 4096,
                     length: 4096,
                     payload_digest: IntegrityDigest64(0xCAFE0000 + entry_id),
+                    base_data_version: 0,
                     data_version: 1,
                 },
                 test_root_anchor(),
@@ -2680,6 +3562,7 @@ mod tests {
                 offset: entry_id * 4096,
                 length: 4096,
                 payload_digest: IntegrityDigest64(0xCAFE0000 + entry_id),
+                base_data_version: 0,
                 data_version: 1,
             },
             root_anchor: test_root_anchor(),
@@ -3012,6 +3895,7 @@ mod tests {
                     offset: 0,
                     length: 4096,
                     payload_digest: IntegrityDigest64(0xBEEF),
+                    base_data_version: 0,
                     data_version: 1,
                 },
                 test_root_anchor(),
@@ -3050,6 +3934,7 @@ mod tests {
                     offset: 0,
                     length: 4096,
                     payload_digest: IntegrityDigest64(0xAAAA),
+                    base_data_version: 0,
                     data_version: 1,
                 },
                 test_root_anchor(),
@@ -3129,6 +4014,7 @@ mod tests {
                     offset: i * 4096,
                     length: 4096,
                     payload_digest: IntegrityDigest64(0xCAFE0000 + i),
+                    base_data_version: 0,
                     data_version: 1,
                 },
                 test_root_anchor(),
@@ -3151,6 +4037,7 @@ mod tests {
                     offset: i * 4096,
                     length: 4096,
                     payload_digest: IntegrityDigest64(0xCAFE0000 + i),
+                    base_data_version: 0,
                     data_version: 1,
                 },
                 test_root_anchor(),
@@ -3179,6 +4066,7 @@ mod tests {
                     offset: i * 4096,
                     length: 4096,
                     payload_digest: IntegrityDigest64(0xCAFE0000 + i),
+                    base_data_version: 0,
                     data_version: 1,
                 },
                 test_root_anchor(),
@@ -3216,6 +4104,7 @@ mod tests {
                     offset: 0,
                     length: 4096,
                     payload_digest: IntegrityDigest64(0xBEEF),
+                    base_data_version: 0,
                     data_version: 1,
                 },
                 test_root_anchor(),
@@ -3260,6 +4149,7 @@ mod tests {
                     offset: i * 4096,
                     length: 4096,
                     payload_digest: IntegrityDigest64(0xCAFE0000 + i),
+                    base_data_version: 0,
                     data_version: 1,
                 },
                 test_root_anchor(),
@@ -3355,6 +4245,7 @@ mod tests {
                     offset: 0,
                     length: 4096,
                     payload_digest: IntegrityDigest64(0xCAFE),
+                    base_data_version: 0,
                     data_version: 1,
                 },
                 test_root_anchor(),
@@ -3376,6 +4267,7 @@ mod tests {
                 offset: 1024,
                 length: 4096,
                 payload_digest: IntegrityDigest64(0xDEADBEEF),
+                base_data_version: 0,
                 data_version: 1,
             },
             root_anchor: test_root_anchor(),
@@ -3493,7 +4385,7 @@ mod tests {
         IntentLogRootAnchor {
             transaction_id,
             generation: 1,
-            manifest_digest: IntegrityDigest64(0),
+            manifest_checksum: IntegrityDigest64(0),
         }
     }
 
@@ -3577,6 +4469,7 @@ mod tests {
                 offset: 0,
                 length: payload.len() as u64,
                 payload_digest: IntegrityDigest64(0),
+                base_data_version: 0,
                 data_version: 1,
             },
             root_anchor: anchor_for_tx(2),
@@ -3610,6 +4503,7 @@ mod tests {
                 length: 4,
                 payload_digest: IntegrityDigest64(0),
                 has_size_delta: true,
+                base_data_version: 0,
                 data_version: 1,
             },
             root_anchor: anchor_for_tx(2),
@@ -3628,6 +4522,7 @@ mod tests {
                 length: 4,
                 payload_digest: IntegrityDigest64(0),
                 has_size_delta: true,
+                base_data_version: 0,
                 data_version: 2,
             },
             root_anchor: anchor_for_tx(3),
@@ -3657,6 +4552,7 @@ mod tests {
                 offset: 0,
                 length: payload.len() as u64,
                 payload_digest: IntegrityDigest64(0),
+                base_data_version: 0,
                 data_version: 1,
             },
             root_anchor: anchor_for_tx(2),
@@ -3913,7 +4809,7 @@ mod tests {
     }
 
     #[test]
-    fn replay_metadata_setattr_intent_restores_post_setattr_record() {
+    fn replay_metadata_setattr_intent_restores_metadata_without_content_change() {
         let (mut store, _dir) = test_store();
         let mut state = minimal_state();
         let file_id = InodeId::new(260);
@@ -3923,8 +4819,6 @@ mod tests {
         updated.mode = S_IFREG | 0o600;
         updated.uid = 1000;
         updated.gid = 1001;
-        updated.size = 4096;
-        updated.data_version = 5;
         updated.metadata_version = 6;
         updated.posix_time = crate::types::PosixTimeRecord::new(10, 20, 30, 40);
         updated.subtree_rev = 2;
@@ -3939,7 +4833,7 @@ mod tests {
 
         assert_eq!(state.inodes.get(&file_id), Some(&updated));
         assert!(state.dirty_inodes.contains(&file_id));
-        assert!(state.dirty_content.contains(&file_id));
+        assert!(!state.dirty_content.contains(&file_id));
     }
 
     #[test]
@@ -3959,12 +4853,13 @@ mod tests {
                 offset: 0,
                 length: 4,
                 payload_digest: IntegrityDigest64(0),
+                base_data_version: 0,
                 data_version: 1,
             },
             root_anchor: IntentLogRootAnchor {
                 transaction_id: 1,
                 generation: 1,
-                manifest_digest: IntegrityDigest64(0),
+                manifest_checksum: IntegrityDigest64(0),
             },
             timestamp_ns: 0,
         };
@@ -3975,12 +4870,13 @@ mod tests {
                 offset: 4,
                 length: 4,
                 payload_digest: IntegrityDigest64(0),
+                base_data_version: 0,
                 data_version: 1,
             },
             root_anchor: IntentLogRootAnchor {
                 transaction_id: 3,
                 generation: 1,
-                manifest_digest: IntegrityDigest64(0),
+                manifest_checksum: IntegrityDigest64(0),
             },
             timestamp_ns: 0,
         };
@@ -4014,12 +4910,13 @@ mod tests {
                 offset: 0,
                 length: 4,
                 payload_digest: IntegrityDigest64(0),
+                base_data_version: 0,
                 data_version: 1,
             },
             root_anchor: IntentLogRootAnchor {
                 transaction_id: 1,
                 generation: 1,
-                manifest_digest: IntegrityDigest64(0),
+                manifest_checksum: IntegrityDigest64(0),
             },
             timestamp_ns: 0,
         };
@@ -4044,6 +4941,7 @@ mod tests {
                 offset: 0,
                 length: 4,
                 payload_digest: IntegrityDigest64(0),
+                base_data_version: 0,
                 data_version: 1,
             },
             root_anchor: anchor_for_tx(2),
@@ -4069,6 +4967,7 @@ mod tests {
                 offset: 0,
                 length: 4,
                 payload_digest: IntegrityDigest64(0),
+                base_data_version: 0,
                 data_version: 1,
             },
             root_anchor: anchor_for_tx(2),
@@ -4089,7 +4988,7 @@ mod tests {
             root_anchor: IntentLogRootAnchor {
                 transaction_id: 5,
                 generation: 1,
-                manifest_digest: IntegrityDigest64(0),
+                manifest_checksum: IntegrityDigest64(0),
             },
             timestamp_ns: 0,
         });
@@ -4128,6 +5027,7 @@ mod tests {
                 offset,
                 length: data.len() as u64,
                 payload_digest: IntegrityDigest64(0),
+                base_data_version: 0,
                 data_version: 1,
             },
             root_anchor: anchor_for_tx(tx),
@@ -4264,7 +5164,7 @@ mod tests {
     }
 
     #[test]
-    fn batched_replay_flushes_before_metadata_setattr_intent() {
+    fn batched_replay_rejects_unsupported_truncate_setattr_intent() {
         let (mut store, _dir) = test_store();
         let mut state = minimal_state();
         let file_id = InodeId::new(72);
@@ -4287,10 +5187,16 @@ mod tests {
         ];
 
         let log = log_from_entries(entries);
-        let count =
-            batched_replay_uncommitted(&log, &mut state, &mut store, 0).expect("batched replay");
-        assert_eq!(count, 2);
-        assert_eq!(state.inodes.get(&file_id), Some(&truncated));
+        let error = batched_replay_uncommitted(&log, &mut state, &mut store, 0)
+            .expect_err("truncate replay without content authority must fail closed");
+        assert!(matches!(
+            error,
+            FileSystemError::CorruptState {
+                reason: "intent log replay: metadata setattr cannot replay truncate or content-version changes"
+            }
+        ));
+        assert_eq!(state.inodes.get(&file_id).expect("inode").size, 0);
+        assert_eq!(state.inodes.get(&file_id).expect("inode").data_version, 1);
     }
 
     #[test]

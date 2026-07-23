@@ -52,7 +52,8 @@ fn dedup_enabled_produces_hits_for_duplicate_content() {
 
     {
         let mut fs = open_fs(&dir);
-        fs.set_dedup_enabled(true);
+        fs.set_dedup_enabled(true)
+            .expect("test setup mutation must be admitted");
         assert!(fs.is_dedup_enabled());
 
         // First file: writes all chunks as canonical objects
@@ -179,7 +180,8 @@ fn toggle_mid_session_only_affects_future_writes() {
     );
 
     // Enable dedup
-    fs.set_dedup_enabled(true);
+    fs.set_dedup_enabled(true)
+        .expect("test setup mutation must be admitted");
     assert!(fs.is_dedup_enabled());
 
     // Write with dedup enabled (new content, not yet canonicalized)
@@ -226,7 +228,8 @@ fn dedup_stats_defaults_and_ratio() {
     assert_eq!(s0.total_chunks, 0);
     assert_eq!(s0.dedup_bytes_saved, 0);
 
-    fs.set_dedup_enabled(true);
+    fs.set_dedup_enabled(true)
+        .expect("test setup mutation must be admitted");
 
     // Write first file
     fs.create_file("/unique.bin", DEFAULT_FILE_PERMISSIONS)

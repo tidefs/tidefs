@@ -21,9 +21,9 @@ use tidefs_local_filesystem::{
     feature_flags_roots_object_key,
     inspect_filesystem_content_objects_with_root_authentication_key, intent_log_head_object_key,
     orphan_index_object_key, plan_root_retention_with_root_authentication_key,
-    space_counters_object_key, superblock_object_key, verify_online_with_root_authentication_key,
-    LocalFileSystem, OnlineVerifierIssueSeverity, OnlineVerifierReport, RootAuthenticationKey,
-    RootRetentionPolicy, ROOT_AUTHENTICATION_ENV_VAR,
+    space_counters_object_key, verify_online_with_root_authentication_key, LocalFileSystem,
+    OnlineVerifierIssueSeverity, OnlineVerifierReport, RootAuthenticationKey, RootRetentionPolicy,
+    ROOT_AUTHENTICATION_ENV_VAR,
 };
 use tidefs_local_object_store::{checksum64, LocalObjectStore, ObjectKey, Pool, StoreOptions};
 
@@ -820,7 +820,6 @@ impl ScrubWalker {
 
 fn is_housekeeping_key(key: ObjectKey) -> bool {
     [
-        superblock_object_key(),
         space_counters_object_key(),
         orphan_index_object_key(),
         feature_flags_roots_object_key(),

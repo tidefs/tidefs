@@ -116,7 +116,7 @@ impl LocalFileSystem {
         fs.dirty_set = Default::default();
 
         let mut engine = VfsLocalFileSystem::new(fs).with_read_only();
-        engine.set_timestamp_policy(TimestampPolicy::Noatime);
+        engine.set_timestamp_policy(TimestampPolicy::Noatime)?;
         Ok(SnapshotExportSession {
             summary,
             engine: Some(engine),
@@ -214,8 +214,6 @@ impl LocalFileSystem {
 
     fn clear_snapshot_extract_caches(&self) {
         self.inode_cache.borrow_mut().clear();
-        self.hot_read_cache.borrow_mut().clear();
-        self.content_layout_cache.borrow_mut().clear();
     }
 }
 
@@ -393,8 +391,10 @@ mod tests {
             .expect("write snapshot file");
         fs.create_snapshot("snap0").expect("create snapshot");
 
-        fs.set_auto_commit(false);
-        fs.set_max_uncommitted_mutations(1_000_000);
+        fs.set_auto_commit(false)
+            .expect("test setup mutation must be admitted");
+        fs.set_max_uncommitted_mutations(1_000_000)
+            .expect("test setup mutation must be admitted");
         fs.write_file("/lost.txt", 0, b"live payloaddata")
             .expect("mutate live file");
         fs.create_dir("/live-only", 0o755)

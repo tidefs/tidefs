@@ -12,7 +12,10 @@ pub const DEFAULT_FILE_PERMISSIONS: u32 = 0o644;
 pub const CONTENT_INLINE_CHECKSUM_ENCODING_VERSION: u16 = 1;
 pub const DEFAULT_DIRECTORY_PERMISSIONS: u32 = 0o755;
 pub const DEFAULT_SYMLINK_PERMISSIONS: u32 = 0o777;
-pub const FILESYSTEM_SUPERBLOCK_OBJECT_NAME: &str = "tidefs.local-filesystem.v1.superblock";
+pub(crate) const RETIRED_V0390_FIXED_SUPERBLOCK_OBJECT_NAME: &str =
+    "tidefs.local-filesystem.v1.superblock";
+pub(crate) const RETIRED_V0390_FIXED_SUPERBLOCK_REFUSAL_REASON: &str =
+    "retired pre-release fixed-superblock format is unsupported";
 /// Pool-wide dataset catalog object key for durable B+tree path-to-ID mapping.
 /// Persisted through the pool object store; the canonical dataset catalog authority.
 pub const DATASET_CATALOG_OBJECT_NAME: &str = "tidefs.local-filesystem.v1.dataset-catalog";
@@ -46,9 +49,6 @@ pub fn content_chunk_size() -> u32 {
     })
 }
 
-pub const HOT_READ_CACHE_SPEC: &str = "hot read cache: LocalFileSystem read_file/read_symlink use a bounded, non-authoritative, inode/data-version/size keyed cache that accelerates reads without becoming publication, recovery, or allocator truth";
-pub const DEFAULT_HOT_READ_CACHE_MAX_ENTRIES: usize = 64;
-pub const DEFAULT_HOT_READ_CACHE_MAX_BYTES: u64 = 256 * 1024;
 pub const LOCAL_STORAGE_ALLOCATOR_GRAIN_BYTES: u64 = DEFAULT_FILESYSTEM_CONTENT_CHUNK_SIZE as u64;
 
 /// Inode metadata cache: default max entries (adaptive ARC).
@@ -105,7 +105,9 @@ pub const POSIX_SUBSET_POLICY_VERSION: u16 = 1;
 pub const FILESYSTEM_INTENT_LOG_OBJECT_PREFIX: &str = "tidefs.local-filesystem.v1.intent-log";
 pub const INTENT_LOG_MAGIC_ASCII: &str = "VFSILOG1";
 pub const INTENT_LOG_MAGIC_BYTES: [u8; 8] = *b"VFSILOG1";
-pub const INTENT_LOG_ENTRY_VERSION: u16 = 2;
+/// Version 3 binds replayable data to its exact committed-root base and inode
+/// predecessor version. Pre-release version 2 records are rejected, not migrated.
+pub const INTENT_LOG_ENTRY_VERSION: u16 = 3;
 
 pub const FORMAT_VERSION_EXTENSION_MAGIC_ASCII: &str = "VFSFMTV1";
 pub const FORMAT_VERSION_EXTENSION_MAGIC_BYTES: [u8; 8] = *b"VFSFMTV1";
