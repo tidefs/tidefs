@@ -1481,7 +1481,31 @@ impl LocalObjectStore {
     /// the superblock region). On open, the data region is scanned to
     /// rebuild the in-memory index.
     pub fn open_block_device(device_path: impl AsRef<Path>, options: StoreOptions) -> Result<Self> {
+        Self::open_block_device_with_mode(device_path, options, StoreOpenMode::WritableCreate)
+    }
+
+    /// Open an existing block-device store without permitting writes.
+    ///
+    /// Unlike [`Self::open_block_device`], this refuses an uninitialized or
+    /// incompatible format header instead of creating one. The backing handle
+    /// is opened read-only, so the returned store is suitable for concurrent
+    /// integrity inspection of an already-mounted pool.
+    pub(crate) fn open_block_device_read_only_existing(
+        device_path: impl AsRef<Path>,
+        options: StoreOptions,
+    ) -> Result<Self> {
+        Self::open_block_device_with_mode(device_path, options, StoreOpenMode::ReadOnlyExisting)
+    }
+
+    fn open_block_device_with_mode(
+        device_path: impl AsRef<Path>,
+        mut options: StoreOptions,
+        mode: StoreOpenMode,
+    ) -> Result<Self> {
         options.validate()?;
+        if mode == StoreOpenMode::ReadOnlyExisting {
+            options.repair_torn_tail = false;
+        }
         let device_path = device_path.as_ref().to_path_buf();
 
         let metadata = std::fs::metadata(&device_path).map_err(|e| StoreError::Io {
@@ -1501,9 +1525,12 @@ impl LocalObjectStore {
             });
         }
 
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
+        let mut open_options = OpenOptions::new();
+        open_options.read(true);
+        if mode == StoreOpenMode::WritableCreate {
+            open_options.write(true);
+        }
+        let mut file = open_options
             .open(&device_path)
             .map_err(|e| StoreError::Io {
                 operation: "block_device_open",
@@ -1527,10 +1554,19 @@ impl LocalObjectStore {
             });
         }
 
-        // Read or initialize the format header.
+        // Read the existing format header. Writable mounts retain the
+        // pre-release initialization behavior; inspection must never create
+        // or repair storage merely because the header is absent or invalid.
         let _generation = match Self::read_block_format_header(&mut file, format_start)? {
             Some(gen) => gen,
-            None => Self::write_block_format_header(&mut file, format_start)?,
+            None if mode == StoreOpenMode::WritableCreate => {
+                Self::write_block_format_header(&mut file, format_start)?
+            }
+            None => {
+                return Err(StoreError::InvalidOptions {
+                    reason: "read-only block-device open requires an existing valid format header",
+                })
+            }
         };
 
         let (index, history, next_sequence, current_offset) = Self::scan_block_device_for_index(
@@ -1553,7 +1589,7 @@ impl LocalObjectStore {
             root,
             segments_dir,
             options,
-            read_only: false,
+            read_only: mode == StoreOpenMode::ReadOnlyExisting,
             current_segment_id: 0,
             free_map,
             current_offset,
@@ -4529,6 +4565,7 @@ impl LocalObjectStore {
     }
 
     pub fn sync_all(&mut self) -> Result<()> {
+        self.ensure_writable("sync_all")?;
         if self.dead_object_reclaim_queue_dirty {
             let queue = std::mem::replace(
                 &mut self.dead_object_reclaim_queue,
@@ -4697,6 +4734,7 @@ impl LocalObjectStore {
     /// Use this for writeback-drain convergence points where per-inode data
     /// durability is sufficient and a full commit-group commit is deferred.
     pub fn sync_data(&mut self) -> Result<()> {
+        self.ensure_writable("sync_data")?;
         let path = segment_path(&self.segments_dir, self.current_segment_id);
         self.current_file
             .sync_data()
