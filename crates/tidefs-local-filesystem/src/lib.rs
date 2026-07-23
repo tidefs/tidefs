@@ -1810,25 +1810,22 @@ impl<'a> MountedMetadataIntentRawStateAuthority<'a> {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum MountedCommittedRootRepairTransformMode {
-    MetadataRawOnlyNoDeviceTransforms,
+    MetadataRawOnlyPoolContentNoDeviceTransforms,
 }
 
 pub(crate) struct MountedCommittedRootRepairAuthority<'a> {
-    store: &'a mut LocalObjectStore,
+    pool: &'a mut Pool,
     root_authentication_key: RootAuthenticationKey,
     transform_mode: MountedCommittedRootRepairTransformMode,
 }
 
 impl<'a> MountedCommittedRootRepairAuthority<'a> {
-    fn raw_only(
-        store: &'a mut LocalObjectStore,
-        root_authentication_key: RootAuthenticationKey,
-    ) -> Self {
+    fn pool_content(pool: &'a mut Pool, root_authentication_key: RootAuthenticationKey) -> Self {
         Self {
-            store,
+            pool,
             root_authentication_key,
             transform_mode:
-                MountedCommittedRootRepairTransformMode::MetadataRawOnlyNoDeviceTransforms,
+                MountedCommittedRootRepairTransformMode::MetadataRawOnlyPoolContentNoDeviceTransforms,
         }
     }
 
@@ -1841,27 +1838,27 @@ impl<'a> MountedCommittedRootRepairAuthority<'a> {
     }
 
     fn recovery_probe_report(&mut self) -> Result<RecoveryProbeReport> {
-        recovery_probe_from_store(&mut *self.store, self.root_authentication_key)
+        recovery_probe_pool(&mut *self.pool, self.root_authentication_key)
     }
 
     fn recovery_audit(&mut self) -> Result<RecoveryAuditReport> {
-        audit_recovery_store(&mut *self.store, self.root_authentication_key)
+        audit_recovery_pool(&mut *self.pool, self.root_authentication_key)
     }
 
     fn online_verifier_report(&mut self) -> Result<OnlineVerifierReport> {
-        verify_online_store(&mut *self.store, self.root_authentication_key)
+        verify_online_pool(&mut *self.pool, self.root_authentication_key)
     }
 
     #[cfg(test)]
     fn root_retention_plan(&mut self, policy: RootRetentionPolicy) -> Result<RootRetentionPlan> {
-        plan_root_retention_store(&mut *self.store, policy, self.root_authentication_key)
+        plan_root_retention_pool(&mut *self.pool, policy, self.root_authentication_key)
     }
 
     fn root_slot_locations_for_summary(
         &self,
         expected: &CommittedRootSummary,
     ) -> Result<Vec<ObjectLocation>> {
-        root_slot_locations_for_summary(&*self.store, expected)
+        root_slot_locations_for_summary(self.pool.raw_primary_store(), expected)
     }
 }
 
@@ -1963,19 +1960,15 @@ impl<'a> MountedOpenRecoveryAuthority<'a> {
         self.store.raw_primary_store()
     }
 
-    fn raw_recovery_store_mut(&mut self) -> &mut LocalObjectStore {
-        self.store.raw_primary_store_mut()
-    }
-
     fn committed_root_repair_authority(&mut self) -> MountedCommittedRootRepairAuthority<'_> {
         let root_authentication_key = self.root_authentication_key;
-        let authority = MountedCommittedRootRepairAuthority::raw_only(
-            self.raw_recovery_store_mut(),
+        let authority = MountedCommittedRootRepairAuthority::pool_content(
+            &mut *self.store,
             root_authentication_key,
         );
         debug_assert_eq!(
             authority.transform_mode(),
-            MountedCommittedRootRepairTransformMode::MetadataRawOnlyNoDeviceTransforms
+            MountedCommittedRootRepairTransformMode::MetadataRawOnlyPoolContentNoDeviceTransforms
         );
         debug_assert_eq!(
             authority.transform_ordering_boundary(),
@@ -2136,7 +2129,7 @@ impl<'a> MountedOpenRecoveryAuthority<'a> {
     }
 
     fn committed_content_used_bytes(&self, state: &FileSystemState) -> Result<u64> {
-        content_allocation_entries_for_state(self.raw_recovery_store(), state)
+        content_allocation_entries_for_state_pool(self.store, state)
             .and_then(|entries| allocation_bytes(&entries))
     }
 }
@@ -3458,8 +3451,7 @@ impl LocalFileSystem {
             // metadata/log bytes, while LocalStorageAllocatorPolicy's capacity
             // is the user-content ceiling enforced by fallocate/write paths.
             let used_bytes = open_recovery
-                .committed_content_used_bytes(&state)
-                .unwrap_or(pool_stats.used_bytes)
+                .committed_content_used_bytes(&state)?
                 .min(total_bytes);
             let mut counters = *state.space_accounting.counters();
             if counters.logical_used_bytes < used_bytes {
@@ -5625,8 +5617,8 @@ impl LocalFileSystem {
     }
 
     pub fn allocator_report(&mut self) -> Result<LocalStorageAllocatorReport> {
-        let mut report = allocator_report_for_state(
-            self.store.raw_primary_store_mut(),
+        let mut report = allocator_report_for_state_pool(
+            &mut self.store,
             &self.state,
             self.allocator_policy,
             self.root_authentication_key,
@@ -7261,18 +7253,19 @@ impl LocalFileSystem {
                 bytes: &patch.bytes,
             })
             .collect();
-        let planned_entries = planned_chunk_allocation_entries_for_patch_batch(
-            self.store.raw_primary_store(),
+        let old_layout = self.read_committed_content_layout(inode_id, &old_record)?;
+        let planned_entries = planned_chunk_allocation_entries_for_patch_batch_layout(
+            &old_layout,
             &old_record,
             &planned_record,
             &content_patches,
             allow_holes,
         )?;
-        let old_allocation_bytes = allocation_bytes(&content_allocation_entries_for_inode(
-            self.store.raw_primary_store(),
+        let old_allocation_bytes = allocation_bytes(&content_allocation_entries_for_inode_pool(
+            &self.store,
             &old_record,
         )?)?;
-        let allocation_bytes = allocation_bytes(&planned_entries).unwrap_or(0);
+        let allocation_bytes = allocation_bytes(&planned_entries)?;
         let dirty_allocation_bytes = dirty_patch_batch_allocation_bytes(new_size, patches)?;
         let new_blocks = allocation_bytes / content_chunk_size() as u64;
         let patch_ranges = self.coalesced_patch_ranges(patches)?;
@@ -7280,11 +7273,8 @@ impl LocalFileSystem {
             self.materialized_content_bytes_in_ranges(inode_id, &old_record, &patch_ranges)?;
         if allocation_bytes > old_allocation_bytes {
             self.ensure_obligation_capacity("staging_dirty", new_blocks, Some(inode_id))?;
-            self.ensure_content_capacity_with_planned_inode(
-                Some(inode_id),
-                planned_entries.clone(),
-            )?;
         }
+        self.ensure_content_capacity_with_planned_inode(Some(inode_id), planned_entries.clone())?;
 
         self.begin_mutation("rewrite file content")?;
         let tick = self.bump_generation();
@@ -10734,20 +10724,17 @@ impl LocalFileSystem {
         planned_record.data_version = planned_tick;
         planned_record.metadata_version = planned_tick;
         let planned_entries = planned_chunk_allocation_entries_for_full_content(&planned_record)?;
-        let old_allocation_bytes = allocation_bytes(&content_allocation_entries_for_inode(
-            self.store.raw_primary_store(),
+        let old_allocation_bytes = allocation_bytes(&content_allocation_entries_for_inode_pool(
+            &self.store,
             &record,
         )?)?;
         // Pre-check obligation ledger before allocator (Design rule Rule 3: authority is scarce)
-        let allocation_bytes = allocation_bytes(&planned_entries).unwrap_or(0);
+        let allocation_bytes = allocation_bytes(&planned_entries)?;
         let new_blocks = allocation_bytes / content_chunk_size() as u64;
         if allocation_bytes > old_allocation_bytes {
             self.ensure_obligation_capacity("staging_dirty", new_blocks, Some(inode_id))?;
-            self.ensure_content_capacity_with_planned_inode(
-                Some(inode_id),
-                planned_entries.clone(),
-            )?;
         }
+        self.ensure_content_capacity_with_planned_inode(Some(inode_id), planned_entries.clone())?;
 
         self.begin_mutation("replace file content")?; // was: let previous_state = self.state.clone()
         let tick = self.bump_generation();
@@ -10849,20 +10836,21 @@ impl LocalFileSystem {
         planned_record.size = new_size;
         planned_record.data_version = planned_tick;
         planned_record.metadata_version = planned_tick;
-        let planned_entries = planned_chunk_allocation_entries_for_overlay(
-            self.store.raw_primary_store(),
+        let old_layout = self.read_committed_content_layout(inode_id, &old_record)?;
+        let planned_entries = planned_chunk_allocation_entries_for_overlay_layout(
+            &old_layout,
             &old_record,
             &planned_record,
             overlay_offset,
             overlay_bytes,
             allow_holes,
         )?;
-        let old_allocation_bytes = allocation_bytes(&content_allocation_entries_for_inode(
-            self.store.raw_primary_store(),
+        let old_allocation_bytes = allocation_bytes(&content_allocation_entries_for_inode_pool(
+            &self.store,
             &old_record,
         )?)?;
         // Pre-check obligation ledger before allocator (Design rule Rule 3: authority is scarce)
-        let allocation_bytes = allocation_bytes(&planned_entries).unwrap_or(0);
+        let allocation_bytes = allocation_bytes(&planned_entries)?;
         let dirty_allocation_bytes =
             dirty_overlay_allocation_bytes(new_size, overlay_offset, overlay_bytes)?;
         let new_blocks = allocation_bytes / content_chunk_size() as u64;
@@ -10881,11 +10869,8 @@ impl LocalFileSystem {
         };
         if allocation_bytes > old_allocation_bytes {
             self.ensure_obligation_capacity("staging_dirty", new_blocks, Some(inode_id))?;
-            self.ensure_content_capacity_with_planned_inode(
-                Some(inode_id),
-                planned_entries.clone(),
-            )?;
         }
+        self.ensure_content_capacity_with_planned_inode(Some(inode_id), planned_entries.clone())?;
 
         self.begin_mutation("rewrite file content overlay")?; // was: let previous_state = self.state.clone()
         let tick = self.bump_generation();
@@ -12704,13 +12689,10 @@ impl LocalFileSystem {
         planned_entries: BTreeMap<ObjectKey, u64>,
     ) -> Result<()> {
         let mut current_entries =
-            content_allocation_entries_for_state(self.store.raw_primary_store(), &self.state)?;
+            content_allocation_entries_for_state_pool(&self.store, &self.state)?;
         if let Some(inode_id) = replaced_inode {
             let old_record = self.committed_inode_record(inode_id)?;
-            for key in
-                content_allocation_entries_for_inode(self.store.raw_primary_store(), &old_record)?
-                    .keys()
-            {
+            for key in content_allocation_entries_for_inode_pool(&self.store, &old_record)?.keys() {
                 current_entries.remove(key);
             }
         }
@@ -12722,8 +12704,8 @@ impl LocalFileSystem {
         &mut self,
         current_entries: BTreeMap<ObjectKey, u64>,
     ) -> Result<()> {
-        let mut reserved_entries = protected_committed_content_entries(
-            self.store.raw_primary_store_mut(),
+        let mut reserved_entries = protected_committed_content_entries_pool(
+            &mut self.store,
             self.root_authentication_key,
             &self.state,
         )?;

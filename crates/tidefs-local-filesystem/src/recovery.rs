@@ -12,7 +12,8 @@ use tidefs_types_vfs_core::{Generation, InodeId, NodeKind, ROOT_INODE_ID};
 
 use crate::allocation_bytes;
 use crate::constants::*;
-use crate::content_allocation_entries_for_state;
+use crate::content::MountedContentReadAuthority;
+use crate::content_allocation_entries_for_state_pool;
 use crate::crash_hooks::check_crash_hook;
 use crate::encoding::*;
 use crate::error::FileSystemError;
@@ -138,6 +139,14 @@ trait CommittedRootRecoverySource {
     ) -> Result<FileSystemState>;
 
     fn read_current_content_for_retention(&self, key: ObjectKey) -> Result<Option<Vec<u8>>>;
+
+    fn load_online_verifier_state(
+        &mut self,
+        root: &RootCommitRecord,
+        root_authentication_key: RootAuthenticationKey,
+    ) -> Result<FileSystemState>;
+
+    fn online_verifier_content_counts(&self, state: &FileSystemState) -> Result<(u64, u64)>;
 }
 
 impl CommittedRootRecoverySource for LocalObjectStore {
@@ -161,6 +170,18 @@ impl CommittedRootRecoverySource for LocalObjectStore {
 
     fn read_current_content_for_retention(&self, key: ObjectKey) -> Result<Option<Vec<u8>>> {
         Ok(self.get(key)?)
+    }
+
+    fn load_online_verifier_state(
+        &mut self,
+        root: &RootCommitRecord,
+        root_authentication_key: RootAuthenticationKey,
+    ) -> Result<FileSystemState> {
+        load_state_from_transaction(self, root, root_authentication_key)
+    }
+
+    fn online_verifier_content_counts(&self, state: &FileSystemState) -> Result<(u64, u64)> {
+        online_verifier_content_counts(self, state)
     }
 }
 
@@ -189,6 +210,18 @@ impl CommittedRootRecoverySource for Pool {
             .map(|content| content.map(|(bytes, _receipt)| bytes))
             .map_err(FileSystemError::from)
             .map_err(pool_candidate_content_error)
+    }
+
+    fn load_online_verifier_state(
+        &mut self,
+        root: &RootCommitRecord,
+        root_authentication_key: RootAuthenticationKey,
+    ) -> Result<FileSystemState> {
+        load_state_from_transaction_pool(self, root, root_authentication_key)
+    }
+
+    fn online_verifier_content_counts(&self, state: &FileSystemState) -> Result<(u64, u64)> {
+        online_verifier_content_counts_pool(self, state)
     }
 }
 
@@ -366,24 +399,25 @@ pub(crate) fn load_latest_committed_state_pool(
     }
 }
 
-pub(crate) fn recovery_probe_from_store(
-    store: &mut LocalObjectStore,
+pub(crate) fn recovery_probe_pool(
+    pool: &mut Pool,
     root_authentication_key: RootAuthenticationKey,
 ) -> Result<RecoveryProbeReport> {
-    let mut report = select_latest_committed_root(store, root_authentication_key)?.report;
+    recovery_probe_source(pool, root_authentication_key)
+}
+
+fn recovery_probe_source<S: CommittedRootRecoverySource>(
+    source: &mut S,
+    root_authentication_key: RootAuthenticationKey,
+) -> Result<RecoveryProbeReport> {
+    let mut report =
+        select_latest_committed_root_from_source(source, root_authentication_key)?.report;
     if report.outcome == RecoveryProbeOutcome::EmptyStore
-        && retired_v0390_fixed_superblock_marker_present(store)?
+        && retired_v0390_fixed_superblock_marker_present(source.raw_store())?
     {
         report.outcome = RecoveryProbeOutcome::ExplicitIntegrityOrMediaError;
     }
     Ok(report)
-}
-
-pub(crate) fn audit_recovery_store(
-    store: &mut LocalObjectStore,
-    root_authentication_key: RootAuthenticationKey,
-) -> Result<RecoveryAuditReport> {
-    Ok(audit_recovery_source_details(store, root_authentication_key)?.report)
 }
 
 pub(crate) fn audit_recovery_pool(
@@ -471,12 +505,26 @@ pub fn verify_online_store(
     store: &mut LocalObjectStore,
     root_authentication_key: RootAuthenticationKey,
 ) -> Result<OnlineVerifierReport> {
+    verify_online_source(store, root_authentication_key)
+}
+
+pub(crate) fn verify_online_pool(
+    pool: &mut Pool,
+    root_authentication_key: RootAuthenticationKey,
+) -> Result<OnlineVerifierReport> {
+    verify_online_source(pool, root_authentication_key)
+}
+
+fn verify_online_source<S: CommittedRootRecoverySource>(
+    source: &mut S,
+    root_authentication_key: RootAuthenticationKey,
+) -> Result<OnlineVerifierReport> {
     let mut report = OnlineVerifierReport::empty();
     let mut selected: Option<CommittedRootSummary> = None;
 
     for slot in 0..FILESYSTEM_ROOT_SLOT_COUNT {
         let slot_key = root_slot_object_key(slot);
-        let locations = store.version_locations_of(slot_key);
+        let locations = source.raw_store().version_locations_of(slot_key);
         if locations.is_empty() {
             continue;
         }
@@ -489,7 +537,7 @@ pub fn verify_online_store(
 
         for location in locations.into_iter().rev() {
             report.root_candidates_seen = report.root_candidates_seen.saturating_add(1);
-            let bytes = match store.get_at_location(location) {
+            let bytes = match source.raw_store().get_at_location(location) {
                 Ok(bytes) => bytes,
                 Err(err) => {
                     report.invalid_root_candidates =
@@ -531,7 +579,7 @@ pub fn verify_online_store(
                 continue;
             }
 
-            match online_verifier_root_report(store, &root, root_authentication_key) {
+            match online_verifier_root_report_source(source, &root, root_authentication_key) {
                 Ok(root_report) => {
                     if selected
                         .as_ref()
@@ -592,7 +640,7 @@ pub fn verify_online_store(
 
     if selected.is_none()
         && report.root_slot_records_seen == 0
-        && retired_v0390_fixed_superblock_marker_present(store)?
+        && retired_v0390_fixed_superblock_marker_present(source.raw_store())?
     {
         report.issues.push(online_verifier_issue(
             OnlineVerifierIssueKind::RootCommitValidation,
@@ -618,8 +666,8 @@ pub fn verify_online_store(
     Ok(report)
 }
 
-pub fn online_verifier_root_report(
-    store: &mut LocalObjectStore,
+fn online_verifier_root_report_source<S: CommittedRootRecoverySource>(
+    source: &mut S,
     root: &RootCommitRecord,
     root_authentication_key: RootAuthenticationKey,
 ) -> Result<OnlineVerifierRootReport> {
@@ -633,12 +681,12 @@ pub fn online_verifier_root_report(
             reason: "online verifier requires authenticated committed roots",
         });
     }
-    let state = load_state_from_transaction(store, root, root_authentication_key)?;
+    let state = source.load_online_verifier_state(root, root_authentication_key)?;
     let mount_invariant = mount_invariant_report_from_state(&state)?;
     let (checked_content_objects, checked_content_chunks) =
-        online_verifier_content_counts(store, &state)?;
+        source.online_verifier_content_counts(&state)?;
     let verified_snapshot_roots =
-        online_verifier_snapshot_roots(store, root, &state, root_authentication_key)?;
+        online_verifier_snapshot_roots_source(source, root, &state, root_authentication_key)?;
     Ok(OnlineVerifierRootReport {
         root: root.summary(),
         mount_invariant,
@@ -669,6 +717,29 @@ pub fn online_verifier_content_counts(
                 checked_content_chunks =
                     checked_content_chunks.saturating_add(manifest.chunks.len() as u64);
             }
+        }
+    }
+    Ok((checked_content_objects, checked_content_chunks))
+}
+
+fn online_verifier_content_counts_pool(pool: &Pool, state: &FileSystemState) -> Result<(u64, u64)> {
+    let reader = MountedContentReadAuthority::new(pool);
+    let mut checked_content_objects = 0_u64;
+    let mut checked_content_chunks = 0_u64;
+    for inode in state.inodes.values() {
+        if !inode.is_file_like() {
+            continue;
+        }
+        let content_key = content_object_key_for_version(inode.inode_id, inode.data_version);
+        if inode.size == 0 && reader.read_current_object(content_key)?.is_none() {
+            continue;
+        }
+        let layout = reader.read_layout(inode.inode_id, inode)?;
+        let _ = reader.read_all(inode.inode_id, inode)?;
+        checked_content_objects = checked_content_objects.saturating_add(1);
+        if let ContentLayout::Chunked(manifest) = layout {
+            checked_content_chunks =
+                checked_content_chunks.saturating_add(manifest.chunks.len() as u64);
         }
     }
     Ok((checked_content_objects, checked_content_chunks))
@@ -907,8 +978,8 @@ fn inspect_chunk_object(
     Ok(())
 }
 
-pub fn online_verifier_snapshot_roots(
-    store: &mut LocalObjectStore,
+fn online_verifier_snapshot_roots_source<S: CommittedRootRecoverySource>(
+    source: &mut S,
     current_root: &RootCommitRecord,
     state: &FileSystemState,
     root_authentication_key: RootAuthenticationKey,
@@ -920,9 +991,9 @@ pub fn online_verifier_snapshot_roots(
                 reason: "online verifier found a snapshot root at or after the current root",
             });
         }
-        let _locations = root_slot_locations_for_summary(store, &snapshot.root)?;
+        let _locations = root_slot_locations_for_summary(source.raw_store(), &snapshot.root)?;
         let root = root_commit_from_summary(&snapshot.root);
-        let _state = load_state_from_transaction(store, &root, root_authentication_key)?;
+        let _state = source.load_online_verifier_state(&root, root_authentication_key)?;
         verified = verified.saturating_add(1);
     }
     Ok(verified)
@@ -944,15 +1015,6 @@ pub fn online_verifier_issue(
         generation: root.map(|root| root.generation),
         reason: reason.into(),
     }
-}
-
-#[cfg(test)]
-pub(crate) fn plan_root_retention_store(
-    store: &mut LocalObjectStore,
-    policy: RootRetentionPolicy,
-    root_authentication_key: RootAuthenticationKey,
-) -> Result<RootRetentionPlan> {
-    plan_root_retention_source(store, policy, root_authentication_key)
 }
 
 pub(crate) fn plan_root_retention_pool(
@@ -1434,26 +1496,43 @@ pub(crate) fn root_commit_from_summary(summary: &CommittedRootSummary) -> RootCo
     }
 }
 
-pub(crate) fn allocator_report_for_state(
-    store: &mut LocalObjectStore,
+pub(crate) fn allocator_report_for_state_pool(
+    pool: &mut Pool,
     state: &FileSystemState,
     policy: LocalStorageAllocatorPolicy,
     root_authentication_key: RootAuthenticationKey,
 ) -> Result<LocalStorageAllocatorReport> {
     policy.validate()?;
-    let current_entries = content_allocation_entries_for_state(store, state)?;
-    let unique_current_content_objects = current_entries.len() as u64;
-    let current_namespace_allocated_bytes = allocation_bytes(&current_entries)?;
+    let current_entries = content_allocation_entries_for_state_pool(pool, state)?;
     let protected_roots = snapshot_retained_roots(state);
     let mut protected_entries = BTreeMap::new();
     for summary in &protected_roots {
         let root = root_commit_from_summary(summary);
-        let committed_state = load_state_from_transaction(store, &root, root_authentication_key)?;
+        let committed_state =
+            load_state_from_transaction_pool(pool, &root, root_authentication_key)?;
         merge_allocation_entries(
             &mut protected_entries,
-            content_allocation_entries_for_state(store, &committed_state)?,
+            content_allocation_entries_for_state_pool(pool, &committed_state)?,
         );
     }
+    allocator_report_from_entries(
+        state,
+        policy,
+        protected_roots.len() as u64,
+        current_entries,
+        protected_entries,
+    )
+}
+
+fn allocator_report_from_entries(
+    state: &FileSystemState,
+    policy: LocalStorageAllocatorPolicy,
+    protected_committed_roots: u64,
+    current_entries: BTreeMap<ObjectKey, u64>,
+    protected_entries: BTreeMap<ObjectKey, u64>,
+) -> Result<LocalStorageAllocatorReport> {
+    let unique_current_content_objects = current_entries.len() as u64;
+    let current_namespace_allocated_bytes = allocation_bytes(&current_entries)?;
     let protected_committed_root_allocated_bytes = allocation_bytes(&protected_entries)?;
     let mut reserved_entries = protected_entries.clone();
     merge_allocation_entries(&mut reserved_entries, current_entries);
@@ -1468,7 +1547,7 @@ pub(crate) fn allocator_report_for_state(
         grain_bytes: content_chunk_size() as u64,
         current_namespace_allocated_bytes,
         protected_committed_root_allocated_bytes,
-        protected_committed_roots: protected_roots.len() as u64,
+        protected_committed_roots,
         unique_current_content_objects,
         unique_protected_content_objects: protected_entries.len() as u64,
         allocator_reserved_bytes,
@@ -1483,8 +1562,8 @@ pub(crate) fn allocator_report_for_state(
     })
 }
 
-pub(crate) fn protected_committed_content_entries(
-    store: &mut LocalObjectStore,
+pub(crate) fn protected_committed_content_entries_pool(
+    pool: &mut Pool,
     root_authentication_key: RootAuthenticationKey,
     state: &FileSystemState,
 ) -> Result<BTreeMap<ObjectKey, u64>> {
@@ -1492,10 +1571,12 @@ pub(crate) fn protected_committed_content_entries(
     let mut entries = BTreeMap::new();
     for summary in &protected_roots {
         let root = root_commit_from_summary(summary);
-        let committed_state = load_state_from_transaction(store, &root, root_authentication_key)?;
-        let state_entries = content_allocation_entries_for_state(store, &committed_state)?;
-        let _state_bytes: u64 = state_entries.values().sum();
-        merge_allocation_entries(&mut entries, state_entries);
+        let committed_state =
+            load_state_from_transaction_pool(pool, &root, root_authentication_key)?;
+        merge_allocation_entries(
+            &mut entries,
+            content_allocation_entries_for_state_pool(pool, &committed_state)?,
+        );
     }
     Ok(entries)
 }
@@ -3247,6 +3328,18 @@ mod selection_authority_tests {
         fn read_current_content_for_retention(&self, key: ObjectKey) -> Result<Option<Vec<u8>>> {
             Ok(self.store.get(key)?)
         }
+
+        fn load_online_verifier_state(
+            &mut self,
+            root: &RootCommitRecord,
+            root_authentication_key: RootAuthenticationKey,
+        ) -> Result<FileSystemState> {
+            load_state_from_transaction(&mut self.store, root, root_authentication_key)
+        }
+
+        fn online_verifier_content_counts(&self, state: &FileSystemState) -> Result<(u64, u64)> {
+            super::online_verifier_content_counts(&self.store, state)
+        }
     }
 
     fn temp_root(label: &str) -> PathBuf {
@@ -3656,7 +3749,7 @@ mod candidate_history_tests {
                 key,
             )
             .expect("persist standalone root");
-            let report = recovery_probe_from_store(&mut store, key)
+            let report = recovery_probe_source(&mut store, key)
                 .expect("standalone root must be recoverable");
             assert_eq!(report.outcome, RecoveryProbeOutcome::SelectedCommittedRoot);
             store

@@ -485,6 +485,132 @@ fn stage_receiptless_raw_object_substitute(fs: &mut LocalFileSystem, key: Object
         .is_none());
 }
 
+fn two_device_block_fixture(label: &str) -> (PathBuf, Vec<PathBuf>) {
+    let root = temp_root(&format!("{label}-metadata"));
+    fs::create_dir_all(&root).expect("create block-device metadata directory");
+    let devices: Vec<_> = (0..2)
+        .map(|index| temp_root(&format!("{label}-device-{index}")))
+        .collect();
+    for device in &devices {
+        let file = fs::File::create(device).expect("create block-device image");
+        file.set_len(8 * 1024 * 1024)
+            .expect("size block-device image");
+    }
+    (root, devices)
+}
+
+fn cleanup_two_device_block_fixture(root: &Path, devices: &[PathBuf]) {
+    cleanup(root);
+    for device in devices {
+        let _ = fs::remove_file(device);
+    }
+}
+
+fn open_two_device_block_filesystem(
+    root: &Path,
+    devices: &[PathBuf],
+    allocator_policy: LocalStorageAllocatorPolicy,
+) -> LocalFileSystem {
+    LocalFileSystem::open_with_allocator_policy_and_root_authentication_key(
+        root,
+        LocalFileSystemOpenConfig {
+            options: options(),
+            allocator_policy,
+            root_authentication_key: RootAuthenticationKey::demo_key(),
+            encryption: None,
+            compression: None,
+            log_device_device_path: None,
+            recovery_policy: RecoveryPolicy::default(),
+            block_devices: Some(devices),
+        },
+    )
+    .expect("open two-device block filesystem")
+}
+
+struct OffPrimaryCommittedContent {
+    path: String,
+    key: ObjectKey,
+    payload: Vec<u8>,
+    root: CommittedRootSummary,
+}
+
+fn commit_off_primary_file_version(
+    fs: &mut LocalFileSystem,
+    label: &str,
+) -> OffPrimaryCommittedContent {
+    let path = format!("/{label}.bin");
+    fs.create_file(&path, DEFAULT_FILE_PERMISSIONS)
+        .expect("create off-primary fixture file");
+
+    for attempt in 0..64_u64 {
+        let payload = format!("{label} off-primary committed payload {attempt}").into_bytes();
+        fs.replace_file(&path, &payload)
+            .expect("replace off-primary fixture content");
+        fs.sync_all().expect("commit off-primary fixture content");
+        let record = fs.stat(&path).expect("stat off-primary fixture file");
+        let manifest_key = content_object_key_for_version(record.inode_id, record.data_version);
+        let manifest_receipt = fs
+            .store
+            .placement_receipt_for_key(DeviceIoClass::Data, manifest_key)
+            .expect("read content-manifest placement receipt")
+            .expect("committed content manifest has a placement receipt");
+        let layout = fs
+            .read_committed_content_layout(record.inode_id, &record)
+            .expect("read committed content layout through Pool authority");
+        let ContentLayout::Chunked(manifest) = layout else {
+            panic!("committed fixture content must use a chunk manifest");
+        };
+        let chunk_ref = manifest
+            .chunks
+            .iter()
+            .find(|chunk_ref| !chunk_ref.is_hole())
+            .expect("committed fixture content has a non-hole chunk");
+        let chunk_key = content_chunk_object_key_for_version(
+            record.inode_id,
+            chunk_ref.data_version,
+            chunk_ref.chunk_index,
+        );
+        let chunk_receipt = fs
+            .store
+            .placement_receipt_for_key(DeviceIoClass::Data, chunk_key)
+            .expect("read content-chunk placement receipt")
+            .expect("committed content chunk has a placement receipt");
+        assert!(!manifest_receipt.targets.is_empty());
+        assert!(!chunk_receipt.targets.is_empty());
+        if manifest_receipt
+            .targets
+            .iter()
+            .all(|target| target.device_index != 0)
+            && chunk_receipt
+                .targets
+                .iter()
+                .all(|target| target.device_index != 0)
+        {
+            for key in [manifest_key, chunk_key] {
+                assert!(
+                    fs.store
+                        .raw_primary_store()
+                        .get(key)
+                        .expect("inspect raw primary content")
+                        .is_none(),
+                    "off-primary receipt must not be backed by raw-primary bytes"
+                );
+            }
+            let root = fs
+                .selected_current_root_summary()
+                .expect("select committed off-primary root");
+            return OffPrimaryCommittedContent {
+                path,
+                key: chunk_key,
+                payload,
+                root,
+            };
+        }
+    }
+
+    panic!("deterministic placement did not select the secondary device in 64 versions");
+}
+
 fn write_transaction_inodes(
     store: &mut LocalObjectStore,
     staged: &FileSystemState,
@@ -7860,7 +7986,7 @@ fn mounted_committed_root_repair_authority_routes_probe_audit_verifier_and_reten
         let mut repair_authority = open_authority.committed_root_repair_authority();
         assert_eq!(
             repair_authority.transform_mode(),
-            MountedCommittedRootRepairTransformMode::MetadataRawOnlyNoDeviceTransforms
+            MountedCommittedRootRepairTransformMode::MetadataRawOnlyPoolContentNoDeviceTransforms
         );
         assert_eq!(
             repair_authority.transform_ordering_boundary(),
@@ -10200,6 +10326,255 @@ fn block_device_reopen_after_sync_persists_file_data() {
     cleanup(&root);
     let _ = std::fs::remove_file(dev0);
     let _ = std::fs::remove_file(dev1);
+}
+
+#[test]
+fn block_device_mounted_diagnostics_accept_off_primary_committed_content() {
+    let (root, devices) = two_device_block_fixture("pool-diagnostics-off-primary");
+    let mut fs =
+        open_two_device_block_filesystem(&root, &devices, LocalStorageAllocatorPolicy::default());
+    let committed = commit_off_primary_file_version(&mut fs, "diagnostic");
+
+    let probe = fs
+        .recovery_probe_report()
+        .expect("probe off-primary committed root");
+    assert_eq!(probe.outcome, RecoveryProbeOutcome::SelectedCommittedRoot);
+    assert_eq!(
+        probe.selected_transaction_id,
+        Some(committed.root.transaction_id)
+    );
+
+    let audit = fs
+        .recovery_audit()
+        .expect("audit off-primary committed root");
+    assert_eq!(audit.outcome, RecoveryAuditOutcome::SelectedCommittedRoot);
+    assert_eq!(audit.selected_root.as_ref(), Some(&committed.root));
+
+    let verifier = fs
+        .online_verifier_report()
+        .expect("verify off-primary committed root");
+    assert_eq!(verifier.outcome, OnlineVerifierOutcome::Clean);
+    assert_eq!(verifier.selected_root.as_ref(), Some(&committed.root));
+    assert!(verifier.checked_content_objects > 0);
+    assert!(verifier.issues.is_empty());
+    assert_eq!(
+        fs.read_file(&committed.path)
+            .expect("read off-primary committed content"),
+        committed.payload
+    );
+
+    drop(fs);
+    cleanup_two_device_block_fixture(&root, &devices);
+}
+
+#[test]
+fn block_device_startup_accounting_accepts_off_primary_committed_content() {
+    let (root, devices) = two_device_block_fixture("pool-startup-accounting-off-primary");
+    let policy = LocalStorageAllocatorPolicy::default();
+    let committed = {
+        let mut fs = open_two_device_block_filesystem(&root, &devices, policy);
+        commit_off_primary_file_version(&mut fs, "startup-accounting")
+    };
+
+    let mut reopened = open_two_device_block_filesystem(&root, &devices, policy);
+    assert_eq!(
+        reopened.capacity_authority().used_bytes(),
+        u64::from(content_chunk_size()),
+        "startup accounting must count the committed content grain, not raw pool bytes"
+    );
+    let report = reopened
+        .allocator_report()
+        .expect("report Pool-authorized startup allocation");
+    assert_eq!(
+        report.current_namespace_allocated_bytes,
+        u64::from(content_chunk_size())
+    );
+    assert_eq!(
+        reopened
+            .read_file(&committed.path)
+            .expect("read content after Pool-authorized startup accounting"),
+        committed.payload
+    );
+
+    drop(reopened);
+    cleanup_two_device_block_fixture(&root, &devices);
+}
+
+#[test]
+fn block_device_capacity_growth_accepts_off_primary_retained_root() {
+    let (root, devices) = two_device_block_fixture("pool-capacity-retained-off-primary");
+    let grain = u64::from(content_chunk_size());
+    let policy =
+        LocalStorageAllocatorPolicy::new(grain * 3, DEFAULT_LOCAL_FILESYSTEM_INODE_CAPACITY);
+    let mut fs = open_two_device_block_filesystem(&root, &devices, policy);
+    let retained = commit_off_primary_file_version(&mut fs, "retained-capacity");
+    let snapshot = fs
+        .create_snapshot("keep-off-primary")
+        .expect("snapshot off-primary committed content");
+    assert_eq!(snapshot.source_root, retained.root);
+
+    fs.update_allocator_policy(LocalStorageAllocatorPolicy::new(
+        grain,
+        DEFAULT_LOCAL_FILESYSTEM_INODE_CAPACITY,
+    ))
+    .expect("tighten capacity to the retained root");
+    let same_size_replacement = vec![0x4d; retained.payload.len()];
+    let same_size_error = fs
+        .replace_file(&retained.path, &same_size_replacement)
+        .expect_err("retained root plus same-size replacement must exceed one grain");
+    assert!(matches!(
+        same_size_error,
+        FileSystemError::NoSpace {
+            resource: LocalStorageResource::ContentBytes,
+            ..
+        }
+    ));
+    assert_eq!(
+        fs.read_file(&retained.path)
+            .expect("read original content after refused same-size rewrite"),
+        retained.payload
+    );
+
+    fs.update_allocator_policy(policy)
+        .expect("restore capacity for retained-root growth");
+    fs.replace_file(&retained.path, b"current one-grain content")
+        .expect("replace current content while retaining snapshot root");
+    let current = fs
+        .stat(&retained.path)
+        .expect("stat current content before patch and truncate");
+    fs.write_file(&retained.path, 0, b"patched")
+        .expect("buffer patch with off-primary retained root");
+    fs.flush_write_buffer(current.inode_id)
+        .expect("flush patch with off-primary retained root");
+    fs.truncate_file(&retained.path, current.size - 1)
+        .expect("truncate through overlay planner with off-primary retained root");
+    let grown = vec![0x5a; content_chunk_size() as usize + 1];
+    fs.replace_file(&retained.path, &grown)
+        .expect("grow content with off-primary snapshot reserve");
+
+    let report = fs
+        .allocator_report()
+        .expect("report Pool-authorized retained-root capacity");
+    assert_eq!(report.protected_committed_roots, 1);
+    assert_eq!(report.protected_committed_root_allocated_bytes, grain);
+    assert_eq!(report.current_namespace_allocated_bytes, grain * 2);
+    assert_eq!(report.allocator_reserved_bytes, grain * 3);
+    assert_eq!(report.reusable_free_bytes, 0);
+    assert_eq!(
+        fs.read_file(&retained.path)
+            .expect("read capacity-grown content"),
+        grown
+    );
+
+    drop(fs);
+    cleanup_two_device_block_fixture(&root, &devices);
+}
+
+#[test]
+fn block_device_mounted_diagnostics_reject_receiptless_raw_substitute() {
+    let (root, devices) = two_device_block_fixture("pool-diagnostics-receiptless");
+    let mut fs =
+        open_two_device_block_filesystem(&root, &devices, LocalStorageAllocatorPolicy::default());
+    let committed = commit_off_primary_file_version(&mut fs, "receiptless-diagnostic");
+    stage_receiptless_raw_object_substitute(&mut fs, committed.key);
+
+    let generation_before = fs.state.generation;
+    let inodes_before = Arc::clone(&fs.state.inodes);
+    let directories_before = Arc::clone(&fs.state.directories);
+    let snapshots_before = fs.state.snapshots.clone();
+    let receipts_before = fs
+        .store
+        .placement_receipts(DeviceIoClass::Data)
+        .expect("capture receipts after staging substitute");
+    let root_locations_before: Vec<_> = (0..FILESYSTEM_ROOT_SLOT_COUNT)
+        .map(|slot| {
+            fs.store
+                .raw_primary_store()
+                .version_locations_of(root_slot_object_key(slot))
+        })
+        .collect();
+    let raw_substitute_before = fs
+        .store
+        .raw_primary_store()
+        .get(committed.key)
+        .expect("read staged raw substitute");
+
+    let probe = fs
+        .recovery_probe_report()
+        .expect("probe must report an older valid root or explicit failure");
+    assert_ne!(
+        probe.selected_transaction_id,
+        Some(committed.root.transaction_id),
+        "receiptless current root must not be selected"
+    );
+
+    let audit = fs
+        .recovery_audit()
+        .expect("audit must classify the receiptless candidate");
+    assert!(
+        !audit.valid_committed_roots.contains(&committed.root),
+        "receiptless current root must not be audited as valid"
+    );
+
+    let verifier = fs
+        .online_verifier_report()
+        .expect("verifier must report the receiptless candidate");
+    assert!(
+        verifier
+            .verified_committed_roots
+            .iter()
+            .all(|report| report.root != committed.root),
+        "receiptless current root must not be verified"
+    );
+    assert!(
+        verifier.issues.iter().any(|issue| {
+            issue.transaction_id == Some(committed.root.transaction_id)
+                && issue.reason.contains("receipt")
+        }),
+        "receiptless current root must produce an explicit verifier issue: {:?}",
+        verifier.issues
+    );
+
+    let allocation_error = fs
+        .allocator_report()
+        .expect_err("receiptless content must not authorize capacity accounting");
+    assert!(allocation_error.to_string().contains("receipt"));
+    let growth_error = fs
+        .replace_file(&committed.path, &[0x77; 256])
+        .expect_err("receiptless content must not authorize capacity growth");
+    assert!(growth_error.to_string().contains("receipt"));
+
+    assert_eq!(fs.state.generation, generation_before);
+    assert_eq!(fs.state.inodes.as_ref(), inodes_before.as_ref());
+    assert_eq!(fs.state.directories.as_ref(), directories_before.as_ref());
+    assert_eq!(fs.state.snapshots, snapshots_before);
+    assert_eq!(
+        fs.store
+            .placement_receipts(DeviceIoClass::Data)
+            .expect("inspect receipts after refused diagnostics and growth"),
+        receipts_before
+    );
+    assert_eq!(
+        (0..FILESYSTEM_ROOT_SLOT_COUNT)
+            .map(|slot| {
+                fs.store
+                    .raw_primary_store()
+                    .version_locations_of(root_slot_object_key(slot))
+            })
+            .collect::<Vec<_>>(),
+        root_locations_before
+    );
+    assert_eq!(
+        fs.store
+            .raw_primary_store()
+            .get(committed.key)
+            .expect("read raw substitute after refused operations"),
+        raw_substitute_before
+    );
+
+    fs.recovery_policy = RecoveryPolicy::ReadOnly;
+    drop(fs);
+    cleanup_two_device_block_fixture(&root, &devices);
 }
 
 #[test]
