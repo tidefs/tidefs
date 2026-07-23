@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 use std::collections::BTreeMap;
 
-use tidefs_local_object_store::{LocalObjectStore, ObjectKey};
+#[cfg(test)]
+use tidefs_local_object_store::LocalObjectStore;
+use tidefs_local_object_store::{pool::Pool, ObjectKey};
 use tidefs_types_vfs_core::{InodeId, ROOT_INODE_ID};
 
 use crate::constants::*;
+#[cfg(test)]
+use crate::content::read_content_layout_from_store;
 use crate::content::{
-    content_chunk_count, content_chunk_len, content_chunk_start, decode_content_layout,
-    find_chunk_in_manifest, is_valid_content_chunk_size, overlay_chunk_index_bounds,
-    overlay_chunk_writes_only_zeros, range_intersects_overlay, read_content_layout_from_store,
-    retained_content_chunk_ref, validate_content_layout, ContentOverlayPatch,
+    content_chunk_count, content_chunk_len, content_chunk_start, find_chunk_in_manifest,
+    is_valid_content_chunk_size, overlay_chunk_index_bounds, overlay_chunk_writes_only_zeros,
+    range_intersects_overlay, retained_content_chunk_ref, ContentOverlayPatch,
+    MountedContentReadAuthority,
 };
 use crate::encoding::{
     compute_content_fingerprint, decode_content, decode_content_chunk, decode_content_manifest,
@@ -22,8 +26,8 @@ use crate::object_keys::{
 use crate::records::ContentLayout;
 use crate::types::*;
 use crate::{FileSystemState, Result};
-pub(crate) fn content_allocation_entries_for_state(
-    store: &LocalObjectStore,
+pub(crate) fn content_allocation_entries_for_state_pool(
+    pool: &Pool,
     state: &FileSystemState,
 ) -> Result<BTreeMap<ObjectKey, u64>> {
     let mut entries = BTreeMap::new();
@@ -31,28 +35,26 @@ pub(crate) fn content_allocation_entries_for_state(
         if inode.is_file_like() {
             merge_allocation_entries(
                 &mut entries,
-                content_allocation_entries_for_inode(store, inode)?,
+                content_allocation_entries_for_inode_pool(pool, inode)?,
             );
         }
     }
     Ok(entries)
 }
 
-pub(crate) fn content_allocation_entries_for_inode(
-    store: &LocalObjectStore,
+pub(crate) fn content_allocation_entries_for_inode_pool(
+    pool: &Pool,
     inode: &InodeRecord,
 ) -> Result<BTreeMap<ObjectKey, u64>> {
-    let content_key = content_object_key_for_version(inode.inode_id, inode.data_version);
-    let Some(bytes) = store.get(content_key)? else {
-        if inode.size == 0 {
-            return Ok(BTreeMap::new());
+    let reader = MountedContentReadAuthority::new(pool);
+    let layout = reader.read_layout(inode.inode_id, inode)?;
+    if let ContentLayout::Chunked(manifest) = &layout {
+        for chunk_ref in &manifest.chunks {
+            if !chunk_ref.is_hole() {
+                let _ = reader.read_chunk(inode.inode_id, chunk_ref)?;
+            }
         }
-        return Err(FileSystemError::CorruptState {
-            reason: "allocator expected a missing content object",
-        });
-    };
-    let layout = decode_content_layout(&bytes)?;
-    validate_content_layout(inode.inode_id, inode, &layout)?;
+    }
     content_allocation_entries_for_layout(inode.inode_id, &layout)
 }
 
@@ -178,6 +180,7 @@ pub(crate) fn materialized_content_bytes_for_layout(layout: &ContentLayout) -> R
     }
 }
 
+#[cfg(test)]
 pub(crate) fn planned_chunk_allocation_entries_for_overlay(
     store: &LocalObjectStore,
     old_record: &InodeRecord,
@@ -187,9 +190,27 @@ pub(crate) fn planned_chunk_allocation_entries_for_overlay(
     allow_holes: bool,
 ) -> Result<BTreeMap<ObjectKey, u64>> {
     let old_layout = read_content_layout_from_store(store, old_record.inode_id, old_record)?;
+    planned_chunk_allocation_entries_for_overlay_layout(
+        &old_layout,
+        old_record,
+        new_record,
+        overlay_offset,
+        overlay_bytes,
+        allow_holes,
+    )
+}
+
+pub(crate) fn planned_chunk_allocation_entries_for_overlay_layout(
+    old_layout: &ContentLayout,
+    old_record: &InodeRecord,
+    new_record: &InodeRecord,
+    overlay_offset: u64,
+    overlay_bytes: &[u8],
+    allow_holes: bool,
+) -> Result<BTreeMap<ObjectKey, u64>> {
     let mut entries = BTreeMap::new();
     if allow_holes && overlay_bytes.is_empty() {
-        if let crate::records::ContentLayout::Chunked(ref manifest) = old_layout {
+        if let crate::records::ContentLayout::Chunked(manifest) = old_layout {
             let new_chunk_count = content_chunk_count(new_record.size)?;
             for old_ref in &manifest.chunks {
                 if old_ref.is_hole() || old_ref.chunk_index >= new_chunk_count {
@@ -219,7 +240,7 @@ pub(crate) fn planned_chunk_allocation_entries_for_overlay(
         }
     }
     if allow_holes && old_record.size == new_record.size && !overlay_bytes.is_empty() {
-        if let crate::records::ContentLayout::Chunked(ref manifest) = old_layout {
+        if let crate::records::ContentLayout::Chunked(manifest) = old_layout {
             for old_ref in &manifest.chunks {
                 if old_ref.is_hole() {
                     continue;
@@ -289,7 +310,7 @@ pub(crate) fn planned_chunk_allocation_entries_for_overlay(
         }
     }
     if allow_holes && old_record.size != new_record.size && !overlay_bytes.is_empty() {
-        if let crate::records::ContentLayout::Chunked(ref manifest) = old_layout {
+        if let crate::records::ContentLayout::Chunked(manifest) = old_layout {
             let new_chunk_count = content_chunk_count(new_record.size)?;
             for old_ref in &manifest.chunks {
                 if old_ref.is_hole() || old_ref.chunk_index >= new_chunk_count {
@@ -367,7 +388,7 @@ pub(crate) fn planned_chunk_allocation_entries_for_overlay(
     }
     for chunk_index in 0..content_chunk_count(new_record.size)? {
         if let Some(retained) = retained_content_chunk_ref(
-            &old_layout,
+            old_layout,
             old_record.size,
             new_record.size,
             overlay_offset,
@@ -404,7 +425,7 @@ pub(crate) fn planned_chunk_allocation_entries_for_overlay(
                 })?;
             if !range_intersects_overlay(cstart, cend, overlay_offset, overlay_bytes)? {
                 let can_skip_hole = match old_layout {
-                    crate::records::ContentLayout::Chunked(ref manifest) => {
+                    crate::records::ContentLayout::Chunked(manifest) => {
                         find_chunk_in_manifest(manifest, chunk_index).is_none()
                             || cstart >= old_record.size
                     }
@@ -433,14 +454,13 @@ pub(crate) fn planned_chunk_allocation_entries_for_overlay(
     Ok(entries)
 }
 
-pub(crate) fn planned_chunk_allocation_entries_for_patch_batch(
-    store: &LocalObjectStore,
+pub(crate) fn planned_chunk_allocation_entries_for_patch_batch_layout(
+    old_layout: &ContentLayout,
     old_record: &InodeRecord,
     new_record: &InodeRecord,
     patches: &[ContentOverlayPatch<'_>],
     allow_holes: bool,
 ) -> Result<BTreeMap<ObjectKey, u64>> {
-    let old_layout = read_content_layout_from_store(store, old_record.inode_id, old_record)?;
     let mut entries = BTreeMap::new();
     if !allow_holes || old_record.size > new_record.size {
         return Err(FileSystemError::Unsupported {
@@ -448,7 +468,7 @@ pub(crate) fn planned_chunk_allocation_entries_for_patch_batch(
             reason: "batch writeback optimization requires non-shrinking sparse content",
         });
     }
-    let crate::records::ContentLayout::Chunked(ref manifest) = old_layout else {
+    let crate::records::ContentLayout::Chunked(manifest) = old_layout else {
         return Err(FileSystemError::Unsupported {
             operation: "patch batch allocation planning",
             reason: "batch writeback optimization requires chunked content",
