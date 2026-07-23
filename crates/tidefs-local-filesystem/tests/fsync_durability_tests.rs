@@ -85,7 +85,8 @@ fn fsync_flush_writes_to_object_store() {
 
     {
         let mut fs = LocalFileSystem::open_with_options(&root, opts()).expect("open fs");
-        fs.set_auto_commit(false);
+        fs.set_auto_commit(false)
+            .expect("test setup mutation must be admitted");
         fs.create_file("/f", DEFAULT_FILE_PERMISSIONS)
             .expect("create /f");
         fs.write_file("/f", 0, &data).expect("write 4 KiB");
@@ -123,7 +124,8 @@ fn fdatasync_persists_data_object_skips_metadata_commit() {
 
     {
         let mut fs = LocalFileSystem::open_with_options(&root, opts()).expect("open fs");
-        fs.set_auto_commit(false);
+        fs.set_auto_commit(false)
+            .expect("test setup mutation must be admitted");
         fs.create_file("/fdat.txt", DEFAULT_FILE_PERMISSIONS)
             .expect("create /fdat.txt");
         fs.write_file("/fdat.txt", 0, &data).expect("write");
@@ -161,7 +163,8 @@ fn fsync_vs_fdatasync_reachability_after_reopen() {
     // File A: full fsync (metadata + data committed).
     {
         let mut fs = LocalFileSystem::open_with_options(&root, opts()).expect("open fs");
-        fs.set_auto_commit(false);
+        fs.set_auto_commit(false)
+            .expect("test setup mutation must be admitted");
         fs.create_file("/a.txt", DEFAULT_FILE_PERMISSIONS)
             .expect("create a.txt");
         fs.write_file("/a.txt", 0, b"AAAA").expect("write a.txt");
@@ -171,7 +174,8 @@ fn fsync_vs_fdatasync_reachability_after_reopen() {
     // File B: fdatasync only (data committed, metadata may not be).
     {
         let mut fs = LocalFileSystem::open_with_options(&root, opts()).expect("open fs");
-        fs.set_auto_commit(false);
+        fs.set_auto_commit(false)
+            .expect("test setup mutation must be admitted");
         fs.create_file("/b.txt", DEFAULT_FILE_PERMISSIONS)
             .expect("create b.txt");
         fs.write_file("/b.txt", 0, b"BBBB").expect("write b.txt");
@@ -203,7 +207,8 @@ fn fsync_empty_file_preserves_empty_file_without_content_object() {
 
     {
         let mut fs = LocalFileSystem::open_with_options(&root, opts()).expect("open fs");
-        fs.set_auto_commit(false);
+        fs.set_auto_commit(false)
+            .expect("test setup mutation must be admitted");
         fs.create_file("/empty.bin", DEFAULT_FILE_PERMISSIONS)
             .expect("create empty.bin");
         let inode = fs.stat("/empty.bin").expect("stat empty.bin");
@@ -242,7 +247,8 @@ fn fsync_partial_page_write_persists_exact_byte_range() {
 
     {
         let mut fs = LocalFileSystem::open_with_options(&root, opts()).expect("open fs");
-        fs.set_auto_commit(false);
+        fs.set_auto_commit(false)
+            .expect("test setup mutation must be admitted");
         fs.create_file("/sparse.bin", DEFAULT_FILE_PERMISSIONS)
             .expect("create sparse.bin");
         fs.write_file("/sparse.bin", offset, &data)
@@ -292,7 +298,8 @@ fn fsync_multiple_calls_capture_incremental_deltas() {
 
     {
         let mut fs = LocalFileSystem::open_with_options(&root, opts()).expect("open fs");
-        fs.set_auto_commit(false);
+        fs.set_auto_commit(false)
+            .expect("test setup mutation must be admitted");
         fs.create_file("/inc.bin", DEFAULT_FILE_PERMISSIONS)
             .expect("create inc.bin");
 
@@ -341,7 +348,8 @@ fn fsync_overwrite_replaces_previous_durable_state() {
 
     {
         let mut fs = LocalFileSystem::open_with_options(&root, opts()).expect("open fs");
-        fs.set_auto_commit(false);
+        fs.set_auto_commit(false)
+            .expect("test setup mutation must be admitted");
         fs.create_file("/over.bin", DEFAULT_FILE_PERMISSIONS)
             .expect("create over.bin");
 
@@ -387,7 +395,8 @@ fn concurrent_write_and_fsync_sees_consistent_snapshot() {
         std::sync::Mutex::new(LocalFileSystem::open_with_options(&root, opts()).expect("open fs"));
     {
         let mut fs = fs.lock().unwrap();
-        fs.set_auto_commit(false);
+        fs.set_auto_commit(false)
+            .expect("test setup mutation must be admitted");
         fs.create_file("/concurrent.bin", DEFAULT_FILE_PERMISSIONS)
             .expect("create concurrent.bin");
     }
@@ -482,7 +491,8 @@ fn fsync_file_no_prior_write_is_noop() {
 
     let inode = {
         let mut fs = LocalFileSystem::open_with_options(&root, opts()).expect("open fs");
-        fs.set_auto_commit(false);
+        fs.set_auto_commit(false)
+            .expect("test setup mutation must be admitted");
         let rec = fs
             .create_file("/noop.bin", DEFAULT_FILE_PERMISSIONS)
             .expect("create noop.bin");

@@ -52,7 +52,8 @@ fn dedup_redirects_survive_crash_reopen() {
     // a dedup redirect.
     {
         let mut fs = LocalFileSystem::open(&dir).expect("open");
-        fs.set_dedup_enabled(true);
+        fs.set_dedup_enabled(true)
+            .expect("test setup mutation must be admitted");
 
         fs.create_file("/first.bin", DEFAULT_FILE_PERMISSIONS)
             .expect("create first");
@@ -128,7 +129,8 @@ fn synced_dedup_data_survives_crash_with_unsynced_loss() {
     // only the first txg committed.
     {
         let mut fs = LocalFileSystem::open(&dir).expect("open");
-        fs.set_dedup_enabled(true);
+        fs.set_dedup_enabled(true)
+            .expect("test setup mutation must be admitted");
 
         // Synced: two identical files created and committed
         fs.create_file("/safe_a.bin", DEFAULT_FILE_PERMISSIONS)
@@ -195,7 +197,8 @@ fn crash_reopen_dedup_hit_on_identical_rewrite() {
     // Session 1: write two identical files, creating canonical + redirect.
     {
         let mut fs = LocalFileSystem::open(&dir).expect("open");
-        fs.set_dedup_enabled(true);
+        fs.set_dedup_enabled(true)
+            .expect("test setup mutation must be admitted");
 
         fs.create_file("/orig_a.bin", DEFAULT_FILE_PERMISSIONS)
             .expect("create orig_a");
@@ -215,7 +218,8 @@ fn crash_reopen_dedup_hit_on_identical_rewrite() {
     // canonical object and produce a dedup hit.
     {
         let mut fs = LocalFileSystem::open(&dir).expect("reopen");
-        fs.set_dedup_enabled(true);
+        fs.set_dedup_enabled(true)
+            .expect("test setup mutation must be admitted");
 
         // Delete original files (canonical object may still survive)
         fs.unlink("/orig_a.bin").expect("unlink orig_a");
@@ -225,7 +229,8 @@ fn crash_reopen_dedup_hit_on_identical_rewrite() {
 
     {
         let mut fs = LocalFileSystem::open(&dir).expect("reopen 2");
-        fs.set_dedup_enabled(true);
+        fs.set_dedup_enabled(true)
+            .expect("test setup mutation must be admitted");
 
         fs.create_file("/new.bin", DEFAULT_FILE_PERMISSIONS)
             .expect("create new");
@@ -277,7 +282,8 @@ fn canonical_target_survives_crash_with_live_references() {
     // canonical chunk object; the second stores a dedup redirect.
     {
         let mut fs = LocalFileSystem::open(&dir).expect("open");
-        fs.set_dedup_enabled(true);
+        fs.set_dedup_enabled(true)
+            .expect("test setup mutation must be admitted");
 
         fs.create_file("/file_a.bin", DEFAULT_FILE_PERMISSIONS)
             .expect("create file_a");
@@ -303,7 +309,8 @@ fn canonical_target_survives_crash_with_live_references() {
     // from session 1 must survive the crash and produce a dedup hit.
     {
         let mut fs = LocalFileSystem::open(&dir).expect("reopen");
-        fs.set_dedup_enabled(true);
+        fs.set_dedup_enabled(true)
+            .expect("test setup mutation must be admitted");
 
         // Files from session 1 survive the crash
         assert_eq!(
@@ -359,7 +366,8 @@ fn canonical_target_survives_crash_with_dedup_toggled() {
     // Session 1: write canonical object with dedup enabled
     {
         let mut fs = LocalFileSystem::open(&dir).expect("open");
-        fs.set_dedup_enabled(true);
+        fs.set_dedup_enabled(true)
+            .expect("test setup mutation must be admitted");
         fs.create_file("/canon.bin", DEFAULT_FILE_PERMISSIONS)
             .expect("create canon");
         fs.write_file("/canon.bin", 0, &payload)
@@ -372,7 +380,8 @@ fn canonical_target_survives_crash_with_dedup_toggled() {
     {
         let mut fs = LocalFileSystem::open(&dir).expect("reopen");
         assert!(!fs.is_dedup_enabled());
-        fs.set_dedup_enabled(true);
+        fs.set_dedup_enabled(true)
+            .expect("test setup mutation must be admitted");
 
         fs.create_file("/copy.bin", DEFAULT_FILE_PERMISSIONS)
             .expect("create copy");

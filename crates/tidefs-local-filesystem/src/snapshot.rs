@@ -504,6 +504,7 @@ impl LocalFileSystem {
         &mut self,
         record: &SnapshotRecord,
     ) -> Result<()> {
+        self.ensure_mutation_allowed("enqueue released snapshot deadlist")?;
         if !snapshot_record_retains_data(record) {
             return Ok(());
         }
@@ -564,6 +565,7 @@ impl LocalFileSystem {
         clone_name: impl AsRef<str>,
         source_snapshot: impl AsRef<str>,
     ) -> Result<CloneSummary> {
+        self.ensure_mutation_allowed("create mounted filesystem clone")?;
         let clone_name = clone_name.as_ref();
         let source_snapshot = source_snapshot.as_ref();
 
@@ -605,7 +607,7 @@ impl LocalFileSystem {
             });
         }
 
-        self.begin_mutation();
+        self.begin_mutation("create clone")?;
         let created_at_generation = self.bump_generation();
 
         let record = SnapshotRecord {
@@ -648,6 +650,7 @@ impl LocalFileSystem {
         &mut self,
         name: impl AsRef<str>,
     ) -> Result<(SnapshotSummary, SnapshotRecord)> {
+        self.ensure_mutation_allowed("delete mounted filesystem clone")?;
         let name = name.as_ref();
         let name_bytes = snapshot_name_bytes(name)?;
         let record = self
@@ -675,7 +678,7 @@ impl LocalFileSystem {
 
         self.ensure_snapshot_authority_consistent()?;
 
-        self.begin_mutation();
+        self.begin_mutation("delete clone")?;
         self.bump_generation();
         self.state.snapshots.remove(&name_bytes);
         self.mark_inode_metadata_dirty(ROOT_INODE_ID);
@@ -687,6 +690,7 @@ impl LocalFileSystem {
     }
 
     pub fn delete_clone(&mut self, name: impl AsRef<str>) -> Result<SnapshotSummary> {
+        self.ensure_mutation_allowed("delete mounted filesystem clone")?;
         let (summary, record) = self.delete_clone_without_deadlist(name)?;
         self.enqueue_released_snapshot_deadlist(&record)?;
         Ok(summary)
@@ -698,6 +702,7 @@ impl LocalFileSystem {
     /// on disk (or in the object store) independent of the origin.
     /// The origin snapshot can be deleted safely after promotion.
     pub fn promote_clone(&mut self, name: impl AsRef<str>) -> Result<PromoteReport> {
+        self.ensure_mutation_allowed("promote mounted filesystem clone")?;
         let name = name.as_ref();
         let name_bytes = snapshot_name_bytes(name)?;
         let record = self
@@ -737,7 +742,7 @@ impl LocalFileSystem {
         self.ensure_snapshot_record_authority(&record)?;
         self.ensure_snapshot_record_authority(&origin_record)?;
 
-        self.begin_mutation();
+        self.begin_mutation("promote clone")?;
         let generation = self.bump_generation();
 
         let promoted = SnapshotRecord {
@@ -795,6 +800,7 @@ impl LocalFileSystem {
         &mut self,
         mutation: &SnapshotMutation,
     ) -> Result<SnapshotMutationApplyReport> {
+        self.ensure_mutation_allowed("apply VFSSEND2 snapshot mutation")?;
         match mutation.kind {
             SnapshotMutationKind::Promote => {
                 let (name, record) =
@@ -941,6 +947,7 @@ impl LocalFileSystem {
         bookmark_name: impl AsRef<str>,
         source_snapshot: impl AsRef<str>,
     ) -> Result<BookmarkSummary> {
+        self.ensure_mutation_allowed("create mounted filesystem bookmark")?;
         let bookmark_name = bookmark_name.as_ref();
         let source_snapshot = source_snapshot.as_ref();
 
@@ -957,7 +964,7 @@ impl LocalFileSystem {
             });
         }
 
-        self.begin_mutation();
+        self.begin_mutation("create bookmark")?;
         let created_at_generation = self.bump_generation();
 
         let record = SnapshotRecord {
@@ -989,6 +996,7 @@ impl LocalFileSystem {
 
     /// Delete a bookmark.
     pub fn delete_bookmark(&mut self, name: impl AsRef<str>) -> Result<SnapshotSummary> {
+        self.ensure_mutation_allowed("delete mounted filesystem bookmark")?;
         let name = name.as_ref();
         let name_bytes = snapshot_name_bytes(name)?;
         let record = self
@@ -1006,7 +1014,7 @@ impl LocalFileSystem {
             });
         }
 
-        self.begin_mutation();
+        self.begin_mutation("delete bookmark")?;
         self.bump_generation();
         self.state.snapshots.remove(&name_bytes);
         self.mark_inode_metadata_dirty(ROOT_INODE_ID);
@@ -1060,6 +1068,7 @@ impl LocalFileSystem {
         name: impl AsRef<str>,
         tag: Option<&str>,
     ) -> Result<HoldInfo> {
+        self.ensure_mutation_allowed("hold mounted filesystem snapshot")?;
         let name = name.as_ref();
         let name_bytes = snapshot_name_bytes(name)?;
         let record = self
@@ -1077,7 +1086,7 @@ impl LocalFileSystem {
             });
         }
 
-        self.begin_mutation();
+        self.begin_mutation("hold snapshot")?;
         self.bump_generation();
 
         let mut updated = record;
@@ -1102,6 +1111,7 @@ impl LocalFileSystem {
 
     /// Place a general-purpose hold (no tag).
     pub fn hold_snapshot(&mut self, name: impl AsRef<str>) -> Result<HoldInfo> {
+        self.ensure_mutation_allowed("hold mounted filesystem snapshot")?;
         self.hold_snapshot_tagged(name, None)
     }
 
@@ -1110,6 +1120,7 @@ impl LocalFileSystem {
     /// When hold_count reaches 0 (and no other active holds exist), the
     /// snapshot or clone can be deleted.
     pub fn release_snapshot(&mut self, name: impl AsRef<str>) -> Result<HoldInfo> {
+        self.ensure_mutation_allowed("release mounted filesystem snapshot hold")?;
         let name = name.as_ref();
         let name_bytes = snapshot_name_bytes(name)?;
         let record = self
@@ -1134,7 +1145,7 @@ impl LocalFileSystem {
             });
         }
 
-        self.begin_mutation();
+        self.begin_mutation("release snapshot hold")?;
         self.bump_generation();
 
         let mut updated = record;
@@ -1257,6 +1268,7 @@ impl LocalFileSystem {
         &mut self,
         policy: SnapshotRetentionPolicy,
     ) -> Result<SnapshotRetentionReport> {
+        self.ensure_mutation_allowed("prune mounted filesystem snapshots")?;
         let evaluated_at_generation = self.state.generation;
         let regular_snapshots = self.regular_snapshots_by_age();
         let excluded_catalog_entries = self
@@ -2031,6 +2043,7 @@ mod tests {
             fs.create_snapshot("snap1").expect("snapshot");
             fs.create_clone("clone1", "snap1").expect("clone");
             fs.dataset_catalog_mut()
+                .expect("access dataset catalog")
                 .destroy("root@clone1")
                 .expect("remove clone catalog entry");
             fs.persist_dataset_catalog()
@@ -2055,6 +2068,7 @@ mod tests {
         seed_file(&mut fs, "/data.bin", b"catalog-mismatch");
         fs.create_snapshot("snap1").expect("snapshot");
         fs.dataset_catalog_mut()
+            .expect("access dataset catalog")
             .destroy("root@snap1")
             .expect("remove snapshot catalog entry");
 
@@ -2071,7 +2085,9 @@ mod tests {
 
         seed_file(&mut fs, "/data.bin", b"pin-mismatch");
         let snap = fs.create_snapshot("snap1").expect("snapshot");
-        fs.lifecycle_mut().unpin_root(snapshot_root(&snap));
+        fs.lifecycle_mut()
+            .expect("access dataset lifecycle")
+            .unpin_root(snapshot_root(&snap));
 
         let err = fs.export_changed_records().unwrap_err();
         assert_snapshot_authority_error(err);

@@ -134,6 +134,16 @@ Current guard evidence:
   `dequeue_receipt_bound_batch_with_stable_generation(...)` for the
   release-facing dead-object physical reclaim path.
 
+The mounted `LocalFileSystem` cannot currently supply that physical drain with
+an exact root-bound stability token. A filesystem root generation and a Pool
+receipt generation are different ordering domains, and a global maximum
+receipt generation does not prove that an obsolete placement is unreachable
+from every authenticated fallback or snapshot root. Mounted background work
+therefore performs only the logical `Pool::delete()` handoff and leaves the
+lower receipt-bound physical queue durably pending. Physical reuse remains
+disabled until obsolete-placement tokens are durably bound to an authenticated
+filesystem root and checked against every retained mountable root.
+
 ## Current Coupling Sites To Preserve Until Follow-Up Work
 
 The current implementation still discovers or orders some reclaim work through
@@ -143,16 +153,15 @@ change those paths.
 - `crates/tidefs-local-filesystem/src/lib.rs:70`-`:85` documents the current
   production reclaim chain: local B+tree queue, `tick_background_services`,
   `LocalObjectStore::delete()`, and receipt-bound dead-object drain.
-- `crates/tidefs-local-filesystem/src/lib.rs:3760`-`:3767` exposes the local
-  B+tree reclaim queue depth; that queue is the frontend fed by file
-  mutations.
-- `crates/tidefs-local-filesystem/src/lib.rs:3819`-`:3838` drains local queue
-  entries by `ObjectKey` and pre-computes receipt durability for those keys.
-  If the key is a content key, its name includes `data_version`, but the
-  liveness decision is the receipt durability gate, not the key's version
-  number.
-- `crates/tidefs-local-filesystem/src/lib.rs:3885`-`:3893` deletes only keys
-  whose placement receipt is durable.
+- `crates/tidefs-local-filesystem/src/lib.rs` exposes the local B+tree reclaim
+  queue depth; that queue is the frontend fed by file mutations.
+- `drain_local_reclaim_queue_into_store(...)` protects content reachable from
+  every currently mountable root-ring fallback and recursively retained
+  snapshot or clone, then uses strict current Pool receipts for the logical
+  handoff. Receipt uncertainty keeps the exact local entry pending.
+- `tick_background_services(...)` deliberately does not call the Pool's
+  receipt-bound physical drain. The lower queue survives background ticks and
+  reopen until the missing root-bound placement token exists.
 - `crates/tidefs-local-filesystem/src/lib.rs:3916`-`:3971` builds rewrite
   trim plans from old/new content keys and either queues trimmable keys or
   defers `(old_key, new_key)` pairs.
@@ -160,9 +169,9 @@ change those paths.
   rewrite trims only after `replacement_key_receipt_is_durable(...)` reports
   the replacement key stable.
 - `crates/tidefs-local-filesystem/src/orphan_cleanup.rs:183`-`:194` deletes
-  legacy and versioned orphan content object keys by scanning `data_version`
-  values. This is key discovery for today's format, not an authority that
-  lower versions are always reclaimable.
+  versioned orphan content object keys by scanning `data_version` values. This
+  is key discovery for today's format, not an authority that lower versions
+  are always reclaimable.
 - `crates/tidefs-local-filesystem/src/orphan_cleanup.rs:220`-`:228` scans
   orphan chunk keys by `(data_version, chunk_index)` when cleaning dedup
   redirects, again as key discovery rather than a liveness proof.

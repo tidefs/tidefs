@@ -32,6 +32,9 @@ const EINVAL: i32 = 22;
 /// Errors that can occur during setattr dispatch.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SetattrDispatchError {
+    /// The mounted instance observed an uncertain root publication and must
+    /// be reopened before metadata mutation.
+    MutationRequiresReopen,
     /// The inode does not exist or is stale.
     NoEntry,
     /// Generic I/O error (corrupt state, object-store write failure).
@@ -48,6 +51,7 @@ impl SetattrDispatchError {
     #[must_use]
     pub fn to_errno(self) -> Errno {
         match self {
+            Self::MutationRequiresReopen => Errno(EIO as u16),
             Self::NoEntry => Errno(ENOENT as u16),
             Self::Io => Errno(EIO as u16),
             Self::PermissionDenied => Errno(EPERM as u16),
@@ -59,6 +63,7 @@ impl SetattrDispatchError {
 impl From<&FileSystemError> for SetattrDispatchError {
     fn from(err: &FileSystemError) -> Self {
         match err {
+            FileSystemError::MutationRequiresReopen { .. } => Self::MutationRequiresReopen,
             FileSystemError::NotFound { .. } => Self::NoEntry,
             FileSystemError::CorruptState { .. } => Self::Io,
             _ => Self::Io,
@@ -112,6 +117,8 @@ pub fn engine_setattr(
     ino: u64,
     set: &SetAttr,
 ) -> Result<InodeAttr, SetattrDispatchError> {
+    fs.ensure_mutation_allowed("set inode attributes")
+        .map_err(|error| SetattrDispatchError::from(&error))?;
     // Inode 0 is invalid (FUSE root is ROOT_INODE_ID=1).
     if ino == 0 {
         return Err(SetattrDispatchError::NoEntry);
@@ -230,7 +237,8 @@ pub fn engine_setattr(
         return Ok(record.to_inode_attr());
     }
 
-    fs.begin_mutation();
+    fs.begin_mutation("set inode attributes")
+        .map_err(|e| SetattrDispatchError::from(&e))?;
     let tick = fs.bump_generation();
     updated.metadata_version = updated.metadata_version.max(tick);
 

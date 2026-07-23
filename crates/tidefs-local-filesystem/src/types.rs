@@ -2587,9 +2587,10 @@ pub struct ReclaimStats {
     pub orphan_index_entries: usize,
     pub reclaim_queue_entries: usize,
     pub pending_orphan_deletions: usize,
-    /// Total number of calls to drain_local_reclaim_queue_into_store since mount.
+    /// Total number of nonempty reclaim-drain attempts since mount.
     pub total_reclaim_drains: u64,
-    /// Total reclaim entries handed off to the object-store durable reclaim queue since mount.
+    /// Total local reclaim entries completed since mount. Present objects are
+    /// handed to the object-store queue; already-absent objects also complete.
     pub total_reclaim_entries_drained: u64,
 }
 
@@ -2607,66 +2608,22 @@ impl ReclaimStats {
 
 /// Stats returned by `LocalFileSystem::drain_local_reclaim_queue_into_store`.
 ///
-/// Records the handoff from the local-filesystem B+tree reclaim queue into
-/// the object-store legacy reclaim queue via `store.delete()`. Physical
-/// segment freeing is reserved for receipt-bound dead-object drains.
+/// Records entries completed from the local-filesystem B+tree reclaim queue.
+/// Present objects complete through `Pool::delete()`; already-absent objects
+/// also complete. Physical segment freeing remains reserved for receipt-bound
+/// dead-object drains.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ReclaimDrainStats {
-    /// Number of reclaim entries drained from the local B+tree queue
-    /// and handed off to the object-store durable reclaim queue.
+    /// Number of reclaim entries removed from the local B+tree queue after
+    /// strict preflight proved absence or their Pool handoff completed.
     pub entries_drained: usize,
 }
 
 impl ReclaimDrainStats {
-    /// True when at least one reclaim entry was handed off to the
-    /// object-store durable reclaim queue in this drain call.
+    /// True when at least one local reclaim entry completed in this call.
     #[must_use]
     pub const fn drained_any(&self) -> bool {
         self.entries_drained > 0
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct HotReadCachePolicy {
-    pub max_entries: usize,
-    pub max_bytes: u64,
-}
-
-impl Default for HotReadCachePolicy {
-    fn default() -> Self {
-        Self {
-            max_entries: DEFAULT_HOT_READ_CACHE_MAX_ENTRIES,
-            max_bytes: DEFAULT_HOT_READ_CACHE_MAX_BYTES,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct HotReadCacheReport {
-    pub spec: &'static str,
-    pub max_entries: usize,
-    pub max_bytes: u64,
-    pub hits: u64,
-    pub misses: u64,
-    pub insertions: u64,
-    pub evictions: u64,
-    pub invalidations: u64,
-    pub admission_bypasses: u64,
-    pub resident_entries: usize,
-    pub resident_bytes: u64,
-    pub admission_rejected_budget: u64,
-    pub admission_rejected_reserve: u64,
-    pub admission_rejected_dirty_state: u64,
-    pub poisoned_on_validate: u64,
-}
-
-impl HotReadCacheReport {
-    pub const fn is_bounded(&self) -> bool {
-        self.resident_entries <= self.max_entries && self.resident_bytes <= self.max_bytes
-    }
-
-    pub fn is_non_authoritative(&self) -> bool {
-        self.spec == HOT_READ_CACHE_SPEC
     }
 }
 

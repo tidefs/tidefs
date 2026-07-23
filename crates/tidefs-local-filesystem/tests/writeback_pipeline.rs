@@ -54,7 +54,7 @@ fn open_fs(dir: &std::path::Path) -> LocalFileSystem {
 // ═══════════════════════════════════════════════════════════════════
 
 /// Insert a page into the page cache, mark it dirty, and check
-/// dirty tracking through the public `dirty_page_tracker_mut()` API.
+/// dirty tracking through the fenced public dirty-page mutation API.
 #[test]
 fn dirty_track_smoke_page_cache_mark_dirty() {
     set_test_key();
@@ -71,28 +71,29 @@ fn dirty_track_smoke_page_cache_mark_dirty() {
     let page_key = PageKey::new(ino, 0, 4096);
     let page_data = vec![0xABu8; 4096];
     let page = CachedPage::new(page_data.clone(), page_data.len());
-    fs.insert_page_and_maybe_reclaim(page_key, page);
+    fs.insert_page_and_maybe_reclaim(page_key, page)
+        .expect("page-cache insertion must be admitted");
 
     // Mark the page dirty via the dirty page tracker.
-    {
-        let mut dt = fs.dirty_page_tracker_mut();
+    fs.with_dirty_page_tracker_mut(|dt| {
         assert!(!dt.is_dirty(&page_key), "page should be clean before mark");
         dt.mark_dirty(page_key);
         assert!(dt.is_dirty(&page_key), "page should be dirty after mark");
         assert_eq!(dt.dirty_page_count(), 1, "one dirty page");
         assert_eq!(dt.per_inode_dirty_count(ino), 1, "one dirty page for inode");
-    }
+    })
+    .expect("dirty-page tracking must be admitted");
 
     // Mark clean and verify.
-    {
-        let mut dt = fs.dirty_page_tracker_mut();
+    fs.with_dirty_page_tracker_mut(|dt| {
         dt.mark_clean(page_key);
         assert!(
             !dt.is_dirty(&page_key),
             "page should be clean after mark_clean"
         );
         assert_eq!(dt.dirty_page_count(), 0, "no dirty pages");
-    }
+    })
+    .expect("dirty-page cleanup must be admitted");
 
     drop(fs);
 }
@@ -116,13 +117,15 @@ fn dirty_track_smoke_multi_page_per_inode() {
     let key1 = PageKey::new(ino, 4096, 4096);
     let key2 = PageKey::new(ino, 8192, 4096);
 
-    fs.insert_page_and_maybe_reclaim(key0, CachedPage::new(vec![0x00u8; 4096], 4096));
-    fs.insert_page_and_maybe_reclaim(key1, CachedPage::new(vec![0x11u8; 4096], 4096));
-    fs.insert_page_and_maybe_reclaim(key2, CachedPage::new(vec![0x22u8; 4096], 4096));
+    fs.insert_page_and_maybe_reclaim(key0, CachedPage::new(vec![0x00u8; 4096], 4096))
+        .expect("page-cache insertion must be admitted");
+    fs.insert_page_and_maybe_reclaim(key1, CachedPage::new(vec![0x11u8; 4096], 4096))
+        .expect("page-cache insertion must be admitted");
+    fs.insert_page_and_maybe_reclaim(key2, CachedPage::new(vec![0x22u8; 4096], 4096))
+        .expect("page-cache insertion must be admitted");
 
     // Mark pages 0 and 2 dirty, leave page 1 clean.
-    {
-        let mut dt = fs.dirty_page_tracker_mut();
+    fs.with_dirty_page_tracker_mut(|dt| {
         dt.mark_dirty(key0);
         dt.mark_dirty(key2);
         assert_eq!(dt.dirty_page_count(), 2, "two dirty pages total");
@@ -131,16 +134,17 @@ fn dirty_track_smoke_multi_page_per_inode() {
             2,
             "two dirty pages for inode"
         );
-    }
+    })
+    .expect("dirty-page tracking must be admitted");
 
     // Verify dirty pages iterator.
-    {
-        let dt = fs.dirty_page_tracker_mut();
+    fs.with_dirty_page_tracker_mut(|dt| {
         let dirty: Vec<_> = dt.dirty_pages_for_inode(ino).cloned().collect();
         assert_eq!(dirty.len(), 2, "two dirty pages for inode");
         // Key1 (offset 4096) should NOT be dirty.
         assert!(!dt.is_dirty(&key1), "page 1 should be clean");
-    }
+    })
+    .expect("dirty-page inspection must be admitted");
 
     drop(fs);
 }
@@ -187,14 +191,14 @@ fn dirty_track_smoke_zero_length_write_no_dirty() {
         .expect("zero-length write");
 
     // Verify no dirty pages in the page_cache dirty tracker.
-    {
-        let dt = fs.dirty_page_tracker_mut();
+    fs.with_dirty_page_tracker_mut(|dt| {
         assert_eq!(
             dt.per_inode_dirty_count(ino),
             0,
             "zero-length write should not dirty pages"
         );
-    }
+    })
+    .expect("dirty-page inspection must be admitted");
 
     drop(fs);
 }
@@ -674,8 +678,10 @@ fn end_to_end_writeback_pipeline_crash_recovery() {
     // Phase 2: simulate an abrupt stop with an uncommitted handle. A normal
     // Drop is best-effort and commits dirty write buffers.
     let mut fs = open_fs(&dir);
-    fs.set_auto_commit(false);
-    fs.set_max_uncommitted_mutations(1_000_000);
+    fs.set_auto_commit(false)
+        .expect("test setup mutation must be admitted");
+    fs.set_max_uncommitted_mutations(1_000_000)
+        .expect("test setup mutation must be admitted");
 
     // Write uncommitted data (will be lost on crash).
     fs.write_file("/pipeline.dat", committed_payload.len() as u64, b"-lost")

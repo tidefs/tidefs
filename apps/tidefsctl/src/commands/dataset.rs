@@ -1104,7 +1104,14 @@ fn handle_create(args: DatasetCreateArgs) {
     let dataset_id = dataset_id_from_name(&full_path);
     let property_set = property_set_from_assignments(&properties);
 
-    if let Err(err) = fs.dataset_catalog_mut().create(
+    let catalog = fs.dataset_catalog_mut().unwrap_or_else(|err| {
+        exit_dataset_error(
+            "create",
+            format!("filesystem mutation requires reopen: {err}"),
+            args.json,
+        )
+    });
+    if let Err(err) = catalog.create(
         &full_path,
         dataset_id,
         dataset_type,
@@ -1299,7 +1306,14 @@ fn handle_rename(args: DatasetRenameArgs) {
         process::exit(1);
     }
 
-    match fs.dataset_catalog_mut().rename(old_name, new_name) {
+    let catalog = match fs.dataset_catalog_mut() {
+        Ok(catalog) => catalog,
+        Err(err) => {
+            eprintln!("tidefsctl dataset rename: filesystem mutation requires reopen: {err}");
+            process::exit(1);
+        }
+    };
+    match catalog.rename(old_name, new_name) {
         Ok(()) => {
             println!(
                 "dataset '{old_name}' renamed to '{new_name}' in pool '{}'",
@@ -1439,10 +1453,16 @@ fn handle_set_strategy(args: DatasetSetStrategyArgs) {
         }
         match FeatureName::from_str(feature_str) {
             Some(name) => {
-                match fs
-                    .feature_flags_mut()
-                    .enable_feature_with_prereqs(name.clone(), feature_class)
-                {
+                let flags = match fs.feature_flags_mut() {
+                    Ok(flags) => flags,
+                    Err(err) => {
+                        eprintln!(
+                            "tidefsctl dataset set-strategy: filesystem mutation requires reopen: {err}"
+                        );
+                        process::exit(1);
+                    }
+                };
+                match flags.enable_feature_with_prereqs(name.clone(), feature_class) {
                     Ok(()) => {
                         println!("enabled feature '{feature_str}' (class: {feature_class})");
                         changed = true;
@@ -1471,18 +1491,29 @@ fn handle_set_strategy(args: DatasetSetStrategyArgs) {
             continue;
         }
         match FeatureName::from_str(feature_str) {
-            Some(name) => match fs.feature_flags_mut().disable_feature(&name) {
-                Ok(()) => {
-                    println!("disabled feature '{feature_str}'");
-                    changed = true;
+            Some(name) => {
+                let flags = match fs.feature_flags_mut() {
+                    Ok(flags) => flags,
+                    Err(err) => {
+                        eprintln!(
+                            "tidefsctl dataset set-strategy: filesystem mutation requires reopen: {err}"
+                        );
+                        process::exit(1);
+                    }
+                };
+                match flags.disable_feature(&name) {
+                    Ok(()) => {
+                        println!("disabled feature '{feature_str}'");
+                        changed = true;
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "tidefsctl dataset set-strategy: failed to disable '{feature_str}': {e}"
+                        );
+                        process::exit(1);
+                    }
                 }
-                Err(e) => {
-                    eprintln!(
-                        "tidefsctl dataset set-strategy: failed to disable '{feature_str}': {e}"
-                    );
-                    process::exit(1);
-                }
-            },
+            }
             None => {
                 eprintln!(
                     "tidefsctl dataset set-strategy: invalid feature name '{feature_str}'; expected format org.tidefs:<name>"
@@ -1499,7 +1530,12 @@ fn handle_set_strategy(args: DatasetSetStrategyArgs) {
                 eprintln!("feature flags persisted for dataset '{}'", args.name);
                 // Refresh runtime policies so new writes use the updated
                 // compression/dedup settings immediately, without remount.
-                fs.refresh_policies_from_features();
+                if let Err(e) = fs.refresh_policies_from_features() {
+                    eprintln!(
+                        "tidefsctl dataset set-strategy: failed to refresh mounted policies: {e}"
+                    );
+                    process::exit(1);
+                }
             }
             Err(e) => {
                 eprintln!("tidefsctl dataset set-strategy: failed to persist feature flags: {e}");
@@ -1589,10 +1625,16 @@ fn handle_upgrade(args: DatasetUpgradeArgs) {
                 }
             };
 
-            match fs
-                .feature_flags_mut()
-                .enable_feature_with_prereqs(name.clone(), class)
-            {
+            let enable_result = match fs.feature_flags_mut() {
+                Ok(flags) => flags.enable_feature_with_prereqs(name.clone(), class),
+                Err(err) => {
+                    eprintln!(
+                        "tidefsctl dataset upgrade: filesystem mutation requires reopen: {err}"
+                    );
+                    process::exit(1);
+                }
+            };
+            match enable_result {
                 Ok(()) => {
                     println!("  enabled {name} ({class})");
                     enabled_count += 1;
@@ -1618,10 +1660,16 @@ fn handle_upgrade(args: DatasetUpgradeArgs) {
                     skipped_count += 1;
                     continue;
                 };
-                if let Err(e) = fs
-                    .feature_flags_mut()
-                    .enable_feature_with_prereqs(name.clone(), class)
-                {
+                let enable_result = match fs.feature_flags_mut() {
+                    Ok(flags) => flags.enable_feature_with_prereqs(name.clone(), class),
+                    Err(err) => {
+                        eprintln!(
+                            "tidefsctl dataset upgrade: filesystem mutation requires reopen: {err}"
+                        );
+                        process::exit(1);
+                    }
+                };
+                if let Err(e) = enable_result {
                     let msg = format!("{e}");
                     eprintln!("  FAILED {name} ({class}) : {msg}");
                     failed.push((name.to_string(), msg));
@@ -1637,7 +1685,10 @@ fn handle_upgrade(args: DatasetUpgradeArgs) {
         match fs.persist_feature_flags() {
             Ok(()) => {
                 eprintln!("feature flags persisted for dataset '{}'", args.name);
-                fs.refresh_policies_from_features();
+                if let Err(e) = fs.refresh_policies_from_features() {
+                    eprintln!("tidefsctl dataset upgrade: failed to refresh mounted policies: {e}");
+                    process::exit(1);
+                }
             }
             Err(e) => {
                 eprintln!("tidefsctl dataset upgrade: failed to persist feature flags: {e}");
@@ -1785,7 +1836,14 @@ fn handle_set(args: DatasetSetArgs) {
         props.set_local(key.clone(), assignment.value.clone());
     }
 
-    match fs.dataset_catalog_mut().set_properties(&path, &props) {
+    let catalog = fs.dataset_catalog_mut().unwrap_or_else(|err| {
+        exit_dataset_error(
+            "set",
+            format!("filesystem mutation requires reopen: {err}"),
+            args.json,
+        )
+    });
+    match catalog.set_properties(&path, &props) {
         Ok(()) => {
             if let Err(e) = fs.persist_dataset_catalog() {
                 exit_dataset_error(
@@ -1987,7 +2045,14 @@ fn handle_destroy(args: DatasetDestroyArgs) {
         exit_dataset_error("destroy", err, args.json);
     }
 
-    let destroyed_entries = destroy_catalog_subtree(fs.dataset_catalog_mut(), &name)
+    let catalog = fs.dataset_catalog_mut().unwrap_or_else(|err| {
+        exit_dataset_error(
+            "destroy",
+            format!("filesystem mutation requires reopen: {err}"),
+            args.json,
+        )
+    });
+    let destroyed_entries = destroy_catalog_subtree(catalog, &name)
         .unwrap_or_else(|err| exit_dataset_error("destroy", err, args.json));
 
     if let Err(err) = fs.persist_dataset_catalog() {

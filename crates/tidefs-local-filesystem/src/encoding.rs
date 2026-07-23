@@ -414,9 +414,7 @@ pub(crate) fn encode_superblock(superblock: &SuperblockRecord) -> Vec<u8> {
     out
 }
 
-pub(crate) fn decode_superblock(
-    bytes: &[u8],
-) -> Result<(SuperblockRecord, Option<Vec<SnapshotRecord>>)> {
+pub(crate) fn decode_superblock(bytes: &[u8]) -> Result<SuperblockRecord> {
     let mut decoder = Decoder::new("local filesystem superblock", bytes);
     decoder.expect_magic(SUPERBLOCK_MAGIC)?;
     let version = decoder.read_u16()?;
@@ -441,10 +439,8 @@ pub(crate) fn decode_superblock(
     for _ in 0..bitmap_word_count {
         inode_allocation_bitmap.push(decoder.read_u64()?);
     }
-    // v3+: snapshots are stored as separate transaction objects, not in the superblock.
-    // Embedded snapshot catalogs in v1-v2 legacy superblocks are not supported;
-    // TideFS has no public release, so there is no legacy data to decode.
-    let legacy_snapshots: Option<Vec<SnapshotRecord>> = None;
+    // Snapshot catalogs are separate transaction objects. Retired pre-release
+    // superblocks that embedded them are rejected by the version checks above.
     // Format-version-range extension (required for current format version).
     let (format_version_min, format_version_max) =
         if decoder.try_peek_magic(FORMAT_VERSION_EXTENSION_MAGIC_BYTES) {
@@ -457,17 +453,14 @@ pub(crate) fn decode_superblock(
             });
         };
     decoder.finish()?;
-    Ok((
-        SuperblockRecord {
-            next_inode_id,
-            generation,
-            inode_count,
-            inode_allocation_bitmap,
-            format_version_min,
-            format_version_max,
-        },
-        legacy_snapshots,
-    ))
+    Ok(SuperblockRecord {
+        next_inode_id,
+        generation,
+        inode_count,
+        inode_allocation_bitmap,
+        format_version_min,
+        format_version_max,
+    })
 }
 
 pub(crate) fn encode_committed_root_summary(out: &mut Vec<u8>, summary: &CommittedRootSummary) {

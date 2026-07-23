@@ -50,6 +50,43 @@ fn open_fs(dir: &std::path::Path) -> LocalFileSystem {
     LocalFileSystem::open(dir).expect("open filesystem")
 }
 
+fn with_page_cache<T>(fs: &LocalFileSystem, mutate: impl FnOnce(&mut PageCache) -> T) -> T {
+    fs.with_page_cache_mut(mutate)
+        .expect("page-cache test mutation must be admitted")
+}
+
+fn with_dirty_page_tracker<T>(
+    fs: &LocalFileSystem,
+    mutate: impl FnOnce(&mut DirtyPageTracker) -> T,
+) -> T {
+    fs.with_dirty_page_tracker_mut(mutate)
+        .expect("dirty-page test mutation must be admitted")
+}
+
+fn with_page_cache_and_dirty_tracker<T>(
+    fs: &LocalFileSystem,
+    mutate: impl FnOnce(&mut PageCache, &mut DirtyPageTracker) -> T,
+) -> T {
+    fs.with_page_cache_and_dirty_page_tracker_mut(mutate)
+        .expect("page-cache test mutation must be admitted")
+}
+
+fn page_is_cached(fs: &LocalFileSystem, key: &PageKey) -> bool {
+    with_page_cache(fs, |cache| cache.get(key).is_some())
+}
+
+fn mark_page_dirty(fs: &LocalFileSystem, key: PageKey) {
+    with_dirty_page_tracker(fs, |tracker| tracker.mark_dirty(key));
+}
+
+fn mark_page_clean(fs: &LocalFileSystem, key: PageKey) {
+    with_dirty_page_tracker(fs, |tracker| tracker.mark_clean(key));
+}
+
+fn page_is_dirty(fs: &LocalFileSystem, key: &PageKey) -> bool {
+    with_dirty_page_tracker(fs, |tracker| tracker.is_dirty(key))
+}
+
 /// Build a PageCacheReclaimer with tight watermarks so any eviction
 /// request actually evicts.
 fn testing_reclaimer<'a>(
@@ -84,20 +121,17 @@ fn evict_single_clean_page() {
     let data = fill_page(0xAB);
 
     // Insert via the page-cache directly, skipping reclaim trigger.
-    {
-        let mut cache = fs.page_cache_mut();
+    with_page_cache(&fs, |cache| {
         cache.insert(key, CachedPage::new(data.clone(), data.len()));
-    }
+    });
     assert_eq!(fs.page_cache_stats().1, 1, "one page should be resident");
 
     // Trigger reclaim with tiny watermarks — the single clean page
     // should be evicted.
-    let evicted = {
-        let mut cache = fs.page_cache_mut();
-        let dt = fs.dirty_page_tracker_mut();
-        let mut reclaimer = testing_reclaimer(&mut cache, &dt);
+    let evicted = with_page_cache_and_dirty_tracker(&fs, |cache, dt| {
+        let mut reclaimer = testing_reclaimer(cache, dt);
         reclaimer.evict_lru(1)
-    };
+    });
     assert_eq!(evicted, 1, "single clean page should be evicted");
     assert_eq!(
         fs.page_cache_stats().1,
@@ -123,25 +157,19 @@ fn dirty_page_not_evicted() {
     let data = fill_page(0xCC);
 
     // Insert the page and mark it dirty.
-    {
-        let mut cache = fs.page_cache_mut();
+    with_page_cache(&fs, |cache| {
         cache.insert(key, CachedPage::new(data.clone(), data.len()));
-    }
-    fs.dirty_page_tracker_mut().mark_dirty(key);
+    });
+    mark_page_dirty(&fs, key);
 
     assert_eq!(fs.page_cache_stats().1, 1, "one page resident");
-    assert!(
-        fs.dirty_page_tracker_mut().is_dirty(&key),
-        "page should be tracked as dirty"
-    );
+    assert!(page_is_dirty(&fs, &key), "page should be tracked as dirty");
 
     // Trigger reclaim — dirty page must be skipped.
-    let evicted = {
-        let mut cache = fs.page_cache_mut();
-        let dt = fs.dirty_page_tracker_mut();
-        let mut reclaimer = testing_reclaimer(&mut cache, &dt);
+    let evicted = with_page_cache_and_dirty_tracker(&fs, |cache, dt| {
+        let mut reclaimer = testing_reclaimer(cache, dt);
         reclaimer.evict_lru(1)
-    };
+    });
     assert_eq!(evicted, 0, "dirty page must not be evicted");
     assert_eq!(
         fs.page_cache_stats().1,
@@ -150,7 +178,7 @@ fn dirty_page_not_evicted() {
     );
 
     // Verify the page is still in cache.
-    let still_there = fs.page_cache_mut().get(&key).is_some();
+    let still_there = page_is_cached(&fs, &key);
     assert!(still_there, "dirty page should still be in cache");
 }
 
@@ -176,50 +204,45 @@ fn evict_lru_clean_pages() {
     let key1 = PageKey::new(inode_id, 4096, 4096);
     let key2 = PageKey::new(inode_id, 8192, 4096);
 
-    {
-        let mut cache = fs.page_cache_mut();
+    with_page_cache(&fs, |cache| {
         cache.insert(key0, CachedPage::new(fill_page(0x00), 4096));
         cache.insert(key1, CachedPage::new(fill_page(0x11), 4096));
         cache.insert(key2, CachedPage::new(fill_page(0x22), 4096));
-    }
+    });
     assert_eq!(fs.page_cache_stats().1, 3, "three pages resident");
 
     // Evict one page — should be key0 (oldest/first-inserted).
-    {
-        let mut cache = fs.page_cache_mut();
-        let dt = fs.dirty_page_tracker_mut();
-        let mut reclaimer = testing_reclaimer(&mut cache, &dt);
+    with_page_cache_and_dirty_tracker(&fs, |cache, dt| {
+        let mut reclaimer = testing_reclaimer(cache, dt);
         let evicted = reclaimer.evict_lru(1);
         assert_eq!(evicted, 1, "one page should be evicted");
-    }
+    });
     assert_eq!(fs.page_cache_stats().1, 2, "two pages remaining");
 
     // key0 must be gone; key1 and key2 remain.
     assert!(
-        fs.page_cache_mut().get(&key0).is_none(),
+        !page_is_cached(&fs, &key0),
         "oldest page (offset 0) should be evicted first"
     );
     assert!(
-        fs.page_cache_mut().get(&key1).is_some(),
+        page_is_cached(&fs, &key1),
         "middle page (offset 4096) should remain"
     );
     assert!(
-        fs.page_cache_mut().get(&key2).is_some(),
+        page_is_cached(&fs, &key2),
         "newest page (offset 8192) should remain"
     );
 
     // Evict a second page — should be key1.
-    {
-        let mut cache = fs.page_cache_mut();
-        let dt = fs.dirty_page_tracker_mut();
-        let mut reclaimer = testing_reclaimer(&mut cache, &dt);
+    with_page_cache_and_dirty_tracker(&fs, |cache, dt| {
+        let mut reclaimer = testing_reclaimer(cache, dt);
         let evicted = reclaimer.evict_lru(1);
         assert_eq!(evicted, 1);
-    }
+    });
     assert_eq!(fs.page_cache_stats().1, 1);
 
-    assert!(fs.page_cache_mut().get(&key1).is_none());
-    assert!(fs.page_cache_mut().get(&key2).is_some());
+    assert!(!page_is_cached(&fs, &key1));
+    assert!(page_is_cached(&fs, &key2));
 }
 
 // ── test 4: mixed dirty/clean LRU ─────────────────────────────────
@@ -244,45 +267,39 @@ fn mixed_dirty_clean_lru() {
     let key_c = PageKey::new(inode_id, 8192, 4096);
     let key_d = PageKey::new(inode_id, 12288, 4096);
 
-    {
-        let mut cache = fs.page_cache_mut();
+    with_page_cache(&fs, |cache| {
         cache.insert(key_a, CachedPage::new(fill_page(0xAA), 4096));
         cache.insert(key_b, CachedPage::new(fill_page(0xBB), 4096));
         cache.insert(key_c, CachedPage::new(fill_page(0xCC), 4096));
         cache.insert(key_d, CachedPage::new(fill_page(0xDD), 4096));
-    }
+    });
 
     // Mark A (oldest) and C as dirty.
-    fs.dirty_page_tracker_mut().mark_dirty(key_a);
-    fs.dirty_page_tracker_mut().mark_dirty(key_c);
+    mark_page_dirty(&fs, key_a);
+    mark_page_dirty(&fs, key_c);
 
     assert_eq!(fs.page_cache_stats().1, 4, "four pages resident");
 
     // Evict 2 pages. Should skip A (dirty, oldest), evict B (oldest clean),
     // skip C (dirty), evict D (next clean). Total evicted: 2.
-    let evicted = {
-        let mut cache = fs.page_cache_mut();
-        let dt = fs.dirty_page_tracker_mut();
-        let mut reclaimer = testing_reclaimer(&mut cache, &dt);
+    let evicted = with_page_cache_and_dirty_tracker(&fs, |cache, dt| {
+        let mut reclaimer = testing_reclaimer(cache, dt);
         reclaimer.evict_lru(2)
-    };
+    });
     assert_eq!(evicted, 2, "should evict the two clean pages");
 
     // A (dirty) and C (dirty) must remain; B and D must be gone.
     assert!(
-        fs.page_cache_mut().get(&key_a).is_some(),
+        page_is_cached(&fs, &key_a),
         "dirty page A should remain despite being oldest"
     );
     assert!(
-        fs.page_cache_mut().get(&key_b).is_none(),
+        !page_is_cached(&fs, &key_b),
         "clean page B should be evicted"
     );
+    assert!(page_is_cached(&fs, &key_c), "dirty page C should remain");
     assert!(
-        fs.page_cache_mut().get(&key_c).is_some(),
-        "dirty page C should remain"
-    );
-    assert!(
-        fs.page_cache_mut().get(&key_d).is_none(),
+        !page_is_cached(&fs, &key_d),
         "clean page D should be evicted"
     );
 }
@@ -312,62 +329,55 @@ fn two_handles_single_file_lru_merged() {
     let h2_key1 = PageKey::new(inode_id, 4096, 4096);
     let h2_key3 = PageKey::new(inode_id, 12288, 4096);
 
-    {
-        let mut cache = fs.page_cache_mut();
+    with_page_cache(&fs, |cache| {
         cache.insert(h1_key0, CachedPage::new(fill_page(0x00), 4096));
         cache.insert(h2_key1, CachedPage::new(fill_page(0x11), 4096));
         cache.insert(h1_key2, CachedPage::new(fill_page(0x22), 4096));
         cache.insert(h2_key3, CachedPage::new(fill_page(0x33), 4096));
-    }
+    });
     assert_eq!(fs.page_cache_stats().1, 4, "four pages resident");
 
     // Evict 1 page — should be h1_key0 (oldest overall, offset 0).
-    {
-        let mut cache = fs.page_cache_mut();
-        let dt = fs.dirty_page_tracker_mut();
-        let mut reclaimer = testing_reclaimer(&mut cache, &dt);
+    with_page_cache_and_dirty_tracker(&fs, |cache, dt| {
+        let mut reclaimer = testing_reclaimer(cache, dt);
         let evicted = reclaimer.evict_lru(1);
         assert_eq!(evicted, 1);
-    }
+    });
 
     assert!(
-        fs.page_cache_mut().get(&h1_key0).is_none(),
+        !page_is_cached(&fs, &h1_key0),
         "handle-1 first page (offset 0) should be evicted (oldest overall)"
     );
     assert!(
-        fs.page_cache_mut().get(&h2_key1).is_some(),
+        page_is_cached(&fs, &h2_key1),
         "handle-2 first page (offset 4096) should remain"
     );
     assert!(
-        fs.page_cache_mut().get(&h1_key2).is_some(),
+        page_is_cached(&fs, &h1_key2),
         "handle-1 second page (offset 8192) should remain"
     );
     assert!(
-        fs.page_cache_mut().get(&h2_key3).is_some(),
+        page_is_cached(&fs, &h2_key3),
         "handle-2 second page (offset 12288) should remain"
     );
 
     // Evict second page — should be h2_key1 (next oldest).
-    {
-        let mut cache = fs.page_cache_mut();
-        let dt = fs.dirty_page_tracker_mut();
-        let mut reclaimer = testing_reclaimer(&mut cache, &dt);
+    with_page_cache_and_dirty_tracker(&fs, |cache, dt| {
+        let mut reclaimer = testing_reclaimer(cache, dt);
         let evicted = reclaimer.evict_lru(1);
         assert_eq!(evicted, 1);
-    }
+    });
 
-    assert!(fs.page_cache_mut().get(&h2_key1).is_none());
-    assert!(fs.page_cache_mut().get(&h1_key2).is_some());
-    assert!(fs.page_cache_mut().get(&h2_key3).is_some());
+    assert!(!page_is_cached(&fs, &h2_key1));
+    assert!(page_is_cached(&fs, &h1_key2));
+    assert!(page_is_cached(&fs, &h2_key3));
 
     // Evict remaining two.
-    {
-        let mut cache = fs.page_cache_mut();
-        let dt = fs.dirty_page_tracker_mut();
-        let mut reclaimer = testing_reclaimer(&mut cache, &dt);
+    with_page_cache_and_dirty_tracker(&fs, |cache, dt| {
+        let mut reclaimer = testing_reclaimer(cache, dt);
         let evicted = reclaimer.evict_lru(2);
         assert_eq!(evicted, 2);
-    }
+    });
     assert_eq!(fs.page_cache_stats().1, 0, "all pages should be evicted");
 }
 
@@ -392,21 +402,18 @@ fn evict_under_exact_pressure() {
         .map(|i| PageKey::new(inode_id, i * 4096, 4096))
         .collect();
 
-    {
-        let mut cache = fs.page_cache_mut();
+    with_page_cache(&fs, |cache| {
         for (i, &key) in keys.iter().enumerate() {
             cache.insert(key, CachedPage::new(fill_page(i as u8), 4096));
         }
-    }
+    });
     assert_eq!(fs.page_cache_stats().1, 5, "five pages resident");
 
     // Request eviction of exactly 3 pages.
-    let evicted = {
-        let mut cache = fs.page_cache_mut();
-        let dt = fs.dirty_page_tracker_mut();
-        let mut reclaimer = testing_reclaimer(&mut cache, &dt);
+    let evicted = with_page_cache_and_dirty_tracker(&fs, |cache, dt| {
+        let mut reclaimer = testing_reclaimer(cache, dt);
         reclaimer.evict_lru(3)
-    };
+    });
     assert_eq!(evicted, 3, "exactly 3 pages should be evicted");
     assert_eq!(
         fs.page_cache_stats().1,
@@ -415,13 +422,13 @@ fn evict_under_exact_pressure() {
     );
 
     // The first 3 pages (offset 0, 4096, 8192) should be gone.
-    assert!(fs.page_cache_mut().get(&keys[0]).is_none());
-    assert!(fs.page_cache_mut().get(&keys[1]).is_none());
-    assert!(fs.page_cache_mut().get(&keys[2]).is_none());
+    assert!(!page_is_cached(&fs, &keys[0]));
+    assert!(!page_is_cached(&fs, &keys[1]));
+    assert!(!page_is_cached(&fs, &keys[2]));
 
     // The last 2 pages (offset 12288, 16384) should remain.
-    assert!(fs.page_cache_mut().get(&keys[3]).is_some());
-    assert!(fs.page_cache_mut().get(&keys[4]).is_some());
+    assert!(page_is_cached(&fs, &keys[3]));
+    assert!(page_is_cached(&fs, &keys[4]));
 }
 
 // ── test 7: dirty page evicted after writeback ────────────────────
@@ -440,38 +447,33 @@ fn dirty_page_evicted_after_writeback() {
     let key = PageKey::new(inode.inode_id, 0, 4096);
 
     // Insert page and mark dirty.
-    {
-        let mut cache = fs.page_cache_mut();
+    with_page_cache(&fs, |cache| {
         cache.insert(key, CachedPage::new(fill_page(0xEE), 4096));
-    }
-    fs.dirty_page_tracker_mut().mark_dirty(key);
+    });
+    mark_page_dirty(&fs, key);
     assert_eq!(fs.page_cache_stats().1, 1);
 
     // Reclaim while dirty — must skip.
-    {
-        let mut cache = fs.page_cache_mut();
-        let dt = fs.dirty_page_tracker_mut();
-        let mut reclaimer = testing_reclaimer(&mut cache, &dt);
+    with_page_cache_and_dirty_tracker(&fs, |cache, dt| {
+        let mut reclaimer = testing_reclaimer(cache, dt);
         let evicted = reclaimer.evict_lru(1);
         assert_eq!(
             evicted, 0,
             "dirty page must not be evicted before writeback"
         );
-    }
+    });
     assert_eq!(fs.page_cache_stats().1, 1, "dirty page still resident");
 
     // Simulate writeback completion: mark clean.
-    fs.dirty_page_tracker_mut().mark_clean(key);
-    assert!(!fs.dirty_page_tracker_mut().is_dirty(&key));
+    mark_page_clean(&fs, key);
+    assert!(!page_is_dirty(&fs, &key));
 
     // Reclaim after writeback — page is now clean and evictable.
-    {
-        let mut cache = fs.page_cache_mut();
-        let dt = fs.dirty_page_tracker_mut();
-        let mut reclaimer = testing_reclaimer(&mut cache, &dt);
+    with_page_cache_and_dirty_tracker(&fs, |cache, dt| {
+        let mut reclaimer = testing_reclaimer(cache, dt);
         let evicted = reclaimer.evict_lru(1);
         assert_eq!(evicted, 1, "clean page should be evicted after writeback");
-    }
+    });
     assert_eq!(
         fs.page_cache_stats().1,
         0,
@@ -507,16 +509,17 @@ fn two_files_independent_lru() {
         .map(|i| PageKey::new(inode_b.inode_id, i * 4096, 4096))
         .collect();
 
-    {
-        let mut cache = fs.page_cache_mut();
+    with_page_cache(&fs, |cache| {
         for key in keys_a.iter().chain(keys_b.iter()) {
             cache.insert(*key, CachedPage::new(fill_page(0x77), 4096));
         }
-    }
+    });
     assert_eq!(fs.page_cache_stats().1, 6, "six pages total");
 
     // Evict all clean pages for inode A only.
-    let evicted = fs.page_cache_evict_inode(inode_a.inode_id);
+    let evicted = fs
+        .page_cache_evict_inode(inode_a.inode_id)
+        .expect("inode page-cache eviction must be admitted");
     assert_eq!(
         evicted, 3,
         "all 3 clean pages for inode A should be evicted"
@@ -524,16 +527,13 @@ fn two_files_independent_lru() {
 
     // Inode A pages must be gone.
     for key in &keys_a {
-        assert!(
-            fs.page_cache_mut().get(key).is_none(),
-            "inode A page should be evicted"
-        );
+        assert!(!page_is_cached(&fs, key), "inode A page should be evicted");
     }
 
     // Inode B pages must remain untouched.
     for key in &keys_b {
         assert!(
-            fs.page_cache_mut().get(key).is_some(),
+            page_is_cached(&fs, key),
             "inode B page should be unaffected"
         );
     }
@@ -562,17 +562,14 @@ fn writeback_before_evict_ordering() {
     let key = PageKey::new(inode.inode_id, 0, 4096);
 
     // Insert page and mark dirty.
-    {
-        let mut cache = fs.page_cache_mut();
+    with_page_cache(&fs, |cache| {
         cache.insert(key, CachedPage::new(fill_page(0xFF), 4096));
-    }
-    fs.dirty_page_tracker_mut().mark_dirty(key);
+    });
+    mark_page_dirty(&fs, key);
 
     // Reclaim must skip the dirty page and record the skip.
-    {
-        let mut cache = fs.page_cache_mut();
-        let dt = fs.dirty_page_tracker_mut();
-        let mut reclaimer = testing_reclaimer(&mut cache, &dt);
+    with_page_cache_and_dirty_tracker(&fs, |cache, dt| {
+        let mut reclaimer = testing_reclaimer(cache, dt);
         let evicted = reclaimer.evict_lru(1);
 
         assert_eq!(evicted, 0, "no pages evicted while dirty");
@@ -580,18 +577,16 @@ fn writeback_before_evict_ordering() {
             reclaimer.stats.pages_skipped_dirty > 0,
             "reclaim must record dirty-page skips (writeback-before-evict check)"
         );
-    }
+    });
 
     // Mark clean (writeback completed) — page becomes evictable.
-    fs.dirty_page_tracker_mut().mark_clean(key);
+    mark_page_clean(&fs, key);
 
-    {
-        let mut cache = fs.page_cache_mut();
-        let dt = fs.dirty_page_tracker_mut();
-        let mut reclaimer = testing_reclaimer(&mut cache, &dt);
+    with_page_cache_and_dirty_tracker(&fs, |cache, dt| {
+        let mut reclaimer = testing_reclaimer(cache, dt);
         let evicted = reclaimer.evict_lru(1);
         assert_eq!(evicted, 1, "page evicted after writeback completion");
-    }
+    });
     assert_eq!(fs.page_cache_stats().1, 0);
 }
 
@@ -617,35 +612,32 @@ fn writeback_failure_keeps_page() {
     let key2 = PageKey::new(inode_id, 8192, 4096);
     let key_dirty = PageKey::new(inode_id, 12288, 4096);
 
-    {
-        let mut cache = fs.page_cache_mut();
+    with_page_cache(&fs, |cache| {
         cache.insert(key0, CachedPage::new(fill_page(0x00), 4096));
         cache.insert(key1, CachedPage::new(fill_page(0x11), 4096));
         cache.insert(key2, CachedPage::new(fill_page(0x22), 4096));
         cache.insert(key_dirty, CachedPage::new(fill_page(0xFF), 4096));
-    }
+    });
     // Mark one page dirty — writeback "failed", dirty flag remains.
-    fs.dirty_page_tracker_mut().mark_dirty(key_dirty);
+    mark_page_dirty(&fs, key_dirty);
 
     assert_eq!(fs.page_cache_stats().1, 4);
 
     // Evict up to 4 pages — should evict the 3 clean ones and skip the dirty one.
-    let (evicted, skipped_dirty) = {
-        let mut cache = fs.page_cache_mut();
-        let dt = fs.dirty_page_tracker_mut();
-        let mut reclaimer = testing_reclaimer(&mut cache, &dt);
+    let (evicted, skipped_dirty) = with_page_cache_and_dirty_tracker(&fs, |cache, dt| {
+        let mut reclaimer = testing_reclaimer(cache, dt);
         let n = reclaimer.evict_lru(4);
         (n, reclaimer.stats.pages_skipped_dirty)
-    };
+    });
     assert_eq!(evicted, 3, "only 3 clean pages evicted");
     assert!(skipped_dirty > 0, "dirty page skipped during reclaim");
 
     // Clean pages gone, dirty page remains.
-    assert!(fs.page_cache_mut().get(&key0).is_none());
-    assert!(fs.page_cache_mut().get(&key1).is_none());
-    assert!(fs.page_cache_mut().get(&key2).is_none());
+    assert!(!page_is_cached(&fs, &key0));
+    assert!(!page_is_cached(&fs, &key1));
+    assert!(!page_is_cached(&fs, &key2));
     assert!(
-        fs.page_cache_mut().get(&key_dirty).is_some(),
+        page_is_cached(&fs, &key_dirty),
         "dirty page must remain after failed writeback"
     );
     assert_eq!(fs.page_cache_stats().1, 1);
@@ -672,16 +664,15 @@ fn evict_to_low_watermark_stops() {
         .map(|i| PageKey::new(inode_id, i * 4096, 4096))
         .collect();
 
-    {
-        let mut cache = fs.page_cache_mut();
+    with_page_cache(&fs, |cache| {
         for &key in &keys {
             cache.insert(key, CachedPage::new(fill_page(0x77), 4096));
         }
-    }
+    });
     // Mark the last 3 pages dirty so eviction cannot clear everything.
-    fs.dirty_page_tracker_mut().mark_dirty(keys[17]);
-    fs.dirty_page_tracker_mut().mark_dirty(keys[18]);
-    fs.dirty_page_tracker_mut().mark_dirty(keys[19]);
+    mark_page_dirty(&fs, keys[17]);
+    mark_page_dirty(&fs, keys[18]);
+    mark_page_dirty(&fs, keys[19]);
     let resident_before = fs.page_cache_stats().0;
     assert_eq!(fs.page_cache_stats().1, 20);
     assert!(
@@ -695,18 +686,16 @@ fn evict_to_low_watermark_stops() {
     let high_bytes = 10 * (4096 + 64);
     let low_bytes = 5 * (4096 + 64);
 
-    let evicted = {
-        let mut cache = fs.page_cache_mut();
-        let dt = fs.dirty_page_tracker_mut();
+    let evicted = with_page_cache_and_dirty_tracker(&fs, |cache, dt| {
         let wm = ReclaimWatermarks::new(high_bytes, low_bytes);
-        let mut reclaimer = PageCacheReclaimer::new(&mut cache, &dt, wm);
+        let mut reclaimer = PageCacheReclaimer::new(cache, dt, wm);
 
         assert!(
             reclaimer.above_high_watermark(),
             "should exceed high watermark"
         );
         reclaimer.evict_to_low_watermark()
-    };
+    });
 
     assert!(
         evicted > 0,
@@ -744,22 +733,19 @@ fn reclaim_does_not_deadlock_with_open_handles() {
         .map(|i| PageKey::new(inode_id, i * 4096, 4096))
         .collect();
 
-    {
-        let mut cache = fs.page_cache_mut();
+    with_page_cache(&fs, |cache| {
         for &key in &keys {
             cache.insert(key, CachedPage::new(fill_page(0x42), 4096));
         }
-    }
+    });
     assert_eq!(fs.page_cache_stats().1, 10);
 
     // Aggressive reclaim — evict all 10 pages.
-    {
-        let mut cache = fs.page_cache_mut();
-        let dt = fs.dirty_page_tracker_mut();
-        let mut reclaimer = testing_reclaimer(&mut cache, &dt);
+    with_page_cache_and_dirty_tracker(&fs, |cache, dt| {
+        let mut reclaimer = testing_reclaimer(cache, dt);
         let evicted = reclaimer.evict_lru(10);
         assert_eq!(evicted, 10, "all clean pages should be evicted");
-    }
+    });
     assert_eq!(fs.page_cache_stats().1, 0);
 
     // Filesystem must still be responsive: stat the file, create another.
@@ -792,23 +778,20 @@ fn read_during_eviction() {
     // Also insert matching pages into the page cache.
     let inode_id = fs.stat("/data").expect("stat").inode_id;
     let key = PageKey::new(inode_id, 0, 4096);
-    {
-        let mut cache = fs.page_cache_mut();
+    with_page_cache(&fs, |cache| {
         let mut page_data = vec![0u8; 4096];
         let copy_len = payload.len().min(4096);
         page_data[..copy_len].copy_from_slice(&payload[..copy_len]);
         cache.insert(key, CachedPage::new(page_data, copy_len));
-    }
+    });
     assert_eq!(fs.page_cache_stats().1, 1, "page should be in cache");
 
     // Evict the page from cache.
-    {
-        let mut cache = fs.page_cache_mut();
-        let dt = fs.dirty_page_tracker_mut();
-        let mut reclaimer = testing_reclaimer(&mut cache, &dt);
+    with_page_cache_and_dirty_tracker(&fs, |cache, dt| {
+        let mut reclaimer = testing_reclaimer(cache, dt);
         let evicted = reclaimer.evict_lru(1);
         assert_eq!(evicted, 1, "page should be evicted from cache");
-    }
+    });
     assert_eq!(fs.page_cache_stats().1, 0, "cache should be empty");
 
     // Read must still return correct data from the object store.
@@ -840,24 +823,21 @@ fn write_during_eviction() {
     // in-flight dirty page from the write path).
     let inode_id = fs.stat("/dirty_write").expect("stat").inode_id;
     let key = PageKey::new(inode_id, 0, 4096);
-    {
-        let mut cache = fs.page_cache_mut();
+    with_page_cache(&fs, |cache| {
         let mut page_data = vec![0u8; 4096];
         let copy_len = payload.len().min(4096);
         page_data[..copy_len].copy_from_slice(&payload[..copy_len]);
         cache.insert(key, CachedPage::new(page_data, copy_len));
-    }
-    fs.dirty_page_tracker_mut().mark_dirty(key);
+    });
+    mark_page_dirty(&fs, key);
     assert_eq!(fs.page_cache_stats().1, 1);
 
     // Trigger reclaim — the dirty page must survive.
-    {
-        let mut cache = fs.page_cache_mut();
-        let dt = fs.dirty_page_tracker_mut();
-        let mut reclaimer = testing_reclaimer(&mut cache, &dt);
+    with_page_cache_and_dirty_tracker(&fs, |cache, dt| {
+        let mut reclaimer = testing_reclaimer(cache, dt);
         let evicted = reclaimer.evict_lru(1);
         assert_eq!(evicted, 0, "dirty page must not be evicted during write");
-    }
+    });
     assert_eq!(fs.page_cache_stats().1, 1, "dirty page still in cache");
 
     // Object-store read must still work.
@@ -888,41 +868,38 @@ fn reclaim_stats_track_dirty_skips() {
         .map(|i| PageKey::new(inode_id, i * 4096, 4096))
         .collect();
 
-    {
-        let mut cache = fs.page_cache_mut();
+    with_page_cache(&fs, |cache| {
         for &key in &keys {
             cache.insert(key, CachedPage::new(fill_page(0x99), 4096));
         }
-    }
+    });
 
     // Mark exactly 2 pages dirty: keys at indices 1 and 4.
-    fs.dirty_page_tracker_mut().mark_dirty(keys[1]);
-    fs.dirty_page_tracker_mut().mark_dirty(keys[4]);
+    mark_page_dirty(&fs, keys[1]);
+    mark_page_dirty(&fs, keys[4]);
 
     assert_eq!(fs.page_cache_stats().1, 6);
 
     // Evict up to 6 pages — should evict 4 clean, skip 2 dirty.
-    let (evicted, skipped) = {
-        let mut cache = fs.page_cache_mut();
-        let dt = fs.dirty_page_tracker_mut();
-        let mut reclaimer = testing_reclaimer(&mut cache, &dt);
+    let (evicted, skipped) = with_page_cache_and_dirty_tracker(&fs, |cache, dt| {
+        let mut reclaimer = testing_reclaimer(cache, dt);
         let n = reclaimer.evict_lru(6);
         (n, reclaimer.stats.pages_skipped_dirty)
-    };
+    });
 
     assert_eq!(evicted, 4, "four clean pages evicted");
     assert_eq!(skipped, 2, "exactly two dirty pages skipped");
 
     // Only the 2 dirty pages should remain.
     assert_eq!(fs.page_cache_stats().1, 2);
-    assert!(fs.page_cache_mut().get(&keys[1]).is_some());
-    assert!(fs.page_cache_mut().get(&keys[4]).is_some());
+    assert!(page_is_cached(&fs, &keys[1]));
+    assert!(page_is_cached(&fs, &keys[4]));
 
     // Clean pages gone.
-    assert!(fs.page_cache_mut().get(&keys[0]).is_none());
-    assert!(fs.page_cache_mut().get(&keys[2]).is_none());
-    assert!(fs.page_cache_mut().get(&keys[3]).is_none());
-    assert!(fs.page_cache_mut().get(&keys[5]).is_none());
+    assert!(!page_is_cached(&fs, &keys[0]));
+    assert!(!page_is_cached(&fs, &keys[2]));
+    assert!(!page_is_cached(&fs, &keys[3]));
+    assert!(!page_is_cached(&fs, &keys[5]));
 }
 
 // ── test 16: hard limit enforced ──────────────────────────────────
@@ -949,14 +926,16 @@ fn hard_limit_enforced() {
 
     for &key in &keys {
         let page = CachedPage::new(fill_page(0xBB), 4096);
-        let _old = fs.insert_page_and_maybe_reclaim(key, page);
+        let _old = fs
+            .insert_page_and_maybe_reclaim(key, page)
+            .expect("page-cache insertion must be admitted");
         // Default watermarks are 256 MiB — no reclaim triggered here.
     }
     assert_eq!(fs.page_cache_stats().1, 18, "18 pages resident");
 
     // Mark last 2 pages dirty to act as an eviction floor.
     for key in &keys[16..] {
-        fs.dirty_page_tracker_mut().mark_dirty(*key);
+        mark_page_dirty(&fs, *key);
     }
 
     let page_overhead: u64 = 4096 + 64; // data + struct overhead
@@ -965,18 +944,16 @@ fn hard_limit_enforced() {
     let high_bytes = 8 * page_overhead;
     let low_bytes = 4 * page_overhead;
 
-    let evicted = {
-        let mut cache = fs.page_cache_mut();
-        let dt = fs.dirty_page_tracker_mut();
+    let evicted = with_page_cache_and_dirty_tracker(&fs, |cache, dt| {
         let wm = ReclaimWatermarks::new(high_bytes, low_bytes);
-        let mut reclaimer = PageCacheReclaimer::new(&mut cache, &dt, wm);
+        let mut reclaimer = PageCacheReclaimer::new(cache, dt, wm);
 
         assert!(
             reclaimer.above_high_watermark(),
             "18 pages exceed 8-page high watermark"
         );
         reclaimer.evict_to_low_watermark()
-    };
+    });
 
     assert!(evicted > 0, "pages should be evicted");
     assert!(
@@ -1015,36 +992,37 @@ fn per_inode_dirty_count() {
     // Inode 1: 2 dirty pages.
     let k1a = PageKey::new(ino1.inode_id, 0, 4096);
     let k1b = PageKey::new(ino1.inode_id, 4096, 4096);
-    fs.dirty_page_tracker_mut().mark_dirty(k1a);
-    fs.dirty_page_tracker_mut().mark_dirty(k1b);
+    mark_page_dirty(&fs, k1a);
+    mark_page_dirty(&fs, k1b);
 
     // Inode 2: 3 dirty pages.
     let k2a = PageKey::new(ino2.inode_id, 0, 4096);
     let k2b = PageKey::new(ino2.inode_id, 4096, 4096);
     let k2c = PageKey::new(ino2.inode_id, 8192, 4096);
-    fs.dirty_page_tracker_mut().mark_dirty(k2a);
-    fs.dirty_page_tracker_mut().mark_dirty(k2b);
-    fs.dirty_page_tracker_mut().mark_dirty(k2c);
+    mark_page_dirty(&fs, k2a);
+    mark_page_dirty(&fs, k2b);
+    mark_page_dirty(&fs, k2c);
 
     // Inode 3: 0 dirty pages.
 
-    let dt = fs.dirty_page_tracker_mut();
-    assert_eq!(
-        dt.per_inode_dirty_count(ino1.inode_id),
-        2,
-        "inode 1 should have 2 dirty pages"
-    );
-    assert_eq!(
-        dt.per_inode_dirty_count(ino2.inode_id),
-        3,
-        "inode 2 should have 3 dirty pages"
-    );
-    assert_eq!(
-        dt.per_inode_dirty_count(ino3.inode_id),
-        0,
-        "inode 3 should have 0 dirty pages"
-    );
-    assert_eq!(dt.dirty_page_count(), 5, "total 5 dirty pages");
+    with_dirty_page_tracker(&fs, |dt| {
+        assert_eq!(
+            dt.per_inode_dirty_count(ino1.inode_id),
+            2,
+            "inode 1 should have 2 dirty pages"
+        );
+        assert_eq!(
+            dt.per_inode_dirty_count(ino2.inode_id),
+            3,
+            "inode 2 should have 3 dirty pages"
+        );
+        assert_eq!(
+            dt.per_inode_dirty_count(ino3.inode_id),
+            0,
+            "inode 3 should have 0 dirty pages"
+        );
+        assert_eq!(dt.dirty_page_count(), 5, "total 5 dirty pages");
+    });
 }
 
 // ── test 18: all-dirty pages block eviction ───────────────────────
@@ -1067,29 +1045,26 @@ fn full_lru_walk_stops_on_all_dirty() {
         .map(|i| PageKey::new(inode_id, i * 4096, 4096))
         .collect();
 
-    {
-        let mut cache = fs.page_cache_mut();
+    with_page_cache(&fs, |cache| {
         for &key in &keys {
             cache.insert(key, CachedPage::new(fill_page(0xDD), 4096));
         }
-    }
+    });
 
     // Mark every page dirty.
     for &key in &keys {
-        fs.dirty_page_tracker_mut().mark_dirty(key);
+        mark_page_dirty(&fs, key);
     }
     assert_eq!(fs.page_cache_stats().1, 8);
 
     // Reclaim must evict nothing and skip all 8 pages.
-    let (evicted, skipped) = {
-        let mut cache = fs.page_cache_mut();
-        let dt = fs.dirty_page_tracker_mut();
+    let (evicted, skipped) = with_page_cache_and_dirty_tracker(&fs, |cache, dt| {
         // Tiny watermarks force eviction attempt.
         let wm = ReclaimWatermarks::new(512, 256);
-        let mut reclaimer = PageCacheReclaimer::new(&mut cache, &dt, wm);
+        let mut reclaimer = PageCacheReclaimer::new(cache, dt, wm);
         let n = reclaimer.evict_to_low_watermark();
         (n, reclaimer.stats.pages_skipped_dirty)
-    };
+    });
 
     assert_eq!(evicted, 0, "no pages evicted when all are dirty");
     assert_eq!(skipped, 8, "all 8 dirty pages should be skipped");
@@ -1098,7 +1073,7 @@ fn full_lru_walk_stops_on_all_dirty() {
     assert_eq!(fs.page_cache_stats().1, 8);
     for key in &keys {
         assert!(
-            fs.page_cache_mut().get(key).is_some(),
+            page_is_cached(&fs, key),
             "every dirty page must remain after reclaim attempt"
         );
     }

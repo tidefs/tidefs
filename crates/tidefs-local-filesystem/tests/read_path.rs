@@ -902,45 +902,6 @@ fn concurrent_reads_disjoint_ranges() {
     });
 }
 
-// ── Read-ahead hint ────────────────────────────────────────────────────
-
-#[test]
-fn read_ahead_hint_populates_for_sequential_read() {
-    set_test_key();
-    let dir = temp_dir("readahead");
-    let payload = make_data(0xEE, 32768); // 32 KiB
-
-    let mut fs = open_fs(&dir);
-    fs.create_file("/ahead.bin", DEFAULT_FILE_PERMISSIONS)
-        .expect("create");
-    fs.write_file("/ahead.bin", 0, &payload).expect("write");
-    fs.sync_all().expect("sync");
-
-    // Read the first page; a read-ahead hint should pre-populate the
-    // next page in cache. We verify by reading the second page and
-    // checking that the hot_read_cache reports at least one hit.
-    let _first = fs
-        .read_file_range("/ahead.bin", 0, 4096)
-        .expect("read first page");
-
-    // The preflight report before read-ahead may be zero or non-zero.
-    // After the first read, subsequent read of the next page should
-    // be fast (cache-assisted), and we can check the cache report.
-    let report_before = fs.hot_read_cache_report();
-
-    let _second = fs
-        .read_file_range("/ahead.bin", 4096, 4096)
-        .expect("read second page");
-
-    let report_after = fs.hot_read_cache_report();
-    // Cache should have been populated: either hits increased or
-    // total access count grew.
-    assert!(
-        (report_after.hits + report_after.misses) >= (report_before.hits + report_before.misses),
-        "read-ahead should populate cache"
-    );
-}
-
 // ── Error handling: directory as file ─────────────────────────────────
 
 #[test]
@@ -1281,44 +1242,6 @@ fn concurrent_reads_same_range() {
             h.join().unwrap();
         }
     });
-}
-
-// ── Read hot cache consistency ────────────────────────────────────────
-
-#[test]
-fn repeated_read_of_same_range_hits_hot_cache() {
-    set_test_key();
-    let dir = temp_dir("hotcache");
-    let payload = make_data(0xDD, 8192);
-
-    let mut fs = open_fs(&dir);
-    fs.create_file("/cached.bin", DEFAULT_FILE_PERMISSIONS)
-        .expect("create");
-    fs.write_file("/cached.bin", 0, &payload).expect("write");
-    fs.sync_all().expect("sync");
-
-    // First read: cold cache
-    let _cold_before = fs.hot_read_cache_report();
-    let first = fs
-        .read_file_range("/cached.bin", 0, 4096)
-        .expect("first read");
-    assert_eq!(&first[..], &payload[..4096]);
-
-    // Second read of same range: should be served from hot cache
-    let warm_before = fs.hot_read_cache_report();
-    let second = fs
-        .read_file_range("/cached.bin", 0, 4096)
-        .expect("second read");
-    assert_eq!(&second[..], &payload[..4096]);
-
-    let warm_after = fs.hot_read_cache_report();
-    // At least one of hits or total accesses grew
-    let accesses_before = warm_before.hits + warm_before.misses;
-    let accesses_after = warm_after.hits + warm_after.misses;
-    assert!(
-        accesses_after >= accesses_before,
-        "cache report should reflect additional access"
-    );
 }
 
 // ── Read spanning many chunks ─────────────────────────────────────────

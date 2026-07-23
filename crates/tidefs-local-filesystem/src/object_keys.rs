@@ -3,8 +3,8 @@ use tidefs_local_object_store::ObjectKey;
 use tidefs_types_vfs_core::InodeId;
 
 use crate::constants::*;
-pub fn superblock_object_key() -> ObjectKey {
-    ObjectKey::from_name(FILESYSTEM_SUPERBLOCK_OBJECT_NAME)
+pub(crate) fn retired_v0390_fixed_superblock_object_key() -> ObjectKey {
+    ObjectKey::from_name(RETIRED_V0390_FIXED_SUPERBLOCK_OBJECT_NAME)
 }
 
 pub fn dataset_catalog_object_key() -> ObjectKey {
@@ -25,13 +25,6 @@ pub fn inode_object_key(inode_id: InodeId) -> ObjectKey {
 pub fn directory_object_key(inode_id: InodeId) -> ObjectKey {
     ObjectKey::from_name(format!(
         "{FILESYSTEM_DIRECTORY_OBJECT_PREFIX}/{:016x}",
-        inode_id.get()
-    ))
-}
-
-pub fn content_object_key(inode_id: InodeId) -> ObjectKey {
-    ObjectKey::from_name(format!(
-        "{FILESYSTEM_CONTENT_OBJECT_PREFIX}/{:016x}",
         inode_id.get()
     ))
 }

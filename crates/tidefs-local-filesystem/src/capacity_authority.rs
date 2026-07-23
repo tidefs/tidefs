@@ -268,7 +268,7 @@ impl CapacityAuthority {
 
     /// Refresh the committed accounting mirror without changing the local
     /// transient reservation ledger.
-    pub fn refresh_committed_accounting(
+    pub(crate) fn refresh_committed_accounting(
         &self,
         accounting: &SpaceAccounting,
         pool: PoolPhysicalCountersV1,
@@ -290,7 +290,7 @@ impl CapacityAuthority {
 
     /// Refresh the committed accounting mirror after a commit boundary and
     /// clear transient bytes that are now part of committed counters.
-    pub fn refresh_committed_accounting_after_commit(
+    pub(crate) fn refresh_committed_accounting_after_commit(
         &self,
         accounting: &SpaceAccounting,
         pool: PoolPhysicalCountersV1,
@@ -301,7 +301,8 @@ impl CapacityAuthority {
     }
 
     /// Set the root-reserve byte count.
-    pub fn set_root_reserve_bytes(&self, bytes: u64) {
+    #[cfg(test)]
+    pub(crate) fn set_root_reserve_bytes(&self, bytes: u64) {
         self.root_reserve_bytes.store(bytes, Ordering::Release);
     }
 
@@ -309,7 +310,8 @@ impl CapacityAuthority {
     ///
     /// Called when the allocator policy is resized so statfs-derived
     /// block counts reflect the new configured ceiling.
-    pub fn set_total_bytes(&self, bytes: u64) {
+    #[cfg(test)]
+    pub(crate) fn set_total_bytes(&self, bytes: u64) {
         self.total_bytes.store(bytes, Ordering::Release);
         let mut accounting = self
             .committed_accounting
@@ -322,13 +324,14 @@ impl CapacityAuthority {
     // ── Block accounting ────────────────────────────────────────────
 
     /// Record a committed allocation of `bytes` bytes.
-    pub fn record_allocation(&self, bytes: u64) {
+    #[cfg(test)]
+    pub(crate) fn record_allocation(&self, bytes: u64) {
         self.used_bytes.fetch_add(bytes, Ordering::Release);
         self.pending_bytes.fetch_add(bytes, Ordering::Release);
     }
 
     /// Record the freeing of `bytes` bytes from committed state.
-    pub fn record_free(&self, bytes: u64) {
+    pub(crate) fn record_free(&self, bytes: u64) {
         self.used_bytes
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                 Some(used.saturating_sub(bytes))
@@ -354,7 +357,7 @@ impl CapacityAuthority {
     /// [`CapacityReservationHandle::release`] on failure. This replaces the
     /// former fragmented reservation paths in `SpaceAccounting` and
     /// `BlockAllocator::QuotaTable`.
-    pub fn reserve(&self, bytes: u64) -> Result<CapacityReservationHandle, Errno> {
+    pub(crate) fn reserve(&self, bytes: u64) -> Result<CapacityReservationHandle, Errno> {
         if bytes == 0 {
             return Ok(CapacityReservationHandle {
                 authority: self,
@@ -375,7 +378,7 @@ impl CapacityAuthority {
     /// content. Admission checks only the net new bytes, while the full
     /// reservation stays held until the rewrite commits and releases the
     /// replaced content.
-    pub fn reserve_with_replacement_credit(
+    pub(crate) fn reserve_with_replacement_credit(
         &self,
         bytes: u64,
         replacement_credit_bytes: u64,
@@ -448,13 +451,13 @@ impl CapacityAuthority {
 
     /// Record pending bytes in the write pipeline.
     #[cfg(test)]
-    pub fn record_pending(&self, bytes: u64) {
+    pub(crate) fn record_pending(&self, bytes: u64) {
         self.pending_bytes.fetch_add(bytes, Ordering::Release);
     }
 
     /// Clear pending bytes after they have been resolved.
     #[cfg(test)]
-    pub fn clear_pending(&self, bytes: u64) {
+    pub(crate) fn clear_pending(&self, bytes: u64) {
         self.pending_bytes
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |p| {
                 Some(p.saturating_sub(bytes))

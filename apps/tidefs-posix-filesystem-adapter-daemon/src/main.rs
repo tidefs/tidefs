@@ -512,7 +512,8 @@ fn mount_vfs(config: MountVfsConfig) -> Result<(), String> {
             open_config,
         )
         .map_err(|e| format!("open store: {e}"))?;
-        lfs.set_write_buffer_flush_threshold_bytes(MOUNT_VFS_WRITE_BUFFER_FLUSH_THRESHOLD_BYTES);
+        lfs.set_write_buffer_flush_threshold_bytes(MOUNT_VFS_WRITE_BUFFER_FLUSH_THRESHOLD_BYTES)
+            .map_err(|e| format!("set mounted write-buffer threshold: {e}"))?;
 
         // Enable org.tidefs:dedup dataset feature when requested by the operator.
         if config.enable_dedup {
@@ -520,11 +521,13 @@ fn mount_vfs(config: MountVfsConfig) -> Result<(), String> {
             let dedup_name = FeatureName::from_str("org.tidefs:dedup")
                 .expect("org.tidefs:dedup is a valid FeatureName");
             lfs.feature_flags_mut()
+                .map_err(|e| format!("access dedup feature flags: {e}"))?
                 .enable_feature(dedup_name, FeatureClass::RoCompat)
                 .map_err(|e| format!("enable dedup feature: {e}"))?;
             lfs.persist_feature_flags()
                 .map_err(|e| format!("persist dedup feature flag: {e}"))?;
-            lfs.refresh_policies_from_features();
+            lfs.refresh_policies_from_features()
+                .map_err(|e| format!("refresh mounted feature policies: {e}"))?;
         }
 
         // ── Committed-root validation ──────────────────────────────────────
@@ -578,11 +581,16 @@ fn mount_vfs(config: MountVfsConfig) -> Result<(), String> {
         // Mounted FUSE uses commit-group batching for ordinary metadata writes.
         // Keep the threshold large enough for metadata bursts while fsync, fsyncdir,
         // syncfs, and destroy still force the durability barrier.
-        lfs.set_auto_commit(false);
-        lfs.set_commit_group_throughput_profile();
-        lfs.set_max_uncommitted_mutations(MOUNT_VFS_MAX_UNCOMMITTED_MUTATIONS);
+        lfs.set_auto_commit(false)
+            .map_err(|e| format!("set mounted auto-commit policy: {e}"))?;
+        lfs.set_commit_group_throughput_profile()
+            .map_err(|e| format!("set mounted commit-group profile: {e}"))?;
+        lfs.set_max_uncommitted_mutations(MOUNT_VFS_MAX_UNCOMMITTED_MUTATIONS)
+            .map_err(|e| format!("set mounted mutation threshold: {e}"))?;
 
-        let writeback_tracker = std::sync::Arc::clone(lfs.writeback_range_tracker());
+        let writeback_tracker = lfs
+            .clone_writeback_range_tracker()
+            .map_err(|e| format!("attach mounted writeback tracker: {e}"))?;
         (
             VfsLocalFileSystem::new(lfs).with_sync_guarantee(effective_sync_guarantee),
             Some(writeback_tracker),
@@ -599,7 +607,9 @@ fn mount_vfs(config: MountVfsConfig) -> Result<(), String> {
             crate::mount_options::TimestampPolicy::NoAtime => EngineTimestampPolicy::Noatime,
         }
     };
-    vfs_engine.set_timestamp_policy(engine_timestamp_policy);
+    vfs_engine
+        .set_timestamp_policy(engine_timestamp_policy)
+        .map_err(|e| format!("set mounted timestamp policy: {e}"))?;
     if effective_mode.read_only {
         vfs_engine = vfs_engine.with_read_only();
     }

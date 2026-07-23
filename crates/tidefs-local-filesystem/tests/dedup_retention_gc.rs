@@ -56,7 +56,8 @@ fn canonical_object_retained_while_any_file_references_it() {
     // canonical chunk object; the second produces a dedup redirect.
     {
         let mut fs = open_fs(&dir);
-        fs.set_dedup_enabled(true);
+        fs.set_dedup_enabled(true)
+            .expect("test setup mutation must be admitted");
 
         fs.create_file("/a.bin", DEFAULT_FILE_PERMISSIONS)
             .expect("create a");
@@ -109,7 +110,8 @@ fn canonical_object_reclaimed_after_all_files_deleted() {
     // Write content with dedup enabled, creating a canonical object.
     {
         let mut fs = open_fs(&dir);
-        fs.set_dedup_enabled(true);
+        fs.set_dedup_enabled(true)
+            .expect("test setup mutation must be admitted");
 
         fs.create_file("/only.bin", DEFAULT_FILE_PERMISSIONS)
             .expect("create");
@@ -137,7 +139,8 @@ fn canonical_object_reclaimed_after_all_files_deleted() {
         fs.unlink("/only.bin").expect("unlink");
         fs.sync_all().expect("sync");
         // Drive reclaim drain.
-        fs.tick_background_services();
+        fs.tick_background_services()
+            .expect("tick background services");
     }
 
     // Reopen with dedup enabled and write the same content again.
@@ -147,7 +150,8 @@ fn canonical_object_reclaimed_after_all_files_deleted() {
     // and a new canonical object is created.
     {
         let mut fs = open_fs(&dir);
-        fs.set_dedup_enabled(true);
+        fs.set_dedup_enabled(true)
+            .expect("test setup mutation must be admitted");
 
         fs.create_file("/again.bin", DEFAULT_FILE_PERMISSIONS)
             .expect("create again");
@@ -185,7 +189,8 @@ fn dedup_redirects_resolve_after_reopen() {
     // Write two identical files with dedup enabled.
     {
         let mut fs = open_fs(&dir);
-        fs.set_dedup_enabled(true);
+        fs.set_dedup_enabled(true)
+            .expect("test setup mutation must be admitted");
         fs.create_file("/first.bin", DEFAULT_FILE_PERMISSIONS)
             .unwrap();
         fs.write_file("/first.bin", 0, &payload).unwrap();

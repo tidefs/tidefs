@@ -2,26 +2,18 @@
 use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::ops::Bound::{Excluded, Included, Unbounded};
-use std::time::Duration;
 
-/// Configuration for write-buffer coalescing thresholds.
+/// Configuration for the write-buffer coalescing byte threshold.
 #[derive(Debug, Clone)]
 pub struct WriteBufferConfig {
     /// Flush foreground writes when total accumulated dirty bytes reaches this limit.
     pub flush_threshold_bytes: usize,
-    /// Age threshold for background/tick-driven dirty epoch sealing.
-    ///
-    /// The foreground write path deliberately does not synchronously flush
-    /// just because this age elapsed; doing so turns slow mmap writeback into
-    /// tiny object-store rewrites.
-    pub flush_threshold_age: Duration,
 }
 
 impl Default for WriteBufferConfig {
     fn default() -> Self {
         Self {
             flush_threshold_bytes: 8 * 1024 * 1024,
-            flush_threshold_age: Duration::from_millis(32),
         }
     }
 }
@@ -31,8 +23,7 @@ impl Default for WriteBufferConfig {
 /// Accumulates small sequential writes and flushes them in fewer,
 /// larger object-store operations when a foreground byte-count threshold
 /// is crossed. Read-your-writes is preserved by serving dirty segments
-/// directly. The age threshold remains available for background/tick
-/// scheduling, but foreground writes do not enforce it synchronously.
+/// directly.
 #[derive(Debug, Clone)]
 pub struct WriteBuffer {
     config: WriteBufferConfig,
@@ -472,15 +463,13 @@ mod tests {
     fn test_config() -> WriteBufferConfig {
         WriteBufferConfig {
             flush_threshold_bytes: 1024,
-            flush_threshold_age: Duration::from_millis(50),
         }
     }
 
     #[test]
-    fn default_thresholds_match_writeback_batch_policy() {
+    fn default_threshold_matches_writeback_batch_policy() {
         let config = WriteBufferConfig::default();
         assert_eq!(config.flush_threshold_bytes, 8 * 1024 * 1024);
-        assert_eq!(config.flush_threshold_age, Duration::from_millis(32));
     }
 
     #[test]
@@ -545,7 +534,6 @@ mod tests {
     fn fragmented_sparse_writes_remain_sparse_and_ordered() {
         let mut wb = WriteBuffer::new(WriteBufferConfig {
             flush_threshold_bytes: 8 * 1024 * 1024,
-            flush_threshold_age: Duration::from_millis(50),
         });
         let segment_count = 4096usize;
         let segment_len = 512usize;
@@ -641,7 +629,6 @@ mod tests {
     fn sparse_markers_merge_with_full_page_writeback() {
         let mut wb = WriteBuffer::new(WriteBufferConfig {
             flush_threshold_bytes: 128 * 1024,
-            flush_threshold_age: Duration::from_millis(50),
         });
         let page_size = 4096usize;
         let pages = 4usize;
@@ -685,7 +672,6 @@ mod tests {
     fn batch_drain_leaves_future_sparse_markers_buffered() {
         let mut wb = WriteBuffer::new(WriteBufferConfig {
             flush_threshold_bytes: 8192,
-            flush_threshold_age: Duration::from_millis(50),
         });
         let page_size = 4096usize;
         let pwrite_offset = 1024usize;
@@ -717,7 +703,6 @@ mod tests {
     fn batch_drain_splits_large_segment_at_threshold() {
         let mut wb = WriteBuffer::new(WriteBufferConfig {
             flush_threshold_bytes: 4,
-            flush_threshold_age: Duration::from_millis(50),
         });
 
         wb.ingest(b"abcdefghij", 0);
@@ -729,25 +714,8 @@ mod tests {
     }
 
     #[test]
-    fn age_threshold_does_not_trigger_foreground_flush() {
-        let config = WriteBufferConfig {
-            flush_threshold_bytes: 1024 * 1024,
-            flush_threshold_age: Duration::from_millis(1),
-        };
-        let mut wb = WriteBuffer::new(config);
-        wb.ingest(b"tiny", 0);
-        std::thread::sleep(Duration::from_millis(2));
-        assert!(!wb.should_flush());
-    }
-
-    #[test]
-    fn empty_buffer_never_triggers_age_flush() {
-        let config = WriteBufferConfig {
-            flush_threshold_bytes: 1024,
-            flush_threshold_age: Duration::from_millis(1),
-        };
-        let wb = WriteBuffer::new(config);
-        std::thread::sleep(Duration::from_millis(2));
+    fn empty_buffer_never_needs_flush() {
+        let wb = WriteBuffer::new(test_config());
         assert!(!wb.should_flush());
     }
 
@@ -785,15 +753,10 @@ mod tests {
     }
 
     #[test]
-    fn truncate_to_empty_clears_age_state() {
-        let config = WriteBufferConfig {
-            flush_threshold_bytes: 1024,
-            flush_threshold_age: Duration::from_millis(1),
-        };
-        let mut wb = WriteBuffer::new(config);
+    fn truncate_to_empty_clears_buffer() {
+        let mut wb = WriteBuffer::new(test_config());
         wb.ingest(b"dirty", 0);
         wb.truncate(0);
-        std::thread::sleep(Duration::from_millis(2));
         assert!(wb.is_empty());
         assert!(!wb.should_flush());
     }
@@ -878,7 +841,6 @@ mod tests {
     fn sequential_full_page_writeback_extends_one_segment() {
         let mut wb = WriteBuffer::new(WriteBufferConfig {
             flush_threshold_bytes: 8 * 1024 * 1024,
-            flush_threshold_age: Duration::from_millis(50),
         });
         let page_size = 4096usize;
         let page_count = 1536usize;

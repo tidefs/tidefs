@@ -84,6 +84,14 @@ pub struct PersistentNamespaceRoot {
 // ---------------------------------------------------------------------------
 
 pub trait PersistentInodeStore: Send + Sync {
+    /// Refuse a namespace mutation before validation or no-op handling.
+    ///
+    /// In-memory stores accept mutations by default. Mounted stores override
+    /// this hook to propagate their typed reopen-required fence.
+    fn ensure_mutation_allowed(&self, _operation: &'static str) -> Result<(), NamespaceError> {
+        Ok(())
+    }
+
     fn dataset_identity(&self) -> NamespaceDatasetIdentity {
         NamespaceDatasetIdentity::default()
     }
@@ -101,6 +109,7 @@ pub trait PersistentInodeStore: Send + Sync {
         identity: &NamespaceDatasetIdentity,
         attrs: &InodeAttributes,
     ) -> Result<PersistentNamespaceRoot, NamespaceError> {
+        self.ensure_mutation_allowed("initialize persistent namespace root")?;
         self.verify_dataset_identity(identity)?;
         let (root_inode, generation) = self.alloc_inode(attrs)?;
         Ok(PersistentNamespaceRoot {
@@ -115,6 +124,7 @@ pub trait PersistentInodeStore: Send + Sync {
         identity: &NamespaceDatasetIdentity,
         attrs: &InodeAttributes,
     ) -> Result<PersistentNamespaceRoot, NamespaceError> {
+        self.ensure_mutation_allowed("ensure persistent namespace root")?;
         match self.namespace_root()? {
             Some(root) if root.identity == *identity => Ok(root),
             Some(root) => Err(NamespaceError::DatasetIdentityMismatch {
@@ -146,6 +156,7 @@ pub trait PersistentInodeStore: Send + Sync {
         identity: &NamespaceDatasetIdentity,
         attrs: &InodeAttributes,
     ) -> Result<(Inode, u64), NamespaceError> {
+        self.ensure_mutation_allowed("allocate persistent namespace inode")?;
         self.verify_dataset_identity(identity)?;
         self.alloc_inode(attrs)
     }
@@ -162,6 +173,14 @@ pub trait PersistentInodeStore: Send + Sync {
 // ---------------------------------------------------------------------------
 
 pub trait PersistentDirectoryStore: Send + Sync {
+    /// Refuse a namespace mutation before validation or no-op handling.
+    ///
+    /// In-memory stores accept mutations by default. Mounted stores override
+    /// this hook to propagate their typed reopen-required fence.
+    fn ensure_mutation_allowed(&self, _operation: &'static str) -> Result<(), NamespaceError> {
+        Ok(())
+    }
+
     fn dataset_identity(&self) -> NamespaceDatasetIdentity {
         NamespaceDatasetIdentity::default()
     }
@@ -226,6 +245,7 @@ pub trait PersistentDirectoryStore: Send + Sync {
         generation: u64,
         kind: u32,
     ) -> Result<(), NamespaceError> {
+        self.ensure_mutation_allowed("insert persistent namespace directory entry")?;
         self.verify_dataset_identity(identity)?;
         self.insert(parent, name, inode_id, generation, kind)
     }
@@ -237,6 +257,7 @@ pub trait PersistentDirectoryStore: Send + Sync {
         parent: Inode,
         name: &[u8],
     ) -> Result<(), NamespaceError> {
+        self.ensure_mutation_allowed("remove persistent namespace directory entry")?;
         self.verify_dataset_identity(identity)?;
         self.remove(parent, name)
     }
@@ -283,6 +304,7 @@ pub trait PersistentDirectoryStore: Send + Sync {
         dst_name: &[u8],
         mode: PersistentSwapMode,
     ) -> Result<Option<(Inode, u64, u32)>, NamespaceError> {
+        self.ensure_mutation_allowed("atomically update persistent namespace entries")?;
         self.verify_dataset_identity(identity)?;
         self.atomic_swap(src_parent, src_name, dst_parent, dst_name, mode)
     }
@@ -293,6 +315,7 @@ pub trait PersistentDirectoryStore: Send + Sync {
         identity: &NamespaceDatasetIdentity,
         dir_inode: Inode,
     ) -> Result<(), NamespaceError> {
+        self.ensure_mutation_allowed("initialize persistent namespace directory")?;
         self.verify_dataset_identity(identity)?;
         self.init_dir(dir_inode)
     }

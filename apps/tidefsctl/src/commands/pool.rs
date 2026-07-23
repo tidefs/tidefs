@@ -1843,7 +1843,14 @@ fn handle_pool_set(pool: &str, devices: Option<&[PathBuf]>, assignment: &str) {
         props.set_local(key.clone(), value.clone());
     }
 
-    fs.pool_properties_mut().clone_from(&props);
+    let pool_properties = match fs.pool_properties_mut() {
+        Ok(properties) => properties,
+        Err(err) => {
+            eprintln!("tidefsctl pool set: filesystem mutation requires reopen: {err}");
+            process::exit(1);
+        }
+    };
+    pool_properties.clone_from(&props);
     if let Err(e) = fs.persist_pool_properties() {
         eprintln!("tidefsctl pool set: property set but persist failed: {e}");
         process::exit(1);

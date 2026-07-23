@@ -33,6 +33,13 @@ use crate::LocalFileSystem;
 /// Broader recovery/fsync/writeback/mmap authority remains tracked by
 /// TFR-008.
 pub trait DirtyFlush {
+    /// Refuse a mounted mutation before handle, inode-kind, or no-op checks.
+    ///
+    /// Generic and test-only flush implementations accept by default.
+    fn mutation_preflight(&self, _operation: &'static str) -> Result<(), FsyncDispatchError> {
+        Ok(())
+    }
+
     /// Flush all dirty pages belonging to `inode_id`.
     ///
     /// When `datasync` is true, only data pages are flushed; metadata-only
@@ -142,6 +149,7 @@ pub fn dispatch_engine_fsync(
     fh: &EngineFileHandle,
     datasync: bool,
 ) -> Result<(), Errno> {
+    map_cache_error(dirty_flush.mutation_preflight("synchronize mounted file handle"))?;
     let state = validate_handle(table, fh)?;
     map_cache_error(dirty_flush.flush_inode(state.inode_id, datasync))
 }
@@ -161,6 +169,7 @@ pub fn dispatch_engine_flush(
     dirty_flush: &dyn DirtyFlush,
     fh: &EngineFileHandle,
 ) -> Result<(), Errno> {
+    map_cache_error(dirty_flush.mutation_preflight("flush mounted file handle"))?;
     let state = validate_handle(table, fh)?;
     map_cache_error(dirty_flush.flush_inode(state.inode_id, false))
 }
@@ -186,6 +195,7 @@ pub fn dispatch_engine_fsyncdir(
     kind: NodeKind,
     datasync: bool,
 ) -> Result<(), Errno> {
+    map_cache_error(dirty_flush.mutation_preflight("synchronize mounted directory handle"))?;
     let state = validate_handle(table, fh)?;
 
     if kind != NodeKind::Dir {
@@ -212,6 +222,7 @@ pub fn dispatch_namespace_fsync(
     inode_id: InodeId,
     datasync: bool,
 ) -> Result<(), Errno> {
+    map_cache_error(dirty_flush.mutation_preflight("synchronize mounted namespace inode"))?;
     map_cache_error(dirty_flush.flush_inode(inode_id, datasync))
 }
 
@@ -220,6 +231,7 @@ pub fn dispatch_namespace_fsync(
 /// Calls [`DirtyFlush::flush_all`] to write back all dirty pages across
 /// all inodes, then issues a filesystem-wide durability barrier.
 pub fn dispatch_syncfs(dirty_flush: &dyn DirtyFlush) -> Result<(), Errno> {
+    map_cache_error(dirty_flush.mutation_preflight("synchronize mounted filesystem"))?;
     map_cache_error(dirty_flush.flush_all())
 }
 
@@ -322,6 +334,13 @@ impl<'a> LocalFsDirtyFlush<'a> {
 }
 
 impl DirtyFlush for LocalFsDirtyFlush<'_> {
+    fn mutation_preflight(&self, operation: &'static str) -> Result<(), FsyncDispatchError> {
+        self.fs
+            .borrow()
+            .ensure_mutation_allowed(operation)
+            .map_err(|_| FsyncDispatchError::IoError)
+    }
+
     fn flush_inode(&self, inode_id: InodeId, datasync: bool) -> Result<(), FsyncDispatchError> {
         let result = if datasync {
             self.fs.borrow_mut().sync_inode_data_only(inode_id)
@@ -367,6 +386,35 @@ mod tests {
     fn register_test_handle(table: &RefCell<FileHandleTable>, inode: u64) -> EngineFileHandle {
         let inode_id = InodeId::new(inode);
         table.borrow_mut().register(inode_id, 0, false).unwrap()
+    }
+
+    #[test]
+    fn mounted_reopen_fence_precedes_sync_dispatch_validation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut fs = LocalFileSystem::open(dir.path()).expect("open filesystem");
+        fs.arm_mutation_reopen_fence();
+        let fs = RefCell::new(fs);
+        let dirty_flush = LocalFsDirtyFlush::new(&fs);
+        let table = RefCell::new(FileHandleTable::new());
+        let unknown = EngineFileHandle::new(InodeId::new(99), 0, FileHandleId::new(u64::MAX), 0);
+
+        assert_eq!(
+            dispatch_engine_fsync(&table, &dirty_flush, &unknown, false),
+            Err(Errno::EIO)
+        );
+        assert_eq!(
+            dispatch_engine_flush(&table, &dirty_flush, &unknown),
+            Err(Errno::EIO)
+        );
+        assert_eq!(
+            dispatch_engine_fsyncdir(&table, &dirty_flush, &unknown, NodeKind::File, false,),
+            Err(Errno::EIO)
+        );
+        assert_eq!(
+            dispatch_namespace_fsync(&dirty_flush, InodeId::new(99), false),
+            Err(Errno::EIO)
+        );
+        assert_eq!(dispatch_syncfs(&dirty_flush), Err(Errno::EIO));
     }
 
     // ── dispatch_engine_fsync tests ───────────────────────────────────────
@@ -704,7 +752,8 @@ mod tests {
         let data_c = b"third block at offset 128K";
         {
             let mut fs = crate::LocalFileSystem::open(&root).expect("open fs");
-            fs.set_auto_commit(false);
+            fs.set_auto_commit(false)
+                .expect("test setup mutation must be admitted");
             fs.create_file("/multi.bin", 0o644).expect("create file");
             fs.write_file("/multi.bin", 0, data_a).expect("write A");
             fs.write_file("/multi.bin", 65536, data_b).expect("write B");
@@ -742,7 +791,8 @@ mod tests {
         let full_data: Vec<u8> = (0..128u8).collect();
         {
             let mut fs = crate::LocalFileSystem::open(&root).expect("open fs");
-            fs.set_auto_commit(false);
+            fs.set_auto_commit(false)
+                .expect("test setup mutation must be admitted");
             fs.create_file("/trunc.bin", 0o644).expect("create file");
             fs.write_file("/trunc.bin", 0, &full_data)
                 .expect("write 128B");
@@ -794,7 +844,8 @@ mod tests {
         let data = b"instrumented fsync data";
         {
             let mut fs = crate::LocalFileSystem::open(&root).expect("open fs");
-            fs.set_auto_commit(false);
+            fs.set_auto_commit(false)
+                .expect("test setup mutation must be admitted");
             fs.create_file("/stats.bin", 0o644).expect("create file");
             fs.write_file("/stats.bin", 0, data).expect("write data");
 
@@ -824,7 +875,8 @@ mod tests {
         let data = b"fdatasync counter test";
         {
             let mut fs = crate::LocalFileSystem::open(&root).expect("open fs");
-            fs.set_auto_commit(false);
+            fs.set_auto_commit(false)
+                .expect("test setup mutation must be admitted");
             fs.create_file("/fdat.bin", 0o644).expect("create file");
             fs.write_file("/fdat.bin", 0, data).expect("write data");
 

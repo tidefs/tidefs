@@ -26,7 +26,7 @@ use tidefs_types_reclaim_queue_core::QueueFamily as ReclaimQueueFamily;
 use tidefs_types_reclaim_queue_core::ReclaimQueueEntry;
 use tidefs_types_vfs_core::InodeId;
 
-use crate::object_keys::{content_object_key, content_object_key_for_version};
+use crate::object_keys::content_object_key_for_version;
 use crate::Result;
 
 /// Statistics from a mount-time orphan cleanup pass.
@@ -68,8 +68,7 @@ impl OrphanCleanupStats {
 /// 3. Scan all directories for stale entries pointing to this inode and
 ///    remove them.
 /// 4. Free the extent map if present.
-/// 5. Delete content objects (legacy and per-version keys) from the object
-///    store.
+/// 5. Delete versioned content objects from the object store.
 /// 6. Remove the orphan index entry.
 ///
 /// Inodes with nlink > 0 that appear in the orphan index are inconsistent.
@@ -178,13 +177,7 @@ pub(crate) fn cleanup_orphans(
         }
         state.dirty_extent_maps.remove(&inode_id);
 
-        // 4. Delete content objects from the object store.
-        //    Legacy format key.
-        let legacy_key = content_object_key(inode_id);
-        if store.delete(legacy_key).unwrap_or(false) {
-            stats.content_objects_deleted += 1;
-        }
-        // Versioned content object keys.  Walk forward until we see
+        // 4. Delete versioned content objects from the object store. Walk forward until we see
         // two consecutive misses to avoid scanning u64::MAX versions.
         let mut misses = 0_u64;
         for dv in 0_u64.. {

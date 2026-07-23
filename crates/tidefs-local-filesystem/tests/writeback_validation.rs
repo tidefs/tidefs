@@ -32,7 +32,7 @@ use std::env;
 use std::fs;
 
 use tidefs_local_filesystem::{FileSystemError, LocalFileSystem, DEFAULT_FILE_PERMISSIONS};
-use tidefs_local_object_store::IntegrityDigest64;
+use tidefs_local_object_store::checksum64;
 
 // ── helpers ───────────────────────────────────────────────────────
 
@@ -144,7 +144,8 @@ fn fsync_barrier_durability() {
             .expect("create file");
 
         // Disable auto-commit so write_file does not immediately commit.
-        fs.set_auto_commit(false);
+        fs.set_auto_commit(false)
+            .expect("test setup mutation must be admitted");
 
         // Write and fsync pre-barrier data.
         fs.write_file("/barrier", 0, &pre_barrier)
@@ -547,13 +548,16 @@ fn page_cache_reclaim_preserves_dirty_pages() {
         use tidefs_local_filesystem::page_cache::{CachedPage, PageKey};
         let page_key = PageKey::new(inode.inode_id, 0, 4096);
         let page = CachedPage::new(payload.clone(), payload.len());
-        fs.insert_page_and_maybe_reclaim(page_key, page);
+        fs.insert_page_and_maybe_reclaim(page_key, page)
+            .expect("page-cache insertion must be admitted");
 
         // Now write the same data through the filesystem (dirties via tracker).
         fs.write_file("/dirty", 0, &payload).expect("write file");
 
         // Trigger reclaim — dirty pages should be preserved.
-        let evicted = fs.page_cache_maybe_reclaim();
+        let evicted = fs
+            .page_cache_maybe_reclaim()
+            .expect("page-cache reclaim must be admitted");
         assert_eq!(
             evicted, 0,
             "dirty pages must not be evicted (writeback-before-evict invariant)"
@@ -586,7 +590,9 @@ fn page_cache_evict_inode_skips_dirty_pages() {
 
         // The page is dirty — evict_inode should skip it.
         let inode_id = fs.stat("/evict").expect("stat").inode_id;
-        let evicted = fs.page_cache_evict_inode(inode_id);
+        let evicted = fs
+            .page_cache_evict_inode(inode_id)
+            .expect("inode page-cache eviction must be admitted");
         // Dirty pages are not evicted; this is the writeback-before-evict
         // invariant. If the implementation changes, this assertion will
         // catch regressions.
@@ -633,7 +639,8 @@ fn writeback_daemon_survives_uncommitted_inode_read_error() {
             .expect("create file");
 
         // Disable auto-commit so the inode stays in memory only.
-        fs.set_auto_commit(false);
+        fs.set_auto_commit(false)
+            .expect("test setup mutation must be admitted");
         fs.write_file("/gap", 0, &payload).expect("write file");
 
         // At this point the inode is not committed to the object store.
@@ -695,7 +702,7 @@ fn fsync_fast_path_preserves_intent_log_entries() {
         let rec = fs
             .create_file("/keep", DEFAULT_FILE_PERMISSIONS)
             .expect("create file");
-        let digest = IntegrityDigest64(0);
+        let digest = checksum64(&payload);
         fs.sync_write_intent(rec.inode_id, 0, payload.len() as u64, digest, &payload)
             .expect("sync_write_intent");
         assert!(
@@ -726,7 +733,7 @@ fn fdatasync_fast_path_preserves_intent_log_entries() {
         let rec = fs
             .create_file("/fdatakeep", DEFAULT_FILE_PERMISSIONS)
             .expect("create file");
-        let digest = IntegrityDigest64(0);
+        let digest = checksum64(&payload);
         fs.sync_write_intent(rec.inode_id, 0, payload.len() as u64, digest, &payload)
             .expect("sync_write_intent");
         assert!(
@@ -759,7 +766,7 @@ fn fsync_fast_path_data_survives_crash_reopen() {
         let rec = fs
             .create_file("/crashsave", DEFAULT_FILE_PERMISSIONS)
             .expect("create file");
-        let digest = IntegrityDigest64(0);
+        let digest = checksum64(&payload);
         fs.sync_write_intent(rec.inode_id, 0, payload.len() as u64, digest, &payload)
             .expect("sync_write_intent");
         assert!(
@@ -796,7 +803,7 @@ fn intent_log_cleared_after_full_commit() {
         let rec = fs
             .create_file("/commitme", DEFAULT_FILE_PERMISSIONS)
             .expect("create file");
-        let digest = IntegrityDigest64(0);
+        let digest = checksum64(&payload);
         fs.sync_write_intent(rec.inode_id, 0, payload.len() as u64, digest, &payload)
             .expect("sync_write_intent");
         assert!(

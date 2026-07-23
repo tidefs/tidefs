@@ -998,6 +998,7 @@ pub fn receive_vfssend2_snapshot_mutations(
     fs: &mut crate::LocalFileSystem,
     stream_bytes: &[u8],
 ) -> crate::Result<Vec<crate::SnapshotMutationApplyReport>> {
+    fs.ensure_mutation_allowed("receive VFSSEND2 snapshot mutations")?;
     let (_header, dataset) = receive_vfssend2_dataset(stream_bytes)?;
     let mut reports = Vec::with_capacity(dataset.snapshot_mutations.len());
     for mutation in &dataset.snapshot_mutations {

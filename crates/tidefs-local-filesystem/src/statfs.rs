@@ -240,7 +240,8 @@ mod tests {
                 ..Default::default()
             },
         );
-        fs.set_quota_hierarchy(hierarchy);
+        fs.set_quota_hierarchy(hierarchy)
+            .expect("test setup mutation must be admitted");
 
         let st = fs.statvfs().expect("statvfs");
 

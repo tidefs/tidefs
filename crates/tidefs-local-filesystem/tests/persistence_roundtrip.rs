@@ -585,7 +585,9 @@ mod dirty_clean_tracking {
     #[test]
     fn mutation_sets_dirty_commit_clears() {
         let mut h = PersistenceHarness::mount("dirty_clear");
-        h.fs_mut().set_auto_commit(false);
+        h.fs_mut()
+            .set_auto_commit(false)
+            .expect("test setup mutation must be admitted");
         // Commit any initial dirty state
         h.commit();
 
@@ -620,7 +622,9 @@ mod dirty_clean_tracking {
     #[test]
     fn dirty_state_does_not_survive_commit_across_remount() {
         let mut h = PersistenceHarness::mount("dirty_remount");
-        h.fs_mut().set_auto_commit(false);
+        h.fs_mut()
+            .set_auto_commit(false)
+            .expect("test setup mutation must be admitted");
 
         // Get to clean state
         h.commit();
@@ -648,7 +652,9 @@ mod dirty_clean_tracking {
     #[test]
     fn mkdir_sets_dirty_commit_clears() {
         let mut h = PersistenceHarness::mount("mkdir_dirty");
-        h.fs_mut().set_auto_commit(false);
+        h.fs_mut()
+            .set_auto_commit(false)
+            .expect("test setup mutation must be admitted");
         h.commit();
         assert!(!h.has_dirty_metadata());
 
@@ -670,7 +676,9 @@ mod dirty_clean_tracking {
     #[test]
     fn hard_link_sets_dirty() {
         let mut h = PersistenceHarness::mount("link_dirty");
-        h.fs_mut().set_auto_commit(false);
+        h.fs_mut()
+            .set_auto_commit(false)
+            .expect("test setup mutation must be admitted");
         h.create_file("/link_src.txt", DEFAULT_FILE_PERMISSIONS);
         h.commit();
         assert!(!h.has_dirty_metadata());

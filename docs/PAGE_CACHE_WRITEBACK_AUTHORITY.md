@@ -136,10 +136,10 @@ Current source reviewed:
 
 | Surface | Current source | Authority classification |
 |---|---|---|
-| Committed-root recovery | `crates/tidefs-local-filesystem/src/recovery.rs`, `crash_recovery.rs`, root-slot helpers, commit-group and txg replay paths | Canonical local durability input. Recovery chooses committed roots and replays durable intents; in-memory cache state is gone after crash. |
+| Committed-root recovery | `crates/tidefs-local-filesystem/src/recovery.rs`, root-slot helpers, commit-group recovery, and intent replay paths | Canonical local durability input. Recovery chooses committed roots and replays durable intents; in-memory cache state is gone after crash. |
 | Intent-log replay | `crates/tidefs-intent-log/`, local `intent_log.rs`, LOG_DEVICE file handling | Canonical replay input, but marker records and acknowledgments are ordering evidence, not clean-page authority. |
 | Dirty accounting | Local `DirtySet`, range `DirtyPageTracker`, local page-cache tracker, FUSE dirty-state ranges, kmod live write buffer | Split implementation state. The authority target is one observable dirty lifecycle; current copies are projections or partial indexes until unified. |
-| Writeback scheduling | `tidefs-cache-core::PageCache`, local `WritebackDaemon`, FUSE writeback scheduler/cache, kmod `writeback_folios` and C address-space callbacks | Cache-core owns non-durable page state transitions. Local/FUSE/kmod schedulers consume that authority and must not mark clean before storage or replay authority completes. |
+| Writeback scheduling | `tidefs-cache-core::PageCache`, FUSE writeback scheduler/cache, kmod `writeback_folios` and C address-space callbacks | Cache-core owns non-durable page state transitions. Live FUSE/kmod schedulers consume that authority and must not mark clean before storage or replay authority completes. |
 | `fsync` and `fdatasync` | Local `DirtyFlush`, `dispatch_engine_fsync`, `fdatasync_inode`, local commit-group and sync gates, FUSE fsync handler, kmod file fsync | Caller-visible durability barriers. They must wait for dirty ranges, intent/replay coverage, and committed-root or equivalent receipt authority. |
 | `syncfs`, flush, and clean unmount | Local `flush_all`, `sync_all`, commit-group close, FUSE flush/syncfs, kmod syncfs and unmount barrier | Filesystem or mount-scope barriers. They cannot replace single-inode fsync correctness with unbounded global flushing as the default design. |
 | Mmap | Local `SharedMmapMsync` intent kind, FUSE `MmapCoherency`, kmod `generic_file_mmap()` path and C address-space callbacks | Shared writable mmap dirties must join writeback authority. Private COW bytes are outside this authority. Cross-node mmap remains a non-claim without a lease manager. |
@@ -184,8 +184,8 @@ The following crates and paths are projections or consumers:
   writeback-cache, mmap-coherency, and notification projection.
 - `kmod/` and `crates/tidefs-kmod-posix-vfs/`: kernel address-space,
   writeback, fsync, syncfs, mmap, invalidation, and committed-root projection.
-- `crates/tidefs-local-filesystem/src/page_cache/`, hot-read cache, inode
-  cache, and adapter read caches: non-authoritative read/cache acceleration.
+- `crates/tidefs-local-filesystem/src/page_cache/`, inode cache, and adapter
+  read caches: non-authoritative read/cache acceleration.
 - `validation/`, `docs/CLAIM_REGISTRY.md`, and `validation/claims.toml`: claim
   consumers. They may record evidence only after the runtime authority is
   implemented and validated.
@@ -472,7 +472,7 @@ lands, before implementation starts.
 | Issue | Slice | Primary write set | Boundary |
 |---|---|---|---|
 | #1532 | Dirty-page lifecycle unification. | `crates/tidefs-cache-core/src/page_cache.rs`, `crates/tidefs-cache-core/tests/`, `crates/tidefs-local-filesystem/src/dirty_page_tracker.rs`, `writeback.rs`, `writeback_daemon.rs`, `page_cache/`, and focused local/cache tests. | Owns dirty/writeback/clean state and duplicate dirty-index reconciliation. Does not edit FUSE adapter policy, kmod address-space callbacks, lease transport, or intent-log schema. |
-| create after #1065 | Local fsync/fdatasync and recovery ordering. | `crates/tidefs-local-filesystem/src/fuse_fsync.rs`, `lib.rs` sync paths, `commit_group.rs`, `intent_log.rs`, `recovery.rs`, `crash_recovery.rs`, `txg_replay.rs`, and focused local runtime/unit tests. | Owns local recovery-safe barrier semantics and LOG_DEVICE/import ordering. Does not change adapter cache invalidation, kmod callbacks, or cluster leases. Must coordinate with #842 for receipt emission rather than duplicate receipt policy. |
+| create after #1065 | Local fsync/fdatasync and recovery ordering. | `crates/tidefs-local-filesystem/src/fuse_fsync.rs`, `lib.rs` sync paths, `commit_group.rs`, `intent_log.rs`, `recovery.rs`, `crash_recovery.rs`, and focused local runtime/unit tests. | Owns local recovery-safe barrier semantics and LOG_DEVICE/import ordering. Does not change adapter cache invalidation, kmod callbacks, or cluster leases. Must coordinate with #842 for receipt emission rather than duplicate receipt policy. |
 | create after #1065 | FUSE writeback-cache projection. | `apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_vfs_adapter.rs`, `fsync_handler.rs`, `mmap_coherency.rs`, FUSE writeback/read cache tests, and focused FUSE validation artifacts. | Consumes local durability authority. Does not own durable inode lookup/forget (#665/#709), FUSE invalidation fences (#752), or cluster lease transport. |
 | create after #1065 | Kernel mmap/writeback projection. | `kmod/`, `crates/tidefs-kmod-posix-vfs/`, kernel address-space/writeback/fsync/mmap validation hooks, and focused kernel validation artifacts. | Consumes local/kernel storage authority. Does not change FUSE adapter policy, userspace local-fs dirty accounting, or clustered invalidation feed. |
 | create after #1065 | Claim-gate and no-hidden-writeback evidence. | `validation/`, `validation/claims.toml`, `docs/CLAIM_REGISTRY.md`, `xtask/`, and evidence manifests. | Records evidence only after runtime implementation exists. Does not implement writeback, recovery, FUSE, kmod, or lease behavior. |

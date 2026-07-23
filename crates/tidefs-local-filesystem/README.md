@@ -7,9 +7,10 @@ Durable local filesystem model built on the TideFS Local Object Store.
 `tidefs-local-filesystem` is the primary filesystem implementation crate in
 TideFS. It publishes namespace changes through immutable transaction objects
 and root-slot commits on top of [`tidefs_local_object_store`]. On reopen,
-the implementation ignores incomplete commits and selects the newest valid
-committed root. That is committed-root replay behavior only; it is not a
-product-grade crash recovery, automatic repair, or release-readiness claim.
+the implementation selects the newest Pool-authorized committed root and,
+when recovery policy permits, replays newer durable intents before retiring
+the log records they made redundant. This is not an automatic-repair or
+release-readiness claim.
 Product recovery and writeback claims remain gated by
 `docs/PAGE_CACHE_WRITEBACK_AUTHORITY.md`, `validation/claims.toml`,
 `docs/CLAIM_REGISTRY.md`, the registry-listed validation artifacts, and live
@@ -35,15 +36,12 @@ FUSE daemon (tidefs-posix-filesystem-adapter-daemon)
          ▼
   LocalFileSystem
     ├── FileSystemState          (inode table, dirs, extent maps, quota)
-    ├── CommitGroupStateMachine  (Open → Syncing → Committed)
+    ├── CommitGroupStateMachine  (Open → Quiesce → Sync)
     ├── WriteBuffer              (small-write coalescing)
     ├── DirtySet                 (data, metadata, catalog dirty tracking)
-    ├── IntentLog                (crash-safe mutation records)
+    ├── IntentLog                (durable mutation records and replay payloads)
     ├── PageCache                (cached read pages + dirty-page tracking)
-    └── Background Services
-         ├── BackgroundCompaction
-         ├── BackgroundOrphanReclamation
-         └── WritebackDaemon
+    └── BackgroundScheduler      (orphan reclaim, defrag, optional scrub)
          │
          ▼
   LocalObjectStore (tidefs-local-object-store)
@@ -60,29 +58,27 @@ FUSE daemon (tidefs-posix-filesystem-adapter-daemon)
 | `FileSystemState` | Authoritative metadata snapshot: inode table, directories, extent maps, quota, space accounting |
 | [`DedupIndex`] | In-memory `BTreeMap`-backed dedup index mapping `ContentFingerprint` to canonical `ObjectKey` |
 | [`FsckReport`] | Block-level and metadata integrity scan output with severity classification |
-| [`CrashRecoveryReport`] | Intent-log replay and root-selection summary after crash |
+| [`RecoveryProbeReport`] | Committed-root selection summary after reopen |
 | [`RecoveryAuditReport`] | Deterministic replay-audit of committed-root chain |
 | [`OnlineVerifierReport`] | Live integrity scan of pool object state |
 | [`CommitGroupConfig`] | Transaction-group config: sync thresholds, auto-commit policy |
-| [`IntentLog`] | Metadata-level intent-log buffer for crash-safe namespace operations |
+| [`IntentLog`] | Durable mutation log containing metadata records and replay payloads |
 | [`PageCache`] | In-memory page cache for read acceleration and dirty-page tracking |
-| [`TxgReplayEngine`] | Replays committed txgs during mount, bridging committed-root discovery to commit_group journal records |
 
 ## Transaction Model
 
 Writes are grouped into transaction groups managed by
 [`CommitGroupStateMachine`]. Each commit group proceeds through
-`Open → Syncing → Committed` phases. A `CommitClass` tags each commit
-group as `Sync`, `DataSync`, or `AutoCommit` to control durability
-semantics. The state machine ensures exactly-once replay of committed
-groups after a crash.
+`Open → Quiesce → Sync`; durable state is published through authenticated
+transaction objects and a root slot.
 
 ## Recovery Model
 
-On open, [`crash_recovery`] replays the intent log and selects the
-newest valid committed root. The [`recovery`] module implements the current
-torn-tail repair path. [`repair`] applies corruption resolution strategies
-(truncate, mark-corrupt, reconstruct), and
+On open, [`recovery`] selects the newest Pool-authorized committed root and
+replays newer durable intent-log entries when the selected recovery policy
+allows mutation. The [`crash_recovery`] module contains crash-matrix validation
+fixtures rather than the mounted recovery implementation. [`repair`] applies
+corruption resolution strategies (truncate, mark-corrupt, reconstruct), and
 [`scrub`] runs a full block-level checksum pipeline with outcome
 classification.
 
@@ -91,60 +87,46 @@ recovery, write/fsync/writeback, mmap, and automatic repair admission remains
 non-claim authority tracked by `docs/PAGE_CACHE_WRITEBACK_AUTHORITY.md`,
 TFR-008, `validation/claims.toml`, and the claim-registry product gates.
 
-### Txg Commit Replay
-
-[`TxgReplayEngine`] replays committed transaction groups during mount
-recovery, bridging the gap between committed-root discovery (root-slot
-ring scan) and commit_group journal records.
-
-The mount sequence runs: root-slot recovery → intent-log replay →
-commit_group journal recovery → **txg commit replay** → mount.
-
-Chain digests are computed via `compute_chain_digest` from
-`tidefs-commit_group` using domain-separated BLAKE3 key derivation.
-After each txg is replayed, a completion marker is written under the
-deterministic key `txg-replay-marker-{txg_id}`, allowing interrupted
-replays to resume from the last fully-applied group.
-
 ## Background Services
 
-Four background services are wired via [`tidefs_background_scheduler`]:
-
-- **`BackgroundCompaction`** — compacts the reclaim queue's B+tree
-  when fill ratios drop below the configured threshold, using
-  [`BPlusTreeReclaimQueue`] from [`tidefs_reclaim_queue_core`].
-- **`BackgroundReclaim`** — model/test surface only (quarantined behind
-  `#[cfg(test)]`); live mounted-pool physical reclaim requires the
-  receipt-bound dead-object drain in `LocalObjectStore` (see Reclaim
-  Authority below).
-- **`BackgroundOrphanReclamation`** — cleans up orphaned inodes and
-  blocks that lost their last reference path.
-- **`WritebackDaemon`** — flushes dirty data from the page cache to
-  the object store on a timer, gated by the dirty-set tracker.
+A writable mounted open starts the shared scheduler with
+`BackgroundOrphanReclamation`, online extent-map defragmentation, and an
+optional `BackgroundScrubber` when its interval is nonzero. `BackgroundReclaim`
+is a model/test surface. Mounted production open does not start
+`WritebackDaemon`; the foreground write-buffer byte threshold and explicit
+durability operations drive content flushes.
 
 ## Reclaim Authority
 
-The mounted-pool segment-freeing authority is the receipt-bound dead-object
-drain in `tidefs-local-object-store`. `LocalObjectStore::drain_dead_segments`
-now inspects the older object-store reclaim queue and fails closed without
-committed receipt evidence. `BackgroundReclaim` and `ProcessedDelta` in
-`background_reclaim.rs` are model/test surfaces quarantined behind
-`#[cfg(test)]` and are not product reclaim evidence.
+Mounted `LocalFileSystem` does not currently free physical segments through the
+receipt-bound dead-object drain. The lower queue records Pool receipt
+generations, but it does not persist exact obsolete-placement tokens bound to
+an authenticated filesystem root. A filesystem generation and a global Pool
+receipt-allocation frontier are different domains and cannot authorize one
+another. Physical entries therefore remain queued fail-closed until that
+root-bound identity exists.
+
+`LocalObjectStore::drain_dead_segments` also leaves the older object-store
+reclaim queue allocated without committed clearance. `BackgroundReclaim` and
+`ProcessedDelta` in `background_reclaim.rs` are model/test surfaces
+quarantined behind `#[cfg(test)]` and are not product reclaim evidence.
 
 Current implementation reclaim path (non-claim):
 
 1. `record_reclaim_delta()` — records refcount deltas into the local
    `BPlusTreeReclaimQueue` during unlink, truncate, and rename-overwrite.
 2. `tick_background_services()` Duty 2 — drains the local queue and calls
-   `LocalObjectStore::delete()` for each entry.
-3. `LocalObjectStore::delete()` — removes the object from the in-memory
-   index and enqueues a legacy object-store reclaim entry.
-4. Receipt-bound dead-object drain — frees physical segments only after
-   committed deadlist and snapshot-pin clearance evidence authorizes the
-   dead object ids.
+   `Pool::delete()` for each entry.
+3. `Pool::delete()` — removes the current placement/index entries and
+   enqueues lower reclaim work.
+4. The mounted path stops after that logical handoff. Receipt-bound physical
+   entries are conservatively retained; it does not infer root stability from
+   receipt allocation order.
 
 This sequence records current source behavior and focused tests. Product
-reclaim, source-retirement, and lifecycle wording remains blocked by
+physical reclaim requires exact per-placement identity, durable root binding,
+and retained-root/snapshot clearance. Product reclaim, source-retirement, and
+lifecycle wording remains blocked by
 `docs/SNAPSHOT_CLONE_DEADLIST_AUTHORITY.md`, TFR-010,
 `validation/claims.toml`, `docs/CLAIM_REGISTRY.md`, and the open follow-ups
 named there.
@@ -227,11 +209,10 @@ three categories:
 | `error.rs` | [`FileSystemError`] enum and `Result<T>` type alias |
 | `types.rs` | Supporting types: `FileSystemState`, `RootAuthenticationKey`, `ContentFingerprint`, etc. |
 | `vfs_engine_impl.rs` | `VfsEngine` trait implementation bridging the FUSE adapter |
-| `commit_group.rs` | `CommitGroupStateMachine`, `CommitGroupConfig`, `CommitClass` |
-| `txg_replay.rs` | [`TxgReplayEngine`]: committed-txg roll-forward with BLAKE3 chain verification |
+| `commit_group.rs` | `CommitGroupStateMachine`, `CommitGroupConfig`, commit phases and ordering |
 | `intent_log.rs` | `IntentLog` and intent-log buffer for crash-safe mutations |
-| `crash_recovery.rs` | Mount-time intent-log replay and root selection |
-| `recovery.rs` | Torn-tail repair, committed-root chain traversal |
+| `crash_recovery.rs` | Crash-matrix validation fixtures |
+| `recovery.rs` | Mounted committed-root selection and durable-intent replay |
 | `repair.rs` | Corruption resolution: truncate, mark-corrupt, reconstruct |
 | `scrub.rs` | Block-level checksum pipeline with outcome classification |
 | `fsck.rs` | `FsckReport`, `FsckCategory`, `FsckSeverity` |
@@ -262,11 +243,9 @@ three categories:
 | `fuse_setattr.rs` | FUSE `setattr` (chmod, chown, truncate, utimes) |
 | `fuse_statfs.rs` | FUSE `statfs` capacity reporting |
 | `parity_raid.rs` | Erasure-coded parity-RAID layout |
-| `hot_read_cache.rs` | Small-read cache for frequently accessed blocks (Derived, superseded by cache-core) |
 | `inode_cache.rs` | In-memory inode attribute cache (Authoritative) |
 | `object_keys.rs` | Object-key family constructors |
 | `orphan_cleanup.rs` | Orphan inode and block reclamation |
-| `readahead.rs` | Sequential read prefetch (Derived) |
 | `journal_cleaner.rs` | Intent-log journal pruning |
 | `pool_label.rs` | Pool label management |
 | `persistence.rs` | Object-store persistence helpers |
@@ -286,21 +265,18 @@ in its module-level documentation.
 
 | Module | Authority | Delegates To |
 |---|---|---|
-| `hot_read_cache.rs` | **Derived** (superseded) | `tidefs-cache-core::PageCache` |
 | `inode_cache.rs` | **Authoritative** | — |
 | `page_cache/` | **Derived** | `tidefs-cache-core::PageCache` |
 | `dirty_page_tracker.rs` | **Authoritative** (range tracking) | — |
 | `writeback.rs` | **Authoritative** (dirty accounting) | — |
 | `writeback_daemon.rs` | **Derived** | `dirty_page_tracker` + `writeback` |
-| `readahead.rs` | **Derived** | `tidefs-cache-core::Prefetch` |
 
-The `HotReadCache` and local-fs `PageCache` are classified as Derived and
-must not grow new authority claims or dirty-data ownership that conflicts
-with `tidefs-cache-core`.  Future work will remove the `HotReadCache` in
-favor of cache-core delegation and merge the local-fs `PageCache` into
-cache-core.
+There is no local whole-file content cache. Dirty overlay reads use buffered
+bytes, and committed content reads retain current Pool placement authority.
+The local-fs `PageCache` remains Derived and must not grow dirty-data or
+durability authority that conflicts with cache-core.
 
 
 ## Revision Note
 
-Last reconciled against codebase: 2026-05-17.
+Last reconciled against codebase: 2026-07-23.

@@ -274,6 +274,9 @@ pub enum NamespaceError {
     RenameCycle,
     /// Operation not yet supported.
     NotSupported,
+    /// The mounted local filesystem cannot safely accept more mutations until
+    /// it is reopened after an indeterminate root publication.
+    MutationRequiresReopen { operation: &'static str },
     /// Persisted namespace root belongs to a different dataset identity.
     DatasetIdentityMismatch {
         expected: NamespaceDatasetIdentity,
@@ -300,6 +303,10 @@ impl fmt::Display for NamespaceError {
             NamespaceError::LinkCountOverflow => f.write_str("link count overflow"),
             NamespaceError::RenameCycle => f.write_str("rename would create directory cycle"),
             NamespaceError::NotSupported => f.write_str("operation not supported"),
+            NamespaceError::MutationRequiresReopen { operation } => write!(
+                f,
+                "mounted filesystem mutation requires reopen before {operation}"
+            ),
             NamespaceError::DatasetIdentityMismatch { expected, found } => write!(
                 f,
                 "dataset identity mismatch: expected {}/{} found {}/{}",
@@ -1002,6 +1009,16 @@ impl Namespace {
     }
 
     // ── Persistent-store delegation ─────────────────────────────────
+    fn ensure_mutation_allowed(&self, operation: &'static str) -> Result<(), NamespaceError> {
+        if let Some(ref store) = self.persistent_inodes {
+            store.ensure_mutation_allowed(operation)?;
+        }
+        if let Some(ref store) = self.persistent_dirs {
+            store.ensure_mutation_allowed(operation)?;
+        }
+        Ok(())
+    }
+
     #[allow(dead_code)]
     fn alloc_inode_delegate(&self, attrs: InodeAttributes) -> Result<(Inode, u64), NamespaceError> {
         if let Some(ref store) = self.persistent_inodes {
@@ -1472,6 +1489,7 @@ impl Namespace {
         &self,
         store: &mut tidefs_dir_index::tidefs_local_object_store::LocalObjectStore,
     ) -> Result<(), NamespaceError> {
+        self.ensure_mutation_allowed("flush persistent namespace")?;
         use tidefs_dir_index::format;
 
         let mut dir_set = self.persistent_manifest_dirs.read().unwrap().clone();
@@ -1643,6 +1661,7 @@ impl Namespace {
         name: &str,
         attrs: InodeAttributes,
     ) -> Result<Inode, NamespaceError> {
+        self.ensure_mutation_allowed("create namespace file")?;
         validate_name(name.as_bytes(), true)?;
 
         #[cfg(feature = "persistent-dir-index")]
@@ -1691,6 +1710,7 @@ impl Namespace {
         name: &str,
         target: &[u8],
     ) -> Result<Inode, NamespaceError> {
+        self.ensure_mutation_allowed("create namespace symbolic link")?;
         validate_name(name.as_bytes(), true)?;
         if target.is_empty() {
             return Err(NamespaceError::InvalidName);
@@ -1749,11 +1769,14 @@ impl Namespace {
         generation: u64,
         creating_pid: u32,
         txg: u64,
-    ) -> bool {
-        self.orphan_index
-            .write()
-            .unwrap()
-            .insert_tmpfile(inode_id, generation, creating_pid, txg)
+    ) -> Result<bool, NamespaceError> {
+        self.ensure_mutation_allowed("track anonymous namespace inode")?;
+        Ok(self.orphan_index.write().unwrap().insert_tmpfile(
+            inode_id,
+            generation,
+            creating_pid,
+            txg,
+        ))
     }
 
     /// Remove an inode from the orphan index when it is linked into
@@ -1764,11 +1787,13 @@ impl Namespace {
     /// no longer orphaned.
     ///
     /// Returns `true` if the inode was in the orphan index and removed.
-    pub fn on_orphan_link(&self, inode_id: u64, txg: u64) -> bool {
-        self.orphan_index
+    pub fn on_orphan_link(&self, inode_id: u64, txg: u64) -> Result<bool, NamespaceError> {
+        self.ensure_mutation_allowed("link anonymous namespace inode")?;
+        Ok(self
+            .orphan_index
             .write()
             .unwrap()
-            .remove_on_link(inode_id, txg)
+            .remove_on_link(inode_id, txg))
     }
 
     /// Scan the orphan index for O_TMPFILE entries whose creating
@@ -1832,6 +1857,7 @@ impl Namespace {
         new_parent: Inode,
         new_name: &str,
     ) -> Result<Inode, NamespaceError> {
+        self.ensure_mutation_allowed("create namespace hard link")?;
         validate_name(old_name.as_bytes(), true)?;
         validate_name(new_name.as_bytes(), true)?;
 
@@ -1924,6 +1950,7 @@ impl Namespace {
         new_parent: Inode,
         new_name: &str,
     ) -> Result<Inode, NamespaceError> {
+        self.ensure_mutation_allowed("create namespace hard link by inode")?;
         validate_name(new_name.as_bytes(), true)?;
 
         #[cfg(feature = "persistent-dir-index")]
@@ -2010,6 +2037,7 @@ impl Namespace {
         mode: u32,
         rdev: u32,
     ) -> Result<Inode, NamespaceError> {
+        self.ensure_mutation_allowed("create namespace special inode")?;
         validate_name(name.as_bytes(), true)?;
 
         #[cfg(feature = "persistent-dir-index")]
@@ -2109,6 +2137,7 @@ impl Namespace {
         name: &str,
         attrs: InodeAttributes,
     ) -> Result<Inode, NamespaceError> {
+        self.ensure_mutation_allowed("create namespace directory")?;
         validate_name(name.as_bytes(), true)?;
 
         #[cfg(feature = "persistent-dir-index")]
@@ -2182,6 +2211,7 @@ impl Namespace {
     ///   and their inode is freed.
     /// - The root inode cannot be unlinked.
     pub fn unlink(&self, parent: Inode, name: &str) -> Result<(), NamespaceError> {
+        self.ensure_mutation_allowed("unlink namespace entry")?;
         validate_name(name.as_bytes(), true)?;
 
         if parent == ROOT_INODE && (name.as_bytes() == b"." || name.as_bytes() == b"..") {
@@ -2261,6 +2291,7 @@ impl Namespace {
         new_parent: Inode,
         new_name: &str,
     ) -> Result<(), NamespaceError> {
+        self.ensure_mutation_allowed("rename namespace entry")?;
         self.rename_with_flags(old_parent, old_name, new_parent, new_name, 0)
     }
 
@@ -2275,6 +2306,7 @@ impl Namespace {
         new_name: &str,
         flags: u32,
     ) -> Result<(), NamespaceError> {
+        self.ensure_mutation_allowed("rename namespace entry with flags")?;
         validate_name(old_name.as_bytes(), true)?;
         validate_name(new_name.as_bytes(), true)?;
 
@@ -2594,6 +2626,7 @@ impl Namespace {
 
     /// Update attributes for an inode.
     pub fn update_attrs(&self, inode: Inode, attrs: InodeAttributes) -> Result<(), NamespaceError> {
+        self.ensure_mutation_allowed("update namespace inode attributes")?;
         self.set_inode_attrs_delegate(inode, attrs)
     }
 
@@ -2718,8 +2751,50 @@ impl Default for Namespace {
 mod tests {
     use super::*;
 
+    struct FencedPersistentInodeStore;
+
+    impl PersistentInodeStore for FencedPersistentInodeStore {
+        fn ensure_mutation_allowed(&self, operation: &'static str) -> Result<(), NamespaceError> {
+            Err(NamespaceError::MutationRequiresReopen { operation })
+        }
+
+        fn alloc_inode(&self, _attrs: &InodeAttributes) -> Result<(Inode, u64), NamespaceError> {
+            unreachable!("outer namespace preflight must run first")
+        }
+
+        fn get_attrs(&self, _inode: Inode) -> Option<InodeAttributes> {
+            None
+        }
+
+        fn update_attrs(
+            &self,
+            _inode: Inode,
+            _attrs: &InodeAttributes,
+        ) -> Result<(), NamespaceError> {
+            unreachable!("outer namespace preflight must run first")
+        }
+
+        fn free_inode(&self, _inode: Inode) -> Result<(), NamespaceError> {
+            unreachable!("outer namespace preflight must run first")
+        }
+
+        fn next_inode_id(&self) -> Inode {
+            0
+        }
+
+        fn generation(&self) -> u64 {
+            0
+        }
+    }
+
     fn test_ns() -> Namespace {
         Namespace::new()
+    }
+
+    fn fenced_persistent_ns() -> Namespace {
+        let mut namespace = Namespace::new();
+        namespace.persistent_inodes = Some(Arc::new(FencedPersistentInodeStore));
+        namespace
     }
 
     fn test_file_attrs(ino: Inode) -> InodeAttributes {
@@ -2744,6 +2819,28 @@ mod tests {
     // ------------------------------------------------------------------
     // Basename validation tests
     // ------------------------------------------------------------------
+
+    #[test]
+    fn mounted_reopen_refusal_precedes_namespace_validation_and_noops() {
+        let namespace = fenced_persistent_ns();
+
+        assert!(matches!(
+            namespace.create_file(ROOT_INODE, "", test_file_attrs(0)),
+            Err(NamespaceError::MutationRequiresReopen { .. })
+        ));
+        assert!(matches!(
+            namespace.unlink(ROOT_INODE, ""),
+            Err(NamespaceError::MutationRequiresReopen { .. })
+        ));
+        assert!(matches!(
+            namespace.rename(ROOT_INODE, "same", ROOT_INODE, "same"),
+            Err(NamespaceError::MutationRequiresReopen { .. })
+        ));
+        assert!(matches!(
+            namespace.track_anonymous_inode(9, 1, 1, 0),
+            Err(NamespaceError::MutationRequiresReopen { .. })
+        ));
+    }
 
     #[test]
     fn basename_validation_plan_classifies_invalid_names() {
@@ -4856,38 +4953,38 @@ mod tests {
     #[test]
     fn track_anonymous_inode_inserts_into_orphan_index() {
         let ns = Namespace::new();
-        assert!(ns.track_anonymous_inode(10, 100, 1234, 0));
+        assert!(ns.track_anonymous_inode(10, 100, 1234, 0).unwrap());
         assert_eq!(ns.orphan_count(), 1);
     }
 
     #[test]
     fn track_anonymous_inode_duplicate_returns_false() {
         let ns = Namespace::new();
-        assert!(ns.track_anonymous_inode(1, 10, 100, 0));
-        assert!(!ns.track_anonymous_inode(1, 20, 200, 0));
+        assert!(ns.track_anonymous_inode(1, 10, 100, 0).unwrap());
+        assert!(!ns.track_anonymous_inode(1, 20, 200, 0).unwrap());
         assert_eq!(ns.orphan_count(), 1);
     }
 
     #[test]
     fn on_orphan_link_removes_from_index() {
         let ns = Namespace::new();
-        ns.track_anonymous_inode(5, 50, 999, 0);
+        ns.track_anonymous_inode(5, 50, 999, 0).unwrap();
         assert_eq!(ns.orphan_count(), 1);
-        assert!(ns.on_orphan_link(5, 0));
+        assert!(ns.on_orphan_link(5, 0).unwrap());
         assert_eq!(ns.orphan_count(), 0);
     }
 
     #[test]
     fn on_orphan_link_nonexistent_returns_false() {
         let ns = Namespace::new();
-        assert!(!ns.on_orphan_link(999, 0));
+        assert!(!ns.on_orphan_link(999, 0).unwrap());
     }
 
     #[test]
     fn reap_tmpfile_timeouts_uses_process_liveness() {
         let ns = Namespace::new();
         // PID 1 (init) is always alive
-        ns.track_anonymous_inode(10, 100, 1, 0);
+        ns.track_anonymous_inode(10, 100, 1, 0).unwrap();
         let reap = ns.reap_tmpfile_timeouts();
         assert!(reap.is_empty(), "PID 1 should be alive");
     }
@@ -4896,7 +4993,7 @@ mod tests {
     fn reap_tmpfile_timeouts_detects_dead_process() {
         let ns = Namespace::new();
         // Very high PID that does not exist
-        ns.track_anonymous_inode(20, 200, 0xFFFFFD, 0);
+        ns.track_anonymous_inode(20, 200, 0xFFFFFD, 0).unwrap();
         let reap = ns.reap_tmpfile_timeouts();
         assert_eq!(reap, vec![20]);
     }
@@ -4905,24 +5002,24 @@ mod tests {
     fn track_link_reap_cycle() {
         let ns = Namespace::new();
         // Create tmpfile
-        assert!(ns.track_anonymous_inode(100, 1000, 42, 0));
+        assert!(ns.track_anonymous_inode(100, 1000, 42, 0).unwrap());
         assert_eq!(ns.orphan_count(), 1);
         // Link it
-        assert!(ns.on_orphan_link(100, 0));
+        assert!(ns.on_orphan_link(100, 0).unwrap());
         assert_eq!(ns.orphan_count(), 0);
         // Link again is no-op
-        assert!(!ns.on_orphan_link(100, 0));
+        assert!(!ns.on_orphan_link(100, 0).unwrap());
     }
 
     #[test]
     fn multiple_tmpfiles_mixed_reap() {
         let ns = Namespace::new();
         // PID 1 is alive
-        ns.track_anonymous_inode(1, 10, 1, 0);
+        ns.track_anonymous_inode(1, 10, 1, 0).unwrap();
         // Dead PID
-        ns.track_anonymous_inode(2, 20, 0xFFFFFC, 0);
+        ns.track_anonymous_inode(2, 20, 0xFFFFFC, 0).unwrap();
         // Zero PID (old recovery) is always reaped
-        ns.track_anonymous_inode(3, 30, 0, 0);
+        ns.track_anonymous_inode(3, 30, 0, 0).unwrap();
         let reap = ns.reap_tmpfile_timeouts();
         // Both dead-PID and zero-PID should be reaped
         assert_eq!(reap.len(), 2);

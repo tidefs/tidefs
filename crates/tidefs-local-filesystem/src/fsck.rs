@@ -340,11 +340,9 @@ fn check_extent_reference_integrity(
             continue;
         }
 
-        let content_key = content_object_key(inode_id);
         let versioned_key = content_object_key_for_version(inode_id, rec.data_version);
 
-        if !store.contains_key(content_key)
-            && !store.contains_key(versioned_key)
+        if !store.contains_key(versioned_key)
             && (rec.size > 0 || extent_maps.contains_key(&inode_id))
         {
             report.add_finding(FsckFinding {
@@ -352,7 +350,7 @@ fn check_extent_reference_integrity(
                 severity: FsckSeverity::Warning,
                 inode_id: Some(inode_id),
                 description: format!(
-                    "inode {} (size={}) has no content object in store",
+                    "inode {} (size={}) has no versioned content object in store",
                     inode_id.get(),
                     rec.size
                 ),
@@ -607,12 +605,13 @@ mod tests {
                 offset: 0,
                 length: 64,
                 payload_digest: tidefs_local_object_store::IntegrityDigest64(0),
+                base_data_version: 0,
                 data_version: 0,
             },
             root_anchor: crate::intent_log::IntentLogRootAnchor {
                 transaction_id: 2,
                 generation: 2,
-                manifest_digest: tidefs_local_object_store::IntegrityDigest64(0),
+                manifest_checksum: tidefs_local_object_store::IntegrityDigest64(0),
             },
             timestamp_ns: 1,
         };
