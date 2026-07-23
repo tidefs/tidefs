@@ -1552,9 +1552,9 @@ fn scan_quorum_root_candidates<S: CommittedRootRecoverySource>(
     let mut checked_transaction_manifests = 0_u64;
     let mut first_candidate_io_error = None;
 
-    // Retain one store vote per encoded candidate while scanning. The current
-    // quorum contract aggregates those store votes by transaction ID below;
-    // exact encoded-root vote identity is a separate follow-on boundary.
+    // Retain one store vote per exact encoded candidate. Transaction IDs only
+    // group independently quorate roots for ordering and conflict detection;
+    // divergent roots must never borrow one another's store votes.
     for slot in 0..FILESYSTEM_ROOT_SLOT_COUNT {
         let slot_key = root_slot_object_key(slot);
         let all_store_locations = source.raw_store().version_locations_across_stores(slot_key);
@@ -1595,8 +1595,7 @@ fn scan_quorum_root_candidates<S: CommittedRootRecoverySource>(
         }
     }
 
-    let mut decoded_candidates = Vec::new();
-    let mut supporting_stores_by_transaction: BTreeMap<u64, BTreeSet<usize>> = BTreeMap::new();
+    let mut roots_by_transaction = BTreeMap::new();
     for ((slot, bytes), supporting_store_indices) in encoded_candidates {
         let root = match decode_quorum_root_candidate(slot, &bytes) {
             Ok(root) => root,
@@ -1613,19 +1612,6 @@ fn scan_quorum_root_candidates<S: CommittedRootRecoverySource>(
             skipped_root_candidates = skipped_root_candidates.saturating_add(1);
             continue;
         }
-        supporting_stores_by_transaction
-            .entry(root.transaction_id)
-            .or_default()
-            .extend(supporting_store_indices.iter().copied());
-        decoded_candidates.push(root);
-    }
-
-    let mut roots_by_transaction = BTreeMap::new();
-    for root in decoded_candidates {
-        let supporting_store_indices = supporting_stores_by_transaction
-            .get(&root.transaction_id)
-            .cloned()
-            .unwrap_or_default();
         if supporting_store_indices.len() < quorum {
             skipped_root_candidates = skipped_root_candidates.saturating_add(1);
             continue;
@@ -3650,6 +3636,63 @@ mod candidate_history_tests {
         ));
 
         drop(pool);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn divergent_roots_with_one_transaction_id_do_not_form_quorum() {
+        let root = temp_root("divergent-root-votes");
+        let primary = root.join("primary");
+        let replica = root.join("replica");
+        let key = RootAuthenticationKey::demo_key();
+        let slot_key = root_slot_object_key(root_slot_for_transaction(2));
+
+        let persist_root = |path: &PathBuf, uid: u32, next_inode_id: u64| {
+            let mut store = LocalObjectStore::open_with_options(path, StoreOptions::test_fast())
+                .expect("open standalone store");
+            crate::persistence::persist_state(
+                &mut store,
+                &state_with_generation_uid_and_next_inode(2, uid, next_inode_id),
+                key,
+            )
+            .expect("persist standalone root");
+            let report = recovery_probe_from_store(&mut store, key)
+                .expect("standalone root must be recoverable");
+            assert_eq!(report.outcome, RecoveryProbeOutcome::SelectedCommittedRoot);
+            store
+                .get(slot_key)
+                .expect("read standalone root slot")
+                .expect("standalone root slot must exist")
+        };
+        let primary_root_bytes = persist_root(&primary, 1001, 2);
+        let replica_root_bytes = persist_root(&replica, 1002, 3);
+
+        let primary_root = decode_root_commit(&primary_root_bytes).expect("decode primary root");
+        let replica_root = decode_root_commit(&replica_root_bytes).expect("decode replica root");
+        assert_eq!(primary_root.transaction_id, 2);
+        assert_eq!(replica_root.transaction_id, 2);
+        assert!(primary_root.root_authentication.is_some());
+        assert!(replica_root.root_authentication.is_some());
+        assert_ne!(primary_root_bytes, replica_root_bytes);
+
+        let mut options = StoreOptions::test_fast();
+        options.replica_paths = vec![replica];
+        let mut store =
+            LocalObjectStore::open_with_options(&primary, options).expect("reopen both stores");
+        let selection = select_latest_committed_root(&mut store, key)
+            .expect("divergent minority roots must produce a recovery report");
+
+        assert_eq!(
+            selection.report.outcome,
+            RecoveryProbeOutcome::ExplicitIntegrityOrMediaError
+        );
+        assert_eq!(selection.report.selected_slot, None);
+        assert_eq!(selection.report.selected_transaction_id, None);
+        assert_eq!(selection.report.valid_committed_roots_seen, 0);
+        assert!(selection.selected_root.is_none());
+        assert!(selection.state.is_none());
+
+        drop(store);
         let _ = std::fs::remove_dir_all(root);
     }
 
